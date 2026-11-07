@@ -198,6 +198,8 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
 void RequestDeliveryProbe();
 // Tests: presents between re-verifying traces once a crossing is learned (default 900).
 void SetNativeTraceIntervalForTests(uint32_t presents);
+// Quality stability gate: consecutive deliverable frames before DLSS is written (default 30).
+void SetQualityWarmupForTests(uint32_t frames);
 // P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
 // immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
 // LOGICAL scene colour/depth ids; J2 evaluates the provider's PHYSICAL (reduced) companions and

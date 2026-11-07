@@ -589,6 +589,7 @@ int main(int argc,char** argv)
         const bool native_stale=native_se5&&argc>1&&std::strstr(argv[1],"stale")!=nullptr;
         unsigned stale_from=0;
         if(native_stale)na::j2::SetNativeTraceIntervalForTests(20);
+        na::j2::SetQualityWarmupForTests(2); // the fixtures are short; the gate itself is exercised by the first two held frames
         test::List over;if(native_replace||native_stale){REQUIRE(over.Create(dev));REQUIRE(SUCCEEDED(over.list->Close()));}        // SE5: the presenting list is recorded ONCE (before any trace window) and
         // executed every frame; it writes the presented image twice: first from
         // the decoy, then from the game's upscaled image (the write that counts).
