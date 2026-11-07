@@ -81,6 +81,7 @@ void SetOperationSnapshots(bool enabled);
 // Recording thread, before a native operation. Bounded by the real finite root
 // ranges (4096 descriptors), never table-head guessing or event-delivery order.
 // False leaves out empty and the game's operation untouched.
-bool ListNativeOperation(ID3D12GraphicsCommandList*, bool compute, NativeOperation& out,const char** reason=nullptr);
+bool ListNativeOperation(ID3D12GraphicsCommandList*, bool compute, NativeOperation& out,const char** reason=nullptr,
+                         bool read_only=false);
 bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE, OperationDescriptor& out);
 } // namespace na::observe

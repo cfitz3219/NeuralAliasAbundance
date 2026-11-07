@@ -395,6 +395,7 @@ struct TraceIo {
     uint64_t id = 0;
     uint32_t w = 0, h = 0, fmt = 0, vfmt = 0;
     bool whole = false;
+    char binding = 0;
 };
 struct NativeCrossing {
     uint64_t pso = 0, input = 0, output = 0, scene = 0;
@@ -410,7 +411,7 @@ struct TraceOp {
     bool compute = false, direct = false, transfer = false, preserves = false, reflected = false;
     bool blend = false, depth = false;
     uint64_t pso = 0;
-    uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0;
+    uint32_t vw = 0, vh = 0, gx = 0, gy = 0, gz = 0, uavs = 0, descriptor_slots = 0;
     ID3D12CommandQueue* queue = nullptr;
     std::vector<TraceIo> in, out;
 };
@@ -424,12 +425,12 @@ struct NativeTrace{
 };
 NativeTrace& g_trace=*new NativeTrace;
 constexpr uint64_t kTraceOps=60000;
-TraceIo trace_view(ID3D12Resource* resource, uint64_t id, uint32_t view, bool whole)
+TraceIo trace_view(ID3D12Resource* resource, uint64_t id, uint32_t view, bool whole, char binding=0)
 {
     const auto d = resource->GetDesc();
     return {id, uint32_t(d.Width), d.Height, uint32_t(d.Format), view,
             whole && d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-            d.DepthOrArraySize==1 && d.MipLevels==1 && d.SampleDesc.Count==1};
+            d.DepthOrArraySize==1 && d.MipLevels==1 && d.SampleDesc.Count==1,binding};
 }
 void trace_append(ID3D12GraphicsCommandList* l, TraceOp&& op)
 {
@@ -450,7 +451,7 @@ void trace_texture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall&
             na::observe::OperationDescriptor target;
             if (!na::observe::NativeDescriptor(call.target, target) || !target.resource) return;
             op.out.push_back(trace_view(target.resource.Get(), target.view.resource, uint32_t(target.view.rtv.Format),
-                !target.view.explicit_view || (target.view.rtv.ViewDimension==D3D12_RTV_DIMENSION_TEXTURE2D && target.view.rtv.Texture2D.MipSlice==0)));
+                !target.view.explicit_view || (target.view.rtv.ViewDimension==D3D12_RTV_DIMENSION_TEXTURE2D && target.view.rtv.Texture2D.MipSlice==0),'r'));
             op.preserves = call.rect_count != 0;
         } else {
             if (!call.source || !call.destination) return;
@@ -474,9 +475,10 @@ void trace_texture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall&
 }
 void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
     const bool compute=call.kind==na::observe::ShaderKind::Dispatch;
-    na::observe::NativeOperation op;if(!na::observe::ListNativeOperation(l,compute,op,nullptr))return;
+    na::observe::NativeOperation op;if(!na::observe::ListNativeOperation(l,compute,op,nullptr,true))return;
     TraceOp t;t.compute=compute;t.pso=op.pipeline_id;t.reflected=op.reflection_complete;
     t.direct=l->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT;
+    t.descriptor_slots=static_cast<uint32_t>(op.descriptors.size());
     if(compute){t.gx=uint32_t(call.args[0]);t.gy=uint32_t(call.args[1]);t.gz=uint32_t(call.args[2]);}
     else{
         if(!op.viewports.empty()){t.vw=uint32_t(op.viewports[0].Width);t.vh=uint32_t(op.viewports[0].Height);}
@@ -496,13 +498,13 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
             const bool whole = !d.view.explicit_view || (srv.ViewDimension==D3D12_SRV_DIMENSION_TEXTURE2D &&
                 !srv.Texture2D.MostDetailedMip && !srv.Texture2D.PlaneSlice);
             t.in.push_back(trace_view(d.resource.Get(), d.view.resource,
-                d.view.explicit_view ? uint32_t(srv.Format) : uint32_t(desc.Format), whole));
+                d.view.explicit_view ? uint32_t(srv.Format) : uint32_t(desc.Format), whole,'s'));
         } else if (d.view.kind==NA_DESC_UAV) {
             const auto& uav = d.view.uav;
             const bool whole = !d.view.explicit_view || (uav.ViewDimension==D3D12_UAV_DIMENSION_TEXTURE2D &&
                 !uav.Texture2D.MipSlice && !uav.Texture2D.PlaneSlice);
             t.out.push_back(trace_view(d.resource.Get(), d.view.resource,
-                d.view.explicit_view ? uint32_t(uav.Format) : uint32_t(desc.Format), whole));
+                d.view.explicit_view ? uint32_t(uav.Format) : uint32_t(desc.Format), whole,'u'));
         }
     }
     for (const auto& d : op.colors) if (d.resource) {
@@ -510,7 +512,7 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
         t.out.push_back(trace_view(d.resource.Get(), d.view.resource,
             d.view.explicit_view ? uint32_t(rtv.Format) : uint32_t(d.resource->GetDesc().Format),
             !d.view.explicit_view || (rtv.ViewDimension==D3D12_RTV_DIMENSION_TEXTURE2D &&
-                !rtv.Texture2D.MipSlice && !rtv.Texture2D.PlaneSlice)));
+                !rtv.Texture2D.MipSlice && !rtv.Texture2D.PlaneSlice),'r'));
     }
     trace_append(l, std::move(t));
 }
@@ -536,10 +538,12 @@ int trace_describe(char* out,size_t n,const TraceOp& t){
     int k=t.transfer?std::snprintf(out,n,"[copy"):
         t.compute?std::snprintf(out,n,"[cs pso=%llu g=%u,%u,%u",(unsigned long long)t.pso,t.gx,t.gy,t.gz)
                    :std::snprintf(out,n,"[draw pso=%llu vp=%ux%u%s%s",(unsigned long long)t.pso,t.vw,t.vh,t.blend?" blend":"",t.depth?" depth":"");
-    if(k<0)return 0;size_t used=size_t(k);
+    if(k<0 || size_t(k)>=n)return 0;size_t used=size_t(k);
+    const int detail=std::snprintf(out+used,n-used," %s/%u",t.reflected?"exact":"table",t.descriptor_slots);
+    if(detail>0)used=(std::min)(n-1,used+size_t(detail));
     const auto list=[&](const char* tag,const std::vector<TraceIo>& v){
         for(size_t i=0;i<v.size()&&i<4&&used+48<n;++i){
-            const int m=std::snprintf(out+used,n-used," %s#%llu=%ux%u/%u(%u)",tag,(unsigned long long)(v[i].id%100000),v[i].w,v[i].h,v[i].fmt,v[i].vfmt);
+            const int m=std::snprintf(out+used,n-used," %s%c#%llu=%ux%u/%u(%u)",tag,v[i].binding?v[i].binding:'-',(unsigned long long)v[i].id,v[i].w,v[i].h,v[i].fmt,v[i].vfmt);
             if(m>0)used+=size_t(m);
         }
         if(v.size()>4&&used+12<n){const int m=std::snprintf(out+used,n-used," %s+%zu",tag,v.size()-4);if(m>0)used+=size_t(m);}
@@ -579,7 +583,8 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
     std::unordered_map<uint64_t,std::vector<size_t>> writers;
     for (size_t i=0;i<ops.size();++i) {
         if (ops[i].queue!=queue) continue;
-        for (const auto& out:ops[i].out) if (out.id) writers[out.id].push_back(i);
+        for (const auto& out:ops[i].out)
+            if (out.id && (out.binding!='u' || ops[i].reflected)) writers[out.id].push_back(i);
     }
     const auto writer=[&](uint64_t id,size_t before) -> size_t {
         const auto found=writers.find(id);
@@ -599,7 +604,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
             if (scene && next.first==scene) return true;
             visited.push_back(index);
             const auto& op=ops[index];
-            for (const auto& in:op.in)
+            if (op.reflected || op.transfer) for (const auto& in:op.in)
                 if (in.whole && in.w==e.rw && in.h==e.rh) pending.emplace_back(in.id,index);
         }
         return false;
@@ -621,7 +626,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         const auto& op=ops[index];
         const auto output=std::find_if(op.out.begin(),op.out.end(),[&](const TraceIo& v){return v.id==edge.id;});
         if (output==op.out.end() || !output->whole || output->w!=e.ow || output->h!=e.oh) continue;
-        if (!op.compute && !op.transfer && op.preserves) {
+        if (output->binding=='r' && op.preserves) {
             ++overlays;
             pending.push_back({edge.id,index,edge.srgb});
             continue;
