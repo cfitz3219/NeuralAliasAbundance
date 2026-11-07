@@ -255,13 +255,15 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         CHECK(after.not_ready == before.not_ready);
     }
     // f905099 run (take_other_list=12792): SE5 draws its geometry on one list
-    // and J2 records on a later one. Positions of an already submitted list
-    // must reach J2's list; an unsubmitted one must not.
+    // and J2 records on a later one. 98d13f1 run (pending 6723 of 6724, fed 0):
+    // J2 records before SE5 submits that list. A list submitted later but
+    // before J2's list runs must give correct motion (GPU stamp passes); one
+    // that runs after J2's list must leave no motion (stamp fails).
     {
         test::List geo, post;
         REQUIRE(geo.Create(dev) && post.Create(dev));
         REQUIRE(SUCCEEDED(geo.list->Close()) && SUCCEEDED(post.list->Close()));
-        uint32_t fed_frames = 0, unsubmitted_fed = 0;
+        uint32_t fed_frames = 0, pending_ok = 0, late_masked = 0;
         for (uint32_t frame = 200; frame < 212; ++frame) {
             na::nr::native::Reset(geo.list.Get());geo.Reset();
             na::nr::native::Reset(post.list.Get());post.Reset();
@@ -284,26 +286,63 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
             auto to_read = test::Transition(depth.Get(), depth_write, npsr);
             g->ResourceBarrier(1, &to_read);
             REQUIRE(SUCCEEDED(g->Close()));
-            const bool submit_first = frame != 205; // one frame: J2 records before the geometry list is submitted
+            // 205: geometry submitted after J2 recorded, before J2's list runs.
+            // 208: geometry submitted after J2's list ran (its positions are stale).
+            const bool submit_first = frame != 205 && frame != 208;
             ID3D12CommandList* gl[] = {g};
             if (submit_first) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
             const na::j2::replay_motion::Output output = [&] {
                 const na::observe::HostWorkScope host;
                 return pass.Record(post.list.Get(), d.queue.Get(), depth.Get(), w, h, false, false, jitter);
             }();
-            if (output.motion) { if (submit_first) ++fed_frames; else ++unsubmitted_fed; }
+            if (output.motion) {
+                ++fed_frames;
+                ID3D12Resource* textures[] = {output.motion, output.valid};
+                for (UINT i = 0; i < 2; ++i) {
+                    auto barrier = test::Transition(textures[i], npsr, copy_source);
+                    post.list->ResourceBarrier(1, &barrier);
+                    D3D12_TEXTURE_COPY_LOCATION src{textures[i], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                    D3D12_TEXTURE_COPY_LOCATION dst{rb.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                    dst.PlacedFootprint.Offset = uint64_t(i) * h * pitch;
+                    dst.PlacedFootprint.Footprint = {i ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32_FLOAT, w, h, 1, pitch};
+                    post.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+                    post.list->ResourceBarrier(1, &barrier);
+                }
+            }
             std::swap(to_read.Transition.StateBefore, to_read.Transition.StateAfter);
             post.list->ResourceBarrier(1, &to_read);
             REQUIRE(SUCCEEDED(post.list->Close()));
-            if (!submit_first) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
+            if (frame == 205) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
             ID3D12CommandList* pl[] = {post.list.Get()};
             { na::nr::native::Submission s2(d.queue.Get(), 1, pl); d.queue->ExecuteCommandLists(1, pl); }
+            if (frame == 208) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
             d.WaitIdle();
+            if (output.motion) {
+                std::byte* mapped = nullptr;
+                REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+                const auto* motion = reinterpret_cast<const float*>(mapped + 7 * pitch);
+                const auto* valid = reinterpret_cast<const float*>(mapped + (h + 7) * pitch);
+                const bool right = valid[12] == 1.f && std::abs(motion[24] - (frame % 2 ? -1.f : 1.f)) < 1e-3f && std::abs(motion[25]) < 1e-3f;
+                if (frame == 208) {
+                    CHECK(valid[12] == 0.f);
+                    if (valid[12] == 0.f) ++late_masked;
+                } else {
+                    CHECK(right);
+                    if (frame == 205 && right) ++pending_ok;
+                }
+                std::printf("frame %u: motion (12,7) %.3f %.3f valid %.0f\n", frame, motion[24], motion[25], valid[12]);
+                rb->Unmap(0, nullptr);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        std::printf("geometry on another list: motion on %u frames (9 expected), unsubmitted fed %u\n", fed_frames, unsubmitted_fed);
-        CHECK(fed_frames >= 9);   // 200 has no previous; 205 is unsubmitted; 206 follows it
-        CHECK(unsubmitted_fed == 0);
+        na::observe::DrawReplayStats stats{};
+        na::observe::GetDrawReplayStats(&stats);
+        std::printf("geometry on another list: motion on %u frames (11 expected), pending ok %u, late masked %u, stamps %llu, pending_stamped %llu\n",
+                    fed_frames, pending_ok, late_masked, (unsigned long long)stats.stamps, (unsigned long long)stats.pending_stamped);
+        CHECK(fed_frames >= 11); // 200 has no previous
+        CHECK(pending_ok == 1);
+        CHECK(late_masked == 1);
     }
     test::ComPtr<ID3D12InfoQueue> messages;
     if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&messages)))) {

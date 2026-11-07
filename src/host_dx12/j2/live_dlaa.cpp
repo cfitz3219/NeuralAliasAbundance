@@ -1260,7 +1260,7 @@ void replay_probe_frame()
             na::observe::DrawReplayStats d{};
             na::observe::GetDrawReplayStats(&d);
             const auto p = g.replay.GetStats();
-            na::eventlog::Emit("draw_replay", "noted=%llu built=%llu build_failed=%llu replayed=%llu verts=%llu not_ready=%llu twin_queued=%llu building=%llu twin_failed=%llu no_recipe=%llu hash_mismatch=%llu untwinned=%llu topology=%llu stages=%llu overflow=%llu other_list=%llu taken=%llu take_unclaimed=%llu take_other_list=%llu take_sealed=%llu segments=%llu pending_segments=%llu | frames=%llu fed=%llu draws=%llu prev_draws=%llu exact=%llu loose=%llu unmatched=%llu raster_verts=%llu last_draws=%u last_pairs=%u fed_now=%d",
+            na::eventlog::Emit("draw_replay", "noted=%llu built=%llu build_failed=%llu replayed=%llu verts=%llu not_ready=%llu twin_queued=%llu building=%llu twin_failed=%llu no_recipe=%llu hash_mismatch=%llu untwinned=%llu topology=%llu stages=%llu overflow=%llu other_list=%llu taken=%llu take_unclaimed=%llu take_other_list=%llu take_sealed=%llu segments=%llu pending_segments=%llu pending_stamped=%llu stamps=%llu | frames=%llu fed=%llu draws=%llu prev_draws=%llu exact=%llu loose=%llu unmatched=%llu raster_verts=%llu checked=%llu last_draws=%u last_pairs=%u fed_now=%d",
                 (unsigned long long)d.noted, (unsigned long long)d.built, (unsigned long long)d.build_failed, (unsigned long long)d.replayed,
                 (unsigned long long)d.vertices, (unsigned long long)d.not_ready, (unsigned long long)d.twin_queued, (unsigned long long)d.twin_building,
                 (unsigned long long)d.twin_failed, (unsigned long long)d.no_recipe, (unsigned long long)d.hash_mismatch, (unsigned long long)d.untwinned,
@@ -1268,8 +1268,9 @@ void replay_probe_frame()
                 (unsigned long long)d.other_list, (unsigned long long)d.taken, (unsigned long long)d.take_unclaimed,
                 (unsigned long long)d.take_other_list, (unsigned long long)d.take_sealed,
                 (unsigned long long)d.segments, (unsigned long long)d.pending_segments,
+                (unsigned long long)d.pending_stamped, (unsigned long long)d.stamps,
                 (unsigned long long)p.frames, (unsigned long long)p.fed, (unsigned long long)p.draws, (unsigned long long)p.prev_draws,
-                (unsigned long long)p.matched_exact, (unsigned long long)p.matched_loose, (unsigned long long)p.unmatched, (unsigned long long)p.verts,
+                (unsigned long long)p.matched_exact, (unsigned long long)p.matched_loose, (unsigned long long)p.unmatched, (unsigned long long)p.verts, (unsigned long long)p.checked,
                 p.last_draws, p.last_pairs, g.replay_fed_frame && g.replay_fed_frame + 2 >= g.frame ? 1 : 0);
         }
     }

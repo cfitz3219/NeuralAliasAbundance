@@ -375,12 +375,16 @@ struct ReplayRecord {
     uint64_t sig = 0, vb = 0;
     uint32_t first = 0, verts = 0, width = 0, height = 0;
     int32_t scissor[4]{};
+    // 0: usable as is. Else the writer list was not submitted when J2 took the
+    // frame: use only where stamps[check - 1] == token on the GPU.
+    uint32_t check = 0, token = 0;
 };
 struct ReplayFrame {
     ID3D12Resource* cur = nullptr;  // this frame's positions (draws in cur_draws)
     ID3D12Resource* prev = nullptr; // the frame before (null when not continuous)
     uint64_t data_offset = 0; // positions start at data_offset (16 bytes each)
     bool cur_in_list = false; // cur is in STREAM_OUT in the reading list (it wrote some itself); else COMMON
+    ID3D12Resource* stamps = nullptr; // uint per writer segment (COMMON); see ReplayRecord::check
     std::vector<ReplayRecord> cur_draws, prev_draws;
 };
 struct DrawReplayStats {
@@ -388,7 +392,8 @@ struct DrawReplayStats {
     uint64_t untwinned = 0, no_recipe = 0, not_ready = 0, built = 0, build_failed = 0, noted = 0, hash_mismatch = 0;
     // Why J2 could not use a frame: slot never claimed this frame, claimed by another list/recording, or already taken.
     uint64_t other_list = 0, take_unclaimed = 0, take_other_list = 0, take_sealed = 0, taken = 0;
-    uint64_t segments = 0, pending_segments = 0; // list segments written; other-list segments not yet submitted at J2
+    uint64_t segments = 0, pending_segments = 0; // list segments written; other-list segments not yet submitted at J2 and unusable
+    uint64_t pending_stamped = 0, stamps = 0; // unsubmitted segments used under a GPU stamp check; stamps written at Close
 };
 void SetDrawReplay(uint64_t frame, ReplayRetain retain);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);
