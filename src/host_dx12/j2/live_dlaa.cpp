@@ -418,7 +418,7 @@ struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
     uint32_t frames=0,untraced=0,traced_lists=0;uint64_t ops=0,traces=0,presents=0,armed_at=0;
     std::map<std::pair<uint64_t,uint64_t>,std::vector<TraceOp>> recs;std::vector<TraceOp> frame;
-    char result[1800]{};
+    char result[4096]{};
     NativeCrossing previous, learned;
     std::atomic<uint64_t> learned_pso{0};
 };
@@ -661,7 +661,43 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
     }    g_trace.previous=candidate;
     g_trace.learned_pso.store(g_trace.learned.pso,std::memory_order_release);
     add(" overlays=%u learned=%llu",overlays,static_cast<unsigned long long>(g_trace.learned.pso));
-    if (!candidate.pso) add(" waiting_for_presented_scene_chain");
+    if (!candidate.pso) {
+        add(" waiting_for_presented_scene_chain");
+        // Preserve Opus's downstream diagnostic, with compute candidates first
+        // so a long run of HUD draws cannot crowd out the relevant evidence.
+        unsigned listed=0;
+        for (size_t i=0;i<ops.size()&&listed<4;++i) {
+            const auto& op=ops[i];
+            if (!op.compute || op.queue!=queue) continue;
+            const auto source=std::find_if(op.in.begin(),op.in.end(),[&](const TraceIo& v){
+                return v.whole&&v.w==e.rw&&v.h==e.rh;
+            });
+            const auto target=std::find_if(op.out.begin(),op.out.end(),[&](const TraceIo& v){
+                return v.whole&&v.w==e.ow&&v.h==e.oh;
+            });
+            if (source==op.in.end()||target==op.out.end()||!trace_same_color(source->vfmt,target->vfmt)) continue;
+            ++listed;
+            char text[380]{};
+            trace_describe(text,sizeof text,op);
+            add(" candidate@%zu=%s",i,text);
+            const size_t upstream=writer(source->id,i);
+            if (upstream<ops.size()) {
+                trace_describe(text,sizeof text,ops[upstream]);
+                add(" input_from=%s",text);
+            }
+            for (size_t j=i+1;j<ops.size();++j) {
+                const auto& next=ops[j];
+                if (next.queue!=queue) continue;
+                const auto matches=[&](const TraceIo& v){return v.id==target->id;};
+                const bool read=std::any_of(next.in.begin(),next.in.end(),matches);
+                const bool write=std::any_of(next.out.begin(),next.out.end(),matches);
+                if (!read&&!write) continue;
+                trace_describe(text,sizeof text,next);
+                add(" %s@%zu=%s",read?"read_by":"written_by",j,text);
+                break;
+            }
+        }
+    }
 }
 void native_reject(std::atomic<uint64_t>& counter,const char* why){
     counter.fetch_add(1,std::memory_order_relaxed);

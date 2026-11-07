@@ -1131,8 +1131,8 @@ void write_status_line()
                 (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
                 (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,b.steps);
             if(steps_n>0)WriteFile(f,steps_line,DWORD((std::min)(steps_n,int(sizeof steps_line-1))),&written,nullptr);
-            char trace_text[1800];uint64_t traces=0;na::j2::NativeTraceResult(trace_text,sizeof trace_text,&traces);
-            char trace_line[2000];
+            char trace_text[4096];uint64_t traces=0;na::j2::NativeTraceResult(trace_text,sizeof trace_text,&traces);
+            char trace_line[4400];
             const int trace_n=std::snprintf(trace_line,sizeof trace_line,"native_trace traces=%llu redirect_submitted=%llu producer_state_imported=%llu last{%s}\r\n",
                 (unsigned long long)traces,(unsigned long long)b.redirect_submitted,(unsigned long long)b.depth_state_refused,trace_text);
             if(trace_n>0)WriteFile(f,trace_line,DWORD((std::min)(trace_n,int(sizeof trace_line-1))),&written,nullptr);
