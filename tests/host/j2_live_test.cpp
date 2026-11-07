@@ -34,12 +34,18 @@ void __cdecl Sink(const na_event_batch*, void*) {}
 std::vector<ID3D12CommandList*> g_forwarded;
 ID3D12CommandQueue* g_queue = nullptr;
 void __stdcall RawForward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists){q->ExecuteCommandLists(n,lists);}
+// SE5 runs (100 frames, 30+ inline deliveries): also the overlay's DLSS completion
+// bookkeeping around game submissions (overlay/submission_tracking.hpp), without
+// which inline evaluations are never seen submitted and tracking fills up.
+bool g_track_dlss = false;
 void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
     g_forwarded.assign(lists, lists + n);
+    if (g_track_dlss) na::dlss::BeforeExecute(q, n, lists);
     // Same mandatory forward seam as overlay::ForwardThroughNr, including when
     // NR is disabled. It publishes real GPU completion for recording leases.
     na::nr::Execute(q,n,lists,&RawForward);
+    if (g_track_dlss) na::dlss::OnExecuted(q, n, lists);
 }
 
 using M = std::array<double, 16>;
@@ -357,7 +363,7 @@ int main(int argc,char** argv)
         if(native_se5){
             // Normal output path: no debug picture, no sharpening; the fake
             // evaluation writes the pattern into its real output.
-            g_pattern_dev=dev;fake::eval_output=&WritePattern;
+            g_pattern_dev=dev;fake::eval_output=&WritePattern;g_track_dlss=true;
             na::settings::Get().j2_sharpness.store(0);
         }
         test::ComPtr<ID3D12DescriptorHeap> heap,cpu_heap;
@@ -490,6 +496,10 @@ int main(int argc,char** argv)
             REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&c,IID_PPV_ARGS(&se5_upscale))));
         }
         const bool native_overwrite=native_se5&&argc>1&&std::strstr(argv[1],"overwrite")!=nullptr;
+        // Negative: the upscale list is submitted BEFORE its scene producer.
+        const bool native_reverse=native_se5&&argc>1&&std::strstr(argv[1],"reverse")!=nullptr;
+        // Negative: delivery works, then the game overwrites its image in the same list.
+        const bool native_replace=native_se5&&argc>1&&std::strstr(argv[1],"replace")!=nullptr;
         // SE5: the presenting list is recorded ONCE (before any trace window) and
         // executed every frame; it writes the presented image twice: first from
         // the decoy, then from the game's upscaled image (the write that counts).
@@ -498,7 +508,8 @@ int main(int argc,char** argv)
         test::List post;REQUIRE(post.Create(dev));REQUIRE(SUCCEEDED(post.list->Close()));
         na::j2::SetNativeRenderExtent(W,H,OW,OH);na::j2::SetDebugView(native_se5?0:3); // 3: known black depth output, alpha1; SE5: the normal output
         const int before_native=fake::evals;
-        const unsigned iterations=native_late?68u:3u;
+        const unsigned iterations=native_se5?100u:native_late?68u:3u;
+        if(native_se5)na::j2::RequestDeliveryProbe();
         unsigned late_deliveries=0;
         for(unsigned iteration=0;iteration<iterations;++iteration){
             d.WaitIdle();na::j2::OnPresent(d.queue.Get());
@@ -520,7 +531,9 @@ int main(int argc,char** argv)
                 // Render ahead: this producer closes before the preceding
                 // picture's Present; its separate post list records afterward.
                 // Cover both not-yet-submitted and already-submitted producer.
-                if(native_late || iteration==2){ID3D12CommandList* producer[]{scene.list.Get()};na::j2::Execute(d.queue.Get(),1,producer,&Forward);}
+                // SE5 (Sol bafa40a): the scene is closed but NOT submitted before the
+                // upscale list records; both are submitted afterwards, in game order.
+                if((native_late&&!native_se5) || iteration==2){ID3D12CommandList* producer[]{scene.list.Get()};na::j2::Execute(d.queue.Get(),1,producer,&Forward);}
                 if(!native_late && iteration)na::j2::OnPresent(d.queue.Get());
                 post.Reset();target_list=post.list.Get();
             }
@@ -563,8 +576,9 @@ int main(int argc,char** argv)
             D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;order.UAV.pResource=native.Get();target_list->ResourceBarrier(1,&order);
             const float green[]{0,1,0,1};const D3D12_RECT hud_rect{0,0,4,4};
             target_list->ClearUnorderedAccessViewFloat(gpu_uav,cpu_heap->GetCPUDescriptorHandleForHeapStart(),native.Get(),green,1,&hud_rect);
-            if(native_overwrite){
-                // Negative: the game overwrites its upscaled image before the final write reads it.
+            if(native_overwrite||(native_replace&&late_deliveries>0)){
+                // Negative: the game overwrites its upscaled image before the final write reads it
+                // (replace: only once delivery has started, so the trace already learned).
                 auto to_rt=test::Transition(native.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_RENDER_TARGET);
                 target_list->ResourceBarrier(1,&to_rt);
                 auto h=composite_rtv->GetCPUDescriptorHandleForHeapStart();h.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -612,7 +626,12 @@ int main(int argc,char** argv)
             }else target_list->ResourceBarrier(2,end_native);
             REQUIRE(SUCCEEDED(target_list->Close()));
             ID3D12CommandList* native_lists[]{scene.list.Get(),post.list.Get()};
-            if(!native_merged&&(native_late||iteration==2))na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
+            if(native_se5&&iteration!=2){
+                if(native_reverse){na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);na::j2::Execute(d.queue.Get(),1,native_lists,&Forward);}
+                else if(iteration%2)na::j2::Execute(d.queue.Get(),2,native_lists,&Forward);   // one batch, scene first
+                else{na::j2::Execute(d.queue.Get(),1,native_lists,&Forward);na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);}
+            }
+            else if(!native_merged&&(native_late||iteration==2))na::j2::Execute(d.queue.Get(),1,native_lists+1,&Forward);
             else na::j2::Execute(d.queue.Get(),native_merged?1u:2u,native_lists,&Forward);
             d.WaitIdle();
             if(native_se5&&iteration>=1){
@@ -644,8 +663,13 @@ int main(int argc,char** argv)
             st=na::j2::GetStats();
             if(native_se5){
                 na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false);
+                na::j2::NativeProbePresent(d.queue.Get(),presented.Get(),nullptr);
+                d.WaitIdle();
+                if(st.native_deliveries>late_deliveries&&native_replace){late_deliveries=unsigned(st.native_deliveries);continue;}
+                if(st.native_deliveries&&st.native_deliveries==late_deliveries)
+                    std::printf("se5 iteration %u: no new delivery: j2 \"%s\" bridge \"%s\"\n",iteration,st.reason,na::j2::GetNativeBridgeStats().reason);
                 if(st.native_deliveries){
-                    CHECK(!native_overwrite);
+                    CHECK(!native_overwrite&&!native_reverse);
                     CHECK(st.native_deliveries==++late_deliveries);
                     // The evaluation's own pixels, through J2's normal write-back, the game's HUD,
                     // and the game's explicit UNORM -> FP16 conversion into the presented image.
@@ -661,7 +685,8 @@ int main(int argc,char** argv)
                     }
                     CHECK(hud[0]==0&&hud[1]==1&&hud[2]==0);
                 }else{
-                    CHECK(fake::evals==before_native);
+                    if(late_deliveries)std::printf("se5 iteration %u: no delivery: j2 \"%s\" bridge \"%s\"\n",iteration,st.reason,na::j2::GetNativeBridgeStats().reason);
+                    if(!native_reverse)CHECK(fake::evals==before_native);
                     if(native_overwrite&&final_recorded){
                         const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1);
                         CHECK(world[0]==0&&world[1]==0&&world[2]==1);
@@ -688,10 +713,28 @@ int main(int argc,char** argv)
         if(native_late){
             char trace[2048];uint64_t traces=0;na::j2::NativeTraceResult(trace,sizeof trace,&traces);
             std::printf("learned native Quality deliveries %u, traces %llu: %s\n",late_deliveries,(unsigned long long)traces,trace);
+            const auto nbs=na::j2::GetNativeBridgeStats();
+            if(native_se5)std::printf("se5 delivery: delivered %llu first %llu best_streak %llu order_refused %llu later_written %llu probe{%s} refusals{%s}\n",
+                (unsigned long long)nbs.delivered,(unsigned long long)nbs.first_delivery_frame,(unsigned long long)nbs.best_streak,
+                (unsigned long long)nbs.order_refused,(unsigned long long)nbs.later_written,nbs.probe,nbs.refusals);
+            if(native_replace){
+                // Delivered and submitted, but the game's later write replaced it: the probe says so.
+                CHECK(late_deliveries>=2 && nbs.later_written>0);
+                CHECK(std::strstr(nbs.probe,"verdict=replaced_before_present")!=nullptr);
+            }else if(native_se5&&!native_overwrite&&!native_reverse){
+                CHECK(std::strstr(nbs.probe,"verdict=confirmed_in_presented")!=nullptr);
+            }else if(native_se5){
+                CHECK(std::strstr(nbs.probe,"verdict=confirmed")==nullptr);
+            }
             if(native_overwrite){
                 // No false confirmation: nothing learned, nothing evaluated or delivered.
                 CHECK(late_deliveries==0 && fake::evals==before_native && std::strstr(trace,"learned=0")!=nullptr);
+            }else if(native_reverse){
+                // Recorded, but its producer runs after it: refused at submission, never confirmed.
+                CHECK(late_deliveries==0 && nbs.delivered==0 && nbs.order_refused>0);
+                CHECK(std::strstr(nbs.refusals,"not submitted before the upscale list")!=nullptr);
             }else{
+                if(native_se5)CHECK(nbs.delivered==late_deliveries && nbs.order_refused==0 && nbs.best_streak>=2);
                 if(native_se5){
                     // Learned through the once-recorded presenting list (cached, last write),
                     // with the typed UNORM -> FP16 handoff named.
@@ -712,7 +755,7 @@ int main(int argc,char** argv)
         // completion, rather than requiring its future Reset, permits resizing.
         na::j2::SetNativeRenderExtent(W,H,W,H);na::j2::OnPresent(d.queue.Get());frame(.5);
         st=na::j2::GetStats();CHECK(st.active&&st.render_w==W&&st.render_h==H&&st.out_w==W&&st.out_h==H);
-        CHECK(fake::evals==before_native+(native_late?int(late_deliveries):3)+1);
+        if(!native_reverse)CHECK(fake::evals==before_native+(native_late?int(late_deliveries):3)+1);
         test::ComPtr<ID3D12InfoQueue> info;
         if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&info)))) {
             for (UINT64 i=0;i<info->GetNumStoredMessages();++i) {
@@ -720,6 +763,9 @@ int main(int argc,char** argv)
                 info->GetMessage(i,nullptr,&size);
                 std::vector<uint8_t> storage(size);
                 auto* message=reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                // The reverse case submits the fixture's own lists out of order on
+                // purpose, so their scene-colour barriers mismatch (527) there only.
+                if (native_reverse && SUCCEEDED(info->GetMessage(i,message,&size)) && unsigned(message->ID)==527u) continue;
                 if (SUCCEEDED(info->GetMessage(i,message,&size)) && message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR) {
                     std::printf("D3D12 error %u: %s\n",unsigned(message->ID),message->pDescription);
                     CHECK(false);

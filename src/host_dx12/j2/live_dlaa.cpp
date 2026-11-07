@@ -125,6 +125,7 @@ struct SceneInput {
     // cannot become a usable producer. Frame remains diagnostic for this path.
     uint64_t native_serial=0,native_recording=0;
     na::nr::native::RecordingLease native_origin;
+    const void* native_list=nullptr; // the producer list (order is confirmed at submission)
     // Between fallback: a not-yet-accepted entry already read this finished image in an
     // earlier submission, so a DLSS placed now lands after the picture moved on.
     bool read_before = false;
@@ -253,6 +254,12 @@ struct State {
         uint64_t color = 0;
         PendingHistory history;
         bool valid = false;
+        // Separate-list producer of a native delivery (Sol bafa40a): recorded before
+        // the producer was submitted; its order is confirmed when the game submits.
+        const void* producer_list = nullptr;
+        uint64_t producer_rec = 0;
+        na::nr::native::RecordingLease producer;
+        uint64_t dest = 0; uint32_t dest_writes = 0; // the delivery target and its writes at delivery
     } inl;
     int64_t camera_offset = -1; // learned offset of the ViewProjection inside its block
     int64_t camera_param = -1;  // learned root parameter that binds the camera block
@@ -373,7 +380,11 @@ struct NativeBridgeCounters {
         no_destination{0},ambiguous{0},candidates{0},recorded{0},record_failed{0},after_skipped{0},redirected{0},redirect_failed{0},redirect_submitted{0},depth_state_refused{0},
         st_gated{0},st_full{0},st_examined{0},st_no_input{0},st_ambiguous{0},st_draw_state{0},st_candidates{0},st_recorded{0},st_failed{0},
         st_ungated_full{0},st_budget{0},st_aux{0};
-    std::mutex m;char reason[200]{};uint32_t src_w=0,src_h=0,src_fmt=0,seen_w=0,seen_h=0,seen_fmt=0;
+    std::mutex m;char reason[200]{};
+    // Sol bafa40a (5c/5d), under m: every refusal reason with its count, and first
+    // vs sustained delivery (by submitted frame).
+    struct Refusal{char why[100];uint64_t n;};Refusal refusals[12]{};uint32_t refusal_kinds=0;
+    uint64_t delivered=0,first_delivery_frame=0,last_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;uint32_t src_w=0,src_h=0,src_fmt=0,seen_w=0,seen_h=0,seen_fmt=0;
     // Every distinct full-output writer seen while waiting (pipeline + kind), with its
     // render-size inputs: the log names the game's upscale step instead of guessing.
     struct Step{uint64_t pso=0;bool compute=false;uint32_t dw=0,dh=0,df=0,inputs=0,iw=0,ih=0,ifmt=0,scene=0;uint64_t n=0;char verdict[24]{};};
@@ -930,9 +941,214 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         }
     }
 }
+void native_refusal_locked(const char* why){
+    if(!why||!*why)return;
+    for(uint32_t i=0;i<g_nb.refusal_kinds;++i)if(std::strncmp(g_nb.refusals[i].why,why,sizeof g_nb.refusals[i].why-1)==0){++g_nb.refusals[i].n;return;}
+    if(g_nb.refusal_kinds<12){auto& r=g_nb.refusals[g_nb.refusal_kinds++];std::snprintf(r.why,sizeof r.why,"%s",why);r.n=1;}
+}
 void native_reject(std::atomic<uint64_t>& counter,const char* why){
     counter.fetch_add(1,std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"%s",why);
+    native_refusal_locked(why);
+}
+// A native delivery reached the game's submission (Sol bafa40a 5c/5d).
+void native_delivery_submitted(bool producer_order,const char* refusal,uint32_t later_writes,uint64_t frame){
+    std::lock_guard<std::mutex> lock(g_nb.m);
+    if(!producer_order){++g_nb.order_refused;native_refusal_locked(refusal);g_nb.streak=0;return;}
+    if(later_writes)++g_nb.later_written; // HUD overlays or an overwrite: the run's pixel check decides
+    ++g_nb.delivered;
+    if(!g_nb.first_delivery_frame)g_nb.first_delivery_frame=frame;
+    g_nb.streak=g_nb.last_delivery_frame+1==frame?g_nb.streak+1:1;
+    g_nb.best_streak=(std::max)(g_nb.best_streak,g_nb.streak);
+    g_nb.last_delivery_frame=frame;
+}
+
+// Delivery probe (Sol 6a48746 item 4). Diagnostic only, in short sessions: the
+// first sustained delivery (30 consecutive frames) and whenever the opt-in J2
+// capture is armed. On a probed delivery, three 4x4 blocks of the DLSS image in
+// the game's own target alternate black/white per frame; at Present the same
+// three texels of the presented image are read back (unhooked copy, own fence)
+// and paired with that delivery by submitted frame. A point "follows" when the
+// presented luma steps with the marker. The verdict is made only from paired
+// frames: confirmed (>= 2 points follow or invert on >= 75% of steps), replaced
+// (no point moves), else unresolved (HUD over the points, frame pairing missing).
+struct DeliveryProbe {
+    std::mutex m;
+    static constexpr float kAt[3][2]{{.30f,.62f},{.70f,.62f},{.50f,.38f}};
+    static constexpr uint32_t kSession=24;
+    uint32_t remaining=0;uint64_t sessions=0;bool auto_done=false;
+    ComPtr<ID3D12DescriptorHeap> gpu,cpu;uint32_t next_desc=0;
+    struct Mark{uint64_t frame=0;uint32_t value=0;bool submitted=false;};
+    std::deque<Mark> marks;
+    struct Slot{ComPtr<ID3D12CommandAllocator> alloc;ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> rb;
+        uint64_t fence=0;uint32_t value=0;uint64_t frame=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;bool busy=false;};
+    Slot slots[6];ComPtr<ID3D12Fence> fence;uint64_t fence_next=1;
+    struct Sample{uint32_t value=0;float luma[3]{};uint64_t frame=0;};
+    std::vector<Sample> seq;
+    uint64_t marked=0,paired=0,unpaired=0,size_mismatch=0;
+    uint32_t follow[3]{},invert[3]{},flat[3]{},steps=0;
+    char verdict[48]="none";
+};
+DeliveryProbe& g_probe=*new DeliveryProbe;
+float probe_luma(const uint8_t* p,DXGI_FORMAT f){
+    const auto half=[](uint16_t h){const uint32_t e=(h>>10)&31,m=h&1023;const float v=e==0?std::ldexp(float(m),-24):std::ldexp(float(m|1024),int(e)-25);return (h&0x8000)?-v:v;};
+    float r=0,g2=0,b=0;
+    switch(f){
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:case DXGI_FORMAT_R16G16B16A16_TYPELESS:{uint16_t t[4];std::memcpy(t,p,8);r=half(t[0]);g2=half(t[1]);b=half(t[2]);break;}
+    case DXGI_FORMAT_R8G8B8A8_UNORM:case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:case DXGI_FORMAT_R8G8B8A8_TYPELESS:r=p[0]/255.f;g2=p[1]/255.f;b=p[2]/255.f;break;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:case DXGI_FORMAT_B8G8R8A8_TYPELESS:b=p[0]/255.f;g2=p[1]/255.f;r=p[2]/255.f;break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:case DXGI_FORMAT_R10G10B10A2_TYPELESS:{uint32_t v;std::memcpy(&v,p,4);r=(v&1023)/1023.f;g2=((v>>10)&1023)/1023.f;b=((v>>20)&1023)/1023.f;break;}
+    default:return -1.f;
+    }
+    return .2126f*r+.7152f*g2+.0722f*b;
+}
+// In the delivery recording, after J2's write-back (dest in UNORDERED_ACCESS).
+// Returns true when a marker was written (the caller restores the game's state).
+bool probe_mark(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_t view_format,uint64_t frame){
+    uint64_t streak=0;{std::lock_guard<std::mutex> nb(g_nb.m);streak=g_nb.streak;} // lock order: g_nb.m before g_probe.m
+    std::lock_guard<std::mutex> lock(g_probe.m);
+    const bool armed=na::capture::j2::Armed();
+    if(!g_probe.remaining){
+        bool start=!g_probe.auto_done&&streak>=30;
+        if(start)g_probe.auto_done=true;
+        if(start||armed){g_probe.remaining=DeliveryProbe::kSession;++g_probe.sessions;g_probe.seq.clear();
+            for(auto& x:g_probe.follow)x=0;for(auto& x:g_probe.invert)x=0;for(auto& x:g_probe.flat)x=0;g_probe.steps=0;}
+    }
+    if(!g_probe.remaining||!dest||!g.device)return false;
+    const auto desc=dest->GetDesc();
+    if(!(desc.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)||!view_format)return false;
+    if(!g_probe.gpu){
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,16,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+        if(FAILED(g.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&g_probe.gpu))))return false;
+        hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        if(FAILED(g.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&g_probe.cpu)))){g_probe.gpu.Reset();return false;}
+    }
+    // A ring of 16 descriptors: a slot is rewritten only 16 marks later (more
+    // than the frames that can be in flight).
+    const UINT inc=g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT at=g_probe.next_desc++%16;
+    D3D12_CPU_DESCRIPTOR_HANDLE gc=g_probe.gpu->GetCPUDescriptorHandleForHeapStart();gc.ptr+=SIZE_T(at)*inc;
+    D3D12_GPU_DESCRIPTOR_HANDLE gg=g_probe.gpu->GetGPUDescriptorHandleForHeapStart();gg.ptr+=UINT64(at)*inc;
+    D3D12_CPU_DESCRIPTOR_HANDLE cc=g_probe.cpu->GetCPUDescriptorHandleForHeapStart();cc.ptr+=SIZE_T(at)*inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u{};u.Format=DXGI_FORMAT(view_format);u.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(dest,nullptr,&u,gc);g.device->CreateUnorderedAccessView(dest,nullptr,&u,cc);
+    const uint32_t value=uint32_t(g_probe.marked&1);
+    const float c[4]{float(value),float(value),float(value),1.f};
+    D3D12_RECT rects[3];
+    for(int i=0;i<3;++i){const LONG x=LONG(DeliveryProbe::kAt[i][0]*float(desc.Width))-2,y=LONG(DeliveryProbe::kAt[i][1]*float(desc.Height))-2;rects[i]={x,y,x+4,y+4};}
+    const na::observe::HostWorkScope own;
+    ID3D12DescriptorHeap* heaps[]{g_probe.gpu.Get()};l->SetDescriptorHeaps(1,heaps);
+    D3D12_RESOURCE_BARRIER uav{};uav.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;uav.UAV.pResource=dest;l->ResourceBarrier(1,&uav);
+    l->ClearUnorderedAccessViewFloat(gg,cc,dest,c,3,rects);
+    l->ResourceBarrier(1,&uav);
+    if(g_probe.marks.size()>=16)g_probe.marks.pop_front();
+    g_probe.marks.push_back({frame,value,false});
+    ++g_probe.marked;--g_probe.remaining;
+    return true;
+}
+void probe_submitted(uint64_t frame,bool ok){
+    std::lock_guard<std::mutex> lock(g_probe.m);
+    for(auto& x:g_probe.marks)if(x.frame==frame){x.submitted=ok;}
+}
+void probe_judge_locked(){
+    auto& p=g_probe;
+    // Steps between consecutive paired presents: luma moves with the marker?
+    for(size_t i=1;i<p.seq.size();++i){
+        const auto& a=p.seq[i-1];const auto& b=p.seq[i];
+        if(a.value==b.value)continue;
+        ++p.steps;const float dm=b.value?1.f:-1.f;
+        for(int k=0;k<3;++k){const float d=b.luma[k]-a.luma[k];
+            if(std::fabs(d)<.02f)++p.flat[k];else if(d*dm>0)++p.follow[k];else ++p.invert[k];}
+    }
+    p.seq.erase(p.seq.begin(),p.seq.end()-(p.seq.empty()?0:1));
+    if(p.steps<6){std::snprintf(p.verdict,sizeof p.verdict,"%s",p.paired?"unresolved_few_pairs":"unresolved_unpaired");return;}
+    uint32_t reach=0,still=0;
+    for(int k=0;k<3;++k){
+        if(p.follow[k]*4>=p.steps*3||p.invert[k]*4>=p.steps*3)++reach;
+        if(p.flat[k]*4>=p.steps*3)++still;
+    }
+    std::snprintf(p.verdict,sizeof p.verdict,"%s",reach>=2?"confirmed_in_presented":still==3?"replaced_before_present":"unresolved_mixed");
+}
+// Collect finished readbacks (never waits on the GPU).
+void probe_collect_locked(){
+    auto& p=g_probe;
+    if(!p.fence)return;
+    const uint64_t done=p.fence->GetCompletedValue();
+    for(auto& s:p.slots){
+        if(!s.busy||s.fence>done)continue;
+        s.busy=false;
+        uint8_t* data=nullptr;D3D12_RANGE r{0,768};
+        if(FAILED(s.rb->Map(0,&r,reinterpret_cast<void**>(&data)))||!data)continue;
+        DeliveryProbe::Sample x;x.value=s.value;x.frame=s.frame;
+        bool ok=true;
+        for(int k=0;k<3;++k){x.luma[k]=probe_luma(data+k*256,s.format);ok&=x.luma[k]>=0;}
+        D3D12_RANGE none{0,0};s.rb->Unmap(0,&none);
+        if(ok){p.seq.push_back(x);++p.paired;}
+    }
+    std::sort(p.seq.begin(),p.seq.end(),[](const auto& a,const auto& b){return a.frame<b.frame;});
+    if(p.seq.size()>=2)probe_judge_locked();
+}
+}
+void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*))
+{
+    try{
+        std::lock_guard<std::mutex> lock(g_probe.m);
+        auto& p=g_probe;
+        probe_collect_locked();
+        if(!queue||!frame||!g.device||p.marks.empty())return;
+        // The submitted mark of this frame or the frame before it (Present ordinal vs record ordinal).
+        auto mark=std::find_if(p.marks.rbegin(),p.marks.rend(),[&](const auto& x){return x.submitted&&(x.frame==g.frame||x.frame+1==g.frame);});
+        if(mark==p.marks.rend()){if(std::any_of(p.marks.begin(),p.marks.end(),[](const auto& x){return x.submitted;}))++p.unpaired;return;}
+        const auto desc=frame->GetDesc();
+        if(!g_trace.learned.ow||desc.Width!=g_trace.learned.ow||desc.Height!=g_trace.learned.oh){++p.size_mismatch;p.marks.clear();return;}
+        if(!p.fence&&FAILED(g.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&p.fence))))return;
+        auto* slot=std::find_if(std::begin(p.slots),std::end(p.slots),[](const auto& s){return !s.busy;});
+        if(slot==std::end(p.slots))return;
+        if(!slot->alloc){
+            if(FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&slot->alloc)))||
+               FAILED(g.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,slot->alloc.Get(),nullptr,IID_PPV_ARGS(&slot->list)))){slot->alloc.Reset();return;}
+            slot->list->Close();
+            D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rd.Width=768;rd.Height=1;rd.DepthOrArraySize=1;rd.MipLevels=1;rd.SampleDesc.Count=1;rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if(FAILED(g.device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&slot->rb)))){slot->alloc.Reset();return;}
+        }
+        if(FAILED(slot->alloc->Reset())||FAILED(slot->list->Reset(slot->alloc.Get(),nullptr)))return;
+        auto* l=slot->list.Get();
+        D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=frame;b.Transition.Subresource=0;
+        b.Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;l->ResourceBarrier(1,&b);
+        for(int k=0;k<3;++k){
+            D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=frame;src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.pResource=slot->rb.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset=UINT64(k)*256;dst.PlacedFootprint.Footprint={desc.Format,1,1,1,256};
+            const UINT x=UINT(DeliveryProbe::kAt[k][0]*float(desc.Width)),y=UINT(DeliveryProbe::kAt[k][1]*float(desc.Height));
+            const D3D12_BOX box{x,y,0,x+1,y+1,1};
+            l->CopyTextureRegion(&dst,0,0,0,&src,&box);
+        }
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);l->ResourceBarrier(1,&b);
+        if(FAILED(l->Close()))return;
+        ID3D12CommandList* one[]{l};
+        if(exec)exec(queue,1,one);else queue->ExecuteCommandLists(1,one);
+        slot->fence=p.fence_next++;queue->Signal(p.fence.Get(),slot->fence);
+        slot->busy=true;slot->value=mark->value;slot->frame=mark->frame;slot->format=desc.Format;
+        p.marks.erase(std::next(mark).base());
+    }catch(...){}
+}
+void RequestDeliveryProbe()
+{
+    std::lock_guard<std::mutex> lock(g_probe.m);
+    auto& p=g_probe;
+    p.auto_done=true; // an explicit session replaces the automatic one
+    p.remaining=DeliveryProbe::kSession;++p.sessions;p.seq.clear();
+    for(auto& x:p.follow)x=0;for(auto& x:p.invert)x=0;for(auto& x:p.flat)x=0;p.steps=0;
+}
+namespace {
+void probe_stats(char* out,size_t n){
+    std::lock_guard<std::mutex> lock(g_probe.m);auto& p=g_probe;
+    // Said explicitly when there is nothing to judge (Sol 6a48746: no verdict from absence).
+    if(!p.paired)std::snprintf(p.verdict,sizeof p.verdict,"%s",p.marked?"unresolved_no_paired_present":"unresolved_no_marked_delivery");
+    std::snprintf(out,n,"sessions=%llu marked=%llu paired=%llu unpaired=%llu size_mismatch=%llu steps=%u follow=%u/%u/%u invert=%u/%u/%u flat=%u/%u/%u verdict=%s",
+        (unsigned long long)p.sessions,(unsigned long long)p.marked,(unsigned long long)p.paired,(unsigned long long)p.unpaired,(unsigned long long)p.size_mismatch,
+        p.steps,p.follow[0],p.follow[1],p.follow[2],p.invert[0],p.invert[1],p.invert[2],p.flat[0],p.flat[1],p.flat[2],p.verdict);
 }
 PhysicalInputProvider g_phys; // under g_up_m
 
@@ -4462,8 +4678,12 @@ public:
                     staged.has_camera=find_camera(one,0,depth,&staged.vp,&staged.reversed,&staged.interlopers);staged.judged=staged.has_camera;
                     staged.injected=g_injected;staged.jitter[0]=g_injected?g.jit.px[0]:0;staged.jitter[1]=g_injected?g.jit.px[1]:0;
                 }else {
-                    if (!saved.native_origin.Ready(g.queue.Get())) {
-                        skip("Waiting for the scene producer to submit before the learned upscale pass.");
+                    // Sol bafa40a: SE5 records scene and upscale lists first, then submits
+                    // scene first. Submission is not required here: the producer's private
+                    // depth snapshot (copied in its own recording) is used, and the order
+                    // (same queue, producer before this list) is confirmed at submission.
+                    if (!saved.native_origin.Ready(g.queue.Get()) && !saved.native_depth_snapshot) {
+                        skip("The scene producer is not submitted yet and has no private depth snapshot.");
                         return false;
                     }
                     staged=saved;
@@ -4518,6 +4738,12 @@ public:
                 if(op)owned->push_back(full_.tex); // Sol 697b223: the private image lives as long as the recording
                 g.slots[slot].native_scale_use=lease;
             }
+            // Delivery probe (diagnostic sessions only): after the write-back into the
+            // game's target, before its own later work; game state restored below.
+            if(ok&&c->input&&!op&&c->target){
+                uint32_t view=0;{std::lock_guard<std::mutex> t(g_trace.m);view=g_trace.learned.out_view;}
+                if(probe_mark(l,c->target.Get(),view,g.frame))touched=true;
+            }
             if(touched&&!na::observe::RestoreListState(l)){g.latched=true;reason("Stopped: native-scale pass could not restore game state.");return false;}
             if(!ok){na::capture::j2::Discard(pending.capture,true);++g.stats.inline_record_failed;
                 g_nb.record_failed.fetch_add(1,std::memory_order_relaxed);
@@ -4536,6 +4762,9 @@ public:
             {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"%s",c->input?"DLSS reconstructs at the game's own upscale step (its render-size input).":"DLSS reconstructs at the game's own upscale pass.");}
             g.slot=(slot+1)%kRing;g.inl.list=l;g.inl.rec=c->recording;g.inl.frame=g.frame;g.inl.slot=slot;
             g.inl.writes=na::observe::ListInsertionDecision(l,color).writes;g.inl.color=color;g.inl.history=pending;g.inl.valid=true;g.inl_frame=g.frame;
+            g.inl.producer={};g.inl.producer_list=nullptr;g.inl.producer_rec=0;
+            if(!local){g.inl.producer=saved.native_origin;g.inl.producer_list=saved.native_list;g.inl.producer_rec=saved.native_recording;}
+            g.inl.dest=c->dest;g.inl.dest_writes=c->dest?na::observe::ListInsertionDecision(l,c->dest).writes:0;
             ++g.stats.inline_recorded;g.inline_mode=true;
             return true;
         }catch(...){na::observe::RestoreListState(l);std::lock_guard<std::mutex> lock(g.m);g.latched=true;reason("Stopped: native-scale recording failed.");}
@@ -4570,6 +4799,7 @@ public:
             ComPtr<ID3D12Resource> image,guide;image.Attach(na::observe::AcquireResource(color));guide.Attach(na::observe::AcquireResource(depth));
             if(!image||!guide)return;*owner={image,guide};
             saved.native_origin=na::nr::native::RetainRecording(l,owner);if(!saved.native_origin)return;
+            saved.native_list=l;
             if (depth_known) snapshot_depth(l,guide.Get(),saved,saved.depth_state,*owner);
             saved.native_serial=++g.next_native_source;
 
@@ -6110,6 +6340,14 @@ NativeBridgeStats GetNativeBridgeStats() {
             e.compute?"cs":"draw",(unsigned long long)e.pso,e.dw,e.dh,e.df,e.inputs,e.iw,e.ih,e.ifmt,e.scene,(unsigned long long)e.n,e.verdict);
         if(k<=0)break;used+=size_t(k);
     }
+    r.delivered=n.delivered;r.first_delivery_frame=n.first_delivery_frame;r.streak=n.streak;r.best_streak=n.best_streak;
+    r.order_refused=n.order_refused;r.later_written=n.later_written;
+    probe_stats(r.probe,sizeof r.probe);
+    used=0;
+    for(uint32_t i=0;i<n.refusal_kinds&&used+120<sizeof r.refusals;++i){
+        const int k=std::snprintf(r.refusals+used,sizeof r.refusals-used,"%s%llu:%s",i?" | ":"",(unsigned long long)n.refusals[i].n,n.refusals[i].why);
+        if(k<=0)break;used+=size_t(k);
+    }
     return r;
 }
 void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present) {
@@ -6709,9 +6947,27 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         // Inline mode: no J2 list is inserted; DLAA is already inside the game's list.
         // Its history is committed when that list is actually submitted.
         bool has = false;
+        UINT consumer_at = 0;
         if (g.inl.valid)
             for (UINT i = 0; i < count && !has; ++i)
-                has = lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec;
+                if ((has = lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec)) consumer_at = i;
+        // Sol bafa40a: a native delivery recorded before its separate scene producer
+        // was submitted is valid only if that producer recording executes first on
+        // this queue: submitted here earlier, or earlier in this same batch.
+        bool producer_order = true;
+        const char* producer_refusal = nullptr;
+        if (has && g.inl.history.native_delivery && g.inl.producer) {
+            producer_order = g.inl.producer.Ready(queue);
+            for (UINT j = 0; j < consumer_at && !producer_order; ++j)
+                producer_order = lists[j] && lists[j] == g.inl.producer_list && na::observe::ListRecording(lists[j]) == g.inl.producer_rec;
+            if (!producer_order) producer_refusal = "The scene producer was not submitted before the upscale list on this queue.";
+        }
+        // Delivery target written again later in the same recording than the delivery.
+        uint32_t later_dest_writes = 0;
+        if (has && g.inl.history.native_delivery && g.inl.dest) {
+            const auto w = na::observe::ListInsertionDecision(lists[consumer_at], g.inl.dest).writes;
+            if (w > g.inl.dest_writes) later_dest_writes = w - g.inl.dest_writes;
+        }
         jitter_batch(lists, count);
         for (UINT i = 0; i < count; ++i)
             if (lists[i] && na::observe::ListReferences(lists[i], selected_depth) &&
@@ -6759,9 +7015,12 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.inl.history.has_interlopers) g.interlopers = g.inl.history.interlopers;
         g.eval_selection_version = g.inl.history.selection_version;
         committed_sources(g.inl.history);
-        if (g.inl.history.native_delivery) ++g.stats.native_deliveries;
+        if (g.inl.history.native_delivery) { native_delivery_submitted(producer_order, producer_refusal, later_dest_writes, g.frame); probe_submitted(g.inl.frame, producer_order); }
+        if (g.inl.history.native_delivery && producer_order) ++g.stats.native_deliveries;
         g.submitted_frame = g.frame;
         if (!g.inl.history.keep_reset) g.resume_reset = false;
+        // A delivery that read an unwritten depth snapshot: its history is not trusted.
+        if (!producer_order) g.resume_reset = true;
         if (g.inl.history.cut) ++g.stats.cuts;
         ++g.stats.frames;
         ++g.stats.inline_frames;

@@ -172,12 +172,23 @@ struct NativeBridgeStats {
     uint64_t st_gated=0,st_full=0,st_examined=0,st_no_input=0,st_ambiguous=0,st_draw_state=0,st_candidates=0,st_recorded=0,st_failed=0,
         st_ungated_full=0,st_budget=0,st_aux=0;
     char steps[720]{};
+    // Sol bafa40a: deliveries confirmed at submission (first frame, current and
+    // best consecutive run), producer-order refusals, deliveries whose target was
+    // written again later in the same list, and every refusal reason with its count.
+    uint64_t delivered=0,first_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
+    char refusals[1300]{};
+    char probe[320]{}; // delivery probe: sessions, pairs, per-point follow/invert/flat, verdict
 };
 NativeBridgeStats GetNativeBridgeStats();
 // Presented-frame trace while the scene is reduced (diagnostic): call at every Present with
 // the presented image; the walk from it back to the scale crossing is logged (native_trace).
 void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present);
 void NativeTraceResult(char* out,size_t n,uint64_t* traces);
+// Delivery probe readback at Present (after NativeTracePresent): reads the marked
+// texels of the presented image (PRESENT state) with `exec` (unhooked; null = direct).
+void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*));
+// Starts one probe session (24 marked deliveries) now, as an armed J2 capture does.
+void RequestDeliveryProbe();
 // P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
 // immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
 // LOGICAL scene colour/depth ids; J2 evaluates the provider's PHYSICAL (reduced) companions and

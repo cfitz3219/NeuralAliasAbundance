@@ -1125,6 +1125,11 @@ void write_status_line()
                 (unsigned long long)b.draw_state,(unsigned long long)b.viewport,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
                 (unsigned long long)native.game_applies,(unsigned long long)native.refusals,(unsigned long long)native.thread_changes,b.reason);
             if(bridge_n>0)WriteFile(f,bridge_line,DWORD((std::min)(bridge_n,int(sizeof bridge_line-1))),&written,nullptr);
+            char delivery_line[1600];
+            const int delivery_n=std::snprintf(delivery_line,sizeof delivery_line,"native_delivery delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu probe{%s} refusals{%s}\r\n",
+                (unsigned long long)b.delivered,(unsigned long long)b.first_delivery_frame,(unsigned long long)b.streak,(unsigned long long)b.best_streak,
+                (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.probe,b.refusals);
+            if(delivery_n>0)WriteFile(f,delivery_line,DWORD((std::min)(delivery_n,int(sizeof delivery_line-1))),&written,nullptr);
             char steps_line[1024];
             const int steps_n=std::snprintf(steps_line,sizeof steps_line,"native_steps gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu steps{%s}\r\n",
                 (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
@@ -2908,6 +2913,7 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
     const bool sdr = cs==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ||
         (cs==DXGI_COLOR_SPACE_CUSTOM && frame_format==DXGI_FORMAT_R8G8B8A8_UNORM);
     na::j2::NativeTracePresent(queue,frame,sdr);
+    na::j2::NativeProbePresent(queue,frame,g_orig_execute);
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
     if (na::capture::Pending()) {
@@ -3176,6 +3182,9 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
                 (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
                 (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
                 (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,(unsigned long long)b.st_aux,b.steps);
+            na::eventlog::Emit("native_delivery","delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu probe{%s} refusals{%s}",
+                (unsigned long long)b.delivered,(unsigned long long)b.first_delivery_frame,(unsigned long long)b.streak,(unsigned long long)b.best_streak,
+                (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.probe,b.refusals);
         }
     }
     na::settings::WatchChanges("code");
