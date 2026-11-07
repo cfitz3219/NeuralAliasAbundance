@@ -27,6 +27,7 @@
 #include "Denoise.h"
 #include "Temporal.h"
 #include "Compose.h"
+#include "ComposeDirect.h"
 #endif
 
 namespace na::xegtao {
@@ -36,16 +37,21 @@ constexpr auto Read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr auto Write=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 // Tables: 0 extract, 1 prefilter, 2 normals, 3 main, 4-6 denoise, 7/10 compose
 // (history parity 0/1), 8/9 temporal (parity 0/1).
-constexpr unsigned Tables=11, Srvs=5, Uavs=5, TableSize=Srvs+Uavs;
-constexpr unsigned kCompose[2]={7,10}, kTemporal[2]={8,9};
+// 11: compose straight from this frame's AO (history off: no Temporal pass).
+constexpr unsigned Tables=12, Srvs=5, Uavs=5, TableSize=Srvs+Uavs;
+constexpr unsigned kCompose[2]={7,10}, kTemporal[2]={8,9}, kComposeDirect=11;
 struct Constants {
     XeGTAO::GTAOConstants gtao{};
     uint32_t color_base[2]{},depth_base[2]{};
     float amount=0,clear=0;uint32_t quality=0,srgb=0;
     uint32_t output_base[2]{},final_apply=1,padding=0;
     float temporal_blend=1,jitter_delta[2]{},depth_tolerance=.06f;
+    // GPU proof that the history read is the one the previous RECORDED frame
+    // wrote AND that it executed before this one (Sol 2026-11-06: discarded,
+    // unrecorded or reordered recordings must not feed history).
+    uint32_t expected_stamp=0,own_stamp=0,stamp_read=0,stamp_write=0;
 };
-static_assert(sizeof(Constants)==160,"HLSL constants layout");
+static_assert(sizeof(Constants)==176,"HLSL constants layout");
 void move(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) {
     if(a==b)return;
     D3D12_RESOURCE_BARRIER x{};x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -83,11 +89,12 @@ bool build_programs(Programs& p) {
         {na_xegtao_Denoise,sizeof(na_xegtao_Denoise)}, {na_xegtao_Denoise,sizeof(na_xegtao_Denoise)},
         {na_xegtao_Denoise,sizeof(na_xegtao_Denoise)}, {na_xegtao_Compose,sizeof(na_xegtao_Compose)},
         {na_xegtao_Temporal,sizeof(na_xegtao_Temporal)}, {na_xegtao_Temporal,sizeof(na_xegtao_Temporal)},
-        {na_xegtao_Compose,sizeof(na_xegtao_Compose)}};
+        {na_xegtao_Compose,sizeof(na_xegtao_Compose)}, {na_xegtao_ComposeDirect,sizeof(na_xegtao_ComposeDirect)}};
     for(unsigned i=0;i<Tables;++i){
         if(i==5||i==6){p.pso[i]=p.pso[4];continue;}
         if(i==9){p.pso[i]=p.pso[8];continue;}
         if(i==10){p.pso[i]=p.pso[7];continue;}
+        // 11 = ComposeDirect: its own shader (reads the uint AO directly).
         D3D12_COMPUTE_PIPELINE_STATE_DESC d{};d.pRootSignature=p.root.Get();d.CS=shaders[i];
         if(FAILED(p.device->CreateComputePipelineState(&d,IID_PPV_ARGS(&p.pso[i])))){
             p.error="XeGTAO pipeline could not be prepared.";return false;
@@ -98,8 +105,12 @@ bool build_programs(Programs& p) {
 }
 struct Scratch {
     na::gpu::Texture raw,pyramid,normals,ao,edges,filtered,color,encoded;
-    na::gpu::Texture history[2],history_depth[2]; // temporal visibility + its view depth (ping-pong)
-    unsigned next=0;bool history_valid=false;float last_jitter[2]{};
+    // Temporal visibility + its view depth (ping-pong) and a 2x1 stamp of the
+    // recording that last wrote each; allocated only once history is used.
+    na::gpu::Texture history[2],history_depth[2],stamp;
+    // Advanced at Record (never Prepare), under the mutex: recordings of one
+    // queue may be recorded on several threads.
+    std::mutex history_m;unsigned next=0;uint32_t last_stamp=0,serial=0;float last_jitter[2]{};
     bool nvrhi=false;
     ComPtr<ID3D12CommandQueue> queue; // absent => this scratch belongs to only one recording
     uint32_t w=0,h=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
@@ -127,8 +138,10 @@ struct Frame::Work {
     ComPtr<ID3D12Resource> copied_depth;
     D3D12_RESOURCE_STATES depth_state=Read;
     bool copy_depth=false;
-    unsigned denoise=1,parity=0;
-    ComPtr<ID3D12Resource> input_motion;ID3D12Resource* bound_motion=nullptr;
+    unsigned denoise=1;
+    bool temporal=false,reset=false;float keep=0,jitter[2]{};
+    ComPtr<ID3D12Resource> input_motion;ID3D12Resource* bound_motion=nullptr;ID3D12Resource* bound_history=nullptr;
+    DXGI_FORMAT motion_format=DXGI_FORMAT_UNKNOWN;
     Constants constants;
     ID3D12Resource* bound_color=nullptr;ID3D12Resource* bound_depth=nullptr;Scratch* bound_scratch=nullptr;
     DXGI_FORMAT bound_color_format=DXGI_FORMAT_UNKNOWN,bound_depth_format=DXGI_FORMAT_UNKNOWN;unsigned bound_denoise=0;
@@ -219,8 +232,6 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
         if(!make(DXGI_FORMAT_R32_FLOAT,1,scratch->raw)||!make(DXGI_FORMAT_R32_FLOAT,5,scratch->pyramid)||
            !make(DXGI_FORMAT_R32_UINT,1,scratch->normals)||!make(DXGI_FORMAT_R8_UINT,1,scratch->ao)||
            !make(DXGI_FORMAT_R8_UNORM,1,scratch->edges)||!make(DXGI_FORMAT_R8_UINT,1,scratch->filtered)||
-           !make(DXGI_FORMAT_R16_FLOAT,1,scratch->history[0])||!make(DXGI_FORMAT_R16_FLOAT,1,scratch->history[1])||
-           !make(DXGI_FORMAT_R32_FLOAT,1,scratch->history_depth[0])||!make(DXGI_FORMAT_R32_FLOAT,1,scratch->history_depth[1])||
            !texture(dev,queue,ow,oh,format,1,scratch->color)){s.reason="XeGTAO working textures could not be allocated.";return {};}
         if(in.srgb){
             auto desc=scratch->color->GetDesc();desc.Format=in.color_format;desc.Flags=D3D12_RESOURCE_FLAG_NONE;
@@ -271,20 +282,33 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
     c.output_base[0]=in.preserve_color_extent?in.color_x:0;c.output_base[1]=in.preserve_color_extent?in.color_y:0;
     // Temporal history: only with motion vectors of this extent, a shared
     // (GPU-ordered) scratch and a history that belongs to the same scene.
-    const bool motion_ok=in.motion&&covered(in.motion,0,0,in.width,in.height);
+    // The motion texture's actual format is viewed as itself (two float
+    // channels only); anything else disables history instead of misreading.
+    DXGI_FORMAT motion_format=DXGI_FORMAT_UNKNOWN;
+    if(in.motion&&covered(in.motion,0,0,in.width,in.height))switch(in.motion->GetDesc().Format){
+        case DXGI_FORMAT_R32G32_FLOAT:case DXGI_FORMAT_R32G32_TYPELESS:motion_format=DXGI_FORMAT_R32G32_FLOAT;break;
+        case DXGI_FORMAT_R16G16_FLOAT:case DXGI_FORMAT_R16G16_TYPELESS:motion_format=DXGI_FORMAT_R16G16_FLOAT;break;
+        default:break;
+    }
     const float keep=std::isfinite(options.temporal)?std::clamp(options.temporal,0.f,.95f):0.f;
-    const bool use_history=shared&&motion_ok&&keep>0&&scratch->history_valid&&!in.reset;
-    c.temporal_blend=use_history?1.f-keep:1.f;
-    c.jitter_delta[0]=use_history?scratch->last_jitter[0]-in.jitter_x:0.f;c.jitter_delta[1]=use_history?scratch->last_jitter[1]-in.jitter_y:0.f;
-    w.parity=scratch->next;scratch->next^=1u;
-    scratch->last_jitter[0]=in.jitter_x;scratch->last_jitter[1]=in.jitter_y;scratch->history_valid=shared;
-    w.input_motion=motion_ok?in.motion:nullptr;
+    w.temporal=shared&&motion_format!=DXGI_FORMAT_UNKNOWN&&keep>0;w.keep=keep;w.reset=in.reset;
+    w.jitter[0]=in.jitter_x;w.jitter[1]=in.jitter_y;
+    w.input_motion=w.temporal?in.motion:nullptr;w.motion_format=w.temporal?motion_format:DXGI_FORMAT_UNKNOWN;
+    if(w.temporal&&!scratch->history[0]){
+        const auto make=[&](DXGI_FORMAT f,uint32_t tw,uint32_t th,na::gpu::Texture& r){return texture(dev,queue,tw,th,f,1,r);};
+        if(!make(DXGI_FORMAT_R16_FLOAT,in.width,in.height,scratch->history[0])||!make(DXGI_FORMAT_R16_FLOAT,in.width,in.height,scratch->history[1])||
+           !make(DXGI_FORMAT_R32_FLOAT,in.width,in.height,scratch->history_depth[0])||!make(DXGI_FORMAT_R32_FLOAT,in.width,in.height,scratch->history_depth[1])||
+           !make(DXGI_FORMAT_R32_UINT,2,1,scratch->stamp)){
+            for(auto* t:{&scratch->history[0],&scratch->history[1],&scratch->history_depth[0],&scratch->history_depth[1],&scratch->stamp})t->Reset();
+            w.temporal=false;w.input_motion=nullptr; // this frame without history; nothing else changes
+        }
+    }
     // Immutable binding-set cache (NVRHI pattern). This packet is exclusively
     // reusable only after its existing recording/fence owners release it.
     auto* depth_input=in.copy_depth?w.copied_depth.Get():in.depth;
     if(w.bound_color!=in.color||w.bound_depth!=depth_input||w.bound_scratch!=scratch.get()||
        w.bound_color_format!=in.color_format||w.bound_depth_format!=in.depth_format||w.bound_denoise!=w.denoise||
-       w.bound_motion!=w.input_motion.Get()){
+       w.bound_motion!=w.input_motion.Get()||w.bound_history!=scratch->history[0].Get()){
     for(unsigned t=0;t<Tables;++t){for(unsigned i=0;i<Srvs;++i)w.srv(t,i,nullptr,DXGI_FORMAT_R32_FLOAT);
         for(unsigned i=0;i<Uavs;++i)w.uav(t,i,nullptr,DXGI_FORMAT_R32_FLOAT);}
     w.srv(0,0,in.copy_depth?w.copied_depth.Get():in.depth,in.depth_format);w.uav(0,0,scratch->raw.Get(),DXGI_FORMAT_R32_FLOAT);
@@ -304,13 +328,16 @@ std::shared_ptr<Frame> Pass::Prepare(ID3D12Device* dev,ID3D12CommandQueue* queue
         const unsigned t=kTemporal[k];
         w.srv(t,0,final_ao,DXGI_FORMAT_R8_UINT);w.srv(t,1,scratch->history[k^1].Get(),DXGI_FORMAT_R16_FLOAT);
         w.srv(t,2,scratch->history_depth[k^1].Get(),DXGI_FORMAT_R32_FLOAT);w.srv(t,3,scratch->pyramid.Get(),DXGI_FORMAT_R32_FLOAT,1);
-        w.srv(t,4,w.input_motion.Get(),DXGI_FORMAT_R32G32_FLOAT);
+        w.srv(t,4,w.input_motion.Get(),w.input_motion?w.motion_format:DXGI_FORMAT_R32G32_FLOAT);
         w.uav(t,0,scratch->history[k].Get(),DXGI_FORMAT_R16_FLOAT);w.uav(t,1,scratch->history_depth[k].Get(),DXGI_FORMAT_R32_FLOAT);
+        w.uav(t,2,scratch->stamp.Get(),DXGI_FORMAT_R32_UINT);
         const unsigned o=kCompose[k];
         w.srv(o,0,in.color,in.color_format);w.srv(o,1,scratch->history[k].Get(),DXGI_FORMAT_R16_FLOAT);
         w.srv(o,2,scratch->raw.Get(),DXGI_FORMAT_R32_FLOAT);w.uav(o,0,scratch->color.Get(),format);
     }
-    w.bound_motion=w.input_motion.Get();
+    w.srv(kComposeDirect,0,in.color,in.color_format);w.srv(kComposeDirect,1,final_ao,DXGI_FORMAT_R8_UINT);
+    w.srv(kComposeDirect,2,scratch->raw.Get(),DXGI_FORMAT_R32_FLOAT);w.uav(kComposeDirect,0,scratch->color.Get(),format);
+    w.bound_motion=w.input_motion.Get();w.bound_history=scratch->history[0].Get();
     w.bound_color=in.color;w.bound_depth=depth_input;w.bound_scratch=scratch.get();
     w.bound_color_format=in.color_format;w.bound_depth_format=in.depth_format;w.bound_denoise=w.denoise;++s.bindings;
     }
@@ -343,11 +370,31 @@ bool Frame::Record(ID3D12GraphicsCommandList* l) {
         l->SetComputeRoot32BitConstant(0,i+1==w.denoise?1u:0u,34);
         move(l,destination,Read,Write);dispatch(4+i,(s.w+15)/16,gy);move(l,destination,Write,Read);
     }
-    {   // Temporal visibility (an exact copy of this frame's AO when no history applies).
-        auto* h=s.history[w.parity].Get();auto* hd=s.history_depth[w.parity].Get();
-        move(l,h,Read,Write);move(l,hd,Read,Write);dispatch(kTemporal[w.parity],gx,gy);move(l,h,Write,Read);move(l,hd,Write,Read);
+    if(w.temporal){
+        // History bookkeeping happens HERE, for a frame that is actually being
+        // recorded. Whether the previous recording executed (and before this
+        // one) is decided on the GPU by its stamp, so a discarded or reordered
+        // list resets the history instead of feeding stale or unwritten data.
+        unsigned parity;
+        {   std::lock_guard<std::mutex> lock(s.history_m);
+            auto& c=w.constants;parity=s.next;s.next^=1u;
+            const uint32_t own=++s.serial?s.serial:++s.serial; // 0 = never written
+            c.expected_stamp=w.reset?0u:s.last_stamp;c.own_stamp=own;c.stamp_read=parity^1u;c.stamp_write=parity;
+            c.temporal_blend=w.reset||!s.last_stamp?1.f:1.f-w.keep;
+            c.jitter_delta[0]=s.last_jitter[0]-w.jitter[0];c.jitter_delta[1]=s.last_jitter[1]-w.jitter[1];
+            s.last_stamp=own;s.last_jitter[0]=w.jitter[0];s.last_jitter[1]=w.jitter[1];
+        }
+        l->SetComputeRoot32BitConstants(0,sizeof(Constants)/4,&w.constants,0);
+        auto* h=s.history[parity].Get();auto* hd=s.history_depth[parity].Get();
+        move(l,h,Read,Write);move(l,hd,Read,Write);move(l,s.stamp.Get(),Read,Write);dispatch(kTemporal[parity],gx,gy);
+        move(l,h,Write,Read);move(l,hd,Write,Read);move(l,s.stamp.Get(),Write,Read);
+        move(l,s.color.Get(),Read,Write);dispatch(kCompose[parity],gx,gy);move(l,s.color.Get(),Write,Read);
+    }else{
+        // A frame without history breaks the chain: a later frame must not
+        // pick up the history of a frame from before this one.
+        if(s.stamp){std::lock_guard<std::mutex> lock(s.history_m);s.last_stamp=0;}
+        move(l,s.color.Get(),Read,Write);dispatch(kComposeDirect,gx,gy);move(l,s.color.Get(),Write,Read);
     }
-    move(l,s.color.Get(),Read,Write);dispatch(kCompose[w.parity],gx,gy);move(l,s.color.Get(),Write,Read);
     if(s.encoded){
         move(l,s.color.Get(),Read,D3D12_RESOURCE_STATE_COPY_SOURCE);move(l,s.encoded.Get(),Read,D3D12_RESOURCE_STATE_COPY_DEST);
         l->CopyResource(s.encoded.Get(),s.color.Get());

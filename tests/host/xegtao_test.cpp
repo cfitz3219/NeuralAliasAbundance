@@ -9,7 +9,9 @@
 #if defined(NA_HAVE_NGX_SDK)
 #include "fake_ngx_params.hpp"
 #endif
+#include <algorithm>
 #include <array>
+#include <memory>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -243,6 +245,53 @@ int main() {
         const double without=flicker(0.f),with=flicker(.85f);
         std::printf("XeGTAO edge flicker (mean change, HDR 4): without history %.5f, with %.5f\n",without,with);
         CHECK(without>.002);CHECK(with<without*.5);
+    }
+    // Sol 2026-11-06: only a recording that actually executed, and executed
+    // BEFORE the next one, may feed history. Prepare-without-Record changes
+    // nothing; a discarded or reordered recording resets to this frame's AO.
+    {
+        constexpr unsigned TW=96,TH=64;
+        struct Pending{test::List l;Image color,depth,motion;Readback rb;bool ok=false;};
+        const auto scene=[&](na::xegtao::Pass& pass,const na::xegtao::Options& op,unsigned shift,bool record)->std::unique_ptr<Pending>{
+            auto r=std::make_unique<Pending>();if(!r->l.Create(d.device.Get()))return r;
+            std::vector<float> c(size_t(TW)*TH*4,4.f),z(size_t(TW)*TH),mv(size_t(TW)*TH*2,0.f);
+            for(unsigned y=0;y<TH;++y)for(unsigned x=0;x<TW;++x){
+                const bool inside=x>30+shift&&x<53+shift&&y>20&&y<45;z[size_t(y)*TW+x]=1-.1f/(inside?1.8f:2.f);}
+            r->color=input(d,r->l,TW,TH,DXGI_FORMAT_R32G32B32A32_FLOAT,c,4);r->depth=input(d,r->l,TW,TH,DXGI_FORMAT_R32_FLOAT,z,1);
+            r->motion=input(d,r->l,TW,TH,DXGI_FORMAT_R32G32_FLOAT,mv,2);
+            na::xegtao::Inputs in;in.color=r->color.texture.Get();in.depth=r->depth.texture.Get();in.width=TW;in.height=TH;
+            in.color_format=DXGI_FORMAT_R32G32B32A32_FLOAT;in.projection=projection(false);in.clear_depth=1;in.motion=r->motion.texture.Get();
+            auto f=pass.Prepare(d.device.Get(),d.queue.Get(),in,op);
+            if(!f&&pass.WaitPrepared(30000))f=pass.Prepare(d.device.Get(),d.queue.Get(),in,op);
+            if(!f)return r;
+            if(!record){r->ok=true;return r;}
+            if(!f->Record(r->l.list.Get()))return r;
+            r->rb=capture(d,r->l,f->Color());r->ok=SUCCEEDED(r->l.list->Close());return r;
+        };
+        const auto execute=[&](Pending& p){ID3D12CommandList* lists[]={p.l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();return pixels(p.rb);};
+        const auto difference=[](const std::vector<float>& a,const std::vector<float>& b){
+            float m=0;if(a.size()!=b.size()||a.empty())return 1e9f;for(size_t i=0;i<a.size();i+=4)m=std::max(m,std::abs(a[i]-b[i]));return m;};
+        auto keep=options;keep.temporal=.85f;auto off=options;off.temporal=0;
+        na::xegtao::Pass reference;
+        auto r1=scene(reference,off,1,true);REQUIRE(r1->ok);const auto plain=execute(*r1);
+        na::xegtao::Pass history;
+        // Chained: an executed frame feeds the next (so the checks below are not vacuous).
+        {auto a=scene(history,keep,0,true);REQUIRE(a->ok);execute(*a);
+         auto b=scene(history,keep,1,true);REQUIRE(b->ok);const auto out=execute(*b);
+         std::printf("XeGTAO history chained vs plain: %.5f\n",difference(out,plain));CHECK(difference(out,plain)>.01f);}
+        // Prepare without Record changes nothing: the next frame still has its history.
+        {auto a=scene(history,keep,0,true);REQUIRE(a->ok);execute(*a);
+         auto unused=scene(history,keep,1,false);REQUIRE(unused->ok);unused.reset();
+         auto b=scene(history,keep,1,true);REQUIRE(b->ok);CHECK(difference(execute(*b),plain)>.01f);}
+        // Discarded: a recorded list that never executes must not feed the next frame.
+        {auto a=scene(history,keep,0,true);REQUIRE(a->ok);a.reset();
+         auto b=scene(history,keep,1,true);REQUIRE(b->ok);const auto out=execute(*b);
+         std::printf("XeGTAO history after a discarded recording vs plain: %.5f\n",difference(out,plain));CHECK(difference(out,plain)<.01f);}
+        // Reordered: the later recording executes first and must not read the earlier one's history.
+        {auto a=scene(history,keep,0,true);REQUIRE(a->ok);auto b=scene(history,keep,1,true);REQUIRE(b->ok);
+         const auto out=execute(*b);execute(*a);
+         std::printf("XeGTAO history executed out of order vs plain: %.5f\n",difference(out,plain));CHECK(difference(out,plain)<.01f);}
+        CHECK(d.device->GetDeviceRemovedReason()==S_OK);
     }
     CHECK(pass.GetStats().recorded==3);
     options.amount=0;CHECK(!pass.Prepare(d.device.Get(),d.queue.Get(),{},options));

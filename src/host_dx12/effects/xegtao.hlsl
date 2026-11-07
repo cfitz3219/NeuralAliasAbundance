@@ -12,6 +12,7 @@ cbuffer Constants:register(b0) {
     float amount; float clearDepth; uint quality; uint srgb;
     uint2 outputBase; uint finalApply; uint padding;
     float temporalBlend; float2 jitterDelta; float depthTolerance;
+    uint expectedStamp; uint ownStamp; uint stampRead; uint stampWrite;
 };
 #include "XeGTAO.hlsli"
 SamplerState pointClamp:register(s0);
@@ -70,14 +71,20 @@ Texture2D<uint> ao:register(t0); Texture2D<float> history:register(t1);
 Texture2D<float> historyDepth:register(t2); Texture2D<float> viewDepth:register(t3);
 Texture2D<float2> motion:register(t4);
 RWTexture2D<float> visibilityOut:register(u0); RWTexture2D<float> depthOut:register(u1);
+RWTexture2D<uint> stamps:register(u2); // which recording wrote each history (0 = none)
 [numthreads(8,8,1)] void Temporal(uint2 p:SV_DispatchThreadID) {
     if(any(p>=uint2(c.ViewportSize)))return;
     const int2 size=int2(c.ViewportSize);
+    // History only when the frame recorded before this one actually ran
+    // before it (its stamp is there); every thread reads before any write
+    // of the OTHER slot, so the check is race-free.
+    const bool chained=expectedStamp!=0&&stamps[uint2(stampRead,0)]==expectedStamp;
+    if(all(p==0))stamps[uint2(stampWrite,0)]=ownStamp;
     float current=float(ao[p])/255.0;
     float z=viewDepth.Load(int3(p,0));
     depthOut[p]=z;
     float result=current;
-    if(temporalBlend<1.0) {
+    if(chained&&temporalBlend<1.0) {
         // Texel-centre space of the previous frame: its sample at t+0.5-jp
         // equals this pixel's p+0.5-jc+mv.
         float2 q=float2(p)+motion.Load(int3(p,0))+jitterDelta;
@@ -107,6 +114,24 @@ RWTexture2D<float> visibilityOut:register(u0); RWTexture2D<float> depthOut:regis
         }
     }
     visibilityOut[p]=result;
+}
+#elif defined(PASS_COMPOSEDIRECT)
+// History off: this frame's AO straight into the colour (no Temporal pass).
+Texture2D<float4> image:register(t0); Texture2D<uint> ao:register(t1);
+Texture2D<float> rawDepth:register(t2); RWTexture2D<float4> outputColor:register(u0);
+float3 LinearToSrgb(float3 v) {
+    return float3(v.x<=.0031308?12.92*v.x:1.055*pow(max(v.x,0),1/2.4)-.055,
+                  v.y<=.0031308?12.92*v.y:1.055*pow(max(v.y,0),1/2.4)-.055,
+                  v.z<=.0031308?12.92*v.z:1.055*pow(max(v.z,0),1/2.4)-.055);
+}
+[numthreads(8,8,1)] void ComposeDirect(uint2 p:SV_DispatchThreadID) {
+    if(any(p>=uint2(c.ViewportSize)))return;
+    float4 color=image.Load(int3(p+colorBase,0));
+    float visibility=saturate(float(ao[p])/255.0);
+    float weight=abs(rawDepth[p]-clearDepth)<1e-7?0:amount;
+    color.rgb*=lerp(1.0,visibility,weight);
+    if(srgb!=0)color.rgb=LinearToSrgb(color.rgb);
+    outputColor[p+outputBase]=color;
 }
 #elif defined(PASS_COMPOSE)
 Texture2D<float4> image:register(t0); Texture2D<float> visibilityIn:register(t1);
