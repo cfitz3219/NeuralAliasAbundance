@@ -3176,6 +3176,8 @@ struct On<sl::list::Reset> {
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
                     ls->cur_nrt = 0;
+                    ls->native_colors.clear();
+                    ls->native_depth.reset();
                     ls->restorable = true;
                     ls->active_queries=0;
                     ls->in_render_pass = false;
@@ -3896,6 +3898,8 @@ struct On<sl::list::ExecuteIndirect> {
     }
 };
 
+std::atomic<TextureTraceListener> g_texture_trace_listener{nullptr};
+
 // ID3D12GraphicsCommandList4 render passes (Kind::CommandList4). BeginRenderPass binds
 // the attachments (and may clear them); EndRenderPass leaves bindings UNDEFINED
 // (Microsoft's contract), so current bindings are cleared, history kept. Host
@@ -3908,16 +3912,23 @@ struct On<sl::list::BeginRenderPass> {
         Rec r;
         if (!begin_op(l, &r)) return;
         na_view_ref refs[9];
+        std::shared_ptr<const DescriptorDetails> color_views[8];
+        std::shared_ptr<const DescriptorDetails> depth_view;
+        const bool snapshot=g_operation_snapshots.load(std::memory_order_relaxed);
         uint32_t m = 0;
         {
             std::shared_lock<RegistryLock> lock(g_m);
             for (UINT i = 0; rts && i < n && i < 8; ++i) {
                 uint32_t slot = 0;
-                refs[m++] = view_ref_locked(heap_for_cpu_locked(rts[i].cpuDescriptor.ptr, &slot), slot);
+                auto* heap=heap_for_cpu_locked(rts[i].cpuDescriptor.ptr,&slot);
+                refs[m++]=view_ref_locked(heap,slot);
+                if(snapshot&&heap){const SlotShared stripe(heap,slot);color_views[i]=heap->info[slot].details;}
             }
             if (ds) {
                 uint32_t slot = 0;
-                refs[m++] = view_ref_locked(heap_for_cpu_locked(ds->cpuDescriptor.ptr, &slot), slot);
+                auto* heap=heap_for_cpu_locked(ds->cpuDescriptor.ptr,&slot);
+                refs[m++]=view_ref_locked(heap,slot);
+                if(snapshot&&heap){const SlotShared stripe(heap,slot);depth_view=heap->info[slot].details;}
             }
         }
         const uint32_t nrt = ds ? (m ? m - 1 : 0) : m;
@@ -3930,6 +3941,18 @@ struct On<sl::list::BeginRenderPass> {
             if (!begin_op(l, &rc)) break;
             const FLOAT* c = rts[i].BeginningAccess.Clear.ClearValue.Color;
             emit_op(rc, NA_OP_CLEAR_RTV, {float_bits(c[0], c[1]), float_bits(c[2], c[3])}, &refs[i], sizeof(refs[i]), sizeof(refs[i]), 0, NA_GROUP_RESOURCE_USE);
+        }
+        if (const auto trace=g_texture_trace_listener.load(std::memory_order_relaxed)) {
+            const HostWorkScope own;
+            for (uint32_t i=0;i<nrt;++i) {
+                if (rts[i].BeginningAccess.Type!=D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR &&
+                    rts[i].BeginningAccess.Type!=D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD) continue;
+                TextureCall call;
+                call.kind=TextureKind::ClearColor;
+                call.target=rts[i].cpuDescriptor;
+                call.target_id=refs[i].resource;
+                trace(l,call); // both modes discard the previous contents
+            }
         }
         const bool depth_clear = ds && ds->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
         if (depth_clear) {
@@ -3944,7 +3967,9 @@ struct On<sl::list::BeginRenderPass> {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             set_targets_locked(ls, refs, m, ds != nullptr);
             ls.in_render_pass = true;
-            ls.raster_targets_known = false; // render-pass targets need their own snapshot before Layer2 work
+            ls.raster_targets_known = false; // in-pass snapshots are observation only
+            ls.native_colors.assign(color_views,color_views+nrt);
+            ls.native_depth=std::move(depth_view);
             for (uint32_t i = 0; i < nrt; ++i) {
                 if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
                 ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::ClearWrite});
@@ -3967,6 +3992,9 @@ struct On<sl::list::EndRenderPass> {
             ls.in_render_pass = false;
             ls.cur_rt = ls.cur_ds = 0; // attachments are not bound after the pass
             ls.cur_nrt = 0;
+            ls.native_colors.clear();
+            ls.native_depth.reset();
+            ls.raster_targets_known = false;
             for (auto& t : ls.cur_rts) t = 0;
             ls.cur_ds_sub = NA_UNKNOWN_U32;
         });
@@ -4336,6 +4364,7 @@ struct TextureHooks { std::shared_ptr<TextureOperationHook> lane[2]; };
 auto& g_texture_hooks = *new std::shared_ptr<const TextureHooks>();
 std::mutex g_texture_hooks_m;
 std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
+
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
     BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
@@ -5173,7 +5202,8 @@ struct ListHook<Slot, R(A...)> {
                 }
                 if (!t_host_work && scope.outermost && !scope.ambiguous) {
                     const auto hooks = std::atomic_load_explicit(&g_texture_hooks, std::memory_order_acquire);
-                    if (hooks && (hooks->lane[0] || hooks->lane[1])) {
+                    const auto trace = g_texture_trace_listener.load(std::memory_order_relaxed);
+                    if (trace || (hooks && (hooks->lane[0] || hooks->lane[1]))) {
                         TextureCall call;
                         const auto args = std::forward_as_tuple(a...);
                         if constexpr (Slot == sl::list::ClearRenderTargetView) {
@@ -5203,7 +5233,7 @@ struct ListHook<Slot, R(A...)> {
                         bool replaced = false;
                         for (unsigned i = 0; i < 2; ++i) {
                             entered = i + 1;
-                            if (!hooks->lane[i]) continue;
+                            if (!hooks || !hooks->lane[i]) continue;
                             { HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
                             if (saved[i].action == ShaderAction::Replaced) { replaced = true; break; }
                         }
@@ -5212,8 +5242,9 @@ struct ListHook<Slot, R(A...)> {
                             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource)
                                 after_texture_copy(l, call.destination);
                             On<Slot>::run(l, a...);
+                            if (trace) { const HostWorkScope own; trace(l, call); }
                         }
-                        for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
+                        for (unsigned i = entered; i > 0; --i) if (hooks && hooks->lane[i - 1]) {
                             HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
                         }
                         return;
@@ -6838,6 +6869,17 @@ bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
     std::memcpy(out.rects, ls->raster_scissors, out.count * sizeof(D3D12_RECT));
     return true;
 }
+na_object_id ListPipelineId(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* state = list ? list_state_locked(list, &id) : nullptr;
+    if (!state) return 0;
+    std::lock_guard<std::mutex> bindings(state->bind_m);
+    const auto pipeline = g_objs.find(canon(state->pso));
+    return pipeline == g_objs.end() ? 0 : pipeline->second.id;
+}
+
 bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
 {
     DrawInfo r;
@@ -6964,6 +7006,7 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
         g_shader_hooks_enabled.store(enabled, std::memory_order_release);
     } // old callbacks/resources can be destroyed outside the registration lock
 }
+void SetTextureTraceListener(TextureTraceListener listener) { g_texture_trace_listener.store(listener, std::memory_order_release); }
 void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {
@@ -7817,7 +7860,7 @@ bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const u
         for(UINT i=0;i<ls->raster_scissor_count;++i)OperationKey::add(key.state,ls->raster_scissors[i]);}
     out.key=key.finish(rebase);return true;
 }
-bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOperation& out,const char** reason)
+bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOperation& out,const char** reason,bool read_only)
 {
     out = {};
     if(reason)*reason=nullptr;
@@ -7828,7 +7871,7 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
         auto* ls = list ? list_state_locked(list, &next.list) : nullptr;
         if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load() || !ls->generation_known.load()) return fail("Scene recording metadata is incomplete.");
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (!ls->restorable || ls->in_render_pass) return fail("Scene state cannot be restored here (including an active render pass).");
+        if (!ls->restorable || (ls->in_render_pass && !read_only)) return fail("Scene state cannot be restored here (including an active render pass).");
         next.recording = ls->generation.load() + 1; // same public identity as ListRecording
         auto rs = g_objs.find(canon(ls->root_sig[compute]));
         if (rs == g_objs.end() || !ls->pso || rs->second.root_params.size() > 64) return fail("Scene root signature or pipeline bindings are unavailable.");
@@ -7868,7 +7911,8 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
             }
         }
         if (!compute) {
-            if (!ls->raster_tracking || !ls->raster_targets_known || !ls->raster_viewports_known || !ls->raster_scissors_known) return fail("Scene targets, viewport or clipping metadata is incomplete.");
+            if (!ls->raster_tracking || (!ls->raster_targets_known && !(read_only&&ls->in_render_pass)) ||
+                !ls->raster_viewports_known || !ls->raster_scissors_known) return fail("Scene targets, viewport or clipping metadata is incomplete.");
             for (const auto& c : ls->native_colors) {
                 if (!c) return fail("A scene render target lacks its typed creation data.");
                 OperationDescriptor d; d.view = *c; next.colors.push_back(std::move(d));

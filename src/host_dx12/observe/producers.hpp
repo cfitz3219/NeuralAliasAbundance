@@ -233,6 +233,7 @@ struct DrawInfo {
     int32_t scissors[16][4]{};  // left, top, right, bottom
 };
 bool ListDrawState(ID3D12CommandList* list, DrawInfo& out);
+na_object_id ListPipelineId(ID3D12CommandList* list);
 // Identity of the list's current recording (changes on every Reset); 0 if unknown.
 uint64_t ListRecording(ID3D12CommandList* list);
 // True when this recording cleared `target` with ClearRenderTargetView.

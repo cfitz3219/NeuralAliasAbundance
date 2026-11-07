@@ -2903,8 +2903,11 @@ void render_with_fault_receipt(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bo
 void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
 {
     if (!frame) return;
-    na::j2::NativeTracePresent(frame); // diagnostic: presented-frame trace while the scene is reduced
     DXGI_COLOR_SPACE_TYPE cs = static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire));
+    const auto frame_format = frame->GetDesc().Format;
+    const bool sdr = cs==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ||
+        (cs==DXGI_COLOR_SPACE_CUSTOM && frame_format==DXGI_FORMAT_R8G8B8A8_UNORM);
+    na::j2::NativeTracePresent(queue,frame,sdr);
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
     if (na::capture::Pending()) {
@@ -3140,8 +3143,12 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
     na::j2::OnPresent(queue);
     if(na::scale::native::Available()){
         const auto scene=na::j2::GetStats();
+        const auto before=na::scale::native::GetStats();
+        static uint64_t previous_deliveries=0;
+        const bool delivered=scene.native_deliveries>previous_deliveries;
+        previous_deliveries=scene.native_deliveries;
         na::scale::native::Observe(!na::j2::Paused()&&na::settings::EffectsReady(),scene.render_w?scene.render_w:scene.width,
-            scene.render_h?scene.render_h:scene.height,scene.out_w,scene.out_h,scene.frames,scene.active);
+            scene.render_h?scene.render_h:scene.height,scene.out_w,scene.out_h,scene.frames,scene.active&&(!before.mode||delivered));
         const auto native=na::scale::native::GetStats();
         na::j2::SetNativeRenderExtent(native.controlled?native.render_w:0,native.controlled?native.render_h:0,native.out_w,native.out_h);
         // Audit 2026-11-06: only on a change, and never 0 for DLAA. Setting it
