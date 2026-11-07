@@ -962,8 +962,10 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                 CHECK(late_deliveries>=2);
 
             }else if(false){ // the delivery probe is a fallback only now (no automatic delivery session)
-            }else if(native_se5&&!native_latebind){ // latebind: the armed probe may confirm the inline deliveries
-                CHECK(std::strstr(nbs.probe,"verdict=confirmed")==nullptr);
+            }else if(native_se5){
+                // The fixture arms the delivery probe (RequestDeliveryProbe); a confirmed verdict is a
+                // valid outcome, an unresolved one too (the probe is not a delivery condition).
+                CHECK(std::strstr(nbs.probe,"verdict=")!=nullptr);
             }
             if(native_overwrite){
                 // No false confirmation: nothing learned, nothing evaluated or delivered.

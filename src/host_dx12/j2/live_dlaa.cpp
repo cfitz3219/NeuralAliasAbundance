@@ -67,6 +67,11 @@ namespace na::j2 {
 namespace {
 
 constexpr uint32_t kRing = 6;            // frames in flight before a slot is reused (never waited on)
+// Astra audit item 3: the game's original depth (SE5: format 19 read through view 21) and
+// its R32_FLOAT snapshot are the same single-sample 32-bit plane-0 representation after the
+// existing conversion. Switching between them must not rebuild the temporal working textures
+// (and reset history); only genuinely different depth formats key the working set.
+inline DXGI_FORMAT depth_working_key(DXGI_FORMAT f) { return na::depth::PlaneZeroCopiesToR32F(f) ? DXGI_FORMAT_R32_FLOAT : f; }
 // Quality stability gate: consecutive deliverable frames required before DLSS is written.
 // 0 (Cort: no fail-safes, every frame): DLSS is written whenever the route can; the gate then
 // only counts misses (gate{drops}) so a drop-out is visible in the log.
@@ -146,6 +151,7 @@ struct DeferredNativeScale {
     // writes those descriptors after recording). input/output are filled then.
     std::shared_ptr<na::observe::NativeOperation> op;
     bool late = false;
+    bool aux_counted = false; // the auxiliary input was already counted at record time
 };
 
 struct State {
@@ -229,6 +235,11 @@ struct State {
     SceneInput waiting_scene;
     SceneInput native_scene;
     DeferredNativeScale native_deferred;
+    // Astra audit (docs/SE5-FABLE-STABILITY-REVIEW-20261107.md, item 1): the recent scene
+    // producers, retained until consumed or retired, so a consumer picks the compatible one by
+    // actual GPU order instead of the single newest Close (SE5 closes three scene lists per
+    // frame; a later unrelated Close must not discard the right producer). Bounded.
+    std::deque<SceneInput> native_producers;
     // Quality stability gate (Cort, p34296: deliveries on alternating frames flicker worse than
     // none). A frame where the learned step was seen counts as an attempt; a frame where the
     // route passed every check before recording counts as ok. DLSS is written only once ok
@@ -410,6 +421,7 @@ struct NativeBridgeCounters {
         // had descriptors rewritten after recording (changed) or not (same), and how many
         // resolved to the learned images and went to the list-boundary DLSS.
         st_late_staged{0},st_late_changed{0},st_late_same{0},st_late_resolved{0},st_late_inline{0},
+        st_late_no_producer{0},st_late_no_state{0}, // inline not taken: no established producer / input state unknown at record time
         // Depth snapshots at scene-list Close: closes seen, depth state unknown (no snapshot),
         // unsupported depth format, no free slot, taken.
         snap_closes{0},snap_depth_unknown{0},snap_format{0},snap_no_slot{0},snap_taken{0};
@@ -3643,7 +3655,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const bool resize = !g.output || !g.color_in || g.w != w || g.h != h || g.color_format != cf ||
                         g.rw != rw || g.rh != rh || g.ow != ow || g.oh != oh ||
                         g.samples != cd.SampleDesc.Count || g.sample_quality != cd.SampleDesc.Quality ||
-                        g.depth_samples != dd.SampleDesc.Count || g.depth_quality != dd.SampleDesc.Quality || g.depth_format != dd.Format;
+                        g.depth_samples != dd.SampleDesc.Count || g.depth_quality != dd.SampleDesc.Quality ||
+                        depth_working_key(g.depth_format) != depth_working_key(dd.Format);
     if (resize) {
         for(const auto& old:g.slots)if(old.native_scale_use&&!old.native_scale_use.Completed()) {
             ++g.stats.busy;reason("Waiting for the previous native scene size to finish.");return false;
@@ -4673,6 +4686,32 @@ void on_entry(ID3D12GraphicsCommandList* l,const na::j2::InsertionEvent& entry) 
     on_table_bind_impl(l,&entry.resource,1,compute,&entry);
 }
 
+// Astra audit (SE5-FABLE-STABILITY-REVIEW-20261107, item 1): the producer for a consumer is
+// the newest retained scene recording of the same colour/depth that is unused and ALREADY
+// ordered before the consumer on the GPU: submitted (Ready), or earlier in the batch being
+// submitted, or the consumer's own list. CPU Close order alone qualifies nothing. g.m held.
+// allow_unsubmitted: the pre-existing scene-pass route (no stretch input) also accepts a closed,
+// not yet submitted producer of this frame; its order is then only CHECKED at submission
+// (producer_order/order_refused), which cannot cancel the recorded work. The Quality step
+// route does not use that allowance.
+const SceneInput* pick_producer_locked(uint64_t color,uint64_t depth,ID3D12CommandQueue* queue,
+                                       ID3D12CommandList* const* lists,UINT count,UINT at,bool allow_unsubmitted=false)
+{
+    for (auto it=g.native_producers.rbegin();it!=g.native_producers.rend();++it) {
+        const auto& p=*it;
+        if (p.color!=color || p.depth!=depth || !p.native_origin || !p.native_recording || !p.native_list ||
+            p.native_serial<=g.consumed_native_source) continue;
+        // The newest unused recording of this scene IS the producer; an older one is superseded
+        // (reverse-order fixture: a previous frame's submitted scene must not stand in). Only
+        // its qualification is decided here.
+        if (p.native_origin.Ready(queue)) return &p;
+        if (lists) for (UINT j=0;j<=at && j<count;++j)
+            if (lists[j] && uint64_t(na::observe::IdOf(lists[j]))==p.native_list && na::observe::ListRecording(lists[j])==p.native_recording) return &p;
+        if (allow_unsubmitted && !p.native_origin.Retired()) return &p;
+        return nullptr;
+    }
+    return nullptr;
+}
 // Native engine control owns sizing; J2 only supplies reconstruction at the
 // observed source->native-destination pass. Reuse record(), its state restore,
 // history commit, capture and per-recording lifetime machinery in both engines.
@@ -4838,7 +4877,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
     // dispatch's table snapshot are staged; record_deferred_native resolves the table at
     // ExecuteCommandLists and records DLSS into our own list spliced right after this one.
     na::observe::ShaderScope stage_late(ID3D12GraphicsCommandList* l,na::observe::NativeOperation&& snapshot,
-                                        const NativeCrossing& learned,uint64_t scene,uint64_t depth)
+                                        const NativeCrossing& learned,uint64_t scene,uint64_t depth,bool aux_counted=false)
     {
         (void)scene; // the scene producer is matched at submission (record_deferred_native)
         if (snapshot.tables.empty()) { native_reject(g_nb.st_no_input,"The learned upscale step binds no descriptor table."); return {}; }
@@ -4855,7 +4894,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         DeferredNativeScale staged;
         staged.list=writer;staged.recording=na::observe::ListRecording(l);staged.frame=g.frame;staged.pso=learned.pso;
         staged.depth.Attach(na::observe::AcquireResource(depth));
-        staged.op=std::make_shared<na::observe::NativeOperation>(std::move(snapshot));staged.late=true;
+        staged.op=std::make_shared<na::observe::NativeOperation>(std::move(snapshot));staged.late=true;staged.aux_counted=aux_counted;
         if (!staged.depth) return refuse("The scene depth has retired.");
         g.native_deferred=std::move(staged);
         g_nb.st_candidates.fetch_add(1,std::memory_order_relaxed);
@@ -4924,7 +4963,23 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             uint64_t chosen=0; unsigned written=0;
             for (const auto id:inputs) if (na::observe::ListInsertionDecision(l,id).writes>0) { chosen=id; ++written; }
             if (written!=1) chosen=inputs.size()==1?inputs[0]:0;
+            // Inline only when its dependencies are established BEFORE the dispatch is appended
+            // (Astra audit items 1, 4, 5): the scene producer is this list or an already
+            // submitted recording, and the input's state is known here or on the queue. Else
+            // the list-boundary route, decided before the operation so After() arms the watch.
+            bool inline_ok=false;
             if (chosen) {
+                const bool local=na::observe::ListRendersTo(l,scene,depth);
+                bool producer_ok=local;
+                if (!producer_ok) { std::lock_guard<std::mutex> lock(g.m); producer_ok=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)!=nullptr; }
+                uint32_t st=0;
+                const bool state_ok=na::observe::ListStateSub(l,chosen,0,&st)==na::observe::StateLookup::Known ||
+                    (g.queue && na::observe::KnownSubStateOnQueueNow(g.queue.Get(),chosen,0,&st));
+                if (!producer_ok) g_nb.st_late_no_producer.fetch_add(1,std::memory_order_relaxed);
+                if (!state_ok) g_nb.st_late_no_state.fetch_add(1,std::memory_order_relaxed);
+                inline_ok=producer_ok&&state_ok;
+            }
+            if (inline_ok) {
                 auto c=std::make_shared<Candidate>();
                 c->color=scene;c->depth=depth;c->recording=op.recording;
                 c->source.Attach(na::observe::AcquireResource(chosen));
@@ -4970,12 +5025,12 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             native_reject(g_nb.st_ambiguous,pick.why); return {};
         }
         input=srv_of[pick.at];
+        if (pick.aux) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed); // observed at record time, whichever route delivers
         if (!input || !output || input->view.resource!=learned.input || output->view.resource!=learned.output) {
-            if (late_eligible) return stage_late(l,std::move(op),learned,scene,depth);
+            if (late_eligible) return stage_late(l,std::move(op),learned,scene,depth,pick.aux!=0);
             native_reject(g_nb.st_no_input,"The learned upscale step reads or writes other images than learned.");
             return {};
         }
-        if (pick.aux) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed);
         const auto& srv=input->view.srv;
         const auto& uav=output->view.uav;
         const auto in_desc=input->resource->GetDesc(), out_desc=output->resource->GetDesc();
@@ -4993,6 +5048,14 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             typed(in_desc.Format)!=typed(out_desc.Format)) {
             native_reject(g_nb.st_no_input,"The learned upscale step's views changed size or format.");
             return {};
+        }
+        // Inline needs an established producer (this list, or a submitted recording) before the
+        // dispatch is appended; otherwise the list-boundary route, decided here before the
+        // operation (Astra audit items 1, 5).
+        if (!na::observe::ListRendersTo(l,scene,depth)) {
+            bool producer_ok=false;
+            { std::lock_guard<std::mutex> lock(g.m); producer_ok=pick_producer_locked(scene,depth,g.queue.Get(),nullptr,0,0)!=nullptr; }
+            if (!producer_ok) { g_nb.st_late_no_producer.fetch_add(1,std::memory_order_relaxed); return stage_late(l,std::move(op),learned,scene,depth,pick.aux!=0); }
         }
         auto c=std::make_shared<Candidate>();
         c->color=scene;
@@ -5171,12 +5234,13 @@ public:
             ID3D12CommandList* one[]{l};SceneInput saved;
             const bool local=na::observe::ListRendersTo(l,color,depth);
             if(!local){
-                saved=g.native_scene;
-                if(saved.color!=color||saved.depth!=depth||!saved.native_origin||!saved.native_recording||
-                   saved.native_serial<=g.consumed_native_source||
-                   (saved.native_origin.Retired()&&!saved.native_origin.Ready(g.queue.Get()))){
-                    skip("No unused executable or submitted scene producer matches this upscale pass.");return false;
-                }
+                // Inline work depends on the producer's GPU work, so the producer must already
+                // be ordered before this list: submitted. A closed, unsubmitted one is not
+                // accepted here (recorded commands cannot be cancelled by a later order check);
+                // such a frame goes to the list-boundary route from stretch() instead.
+                const auto* p=pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/!c->input);
+                if(!p){skip(c->input?"No submitted scene producer matches this upscale step.":"No unused executable or submitted scene producer matches this upscale pass.");return false;}
+                saved=*p;
             }
             // Stretch finder: DLSS reads the step's own render-size input (already
             // post-processed); camera, depth and producer stay the scene's.
@@ -5190,29 +5254,7 @@ public:
                     if(!na::observe::ListSceneSubresource(l,color,depth,&cs,&staged.depth_sub)){skip("The scene's depth view in this recording cannot be placed.");return false;}
                     staged.has_camera=find_camera(one,0,depth,&staged.vp,&staged.reversed,&staged.interlopers);staged.judged=staged.has_camera;
                     staged.injected=g_injected;staged.jitter[0]=g_injected?g.jit.px[0]:0;staged.jitter[1]=g_injected?g.jit.px[1]:0;
-                }else {
-                    if (!saved.native_origin.Ready(g.queue.Get())) {
-                        const auto writer=na::observe::IdOf(l);
-                        if (c->separate_reader && saved.native_depth_snapshot && saved.native_depth_reader_fence &&
-                            saved.native_list && writer && !g.native_deferred.list &&
-                            na::observe::ListWorkTailUnchanged(l,true)) {
-                            // CPU metadata only. A reversed or discarded submission
-                            // leaves the original game recording untouched.
-                            g.native_deferred={saved,c->source,c->guide,c->target,writer,c->recording,
-                                               g.frame,c->input,c->dest,na::observe::ListPipelineId(l)};
-                            return false;
-                        }
-                        // p-b66b1ea run (Cort): 659 frames lost here, each a visible drop-out. A producer
-                        // that is closed but not yet submitted is normally submitted earlier in the same
-                        // batch as this list; the submission check (producer_order in Execute) still
-                        // refuses the delivery and counts order_refused when it is not.
-                        if (saved.native_origin.Retired()) {
-                            skip("Quality needs its scene submitted before an inline upscale pass.");
-                            return false;
-                        }
-                    }
-                    staged=saved;
-                }
+                }else staged=saved; // an established (submitted) producer, see pick_producer_locked
                 staged.color=c->input;staged.color_sub=0;
                 if (staged.native_depth_snapshot) staged.depth_sub=0;
                 staged.require_current_states=true;
@@ -5335,7 +5377,9 @@ public:
             else g_nb.snap_depth_unknown.fetch_add(1,std::memory_order_relaxed);
             saved.native_serial=++g.next_native_source;
 
-            g.native_scene=std::move(saved);
+            g.native_scene=saved;
+            g.native_producers.push_back(std::move(saved));
+            while(g.native_producers.size()>8)g.native_producers.pop_front();
         }catch(...){}
     }
 };
@@ -5360,38 +5404,19 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
             return skip("Quality's deferred upscale no longer owns this frame or queue.");
         if (!na::observe::ListWorkTailUnchanged(lists[i]))
             return skip("Game work follows the upscale inside its recording; there is no list boundary for Quality.");
-        if (work.late) {
-            // The scene producer as published at its Close (the same list, or an earlier one).
-            work.source=g.native_scene;
-            if (!work.source.native_origin || !work.source.native_recording || !work.source.native_list)
-                return skip("No scene producer was published for the late-bound upscale step.");
-            if (!work.source.native_depth_snapshot || !work.source.native_depth_reader_fence)
-                return skip("The scene producer has no depth snapshot for the late-bound upscale step.");
-        }
-        if (!work.late && work.source.native_serial!=g.native_scene.native_serial) {
-            // Another list rendering the same scene closed after this step was staged (SE5 closes
-            // three scene lists per frame): the newest producer is the one to use when it is for
-            // the same scene, unused and has its depth snapshot (b66b1ea run: 1186 drop-outs here).
-            const auto& newest=g.native_scene;
-            if (newest.color==work.source.color && newest.depth==work.source.depth && newest.native_origin && newest.native_recording &&
-                newest.native_list && newest.native_depth_snapshot && newest.native_depth_reader_fence &&
-                newest.native_serial>g.consumed_native_source)
-                work.source=newest;
-        }
-        const auto& source=work.source;
-        const auto is_producer=[&](ID3D12CommandList* list) {
-            return list && na::observe::IdOf(list)==source.native_list &&
-                na::observe::ListRecording(list)==source.native_recording;
-        };
-        // The producer may be this very list (scene drawn before the upscale in one recording).
-        if (std::any_of(lists+i+1,lists+count,is_producer) ||
-            (!is_producer(lists[i]) && !source.native_origin.Ready(queue) && !std::any_of(lists,lists+i,is_producer)))
-            return skip("The scene producer was not submitted before the upscale recording.");
         uint64_t depth=0,color=0;
         na::observe::GetLiveSelection(&depth,&color);
-        if (depth!=source.depth || color!=source.color || source.native_serial<=g.consumed_native_source ||
-            source.native_serial!=g.native_scene.native_serial)
-            return skip("The scene selection or producer changed before the upscale recording was submitted.");
+        // The producer is chosen now, by actual order: a retained scene recording for this
+        // selection that is submitted, earlier in this batch, or this very list (scene drawn
+        // before the upscale in one recording). Newest Close is not a qualification.
+        {
+            const auto* p=pick_producer_locked(color,depth,queue,lists,count,i);
+            if (!p) return skip("The scene producer was not submitted before the upscale recording.");
+            work.source=*p;
+        }
+        if (!work.source.native_depth_snapshot || !work.source.native_depth_reader_fence)
+            return skip("The scene producer has no depth snapshot for the late-bound upscale step.");
+        const auto& source=work.source;
         NativeCrossing learned;
         std::vector<uint64_t> learned_inputs;
         {
@@ -5428,7 +5453,7 @@ int record_deferred_native(ID3D12CommandQueue* queue, ID3D12CommandList* const* 
             }
             const auto pick=pick_scene_input(srvs,extent.rw,extent.rh,extent.ow,extent.oh);
             if (!pick.ok) { g_nb.st_no_input.fetch_add(1,std::memory_order_relaxed); return skip(pick.why); }
-            if (pick.aux) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed);
+            if (pick.aux && !work.aux_counted) g_nb.st_aux.fetch_add(1,std::memory_order_relaxed);
             input=srv_of[pick.at];
             if (!output || !output->resource) return skip("The late-bound upscale step writes no image at submission.");
             const auto& uav=output->view.uav;
@@ -7011,6 +7036,7 @@ NativeBridgeStats GetNativeBridgeStats() {
     r.st_ambiguous=n.st_ambiguous.load();r.st_draw_state=n.st_draw_state.load();r.st_candidates=n.st_candidates.load();
     r.st_recorded=n.st_recorded.load();r.st_failed=n.st_failed.load();r.st_ungated_full=n.st_ungated_full.load();r.st_budget=n.st_budget.load();r.st_aux=n.st_aux.load();
     r.st_late_staged=n.st_late_staged.load();r.st_late_changed=n.st_late_changed.load();r.st_late_same=n.st_late_same.load();r.st_late_resolved=n.st_late_resolved.load();r.st_late_inline=n.st_late_inline.load();
+    r.st_late_no_producer=n.st_late_no_producer.load();r.st_late_no_state=n.st_late_no_state.load();
     r.snap_closes=n.snap_closes.load();r.snap_depth_unknown=n.snap_depth_unknown.load();r.snap_format=n.snap_format.load();r.snap_no_slot=n.snap_no_slot.load();r.snap_taken=n.snap_taken.load();
     size_t used=0;
     for(uint32_t i=0;i<n.step_count&&used+100<sizeof r.steps;++i){
@@ -7029,7 +7055,9 @@ NativeBridgeStats GetNativeBridgeStats() {
         const bool screen=std::strstr(r.probe,"verdict=confirmed_in_presented")!=nullptr;
         const char* furthest=screen?"screen_confirmed":n.delivered?"submitted":r.st_recorded?"recorded":n.q_entered.load()?"entered":
             r.st_candidates?"matched":learned?"learned":"not_learned";
-        std::snprintf(r.stages,sizeof r.stages,"learned=%llu matched=%llu entered=%llu recorded=%llu ngx_failed=%llu submitted=%llu order_refused=%llu furthest=%s gate{run=%llu warmup=%u held=%llu drops=%llu} stop=\"%s\"",
+        // record_failed: every record() refusal at the learned step (colour/depth state, camera,
+        // NGX...), each also counted under its reason in refusals{}; actual NGX failures are dlss_failed.
+        std::snprintf(r.stages,sizeof r.stages,"learned=%llu matched=%llu entered=%llu recorded=%llu record_failed=%llu submitted=%llu order_refused=%llu furthest=%s gate{run=%llu warmup=%u held=%llu drops=%llu} stop=\"%s\"",
             (unsigned long long)learned,(unsigned long long)r.st_candidates,(unsigned long long)n.q_entered.load(),(unsigned long long)r.st_recorded,
             (unsigned long long)n.q_failed.load(),(unsigned long long)n.delivered,(unsigned long long)n.order_refused,furthest,
             (unsigned long long)g.q_run,g_quality_warmup,(unsigned long long)n.q_warmup.load(),(unsigned long long)n.q_drops.load(),n.reason);
@@ -7955,6 +7983,7 @@ void Shutdown()
     g.entries.Clear();
     g.waiting_scene = {};
     g.native_scene = {};
+    g.native_producers.clear();
     g.native_deferred = {};
     g_native_reduced.store(false);g_native_bridge.store(false);
     g.jitter_writes.Clear();
