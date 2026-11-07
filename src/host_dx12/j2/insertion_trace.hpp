@@ -111,6 +111,30 @@ struct InsertionDecision {
     uint32_t writer_occurrence = 0;
     uint32_t derived_reads = 0; // reads of textures copied from the colour this frame
 };
+struct LearnedInsertion {
+    uint64_t color = 0, depth = 0;
+    InsertionDecision decision;
+};
+
+inline bool MatchesBoundary(const LearnedInsertion& learned, uint64_t color, uint64_t depth,
+                            const InsertionDecision& current) {
+    const auto& d = learned.decision;
+    if (!d.final_candidate || learned.color != color || learned.depth != depth ||
+        current.destination != d.destination || current.pipeline != d.pipeline) return false;
+    if (d.final_transition && d.boundary_writer)
+        return current.boundary_writer == d.boundary_writer && current.writer_occurrence == d.writer_occurrence;
+    if (d.final_transition) return current.final_transition == d.final_transition;
+    return current.candidates == d.final_candidate;
+}
+
+inline const LearnedInsertion* FindBoundary(const LearnedInsertion& previous, const LearnedInsertion* delivered,
+                                             int count, uint64_t color, uint64_t depth, const InsertionDecision& current) {
+    if (MatchesBoundary(previous, color, depth, current)) return &previous;
+    for (int i = 0; i < count; ++i)
+        if (MatchesBoundary(delivered[i], color, depth, current)) return &delivered[i];
+    return nullptr;
+}
+
 // A write or an actual consumer of the selected colour, in recording order (frame labelling).
 struct ColorEvent {
     bool write = false;

@@ -249,7 +249,7 @@ struct State {
     uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
-    struct LearnedInsertion { uint64_t color = 0, depth = 0; na::j2::InsertionDecision decision; };
+    using LearnedInsertion = na::j2::LearnedInsertion;
     LearnedInsertion insertion_frame, insertion_learned;
     // Scene-end shapes of recent frames that DID get DLAA (SE5 p31032, 2026-11-06: the game
     // alternates between two frame shapes; with only the previous frame's shape learned,
@@ -4394,6 +4394,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     // The existing MSAA-depth path changes raster state which this restore does
     // not replay. Keep it at its original boundary, as for resolved consumers.
     if(entry && g.depth_samples>1)return;
+
     // Match an actual operation even with unresolved SRVs; never recover at Close.
     if(!entry && g.depth_samples<=1 && g.entries.Ready() &&
        na::observe::ListLiveConsumer(l,color_id).op!=na::j2::Op::CopyRead)return;
@@ -4411,6 +4412,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     if (g.inl_frame == g.frame || g.submitted_frame == g.frame) return; // either placement path already owns this frame
     const auto current = na::observe::ListInsertionDecision(l, color_id);
     const auto& learned = g.insertion_learned;
+    const auto* selected_boundary = &learned;
     // Role-class trigger (placement design): at the ACTUAL consumer (draw/dispatch/copy),
     // fire when its class is accepted by the profile. A class known to be a temporary
     // reader blocks the boundary matcher too (a fact from earlier frames). Otherwise the
@@ -4439,41 +4441,12 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
                     (unsigned long long)entry->destination,static_cast<unsigned>(entry->op),
                     (unsigned long long)entry->recording,(unsigned long long)entry->operation,entry->barrier);
             ++g.frame_rejects;
-            // Rescue (SE5 2026-11-05: every ~40 s the game merges its last two command lists for
-            // a few seconds; the terminal entry is then an operation the profile has seen
-            // mid-scene, so every entry is refused and ~40% of frames lose DLAA). The learned
-            // scene boundary (same final writer, same occurrence, destination and pipeline) is
-            // the same in both shapes: when it matches HERE, the scene is complete at this
-            // operation, so the boundary matcher below places DLAA as it did before entries.
-            // The learned scene boundary: the previous frame's shape, and every recent shape
-            // that got DLAA (the game alternates shapes; see delivered_shapes).
-            auto judge_shape=[&](const State::LearnedInsertion& L,bool& writer_only){
-                writer_only=false;
-                const bool same_target=L.decision.final_candidate && L.color==color_id && L.depth==depth_id &&
-                    current.destination==L.decision.destination && current.pipeline==L.decision.pipeline;
-                const bool exact=same_target &&
-                    (L.decision.final_transition && L.decision.boundary_writer
-                         ? current.boundary_writer==L.decision.boundary_writer && current.writer_occurrence==L.decision.writer_occurrence
-                         : L.decision.final_transition ? current.final_transition==L.decision.final_transition
-                                                       : current.candidates==L.decision.final_candidate);
-                // SE5 p41768: the same scene end reached by a different final pass (only the
-                // writer differs; occurrence, transition, destination and pipeline match).
-                writer_only=!exact && same_target && L.decision.final_transition && L.decision.boundary_writer &&
-                    current.boundary_writer && current.boundary_writer!=L.decision.boundary_writer &&
-                    current.writer_occurrence==L.decision.writer_occurrence &&
-                    current.final_transition==L.decision.final_transition && current.writes>0;
-                return exact;
-            };
-            bool writer_only=false,by_memory=false;
-            bool boundary=judge_shape(learned,writer_only);
-            for(int k=0;k<g.delivered_shape_count&&!boundary&&!writer_only;++k){
-                bool w=false;
-                if(judge_shape(g.delivered_shapes[k],w)){boundary=true;by_memory=true;}
-                else if(w){writer_only=true;by_memory=true;}
-            }
-            if(writer_only)++g.stats.entry_rescued_writer;
-            if(by_memory&&(boundary||writer_only))++g.stats.entry_rescued_memory;
-            if(!(boundary||writer_only) || g.inl.valid){
+            // A consumer may be intermediate in one recording and terminal
+            // in another. Use the exact boundary that matched, including a
+            // previously delivered shape when the preceding frame differed.
+            const auto* matched = na::j2::FindBoundary(learned, g.delivered_shapes,
+                g.delivered_shape_count, color_id, depth_id, current);
+            if (!matched || g.inl.valid) {
                 // Name the first failing check (same order as the boundary matcher below).
                 uint32_t f=8;
                 if(!learned.decision.final_candidate||!learned.color)f=0;
@@ -4494,7 +4467,13 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
                     (unsigned long long)current.destination,(unsigned long long)current.pipeline,(unsigned long long)entry->pipeline,static_cast<unsigned>(entry->op));
                 return;
             }
+            selected_boundary = matched;
             ++g.stats.entry_rescued;
+            if (matched != &learned) {
+                ++g.stats.entry_rescued_memory;
+                if (matched->decision.boundary_writer != learned.decision.boundary_writer)
+                    ++g.stats.entry_rescued_writer;
+            }
         }
     } else {
         const auto live = na::observe::ListLiveConsumer(l, color_id);
@@ -4552,23 +4531,24 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
         }
         g.stats.inline_target = learned.decision.final_candidate;
     } else {
+    const auto& boundary = *selected_boundary;
     // Optional passes change the absolute transition ordinal. Match the producer
     // of the learned final scene boundary, retaining an occurrence only among
     // boundaries from that same producer (not unrelated intermediate reads).
     // Same predicates as before, evaluated one by one so a rejection names its cause.
     using S = Stats;
     uint32_t rej = S::kRejCount;
-    if (!learned.decision.final_candidate || !learned.color) rej = S::kRejNoLearned;
-    else if (learned.color != color_id || learned.depth != depth_id) rej = S::kRejResource;
-    else if (learned.decision.final_transition && learned.decision.boundary_writer) {
-        if (current.boundary_writer != learned.decision.boundary_writer) rej = S::kRejWriter;
-        else if (current.writer_occurrence != learned.decision.writer_occurrence) rej = S::kRejOccurrence;
-    } else if (learned.decision.final_transition) {
-        if (current.final_transition != learned.decision.final_transition) rej = S::kRejTransition;
-    } else if (current.candidates != learned.decision.final_candidate) rej = S::kRejCandidate;
-    if (rej == S::kRejCount && current.destination != learned.decision.destination) rej = S::kRejDestination;
-    if (rej == S::kRejCount && current.pipeline != learned.decision.pipeline) rej = S::kRejPipeline;
-    if (rej == S::kRejCount) g.stats.inline_target = learned.decision.final_candidate;
+    if (!boundary.decision.final_candidate || !boundary.color) rej = S::kRejNoLearned;
+    else if (boundary.color != color_id || boundary.depth != depth_id) rej = S::kRejResource;
+    else if (boundary.decision.final_transition && boundary.decision.boundary_writer) {
+        if (current.boundary_writer != boundary.decision.boundary_writer) rej = S::kRejWriter;
+        else if (current.writer_occurrence != boundary.decision.writer_occurrence) rej = S::kRejOccurrence;
+    } else if (boundary.decision.final_transition) {
+        if (current.final_transition != boundary.decision.final_transition) rej = S::kRejTransition;
+    } else if (current.candidates != boundary.decision.final_candidate) rej = S::kRejCandidate;
+    if (rej == S::kRejCount && current.destination != boundary.decision.destination) rej = S::kRejDestination;
+    if (rej == S::kRejCount && current.pipeline != boundary.decision.pipeline) rej = S::kRejPipeline;
+    if (rej == S::kRejCount) g.stats.inline_target = boundary.decision.final_candidate;
     if (rej == S::kRejCount && (g.inl_frame == g.frame || g.inl.valid)) {
         // Already inserted this frame (normal for later candidates) or the previous
         // recording was never submitted (a real stall): only the latter is a rejection.
@@ -4584,9 +4564,9 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
                                          "different consumer destination", "different consumer pipeline", "previous recording not submitted"};
             std::snprintf(g.frame_reject_text, sizeof g.frame_reject_text,
                 "reject=%s learned{writer=%llu occ=%u tr=%u cand=%u dst=%llu pso=%llu} actual{writer=%llu occ=%u tr=%u cand=%u dst=%llu pso=%llu}",
-                kWhy[rej], (unsigned long long)learned.decision.boundary_writer, learned.decision.writer_occurrence,
-                learned.decision.final_transition, learned.decision.final_candidate, (unsigned long long)learned.decision.destination,
-                (unsigned long long)learned.decision.pipeline, (unsigned long long)current.boundary_writer, current.writer_occurrence,
+                kWhy[rej], (unsigned long long)boundary.decision.boundary_writer, boundary.decision.writer_occurrence,
+                boundary.decision.final_transition, boundary.decision.final_candidate, (unsigned long long)boundary.decision.destination,
+                (unsigned long long)boundary.decision.pipeline, (unsigned long long)current.boundary_writer, current.writer_occurrence,
                 current.final_transition, current.candidates, (unsigned long long)current.destination, (unsigned long long)current.pipeline);
         }
         return;
@@ -7306,7 +7286,8 @@ void OnPresent(ID3D12CommandQueue* queue)
         }
         if (g.insertion_frame.color) {
             g.insertion_learned = g.insertion_frame;
-            if (g.submitted_frame == g.frame) { // a shape that got DLAA: remember it (most recent first, no duplicates)
+            if (g.submitted_frame == g.frame && g.stats.inline_late_writes + g.stats.post_scene_batches == g.route_prev_late_class) {
+                // Remember only deliveries that survived the remaining observed scene work.
                 const auto same = [](const State::LearnedInsertion& a, const State::LearnedInsertion& b) {
                     return a.color == b.color && a.depth == b.depth && a.decision.final_candidate == b.decision.final_candidate &&
                            a.decision.final_transition == b.decision.final_transition && a.decision.boundary_writer == b.decision.boundary_writer &&

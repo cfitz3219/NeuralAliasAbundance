@@ -61,5 +61,26 @@ int main() {
         check(final.boundary_writer == 200 && final.writer_occurrence == 2,
               "repeated producer boundaries remain distinguishable");
     }
+    // Alternate between two proven endings of the same scene. A middle-class
+    // consumer can use the remembered ending, but never an unknown writer,
+    // another target, or another occurrence of the same writer.
+    na::j2::LearnedInsertion previous{1, 2, {}};
+    previous.decision.final_candidate = previous.decision.final_transition = 2;
+    previous.decision.boundary_writer = 100;
+    previous.decision.writer_occurrence = 1;
+    previous.decision.destination = 3;
+    previous.decision.pipeline = 20;
+    auto remembered = previous;
+    remembered.decision.boundary_writer = 200;
+    auto current = remembered.decision;
+    check(na::j2::FindBoundary(previous, &remembered, 1, 1, 2, current) == &remembered,
+          "previously delivered alternate ending wins over previous frame");
+    current.boundary_writer = 300;
+    check(!na::j2::FindBoundary(previous, &remembered, 1, 1, 2, current), "unknown writer cannot use a remembered ending");
+    current = remembered.decision;
+    ++current.writer_occurrence;
+    check(!na::j2::FindBoundary(previous, &remembered, 1, 1, 2, current), "another writer occurrence remains ineligible");
+    current = remembered.decision;
+    check(!na::j2::FindBoundary(previous, &remembered, 1, 1, 9, current), "another depth cannot use the ending");
     return failures ? 1 : 0;
 }
