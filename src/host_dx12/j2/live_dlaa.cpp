@@ -1117,7 +1117,7 @@ struct DeliveryProbe {
     bool verify=false;NativeCrossing target;uint32_t verify_attempts=0;
     int outcome=0;NativeCrossing outcome_target; // for the trace, applied outside this lock
     uint32_t expect_w=0,expect_h=0;
-    ComPtr<ID3D12DescriptorHeap> gpu,cpu;uint32_t next_desc=0;
+    ComPtr<ID3D12DescriptorHeap> gpu,cpu,rtv;uint32_t next_desc=0;
     struct Mark{uint64_t frame=0;uint32_t value=0;bool submitted=false;na::nr::native::RecordingLease lease;};
     std::deque<Mark> marks;
     struct Slot{ComPtr<ID3D12CommandAllocator> alloc;ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> rb;
@@ -1150,11 +1150,18 @@ float probe_luma(const uint8_t* p,DXGI_FORMAT f){
 // Writes this frame's marker texels into `dest` (UNORDERED_ACCESS) in `l`.
 // verifying: the mark pairs once its recording was submitted (lease); a delivery
 // mark pairs only when J2 confirmed that delivery at submission (probe_submitted).
-bool probe_write_locked(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_t view_format,uint64_t frame,bool verifying=false){
+bool probe_write_locked(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_t view_format,uint64_t frame,bool verifying=false,bool render_target=false){
     auto& p=g_probe;
     if(!p.remaining||!dest||!g.device)return false;
     const auto desc=dest->GetDesc();
-    if(!(desc.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)||!view_format)return false;
+    // A render-target output (a draw writing the full-size image as RT) is marked
+    // with a rect clear of an RTV while it is in RENDER_TARGET state.
+    if(!view_format)return false;
+    if(render_target?!(desc.Flags&D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET):!(desc.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))return false;
+    if(render_target&&!p.rtv){
+        D3D12_DESCRIPTOR_HEAP_DESC hr{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,16,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+        if(FAILED(g.device->CreateDescriptorHeap(&hr,IID_PPV_ARGS(&p.rtv))))return false;
+    }
     if(!p.gpu){
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,16,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
         if(FAILED(g.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p.gpu))))return false;
@@ -1177,10 +1184,18 @@ bool probe_write_locked(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32
     D3D12_RECT rects[3];
     for(int i=0;i<3;++i){const LONG x=LONG(DeliveryProbe::kAt[i][0]*float(desc.Width)),y=LONG(DeliveryProbe::kAt[i][1]*float(desc.Height));rects[i]={x,y,x+1,y+1};}
     const na::observe::HostWorkScope own;
-    ID3D12DescriptorHeap* heaps[]{p.gpu.Get()};l->SetDescriptorHeaps(1,heaps);
-    D3D12_RESOURCE_BARRIER uav{};uav.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;uav.UAV.pResource=dest;l->ResourceBarrier(1,&uav);
-    l->ClearUnorderedAccessViewFloat(gg,cc,dest,c,3,rects);
-    l->ResourceBarrier(1,&uav);
+    if(render_target){
+        D3D12_CPU_DESCRIPTOR_HANDLE rh=p.rtv->GetCPUDescriptorHandleForHeapStart();
+        rh.ptr+=SIZE_T(at)*g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_RENDER_TARGET_VIEW_DESC rd{};rd.Format=DXGI_FORMAT(view_format);rd.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+        g.device->CreateRenderTargetView(dest,&rd,rh);
+        l->ClearRenderTargetView(rh,c,3,rects);
+    }else{
+        ID3D12DescriptorHeap* heaps[]{p.gpu.Get()};l->SetDescriptorHeaps(1,heaps);
+        D3D12_RESOURCE_BARRIER uav{};uav.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;uav.UAV.pResource=dest;l->ResourceBarrier(1,&uav);
+        l->ClearUnorderedAccessViewFloat(gg,cc,dest,c,3,rects);
+        l->ResourceBarrier(1,&uav);
+    }
     if(p.marks.size()>=16)p.marks.pop_front();
     p.marks.push_back({frame,value,false,lease});
     p.expect_w=uint32_t(desc.Width);p.expect_h=desc.Height;
@@ -1204,7 +1219,7 @@ bool probe_mark(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_t view_
 }
 // Provisional crossing: mark the game's own image (no DLSS) right after the
 // game's upscale step wrote it. Starts a verify session for `c` when none runs.
-bool probe_verify_mark(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_t view_format,uint64_t frame,const NativeCrossing& c){
+bool probe_verify_mark(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_t view_format,uint64_t frame,const NativeCrossing& c,bool render_target=false){
     std::lock_guard<std::mutex> lock(g_probe.m);
     auto& p=g_probe;
     if(p.outcome)return false; // last session's result not applied yet
@@ -1213,7 +1228,7 @@ bool probe_verify_mark(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_
         if(p.remaining&&!p.verify)return false; // a delivery session is running
         p.start(true);p.target=c;
     }
-    return probe_write_locked(l,dest,view_format,frame,true);
+    return probe_write_locked(l,dest,view_format,frame,true,render_target);
 }
 void probe_submitted(uint64_t frame,bool ok){
     std::lock_guard<std::mutex> lock(g_probe.m);
@@ -4600,7 +4615,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         uint64_t other=0;ComPtr<ID3D12Resource> other_target;
         bool rebound=false;
         uint64_t input=0; // stretch finder: DLSS reads this render-size image (0 = the scene colour)
-        bool verify=false; NativeCrossing crossing; // provisional: mark the game's own image, no DLSS
+        bool verify=false, verify_rt=false; NativeCrossing crossing; // provisional: mark the game's own image, no DLSS
         bool separate_reader=false;    };
     // Private full-size HDR image for the F10 route (recreated on size/format change).
     struct Full { ComPtr<ID3D12Resource> tex; uint32_t w=0,h=0; DXGI_FORMAT f=DXGI_FORMAT_UNKNOWN; };
@@ -4889,15 +4904,18 @@ public:
         }
         const auto pick=pick_scene_input(srvs,p.rw,p.rh,p.ow,p.oh);
         if (!pick.ok) return refuse(pick.why);
+        // A draw may write the full-size image as its render target instead of a UAV.
+        bool rt=false;
+        if (!output && !dispatch && op.colors.size()==1 && op.colors[0].resource && op.colors[0].view.resource==p.output) { output=&op.colors[0]; rt=true; }
         if (srvs[pick.at].id!=p.input || !output || output->view.resource!=p.output) return refuse("Screen check: the provisional step reads or writes other images than traced.");
         auto c=std::make_shared<Candidate>();
-        c->verify=true;c->crossing=p;c->target=output->resource;c->dest=p.output;
+        c->verify=true;c->verify_rt=rt;c->crossing=p;c->target=output->resource;c->dest=p.output;
         return {na::observe::ShaderAction::Forward,c};
     }    void After(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall&,na::observe::ShaderScope& scope) noexcept override {
         auto c=std::static_pointer_cast<Candidate>(scope.state);if(!c)return;
         if(c->verify){
             try{
-                if(probe_verify_mark(l,c->target.Get(),c->crossing.out_view,g.frame,c->crossing)&&!na::observe::RestoreListState(l)){
+                if(probe_verify_mark(l,c->target.Get(),c->crossing.out_view,g.frame,c->crossing,c->verify_rt)&&!na::observe::RestoreListState(l)){
                     std::lock_guard<std::mutex> lock(g.m);g.latched=true;reason("Stopped: the screen probe could not restore game state.");
                 }
             }catch(...){}
