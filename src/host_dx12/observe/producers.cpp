@@ -4527,7 +4527,25 @@ void vpj_before_draw(GL* l)
             if (ls->vpj_applied && ls->vpj_value == sample) return;
             const float dx = vpj_axis(sample, 16), dy = vpj_axis(sample, 0);
             n = ls->raster_viewport_count;
-            for (UINT i = 0; i < n; ++i) { v[i] = ls->raster_viewports[i]; v[i].TopLeftX += dx; v[i].TopLeftY += dy; }
+            std::copy_n(ls->raster_viewports, n, v);
+            // Fractional translation can truncate the hardware viewport's
+            // right/bottom coverage, leaving a row or column of clear pixels.
+            // Give a full-depth scene viewport half a pixel on each side.
+            // The depth attachment and original scissor still clip writes,
+            // and the centred expansion keeps the declared jitter unchanged.
+            uint32_t width = 0, height = 0, format = 0;
+            if (n == 1 && v[0].TopLeftX == 0.f && v[0].TopLeftY == 0.f &&
+                ls->cur_ds_sub == 0 && resource_dims_locked(sel_depth, &width, &height, &format) &&
+                v[0].Width == static_cast<float>(width) && v[0].Height == static_cast<float>(height)) {
+                v[0].TopLeftX -= .5f;
+                v[0].TopLeftY -= .5f;
+                v[0].Width += 1.f;
+                v[0].Height += 1.f;
+            }
+            for (UINT i = 0; i < n; ++i) {
+                v[i].TopLeftX += dx;
+                v[i].TopLeftY += dy;
+            }
             ls->vpj_applied = true; ls->vpj_value = sample;
             ++ls->viewport_serial; // actual driver viewport changed outside the game shadow
             g_vpj_sets.fetch_add(1, std::memory_order_relaxed);
