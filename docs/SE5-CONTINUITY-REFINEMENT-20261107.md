@@ -99,3 +99,36 @@ images. Reading the descriptor increment now holds the existing device mutex,
 so shutdown cannot null the device during that access. No game-path GPU wait is
 introduced. This is a lifecycle completion of the new copy, separate from the
 captured interruption causes.
+
+### Completed automated validation
+
+- The broad 255-case suite finished with 251 PASS, 4 SKIP, 0 FAIL (498.96 s).
+  The optional NR runtime probe and three unsupported 16x MSAA cases skipped.
+  This run preceded the final combined rebuild and latest fixture registrations;
+  do not describe it as an immutable full-suite run of the final package.
+- Combined 2523220 (including Opus a42171b unchanged): complete Release build;
+  all 99 affected tests finished, 96 PASS, 3 unsupported MSAA16 SKIP, 0 FAIL
+  (280.30 s), including five real-NVIDIA cases and the new input/camera cases.
+- Final runtime 1ebb7b7d243dac63ffff8bb6759f4a0762a75a66 adds only the cleanup/device
+  access completion above. Complete Release build passed, then all five direct
+  input-format, camera-gap and stale-boundary regressions passed (16.33 s).
+- `git diff --check` passed. Source is pushed on astra/se5-quality-continuity,
+  PR126 into claude/se5-tox2-gates. No new live-game acceptance is claimed.
+
+### Package and handoff
+
+Prepared Documents/NA-se5-motion-1ebb7b7 from Opus's a42171b additive installer,
+with final runtime 1ebb7b7. DLL SHA256:
+`B3390C50E447E40530BBD576BB8D7290B600A0451C013C70D9962A2DD8404659`.
+All 22 payload hashes and five isolated installer checks passed: additive install,
+menu-setting preservation, corrupt-package rejection, exact rollback and foreign
+DLL preservation. The usual DLAA, DLSS-update and DLAA-fix-update CMDs, plus their
+Results/Rollback CMDs, now agree on this package. Previous launchers are preserved
+under main local/se5-continuity-20261107/public-cmd-before. Dedicated TOX2/play
+launchers are unchanged. No game installation or launch occurred this turn.
+
+Main COMMS/HANDOFF receipt 61a0a71 gives Opus the complete source/package chain;
+installation remains with him. CI was still running when handed off. Prior game
+acceptance of preceding repairs is not acceptance of this new package. The
+package contains this report through the completed automated validation section;
+this post-packaging receipt lives in source to avoid changing validated payloads.
