@@ -89,3 +89,13 @@ admissions. These are not silently relabeled as successful. No universal
 zero-miss or new live-game acceptance claim follows from this automated repair.
 
 Local detailed logs: `C:\Users\Cort\NeuralAliasAbundance\local\se5-continuity-20261107`.
+
+### Final resource-lifecycle pass
+
+The late-input scratch buffer is released with its completion-qualified slot at
+J2 shutdown; submitted recording leases keep their own references. This avoids
+reusing a buffer from a previous device when a recreated device has equal-sized
+images. Reading the descriptor increment now holds the existing device mutex,
+so shutdown cannot null the device during that access. No game-path GPU wait is
+introduced. This is a lifecycle completion of the new copy, separate from the
+captured interruption causes.

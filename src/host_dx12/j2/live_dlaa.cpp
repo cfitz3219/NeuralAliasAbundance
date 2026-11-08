@@ -5038,8 +5038,12 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
                 if(na::observe::ListShaderState(l,true,state) && state.resources){
                     for(const auto& table:op.tables) if(table.param==learned.input_param && learned.input_offset<table.count){
                         for(uint32_t i=0;i<state.count;++i)if(!state.tables[i].sampler && state.tables[i].param==table.param){
-                            binding=std::make_shared<LateInputBinding>();binding->heap=state.resources;
-                            binding->srv.ptr=state.tables[i].handle+UINT64(learned.input_offset)*g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                            UINT increment=0;
+                            {std::lock_guard<std::mutex> lock(g.m);if(g.device)increment=g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);}
+                            if(increment){
+                                binding=std::make_shared<LateInputBinding>();binding->heap=state.resources;
+                                binding->srv.ptr=state.tables[i].handle+UINT64(learned.input_offset)*increment;
+                            }
                         }
                     }
                 }
@@ -8135,7 +8139,7 @@ void Shutdown()
     std::lock_guard<std::mutex> lock(g.m);
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset(); g.jshift.Reset();
     g.msaa = MsaaResolve{};
-    for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; s.native_scale_resources={}; }
+    for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; s.native_scale_resources={}; s.late_input_buffer={}; }
     na::j2::flow::Shutdown(); // before the device and J2's fence go
     na::j2::compute_flow::Reset();
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
