@@ -385,6 +385,7 @@ struct Stats {
     uint64_t entry_rescued_writer=0; // of those, boundaries whose final writer differed from the learned one (SE5 bursts)
     uint64_t entry_rescued_memory=0; // of those, matched a remembered earlier delivered shape (not the previous frame's)
     uint32_t entry_shapes=0; // delivered frame shapes remembered (max 8)
+    uint64_t entry_shapes_retired=0; // remembered endings disproved by subsequent scene writes
     uint32_t entry_keys=0;
     // SE5 2026-11-02 (Cort: flicker only while panning): every frame whose DLAA ran and was then
     // followed by more scene drawing, newest first: what placed it and what drew after it.

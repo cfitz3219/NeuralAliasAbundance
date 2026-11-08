@@ -291,7 +291,8 @@ int main(int argc, char** argv)
     const bool entry_indirect=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-indirect")==0);
     const bool entry_split=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-split")==0);
     const bool entry_decoy=argc>3 && std::strcmp(argv[3],"--entry-decoy")==0;
-    const bool entry_boundary=argc>3 && std::strcmp(argv[3],"--entry-boundary")==0;
+    const bool entry_retire=argc>3 && std::strcmp(argv[3],"--entry-boundary-retire")==0;
+    const bool entry_boundary=entry_retire || (argc>3 && std::strcmp(argv[3],"--entry-boundary")==0);
     const bool entry_test=entry_boundary || entry_decoy || entry_real || entry_indirect || entry_split || (argc>3 && std::strcmp(argv[3],"--entry")==0);
     const bool real_ngx = entry_real || argc > 3 && std::strcmp(argv[3], "--real") == 0;
     // --planes: depth's two planes (depth, stencil) are transitioned by separate
@@ -848,7 +849,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         d.WaitIdle();
     }
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()) && SUCCEEDED(prepass.list->Close()));
-    na::settings::Get().j2_inline.store(inline_list && !auto_inline && !entry_split);
+    na::settings::Get().j2_inline.store(inline_list && !auto_inline && !entry_split && !entry_retire);
     // Fixed-route tests force between-list insertion so their frame-1 expectations hold;
     // the auto modes exercise the selector.
     na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
@@ -962,6 +963,18 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         scene.list->SetGraphicsRootSignature(rs.Get());
         if (alias_test) scene.list->SetGraphicsRootDescriptorTable(0, short_gpu);
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+        if (entry_retire && entry_frame >= 12) {
+            // The NEW final writer is also used earlier in this same recording.
+            // Its post-entry context is therefore genuinely ambiguous: only the
+            // last writer occurrence can deliver the finished picture. This keeps
+            // the pixel test from passing just through a newly accepted context.
+            D3D12_VIEWPORT v{0, 0, float(W), float(H), 0, 1};
+            D3D12_RECT s{0, 0, LONG(W), LONG(H)};
+            scene.list->RSSetViewports(1, &v); scene.list->RSSetScissorRects(1, &s);
+            scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            scene.list->SetPipelineState(entry_writers.at(2).Get());
+            scene.list->DrawInstanced(3, 1, 0, 0);
+        }
         if (inline_list) { // ...then, in the SAME list, post-processing reads the colour
             D3D12_RESOURCE_BARRIER rd2 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             scene.list->ResourceBarrier(1, &rd2);
@@ -992,8 +1005,32 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             if(entry_test){
                 scene.list->SetGraphicsRootSignature(rs.Get());scene.list->SetDescriptorHeaps(1,heaps);
                 scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
-                scene.list->SetPipelineState(entry_writers.at(entry_split?0:entry_boundary?entry_frame%2:entry_frame-1).Get());scene.list->DrawInstanced(3,1,0,0);
+                const int writer = entry_retire && entry_frame <= 8 ? (entry_frame <= 4 ? 0 : 1) :
+                    entry_split ? 0 : entry_boundary ? entry_frame % 2 : entry_frame - 1;
+                scene.list->SetPipelineState(entry_writers.at(writer).Get());scene.list->DrawInstanced(3,1,0,0);
                 scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
+                if (entry_retire && entry_frame >= 12) {
+                    // A previously successful ending is now MID-scene. The next
+                    // real scene draw overwrites an early DLAA result. Alternating
+                    // old endings must both be retired, not rescued forever from
+                    // memory and made to cycle the automatic route off/on.
+                    auto read = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    scene.list->ResourceBarrier(1, &read);
+                    scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
+                    scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+                    scene.list->SetPipelineState(post_pso.Get());
+                    scene.list->DrawInstanced(3, 1, 0, 0);
+                    std::swap(read.Transition.StateBefore, read.Transition.StateAfter);
+                    scene.list->ResourceBarrier(1, &read);
+                    scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+                    scene.list->SetDescriptorHeaps(1, heaps);
+                    scene.list->SetGraphicsRootSignature(rs.Get());
+                    scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+                    scene.list->SetPipelineState(entry_writers.at(2).Get());
+                    scene.list->DrawInstanced(3, 1, 0, 0);
+                    scene.list->SetDescriptorHeaps(1, ph);
+                    scene.list->SetGraphicsRootSignature(post_root.Get());
+                }
             }
             if (other_writer) { // the final scene write is a draw with another pipeline
                 scene.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -1126,7 +1163,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         na::j2::OnPresent(q);
         if (capture) na::capture::j2::OnPresent(q, presented.Get(), &PlainExecute);
         d.WaitIdle();
-        if(entry_test && entry_frame>=8){
+        if(entry_test && entry_frame >= (entry_retire ? 16 : 8)){
             if(entry_split || entry_decoy || entry_boundary)CHECK(fake::evals==frame_evals+1); // exactly one evaluation in each warmed frame
             const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
             dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
@@ -1196,18 +1233,25 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         return test::finish(auto_inline ? "j2_anno_shape_test (auto-inline)" : "j2_anno_shape_test (auto-between)");
     }
     if(entry_test){
-        for(int f=0;f<24;++f)REQUIRE(frame(.25*(f%4))==0);
+        for(int f=0;f<(entry_retire ? 40 : 24);++f)REQUIRE(frame(.25*(f%4))==0);
         const auto st=na::j2::GetStats();
         printf("POST ENTRY %u/%u downstream; matches %llu frames %llu late %llu real %u\n",entry_delivered,entry_checks,(unsigned long long)st.entry_matched,(unsigned long long)st.frames,(unsigned long long)st.inline_late_writes,real_ngx);
-        CHECK(entry_checks==17 && entry_delivered==17 && (entry_boundary ? st.entry_rescued_memory>=2 : entry_decoy ? st.class_matched+st.class_pair_matched>=17 : st.entry_matched>=17));
-        CHECK(st.no_camera==0 && st.no_state==0 && st.inline_late_writes==0);
+        const unsigned expected = entry_retire ? 25u : 17u;
+        CHECK(entry_checks==expected && entry_delivered==expected && (entry_boundary ? st.entry_rescued_memory>=2 : entry_decoy ? st.class_matched+st.class_pair_matched>=17 : st.entry_matched>=17));
+        CHECK(st.no_camera==0 && st.no_state==0);
+        if (entry_retire) {
+            CHECK(st.inline_late_writes <= 2); // one disproval per formerly valid ending
+            CHECK(st.entry_shapes_retired >= 2);
+            CHECK(st.legacy_matched >= expected); // true last occurrence, not context acceptance
+            CHECK(st.route.changes == 1 && st.route.contradictions <= 2);
+        } else CHECK(st.inline_late_writes==0);
         CHECK(st.depth_sources[1]+(entry_split?st.depth_sources[3]:0)>=17 && st.depth_state_assumed==0); // inherited or exact submitted-prefix state, never guessed
         if(entry_split)CHECK(st.between_observed>=9 && st.depth_sources[2]==0); // saved handoff exercised; no supplied substitute
         uint64_t depth_total=0,camera_total=0;
         for(const auto value:st.depth_sources)depth_total+=value;
         for(const auto value:st.camera_sources)camera_total+=value;
         CHECK(depth_total==st.frames && camera_total==st.frames); // count submissions, not attempts
-        CHECK(evaluations()-evals0>=17 && evaluations()-evals0<=24);
+        CHECK(evaluations()-evals0>=17 && evaluations()-evals0<=(entry_retire ? 40 : 24));
         CHECK(dev->GetDeviceRemovedReason()==S_OK);
         na::capture::j2::Shutdown();
         const auto cs=na::capture::j2::GetStats();

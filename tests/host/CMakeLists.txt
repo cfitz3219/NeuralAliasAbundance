@@ -303,7 +303,8 @@ if(NA_HAVE_NGX_SDK)
   add_test(NAME host_j2_post_entry_indirect_test COMMAND j2_anno_shape_test 1 1 --entry-indirect)
   add_test(NAME host_j2_post_entry_decoy_test COMMAND j2_anno_shape_test 1 1 --entry-decoy)
   add_test(NAME host_j2_post_entry_boundary_test COMMAND j2_anno_shape_test 1 1 --entry-boundary)
-  set_tests_properties(host_j2_post_entry_test host_j2_post_entry_indirect_test host_j2_post_entry_decoy_test host_j2_post_entry_boundary_test
+  add_test(NAME host_j2_post_entry_boundary_retire_test COMMAND j2_anno_shape_test 1 1 --entry-boundary-retire)
+  set_tests_properties(host_j2_post_entry_test host_j2_post_entry_indirect_test host_j2_post_entry_decoy_test host_j2_post_entry_boundary_test host_j2_post_entry_boundary_retire_test
     PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   set_tests_properties(host_j2_inline_copy_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
   add_test(NAME host_j2_inline_record_first_test COMMAND j2_anno_shape_test 1 1 --inline-record-first)
