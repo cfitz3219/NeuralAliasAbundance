@@ -5,6 +5,7 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/camera_interloper.hpp"
 #include "host_dx12/j2/game_motion.hpp"
+#include "host_dx12/j2/late_input.hpp"
 #include "host_dx12/j2/replay_motion.hpp"
 #include <unordered_map>
 #include <map>
@@ -83,7 +84,10 @@ constexpr size_t kMaxBlocks = 256;       // unique constant blocks examined per 
 constexpr uint32_t kMaxBlockRead = 1024; // bytes read from one constant buffer
 constexpr uint64_t kViewId = 0x4A32;     // DLSS view for this source ("J2")
 
+LateInputCopy g_late_input_copy;
+
 struct Slot {
+    LateInputCopy::Buffer late_input_buffer;
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
     UINT64 fence_value = 0;
@@ -116,6 +120,7 @@ struct PendingHistory {
 // CPU metadata of this frame's last submitted scene. No pooled command-list
 // pointer survives Execute: games reset those lists before the consumer arrives.
 struct SceneInput {
+    std::shared_ptr<LateInputBinding> late_input;
     uint64_t frame = 0, color = 0, depth = 0, producer = 0;
     uint32_t color_sub = 0, depth_sub = 0;
     uint32_t color_state=0,depth_state=0;
@@ -461,6 +466,7 @@ struct TraceIo {
     uint32_t w = 0, h = 0, fmt = 0, vfmt = 0;
     bool whole = false;
     char binding = 0;
+    uint32_t param=UINT_MAX, offset=0; // exact SRV table coordinate, resolved with the trace
 };
 struct NativeCrossing {
     uint64_t pso = 0, input = 0, output = 0, scene = 0;
@@ -470,17 +476,19 @@ struct NativeCrossing {
     // Execution-resolved input equals the last actual draw's sole target.
     // Unlike a current binding, this survives the game's OM unbind before CS.
     bool input_is_last_draw = false;
+    uint32_t input_param=UINT_MAX, input_offset=0;
     bool operator==(const NativeCrossing& b) const {
         return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
-            gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader;
+            gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader&&
+            input_param==b.input_param&&input_offset==b.input_offset;
     }
     // The same step reading another render-size image (p27252: SE5's pso 556 alternates its
     // input between #13433 and #13435 while the output #13437 stays).
     bool same_step(const NativeCrossing& b) const {
         return pso==b.pso&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
-            gx==b.gx&&gy==b.gy&&gz==b.gz;
+            gx==b.gx&&gy==b.gy&&gz==b.gz&&input_param==b.input_param&&input_offset==b.input_offset;
     }
 };
 struct TraceOp {
@@ -664,6 +672,10 @@ void trace_fill_io(const na::observe::NativeOperation& op, TraceOp& t){
                 !srv.Texture2D.MostDetailedMip && !srv.Texture2D.PlaneSlice);
             t.in.push_back(trace_view(d.resource.Get(), d.view.resource,
                 d.view.explicit_view ? uint32_t(srv.Format) : uint32_t(desc.Format), whole,'s'));
+            const auto index=static_cast<uint32_t>(&d-op.descriptors.data());
+            for(const auto& table:op.tables) if(index>=table.first && index-table.first<table.count){
+                t.in.back().param=table.param;t.in.back().offset=index-table.first;break;
+            }
         } else if (d.view.kind==NA_DESC_UAV) {
             const auto& uav = d.view.uav;
             const bool whole = !d.view.explicit_view || (uav.ViewDimension==D3D12_UAV_DIMENSION_TEXTURE2D &&
@@ -1038,11 +1050,13 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 const bool encoded=output->vfmt==DXGI_FORMAT_R16G16B16A16_FLOAT ||
                     in.vfmt==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || edge.srgb || sdr_present || unorm_handoff;
                 if (encoded && trace_same_color(in.vfmt,output->vfmt) && traces_scene(in.id,index)) {
-                    const NativeCrossing next{op.pso,in.id,output->id,scene,e.rw,e.rh,e.ow,e.oh,
+                    NativeCrossing next{op.pso,in.id,output->id,scene,e.rw,e.rh,e.ow,e.oh,
                                               in.vfmt,output->vfmt,op.gx,op.gy,op.gz,
                                               edge.reader_list && edge.reader_recording &&
                                               (edge.reader_list!=op.list || edge.reader_recording!=op.recording),
                                               op.compute && op.last_draw_rt==in.id};
+                    next.input_param=in.param;next.input_offset=in.offset;
+                    add(" input_binding=%u/%u",next.input_param,next.input_offset);
                     add(" input_last_draw=%u reader_separate=%u",unsigned(next.input_is_last_draw),unsigned(next.separate_reader));
                     if (candidate.pso && !(candidate==next)) ambiguous=true;
                     else candidate=next;
@@ -3501,7 +3515,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // I1.4: the Present-time source never touches the scene colour (DLSS reads the presented
     // picture), so its state at Present is not needed (Cort's 9346113 run: every attempt waited on it).
     const bool skip_color = saved && saved->at_present;
-    const bool have_sc = phys ? (sc = phys->color_state, true) : skip_color ? true : state_of(color_id, csub, &sc);
+    const bool late_input = inl && saved && saved->late_input;
+    const bool have_sc = late_input ? true : phys ? (sc = phys->color_state, true) : skip_color ? true : state_of(color_id, csub, &sc);
     bool have_sd = phys ? (sd = phys->depth_state, true) :
         saved && saved->native_depth_snapshot ? (sd = D3D12_RESOURCE_STATE_COPY_DEST, true) :
         state_of(depth_id, dsub, &sd);
@@ -3750,6 +3765,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             return false;
         }
     }
+    if(late_input && !g_late_input_copy.Prepare(g.device.Get(),g.color_in.Get(),s.late_input_buffer,*saved->late_input)){
+        reason("The native input's GPU copy could not be prepared.");return false;
+    }
     const bool repeat = unpacked || repeat_only;
     if (repeat && g.win.last_eval && g.frame > g.win.last_eval + 4) ++g.stats.window_repeat_stale; // an old picture, still better than a clipped one
     pending.tracker = g.tracker;
@@ -3880,11 +3898,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     addsub(b, depth.Get(), dsub, sd, SRC);
     add(b, g.depth32.Get(), NPSR, depth_msaa ? UAV : DST);
     if (!skip_color) {
-        addsub(b, color.Get(), csub, sc, color_source);
+        if(!late_input)addsub(b, color.Get(), csub, sc, color_source);
         add(b, g.color_in.Get(), NPSR, color_dest);
     }
     flush(l, b);
     if (skip_color) {
+    } else if(late_input){
+        g_late_input_copy.Record(l,*saved->late_input,s.late_input_buffer,g.color_in.Get());
     } else if (color_msaa) {
         l->ResolveSubresource(g.color_in.Get(), 0, color.Get(), csub, cf);
     } else {
@@ -4063,7 +4083,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     if (!have_motion) {
         if (inl) { // hand the game's list back with the scene colour in its own state
-            addsub(b, color.Get(), csub, color_source, sc);
+            if(!late_input)addsub(b, color.Get(), csub, color_source, sc);
             flush(l, b);
         } else {
             l->Close();
@@ -4109,7 +4129,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             }
             add(b,ambient->Color(),from,NPSR);addsub(b,color.Get(),csub,into,color_source);flush(l,b);
         }
-        if (!skip_color) addsub(b, color.Get(), csub, color_source, sc);
+        if (!skip_color && !late_input) addsub(b, color.Get(), csub, color_source, sc);
         add(b, g.motion.Get(), NPSR, UAV);
         flush(l, b);
         if (!inl && FAILED(l->Close())) { reason("Render-small: could not close the depth and motion list."); g.latched = true; return false; }
@@ -4367,7 +4387,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (evaluated && upscaling) {
         b.push_back(uav_barrier(g.output.Get()));
         add(b, g.output.Get(), UAV, SRC);
-        addsub(b, color.Get(), csub, color_source, sc); // the game's scene colour is left as drawn
+        if(!late_input)addsub(b, color.Get(), csub, color_source, sc); // the game's scene colour is left as drawn
         addsub(b, dest.Get(), dsub_out, sdest, DST);
         flush(l, b);
         D3D12_TEXTURE_COPY_LOCATION cs{}, cdst{};
@@ -4399,7 +4419,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         add(b, g.output.Get(), output_read, UAV);
         addsub(b, color.Get(), csub, color_write, sc);
     } else {
-        addsub(b, color.Get(), csub, color_source, sc);
+        if(!late_input)addsub(b, color.Get(), csub, color_source, sc);
     }
     add(b, g.motion.Get(), NPSR, UAV);
     flush(l, b);
@@ -4828,6 +4848,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         uint64_t input=0; // stretch finder: DLSS reads this render-size image (0 = the scene colour)
         bool verify=false, verify_rt=false; NativeCrossing crossing; // provisional: mark the game's own image, no DLSS
         bool separate_reader=false;
+        std::shared_ptr<LateInputBinding> late_input;
         bool late=false; // staged for submission-time resolution (stage_late); After() arms the boundary watch
     };
     // Private full-size HDR image for the F10 route (recreated on size/format change).
@@ -5008,17 +5029,39 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             std::vector<uint64_t> inputs;
             { std::lock_guard<std::mutex> lock(g_trace.m); inputs=g_trace.learned_inputs; }
             if (std::find(inputs.begin(),inputs.end(),learned.input)==inputs.end()) inputs.push_back(learned.input);
-            uint64_t chosen=0; unsigned written=0;
-            for (const auto id:inputs) if (na::observe::ListInsertionDecision(l,id).writes>0) { chosen=id; ++written; }
-            if (written!=1) chosen=inputs.size()==1?inputs[0]:0;
+            // A learned descriptor coordinate is stable even when the image is
+            // not the last RTV, or the game fills its table after recording.
+            std::shared_ptr<LateInputBinding> binding;
+            if(learned.input_param!=UINT_MAX &&
+               (learned.in_view==DXGI_FORMAT_R8G8B8A8_UNORM || learned.in_view==DXGI_FORMAT_R16G16B16A16_FLOAT)){
+                na::observe::ShaderState state;
+                if(na::observe::ListShaderState(l,true,state) && state.resources){
+                    for(const auto& table:op.tables) if(table.param==learned.input_param && learned.input_offset<table.count){
+                        for(uint32_t i=0;i<state.count;++i)if(!state.tables[i].sampler && state.tables[i].param==table.param){
+                            UINT increment=0;
+                            {std::lock_guard<std::mutex> lock(g.m);if(g.device)increment=g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);}
+                            if(increment){
+                                binding=std::make_shared<LateInputBinding>();binding->heap=state.resources;
+                                binding->srv.ptr=state.tables[i].handle+UINT64(learned.input_offset)*increment;
+                            }
+                        }
+                    }
+                }
+            }
+            uint64_t chosen=binding?learned.input:0; unsigned written=0;
+            if(!binding){
+                for (const auto id:inputs) if (na::observe::ListInsertionDecision(l,id).writes>0) { chosen=id; ++written; }
+                if (written!=1) chosen=inputs.size()==1?inputs[0]:0;
+            }
             // Two execution-resolved traces established that this consumer reads
             // the last drawn target. Sniper unbinds its RTV before dispatching;
             // retain the actual draw evidence rather than its current OM state.
             // Extent, format, state and producer checks below still apply.
-            if(learned.input_is_last_draw){
+            if(!binding && learned.input_is_last_draw){
                 const auto drawn=na::observe::ListLastDrawTarget(l);
                 if(drawn && na::observe::ListInsertionDecision(l,drawn).writes>0)chosen=drawn;
             }
+            // With binding, chosen is only a size/format template; never sampled.
             // Inline only when its dependencies are established BEFORE the dispatch is appended
             // (Astra audit items 1, 4, 5): the scene producer is this list or an already
             // submitted recording, and the input's state is known here or on the queue. Else
@@ -5035,8 +5078,8 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
                     }
                 }
                 uint32_t st=0;
-                const auto evidence=na::observe::ListStateSub(l,chosen,0,&st);
-                const bool state_ok=evidence==na::observe::StateLookup::Known ||
+                const auto evidence=binding?na::observe::StateLookup::Known:na::observe::ListStateSub(l,chosen,0,&st);
+                const bool state_ok=bool(binding) || evidence==na::observe::StateLookup::Known ||
                     (evidence==na::observe::StateLookup::Absent && g.queue && na::observe::KnownSubStateOnQueueNow(g.queue.Get(),chosen,0,&st));
                 if (!producer_ok) g_nb.st_late_no_producer.fetch_add(1,std::memory_order_relaxed);
                 if (!state_ok) g_nb.st_late_no_state.fetch_add(1,std::memory_order_relaxed);
@@ -5045,7 +5088,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
             if (inline_ok) {
                 auto c=std::make_shared<Candidate>();
                 c->color=scene;c->depth=depth;c->recording=op.recording;
-                c->producer=std::move(producer);
+                c->producer=std::move(producer);c->late_input=std::move(binding);
                 c->source.Attach(na::observe::AcquireResource(chosen));
                 c->guide.Attach(na::observe::AcquireResource(depth));
                 c->target.Attach(na::observe::AcquireResource(learned.output));
@@ -5336,7 +5379,7 @@ public:
                     staged.has_camera=find_camera(one,0,depth,&staged.vp,&staged.reversed,&staged.interlopers);staged.judged=staged.has_camera;
                     staged.injected=g_injected;staged.jitter[0]=g_injected?g.jit.px[0]:0;staged.jitter[1]=g_injected?g.jit.px[1]:0;
                 }else staged=saved; // an established (submitted) producer, see pick_producer_locked
-                staged.color=c->input;staged.color_sub=0;
+                staged.color=c->input;staged.color_sub=0;staged.late_input=c->late_input;
                 if (staged.native_depth_snapshot) staged.depth_sub=0;
                 staged.require_current_states=true;
                 if(!uav_store(typed(c->source->GetDesc().Format))){skip("The upscale step's input format cannot be written by DLSS.");return false;}
@@ -5351,6 +5394,7 @@ public:
             auto owned=std::make_shared<std::vector<ComPtr<ID3D12Resource>>>();owned->reserve(16);
             *owned={c->source,c->guide,c->target};
             auto lease=na::nr::native::RetainRecording(l,owned);if(!lease)return false;
+            if(c->late_input && !na::nr::native::RetainRecording(l,c->late_input))return false;
             if (staged.native_depth_snapshot) {
                 owned->push_back(staged.native_depth_snapshot);
                 for (auto& snapshot:snapshots_) if (snapshot.texture.Get()==staged.native_depth_snapshot.Get()) snapshot.reader=lease;
@@ -5388,6 +5432,7 @@ public:
                 // Appended, never replaced: the prepared tables' resources stay owned too.
                 for(const auto& r:{c->source,c->guide,c->target,g.color_in,g.depth32,g.motion,g.output,g.sharp,g.provenance,g.jshift})if(r)owned->push_back(r);
                 if(op)owned->push_back(full_.tex); // Sol 697b223: the private image lives as long as the recording
+                if(c->late_input && g.slots[slot].late_input_buffer.resource)owned->push_back(g.slots[slot].late_input_buffer.resource);
                 g.slots[slot].native_scale_use=lease;
             }
             // Delivery probe (diagnostic sessions only): after the write-back into the
@@ -5676,9 +5721,13 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
             // End-of-list metadata is useful only if its final image has not
             // already been consumed within that recording.
             if (!consumed && na::observe::ListRendersTo(lists[i], color, depth) &&
-                na::observe::ListSceneSubresource(lists[i], color, depth, &saved.color_sub, &saved.depth_sub) &&
-                find_camera(lists, i, depth, &saved.vp, &saved.reversed, &saved.interlopers)) {
-                saved.judged = true;
+                na::observe::ListSceneSubresource(lists[i], color, depth, &saved.color_sub, &saved.depth_sub)) {
+                // Keep the actual scene handoff even if this list has no readable
+                // camera. record() already recovers the current J1 camera or a
+                // bounded recent camera; rejecting here bypassed that path and
+                // made a one-frame read gap flash the unprocessed picture.
+                saved.has_camera=find_camera(lists,i,depth,&saved.vp,&saved.reversed,&saved.interlopers);
+                saved.judged = saved.has_camera;
                 saved.frame = g.frame; saved.color = color; saved.depth = depth; saved.producer = producer;
                 saved.jitter[0] = g_injected ? g.jit.px[0] : 0;
                 saved.jitter[1] = g_injected ? g.jit.px[1] : 0;
@@ -8090,7 +8139,7 @@ void Shutdown()
     std::lock_guard<std::mutex> lock(g.m);
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset(); g.jshift.Reset();
     g.msaa = MsaaResolve{};
-    for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; s.native_scale_resources={}; }
+    for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; s.native_scale_resources={}; s.late_input_buffer={}; }
     na::j2::flow::Shutdown(); // before the device and J2's fence go
     na::j2::compute_flow::Reset();
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
@@ -8098,6 +8147,7 @@ void Shutdown()
     na::observe::SetDrawReplay(0, nullptr);
     g.replay = na::j2::replay_motion::Pass{}; g.replay_ok = false; g.replay_fed_frame = 0;
     g.game_motion = na::j2::game_motion::Feed{}; g.game_motion_ok = false; g.game_motion_logged = false; g.game_motion_used = -2;
+    g_late_input_copy=LateInputCopy{};
     g_dbg = DebugPass{};
     g_rcas = RcasPass{};
     g_jshift = JitterShift{}; // released here, not in static destruction after D3D12 has gone

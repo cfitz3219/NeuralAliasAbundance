@@ -289,7 +289,8 @@ int main(int argc, char** argv)
     const bool entry_real=argc>3 && std::strcmp(argv[3],"--entry-real")==0;
     const bool entry_split_indirect=argc>3 && std::strcmp(argv[3],"--entry-split-indirect")==0;
     const bool entry_indirect=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-indirect")==0);
-    const bool entry_split=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-split")==0);
+    const bool entry_camera_gap=argc>3 && std::strcmp(argv[3],"--entry-split-camera-gap")==0;
+    const bool entry_split=entry_camera_gap || entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-split")==0);
     const bool entry_decoy=argc>3 && std::strcmp(argv[3],"--entry-decoy")==0;
     const bool entry_retire=argc>3 && std::strcmp(argv[3],"--entry-boundary-retire")==0;
     const bool entry_boundary=entry_retire || (argc>3 && std::strcmp(argv[3],"--entry-boundary")==0);
@@ -921,6 +922,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         Store(cpu + kBlock + kVp + 192, Proj()); // the camera's own projection, in the same block
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
         Store(cpu + kPre + kVp + 128, inv);
+        if(entry_camera_gap && (entry_frame==12 || entry_frame==18))std::memset(cpu,0,4096);
         std::memset(lens_cpu, 0, 256);
         M lens_p = Proj();
         if (column_component) for (int r = 0; r < 4; ++r) for (int c = r + 1; c < 4; ++c) std::swap(lens_p[r * 4 + c], lens_p[c * 4 + r]);
@@ -1134,6 +1136,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 uint8_t original[64]; Store(original, vp);
                 const auto f = [](const uint8_t* p, size_t i) { float v; std::memcpy(&v, p + i * 4, 4); return double(v); };
                 for (size_t block : {size_t(kBlock), size_t(kPre)}) {
+                    if(entry_camera_gap && (entry_frame==12 || entry_frame==18)){
+                        REQUIRE(jx==0 && jy==0); // unreadable camera was not jittered
+                        continue;
+                    }
                     const auto* raster = cpu + block + kVp;
                     const double dx = (f(raster, 3) / f(raster, 15) - f(original, 3) / f(original, 15)) * W / 2;
                     const double dy = -(f(raster, 7) / f(raster, 15) - f(original, 7) / f(original, 15)) * H / 2;
@@ -1247,6 +1253,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         } else CHECK(st.inline_late_writes==0);
         CHECK(st.depth_sources[1]+(entry_split?st.depth_sources[3]:0)>=17 && st.depth_state_assumed==0); // inherited or exact submitted-prefix state, never guessed
         if(entry_split)CHECK(st.between_observed>=9 && st.depth_sources[2]==0); // saved handoff exercised; no supplied substitute
+        if(entry_camera_gap)CHECK(st.camera_held>=2);
         uint64_t depth_total=0,camera_total=0;
         for(const auto value:st.depth_sources)depth_total+=value;
         for(const auto value:st.camera_sources)camera_total+=value;
