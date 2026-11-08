@@ -40,6 +40,8 @@ float4 PS(V v):SV_Target{return float4(v.uv,0,1);})";
         const float jx=round?-.375f:.25f,jy=round?.125f:-.375f;
         l.list->SetGraphicsRootSignature(root.Get());l.list->SetPipelineState(scene.Get());l.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         l.list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);D3D12_VIEWPORT vp{0,0,float(W),float(H),0,1};l.list->RSSetViewports(1,&vp);
+        const float clear[]{1,1,1,1};
+        l.list->ClearRenderTargetView(rtv,clear,0,nullptr);
         D3D12_RECT sc{0,0,32,32};l.list->RSSetScissorRects(1,&sc);
         if (!round) {
             // An entirely inactive call can skip the jitter registry. A later
@@ -64,7 +66,14 @@ float4 PS(V v):SV_Target{return float4(v.uv,0,1);})";
         l.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);l.list->ResourceBarrier(1,&barrier);
         REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* lists[]={l.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
         float* pixels=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,reinterpret_cast<void**>(&pixels))));
-        for(UINT X:{16u,48u}){const auto k=(20*W+X)*4;CHECK(std::abs(pixels[k]-(float(X)+.5f-jx)/W)<1e-5f);CHECK(std::abs(pixels[k+1]-(20.5f-jy)/H)<1e-5f);}
+        for(UINT X:{0u,16u,48u,W-1}){
+            const auto k=(20*W+X)*4;
+            CHECK(std::abs(pixels[k]-(float(X)+1.f-jx)/(W+1))<1e-5f);
+            CHECK(std::abs(pixels[k+1]-(21.f-jy)/(H+1))<1e-5f);
+        }
+        CHECK(pixels[(20*W+W-1)*4+2]==0.f);
+        CHECK(pixels[((H-1)*W+16)*4+2]==0.f);
+        CHECK(pixels[16*4+2]==0.f);
         CHECK(std::abs(pixels[(10*W+32)*4]-32.5f/W)<1e-5f);CHECK(std::abs(pixels[(10*W+32)*4+1]-10.5f/H)<1e-5f);rb->Unmap(0,nullptr);
     }
     na::observe::SetSceneViewportJitter(0,0,0);CHECK(dev->GetDeviceRemovedReason()==S_OK);na_observe_stop();na::observe::SetProcessExiting();
