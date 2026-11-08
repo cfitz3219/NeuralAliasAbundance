@@ -7410,3 +7410,11 @@ Ready package C:\Users\Cort\Documents\NA-se5-motion-1ebb7b7, DLL SHA256 B3390C50
 ### 2026-11-08 02:20Z — Claude (DLAA-flicker thread) — PR126 merged into claude/se5-tox2-gates (a74cf9d); 1ebb7b7 is the single build
 
 Cort: "merge Astra's fix with this one; if it's stable we move on to another game." PR126 (astra/se5-quality-continuity, head 62ad944, CI green x6, mergeable clean) merged into claude/se5-tox2-gates as a74cf9d. a42171b was already an ancestor, so the lane's code equals runtime 1ebb7b7. No rebuild: Astra's staged Documents\NA-se5-motion-1ebb7b7 (DLL B3390C50…, 22 hashes, 5 installer checks) is the package, and NA-se5-dlaa.cmd / NA-se5-dlss-update.cmd / NA-se5-dlaa-fix-update.cmd already point at it. Cort installs it himself; acceptance = his run's log (history_resets, no_candidate deltas, presents-luma), not these receipts.
+
+### 2026-11-08 21:05Z — Claude (DLAA-flicker thread) — 1ebb7b7 run p48964: Quality stable for 21 min
+
+Results Documents/NA-se5-results-20261108-125805 (run 2026-11-07 18:15–18:37 local, saved 11-08 12:58; manifest sourceCommit 1ebb7b7). Quality only (scale_mode 1 throughout; no DLAA stretch, so TOX2 never ran: draw_replay gpu_nonzero=0).
+- j2_summary history_resets=0, route_changes=1; j2_coverage 79,776 of 81,516 presents with DLSS (97.9%); native_delivery best_streak 27,695.
+- All 1,739 uncovered presents fall in three windows only: level start 18:15:56, 18:19:06–18:19:21 (fps 165, executed frames 0 = loading/menu, no scene), and 18:36:49–18:36:59 (quitting). Gameplay 18:19:26–18:36:44 (~17 min): zero misses. The 17:03 p2740-style Quality drop-out (Astra's late-input fix) did not recur.
+- Summary verdict reads "presented picture UNRESOLVED (unresolved_no_marked_delivery)": no screen-marker session ran this time; not a failure signal.
+- DLAA on 1ebb7b7 is not separately run-tested; its last evidence is p2740 (8503d19): 0 resets, loop gone.
