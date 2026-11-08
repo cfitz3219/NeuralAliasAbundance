@@ -12,6 +12,7 @@
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
 #include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/native_hud.hpp"
@@ -109,6 +110,9 @@ DWORD WINAPI InitThread(LPVOID)
     }
     na::settings::SetIniPath(g_ini);
     na::settings::Load();
+    // DX11 games ([dx11on12] enabled=1): their D3D11 device is built on our D3D12 queue, so the
+    // whole DX12 program runs on them unchanged. Hooked here, before the game creates its device.
+    na::on12::Start(g_ini, &boot_log);
     na::host::StartSession();
     // DRED (Windows' own device-removed diagnostics): must be on before the game creates its
     // D3D12 device, which waits for this thread. Report beside the status log.

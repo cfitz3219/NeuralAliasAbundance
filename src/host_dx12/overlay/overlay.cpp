@@ -28,6 +28,7 @@
 #include "host_dx12/overlay/submission_tracking.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/overlay/dlss_debug.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -163,6 +164,15 @@ HRESULT real_get_buffer(IDXGISwapChain* sc, UINT i, REFIID riid, void** out)
     NativeBufferRead scope;
     return sc->GetBuffer(i, riid, out);
 }
+// The swap chain's D3D12 device; for a DX11 game on our 11on12 device, the D3D12 device behind it.
+HRESULT swapchain_d3d12_device(IDXGISwapChain* sc, ComPtr<ID3D12Device>& out)
+{
+    HRESULT hr = sc->GetDevice(IID_PPV_ARGS(&out));
+    if (SUCCEEDED(hr)) return hr;
+    ComPtr<IUnknown> any;
+    if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&any)))) out.Attach(na::on12::DeviceFor(any.Get()));
+    return out ? S_OK : hr;
+}
 UINT real_index(IDXGISwapChain* sc)
 {
     if(!sc)return 0xFFFFFFFFu;
@@ -198,7 +208,11 @@ void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
 {
     if (!device_or_queue || !swapchain) return;
     ComPtr<ID3D12CommandQueue> q;
-    if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) return; // D3D11 / other device: not ours
+    if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) {
+        // A DX11 game on our 11on12 device presents on the D3D12 queue behind it.
+        q.Attach(na::on12::QueueFor(device_or_queue));
+        if (!q) return; // D3D11 / other device: not ours
+    }
     std::lock_guard<std::mutex> lk(g_swap_queue_m);
     for (auto& e : g_swap_queues)
         if (e.sc == swapchain) { e.queues.Created(q.Get()); e.color_space=DXGI_COLOR_SPACE_CUSTOM; g_swap_queues_recorded.fetch_add(1); return; } // address reused
@@ -891,6 +905,8 @@ void write_status_line()
     }
     char safe_line[144];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s renderer_ready=%u shared_writer=%u clean_exit_hook=%u\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason(),na::host::SessionReady()?1u:0u,na::settings::CanPersist()?1u:0u,na::host::CleanExitObserved()?1u:0u);
     if(safe_bytes>0)WriteFile(f, safe_line, static_cast<DWORD>((std::min)(safe_bytes, static_cast<int>(sizeof(safe_line)-1))), &written, nullptr);
+    {char on12_line[384];const int on12_bytes=na::on12::FormatStatus(on12_line,sizeof(on12_line)-2);
+     if(on12_bytes>0){WriteFile(f,on12_line,static_cast<DWORD>((std::min)(on12_bytes,static_cast<int>(sizeof(on12_line)-3))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}}
     char fg_inputs[512];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
@@ -2409,7 +2425,7 @@ bool ensure_init_locked(IDXGISwapChain* sc)
         bool committed=false;
         ~MenuAttempt(){if(!committed)discard_menu_init_locked();}
     } attempt;
-    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))) return false;
+    if (FAILED(swapchain_d3d12_device(sc, g_state.device))) return false;
     na::gputime::SetDevice(g_state.device.Get());
     g_state.rtv_stride = g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     g_state.srv_stride = g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -3065,7 +3081,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
         g_retargets.fetch_add(1, std::memory_order_relaxed);
     }
     if(!g_state.device){
-        if(SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))){
+        if(SUCCEEDED(swapchain_d3d12_device(sc,g_state.device))){
             na::gputime::SetDevice(g_state.device.Get());
             g_seen_device.store(g_state.device.Get(),std::memory_order_release);
             if(seen_push(SeenKind::Device,g_state.device.Get()))g_device_announced.store(true,std::memory_order_release);
