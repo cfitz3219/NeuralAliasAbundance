@@ -148,7 +148,8 @@ struct ListState {
     na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
     uint32_t entry_barrier=0;
     bool restorable = true;              // false after work whose state effects we cannot replay
-    bool game_stream_output = false;
+    bool game_stream_output = false;     // a stream-output target of the game is bound now (any slot)
+    D3D12_GPU_VIRTUAL_ADDRESS game_so[D3D12_SO_BUFFER_SLOT_COUNT]{};
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
     D3D12_VIEWPORT raster_viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     D3D12_RECT raster_scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
@@ -3199,6 +3200,7 @@ struct On<sl::list::Reset> {
                     ls->vertex_mask=0;ls->index_known=false;ls->index_buffer={};ls->stencil_ref=0;
                     std::fill_n(ls->blend_factor,4,0.f);ls->predicate=nullptr;ls->predicate_offset=0;
                     ls->game_stream_output = false;
+                    std::fill_n(ls->game_so, D3D12_SO_BUFFER_SLOT_COUNT, D3D12_GPU_VIRTUAL_ADDRESS{0});
                     ls->raster_targets_known = false;
                     ls->raster_tracking = g_raster_tracking.load(std::memory_order_acquire);
                 }
@@ -3448,19 +3450,21 @@ struct On<sl::list::ClearState> {
         s.raster_targets_known=s.raster_viewports_known=s.raster_scissors_known=s.raster_topology_known=true;
         s.raster_topology=D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;s.restorable=true;
         s.vertex_mask=0;s.index_known=false;s.index_buffer={};s.stencil_ref=0;std::fill_n(s.blend_factor,4,0.f);
-        s.game_stream_output=false;s.predicate=nullptr;s.predicate_offset=0;++s.key_revision[0];++s.key_revision[1];++s.read_revision[0];++s.read_revision[1];
+        s.game_stream_output=false;std::fill_n(s.game_so,D3D12_SO_BUFFER_SLOT_COUNT,D3D12_GPU_VIRTUAL_ADDRESS{0});s.predicate=nullptr;s.predicate_offset=0;++s.key_revision[0];++s.key_revision[1];++s.read_revision[0];++s.read_revision[1];
     });}
 };
 template <>
 struct On<sl::list::SOSetTargets> {
-    static void run(GL* list, UINT, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views)
+    static void run(GL* list, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views)
     {
-        if (!views || !count) return;
+        // Track each slot, so unbinding (null views or zero locations) clears the state again.
+        // Previously the first binding made every later draw of the recording ineligible.
         with_list_state(list, [&](ListState& state) {
             std::lock_guard<std::mutex> lock(state.bind_m);
-            for (UINT i = 0; i < count; ++i) {
-                if (views[i].BufferLocation) { state.game_stream_output = true; break; }
-            }
+            for (UINT i = 0; i < count && start + i < D3D12_SO_BUFFER_SLOT_COUNT; ++i)
+                state.game_so[start + i] = views ? views[i].BufferLocation : 0;
+            state.game_stream_output = false;
+            for (const auto location : state.game_so) state.game_stream_output |= location != 0;
         });
     }
 };
