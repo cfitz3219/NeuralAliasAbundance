@@ -277,7 +277,7 @@ struct State {
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
     using LearnedInsertion = na::j2::LearnedInsertion;
-    LearnedInsertion insertion_frame, insertion_learned;
+    LearnedInsertion insertion_frame, insertion_learned, submitted_boundary;
     // Scene-end shapes of recent frames that DID get DLAA (SE5 p31032, 2026-11-06: the game
     // alternates between two frame shapes; with only the previous frame's shape learned,
     // every shape change missed, so DLSS flipped on/off frame by frame). Most recent first.
@@ -294,6 +294,7 @@ struct State {
         uint32_t writes = 0;
         uint64_t color = 0;
         PendingHistory history;
+        LearnedInsertion boundary; // actual insertion prefix, retained through submission
         bool valid = false;
         // Separate-list producer of a native delivery (Sol bafa40a): recorded before
         // the producer was submitted; its order is confirmed when the game submits.
@@ -4687,6 +4688,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     g.inl.writes = current.writes;
     g.inl.color = color_id;
     g.inl.history = pending;
+    g.inl.boundary = {color_id, depth_id, current};
     g.inl.valid = true;
     g.inl_frame = g.frame;
     ++g.stats.inline_recorded;
@@ -5412,7 +5414,7 @@ public:
 
             {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"%s",c->input?"DLSS reconstructs at the game's own upscale step (its render-size input).":"DLSS reconstructs at the game's own upscale pass.");}
             g.slot=(slot+1)%kRing;g.inl.list=l;g.inl.rec=c->recording;g.inl.frame=g.frame;g.inl.slot=slot;
-            g.inl.writes=na::observe::ListInsertionDecision(l,color).writes;g.inl.color=color;g.inl.history=pending;g.inl.valid=true;g.inl_frame=g.frame;
+            g.inl.writes=na::observe::ListInsertionDecision(l,color).writes;g.inl.color=color;g.inl.history=pending;g.inl.boundary={};g.inl.valid=true;g.inl_frame=g.frame;
             g.inl.producer={};g.inl.producer_list=0;g.inl.producer_rec=0;
             if(!local){g.inl.producer=saved.native_origin;g.inl.producer_list=saved.native_list;g.inl.producer_rec=saved.native_recording;}
             g.inl.dest=c->dest;g.inl.dest_writes=c->dest?na::observe::ListInsertionDecision(l,c->dest).writes:0;
@@ -7549,6 +7551,25 @@ void OnPresent(ID3D12CommandQueue* queue)
             }
             g.stats.active = g.submitted_frame == g.frame;
         }
+        if (g.submitted_frame == g.frame && g.submitted_boundary.color &&
+            g.stats.inline_late_writes + g.stats.post_scene_batches > g.route_prev_late_class) {
+            // A once-terminal boundary can become intermediate when an optional
+            // scene pass appears. Withdraw every cached alias matching the actual
+            // executed prefix; otherwise FindBoundary rescues it forever despite
+            // the entry profile learning "middle", and the route cycles 3 on/2 off.
+            // Do this only after submission and observed later writes. The current
+            // completed frame still teaches its true final boundary below.
+            int kept = 0;
+            for (int i = 0; i < g.delivered_shape_count; ++i) {
+                if (na::j2::MatchesBoundary(g.delivered_shapes[i], g.submitted_boundary.color,
+                        g.submitted_boundary.depth, g.submitted_boundary.decision)) {
+                    ++g.stats.entry_shapes_retired;
+                } else g.delivered_shapes[kept++] = g.delivered_shapes[i];
+            }
+            g.delivered_shape_count = kept;
+            g.stats.entry_shapes = static_cast<uint32_t>(kept);
+        }
+        g.submitted_boundary = {};
         if (g.insertion_frame.color) {
             g.insertion_learned = g.insertion_frame;
             if (g.submitted_frame == g.frame && g.stats.inline_late_writes + g.stats.post_scene_batches == g.route_prev_late_class) {
@@ -7865,6 +7886,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.inl.history.has_interlopers) g.interlopers = g.inl.history.interlopers;
         g.eval_selection_version = g.inl.history.selection_version;
         committed_sources(g.inl.history);
+        g.submitted_boundary = g.inl.boundary;
         if (g.inl.history.native_delivery) { native_delivery_submitted(producer_order, producer_refusal, later_dest_writes, g.frame); probe_submitted(g.inl.frame, producer_order); }
         if (g.inl.history.native_delivery && producer_order) ++g.stats.native_deliveries;
         g.submitted_frame = g.frame;
@@ -8112,7 +8134,7 @@ void Shutdown()
     g.scene_w = g.scene_h = 0;
     g.class_fired = false;
     g.route_prev_late_class = 0;
-    g.insertion_frame = g.insertion_learned = {};
+    g.insertion_frame = g.insertion_learned = g.submitted_boundary = {};
     g.delivered_shape_count = 0;
     g.inl = State::InlinePending{};
     g.inl_frame = 0;
