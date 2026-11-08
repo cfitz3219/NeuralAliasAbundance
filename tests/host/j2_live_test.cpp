@@ -241,6 +241,7 @@ int main(int argc,char** argv)
     const bool native_latebind=native_se5&&argc>1&&std::strstr(argv[1],"latebind")!=nullptr;
     const bool native_rotate=native_latebind&&std::strstr(argv[1],"rotate")!=nullptr;
     const bool native_layout_change=native_latebind&&std::strstr(argv[1],"layout-change")!=nullptr;
+    const bool native_earlier_input=native_layout_change&&std::strstr(argv[1],"earlier-input")!=nullptr;
     const bool native_inherited=native_latebind&&std::strstr(argv[1],"inherited")!=nullptr;
     const bool native_close_race=native_latebind&&std::strstr(argv[1],"close-race")!=nullptr;
     const bool native_close_before=native_close_race&&std::strstr(argv[1],"close-before")!=nullptr;
@@ -412,8 +413,9 @@ int main(int argc,char** argv)
         // callback, destination injection or test-only bridge matcher. The
         // existing operation shadow must find the source/destination itself.
         constexpr uint32_t OW=96,OH=48;
-        const auto format=native_late?DXGI_FORMAT_R8G8B8A8_TYPELESS:DXGI_FORMAT_R16G16B16A16_FLOAT;
-        const auto view_format=native_late?DXGI_FORMAT_R8G8B8A8_UNORM:format;
+        const bool late_fp16=native_earlier_input && std::strstr(argv[1],"fp16")!=nullptr;
+        const auto format=native_late&&!late_fp16?DXGI_FORMAT_R8G8B8A8_TYPELESS:DXGI_FORMAT_R16G16B16A16_FLOAT;
+        const auto view_format=native_late&&!late_fp16?DXGI_FORMAT_R8G8B8A8_UNORM:format;
         const auto flags=D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         auto native=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
         REQUIRE(native);
@@ -850,6 +852,18 @@ int main(int argc,char** argv)
                         const D3D12_VIEWPORT vp{0,0,float(W),float(H),0,1};const D3D12_RECT sc{0,0,LONG(W),LONG(H)};
                         target_list->RSSetViewports(1,&vp);target_list->RSSetScissorRects(1,&sc);
                         target_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);target_list->DrawInstanced(3,1,0,0);
+                        if(native_earlier_input && iteration>=85){
+                            // The late descriptor reads the earlier image, not
+                            // the last drawn same-size image. Readback must see
+                            // its grey pixels, never the later blue decoy.
+                            auto other=test::Transition(alternate_late.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            target_list->ResourceBarrier(1,&other);
+                            auto alt=h;alt.ptr+=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                            target_list->OMSetRenderTargets(1,&alt,FALSE,nullptr);
+                            target_list->DrawInstanced(3,1,0,0);
+                            const float blue[]{0,0,1,1};target_list->ClearRenderTargetView(alt,blue,0,nullptr);
+                            std::swap(other.Transition.StateBefore,other.Transition.StateAfter);target_list->ResourceBarrier(1,&other);
+                        }
                     }
                     if(!native_layout_change){
                         auto write=test::Transition(late.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -891,7 +905,7 @@ int main(int argc,char** argv)
                     // frames with the reader and later HUD in this same list.
                     if(native_layout_change){
                         const auto drawn=na::observe::ListLastDrawTarget(target_list);
-                        CHECK(drawn==na::observe::IdOf(late.Get()));
+                        CHECK(drawn==na::observe::IdOf(native_earlier_input&&iteration>=85?alternate_late.Get():late.Get()));
                         target_list->OMSetRenderTargets(0,nullptr,FALSE,nullptr);
                         CHECK(na::observe::ListLastDrawTarget(target_list)==drawn);
                     }
