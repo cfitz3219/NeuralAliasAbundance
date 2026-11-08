@@ -117,3 +117,14 @@ Prepared standalone repair candidate `C:\Users\Cort\Documents\NA-se5-motion-abf7
 No game install or game testing was performed for abf70fd. The actual saved-run
 diagnosis and the automated repair verification are distinct from post-repair
 gameplay acceptance.
+
+Claude independently confirmed the same three-on/two-off timeline and warned
+that withdrawing the obsolete ending must not merely replace flicker with
+permanent misses. The final test-only refinement makes the NEW final writer
+also occur earlier in each recording, keeping its entry context ambiguous.
+The remembered-boundary path must select its true last occurrence. Both the
+existing alternate-ending test and this refined test pass; the latter retains
+25/25 settled final-pixel deliveries, 37 evaluations across 40 frames including
+cold startup, two initial misplaced evaluations that disprove the old endings,
+and no repeated route drop. Production DLL
+bytes remain identical to the packaged abf70fd candidate.

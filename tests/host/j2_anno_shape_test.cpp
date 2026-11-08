@@ -963,6 +963,18 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         scene.list->SetGraphicsRootSignature(rs.Get());
         if (alias_test) scene.list->SetGraphicsRootDescriptorTable(0, short_gpu);
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+        if (entry_retire && entry_frame >= 12) {
+            // The NEW final writer is also used earlier in this same recording.
+            // Its post-entry context is therefore genuinely ambiguous: only the
+            // last writer occurrence can deliver the finished picture. This keeps
+            // the pixel test from passing just through a newly accepted context.
+            D3D12_VIEWPORT v{0, 0, float(W), float(H), 0, 1};
+            D3D12_RECT s{0, 0, LONG(W), LONG(H)};
+            scene.list->RSSetViewports(1, &v); scene.list->RSSetScissorRects(1, &s);
+            scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            scene.list->SetPipelineState(entry_writers.at(2).Get());
+            scene.list->DrawInstanced(3, 1, 0, 0);
+        }
         if (inline_list) { // ...then, in the SAME list, post-processing reads the colour
             D3D12_RESOURCE_BARRIER rd2 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             scene.list->ResourceBarrier(1, &rd2);
@@ -1230,6 +1242,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         if (entry_retire) {
             CHECK(st.inline_late_writes <= 2); // one disproval per formerly valid ending
             CHECK(st.entry_shapes_retired >= 2);
+            CHECK(st.legacy_matched >= expected); // true last occurrence, not context acceptance
             CHECK(st.route.changes == 1 && st.route.contradictions <= 2);
         } else CHECK(st.inline_late_writes==0);
         CHECK(st.depth_sources[1]+(entry_split?st.depth_sources[3]:0)>=17 && st.depth_state_assumed==0); // inherited or exact submitted-prefix state, never guessed
