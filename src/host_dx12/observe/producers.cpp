@@ -4705,9 +4705,9 @@ static_assert(kRpStatCount <= 32, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
 // 83b0749/8cc8cb6 runs: noted=240 built=0 twin_queued=0 no_recipe=0, so every draw
 // stopped at a gate before the recipe lookup without a count. Each gate is counted.
-enum : uint32_t { kGateNotDirect, kGateNoRetain, kGateNoDepth, kGateNoList, kGateOtherDepth, kGateRenderPass, kGateState,
+enum : uint32_t { kGateNotDirect, kGateNoRetain, kGateNoDepth, kGateNoList, kGateOtherDepth, kGateRenderPass, kGateState, kGateBundle, kGatePredicate, kGateStreamOut,
                   kGateRecording, kGateNoPipeline, kGateNoDepthWrite, kGateMsaa, kGateViewport, kGateRootMismatch,
-                  kGateRootUnknown, kGateDirectHeap, kGateVsUav, kGateNoVertexBuffer, kGateCount };
+                  kGateRootUnknown, kGateDirectHeap, kGateVsUav, kGateNoVertexBuffer, kGateDepthMatched, kGateCount };
 std::atomic<uint64_t> g_rp_gate[kGateCount];
 void rp_gate(uint32_t k) { g_rp_gate[k].fetch_add(1, std::memory_order_relaxed); }
 
@@ -4893,13 +4893,24 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (ls->cur_ds != sel_depth) { rp_gate(kGateOtherDepth); return; }
         if (ls->in_render_pass) { rp_gate(kGateRenderPass); return; }
-        if (!ls->pso || !ls->restorable || ls->predicate || ls->game_stream_output) { rp_gate(kGateState); return; }
+        if (!ls->pso) { rp_gate(kGateState); return; }
+        if (!ls->restorable) { rp_gate(kGateBundle); return; }
+        if (ls->predicate) { rp_gate(kGatePredicate); return; }
+        if (ls->game_stream_output) { rp_gate(kGateStreamOut); return; }
         if (!ls->recording_observed.load() || !ls->generation_known.load() || !ls->coverage_complete.load()) { rp_gate(kGateRecording); return; }
         recording = ls->generation.load() + 1;
         const auto pipeline = g_objs.find(canon(ls->pso));
         if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) { rp_gate(kGateNoPipeline); return; }
         const auto* pc = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
-        if (pc->depth_enable != 1 || pc->depth_write != 1) { rp_gate(kGateNoDepthWrite); return; }
+        // Opaque geometry whose depth is already in the scene depth also qualifies: engines with a
+        // depth pre-pass draw their G-buffer pass with depth writes off and an EQUAL / LESS_EQUAL
+        // (GREATER_EQUAL when reversed) test. Blended or other-test draws stay out.
+        const bool depth_written = pc->depth_enable == 1 && pc->depth_write == 1;
+        const bool depth_matched = pc->depth_enable == 1 && pc->depth_write == 0 && pc->blend_enable_mask == 0 &&
+                                   (pc->depth_func == D3D12_COMPARISON_FUNC_EQUAL || pc->depth_func == D3D12_COMPARISON_FUNC_LESS_EQUAL ||
+                                    pc->depth_func == D3D12_COMPARISON_FUNC_GREATER_EQUAL);
+        if (!depth_written && !depth_matched) { rp_gate(kGateNoDepthWrite); return; }
+        if (depth_matched) rp_gate(kGateDepthMatched);
         if (pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS]) { rp_count(kRpStages); return; }
         if (!ls->raster_topology_known || ls->raster_topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) { rp_count(kRpTopology); return; }
         if (pc->sample_count != 1) { rp_gate(kGateMsaa); return; }
@@ -8332,8 +8343,8 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
     out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
     out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired); out->slots = v(kRpSlotsMade);
-    static const char* const names[kGateCount] = {"not_direct", "no_retain", "no_depth", "no_list", "other_depth", "render_pass", "state",
-        "recording", "no_pipeline", "no_depth_write", "msaa", "viewport", "root_mismatch", "root_unknown", "direct_heap", "vs_uav", "no_vb"};
+    static const char* const names[kGateCount] = {"not_direct", "no_retain", "no_depth", "no_list", "other_depth", "render_pass", "no_pso", "bundle", "predicated", "stream_out",
+        "recording", "no_pipeline", "no_depth_write", "msaa", "viewport", "root_mismatch", "root_unknown", "direct_heap", "vs_uav", "no_vb", "admitted_depth_tested"};
     int used = 0;
     out->gates[0] = 0;
     for (uint32_t k = 0; k < kGateCount; ++k) {
