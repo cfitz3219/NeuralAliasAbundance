@@ -86,3 +86,34 @@ The fixture uses a fake model to test scheduling and actual image delivery.
 It is not a claim that the repaired runtime has already passed Cort's gameplay.
 No game launch, installation, or replacement of public CMDs occurred in this
 investigation. Opus retains installation coordination.
+
+## Completed automated receipt and handoff
+
+Runtime commit **abf70fdc9432d30dd46907e1e9c8844deb407fdd**, PR124 targets
+`claude/se5-tox2-gates` at **304f1c9**, which already contains the separate edge
+fix. Read-only merge-tree check is clean. Opus can merge PR124 or cherry-pick
+abf70fd while retaining his TOX2 gate counters; do not replace that newer lane
+with this branch's baseline.
+
+The rebuilt affected suite completed **86 cases: 83 passed, 3 unsupported
+16x-MSAA skips, 0 failed**, 229.94 seconds. This includes automatic/forced
+placement, alternating/retired boundaries, late-bound native Quality producers,
+HUD, viewport jitter, draw replay, XeGTAO and five tests using real NVIDIA DLSS.
+Log: `C:\Users\Cort\NeuralAliasAbundance\local\se5-stale-boundary-regressions.log`.
+GitHub CI was still running at the handoff; no CI-success claim is made here.
+
+Prepared standalone repair candidate `C:\Users\Cort\Documents\NA-se5-motion-abf70fd`:
+
+- DLL SHA256: `470E9418603DA075A032226D453EF43C5B68BA2EFE22CC9F4F25CB665B6FABBC`.
+- All 20 payload hashes verified; all five isolated additive installation,
+  preferences preservation, corrupt package rejection, rollback and foreign-DLL
+  preservation checks passed.
+- Dedicated `NA-se5-dlaa-flicker-test.cmd` exists for this precise candidate;
+  public update/results/rollback launchers were not repointed.
+- Opus should build his combined lane after integrating the source fix, retaining
+  288d54b's TOX2 counter additions. The standalone candidate does not contain
+  those independent newer counter changes.
+
+No game install or game testing was performed for abf70fd. The actual saved-run
+diagnosis and the automated repair verification are distinct from post-repair
+gameplay acceptance.
