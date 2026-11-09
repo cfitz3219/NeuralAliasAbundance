@@ -7491,13 +7491,18 @@ bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na
 // that lands during the scan computes its own bit from the already-published set, so when the
 // last chunk is done the bits are exact. Until then g_hot_ready stays false (the original walk).
 constexpr uint32_t kHotScanChunk = 32768; // slots per Present (~1.5 MB of SlotInfo, well under a millisecond)
-bool g_hot_scan_active = false;           // present thread only
+// Scan state, under g_hot_scan_m: Present can run on several threads (one per chain), and two
+// concurrent refreshes would share these; the second one simply leaves (try-lock, no waiting).
+std::mutex g_hot_scan_m;
+bool g_hot_scan_active = false;
 size_t g_hot_scan_heap = 0;               // index into g_hot_scan_ids
 uint32_t g_hot_scan_word = 0;
 std::vector<na_object_id> g_hot_scan_ids; // heap ids snapshot when the scan began (heaps may come and go)
 void RefreshReadFilter()
 {
     if (g_hot_ready.load(std::memory_order_acquire) || t_host_work) return;
+    std::unique_lock<std::mutex> scan(g_hot_scan_m, std::try_to_lock);
+    if (!scan.owns_lock()) return; // another Present thread is refreshing
     uint64_t depth = 0, color = 0;
     GetLiveSelection(&depth, &color);
     if (!color) { g_hot_scan_active = false; return; } // nothing to filter for; no lock taken
@@ -7559,14 +7564,25 @@ void RefreshReadFilter()
     }
     if (g_hot_scan_heap < g_hot_scan_ids.size()) return; // more next Present
     g_hot_scan_active = false;
-    bool grown;
-    { std::lock_guard<std::mutex> lk(g_hot_pending_m); grown = g_hot_pending_n != 0 || g_hot_overflow; }
     uint64_t d2 = 0, c2 = 0;
     GetLiveSelection(&d2, &c2);
-    if (grown || c2 != g_hot_color) return; // the set moved during the scan: the next Present starts over
-    ++g_operation_revision; // per-list read caches were built without the filter; let them refill through it
-    g_hot_rebuilds.fetch_add(1, std::memory_order_relaxed);
-    g_hot_ready.store(true, std::memory_order_release);
+    if (c2 != g_hot_color) return; // the colour moved during the scan: the next Present starts over
+    {
+        // Astra (2026-11-09): the pending check and the ready publication must be one step under
+        // g_hot_pending_m. mark_hot_candidate adds its id and stores ready=false under that mutex, so
+        // a copy seen between an unlocked check and the store would have its false overwritten by our
+        // true while its id and bits are absent (a false "no read" skip).
+        std::lock_guard<std::mutex> lk(g_hot_pending_m);
+        if (g_hot_pending_n != 0 || g_hot_overflow) return; // the set grew during the scan
+        ++g_operation_revision; // per-list read caches were built without the filter; let them refill through it
+        g_hot_rebuilds.fetch_add(1, std::memory_order_relaxed);
+        g_hot_ready.store(true, std::memory_order_release);
+    }
+    // A colour change publishes ready=false without that mutex; re-check after our store so a change
+    // in between cannot be left overwritten (either it lands after our store, or we undo ours here).
+    uint64_t d3 = 0, c3 = 0;
+    GetLiveSelection(&d3, &c3);
+    if (c3 != g_hot_color) g_hot_ready.store(false, std::memory_order_release);
 }
 int FormatReadFilter(char* out, size_t n)
 {
@@ -8836,6 +8852,9 @@ void SetLiveSelection(uint64_t depth, uint64_t color)
     g_live_depth.store(depth, std::memory_order_relaxed);
     g_live_color.store(color, std::memory_order_relaxed);
     g_live_seq.fetch_add(1, std::memory_order_release); // even: consistent
+    // Again after the publish: RefreshReadFilter stores ready=true and then re-reads the selection,
+    // so a change is either seen by that re-read or its own false here lands after the true.
+    if (color != c0) g_hot_ready.store(false, std::memory_order_release);
 }
 void GetLiveSelection(uint64_t* depth, uint64_t* color)
 {
