@@ -29,6 +29,7 @@
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/overlay/dlss_debug.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
+#include "host_dx12/native11/input_provider.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -883,7 +884,24 @@ void write_status_line()
     ULONGLONG now = GetTickCount64();
     flush_events(); // timed transitions, written as soon as the discovery thread runs
     if (now - g_status_last_tick < 5000) return;
+    const bool have_interval = g_status_last_tick != 0;
+    const ULONGLONG elapsed = now - g_status_last_tick;
     g_status_last_tick = now;
+    if (na::on12::NativeRoute()) {
+        static uint64_t previous_frames = 0;
+        const uint64_t frames = na::native11::Stats().frames;
+        const double fps = have_interval && frames >= previous_frames
+            ? double(frames - previous_frames) * 1000.0 / double(elapsed) : 0.0;
+        previous_frames = frames;
+        char status[2048]{}, line[2240]{};
+        na::on12::FormatStatus(status, sizeof status);
+        SYSTEMTIME t{};
+        GetLocalTime(&t);
+        const int bytes = snprintf(line, sizeof line, "%02u:%02u:%02u fps=%.1f frame_ms=%.2f | %s\r\n",
+                                   t.wHour, t.wMinute, t.wSecond, fps, fps > 0 ? 1000.0 / fps : 0.0, status);
+        append_status_text(line, (std::min)(bytes, int(sizeof line) - 1));
+        return;
+    }
     {
         char el[160];
         const int en = snprintf(el, sizeof el, "event_log frame=%llu total=%llu dropped=%llu\r\n",
@@ -3633,8 +3651,27 @@ void note_menu_present_result(bool open, UINT flags, HRESULT result) {
         g_menu_skips.present_rejected.fetch_add(1, std::memory_order_relaxed);
     }
 }
+thread_local bool t_native11_present = false;
+struct Native11Present {
+    bool outer = !t_native11_present;
+    Native11Present(IDXGISwapChain* sc, UINT flags) {
+        if (!outer) return;
+        t_native11_present = true;
+        if ((flags & DXGI_PRESENT_TEST) || !na::native11::ObservePresent(sc)) return;
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        ComPtr<ID3D12CommandQueue> retained;
+        ID3D12CommandQueue* queue = nullptr;
+        if (present_prelude(sc, queue, retained)) menu_step(sc, queue, g_open.load(std::memory_order_acquire));
+    }
+    ~Native11Present() { if (outer) t_native11_present = false; }
+};
+
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
+    if (na::on12::NativeRoute()) {
+        Native11Present frame(sc, flags);
+        return g_orig_present(sc, sync, flags);
+    }
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
     na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
@@ -3671,6 +3708,10 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
 HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
+    if (na::on12::NativeRoute()) {
+        Native11Present frame(sc, flags);
+        return g_orig_present1(sc, sync, flags, pp);
+    }
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
     na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
@@ -3851,6 +3892,16 @@ HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
+    if (na::on12::NativeRoute()) {
+        na::native11::BeforeResize(sc);
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            if (g_state.swapchain == sc) release_buffers_locked();
+        }
+        const auto result = g_orig_resize(sc, count, w, h, fmt, flags);
+        na::native11::AfterResize(sc, result);
+        return result;
+    }
     // Reset may have retired the native FG recording without another Present.
     // Drop its completed image references before DXGI checks ResizeBuffers.
     na::nr::native::Maintain();
@@ -3872,6 +3923,16 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
 {
+    if (na::on12::NativeRoute()) {
+        na::native11::BeforeResize(sc);
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            if (g_state.swapchain == sc) release_buffers_locked();
+        }
+        const auto result = g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+        na::native11::AfterResize(sc, result);
+        return result;
+    }
     na::nr::native::Maintain();
     retire_nr_backbuffers(sc);
     {

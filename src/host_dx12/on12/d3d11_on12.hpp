@@ -81,6 +81,7 @@ bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* qu
 // D3D12 list submitted through the normal (observed) queue path, exactly like
 // a DX12 game's final copy. The program then sees a DX12 game, unchanged.
 bool Enabled();
+bool NativeRoute();
 
 // Factory CreateSwapChain / CreateSwapChainForHwnd: when `device` is one of
 // our 11on12 devices and the description can be presented by D3D12, returns

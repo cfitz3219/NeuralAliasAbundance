@@ -296,10 +296,12 @@ DWORD WINAPI InitThread(LPVOID)
     }
     // C8: discovery observation producers (H1/H2). Off by default until a
     // consumer (A5 classifier) runs; [observe] producers=1 turns them on.
-    na::observe::RequestInstall(GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
-    // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
+    const bool native11 = na::on12::NativeRoute();
+    const bool dx12_producers = !native11 && GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1;
+    na::observe::RequestInstall(dx12_producers);
+    // Each route supplies scene inputs through its own observer.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
-                       GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+                       (native11 || dx12_producers));
     wchar_t scene_camera_exe[MAX_PATH]{};
     GetPrivateProfileStringW(L"host", L"executable", L"", scene_camera_exe, MAX_PATH, g_ini);
     na::j2::EnableWwiiSceneCamera(na::j2::Configured() &&
@@ -466,9 +468,10 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
         if (tag_w[0]) WideCharToMultiByte(CP_ACP, 0, tag_w, -1, tag_a, 32, nullptr, nullptr);
         strncpy_s(g_status.tag, tag_a[0] ? tag_a : (default_tag ? default_tag : "HOST"), _TRUNCATE);
     }
-    if ((GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 ||
-         (GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1)) &&
-        GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1)
+    if (GetPrivateProfileIntW(L"native11", L"enabled", 0, g_ini) == 1 ||
+        ((GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 ||
+          GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1) &&
+         GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1))
         g_install_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
     if (!t) {
