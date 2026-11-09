@@ -3549,7 +3549,7 @@ void note_late_frame()
 // went from 2 us to ~100 us per call (250-620 ms/s of the translator thread; fps 105 -> 25-37).
 // Per-phase wall time of this callback, windowed per status line (j2_inline_cost), so the
 // expensive phase is named instead of inferred. A few calls per frame; two clock reads each phase.
-enum InlineCostPhase : uint32_t { kIcPre = 0, kIcLock, kIcQuery, kIcMatch, kIcRecord, kIcAfter, kIcCamera, kIcEvaluate, kIcCount };
+enum InlineCostPhase : uint32_t { kIcPre = 0, kIcLock, kIcQuery, kIcMatch, kIcRecord, kIcAfter, kIcCamera, kIcEvaluate, kIcSetup, kIcCopies, kIcFlow, kIcTextures, kIcGameMotion, kIcMotion, kIcAO, kIcFinish, kIcCount };
 std::atomic<uint64_t> g_ic_ticks[kIcCount]{}, g_ic_calls{0}, g_ic_deep{0}, g_ic_max{0};
 inline uint64_t ic_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
 struct InlineCost {
@@ -3873,6 +3873,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
+    if(t_ic) t_ic->mark(kIcSetup);
     pending.camera_source=(saved && saved->has_camera)?6u:from_j1?2u:held?(extrapolated?5u:held_still?3u:4u):1u;
     pending.camera_age=held?g.frame-g.cam_f1:0u;
     if (!held) remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
@@ -4090,6 +4091,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         *out_list = l;
         return true;
     }
+    if(t_ic) t_ic->mark(kIcCopies);
     // 1. Copy or resolve exactly the scene views into single-sample DLSS inputs.
     const UINT color_source = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : SRC;
     const UINT color_dest = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : DST;
@@ -4131,6 +4133,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         addsub(b, g.msaa.DepthCopy(), 0, NPSR, DST);
     } else add(b, g.depth32.Get(), DST, NPSR);
     flush(l, b);
+    if(t_ic) t_ic->mark(kIcFlow);
     // 2/3. camera motion vectors
     if (!deferred && !(saved && saved->at_present)) smear_step(); // smear test variants: native DLAA only
     bool have_motion = false;
@@ -4206,7 +4209,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             static const uint32_t kMotionFormats[] = {
                 DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_SNORM};
             na_object_id ids[6] = {};
+    if(t_ic) t_ic->mark(kIcTextures);
             const uint32_t found_n = na::observe::FindTextures(kMotionFormats, 4, w, h, ids, 6);
+    if(t_ic) t_ic->mark(kIcGameMotion);
             ComPtr<ID3D12Resource> hold[na::j2::game_motion::kCandidates];
             na::j2::game_motion::Candidate cands[na::j2::game_motion::kCandidates];
             uint32_t nc = 0;
@@ -4246,6 +4251,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 if (gs.measured >= 64) g.game_motion_logged = true;
             }
         }
+    if(t_ic) t_ic->mark(kIcMotion);
         bool use_replay_motion = false;
         // Tier 1 from the game's own draws replayed with stream output (producers.cpp "Draw replay"):
         // per-object motion where the game's own motion texture is unavailable.
@@ -4279,6 +4285,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         have_motion = g.arbiter.Dispatch(l, in, o, g.slot);
         if (have_motion && use_replay_motion && in.tier1_valid_flag) g.replay_fed_frame = g.frame;
     }
+    if(t_ic) t_ic->mark(kIcAO);
     if (!have_motion) {
         if (inl) { // hand the game's list back with the scene colour in its own state
             if(!late_input)addsub(b, color.Get(), csub, color_source, sc);
@@ -4358,6 +4365,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         *out_list = l;
         return true;
     }
+    if(t_ic) t_ic->mark(kIcSetup);
     // 4. DLSS at native resolution
     na::dlss::EvalDesc e{};
     const int smear = smear_mode();
@@ -4420,7 +4428,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     if (t_ic) t_ic->mark(kIcEvaluate);
     const bool evaluated = na::dlss::Evaluate(l, e);
-    if (t_ic) t_ic->mark(kIcRecord);
+    if (t_ic) t_ic->mark(kIcFinish);
     if (!evaluated) ++g.stats.dlss_failed;
     if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
     if (evaluated && na::capture::j2::Armed()) {
@@ -8350,9 +8358,9 @@ int FormatInlineCost(char* out, size_t n)
     const uint64_t calls = g_ic_calls.exchange(0, std::memory_order_relaxed), deep = g_ic_deep.exchange(0, std::memory_order_relaxed),
                    mx = g_ic_max.exchange(0, std::memory_order_relaxed);
     return std::snprintf(out, n,
-        "j2_inline_cost calls=%llu past_lock=%llu us{pre=%.0f lock_wait=%.0f query=%.0f match=%.0f record=%.0f camera=%.0f evaluate=%.0f after_record=%.0f} max_call_us=%.0f\r\n",
+        "j2_inline_cost calls=%llu past_lock=%llu us{pre=%.0f lock_wait=%.0f query=%.0f match=%.0f record=%.0f camera=%.0f evaluate=%.0f after_record=%.0f setup=%.0f copies=%.0f flow=%.0f textures=%.0f game_motion=%.0f motion=%.0f ao=%.0f finish=%.0f} max_call_us=%.0f\r\n",
         (unsigned long long)calls, (unsigned long long)deep, t[kIcPre] * us, t[kIcLock] * us, t[kIcQuery] * us, t[kIcMatch] * us,
-        t[kIcRecord] * us, t[kIcCamera] * us, t[kIcEvaluate] * us, t[kIcAfter] * us, double(mx) * us);
+        t[kIcRecord] * us, t[kIcCamera] * us, t[kIcEvaluate] * us, t[kIcAfter] * us, t[kIcSetup]*us, t[kIcCopies]*us, t[kIcFlow]*us, t[kIcTextures]*us, t[kIcGameMotion]*us, t[kIcMotion]*us, t[kIcAO]*us, t[kIcFinish]*us, double(mx) * us);
 }
 
 Stats GetStats()
