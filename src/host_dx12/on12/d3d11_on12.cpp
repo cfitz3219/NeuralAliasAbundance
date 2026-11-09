@@ -34,7 +34,9 @@ LogFn g_log = nullptr;
 std::atomic<bool> g_enabled{false}, g_hooked{false};
 // [dx11on12] menu_buffer: 0 never borrow the back buffer (menu does not draw), 1 borrow and return
 // with the menu's fence, 2 borrow and return with no fence (same queue, so already ordered),
-// 3 borrow and return but skip the GPU draw (diagnostic: separates the draw from the borrow).
+// 3 borrow and return but skip the GPU draw (diagnostic: separates the draw from the borrow),
+// 4 borrow, submit an empty command list + signal on the queue (diagnostic: any queue work?),
+// 5 borrow, submit only the back buffer's PRESENT->RENDER_TARGET->PRESENT barriers (diagnostic).
 std::atomic<int> g_menu_buffer{1};
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
@@ -342,7 +344,7 @@ Borrowed::~Borrowed()
     delete t;
 }
 
-bool DrawOnBorrowed() { return g_menu_buffer.load() != 3; }
+int BorrowMode() { return g_menu_buffer.load(); }
 
 int FormatStatus(char* out, size_t capacity)
 {

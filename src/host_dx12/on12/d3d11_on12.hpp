@@ -56,9 +56,9 @@ struct Borrowed {
 };
 bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, ID3D12Resource** out, Borrowed& borrowed);
 
-// False under the [dx11on12] menu_buffer=3 diagnostic: borrow and return the back
-// buffer but submit no menu draw.
-bool DrawOnBorrowed();
+// [dx11on12] menu_buffer: 1/2 draw normally; 3 = submit nothing, 4 = submit an empty
+// list, 5 = submit only the back buffer barriers (diagnostics for the menu-open stall).
+int BorrowMode();
 
 // One status line (no newline) for the 5-second status log.
 int FormatStatus(char* out, size_t capacity);

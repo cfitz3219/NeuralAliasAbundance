@@ -2959,7 +2959,8 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
             }
         }
     }
-    if (borrowed.token && !na::on12::DrawOnBorrowed()) return; // menu_buffer=3 diagnostic: borrow without drawing
+    const int borrow_mode = borrowed.token ? na::on12::BorrowMode() : 0;
+    if (borrow_mode == 3) return; // menu_buffer=3 diagnostic: borrow without drawing
     if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) {
         g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -2971,7 +2972,8 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g_state.list->ResourceBarrier(1, &b);
+    if (borrow_mode != 4) g_state.list->ResourceBarrier(1, &b);
+    if (borrow_mode != 4 && borrow_mode != 5) {
     g_state.list->OMSetRenderTargets(1, &f.rtv, FALSE, nullptr);
     ID3D12DescriptorHeap* heaps[] = {g_state.srv_heap.Get()};
     g_state.list->SetDescriptorHeaps(1, heaps);
@@ -2981,9 +2983,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     }
     ++g_state.imgui_draws; // backend advances once per RenderDrawData, even if submission fails
     if (just_opened) menu_note("menu_open: GPU draw recorded\r\n");
+    }
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    g_state.list->ResourceBarrier(1, &b);
+    if (borrow_mode != 4) g_state.list->ResourceBarrier(1, &b);
     if (FAILED(g_state.list->Close())) {
         g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
         return;
