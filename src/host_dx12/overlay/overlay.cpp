@@ -2966,6 +2966,28 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         return;
     }
 
+    if (borrow_mode == 6) {
+        // menu_buffer=6 diagnostic: the full menu draw, into a texture of ours instead of the
+        // presented buffer (does any real draw on 11on12's queue stall Present, or only one
+        // that writes the back buffer?).
+        static ComPtr<ID3D12Resource> s_diag_target;
+        if (!s_diag_target) {
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc = menu_target;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (FAILED(g_state.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PRESENT,
+                                                              nullptr, IID_PPV_ARGS(&s_diag_target)))) {
+                g_menu_skips.buffer.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+        rtv.Format = g_state.format;
+        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        g_state.device->CreateRenderTargetView(s_diag_target.Get(), &rtv, f.rtv);
+        back_buffer = s_diag_target; // the borrowed buffer stays untouched
+    }
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = back_buffer.Get();

@@ -36,7 +36,8 @@ std::atomic<bool> g_enabled{false}, g_hooked{false};
 // with the menu's fence, 2 borrow and return with no fence (same queue, so already ordered),
 // 3 borrow and return but skip the GPU draw (diagnostic: separates the draw from the borrow),
 // 4 borrow, submit an empty command list + signal on the queue (diagnostic: any queue work?),
-// 5 borrow, submit only the back buffer's PRESENT->RENDER_TARGET->PRESENT barriers (diagnostic).
+// 5 borrow, submit only the back buffer's PRESENT->RENDER_TARGET->PRESENT barriers (diagnostic),
+// 6 borrow, full menu draw into a texture of ours instead of the back buffer (diagnostic).
 std::atomic<int> g_menu_buffer{1};
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
