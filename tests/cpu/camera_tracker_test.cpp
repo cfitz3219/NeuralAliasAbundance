@@ -1,3 +1,4 @@
+#include <algorithm>
 // J2 camera tracker: jitter extraction (known and estimated), camera cuts and
 // the unjittered matrices handed to the motion arbiter, on matrices built as
 // Perspective x View in both depth conventions and handednesses.
@@ -113,12 +114,16 @@ int main()
                  const size_t e = size == 1280 ? 704 : 816;
                  const size_t first = size == 1280 ? 384 : 480;
                  const size_t witness = size == 1280 ? 944 : 512;
-                 std::memcpy(bytes.data()+v, column.data(), 64);
-                 if (size == 1280) std::memcpy(bytes.data()+320, column.data(), 64);
-                 std::memcpy(bytes.data()+e, extent, 16);
-                 std::memcpy(bytes.data()+first, origin, 16);
-                 std::memcpy(bytes.data()+witness, rounded, 16);
-                 if (size == 1536) std::memcpy(bytes.data()+528, rounded, 16);
+                 // Bounds-checked writes (GCC 13 -O2 misreads memcpy into a vector sized by the loop value).
+                 const auto put = [&bytes](size_t at, const void* src, size_t n) {
+                     if (at + n <= bytes.size()) std::copy_n(static_cast<const uint8_t*>(src), n, bytes.begin() + static_cast<std::ptrdiff_t>(at));
+                 };
+                 put(v, column.data(), 64);
+                 if (size == 1280) put(320, column.data(), 64);
+                 put(e, extent, 16);
+                 put(first, origin, 16);
+                 put(witness, rounded, 16);
+                 if (size == 1536) put(528, rounded, 16);
                  // Adjacent fields remain zero, as in observed shader variants.
                  na::wwii::SceneCamera camera;
                  CHECK(na::wwii::DecodeSceneCamera(bytes, size, W, H, camera));
