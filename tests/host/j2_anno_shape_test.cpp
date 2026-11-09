@@ -285,6 +285,10 @@ int main(int argc, char** argv)
     if(argc>1&&std::strcmp(argv[1],"--mip-pixels-native-already")==0)return AnisoPixels(false,false,true,-1.f);
     const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 1;
     const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
+    bool depth24 = false;
+    for (int i = 3; i < argc; ++i) depth24 |= std::strcmp(argv[i], "--depth24") == 0;
+    const auto depth_texture_format = depth24 ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R32G8X24_TYPELESS;
+    const auto depth_view_format = depth24 ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     const bool msaa = samples > 1;
     const bool entry_real=argc>3 && std::strcmp(argv[3],"--entry-real")==0;
     const bool entry_split_indirect=argc>3 && std::strcmp(argv[3],"--entry-split-indirect")==0;
@@ -366,7 +370,7 @@ int main(int argc, char** argv)
 #else
     constexpr uint32_t W = 64, H = 32;
 #endif
-    for (auto pair : {std::make_pair(DXGI_FORMAT_R16G16B16A16_FLOAT,samples), std::make_pair(DXGI_FORMAT_D32_FLOAT_S8X24_UINT,depth_samples)}) {
+    for (auto pair : {std::make_pair(DXGI_FORMAT_R16G16B16A16_FLOAT,samples), std::make_pair(depth_view_format,depth_samples)}) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{pair.first,pair.second,D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE,0};
         REQUIRE(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&levels,sizeof levels)));
         if (!levels.NumQualityLevels) { printf("SKIP: hardware does not support sample count %u\n",pair.second); return test::kSkip; }
@@ -386,12 +390,14 @@ int main(int argc, char** argv)
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&color))));
     }
-    auto depth = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    const auto depth_flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                             (depth24 ? D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE : D3D12_RESOURCE_FLAG_NONE);
+    auto depth = test::CreateTexture(dev, W, H, depth_texture_format, D3D12_RESOURCE_STATE_COMMON, depth_flags);
     if (depth_samples > 1) {
         depth.Reset();
         D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         auto dd = color->GetDesc();
-        dd.DepthOrArraySize = 1; dd.MipLevels = 1; dd.SampleDesc.Count = depth_samples; dd.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+        dd.DepthOrArraySize = 1; dd.MipLevels = 1; dd.SampleDesc.Count = depth_samples; dd.Format = depth_texture_format;
         dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
         REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&depth))));
@@ -428,7 +434,7 @@ int main(int argc, char** argv)
         dev->CreateRenderTargetView(color.Get(), &v0, rtv0);
     }
     D3D12_DEPTH_STENCIL_VIEW_DESC dvd{};
-    dvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    dvd.Format = depth_view_format;
     dvd.ViewDimension = depth_samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
     dev->CreateDepthStencilView(depth.Get(), &dvd, dsv);
     constexpr uint32_t kBlock = 1024, kVp = 336;
@@ -816,7 +822,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             REQUIRE(SUCCEEDED(D3DCompile(geometry,std::strlen(geometry),nullptr,nullptr,nullptr,"VS","vs_5_0",0,0,&vs,&err)));
             REQUIRE(SUCCEEDED(D3DCompile(geometry,std::strlen(geometry),nullptr,nullptr,nullptr,"PS","ps_5_0",0,0,&ps,&err)));
             pd.pRootSignature=rs.Get();pd.VS={vs->GetBufferPointer(),vs->GetBufferSize()};pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
-            pd.DSVFormat=DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+            pd.DSVFormat=depth_view_format;
             for(int i=0;i<24;++i){pd.RasterizerState.DepthBias=i;test::ComPtr<ID3D12PipelineState> pso;
                 REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&pso))));entry_writers.push_back(pso);}
         }

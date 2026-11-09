@@ -14,19 +14,23 @@ int main(int argc, char** argv) {
     test::ComPtr<ID3D12InfoQueue> info; dev->QueryInterface(IID_PPV_ARGS(&info));
     constexpr UINT W = 16, H = 16;
     const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 2;
-    const bool stencil = argc < 3;
-    for (auto format : {DXGI_FORMAT_R16G16B16A16_FLOAT, stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT}) {
+    const bool depth24 = argc > 2 && std::strcmp(argv[2], "--depth24") == 0;
+    const bool stencil = argc < 3 || depth24;
+    const auto view_format = depth24 ? DXGI_FORMAT_D24_UNORM_S8_UINT :
+                             stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT;
+    for (auto format : {DXGI_FORMAT_R16G16B16A16_FLOAT, view_format}) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{format, samples, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
         REQUIRE(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&levels,sizeof levels)));
         if (!levels.NumQualityLevels) { printf("SKIP: hardware format %u does not support x%u\n",unsigned(format),samples); return test::kSkip; }
     }
-    printf("testing x%u, depth %s\n",samples,stencil?"32+stencil":"32");
+    printf("testing x%u, depth %s\n",samples,depth24?"24+stencil":stencil?"32+stencil":"32");
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width = W; desc.Height = H;
     desc.MipLevels = desc.DepthOrArraySize = 1; desc.SampleDesc.Count = samples;
 
-    desc.Format = stencil ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
+    desc.Format = depth24 ? DXGI_FORMAT_R24G8_TYPELESS :
+                  stencil ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     test::ComPtr<ID3D12Resource> depth, color;
     REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc,
@@ -47,7 +51,8 @@ int main(int argc, char** argv) {
     hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rh))));
     auto dsv=dh->GetCPUDescriptorHandleForHeapStart(),rtv=rh->GetCPUDescriptorHandleForHeapStart();
-    D3D12_DEPTH_STENCIL_VIEW_DESC dv{}; dv.Format=stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT; dv.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS;
+    D3D12_DEPTH_STENCIL_VIEW_DESC dv{}; dv.Format=view_format;
+    dv.ViewDimension=samples>1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
     dev->CreateDepthStencilView(depth.Get(),&dv,dsv); dev->CreateRenderTargetView(color.Get(),nullptr,rtv);
     const char* shader=R"(
 float4 vs(uint i:SV_VertexID):SV_Position { float2 uv=float2((i<<1)&2,i&2); return float4(uv*float2(2,-2)+float2(-1,1),0,1); }
@@ -93,21 +98,25 @@ Output ps(uint sample:SV_SampleIndex) { Output o; o.color=(sample & 1)?float4(0,
     barrier(resolver.DepthCopy(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,0);
     resolver.ResolveDepth(l.list.Get(),normal.Get(),W,H,false,0);
     resolver.ResolveDepth(l.list.Get(),reverse.Get(),W,H,true,1);
-    barrier(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-    l.list->ResolveSubresource(plain.Get(),0,color.Get(),0,desc.Format);
-    barrier(plain.Get(),D3D12_RESOURCE_STATE_RESOLVE_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    barrier(color.Get(),D3D12_RESOURCE_STATE_RESOLVE_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);
-    const float green[4] = {0,1,0,1};
-    l.list->ClearRenderTargetView(rtv,green,0,nullptr); // writeback must replace this, not merely retain the original purple average
-    resolver.WriteColor(l.list.Get(),plain.Get(),color.Get(),0,W,H,0);
-    // Resolve writeback again: every output sample must contain the processed purple pixel.
-    auto back=test::CreateTexture(dev,W,H,desc.Format,D3D12_RESOURCE_STATE_RESOLVE_DEST,D3D12_RESOURCE_FLAG_NONE);
-    REQUIRE(back);
-    barrier(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-    l.list->ResolveSubresource(back.Get(),0,color.Get(),0,desc.Format);
+    test::ComPtr<ID3D12Resource> back;
+    if (samples > 1) {
+        barrier(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        l.list->ResolveSubresource(plain.Get(),0,color.Get(),0,desc.Format);
+        barrier(plain.Get(),D3D12_RESOURCE_STATE_RESOLVE_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        barrier(color.Get(),D3D12_RESOURCE_STATE_RESOLVE_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const float green[4] = {0,1,0,1};
+        l.list->ClearRenderTargetView(rtv,green,0,nullptr);
+        resolver.WriteColor(l.list.Get(),plain.Get(),color.Get(),0,W,H,0);
+        // Resolve writeback again: every output sample must contain the processed purple pixel.
+        back=test::CreateTexture(dev,W,H,desc.Format,D3D12_RESOURCE_STATE_RESOLVE_DEST,D3D12_RESOURCE_FLAG_NONE);
+        REQUIRE(back);
+        barrier(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        l.list->ResolveSubresource(back.Get(),0,color.Get(),0,desc.Format);
+    }
     ID3D12Resource* resources[]={normal.Get(),reverse.Get(),back.Get()};
+    const UINT resource_count = back ? 3 : 2;
     test::ComPtr<ID3D12Resource> readbacks[3]; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[3]{};
-    for (UINT i=0;i<3;++i) {
+    for (UINT i=0;i<resource_count;++i) {
         auto rdesc=resources[i]->GetDesc(); UINT64 bytes=0;
         dev->GetCopyableFootprints(&rdesc,0,1,0,&fp[i],nullptr,nullptr,&bytes);
         readbacks[i]=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
@@ -117,10 +126,14 @@ Output ps(uint sample:SV_SampleIndex) { Output o; o.color=(sample & 1)?float4(0,
         l.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
     }
     REQUIRE(SUCCEEDED(l.list->Close())); ID3D12CommandList* lists[]={l.list.Get()}; d.queue->ExecuteCommandLists(1,lists); d.WaitIdle();
-    for (UINT i=0;i<3;++i) {
+    for (UINT i=0;i<resource_count;++i) {
         uint8_t* p=nullptr; REQUIRE(SUCCEEDED(readbacks[i]->Map(0,nullptr,reinterpret_cast<void**>(&p))));
         for(UINT y=0;y<H;++y) for(UINT x=0;x<W;++x) {
-            if(i<2) { float value; memcpy(&value,p+fp[i].Footprint.RowPitch*y+x*4,4); CHECK(std::abs(value-(i?0.75f:0.25f))<1e-6f); }
+            if(i<2) {
+                float value; memcpy(&value,p+fp[i].Footprint.RowPitch*y+x*4,4);
+                const float expected = samples == 1 ? 0.5f : i ? 0.75f : 0.25f;
+                CHECK(std::abs(value-expected)<1e-6f);
+            }
             else { uint16_t c[4]; memcpy(c,p+fp[i].Footprint.RowPitch*y+x*8,8); CHECK(c[0]==0x3800 && c[1]==0 && c[2]==0x3800 && c[3]==0x3c00); }
         }
         readbacks[i]->Unmap(0,nullptr);

@@ -73,6 +73,7 @@ constexpr uint32_t kRing = 6;            // frames in flight before a slot is re
 // existing conversion. Switching between them must not rebuild the temporal working textures
 // (and reset history); only genuinely different depth formats key the working set.
 inline DXGI_FORMAT depth_working_key(DXGI_FORMAT f, uint32_t samples) {
+    if (na::depth::IsDepth24(f)) return DXGI_FORMAT_R24G8_TYPELESS;
     return samples == 1 && na::depth::PlaneZeroCopiesToR32F(f) ? DXGI_FORMAT_R32_FLOAT : f;
 }
 // Quality stability gate: consecutive deliverable frames required before DLSS is written.
@@ -3536,13 +3537,18 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const uint32_t cmip = csub % g.stats.color_mips;
     const uint32_t dmip = dsub % (dd.MipLevels ? dd.MipLevels : 1u);
     const uint32_t w = (std::max)(1u, static_cast<uint32_t>(cd.Width >> cmip)), h = (std::max)(1u, cd.Height >> cmip);
-    if ((std::max)(1u, static_cast<uint32_t>(dd.Width >> dmip)) != w || (std::max)(1u, dd.Height >> dmip) != h ||
-        !na::depth::PlaneZeroCopiesToR32F(dd.Format)) {
-        reason("Scene depth does not match the colour size or is not 32-bit depth.");
+    const bool depth24 = na::depth::IsDepth24(dd.Format);
+    if ((std::max)(1u, static_cast<uint32_t>(dd.Width >> dmip)) != w || (std::max)(1u, dd.Height >> dmip) != h) {
+        reason("Scene depth does not match the colour size.");
+        return false;
+    }
+    if (!depth24 && !na::depth::PlaneZeroCopiesToR32F(dd.Format)) {
+        reason("The scene depth format is not supported by DLAA.");
         return false;
     }
     const DXGI_FORMAT cf = typed(cd.Format); // our copies' format
     const bool color_msaa = cd.SampleDesc.Count > 1, depth_msaa = dd.SampleDesc.Count > 1;
+    const bool depth_compute = depth24 || depth_msaa;
 
     // P4-4: upscaling destination (slider route). Any reason not to use it falls back
     // to DLAA at the scene's size, written back as before.
@@ -3707,17 +3713,17 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (done + 1 < g.fence_next) { ++g.stats.busy; reason("Waiting for the previous picture size to finish."); return false; }
         if (!uav_store(cf) || !uav_store(DXGI_FORMAT_R32G32_FLOAT)) { reason("This scene colour format cannot be written by DLSS here."); return false; }
         g.msaa = MsaaResolve{};
-        if (color_msaa || depth_msaa) {
+        if (color_msaa || depth_compute) {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT support{cf};
             if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) ||
                 (color_msaa && !(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE)) ||
                 !g.msaa.Init(g.device.Get(), w, h, cf, dd, cd.SampleDesc, kRing)) {
                 g.output.Reset();
-                reason("Could not prepare the MSAA resolve pipeline.");
+                reason("Could not prepare the scene resolve or depth conversion pipeline.");
                 return false;
             }
         }
-        if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, depth_msaa, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
+        if (!texture(w, h, DXGI_FORMAT_R32_FLOAT, depth_compute, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g.depth32) ||
             !texture(w, h, DXGI_FORMAT_R32G32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.motion) ||
             !texture(w, h, DXGI_FORMAT_R8_UINT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.provenance) ||
             !texture(ow, oh, cf, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g.output) ||
@@ -3896,7 +3902,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const UINT color_source = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : SRC;
     const UINT color_dest = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : DST;
     addsub(b, depth.Get(), dsub, sd, SRC);
-    add(b, g.depth32.Get(), NPSR, depth_msaa ? UAV : DST);
+    add(b, g.depth32.Get(), NPSR, depth_compute ? UAV : DST);
     if (!skip_color) {
         if(!late_input)addsub(b, color.Get(), csub, sc, color_source);
         add(b, g.color_in.Get(), NPSR, color_dest);
@@ -3920,11 +3926,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     src.Type = dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = depth.Get();
     src.SubresourceIndex = dsub; // plane 0 of the slice / mip the scene used
-    dst.pResource = depth_msaa ? g.msaa.DepthCopy() : g.depth32.Get();
+    dst.pResource = depth_compute ? g.msaa.DepthCopy() : g.depth32.Get();
     dst.SubresourceIndex = 0;
     l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     addsub(b, depth.Get(), dsub, SRC, sd);
-    if (depth_msaa) {
+    if (depth_compute) {
         addsub(b, g.msaa.DepthCopy(), 0, DST, NPSR);
         flush(l, b);
         g.msaa.ResolveDepth(l, g.depth32.Get(), w, h, reversed, g.slot);
