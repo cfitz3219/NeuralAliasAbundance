@@ -12,9 +12,9 @@
 //    draws or <= 3 vertices, and "frames" with a single depth and <= 8 draws
 //    (loading screens, menus);
 //  - colour: the render target drawn most with that depth bound, same size;
-//  - camera block: the vertex-shader constant buffer bound during the most
-//    scene draws, leaving out buffers re-uploaded for more than a quarter of
-//    those draws (object constants change every draw or two);
+//  - camera blocks: VS/PS constant-buffer ranges actually bound by scene draws;
+//    stable buffers are ranked first, but frequently updated ranges remain
+//    candidates. The provider validates their draw-time snapshots;
 //  - DLSS point: learned per frame as "the n-th read of the scene colour",
 //    the first read after its last scene draw. The next frame fires right
 //    before that read. A scene draw after we fired is a contradiction (the
@@ -56,6 +56,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -259,6 +260,21 @@ public:
         }
         return r;
     }
+    struct CameraBinding { Id buffer; int slot; uint32_t first, count, version, draws; };
+    // Distinct ranges on the same ring are distinct shader inputs. Preserve each
+    // range used by THIS scene, not just the last range bound at that slot.
+    std::vector<CameraBinding> SceneCameraBindings() const
+    {
+        std::vector<CameraBinding> result;
+        result.reserve(cb_ranges_.size());
+        for (const auto& kv : cb_ranges_) {
+            const auto& k = kv.first;
+            result.push_back({std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k),
+                              kv.second.last_version, kv.second.draws});
+        }
+        std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.draws > b.draws; });
+        return result;
+    }
     // The engine found the camera's matrices in this buffer (or, with 0, gave up on it).
     void SetCamera(Id cb, int slot) { sel_.camera_cb = cb; sel_.camera_slot = slot; }
 
@@ -326,6 +342,7 @@ public:
         depth_.clear();
         color_.clear();
         cb_scene_.clear();
+        cb_ranges_.clear();
         camera_versions_.clear();
         draws_ = scene_draws_ = color_reads_ = 0;
         events_ = last_scene_draw_event_ = 0;
@@ -383,6 +400,9 @@ private:
             u.count = e.cb_count[i];
             const uint32_t v = CbVersion(e.cb[i]);
             if (!u.versions || v != u.last_version) { ++u.versions; u.last_version = v; }
+            CbUse& range = cb_ranges_[{e.cb[i], i, e.cb_first[i], e.cb_count[i]}];
+            ++range.draws;
+            range.last_version = v;
         }
     }
 
@@ -456,6 +476,7 @@ private:
     std::unordered_map<std::pair<Id, Id>, PairCount, PairHash> color_;
     struct CbUse { uint32_t draws = 0, versions = 0, last_version = 0, first = 0, count = 0; };
     std::unordered_map<std::pair<Id, int>, CbUse, CbHash> cb_scene_;
+    std::map<std::tuple<Id, int, uint32_t, uint32_t>, CbUse> cb_ranges_;
     std::unordered_map<Id, uint32_t> cb_version_;
     std::map<uint32_t, uint32_t> camera_versions_;
     std::vector<std::pair<Id, int>> last_cb_order_;

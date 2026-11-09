@@ -22,11 +22,17 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/effects/xegtao.hpp"
+#include "host_dx12/effects/donut.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/observe/producers.hpp"
 #include <DirectXPackedVector.h>
 #include <d3d11on12.h>
 #include <filesystem>
@@ -77,6 +83,10 @@ float4 vs_post(uint id : SV_VertexID) : SV_Position {
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
+SamplerState material : register(s0);
+float4 ps_mips(float4 p : SV_Position) : SV_Target {
+    return scene.SampleGrad(material, float2(0.5, 0.5), float2(2.0/64.0,0), float2(0,2.0/64.0));
+}
 )";
 
 ComPtr<ID3DBlob> Compile(const char* entry, const char* target)
@@ -114,6 +124,7 @@ struct Game {
     UINT w = 320, h = 180;
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
+    bool campaign_mixed_ring = false;
     ComPtr<ID3D11Texture2D> shadow_depth, shadow_rt, depth, color;
     ComPtr<ID3D11DepthStencilView> shadow_dsv, dsv;
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
@@ -295,7 +306,25 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     c->ClearRenderTargetView(g.color_rtv.Get(), clear);
     c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
     Viewport(c, g.w, g.h);
-    for (int i = 0; i < 40; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
+    for (int i = 0; i < 40; ++i) {
+        if (g.campaign_mixed_ring && i == 20) {
+            // Real campaign rings carry camera and non-camera slices at the
+            // same binding. Discard/reuse it after the camera's scene draws.
+            D3D11_MAPPED_SUBRESOURCE map{};
+            if (SUCCEEDED(c->Map(g.cam_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                std::memset(map.pData, 0, 32768);
+                c->Unmap(g.cam_cb.Get(), 0);
+            }
+            ComPtr<ID3D11DeviceContext1> c1;
+            if (SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c1)))) {
+                const UINT first = 0, count = 16;
+                auto* ring = g.cam_cb.Get();
+                c1->PSSetConstantBuffers1(0, 1, &ring, &first, &count);
+                c1->VSSetConstantBuffers1(2, 1, &ring, &first, &count);
+            }
+        }
+        SetObject(c, g, i); c->Draw(4, 0);
+    }
 }
 
 
@@ -728,6 +757,12 @@ int main()
            g_seen.last.camera.first_constant == 24576 / 16 && g_seen.last.camera.num_constants == 1280 / 16,
            "native DLAA accepts the current WWII pose from the actual PS binding range");
     expect(g_seen.jitter_reported == raster_before_pixel, "PS-only camera is never treated as raster jitter");
+    g.campaign_mixed_ring = true;
+    const auto before_mixed_ring = evaluations;
+    for (int i = 0; i < 22; ++i) present_campaign();
+    expect(evaluations == before_mixed_ring + 22 && g_seen.last.camera.first_constant == 24576 / 16,
+           "mixed VS/PS ring retains camera range after another range and discard overwrite");
+    g.campaign_mixed_ring = false;
     na::settings::Get().j2_sharpness.store(60);
     na::settings::Get().j2_preset.store(11);
     present_campaign();
@@ -739,6 +774,130 @@ int main()
     na::native_d3d11::FormatStatus(status, sizeof status);
     expect(std::strstr(status, "preset=11 sharpness=0 raster_slot=-1") != nullptr,
            "sharpness at zero bypasses RCAS on the native route");
+    const auto effects_before = evaluations;
+    const auto flow_before = na::j2::compute_flow::GetStats();
+    na::j2::flow::SetEnabled(true);
+    na::settings::Get().xegtao_enabled.store(1);
+    na::settings::Get().donut_bloom.store(1);
+    na::settings::Get().donut_tone.store(1);
+    present_campaign(); // starts existing asynchronous shader preparation
+    na::xegtao::ScenePass().WaitPrepared(20000); // offline fixture only
+    na::donut::ScenePass().WaitPrepared(20000);
+    for (int i = 0; i < 20; ++i) present_campaign();
+    const auto flow_live = na::j2::compute_flow::GetStats();
+    const auto ao_live = na::xegtao::ScenePass().GetStats();
+    const auto lighting_live = na::donut::ScenePass().GetStats();
+    std::printf("native effects: flow pairs=%llu submitted=%llu busy=%llu unavailable=%llu ao=%llu lighting=%llu\n",
+        (unsigned long long)flow_live.submitted_pairs, (unsigned long long)flow_live.submitted,
+        (unsigned long long)flow_live.busy, (unsigned long long)flow_live.unavailable,
+        (unsigned long long)ao_live.recorded, (unsigned long long)lighting_live.recorded);
+    expect(flow_live.submitted >= flow_before.submitted + 20 && flow_live.submitted_pairs >= flow_before.submitted_pairs + 16,
+           "native optical-flow switch submits consecutive paired frames with retired recording ownership");
+    expect(ao_live.recorded >= 20 && lighting_live.recorded >= 20 && evaluations == effects_before + 21,
+           "native XeGTAO and lighting run before real DLAA without missing frames");
+    na::j2::flow::SetEnabled(false);
+    na::settings::Get().xegtao_enabled.store(0);
+    na::settings::Get().donut_bloom.store(0);
+    na::settings::Get().donut_tone.store(0);
+    for (int i = 0; i < 4; ++i) present_campaign();
+    expect(na::j2::compute_flow::GetStats().submitted == flow_live.submitted &&
+           na::xegtao::ScenePass().GetStats().recorded == ao_live.recorded &&
+           na::donut::ScenePass().GetStats().recorded == lighting_live.recorded,
+           "native enhancement switches stop their GPU work live");
+    // Real shader sampling: each mip is a different colour. Exact LOD 1
+    // produces green; a total bias of -1 selects red mip 0. No counters stand
+    // in for the pixel result, and the sampler is bound only once.
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = td.Height = 64; td.MipLevels = 7; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    std::vector<uint32_t> pixels[7]; D3D11_SUBRESOURCE_DATA initial[7]{};
+    for (UINT mip = 0; mip < 7; ++mip) {
+        const UINT extent = 64u >> mip;
+        pixels[mip].assign(size_t(extent) * extent, mip == 0 ? 0xff0000ffu : mip == 1 ? 0xff00ff00u : 0xffff0000u);
+        initial[mip] = {pixels[mip].data(), extent * 4, 0};
+    }
+    ComPtr<ID3D11Texture2D> mip_texture;
+    ComPtr<ID3D11ShaderResourceView> mip_view;
+    ComPtr<ID3D11PixelShader> mip_shader;
+    auto mip_code = Compile("ps_mips", "ps_5_0");
+    expect(mip_code && SUCCEEDED(g.device->CreateTexture2D(&td, initial, &mip_texture)) &&
+           SUCCEEDED(g.device->CreateShaderResourceView(mip_texture.Get(), nullptr, &mip_view)) &&
+           SUCCEEDED(g.device->CreatePixelShader(mip_code->GetBufferPointer(), mip_code->GetBufferSize(), nullptr, &mip_shader)),
+           "create native material-mip pixel test");
+    D3D11_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampler.MaxLOD = D3D11_FLOAT32_MAX; sampler.MaxAnisotropy = 1;
+    ComPtr<ID3D11SamplerState> material;
+    expect(SUCCEEDED(g.device->CreateSamplerState(&sampler, &material)), "create native material sampler");
+    na::observe::SetSamplerMipBias(0.f); na::observe::SetSamplerAnisotropy(0);
+    auto* material_raw = material.Get();
+    g.ctx->PSSetSamplers(0, 1, &material_raw);
+    g.ctx->ClearState();
+    g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    D3D11_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D11_FILL_SOLID; raster.CullMode = D3D11_CULL_NONE; raster.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> no_cull;
+    g.device->CreateRasterizerState(&raster, &no_cull); g.ctx->RSSetState(no_cull.Get());
+    g.ctx->PSSetSamplers(0, 1, &material_raw);
+    auto* rt = g.color_rtv.Get(); g.ctx->OMSetRenderTargets(1, &rt, nullptr);
+    auto* texture_view = mip_view.Get(); g.ctx->PSSetShaderResources(0, 1, &texture_view);
+    g.ctx->VSSetShader(g.vs_post.Get(), nullptr, 0); g.ctx->PSSetShader(mip_shader.Get(), nullptr, 0);
+    Viewport(g.ctx.Get(), g.w, g.h);
+    float before_bias[4]{}, after_bias[4]{}, restored_bias[4]{};
+    g.ctx->Draw(4, 0); ReadCopy(g, before_bias, g.color.Get());
+    na::observe::SetSamplerMipBias(-1.f);
+    g.ctx->Draw(4, 0); ReadCopy(g, after_bias, g.color.Get());
+    na::observe::SetSamplerMipBias(0.f);
+    g.ctx->Draw(4, 0); ReadCopy(g, restored_bias, g.color.Get());
+    std::printf("native mip pixels: own %.2f/%.2f, -1 %.2f/%.2f, restored %.2f/%.2f\n",
+                before_bias[0], before_bias[1], after_bias[0], after_bias[1], restored_bias[0], restored_bias[1]);
+    expect(before_bias[1] > .9f && after_bias[0] > .9f && after_bias[1] < .1f && restored_bias[1] > .9f,
+           "live native mip bias changes sampled pixels and restores without another game sampler bind");
+    na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(16);
+    g.ctx->Draw(4, 0);
+    ComPtr<ID3D11SamplerState> bound;
+    g.ctx->PSGetSamplers(0, 1, &bound); D3D11_SAMPLER_DESC applied{};
+    if (bound) bound->GetDesc(&applied);
+    expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
+           "the actual native draw binding has 16x AF and total -1 mip bias");
+    // Deferred state queries must carry the same live policy to recorded draws.
+    // Keep state over FinishCommandList so the second draw has no new sampler bind.
+    ComPtr<ID3D11DeviceContext> sampler_deferred;
+    g.device->CreateDeferredContext(0, &sampler_deferred);
+    na::observe::SetSamplerAnisotropy(0);
+    if (sampler_deferred) {
+        auto* dc = sampler_deferred.Get();
+        dc->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        dc->RSSetState(no_cull.Get()); dc->OMSetRenderTargets(1, &rt, nullptr);
+        dc->VSSetShader(g.vs_post.Get(), nullptr, 0); dc->PSSetShader(mip_shader.Get(), nullptr, 0);
+        dc->PSSetShaderResources(0, 1, &texture_view); material_raw = material.Get();
+        dc->PSSetSamplers(0, 1, &material_raw); Viewport(dc, g.w, g.h);
+        float deferred_on[4]{}, deferred_off[4]{};
+        dc->Draw(4, 0);
+        ComPtr<ID3D11CommandList> recorded;
+        expect(SUCCEEDED(dc->FinishCommandList(TRUE, &recorded)), "record native sampler change");
+        if (recorded) g.ctx->ExecuteCommandList(recorded.Get(), TRUE);
+        ReadCopy(g, deferred_on, g.color.Get());
+        na::observe::SetSamplerMipBias(0.f);
+        dc->Draw(4, 0); recorded.Reset();
+        expect(SUCCEEDED(dc->FinishCommandList(TRUE, &recorded)), "record native sampler restoration");
+        if (recorded) g.ctx->ExecuteCommandList(recorded.Get(), TRUE);
+        ReadCopy(g, deferred_off, g.color.Get());
+        expect(deferred_on[0] > .9f && deferred_off[1] > .9f,
+               "deferred draws update and restore mip pixels without rebinding");
+    } else expect(false, "create deferred material context");
+    na::observe::SetSamplerMipBias(-1.f);
+    // A game sampler already at -1 must stay there, rather than receiving -2.
+    sampler.MipLODBias = -1.f;
+    ComPtr<ID3D11SamplerState> already;
+    g.device->CreateSamplerState(&sampler, &already); material_raw = already.Get();
+    g.ctx->PSSetSamplers(0, 1, &material_raw);
+    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound);
+    if (bound) bound->GetDesc(&applied);
+    expect(bound && applied.MipLODBias == -1.f && na::native11::GetSamplerStats().original_bias == -1.f,
+           "native mip total avoids double bias when the game already requests -1");
     na::capture::j2::Shutdown();
     na::capture::Shutdown();
     DeleteFileW(ini.c_str());

@@ -96,6 +96,8 @@ public:
 private:
     bool was_;
 };
+bool IsGameWork(void* context);
+bool IsOwnWork();
 void Uninstall();
 // Jitter for the NEXT frame's scene camera, in pixels (the backend's sequence). Covers that one frame
 // only: a frame with no request (missed or failed evaluation) renders with the game's own camera. The provider writes

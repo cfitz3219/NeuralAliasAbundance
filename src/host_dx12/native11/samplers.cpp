@@ -1,5 +1,6 @@
 // Native DX11 route: mip bias + anisotropic filtering on the game's samplers (see samplers.hpp).
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/input_provider.hpp"
 
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
@@ -40,6 +41,7 @@ std::mutex g_install_mu;
 // A game sampler: its description and the variants made for it, keyed by (bias, af).
 struct Entry {
     D3D11_SAMPLER_DESC desc{};
+    ComPtr<ID3D11SamplerState> original;
     bool wants_bias = false, wants_af = false;
     std::mutex mu;
     std::vector<std::pair<uint64_t, ComPtr<ID3D11SamplerState>>> variants; // never released while the game runs
@@ -53,6 +55,8 @@ std::atomic<uint64_t> g_created{0}, g_elig_bias{0}, g_elig_af{0}, g_variants{0},
 std::atomic<uint64_t> g_binds{0}, g_swapped{0}, g_unknown{0};
 std::atomic<float> g_last_bias{0.0f};
 std::atomic<uint32_t> g_last_af{0};
+std::atomic<uint64_t> g_material_binds{0};
+std::atomic<float> g_original_bias{0};
 
 uint64_t Key(float bias, uint32_t af)
 {
@@ -77,10 +81,11 @@ SamplerFacts Facts(const D3D11_SAMPLER_DESC& d)
 HRESULT STDMETHODCALLTYPE CreateSamplerState_d(ID3D11Device* dev, const D3D11_SAMPLER_DESC* d, ID3D11SamplerState** out)
 {
     const HRESULT hr = g_create(dev, d, out);
-    if (SUCCEEDED(hr) && d && out && *out && dev == g_device.load(std::memory_order_acquire)) {
+    if (SUCCEEDED(hr) && d && out && *out && dev == g_device.load(std::memory_order_acquire) && !IsOwnWork()) {
         g_created.fetch_add(1, std::memory_order_relaxed);
         auto e = std::make_shared<Entry>();
         e->desc = *d;
+        e->original = *out;
         const SamplerFacts f = Facts(*d);
         e->wants_bias = WantsBias(f);
         e->wants_af = WantsAniso(f);
@@ -97,7 +102,7 @@ HRESULT STDMETHODCALLTYPE CreateSamplerState_d(ID3D11Device* dev, const D3D11_SA
 }
 
 // The variant of `e` for (bias, af), made on first use; null = bind the game's own.
-ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af)
+ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af, bool& created)
 {
     if (!(e.wants_bias && bias != 0.0f) && !(e.wants_af && af)) return nullptr;
     const uint64_t key = Key(bias, af);
@@ -118,6 +123,7 @@ ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af)
             made.Reset();
         } else {
             g_variants.fetch_add(1, std::memory_order_relaxed);
+            created = true;
         }
     }
     e.variants.emplace_back(key, made); // a null entry remembers "nothing to change" for this key
@@ -126,28 +132,51 @@ ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af)
 
 void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n, ID3D11SamplerState* const* s)
 {
+    if (!IsGameWork(c) || !s || !n || start >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
+        n > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT - start) return original(c, start, n, s);
     const float bias = g_bias_fn ? g_bias_fn() : 0.0f;
     const uint32_t af = g_af_fn ? g_af_fn() : 0u;
-    if ((bias == 0.0f && af == 0) || !s || !n || n > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) return original(c, start, n, s);
-    g_last_bias.store(bias, std::memory_order_relaxed);
-    g_last_af.store(af, std::memory_order_relaxed);
-    ID3D11SamplerState* swapped[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
-    bool any = false;
-    uint64_t unknown = 0, changed = 0;
+    ID3D11SamplerState* swapped[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
+    std::shared_ptr<Entry> entries[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
     {
-        std::shared_lock<std::shared_mutex> l(g_mu);
+        std::shared_lock<std::shared_mutex> lock(g_mu);
         for (UINT i = 0; i < n; ++i) {
-            swapped[i] = s[i];
-            if (!s[i]) continue;
             const auto it = g_entries.find(s[i]);
-            if (it == g_entries.end()) { ++unknown; continue; }
-            if (ID3D11SamplerState* v = VariantOf(*it->second, bias, af)) { swapped[i] = v; any = true; ++changed; }
+            if (it != g_entries.end()) entries[i] = it->second;
+        }
+    }
+    uint64_t unknown = 0, changed = 0;
+    for (UINT i = 0; i < n; ++i) {
+        swapped[i] = s[i];
+        if (!s[i]) continue;
+        const auto& e = entries[i];
+        if (!e) { ++unknown; continue; }
+        swapped[i] = e->original.Get();
+        bool created = false;
+        if (auto* v = VariantOf(*e, bias, af, created)) {
+            swapped[i] = v;
+            if (created) {
+                std::unique_lock<std::shared_mutex> lock(g_mu);
+                g_entries.emplace(v, e); // lets a cached/GetSamplers variant restore its original
+            }
+        }
+        if (swapped[i] != e->original.Get()) ++changed;
+        if (e->wants_bias || e->wants_af) {
+            D3D11_SAMPLER_DESC applied{};
+            swapped[i]->GetDesc(&applied);
+            if (e->wants_bias) {
+                g_original_bias.store(e->desc.MipLODBias, std::memory_order_relaxed);
+                g_last_bias.store(applied.MipLODBias, std::memory_order_relaxed);
+                g_material_binds.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (e->wants_af) g_last_af.store(sampler_bits::Anisotropic(applied.Filter) ? applied.MaxAnisotropy : 1u,
+                                           std::memory_order_relaxed);
         }
     }
     g_binds.fetch_add(n, std::memory_order_relaxed);
     if (unknown) g_unknown.fetch_add(unknown, std::memory_order_relaxed);
     if (changed) g_swapped.fetch_add(changed, std::memory_order_relaxed);
-    original(c, start, n, any ? swapped : s);
+    original(c, start, n, swapped);
 }
 
 // Immediate-class detours (also serve the deferred class when both share these functions).
@@ -212,6 +241,25 @@ bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af)
     return ok;
 }
 
+uint64_t SamplerPolicyKey()
+{
+    return g_installed.load(std::memory_order_relaxed)
+        ? Key(g_bias_fn ? g_bias_fn() : 0.f, g_af_fn ? g_af_fn() : 0u) : 0;
+}
+void RefreshSamplers(void* context)
+{
+    auto* c = static_cast<ID3D11DeviceContext*>(context);
+    if (!g_installed.load() || !IsGameWork(c)) return;
+    ID3D11SamplerState* bound[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
+    const int deferred = c->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED ? 1 : 0;
+    c->PSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    Bind(g_ps[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    for (auto* s : bound) if (s) s->Release();
+    c->CSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    Bind(g_cs[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    for (auto* s : bound) if (s) s->Release();
+}
+
 SamplerStats GetSamplerStats()
 {
     SamplerStats s;
@@ -223,6 +271,8 @@ SamplerStats GetSamplerStats()
     s.binds = g_binds.load();
     s.swapped = g_swapped.load();
     s.unknown = g_unknown.load();
+    s.material_binds = g_material_binds.load();
+    s.original_bias = g_original_bias.load();
     s.bias = g_last_bias.load();
     s.af = g_last_af.load();
     s.installed = g_installed.load();

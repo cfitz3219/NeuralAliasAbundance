@@ -21,8 +21,9 @@
 //   * the scene colour and depth are held by references taken from the game's own live views, and
 //     released before ResizeBuffers (a held back buffer would make ResizeBuffers fail);
 //   * any missing evidence skips the frame with a reason; the game's frame is never changed then.
-//   * Not here yet (owned elsewhere or later): sampler mip bias for the native route.
+//   * native sampler policy is handled by samplers.cpp, sharing the own-work exclusion.
 #include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native11/samplers.hpp"
 
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
@@ -73,6 +74,7 @@ constexpr size_t kMaxLists = 512;          // recorded command lists kept
 
 struct Ctx {
     bool game = false; // a context of the game's device
+    uint64_t sampler_policy = ~uint64_t{0};
     bool deferred = false;
     Id rt0 = 0, depth = 0;
     bool depth_test = true;
@@ -85,6 +87,7 @@ struct Ctx {
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
     void reset_state()
     {
+        sampler_policy = ~uint64_t{0};
         rt0 = depth = 0;
         depth_test = true;
         std::memset(cb, 0, sizeof(cb));
@@ -116,10 +119,13 @@ IDXGISwapChain* g_swap = nullptr; // identity only
 std::atomic<Id> g_sel_color{0};    // readable from any thread
 
 std::atomic<Id> g_cand[kMaxCandidates + 1] = {};
-struct CameraUpload { uint32_t version = 0; std::vector<uint8_t> bytes; };
+using CameraBytes = std::shared_ptr<const std::vector<uint8_t>>;
+struct CameraUpload { uint32_t version = 0; CameraBytes bytes; };
+using BindingKey = std::tuple<Id, int, uint32_t, uint32_t>;
+std::map<BindingKey, CameraUpload> g_scene_uploads;
+std::atomic<bool> g_collect_camera{true};
 std::unordered_map<Id, CameraUpload> g_cb_latest;
 std::unordered_map<Id, uint64_t> g_cb_incarnation; // candidate camera buffers: lifetime id, tagged at upload (live object)
-std::map<std::pair<Id, uint32_t>, std::vector<uint8_t>> g_cb_versions;
 
 ComPtr<ID3D11Resource> g_color_ref, g_depth_ref;
 ViewUse g_color_view, g_depth_view;
@@ -201,6 +207,7 @@ ResourceInfo InfoOf(ID3D11Resource* r, bool depth)
 bool IsCandidate(Id id)
 {
     if (!id) return false;
+    if (g_collect_camera.load(std::memory_order_relaxed)) return true;
     for (auto& c : g_cand)
         if (c.load(std::memory_order_relaxed) == id) return true;
     return false;
@@ -326,51 +333,30 @@ bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t
     const Selection& s = g_model.Current();
     const uint32_t w = g_scene_vp_w >= 1.f ? static_cast<uint32_t>(g_scene_vp_w + 0.5f) : s.color_info.width;
     const uint32_t h = g_scene_vp_h >= 1.f ? static_cast<uint32_t>(g_scene_vp_h + 0.5f) : s.color_info.height;
-    const auto bytes_of = [&](Id cb, uint32_t version) -> const std::vector<uint8_t>* {
-        if (!version) return nullptr; // no scene draw used this buffer in the current frame
-        const auto it = g_cb_versions.find({cb, version});
-        if (it != g_cb_versions.end()) return &it->second;
-        if (version != g_model.CbVersion(cb)) return nullptr;
-        const auto latest = g_cb_latest.find(cb);
-        return latest == g_cb_latest.end() || latest->second.version != version ? nullptr : &latest->second.bytes;
-    };
-    if (s.camera_cb && g_camera.found) {
-        uint32_t first = 0, count = 0;
-        const uint32_t version = g_model.CameraCandidateVersion(s.camera_cb, s.camera_slot, first, count);
-        const std::vector<uint8_t>* bytes = bytes_of(s.camera_cb, version);
-        if (bytes) {
-            const auto bound = BoundCameraBytes(bytes->data(), bytes->size(), first, count);
-            const CameraPick p = PickForScene(bound, g_camera, w, h, g_frame + 1);
-            if (p.found) {
-                g_camera = p;
-                g_camera_first = first;
-                g_camera_num = count;
-                *out = p;
-                *bytes_out = bytes;
-                *version_out = version;
-                return true;
-            }
-        }
-        g_camera = CameraPick{};
-        g_model.SetCamera(0, -1);
-    }
-    for (const auto& c : g_model.CameraCandidates(kMaxCandidates)) {
-        uint32_t first = 0, count = 0;
-        const uint32_t version = g_model.CameraCandidateVersion(c.first, c.second, first, count);
-        const auto* bytes = bytes_of(c.first, version);
-        if (!bytes) continue;
-        const auto bound = BoundCameraBytes(bytes->data(), bytes->size(), first, count);
-        const CameraPick p = PickForScene(bound, {}, w, h, g_frame + 1);
+    auto bindings = g_model.SceneCameraBindings();
+    // Prefer the learned range, but never substitute its last frame's bytes.
+    std::stable_partition(bindings.begin(), bindings.end(), [&](const auto& b) {
+        return b.buffer == s.camera_cb && b.slot == s.camera_slot &&
+               b.first == g_camera_first && b.count == g_camera_num;
+    });
+    for (const auto& b : bindings) {
+        const auto it = g_scene_uploads.find({b.buffer, b.slot, b.first, b.count});
+        if (it == g_scene_uploads.end() || it->second.version != b.version || !it->second.bytes) continue;
+        const auto* bytes = it->second.bytes.get();
+        const auto bound = BoundCameraBytes(bytes->data(), bytes->size(), b.first, b.count);
+        const CameraPick p = PickForScene(bound, g_camera, w, h, g_frame + 1);
         if (!p.found) continue;
         g_camera = p;
-        g_model.SetCamera(c.first, c.second);
-        g_camera_first = first;
-        g_camera_num = count;
+        g_model.SetCamera(b.buffer, b.slot);
+        g_camera_first = b.first;
+        g_camera_num = b.count;
         *out = p;
         *bytes_out = bytes;
-        *version_out = version;
+        *version_out = b.version;
         return true;
     }
+    g_camera = {};
+    g_model.SetCamera(0, -1);
     return false;
 }
 
@@ -390,32 +376,29 @@ void DiagnoseCameraMiss()
     const Selection& s = g_model.Current();
     const uint32_t w = g_scene_vp_w >= 1.f ? static_cast<uint32_t>(g_scene_vp_w + 0.5f) : s.color_info.width;
     const uint32_t h = g_scene_vp_h >= 1.f ? static_cast<uint32_t>(g_scene_vp_h + 0.5f) : s.color_info.height;
-    const auto cands = g_model.CameraCandidates(kMaxCandidates);
+    const auto cands = g_model.SceneCameraBindings();
     na::eventlog::Emit("native11_cam",
                        "frame=%llu colour=%ux%u fmt=%u depth=%ux%u fmt=%u scene_vp=%.0fx%.0f+%.0f+%.0f decode_wh=%ux%u scene_draws=%u "
-                       "cb_bindings=%zu ranked=%zu searched=%zu kept_buffers=%zu saved_versions=%zu learned_cb=%d",
+                       "cb_bindings=%zu ranked=%zu searched=%zu kept_buffers=%zu draw_snapshots=%zu learned_cb=%d",
                        static_cast<unsigned long long>(g_frame), s.color_info.width, s.color_info.height, s.color_info.format,
                        s.depth_info.width, s.depth_info.height, s.depth_info.format, g_scene_vp_w, g_scene_vp_h, g_scene_vp_x,
                        g_scene_vp_y, w, h, g_model.SceneDrawsThisFrame(), g_model.CbSceneBindings(), g_model.RankedCandidates(),
-                       cands.size(), g_cb_latest.size(), g_cb_versions.size(), s.camera_cb ? 1 : 0);
+                       cands.size(), g_cb_latest.size(), g_scene_uploads.size(), s.camera_cb ? 1 : 0);
     int rank = 0;
     for (const auto& c : cands) {
-        ++rank;
-        uint32_t first = 0, count = 0, draws = 0, versions = 0;
-        const uint32_t version = g_model.CameraCandidateVersion(c.first, c.second, first, count);
-        const bool used = g_model.CbSceneUse(c.first, c.second, draws, versions);
-        const auto latest = g_cb_latest.find(c.first);
-        const size_t kept = latest == g_cb_latest.end() ? 0 : latest->second.bytes.size();
+        if (++rank > 12) break;
+        const uint32_t first = c.first, count = c.count, draws = c.draws, versions = 1;
+        const uint32_t version = c.version;
+        const bool used = true;
+        const auto latest = g_cb_latest.find(c.buffer);
+        const size_t kept = latest == g_cb_latest.end() ? 0 : (latest->second.bytes ? latest->second.bytes->size() : 0);
         const uint32_t latest_version = latest == g_cb_latest.end() ? 0 : latest->second.version;
-        // Same lookup as CameraNow's bytes_of, with the reason it fails.
         const std::vector<uint8_t>* bytes = nullptr;
-        const char* source = "none";
-        if (!version) source = "no_scene_use";
-        else if (auto it = g_cb_versions.find({c.first, version}); it != g_cb_versions.end()) { bytes = &it->second; source = "saved_version"; }
-        else if (latest == g_cb_latest.end()) source = "no_kept_upload";
-        else if (version != g_model.CbVersion(c.first)) source = "version_overwritten_not_saved";
-        else if (latest_version != version) source = "latest_is_other_version";
-        else { bytes = &latest->second.bytes; source = "latest"; }
+        const char* source = "no_draw_snapshot";
+        const auto snap = g_scene_uploads.find({c.buffer, c.slot, c.first, c.count});
+        if (snap != g_scene_uploads.end() && snap->second.version == version && snap->second.bytes) {
+            bytes = snap->second.bytes.get(); source = "scene_draw";
+        }
         const char* why = "-";
         const char* generic = "-";
         size_t bound_len = 0;
@@ -431,12 +414,12 @@ void DiagnoseCameraMiss()
                 generic = p.found ? "vp+inverse" : "none";
             }
         }
-        const int stage_ps = c.second >= kPsCbBase;
+        const int stage_ps = c.slot >= kPsCbBase;
         na::eventlog::Emit("native11_cam",
                            "cand=%d cb=%llx stage=%s slot=%d draws=%u versions=%u used=%d bind_first=%u bind_count=%u kept=%zu "
                            "version=%u latest_version=%u bytes=%s bound=%zu wwii_decode=%s generic=%s",
-                           rank, static_cast<unsigned long long>(c.first), stage_ps ? "ps" : "vs",
-                           stage_ps ? c.second - kPsCbBase : c.second, draws, versions, used ? 1 : 0, first, count, kept, version,
+                           rank, static_cast<unsigned long long>(c.buffer), stage_ps ? "ps" : "vs",
+                           stage_ps ? c.slot - kPsCbBase : c.slot, draws, versions, used ? 1 : 0, first, count, kept, version,
                            latest_version, source, bound_len, why, generic);
         if (dump && !bound.empty()) {
             static const char hex[] = "0123456789abcdef";
@@ -444,7 +427,7 @@ void DiagnoseCameraMiss()
             std::string text(n * 2, '0');
             for (size_t i = 0; i < n; ++i) { text[2 * i] = hex[bound[i] >> 4]; text[2 * i + 1] = hex[bound[i] & 15]; }
             na::eventlog::Emit("native11_cam_bytes", "cand=%d cb=%llx len=%zu hex=%s", rank,
-                               static_cast<unsigned long long>(c.first), bound.size(), text.c_str());
+                               static_cast<unsigned long long>(c.buffer), bound.size(), text.c_str());
         }
     }
 }
@@ -547,13 +530,20 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
 void SaveCameraUpload(Id resource, uint32_t version, const uint8_t* data, size_t size)
 {
     auto& latest = g_cb_latest[resource];
-    // Keep the recent versions used by scene draws, including when the game
-    // uploads a different view to this buffer before the scene consumer.
-    constexpr size_t kMaxSavedVersions = 64;
-    if (latest.version && g_cb_versions.size() < kMaxSavedVersions)
-        g_cb_versions[{resource, latest.version}] = std::move(latest.bytes);
     latest.version = version;
-    latest.bytes.assign(data, data + size);
+    latest.bytes = std::make_shared<const std::vector<uint8_t>>(data, data + size);
+}
+// Pin the immutable upload actually used by each scene range. A later upload
+// or a different binding in the same ring cannot erase this draw's evidence.
+void RememberSceneUploads(const Event& e)
+{
+    if (e.kind != Kind::Draw || !g_model.IsSceneDraw(e)) return;
+    for (int slot = 0; slot < kCbBindSlots; ++slot) {
+        if (!e.cb[slot]) continue;
+        const auto it = g_cb_latest.find(e.cb[slot]);
+        if (it == g_cb_latest.end() || it->second.version != g_model.CbVersion(e.cb[slot])) continue;
+        g_scene_uploads[{e.cb[slot], slot, e.cb_first[slot], e.cb_count[slot]}] = it->second;
+    }
 }
 // ---------------------------------------------------------------- events
 void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes = nullptr, size_t cb_size = 0)
@@ -575,6 +565,7 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes =
         Fire(c, l, Boundary::BeforeHud);
     }
     const uint32_t v = g_model.Feed(e);
+    RememberSceneUploads(e);
     if (e.kind == Kind::CbUpdate && cb_bytes)
         SaveCameraUpload(e.resource, v, static_cast<const uint8_t*>(cb_bytes), cb_size);
 }
@@ -583,6 +574,11 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
 {
     Ctx* x = Get(c);
     if (!x) return;
+    const uint64_t policy = SamplerPolicyKey();
+    if (x->sampler_policy != policy) {
+        RefreshSamplers(c);
+        x->sampler_policy = policy;
+    }
     Event e;
     e.kind = Kind::Draw;
     e.rt0 = x->rt0;
@@ -832,7 +828,8 @@ HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT 
     if (x && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
                                     type == D3D11_MAP_READ_WRITE)) {
         const Id id = IdOf(r);
-        if (IsCandidate(id)) x->mapped[id] = m->pData;
+        UINT size = 0;
+        if (IsCandidate(id) && IsConstantBuffer(r, &size) && size <= kMaxCbBytes) x->mapped[id] = m->pData;
         else if (!x->mapped.empty()) x->mapped.erase(id);
     }
     return hr;
@@ -1063,6 +1060,7 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
             const auto& bytes = it->second.cb_bytes;
             for (size_t i = 0; i < events.size(); ++i) {
                 const uint32_t v = g_model.Feed(events[i]);
+                RememberSceneUploads(events[i]);
                 if (events[i].kind == Kind::CbUpdate && next_bytes < bytes.size() && bytes[next_bytes].first == i) {
                     const auto& upload = bytes[next_bytes++].second;
                     SaveCameraUpload(events[i].resource, v, upload.data(), upload.size());
@@ -1110,7 +1108,17 @@ bool OnPresent(IDXGISwapChain* swap)
     for (const auto& c : g_model.CameraCandidates(kMaxCandidates))
         if (k < kMaxCandidates + 1 && c.first != s.camera_cb) g_cand[k++].store(c.first);
     while (k < kMaxCandidates + 1) g_cand[k++].store(0);
-    g_cb_versions.clear();
+    g_scene_uploads.clear();
+    g_collect_camera.store(!g_camera.found, std::memory_order_relaxed);
+    // Retire upload shadows not in the next scene's acquisition set. Draw-time
+    // snapshots keep their own ownership until this frame is closed.
+    if (g_cb_latest.size() > 512) {
+        for (auto it = g_cb_latest.begin(); it != g_cb_latest.end();) {
+            bool keep = it->first == s.camera_cb;
+            for (const auto& candidate : g_cand) keep |= candidate.load() == it->first;
+            if (!keep) it = g_cb_latest.erase(it); else ++it;
+        }
+    }
     g_sel_color.store(s.color, std::memory_order_relaxed);
     g_scene_vp_x = g_scene_vp_y = g_scene_vp_w = g_scene_vp_h = 0;
     // Next frame's jitter: the backend's sample, written into the main camera's uploads.
@@ -1294,6 +1302,8 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present)
     return true;
 }
 
+bool IsGameWork(void* context) { return Get(static_cast<ID3D11DeviceContext*>(context)) != nullptr; }
+bool IsOwnWork() { return t_inside; }
 void Uninstall()
 {
     // Hooks stay (unhooking under a running game is unsafe); the provider goes idle: no game device,
