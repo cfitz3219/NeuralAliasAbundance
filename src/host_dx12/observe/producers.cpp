@@ -1352,7 +1352,8 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
 std::atomic<uint64_t> g_copy_simple{0}, g_copy_calls{0}, g_copy_batched{0}, g_copy_batched_runs{0}; // per-API-call shape (status line)
 bool note_descriptor_copies_batch(const uint64_t* dst, const uint64_t* src, const uint32_t* cnt, uint32_t n, uint32_t increment)
 {
-    constexpr uint32_t kMaxRuns = 64, kMaxStripes = 32;
+    // A gather of 64 single-descriptor sources can touch 64 source stripes plus the destination's.
+    constexpr uint32_t kMaxRuns = 64, kMaxStripes = 96;
     if (n < 2 || n > kMaxRuns || !increment) return false;
     struct Run { DescHeap* dh; DescHeap* sh; uint32_t ds, ss; };
     Run runs[kMaxRuns];
