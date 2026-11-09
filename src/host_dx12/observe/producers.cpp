@@ -1082,7 +1082,10 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
     // descriptor metadata is published, outside the registry lock. Otherwise the view
     // keeps NA_UNKNOWN_U64 forever and the presenting draw's target is invisible.
     // Host-owned work stays unregistered (ensure_resource_registered checks t_host_work).
-    if (resource && kind != NA_DESC_SAMPLER) ensure_resource_registered(static_cast<ID3D12Resource*>(resource));
+    // The id returned here is the resource's registry id; the game holds the resource across this
+    // call, so it cannot retire before the publish below (WWII: ~1 M view writes/s on the bridge's
+    // single thread; the second canonical lookup under the lock was pure repetition).
+    const na_object_id pre = resource && kind != NA_DESC_SAMPLER ? ensure_resource_registered(static_cast<ID3D12Resource*>(resource)) : 0;
     {
         const CostScope cost(kCostDescWrite);
         std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
@@ -1093,7 +1096,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             g_c.unresolved.fetch_add(1);
             return;
         }
-        const na_object_id rid=resource?id_locked(resource):0;
+        const na_object_id rid=pre?pre:resource?id_locked(resource):0;
         // The registry lock retains the heap/resource identity; only this slot's
         // stripe is exclusive. Publish compact metadata and replay details together.
         std::unique_lock<std::shared_mutex> stripe(h->stripes[slot >> kStripeShift], std::defer_lock);
