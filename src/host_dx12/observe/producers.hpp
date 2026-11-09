@@ -325,6 +325,7 @@ struct MipLiveStats {
 };
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
+uint32_t SamplerAnisotropyWanted(); // the menu's AF level (0 / 4 / 8 / 16), as SamplerMipBias is the bias
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
 // Every distinct sampler the game created (heap, heap v2, root-signature static), most used first.
 std::string FormatSamplerTable(uint64_t* total = nullptr);

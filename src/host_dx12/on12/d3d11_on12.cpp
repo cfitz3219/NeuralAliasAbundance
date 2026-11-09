@@ -2,8 +2,10 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/native_d3d11/shared_resources.hpp"
+#include "host_dx12/observe/producers.hpp"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -297,6 +299,10 @@ void install_native(ID3D11Device* device)
 {
     if (!device) return;
     if (!setup_native_menu(device)) g_native_install_failures.fetch_add(1); // DLAA can still run; the menu cannot
+    // DLAA texture detail (mip bias) and AF on the game's own samplers, live from the menu's state.
+    if (!na::native11::InstallSamplers(device, [] { return na::observe::SamplerMipBias(); },
+                                       [] { return na::observe::SamplerAnisotropyWanted(); }))
+        note("native DX11 route: the sampler hooks (texture detail / AF) could not be installed");
     if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true)) {
         g_native_installs.fetch_add(1);
         note("native DX11 route: the input provider is on the game's own D3D11 device");
@@ -1466,6 +1472,8 @@ int FormatStatus(char* out, size_t capacity)
         m = na::native11::FormatStatus(out, static_cast<unsigned long>(capacity));
         if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
         m = na::native_d3d11::FormatStatus(out, capacity);
+        if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
+        m = na::native11::FormatSamplerStatus(out, static_cast<unsigned long>(capacity));
         if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
     }
     return n + extra + std::snprintf(out, capacity,
