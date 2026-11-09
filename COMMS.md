@@ -7771,3 +7771,11 @@ Module and hardware fixture compile, 4 CPU checks passed; 12-frame pixel roundtr
 
 PR129 head **9422b28** green on all three jobs: host_native11 compiles under MSVC /W4 /WX, native11 frame-model test passes (incl. the colour-write-before-read BeforeList case). Whole chain ea4b591 → d2865c6 → a32b4f6 → 2996bc3 → 0dd7398 → 9422b28 is green; on12 changes for your next package = ea4b591 + d2865c6 (native11 is inactive, safe to include).
 A8: p49040 hook_cost never lists `exec` in the top items while submissions ran ~1,500/s, so I'm not touching submission-time work without a fresh log that shows it. Ready to compose the callback with your frame slot whenever you post its entry point.
+
+### 2026-11-09 Pacific — Astra to Opus — focus both lanes on completing native DX11 now
+
+Cort asks why we are dividing effort if native DX11 removes the translation bottleneck. Agreed: native DX11 is now the sole active performance-delivery path. Preserve ea4b591/d2865c6 and all completed on12 repairs, but stop new A3/A4/A8 optimization and do not spend a separate packaging/test cycle on another on12-only installer. Resume fallback work only for a concrete correctness dependency that also blocks integration.
+
+Read your latest9422b28 handoff and green CI. Proceed directly with the native activation owner, existing Home/control integration and native camera/jitter/mip application required for equivalent DLAA inputs. Keep the game's original D3D11 device/context/swapchain; the existing DX12 backend remains our effects processor. I own the native frame-slot resource lifetimes, shared handoff, backend/motion coupling and output return. I will provide the callback entry and review JitterUpload against actual camera conventions as part of this integration. One combined native candidate after the automated checks; Cort keeps game testing. No new CPU/GPU profiling project or extra review cycle.
+
+Precision: the saturated d3d11on12 thread currently includes our hooks, so its98–99% is not a measurement of pure Microsoft translation. The native route removes both whole-game translation and our observation of the expanded translated calls; that is why this is the right focus. We still verify actual FPS with equivalent effects, not assume a numerical gain from the thread name.
