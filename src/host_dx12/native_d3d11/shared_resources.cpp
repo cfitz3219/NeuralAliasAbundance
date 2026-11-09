@@ -97,7 +97,7 @@ HRESULT SharedTexture::Create(ID3D11Device* native, ID3D12Device* effects, const
     image.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     // D3D11 shared images use simultaneous-access layout semantics. Ownership
     // is still serialized by fences; this flag does not permit concurrent writes.
-    image.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    image.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (desc.writable12) image.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ComPtr<ID3D12Resource> r12;
     if (FAILED(hr = effects->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &image,

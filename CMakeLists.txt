@@ -283,6 +283,9 @@ if(NA_HAVE_NVRHI)
   target_link_libraries(host_gpu_services PRIVATE nvrhi nvrhi_d3d12)
 endif()
 target_link_libraries(host_dx12 PUBLIC host_gpu_services host_background)
+add_subdirectory(src/host_dx12/native_d3d11)
+target_sources(host_dx12 PRIVATE src/host_dx12/native_d3d11/live_dlaa.cpp)
+target_link_libraries(host_dx12 PUBLIC host_native_d3d11_shared host_native11)
 target_include_directories(host_dx12 SYSTEM PRIVATE third_party/nis)
 target_link_libraries(host_dx12
   PUBLIC abundance_options d3d12ma host_hooking host_native_present host_scale host_settings host_capture host_nvof host_ffx_flow core_gpu imgui nvapi_headers host_dlss host_upscalers host_observe_producers host_scene_scale

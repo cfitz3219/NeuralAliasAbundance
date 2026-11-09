@@ -40,13 +40,21 @@ int main()
     SharedFences handoff;
     REQUIRE(SUCCEEDED(handoff.Create(d11.Get(), d12.Get(), queue.Get())));
     REQUIRE(FAILED(handoff.WaitNative(1)) && FAILED(handoff.WaitEffects(1)));
+    for (auto format : {DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R32_FLOAT}) {
+        SharedTexture image;
+        hr = image.Create(d11.Get(), d12.Get(), {64, 19, format, true});
+        if (FAILED(hr)) std::printf("campaign format %u: %08lx\n", static_cast<unsigned>(format), hr);
+        REQUIRE(SUCCEEDED(hr));
+    }
 
     // Two resource generations exercise exact-size recreation; each is retired
     // before releasing either API's reference. No resource created per frame.
     for (UINT width : {64u, 37u}) {
         const UINT height = 19;
         SharedTexture input, output;
-        REQUIRE(SUCCEEDED(input.Create(d11.Get(), d12.Get(), {width, height, DXGI_FORMAT_R8G8B8A8_UNORM})));
+        hr = input.Create(d11.Get(), d12.Get(), {width, height, DXGI_FORMAT_R8G8B8A8_UNORM});
+        if (FAILED(hr)) std::printf("shared input creation: %08lx\n", hr);
+        REQUIRE(SUCCEEDED(hr));
         REQUIRE(SUCCEEDED(output.Create(d11.Get(), d12.Get(), {width, height, DXGI_FORMAT_R8G8B8A8_UNORM, true})));
         REQUIRE(FAILED(input.Create(d11.Get(), d12.Get(), {width, height, DXGI_FORMAT_R8G8B8A8_UNORM})));
         D3D11_TEXTURE2D_DESC desc{};
