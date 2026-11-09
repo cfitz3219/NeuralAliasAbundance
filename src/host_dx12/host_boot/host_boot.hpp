@@ -48,4 +48,10 @@ Status GetStatus();
 // early swap-chain queue bindings are captured as well as producer objects.
 void WaitForObserveInstall();
 
+// The DX11 bridge waits here (up to `ms`) before it creates its own D3D12 device, so that
+// creation never competes with the host's own install (Pharaoh, 068c8a3: a bridge D3D12CreateDevice
+// started mid-install took 13-14 s, each factory inside it sitting out the 3 s gate). True once
+// install was attempted (or no gate is configured).
+bool WaitForInstallAttempt(unsigned long ms);
+
 } // namespace na::host

@@ -1,5 +1,6 @@
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/host_boot/host_boot.hpp"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -169,10 +170,11 @@ bool build_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* leve
 }
 
 // The game's request runs on a worker thread of ours, and the game waits at most
-// kCreateTimeoutMs (10 s). Pharaoh (2026-11-09, 250d6ca) hung forever inside this creation on its
+// kCreateTimeoutMs (25 s, including the wait for the host's install). Pharaoh (2026-11-09, 250d6ca) hung forever inside this creation on its
 // own thread; whatever the step, the game now falls back to native DX11 instead of freezing
 // (fail-quiet), and the startup log names the step that stalled.
-constexpr DWORD kCreateTimeoutMs = 10000; // D3D12CreateDevice alone can sit 3 s in the early factory gate
+constexpr DWORD kInstallWaitMs = 15000;   // the host's own install, before our D3D12 device
+constexpr DWORD kCreateTimeoutMs = 25000; // that wait + the creation itself (~3 s for 11on12)
 struct CreateJob {
     IDXGIAdapter* adapter = nullptr;
     UINT flags = 0;
@@ -199,6 +201,10 @@ DWORD WINAPI create_worker(LPVOID param)
     std::shared_ptr<CreateJob> job(*static_cast<std::shared_ptr<CreateJob>*>(param));
     delete static_cast<std::shared_ptr<CreateJob>*>(param);
     ++t_inside; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
+    // Our D3D12 device only after the host's install: started mid-install, D3D12CreateDevice
+    // competes with it and sits out the 3 s factory gate per factory (Pharaoh: 13-14 s).
+    step("wait for host install", job->thread, job->t0);
+    if (!na::host::WaitForInstallAttempt(kInstallWaitMs)) step("host install still running; creating anyway", job->thread, job->t0);
     ID3D11Device* d = nullptr;
     ID3D11DeviceContext* c = nullptr;
     D3D_FEATURE_LEVEL l{};
@@ -210,7 +216,8 @@ DWORD WINAPI create_worker(LPVOID param)
     if (job->abandoned) { // the game already went native: drop what we built
         if (c) c->Release();
         if (d) d->Release();
-        if (job->thread && g_log) g_log("dx11on12: a timed-out creation finished late; its device was released");
+        if (ok) g_wrapped.fetch_sub(1); // counted by build_on12, never handed out
+        note("a timed-out 11on12 creation finished late and was released; the game runs native DX11");
     } else {
         job->ok = ok;
         job->device = d;
@@ -249,7 +256,7 @@ bool create_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* lev
     if (!job->finished) {
         job->abandoned = true;
         (void)wait;
-        note("11on12 device creation did not finish in 10 s (see the last 'step' line); native DX11");
+        note("11on12 device creation did not finish in 25 s (see the last 'step' line); native DX11");
         return false;
     }
     if (!job->ok) return false;

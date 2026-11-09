@@ -472,6 +472,12 @@ void WaitForObserveInstall()
     if(WaitForSingleObject(g_install_event,3000)==WAIT_TIMEOUT)g_gate_expired.fetch_add(1);
 }
 
+bool WaitForInstallAttempt(unsigned long ms)
+{
+    if (!g_install_event) return true;
+    return WaitForSingleObject(g_install_event, ms) == WAIT_OBJECT_0;
+}
+
 Status GetStatus()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
