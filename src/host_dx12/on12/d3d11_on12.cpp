@@ -280,6 +280,20 @@ ID3D12Device* DeviceFor(IUnknown* device)
 namespace {
 struct Token { ComPtr<ID3D11On12Device2> device; ComPtr<ID3D11Resource> buffer; };
 std::atomic<uint64_t> g_unwraps{0}, g_unwrap_failures{0}, g_returns{0};
+// Time spent inside 11on12's unwrap / return (CPU), to find stalls while the menu draws.
+std::atomic<uint64_t> g_unwrap_us{0}, g_unwrap_max_us{0}, g_return_us{0}, g_return_max_us{0};
+uint64_t now_us()
+{
+    static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return 1e6 / double(q.QuadPart); }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return static_cast<uint64_t>(double(t.QuadPart) * f);
+}
+void add_time(std::atomic<uint64_t>& total, std::atomic<uint64_t>& peak, uint64_t us)
+{
+    total.fetch_add(us);
+    uint64_t m = peak.load();
+    while (us > m && !peak.compare_exchange_weak(m, us)) {}
+}
 }
 
 bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, ID3D12Resource** out, Borrowed& borrowed)
@@ -291,7 +305,9 @@ bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* qu
     if (FAILED(any.As(&device))) return false; // not an 11on12 chain
     ComPtr<ID3D11Resource> buffer;
     HRESULT hr = sc->GetBuffer(index, IID_PPV_ARGS(&buffer));
+    const uint64_t t0 = now_us();
     if (SUCCEEDED(hr)) hr = device->UnwrapUnderlyingResource(buffer.Get(), queue, IID_PPV_ARGS(out));
+    add_time(g_unwrap_us, g_unwrap_max_us, now_us() - t0);
     if (FAILED(hr) || !*out) { g_unwrap_failures.fetch_add(1); g_last_hr.store(static_cast<long>(hr)); return false; }
     auto* t = new Token{device, buffer};
     borrowed.token = t;
@@ -308,7 +324,9 @@ Borrowed::~Borrowed()
     UINT64 v = value;
     ID3D12Fence* fences[] = {fence};
     // Back to 11on12 before Present; with our fence, 11on12 waits for the menu draw.
+    const uint64_t t0 = now_us();
     t->device->ReturnUnderlyingResource(t->buffer.Get(), fence ? 1u : 0u, fence ? &v : nullptr, fence ? fences : nullptr);
+    add_time(g_return_us, g_return_max_us, now_us() - t0);
     g_returns.fetch_add(1);
     delete t;
 }
@@ -317,11 +335,15 @@ int FormatStatus(char* out, size_t capacity)
 {
     std::lock_guard<std::mutex> lk(g_m);
     return std::snprintf(out, capacity,
-                         "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{unwraps=%llu failures=%llu returns=%llu} last_hr=0x%08lX reason=\"%s\"",
+                         "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{unwraps=%llu failures=%llu returns=%llu unwrap_us=%llu/max%llu return_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\"",
                          g_enabled.load() ? 1u : 0u, g_hooked.load() ? 1u : 0u, g_requests.load(), g_wrapped.load(),
                          g_with_swapchain.load(), g_native.load(), g_probes.load(), g_swapchain_check.load(),
                          static_cast<unsigned long long>(g_unwraps.load()), static_cast<unsigned long long>(g_unwrap_failures.load()),
                          static_cast<unsigned long long>(g_returns.load()),
+                         static_cast<unsigned long long>(g_unwraps.load() ? g_unwrap_us.load() / g_unwraps.load() : 0),
+                         static_cast<unsigned long long>(g_unwrap_max_us.load()),
+                         static_cast<unsigned long long>(g_returns.load() ? g_return_us.load() / g_returns.load() : 0),
+                         static_cast<unsigned long long>(g_return_max_us.load()),
                          static_cast<unsigned long>(g_last_hr.load()), g_reason);
 }
 
