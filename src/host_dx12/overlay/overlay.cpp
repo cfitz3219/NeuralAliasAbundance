@@ -29,6 +29,7 @@
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/overlay/dlss_debug.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
+#include "host_dx12/native11/input_provider.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -883,7 +884,24 @@ void write_status_line()
     ULONGLONG now = GetTickCount64();
     flush_events(); // timed transitions, written as soon as the discovery thread runs
     if (now - g_status_last_tick < 5000) return;
+    const bool have_interval = g_status_last_tick != 0;
+    const ULONGLONG elapsed = now - g_status_last_tick;
     g_status_last_tick = now;
+    if (na::on12::NativeRoute()) {
+        static uint64_t previous_frames = 0;
+        const uint64_t frames = na::native11::Stats().frames;
+        const double fps = have_interval && frames >= previous_frames
+            ? double(frames - previous_frames) * 1000.0 / double(elapsed) : 0.0;
+        previous_frames = frames;
+        char status[2048]{}, line[2240]{};
+        na::on12::FormatStatus(status, sizeof status);
+        SYSTEMTIME t{};
+        GetLocalTime(&t);
+        const int bytes = snprintf(line, sizeof line, "%02u:%02u:%02u fps=%.1f frame_ms=%.2f | %s\r\n",
+                                   t.wHour, t.wMinute, t.wSecond, fps, fps > 0 ? 1000.0 / fps : 0.0, status);
+        append_status_text(line, (std::min)(bytes, int(sizeof line) - 1));
+        return;
+    }
     {
         char el[160];
         const int en = snprintf(el, sizeof el, "event_log frame=%llu total=%llu dropped=%llu\r\n",
@@ -4140,6 +4158,13 @@ bool StartCore(const char* route_tag, PanelFn controls)
     snprintf(g_route_tag, sizeof(g_route_tag), "%s", route_tag ? route_tag : "");
     g_controls = controls;
     g_stopping.store(false);
+    if (na::on12::NativeRoute()) {
+        // Native11 owns Present and ResizeBuffers. Run the existing status
+        // worker without installing the competing DX12 swap-chain detours.
+        const bool started = na::hooking::variants::StartDiscoveryThread(&seen_drain, nullptr);
+        g_core_started.store(started, std::memory_order_release);
+        return started;
+    }
     g_boundary_frames.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(g_boundary_m);
@@ -4341,6 +4366,7 @@ bool StartMenu()
 {
     std::lock_guard<std::mutex> start_lock(g_start_m);
     if(!g_core_started.load(std::memory_order_acquire))return false;
+    if(na::on12::NativeRoute())return false;
     if(g_menu_enabled.load(std::memory_order_acquire) && g_input_hooks.load()==8)return true;
     if(g_fail_menu_start.exchange(false))return false;
     g_menu_cursor=LoadCursorW(nullptr,IDC_ARROW);

@@ -397,15 +397,19 @@ HMODULE system_module(const wchar_t* name)
 void Start(const wchar_t* ini, LogFn log)
 {
     g_log = log;
-    if (GetPrivateProfileIntW(L"dx11on12", L"enabled", 0, ini) != 1) {
-        std::snprintf(g_reason, sizeof g_reason, "Off ([dx11on12] enabled=0).");
+    const bool native = GetPrivateProfileIntW(L"native11", L"enabled", 0, ini) == 1;
+    const bool bridge = GetPrivateProfileIntW(L"dx11on12", L"enabled", 0, ini) == 1;
+    if (!native && !bridge) {
+        std::snprintf(g_reason, sizeof g_reason, "Native DX11 and D3D11On12 disabled.");
         return;
     }
     HMODULE d3d11 = system_module(L"d3d11.dll");
-    HMODULE d3d12 = system_module(L"d3d12.dll");
     if (!d3d11) { note("system d3d11.dll not found; DX11 bridge off"); return; }
-    g_on12_create = reinterpret_cast<On12CreateDeviceFn>(GetProcAddress(d3d11, "D3D11On12CreateDevice"));
-    g_d3d12_create = d3d12 ? reinterpret_cast<D3D12CreateDeviceFn>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
+    if (!native) {
+        HMODULE d3d12 = system_module(L"d3d12.dll");
+        g_on12_create = reinterpret_cast<On12CreateDeviceFn>(GetProcAddress(d3d11, "D3D11On12CreateDevice"));
+        g_d3d12_create = d3d12 ? reinterpret_cast<D3D12CreateDeviceFn>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
+    }
     void* create = reinterpret_cast<void*>(GetProcAddress(d3d11, "D3D11CreateDevice"));
     void* create_sc = reinterpret_cast<void*>(GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain"));
     bool ok = create && create_sc &&
@@ -415,9 +419,7 @@ void Start(const wchar_t* ini, LogFn log)
     g_menu_buffer.store(static_cast<int>(GetPrivateProfileIntW(L"dx11on12", L"menu_buffer", 1, ini)));
     g_copy_with_d3d11.store(GetPrivateProfileIntW(L"dx11on12", L"copy_with_d3d11", 0, ini) != 0);
     g_keep_game_swapchain.store(GetPrivateProfileIntW(L"dx11on12", L"keep_game_swapchain", 0, ini) != 0);
-    wchar_t route[16] = {};
-    GetPrivateProfileStringW(L"dx11on12", L"route", L"bridge", route, 16, ini);
-    g_route_native.store(lstrcmpiW(route, L"native") == 0);
+    g_route_native.store(native);
     g_hooked.store(true);
     g_enabled.store(true);
     note(g_route_native.load() ? "D3D11 device creation hooked; native DX11 route (no translation), DLAA through shared images"
@@ -966,7 +968,8 @@ bool translate_common(IUnknown* device, DXGI_FORMAT format, ID3D12CommandQueue**
 
 } // namespace
 
-bool Enabled() { return g_hooked.load(); }
+bool Enabled() { return g_hooked.load() && !g_route_native.load(); }
+bool NativeRoute() { return g_enabled.load() && g_route_native.load(); }
 
 bool TranslateSwapChain(IUnknown* device, const DXGI_SWAP_CHAIN_DESC& game, DXGI_SWAP_CHAIN_DESC& real, ID3D12CommandQueue** queue)
 {
@@ -1289,7 +1292,7 @@ int FormatStatus(char* out, size_t capacity)
     int extra = 0;
     if (g_route_native.load()) {
         // Native route: provider and handoff state, then the bridge's own counters (requests only).
-        int m = std::snprintf(out, capacity, "dx11on12_route=native installs=%u install_failures=%u | ", g_native_installs.load(),
+        int m = std::snprintf(out, capacity, "native11_route=active installs=%u install_failures=%u | ", g_native_installs.load(),
                               g_native_install_failures.load());
         if (m > 0 && static_cast<size_t>(m) < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; }
         m = na::native11::FormatStatus(out, static_cast<unsigned long>(capacity));
@@ -1299,7 +1302,7 @@ int FormatStatus(char* out, size_t capacity)
     }
     return n + extra + std::snprintf(out, capacity,
                          "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{mode=%d unwraps=%llu failures=%llu returns=%llu composites=%llu composite_failures=%llu unwrap_us=%llu/max%llu return_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\"",
-                         g_enabled.load() ? 1u : 0u, g_hooked.load() ? 1u : 0u, g_requests.load(), g_wrapped.load(),
+                         Enabled() ? 1u : 0u, g_hooked.load() ? 1u : 0u, g_requests.load(), g_wrapped.load(),
                          g_with_swapchain.load(), g_native.load(), g_probes.load(), g_swapchain_check.load(), g_menu_buffer.load(),
                          static_cast<unsigned long long>(g_unwraps.load()), static_cast<unsigned long long>(g_unwrap_failures.load()),
                          static_cast<unsigned long long>(g_returns.load()),

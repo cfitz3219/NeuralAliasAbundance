@@ -5,6 +5,7 @@
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
@@ -235,6 +236,9 @@ bool FailSession(Session& s, const char* why)
 
 bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
 {
+    // The native provider has witnessed a real rendered scene. Wake the
+    // existing session worker so it can qualify settings and enable effects.
+    if (context) host::RendererObserved();
     native11::SetNextJitter(0, 0);
     if (!context || !j2::Enabled() || j2::Paused()) return Skip("DLAA paused.");
     std::lock_guard<std::mutex> lock(mutex);
