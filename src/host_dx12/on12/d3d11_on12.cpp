@@ -705,6 +705,9 @@ struct TChain {
 // Recursive: BeforePresent asks the chain for its D3D12 buffer through the hooked GetBuffer.
 std::recursive_mutex g_tm;
 TChain g_tchains[4];
+// A deferred backbuffer destruction can re-enter the swap chain's Release
+// from the translation worker while ResizeBuffers waits for that worker.
+std::atomic<IDXGISwapChain*> g_tchain_ids[std::size(g_tchains)]{};
 std::atomic<uint32_t> g_tchain_count{0};
 std::atomic<uint64_t> g_translated{0}, g_untranslated{0}, g_tcopies{0}, g_tcopy_failures{0}, g_tresizes{0}, g_tresize_waits{0};
 std::atomic<long> g_tlast_hr{0};
@@ -903,18 +906,21 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
     TChain* c = tfind(chain);
     if (!c) for (auto& k : g_tchains) if (!k.sc) { c = &k; break; }
     if (!c) { tnote("more than four translated swap chains; the game gets its own chain"); return false; }
+    auto& published = g_tchain_ids[c - g_tchains];
     const bool reused = c->sc == chain;
     if (c->event) CloseHandle(c->event);
     *c = TChain{};
     auto fail = [&](const char* why) {
         *c = TChain{};
-        if (reused) g_tchain_count.fetch_sub(1);
+        if (reused) {
+            published.store(nullptr);
+            g_tchain_count.fetch_sub(1);
+        }
         g_untranslated.fetch_add(1);
         tnote(why);
         return false;
     };
     if (!init_translated(*c, chain, device)) return fail("the translated swap chain could not be attached; the game gets its own chain");
-    if (!reused) g_tchain_count.fetch_add(1);
     c->game_format = game_format;
     c->game_count = game_count;
     c->game_effect = game_effect;
@@ -922,6 +928,8 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
     c->game_usage = game_usage;
     read_size(*c);
     if (!build_virtual(*c)) return fail("the game's back buffer could not be built; the game gets its own chain");
+    published.store(chain);
+    if (!reused) g_tchain_count.fetch_add(1);
     g_translated.fetch_add(1);
     char line[160];
     std::snprintf(line, sizeof line, "the game presents through a D3D12 swap chain (%ux%u, format %d, %u sample(s))", c->width, c->height,
@@ -932,9 +940,9 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
 
 bool IsTranslated(IDXGISwapChain* chain)
 {
-    if (!g_tchain_count.load(std::memory_order_relaxed)) return false;
-    std::lock_guard<std::recursive_mutex> lk(g_tm);
-    return tfind(chain) != nullptr;
+    if (!chain) return false;
+    for (const auto& id : g_tchain_ids) if (id.load() == chain) return true;
+    return false;
 }
 
 bool HandleGetBuffer(IDXGISwapChain* chain, unsigned index, const GUID& riid, void** out, long* hr)
@@ -1114,6 +1122,7 @@ void ForgetSwapChain(IDXGISwapChain* chain)
     std::lock_guard<std::recursive_mutex> lk(g_tm);
     TChain* c = tfind(chain);
     if (!c) return;
+    g_tchain_ids[c - g_tchains].store(nullptr);
     tdrain(*c);
     if (c->event) CloseHandle(c->event);
     *c = TChain{};
