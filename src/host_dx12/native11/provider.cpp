@@ -1133,13 +1133,13 @@ int FormatStatus(char* out, unsigned long n)
     const ProviderStats s = Stats();
     return std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
-                         "camera_found=%llu camera_missing=%llu jitter_written=%llu%s%s",
+                         "camera_found=%llu camera_missing=%llu jitter_written=%llu%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
                          static_cast<unsigned long long>(s.camera_found), static_cast<unsigned long long>(s.camera_missing),
                          static_cast<unsigned long long>(s.jitter_written), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
-                         s.last_miss && s.last_miss[0] ? s.last_miss : "");
+                         s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
 
 } // namespace na::native11
