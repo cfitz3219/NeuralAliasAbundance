@@ -393,7 +393,7 @@ endif()
 # Reversible per-application FG preset helper; no profile changes at build/test time.
 # DX11-on-DX12 bridge probe: a tiny DX11 "game" run beside dxgi.dll ([dx11on12] enabled=1).
 add_executable(na_dx11on12_probe tools/dx11on12_probe.cpp)
-target_link_libraries(na_dx11on12_probe PRIVATE d3d11 dxgi)
+target_link_libraries(na_dx11on12_probe PRIVATE d3d11 dxgi d3dcompiler)
 add_executable(NAProfile src/host_dx12/fg/preset_profile.cpp)
 target_compile_definitions(NAProfile PRIVATE NA_PROFILE_CLI)
 target_link_libraries(NAProfile PRIVATE host_settings nvapi_headers)
