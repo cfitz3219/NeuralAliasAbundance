@@ -213,6 +213,8 @@ void Viewport(ID3D11DeviceContext* c, UINT w, UINT h)
     c->RSSetViewports(1, &vp);
 }
 
+std::atomic<bool> g_tonemap_bound{false}; // the immediate context's tonemap read was bound this frame
+
 void Scene(ID3D11DeviceContext* c, Game& g, int frame)
 {
     g_tonemap_bound = false;
@@ -238,8 +240,6 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     Viewport(c, g.w, g.h);
     for (int i = 0; i < 40; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
 }
-
-std::atomic<bool> g_tonemap_bound{false}; // the immediate context's tonemap read was bound this frame
 
 void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 {
