@@ -352,6 +352,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         return SetReason("No camera matrix (with its inverse) was found in the scene's constant buffers.");
     }
     ++g_stats.camera_found;
+    const Selection cam_sel = g_model.Current(); // CameraNow may have just chosen (or changed) the camera buffer
     SceneFrame f;
     f.frame = g_frame;
     const auto texture = [](TextureFacts& t, ID3D11Resource* r, const ResourceInfo& info, const ViewUse& view) {
@@ -381,8 +382,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     texture(f.depth, depth.Get(), sel.depth_info, g_depth_view);
     f.reversed_depth = cam.reversed;
     std::vector<uint8_t> camera_bytes(*bytes); // the callback runs without g_mu
-    f.camera.buffer = sel.camera_cb;
-    f.camera.vs_slot = sel.camera_slot;
+    f.camera.buffer = cam_sel.camera_cb;
+    f.camera.vs_slot = cam_sel.camera_slot;
     f.camera.first_constant = g_camera_first;
     f.camera.num_constants = g_camera_num;
     f.camera.version = version;
@@ -397,19 +398,19 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     // tagged when the game last uploaded to it.
     // A buffer selected before its first candidate upload has no tag yet: its first tag is not a change.
     uint64_t cam_inc = 0;
-    if (sel.camera_cb) {
-        auto it = g_cb_incarnation.find(sel.camera_cb);
+    if (cam_sel.camera_cb) {
+        auto it = g_cb_incarnation.find(cam_sel.camera_cb);
         if (it != g_cb_incarnation.end()) cam_inc = it->second;
     }
     f.selection_changed = !g_stream || f.color.incarnation != g_stream_key[0] || f.depth.incarnation != g_stream_key[1] ||
-                          sel.camera_cb != g_stream_key[2] || (cam_inc && g_stream_key[3] && cam_inc != g_stream_key[3]);
+                          cam_sel.camera_cb != g_stream_key[2] || (cam_inc && g_stream_key[3] && cam_inc != g_stream_key[3]);
     if (f.selection_changed) ++g_stream;
     g_stream_key[0] = f.color.incarnation;
     g_stream_key[1] = f.depth.incarnation;
-    g_stream_key[2] = sel.camera_cb;
+    g_stream_key[2] = cam_sel.camera_cb;
     if (cam_inc || f.selection_changed) g_stream_key[3] = cam_inc;
     f.stream = g_stream;
-    g_last_selection = sel;
+    g_last_selection = cam_sel;
     const SceneCallback cb = g_cb;
     void* user = g_cb_user;
     lk.unlock();
