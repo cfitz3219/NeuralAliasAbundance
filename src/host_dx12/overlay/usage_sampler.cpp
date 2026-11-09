@@ -20,7 +20,7 @@
 namespace na::usage {
 namespace {
 
-struct TopThread { DWORD tid = 0; double pct = 0; char name[24] = {}; };
+struct TopThread { DWORD tid = 0; double pct = 0; char name[40] = {}; };
 
 struct Snapshot {
     bool valid = false;
@@ -41,16 +41,40 @@ ULONGLONG ft(const FILETIME& f) { return (ULONGLONG(f.dwHighDateTime) << 32) | f
 
 using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
 
+// A busy thread without a description is named by the module its start address lies in
+// ("@d3d11.dll", "@NeuralAliasDXGI.dll", "@game.exe"): on a DX11 game through the bridge the
+// pinned threads were unnamed (WWII p35760), so the log could not say whose they were.
+using NtQueryInformationThreadFn = LONG(WINAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+void thread_module(HANDLE h, char* out, std::size_t size)
+{
+    static const auto query = reinterpret_cast<NtQueryInformationThreadFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    if (!query) return;
+    PVOID start = nullptr;
+    if (query(h, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof start, nullptr) < 0 || !start) return;
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(start), &m) || !m) return;
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return;
+    const wchar_t* base = path;
+    for (const wchar_t* p = path; *p; ++p) if (*p == L'\\' || *p == L'/') base = p + 1;
+    std::size_t i = 0;
+    out[i++] = '@';
+    for (; base[i - 1] && i + 1 < size; ++i) out[i] = (base[i - 1] > 32 && base[i - 1] < 127) ? char(base[i - 1]) : '_';
+    out[i] = 0;
+}
 void thread_name(GetThreadDescriptionFn fn, HANDLE h, char* out, std::size_t size)
 {
     out[0] = 0;
-    if (!fn) return;
     PWSTR w = nullptr;
-    if (FAILED(fn(h, &w)) || !w) return;
-    std::size_t i = 0;
-    for (; w[i] && i + 1 < size; ++i) out[i] = (w[i] > 32 && w[i] < 127) ? char(w[i]) : '_';
-    out[i] = 0;
-    LocalFree(w);
+    if (fn && SUCCEEDED(fn(h, &w)) && w) {
+        std::size_t i = 0;
+        for (; w[i] && i + 1 < size; ++i) out[i] = (w[i] > 32 && w[i] < 127) ? char(w[i]) : '_';
+        out[i] = 0;
+        LocalFree(w);
+    }
+    if (!out[0]) thread_module(h, out, size);
 }
 
 DWORD WINAPI sampler(void*)
@@ -106,7 +130,8 @@ DWORD WINAPI sampler(void*)
             te.dwSize = sizeof te;
             for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
                 if (te.th32OwnerProcessID != pid) continue;
-                HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+                HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID); // start address needs the full query right (own process)
+                if (!h) h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
                 if (!h) continue;
                 if (GetThreadTimes(h, &c, &e, &k, &u)) {
                     const ULONGLONG t = ft(k) + ft(u);
