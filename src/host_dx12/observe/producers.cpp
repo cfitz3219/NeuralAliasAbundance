@@ -84,6 +84,11 @@ struct ListState {
     std::mutex bind_m;
     std::vector<Binding> bindings;
     const void* root_sig[2] = {nullptr, nullptr}; // graphics, compute (recording thread)
+    // root_table: the bound root signature's registry entry, reused while the same signature stays
+    // bound and no object retired (g_retire_gen); std::unordered_map nodes never move otherwise.
+    const void* rs_key[2] = {nullptr, nullptr};
+    const void* rs_obj[2] = {nullptr, nullptr};
+    uint64_t rs_gen[2] = {0, 0};
     uint64_t root_serial[2]{},host_restore_serial=0;
     // C9b: explicit transitions recorded in this recording, in order (under bind_m).
     struct StateNote {
@@ -248,6 +253,10 @@ struct DescHeap {
     // time. Writers under the exclusive g_m need none (no copy can be running then).
     std::unique_ptr<std::shared_mutex[]> stripes;
     uint32_t nstripes = 0;
+    // Read filter (one bit per slot, one word per stripe): the slot holds an SRV of a resource in
+    // g_hot_ids (the live scene colour or any resource ever seen as a copy of it). Written with
+    // info, under the same locks; read under the shared g_m.
+    std::unique_ptr<std::atomic<uint64_t>[]> hot;
 };
 constexpr uint32_t kStripeShift = 6;
 // Shared lock of the stripe holding a slot. Holds at most one stripe: lock() moves to
@@ -334,6 +343,65 @@ void ReleaseParkedTwins()
     dead.clear(); // plain Release calls from the game's own call stack
 }
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
+// ---- Read filter (WWII p31660, 2026-11-09: DLAA on, 10 fps, the bridge's single thread at 98%:
+// before_shader_use walked every descriptor of every bound table on ~9,000 draws per frame,
+// 2.6 us per draw, touching one 48-byte SlotInfo per descriptor of a ring heap that is new each
+// draw, so its cache never hits). The walk only produces something when a table holds an SRV
+// of the scene colour or of a copy of it. g_hot_ids is a superset of both (the selected colour
+// plus every copy ever seen); each heap keeps one bit per slot for "SRV of a hot id". When no
+// bound SRV range has a hot bit, the walk's result is known (no colour read, no derived read)
+// and it is skipped; otherwise the original walk runs unchanged. The set changes only under the
+// exclusive g_m (RefreshReadFilter, called at Present with no lock held), which recomputes every
+// bit; until then g_hot_ready is false and every draw takes the original walk.
+constexpr uint32_t kHotMax = 64;
+na_object_id g_hot_ids[kHotMax] = {}; // read under the shared g_m, written under the exclusive g_m
+uint32_t g_hot_n = 0;
+na_object_id g_hot_color = 0;         // the selected colour the bits were built for
+std::atomic<bool> g_hot_ready{false};
+std::mutex g_hot_pending_m;           // the known set mirrored here, plus additions not yet applied
+na_object_id g_hot_known[kHotMax] = {};
+uint32_t g_hot_known_n = 0;
+na_object_id g_hot_pending[kHotMax] = {};
+uint32_t g_hot_pending_n = 0;
+bool g_hot_overflow = false;          // more than kHotMax ids: the filter stays off (original walk)
+std::atomic<uint64_t> g_hot_rebuilds{0}, g_hot_skipped{0}, g_hot_walked{0};
+inline bool hot_id_locked(na_object_id id)
+{
+    if (!id || id == NA_UNKNOWN_U64) return false;
+    for (uint32_t i = 0; i < g_hot_n; ++i) if (g_hot_ids[i] == id) return true;
+    return false;
+}
+inline void set_hot_bit(DescHeap* h, uint64_t slot, bool on)
+{
+    if (!h->hot || (slot >> kStripeShift) >= h->nstripes) return;
+    const uint64_t bit = 1ull << (slot & 63);
+    auto& w = h->hot[static_cast<size_t>(slot >> kStripeShift)];
+    if (on) w.fetch_or(bit, std::memory_order_relaxed);
+    else if (w.load(std::memory_order_relaxed) & bit) w.fetch_and(~bit, std::memory_order_relaxed);
+}
+// Any hot slot in [first, first + n) (clipped to the heap); the shared g_m is held.
+inline bool any_hot(const DescHeap* h, uint64_t first, uint64_t n)
+{
+    if (!h->hot) return true; // no bitmap: let the walk decide
+    if (first >= h->count) return false;
+    const uint64_t end = std::min<uint64_t>(first + n, h->count);
+    for (uint64_t a = first; a < end;) {
+        const uint64_t w = a >> kStripeShift, lo = a & 63, hi = std::min<uint64_t>(64, lo + (end - a));
+        const uint64_t mask = (hi == 64 ? ~0ull : ((1ull << hi) - 1)) & ~((1ull << lo) - 1);
+        if (h->hot[static_cast<size_t>(w)].load(std::memory_order_relaxed) & mask) return true;
+        a += hi - lo;
+    }
+    return false;
+}
+void mark_hot_candidate(na_object_id id) // a copy of the scene colour (any thread, any lock)
+{
+    if (!id || id == NA_UNKNOWN_U64) return;
+    std::lock_guard<std::mutex> lk(g_hot_pending_m);
+    for (uint32_t i = 0; i < g_hot_known_n; ++i) if (g_hot_known[i] == id) return;
+    for (uint32_t i = 0; i < g_hot_pending_n; ++i) if (g_hot_pending[i] == id) return;
+    g_hot_ready.store(false, std::memory_order_release);
+    if (g_hot_pending_n < kHotMax) g_hot_pending[g_hot_pending_n++] = id; else g_hot_overflow = true;
+}
 // CPU-handle index of g_heaps, sorted by cpu_start (rebuilt under the exclusive g_m whenever
 // g_heaps changes): every descriptor write/copy and many binds looked their heap up by
 // walking all heaps under the lock.
@@ -572,11 +640,29 @@ constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
 constexpr uint32_t kCostPseudo = 100, kCostVpj = 100, kCostShaderUse = 101, kCostLaneBefore = 102, kCostLaneAfter = 103,
                    kCostDriver = 104, kCostRun = 105, kCostRootTable = 106, kCostSampled = 107, kCostEmit = 108,
                    kCostNoteDraw = 109, kCostCanonMiss = 110,
-                   kCostDescCopy = 111, kCostDescCopyWait = 112, kCostDescWrite = 113, kCostDescWriteWait = 114; // descriptor copies/writes and their wait for the exclusive g_m
+                   kCostDescCopy = 111, kCostDescCopyWait = 112, kCostDescWrite = 113, kCostDescWriteWait = 114, // descriptor copies/writes and their wait for the exclusive g_m
+                   // WWII p28412 (2026-11-09): pso 37-81 ms per creation and shader_use 10 us per draw were the two
+                   // costs; these split each into the driver's / the walk's share and ours.
+                   kCostPsoDriver = 115, kCostPsoReflect = 116, kCostUseLookup = 117, kCostUseWalk = 118, kCostUseCallback = 119,
+                   // WWII p7632: ResourceBarrier cost 15 ms per DLAA frame; the scene-read callback (inline DLAA) is timed alone.
+                   kCostSceneReadCb = 120, kCostLast = 120;
 std::atomic<bool> g_cost_enabled{false};
-std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
-thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
-thread_local uint32_t t_cost_n = 0;
+std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{}, g_cost_timed[kCostSlots]{};
+thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{}, t_cost_timed[kCostSlots]{};
+thread_local uint32_t t_cost_n = 0, t_cost_seq[kCostSlots]{};
+// WWII p7632: ~7 million timed scopes per second (one per descriptor copy/write, its lock wait, every
+// driver forward, root table and event emit) made the profiler a large share of what it measured: two
+// clock reads per scope, nested inside the slot envelopes. These uniform, very frequent scopes are
+// timed on one call in 16 (per thread) and every call is counted; the report scales the timed sum
+// by calls/timed. All other slots (rare or heavy-tailed, such as ResourceBarrier) time every call.
+constexpr uint32_t kCostSampleMask = 15;
+constexpr bool cost_sampled(uint32_t s)
+{
+    return s == kCostDescCopy || s == kCostDescCopyWait || s == kCostDescWrite || s == kCostDescWriteWait ||
+           s == kCostDriver || s == kCostRootTable || s == kCostEmit ||
+           // WWII p31660: ~9,000 draws per frame, each opening up to five of these nested per-draw scopes.
+           s == kCostVpj || s == kCostShaderUse || s == kCostUseLookup || s == kCostUseWalk || s == kCostUseCallback;
+}
 inline uint64_t cost_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
 void cost_flush()
 {
@@ -584,19 +670,50 @@ void cost_flush()
         if (t_cost_calls[i]) {
             g_cost_ticks[i].fetch_add(t_cost_ticks[i], std::memory_order_relaxed);
             g_cost_calls[i].fetch_add(t_cost_calls[i], std::memory_order_relaxed);
-            t_cost_ticks[i] = t_cost_calls[i] = 0;
+            g_cost_timed[i].fetch_add(t_cost_timed[i], std::memory_order_relaxed);
+            t_cost_ticks[i] = t_cost_calls[i] = t_cost_timed[i] = 0;
         }
     t_cost_n = 0;
 }
 struct CostScope {
-    uint32_t slot; uint64_t t0;
-    explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots && g_cost_enabled.load(std::memory_order_relaxed) ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
-    ~CostScope()
+    uint32_t slot = kCostSlots; uint64_t t0 = 0; bool counted = false; // counted: the call was counted at entry (sampled slot)
+    explicit CostScope(uint32_t s, bool on = true)
+    {
+        if (!on || s >= kCostSlots || !g_cost_enabled.load(std::memory_order_relaxed)) return;
+        if (cost_sampled(s)) {
+            ++t_cost_calls[s];
+            if (t_cost_seq[s]++ & kCostSampleMask) return; // counted, not timed
+            counted = true;
+        }
+        slot = s; t0 = cost_now();
+    }
+    void Close()
     {
         if (slot >= kCostSlots) return;
-        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_calls[slot];
+        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_timed[slot];
+        if (!counted) ++t_cost_calls[slot];
+        counted = false;
         if (++t_cost_n >= 512 || slot >= kCostExec) cost_flush();
+        slot = kCostSlots;
     }
+    // Account what ran so far to this scope's slot and continue under another one.
+    // A sampled target is counted on every call and timed only when this scope was timed, so a
+    // sampled chain (lookup -> walk) times whole calls and the report's calls/timed scaling holds.
+    void Switch(uint32_t s)
+    {
+        const bool on = slot < kCostSlots;
+        Close();
+        if (s >= kCostSlots || !g_cost_enabled.load(std::memory_order_relaxed)) return;
+        if (cost_sampled(s)) {
+            ++t_cost_calls[s];
+            if (!on) return;
+            counted = true;
+        } else if (!on) {
+            return;
+        }
+        slot = s; t0 = cost_now();
+    }
+    ~CostScope() { Close(); }
     CostScope(const CostScope&) = delete;
     CostScope& operator=(const CostScope&) = delete;
 };
@@ -682,6 +799,9 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         ++g_operation_revision;++g_heap_registry_revision;
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.id == id) { drop = take_parcel(it->second); g_objs.erase(it); }
+        // Again under the exclusive lock: an entry cached between the bump above and this erase
+        // (root_table's per-recording root signature entry) must not survive it.
+        g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
         heap_index_rebuild();
@@ -1036,8 +1156,49 @@ DescHeap* heap_for_cpu_locked(uint64_t ptr, uint32_t* slot)
     return nullptr;
 }
 
+// Publish a view's creation arguments into a slot (caller holds the slot's stripe exclusively).
+// WWII p31660: ~1 M view writes per second on the bridge's single translator thread, each one a
+// make_shared of a ~250-byte DescriptorDetails plus the free of the slot's previous one. The slot's
+// previous details object is reused in place when the slot is its only owner: every other owner
+// (a descriptor copy's destination slot, a reader's snapshot) can only obtain it by copying from a
+// holder, and the only holder is this slot, whose stripe we hold exclusively. Otherwise (shared)
+// a new object is made, as before. Readers never see a published object change: a shared one is
+// never touched.
+// Only eligible game sampler slots carry this payload. Descriptor-copy shadowing
+// already preserves the slot recipe and drops it when the owning heap is retired.
+struct SamplerRecipe final : DescriptorDetails {
+    D3D12_SAMPLER_DESC desc{};
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+    D3D12_SAMPLER_DESC2 desc2{};
+    bool modern = false;
+#endif
+    float native_bias = 0.0f, stored_bias = 0.0f;
+};
+
+void publish_details(DescHeap::SlotInfo& info, std::shared_ptr<const DescriptorDetails> old, const DescriptorDetails* view,
+                     uint32_t kind, na_object_id resource)
+{
+    if (!view) return;
+    if (kind == NA_DESC_SAMPLER) {
+        auto sampler = std::make_shared<SamplerRecipe>(*static_cast<const SamplerRecipe*>(view));
+        sampler->kind = kind;
+        info.details = std::move(sampler);
+        return;
+    }
+    if (old && old.use_count() == 1) {
+        auto* d = const_cast<DescriptorDetails*>(old.get()); // made non-const by make_shared below
+        *d = *view;
+        d->kind = kind; d->resource = resource;
+        info.details = std::move(old);
+        return;
+    }
+    auto d = std::make_shared<DescriptorDetails>(*view);
+    d->kind = kind; d->resource = resource;
+    info.details = std::move(d);
+}
+
 void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnknown* resource, uint32_t format,
-                           uint32_t first_sub, uint32_t sub_count, std::shared_ptr<DescriptorDetails> view = {})
+                           uint32_t first_sub, uint32_t sub_count, const DescriptorDetails* view = nullptr)
 {
     na_ev_descriptor_write e;
     const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
@@ -1046,18 +1207,33 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
     // descriptor metadata is published, outside the registry lock. Otherwise the view
     // keeps NA_UNKNOWN_U64 forever and the presenting draw's target is invisible.
     // Host-owned work stays unregistered (ensure_resource_registered checks t_host_work).
-    if (resource && kind != NA_DESC_SAMPLER) ensure_resource_registered(static_cast<ID3D12Resource*>(resource));
-    {
+    // The id returned here is the resource's registry id; the game holds the resource across this
+    // call, so it cannot retire before the publish below (WWII: ~1 M view writes/s on the bridge's
+    // single thread; the second canonical lookup under the lock was pure repetition).
+    // 2026-11-09: the known-resource case (every view after the first) resolves the id under the same
+    // shared registry lock that publishes the slot: one lock acquisition per write instead of two.
+    // Only a resource not yet registered leaves the lock, registers (outside it, as before) and retries,
+    // so the registration still precedes the publish.
+    const bool registrable = resource && kind != NA_DESC_SAMPLER;
+    na_object_id pre = 0;
+    bool registered = false;
+    for (;;) {
         const CostScope cost(kCostDescWrite);
         std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
         { const CostScope wait(kCostDescWriteWait); lock.lock(); }
+        const na_object_id rid = pre ? pre : resource ? id_locked(resource) : 0;
+        if (registrable && !rid && !registered && !t_host_work) {
+            lock.unlock();
+            pre = ensure_resource_registered(static_cast<ID3D12Resource*>(resource));
+            registered = true; // at most one retry; a failed registration publishes as unknown, as before
+            continue;
+        }
         uint32_t slot = 0;
         DescHeap* h = heap_for_cpu_locked(dst.ptr, &slot);
         if (!h) {
             g_c.unresolved.fetch_add(1);
             return;
         }
-        const na_object_id rid=resource?id_locked(resource):0;
         // The registry lock retains the heap/resource identity; only this slot's
         // stripe is exclusive. Publish compact metadata and replay details together.
         std::unique_lock<std::shared_mutex> stripe(h->stripes[slot >> kStripeShift], std::defer_lock);
@@ -1071,11 +1247,11 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             e.resource = NA_UNKNOWN_U64; // resource-backed, but created before observation
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
         }
+        std::shared_ptr<const DescriptorDetails> prev = std::move(h->info[slot].details);
         h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0};
-        if (view) {
-            view->kind=kind;view->resource=e.resource;
-            h->info[slot].details=std::move(view);
-        }
+        set_hot_bit(h, slot, kind == NA_DESC_SRV && hot_id_locked(e.resource));
+        publish_details(h->info[slot], std::move(prev), view, kind, e.resource);
+        break;
     }
     e.descriptor_kind = kind;
     e.format = format;
@@ -1133,6 +1309,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
                     for (uint32_t i = 0; i < run; ++i) {
                         ++dh->versions[ds + i];
                         dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
+                        set_hot_bit(dh, ds + i, dh->info[ds + i].kind == NA_DESC_SRV && hot_id_locked(dh->info[ds + i].resource));
                     }
                     for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
                     striped = true;
@@ -1165,6 +1342,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             for (uint32_t i = 0; i < run; ++i) {
                 ++dh->versions[ds + i];
                 dh->info[ds + i] = sh->info[ss + i];
+                set_hot_bit(dh, ds + i, dh->info[ds + i].kind == NA_DESC_SRV && hot_id_locked(dh->info[ds + i].resource));
             }
             e.src_heap = sh->id;
             e.dst_heap = dh->id;
@@ -1178,6 +1356,93 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
         dst += static_cast<uint64_t>(run) * increment;
         src += static_cast<uint64_t>(run) * increment;
     }
+}
+
+// CopyDescriptors with several ranges, as one unit (2026-11-09, WWII p31660: ~580k copy runs/s on the
+// D3D11On12 translator thread, the fps bottleneck). The translation layer gathers a shader table with ONE
+// CopyDescriptors call: one destination range, one single-descriptor source range per view. Run by run,
+// each of those paid the registry lock, two heap searches, its stripe locks, a revision bump and the
+// counters. Here the registry lock, the destination heap search and every stripe lock are taken once
+// per call; each run still updates exactly the slots, versions, hot bits and events it did run by run
+// (in the same order; D3D12 leaves overlapping source/destination undefined). Anything unusual (an
+// unresolved heap, a run crossing a heap end, too many runs or stripes) returns false BEFORE any
+// change and the caller uses the per-run path unchanged.
+std::atomic<uint64_t> g_copy_simple{0}, g_copy_calls{0}, g_copy_batched{0}, g_copy_batched_runs{0}; // per-API-call shape (status line)
+bool note_descriptor_copies_batch(const uint64_t* dst, const uint64_t* src, const uint32_t* cnt, uint32_t n, uint32_t increment)
+{
+    constexpr uint32_t kMaxRuns = 64, kMaxStripes = 32;
+    if (n < 2 || n > kMaxRuns || !increment) return false;
+    struct Run { DescHeap* dh; DescHeap* sh; uint32_t ds, ss; };
+    Run runs[kMaxRuns];
+    na_ev_descriptor_copy ev[kMaxRuns];
+    bool want_ev[kMaxRuns];
+    {
+        const CostScope cost(kCostDescCopy);
+        std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
+        { const CostScope wait(kCostDescCopyWait); lock.lock(); }
+        struct Want { std::shared_mutex* m; bool ex; };
+        Want want[kMaxStripes];
+        uint32_t nw = 0;
+        const auto add = [&](DescHeap* h, uint32_t first, uint32_t count, bool ex) {
+            if (!h->stripes) return false;
+            for (uint32_t st = first >> kStripeShift; st <= (first + count - 1) >> kStripeShift; ++st) {
+                if (st >= h->nstripes) return false;
+                std::shared_mutex* m = &h->stripes[st];
+                bool merged = false;
+                for (uint32_t i = 0; i < nw; ++i) if (want[i].m == m) { want[i].ex |= ex; merged = true; }
+                if (merged) continue;
+                if (nw == kMaxStripes) return false;
+                want[nw++] = {m, ex};
+            }
+            return true;
+        };
+        DescHeap* last_d = nullptr; DescHeap* last_s = nullptr;
+        const auto find = [&](DescHeap*& last, uint64_t ptr, uint32_t* slot) -> DescHeap* {
+            if (last && ptr >= last->cpu_start) { // same heap as the previous run: no search
+                const uint64_t off = ptr - last->cpu_start;
+                if (off % last->increment == 0 && off / last->increment < last->count) { *slot = static_cast<uint32_t>(off / last->increment); return last; }
+            }
+            DescHeap* h = heap_for_cpu_locked(ptr, slot);
+            if (h) last = h;
+            return h;
+        };
+        // Pass 1: resolve every run and collect its stripes; nothing changes yet.
+        for (uint32_t r = 0; r < n; ++r) {
+            if (!cnt[r]) return false;
+            Run& x = runs[r];
+            x.dh = find(last_d, dst[r], &x.ds);
+            x.sh = find(last_s, src[r], &x.ss);
+            if (!x.dh || !x.sh) return false;
+            if (cnt[r] > x.dh->count - x.ds || cnt[r] > x.sh->count - x.ss) return false;
+            if (!add(x.dh, x.ds, cnt[r], true) || !add(x.sh, x.ss, cnt[r], false)) return false;
+        }
+        // Pass 2: same per-slot effect as the per-run path, under every stripe at once (global address order).
+        std::sort(want, want + nw, [](const Want& a, const Want& b) { return std::less<std::shared_mutex*>()(a.m, b.m); });
+        {
+            const CostScope wait(kCostDescCopyWait);
+            for (uint32_t i = 0; i < nw; ++i) { if (want[i].ex) want[i].m->lock(); else want[i].m->lock_shared(); }
+        }
+        for (uint32_t r = 0; r < n; ++r) {
+            const Run& x = runs[r];
+            want_ev[r] = init_header_wanted(ev[r], NA_EV_DESCRIPTOR_COPY, 0);
+            ++g_operation_revision;
+            for (uint32_t i = 0; i < cnt[r]; ++i) {
+                ++x.dh->versions[x.ds + i];
+                x.dh->info[x.ds + i] = x.sh->info[x.ss + i];
+                set_hot_bit(x.dh, x.ds + i, x.dh->info[x.ds + i].kind == NA_DESC_SRV && hot_id_locked(x.dh->info[x.ds + i].resource));
+            }
+            ev[r].src_heap = x.sh->id;
+            ev[r].dst_heap = x.dh->id;
+            ev[r].src_slot = x.ss;
+            ev[r].dst_slot = x.ds;
+            ev[r].slot_count = cnt[r];
+        }
+        for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
+    }
+    g_c.copies.fetch_add(n);
+    g_copy_batched.fetch_add(1, std::memory_order_relaxed); g_copy_batched_runs.fetch_add(n, std::memory_order_relaxed);
+    for (uint32_t r = 0; r < n; ++r) if (want_ev[r]) emit(ev[r], NA_GROUP_DESCRIPTOR);
+    return true;
 }
 
 std::atomic<uint32_t> g_increment[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES] = {};
@@ -1348,6 +1613,8 @@ void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, co
     dh->info.assign(desc->NumDescriptors, DescHeap::SlotInfo{});
     dh->nstripes = (desc->NumDescriptors + (1u << kStripeShift) - 1) >> kStripeShift;
     dh->stripes.reset(new std::shared_mutex[dh->nstripes ? dh->nstripes : 1]);
+    dh->hot.reset(new std::atomic<uint64_t>[dh->nstripes ? dh->nstripes : 1]);
+    for (uint32_t i = 0; i < (dh->nstripes ? dh->nstripes : 1); ++i) dh->hot[i].store(0, std::memory_order_relaxed);
     const na_object_id dev_id = device_id(dev);
     na_ev_descriptor_heap_created e;
     init_header(e, NA_EV_DESCRIPTOR_HEAP_CREATED, flags);
@@ -1395,8 +1662,9 @@ void ensure_heap_registered(ID3D12DescriptorHeap* h)
 void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     o_CreateConstantBufferView(dev, desc, h);
-    std::shared_ptr<DescriptorDetails> view;
-    if(g_operation_snapshots.load()&&!t_host_work&&desc){view=std::make_shared<DescriptorDetails>();view->explicit_view=true;view->cbv=*desc;}
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
+    if(g_operation_snapshots.load()&&!t_host_work&&desc){view_args.explicit_view=true;view_args.cbv=*desc;view=&view_args;}
     na_object_id res = 0;
     uint64_t off = 0;
     bool known = false;
@@ -1422,9 +1690,11 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
         e.slot = slot;
         e.slot_version = ++dh->versions[slot];
         ++g_operation_revision;
+        std::shared_ptr<const DescriptorDetails> prev = std::move(dh->info[slot].details);
         dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
                                             known ? off : 0, desc ? desc->SizeInBytes : 0};
-        if(view){view->kind=NA_DESC_CBV;view->resource=dh->info[slot].resource;dh->info[slot].details=std::move(view);}
+        publish_details(dh->info[slot], std::move(prev), view, NA_DESC_CBV, dh->info[slot].resource);
+        set_hot_bit(dh, slot, false);
     }
     e.descriptor_kind = NA_DESC_CBV;
     e.resource = desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0;
@@ -1440,11 +1710,12 @@ void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resou
     o_CreateShaderResourceView(dev, r, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MostDetailedMip; count = d->Texture2D.MipLevels; }
-    std::shared_ptr<DescriptorDetails> view;
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
     if (g_operation_snapshots.load() && !t_host_work) {
-        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->srv = *d;
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.srv = *d;
     }
-    note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
+    note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Resource* r, ID3D12Resource* counter,
@@ -1453,12 +1724,13 @@ void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Reso
     o_CreateUnorderedAccessView(dev, r, counter, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MipSlice; count = 1; }
-    std::shared_ptr<DescriptorDetails> view;
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
     if (g_operation_snapshots.load() && !t_host_work) {
-        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->uav = *d;
-        bool created = false; view->counter = counter ? ensure_registered(counter, NA_OBJ_RESOURCE, &created) : 0;
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.uav = *d;
+        bool created = false; view_args.counter = counter ? ensure_registered(counter, NA_OBJ_RESOURCE, &created) : 0;
     }
-    note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
+    note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1476,11 +1748,12 @@ void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resourc
     else if (d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
         first = d->Texture2DMSArray.FirstArraySlice; count = 1; // MSAA textures have exactly one mip
     }
-    std::shared_ptr<DescriptorDetails> view;
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
     if (g_operation_snapshots.load() && !t_host_work) {
-        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->rtv = *d;
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.rtv = *d;
     }
-    note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
+    note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1497,11 +1770,12 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
     else if (d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
         first = d->Texture2DMSArray.FirstArraySlice; count = 1;
     }
-    std::shared_ptr<DescriptorDetails> view;
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
     if (g_operation_snapshots.load() && !t_host_work) {
-        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->dsv = *d;
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.dsv = *d;
     }
-    note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
+    note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 // Texture LOD (mip) bias for temporal reconstruction (J2 DLAA): with jitter and
@@ -1692,17 +1966,6 @@ void note_sampler_desc(uint32_t kind, const D& d)
                                uint32_t(d.ComparisonFunc), d.MipLODBias, d.MinLOD, d.MaxLOD, 1});
 }
 
-// Only eligible game sampler slots carry this payload. Descriptor-copy shadowing
-// already preserves the slot recipe and drops it when the owning heap is retired.
-struct SamplerRecipe final : DescriptorDetails {
-    D3D12_SAMPLER_DESC desc{};
-#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
-    D3D12_SAMPLER_DESC2 desc2{};
-    bool modern = false;
-#endif
-    float native_bias = 0.0f, stored_bias = 0.0f;
-};
-
 std::atomic<uint64_t> g_visible_sampler_uploads{0};
 std::atomic<float> g_visible_sampler_bias{0.0f};
 
@@ -1739,15 +2002,15 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
     } else {
         o_CreateSampler(dev, d, h);
     }
-    std::shared_ptr<SamplerRecipe> recipe;
-    if (surface && g_mip_live_enabled.load(std::memory_order_relaxed)) {
-        recipe = std::make_shared<SamplerRecipe>();
-        recipe->desc = m;
-        recipe->native_bias = d->MipLODBias;
-        recipe->stored_bias = m.MipLODBias;
-        if (shader_visible_sampler(h)) visible_sampler_bias(recipe->stored_bias);
+    SamplerRecipe recipe;
+    const bool retain = surface && g_mip_live_enabled.load(std::memory_order_relaxed);
+    if (retain) {
+        recipe.desc = m;
+        recipe.native_bias = d->MipLODBias;
+        recipe.stored_bias = m.MipLODBias;
+        if (shader_visible_sampler(h)) visible_sampler_bias(recipe.stored_bias);
     }
-    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, std::move(recipe));
+    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, retain ? &recipe : nullptr);
 }
 #if defined(__ID3D12Device11_INTERFACE_DEFINED__)
 // ID3D12Device11::CreateSampler2 (Agility SDK games): the same sampler as CreateSampler with
@@ -1773,16 +2036,16 @@ void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER
     } else {
         o_CreateSampler2(dev, d, h);
     }
-    std::shared_ptr<SamplerRecipe> recipe;
-    if (surface && g_mip_live_enabled.load(std::memory_order_relaxed)) {
-        recipe = std::make_shared<SamplerRecipe>();
-        recipe->desc2 = m;
-        recipe->modern = true;
-        recipe->native_bias = d->MipLODBias;
-        recipe->stored_bias = m.MipLODBias;
-        if (shader_visible_sampler(h)) visible_sampler_bias(recipe->stored_bias);
+    SamplerRecipe recipe;
+    const bool retain = surface && g_mip_live_enabled.load(std::memory_order_relaxed);
+    if (retain) {
+        recipe.desc2 = m;
+        recipe.modern = true;
+        recipe.native_bias = d->MipLODBias;
+        recipe.stored_bias = m.MipLODBias;
+        if (shader_visible_sampler(h)) visible_sampler_bias(recipe.stored_bias);
     }
-    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, std::move(recipe));
+    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, retain ? &recipe : nullptr);
 }
 #endif
 
@@ -1850,7 +2113,33 @@ void STDMETHODCALLTYPE D_CopyDescriptors(ID3D12Device* dev, UINT nd, const D3D12
     o_CopyDescriptors(dev, nd, ds, dsz, ns, ss, ssz, type);
     if (!ds || !ss) return;
     const uint32_t inc = descriptor_increment(dev, type);
-    // Walk both range lists in step; null size arrays mean ranges of 1.
+    // Walk both range lists in step; null size arrays mean ranges of 1. The runs are gathered first
+    // and applied as one unit when they fit (note_descriptor_copies_batch); otherwise run by run.
+    constexpr uint32_t kBatch = 64;
+    uint64_t bd[kBatch], bs[kBatch];
+    uint32_t bc[kBatch], nb = 0;
+    bool fits = true;
+    {
+        uint32_t di = 0, si = 0, doff = 0, soff = 0;
+        while (di < nd && si < ns) {
+            const uint32_t dlen = dsz ? dsz[di] : 1, slen = ssz ? ssz[si] : 1;
+            if (doff >= dlen) { ++di; doff = 0; continue; }
+            if (soff >= slen) { ++si; soff = 0; continue; }
+            const uint32_t run = std::min(dlen - doff, slen - soff);
+            if (nb == kBatch) { fits = false; break; }
+            bd[nb] = ds[di].ptr + static_cast<uint64_t>(doff) * inc;
+            bs[nb] = ss[si].ptr + static_cast<uint64_t>(soff) * inc;
+            bc[nb++] = run;
+            doff += run;
+            soff += run;
+        }
+    }
+    g_copy_calls.fetch_add(1, std::memory_order_relaxed);
+    if (fits && note_descriptor_copies_batch(bd, bs, bc, nb, inc)) {
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            for (uint32_t i = 0; i < nb; ++i) apply_sampler_upload(dev, bd[i], bs[i], bc[i], inc);
+        return;
+    }
     uint32_t di = 0, si = 0, doff = 0, soff = 0;
     while (di < nd && si < ns) {
         const uint32_t dlen = dsz ? dsz[di] : 1, slen = ssz ? ssz[si] : 1;
@@ -1869,6 +2158,7 @@ void STDMETHODCALLTYPE D_CopyDescriptorsSimple(ID3D12Device* dev, UINT n, D3D12_
                                                D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
     o_CopyDescriptorsSimple(dev, n, dst, src, type);
+    g_copy_simple.fetch_add(1, std::memory_order_relaxed);
     const uint32_t inc = descriptor_increment(dev, type);
     if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) apply_sampler_upload(dev, dst.ptr, src.ptr, n, inc);
     note_descriptor_copy(dst.ptr, src.ptr, n, inc);
@@ -2873,7 +3163,9 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
 {
     const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateGraphicsPipelineState");
-    const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreateGraphicsPipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
     g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
@@ -2910,7 +3202,9 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
 {
     const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateComputePipelineState");
-    const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreateComputePipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
     g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
@@ -2938,7 +3232,9 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
 {
     const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreatePipelineState");
-    const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreatePipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d || !d->pPipelineStateSubobjectStream) return hr;
     g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
@@ -3804,12 +4100,23 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
         }
         // C9: CBV ranges of this table, per the bound root signature.
 
-        if (dh && ls->root_sig[Compute]) {
-            auto it = g_objs.find(canon(ls->root_sig[Compute]));
-            if (it != g_objs.end() && param < it->second.root_params.size()) {
-                const na_root_param& rp = it->second.root_params[param];
+        // WWII p31660: ~250k table binds/s on the translator thread. Both per-recording budgets full
+        // (256 sampled textures, 4096 CBV bindings) means the range loops below add nothing: skip them,
+        // and reuse the root signature's entry instead of two hash lookups per bind.
+        if (dh && ls->root_sig[Compute] && (ls->sampled_textures.size() < 256 || ls->bindings.size() < 4096)) {
+            const Obj* rso = nullptr;
+            const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+            if (ls->rs_key[Compute] == ls->root_sig[Compute] && ls->rs_gen[Compute] == gen) {
+                rso = static_cast<const Obj*>(ls->rs_obj[Compute]);
+            } else {
+                auto it = g_objs.find(canon(ls->root_sig[Compute]));
+                rso = it != g_objs.end() ? &it->second : nullptr;
+                if (rso) { ls->rs_key[Compute] = ls->root_sig[Compute]; ls->rs_obj[Compute] = rso; ls->rs_gen[Compute] = gen; }
+            }
+            if (rso && param < rso->root_params.size()) {
+                const na_root_param& rp = rso->root_params[param];
                 if (rp.param_type == NA_ROOT_TABLE) {
-                    const auto& rr = it->second.root_ranges;
+                    const auto& rr = rso->root_ranges;
                     for (uint32_t q = 0; q < rp.count && rp.first_range + q < rr.size(); ++q) {
                         const na_root_range& range = rr[rp.first_range + q];
                         if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32 && ls->sampled_textures.size()<256) {
@@ -4177,6 +4484,7 @@ bool is_derived(na_object_id id) { return is_derived_any(&id, 1); }
 void add_derived(na_object_id id)
 {
     if (!id) return;
+    mark_hot_candidate(id);
     std::lock_guard<std::mutex> lk(g_derived_m);
     const uint32_t m = g_derived_n.load(std::memory_order_relaxed);
     for (uint32_t i = 0; i < m; ++i) if (g_derived[i] == id) return;
@@ -4235,7 +4543,7 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
             ls->pending_entry = color;
             ++ls->entry_barrier;
         }
-        if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+        if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, true); }
         break; // our pass runs before the whole original barrier batch
     }
 }
@@ -4269,7 +4577,7 @@ void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
         ev.color_srvs = from_color ? 1 : 0;
         ls->insertion.Add(ev);
     }
-    if (from_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+    if (from_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, true); }
 }
 
 void after_texture_copy(GL* l, ID3D12Resource* dst)
@@ -4284,6 +4592,31 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
     ls->insertion.Add({destination, 0, 0, true, na::j2::Op::CopyWrite});
 }
 
+// The same tables, ranges and bound-heap test as the walk below, reading only the hot bits.
+// False = the walk would find no SRV of the colour and no SRV of a copy of it.
+template <typename Sig>
+bool read_filter_needs_walk_locked(ListState& ls, const Sig& sig, bool compute, na_object_id color)
+{
+    if (!g_hot_ready.load(std::memory_order_acquire) || g_hot_color != color) return true;
+    const auto& params = sig.root_params;
+    const auto& ranges = sig.root_ranges;
+    for (size_t p = 0; p < ls.args[compute].size() && p < params.size(); ++p) {
+        const auto& arg = ls.args[compute][p];
+        if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
+        uint32_t slot = 0;
+        auto* heap = bound_heap_for_gpu_locked(ls, arg.value, &slot);
+        if (!heap) continue;
+        bool bound = false;
+        for (uint32_t h = 0; h < ls.nheaps; ++h) bound |= heap->key == ls.heaps[h];
+        if (!bound) continue;
+        for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
+            const auto& range = ranges[params[p].first_range + r];
+            if (range.table_offset == NA_UNKNOWN_U32 || range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) continue;
+            if (any_hot(heap, uint64_t(slot) + range.table_offset, std::min<uint32_t>(range.num_descriptors, 64))) return true;
+        }
+    }
+    return false;
+}
 void before_shader_use(GL* l, bool compute, bool indirect=false)
 {
     if (t_host_work || !na::observe_internal::Started()) return;
@@ -4293,6 +4626,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
     bool reads_color = false;
     na::j2::InsertionEvent entry;
     {
+        CostScope lookup(kCostUseLookup);
         std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         auto* ls = list_state_locked(l, &lid);
@@ -4323,10 +4657,14 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
         bool reads_derived = false;
         auto& cached=ls->shader_reads[compute];
         const uint64_t revision_now=g_operation_revision.load(); // before reading: a concurrent copy then invalidates
+        lookup.Switch(kCostUseWalk);
         if(cached.valid&&cached.state_revision==ls->read_revision[compute]&&cached.registry_revision==revision_now&&cached.color==color){
             color_srvs=cached.color_srvs;reads_color=color_srvs!=0;nsrv=cached.count;
             std::copy_n(cached.srvs,nsrv,srv_ids);if(compute)destination=cached.uav;
+        }else if(!read_filter_needs_walk_locked(*ls, signature->second, compute, color)){
+            g_hot_skipped.fetch_add(1, std::memory_order_relaxed); // no bound SRV of the colour or a copy: nothing to record
         }else{
+        g_hot_walked.fetch_add(1, std::memory_order_relaxed);
         const auto& params = signature->second.root_params;
         const auto& ranges = signature->second.root_ranges;
         for (size_t p = 0; p < ls->args[compute].size() && p < params.size(); ++p) {
@@ -4384,8 +4722,9 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
                 ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false, na::j2::Op::DerivedRead});
         }
     }
+    const CostScope callbacks(kCostUseCallback);
     if(entry.resource)if(auto cb=g_entry_cb.load(std::memory_order_acquire))cb(l,entry);
-    if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
+    if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, compute); }
 }
 
 // ---- Live mip bias: bind the twins of the level latched at this recording's Reset.
@@ -7078,6 +7417,61 @@ bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->insertion.ColorEvents(color, out);
 }
+void RefreshReadFilter()
+{
+    if (g_hot_ready.load(std::memory_order_acquire) || t_host_work) return;
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    std::unique_lock<RegistryLock> lock(g_m); // no hook reads or writes slots meanwhile
+    std::lock_guard<std::mutex> lk(g_hot_pending_m);
+    if (g_hot_overflow) return;
+    na_object_id ids[kHotMax];
+    uint32_t n = 0;
+    const auto add = [&](na_object_id id) {
+        if (!id || id == NA_UNKNOWN_U64) return true;
+        for (uint32_t i = 0; i < n; ++i) if (ids[i] == id) return true;
+        if (n == kHotMax) return false;
+        ids[n++] = id;
+        return true;
+    };
+    bool fits = add(color);
+    for (uint32_t i = 0; fits && i < g_hot_known_n; ++i) fits = add(g_hot_known[i]);
+    for (uint32_t i = 0; fits && i < g_hot_pending_n; ++i) fits = add(g_hot_pending[i]);
+    if (!fits) { g_hot_overflow = true; return; }
+    std::copy_n(ids, n, g_hot_ids);
+    g_hot_n = n;
+    g_hot_color = color;
+    std::copy_n(ids, n, g_hot_known);
+    g_hot_known_n = n;
+    g_hot_pending_n = 0;
+    for (auto& h : g_heaps) {
+        if (!h->hot) continue;
+        for (uint32_t w = 0; w < h->nstripes; ++w) {
+            uint64_t bits = 0;
+            const uint64_t base = uint64_t(w) << kStripeShift;
+            for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
+                const auto& si = h->info[static_cast<size_t>(base + b)];
+                if (si.kind == NA_DESC_SRV && hot_id_locked(si.resource)) bits |= 1ull << b;
+            }
+            h->hot[w].store(bits, std::memory_order_relaxed);
+        }
+    }
+    ++g_operation_revision; // per-list read caches were built without the filter; let them refill through it
+    g_hot_rebuilds.fetch_add(1, std::memory_order_relaxed);
+    g_hot_ready.store(color != 0, std::memory_order_release);
+}
+int FormatReadFilter(char* out, size_t n)
+{
+    bool overflow;
+    uint32_t ids;
+    { std::lock_guard<std::mutex> lk(g_hot_pending_m); overflow = g_hot_overflow; ids = g_hot_known_n; }
+    return std::snprintf(out, n, "read_filter ready=%u ids=%u overflow=%u rebuilds=%llu skipped=%llu walked=%llu"
+        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu",
+        g_hot_ready.load() ? 1u : 0u, ids, overflow ? 1u : 0u, (unsigned long long)g_hot_rebuilds.load(),
+        (unsigned long long)g_hot_skipped.load(), (unsigned long long)g_hot_walked.load(),
+        (unsigned long long)g_copy_simple.load(), (unsigned long long)g_copy_calls.load(),
+        (unsigned long long)g_copy_batched.load(), (unsigned long long)g_copy_batched_runs.load());
+}
 void ResetDerived()
 {
     std::lock_guard<std::mutex> lk(g_derived_m);
@@ -8327,6 +8721,7 @@ void SetLiveSelection(uint64_t depth, uint64_t color)
     std::lock_guard<std::mutex> lock(g_live_m);
     const uint64_t d0 = g_live_depth.load(std::memory_order_relaxed), c0 = g_live_color.load(std::memory_order_relaxed);
     if (depth == d0 && color == c0) return;
+    if (color != c0) g_hot_ready.store(false, std::memory_order_release); // bits were built for the old colour
     ++g_live_version;
     g_live_seq.fetch_add(1, std::memory_order_acq_rel); // odd: update in progress
     g_live_depth.store(depth, std::memory_order_relaxed);
@@ -8498,7 +8893,7 @@ void FormatHookCost(char* out, size_t n)
     out[0] = 0;
     if(!g_cost_enabled.load(std::memory_order_relaxed)){std::snprintf(out,n,"hook_cost disabled");return;}
     cost_flush(); // this thread's share
-    static uint64_t prev_ticks[kCostSlots]{}, prev_calls[kCostSlots]{}, prev_at = 0;
+    static uint64_t prev_ticks[kCostSlots]{}, prev_calls[kCostSlots]{}, prev_timed[kCostSlots]{}, prev_at = 0;
     static std::mutex m;
     std::lock_guard<std::mutex> lock(m);
     LARGE_INTEGER f; QueryPerformanceFrequency(&f);
@@ -8507,11 +8902,13 @@ void FormatHookCost(char* out, size_t n)
     struct Row { uint32_t slot; double ms_per_s, calls_per_s, us_per_call; };
     Row rows[kCostSlots]; uint32_t nr = 0; double list_total = 0;
     for (uint32_t i = 0; i < kCostSlots; ++i) {
-        const uint64_t t = g_cost_ticks[i].load(std::memory_order_relaxed), c = g_cost_calls[i].load(std::memory_order_relaxed);
-        const uint64_t dt = t - prev_ticks[i], dc = c - prev_calls[i];
-        prev_ticks[i] = t; prev_calls[i] = c;
-        if (!dc || secs <= 0) continue;
-        const double ms = double(dt) * 1000.0 / double(f.QuadPart);
+        const uint64_t t = g_cost_ticks[i].load(std::memory_order_relaxed), c = g_cost_calls[i].load(std::memory_order_relaxed),
+                       tc = g_cost_timed[i].load(std::memory_order_relaxed);
+        const uint64_t dt = t - prev_ticks[i], dc = c - prev_calls[i], dtc = tc - prev_timed[i];
+        prev_ticks[i] = t; prev_calls[i] = c; prev_timed[i] = tc;
+        if (!dc || !dtc || secs <= 0) continue;
+        // Sampled slots: the timed calls' sum scaled to every call (exact for the others, dtc == dc).
+        const double ms = double(dt) * 1000.0 / double(f.QuadPart) * (double(dc) / double(dtc));
         rows[nr++] = {i, ms / secs, double(dc) / secs, ms * 1000.0 / double(dc)};
         if (i < kCostPseudo) list_total += ms / secs;
     }
@@ -8520,11 +8917,13 @@ void FormatHookCost(char* out, size_t n)
     int w = std::snprintf(out, n, "hook_cost window_s=%.1f list_ms_per_s=%.1f", secs, list_total);
     static const char* const kPseudo[] = {"vpj", "shader_use", "lane_before", "lane_after", "driver", "run", "root_table",
                                            "sampled", "emit", "note_draw", "canon_miss", "desc_copy", "desc_copy_wait",
-                                           "desc_write", "desc_write_wait"};
+                                           "desc_write", "desc_write_wait", "pso_driver", "pso_reflect", "use_lookup", "use_walk", "use_callback",
+                                           "scene_read_cb"};
+    static_assert(sizeof(kPseudo) / sizeof(kPseudo[0]) == kCostLast - kCostPseudo + 1, "one name per pseudo slot");
     for (uint32_t i = 0; i < nr && i < 24 && w > 0 && size_t(w) < n; ++i) {
         const uint32_t sl = rows[i].slot;
         const char* tag = sl == kCostExec ? "exec" : sl == kCostPso ? "pso" :
-                          (sl >= kCostPseudo && sl <= kCostDescWriteWait) ? kPseudo[sl - kCostPseudo] : nullptr;
+                          (sl >= kCostPseudo && sl <= kCostLast) ? kPseudo[sl - kCostPseudo] : nullptr;
         if (tag) w += std::snprintf(out + w, n - w, " %s{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", tag, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
         else w += std::snprintf(out + w, n - w, " s%u{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", rows[i].slot, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
     }

@@ -3545,6 +3545,31 @@ void note_late_frame()
     ++g.stats.late_frames;
 }
 
+// WWII p7632 (2026-11-09): once inline DLAA engaged, the ResourceBarrier hook that calls this
+// went from 2 us to ~100 us per call (250-620 ms/s of the translator thread; fps 105 -> 25-37).
+// Per-phase wall time of this callback, windowed per status line (j2_inline_cost), so the
+// expensive phase is named instead of inferred. A few calls per frame; two clock reads each phase.
+enum InlineCostPhase : uint32_t { kIcPre = 0, kIcLock, kIcQuery, kIcMatch, kIcRecord, kIcAfter, kIcCamera, kIcEvaluate, kIcCount };
+std::atomic<uint64_t> g_ic_ticks[kIcCount]{}, g_ic_calls{0}, g_ic_deep{0}, g_ic_max{0};
+inline uint64_t ic_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
+struct InlineCost {
+    uint64_t t0 = ic_now(), last = t0, ticks[kIcCount]{};
+    uint32_t cur = kIcPre;
+    void mark(uint32_t next) { const uint64_t now = ic_now(); ticks[cur] += now - last; last = now; cur = next; }
+    ~InlineCost()
+    {
+        const uint64_t now = ic_now();
+        ticks[cur] += now - last;
+        for (uint32_t i = 0; i < kIcCount; ++i) if (ticks[i]) g_ic_ticks[i].fetch_add(ticks[i], std::memory_order_relaxed);
+        g_ic_calls.fetch_add(1, std::memory_order_relaxed);
+        if (cur >= kIcQuery) g_ic_deep.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t total = now - t0;
+        uint64_t m = g_ic_max.load(std::memory_order_relaxed);
+        while (total > m && !g_ic_max.compare_exchange_weak(m, total, std::memory_order_relaxed)) {}
+    }
+};
+thread_local InlineCost* t_ic = nullptr; // record()'s camera search and DLSS evaluate split out of "record"
+struct InlineCostBind { InlineCost* prev; explicit InlineCostBind(InlineCost* c) : prev(t_ic) { t_ic = c; } ~InlineCostBind() { t_ic = prev; } };
 bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, na_object_id color_id,
             ID3D12GraphicsCommandList** out_list, PendingHistory& pending, ID3D12GraphicsCommandList* inl = nullptr,
             bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0,
@@ -3781,6 +3806,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (saved && saved->has_camera) { vp = saved->vp; reversed = saved->reversed; }
     if (repeat_only) { vp = g.cam_u1; reversed = g.cam_rev; held = true; } // no camera search: the last one is only a placeholder
     na::j2::InterloperFilter judged = g.interlopers;
+    if (t_ic) t_ic->mark(kIcCamera);
     na::wwii::SceneCameraReceipt world_camera;
     if (inl && !repeat_only && vpj_mode() && g.wwii_scene_camera.load(std::memory_order_relaxed)) {
         if (g.wwii_submitted_camera.Matches(g.frame, color_id, depth_id))
@@ -3800,6 +3826,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const bool found = world_camera.writes || repeat_only ||
         (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed, &judged));
     if (!world_camera.writes && saved && saved->judged && !repeat_only) judged = saved->interlopers;
+    if (t_ic) t_ic->mark(kIcRecord);
     if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
         // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
         // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
@@ -4391,7 +4418,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if ((smear == 4) != preset_test) { preset_test = smear == 4; na::dlss::ReleaseView(kViewId); e.reset = true; }
         if (smear == 4) e.preset = 12; // NVSDK_NGX_DLSS_Hint_Render_Preset_L
     }
+    if (t_ic) t_ic->mark(kIcEvaluate);
     const bool evaluated = na::dlss::Evaluate(l, e);
+    if (t_ic) t_ic->mark(kIcRecord);
     if (!evaluated) ++g.stats.dlss_failed;
     if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
     if (evaluated && na::capture::j2::Armed()) {
@@ -4634,6 +4663,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
 void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, uint32_t n, bool compute,
                         const na::j2::InsertionEvent* entry=nullptr)
 {
+    InlineCost ic;
+    const InlineCostBind bind_ic(&ic);
     if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
     uint64_t depth_id = 0, color_id = 0;
     na::observe::GetLiveSelection(&depth_id, &color_id);
@@ -4650,7 +4681,9 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
         g_nb.hints.fetch_add(1,std::memory_order_relaxed);return;
     }
     const na::observe::HostWorkScope host; // our commands in the game's list are not the game's
+    ic.mark(kIcLock);
     std::lock_guard<std::mutex> lock(g.m);
+    ic.mark(kIcQuery);
     if (!g.inline_mode || g.latched || !g.device) return;
     // The existing MSAA-depth path changes raster state which this restore does
     // not replay. Keep it at its original boundary, as for resolved consumers.
@@ -4673,6 +4706,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     if (!reading) return;
     ++g.stats.inline_candidates;
     if (g.inl_frame == g.frame || g.submitted_frame == g.frame) return; // either placement path already owns this frame
+    ic.mark(kIcMatch);
     const auto current = na::observe::ListInsertionDecision(l, color_id);
     const auto& learned = g.insertion_learned;
     const auto* selected_boundary = &learned;
@@ -4838,6 +4872,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
         return;
     }
     } // legacy boundary matcher
+    ic.mark(kIcRecord);
     if (!na::observe::ListStateRestorable(l)) { ++g.stats.inline_refused; reason("The scene list's state cannot be restored after DLAA here (a bundle ran, or inside a render pass); left untouched."); return; }
     ID3D12CommandList* one[1] = {l};
     // The depth/earlier scene batches must already have established this frame's
@@ -4863,6 +4898,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
         if (ok) ++g.stats.window_repeat_fallbacks;
     }
     g.capture_entry={};
+    ic.mark(kIcAfter);
     if (touched && !na::observe::RestoreListState(l)) {
         // Checked as restorable above; this cannot normally happen. Stop for the session.
         g.latched = true;
@@ -8302,6 +8338,21 @@ void SmearTestStatus(char* text, size_t capacity)
     if (!text || !capacity) return;
     std::lock_guard<std::mutex> lock(g.m);
     std::snprintf(text, capacity, "%s", g_smear.requested.load() && !g_smear.running ? "Smear test starts with the next DLAA frame." : g_smear.status);
+}
+
+int FormatInlineCost(char* out, size_t n)
+{
+    if (!out || !n) return 0;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const double us = 1e6 / double(f.QuadPart);
+    uint64_t t[kIcCount];
+    for (uint32_t i = 0; i < kIcCount; ++i) t[i] = g_ic_ticks[i].exchange(0, std::memory_order_relaxed);
+    const uint64_t calls = g_ic_calls.exchange(0, std::memory_order_relaxed), deep = g_ic_deep.exchange(0, std::memory_order_relaxed),
+                   mx = g_ic_max.exchange(0, std::memory_order_relaxed);
+    return std::snprintf(out, n,
+        "j2_inline_cost calls=%llu past_lock=%llu us{pre=%.0f lock_wait=%.0f query=%.0f match=%.0f record=%.0f camera=%.0f evaluate=%.0f after_record=%.0f} max_call_us=%.0f\r\n",
+        (unsigned long long)calls, (unsigned long long)deep, t[kIcPre] * us, t[kIcLock] * us, t[kIcQuery] * us, t[kIcMatch] * us,
+        t[kIcRecord] * us, t[kIcCamera] * us, t[kIcEvaluate] * us, t[kIcAfter] * us, double(mx) * us);
 }
 
 Stats GetStats()

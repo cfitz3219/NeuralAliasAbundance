@@ -12,6 +12,14 @@
 // through the borrowed back buffer (dx11on12 menu_buffer{...} in the status log).
 // "stream" uploads textures on every frame, resizes the chain, and checks
 // copied pixels on both sides of the resize (translated native chain only).
+// "load=<draws>" (with optional "textures=<n>", default 3000 / 64) records a
+// game-sized frame: each draw maps a dynamic constant buffer, binds one of n
+// textures and draws a tiny quad, so the translator builds descriptor tables,
+// root bindings and upload copies per draw the way it does for a real DX11
+// game. Presents without vsync and prints wall/CPU time per frame, so the
+// same run under (a) native D3D11, (b) the bridge with [observe] producers=0
+// and (c) producers=1 profile_hooks=1 measures what the observers cost on the
+// translation thread (CoD WWII 2026-11-09: that thread capped the game at 30 fps).
 // Add "hdr" for the campaign's 3440x1440 FP16 output format.
 // Exit 0 = device wrapped and alive, 1 = not wrapped or removed.
 #include <windows.h>
@@ -27,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -67,10 +76,13 @@ int main(int argc, char** argv)
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const int frames = argc > 1 ? std::atoi(argv[1]) : 300;
     bool press_home = false, draw_scene = false, stream = false, hdr = false;
+    int load_draws = 0, load_textures = 64;
     for (int arg = 2; arg < argc; ++arg) {
         press_home |= std::strcmp(argv[arg], "menu") == 0;
         draw_scene |= std::strcmp(argv[arg], "scene") == 0;
         stream |= std::strcmp(argv[arg], "stream") == 0;
+        if (std::strncmp(argv[arg], "load=", 5) == 0) load_draws = std::atoi(argv[arg] + 5);
+        if (std::strncmp(argv[arg], "textures=", 9) == 0) load_textures = std::atoi(argv[arg] + 9);
         hdr |= std::strcmp(argv[arg], "hdr") == 0;
     }
     const UINT width = hdr ? 3440 : 1280;
@@ -128,7 +140,12 @@ int main(int argc, char** argv)
     if (depth) dev->CreateDepthStencilView(depth.Get(), nullptr, &dsv);
     ComPtr<ID3D11Texture2D> scene;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11PixelShader> ps, ps_load;
+    ComPtr<ID3D11Buffer> load_cb;
+    ComPtr<ID3D11SamplerState> load_sampler;
+    std::vector<ComPtr<ID3D11ShaderResourceView>> load_srvs;
+    if (load_draws > 0) draw_scene = true;
+    if (load_draws > 0 && load_textures < 1) load_textures = 1;
     if (draw_scene) {
         if (!back || !dsv) return 2;
         static constexpr char shaders[] = R"(
@@ -139,6 +156,12 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
 }
 float4 ps(float4 p : SV_Position) : SV_Target {
     return float4(frac(p.x / 64), frac(p.y / 64), 0.25, 1);
+}
+Texture2D t0 : register(t0);
+SamplerState s0 : register(s0);
+cbuffer Tint : register(b0) { float4 tint; };
+float4 ps_load(float4 p : SV_Position) : SV_Target {
+    return t0.Sample(s0, p.xy / float2(1280, 720)) * tint;
 })";
         ComPtr<ID3DBlob> vs_code, ps_code;
         if (FAILED(D3DCompile(shaders, sizeof(shaders)-1, nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs_code, nullptr)) ||
@@ -150,6 +173,37 @@ float4 ps(float4 p : SV_Position) : SV_Target {
         td.MiscFlags = 0;
         if (FAILED(dev->CreateTexture2D(&td, nullptr, &scene)) ||
             FAILED(dev->CreateRenderTargetView(scene.Get(), nullptr, rtv.ReleaseAndGetAddressOf()))) return 2;
+        if (load_draws > 0) {
+            ComPtr<ID3DBlob> load_code;
+            if (FAILED(D3DCompile(shaders, sizeof(shaders)-1, nullptr, nullptr, nullptr, "ps_load", "ps_5_0", 0, 0, &load_code, nullptr)) ||
+                FAILED(dev->CreatePixelShader(load_code->GetBufferPointer(), load_code->GetBufferSize(), nullptr, &ps_load))) return 2;
+            D3D11_BUFFER_DESC cb{};
+            cb.ByteWidth = 16;
+            cb.Usage = D3D11_USAGE_DYNAMIC;
+            cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (FAILED(dev->CreateBuffer(&cb, nullptr, &load_cb))) return 2;
+            D3D11_SAMPLER_DESC sd{};
+            sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+            sd.MaxLOD = D3D11_FLOAT32_MAX;
+            if (FAILED(dev->CreateSamplerState(&sd, &load_sampler))) return 2;
+            std::array<unsigned, 64 * 64> texels{};
+            D3D11_TEXTURE2D_DESC lt{};
+            lt.Width = lt.Height = 64;
+            lt.MipLevels = lt.ArraySize = lt.SampleDesc.Count = 1;
+            lt.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            lt.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            for (int t = 0; t < load_textures; ++t) {
+                texels.fill(0xff000000u | (static_cast<unsigned>(t) * 2654435761u & 0xffffffu));
+                const D3D11_SUBRESOURCE_DATA initial{texels.data(), 64 * sizeof(unsigned), 0};
+                ComPtr<ID3D11Texture2D> texture;
+                ComPtr<ID3D11ShaderResourceView> srv;
+                if (FAILED(dev->CreateTexture2D(&lt, &initial, &texture)) ||
+                    FAILED(dev->CreateShaderResourceView(texture.Get(), nullptr, &srv))) return 2;
+                load_srvs.push_back(srv);
+            }
+        }
     }
     ComPtr<IDXGISwapChain3> sc3;
     ComPtr<ID3D11Texture2D> uploads[4], readback;
@@ -172,6 +226,13 @@ float4 ps(float4 p : SV_Position) : SV_Target {
         loader.Start(dev.Get(), streamed, pixel_bytes);
     }
     int presented = 0, checked = 0;
+    LARGE_INTEGER qpf{}, load_begin{}, load_end{};
+    FILETIME ft_create{}, ft_exit{}, cpu_kernel_begin{}, cpu_user_begin{}, cpu_kernel_end{}, cpu_user_end{};
+    QueryPerformanceFrequency(&qpf);
+    if (load_draws > 0) {
+        QueryPerformanceCounter(&load_begin);
+        GetProcessTimes(GetCurrentProcess(), &ft_create, &ft_exit, &cpu_kernel_begin, &cpu_user_begin);
+    }
     for (int i = 0; i < frames; ++i) {
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
@@ -204,6 +265,31 @@ float4 ps(float4 p : SV_Position) : SV_Target {
             ctx->PSSetShader(ps.Get(), nullptr, 0);
             // Go past discovery's small depth-only loading-screen filter.
             for (int draw = 0; draw < 12; ++draw) ctx->Draw(6, 0);
+            if (load_draws > 0) {
+                // Game-sized recording: per draw a dynamic constant update, a texture
+                // binding and a tiny quad (8x8 pixels keeps the GPU out of the picture).
+                const D3D11_VIEWPORT tiny{0, 0, 8, 8, 0, 1};
+                ctx->RSSetViewports(1, &tiny);
+                ctx->PSSetShader(ps_load.Get(), nullptr, 0);
+                ID3D11SamplerState* sampler = load_sampler.Get();
+                ctx->PSSetSamplers(0, 1, &sampler);
+                ID3D11Buffer* cb = load_cb.Get();
+                ctx->PSSetConstantBuffers(0, 1, &cb);
+                for (int draw = 0; draw < load_draws; ++draw) {
+                    D3D11_MAPPED_SUBRESOURCE mapped{};
+                    if (SUCCEEDED(ctx->Map(load_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                        const float tint[4] = {1.f, 1.f - 0.001f * (draw % 1000), 1.f, 1.f};
+                        std::memcpy(mapped.pData, tint, sizeof(tint));
+                        ctx->Unmap(load_cb.Get(), 0);
+                    }
+                    ID3D11ShaderResourceView* srv = load_srvs[static_cast<size_t>(draw) % load_srvs.size()].Get();
+                    ctx->PSSetShaderResources(0, 1, &srv);
+                    ctx->Draw(6, 0);
+                }
+                ID3D11ShaderResourceView* none = nullptr;
+                ctx->PSSetShaderResources(0, 1, &none);
+                ctx->RSSetViewports(1, &vp);
+            }
             ctx->OMSetRenderTargets(0, nullptr, nullptr);
             ctx->CopyResource(back.Get(), scene.Get());
         }
@@ -222,7 +308,7 @@ float4 ps(float4 p : SV_Position) : SV_Target {
             const bool verify = (i >= frames / 2 - 2 && i < frames / 2) || i >= frames - 3;
             if (verify && FAILED(sc->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&actual)))) return 2;
         }
-        if (FAILED(hr = sc->Present(1, 0))) { std::printf("present %d hr=0x%08lX\n", i, static_cast<unsigned long>(hr)); break; }
+        if (FAILED(hr = sc->Present(load_draws > 0 ? 0 : 1, 0))) { std::printf("present %d hr=0x%08lX\n", i, static_cast<unsigned long>(hr)); break; }
         if (actual) {
             D3D11_RESOURCE_FLAGS flags{};
             ComPtr<ID3D11Resource> image;
@@ -246,6 +332,20 @@ float4 ps(float4 p : SV_Position) : SV_Target {
         ++presented;
     }
     const HRESULT removed = dev->GetDeviceRemovedReason();
+    if (load_draws > 0 && presented > 0) {
+        QueryPerformanceCounter(&load_end);
+        GetProcessTimes(GetCurrentProcess(), &ft_create, &ft_exit, &cpu_kernel_end, &cpu_user_end);
+        const auto ft_ms = [](const FILETIME& a, const FILETIME& b) {
+            ULARGE_INTEGER ua{a.dwLowDateTime, a.dwHighDateTime}, ub{b.dwLowDateTime, b.dwHighDateTime};
+            return static_cast<double>(ub.QuadPart - ua.QuadPart) / 10000.0;
+        };
+        const double wall_ms = static_cast<double>(load_end.QuadPart - load_begin.QuadPart) * 1000.0 / static_cast<double>(qpf.QuadPart);
+        const double cpu_ms = ft_ms(cpu_kernel_begin, cpu_kernel_end) + ft_ms(cpu_user_begin, cpu_user_end);
+        // wall_ms_per_frame is the frame time (the translation thread's pace when it is the
+        // bottleneck); process_cpu_ms_per_frame sums every thread, ours and the translator's.
+        std::printf("load draws_per_frame=%d textures=%d frames=%d wall_ms=%.1f fps=%.1f wall_ms_per_frame=%.3f process_cpu_ms_per_frame=%.3f\n",
+                    load_draws, load_textures, presented, wall_ms, presented * 1000.0 / wall_ms, wall_ms / presented, cpu_ms / presented);
+    }
     std::printf("presented=%d of %d device_removed_reason=0x%08lX\n", presented, frames, static_cast<unsigned long>(removed));
     ULONG chain_refs = 0;
     if (stream) {

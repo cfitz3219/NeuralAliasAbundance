@@ -166,6 +166,14 @@ int main()
     REQUIRE(SUCCEEDED(dev->GetDeviceRemovedReason()));
     dev->CopyDescriptorsSimple(3, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + inc},
                                s3, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    {
+        // A translation layer's table gather: one destination range, one single-descriptor source per view
+        // (applied as one unit by the batched copy path; same events as run by run).
+        const D3D12_CPU_DESCRIPTOR_HANDLE gather_dst{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc};
+        const UINT gather_n = 2;
+        const D3D12_CPU_DESCRIPTOR_HANDLE gather_src[2] = {D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 5 * inc}, s3};
+        dev->CopyDescriptors(1, &gather_dst, &gather_n, 2, gather_src, nullptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
     dev->CreateRenderTargetView(rt.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
 
     std::printf("checkpoint 4\n"); std::fflush(stdout);
@@ -298,6 +306,13 @@ int main()
         for (const auto& c : copies)
             if (c.src_heap == staging_id && c.dst_heap == srv_heap_id && c.src_slot == 3 && c.dst_slot == 1 && c.slot_count == 3) copy_ok = true;
         CHECK(copy_ok);
+        bool gather_a = false, gather_b = false;
+        for (const auto& c : copies) {
+            if (c.src_heap == staging_id && c.dst_heap == srv_heap_id && c.src_slot == 5 && c.dst_slot == 6 && c.slot_count == 1) gather_a = true;
+            if (c.src_heap == staging_id && c.dst_heap == srv_heap_id && c.src_slot == 3 && c.dst_slot == 7 && c.slot_count == 1) gather_b = true;
+        }
+        CHECK(gather_a);
+        CHECK(gather_b);
     }
     {
         const na_object_id list_id = na::observe::IdOf(list.Get());

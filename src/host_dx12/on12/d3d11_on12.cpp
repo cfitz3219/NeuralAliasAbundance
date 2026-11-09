@@ -723,6 +723,11 @@ std::atomic<IDXGISwapChain*> g_tchain_ids[std::size(g_tchains)]{};
 std::atomic<uint32_t> g_tchain_count{0};
 std::atomic<uint64_t> g_translated{0}, g_untranslated{0}, g_tcopies{0}, g_tcopy_failures{0}, g_tresizes{0}, g_tresize_waits{0};
 std::atomic<uint64_t> g_tcopies_d3d11{0};
+// Where a present's time goes (CPU, this thread), since the last status line: the
+// D3D11->D3D12 handoff (release + flush), our copy submission, the reacquire, and the
+// DXGI Present itself. Cort 2026-11-09: main menu 17-20 fps, GPU 0%, two busy threads.
+std::atomic<uint64_t> g_t_release_us{0}, g_t_release_max{0}, g_t_copy_us{0}, g_t_copy_max{0}, g_t_acquire_us{0}, g_t_acquire_max{0},
+    g_t_present_us{0}, g_t_present_max{0}, g_t_presents{0}, g_t_handoffs{0};
 std::atomic<long> g_tlast_hr{0};
 char g_treason[160] = "No translated swap chain yet.";
 
@@ -1066,7 +1071,10 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
         return;
     }
     if (g_copy_with_d3d11.load(std::memory_order_relaxed)) {
+        const uint64_t t0 = now_us();
         hr = copy_on_d3d11(*c, target.Get(), typeless(c->game_format) ? td.Format : c->game_format, same_size);
+        add_time(g_t_copy_us, g_t_copy_max, now_us() - t0);
+        g_t_handoffs.fetch_add(1, std::memory_order_relaxed);
         if (SUCCEEDED(hr)) {
             g_tcopies.fetch_add(1, std::memory_order_relaxed);
             g_tcopies_d3d11.fetch_add(1, std::memory_order_relaxed);
@@ -1078,8 +1086,12 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
     }
     // D3D11's frame goes to the queue first; D3D12 owns the virtual buffer until we give it back.
     ID3D11Resource* r[] = {c->virt11.Get()};
+    const uint64_t t_release = now_us();
     c->on12->ReleaseWrappedResources(r, 1);
     c->ctx->Flush();
+    const uint64_t t_copy = now_us();
+    add_time(g_t_release_us, g_t_release_max, t_copy - t_release);
+    g_t_handoffs.fetch_add(1, std::memory_order_relaxed);
     TChain::Slot* s = nullptr;
     if (tlist(*c, s)) {
         ID3D12GraphicsCommandList* l = s->list.Get();
@@ -1121,7 +1133,17 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
     } else {
         g_tcopy_failures.fetch_add(1);
     }
+    const uint64_t t_acquire = now_us();
+    add_time(g_t_copy_us, g_t_copy_max, t_acquire - t_copy);
     c->on12->AcquireWrappedResources(r, 1); // the game draws its next frame into it
+    add_time(g_t_acquire_us, g_t_acquire_max, now_us() - t_acquire);
+}
+
+void AfterPresent(IDXGISwapChain* chain, unsigned flags, unsigned long long present_us)
+{
+    if (!g_tchain_count.load(std::memory_order_relaxed) || (flags & DXGI_PRESENT_TEST) || !IsTranslated(chain)) return;
+    add_time(g_t_present_us, g_t_present_max, present_us);
+    g_t_presents.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags)
@@ -1198,13 +1220,28 @@ void ForgetSwapChain(IDXGISwapChain* chain)
 int FormatStatus(char* out, size_t capacity)
 {
     std::lock_guard<std::mutex> lk(g_m);
+    // Per-present CPU time since the last status line (avg/max us), then the window restarts.
+    const auto take = [](std::atomic<uint64_t>& total, std::atomic<uint64_t>& peak, uint64_t count, unsigned long long& avg, unsigned long long& mx) {
+        const uint64_t t = total.exchange(0), m = peak.exchange(0);
+        avg = count ? t / count : 0;
+        mx = m;
+    };
+    const uint64_t handoffs = g_t_handoffs.exchange(0), presents = g_t_presents.exchange(0);
+    unsigned long long rel_avg, rel_max, copy_avg, copy_max, acq_avg, acq_max, pres_avg, pres_max;
+    take(g_t_release_us, g_t_release_max, handoffs, rel_avg, rel_max);
+    take(g_t_copy_us, g_t_copy_max, handoffs, copy_avg, copy_max);
+    take(g_t_acquire_us, g_t_acquire_max, handoffs, acq_avg, acq_max);
+    take(g_t_present_us, g_t_present_max, presents, pres_avg, pres_max);
     const int n = std::snprintf(out, capacity,
-                                "dx11on12_present chains=%u translated=%llu untranslated=%llu copies=%llu copies_d3d11=%llu copy_failures=%llu resizes=%llu resize_wait_timeouts=%llu last_hr=0x%08lX reason=\"%s\" | ",
+                                "dx11on12_present chains=%u translated=%llu untranslated=%llu copies=%llu copies_d3d11=%llu copy_failures=%llu resizes=%llu resize_wait_timeouts=%llu "
+                                "window{presents=%llu release_flush_us=%llu/max%llu copy_us=%llu/max%llu acquire_us=%llu/max%llu dxgi_present_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\" | ",
                                 g_tchain_count.load(), static_cast<unsigned long long>(g_translated.load()),
                                 static_cast<unsigned long long>(g_untranslated.load()), static_cast<unsigned long long>(g_tcopies.load()),
                                 static_cast<unsigned long long>(g_tcopies_d3d11.load()),
                                 static_cast<unsigned long long>(g_tcopy_failures.load()), static_cast<unsigned long long>(g_tresizes.load()),
-                                static_cast<unsigned long long>(g_tresize_waits.load()), static_cast<unsigned long>(g_tlast_hr.load()), g_treason);
+                                static_cast<unsigned long long>(g_tresize_waits.load()),
+                                static_cast<unsigned long long>(presents), rel_avg, rel_max, copy_avg, copy_max, acq_avg, acq_max, pres_avg, pres_max,
+                                static_cast<unsigned long>(g_tlast_hr.load()), g_treason);
     if (n < 0 || static_cast<size_t>(n) >= capacity) return n;
     out += n;
     capacity -= static_cast<size_t>(n);

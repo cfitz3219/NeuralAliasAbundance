@@ -1111,6 +1111,9 @@ void write_status_line()
             na::observe::FormatHookCost(hl, sizeof hl - 2);
             const size_t hn = std::strlen(hl);
             if (hn) { hl[hn] = '\r'; hl[hn + 1] = '\n'; WriteFile(f, hl, DWORD(hn + 2), &written, nullptr); }
+            char rf[384];
+            const int rn = na::observe::FormatReadFilter(rf, sizeof rf - 2);
+            if (rn > 0 && size_t(rn) < sizeof rf - 2) { rf[rn] = '\r'; rf[rn + 1] = '\n'; WriteFile(f, rf, DWORD(rn + 2), &written, nullptr); }
         }
         { // Viewport jitter ([j2] viewport_jitter): real samples through the game's viewports
             const auto vps = na::observe::GetViewportJitterStats();
@@ -1402,6 +1405,9 @@ void write_status_line()
                 (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
                 (unsigned long long)rj[8], j2.inline_frame_rejects);
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
+            char icl[300];
+            const int nic = na::j2::FormatInlineCost(icl, sizeof icl);
+            if (nic > 0) WriteFile(f, icl, static_cast<DWORD>((std::min)(nic, static_cast<int>(sizeof icl - 1))), &written, nullptr);
             char al[900];
             const int na2 = snprintf(al, sizeof al,
                 "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu earlier=%llu late=%llu} note=\"%s\"\r\n",
@@ -3610,6 +3616,7 @@ void note_menu_present_result(bool open, UINT flags, HRESULT result) {
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
+    na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
     na::on12::BeforePresent(sc, flags); // DX11 bridge: the game's picture reaches the D3D12 chain as an observed copy
@@ -3618,7 +3625,9 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
         // from boot) and the swapchain size stays unknown, so after a render-size change a shadow map won
         // the depth pick and the scene was never found again (Anno, 2026-11-03).
         const auto observed = na::observe::PresentBegin(sc);
+        const uint64_t tp = qpc_us();
         const HRESULT result = presenter_present(sc, sync, flags, nullptr);
+        na::on12::AfterPresent(sc, flags, qpc_us() - tp);
         na::observe::PresentEnd(observed, sync, flags, result);
         return result;
     }
@@ -3633,6 +3642,7 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     const uint64_t t2 = qpc_us();
     finish_deferred_present(sc, after_present.Get());
     note_present_timing(menu_open, (t1 - t0) + (after_present ? qpc_us() - t2 : 0), t2 - t1);
+    na::on12::AfterPresent(sc, flags, t2 - t1);
     note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
@@ -3642,6 +3652,7 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
+    na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
     na::on12::BeforePresent(sc, flags); // DX11 bridge: the game's picture reaches the D3D12 chain as an observed copy
@@ -3650,7 +3661,9 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
         // from boot) and the swapchain size stays unknown, so after a render-size change a shadow map won
         // the depth pick and the scene was never found again (Anno, 2026-11-03).
         const auto observed = na::observe::PresentBegin(sc);
+        const uint64_t tp = qpc_us();
         const HRESULT result = presenter_present(sc, sync, flags, pp);
+        na::on12::AfterPresent(sc, flags, qpc_us() - tp);
         na::observe::PresentEnd(observed, sync, flags, result);
         return result;
     }
@@ -3659,8 +3672,11 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     const bool menu_open = g_open.load(std::memory_order_acquire);
     ComPtr<ID3D12CommandQueue> after_present;
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present);
+    const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
+    const uint64_t t2 = qpc_us();
     finish_deferred_present(sc, after_present.Get());
+    na::on12::AfterPresent(sc, flags, t2 - t1);
     note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);

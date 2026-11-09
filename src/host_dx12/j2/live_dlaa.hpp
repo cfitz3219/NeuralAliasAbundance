@@ -465,6 +465,8 @@ struct Stats {
     uint32_t reason_kinds = 0;
     uint64_t inline_record_failed = 0; // an inline placement fired but recording DLAA failed (reason in the tally)
 };
+// Per-phase time of the inline DLAA scene-read callback since the last call (status line j2_inline_cost).
+int FormatInlineCost(char* out, size_t n);
 Stats GetStats();
 // Smear test (live_dlaa.cpp): a fixed sequence of DLAA variants, 8 captured frames each, into
 // captures\smear-<time>-<exe>-p<pid>\<n-variant>. Starts with the next native DLAA frame.
