@@ -95,7 +95,7 @@ struct Rig {
         l->ResourceBarrier(2, b);
     }
     // Runs `frames` frames; returns the last Output and leaves the motion readback in rb (when fed).
-    Output run(Feed& f, int frames, bool motion, int first = 0)
+    Output run(Feed& f, int frames, bool motion, int first = 0, bool candidate_present = true)
     {
         Output o{};
         for (int i = first; i < first + frames; ++i) {
@@ -105,7 +105,7 @@ struct Rig {
             upload(l.list.Get());
             Candidate c{cand.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 77};
             // frame i % 7 == 0 jumps back to t = 0: not a continuation, so not scored
-            o = f.Record(l.list.Get(), static_cast<uint32_t>(i) % kSlotsInFlight, &c, 1, color.Get(), W, H, i % 7 == 0);
+            o = f.Record(l.list.Get(), static_cast<uint32_t>(i) % kSlotsInFlight, &c, candidate_present ? 1u : 0u, color.Get(), W, H, i % 7 == 0);
             if (o.motion) {
                 D3D12_RESOURCE_BARRIER b = test::Transition(o.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 l.list->ResourceBarrier(1, &b);
@@ -165,6 +165,21 @@ int main()
             CHECK(at(5, 5, 0) == 0.f && at(5, 5, 1) == 0.f);
             rig.rb->Unmap(0, nullptr);
         }
+        // A texture may disappear during a menu/scene change and reappear with
+        // the same id. Empty work must neither record/score nor reuse old scores.
+        const auto before_gap = f.GetStats();
+        const auto gap = rig.run(f, 3, true, 80, false);
+        const auto after_gap = f.GetStats();
+        CHECK(!gap.motion && after_gap.used_candidate == -1);
+        CHECK(after_gap.recorded == before_gap.recorded && after_gap.scored == before_gap.scored);
+        const auto warming = rig.run(f, 1, true, 83); // not a scripted cut
+        const auto after_warm = f.GetStats();
+        CHECK(!warming.motion && after_warm.recorded == after_gap.recorded + 1);
+        CHECK(after_warm.scored == after_gap.scored);
+        CHECK(after_warm.collected == after_gap.collected); // no old-slot measurements re-enter
+        const auto resumed = rig.run(f, 72, true, 84);
+        CHECK(resumed.motion && f.GetStats().used_candidate == 0);
+        REQUIRE(d.device->GetDeviceRemovedReason() == S_OK);
     }
     {
         Rig rig(d);

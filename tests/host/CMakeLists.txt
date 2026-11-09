@@ -273,6 +273,10 @@ if(NA_HAVE_NGX_SDK)
   set_tests_properties(host_j2_mip_pixels_test PROPERTIES LABELS gpu TIMEOUT 45)
   add_test(NAME host_j2_mip_pixels_native_negative_test COMMAND j2_anno_shape_test --mip-pixels-native-negative)
   add_test(NAME host_j2_mip_pixels_native_already_test COMMAND j2_anno_shape_test --mip-pixels-native-already)
+  add_test(NAME host_j2_mip_dynamic_pixels_test COMMAND j2_anno_shape_test --mip-dynamic-pixels)
+  add_test(NAME host_j2_mip_dynamic_native_already_test COMMAND j2_anno_shape_test --mip-dynamic-native-already)
+  set_tests_properties(host_j2_mip_dynamic_pixels_test host_j2_mip_dynamic_native_already_test
+    PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   set_tests_properties(host_j2_mip_pixels_native_negative_test host_j2_mip_pixels_native_already_test PROPERTIES LABELS gpu TIMEOUT 45)
   add_test(NAME host_j2_split_entry_test COMMAND j2_anno_shape_test 1 1 --entry-split)
   add_test(NAME host_j2_split_entry_camera_gap_test COMMAND j2_anno_shape_test 1 1 --entry-split-camera-gap)
@@ -397,6 +401,12 @@ na_host_test(native11_frame_model_test SOURCES native11/frame_model_test.cpp)
 if(TARGET host_native11)
   # The B1 provider on a synthetic DX11 game (hardware, else WARP): runs on the hosted runner.
   na_host_test(native11_provider_test SOURCES native11/provider_test.cpp LIBS host_native11 d3dcompiler)
+  if(NA_HAVE_NGX_LIB AND NA_DLSS_DLL)
+    na_host_test(native11_dlaa_test SOURCES native11/provider_test.cpp LIBS host_dx12 LABELS "gpu;nvidia")
+    target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
+    add_custom_command(TARGET native11_dlaa_test POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_dlaa_test>")
+  endif()
 endif()
 # C8b: a frame with known passes must come back as exactly those ops (ABI 0.2).
 na_host_test(observe_passes_test SOURCES observe_passes_test.cpp LIBS host_observe_producers d3d12 d3dcompiler dxgi)

@@ -339,7 +339,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
 {
     ++g_stats.fired;
     if (!g_cb) return SetReason("No consumer is attached.");
-    const Selection sel = g_model.Current();
+    // CameraNow may learn the camera for this very callback.
+    const Selection& sel = g_model.Current();
     if (!g_color_ref || IdOf(g_color_ref.Get()) != sel.color || !g_depth_ref || IdOf(g_depth_ref.Get()) != sel.depth) {
         ++g_stats.missed;
         return SetReason("The scene colour or depth is not held from a live game view yet.");

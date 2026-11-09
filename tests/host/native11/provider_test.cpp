@@ -16,6 +16,11 @@
 // Hardware first, then WARP; exit 77 (SKIP) only without any DX11 device.
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
+#if defined(NA_TEST_NATIVE_DLAA)
+#include "host_dx12/native_d3d11/live_dlaa.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
+#include <DirectXPackedVector.h>
+#endif
 
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
@@ -32,6 +37,13 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+#if defined(NA_TEST_NATIVE_DLAA)
+// Same packed HDR colour format as the recorded WWII campaign.
+constexpr DXGI_FORMAT kSceneFormat = DXGI_FORMAT_R11G11B10_FLOAT;
+#else
+constexpr DXGI_FORMAT kSceneFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+#endif
+
 int g_failed = 0;
 void expect(bool ok, const char* what)
 {
@@ -47,6 +59,9 @@ Texture2D<float4> scene : register(t0);
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 p = float2((id & 1) ? 0.5 : -0.5, (id & 2) ? 0.5 : -0.5) + offset.xy;
     return float4(p, 0.5, 1.0) + vp[0] * 0.0; // the camera block is bound and referenced
+}
+float4 vs_post(uint id : SV_VertexID) : SV_Position {
+    return float4((id & 1) ? 1.0 : -1.0, (id & 2) ? 1.0 : -1.0, 0.5, 1.0);
 }
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
@@ -91,7 +106,7 @@ struct Game {
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
     ComPtr<ID3D11ShaderResourceView> color_srv;
     ComPtr<ID3D11Buffer> cam_cb, obj_cb;
-    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11VertexShader> vs, vs_post;
     ComPtr<ID3D11PixelShader> ps_scene, ps_tonemap, ps_hud;
     ComPtr<ID3D11BlendState> blend;
     na::camera::Matrix last_written{};
@@ -115,7 +130,7 @@ bool MakeTargets(Game& g)
     d.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     d.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.depth)) || FAILED(g.device->CreateDepthStencilView(g.depth.Get(), nullptr, &g.dsv))) return false;
-    d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    d.Format = kSceneFormat;
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.color)) || FAILED(g.device->CreateRenderTargetView(g.color.Get(), nullptr, &g.color_rtv)) ||
         FAILED(g.device->CreateShaderResourceView(g.color.Get(), nullptr, &g.color_srv)))
@@ -166,8 +181,10 @@ bool MakeGame(Game& g, bool warp)
     b.ByteWidth = 16;
     g.device->CreateBuffer(&b, nullptr, &g.obj_cb);
     auto vs = Compile("vs", "vs_5_0"), pss = Compile("ps_scene", "ps_5_0"), pst = Compile("ps_tonemap", "ps_5_0"), psh = Compile("ps_hud", "ps_5_0");
-    if (!vs || !pss || !pst || !psh) return false;
+    auto vsp = Compile("vs_post", "vs_5_0");
+    if (!vs || !vsp || !pss || !pst || !psh) return false;
     g.device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g.vs);
+    if (FAILED(g.device->CreateVertexShader(vsp->GetBufferPointer(), vsp->GetBufferSize(), nullptr, &g.vs_post))) return false;
     g.device->CreatePixelShader(pss->GetBufferPointer(), pss->GetBufferSize(), nullptr, &g.ps_scene);
     g.device->CreatePixelShader(pst->GetBufferPointer(), pst->GetBufferSize(), nullptr, &g.ps_tonemap);
     g.device->CreatePixelShader(psh->GetBufferPointer(), psh->GetBufferSize(), nullptr, &g.ps_hud);
@@ -177,6 +194,7 @@ bool MakeGame(Game& g, bool warp)
     bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     bd.RenderTarget[0].BlendOp = bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     bd.RenderTarget[0].SrcBlendAlpha = bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     g.device->CreateBlendState(&bd, &g.blend);
     return g.shadow_dsv && g.shadow_rtv && g.cam_cb && g.obj_cb && g.blend && MakeTargets(g);
@@ -207,13 +225,14 @@ void SetObject(ID3D11DeviceContext* c, Game& g, int i)
     c->Unmap(g.obj_cb.Get(), 0);
 }
 
+std::atomic<bool> g_tonemap_bound{false}; // the immediate context's tonemap read was bound this frame
+
 void Viewport(ID3D11DeviceContext* c, UINT w, UINT h)
 {
     const D3D11_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
     c->RSSetViewports(1, &vp);
 }
 
-std::atomic<bool> g_tonemap_bound{false}; // the immediate context's tonemap read was bound this frame
 
 void Scene(ID3D11DeviceContext* c, Game& g, int frame)
 {
@@ -241,8 +260,12 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     for (int i = 0; i < 40; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
 }
 
+
+
 void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 {
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    c->VSSetShader(g.vs_post.Get(), nullptr, 0);
     // Tonemap: reads the scene colour (the insertion point is just before this bind).
     ID3D11RenderTargetView* bb = g.back_rtv.Get();
     c->OMSetRenderTargets(1, &bb, nullptr);
@@ -264,11 +287,19 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 
 void Pump()
 {
+#if defined(NA_TEST_NATIVE_DLAA)
+    // Exercise the target cadence without flooding the fixed in-flight ring
+    // from an invisible, uncapped test window.
+    Sleep(20);
+#endif
     MSG m;
     while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
 }
 
 // ---- the stand-in consumer ----
+#if defined(NA_TEST_NATIVE_DLAA)
+uint64_t evaluations = 0;
+#endif
 struct Seen {
     Game* game = nullptr;
     ComPtr<ID3D11Texture2D> copy; // the consumer's own texture (what B2's shared input would be)
@@ -290,7 +321,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     s.last_frame = f.frame;
     const bool inputs = f.color.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.color.Get())) &&
                         f.depth.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.depth.Get())) &&
-                        f.color.format == DXGI_FORMAT_R16G16B16A16_FLOAT && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
+                        f.color.format == kSceneFormat && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
                         f.color.width == g.w && f.color.height == g.h && f.color.active_x == 0 && f.color.active_y == 0 &&
                         f.color.active_w == g.w && f.color.active_h == g.h && f.color.incarnation && f.depth.incarnation &&
                         f.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get());
@@ -337,23 +368,34 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
         g.device->CreateTexture2D(&d, nullptr, &s.copy);
     }
     if (s.copy) c->CopyResource(s.copy.Get(), static_cast<ID3D11Resource*>(f.color.d3d11_resource));
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (na::native_d3d11::EvaluateFrame(nullptr, context, f)) ++evaluations;
+#endif
     return true;
 }
 
-// Reads one pixel of the consumer's copy (R16G16B16A16_FLOAT, x = 0, y = 0).
-bool ReadCopy(Game& g, float out[4])
+// Reads one pixel of the consumer's copy (x = 0, y = 0).
+bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
 {
-    if (!g_seen.copy) return false;
+    if (!source) source = g_seen.copy.Get();
+    if (!source) return false;
     D3D11_TEXTURE2D_DESC d{};
-    g_seen.copy->GetDesc(&d);
+    source->GetDesc(&d);
     d.Usage = D3D11_USAGE_STAGING;
     d.BindFlags = 0;
     d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     ComPtr<ID3D11Texture2D> st;
     if (FAILED(g.device->CreateTexture2D(&d, nullptr, &st))) return false;
-    g.ctx->CopyResource(st.Get(), g_seen.copy.Get());
+    g.ctx->CopyResource(st.Get(), source);
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(g.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+#if defined(NA_TEST_NATIVE_DLAA)
+    DirectX::PackedVector::XMFLOAT3PK packed;
+    std::memcpy(&packed, m.pData, sizeof packed);
+    DirectX::XMFLOAT3 rgb;
+    DirectX::XMStoreFloat3(&rgb, DirectX::PackedVector::XMLoadFloat3PK(&packed));
+    out[0] = rgb.x; out[1] = rgb.y; out[2] = rgb.z; out[3] = 1.f;
+#else
     const uint16_t* p = static_cast<const uint16_t*>(m.pData);
     for (int i = 0; i < 4; ++i) {
         const uint16_t h = p[i];
@@ -361,6 +403,7 @@ bool ReadCopy(Game& g, float out[4])
         float v = exp == 0 ? std::ldexp(float(man), -24) : std::ldexp(float(man | 1024), int(exp) - 25);
         out[i] = sign ? -v : v;
     }
+#endif
     g.ctx->Unmap(st.Get(), 0);
     return true;
 }
@@ -377,6 +420,11 @@ int main()
         warp = true;
     }
     std::printf("device: %s\n", warp ? "WARP" : "hardware");
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (warp) return 77;
+    na::j2::SetEnabled(true);
+    na::j2::SetJitter(true);
+#endif
     g_seen.game = &g;
     const bool installed = na::native11::Install(g.device.Get(), &Consume, &g_seen);
     expect(installed, "the provider's hooks install on the game's device");
@@ -396,7 +444,7 @@ int main()
     std::printf("phase 1: frames=%d calls=%llu | %s\n", frame, static_cast<unsigned long long>(g_seen.calls), status);
     expect(g_seen.calls >= 30, "the consumer is called every frame once the scene is learned (30 frames)");
     expect(g_seen.twice == 0, "at most one call per frame");
-    expect(g_seen.wrong_inputs == 0, "colour = FP16 scene target, depth = D24S8 scene depth, full extent, lifetime ids set");
+    expect(g_seen.wrong_inputs == 0, "correct HDR scene colour, D24S8 depth, full extent and lifetime ids");
     expect(g_seen.after_tonemap == 0 && g_seen.before_read == g_seen.calls, "every call is before the tonemap read (BeforeRead)");
     expect(g_seen.no_scene == 0, "the scene's 40 draws are done when the consumer is called");
     expect(g_seen.no_camera == 0, "the camera buffer (VS slot 0) and its 512 CPU bytes come with each call");
@@ -408,6 +456,13 @@ int main()
         const bool scene_pixel = read && px[3] > 0.99f && (std::fabs(px[0] - 0.25f) < 0.01f || std::fabs(px[0] - 0.1f) < 0.01f);
         std::printf("consumer copy pixel: %.3f %.3f %.3f %.3f\n", px[0], px[1], px[2], px[3]);
         expect(scene_pixel, "the consumer's copy on the game's context holds the drawn scene");
+#if defined(NA_TEST_NATIVE_DLAA)
+        float result[4]{};
+        const bool read_result = ReadCopy(g, result, g.color.Get());
+        expect(read_result && std::isfinite(result[0]) && std::fabs(result[0] - px[0]) < 0.06f &&
+               std::fabs(result[1] - px[1]) < 0.06f && std::fabs(result[2] - px[2]) < 0.06f,
+               "native scene contains the expected RGB after the effects writeback");
+#endif
     }
 
     // The GPU sees the jittered camera: rows 0/1 moved by a sub-pixel amount, rows 2/3 unchanged.
@@ -451,9 +506,9 @@ int main()
         Pump();
         ComPtr<ID3D11CommandList> l_scene, l_post;
         Scene(d_scene.Get(), g, frame);
-        d_scene->FinishCommandList(FALSE, &l_scene);
+        if (FAILED(d_scene->FinishCommandList(FALSE, &l_scene))) { expect(false, "finish scene list"); break; }
         Post(d_post.Get(), g, false);
-        d_post->FinishCommandList(FALSE, &l_post);
+        if (FAILED(d_post->FinishCommandList(FALSE, &l_post))) { expect(false, "finish post list"); break; }
         g.ctx->ExecuteCommandList(l_scene.Get(), FALSE);
         g.ctx->ExecuteCommandList(l_post.Get(), FALSE);
         g.swap->Present(0, 0);
@@ -466,12 +521,14 @@ int main()
 
     // ---- resize: nothing of the game's held, new targets found, new stream ----
     const uint64_t color_inc = g_seen.color_inc, streams = g_seen.streams, calls2 = g_seen.calls;
+    g.ctx->ClearState();
     g.back_rtv.Reset();
     g.color_srv.Reset();
     g.color_rtv.Reset();
     g.dsv.Reset();
     g.color.Reset();
     g.depth.Reset();
+    g.ctx->Flush();
     g.w = 256;
     g.h = 144;
     const HRESULT rz = g.swap->ResizeBuffers(0, g.w, g.h, DXGI_FORMAT_UNKNOWN, 0);
@@ -488,6 +545,12 @@ int main()
     expect(g_seen.calls - calls2 >= 20 && g_seen.color_w == 256 && g_seen.color_h == 144, "after the resize the new scene colour is handed over");
     expect(g_seen.color_inc != color_inc && g_seen.streams > streams, "the new colour has a new lifetime id and starts a new stream");
     expect(g_seen.wrong_inputs == 0, "no call ever named the wrong colour or depth");
+#if defined(NA_TEST_NATIVE_DLAA)
+    na::native_d3d11::FormatStatus(status, sizeof status);
+    std::printf("%s\n", status);
+    expect(evaluations + 2 >= g_seen.calls && evaluations >= 65,
+           "real DLAA reaches the native scene across immediate, deferred, and resize cases");
+#endif
 
     std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: native DX11 provider on a synthetic game\n", g_failed);
     std::fflush(stdout);

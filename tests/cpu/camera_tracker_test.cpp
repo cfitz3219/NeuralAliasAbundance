@@ -5,6 +5,7 @@
 #include "core/temporal_jitter.hpp"
 #include "core/motion_arbiter.hpp"
 #include "providers/camera/camera_tracker.hpp"
+#include "host_dx12/adapters/wwii/scene_camera.hpp"
 
 #include <cmath>
 
@@ -57,6 +58,80 @@ na::motion::Tier2Input MotionInput(const CameraFrame& f) {
 int main()
 {
     return test::run({
+        {"WWII scene pose beats a consumer pose a frame late", [] {
+             const Matrix projection = Perspective(true, 1);
+             const Matrix old_vp = Mul(projection, View(0.2, 0, 0, 0));
+             const Matrix current_vp = Mul(projection, View(0.25, 0, 0, 0));
+             const auto make = [](const Matrix& vp, const std::array<float, 4>& origin) {
+                 std::vector<uint8_t> bytes(1280);
+                 std::array<float, 16> column{};
+                 for (size_t r = 0; r < 4; ++r)
+                     for (size_t c = 0; c < 4; ++c) column[c * 4 + r] = float(vp[r * 4 + c]);
+                 for (size_t o : {64u, 208u, 320u}) std::memcpy(bytes.data() + o, column.data(), 64);
+                 for (size_t o : {384u, 400u, 944u, 960u}) std::memcpy(bytes.data() + o, origin.data(), 16);
+                 const float extent[]{float(W), float(H), 1.f / W, 1.f / H};
+                 std::memcpy(bytes.data() + 704, extent, sizeof(extent));
+                 return bytes;
+             };
+             const auto old_bytes = make(old_vp, {2298, -10183, -51, 0});
+             auto current_bytes = make(current_vp, {2299, -10183, -51, 0});
+             na::wwii::SceneCamera first, current, unused;
+             CHECK(na::wwii::DecodeSceneCamera(old_bytes, 1280, W, H, first));
+             CHECK(na::wwii::DecodeSceneCamera(current_bytes, 1280, W, H, current));
+             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1280, W + 1, H, unused));
+             const float conflicting_origin = 2303.f;
+             std::memcpy(current_bytes.data() + 944, &conflicting_origin, sizeof(float));
+             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1280, W, H, unused));
+             const na::wwii::SceneCameraReceipt submitted{2005, 3, 4, 513, current};
+             CHECK(submitted.Matches(2005, 3, 4));
+             CHECK(!submitted.Matches(2006, 3, 4) && !submitted.Matches(2005, 3, 5));
+             const double zero[2]{};
+             CameraTracker fixed, late;
+             fixed.UpdateCameraRelative(first.vp, first.origin, 2004, W, H, zero);
+             late.Update(first.vp, 2004, W, H, zero);
+             const auto now = fixed.UpdateCameraRelative(submitted.camera.vp, submitted.camera.origin, 2005, W, H, zero);
+             const auto old = late.Update(first.vp, 2005, W, H, zero);
+             CHECK(now.valid && !now.camera_cut && now.position[0] == 2299);
+             CHECK(Close(now.unjittered, current_vp, 1e-6));
+             float ax{}, ay{}, bx{}, by{};
+             CHECK(na::motion::ReprojectPixel(MotionInput(now), W, H, W/2, H/2, 0.02f, &ax, &ay, nullptr));
+             CHECK(na::motion::ReprojectPixel(MotionInput(old), W, H, W/2, H/2, 0.02f, &bx, &by, nullptr));
+             CHECK(std::abs(ax) > 10.f);
+             NEAR(bx, 0.f, 0.01f);
+         }},
+        {"WWII captured shader variants accept rounded origin witnesses", [] {
+             const Matrix vp = Mul(Perspective(true, 1), View(0.25, 0, 0, 0));
+             std::array<float, 16> column{};
+             for (size_t r = 0; r < 4; ++r)
+                 for (size_t c = 0; c < 4; ++c) column[c * 4 + r] = float(vp[r * 4 + c]);
+             const float extent[]{float(W), float(H), 1.f/W, 1.f/H};
+             const float origin[]{-4339.75048828125f, -5987.14208984375f, -682.3656005859375f, 0};
+             const float rounded[]{origin[0], origin[1], std::nextafter(origin[2], 0.f), 0};
+             for (uint32_t size : {1280u, 1536u}) {
+                 std::vector<uint8_t> bytes(size);
+                 const size_t v = size == 1280 ? 64 : 192;
+                 const size_t e = size == 1280 ? 704 : 816;
+                 const size_t first = size == 1280 ? 384 : 480;
+                 const size_t witness = size == 1280 ? 944 : 512;
+                 std::memcpy(bytes.data()+v, column.data(), 64);
+                 if (size == 1280) std::memcpy(bytes.data()+320, column.data(), 64);
+                 std::memcpy(bytes.data()+e, extent, 16);
+                 std::memcpy(bytes.data()+first, origin, 16);
+                 std::memcpy(bytes.data()+witness, rounded, 16);
+                 if (size == 1536) std::memcpy(bytes.data()+528, rounded, 16);
+                 // Adjacent fields remain zero, as in observed shader variants.
+                 na::wwii::SceneCamera camera;
+                 CHECK(na::wwii::DecodeSceneCamera(bytes, size, W, H, camera));
+                 NEAR(camera.origin[2], double(origin[2]), 1e-9);
+                 CHECK(!na::wwii::DecodeSceneCamera(bytes, size, W, H+1, camera));
+                 float mismatch = origin[2] + 1.f;
+                 std::memcpy(bytes.data()+witness+8, &mismatch, 4);
+                 CHECK(!na::wwii::DecodeSceneCamera(bytes, size, W, H, camera));
+                 mismatch = std::numeric_limits<float>::quiet_NaN();
+                 std::memcpy(bytes.data()+witness+8, &mismatch, 4);
+                 CHECK(!na::wwii::DecodeSceneCamera(bytes, size, W, H, camera));
+             }
+         }},
         {"camera-relative CBV origin reproduces world-space pixel motion", [] {
              for (bool reverse : {false, true}) for (double sign : {1.0, -1.0}) {
                  const Matrix p = Perspective(reverse, sign);

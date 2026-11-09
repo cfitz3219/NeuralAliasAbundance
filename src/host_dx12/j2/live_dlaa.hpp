@@ -37,8 +37,14 @@ using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList*
 void SetEnabled(bool on);   // from the INI at start-up
 bool Enabled();
 bool Configured();          // enabled at start-up (the overlay shows its section)
+void EnableWwiiSceneCamera(bool on);
 void SetPaused(bool paused); // the overlay's on/off switch (history resets on resume)
 bool Paused();
+// The native DX11 route uses the same sharpening kernel with its own slots.
+bool RecordNativeRcas(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                      ID3D12Resource* in, ID3D12Resource* out, ID3D12Resource* depth,
+                      uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT format,
+                      uint32_t slot, bool reversed);
 // Debug view (replaces the DLAA result): 0 off, 1 motion vectors, 2 fine motion
 // (sub-pixel), 3 depth.
 void SetDebugView(int mode);

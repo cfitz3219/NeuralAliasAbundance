@@ -209,6 +209,8 @@ std::atomic<uintptr_t> g_last_present_queue{0};
 // open): our own present work (on_present) vs the original Present, per 5-second status window.
 struct PresentTiming { std::atomic<uint64_t> n{0}, ours_us{0}, ours_max{0}, orig_us{0}, orig_max{0}; };
 PresentTiming g_present_timing[2]; // [0] menu closed, [1] menu open
+struct DeferredTiming { std::atomic<uint64_t> n{0}, flush{0}, lock{0}, boundary{0}; };
+DeferredTiming g_deferred_timing;
 uint64_t qpc_us()
 {
     static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return 1e6 / double(q.QuadPart); }();
@@ -1405,7 +1407,7 @@ void write_status_line()
                 (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
                 (unsigned long long)rj[8], j2.inline_frame_rejects);
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
-            char icl[300];
+            char icl[768];
             const int nic = na::j2::FormatInlineCost(icl, sizeof icl);
             if (nic > 0) WriteFile(f, icl, static_cast<DWORD>((std::min)(nic, static_cast<int>(sizeof icl - 1))), &written, nullptr);
             char al[900];
@@ -1889,6 +1891,14 @@ void write_menu_progress(HANDLE log)
                      open ? "open" : "closed", static_cast<unsigned long long>(c),
                      static_cast<unsigned long long>(c ? ours / c : 0), static_cast<unsigned long long>(ours_max),
                      static_cast<unsigned long long>(c ? orig / c : 0), static_cast<unsigned long long>(orig_max));
+        if (n > 0) WriteFile(log, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)) - 1)), &written, nullptr);
+    }
+    {
+        const uint64_t c = g_deferred_timing.n.exchange(0), f = g_deferred_timing.flush.exchange(0),
+                       l = g_deferred_timing.lock.exchange(0), b = g_deferred_timing.boundary.exchange(0);
+        n = snprintf(line, sizeof(line), "on12_boundary presents=%llu flush_us=%llu lock_us=%llu boundary_us=%llu\r\n",
+            static_cast<unsigned long long>(c), static_cast<unsigned long long>(c ? f/c : 0),
+            static_cast<unsigned long long>(c ? l/c : 0), static_cast<unsigned long long>(c ? b/c : 0));
         if (n > 0) WriteFile(log, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)) - 1)), &written, nullptr);
     }
     auto nr_progress = na::nr::GetStats();
@@ -3419,10 +3429,20 @@ void finish_deferred_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
     if (!queue || g_stopping.load(std::memory_order_acquire)) return;
     // Present can return while the translation worker still has commands for
     // the same frame. Keep the host lock out of that worker's submission path.
+    // Flush includes waiting for that worker's DLAA callback; it is not an
+    // additional independent cost to add to j2_inline_cost.
+    const uint64_t begin = qpc_us();
     if (na::j2::Enabled() && !na::j2::Paused()) na::on12::FlushPresentedWork(sc);
+    const uint64_t flushed = qpc_us();
     std::lock_guard<std::mutex> lock(g_state.mutex);
+    const uint64_t locked = qpc_us();
     if (!g_stopping.load(std::memory_order_acquire) && (!g_state.swapchain || g_state.swapchain == sc))
         game_frame_boundary(queue);
+    const uint64_t ended = qpc_us();
+    g_deferred_timing.n.fetch_add(1, std::memory_order_relaxed);
+    g_deferred_timing.flush.fetch_add(flushed - begin, std::memory_order_relaxed);
+    g_deferred_timing.lock.fetch_add(locked - flushed, std::memory_order_relaxed);
+    g_deferred_timing.boundary.fetch_add(ended - locked, std::memory_order_relaxed);
 }
 
 // A59 presenter path: the game drew into its proxy; the presenter copies,

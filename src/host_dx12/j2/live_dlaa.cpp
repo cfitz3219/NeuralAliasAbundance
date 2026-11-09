@@ -43,6 +43,7 @@
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "providers/camera/camera_tracker.hpp"
+#include "host_dx12/adapters/wwii/scene_camera.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -213,6 +214,8 @@ struct State {
     na::camera::Matrix cam_u0{}, cam_u1{}; // unjittered VPs of the last two read frames (u1 newest)
     uint64_t cam_f0 = 0, cam_f1 = 0;       // their frames (0 = none)
     bool cam_rev = false;
+    std::atomic<bool> wwii_scene_camera{false};
+    na::wwii::SceneCameraReceipt wwii_submitted_camera;
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
     uint64_t eval_selection_version = 0; // live selection version of the last committed evaluation
@@ -1893,10 +1896,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     u_out[p] = float4(inv(o), alpha);
 })";
-bool rcas_init()
+bool rcas_init(ID3D12Device* device, RcasPass& pass)
 {
-    if (g_rcas.tried) return g_rcas.ok;
-    g_rcas.tried = true;
+    if (pass.tried) return pass.ok;
+    pass.tried = true;
     D3D12_DESCRIPTOR_RANGE r[2]{};
     r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     r[0].NumDescriptors = 2;
@@ -1912,50 +1915,51 @@ bool rcas_init()
     D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> sig, err, code;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
-        FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_rcas.root))))
+        FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&pass.root))))
         return false;
     const UINT cf = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     if (FAILED(D3DCompile(kRcasHlsl, sizeof(kRcasHlsl) - 1, "j2_rcas.hlsl", nullptr, nullptr, "main", "cs_5_0", cf, 0, &code, &err)))
         return false;
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = g_rcas.root.Get();
+    pd.pRootSignature = pass.root.Get();
     pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rcas.pso)))) return false;
+    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pass.pso)))) return false;
     // Slots 0..kRing-1: the DLAA path; kRing..2*kRing-1: the render-small upscale ring. Each slot
     // has one table of three descriptors (t0 in, t1 depth, u0 out).
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2 * 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rcas.heap)))) return false;
-    g_rcas.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    g_rcas.ok = true;
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&pass.heap)))) return false;
+    pass.inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    pass.ok = true;
     return true;
 }
 // RCAS from `in` (readable, NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS).
 // depth: optional R32_FLOAT dw x dh, NON_PIXEL_SHADER_RESOURCE (same picture, any size).
 bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t w, uint32_t h, uint32_t percent,
-                   DXGI_FORMAT fmt, UINT slot, ID3D12Resource* depth = nullptr, uint32_t dw = 0, uint32_t dh = 0, bool reversed = false)
+                   DXGI_FORMAT fmt, UINT slot, ID3D12Resource* depth = nullptr, uint32_t dw = 0, uint32_t dh = 0, bool reversed = false, ID3D12Device* device = nullptr, RcasPass& pass = g_rcas)
 {
-    if (!percent || !in || !out || slot >= 2 * kRing || !rcas_init()) return false;
+    if (!device) device = g.device.Get();
+    if (!device || !percent || !in || !out || slot >= 2 * kRing || !rcas_init(device, pass)) return false;
     if (!depth || !dw || !dh) depth = nullptr;
     const UINT base = slot * 3;
-    auto cpu = [&](UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE c = g_rcas.heap->GetCPUDescriptorHandleForHeapStart(); c.ptr += SIZE_T(base + i) * g_rcas.inc; return c; };
+    auto cpu = [&](UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE c = pass.heap->GetCPUDescriptorHandleForHeapStart(); c.ptr += SIZE_T(base + i) * pass.inc; return c; };
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;
     sv.Format = fmt;
-    g.device->CreateShaderResourceView(in, &sv, cpu(0));
+    device->CreateShaderResourceView(in, &sv, cpu(0));
     sv.Format = DXGI_FORMAT_R32_FLOAT;
-    g.device->CreateShaderResourceView(depth, &sv, cpu(1));
+    device->CreateShaderResourceView(depth, &sv, cpu(1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
     uv.Format = fmt;
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g.device->CreateUnorderedAccessView(out, nullptr, &uv, cpu(2));
-    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_rcas.heap->GetGPUDescriptorHandleForHeapStart();
-    gh.ptr += UINT64(base) * g_rcas.inc;
-    ID3D12DescriptorHeap* heaps[] = {g_rcas.heap.Get()};
+    device->CreateUnorderedAccessView(out, nullptr, &uv, cpu(2));
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = pass.heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += UINT64(base) * pass.inc;
+    ID3D12DescriptorHeap* heaps[] = {pass.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
-    l->SetComputeRootSignature(g_rcas.root.Get());
-    l->SetPipelineState(g_rcas.pso.Get());
+    l->SetComputeRootSignature(pass.root.Get());
+    l->SetPipelineState(pass.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
     // One rate over the whole range: the gain doubles every 50 % (menu: every 25 points).
     const uint32_t pc = (std::min)(percent, 200u);
@@ -2998,6 +3002,41 @@ void dump_camera_inputs(const std::vector<const Block*>& order, na_object_id dep
                        (unsigned long long)count, total, path);
 }
 
+// Only consider this adapter on the translated campaign path. The pixel
+// constants of the scene-producing list carry the current world pose; the
+// VP-only slot on the list reading the scene can lag that pose by a frame.
+na::wwii::SceneCameraReceipt wwii_scene_camera(ID3D12CommandList* list, uint64_t color,
+                                              uint64_t depth, uint32_t writes)
+{
+    if (!writes || !na::observe::ListRendersTo(list, color, depth)) return {};
+    const auto binds = na::observe::ListRootConstantBuffers(list);
+    std::map<std::pair<uint64_t, uint64_t>, Block> candidates;
+    for (const auto& b : binds) {
+        if (!b.table || b.param != 0 || (b.size != 1280 && b.size != 1536)) continue;
+        auto& block = candidates[{b.resource, b.offset}];
+        block.resource = b.resource; block.offset = b.offset; block.size = b.size;
+        ++block.uses;
+    }
+    if (candidates.empty()) return {};
+    std::vector<const Block*> order;
+    order.reserve(candidates.size());
+    for (const auto& candidate : candidates) order.push_back(&candidate.second);
+    constexpr size_t max_reads = 16;
+    const size_t reads = std::min(order.size(), max_reads);
+    std::partial_sort(order.begin(), order.begin() + reads, order.end(),
+        [](const Block* a, const Block* b) { return a->uses > b->uses; });
+    std::vector<uint8_t> bytes(1024);
+    for (size_t i = 0; i < reads; ++i) {
+        const auto& block = *order[i];
+        bytes.resize(1024);
+        bytes.resize(na::observe::ReadBuffer(block.resource, block.offset, bytes.data(), 1024));
+        na::wwii::SceneCamera camera;
+        if (na::wwii::DecodeSceneCamera(bytes, block.size, g.scene_w, g.scene_h, camera))
+            return {g.frame, color, depth, writes, camera};
+    }
+    return {};
+}
+
 bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bool* reversed)
 {
     const size_t n = bytes.size();
@@ -3511,7 +3550,7 @@ void note_late_frame()
 // went from 2 us to ~100 us per call (250-620 ms/s of the translator thread; fps 105 -> 25-37).
 // Per-phase wall time of this callback, windowed per status line (j2_inline_cost), so the
 // expensive phase is named instead of inferred. A few calls per frame; two clock reads each phase.
-enum InlineCostPhase : uint32_t { kIcPre = 0, kIcLock, kIcQuery, kIcMatch, kIcRecord, kIcAfter, kIcCamera, kIcEvaluate, kIcCount };
+enum InlineCostPhase : uint32_t { kIcPre = 0, kIcLock, kIcQuery, kIcMatch, kIcRecord, kIcAfter, kIcCamera, kIcEvaluate, kIcSetup, kIcCopies, kIcFlow, kIcTextures, kIcGameMotion, kIcMotion, kIcAO, kIcFinish, kIcCount };
 std::atomic<uint64_t> g_ic_ticks[kIcCount]{}, g_ic_calls{0}, g_ic_deep{0}, g_ic_max{0};
 inline uint64_t ic_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
 struct InlineCost {
@@ -3769,9 +3808,26 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (repeat_only) { vp = g.cam_u1; reversed = g.cam_rev; held = true; } // no camera search: the last one is only a placeholder
     na::j2::InterloperFilter judged = g.interlopers;
     if (t_ic) t_ic->mark(kIcCamera);
-    const bool found = repeat_only || (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed, &judged));
+    na::wwii::SceneCameraReceipt world_camera;
+    if (inl && !repeat_only && vpj_mode() && g.wwii_scene_camera.load(std::memory_order_relaxed)) {
+        if (g.wwii_submitted_camera.Matches(g.frame, color_id, depth_id))
+            world_camera = g.wwii_submitted_camera;
+        if (lists && lists[scene]) {
+            const auto draws = na::observe::ListInsertionDecision(lists[scene], color_id).writes;
+            if (draws > world_camera.writes) {
+                const auto current = wwii_scene_camera(lists[scene], color_id, depth_id, draws);
+                if (current.writes) world_camera = current;
+            }
+        }
+    }
+    if (world_camera.writes) {
+        vp = world_camera.camera.vp;
+        reversed = true;
+    }
+    const bool found = world_camera.writes || repeat_only ||
+        (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed, &judged));
+    if (!world_camera.writes && saved && saved->judged && !repeat_only) judged = saved->interlopers;
     if (t_ic) t_ic->mark(kIcRecord);
-    if (saved && saved->judged && !repeat_only) judged = saved->interlopers;
     if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
         // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
         // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
@@ -3818,6 +3874,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false;
     }
+    if(t_ic) t_ic->mark(kIcSetup);
     pending.camera_source=(saved && saved->has_camera)?6u:from_j1?2u:held?(extrapolated?5u:held_still?3u:4u):1u;
     pending.camera_age=held?g.frame-g.cam_f1:0u;
     if (!held) remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
@@ -3931,14 +3988,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (tracker_restart) pending.tracker.Reset();
     na::camera::CameraTracker::Limits lim{};
     lim.max_frame_gap = max_gap;
-    lim.confirm_cuts = true; // a one-frame camera jump is held, not reset (f905099: 418 motion cuts)
+    lim.confirm_cuts = !world_camera.writes; // a verified scene-pose cut belongs to the current frame
     if (g.submitted_frame && g.frame > g.submitted_frame + 1) { // per-frame motion limits over the whole step
         const double steps = static_cast<double>((std::min)(g.frame - g.submitted_frame, max_gap));
         lim.max_translation *= steps;
         lim.max_rotation = (std::min)(lim.max_rotation * steps, 3.0);
     }
     if (same_epoch && g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames && !tracker_restart) ++g.stats.gap_bridged;
-    na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim); // active extent
+    const auto* origin = world_camera.writes ? &world_camera.camera.origin : nullptr;
+    na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim, origin);
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
     bool viewport_sample_known=false;
     if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
@@ -4034,6 +4092,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         *out_list = l;
         return true;
     }
+    if(t_ic) t_ic->mark(kIcCopies);
     // 1. Copy or resolve exactly the scene views into single-sample DLSS inputs.
     const UINT color_source = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : SRC;
     const UINT color_dest = color_msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : DST;
@@ -4075,6 +4134,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         addsub(b, g.msaa.DepthCopy(), 0, NPSR, DST);
     } else add(b, g.depth32.Get(), DST, NPSR);
     flush(l, b);
+    if(t_ic) t_ic->mark(kIcFlow);
     // 2/3. camera motion vectors
     if (!deferred && !(saved && saved->at_present)) smear_step(); // smear test variants: native DLAA only
     bool have_motion = false;
@@ -4150,7 +4210,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             static const uint32_t kMotionFormats[] = {
                 DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_SNORM};
             na_object_id ids[6] = {};
+    if(t_ic) t_ic->mark(kIcTextures);
             const uint32_t found_n = na::observe::FindTextures(kMotionFormats, 4, w, h, ids, 6);
+    if(t_ic) t_ic->mark(kIcGameMotion);
             ComPtr<ID3D12Resource> hold[na::j2::game_motion::kCandidates];
             na::j2::game_motion::Candidate cands[na::j2::game_motion::kCandidates];
             uint32_t nc = 0;
@@ -4190,6 +4252,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 if (gs.measured >= 64) g.game_motion_logged = true;
             }
         }
+    if(t_ic) t_ic->mark(kIcMotion);
         bool use_replay_motion = false;
         // Tier 1 from the game's own draws replayed with stream output (producers.cpp "Draw replay"):
         // per-object motion where the game's own motion texture is unavailable.
@@ -4223,6 +4286,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         have_motion = g.arbiter.Dispatch(l, in, o, g.slot);
         if (have_motion && use_replay_motion && in.tier1_valid_flag) g.replay_fed_frame = g.frame;
     }
+    if(t_ic) t_ic->mark(kIcAO);
     if (!have_motion) {
         if (inl) { // hand the game's list back with the scene colour in its own state
             if(!late_input)addsub(b, color.Get(), csub, color_source, sc);
@@ -4302,6 +4366,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         *out_list = l;
         return true;
     }
+    if(t_ic) t_ic->mark(kIcSetup);
     // 4. DLSS at native resolution
     na::dlss::EvalDesc e{};
     const int smear = smear_mode();
@@ -4364,7 +4429,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     if (t_ic) t_ic->mark(kIcEvaluate);
     const bool evaluated = na::dlss::Evaluate(l, e);
-    if (t_ic) t_ic->mark(kIcRecord);
+    if (t_ic) t_ic->mark(kIcFinish);
     if (!evaluated) ++g.stats.dlss_failed;
     if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
     if (evaluated && na::capture::j2::Armed()) {
@@ -7305,6 +7370,7 @@ void SetEnabled(bool on)
     if (on) na::observe::SetTableBindCallback(&on_table_bind);
     na::observe::SetEntryCallback(on?&on_entry:nullptr);
 }
+void EnableWwiiSceneCamera(bool on) { g.wwii_scene_camera.store(on, std::memory_order_relaxed); }
 bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
 PhysicalReport::~PhysicalReport()
 {
@@ -7450,6 +7516,16 @@ void SetPaused(bool paused)
     g.paused.store(paused);
 }
 bool Paused() { return g.paused.load(); }
+bool RecordNativeRcas(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                      ID3D12Resource* in, ID3D12Resource* out, ID3D12Resource* depth,
+                      uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT format,
+                      uint32_t slot, bool reversed)
+{
+    // This route is exclusive with translated J2. Its caller serializes
+    // recording and retires a slot before replacing its descriptors.
+    static auto* pass = new RcasPass;
+    return rcas_dispatch(list, in, out, w, h, percent, format, slot, depth, w, h, reversed, device, *pass);
+}
 bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
                         uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt)
 {
@@ -7858,6 +7934,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             else { if (g.q_run>=g_quality_warmup) g_nb.q_drops.fetch_add(1,std::memory_order_relaxed); g.q_run=0; }
         }
         ++g.frame;
+        g.wwii_submitted_camera = {};
         g.native_deferred = {};
         vpj_advance();
         replay_probe_frame();
@@ -7929,6 +8006,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             g.scene_h = cd.Height;
         }
     }
+    na::wwii::SceneCameraReceipt scene_camera_to_submit;
     if (selected_color && selected_depth) for (UINT i = 0; i < count; ++i) {
         if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
@@ -7962,6 +8040,14 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             sum.boundary_signature = decision.final_candidate ? sig : 0;
             g.frame_agg.AddList(sum);
             if (sum.renders_scene) {
+                if (g.inline_mode && g.queue.Get() == queue && g.wwii_scene_camera.load(std::memory_order_relaxed) && vpj_mode()) {
+                    const uint32_t submitted_writes = g.wwii_submitted_camera.Matches(g.frame, selected_color, selected_depth) ?
+                        g.wwii_submitted_camera.writes : 0;
+                    if (decision.writes > std::max(submitted_writes, scene_camera_to_submit.writes)) {
+                        const auto camera = wwii_scene_camera(lists[i], selected_color, selected_depth, decision.writes);
+                        if (camera.writes) scene_camera_to_submit = camera;
+                    }
+                }
                 // Present must be attributable to learn, and every route needs DLSS:
                 // start it here (host-work scope), never from Present.
                 if (!g.device) ensure_device(queue);
@@ -8081,8 +8167,15 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         na::capture::j2::Discard(pending.capture, false);
         lock.unlock();
         forward(queue, count, lists);
-        if (!has) return;
+        if (!has && !scene_camera_to_submit.writes) return;
         lock.lock();
+        // A recording only contributes its pose after forwarding the work on
+        // the scene queue. If Present closed the frame meanwhile, drop it.
+        if (scene_camera_to_submit.Matches(g.frame, selected_color, selected_depth) &&
+            (!g.wwii_submitted_camera.Matches(g.frame, selected_color, selected_depth) ||
+             scene_camera_to_submit.writes > g.wwii_submitted_camera.writes))
+            g.wwii_submitted_camera = scene_camera_to_submit;
+        if (!has) return;
         g.tracker = g.inl.history.tracker;
         if (g.inl.history.has_interlopers) g.interlopers = g.inl.history.interlopers;
         g.eval_selection_version = g.inl.history.selection_version;
@@ -8276,9 +8369,9 @@ int FormatInlineCost(char* out, size_t n)
     const uint64_t calls = g_ic_calls.exchange(0, std::memory_order_relaxed), deep = g_ic_deep.exchange(0, std::memory_order_relaxed),
                    mx = g_ic_max.exchange(0, std::memory_order_relaxed);
     return std::snprintf(out, n,
-        "j2_inline_cost calls=%llu past_lock=%llu us{pre=%.0f lock_wait=%.0f query=%.0f match=%.0f record=%.0f camera=%.0f evaluate=%.0f after_record=%.0f} max_call_us=%.0f\r\n",
+        "j2_inline_cost calls=%llu past_lock=%llu us{pre=%.0f lock_wait=%.0f query=%.0f match=%.0f record=%.0f camera=%.0f evaluate=%.0f after_record=%.0f setup=%.0f copies=%.0f flow=%.0f textures=%.0f game_motion=%.0f motion=%.0f ao=%.0f finish=%.0f} max_call_us=%.0f\r\n",
         (unsigned long long)calls, (unsigned long long)deep, t[kIcPre] * us, t[kIcLock] * us, t[kIcQuery] * us, t[kIcMatch] * us,
-        t[kIcRecord] * us, t[kIcCamera] * us, t[kIcEvaluate] * us, t[kIcAfter] * us, double(mx) * us);
+        t[kIcRecord] * us, t[kIcCamera] * us, t[kIcEvaluate] * us, t[kIcAfter] * us, t[kIcSetup]*us, t[kIcCopies]*us, t[kIcFlow]*us, t[kIcTextures]*us, t[kIcGameMotion]*us, t[kIcMotion]*us, t[kIcAO]*us, t[kIcFinish]*us, double(mx) * us);
 }
 
 Stats GetStats()
