@@ -30,7 +30,6 @@ struct Slot {
     ComPtr<ID3D12Resource> motion, provenance;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D11Texture2D> source_color, source_depth;
     ComPtr<ID3D11Texture2D> packed_depth;
     ComPtr<ID3D11ShaderResourceView> packed_view;
     ComPtr<ID3D11UnorderedAccessView> float_view;
@@ -235,18 +234,11 @@ bool FailSession(Session& s, const char* why)
 
 bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
 {
-    if (!context || !j2::Enabled() || j2::Paused()) {
-        native11::SetNextJitter(0, 0);
-        return Skip("DLAA paused.");
-    }
+    native11::SetNextJitter(0, 0);
+    if (!context || !j2::Enabled() || j2::Paused()) return Skip("DLAA paused.");
     std::lock_guard<std::mutex> lock(mutex);
     auto& s = State();
     if (s.failed) return false;
-    const auto sample = settings::Get().j2_jitter_r2.load()
-        ? neural_alias::temporal_jitter_r2(static_cast<uint32_t>(frame.frame), 8)
-        : neural_alias::temporal_jitter(static_cast<uint32_t>(frame.frame), 8);
-    native11::SetNextJitter(j2::Jitter() ? static_cast<float>(sample.x_pixels) : 0.f,
-                            j2::Jitter() ? static_cast<float>(sample.y_pixels) : 0.f);
     auto* ctx = static_cast<ID3D11DeviceContext*>(context);
     ComPtr<ID3D11Device> native;
     ctx->GetDevice(&native);
@@ -265,7 +257,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const auto cf = static_cast<DXGI_FORMAT>(c.view_format);
     const bool hdr = cf == DXGI_FORMAT_R11G11B10_FLOAT || cf == DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (!hdr && cf != DXGI_FORMAT_R8G8B8A8_UNORM) return Skip("Scene colour format unsupported.");
-    ImageDesc ci{c.active_w, c.active_h, cf};
+    ImageDesc ci{c.active_w, c.active_h, cf, true};
     const DXGI_FORMAT df = na::depth::IsDepth24(dd.Format) ? DXGI_FORMAT_R24G8_TYPELESS :
         dd.Format == DXGI_FORMAT_R32G8X24_TYPELESS || dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
         ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT;
@@ -337,14 +329,26 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     constexpr uint64_t kNativeView = 0x4e41544956453131ull;
     eval.view_id = kNativeView;
     const bool evaluated = dlss::Evaluate(list, eval);
-    Barrier(list, slot.output.Effects(), kWrite, kCommon);
-    Barrier(list, slot.color.Effects(), kRead, kCommon);
+    auto* result = slot.output.Native();
+    const uint32_t sharpness = settings::Get().j2_sharpness.load();
+    if (evaluated && sharpness) {
+        Barrier(list, slot.output.Effects(), kWrite, kRead);
+        Barrier(list, slot.color.Effects(), kRead, kWrite);
+        if (j2::RecordNativeRcas(s.device.Get(), list, slot.output.Effects(), slot.color.Effects(), shared_depth,
+                                 ci.width, ci.height, sharpness, cf, index, frame.reversed_depth))
+            result = slot.color.Native();
+        Barrier(list, slot.output.Effects(), kRead, kCommon);
+        Barrier(list, slot.color.Effects(), kWrite, kCommon);
+    } else {
+        Barrier(list, slot.output.Effects(), kWrite, kCommon);
+        Barrier(list, slot.color.Effects(), kRead, kCommon);
+    }
     Barrier(list, shared_depth, kRead, kCommon);
     Barrier(list, slot.motion.Get(), kRead, kWrite);
     if (FAILED(list->Close())) return FailSession(s, "Native effects command list could not close.");
 
-    slot.source_color = color;
-    slot.source_depth = depth;
+    // The D3D11 runtime retains submitted native copy resources itself.
+    // Do not keep a game backbuffer reference across ResizeBuffers.
     D3D11_BOX box{c.active_x, c.active_y, 0, c.active_x + ci.width, c.active_y + ci.height, 1};
     ctx->CopySubresourceRegion(slot.color.Native(), 0, 0, 0, 0, color.Get(), csub, &box);
     CopyDepth(s, slot, ctx, depth.Get(), dsub);
@@ -357,11 +361,19 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     if (FAILED(s.fences.SignalEffects(&slot.effects_done))) return FailSession(s, "DX12 effects submission failed.");
     if (!evaluated) return Skip("DLAA evaluation rejected this frame.");
     if (FAILED(s.fences.WaitNative(slot.effects_done))) return FailSession(s, "Native result dependency failed.");
-    ctx->CopySubresourceRegion(color.Get(), csub, c.active_x, c.active_y, 0, slot.output.Native(), 0, nullptr);
-    if (FAILED(s.fences.SignalNative(&slot.native_done))) return FailSession(s, "Native result submission failed.");
+    ctx->CopySubresourceRegion(color.Get(), csub, c.active_x, c.active_y, 0, result, 0, nullptr);
+    // This signal retires the slot. The game's subsequent submission can
+    // flush it naturally because no effects queue waits on the value.
+    if (FAILED(s.fences.SignalNative(&slot.native_done, false))) return FailSession(s, "Native result submission failed.");
     s.stream = frame.stream;
     s.last_frame = frame.frame;
     delivered.fetch_add(1, std::memory_order_relaxed);
+    if (j2::Jitter()) {
+        const auto phase = static_cast<uint32_t>(frame.frame);
+        const auto sample = settings::Get().j2_jitter_r2.load()
+            ? neural_alias::temporal_jitter_r2(phase, 8) : neural_alias::temporal_jitter(phase, 8);
+        native11::SetNextJitter(static_cast<float>(sample.x_pixels), static_cast<float>(sample.y_pixels));
+    }
     reason.store("Native DX11 DLAA delivered before the scene consumer.", std::memory_order_relaxed);
     return true;
 }

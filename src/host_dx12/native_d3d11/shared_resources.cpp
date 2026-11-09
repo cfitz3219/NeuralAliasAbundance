@@ -95,8 +95,8 @@ HRESULT SharedTexture::Create(ID3D11Device* native, ID3D12Device* effects, const
     image.DepthOrArraySize = 1; image.MipLevels = 1;
     image.Format = desc.format; image.SampleDesc.Count = 1;
     image.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    // D3D11 shared images use simultaneous-access layout semantics. Ownership
-    // is still serialized by fences; this flag does not permit concurrent writes.
+    // D3D11's shareable texture description needs render-target binding.
+    // The simultaneous-access layout still uses fenced, serialized writers.
     image.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (desc.writable12) image.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ComPtr<ID3D12Resource> r12;
@@ -144,7 +144,7 @@ HRESULT SharedFences::Create(ID3D11Device* native, ID3D12Device* effects, ID3D12
 
 HRESULT SharedFences::Fail(HRESULT hr) { if (FAILED(hr)) failure_ = hr; return hr; }
 
-HRESULT SharedFences::SignalNative(uint64_t* value)
+HRESULT SharedFences::SignalNative(uint64_t* value, bool submit)
 {
     if (value) *value = 0;
     if (FAILED(failure_)) return failure_;
@@ -154,7 +154,10 @@ HRESULT SharedFences::SignalNative(uint64_t* value)
     if (FAILED(hr)) return Fail(hr);
     // Submission, not completion: prevents waiting on DX11 work still buffered
     // on the CPU. Do not replace with GetData, CPU Wait, or Unwrap.
-    context_->Flush();
+    if (submit) {
+        context_->Flush();
+        native_submitted_ = next;
+    }
     native_value_ = next; *value = next;
     return S_OK;
 }
@@ -162,7 +165,7 @@ HRESULT SharedFences::SignalNative(uint64_t* value)
 HRESULT SharedFences::WaitEffects(uint64_t value)
 {
     if (FAILED(failure_)) return failure_;
-    if (!queue_ || !value || value > native_value_) return E_INVALIDARG;
+    if (!queue_ || !value || value > native_submitted_) return E_INVALIDARG;
     return Fail(queue_->Wait(native12_.Get(), value));
 }
 

@@ -401,6 +401,12 @@ na_host_test(native11_frame_model_test SOURCES native11/frame_model_test.cpp)
 if(TARGET host_native11)
   # The B1 provider on a synthetic DX11 game (hardware, else WARP): runs on the hosted runner.
   na_host_test(native11_provider_test SOURCES native11/provider_test.cpp LIBS host_native11 d3dcompiler)
+  if(NA_HAVE_NGX_LIB AND NA_DLSS_DLL)
+    na_host_test(native11_dlaa_test SOURCES native11/provider_test.cpp LIBS host_dx12 LABELS "gpu;nvidia")
+    target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
+    add_custom_command(TARGET native11_dlaa_test POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_dlaa_test>")
+  endif()
 endif()
 # C8b: a frame with known passes must come back as exactly those ops (ABI 0.2).
 na_host_test(observe_passes_test SOURCES observe_passes_test.cpp LIBS host_observe_producers d3d12 d3dcompiler dxgi)

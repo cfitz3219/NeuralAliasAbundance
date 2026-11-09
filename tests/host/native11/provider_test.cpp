@@ -16,6 +16,10 @@
 // Hardware first, then WARP; exit 77 (SKIP) only without any DX11 device.
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
+#if defined(NA_TEST_NATIVE_DLAA)
+#include "host_dx12/native_d3d11/live_dlaa.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
+#endif
 
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
@@ -207,6 +211,8 @@ void SetObject(ID3D11DeviceContext* c, Game& g, int i)
     c->Unmap(g.obj_cb.Get(), 0);
 }
 
+std::atomic<bool> g_tonemap_bound{false}; // the immediate context's tonemap read was bound this frame
+
 void Viewport(ID3D11DeviceContext* c, UINT w, UINT h)
 {
     const D3D11_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
@@ -239,7 +245,7 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     for (int i = 0; i < 40; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
 }
 
-std::atomic<bool> g_tonemap_bound{false}; // the immediate context's tonemap read was bound this frame
+
 
 void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 {
@@ -269,6 +275,9 @@ void Pump()
 }
 
 // ---- the stand-in consumer ----
+#if defined(NA_TEST_NATIVE_DLAA)
+uint64_t evaluations = 0;
+#endif
 struct Seen {
     Game* game = nullptr;
     ComPtr<ID3D11Texture2D> copy; // the consumer's own texture (what B2's shared input would be)
@@ -326,6 +335,9 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
         g.device->CreateTexture2D(&d, nullptr, &s.copy);
     }
     if (s.copy) c->CopyResource(s.copy.Get(), static_cast<ID3D11Resource*>(f.color.d3d11_resource));
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (na::native_d3d11::EvaluateFrame(nullptr, context, f)) ++evaluations;
+#endif
     return true;
 }
 
@@ -366,6 +378,11 @@ int main()
         warp = true;
     }
     std::printf("device: %s\n", warp ? "WARP" : "hardware");
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (warp) return 77;
+    na::j2::SetEnabled(true);
+    na::j2::SetJitter(true);
+#endif
     g_seen.game = &g;
     const bool installed = na::native11::Install(g.device.Get(), &Consume, &g_seen);
     expect(installed, "the provider's hooks install on the game's device");
@@ -477,6 +494,12 @@ int main()
     expect(g_seen.calls - calls2 >= 20 && g_seen.color_w == 256 && g_seen.color_h == 144, "after the resize the new scene colour is handed over");
     expect(g_seen.color_inc != color_inc && g_seen.streams > streams, "the new colour has a new lifetime id and starts a new stream");
     expect(g_seen.wrong_inputs == 0, "no call ever named the wrong colour or depth");
+#if defined(NA_TEST_NATIVE_DLAA)
+    na::native_d3d11::FormatStatus(status, sizeof status);
+    std::printf("%s\n", status);
+    expect(evaluations + 2 >= g_seen.calls && evaluations >= 65,
+           "real DLAA reaches the native scene across immediate, deferred, and resize cases");
+#endif
 
     std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: native DX11 provider on a synthetic game\n", g_failed);
     std::fflush(stdout);

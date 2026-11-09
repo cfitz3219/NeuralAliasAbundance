@@ -55,7 +55,7 @@ public:
     SharedFences(const SharedFences&) = delete;
     SharedFences& operator=(const SharedFences&) = delete;
     HRESULT Create(ID3D11Device* native, ID3D12Device* effects, ID3D12CommandQueue* queue);
-    HRESULT SignalNative(uint64_t* value);
+    HRESULT SignalNative(uint64_t* value, bool submit = true);
     HRESULT WaitEffects(uint64_t native_value);
     HRESULT SignalEffects(uint64_t* value);
     HRESULT WaitNative(uint64_t effects_value);
@@ -68,7 +68,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
     Microsoft::WRL::ComPtr<ID3D11Fence> native11_, effects11_;
     Microsoft::WRL::ComPtr<ID3D12Fence> native12_, effects12_;
-    uint64_t native_value_ = 0, effects_value_ = 0;
+    uint64_t native_value_ = 0, native_submitted_ = 0, effects_value_ = 0;
     HRESULT failure_ = S_OK;
 };
 

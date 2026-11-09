@@ -1896,10 +1896,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     u_out[p] = float4(inv(o), alpha);
 })";
-bool rcas_init()
+bool rcas_init(ID3D12Device* device, RcasPass& pass)
 {
-    if (g_rcas.tried) return g_rcas.ok;
-    g_rcas.tried = true;
+    if (pass.tried) return pass.ok;
+    pass.tried = true;
     D3D12_DESCRIPTOR_RANGE r[2]{};
     r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     r[0].NumDescriptors = 2;
@@ -1915,50 +1915,51 @@ bool rcas_init()
     D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> sig, err, code;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
-        FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_rcas.root))))
+        FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&pass.root))))
         return false;
     const UINT cf = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     if (FAILED(D3DCompile(kRcasHlsl, sizeof(kRcasHlsl) - 1, "j2_rcas.hlsl", nullptr, nullptr, "main", "cs_5_0", cf, 0, &code, &err)))
         return false;
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = g_rcas.root.Get();
+    pd.pRootSignature = pass.root.Get();
     pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_rcas.pso)))) return false;
+    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pass.pso)))) return false;
     // Slots 0..kRing-1: the DLAA path; kRing..2*kRing-1: the render-small upscale ring. Each slot
     // has one table of three descriptors (t0 in, t1 depth, u0 out).
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 2 * 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rcas.heap)))) return false;
-    g_rcas.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    g_rcas.ok = true;
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&pass.heap)))) return false;
+    pass.inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    pass.ok = true;
     return true;
 }
 // RCAS from `in` (readable, NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS).
 // depth: optional R32_FLOAT dw x dh, NON_PIXEL_SHADER_RESOURCE (same picture, any size).
 bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resource* out, uint32_t w, uint32_t h, uint32_t percent,
-                   DXGI_FORMAT fmt, UINT slot, ID3D12Resource* depth = nullptr, uint32_t dw = 0, uint32_t dh = 0, bool reversed = false)
+                   DXGI_FORMAT fmt, UINT slot, ID3D12Resource* depth = nullptr, uint32_t dw = 0, uint32_t dh = 0, bool reversed = false, ID3D12Device* device = nullptr, RcasPass& pass = g_rcas)
 {
-    if (!percent || !in || !out || slot >= 2 * kRing || !rcas_init()) return false;
+    if (!device) device = g.device.Get();
+    if (!device || !percent || !in || !out || slot >= 2 * kRing || !rcas_init(device, pass)) return false;
     if (!depth || !dw || !dh) depth = nullptr;
     const UINT base = slot * 3;
-    auto cpu = [&](UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE c = g_rcas.heap->GetCPUDescriptorHandleForHeapStart(); c.ptr += SIZE_T(base + i) * g_rcas.inc; return c; };
+    auto cpu = [&](UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE c = pass.heap->GetCPUDescriptorHandleForHeapStart(); c.ptr += SIZE_T(base + i) * pass.inc; return c; };
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;
     sv.Format = fmt;
-    g.device->CreateShaderResourceView(in, &sv, cpu(0));
+    device->CreateShaderResourceView(in, &sv, cpu(0));
     sv.Format = DXGI_FORMAT_R32_FLOAT;
-    g.device->CreateShaderResourceView(depth, &sv, cpu(1));
+    device->CreateShaderResourceView(depth, &sv, cpu(1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
     uv.Format = fmt;
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g.device->CreateUnorderedAccessView(out, nullptr, &uv, cpu(2));
-    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_rcas.heap->GetGPUDescriptorHandleForHeapStart();
-    gh.ptr += UINT64(base) * g_rcas.inc;
-    ID3D12DescriptorHeap* heaps[] = {g_rcas.heap.Get()};
+    device->CreateUnorderedAccessView(out, nullptr, &uv, cpu(2));
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = pass.heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += UINT64(base) * pass.inc;
+    ID3D12DescriptorHeap* heaps[] = {pass.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
-    l->SetComputeRootSignature(g_rcas.root.Get());
-    l->SetPipelineState(g_rcas.pso.Get());
+    l->SetComputeRootSignature(pass.root.Get());
+    l->SetPipelineState(pass.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
     // One rate over the whole range: the gain doubles every 50 % (menu: every 25 points).
     const uint32_t pc = (std::min)(percent, 200u);
@@ -7515,6 +7516,16 @@ void SetPaused(bool paused)
     g.paused.store(paused);
 }
 bool Paused() { return g.paused.load(); }
+bool RecordNativeRcas(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                      ID3D12Resource* in, ID3D12Resource* out, ID3D12Resource* depth,
+                      uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT format,
+                      uint32_t slot, bool reversed)
+{
+    // This route is exclusive with translated J2. Its caller serializes
+    // recording and retires a slot before replacing its descriptors.
+    static auto* pass = new RcasPass;
+    return rcas_dispatch(list, in, out, w, h, percent, format, slot, depth, w, h, reversed, device, *pass);
+}
 bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
                         uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt)
 {
