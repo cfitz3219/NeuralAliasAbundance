@@ -4,13 +4,18 @@
 // 32-bit float layout. 24-bit (D24_UNORM_S8_UINT family) and 16-bit (D16_UNORM
 // family) depth would be an invalid copy (undefined behaviour, typically device
 // removal), so callers must check here first and decline with a plain reason.
-// Converting 24/16-bit depth (compute pass reading an R24_UNORM_X8 / R16_UNORM
-// SRV into R32_FLOAT) is planned work, see MASTER-PLAN "Audit notes".
+// J2 converts 24-bit depth separately. This predicate remains copy-only.
 #pragma once
 
 #include <dxgiformat.h>
 
 namespace na::depth {
+
+inline bool IsDepth24(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+           format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+}
 
 inline bool PlaneZeroCopiesToR32F(DXGI_FORMAT f)
 {

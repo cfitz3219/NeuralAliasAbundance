@@ -48,10 +48,18 @@ Status GetStatus();
 // early swap-chain queue bindings are captured as well as producer objects.
 void WaitForObserveInstall();
 
-// The DX11 bridge waits here (up to `ms`) before it creates its own D3D12 device, so that
-// creation never competes with the host's own install (Pharaoh, 068c8a3: a bridge D3D12CreateDevice
-// started mid-install took 13-14 s, each factory inside it sitting out the 3 s gate). True once
-// install was attempted (or no gate is configured).
-bool WaitForInstallAttempt(unsigned long ms);
+// The bridge's private device bootstrap can call back into our DXGI exports.
+// Like the host installer, it must not wait on the game-facing factory gate.
+class InternalFactoryScope {
+public:
+    InternalFactoryScope();
+    ~InternalFactoryScope();
+    InternalFactoryScope(const InternalFactoryScope&) = delete;
+    InternalFactoryScope& operator=(const InternalFactoryScope&) = delete;
+};
+
+// Device creation nested in our own graphics setup belongs to the runtime,
+// not the game's renderer. The 11on12 hook must forward it unchanged too.
+bool IsInternalGraphicsCall();
 
 } // namespace na::host

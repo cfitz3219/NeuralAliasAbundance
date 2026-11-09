@@ -60,6 +60,7 @@ wchar_t g_ini[MAX_PATH] = {};
 HANDLE g_install_event = nullptr;              // manual reset; set once install was attempted
 std::atomic<DWORD> g_init_thread{0};
 std::atomic<uint32_t> g_gate_expired{0};
+thread_local unsigned t_internal_factory_depth = 0;
 void signal_install_attempted()
 {
     if (g_install_event) SetEvent(g_install_event);
@@ -90,6 +91,7 @@ void set_error(const char* text)
 DWORD WINAPI InitThread(LPVOID)
 {
     g_init_thread.store(GetCurrentThreadId());
+    InternalFactoryScope internal_graphics;
     struct Release { ~Release() { signal_install_attempted(); } } release; // every exit path
     boot_log("host init thread entered");
     // Once hooks go in, this module must never unload.
@@ -318,6 +320,7 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
+    na::j2::EnableCameraInputDiagnostic(GetPrivateProfileIntW(L"diagnostics", L"camera_inputs", 0, g_ini) == 1);
     {const bool profile=GetPrivateProfileIntW(L"observe",L"profile_hooks",0,g_ini)==1;
      na::observe::SetHookProfiling(profile);
      if(profile||GetPrivateProfileIntW(L"observe",L"usage_log",0,g_ini)==1)na::usage::Start();} // CPU/GPU usage + busiest threads in the status log; cheap (5 s background sample), so test packages keep it on with profile_hooks=0
@@ -439,6 +442,16 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
     wsprintfW(g_ini, L"%s\\%s", dir, ini_name);
     if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES) return false;
     if (GetPrivateProfileIntW(L"host", L"enabled", 0, g_ini) != 1) return false;
+    wchar_t expected_exe[MAX_PATH]{};
+    if (GetPrivateProfileStringW(L"host", L"executable", L"", expected_exe, MAX_PATH, g_ini)) {
+        wchar_t process_path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, process_path, MAX_PATH);
+        if (!length || length >= MAX_PATH) return false;
+        const wchar_t* basename = process_path;
+        for (const wchar_t* p = process_path; *p; ++p)
+            if (*p == L'\\' || *p == L'/') basename = p + 1;
+        if (lstrcmpiW(basename, expected_exe) != 0) return false;
+    }
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_status.host_enabled = 1;
@@ -463,7 +476,7 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
 
 void WaitForObserveInstall()
 {
-    if (!g_install_event) return;
+    if (!g_install_event || t_internal_factory_depth) return;
     // The init thread's own setup creates factories through this proxy.
     const DWORD init = g_init_thread.load();
     if (init && init == GetCurrentThreadId()) return;
@@ -472,11 +485,9 @@ void WaitForObserveInstall()
     if(WaitForSingleObject(g_install_event,3000)==WAIT_TIMEOUT)g_gate_expired.fetch_add(1);
 }
 
-bool WaitForInstallAttempt(unsigned long ms)
-{
-    if (!g_install_event) return true;
-    return WaitForSingleObject(g_install_event, ms) == WAIT_OBJECT_0;
-}
+InternalFactoryScope::InternalFactoryScope() { ++t_internal_factory_depth; }
+InternalFactoryScope::~InternalFactoryScope() { --t_internal_factory_depth; }
+bool IsInternalGraphicsCall() { return t_internal_factory_depth != 0; }
 
 Status GetStatus()
 {

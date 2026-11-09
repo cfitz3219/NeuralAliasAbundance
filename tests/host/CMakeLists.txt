@@ -144,7 +144,9 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 
 na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
-na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32)
+na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32 d3d11)
+add_test(NAME host_on12_bootstrap_ownership_test COMMAND overlay_bootstrap_test --on12-ownership)
+set_tests_properties(host_on12_bootstrap_ownership_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(overlay_input_handover_test SOURCES overlay_input_handover_test.cpp LIBS host_dx12)
 na_host_test(overlay_boundary_fallback_test SOURCES overlay_boundary_fallback_test.cpp)
 add_test(NAME host_overlay_hardware_test COMMAND overlay_test --hardware)
@@ -334,6 +336,14 @@ if(NA_HAVE_NGX_SDK)
   endforeach()
   add_test(NAME host_j2_resolved_color_msaa_depth COMMAND j2_anno_shape_test 1 4)
   add_test(NAME host_j2_msaa_color_plain_depth COMMAND j2_anno_shape_test 4 1)
+  add_test(NAME host_j2_depth24_scene COMMAND j2_anno_shape_test 1 1 --planes --depth24)
+  add_test(NAME host_j2_depth24_inline_scene COMMAND j2_anno_shape_test 1 1 --inline --depth24)
+  add_test(NAME host_j2_depth24_msaa_scene COMMAND j2_anno_shape_test 4 4 --planes --depth24)
+  add_test(NAME host_j2_depth24_pixels COMMAND j2_msaa_resolve_test 1 --depth24)
+  add_test(NAME host_j2_depth24_msaa_pixels COMMAND j2_msaa_resolve_test 4 --depth24)
+  set_tests_properties(host_j2_depth24_scene host_j2_depth24_inline_scene host_j2_depth24_msaa_scene
+    host_j2_depth24_pixels host_j2_depth24_msaa_pixels
+    PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_j2_before_postprocess COMMAND j2_anno_shape_test 1 1 --post-reader)
   set_tests_properties(host_j2_resolved_color_msaa_depth host_j2_msaa_color_plain_depth host_j2_before_postprocess
     PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
@@ -347,7 +357,9 @@ if(NA_HAVE_NGX_LIB)
       set_tests_properties(host_j2_msaa${samples}_real PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     endforeach()
     add_test(NAME host_j2_post_entry_real_test COMMAND j2_anno_shape_test 1 1 --entry-real)
-    set_tests_properties(host_j2_post_entry_real_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    add_test(NAME host_j2_depth24_real COMMAND j2_anno_shape_test 1 1 --real --depth24)
+    set_tests_properties(host_j2_post_entry_real_test host_j2_depth24_real
+      PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   endif()
   na_host_test(dlss_real_test SOURCES dlss_real_test.cpp LIBS host_dlss dxgi
                ARGS "${CMAKE_CURRENT_BINARY_DIR}/dlss-real-test" LABELS "gpu;nvidia")

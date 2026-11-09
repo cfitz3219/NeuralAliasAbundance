@@ -78,6 +78,7 @@
 #include <ctime>
 #include "host_dx12/settings.hpp"
 #include "host_dx12/host_boot/session.hpp"
+#include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 #include "host_dx12/latency/pcl_stats.hpp"
 
@@ -169,8 +170,7 @@ HRESULT swapchain_d3d12_device(IDXGISwapChain* sc, ComPtr<ID3D12Device>& out)
 {
     HRESULT hr = sc->GetDevice(IID_PPV_ARGS(&out));
     if (SUCCEEDED(hr)) return hr;
-    ComPtr<IUnknown> any;
-    if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&any)))) out.Attach(na::on12::DeviceFor(any.Get()));
+    out.Attach(na::on12::DeviceForSwapchain(sc));
     return out ? S_OK : hr;
 }
 UINT real_index(IDXGISwapChain* sc)
@@ -202,6 +202,7 @@ std::mutex g_swap_queue_m;
 SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
 std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0}, g_swap_queue_observed{0};
+std::atomic<uint32_t> g_swap_queue_on12_recovered{0};
 std::atomic<uintptr_t> g_last_present_queue{0};
 // Where a slow Present goes (DX11 bridge menu probe, 2026-11-09: ~200 ms frames only with the menu
 // open): our own present work (on_present) vs the original Present, per 5-second status window.
@@ -221,22 +222,24 @@ void note_present_timing(bool open, uint64_t ours, uint64_t orig)
     m = t.orig_max.load(); while (orig > m && !t.orig_max.compare_exchange_weak(m, orig)) {}
 }
 
+void store_swapchain_queue(ID3D12CommandQueue* queue, void* swapchain)
+{
+    std::lock_guard<std::mutex> lk(g_swap_queue_m);
+    for (auto& e : g_swap_queues)
+        if (e.sc == swapchain) { e.queues.Created(queue); e.color_space=DXGI_COLOR_SPACE_CUSTOM; g_swap_queues_recorded.fetch_add(1); return; } // address reused
+    SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
+    slot.sc = swapchain;slot.color_space=DXGI_COLOR_SPACE_CUSTOM;
+    slot.queues.Created(queue);
+    g_swap_queues_recorded.fetch_add(1);
+}
+
 void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
 {
     if (!device_or_queue || !swapchain) return;
-    ComPtr<ID3D12CommandQueue> q;
-    if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) {
-        // A DX11 game on our 11on12 device presents on the D3D12 queue behind it.
-        q.Attach(na::on12::QueueFor(device_or_queue));
-        if (!q) return; // D3D11 / other device: not ours
-    }
-    std::lock_guard<std::mutex> lk(g_swap_queue_m);
-    for (auto& e : g_swap_queues)
-        if (e.sc == swapchain) { e.queues.Created(q.Get()); e.color_space=DXGI_COLOR_SPACE_CUSTOM; g_swap_queues_recorded.fetch_add(1); return; } // address reused
-    SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
-    slot.sc = swapchain;slot.color_space=DXGI_COLOR_SPACE_CUSTOM;
-    slot.queues.Created(q.Get());
-    g_swap_queues_recorded.fetch_add(1);
+    ComPtr<ID3D12CommandQueue> queue;
+    // D3D11On12 is resolved from the presenting chain itself on first use.
+    if (SUCCEEDED(device_or_queue->QueryInterface(IID_PPV_ARGS(&queue))) && queue)
+        store_swapchain_queue(queue.Get(), swapchain);
 }
 ComPtr<ID3D12CommandQueue> swapchain_queue(IDXGISwapChain* swapchain)
 {
@@ -897,11 +900,11 @@ void write_status_line()
     }
     {
         char source_line[256];
-        const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu pid=%lu queue_hits=%u buffer_queue=%u queue_misses=%u\r\n",
+        const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu pid=%lu queue_hits=%u buffer_queue=%u queue_misses=%u on12_queue_recovered=%u\r\n",
             g_boundary_frames.load(std::memory_order_acquire)?"streamline":"native",
             static_cast<unsigned long long>(g_native_game_presents.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_presents.load(std::memory_order_relaxed)),GetCurrentProcessId(),
-            g_swap_queue_hits.load(),g_swap_queue_observed.load(),g_swap_queue_misses.load());
+            g_swap_queue_hits.load(),g_swap_queue_observed.load(),g_swap_queue_misses.load(),g_swap_queue_on12_recovered.load());
         if(source_bytes>0)WriteFile(f,source_line,DWORD((std::min)(source_bytes,int(sizeof(source_line)-1))),&written,nullptr);
     }
     {
@@ -3074,6 +3077,15 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     g_presents.fetch_add(1, std::memory_order_relaxed);
     // Use the recorded per-buffer queue or recover it from submitted writes.
     retained_queue = queue_hint ? ComPtr<ID3D12CommandQueue>(queue_hint) : swapchain_queue(sc);
+    if (!retained_queue) {
+        // The translated chain exposes a D3D11 back buffer. Recover its exact
+        // queue via the bridge's device registry, even if its creation predated us.
+        retained_queue.Attach(na::on12::QueueForSwapchain(sc));
+        if (retained_queue) {
+            store_swapchain_queue(retained_queue.Get(), sc);
+            g_swap_queue_on12_recovered.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // Boundary frames: the game-facing proxy is not a key in g_swap_queues;
     // sl_boundary supplies the proxy's exact creation/ResizeBuffers1 queue.
     if (retained_queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
@@ -3972,6 +3984,10 @@ const na::slb::OverlayHooks g_boundary_hooks = make_boundary_hooks();
 
 bool StartCore(const char* route_tag, PanelFn controls)
 {
+    // Drivers/other graphics layers may create a D3D11 helper while our
+    // throwaway D3D12 device is being built. Translating that helper on a
+    // worker can wait on the very D3D12 creation this caller already owns.
+    na::host::InternalFactoryScope internal_graphics;
     std::lock_guard<std::mutex> start_lock(g_start_m);
     if(g_core_started.load(std::memory_order_acquire))return true;
     QueryPerformanceFrequency(&g_state.qpc_freq);

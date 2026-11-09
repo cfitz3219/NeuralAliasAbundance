@@ -2,8 +2,9 @@
 // NeuralAliasDXGI.dll renamed to dxgi.dll plus a NeuralAliasHost.ini with
 // [dx11on12] enabled=1 (and the usual host/observe/j2 keys). It behaves like a
 // small DX11 game: DXGI factory first (as games enumerate adapters), then
-// D3D11CreateDeviceAndSwapChain, then N frames of clears + one triangle-free
-// draw call and Present. It answers, in its own output and the host's status log:
+// D3D11CreateDeviceAndSwapChain, then N frames of clears and Present. Add
+// "scene" after the frame count (or after "menu") for actual depth-writing
+// geometry and an offscreen scene color target. It answers:
 //   1. did the game's device become an 11on12 device on our D3D12 queue?
 //   2. can the swap chain's back buffer be read as an ID3D12Resource (the menu needs it)?
 //   3. does the device survive N presents (no removal)?
@@ -14,6 +15,7 @@
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <cstdio>
@@ -25,7 +27,11 @@ using Microsoft::WRL::ComPtr;
 int main(int argc, char** argv)
 {
     const int frames = argc > 1 ? std::atoi(argv[1]) : 300;
-    const bool press_home = argc > 2 && std::strcmp(argv[2], "menu") == 0; // opens the NeuralAlias menu a third of the way in
+    bool press_home = false, draw_scene = false;
+    for (int arg = 2; arg < argc; ++arg) {
+        press_home |= std::strcmp(argv[arg], "menu") == 0;
+        draw_scene |= std::strcmp(argv[arg], "scene") == 0;
+    }
     ComPtr<IDXGIFactory1> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory)); // waits for the host install, like a game's adapter scan
     std::printf("factory hr=0x%08lX\n", static_cast<unsigned long>(hr));
@@ -74,6 +80,31 @@ int main(int argc, char** argv)
     ComPtr<ID3D11DepthStencilView> dsv;
     dev->CreateTexture2D(&td, nullptr, &depth);
     if (depth) dev->CreateDepthStencilView(depth.Get(), nullptr, &dsv);
+    ComPtr<ID3D11Texture2D> scene;
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    if (draw_scene) {
+        if (!back || !dsv) return 2;
+        static constexpr char shaders[] = R"(
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 p[6] = {float2(-1,-1),float2(-1,1),float2(1,-1),
+                   float2(1,-1),float2(-1,1),float2(1,1)};
+    return float4(p[id], 0.5f + 0.2f * p[id].x, 1);
+}
+float4 ps(float4 p : SV_Position) : SV_Target {
+    return float4(frac(p.x / 64), frac(p.y / 64), 0.25, 1);
+})";
+        ComPtr<ID3DBlob> vs_code, ps_code;
+        if (FAILED(D3DCompile(shaders, sizeof(shaders)-1, nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs_code, nullptr)) ||
+            FAILED(D3DCompile(shaders, sizeof(shaders)-1, nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps_code, nullptr)) ||
+            FAILED(dev->CreateVertexShader(vs_code->GetBufferPointer(), vs_code->GetBufferSize(), nullptr, &vs)) ||
+            FAILED(dev->CreatePixelShader(ps_code->GetBufferPointer(), ps_code->GetBufferSize(), nullptr, &ps))) return 2;
+        back->GetDesc(&td);
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = 0;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &scene)) ||
+            FAILED(dev->CreateRenderTargetView(scene.Get(), nullptr, rtv.ReleaseAndGetAddressOf()))) return 2;
+    }
     int presented = 0;
     for (int i = 0; i < frames; ++i) {
         MSG m;
@@ -90,6 +121,17 @@ int main(int argc, char** argv)
         ctx->OMSetRenderTargets(1, &r, dsv.Get());
         ctx->ClearRenderTargetView(rtv.Get(), c);
         if (dsv) ctx->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 1.f, 0);
+        if (draw_scene) {
+            const D3D11_VIEWPORT vp{0, 0, 1280, 720, 0, 1};
+            ctx->RSSetViewports(1, &vp);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx->VSSetShader(vs.Get(), nullptr, 0);
+            ctx->PSSetShader(ps.Get(), nullptr, 0);
+            // Go past discovery's small depth-only loading-screen filter.
+            for (int draw = 0; draw < 12; ++draw) ctx->Draw(6, 0);
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            ctx->CopyResource(back.Get(), scene.Get());
+        }
         if (FAILED(hr = sc->Present(1, 0))) { std::printf("present %d hr=0x%08lX\n", i, static_cast<unsigned long>(hr)); break; }
         ++presented;
     }

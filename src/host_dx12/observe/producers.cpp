@@ -3694,7 +3694,7 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
             const SlotShared stripe(dh, slot);
             version = dh->versions[slot];
         }
-        // C9: CBV ranges of this table (first range, per the bound root signature).
+        // C9: CBV ranges of this table, per the bound root signature.
 
         if (dh && ls->root_sig[Compute]) {
             auto it = g_objs.find(canon(ls->root_sig[Compute]));
@@ -3720,12 +3720,18 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                             }
                         }
                         if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV || range.table_offset == NA_UNKNOWN_U32) continue;
-                        const uint32_t n = std::min<uint32_t>(range.num_descriptors, 8);
-                        const bool cut = range.num_descriptors > 8; // incl. unbounded: coverage flagged
+                        // Cover the complete conventional hardware CB register bank.
+                        // Microsoft D3D11On12 uses 4/8/14/15-entry tables; the old
+                        // eight-entry budget silently hid its later camera buffers.
+                        constexpr uint32_t max_cbvs = D3D12_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT;
+                        const uint64_t first = uint64_t(slot) + range.table_offset;
+                        const uint32_t available = first < dh->count ? static_cast<uint32_t>(dh->count - first) : 0;
+                        const uint32_t n = std::min({range.num_descriptors, max_cbvs, available});
+                        const bool cut = range.num_descriptors > n; // incl. unbounded: coverage flagged
                         SlotShared stripe;
-                        for (uint32_t k = 0; k < n && slot + range.table_offset + k < dh->count; ++k) {
-                            stripe.lock(dh, uint64_t(slot) + range.table_offset + k);
-                            const DescHeap::SlotInfo& si = dh->info[slot + range.table_offset + k];
+                        for (uint32_t k = 0; k < n && ls->bindings.size() < 4096; ++k) {
+                            stripe.lock(dh, first + k);
+                            const DescHeap::SlotInfo& si = dh->info[static_cast<size_t>(first + k)];
                             if (si.kind != NA_DESC_CBV) continue;
                             ListState::Binding b;
                             b.kind = NA_SNAP_TABLE_CBV;

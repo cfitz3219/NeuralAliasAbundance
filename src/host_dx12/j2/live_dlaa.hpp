@@ -155,6 +155,8 @@ UpscaleTarget GetUpscaleTarget();
 // exact operation, before subsequent post effects/HUD. Does not change window
 // geometry or run a second Present upscaler.
 void EnableNativeScaleBridge(bool enabled);
+// Explicit, one-shot F8 diagnostic of CPU-visible scene constants. No GPU readback.
+void EnableCameraInputDiagnostic(bool enabled);
 void SetNativeRenderExtent(uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh);
 // Audit 2026-11-06: what the native-scale bridge saw. One run with the game at
 // Quality must say why DLSS did or did not reconstruct (status + run log).
