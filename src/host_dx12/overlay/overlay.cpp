@@ -30,6 +30,7 @@
 #include "host_dx12/overlay/dlss_debug.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native_d3d11/live_dlaa.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -3662,6 +3663,7 @@ struct Native11Present {
         ComPtr<ID3D12CommandQueue> retained;
         ID3D12CommandQueue* queue = nullptr;
         if (present_prelude(sc, queue, retained)) menu_step(sc, queue, g_open.load(std::memory_order_acquire));
+        na::native_d3d11::CapturePresent(sc, queue);
     }
     ~Native11Present() { if (outer) t_native11_present = false; }
 };

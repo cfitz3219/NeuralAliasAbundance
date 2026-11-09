@@ -25,6 +25,7 @@
 #include "host_dx12/native11/input_provider.hpp"
 
 #include "core/temporal_jitter.hpp"
+#include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/frame_model.hpp"
@@ -113,7 +114,8 @@ IDXGISwapChain* g_swap = nullptr; // identity only
 std::atomic<Id> g_sel_color{0};    // readable from any thread
 
 std::atomic<Id> g_cand[kMaxCandidates + 1] = {};
-std::unordered_map<Id, std::vector<uint8_t>> g_cb_latest;
+struct CameraUpload { uint32_t version = 0; std::vector<uint8_t> bytes; };
+std::unordered_map<Id, CameraUpload> g_cb_latest;
 std::unordered_map<Id, uint64_t> g_cb_incarnation; // candidate camera buffers: lifetime id, tagged at upload (live object)
 std::map<std::pair<Id, uint32_t>, std::vector<uint8_t>> g_cb_versions;
 
@@ -292,40 +294,59 @@ inline const Originals& O(ID3D11DeviceContext* c, Ctx* x)
 }
 
 // ---------------------------------------------------------------- the boundary
+CameraPick PickForScene(const std::vector<uint8_t>& bytes, const CameraPick& learned,
+                        uint32_t width, uint32_t height, uint64_t frame)
+{
+    // WWII's camera-relative packet carries the world origin and redundant
+    // witnesses instead of a VP/inverse pair. Use the same decoder as the
+    // effects consumer before trying the generic inverse-pair rule.
+    wwii::SceneCamera scene;
+    if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(bytes.size()), width, height, scene)) {
+        CameraPick pick;
+        pick.found = pick.reversed = pick.camera_relative = true;
+        pick.vp = scene.vp;
+        return pick;
+    }
+    CameraPick pick;
+    if (CheckLearned(bytes, learned, &pick)) return pick;
+    return FindCamera(bytes, frame);
+}
+
 // The camera for this frame (under g_mu): the learned block re-read, else a search of the candidates.
 bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out)
 {
     const Selection& s = g_model.Current();
-    const auto bytes_of = [&](Id cb, uint64_t* version) -> const std::vector<uint8_t>* {
-        const uint32_t v = g_model.CameraVersionThisFrame();
-        auto it = v ? g_cb_versions.find({cb, v}) : g_cb_versions.end();
-        if (it != g_cb_versions.end()) { *version = v; return &it->second; }
-        auto lt = g_cb_latest.find(cb);
-        if (lt == g_cb_latest.end()) return nullptr;
-        *version = 0; // latest upload, version not attributable to this frame's scene draws
-        return &lt->second;
+    const uint32_t w = g_scene_vp_w >= 1.f ? static_cast<uint32_t>(g_scene_vp_w + 0.5f) : s.color_info.width;
+    const uint32_t h = g_scene_vp_h >= 1.f ? static_cast<uint32_t>(g_scene_vp_h + 0.5f) : s.color_info.height;
+    const auto bytes_of = [&](Id cb, uint32_t version) -> const std::vector<uint8_t>* {
+        if (!version) return nullptr; // no scene draw used this buffer in the current frame
+        const auto it = g_cb_versions.find({cb, version});
+        if (it != g_cb_versions.end()) return &it->second;
+        if (version != g_model.CbVersion(cb)) return nullptr;
+        const auto latest = g_cb_latest.find(cb);
+        return latest == g_cb_latest.end() || latest->second.version != version ? nullptr : &latest->second.bytes;
     };
     if (s.camera_cb && g_camera.found) {
-        uint64_t version = 0;
-        const std::vector<uint8_t>* bytes = bytes_of(s.camera_cb, &version);
-        if (bytes && CheckLearned(*bytes, g_camera, out)) { *bytes_out = bytes; *version_out = version; return true; }
+        const uint32_t version = g_model.CameraVersionThisFrame();
+        const std::vector<uint8_t>* bytes = bytes_of(s.camera_cb, version);
         if (bytes) {
-            const CameraPick p = FindCamera(*bytes, g_frame + 1);
+            const CameraPick p = PickForScene(*bytes, g_camera, w, h, g_frame + 1);
             if (p.found) { g_camera = p; *out = p; *bytes_out = bytes; *version_out = version; return true; }
         }
         g_camera = CameraPick{};
         g_model.SetCamera(0, -1);
     }
     for (const auto& c : g_model.CameraCandidates(kMaxCandidates)) {
-        auto it = g_cb_latest.find(c.first);
-        if (it == g_cb_latest.end()) continue;
-        const CameraPick p = FindCamera(it->second, g_frame + 1);
+        const uint32_t version = g_model.CameraCandidateVersion(c.first, c.second);
+        const auto* bytes = bytes_of(c.first, version);
+        if (!bytes) continue;
+        const CameraPick p = PickForScene(*bytes, {}, w, h, g_frame + 1);
         if (!p.found) continue;
         g_camera = p;
         g_model.SetCamera(c.first, c.second);
         *out = p;
-        *bytes_out = &it->second;
-        *version_out = 0;
+        *bytes_out = bytes;
+        *version_out = version;
         return true;
     }
     return false;
@@ -350,7 +371,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     uint64_t version = 0;
     if (!CameraNow(&cam, &bytes, &version)) {
         ++g_stats.camera_missing;
-        return SetReason("No camera matrix (with its inverse) was found in the scene's constant buffers.");
+        return SetReason("No supported camera was found in the scene's constant buffers.");
     }
     ++g_stats.camera_found;
     const Selection cam_sel = g_model.Current(); // CameraNow may have just chosen (or changed) the camera buffer
@@ -424,6 +445,17 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     if (!ok) ++g_stats.missed;
 }
 
+void SaveCameraUpload(Id resource, uint32_t version, const uint8_t* data, size_t size)
+{
+    auto& latest = g_cb_latest[resource];
+    // Keep the recent versions used by scene draws, including when the game
+    // uploads a different view to this buffer before the scene consumer.
+    constexpr size_t kMaxSavedVersions = 64;
+    if (latest.version && g_cb_versions.size() < kMaxSavedVersions)
+        g_cb_versions[{resource, latest.version}] = std::move(latest.bytes);
+    latest.version = version;
+    latest.bytes.assign(data, data + size);
+}
 // ---------------------------------------------------------------- events
 void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes = nullptr, size_t cb_size = 0)
 {
@@ -444,11 +476,8 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes =
         Fire(c, l, Boundary::BeforeHud);
     }
     const uint32_t v = g_model.Feed(e);
-    if (e.kind == Kind::CbUpdate && cb_bytes) {
-        const auto* p = static_cast<const uint8_t*>(cb_bytes);
-        g_cb_latest[e.resource].assign(p, p + cb_size);
-        if (g_model.Current().camera_cb == e.resource) g_cb_versions[{e.resource, v}].assign(p, p + cb_size);
-    }
+    if (e.kind == Kind::CbUpdate && cb_bytes)
+        SaveCameraUpload(e.resource, v, static_cast<const uint8_t*>(cb_bytes), cb_size);
 }
 
 void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
@@ -573,17 +602,34 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
     size = std::min(size, kMaxCbBytes);
     std::vector<uint8_t> v(static_cast<uint8_t*>(bytes), static_cast<uint8_t*>(bytes) + size);
     CameraPick now;
-    if (!CheckLearned(v, learned, &now)) return false;
+    wwii::SceneCamera relative;
+    if (learned.camera_relative) {
+        if (!wwii::DecodeSceneCamera(v, static_cast<uint32_t>(v.size()), w, h, relative)) return false;
+        now = learned;
+        now.offset = relative.vp_offset;
+        now.layout = na::camera::Layout::ColumnMajor;
+        now.vp = relative.vp;
+    } else if (!CheckLearned(v, learned, &now)) {
+        return false;
+    }
     na::camera::VpGeometry geo{};
     if (!na::camera::DecomposeViewProjection(now.vp, geo)) return false;
     const double aspect = geo.sy / geo.sx, screen = double(w) / h;
     if (std::fabs(aspect - screen) > 0.01 * screen) return false; // not the main camera
     const auto jittered = neural_alias::jitter_projection(now.vp, sample, w, h);
-    na::camera::Matrix inv{};
-    if (!na::camera::Invert(jittered, inv)) return false;
-    StoreMatrix(static_cast<uint8_t*>(bytes), size, now.offset, now.layout, jittered);
-    const int64_t io = static_cast<int64_t>(now.offset) + now.inverse_delta;
-    if (io >= 0) StoreMatrix(static_cast<uint8_t*>(bytes), size, static_cast<uint64_t>(io), now.layout, inv);
+    auto* dst = static_cast<uint8_t*>(bytes);
+    if (now.camera_relative) {
+        // Only the witnessed current projection(s). Leave the previous camera,
+        // depth reconstruction matrices and world origin as the game wrote them.
+        StoreMatrix(dst, size, now.offset, now.layout, jittered);
+        if (relative.vp_duplicate) StoreMatrix(dst, size, relative.vp_duplicate, now.layout, jittered);
+    } else {
+        na::camera::Matrix inv{};
+        if (!na::camera::Invert(jittered, inv)) return false;
+        StoreMatrix(dst, size, now.offset, now.layout, jittered);
+        const int64_t io = static_cast<int64_t>(now.offset) + now.inverse_delta;
+        if (io >= 0) StoreMatrix(dst, size, static_cast<uint64_t>(io), now.layout, inv);
+    }
     std::lock_guard<std::mutex> l(g_mu);
     ++g_stats.jitter_written;
     g_jitter_written = true;
@@ -894,9 +940,8 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
             for (size_t i = 0; i < events.size(); ++i) {
                 const uint32_t v = g_model.Feed(events[i]);
                 if (events[i].kind == Kind::CbUpdate && next_bytes < bytes.size() && bytes[next_bytes].first == i) {
-                    if (g_model.Current().camera_cb == events[i].resource) g_cb_versions[{events[i].resource, v}] = bytes[next_bytes].second;
-                    g_cb_latest[events[i].resource] = bytes[next_bytes].second;
-                    ++next_bytes;
+                    const auto& upload = bytes[next_bytes++].second;
+                    SaveCameraUpload(events[i].resource, v, upload.data(), upload.size());
                 }
             }
         }

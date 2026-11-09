@@ -3,6 +3,8 @@
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
+#include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_boot/session.hpp"
@@ -13,6 +15,7 @@
 #include "host_dx12/settings.hpp"
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <memory>
@@ -57,6 +60,7 @@ std::mutex mutex;
 std::atomic<const char*> reason{"Waiting for a native scene."};
 std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
 std::atomic<uint64_t> delivered_size{0}, delivered_at{0};
+std::atomic<bool> evaluation_capture_pending{false};
 
 bool Skip(const char* why)
 {
@@ -335,6 +339,36 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     constexpr uint64_t kNativeView = 0x4e41544956453131ull;
     eval.view_id = kNativeView;
     const bool evaluated = dlss::Evaluate(list, eval);
+    uint32_t capture_token = 0;
+    if (evaluated && capture::j2::Armed()) {
+        capture::j2::Planes planes;
+        planes.color = slot.color.Effects();
+        planes.depth = shared_depth;
+        planes.motion = slot.motion.Get();
+        planes.output = slot.output.Effects();
+        capture::j2::Identity id;
+        id.present_ordinal = id.inputs_frame = frame.frame;
+        id.view_color = c.incarnation;
+        id.view_depth = d.incarnation;
+        id.width = ci.width;
+        id.height = ci.height;
+        id.color_format = cf;
+        id.jitter_x = eval.jitter_x;
+        id.jitter_y = eval.jitter_y;
+        id.preset = eval.preset;
+        id.sharpness = settings::Get().j2_sharpness.load();
+        id.dlss_hdr = eval.hdr;
+        id.dlss_auto_exposure = eval.auto_exposure;
+        id.dlss_depth_inverted = frame.reversed_depth;
+        id.reset = eval.reset;
+        id.camera_valid = true;
+        id.camera_source = 1;
+        std::copy(cam.view_proj_current_row.begin(), cam.view_proj_current_row.end(), id.vp_cur);
+        std::copy(cam.view_proj_previous_row.begin(), cam.view_proj_previous_row.end(), id.vp_prev);
+        std::copy(cam.inv_view_proj_current_row.begin(), cam.inv_view_proj_current_row.end(), id.inv_vp_cur);
+        std::copy(cam.position.begin(), cam.position.end(), id.eye);
+        capture_token = capture::j2::RecordEvaluation(list, planes, id);
+    }
     auto* result = slot.output.Native();
     const uint32_t sharpness = settings::Get().j2_sharpness.load();
     if (evaluated && sharpness) {
@@ -351,19 +385,28 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     Barrier(list, shared_depth, kRead, kCommon);
     Barrier(list, slot.motion.Get(), kRead, kWrite);
-    if (FAILED(list->Close())) return FailSession(s, "Native effects command list could not close.");
+    if (FAILED(list->Close())) {
+        capture::j2::Discard(capture_token, false);
+        return FailSession(s, "Native effects command list could not close.");
+    }
 
     // The D3D11 runtime retains submitted native copy resources itself.
     // Do not keep a game backbuffer reference across ResizeBuffers.
     D3D11_BOX box{c.active_x, c.active_y, 0, c.active_x + ci.width, c.active_y + ci.height, 1};
     ctx->CopySubresourceRegion(slot.color.Native(), 0, 0, 0, 0, color.Get(), csub, &box);
     CopyDepth(s, slot, ctx, depth.Get(), dsub);
-    if (FAILED(s.fences.SignalNative(&slot.native_done)) || FAILED(s.fences.WaitEffects(slot.native_done)))
+    if (FAILED(s.fences.SignalNative(&slot.native_done)) || FAILED(s.fences.WaitEffects(slot.native_done))) {
+        capture::j2::Discard(capture_token, false);
         return FailSession(s, "Native scene submission failed.");
+    }
     ID3D12CommandList* lists[] = {list};
     dlss::BeforeExecute(s.queue.Get(), 1, lists);
     s.queue->ExecuteCommandLists(1, lists);
     dlss::OnExecuted(s.queue.Get(), 1, lists);
+    if (capture_token) {
+        capture::j2::Submitted(capture_token, s.queue.Get(), frame.frame);
+        evaluation_capture_pending.store(true, std::memory_order_release);
+    }
     if (FAILED(s.fences.SignalEffects(&slot.effects_done))) return FailSession(s, "DX12 effects submission failed.");
     if (!evaluated) return Skip("DLAA evaluation rejected this frame.");
     if (FAILED(s.fences.WaitNative(slot.effects_done))) return FailSession(s, "Native result dependency failed.");
@@ -386,6 +429,62 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     return true;
 }
 
+void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
+{
+    const bool eval = evaluation_capture_pending.exchange(false, std::memory_order_acq_rel);
+    const bool burst = capture::Pending();
+    if (!eval && !burst) return;
+    struct PresentCopy {
+        SharedTexture image;
+        SharedFences fences;
+        ComPtr<ID3D11Device> native;
+        ComPtr<ID3D12CommandQueue> queue;
+        uint64_t native_done = 0, effects_done = 0;
+    };
+    static auto* state = new std::unique_ptr<PresentCopy>;
+    const auto stats = native11::Stats();
+    if (eval) capture::j2::OnFrameClosed(stats.frames - 1, 0);
+    const auto complete = [queue, eval, burst](ID3D12Resource* image) {
+        if (eval) capture::j2::OnPresent(queue, image,
+            [](ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) { q->ExecuteCommandLists(n, lists); });
+        if (burst && image) {
+            char note[256]{};
+            FormatStatus(note, sizeof note);
+            capture::NotePresent(note);
+            capture::OnPresent(queue, image, false);
+        }
+    };
+    ComPtr<ID3D11Texture2D> backbuffer;
+    if (!queue || FAILED(swap->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) return complete(nullptr);
+    native11::OwnWorkScope own;
+    observe::HostWorkScope host_work;
+    D3D11_TEXTURE2D_DESC desc{};
+    backbuffer->GetDesc(&desc);
+    ComPtr<ID3D11Device> native;
+    backbuffer->GetDevice(&native);
+    const ImageDesc image{desc.Width, desc.Height, desc.Format};
+    if (!CompatibleImageCopy(desc, 0, image)) return complete(nullptr);
+    auto& copy = *state;
+    if (!copy || copy->queue.Get() != queue || copy->native.Get() != native.Get() ||
+        copy->image.Description().width != image.width || copy->image.Description().height != image.height ||
+        copy->image.Description().format != image.format) {
+        if (copy && !copy->fences.Retired(copy->native_done, copy->effects_done)) return complete(nullptr);
+        auto next = std::make_unique<PresentCopy>();
+        ComPtr<ID3D12Device> effects;
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&effects))) ||
+            FAILED(next->image.Create(native.Get(), effects.Get(), image)) ||
+            FAILED(next->fences.Create(native.Get(), effects.Get(), queue))) return complete(nullptr);
+        next->native = native;
+        next->queue = queue;
+        copy = std::move(next);
+    }
+    if (copy->effects_done && FAILED(copy->fences.WaitNative(copy->effects_done))) return complete(nullptr);
+    copy->fences.NativeContext()->CopySubresourceRegion(copy->image.Native(), 0, 0, 0, 0, backbuffer.Get(), 0, nullptr);
+    if (FAILED(copy->fences.SignalNative(&copy->native_done)) ||
+        FAILED(copy->fences.WaitEffects(copy->native_done))) return complete(nullptr);
+    complete(copy->image.Effects());
+    copy->fences.SignalEffects(&copy->effects_done);
+}
 int FormatStatus(char* out, size_t capacity)
 {
     return std::snprintf(out, capacity, "native11_dlaa delivered=%llu busy=%llu rejected=%llu \"%s\"",

@@ -304,10 +304,11 @@ bool OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     return ok;
 }
 
-void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer)
+void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, bool wait_for_slot)
 {
     if (!Pending() || !queue) return;
     std::lock_guard<std::mutex> lock(g.m);
+    if (!wait_for_slot && g.fence_next > 1 && g.fence->GetCompletedValue() < g.fence_next - 1) return;
     if (!g.current && g.presents_only && g.evaluated < g.requested) {
         ComPtr<ID3D12Device> dev;
         if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_device(dev.Get())) { ++g.errors; return; }

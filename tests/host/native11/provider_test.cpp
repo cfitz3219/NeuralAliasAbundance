@@ -17,6 +17,9 @@
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #if defined(NA_TEST_NATIVE_DLAA)
+#include "host_dx12/adapters/wwii/scene_camera.hpp"
+#include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
@@ -108,6 +111,7 @@ struct Game {
     ComPtr<IDXGISwapChain> swap;
     HWND wnd = nullptr;
     UINT w = 320, h = 180;
+    bool campaign_camera = false;
     ComPtr<ID3D11Texture2D> shadow_depth, shadow_rt, depth, color;
     ComPtr<ID3D11DepthStencilView> shadow_dsv, dsv;
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
@@ -211,13 +215,25 @@ void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp,
 {
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(c->Map(g.cam_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
-    std::vector<uint8_t> bytes(512, 0);
+    std::vector<uint8_t> bytes(g.campaign_camera ? 1280 : 512, 0);
     const float pad[4] = {1.f, 2.f, 3.f, 4.f};
     std::memcpy(bytes.data(), pad, 16);
     na::native11::StoreMatrix(bytes.data(), bytes.size(), 64, na::camera::Layout::RowMajor, vp);
     na::camera::Matrix inv{};
     na::camera::Invert(vp, inv);
     na::native11::StoreMatrix(bytes.data(), bytes.size(), 192, na::camera::Layout::RowMajor, inv);
+    if (g.campaign_camera && remember) {
+        std::fill(bytes.begin(), bytes.end(), uint8_t{0});
+        const na::camera::Matrix relative{double(g.h) / g.w, 0, 0, 0, 0, 1, 0, 0,
+                                          0, 0, 0, 4, 0, 0, 1, 0};
+        for (const uint32_t offset : {64u, 320u})
+            na::native11::StoreMatrix(bytes.data(), bytes.size(), offset, na::camera::Layout::ColumnMajor, relative);
+        const float origin[]{static_cast<float>(vp[3]), -10183.53808594f, -50.8396759f, 0.f};
+        const float extent[]{float(g.w), float(g.h), 1.f / g.w, 1.f / g.h};
+        std::memcpy(bytes.data() + 384, origin, sizeof origin);
+        std::memcpy(bytes.data() + 944, origin, sizeof origin);
+        std::memcpy(bytes.data() + 704, extent, sizeof extent);
+    }
     std::memcpy(m.pData, bytes.data(), bytes.size());
     c->Unmap(g.cam_cb.Get(), 0);
     if (remember) g.last_written = vp;
@@ -335,7 +351,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     if (!inputs) ++s.wrong_inputs;
     if (g_tonemap_bound && f.boundary == na::native11::Boundary::BeforeRead) ++s.after_tonemap;
     if (f.scene_draws != 40) ++s.no_scene;
-    if (!f.camera.bytes || f.camera.size != 512 || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) ||
+    if (!f.camera.bytes || f.camera.size != (g.campaign_camera ? 1280u : 512u) || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) ||
         f.camera.vs_slot != 0) {
         if (!s.no_camera)
             std::printf("camera handed over: bytes=%p size=%u buffer=%llx (game %llx) slot=%d first=%u num=%u version=%llu\n",
@@ -630,6 +646,57 @@ int main()
     SendMessageW(g.wnd, WM_KEYDOWN, VK_HOME, 1);
     g.swap->Present(0, 0);
     expect(!na::overlay::GetStats().open, "Home closes on the native swap chain");
+    // The earlier fixture only provided VP+inverse. Replace its camera with
+    // the observed WWII packet shape (relative VP, repeated origin, no inverse).
+    D3D11_BUFFER_DESC camera_desc{};
+    g.cam_cb->GetDesc(&camera_desc);
+    camera_desc.ByteWidth = 1280;
+    expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())), "create WWII-shaped camera buffer");
+    g.campaign_camera = true;
+    const auto before_campaign = evaluations;
+    const auto before_jitter = g_seen.jitter_reported;
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, temp);
+    const auto captures = std::filesystem::path(temp) / (L"NA-native-camera-capture-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(captures / L"eval");
+    std::filesystem::create_directories(captures / L"present");
+    na::capture::j2::Request(3, (captures / L"eval").c_str());
+    na::capture::RequestPresents(3, (captures / L"present").c_str());
+    auto present_campaign = [&]() {
+        Scene(g.ctx.Get(), g, frame++);
+        Post(g.ctx.Get(), g, true);
+        g.swap->Present(0, 0);
+        Pump();
+    };
+    na::j2::SetJitter(true);
+    for (int i = 0; i < 22; ++i) present_campaign();
+    expect(g_seen.last.camera.buffer == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) &&
+           g_seen.last.camera.size == 1280 && g_seen.last.camera.version != 0 && evaluations >= before_campaign + 16,
+           "native DLAA accepts the current WWII camera packet with no inverse");
+    expect(g_seen.jitter_reported >= before_jitter + 12, "native WWII camera uploads carry the applied jitter");
+    na::j2::SetJitter(false);
+    present_campaign(); // an already armed phase may still apply to this frame
+    const auto jitter_off = g_seen.jitter_reported;
+    for (int i = 0; i < 4; ++i) present_campaign();
+    expect(g_seen.jitter_reported == jitter_off, "jitter switch stops changing future WWII camera uploads");
+    na::j2::SetPaused(true);
+    const auto paused = evaluations;
+    for (int i = 0; i < 3; ++i) present_campaign();
+    expect(evaluations == paused, "DLAA switch stops native evaluations");
+    na::j2::SetPaused(false);
+    present_campaign();
+    expect(evaluations > paused, "DLAA switch resumes native evaluations");
+    for (int i = 0; i < 100 && (na::capture::j2::GetStats().written < 3 || na::capture::GetStats().frames_written < 3); ++i) {
+        present_campaign();
+        Sleep(10);
+    }
+    const auto ec = na::capture::j2::GetStats();
+    const auto pc = na::capture::GetStats();
+    expect(ec.written == 3 && ec.without_present == 0 && ec.errors == 0 &&
+           std::filesystem::exists(captures / L"eval" / L"00000-present.raw"), "native DLAA capture saves evaluations with their actual presented image");
+    expect(pc.frames_written == 3 && pc.errors == 0, "native presented-frame capture writes the backbuffers");
+    na::capture::j2::Shutdown();
+    na::capture::Shutdown();
     DeleteFileW(ini.c_str());
 #endif
 

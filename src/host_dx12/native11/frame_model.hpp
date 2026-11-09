@@ -222,6 +222,12 @@ public:
             if (kv.second > best_n) { best_n = kv.second; best = kv.first; }
         return best;
     }
+    // A previous candidate is useful only if this scene actually bound it.
+    uint32_t CameraCandidateVersion(Id cb, int slot) const
+    {
+        const auto it = cb_scene_.find({cb, slot});
+        return it == cb_scene_.end() ? 0 : it->second.last_version;
+    }
     // Camera-buffer candidates of the last frame, most scene draws first (for camera search).
     std::vector<std::pair<Id, int>> CameraCandidates(size_t max) const
     {
