@@ -571,7 +571,10 @@ constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
 constexpr uint32_t kCostPseudo = 100, kCostVpj = 100, kCostShaderUse = 101, kCostLaneBefore = 102, kCostLaneAfter = 103,
                    kCostDriver = 104, kCostRun = 105, kCostRootTable = 106, kCostSampled = 107, kCostEmit = 108,
                    kCostNoteDraw = 109, kCostCanonMiss = 110,
-                   kCostDescCopy = 111, kCostDescCopyWait = 112, kCostDescWrite = 113, kCostDescWriteWait = 114; // descriptor copies/writes and their wait for the exclusive g_m
+                   kCostDescCopy = 111, kCostDescCopyWait = 112, kCostDescWrite = 113, kCostDescWriteWait = 114, // descriptor copies/writes and their wait for the exclusive g_m
+                   // WWII p28412 (2026-11-09): pso 37-81 ms per creation and shader_use 10 us per draw were the two
+                   // costs; these split each into the driver's / the walk's share and ours.
+                   kCostPsoDriver = 115, kCostPsoReflect = 116, kCostUseLookup = 117, kCostUseWalk = 118, kCostUseCallback = 119, kCostLast = 119;
 std::atomic<bool> g_cost_enabled{false};
 std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
 thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
@@ -590,12 +593,21 @@ void cost_flush()
 struct CostScope {
     uint32_t slot; uint64_t t0;
     explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots && g_cost_enabled.load(std::memory_order_relaxed) ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
-    ~CostScope()
+    void Close()
     {
         if (slot >= kCostSlots) return;
         t_cost_ticks[slot] += cost_now() - t0; ++t_cost_calls[slot];
         if (++t_cost_n >= 512 || slot >= kCostExec) cost_flush();
+        slot = kCostSlots;
     }
+    // Account what ran so far to this scope's slot and continue under another one.
+    void Switch(uint32_t s)
+    {
+        const bool on = slot < kCostSlots;
+        Close();
+        if (on && s < kCostSlots) { slot = s; t0 = cost_now(); }
+    }
+    ~CostScope() { Close(); }
     CostScope(const CostScope&) = delete;
     CostScope& operator=(const CostScope&) = delete;
 };
@@ -2765,7 +2777,9 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
 {
     const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateGraphicsPipelineState");
-    const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreateGraphicsPipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
     g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
@@ -2802,7 +2816,9 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
 {
     const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateComputePipelineState");
-    const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreateComputePipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
     g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
@@ -2830,7 +2846,9 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
 {
     const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreatePipelineState");
-    const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreatePipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d || !d->pPipelineStateSubobjectStream) return hr;
     g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
@@ -4185,6 +4203,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
     bool reads_color = false;
     na::j2::InsertionEvent entry;
     {
+        CostScope lookup(kCostUseLookup);
         std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         auto* ls = list_state_locked(l, &lid);
@@ -4215,6 +4234,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
         bool reads_derived = false;
         auto& cached=ls->shader_reads[compute];
         const uint64_t revision_now=g_operation_revision.load(); // before reading: a concurrent copy then invalidates
+        lookup.Switch(kCostUseWalk);
         if(cached.valid&&cached.state_revision==ls->read_revision[compute]&&cached.registry_revision==revision_now&&cached.color==color){
             color_srvs=cached.color_srvs;reads_color=color_srvs!=0;nsrv=cached.count;
             std::copy_n(cached.srvs,nsrv,srv_ids);if(compute)destination=cached.uav;
@@ -4276,6 +4296,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
                 ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false, na::j2::Op::DerivedRead});
         }
     }
+    const CostScope callbacks(kCostUseCallback);
     if(entry.resource)if(auto cb=g_entry_cb.load(std::memory_order_acquire))cb(l,entry);
     if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
 }
@@ -8410,11 +8431,12 @@ void FormatHookCost(char* out, size_t n)
     int w = std::snprintf(out, n, "hook_cost window_s=%.1f list_ms_per_s=%.1f", secs, list_total);
     static const char* const kPseudo[] = {"vpj", "shader_use", "lane_before", "lane_after", "driver", "run", "root_table",
                                            "sampled", "emit", "note_draw", "canon_miss", "desc_copy", "desc_copy_wait",
-                                           "desc_write", "desc_write_wait"};
+                                           "desc_write", "desc_write_wait", "pso_driver", "pso_reflect", "use_lookup", "use_walk", "use_callback"};
+    static_assert(sizeof(kPseudo) / sizeof(kPseudo[0]) == kCostLast - kCostPseudo + 1, "one name per pseudo slot");
     for (uint32_t i = 0; i < nr && i < 24 && w > 0 && size_t(w) < n; ++i) {
         const uint32_t sl = rows[i].slot;
         const char* tag = sl == kCostExec ? "exec" : sl == kCostPso ? "pso" :
-                          (sl >= kCostPseudo && sl <= kCostDescWriteWait) ? kPseudo[sl - kCostPseudo] : nullptr;
+                          (sl >= kCostPseudo && sl <= kCostLast) ? kPseudo[sl - kCostPseudo] : nullptr;
         if (tag) w += std::snprintf(out + w, n - w, " %s{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", tag, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
         else w += std::snprintf(out + w, n - w, " s%u{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", rows[i].slot, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
     }
