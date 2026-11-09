@@ -304,7 +304,12 @@ bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* qu
     ComPtr<ID3D11On12Device2> device;
     if (FAILED(any.As(&device))) return false; // not an 11on12 chain
     ComPtr<ID3D11Resource> buffer;
-    HRESULT hr = sc->GetBuffer(index, IID_PPV_ARGS(&buffer));
+    // D3D11 swap chains expose only buffer 0: it is always the current back buffer (the runtime
+    // rotates the rest). Asking for the D3D12-style current index borrows a buffer that is queued
+    // for display, which 11on12 must first wait out (probe e13b422: Presents of up to 2 s with the
+    // menu open, none without it).
+    (void)index;
+    HRESULT hr = sc->GetBuffer(0, IID_PPV_ARGS(&buffer));
     const uint64_t t0 = now_us();
     if (SUCCEEDED(hr)) hr = device->UnwrapUnderlyingResource(buffer.Get(), queue, IID_PPV_ARGS(out));
     add_time(g_unwrap_us, g_unwrap_max_us, now_us() - t0);
