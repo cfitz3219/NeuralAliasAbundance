@@ -3651,8 +3651,27 @@ void note_menu_present_result(bool open, UINT flags, HRESULT result) {
         g_menu_skips.present_rejected.fetch_add(1, std::memory_order_relaxed);
     }
 }
+thread_local bool t_native11_present = false;
+struct Native11Present {
+    bool outer = !t_native11_present;
+    Native11Present(IDXGISwapChain* sc, UINT flags) {
+        if (!outer) return;
+        t_native11_present = true;
+        if ((flags & DXGI_PRESENT_TEST) || !na::native11::ObservePresent(sc)) return;
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        ComPtr<ID3D12CommandQueue> retained;
+        ID3D12CommandQueue* queue = nullptr;
+        if (present_prelude(sc, queue, retained)) menu_step(sc, queue, g_open.load(std::memory_order_acquire));
+    }
+    ~Native11Present() { if (outer) t_native11_present = false; }
+};
+
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
+    if (na::on12::NativeRoute()) {
+        Native11Present frame(sc, flags);
+        return g_orig_present(sc, sync, flags);
+    }
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
     na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
@@ -3689,6 +3708,10 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
 HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
+    if (na::on12::NativeRoute()) {
+        Native11Present frame(sc, flags);
+        return g_orig_present1(sc, sync, flags, pp);
+    }
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
     na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
@@ -3869,6 +3892,16 @@ HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
+    if (na::on12::NativeRoute()) {
+        na::native11::BeforeResize(sc);
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            if (g_state.swapchain == sc) release_buffers_locked();
+        }
+        const auto result = g_orig_resize(sc, count, w, h, fmt, flags);
+        na::native11::AfterResize(sc, result);
+        return result;
+    }
     // Reset may have retired the native FG recording without another Present.
     // Drop its completed image references before DXGI checks ResizeBuffers.
     na::nr::native::Maintain();
@@ -3890,6 +3923,16 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
 {
+    if (na::on12::NativeRoute()) {
+        na::native11::BeforeResize(sc);
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            if (g_state.swapchain == sc) release_buffers_locked();
+        }
+        const auto result = g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+        na::native11::AfterResize(sc, result);
+        return result;
+    }
     na::nr::native::Maintain();
     retire_nr_backbuffers(sc);
     {
@@ -4158,13 +4201,6 @@ bool StartCore(const char* route_tag, PanelFn controls)
     snprintf(g_route_tag, sizeof(g_route_tag), "%s", route_tag ? route_tag : "");
     g_controls = controls;
     g_stopping.store(false);
-    if (na::on12::NativeRoute()) {
-        // Native11 owns Present and ResizeBuffers. Run the existing status
-        // worker without installing the competing DX12 swap-chain detours.
-        const bool started = na::hooking::variants::StartDiscoveryThread(&seen_drain, nullptr);
-        g_core_started.store(started, std::memory_order_release);
-        return started;
-    }
     g_boundary_frames.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(g_boundary_m);
@@ -4366,7 +4402,6 @@ bool StartMenu()
 {
     std::lock_guard<std::mutex> start_lock(g_start_m);
     if(!g_core_started.load(std::memory_order_acquire))return false;
-    if(na::on12::NativeRoute())return false;
     if(g_menu_enabled.load(std::memory_order_acquire) && g_input_hooks.load()==8)return true;
     if(g_fail_menu_start.exchange(false))return false;
     g_menu_cursor=LoadCursorW(nullptr,IDC_ARROW);

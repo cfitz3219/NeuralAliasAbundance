@@ -22,6 +22,7 @@
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
+#include "host_dx12/overlay/overlay.hpp"
 #include <DirectXPackedVector.h>
 #include <d3d11on12.h>
 #include <filesystem>
@@ -433,7 +434,7 @@ int main()
     };
     if (!set(L"host", L"enabled", L"1") || !set(L"host", L"status_log", status_path.c_str()) ||
         !set(L"dx11on12", L"enabled", L"0") || !set(L"native11", L"enabled", L"1") ||
-        !set(L"overlay", L"enabled", L"0") || !set(L"adapter", L"enabled", L"0") ||
+        !set(L"overlay", L"enabled", L"1") || !set(L"adapter", L"enabled", L"0") ||
         !set(L"observe", L"producers", L"0") || !set(L"observe", L"early_install", L"0") ||
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
@@ -612,6 +613,23 @@ int main()
         }
     }
     expect(native_status, "status worker records native FPS and DLAA delivery without a DX12 swap chain");
+    expect(na::overlay::GetStats().initialized == 1, "Home renderer initialized on the native swap chain");
+    SendMessageW(g.wnd, WM_KEYDOWN, VK_HOME, 1);
+    for (unsigned i = 0; i < 12; ++i) {
+        Scene(g.ctx.Get(), g, frame++);
+        Post(g.ctx.Get(), g, true);
+        expect(SUCCEEDED(g.swap->Present(0, 0)), "native Present with Home open");
+        Pump();
+    }
+    char menu_status[2048]{};
+    na::on12::FormatStatus(menu_status, sizeof menu_status);
+    std::printf("%s\n", menu_status);
+    const char* draws = std::strstr(menu_status, "menu{draws=");
+    expect(na::overlay::GetStats().open && draws && std::strtoull(draws + std::strlen("menu{draws="), nullptr, 10) >= 8 &&
+           std::strstr(draws, " failures=0}") != nullptr, "Home is composited repeatedly on native DX11 without failures");
+    SendMessageW(g.wnd, WM_KEYDOWN, VK_HOME, 1);
+    g.swap->Present(0, 0);
+    expect(!na::overlay::GetStats().open, "Home closes on the native swap chain");
     DeleteFileW(ini.c_str());
 #endif
 

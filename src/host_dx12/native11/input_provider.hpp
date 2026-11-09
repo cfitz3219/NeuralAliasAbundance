@@ -81,7 +81,20 @@ struct ProviderStats {
 };
 
 // Installs the D3D11 hooks on `device` (ID3D11Device*) and its immediate context. Idempotent.
-bool Install(void* device, SceneCallback cb, void* user);
+bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present = false);
+// The hosted path receives DXGI events through the overlay's existing hooks.
+bool ObservePresent(void* swapchain);
+void BeforeResize(void* swapchain);
+void AfterResize(void* swapchain, long result);
+class OwnWorkScope {
+public:
+    OwnWorkScope();
+    ~OwnWorkScope();
+    OwnWorkScope(const OwnWorkScope&) = delete;
+    OwnWorkScope& operator=(const OwnWorkScope&) = delete;
+private:
+    bool was_;
+};
 void Uninstall();
 // Jitter for the NEXT frame's scene camera, in pixels (the backend's sequence). Covers that one frame
 // only: a frame with no request (missed or failed evaluation) renders with the game's own camera. The provider writes

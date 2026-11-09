@@ -911,18 +911,18 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
 }
 
 // ---------------------------------------------------------------- frame boundary
-void OnPresent(IDXGISwapChain* swap)
+bool OnPresent(IDXGISwapChain* swap)
 {
-    if (t_inside) return;
+    if (t_inside) return false;
     ID3D11Device* game = g_device_raw.load(std::memory_order_acquire);
-    if (!game) return;
+    if (!game) return false;
     std::lock_guard<std::mutex> l(g_mu);
     if (swap != g_swap) {
         // A swap chain of the game's device (fullscreen toggles can recreate it) is adopted; one of
         // another device (a launcher window, a video, our own) is ignored.
         Inside in;
         ComPtr<ID3D11Device> d;
-        if (FAILED(swap->GetDevice(IID_PPV_ARGS(&d))) || d.Get() != game) return;
+        if (FAILED(swap->GetDevice(IID_PPV_ARGS(&d))) || d.Get() != game) return false;
         g_swap = swap;
         DXGI_SWAP_CHAIN_DESC sd{};
         swap->GetDesc(&sd);
@@ -951,6 +951,7 @@ void OnPresent(IDXGISwapChain* swap)
     g_jitter_active = g_jitter_requested && g_camera.found;
     g_jitter = neural_alias::JitterSample{g_next_jitter[0], g_next_jitter[1]};
     g_jitter_requested = false;
+    return true;
 }
 
 HRESULT STDMETHODCALLTYPE Present_d(IDXGISwapChain* s, UINT sync, UINT flags)
@@ -973,22 +974,31 @@ HRESULT STDMETHODCALLTYPE Present1_d(IDXGISwapChain1* s, UINT sync, UINT flags, 
 }
 HRESULT STDMETHODCALLTYPE ResizeBuffers_d(IDXGISwapChain* s, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
+    BeforeResize(s);
+    const HRESULT hr = g_resize(s, n, w, h, f, flags);
+    AfterResize(s, hr);
+    return hr;
+}
+
+void ReleaseResizeInputs(IDXGISwapChain* s)
+{
+    std::lock_guard<std::mutex> l(g_mu);
     if (s == g_swap) {
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
-        std::lock_guard<std::mutex> l(g_mu);
         g_color_ref.Reset();
         g_depth_ref.Reset();
         g_model.Forget(g_model.Current().color); // the scene targets are usually recreated with the new size
         g_sel_color.store(0);
     }
-    const HRESULT hr = g_resize(s, n, w, h, f, flags);
-    if (s == g_swap && SUCCEEDED(hr)) {
-        std::lock_guard<std::mutex> l(g_mu);
+}
+void UpdateResizeExtent(IDXGISwapChain* s, long result)
+{
+    std::lock_guard<std::mutex> l(g_mu);
+    if (s == g_swap && SUCCEEDED(result)) {
         DXGI_SWAP_CHAIN_DESC sd{};
         s->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
     }
-    return hr;
 }
 
 // ---------------------------------------------------------------- install
@@ -1034,7 +1044,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     return true;
 }
 
-bool InstallHooks()
+bool InstallHooks(bool host_owns_present)
 {
     if (!na::hooking::Initialize()) return SetReason("The hooking core failed to initialise."), false;
     // A private device and swap chain, only to reach d3d11.dll's and dxgi.dll's functions.
@@ -1073,9 +1083,11 @@ bool InstallHooks()
     bool ok = na::hooking::BeginInstallWait("native11");
     ok = ok && HookCtx(imm.Get(), 0, false);
     ok = ok && (!def || HookCtx(def.Get(), 1, true));
-    ok = ok && na::hooking::PrepareVTableSlot(swap.Get(), kPresent, reinterpret_cast<void*>(&Present_d), reinterpret_cast<void**>(&g_present));
-    ok = ok && na::hooking::PrepareVTableSlot(swap.Get(), kResizeBuffers, reinterpret_cast<void*>(&ResizeBuffers_d), reinterpret_cast<void**>(&g_resize));
-    ok = ok && (!swap1 || na::hooking::PrepareVTableSlot(swap1.Get(), kPresent1, reinterpret_cast<void*>(&Present1_d), reinterpret_cast<void**>(&g_present1)));
+    if (!host_owns_present) {
+        ok = ok && na::hooking::PrepareVTableSlot(swap.Get(), kPresent, reinterpret_cast<void*>(&Present_d), reinterpret_cast<void**>(&g_present));
+        ok = ok && na::hooking::PrepareVTableSlot(swap.Get(), kResizeBuffers, reinterpret_cast<void*>(&ResizeBuffers_d), reinterpret_cast<void**>(&g_resize));
+        ok = ok && (!swap1 || na::hooking::PrepareVTableSlot(swap1.Get(), kPresent1, reinterpret_cast<void*>(&Present1_d), reinterpret_cast<void**>(&g_present1)));
+    }
     if (ok) ok = na::hooking::CommitInstall();
     else na::hooking::AbandonInstall();
     if (!def) g_o[1] = g_o[0];
@@ -1090,7 +1102,13 @@ bool InstallHooks()
 
 } // namespace
 
-bool Install(void* device, SceneCallback cb, void* user)
+bool ObservePresent(void* swapchain) { return OnPresent(static_cast<IDXGISwapChain*>(swapchain)); }
+void BeforeResize(void* swapchain) { ReleaseResizeInputs(static_cast<IDXGISwapChain*>(swapchain)); }
+void AfterResize(void* swapchain, long result) { UpdateResizeExtent(static_cast<IDXGISwapChain*>(swapchain), result); }
+OwnWorkScope::OwnWorkScope() : was_(t_inside) { t_inside = true; }
+OwnWorkScope::~OwnWorkScope() { t_inside = was_; }
+
+bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present)
 {
     std::lock_guard<std::mutex> g(g_install_mu);
     {
@@ -1100,7 +1118,7 @@ bool Install(void* device, SceneCallback cb, void* user)
     }
     if (device) g_device_raw.store(static_cast<ID3D11Device*>(device), std::memory_order_release);
     if (g_installed.load()) return true;
-    if (!InstallHooks()) return false;
+    if (!InstallHooks(host_owns_present)) return false;
     g_installed.store(true);
     return true;
 }

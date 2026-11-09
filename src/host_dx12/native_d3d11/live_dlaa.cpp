@@ -56,6 +56,7 @@ Session& State() { static auto* s = new Session; return *s; }
 std::mutex mutex;
 std::atomic<const char*> reason{"Waiting for a native scene."};
 std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
+std::atomic<uint64_t> delivered_size{0}, delivered_at{0};
 
 bool Skip(const char* why)
 {
@@ -373,6 +374,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     s.stream = frame.stream;
     s.last_frame = frame.frame;
     delivered.fetch_add(1, std::memory_order_relaxed);
+    delivered_size.store((uint64_t(ci.width) << 32) | ci.height, std::memory_order_relaxed);
+    delivered_at.store(GetTickCount64(), std::memory_order_relaxed);
     if (j2::Jitter()) {
         const auto phase = static_cast<uint32_t>(frame.frame);
         const auto sample = settings::Get().j2_jitter_r2.load()
@@ -389,5 +392,17 @@ int FormatStatus(char* out, size_t capacity)
                          static_cast<unsigned long long>(delivered.load()),
                          static_cast<unsigned long long>(busy.load()),
                          static_cast<unsigned long long>(rejected.load()), reason.load());
+}
+bool FormatMenuStatus(char* out, size_t capacity)
+{
+    const auto last = delivered_at.load(std::memory_order_relaxed);
+    const auto size = delivered_size.load(std::memory_order_relaxed);
+    const bool running = j2::Enabled() && !j2::Paused() && last && GetTickCount64() - last < 1000;
+    if (running)
+        std::snprintf(out, capacity, "Native DX11 DLAA running at %u × %u. %llu frames improved.",
+                      unsigned(size >> 32), unsigned(size), static_cast<unsigned long long>(delivered.load()));
+    else
+        std::snprintf(out, capacity, "%s", j2::Paused() ? "Native DX11 DLAA is off." : reason.load());
+    return running;
 }
 } // namespace na::native_d3d11

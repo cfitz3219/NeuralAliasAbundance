@@ -35,6 +35,8 @@
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/native_d3d11/live_dlaa.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -1043,6 +1045,17 @@ void DrawLiveDlaa()
             na::settings::Save();
         }
         EndRow();
+    }
+    if (na::on12::NativeRoute()) {
+        bool jitter = na::j2::Jitter();
+        BeginRow("Camera jitter", "Offsets scene samples by a fraction of a pixel for DLAA to reconstruct fine detail.", SwitchWidth());
+        if (Switch("native11_jitter", &jitter)) na::j2::SetJitter(jitter);
+        EndRow();
+        char status[200]{};
+        const bool running = na::native_d3d11::FormatMenuStatus(status, sizeof status);
+        StatusLine(running ? 1 : 0, status);
+        EndGroupBox();
+        return;
     }
     {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
