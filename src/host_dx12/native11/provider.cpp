@@ -946,8 +946,11 @@ void OnPresent(IDXGISwapChain* swap)
     g_scene_vp_x = g_scene_vp_y = g_scene_vp_w = g_scene_vp_h = 0;
     // Next frame's jitter: the backend's sample, written into the main camera's uploads.
     g_jitter_written = false;
+    // A request covers exactly the frame that starts here: without a new one (a missed or failed
+    // evaluation), the next frame's camera is the game's own, unjittered.
     g_jitter_active = g_jitter_requested && g_camera.found;
     g_jitter = neural_alias::JitterSample{g_next_jitter[0], g_next_jitter[1]};
+    g_jitter_requested = false;
 }
 
 HRESULT STDMETHODCALLTYPE Present_d(IDXGISwapChain* s, UINT sync, UINT flags)

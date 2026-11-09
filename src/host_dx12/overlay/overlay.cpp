@@ -990,7 +990,7 @@ void write_status_line()
     }
     char safe_line[144];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s renderer_ready=%u shared_writer=%u clean_exit_hook=%u\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason(),na::host::SessionReady()?1u:0u,na::settings::CanPersist()?1u:0u,na::host::CleanExitObserved()?1u:0u);
     if(safe_bytes>0)WriteFile(f, safe_line, static_cast<DWORD>((std::min)(safe_bytes, static_cast<int>(sizeof(safe_line)-1))), &written, nullptr);
-    {char on12_line[768];const int on12_bytes=na::on12::FormatStatus(on12_line,sizeof(on12_line)-2);
+    {char on12_line[2048];const int on12_bytes=na::on12::FormatStatus(on12_line,sizeof(on12_line)-2);
      if(on12_bytes>0){WriteFile(f,on12_line,static_cast<DWORD>((std::min)(on12_bytes,static_cast<int>(sizeof(on12_line)-3))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}}
     char fg_inputs[512];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),

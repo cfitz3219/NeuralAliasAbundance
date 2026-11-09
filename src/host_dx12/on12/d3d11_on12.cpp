@@ -1,6 +1,8 @@
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
+#include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native_d3d11/live_dlaa.hpp"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -38,6 +40,10 @@ On12CreateDeviceFn g_on12_create = nullptr;
 D3D12CreateDeviceFn g_d3d12_create = nullptr;
 LogFn g_log = nullptr;
 std::atomic<bool> g_enabled{false}, g_hooked{false};
+// [dx11on12] route=native (WWII plan B1/B2): the game keeps its own D3D11 device; the native
+// input provider hands each frame's scene to the DX12 effects through shared images.
+std::atomic<bool> g_route_native{false};
+std::atomic<uint32_t> g_native_installs{0}, g_native_install_failures{0};
 // [dx11on12] menu_buffer: 1 (default) the menu draws into a canvas texture of ours, which the
 // game's own D3D11 context then blends onto the back buffer; 2 the menu draws straight into the
 // borrowed back buffer (D3D12 writes to an 11on12 swap chain's presented buffer make the D3D11
@@ -280,10 +286,33 @@ bool wanted(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, UINT flags, void* out_d
     return true;
 }
 
+// Native route: the game's own device, created by the original call, gets the input provider with
+// the DX12 effects handoff as its consumer. The provider's probe device goes straight to the
+// original (t_inside is held by the caller).
+void install_native(ID3D11Device* device)
+{
+    if (!device) return;
+    if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr)) {
+        g_native_installs.fetch_add(1);
+        note("native DX11 route: the input provider is on the game's own D3D11 device");
+    } else {
+        g_native_install_failures.fetch_add(1);
+        note("native DX11 route: the input provider could not hook the game's device");
+    }
+}
+
 HRESULT WINAPI DetourCreateDevice(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODULE sw, UINT flags,
                                   const D3D_FEATURE_LEVEL* levels, UINT level_count, UINT sdk,
                                   ID3D11Device** out_device, D3D_FEATURE_LEVEL* out_level, ID3D11DeviceContext** out_context)
 {
+    if (g_route_native.load() && wanted(adapter, type, flags, out_device)) {
+        g_requests.fetch_add(1);
+        ++t_inside;
+        const HRESULT hr = g_orig_create(adapter, type, sw, flags, levels, level_count, sdk, out_device, out_level, out_context);
+        if (SUCCEEDED(hr) && *out_device) install_native(*out_device);
+        --t_inside;
+        return hr;
+    }
     if (wanted(adapter, type, flags, out_device)) {
         g_requests.fetch_add(1);
         ++t_inside;
@@ -304,6 +333,14 @@ HRESULT WINAPI DetourCreateDeviceAndSwapChain(IDXGIAdapter* adapter, D3D_DRIVER_
                                               ID3D11Device** out_device, D3D_FEATURE_LEVEL* out_level,
                                               ID3D11DeviceContext** out_context)
 {
+    if (g_route_native.load() && wanted(adapter, type, flags, out_device)) {
+        g_requests.fetch_add(1);
+        ++t_inside;
+        const HRESULT hr = g_orig_create_sc(adapter, type, sw, flags, levels, level_count, sdk, desc, out_sc, out_device, out_level, out_context);
+        if (SUCCEEDED(hr) && *out_device) install_native(*out_device);
+        --t_inside;
+        return hr;
+    }
     if (wanted(adapter, type, flags, out_device) && (!out_sc || desc)) {
         g_requests.fetch_add(1);
         ++t_inside;
@@ -378,9 +415,13 @@ void Start(const wchar_t* ini, LogFn log)
     g_menu_buffer.store(static_cast<int>(GetPrivateProfileIntW(L"dx11on12", L"menu_buffer", 1, ini)));
     g_copy_with_d3d11.store(GetPrivateProfileIntW(L"dx11on12", L"copy_with_d3d11", 0, ini) != 0);
     g_keep_game_swapchain.store(GetPrivateProfileIntW(L"dx11on12", L"keep_game_swapchain", 0, ini) != 0);
+    wchar_t route[16] = {};
+    GetPrivateProfileStringW(L"dx11on12", L"route", L"bridge", route, 16, ini);
+    g_route_native.store(lstrcmpiW(route, L"native") == 0);
     g_hooked.store(true);
     g_enabled.store(true);
-    note("D3D11 device creation hooked; the game's DX11 device will run on D3D12");
+    note(g_route_native.load() ? "D3D11 device creation hooked; native DX11 route (no translation), DLAA through shared images"
+                               : "D3D11 device creation hooked; the game's DX11 device will run on D3D12");
 }
 
 ID3D12CommandQueue* QueueFor(IUnknown* device)
@@ -1245,7 +1286,18 @@ int FormatStatus(char* out, size_t capacity)
     if (n < 0 || static_cast<size_t>(n) >= capacity) return n;
     out += n;
     capacity -= static_cast<size_t>(n);
-    return n + std::snprintf(out, capacity,
+    int extra = 0;
+    if (g_route_native.load()) {
+        // Native route: provider and handoff state, then the bridge's own counters (requests only).
+        int m = std::snprintf(out, capacity, "dx11on12_route=native installs=%u install_failures=%u | ", g_native_installs.load(),
+                              g_native_install_failures.load());
+        if (m > 0 && static_cast<size_t>(m) < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; }
+        m = na::native11::FormatStatus(out, static_cast<unsigned long>(capacity));
+        if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
+        m = na::native_d3d11::FormatStatus(out, capacity);
+        if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
+    }
+    return n + extra + std::snprintf(out, capacity,
                          "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{mode=%d unwraps=%llu failures=%llu returns=%llu composites=%llu composite_failures=%llu unwrap_us=%llu/max%llu return_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\"",
                          g_enabled.load() ? 1u : 0u, g_hooked.load() ? 1u : 0u, g_requests.load(), g_wrapped.load(),
                          g_with_swapchain.load(), g_native.load(), g_probes.load(), g_swapchain_check.load(), g_menu_buffer.load(),
