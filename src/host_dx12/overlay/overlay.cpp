@@ -198,7 +198,7 @@ std::atomic<ID3D12CommandQueue*> g_direct_queue{nullptr};
 // direct queue that submitted", which in a two-queue game with native Frame
 // Generation (Phantom Blade Zero) is often not the presenting queue: the menu then
 // wrote the back buffer unsynchronised with FG and the GPU faulted (Cort, 2026-10-29).
-struct SwapQueue { void* sc = nullptr; PresentQueues queues; int color_space=DXGI_COLOR_SPACE_CUSTOM; };
+struct SwapQueue { void* sc = nullptr; PresentQueues queues; int color_space=DXGI_COLOR_SPACE_CUSTOM; bool on12_owned=false; };
 std::mutex g_swap_queue_m;
 SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
@@ -223,13 +223,13 @@ void note_present_timing(bool open, uint64_t ours, uint64_t orig)
     m = t.orig_max.load(); while (orig > m && !t.orig_max.compare_exchange_weak(m, orig)) {}
 }
 
-void store_swapchain_queue(ID3D12CommandQueue* queue, void* swapchain)
+void store_swapchain_queue(ID3D12CommandQueue* queue, void* swapchain, bool on12_owned = false)
 {
     std::lock_guard<std::mutex> lk(g_swap_queue_m);
     for (auto& e : g_swap_queues)
-        if (e.sc == swapchain) { e.queues.Created(queue); e.color_space=DXGI_COLOR_SPACE_CUSTOM; g_swap_queues_recorded.fetch_add(1); return; } // address reused
+        if (e.sc == swapchain) { e.queues.Created(queue); e.color_space=DXGI_COLOR_SPACE_CUSTOM; e.on12_owned=on12_owned; g_swap_queues_recorded.fetch_add(1); return; } // address reused
     SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
-    slot.sc = swapchain;slot.color_space=DXGI_COLOR_SPACE_CUSTOM;
+    slot.sc = swapchain;slot.color_space=DXGI_COLOR_SPACE_CUSTOM;slot.on12_owned=on12_owned;
     slot.queues.Created(queue);
     g_swap_queues_recorded.fetch_add(1);
 }
@@ -242,11 +242,14 @@ void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
     if (SUCCEEDED(device_or_queue->QueryInterface(IID_PPV_ARGS(&queue))) && queue)
         store_swapchain_queue(queue.Get(), swapchain);
 }
-ComPtr<ID3D12CommandQueue> swapchain_queue(IDXGISwapChain* swapchain)
+ComPtr<ID3D12CommandQueue> swapchain_queue(IDXGISwapChain* swapchain, bool* on12_owned = nullptr)
 {
     const UINT index=real_index(swapchain);
     std::lock_guard<std::mutex> lk(g_swap_queue_m);
-    for (const auto& e : g_swap_queues) if (e.sc == swapchain) return e.queues.At(index);
+    for (const auto& e : g_swap_queues) if (e.sc == swapchain) {
+        if (on12_owned) *on12_owned = e.on12_owned;
+        return e.queues.At(index);
+    }
     return nullptr;
 }
 
@@ -3129,20 +3132,22 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
 // failed). Takes g_state.mutex on success (caller releases via the guard it
 // passes in).
 bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D12CommandQueue>& retained_queue,
-                     ID3D12CommandQueue* queue_hint = nullptr)
+                     ID3D12CommandQueue* queue_hint = nullptr, bool* on12_owned = nullptr)
 {
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
     na::host::RendererObserved();
     g_presents.fetch_add(1, std::memory_order_relaxed);
     // Use the recorded per-buffer queue or recover it from submitted writes.
-    retained_queue = queue_hint ? ComPtr<ID3D12CommandQueue>(queue_hint) : swapchain_queue(sc);
+    retained_queue = queue_hint ? ComPtr<ID3D12CommandQueue>(queue_hint) : swapchain_queue(sc, on12_owned);
     if (!retained_queue) {
         // The translated chain exposes a D3D11 back buffer. Recover its exact
         // queue via the bridge's device registry, even if its creation predated us.
         retained_queue.Attach(na::on12::QueueForSwapchain(sc));
         if (retained_queue) {
-            store_swapchain_queue(retained_queue.Get(), sc);
+            const bool owned = !na::on12::IsTranslated(sc);
+            store_swapchain_queue(retained_queue.Get(), sc, owned);
+            if (on12_owned) *on12_owned = owned;
             g_swap_queue_on12_recovered.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -3377,13 +3382,18 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
     na::settings::WatchChanges("code");
     na::scale::AutomaticScenePresent();
 }
-void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
+void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr,
+                ComPtr<ID3D12CommandQueue>* after_present = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12CommandQueue> retained_queue;
-    if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
-    game_frame_boundary(queue);
+    bool on12_owned = false;
+    if (!present_prelude(sc, queue,retained_queue,queue_hint,&on12_owned)) return;
+    // A D3D11On12-owned chain can close and execute the game's last command
+    // list inside Present. Learn from that submission in the same frame.
+    if (on12_owned && after_present) *after_present = retained_queue;
+    else game_frame_boundary(queue);
     note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
@@ -3396,6 +3406,17 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
     // The game-facing Present capture must include Home. Keep the separate
     // J2 evaluation capture before Home so its image can be compared to DLSS.
     capture_present_picture(queue, bb.Get(), open, g_frames.load(std::memory_order_relaxed) != draws, true);
+}
+
+void finish_deferred_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
+{
+    if (!queue || g_stopping.load(std::memory_order_acquire)) return;
+    // Present can return while the translation worker still has commands for
+    // the same frame. Keep the host lock out of that worker's submission path.
+    if (na::j2::Enabled() && !na::j2::Paused()) na::on12::FlushPresentedWork(sc);
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    if (!g_stopping.load(std::memory_order_acquire) && (!g_state.swapchain || g_state.swapchain == sc))
+        game_frame_boundary(queue);
 }
 
 // A59 presenter path: the game drew into its proxy; the presenter copies,
@@ -3605,10 +3626,13 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     na::nr::trace::Record("present_begin",sc);
     const bool menu_open = g_open.load(std::memory_order_acquire);
     const uint64_t t0 = qpc_us();
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
+    ComPtr<ID3D12CommandQueue> after_present;
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present);
     const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present(sc, sync, flags);
-    note_present_timing(menu_open, t1 - t0, qpc_us() - t1);
+    const uint64_t t2 = qpc_us();
+    finish_deferred_present(sc, after_present.Get());
+    note_present_timing(menu_open, (t1 - t0) + (after_present ? qpc_us() - t2 : 0), t2 - t1);
     note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
@@ -3633,8 +3657,10 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present1_begin",sc);
     const bool menu_open = g_open.load(std::memory_order_acquire);
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
+    ComPtr<ID3D12CommandQueue> after_present;
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present);
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
+    finish_deferred_present(sc, after_present.Get());
     note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);

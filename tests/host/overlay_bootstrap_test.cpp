@@ -8,6 +8,8 @@
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
+#include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <filesystem>
@@ -15,6 +17,70 @@
 namespace {std::atomic<unsigned> submits{0},devices{0};
 void submitted(na::overlay::ExecuteContext*){submits.fetch_add(1);}
 void device_seen(ID3D12Device*,void*){devices.fetch_add(1);}}
+namespace {
+struct PresentOrder {
+    uint64_t frame;
+    std::atomic<unsigned> submissions{0}, wrong_frame{0};
+};
+void record_present_order(na::overlay::ExecuteContext* context)
+{
+    auto& test = *static_cast<PresentOrder*>(context->user);
+    if (na::eventlog::Frame() != test.frame) ++test.wrong_frame;
+    ++test.submissions;
+}
+
+int native_on12_present_order(IDXGIFactory4* factory, HWND window, const DXGI_SWAP_CHAIN_DESC1& desc)
+{
+    test::ComPtr<ID3D11Device> device;
+    test::ComPtr<ID3D11DeviceContext> context;
+    REQUIRE(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                       D3D11_SDK_VERSION, &device, nullptr, &context)));
+    test::ComPtr<ID3D11On12Device> translated;
+    REQUIRE(SUCCEEDED(device.As(&translated)));
+    test::ComPtr<IDXGISwapChain1> chain;
+    REQUIRE(SUCCEEDED(factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, &chain)));
+    test::ComPtr<ID3D11Texture2D> buffer;
+    REQUIRE(SUCCEEDED(chain->GetBuffer(0, IID_PPV_ARGS(&buffer))));
+    test::ComPtr<ID3D12Resource> native_buffer;
+    CHECK(FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&native_buffer))));
+    test::ComPtr<ID3D11RenderTargetView> view;
+    REQUIRE(SUCCEEDED(device->CreateRenderTargetView(buffer.Get(), nullptr, &view)));
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    REQUIRE(SUCCEEDED(chain->Present(0, 0))); // finish hook/bootstrap work before measuring
+    for(unsigned i=0;i<400 && !na::host::SessionReady();++i)Sleep(5);
+    REQUIRE(na::j2::Enabled() && !na::j2::Paused());
+    test::Device backend;
+    backend.queue.Attach(na::overlay::AcquirePresentQueue(chain.Get()));
+    REQUIRE(backend.queue);
+    REQUIRE(SUCCEEDED(backend.queue->GetDevice(IID_PPV_ARGS(&backend.device))));
+    REQUIRE(SUCCEEDED(backend.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&backend.fence))));
+    backend.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    REQUIRE(backend.event);
+    test::List control;
+    REQUIRE(control.Create(backend.device.Get()));
+    REQUIRE(SUCCEEDED(control.list->Close()));
+    REQUIRE(na::overlay::UnsubscribeExecute()); // the warm-up can still be submitting
+    PresentOrder order{na::eventlog::Frame()};
+    REQUIRE(na::overlay::SubscribeExecute(nullptr, &record_present_order, &order));
+    ID3D12CommandList* lists[]{control.list.Get()};
+    backend.queue->ExecuteCommandLists(1, lists);
+    CHECK(order.submissions.exchange(0) == 1);
+    const float color[]{0.25f, 0.5f, 0.75f, 1.0f};
+    context->ClearRenderTargetView(view.Get(), color); // intentionally leave it batched for Present
+    const HRESULT presented = chain->Present(0, 0);
+    for (unsigned i = 0; i < 100 && !order.submissions.load(); ++i) Sleep(1);
+    REQUIRE(na::overlay::UnsubscribeExecute());
+    CHECK(SUCCEEDED(presented));
+    std::printf("D3D11On12 submissions=%u assigned_to_next_frame=%u\n",
+                order.submissions.load(), order.wrong_frame.load());
+    CHECK(order.submissions.load() > 0);
+    CHECK(order.wrong_frame.load() == 0);
+    CHECK(na::eventlog::Frame() == order.frame + 1);
+    backend.WaitIdle();
+    return 0;
+}
+} // namespace
+
 int main(int argc,char** argv) {
     const bool menu_failure=argc>1 && !strcmp(argv[1],"--menu-failure");
     const bool cursor_cleanup=argc>1 && !strcmp(argv[1],"--cursor-cleanup");
@@ -22,7 +88,8 @@ int main(int argc,char** argv) {
     const bool create_failure=argc>1 && !strcmp(argv[1],"--menu-create-failure");
     const bool recovery=argc>1 && !strcmp(argv[1],"--recovery");
     const bool on12_ownership=argc>1 && !strcmp(argv[1],"--on12-ownership");
-    SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",L"1");
+    const bool on12_present_order=argc>1 && !strcmp(argv[1],"--on12-present-order");
+    SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",on12_present_order?L"0":L"1");
     wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
     const auto dir=std::filesystem::path(exe).parent_path();
     const auto suffix=std::to_wstring(GetCurrentProcessId());
@@ -35,12 +102,14 @@ int main(int argc,char** argv) {
     };
     set(L"host",L"enabled",L"1");set(L"host",L"startup_log",startup.c_str());
     set(L"route_a",L"enabled",L"1");set(L"overlay",L"enabled",L"1");
-    set(L"observe",L"producers",L"0");set(L"observe",L"early_install",L"1");
+    set(L"observe",L"producers",on12_present_order?L"1":L"0");set(L"observe",L"early_install",L"1");
     set(L"adapter",L"enabled",L"0");set(L"fsr",L"enabled",L"0");set(L"xess",L"enabled",L"0");
     set(L"unreal",L"probe",L"0");set(L"unreal",L"screen_percentage",L"0");
     set(L"settings",L"scope",scope.c_str());set(L"present",L"proxy",L"0");
     set(L"dlss",L"enabled",L"0");
-    if(on12_ownership)set(L"dx11on12",L"enabled",L"1");
+    if(on12_ownership || on12_present_order)set(L"dx11on12",L"enabled",L"1");
+    if(on12_present_order)set(L"dx11on12",L"keep_game_swapchain",L"1");
+    if(on12_present_order)set(L"j2",L"enabled",L"1");
     if(recovery){
         na::settings::SetIniPath(ini.c_str());na::settings::Load();
         const auto marker=std::wstring(na::settings::UserIniPath())+L".session";
@@ -66,6 +135,16 @@ int main(int argc,char** argv) {
     DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=320;desc.Height=180;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count=1;desc.BufferCount=2;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
     desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    if(on12_present_order){
+        for(unsigned i=0;i<400 && !na::host::GetStatus().init_complete;++i)Sleep(5);
+        REQUIRE(na::host::GetStatus().init_complete==1);
+        REQUIRE(native_on12_present_order(d.factory.Get(),window,desc)==0);
+        na::host::StopSessionForTests();
+        REQUIRE(na::overlay::Stop());
+        DestroyWindow(window);
+        DeleteFileW(ini.c_str());
+        return test::finish("overlay_bootstrap_test on12 present order");
+    }
     test::ComPtr<IDXGISwapChain1> chain;
     REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(),window,&desc,nullptr,nullptr,&chain)));
     // No Execute or transition has occurred: only early creation can supply it.

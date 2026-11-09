@@ -43,6 +43,10 @@ ID3D12CommandQueue* QueueForSwapchain(IDXGISwapChain* chain);
 // The D3D12 device behind this translated swap chain (AddRef'ed), or null.
 ID3D12Device* DeviceForSwapchain(IDXGISwapChain* chain);
 
+// Submit the translator's remaining CPU-side recording before closing a
+// frame for DLAA. This requests submission, with no GPU completion wait.
+void FlushPresentedWork(IDXGISwapChain* chain);
+
 // The menu draws through D3D12, but an 11on12 swap chain only hands out D3D11
 // textures. For one frame, hand the menu a D3D12 render target
 // (ID3D11On12Device2::UnwrapUnderlyingResource) and take it back with the fence

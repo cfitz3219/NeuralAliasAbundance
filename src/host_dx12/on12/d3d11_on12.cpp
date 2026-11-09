@@ -423,6 +423,14 @@ ID3D12Device* DeviceForSwapchain(IDXGISwapChain* chain)
     return nullptr;
 }
 
+void FlushPresentedWork(IDXGISwapChain* chain)
+{
+    const auto device = swapchain_device(chain);
+    ComPtr<ID3D11DeviceContext> context;
+    if (device) device->GetImmediateContext(&context);
+    if (context) context->Flush();
+}
+
 namespace {
 struct Token {
     ComPtr<ID3D11On12Device2> device;

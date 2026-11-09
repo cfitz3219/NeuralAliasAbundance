@@ -146,6 +146,8 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
 na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
 na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32 d3d11)
 add_test(NAME host_on12_bootstrap_ownership_test COMMAND overlay_bootstrap_test --on12-ownership)
+add_test(NAME host_on12_present_order_test COMMAND overlay_bootstrap_test --on12-present-order)
+set_tests_properties(host_on12_present_order_test PROPERTIES TIMEOUT 30 LABELS "host;gpu")
 set_tests_properties(host_on12_bootstrap_ownership_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(overlay_input_handover_test SOURCES overlay_input_handover_test.cpp LIBS host_dx12)
 na_host_test(overlay_boundary_fallback_test SOURCES overlay_boundary_fallback_test.cpp)
