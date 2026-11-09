@@ -653,7 +653,9 @@ constexpr uint32_t kCostSampleMask = 15;
 constexpr bool cost_sampled(uint32_t s)
 {
     return s == kCostDescCopy || s == kCostDescCopyWait || s == kCostDescWrite || s == kCostDescWriteWait ||
-           s == kCostDriver || s == kCostRootTable || s == kCostEmit;
+           s == kCostDriver || s == kCostRootTable || s == kCostEmit ||
+           // WWII p31660: ~9,000 draws per frame, each opening up to five of these nested per-draw scopes.
+           s == kCostVpj || s == kCostShaderUse || s == kCostUseLookup || s == kCostUseWalk || s == kCostUseCallback;
 }
 inline uint64_t cost_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
 void cost_flush()
@@ -689,11 +691,21 @@ struct CostScope {
         slot = kCostSlots;
     }
     // Account what ran so far to this scope's slot and continue under another one.
+    // A sampled target is counted on every call and timed only when this scope was timed, so a
+    // sampled chain (lookup -> walk) times whole calls and the report's calls/timed scaling holds.
     void Switch(uint32_t s)
     {
         const bool on = slot < kCostSlots;
         Close();
-        if (on && s < kCostSlots) { slot = s; t0 = cost_now(); }
+        if (s >= kCostSlots || !g_cost_enabled.load(std::memory_order_relaxed)) return;
+        if (cost_sampled(s)) {
+            ++t_cost_calls[s];
+            if (!on) return;
+            counted = true;
+        } else if (!on) {
+            return;
+        }
+        slot = s; t0 = cost_now();
     }
     ~CostScope() { Close(); }
     CostScope(const CostScope&) = delete;
@@ -1148,18 +1160,30 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
     // The id returned here is the resource's registry id; the game holds the resource across this
     // call, so it cannot retire before the publish below (WWII: ~1 M view writes/s on the bridge's
     // single thread; the second canonical lookup under the lock was pure repetition).
-    const na_object_id pre = resource && kind != NA_DESC_SAMPLER ? ensure_resource_registered(static_cast<ID3D12Resource*>(resource)) : 0;
-    {
+    // 2026-11-09: the known-resource case (every view after the first) resolves the id under the same
+    // shared registry lock that publishes the slot: one lock acquisition per write instead of two.
+    // Only a resource not yet registered leaves the lock, registers (outside it, as before) and retries,
+    // so the registration still precedes the publish.
+    const bool registrable = resource && kind != NA_DESC_SAMPLER;
+    na_object_id pre = 0;
+    bool registered = false;
+    for (;;) {
         const CostScope cost(kCostDescWrite);
         std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
         { const CostScope wait(kCostDescWriteWait); lock.lock(); }
+        const na_object_id rid = pre ? pre : resource ? id_locked(resource) : 0;
+        if (registrable && !rid && !registered && !t_host_work) {
+            lock.unlock();
+            pre = ensure_resource_registered(static_cast<ID3D12Resource*>(resource));
+            registered = true; // at most one retry; a failed registration publishes as unknown, as before
+            continue;
+        }
         uint32_t slot = 0;
         DescHeap* h = heap_for_cpu_locked(dst.ptr, &slot);
         if (!h) {
             g_c.unresolved.fetch_add(1);
             return;
         }
-        const na_object_id rid=pre?pre:resource?id_locked(resource):0;
         // The registry lock retains the heap/resource identity; only this slot's
         // stripe is exclusive. Publish compact metadata and replay details together.
         std::unique_lock<std::shared_mutex> stripe(h->stripes[slot >> kStripeShift], std::defer_lock);
@@ -1179,6 +1203,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             view->kind=kind;view->resource=e.resource;
             h->info[slot].details=std::move(view);
         }
+        break;
     }
     e.descriptor_kind = kind;
     e.format = format;
