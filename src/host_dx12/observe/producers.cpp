@@ -455,6 +455,38 @@ bool cpu_visible_heap(const D3D12_HEAP_PROPERTIES& p)
 }
 std::unordered_map<na_object_id, BufferInfo> g_buffers; // under g_m
 std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> canonical object (C9b), under g_m
+// 2D textures by (width, height), kept beside g_res_keys under g_m so FindTextures is a
+// bucket lookup. Before this (p49040, WWII 11on12) the lookup walked every resource and ran
+// three to four times per DLAA evaluation on the translator thread: ~18 ms of each frame.
+std::unordered_map<uint64_t, std::vector<na_object_id>> g_tex2d_by_dims;
+std::unordered_map<na_object_id, uint64_t> g_tex2d_dims; // id -> its key, for retirement
+inline uint64_t tex2d_key(uint64_t w, uint32_t h) { return (w << 32) | h; }
+void tex2d_index_add_locked(na_object_id id, const D3D12_RESOURCE_DESC& d)
+{
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    const uint64_t key = tex2d_key(d.Width, d.Height);
+    const auto prev = g_tex2d_dims.find(id);
+    if (prev != g_tex2d_dims.end()) {
+        if (prev->second == key) return; // re-registered with the same description
+        auto& v = g_tex2d_by_dims[prev->second];
+        v.erase(std::remove(v.begin(), v.end(), id), v.end());
+        if (v.empty()) g_tex2d_by_dims.erase(prev->second);
+    }
+    g_tex2d_dims[id] = key;
+    g_tex2d_by_dims[key].push_back(id);
+}
+void tex2d_index_erase_locked(na_object_id id)
+{
+    const auto it = g_tex2d_dims.find(id);
+    if (it == g_tex2d_dims.end()) return;
+    const auto b = g_tex2d_by_dims.find(it->second);
+    if (b != g_tex2d_by_dims.end()) {
+        auto& v = b->second;
+        v.erase(std::remove(v.begin(), v.end(), id), v.end());
+        if (v.empty()) g_tex2d_by_dims.erase(b);
+    }
+    g_tex2d_dims.erase(it);
+}
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
@@ -814,6 +846,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         }
         g_buffers.erase(id);
         g_res_keys.erase(id);
+        tex2d_index_erase_locked(id);
     }
     ReleaseLater(std::move(drop));
     if (kind == NA_OBJ_RESOURCE) known_forget(id);
@@ -1009,6 +1042,7 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
     {
         std::unique_lock<RegistryLock> lock(g_m);
         g_res_keys[id] = canon(obj);
+        tex2d_index_add_locked(id, d);
     }
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         std::unique_lock<RegistryLock> lock(g_m);
@@ -1077,6 +1111,7 @@ na_object_id ensure_resource_registered(ID3D12Resource* res)
     {
         std::unique_lock<RegistryLock> lock(g_m);
         g_res_keys[id] = canon(res);
+        tex2d_index_add_locked(id, d);
         if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             BufferInfo& bi = g_buffers[id];
             bi.heap_type = e.heap_type;
@@ -8604,20 +8639,22 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
     out = std::move(next); return true;
 }
 // Read-only: 2D textures whose recorded creation has one of `formats` and exactly w x h
-// (Claude 2026-11-06, Cort's OK: J2 captures a game velocity candidate). Walks every known
-// resource under the shared lock; call rarely (capture time), never per draw.
+// (Claude 2026-11-06, Cort's OK: J2 captures a game velocity candidate). One bucket of the
+// (w, h) index under the shared lock, so it is cheap enough for every DLAA evaluation.
 uint32_t FindTextures(const uint32_t* formats, uint32_t format_count, uint32_t w, uint32_t h, na_object_id* out, uint32_t max)
 {
     if (!formats || !format_count || !out || !max) return 0;
     std::shared_lock<RegistryLock> lock(g_m);
+    const auto b = g_tex2d_by_dims.find(tex2d_key(w, h));
+    if (b == g_tex2d_by_dims.end()) return 0;
     uint32_t n = 0;
-    for (const auto& kv : g_res_keys) {
+    for (const na_object_id id : b->second) {
         uint32_t rw = 0, rh = 0, rf = 0;
-        if (!resource_dims_locked(kv.first, &rw, &rh, &rf) || rw != w || rh != h) continue;
+        if (!resource_dims_locked(id, &rw, &rh, &rf) || rw != w || rh != h) continue;
         bool match = false;
         for (uint32_t i = 0; i < format_count && !match; ++i) match = formats[i] == rf;
         if (!match) continue;
-        out[n++] = kv.first;
+        out[n++] = id;
         if (n == max) break;
     }
     return n;

@@ -277,6 +277,14 @@ Output Feed::Record(ID3D12GraphicsCommandList* list, uint32_t slot, const Candid
     Output out{};
     if (!list || !pso_score_ || slot >= slots_ || !color || rw < 4 || rh < 4) return out;
     collect(slot);
+    if (count == 0) {
+        // Nothing to score: free the seats (so a texture found later starts fresh) and stop
+        // before any texture or descriptor work (WWII p49040: every evaluation came here).
+        std::lock_guard<std::mutex> lock(g_stats_m);
+        for (uint32_t c = 0; c < kCandidates; ++c)
+            if (current_id_[c]) { decider_.ResetCandidate(c); current_id_[c] = 0; ++stats_.candidate_changes; }
+        return out;
+    }
     if (count > kCandidates) count = kCandidates;
     // Stable seats: a texture keeps its seat while it is found; a new one takes a free seat.
     uint64_t next[kCandidates]{};
