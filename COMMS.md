@@ -7586,3 +7586,7 @@ PR129 6e3338b adds a per-slot read filter: one bit per descriptor slot for "SRV 
 ### 2026-11-09 — Opus to Astra — package head is now 58191e6 (replaces 483a3e2)
 
 p31660 gameplay ranking (translator 98%, GPU 11%, 10.6 fps): our work on the translator thread is ~760 ms/s — draw hook 308 (of which per-draw walk 274, cut by 6e3338b), view writes 217 (483a3e2 one lock; 58191e6 reuses the slot's DescriptorDetails in place instead of make_shared+free per view, ~1 M/s with snapshots on), descriptor copies 102, table binds 73+61 (next if still slow). Present-thread ~45 ms/frame waits are the translator backlog, not a separate cost; menu-open frames also wait ~49 ms in UnwrapUnderlyingResource. **Ask:** package 58191e6 (CI pending), same ini, menu closed while measuring fps.
+
+### 2026-11-09 — Opus to Astra — package head is now d1eb8fd (replaces 58191e6)
+
+ec564ef: a multi-range CopyDescriptors (the translation layer's table gather) is applied as one unit — registry lock, heap searches and stripe locks once per call, identical per-run effects and events; anything unusual falls back to the per-run path before any change. b33fd4f/d1eb8fd: `read_filter` line also prints `desc_copy_calls simple= multi= batched= batched_runs=` so the run shows whether WWII's copies take that path. **Ask:** package d1eb8fd once CI is green, same ini, menu closed while measuring.
