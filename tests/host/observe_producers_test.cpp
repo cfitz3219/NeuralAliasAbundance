@@ -18,12 +18,19 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
 std::mutex g_m;
 std::vector<std::vector<uint8_t>> g_events;
 std::atomic<unsigned> g_invalid_reports{0};
+HANDLE g_drain_entered = nullptr, g_drain_resume = nullptr;
+void PauseDeferredApply()
+{
+    SetEvent(g_drain_entered);
+    WaitForSingleObject(g_drain_resume, 5000);
+}
 struct ObserveSession {
     bool running = false;
     ~ObserveSession() { if (running) na_observe_stop(); }
@@ -393,6 +400,31 @@ int main()
         dev->CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc},
                                    D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc}, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fb))));
+        // A detached batch is still pending until it is applied. A second registry
+        // reader must not pass the drain and observe the old descriptor metadata.
+        g_drain_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_drain_resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE reader_started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE reader_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        REQUIRE(g_drain_entered && g_drain_resume && reader_started && reader_done);
+        na::observe::SetDeferredApplyProbeForTests(&PauseDeferredApply);
+        dev->CreateShaderResourceView(rt.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc});
+        std::thread drainer([&] { na::observe::IdOf(rt.Get()); });
+        const DWORD entered = WaitForSingleObject(g_drain_entered, 5000);
+        CHECK(entered == WAIT_OBJECT_0);
+        std::thread reader([&] {
+            SetEvent(reader_started);
+            na::observe::IdOf(rt.Get());
+            SetEvent(reader_done);
+        });
+        CHECK(WaitForSingleObject(reader_started, 5000) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(reader_done, 100) == WAIT_TIMEOUT);
+        SetEvent(g_drain_resume);
+        drainer.join(); reader.join();
+        na::observe::SetDeferredApplyProbeForTests(nullptr);
+        CHECK(WaitForSingleObject(reader_done, 0) == WAIT_OBJECT_0);
+        CloseHandle(g_drain_entered); CloseHandle(g_drain_resume);
+        CloseHandle(reader_started); CloseHandle(reader_done);
         na_observe_status status{};
         status.size_bytes = sizeof(status);
         REQUIRE(na_observe_query_status(&status) == NA_OK);
@@ -401,7 +433,7 @@ int main()
         const auto after = na::observe::GetProducerStats();
         CHECK(CountKind(NA_EV_DESCRIPTOR_WRITE) == 0);
         CHECK(CountKind(NA_EV_DESCRIPTOR_COPY) == 0);
-        CHECK(after.descriptor_writes == before.descriptor_writes + 3); // bookkeeping still runs (the queued write was applied)
+        CHECK(after.descriptor_writes == before.descriptor_writes + 4); // both queued writes were applied
         CHECK(after.descriptor_copies == before.descriptor_copies + 1);
         uint32_t seq_a = 0, seq_b = 0;
         const na_object_id fa_id = na::observe::IdOf(fa.Get()), fb_id = na::observe::IdOf(fb.Get());
