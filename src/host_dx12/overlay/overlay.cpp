@@ -1399,6 +1399,9 @@ void write_status_line()
                 (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
                 (unsigned long long)rj[8], j2.inline_frame_rejects);
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
+            char icl[300];
+            const int nic = na::j2::FormatInlineCost(icl, sizeof icl);
+            if (nic > 0) WriteFile(f, icl, static_cast<DWORD>((std::min)(nic, static_cast<int>(sizeof icl - 1))), &written, nullptr);
             char al[900];
             const int na2 = snprintf(al, sizeof al,
                 "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu earlier=%llu late=%llu} note=\"%s\"\r\n",
