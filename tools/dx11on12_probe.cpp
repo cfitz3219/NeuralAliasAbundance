@@ -20,6 +20,7 @@
 // same run under (a) native D3D11, (b) the bridge with [observe] producers=0
 // and (c) producers=1 profile_hooks=1 measures what the observers cost on the
 // translation thread (CoD WWII 2026-11-09: that thread capped the game at 30 fps).
+// Add "hdr" for the campaign's 3440x1440 FP16 output format.
 // Exit 0 = device wrapped and alive, 1 = not wrapped or removed.
 #include <windows.h>
 #include <d3d11.h>
@@ -41,11 +42,11 @@ using Microsoft::WRL::ComPtr;
 // The campaign creates textures with initial data on a loader thread while
 // the backend thread presents. Exercise that overlap as well as frame uploads.
 struct TextureLoader {
-    void Start(ID3D11Device* device, D3D11_TEXTURE2D_DESC desc)
+    void Start(ID3D11Device* device, D3D11_TEXTURE2D_DESC desc, UINT pixel_bytes)
     {
-        thread = std::thread([this, device, desc] {
-            std::array<unsigned, 256 * 256> data{};
-            const D3D11_SUBRESOURCE_DATA initial{data.data(), 256 * sizeof(unsigned), 0};
+        thread = std::thread([this, device, desc, pixel_bytes] {
+            std::array<uint64_t, 256 * 256> data{};
+            const D3D11_SUBRESOURCE_DATA initial{data.data(), 256 * pixel_bytes, 0};
             while (!stop.load(std::memory_order_relaxed)) {
                 ComPtr<ID3D11Texture2D> texture;
                 result = device->CreateTexture2D(&desc, &initial, &texture);
@@ -74,7 +75,7 @@ int main(int argc, char** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const int frames = argc > 1 ? std::atoi(argv[1]) : 300;
-    bool press_home = false, draw_scene = false, stream = false;
+    bool press_home = false, draw_scene = false, stream = false, hdr = false;
     int load_draws = 0, load_textures = 64;
     for (int arg = 2; arg < argc; ++arg) {
         press_home |= std::strcmp(argv[arg], "menu") == 0;
@@ -82,7 +83,12 @@ int main(int argc, char** argv)
         stream |= std::strcmp(argv[arg], "stream") == 0;
         if (std::strncmp(argv[arg], "load=", 5) == 0) load_draws = std::atoi(argv[arg] + 5);
         if (std::strncmp(argv[arg], "textures=", 9) == 0) load_textures = std::atoi(argv[arg] + 9);
+        hdr |= std::strcmp(argv[arg], "hdr") == 0;
     }
+    const UINT width = hdr ? 3440 : 1280;
+    const UINT height = hdr ? 1440 : 720;
+    const UINT pixel_bytes = hdr ? 8 : 4;
+    const DXGI_FORMAT format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     ComPtr<IDXGIFactory1> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory)); // waits for the host install, like a game's adapter scan
     std::printf("factory hr=0x%08lX\n", static_cast<unsigned long>(hr));
@@ -95,7 +101,7 @@ int main(int argc, char** argv)
                                100, 100, 1280, 720, nullptr, nullptr, wc.hInstance, nullptr);
     DXGI_SWAP_CHAIN_DESC d{};
     d.BufferCount = 2;
-    d.BufferDesc.Width = 1280; d.BufferDesc.Height = 720; d.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.BufferDesc.Width = width; d.BufferDesc.Height = height; d.BufferDesc.Format = format;
     d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     d.OutputWindow = wnd; d.SampleDesc.Count = 1; d.Windowed = TRUE;
     // The pixel check reads a buffer after Present, so its contents must be preserved.
@@ -126,7 +132,7 @@ int main(int argc, char** argv)
     dev->CreateRenderTargetView(back.Get(), nullptr, &rtv);
     // A small scene with depth so discovery has something to look at.
     D3D11_TEXTURE2D_DESC td{};
-    td.Width = 1280; td.Height = 720; td.MipLevels = 1; td.ArraySize = 1; td.SampleDesc.Count = 1;
+    td.Width = width; td.Height = height; td.MipLevels = 1; td.ArraySize = 1; td.SampleDesc.Count = 1;
     td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     ComPtr<ID3D11Texture2D> depth;
     ComPtr<ID3D11DepthStencilView> dsv;
@@ -201,14 +207,14 @@ float4 ps_load(float4 p : SV_Position) : SV_Target {
     }
     ComPtr<IDXGISwapChain3> sc3;
     ComPtr<ID3D11Texture2D> uploads[4], readback;
-    std::array<unsigned, 256 * 256> pixels{};
+    std::array<uint64_t, 256 * 256> pixels{};
     TextureLoader loader;
     if (stream) {
         if (frames < 8 || press_home || !on12 || FAILED(sc.As(&sc3)) || !back || !rtv) return 2;
         D3D11_TEXTURE2D_DESC upload{};
         upload.Width = upload.Height = 256;
         upload.MipLevels = upload.ArraySize = upload.SampleDesc.Count = 1;
-        upload.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        upload.Format = format;
         for (auto& tex : uploads) {
             if (FAILED(dev->CreateTexture2D(&upload, nullptr, &tex))) return 2;
         }
@@ -217,7 +223,7 @@ float4 ps_load(float4 p : SV_Position) : SV_Target {
         upload.Usage = D3D11_USAGE_STAGING;
         upload.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(dev->CreateTexture2D(&upload, nullptr, &readback))) return 2;
-        loader.Start(dev.Get(), streamed);
+        loader.Start(dev.Get(), streamed, pixel_bytes);
     }
     int presented = 0, checked = 0;
     LARGE_INTEGER qpf{}, load_begin{}, load_end{};
@@ -234,7 +240,7 @@ float4 ps_load(float4 p : SV_Position) : SV_Target {
             ctx->OMSetRenderTargets(0, nullptr, nullptr);
             back.Reset();
             if (!draw_scene) rtv.Reset();
-            hr = sc->ResizeBuffers(3, 1280, 720, DXGI_FORMAT_UNKNOWN, 0);
+            hr = sc->ResizeBuffers(3, width, height, DXGI_FORMAT_UNKNOWN, 0);
             std::printf("resize hr=0x%08lX\n", static_cast<unsigned long>(hr));
             if (FAILED(hr) || FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&back))) ||
                 (!draw_scene && FAILED(dev->CreateRenderTargetView(back.Get(), nullptr, &rtv)))) return 2;
@@ -252,7 +258,7 @@ float4 ps_load(float4 p : SV_Position) : SV_Target {
         ctx->ClearRenderTargetView(rtv.Get(), c);
         if (dsv) ctx->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 1.f, 0);
         if (draw_scene) {
-            const D3D11_VIEWPORT vp{0, 0, 1280, 720, 0, 1};
+            const D3D11_VIEWPORT vp{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
             ctx->RSSetViewports(1, &vp);
             ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx->VSSetShader(vs.Get(), nullptr, 0);
@@ -287,13 +293,15 @@ float4 ps_load(float4 p : SV_Position) : SV_Target {
             ctx->OMSetRenderTargets(0, nullptr, nullptr);
             ctx->CopyResource(back.Get(), scene.Get());
         }
-        const unsigned expected = 0xff000000u | (static_cast<unsigned>(i) * 675929u & 0xffffffu);
+        const uint64_t expected = hdr ? (0x3c00380034003000ull | (static_cast<unsigned>(i) & 0x3ffu))
+                                      : (0xff000000u | (static_cast<unsigned>(i) * 675929u & 0xffffffu));
         ComPtr<ID3D12Resource> actual;
         if (stream) {
             ctx->OMSetRenderTargets(0, nullptr, nullptr);
             for (unsigned n = 0; n < 4; ++n) {
-                pixels.fill(expected ^ n);
-                ctx->UpdateSubresource(uploads[n].Get(), 0, nullptr, pixels.data(), 256 * sizeof(unsigned), 0);
+                const uint64_t stamp = expected ^ n;
+                pixels.fill(hdr ? stamp : (stamp << 32) | stamp);
+                ctx->UpdateSubresource(uploads[n].Get(), 0, nullptr, pixels.data(), 256 * pixel_bytes, 0);
                 const D3D11_BOX box{0, 0, 0, 16, 16, 1};
                 ctx->CopySubresourceRegion(back.Get(), 0, 100 + 16 * n, 100, 0, uploads[n].Get(), 0, &box);
             }
@@ -313,10 +321,11 @@ float4 ps_load(float4 p : SV_Position) : SV_Target {
             on12->ReleaseWrappedResources(&wrapped_image, 1);
             D3D11_MAPPED_SUBRESOURCE mapped{};
             if (FAILED(ctx->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 2;
-            unsigned received = 0;
-            std::memcpy(&received, mapped.pData, sizeof(received));
+            uint64_t received = 0;
+            std::memcpy(&received, mapped.pData, pixel_bytes);
             ctx->Unmap(readback.Get(), 0);
-            std::printf("frame=%d copied_pixel=0x%08X expected=0x%08X\n", i, received, expected);
+            std::printf("frame=%d copied_pixel=0x%016llX expected=0x%016llX\n", i,
+                        static_cast<unsigned long long>(received), static_cast<unsigned long long>(expected));
             if (received != expected) return 2;
             ++checked;
         }
