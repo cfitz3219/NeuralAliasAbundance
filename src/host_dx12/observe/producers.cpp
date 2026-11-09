@@ -1288,6 +1288,12 @@ std::atomic<DeferredQueue*> g_dw_queues[kDeferredQueues]{};
 std::atomic<uint32_t> g_dw_queue_n{0};
 std::atomic<uint32_t> g_dw_pending{0}; // queues holding at least one write (the drain's fast "nothing to do")
 std::atomic<uint64_t> g_deferred_writes{0}, g_deferred_flushes{0};
+std::atomic<void (*)()> g_deferred_apply_probe{nullptr};
+std::mutex& deferred_drain_mutex()
+{
+    static auto* m = new std::mutex(); // registry also remains usable during process exit
+    return *m;
+}
 thread_local DeferredQueue* t_dwq = nullptr;
 inline void dwq_lock(DeferredQueue& q) { while (q.busy.exchange(true, std::memory_order_acquire)) YieldProcessor(); }
 inline void dwq_unlock(DeferredQueue& q) { q.busy.store(false, std::memory_order_release); }
@@ -1338,6 +1344,9 @@ void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
 void flush_deferred_writes()
 {
     if (!g_dw_pending.load(std::memory_order_acquire)) return;
+    // Keep detached batches visible to every reader, and preserve application order
+    // when another thread drains a newer batch from the same queue.
+    std::lock_guard<std::mutex> drain(deferred_drain_mutex());
     const uint32_t nq = std::min<uint32_t>(g_dw_queue_n.load(std::memory_order_acquire), kDeferredQueues);
     for (uint32_t qi = 0; qi < nq; ++qi) {
         DeferredQueue* q = g_dw_queues[qi].load(std::memory_order_acquire);
@@ -1349,8 +1358,9 @@ void flush_deferred_writes()
         q->n.store(0, std::memory_order_relaxed);
         dwq_unlock(*q);
         if (!n) continue;
-        g_dw_pending.fetch_sub(1, std::memory_order_acq_rel);
+        if (auto probe = g_deferred_apply_probe.load(std::memory_order_acquire)) probe();
         apply_deferred_writes(w, n);
+        g_dw_pending.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
 bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, uint32_t format, uint32_t first_sub)
@@ -9193,6 +9203,7 @@ uint64_t LiveSelectionVersion()
 }
 
 void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
+void SetDeferredApplyProbeForTests(void (*probe)()) { g_deferred_apply_probe.store(probe, std::memory_order_release); }
 void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }
 void SetSampleWorkerStartFailsForTests(bool fail) { g_fail_worker_start.store(fail); }
 void SetSampleSignalFailsForTests(bool fail) { g_fail_sample_signal.store(fail); }

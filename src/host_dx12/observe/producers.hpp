@@ -113,6 +113,8 @@ void SetUnmapBoundaryProbeForTests(void (*probe)(void* user), void* user);
 // stops the sample worker's maintenance ticks so scope checks at each
 // operation are exercised without the worker masking the window.
 void SetSampleAcquireProbeForTests(void (*probe)());
+// Pauses a detached descriptor batch before publication, for cross-thread ordering tests.
+void SetDeferredApplyProbeForTests(void (*probe)());
 void SetSampleWorkerPausedForTests(bool paused);
 // Tests: the sample worker thread fails to start (requests must be refused).
 void SetSampleWorkerStartFailsForTests(bool fail);
