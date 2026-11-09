@@ -89,6 +89,10 @@ struct ListState {
     const void* rs_key[2] = {nullptr, nullptr};
     const void* rs_obj[2] = {nullptr, nullptr};
     uint64_t rs_gen[2] = {0, 0};
+    // The bound pipeline's registry entry, reused the same way (pso_obj_locked; under g_m + bind_m).
+    const void* pso_key = nullptr;
+    const void* pso_obj = nullptr;
+    uint64_t pso_gen = 0;
     uint64_t root_serial[2]{},host_restore_serial=0;
     // C9b: explicit transitions recorded in this recording, in order (under bind_m).
     struct StateNote {
@@ -917,7 +921,10 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
         std::unique_lock<RegistryLock> lock(g_m);
         Obj& o = g_objs[key];
         ++g_operation_revision;
-        if (o.id) g_c.live.fetch_sub(1); // address reused without a retirement we saw
+        if (o.id) {
+            g_c.live.fetch_sub(1); // address reused without a retirement we saw
+            g_retire_gen.fetch_add(1, std::memory_order_acq_rel); // cached entries (lists, pipelines, signatures) of the old object
+        }
         drop = take_parcel(o);
         o = fresh_obj(id, kind);
     }
@@ -944,7 +951,7 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
         if (it != g_objs.end() && it->second.kind == kind) return it->second.id;
         id = g_next_id.fetch_add(1);
         ++g_operation_revision;
-        if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = take_parcel(it->second); }
+        if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = take_parcel(it->second); g_retire_gen.fetch_add(1, std::memory_order_acq_rel); }
         g_objs[key] = fresh_obj(id, kind);
     }
     ReleaseLater(std::move(drop));
@@ -1278,7 +1285,10 @@ inline void idc_put(const void* p, na_object_id id)
     t_idc.id[i] = id;
 }
 constexpr uint32_t kDeferredWrites = 64, kDeferredQueues = 256;
-struct DeferredWrite { uint64_t ptr; na_object_id resource; uint32_t kind, format, first_sub; };
+// CBV entries carry the buffer address and size instead of a resource id: the address is resolved
+// when the batch is applied (under the shared g_m, which no retirement can hold at the same time,
+// and every retirement drains the queues first, so it resolves exactly as it would have at the write).
+struct DeferredWrite { uint64_t ptr; na_object_id resource; uint32_t kind, format, first_sub; uint32_t cbv_size; uint64_t cbv_va; };
 struct DeferredQueue {
     std::atomic<bool> busy{false}; // spin lock: the owner appends, any thread drains
     std::atomic<uint32_t> n{0};
@@ -1287,7 +1297,7 @@ struct DeferredQueue {
 std::atomic<DeferredQueue*> g_dw_queues[kDeferredQueues]{};
 std::atomic<uint32_t> g_dw_queue_n{0};
 std::atomic<uint32_t> g_dw_pending{0}; // queues holding at least one write (the drain's fast "nothing to do")
-std::atomic<uint64_t> g_deferred_writes{0}, g_deferred_flushes{0};
+std::atomic<uint64_t> g_deferred_writes{0}, g_deferred_flushes{0}, g_deferred_cbvs{0};
 std::atomic<void (*)()> g_deferred_apply_probe{nullptr};
 std::mutex& deferred_drain_mutex()
 {
@@ -1313,7 +1323,7 @@ void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
     std::shared_lock<na::observe::ReaderSlotsLock> lock(static_cast<na::observe::ReaderSlotsLock&>(g_m), std::defer_lock);
     { const CostScope wait(kCostDescWriteWait); lock.lock(); }
     DescHeap* cur_h = nullptr;
-    uint32_t cur_stripe = ~0u, unresolved = 0;
+    uint32_t cur_stripe = ~0u, unresolved = 0, cbvs = 0;
     std::shared_mutex* held = nullptr;
     for (uint32_t i = 0; i < n; ++i) {
         uint32_t slot = 0;
@@ -1328,8 +1338,18 @@ void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
         }
         ++h->versions[slot];
         std::shared_ptr<const DescriptorDetails> prev = std::move(h->info[slot].details); // no snapshot: dropped, as the immediate path
-        h->info[slot] = DescHeap::SlotInfo{w[i].kind, w[i].resource, w[i].format, w[i].first_sub, 0, 0};
-        set_hot_bit(h, slot, w[i].kind == NA_DESC_SRV && hot_id_locked(w[i].resource));
+        if (w[i].kind == NA_DESC_CBV) {
+            na_object_id res = 0;
+            uint64_t off = 0;
+            const bool known = w[i].cbv_va && resolve_va_locked(w[i].cbv_va, &res, &off);
+            h->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, w[i].cbv_va ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
+                                               known ? off : 0, w[i].cbv_size};
+            set_hot_bit(h, slot, false);
+            ++cbvs;
+        } else {
+            h->info[slot] = DescHeap::SlotInfo{w[i].kind, w[i].resource, w[i].format, w[i].first_sub, 0, 0};
+            set_hot_bit(h, slot, w[i].kind == NA_DESC_SRV && hot_id_locked(w[i].resource));
+        }
     }
     if (held) held->unlock();
     // After the writes: a reader that took the revision before this and walked a slot before its
@@ -1338,6 +1358,7 @@ void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
     g_c.writes.fetch_add(n);
     if (unresolved) g_c.unresolved.fetch_add(unresolved);
     g_deferred_writes.fetch_add(n, std::memory_order_relaxed);
+    if (cbvs) g_deferred_cbvs.fetch_add(cbvs, std::memory_order_relaxed);
     g_deferred_flushes.fetch_add(1, std::memory_order_relaxed);
 }
 // Drains every thread's queue. Called before any registry lock (RegistryLock); takes the base lock itself.
@@ -1363,7 +1384,8 @@ void flush_deferred_writes()
         g_dw_pending.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
-bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, uint32_t format, uint32_t first_sub)
+bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, uint32_t format, uint32_t first_sub,
+                            uint64_t cbv_va = 0, uint32_t cbv_size = 0)
 {
     DeferredQueue* q = my_deferred_queue();
     if (!q) return false;
@@ -1374,7 +1396,7 @@ bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, 
         dwq_lock(*q);
     }
     const uint32_t n = q->n.load(std::memory_order_relaxed);
-    q->w[n] = DeferredWrite{ptr, resource, kind, format, first_sub};
+    q->w[n] = DeferredWrite{ptr, resource, kind, format, first_sub, cbv_size, cbv_va};
     q->n.store(n + 1, std::memory_order_relaxed);
     if (n == 0) g_dw_pending.fetch_add(1, std::memory_order_release);
     dwq_unlock(*q);
@@ -1614,21 +1636,31 @@ bool note_descriptor_copies_batch(const uint64_t* dst, const uint64_t* src, cons
             const CostScope wait(kCostDescCopyWait);
             for (uint32_t i = 0; i < nw; ++i) { if (want[i].ex) want[i].m->lock(); else want[i].m->lock_shared(); }
         }
+        // Events: the kind is skipped in ordinary play, so the per-run header work is checked once.
+        const bool events = !na::observe_internal::KindSkipped(NA_EV_DESCRIPTOR_COPY);
+        const bool any_hot_ids = g_hot_n != 0; // under g_m: no SRV can be hot without an id
         for (uint32_t r = 0; r < n; ++r) {
             const Run& x = runs[r];
-            want_ev[r] = init_header_wanted(ev[r], NA_EV_DESCRIPTOR_COPY, 0);
-            ++g_operation_revision;
+            DescHeap::SlotInfo* d = &x.dh->info[x.ds];
+            const DescHeap::SlotInfo* sinfo = &x.sh->info[x.ss];
+            uint64_t* ver = &x.dh->versions[x.ds];
             for (uint32_t i = 0; i < cnt[r]; ++i) {
-                ++x.dh->versions[x.ds + i];
-                x.dh->info[x.ds + i] = x.sh->info[x.ss + i];
-                set_hot_bit(x.dh, x.ds + i, x.dh->info[x.ds + i].kind == NA_DESC_SRV && hot_id_locked(x.dh->info[x.ds + i].resource));
+                ++ver[i];
+                d[i] = sinfo[i];
+                set_hot_bit(x.dh, x.ds + i, any_hot_ids && d[i].kind == NA_DESC_SRV && hot_id_locked(d[i].resource));
             }
+            want_ev[r] = events && init_header_wanted(ev[r], NA_EV_DESCRIPTOR_COPY, 0);
+            if (!want_ev[r]) continue;
             ev[r].src_heap = x.sh->id;
             ev[r].dst_heap = x.dh->id;
             ev[r].src_slot = x.ss;
             ev[r].dst_slot = x.ds;
             ev[r].slot_count = cnt[r];
         }
+        // One revision step for the whole call, after its writes and before any stripe is released:
+        // a reader that read the revision earlier is invalidated, one that reads it now waits on a
+        // stripe and then sees every write (the per-run steps gave readers nothing more).
+        ++g_operation_revision;
         for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
     }
     g_c.copies.fetch_add(n);
@@ -1864,6 +1896,12 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     // what H1 promises. Unresolved / ambiguous ranges are UNKNOWN, never guessed.
     na_ev_descriptor_write e;
     const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    // p22748 (2026-11-09): CBV writes are nearly all of the bridge's view writes (one per constant
+    // buffer bind per draw) and none took the deferred path. Queue them like other views: same slot
+    // record, the address resolved when the batch is applied.
+    if (!want && !view && !t_host_work &&
+        defer_descriptor_write(h.ptr, 0, NA_DESC_CBV, NA_UNKNOWN_U32, 0, desc ? desc->BufferLocation : 0, desc ? desc->SizeInBytes : 0))
+        return;
     {
         const CostScope cost(kCostDescWrite);
         std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
@@ -3512,12 +3550,43 @@ struct Rec {
     uint32_t flags = 0;
 };
 
+// Per-thread cache of the last few lists (WWII: every hook of every translated draw looked its list
+// up in g_objs, ~1 M entries under D3D11On12, three to four times per draw). Keyed by the caller's
+// pointer; valid while no object retired or was replaced (g_retire_gen, bumped under the exclusive
+// g_m whenever an entry is erased or replaced), and the caller holds the shared g_m, so the entry
+// cannot go away while it is used.
+struct ListCacheEntry { const void* key = nullptr; ListState* ls = nullptr; na_object_id id = 0; };
+constexpr uint32_t kListCache = 4;
+thread_local ListCacheEntry t_list_cache[kListCache];
+thread_local uint64_t t_list_cache_gen = 0;
+thread_local uint32_t t_list_cache_next = 0;
 ListState* list_state_locked(const void* l, na_object_id* id)
 {
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (gen != t_list_cache_gen) { for (auto& e : t_list_cache) e = {}; t_list_cache_gen = gen; }
+    if (l) for (const auto& e : t_list_cache) if (e.key == l) { *id = e.id; return e.ls; }
     auto it = g_objs.find(canon(l));
     if (it == g_objs.end() || !it->second.list) return nullptr;
     *id = it->second.id;
+    if (l) t_list_cache[t_list_cache_next++ % kListCache] = {l, it->second.list.get(), it->second.id};
     return it->second.list.get();
+}
+// The bound pipeline's entry (nullptr if unknown), cached per recording like root_sig_obj_locked.
+const Obj* pso_obj_locked(ListState& ls)
+{
+    if (!ls.pso) return nullptr;
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (ls.pso_key == ls.pso && ls.pso_gen == gen) return static_cast<const Obj*>(ls.pso_obj);
+    const auto it = g_objs.find(canon(ls.pso));
+    const Obj* o = it != g_objs.end() ? &it->second : nullptr;
+    if (o) { ls.pso_key = ls.pso; ls.pso_obj = o; ls.pso_gen = gen; }
+    return o;
+}
+const na_ev_pipeline_created* pso_created_locked(ListState& ls)
+{
+    const Obj* o = pso_obj_locked(ls);
+    if (!o || o->created.size() < sizeof(na_ev_pipeline_created)) return nullptr;
+    return reinterpret_cast<const na_ev_pipeline_created*>(o->created.data());
 }
 
 template <typename F>
@@ -3849,10 +3918,8 @@ void note_draw_locked(ListState* ls){
             ev.with_depth = sel_depth && ls->cur_ds == sel_depth; // scene content, not a reuse of the texture
             ls->insertion.Add(ev);
         }
-    auto pipeline = g_objs.find(canon(ls->pso));
-    if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
-        pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
-        const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+    const na_ev_pipeline_created* p = ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 ? pso_created_locked(*ls) : nullptr;
+    if (p) {
         if(p->depth_enable==1&&p->depth_write==1&&ls->states.size()<4096){
             const bool same=!ls->states.empty()&&ls->states.back().resource==ls->cur_ds&&ls->states.back().subresource==ls->cur_ds_sub&&ls->states.back().state_after==D3D12_RESOURCE_STATE_DEPTH_WRITE;
             if(!same)ls->states.push_back({ls->cur_ds,ls->cur_ds_sub,D3D12_RESOURCE_STATE_DEPTH_WRITE});
@@ -4829,19 +4896,20 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
         auto* ls = list_state_locked(l, &lid);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        const auto current_pso = g_objs.find(canon(ls->pso));
+        const Obj* current_pso = pso_obj_locked(*ls);
         if(indirect) {
-            if(current_pso==g_objs.end() || current_pso->second.created.size()<sizeof(na_ev_pipeline_created))return;
-            const auto* pd=reinterpret_cast<const na_ev_pipeline_created*>(current_pso->second.created.data());
+            if(!current_pso || current_pso->created.size()<sizeof(na_ev_pipeline_created))return;
+            const auto* pd=reinterpret_cast<const na_ev_pipeline_created*>(current_pso->created.data());
             compute=pd->pipeline_kind==NA_PIPELINE_COMPUTE || pd->stage_bytes[NA_STAGE_CS]!=0;
         }
-        const auto signature = g_objs.find(canon(ls->root_sig[compute]));
-        if (signature == g_objs.end()) return;
+        const Obj* sig_obj = root_sig_obj_locked(*ls, compute);
+        if (!sig_obj) return;
+        const Obj& sig = *sig_obj;
         if(ls->pending_entry==color) {
             ls->pending_entry=0;
-            entry={color,compute?0:ls->cur_rt,current_pso==g_objs.end()?0:current_pso->second.id,false,
+            entry={color,compute?0:ls->cur_rt,current_pso?current_pso->id:0,false,
                 indirect?(compute?na::j2::Op::IndirectComputeEntry:na::j2::Op::IndirectGraphicsEntry):
-                         (compute?na::j2::Op::ComputeEntry:na::j2::Op::GraphicsEntry),signature->second.root_hash};
+                         (compute?na::j2::Op::ComputeEntry:na::j2::Op::GraphicsEntry),sig.root_hash};
             resource_dims_locked(entry.destination,&entry.dst_w,&entry.dst_h,&entry.dst_fmt);
             entry.recording=ls->generation.load();entry.operation=ls->op_index.load()+1;entry.barrier=ls->entry_barrier;
             ls->insertion.SetEntryContext(entry);
@@ -4858,12 +4926,12 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
         if(cached.valid&&cached.state_revision==ls->read_revision[compute]&&cached.registry_revision==revision_now&&cached.color==color){
             color_srvs=cached.color_srvs;reads_color=color_srvs!=0;nsrv=cached.count;
             std::copy_n(cached.srvs,nsrv,srv_ids);if(compute)destination=cached.uav;
-        }else if(!read_filter_needs_walk_locked(*ls, signature->second, compute, color)){
+        }else if(!read_filter_needs_walk_locked(*ls, sig, compute, color)){
             g_hot_skipped.fetch_add(1, std::memory_order_relaxed); // no bound SRV of the colour or a copy: nothing to record
         }else{
         g_hot_walked.fetch_add(1, std::memory_order_relaxed);
-        const auto& params = signature->second.root_params;
-        const auto& ranges = signature->second.root_ranges;
+        const auto& params = sig.root_params;
+        const auto& ranges = sig.root_ranges;
         for (size_t p = 0; p < ls->args[compute].size() && p < params.size(); ++p) {
             const auto& arg = ls->args[compute][p];
             if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
@@ -4903,7 +4971,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
             // Role-class inputs (only for the few draws that read the scene colour).
             na::j2::InsertionEvent ev{color, destination, reinterpret_cast<uint64_t>(ls->pso), false,
                                       compute ? na::j2::Op::ComputeRead : na::j2::Op::GraphicsRead,
-                                      signature->second.root_hash};
+                                      sig.root_hash};
             ev.color_srvs = color_srvs;
             resource_dims_locked(destination, &ev.dst_w, &ev.dst_h, &ev.dst_fmt);
             uint32_t cw = 0, ch = 0, cf = 0;
@@ -5168,9 +5236,8 @@ void vpj_before_draw(GL* l)
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
         bool want = sample && sel_depth && ls->cur_ds == sel_depth;
         if (want) {
-            const auto pipeline = g_objs.find(canon(ls->pso));
-            want = pipeline != g_objs.end() && pipeline->second.created.size() >= sizeof(na_ev_pipeline_created) &&
-                   reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data())->depth_enable == 1;
+            const na_ev_pipeline_created* pc = pso_created_locked(*ls);
+            want = pc && pc->depth_enable == 1;
         }
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
@@ -5242,10 +5309,8 @@ void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (ls->cur_ds != sel_depth) return;
-        const auto pipeline = g_objs.find(canon(ls->pso));
-        if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) return;
-        const auto* pc = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
-        if (pc->depth_enable != 1) return;
+        const na_ev_pipeline_created* pc = pso_created_locked(*ls);
+        if (!pc || pc->depth_enable != 1) return;
         uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
         h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
         d.stages = pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS];
@@ -7723,12 +7788,13 @@ int FormatReadFilter(char* out, size_t n)
     uint32_t ids;
     { std::lock_guard<std::mutex> lk(g_hot_pending_m); overflow = g_hot_overflow; ids = g_hot_known_n; }
     return std::snprintf(out, n, "read_filter ready=%u ids=%u overflow=%u rebuilds=%llu skipped=%llu walked=%llu"
-        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu | view_writes=%llu deferred=%llu flushes=%llu",
+        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu | view_writes=%llu deferred=%llu deferred_cbv=%llu flushes=%llu",
         g_hot_ready.load() ? 1u : 0u, ids, overflow ? 1u : 0u, (unsigned long long)g_hot_rebuilds.load(),
         (unsigned long long)g_hot_skipped.load(), (unsigned long long)g_hot_walked.load(),
         (unsigned long long)g_copy_simple.load(), (unsigned long long)g_copy_calls.load(),
         (unsigned long long)g_copy_batched.load(), (unsigned long long)g_copy_batched_runs.load(),
-        (unsigned long long)g_c.writes.load(), (unsigned long long)g_deferred_writes.load(), (unsigned long long)g_deferred_flushes.load());
+        (unsigned long long)g_c.writes.load(), (unsigned long long)g_deferred_writes.load(), (unsigned long long)g_deferred_cbvs.load(),
+        (unsigned long long)g_deferred_flushes.load());
 }
 void ResetDerived()
 {
@@ -9241,6 +9307,7 @@ void SetProcessExiting() { g_process_exiting.store(true, std::memory_order_relea
 
 ProducerStats GetProducerStats()
 {
+    flush_deferred_writes(); // queued view writes count once applied
     ProducerStats s{};
     s.objects_live = g_c.live.load();
     s.objects_created = g_c.created.load();
