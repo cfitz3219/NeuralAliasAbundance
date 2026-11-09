@@ -134,9 +134,16 @@ void step(const char* what, DWORD thread, ULONGLONG t0)
 
 // Builds the 11on12 device on our own D3D12 device + direct queue. Returns
 // false (nothing handed out, nothing kept) on any failure.
+struct DeviceResult {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<ID3D12Device> backend;
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D_FEATURE_LEVEL level{};
+};
+
 bool build_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* levels, UINT level_count,
-                ID3D11Device** out_device, D3D_FEATURE_LEVEL* out_level, ID3D11DeviceContext** out_context,
-                DWORD thread, ULONGLONG t0)
+                DeviceResult& result, DWORD thread, ULONGLONG t0)
 {
     if (!g_on12_create || !g_d3d12_create) { note("D3D11On12 or D3D12 is not available; native DX11"); return false; }
     step("D3D12CreateDevice", thread, t0);
@@ -158,23 +165,14 @@ bool build_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* leve
     step("swap chain check", thread, t0);
     if (!swapchain_supported(d11.Get())) return false;
     step("done", thread, t0);
-    remember(d11.Get(), d12.Get(), queue.Get());
-    if (out_level) *out_level = chosen;
-    if (out_context) *out_context = ctx.Detach();
-    *out_device = d11.Detach();
-    g_wrapped.fetch_add(1);
-    char line[128];
-    std::snprintf(line, sizeof line, "the game's D3D11 device runs on our D3D12 queue (feature level 0x%X)", static_cast<unsigned>(chosen));
-    note(line);
+    result = {std::move(d11), std::move(ctx), std::move(d12), std::move(queue), chosen};
     return true;
 }
 
 // The game's request runs on a worker thread of ours, and the game waits at most
-// kCreateTimeoutMs (25 s, including the wait for the host's install). Pharaoh (2026-11-09, 250d6ca) hung forever inside this creation on its
-// own thread; whatever the step, the game now falls back to native DX11 instead of freezing
-// (fail-quiet), and the startup log names the step that stalled.
-constexpr DWORD kInstallWaitMs = 15000;   // the host's own install, before our D3D12 device
-constexpr DWORD kCreateTimeoutMs = 25000; // that wait + the creation itself (~3 s for 11on12)
+// kCreateTimeoutMs. The private build runs independently of host attachment.
+// A driver stall still falls back to native DX11 instead of blocking forever.
+constexpr DWORD kCreateTimeoutMs = 25000;
 struct CreateJob {
     IDXGIAdapter* adapter = nullptr;
     UINT flags = 0;
@@ -185,9 +183,7 @@ struct CreateJob {
     ULONGLONG t0 = 0;
     std::mutex m;
     bool finished = false, abandoned = false, ok = false;
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* context = nullptr;
-    D3D_FEATURE_LEVEL level{};
+    DeviceResult result;
     HANDLE done = nullptr;
     ~CreateJob()
     {
@@ -201,28 +197,20 @@ DWORD WINAPI create_worker(LPVOID param)
     std::shared_ptr<CreateJob> job(*static_cast<std::shared_ptr<CreateJob>*>(param));
     delete static_cast<std::shared_ptr<CreateJob>*>(param);
     ++t_inside; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
-    // Our D3D12 device only after the host's install: started mid-install, D3D12CreateDevice
-    // competes with it and sits out the 3 s factory gate per factory (Pharaoh: 13-14 s).
-    step("wait for host install", job->thread, job->t0);
-    if (!na::host::WaitForInstallAttempt(kInstallWaitMs)) step("host install still running; creating anyway", job->thread, job->t0);
-    ID3D11Device* d = nullptr;
-    ID3D11DeviceContext* c = nullptr;
-    D3D_FEATURE_LEVEL l{};
-    const bool ok = build_on12(job->adapter, job->flags, job->default_levels ? nullptr : job->levels, job->level_count, &d, &l, &c,
-                               job->thread, job->t0);
+    // The intercepted game thread is waiting for this worker. The worker's
+    // own DXGI factory calls cannot also wait on the startup installation.
+    na::host::InternalFactoryScope private_factories;
+    DeviceResult result;
+    const bool ok = build_on12(job->adapter, job->flags, job->default_levels ? nullptr : job->levels,
+                              job->level_count, result, job->thread, job->t0);
     --t_inside;
     std::lock_guard<std::mutex> lk(job->m);
     job->finished = true;
     if (job->abandoned) { // the game already went native: drop what we built
-        if (c) c->Release();
-        if (d) d->Release();
-        if (ok) g_wrapped.fetch_sub(1); // counted by build_on12, never handed out
         note("a timed-out 11on12 creation finished late and was released; the game runs native DX11");
     } else {
         job->ok = ok;
-        job->device = d;
-        job->context = c;
-        job->level = l;
+        job->result = std::move(result);
     }
     SetEvent(job->done);
     return 0;
@@ -260,10 +248,18 @@ bool create_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* lev
         return false;
     }
     if (!job->ok) return false;
-    if (out_level) *out_level = job->level;
-    if (out_context) *out_context = job->context; else if (job->context) job->context->Release();
-    *out_device = job->device;
+    auto& result = job->result;
+    remember(result.device.Get(), result.backend.Get(), result.queue.Get());
+    if (out_level) *out_level = result.level;
+    if (out_context) *out_context = result.context.Detach();
+    *out_device = result.device.Detach();
     return true;
+}
+
+void report_wrapped()
+{
+    g_wrapped.fetch_add(1);
+    note("the game received a D3D11On12 device backed by our D3D12 queue");
 }
 
 // Requests this layer answers: a real device on hardware, no debug layer.
@@ -287,7 +283,7 @@ HRESULT WINAPI DetourCreateDevice(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, H
         ++t_inside;
         const bool ok = create_on12(adapter, flags, levels, level_count, out_device, out_level, out_context);
         --t_inside;
-        if (ok) return S_OK;
+        if (ok) { report_wrapped(); return S_OK; }
         g_native.fetch_add(1);
     }
     ++t_inside;
@@ -332,6 +328,7 @@ HRESULT WINAPI DetourCreateDeviceAndSwapChain(IDXGIAdapter* adapter, D3D_DRIVER_
             *out_device = d11;
             if (out_level) *out_level = level;
             if (out_context) *out_context = ctx; else if (ctx) ctx->Release();
+            report_wrapped();
             return S_OK;
         }
         g_native.fetch_add(1);
