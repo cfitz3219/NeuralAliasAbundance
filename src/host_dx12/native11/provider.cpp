@@ -123,7 +123,7 @@ float g_scene_vp_x = 0, g_scene_vp_y = 0, g_scene_vp_w = 0, g_scene_vp_h = 0; //
 uint32_t g_camera_first = 0;              // first constant of the camera binding at the last scene draw
 uint32_t g_camera_num = 0;                // its constant count (0 = whole buffer)
 uint64_t g_stream = 0;                    // SceneFrame::stream; bumps when any input object changes
-uint64_t g_stream_key[3] = {};            // incarnations of colour, depth, camera buffer behind g_stream
+uint64_t g_stream_key[4] = {};            // colour and depth lifetime ids, camera buffer id and its lifetime id (0 = untagged)
 
 CameraPick g_camera;
 Selection g_last_selection;
@@ -395,17 +395,19 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.scene_draws = g_model.SceneDrawsThisFrame();
     // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
     // tagged when the game last uploaded to it.
+    // A buffer selected before its first candidate upload has no tag yet: its first tag is not a change.
     uint64_t cam_inc = 0;
     if (sel.camera_cb) {
         auto it = g_cb_incarnation.find(sel.camera_cb);
-        cam_inc = it != g_cb_incarnation.end() ? it->second : sel.camera_cb;
+        if (it != g_cb_incarnation.end()) cam_inc = it->second;
     }
-    const uint64_t key[3] = {f.color.incarnation, f.depth.incarnation, cam_inc};
-    f.selection_changed = !g_stream || std::memcmp(key, g_stream_key, sizeof(key)) != 0;
-    if (f.selection_changed) {
-        ++g_stream;
-        std::memcpy(g_stream_key, key, sizeof(key));
-    }
+    f.selection_changed = !g_stream || f.color.incarnation != g_stream_key[0] || f.depth.incarnation != g_stream_key[1] ||
+                          sel.camera_cb != g_stream_key[2] || (cam_inc && g_stream_key[3] && cam_inc != g_stream_key[3]);
+    if (f.selection_changed) ++g_stream;
+    g_stream_key[0] = f.color.incarnation;
+    g_stream_key[1] = f.depth.incarnation;
+    g_stream_key[2] = sel.camera_cb;
+    if (cam_inc || f.selection_changed) g_stream_key[3] = cam_inc;
     f.stream = g_stream;
     g_last_selection = sel;
     const SceneCallback cb = g_cb;

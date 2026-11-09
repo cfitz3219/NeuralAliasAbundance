@@ -298,13 +298,24 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     if (g_tonemap_bound && f.boundary == na::native11::Boundary::BeforeRead) ++s.after_tonemap;
     if (f.scene_draws != 40) ++s.no_scene;
     if (!f.camera.bytes || f.camera.size != 512 || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) ||
-        f.camera.vs_slot != 0)
+        f.camera.vs_slot != 0) {
+        if (!s.no_camera)
+            std::printf("camera handed over: bytes=%p size=%u buffer=%llx (game %llx) slot=%d first=%u num=%u version=%llu\n",
+                        static_cast<const void*>(f.camera.bytes), f.camera.size, static_cast<unsigned long long>(f.camera.buffer),
+                        static_cast<unsigned long long>(reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get()))),
+                        f.camera.vs_slot, f.camera.first_constant, f.camera.num_constants, static_cast<unsigned long long>(f.camera.version));
         ++s.no_camera;
+    }
     if (f.boundary == na::native11::Boundary::BeforeRead) ++s.before_read;
     if (f.boundary == na::native11::Boundary::BeforeList) ++s.before_list;
     if (f.camera.jitter_applied && (f.camera.jitter_px[0] != 0.f || f.camera.jitter_px[1] != 0.f)) ++s.jitter_reported;
     if (f.selection_changed) ++s.changed;
-    if (f.stream != s.last_stream) ++s.streams;
+    if (f.stream != s.last_stream) {
+        ++s.streams;
+        std::printf("stream %llu at call %llu (changed=%d colour=%llu depth=%llu)\n", static_cast<unsigned long long>(f.stream),
+                    static_cast<unsigned long long>(s.calls), f.selection_changed ? 1 : 0, static_cast<unsigned long long>(f.color.incarnation),
+                    static_cast<unsigned long long>(f.depth.incarnation));
+    }
     s.last_stream = f.stream;
     s.color_w = f.color.active_w;
     s.color_h = f.color.active_h;
