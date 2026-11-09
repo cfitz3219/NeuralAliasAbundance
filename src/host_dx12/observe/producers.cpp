@@ -574,11 +574,24 @@ constexpr uint32_t kCostPseudo = 100, kCostVpj = 100, kCostShaderUse = 101, kCos
                    kCostDescCopy = 111, kCostDescCopyWait = 112, kCostDescWrite = 113, kCostDescWriteWait = 114, // descriptor copies/writes and their wait for the exclusive g_m
                    // WWII p28412 (2026-11-09): pso 37-81 ms per creation and shader_use 10 us per draw were the two
                    // costs; these split each into the driver's / the walk's share and ours.
-                   kCostPsoDriver = 115, kCostPsoReflect = 116, kCostUseLookup = 117, kCostUseWalk = 118, kCostUseCallback = 119, kCostLast = 119;
+                   kCostPsoDriver = 115, kCostPsoReflect = 116, kCostUseLookup = 117, kCostUseWalk = 118, kCostUseCallback = 119,
+                   // WWII p7632: ResourceBarrier cost 15 ms per DLAA frame; the scene-read callback (inline DLAA) is timed alone.
+                   kCostSceneReadCb = 120, kCostLast = 120;
 std::atomic<bool> g_cost_enabled{false};
-std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{};
-thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{};
-thread_local uint32_t t_cost_n = 0;
+std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{}, g_cost_timed[kCostSlots]{};
+thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{}, t_cost_timed[kCostSlots]{};
+thread_local uint32_t t_cost_n = 0, t_cost_seq[kCostSlots]{};
+// WWII p7632: ~7 million timed scopes per second (one per descriptor copy/write, its lock wait, every
+// driver forward, root table and event emit) made the profiler a large share of what it measured: two
+// clock reads per scope, nested inside the slot envelopes. These uniform, very frequent scopes are
+// timed on one call in 16 (per thread) and every call is counted; the report scales the timed sum
+// by calls/timed. All other slots (rare or heavy-tailed, such as ResourceBarrier) time every call.
+constexpr uint32_t kCostSampleMask = 15;
+constexpr bool cost_sampled(uint32_t s)
+{
+    return s == kCostDescCopy || s == kCostDescCopyWait || s == kCostDescWrite || s == kCostDescWriteWait ||
+           s == kCostDriver || s == kCostRootTable || s == kCostEmit;
+}
 inline uint64_t cost_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
 void cost_flush()
 {
@@ -586,17 +599,29 @@ void cost_flush()
         if (t_cost_calls[i]) {
             g_cost_ticks[i].fetch_add(t_cost_ticks[i], std::memory_order_relaxed);
             g_cost_calls[i].fetch_add(t_cost_calls[i], std::memory_order_relaxed);
-            t_cost_ticks[i] = t_cost_calls[i] = 0;
+            g_cost_timed[i].fetch_add(t_cost_timed[i], std::memory_order_relaxed);
+            t_cost_ticks[i] = t_cost_calls[i] = t_cost_timed[i] = 0;
         }
     t_cost_n = 0;
 }
 struct CostScope {
-    uint32_t slot; uint64_t t0;
-    explicit CostScope(uint32_t s, bool on = true) : slot(on && s < kCostSlots && g_cost_enabled.load(std::memory_order_relaxed) ? s : kCostSlots), t0(slot < kCostSlots ? cost_now() : 0) {}
+    uint32_t slot = kCostSlots; uint64_t t0 = 0; bool counted = false; // counted: the call was counted at entry (sampled slot)
+    explicit CostScope(uint32_t s, bool on = true)
+    {
+        if (!on || s >= kCostSlots || !g_cost_enabled.load(std::memory_order_relaxed)) return;
+        if (cost_sampled(s)) {
+            ++t_cost_calls[s];
+            if (t_cost_seq[s]++ & kCostSampleMask) return; // counted, not timed
+            counted = true;
+        }
+        slot = s; t0 = cost_now();
+    }
     void Close()
     {
         if (slot >= kCostSlots) return;
-        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_calls[slot];
+        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_timed[slot];
+        if (!counted) ++t_cost_calls[slot];
+        counted = false;
         if (++t_cost_n >= 512 || slot >= kCostExec) cost_flush();
         slot = kCostSlots;
     }
@@ -4145,7 +4170,7 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
             ls->pending_entry = color;
             ++ls->entry_barrier;
         }
-        if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+        if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, true); }
         break; // our pass runs before the whole original barrier batch
     }
 }
@@ -4179,7 +4204,7 @@ void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
         ev.color_srvs = from_color ? 1 : 0;
         ls->insertion.Add(ev);
     }
-    if (from_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+    if (from_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, true); }
 }
 
 void after_texture_copy(GL* l, ID3D12Resource* dst)
@@ -4298,7 +4323,7 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
     }
     const CostScope callbacks(kCostUseCallback);
     if(entry.resource)if(auto cb=g_entry_cb.load(std::memory_order_acquire))cb(l,entry);
-    if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
+    if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, compute); }
 }
 
 // ---- Live mip bias: bind the twins of the level latched at this recording's Reset.
@@ -8409,7 +8434,7 @@ void FormatHookCost(char* out, size_t n)
     out[0] = 0;
     if(!g_cost_enabled.load(std::memory_order_relaxed)){std::snprintf(out,n,"hook_cost disabled");return;}
     cost_flush(); // this thread's share
-    static uint64_t prev_ticks[kCostSlots]{}, prev_calls[kCostSlots]{}, prev_at = 0;
+    static uint64_t prev_ticks[kCostSlots]{}, prev_calls[kCostSlots]{}, prev_timed[kCostSlots]{}, prev_at = 0;
     static std::mutex m;
     std::lock_guard<std::mutex> lock(m);
     LARGE_INTEGER f; QueryPerformanceFrequency(&f);
@@ -8418,11 +8443,13 @@ void FormatHookCost(char* out, size_t n)
     struct Row { uint32_t slot; double ms_per_s, calls_per_s, us_per_call; };
     Row rows[kCostSlots]; uint32_t nr = 0; double list_total = 0;
     for (uint32_t i = 0; i < kCostSlots; ++i) {
-        const uint64_t t = g_cost_ticks[i].load(std::memory_order_relaxed), c = g_cost_calls[i].load(std::memory_order_relaxed);
-        const uint64_t dt = t - prev_ticks[i], dc = c - prev_calls[i];
-        prev_ticks[i] = t; prev_calls[i] = c;
-        if (!dc || secs <= 0) continue;
-        const double ms = double(dt) * 1000.0 / double(f.QuadPart);
+        const uint64_t t = g_cost_ticks[i].load(std::memory_order_relaxed), c = g_cost_calls[i].load(std::memory_order_relaxed),
+                       tc = g_cost_timed[i].load(std::memory_order_relaxed);
+        const uint64_t dt = t - prev_ticks[i], dc = c - prev_calls[i], dtc = tc - prev_timed[i];
+        prev_ticks[i] = t; prev_calls[i] = c; prev_timed[i] = tc;
+        if (!dc || !dtc || secs <= 0) continue;
+        // Sampled slots: the timed calls' sum scaled to every call (exact for the others, dtc == dc).
+        const double ms = double(dt) * 1000.0 / double(f.QuadPart) * (double(dc) / double(dtc));
         rows[nr++] = {i, ms / secs, double(dc) / secs, ms * 1000.0 / double(dc)};
         if (i < kCostPseudo) list_total += ms / secs;
     }
@@ -8431,7 +8458,8 @@ void FormatHookCost(char* out, size_t n)
     int w = std::snprintf(out, n, "hook_cost window_s=%.1f list_ms_per_s=%.1f", secs, list_total);
     static const char* const kPseudo[] = {"vpj", "shader_use", "lane_before", "lane_after", "driver", "run", "root_table",
                                            "sampled", "emit", "note_draw", "canon_miss", "desc_copy", "desc_copy_wait",
-                                           "desc_write", "desc_write_wait", "pso_driver", "pso_reflect", "use_lookup", "use_walk", "use_callback"};
+                                           "desc_write", "desc_write_wait", "pso_driver", "pso_reflect", "use_lookup", "use_walk", "use_callback",
+                                           "scene_read_cb"};
     static_assert(sizeof(kPseudo) / sizeof(kPseudo[0]) == kCostLast - kCostPseudo + 1, "one name per pseudo slot");
     for (uint32_t i = 0; i < nr && i < 24 && w > 0 && size_t(w) < n; ++i) {
         const uint32_t sl = rows[i].slot;
