@@ -28,6 +28,7 @@
 #include "host_dx12/overlay/submission_tracking.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/overlay/dlss_debug.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -163,6 +164,15 @@ HRESULT real_get_buffer(IDXGISwapChain* sc, UINT i, REFIID riid, void** out)
     NativeBufferRead scope;
     return sc->GetBuffer(i, riid, out);
 }
+// The swap chain's D3D12 device; for a DX11 game on our 11on12 device, the D3D12 device behind it.
+HRESULT swapchain_d3d12_device(IDXGISwapChain* sc, ComPtr<ID3D12Device>& out)
+{
+    HRESULT hr = sc->GetDevice(IID_PPV_ARGS(&out));
+    if (SUCCEEDED(hr)) return hr;
+    ComPtr<IUnknown> any;
+    if (SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&any)))) out.Attach(na::on12::DeviceFor(any.Get()));
+    return out ? S_OK : hr;
+}
 UINT real_index(IDXGISwapChain* sc)
 {
     if(!sc)return 0xFFFFFFFFu;
@@ -193,12 +203,33 @@ SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
 std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0}, g_swap_queue_observed{0};
 std::atomic<uintptr_t> g_last_present_queue{0};
+// Where a slow Present goes (DX11 bridge menu probe, 2026-11-09: ~200 ms frames only with the menu
+// open): our own present work (on_present) vs the original Present, per 5-second status window.
+struct PresentTiming { std::atomic<uint64_t> n{0}, ours_us{0}, ours_max{0}, orig_us{0}, orig_max{0}; };
+PresentTiming g_present_timing[2]; // [0] menu closed, [1] menu open
+uint64_t qpc_us()
+{
+    static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return 1e6 / double(q.QuadPart); }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return static_cast<uint64_t>(double(t.QuadPart) * f);
+}
+void note_present_timing(bool open, uint64_t ours, uint64_t orig)
+{
+    auto& t = g_present_timing[open ? 1 : 0];
+    t.n.fetch_add(1); t.ours_us.fetch_add(ours); t.orig_us.fetch_add(orig);
+    uint64_t m = t.ours_max.load(); while (ours > m && !t.ours_max.compare_exchange_weak(m, ours)) {}
+    m = t.orig_max.load(); while (orig > m && !t.orig_max.compare_exchange_weak(m, orig)) {}
+}
 
 void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
 {
     if (!device_or_queue || !swapchain) return;
     ComPtr<ID3D12CommandQueue> q;
-    if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) return; // D3D11 / other device: not ours
+    if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) {
+        // A DX11 game on our 11on12 device presents on the D3D12 queue behind it.
+        q.Attach(na::on12::QueueFor(device_or_queue));
+        if (!q) return; // D3D11 / other device: not ours
+    }
     std::lock_guard<std::mutex> lk(g_swap_queue_m);
     for (auto& e : g_swap_queues)
         if (e.sc == swapchain) { e.queues.Created(q.Get()); e.color_space=DXGI_COLOR_SPACE_CUSTOM; g_swap_queues_recorded.fetch_add(1); return; } // address reused
@@ -891,6 +922,8 @@ void write_status_line()
     }
     char safe_line[144];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s renderer_ready=%u shared_writer=%u clean_exit_hook=%u\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason(),na::host::SessionReady()?1u:0u,na::settings::CanPersist()?1u:0u,na::host::CleanExitObserved()?1u:0u);
     if(safe_bytes>0)WriteFile(f, safe_line, static_cast<DWORD>((std::min)(safe_bytes, static_cast<int>(sizeof(safe_line)-1))), &written, nullptr);
+    {char on12_line[768];const int on12_bytes=na::on12::FormatStatus(on12_line,sizeof(on12_line)-2);
+     if(on12_bytes>0){WriteFile(f,on12_line,static_cast<DWORD>((std::min)(on12_bytes,static_cast<int>(sizeof(on12_line)-3))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}}
     char fg_inputs[512];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
@@ -1776,6 +1809,16 @@ void write_menu_progress(HANDLE log)
         static_cast<unsigned long long>(g_menu_skips.present_rejected.load(std::memory_order_relaxed)),
         static_cast<unsigned long>(g_menu_skips.last_present_rejection.load(std::memory_order_relaxed)));
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
+    for (int open = 0; open < 2; ++open) {
+        auto& t = g_present_timing[open];
+        const uint64_t c = t.n.exchange(0), ours = t.ours_us.exchange(0), orig = t.orig_us.exchange(0);
+        const uint64_t ours_max = t.ours_max.exchange(0), orig_max = t.orig_max.exchange(0);
+        n = snprintf(line, sizeof(line), "present_timing menu=%s presents=%llu ours_us=%llu/max%llu original_present_us=%llu/max%llu\r\n",
+                     open ? "open" : "closed", static_cast<unsigned long long>(c),
+                     static_cast<unsigned long long>(c ? ours / c : 0), static_cast<unsigned long long>(ours_max),
+                     static_cast<unsigned long long>(c ? orig / c : 0), static_cast<unsigned long long>(orig_max));
+        if (n > 0) WriteFile(log, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)) - 1)), &written, nullptr);
+    }
     auto nr_progress = na::nr::GetStats();
     n = snprintf(line, sizeof(line), "frame_progress nr_submitted=%llu nr_completed=%llu direct_queues=%u present_thread=%u\r\n",
         static_cast<unsigned long long>(nr_progress.gpu_submitted), static_cast<unsigned long long>(nr_progress.gpu_completed),
@@ -2340,10 +2383,14 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
 
 // The current real back buffer for THIS frame only: fetched, its RTV
 // (re)written, used, and released by the caller before the Present returns.
-bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPTOR_HANDLE target_rtv, ComPtr<ID3D12Resource>& out)
+bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPTOR_HANDLE target_rtv, ComPtr<ID3D12Resource>& out,
+                                ID3D12CommandQueue* queue = nullptr, na::on12::Borrowed* borrowed = nullptr)
 {
     if (idx >= g_state.backbuffer_count) return false;
-    if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) return false;
+    if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) {
+        // DX11 game on our 11on12 device: borrow the D3D12 buffer underneath for this draw.
+        if (!borrowed || !na::on12::UnwrapBackBuffer(sc, idx, queue, g_state.format, out.ReleaseAndGetAddressOf(), *borrowed)) return false;
+    }
     D3D12_RENDER_TARGET_VIEW_DESC rtv{};
     rtv.Format = g_state.format;
     rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
@@ -2409,7 +2456,7 @@ bool ensure_init_locked(IDXGISwapChain* sc)
         bool committed=false;
         ~MenuAttempt(){if(!committed)discard_menu_init_locked();}
     } attempt;
-    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))) return false;
+    if (FAILED(swapchain_d3d12_device(sc, g_state.device))) return false;
     na::gputime::SetDevice(g_state.device.Get());
     g_state.rtv_stride = g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     g_state.srv_stride = g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -2849,6 +2896,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         g_menu_skips.busy.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    na::on12::Borrowed borrowed; // returned to 11on12 when this function ends (after our submit)
     ComPtr<ID3D12Resource> back_buffer; // A71: this frame only
     if (frame) {
         back_buffer = frame;
@@ -2856,7 +2904,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         rtv.Format = g_state.format;
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         g_state.device->CreateRenderTargetView(frame, &rtv, f.rtv);
-    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer)) {
+    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer, queue, &borrowed)) {
         g_menu_skips.buffer.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -2924,6 +2972,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     g_state.list->ResourceBarrier(1, &b);
     g_state.list->OMSetRenderTargets(1, &f.rtv, FALSE, nullptr);
+    if (borrowed.clear) { // 11on12 canvas: the menu goes over transparent, then D3D11 blends it on
+        const float transparent[4] = {};
+        g_state.list->ClearRenderTargetView(f.rtv, transparent, 0, nullptr);
+    }
     ID3D12DescriptorHeap* heaps[] = {g_state.srv_heap.Get()};
     g_state.list->SetDescriptorHeaps(1, heaps);
     {
@@ -2945,6 +2997,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     g_state.imgui_slot_fences[imgui_slot] = f.fence_value;
     f.signal_failed = FAILED(queue->Signal(f.completion.Get(), f.fence_value));
     g_menu_draw_marker.store(f.fence_value);
+    if (!f.signal_failed) borrowed.Submitted(f.completion.Get(), f.fence_value);
     g_frames.fetch_add(1, std::memory_order_relaxed);
     if (just_opened) menu_note("menu_open: GPU draw submitted\r\n");
 }
@@ -3065,7 +3118,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
         g_retargets.fetch_add(1, std::memory_order_relaxed);
     }
     if(!g_state.device){
-        if(SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))){
+        if(SUCCEEDED(swapchain_d3d12_device(sc,g_state.device))){
             na::gputime::SetDevice(g_state.device.Get());
             g_seen_device.store(g_state.device.Get(),std::memory_order_release);
             if(seen_push(SeenKind::Device,g_state.device.Get()))g_device_announced.store(true,std::memory_order_release);
@@ -3478,8 +3531,11 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present_begin",sc);
     const bool menu_open = g_open.load(std::memory_order_acquire);
+    const uint64_t t0 = qpc_us();
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
+    const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present(sc, sync, flags);
+    note_present_timing(menu_open, t1 - t0, qpc_us() - t1);
     note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);

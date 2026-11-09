@@ -243,6 +243,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/adapters/mode_control.cpp
   src/host_dx12/adapters/tlou1/timing.cpp
   src/host_dx12/host_boot/host_boot.cpp
+  src/host_dx12/on12/d3d11_on12.cpp
   src/host_dx12/host_boot/session.cpp)
 if(NA_GAME_ADAPTER_LIB)
   target_link_libraries(host_dx12 PUBLIC "${NA_GAME_ADAPTER_LIB}")
@@ -390,6 +391,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt")
 endif()
 
 # Reversible per-application FG preset helper; no profile changes at build/test time.
+# DX11-on-DX12 bridge probe: a tiny DX11 "game" run beside dxgi.dll ([dx11on12] enabled=1).
+add_executable(na_dx11on12_probe tools/dx11on12_probe.cpp)
+target_link_libraries(na_dx11on12_probe PRIVATE d3d11 dxgi)
 add_executable(NAProfile src/host_dx12/fg/preset_profile.cpp)
 target_compile_definitions(NAProfile PRIVATE NA_PROFILE_CLI)
 target_link_libraries(NAProfile PRIVATE host_settings nvapi_headers)
