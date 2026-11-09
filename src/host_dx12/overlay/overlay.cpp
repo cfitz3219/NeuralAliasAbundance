@@ -3377,13 +3377,47 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
     na::settings::WatchChanges("code");
     na::scale::AutomaticScenePresent();
 }
+// DX11 bridge (WWII p7632, 2026-11-09): the game's D3D11 calls reach D3D12 on the translator's
+// worker thread, AFTER the game thread's Present call. Closing the frame at the start of Present
+// left part of that frame's lists (with the inline DLAA insertion) to the next window, and the
+// next frame's first scene writes then counted as "the scene was written again after our
+// insertion": 112 relearns, DLAA flashing on and off. The original Present on such a chain
+// first submits every queued D3D11 operation to the same D3D12 queue (the present is queued
+// after them), so the frame closes right after it returns, in the queue's own order.
+thread_local ComPtr<ID3D12CommandQueue> t_deferred_boundary;
+bool bridge_chain(IDXGISwapChain* sc)
+{
+    if (!sc || !na::on12::Enabled()) return false;
+    if (na::on12::IsTranslated(sc)) return true;
+    thread_local IDXGISwapChain* last = nullptr;
+    thread_local bool last_ours = false;
+    if (sc != last) {
+        ComPtr<ID3D12CommandQueue> q;
+        q.Attach(na::on12::QueueForSwapchain(sc));
+        last = sc;
+        last_ours = q != nullptr;
+    }
+    return last_ours;
+}
+void close_deferred_boundary()
+{
+    if (!t_deferred_boundary) return;
+    ComPtr<ID3D12CommandQueue> queue = std::move(t_deferred_boundary);
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    game_frame_boundary(queue.Get());
+}
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12CommandQueue> retained_queue;
     if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
-    game_frame_boundary(queue);
+    if (bridge_chain(sc)) {
+        t_deferred_boundary = queue; // closed after the original Present
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) na::eventlog::Emit("on12", "frame_boundary=after_present (bridge chain: the frame closes in the queue's order)");
+    }
+    else game_frame_boundary(queue);
     note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
@@ -3611,6 +3645,7 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present(sc, sync, flags);
     const uint64_t t2 = qpc_us();
+    close_deferred_boundary();
     note_present_timing(menu_open, t1 - t0, t2 - t1);
     na::on12::AfterPresent(sc, flags, t2 - t1);
     note_menu_present_result(menu_open, flags, result);
@@ -3642,7 +3677,9 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
     const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
-    na::on12::AfterPresent(sc, flags, qpc_us() - t1);
+    const uint64_t t2 = qpc_us();
+    close_deferred_boundary();
+    na::on12::AfterPresent(sc, flags, t2 - t1);
     note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
