@@ -15,6 +15,7 @@ namespace na::wwii {
 struct SceneCamera {
     camera::Matrix vp{};
     std::array<double, 3> origin{};
+    uint32_t vp_offset = 0, vp_duplicate = 0;
 };
 
 // Campaign shader constant layouts observed in the translated scene pass.
@@ -67,7 +68,7 @@ inline bool DecodeSceneCamera(const std::vector<uint8_t>& bytes, uint32_t declar
             std::abs(geometry.sy / geometry.sx - double(width) / height) > 0.02 ||
             std::abs(geometry.position[0]) > 1e-5 || std::abs(geometry.position[1]) > 1e-5 ||
             std::abs(geometry.position[2]) > 1e-5) continue;
-        out = {vp, {origin[0], origin[1], origin[2]}};
+        out = {vp, {origin[0], origin[1], origin[2]}, layout.vp, layout.size == 1280 ? 320u : 0u};
         return true;
     }
     return false;

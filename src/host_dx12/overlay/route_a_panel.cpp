@@ -1046,7 +1046,8 @@ void DrawLiveDlaa()
         }
         EndRow();
     }
-    if (na::on12::NativeRoute()) {
+    const bool native = na::on12::NativeRoute();
+    if (native) {
         bool jitter = na::j2::Jitter();
         BeginRow("Camera jitter", "Offsets scene samples by a fraction of a pixel for DLAA to reconstruct fine detail.", SwitchWidth());
         if (Switch("native11_jitter", &jitter)) na::j2::SetJitter(jitter);
@@ -1054,10 +1055,8 @@ void DrawLiveDlaa()
         char status[200]{};
         const bool running = na::native_d3d11::FormatMenuStatus(status, sizeof status);
         StatusLine(running ? 1 : 0, status);
-        EndGroupBox();
-        return;
     }
-    {
+    if (!native) {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
         int dv = na::j2::DebugView();
         BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible (0.2 px = full colour). Colour wheel: red = right, green = down-left, blue = up-left, magenta = right-and-up. White = broken values.", S(220));
@@ -1065,7 +1064,7 @@ void DrawLiveDlaa()
         if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
         EndRow();
     }
-    {
+    if (!native) {
         // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).
         const auto& rt = st.route;
         static const char* kWhere[] = {"not placed yet", "between the game's command lists", "inside the game's scene list", "handled by the game's own upscaler call"};
@@ -1087,7 +1086,7 @@ void DrawLiveDlaa()
         if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
         ImGui::EndDisabled();
         EndRow();
-        {   // Draw-replay motion on/off (Cort 2026-11-06): live, remembered.
+        if (!native) {   // Draw-replay motion on/off (Cort 2026-11-06): live, remembered.
             na::settings::Settings& rs = na::settings::Get();
             bool replay = rs.j2_draw_replay.load() != 0;
             BeginRow("Object motion (draw replay)", "Tests whether replaying matching scene draws reduces smearing on moving objects. Uses extra GPU time and applies live.", S(220));
@@ -1095,7 +1094,7 @@ void DrawLiveDlaa()
             EndRow();
             if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
         }
-        {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
+        if (!native) {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
             const bool running = na::j2::SmearTestRunning();
             BeginRow("Smear test", "About 20 seconds: DLAA runs in 7 variants one after another (normal, no motion, current frame only, no sharpening, DLSS preset L, the game's own motion, normal) and saves 8 frames of each. The picture changes while it runs; keep the view still. Shift + the capture key starts it too.", ButtonWidth("Start smear test"));
             ImGui::BeginDisabled(!on || running || na::capture::j2::Armed());
@@ -1116,7 +1115,7 @@ void DrawLiveDlaa()
         // only way to see WHICH presents flash (Cort, SE5 2026-11-02). Starts 3 s after the click.
         const na::capture::Stats pc = na::capture::GetStats();
         constexpr uint32_t kPresentFrames = 40;
-        BeginRow("Capture every presented frame", "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
+        BeginRow(native ? "Capture presented frames" : "Capture every presented frame", native ? "Saves up to 40 presented pictures without blocking the game for GPU readback." : "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
         ImGui::BeginDisabled(pc.frames_requested != 0 && pc.frames_written < pc.frames_requested);
         if (Button("Capture 40 presents")) {
             wchar_t dir[MAX_PATH];
@@ -1135,6 +1134,7 @@ void DrawLiveDlaa()
             StatusLine(0, pl);
         }
     }
+    if (native) { EndGroupBox(); return; }
     char buf[320];
     if (!on) {
         StatusLine(0, "Off: you are seeing the game's own picture.");
@@ -1376,6 +1376,7 @@ void RegisterLiveDlaaMenu()
 {
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
     na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
+    if (na::on12::NativeRoute()) return;
     na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
     // XeGTAO and Lighting run inside live DLAA too, but their rows were only registered with
     // the Route A menu, so a live-DLAA-only game (Sniper Elite 5, Cort 2026-11-05) never showed

@@ -23,13 +23,14 @@ struct CameraPick {
     na::camera::Layout layout = na::camera::Layout::RowMajor;
     na::camera::Matrix vp{};      // column-vector convention, as FindMatrices normalises
     bool reversed = false;        // reverse-Z
+    bool camera_relative = false; // the game adapter proved this pose without an inverse pair
 };
 
 // Re-reads a learned camera at `learned` (same layout); true if it still is a
 // perspective ViewProjection with its inverse at the same distance.
 inline bool CheckLearned(const std::vector<uint8_t>& bytes, const CameraPick& learned, CameraPick* out)
 {
-    if (!learned.found || learned.offset + 64 > bytes.size()) return false;
+    if (!learned.found || learned.camera_relative || learned.offset + 64 > bytes.size()) return false;
     const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(learned.offset), learned.layout);
     na::camera::Candidate c{};
     if (!na::camera::ViewProjection(m, c)) return false;

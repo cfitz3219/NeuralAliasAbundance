@@ -91,6 +91,7 @@ struct Event {
     uint64_t vertices = 0;        // Draw: vertices (indices) x instances; 0 for indirect
     bool indirect = false;
     Id cb[kCbBindSlots] = {};     // Draw: constant buffers (VS 0..13, PS kPsCbBase + 0..13)
+    uint16_t cb_first[kCbBindSlots] = {}, cb_count[kCbBindSlots] = {}; // in 16-byte constants
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
 };
 
@@ -228,6 +229,15 @@ public:
             if (kv.second > best_n) { best_n = kv.second; best = kv.first; }
         return best;
     }
+    // A previous candidate is useful only if this scene actually bound it.
+    uint32_t CameraCandidateVersion(Id cb, int slot, uint32_t& first, uint32_t& count) const
+    {
+        const auto it = cb_scene_.find({cb, slot});
+        if (it == cb_scene_.end()) return 0;
+        first = it->second.first;
+        count = it->second.count;
+        return it->second.last_version;
+    }
     // Camera-buffer candidates of the last frame, most scene draws first (for camera search).
     std::vector<std::pair<Id, int>> CameraCandidates(size_t max) const
     {
@@ -358,6 +368,8 @@ private:
             if (!e.cb[i]) continue;
             CbUse& u = cb_scene_[{e.cb[i], i}];
             ++u.draws;
+            u.first = e.cb_first[i];
+            u.count = e.cb_count[i];
             const uint32_t v = CbVersion(e.cb[i]);
             if (!u.versions || v != u.last_version) { ++u.versions; u.last_version = v; }
         }
@@ -431,7 +443,7 @@ private:
     std::unordered_map<Id, ResourceInfo> info_;
     std::unordered_map<Id, Cand> depth_;
     std::unordered_map<std::pair<Id, Id>, PairCount, PairHash> color_;
-    struct CbUse { uint32_t draws = 0, versions = 0, last_version = 0; };
+    struct CbUse { uint32_t draws = 0, versions = 0, last_version = 0, first = 0, count = 0; };
     std::unordered_map<std::pair<Id, int>, CbUse, CbHash> cb_scene_;
     std::unordered_map<Id, uint32_t> cb_version_;
     std::map<uint32_t, uint32_t> camera_versions_;

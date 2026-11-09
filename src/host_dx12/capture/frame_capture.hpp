@@ -46,7 +46,7 @@ bool OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in);
 // At Present, before the original Present: `backbuffer` is in PRESENT state.
 // Records the back-buffer copy on our own list, executes it on `queue`,
 // signals the fence and hands the frame to the writer thread.
-void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer);
+void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, bool wait_for_slot = true);
 
 struct Stats {
     uint32_t frames_requested;
