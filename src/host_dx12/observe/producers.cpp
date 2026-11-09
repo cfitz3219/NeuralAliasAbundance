@@ -8629,6 +8629,7 @@ void SetSamplerMipBias(float bias)
     request_variant([level](uint32_t w) { return var_pack(level, var_af(w)); });
 }
 float SamplerMipBias() { return kMipLevels[var_level(g_var_want.load(std::memory_order_relaxed))]; }
+uint32_t SamplerAnisotropyWanted() { return kAfLevels[var_af(g_var_want.load(std::memory_order_relaxed))]; }
 void SetSamplerMipBiasLive(float bias) { SetSamplerMipBias(bias); }
 void SetSamplerMipBiasLiveEnabled(bool on) { g_mip_live_enabled.store(on, std::memory_order_relaxed); }
 void SetSamplerMipPrewarm(bool on) {

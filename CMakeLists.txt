@@ -156,7 +156,7 @@ target_link_libraries(host_observe_producers PUBLIC abundance_options host_obser
 
 # Plan B1 (native DX11 route): D3D11 input provider. Isolated and inactive:
 # nothing installs it until Astra's B2 handoff lands; built so CI compiles it.
-add_library(host_native11 STATIC src/host_dx12/native11/provider.cpp)
+add_library(host_native11 STATIC src/host_dx12/native11/provider.cpp src/host_dx12/native11/samplers.cpp)
 target_link_libraries(host_native11 PUBLIC abundance_options host_hooking d3d11 dxgi)
 
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
