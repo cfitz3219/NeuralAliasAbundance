@@ -15,12 +15,12 @@
 
 #include <cstddef>
 
-struct IUnknown;
+#include <dxgi1_2.h>
+
 struct ID3D12CommandQueue;
 struct ID3D12Device;
 struct ID3D12Resource;
 struct ID3D12Fence;
-struct IDXGISwapChain;
 
 namespace na::on12 {
 
@@ -63,6 +63,51 @@ struct Borrowed {
 };
 bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, unsigned format, ID3D12Resource** out,
                       Borrowed& borrowed);
+
+// ---- Translated presentation (2026-11-09) --------------------------------
+// Every DX12 part of the program (overlay queue, menu target, J2 scene
+// consumer / present lineage, captures, NR, resize events) reads the game's
+// swap chain as a D3D12 swap chain: GetBuffer(ID3D12Resource), its creation
+// queue. An 11on12 swap chain answers none of that, so each part failed in
+// turn (queue misses, ~2 s menu stalls, "the scene's consumer is not visible").
+// Instead, the game's swap chain is created as a REAL D3D12 flip-model chain
+// on our queue. The game keeps D3D11 semantics: GetBuffer(0) hands it one
+// virtual back buffer (a D3D12 texture of ours wrapped once for D3D11), and
+// at Present that buffer is copied into the chain's current D3D12 buffer by a
+// D3D12 list submitted through the normal (observed) queue path, exactly like
+// a DX12 game's final copy. The program then sees a DX12 game, unchanged.
+bool Enabled();
+
+// Factory CreateSwapChain / CreateSwapChainForHwnd: when `device` is one of
+// our 11on12 devices and the description can be presented by D3D12, returns
+// true with the queue to create on (AddRef'ed) and the translated description.
+// False: create the chain as asked (native D3D11, or the old 11on12 chain).
+bool TranslateSwapChain(IUnknown* device, const DXGI_SWAP_CHAIN_DESC& game, DXGI_SWAP_CHAIN_DESC& real, ID3D12CommandQueue** queue);
+bool TranslateSwapChain1(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1& game, DXGI_SWAP_CHAIN_DESC1& real, ID3D12CommandQueue** queue);
+// After the translated chain was created: build the game's virtual back buffer.
+void AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_format, UINT game_count, DXGI_SWAP_EFFECT game_effect,
+                     DXGI_SAMPLE_DESC game_samples, DXGI_USAGE game_usage);
+bool IsTranslated(IDXGISwapChain* chain);
+
+// GetBuffer for anything but a D3D12 interface on a translated chain: the
+// virtual back buffer (the game's D3D11 view of its swap chain).
+bool HandleGetBuffer(IDXGISwapChain* chain, unsigned index, const GUID& riid, void** out, long* hr);
+// GetDevice that the D3D12 chain refused (e.g. ID3D11Device): the game's device.
+bool HandleGetDevice(IDXGISwapChain* chain, const GUID& riid, void** out);
+// Game descriptor queries: the game sees the description it asked for.
+void RewriteDesc(IDXGISwapChain* chain, DXGI_SWAP_CHAIN_DESC* desc);
+void RewriteDesc1(IDXGISwapChain* chain, DXGI_SWAP_CHAIN_DESC1* desc);
+
+// First thing in the game's Present / Present1: hand the virtual buffer's
+// picture to the chain's current D3D12 buffer (D3D11 work flushed first).
+void BeforePresent(IDXGISwapChain* chain, unsigned flags);
+// ResizeBuffers: waits for our copies, drops the virtual buffer, translates
+// the count/format/flags; AfterResize rebuilds the virtual buffer.
+void BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags, DXGI_FORMAT* game_format);
+void AfterResize(IDXGISwapChain* chain, long result, DXGI_FORMAT game_format);
+// The game is about to drop its last reference: wait for our GPU copies.
+void BeforeFinalRelease(IDXGISwapChain* chain);
+void ForgetSwapChain(IDXGISwapChain* chain);
 
 // One status line (no newline) for the 5-second status log.
 int FormatStatus(char* out, size_t capacity);

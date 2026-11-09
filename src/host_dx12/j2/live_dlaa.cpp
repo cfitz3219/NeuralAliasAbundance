@@ -3062,6 +3062,45 @@ double continuity(const na::camera::Matrix& m, bool injected)
     }
     return bonus + mirrored + std::acos(std::clamp(dot, -1.0, 1.0)) + std::sqrt(d2) / 25.0 + std::abs(v.sy - p.sy);
 }
+// First main camera without an inverse pair (2026-11-09, Call of Duty WWII through the DX11
+// bridge: the scene's view-projection is uploaded with the camera translation removed and no
+// inverse anywhere in the frame's constants, so the inverse-pair proof can never start the
+// camera; `loose` only continues a camera that already exists). A ViewProjection in the
+// scene list's most-used constant block that keeps the same slot and moves like one camera
+// over consecutive scene frames is accepted as the first main camera. Any later inverse pair
+// relearns the slot as before; the interloper rule still judges the result.
+struct CameraBoot {
+    bool valid = false;
+    uint64_t resource = 0, offset = 0, byte_offset = 0;
+    uint32_t param = 0;
+    bool table = false;
+    na::camera::Matrix vp{};
+    uint64_t frame = 0;
+    uint32_t streak = 0;
+};
+CameraBoot g_boot;
+constexpr uint32_t kBootFrames = 4;
+bool boot_continues(const na::camera::Matrix& a, const na::camera::Matrix& b)
+{
+    na::camera::VpGeometry u{}, v{};
+    if (!na::camera::DecomposeViewProjection(a, u) || !na::camera::DecomposeViewProjection(b, v)) return false;
+    double dot = 0, d2 = 0;
+    for (int j = 0; j < 3; ++j) { dot += u.forward[j] * v.forward[j]; d2 += (u.position[j] - v.position[j]) * (u.position[j] - v.position[j]); }
+    return dot > 0.9 && d2 <= 2500.0 && std::abs(u.sy - v.sy) <= 0.05 * std::abs(v.sy);
+}
+// Returns true when `c` (from block `o`, this frame) completes the streak.
+bool boot_camera(const Block* o, const na::camera::Candidate& c)
+{
+    const bool same_slot = g_boot.valid && g_boot.resource == o->resource && g_boot.offset == o->offset && g_boot.param == o->param &&
+                           g_boot.table == o->table && g_boot.byte_offset == c.byte_offset;
+    const bool consecutive = g_boot.valid && g_boot.frame + 1 == g.frame;
+    if (same_slot && consecutive && boot_continues(g_boot.vp, c.matrix)) ++g_boot.streak;
+    else g_boot.streak = 1;
+    g_boot.valid = true;
+    g_boot.resource = o->resource; g_boot.offset = o->offset; g_boot.param = o->param; g_boot.table = o->table;
+    g_boot.byte_offset = c.byte_offset; g_boot.vp = c.matrix; g_boot.frame = g.frame;
+    return g_boot.streak >= kBootFrames;
+}
 const CamPick* best_pick(const std::vector<CamPick>& v)
 {
     const CamPick* best = nullptr;
@@ -3298,6 +3337,9 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
     std::vector<BlockNote> notes;
     CamPick loose;               // a ViewProjection WITHOUT its inverse that continues the main camera
     bool have_loose = false;     // (accepted for this frame only; the slot is not relearned from it)
+    bool boot_seen = false;      // the first ViewProjection of the best-ranked block was judged this frame
+    bool have_boot = false;      // ... and completed its streak: the first main camera
+    CamPick boot;
     for (const Block* o : order) {
         if (picks.size() >= 4) break;
         na::camera::Snapshot s{};
@@ -3315,6 +3357,14 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
                 else ++bn.view;
             }
             if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
+            if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !boot_seen && !g_jit_cam.valid && !is_interloper(c.matrix)) {
+                boot_seen = true; // the best-ranked block's first camera-shaped matrix, once per frame
+                if (boot_camera(o, c)) {
+                    boot.vp = c.matrix; boot.reversed = c.reversed; boot.injected = holds_jittered(s.bytes, c.byte_offset);
+                    boot.block = o; boot.offset = static_cast<int64_t>(c.byte_offset); boot.inv_delta = 0;
+                    have_boot = true;
+                }
+            }
             if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix) && !is_interloper(c.matrix)) {
                 loose.vp = c.matrix;
                 loose.reversed = c.reversed;
@@ -3342,6 +3392,13 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
         }
     }
     const CamPick* p = picks.empty() ? nullptr : best_pick(picks);
+    if (!p && have_boot) {
+        // The first main camera, proven by persistence instead of an inverse pair. The slot is
+        // learned from it so the next frames read it first; the tracker inverts it itself.
+        ++g.stats.camera_bootstrapped;
+        g_boot = {};
+        p = &boot;
+    }
     if (!p && have_loose) {
         // The main camera's ViewProjection without an inverse beside it (a smaller per-view
         // block): the tracker inverts it itself; the inverse pair was only a validation, and

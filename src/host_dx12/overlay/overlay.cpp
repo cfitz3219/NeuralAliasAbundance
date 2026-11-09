@@ -90,6 +90,7 @@ namespace {
 constexpr uint32_t kSwapReleaseSlot = 2;          // IUnknown::Release on the swap chain (A71: same-window replacement)
 constexpr uint32_t kSwapPresentSlot = 8;
 constexpr uint32_t kSwapGetBufferSlot = 9;        // IDXGISwapChain::GetBuffer (A59 presenter)
+constexpr uint32_t kSwapGetDeviceSlot = 7;        // IDXGIDeviceSubObject::GetDevice (DX11 bridge: the game's D3D11 device)
 constexpr uint32_t kSwapResizeBuffersSlot = 13;
 constexpr uint32_t kSwapResizeTargetSlot = 14;
 constexpr uint32_t kSwapSetFullscreenStateSlot = 10; // IDXGISwapChain::SetFullscreenState
@@ -291,21 +292,68 @@ void small_attach(HWND w, IDXGISwapChain* sc)
 HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out)
 {
     DXGI_SWAP_CHAIN_DESC copy{};
-    if (d && na::j2::RenderSmall()) { copy = *d; small_native_dims(copy.OutputWindow, copy.BufferDesc.Width, copy.BufferDesc.Height); }
+    bool use_copy = false;
+    if (d && na::j2::RenderSmall()) { copy = *d; use_copy = true; small_native_dims(copy.OutputWindow, copy.BufferDesc.Width, copy.BufferDesc.Height); }
+    // DX11 game on our 11on12 device: its swap chain becomes a real D3D12 chain on our queue
+    // (the game keeps one virtual D3D11 back buffer; see on12::TranslateSwapChain).
+    ComPtr<ID3D12CommandQueue> on12_queue;
+    if (d && na::on12::Enabled()) {
+        DXGI_SWAP_CHAIN_DESC real{};
+        if (na::on12::TranslateSwapChain(dev, use_copy ? copy : *d, real, on12_queue.ReleaseAndGetAddressOf())) { copy = real; use_copy = true; }
+    }
     HRESULT hr;
-    { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, dev, d && na::j2::RenderSmall() ? &copy : d, out); }
-    if (SUCCEEDED(hr) && out && *out) { note_swapchain_queue(dev, *out); if (d) small_attach(d->OutputWindow, *out); }
+    { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, use_copy ? &copy : d, out); }
+    if (SUCCEEDED(hr) && out && *out) {
+        if (on12_queue) {
+            na::on12::AttachSwapChain(*out, dev, d->BufferDesc.Format, d->BufferCount, d->SwapEffect, d->SampleDesc, d->BufferUsage);
+            note_swapchain_queue(on12_queue.Get(), *out);
+        } else note_swapchain_queue(dev, *out);
+        if (d) small_attach(d->OutputWindow, *out);
+    }
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND w, const DXGI_SWAP_CHAIN_DESC1* d,
                                               const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* o, IDXGISwapChain1** out)
 {
     DXGI_SWAP_CHAIN_DESC1 copy{};
-    if (d && na::j2::RenderSmall()) { copy = *d; small_native_dims(w, copy.Width, copy.Height); }
+    bool use_copy = false;
+    if (d && na::j2::RenderSmall()) { copy = *d; use_copy = true; small_native_dims(w, copy.Width, copy.Height); }
+    ComPtr<ID3D12CommandQueue> on12_queue; // DX11 bridge: real D3D12 chain on our queue
+    if (d && na::on12::Enabled()) {
+        DXGI_SWAP_CHAIN_DESC1 real{};
+        if (na::on12::TranslateSwapChain1(dev, use_copy ? copy : *d, real, on12_queue.ReleaseAndGetAddressOf())) { copy = real; use_copy = true; }
+    }
     HRESULT hr;
-    { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, dev, w, d && na::j2::RenderSmall() ? &copy : d, fs, o, out); }
-    if (SUCCEEDED(hr) && out && *out) { note_swapchain_queue(dev, *out); small_attach(w, *out); }
+    { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, w, use_copy ? &copy : d, fs, o, out); }
+    if (SUCCEEDED(hr) && out && *out) {
+        if (on12_queue) {
+            na::on12::AttachSwapChain(*out, dev, d->Format, d->BufferCount, d->SwapEffect, d->SampleDesc, d->BufferUsage);
+            note_swapchain_queue(on12_queue.Get(), *out);
+        } else note_swapchain_queue(dev, *out);
+        small_attach(w, *out);
+    }
     return hr;
+}
+// The caller of a hooked swap-chain method is this DLL (no rewrite) or someone else (the game, or
+// a module acting for it).
+bool caller_in_our_module(const void* caller)
+{
+    static const auto range = [] {
+        HMODULE m = nullptr;
+        MEMORY_BASIC_INFORMATION mbi{};
+        std::pair<uintptr_t, uintptr_t> r{0, 0};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&caller_in_our_module), &m) && m &&
+            VirtualQuery(m, &mbi, sizeof mbi)) {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(m) + dos->e_lfanew);
+            r.first = reinterpret_cast<uintptr_t>(m);
+            r.second = r.first + nt->OptionalHeader.SizeOfImage;
+        }
+        return r;
+    }();
+    const auto p = reinterpret_cast<uintptr_t>(caller);
+    return p >= range.first && p < range.second;
 }
 // Render-small: the game's own descriptor queries see the render size; ours and other modules' stay real.
 using GetDescFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, DXGI_SWAP_CHAIN_DESC*);
@@ -316,14 +364,18 @@ HRESULT STDMETHODCALLTYPE DetourGetDesc(IDXGISwapChain* sc, DXGI_SWAP_CHAIN_DESC
 {
     const void* caller = _ReturnAddress();
     const HRESULT hr = g_orig_get_desc(sc, d);
-    if (SUCCEEDED(hr) && d && na::native_present::GameCaller(caller)) na::native_present::RewriteDesc(d);
+    if (SUCCEEDED(hr) && d && !caller_in_our_module(caller)) {
+        na::on12::RewriteDesc(sc, d); // DX11 bridge: the game sees the D3D11 description it asked for
+        if (na::j2::RenderSmall() && na::native_present::GameCaller(caller)) na::native_present::RewriteDesc(d);
+    }
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourGetDesc1(IDXGISwapChain1* sc, DXGI_SWAP_CHAIN_DESC1* d)
 {
     const void* caller = _ReturnAddress();
     const HRESULT hr = g_orig_get_desc1(sc, d);
-    if (SUCCEEDED(hr) && d && na::native_present::GameCaller(caller)) {
+    if (SUCCEEDED(hr) && d && !caller_in_our_module(caller)) na::on12::RewriteDesc1(sc, d);
+    if (SUCCEEDED(hr) && d && na::j2::RenderSmall() && na::native_present::GameCaller(caller)) {
         HWND w = nullptr;
         { na::native_present::NativeScope native; if (FAILED(sc->GetHwnd(&w))) w = nullptr; }
         if (w) na::native_present::RewriteDesc1(w, d);
@@ -1209,12 +1261,12 @@ void write_status_line()
         {
             char cl[320]; // camera choice and loss reasons (Sniper steep-view flicker, 2026-11-01)
             const int cn = snprintf(cl, sizeof(cl),
-                "j2_camera contested=%llu alternatives=%llu lost_unread=%llu lost_no_vp=%llu lost_no_inverse=%llu lost_capped=%llu other_cam=%llu jitter_slot_other=%llu inverse_computed=%llu\r\n",
+                "j2_camera contested=%llu alternatives=%llu lost_unread=%llu lost_no_vp=%llu lost_no_inverse=%llu lost_capped=%llu other_cam=%llu jitter_slot_other=%llu inverse_computed=%llu bootstrapped=%llu\r\n",
                 static_cast<unsigned long long>(j2.camera_contested), static_cast<unsigned long long>(j2.camera_alternatives),
                 static_cast<unsigned long long>(j2.camera_lost_unread), static_cast<unsigned long long>(j2.camera_lost_no_vp),
                 static_cast<unsigned long long>(j2.camera_lost_no_inverse), static_cast<unsigned long long>(j2.camera_lost_capped),
                 static_cast<unsigned long long>(j2.other_camera_blocks), static_cast<unsigned long long>(j2.jitter_slot_other_camera),
-                static_cast<unsigned long long>(j2.camera_inverse_computed));
+                static_cast<unsigned long long>(j2.camera_inverse_computed), static_cast<unsigned long long>(j2.camera_bootstrapped));
             if (cn > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(cn, static_cast<int>(sizeof(cl) - 1))), &written, nullptr);
             // Per present: why a frame had no DLAA / why a DLAA frame had no jitter (SE5 flicker, 2026-11-02).
             char ml[384];
@@ -3531,6 +3583,7 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
+    na::on12::BeforePresent(sc, flags); // DX11 bridge: the game's picture reaches the D3D12 chain as an observed copy
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) {
         // Discovery must see the game's Present here too: without it, its frame never ends (scores add up
         // from boot) and the swapchain size stays unknown, so after a render-size change a shadow map won
@@ -3559,6 +3612,7 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
+    na::on12::BeforePresent(sc, flags); // DX11 bridge: the game's picture reaches the D3D12 chain as an observed copy
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) {
         // Discovery must see the game's Present here too: without it, its frame never ends (scores add up
         // from boot) and the swapchain size stays unknown, so after a render-size change a shadow map won
@@ -3581,8 +3635,18 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
 HRESULT STDMETHODCALLTYPE DetourGetBuffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out)
 {
     HRESULT hr = S_OK;
+    // DX11 bridge: a D3D11 interface asked of a translated chain is the game's virtual back buffer.
+    if (sc != g_state.dummy_swapchain_identity && na::on12::HandleGetBuffer(sc, index, riid, out, &hr)) return hr;
     if (!t_native_buffer_read && sc != g_state.dummy_swapchain_identity && na::present::HandleGetBuffer(sc, index, riid, out, &hr)) return hr;
     return g_orig_get_buffer(sc, index, riid, out);
+}
+using GetDeviceFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, REFIID, void**);
+GetDeviceFn g_orig_get_device = nullptr;
+HRESULT STDMETHODCALLTYPE DetourGetDevice(IDXGISwapChain* sc, REFIID riid, void** out)
+{
+    const HRESULT hr = g_orig_get_device(sc, riid, out);
+    if (FAILED(hr) && out && na::on12::HandleGetDevice(sc, riid, out)) return S_OK; // the game's D3D11 device
+    return hr;
 }
 UINT STDMETHODCALLTYPE DetourGetCurrentBackBufferIndex(IDXGISwapChain3* sc)
 {
@@ -3655,8 +3719,13 @@ ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
 {
     if (t_in_our_release || na::present::InTeardownRelease() || !obj || obj == g_state.dummy_swapchain_identity) return g_orig_release(obj);
     auto* sc = static_cast<IDXGISwapChain*>(obj);
+    if (na::on12::IsTranslated(sc)) { // our copies may still run on the chain's buffers
+        obj->AddRef();
+        if (g_orig_release(obj) == 1) na::on12::BeforeFinalRelease(sc);
+    }
     ULONG n = g_orig_release(obj);
     if (n == 0) {
+        na::on12::ForgetSwapChain(sc);
         on_chain_gone(sc);
         return 0;
     }
@@ -3722,7 +3791,10 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
+    DXGI_FORMAT on12_game_format=DXGI_FORMAT_UNKNOWN;
+    na::on12::BeforeResize(sc,&count,&fmt,&flags,&on12_game_format); // DX11 bridge: D3D12 chain parameters
     const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
+    na::on12::AfterResize(sc,result,on12_game_format);
     na::present::AfterResize(sc,result);
     na::observe::SwapchainResized(sc,result);return result;
 }
@@ -4124,12 +4196,15 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 // Swap-chain creation on the shared factory vtable (after our own dummy
                 // chain exists, so it is never recorded). Late attachments recover
                 // per-buffer queues from submitted writes instead.
-                if (na::j2::RenderSmall()) { // render-small size spoof on the game's descriptor queries
+                if (na::j2::RenderSmall() || na::on12::Enabled()) { // render-small size spoof / DX11 bridge description
                     prepare_start_hook(sc.Get(), kSwapGetDescSlot, reinterpret_cast<void*>(&DetourGetDesc),
                                        reinterpret_cast<void**>(&g_orig_get_desc));
                     prepare_start_hook(sc.Get(), kSwap1GetDesc1Slot, reinterpret_cast<void*>(&DetourGetDesc1),
                                        reinterpret_cast<void**>(&g_orig_get_desc1));
                 }
+                if (na::on12::Enabled()) // the game's ID3D11Device from its (D3D12) swap chain
+                    prepare_start_hook(sc.Get(), kSwapGetDeviceSlot, reinterpret_cast<void*>(&DetourGetDevice),
+                                       reinterpret_cast<void**>(&g_orig_get_device));
                 prepare_start_hook(factory.Get(), kFactoryCreateSwapChainSlot,
                                             reinterpret_cast<void*>(&DetourCreateSwapChain),
                                             reinterpret_cast<void**>(&g_orig_create_swapchain));
