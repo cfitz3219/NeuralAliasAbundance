@@ -1341,6 +1341,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
 // (in the same order; D3D12 leaves overlapping source/destination undefined). Anything unusual (an
 // unresolved heap, a run crossing a heap end, too many runs or stripes) returns false BEFORE any
 // change and the caller uses the per-run path unchanged.
+std::atomic<uint64_t> g_copy_simple{0}, g_copy_calls{0}, g_copy_batched{0}, g_copy_batched_runs{0}; // per-API-call shape (status line)
 bool note_descriptor_copies_batch(const uint64_t* dst, const uint64_t* src, const uint32_t* cnt, uint32_t n, uint32_t increment)
 {
     constexpr uint32_t kMaxRuns = 64, kMaxStripes = 32;
@@ -1413,6 +1414,7 @@ bool note_descriptor_copies_batch(const uint64_t* dst, const uint64_t* src, cons
         for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
     }
     g_c.copies.fetch_add(n);
+    g_copy_batched.fetch_add(1, std::memory_order_relaxed); g_copy_batched_runs.fetch_add(n, std::memory_order_relaxed);
     for (uint32_t r = 0; r < n; ++r) if (want_ev[r]) emit(ev[r], NA_GROUP_DESCRIPTOR);
     return true;
 }
@@ -2014,6 +2016,7 @@ void STDMETHODCALLTYPE D_CopyDescriptors(ID3D12Device* dev, UINT nd, const D3D12
             soff += run;
         }
     }
+    g_copy_calls.fetch_add(1, std::memory_order_relaxed);
     if (fits && note_descriptor_copies_batch(bd, bs, bc, nb, inc)) return;
     uint32_t di = 0, si = 0, doff = 0, soff = 0;
     while (di < nd && si < ns) {
@@ -2031,6 +2034,7 @@ void STDMETHODCALLTYPE D_CopyDescriptorsSimple(ID3D12Device* dev, UINT n, D3D12_
                                                D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
     o_CopyDescriptorsSimple(dev, n, dst, src, type);
+    g_copy_simple.fetch_add(1, std::memory_order_relaxed);
     note_descriptor_copy(dst.ptr, src.ptr, n, descriptor_increment(dev, type));
 }
 
@@ -7324,9 +7328,12 @@ int FormatReadFilter(char* out, size_t n)
     bool overflow;
     uint32_t ids;
     { std::lock_guard<std::mutex> lk(g_hot_pending_m); overflow = g_hot_overflow; ids = g_hot_known_n; }
-    return std::snprintf(out, n, "read_filter ready=%u ids=%u overflow=%u rebuilds=%llu skipped=%llu walked=%llu",
+    return std::snprintf(out, n, "read_filter ready=%u ids=%u overflow=%u rebuilds=%llu skipped=%llu walked=%llu"
+        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu",
         g_hot_ready.load() ? 1u : 0u, ids, overflow ? 1u : 0u, (unsigned long long)g_hot_rebuilds.load(),
-        (unsigned long long)g_hot_skipped.load(), (unsigned long long)g_hot_walked.load());
+        (unsigned long long)g_hot_skipped.load(), (unsigned long long)g_hot_walked.load(),
+        (unsigned long long)g_copy_simple.load(), (unsigned long long)g_copy_calls.load(),
+        (unsigned long long)g_copy_batched.load(), (unsigned long long)g_copy_batched_runs.load());
 }
 void ResetDerived()
 {
