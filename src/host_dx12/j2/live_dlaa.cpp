@@ -65,6 +65,10 @@
 using Microsoft::WRL::ComPtr;
 
 namespace na::j2 {
+// A camera whose inverse the game never uploads: the tracker derives it. Stored in
+// g.camera_inv_delta so every "inverse at its learned position" read is out of bounds and
+// the derived path is taken; check_learned accepts the ViewProjection alone in that state.
+constexpr int64_t kDerivedInverse = INT64_MIN;
 namespace {
 
 constexpr uint32_t kRing = 6;            // frames in flight before a slot is reused (never waited on)
@@ -2506,7 +2510,7 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
                 if (!na::camera::Invert(m, inv)) continue;
             }
         } else {
-            if (slot || !na::camera::Invert(m, inv)) continue;
+            if ((slot && g.camera_inv_delta != kDerivedInverse) || !na::camera::Invert(m, inv)) continue;
         }
         remember_main_camera(m);
         const uint32_t phases = windowed ? JitterPhasesFor(jw, g.win.w) : jitter_phases();
@@ -3005,6 +3009,11 @@ bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bo
         na::camera::Candidate c{};
         if (!na::camera::ViewProjection(m, c)) continue;
         have_vp=true;
+        if (g.camera_inv_delta == kDerivedInverse) { // the game uploads no inverse: the ViewProjection is the slot's proof
+            *vp = m;
+            *reversed = c.reversed;
+            return true;
+        }
         for (int64_t d : {g.camera_inv_delta}) { // the learned inverse position (Anno: not adjacent)
             const int64_t off = g.camera_offset + d;
             if (off < 0 || static_cast<uint64_t>(off) + 64 > n) continue;
@@ -3069,14 +3078,18 @@ double continuity(const na::camera::Matrix& m, bool injected)
 // scene list's most-used constant block that keeps the same slot and moves like one camera
 // over consecutive scene frames is accepted as the first main camera. Any later inverse pair
 // relearns the slot as before; the interloper rule still judges the result.
+// The slot is logical (root parameter, table or not, byte offset inside the block), never the
+// physical buffer: translated upload rings rotate resource+offset every frame (Astra, p12724).
+// One verdict per frame: same-frame retries of the scan reuse it instead of restarting the streak.
 struct CameraBoot {
     bool valid = false;
-    uint64_t resource = 0, offset = 0, byte_offset = 0;
+    uint64_t byte_offset = 0;
     uint32_t param = 0;
     bool table = false;
     na::camera::Matrix vp{};
     uint64_t frame = 0;
     uint32_t streak = 0;
+    bool verdict = false;
 };
 CameraBoot g_boot;
 constexpr uint32_t kBootFrames = 4;
@@ -3091,15 +3104,16 @@ bool boot_continues(const na::camera::Matrix& a, const na::camera::Matrix& b)
 // Returns true when `c` (from block `o`, this frame) completes the streak.
 bool boot_camera(const Block* o, const na::camera::Candidate& c)
 {
-    const bool same_slot = g_boot.valid && g_boot.resource == o->resource && g_boot.offset == o->offset && g_boot.param == o->param &&
-                           g_boot.table == o->table && g_boot.byte_offset == c.byte_offset;
-    const bool consecutive = g_boot.valid && g_boot.frame + 1 == g.frame;
+    if (g_boot.valid && g_boot.frame == g.frame) return g_boot.verdict; // already judged this frame
+    const bool same_slot = g_boot.valid && g_boot.param == o->param && g_boot.table == o->table && g_boot.byte_offset == c.byte_offset;
+    const bool consecutive = g_boot.valid && g.frame > g_boot.frame && g.frame - g_boot.frame <= 2; // a menu frame between is tolerated
     if (same_slot && consecutive && boot_continues(g_boot.vp, c.matrix)) ++g_boot.streak;
     else g_boot.streak = 1;
     g_boot.valid = true;
-    g_boot.resource = o->resource; g_boot.offset = o->offset; g_boot.param = o->param; g_boot.table = o->table;
+    g_boot.param = o->param; g_boot.table = o->table;
     g_boot.byte_offset = c.byte_offset; g_boot.vp = c.matrix; g_boot.frame = g.frame;
-    return g_boot.streak >= kBootFrames;
+    g_boot.verdict = g_boot.streak >= kBootFrames;
+    return g_boot.verdict;
 }
 const CamPick* best_pick(const std::vector<CamPick>& v)
 {
@@ -3361,7 +3375,7 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
                 boot_seen = true; // the best-ranked block's first camera-shaped matrix, once per frame
                 if (boot_camera(o, c)) {
                     boot.vp = c.matrix; boot.reversed = c.reversed; boot.injected = holds_jittered(s.bytes, c.byte_offset);
-                    boot.block = o; boot.offset = static_cast<int64_t>(c.byte_offset); boot.inv_delta = 0;
+                    boot.block = o; boot.offset = static_cast<int64_t>(c.byte_offset); boot.inv_delta = kDerivedInverse;
                     have_boot = true;
                 }
             }
