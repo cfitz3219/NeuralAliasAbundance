@@ -266,6 +266,7 @@ void report_wrapped()
 bool wanted(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, UINT flags, void* out_device)
 {
     if (!g_enabled.load() || t_inside > 0) return false;
+    if (na::host::IsInternalGraphicsCall()) return false;
     if (!out_device) { g_probes.fetch_add(1); return false; } // feature-level probe
     if (flags & D3D11_CREATE_DEVICE_DEBUG) { note("debug-layer device requested; native DX11"); return false; }
     if (adapter ? type != D3D_DRIVER_TYPE_UNKNOWN : type != D3D_DRIVER_TYPE_HARDWARE) {

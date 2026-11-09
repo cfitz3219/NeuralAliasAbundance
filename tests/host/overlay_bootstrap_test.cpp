@@ -7,6 +7,9 @@
 #include "host_dx12/settings.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
+#include <d3d11.h>
+#include <d3d11on12.h>
 #include <filesystem>
 
 namespace {std::atomic<unsigned> submits{0},devices{0};
@@ -18,6 +21,7 @@ int main(int argc,char** argv) {
     const bool optional_input=argc>1 && !strcmp(argv[1],"--optional-input");
     const bool create_failure=argc>1 && !strcmp(argv[1],"--menu-create-failure");
     const bool recovery=argc>1 && !strcmp(argv[1],"--recovery");
+    const bool on12_ownership=argc>1 && !strcmp(argv[1],"--on12-ownership");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",L"1");
     wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
     const auto dir=std::filesystem::path(exe).parent_path();
@@ -36,6 +40,7 @@ int main(int argc,char** argv) {
     set(L"unreal",L"probe",L"0");set(L"unreal",L"screen_percentage",L"0");
     set(L"settings",L"scope",scope.c_str());set(L"present",L"proxy",L"0");
     set(L"dlss",L"enabled",L"0");
+    if(on12_ownership)set(L"dx11on12",L"enabled",L"1");
     if(recovery){
         na::settings::SetIniPath(ini.c_str());na::settings::Load();
         const auto marker=std::wstring(na::settings::UserIniPath())+L".session";
@@ -69,6 +74,29 @@ int main(int argc,char** argv) {
     CHECK(observed.Get()==d.queue.Get());
     for(unsigned i=0;i<400 && !na::host::GetStatus().init_complete;++i)Sleep(5);
     REQUIRE(na::host::GetStatus().init_complete==1);
+    if(on12_ownership){
+        const D3D_FEATURE_LEVEL level=D3D_FEATURE_LEVEL_11_0;
+        auto make_device=[&](bool translated){
+            test::ComPtr<ID3D11Device> dev;
+            test::ComPtr<ID3D11DeviceContext> context;
+            REQUIRE(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,
+                &level,1,D3D11_SDK_VERSION,&dev,nullptr,&context)));
+            test::ComPtr<ID3D11On12Device> bridge;
+            CHECK(SUCCEEDED(dev.As(&bridge))==translated);
+            test::ComPtr<ID3D12CommandQueue> queue;
+            queue.Attach(na::on12::QueueFor(dev.Get()));
+            CHECK(bool(queue)==translated);
+            return 0;
+        };
+        {
+            // A DX11 helper created while our bootstrap owns graphics setup
+            // must remain native. Returning to the game thread restores wrapping.
+            na::host::InternalFactoryScope internal;
+            {na::host::InternalFactoryScope nested;REQUIRE(make_device(false)==0);}
+            REQUIRE(make_device(false)==0);
+        }
+        REQUIRE(make_device(true)==0);
+    }
     if(create_failure)na::overlay::FailNextMenuCreateForTests();
     REQUIRE(SUCCEEDED(chain->Present(0,0)));d.WaitIdle();
     if(cursor_cleanup){

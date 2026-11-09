@@ -91,6 +91,7 @@ void set_error(const char* text)
 DWORD WINAPI InitThread(LPVOID)
 {
     g_init_thread.store(GetCurrentThreadId());
+    InternalFactoryScope internal_graphics;
     struct Release { ~Release() { signal_install_attempted(); } } release; // every exit path
     boot_log("host init thread entered");
     // Once hooks go in, this module must never unload.
@@ -485,6 +486,7 @@ void WaitForObserveInstall()
 
 InternalFactoryScope::InternalFactoryScope() { ++t_internal_factory_depth; }
 InternalFactoryScope::~InternalFactoryScope() { --t_internal_factory_depth; }
+bool IsInternalGraphicsCall() { return t_internal_factory_depth != 0; }
 
 Status GetStatus()
 {

@@ -58,4 +58,8 @@ public:
     InternalFactoryScope& operator=(const InternalFactoryScope&) = delete;
 };
 
+// Device creation nested in our own graphics setup belongs to the runtime,
+// not the game's renderer. The 11on12 hook must forward it unchanged too.
+bool IsInternalGraphicsCall();
+
 } // namespace na::host

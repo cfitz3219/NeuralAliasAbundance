@@ -78,6 +78,7 @@
 #include <ctime>
 #include "host_dx12/settings.hpp"
 #include "host_dx12/host_boot/session.hpp"
+#include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 #include "host_dx12/latency/pcl_stats.hpp"
 
@@ -3983,6 +3984,10 @@ const na::slb::OverlayHooks g_boundary_hooks = make_boundary_hooks();
 
 bool StartCore(const char* route_tag, PanelFn controls)
 {
+    // Drivers/other graphics layers may create a D3D11 helper while our
+    // throwaway D3D12 device is being built. Translating that helper on a
+    // worker can wait on the very D3D12 creation this caller already owns.
+    na::host::InternalFactoryScope internal_graphics;
     std::lock_guard<std::mutex> start_lock(g_start_m);
     if(g_core_started.load(std::memory_order_acquire))return true;
     QueryPerformanceFrequency(&g_state.qpc_freq);
