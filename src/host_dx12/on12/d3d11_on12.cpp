@@ -31,7 +31,7 @@ CreateDeviceAndSwapChainFn g_orig_create_sc = nullptr;
 On12CreateDeviceFn g_on12_create = nullptr;
 D3D12CreateDeviceFn g_d3d12_create = nullptr;
 LogFn g_log = nullptr;
-std::atomic<bool> g_enabled{false}, g_hooked{false};
+std::atomic<bool> g_enabled{false}, g_hooked{false}, g_menu_buffer{true};
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
 struct Entry { IUnknown* identity = nullptr; ID3D12Device* device = nullptr; ID3D12CommandQueue* queue = nullptr; };
@@ -250,6 +250,7 @@ void Start(const wchar_t* ini, LogFn log)
               na::hooking::HookFunction(create, reinterpret_cast<void*>(&DetourCreateDevice), reinterpret_cast<void**>(&g_orig_create)) &&
               na::hooking::HookFunction(create_sc, reinterpret_cast<void*>(&DetourCreateDeviceAndSwapChain), reinterpret_cast<void**>(&g_orig_create_sc));
     if (!ok) { note("could not hook D3D11CreateDevice; DX11 bridge off"); return; }
+    g_menu_buffer.store(GetPrivateProfileIntW(L"dx11on12", L"menu_buffer", 1, ini) != 0); // 0 = diagnostic: never borrow the back buffer
     g_hooked.store(true);
     g_enabled.store(true);
     note("D3D11 device creation hooked; the game's DX11 device will run on D3D12");
@@ -298,7 +299,7 @@ void add_time(std::atomic<uint64_t>& total, std::atomic<uint64_t>& peak, uint64_
 
 bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, ID3D12Resource** out, Borrowed& borrowed)
 {
-    if (!g_hooked.load() || !sc || !queue || !out) return false;
+    if (!g_hooked.load() || !g_menu_buffer.load() || !sc || !queue || !out) return false;
     ComPtr<IUnknown> any;
     if (FAILED(sc->GetDevice(IID_PPV_ARGS(&any)))) return false;
     ComPtr<ID3D11On12Device2> device;
