@@ -132,6 +132,17 @@ int main()
         CHECK(!na::observe::ResolveGpuVa(cbuf->GetGPUVirtualAddress() + 65536 + 4096 * 64, &r, &off) || r != cbuf_id);
     }
 
+    {
+        // FindTextures answers from the (w, h) index: exact size and format, nothing else.
+        const uint32_t rgba8[] = {DXGI_FORMAT_R8G8B8A8_UNORM};
+        const uint32_t f16[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_FLOAT};
+        na_object_id found[4] = {};
+        CHECK(na::observe::FindTextures(rgba8, 1, 64, 32, found, 4) == 1 && found[0] == placed_id);
+        CHECK(na::observe::FindTextures(f16, 2, 128, 64, found, 4) == 1 && found[0] == rt_id);
+        CHECK(na::observe::FindTextures(f16, 2, 64, 32, found, 4) == 0);   // right size, other format
+        CHECK(na::observe::FindTextures(rgba8, 1, 64, 64, found, 4) == 0); // no texture of that size
+    }
+
     std::printf("checkpoint 3\n"); std::fflush(stdout);
     // Descriptor heaps and writes.
     D3D12_DESCRIPTOR_HEAP_DESC dhd{};
@@ -358,6 +369,9 @@ int main()
         for (const auto& r : All<na_ev_object_retired>(NA_EV_OBJECT_RETIRED))
             if (r.object == placed_id) retired = r.object_kind == NA_OBJ_RESOURCE;
         CHECK(retired);
+        const uint32_t rgba8[] = {DXGI_FORMAT_R8G8B8A8_UNORM};
+        na_object_id found[2] = {};
+        CHECK(na::observe::FindTextures(rgba8, 1, 64, 32, found, 2) == 0); // left the (w, h) index with its retirement
         CHECK(na::observe::IdOf(placed.Get()) == 0);
     }
     {

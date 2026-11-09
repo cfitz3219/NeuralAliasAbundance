@@ -350,9 +350,9 @@ std::vector<std::unique_ptr<DescHeap>> g_heaps;
 // of the scene colour or of a copy of it. g_hot_ids is a superset of both (the selected colour
 // plus every copy ever seen); each heap keeps one bit per slot for "SRV of a hot id". When no
 // bound SRV range has a hot bit, the walk's result is known (no colour read, no derived read)
-// and it is skipped; otherwise the original walk runs unchanged. The set changes only under the
-// exclusive g_m (RefreshReadFilter, called at Present with no lock held), which recomputes every
-// bit; until then g_hot_ready is false and every draw takes the original walk.
+// and it is skipped; otherwise the original walk runs unchanged. The set grows only through RefreshReadFilter
+// (called at Present with no lock held), which publishes the ids and then adds the bits heap by
+// heap in chunks; until that scan is complete g_hot_ready is false and every draw takes the original walk.
 constexpr uint32_t kHotMax = 64;
 na_object_id g_hot_ids[kHotMax] = {}; // read under the shared g_m, written under the exclusive g_m
 uint32_t g_hot_n = 0;
@@ -456,6 +456,38 @@ bool cpu_visible_heap(const D3D12_HEAP_PROPERTIES& p)
 }
 std::unordered_map<na_object_id, BufferInfo> g_buffers; // under g_m
 std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> canonical object (C9b), under g_m
+// 2D textures by (width, height), kept beside g_res_keys under g_m so FindTextures is a
+// bucket lookup. Before this (p49040, WWII 11on12) the lookup walked every resource and ran
+// three to four times per DLAA evaluation on the translator thread: ~18 ms of each frame.
+std::unordered_map<uint64_t, std::vector<na_object_id>> g_tex2d_by_dims;
+std::unordered_map<na_object_id, uint64_t> g_tex2d_dims; // id -> its key, for retirement
+inline uint64_t tex2d_key(uint64_t w, uint32_t h) { return (w << 32) | h; }
+void tex2d_index_add_locked(na_object_id id, const D3D12_RESOURCE_DESC& d)
+{
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    const uint64_t key = tex2d_key(d.Width, d.Height);
+    const auto prev = g_tex2d_dims.find(id);
+    if (prev != g_tex2d_dims.end()) {
+        if (prev->second == key) return; // re-registered with the same description
+        auto& v = g_tex2d_by_dims[prev->second];
+        v.erase(std::remove(v.begin(), v.end(), id), v.end());
+        if (v.empty()) g_tex2d_by_dims.erase(prev->second);
+    }
+    g_tex2d_dims[id] = key;
+    g_tex2d_by_dims[key].push_back(id);
+}
+void tex2d_index_erase_locked(na_object_id id)
+{
+    const auto it = g_tex2d_dims.find(id);
+    if (it == g_tex2d_dims.end()) return;
+    const auto b = g_tex2d_by_dims.find(it->second);
+    if (b != g_tex2d_by_dims.end()) {
+        auto& v = b->second;
+        v.erase(std::remove(v.begin(), v.end(), id), v.end());
+        if (v.empty()) g_tex2d_by_dims.erase(b);
+    }
+    g_tex2d_dims.erase(it);
+}
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
@@ -815,6 +847,7 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         }
         g_buffers.erase(id);
         g_res_keys.erase(id);
+        tex2d_index_erase_locked(id);
     }
     ReleaseLater(std::move(drop));
     if (kind == NA_OBJ_RESOURCE) known_forget(id);
@@ -1010,6 +1043,7 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
     {
         std::unique_lock<RegistryLock> lock(g_m);
         g_res_keys[id] = canon(obj);
+        tex2d_index_add_locked(id, d);
     }
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         std::unique_lock<RegistryLock> lock(g_m);
@@ -1078,6 +1112,7 @@ na_object_id ensure_resource_registered(ID3D12Resource* res)
     {
         std::unique_lock<RegistryLock> lock(g_m);
         g_res_keys[id] = canon(res);
+        tex2d_index_add_locked(id, d);
         if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             BufferInfo& bi = g_buffers[id];
             bi.heap_type = e.heap_type;
@@ -1370,7 +1405,8 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
 std::atomic<uint64_t> g_copy_simple{0}, g_copy_calls{0}, g_copy_batched{0}, g_copy_batched_runs{0}; // per-API-call shape (status line)
 bool note_descriptor_copies_batch(const uint64_t* dst, const uint64_t* src, const uint32_t* cnt, uint32_t n, uint32_t increment)
 {
-    constexpr uint32_t kMaxRuns = 64, kMaxStripes = 32;
+    // A gather of 64 single-descriptor sources can touch 64 source stripes plus the destination's.
+    constexpr uint32_t kMaxRuns = 64, kMaxStripes = 96;
     if (n < 2 || n > kMaxRuns || !increment) return false;
     struct Run { DescHeap* dh; DescHeap* sh; uint32_t ds, ss; };
     Run runs[kMaxRuns];
@@ -7417,48 +7453,92 @@ bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->insertion.ColorEvents(color, out);
 }
+// Incremental rebuild (2026-11-09, run 48522d0: the first version rescanned EVERY slot of every heap
+// under the exclusive g_m on the present thread whenever the set changed, and also took that lock on
+// every Present while no scene was selected or after an overflow; D3D11On12's online view heap holds
+// about a million descriptors, so each pass stalled the translator thread for milliseconds).
+// Now: the ids are published first (exclusive g_m held only for that copy, no scan), then the slots
+// are scanned in chunks of kHotScanChunk per Present under the SHARED g_m and each word's stripe,
+// on the present thread. The scan only ADDS bits (the id set only grows), and every write or copy
+// that lands during the scan computes its own bit from the already-published set, so when the
+// last chunk is done the bits are exact. Until then g_hot_ready stays false (the original walk).
+constexpr uint32_t kHotScanChunk = 32768; // slots per Present (~1.5 MB of SlotInfo, well under a millisecond)
+bool g_hot_scan_active = false;           // present thread only
+size_t g_hot_scan_heap = 0;               // index into g_hot_scan_ids
+uint32_t g_hot_scan_word = 0;
+std::vector<na_object_id> g_hot_scan_ids; // heap ids snapshot when the scan began (heaps may come and go)
 void RefreshReadFilter()
 {
     if (g_hot_ready.load(std::memory_order_acquire) || t_host_work) return;
     uint64_t depth = 0, color = 0;
     GetLiveSelection(&depth, &color);
-    std::unique_lock<RegistryLock> lock(g_m); // no hook reads or writes slots meanwhile
-    std::lock_guard<std::mutex> lk(g_hot_pending_m);
-    if (g_hot_overflow) return;
-    na_object_id ids[kHotMax];
-    uint32_t n = 0;
-    const auto add = [&](na_object_id id) {
-        if (!id || id == NA_UNKNOWN_U64) return true;
-        for (uint32_t i = 0; i < n; ++i) if (ids[i] == id) return true;
-        if (n == kHotMax) return false;
-        ids[n++] = id;
-        return true;
-    };
-    bool fits = add(color);
-    for (uint32_t i = 0; fits && i < g_hot_known_n; ++i) fits = add(g_hot_known[i]);
-    for (uint32_t i = 0; fits && i < g_hot_pending_n; ++i) fits = add(g_hot_pending[i]);
-    if (!fits) { g_hot_overflow = true; return; }
-    std::copy_n(ids, n, g_hot_ids);
-    g_hot_n = n;
-    g_hot_color = color;
-    std::copy_n(ids, n, g_hot_known);
-    g_hot_known_n = n;
-    g_hot_pending_n = 0;
-    for (auto& h : g_heaps) {
-        if (!h->hot) continue;
-        for (uint32_t w = 0; w < h->nstripes; ++w) {
-            uint64_t bits = 0;
-            const uint64_t base = uint64_t(w) << kStripeShift;
-            for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
-                const auto& si = h->info[static_cast<size_t>(base + b)];
-                if (si.kind == NA_DESC_SRV && hot_id_locked(si.resource)) bits |= 1ull << b;
+    if (!color) { g_hot_scan_active = false; return; } // nothing to filter for; no lock taken
+    { std::lock_guard<std::mutex> lk(g_hot_pending_m); if (g_hot_overflow) return; }
+    if (!g_hot_scan_active) {
+        // Publish the grown id set, then start the scan from the first heap.
+        na_object_id ids[kHotMax];
+        uint32_t n = 0;
+        {
+            std::unique_lock<RegistryLock> lock(g_m); // brief: the id copy and the heap snapshot only
+            std::lock_guard<std::mutex> lk(g_hot_pending_m);
+            const auto add = [&](na_object_id id) {
+                if (!id || id == NA_UNKNOWN_U64) return true;
+                for (uint32_t i = 0; i < n; ++i) if (ids[i] == id) return true;
+                if (n == kHotMax) return false;
+                ids[n++] = id;
+                return true;
+            };
+            bool fits = add(color);
+            for (uint32_t i = 0; fits && i < g_hot_known_n; ++i) fits = add(g_hot_known[i]);
+            for (uint32_t i = 0; fits && i < g_hot_pending_n; ++i) fits = add(g_hot_pending[i]);
+            if (!fits) { g_hot_overflow = true; return; }
+            std::copy_n(ids, n, g_hot_ids);
+            g_hot_n = n;
+            g_hot_color = color;
+            std::copy_n(ids, n, g_hot_known);
+            g_hot_known_n = n;
+            g_hot_pending_n = 0;
+            g_hot_scan_ids.clear();
+            for (auto& h : g_heaps) if (h->hot) g_hot_scan_ids.push_back(h->id);
+        }
+        g_hot_scan_active = true;
+        g_hot_scan_heap = 0;
+        g_hot_scan_word = 0;
+    }
+    uint32_t budget = kHotScanChunk;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        while (budget && g_hot_scan_heap < g_hot_scan_ids.size()) {
+            DescHeap* h = nullptr;
+            for (auto& x : g_heaps) if (x->id == g_hot_scan_ids[g_hot_scan_heap]) { h = x.get(); break; }
+            if (!h || !h->hot) { ++g_hot_scan_heap; g_hot_scan_word = 0; continue; } // retired meanwhile
+            for (; g_hot_scan_word < h->nstripes && budget; ++g_hot_scan_word) {
+                const uint64_t base = uint64_t(g_hot_scan_word) << kStripeShift;
+                if (base >= h->count) break;
+                uint64_t bits = 0;
+                {
+                    std::shared_lock<std::shared_mutex> stripe(h->stripes[g_hot_scan_word]);
+                    for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
+                        const auto& si = h->info[static_cast<size_t>(base + b)];
+                        if (si.kind == NA_DESC_SRV && hot_id_locked(si.resource)) bits |= 1ull << b;
+                    }
+                }
+                if (bits) h->hot[g_hot_scan_word].fetch_or(bits, std::memory_order_relaxed); // adds only; writes keep their own bits exact
+                budget -= static_cast<uint32_t>(std::min<uint64_t>(64, h->count - base));
             }
-            h->hot[w].store(bits, std::memory_order_relaxed);
+            if (g_hot_scan_word >= h->nstripes || (uint64_t(g_hot_scan_word) << kStripeShift) >= h->count) { ++g_hot_scan_heap; g_hot_scan_word = 0; }
         }
     }
+    if (g_hot_scan_heap < g_hot_scan_ids.size()) return; // more next Present
+    g_hot_scan_active = false;
+    bool grown;
+    { std::lock_guard<std::mutex> lk(g_hot_pending_m); grown = g_hot_pending_n != 0 || g_hot_overflow; }
+    uint64_t d2 = 0, c2 = 0;
+    GetLiveSelection(&d2, &c2);
+    if (grown || c2 != g_hot_color) return; // the set moved during the scan: the next Present starts over
     ++g_operation_revision; // per-list read caches were built without the filter; let them refill through it
     g_hot_rebuilds.fetch_add(1, std::memory_order_relaxed);
-    g_hot_ready.store(color != 0, std::memory_order_release);
+    g_hot_ready.store(true, std::memory_order_release);
 }
 int FormatReadFilter(char* out, size_t n)
 {
@@ -8679,20 +8759,22 @@ bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOp
     out = std::move(next); return true;
 }
 // Read-only: 2D textures whose recorded creation has one of `formats` and exactly w x h
-// (Claude 2026-11-06, Cort's OK: J2 captures a game velocity candidate). Walks every known
-// resource under the shared lock; call rarely (capture time), never per draw.
+// (Claude 2026-11-06, Cort's OK: J2 captures a game velocity candidate). One bucket of the
+// (w, h) index under the shared lock, so it is cheap enough for every DLAA evaluation.
 uint32_t FindTextures(const uint32_t* formats, uint32_t format_count, uint32_t w, uint32_t h, na_object_id* out, uint32_t max)
 {
     if (!formats || !format_count || !out || !max) return 0;
     std::shared_lock<RegistryLock> lock(g_m);
+    const auto b = g_tex2d_by_dims.find(tex2d_key(w, h));
+    if (b == g_tex2d_by_dims.end()) return 0;
     uint32_t n = 0;
-    for (const auto& kv : g_res_keys) {
+    for (const na_object_id id : b->second) {
         uint32_t rw = 0, rh = 0, rf = 0;
-        if (!resource_dims_locked(kv.first, &rw, &rh, &rf) || rw != w || rh != h) continue;
+        if (!resource_dims_locked(id, &rw, &rh, &rf) || rw != w || rh != h) continue;
         bool match = false;
         for (uint32_t i = 0; i < format_count && !match; ++i) match = formats[i] == rf;
         if (!match) continue;
-        out[n++] = kv.first;
+        out[n++] = id;
         if (n == max) break;
     }
     return n;
