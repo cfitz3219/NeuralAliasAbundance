@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <d3d11on12.h>
 #include <d3d12.h>
 #include <dxgi1_2.h>
@@ -286,12 +287,15 @@ bool wanted(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, UINT flags, void* out_d
     return true;
 }
 
+bool setup_native_menu(ID3D11Device* d11); // below, with the menu canvas
+
 // Native route: the game's own device, created by the original call, gets the input provider with
 // the DX12 effects handoff as its consumer. The provider's probe device goes straight to the
 // original (t_inside is held by the caller).
 void install_native(ID3D11Device* device)
 {
     if (!device) return;
+    if (!setup_native_menu(device)) g_native_install_failures.fetch_add(1); // DLAA can still run; the menu cannot
     if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr)) {
         g_native_installs.fetch_add(1);
         note("native DX11 route: the input provider is on the game's own D3D11 device");
@@ -474,6 +478,7 @@ void FlushPresentedWork(IDXGISwapChain* chain)
 
 namespace {
 struct Token {
+    bool native = false;                // native DX11 route: the canvas is a shared image, nothing to return
     ComPtr<ID3D11On12Device2> device;
     ComPtr<ID3D11Resource> resource;    // what was unwrapped: the canvas, or the back buffer itself
     ComPtr<ID3D11Resource> back_buffer; // set when `resource` is the canvas
@@ -640,9 +645,152 @@ void composite(ID3D11Device* d11, ID3D11Resource* back_buffer)
 }
 } // namespace
 
+namespace {
+// ---- Native DX11 route: the Home menu --------------------------------------
+// The game keeps its own D3D11 device and swap chain. The overlay draws the menu with D3D12 as it
+// does for the bridge's kept 11on12 chains: our D3D12 device and queue on the game's adapter are
+// registered for the game's device (QueueFor / DeviceForSwapchain), and UnwrapBackBuffer hands the
+// overlay a canvas. Here the canvas is one image shared by both APIs; after the overlay's submit,
+// our queue signals a shared fence, the game's immediate context waits on it (GPU-side) and the
+// canvas is blended onto the back buffer with the same composite as the bridge.
+struct NativeMenu {
+    IUnknown* identity = nullptr; // the game's device (identity only)
+    ComPtr<ID3D11Device> d11;
+    ComPtr<ID3D11DeviceContext4> ctx4;
+    ComPtr<ID3D12Device> d12;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12Fence> fence12;
+    ComPtr<ID3D11Fence> fence11;
+    uint64_t value = 0;
+    ComPtr<ID3D12Resource> canvas12;
+};
+std::mutex g_nm_m;
+NativeMenu g_nm;
+std::atomic<uint64_t> g_native_menu_draws{0}, g_native_menu_failures{0};
+
+bool is_native_device(IUnknown* device)
+{
+    IUnknown* id = identity_of(device);
+    std::lock_guard<std::mutex> lk(g_nm_m);
+    return id && id == g_nm.identity;
+}
+
+// Our D3D12 device (the adapter's one device: the effects handoff gets the same) and a direct
+// queue, plus the shared fence the game's context waits on. Registered like a bridge device.
+bool setup_native_menu(ID3D11Device* d11)
+{
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<ID3D11Device5> d5;
+    NativeMenu m;
+    m.d11 = d11;
+    m.identity = identity_of(d11);
+    ComPtr<ID3D11DeviceContext> ctx;
+    d11->GetImmediateContext(&ctx);
+    HRESULT hr = d11->QueryInterface(IID_PPV_ARGS(&dxgi));
+    if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);
+    if (SUCCEEDED(hr)) hr = d11->QueryInterface(IID_PPV_ARGS(&d5));
+    if (SUCCEEDED(hr) && ctx) hr = ctx.As(&m.ctx4);
+    if (SUCCEEDED(hr)) {
+        na::host::InternalFactoryScope internal;
+        hr = g_d3d12_create ? g_d3d12_create(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m.d12)) : E_NOINTERFACE;
+    }
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (SUCCEEDED(hr)) hr = m.d12->CreateCommandQueue(&qd, IID_PPV_ARGS(&m.queue));
+    if (SUCCEEDED(hr)) hr = m.d12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m.fence12));
+    HANDLE h = nullptr;
+    if (SUCCEEDED(hr)) hr = m.d12->CreateSharedHandle(m.fence12.Get(), nullptr, GENERIC_ALL, nullptr, &h);
+    if (SUCCEEDED(hr)) hr = d5->OpenSharedFence(h, IID_PPV_ARGS(&m.fence11));
+    if (h) CloseHandle(h);
+    if (FAILED(hr) || !m.identity) {
+        note("native DX11 route: the menu's D3D12 queue or shared fence could not be created", FAILED(hr) ? hr : E_FAIL);
+        return false;
+    }
+    m.queue->SetName(L"NeuralAlias native DX11 menu queue");
+    remember(d11, m.d12.Get(), m.queue.Get());
+    std::lock_guard<std::mutex> lk(g_nm_m);
+    g_nm = std::move(m);
+    return true;
+}
+
+// The shared canvas, sized and formatted like the back buffer. Caller holds g_canvas_m and g_nm_m.
+bool ensure_native_canvas(const D3D11_TEXTURE2D_DESC& back, DXGI_FORMAT format)
+{
+    if (g_canvas.texture && g_nm.canvas12 && g_canvas.width == back.Width && g_canvas.height == back.Height && g_canvas.format == format) return true;
+    g_canvas.texture.Reset();
+    g_canvas.srv.Reset();
+    g_nm.canvas12.Reset();
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = back.Width;
+    rd.Height = back.Height;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = format;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    ComPtr<ID3D12Resource> canvas;
+    ComPtr<ID3D11Device1> d1;
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    HANDLE h = nullptr;
+    HRESULT hr = g_nm.d12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&canvas));
+    if (SUCCEEDED(hr)) hr = g_nm.d12->CreateSharedHandle(canvas.Get(), nullptr, GENERIC_ALL, nullptr, &h);
+    if (SUCCEEDED(hr)) hr = g_nm.d11.As(&d1);
+    if (SUCCEEDED(hr)) hr = d1->OpenSharedResource1(h, IID_PPV_ARGS(&texture));
+    if (h) CloseHandle(h);
+    if (SUCCEEDED(hr)) hr = g_nm.d11->CreateShaderResourceView(texture.Get(), nullptr, &srv);
+    if (FAILED(hr)) { g_last_hr.store(static_cast<long>(hr)); return false; }
+    canvas->SetName(L"NeuralAlias native DX11 menu canvas");
+    g_nm.canvas12 = canvas;
+    g_canvas.texture = texture;
+    g_canvas.srv = srv;
+    g_canvas.width = back.Width;
+    g_canvas.height = back.Height;
+    g_canvas.format = format;
+    return true;
+}
+
+bool unwrap_native(IDXGISwapChain* sc, ID3D11Device* d11, DXGI_FORMAT format, ID3D12Resource** out, Borrowed& borrowed)
+{
+    ComPtr<ID3D11Texture2D> buffer;
+    if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return false;
+    D3D11_TEXTURE2D_DESC back{};
+    buffer->GetDesc(&back);
+    ComPtr<ID3D12Resource> canvas;
+    {
+        std::lock_guard<std::mutex> ck(g_canvas_m);
+        std::lock_guard<std::mutex> nk(g_nm_m);
+        if (!ensure_pipeline(d11) || !ensure_native_canvas(back, format)) {
+            g_native_menu_failures.fetch_add(1);
+            return false;
+        }
+        canvas = g_nm.canvas12;
+    }
+    *out = canvas.Detach();
+    auto* t = new Token{};
+    t->native = true;
+    t->back_buffer = buffer;
+    t->d11 = d11;
+    borrowed.token = t;
+    borrowed.clear = true;
+    return true;
+}
+
+} // namespace
+
 bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, unsigned format, ID3D12Resource** out, Borrowed& borrowed)
 {
     const int mode = g_menu_buffer.load();
+    if (g_route_native.load() && g_hooked.load() && sc && queue && out) {
+        auto d11 = swapchain_device(sc);
+        if (d11 && is_native_device(d11.Get())) {
+            return unwrap_native(sc, d11.Get(), static_cast<DXGI_FORMAT>(format), out, borrowed);
+        }
+    }
     if (!g_hooked.load() || mode == 0 || !sc || !queue || !out) return false;
     ComPtr<ID3D11On12Device2> device;
     auto d11 = swapchain_device(sc);
@@ -679,6 +827,21 @@ Borrowed::~Borrowed()
 {
     auto* t = static_cast<Token*>(token);
     if (!t) return;
+    if (t->native) { // the overlay submitted the menu draw on our queue: order the game's context after it, then blend
+        bool drawn = false;
+        if (fence) {
+            std::lock_guard<std::mutex> ck(g_canvas_m);
+            std::lock_guard<std::mutex> nk(g_nm_m);
+            if (g_nm.queue && g_nm.fence12 && g_nm.ctx4 && SUCCEEDED(g_nm.queue->Signal(g_nm.fence12.Get(), ++g_nm.value)) &&
+                SUCCEEDED(g_nm.ctx4->Wait(g_nm.fence11.Get(), g_nm.value)) && g_canvas.owner == t->d11.Get() && g_canvas.state) {
+                composite(t->d11.Get(), t->back_buffer.Get());
+                drawn = true;
+            }
+        }
+        (drawn ? g_native_menu_draws : g_native_menu_failures).fetch_add(1);
+        delete t;
+        return;
+    }
     UINT64 v = value;
     ID3D12Fence* fences[] = {fence};
     // Back to 11on12 before Present; with our fence, later D3D11 work on it waits for the menu draw.
@@ -947,6 +1110,7 @@ void read_size(TChain& c)
 bool translate_common(IUnknown* device, DXGI_FORMAT format, ID3D12CommandQueue** queue)
 {
     if (!g_hooked.load() || !device || !queue) return false;
+    if (is_native_device(device)) return false; // native DX11 route: the game keeps its own swap chain
     *queue = QueueFor(device);
     if (!*queue) return false; // not our 11on12 device: the game's request is left as it was
     if (g_keep_game_swapchain.load(std::memory_order_relaxed)) {
@@ -1289,8 +1453,10 @@ int FormatStatus(char* out, size_t capacity)
     int extra = 0;
     if (g_route_native.load()) {
         // Native route: provider and handoff state, then the bridge's own counters (requests only).
-        int m = std::snprintf(out, capacity, "dx11on12_route=native installs=%u install_failures=%u | ", g_native_installs.load(),
-                              g_native_install_failures.load());
+        int m = std::snprintf(out, capacity, "dx11on12_route=native installs=%u install_failures=%u menu{draws=%llu failures=%llu} | ",
+                              g_native_installs.load(), g_native_install_failures.load(),
+                              static_cast<unsigned long long>(g_native_menu_draws.load()),
+                              static_cast<unsigned long long>(g_native_menu_failures.load()));
         if (m > 0 && static_cast<size_t>(m) < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; }
         m = na::native11::FormatStatus(out, static_cast<unsigned long>(capacity));
         if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
