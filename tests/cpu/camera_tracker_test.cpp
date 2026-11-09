@@ -9,6 +9,7 @@
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 
 #include <cmath>
+#include <cstring>
 
 using namespace na::camera;
 
@@ -79,10 +80,15 @@ int main()
              na::wwii::SceneCamera first, current, unused;
              CHECK(na::wwii::DecodeSceneCamera(old_bytes, 1280, W, H, first));
              CHECK(na::wwii::DecodeSceneCamera(current_bytes, 1280, W, H, current));
-             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1280, W + 1, H, unused));
+             const char* why = nullptr;
+             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1280, W + 1, H, unused, &why));
+             CHECK(why && std::strcmp(why, "extent") == 0);
+             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1024, W, H, unused, &why));
+             CHECK(why && std::strcmp(why, "size") == 0);
              const float conflicting_origin = 2303.f;
              std::memcpy(current_bytes.data() + 944, &conflicting_origin, sizeof(float));
-             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1280, W, H, unused));
+             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1280, W, H, unused, &why));
+             CHECK(why && std::strcmp(why, "origin_witness") == 0);
              const na::wwii::SceneCameraReceipt submitted{2005, 3, 4, 513, current};
              CHECK(submitted.Matches(2005, 3, 4));
              CHECK(!submitted.Matches(2006, 3, 4) && !submitted.Matches(2005, 3, 5));

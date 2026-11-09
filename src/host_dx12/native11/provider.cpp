@@ -26,6 +26,7 @@
 
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/frame_model.hpp"
@@ -43,6 +44,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -372,6 +374,81 @@ bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t
     return false;
 }
 
+// Diagnostics for a camera miss (under g_mu), at most every 5 s: what the scene draws read and why
+// each candidate was turned down, so one run names the failing link (Cort 2026-11-09: no guessing).
+// One summary event, plus one event per candidate with the first 1 KB of its bound bytes in hex
+// for the first four rounds and then once a minute (offline match against the WWII layouts).
+uint64_t g_cam_diag_tick = 0;
+uint32_t g_cam_diag_rounds = 0;
+void DiagnoseCameraMiss()
+{
+    const uint64_t now = GetTickCount64();
+    if (g_cam_diag_tick && now - g_cam_diag_tick < 5000) return;
+    g_cam_diag_tick = now;
+    const bool dump = g_cam_diag_rounds < 4 || g_cam_diag_rounds % 12 == 0;
+    ++g_cam_diag_rounds;
+    const Selection& s = g_model.Current();
+    const uint32_t w = g_scene_vp_w >= 1.f ? static_cast<uint32_t>(g_scene_vp_w + 0.5f) : s.color_info.width;
+    const uint32_t h = g_scene_vp_h >= 1.f ? static_cast<uint32_t>(g_scene_vp_h + 0.5f) : s.color_info.height;
+    const auto cands = g_model.CameraCandidates(kMaxCandidates);
+    na::eventlog::Emit("native11_cam",
+                       "frame=%llu colour=%ux%u fmt=%u depth=%ux%u fmt=%u scene_vp=%.0fx%.0f+%.0f+%.0f decode_wh=%ux%u scene_draws=%u "
+                       "cb_bindings=%zu ranked=%zu searched=%zu kept_buffers=%zu saved_versions=%zu learned_cb=%d",
+                       static_cast<unsigned long long>(g_frame), s.color_info.width, s.color_info.height, s.color_info.format,
+                       s.depth_info.width, s.depth_info.height, s.depth_info.format, g_scene_vp_w, g_scene_vp_h, g_scene_vp_x,
+                       g_scene_vp_y, w, h, g_model.SceneDrawsThisFrame(), g_model.CbSceneBindings(), g_model.RankedCandidates(),
+                       cands.size(), g_cb_latest.size(), g_cb_versions.size(), s.camera_cb ? 1 : 0);
+    int rank = 0;
+    for (const auto& c : cands) {
+        ++rank;
+        uint32_t first = 0, count = 0, draws = 0, versions = 0;
+        const uint32_t version = g_model.CameraCandidateVersion(c.first, c.second, first, count);
+        const bool used = g_model.CbSceneUse(c.first, c.second, draws, versions);
+        const auto latest = g_cb_latest.find(c.first);
+        const size_t kept = latest == g_cb_latest.end() ? 0 : latest->second.bytes.size();
+        const uint32_t latest_version = latest == g_cb_latest.end() ? 0 : latest->second.version;
+        // Same lookup as CameraNow's bytes_of, with the reason it fails.
+        const std::vector<uint8_t>* bytes = nullptr;
+        const char* source = "none";
+        if (!version) source = "no_scene_use";
+        else if (auto it = g_cb_versions.find({c.first, version}); it != g_cb_versions.end()) { bytes = &it->second; source = "saved_version"; }
+        else if (latest == g_cb_latest.end()) source = "no_kept_upload";
+        else if (version != g_model.CbVersion(c.first)) source = "version_overwritten_not_saved";
+        else if (latest_version != version) source = "latest_is_other_version";
+        else { bytes = &latest->second.bytes; source = "latest"; }
+        const char* why = "-";
+        const char* generic = "-";
+        size_t bound_len = 0;
+        std::vector<uint8_t> bound;
+        if (bytes) {
+            bound = BoundCameraBytes(bytes->data(), bytes->size(), first, count);
+            bound_len = bound.size();
+            if (bound.empty()) why = "range_outside_kept_bytes";
+            else {
+                wwii::SceneCamera scene;
+                wwii::DecodeSceneCamera(bound, static_cast<uint32_t>(bound.size()), w, h, scene, &why);
+                const CameraPick p = FindCamera(bound, g_frame + 1);
+                generic = p.found ? "vp+inverse" : "none";
+            }
+        }
+        const int stage_ps = c.second >= kPsCbBase;
+        na::eventlog::Emit("native11_cam",
+                           "cand=%d cb=%llx stage=%s slot=%d draws=%u versions=%u used=%d bind_first=%u bind_count=%u kept=%zu "
+                           "version=%u latest_version=%u bytes=%s bound=%zu wwii_decode=%s generic=%s",
+                           rank, static_cast<unsigned long long>(c.first), stage_ps ? "ps" : "vs",
+                           stage_ps ? c.second - kPsCbBase : c.second, draws, versions, used ? 1 : 0, first, count, kept, version,
+                           latest_version, source, bound_len, why, generic);
+        if (dump && !bound.empty()) {
+            static const char hex[] = "0123456789abcdef";
+            const size_t n = (std::min)(bound.size(), size_t(1024));
+            std::string text(n * 2, '0');
+            for (size_t i = 0; i < n; ++i) { text[2 * i] = hex[bound[i] >> 4]; text[2 * i + 1] = hex[bound[i] & 15]; }
+            na::eventlog::Emit("native11_cam_bytes", "cand=%d cb=%llx len=%zu hex=%s", rank,
+                               static_cast<unsigned long long>(c.first), bound.size(), text.c_str());
+        }
+    }
+}
+
 // Hands this frame's scene to the consumer, before the game's first read of the scene colour (or
 // before the list / HUD draw that holds it). Under g_mu (`lk`), on the immediate context's thread,
 // before the read is forwarded. g_mu is let go during the callback so the game's other threads never
@@ -391,6 +468,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     uint64_t version = 0;
     if (!CameraNow(&cam, &bytes, &version)) {
         ++g_stats.camera_missing;
+        DiagnoseCameraMiss();
         return SetReason("No supported camera was found in the scene's constant buffers.");
     }
     ++g_stats.camera_found;

@@ -238,6 +238,17 @@ public:
         count = it->second.count;
         return it->second.last_version;
     }
+    // Diagnostics: this frame's scene use of (cb, slot) so far; false when no scene draw bound it.
+    bool CbSceneUse(Id cb, int slot, uint32_t& draws, uint32_t& versions) const
+    {
+        const auto it = cb_scene_.find({cb, slot});
+        if (it == cb_scene_.end()) return false;
+        draws = it->second.draws;
+        versions = it->second.versions;
+        return true;
+    }
+    size_t CbSceneBindings() const { return cb_scene_.size(); }
+    size_t RankedCandidates() const { return last_cb_order_.size(); }
     // Camera-buffer candidates of the last frame, most scene draws first (for camera search).
     std::vector<std::pair<Id, int>> CameraCandidates(size_t max) const
     {
