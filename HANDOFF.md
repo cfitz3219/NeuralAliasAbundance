@@ -853,3 +853,7 @@ Package Documents/NA-se5-motion-1ebb7b7 and all general/DLAA-fix Update/Results/
 ## 2026-11-08 Pacific — DX11On12 startup repair and clean WWII campaign baseline
 
 PR128, astra/dx11on12-wwii-startup c13191e, continues Opus 278423d. Pharaoh p32520 proved translator success after the host wait consumed the caller deadline. Worker now avoids startup gate waits and abandoned devices never enter the registry. Final Release and standalone 900-frame translated/native selector tests passed. WWII campaign test package Documents/NA-wwii-on12-c13191e is prepared, not installed. ReShade/OneClick moved to D:\SteamLibrary\NeuralAlias-backups\WWII-ReShade-20261108. Clean folder inspected, Steam depot verification and game acceptance not performed. Results, ownership and package details in latest COMMS.
+
+## 2026-11-08 Pacific — WWII launcher correction after p21136
+
+Latest missing-overlay run was original c13191e (installed hash BDB9F0D3), not 23609e3. Old Install CMD had remained stale; all four WWII Install/Update/Results/Rollback CMDs now target the tested 23609e3 package, hash D1E4CBD5. Nine payload hashes and launcher destinations verified; saved original launchers and p21136 evidence in local/dx11on12-wwii/launcher-correction-cc55708f. No deployment/game launch. PR128 journal head25a284c, runtime unchanged23609e3. Await actual run on that runtime before assessing queue-recovery success; startup timeout remains independent. Full evidence in COMMS/branch WORKLOG.
