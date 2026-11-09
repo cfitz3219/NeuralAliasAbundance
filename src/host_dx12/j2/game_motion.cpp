@@ -278,6 +278,12 @@ Output Feed::Record(ID3D12GraphicsCommandList* list, uint32_t slot, const Candid
     if (!list || !pso_score_ || slot >= slots_ || !color || rw < 4 || rh < 4) return out;
     collect(slot);
     if (count == 0) {
+        // No colour copy is recorded on this path. A candidate returning later
+        // must warm a new adjacent-frame pair, not score against an old picture.
+        // Discard pending CPU scores from that old epoch as well; GPU resources
+        // remain retained and each slot is still recycled only after completion.
+        prev_valid_ = false;
+        for (auto& pending : slot_) pending.recorded = false;
         // Nothing to score: free the seats (so a texture found later starts fresh) and stop
         // before any texture or descriptor work (WWII p49040: every evaluation came here).
         std::lock_guard<std::mutex> lock(g_stats_m);
