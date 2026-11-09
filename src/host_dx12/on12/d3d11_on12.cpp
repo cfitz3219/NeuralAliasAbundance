@@ -386,10 +386,28 @@ ID3D12CommandQueue* QueueFor(IUnknown* device)
     return nullptr;
 }
 
-ID3D12Device* DeviceFor(IUnknown* device)
+namespace {
+ComPtr<ID3D11Device> swapchain_device(IDXGISwapChain* chain)
 {
-    if (!g_hooked.load() || !device) return nullptr;
-    IUnknown* id = identity_of(device);
+    ComPtr<ID3D11Device> device;
+    if (!g_hooked.load() || !chain) return device;
+    if (FAILED(chain->GetDevice(IID_PPV_ARGS(&device)))) {
+        ComPtr<ID3D11Texture2D> backbuffer;
+        if (SUCCEEDED(chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) backbuffer->GetDevice(&device);
+    }
+    return device;
+}
+} // namespace
+
+ID3D12CommandQueue* QueueForSwapchain(IDXGISwapChain* chain)
+{
+    return QueueFor(swapchain_device(chain).Get());
+}
+
+ID3D12Device* DeviceForSwapchain(IDXGISwapChain* chain)
+{
+    const auto device = swapchain_device(chain);
+    IUnknown* id = identity_of(device.Get());
     if (!id) return nullptr;
     std::lock_guard<std::mutex> lk(g_m);
     for (const auto& e : g_entries)
@@ -569,11 +587,9 @@ bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* qu
 {
     const int mode = g_menu_buffer.load();
     if (!g_hooked.load() || mode == 0 || !sc || !queue || !out) return false;
-    ComPtr<IUnknown> any;
-    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&any)))) return false;
     ComPtr<ID3D11On12Device2> device;
-    ComPtr<ID3D11Device> d11;
-    if (FAILED(any.As(&device)) || FAILED(any.As(&d11))) return false; // not an 11on12 chain
+    auto d11 = swapchain_device(sc);
+    if (!d11 || FAILED(d11.As(&device))) return false; // not an 11on12 chain
     // D3D11 swap chains expose only buffer 0: it is always the current back buffer.
     (void)index;
     ComPtr<ID3D11Texture2D> buffer;

@@ -36,8 +36,12 @@ void Start(const wchar_t* ini, LogFn log);
 // returned pointer is AddRef'ed.
 ID3D12CommandQueue* QueueFor(IUnknown* device);
 
-// The D3D12 device behind an 11on12 device we created (AddRef'ed), or null.
-ID3D12Device* DeviceFor(IUnknown* device);
+// Recover the exact queue for an already-created translated swap chain.
+// Native D3D11 and unknown translation devices return null.
+ID3D12CommandQueue* QueueForSwapchain(IDXGISwapChain* chain);
+
+// The D3D12 device behind this translated swap chain (AddRef'ed), or null.
+ID3D12Device* DeviceForSwapchain(IDXGISwapChain* chain);
 
 // The menu draws through D3D12, but an 11on12 swap chain only hands out D3D11
 // textures. For one frame, hand the menu a D3D12 render target
