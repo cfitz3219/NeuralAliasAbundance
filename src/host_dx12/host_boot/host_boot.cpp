@@ -320,6 +320,7 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
+    na::j2::EnableCameraInputDiagnostic(GetPrivateProfileIntW(L"diagnostics", L"camera_inputs", 0, g_ini) == 1);
     {const bool profile=GetPrivateProfileIntW(L"observe",L"profile_hooks",0,g_ini)==1;
      na::observe::SetHookProfiling(profile);
      if(profile||GetPrivateProfileIntW(L"observe",L"usage_log",0,g_ini)==1)na::usage::Start();} // CPU/GPU usage + busiest threads in the status log; cheap (5 s background sample), so test packages keep it on with profile_hooks=0

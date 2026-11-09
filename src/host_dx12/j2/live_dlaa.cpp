@@ -2959,6 +2959,41 @@ struct Block {
     bool table = false;
 };
 
+std::atomic<bool> g_camera_input_diagnostic{false};
+bool g_camera_input_dumped = false; // find_camera_scan holds g.m
+void dump_camera_inputs(const std::vector<const Block*>& order, na_object_id depth)
+{
+    if (!g_camera_input_diagnostic.load(std::memory_order_relaxed) || g_camera_input_dumped || !na::capture::j2::Armed()) return;
+    g_camera_input_dumped = true;
+    wchar_t dir[MAX_PATH]{}, path[MAX_PATH]{};
+    if (!na::capture::MakeDir(L"camera-inputs", dir, MAX_PATH)) return;
+    swprintf_s(path, L"%s\\blocks.bin", dir);
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path, L"wb") || !fp) return;
+    // uint64 header: magic, version, frame, depth, count. Each block has nine
+    // uint64 fields then its readable bytes: id, offset, declared size, parameter,
+    // table, uses, list rank, bytes read, ordinal in the normal ranked search.
+    // Capture beyond the normal search's 256 blocks/1KB to distinguish a missing
+    // inverse from one outside the search budget. Still bounded to 16MB, no wait.
+    const uint64_t count = (std::min)(order.size(), size_t(1024));
+    const uint64_t header[]{0x314243414e, 1, g.frame, depth, count};
+    std::fwrite(header, sizeof(header), 1, fp);
+    std::vector<uint8_t> bytes(65536);
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const auto& b = *order[i];
+        const uint32_t want = total < 16u * 1024u * 1024u ? (std::min)(b.size, uint32_t(bytes.size())) : 0u;
+        const uint32_t got = na::observe::ReadBuffer(b.resource, b.offset, bytes.data(), want);
+        const uint64_t fields[]{b.resource, b.offset, b.size, b.param, b.table ? 1ull : 0ull, b.uses, b.list_rank, got, i};
+        std::fwrite(fields, sizeof(fields), 1, fp);
+        if (got) std::fwrite(bytes.data(), got, 1, fp);
+        total += got;
+    }
+    std::fclose(fp);
+    na::eventlog::Emit("camera_inputs", "frame=%llu blocks=%llu bytes=%zu path=%ls", (unsigned long long)g.frame,
+                       (unsigned long long)count, total, path);
+}
+
 bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bool* reversed)
 {
     const size_t n = bytes.size();
@@ -3216,6 +3251,7 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
         if (a->list_rank != b->list_rank) return a->list_rank < b->list_rank;
         return a->uses > b->uses;
     });
+    dump_camera_inputs(order, depth_id);
     if (order.size() > kMaxBlocks) order.resize(kMaxBlocks);
     g_cd.blocks = order.size();
     std::vector<uint8_t> bytes(kMaxBlockRead);
@@ -7178,6 +7214,7 @@ void EnableNativeScaleBridge(bool enabled) {
     if(enabled){na::observe::SetOperationSnapshots(true);na::observe::SetRasterStateTracking(true);
         na::observe::SetShaderOperationHook(na::observe::ShaderLane::Reconstruction,std::make_shared<NativeScaleHook>());}
 }
+void EnableCameraInputDiagnostic(bool enabled) { g_camera_input_diagnostic.store(enabled); }
 NativeBridgeStats GetNativeBridgeStats() {
     NativeBridgeStats r;auto& n=g_nb;
     r.enabled=g_native_bridge.load();r.reduced=g_native_reduced.load();
