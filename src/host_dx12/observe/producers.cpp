@@ -4106,6 +4106,19 @@ template <>
 struct On<sl::list::SetComputeRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<1>(l, rs); } };
 template <>
 struct On<sl::list::SetGraphicsRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<0>(l, rs); } };
+// The bound root signature's registry entry, reused while the same signature stays bound and no
+// object retired (g_retire_gen; std::unordered_map nodes never move otherwise). Under g_m + bind_m.
+// WWII: every table bind (~280k/s) looked it up twice (shadow_arg_locked and root_table).
+const Obj* root_sig_obj_locked(ListState& ls, uint32_t compute)
+{
+    if (!ls.root_sig[compute]) return nullptr;
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (ls.rs_key[compute] == ls.root_sig[compute] && ls.rs_gen[compute] == gen) return static_cast<const Obj*>(ls.rs_obj[compute]);
+    const auto it = g_objs.find(canon(ls.root_sig[compute]));
+    const Obj* rso = it != g_objs.end() ? &it->second : nullptr;
+    if (rso) { ls.rs_key[compute] = ls.root_sig[compute]; ls.rs_obj[compute] = rso; ls.rs_gen[compute] = gen; }
+    return rso;
+}
 void shadow_arg_locked(ListState& ls,uint32_t compute,UINT param,uint8_t type,uint64_t value,const void* consts=nullptr,UINT count=0,UINT dest=0){
     if(param>=64)return;
         auto& v = ls.args[compute];
@@ -4114,12 +4127,12 @@ void shadow_arg_locked(ListState& ls,uint32_t compute,UINT param,uint8_t type,ui
         if(a.type!=type||a.value!=value||type==5){
             if(type==1||a.type==1){
                 bool texture_table=true;
-                const auto root=g_objs.find(canon(ls.root_sig[compute]));
-                if(type==1&&a.type==1&&root!=g_objs.end()&&param<root->second.root_params.size()){
-                    const auto& p=root->second.root_params[param];
-                    if(p.param_type==NA_ROOT_TABLE&&p.first_range<=root->second.root_ranges.size()&&p.count<=root->second.root_ranges.size()-p.first_range){
+                const Obj* root = type==1&&a.type==1 ? root_sig_obj_locked(ls, compute) : nullptr;
+                if(root&&param<root->root_params.size()){
+                    const auto& p=root->root_params[param];
+                    if(p.param_type==NA_ROOT_TABLE&&p.first_range<=root->root_ranges.size()&&p.count<=root->root_ranges.size()-p.first_range){
                         texture_table=false;
-                        for(UINT i=0;i<p.count;++i){const auto& range=root->second.root_ranges[p.first_range+i];
+                        for(UINT i=0;i<p.count;++i){const auto& range=root->root_ranges[p.first_range+i];
                             texture_table|=range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SRV||range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;}
                     }
                 }
@@ -4168,15 +4181,7 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
         // (256 sampled textures, 4096 CBV bindings) means the range loops below add nothing: skip them,
         // and reuse the root signature's entry instead of two hash lookups per bind.
         if (dh && ls->root_sig[Compute] && (ls->sampled_textures.size() < 256 || ls->bindings.size() < 4096)) {
-            const Obj* rso = nullptr;
-            const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
-            if (ls->rs_key[Compute] == ls->root_sig[Compute] && ls->rs_gen[Compute] == gen) {
-                rso = static_cast<const Obj*>(ls->rs_obj[Compute]);
-            } else {
-                auto it = g_objs.find(canon(ls->root_sig[Compute]));
-                rso = it != g_objs.end() ? &it->second : nullptr;
-                if (rso) { ls->rs_key[Compute] = ls->root_sig[Compute]; ls->rs_obj[Compute] = rso; ls->rs_gen[Compute] = gen; }
-            }
+            const Obj* rso = root_sig_obj_locked(*ls, Compute);
             if (rso && param < rso->root_params.size()) {
                 const na_root_param& rp = rso->root_params[param];
                 if (rp.param_type == NA_ROOT_TABLE) {
