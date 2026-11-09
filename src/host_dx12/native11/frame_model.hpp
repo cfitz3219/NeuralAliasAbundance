@@ -1,6 +1,4 @@
 // DX11 frame model: finds, from what a DX11 game does each frame, the scene
-// (2026-11-09: moved from the separate DX11 host of PR #90 into the native DX11 input
-// provider of the one program, src/host_dx12/native11; see input_provider.hpp.)
 // depth, the scene colour drawn with it, the camera's constant buffer, and the
 // point to run DLSS (just before the game first READS the finished scene
 // colour, which is the tonemap or post pass, so before the HUD and before the
@@ -49,6 +47,8 @@
 // more than once in a frame is not learned (it would not name one place).
 //
 // Portable C++17 (Linux-tested); the DX11 hooks and the Vulkan layer fill it.
+// (2026-11-09: moved from the separate DX11 host of PR #90 into the native DX11 input
+// provider of the one program, src/host_dx12/native11; see input_provider.hpp.)
 #pragma once
 
 #include <algorithm>
