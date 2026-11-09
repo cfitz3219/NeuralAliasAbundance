@@ -862,3 +862,7 @@ Latest missing-overlay run was original c13191e (installed hash BDB9F0D3), not 2
 
 ### 2026-11-08 — WWII Death Factory camera evidence
 PR128 source5511ac1 (receipt03fc68a) fixes the shared 8-slot observation limit proven against Microsoft's 15-slot translation table. It is installed as a reversible camera diagnostic. p12724 reached playable Death Factory and Home worked. Safe startup paused the effect until explicitly resumed for capture. The selected scene camera's zero-translation VP and separate candidate world origin are now recorded. No matching inverse was present in the readable captured data. Confirm the origin against actual shader reads and follow the selected scene color through the translated submissions before claiming DLAA. Saved artifact and exact measurements are in the branch WORKLOG. Game left open after capture with Home closed. Public CMDs remain7be0838. Load delay cause unresolved.
+
+## 2026-11-09 Pacific — WWII bridge handoff
+
+Astra reproduced and fixed a resize deadlock in the shipped DX11On12 trial. The separate campaign upload access violation remains open. See COMMS and branch astra/wwii-streamed-present. b9dbf5f is the independent repair. c0ccd51 carries the standalone loader/resize/pixel fixture and an opt-in alternate frame copy. Exact shipped DLL hung at 1,500 presents in the fixture. Both repaired routes passed 3,000 presents, resize, five pixel checks and clean teardown. No installation or campaign test took place. Fable retains ownership of throughput investigation.
