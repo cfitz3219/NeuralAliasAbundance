@@ -1267,7 +1267,10 @@ inline void idc_put(const void* p, na_object_id id)
     t_idc.id[i] = id;
 }
 constexpr uint32_t kDeferredWrites = 64, kDeferredQueues = 256;
-struct DeferredWrite { uint64_t ptr; na_object_id resource; uint32_t kind, format, first_sub; };
+// CBV entries carry the buffer address and size instead of a resource id: the address is resolved
+// when the batch is applied (under the shared g_m, which no retirement can hold at the same time,
+// and every retirement drains the queues first, so it resolves exactly as it would have at the write).
+struct DeferredWrite { uint64_t ptr; na_object_id resource; uint32_t kind, format, first_sub; uint32_t cbv_size; uint64_t cbv_va; };
 struct DeferredQueue {
     std::atomic<bool> busy{false}; // spin lock: the owner appends, any thread drains
     std::atomic<uint32_t> n{0};
@@ -1276,7 +1279,7 @@ struct DeferredQueue {
 std::atomic<DeferredQueue*> g_dw_queues[kDeferredQueues]{};
 std::atomic<uint32_t> g_dw_queue_n{0};
 std::atomic<uint32_t> g_dw_pending{0}; // queues holding at least one write (the drain's fast "nothing to do")
-std::atomic<uint64_t> g_deferred_writes{0}, g_deferred_flushes{0};
+std::atomic<uint64_t> g_deferred_writes{0}, g_deferred_flushes{0}, g_deferred_cbvs{0};
 std::atomic<void (*)()> g_deferred_apply_probe{nullptr};
 std::mutex& deferred_drain_mutex()
 {
@@ -1302,7 +1305,7 @@ void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
     std::shared_lock<na::observe::ReaderSlotsLock> lock(static_cast<na::observe::ReaderSlotsLock&>(g_m), std::defer_lock);
     { const CostScope wait(kCostDescWriteWait); lock.lock(); }
     DescHeap* cur_h = nullptr;
-    uint32_t cur_stripe = ~0u, unresolved = 0;
+    uint32_t cur_stripe = ~0u, unresolved = 0, cbvs = 0;
     std::shared_mutex* held = nullptr;
     for (uint32_t i = 0; i < n; ++i) {
         uint32_t slot = 0;
@@ -1317,8 +1320,18 @@ void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
         }
         ++h->versions[slot];
         std::shared_ptr<const DescriptorDetails> prev = std::move(h->info[slot].details); // no snapshot: dropped, as the immediate path
-        h->info[slot] = DescHeap::SlotInfo{w[i].kind, w[i].resource, w[i].format, w[i].first_sub, 0, 0};
-        set_hot_bit(h, slot, w[i].kind == NA_DESC_SRV && hot_id_locked(w[i].resource));
+        if (w[i].kind == NA_DESC_CBV) {
+            na_object_id res = 0;
+            uint64_t off = 0;
+            const bool known = w[i].cbv_va && resolve_va_locked(w[i].cbv_va, &res, &off);
+            h->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, w[i].cbv_va ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
+                                               known ? off : 0, w[i].cbv_size};
+            set_hot_bit(h, slot, false);
+            ++cbvs;
+        } else {
+            h->info[slot] = DescHeap::SlotInfo{w[i].kind, w[i].resource, w[i].format, w[i].first_sub, 0, 0};
+            set_hot_bit(h, slot, w[i].kind == NA_DESC_SRV && hot_id_locked(w[i].resource));
+        }
     }
     if (held) held->unlock();
     // After the writes: a reader that took the revision before this and walked a slot before its
@@ -1327,6 +1340,7 @@ void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
     g_c.writes.fetch_add(n);
     if (unresolved) g_c.unresolved.fetch_add(unresolved);
     g_deferred_writes.fetch_add(n, std::memory_order_relaxed);
+    if (cbvs) g_deferred_cbvs.fetch_add(cbvs, std::memory_order_relaxed);
     g_deferred_flushes.fetch_add(1, std::memory_order_relaxed);
 }
 // Drains every thread's queue. Called before any registry lock (RegistryLock); takes the base lock itself.
@@ -1352,7 +1366,8 @@ void flush_deferred_writes()
         g_dw_pending.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
-bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, uint32_t format, uint32_t first_sub)
+bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, uint32_t format, uint32_t first_sub,
+                            uint64_t cbv_va = 0, uint32_t cbv_size = 0)
 {
     DeferredQueue* q = my_deferred_queue();
     if (!q) return false;
@@ -1363,7 +1378,7 @@ bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, 
         dwq_lock(*q);
     }
     const uint32_t n = q->n.load(std::memory_order_relaxed);
-    q->w[n] = DeferredWrite{ptr, resource, kind, format, first_sub};
+    q->w[n] = DeferredWrite{ptr, resource, kind, format, first_sub, cbv_size, cbv_va};
     q->n.store(n + 1, std::memory_order_relaxed);
     if (n == 0) g_dw_pending.fetch_add(1, std::memory_order_release);
     dwq_unlock(*q);
@@ -1863,6 +1878,12 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     // what H1 promises. Unresolved / ambiguous ranges are UNKNOWN, never guessed.
     na_ev_descriptor_write e;
     const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    // p22748 (2026-11-09): CBV writes are nearly all of the bridge's view writes (one per constant
+    // buffer bind per draw) and none took the deferred path. Queue them like other views: same slot
+    // record, the address resolved when the batch is applied.
+    if (!want && !view && !t_host_work &&
+        defer_descriptor_write(h.ptr, 0, NA_DESC_CBV, NA_UNKNOWN_U32, 0, desc ? desc->BufferLocation : 0, desc ? desc->SizeInBytes : 0))
+        return;
     {
         const CostScope cost(kCostDescWrite);
         std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
@@ -7649,12 +7670,13 @@ int FormatReadFilter(char* out, size_t n)
     uint32_t ids;
     { std::lock_guard<std::mutex> lk(g_hot_pending_m); overflow = g_hot_overflow; ids = g_hot_known_n; }
     return std::snprintf(out, n, "read_filter ready=%u ids=%u overflow=%u rebuilds=%llu skipped=%llu walked=%llu"
-        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu | view_writes=%llu deferred=%llu flushes=%llu",
+        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu | view_writes=%llu deferred=%llu deferred_cbv=%llu flushes=%llu",
         g_hot_ready.load() ? 1u : 0u, ids, overflow ? 1u : 0u, (unsigned long long)g_hot_rebuilds.load(),
         (unsigned long long)g_hot_skipped.load(), (unsigned long long)g_hot_walked.load(),
         (unsigned long long)g_copy_simple.load(), (unsigned long long)g_copy_calls.load(),
         (unsigned long long)g_copy_batched.load(), (unsigned long long)g_copy_batched_runs.load(),
-        (unsigned long long)g_c.writes.load(), (unsigned long long)g_deferred_writes.load(), (unsigned long long)g_deferred_flushes.load());
+        (unsigned long long)g_c.writes.load(), (unsigned long long)g_deferred_writes.load(), (unsigned long long)g_deferred_cbvs.load(),
+        (unsigned long long)g_deferred_flushes.load());
 }
 void ResetDerived()
 {
@@ -9165,6 +9187,7 @@ void SetProcessExiting() { g_process_exiting.store(true, std::memory_order_relea
 
 ProducerStats GetProducerStats()
 {
+    flush_deferred_writes(); // queued view writes count once applied
     ProducerStats s{};
     s.objects_live = g_c.live.load();
     s.objects_created = g_c.created.load();
