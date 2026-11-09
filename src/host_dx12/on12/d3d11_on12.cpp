@@ -478,11 +478,11 @@ void FlushPresentedWork(IDXGISwapChain* chain)
 
 namespace {
 struct Token {
-    bool native = false;                // native DX11 route: the canvas is a shared image, nothing to return
     ComPtr<ID3D11On12Device2> device;
     ComPtr<ID3D11Resource> resource;    // what was unwrapped: the canvas, or the back buffer itself
     ComPtr<ID3D11Resource> back_buffer; // set when `resource` is the canvas
     ComPtr<ID3D11Device> d11;
+    bool native = false;                // native DX11 route: the canvas is a shared image, nothing to return
 };
 std::atomic<uint64_t> g_unwraps{0}, g_unwrap_failures{0}, g_returns{0};
 // Time spent inside 11on12's unwrap / return (CPU), to find stalls while the menu draws.
