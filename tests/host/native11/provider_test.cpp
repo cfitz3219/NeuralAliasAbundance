@@ -19,6 +19,7 @@
 #if defined(NA_TEST_NATIVE_DLAA)
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include <DirectXPackedVector.h>
 #endif
 
 #include <d3d11_4.h>
@@ -35,6 +36,13 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
+
+#if defined(NA_TEST_NATIVE_DLAA)
+// Same packed HDR colour format as the recorded WWII campaign.
+constexpr DXGI_FORMAT kSceneFormat = DXGI_FORMAT_R11G11B10_FLOAT;
+#else
+constexpr DXGI_FORMAT kSceneFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+#endif
 
 int g_failed = 0;
 void expect(bool ok, const char* what)
@@ -122,7 +130,7 @@ bool MakeTargets(Game& g)
     d.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     d.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.depth)) || FAILED(g.device->CreateDepthStencilView(g.depth.Get(), nullptr, &g.dsv))) return false;
-    d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    d.Format = kSceneFormat;
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.color)) || FAILED(g.device->CreateRenderTargetView(g.color.Get(), nullptr, &g.color_rtv)) ||
         FAILED(g.device->CreateShaderResourceView(g.color.Get(), nullptr, &g.color_srv)))
@@ -313,7 +321,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     s.last_frame = f.frame;
     const bool inputs = f.color.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.color.Get())) &&
                         f.depth.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.depth.Get())) &&
-                        f.color.format == DXGI_FORMAT_R16G16B16A16_FLOAT && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
+                        f.color.format == kSceneFormat && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
                         f.color.width == g.w && f.color.height == g.h && f.color.active_x == 0 && f.color.active_y == 0 &&
                         f.color.active_w == g.w && f.color.active_h == g.h && f.color.incarnation && f.depth.incarnation &&
                         f.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get());
@@ -366,7 +374,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     return true;
 }
 
-// Reads one pixel of the consumer's copy (R16G16B16A16_FLOAT, x = 0, y = 0).
+// Reads one pixel of the consumer's copy (x = 0, y = 0).
 bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
 {
     if (!source) source = g_seen.copy.Get();
@@ -381,6 +389,13 @@ bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
     g.ctx->CopyResource(st.Get(), source);
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(g.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+#if defined(NA_TEST_NATIVE_DLAA)
+    DirectX::PackedVector::XMFLOAT3PK packed;
+    std::memcpy(&packed, m.pData, sizeof packed);
+    DirectX::XMFLOAT3 rgb;
+    DirectX::XMStoreFloat3(&rgb, DirectX::PackedVector::XMLoadFloat3PK(&packed));
+    out[0] = rgb.x; out[1] = rgb.y; out[2] = rgb.z; out[3] = 1.f;
+#else
     const uint16_t* p = static_cast<const uint16_t*>(m.pData);
     for (int i = 0; i < 4; ++i) {
         const uint16_t h = p[i];
@@ -388,6 +403,7 @@ bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
         float v = exp == 0 ? std::ldexp(float(man), -24) : std::ldexp(float(man | 1024), int(exp) - 25);
         out[i] = sign ? -v : v;
     }
+#endif
     g.ctx->Unmap(st.Get(), 0);
     return true;
 }
@@ -428,7 +444,7 @@ int main()
     std::printf("phase 1: frames=%d calls=%llu | %s\n", frame, static_cast<unsigned long long>(g_seen.calls), status);
     expect(g_seen.calls >= 30, "the consumer is called every frame once the scene is learned (30 frames)");
     expect(g_seen.twice == 0, "at most one call per frame");
-    expect(g_seen.wrong_inputs == 0, "colour = FP16 scene target, depth = D24S8 scene depth, full extent, lifetime ids set");
+    expect(g_seen.wrong_inputs == 0, "correct HDR scene colour, D24S8 depth, full extent and lifetime ids");
     expect(g_seen.after_tonemap == 0 && g_seen.before_read == g_seen.calls, "every call is before the tonemap read (BeforeRead)");
     expect(g_seen.no_scene == 0, "the scene's 40 draws are done when the consumer is called");
     expect(g_seen.no_camera == 0, "the camera buffer (VS slot 0) and its 512 CPU bytes come with each call");
