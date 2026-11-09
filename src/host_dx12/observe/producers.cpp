@@ -349,9 +349,9 @@ std::vector<std::unique_ptr<DescHeap>> g_heaps;
 // of the scene colour or of a copy of it. g_hot_ids is a superset of both (the selected colour
 // plus every copy ever seen); each heap keeps one bit per slot for "SRV of a hot id". When no
 // bound SRV range has a hot bit, the walk's result is known (no colour read, no derived read)
-// and it is skipped; otherwise the original walk runs unchanged. The set changes only under the
-// exclusive g_m (RefreshReadFilter, called at Present with no lock held), which recomputes every
-// bit; until then g_hot_ready is false and every draw takes the original walk.
+// and it is skipped; otherwise the original walk runs unchanged. The set grows only through RefreshReadFilter
+// (called at Present with no lock held), which publishes the ids and then adds the bits heap by
+// heap in chunks; until that scan is complete g_hot_ready is false and every draw takes the original walk.
 constexpr uint32_t kHotMax = 64;
 na_object_id g_hot_ids[kHotMax] = {}; // read under the shared g_m, written under the exclusive g_m
 uint32_t g_hot_n = 0;
@@ -7299,48 +7299,92 @@ bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->insertion.ColorEvents(color, out);
 }
+// Incremental rebuild (2026-11-09, run 48522d0: the first version rescanned EVERY slot of every heap
+// under the exclusive g_m on the present thread whenever the set changed, and also took that lock on
+// every Present while no scene was selected or after an overflow; D3D11On12's online view heap holds
+// about a million descriptors, so each pass stalled the translator thread for milliseconds).
+// Now: the ids are published first (exclusive g_m held only for that copy, no scan), then the slots
+// are scanned in chunks of kHotScanChunk per Present under the SHARED g_m and each word's stripe,
+// on the present thread. The scan only ADDS bits (the id set only grows), and every write or copy
+// that lands during the scan computes its own bit from the already-published set, so when the
+// last chunk is done the bits are exact. Until then g_hot_ready stays false (the original walk).
+constexpr uint32_t kHotScanChunk = 32768; // slots per Present (~1.5 MB of SlotInfo, well under a millisecond)
+bool g_hot_scan_active = false;           // present thread only
+size_t g_hot_scan_heap = 0;               // index into g_hot_scan_ids
+uint32_t g_hot_scan_word = 0;
+std::vector<na_object_id> g_hot_scan_ids; // heap ids snapshot when the scan began (heaps may come and go)
 void RefreshReadFilter()
 {
     if (g_hot_ready.load(std::memory_order_acquire) || t_host_work) return;
     uint64_t depth = 0, color = 0;
     GetLiveSelection(&depth, &color);
-    std::unique_lock<RegistryLock> lock(g_m); // no hook reads or writes slots meanwhile
-    std::lock_guard<std::mutex> lk(g_hot_pending_m);
-    if (g_hot_overflow) return;
-    na_object_id ids[kHotMax];
-    uint32_t n = 0;
-    const auto add = [&](na_object_id id) {
-        if (!id || id == NA_UNKNOWN_U64) return true;
-        for (uint32_t i = 0; i < n; ++i) if (ids[i] == id) return true;
-        if (n == kHotMax) return false;
-        ids[n++] = id;
-        return true;
-    };
-    bool fits = add(color);
-    for (uint32_t i = 0; fits && i < g_hot_known_n; ++i) fits = add(g_hot_known[i]);
-    for (uint32_t i = 0; fits && i < g_hot_pending_n; ++i) fits = add(g_hot_pending[i]);
-    if (!fits) { g_hot_overflow = true; return; }
-    std::copy_n(ids, n, g_hot_ids);
-    g_hot_n = n;
-    g_hot_color = color;
-    std::copy_n(ids, n, g_hot_known);
-    g_hot_known_n = n;
-    g_hot_pending_n = 0;
-    for (auto& h : g_heaps) {
-        if (!h->hot) continue;
-        for (uint32_t w = 0; w < h->nstripes; ++w) {
-            uint64_t bits = 0;
-            const uint64_t base = uint64_t(w) << kStripeShift;
-            for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
-                const auto& si = h->info[static_cast<size_t>(base + b)];
-                if (si.kind == NA_DESC_SRV && hot_id_locked(si.resource)) bits |= 1ull << b;
+    if (!color) { g_hot_scan_active = false; return; } // nothing to filter for; no lock taken
+    { std::lock_guard<std::mutex> lk(g_hot_pending_m); if (g_hot_overflow) return; }
+    if (!g_hot_scan_active) {
+        // Publish the grown id set, then start the scan from the first heap.
+        na_object_id ids[kHotMax];
+        uint32_t n = 0;
+        {
+            std::unique_lock<RegistryLock> lock(g_m); // brief: the id copy and the heap snapshot only
+            std::lock_guard<std::mutex> lk(g_hot_pending_m);
+            const auto add = [&](na_object_id id) {
+                if (!id || id == NA_UNKNOWN_U64) return true;
+                for (uint32_t i = 0; i < n; ++i) if (ids[i] == id) return true;
+                if (n == kHotMax) return false;
+                ids[n++] = id;
+                return true;
+            };
+            bool fits = add(color);
+            for (uint32_t i = 0; fits && i < g_hot_known_n; ++i) fits = add(g_hot_known[i]);
+            for (uint32_t i = 0; fits && i < g_hot_pending_n; ++i) fits = add(g_hot_pending[i]);
+            if (!fits) { g_hot_overflow = true; return; }
+            std::copy_n(ids, n, g_hot_ids);
+            g_hot_n = n;
+            g_hot_color = color;
+            std::copy_n(ids, n, g_hot_known);
+            g_hot_known_n = n;
+            g_hot_pending_n = 0;
+            g_hot_scan_ids.clear();
+            for (auto& h : g_heaps) if (h->hot) g_hot_scan_ids.push_back(h->id);
+        }
+        g_hot_scan_active = true;
+        g_hot_scan_heap = 0;
+        g_hot_scan_word = 0;
+    }
+    uint32_t budget = kHotScanChunk;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        while (budget && g_hot_scan_heap < g_hot_scan_ids.size()) {
+            DescHeap* h = nullptr;
+            for (auto& x : g_heaps) if (x->id == g_hot_scan_ids[g_hot_scan_heap]) { h = x.get(); break; }
+            if (!h || !h->hot) { ++g_hot_scan_heap; g_hot_scan_word = 0; continue; } // retired meanwhile
+            for (; g_hot_scan_word < h->nstripes && budget; ++g_hot_scan_word) {
+                const uint64_t base = uint64_t(g_hot_scan_word) << kStripeShift;
+                if (base >= h->count) break;
+                uint64_t bits = 0;
+                {
+                    std::shared_lock<std::shared_mutex> stripe(h->stripes[g_hot_scan_word]);
+                    for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
+                        const auto& si = h->info[static_cast<size_t>(base + b)];
+                        if (si.kind == NA_DESC_SRV && hot_id_locked(si.resource)) bits |= 1ull << b;
+                    }
+                }
+                if (bits) h->hot[g_hot_scan_word].fetch_or(bits, std::memory_order_relaxed); // adds only; writes keep their own bits exact
+                budget -= static_cast<uint32_t>(std::min<uint64_t>(64, h->count - base));
             }
-            h->hot[w].store(bits, std::memory_order_relaxed);
+            if (g_hot_scan_word >= h->nstripes || (uint64_t(g_hot_scan_word) << kStripeShift) >= h->count) { ++g_hot_scan_heap; g_hot_scan_word = 0; }
         }
     }
+    if (g_hot_scan_heap < g_hot_scan_ids.size()) return; // more next Present
+    g_hot_scan_active = false;
+    bool grown;
+    { std::lock_guard<std::mutex> lk(g_hot_pending_m); grown = g_hot_pending_n != 0 || g_hot_overflow; }
+    uint64_t d2 = 0, c2 = 0;
+    GetLiveSelection(&d2, &c2);
+    if (grown || c2 != g_hot_color) return; // the set moved during the scan: the next Present starts over
     ++g_operation_revision; // per-list read caches were built without the filter; let them refill through it
     g_hot_rebuilds.fetch_add(1, std::memory_order_relaxed);
-    g_hot_ready.store(color != 0, std::memory_order_release);
+    g_hot_ready.store(true, std::memory_order_release);
 }
 int FormatReadFilter(char* out, size_t n)
 {
