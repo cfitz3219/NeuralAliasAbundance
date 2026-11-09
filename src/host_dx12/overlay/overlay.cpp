@@ -1113,7 +1113,7 @@ void write_status_line()
             na::observe::FormatHookCost(hl, sizeof hl - 2);
             const size_t hn = std::strlen(hl);
             if (hn) { hl[hn] = '\r'; hl[hn + 1] = '\n'; WriteFile(f, hl, DWORD(hn + 2), &written, nullptr); }
-            char rf[384];
+            char rf[512];
             const int rn = na::observe::FormatReadFilter(rf, sizeof rf - 2);
             if (rn > 0 && size_t(rn) < sizeof rf - 2) { rf[rn] = '\r'; rf[rn + 1] = '\n'; WriteFile(f, rf, DWORD(rn + 2), &written, nullptr); }
         }

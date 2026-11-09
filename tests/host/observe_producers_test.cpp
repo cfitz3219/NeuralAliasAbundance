@@ -386,6 +386,9 @@ int main()
         test::ComPtr<ID3D12Fence> fa, fb;
         REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fa))));
         dev->CreateShaderResourceView(rt.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc}); // placed was released above
+        // A second view of a resource this thread already resolved is queued on the thread
+        // (deferred view writes) and applied before the copy below reads the slot.
+        dev->CreateShaderResourceView(rt.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc});
         dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 7 * inc});
         dev->CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc},
                                    D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc}, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -398,7 +401,7 @@ int main()
         const auto after = na::observe::GetProducerStats();
         CHECK(CountKind(NA_EV_DESCRIPTOR_WRITE) == 0);
         CHECK(CountKind(NA_EV_DESCRIPTOR_COPY) == 0);
-        CHECK(after.descriptor_writes == before.descriptor_writes + 2); // bookkeeping still runs
+        CHECK(after.descriptor_writes == before.descriptor_writes + 3); // bookkeeping still runs (the queued write was applied)
         CHECK(after.descriptor_copies == before.descriptor_copies + 1);
         uint32_t seq_a = 0, seq_b = 0;
         const na_object_id fa_id = na::observe::IdOf(fa.Get()), fb_id = na::observe::IdOf(fb.Get());
