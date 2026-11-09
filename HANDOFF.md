@@ -876,3 +876,7 @@ Computer Use stopped on physical Escape; no further UI input this turn. Cort con
 ## 2026-11-09 — Testing authority and next performance integration
 
 Cort now retains all game testing, overriding the prior live-test permission for current WWII work. No game launch/control or diagnostic deployment by agents. Opus has posted c2802b4 view-write batching and b93bdbc read-filter publication repair; Astra must inspect/integrate with d3c5dac and run automated regressions before staging. Opus continues root-table/copy/per-draw reductions; Astra owns camera and integration. COMMS records nested-timer budget corrections: descriptor wait is included in descriptor write, J2 search in draw callback, and translator wait in Present. These must not be added twice. The 25 ms whole-frame goal is not yet achieved or measured.
+
+## 2026-11-09 — Combined WWII7613faf staged; next plan begun
+
+All five WWII CMDs point to Documents/NA-wwii-on12-7613faf;11automatedtests and isolated upgrade/rollback pass. Game unchanged. Fine profiling off, cheap timing retained. Plan b2b55e2 docs/WWII-40-50-FPS-PLAN-20261109.md in integration branch and Documents/NeuralAlias-WWII-40-50-FPS-Plan.md; COMMS has ownership and estimated savings. Opus owns remaining descriptor/draw/submission work plus native DX11 input provider; Astra owns camera and shared DX12 handoff. Do not change the package Cort is testing. Live FPS acceptance remains pending.
