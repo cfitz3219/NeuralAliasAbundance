@@ -7,7 +7,7 @@
 // Hook set (vtable functions of d3d11.dll's own context classes, found on a small private device;
 // hooking the function covers every game context of that class). Immediate and deferred contexts
 // are different classes, so both are hooked:
-//   state:  OMSetRenderTargets(+AndUAVs), OMSetDepthStencilState, VSSetConstantBuffers(+1),
+//   state:  OMSetRenderTargets(+AndUAVs), OMSetDepthStencilState, VS/PSSetConstantBuffers(+1),
 //           RSSetViewports, ClearState
 //   events: Draw* (6), ClearDepthStencilView, PS/CS/VSSetShaderResources,
 //           CopyResource / CopySubresourceRegion / ResolveSubresource (reads),
@@ -52,20 +52,20 @@ using Microsoft::WRL::ComPtr;
 
 // ID3D11DeviceContext vtable (d3d11.h order).
 enum CtxSlot : uint32_t {
-    kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
+    kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kPSSetConstantBuffers = 16, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
     kDrawIndexedInstanced = 20, kDrawInstanced = 21, kVSSetShaderResources = 25, kOMSetRenderTargets = 33,
     kOMSetRenderTargetsAndUAVs = 34, kOMSetDepthStencilState = 36, kDrawIndexedInstancedIndirect = 39,
     kDrawInstancedIndirect = 40, kRSSetViewports = 44, kCopySubresourceRegion = 46, kCopyResource = 47, kUpdateSubresource = 48,
     kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
     kClearState = 110, kFinishCommandList = 114,
     // ID3D11DeviceContext1
-    kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119,
+    kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
 };
 enum SwapSlot : uint32_t { kPresent = 8, kResizeBuffers = 13, kPresent1 = 22 };
 
 constexpr size_t kMaxCbBytes = 16 * 1024;  // camera blocks are far smaller
 constexpr size_t kMaxListEvents = 200000; // per deferred recording; beyond this the list's tail is not modelled
-constexpr size_t kMaxCandidates = 4;       // constant buffers searched for the camera
+constexpr size_t kMaxCandidates = 8;       // constant buffers searched for the camera (VS and PS)
 constexpr size_t kMaxLists = 512;          // recorded command lists kept
 
 struct Ctx {
@@ -73,10 +73,10 @@ struct Ctx {
     bool deferred = false;
     Id rt0 = 0, depth = 0;
     bool depth_test = true;
-    Id vs_cb[kCbSlots] = {};
-    uint32_t vs_first[kCbSlots] = {}; // VSSetConstantBuffers1 first constant per slot
+    Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
+    uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
     float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0; // viewport 0
-    uint32_t vs_num[kCbSlots] = {};   // VSSetConstantBuffers1 constant count per slot (0 = whole buffer)
+    uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
     std::vector<std::pair<size_t, std::vector<uint8_t>>> cb_bytes; // (event index, bytes) for CbUpdate events
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
@@ -84,9 +84,9 @@ struct Ctx {
     {
         rt0 = depth = 0;
         depth_test = true;
-        std::memset(vs_cb, 0, sizeof(vs_cb));
-        std::memset(vs_first, 0, sizeof(vs_first));
-        std::memset(vs_num, 0, sizeof(vs_num));
+        std::memset(cb, 0, sizeof(cb));
+        std::memset(cb_first, 0, sizeof(cb_first));
+        std::memset(cb_num, 0, sizeof(cb_num));
         vp_x = vp_y = vp_w = vp_h = 0;
     }
 };
@@ -255,8 +255,8 @@ using PFN_Present1 = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, c
 using PFN_Resize = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
 struct Originals {
-    PFN_VSSetCB vs_cb = nullptr;
-    PFN_VSSetCB1 vs_cb1 = nullptr;
+    PFN_VSSetCB vs_cb = nullptr, ps_cb = nullptr;
+    PFN_VSSetCB1 vs_cb1 = nullptr, ps_cb1 = nullptr;
     PFN_SetSRV ps_srv = nullptr, cs_srv = nullptr, vs_srv = nullptr;
     PFN_DrawIndexed draw_indexed = nullptr;
     PFN_Draw draw = nullptr;
@@ -384,7 +384,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.reversed_depth = cam.reversed;
     std::vector<uint8_t> camera_bytes(*bytes); // the callback runs without g_mu
     f.camera.buffer = cam_sel.camera_cb;
-    f.camera.vs_slot = cam_sel.camera_slot;
+    f.camera.vs_slot = cam_sel.camera_slot >= 0 && cam_sel.camera_slot < kPsCbBase ? cam_sel.camera_slot : -1;
+    f.camera.ps_slot = cam_sel.camera_slot >= kPsCbBase ? cam_sel.camera_slot - kPsCbBase : -1;
     f.camera.first_constant = g_camera_first;
     f.camera.num_constants = g_camera_num;
     f.camera.version = version;
@@ -462,7 +463,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.depth_test = x->depth_test;
     e.vertices = vertices;
     e.indirect = indirect;
-    std::memcpy(e.vs_cb, x->vs_cb, sizeof(e.vs_cb));
+    std::memcpy(e.cb, x->cb, sizeof(e.cb));
     if (!x->deferred && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed)) {
         // Scene-draw facts the frame model does not keep: viewport extent and the camera's offset binding.
         std::lock_guard<std::mutex> l(g_mu);
@@ -472,9 +473,9 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
             g_scene_vp_y = x->vp_y;
             g_scene_vp_w = x->vp_w;
             g_scene_vp_h = x->vp_h;
-            if (s.camera_slot >= 0 && s.camera_slot < kCbSlots) {
-                g_camera_first = x->vs_first[s.camera_slot];
-                g_camera_num = x->vs_num[s.camera_slot];
+            if (s.camera_slot >= 0 && s.camera_slot < kCbBindSlots) {
+                g_camera_first = x->cb_first[s.camera_slot];
+                g_camera_num = x->cb_num[s.camera_slot];
             }
         }
     }
@@ -591,24 +592,42 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
 }
 
 // ---------------------------------------------------------------- detours
+// Constant-buffer binds of one stage (`base` = 0 for VS, kPsCbBase for PS).
+void NoteCbs(Ctx* x, int base, UINT start, UINT n, ID3D11Buffer* const* b, const UINT* first, const UINT* num)
+{
+    if (!x) return;
+    for (UINT i = 0; i < n && start + i < static_cast<UINT>(kCbSlots); ++i) {
+        const int s = base + static_cast<int>(start + i);
+        x->cb[s] = b ? IdOf(b[i]) : 0;
+        x->cb_first[s] = b && first ? first[i] : 0;
+        x->cb_num[s] = b && first && num ? num[i] : 0;
+    }
+}
 void STDMETHODCALLTYPE VSSetConstantBuffers_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11Buffer* const* b)
 {
     Ctx* x = Get(c);
-    if (x && b)
-        for (UINT i = 0; i < n && start + i < static_cast<UINT>(kCbSlots); ++i) { x->vs_cb[start + i] = IdOf(b[i]); x->vs_first[start + i] = 0; x->vs_num[start + i] = 0; }
+    NoteCbs(x, 0, start, n, b, nullptr, nullptr);
     O(c, x).vs_cb(c, start, n, b);
 }
 void STDMETHODCALLTYPE VSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT start, UINT n, ID3D11Buffer* const* b, const UINT* first,
                                                const UINT* num)
 {
     Ctx* x = Get(c);
-    if (x && b)
-        for (UINT i = 0; i < n && start + i < static_cast<UINT>(kCbSlots); ++i) {
-            x->vs_cb[start + i] = IdOf(b[i]);
-            x->vs_first[start + i] = first ? first[i] : 0;
-            x->vs_num[start + i] = first && num ? num[i] : 0;
-        }
+    NoteCbs(x, 0, start, n, b, first, num);
     O(c, x).vs_cb1(c, start, n, b, first, num);
+}
+void STDMETHODCALLTYPE PSSetConstantBuffers_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11Buffer* const* b)
+{
+    Ctx* x = Get(c);
+    NoteCbs(x, kPsCbBase, start, n, b, nullptr, nullptr);
+    O(c, x).ps_cb(c, start, n, b);
+}
+void STDMETHODCALLTYPE PSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT start, UINT n, ID3D11Buffer* const* b, const UINT* first,
+                                               const UINT* num)
+{
+    Ctx* x = Get(c);
+    NoteCbs(x, kPsCbBase, start, n, b, first, num);
+    O(c, x).ps_cb1(c, start, n, b, first, num);
 }
 void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
@@ -1010,6 +1029,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     struct H { uint32_t slot; void* detour; void** out; };
     std::vector<H> hooks = {
         {kVSSetConstantBuffers, reinterpret_cast<void*>(&VSSetConstantBuffers_d), reinterpret_cast<void**>(&o.vs_cb)},
+        {kPSSetConstantBuffers, reinterpret_cast<void*>(&PSSetConstantBuffers_d), reinterpret_cast<void**>(&o.ps_cb)},
         {kPSSetShaderResources, reinterpret_cast<void*>(&PSSetShaderResources_d), reinterpret_cast<void**>(&o.ps_srv)},
         {kCSSetShaderResources, reinterpret_cast<void*>(&CSSetShaderResources_d), reinterpret_cast<void**>(&o.cs_srv)},
         {kVSSetShaderResources, reinterpret_cast<void*>(&VSSetShaderResources_d), reinterpret_cast<void**>(&o.vs_srv)},
@@ -1038,6 +1058,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) {
         hooks.push_back({kUpdateSubresource1, reinterpret_cast<void*>(&UpdateSubresource1_d), reinterpret_cast<void**>(&o.update1)});
         hooks.push_back({kVSSetConstantBuffers1, reinterpret_cast<void*>(&VSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.vs_cb1)});
+        hooks.push_back({kPSSetConstantBuffers1, reinterpret_cast<void*>(&PSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.ps_cb1)});
     }
     for (const H& h : hooks)
         if (!na::hooking::PrepareVTableSlot(ctx, h.slot, h.detour, h.out)) return false;

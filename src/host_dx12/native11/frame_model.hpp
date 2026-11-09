@@ -57,13 +57,19 @@
 #include <cstring>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace na::native11 {
 
 using Id = uint64_t; // a resource identity (the game's ID3D11Resource pointer); 0 = none
 
-constexpr int kCbSlots = 14; // D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+constexpr int kCbSlots = 14; // D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT (per stage)
+// Constant-buffer bindings kept per draw: vertex-shader slots 0..13, then pixel-shader slots at
+// kPsCbBase + 0..13. Engines that rebuild positions from depth keep the camera in pixel constants
+// (WWII's scene pose sits there; the DX12 bridge found it on the pixel stage of the scene list).
+constexpr int kPsCbBase = kCbSlots;
+constexpr int kCbBindSlots = 2 * kCbSlots;
 
 struct ResourceInfo {
     uint32_t width = 0, height = 0, format = 0, samples = 1;
@@ -84,7 +90,7 @@ struct Event {
     bool depth_test = false;      // Draw: depth test enabled in the bound state
     uint64_t vertices = 0;        // Draw: vertices (indices) x instances; 0 for indirect
     bool indirect = false;
-    Id vs_cb[kCbSlots] = {};      // Draw: vertex-shader constant buffers
+    Id cb[kCbBindSlots] = {};     // Draw: constant buffers (VS 0..13, PS kPsCbBase + 0..13)
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
 };
 
@@ -277,11 +283,19 @@ public:
         std::sort(cbs.begin(), cbs.end(), [](const auto& a, const auto& b) {
             return a.second.draws != b.second.draws ? a.second.draws > b.second.draws : a.first.first < b.first.first;
         });
+        // Steady blocks first. Blocks re-uploaded between most scene draws (per-object constants, or a
+        // pass block the engine rewrites per shader variant with the camera repeated in it) come after
+        // them, so they are still searched when the steady ones hold no camera. One entry per buffer
+        // (a buffer bound on both stages is searched once, at its most-used slot).
+        std::vector<std::pair<Id, int>> reuploaded;
+        std::unordered_set<Id> seen;
         for (const auto& c : cbs) {
+            if (!seen.insert(c.first.first).second) continue;
             const uint32_t allowed = std::max<uint32_t>(4, c.second.draws / 4);
-            if (c.second.versions > allowed) continue; // per-object constants
-            last_cb_order_.push_back(c.first);
+            if (c.second.versions > allowed) reuploaded.push_back(c.first);
+            else last_cb_order_.push_back(c.first);
         }
+        last_cb_order_.insert(last_cb_order_.end(), reuploaded.begin(), reuploaded.end());
         stats_.camera_scene_draws = 0;
         for (const auto& c : cbs)
             if (sel_.camera_cb && c.first.first == sel_.camera_cb) stats_.camera_scene_draws += c.second.draws;
@@ -327,7 +341,7 @@ private:
             pending_tag_ = 0;
             first_overlay_after_scene_pending_ = 0; // so was a non-scene draw into the colour
             CountCbs(e);
-            if (sel_.camera_cb && sel_.camera_slot >= 0 && e.vs_cb[sel_.camera_slot] == sel_.camera_cb)
+            if (sel_.camera_cb && sel_.camera_slot >= 0 && e.cb[sel_.camera_slot] == sel_.camera_cb)
                 ++camera_versions_[CbVersion(sel_.camera_cb)];
         } else if (sel_.valid() && e.rt0 == sel_.color) {
             ++overlay_draws_;
@@ -340,11 +354,11 @@ private:
 
     void CountCbs(const Event& e)
     {
-        for (int i = 0; i < kCbSlots; ++i) {
-            if (!e.vs_cb[i]) continue;
-            CbUse& u = cb_scene_[{e.vs_cb[i], i}];
+        for (int i = 0; i < kCbBindSlots; ++i) {
+            if (!e.cb[i]) continue;
+            CbUse& u = cb_scene_[{e.cb[i], i}];
             ++u.draws;
-            const uint32_t v = CbVersion(e.vs_cb[i]);
+            const uint32_t v = CbVersion(e.cb[i]);
             if (!u.versions || v != u.last_version) { ++u.versions; u.last_version = v; }
         }
     }

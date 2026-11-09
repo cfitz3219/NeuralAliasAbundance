@@ -41,8 +41,9 @@ struct TextureFacts {
 
 struct CameraFacts {
     Id buffer = 0;                 // the constant buffer the scene draws read the camera from
-    int vs_slot = -1;              // VS slot it was bound at
-    uint32_t first_constant = 0;   // offset binding (VSSetConstantBuffers1), in 16-byte constants
+    int vs_slot = -1;              // VS slot it was bound at (-1 when it is a pixel-shader block)
+    int ps_slot = -1;              // PS slot it was bound at (-1 when it is a vertex-shader block)
+    uint32_t first_constant = 0;   // offset binding (VS/PSSetConstantBuffers1), in 16-byte constants
     uint32_t num_constants = 0;    // constants readable from first_constant (0 = whole buffer, plain bind)
     uint64_t version = 0;          // content version of the bytes below (bumps on every update)
     const uint8_t* bytes = nullptr; // CPU copy of the bytes the game uploaded (Map/Unmap or UpdateSubresource
