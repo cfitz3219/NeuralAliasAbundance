@@ -55,8 +55,10 @@ int main()
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
 
-    // Root signature: 0 = root CBV b0, 1 = table with one CBV (b1), 2 = root CBV b2.
-    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
+    // D3D11On12 emits CBV tables with 4, 8, 14 or 15 slots. Keep the
+    // translated full-width case in this existing snapshot/live-camera test.
+    constexpr UINT table_count = D3D12_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT;
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, table_count, 0, 1, 0};
     D3D12_ROOT_PARAMETER params[3] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor = {0, 0};
@@ -83,11 +85,14 @@ int main()
     std::memcpy(cpu + 1024, proj, sizeof(proj));
 
     test::ComPtr<ID3D12DescriptorHeap> heap;
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3 + table_count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap))));
     const uint32_t inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{upload->GetGPUVirtualAddress() + 1024, 256};
-    dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{heap->GetCPUDescriptorHandleForHeapStart().ptr + 3 * inc});
+    for (UINT i = 0; i < table_count; ++i) {
+        if (i) std::memset(cpu + 1024 + i * 256, static_cast<int>(i), 256);
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{upload->GetGPUVirtualAddress() + 1024 + i * 256, 256};
+        dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{heap->GetCPUDescriptorHandleForHeapStart().ptr + (3 + i) * inc});
+    }
 
     test::ComPtr<ID3D12CommandAllocator> alloc;
     test::ComPtr<ID3D12GraphicsCommandList> list;
@@ -100,6 +105,15 @@ int main()
     list->SetDescriptorHeaps(1, heaps);                                                              // op 2
     list->SetGraphicsRootConstantBufferView(0, upload->GetGPUVirtualAddress() + 512);                // op 3
     list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{heap->GetGPUDescriptorHandleForHeapStart().ptr + 3 * inc}); // op 4
+    const auto live = na::observe::ListRootConstantBuffers(list.Get());
+    UINT live_tables = 0;
+    for (const auto& b : live) if (b.table && b.param == 1) ++live_tables;
+    CHECK(live_tables == table_count);
+    na::observe::LiveBinding current[32]{};
+    const auto current_count = na::observe::ListCurrentGraphicsCbvs(list.Get(), current, 32);
+    UINT current_tables = 0;
+    for (UINT i = 0; i < current_count; ++i) if (current[i].table && current[i].param == 1) ++current_tables;
+    CHECK(current_tables == table_count);
     list->SetGraphicsRootConstantBufferView(2, gpu->GetGPUVirtualAddress());                         // op 5
     list->SetGraphicsRootConstantBufferView(0, unmapped->GetGPUVirtualAddress() + 256);              // op 6
     REQUIRE(SUCCEEDED(list->Close()));
@@ -196,6 +210,7 @@ int main()
         if (x->hdr.kind == NA_EV_QUEUE_EXECUTE && x->list_count == 1 && !exec_ticket) exec_ticket = x->queue_ticket;
     }
     int snaps = 0;
+    uint32_t table_mask = 0;
     for (const auto& e : g_events) {
         const auto* s = reinterpret_cast<const na_ev_snapshot*>(e.data());
         if (s->hdr.kind != NA_EV_SNAPSHOT) continue;
@@ -221,16 +236,23 @@ int main()
         if (s->resource == upload_id && s->binding == NA_SNAP_ROOT_CBV)
             root_ok = s->status == NA_SNAP_CAPTURED && s->offset == 512 && s->param == 0 && s->op_index == 3 && s->captured_bytes >= 64 &&
                       bytes && std::memcmp(bytes, view, 64) == 0;
-        if (s->resource == upload_id && s->binding == NA_SNAP_TABLE_CBV)
-            table_ok = s->status == NA_SNAP_CAPTURED && s->offset == 1024 && s->param == 1 && s->op_index == 4 && s->requested_bytes == 256 &&
-                       s->captured_bytes == 256 && bytes && std::memcmp(bytes, proj, 64) == 0;
+        if (s->resource == upload_id && s->binding == NA_SNAP_TABLE_CBV) {
+            const auto slot = (s->offset - 1024) / 256;
+            CHECK(s->status == NA_SNAP_CAPTURED && s->param == 1 && s->op_index == 4 && s->requested_bytes == 256 && s->captured_bytes == 256);
+            if (slot < table_count && bytes && s->captured_bytes == 256) {
+                table_mask |= 1u << slot;
+                if (!slot) table_ok = std::memcmp(bytes, proj, 64) == 0;
+                else for (UINT i = 0; i < 256; ++i) CHECK(bytes[i] == slot);
+            }
+        }
         if (s->resource == gpu_id) gpu_ok = s->status == NA_SNAP_GPU_WRITTEN && s->captured_bytes == 0 && s->payload_offset == 0;
         if (s->resource == unmapped_id) unmapped_ok = s->status == NA_SNAP_NOT_MAPPED && s->captured_bytes == 0 && s->offset == 256;
     }
     std::printf("snapshots: %d (root %d table %d gpu-written %d not-mapped %d)\n", snaps, root_ok, table_ok, gpu_ok, unmapped_ok);
     std::printf("unmapped-before-submit re-read %d (host maps %llu), custom upload heap %d\n", reread_ok,
                 static_cast<unsigned long long>(rereads), custom_ok);
-    CHECK(snaps == 7); // 4 from the first submission + the raced root CBV + 2 after the Unmap
+    CHECK(snaps == 6 + table_count);
+    CHECK(table_mask == (1u << table_count) - 1);
     CHECK(reread_ok && rereads >= 1);
     CHECK(custom_ok && custom_id != 0);
     CHECK(root_ok);
