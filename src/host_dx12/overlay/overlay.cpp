@@ -3799,7 +3799,9 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
-    na::on12::BeforeResize(sc,&count,&fmt,&flags); // DX11 bridge: D3D12 chain parameters; the game's buffer waits for the verdict
+    // DX11 bridge: D3D12 chain parameters; the game's buffer waits for the verdict. Our copies
+    // still running refuse the resize with nothing changed; the presenter's transaction closes too.
+    if(!na::on12::BeforeResize(sc,&count,&fmt,&flags)){na::present::AfterResize(sc,DXGI_ERROR_INVALID_CALL);return DXGI_ERROR_INVALID_CALL;}
     const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
     na::on12::AfterResize(sc,result);
     na::present::AfterResize(sc,result);
@@ -3816,7 +3818,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
-    na::on12::BeforeResize(sc,&count,&fmt,&flags); // DX11 bridge (a D3D11 game does not call this; same contract if it does)
+    if(!na::on12::BeforeResize(sc,&count,&fmt,&flags)){na::present::AfterResize(sc,DXGI_ERROR_INVALID_CALL);return DXGI_ERROR_INVALID_CALL;} // DX11 bridge; same contract as ResizeBuffers
     const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
     na::on12::AfterResize(sc,result);
     na::present::AfterResize(sc,result);

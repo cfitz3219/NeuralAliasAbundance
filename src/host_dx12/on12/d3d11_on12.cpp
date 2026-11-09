@@ -744,7 +744,16 @@ bool twait(TChain& c, uint64_t value, DWORD ms)
     if (value == UINT64_MAX) return false; // a submission without a fence receipt: only a drain clears it
     if (!c.event) c.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!c.event || FAILED(c.fence->SetEventOnCompletion(value, c.event))) return false;
-    return WaitForSingleObject(c.event, ms) == WAIT_OBJECT_0;
+    // The auto-reset event may still carry the signal of an earlier registration that timed
+    // out: only the fence value itself says the work is done. Wait out the budget for it.
+    const ULONGLONG deadline = GetTickCount64() + ms;
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+        const DWORD left = now >= deadline ? 0u : static_cast<DWORD>(deadline - now);
+        const DWORD w = WaitForSingleObject(c.event, left);
+        if (c.fence->GetCompletedValue() >= value) return true;
+        if (w != WAIT_OBJECT_0 || !left) return false;
+    }
 }
 
 // Everything submitted to the queue so far, D3D11 work included, has finished.
@@ -1046,16 +1055,17 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
     c->on12->AcquireWrappedResources(r, 1); // the game draws its next frame into it
 }
 
-void BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags)
+bool BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags)
 {
-    if (!g_tchain_count.load(std::memory_order_relaxed)) return;
+    if (!g_tchain_count.load(std::memory_order_relaxed)) return true;
     std::lock_guard<std::recursive_mutex> lk(g_tm);
     TChain* c = tfind(chain);
-    if (!c) return;
-    // DXGI resizes D3D12 buffers only when no GPU work still uses them: our copies first. The
-    // game's buffer is handed back from D3D11 but kept, with everything advertised about it,
-    // until DXGI has decided (a refused resize must leave the game exactly what it had).
-    tdrain(*c);
+    if (!c) return true;
+    // DXGI resizes D3D12 buffers only when no GPU work still uses them: our copies first. A
+    // copy that has not completed within the budget refuses the resize here, before anything
+    // of the game's is touched (a later resize retries). The game's buffer is handed back from
+    // D3D11 but kept, with everything advertised about it, until DXGI has decided.
+    if (!tdrain(*c)) { tnote("a copy to the chain had not completed; this ResizeBuffers is refused unchanged"); return false; }
     if (c->virt11) { ID3D11Resource* r[] = {c->virt11.Get()}; c->on12->ReleaseWrappedResources(r, 1); }
     c->ctx->Flush();
     c->resizing = true;
@@ -1069,6 +1079,7 @@ void BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, u
     if (*count) *count = flip_count(*count);
     *flags = flip_flags(*flags);
     g_tresizes.fetch_add(1);
+    return true;
 }
 
 void AfterResize(IDXGISwapChain* chain, long result)

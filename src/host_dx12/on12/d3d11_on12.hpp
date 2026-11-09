@@ -107,7 +107,9 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags);
 // D3D11 (kept, with the advertised description, until DXGI has decided) and translates the
 // count/format/flags. AfterResize: success builds the new virtual buffer and adopts the
 // requested description; failure reacquires the exact old buffer, nothing advertised changes.
-void BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags);
+// False: our copies on the old buffers did not complete in time; the caller must refuse the
+// resize without touching the chain (nothing of the game's was released or replaced).
+bool BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags);
 void AfterResize(IDXGISwapChain* chain, long result);
 // The game is about to drop its last reference: wait for our GPU copies.
 void BeforeFinalRelease(IDXGISwapChain* chain);
