@@ -884,3 +884,7 @@ All five WWII CMDs point to Documents/NA-wwii-on12-7613faf;11automatedtests and 
 ### 2026-11-09 — Native WWII frame pipeline qualified in hardware fixture
 
 Astra integration head98c9100 includes Opus provider3d14ae9 and the native frame handoff, scene depth conversion, camera motion, real DLAA/RCAS and pre-consumer copyback. Standalone interop exact pixels across12 frames/two sizes. Combined hardware fixture uses recorded campaign HDR format R11G11B10_FLOAT and D24S8 depth, delivered70/70 (immediate30/deferred20/resize20), busy0/rejected0, output RGB readback passed. Four other focused regressions passed: native frame model, translated Present order, old RCAS and old real D24 path. Release builds. No user-facing installer yet: awaiting Opus's native startup/overlay activation. Existing reversible staging script local/wwii-record-cost/stage-native.ps1 ready for the exact combined source. User performs game/FPS test. Neither fixture cadence nor writeback proves campaign FPS.
+
+## 2026-11-09 — Native WWII and Home staged at 20e20fa
+
+Use Documents/NA-wwii-on12-update.cmd for the staged native WWII build and the corresponding Results and Rollback CMDs. The filename is retained for continuity. The package config enables native11 and Home, disables dx11on12 and the old game-facing DX12 observation path. RTX and installer checks passed as recorded in COMMS and Documents/NA-wwii-on12-20e20fa/AUTOMATED-TESTS.txt. Cort alone tests the campaign, including sustained DLAA, Home and actual frame rate. The installed game remains untouched by staging.
