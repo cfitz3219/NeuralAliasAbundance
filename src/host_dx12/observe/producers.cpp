@@ -287,7 +287,14 @@ struct VaRange {
 
 // registry, heaps, VA table. Never held across a D3D12 call. Readers take per-thread slots
 // instead of one shared lock word (reader_slots_lock.hpp: SE5 spun ~3.7 s/s on that word).
-using RegistryLock = na::observe::ReaderSlotsLock;
+// Deferred descriptor view writes (see note_descriptor_write) of every thread are applied before
+// any thread takes the registry lock for anything else, so no reader can see a slot older than
+// its last write. The flush itself locks the base class.
+void flush_deferred_writes();
+struct RegistryLock : na::observe::ReaderSlotsLock {
+    void lock_shared() { flush_deferred_writes(); ReaderSlotsLock::lock_shared(); }
+    void lock() { flush_deferred_writes(); ReaderSlotsLock::lock(); }
+};
 RegistryLock g_m;
 // Never destroyed: at process exit an entry's twins must not be Released (a twin's last
 // Release can retire an object through its sentinel, which takes g_m and walks this map).
@@ -1214,11 +1221,149 @@ void publish_details(DescHeap::SlotInfo& info, std::shared_ptr<const DescriptorD
     info.details = std::move(d);
 }
 
+// ---- Deferred view writes (WWII p49040: ~1.1 M CreateXView per second on the D3D11On12 translator
+// thread, ~0.14 us each = ~12 ms of every frame; the bridge writes ~10 staging descriptors per draw
+// and copies them into its online heap). When nothing needs the write at once (its event is not
+// wanted, no operation snapshot, not host work) and the resource's registry id is already known to
+// this thread, the write is queued on the thread's queue and applied in one batch: one registry
+// lock, one stripe lock per run of neighbouring slots, one revision bump. Every queue is drained by
+// ANY thread before it takes the registry lock for anything else (RegistryLock above), so no reader
+// of a slot (the draw's walk, a copy of the slot, a render-target bind, ExecuteCommandLists, the
+// read-filter scan) can see a slot older than its last write, whichever thread wrote it: a view the
+// game thread created is applied at the latest when the translator thread next touches the registry.
+// Per-thread resource id cache: pointer -> registry id, valid until any object retires
+// (g_retire_gen, as canon()'s cache), so a cached id never names a reused pointer.
+constexpr uint32_t kIdCache = 256;
+struct ThreadIdCache { uint64_t gen = 0; const void* ptr[kIdCache]{}; na_object_id id[kIdCache]{}; };
+thread_local ThreadIdCache t_idc;
+inline uint32_t idc_slot(const void* p) { return static_cast<uint32_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B1u) >> 24; }
+inline void idc_refresh()
+{
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (gen == t_idc.gen) return;
+    for (auto& q : t_idc.ptr) q = nullptr;
+    t_idc.gen = gen;
+}
+inline bool idc_get(const void* p, na_object_id* id)
+{
+    idc_refresh();
+    const uint32_t i = idc_slot(p);
+    if (t_idc.ptr[i] != p) return false;
+    *id = t_idc.id[i];
+    return true;
+}
+inline void idc_put(const void* p, na_object_id id)
+{
+    idc_refresh();
+    const uint32_t i = idc_slot(p);
+    t_idc.ptr[i] = p;
+    t_idc.id[i] = id;
+}
+constexpr uint32_t kDeferredWrites = 64, kDeferredQueues = 256;
+struct DeferredWrite { uint64_t ptr; na_object_id resource; uint32_t kind, format, first_sub; };
+struct DeferredQueue {
+    std::atomic<bool> busy{false}; // spin lock: the owner appends, any thread drains
+    std::atomic<uint32_t> n{0};
+    DeferredWrite w[kDeferredWrites];
+};
+std::atomic<DeferredQueue*> g_dw_queues[kDeferredQueues]{};
+std::atomic<uint32_t> g_dw_queue_n{0};
+std::atomic<uint32_t> g_dw_pending{0}; // queues holding at least one write (the drain's fast "nothing to do")
+std::atomic<uint64_t> g_deferred_writes{0}, g_deferred_flushes{0};
+thread_local DeferredQueue* t_dwq = nullptr;
+inline void dwq_lock(DeferredQueue& q) { while (q.busy.exchange(true, std::memory_order_acquire)) YieldProcessor(); }
+inline void dwq_unlock(DeferredQueue& q) { q.busy.store(false, std::memory_order_release); }
+DeferredQueue* my_deferred_queue()
+{
+    if (t_dwq) return t_dwq;
+    const uint32_t i = g_dw_queue_n.fetch_add(1, std::memory_order_acq_rel);
+    if (i >= kDeferredQueues) return nullptr; // the 257th writing thread keeps the immediate path
+    auto* q = new DeferredQueue(); // kept for the process: the thread's writes may be drained after it is gone
+    g_dw_queues[i].store(q, std::memory_order_release);
+    t_dwq = q;
+    return q;
+}
+void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
+{
+    const CostScope cost(kCostDescWrite);
+    std::shared_lock<na::observe::ReaderSlotsLock> lock(static_cast<na::observe::ReaderSlotsLock&>(g_m), std::defer_lock);
+    { const CostScope wait(kCostDescWriteWait); lock.lock(); }
+    DescHeap* cur_h = nullptr;
+    uint32_t cur_stripe = ~0u, unresolved = 0;
+    std::shared_mutex* held = nullptr;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t slot = 0;
+        DescHeap* h = heap_for_cpu_locked(w[i].ptr, &slot);
+        if (!h) { ++unresolved; continue; }
+        const uint32_t st = slot >> kStripeShift;
+        if (h != cur_h || st != cur_stripe) {
+            if (held) held->unlock();
+            held = h->stripes && st < h->nstripes ? &h->stripes[st] : nullptr;
+            if (held) held->lock(); // one stripe at a time, as the immediate path
+            cur_h = h; cur_stripe = st;
+        }
+        ++h->versions[slot];
+        std::shared_ptr<const DescriptorDetails> prev = std::move(h->info[slot].details); // no snapshot: dropped, as the immediate path
+        h->info[slot] = DescHeap::SlotInfo{w[i].kind, w[i].resource, w[i].format, w[i].first_sub, 0, 0};
+        set_hot_bit(h, slot, w[i].kind == NA_DESC_SRV && hot_id_locked(w[i].resource));
+    }
+    if (held) held->unlock();
+    // After the writes: a reader that took the revision before this and walked a slot before its
+    // write caches the old revision and is invalidated; one that takes it now sees every write.
+    ++g_operation_revision;
+    g_c.writes.fetch_add(n);
+    if (unresolved) g_c.unresolved.fetch_add(unresolved);
+    g_deferred_writes.fetch_add(n, std::memory_order_relaxed);
+    g_deferred_flushes.fetch_add(1, std::memory_order_relaxed);
+}
+// Drains every thread's queue. Called before any registry lock (RegistryLock); takes the base lock itself.
+void flush_deferred_writes()
+{
+    if (!g_dw_pending.load(std::memory_order_acquire)) return;
+    const uint32_t nq = std::min<uint32_t>(g_dw_queue_n.load(std::memory_order_acquire), kDeferredQueues);
+    for (uint32_t qi = 0; qi < nq; ++qi) {
+        DeferredQueue* q = g_dw_queues[qi].load(std::memory_order_acquire);
+        if (!q || !q->n.load(std::memory_order_relaxed)) continue;
+        DeferredWrite w[kDeferredWrites];
+        dwq_lock(*q);
+        const uint32_t n = q->n.load(std::memory_order_relaxed);
+        std::copy_n(q->w, n, w);
+        q->n.store(0, std::memory_order_relaxed);
+        dwq_unlock(*q);
+        if (!n) continue;
+        g_dw_pending.fetch_sub(1, std::memory_order_acq_rel);
+        apply_deferred_writes(w, n);
+    }
+}
+bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, uint32_t format, uint32_t first_sub)
+{
+    DeferredQueue* q = my_deferred_queue();
+    if (!q) return false;
+    dwq_lock(*q);
+    if (q->n.load(std::memory_order_relaxed) == kDeferredWrites) {
+        dwq_unlock(*q);
+        flush_deferred_writes(); // drains this queue among the others
+        dwq_lock(*q);
+    }
+    const uint32_t n = q->n.load(std::memory_order_relaxed);
+    q->w[n] = DeferredWrite{ptr, resource, kind, format, first_sub};
+    q->n.store(n + 1, std::memory_order_relaxed);
+    if (n == 0) g_dw_pending.fetch_add(1, std::memory_order_release);
+    dwq_unlock(*q);
+    return true;
+}
+
 void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnknown* resource, uint32_t format,
                            uint32_t first_sub, uint32_t sub_count, const DescriptorDetails* view = nullptr)
 {
     na_ev_descriptor_write e;
     const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    if (!want && !view && !t_host_work) {
+        // The common case under the bridge: the resource's id is known to this thread (every view
+        // after the first of a resource) or there is none (sampler, null view): queue it.
+        na_object_id rid = 0;
+        if ((!resource || idc_get(resource, &rid)) && defer_descriptor_write(dst.ptr, rid, kind, format, first_sub)) return;
+    }
     // Sol 7fec1c4: a resource first met through a view (DXGI swap-chain buffers are
     // created by DXGI, never through our creation hooks) is registered BEFORE the
     // descriptor metadata is published, outside the registry lock. Otherwise the view
@@ -1245,6 +1390,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             registered = true; // at most one retry; a failed registration publishes as unknown, as before
             continue;
         }
+        if (rid && registrable && !t_host_work) idc_put(resource, rid); // later views of it on this thread are queued
         uint32_t slot = 0;
         DescHeap* h = heap_for_cpu_locked(dst.ptr, &slot);
         if (!h) {
@@ -7428,11 +7574,12 @@ int FormatReadFilter(char* out, size_t n)
     uint32_t ids;
     { std::lock_guard<std::mutex> lk(g_hot_pending_m); overflow = g_hot_overflow; ids = g_hot_known_n; }
     return std::snprintf(out, n, "read_filter ready=%u ids=%u overflow=%u rebuilds=%llu skipped=%llu walked=%llu"
-        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu",
+        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu | view_writes=%llu deferred=%llu flushes=%llu",
         g_hot_ready.load() ? 1u : 0u, ids, overflow ? 1u : 0u, (unsigned long long)g_hot_rebuilds.load(),
         (unsigned long long)g_hot_skipped.load(), (unsigned long long)g_hot_walked.load(),
         (unsigned long long)g_copy_simple.load(), (unsigned long long)g_copy_calls.load(),
-        (unsigned long long)g_copy_batched.load(), (unsigned long long)g_copy_batched_runs.load());
+        (unsigned long long)g_copy_batched.load(), (unsigned long long)g_copy_batched_runs.load(),
+        (unsigned long long)g_c.writes.load(), (unsigned long long)g_deferred_writes.load(), (unsigned long long)g_deferred_flushes.load());
 }
 void ResetDerived()
 {
