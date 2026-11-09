@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <memory>
 #include <cstdio>
 #include <mutex>
 
@@ -119,26 +120,43 @@ bool swapchain_supported(ID3D11Device* device)
     return ok;
 }
 
+// One startup-log line per creation step (thread id + ms since the request), so a
+// stall inside the game's device creation names its step.
+void step(const char* what, DWORD thread, ULONGLONG t0)
+{
+    if (!g_log) return;
+    char line[160];
+    std::snprintf(line, sizeof line, "dx11on12: step %s (request thread %lu, +%llu ms)", what, thread,
+                  static_cast<unsigned long long>(GetTickCount64() - t0));
+    g_log(line);
+}
+
 // Builds the 11on12 device on our own D3D12 device + direct queue. Returns
 // false (nothing handed out, nothing kept) on any failure.
-bool create_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* levels, UINT level_count,
-                 ID3D11Device** out_device, D3D_FEATURE_LEVEL* out_level, ID3D11DeviceContext** out_context)
+bool build_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* levels, UINT level_count,
+                ID3D11Device** out_device, D3D_FEATURE_LEVEL* out_level, ID3D11DeviceContext** out_context,
+                DWORD thread, ULONGLONG t0)
 {
     if (!g_on12_create || !g_d3d12_create) { note("D3D11On12 or D3D12 is not available; native DX11"); return false; }
+    step("D3D12CreateDevice", thread, t0);
     ComPtr<ID3D12Device> d12;
     HRESULT hr = g_d3d12_create(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d12));
     if (FAILED(hr) || !d12) { note("no D3D12 device on the game's adapter; native DX11", hr); return false; }
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     ComPtr<ID3D12CommandQueue> queue;
+    step("CreateCommandQueue", thread, t0);
     if (FAILED(hr = d12->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)))) { note("D3D12 queue creation failed; native DX11", hr); return false; }
     IUnknown* queues[] = {queue.Get()};
     ComPtr<ID3D11Device> d11;
     ComPtr<ID3D11DeviceContext> ctx;
     D3D_FEATURE_LEVEL chosen{};
+    step("D3D11On12CreateDevice", thread, t0);
     hr = g_on12_create(d12.Get(), flags, levels, level_count, queues, 1, 0, &d11, &ctx, &chosen);
     if (FAILED(hr) || !d11) { note("D3D11On12CreateDevice refused the game's request; native DX11", hr); return false; }
+    step("swap chain check", thread, t0);
     if (!swapchain_supported(d11.Get())) return false;
+    step("done", thread, t0);
     remember(d11.Get(), d12.Get(), queue.Get());
     if (out_level) *out_level = chosen;
     if (out_context) *out_context = ctx.Detach();
@@ -147,6 +165,97 @@ bool create_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* lev
     char line[128];
     std::snprintf(line, sizeof line, "the game's D3D11 device runs on our D3D12 queue (feature level 0x%X)", static_cast<unsigned>(chosen));
     note(line);
+    return true;
+}
+
+// The game's request runs on a worker thread of ours, and the game waits at most
+// kCreateTimeoutMs. Pharaoh (2026-11-09, 250d6ca) hung forever inside this creation on its
+// own thread; whatever the step, the game now falls back to native DX11 instead of freezing
+// (fail-quiet), and the startup log names the step that stalled.
+constexpr DWORD kCreateTimeoutMs = 5000;
+struct CreateJob {
+    IDXGIAdapter* adapter = nullptr;
+    UINT flags = 0;
+    D3D_FEATURE_LEVEL levels[16]{};
+    UINT level_count = 0;
+    bool default_levels = false;
+    DWORD thread = 0;
+    ULONGLONG t0 = 0;
+    std::mutex m;
+    bool finished = false, abandoned = false, ok = false;
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    D3D_FEATURE_LEVEL level{};
+    HANDLE done = nullptr;
+    ~CreateJob()
+    {
+        if (adapter) adapter->Release();
+        if (done) CloseHandle(done);
+    }
+};
+
+DWORD WINAPI create_worker(LPVOID param)
+{
+    std::shared_ptr<CreateJob> job(*static_cast<std::shared_ptr<CreateJob>*>(param));
+    delete static_cast<std::shared_ptr<CreateJob>*>(param);
+    ++t_inside; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
+    ID3D11Device* d = nullptr;
+    ID3D11DeviceContext* c = nullptr;
+    D3D_FEATURE_LEVEL l{};
+    const bool ok = build_on12(job->adapter, job->flags, job->default_levels ? nullptr : job->levels, job->level_count, &d, &l, &c,
+                               job->thread, job->t0);
+    --t_inside;
+    std::lock_guard<std::mutex> lk(job->m);
+    job->finished = true;
+    if (job->abandoned) { // the game already went native: drop what we built
+        if (c) c->Release();
+        if (d) d->Release();
+        if (job->thread && g_log) g_log("dx11on12: a timed-out creation finished late; its device was released");
+    } else {
+        job->ok = ok;
+        job->device = d;
+        job->context = c;
+        job->level = l;
+    }
+    SetEvent(job->done);
+    return 0;
+}
+
+bool create_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* levels, UINT level_count,
+                 ID3D11Device** out_device, D3D_FEATURE_LEVEL* out_level, ID3D11DeviceContext** out_context)
+{
+    auto job = std::make_shared<CreateJob>();
+    job->adapter = adapter;
+    if (adapter) adapter->AddRef();
+    job->flags = flags;
+    job->default_levels = !levels || !level_count;
+    job->level_count = job->default_levels ? 0 : (level_count < 16 ? level_count : 16);
+    for (UINT i = 0; i < job->level_count; ++i) job->levels[i] = levels[i];
+    job->thread = GetCurrentThreadId();
+    job->t0 = GetTickCount64();
+    job->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!job->done) { note("could not start the 11on12 creation; native DX11", HRESULT_FROM_WIN32(GetLastError())); return false; }
+    step("request", job->thread, job->t0);
+    auto* param = new std::shared_ptr<CreateJob>(job);
+    HANDLE worker = CreateThread(nullptr, 0, &create_worker, param, 0, nullptr);
+    if (!worker) {
+        delete param;
+        note("could not start the 11on12 creation; native DX11", HRESULT_FROM_WIN32(GetLastError()));
+        return false;
+    }
+    CloseHandle(worker);
+    const DWORD wait = WaitForSingleObject(job->done, kCreateTimeoutMs);
+    std::lock_guard<std::mutex> lk(job->m);
+    if (!job->finished) {
+        job->abandoned = true;
+        (void)wait;
+        note("11on12 device creation did not finish in 5 s (see the last 'step' line); native DX11");
+        return false;
+    }
+    if (!job->ok) return false;
+    if (out_level) *out_level = job->level;
+    if (out_context) *out_context = job->context; else if (job->context) job->context->Release();
+    *out_device = job->device;
     return true;
 }
 
