@@ -18,6 +18,9 @@
 struct IUnknown;
 struct ID3D12CommandQueue;
 struct ID3D12Device;
+struct ID3D12Resource;
+struct ID3D12Fence;
+struct IDXGISwapChain;
 
 namespace na::on12 {
 
@@ -35,6 +38,23 @@ ID3D12CommandQueue* QueueFor(IUnknown* device);
 
 // The D3D12 device behind an 11on12 device we created (AddRef'ed), or null.
 ID3D12Device* DeviceFor(IUnknown* device);
+
+// The menu draws on the back buffer as a D3D12 resource, but an 11on12 swap
+// chain only hands out D3D11 textures. Borrow the D3D12 resource underneath
+// (ID3D11On12Device2::UnwrapUnderlyingResource) for one frame, and give it
+// back with the fence that ends our draw (or none when nothing was submitted).
+// Unwrap returns false for any swap chain that is not on our 11on12 device.
+struct Borrowed {
+    void* token = nullptr; // opaque: the D3D11 back buffer + its 11on12 device
+    Borrowed() = default;
+    Borrowed(const Borrowed&) = delete;
+    Borrowed& operator=(const Borrowed&) = delete;
+    ~Borrowed();
+    void Submitted(ID3D12Fence* fence, unsigned long long value);
+    ID3D12Fence* fence = nullptr;
+    unsigned long long value = 0;
+};
+bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, ID3D12Resource** out, Borrowed& borrowed);
 
 // One status line (no newline) for the 5-second status log.
 int FormatStatus(char* out, size_t capacity);

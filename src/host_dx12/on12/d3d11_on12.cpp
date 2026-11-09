@@ -277,13 +277,51 @@ ID3D12Device* DeviceFor(IUnknown* device)
     return nullptr;
 }
 
+namespace {
+struct Token { ComPtr<ID3D11On12Device2> device; ComPtr<ID3D11Resource> buffer; };
+std::atomic<uint64_t> g_unwraps{0}, g_unwrap_failures{0}, g_returns{0};
+}
+
+bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, ID3D12Resource** out, Borrowed& borrowed)
+{
+    if (!g_hooked.load() || !sc || !queue || !out) return false;
+    ComPtr<IUnknown> any;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&any)))) return false;
+    ComPtr<ID3D11On12Device2> device;
+    if (FAILED(any.As(&device))) return false; // not an 11on12 chain
+    ComPtr<ID3D11Resource> buffer;
+    HRESULT hr = sc->GetBuffer(index, IID_PPV_ARGS(&buffer));
+    if (SUCCEEDED(hr)) hr = device->UnwrapUnderlyingResource(buffer.Get(), queue, IID_PPV_ARGS(out));
+    if (FAILED(hr) || !*out) { g_unwrap_failures.fetch_add(1); g_last_hr.store(static_cast<long>(hr)); return false; }
+    auto* t = new Token{device, buffer};
+    borrowed.token = t;
+    g_unwraps.fetch_add(1);
+    return true;
+}
+
+void Borrowed::Submitted(ID3D12Fence* f, unsigned long long v) { fence = f; value = v; }
+
+Borrowed::~Borrowed()
+{
+    auto* t = static_cast<Token*>(token);
+    if (!t) return;
+    UINT64 v = value;
+    ID3D12Fence* fences[] = {fence};
+    // Back to 11on12 before Present; with our fence, 11on12 waits for the menu draw.
+    t->device->ReturnUnderlyingResource(t->buffer.Get(), fence ? 1u : 0u, fence ? &v : nullptr, fence ? fences : nullptr);
+    g_returns.fetch_add(1);
+    delete t;
+}
+
 int FormatStatus(char* out, size_t capacity)
 {
     std::lock_guard<std::mutex> lk(g_m);
     return std::snprintf(out, capacity,
-                         "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d last_hr=0x%08lX reason=\"%s\"",
+                         "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{unwraps=%llu failures=%llu returns=%llu} last_hr=0x%08lX reason=\"%s\"",
                          g_enabled.load() ? 1u : 0u, g_hooked.load() ? 1u : 0u, g_requests.load(), g_wrapped.load(),
                          g_with_swapchain.load(), g_native.load(), g_probes.load(), g_swapchain_check.load(),
+                         static_cast<unsigned long long>(g_unwraps.load()), static_cast<unsigned long long>(g_unwrap_failures.load()),
+                         static_cast<unsigned long long>(g_returns.load()),
                          static_cast<unsigned long>(g_last_hr.load()), g_reason);
 }
 

@@ -2356,10 +2356,14 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
 
 // The current real back buffer for THIS frame only: fetched, its RTV
 // (re)written, used, and released by the caller before the Present returns.
-bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPTOR_HANDLE target_rtv, ComPtr<ID3D12Resource>& out)
+bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPTOR_HANDLE target_rtv, ComPtr<ID3D12Resource>& out,
+                                ID3D12CommandQueue* queue = nullptr, na::on12::Borrowed* borrowed = nullptr)
 {
     if (idx >= g_state.backbuffer_count) return false;
-    if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) return false;
+    if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) {
+        // DX11 game on our 11on12 device: borrow the D3D12 buffer underneath for this draw.
+        if (!borrowed || !na::on12::UnwrapBackBuffer(sc, idx, queue, out.ReleaseAndGetAddressOf(), *borrowed)) return false;
+    }
     D3D12_RENDER_TARGET_VIEW_DESC rtv{};
     rtv.Format = g_state.format;
     rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
@@ -2865,6 +2869,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         g_menu_skips.busy.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    na::on12::Borrowed borrowed; // returned to 11on12 when this function ends (after our submit)
     ComPtr<ID3D12Resource> back_buffer; // A71: this frame only
     if (frame) {
         back_buffer = frame;
@@ -2872,7 +2877,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         rtv.Format = g_state.format;
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         g_state.device->CreateRenderTargetView(frame, &rtv, f.rtv);
-    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer)) {
+    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer, queue, &borrowed)) {
         g_menu_skips.buffer.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -2961,6 +2966,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     g_state.imgui_slot_fences[imgui_slot] = f.fence_value;
     f.signal_failed = FAILED(queue->Signal(f.completion.Get(), f.fence_value));
     g_menu_draw_marker.store(f.fence_value);
+    if (!f.signal_failed) borrowed.Submitted(f.completion.Get(), f.fence_value);
     g_frames.fetch_add(1, std::memory_order_relaxed);
     if (just_opened) menu_note("menu_open: GPU draw submitted\r\n");
 }

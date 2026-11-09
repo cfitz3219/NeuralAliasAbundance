@@ -7,6 +7,8 @@
 //   1. did the game's device become an 11on12 device on our D3D12 queue?
 //   2. can the swap chain's back buffer be read as an ID3D12Resource (the menu needs it)?
 //   3. does the device survive N presents (no removal)?
+// "dx11on12_probe <frames> menu" presses Home a third of the way in, so the menu draws
+// through the borrowed back buffer (dx11on12 menu_buffer{...} in the status log).
 // Exit 0 = device wrapped and alive, 1 = not wrapped or removed.
 #include <windows.h>
 #include <d3d11.h>
@@ -16,12 +18,14 @@
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 using Microsoft::WRL::ComPtr;
 
 int main(int argc, char** argv)
 {
     const int frames = argc > 1 ? std::atoi(argv[1]) : 300;
+    const bool press_home = argc > 2 && std::strcmp(argv[2], "menu") == 0; // opens the NeuralAlias menu a third of the way in
     ComPtr<IDXGIFactory1> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory)); // waits for the host install, like a game's adapter scan
     std::printf("factory hr=0x%08lX\n", static_cast<unsigned long>(hr));
@@ -74,6 +78,14 @@ int main(int argc, char** argv)
     for (int i = 0; i < frames; ++i) {
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        if (press_home && i == frames / 3) {
+            SetForegroundWindow(wnd);
+            INPUT in[2]{};
+            in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_HOME;
+            in[1] = in[0]; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(2, in, sizeof(INPUT));
+            std::printf("pressed Home at frame %d\n", i);
+        }
         const float c[4] = {0.1f + 0.4f * ((i % 60) / 60.f), 0.2f, 0.3f, 1.f};
         ID3D11RenderTargetView* r = rtv.Get();
         ctx->OMSetRenderTargets(1, &r, dsv.Get());
