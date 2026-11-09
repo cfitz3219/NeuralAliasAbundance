@@ -60,6 +60,8 @@ std::mutex mutex;
 std::atomic<const char*> reason{"Waiting for a native scene."};
 std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
 std::atomic<uint64_t> delivered_size{0}, delivered_at{0};
+std::atomic<uint32_t> applied_preset{0}, applied_sharpness{0};
+std::atomic<int> raster_slot{-1};
 std::atomic<bool> evaluation_capture_pending{false};
 
 bool Skip(const char* why)
@@ -370,13 +372,16 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         capture_token = capture::j2::RecordEvaluation(list, planes, id);
     }
     auto* result = slot.output.Native();
+    uint32_t sharpened = 0;
     const uint32_t sharpness = settings::Get().j2_sharpness.load();
     if (evaluated && sharpness) {
         Barrier(list, slot.output.Effects(), kWrite, kRead);
         Barrier(list, slot.color.Effects(), kRead, kWrite);
         if (j2::RecordNativeRcas(s.device.Get(), list, slot.output.Effects(), slot.color.Effects(), shared_depth,
-                                 ci.width, ci.height, sharpness, cf, index, frame.reversed_depth))
+                                 ci.width, ci.height, sharpness, cf, index, frame.reversed_depth)) {
             result = slot.color.Native();
+            sharpened = sharpness;
+        }
         Barrier(list, slot.output.Effects(), kRead, kCommon);
         Barrier(list, slot.color.Effects(), kWrite, kCommon);
     } else {
@@ -418,8 +423,11 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     s.last_frame = frame.frame;
     delivered.fetch_add(1, std::memory_order_relaxed);
     delivered_size.store((uint64_t(ci.width) << 32) | ci.height, std::memory_order_relaxed);
+    applied_preset.store(eval.preset, std::memory_order_relaxed);
+    applied_sharpness.store(sharpened, std::memory_order_relaxed);
+    raster_slot.store(frame.camera.vs_slot, std::memory_order_relaxed);
     delivered_at.store(GetTickCount64(), std::memory_order_relaxed);
-    if (j2::Jitter()) {
+    if (frame.camera.vs_slot >= 0 && j2::Jitter()) {
         const auto phase = static_cast<uint32_t>(frame.frame);
         const auto sample = settings::Get().j2_jitter_r2.load()
             ? neural_alias::temporal_jitter_r2(phase, 8) : neural_alias::temporal_jitter(phase, 8);
@@ -487,10 +495,11 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
 }
 int FormatStatus(char* out, size_t capacity)
 {
-    return std::snprintf(out, capacity, "native11_dlaa delivered=%llu busy=%llu rejected=%llu \"%s\"",
+    return std::snprintf(out, capacity, "native11_dlaa delivered=%llu busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d \"%s\"",
                          static_cast<unsigned long long>(delivered.load()),
                          static_cast<unsigned long long>(busy.load()),
-                         static_cast<unsigned long long>(rejected.load()), reason.load());
+                         static_cast<unsigned long long>(rejected.load()), applied_preset.load(), applied_sharpness.load(),
+                         raster_slot.load(), reason.load());
 }
 bool FormatMenuStatus(char* out, size_t capacity)
 {
@@ -498,8 +507,9 @@ bool FormatMenuStatus(char* out, size_t capacity)
     const auto size = delivered_size.load(std::memory_order_relaxed);
     const bool running = j2::Enabled() && !j2::Paused() && last && GetTickCount64() - last < 1000;
     if (running)
-        std::snprintf(out, capacity, "Native DX11 DLAA running at %u × %u. %llu frames improved.",
-                      unsigned(size >> 32), unsigned(size), static_cast<unsigned long long>(delivered.load()));
+        std::snprintf(out, capacity, "Native DX11 DLAA running at %u × %u. %llu frames improved.%s",
+                      unsigned(size >> 32), unsigned(size), static_cast<unsigned long long>(delivered.load()),
+                      raster_slot.load() < 0 ? " Camera motion is available. Jitter is waiting for the vertex camera." : "");
     else
         std::snprintf(out, capacity, "%s", j2::Paused() ? "Native DX11 DLAA is off." : reason.load());
     return running;

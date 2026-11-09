@@ -29,8 +29,8 @@ static Event Draw(Id rt, Id depth, uint64_t verts, Id cam = kCamCb, Id obj = kOb
     e.depth = depth;
     e.depth_test = depth != 0;
     e.vertices = verts;
-    e.vs_cb[0] = cam;
-    e.vs_cb[1] = obj;
+    e.cb[0] = cam;
+    e.cb[1] = obj;
     return e;
 }
 static Event Read(Id r) { Event e; e.kind = Kind::Read; e.resource = r; return e; }
@@ -248,6 +248,36 @@ int main()
         expect(!FindCamera(noise, 1).found, "random bytes give no camera");
     }
 
+    // ---- pixel-stage camera block, re-uploaded per draw (WWII shape): still a candidate ----
+    {
+        enum : Id { kPassCb = 20 };
+        FrameModel m;
+        Setup(m);
+        auto frame = [&] {
+            std::vector<Event> f;
+            for (int i = 0; i < 40; ++i) {
+                f.push_back(Upd(kObjCb));
+                f.push_back(Upd(kPassCb)); // rewritten per shader variant, pose repeated in it
+                Event d = Draw(kColor, kDepth, 900, 0, kObjCb);
+                d.cb[kPsCbBase + 0] = kPassCb;
+                d.cb[kPsCbBase + 1] = kObjCb; // the same buffer on both stages: searched once
+                f.push_back(d);
+            }
+            f.push_back(Read(kColor));
+            f.push_back(Draw(kBackBuffer, 0, 3, 0, 0));
+            return f;
+        };
+        for (int i = 0; i < 3; ++i) RunImmediate(m, frame());
+        const auto cands = m.CameraCandidates(8);
+        bool pass = false;
+        int obj = 0;
+        for (const auto& c : cands) {
+            if (c.first == kPassCb && c.second == kPsCbBase) pass = true;
+            if (c.first == kObjCb) ++obj;
+        }
+        expect(pass, "a pixel-shader block rewritten every draw is still searched for the camera (PS slot kept)");
+        expect(obj == 1, "a buffer bound on both stages is listed once");
+    }
     // ---- tags (Vulkan): the point is learned as the tag of the first read after the scene ----
     {
         FrameModel m;

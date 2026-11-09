@@ -26,6 +26,7 @@
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/overlay/overlay.hpp"
+#include "host_dx12/settings.hpp"
 #include <DirectXPackedVector.h>
 #include <d3d11on12.h>
 #include <filesystem>
@@ -112,6 +113,7 @@ struct Game {
     HWND wnd = nullptr;
     UINT w = 320, h = 180;
     bool campaign_camera = false;
+    bool campaign_pixel_range = false;
     ComPtr<ID3D11Texture2D> shadow_depth, shadow_rt, depth, color;
     ComPtr<ID3D11DepthStencilView> shadow_dsv, dsv;
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
@@ -234,7 +236,9 @@ void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp,
         std::memcpy(bytes.data() + 944, origin, sizeof origin);
         std::memcpy(bytes.data() + 704, extent, sizeof extent);
     }
-    std::memcpy(m.pData, bytes.data(), bytes.size());
+    auto* destination = static_cast<uint8_t*>(m.pData);
+    if (g.campaign_pixel_range) destination += 24576;
+    std::memcpy(destination, bytes.data(), bytes.size());
     c->Unmap(g.cam_cb.Get(), 0);
     if (remember) g.last_written = vp;
 }
@@ -263,7 +267,18 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     ID3D11Buffer* cbs[2] = {g.cam_cb.Get(), g.obj_cb.Get()};
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     c->VSSetShader(g.vs.Get(), nullptr, 0);
-    c->VSSetConstantBuffers(0, 2, cbs);
+    if (g.campaign_pixel_range) {
+        ID3D11Buffer* empty = nullptr;
+        c->VSSetConstantBuffers(0, 1, &empty);
+        c->VSSetConstantBuffers(1, 1, &cbs[1]);
+        ComPtr<ID3D11DeviceContext1> c1;
+        if (SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c1)))) {
+            const UINT first = 24576 / 16, count = 1280 / 16;
+            c1->PSSetConstantBuffers1(0, 1, &cbs[0], &first, &count);
+        }
+    } else {
+        c->VSSetConstantBuffers(0, 2, cbs);
+    }
     // Shadow pass.
     UploadCamera(c, g, ShadowVp(), false);
     ID3D11RenderTargetView* srt = g.shadow_rtv.Get();
@@ -351,8 +366,10 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     if (!inputs) ++s.wrong_inputs;
     if (g_tonemap_bound && f.boundary == na::native11::Boundary::BeforeRead) ++s.after_tonemap;
     if (f.scene_draws != 40) ++s.no_scene;
-    if (!f.camera.bytes || f.camera.size != (g.campaign_camera ? 1280u : 512u) || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) ||
-        f.camera.vs_slot != 0) {
+    const UINT camera_size = g.campaign_pixel_range ? 32768u : g.campaign_camera ? 1280u : 512u;
+    const int vs_slot = g.campaign_pixel_range ? -1 : 0;
+    if (!f.camera.bytes || f.camera.size != camera_size || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) ||
+        f.camera.vs_slot != vs_slot) {
         if (!s.no_camera)
             std::printf("camera handed over: bytes=%p size=%u buffer=%llx (game %llx) slot=%d first=%u num=%u version=%llu\n",
                         static_cast<const void*>(f.camera.bytes), f.camera.size, static_cast<unsigned long long>(f.camera.buffer),
@@ -695,6 +712,33 @@ int main()
     expect(ec.written == 3 && ec.without_present == 0 && ec.errors == 0 &&
            std::filesystem::exists(captures / L"eval" / L"00000-present.raw"), "native DLAA capture saves evaluations with their actual presented image");
     expect(pc.frames_written == 3 && pc.errors == 0, "native presented-frame capture writes the backbuffers");
+    // A second scene uses a PS-only packet in a D3D11.1 ranged bind above
+    // 16 KiB, as seen in the translated campaign's recorded bindings.
+    camera_desc.ByteWidth = 32768;
+    expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
+           "create camera upload ring");
+    g.campaign_pixel_range = true;
+    na::j2::SetJitter(true);
+    const auto before_pixel = evaluations;
+    const auto raster_before_pixel = g_seen.jitter_reported;
+    for (int i = 0; i < 22; ++i) present_campaign();
+    expect(evaluations >= before_pixel + 16 &&
+           g_seen.last.camera.buffer == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) &&
+           g_seen.last.camera.vs_slot == -1 && g_seen.last.camera.ps_slot == 0 &&
+           g_seen.last.camera.first_constant == 24576 / 16 && g_seen.last.camera.num_constants == 1280 / 16,
+           "native DLAA accepts the current WWII pose from the actual PS binding range");
+    expect(g_seen.jitter_reported == raster_before_pixel, "PS-only camera is never treated as raster jitter");
+    na::settings::Get().j2_sharpness.store(60);
+    na::settings::Get().j2_preset.store(11);
+    present_campaign();
+    na::native_d3d11::FormatStatus(status, sizeof status);
+    expect(std::strstr(status, "preset=11 sharpness=60 raster_slot=-1") != nullptr,
+           "native DLAA submits the selected preset and applies the selected RCAS sharpness");
+    na::settings::Get().j2_sharpness.store(0);
+    present_campaign();
+    na::native_d3d11::FormatStatus(status, sizeof status);
+    expect(std::strstr(status, "preset=11 sharpness=0 raster_slot=-1") != nullptr,
+           "sharpness at zero bypasses RCAS on the native route");
     na::capture::j2::Shutdown();
     na::capture::Shutdown();
     DeleteFileW(ini.c_str());
