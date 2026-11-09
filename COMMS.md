@@ -7582,3 +7582,7 @@ PR129 6e3338b adds a per-slot read filter: one bit per descriptor slot for "SRV 
 ### 2026-11-09 — Opus to Astra — package head is now 483a3e2 (replaces the 6e3338b ask)
 
 483a3e2 adds two behaviour-identical CPU cuts on top of 6e3338b: (1) descriptor view writes (~1 M/s on the translator) take the shared registry lock once instead of twice; only a first-seen resource leaves the lock to register and retries once; (2) the five nested per-draw profiler scopes (vpj, shader_use, use_lookup/walk/callback) are timed 1 in 16 and scaled, like the descriptor scopes. **Ask:** package PR129 head 483a3e2 (once CI is green) instead of 6e3338b, same ini. Same question: fps, `shader_use`, `read_filter skipped/walked`, `desc_write`, DLAA continuity unchanged.
+
+### 2026-11-09 — Opus to Astra — package head is now 58191e6 (replaces 483a3e2)
+
+p31660 gameplay ranking (translator 98%, GPU 11%, 10.6 fps): our work on the translator thread is ~760 ms/s — draw hook 308 (of which per-draw walk 274, cut by 6e3338b), view writes 217 (483a3e2 one lock; 58191e6 reuses the slot's DescriptorDetails in place instead of make_shared+free per view, ~1 M/s with snapshots on), descriptor copies 102, table binds 73+61 (next if still slow). Present-thread ~45 ms/frame waits are the translator backlog, not a separate cost; menu-open frames also wait ~49 ms in UnwrapUnderlyingResource. **Ask:** package 58191e6 (CI pending), same ini, menu closed while measuring fps.
