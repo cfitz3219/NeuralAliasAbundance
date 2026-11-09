@@ -1,0 +1,87 @@
+// Native DX11 input provider (WWII 40-50 fps plan, track B1; interface only, 2026-11-09).
+//
+// Purpose: a DX11 game renders through its own D3D11 driver (no D3D11On12). This provider watches
+// the game's D3D11 contexts and publishes, per frame, the facts our existing DX12 backend needs:
+// which texture is the scene colour and depth, where the scene ends (the insertion point, before the
+// HUD), and the camera bytes and jitter that belong to that same scene. Astra's B2 handoff copies
+// the named inputs into shared D3D12 resources, evaluates with the existing dlss::EvalDesc / motion /
+// effects path, and writes the result back. One program: this module is selected by the same
+// activation owner as the D3D11On12 route, never installed beside it.
+//
+// Ownership: Opus fills this (D3D11 hooks, frame model reused from the PR #90 frame_model.hpp /
+// camera_pick.hpp, which already cover the ReShade depth rule, colour-drawn-with-depth, camera
+// buffer ranking, the "first read after the last scene draw" point, deferred contexts and indirect
+// draws). Astra consumes it (B2) and owns the camera math contract (B3 review).
+//
+// Threading: the provider calls the consumer on the game's immediate-context thread, inside the
+// game's call, with the immediate context passed in. The consumer records its D3D11 copies/signal
+// on that context there (GPU order = the game's order) and must not block on the GPU.
+//
+// Portable header: D3D11 objects are passed as opaque pointers so CPU tests build on Linux.
+#pragma once
+
+#include <cstdint>
+
+namespace na::native11 {
+
+using Id = uint64_t; // identity of a game resource (its ID3D11Resource pointer); 0 = none
+
+struct TextureFacts {
+    Id resource = 0;
+    void* d3d11_resource = nullptr; // ID3D11Resource*, borrowed for the duration of the callback
+    uint32_t width = 0, height = 0;  // the texture's size
+    uint32_t active_w = 0, active_h = 0; // the scene's viewport extent inside it (dynamic resolution)
+    uint32_t format = 0;             // DXGI_FORMAT as created (may be typeless)
+    uint32_t view_format = 0;        // DXGI_FORMAT of the view the scene used (RTV/DSV), typed
+    uint32_t samples = 1;
+    uint32_t mip = 0, array_slice = 0; // the subresource the scene rendered to
+};
+
+struct CameraFacts {
+    Id buffer = 0;                 // the constant buffer the scene draws read the camera from
+    int vs_slot = -1;              // VS slot it was bound at
+    uint32_t first_constant = 0;   // offset binding (VSSetConstantBuffers1), in 16-byte constants
+    uint64_t version = 0;          // content version of the bytes below (bumps on every update)
+    const uint8_t* bytes = nullptr; // CPU copy of the bytes the game uploaded (Map/Unmap or UpdateSubresource
+    uint32_t size = 0;              // source data), never a GPU readback; valid for the callback only
+    bool jitter_applied = false;   // the provider wrote this frame's jitter into the scene camera
+    float jitter_px[2] = {0, 0};   // the jitter written, in pixels of the scene extent (DLSS convention)
+};
+
+enum class Boundary : uint8_t {
+    BeforeRead,  // before the first read of the scene colour after its last scene draw (preferred)
+    BeforeList,  // before ExecuteCommandList whose first colour read is that read (deferred contexts)
+    BeforeHud,   // scene-in-back-buffer games: before the first non-scene draw into the colour
+};
+
+struct SceneFrame {
+    uint64_t frame = 0;            // provider frame counter (advances at Present)
+    TextureFacts color, depth;
+    bool reversed_depth = false;   // from the depth func/clear value of the scene draws
+    CameraFacts camera;
+    Boundary boundary = Boundary::BeforeRead;
+    uint32_t scene_draws = 0;      // scene draws this frame before the boundary
+    bool selection_changed = false; // colour/depth/camera choice differs from the previous frame (reset history)
+};
+
+// The consumer (B2). Return false if this frame was not evaluated (the provider counts the reason).
+// `context` is the game's ID3D11DeviceContext* (immediate). The consumer may record D3D11 work on it.
+using SceneCallback = bool (*)(void* user, void* context, const SceneFrame& frame);
+
+struct ProviderStats {
+    uint64_t frames = 0, fired = 0, missed = 0, unplaceable = 0, contradictions = 0, selection_changes = 0;
+    uint64_t camera_found = 0, camera_missing = 0, jitter_written = 0;
+    const char* last_miss = "";
+};
+
+// Installs the D3D11 hooks on `device` (ID3D11Device*) and its immediate context. Idempotent.
+bool Install(void* device, SceneCallback cb, void* user);
+void Uninstall();
+// Jitter for the NEXT frame's scene camera, in pixels (the backend's sequence). The provider writes
+// it into the camera bytes the game uploads (the same write the DX12 route makes) and reports it back
+// in CameraFacts so colour, depth, camera and jitter always belong to one scene.
+void SetNextJitter(float x_px, float y_px);
+ProviderStats Stats();
+int FormatStatus(char* out, unsigned long n); // one status line: "native11 frames= fired= ..."
+
+} // namespace na::native11
