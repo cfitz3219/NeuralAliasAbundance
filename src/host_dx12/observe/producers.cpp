@@ -247,6 +247,10 @@ struct DescHeap {
     // time. Writers under the exclusive g_m need none (no copy can be running then).
     std::unique_ptr<std::shared_mutex[]> stripes;
     uint32_t nstripes = 0;
+    // Read filter (one bit per slot, one word per stripe): the slot holds an SRV of a resource in
+    // g_hot_ids (the live scene colour or any resource ever seen as a copy of it). Written with
+    // info, under the same locks; read under the shared g_m.
+    std::unique_ptr<std::atomic<uint64_t>[]> hot;
 };
 constexpr uint32_t kStripeShift = 6;
 // Shared lock of the stripe holding a slot. Holds at most one stripe: lock() moves to
@@ -333,6 +337,65 @@ void ReleaseParkedTwins()
     dead.clear(); // plain Release calls from the game's own call stack
 }
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
+// ---- Read filter (WWII p31660, 2026-11-09: DLAA on, 10 fps, the bridge's single thread at 98%:
+// before_shader_use walked every descriptor of every bound table on ~9,000 draws per frame,
+// 2.6 us per draw, touching one 48-byte SlotInfo per descriptor of a ring heap that is new each
+// draw, so its cache never hits). The walk only produces something when a table holds an SRV
+// of the scene colour or of a copy of it. g_hot_ids is a superset of both (the selected colour
+// plus every copy ever seen); each heap keeps one bit per slot for "SRV of a hot id". When no
+// bound SRV range has a hot bit, the walk's result is known (no colour read, no derived read)
+// and it is skipped; otherwise the original walk runs unchanged. The set changes only under the
+// exclusive g_m (RefreshReadFilter, called at Present with no lock held), which recomputes every
+// bit; until then g_hot_ready is false and every draw takes the original walk.
+constexpr uint32_t kHotMax = 64;
+na_object_id g_hot_ids[kHotMax] = {}; // read under the shared g_m, written under the exclusive g_m
+uint32_t g_hot_n = 0;
+na_object_id g_hot_color = 0;         // the selected colour the bits were built for
+std::atomic<bool> g_hot_ready{false};
+std::mutex g_hot_pending_m;           // the known set mirrored here, plus additions not yet applied
+na_object_id g_hot_known[kHotMax] = {};
+uint32_t g_hot_known_n = 0;
+na_object_id g_hot_pending[kHotMax] = {};
+uint32_t g_hot_pending_n = 0;
+bool g_hot_overflow = false;          // more than kHotMax ids: the filter stays off (original walk)
+std::atomic<uint64_t> g_hot_rebuilds{0}, g_hot_skipped{0}, g_hot_walked{0};
+inline bool hot_id_locked(na_object_id id)
+{
+    if (!id || id == NA_UNKNOWN_U64) return false;
+    for (uint32_t i = 0; i < g_hot_n; ++i) if (g_hot_ids[i] == id) return true;
+    return false;
+}
+inline void set_hot_bit(DescHeap* h, uint64_t slot, bool on)
+{
+    if (!h->hot || (slot >> kStripeShift) >= h->nstripes) return;
+    const uint64_t bit = 1ull << (slot & 63);
+    auto& w = h->hot[static_cast<size_t>(slot >> kStripeShift)];
+    if (on) w.fetch_or(bit, std::memory_order_relaxed);
+    else if (w.load(std::memory_order_relaxed) & bit) w.fetch_and(~bit, std::memory_order_relaxed);
+}
+// Any hot slot in [first, first + n) (clipped to the heap); the shared g_m is held.
+inline bool any_hot(const DescHeap* h, uint64_t first, uint64_t n)
+{
+    if (!h->hot) return true; // no bitmap: let the walk decide
+    if (first >= h->count) return false;
+    const uint64_t end = std::min<uint64_t>(first + n, h->count);
+    for (uint64_t a = first; a < end;) {
+        const uint64_t w = a >> kStripeShift, lo = a & 63, hi = std::min<uint64_t>(64, lo + (end - a));
+        const uint64_t mask = (hi == 64 ? ~0ull : ((1ull << hi) - 1)) & ~((1ull << lo) - 1);
+        if (h->hot[static_cast<size_t>(w)].load(std::memory_order_relaxed) & mask) return true;
+        a += hi - lo;
+    }
+    return false;
+}
+void mark_hot_candidate(na_object_id id) // a copy of the scene colour (any thread, any lock)
+{
+    if (!id || id == NA_UNKNOWN_U64) return;
+    std::lock_guard<std::mutex> lk(g_hot_pending_m);
+    for (uint32_t i = 0; i < g_hot_known_n; ++i) if (g_hot_known[i] == id) return;
+    for (uint32_t i = 0; i < g_hot_pending_n; ++i) if (g_hot_pending[i] == id) return;
+    g_hot_ready.store(false, std::memory_order_release);
+    if (g_hot_pending_n < kHotMax) g_hot_pending[g_hot_pending_n++] = id; else g_hot_overflow = true;
+}
 // CPU-handle index of g_heaps, sorted by cpu_start (rebuilt under the exclusive g_m whenever
 // g_heaps changes): every descriptor write/copy and many binds looked their heap up by
 // walking all heaps under the lock.
@@ -1111,6 +1174,7 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
         }
         h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0};
+        set_hot_bit(h, slot, kind == NA_DESC_SRV && hot_id_locked(e.resource));
         if (view) {
             view->kind=kind;view->resource=e.resource;
             h->info[slot].details=std::move(view);
@@ -1172,6 +1236,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
                     for (uint32_t i = 0; i < run; ++i) {
                         ++dh->versions[ds + i];
                         dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
+                        set_hot_bit(dh, ds + i, dh->info[ds + i].kind == NA_DESC_SRV && hot_id_locked(dh->info[ds + i].resource));
                     }
                     for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
                     striped = true;
@@ -1204,6 +1269,7 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             for (uint32_t i = 0; i < run; ++i) {
                 ++dh->versions[ds + i];
                 dh->info[ds + i] = sh->info[ss + i];
+                set_hot_bit(dh, ds + i, dh->info[ds + i].kind == NA_DESC_SRV && hot_id_locked(dh->info[ds + i].resource));
             }
             e.src_heap = sh->id;
             e.dst_heap = dh->id;
@@ -1387,6 +1453,8 @@ void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, co
     dh->info.assign(desc->NumDescriptors, DescHeap::SlotInfo{});
     dh->nstripes = (desc->NumDescriptors + (1u << kStripeShift) - 1) >> kStripeShift;
     dh->stripes.reset(new std::shared_mutex[dh->nstripes ? dh->nstripes : 1]);
+    dh->hot.reset(new std::atomic<uint64_t>[dh->nstripes ? dh->nstripes : 1]);
+    for (uint32_t i = 0; i < (dh->nstripes ? dh->nstripes : 1); ++i) dh->hot[i].store(0, std::memory_order_relaxed);
     const na_object_id dev_id = device_id(dev);
     na_ev_descriptor_heap_created e;
     init_header(e, NA_EV_DESCRIPTOR_HEAP_CREATED, flags);
@@ -1464,6 +1532,7 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
         dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
                                             known ? off : 0, desc ? desc->SizeInBytes : 0};
         if(view){view->kind=NA_DESC_CBV;view->resource=dh->info[slot].resource;dh->info[slot].details=std::move(view);}
+        set_hot_bit(dh, slot, false);
     }
     e.descriptor_kind = NA_DESC_CBV;
     e.resource = desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0;
@@ -4115,6 +4184,7 @@ bool is_derived(na_object_id id) { return is_derived_any(&id, 1); }
 void add_derived(na_object_id id)
 {
     if (!id) return;
+    mark_hot_candidate(id);
     std::lock_guard<std::mutex> lk(g_derived_m);
     const uint32_t m = g_derived_n.load(std::memory_order_relaxed);
     for (uint32_t i = 0; i < m; ++i) if (g_derived[i] == id) return;
@@ -4222,6 +4292,31 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
     ls->insertion.Add({destination, 0, 0, true, na::j2::Op::CopyWrite});
 }
 
+// The same tables, ranges and bound-heap test as the walk below, reading only the hot bits.
+// False = the walk would find no SRV of the colour and no SRV of a copy of it.
+template <typename Sig>
+bool read_filter_needs_walk_locked(ListState& ls, const Sig& sig, bool compute, na_object_id color)
+{
+    if (!g_hot_ready.load(std::memory_order_acquire) || g_hot_color != color) return true;
+    const auto& params = sig.root_params;
+    const auto& ranges = sig.root_ranges;
+    for (size_t p = 0; p < ls.args[compute].size() && p < params.size(); ++p) {
+        const auto& arg = ls.args[compute][p];
+        if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
+        uint32_t slot = 0;
+        auto* heap = bound_heap_for_gpu_locked(ls, arg.value, &slot);
+        if (!heap) continue;
+        bool bound = false;
+        for (uint32_t h = 0; h < ls.nheaps; ++h) bound |= heap->key == ls.heaps[h];
+        if (!bound) continue;
+        for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
+            const auto& range = ranges[params[p].first_range + r];
+            if (range.table_offset == NA_UNKNOWN_U32 || range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) continue;
+            if (any_hot(heap, uint64_t(slot) + range.table_offset, std::min<uint32_t>(range.num_descriptors, 64))) return true;
+        }
+    }
+    return false;
+}
 void before_shader_use(GL* l, bool compute, bool indirect=false)
 {
     if (t_host_work || !na::observe_internal::Started()) return;
@@ -4266,7 +4361,10 @@ void before_shader_use(GL* l, bool compute, bool indirect=false)
         if(cached.valid&&cached.state_revision==ls->read_revision[compute]&&cached.registry_revision==revision_now&&cached.color==color){
             color_srvs=cached.color_srvs;reads_color=color_srvs!=0;nsrv=cached.count;
             std::copy_n(cached.srvs,nsrv,srv_ids);if(compute)destination=cached.uav;
+        }else if(!read_filter_needs_walk_locked(*ls, signature->second, compute, color)){
+            g_hot_skipped.fetch_add(1, std::memory_order_relaxed); // no bound SRV of the colour or a copy: nothing to record
         }else{
+        g_hot_walked.fetch_add(1, std::memory_order_relaxed);
         const auto& params = signature->second.root_params;
         const auto& ranges = signature->second.root_ranges;
         for (size_t p = 0; p < ls->args[compute].size() && p < params.size(); ++p) {
@@ -7019,6 +7117,58 @@ bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->insertion.ColorEvents(color, out);
 }
+void RefreshReadFilter()
+{
+    if (g_hot_ready.load(std::memory_order_acquire) || t_host_work) return;
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    std::unique_lock<RegistryLock> lock(g_m); // no hook reads or writes slots meanwhile
+    std::lock_guard<std::mutex> lk(g_hot_pending_m);
+    if (g_hot_overflow) return;
+    na_object_id ids[kHotMax];
+    uint32_t n = 0;
+    const auto add = [&](na_object_id id) {
+        if (!id || id == NA_UNKNOWN_U64) return true;
+        for (uint32_t i = 0; i < n; ++i) if (ids[i] == id) return true;
+        if (n == kHotMax) return false;
+        ids[n++] = id;
+        return true;
+    };
+    bool fits = add(color);
+    for (uint32_t i = 0; fits && i < g_hot_known_n; ++i) fits = add(g_hot_known[i]);
+    for (uint32_t i = 0; fits && i < g_hot_pending_n; ++i) fits = add(g_hot_pending[i]);
+    if (!fits) { g_hot_overflow = true; return; }
+    std::copy_n(ids, n, g_hot_ids);
+    g_hot_n = n;
+    g_hot_color = color;
+    std::copy_n(ids, n, g_hot_known);
+    g_hot_known_n = n;
+    g_hot_pending_n = 0;
+    for (auto& h : g_heaps) {
+        if (!h->hot) continue;
+        for (uint32_t w = 0; w < h->nstripes; ++w) {
+            uint64_t bits = 0;
+            const uint64_t base = uint64_t(w) << kStripeShift;
+            for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
+                const auto& si = h->info[static_cast<size_t>(base + b)];
+                if (si.kind == NA_DESC_SRV && hot_id_locked(si.resource)) bits |= 1ull << b;
+            }
+            h->hot[w].store(bits, std::memory_order_relaxed);
+        }
+    }
+    ++g_operation_revision; // per-list read caches were built without the filter; let them refill through it
+    g_hot_rebuilds.fetch_add(1, std::memory_order_relaxed);
+    g_hot_ready.store(color != 0, std::memory_order_release);
+}
+int FormatReadFilter(char* out, size_t n)
+{
+    bool overflow;
+    uint32_t ids;
+    { std::lock_guard<std::mutex> lk(g_hot_pending_m); overflow = g_hot_overflow; ids = g_hot_known_n; }
+    return std::snprintf(out, n, "read_filter ready=%u ids=%u overflow=%u rebuilds=%llu skipped=%llu walked=%llu",
+        g_hot_ready.load() ? 1u : 0u, ids, overflow ? 1u : 0u, (unsigned long long)g_hot_rebuilds.load(),
+        (unsigned long long)g_hot_skipped.load(), (unsigned long long)g_hot_walked.load());
+}
 void ResetDerived()
 {
     std::lock_guard<std::mutex> lk(g_derived_m);
@@ -8266,6 +8416,7 @@ void SetLiveSelection(uint64_t depth, uint64_t color)
     std::lock_guard<std::mutex> lock(g_live_m);
     const uint64_t d0 = g_live_depth.load(std::memory_order_relaxed), c0 = g_live_color.load(std::memory_order_relaxed);
     if (depth == d0 && color == c0) return;
+    if (color != c0) g_hot_ready.store(false, std::memory_order_release); // bits were built for the old colour
     ++g_live_version;
     g_live_seq.fetch_add(1, std::memory_order_acq_rel); // odd: update in progress
     g_live_depth.store(depth, std::memory_order_relaxed);

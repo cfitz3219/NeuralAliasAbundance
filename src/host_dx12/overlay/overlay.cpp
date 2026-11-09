@@ -1111,6 +1111,9 @@ void write_status_line()
             na::observe::FormatHookCost(hl, sizeof hl - 2);
             const size_t hn = std::strlen(hl);
             if (hn) { hl[hn] = '\r'; hl[hn + 1] = '\n'; WriteFile(f, hl, DWORD(hn + 2), &written, nullptr); }
+            char rf[200];
+            const int rn = na::observe::FormatReadFilter(rf, sizeof rf - 2);
+            if (rn > 0 && size_t(rn) < sizeof rf - 2) { rf[rn] = '\r'; rf[rn + 1] = '\n'; WriteFile(f, rf, DWORD(rn + 2), &written, nullptr); }
         }
         { // Viewport jitter ([j2] viewport_jitter): real samples through the game's viewports
             const auto vps = na::observe::GetViewportJitterStats();
@@ -3613,6 +3616,7 @@ void note_menu_present_result(bool open, UINT flags, HRESULT result) {
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
+    na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
     na::on12::BeforePresent(sc, flags); // DX11 bridge: the game's picture reaches the D3D12 chain as an observed copy
@@ -3648,6 +3652,7 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
+    na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
     na::on12::BeforePresent(sc, flags); // DX11 bridge: the game's picture reaches the D3D12 chain as an observed copy

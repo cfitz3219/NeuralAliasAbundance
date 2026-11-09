@@ -349,6 +349,19 @@ int main()
     for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==200);
     dev->CreateShaderResourceView(tex.Get(),&read_sv,read_cpu);
     for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==200);
+    // Read filter (WWII p31660): the same answers with the per-slot hot bits in use.
+    na::observe::RefreshReadFilter(); // selection: other_tex; the bound slot holds tex
+    for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==200);
+    { char rf[200]; na::observe::FormatReadFilter(rf,sizeof rf); CHECK(std::strstr(rf,"ready=1")!=nullptr && std::strstr(rf,"skipped=0")==nullptr); }
+    read_cpu=read_heap->GetCPUDescriptorHandleForHeapStart();read_cpu.ptr+=read_inc;
+    dev->CreateShaderResourceView(other_tex.Get(),&read_sv,read_cpu); // a write of the selected colour sets its bit
+    for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==300);
+    na::observe::SetLiveSelection(depth_id,na::observe::IdOf(tex.Get())); // stale bits: the original walk until refreshed
+    for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==300);
+    na::observe::RefreshReadFilter();
+    for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==300);
+    cl->SetGraphicsRootDescriptorTable(1,read_heap->GetGPUDescriptorHandleForHeapStart()); // slot 0 holds tex
+    for(unsigned i=0;i<100;++i)cl->DrawInstanced(3,1,0,0);CHECK(selected_reads.load()==400);
     // Thousands of identical depth-write facts must leave room for a REAL new
     // depth target, whose state the acquisition path then needs.
     for(unsigned i=0;i<5000;++i)cl->DrawInstanced(3,1,0,0);

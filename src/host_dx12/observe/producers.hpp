@@ -154,6 +154,10 @@ na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id colo
 // unobserved or truncated). ResetDerived clears the per-frame lineage set (J2, at Present).
 bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na::j2::ColorEvent>& out);
 void ResetDerived();
+// Read filter for the per-draw scene-read walk: applies a changed colour selection or newly seen
+// copies of it. Call with no observer lock held (the game's Present). Cheap when nothing changed.
+void RefreshReadFilter();
+int FormatReadFilter(char* out, size_t n);
 // Re-applies the game's descriptor heaps, root signatures, every root argument and the
 // pipeline state of this recording. False (nothing issued) if the state is not fully
 // known (unobserved recording, a bundle was executed).
