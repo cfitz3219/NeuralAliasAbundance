@@ -1147,8 +1147,32 @@ DescHeap* heap_for_cpu_locked(uint64_t ptr, uint32_t* slot)
     return nullptr;
 }
 
+// Publish a view's creation arguments into a slot (caller holds the slot's stripe exclusively).
+// WWII p31660: ~1 M view writes per second on the bridge's single translator thread, each one a
+// make_shared of a ~250-byte DescriptorDetails plus the free of the slot's previous one. The slot's
+// previous details object is reused in place when the slot is its only owner: every other owner
+// (a descriptor copy's destination slot, a reader's snapshot) can only obtain it by copying from a
+// holder, and the only holder is this slot, whose stripe we hold exclusively. Otherwise (shared)
+// a new object is made, as before. Readers never see a published object change: a shared one is
+// never touched.
+void publish_details(DescHeap::SlotInfo& info, std::shared_ptr<const DescriptorDetails> old, const DescriptorDetails* view,
+                     uint32_t kind, na_object_id resource)
+{
+    if (!view) return;
+    if (old && old.use_count() == 1) {
+        auto* d = const_cast<DescriptorDetails*>(old.get()); // made non-const by make_shared below
+        *d = *view;
+        d->kind = kind; d->resource = resource;
+        info.details = std::move(old);
+        return;
+    }
+    auto d = std::make_shared<DescriptorDetails>(*view);
+    d->kind = kind; d->resource = resource;
+    info.details = std::move(d);
+}
+
 void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnknown* resource, uint32_t format,
-                           uint32_t first_sub, uint32_t sub_count, std::shared_ptr<DescriptorDetails> view = {})
+                           uint32_t first_sub, uint32_t sub_count, const DescriptorDetails* view = nullptr)
 {
     na_ev_descriptor_write e;
     const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
@@ -1197,12 +1221,10 @@ void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnkn
             e.resource = NA_UNKNOWN_U64; // resource-backed, but created before observation
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
         }
+        std::shared_ptr<const DescriptorDetails> prev = std::move(h->info[slot].details);
         h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0};
         set_hot_bit(h, slot, kind == NA_DESC_SRV && hot_id_locked(e.resource));
-        if (view) {
-            view->kind=kind;view->resource=e.resource;
-            h->info[slot].details=std::move(view);
-        }
+        publish_details(h->info[slot], std::move(prev), view, kind, e.resource);
         break;
     }
     e.descriptor_kind = kind;
@@ -1527,8 +1549,9 @@ void ensure_heap_registered(ID3D12DescriptorHeap* h)
 void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     o_CreateConstantBufferView(dev, desc, h);
-    std::shared_ptr<DescriptorDetails> view;
-    if(g_operation_snapshots.load()&&!t_host_work&&desc){view=std::make_shared<DescriptorDetails>();view->explicit_view=true;view->cbv=*desc;}
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
+    if(g_operation_snapshots.load()&&!t_host_work&&desc){view_args.explicit_view=true;view_args.cbv=*desc;view=&view_args;}
     na_object_id res = 0;
     uint64_t off = 0;
     bool known = false;
@@ -1554,9 +1577,10 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
         e.slot = slot;
         e.slot_version = ++dh->versions[slot];
         ++g_operation_revision;
+        std::shared_ptr<const DescriptorDetails> prev = std::move(dh->info[slot].details);
         dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
                                             known ? off : 0, desc ? desc->SizeInBytes : 0};
-        if(view){view->kind=NA_DESC_CBV;view->resource=dh->info[slot].resource;dh->info[slot].details=std::move(view);}
+        publish_details(dh->info[slot], std::move(prev), view, NA_DESC_CBV, dh->info[slot].resource);
         set_hot_bit(dh, slot, false);
     }
     e.descriptor_kind = NA_DESC_CBV;
@@ -1573,11 +1597,12 @@ void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resou
     o_CreateShaderResourceView(dev, r, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MostDetailedMip; count = d->Texture2D.MipLevels; }
-    std::shared_ptr<DescriptorDetails> view;
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
     if (g_operation_snapshots.load() && !t_host_work) {
-        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->srv = *d;
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.srv = *d;
     }
-    note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
+    note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Resource* r, ID3D12Resource* counter,
@@ -1586,12 +1611,13 @@ void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Reso
     o_CreateUnorderedAccessView(dev, r, counter, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MipSlice; count = 1; }
-    std::shared_ptr<DescriptorDetails> view;
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
     if (g_operation_snapshots.load() && !t_host_work) {
-        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->uav = *d;
-        bool created = false; view->counter = counter ? ensure_registered(counter, NA_OBJ_RESOURCE, &created) : 0;
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.uav = *d;
+        bool created = false; view_args.counter = counter ? ensure_registered(counter, NA_OBJ_RESOURCE, &created) : 0;
     }
-    note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
+    note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1609,11 +1635,12 @@ void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resourc
     else if (d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
         first = d->Texture2DMSArray.FirstArraySlice; count = 1; // MSAA textures have exactly one mip
     }
-    std::shared_ptr<DescriptorDetails> view;
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
     if (g_operation_snapshots.load() && !t_host_work) {
-        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->rtv = *d;
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.rtv = *d;
     }
-    note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
+    note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1630,11 +1657,12 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
     else if (d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
         first = d->Texture2DMSArray.FirstArraySlice; count = 1;
     }
-    std::shared_ptr<DescriptorDetails> view;
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
     if (g_operation_snapshots.load() && !t_host_work) {
-        view = std::make_shared<DescriptorDetails>(); view->explicit_view = d != nullptr; if (d) view->dsv = *d;
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.dsv = *d;
     }
-    note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,std::move(view));
+    note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 // Texture LOD (mip) bias for temporal reconstruction (J2 DLAA): with jitter and
