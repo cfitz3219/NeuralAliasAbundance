@@ -169,10 +169,10 @@ bool build_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* leve
 }
 
 // The game's request runs on a worker thread of ours, and the game waits at most
-// kCreateTimeoutMs. Pharaoh (2026-11-09, 250d6ca) hung forever inside this creation on its
+// kCreateTimeoutMs (10 s). Pharaoh (2026-11-09, 250d6ca) hung forever inside this creation on its
 // own thread; whatever the step, the game now falls back to native DX11 instead of freezing
 // (fail-quiet), and the startup log names the step that stalled.
-constexpr DWORD kCreateTimeoutMs = 5000;
+constexpr DWORD kCreateTimeoutMs = 10000; // D3D12CreateDevice alone can sit 3 s in the early factory gate
 struct CreateJob {
     IDXGIAdapter* adapter = nullptr;
     UINT flags = 0;
@@ -249,7 +249,7 @@ bool create_on12(IDXGIAdapter* adapter, UINT flags, const D3D_FEATURE_LEVEL* lev
     if (!job->finished) {
         job->abandoned = true;
         (void)wait;
-        note("11on12 device creation did not finish in 5 s (see the last 'step' line); native DX11");
+        note("11on12 device creation did not finish in 10 s (see the last 'step' line); native DX11");
         return false;
     }
     if (!job->ok) return false;
