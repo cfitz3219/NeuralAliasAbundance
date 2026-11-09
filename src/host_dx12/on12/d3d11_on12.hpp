@@ -84,8 +84,10 @@ bool Enabled();
 // False: create the chain as asked (native D3D11, or the old 11on12 chain).
 bool TranslateSwapChain(IUnknown* device, const DXGI_SWAP_CHAIN_DESC& game, DXGI_SWAP_CHAIN_DESC& real, ID3D12CommandQueue** queue);
 bool TranslateSwapChain1(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1& game, DXGI_SWAP_CHAIN_DESC1& real, ID3D12CommandQueue** queue);
-// After the translated chain was created: build the game's virtual back buffer.
-void AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_format, UINT game_count, DXGI_SWAP_EFFECT game_effect,
+// After the translated chain was created: build the game's virtual back buffer. False = the
+// chain is unusable for the game (nothing kept); the caller releases it and creates the chain
+// the game asked for on the game's device instead.
+bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_format, UINT game_count, DXGI_SWAP_EFFECT game_effect,
                      DXGI_SAMPLE_DESC game_samples, DXGI_USAGE game_usage);
 bool IsTranslated(IDXGISwapChain* chain);
 
@@ -101,10 +103,12 @@ void RewriteDesc1(IDXGISwapChain* chain, DXGI_SWAP_CHAIN_DESC1* desc);
 // First thing in the game's Present / Present1: hand the virtual buffer's
 // picture to the chain's current D3D12 buffer (D3D11 work flushed first).
 void BeforePresent(IDXGISwapChain* chain, unsigned flags);
-// ResizeBuffers: waits for our copies, drops the virtual buffer, translates
-// the count/format/flags; AfterResize rebuilds the virtual buffer.
-void BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags, DXGI_FORMAT* game_format);
-void AfterResize(IDXGISwapChain* chain, long result, DXGI_FORMAT game_format);
+// ResizeBuffers / ResizeBuffers1: waits for our copies, hands the virtual buffer back from
+// D3D11 (kept, with the advertised description, until DXGI has decided) and translates the
+// count/format/flags. AfterResize: success builds the new virtual buffer and adopts the
+// requested description; failure reacquires the exact old buffer, nothing advertised changes.
+void BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags);
+void AfterResize(IDXGISwapChain* chain, long result);
 // The game is about to drop its last reference: wait for our GPU copies.
 void BeforeFinalRelease(IDXGISwapChain* chain);
 void ForgetSwapChain(IDXGISwapChain* chain);

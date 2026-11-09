@@ -695,6 +695,10 @@ struct TChain {
     ComPtr<ID3D12Fence> fence;
     uint64_t fence_value = 0;
     HANDLE event = nullptr;
+    // A resize in flight: what the game asked for, adopted only when DXGI succeeds.
+    bool resizing = false;
+    UINT pending_count = 0;
+    DXGI_FORMAT pending_format = DXGI_FORMAT_UNKNOWN;
     struct Slot { ComPtr<ID3D12CommandAllocator> alloc; ComPtr<ID3D12GraphicsCommandList> list; uint64_t value = 0; } slots[4];
     uint32_t next = 0;
 };
@@ -737,6 +741,7 @@ bool d3d12_interface(REFIID riid)
 bool twait(TChain& c, uint64_t value, DWORD ms)
 {
     if (!value || !c.fence || c.fence->GetCompletedValue() >= value) return true;
+    if (value == UINT64_MAX) return false; // a submission without a fence receipt: only a drain clears it
     if (!c.event) c.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!c.event || FAILED(c.fence->SetEventOnCompletion(value, c.event))) return false;
     return WaitForSingleObject(c.event, ms) == WAIT_OBJECT_0;
@@ -750,6 +755,7 @@ bool tdrain(TChain& c)
     if (FAILED(c.queue->Signal(c.fence.Get(), ++c.fence_value))) return false;
     const bool done = twait(c, c.fence_value, 2000);
     if (!done) g_tresize_waits.fetch_add(1);
+    else for (auto& s : c.slots) if (s.value == UINT64_MAX) s.value = 0; // everything before this drain has completed
     return done;
 }
 
@@ -881,22 +887,24 @@ bool TranslateSwapChain1(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1& game, DX
     return true;
 }
 
-void AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_format, UINT game_count, DXGI_SWAP_EFFECT game_effect,
+bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_format, UINT game_count, DXGI_SWAP_EFFECT game_effect,
                      DXGI_SAMPLE_DESC game_samples, DXGI_USAGE game_usage)
 {
     std::lock_guard<std::recursive_mutex> lk(g_tm);
     TChain* c = tfind(chain);
     if (!c) for (auto& k : g_tchains) if (!k.sc) { c = &k; break; }
-    if (!c) { tnote("more than four translated swap chains; this one presents nothing"); return; }
+    if (!c) { tnote("more than four translated swap chains; the game gets its own chain"); return false; }
     const bool reused = c->sc == chain;
     if (c->event) CloseHandle(c->event);
     *c = TChain{};
-    if (!init_translated(*c, chain, device)) {
+    auto fail = [&](const char* why) {
         *c = TChain{};
         if (reused) g_tchain_count.fetch_sub(1);
-        tnote("the translated swap chain could not be attached");
-        return;
-    }
+        g_untranslated.fetch_add(1);
+        tnote(why);
+        return false;
+    };
+    if (!init_translated(*c, chain, device)) return fail("the translated swap chain could not be attached; the game gets its own chain");
     if (!reused) g_tchain_count.fetch_add(1);
     c->game_format = game_format;
     c->game_count = game_count;
@@ -904,12 +912,13 @@ void AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
     c->game_samples = game_samples.Count ? game_samples : DXGI_SAMPLE_DESC{1, 0};
     c->game_usage = game_usage;
     read_size(*c);
-    if (!build_virtual(*c)) return;
+    if (!build_virtual(*c)) return fail("the game's back buffer could not be built; the game gets its own chain");
     g_translated.fetch_add(1);
     char line[160];
     std::snprintf(line, sizeof line, "the game presents through a D3D12 swap chain (%ux%u, format %d, %u sample(s))", c->width, c->height,
                   static_cast<int>(game_format), c->game_samples.Count);
     tnote(line);
+    return true;
 }
 
 bool IsTranslated(IDXGISwapChain* chain)
@@ -981,9 +990,12 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
     HRESULT hr = chain->GetBuffer(index, IID_PPV_ARGS(&target));
     if (FAILED(hr) || !target) { g_tcopy_failures.fetch_add(1); g_tlast_hr.store(hr); return; }
     const D3D12_RESOURCE_DESC td = target->GetDesc();
-    if (flip_format(td.Format) != flip_format(c->game_format)) {
-        g_tcopy_failures.fetch_add(1);
-        tnote("the chain's buffer format no longer matches the game's back buffer; picture not copied");
+    const bool msaa = c->game_samples.Count > 1;
+    const bool same_size = td.Width == c->width && td.Height == c->height;
+    if (flip_format(td.Format) != flip_format(c->game_format) || (msaa && !same_size)) {
+        g_tcopy_failures.fetch_add(1); // nothing is transferred this frame; the game's buffer stays acquired
+        tnote(msaa ? "the chain's buffer size differs from the game's multisampled back buffer; no resolve this frame"
+                   : "the chain's buffer format no longer matches the game's back buffer; picture not copied");
         return;
     }
     // D3D11's frame goes to the queue first; D3D12 owns the virtual buffer until we give it back.
@@ -993,13 +1005,10 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
     TChain::Slot* s = nullptr;
     if (tlist(*c, s)) {
         ID3D12GraphicsCommandList* l = s->list.Get();
-        const bool msaa = c->game_samples.Count > 1;
         const D3D12_RESOURCE_STATES dst = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST;
         barrier(l, target.Get(), D3D12_RESOURCE_STATE_PRESENT, dst);
-        const bool same_size = td.Width == c->width && td.Height == c->height;
         if (msaa) {
-            const DXGI_FORMAT f = typeless(c->game_format) ? td.Format : c->game_format;
-            if (same_size) l->ResolveSubresource(target.Get(), 0, c->virt12.Get(), 0, f);
+            l->ResolveSubresource(target.Get(), 0, c->virt12.Get(), 0, typeless(c->game_format) ? td.Format : c->game_format);
         } else if (same_size) {
             l->CopyResource(target.Get(), c->virt12.Get());
         } else { // a size the game has not caught up with yet: copy what overlaps
@@ -1016,12 +1025,18 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
         barrier(l, target.Get(), dst, D3D12_RESOURCE_STATE_PRESENT);
         if (SUCCEEDED(hr = l->Close())) {
             // The hooked ExecuteCommandLists: the program observes this copy as the
-            // game's final write of the presented picture.
+            // game's final write of the presented picture. A transfer counts only with
+            // its fence receipt; without one the slot is never reused before a full drain.
             ID3D12CommandList* lists[] = {l};
             c->queue->ExecuteCommandLists(1, lists);
-            c->queue->Signal(c->fence.Get(), ++c->fence_value);
-            s->value = c->fence_value;
-            g_tcopies.fetch_add(1, std::memory_order_relaxed);
+            hr = c->queue->Signal(c->fence.Get(), c->fence_value + 1);
+            if (SUCCEEDED(hr)) {
+                s->value = ++c->fence_value;
+                g_tcopies.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                s->value = UINT64_MAX; // unknown completion: tlist waits (bounded) and the slot stays out of rotation until a drain
+                g_tcopy_failures.fetch_add(1); g_tlast_hr.store(hr);
+            }
         } else {
             g_tcopy_failures.fetch_add(1); g_tlast_hr.store(hr);
         }
@@ -1031,38 +1046,48 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
     c->on12->AcquireWrappedResources(r, 1); // the game draws its next frame into it
 }
 
-void BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags, DXGI_FORMAT* game_format)
+void BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, unsigned* flags)
 {
-    *game_format = DXGI_FORMAT_UNKNOWN;
     if (!g_tchain_count.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::recursive_mutex> lk(g_tm);
     TChain* c = tfind(chain);
     if (!c) return;
-    // DXGI resizes D3D12 buffers only when no GPU work still uses them.
+    // DXGI resizes D3D12 buffers only when no GPU work still uses them: our copies first. The
+    // game's buffer is handed back from D3D11 but kept, with everything advertised about it,
+    // until DXGI has decided (a refused resize must leave the game exactly what it had).
     tdrain(*c);
     if (c->virt11) { ID3D11Resource* r[] = {c->virt11.Get()}; c->on12->ReleaseWrappedResources(r, 1); }
-    drop_virtual(*c);
     c->ctx->Flush();
-    *game_format = *format == DXGI_FORMAT_UNKNOWN ? c->game_format : *format;
+    c->resizing = true;
+    c->pending_count = *count ? *count : c->game_count;
+    c->pending_format = *format == DXGI_FORMAT_UNKNOWN ? c->game_format : *format;
     if (*format != DXGI_FORMAT_UNKNOWN) {
         const DXGI_FORMAT f = flip_format(*format);
-        *format = f != DXGI_FORMAT_UNKNOWN ? f : DXGI_FORMAT_UNKNOWN; // unsupported: the chain keeps its format
+        if (f == DXGI_FORMAT_UNKNOWN) c->pending_format = c->game_format; // unsupported: the chain and the game's buffer keep their format
+        *format = f;
     }
-    if (*count) { c->game_count = *count; *count = flip_count(*count); }
+    if (*count) *count = flip_count(*count);
     *flags = flip_flags(*flags);
     g_tresizes.fetch_add(1);
 }
 
-void AfterResize(IDXGISwapChain* chain, long result, DXGI_FORMAT game_format)
+void AfterResize(IDXGISwapChain* chain, long result)
 {
     if (!g_tchain_count.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::recursive_mutex> lk(g_tm);
     TChain* c = tfind(chain);
-    if (!c) return;
-    if (SUCCEEDED(result) && game_format != DXGI_FORMAT_UNKNOWN) c->game_format = game_format;
-    if (FAILED(result)) tnote("the game's ResizeBuffers failed; its back buffer keeps the previous size", result);
+    if (!c || !c->resizing) return;
+    c->resizing = false;
+    if (FAILED(result)) {
+        // The game keeps the exact buffer it had: back under D3D11, same description.
+        tnote("the game's ResizeBuffers was refused; its back buffer is unchanged", result);
+        if (c->virt11) { ID3D11Resource* r[] = {c->virt11.Get()}; c->on12->AcquireWrappedResources(r, 1); }
+        return;
+    }
+    c->game_count = c->pending_count;
+    c->game_format = c->pending_format;
     read_size(*c);
-    build_virtual(*c);
+    if (!build_virtual(*c)) tnote("the game's back buffer could not be rebuilt after ResizeBuffers");
 }
 
 void BeforeFinalRelease(IDXGISwapChain* chain)

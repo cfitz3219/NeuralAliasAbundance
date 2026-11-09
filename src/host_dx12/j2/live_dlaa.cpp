@@ -3084,7 +3084,7 @@ double continuity(const na::camera::Matrix& m, bool injected)
 struct CameraBoot {
     bool valid = false;
     uint64_t byte_offset = 0;
-    uint32_t param = 0;
+    uint32_t param = 0, size = 0; // block size tells apart descriptors of one table with the same in-block offset
     bool table = false;
     na::camera::Matrix vp{};
     uint64_t frame = 0;
@@ -3104,13 +3104,15 @@ bool boot_continues(const na::camera::Matrix& a, const na::camera::Matrix& b)
 // Returns true when `c` (from block `o`, this frame) completes the streak.
 bool boot_camera(const Block* o, const na::camera::Candidate& c)
 {
-    if (g_boot.valid && g_boot.frame == g.frame) return g_boot.verdict; // already judged this frame
-    const bool same_slot = g_boot.valid && g_boot.param == o->param && g_boot.table == o->table && g_boot.byte_offset == c.byte_offset;
+    const bool same_slot = g_boot.valid && g_boot.param == o->param && g_boot.table == o->table && g_boot.size == o->size &&
+                           g_boot.byte_offset == c.byte_offset;
+    if (g_boot.valid && g_boot.frame == g.frame) // already judged this frame: the verdict belongs to that slot and camera only
+        return same_slot && g_boot.verdict && boot_continues(g_boot.vp, c.matrix);
     const bool consecutive = g_boot.valid && g.frame > g_boot.frame && g.frame - g_boot.frame <= 2; // a menu frame between is tolerated
     if (same_slot && consecutive && boot_continues(g_boot.vp, c.matrix)) ++g_boot.streak;
     else g_boot.streak = 1;
     g_boot.valid = true;
-    g_boot.param = o->param; g_boot.table = o->table;
+    g_boot.param = o->param; g_boot.table = o->table; g_boot.size = o->size;
     g_boot.byte_offset = c.byte_offset; g_boot.vp = c.matrix; g_boot.frame = g.frame;
     g_boot.verdict = g_boot.streak >= kBootFrames;
     return g_boot.verdict;
@@ -3408,9 +3410,9 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
     const CamPick* p = picks.empty() ? nullptr : best_pick(picks);
     if (!p && have_boot) {
         // The first main camera, proven by persistence instead of an inverse pair. The slot is
-        // learned from it so the next frames read it first; the tracker inverts it itself.
+        // learned from it so the next frames read it first; the tracker inverts it itself. The
+        // streak is kept: a retry of this frame, or a lost next frame, resumes from it.
         ++g.stats.camera_bootstrapped;
-        g_boot = {};
         p = &boot;
     }
     if (!p && have_loose) {

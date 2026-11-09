@@ -303,11 +303,16 @@ HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, 
     }
     HRESULT hr;
     { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, use_copy ? &copy : d, out); }
+    if (on12_queue && (FAILED(hr) || !out || !*out ||
+                       !na::on12::AttachSwapChain(*out, dev, d->BufferDesc.Format, d->BufferCount, d->SwapEffect, d->SampleDesc, d->BufferUsage))) {
+        // The D3D12 chain cannot serve the game: release it and create exactly what the game asked
+        // for on its own device (the 11on12 chain the earlier bridge builds used).
+        if (SUCCEEDED(hr) && out && *out) { (*out)->Release(); *out = nullptr; }
+        on12_queue.Reset();
+        { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, dev, d, out); }
+    }
     if (SUCCEEDED(hr) && out && *out) {
-        if (on12_queue) {
-            na::on12::AttachSwapChain(*out, dev, d->BufferDesc.Format, d->BufferCount, d->SwapEffect, d->SampleDesc, d->BufferUsage);
-            note_swapchain_queue(on12_queue.Get(), *out);
-        } else note_swapchain_queue(dev, *out);
+        note_swapchain_queue(on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, *out);
         if (d) small_attach(d->OutputWindow, *out);
     }
     return hr;
@@ -325,11 +330,14 @@ HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, H
     }
     HRESULT hr;
     { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, w, use_copy ? &copy : d, fs, o, out); }
+    if (on12_queue && (FAILED(hr) || !out || !*out ||
+                       !na::on12::AttachSwapChain(*out, dev, d->Format, d->BufferCount, d->SwapEffect, d->SampleDesc, d->BufferUsage))) {
+        if (SUCCEEDED(hr) && out && *out) { (*out)->Release(); *out = nullptr; }
+        on12_queue.Reset();
+        { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, dev, w, d, fs, o, out); }
+    }
     if (SUCCEEDED(hr) && out && *out) {
-        if (on12_queue) {
-            na::on12::AttachSwapChain(*out, dev, d->Format, d->BufferCount, d->SwapEffect, d->SampleDesc, d->BufferUsage);
-            note_swapchain_queue(on12_queue.Get(), *out);
-        } else note_swapchain_queue(dev, *out);
+        note_swapchain_queue(on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, *out);
         small_attach(w, *out);
     }
     return hr;
@@ -3791,10 +3799,9 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
-    DXGI_FORMAT on12_game_format=DXGI_FORMAT_UNKNOWN;
-    na::on12::BeforeResize(sc,&count,&fmt,&flags,&on12_game_format); // DX11 bridge: D3D12 chain parameters
+    na::on12::BeforeResize(sc,&count,&fmt,&flags); // DX11 bridge: D3D12 chain parameters; the game's buffer waits for the verdict
     const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
-    na::on12::AfterResize(sc,result,on12_game_format);
+    na::on12::AfterResize(sc,result);
     na::present::AfterResize(sc,result);
     na::observe::SwapchainResized(sc,result);return result;
 }
@@ -3809,7 +3816,9 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
     na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
+    na::on12::BeforeResize(sc,&count,&fmt,&flags); // DX11 bridge (a D3D11 game does not call this; same contract if it does)
     const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    na::on12::AfterResize(sc,result);
     na::present::AfterResize(sc,result);
     na::observe::SwapchainResized(sc,result);
     if(SUCCEEDED(result) && queues){
