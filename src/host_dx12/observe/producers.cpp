@@ -83,6 +83,11 @@ struct ListState {
     std::mutex bind_m;
     std::vector<Binding> bindings;
     const void* root_sig[2] = {nullptr, nullptr}; // graphics, compute (recording thread)
+    // root_table: the bound root signature's registry entry, reused while the same signature stays
+    // bound and no object retired (g_retire_gen); std::unordered_map nodes never move otherwise.
+    const void* rs_key[2] = {nullptr, nullptr};
+    const void* rs_obj[2] = {nullptr, nullptr};
+    uint64_t rs_gen[2] = {0, 0};
     uint64_t root_serial[2]{},host_restore_serial=0;
     // C9b: explicit transitions recorded in this recording, in order (under bind_m).
     struct StateNote {
@@ -793,6 +798,9 @@ void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
         ++g_operation_revision;++g_heap_registry_revision;
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.id == id) { drop = take_parcel(it->second); g_objs.erase(it); }
+        // Again under the exclusive lock: an entry cached between the bump above and this erase
+        // (root_table's per-recording root signature entry) must not survive it.
+        g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
         heap_index_rebuild();
@@ -3974,12 +3982,23 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
         }
         // C9: CBV ranges of this table, per the bound root signature.
 
-        if (dh && ls->root_sig[Compute]) {
-            auto it = g_objs.find(canon(ls->root_sig[Compute]));
-            if (it != g_objs.end() && param < it->second.root_params.size()) {
-                const na_root_param& rp = it->second.root_params[param];
+        // WWII p31660: ~250k table binds/s on the translator thread. Both per-recording budgets full
+        // (256 sampled textures, 4096 CBV bindings) means the range loops below add nothing: skip them,
+        // and reuse the root signature's entry instead of two hash lookups per bind.
+        if (dh && ls->root_sig[Compute] && (ls->sampled_textures.size() < 256 || ls->bindings.size() < 4096)) {
+            const Obj* rso = nullptr;
+            const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+            if (ls->rs_key[Compute] == ls->root_sig[Compute] && ls->rs_gen[Compute] == gen) {
+                rso = static_cast<const Obj*>(ls->rs_obj[Compute]);
+            } else {
+                auto it = g_objs.find(canon(ls->root_sig[Compute]));
+                rso = it != g_objs.end() ? &it->second : nullptr;
+                if (rso) { ls->rs_key[Compute] = ls->root_sig[Compute]; ls->rs_obj[Compute] = rso; ls->rs_gen[Compute] = gen; }
+            }
+            if (rso && param < rso->root_params.size()) {
+                const na_root_param& rp = rso->root_params[param];
                 if (rp.param_type == NA_ROOT_TABLE) {
-                    const auto& rr = it->second.root_ranges;
+                    const auto& rr = rso->root_ranges;
                     for (uint32_t q = 0; q < rp.count && rp.first_range + q < rr.size(); ++q) {
                         const na_root_range& range = rr[rp.first_range + q];
                         if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32 && ls->sampled_textures.size()<256) {
