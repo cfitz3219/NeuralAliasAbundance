@@ -79,11 +79,10 @@ int main(int argc, char** argv)
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
         if (press_home && i == frames / 3) {
-            SetForegroundWindow(wnd);
-            INPUT in[2]{};
-            in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_HOME;
-            in[1] = in[0]; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
-            SendInput(2, in, sizeof(INPUT));
+            // Straight to our own window (the host hooks its WndProc), so the probe never takes
+            // focus or sends a key to whatever else is in front on the desktop.
+            SendMessageW(wnd, WM_KEYDOWN, VK_HOME, 1);
+            SendMessageW(wnd, WM_KEYUP, VK_HOME, 0xC0000001);
             std::printf("pressed Home at frame %d\n", i);
         }
         const float c[4] = {0.1f + 0.4f * ((i % 60) / 60.f), 0.2f, 0.3f, 1.f};
