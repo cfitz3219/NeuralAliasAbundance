@@ -32,12 +32,10 @@ On12CreateDeviceFn g_on12_create = nullptr;
 D3D12CreateDeviceFn g_d3d12_create = nullptr;
 LogFn g_log = nullptr;
 std::atomic<bool> g_enabled{false}, g_hooked{false};
-// [dx11on12] menu_buffer: 0 never borrow the back buffer (menu does not draw), 1 borrow and return
-// with the menu's fence, 2 borrow and return with no fence (same queue, so already ordered),
-// 3 borrow and return but skip the GPU draw (diagnostic: separates the draw from the borrow),
-// 4 borrow, submit an empty command list + signal on the queue (diagnostic: any queue work?),
-// 5 borrow, submit only the back buffer's PRESENT->RENDER_TARGET->PRESENT barriers (diagnostic),
-// 6 borrow, full menu draw into a texture of ours instead of the back buffer (diagnostic).
+// [dx11on12] menu_buffer: 1 (default) the menu draws into a canvas texture of ours, which the
+// game's own D3D11 context then blends onto the back buffer; 2 the menu draws straight into the
+// borrowed back buffer (D3D12 writes to an 11on12 swap chain's presented buffer make the D3D11
+// present wait ~2 s on its latency semaphore: probe runs 2026-11-09, modes 1-6); 0 no menu.
 std::atomic<int> g_menu_buffer{1};
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
@@ -286,7 +284,12 @@ ID3D12Device* DeviceFor(IUnknown* device)
 }
 
 namespace {
-struct Token { ComPtr<ID3D11On12Device2> device; ComPtr<ID3D11Resource> buffer; };
+struct Token {
+    ComPtr<ID3D11On12Device2> device;
+    ComPtr<ID3D11Resource> resource;    // what was unwrapped: the canvas, or the back buffer itself
+    ComPtr<ID3D11Resource> back_buffer; // set when `resource` is the canvas
+    ComPtr<ID3D11Device> d11;
+};
 std::atomic<uint64_t> g_unwraps{0}, g_unwrap_failures{0}, g_returns{0};
 // Time spent inside 11on12's unwrap / return (CPU), to find stalls while the menu draws.
 std::atomic<uint64_t> g_unwrap_us{0}, g_unwrap_max_us{0}, g_return_us{0}, g_return_max_us{0};
@@ -304,26 +307,181 @@ void add_time(std::atomic<uint64_t>& total, std::atomic<uint64_t>& peak, uint64_
 }
 }
 
-bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, ID3D12Resource** out, Borrowed& borrowed)
+namespace {
+// The canvas: a D3D11 texture on the game's 11on12 device that the menu draws into through
+// D3D12 (unwrapped for that draw), then a fullscreen triangle on the game's immediate context
+// blends it onto the back buffer. Drawing never touches the presented buffer from D3D12.
+const char kCompositeSource[] = R"(
+Texture2D<float4> canvas : register(t0);
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps(float4 pos : SV_Position) : SV_Target { return canvas.Load(int3(pos.xy, 0)); }
+)";
+
+struct Canvas {
+    ID3D11Device* owner = nullptr; // identity of the 11on12 device (not owned)
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11BlendState> blend;
+    ComPtr<ID3D11RasterizerState> raster;
+    ComPtr<ID3D11DepthStencilState> depth;
+    ComPtr<ID3DDeviceContextState> state;
+    UINT width = 0, height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    bool broken = false; // composite setup failed on this device: draw straight into the back buffer
+};
+std::mutex g_canvas_m;
+Canvas g_canvas;
+std::atomic<uint64_t> g_composites{0}, g_composite_failures{0};
+
+using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+bool compile(const char* entry, const char* target, ComPtr<ID3DBlob>& out)
 {
-    if (!g_hooked.load() || g_menu_buffer.load() == 0 || !sc || !queue || !out) return false;
+    static CompileFn fn = [] {
+        HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+        return m ? reinterpret_cast<CompileFn>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    }();
+    return fn && SUCCEEDED(fn(kCompositeSource, sizeof(kCompositeSource) - 1, "NeuralAlias 11on12 menu composite", nullptr, nullptr,
+                              entry, target, 0, 0, &out, nullptr));
+}
+
+// Pipeline objects, once per device. Caller holds g_canvas_m.
+bool ensure_pipeline(ID3D11Device* d11)
+{
+    if (g_canvas.owner != d11) g_canvas = Canvas{}, g_canvas.owner = d11;
+    if (g_canvas.broken) return false;
+    if (g_canvas.state) return true;
+    ComPtr<ID3DBlob> vsb, psb;
+    ComPtr<ID3D11Device1> d1;
+    D3D_FEATURE_LEVEL level = d11->GetFeatureLevel();
+    const IID emulated = __uuidof(ID3D11Device);
+    D3D11_BLEND_DESC bd{};
+    bd.RenderTarget[0].BlendEnable = TRUE; // the canvas holds premultiplied colour (ImGui over transparent)
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    D3D11_DEPTH_STENCIL_DESC dd{}; // depth and stencil off
+    const bool ok = compile("vs", "vs_4_0", vsb) && compile("ps", "ps_4_0", psb) &&
+                    SUCCEEDED(d11->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g_canvas.vs)) &&
+                    SUCCEEDED(d11->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g_canvas.ps)) &&
+                    SUCCEEDED(d11->CreateBlendState(&bd, &g_canvas.blend)) &&
+                    SUCCEEDED(d11->CreateRasterizerState(&rd, &g_canvas.raster)) &&
+                    SUCCEEDED(d11->CreateDepthStencilState(&dd, &g_canvas.depth)) &&
+                    SUCCEEDED(d11->QueryInterface(IID_PPV_ARGS(&d1))) &&
+                    SUCCEEDED(d1->CreateDeviceContextState((d11->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED) ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED : 0u, &level, 1, D3D11_SDK_VERSION, emulated, nullptr, &g_canvas.state));
+    if (!ok) { g_canvas.broken = true; g_composite_failures.fetch_add(1); }
+    return ok;
+}
+
+// Canvas sized and formatted like the back buffer. Caller holds g_canvas_m.
+bool ensure_canvas(ID3D11Device* d11, const D3D11_TEXTURE2D_DESC& back, DXGI_FORMAT format)
+{
+    if (g_canvas.texture && g_canvas.width == back.Width && g_canvas.height == back.Height && g_canvas.format == format) return true;
+    g_canvas.texture.Reset();
+    g_canvas.srv.Reset();
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = back.Width;
+    td.Height = back.Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = format;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(d11->CreateTexture2D(&td, nullptr, &g_canvas.texture)) ||
+        FAILED(d11->CreateShaderResourceView(g_canvas.texture.Get(), nullptr, &g_canvas.srv))) {
+        g_canvas.texture.Reset();
+        g_canvas.srv.Reset();
+        return false;
+    }
+    g_canvas.width = back.Width;
+    g_canvas.height = back.Height;
+    g_canvas.format = format;
+    return true;
+}
+
+// Blend the canvas onto back buffer 0 with the game's immediate context, inside our own
+// context state so the game's bindings are untouched.
+void composite(ID3D11Device* d11, ID3D11Resource* back_buffer)
+{
+    ComPtr<ID3D11DeviceContext> ctx;
+    d11->GetImmediateContext(&ctx);
+    ComPtr<ID3D11DeviceContext1> ctx1;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    rd.Format = g_canvas.format;
+    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    if (!ctx || FAILED(ctx.As(&ctx1)) || FAILED(d11->CreateRenderTargetView(back_buffer, &rd, &rtv))) {
+        g_composite_failures.fetch_add(1);
+        return;
+    }
+    ComPtr<ID3DDeviceContextState> game_state;
+    ctx1->SwapDeviceContextState(g_canvas.state.Get(), &game_state);
+    D3D11_VIEWPORT vp{0, 0, float(g_canvas.width), float(g_canvas.height), 0, 1};
+    const float factor[4] = {};
+    ID3D11RenderTargetView* targets[] = {rtv.Get()};
+    ID3D11ShaderResourceView* views[] = {g_canvas.srv.Get()};
+    ctx1->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx1->IASetInputLayout(nullptr);
+    ctx1->VSSetShader(g_canvas.vs.Get(), nullptr, 0);
+    ctx1->PSSetShader(g_canvas.ps.Get(), nullptr, 0);
+    ctx1->PSSetShaderResources(0, 1, views);
+    ctx1->RSSetState(g_canvas.raster.Get());
+    ctx1->RSSetViewports(1, &vp);
+    ctx1->OMSetBlendState(g_canvas.blend.Get(), factor, 0xffffffffu);
+    ctx1->OMSetDepthStencilState(g_canvas.depth.Get(), 0);
+    ctx1->OMSetRenderTargets(1, targets, nullptr);
+    ctx1->Draw(3, 0);
+    ID3D11ShaderResourceView* none[] = {nullptr};
+    ctx1->PSSetShaderResources(0, 1, none); // the canvas is a render target again next frame
+    ctx1->OMSetRenderTargets(0, nullptr, nullptr);
+    ctx1->SwapDeviceContextState(game_state.Get(), nullptr);
+    g_composites.fetch_add(1);
+}
+} // namespace
+
+bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, unsigned format, ID3D12Resource** out, Borrowed& borrowed)
+{
+    const int mode = g_menu_buffer.load();
+    if (!g_hooked.load() || mode == 0 || !sc || !queue || !out) return false;
     ComPtr<IUnknown> any;
     if (FAILED(sc->GetDevice(IID_PPV_ARGS(&any)))) return false;
     ComPtr<ID3D11On12Device2> device;
-    if (FAILED(any.As(&device))) return false; // not an 11on12 chain
-    ComPtr<ID3D11Resource> buffer;
-    // D3D11 swap chains expose only buffer 0: it is always the current back buffer (the runtime
-    // rotates the rest). Asking for the D3D12-style current index borrows a buffer that is queued
-    // for display, which 11on12 must first wait out (probe e13b422: Presents of up to 2 s with the
-    // menu open, none without it).
+    ComPtr<ID3D11Device> d11;
+    if (FAILED(any.As(&device)) || FAILED(any.As(&d11))) return false; // not an 11on12 chain
+    // D3D11 swap chains expose only buffer 0: it is always the current back buffer.
     (void)index;
-    HRESULT hr = sc->GetBuffer(0, IID_PPV_ARGS(&buffer));
+    ComPtr<ID3D11Texture2D> buffer;
+    if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return false;
+    ComPtr<ID3D11Resource> target;
+    bool canvas = false;
+    if (mode == 1) {
+        D3D11_TEXTURE2D_DESC back{};
+        buffer->GetDesc(&back);
+        std::lock_guard<std::mutex> lk(g_canvas_m);
+        if (ensure_pipeline(d11.Get()) && ensure_canvas(d11.Get(), back, static_cast<DXGI_FORMAT>(format))) {
+            target = g_canvas.texture;
+            canvas = true;
+        }
+    }
+    if (!target) target = buffer; // mode 2, or the composite could not be set up
     const uint64_t t0 = now_us();
-    if (SUCCEEDED(hr)) hr = device->UnwrapUnderlyingResource(buffer.Get(), queue, IID_PPV_ARGS(out));
+    HRESULT hr = device->UnwrapUnderlyingResource(target.Get(), queue, IID_PPV_ARGS(out));
     add_time(g_unwrap_us, g_unwrap_max_us, now_us() - t0);
     if (FAILED(hr) || !*out) { g_unwrap_failures.fetch_add(1); g_last_hr.store(static_cast<long>(hr)); return false; }
-    auto* t = new Token{device, buffer};
-    borrowed.token = t;
+    borrowed.token = new Token{device, target, canvas ? ComPtr<ID3D11Resource>(buffer) : ComPtr<ID3D11Resource>{}, d11};
+    borrowed.clear = canvas;
     g_unwraps.fetch_add(1);
     return true;
 }
@@ -336,26 +494,28 @@ Borrowed::~Borrowed()
     if (!t) return;
     UINT64 v = value;
     ID3D12Fence* fences[] = {fence};
-    if (g_menu_buffer.load() == 2) fence = nullptr; // our draw went to 11on12's own queue: already ordered
-    // Back to 11on12 before Present; with our fence, 11on12 waits for the menu draw.
+    // Back to 11on12 before Present; with our fence, later D3D11 work on it waits for the menu draw.
     const uint64_t t0 = now_us();
-    t->device->ReturnUnderlyingResource(t->buffer.Get(), fence ? 1u : 0u, fence ? &v : nullptr, fence ? fences : nullptr);
+    t->device->ReturnUnderlyingResource(t->resource.Get(), fence ? 1u : 0u, fence ? &v : nullptr, fence ? fences : nullptr);
     add_time(g_return_us, g_return_max_us, now_us() - t0);
     g_returns.fetch_add(1);
+    if (t->back_buffer && fence) { // canvas drawn: blend it onto the back buffer through D3D11
+        std::lock_guard<std::mutex> lk(g_canvas_m);
+        if (g_canvas.owner == t->d11.Get() && g_canvas.state) composite(t->d11.Get(), t->back_buffer.Get());
+    }
     delete t;
 }
-
-int BorrowMode() { return g_menu_buffer.load(); }
 
 int FormatStatus(char* out, size_t capacity)
 {
     std::lock_guard<std::mutex> lk(g_m);
     return std::snprintf(out, capacity,
-                         "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{mode=%d unwraps=%llu failures=%llu returns=%llu unwrap_us=%llu/max%llu return_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\"",
+                         "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{mode=%d unwraps=%llu failures=%llu returns=%llu composites=%llu composite_failures=%llu unwrap_us=%llu/max%llu return_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\"",
                          g_enabled.load() ? 1u : 0u, g_hooked.load() ? 1u : 0u, g_requests.load(), g_wrapped.load(),
                          g_with_swapchain.load(), g_native.load(), g_probes.load(), g_swapchain_check.load(), g_menu_buffer.load(),
                          static_cast<unsigned long long>(g_unwraps.load()), static_cast<unsigned long long>(g_unwrap_failures.load()),
                          static_cast<unsigned long long>(g_returns.load()),
+                         static_cast<unsigned long long>(g_composites.load()), static_cast<unsigned long long>(g_composite_failures.load()),
                          static_cast<unsigned long long>(g_unwraps.load() ? g_unwrap_us.load() / g_unwraps.load() : 0),
                          static_cast<unsigned long long>(g_unwrap_max_us.load()),
                          static_cast<unsigned long long>(g_returns.load() ? g_return_us.load() / g_returns.load() : 0),

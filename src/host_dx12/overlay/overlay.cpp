@@ -2389,7 +2389,7 @@ bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPT
     if (idx >= g_state.backbuffer_count) return false;
     if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) {
         // DX11 game on our 11on12 device: borrow the D3D12 buffer underneath for this draw.
-        if (!borrowed || !na::on12::UnwrapBackBuffer(sc, idx, queue, out.ReleaseAndGetAddressOf(), *borrowed)) return false;
+        if (!borrowed || !na::on12::UnwrapBackBuffer(sc, idx, queue, g_state.format, out.ReleaseAndGetAddressOf(), *borrowed)) return false;
     }
     D3D12_RENDER_TARGET_VIEW_DESC rtv{};
     rtv.Format = g_state.format;
@@ -2959,44 +2959,23 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
             }
         }
     }
-    const int borrow_mode = borrowed.token ? na::on12::BorrowMode() : 0;
-    if (borrow_mode == 3) return; // menu_buffer=3 diagnostic: borrow without drawing
     if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) {
         g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
-    if (borrow_mode == 6) {
-        // menu_buffer=6 diagnostic: the full menu draw, into a texture of ours instead of the
-        // presented buffer (does any real draw on 11on12's queue stall Present, or only one
-        // that writes the back buffer?).
-        static ComPtr<ID3D12Resource> s_diag_target;
-        if (!s_diag_target) {
-            D3D12_HEAP_PROPERTIES heap{};
-            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC desc = menu_target;
-            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-            if (FAILED(g_state.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PRESENT,
-                                                              nullptr, IID_PPV_ARGS(&s_diag_target)))) {
-                g_menu_skips.buffer.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
-        D3D12_RENDER_TARGET_VIEW_DESC rtv{};
-        rtv.Format = g_state.format;
-        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        g_state.device->CreateRenderTargetView(s_diag_target.Get(), &rtv, f.rtv);
-        back_buffer = s_diag_target; // the borrowed buffer stays untouched
-    }
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = back_buffer.Get();
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    if (borrow_mode != 4) g_state.list->ResourceBarrier(1, &b);
-    if (borrow_mode != 4 && borrow_mode != 5) {
+    g_state.list->ResourceBarrier(1, &b);
     g_state.list->OMSetRenderTargets(1, &f.rtv, FALSE, nullptr);
+    if (borrowed.clear) { // 11on12 canvas: the menu goes over transparent, then D3D11 blends it on
+        const float transparent[4] = {};
+        g_state.list->ClearRenderTargetView(f.rtv, transparent, 0, nullptr);
+    }
     ID3D12DescriptorHeap* heaps[] = {g_state.srv_heap.Get()};
     g_state.list->SetDescriptorHeaps(1, heaps);
     {
@@ -3005,10 +2984,9 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     }
     ++g_state.imgui_draws; // backend advances once per RenderDrawData, even if submission fails
     if (just_opened) menu_note("menu_open: GPU draw recorded\r\n");
-    }
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    if (borrow_mode != 4) g_state.list->ResourceBarrier(1, &b);
+    g_state.list->ResourceBarrier(1, &b);
     if (FAILED(g_state.list->Close())) {
         g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
         return;

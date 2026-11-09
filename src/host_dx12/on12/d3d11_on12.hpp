@@ -39,13 +39,16 @@ ID3D12CommandQueue* QueueFor(IUnknown* device);
 // The D3D12 device behind an 11on12 device we created (AddRef'ed), or null.
 ID3D12Device* DeviceFor(IUnknown* device);
 
-// The menu draws on the back buffer as a D3D12 resource, but an 11on12 swap
-// chain only hands out D3D11 textures. Borrow the D3D12 resource underneath
-// (ID3D11On12Device2::UnwrapUnderlyingResource) for one frame, and give it
-// back with the fence that ends our draw (or none when nothing was submitted).
-// Unwrap returns false for any swap chain that is not on our 11on12 device.
+// The menu draws through D3D12, but an 11on12 swap chain only hands out D3D11
+// textures. For one frame, hand the menu a D3D12 render target
+// (ID3D11On12Device2::UnwrapUnderlyingResource) and take it back with the fence
+// that ends the menu draw. By default that target is a canvas of ours (clear it
+// first: `clear` is set), which is then blended onto the back buffer by the game's
+// D3D11 context; a D3D12 draw straight into the presented buffer stalls the
+// D3D11 present for ~2 s. Returns false for any swap chain not on our device.
 struct Borrowed {
-    void* token = nullptr; // opaque: the D3D11 back buffer + its 11on12 device
+    void* token = nullptr; // opaque
+    bool clear = false;    // the target is the canvas: clear it to transparent before drawing
     Borrowed() = default;
     Borrowed(const Borrowed&) = delete;
     Borrowed& operator=(const Borrowed&) = delete;
@@ -54,11 +57,8 @@ struct Borrowed {
     ID3D12Fence* fence = nullptr;
     unsigned long long value = 0;
 };
-bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, ID3D12Resource** out, Borrowed& borrowed);
-
-// [dx11on12] menu_buffer: 1/2 draw normally; 3 = submit nothing, 4 = submit an empty
-// list, 5 = submit only the back buffer barriers (diagnostics for the menu-open stall).
-int BorrowMode();
+bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, unsigned format, ID3D12Resource** out,
+                      Borrowed& borrowed);
 
 // One status line (no newline) for the 5-second status log.
 int FormatStatus(char* out, size_t capacity);
