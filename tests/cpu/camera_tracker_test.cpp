@@ -5,6 +5,7 @@
 #include "core/temporal_jitter.hpp"
 #include "core/motion_arbiter.hpp"
 #include "providers/camera/camera_tracker.hpp"
+#include "host_dx12/adapters/wwii/scene_camera.hpp"
 
 #include <cmath>
 
@@ -57,6 +58,46 @@ na::motion::Tier2Input MotionInput(const CameraFrame& f) {
 int main()
 {
     return test::run({
+        {"WWII scene pose beats a consumer pose a frame late", [] {
+             const Matrix projection = Perspective(true, 1);
+             const Matrix old_vp = Mul(projection, View(0.2, 0, 0, 0));
+             const Matrix current_vp = Mul(projection, View(0.25, 0, 0, 0));
+             const auto make = [](const Matrix& vp, const std::array<float, 4>& origin) {
+                 std::vector<uint8_t> bytes(1280);
+                 std::array<float, 16> column{};
+                 for (size_t r = 0; r < 4; ++r)
+                     for (size_t c = 0; c < 4; ++c) column[c * 4 + r] = float(vp[r * 4 + c]);
+                 for (size_t o : {64u, 208u, 320u}) std::memcpy(bytes.data() + o, column.data(), 64);
+                 for (size_t o : {384u, 400u, 944u, 960u}) std::memcpy(bytes.data() + o, origin.data(), 16);
+                 const float extent[]{float(W), float(H), 1.f / W, 1.f / H};
+                 std::memcpy(bytes.data() + 704, extent, sizeof(extent));
+                 return bytes;
+             };
+             const auto old_bytes = make(old_vp, {2298, -10183, -51, 0});
+             auto current_bytes = make(current_vp, {2299, -10183, -51, 0});
+             na::wwii::SceneCamera first, current, unused;
+             CHECK(na::wwii::DecodeSceneCamera(old_bytes, 1280, W, H, first));
+             CHECK(na::wwii::DecodeSceneCamera(current_bytes, 1280, W, H, current));
+             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1280, W + 1, H, unused));
+             current_bytes[944] ^= 1;
+             CHECK(!na::wwii::DecodeSceneCamera(current_bytes, 1280, W, H, unused));
+             const na::wwii::SceneCameraReceipt submitted{2005, 3, 4, 513, current};
+             CHECK(submitted.Matches(2005, 3, 4));
+             CHECK(!submitted.Matches(2006, 3, 4) && !submitted.Matches(2005, 3, 5));
+             const double zero[2]{};
+             CameraTracker fixed, late;
+             fixed.UpdateCameraRelative(first.vp, first.origin, 2004, W, H, zero);
+             late.Update(first.vp, 2004, W, H, zero);
+             const auto now = fixed.UpdateCameraRelative(submitted.camera.vp, submitted.camera.origin, 2005, W, H, zero);
+             const auto old = late.Update(first.vp, 2005, W, H, zero);
+             CHECK(now.valid && !now.camera_cut && now.position[0] == 2299);
+             CHECK(Close(now.unjittered, current_vp, 1e-6));
+             float ax{}, ay{}, bx{}, by{};
+             CHECK(na::motion::ReprojectPixel(MotionInput(now), W, H, W/2, H/2, 0.02f, &ax, &ay, nullptr));
+             CHECK(na::motion::ReprojectPixel(MotionInput(old), W, H, W/2, H/2, 0.02f, &bx, &by, nullptr));
+             CHECK(std::abs(ax) > 10.f);
+             NEAR(bx, 0.f, 0.01f);
+         }},
         {"camera-relative CBV origin reproduces world-space pixel motion", [] {
              for (bool reverse : {false, true}) for (double sign : {1.0, -1.0}) {
                  const Matrix p = Perspective(reverse, sign);

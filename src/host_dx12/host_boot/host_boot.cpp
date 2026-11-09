@@ -169,7 +169,7 @@ DWORD WINAPI InitThread(LPVOID)
         // render-small, the DLSS modes' automatic levels) are built as the game creates its
         // objects, before activation, so the saved choice works from the first frame it is
         // activated; any other choice is prepared in the background when picked.
-        na::observe::SetSamplerMipBiasLiveEnabled(!na::settings::SafeStart() && GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
+        na::observe::SetSamplerMipBiasLiveEnabled(GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
         na::observe::SetSamplerMipPrewarm(GetPrivateProfileIntW(L"j2", L"mip_prewarm", 1, g_ini) != 0);
         if (!na::settings::SafeStart()) {
             auto& st = na::settings::Get();
@@ -300,6 +300,11 @@ DWORD WINAPI InitThread(LPVOID)
     // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
+    wchar_t scene_camera_exe[MAX_PATH]{};
+    GetPrivateProfileStringW(L"host", L"executable", L"", scene_camera_exe, MAX_PATH, g_ini);
+    na::j2::EnableWwiiSceneCamera(na::j2::Configured() &&
+        GetPrivateProfileIntW(L"dx11on12", L"enabled", 0, g_ini) == 1 &&
+        lstrcmpiW(scene_camera_exe, L"s2_sp64_ship.exe") == 0);
     // P4-4 projection window ([j2] window=1): the no-slider route that windows J1's camera;
     // Layer2 stays off with it (both would change the scene's render size).
     // P4-4 render-small ([present] render_small=1, plan COMMS 4e30a94): the game renders its whole

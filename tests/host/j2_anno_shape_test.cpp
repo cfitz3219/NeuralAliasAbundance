@@ -164,7 +164,7 @@ int ProjectionShift(test::Device& d, ID3D12Resource* lens, UINT w, UINT h, bool 
 
 // Actual sampler pixels, not a no-op Dispatch or a count of created twins.
 // All waits/readbacks in this standalone diagnostic are test-only.
-int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float native_bias=0.f)
+int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float native_bias=0.f,bool dynamic=false)
 {
     test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("AF pixels");auto* dev=d.device.Get();
     REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),false));
@@ -198,7 +198,27 @@ int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float n
     D3D12_STATIC_SAMPLER_DESC ss{};ss.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;ss.AddressU=ss.AddressV=ss.AddressW=clamp?D3D12_TEXTURE_ADDRESS_MODE_CLAMP:D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     ss.MaxAnisotropy=1;ss.MaxLOD=D3D12_FLOAT32_MAX;ss.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
     ss.MipLODBias=native_bias;
-    D3D12_ROOT_SIGNATURE_DESC rd{1,&param,1,&ss,D3D12_ROOT_SIGNATURE_FLAG_NONE};test::ComPtr<ID3DBlob> blob,error,cs;test::ComPtr<ID3D12RootSignature> root;
+    D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,1,0,0,0};
+    D3D12_ROOT_PARAMETER params[2]{param,{}};
+    params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable={1,&sampler_range};
+    test::ComPtr<ID3D12DescriptorHeap> sampler_cpu, sampler_gpu;
+    if(dynamic){
+        D3D12_DESCRIPTOR_HEAP_DESC sd{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&sd,IID_PPV_ARGS(&sampler_cpu))));
+        sd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&sd,IID_PPV_ARGS(&sampler_gpu))));
+        D3D12_SAMPLER_DESC desc{};
+        desc.Filter=ss.Filter;desc.AddressU=ss.AddressU;desc.AddressV=ss.AddressV;desc.AddressW=ss.AddressW;
+        desc.MipLODBias=ss.MipLODBias;desc.MaxAnisotropy=ss.MaxAnisotropy;
+        desc.ComparisonFunc=ss.ComparisonFunc;desc.MaxLOD=ss.MaxLOD;
+        auto base=sampler_cpu->GetCPUDescriptorHandleForHeapStart();
+        dev->CreateSampler(&desc,base);
+        auto staging=base;staging.ptr+=dev->GetDescriptorHandleIncrementSize(sd.Type);
+        dev->CopyDescriptorsSimple(1,staging,base,sd.Type);
+    }
+    D3D12_ROOT_SIGNATURE_DESC rd{dynamic?2u:1u,params,dynamic?0u:1u,dynamic?nullptr:&ss,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    test::ComPtr<ID3DBlob> blob,error,cs;test::ComPtr<ID3D12RootSignature> root;
     REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error)));REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))));
     // Left: oblique 16:1 footprint. Right: isotropic 1:1 postprocess control;
     // changing AF must not alter those control pixels even with CLAMP addressing.
@@ -234,7 +254,23 @@ int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float n
         // requested PSO level before becoming active.
         if(pass==1&&!clamp&&!mip_pixels)CHECK(after.twin_pipelines-before.twin_pipelines==1);
         REQUIRE(SUCCEEDED(list.alloc->Reset()));REQUIRE(SUCCEEDED(list.list->Reset(list.alloc.Get(),pso.Get())));
-        list.list->SetComputeRootSignature(root.Get());ID3D12DescriptorHeap* heaps[]={heap.Get()};list.list->SetDescriptorHeaps(1,heaps);list.list->SetComputeRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());list.list->Dispatch(W/8,H/8,1);
+        list.list->SetComputeRootSignature(root.Get());
+        ID3D12DescriptorHeap* heaps[]={heap.Get(),sampler_gpu.Get()};
+        list.list->SetDescriptorHeaps(dynamic?2:1,heaps);
+        list.list->SetComputeRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+        if(dynamic){
+            constexpr auto type=D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            auto src=sampler_cpu->GetCPUDescriptorHandleForHeapStart();
+            src.ptr+=dev->GetDescriptorHandleIncrementSize(type);
+            const auto dest=sampler_gpu->GetCPUDescriptorHandleForHeapStart();
+            if(pass%2)dev->CopyDescriptors(1,&dest,nullptr,1,&src,nullptr,type);
+            else dev->CopyDescriptorsSimple(1,dest,src,type);
+            list.list->SetComputeRootDescriptorTable(1,sampler_gpu->GetGPUDescriptorHandleForHeapStart());
+            const auto applied=na::observe::GetMipLiveStats();
+            CHECK(applied.visible_sampler_uploads==pass+1);
+            CHECK(applied.visible_sampler_bias==(choice==0?native_bias:choice));
+        }
+        list.list->Dispatch(W/8,H/8,1);
         b=test::Transition(out.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);list.list->ResourceBarrier(1,&b);
         D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=out.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=of;list.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
@@ -283,6 +319,8 @@ int main(int argc, char** argv)
     if(argc>1&&std::strcmp(argv[1],"--mip-pixels")==0)return AnisoPixels(false,false,true);
     if(argc>1&&std::strcmp(argv[1],"--mip-pixels-native-negative")==0)return AnisoPixels(false,false,true,-1.5f);
     if(argc>1&&std::strcmp(argv[1],"--mip-pixels-native-already")==0)return AnisoPixels(false,false,true,-1.f);
+    if (argc > 1 && std::strcmp(argv[1], "--mip-dynamic-pixels") == 0) return AnisoPixels(false,false,true,0.f,true);
+    if (argc > 1 && std::strcmp(argv[1], "--mip-dynamic-native-already") == 0) return AnisoPixels(false,false,true,-1.f,true);
     const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 1;
     const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
     bool depth24 = false;

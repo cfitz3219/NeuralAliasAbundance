@@ -19,6 +19,7 @@
 #include <functional>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <system_error>
 #include <chrono>
 #include <condition_variable>
@@ -1691,6 +1692,34 @@ void note_sampler_desc(uint32_t kind, const D& d)
                                uint32_t(d.ComparisonFunc), d.MipLODBias, d.MinLOD, d.MaxLOD, 1});
 }
 
+// Only eligible game sampler slots carry this payload. Descriptor-copy shadowing
+// already preserves the slot recipe and drops it when the owning heap is retired.
+struct SamplerRecipe final : DescriptorDetails {
+    D3D12_SAMPLER_DESC desc{};
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+    D3D12_SAMPLER_DESC2 desc2{};
+    bool modern = false;
+#endif
+    float native_bias = 0.0f, stored_bias = 0.0f;
+};
+
+std::atomic<uint64_t> g_visible_sampler_uploads{0};
+std::atomic<float> g_visible_sampler_bias{0.0f};
+
+void visible_sampler_bias(float bias)
+{
+    g_visible_sampler_bias.store(bias, std::memory_order_relaxed);
+    g_visible_sampler_uploads.fetch_add(1, std::memory_order_release);
+}
+
+bool shader_visible_sampler(D3D12_CPU_DESCRIPTOR_HANDLE handle)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    uint32_t slot = 0;
+    const auto* heap = heap_for_cpu_locked(handle.ptr, &slot);
+    return heap && heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap->gpu_start;
+}
+
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     if (!t_host_work) g_sampler_calls.fetch_add(1, std::memory_order_relaxed);
@@ -1710,7 +1739,15 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
     } else {
         o_CreateSampler(dev, d, h);
     }
-    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32);
+    std::shared_ptr<SamplerRecipe> recipe;
+    if (surface && g_mip_live_enabled.load(std::memory_order_relaxed)) {
+        recipe = std::make_shared<SamplerRecipe>();
+        recipe->desc = m;
+        recipe->native_bias = d->MipLODBias;
+        recipe->stored_bias = m.MipLODBias;
+        if (shader_visible_sampler(h)) visible_sampler_bias(recipe->stored_bias);
+    }
+    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, std::move(recipe));
 }
 #if defined(__ID3D12Device11_INTERFACE_DEFINED__)
 // ID3D12Device11::CreateSampler2 (Agility SDK games): the same sampler as CreateSampler with
@@ -1736,9 +1773,76 @@ void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER
     } else {
         o_CreateSampler2(dev, d, h);
     }
-    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32);
+    std::shared_ptr<SamplerRecipe> recipe;
+    if (surface && g_mip_live_enabled.load(std::memory_order_relaxed)) {
+        recipe = std::make_shared<SamplerRecipe>();
+        recipe->desc2 = m;
+        recipe->modern = true;
+        recipe->native_bias = d->MipLODBias;
+        recipe->stored_bias = m.MipLODBias;
+        if (shader_visible_sampler(h)) visible_sampler_bias(recipe->stored_bias);
+    }
+    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, std::move(recipe));
 }
 #endif
+
+// D3D11On12 stages samplers in CPU heaps and refreshes shader-visible tables
+// with CopyDescriptors. Change only that fresh destination, within the game's
+// original write. CPU recipes stay intact, including through CPU-to-CPU copies.
+void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_t n, uint32_t inc)
+{
+    if (!n || t_host_work || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
+    const float target = g_mip_bias.load(std::memory_order_relaxed);
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+    Microsoft::WRL::ComPtr<ID3D12Device11> device11;
+#endif
+    uint32_t copied = 0;
+    while (copied < n) {
+        std::array<std::shared_ptr<const SamplerRecipe>, 16> recipes{};
+        uint32_t run = 0;
+        {
+            std::shared_lock<RegistryLock> lock(g_m);
+            uint32_t ds = 0, ss = 0;
+            const auto* dest = heap_for_cpu_locked(dst + uint64_t(copied) * inc, &ds);
+            const auto* source = heap_for_cpu_locked(src + uint64_t(copied) * inc, &ss);
+            if (!dest || !source || !dest->gpu_start || source->gpu_start ||
+                dest->type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER || source->type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) return;
+            run = std::min({n - copied, dest->count - ds, source->count - ss, uint32_t(recipes.size())});
+            SlotShared stripe;
+            for (uint32_t i = 0; i < run; ++i) {
+                stripe.lock(source, ss + i);
+                const auto& info = source->info[ss + i];
+                if (info.kind == NA_DESC_SAMPLER) recipes[i] = std::static_pointer_cast<const SamplerRecipe>(info.details);
+            }
+        }
+        if (!run) return;
+        for (uint32_t i = 0; i < run; ++i) {
+            const auto& recipe = recipes[i];
+            if (!recipe) continue;
+            float total = biased(recipe->native_bias, target);
+            if (total != recipe->stored_bias) {
+                const D3D12_CPU_DESCRIPTOR_HANDLE handle{dst + uint64_t(copied + i) * inc};
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+                if (recipe->modern) {
+                    if (!device11) dev->QueryInterface(IID_PPV_ARGS(&device11));
+                    if (device11) {
+                        auto desc = recipe->desc2;
+                        desc.MipLODBias = total;
+                        o_CreateSampler2(device11.Get(), &desc, handle);
+                    } else total = recipe->stored_bias;
+                } else
+#endif
+                {
+                    auto desc = recipe->desc;
+                    desc.MipLODBias = total;
+                    o_CreateSampler(dev, &desc, handle);
+                }
+            }
+            visible_sampler_bias(total);
+        }
+        copied += run;
+    }
+}
 
 void STDMETHODCALLTYPE D_CopyDescriptors(ID3D12Device* dev, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* ds, const UINT* dsz, UINT ns,
                                          const D3D12_CPU_DESCRIPTOR_HANDLE* ss, const UINT* ssz, D3D12_DESCRIPTOR_HEAP_TYPE type)
@@ -1753,7 +1857,9 @@ void STDMETHODCALLTYPE D_CopyDescriptors(ID3D12Device* dev, UINT nd, const D3D12
         if (doff >= dlen) { ++di; doff = 0; continue; }
         if (soff >= slen) { ++si; soff = 0; continue; }
         const uint32_t run = std::min(dlen - doff, slen - soff);
-        note_descriptor_copy(ds[di].ptr + static_cast<uint64_t>(doff) * inc, ss[si].ptr + static_cast<uint64_t>(soff) * inc, run, inc);
+        const uint64_t dst = ds[di].ptr + uint64_t(doff) * inc, src = ss[si].ptr + uint64_t(soff) * inc;
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) apply_sampler_upload(dev, dst, src, run, inc);
+        note_descriptor_copy(dst, src, run, inc);
         doff += run;
         soff += run;
     }
@@ -1763,7 +1869,9 @@ void STDMETHODCALLTYPE D_CopyDescriptorsSimple(ID3D12Device* dev, UINT n, D3D12_
                                                D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
     o_CopyDescriptorsSimple(dev, n, dst, src, type);
-    note_descriptor_copy(dst.ptr, src.ptr, n, descriptor_increment(dev, type));
+    const uint32_t inc = descriptor_increment(dev, type);
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) apply_sampler_upload(dev, dst.ptr, src.ptr, n, inc);
+    note_descriptor_copy(dst.ptr, src.ptr, n, inc);
 }
 
 HRESULT STDMETHODCALLTYPE D_CreateCommittedResource(ID3D12Device* dev, const D3D12_HEAP_PROPERTIES* p, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d,
@@ -7831,6 +7939,8 @@ MipLiveStats GetMipLiveStats()
     m.enabled = g_mip_live_enabled.load(std::memory_order_relaxed);
     m.game_bias = 0.0f;
     m.live_bias = kMipLevels[var_level(live)];
+    m.visible_sampler_uploads = g_visible_sampler_uploads.load(std::memory_order_acquire);
+    m.visible_sampler_bias = g_visible_sampler_bias.load(std::memory_order_relaxed);
     m.want_bias = kMipLevels[var_level(want)];
     m.want_aniso = kAfLevels[var_af(want)];
     m.live_aniso = kAfLevels[var_af(live)];

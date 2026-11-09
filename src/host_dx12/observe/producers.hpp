@@ -302,6 +302,8 @@ bool WaitSamplerVariant(uint32_t timeout_ms);
 struct MipLiveStats {
     bool enabled = false;
     float game_bias = 0, live_bias = 0;  // game_bias: the game's own objects (always unbiased now)
+    uint64_t visible_sampler_uploads = 0;
+    float visible_sampler_bias = 0;
     float want_bias = 0;                 // chosen; live_bias is the one in use (differs while preparing)
     uint32_t want_aniso = 0, live_aniso = 0;
     bool preparing = false;

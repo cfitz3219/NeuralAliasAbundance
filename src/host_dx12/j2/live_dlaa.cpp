@@ -43,6 +43,7 @@
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "providers/camera/camera_tracker.hpp"
+#include "host_dx12/adapters/wwii/scene_camera.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -213,6 +214,8 @@ struct State {
     na::camera::Matrix cam_u0{}, cam_u1{}; // unjittered VPs of the last two read frames (u1 newest)
     uint64_t cam_f0 = 0, cam_f1 = 0;       // their frames (0 = none)
     bool cam_rev = false;
+    std::atomic<bool> wwii_scene_camera{false};
+    na::wwii::SceneCameraReceipt wwii_submitted_camera;
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
     uint64_t eval_selection_version = 0; // live selection version of the last committed evaluation
@@ -2998,6 +3001,41 @@ void dump_camera_inputs(const std::vector<const Block*>& order, na_object_id dep
                        (unsigned long long)count, total, path);
 }
 
+// Only consider this adapter on the translated campaign path. The pixel
+// constants of the scene-producing list carry the current world pose; the
+// VP-only slot on the list reading the scene can lag that pose by a frame.
+na::wwii::SceneCameraReceipt wwii_scene_camera(ID3D12CommandList* list, uint64_t color,
+                                              uint64_t depth, uint32_t writes)
+{
+    if (!writes || !na::observe::ListRendersTo(list, color, depth)) return {};
+    const auto binds = na::observe::ListRootConstantBuffers(list);
+    std::map<std::pair<uint64_t, uint64_t>, Block> candidates;
+    for (const auto& b : binds) {
+        if (!b.table || b.param != 0 || (b.size != 1280 && b.size != 1536)) continue;
+        auto& block = candidates[{b.resource, b.offset}];
+        block.resource = b.resource; block.offset = b.offset; block.size = b.size;
+        ++block.uses;
+    }
+    if (candidates.empty()) return {};
+    std::vector<const Block*> order;
+    order.reserve(candidates.size());
+    for (const auto& candidate : candidates) order.push_back(&candidate.second);
+    constexpr size_t max_reads = 16;
+    const size_t reads = std::min(order.size(), max_reads);
+    std::partial_sort(order.begin(), order.begin() + reads, order.end(),
+        [](const Block* a, const Block* b) { return a->uses > b->uses; });
+    std::vector<uint8_t> bytes(1024);
+    for (size_t i = 0; i < reads; ++i) {
+        const auto& block = *order[i];
+        bytes.resize(1024);
+        bytes.resize(na::observe::ReadBuffer(block.resource, block.offset, bytes.data(), 1024));
+        na::wwii::SceneCamera camera;
+        if (na::wwii::DecodeSceneCamera(bytes, block.size, g.scene_w, g.scene_h, camera))
+            return {g.frame, color, depth, writes, camera};
+    }
+    return {};
+}
+
 bool check_learned(const std::vector<uint8_t>& bytes, na::camera::Matrix* vp, bool* reversed)
 {
     const size_t n = bytes.size();
@@ -3743,8 +3781,25 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (saved && saved->has_camera) { vp = saved->vp; reversed = saved->reversed; }
     if (repeat_only) { vp = g.cam_u1; reversed = g.cam_rev; held = true; } // no camera search: the last one is only a placeholder
     na::j2::InterloperFilter judged = g.interlopers;
-    const bool found = repeat_only || (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed, &judged));
-    if (saved && saved->judged && !repeat_only) judged = saved->interlopers;
+    na::wwii::SceneCameraReceipt world_camera;
+    if (inl && !repeat_only && vpj_mode() && g.wwii_scene_camera.load(std::memory_order_relaxed)) {
+        if (g.wwii_submitted_camera.Matches(g.frame, color_id, depth_id))
+            world_camera = g.wwii_submitted_camera;
+        if (lists && lists[scene]) {
+            const auto draws = na::observe::ListInsertionDecision(lists[scene], color_id).writes;
+            if (draws > world_camera.writes) {
+                const auto current = wwii_scene_camera(lists[scene], color_id, depth_id, draws);
+                if (current.writes) world_camera = current;
+            }
+        }
+    }
+    if (world_camera.writes) {
+        vp = world_camera.camera.vp;
+        reversed = true;
+    }
+    const bool found = world_camera.writes || repeat_only ||
+        (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed, &judged));
+    if (!world_camera.writes && saved && saved->judged && !repeat_only) judged = saved->interlopers;
     if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
         // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
         // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
@@ -3904,14 +3959,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (tracker_restart) pending.tracker.Reset();
     na::camera::CameraTracker::Limits lim{};
     lim.max_frame_gap = max_gap;
-    lim.confirm_cuts = true; // a one-frame camera jump is held, not reset (f905099: 418 motion cuts)
+    lim.confirm_cuts = !world_camera.writes; // a verified scene-pose cut belongs to the current frame
     if (g.submitted_frame && g.frame > g.submitted_frame + 1) { // per-frame motion limits over the whole step
         const double steps = static_cast<double>((std::min)(g.frame - g.submitted_frame, max_gap));
         lim.max_translation *= steps;
         lim.max_rotation = (std::min)(lim.max_rotation * steps, 3.0);
     }
     if (same_epoch && g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames && !tracker_restart) ++g.stats.gap_bridged;
-    na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim); // active extent
+    const auto* origin = world_camera.writes ? &world_camera.camera.origin : nullptr;
+    na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim, origin);
     if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
     bool viewport_sample_known=false;
     if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
@@ -7269,6 +7325,7 @@ void SetEnabled(bool on)
     if (on) na::observe::SetTableBindCallback(&on_table_bind);
     na::observe::SetEntryCallback(on?&on_entry:nullptr);
 }
+void EnableWwiiSceneCamera(bool on) { g.wwii_scene_camera.store(on, std::memory_order_relaxed); }
 bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
 PhysicalReport::~PhysicalReport()
 {
@@ -7822,6 +7879,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             else { if (g.q_run>=g_quality_warmup) g_nb.q_drops.fetch_add(1,std::memory_order_relaxed); g.q_run=0; }
         }
         ++g.frame;
+        g.wwii_submitted_camera = {};
         g.native_deferred = {};
         vpj_advance();
         replay_probe_frame();
@@ -7893,6 +7951,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             g.scene_h = cd.Height;
         }
     }
+    na::wwii::SceneCameraReceipt scene_camera_to_submit;
     if (selected_color && selected_depth) for (UINT i = 0; i < count; ++i) {
         if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
@@ -7926,6 +7985,14 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             sum.boundary_signature = decision.final_candidate ? sig : 0;
             g.frame_agg.AddList(sum);
             if (sum.renders_scene) {
+                if (g.inline_mode && g.queue.Get() == queue && g.wwii_scene_camera.load(std::memory_order_relaxed) && vpj_mode()) {
+                    const uint32_t submitted_writes = g.wwii_submitted_camera.Matches(g.frame, selected_color, selected_depth) ?
+                        g.wwii_submitted_camera.writes : 0;
+                    if (decision.writes > std::max(submitted_writes, scene_camera_to_submit.writes)) {
+                        const auto camera = wwii_scene_camera(lists[i], selected_color, selected_depth, decision.writes);
+                        if (camera.writes) scene_camera_to_submit = camera;
+                    }
+                }
                 // Present must be attributable to learn, and every route needs DLSS:
                 // start it here (host-work scope), never from Present.
                 if (!g.device) ensure_device(queue);
@@ -8045,8 +8112,15 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         na::capture::j2::Discard(pending.capture, false);
         lock.unlock();
         forward(queue, count, lists);
-        if (!has) return;
+        if (!has && !scene_camera_to_submit.writes) return;
         lock.lock();
+        // A recording only contributes its pose after forwarding the work on
+        // the scene queue. If Present closed the frame meanwhile, drop it.
+        if (scene_camera_to_submit.Matches(g.frame, selected_color, selected_depth) &&
+            (!g.wwii_submitted_camera.Matches(g.frame, selected_color, selected_depth) ||
+             scene_camera_to_submit.writes > g.wwii_submitted_camera.writes))
+            g.wwii_submitted_camera = scene_camera_to_submit;
+        if (!has) return;
         g.tracker = g.inl.history.tracker;
         if (g.inl.history.has_interlopers) g.interlopers = g.inl.history.interlopers;
         g.eval_selection_version = g.inl.history.selection_version;

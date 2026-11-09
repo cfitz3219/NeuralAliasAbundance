@@ -937,7 +937,12 @@ void DrawLiveDlaa()
     BeginGroupBox("Live DLAA");
     bool on = !na::j2::Paused();
     BeginRow("NeuralAlias DLAA (test)", "NVIDIA DLSS at full resolution on this game's 3D picture. Switch off to compare.", SwitchWidth());
-    if (Switch("j2", &on)) na::j2::SetPaused(!on);
+    if (Switch("j2", &on)) {
+        na::j2::SetPaused(!on);
+        const auto mip = na::observe::GetMipLiveStats();
+        if (mip.enabled && !na::j2::RenderSmall() && na::settings::Get().j2_scale_mode.load() == 0)
+            na::observe::SetSamplerMipBiasLive(on ? -1.0f : 0.0f);
+    }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
     if (na::scale::native::Available()||na::scale::SliderRouteActive()||na::scale::GetAutomaticSceneStats().enabled||na::j2::ProjectionWindow()||na::j2::RenderSmall()) {
@@ -1187,14 +1192,23 @@ void DrawLiveDlaaEnhancements()
         }
     }
     {
-        // The automatic number is the TOTAL, including the native sampler's
-        // value. Display the selected target plainly, not as a disabled control.
         const auto ml = na::observe::GetMipLiveStats();
-        BeginRow("Texture mip bias", "Automatic total for the current mode, including the game's own bias. DLAA: -1.00; Quality: -1.58; Balanced: -2.00; Performance: -2.25. If the game already uses -1, Quality adjusts it by only another -0.58. Updates live with the quality mode.", S(120));
-        PushTitle();ImGui::TextColored(kText,"%.2f",ml.want_bias);PopFont();
+        BeginRow("Texture mip bias", "The total we target on eligible material samplers. DLAA targets -1.00. A sampler already at the target keeps its value.", S(120));
+        PushTitle();
+        if (ml.want_bias == 0.0f) ImGui::TextColored(kText, "Game's own");
+        else ImGui::TextColored(kText, "Target %.2f", ml.want_bias);
+        PopFont();
         EndRow();
-        if(ml.preparing){char text[128];std::snprintf(text,sizeof text,"Applying %.2f; the current total is %.2f until preparation finishes.",ml.want_bias,ml.live_bias);Hint(text);}
-        else Hint("Automatic total, including the game's own bias.");
+        if (ml.visible_sampler_uploads) {
+            char text[96];
+            std::snprintf(text, sizeof text, "Last material sampler uploaded to the GPU: %.2f", ml.visible_sampler_bias);
+            Hint(text);
+        } else if (ml.live_static_changed && ml.bound_pso_twin) {
+            char text[96];
+            std::snprintf(text, sizeof text, "Prepared static sampler target: %.2f", ml.live_bias);
+            Hint(text);
+        } else Hint("Waiting for an observed material sampler.");
+        if (ml.preparing) Hint("Preparing static sampler variants.");
         if (!ml.enabled) StatusLine(2, "Live texture adjustments are disabled for this session.");
     }
     {
