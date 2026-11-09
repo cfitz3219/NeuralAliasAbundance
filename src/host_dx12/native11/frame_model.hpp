@@ -99,6 +99,7 @@ struct Selection {
 struct ListSummary {
     uint32_t color_reads = 0;            // reads of the selected colour in this list
     uint32_t scene_draws_before_first_read = 0;
+    uint32_t color_writes_before_first_read = 0; // any draw into the selected colour (scene or not)
     uint32_t scene_draws = 0;
 };
 
@@ -144,8 +145,9 @@ public:
     {
         if (fired_ || !sel_.valid() || !learned_read_ || !l.color_reads) return false;
         if (color_reads_ >= learned_read_ || color_reads_ + l.color_reads < learned_read_) return false;
-        if (color_reads_ + 1 != learned_read_ || l.scene_draws_before_first_read) {
-            // The target read is inside this list, after scene work in the same list.
+        if (color_reads_ + 1 != learned_read_ || l.scene_draws_before_first_read || l.color_writes_before_first_read) {
+            // The target read is inside this list, after scene work or other writes to the scene
+            // colour in the same list: inputs copied before the list would be stale (Astra's rule).
             ++stats_.unplaceable;
             unplaceable_this_frame_ = true;
             stats_.last_miss = "The scene colour is read inside a command list that also draws the scene; no place to insert.";
@@ -172,6 +174,7 @@ public:
         ListSummary s;
         for (const Event& e : events) {
             if (e.kind == Kind::Read && sel_.color && e.resource == sel_.color) ++s.color_reads;
+            if (e.kind == Kind::Draw && sel_.color && e.rt0 == sel_.color && !s.color_reads) ++s.color_writes_before_first_read;
             if (e.kind == Kind::Draw && IsSceneDraw(e)) {
                 ++s.scene_draws;
                 if (!s.color_reads) ++s.scene_draws_before_first_read;

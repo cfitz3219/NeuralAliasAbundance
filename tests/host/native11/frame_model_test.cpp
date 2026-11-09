@@ -177,6 +177,17 @@ int main()
         for (const auto& e : f) m.Feed(e);
         m.EndFrame();
         expect(!fired_all && m.GetStats().unplaceable == 1, "deferred: scene and tonemap in one list is refused with a reason");
+        // A list whose first colour read follows a non-scene draw into the colour (e.g. a decal or
+        // sky pass with no depth test): inputs copied before it would be stale, so also refused.
+        std::vector<Event> scene2(f.begin(), f.begin() + long(split)), post2(f.begin() + long(split), f.end());
+        Event late = Draw(kColor, 0, 6);
+        late.depth_test = false;
+        post2.insert(post2.begin(), late);
+        for (const auto& e : scene2) m.Feed(e);
+        const bool fired_written = m.ShouldFireBeforeList(m.Summarize(post2));
+        for (const auto& e : post2) m.Feed(e);
+        m.EndFrame();
+        expect(!fired_written && m.GetStats().unplaceable == 2, "deferred: a colour write before the first read in the list is refused");
     }
     // ---- too-early point is detected ----
     {

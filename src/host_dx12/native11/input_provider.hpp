@@ -28,9 +28,11 @@ using Id = uint64_t; // identity of a game resource (its ID3D11Resource pointer)
 
 struct TextureFacts {
     Id resource = 0;
+    uint64_t incarnation = 0;       // this object's lifetime id: a new object at a reused address gets a new value
     void* d3d11_resource = nullptr; // ID3D11Resource*, borrowed for the duration of the callback
-    uint32_t width = 0, height = 0;  // the texture's size
-    uint32_t active_w = 0, active_h = 0; // the scene's viewport extent inside it (dynamic resolution)
+    uint32_t width = 0, height = 0;  // base (mip 0) extent of the texture; mip/array_slice pick the subresource
+    uint32_t active_x = 0, active_y = 0; // the scene viewport's origin inside that subresource
+    uint32_t active_w = 0, active_h = 0; // the scene viewport's extent inside it (dynamic resolution)
     uint32_t format = 0;             // DXGI_FORMAT as created (may be typeless)
     uint32_t view_format = 0;        // DXGI_FORMAT of the view the scene used (RTV/DSV), typed
     uint32_t samples = 1;
@@ -41,6 +43,7 @@ struct CameraFacts {
     Id buffer = 0;                 // the constant buffer the scene draws read the camera from
     int vs_slot = -1;              // VS slot it was bound at
     uint32_t first_constant = 0;   // offset binding (VSSetConstantBuffers1), in 16-byte constants
+    uint32_t num_constants = 0;    // constants readable from first_constant (0 = whole buffer, plain bind)
     uint64_t version = 0;          // content version of the bytes below (bumps on every update)
     const uint8_t* bytes = nullptr; // CPU copy of the bytes the game uploaded (Map/Unmap or UpdateSubresource
     uint32_t size = 0;              // source data), never a GPU readback; valid for the callback only
@@ -50,21 +53,24 @@ struct CameraFacts {
 
 enum class Boundary : uint8_t {
     BeforeRead,  // before the first read of the scene colour after its last scene draw (preferred)
-    BeforeList,  // before ExecuteCommandList whose first colour read is that read (deferred contexts)
+    BeforeList,  // before ExecuteCommandList whose first colour read is that read (deferred contexts);
+                 // only when the scene's draws were all submitted before the list and the list writes
+                 // nothing to the scene colour before that read. Otherwise the frame is unplaceable.
     BeforeHud,   // scene-in-back-buffer games: before the first non-scene draw into the colour
 };
 
 struct SceneFrame {
     uint64_t frame = 0;            // provider frame counter (advances at Present)
+    uint64_t stream = 0;           // input stream id: stays while colour/depth/camera objects stay; new on any change
     TextureFacts color, depth;
     bool reversed_depth = false;   // from the depth func/clear value of the scene draws
     CameraFacts camera;
     Boundary boundary = Boundary::BeforeRead;
     uint32_t scene_draws = 0;      // scene draws this frame before the boundary
-    bool selection_changed = false; // colour/depth/camera choice differs from the previous frame (reset history)
+    bool selection_changed = false; // stream differs from the previous fired frame (reset history)
 };
 
-// The consumer (B2). Return false if this frame was not evaluated (the provider counts the reason).
+// The consumer (B2). It copies what it keeps (COM refs, camera bytes) during the callback. Return false if this frame was not evaluated (the provider counts the reason).
 // `context` is the game's ID3D11DeviceContext* (immediate). The consumer may record D3D11 work on it.
 using SceneCallback = bool (*)(void* user, void* context, const SceneFrame& frame);
 

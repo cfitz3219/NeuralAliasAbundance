@@ -75,7 +75,8 @@ struct Ctx {
     bool depth_test = true;
     Id vs_cb[kCbSlots] = {};
     uint32_t vs_first[kCbSlots] = {}; // VSSetConstantBuffers1 first constant per slot
-    float vp_w = 0, vp_h = 0;         // viewport 0
+    float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0; // viewport 0
+    uint32_t vs_num[kCbSlots] = {};   // VSSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
     std::vector<std::pair<size_t, std::vector<uint8_t>>> cb_bytes; // (event index, bytes) for CbUpdate events
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
@@ -85,7 +86,8 @@ struct Ctx {
         depth_test = true;
         std::memset(vs_cb, 0, sizeof(vs_cb));
         std::memset(vs_first, 0, sizeof(vs_first));
-        vp_w = vp_h = 0;
+        std::memset(vs_num, 0, sizeof(vs_num));
+        vp_x = vp_y = vp_w = vp_h = 0;
     }
 };
 struct ListRecord {
@@ -112,12 +114,16 @@ std::atomic<Id> g_sel_color{0};    // readable from any thread
 
 std::atomic<Id> g_cand[kMaxCandidates + 1] = {};
 std::unordered_map<Id, std::vector<uint8_t>> g_cb_latest;
+std::unordered_map<Id, uint64_t> g_cb_incarnation; // candidate camera buffers: lifetime id, tagged at upload (live object)
 std::map<std::pair<Id, uint32_t>, std::vector<uint8_t>> g_cb_versions;
 
 ComPtr<ID3D11Resource> g_color_ref, g_depth_ref;
 ViewUse g_color_view, g_depth_view;
-float g_scene_vp_w = 0, g_scene_vp_h = 0; // viewport of the immediate context's scene draws this frame
+float g_scene_vp_x = 0, g_scene_vp_y = 0, g_scene_vp_w = 0, g_scene_vp_h = 0; // scene viewport this frame
 uint32_t g_camera_first = 0;              // first constant of the camera binding at the last scene draw
+uint32_t g_camera_num = 0;                // its constant count (0 = whole buffer)
+uint64_t g_stream = 0;                    // SceneFrame::stream; bumps when any input object changes
+uint64_t g_stream_key[3] = {};            // incarnations of colour, depth, camera buffer behind g_stream
 
 CameraPick g_camera;
 Selection g_last_selection;
@@ -148,6 +154,22 @@ void SetReason(const char* r)
 }
 
 Id IdOf(ID3D11Resource* r) { return reinterpret_cast<Id>(r); }
+
+// Lifetime id of a D3D11 object, kept in its private data: an object created at a freed object's
+// address has no tag yet and gets a new value, which the pointer alone cannot tell apart.
+// {6b0f8a2e-3c1d-4e57-9a40-7d2b51c9e3f1}
+const GUID kIncarnationGuid = {0x6b0f8a2e, 0x3c1d, 0x4e57, {0x9a, 0x40, 0x7d, 0x2b, 0x51, 0xc9, 0xe3, 0xf1}};
+std::atomic<uint64_t> g_next_incarnation{1};
+uint64_t IncarnationOf(ID3D11DeviceChild* o)
+{
+    if (!o) return 0;
+    uint64_t v = 0;
+    UINT size = sizeof(v);
+    if (SUCCEEDED(o->GetPrivateData(kIncarnationGuid, &size, &v)) && size == sizeof(v) && v) return v;
+    v = g_next_incarnation.fetch_add(1, std::memory_order_relaxed);
+    o->SetPrivateData(kIncarnationGuid, sizeof(v), &v);
+    return v;
+}
 Id ResourceOfView(ID3D11View* v)
 {
     if (!v) return 0;
@@ -332,8 +354,13 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     ++g_stats.camera_found;
     SceneFrame f;
     f.frame = g_frame;
-    const auto texture = [](TextureFacts& t, ID3D11Resource* r, const ResourceInfo& info, const ViewUse& view, float vw, float vh) {
+    const auto texture = [](TextureFacts& t, ID3D11Resource* r, const ResourceInfo& info, const ViewUse& view) {
+        const float vx = g_scene_vp_x, vy = g_scene_vp_y, vw = g_scene_vp_w, vh = g_scene_vp_h;
         t.resource = IdOf(r);
+        {
+            Inside in;
+            t.incarnation = IncarnationOf(r);
+        }
         t.d3d11_resource = r;
         t.width = info.width;
         t.height = info.height;
@@ -343,18 +370,21 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         t.mip = view.mip;
         t.array_slice = view.slice;
         const uint32_t mw = std::max(1u, info.width >> view.mip), mh = std::max(1u, info.height >> view.mip);
-        t.active_w = vw >= 1.f ? std::min(mw, static_cast<uint32_t>(vw + 0.5f)) : mw;
-        t.active_h = vh >= 1.f ? std::min(mh, static_cast<uint32_t>(vh + 0.5f)) : mh;
+        t.active_x = vx > 0.f ? std::min(mw - 1, static_cast<uint32_t>(vx + 0.5f)) : 0;
+        t.active_y = vy > 0.f ? std::min(mh - 1, static_cast<uint32_t>(vy + 0.5f)) : 0;
+        t.active_w = vw >= 1.f ? std::min(mw - t.active_x, static_cast<uint32_t>(vw + 0.5f)) : mw - t.active_x;
+        t.active_h = vh >= 1.f ? std::min(mh - t.active_y, static_cast<uint32_t>(vh + 0.5f)) : mh - t.active_y;
     };
     // Our own references for the callback's duration (nothing another thread does can free them).
     const ComPtr<ID3D11Resource> color = g_color_ref, depth = g_depth_ref;
-    texture(f.color, color.Get(), sel.color_info, g_color_view, g_scene_vp_w, g_scene_vp_h);
-    texture(f.depth, depth.Get(), sel.depth_info, g_depth_view, g_scene_vp_w, g_scene_vp_h);
+    texture(f.color, color.Get(), sel.color_info, g_color_view);
+    texture(f.depth, depth.Get(), sel.depth_info, g_depth_view);
     f.reversed_depth = cam.reversed;
     std::vector<uint8_t> camera_bytes(*bytes); // the callback runs without g_mu
     f.camera.buffer = sel.camera_cb;
     f.camera.vs_slot = sel.camera_slot;
     f.camera.first_constant = g_camera_first;
+    f.camera.num_constants = g_camera_num;
     f.camera.version = version;
     f.camera.bytes = camera_bytes.data();
     f.camera.size = static_cast<uint32_t>(camera_bytes.size());
@@ -363,8 +393,20 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.camera.jitter_px[1] = g_jitter_written ? static_cast<float>(g_jitter.y_pixels) : 0.f;
     f.boundary = boundary;
     f.scene_draws = g_model.SceneDrawsThisFrame();
-    f.selection_changed = sel.color != g_last_selection.color || sel.depth != g_last_selection.depth ||
-                          sel.camera_cb != g_last_selection.camera_cb;
+    // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
+    // tagged when the game last uploaded to it.
+    uint64_t cam_inc = 0;
+    if (sel.camera_cb) {
+        auto it = g_cb_incarnation.find(sel.camera_cb);
+        cam_inc = it != g_cb_incarnation.end() ? it->second : sel.camera_cb;
+    }
+    const uint64_t key[3] = {f.color.incarnation, f.depth.incarnation, cam_inc};
+    f.selection_changed = !g_stream || std::memcmp(key, g_stream_key, sizeof(key)) != 0;
+    if (f.selection_changed) {
+        ++g_stream;
+        std::memcpy(g_stream_key, key, sizeof(key));
+    }
+    f.stream = g_stream;
     g_last_selection = sel;
     const SceneCallback cb = g_cb;
     void* user = g_cb_user;
@@ -422,9 +464,14 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         std::lock_guard<std::mutex> l(g_mu);
         const Selection& s = g_model.Current();
         if (e.depth == s.depth) {
+            g_scene_vp_x = x->vp_x;
+            g_scene_vp_y = x->vp_y;
             g_scene_vp_w = x->vp_w;
             g_scene_vp_h = x->vp_h;
-            if (s.camera_slot >= 0 && s.camera_slot < kCbSlots) g_camera_first = x->vs_first[s.camera_slot];
+            if (s.camera_slot >= 0 && s.camera_slot < kCbSlots) {
+                g_camera_first = x->vs_first[s.camera_slot];
+                g_camera_num = x->vs_num[s.camera_slot];
+            }
         }
     }
     Emit(x, c, e);
@@ -477,6 +524,16 @@ void CbUpdate(ID3D11DeviceContext* c, ID3D11Resource* r, const void* bytes, size
     e.kind = Kind::CbUpdate;
     e.resource = IdOf(r);
     const bool keep = IsCandidate(e.resource) && bytes && size;
+    if (keep) {
+        uint64_t inc = 0;
+        {
+            Inside in;
+            inc = IncarnationOf(r);
+        }
+        std::lock_guard<std::mutex> l(g_mu);
+        if (g_cb_incarnation.size() > 256) g_cb_incarnation.clear();
+        g_cb_incarnation[e.resource] = inc;
+    }
     Emit(x, c, e, keep ? bytes : nullptr, keep ? std::min(size, kMaxCbBytes) : 0);
 }
 bool IsConstantBuffer(ID3D11Resource* r, UINT* size)
@@ -534,7 +591,7 @@ void STDMETHODCALLTYPE VSSetConstantBuffers_d(ID3D11DeviceContext* c, UINT start
 {
     Ctx* x = Get(c);
     if (x && b)
-        for (UINT i = 0; i < n && start + i < static_cast<UINT>(kCbSlots); ++i) { x->vs_cb[start + i] = IdOf(b[i]); x->vs_first[start + i] = 0; }
+        for (UINT i = 0; i < n && start + i < static_cast<UINT>(kCbSlots); ++i) { x->vs_cb[start + i] = IdOf(b[i]); x->vs_first[start + i] = 0; x->vs_num[start + i] = 0; }
     O(c, x).vs_cb(c, start, n, b);
 }
 void STDMETHODCALLTYPE VSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT start, UINT n, ID3D11Buffer* const* b, const UINT* first,
@@ -545,6 +602,7 @@ void STDMETHODCALLTYPE VSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT sta
         for (UINT i = 0; i < n && start + i < static_cast<UINT>(kCbSlots); ++i) {
             x->vs_cb[start + i] = IdOf(b[i]);
             x->vs_first[start + i] = first ? first[i] : 0;
+            x->vs_num[start + i] = first && num ? num[i] : 0;
         }
     O(c, x).vs_cb1(c, start, n, b, first, num);
 }
@@ -745,6 +803,8 @@ void STDMETHODCALLTYPE RSSetViewports_d(ID3D11DeviceContext* c, UINT n, const D3
 {
     Ctx* x = Get(c);
     if (x) {
+        x->vp_x = n && v ? v[0].TopLeftX : 0.f;
+        x->vp_y = n && v ? v[0].TopLeftY : 0.f;
         x->vp_w = n && v ? v[0].Width : 0.f;
         x->vp_h = n && v ? v[0].Height : 0.f;
     }
@@ -879,7 +939,7 @@ void OnPresent(IDXGISwapChain* swap)
     while (k < kMaxCandidates + 1) g_cand[k++].store(0);
     g_cb_versions.clear();
     g_sel_color.store(s.color, std::memory_order_relaxed);
-    g_scene_vp_w = g_scene_vp_h = 0;
+    g_scene_vp_x = g_scene_vp_y = g_scene_vp_w = g_scene_vp_h = 0;
     // Next frame's jitter: the backend's sample, written into the main camera's uploads.
     g_jitter_written = false;
     g_jitter_active = g_jitter_requested && g_camera.found;
