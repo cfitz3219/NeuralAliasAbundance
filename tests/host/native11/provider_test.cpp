@@ -52,6 +52,9 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 p = float2((id & 1) ? 0.5 : -0.5, (id & 2) ? 0.5 : -0.5) + offset.xy;
     return float4(p, 0.5, 1.0) + vp[0] * 0.0; // the camera block is bound and referenced
 }
+float4 vs_post(uint id : SV_VertexID) : SV_Position {
+    return float4((id & 1) ? 1.0 : -1.0, (id & 2) ? 1.0 : -1.0, 0.5, 1.0);
+}
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
@@ -95,7 +98,7 @@ struct Game {
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
     ComPtr<ID3D11ShaderResourceView> color_srv;
     ComPtr<ID3D11Buffer> cam_cb, obj_cb;
-    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11VertexShader> vs, vs_post;
     ComPtr<ID3D11PixelShader> ps_scene, ps_tonemap, ps_hud;
     ComPtr<ID3D11BlendState> blend;
     na::camera::Matrix last_written{};
@@ -170,8 +173,10 @@ bool MakeGame(Game& g, bool warp)
     b.ByteWidth = 16;
     g.device->CreateBuffer(&b, nullptr, &g.obj_cb);
     auto vs = Compile("vs", "vs_5_0"), pss = Compile("ps_scene", "ps_5_0"), pst = Compile("ps_tonemap", "ps_5_0"), psh = Compile("ps_hud", "ps_5_0");
-    if (!vs || !pss || !pst || !psh) return false;
+    auto vsp = Compile("vs_post", "vs_5_0");
+    if (!vs || !vsp || !pss || !pst || !psh) return false;
     g.device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g.vs);
+    if (FAILED(g.device->CreateVertexShader(vsp->GetBufferPointer(), vsp->GetBufferSize(), nullptr, &g.vs_post))) return false;
     g.device->CreatePixelShader(pss->GetBufferPointer(), pss->GetBufferSize(), nullptr, &g.ps_scene);
     g.device->CreatePixelShader(pst->GetBufferPointer(), pst->GetBufferSize(), nullptr, &g.ps_tonemap);
     g.device->CreatePixelShader(psh->GetBufferPointer(), psh->GetBufferSize(), nullptr, &g.ps_hud);
@@ -181,6 +186,7 @@ bool MakeGame(Game& g, bool warp)
     bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     bd.RenderTarget[0].BlendOp = bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     bd.RenderTarget[0].SrcBlendAlpha = bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     g.device->CreateBlendState(&bd, &g.blend);
     return g.shadow_dsv && g.shadow_rtv && g.cam_cb && g.obj_cb && g.blend && MakeTargets(g);
@@ -249,6 +255,8 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
 
 void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 {
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    c->VSSetShader(g.vs_post.Get(), nullptr, 0);
     // Tonemap: reads the scene colour (the insertion point is just before this bind).
     ID3D11RenderTargetView* bb = g.back_rtv.Get();
     c->OMSetRenderTargets(1, &bb, nullptr);
@@ -270,6 +278,11 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 
 void Pump()
 {
+#if defined(NA_TEST_NATIVE_DLAA)
+    // Exercise the target cadence without flooding the fixed in-flight ring
+    // from an invisible, uncapped test window.
+    Sleep(20);
+#endif
     MSG m;
     while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
 }
@@ -342,17 +355,18 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
 }
 
 // Reads one pixel of the consumer's copy (R16G16B16A16_FLOAT, x = 0, y = 0).
-bool ReadCopy(Game& g, float out[4])
+bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
 {
-    if (!g_seen.copy) return false;
+    if (!source) source = g_seen.copy.Get();
+    if (!source) return false;
     D3D11_TEXTURE2D_DESC d{};
-    g_seen.copy->GetDesc(&d);
+    source->GetDesc(&d);
     d.Usage = D3D11_USAGE_STAGING;
     d.BindFlags = 0;
     d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     ComPtr<ID3D11Texture2D> st;
     if (FAILED(g.device->CreateTexture2D(&d, nullptr, &st))) return false;
-    g.ctx->CopyResource(st.Get(), g_seen.copy.Get());
+    g.ctx->CopyResource(st.Get(), source);
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(g.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
     const uint16_t* p = static_cast<const uint16_t*>(m.pData);
@@ -414,6 +428,13 @@ int main()
         const bool scene_pixel = read && px[3] > 0.99f && (std::fabs(px[0] - 0.25f) < 0.01f || std::fabs(px[0] - 0.1f) < 0.01f);
         std::printf("consumer copy pixel: %.3f %.3f %.3f %.3f\n", px[0], px[1], px[2], px[3]);
         expect(scene_pixel, "the consumer's copy on the game's context holds the drawn scene");
+#if defined(NA_TEST_NATIVE_DLAA)
+        float result[4]{};
+        const bool read_result = ReadCopy(g, result, g.color.Get());
+        expect(read_result && std::isfinite(result[0]) && std::fabs(result[0] - px[0]) < 0.06f &&
+               std::fabs(result[1] - px[1]) < 0.06f && std::fabs(result[2] - px[2]) < 0.06f,
+               "native scene contains the expected RGB after the effects writeback");
+#endif
     }
 
     // The GPU sees the jittered camera: rows 0/1 moved by a sub-pixel amount, rows 2/3 unchanged.
@@ -457,9 +478,9 @@ int main()
         Pump();
         ComPtr<ID3D11CommandList> l_scene, l_post;
         Scene(d_scene.Get(), g, frame);
-        d_scene->FinishCommandList(FALSE, &l_scene);
+        if (FAILED(d_scene->FinishCommandList(FALSE, &l_scene))) { expect(false, "finish scene list"); break; }
         Post(d_post.Get(), g, false);
-        d_post->FinishCommandList(FALSE, &l_post);
+        if (FAILED(d_post->FinishCommandList(FALSE, &l_post))) { expect(false, "finish post list"); break; }
         g.ctx->ExecuteCommandList(l_scene.Get(), FALSE);
         g.ctx->ExecuteCommandList(l_post.Get(), FALSE);
         g.swap->Present(0, 0);
@@ -472,12 +493,14 @@ int main()
 
     // ---- resize: nothing of the game's held, new targets found, new stream ----
     const uint64_t color_inc = g_seen.color_inc, streams = g_seen.streams, calls2 = g_seen.calls;
+    g.ctx->ClearState();
     g.back_rtv.Reset();
     g.color_srv.Reset();
     g.color_rtv.Reset();
     g.dsv.Reset();
     g.color.Reset();
     g.depth.Reset();
+    g.ctx->Flush();
     g.w = 256;
     g.h = 144;
     const HRESULT rz = g.swap->ResizeBuffers(0, g.w, g.h, DXGI_FORMAT_UNKNOWN, 0);
