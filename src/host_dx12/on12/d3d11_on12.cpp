@@ -43,6 +43,7 @@ std::atomic<bool> g_enabled{false}, g_hooked{false};
 // borrowed back buffer (D3D12 writes to an 11on12 swap chain's presented buffer make the D3D11
 // present wait ~2 s on its latency semaphore: probe runs 2026-11-09, modes 1-6); 0 no menu.
 std::atomic<int> g_menu_buffer{1};
+std::atomic<bool> g_copy_with_d3d11{false};
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
 struct Entry { IUnknown* identity = nullptr; ID3D12Device* device = nullptr; ID3D12CommandQueue* queue = nullptr; };
@@ -374,6 +375,7 @@ void Start(const wchar_t* ini, LogFn log)
               na::hooking::HookFunction(create_sc, reinterpret_cast<void*>(&DetourCreateDeviceAndSwapChain), reinterpret_cast<void**>(&g_orig_create_sc));
     if (!ok) { note("could not hook D3D11CreateDevice; DX11 bridge off"); return; }
     g_menu_buffer.store(static_cast<int>(GetPrivateProfileIntW(L"dx11on12", L"menu_buffer", 1, ini)));
+    g_copy_with_d3d11.store(GetPrivateProfileIntW(L"dx11on12", L"copy_with_d3d11", 0, ini) != 0);
     g_hooked.store(true);
     g_enabled.store(true);
     note("D3D11 device creation hooked; the game's DX11 device will run on D3D12");
@@ -710,6 +712,7 @@ TChain g_tchains[4];
 std::atomic<IDXGISwapChain*> g_tchain_ids[std::size(g_tchains)]{};
 std::atomic<uint32_t> g_tchain_count{0};
 std::atomic<uint64_t> g_translated{0}, g_untranslated{0}, g_tcopies{0}, g_tcopy_failures{0}, g_tresizes{0}, g_tresize_waits{0};
+std::atomic<uint64_t> g_tcopies_d3d11{0};
 std::atomic<long> g_tlast_hr{0};
 char g_treason[160] = "No translated swap chain yet.";
 
@@ -769,6 +772,37 @@ bool tdrain(TChain& c)
     if (!done) g_tresize_waits.fetch_add(1);
     else for (auto& s : c.slots) if (s.value == UINT64_MAX) s.value = 0; // everything before this drain has completed
     return done;
+}
+
+HRESULT copy_on_d3d11(TChain& c, ID3D12Resource* target, DXGI_FORMAT format, bool same_size)
+{
+    D3D11_RESOURCE_FLAGS flags{};
+    ComPtr<ID3D11Resource> wrapper;
+    HRESULT hr = c.on12->CreateWrappedResource(
+        target, &flags, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT,
+        IID_PPV_ARGS(&wrapper));
+    if (FAILED(hr)) return hr;
+    ID3D11Resource* dest = wrapper.Get(); // a newly wrapped resource starts acquired
+    if (c.game_samples.Count > 1) {
+        c.ctx->ResolveSubresource(dest, 0, c.virt11.Get(), 0, format);
+    } else if (same_size) {
+        c.ctx->CopyResource(dest, c.virt11.Get());
+    } else {
+        const auto desc = target->GetDesc();
+        const D3D11_BOX overlap{0, 0, 0, static_cast<UINT>((std::min<UINT64>)(desc.Width, c.width)),
+                               (std::min)(desc.Height, c.height), 1};
+        c.ctx->CopySubresourceRegion(dest, 0, 0, 0, 0, c.virt11.Get(), 0, &overlap);
+    }
+    // Only the destination crosses the API boundary. The translator owns both
+    // the game's writes and this copy, through the same immediate context.
+    c.on12->ReleaseWrappedResources(&dest, 1);
+    // Keeping the wrapper across frames also keeps an indirect reference to
+    // the swap chain and hides the game's last Release from our teardown hook.
+    wrapper.Reset();
+    c.ctx->Flush();
+    hr = c.queue->Signal(c.fence.Get(), c.fence_value + 1);
+    if (SUCCEEDED(hr)) ++c.fence_value;
+    return hr;
 }
 
 void drop_virtual(TChain& c)
@@ -996,7 +1030,7 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
     if (!g_tchain_count.load(std::memory_order_relaxed) || (flags & DXGI_PRESENT_TEST)) return;
     std::lock_guard<std::recursive_mutex> lk(g_tm);
     TChain* c = tfind(chain);
-    if (!c || !c->virt11) return;
+    if (!c || c->resizing || !c->virt11) return;
     // The chain's current buffer, asked for the way a DX12 game asks: through
     // the hooked GetBuffer / GetCurrentBackBufferIndex, so the presenter's
     // buffers (when it owns this chain) are what we fill.
@@ -1013,6 +1047,17 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
         g_tcopy_failures.fetch_add(1); // nothing is transferred this frame; the game's buffer stays acquired
         tnote(msaa ? "the chain's buffer size differs from the game's multisampled back buffer; no resolve this frame"
                    : "the chain's buffer format no longer matches the game's back buffer; picture not copied");
+        return;
+    }
+    if (g_copy_with_d3d11.load(std::memory_order_relaxed)) {
+        hr = copy_on_d3d11(*c, target.Get(), typeless(c->game_format) ? td.Format : c->game_format, same_size);
+        if (SUCCEEDED(hr)) {
+            g_tcopies.fetch_add(1, std::memory_order_relaxed);
+            g_tcopies_d3d11.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_tcopy_failures.fetch_add(1);
+            tnote("D3D11 could not transfer the translated picture", hr);
+        }
         return;
     }
     // D3D11's frame goes to the queue first; D3D12 owns the virtual buffer until we give it back.
@@ -1074,8 +1119,10 @@ bool BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, u
     // of the game's is touched (a later resize retries). The game's buffer is handed back from
     // D3D11 but kept, with everything advertised about it, until DXGI has decided.
     if (!tdrain(*c)) { tnote("a copy to the chain had not completed; this ResizeBuffers is refused unchanged"); return false; }
-    if (c->virt11) { ID3D11Resource* r[] = {c->virt11.Get()}; c->on12->ReleaseWrappedResources(r, 1); }
-    c->ctx->Flush();
+    if (!g_copy_with_d3d11.load(std::memory_order_relaxed)) {
+        if (c->virt11) { ID3D11Resource* r[] = {c->virt11.Get()}; c->on12->ReleaseWrappedResources(r, 1); }
+        c->ctx->Flush();
+    }
     c->resizing = true;
     c->pending_count = *count ? *count : c->game_count;
     c->pending_format = *format == DXGI_FORMAT_UNKNOWN ? c->game_format : *format;
@@ -1100,7 +1147,10 @@ void AfterResize(IDXGISwapChain* chain, long result)
     if (FAILED(result)) {
         // The game keeps the exact buffer it had: back under D3D11, same description.
         tnote("the game's ResizeBuffers was refused; its back buffer is unchanged", result);
-        if (c->virt11) { ID3D11Resource* r[] = {c->virt11.Get()}; c->on12->AcquireWrappedResources(r, 1); }
+        if (c->virt11 && !g_copy_with_d3d11.load(std::memory_order_relaxed)) {
+            ID3D11Resource* r[] = {c->virt11.Get()};
+            c->on12->AcquireWrappedResources(r, 1);
+        }
         return;
     }
     c->game_count = c->pending_count;
@@ -1133,9 +1183,10 @@ int FormatStatus(char* out, size_t capacity)
 {
     std::lock_guard<std::mutex> lk(g_m);
     const int n = std::snprintf(out, capacity,
-                                "dx11on12_present chains=%u translated=%llu untranslated=%llu copies=%llu copy_failures=%llu resizes=%llu resize_wait_timeouts=%llu last_hr=0x%08lX reason=\"%s\" | ",
+                                "dx11on12_present chains=%u translated=%llu untranslated=%llu copies=%llu copies_d3d11=%llu copy_failures=%llu resizes=%llu resize_wait_timeouts=%llu last_hr=0x%08lX reason=\"%s\" | ",
                                 g_tchain_count.load(), static_cast<unsigned long long>(g_translated.load()),
                                 static_cast<unsigned long long>(g_untranslated.load()), static_cast<unsigned long long>(g_tcopies.load()),
+                                static_cast<unsigned long long>(g_tcopies_d3d11.load()),
                                 static_cast<unsigned long long>(g_tcopy_failures.load()), static_cast<unsigned long long>(g_tresizes.load()),
                                 static_cast<unsigned long long>(g_tresize_waits.load()), static_cast<unsigned long>(g_tlast_hr.load()), g_treason);
     if (n < 0 || static_cast<size_t>(n) >= capacity) return n;
