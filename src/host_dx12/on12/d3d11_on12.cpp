@@ -44,6 +44,7 @@ std::atomic<bool> g_enabled{false}, g_hooked{false};
 // present wait ~2 s on its latency semaphore: probe runs 2026-11-09, modes 1-6); 0 no menu.
 std::atomic<int> g_menu_buffer{1};
 std::atomic<bool> g_copy_with_d3d11{false};
+std::atomic<bool> g_keep_game_swapchain{false};
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
 struct Entry { IUnknown* identity = nullptr; ID3D12Device* device = nullptr; ID3D12CommandQueue* queue = nullptr; };
@@ -376,6 +377,7 @@ void Start(const wchar_t* ini, LogFn log)
     if (!ok) { note("could not hook D3D11CreateDevice; DX11 bridge off"); return; }
     g_menu_buffer.store(static_cast<int>(GetPrivateProfileIntW(L"dx11on12", L"menu_buffer", 1, ini)));
     g_copy_with_d3d11.store(GetPrivateProfileIntW(L"dx11on12", L"copy_with_d3d11", 0, ini) != 0);
+    g_keep_game_swapchain.store(GetPrivateProfileIntW(L"dx11on12", L"keep_game_swapchain", 0, ini) != 0);
     g_hooked.store(true);
     g_enabled.store(true);
     note("D3D11 device creation hooked; the game's DX11 device will run on D3D12");
@@ -893,6 +895,12 @@ bool translate_common(IUnknown* device, DXGI_FORMAT format, ID3D12CommandQueue**
     if (!g_hooked.load() || !device || !queue) return false;
     *queue = QueueFor(device);
     if (!*queue) return false; // not our 11on12 device: the game's request is left as it was
+    if (g_keep_game_swapchain.load(std::memory_order_relaxed)) {
+        (*queue)->Release(); *queue = nullptr;
+        g_untranslated.fetch_add(1);
+        tnote("the game keeps its D3D11On12 swap chain and presentation ownership");
+        return false;
+    }
     if (flip_format(format) == DXGI_FORMAT_UNKNOWN) {
         (*queue)->Release(); *queue = nullptr;
         g_untranslated.fetch_add(1);
