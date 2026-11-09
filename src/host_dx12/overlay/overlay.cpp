@@ -2959,6 +2959,7 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
             }
         }
     }
+    if (borrowed.token && !na::on12::DrawOnBorrowed()) return; // menu_buffer=3 diagnostic: borrow without drawing
     if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) {
         g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
         return;

@@ -31,7 +31,11 @@ CreateDeviceAndSwapChainFn g_orig_create_sc = nullptr;
 On12CreateDeviceFn g_on12_create = nullptr;
 D3D12CreateDeviceFn g_d3d12_create = nullptr;
 LogFn g_log = nullptr;
-std::atomic<bool> g_enabled{false}, g_hooked{false}, g_menu_buffer{true};
+std::atomic<bool> g_enabled{false}, g_hooked{false};
+// [dx11on12] menu_buffer: 0 never borrow the back buffer (menu does not draw), 1 borrow and return
+// with the menu's fence, 2 borrow and return with no fence (same queue, so already ordered),
+// 3 borrow and return but skip the GPU draw (diagnostic: separates the draw from the borrow).
+std::atomic<int> g_menu_buffer{1};
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
 struct Entry { IUnknown* identity = nullptr; ID3D12Device* device = nullptr; ID3D12CommandQueue* queue = nullptr; };
@@ -250,7 +254,7 @@ void Start(const wchar_t* ini, LogFn log)
               na::hooking::HookFunction(create, reinterpret_cast<void*>(&DetourCreateDevice), reinterpret_cast<void**>(&g_orig_create)) &&
               na::hooking::HookFunction(create_sc, reinterpret_cast<void*>(&DetourCreateDeviceAndSwapChain), reinterpret_cast<void**>(&g_orig_create_sc));
     if (!ok) { note("could not hook D3D11CreateDevice; DX11 bridge off"); return; }
-    g_menu_buffer.store(GetPrivateProfileIntW(L"dx11on12", L"menu_buffer", 1, ini) != 0); // 0 = diagnostic: never borrow the back buffer
+    g_menu_buffer.store(static_cast<int>(GetPrivateProfileIntW(L"dx11on12", L"menu_buffer", 1, ini)));
     g_hooked.store(true);
     g_enabled.store(true);
     note("D3D11 device creation hooked; the game's DX11 device will run on D3D12");
@@ -299,7 +303,7 @@ void add_time(std::atomic<uint64_t>& total, std::atomic<uint64_t>& peak, uint64_
 
 bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, ID3D12Resource** out, Borrowed& borrowed)
 {
-    if (!g_hooked.load() || !g_menu_buffer.load() || !sc || !queue || !out) return false;
+    if (!g_hooked.load() || g_menu_buffer.load() == 0 || !sc || !queue || !out) return false;
     ComPtr<IUnknown> any;
     if (FAILED(sc->GetDevice(IID_PPV_ARGS(&any)))) return false;
     ComPtr<ID3D11On12Device2> device;
@@ -329,6 +333,7 @@ Borrowed::~Borrowed()
     if (!t) return;
     UINT64 v = value;
     ID3D12Fence* fences[] = {fence};
+    if (g_menu_buffer.load() == 2) fence = nullptr; // our draw went to 11on12's own queue: already ordered
     // Back to 11on12 before Present; with our fence, 11on12 waits for the menu draw.
     const uint64_t t0 = now_us();
     t->device->ReturnUnderlyingResource(t->buffer.Get(), fence ? 1u : 0u, fence ? &v : nullptr, fence ? fences : nullptr);
@@ -337,13 +342,15 @@ Borrowed::~Borrowed()
     delete t;
 }
 
+bool DrawOnBorrowed() { return g_menu_buffer.load() != 3; }
+
 int FormatStatus(char* out, size_t capacity)
 {
     std::lock_guard<std::mutex> lk(g_m);
     return std::snprintf(out, capacity,
-                         "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{unwraps=%llu failures=%llu returns=%llu unwrap_us=%llu/max%llu return_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\"",
+                         "dx11on12 enabled=%u hooked=%u requests=%u wrapped=%u with_swapchain=%u native=%u probes=%u swapchain_check=%d menu_buffer{mode=%d unwraps=%llu failures=%llu returns=%llu unwrap_us=%llu/max%llu return_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\"",
                          g_enabled.load() ? 1u : 0u, g_hooked.load() ? 1u : 0u, g_requests.load(), g_wrapped.load(),
-                         g_with_swapchain.load(), g_native.load(), g_probes.load(), g_swapchain_check.load(),
+                         g_with_swapchain.load(), g_native.load(), g_probes.load(), g_swapchain_check.load(), g_menu_buffer.load(),
                          static_cast<unsigned long long>(g_unwraps.load()), static_cast<unsigned long long>(g_unwrap_failures.load()),
                          static_cast<unsigned long long>(g_returns.load()),
                          static_cast<unsigned long long>(g_unwraps.load() ? g_unwrap_us.load() / g_unwraps.load() : 0),
