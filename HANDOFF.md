@@ -888,3 +888,7 @@ Astra integration head98c9100 includes Opus provider3d14ae9 and the native frame
 ## 2026-11-09 — Native WWII and Home staged at 20e20fa
 
 Use Documents/NA-wwii-on12-update.cmd for the staged native WWII build and the corresponding Results and Rollback CMDs. The filename is retained for continuity. The package config enables native11 and Home, disables dx11on12 and the old game-facing DX12 observation path. RTX and installer checks passed as recorded in COMMS and Documents/NA-wwii-on12-20e20fa/AUTOMATED-TESTS.txt. Cort alone tests the campaign, including sustained DLAA, Home and actual frame rate. The installed game remains untouched by staging.
+
+## 2026-11-09 — Native WWII live regression corrected in candidate a5c1113
+
+The 20e20fa campaign ran with zero DLAA because camera admission demanded a VP/inverse pair before the known WWII camera-relative decoder. It also did not watch the pixel stage where translated campaign evidence identified the pose. The new native provider uses the current draw's camera upload and constant-buffer range. The existing updater, results and rollback CMDs point to a5c1113. RTX fixture covers the observed packet shapes, live settings and both native captures. D3D11On12 remains disabled and the installed game was left alone. Actual campaign DLAA coverage, raster jitter availability and FPS with DLAA active are pending Cort's test.
