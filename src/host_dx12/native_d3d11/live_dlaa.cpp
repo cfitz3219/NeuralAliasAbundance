@@ -219,7 +219,8 @@ camera::CameraFrame Pose(Session& s, const native11::SceneFrame& frame, UINT w, 
     if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(length), w, h, scene))
         return s.camera.UpdateCameraRelative(scene.vp, scene.origin, frame.frame, w, h, jitter);
     native11::CameraPick pick;
-    if (!native11::CheckLearned(bytes, s.pick, &pick)) pick = native11::FindCamera(bytes, c.version);
+    if (!native11::CheckLearned(bytes, s.pick, &pick))
+        pick = native11::FindCamera(bytes, c.version ? c.version : frame.frame + 1);
     if (!pick.found) return {};
     s.pick = pick;
     return s.camera.Update(pick.vp, frame.frame, w, h, jitter);
