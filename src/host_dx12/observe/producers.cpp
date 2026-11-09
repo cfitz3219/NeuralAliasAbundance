@@ -1332,6 +1332,91 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
     }
 }
 
+// CopyDescriptors with several ranges, as one unit (2026-11-09, WWII p31660: ~580k copy runs/s on the
+// D3D11On12 translator thread, the fps bottleneck). The translation layer gathers a shader table with ONE
+// CopyDescriptors call: one destination range, one single-descriptor source range per view. Run by run,
+// each of those paid the registry lock, two heap searches, its stripe locks, a revision bump and the
+// counters. Here the registry lock, the destination heap search and every stripe lock are taken once
+// per call; each run still updates exactly the slots, versions, hot bits and events it did run by run
+// (in the same order; D3D12 leaves overlapping source/destination undefined). Anything unusual (an
+// unresolved heap, a run crossing a heap end, too many runs or stripes) returns false BEFORE any
+// change and the caller uses the per-run path unchanged.
+bool note_descriptor_copies_batch(const uint64_t* dst, const uint64_t* src, const uint32_t* cnt, uint32_t n, uint32_t increment)
+{
+    constexpr uint32_t kMaxRuns = 64, kMaxStripes = 32;
+    if (n < 2 || n > kMaxRuns || !increment) return false;
+    struct Run { DescHeap* dh; DescHeap* sh; uint32_t ds, ss; };
+    Run runs[kMaxRuns];
+    na_ev_descriptor_copy ev[kMaxRuns];
+    bool want_ev[kMaxRuns];
+    {
+        const CostScope cost(kCostDescCopy);
+        std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
+        { const CostScope wait(kCostDescCopyWait); lock.lock(); }
+        struct Want { std::shared_mutex* m; bool ex; };
+        Want want[kMaxStripes];
+        uint32_t nw = 0;
+        const auto add = [&](DescHeap* h, uint32_t first, uint32_t count, bool ex) {
+            if (!h->stripes) return false;
+            for (uint32_t st = first >> kStripeShift; st <= (first + count - 1) >> kStripeShift; ++st) {
+                if (st >= h->nstripes) return false;
+                std::shared_mutex* m = &h->stripes[st];
+                bool merged = false;
+                for (uint32_t i = 0; i < nw; ++i) if (want[i].m == m) { want[i].ex |= ex; merged = true; }
+                if (merged) continue;
+                if (nw == kMaxStripes) return false;
+                want[nw++] = {m, ex};
+            }
+            return true;
+        };
+        DescHeap* last_d = nullptr; DescHeap* last_s = nullptr;
+        const auto find = [&](DescHeap*& last, uint64_t ptr, uint32_t* slot) -> DescHeap* {
+            if (last && ptr >= last->cpu_start) { // same heap as the previous run: no search
+                const uint64_t off = ptr - last->cpu_start;
+                if (off % last->increment == 0 && off / last->increment < last->count) { *slot = static_cast<uint32_t>(off / last->increment); return last; }
+            }
+            DescHeap* h = heap_for_cpu_locked(ptr, slot);
+            if (h) last = h;
+            return h;
+        };
+        // Pass 1: resolve every run and collect its stripes; nothing changes yet.
+        for (uint32_t r = 0; r < n; ++r) {
+            if (!cnt[r]) return false;
+            Run& x = runs[r];
+            x.dh = find(last_d, dst[r], &x.ds);
+            x.sh = find(last_s, src[r], &x.ss);
+            if (!x.dh || !x.sh) return false;
+            if (cnt[r] > x.dh->count - x.ds || cnt[r] > x.sh->count - x.ss) return false;
+            if (!add(x.dh, x.ds, cnt[r], true) || !add(x.sh, x.ss, cnt[r], false)) return false;
+        }
+        // Pass 2: same per-slot effect as the per-run path, under every stripe at once (global address order).
+        std::sort(want, want + nw, [](const Want& a, const Want& b) { return std::less<std::shared_mutex*>()(a.m, b.m); });
+        {
+            const CostScope wait(kCostDescCopyWait);
+            for (uint32_t i = 0; i < nw; ++i) { if (want[i].ex) want[i].m->lock(); else want[i].m->lock_shared(); }
+        }
+        for (uint32_t r = 0; r < n; ++r) {
+            const Run& x = runs[r];
+            want_ev[r] = init_header_wanted(ev[r], NA_EV_DESCRIPTOR_COPY, 0);
+            ++g_operation_revision;
+            for (uint32_t i = 0; i < cnt[r]; ++i) {
+                ++x.dh->versions[x.ds + i];
+                x.dh->info[x.ds + i] = x.sh->info[x.ss + i];
+                set_hot_bit(x.dh, x.ds + i, x.dh->info[x.ds + i].kind == NA_DESC_SRV && hot_id_locked(x.dh->info[x.ds + i].resource));
+            }
+            ev[r].src_heap = x.sh->id;
+            ev[r].dst_heap = x.dh->id;
+            ev[r].src_slot = x.ss;
+            ev[r].dst_slot = x.ds;
+            ev[r].slot_count = cnt[r];
+        }
+        for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
+    }
+    g_c.copies.fetch_add(n);
+    for (uint32_t r = 0; r < n; ++r) if (want_ev[r]) emit(ev[r], NA_GROUP_DESCRIPTOR);
+    return true;
+}
+
 std::atomic<uint32_t> g_increment[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES] = {};
 uint32_t descriptor_increment_cached(D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
@@ -1908,7 +1993,28 @@ void STDMETHODCALLTYPE D_CopyDescriptors(ID3D12Device* dev, UINT nd, const D3D12
     o_CopyDescriptors(dev, nd, ds, dsz, ns, ss, ssz, type);
     if (!ds || !ss) return;
     const uint32_t inc = descriptor_increment(dev, type);
-    // Walk both range lists in step; null size arrays mean ranges of 1.
+    // Walk both range lists in step; null size arrays mean ranges of 1. The runs are gathered first
+    // and applied as one unit when they fit (note_descriptor_copies_batch); otherwise run by run.
+    constexpr uint32_t kBatch = 64;
+    uint64_t bd[kBatch], bs[kBatch];
+    uint32_t bc[kBatch], nb = 0;
+    bool fits = true;
+    {
+        uint32_t di = 0, si = 0, doff = 0, soff = 0;
+        while (di < nd && si < ns) {
+            const uint32_t dlen = dsz ? dsz[di] : 1, slen = ssz ? ssz[si] : 1;
+            if (doff >= dlen) { ++di; doff = 0; continue; }
+            if (soff >= slen) { ++si; soff = 0; continue; }
+            const uint32_t run = std::min(dlen - doff, slen - soff);
+            if (nb == kBatch) { fits = false; break; }
+            bd[nb] = ds[di].ptr + static_cast<uint64_t>(doff) * inc;
+            bs[nb] = ss[si].ptr + static_cast<uint64_t>(soff) * inc;
+            bc[nb++] = run;
+            doff += run;
+            soff += run;
+        }
+    }
+    if (fits && note_descriptor_copies_batch(bd, bs, bc, nb, inc)) return;
     uint32_t di = 0, si = 0, doff = 0, soff = 0;
     while (di < nd && si < ns) {
         const uint32_t dlen = dsz ? dsz[di] : 1, slen = ssz ? ssz[si] : 1;
