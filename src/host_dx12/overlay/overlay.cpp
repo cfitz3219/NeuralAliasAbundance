@@ -203,6 +203,23 @@ SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
 std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0}, g_swap_queue_observed{0};
 std::atomic<uintptr_t> g_last_present_queue{0};
+// Where a slow Present goes (DX11 bridge menu probe, 2026-11-09: ~200 ms frames only with the menu
+// open): our own present work (on_present) vs the original Present, per 5-second status window.
+struct PresentTiming { std::atomic<uint64_t> n{0}, ours_us{0}, ours_max{0}, orig_us{0}, orig_max{0}; };
+PresentTiming g_present_timing[2]; // [0] menu closed, [1] menu open
+uint64_t qpc_us()
+{
+    static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return 1e6 / double(q.QuadPart); }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return static_cast<uint64_t>(double(t.QuadPart) * f);
+}
+void note_present_timing(bool open, uint64_t ours, uint64_t orig)
+{
+    auto& t = g_present_timing[open ? 1 : 0];
+    t.n.fetch_add(1); t.ours_us.fetch_add(ours); t.orig_us.fetch_add(orig);
+    uint64_t m = t.ours_max.load(); while (ours > m && !t.ours_max.compare_exchange_weak(m, ours)) {}
+    m = t.orig_max.load(); while (orig > m && !t.orig_max.compare_exchange_weak(m, orig)) {}
+}
 
 void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
 {
@@ -1792,6 +1809,16 @@ void write_menu_progress(HANDLE log)
         static_cast<unsigned long long>(g_menu_skips.present_rejected.load(std::memory_order_relaxed)),
         static_cast<unsigned long>(g_menu_skips.last_present_rejection.load(std::memory_order_relaxed)));
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
+    for (int open = 0; open < 2; ++open) {
+        auto& t = g_present_timing[open];
+        const uint64_t c = t.n.exchange(0), ours = t.ours_us.exchange(0), orig = t.orig_us.exchange(0);
+        const uint64_t ours_max = t.ours_max.exchange(0), orig_max = t.orig_max.exchange(0);
+        n = snprintf(line, sizeof(line), "present_timing menu=%s presents=%llu ours_us=%llu/max%llu original_present_us=%llu/max%llu\r\n",
+                     open ? "open" : "closed", static_cast<unsigned long long>(c),
+                     static_cast<unsigned long long>(c ? ours / c : 0), static_cast<unsigned long long>(ours_max),
+                     static_cast<unsigned long long>(c ? orig / c : 0), static_cast<unsigned long long>(orig_max));
+        if (n > 0) WriteFile(log, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)) - 1)), &written, nullptr);
+    }
     auto nr_progress = na::nr::GetStats();
     n = snprintf(line, sizeof(line), "frame_progress nr_submitted=%llu nr_completed=%llu direct_queues=%u present_thread=%u\r\n",
         static_cast<unsigned long long>(nr_progress.gpu_submitted), static_cast<unsigned long long>(nr_progress.gpu_completed),
@@ -3500,8 +3527,11 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present_begin",sc);
     const bool menu_open = g_open.load(std::memory_order_acquire);
+    const uint64_t t0 = qpc_us();
     if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
+    const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present(sc, sync, flags);
+    note_present_timing(menu_open, t1 - t0, qpc_us() - t1);
     note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
