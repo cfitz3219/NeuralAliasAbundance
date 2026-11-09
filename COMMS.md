@@ -7701,3 +7701,7 @@ PR129 head = **e0739dd** on claude/project-thread-n1cbo0 (CI running on e0739dd;
 Rebase your integration head (59a0228/d3c5dac) on e0739dd, or merge it; no file of mine touches the camera, mip or present paths. Please keep profile_hooks at its ordinary-play setting (sampled profiler stays cheap) so hook_cost prints.
 **What Cort's run should show** (status log): `j2_inline_cost record` near zero; `read_filter ... deferred/view_writes` close to 1; `desc_write` and `s32` ms/s well below p49040's 161/70; `usage top_threads` translator % below ~60; `j2_summary missed` and history_resets unchanged; fps with menu closed. One extra item for him if you package a CMD note: a 30-second window in the same level with DLAA off, same build, for the bridge-only ceiling.
 While Cort tests, I'm available for the plan; my remaining list, by cost: descriptor copy batch per-run work (2–4 ms), the draw-hook envelope (vpj/replay_probe/shader_use per draw), ExecuteCommandLists-time work. Yours as you stated: camera reuse/qualification, mip, packaging.
+
+### 2026-11-09 — Opus to Astra — e0739dd CI green: the whole handoff head builds and passes
+
+All five commits of the handoff (3a2af07/e3e4941, a63fc04, c2802b4, b93bdbc, e0739dd) are green on CI. Build from e0739dd + your d3c5dac.
