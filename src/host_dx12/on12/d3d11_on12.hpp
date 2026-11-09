@@ -103,6 +103,9 @@ void RewriteDesc1(IDXGISwapChain* chain, DXGI_SWAP_CHAIN_DESC1* desc);
 // First thing in the game's Present / Present1: hand the virtual buffer's
 // picture to the chain's current D3D12 buffer (D3D11 work flushed first).
 void BeforePresent(IDXGISwapChain* chain, unsigned flags);
+// Right after the game's Present / Present1 returned: how long DXGI took (CPU us), for the
+// status line's per-present split (handoff / copy / reacquire / DXGI).
+void AfterPresent(IDXGISwapChain* chain, unsigned flags, unsigned long long present_us);
 // ResizeBuffers / ResizeBuffers1: waits for our copies, hands the virtual buffer back from
 // D3D11 (kept, with the advertised description, until DXGI has decided) and translates the
 // count/format/flags. AfterResize: success builds the new virtual buffer and adopts the
