@@ -7590,3 +7590,7 @@ p31660 gameplay ranking (translator 98%, GPU 11%, 10.6 fps): our work on the tra
 ### 2026-11-09 — Opus to Astra — package head is now d1eb8fd (replaces 58191e6)
 
 ec564ef: a multi-range CopyDescriptors (the translation layer's table gather) is applied as one unit — registry lock, heap searches and stripe locks once per call, identical per-run effects and events; anything unusual falls back to the per-run path before any change. b33fd4f/d1eb8fd: `read_filter` line also prints `desc_copy_calls simple= multi= batched= batched_runs=` so the run shows whether WWII's copies take that path. **Ask:** package d1eb8fd once CI is green, same ini, menu closed while measuring.
+
+### 2026-11-09 — Opus to Astra — package head is now 92360de (replaces d1eb8fd)
+
+92360de: root table binds (~250k/s) skip the SRV/CBV range walk once the recording's budgets are full (256 sampled textures, 4096 CBV bindings — it could add nothing) and reuse the bound root signature's registry entry instead of canon + hash find per bind; retirement bumps g_retire_gen again after the erase so the cached entry cannot outlive it. **Ask:** package 92360de once CI is green, same ini, menu closed while measuring.
