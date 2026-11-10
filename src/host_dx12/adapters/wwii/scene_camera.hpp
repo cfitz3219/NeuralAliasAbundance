@@ -16,9 +16,10 @@ struct SceneCamera {
     camera::Matrix vp{};
     std::array<double, 3> origin{};
     uint32_t vp_offset = 0, vp_duplicate = 0;
+    bool raster_jitter_qualified = false;
 };
 
-// Campaign shader constant layouts observed in the translated scene pass.
+// Campaign shader constant layouts observed at the scene draw.
 // Require scene extent and the observed redundant pose fields. p49040 has
 // rounded copies of the world origin, and shader variants reuse the adjacent
 // float4s (400/960 or 560) for unrelated data. Those are not pose witnesses.
@@ -29,28 +30,38 @@ inline bool DecodeSceneCamera(const std::vector<uint8_t>& bytes, uint32_t declar
     // `why` (diagnostics): the first check that failed on the layout whose size matched.
     const char* failed = "size";
     struct Layout {
-        uint32_t size, vp, extent;
+        uint32_t size, vp, duplicate, extent;
         std::array<uint32_t, 3> origin;
         uint32_t origin_count;
+        bool native_variant;
     };
     constexpr Layout layouts[]{
-        {1280, 64, 704, {384, 944, 0}, 2},
-        {1536, 192, 816, {480, 512, 528}, 3},
+        {1280, 64, 320, 704, {384, 944, 0}, 2, false},
+        // Native campaign p30648: the copy at 64 is unrelated. Two matching
+        // matrices and two nonzero origin witnesses still establish the pose.
+        {1280, 208, 320, 704, {800, 928, 0}, 2, true},
+        {1536, 192, 0, 816, {480, 512, 528}, 3, false},
     };
+    bool matched_projection_copy = false;
     for (const auto& layout : layouts) {
         if (declared_size != layout.size) continue;
+        if (layout.native_variant && matched_projection_copy) continue;
         if (bytes.size() < 976 || !width || !height) { failed = "short_or_no_extent"; continue; }
         std::array<float, 4> extent{}, origin{};
         std::memcpy(extent.data(), bytes.data() + layout.extent, sizeof(extent));
         if (extent[0] != float(width) || extent[1] != float(height) ||
             !(std::abs(extent[2] * width - 1.0f) < 0.002f) ||
             !(std::abs(extent[3] * height - 1.0f) < 0.002f)) { failed = "extent"; continue; }
-        // The 208 slot differs by 4.0 in captured scene variants; 64 and 320
-        // are the repeated current view-projection in those same blocks.
-        if (layout.size == 1280 &&
-            std::memcmp(bytes.data() + layout.vp, bytes.data() + 320, 64)) { failed = "vp_repeat"; continue; }
+        if (layout.duplicate && std::memcmp(bytes.data() + layout.vp, bytes.data() + layout.duplicate, 64)) {
+            failed = "vp_repeat";
+            continue;
+        }
+        matched_projection_copy = true;
         std::memcpy(origin.data(), bytes.data() + layout.origin[0], sizeof(origin));
         if (!std::isfinite(origin[0]) || !std::isfinite(origin[1]) || !std::isfinite(origin[2]) || origin[3] != 0.f) { failed = "origin"; continue; }
+        if (layout.native_variant && origin[0] == 0.f && origin[1] == 0.f && origin[2] == 0.f) {
+            failed = "empty_origin"; continue;
+        }
         bool agrees = true;
         for (uint32_t i = 1; i < layout.origin_count; ++i) {
             std::array<float, 4> other{};
@@ -72,7 +83,9 @@ inline bool DecodeSceneCamera(const std::vector<uint8_t>& bytes, uint32_t declar
             std::abs(geometry.sy / geometry.sx - double(width) / height) > 0.02 ||
             std::abs(geometry.position[0]) > 1e-5 || std::abs(geometry.position[1]) > 1e-5 ||
             std::abs(geometry.position[2]) > 1e-5) { failed = "vp_shape"; continue; }
-        out = {vp, {origin[0], origin[1], origin[2]}, layout.vp, layout.size == 1280 ? 320u : 0u};
+        // Native reads establish motion, but do not establish which of its
+        // matrices the vertex shader uses to place raster samples.
+        out = {vp, {origin[0], origin[1], origin[2]}, layout.vp, layout.duplicate, !layout.native_variant};
         if (why) *why = "ok";
         return true;
     }

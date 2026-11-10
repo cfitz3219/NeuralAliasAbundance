@@ -9,6 +9,11 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/effects/xegtao.hpp"
+#include "host_dx12/effects/donut.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/observe/producers.hpp"
@@ -39,6 +44,8 @@ struct Slot {
     ComPtr<ID3D11UnorderedAccessView> float_view;
     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
     uint64_t native_done = 0, effects_done = 0;
+    std::shared_ptr<xegtao::Frame> ambient;
+    std::shared_ptr<donut::Frame> grade;
 };
 struct Session {
     ComPtr<ID3D11Device> native;
@@ -301,6 +308,11 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     auto& slot = *owned;
     auto* list = slot.list.Get();
+    // Both interop fences retired this slot. End the old recording before
+    // reusing its private descriptors, flow history and effect ownership.
+    nr::native::Reset(list);
+    slot.ambient.reset();
+    slot.grade.reset();
     if (FAILED(slot.allocator->Reset()) || FAILED(list->Reset(slot.allocator.Get(), nullptr)))
         return FailSession(s, "Could not reset the native effects list.");
     auto* shared_depth = slot.depth.Effects();
@@ -317,6 +329,25 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     in.jitter_current_px[0] = static_cast<float>(cam.jitter_px_x);
     in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
+    const bool reset_history = cam.camera_cut || frame.selection_changed || frame.frame != s.last_frame + 1;
+    j2::compute_flow::Ticket flow;
+    if (j2::flow::Enabled()) {
+        j2::compute_flow::Frame ff;
+        ff.frame = frame.frame; ff.previous = s.last_frame;
+        ff.generation = static_cast<uint32_t>(frame.stream); ff.source_generation = frame.stream;
+        ff.slot = index; ff.reset = reset_history; ff.hdr = hdr;
+        ff.jitter[0] = ff.raster_jitter[0] = in.jitter_current_px[0];
+        ff.jitter[1] = ff.raster_jitter[1] = in.jitter_current_px[1];
+        ff.raster_sample = true; ff.raster_confirmed = frame.camera.jitter_applied;
+        j2::compute_flow::Tier3 tier;
+        j2::compute_flow::SetLoosen(settings::Get().j2_flow_loosen.load());
+        flow = j2::compute_flow::Record(list, s.queue.Get(), slot.color.Effects(), shared_depth, in, ff, tier);
+        if (tier.residual) {
+            in.tier3_valid_flag = true;
+            in.tier3_residual = tier.residual; in.tier3_valid = tier.valid; in.tier3_mask = tier.mask;
+        }
+        in.fix = tier.fix;
+    }
     motion::gpu::Outputs motion_out{slot.motion.Get(), slot.provenance.Get(), nullptr, ci.width, ci.height};
     if (!s.arbiter.Dispatch(list, in, motion_out, index)) {
         list->Close();
@@ -325,6 +356,20 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     Barrier(list, slot.motion.Get(), kWrite, kRead);
     dlss::EvalDesc eval{};
     eval.color = slot.color.Effects();
+    if (settings::Get().xegtao_enabled.load()) {
+        xegtao::Inputs ai;
+        ai.color = eval.color; ai.depth = shared_depth; ai.motion = slot.motion.Get();
+        ai.color_format = cf; ai.width = ci.width; ai.height = ci.height;
+        ai.srgb = !hdr; ai.clear_depth = frame.reversed_depth ? 0.f : 1.f;
+        ai.jitter_x = in.jitter_current_px[0]; ai.jitter_y = in.jitter_current_px[1];
+        ai.frame = frame.frame; ai.motion_reference_frame = s.last_frame;
+        ai.scene_epoch = frame.stream; ai.reset = reset_history;
+        const auto column = camera::TransposeMatrix(cam.view_proj_current_row);
+        if (xegtao::FromViewProjection(column.data(), ai.projection)) {
+            slot.ambient = xegtao::ScenePass().Prepare(s.device.Get(), s.queue.Get(), ai, xegtao::CurrentOptions());
+            if (slot.ambient && slot.ambient->Record(list)) eval.color = slot.ambient->Color();
+        } else xegtao::ScenePass().Unavailable("Waiting for supported native camera geometry.");
+    }
     eval.depth = shared_depth;
     eval.motion = slot.motion.Get();
     eval.output = slot.output.Effects();
@@ -335,16 +380,24 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     eval.depth_inverted = frame.reversed_depth;
     eval.jitter_x = in.jitter_current_px[0];
     eval.jitter_y = in.jitter_current_px[1];
-    eval.reset = cam.camera_cut || frame.selection_changed || frame.frame != s.last_frame + 1;
+    eval.reset = reset_history;
     const uint32_t preset = settings::Get().j2_preset.load();
     eval.preset = preset == 255 ? 12 : preset;
     constexpr uint64_t kNativeView = 0x4e41544956453131ull;
     eval.view_id = kNativeView;
+    const auto lighting = donut::CurrentOptions();
+    if (lighting.tone || lighting.bloom) {
+        donut::Inputs gi;
+        gi.color = eval.color; gi.format = cf; gi.width = ci.width; gi.height = ci.height;
+        gi.srgb = !hdr; gi.reset = reset_history; gi.stream = kNativeView;
+        slot.grade = donut::ScenePass().Prepare(s.device.Get(), s.queue.Get(), gi, lighting);
+        if (slot.grade && slot.grade->Record(list)) eval.color = slot.grade->Color();
+    }
     const bool evaluated = dlss::Evaluate(list, eval);
     uint32_t capture_token = 0;
     if (evaluated && capture::j2::Armed()) {
         capture::j2::Planes planes;
-        planes.color = slot.color.Effects();
+        planes.color = eval.color;
         planes.depth = shared_depth;
         planes.motion = slot.motion.Get();
         planes.output = slot.output.Effects();
@@ -406,7 +459,11 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     ID3D12CommandList* lists[] = {list};
     dlss::BeforeExecute(s.queue.Get(), 1, lists);
-    s.queue->ExecuteCommandLists(1, lists);
+    {
+        nr::native::Submission submitted(s.queue.Get(), 1, lists);
+        s.queue->ExecuteCommandLists(1, lists);
+    }
+    j2::compute_flow::Committed(flow);
     dlss::OnExecuted(s.queue.Get(), 1, lists);
     if (capture_token) {
         capture::j2::Submitted(capture_token, s.queue.Get(), frame.frame);
@@ -425,9 +482,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     delivered_size.store((uint64_t(ci.width) << 32) | ci.height, std::memory_order_relaxed);
     applied_preset.store(eval.preset, std::memory_order_relaxed);
     applied_sharpness.store(sharpened, std::memory_order_relaxed);
-    raster_slot.store(frame.camera.vs_slot, std::memory_order_relaxed);
+    raster_slot.store(frame.camera.raster_jitter_qualified ? frame.camera.vs_slot : -1, std::memory_order_relaxed);
     delivered_at.store(GetTickCount64(), std::memory_order_relaxed);
-    if (frame.camera.vs_slot >= 0 && j2::Jitter()) {
+    if (frame.camera.raster_jitter_qualified && j2::Jitter()) {
         const auto phase = static_cast<uint32_t>(frame.frame);
         const auto sample = settings::Get().j2_jitter_r2.load()
             ? neural_alias::temporal_jitter_r2(phase, 8) : neural_alias::temporal_jitter(phase, 8);
@@ -509,9 +566,13 @@ bool FormatMenuStatus(char* out, size_t capacity)
     if (running)
         std::snprintf(out, capacity, "Native DX11 DLAA running at %u × %u. %llu frames improved.%s",
                       unsigned(size >> 32), unsigned(size), static_cast<unsigned long long>(delivered.load()),
-                      raster_slot.load() < 0 ? " Camera motion is available. Jitter is waiting for the vertex camera." : "");
-    else
-        std::snprintf(out, capacity, "%s", j2::Paused() ? "Native DX11 DLAA is off." : reason.load());
+                      raster_slot.load() < 0 ? " Camera motion is available. Jitter is waiting for a verified raster projection." : "");
+    else {
+        const auto provider = native11::Stats();
+        const char* waiting = !delivered.load() && provider.last_miss && provider.last_miss[0]
+            ? provider.last_miss : reason.load();
+        std::snprintf(out, capacity, "%s", j2::Paused() ? "Native DX11 DLAA is off." : waiting);
+    }
     return running;
 }
 } // namespace na::native_d3d11

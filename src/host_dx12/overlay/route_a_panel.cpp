@@ -1,3 +1,4 @@
+#include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
@@ -1157,6 +1158,7 @@ void DrawLiveDlaaEnhancements()
 {
     using namespace na::ui;
     if (!na::j2::Configured()) return;
+    const bool native = na::on12::NativeRoute();
     BeginGroupBox("DLAA enhancements");
     bool jit = na::j2::Jitter();
     BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
@@ -1183,7 +1185,7 @@ void DrawLiveDlaaEnhancements()
         if (fl) {
             const na::j2::flow::Stats fs = na::j2::flow::GetStats();
             const auto cs=na::j2::compute_flow::GetStats();
-            if(na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
+            if(na::on12::NativeRoute() || na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
                 char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
                 StatusLine(0,line);
                 if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
@@ -1212,7 +1214,15 @@ void DrawLiveDlaaEnhancements()
         else ImGui::TextColored(kText, "Target %.2f", ml.want_bias);
         PopFont();
         EndRow();
-        if (ml.visible_sampler_uploads) {
+        if (native) {
+            const auto applied = na::native11::GetSamplerStats();
+            char detail[180]{};
+            if (applied.material_binds)
+                std::snprintf(detail, sizeof detail, "Last bound material sampler: game %.2f, applied %.2f (change %+.2f).",
+                              applied.original_bias, applied.bias, applied.bias - applied.original_bias);
+            else std::snprintf(detail, sizeof detail, "Waiting for a material sampler on the native DX11 route.");
+            Hint(detail);
+        } else if (ml.visible_sampler_uploads) {
             char text[96];
             std::snprintf(text, sizeof text, "Last material sampler uploaded to the GPU: %.2f", ml.visible_sampler_bias);
             Hint(text);
@@ -1221,8 +1231,8 @@ void DrawLiveDlaaEnhancements()
             std::snprintf(text, sizeof text, "Prepared static sampler target: %.2f", ml.live_bias);
             Hint(text);
         } else Hint("Waiting for an observed material sampler.");
-        if (ml.preparing) Hint("Preparing static sampler variants.");
-        if (!ml.enabled) StatusLine(2, "Live texture adjustments are disabled for this session.");
+        if (!native && ml.preparing) Hint("Preparing static sampler variants.");
+        if (!native && !ml.enabled) StatusLine(2, "Live texture adjustments are disabled for this session.");
     }
     {
         // Anisotropic filtering on the game's surface textures (before DLSS, where the game
@@ -1261,7 +1271,12 @@ void DrawLiveDlaaEnhancements()
         const auto as = na::observe::GetAnisoStats();
         char tb[240];
         const auto ml2 = na::observe::GetMipLiveStats();
-        if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
+        if (native) {
+            const auto applied = na::native11::GetSamplerStats();
+            std::snprintf(tb, sizeof tb, "Native material filtering last bound: %ux. Changed bindings: %llu; variant errors: %llu.",
+                          applied.af, static_cast<unsigned long long>(applied.swapped),
+                          static_cast<unsigned long long>(applied.variant_failures));
+        } else if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
             std::snprintf(tb, sizeof tb, "Preparing %ux in the background (%llu of %llu objects); the current filtering stays until it is complete.", ml2.want_aniso,
                           static_cast<unsigned long long>(ml2.prepare_done), static_cast<unsigned long long>(ml2.prepare_total));
         else if (as.level)
@@ -1270,7 +1285,7 @@ void DrawLiveDlaaEnhancements()
         else
             std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
         StatusLine(0, tb);
-        if (as.level) {
+        if (!native && as.level) {
             // Draw-time proof: how often the game's draws really went to the GPU with our
             // changed pipelines, against with its own (which never carry the change).
             std::snprintf(tb, sizeof tb, "Changed pipeline bindings recorded: %llu; original pipeline bindings: %llu.",
@@ -1376,7 +1391,6 @@ void RegisterLiveDlaaMenu()
 {
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
     na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
-    if (na::on12::NativeRoute()) return;
     na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
     // XeGTAO and Lighting run inside live DLAA too, but their rows were only registered with
     // the Route A menu, so a live-DLAA-only game (Sniper Elite 5, Cort 2026-11-05) never showed

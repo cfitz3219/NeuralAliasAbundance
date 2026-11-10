@@ -4,7 +4,8 @@
 // The game's sampler states are recorded at CreateSamplerState. When the policy
 // is on, each eligible sampler bound with PSSetSamplers / CSSetSamplers is
 // swapped for a variant (same state, policy bias / AF) created on demand and
-// kept for the process; when it is off, binds pass through untouched. Rules:
+// kept for the process. Policy changes also refresh existing bindings at the
+// next draw; off restores the original sampler. Rules:
 // sampler_policy.hpp (the DX12 host's rules on D3D11's fields).
 #pragma once
 
@@ -20,16 +21,21 @@ using SamplerAfFn = uint32_t (*)();
 // Idempotent. Install it when the device is created, before the game makes its samplers.
 bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af);
 
+uint64_t SamplerPolicyKey();
+void RefreshSamplers(void* context);
+
 struct SamplerStats {
     uint64_t created = 0;          // game CreateSamplerState calls seen
     uint64_t eligible_bias = 0;    // of the distinct game samplers: material samplers (bias rule)
     uint64_t eligible_af = 0;      // of the distinct game samplers: AF rule
     uint64_t variants = 0;         // variant sampler states we created
     uint64_t variant_failures = 0;
-    uint64_t binds = 0;            // sampler slots bound while the policy was on
+    uint64_t binds = 0;            // observed game sampler slots bound
     uint64_t swapped = 0;          // of those, bound as our variant
     uint64_t unknown = 0;          // bound samplers we never saw created (passed through)
-    float bias = 0.0f;             // policy applied at the last bind
+    uint64_t material_binds = 0;
+    float original_bias = 0.0f;
+    float bias = 0.0f;             // actual total bias at the last eligible material bind
     uint32_t af = 0;
     bool installed = false;
 };
