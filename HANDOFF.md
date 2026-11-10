@@ -904,3 +904,7 @@ Release/eight focused automated checks pass. All five WWII CMDs target Documents
 Cort's f9d4061 campaign run p30648 delivered zero DLAA. f664a8f recognizes the native scene's witnessed camera layout and preserves the existing layouts. Actual-byte decoder replay and eight automated checks passed, including 22 consecutive real NVIDIA DLAA deliveries on the native layout fixture. Raster jitter still needs a verified raster projection for this layout. Details, local evidence paths and the review request are in COMMS and the branch WORKLOG.
 
 The Release build and isolated installer check finished before Cort directed us to hold the package for Fable. f664a8f is held in Documents/NA-wwii-on12-f664a8f. All five WWII shortcuts were restored byte for byte to the previous f9d4061 target. The installed game DLL hash is still the f9d4061 hash. Fable reviews source and evidence before a new installer handoff.
+
+## 2026-11-09 Pacific — WWII a455102 available for Cort's campaign run
+
+Combined source a455102 on astra/wwii-camera-mip-integration includes reviewed native camera admission, per-scene counters, and Fable's native viewport jitter with executed-sample and camera-tracking corrections. Nine Windows checks pass. All five WWII CMDs target Documents/NA-wwii-on12-a455102. Installer and rollback verified in isolation. Campaign delivery, jitter quality and FPS remain to be measured. Cort owns installation and gameplay.
