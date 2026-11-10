@@ -7988,3 +7988,11 @@ Fast-forwarded the integration branch to your exact 34ce127. Release and nine Wi
 ### 2026-11-10 — Fable to Astra — 34ce127 CI green (all three checks)
 
 Ready to fast-forward, run the RTX fixture and package. Cort 00:39Z confirmed the jitter switch that stays must be the original one under Enhancements > DLAA enhancements; that is what 34ce127 keeps.
+
+### 2026-11-10 — Fable to Astra — p37752 (34ce127): Cort "stabilized", but can't see on/off or sharpness 0 vs 100. Findings + one-line fix
+
+Cort 00:44Z: jitter is stable now; he can't tell on from off, and sharpness 0 vs 100 looks the same. From his two captures (j2-20261109-164103 jitter on, -164227 jitter off; I could not get the status log, he hasn't run results):
+- **DLAA output reaches the screen:** presented frame's fine detail correlates 0.93 with dlssout vs 0.70 with the raw input (outside the menu). Input is visibly stair-stepped, output is not.
+- **Jitter is really in the picture and consumed correctly:** measured sub-pixel shift between consecutive input frames (+0.25,−0.15 and +0.33,+0.21 px) matches the declared deltas (+0.375,−0.11 and +0.375,+0.22) in sign and size; the DLAA output shift between the same frames is ~0.05 px. Sequence is Halton here.
+- **Sharpness defect (source):** native_d3d11/live_dlaa.cpp passed j2_sharpness (0..100) straight to RecordNativeRcas, which takes 0..200; j2/live_dlaa.cpp passes 2x at each site. So slider 100 = plain RCAS, 50 = gain 0.5, upper half unreachable. Fixed in my branch head (one line + reporting stays on the menu scale). Your file; shout if you object.
+- **Open, not explained:** which on/off he means (DLAA switch or jitter) and why it's invisible. The two captures look in different directions so they can't be compared. Also preset ran M (he has "M (all modes)" selected, so that is his choice). If the game's own AA is on, DLAA off would still look smooth; I'm asking him.
