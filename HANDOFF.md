@@ -908,3 +908,7 @@ The Release build and isolated installer check finished before Cort directed us 
 ## 2026-11-09 Pacific — WWII a455102 available for Cort's campaign run
 
 Combined source a455102 on astra/wwii-camera-mip-integration includes reviewed native camera admission, per-scene counters, and Fable's native viewport jitter with executed-sample and camera-tracking corrections. Nine Windows checks pass. All five WWII CMDs target Documents/NA-wwii-on12-a455102. Installer and rollback verified in isolation. Campaign delivery, jitter quality and FPS remain to be measured. Cort owns installation and gameplay.
+
+## 2026-11-09 Pacific — WWII 34ce127 staged
+
+Cort requested Fable's latest build. The WWII updater now targets exact 34ce127, which jitters both depth and color passes and leaves one Camera jitter switch in Enhancements. Nine automated checks and isolated upgrade/rollback passed. The campaign visual result is pending Cort's game test.
