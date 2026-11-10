@@ -302,23 +302,34 @@ inline const Originals& O(ID3D11DeviceContext* c, Ctx* x)
 }
 
 // ---------------------------------------------------------------- the boundary
+// Order rejected candidates by how far they passed the WWII layout checks.
+// Count only the strongest result at a missed boundary, not every bound buffer.
+enum class PoseCheck { NoPacket, Extent, Repeat, Origin, Shape, Native, Legacy, Generic };
+
 CameraPick PickForScene(const std::vector<uint8_t>& bytes, const CameraPick& learned,
-                        uint32_t width, uint32_t height, uint64_t frame)
+                        uint32_t width, uint32_t height, uint64_t frame, PoseCheck& check)
 {
     // WWII's camera-relative packet carries the world origin and redundant
     // witnesses instead of a VP/inverse pair. Use the same decoder as the
     // effects consumer before trying the generic inverse-pair rule.
     wwii::SceneCamera scene;
-    if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(bytes.size()), width, height, scene)) {
+    const char* why = nullptr;
+    if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(bytes.size()), width, height, scene, &why)) {
         CameraPick pick;
         pick.found = pick.reversed = pick.camera_relative = true;
         pick.vp = scene.vp;
         pick.raster_jitter_qualified = scene.raster_jitter_qualified;
+        check = scene.raster_jitter_qualified ? PoseCheck::Legacy : PoseCheck::Native;
         return pick;
     }
+    if (std::strcmp(why, "vp_shape") == 0) check = PoseCheck::Shape;
+    else if (std::strcmp(why, "vp_repeat") == 0) check = PoseCheck::Repeat;
+    else if (std::strncmp(why, "origin", 6) == 0 || std::strcmp(why, "empty_origin") == 0) check = PoseCheck::Origin;
+    else if (std::strcmp(why, "extent") == 0) check = PoseCheck::Extent;
     CameraPick pick;
-    if (CheckLearned(bytes, learned, &pick)) return pick;
-    return FindCamera(bytes, frame);
+    if (!CheckLearned(bytes, learned, &pick)) pick = FindCamera(bytes, frame);
+    if (pick.found) check = PoseCheck::Generic;
+    return pick;
 }
 
 std::vector<uint8_t> BoundCameraBytes(const uint8_t* bytes, size_t size, uint32_t first, uint32_t count)
@@ -329,7 +340,7 @@ std::vector<uint8_t> BoundCameraBytes(const uint8_t* bytes, size_t size, uint32_
     return {bytes + offset, bytes + offset + length};
 }
 // The camera for this frame (under g_mu): the learned block re-read, else a search of the candidates.
-bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out)
+bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out, PoseCheck& result)
 {
     const Selection& s = g_model.Current();
     const uint32_t w = g_scene_vp_w >= 1.f ? static_cast<uint32_t>(g_scene_vp_w + 0.5f) : s.color_info.width;
@@ -345,8 +356,13 @@ bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t
         if (it == g_scene_uploads.end() || it->second.version != b.version || !it->second.bytes) continue;
         const auto* bytes = it->second.bytes.get();
         const auto bound = BoundCameraBytes(bytes->data(), bytes->size(), b.first, b.count);
-        const CameraPick p = PickForScene(bound, g_camera, w, h, g_frame + 1);
-        if (!p.found) continue;
+        PoseCheck check = PoseCheck::NoPacket;
+        const CameraPick p = PickForScene(bound, g_camera, w, h, g_frame + 1, check);
+        if (!p.found) {
+            result = std::max(result, check);
+            continue;
+        }
+        result = check;
         g_camera = p;
         g_model.SetCamera(b.buffer, b.slot);
         g_camera_first = b.first;
@@ -359,6 +375,20 @@ bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t
     g_camera = {};
     g_model.SetCamera(0, -1);
     return false;
+}
+
+void CountPoseCheck(PoseCheck result)
+{
+    switch (result) {
+    case PoseCheck::NoPacket: ++g_stats.pose_no_packet; break;
+    case PoseCheck::Extent: ++g_stats.pose_extent; break;
+    case PoseCheck::Repeat: ++g_stats.pose_repeat; break;
+    case PoseCheck::Origin: ++g_stats.pose_origin; break;
+    case PoseCheck::Shape: ++g_stats.pose_shape; break;
+    case PoseCheck::Native: ++g_stats.pose_native; break;
+    case PoseCheck::Legacy: ++g_stats.pose_legacy; break;
+    case PoseCheck::Generic: ++g_stats.pose_generic; break;
+    }
 }
 
 // Diagnostics for a camera miss (under g_mu), at most every 5 s: what the scene draws read and why
@@ -450,7 +480,10 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     CameraPick cam;
     const std::vector<uint8_t>* bytes = nullptr;
     uint64_t version = 0;
-    if (!CameraNow(&cam, &bytes, &version)) {
+    PoseCheck pose_check = PoseCheck::NoPacket;
+    const bool found = CameraNow(&cam, &bytes, &version, pose_check);
+    CountPoseCheck(pose_check);
+    if (!found) {
         ++g_stats.camera_missing;
         DiagnoseCameraMiss();
         return SetReason("No supported camera was found in the scene's constant buffers.");
@@ -1342,12 +1375,18 @@ int FormatStatus(char* out, unsigned long n)
     const ProviderStats s = Stats();
     return std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
-                         "camera_found=%llu camera_missing=%llu jitter_written=%llu%s%s%s",
+                         "camera_found=%llu camera_missing=%llu jitter_written=%llu "
+                         "pose{native=%llu legacy=%llu generic=%llu no_packet=%llu extent=%llu vp_repeat=%llu origin=%llu vp_shape=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
                          static_cast<unsigned long long>(s.camera_found), static_cast<unsigned long long>(s.camera_missing),
-                         static_cast<unsigned long long>(s.jitter_written), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
+                         static_cast<unsigned long long>(s.jitter_written),
+                         static_cast<unsigned long long>(s.pose_native), static_cast<unsigned long long>(s.pose_legacy),
+                         static_cast<unsigned long long>(s.pose_generic), static_cast<unsigned long long>(s.pose_no_packet),
+                         static_cast<unsigned long long>(s.pose_extent), static_cast<unsigned long long>(s.pose_repeat),
+                         static_cast<unsigned long long>(s.pose_origin), static_cast<unsigned long long>(s.pose_shape),
+                         s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
 
