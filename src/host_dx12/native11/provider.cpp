@@ -130,6 +130,22 @@ using CameraBytes = std::shared_ptr<const std::vector<uint8_t>>;
 struct CameraUpload { uint32_t version = 0; CameraBytes bytes; };
 using BindingKey = std::tuple<Id, int, uint32_t, uint32_t>;
 std::map<BindingKey, CameraUpload> g_scene_uploads;
+using SplitKey = std::pair<std::array<uint8_t, 64>, wwii::WorldOrigins>;
+struct SplitVote {
+    FrameModel::CameraBinding projection{};
+    CameraBytes projection_bytes;
+    Id world_buffer = 0;
+    uint32_t draws = 0;
+};
+std::map<SplitKey, SplitVote> g_split_votes;
+struct SplitDraw {
+    CameraBytes world, projection;
+    BindingKey world_binding, projection_binding;
+    SplitVote* vote = nullptr;
+};
+SplitDraw g_split_draw;
+Id g_split_world = 0;
+std::atomic<Id> g_split_candidate{0};
 std::atomic<bool> g_collect_camera{true};
 std::unordered_map<Id, CameraUpload> g_cb_latest;
 std::unordered_map<Id, uint64_t> g_cb_incarnation; // candidate camera buffers: lifetime id, tagged at upload (live object)
@@ -227,7 +243,8 @@ ResourceInfo InfoOf(ID3D11Resource* r, bool depth)
 bool IsCandidate(Id id)
 {
     if (!id) return false;
-    if (g_collect_camera.load(std::memory_order_relaxed)) return true;
+    if (g_collect_camera.load(std::memory_order_relaxed) ||
+        g_split_candidate.load(std::memory_order_relaxed) == id) return true;
     for (auto& c : g_cand)
         if (c.load(std::memory_order_relaxed) == id) return true;
     return false;
@@ -359,12 +376,57 @@ std::vector<uint8_t> BoundCameraBytes(const uint8_t* bytes, size_t size, uint32_
     const size_t length = count ? std::min(size_t(count) * 16, size - offset) : size - offset;
     return {bytes + offset, bytes + offset + length};
 }
+bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uint8_t>*& bytes,
+                 uint64_t& version, std::optional<CameraFacts::RelativePose>& pose)
+{
+    const SplitKey* best_key = nullptr;
+    const SplitVote* best = nullptr;
+    uint32_t votes = 0;
+    for (const auto& [key, vote] : g_split_votes) {
+        const auto bound = BoundCameraBytes(vote.projection_bytes->data(), vote.projection_bytes->size(),
+                                           vote.projection.first, vote.projection.count);
+        const auto vp = camera::LoadMatrix(bound, 0, camera::Layout::RowMajor);
+        if (!wwii::IsRelativeSceneProjection(vp, w, h)) continue;
+        votes += vote.draws;
+        if (!best || vote.draws > best->draws) {
+            best = &vote;
+            best_key = &key;
+            pick.vp = vp;
+        }
+    }
+    // The world candidate must dominate qualified votes and cover a real
+    // share of the scene. A small object drawn twice is not a world origin.
+    if (!best || best->draws < 2 || best->draws <= votes / 2 ||
+        uint64_t(best->draws) * 8 < g_model.SceneDrawsThisFrame()) return false;
+    const auto& b = best->projection;
+    pose = CameraFacts::RelativePose{pick.vp, {best_key->second[0], best_key->second[1], best_key->second[2]}};
+    pick.found = pick.reversed = pick.camera_relative = true;
+    pick.raster_jitter_qualified = false;
+    g_camera = pick;
+    g_model.SetCamera(b.buffer, b.slot);
+    g_camera_first = b.first;
+    g_camera_num = b.count;
+    g_split_world = best->world_buffer;
+    bytes = best->projection_bytes.get();
+    version = b.version;
+    return true;
+}
+
 // The camera for this frame (under g_mu): the learned block re-read, else a search of the candidates.
-bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out, PoseCheck& result)
+bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out,
+               PoseCheck& result, std::optional<CameraFacts::RelativePose>& split_pose)
 {
     const Selection& s = g_model.Current();
     const uint32_t w = g_scene_vp_w >= 1.f ? static_cast<uint32_t>(g_scene_vp_w + 0.5f) : s.color_info.width;
     const uint32_t h = g_scene_vp_h >= 1.f ? static_cast<uint32_t>(g_scene_vp_h + 0.5f) : s.color_info.height;
+    // Prefer the stable split source when viewport jitter owns raster positioning.
+    const auto split = [&] {
+        if (!SplitCamera(w, h, *out, *bytes_out, *version_out, split_pose)) return false;
+        result = PoseCheck::Native;
+        return true;
+    };
+    const bool viewport = g_vpj_route.load(std::memory_order_relaxed);
+    if (viewport && split()) return true;
     auto bindings = g_model.SceneCameraBindings();
     // Prefer the learned range, but never substitute its last frame's bytes.
     std::stable_partition(bindings.begin(), bindings.end(), [&](const auto& b) {
@@ -392,6 +454,7 @@ bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t
         *version_out = b.version;
         return true;
     }
+    if (!viewport && split()) return true;
     g_camera = {};
     g_model.SetCamera(0, -1);
     return false;
@@ -501,7 +564,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     const std::vector<uint8_t>* bytes = nullptr;
     uint64_t version = 0;
     PoseCheck pose_check = PoseCheck::NoPacket;
-    const bool found = CameraNow(&cam, &bytes, &version, pose_check);
+    std::optional<CameraFacts::RelativePose> split_pose;
+    const bool found = CameraNow(&cam, &bytes, &version, pose_check, split_pose);
     CountPoseCheck(pose_check);
     if (!found) {
         ++g_stats.camera_missing;
@@ -509,6 +573,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         return SetReason("No supported camera was found in the scene's constant buffers.");
     }
     ++g_stats.camera_found;
+    if (split_pose) ++g_stats.pose_split;
     const Selection cam_sel = g_model.Current(); // CameraNow may have just chosen (or changed) the camera buffer
     SceneFrame f;
     f.frame = g_frame;
@@ -545,6 +610,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.camera.first_constant = g_camera_first;
     f.camera.num_constants = g_camera_num;
     f.camera.version = version;
+    f.camera.split_pose = split_pose;
     f.camera.bytes = camera_bytes.data();
     f.camera.size = static_cast<uint32_t>(camera_bytes.size());
     const bool vpj_route = g_vpj_route.load(std::memory_order_relaxed);
@@ -600,17 +666,49 @@ void SaveCameraUpload(Id resource, uint32_t version, const uint8_t* data, size_t
     latest.version = version;
     latest.bytes = std::make_shared<const std::vector<uint8_t>>(data, data + size);
 }
+void RememberSplitDraw(const Event& e, const CameraUpload& world, const CameraUpload& projection)
+{
+    const BindingKey world_binding{e.cb[0], 0, e.cb_first[0], e.cb_count[0]};
+    const BindingKey projection_binding{e.cb[1], 1, e.cb_first[1], e.cb_count[1]};
+    if (world.bytes != g_split_draw.world || projection.bytes != g_split_draw.projection ||
+        world_binding != g_split_draw.world_binding || projection_binding != g_split_draw.projection_binding) {
+        g_split_draw = {world.bytes, projection.bytes, world_binding, projection_binding, nullptr};
+        const size_t world_start = size_t(e.cb_first[0]) * 16;
+        const size_t projection_start = size_t(e.cb_first[1]) * 16;
+        if (world_start >= world.bytes->size() || projection_start >= projection.bytes->size()) return;
+        const size_t world_left = world.bytes->size() - world_start;
+        const size_t projection_left = projection.bytes->size() - projection_start;
+        const size_t world_size = e.cb_count[0] ? std::min(world_left, size_t(e.cb_count[0]) * 16) : world_left;
+        const size_t projection_size = e.cb_count[1] ? std::min(projection_left, size_t(e.cb_count[1]) * 16) : projection_left;
+        SplitKey key{};
+        if (projection_size != key.first.size() ||
+            !wwii::DecodeWorldOrigins(world.bytes->data() + world_start, world_size, key.second)) return;
+        std::memcpy(key.first.data(), projection.bytes->data() + projection_start, key.first.size());
+        auto [it, inserted] = g_split_votes.try_emplace(key);
+        if (inserted) {
+            it->second.projection = {e.cb[1], 1, e.cb_first[1], e.cb_count[1], projection.version, 0};
+            it->second.projection_bytes = projection.bytes;
+            it->second.world_buffer = e.cb[0];
+        }
+        g_split_draw.vote = &it->second;
+    }
+    if (g_split_draw.vote) ++g_split_draw.vote->draws;
+}
+
 // Pin the immutable upload actually used by each scene range. A later upload
 // or a different binding in the same ring cannot erase this draw's evidence.
 void RememberSceneUploads(const Event& e)
 {
     if (e.kind != Kind::Draw || !g_model.IsSceneDraw(e)) return;
+    const CameraUpload* split[2]{};
     for (int slot = 0; slot < kCbBindSlots; ++slot) {
         if (!e.cb[slot]) continue;
         const auto it = g_cb_latest.find(e.cb[slot]);
         if (it == g_cb_latest.end() || it->second.version != g_model.CbVersion(e.cb[slot])) continue;
         g_scene_uploads[{e.cb[slot], slot, e.cb_first[slot], e.cb_count[slot]}] = it->second;
+        if (slot < 2 && it->second.bytes) split[slot] = &it->second;
     }
+    if (split[0] && split[1]) RememberSplitDraw(e, *split[0], *split[1]);
 }
 // Called in immediate draw order and while replaying executed command lists.
 void NoteViewportDraw(const Event& e)
@@ -1249,12 +1347,16 @@ bool OnPresent(IDXGISwapChain* swap)
         if (k < kMaxCandidates + 1 && c.first != s.camera_cb) g_cand[k++].store(c.first);
     while (k < kMaxCandidates + 1) g_cand[k++].store(0);
     g_scene_uploads.clear();
+    g_split_draw = {};
+    g_split_votes.clear();
+    g_split_candidate.store(g_split_world, std::memory_order_relaxed);
+    g_split_world = 0;
     g_collect_camera.store(!g_camera.found, std::memory_order_relaxed);
     // Retire upload shadows not in the next scene's acquisition set. Draw-time
     // snapshots keep their own ownership until this frame is closed.
     if (g_cb_latest.size() > 512) {
         for (auto it = g_cb_latest.begin(); it != g_cb_latest.end();) {
-            bool keep = it->first == s.camera_cb;
+            bool keep = it->first == s.camera_cb || it->first == g_split_candidate.load(std::memory_order_relaxed);
             for (const auto& candidate : g_cand) keep |= candidate.load() == it->first;
             if (!keep) it = g_cb_latest.erase(it); else ++it;
         }
@@ -1321,6 +1423,8 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
         g_color_ref.Reset();
         g_depth_ref.Reset();
         g_model.Forget(g_model.Current().color); // the scene targets are usually recreated with the new size
+        g_split_draw = {};
+        g_split_votes.clear();
         g_sel_color.store(0);
         g_sel_depth.store(0);
         g_vpj_sample.store(0);
@@ -1506,7 +1610,7 @@ int FormatStatus(char* out, unsigned long n)
     return std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
                          "camera_found=%llu camera_missing=%llu jitter_written=%llu "
-                         "pose{native=%llu legacy=%llu generic=%llu no_packet=%llu extent=%llu vp_repeat=%llu origin=%llu vp_shape=%llu} "
+                         "pose{native=%llu legacy=%llu generic=%llu no_packet=%llu extent=%llu vp_repeat=%llu origin=%llu vp_shape=%llu split=%llu} "
                          "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
@@ -1517,6 +1621,7 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(s.pose_generic), static_cast<unsigned long long>(s.pose_no_packet),
                          static_cast<unsigned long long>(s.pose_extent), static_cast<unsigned long long>(s.pose_repeat),
                          static_cast<unsigned long long>(s.pose_origin), static_cast<unsigned long long>(s.pose_shape),
+                         static_cast<unsigned long long>(s.pose_split),
                          g_vpj_route.load() ? 1 : 0, g_vpj_sample.load() ? 1 : 0,
                          static_cast<unsigned long long>(g_vpj_frames.load()), static_cast<unsigned long long>(g_vpj_draws.load()),
                          g_vpj_last_frame_draws.load(), static_cast<unsigned long long>(g_vpj_sets.load()),

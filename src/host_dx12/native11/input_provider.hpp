@@ -20,7 +20,9 @@
 // Portable header: D3D11 objects are passed as opaque pointers so CPU tests build on Linux.
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <optional>
 
 namespace na::native11 {
 
@@ -52,6 +54,11 @@ struct CameraFacts {
     bool viewport_jitter = false;  // the raster sample is external to the camera matrix
     bool jitter_applied = false;   // the provider wrote this frame's jitter into the scene camera
     float jitter_px[2] = {0, 0};   // the jitter written, in pixels of the scene extent (DLSS convention)
+    struct RelativePose {
+        std::array<double, 16> projection{};
+        std::array<double, 3> origin{};
+    };
+    std::optional<RelativePose> split_pose; // projection and origin corroborated on the same scene draws
 };
 
 enum class Boundary : uint8_t {
@@ -80,7 +87,7 @@ using SceneCallback = bool (*)(void* user, void* context, const SceneFrame& fram
 struct ProviderStats {
     uint64_t frames = 0, fired = 0, missed = 0, unplaceable = 0, contradictions = 0, selection_changes = 0;
     uint64_t camera_found = 0, camera_missing = 0, jitter_written = 0;
-    uint64_t pose_native = 0, pose_legacy = 0, pose_generic = 0;
+    uint64_t pose_native = 0, pose_legacy = 0, pose_generic = 0, pose_split = 0;
     uint64_t pose_no_packet = 0, pose_extent = 0, pose_repeat = 0, pose_origin = 0, pose_shape = 0;
     const char* last_miss = "";
 };

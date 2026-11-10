@@ -132,7 +132,8 @@ struct Game {
     ComPtr<ID3D11DepthStencilView> shadow_dsv, dsv;
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
     ComPtr<ID3D11ShaderResourceView> color_srv;
-    ComPtr<ID3D11Buffer> cam_cb, obj_cb;
+    bool campaign_split_camera = false, split_tie = false;
+    ComPtr<ID3D11Buffer> cam_cb, obj_cb, split_world, split_projection;
     ComPtr<ID3D11VertexShader> vs, vs_post;
     ComPtr<ID3D11PixelShader> ps_scene, ps_tonemap, ps_hud;
     ComPtr<ID3D11BlendState> blend;
@@ -247,9 +248,9 @@ void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp,
             na::native11::StoreMatrix(bytes.data(), bytes.size(), offset, na::camera::Layout::ColumnMajor, relative);
         const float origin[]{static_cast<float>(vp[3]), -10183.53808594f, -50.8396759f, 0.f};
         const float extent[]{float(g.w), float(g.h), 1.f / g.w, 1.f / g.h};
-        if (!g.campaign_single_origin)
+        if (!g.campaign_split_camera && !g.campaign_single_origin)
             std::memcpy(bytes.data() + (g.campaign_native_pose ? 800 : 384), origin, sizeof origin);
-        if (!g.campaign_blank_witness)
+        if (!g.campaign_split_camera && !g.campaign_blank_witness)
             std::memcpy(bytes.data() + (g.campaign_native_pose ? 928 : 944), origin, sizeof origin);
         std::memcpy(bytes.data() + 704, extent, sizeof extent);
     }
@@ -267,6 +268,33 @@ void SetObject(ID3D11DeviceContext* c, Game& g, int i)
     const float o[4] = {float(i % 7) * 0.05f - 0.15f, float(i % 5) * 0.05f - 0.1f, 0, 0};
     std::memcpy(m.pData, o, 16);
     c->Unmap(g.obj_cb.Get(), 0);
+}
+
+void UploadSplitWorld(ID3D11DeviceContext* c, Game& g, float x)
+{
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(c->Map(g.split_world.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    std::memset(m.pData, 0, 160);
+    auto* dst = static_cast<uint8_t*>(m.pData);
+    for (const size_t offset : {0u, 96u}) {
+        const std::array<float, 16> world{1, 0, 0, x, 0, 1, 0, -8018, 0, 0, 1, 1746, 0, 0, 0, 1};
+        std::memcpy(dst + offset, world.data(), 64);
+    }
+    c->Unmap(g.split_world.Get(), 0);
+}
+
+void BindSplitCamera(ID3D11DeviceContext* c, Game& g)
+{
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (SUCCEEDED(c->Map(g.split_projection.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        const na::camera::Matrix relative{double(g.h) / g.w, 0, 0, 0, 0, 1, 0, 0,
+                                          0, 0, 0, 4, 0, 0, 1, 0};
+        na::native11::StoreMatrix(static_cast<uint8_t*>(m.pData), 64, 0, na::camera::Layout::RowMajor, relative);
+        c->Unmap(g.split_projection.Get(), 0);
+    }
+    UploadSplitWorld(c, g, 11659.f);
+    ID3D11Buffer* split[]{g.split_world.Get(), g.split_projection.Get()};
+    c->VSSetConstantBuffers(0, 2, split);
 }
 
 std::atomic<bool> g_tonemap_bound{false}; // the immediate context's tonemap read was bound this frame
@@ -316,7 +344,11 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     c->ClearRenderTargetView(g.color_rtv.Get(), clear);
     c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
     Viewport(c, g.w, g.h);
+    if (g.campaign_split_camera) BindSplitCamera(c, g);
     for (int i = 0; i < 40; ++i) {
+        // Rewrite the same buffer to an identity-basis object pose. These
+        // draws must never get the support of the earlier world-buffer version.
+        if (g.campaign_split_camera && i == (g.split_tie ? 20 : 39)) UploadSplitWorld(c, g, 7.f);
         if (g.campaign_mixed_ring && i == 20) {
             // Real campaign rings carry camera and non-camera slices at the
             // same binding. Discard/reuse it after the camera's scene draws.
@@ -405,9 +437,10 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     if (!inputs) ++s.wrong_inputs;
     if (g_tonemap_bound && f.boundary == na::native11::Boundary::BeforeRead) ++s.after_tonemap;
     if (f.scene_draws != 40) ++s.no_scene;
-    const UINT camera_size = g.campaign_pixel_range ? 32768u : g.campaign_camera ? 1280u : 512u;
-    const int vs_slot = g.campaign_pixel_range ? -1 : g.campaign_native_pose ? 3 : 0;
-    if (!f.camera.bytes || f.camera.size != camera_size || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) ||
+    const UINT camera_size = g.campaign_split_camera ? 64u : g.campaign_pixel_range ? 32768u : g.campaign_camera ? 1280u : 512u;
+    const int vs_slot = g.campaign_split_camera ? 1 : g.campaign_pixel_range ? -1 : g.campaign_native_pose ? 3 : 0;
+    auto* expected_cb = g.campaign_split_camera ? g.split_projection.Get() : g.cam_cb.Get();
+    if (!f.camera.bytes || f.camera.size != camera_size || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(expected_cb)) ||
         f.camera.vs_slot != vs_slot) {
         if (!s.no_camera)
             std::printf("camera handed over: bytes=%p size=%u buffer=%llx (game %llx) slot=%d first=%u num=%u version=%llu\n",
@@ -962,6 +995,27 @@ int main()
         const auto viewport_off = g_seen.jitter_reported;
         for (int i = 0; i < 4; ++i) present_campaign();
         expect(g_seen.jitter_reported == viewport_off, "the jitter switch stops the viewport offsets");
+
+        camera_desc.ByteWidth = 160;
+        expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, &g.split_world)), "create split world block");
+        camera_desc.ByteWidth = 64;
+        expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, &g.split_projection)), "create split projection block");
+        g.campaign_split_camera = true;
+        // Newly bound buffers get acquired after the old source misses.
+        present_campaign();
+        const auto split_start = evaluations;
+        for (int i = 0; i < 8; ++i) present_campaign();
+        expect(evaluations == split_start + 8 && g_seen.last.camera.split_pose &&
+               g_seen.last.camera.split_pose->origin[0] == -11659.0,
+               "split camera keeps DLAA delivering and excludes a late identity-basis object pose");
+        g.split_tie = true;
+        const auto tied = evaluations;
+        present_campaign();
+        expect(evaluations == tied, "equally supported contradictory world origins do not deliver a false pose");
+        g.split_tie = false;
+        present_campaign();
+        expect(evaluations == tied + 1, "fresh scene agreement restores split-camera DLAA");
+        g.campaign_split_camera = false;
         na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
     }
     // Real shader sampling: each mip is a different colour. Exact LOD 1

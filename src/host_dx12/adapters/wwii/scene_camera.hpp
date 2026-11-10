@@ -19,6 +19,38 @@ struct SceneCamera {
     bool raster_jitter_qualified = false;
 };
 
+inline bool IsRelativeSceneProjection(const camera::Matrix& vp, uint32_t width, uint32_t height)
+{
+    camera::VpGeometry geometry{};
+    camera::Candidate candidate{};
+    return width && height && camera::ViewProjection(vp, candidate) && candidate.reversed &&
+        camera::DecomposeViewProjection(vp, geometry) &&
+        std::abs(geometry.sy / geometry.sx - double(width) / height) <= 0.02 &&
+        std::abs(geometry.position[0]) <= 1e-5 && std::abs(geometry.position[1]) <= 1e-5 &&
+        std::abs(geometry.position[2]) <= 1e-5;
+}
+
+// Current and previous identity-basis world transforms witness the rebased
+// origin. An individual matching transform is only a vote, never a camera.
+using WorldOrigins = std::array<double, 6>;
+inline bool DecodeWorldOrigins(const uint8_t* bytes, size_t size, WorldOrigins& out)
+{
+    if (size != 160) return false;
+    constexpr std::array<float, 16> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    for (size_t sample = 0; sample < 2; ++sample) {
+        std::array<float, 16> matrix{};
+        std::memcpy(matrix.data(), bytes + sample * 96, 64);
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const size_t translation = axis * 4 + 3;
+            if (!std::isfinite(matrix[translation])) return false;
+            out[sample * 3 + axis] = -double(matrix[translation]);
+            matrix[translation] = 0.f;
+        }
+        if (matrix != identity) return false;
+    }
+    return out[0] != 0 || out[1] != 0 || out[2] != 0;
+}
+
 // Campaign shader constant layouts observed at the scene draw.
 // Require scene extent and the observed redundant pose fields. p49040 has
 // rounded copies of the world origin, and shader variants reuse the adjacent
@@ -97,13 +129,7 @@ inline bool DecodeSceneCamera(const std::vector<uint8_t>& bytes, uint32_t declar
         if (!agrees) { failed = "origin_witness"; continue; }
 
         const auto vp = camera::LoadMatrix(bytes, layout.vp, camera::Layout::ColumnMajor);
-        camera::VpGeometry geometry{};
-        camera::Candidate candidate{};
-        if (!camera::ViewProjection(vp, candidate) || !candidate.reversed ||
-            !camera::DecomposeViewProjection(vp, geometry) ||
-            std::abs(geometry.sy / geometry.sx - double(width) / height) > 0.02 ||
-            std::abs(geometry.position[0]) > 1e-5 || std::abs(geometry.position[1]) > 1e-5 ||
-            std::abs(geometry.position[2]) > 1e-5) { failed = "vp_shape"; continue; }
+        if (!IsRelativeSceneProjection(vp, width, height)) { failed = "vp_shape"; continue; }
         // Native reads establish motion, but do not establish which of its
         // matrices the vertex shader uses to place raster samples.
         out = {vp, {origin[0], origin[1], origin[2]}, layout.vp, layout.duplicate, !layout.native_variant};
