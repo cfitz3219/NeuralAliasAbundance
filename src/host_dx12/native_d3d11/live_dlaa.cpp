@@ -437,14 +437,17 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     auto* result = slot.output.Native();
     uint32_t sharpened = 0;
-    const uint32_t sharpness = settings::Get().j2_sharpness.load();
+    // The menu value is 0..100; the RCAS pass takes 0..200 (100 = standard RCAS). The DX12 host
+    // doubles it at every call site; without that the slider's top was plain RCAS and its upper,
+    // stronger half was unreachable (p37752: 0 and 100 looked alike).
+    const uint32_t sharpness = 2u * settings::Get().j2_sharpness.load();
     if (evaluated && sharpness) {
         Barrier(list, slot.output.Effects(), kWrite, kRead);
         Barrier(list, slot.color.Effects(), kRead, kWrite);
         if (j2::RecordNativeRcas(s.device.Get(), list, slot.output.Effects(), slot.color.Effects(), shared_depth,
                                  ci.width, ci.height, sharpness, cf, index, frame.reversed_depth)) {
             result = slot.color.Native();
-            sharpened = sharpness;
+            sharpened = sharpness / 2; // reported on the menu scale
         }
         Barrier(list, slot.output.Effects(), kRead, kCommon);
         Barrier(list, slot.color.Effects(), kWrite, kCommon);
