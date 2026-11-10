@@ -654,6 +654,33 @@ int main()
         g.swap->Present(0, 0);
         expect(plain.TopLeftX == 0.f && plain.TopLeftY == 0.f && plain.Width == float(g.w) && plain.Height == float(g.h),
                "a frame with no jitter request renders through the game's own viewports");
+        // Submit a list after Present advances the armed offset. DLAA needs
+        // the offset recorded into the executed draws, not the newer request.
+        ComPtr<ID3D11DeviceContext> delayed;
+        expect(SUCCEEDED(g.device->CreateDeferredContext(0, &delayed)), "create delayed viewport recording context");
+        if (delayed) {
+            na::native11::SetNextJitter(0.25f, -0.25f);
+            Scene(g.ctx.Get(), g, frame++);
+            Post(g.ctx.Get(), g, true);
+            g.swap->Present(0, 0);
+            Scene(delayed.Get(), g, frame);
+            ComPtr<ID3D11CommandList> list;
+            expect(SUCCEEDED(delayed->FinishCommandList(FALSE, &list)), "finish the delayed jitter list");
+            na::native11::SetNextJitter(-0.25f, 0.25f);
+            Scene(g.ctx.Get(), g, frame++);
+            Post(g.ctx.Get(), g, true);
+            g.swap->Present(0, 0);
+            if (list) {
+                const auto before = g_seen.calls;
+                g.ctx->ExecuteCommandList(list.Get(), FALSE);
+                Post(g.ctx.Get(), g, true);
+                expect(g_seen.calls == before + 1 && g_seen.last.camera.viewport_jitter &&
+                       g_seen.last.camera.jitter_applied && g_seen.last.camera.jitter_px[0] == 0.25f &&
+                       g_seen.last.camera.jitter_px[1] == -0.25f,
+                       "delayed list reports the executed viewport sample after Present advances");
+                g.swap->Present(0, 0);
+            }
+        }
         na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
     }
 #endif
@@ -901,7 +928,6 @@ int main()
     {
         na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
         na::j2::SetJitter(true);
-        present_campaign(); // back to an accepted pose after the rejected frame above; arms the first sample
         const auto jitter_before_viewport = g_seen.jitter_reported;
         const auto delivered_before_viewport = evaluations;
         for (int i = 0; i < 12; ++i) present_campaign();

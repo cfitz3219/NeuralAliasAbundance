@@ -229,16 +229,27 @@ camera::CameraFrame Pose(Session& s, const native11::SceneFrame& frame, UINT w, 
         s.camera.Reset();
         s.pick = {};
     }
-    const double jitter[2]{c.jitter_applied ? c.jitter_px[0] : 0, c.jitter_applied ? c.jitter_px[1] : 0};
+    // A viewport shift never enters the uploaded matrix. Removing it from the
+    // matrix here would also create false camera motion on a still scene.
+    const bool matrix_jitter = c.jitter_applied && !c.viewport_jitter;
+    const double jitter[2]{matrix_jitter ? c.jitter_px[0] : 0, matrix_jitter ? c.jitter_px[1] : 0};
+    camera::CameraFrame result;
     wwii::SceneCamera scene;
-    if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(length), w, h, scene))
-        return s.camera.UpdateCameraRelative(scene.vp, scene.origin, frame.frame, w, h, jitter);
-    native11::CameraPick pick;
-    if (!native11::CheckLearned(bytes, s.pick, &pick))
-        pick = native11::FindCamera(bytes, c.version ? c.version : frame.frame + 1);
-    if (!pick.found) return {};
-    s.pick = pick;
-    return s.camera.Update(pick.vp, frame.frame, w, h, jitter);
+    if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(length), w, h, scene)) {
+        result = s.camera.UpdateCameraRelative(scene.vp, scene.origin, frame.frame, w, h, jitter);
+    } else {
+        native11::CameraPick pick;
+        if (!native11::CheckLearned(bytes, s.pick, &pick))
+            pick = native11::FindCamera(bytes, c.version ? c.version : frame.frame + 1);
+        if (!pick.found) return {};
+        s.pick = pick;
+        result = s.camera.Update(pick.vp, frame.frame, w, h, jitter);
+    }
+    if (c.viewport_jitter && c.jitter_applied) {
+        result.jitter_px_x = c.jitter_px[0];
+        result.jitter_px_y = c.jitter_px[1];
+    }
+    return result;
 }
 
 bool FailSession(Session& s, const char* why)
@@ -567,7 +578,7 @@ bool FormatMenuStatus(char* out, size_t capacity)
     if (running)
         std::snprintf(out, capacity, "Native DX11 DLAA running at %u × %u. %llu frames improved.%s",
                       unsigned(size >> 32), unsigned(size), static_cast<unsigned long long>(delivered.load()),
-                      raster_slot.load() < 0 ? " Camera motion is available. Jitter is waiting for a verified raster projection." : "");
+                      j2::Jitter() && raster_slot.load() < 0 ? " Jitter is waiting for a matched scene sample." : "");
     else {
         const auto provider = native11::Stats();
         const char* waiting = !delivered.load() && provider.last_miss && provider.last_miss[0]

@@ -93,6 +93,7 @@ struct Event {
     bool indirect = false;
     Id cb[kCbBindSlots] = {};     // Draw: constant buffers (VS 0..13, PS kPsCbBase + 0..13)
     uint16_t cb_first[kCbBindSlots] = {}, cb_count[kCbBindSlots] = {}; // in 16-byte constants
+    uint64_t viewport_sample = 0; // Draw: actual native viewport offset encoded as two floats
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
 };
 
