@@ -929,10 +929,12 @@ int main()
     present_campaign();
     g.campaign_single_origin = false;
     const auto rejected_pose_stats = na::native11::Stats();
-    expect(rejected_pose_stats.pose_repeat == accepted_pose_stats.pose_repeat + 1 &&
-           rejected_pose_stats.camera_missing == accepted_pose_stats.camera_missing + 1 &&
-           evaluations == before_native_pose + 22,
-           "unqualified single-origin scene counts one projection mismatch and no DLAA delivery");
+    // Native p47656: this form (matrix copy at 192, origin at 928 only) ran 36 min of play.
+    expect(rejected_pose_stats.pose_repeat == accepted_pose_stats.pose_repeat &&
+           rejected_pose_stats.camera_missing == accepted_pose_stats.camera_missing &&
+           rejected_pose_stats.pose_native == accepted_pose_stats.pose_native + 1 &&
+           evaluations == before_native_pose + 23,
+           "the single-origin form (matrix copy at 192) yields the native pose and delivers DLAA");
     // Native p37752: the game leaves the second origin copy blank for whole stretches (30 s of
     // rejected frames, no DLAA). Both matrices and the first origin still establish the pose.
     g.campaign_blank_witness = true;

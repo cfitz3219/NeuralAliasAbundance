@@ -40,6 +40,10 @@ inline bool DecodeSceneCamera(const std::vector<uint8_t>& bytes, uint32_t declar
         // Native campaign p30648: the copy at 64 is unrelated. Two matching
         // matrices and two nonzero origin witnesses still establish the pose.
         {1280, 208, 320, 704, {800, 928, 0}, 2, true},
+        // Native p47656: a second shader form copies the matrix at 192 instead and keeps the
+        // origin at 928 only (800 then holds a plane, w != 0). 36 min of play ran without DLAA
+        // while it was rejected as vp_repeat.
+        {1280, 192, 320, 704, {928, 800, 0}, 2, true},
         {1536, 192, 0, 816, {480, 512, 528}, 3, false},
     };
     bool matched_projection_copy = false;
@@ -57,26 +61,37 @@ inline bool DecodeSceneCamera(const std::vector<uint8_t>& bytes, uint32_t declar
             continue;
         }
         matched_projection_copy = true;
-        std::memcpy(origin.data(), bytes.data() + layout.origin[0], sizeof(origin));
-        if (!std::isfinite(origin[0]) || !std::isfinite(origin[1]) || !std::isfinite(origin[2]) || origin[3] != 0.f) { failed = "origin"; continue; }
-        if (layout.native_variant && origin[0] == 0.f && origin[1] == 0.f && origin[2] == 0.f) {
-            failed = "empty_origin"; continue;
-        }
         bool agrees = true;
-        for (uint32_t i = 1; i < layout.origin_count; ++i) {
-            std::array<float, 4> other{};
-            std::memcpy(other.data(), bytes.data() + layout.origin[i], sizeof(other));
-            // Native p37752 (frame 13264, then every frame from 22045 for 30 s): the game leaves
-            // this copy all zero for whole stretches while both matrices, the extent and the first
-            // origin stay live, and DLAA stopped for as long as that lasted. A blank copy is
-            // absent, not a disagreement. One that holds anything must still agree.
-            if (layout.native_variant && other[0] == 0.f && other[1] == 0.f && other[2] == 0.f && other[3] == 0.f)
-                continue;
-            agrees &= other[3] == 0.f;
-            for (size_t axis = 0; axis < 3; ++axis) {
-                const double scale = std::max(1.0, std::max(std::abs(double(origin[axis])), std::abs(double(other[axis]))));
-                agrees &= std::isfinite(other[axis]) &&
-                    std::abs(double(origin[axis]) - other[axis]) <= 2.0 * std::numeric_limits<float>::epsilon() * scale;
+        if (layout.native_variant) {
+            // Native forms: each origin slot is either a live origin (finite, w == 0, not all
+            // zero), blank, or unrelated data (w != 0). p37752 left 928 blank for 30 s, p47656
+            // put a plane at 800 while 928 held the origin. Every live origin must agree and
+            // at least one must exist.
+            uint32_t live = 0;
+            for (uint32_t i = 0; i < layout.origin_count; ++i) {
+                std::array<float, 4> slot{};
+                std::memcpy(slot.data(), bytes.data() + layout.origin[i], sizeof(slot));
+                if (!std::isfinite(slot[0]) || !std::isfinite(slot[1]) || !std::isfinite(slot[2]) || slot[3] != 0.f) continue;
+                if (slot[0] == 0.f && slot[1] == 0.f && slot[2] == 0.f) continue;
+                if (!live++) { origin = slot; continue; }
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    const double scale = std::max(1.0, std::max(std::abs(double(origin[axis])), std::abs(double(slot[axis]))));
+                    agrees &= std::abs(double(origin[axis]) - slot[axis]) <= 2.0 * std::numeric_limits<float>::epsilon() * scale;
+                }
+            }
+            if (!live) { failed = "empty_origin"; continue; }
+        } else {
+            std::memcpy(origin.data(), bytes.data() + layout.origin[0], sizeof(origin));
+            if (!std::isfinite(origin[0]) || !std::isfinite(origin[1]) || !std::isfinite(origin[2]) || origin[3] != 0.f) { failed = "origin"; continue; }
+            for (uint32_t i = 1; i < layout.origin_count; ++i) {
+                std::array<float, 4> other{};
+                std::memcpy(other.data(), bytes.data() + layout.origin[i], sizeof(other));
+                agrees &= other[3] == 0.f;
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    const double scale = std::max(1.0, std::max(std::abs(double(origin[axis])), std::abs(double(other[axis]))));
+                    agrees &= std::isfinite(other[axis]) &&
+                        std::abs(double(origin[axis]) - other[axis]) <= 2.0 * std::numeric_limits<float>::epsilon() * scale;
+                }
             }
         }
         if (!agrees) { failed = "origin_witness"; continue; }

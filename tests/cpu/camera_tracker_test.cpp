@@ -175,6 +175,37 @@ int main()
              CHECK(!na::wwii::DecodeSceneCamera(bytes, 1280, W, H, camera, &why));
              CHECK(why && std::strcmp(why, "empty_origin") == 0);
          }},
+        {"WWII native second form: matrix copy at 192, origin at 928, a plane at 800", [] {
+             // Native p47656 frames 85512..173674: VP at 192 == VP at 320, origin only at 928,
+             // 800 holds (0.11, -0.99, 0.48, 2233.48). Rejected as vp_repeat for 36 min.
+             const Matrix vp = Mul(Perspective(true, 1), View(0.25, 0, 0, 0));
+             std::array<float, 16> column{};
+             for (size_t r = 0; r < 4; ++r)
+                 for (size_t c = 0; c < 4; ++c) column[c * 4 + r] = float(vp[r * 4 + c]);
+             const float extent[]{float(W), float(H), 1.f / W, 1.f / H};
+             const float origin[]{-4064.15f, -5890.40f, -675.12f, 0};
+             const float plane[]{0.11f, -0.99f, 0.48f, 2233.48f};
+             std::vector<uint8_t> bytes(1280);
+             for (size_t o : {192u, 320u}) std::memcpy(bytes.data() + o, column.data(), 64);
+             std::memcpy(bytes.data() + 704, extent, sizeof(extent));
+             std::memcpy(bytes.data() + 800, plane, sizeof(plane));
+             std::memcpy(bytes.data() + 928, origin, sizeof(origin));
+             na::wwii::SceneCamera camera;
+             const char* why = nullptr;
+             CHECK(na::wwii::DecodeSceneCamera(bytes, 1280, W, H, camera, &why));
+             CHECK(camera.vp_offset == 192 && !camera.raster_jitter_qualified);
+             NEAR(camera.origin[0], double(origin[0]), 1e-9);
+             // The first form with the plane at 800 and the origin at 928 (p47656 frame 144712).
+             std::vector<uint8_t> first = bytes;
+             std::memset(first.data() + 192, 0, 64);
+             for (size_t o : {208u, 320u}) std::memcpy(first.data() + o, column.data(), 64);
+             CHECK(na::wwii::DecodeSceneCamera(first, 1280, W, H, camera, &why));
+             CHECK(camera.vp_offset == 208);
+             NEAR(camera.origin[2], double(origin[2]), 1e-9);
+             // Matrices that do not repeat are still no pose.
+             std::memset(bytes.data() + 320, 0, 64);
+             CHECK(!na::wwii::DecodeSceneCamera(bytes, 1280, W, H, camera, &why));
+         }},
         {"camera-relative CBV origin reproduces world-space pixel motion", [] {
              for (bool reverse : {false, true}) for (double sign : {1.0, -1.0}) {
                  const Matrix p = Perspective(reverse, sign);
