@@ -916,3 +916,7 @@ Cort requested Fable's latest build. The WWII updater now targets exact 34ce127,
 ## 2026-11-09 Pacific — WWII f35314f staged
 
 Cort requested Fable's latest build. Exact f35314f restores the full native sharpening range to match DX12. All WWII CMDs target Documents/NA-wwii-on12-f35314f. Nine focused Windows checks and isolated upgrade/rollback passed. Campaign visual comparison belongs to Cort.
+
+## 2026-11-09 Pacific — WWII 3b423ba staged
+
+Exact Fable 3b423ba fixes the confirmed blank second camera-position copy rejection. The actual p47656 replay goes from zero to three accepted camera packets and nine automated Windows checks passed. The WWII update, install, trial, results and rollback CMDs point to the new package. Isolated upgrade/rollback passed. Cort owns the campaign run. The later projection-repeat rejection seen in p47656 is tracked separately.
