@@ -31,6 +31,7 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/frame_model.hpp"
+#include "host_dx12/native11/viewport_jitter.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
 #include <d3d11_4.h>
@@ -81,6 +82,10 @@ struct Ctx {
     Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
     uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
     float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0; // viewport 0
+    D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {}; // the game's own viewports
+    UINT vp_n = 0;
+    bool vpj_applied = false;          // our offset copies are bound on this context now
+    float vpj_dx = 0, vpj_dy = 0;      // the sample they carry
     uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
     std::vector<std::pair<size_t, std::vector<uint8_t>>> cb_bytes; // (event index, bytes) for CbUpdate events
@@ -94,6 +99,8 @@ struct Ctx {
         std::memset(cb_first, 0, sizeof(cb_first));
         std::memset(cb_num, 0, sizeof(cb_num));
         vp_x = vp_y = vp_w = vp_h = 0;
+        vp_n = 0;
+        vpj_applied = false;
     }
 };
 struct ListRecord {
@@ -142,6 +149,17 @@ bool g_jitter_requested = false;
 neural_alias::JitterSample g_jitter{0, 0};
 bool g_jitter_active = false;
 bool g_jitter_written = false; // this frame's camera upload carried our sample
+// Viewport jitter (viewport_jitter.hpp): the route used on the native path. The frame's sample is
+// applied to the game's viewports on scene draws, on whichever context records them, so it is read
+// without g_mu. While it is the route, the camera-matrix write (JitterUpload) stays out of it.
+std::atomic<bool> g_vpj_route{false}; // SetJitterRoute; the host turns it on for the native path
+std::atomic<bool> g_vpj_on{false};
+std::atomic<float> g_vpj_x{0.f}, g_vpj_y{0.f};
+std::atomic<Id> g_sel_depth{0};
+std::atomic<uint32_t> g_sel_depth_w{0}, g_sel_depth_h{0};
+std::atomic<uint32_t> g_vpj_frame_draws{0}; // scene draws rasterised with this frame's sample
+std::atomic<uint64_t> g_vpj_frames{0}, g_vpj_draws{0}, g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_unknown{0};
+std::atomic<uint32_t> g_vpj_last_frame_draws{0};
 ProviderStats g_stats;
 char g_reason[192] = {};
 
@@ -494,8 +512,13 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.camera.version = version;
     f.camera.bytes = camera_bytes.data();
     f.camera.size = static_cast<uint32_t>(camera_bytes.size());
-    f.camera.raster_jitter_qualified = f.camera.vs_slot >= 0 && cam.raster_jitter_qualified;
-    f.camera.jitter_applied = f.camera.raster_jitter_qualified && g_jitter_written;
+    // Viewport route: the write needs no camera layout, and "applied" means scene draws of this very
+    // frame were rasterised with the sample. Matrix route: as qualified by the camera adapter.
+    const bool vpj_route = g_vpj_route.load(std::memory_order_relaxed);
+    const bool vpj_applied = vpj_route && g_vpj_on.load(std::memory_order_relaxed) &&
+                             g_vpj_frame_draws.load(std::memory_order_relaxed) > 0;
+    f.camera.raster_jitter_qualified = vpj_route || (f.camera.vs_slot >= 0 && cam.raster_jitter_qualified);
+    f.camera.jitter_applied = vpj_route ? vpj_applied : (f.camera.raster_jitter_qualified && g_jitter_written);
     f.camera.jitter_px[0] = f.camera.jitter_applied ? static_cast<float>(g_jitter.x_pixels) : 0.f;
     f.camera.jitter_px[1] = f.camera.jitter_applied ? static_cast<float>(g_jitter.y_pixels) : 0.f;
     f.boundary = boundary;
@@ -572,10 +595,55 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes =
         SaveCameraUpload(e.resource, v, static_cast<const uint8_t*>(cb_bytes), cb_size);
 }
 
+// Viewport jitter, before a game draw is forwarded: a depth-tested draw into the scene depth gets
+// the game's viewports moved by this frame's sample; any other draw gets the game's own back.
+void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
+{
+    const bool on = g_vpj_on.load(std::memory_order_acquire);
+    if (!on && !x->vpj_applied) return;
+    const Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
+    const bool scene = on && scene_depth && x->depth == scene_depth && x->depth_test;
+    if (scene && !x->vp_n) g_vpj_unknown.fetch_add(1, std::memory_order_relaxed);
+    const bool want = WantsViewportJitter(on, x->depth, scene_depth, x->depth_test, x->vp_n);
+    const UINT n = x->vp_n;
+    if (want) {
+        g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
+        g_vpj_frame_draws.fetch_add(1, std::memory_order_relaxed);
+    } else if (!x->vpj_applied) {
+        return;
+    }
+    const float dx = g_vpj_x.load(std::memory_order_relaxed), dy = g_vpj_y.load(std::memory_order_relaxed);
+    if (want && x->vpj_applied && x->vpj_dx == dx && x->vpj_dy == dy) return; // already bound: the common case
+    D3D11_VIEWPORT v[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    if (want) {
+        ViewportRect r[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        for (UINT i = 0; i < n; ++i) r[i] = {x->vps[i].TopLeftX, x->vps[i].TopLeftY, x->vps[i].Width, x->vps[i].Height};
+        JitterViewports(r, n, dx, dy, g_sel_depth_w.load(std::memory_order_relaxed), g_sel_depth_h.load(std::memory_order_relaxed));
+        for (UINT i = 0; i < n; ++i) {
+            v[i] = x->vps[i];
+            v[i].TopLeftX = r[i].x;
+            v[i].TopLeftY = r[i].y;
+            v[i].Width = r[i].w;
+            v[i].Height = r[i].h;
+        }
+        x->vpj_applied = true;
+        x->vpj_dx = dx;
+        x->vpj_dy = dy;
+        g_vpj_sets.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        x->vpj_applied = false;
+        if (!n) return; // nothing known to hand back; the game sets its own before relying on them
+        for (UINT i = 0; i < n; ++i) v[i] = x->vps[i];
+        g_vpj_restores.fetch_add(1, std::memory_order_relaxed);
+    }
+    O(c, x).rs_vp(c, n, v); // the original: not a change of the game's viewports
+}
+
 void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
 {
     Ctx* x = Get(c);
     if (!x) return;
+    VpjBeforeDraw(c, x);
     const uint64_t policy = SamplerPolicyKey();
     if (x->sampler_policy != policy) {
         RefreshSamplers(c);
@@ -689,6 +757,7 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
     neural_alias::JitterSample sample{0, 0};
     {
         std::lock_guard<std::mutex> l(g_mu);
+        if (g_vpj_route.load(std::memory_order_relaxed)) return false; // jitter goes through the viewports; never both
         const auto& selection = g_model.Current();
         // A PS-only pose can reconstruct camera motion. Rewriting it cannot
         // move the scene's raster samples and must not be reported as jitter.
@@ -981,6 +1050,10 @@ void STDMETHODCALLTYPE RSSetViewports_d(ID3D11DeviceContext* c, UINT n, const D3
         x->vp_y = n && v ? v[0].TopLeftY : 0.f;
         x->vp_w = n && v ? v[0].Width : 0.f;
         x->vp_h = n && v ? v[0].Height : 0.f;
+        // The game's own viewports replace ours; the next scene draw moves them again.
+        x->vp_n = v ? (std::min)(n, UINT(D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)) : 0u;
+        for (UINT i = 0; i < x->vp_n; ++i) x->vps[i] = v[i];
+        x->vpj_applied = false;
     }
     O(c, x).rs_vp(c, n, v);
 }
@@ -1130,6 +1203,19 @@ bool OnPresent(IDXGISwapChain* swap)
     // evaluation), the next frame's camera is the game's own, unjittered.
     g_jitter_active = g_jitter_requested && g_camera.found;
     g_jitter = neural_alias::JitterSample{g_next_jitter[0], g_next_jitter[1]};
+    // Viewport route: the same one-frame request, applied on the scene draws of the frame starting here.
+    const uint32_t jittered_draws = g_vpj_frame_draws.exchange(0, std::memory_order_relaxed);
+    g_vpj_last_frame_draws.store(jittered_draws, std::memory_order_relaxed);
+    if (jittered_draws) g_vpj_frames.fetch_add(1, std::memory_order_relaxed);
+    g_sel_depth.store(s.depth, std::memory_order_relaxed);
+    g_sel_depth_w.store(s.depth_info.width, std::memory_order_relaxed);
+    g_sel_depth_h.store(s.depth_info.height, std::memory_order_relaxed);
+    g_vpj_x.store(static_cast<float>(g_jitter.x_pixels), std::memory_order_relaxed);
+    g_vpj_y.store(static_cast<float>(g_jitter.y_pixels), std::memory_order_relaxed);
+    // A zero request is the consumer's "no jitter for the next frame".
+    g_vpj_on.store(g_vpj_route.load(std::memory_order_relaxed) && g_jitter_requested && s.valid() &&
+                       (g_next_jitter[0] != 0.f || g_next_jitter[1] != 0.f),
+                   std::memory_order_release);
     g_jitter_requested = false;
     return true;
 }
@@ -1169,6 +1255,8 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
         g_depth_ref.Reset();
         g_model.Forget(g_model.Current().color); // the scene targets are usually recreated with the new size
         g_sel_color.store(0);
+    g_sel_depth.store(0);
+    g_vpj_on.store(false);
     }
 }
 void UpdateResizeExtent(IDXGISwapChain* s, long result)
@@ -1321,6 +1409,14 @@ void Uninstall()
     g_lists.clear();
     g_ctx.clear();
     g_sel_color.store(0);
+    g_sel_depth.store(0);
+    g_vpj_on.store(false);
+}
+
+void SetJitterRoute(JitterRoute route)
+{
+    g_vpj_route.store(route == JitterRoute::Viewport, std::memory_order_relaxed);
+    if (route != JitterRoute::Viewport) g_vpj_on.store(false, std::memory_order_release); // bound copies restore at the next draw
 }
 
 void SetNextJitter(float x_px, float y_px)
@@ -1342,12 +1438,17 @@ int FormatStatus(char* out, unsigned long n)
     const ProviderStats s = Stats();
     return std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
-                         "camera_found=%llu camera_missing=%llu jitter_written=%llu%s%s%s",
+                         "camera_found=%llu camera_missing=%llu jitter_written=%llu "
+                         "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
                          static_cast<unsigned long long>(s.camera_found), static_cast<unsigned long long>(s.camera_missing),
-                         static_cast<unsigned long long>(s.jitter_written), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
+                         static_cast<unsigned long long>(s.jitter_written), g_vpj_route.load() ? 1 : 0, g_vpj_on.load() ? 1 : 0,
+                         static_cast<unsigned long long>(g_vpj_frames.load()), static_cast<unsigned long long>(g_vpj_draws.load()),
+                         g_vpj_last_frame_draws.load(), static_cast<unsigned long long>(g_vpj_sets.load()),
+                         static_cast<unsigned long long>(g_vpj_restores.load()),
+                         static_cast<unsigned long long>(g_vpj_unknown.load()), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
 

@@ -537,6 +537,9 @@ int main()
     const bool installed = na::native11::Install(g.device.Get(), &Consume, &g_seen);
     expect(installed, "the provider's hooks install on the game's device");
     if (!installed) return 1;
+    // The production host selects the viewport route. The camera-matrix checks below exercise the
+    // matrix route explicitly; the viewport route has its own phases.
+    na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
 
     char status[512];
     // ---- phase 1: immediate context ----
@@ -603,6 +606,54 @@ int main()
         expect(rows23 && sub_pixel, "the GPU's camera carries a sub-pixel jitter in rows 0/1 only");
         ++frame;
     }
+
+#if !defined(NA_TEST_NATIVE_DLAA)
+    // ---- viewport jitter route: the sample moves the game's viewports on scene draws only ----
+    {
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        const auto reported = g_seen.jitter_reported;
+        const auto written = na::native11::Stats().jitter_written;
+        const auto viewport_now = [&] {
+            UINT n = 1;
+            D3D11_VIEWPORT vp{};
+            g.ctx->RSGetViewports(&n, &vp);
+            return vp;
+        };
+        bool moved = true, restored = true;
+        for (int i = 0; i < 6; ++i) {
+            na::native11::SetNextJitter(0.25f, -0.25f); // covers the frame after the next Present
+            Scene(g.ctx.Get(), g, frame++);
+            const D3D11_VIEWPORT scene_vp = viewport_now(); // the last scene draw's viewport
+            Post(g.ctx.Get(), g, true);
+            const D3D11_VIEWPORT post_vp = viewport_now();
+            g.swap->Present(0, 0);
+            if (i == 0) continue; // armed by the first Present
+            // Full-target viewport: widened half a pixel each side, then moved by the sample.
+            moved = moved && std::fabs(scene_vp.TopLeftX - (-0.5f + 0.25f)) < 1e-4f && std::fabs(scene_vp.TopLeftY - (-0.5f - 0.25f)) < 1e-4f &&
+                    std::fabs(scene_vp.Width - float(g.w + 1)) < 1e-4f && std::fabs(scene_vp.Height - float(g.h + 1)) < 1e-4f;
+            restored = restored && post_vp.TopLeftX == 0.f && post_vp.TopLeftY == 0.f && post_vp.Width == float(g.w) && post_vp.Height == float(g.h);
+            if (i == 1) std::printf("viewport jitter: scene viewport %.3f %.3f %.3f x %.3f, post viewport %.3f %.3f\n", scene_vp.TopLeftX,
+                                    scene_vp.TopLeftY, scene_vp.Width, scene_vp.Height, post_vp.TopLeftX, post_vp.TopLeftY);
+        }
+        na::native11::FormatStatus(status, sizeof status);
+        std::printf("viewport jitter: %s\n", status);
+        expect(moved, "scene draws are rasterised through viewports moved by the sub-pixel sample");
+        expect(restored, "the post pass gets the game's own viewport back");
+        expect(g_seen.jitter_reported >= reported + 5, "the consumer is told the jitter the scene draws carried");
+        expect(na::native11::Stats().jitter_written == written, "the camera upload is left alone on the viewport route");
+        // No request: the next frame's scene is the game's own.
+        Scene(g.ctx.Get(), g, frame++);
+        Post(g.ctx.Get(), g, true);
+        g.swap->Present(0, 0);
+        Scene(g.ctx.Get(), g, frame++);
+        const D3D11_VIEWPORT plain = viewport_now();
+        Post(g.ctx.Get(), g, true);
+        g.swap->Present(0, 0);
+        expect(plain.TopLeftX == 0.f && plain.TopLeftY == 0.f && plain.Width == float(g.w) && plain.Height == float(g.h),
+               "a frame with no jitter request renders through the game's own viewports");
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
+    }
+#endif
 
     // ---- phase 2: scene and post recorded on deferred contexts ----
     const uint64_t calls1 = g_seen.calls, lists1 = g_seen.before_list;
@@ -831,6 +882,25 @@ int main()
            "native campaign slot-3 pose delivers all 22 NVIDIA DLAA frames");
     expect(!g_seen.last.camera.raster_jitter_qualified && g_seen.jitter_reported == jitter_before_native_pose,
            "the native campaign pose does not authorize a raster jitter write");
+    // The production route: jitter through the viewports needs no proven camera layout.
+    {
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        na::j2::SetJitter(true);
+        const auto jitter_before_viewport = g_seen.jitter_reported;
+        const auto delivered_before_viewport = evaluations;
+        for (int i = 0; i < 12; ++i) present_campaign();
+        na::native11::FormatStatus(status, sizeof status);
+        std::printf("native campaign viewport jitter: %s\n", status);
+        expect(evaluations == delivered_before_viewport + 12, "DLAA keeps delivering every frame with viewport jitter on");
+        expect(g_seen.last.camera.jitter_applied && g_seen.jitter_reported >= jitter_before_viewport + 8,
+               "the native campaign pose gets real jitter through the viewports");
+        na::j2::SetJitter(false);
+        present_campaign(); // an already armed sample may still apply to this frame
+        const auto viewport_off = g_seen.jitter_reported;
+        for (int i = 0; i < 4; ++i) present_campaign();
+        expect(g_seen.jitter_reported == viewport_off, "the jitter switch stops the viewport offsets");
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
+    }
     // Real shader sampling: each mip is a different colour. Exact LOD 1
     // produces green; a total bias of -1 selects red mip 0. No counters stand
     // in for the pixel result, and the sampler is bound only once.

@@ -105,6 +105,14 @@ void Uninstall();
 // it into the camera bytes the game uploads (the same write the DX12 route makes) and reports it back
 // in CameraFacts so colour, depth, camera and jitter always belong to one scene.
 void SetNextJitter(float x_px, float y_px);
+// How SetNextJitter's sample reaches the picture.
+//  Matrix (default):  written into the scene camera's ViewProjection at the game's upload. Needs a
+//                     camera layout the adapter has qualified for the raster transform.
+//  Viewport:          the game's viewports are moved by the sample on every depth-tested draw into
+//                     the scene depth (the DX12 host's viewport jitter). Needs no camera layout;
+//                     CameraFacts::jitter_applied then means this frame's scene draws carried it.
+enum class JitterRoute { Matrix, Viewport };
+void SetJitterRoute(JitterRoute route);
 ProviderStats Stats();
 int FormatStatus(char* out, unsigned long n); // one status line: "native11 frames= fired= ..."
 

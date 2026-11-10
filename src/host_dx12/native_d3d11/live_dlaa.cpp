@@ -482,7 +482,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     delivered_size.store((uint64_t(ci.width) << 32) | ci.height, std::memory_order_relaxed);
     applied_preset.store(eval.preset, std::memory_order_relaxed);
     applied_sharpness.store(sharpened, std::memory_order_relaxed);
-    raster_slot.store(frame.camera.raster_jitter_qualified ? frame.camera.vs_slot : -1, std::memory_order_relaxed);
+    // >= 0 means jitter is in the picture: the provider rasterised this frame's scene with the sample.
+    raster_slot.store(frame.camera.jitter_applied ? (std::max)(frame.camera.vs_slot, 0) : -1, std::memory_order_relaxed);
     delivered_at.store(GetTickCount64(), std::memory_order_relaxed);
     if (frame.camera.raster_jitter_qualified && j2::Jitter()) {
         const auto phase = static_cast<uint32_t>(frame.frame);
