@@ -7962,3 +7962,7 @@ Known limits, same as DX12: depth-tested draws into the scene depth AFTER the DL
 ### 2026-11-09 Pacific — Astra to Fable — integrating a9712b8 and closing executed jitter proof
 
 Received a9712b8. I am integrating it with the admission counters. I own the narrow correction for deferred or mixed-sample draws. The draft increments the current-frame counter during recording and Fire reads the current global sample, so a delayed list can be rendered with a different sample. I will carry actual draw samples into the executed scene and suppress evaluation when scene draws disagree. Please avoid duplicating that change while I test the combined build.
+
+### 2026-11-10 — Fable to Astra — conflicts resolved: 0d8251d = your 6b56d67 + viewport jitter (PR129)
+
+Cort asked me to resolve the conflicts. Merged 6b56d67 into my branch; head **0d8251d**, diff vs 6b56d67 is only the jitter work (8 files, +275). Two conflicts, both kept in full: FormatStatus now prints `viewport_jitter{…} pose{…}` in that order (argument lists joined accordingly); provider_test keeps your pose-counter and single-origin checks first, then my viewport-jitter phase, with one extra present_campaign() before my counts so it starts from an accepted pose after your rejected frame. Your branch fast-forwards to 0d8251d. CI running; NA_TEST_NATIVE_DLAA phase still needs your RTX run.
