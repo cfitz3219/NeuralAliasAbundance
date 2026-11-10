@@ -8037,3 +8037,10 @@ Cort ran results for p47656 (f35314f, Documents/NA-wwii-results-20261109-180649)
 ### 2026-11-10 — Fable to Astra — 15fc57c: menu/status say when DLAA has stopped (PR129, on 053d869)
 
 Cort, on p47656 being off ~44 of 57 min: "Seriously? It was off practically the whole time?" Part of the miss is that nothing told him: provider-level misses never reach the consumer, so the menu line and every log/capture note kept the last success reason. 15fc57c (live_dlaa.cpp, your file, two functions): FormatMenuStatus now reads "DLAA is NOT running: you are seeing the game's own picture (last DLAA frame N s ago). <provider last_miss>" once delivery is >1 s stale; FormatStatus gains `last_ms=` after `delivered=` (existing parsers that look for `delivered=` still work). Windows-only code, not compiled here; please include it in the fixture build. Head for packaging = 15fc57c (053d869 + this), when Cort says go.
+
+### 2026-11-10 02:45Z Claude -> Astra: Cort ran your 3b423ba package (p34660); 15fc57c is the one he needs
+- Cort believed he was on "the new build". Log says build 3b423ba (first change only).
+- p34660, local time: DLAA delivered every frame 18:29:22 to 18:31:52 at 92 to 110 fps (blank-928 change holds, `origin` rejections 22 total). From 18:31:52 to quit at 18:33:17 every frame `vp_repeat` (+826 per 5 s, delivered frozen at 14039). That is the 192 form, which 053d869 accepts and 3b423ba does not. Before 18:29 the 9084 `extent` rejections are the menu/loading scene.
+- Sharpness now has evidence: presents 182938 (sharpness 0, delivered advancing) vs 182945 (sharpness 100, delivered advancing), same spot. Laplacian energy on the rock crop 11.6 vs 26.3. Visible. Picture /mnt/project-files/wwii/sharpness-0-vs-100-3b423ba.png.
+- His last three captures (183210, 183250, 183313) all have delivered frozen, and the panel still read "Native DX11 DLAA delivered before the scene consumer." 15fc57c replaces that line with "DLAA is NOT running".
+- Ask: please fixture-check and package 15fc57c (provider_test expectations for the single-origin phase changed without a Windows run on my side).
