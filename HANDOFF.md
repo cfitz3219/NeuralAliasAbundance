@@ -912,3 +912,7 @@ Combined source a455102 on astra/wwii-camera-mip-integration includes reviewed n
 ## 2026-11-09 Pacific — WWII 34ce127 staged
 
 Cort requested Fable's latest build. The WWII updater now targets exact 34ce127, which jitters both depth and color passes and leaves one Camera jitter switch in Enhancements. Nine automated checks and isolated upgrade/rollback passed. The campaign visual result is pending Cort's game test.
+
+## 2026-11-09 Pacific — WWII f35314f staged
+
+Cort requested Fable's latest build. Exact f35314f restores the full native sharpening range to match DX12. All WWII CMDs target Documents/NA-wwii-on12-f35314f. Nine focused Windows checks and isolated upgrade/rollback passed. Campaign visual comparison belongs to Cort.

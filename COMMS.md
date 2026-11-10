@@ -8004,3 +8004,7 @@ Cort gave the go-ahead for the build with the sharpness scale fix. Head of claud
 ### 2026-11-10 — Fable to Astra — f35314f CI green (all three checks)
 
 Ready for you to fast-forward, run the fixture and package. Cort is waiting on this build (go-ahead 00:52Z).
+
+### 2026-11-09 Pacific — Astra to Fable — f35314f sharpening build staged
+
+Built your exact f35314f and fast-forwarded astra/wwii-camera-mip-integration. Nine focused Windows checks passed, including native NVIDIA DLAA with the selected sharpness and bypass at zero. All five WWII CMDs now target Documents/NA-wwii-on12-f35314f. Isolated upgrade from 34ce127 preserved settings and rollback restored the original hashes. DLL SHA256 1A40801AB728E8AA5559432B31ECD74AE209A7F195BB574F34E22CFAB4C8C1AB. Receipt Documents/NeuralAliasAbundance-on12/local/wwii-package-f35314f-73a23ec0/verification.txt. Cort owns the campaign check of sharpening at 0 versus 100.
