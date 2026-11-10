@@ -567,8 +567,12 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
 }
 int FormatStatus(char* out, size_t capacity)
 {
-    return std::snprintf(out, capacity, "native11_dlaa delivered=%llu busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d \"%s\"",
-                         static_cast<unsigned long long>(delivered.load()),
+    // last_ms: how long ago the last frame was delivered (-1 = never). A provider-level miss leaves
+    // `reason` at its last success, so this is what shows DLAA has stopped.
+    const auto last = delivered_at.load(std::memory_order_relaxed);
+    const long long last_ms = last ? static_cast<long long>(GetTickCount64() - last) : -1;
+    return std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d \"%s\"",
+                         static_cast<unsigned long long>(delivered.load()), last_ms,
                          static_cast<unsigned long long>(busy.load()),
                          static_cast<unsigned long long>(rejected.load()), applied_preset.load(), applied_sharpness.load(),
                          raster_slot.load(), reason.load());
@@ -582,11 +586,19 @@ bool FormatMenuStatus(char* out, size_t capacity)
         std::snprintf(out, capacity, "Native DX11 DLAA running at %u × %u. %llu frames improved.%s",
                       unsigned(size >> 32), unsigned(size), static_cast<unsigned long long>(delivered.load()),
                       j2::Jitter() && raster_slot.load() < 0 ? " Jitter is waiting for a matched scene sample." : "");
-    else {
+    else if (j2::Paused()) {
+        std::snprintf(out, capacity, "Native DX11 DLAA is off.");
+    } else {
+        // p47656: DLAA stopped for 36 min while this line still read "delivered" (the consumer's
+        // last reason). Provider misses never reach the consumer, so name them here.
         const auto provider = native11::Stats();
-        const char* waiting = !delivered.load() && provider.last_miss && provider.last_miss[0]
-            ? provider.last_miss : reason.load();
-        std::snprintf(out, capacity, "%s", j2::Paused() ? "Native DX11 DLAA is off." : waiting);
+        const bool provider_miss = provider.last_miss && provider.last_miss[0];
+        const char* why = provider_miss ? provider.last_miss : reason.load();
+        if (last)
+            std::snprintf(out, capacity, "DLAA is NOT running: you are seeing the game's own picture (last DLAA frame %llu s ago). %s",
+                          static_cast<unsigned long long>((GetTickCount64() - last) / 1000), why);
+        else
+            std::snprintf(out, capacity, "DLAA has not run yet. %s", why);
     }
     return running;
 }
