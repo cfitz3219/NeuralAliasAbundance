@@ -920,3 +920,7 @@ Cort requested Fable's latest build. Exact f35314f restores the full native shar
 ## 2026-11-09 Pacific — WWII 3b423ba staged
 
 Exact Fable 3b423ba fixes the confirmed blank second camera-position copy rejection. The actual p47656 replay goes from zero to three accepted camera packets and nine automated Windows checks passed. The WWII update, install, trial, results and rollback CMDs point to the new package. Isolated upgrade/rollback passed. Cort owns the campaign run. The later projection-repeat rejection seen in p47656 is tracked separately.
+
+## 2026-11-09 Pacific — WWII 15fc57c staged with Cort's native-route go-ahead
+
+All five WWII CMDs target exact Fable 15fc57c. Native NVIDIA DLAA passed, four captured alternate-layout packets passed replay, and the isolated upgrade and rollback passed. The disabled D3D11On12 route's separate startup test timeout is tracked in COMMS. Campaign delivery and status are pending Cort's test.
