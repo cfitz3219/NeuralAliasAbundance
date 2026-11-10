@@ -24,6 +24,7 @@ struct CameraPick {
     na::camera::Matrix vp{};      // column-vector convention, as FindMatrices normalises
     bool reversed = false;        // reverse-Z
     bool camera_relative = false; // the game adapter proved this pose without an inverse pair
+    bool raster_jitter_qualified = true; // adapter can limit a pose to motion reconstruction
 };
 
 // Re-reads a learned camera at `learned` (same layout); true if it still is a

@@ -313,6 +313,7 @@ CameraPick PickForScene(const std::vector<uint8_t>& bytes, const CameraPick& lea
         CameraPick pick;
         pick.found = pick.reversed = pick.camera_relative = true;
         pick.vp = scene.vp;
+        pick.raster_jitter_qualified = scene.raster_jitter_qualified;
         return pick;
     }
     CameraPick pick;
@@ -493,9 +494,10 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.camera.version = version;
     f.camera.bytes = camera_bytes.data();
     f.camera.size = static_cast<uint32_t>(camera_bytes.size());
-    f.camera.jitter_applied = g_jitter_written;
-    f.camera.jitter_px[0] = g_jitter_written ? static_cast<float>(g_jitter.x_pixels) : 0.f;
-    f.camera.jitter_px[1] = g_jitter_written ? static_cast<float>(g_jitter.y_pixels) : 0.f;
+    f.camera.raster_jitter_qualified = f.camera.vs_slot >= 0 && cam.raster_jitter_qualified;
+    f.camera.jitter_applied = f.camera.raster_jitter_qualified && g_jitter_written;
+    f.camera.jitter_px[0] = f.camera.jitter_applied ? static_cast<float>(g_jitter.x_pixels) : 0.f;
+    f.camera.jitter_px[1] = f.camera.jitter_applied ? static_cast<float>(g_jitter.y_pixels) : 0.f;
     f.boundary = boundary;
     f.scene_draws = g_model.SceneDrawsThisFrame();
     // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
@@ -690,7 +692,7 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
         const auto& selection = g_model.Current();
         // A PS-only pose can reconstruct camera motion. Rewriting it cannot
         // move the scene's raster samples and must not be reported as jitter.
-        if (!g_jitter_active || cb != selection.camera_cb || !g_camera.found ||
+        if (!g_jitter_active || cb != selection.camera_cb || !g_camera.found || !g_camera.raster_jitter_qualified ||
             selection.camera_slot < 0 || selection.camera_slot >= kPsCbBase) return false;
         first = g_camera_first;
         count = g_camera_num;
@@ -705,7 +707,8 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
     CameraPick now;
     wwii::SceneCamera relative;
     if (learned.camera_relative) {
-        if (!wwii::DecodeSceneCamera(v, static_cast<uint32_t>(v.size()), w, h, relative)) return false;
+        if (!wwii::DecodeSceneCamera(v, static_cast<uint32_t>(v.size()), w, h, relative) ||
+            !relative.raster_jitter_qualified) return false;
         now = learned;
         now.offset = relative.vp_offset;
         now.layout = na::camera::Layout::ColumnMajor;

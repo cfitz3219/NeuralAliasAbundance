@@ -125,6 +125,7 @@ struct Game {
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
     bool campaign_mixed_ring = false;
+    bool campaign_native_pose = false;
     ComPtr<ID3D11Texture2D> shadow_depth, shadow_rt, depth, color;
     ComPtr<ID3D11DepthStencilView> shadow_dsv, dsv;
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
@@ -239,12 +240,12 @@ void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp,
         std::fill(bytes.begin(), bytes.end(), uint8_t{0});
         const na::camera::Matrix relative{double(g.h) / g.w, 0, 0, 0, 0, 1, 0, 0,
                                           0, 0, 0, 4, 0, 0, 1, 0};
-        for (const uint32_t offset : {64u, 320u})
+        for (const uint32_t offset : {g.campaign_native_pose ? 208u : 64u, 320u})
             na::native11::StoreMatrix(bytes.data(), bytes.size(), offset, na::camera::Layout::ColumnMajor, relative);
         const float origin[]{static_cast<float>(vp[3]), -10183.53808594f, -50.8396759f, 0.f};
         const float extent[]{float(g.w), float(g.h), 1.f / g.w, 1.f / g.h};
-        std::memcpy(bytes.data() + 384, origin, sizeof origin);
-        std::memcpy(bytes.data() + 944, origin, sizeof origin);
+        std::memcpy(bytes.data() + (g.campaign_native_pose ? 800 : 384), origin, sizeof origin);
+        std::memcpy(bytes.data() + (g.campaign_native_pose ? 928 : 944), origin, sizeof origin);
         std::memcpy(bytes.data() + 704, extent, sizeof extent);
     }
     auto* destination = static_cast<uint8_t*>(m.pData);
@@ -287,6 +288,10 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
             const UINT first = 24576 / 16, count = 1280 / 16;
             c1->PSSetConstantBuffers1(0, 1, &cbs[0], &first, &count);
         }
+    } else if (g.campaign_native_pose) {
+        c->VSSetConstantBuffers(1, 1, &cbs[1]);
+        c->VSSetConstantBuffers(3, 1, &cbs[0]);
+        c->PSSetConstantBuffers(3, 1, &cbs[0]);
     } else {
         c->VSSetConstantBuffers(0, 2, cbs);
     }
@@ -396,7 +401,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     if (g_tonemap_bound && f.boundary == na::native11::Boundary::BeforeRead) ++s.after_tonemap;
     if (f.scene_draws != 40) ++s.no_scene;
     const UINT camera_size = g.campaign_pixel_range ? 32768u : g.campaign_camera ? 1280u : 512u;
-    const int vs_slot = g.campaign_pixel_range ? -1 : 0;
+    const int vs_slot = g.campaign_pixel_range ? -1 : g.campaign_native_pose ? 3 : 0;
     if (!f.camera.bytes || f.camera.size != camera_size || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.cam_cb.Get())) ||
         f.camera.vs_slot != vs_slot) {
         if (!s.no_camera)
@@ -804,6 +809,28 @@ int main()
            na::xegtao::ScenePass().GetStats().recorded == ao_live.recorded &&
            na::donut::ScenePass().GetStats().recorded == lighting_live.recorded,
            "native enhancement switches stop their GPU work live");
+    // Reproduce the plain VS/PS slot-3 layout recorded in native WWII p30648.
+    // The duplicated pose proves motion, but the raster transform is unknown.
+    g.campaign_native_pose = true;
+    g.campaign_pixel_range = false;
+    camera_desc.ByteWidth = 1280;
+    expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
+           "create native campaign camera buffer");
+    g.ctx->ClearState();
+    // Changing buffers invalidates the previous learned range. That first
+    // frame lets the provider return to acquisition for the new buffer.
+    present_campaign();
+    const auto before_native_pose = evaluations;
+    const auto jitter_before_native_pose = g_seen.jitter_reported;
+    for (int i = 0; i < 22; ++i) present_campaign();
+    na::native_d3d11::FormatStatus(status, sizeof status);
+    std::printf("native campaign slot-3: delivered +%llu | %s\n",
+                (unsigned long long)(evaluations - before_native_pose), status);
+    expect(evaluations == before_native_pose + 22 &&
+           (g_seen.last.camera.vs_slot == 3 || g_seen.last.camera.ps_slot == 3),
+           "native campaign slot-3 pose delivers all 22 NVIDIA DLAA frames");
+    expect(!g_seen.last.camera.raster_jitter_qualified && g_seen.jitter_reported == jitter_before_native_pose,
+           "the native campaign pose does not authorize a raster jitter write");
     // Real shader sampling: each mip is a different colour. Exact LOD 1
     // produces green; a total bias of -1 selects red mip 0. No counters stand
     // in for the pixel result, and the sampler is bound only once.

@@ -48,6 +48,7 @@ struct CameraFacts {
     uint64_t version = 0;          // content version of the bytes below (bumps on every update)
     const uint8_t* bytes = nullptr; // CPU copy of the bytes the game uploaded (Map/Unmap or UpdateSubresource
     uint32_t size = 0;              // source data), never a GPU readback; valid for the callback only
+    bool raster_jitter_qualified = false; // this vertex binding and layout support the jitter write
     bool jitter_applied = false;   // the provider wrote this frame's jitter into the scene camera
     float jitter_px[2] = {0, 0};   // the jitter written, in pixels of the scene extent (DLSS convention)
 };

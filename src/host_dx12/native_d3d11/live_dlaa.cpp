@@ -482,9 +482,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     delivered_size.store((uint64_t(ci.width) << 32) | ci.height, std::memory_order_relaxed);
     applied_preset.store(eval.preset, std::memory_order_relaxed);
     applied_sharpness.store(sharpened, std::memory_order_relaxed);
-    raster_slot.store(frame.camera.vs_slot, std::memory_order_relaxed);
+    raster_slot.store(frame.camera.raster_jitter_qualified ? frame.camera.vs_slot : -1, std::memory_order_relaxed);
     delivered_at.store(GetTickCount64(), std::memory_order_relaxed);
-    if (frame.camera.vs_slot >= 0 && j2::Jitter()) {
+    if (frame.camera.raster_jitter_qualified && j2::Jitter()) {
         const auto phase = static_cast<uint32_t>(frame.frame);
         const auto sample = settings::Get().j2_jitter_r2.load()
             ? neural_alias::temporal_jitter_r2(phase, 8) : neural_alias::temporal_jitter(phase, 8);
@@ -566,7 +566,7 @@ bool FormatMenuStatus(char* out, size_t capacity)
     if (running)
         std::snprintf(out, capacity, "Native DX11 DLAA running at %u × %u. %llu frames improved.%s",
                       unsigned(size >> 32), unsigned(size), static_cast<unsigned long long>(delivered.load()),
-                      raster_slot.load() < 0 ? " Camera motion is available. Jitter is waiting for the vertex camera." : "");
+                      raster_slot.load() < 0 ? " Camera motion is available. Jitter is waiting for a verified raster projection." : "");
     else {
         const auto provider = native11::Stats();
         const char* waiting = !delivered.load() && provider.last_miss && provider.last_miss[0]
