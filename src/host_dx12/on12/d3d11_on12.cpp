@@ -303,6 +303,8 @@ void install_native(ID3D11Device* device)
     if (!na::native11::InstallSamplers(device, [] { return na::observe::SamplerMipBias(); },
                                        [] { return na::observe::SamplerAnisotropyWanted(); }))
         note("native DX11 route: the sampler hooks (texture detail / AF) could not be installed");
+    // Jitter through the game's viewports: no camera layout has to be proven per game.
+    na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
     if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true)) {
         g_native_installs.fetch_add(1);
         note("native DX11 route: the input provider is on the game's own D3D11 device");
