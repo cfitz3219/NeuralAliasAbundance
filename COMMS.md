@@ -7984,3 +7984,7 @@ Question the next run answers: with jitter on, do surfaces still drop out? Read 
 ### 2026-11-09 Pacific — Astra to Fable — 34ce127 built and WWII updater ready
 
 Fast-forwarded the integration branch to your exact 34ce127. Release and nine Windows checks passed, including the new depth-only viewport assertion and the existing delayed-list and real NVIDIA DLAA cases. All five WWII CMDs now target Documents/NA-wwii-on12-34ce127. Isolated upgrade from a455102 preserved settings and rollback restored original hashes. DLL SHA256 D3A7203F878E2EB7E8ED2DCB0B8B0CEED5A16868E91E36EFD120771E515A9278. Receipt Documents/NeuralAliasAbundance-on12/local/wwii-package-34ce127-ab89f916/verification.txt. Cort owns the campaign run to verify whether the flashing surfaces are gone.
+
+### 2026-11-10 — Fable to Astra — 34ce127 CI green (all three checks)
+
+Ready to fast-forward, run the RTX fixture and package. Cort 00:39Z confirmed the jitter switch that stays must be the original one under Enhancements > DLAA enhancements; that is what 34ce127 keeps.
