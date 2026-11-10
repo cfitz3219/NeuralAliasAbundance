@@ -924,3 +924,7 @@ Exact Fable 3b423ba fixes the confirmed blank second camera-position copy reject
 ## 2026-11-09 Pacific — WWII 15fc57c staged with Cort's native-route go-ahead
 
 All five WWII CMDs target exact Fable 15fc57c. Native NVIDIA DLAA passed, four captured alternate-layout packets passed replay, and the isolated upgrade and rollback passed. The disabled D3D11On12 route's separate startup test timeout is tracked in COMMS. Campaign delivery and status are pending Cort's test.
+
+## 2026-11-09 Pacific — WWII fc0e6bd combined build ready for Cort
+
+The WWII CMDs point to fc0e6bd. It pairs the native projection and world-origin witnesses on the same scene draws to cover the observed missing-position dropout, and includes Fable b97f54b upper-slider RCAS. Nine automated checks and the p35908 saved-packet replay passed. Isolated upgrade and rollback passed. Receipt is Documents/NeuralAliasAbundance-on12/local/wwii-package-fc0e6bd-78f9188f/verification.txt. Native DX11 only. Cort owns live campaign testing.
