@@ -622,11 +622,17 @@ int main()
             g.ctx->RSGetViewports(&n, &vp);
             return vp;
         };
-        bool moved = true, restored = true;
+        bool moved = true, restored = true, depth_only_same = true;
         for (int i = 0; i < 6; ++i) {
             na::native11::SetNextJitter(0.25f, -0.25f); // covers the frame after the next Present
             Scene(g.ctx.Get(), g, frame++);
             const D3D11_VIEWPORT scene_vp = viewport_now(); // the last scene draw's viewport
+            // A depth-only pass into the scene depth (a prepass has no colour target) must sit at
+            // the same sub-pixel position as the colour passes tested against it.
+            g.ctx->OMSetRenderTargets(0, nullptr, g.dsv.Get());
+            g.ctx->Draw(3, 0);
+            const D3D11_VIEWPORT depth_only_vp = viewport_now();
+            depth_only_same = depth_only_same && (i == 0 || std::memcmp(&depth_only_vp, &scene_vp, sizeof scene_vp) == 0);
             Post(g.ctx.Get(), g, true);
             const D3D11_VIEWPORT post_vp = viewport_now();
             g.swap->Present(0, 0);
@@ -641,6 +647,7 @@ int main()
         na::native11::FormatStatus(status, sizeof status);
         std::printf("viewport jitter: %s\n", status);
         expect(moved, "scene draws are rasterised through viewports moved by the sub-pixel sample");
+        expect(depth_only_same, "a depth-only draw into the scene depth carries the same offset as the colour draws");
         expect(restored, "the post pass gets the game's own viewport back");
         expect(g_seen.jitter_reported >= reported + 5, "the consumer is told the jitter the scene draws carried");
         expect(na::native11::Stats().jitter_written == written, "the camera upload is left alone on the viewport route");

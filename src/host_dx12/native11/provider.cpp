@@ -660,10 +660,13 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
     const bool on = sample != 0;
     if (!on && !x->vpj_applied) return;
     const Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
-    const Id scene_color = g_sel_color.load(std::memory_order_relaxed);
-    const bool scene = on && scene_depth && x->depth == scene_depth && x->rt0 == scene_color && x->depth_test;
+    // Every depth-tested draw into the scene depth moves, whatever colour target is bound: a depth
+    // prepass (no colour target) and the colour passes tested against it must rasterise at the same
+    // sub-pixel position, or the later passes fail their depth test over whole surfaces
+    // (p42728: triangles dropped to black, differently for each sample).
+    const bool scene = on && scene_depth && x->depth == scene_depth && x->depth_test;
     if (scene && !x->vp_n) g_vpj_unknown.fetch_add(1, std::memory_order_relaxed);
-    const bool want = WantsViewportJitter(on && x->rt0 == scene_color, x->depth, scene_depth, x->depth_test, x->vp_n);
+    const bool want = WantsViewportJitter(on, x->depth, scene_depth, x->depth_test, x->vp_n);
     const UINT n = x->vp_n;
     if (want) {
         g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
@@ -1509,11 +1512,7 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
                          static_cast<unsigned long long>(s.camera_found), static_cast<unsigned long long>(s.camera_missing),
-                         static_cast<unsigned long long>(s.jitter_written), g_vpj_route.load() ? 1 : 0, g_vpj_on.load() ? 1 : 0,
-                         static_cast<unsigned long long>(g_vpj_frames.load()), static_cast<unsigned long long>(g_vpj_draws.load()),
-                         g_vpj_last_frame_draws.load(), static_cast<unsigned long long>(g_vpj_sets.load()),
-                         static_cast<unsigned long long>(g_vpj_restores.load()),
-                         static_cast<unsigned long long>(g_vpj_unknown.load()),
+                         static_cast<unsigned long long>(s.jitter_written),
                          static_cast<unsigned long long>(s.pose_native), static_cast<unsigned long long>(s.pose_legacy),
                          static_cast<unsigned long long>(s.pose_generic), static_cast<unsigned long long>(s.pose_no_packet),
                          static_cast<unsigned long long>(s.pose_extent), static_cast<unsigned long long>(s.pose_repeat),

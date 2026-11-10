@@ -1049,10 +1049,7 @@ void DrawLiveDlaa()
     }
     const bool native = na::on12::NativeRoute();
     if (native) {
-        bool jitter = na::j2::Jitter();
-        BeginRow("Camera jitter", "Offsets scene samples by a fraction of a pixel for DLAA to reconstruct fine detail.", SwitchWidth());
-        if (Switch("native11_jitter", &jitter)) na::j2::SetJitter(jitter);
-        EndRow();
+        // Camera jitter has one switch for every route: Enhancements > DLAA enhancements.
         char status[200]{};
         const bool running = na::native_d3d11::FormatMenuStatus(status, sizeof status);
         StatusLine(running ? 1 : 0, status);
