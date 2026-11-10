@@ -127,6 +127,7 @@ struct Game {
     bool campaign_mixed_ring = false;
     bool campaign_native_pose = false;
     bool campaign_single_origin = false;
+    bool campaign_blank_witness = false; // native p37752: the origin copy at 928 left all zero
     ComPtr<ID3D11Texture2D> shadow_depth, shadow_rt, depth, color;
     ComPtr<ID3D11DepthStencilView> shadow_dsv, dsv;
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
@@ -248,7 +249,8 @@ void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp,
         const float extent[]{float(g.w), float(g.h), 1.f / g.w, 1.f / g.h};
         if (!g.campaign_single_origin)
             std::memcpy(bytes.data() + (g.campaign_native_pose ? 800 : 384), origin, sizeof origin);
-        std::memcpy(bytes.data() + (g.campaign_native_pose ? 928 : 944), origin, sizeof origin);
+        if (!g.campaign_blank_witness)
+            std::memcpy(bytes.data() + (g.campaign_native_pose ? 928 : 944), origin, sizeof origin);
         std::memcpy(bytes.data() + 704, extent, sizeof extent);
     }
     auto* destination = static_cast<uint8_t*>(m.pData);
@@ -931,6 +933,16 @@ int main()
            rejected_pose_stats.camera_missing == accepted_pose_stats.camera_missing + 1 &&
            evaluations == before_native_pose + 22,
            "unqualified single-origin scene counts one projection mismatch and no DLAA delivery");
+    // Native p37752: the game leaves the second origin copy blank for whole stretches (30 s of
+    // rejected frames, no DLAA). Both matrices and the first origin still establish the pose.
+    g.campaign_blank_witness = true;
+    for (int i = 0; i < 4; ++i) present_campaign();
+    g.campaign_blank_witness = false;
+    const auto blank_pose_stats = na::native11::Stats();
+    expect(blank_pose_stats.pose_origin == rejected_pose_stats.pose_origin &&
+           blank_pose_stats.camera_missing == rejected_pose_stats.camera_missing &&
+           blank_pose_stats.pose_native > rejected_pose_stats.pose_native,
+           "a blank second origin copy still yields the native pose");
     // The production route: jitter through the viewports needs no proven camera layout.
     {
         na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);

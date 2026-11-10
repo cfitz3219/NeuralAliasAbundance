@@ -66,6 +66,12 @@ inline bool DecodeSceneCamera(const std::vector<uint8_t>& bytes, uint32_t declar
         for (uint32_t i = 1; i < layout.origin_count; ++i) {
             std::array<float, 4> other{};
             std::memcpy(other.data(), bytes.data() + layout.origin[i], sizeof(other));
+            // Native p37752 (frame 13264, then every frame from 22045 for 30 s): the game leaves
+            // this copy all zero for whole stretches while both matrices, the extent and the first
+            // origin stay live, and DLAA stopped for as long as that lasted. A blank copy is
+            // absent, not a disagreement. One that holds anything must still agree.
+            if (layout.native_variant && other[0] == 0.f && other[1] == 0.f && other[2] == 0.f && other[3] == 0.f)
+                continue;
             agrees &= other[3] == 0.f;
             for (size_t axis = 0; axis < 3; ++axis) {
                 const double scale = std::max(1.0, std::max(std::abs(double(origin[axis])), std::abs(double(other[axis]))));
