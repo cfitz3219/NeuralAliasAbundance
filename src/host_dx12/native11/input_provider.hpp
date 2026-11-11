@@ -89,6 +89,8 @@ struct ProviderStats {
     uint64_t camera_found = 0, camera_missing = 0, jitter_written = 0;
     uint64_t pose_native = 0, pose_legacy = 0, pose_generic = 0, pose_split = 0;
     uint64_t pose_no_packet = 0, pose_extent = 0, pose_repeat = 0, pose_origin = 0, pose_shape = 0;
+    // Frames on which the split-camera vote gave no camera, by reason (split_camera.hpp SplitVerdict).
+    uint64_t split_no_votes = 0, split_no_projection = 0, split_few_draws = 0, split_no_majority = 0, split_small_share = 0;
     const char* last_miss = "";
 };
 

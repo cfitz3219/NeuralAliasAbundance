@@ -34,7 +34,7 @@ Columns: name | what it does | first seen in | observed condition that selects i
 | camera12/joined | Applies jitter to a constant block that holds the whole camera matrix | Anno 1800 | The block contains the known combined camera | tests/host/j2_anno_shape_test.cpp | `jitter_writes` | aca551b | Astra |
 | camera12/parts | Applies jitter to a block that holds only one part of the camera (lens, inverse, or previous frame) | Anno 1800 | The block contains a known camera part and no combined camera beside it | tests/host/j2_anno_shape_test.cpp | `jitter_writes`, `other_camera_blocks` | aca551b | Astra |
 | camera11/packed | Reads the camera from one packed constant block using a known layout | Call of Duty WWII | A size-matching layout passes its checks on this frame | tests/host/native11/provider_test.cpp | `pose{native, legacy}` | 15fc57c | Astra |
-| camera11/split | Builds the camera from two small blocks that agree across many draws: per-object translation and the view-projection matrix | Call of Duty WWII | Viewport jitter owns raster positioning and the two blocks agree across the frame's draws | tests/host/native11/provider_test.cpp | `pose{split}` | fc0e6bd | Astra |
+| camera11/split | Builds the camera from two small blocks that agree across many draws: per-object translation and the view-projection matrix | Call of Duty WWII | Viewport jitter owns raster positioning and the two blocks agree across the frame's draws | tests/cpu/native11_split_camera_test.cpp, tests/host/native11/provider_test.cpp | `pose{split}`, `split_rejected{...}` | fc0e6bd | Astra |
 
 ## Not carried, and why
 

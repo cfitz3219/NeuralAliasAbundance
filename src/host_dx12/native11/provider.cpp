@@ -385,6 +385,14 @@ bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uin
     const SplitVerdict verdict = ChooseSplitCamera(
         g_split_votes, [](const SplitVote& vote) { return vote.draws; }, w, h, g_model.SceneDrawsThisFrame(), chosen, vp);
     if (chosen != g_split_votes.cend()) pick.vp = vp;
+    switch (verdict) {
+    case SplitVerdict::Chosen: break;
+    case SplitVerdict::NoVotes: ++g_stats.split_no_votes; break;
+    case SplitVerdict::NoProjection: ++g_stats.split_no_projection; break;
+    case SplitVerdict::FewDraws: ++g_stats.split_few_draws; break;
+    case SplitVerdict::NoMajority: ++g_stats.split_no_majority; break;
+    case SplitVerdict::SmallShare: ++g_stats.split_small_share; break;
+    }
     if (verdict != SplitVerdict::Chosen) return false;
     const SplitKey* best_key = &chosen->first;
     const SplitVote* best = &chosen->second;
@@ -1593,6 +1601,7 @@ int FormatStatus(char* out, unsigned long n)
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
                          "camera_found=%llu camera_missing=%llu jitter_written=%llu "
                          "pose{native=%llu legacy=%llu generic=%llu no_packet=%llu extent=%llu vp_repeat=%llu origin=%llu vp_shape=%llu split=%llu} "
+                         "split_rejected{no_votes=%llu no_projection=%llu few_draws=%llu no_majority=%llu small_share=%llu} "
                          "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
@@ -1604,6 +1613,9 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(s.pose_extent), static_cast<unsigned long long>(s.pose_repeat),
                          static_cast<unsigned long long>(s.pose_origin), static_cast<unsigned long long>(s.pose_shape),
                          static_cast<unsigned long long>(s.pose_split),
+                         static_cast<unsigned long long>(s.split_no_votes), static_cast<unsigned long long>(s.split_no_projection),
+                         static_cast<unsigned long long>(s.split_few_draws), static_cast<unsigned long long>(s.split_no_majority),
+                         static_cast<unsigned long long>(s.split_small_share),
                          g_vpj_route.load() ? 1 : 0, g_vpj_sample.load() ? 1 : 0,
                          static_cast<unsigned long long>(g_vpj_frames.load()), static_cast<unsigned long long>(g_vpj_draws.load()),
                          g_vpj_last_frame_draws.load(), static_cast<unsigned long long>(g_vpj_sets.load()),
