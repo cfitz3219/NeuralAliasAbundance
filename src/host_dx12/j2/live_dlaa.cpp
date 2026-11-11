@@ -292,7 +292,7 @@ struct State {
     uint32_t frame_handoff = 0;       // HandoffBit flags of the current frame
     uint32_t frame_owned_entries = 0; // entry reads that arrived after this frame's DLSS was already submitted
     uint32_t prev_owned_entries = 0;  // the same count for the frame before
-    char handoff_reader[200] = {};    // the frame's first entry that read the finished scene without being accepted
+    char handoff_reader[320] = {};    // the frame's first entry that read the finished scene without being accepted
     // Readers the inline route turned away at RECORDING time because the frame number then open
     // already had its DLSS. If such a recording is submitted under a later frame number, the game
     // recorded it before the previous Present: that frame gets no inline DLSS (diagnostic only).
@@ -5962,6 +5962,18 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 }
                 g.frame_handoff |= recorded ? kHoRecorded : (entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer)
                                                               ? kHoRecordFailed : kHoReaderUnjudged;
+                if (!recorded && !entry && verdict != V::Accepted && verdict != V::AcceptedWithProducer) {
+                    // The reader that had the finished scene and was turned down: its class verdict and the tallies behind it.
+                    uint32_t t[4];
+                    const bool stored = g.profile.Tallies(cls, saved.producer, t);
+                    std::snprintf(g.handoff_reader, sizeof g.handoff_reader,
+                                  "class_verdict=%s stored=%u class{post=%u temp=%u} pair{post=%u temp=%u} op=%u root=%llu size=%u/%u fmt=%u srvs=%u/%u producer=%llu list=%u",
+                                  verdict == V::Unknown ? (stored ? "learning" : "not_in_table") : verdict == V::Rejected ? "rejected"
+                                      : verdict == V::Ambiguous ? "ambiguous" : "qualified_only",
+                                  stored ? 1u : 0u, t[0], t[1], t[2], t[3], unsigned(cls.op), (unsigned long long)cls.root,
+                                  unsigned(cls.w_class), unsigned(cls.h_class), unsigned(cls.fmt), unsigned(cls.color_srvs),
+                                  unsigned(cls.view_srvs), (unsigned long long)saved.producer, unsigned(i));
+                }
                 if (recorded) {
                     if (at < i) ++g.stats.between_earlier;
                     if (saved.read_before) ++g.stats.between_late;
@@ -7954,6 +7966,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             g.stats.profile_rejected = g.profile.RejectedCount();
             g.stats.profile_ambiguous = g.profile.AmbiguousCount();
             g.stats.profile_entries = static_cast<uint32_t>(g.profile.Size());
+            g.stats.profile_forgotten = g.profile.Evictions();
             // An inline recording that was never submitted within two frames is released
             // (its capture slot retired; the frame already counted as missed).
             if (g.inl.valid && g.frame >= g.inl.frame + 2) {

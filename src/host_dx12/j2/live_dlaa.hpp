@@ -368,6 +368,7 @@ struct Stats {
     uint32_t inline_frame_rejects = 0; // rejections in the last closed frame
     // Placement profile (role classes; docs/PLACEMENT-DESIGN-RESPONSE.md, Opus's revision).
     uint32_t profile_accepted = 0, profile_rejected = 0, profile_ambiguous = 0, profile_entries = 0;
+    uint64_t profile_forgotten = 0; // learned patterns dropped because the table was full (0 in a healthy run)
     uint64_t class_matched = 0, class_pair_matched = 0, legacy_matched = 0; // inline recordings by trigger
     uint64_t class_rejected_skips = 0;   // consumers skipped because their class is a known temporary reader
     uint64_t barrier_matched = 0;        // inline recordings at a learned scene-completion barrier (final producer)
