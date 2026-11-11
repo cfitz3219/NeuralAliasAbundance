@@ -8272,7 +8272,7 @@ bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
     }
     return false;
 }
-uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n)
+uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n, BufferMapPolicy policy)
 {
     if (!res || !src || !n) return 0;
     ID3D12Resource* rewrite = nullptr;
@@ -8281,7 +8281,7 @@ uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_
         auto it = g_buffers.find(res);
         if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width || it->second.width - offset < n) return 0;
         if (it->second.cpu) return guarded_copy(it->second.cpu + offset, src, n) ? n : 0;
-        if (!it->second.ever_mapped) return 0;
+        if (!it->second.ever_mapped && policy == BufferMapPolicy::Observed) return 0;
         auto key = g_res_keys.find(res);
         if (key != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&rewrite));
     }
@@ -8291,16 +8291,16 @@ uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_
     t_host_work = true;
     const D3D12_RANGE none{0, 0};
     void* p = nullptr;
-    if (SUCCEEDED(rewrite->Map(0, &none, &p)) && p) {
-        ok = guarded_copy(static_cast<uint8_t*>(p) + offset, src, n);
-        const D3D12_RANGE written{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)};
+    if (SUCCEEDED(rewrite->Map(0, &none, &p))) {
+        ok = p && guarded_copy(static_cast<uint8_t*>(p) + offset, src, n);
+        const D3D12_RANGE written = p ? D3D12_RANGE{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)} : none;
         rewrite->Unmap(0, &written);
     }
     t_host_work = was_host;
     rewrite->Release();
     return ok ? n : 0;
 }
-uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
+uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n, BufferMapPolicy policy)
 {
     if (!res || !dst || !n) return 0;
     ID3D12Resource* reread = nullptr;
@@ -8310,7 +8310,7 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
         if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width) return 0;
         n = static_cast<uint32_t>(std::min<uint64_t>(n, it->second.width - offset));
         if (it->second.cpu) return guarded_copy(dst, it->second.cpu + offset, n) ? n : 0;
-        if (!it->second.ever_mapped) return 0;
+        if (!it->second.ever_mapped && policy == BufferMapPolicy::Observed) return 0;
         auto key = g_res_keys.find(res);
         if (key != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&reread));
     }
@@ -8320,8 +8320,8 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
     t_host_work = true;
     const D3D12_RANGE rr{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)};
     void* p = nullptr;
-    if (SUCCEEDED(reread->Map(0, &rr, &p)) && p) {
-        ok = guarded_copy(dst, static_cast<const uint8_t*>(p) + offset, n);
+    if (SUCCEEDED(reread->Map(0, &rr, &p))) {
+        ok = p && guarded_copy(dst, static_cast<const uint8_t*>(p) + offset, n);
         const D3D12_RANGE none{0, 0};
         reread->Unmap(0, &none);
     }
