@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import secrets
+import socket
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
@@ -325,6 +326,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class GameCheckServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
     def __init__(self, library, port=PORT):
         super().__init__((HOST, port), Handler)
         self.library = library

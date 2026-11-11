@@ -45,6 +45,8 @@ class LocalGameCheck(unittest.TestCase):
             second_build = "b" * 40
             (other / "status-2.txt").write_text(synthetic.steady(40, build=second_build), encoding="utf-8")
             with local_app.GameCheckServer(reopened, port=0) as server:
+                with self.assertRaises(OSError):
+                    local_app.GameCheckServer(reopened, port=server.server_port)
                 worker = Thread(target=server.serve_forever, daemon=True)
                 worker.start()
                 self.addCleanup(worker.join, 5)
