@@ -61,6 +61,7 @@ constexpr uint32_t CopyBufferRegion = 15;
 constexpr uint32_t CopyTextureRegion = 16;
 constexpr uint32_t CopyResource = 17;
 constexpr uint32_t ResolveSubresource = 19;
+constexpr uint32_t IASetPrimitiveTopology = 20;
 constexpr uint32_t RSSetViewports = 21;
 constexpr uint32_t RSSetScissorRects = 22;
 constexpr uint32_t SetPipelineState = 25;

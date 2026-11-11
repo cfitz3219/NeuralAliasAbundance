@@ -15,6 +15,7 @@
 #include "host_dx12/observe/producers.hpp"
 
 #include <array>
+#include <memory>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -64,9 +65,56 @@ M Camera(double x)
     for (int r = 0; r < 3; ++r) v[r * 4 + 3] = -(v[r * 4] * pos[0] + v[r * 4 + 1] * pos[1] + v[r * 4 + 2] * pos[2]);
     return Mul(p, v);
 }
+// A planar reflection's camera (water, mirror): the main camera mirrored in y = 0
+// (view-projection times the reflection diag(1, -1, 1, 1)); opposite winding.
+M Reflection(double x)
+{
+    const M r{1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    return Mul(Camera(x), r);
+}
 void Store(uint8_t* dst, const M& m)
 {
     for (int i = 0; i < 16; ++i) { const float f = static_cast<float>(m[i]); std::memcpy(dst + i * 4, &f, 4); }
+}
+float Half(uint16_t h)
+{
+    const uint32_t e = (h >> 10) & 31, m = h & 1023;
+    const float v = e == 0 ? std::ldexp(static_cast<float>(m), -24) : std::ldexp(static_cast<float>(m | 1024), static_cast<int>(e) - 25);
+    return (h & 0x8000) ? -v : v;
+}
+// RGBA16F texel (x, y) of `tex` (in COMMON); the GPU is idle afterwards.
+std::array<float, 4> ReadTexel(test::Device& d, ID3D12Resource* tex, uint32_t x, uint32_t y)
+{
+    ID3D12Device* dev = d.device.Get();
+    const D3D12_RESOURCE_DESC td = tex->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT64 total = 0;
+    dev->GetCopyableFootprints(&td, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    auto rb = test::CreateBuffer(dev, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    test::List l;
+    std::array<float, 4> out{-1, -1, -1, -1};
+    if (!rb || !l.Create(dev)) return out;
+    D3D12_RESOURCE_BARRIER b = test::Transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    l.list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = tex;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = rb.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    l.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    b = test::Transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    l.list->ResourceBarrier(1, &b);
+    l.list->Close();
+    ID3D12CommandList* ls[] = {l.list.Get()};
+    d.queue->ExecuteCommandLists(1, ls);
+    d.WaitIdle();
+    uint8_t* p = nullptr;
+    if (FAILED(rb->Map(0, nullptr, reinterpret_cast<void**>(&p))) || !p) return out;
+    const uint16_t* t = reinterpret_cast<const uint16_t*>(p + fp.Offset + static_cast<size_t>(y) * fp.Footprint.RowPitch) + x * 4;
+    for (int i = 0; i < 4; ++i) out[i] = Half(t[i]);
+    rb->Unmap(0, nullptr);
+    return out;
 }
 } // namespace
 
@@ -119,11 +167,19 @@ int main()
     }
     test::ComPtr<ID3D12DescriptorHeap> cbvh;
     {
-        D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&cbvh))));
         D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress() + 512, 256};
         dev->CreateConstantBufferView(&cv, cbvh->GetCPUDescriptorHandleForHeapStart());
+        // Second descriptor: another camera's block at 1536 (same layout), used by the
+        // several-cameras-in-one-frame case.
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cv2{cb->GetGPUVirtualAddress() + 1536, 256};
+        D3D12_CPU_DESCRIPTOR_HANDLE h2 = cbvh->GetCPUDescriptorHandleForHeapStart();
+        h2.ptr += dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        dev->CreateConstantBufferView(&cv2, h2);
     }
+    D3D12_GPU_DESCRIPTOR_HANDLE other_cam_table = cbvh->GetGPUDescriptorHandleForHeapStart();
+    other_cam_table.ptr += dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu); // persistent, like a game's upload ring
     const D3D12_GPU_VIRTUAL_ADDRESS va = cb->GetGPUVirtualAddress();
@@ -131,7 +187,7 @@ int main()
     test::List scene, consumer;
     REQUIRE(scene.Create(dev) && consumer.Create(dev));
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()));
-    const auto frame = [&](double cam_x) {
+    const auto frame = [&](double cam_x, ID3D12Resource* touched = nullptr, bool other_camera = false) {
         d.WaitIdle();
         // Camera block at 512 (VP at +80, inverse at +144), a junk block at 1024.
         std::memset(cpu, 0, 4096);
@@ -141,6 +197,13 @@ int main()
         Store(cpu + 512 + 80, vp);
         Store(cpu + 512 + 144, inv);
         for (int i = 0; i < 64; ++i) cpu[1024 + i] = static_cast<uint8_t>(i * 7);
+        if (other_camera) { // a water reflection's camera: the main camera mirrored in the plane y = 0
+            const M ov = Reflection(cam_x);
+            M oinv{};
+            Inverse(ov, oinv);
+            Store(cpu + 1536 + 80, ov);
+            Store(cpu + 1536 + 144, oinv);
+        }
         scene.Reset();
         D3D12_RESOURCE_BARRIER in[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
                                         test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
@@ -153,9 +216,17 @@ int main()
         ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
         scene.list->SetDescriptorHeaps(1, heaps);
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootConstantBufferView(0, va + 1024); // junk: most bound
+        if (other_camera) // bound through the camera slot first and more often than the main camera
+            for (int i = 0; i < 2; ++i) scene.list->SetGraphicsRootDescriptorTable(1, other_cam_table);
         scene.list->SetGraphicsRootDescriptorTable(1, cbvh->GetGPUDescriptorHandleForHeapStart()); // camera (table CBV)
         D3D12_RESOURCE_BARRIER out = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         scene.list->ResourceBarrier(1, &out);
+        if (touched) { // a texture the game also uses this frame (P4-4: its stretch destination), left in COMMON
+            D3D12_RESOURCE_BARRIER t[2] = {test::Transition(touched, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                                           test::Transition(touched, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON)};
+            scene.list->ResourceBarrier(1, &t[0]);
+            scene.list->ResourceBarrier(1, &t[1]);
+        }
         REQUIRE(SUCCEEDED(scene.list->Close()));
         consumer.Reset();
         D3D12_RESOURCE_BARRIER back[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
@@ -220,8 +291,12 @@ int main()
     na::dlss::Shutdown();
     fake::eval_result = NVSDK_NGX_Result_Success;
     REQUIRE(na::dlss::Attach(dev, fake::MakeApi()));
+    const auto sharp_before = na::j2::GetStats().sharpened_frames;
+    const auto saved_sharpness = na::settings::Get().j2_sharpness.exchange(75);
     frame(0.5); // camera moved a little: same history
+    na::settings::Get().j2_sharpness.store(saved_sharpness);
     st = na::j2::GetStats();
+    CHECK(st.sharpened_frames == sharp_before + 1 && st.nis_frames == 0);
     std::printf("frame 2: forwarded %zu, frames %llu, cuts %llu, reset %d\n", g_forwarded.size(), static_cast<unsigned long long>(st.frames),
                 static_cast<unsigned long long>(st.cuts), fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset));
     CHECK(g_forwarded.size() == 3 && st.frames == 2 && fake::evals == evals0 + 3);
@@ -274,6 +349,194 @@ int main()
         CHECK(std::strncmp(ds.reason, "Stopped", 7) != 0);
     }
     na::j2::SetDebugView(0);
+
+    // Several valid cameras in one frame (Sniper Elite 5: a water reflection's camera, the sky's;
+    // any engine: shadow, environment, scope cameras). The other camera is bound in the learned
+    // camera slot first and more often; J2 must stay on the camera continuing the last main one:
+    // no history reset, the other block never jittered.
+    {
+        const auto before = na::j2::GetStats();
+        for (int k = 1; k <= 3; ++k) {
+            na::j2::OnPresent(d.queue.Get());
+            frame(501.3 + k * 0.1, nullptr, true);
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+            uint8_t other[64];
+            Store(other, Reflection(501.3 + k * 0.1));
+            CHECK(std::memcmp(cpu + 1536 + 80, other, 64) == 0); // J1 left the other camera alone
+        }
+        const auto after = na::j2::GetStats();
+        std::printf("several cameras: frames +%llu cuts +%llu contested +%llu alternatives +%llu jitter_slot_other +%llu \"%s\"\n",
+                    (unsigned long long)(after.frames - before.frames), (unsigned long long)(after.cuts - before.cuts),
+                    (unsigned long long)(after.camera_contested - before.camera_contested),
+                    (unsigned long long)(after.camera_alternatives - before.camera_alternatives),
+                    (unsigned long long)(after.jitter_slot_other_camera - before.jitter_slot_other_camera), after.reason);
+        CHECK(after.frames == before.frames + 3);
+        CHECK(after.cuts == before.cuts);
+        CHECK(after.camera_contested >= before.camera_contested + 3);
+        CHECK(after.camera_alternatives >= before.camera_alternatives + 3); // the first-ranked block was not chosen
+    }
+
+    // P4-4 Stage 1: upscaling into a distinct full-size destination (slider route).
+    // The depth debug view gives a known output (depth cleared to 0 -> black, alpha 1),
+    // so the readback shows that J2's full-size result reached every corner of `dest`.
+    {
+        constexpr uint32_t OW = 96, OH = 48; // 1.5x: DLSS Quality
+        auto dest = test::CreateTexture(dev, OW, OH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto ldr = test::CreateTexture(dev, OW, OH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(dest && ldr);
+        {   // fill dest with grey so a missing copy shows
+            test::ComPtr<ID3D12DescriptorHeap> h;
+            D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&h))));
+            dev->CreateRenderTargetView(dest.Get(), nullptr, h->GetCPUDescriptorHandleForHeapStart());
+            test::List c;
+            REQUIRE(c.Create(dev));
+            D3D12_RESOURCE_BARRIER b = test::Transition(dest.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            c.list->ResourceBarrier(1, &b);
+            const float grey[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+            c.list->ClearRenderTargetView(h->GetCPUDescriptorHandleForHeapStart(), grey, 0, nullptr);
+            b = test::Transition(dest.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+            c.list->ResourceBarrier(1, &b);
+            REQUIRE(SUCCEEDED(c.list->Close()));
+            ID3D12CommandList* ls[] = {c.list.Get()};
+            d.queue->ExecuteCommandLists(1, ls);
+            d.WaitIdle();
+        }
+        const auto before = ReadTexel(d, dest.Get(), OW - 1, OH - 1);
+        CHECK(std::fabs(before[0] - 0.5f) < 0.01f);
+
+        na::j2::SetDebugView(3);
+        na::j2::SetUpscaleTarget({na::observe::IdOf(dest.Get()), 0, 0, 0});
+        const auto up0 = na::j2::GetStats().upscaled_frames;
+        const int ev = fake::evals;
+        na::j2::OnPresent(d.queue.Get());
+        frame(503, dest.Get());
+        st = na::j2::GetStats();
+        std::printf("upscale: %ux%u -> %ux%u, upscaled %llu, phases %u, note \"%s\", reason \"%s\"\n", st.render_w, st.render_h, st.out_w, st.out_h,
+                    static_cast<unsigned long long>(st.upscaled_frames), st.jitter_phases, st.upscale_note, st.reason);
+        CHECK(fake::evals == ev + 1 && st.upscaled_frames == up0 + 1);
+        CHECK(st.render_w == W && st.render_h == H && st.out_w == OW && st.out_h == OH);
+        CHECK(st.jitter_phases == 18); // ceil(8 * 1.5^2)
+        CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_Width) == W && fake::U(fake::last_create, NVSDK_NGX_Parameter_Height) == H);
+        CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_OutWidth) == OW && fake::U(fake::last_create, NVSDK_NGX_Parameter_OutHeight) == OH);
+        CHECK(fake::I(fake::last_create, NVSDK_NGX_Parameter_PerfQualityValue) == static_cast<int>(na::dlss::Quality::MaxQuality));
+        CHECK(fake::U(fake::last_eval, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width) == W);
+        void* o = fake::P(fake::last_eval, NVSDK_NGX_Parameter_Output);
+        CHECK(o != dest.Get() && o != color.Get()); // J2's own full-size target, then copied
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1); // new target: history restarts
+        const auto corner = ReadTexel(d, dest.Get(), OW - 1, OH - 1), origin = ReadTexel(d, dest.Get(), 0, 0);
+        std::printf("upscale dest: corner %.3f %.3f %.3f %.3f, origin %.3f %.3f %.3f %.3f\n", corner[0], corner[1], corner[2], corner[3],
+                    origin[0], origin[1], origin[2], origin[3]);
+        CHECK(corner[0] == 0.0f && corner[3] == 1.0f && origin[0] == 0.0f && origin[3] == 1.0f);
+
+        // Active extent smaller than the allocation (render at the top left): 48x24 -> 96x48.
+        na::j2::SetUpscaleTarget({na::observe::IdOf(dest.Get()), 0, 48, 24});
+        na::j2::OnPresent(d.queue.Get());
+        frame(503.1, dest.Get());
+        st = na::j2::GetStats();
+        CHECK(st.render_w == 48 && st.render_h == 24 && st.out_w == OW && st.upscaled_frames == up0 + 2);
+        CHECK(st.jitter_phases == 32);
+        CHECK(fake::U(fake::last_eval, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width) == 48);
+        CHECK(fake::I(fake::last_create, NVSDK_NGX_Parameter_PerfQualityValue) == static_cast<int>(na::dlss::Quality::MaxPerformance));
+        // Jitter stays inside a render pixel and the next frame keeps history.
+        na::j2::OnPresent(d.queue.Get());
+        frame(503.2, dest.Get());
+        CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
+        CHECK(std::fabs(fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X)) < 0.5);
+
+        // A destination J2 cannot use (different format) falls back to DLAA, with a reason.
+        const auto refused0 = na::j2::GetStats().upscale_refused;
+        na::j2::SetUpscaleTarget({na::observe::IdOf(ldr.Get()), 0, 0, 0});
+        na::j2::OnPresent(d.queue.Get());
+        frame(503.3, ldr.Get());
+        st = na::j2::GetStats();
+        std::printf("refused: \"%s\", out %ux%u\n", st.upscale_note, st.out_w, st.out_h);
+        CHECK(st.upscale_refused == refused0 + 1 && st.upscale_note[0] != 0);
+        CHECK(st.out_w == W && st.out_h == H && st.upscaled_frames == up0 + 3);
+        CHECK(fake::U(fake::last_create, NVSDK_NGX_Parameter_OutWidth) == W);
+        na::j2::SetUpscaleTarget({});
+
+        // P4-4 Layer2 physical-input override (Astra's no-slider route). J2 evaluates private
+        // companions (not observed, states supplied) into the snapshot's full-size output; the
+        // logical ids stay the identity. Provided / Unavailable / Failed each get one outcome.
+        {
+            auto pc = test::CreateTexture(dev, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE);
+            auto pd = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            REQUIRE(pc && pd);
+            struct Ctx {
+                int mode = 0; // 0 provide, 1 unavailable, 2 provide with the wrong logical id
+                std::shared_ptr<na::j2::PhysicalInput> payload;
+                int outcomes = 0;
+                uint64_t last_gen = 0;
+                na::j2::PhysicalOutcome last = na::j2::PhysicalOutcome::Failed;
+                uint64_t seen_color = 0, seen_depth = 0;
+            } ctx;
+            ctx.payload = std::make_shared<na::j2::PhysicalInput>();
+            auto& pi = *ctx.payload;
+            pi.generation = 7;
+            pi.color = pc.Get();
+            pi.depth = pd.Get();
+            pi.color_state = pi.depth_state = pi.output_state = D3D12_RESOURCE_STATE_COMMON;
+            pi.render_w = 40;
+            pi.render_h = 20;
+            pi.output = dest.Get();
+            pi.owner = std::shared_ptr<void>(pc.Get(), [](void*) {}); // the test owns pc/pd/dest
+            na::j2::PhysicalInputProvider prov;
+            prov.ctx = &ctx;
+            prov.lookup = [](void* c, uint64_t lc, uint64_t ld, ID3D12GraphicsCommandList*, std::shared_ptr<const na::j2::PhysicalInput>* out) {
+                auto& x = *static_cast<Ctx*>(c);
+                x.seen_color = lc;
+                x.seen_depth = ld;
+                if (x.mode == 1) return na::j2::PhysicalLookup::Unavailable;
+                x.payload->logical_color = x.mode == 2 ? lc + 1 : lc;
+                x.payload->logical_depth = ld;
+                *out = x.payload;
+                return na::j2::PhysicalLookup::Provided;
+            };
+            prov.outcome = [](void* c, uint64_t gen, na::j2::PhysicalOutcome r, const char*) {
+                auto& x = *static_cast<Ctx*>(c);
+                ++x.outcomes;
+                x.last_gen = gen;
+                x.last = r;
+            };
+            na::j2::SetPhysicalInputProvider(prov);
+            const auto st0 = na::j2::GetStats();
+            int ev2 = fake::evals;
+            na::j2::OnPresent(d.queue.Get());
+            frame(504);
+            st = na::j2::GetStats();
+            std::printf("physical: evaluated %llu, %ux%u -> %ux%u, outcomes %d, reason \"%s\"\n", (unsigned long long)st.physical_evaluated,
+                        st.render_w, st.render_h, st.out_w, st.out_h, ctx.outcomes, st.reason);
+            CHECK(ctx.seen_color == na::observe::IdOf(color.Get()) && ctx.seen_depth == na::observe::IdOf(depth.Get())); // logical identity
+            CHECK(fake::evals == ev2 + 1 && st.physical_evaluated == st0.physical_evaluated + 1);
+            CHECK(ctx.outcomes == 1 && ctx.last == na::j2::PhysicalOutcome::Evaluated && ctx.last_gen == 7);
+            CHECK(st.render_w == 40 && st.render_h == 20 && st.out_w == OW && st.out_h == OH);
+            const auto pcorner = ReadTexel(d, dest.Get(), OW - 1, OH - 1);
+            CHECK(pcorner[0] == 0.0f && pcorner[3] == 1.0f); // written into the snapshot's output
+            // Redirected but unavailable: nothing evaluated, the owner is told.
+            ctx.mode = 1;
+            ev2 = fake::evals;
+            na::j2::OnPresent(d.queue.Get());
+            frame(504.1);
+            st = na::j2::GetStats();
+            CHECK(fake::evals == ev2 && ctx.outcomes == 2 && ctx.last == na::j2::PhysicalOutcome::Unavailable);
+            CHECK(st.physical_unavailable == st0.physical_unavailable + 1);
+            // Provided but naming other logical ids: refused, reported Failed, never drawn as DLAA.
+            ctx.mode = 2;
+            ev2 = fake::evals;
+            na::j2::OnPresent(d.queue.Get());
+            frame(504.2);
+            st = na::j2::GetStats();
+            CHECK(fake::evals == ev2 && ctx.outcomes == 3 && ctx.last == na::j2::PhysicalOutcome::Failed);
+            CHECK(st.physical_failed == st0.physical_failed + 1);
+            na::j2::SetPhysicalInputProvider({});
+            d.WaitIdle();
+        }
+        na::j2::SetDebugView(0);
+        CHECK(na::j2::JitterPhasesFor(64, 64) == 8 && na::j2::JitterPhasesFor(10, 100) == 64);
+        CHECK(std::fabs(na::j2::UpscaleMipBias(64, 64) + 1.0f) < 1e-6f && std::fabs(na::j2::UpscaleMipBias(50, 100) + 2.0f) < 1e-6f);
+        d.WaitIdle();
+    }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);
     d.WaitIdle();

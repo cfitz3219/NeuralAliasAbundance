@@ -12,7 +12,10 @@ class JitterWrites {
     struct Patch { std::array<uint8_t, 64> original{}, written{}; };
     using Key = std::pair<uint64_t, uint64_t>;
     std::map<Key, Patch> patches_;
+    uint64_t refused_ = 0;
 public:
+    size_t Size() const { return patches_.size(); }
+    uint64_t Refused() const { return refused_; }
     static constexpr size_t kMaxPatches = 65536;
     void Clear() { patches_.clear(); }
     uint32_t Normalize(uint64_t resource, uint64_t offset, uint8_t* bytes, size_t size) const {
@@ -32,7 +35,7 @@ public:
         const Key key{resource, offset};
         auto i = patches_.find(key);
         // Never evict a live patch then mistake its injected bytes for native data.
-        if (i == patches_.end() && patches_.size() == kMaxPatches) return false;
+        if (i == patches_.end() && patches_.size() == kMaxPatches) { ++refused_; return false; }
         if (!write()) return false;
         auto& p = patches_[key];
         std::memcpy(p.original.data(), original, 64);

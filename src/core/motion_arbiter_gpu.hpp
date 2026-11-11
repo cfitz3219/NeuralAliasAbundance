@@ -28,6 +28,8 @@
 
 #include "core/motion_arbiter.hpp"
 
+#include "core/camera_fit_basis.hpp"
+
 namespace na::motion::gpu {
 
 struct Inputs {
@@ -46,6 +48,12 @@ struct Inputs {
     Mat4 view_proj_previous{};
     float jitter_current_px[2] = {0, 0};
     Config config{};
+    // Optional M3 correction: a 256-byte raw buffer (NON_PIXEL_SHADER_RESOURCE) written by
+    // CameraFit on the GPU in the same frame; words 0..15 = G, word 16 = valid. When valid,
+    // tier 2 reprojects with ndc * (inv_view_proj_current + G). Absent or invalid = unchanged.
+    ID3D12Resource* fix = nullptr;
+    // CPU basis for CameraFit (compute_flow runs the fit when this and a flow pair exist).
+    const FitBasis* fit_basis = nullptr;
 };
 
 struct Outputs {
@@ -84,7 +92,8 @@ public:
     bool DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Resource* raw_flow, ID3D12Resource* depth,
                                 const Inputs& camera, const float jitter_previous_px[2], ID3D12Resource* residual_out,
                                 ID3D12Resource* valid_out, uint32_t width, uint32_t height, uint32_t frame_slot,
-                                ID3D12Resource* raw_valid = nullptr);
+                                ID3D12Resource* raw_valid = nullptr,
+                                Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap = nullptr);
     // Converts a read-back stats buffer (from the most recent Dispatch) into
     // the shared Stats struct, adding whole-tier extent rejections that were
     // decided on the CPU side.
@@ -92,6 +101,8 @@ public:
     ID3D12Device* Device() const { return device_.Get(); }
 
 private:
+    static constexpr uint32_t kDescriptors = 11; // per slot: SRV t0..t6, UAV u0..u3
+    void fix_srv(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* fix);
     uint64_t whole_rejects_last_ = 0;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
@@ -101,6 +112,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> dummy2_;  // 1x1 RG32_FLOAT
     Microsoft::WRL::ComPtr<ID3D12Resource> dummy_stats_;
     Microsoft::WRL::ComPtr<ID3D12Resource> dummy_uav_;   // 1x1 R32_FLOAT UAV for unused slots
+    Microsoft::WRL::ComPtr<ID3D12Resource> dummy_fix_;   // 256-byte raw buffer (NPSR) when no fix is supplied
     UINT stride_ = 0;
     uint32_t slots_ = 0;
 };

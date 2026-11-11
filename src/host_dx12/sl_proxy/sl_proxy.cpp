@@ -1,5 +1,6 @@
 #include "host_dx12/fg/camera.hpp"
 #include "host_dx12/host_boot/session.hpp"
+#include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
@@ -366,7 +367,7 @@ extern "C" __declspec(dllexport) void NeuralAliasSLProxyStats(
     if (out_hooked) *out_hooked = s.hooked_functions;
 }
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = instance;
@@ -374,5 +375,6 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
         HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
         if (t) CloseHandle(t);
     }
+    if (reason == DLL_PROCESS_DETACH && reserved) na::host::NotifyProcessExit(); // before the CRT's static teardown
     return TRUE;
 }

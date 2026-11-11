@@ -16,6 +16,7 @@ class RecordingLease {
 public:
     bool Ready(ID3D12CommandQueue* consumer) const;
     bool Retired() const;
+    bool SameRecording(const RecordingLease& other) const;
     explicit operator bool() const { return !!retired_; }
 private:
     std::weak_ptr<void> record_;
@@ -84,4 +85,9 @@ private:
     uint32_t count_=0;
     bool entered_=false;
 };
+// Optional existing-forward seam. Called after recording forward locks are
+// acquired and before native Execute, without the NR registry mutex held.
+// Callback must not wait, read back, or acquire a recording forward lock.
+using SubmissionPrepareCallback=void(*)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*);
+void SetSubmissionPrepareCallback(SubmissionPrepareCallback);
 }
