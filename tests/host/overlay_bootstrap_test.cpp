@@ -15,6 +15,8 @@
 #include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/scale/live_driver.hpp"
 #include "host_dx12/scale/native_control.hpp"
+#include "host_dx12/upscalers/ffx_intercept.hpp"
+#include "host_dx12/upscalers/xess_intercept.hpp"
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <filesystem>
@@ -118,6 +120,10 @@ int main(int argc,char** argv) {
     if(on12_present_order)set(L"j2",L"enabled",L"1");
     if (added_upscaling_off) {
         set(L"route_a", L"enabled", L"0");
+        set(L"fsr", L"enabled", L"1");
+        set(L"fsr", L"replace", L"1");
+        set(L"xess", L"enabled", L"1");
+        set(L"xess", L"replace", L"1");
         set(L"observe", L"producers", L"1");
         set(L"j2", L"enabled", L"1");
         set(L"j2", L"scale_mode", L"3");
@@ -170,7 +176,15 @@ int main(int argc,char** argv) {
     test::ComPtr<ID3D12CommandQueue> observed;
     observed.Attach(na::overlay::AcquirePresentQueue(chain.Get()));
     CHECK(observed.Get()==d.queue.Get());
-    for(unsigned i=0;i<400 && !na::host::GetStatus().init_complete;++i)Sleep(5);
+    if (added_upscaling_off) {
+        // This WARP fixture also installs the DX12 observation producers. Allow
+        // that setup to finish before checking policy, even if the factory gate
+        // released the test thread first. The production gate stays unchanged.
+        const ULONGLONG init_deadline = GetTickCount64() + 20000;
+        while (!na::host::GetStatus().init_complete && GetTickCount64() < init_deadline) Sleep(5);
+    } else {
+        for(unsigned i=0;i<400 && !na::host::GetStatus().init_complete;++i)Sleep(5);
+    }
     REQUIRE(na::host::GetStatus().init_complete==1);
     if(on12_ownership){
         const D3D_FEATURE_LEVEL level=D3D_FEATURE_LEVEL_11_0;
@@ -229,6 +243,8 @@ int main(int argc,char** argv) {
     CHECK(na::settings::SafeStart()==recovery);
     if (added_upscaling_off) {
         CHECK(na::j2::Configured());
+        CHECK(na::ffx::GetMode() == na::ffx::Mode::Observe);
+        CHECK(na::xess::GetMode() == na::xess::Mode::Observe);
         CHECK(na::settings::Get().j2_scale_mode.load() == 3); // keep the old preference
         CHECK(!na::j2::RenderSmall() && !na::j2::ProjectionWindow());
         CHECK(!na::scale::SliderRouteActive() && !na::scale::native::Available());
