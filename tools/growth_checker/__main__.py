@@ -7,8 +7,8 @@
   impact  FROM..TO | --files a b c
   selftest
 
-Exit codes. ingest: 0 scored, 2 evidence unreadable, 3 evidence refused.
-compare: 0 no case receded, 1 a case receded, 2 no scored evidence for the build.
+Exit codes. ingest: 0 scored, 2 evidence unreadable (or nothing but empty logs), 3 evidence refused.
+compare: 0 no case receded or failing, 1 a case receded or is failing, 2 no scored evidence for the build.
 The two are kept apart on purpose: unreadable evidence is never a result.
 """
 import json
@@ -41,8 +41,10 @@ def cmd_ingest(argv):
     records = ingestion.ingest(argv[0], cases.get(case_id), _option(argv, "--type", "live_run"),
                                _option(argv, "--expect-build"), verdicts)
     worst = 0
+    any_scored = any(r["status"] == "scored" for r in records)
     for r in records:
-        worst = max(worst, {"scored": 0, "unreadable": 2, "refused": 3}[r["status"]])
+        # An empty log beside a scored one is a process that left early, not unread evidence.
+        worst = max(worst, {"scored": 0, "unreadable": 2, "refused": 3, "empty": 0 if any_scored else 2}[r["status"]])
         if "--save" in argv and r["status"] == "scored":
             path = store.result_path(r)
             store.save(path, r)
@@ -119,7 +121,7 @@ def cmd_compare(argv):
     answers = [c["verdict"]["answer"] for c in comparison["cases"].values() if "verdict" in c]
     if not answers:
         return 2
-    return 1 if any("reced" in a.lower() for a in answers) else 0
+    return 1 if any("reced" in a.lower() or "fail" in a.lower() for a in answers) else 0
 
 
 def cmd_report(argv):

@@ -75,7 +75,7 @@ td.num { font-family: var(--data); font-variant-numeric: tabular-nums; white-spa
 .chip { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border-radius: 3px; white-space: nowrap;
   font: 500 12px/1.6 var(--data); background: var(--idle-bg); color: var(--idle); }
 .chip.verified, .chip.holds { background: var(--good-bg); color: var(--good); }
-.chip.failed, .chip.below { background: var(--bad-bg); color: var(--bad); }
+.chip.failed, .chip.below, .chip.receded { background: var(--bad-bg); color: var(--bad); }
 .chip.unknown { background: var(--open-bg); color: var(--open); }
 .case { background: var(--sheet); border: 1px solid var(--line); padding: 16px 18px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .case > header { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; }
@@ -119,7 +119,7 @@ def short(build):
 
 def _answer_class(answer):
     a = (answer or "").lower()
-    return "receded" if "reced" in a else "grew" if "grew" in a or "grow" in a else "held" if "held" in a else "open"
+    return "receded" if "reced" in a or "fail" in a else "grew" if "grew" in a or "grow" in a else "held" if "held" in a else "open"
 
 
 def _job_grid(route, title, cases, comparison, results_by_id):
@@ -208,7 +208,7 @@ def _case_sheet(case, c, result, baseline):
 
 
 def _pattern_map(cases, comparison, results_by_id):
-    names = ["api", "camera_admission", "camera_layout_from", "depth_convention", "jitter_route", "motion_source", "hud_composition", "presentation"]
+    names = ["api", "scene_placement", "camera_admission", "camera_layout_from", "depth_convention", "jitter_route", "motion_source", "hud_composition", "presentation"]
     cols = [(cid, results_by_id.get(c.get("candidate"))) for cid, c in sorted(comparison["cases"].items())]
     cols = [(cid, r) for cid, r in cols if r]
     if not cols:
@@ -267,7 +267,8 @@ def page(comparison, cases, results, date, title="Growth report"):
 <strong>{e(verdict["answer"])}</strong><ul>{"".join(f"<li>{e(b)}</li>" for b in verdict["because"])}</ul>''']
     if missing_rules:
         parts.append(f'<p class="muted">Judgment rules not in this checker yet: {e(", ".join(missing_rules))}. Until they are, '
-                     f'the only answers it gives are "receded", on a broken floor or a verified job that now fails, and "not proven".</p>')
+                     f'the only answers it gives are "receded" (a broken floor, or a verified job that now fails), "failing" (a required job '
+                     f'failed and there is nothing earlier to compare) and "not proven".</p>')
     parts.append("</div>")
     imp = comparison.get("impact")
     if imp:

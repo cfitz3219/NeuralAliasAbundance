@@ -2,7 +2,7 @@
   "schema": "growth.result/1",
   "manifest": {
     "schema": "growth.manifest/1",
-    "evidence_id": "nobuild-8b87a9eb0988",
+    "evidence_id": "nobuild-dbff887d37b9",
     "evidence_type": "synthetic",
     "producer": {
       "build": null,
@@ -22,13 +22,13 @@
       {
         "name": "status-sample.txt",
         "role": "status",
-        "bytes": 6020,
-        "sha256": "8b87a9eb09888f79a2b099fb879c2516ee5e330271125a8a2ad7e1c0473a886e"
+        "bytes": 7493,
+        "sha256": "dbff887d37b9b984b870db09987d17482c08ce631669321e8cefa27a4cb5a27b"
       }
     ],
     "scorer": {
       "tool": "growth_checker",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "schema": 1
     },
     "notes": [
@@ -196,16 +196,16 @@
       "unit": "frames"
     },
     "menu_draws": {
-      "state": "unknown",
-      "value": null,
-      "why": "the log has no menu draw counter",
-      "unit": "draws"
+      "state": "measured",
+      "value": 0,
+      "unit": "draws",
+      "basis": "counter",
+      "limits": "The Home menu was drawn this many times; says nothing about its controls."
     },
     "camera_found_by": {
       "state": "measured",
       "value": {
-        "native": 9000,
-        "split": 9000
+        "generic": 9000
       },
       "unit": "frames per rule",
       "basis": "counter",
@@ -218,14 +218,36 @@
       },
       "unit": "frames per reason",
       "basis": "counter"
+    },
+    "frames_without_camera": {
+      "state": "measured",
+      "value": 0,
+      "unit": "frames",
+      "basis": "counter",
+      "limits": "Attempts on a scene frame that had no camera."
     }
   },
-  "observed": {},
+  "observed": {
+    "preset": {
+      "last": 13,
+      "distinct": [
+        13
+      ]
+    },
+    "sharpness": {
+      "last": 50,
+      "distinct": [
+        50
+      ]
+    }
+  },
   "jobs": {
     "home_menu_opens": {
-      "state": "unknown",
-      "note": "The log has no menu draw counter.",
-      "evidence": []
+      "state": "untested",
+      "note": "The menu was not opened in this run.",
+      "evidence": [
+        "menu_draws"
+      ]
     },
     "home_controls_take_effect": {
       "state": "untested",
@@ -242,6 +264,7 @@
       "note": "Median 100.0 fps over all play samples against a budget of 40.",
       "evidence": [
         "fps_play_median",
+        "fps_median_while_delivering",
         "not_delivering_share_of_play"
       ]
     },
@@ -264,7 +287,7 @@
     },
     "camera_found": {
       "state": "verified",
-      "note": "A camera was admitted on the 9000 delivered frames. Found by: native 9000, split 9000. Whether it is the right camera shows in the picture.",
+      "note": "A camera was admitted on the 9000 delivered frames. Found by: generic 9000. Whether it is the right camera shows in the picture.",
       "evidence": [
         "frames_delivered",
         "camera_found_by"
@@ -354,21 +377,14 @@
     "camera_admission": {
       "state": "observed",
       "value": {
-        "camera-relative, position witnessed": 9000
+        "inverse pair": 9000
       },
       "source": "pose{...} counters"
     },
     "camera_layout_from": {
-      "state": "unknown",
-      "why": "this build did not log whether the relative layout was seeded or learned"
+      "state": "not_applicable",
+      "why": "no camera-relative pose in this run"
     }
   },
-  "dependencies_in_use": [
-    {
-      "variant": "camera/relative",
-      "kind": "provenance_unknown",
-      "frames": 9000,
-      "source": "pose{split}"
-    }
-  ]
+  "dependencies_in_use": []
 }

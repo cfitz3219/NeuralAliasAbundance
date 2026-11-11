@@ -39,12 +39,16 @@ def parse(text):
 
 
 def series(samples, pattern):
-    """One integer per sample from the first group of `pattern`, or None where absent."""
-    rx = re.compile(pattern)
+    """One integer per sample from the first group of `pattern`, or None where absent.
+
+    `pattern` may be a list: the counters are added, and a sample missing any of
+    them is None (a partial sum is not a count). "^" matches at a line start.
+    """
+    rxs = [re.compile(p, re.M) for p in ([pattern] if isinstance(pattern, str) else pattern)]
     out = []
     for s in samples:
-        m = rx.search(s["text"])
-        out.append(int(m[1]) if m else None)
+        found = [rx.search(s["text"]) for rx in rxs]
+        out.append(sum(int(m[1]) for m in found) if all(found) else None)
     return out
 
 

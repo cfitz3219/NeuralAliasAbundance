@@ -149,6 +149,16 @@ class WholeBuild(unittest.TestCase):
         self.assertEqual(comparison["verdict"]["answer"], "receded")
         self.assertEqual(comparison["cases"]["demo-dx11"]["also_scored"], [good["manifest"]["evidence_id"]])
 
+    def test_a_first_run_that_fails_a_required_job_is_failing_not_unproven(self):
+        # No earlier result and no floor: nothing can have receded, but the build must not pass quietly.
+        dx12_case = dict(CASE, id="demo-dx12", api="dx12", provider="dx12")
+        rows = [{"presented": i * 800, "scene": i * 300, "delivered": 0, "no_camera": i * 300} for i in range(8)]
+        r = run(synthetic.dx12(rows, build=B, route="between"), case=dx12_case)
+        comparison = compare.compare_build(B, {"demo-dx12": dx12_case}, [r], {})
+        self.assertEqual(comparison["cases"]["demo-dx12"]["verdict"]["answer"], "failing")
+        self.assertEqual(comparison["verdict"]["answer"], "failing")
+        self.assertIn("failing", report.page(comparison, {"demo-dx12": dx12_case}, [r], "2026-01-02"))
+
     def test_the_report_states_the_answer_and_escapes_what_it_prints(self):
         base = run(synthetic.steady(40, build=A))
         cand = run(synthetic.steady(40, scene_share=0.5, build=B), stamp="20260102-000000")

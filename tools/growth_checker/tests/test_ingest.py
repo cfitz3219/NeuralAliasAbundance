@@ -41,6 +41,59 @@ class Reading(unittest.TestCase):
         self.assertIsNone(measure.value(r["measurements"], "frames_jittered"))
         self.assertEqual(r["jobs"]["jitter_applied"]["state"], "unknown")
 
+    def test_dx12_between_list_route_that_delivers_nothing_is_a_failure(self):
+        # The shape of the first real between-list run: scene frames seen, no camera, nothing delivered,
+        # and an inline coverage line that stays at zero. It must not read as "no opportunities".
+        rows = [{"presented": i * 800, "scene": i * 300, "delivered": 0, "no_camera": i * 300, "lost_no_vp": i * 300,
+                 "menu": i * 10, "sharpness": 49 if i < 3 else 100} for i in range(8)]
+        r = ingest.ingest(folder({"status-1.log": synthetic.dx12(rows, build=BUILD_A, route="between")}))[0]
+        m, jobs = r["measurements"], r["jobs"]
+        self.assertEqual((m["frames_presented"]["value"], m["frames_scene"]["value"], m["frames_delivered"]["value"]), (5600, 2100, 0))
+        self.assertEqual(jobs["dlaa_delivered"]["state"], "failed")
+        self.assertEqual(jobs["camera_found"]["state"], "failed")
+        self.assertEqual(m["missed_because"]["value"], {"no_camera": 2100})
+        self.assertEqual(m["camera_scan_losses"]["value"], {"lost_no_vp": 2100})
+        # Fps without DLSS running does not test the budget, and a slider moved while nothing ran proves nothing.
+        self.assertEqual(jobs["performance_budget"]["state"], "untested")
+        self.assertEqual(jobs["home_controls_take_effect"]["state"], "untested")
+
+    def test_dx12_counts_both_routes_and_keeps_scan_losses_apart_from_misses(self):
+        # Inline frames carry their own jitter count; between-list frames declare a viewport sample.
+        rows = [{"presented": i * 1000, "scene": i * 950, "delivered": i * 940, "inline": i * 900, "jittered_inline": i * 899,
+                 "no_camera": i, "lost_no_vp": i * 200, "held": i * 150} for i in range(11)]
+        r = ingest.ingest(folder({"status-1.log": synthetic.dx12(rows, build=BUILD_A)}))[0]
+        m = r["measurements"]
+        self.assertEqual(m["frames_delivered"]["value"], 9400)       # the route's count, not the inline coverage line (9000)
+        self.assertEqual(m["delivered_share_of_scene"]["value"], 98.95)
+        self.assertEqual(m["frames_jittered"]["value"], 8990 + 400)  # inline with a sample + between-list declared
+        self.assertEqual(m["missed_because"]["value"], {"no_camera": 10})
+        self.assertEqual(m["camera_scan_losses"]["value"], {"lost_no_vp": 2000})  # scans, mostly rescued: not missed frames
+        self.assertEqual(m["frames_on_predicted_camera"]["value"], 1500)
+        self.assertEqual(r["jobs"]["camera_found"]["state"], "verified")
+        self.assertEqual({k: r["patterns"][k].get("value") for k in ("scene_placement", "jitter_route")},
+                         {"scene_placement": "inline", "jitter_route": "viewport"})
+        self.assertEqual(r["jobs"]["home_controls_take_effect"]["state"], "untested")  # a pattern is not a setting
+
+    def test_dx12_matrix_jitter_is_not_read_as_no_jitter(self):
+        rows = [{"presented": i * 1000, "scene": i * 1000, "delivered": i * 1000, "declared": 0} for i in range(6)]
+        r = ingest.ingest(folder({"status-1.log": synthetic.dx12(rows, route="between", jitter_mode=0)}))[0]
+        self.assertEqual(r["measurements"]["frames_jittered"]["state"], "unknown")
+        self.assertEqual(r["jobs"]["jitter_applied"]["state"], "unknown")   # not "failed": the log cannot say
+
+    def test_a_launcher_log_with_no_sample_is_empty_not_unreadable(self):
+        d = folder({"status-13084.log": f"NeuralAlias build {BUILD_A}\r\n", "status-43256.log": synthetic.steady(6, build=BUILD_A)})
+        got = ingest.ingest(d, expect_build=BUILD_A)
+        self.assertEqual([r["status"] for r in got], ["empty", "scored"])   # both recorded, neither dropped
+        self.assertNotIn("measurements", got[0])
+
+    def test_extracts_beside_a_log_are_not_runs(self):
+        log = synthetic.steady(6, build=BUILD_A)
+        d = folder({"status-48964.log": log, "status-48964-j2_camera.txt": "j2_camera contested=0\r\n", "status-777.log": log})
+        got = ingest.ingest(d)
+        self.assertEqual([r["manifest"]["session"]["id"] for r in got], ["48964", "777"])
+        roles = {f["name"]: f["role"] for f in got[0]["manifest"]["files"]}
+        self.assertEqual(roles["status-48964-j2_camera.txt"], "extract")
+
     def test_counter_reset_splits_sessions(self):
         first = [(i * 500, i * 500, i * 500) for i in range(5)]    # 2000 frames, then the game restarts
         second = [(i * 500, i * 500, i * 500) for i in range(3)]   # 1000 more

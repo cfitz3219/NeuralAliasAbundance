@@ -32,7 +32,9 @@ JOBS = [
 ]
 JOB_TITLES = {j[0]: j[1] for j in JOBS}
 # Jobs only the person at the screen can settle.
-NEEDS_OWNER = {"dlaa_reaches_picture"}
+# Values in `observed` that are settings a person changes in the Home menu.
+SETTINGS = ("preset", "sharpness")
+NEEDS_OWNER = {"dlaa_reaches_picture", "home_controls_take_effect"}
 
 
 def required_jobs(route):
@@ -59,24 +61,32 @@ def score(route, m, observed, case=None, owner_verdicts=None):
     else:
         jobs["home_menu_opens"] = _job("untested", "The menu was not opened in this run.", ["menu_draws"])
 
-    changed = sorted(k for k, o in observed.items() if isinstance(o, dict) and len(o.get("distinct", [])) > 1)
-    if changed:
-        jobs["home_controls_take_effect"] = _job(
-            "verified", "Changed inside the program during the run without a restart: " + ", ".join(changed) +
-            ". The log does not show the picture changing.", [])
-    else:
+    changed = sorted(k for k in SETTINGS if isinstance(observed.get(k), dict) and len(observed[k].get("distinct", [])) > 1)
+    if not changed:
         jobs["home_controls_take_effect"] = _job("untested", "No setting changed during this run.")
+    elif not delivered:
+        jobs["home_controls_take_effect"] = _job(
+            "untested", "A setting changed (" + ", ".join(changed) + "), but DLSS was not delivering, so nothing could take effect.")
+    else:
+        jobs["home_controls_take_effect"] = _job(
+            "unknown", "The program took the change without a restart: " + ", ".join(changed) +
+            ". Whether the picture changed is for the person at the screen.", ["frames_delivered"])
 
     jobs["status_truthful"] = _job("unknown", "No cross-check of the status text against the counters exists yet.")
 
     budget = (case.get("budget") or {}).get("fps_min", DEFAULT_FPS_MIN)
     fps = v("fps_play_median")
+    evidence = ["fps_play_median", "fps_median_while_delivering", "not_delivering_share_of_play"]
     if fps is None:
         jobs["performance_budget"] = _job("unknown", "No fps samples during play.")
+    elif fps < budget:
+        jobs["performance_budget"] = _job("failed", f"Median {fps} fps over all play samples against a budget of {budget}.", evidence)
+    elif route == "B" and v("fps_median_while_delivering") is None:
+        # The budget is for the program doing its work; fps without DLSS running does not test it.
+        jobs["performance_budget"] = _job("untested", f"Median {fps} fps, but no sample had DLSS delivering, so the budget "
+                                          f"of {budget} was not tested.", evidence)
     else:
-        jobs["performance_budget"] = _job("verified" if fps >= budget else "failed",
-                                          f"Median {fps} fps over all play samples against a budget of {budget}.",
-                                          ["fps_play_median", "not_delivering_share_of_play"])
+        jobs["performance_budget"] = _job("verified", f"Median {fps} fps over all play samples against a budget of {budget}.", evidence)
 
     jobs["presentation_modes"] = _job("unknown", "This log carries no evidence of the presentation mode.")
     jobs["no_crash_or_hang"] = _job("unknown", "A log without a crash line does not prove a clean exit.")
@@ -108,6 +118,15 @@ def score(route, m, observed, case=None, owner_verdicts=None):
                                               " The log gives no reason (a telemetry gap).")
             for job in ("camera_found", "depth_found", "motion_found"):
                 jobs[job] = _job("unknown", note + " Which input was missing is not settled by this log.", ["missed_because"])
+            no_camera = v("frames_without_camera")
+            if no_camera is not None and no_camera >= 0.5 * opportunities:
+                lost = v("camera_scan_losses")
+                how = (" Scans came back empty for: " + ", ".join(f"{k} {n}" for k, n in sorted(lost.items())) + ".") if lost else ""
+                jobs["camera_found"] = _job("failed", f"No camera on {no_camera} of {opportunities} scene frames." + how,
+                                            ["frames_without_camera", "camera_scan_losses"])
+                for job in ("depth_found", "motion_found"):
+                    jobs[job] = _job("unknown", "Nothing was delivered because the camera was missing. "
+                                     "This log does not show whether this input was ready.")
             jobs["dlaa_delivered"] = _job("failed", note, ["frames_delivered", "missed_because"])
         else:
             for job in ("camera_found", "depth_found", "motion_found", "dlaa_delivered"):
@@ -122,12 +141,19 @@ def score(route, m, observed, case=None, owner_verdicts=None):
                                           ["frames_jittered", "frames_delivered"])
         else:
             jobs["jitter_applied"] = _job("untested", "Nothing was delivered, so jitter was not exercised.")
-        jobs["dlaa_reaches_picture"] = _job(
-            "unknown", "The program's count shows DLSS ran and its output was handed back. Only the person at the screen "
-            "can say it reached the picture (for example the DLSS indicator showing).", ["frames_delivered"])
+        if delivered:
+            jobs["dlaa_reaches_picture"] = _job(
+                "unknown", "The program's count shows DLSS ran and its output was handed back. Only the person at the screen "
+                "can say it reached the picture (for example the DLSS indicator showing).", ["frames_delivered"])
+        elif delivered == 0 and opportunities:
+            jobs["dlaa_reaches_picture"] = _job("failed", "Nothing was delivered, so nothing reached the picture.", ["frames_delivered"])
+        else:
+            jobs["dlaa_reaches_picture"] = _job("unknown", "The log does not show a delivery to judge.")
         gap = v("longest_gap_seconds")
         limit = (case.get("budget") or {}).get("longest_gap_seconds_max")
-        if gap is None:
+        if delivered == 0 and opportunities:
+            jobs["continuity"] = _job("untested", "Nothing was delivered, so there was no continuity to measure.", ["frames_delivered"])
+        elif gap is None:
             jobs["continuity"] = _job("unknown", "No gap could be measured.")
         elif limit is None:
             jobs["continuity"] = _job("unknown", f"Longest gap {gap} s (sampled). The case sets no limit; the floor comparison judges it.",

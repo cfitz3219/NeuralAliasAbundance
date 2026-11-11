@@ -29,6 +29,14 @@ def describe(provider, api, m, observed):
         "hud_composition": UNKNOWN("not logged yet"),
         "presentation": UNKNOWN("not logged yet"),
     }
+    stated = lambda key: (observed.get(key) or {}).get("last")
+    if stated("scene_placement"):
+        # Where DLAA goes relative to the game's own scene work: between command lists, inside the scene list, or at an upscaler call.
+        patterns["scene_placement"] = KNOWN(stated("scene_placement"), "j2_route route=")
+    if stated("depth_reversed") is not None:
+        patterns["depth_convention"] = KNOWN("reversed" if stated("depth_reversed") == "1" else "forward", "j2 reversed=")
+    if stated("viewport_jitter_mode") is not None:
+        patterns["jitter_route"] = KNOWN("camera matrix" if stated("viewport_jitter_mode") == "0" else "viewport", "viewport_jitter mode=")
     deps = []
     found = value(m, "camera_found_by")
     if found is None:

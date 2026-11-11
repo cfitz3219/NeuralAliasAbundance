@@ -38,12 +38,26 @@ def _file(path, role):
     return {"name": os.path.basename(path), "role": role, "bytes": os.path.getsize(path), "sha256": sha256(path)}
 
 
+def extract_of(name, names):
+    """The status log a file is cut from, or None. The saving script writes extracts
+    beside a log as status-<session>-<section>.txt; they are not runs of their own."""
+    key = STATUS_NAME.match(name)
+    if not key:
+        return None
+    for other in names:
+        k = STATUS_NAME.match(other)
+        if k and other != name and key[1].startswith(k[1] + "-"):
+            return other
+    return None
+
+
 def status_logs(path):
-    """The status logs of a saved folder (or the one file given), sorted by name."""
+    """The status logs of a saved folder (or the one file given), sorted by name.
+    Every log is returned, whatever its size; extracts of a log are not."""
     if os.path.isfile(path):
         return [path]
     names = sorted(n for n in os.listdir(path) if STATUS_NAME.match(n))
-    return [os.path.join(path, n) for n in names]
+    return [os.path.join(path, n) for n in names if not extract_of(n, names)]
 
 
 def producer_build(parsed, status_path):
@@ -109,6 +123,10 @@ def make(status_path, parsed, evidence_type="live_run", case=None, case_source=N
         other = os.path.join(folder, name)
         if os.path.isfile(other) and os.path.abspath(other) != os.path.abspath(status_path):
             files.append(_file(other, "saved-with-run"))
+    siblings = sorted(n for n in os.listdir(folder) if STATUS_NAME.match(n))
+    for name in siblings:
+        if extract_of(name, siblings) == os.path.basename(status_path):
+            files.append(_file(os.path.join(folder, name), "extract"))
     fm = FOLDER_NAME.match(os.path.basename(folder))
     samples = parsed["samples"]
     digest = files[0]["sha256"]

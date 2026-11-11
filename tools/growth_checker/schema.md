@@ -55,7 +55,7 @@ What a piece of evidence is and where it came from. One manifest per status log.
 | `producer.build_source` | Strongest first: `status_header` (the log's own build line), `startup_header`, `run_manifest`, `results_summary` (the text file the saving script wrote), `unknown` |
 | `session` | `id` (the log's process suffix), `first_sample`, `last_sample` (clock times; the log carries no date), `saved_folder`, `saved_at`, `profile_hint` (from the folder name) |
 | `case`, `case_source` | The case this evidence was filed under and who said so (`ingest argument`, later `run_manifest`) |
-| `files[]` | `name`, `role` (`status`, `startup`, `observe`, `saved-with-run`), `bytes`, `sha256` |
+| `files[]` | `name`, `role` (`status`, `startup`, `observe`, `saved-with-run`, `extract`), `bytes`, `sha256`. An `extract` is a file the saving script cut from this status log (`status-<session>-<section>.txt`); it is listed, never scored as a run. |
 | `scorer` | `tool`, `version`, `schema` |
 | `notes[]` | Sentences about provenance (a weak build source, a case that does not match the folder's profile, mixed builds) |
 
@@ -82,9 +82,13 @@ Scoring an old log again with a newer scorer is an analysis update: same
 ```
 
 `status` is the outcome of *reading*, kept apart from any verdict on the build:
-`scored`; `unreadable` (no status log, no samples, no known counters);
+`scored`; `unreadable` (no status log, or samples with no known counters);
 `refused` (an expected build was named and the evidence is from another build or
-carries none). Unreadable and refused records have no measurements.
+carries none); `empty` (a status log with its build line or events and no
+sample, which a process that starts and leaves, such as a launcher, writes
+beside the real run). Only scored
+records have measurements. An empty log beside a scored one does not change
+`ingest`'s exit code; a folder with nothing but empty logs exits 2.
 
 ### 4.1 Sessions
 
@@ -113,9 +117,9 @@ periodic status samples, only as fine as `sample_period_seconds`), `event`,
 
 | Name | Unit | Basis | Notes |
 |---|---|---|---|
-| `frames_presented` | frames | counter | native DX11 `native11 frames=`, DX12 `j2_coverage presents=` |
-| `frames_scene` | frames | counter | Frames the program judged to be a finished scene. Native DX11 `fired=`. **Unknown on DX12**: not logged apart from presented. |
-| `frames_delivered` | frames | counter | Frames with DLSS output delivered, by the program's count |
+| `frames_presented` | frames | counter | native DX11 `native11 frames=`, DX12 `overlay_source=… presents=` |
+| `frames_scene` | frames | counter | Frames the program judged to be a finished scene. Native DX11 `fired=`, DX12 `j2_route … scene_frames=`. |
+| `frames_delivered` | frames | counter | Frames with DLSS output delivered, by the program's count. Native DX11 `native11_dlaa delivered=`, DX12 `j2_route … executed=` (both DX12 routes; `j2_coverage` counts the inline route only and is not used). |
 | `scene_share_of_presented` | percent | derived | Makes a drop in recognised scenes visible. Cannot tell menus from missed gameplay. |
 | `delivered_share_of_scene` | percent | derived | The old scorer's `dlaa_percent` for native DX11 |
 | `delivered_share_of_presented` | percent | derived | |
@@ -126,10 +130,13 @@ periodic status samples, only as fine as `sample_period_seconds`), `event`,
 | `time_to_first_delivery_seconds` | seconds | sampled | |
 | `fps_play_median`, `fps_play_lowest`, `frame_ms_play_median` | fps, ms | sampled | Over **every** play sample, delivering or not |
 | `fps_median_while_delivering`, `fps_lowest_while_delivering` | fps | sampled | Conditional: only samples at 98% delivery or more. Read beside `not_delivering_share_of_play`. |
-| `frames_jittered` | frames | counter | |
+| `frames_jittered` | frames | counter | DX12: inline frames with a non-zero sample (`j2_coverage jittered=`) plus between-list frames whose scene draws declared a viewport sample (`viewport_jitter declared_list=`, `declared_submitted=`). With matrix jitter (`viewport_jitter mode=0`) the between-list part is not counted: a lower bound, or unknown when it would read zero. |
 | `menu_draws` | draws | counter | |
 | `camera_found_by` | frames per rule | counter | A dict. Native DX11 only so far. |
-| `missed_because` | frames per reason | counter | A dict. Unknown when the log gives no reasons (a telemetry gap). |
+| `missed_because` | frames per reason | counter | A dict. Unknown when the log gives no reasons (a telemetry gap). DX12: `no_state`, `no_camera`, `busy`, `dlss_failed` from the `j2 on=` line. |
+| `frames_without_camera` | frames | counter | Attempts on a scene frame that had no camera. Native DX11 `camera_missing=`, DX12 `no_camera=`. |
+| `camera_scan_losses` | scans per reason | counter | DX12 only. A dict from `j2_camera lost_*`. Scans that found no camera; the frame may still be delivered on a held or predicted camera, so these are **not** missed frames. |
+| `frames_on_predicted_camera` | frames | counter | DX12 only. Delivered on a camera held or predicted from earlier frames (`j2_misses camera_held=`, `extrapolated=`). |
 
 `observed` holds settings the log states once DLSS is delivering, for example
 `{"sharpness": {"last": 100, "distinct": [13, 100]}, "relative_layout": "seed"}`.
@@ -146,9 +153,14 @@ States: `verified`, `failed`, `untested`, `not_applicable`, `unknown`.
 | B | `api_chosen`, `camera_found`, `depth_found`, `motion_found`, `jitter_applied`, `dlaa_delivered`, `dlaa_reaches_picture`, `continuity`, `cost` |
 
 A state from a log says what the program counted. A claim about the picture
-(`dlaa_reaches_picture`) needs the owner's verdict:
+(`dlaa_reaches_picture`, `home_controls_take_effect`) needs the owner's verdict:
 `owner_verdicts[] = {"job", "state", "by", "said"}`; a job set that way carries
-`"source": "owner_verdict"`.
+`"source": "owner_verdict"`. Three rules the scorer applies so a quiet run cannot
+pass by default: fps measured while DLSS was not delivering leaves
+`performance_budget` `untested` (it still fails when the fps is under budget); a
+setting changed while nothing was delivered leaves `home_controls_take_effect`
+`untested`; and when nothing was delivered and at least half the scene frames had
+no camera, `camera_found` is `failed`.
 
 ### 4.4 Patterns and dependencies
 
@@ -157,7 +169,11 @@ A state from a log says what the program counted. A claim about the picture
 `api`, `provider`, `camera_admission` (a dict of method to frames),
 `camera_layout_from` (`seed`, `learned`, kept apart from the admission method),
 `depth_convention`, `jitter_route`, `motion_source`, `hud_composition`,
-`presentation`. Most are unknown until NeuralAlias logs them (task G9).
+`presentation`, and on DX12 `scene_placement` (`between`, `inline` or
+`interceptor`: where DLAA goes relative to the game's own scene work). The DX12
+log states `scene_placement`, `depth_convention` and `jitter_route`; the last two
+are read only from samples where DLSS was delivering. The rest are unknown until
+NeuralAlias logs them (task G9).
 
 `dependencies_in_use[] = {"variant", "kind", "frames", "source"}` with `variant`
 a name from `docs/VARIANTS.md` and `kind` one of `shared_rule`,
@@ -223,7 +239,9 @@ def build_verdict(case_verdicts, impact):
 
 Until a rule module exists the tool answers with the cautious stand-ins in
 `defaults.py`: comparisons are "not judged", no floor moves, and the build's
-answer is "not proven".
+answer is "receded" (a broken floor, or a verified job that now fails),
+"failing" (a required job failed and the case has nothing earlier to compare)
+or "not proven".
 
 ## 7. Comparison (what `compare` produces)
 
@@ -264,8 +282,8 @@ Facts are computed by the tool; judgments come from `rules/`:
   `rules.ambiguity.case_verdict(...)`, the build's `verdict` is
   `rules.ambiguity.build_verdict({case: verdict}, impact)`.
 
-`compare` exits 0 when no case receded, 1 when one did, 2 when the build has no
-scored evidence at all.
+`compare` exits 0 when no case receded or is failing, 1 when one did, 2 when the
+build has no scored evidence at all.
 
 ## 8. Dependency map and impact (`growth.dependencies/1`)
 

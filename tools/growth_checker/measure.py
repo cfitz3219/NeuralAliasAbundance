@@ -27,19 +27,38 @@ PROVIDERS = {
         "preset": r"\bnative11_dlaa [^|]*?\bpreset=(\d+)",
         "sharpness": r"\bnative11_dlaa [^|]*?\bsharpness=(\d+)",
         "found_group": "pose", "reason_groups": {"split_rejected": "split_", "start_rejected": "start_"},
+        "camera_missing": r"\bnative11 frames=[^|]*?\bcamera_missing=(\d+)",
     },
+    # Checked against two saved DX12 runs: Sniper Elite 5 on 1ebb7b7 (inline route,
+    # delivering) and Anno 1800 on b8b6a4a (between-list route, nothing delivered).
+    # j2_coverage counts the inline route only, so it is not the delivery count.
     "dx12": {
         "api": "dx12", "route": "B",
-        "presented": r"\bj2_coverage presents=(\d+)",
-        "scene": None,
-        "delivered": r"\bj2_coverage presents=\d+ covered=(\d+)",
-        "jittered": r"\bj2_coverage [^\n]*?\bjittered=(\d+)",
-        "menu_draws": r"\bmenu_gpu draws=(\d+)",
+        "presented": r"^overlay_source=\w+ native_presents=\d+ presents=(\d+)",
+        "scene": r"^j2_route [^\n]*?\bscene_frames=(\d+)",
+        "delivered": r"^j2_route [^\n]*?\bexecuted=(\d+)",
+        # Inline frames with a non-zero sample, plus between-list frames whose scene
+        # draws declared a viewport sample.
+        "jittered": [r"^j2_coverage [^\n]*?\bjittered=(\d+)", r"^viewport_jitter [^\n]*?\bdeclared_list=(\d+)",
+                     r"^viewport_jitter [^\n]*?\bdeclared_submitted=(\d+)"],
+        # Matrix jitter (mode 0) on the between-list route is not counted per frame.
+        "jitter_mode": r"^viewport_jitter mode=(-?\d+)",
+        "menu_draws": r"^menu_gpu draws=(\d+)",
         "preset": r"^j2 on=[^\n]*?\bpreset=(\d+)",
         "sharpness": r"^j2 on=[^\n]*?\bsharpness=(\d+)",
         "found_group": None, "reason_groups": {},
-        # The DX12 host states its misses as counters on the "j2 on=" line.
-        "reason_line": (r"^j2 on=[^\n]*", ("no_selection", "no_scene_list", "no_state", "no_camera", "busy", "dlss_failed")),
+        # Why an attempt on a scene frame got no DLAA. (no_selection and no_scene_list
+        # on the same line count submissions, not frames, so they are left out.)
+        "reason_lines": [(r"^j2 on=[^\n]*", ("no_state", "no_camera", "busy", "dlss_failed"), "")],
+        "camera_missing": r"^j2 on=[^\n]*?\bno_camera=(\d+)",
+        # Why a camera scan came back empty, and how many frames ran on a held or
+        # predicted camera instead. Neither is a count of missed frames.
+        "scan_losses": (r"^j2_camera [^\n]*", ("lost_unread", "lost_no_vp", "lost_no_inverse", "lost_capped")),
+        "camera_predicted": [r"^j2_misses [^\n]*?\bcamera_held=(\d+)", r"^j2_misses [^\n]*?\bextrapolated=(\d+)"],
+        # Rendering patterns the log states. (name, pattern, True when it only means something while delivering)
+        "stated": [("scene_placement", r"^j2_route [^\n]*?\broute=(\w+)", False),
+                   ("depth_reversed", r"^j2 on=[^\n]*?\breversed=(\d)", True),
+                   ("viewport_jitter_mode", r"^viewport_jitter mode=(-?\d+)", True)],
     },
     # Route A: the game runs its own DLSS. Written from the format strings in the
     # source; not yet checked against a saved Route A run.
@@ -195,6 +214,24 @@ def _group_delta(samples, spans, name):
     return total if seen else None
 
 
+def _line_delta(samples, spans, line_rx, keys):
+    """Advance of the named counters on one status line, summed over sessions; None if the line is absent."""
+    totals, seen = {}, False
+    for a, b in spans:
+        first = last = None
+        for i in range(a, b + 1):
+            lm = re.search(line_rx, samples[i]["text"], re.M)
+            if lm:
+                kv = {k: int(v) for k, v in re.findall(r"\b(\w+)=(\d+)\b", lm[0]) if k in keys}
+                first = kv if first is None else first
+                last = kv
+        if first is not None:
+            seen = True
+            for k, v in last.items():
+                totals[k] = totals.get(k, 0) + v - first.get(k, 0)
+    return totals if seen else None
+
+
 def measure(parsed, provider=None):
     """-> {"provider", "api", "route", "sessions": [...], "measurements": {...}, "observed": {...}}
 
@@ -287,6 +324,13 @@ def measure(parsed, provider=None):
 
     jit = _counter_delta(samples, spans, p["jittered"])
     m["frames_jittered"] = count(jit, "the log has no jitter counter")
+    if p.get("jitter_mode") and jit is not None:
+        modes = {x for x in statuslog.series(samples, p["jitter_mode"]) if x is not None}
+        if 0 in modes and not jit and delivered:
+            m["frames_jittered"] = unknown("matrix jitter was selected (viewport_jitter mode=0), which this log does not "
+                                           "count per delivered frame on the between-list route", "frames")
+        elif 0 in modes:
+            m["frames_jittered"]["limits"] = "A lower bound: matrix jitter on the between-list route is not counted."
     menu = _counter_delta(samples, spans, p["menu_draws"])
     m["menu_draws"] = (measured(menu, "draws", "counter", "The Home menu was drawn this many times; says nothing about its controls.")
                        if menu is not None else unknown("the log has no menu draw counter", "draws"))
@@ -302,28 +346,32 @@ def measure(parsed, provider=None):
         if g is not None:
             why_missed = why_missed or {}
             why_missed.update({prefix + k: v for k, v in g.items() if v > 0})
-    if p.get("reason_line"):
-        line_rx, keys = p["reason_line"]
-        totals, seen = {}, False
-        for a, b in spans:
-            first = last = None
-            for i in range(a, b + 1):
-                lm = re.search(line_rx, samples[i]["text"], re.M)
-                if lm:
-                    kv = {k: int(v) for k, v in re.findall(r"\b(\w+)=(\d+)\b", lm[0]) if k in keys}
-                    first = kv if first is None else first
-                    last = kv
-            if first is not None:
-                seen = True
-                for k, v in last.items():
-                    totals[k] = totals.get(k, 0) + v - first.get(k, 0)
-        if seen:
-            why_missed = {k: v for k, v in totals.items() if v > 0}
+    for line_rx, keys, prefix in p.get("reason_lines", ()):
+        totals = _line_delta(samples, spans, line_rx, keys)
+        if totals is not None:
+            why_missed = why_missed or {}
+            why_missed.update({prefix + k: v for k, v in totals.items() if v > 0})
     m["camera_found_by"] = (measured(found, "frames per rule", "counter",
                                      "'native' counts every camera-relative pose, so it overlaps 'split'.")
                             if found is not None else unknown(f"the {name} provider does not log which rule found the camera"))
     m["missed_because"] = (measured(why_missed, "frames per reason", "counter")
                            if why_missed is not None else unknown("the log gives no reasons for missed frames (a telemetry gap)"))
+
+    missing = _counter_delta(samples, spans, p["camera_missing"]) if p.get("camera_missing") else None
+    m["frames_without_camera"] = (measured(missing, "frames", "counter", "Attempts on a scene frame that had no camera.")
+                                  if missing is not None else unknown("the log has no counter of frames without a camera", "frames"))
+    if p.get("scan_losses"):
+        lost = _line_delta(samples, spans, *p["scan_losses"])
+        m["camera_scan_losses"] = (measured({k: v for k, v in lost.items() if v > 0}, "scans per reason", "counter",
+                                            "Scans that found no camera. A frame can still be delivered on a held or "
+                                            "predicted camera, so these are not missed frames.")
+                                   if lost is not None else unknown("the log has no camera scan counters"))
+    if p.get("camera_predicted"):
+        predicted = _counter_delta(samples, spans, p["camera_predicted"])
+        m["frames_on_predicted_camera"] = (measured(predicted, "frames", "counter",
+                                                    "Delivered on a camera held or predicted from earlier frames, "
+                                                    "because this frame's camera could not be read.")
+                                           if predicted is not None else unknown("the log has no held-camera counters", "frames"))
 
     observed = {}
     # Settings count only once DLSS is delivering: the zeros a log shows while the
@@ -335,6 +383,13 @@ def measure(parsed, provider=None):
             xs = [c[i] for i in live if c[i] is not None]
             if xs:
                 observed[key] = {"last": xs[-1], "distinct": sorted(set(xs))}
+    delivering = [i for i in range(len(samples)) if deliv and deliv[i]]
+    for key, pattern, needs_delivery in p.get("stated", ()):
+        rx = re.compile(pattern, re.M)
+        xs = [mm[1] for mm in (rx.search(samples[i]["text"]) for i in (delivering if needs_delivery else range(len(samples)))) if mm]
+        xs = [x for x in xs if x != "none"]
+        if xs:
+            observed[key] = {"last": xs[-1], "distinct": sorted(set(xs))}
     layout = None
     for s in samples:
         lm = re.search(r"\brelative_layout\{(\w+)", s["text"])

@@ -19,13 +19,15 @@ python3 tools/growth_checker selftest
 `ingest` reads one saved run. It exits 0 when the evidence was scored, 2 when it
 could not be read and 3 when it was refused (wrong build, or no build line where
 one was expected). Those codes describe the evidence, never the build. `compare`
-sets every case beside its baseline and floor and exits 1 when a case receded.
+sets every case beside its baseline and floor and exits 1 when a case receded or
+is failing.
 `report` writes the page for Cort and the proposed ledger row. `impact` sorts
 the cases a change can reach into affected, no identified dependency and unknown.
 
 Until the judgment rules exist in `rules/`, the tool answers with the cautious
-stand-ins of `defaults.py`: it can say "receded" on a plain fact and otherwise
-"not proven". It never claims growth by itself.
+stand-ins of `defaults.py`: it can say "receded" on a plain fact against the
+past, "failing" on a plain fact about one run, and otherwise "not proven". It
+never claims growth by itself.
 
 Data lives in `growth/` at the repository root: cases, scored results and floors.
 Raw logs are never committed; a result names its log files by hash.

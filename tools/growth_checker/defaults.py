@@ -1,7 +1,9 @@
 """Cautious stand-ins for the judgment rules, used until a module of the same
 name exists in rules/ (tasks A1 to A4). They never claim growth: a comparison is
-"not judged", no floor moves, and the answer is "receded" on a plain fact (a
-floor broken, a verified job now failing) and otherwise "not proven".
+"not judged", no floor moves, and the answer is one of three. "receded" on a
+plain fact against the past (a floor broken, a verified job now failing),
+"failing" on a plain fact about this run alone (a required job failed and there
+is nothing earlier to set it against), otherwise "not proven".
 """
 
 
@@ -45,12 +47,20 @@ class ambiguity:
         because += [g["message"] for g in guards if g.get("severity") == "blocks"]
         if because:
             return {"answer": "receded", "because": because}
+        failed = sorted(job for job, after in (jobs_after or {}).items() if after["state"] == "failed")
+        if failed:
+            return {"answer": "failing", "because": [f"{job} failed in this run: {jobs_after[job]['note']}" for job in failed] +
+                    ["There is no earlier result or floor for this case to set it against, so this is not called a recession."]}
         return {"answer": "not proven", "because": ["No floor is broken and no verified job fails. Whether the build held or grew "
                                                     "is not judged until the comparison and ambiguity rules exist."]}
 
     @staticmethod
     def build_verdict(case_verdicts, impact):
         receded = sorted(c for c, v in case_verdicts.items() if v["answer"] == "receded")
+        failing = sorted(c for c, v in case_verdicts.items() if v["answer"] == "failing")
         if receded:
-            return {"answer": "receded", "because": ["Receded: " + ", ".join(receded) + "."]}
-        return {"answer": "not proven", "because": ["No case receded. Nothing more is claimed until the judgment rules exist."]}
+            return {"answer": "receded", "because": ["Receded: " + ", ".join(receded) + "."] +
+                    (["Failing with nothing earlier to compare: " + ", ".join(failing) + "."] if failing else [])}
+        if failing:
+            return {"answer": "failing", "because": ["A required job failed in: " + ", ".join(failing) + "."]}
+        return {"answer": "not proven", "because": ["No case receded or failed. Nothing more is claimed until the judgment rules exist."]}

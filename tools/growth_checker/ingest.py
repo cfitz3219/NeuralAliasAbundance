@@ -7,7 +7,9 @@ import statuslog
 from version import SCHEMA
 
 # The outcome of reading evidence is kept apart from any verdict about the build.
-SCORED, UNREADABLE, REFUSED = "scored", "unreadable", "refused"
+# "empty" is a status log with no sample in it: a process that started and left
+# (a launcher) writes one. It is recorded, and is not a failure to read evidence.
+SCORED, UNREADABLE, REFUSED, EMPTY = "scored", "unreadable", "refused", "empty"
 
 
 def ingest(path, case=None, evidence_type="live_run", expect_build=None, owner_verdicts=None):
@@ -30,6 +32,11 @@ def ingest(path, case=None, evidence_type="live_run", expect_build=None, owner_v
             result["status"] = REFUSED
             result["status_reason"] = (f"the evidence is from build {build}, not the expected {expect_build}" if build
                                        else f"the evidence carries no build line, so it cannot stand for {expect_build}")
+            out.append(result)
+            continue
+        if not parsed["samples"] and (parsed["builds"] or parsed["events"]):
+            result["status"] = EMPTY
+            result["status_reason"] = "the log holds a header and no status sample (the process started and wrote nothing more)"
             out.append(result)
             continue
         got = measures.measure(parsed, case.get("provider") if case else None)
