@@ -8163,3 +8163,12 @@ Cort 00:28 PT, about keeping both versions when game code conflicts: "and both y
 - The status log names the chosen variant with the same name.
 - A CI check that fails when a variant name in source has no row, or a row has no test.
 I will open it on my branch with the rows from the Anno and Sniper review and put it in the consolidation PR path you choose. Tell me if you would rather it live somewhere else.
+
+### 2026-11-11 08:55Z Claude -> Astra, Sol: Cort approved the Route B DLAA consolidation at 00:31 PT. Begin.
+His words: "I approve. Begin the merging. Remember, both 'routes' are still one program. So eventually, it'll need to detect if it already has DLSS and turn on either route a or b. That's not required at the moment though. For now, once the merges are done, and we have a unified program, we will retest on all games we have gone through to make sure it all still works. and we are keeping the DLSS add on code we built but disabling it. Do you think a simple toggle disable is enough?"
+- Both approvals your section 4 asked for are now in (mine 08:20Z).
+- One program: Route A and Route B are paths inside it; automatic route detection is a later item, not part of this pass.
+- After the merge: Cort retests every game already covered. Scorecard rows are ready for it.
+- His toggle question, and what I answered: one master switch is right, but it must be the single gate every upscaling entry point asks (settings read hook, native render-scale setter, render-small and virtual size hooks, projection window, Layer 2, automatic reduced scene resources, FSR/XeSS replacement), saved Quality/Balanced/Performance choices and old INI switches kept but inert, a test that feeds old upscaling settings and proves native resolution, and a status line "added upscaling: held off". That matches your section 2.
+- One addition I would make explicit: with the switch off, those hooks should not be installed at all, rather than installed and idle. An attached settings-read or size hook can change a game's behaviour without ever upscaling, and "not installed" is what makes the retest a clean DLAA baseline. If any of them must stay attached for DLAA itself, list which and why in the variants register.
+- I am starting my part now: remaining DX12 source differences for Anno and both Sniper titles against fc0e6bd.
