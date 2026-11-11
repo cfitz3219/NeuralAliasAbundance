@@ -2817,7 +2817,8 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
     // copies elsewhere, nor standalone P/inverse/previous matrices. The cheap
     // byte comparisons below cover the whole range without a general solver.
     for (const JB* k : order) {
-        const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size);
+        const auto policy = k->known ? na::observe::BufferMapPolicy::Recover : na::observe::BufferMapPolicy::Observed;
+        const uint32_t n = na::observe::ReadBuffer(k->res, k->off, bytes.data(), k->size, policy);
         if (n < 64) continue;
         std::vector<uint8_t> view(bytes.begin(), bytes.begin() + n);
         g.stats.jitter_rebased += g.jitter_writes.Normalize(k->res, k->off, view.data(), view.size());
@@ -2915,7 +2916,7 @@ void jitter_batch_impl(ID3D12CommandList* const* lists, UINT count)
                 else if (g.jit.has_proj && !std::memcmp(view.data() + o, g.jit.proj[l], 64)) { rep = w ? g.jit.wproj[l] : g.jit.jproj[l]; kind = 3; ++g.stats.jitter_proj_writes; }
                 else if (l == 0 && w && g.jit.has_prev && !std::memcmp(view.data() + o, g.jit.prev, 64)) { rep = g.jit.wprev; kind = 4; }
                 if (rep && g.jitter_writes.Apply(k->res, k->off + o, view.data() + o, rep, [&] {
-                    return na::observe::WriteBuffer(k->res, k->off + o, rep, 64) == 64;
+                    return na::observe::WriteBuffer(k->res, k->off + o, rep, 64, policy) == 64;
                 })) {
                     ++g.stats.jitter_writes;
                     if (kind == 1) g.jit.applied = true;
@@ -2950,7 +2951,8 @@ void count_post_dlaa(ID3D12CommandList* const* lists, UINT first, UINT count, na
         if (depth_id && na::observe::ListReferences(lists[i], depth_id)) ++g.stats.post_depth_lists;
         if (g.camera_offset < 0) continue;
         for (const auto& b : na::observe::ListRootConstantBuffers(lists[i])) {
-            if (na::observe::ReadBuffer(b.resource, b.offset + lo, bytes.data(), 64) != 64) continue;
+            const auto policy = g_camera_resources.count(b.resource) ? na::observe::BufferMapPolicy::Recover : na::observe::BufferMapPolicy::Observed;
+            if (na::observe::ReadBuffer(b.resource, b.offset + lo, bytes.data(), 64, policy) != 64) continue;
             if (!std::memcmp(bytes.data(), g.jit.jvp[0], 64) || !std::memcmp(bytes.data(), g.jit.jvp[1], 64)) { ++g.stats.post_camera_lists; break; }
             if (g.jit.windowed && (!std::memcmp(bytes.data(), g.jit.wvp[0], 64) || !std::memcmp(bytes.data(), g.jit.wvp[1], 64))) {
                 ++g.stats.post_camera_lists; ++g.stats.window_post_lists; break; // drawn on the full-size output with the corner camera
@@ -3329,9 +3331,11 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
     if (order.size() > kMaxBlocks) order.resize(kMaxBlocks);
     g_cd.blocks = order.size();
     std::vector<uint8_t> bytes(kMaxBlockRead);
-    const auto read_block = [&](const Block* o, na::camera::Snapshot& s) {
+    const auto read_block = [&](const Block* o, na::camera::Snapshot& s, bool recovering = false) {
         const uint32_t want = o->size < kMaxBlockRead ? o->size : kMaxBlockRead;
-        const uint32_t n = na::observe::ReadBuffer(o->resource, o->offset, bytes.data(), want);
+        const auto policy = recovering || g_camera_resources.count(o->resource)
+            ? na::observe::BufferMapPolicy::Recover : na::observe::BufferMapPolicy::Observed;
+        const uint32_t n = na::observe::ReadBuffer(o->resource, o->offset, bytes.data(), want, policy);
         if (n < 128) return false;
         ++g_cd.read;
         // An in-process read at submission time, inside the submitting call:
@@ -3375,13 +3379,12 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
     bool boot_seen = false;      // the first ViewProjection of the best-ranked block was judged this frame
     bool have_boot = false;      // ... and completed its streak: the first main camera
     CamPick boot;
-    for (const Block* o : order) {
-        if (picks.size() >= 4) break;
+    const auto scan_block = [&](const Block* o, bool recovering) {
         na::camera::Snapshot s{};
-        const bool read_ok = read_block(o, s);
-        const bool noted = notes.size() < 12;
+        const bool read_ok = read_block(o, s, recovering);
+        const bool noted = !recovering && notes.size() < 12;
         if (noted) notes.push_back({o->param, o->size, o->uses, read_ok ? static_cast<uint32_t>(s.bytes.size()) : 0u, o->table, 0, 0, 0, 0,o->resource,o->offset});
-        if (!read_ok) continue;
+        if (!read_ok) return;
         const auto scan = na::camera::FindMatrices(s);
         g_cd.cands += scan.candidates.size();
         for (const auto& c : scan.candidates) {
@@ -3392,7 +3395,7 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
                 else ++bn.view;
             }
             if (c.kind == na::camera::Kind::ViewProjection) ++g_cd.vp;
-            if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !boot_seen && !g_jit_cam.valid && !is_interloper(c.matrix)) {
+            if (!recovering && c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !boot_seen && !g_jit_cam.valid && !is_interloper(c.matrix)) {
                 boot_seen = true; // the best-ranked block's first camera-shaped matrix, once per frame
                 if (boot_camera(o, c)) {
                     boot.vp = c.matrix; boot.reversed = c.reversed; boot.injected = holds_jittered(s.bytes, c.byte_offset);
@@ -3400,7 +3403,7 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
                     have_boot = true;
                 }
             }
-            if (c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix) && !is_interloper(c.matrix)) {
+            if (!recovering && c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix) && !is_interloper(c.matrix)) {
                 loose.vp = c.matrix;
                 loose.reversed = c.reversed;
                 loose.injected = holds_jittered(s.bytes, c.byte_offset);
@@ -3425,6 +3428,20 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
             picks.push_back(k);
             break; // one per block
         }
+    };
+    for (const Block* o : order) {
+        if (picks.size() >= 4) break;
+        scan_block(o, false);
+    }
+    bool map_recovered = false;
+    if (picks.empty() && !have_boot && !have_loose) {
+        // An upload ring can be persistently mapped before Map observation is
+        // ready. Retry the strongest bound ranges with a temporary CPU map.
+        // Only an inverse pair can teach this path; normal picks keep priority.
+        constexpr size_t kRecoveryBlocks = 32;
+        for (size_t i = 0; i < (std::min)(order.size(), kRecoveryBlocks) && picks.size() < 4; ++i)
+            scan_block(order[i], true);
+        map_recovered = !picks.empty();
     }
     const CamPick* p = picks.empty() ? nullptr : best_pick(picks);
     if (!p && have_boot) {
@@ -3473,6 +3490,10 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
     ++g.stats.camera_scans;
     g.camera_param = static_cast<int64_t>(p->block->param);
     g.camera_table = p->block->table;
+    if (map_recovered && g_camera_resources.size() < 64 && g_camera_resources.insert(p->block->resource).second)
+        na::eventlog::Emit("camera_map_recovery", "resource=%llu param=%u table=%u offset=%llu",
+                           static_cast<unsigned long long>(p->block->resource), p->block->param,
+                           p->block->table ? 1u : 0u, static_cast<unsigned long long>(p->offset));
     publish_camera_resources_locked();
     g.stats.camera_offset = static_cast<uint64_t>(p->offset);
     *vp = p->vp;
