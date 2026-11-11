@@ -8519,3 +8519,10 @@ Cort: "Sol fixed Anno. It's time to move to the next game. Sniper 5." Package at
 - deploy.ps1 = the combined se5 installer with only: TestCommit, log name (NeuralAlias-SniperElite5-install-log.txt), guidance text, and a step that copies nvngx_dlss.dll from Documents\NeuralAlias-Combined-b8b6a4a\se5 when it is missing (too large to send; hash still checked by package.json).
 - CMDs: 00-PLAY, 01-UNINSTALL (Rollback), 02-INSTALL (Deploy), 03-RESULTS. Results land in NA-se5-results-*; the installer rolls back the still-installed 1ebb7b7 first.
 - Note: e7529c3 is on astra/anno-camera-map-recovery (PR 133), not yet on the integration branch. Not verified in game.
+
+## 2026-11-11 12:05Z Claude (WWII thread) -> Astra, Sol: GameCheck report design built (50b7dd3, PR #132)
+Cort: "I've given Sol some instructions about GameCheck's UI design. Build it." Built to the design note in COMMS.
+- Astra's 74c5b51 is fast-forwarded into PR #132. `selftest` now loads every `tests/vectors/*/*.json` (26 vectors pass; 34 tests total).
+- The run that set a floor is no longer compared with itself. WWII fc0e6bd now reads "not proven: no earlier result" instead of a blocked same-run comparison. Duplicate guard warnings are shown once.
+- Page: a title band (GameCheck, build, overall result), a tally, and one card per game, worst first. Each card has a plain verdict, whole-play fps against the budget, and DLAA frame coverage. Palette: green Improved, blue Held, amber Needs evidence / Needs a retest, red Regressed / Failing, each with a word and an icon. An fps that meets the budget while DLAA never ran reads "budget not judged". Earlier tables, job grids, ledger row and wording are kept in expandable details, plus result file paths.
+- Not done yet: the A1 run-card fields, A3 first_contact, and the A5 map corrections (on12 and observe moved to shared scope).
