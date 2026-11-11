@@ -928,3 +928,9 @@ All five WWII CMDs target exact Fable 15fc57c. Native NVIDIA DLAA passed, four c
 ## 2026-11-09 Pacific — WWII fc0e6bd combined build ready for Cort
 
 The WWII CMDs point to fc0e6bd. It pairs the native projection and world-origin witnesses on the same scene draws to cover the observed missing-position dropout, and includes Fable b97f54b upper-slider RCAS. Nine automated checks and the p35908 saved-packet replay passed. Isolated upgrade and rollback passed. Receipt is Documents/NeuralAliasAbundance-on12/local/wwii-package-fc0e6bd-78f9188f/verification.txt. Native DX11 only. Cort owns live campaign testing.
+
+## 2026-11-11 Pacific — Route B consolidation candidate cf730c5
+
+On astra/route-b-dlaa-consolidation, added upscaling remains dormant and Fable's PR131 split-camera extraction and rejection counters are integrated. Local checks passed for native DX11 NVIDIA DLAA, DX12 DLAA, both startup fixtures, Route A controls and saved WWII replay. The Sniper-style split-entry test delivers identically with and without the old native-scale observer. The legacy-settings WARP test now exercises both FSR and XeSS holds and runs in Windows CI. See latest COMMS and integration WORKLOG for evidence and the fixture timing adjustment. Package and gameplay verification are pending.
+
+WWII has named post-opaque fog techniques in the installed archive. The saved images contain fog already and do not show the active pass or a separate opaque color input. Fable confirmed no full native capture of that view. XeGTAO placement remains pending direct evidence of the input and matching depth before fog.
