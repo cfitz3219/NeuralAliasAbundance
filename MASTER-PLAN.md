@@ -64,20 +64,20 @@ Preserve proven engine and game adapters while assessing what transfers. The exa
 
 ---
 
-## 0. The method: how the program grows, and how we prove it (2026-11-11, v2)
+## 0. The method: how the program grows, and how we prove it (2026-11-11, v3)
 
 **Cort, 2026-11-11:** "We need a planned method after we confirm it works in all games tested. After that we need an actual way to solidly confirm we are growing and not receding. Something professional... a method to the madness that's consistent. That a program becomes intelligent and adaptive to any game type it comes in contact with. We do not want a simple hodge podge of code scripts lazily bound together." Later: the checker "would be separate from the main program."
 
-Status: v2 joins Claude's first draft, Sol's corrections (COMMS 2026-11-11, "make the growth gate measure transfer" and "growth checker is a standalone development tool") and Claude's feasibility review (COMMS, same day). Astra's response is next; Cort decides. It adds no review gate: it replaces "does it feel better" with numbers each build must show.
+Status: v3 joins Claude's draft, Sol's corrections, Claude's feasibility review and Astra's review (all in COMMS, 2026-11-11), and the build plan Cort asked for at 02:49 PT: most of the work is Claude's, the hard judgment rules are Astra's, Claude compiles the result (0.10). It adds no review gate: it replaces "does it feel better" with evidence each build must show.
 
 ### 0.1 Two parts, kept apart
 
 | Part | What it is | Where it runs |
 |---|---|---|
 | **NeuralAlias** | The program in the game. It owns discovery, rule choice, validation and what it remembers per game. Its logs say what it found, which rule found it, and why the other rules did not. | Inside the game |
-| **Growth checker** | A development tool and a separate deliverable. It reads a build ID, test and replay results and saved run logs, and writes the compatibility comparison and the ledger row. It is never loaded by a game and is not part of the installer; NeuralAlias runs without it. | Our workspaces, Sol's machine, optionally CI. It scores saved evidence with the game closed. |
+| **Growth checker** | A development tool and a separate deliverable. It reads saved evidence (run logs, test and replay results) and writes the comparison between builds, a report and a ledger row. It adds no code, hook, service or installer dependency to NeuralAlias, and NeuralAlias runs without it. Its report needs no model or network call. | Our workspaces, Sol's machine, CI for its own tests. It scores saved evidence with the game closed. |
 
-A better rule inside NeuralAlias is a NeuralAlias change with its own evidence. The checker only measures what changed between builds. The checker does not make the program adaptive; the rules do. The checker keeps them honest and points the work at the rule instead of the game.
+A better rule inside NeuralAlias is a NeuralAlias change with its own evidence. The checker only measures what changed between builds. It does not make the program adaptive; the rules do. It keeps them honest and points the work at the rule instead of the game.
 
 ### 0.2 What "adaptive" means inside NeuralAlias
 
@@ -85,17 +85,17 @@ For each job the program holds a short ladder of general rules, strongest proof 
 
 Three laws keep it one program:
 
-1. **A rule is chosen by what the program observes in the running game, never by the game's name or exe.** Every such choice has a name, a `VARIANT:` comment and one row in `docs/VARIANTS.md`; CI fails if they disagree.
-2. **A new game that fails is fixed by improving a rule or adding one to a ladder.** An adapter may supply a hint; the shared rule still verifies it. Title-specific code is counted where it is *used*, including the Route A adapters and anything sitting in shared files.
+1. **A rule is chosen by what the program observes in the running game, never by the game's name or exe.** Every such choice has a name, a `VARIANT:` comment and one row in `docs/VARIANTS.md`; CI checks that the marked names and the register agree (it checks presence, not meaning).
+2. **A new game that fails is fixed by improving a rule or adding one to a ladder.** An adapter may supply a hint; the shared rule still verifies it. A small necessary adapter is acceptable; removing one at the cost of a verified feature is not progress. Title-specific code is counted where it is *used*, including the Route A adapters and anything sitting in shared files.
 3. **Every job says how it was done and why not otherwise.** A missing reason is a telemetry gap: reported as such, and the rest of the run is still scored.
 
 ### 0.3 Required jobs per route
 
-Each job on each run is **verified, failed, untested or not applicable**. A game is never marked down for a job its route does not need (a native DLSS game supplies its own camera).
+Each job on each run is **verified, failed, untested, not applicable or unknown**. A game is never marked down for a job its route does not need. Missing evidence is "unknown"; it never counts as a pass.
 
 | Route | Required jobs |
 |---|---|
-| **Both** | Home menu opens and its controls take effect live; the status says truthfully what runs; at least 40 to 50 fps; windowed, borderless and fullscreen; no crash or hang |
+| **Both** | Home menu opens and its controls take effect live; the status says truthfully what runs; the case's performance budget is met (Cort's minimum of 40 to 50 fps unless he sets another budget for that case); each presentation mode the evidence can tell apart; no crash or hang |
 | **A: game ships DLSS** | A requested mode changes the game's render size; each enabled feature does what its status claims |
 | **B: DLSS added** | API chosen automatically; camera, depth, motion and jitter found; DLAA reaches the presented picture; continuity; cost |
 
@@ -103,77 +103,106 @@ Each job on each run is **verified, failed, untested or not applicable**. A game
 
 | # | Step | Done when |
 |---|---|---|
-| 1 | **Baseline 1.** The build that passes Cort's retest (candidate `b8b6a4a`) is recorded with its per-game results. Floors are set only for what the logs measure; everything else stays "unverified", never guessed. | One floor file per game in `tests/replay/expected/`, one ledger row |
-| 2 | **Automated part of every change.** CPU tests, the variants check, and the changed rule replayed on recorded inputs for the new case and every existing case it can affect. | PASS before packaging |
-| 3 | **Live part, chosen by impact.** The checker lists which games a change can affect: the rules or variants it touched against the rules each game used in its last scored run. Cort plays those; replay covers the rest. A full retest only at a milestone. | The listed games scored |
-| 4 | **First contact.** A new game's first run uses the current build with zero new code and is saved as that game's row, whatever it shows. | Row saved |
-| 5 | **Fix by rule.** The failed job names its ladder; the fix improves or adds a general rule, with a replay case from that game; every other game keeps its floor. Credit goes to transfer (0.6). | Growth checker PASS, then the game's next run |
-| 6 | **Raise floors.** A run that beats a floor by more than normal variation raises it, confirmed by that game's next scheduled run, not by an extra run. Floors go down only by Cort's decision, written in the ledger. | Floor file updated with the build hash |
-| 7 | **Number the build.** A build that passes and adds a game or raises a floor is the next baseline; Cort is told the exact hash before he runs it. | Ledger row |
+| 1 | **Baseline 1.** The build that passes Cort's retest (candidate `b8b6a4a`) is recorded with its per-case results. Floors are set only for what the logs measure. | One result file per case, floors proposed, one ledger row |
+| 2 | **Automated part of every change.** CPU tests, the variants check, and the changed rule replayed on recorded inputs for the new case and every existing case it can affect. Where useful a rule repair adds one generalization case: the same recorded content at other slots or offsets, or among decoy buffers, with the same selection expected. | PASS before packaging |
+| 3 | **Live part, chosen by impact.** For a change the checker sorts every case into **affected**, **no identified dependency (covered by regression tests)** or **impact unknown**, from a small dependency map (source area, capability or provider, cases). An unclassified source change is "impact unknown", never an empty list. The list spends Cort's play time well; it does not prove the other games untouched, and a replay that passes today does not renew a game's older live verification. | The affected cases scored |
+| 4 | **First contact.** A new game's first run uses the current build with zero new code and is saved as that game's first result, whatever it shows. | Result saved |
+| 5 | **Fix by rule.** The failed job names its ladder; the fix improves or adds a general rule, with a replay case from that game; every other case keeps its floor. | Checker PASS, then the game's next run |
+| 6 | **Floors move carefully.** A better run *proposes* a new floor. The old floor stands until that case's next planned run confirms it within the stated variation; no run is requested only to confirm. Floors go down only by Cort's decision. Earlier evidence is kept, never overwritten. | Floor file updated with both runs named |
+| 7 | **Number the build.** A build that passes and adds a case or raises a floor is the next baseline; Cort is told the exact hash before he runs it. | Ledger row |
 
 ### 0.5 What the checker measures
 
 Receding = a verified job fails, a floor falls, or title-specific code in use rises without Cort's decision. Coverage, gaps and frame time are always shown together, so dropping work can never pass for a speed-up.
 
-| Measure | Read from | Today |
-|---|---|---|
-| Each required job: verified / failed / untested / not applicable | scored logs | Route B partly; Route A scorer to write |
-| Route B coverage as three numbers side by side: frames presented, share the program judged to be scene, share with DLAA delivered | status counters (`native11 frames= fired=`, `j2_coverage presents= covered=`) | Counters exist; the current scorer uses different denominators per provider |
-| Continuity: longest stretch without delivery | status samples now; a frame-exact counter later | Sampled estimate, labelled as such |
-| Speed: fps with and without DLAA in the same run and the same kind of motion | status samples | fps exists; on/off and motion labels to add |
-| Time to first delivery, and recovery after a layout change | event log (frame-stamped) | Events exist for the DX11 camera; others to add |
-| Title-specific dependencies actually used | `camera_found_by`, variant names in logs, the register | Camera only so far |
-| Transfer: patterns handled by a shared rule in more than one game | pattern fields (0.6) | To add |
+| Measure | Notes |
+|---|---|
+| Each required job's state | Route B from existing counters; Route A scoring is new |
+| Route B coverage as three numbers side by side: frames presented, share the program judged to be scene, share with DLAA delivered | They make a drop in recognised scenes visible. They do not establish which unrecognised frames were gameplay, and the report says so. |
+| Continuity: the longest gap over observed opportunities | A sampled estimate today and labelled as one. A later exact counter must count defined eligible frames and tell intended Off, menu and loading apart from unexpected misses. |
+| Speed: whole-run frame time over the measured play interval, the skipped or missing share, and fps while DLAA was delivering | The conditional number alone can hide bad stretches |
+| Time to first delivery, and recovery after a layout change | From the frame-stamped event log |
+| Title-specific dependencies actually used | Admission method reported apart from where the layout came from: a shared rule validating a seeded layout is validation with a hint, not discovery |
+| Transfer and tested pattern combinations (0.6) | |
 
-Like is compared with like: same game, same settings, same kind of motion. The program already knows the camera, so it can label each sample *still, turning* or *moving*, and the status lines say whether DLAA was on. The checker splits a run by those labels, so two builds are compared on the same kind of frames without Cort timing anything.
+Comparisons hold only between comparable evidence: same case and settings, a known producer build, the same kind of evidence. Camera rotation and translation flags (with "unknown" where the pose cannot say) help split a run, but they describe the camera, not the scene: a battle under a still camera still changes cost. An on/off interval in a changing scene is an observed comparison, not an isolated cost of DLAA.
 
-### 0.6 The pattern map: how we know we are nearing "most games"
+### 0.6 The pattern map: how we know the program is getting broader
 
-"Any game type" means any rendering pattern. Rows are the patterns the program observes and logs; columns are games; each cell says which shared rule handled it, or which title-specific code was used.
+"Any game type" means any rendering pattern. Rows are the patterns the program observes and logs; columns are cases; each cell says which shared rule handled it, or which title-specific code was used. The map records **tested combinations** as well as single patterns: standard depth in one game and a relative camera in another do not prove the two together.
 
 | Pattern | Kinds seen so far |
 |---|---|
-| Graphics API | DX11 (WWII, Pharaoh), DX12 (Anno, Sniper Elite 5, Resistance, Tsushima, PBZ) |
-| Camera | inverse pair beside the matrix; no inverse; camera-relative with the position witnessed elsewhere (WWII) |
-| Depth | reversed or standard; where it lives |
-| Motion | the game's own vectors, or reconstructed |
-| HUD | composited over the scene in the back buffer, or elsewhere |
-| Presentation | windowed, borderless, fullscreen |
+| Graphics API and provider | DX11 (WWII, Pharaoh), DX12 (Anno, Sniper Elite 5, Resistance, Tsushima, PBZ) |
+| Camera admission | inverse pair; no inverse (start, continue); camera-relative with the position witnessed elsewhere. Layout seeded or learned is recorded separately. Relative learning is wired to native DX11 only today. |
+| Depth | the convention the consumer used, and where that came from |
+| Jitter | route and sample; requested, applied and consumed kept apart when they differ |
+| Motion | as reported by the motion backend (camera motion plus residual flow is a combination) |
+| HUD and presentation | only what the evidence shows; the rest stays unknown |
 
-Transfer is credited when a shared rule handles a pattern in a second game with no title-specific code in use. Holes in the map choose the next first-contact game.
+A new game's zero-change success and an independent engine or pattern are credited separately. Holes in the map choose the next first-contact game.
 
 ### 0.7 The run card
 
-Written by the checker before each run and answered by it afterwards: the build hash and how to confirm it (the installer's S option; the first line of the startup log), the one question this run answers, what to do, and what each outcome means for the next step. "What to do" is the game's **standard scene**: one save, about three minutes: still, turning, moving, with DLAA switched off from the Home menu for about 20 seconds. That one run gives cost, an on/off comparison and continuity. After the run, the installer's L option saves the logs; the checker refuses logs whose build line does not match the card.
+Written by the checker before each run and answered by it afterwards: the build hash and how to confirm it (the installer's S option; the first line of the startup log), the one question this run answers, what to do, and what each outcome means for the next step. "What to do" is the case's **standard scene**: one save, about three minutes: still, turning, moving, with DLAA switched off from the Home menu for about 20 seconds. After the run the installer's L option saves the logs. The build is read from the logs themselves; a label typed by anyone cannot rename old evidence.
 
 ### 0.8 The build ledger
 
-`docs/BUILD-LEDGER.md`, newest at the bottom, from Baseline 1 on. Each game also keeps its last known-good hash, so a regression is answered by comparing two named builds and the rule that changed behaviour between them, not by guessing.
+`docs/BUILD-LEDGER.md`, newest at the bottom, from Baseline 1 on. Each case keeps its last known-good hash, so a regression is answered by comparing two named builds and the rule that changed behaviour between them.
 
-| Baseline | Build hash | Date | Games run by Cort | Jobs verified | Floors raised | Title-specific code in use | What changed for the player |
+| Baseline | Build hash | Date | Cases run by Cort | Jobs verified | Floors proposed or confirmed | Title-specific code in use | What changed for the player |
 |---|---|---|---|---|---|---|---|
 
 ### 0.9 Milestones (proposed; Cort decides)
 
 | Milestone | Done when |
 |---|---|
-| **M1: Baseline 1** | The six retest games scored, floors saved, ledger row written |
+| **M1: Baseline 1** | The six retest games scored, floors proposed, ledger row written |
 | **M2: First proof of transfer** | Pharaoh reaches every Route B job verified with no title-specific code in use |
-| **M3: Broad** | Three new games in a row, on different engines, reach every required job with no new title-specific code |
+| **M3: Broad** | Three new games in a row, on different engines, reach every required job with no new title-specific code. A worthwhile mark, not an estimate of how many games work. |
 
-### 0.10 What exists and what is to build
+### 0.10 Build plan for the growth checker (Cort, 02:49 PT)
 
-| Piece | State | Proposed owner |
+**Form.** A command-line tool in Python 3 using only the standard library, in `tools/growth_checker/`, with its own offline tests. Nothing is installed on Cort's PC: it runs on the logs he saves. It produces three things: a result file per case (numbers with their sources), one self-contained report page for Cort, and a proposed ledger row.
+
+| Where | What lives there |
+|---|---|
+| `tools/growth_checker/` | The tool: `schema.md`, readers, scoring, `rules/` (Astra), report, `tests/` |
+| `growth/cases/` | One file per case: game, route, API, settings, standard scene, required jobs, budget |
+| `growth/results/<build>/` | Scored results with their provenance. Added to, never overwritten. Raw logs are not committed; a result names its log files by hash. |
+| `growth/floors/` | The floor per case with its history and any open proposal |
+| `growth/dependencies.json` | The dependency map behind the impact list |
+| `docs/BUILD-LEDGER.md` | One row per baseline |
+
+**Commands:** `ingest` (a saved run folder becomes a manifest and a scored result), `compare` (a build against the baseline, case by case), `report` (the page and the ledger row), `impact` (which cases a change can affect), `selftest`.
+
+**Claude's tasks**
+
+| # | Task | Done when |
 |---|---|---|
-| Build line in the startup log; the installer's L option saves one build's logs | In `b8b6a4a` | Sol |
-| `scripts/score_run.py` (native DX11 and DX12 counters) and the WWII floor | Exists; becomes one input of the checker | Claude |
-| Variants register and its CI check | Exists | Everyone |
-| Checker, first slice (`tools/growth_checker/`, own tests, not linked into NeuralAlias): per-route jobs, the three coverage numbers, unknowns marked, ledger row, one visual report | After the retest logs exist; does not hold up the retest | Claude |
-| Route A scoring (Home, mode changes render size, features) | In the first slice | Claude, with Sol for the Route A log lines |
-| Small NeuralAlias log additions: frame-exact longest gap, motion labels, pattern fields | Next package after the retest | Sol (package), Astra (camera and depth fields) |
-| Replay of recorded inputs beyond the WWII camera | Case by case, with each changed rule | Owner of that rule |
-| Machine checks of the standing rules (no game or exe names in conditions, one control per setting, upscaling hold respected, every miss counter has a reason) | After the first slice | Claude |
-| Impact list (which games to play for a change) | After the first slice | Claude |
+| G1 | **Data format first** (`schema.md`, sample records): evidence manifest with producer build read from the log, run and session identity, case, settings, API, evidence type, scorer and schema version, file hashes | Published so Astra's rules can be written against it |
+| G2 | **Readers** for native DX11, DX12, Route A and the event log. The run is chosen by its build line and session, never by the largest log. Sessions split at a counter reset. A missing value is "unknown", never zero. A parse failure is its own status, never a pass. | Offline tests on the existing sample and synthetic logs |
+| G3 | **Cases and job scoring** per route, with the per-case budget | The six retest cases defined |
+| G4 | **Results store and floors**: append-only results, floor proposals and confirmations as Astra's rules decide | A proposal cannot replace a floor by itself |
+| G5 | **Report page and ledger row**: route-aware matrix, each case against its baseline, trend, unknowns, warnings, links to the evidence | One self-contained page |
+| G6 | **Impact list** from the dependency map, with its three answers | "Impact unknown" for an unclassified change |
+| G7 | **Command, offline tests, CI step.** The tool is tested on intentionally wrong results before its green is trusted: wrong-build evidence, a missing required maximum, a counter reset, a candidate that recognises fewer scenes, a change to a previously rejected rule, a shared dependency reaching two providers; plus a correctly unchanged and a correctly improved case. | All eight give the expected answer |
+| G8 | **Compile**: bring in Astra's rule modules, run everything, score the retest logs, deliver the first report and the Baseline 1 proposal to Cort | Report in Cort's hands |
+| G9 | *Later, a NeuralAlias change with its own PR, never for `b8b6a4a`:* pattern and pose fields at the existing scene handoff, as Astra specified in COMMS (a) and (b) | Next package after the retest |
+
+**Astra's tasks: the judgment rules.** Each is delivered as a decision table (`rules/README.md`), a pure function over the records of `schema.md` (no file or network access), and test vectors with the expected answer (`tests/vectors/<rule>/`). Claude wires them in at G8.
+
+| # | Task | The question it settles |
+|---|---|---|
+| A1 | **Valid comparison** (`rules/comparison.py`) | When may two results be compared? Which identity and settings must match, how warm-up, cuts, restarts and intended Off or menu intervals are treated, how much evidence is enough, what variation is normal, and when a better sample may propose a floor and what confirms it. Answers: comparable, comparable with stated limits, not comparable (with the reason). |
+| A2 | **Misleading results** (`rules/guards.py`) | Which results look better without being better? Fewer scenes recognised, a speed gain beside lost coverage, a conditional fps hiding bad stretches, a missing value passing a limit, a counter reset, a relabelled or re-scored old log shown as new, a sampled gap shown as exact. Each guard names its inputs, its trigger and the sentence the report prints. |
+| A3 | **Transfer across games** (`rules/transfer.py`) | What earns credit for getting broader? Zero-change success, an independent engine or pattern, a tested combination, and hint against discovery, each counted apart; and how title-specific dependencies in use are counted, Route A adapters and shared files included. |
+| A4 | **Ambiguous evidence** (`rules/ambiguity.py`) | What does the checker say when evidence is missing, partial or in conflict? Live run against replay against fixture, an old live verification beside a new replay pass, two runs that disagree, a telemetry gap; how "unknown" travels from a job to a case to the build's overall answer, and the words for that answer. |
+| A5 | **Review of the dependency map** (small) | Does the map of G6 cover selection and priority logic, eligible alternatives and common dependencies? |
+
+**Sol:** merges the checker's PR into the integration branch; writes the ledger row at packaging; in the next package the installer's L option also writes a small run manifest (build, profile, session, file hashes), so provenance is fixed where the logs are saved.
+
+**Order.** G1 goes first because Astra's rules are written against it. Then A1 to A4 and G2 to G7 proceed side by side. Cort's retest waits for none of it. G8 follows when both halves and the retest logs exist. G9 and the scorecard page fed by the report come after.
 
 ---
 
