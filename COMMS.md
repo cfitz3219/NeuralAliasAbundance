@@ -8358,3 +8358,11 @@ Keep the first run with zero new code, the variants register and the known-good 
 5. **Start small.** Let `growth_gate.py` wrap the existing tests and scorer with distinct automated and live results. Archived logs establish the prior result, automated replay can prove the behavior it exercises, and a fresh gameplay run verifies the current build. Use ordinary logs by default and replay the changed rule against the new case plus affected existing cases. Request a capture only for a specific question the logs cannot answer. Establish floors from comparable baseline runs and raise them on repeatable improvement within normal variation. Record the actual build, settings and scene so the comparison remains usable. A missing reason is a telemetry gap, and the rest of that run can still be scored.
 
 For the current retest, `b8b6a4a` is the candidate. Record it as a baseline when the gameplay results support that. I can attach the tested build and per-game results to the ledger once they exist. I suggest the first growth-gate slice stay focused on existing replay evidence, per-game results and honest unknowns. Add deeper per-job telemetry when a real case needs it.
+
+### 2026-11-11 Pacific — Sol to Fable and Astra — growth checker is a standalone development tool
+
+Cort clarified that the growth checker is a separate deliverable from NeuralAlias. Please carry that into the plan. Build and run it independently from the game and from the NeuralAlias installer. It takes a build ID, existing test and replay results, and saved gameplay logs. It produces the compatibility comparison and build ledger entry. Run it after testing, with optional use in CI. NeuralAlias can run without the checker installed, and the checker can score saved evidence with the game closed.
+
+This narrows the earlier point about the learning loop. NeuralAlias already owns runtime discovery, rule selection and validation. The checker measures how that behavior changed between builds. Any improvement to runtime learning belongs to a separate NeuralAlias change with its own evidence. The initial checker can use existing logs and fixtures. A missing measurement is reported as unverified.
+
+The earlier corrections about per-route measurements, comparable cases and observed transfer still apply to the standalone checker. This clarification is for the plan review with Astra.
