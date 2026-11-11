@@ -20,6 +20,7 @@
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <filesystem>
+#include <fstream>
 
 namespace {std::atomic<unsigned> submits{0},devices{0};
 void submitted(na::overlay::ExecuteContext*){submits.fetch_add(1);}
@@ -120,6 +121,8 @@ int main(int argc,char** argv) {
     if(on12_present_order)set(L"j2",L"enabled",L"1");
     if (added_upscaling_off) {
         set(L"route_a", L"enabled", L"0");
+        set(L"host", L"graphics_api", L"auto");
+        set(L"host", L"build_commit", L"0000000000000000000000000000000000000001");
         set(L"fsr", L"enabled", L"1");
         set(L"fsr", L"replace", L"1");
         set(L"xess", L"enabled", L"1");
@@ -243,6 +246,15 @@ int main(int argc,char** argv) {
     CHECK(na::settings::SafeStart()==recovery);
     if (added_upscaling_off) {
         CHECK(na::j2::Configured());
+        CHECK(na::on12::Automatic() && !na::on12::NativeRoute() && !na::on12::Enabled());
+        CHECK(na::on12::SwapchainApi(chain.Get()) == na::on12::GraphicsApi::Dx12);
+        wchar_t status_path[MAX_PATH]{};
+        REQUIRE(na::host::ProcessLogPath(status_path, MAX_PATH,
+                                       (dir / L"NeuralAliasHost-status.log").c_str()));
+        std::ifstream status{std::filesystem::path(status_path)};
+        std::string header;
+        CHECK(std::getline(status, header) &&
+              header == "NeuralAlias build 0000000000000000000000000000000000000001");
         CHECK(na::ffx::GetMode() == na::ffx::Mode::Observe);
         CHECK(na::xess::GetMode() == na::xess::Mode::Observe);
         CHECK(na::settings::Get().j2_scale_mode.load() == 3); // keep the old preference

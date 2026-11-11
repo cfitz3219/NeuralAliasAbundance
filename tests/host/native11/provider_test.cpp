@@ -522,9 +522,10 @@ bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
 
 } // namespace
 
-int main()
+int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 {
 #if defined(NA_TEST_NATIVE_DLAA)
+    const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const auto dir = std::filesystem::path(exe).parent_path();
@@ -538,7 +539,9 @@ int main()
         return WritePrivateProfileStringW(section, key, value, ini.c_str()) != FALSE;
     };
     if (!set(L"host", L"enabled", L"1") || !set(L"host", L"status_log", status_path.c_str()) ||
-        !set(L"dx11on12", L"enabled", L"0") || !set(L"native11", L"enabled", L"1") ||
+        !set(L"dx11on12", L"enabled", automatic ? L"1" : L"0") ||
+        !set(L"native11", L"enabled", automatic ? L"0" : L"1") ||
+        !set(L"host", L"graphics_api", automatic ? L"auto" : L"") ||
         !set(L"overlay", L"enabled", L"1") || !set(L"adapter", L"enabled", L"0") ||
         !set(L"observe", L"producers", L"0") || !set(L"observe", L"early_install", L"0") ||
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
@@ -547,8 +550,8 @@ int main()
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
     na::host::WaitForObserveInstall();
     for (unsigned i = 0; i < 400 && !na::host::GetStatus().init_complete; ++i) Sleep(5);
-    expect(na::host::GetStatus().init_complete && na::on12::NativeRoute() && !na::on12::Enabled(),
-           "production host starts native route with the bridge disabled");
+    expect(na::host::GetStatus().init_complete && na::on12::NativeRoute() != automatic && !na::on12::Enabled(),
+           "production host starts with the bridge disabled");
     if (g_failed) return 1;
 #endif
     Game g;
@@ -563,11 +566,19 @@ int main()
     if (warp) return 77;
     ComPtr<ID3D11On12Device> translated;
     expect(FAILED(g.device.As(&translated)), "game device is native DX11");
+    if (automatic) {
+        expect(na::on12::SwapchainApi(g.swap.Get()) == na::on12::GraphicsApi::Dx11,
+               "automatic selection identifies the swap chain's native DX11 device");
+        expect(SUCCEEDED(g.swap->Present(0, DXGI_PRESENT_TEST)) && !na::on12::NativeRoute(),
+               "a test present leaves the route unselected");
+        expect(SUCCEEDED(g.swap->Present(0, 0)) && na::on12::NativeRoute(),
+               "the real present selects native DX11");
+    }
     char activation[2048]{};
     na::on12::FormatStatus(activation, sizeof activation);
     expect(std::strstr(activation, "native11_route=active installs=1 install_failures=0") != nullptr &&
            std::strstr(activation, "dx11on12 enabled=0") != nullptr && std::strstr(activation, "wrapped=0") != nullptr,
-           "production device hook installed provider exactly once");
+           "production host installed the native provider exactly once");
     if (g_failed) return 1;
     na::j2::SetJitter(true);
 #endif

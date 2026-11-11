@@ -83,6 +83,13 @@ bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* qu
 bool Enabled();
 bool NativeRoute();
 
+enum class GraphicsApi : unsigned { Unknown, Dx11, Dx12, Dx11On12 };
+bool AutomaticRequested(const wchar_t* ini);
+bool Automatic();
+GraphicsApi SwapchainApi(IDXGISwapChain* chain);
+void AttachNativePresentation(IDXGISwapChain* chain);
+bool AcceptPresentation(GraphicsApi api);
+
 // Factory CreateSwapChain / CreateSwapChainForHwnd: when `device` is one of
 // our 11on12 devices and the description can be presented by D3D12, returns
 // true with the queue to create on (AddRef'ed) and the translated description.

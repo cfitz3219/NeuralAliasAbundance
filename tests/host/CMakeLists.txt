@@ -408,6 +408,8 @@ if(TARGET host_native11)
   if(NA_HAVE_NGX_LIB AND NA_DLSS_DLL)
     na_host_test(native11_dlaa_test SOURCES native11/provider_test.cpp LIBS host_dx12 LABELS "gpu;nvidia")
     target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
+    add_test(NAME host_native11_dlaa_automatic_test COMMAND native11_dlaa_test --automatic)
+    set_tests_properties(host_native11_dlaa_automatic_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_custom_command(TARGET native11_dlaa_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_dlaa_test>")
   endif()

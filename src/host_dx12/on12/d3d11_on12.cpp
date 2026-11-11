@@ -47,6 +47,12 @@ std::atomic<bool> g_enabled{false}, g_hooked{false};
 // [dx11on12] route=native (WWII plan B1/B2): the game keeps its own D3D11 device; the native
 // input provider hands each frame's scene to the DX12 effects through shared images.
 std::atomic<bool> g_route_native{false};
+std::atomic<bool> g_automatic{false};
+std::atomic<GraphicsApi> g_present_api{GraphicsApi::Unknown};
+constexpr GUID kSwapchainGraphicsApi{0x92d1c406, 0xa6f8, 0x497d, {0x96, 0x31, 0xda, 0x44, 0x20, 0x85, 0x2b, 0x9c}};
+std::mutex g_auto_native_m;
+ComPtr<ID3D11Device> g_auto_native_device;
+std::atomic<bool> g_auto_native_attempted{false};
 std::atomic<uint32_t> g_native_installs{0}, g_native_install_failures{0};
 // [dx11on12] menu_buffer: 1 (default) the menu draws into a canvas texture of ours, which the
 // game's own D3D11 context then blends onto the back buffer; 2 the menu draws straight into the
@@ -407,9 +413,25 @@ HMODULE system_module(const wchar_t* name)
 
 } // namespace
 
+bool AutomaticRequested(const wchar_t* ini)
+{
+    wchar_t api[16]{};
+    GetPrivateProfileStringW(L"host", L"graphics_api", L"", api, ARRAYSIZE(api), ini);
+    return lstrcmpiW(api, L"auto") == 0;
+}
+
+bool Automatic() { return g_automatic.load(std::memory_order_acquire); }
+
 void Start(const wchar_t* ini, LogFn log)
 {
     g_log = log;
+    if (AutomaticRequested(ini)) {
+        // Automatic selection observes the game's own swap chain. Never
+        // intercept device creation or opt into the legacy translation path.
+        g_automatic.store(true, std::memory_order_release);
+        note("graphics API: automatic (waiting for game presentation)");
+        return;
+    }
     const bool native = GetPrivateProfileIntW(L"native11", L"enabled", 0, ini) == 1;
     const bool bridge = GetPrivateProfileIntW(L"dx11on12", L"enabled", 0, ini) == 1;
     if (!native && !bridge) {
@@ -441,7 +463,7 @@ void Start(const wchar_t* ini, LogFn log)
 
 ID3D12CommandQueue* QueueFor(IUnknown* device)
 {
-    if (!g_hooked.load() || !device) return nullptr;
+    if ((!g_hooked.load() && !Automatic()) || !device) return nullptr;
     IUnknown* id = identity_of(device);
     if (!id) return nullptr;
     std::lock_guard<std::mutex> lk(g_m);
@@ -454,7 +476,7 @@ namespace {
 ComPtr<ID3D11Device> swapchain_device(IDXGISwapChain* chain)
 {
     ComPtr<ID3D11Device> device;
-    if (!g_hooked.load() || !chain) return device;
+    if ((!g_hooked.load() && !Automatic()) || !chain) return device;
     if (FAILED(chain->GetDevice(IID_PPV_ARGS(&device)))) {
         ComPtr<ID3D11Texture2D> backbuffer;
         if (SUCCEEDED(chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) backbuffer->GetDevice(&device);
@@ -462,6 +484,55 @@ ComPtr<ID3D11Device> swapchain_device(IDXGISwapChain* chain)
     return device;
 }
 } // namespace
+
+GraphicsApi SwapchainApi(IDXGISwapChain* chain)
+{
+    if (!Automatic() || !chain) return GraphicsApi::Unknown;
+    GraphicsApi api = GraphicsApi::Unknown;
+    UINT bytes = sizeof(api);
+    if (SUCCEEDED(chain->GetPrivateData(kSwapchainGraphicsApi, &bytes, &api)) &&
+        bytes == sizeof(api)) return api;
+
+    if (auto d11 = swapchain_device(chain)) {
+        ComPtr<ID3D11On12Device> translated;
+        api = SUCCEEDED(d11.As(&translated)) ? GraphicsApi::Dx11On12 : GraphicsApi::Dx11;
+    } else {
+        ComPtr<ID3D12Device> d12;
+        if (SUCCEEDED(chain->GetDevice(IID_PPV_ARGS(&d12))) && d12) api = GraphicsApi::Dx12;
+    }
+    // A swap chain's device is immutable. Private data expires with the
+    // object, including when a new chain reuses the old address.
+    if (api != GraphicsApi::Unknown) chain->SetPrivateData(kSwapchainGraphicsApi, sizeof(api), &api);
+    return api;
+}
+
+void AttachNativePresentation(IDXGISwapChain* chain)
+{
+    if (!Automatic() || g_auto_native_attempted.load(std::memory_order_acquire) ||
+        g_present_api.load(std::memory_order_acquire) == GraphicsApi::Dx12) return;
+    std::lock_guard<std::mutex> lock(g_auto_native_m);
+    if (g_auto_native_attempted.load(std::memory_order_relaxed) ||
+        g_present_api.load(std::memory_order_acquire) == GraphicsApi::Dx12) return;
+    auto device = swapchain_device(chain);
+    if (!device) return;
+    na::host::InternalFactoryScope internal;
+    g_auto_native_device = device; // the provider's device identity is borrowed
+    install_native(device.Get());
+    g_auto_native_attempted.store(true, std::memory_order_release);
+}
+
+bool AcceptPresentation(GraphicsApi api)
+{
+    if (!Automatic()) return true;
+    GraphicsApi current = GraphicsApi::Unknown;
+    if (!g_present_api.compare_exchange_strong(current, api, std::memory_order_acq_rel))
+        return current == api;
+    // The overlay and temporal effects are bound to a device. A helper
+    // swap chain of another API must not replace that device mid-session.
+    if (g_log) g_log(api == GraphicsApi::Dx11 ? "graphics API selected: DX11 (native)" :
+                                               "graphics API selected: DX12 (native)");
+    return true;
+}
 
 ID3D12CommandQueue* QueueForSwapchain(IDXGISwapChain* chain)
 {
@@ -795,7 +866,7 @@ bool unwrap_native(IDXGISwapChain* sc, ID3D11Device* d11, DXGI_FORMAT format, ID
 bool UnwrapBackBuffer(IDXGISwapChain* sc, unsigned index, ID3D12CommandQueue* queue, unsigned format, ID3D12Resource** out, Borrowed& borrowed)
 {
     const int mode = g_menu_buffer.load();
-    if (g_route_native.load() && g_hooked.load() && sc && queue && out) {
+    if ((g_route_native.load() || Automatic()) && sc && queue && out) {
         auto d11 = swapchain_device(sc);
         if (d11 && is_native_device(d11.Get())) {
             return unwrap_native(sc, d11.Get(), static_cast<DXGI_FORMAT>(format), out, borrowed);
@@ -1143,7 +1214,11 @@ bool translate_common(IUnknown* device, DXGI_FORMAT format, ID3D12CommandQueue**
 } // namespace
 
 bool Enabled() { return g_hooked.load() && !g_route_native.load(); }
-bool NativeRoute() { return g_enabled.load() && g_route_native.load(); }
+bool NativeRoute()
+{
+    return Automatic() ? g_present_api.load(std::memory_order_acquire) == GraphicsApi::Dx11 :
+                         g_enabled.load() && g_route_native.load();
+}
 
 bool TranslateSwapChain(IUnknown* device, const DXGI_SWAP_CHAIN_DESC& game, DXGI_SWAP_CHAIN_DESC& real, ID3D12CommandQueue** queue)
 {
@@ -1464,7 +1539,7 @@ int FormatStatus(char* out, size_t capacity)
     out += n;
     capacity -= static_cast<size_t>(n);
     int extra = 0;
-    if (g_route_native.load()) {
+    if (NativeRoute()) {
         // Native route: provider and handoff state, then the bridge's own counters (requests only).
         int m = std::snprintf(out, capacity, "native11_route=active installs=%u install_failures=%u menu{draws=%llu failures=%llu} | ",
                               g_native_installs.load(), g_native_install_failures.load(),

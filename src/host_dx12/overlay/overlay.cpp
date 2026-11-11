@@ -3171,7 +3171,8 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
 // failed). Takes g_state.mutex on success (caller releases via the guard it
 // passes in).
 bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D12CommandQueue>& retained_queue,
-                     ID3D12CommandQueue* queue_hint = nullptr, bool* on12_owned = nullptr)
+                     ID3D12CommandQueue* queue_hint = nullptr, bool* on12_owned = nullptr,
+                     na::on12::GraphicsApi api = na::on12::GraphicsApi::Dx12)
 {
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
@@ -3212,6 +3213,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     }
     queue=retained_queue.Get();
     if (!queue) return false; // next submitted frame supplies evidence; never guess
+    if (!na::on12::AcceptPresentation(api)) return false;
     g_last_present_queue.store(reinterpret_cast<uintptr_t>(queue), std::memory_order_relaxed);
     if (g_state.swapchain && g_state.swapchain != sc) {
         // A31 robustness: a game that recreates its swap chain (HDR toggle,
@@ -3657,16 +3659,25 @@ void note_menu_present_result(bool open, UINT flags, HRESULT result) {
     }
 }
 thread_local bool t_native11_present = false;
+na::on12::GraphicsApi presentation_api(IDXGISwapChain* chain)
+{
+    if (na::on12::Automatic()) return na::on12::SwapchainApi(chain);
+    return na::on12::NativeRoute() ? na::on12::GraphicsApi::Dx11 : na::on12::GraphicsApi::Unknown;
+}
+
 struct Native11Present {
     bool outer = !t_native11_present;
     Native11Present(IDXGISwapChain* sc, UINT flags) {
         if (!outer) return;
         t_native11_present = true;
-        if ((flags & DXGI_PRESENT_TEST) || !na::native11::ObservePresent(sc)) return;
+        if (flags & DXGI_PRESENT_TEST) return;
+        na::on12::AttachNativePresentation(sc);
+        if (!na::native11::ObservePresent(sc)) return;
         std::lock_guard<std::mutex> lock(g_state.mutex);
         ComPtr<ID3D12CommandQueue> retained;
         ID3D12CommandQueue* queue = nullptr;
-        if (present_prelude(sc, queue, retained)) menu_step(sc, queue, g_open.load(std::memory_order_acquire));
+        if (present_prelude(sc, queue, retained, nullptr, nullptr, na::on12::GraphicsApi::Dx11))
+            menu_step(sc, queue, g_open.load(std::memory_order_acquire));
         na::native_d3d11::CapturePresent(sc, queue);
     }
     ~Native11Present() { if (outer) t_native11_present = false; }
@@ -3674,7 +3685,9 @@ struct Native11Present {
 
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
-    if (na::on12::NativeRoute()) {
+    const auto api = presentation_api(sc);
+    if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present(sc, sync, flags);
+    if (api == na::on12::GraphicsApi::Dx11) {
         Native11Present frame(sc, flags);
         return g_orig_present(sc, sync, flags);
     }
@@ -3714,7 +3727,9 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
 HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
-    if (na::on12::NativeRoute()) {
+    const auto api = presentation_api(sc);
+    if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present1(sc, sync, flags, pp);
+    if (api == na::on12::GraphicsApi::Dx11) {
         Native11Present frame(sc, flags);
         return g_orig_present1(sc, sync, flags, pp);
     }
@@ -3898,7 +3913,9 @@ HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
-    if (na::on12::NativeRoute()) {
+    const auto api = presentation_api(sc);
+    if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_resize(sc, count, w, h, fmt, flags);
+    if (api == na::on12::GraphicsApi::Dx11) {
         na::native11::BeforeResize(sc);
         {
             std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -3929,7 +3946,10 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
 {
-    if (na::on12::NativeRoute()) {
+    const auto api = presentation_api(sc);
+    if (api == na::on12::GraphicsApi::Dx11On12)
+        return g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    if (api == na::on12::GraphicsApi::Dx11) {
         na::native11::BeforeResize(sc);
         {
             std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -4631,10 +4651,15 @@ uint64_t PresentsSinceLastEvaluate() { return g_presents_since_eval.load(std::me
 
 int CurrentPageIndex() { return static_cast<int>(na::menu::CurrentPage()) - 1; }
 
-void SetStatusLogPath(const wchar_t* path)
+void SetStatusLogPath(const wchar_t* path, const wchar_t* build)
 {
     na::host::ProcessLogPath(g_status_log, MAX_PATH, path);
     g_status_last_tick = 0;
+    if (build && *build) {
+        char line[96]{};
+        const int bytes = snprintf(line, sizeof line, "NeuralAlias build %ls\r\n", build);
+        if (bytes > 0 && static_cast<size_t>(bytes) < sizeof line) append_status_text(line, bytes);
+    }
     na::dlss_debug::SetStatusLogPath(g_status_log);
 }
 
