@@ -8101,3 +8101,31 @@ Ownership suggestion: Astra item 6 and the recorder in 3; Claude items 1, 2 and 
 Cort directs two product routes. Route A uses the game's native DLSS integration. Route B adds DLSS to games that ship without it. DX11 belongs in Route B alongside DX12 as an input provider for the shared backend. Classify WWII and the Pharaoh experiments under Route B and show their distinct results in the API/provider columns.
 
 Apply that structure to the scorecard, the source audit and replay. Record the exact build and verified feature per game, keep the current packages as comparison baselines, and identify which adapters belong under each route. The integration target is one maintained source baseline that carries both routes. Start from the existing evidence across games before expanding the title list.
+
+### 2026-11-11 Pacific — Astra to Cort and Fable — approval requested for Route B DLAA consolidation
+
+Cort wants to consolidate the work for games without native DLSS into Route B and focus that route on DLAA. DX11 and DX12 provide inputs within Route B. Route A continues to own games with native DLSS. This is a proposal for Cort and Fable to approve before consolidation begins.
+
+#### 1. Start from the source that already contains most of the work
+
+Use fc0e6bd as the starting candidate. Git ancestry confirms it contains the Anno 1174073, Sniper Elite 5 1ebb7b7, Resistance a450adf, current TOX2 e0a5ad4 and Pharaoh bridge 278423d revisions. The tracked runtime and tests on main are also reachable from that source at the time of this check. Keep each current game package and run receipt as its comparison baseline. Build from one source revision with the existing per-game configurations. Review the remaining branch differences individually and carry forward the applicable changes.
+
+A concrete exception is Anno 2ffc23d. It is outside the candidate's ancestry and changes the shared DX12 camera and jitter code. It includes useful fixes for the camera constant-buffer ranges and how we identify the jitter actually applied to a frame. The final windowed-upscaling trial still stuttered. Fable and I should compare the exact fixes against the current DX12 implementation and carry forward any still-needed DLAA fixes with their tests. The projection-window activation stays dormant.
+
+#### 2. Disable injected upscaling before it can change a game
+
+For the consolidated Route B build, one runtime policy holds injected upscaling off before startup or overlay actions can activate it. Keep the implementation and its regression fixtures in the repo. Cover the settings read hook and native render-scale setter, render-small and virtual size hooks, the projection window, Layer 2 and automatic reduced scene resources, and FSR or XeSS replacement when it would inject upscaling. Route B exposes the DLAA controls and evaluates at equal input and output extents. Old Quality, Balanced or Performance preferences and older INI switches must have no effect on the live path. Preserve those preferences for a future re-enable.
+
+Preserve the shared NVIDIA backend, native-resolution presentation and HUD protection, camera, depth, motion, raster jitter, presets, texture filtering, captures and compatible optional effects. Keep read-only upscaler observation where the game uses it. Route A retains the game's existing DLSS integration and controls. Sniper Elite 5's working Quality package remains available as the separate pinned upscaling reference.
+
+#### 3. Decide conflicts together using the behavior each game needs
+
+- **Where DLAA runs.** Sniper's working placement uses the proven scene boundary before the native HUD. Anno's reduced-size package used a Present proxy, while its older DLAA evidence came from the scene path. Use the native-resolution baseline for each. Keep any presentation hooks that the working DLAA path actually needs.
+- **Which provider owns the frame.** Keep DX12 scene observation for Anno and Sniper, and native DX11 for WWII. The D3D11On12 bridge remains in source and disabled in the consolidated defaults. Pharaoh's failed bridge run stays in the evidence as a startup failure, with any native-provider coverage scored separately when demonstrated.
+- **Camera, jitter, and settings.** Preserve the known-good game behavior and same-frame input rules. Where two changes overlap, Astra and Fable will post the competing behaviors, the affected games, the proposed choice, and the saved evidence or regression that distinguishes them. Cort decides any user-visible tradeoff that would remove a working feature or change what he sees. Routine source overlap gets resolved by the code owners.
+
+#### 4. One bounded verification pass on existing games
+
+Astra owns the integration branch, startup policy, native DX11 regression and combined package. Fable checks the DX12 behavior and remaining source differences for Anno and the two Sniper titles. Cort and Fable should reply here with approval or the exact item to change. After approval, run the existing DX11 and DX12 DLAA tests and saved replays. Add a targeted check using old upscaling settings to prove the new build keeps the game's resolution and delivers native-resolution DLAA. Check that Route A still starts and applies its controls. For live acceptance, Cort uses the combined candidate on the already-tested games and the scorecard records frame delivery, the longest dropout, HUD and picture quality, and frame time where measured. Use the saved baselines to focus any live check. The source and replay pass needs no game time from Cort.
+
+The deliverable is one pinned candidate carrying both product routes, with Route B focused on native-resolution DLAA. Record any remaining game-specific failure in its own row. Use that result before spending on another title or resuming injected upscaling.
