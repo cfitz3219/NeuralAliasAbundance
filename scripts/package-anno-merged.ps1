@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$SourcePackage = 'C:\Users\Cort\Documents\NeuralAlias-Combined-b8b6a4a',
-    [string]$Destination = 'C:\Users\Cort\Documents\NeuralAlias-Anno1800-MERGED-b8b6a4a'
+    [string]$Destination = 'C:\Users\Cort\Documents\NeuralAlias-Anno1800-MERGED-b8b6a4a',
+    [string]$RuntimeDll,
+    [ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit
 )
 $ErrorActionPreference = 'Stop'
 $source = Join-Path $SourcePackage 'anno'
@@ -10,11 +12,20 @@ foreach ($file in $package.payload) {
     if ($file.name -ne [IO.Path]::GetFileName($file.name)) { throw 'Invalid payload name.' }
     if ((Get-FileHash -LiteralPath (Join-Path $source $file.name)).Hash -ne $file.sha256) { throw "Source mismatch: $($file.name)" }
 }
+if ([bool]$RuntimeDll -ne [bool]$SourceCommit) { throw 'Supply both RuntimeDll and SourceCommit when replacing the runtime.' }
+if ($RuntimeDll -and !(Test-Path -LiteralPath $RuntimeDll -PathType Leaf)) { throw 'Replacement runtime was not found.' }
 if (Test-Path -LiteralPath $Destination) { throw 'Destination already exists; preserve the existing package.' }
 New-Item -ItemType Directory -Path $Destination | Out-Null
 Get-ChildItem -LiteralPath $source -File | Copy-Item -Destination $Destination
 $deploy = Join-Path $Destination 'deploy.ps1'
 $text = [IO.File]::ReadAllText($deploy)
+if ($RuntimeDll) {
+    $oldBuild = [string]$package.source_commit
+    if (!$oldBuild -or !$text.Contains($oldBuild)) { throw 'Template build does not match its manifest.' }
+    Copy-Item -LiteralPath $RuntimeDll -Destination (Join-Path $Destination 'NeuralAliasDXGI.dll')
+    $text = $text.Replace($oldBuild, $SourceCommit)
+    $package.source_commit = $SourceCommit
+}
 $text = $text.Replace('NA-anno-layer2-log.txt', 'NeuralAlias-Anno1800-MERGED-install-log.txt')
 $text = $text.Replace('NeuralAlias Anno automatic reduced-scene results', 'NeuralAlias Anno 1800 merged DLAA results')
 $text = $text.Replace('NeuralAlias Anno automatic reduced-scene test', 'NeuralAlias Anno 1800 merged DLAA test')
@@ -69,7 +80,6 @@ and Anti-Aliasing Off for the first comparison. Added upscaling stays held off.
 into a timestamped NA-anno-results folder in Documents after you exit the game.
 Raw capture images stay at their original paths, listed in the summary.
 
-This reuses the tested combined runtime without a rendering change.
-Preparing this folder did not install anything or change your game files.
+The installer verifies all payload hashes before using them.
 "@ | Set-Content -LiteralPath (Join-Path $Destination 'READ-ME-FIRST.txt') -Encoding UTF8
 Write-Host "Prepared $Destination"
