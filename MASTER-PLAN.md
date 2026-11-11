@@ -64,6 +64,85 @@ Preserve proven engine and game adapters while assessing what transfers. The exa
 
 ---
 
+## 0. The method: how the program grows, and how we prove it (2026-11-11)
+
+**Cort, 2026-11-11:** "We need a planned method after we confirm it works in all games tested. After that we need an actual way to solidly confirm we are growing and not receding. Something professional... a method to the madness that's consistent. That a program becomes intelligent and adaptive to any game type it comes in contact with. We do not want a simple hodge podge of code scripts lazily bound together."
+
+Status: written by Claude at Cort's request. It takes effect when the retest of the six covered games passes (step 1). It adds no review gate; it replaces "does it feel better" with numbers every build has to show.
+
+### 0.1 What "intelligent and adaptive" means in this program
+
+The program does six jobs for a game. For each job it holds a short ladder of **general rules**, strongest proof first. In a running game it tries the rules on what the game shows, admits only what is proven, says in the log which rule found it and why the others did not, and remembers the answer for that game.
+
+| Job | What the program has to find | It adapts by |
+|---|---|---|
+| Camera | The main view and its position | Inverse pair, then persistence (start / continue), then the relative-camera vote with a learned layout |
+| Depth | The scene depth and its convention | Scoring candidates against the scene draws |
+| Motion | How each pixel moved | The game's own vectors if present, otherwise camera reprojection, otherwise draw replay |
+| Jitter | A sub-pixel shift the game accepts | Projection write or viewport route, chosen by what the provider supports |
+| Scene boundary | Where the scene ends and the HUD starts | Boundary tracking on the frame's passes |
+| Delivery | Putting the DLSS result on screen every frame | The provider for the API the game presents with |
+
+Three laws keep it one program and not a pile of scripts:
+
+1. **A rule is chosen by what the program observes in the running game, never by the game's name or exe.** Every such choice has a name, a `VARIANT:` comment and one row in `docs/VARIANTS.md`; CI fails if they disagree (`scripts/check_variants.py`).
+2. **A new game that fails is fixed by improving a rule or adding a rule to a ladder.** Code that only one game can use lives in a small adapter, is counted (0.3), and the count is meant to fall.
+3. **Every job says how it was done and why not otherwise** (`camera_found_by`, `split_rejected{}`, `start_rejected{}`, `relative_layout{}` and their equivalents for the other jobs). A run that cannot explain a miss is an incomplete run.
+
+### 0.2 The steps, in order
+
+| # | Step | Done when |
+|---|---|---|
+| 1 | **Lock the baseline.** After Cort's retest of Sniper Elite 5, Sniper Elite Resistance, Anno 1800, WWII, Ghost of Tsushima and Phantom Blade Zero, that build hash becomes **Baseline 1**. | Each game's result log is scored by `scripts/score_run.py` and saved as its floor file in `tests/replay/expected/`. One line per game in the build ledger (0.4). |
+| 2 | **Every change passes the growth gate** (0.3) before it is packaged. | The gate prints PASS for every recorded game. |
+| 3 | **First contact for every new game.** The first run uses the current build with **zero new code**. Its log is scored and added as that game's first row, whatever the result. | The scorecard shows, job by job, what worked untouched and which rule turned down what. |
+| 4 | **Fix by rule.** Each failed job names the ladder it belongs to. The fix improves or adds a general rule, comes with a test fed by that game's recorded data, and must leave every other game's floor standing. | Second run of the new game; growth gate PASS for all earlier games. |
+| 5 | **Raise the floor.** When a run on Cort's PC beats a game's floor, the floor file is updated to the new numbers. Floors only go up, except by Cort's decision, written in the ledger with the reason. | New floor file committed with the run's build hash. |
+| 6 | **Number the build.** A build that passes the gate and adds a game or raises a floor becomes the next Baseline. Cort is told the exact hash before he runs it. | Ledger row added. |
+
+### 0.3 The growth gate: growing or receding, as numbers
+
+Four numbers, printed for every candidate build. Receding has a definition: **number 1 falls, or number 3 rises without Cort's decision.**
+
+| # | Number | Where it comes from | Growing means |
+|---|---|---|---|
+| 1 | **Floors held**: per game, share of scene frames with DLSS delivered, frame rate, longest stretch without delivery, share of frames with jitter | The game's floor file against the newest scored run or replay | No game below its floor |
+| 2 | **First-contact score**: for each new game, how many of the six jobs worked with zero new code | The first-contact row of step 3 | The score of each next new game is higher than the last |
+| 3 | **Game-only code**: number of adapter items only one game can use (today: the WWII packed layouts and the WWII relative seed layout) | Counted from the adapters folder and the "code just for this game?" column of the scorecard | Falls or stays level |
+| 4 | **Found by a general rule**: per game and job, which rule did the work | `camera_found_by` and its equivalents in the scored log | More cells say a general rule, fewer say an adapter |
+
+Two kinds of evidence, never mixed up:
+
+- **Automated (every change, in CI):** CPU tests of each rule, the variants check, and replay of recorded status logs against the floor files.
+- **Game evidence (Cort's PC only):** a scorecard cell turns green only from a run Cort made. Nothing is called fixed before that.
+
+Raw frame dumps and captures stay out of the repository (rule in section 1). They are kept as a local library per game and replayed offline against a change before it is packaged. What the repository holds is the scored result and the floor.
+
+### 0.4 The build ledger
+
+One table, newest at the bottom, kept in `docs/BUILD-LEDGER.md` from Baseline 1 on:
+
+| Baseline | Build hash | Date | Games run by Cort | Floors raised | Game-only code | What changed for the user |
+|---|---|---|---|---|---|---|
+
+Each game also keeps its last known-good hash there, so a regression is answered by comparing two named builds and not by guessing.
+
+### 0.5 What exists today and what is still to build
+
+| Piece | State |
+|---|---|
+| Scoring a run (`scripts/score_run.py`) and one floor file (WWII, fc0e6bd) | On `astra/route-b-dlaa-consolidation` |
+| Variants register and its CI check | On `astra/route-b-dlaa-consolidation` |
+| Game scorecard with the "code just for this game?" column | Live; updated after each run |
+| One camera finder for DX12 and DX11 | PR #131, waiting on GPU fixture runs |
+| Floor files for the other five games | Come out of the retest (step 1) |
+| One command that prints the four numbers and PASS or FAIL (`scripts/growth_gate.py`) | To build (Claude), after PR #131 merges |
+| "How it was found / why not" log lines for depth, motion, jitter, boundary to the same standard as the camera | To build, job by job |
+| `docs/BUILD-LEDGER.md` | Starts at Baseline 1 |
+| A count of game-only code checked in CI | To build with the growth gate |
+
+---
+
 ## 1. How we work (read this first)
 
 **Cort's project-wide direction (2026-11-01):** avoid relentless skepticism or looking for something to object to. Give a sound idea plain credit and pursue it. Raise concrete defects and material limitations when supported by evidence; do not turn hypothetical concerns into extra gates, scope or review cycles. This applies for the duration of the project.
