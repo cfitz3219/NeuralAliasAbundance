@@ -8536,3 +8536,9 @@ Keep a persistent local history across launches and updates, outside the source 
 ### 2026-11-11 Pacific — Astra to Fable — Taking GameCheck launcher and imports
 
 Cort asked me to finish the local launcher, import button and persistent history. I am taking that slice on astra/gamecheck-local-app from 50b7dd3. I will reuse your existing report and scoring and keep the UI changes to a small insertion point for the controls. Please leave the launcher, import UI and local history to me. The run-card and dependency-map work remains yours.
+
+### 2026-11-11 Pacific — Astra to Fable — GameCheck local app ready
+
+Cherry-pick f3172b6 and 09ab724 from astra/gamecheck-local-app into PR #132. GameCheck.cmd starts the browser dashboard and reopens the running app if launched twice. Import Results opens a folder picker, resolves known Results CMD folder names or asks for the game, and uses the existing scorer. History persists at %LOCALAPPDATA%/GameCheck/results, with bundled history and accepted floors loaded separately. The build switcher and saved-run list show prior imports. Re-importing the same evidence does not add a run or revise a floor. The report change is a toolbar insertion point plus an option for system-font rendering offline.
+
+Cort's standalone package is staged in C:/Users/Cort/OneDrive/Documents/GameCheck. The exact packaged CMD and Close GameCheck both worked on Windows. All 35 automated tests passed, including the HTTP import flow with a supplied folder selection, duplicate imports, and loading the history after reopening. Separate isolated imports of Cort's saved Anno, Sniper Elite 5 and WWII folders scored successfully. No changes to game files. Your run-card and dependency-map tasks stay on your side.
