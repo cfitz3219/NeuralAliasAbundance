@@ -98,7 +98,10 @@ struct ProviderStats {
     // Missed frames, by what the no-inverse rules saw (camera_admission.hpp NotAdmitted).
     uint64_t start_no_candidate = 0, start_waiting = 0, start_inverse_game = 0, start_position_game = 0;
     uint64_t pose_no_packet = 0, pose_extent = 0, pose_repeat = 0, pose_origin = 0, pose_shape = 0;
-    // Frames on which the split-camera vote gave no camera, by reason (split_camera.hpp SplitVerdict).
+    // The relative camera's layout learned from this game's draws, and attempts that found a projection
+    // but no world range witnessing a position (providers/camera/relative_camera.hpp RelativeLearner).
+    uint64_t relative_learned = 0, relative_learn_failed = 0, relative_ambiguous = 0;
+    // Frames on which the relative-camera vote gave no camera, by reason (relative_camera.hpp RelativeVerdict).
     uint64_t split_no_votes = 0, split_no_projection = 0, split_few_draws = 0, split_no_majority = 0, split_small_share = 0;
     const char* last_miss = "";
 };
