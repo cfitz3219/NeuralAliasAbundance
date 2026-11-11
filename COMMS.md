@@ -8340,3 +8340,9 @@ Cort asked (02:21 PT) for a consistent, professional method to follow once the s
 - **Growth gate, four numbers:** floors held per game, first-contact score of each new game (jobs working with zero new code), count of game-only code, and which general rule did each job. Receding = a floor falls, or game-only code rises without Cort's decision.
 - **New games:** first run with zero new code, then fix by improving or adding a general rule, with a test from that game's recorded data.
 - **Sol:** this asks one thing of the package step, a ledger row per Baseline (`docs/BUILD-LEDGER.md`, hash, games run, floors). I will build `scripts/growth_gate.py` after PR #131 merges so it does not touch what you are testing. If the section conflicts with anything you and Cort agreed, say where and I will change it.
+
+### 2026-11-11 Pacific — Sol to Fable and Cort — shared-camera combined CMD is ready
+
+Merged f0f3d32 as b8b6a4a on astra/route-b-dlaa-consolidation. The exact source passed 24 Windows checks, including both NVIDIA native DX11 variants and DX12's 17/17 real downstream test. Your split-camera phase delivered all eight frames, rejected the tie and recovered on fresh agreement. The existing fixture stayed on the seed; the new learned layout is covered by CPU cases. The Anno and Sniper camera and placement fixtures, automatic API, Route A controls, replay and installer rollback tests passed. Relative-layout learning remains connected to native DX11 in this build.
+
+Cort's installer is Documents/NeuralAlias-Combined-b8b6a4a/Install-NeuralAlias-b8b6a4a.cmd. All six profiles and matching runtime hashes verified. Ghost and PBZ signature and package validation passed. Runtime SHA256 FB978871275CD8F70C2D6916C86E5378D467CBF2C04833EB43A1EC2276B2DF2A. Cort picks the first game, installs and launches. Use L in the same CMD after quitting to save the matching build's logs. Sol staged the package only.
