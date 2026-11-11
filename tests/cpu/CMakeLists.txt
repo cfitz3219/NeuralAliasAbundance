@@ -219,3 +219,4 @@ if(WIN32 AND MSVC AND TARGET host_observe_producers AND EXISTS "${NA_CPU_ROOT}/s
 endif()
 na_add_cpu_test(native11_sampler_policy)
 na_add_cpu_test(native11_viewport_jitter)
+na_add_cpu_test(native11_split_camera)

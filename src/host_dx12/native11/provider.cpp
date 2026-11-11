@@ -31,6 +31,7 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/frame_model.hpp"
+#include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
@@ -130,7 +131,6 @@ using CameraBytes = std::shared_ptr<const std::vector<uint8_t>>;
 struct CameraUpload { uint32_t version = 0; CameraBytes bytes; };
 using BindingKey = std::tuple<Id, int, uint32_t, uint32_t>;
 std::map<BindingKey, CameraUpload> g_scene_uploads;
-using SplitKey = std::pair<std::array<uint8_t, 64>, wwii::WorldOrigins>;
 struct SplitVote {
     FrameModel::CameraBinding projection{};
     CameraBytes projection_bytes;
@@ -379,25 +379,15 @@ std::vector<uint8_t> BoundCameraBytes(const uint8_t* bytes, size_t size, uint32_
 bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uint8_t>*& bytes,
                  uint64_t& version, std::optional<CameraFacts::RelativePose>& pose)
 {
-    const SplitKey* best_key = nullptr;
-    const SplitVote* best = nullptr;
-    uint32_t votes = 0;
-    for (const auto& [key, vote] : g_split_votes) {
-        const auto bound = BoundCameraBytes(vote.projection_bytes->data(), vote.projection_bytes->size(),
-                                           vote.projection.first, vote.projection.count);
-        const auto vp = camera::LoadMatrix(bound, 0, camera::Layout::RowMajor);
-        if (!wwii::IsRelativeSceneProjection(vp, w, h)) continue;
-        votes += vote.draws;
-        if (!best || vote.draws > best->draws) {
-            best = &vote;
-            best_key = &key;
-            pick.vp = vp;
-        }
-    }
-    // The world candidate must dominate qualified votes and cover a real
-    // share of the scene. A small object drawn twice is not a world origin.
-    if (!best || best->draws < 2 || best->draws <= votes / 2 ||
-        uint64_t(best->draws) * 8 < g_model.SceneDrawsThisFrame()) return false;
+    // VARIANT: camera11/split (the rule itself is in split_camera.hpp)
+    auto chosen = g_split_votes.cend();
+    camera::Matrix vp{};
+    const SplitVerdict verdict = ChooseSplitCamera(
+        g_split_votes, [](const SplitVote& vote) { return vote.draws; }, w, h, g_model.SceneDrawsThisFrame(), chosen, vp);
+    if (chosen != g_split_votes.cend()) pick.vp = vp;
+    if (verdict != SplitVerdict::Chosen) return false;
+    const SplitKey* best_key = &chosen->first;
+    const SplitVote* best = &chosen->second;
     const auto& b = best->projection;
     pose = CameraFacts::RelativePose{pick.vp, {best_key->second[0], best_key->second[1], best_key->second[2]}};
     pick.found = pick.reversed = pick.camera_relative = true;
@@ -673,17 +663,9 @@ void RememberSplitDraw(const Event& e, const CameraUpload& world, const CameraUp
     if (world.bytes != g_split_draw.world || projection.bytes != g_split_draw.projection ||
         world_binding != g_split_draw.world_binding || projection_binding != g_split_draw.projection_binding) {
         g_split_draw = {world.bytes, projection.bytes, world_binding, projection_binding, nullptr};
-        const size_t world_start = size_t(e.cb_first[0]) * 16;
-        const size_t projection_start = size_t(e.cb_first[1]) * 16;
-        if (world_start >= world.bytes->size() || projection_start >= projection.bytes->size()) return;
-        const size_t world_left = world.bytes->size() - world_start;
-        const size_t projection_left = projection.bytes->size() - projection_start;
-        const size_t world_size = e.cb_count[0] ? std::min(world_left, size_t(e.cb_count[0]) * 16) : world_left;
-        const size_t projection_size = e.cb_count[1] ? std::min(projection_left, size_t(e.cb_count[1]) * 16) : projection_left;
         SplitKey key{};
-        if (projection_size != key.first.size() ||
-            !wwii::DecodeWorldOrigins(world.bytes->data() + world_start, world_size, key.second)) return;
-        std::memcpy(key.first.data(), projection.bytes->data() + projection_start, key.first.size());
+        if (!MakeSplitKey(world.bytes->data(), world.bytes->size(), e.cb_first[0], e.cb_count[0],
+                          projection.bytes->data(), projection.bytes->size(), e.cb_first[1], e.cb_count[1], key)) return;
         auto [it, inserted] = g_split_votes.try_emplace(key);
         if (inserted) {
             it->second.projection = {e.cb[1], 1, e.cb_first[1], e.cb_count[1], projection.version, 0};
