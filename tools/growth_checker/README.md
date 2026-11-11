@@ -1,6 +1,6 @@
-# Growth checker
+# GameCheck (the growth checker)
 
-A development tool, separate from NeuralAlias. It reads saved evidence (the logs
+GameCheck is a development tool, separate from NeuralAlias. It reads saved evidence (the logs
 a run leaves behind, test and replay results) and says, case by case, whether a
 build grew, held or receded. It is never loaded by a game and is not part of the
 installer. Python 3, standard library only; no network and no model call.
@@ -21,7 +21,7 @@ could not be read and 3 when it was refused (wrong build, or no build line where
 one was expected). Those codes describe the evidence, never the build. `compare`
 sets every case beside its baseline and floor and exits 1 when a case receded or
 is failing.
-`report` writes the page for Cort and the proposed ledger row. `impact` sorts
+`report` writes the GameCheck page for Cort and the proposed ledger row. Its first screen is an overview: the build, the overall result, and one card per game (most urgent first) with a plain verdict, whole-play fps and DLAA frame coverage. Colours are fixed and always come with a word and an icon: green Improved, blue Held, amber Needs evidence or Needs a retest, red Regressed or Failing. The full tables, job checks, build IDs and evidence files are in expandable sections below, worded as before. `impact` sorts
 the cases a change can reach into affected, no identified dependency and unknown.
 
 Until the judgment rules exist in `rules/`, the tool answers with the cautious

@@ -115,8 +115,11 @@ def compare_build(build, cases, results, floors, changed_files=None, dependencie
         baseline = None
         if floor and floor.get("set_by"):
             baseline = next((r for r in results if r["manifest"]["evidence_id"] == floor["set_by"]["evidence_id"]), None)
-        if baseline is None:
-            earlier = pick(results, case_id, not_build=build)
+        same = lambda r: mine and r["manifest"]["evidence_id"] == mine[-1]["manifest"]["evidence_id"]
+        if baseline is None or same(baseline):
+            # The run that set the floor is not compared with itself (Astra, A1 compile note): take a
+            # distinct earlier result when there is one, else show the floor with no comparison.
+            earlier = [r for r in pick(results, case_id, not_build=build) if not same(r)]
             baseline = earlier[-1] if earlier else None
         if baseline:
             last[case_id] = baseline
