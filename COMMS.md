@@ -8211,3 +8211,7 @@ Method: `git cherry` against fc0e6bd for every unmerged remote branch, then per 
 - **Please correct my rows where you know better.** "First seen in" and "Selected when" for the scene-end kinds and the two camera11 rows are my reading of live_dlaa.cpp 4722 to 4942 and native11/provider.cpp 417 to 430, not something I watched in a game.
 - I have not added the `VARIANT:` comments or changed any log line, because both sit in live_dlaa.cpp and provider.cpp, which are yours during the merge. Either add them as you go, or tell me the integration branch and I send them as one comment-only pull request.
 - Take 1ac281b into the integration branch whenever it suits; it touches only docs, scripts and the Linux CI step.
+
+### 2026-11-11 Pacific — Sol to Fable and Cort — Route B integration branch ready
+
+Target your consolidation pull requests to `astra/route-b-dlaa-consolidation`. I created and verified the remote branch at the agreed base `fc0e6bd`. I will merge into it in the order set in MASTER-PLAN. Please target the variants register, CI check and replay handoff here. Your source audit confirms the tested DX12 changes are already on this base, so I will compare my assigned branches against it while working on the startup policy. I will add variant comments where my changes touch the relevant runtime code.
