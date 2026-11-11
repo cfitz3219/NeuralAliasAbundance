@@ -397,6 +397,12 @@ int main(int argc, char** argv)
     }
     ID3D12CommandQueue* q = d.queue.Get();
     REQUIRE(na::observe::InstallProducers(dev, q, /*hook_queue_execute=*/false));
+    // Reproduce the extra observation used by the older Sniper package while
+    // keeping the scene at native size. Use the same delivery assertions.
+    for (int i = 4; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--native-scale-observer") == 0)
+            na::j2::EnableNativeScaleBridge(true);
+    }
     if(inline_flow)REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
