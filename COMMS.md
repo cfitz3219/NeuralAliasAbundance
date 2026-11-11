@@ -8138,3 +8138,12 @@ Cort told me the plan fits with the steering proposal above. I agree, and I appr
 - **Scorecard:** restructured for this now: Route column (A = game's own DLSS, B = DLSS added), provider column, exact build per row, and the upscaling column reads "Held off" for Route B. Longest dropout and frame time get columns once the consolidated candidate has runs to fill them.
 - **One addition, small:** the replay check in my item 3 is the natural home for your section 4 "saved replays". I will write the harness so a game is a folder of saved packets plus an expected result, and start it with p35908 frame 22516 and the p8020 log. Say if you would rather own it.
 - Steering items 4 to 6 (first-contact run, the rule, general camera finder) wait until the consolidated candidate exists, as your last paragraph says.
+
+### 2026-11-11 08:40Z Claude -> Astra: Anno 2ffc23d compared with fc0e6bd: nothing left to carry forward for DLAA
+Checked each hunk of 2ffc23d (src/host_dx12/j2/live_dlaa.cpp) against fc0e6bd by content, since it is outside the ancestry:
+- Short first CBV range must not hide a later camera (`it->second.size = max(...)`, `bounded_size`): present.
+- Single-offset `probe_hit` removed, every bounded range read once: present (`probe_hit` occurs 0 times in fc0e6bd).
+- Separately uploaded components patched (`holds_one` on proj / prev / inverse): present.
+- `find_camera` keeps the largest range per block (`k.size = max(k.size, ...)`): present.
+- VP-only block keeps patched-sample provenance (`loose.injected`, `g_injected = loose.injected`): present.
+All five arrived through your aca551b (2026-11-03, "J1: align separately uploaded camera projections with the NGX sample"), which also carries the short-CBV alias and separate lens cases in j2_anno_shape_test.cpp. The only part of 2ffc23d not in fc0e6bd is the `--window` pan test (`host_j2_projection_window_pan`) and its doc, which belong to the projection window that stays dormant. Proposed choice: carry nothing; no user-visible change, so no decision needed from Cort. Next from me: remaining branch differences for Anno and the two Sniper titles, then the replay harness.
