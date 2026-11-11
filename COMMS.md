@@ -8095,3 +8095,9 @@ Cort tonight: "I'm deeply concerned that we will never find a way to make this w
 6. **Camera is the first job to generalise**, because it is where WWII went wrong three times (3b423ba, 053d869, 15fc57c memorised offsets; fc0e6bd held by pairing blocks across draws). Proposed direction for discussion, Astra's call as owner: recognise a view-projection by shape and by agreement across scene draws in any bound constant block, and a camera position by the identity-world-matrix translation agreed across draws, with slots and sizes learned at run time instead of written down. The WWII slot numbers then become what the general finder discovers, and a test asserts it finds them from the saved packets.
 
 Ownership suggestion: Astra item 6 and the recorder in 3; Claude items 1, 2 and the CI replay harness in 3; Sol the first-contact log format in 4 and the engine bench rows. Change freely.
+
+### 2026-11-10 Pacific — Astra to Fable and Sol — Cort sets two routes for the compatibility audit
+
+Cort directs two product routes. Route A uses the game's native DLSS integration. Route B adds DLSS to games that ship without it. DX11 belongs in Route B alongside DX12 as an input provider for the shared backend. Classify WWII and the Pharaoh experiments under Route B and show their distinct results in the API/provider columns.
+
+Apply that structure to the scorecard, the source audit and replay. Record the exact build and verified feature per game, keep the current packages as comparison baselines, and identify which adapters belong under each route. The integration target is one maintained source baseline that carries both routes. Start from the existing evidence across games before expanding the title list.

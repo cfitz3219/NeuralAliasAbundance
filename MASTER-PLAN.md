@@ -1,5 +1,18 @@
 # NeuralAliasAbundance: master plan
 
+## Current architecture — two routes (2026-11-10, Cort)
+
+NeuralAlias has two supported routes, defined by whether the game ships native DLSS.
+
+| Route | What NeuralAlias does | Compatibility examples |
+|---|---|---|
+| **A — Native DLSS** | Use the game's existing DLSS integration and its inputs. Apply supported controls through the DLSS integration or a qualified engine adapter. Verify live quality changes against the dimensions the game actually renders. | Ghost of Tsushima, Phantom Blade Zero |
+| **B — Add DLSS** | Acquire scene inputs from a compatible game upscaler or through discovery, reconstruct missing data, and deliver DLAA or DLSS upscaling. DX11 and DX12 are input providers within this route. Both feed the shared DLSS backend and follow the same scene delivery requirements. | Anno 1800, Sniper Elite 5, Sniper Elite Resistance, Call of Duty WWII |
+
+Use the same source baseline for both routes in the compatibility audit. Record the graphics API, provider, build and verified features for each game. A DX11 capture or translation experiment belongs under Route B, with its own evidence and status. The native DX11 provider in WWII is the tested starting point for that API. The short WWII run still had a camera-related dropout, so keep continuity open on the scorecard.
+
+Preserve proven engine and game adapters while assessing what transfers. The examples identify which route owns each game. Individual features earn compatibility credit from gameplay evidence on the candidate being scored.
+
 **Latest execution authority — 2026-11-09:** Cort now explicitly directs: "Leave in game testing to me." For the current WWII performance/integration work, Cort owns game launches, control and live testing. Agents continue source changes, automated CPU/DX12 regressions, coordination and staging; do not perform diagnostic game deployments or live comparisons. This supersedes the earlier standing live-test permission below, retained as history. Target remains at least 40 FPS / 25 ms whole frame with continuous DLAA; no measured acceptance yet.
 
 **Current execution authority — 2026-11-07:** Cort explicitly authorizes Astra to take over after Fable implements the reviewed Sniper stability fixes, including reversible deployment, launching/controlling/restarting games, in-game testing, captures, automated regressions and further repairs without asking Cort to perform the tests. This supersedes the older "Cort retains game testing" restrictions for this repair and integration work. Fable owns the current implementation until his completed handoff; Astra then owns integration, testing, remaining corrections and the combined package. Start with Sniper's continuous DLAA/Quality delivery and preserve its native HUD, then address remaining observed stability/image issues and relevant shared-route regressions. Keep scope on completing the existing product, reuse established machinery, and preserve rollback/settings/saves. Handoff details and the active evidence-backed corrections are in the latest COMMS entries.
@@ -13,7 +26,7 @@
 **Status:** ACTIVE. This is the single source of truth for *what* gets built, *by whom*, and *in what order*.
 **Where we are (2026-10-26):** Phases 1–3 are done. **Live DLAA runs in Anno 1800** (J2, PR #44), a game with no DLSS of its own, and Cort has confirmed it in the game. Next is Phase 4: lock in DLAA, then Reflex, then Frame Generation, then a second-game check for universality, then DLSS upscaling. See §2, Phase 4.
 
-> **Goal:** one universal DX12 injector that obtains or synthesizes everything DLSS needs (scene color, depth, motion vectors, jitter, camera) **without per-game code**. Universal coverage is the engineering goal and working design premise.
+> **Goal:** broad DLSS compatibility through native integration where the game provides it and shared input discovery and reconstruction where it does not. Keep camera, depth, motion, jitter and scene delivery reusable across the graphics APIs that Route B supports.
 > **Course change (2026-10-25, Cort):** discovery uses **established, field-proven algorithms first**: ReShade `generic_depth` depth scoring, UEVR/Geo-11 combined view-projection and inverse-pair camera detection, and Special K/Luma pre-HUD boundary tracking (reference: `docs/ARGON-DROPIN-HEURISTICS.md`). Our own verification checks stay as secondary corroboration and logging, never as all-or-nothing gates that report zero in real games.
 > Discover candidates, test conventions against geometric and photometric evidence, reconstruct or synthesize missing inputs, and save automatically verified profiles. Missing inputs create engineering tasks. Keep discovery active while the original renderer handles frames whose enhancement inputs are still being qualified. Measure progress with fixtures and a growing game/build/feature matrix. Protected-title access remains a separate integration/authorization requirement; no protection bypass is proposed here.
 
