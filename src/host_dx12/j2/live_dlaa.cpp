@@ -293,6 +293,12 @@ struct State {
     uint32_t frame_owned_entries = 0; // entry reads that arrived after this frame's DLSS was already submitted
     uint32_t prev_owned_entries = 0;  // the same count for the frame before
     char handoff_reader[200] = {};    // the frame's first entry that read the finished scene without being accepted
+    // Readers the inline route turned away at RECORDING time because the frame number then open
+    // already had its DLSS. If such a recording is submitted under a later frame number, the game
+    // recorded it before the previous Present: that frame gets no inline DLSS (diagnostic only).
+    struct RefusedReader { const void* list = nullptr; uint64_t rec = 0, frame = 0; bool by_submitted = false; };
+    RefusedReader refused_readers[4];
+    uint32_t refused_next = 0;
     uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
@@ -4690,6 +4696,9 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     ++g.stats.inline_candidates;
     if (g.inl_frame == g.frame || g.submitted_frame == g.frame) { // either placement path already owns this frame
         if (entry && g.submitted_frame == g.frame) ++g.frame_owned_entries; // recorded after that DLSS reached the queue
+        bool known = false;
+        for (const auto& r : g.refused_readers) known = known || (r.list == l && r.rec == rec);
+        if (!known) g.refused_readers[g.refused_next++ % 4] = {l, rec, g.frame, g.submitted_frame == g.frame};
         return;
     }
     ic.mark(kIcMatch);
@@ -5868,13 +5877,16 @@ enum HandoffBit : uint32_t {
     kHoBlockedOwned   = 1u << 10, // not tried: this frame number already had its DLSS
     kHoBlockedOther   = 1u << 11, // not tried: other queue, DLSS not ready, no selection, or route not automatic
     kHoTailUnlearned  = 1u << 12, // a list's last read after its final scene write is an entry that is not accepted
+    kHoEarlyVsSubmit  = 1u << 13, // a submitted recording's reader was refused inline under an EARLIER frame number that already had DLSS
+    kHoEarlyVsInline  = 1u << 14, // the same, refused because an inline recording was pending under that earlier frame number
 };
 const char* handoff_words(uint32_t bits, char* out, size_t cap)
 {
     static const char* const kWord[] = {"untraced_list_dropped_scene", "scene_saved", "reader_in_writer_list", "unlearned_entry_read_first",
                                         "accepted_reader_without_scene", "record_failed", "recorded", "reader_class_not_accepted",
                                         "stale_scene_discarded", "blocked_inline_pending", "blocked_frame_already_has_dlss", "blocked_other",
-                                        "unlearned_entry_after_final_write"};
+                                        "unlearned_entry_after_final_write", "recorded_before_previous_present_that_frame_had_dlss",
+                                        "recorded_before_previous_present_inline_was_pending"};
     size_t used = 0;
     if (cap) out[0] = 0;
     for (uint32_t i = 0; i < sizeof kWord / sizeof kWord[0]; ++i) {
@@ -7796,7 +7808,7 @@ void OnPresent(ID3D12CommandQueue* queue)
                                     : (g.inline_mode && g.inl_frame != g.frame) ? "no_candidate" : "other";
                     const auto& fs = g.insertion_frame.decision;
                     const auto& ls = g.insertion_learned.decision;
-                    char handoff[384];
+                    char handoff[512];
                     na::eventlog::Emit("dlss", "delivered=%u why=%s inline=%u rejects=%u reject=\"%s\" later_scene_write=%u "
                                        "shape{writer=%llu occ=%u tr=%u cand=%u writes=%u dst=%llu} prev_shape{writer=%llu occ=%u tr=%u cand=%u} remembered=%d "
                                        "handoff=%s handoff_reader=\"%s\" inline_recorded=%u entries_after_dlss{this=%u prev=%u}",
@@ -8172,6 +8184,13 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             if (w > g.inl.dest_writes) later_dest_writes = w - g.inl.dest_writes;
         }
         jitter_batch(lists, count);
+        for (UINT i = 0; i < count; ++i) { // diagnostic only: was a reader in this batch refused under an earlier frame number?
+            if (!lists[i]) continue;
+            const uint64_t rec = na::observe::ListRecording(lists[i]);
+            for (const auto& r : g.refused_readers)
+                if (rec && r.list == lists[i] && r.rec == rec && r.frame != g.frame)
+                    g.frame_handoff |= r.by_submitted ? kHoEarlyVsSubmit : kHoEarlyVsInline;
+        }
         for (UINT i = 0; i < count; ++i)
             if (lists[i] && na::observe::ListReferences(lists[i], selected_depth) &&
                 !na::observe::ListRootConstantBuffers(lists[i]).empty())
@@ -8484,6 +8503,8 @@ void Shutdown()
     g.handoff_reader[0] = 0;
     g.frame_owned_entries = 0;
     g.prev_owned_entries = 0;
+    for (auto& r : g.refused_readers) r = {};
+    g.refused_next = 0;
     g.profile.Clear();
     g.entries.Clear();
     g.waiting_scene = {};
