@@ -13,6 +13,38 @@ Use the same source baseline for both routes in the compatibility audit. Record 
 
 Preserve proven engine and game adapters while assessing what transfers. The examples identify which route owns each game. Individual features earn compatibility credit from gameplay evidence on the candidate being scored.
 
+### Merge work split for the Route B DLAA consolidation (2026-11-11, proposed by Fable at Cort's request; Cort tells Sol to proceed)
+
+**Principle:** one pair of hands on the merge. Sol (Astra) is the only one who merges into the integration branch. Fable reviews the older branches and hands over small, tested pull requests into that branch. Nobody edits the same file at the same time, and nothing reaches Cort until the menu shows and the build hash is stated.
+
+| Step | Who | What | Done when |
+|---|---|---|---|
+| 1 | **Sol** | Open the integration branch from **fc0e6bd** and post its name in COMMS. | Branch name posted. |
+| 2 | **Sol** | The single "added upscaling" switch: every upscaling entry point asks it, the hooks are not installed while it is off, saved Quality/Balanced/Performance choices and old INI switches are kept but have no effect, status line says "added upscaling: held off". Test that feeds old upscaling settings and proves native resolution. | Test passes in CI. |
+| 2 | **Fable** (same time as Sol's step 2) | Review the 54 source commits on older branches that are not in fc0e6bd (list below) and sort each into: already there in a newer form, needed for DLAA, upscaling only (stays held off), other API (not this pass), or diagnostic (not carried). Post the sorted list in COMMS. | Sorted list posted. |
+| 3 | **Fable** | For each "needed for DLAA" item on DX12 (Anno, Sniper Elite 5, Sniper Elite Resistance): one small pull request into the integration branch with its test. Conflicts follow Cort's keep-both rule, chosen by a condition seen in the running game. | Pull requests open, CI green. |
+| 3 | **Sol** | Own branches that only Sol has context for: `astra/se5-jitter-domain`, `astra/se5-residual-misses-flow`, `astra/se5-xegtao-flicker`, `astra/graphics-library-survey` (XeGTAO), and anything in the native DX11 provider and WWII camera. Same sort, same rule. | Posted in COMMS. |
+| 4 | **Fable** | `docs/VARIANTS.md` (one row per kept variant, with the condition that selects it and the test that proves it) and the CI check for it. Replay check: a game is a folder of saved recordings plus the expected result, starting with the saved WWII recordings. | Both in the integration branch. |
+| 5 | **Sol** | Merge Fable's pull requests, run the existing DX11 and DX12 DLAA tests and the replay check, confirm Route A still starts and its controls apply, confirm the Home menu shows on both routes. | All green on one commit. |
+| 6 | **Fable** | One read of the finished candidate before packaging, limited to evidence-backed defects. | Posted in COMMS. |
+| 7 | **Sol** | One combined package with its build hash in the file name and in the log's first line. | Package and hash posted. |
+| 8 | **Cort** | Retest the games already covered, in this order: Sniper Elite 5, Sniper Elite Resistance, Anno 1800, Call of Duty WWII, Ghost of Tsushima, Phantom Blade Zero. | Runs done. |
+| 9 | **Fable** | Read each run's saved log, update the scorecard, post what each game did. | Scorecard updated. |
+
+**File lanes while this runs.** Sol: startup and policy, overlay and menu, `src/host_dx12/native_present`, native DX11 provider, WWII adapter, effects, packaging. Fable: `docs/VARIANTS.md`, the replay check, tests, and DX12 scene and camera carries delivered only as pull requests. `src/host_dx12/j2/live_dlaa.cpp` is touched by both, so Fable's changes to it go in as small pull requests that Sol merges in order.
+
+**Decisions.** Routine overlap is settled by the owner of that lane. Anything that removes a working feature or changes what Cort sees goes to Cort as one question with the evidence.
+
+**What Fable's first pass over the older branches found (2026-11-11).** 54 source commits on unmerged branches are not in fc0e6bd line for line. By group:
+- Sniper scene placement and scene endings on DX12 (`astra/se5-pre-exact-pan`, `astra/se5-segment-placement`, `claude/project-thread-pfxnx8`, `astra/se5-stability`, `astra/se5-canvas-trace`, `astra/se5-backbuffer-writer`): about 20 commits. Many are probably older forms of what 1ebb7b7 already carries. Fable checks each by behaviour.
+- Sniper HUD separation (`astra/se5-hud-paths`, `astra/se5-hud-discovery`): 6 commits. Fable checks; DLAA needs the HUD protection.
+- Resizing (`astra/fullscreen-sizing`, `claude/i1-resize`): upscaling only, stays held off.
+- Other graphics APIs (`claude/project-thread-2b5ysj`: early DX11 host and bridge, DX9, Vulkan layer): 21 commits, all in folders that fc0e6bd does not have. Not part of this pass. They stay on their branch untouched.
+- Route A (`claude/nr-inferred-states`, `claude/pbz-optimal-paths`): 2 commits. Fable checks against Route A as it is in fc0e6bd.
+- Effects (XeGTAO): Sol.
+- Temporary diagnostics (`astra/blur-capture`, `claude/j2-repro-tmp`): not carried.
+- Anno `2ffc23d`: already settled, nothing to carry.
+
 **Latest execution authority — 2026-11-09:** Cort now explicitly directs: "Leave in game testing to me." For the current WWII performance/integration work, Cort owns game launches, control and live testing. Agents continue source changes, automated CPU/DX12 regressions, coordination and staging; do not perform diagnostic game deployments or live comparisons. This supersedes the earlier standing live-test permission below, retained as history. Target remains at least 40 FPS / 25 ms whole frame with continuous DLAA; no measured acceptance yet.
 
 **Current execution authority — 2026-11-07:** Cort explicitly authorizes Astra to take over after Fable implements the reviewed Sniper stability fixes, including reversible deployment, launching/controlling/restarting games, in-game testing, captures, automated regressions and further repairs without asking Cort to perform the tests. This supersedes the older "Cort retains game testing" restrictions for this repair and integration work. Fable owns the current implementation until his completed handoff; Astra then owns integration, testing, remaining corrections and the combined package. Start with Sniper's continuous DLAA/Quality delivery and preserve its native HUD, then address remaining observed stability/image issues and relevant shared-route regressions. Keep scope on completing the existing product, reuse established machinery, and preserve rollback/settings/saves. Handoff details and the active evidence-backed corrections are in the latest COMMS entries.
