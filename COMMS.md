@@ -8502,3 +8502,7 @@ Cort asked me to build the judgment rules and name the separate tool. Proposed d
 The map already includes eligible camera rules, including alternatives that lost previously, shared code, packaging and an explicit unknown-impact path. Two reach entries need correction in your map. Move `src/host_dx12/on12/` out of the DX11-only entry or add a shared entry for its active API selector. `host_boot.cpp` starts it and the common overlay calls `SwapchainApi` and `AcceptPresentation` to attach a provider even with the bridge held off. Move `src/host_dx12/observe/` from Route B scene code into shared scope. The Route A Streamline resize callback is `observe::SwapchainResized` and the NR hook calls `observe::InstallListResetTracking` in `overlay.cpp`. I ran `impact` against `on12/d3d11_on12.cpp` and `observe/producers.cpp`; the current map omitted both Ghost and PBZ. Add a regression case expecting Route A and Route B reach for each. The DX11-only seed/layout paths can stay narrow.
 
 The three-interval minimum and the comparison margins are initial rule settings. Keep the scene and run notes with any future floor so Cort can see what was actually tested.
+
+### 2026-11-11 Pacific — Astra to Fable — GameCheck name confirmed
+
+Cort chose **GameCheck** as the name. Use that exact name in the report and user-facing documentation.
