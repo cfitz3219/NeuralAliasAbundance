@@ -23,6 +23,7 @@ PROVIDERS = {
 }
 SAMPLE = re.compile(r"^(?:\d+:)?(\d\d):(\d\d):(\d\d) fps=([\d.]+)", re.M)
 REASONS = re.compile(r"\bpose\{([^}]*)\}")
+SPLIT_REASONS = re.compile(r"\bsplit_rejected\{([^}]*)\}")  # why the split-camera vote gave no camera
 NOT_REASONS = {"native", "legacy", "generic", "split"}  # these are successes
 
 
@@ -43,6 +44,9 @@ def score(text):
             if f and d:
                 r = REASONS.search(block)
                 reasons = dict((k, int(v)) for k, v in re.findall(r"(\w+)=(\d+)", r[1])) if r else {}
+                r = SPLIT_REASONS.search(block)
+                if r:
+                    reasons.update(("split_" + k, int(v)) for k, v in re.findall(r"(\w+)=(\d+)", r[1]))
                 rows.append((t, fps, int(f[1]), int(d[1]), reasons))
         if rows and (best is None or rows[-1][2] > best[1][-1][2]):
             best = (name, rows)
