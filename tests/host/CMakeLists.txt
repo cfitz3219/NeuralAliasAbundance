@@ -145,6 +145,8 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
 
 na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
 na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32 d3d11)
+add_test(NAME host_overlay_bootstrap_automatic_test COMMAND overlay_bootstrap_test --automatic)
+set_tests_properties(host_overlay_bootstrap_automatic_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS host)
 add_test(NAME host_added_upscaling_off_test COMMAND overlay_bootstrap_test --added-upscaling-off)
 set_tests_properties(host_added_upscaling_off_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS host)
 add_test(NAME host_on12_bootstrap_ownership_test COMMAND overlay_bootstrap_test --on12-ownership)

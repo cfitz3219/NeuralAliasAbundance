@@ -93,6 +93,13 @@ DWORD WINAPI InitThread(LPVOID)
     g_init_thread.store(GetCurrentThreadId());
     InternalFactoryScope internal_graphics;
     struct Release { ~Release() { signal_install_attempted(); } } release; // every exit path
+    wchar_t build[41]{};
+    GetPrivateProfileStringW(L"host", L"build_commit", L"", build, ARRAYSIZE(build), g_ini);
+    if (build[0]) {
+        char line[64]{};
+        std::snprintf(line, sizeof line, "NeuralAlias build %ls", build);
+        boot_log(line);
+    }
     boot_log("host init thread entered");
     // Once hooks go in, this module must never unload.
     HMODULE pinned = nullptr;
@@ -294,8 +301,6 @@ DWORD WINAPI InitThread(LPVOID)
         // The game folder may not be writable (Program Files): [host] status_log overrides.
         wchar_t custom[MAX_PATH] = {};
         if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(status_path, custom, MAX_PATH);
-        wchar_t build[41]{};
-        GetPrivateProfileStringW(L"host", L"build_commit", L"", build, ARRAYSIZE(build), g_ini);
         na::overlay::SetStatusLogPath(status_path, build); // A55
         na::overlay::SetMenuDiagnostics(GetPrivateProfileIntW(L"host", L"menu_diagnostics", 0, g_ini) == 1);
     }

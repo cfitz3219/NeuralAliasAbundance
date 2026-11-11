@@ -96,6 +96,7 @@ int main(int argc,char** argv) {
     const bool create_failure=argc>1 && !strcmp(argv[1],"--menu-create-failure");
     const bool recovery=argc>1 && !strcmp(argv[1],"--recovery");
     const bool added_upscaling_off=argc>1 && !strcmp(argv[1],"--added-upscaling-off");
+    const bool auto_api=added_upscaling_off || (argc>1 && !strcmp(argv[1],"--automatic"));
     const bool on12_ownership=argc>1 && !strcmp(argv[1],"--on12-ownership");
     const bool on12_present_order=argc>1 && !strcmp(argv[1],"--on12-present-order");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",on12_present_order?L"0":L"1");
@@ -110,6 +111,7 @@ int main(int argc,char** argv) {
         CHECK(WritePrivateProfileStringW(section,key,value,ini.c_str())!=0);
     };
     set(L"host",L"enabled",L"1");set(L"host",L"startup_log",startup.c_str());
+    if (auto_api) set(L"host", L"graphics_api", L"auto");
     set(L"route_a",L"enabled",L"1");set(L"overlay",L"enabled",L"1");
     set(L"observe",L"producers",on12_present_order?L"1":L"0");set(L"observe",L"early_install",L"1");
     set(L"adapter",L"enabled",L"0");set(L"fsr",L"enabled",L"0");set(L"xess",L"enabled",L"0");
@@ -121,7 +123,6 @@ int main(int argc,char** argv) {
     if(on12_present_order)set(L"j2",L"enabled",L"1");
     if (added_upscaling_off) {
         set(L"route_a", L"enabled", L"0");
-        set(L"host", L"graphics_api", L"auto");
         set(L"host", L"build_commit", L"0000000000000000000000000000000000000001");
         set(L"fsr", L"enabled", L"1");
         set(L"fsr", L"replace", L"1");
@@ -244,10 +245,13 @@ int main(int argc,char** argv) {
     for(unsigned i=0;i<400 && !na::host::SessionReady();++i)Sleep(5);
     REQUIRE(na::host::SessionReady());
     CHECK(na::settings::SafeStart()==recovery);
-    if (added_upscaling_off) {
-        CHECK(na::j2::Configured());
+    if (auto_api) {
         CHECK(na::on12::Automatic() && !na::on12::NativeRoute() && !na::on12::Enabled());
         CHECK(na::on12::SwapchainApi(chain.Get()) == na::on12::GraphicsApi::Dx12);
+        CHECK(!na::on12::AcceptPresentation(na::on12::GraphicsApi::Dx11));
+    }
+    if (added_upscaling_off) {
+        CHECK(na::j2::Configured());
         wchar_t status_path[MAX_PATH]{};
         REQUIRE(na::host::ProcessLogPath(status_path, MAX_PATH,
                                        (dir / L"NeuralAliasHost-status.log").c_str()));
@@ -255,6 +259,11 @@ int main(int argc,char** argv) {
         std::string header;
         CHECK(std::getline(status, header) &&
               header == "NeuralAlias build 0000000000000000000000000000000000000001");
+        wchar_t startup_path[MAX_PATH]{};
+        REQUIRE(na::host::ProcessLogPath(startup_path, MAX_PATH, startup.c_str()));
+        std::ifstream startup_log{std::filesystem::path(startup_path)};
+        CHECK(std::getline(startup_log, header) &&
+              header.find("NeuralAlias build 0000000000000000000000000000000000000001") != std::string::npos);
         CHECK(na::ffx::GetMode() == na::ffx::Mode::Observe);
         CHECK(na::xess::GetMode() == na::xess::Mode::Observe);
         CHECK(na::settings::Get().j2_scale_mode.load() == 3); // keep the old preference

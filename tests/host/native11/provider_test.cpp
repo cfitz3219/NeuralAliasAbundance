@@ -543,13 +543,15 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"native11", L"enabled", automatic ? L"0" : L"1") ||
         !set(L"host", L"graphics_api", automatic ? L"auto" : L"") ||
         !set(L"overlay", L"enabled", L"1") || !set(L"adapter", L"enabled", L"0") ||
-        !set(L"observe", L"producers", L"0") || !set(L"observe", L"early_install", L"0") ||
+        !set(L"observe", L"producers", automatic ? L"1" : L"0") ||
+        !set(L"observe", L"early_install", L"0") ||
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
     na::host::WaitForObserveInstall();
-    for (unsigned i = 0; i < 400 && !na::host::GetStatus().init_complete; ++i) Sleep(5);
+    const ULONGLONG init_deadline = GetTickCount64() + 20000;
+    while (!na::host::GetStatus().init_complete && GetTickCount64() < init_deadline) Sleep(5);
     expect(na::host::GetStatus().init_complete && na::on12::NativeRoute() != automatic && !na::on12::Enabled(),
            "production host starts with the bridge disabled");
     if (g_failed) return 1;
@@ -573,6 +575,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                "a test present leaves the route unselected");
         expect(SUCCEEDED(g.swap->Present(0, 0)) && na::on12::NativeRoute(),
                "the real present selects native DX11");
+        expect(!na::on12::AcceptPresentation(na::on12::GraphicsApi::Dx12),
+               "a helper chain cannot replace the native device with DX12");
     }
     char activation[2048]{};
     na::on12::FormatStatus(activation, sizeof activation);
