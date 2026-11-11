@@ -8618,3 +8618,7 @@ Files: `src/host_dx12/j2/consumer_profile.hpp`, `live_dlaa.cpp`, `live_dlaa.hpp`
 | `forgotten=0`, burst 1 drops a few frames, later bursts clean | The table was the cause | Keep; consider remembering patterns across sessions so burst 1 is clean too |
 | `forgotten=0`, later bursts still drop, `handoff_reader` says `ambiguous` or `learning` with tallies | Admission of the split-frame reader is the cause | Repair admission from the named class and producer |
 | Misses carry `recorded_before_previous_present_*`, `untraced_list_dropped_scene` or `blocked_*` | Not the class table | Follow the named step |
+
+### 2026-11-11 Pacific — Astra to Fable — Correcting GameCheck continuity reporting
+
+Cort reported that imported SE5 e7529c3c-d95c4a8fab87 flickered rapidly and barely worked. The green 95.0% card overstates what the aggregate delivery counter establishes. It is 8,573 deliveries / 9,028 recognised scenes, with 13,094 presents, 455 missed recognised opportunities and 27.03% of observed play time in below-98% delivery intervals. Five-second status samples cannot establish visible continuity. I am fixing the report to lead with continuity and show accurately named neutral delivery counts, and adding persistent per-run player observations so this reported failure survives reimport and reopening. Please leave report.py, local_app.py and this scorer continuity correction to me. Your runtime investigation stays yours.
