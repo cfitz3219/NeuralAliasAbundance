@@ -25,16 +25,30 @@ struct CameraPick {
     bool reversed = false;        // reverse-Z
     bool camera_relative = false; // the game adapter proved this pose without an inverse pair
     bool raster_jitter_qualified = true; // adapter can limit a pose to motion reconstruction
+    // Admitted by the shared no-inverse rules (providers/camera/camera_admission.hpp): the game
+    // uploads no inverse, so the matrix's own shape at the learned place is the re-read's proof.
+    bool derived_inverse = false;
 };
 
 // Re-reads a learned camera at `learned` (same layout); true if it still is a
 // perspective ViewProjection with its inverse at the same distance.
-inline bool CheckLearned(const std::vector<uint8_t>& bytes, const CameraPick& learned, CameraPick* out)
+// A camera learned without an inverse is re-read only from the binding it was
+// learned at (`learned_binding`): an inverse pair proves itself in any block, a
+// lone matrix at the same offset of another block proves nothing.
+inline bool CheckLearned(const std::vector<uint8_t>& bytes, const CameraPick& learned, CameraPick* out,
+                         bool learned_binding = true)
 {
     if (!learned.found || learned.camera_relative || learned.offset + 64 > bytes.size()) return false;
     const auto m = na::camera::LoadMatrix(bytes, static_cast<size_t>(learned.offset), learned.layout);
     na::camera::Candidate c{};
     if (!na::camera::ViewProjection(m, c)) return false;
+    if (learned.derived_inverse) {
+        if (!learned_binding) return false;
+        *out = learned;
+        out->vp = m;
+        out->reversed = c.reversed;
+        return true;
+    }
     const int64_t io = static_cast<int64_t>(learned.offset) + learned.inverse_delta;
     if (io < 0 || static_cast<uint64_t>(io) + 64 > bytes.size()) return false;
     const auto inv = na::camera::LoadMatrix(bytes, static_cast<size_t>(io), learned.layout);

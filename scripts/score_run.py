@@ -24,7 +24,8 @@ PROVIDERS = {
 SAMPLE = re.compile(r"^(?:\d+:)?(\d\d):(\d\d):(\d\d) fps=([\d.]+)", re.M)
 REASONS = re.compile(r"\bpose\{([^}]*)\}")
 SPLIT_REASONS = re.compile(r"\bsplit_rejected\{([^}]*)\}")  # why the split-camera vote gave no camera
-NOT_REASONS = {"native", "legacy", "generic", "split"}  # these are successes
+START_REASONS = re.compile(r"\bstart_rejected\{([^}]*)\}")  # what the no-inverse rules saw on a missed frame
+NOT_REASONS = {"native", "legacy", "generic", "split", "started", "continued", "no_inverse"}  # these are successes
 
 
 def samples(text):
@@ -47,6 +48,9 @@ def score(text):
                 r = SPLIT_REASONS.search(block)
                 if r:
                     reasons.update(("split_" + k, int(v)) for k, v in re.findall(r"(\w+)=(\d+)", r[1]))
+                r = START_REASONS.search(block)
+                if r:
+                    reasons.update(("start_" + k, int(v)) for k, v in re.findall(r"(\w+)=(\d+)", r[1]))
                 rows.append((t, fps, int(f[1]), int(d[1]), reasons))
         if rows and (best is None or rows[-1][2] > best[1][-1][2]):
             best = (name, rows)
@@ -78,6 +82,8 @@ def score(text):
     fps_on.sort()
     first, last = rows[0][4], rows[-1][4]
     why = {k: last[k] - first.get(k, 0) for k in last if k not in NOT_REASONS and last[k] - first.get(k, 0) > 0}
+    # Which rule found the camera ("native" counts every camera-relative pose, so it overlaps "split").
+    found = {k: last[k] - first.get(k, 0) for k in last if k in NOT_REASONS and last[k] - first.get(k, 0) > 0}
     clock = lambda t: None if t is None else "%02d:%02d:%02d" % (t // 3600, t // 60 % 60, t % 60)
     return {
         "provider": name,
@@ -90,6 +96,7 @@ def score(text):
         "longest_gap_started": clock(longest_start),
         "fps_median_with_dlaa": fps_on[len(fps_on) // 2] if fps_on else 0.0,
         "fps_lowest_with_dlaa": fps_on[0] if fps_on else 0.0,
+        "camera_found_by": found,
         "missed_because": why,
     }
 

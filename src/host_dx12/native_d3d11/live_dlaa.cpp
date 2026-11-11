@@ -238,6 +238,9 @@ camera::CameraFrame Pose(Session& s, const native11::SceneFrame& frame, UINT w, 
     if (c.split_pose) {
         result = s.camera.UpdateCameraRelative(c.split_pose->projection, c.split_pose->origin,
                                                frame.frame, w, h, jitter);
+    } else if (c.no_inverse_pose) {
+        // Admitted by the shared no-inverse rules in the provider: a proof over several frames.
+        result = s.camera.Update(*c.no_inverse_pose, frame.frame, w, h, jitter);
     } else if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(length), w, h, scene)) {
         result = s.camera.UpdateCameraRelative(scene.vp, scene.origin, frame.frame, w, h, jitter);
     } else {
