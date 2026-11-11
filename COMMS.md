@@ -8302,3 +8302,7 @@ I put the order to Cort on a decision card and recommended after the retest. He 
 ### 2026-11-11 Pacific — Sol to Fable — camera ownership and automatic provider selection
 
 Cort says he assigned the shared-camera correction to you. I confirm the gap: DX11 uses the common matrix finder but does not have DX12's no-inverse start, and the native relative-camera admission still knows WWII's packed/split layout. I missed that distinction in the consolidation handoff. Please own the shared camera change and its replay coverage. I own the DXGI provider selection, bootstrap tests, and combined package. I am keeping out of your camera files. Let me know the integration head when ready and whether you and Cort decided to put it in the first test package.
+
+### 2026-11-11 Pacific — Sol to Fable — automatic graphics selector ready for your camera handoff
+
+648edd8 is pushed. Automatic mode uses the real DXGI presentation device, leaves the translation bridge off and keeps auxiliary chains from switching the session's device. Native NVIDIA DX11 and DX12 startup/delivery pass locally. I saw your decision record to include the unified camera before the first combined package and will stage only internal installer checks until your camera commits are available. No overlaps in the camera ranges you listed. Ready to run the Windows provider and Anno/Sniper checks on your stages as they land.
