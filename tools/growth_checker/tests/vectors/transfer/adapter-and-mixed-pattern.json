@@ -1,0 +1,140 @@
+{
+  "about": "A hinted layout is not independent, a mixed history is not one pattern, and rescoring does not add frames.",
+  "call": "credit",
+  "args": [
+    {
+      "sample": [
+        {
+          "status": "scored",
+          "route": "B",
+          "api": "dx12",
+          "provider": "dx12",
+          "manifest": {
+            "case": "sample",
+            "evidence_type": "live_run",
+            "evidence_id": "abcdef12-bbbbbbbbbbbb",
+            "files": [{"role": "status", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+            "producer": {"build": "abcdef12", "build_source": "status_header"}
+          },
+          "sessions": [{"samples": 4}],
+          "observed": {"scene_placement": {"last": "inline", "distinct": ["between", "inline"]}},
+          "measurements": {"frames_delivered": {"state": "measured", "value": 900, "basis": "counter"}},
+          "jobs": {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+          "patterns": {
+            "scene_placement": {"state": "observed", "value": "inline"},
+            "depth_convention": {"state": "observed", "value": "forward"}
+          },
+          "dependencies_in_use": [
+            {
+              "variant": "camera/no-inverse",
+              "kind": "shared_rule_with_adapter_hint",
+              "frames": 10,
+              "source": "camera status"
+            },
+            {"variant": "camera11/packed", "kind": "title_specific", "frames": 12},
+            {"variant": "camera11/packed", "kind": "title_specific", "frames": 7}
+          ]
+        },
+        {
+          "status": "scored",
+          "route": "B",
+          "api": "dx12",
+          "provider": "dx12",
+          "manifest": {
+            "case": "sample",
+            "evidence_type": "live_run",
+            "evidence_id": "abcdef12-bbbbbbbbbbbb",
+            "files": [{"role": "status", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+            "producer": {"build": "abcdef12", "build_source": "status_header"}
+          },
+          "sessions": [{"samples": 4}],
+          "observed": {"scene_placement": {"last": "inline", "distinct": ["between", "inline"]}},
+          "measurements": {"frames_delivered": {"state": "measured", "value": 900, "basis": "counter"}},
+          "jobs": {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+          "patterns": {
+            "scene_placement": {"state": "observed", "value": "inline"},
+            "depth_convention": {"state": "observed", "value": "forward"}
+          },
+          "dependencies_in_use": [
+            {
+              "variant": "camera/no-inverse",
+              "kind": "shared_rule_with_adapter_hint",
+              "frames": 10,
+              "source": "camera status"
+            },
+            {"variant": "camera11/packed", "kind": "title_specific", "frames": 12},
+            {"variant": "camera11/packed", "kind": "title_specific", "frames": 7}
+          ]
+        }
+      ],
+      "other": [
+        {
+          "status": "scored",
+          "route": "B",
+          "api": "dx12",
+          "provider": "dx12",
+          "manifest": {
+            "case": "other",
+            "evidence_type": "live_run",
+            "evidence_id": "abcdef12-cccccccccccc",
+            "files": [{"role": "status", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}],
+            "producer": {"build": "abcdef12", "build_source": "status_header"}
+          },
+          "sessions": [{"samples": 4}],
+          "observed": {
+            "mode": {"last": "DLAA", "distinct": ["DLAA"]},
+            "scene_id": "harbor",
+            "test_environment": "pc1",
+            "play_intervals": true
+          },
+          "measurements": {"frames_delivered": {"state": "measured", "value": 900, "basis": "counter"}},
+          "jobs": {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+          "patterns": {
+            "scene_placement": {"state": "observed", "value": "between"},
+            "depth_convention": {"state": "observed", "value": "forward"}
+          },
+          "dependencies_in_use": [{"variant": "camera/no-inverse", "kind": "shared_rule", "frames": 10, "source": "camera status"}]
+        }
+      ]
+    },
+    {
+      "sample": {
+        "id": "sample",
+        "game": "One",
+        "route": "B",
+        "api": "dx12",
+        "provider": "dx12",
+        "engine": {"name": "One Engine", "source": "declared"},
+        "scene": {"id": "harbor"},
+        "settings": {"mode": "DLAA"}
+      },
+      "other": {
+        "id": "other",
+        "game": "Two",
+        "route": "B",
+        "api": "dx12",
+        "provider": "dx12",
+        "engine": {"name": "Two Engine", "source": "declared"},
+        "scene": {"id": "harbor"},
+        "settings": {"mode": "DLAA"}
+      }
+    }
+  ],
+  "expect": {
+    "credits": [
+      {
+        "kind": "adapter_hint",
+        "case": "sample",
+        "pattern": {"variant": "camera/no-inverse"},
+        "because": "The shared rule validated a layout supplied by an adapter."
+      }
+    ],
+    "combinations": [
+      {
+        "patterns": {"scene_placement": "between", "depth_convention": "forward", "api": "dx12", "provider": "dx12"},
+        "cases": ["other"]
+      }
+    ],
+    "title_specific_in_use": [{"variant": "camera11/packed", "cases": ["sample"], "frames": 12}]
+  }
+}

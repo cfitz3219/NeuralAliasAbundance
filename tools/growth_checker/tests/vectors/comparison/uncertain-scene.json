@@ -1,0 +1,67 @@
+{
+  "about": "Historical evidence stays visible but cannot earn a positive verdict.",
+  "call": "judge",
+  "args": [
+    {
+      "status": "scored",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "manifest": {
+        "case": "sample",
+        "evidence_type": "live_run",
+        "evidence_id": "12345678-aaaaaaaaaaaa",
+        "files": [{"role": "status", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],
+        "producer": {"build": "12345678", "build_source": "status_header"}
+      },
+      "sessions": [{"samples": 4}],
+      "observed": {
+        "mode": {"last": "DLAA", "distinct": ["DLAA"]},
+        "scene_id": "harbor",
+        "test_environment": "pc1",
+        "play_intervals": true
+      },
+      "measurements": {}
+    },
+    {
+      "status": "scored",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "manifest": {
+        "case": "sample",
+        "evidence_type": "live_run",
+        "evidence_id": "abcdef12-bbbbbbbbbbbb",
+        "files": [{"role": "status", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+        "producer": {"build": "abcdef12", "build_source": "status_header"}
+      },
+      "sessions": [{"samples": 2}],
+      "observed": {
+        "mode": {"last": "DLAA", "distinct": ["DLAA"]},
+        "scene_id": null,
+        "test_environment": "pc1",
+        "play_intervals": true
+      },
+      "measurements": {}
+    },
+    {
+      "id": "sample",
+      "game": "One",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "engine": {"name": "One Engine", "source": "declared"},
+      "scene": {"id": "harbor"},
+      "settings": {"mode": "DLAA"}
+    }
+  ],
+  "expect": {
+    "verdict": "comparable_with_limits",
+    "limits": [
+      "Candidate has fewer than three measured intervals.",
+      "The same gameplay scene is not confirmed in both runs."
+    ],
+    "reasons": [],
+    "tolerance": {}
+  }
+}

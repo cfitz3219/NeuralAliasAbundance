@@ -1,0 +1,82 @@
+{
+  "about": "Scene-only coverage and FPS rise while the user receives DLAA on fewer presents.",
+  "call": "check",
+  "args": [
+    {
+      "status": "scored",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "manifest": {
+        "case": "sample",
+        "evidence_type": "live_run",
+        "evidence_id": "12345678-aaaaaaaaaaaa",
+        "files": [{"role": "status", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],
+        "producer": {"build": "12345678", "build_source": "status_header"}
+      },
+      "sessions": [{"samples": 4}],
+      "observed": {
+        "mode": {"last": "DLAA", "distinct": ["DLAA"]},
+        "scene_id": "harbor",
+        "test_environment": "pc1",
+        "play_intervals": true
+      },
+      "measurements": {
+        "scene_share_of_presented": {"state": "measured", "value": 99, "basis": "derived"},
+        "delivered_share_of_presented": {"state": "measured", "value": 94, "basis": "derived"},
+        "delivered_share_of_scene": {"state": "measured", "value": 95, "basis": "derived"},
+        "fps_play_median": {"state": "measured", "value": 40, "basis": "sampled"}
+      }
+    },
+    {
+      "status": "scored",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "manifest": {
+        "case": "sample",
+        "evidence_type": "live_run",
+        "evidence_id": "abcdef12-bbbbbbbbbbbb",
+        "files": [{"role": "status", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+        "producer": {"build": "abcdef12", "build_source": "status_header"}
+      },
+      "sessions": [{"samples": 4}],
+      "observed": {
+        "mode": {"last": "DLAA", "distinct": ["DLAA"]},
+        "scene_id": "harbor",
+        "test_environment": "pc1",
+        "play_intervals": true
+      },
+      "measurements": {
+        "scene_share_of_presented": {"state": "measured", "value": 70, "basis": "derived"},
+        "delivered_share_of_presented": {"state": "measured", "value": 69, "basis": "derived"},
+        "delivered_share_of_scene": {"state": "measured", "value": 99, "basis": "derived"},
+        "fps_play_median": {"state": "measured", "value": 60, "basis": "sampled"}
+      }
+    },
+    {
+      "id": "sample",
+      "game": "One",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "engine": {"name": "One Engine", "source": "declared"},
+      "scene": {"id": "harbor"},
+      "settings": {"mode": "DLAA"}
+    }
+  ],
+  "expect": [
+    {
+      "guard": "fewer_scenes",
+      "severity": "blocks",
+      "message": "The run recognised a smaller share of presents as scenes. Check delivery across all presents.",
+      "fields": ["scene_share_of_presented", "delivered_share_of_scene", "delivered_share_of_presented"]
+    },
+    {
+      "guard": "speed_with_lost_coverage",
+      "severity": "blocks",
+      "message": "Frame rate rose while DLAA covered fewer frames. The speed gain cannot count as an improvement.",
+      "fields": ["fps_play_median", "delivered_share_of_presented", "delivered_share_of_scene"]
+    }
+  ]
+}
