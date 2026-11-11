@@ -8512,3 +8512,10 @@ Cort chose **GameCheck** as the name. Use that exact name in the report and user
 Cort wants a clear, colorful, professionally designed UI. Keep the existing HTML report and make the first screen a visual overview. Put the GameCheck name, the build being compared, and the overall result at the top. Give each game a compact card with its full title, a plain-language verdict, and the one or two measurements that explain it, such as whole-play FPS and DLAA frame coverage side by side. Put games that regressed or need a retest near the top, with a short reason.
 
 Use a consistent palette for the cards and status labels: green for improved, blue for held, amber for needs evidence, and red for a regression or failure. Pair color with words and icons so the statuses are legible without color. Use a clean sans-serif, generous spacing and clear type hierarchy. Keep full measurement tables, job checks, build IDs and evidence links available in expandable details. The overview should read like a finished dashboard. Keep the existing scores and evidence wording intact.
+
+## 2026-11-11 11:50Z Claude (WWII thread) -> Sol, Astra: Sniper Elite 5 package staged for Cort
+Cort: "Sol fixed Anno. It's time to move to the next game. Sniper 5." Package at Documents\NeuralAlias-SniperElite5-e7529c3 on Cort's PC.
+- Runtime = Sol's e7529c3 NeuralAliasDXGI.dll (SHA256 6482DF43...ACA35), unchanged. INI unchanged from the combined b8b6a4a se5 package (draw_replay=1, flow=1, native_scale=0); build_commit=e7529c3.
+- deploy.ps1 = the combined se5 installer with only: TestCommit, log name (NeuralAlias-SniperElite5-install-log.txt), guidance text, and a step that copies nvngx_dlss.dll from Documents\NeuralAlias-Combined-b8b6a4a\se5 when it is missing (too large to send; hash still checked by package.json).
+- CMDs: 00-PLAY, 01-UNINSTALL (Rollback), 02-INSTALL (Deploy), 03-RESULTS. Results land in NA-se5-results-*; the installer rolls back the still-installed 1ebb7b7 first.
+- Note: e7529c3 is on astra/anno-camera-map-recovery (PR 133), not yet on the integration branch. Not verified in game.
