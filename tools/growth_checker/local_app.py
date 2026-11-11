@@ -79,10 +79,37 @@ class Library:
 
     def records(self):
         # An imported record takes precedence over a bundled copy of the run.
-        return list({
+        records = list({
             (status_hash(result) or result["manifest"]["evidence_id"], result["manifest"]["case"]): result
             for folder in (self.bundled, self.history) for result in store.results(folder)
         }.values())
+        for result in records:
+            path = self.observation_path(result)
+            if path.is_file():
+                observation = store.load(path)[-1]
+                result["jobs"]["continuity"] = {
+                    "state": observation["state"], "source": "owner_verdict",
+                    "note": "Player report: " + observation["note"], "evidence": [],
+                }
+        return records
+
+    def observation_path(self, result):
+        receipt = result["manifest"]
+        return Path(self.history) / "observations" / receipt["case"] / (receipt["evidence_id"] + ".json")
+
+    def observe(self, evidence, case, state, note):
+        if state not in {"failed", "verified", "unknown"}:
+            raise ValueError("Invalid observation")
+        result = next((r for r in self.records() if r["manifest"]["evidence_id"] == evidence
+                       and r["manifest"]["case"] == case and r["route"] == "B"), None)
+        if result is None:
+            raise ValueError("Unknown run")
+        path = self.observation_path(result)
+        history = store.load(path) if path.is_file() else []
+        history.append({"state": state, "note": note[:1000],
+                        "recorded_at": datetime.now().astimezone().isoformat(timespec="seconds")})
+        save_result(path, history)
+        return result["manifest"]["producer"]["build"]
 
     def detect_case(self, folder):
         match = manifest.FOLDER_NAME.fullmatch(Path(folder).name)
@@ -167,12 +194,30 @@ def dashboard(library, token, selected="", notice="", needs_case=False):
     rows = "".join(f"<li><b>{escape(game)}</b> · {escape(when)} · {escape(metrics)}</li>"
                    for when, game, metrics in sorted(history, reverse=True))
     saved = f'<details><summary>Saved runs for this build ({len(history)})</summary><ul>{rows}</ul></details>' if rows else ""
+    run_options = []
+    for r in results:
+        m = r["manifest"]
+        if r["route"] != "B" or not manifest.build_matches(m["producer"]["build"], selected):
+            continue
+        identity = m["case"] + "|" + m["evidence_id"]
+        name = library.cases[m["case"]]["game"] + " · " + (m["session"].get("saved_at") or m["evidence_id"])
+        run_options.append(f'<option value="{escape(identity)}">{escape(name)}</option>')
+    observations = ""
+    if run_options:
+        observations = (f'<details><summary>Record what you saw</summary><form method="post" action="/observe">{csrf}'
+                        '<p><label>Saved run <select name="run">' + "".join(run_options) + '</select></label></p>'
+                        '<p><label>Visual continuity <select name="state">'
+                        '<option value="failed">DLAA flickered or switched on/off</option>'
+                        '<option value="verified">DLAA stayed visibly stable</option>'
+                        '<option value="unknown">I could not judge stability</option></select></label></p>'
+                        '<p><label>Your notes <input name="note" maxlength="1000"></label></p>'
+                        '<button>Save observation</button></form></details>')
     status = f'<p role="status">{escape(notice)}</p>' if notice else ""
     controls = f'''
 <section class="local-controls" aria-label="Manage results">
 <div class="local-actions">{importer}{chooser}
 <form method="post" action="/close">{csrf}<button>Close GameCheck</button></form></div>
-{status}{saved}</section>
+{status}{observations}{saved}</section>
 <style>
 .local-controls {{ padding: 16px; background: var(--sheet); border: 1px solid var(--line); border-radius: 14px; }}
 .local-actions, .local-actions form {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; }}
@@ -244,12 +289,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_body("<title>GameCheck closed</title><p>GameCheck is closed. Your saved runs are available next time.</p>")
             self.server.shutdown()
             return
-        if self.path != "/import":
+        if self.path not in {"/import", "/observe"}:
             return self.send_error(404)
         if not self.server.import_lock.acquire(blocking=False):
             return self.send_error(409, "Finish the current import first.")
         selected = ""
         try:
+            if self.path == "/observe":
+                case, evidence = form.get("run", [""])[0].split("|", 1)
+                state = form.get("state", [""])[0]
+                default_note = {"failed": "DLAA flickered or switched on/off.",
+                                "verified": "DLAA stayed visibly stable.", "unknown": "Stability was not judged."}
+                selected = self.server.library.observe(evidence, case, state,
+                            form.get("note", [""])[0].strip() or default_note.get(state, ""))
+                self.server.notice = "Your observation was saved with this run."
+                return self.redirect(selected)
             if form.get("cancel"):
                 self.server.pending = ""
                 return self.redirect()

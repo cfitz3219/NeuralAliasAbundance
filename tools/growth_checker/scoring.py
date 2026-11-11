@@ -158,6 +158,9 @@ def score(route, m, observed, case=None, owner_verdicts=None):
         elif limit is None:
             jobs["continuity"] = _job("unknown", f"Longest gap {gap} s (sampled). The case sets no limit; the floor comparison judges it.",
                                       ["longest_gap_seconds", "not_delivering_share_of_play"])
+        elif m["longest_gap_seconds"].get("basis") == "sampled" and gap <= limit:
+            jobs["continuity"] = _job("unknown", f"The sampled gap estimate is {gap} s. Periodic totals cannot establish visible continuity.",
+                                     ["longest_gap_seconds", "not_delivering_share_of_play"])
         else:
             jobs["continuity"] = _job("verified" if gap <= limit else "failed", f"Longest gap {gap} s (sampled) against a limit of {limit} s.",
                                       ["longest_gap_seconds", "not_delivering_share_of_play"])

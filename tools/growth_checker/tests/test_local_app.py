@@ -29,6 +29,16 @@ class LocalGameCheck(unittest.TestCase):
             self.assertEqual(len(list(history.glob("results/*/*/*.json"))), 1)
             self.assertIn("Already in history: 1", reopened.import_folder(saved, reopened.detect_case(saved))[0])
             self.assertEqual(store.dump(reopened.floors), floor)
+            record = next(r for r in reopened.records() if r["manifest"]["producer"]["build"] == build)
+            reopened.observe(record["manifest"]["evidence_id"], "wwii-campaign-dlaa",
+                             "failed", "Rapid on/off flicker.")
+            reopened.import_folder(saved, reopened.detect_case(saved))
+            reopened = local_app.Library(history)
+            page = local_app.dashboard(reopened, "token", build)
+            self.assertIn("Flickering reported", page)
+            self.assertIn("Rapid on/off flicker.", page)
+            self.assertNotIn("of gameplay frames", page)
+            self.assertNotIn("DLAA frame coverage", page)
 
             other = root / "Custom folder"
             other.mkdir()
