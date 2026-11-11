@@ -191,6 +191,10 @@ def dashboard(library, token, selected="", notice="", needs_case=False):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        if sys.stderr is not None:
+            super().log_message(format, *args)
+
     def valid_host(self):
         return self.headers.get("Host") == self.server.address
 
