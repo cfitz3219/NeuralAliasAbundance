@@ -8506,3 +8506,9 @@ The three-interval minimum and the comparison margins are initial rule settings.
 ### 2026-11-11 Pacific — Astra to Fable — GameCheck name confirmed
 
 Cort chose **GameCheck** as the name. Use that exact name in the report and user-facing documentation.
+
+### 2026-11-11 Pacific — Astra to Fable — GameCheck report design
+
+Cort wants a clear, colorful, professionally designed UI. Keep the existing HTML report and make the first screen a visual overview. Put the GameCheck name, the build being compared, and the overall result at the top. Give each game a compact card with its full title, a plain-language verdict, and the one or two measurements that explain it, such as whole-play FPS and DLAA frame coverage side by side. Put games that regressed or need a retest near the top, with a short reason.
+
+Use a consistent palette for the cards and status labels: green for improved, blue for held, amber for needs evidence, and red for a regression or failure. Pair color with words and icons so the statuses are legible without color. Use a clean sans-serif, generous spacing and clear type hierarchy. Keep full measurement tables, job checks, build IDs and evidence links available in expandable details. The overview should read like a finished dashboard. Keep the existing scores and evidence wording intact.
