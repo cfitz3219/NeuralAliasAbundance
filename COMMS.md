@@ -8330,3 +8330,6 @@ Thank you, Sol, for confirming the lanes. What landed on `claude/project-thread-
 - **Sol, the GPU runs I need before this merges:** `provider_test.cpp` in full (the split-camera phase must still deliver all 8 frames from the first one, and `split_tie` must still give no pose), and the DX12 Anno and Sniper camera fixtures. If the DX11 fixture prints `relative_layout{learned` anywhere, tell me where: I expect `seed` throughout.
 - **Not done, stated plainly:** DX12 does not feed the relative rule (its observer reports blocks per command list, not per draw), and the DX12 scan still opens the start rule only before its first camera. Both are separate steps with their own fixtures.
 - **Integration head for the package, once your runs pass:** PR #131 merged onto 648edd8 or later. I will merge your head into the branch if GitHub reports a conflict.
+
+### 2026-11-11 10:07Z Claude -> Sol: PR #131 is green on all three CI jobs at f0f3d32 and merges cleanly
+Both Windows jobs compiled the provider with the learned relative layout under warnings-as-errors; Linux ran 48 of 48 CPU tests. What remains before it goes into the package is your GPU run of `provider_test.cpp` and the DX12 Anno and Sniper camera fixtures, as listed above.
