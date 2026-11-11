@@ -59,6 +59,10 @@ struct CameraFacts {
         std::array<double, 3> origin{};
     };
     std::optional<RelativePose> split_pose; // projection and origin corroborated on the same scene draws
+    // The camera's view-projection when the game uploads no inverse beside it: admitted by the shared
+    // start or continue rule (providers/camera/camera_admission.hpp), or re-read at the place learned
+    // from one. The consumer uses it as given; it cannot repeat a proof that spans several frames.
+    std::optional<std::array<double, 16>> no_inverse_pose;
 };
 
 enum class Boundary : uint8_t {
@@ -88,8 +92,16 @@ struct ProviderStats {
     uint64_t frames = 0, fired = 0, missed = 0, unplaceable = 0, contradictions = 0, selection_changes = 0;
     uint64_t camera_found = 0, camera_missing = 0, jitter_written = 0;
     uint64_t pose_native = 0, pose_legacy = 0, pose_generic = 0, pose_split = 0;
+    // Cameras without an inverse beside them, by the shared rule that admitted them, and re-reads of
+    // the place learned from one.
+    uint64_t pose_started = 0, pose_continued = 0, pose_no_inverse = 0;
+    // Missed frames, by what the no-inverse rules saw (camera_admission.hpp NotAdmitted).
+    uint64_t start_no_candidate = 0, start_waiting = 0, start_inverse_game = 0, start_position_game = 0;
     uint64_t pose_no_packet = 0, pose_extent = 0, pose_repeat = 0, pose_origin = 0, pose_shape = 0;
-    // Frames on which the split-camera vote gave no camera, by reason (split_camera.hpp SplitVerdict).
+    // The relative camera's layout learned from this game's draws, and attempts that found a projection
+    // but no world range witnessing a position (providers/camera/relative_camera.hpp RelativeLearner).
+    uint64_t relative_learned = 0, relative_learn_failed = 0, relative_ambiguous = 0;
+    // Frames on which the relative-camera vote gave no camera, by reason (relative_camera.hpp RelativeVerdict).
     uint64_t split_no_votes = 0, split_no_projection = 0, split_few_draws = 0, split_no_majority = 0, split_small_share = 0;
     const char* last_miss = "";
 };

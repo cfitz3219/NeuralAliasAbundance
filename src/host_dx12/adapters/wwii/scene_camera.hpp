@@ -1,6 +1,7 @@
 #pragma once
 
 #include "providers/camera/camera_tracker.hpp"
+#include "providers/camera/relative_camera.hpp"
 
 #include <algorithm>
 #include <array>
@@ -30,25 +31,25 @@ inline bool IsRelativeSceneProjection(const camera::Matrix& vp, uint32_t width, 
         std::abs(geometry.position[2]) <= 1e-5;
 }
 
-// Current and previous identity-basis world transforms witness the rebased
-// origin. An individual matching transform is only a vote, never a camera.
-using WorldOrigins = std::array<double, 6>;
-inline bool DecodeWorldOrigins(const uint8_t* bytes, size_t size, WorldOrigins& out)
+// Where the campaign keeps its per-object range and its projection on native
+// DX11 (bindings are the provider's: vertex slots 0 and 1). A seed for the
+// general relative-camera rule (providers/camera/relative_camera.hpp): it saves
+// this game the frames of learning and is checked by content on every draw like
+// a learned layout. The rule itself knows nothing about this game.
+inline camera::RelativeLayout RelativeSeedLayout()
 {
-    if (size != 160) return false;
-    constexpr std::array<float, 16> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    for (size_t sample = 0; sample < 2; ++sample) {
-        std::array<float, 16> matrix{};
-        std::memcpy(matrix.data(), bytes + sample * 96, 64);
-        for (size_t axis = 0; axis < 3; ++axis) {
-            const size_t translation = axis * 4 + 3;
-            if (!std::isfinite(matrix[translation])) return false;
-            out[sample * 3 + axis] = -double(matrix[translation]);
-            matrix[translation] = 0.f;
-        }
-        if (matrix != identity) return false;
-    }
-    return out[0] != 0 || out[1] != 0 || out[2] != 0;
+    camera::RelativeLayout layout;
+    layout.world_binding = 0;
+    layout.world_size = 160;
+    layout.witnesses = 2; // this frame's transform at 0, last frame's at 96
+    layout.witness[0] = {0, camera::WitnessForm::Column4x4};
+    layout.witness[1] = {96, camera::WitnessForm::Column4x4};
+    layout.projection_binding = 1;
+    layout.projection_size = 64;
+    layout.projection_offset = 0;
+    layout.projection_layout = camera::Layout::RowMajor;
+    layout.reversed = true;
+    return layout;
 }
 
 // Campaign shader constant layouts observed at the scene draw.

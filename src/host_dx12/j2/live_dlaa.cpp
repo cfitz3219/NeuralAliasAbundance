@@ -42,6 +42,7 @@
 #include "host_dx12/effects/donut.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
+#include "providers/camera/camera_admission.hpp"
 #include "providers/camera/camera_tracker.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 
@@ -2460,16 +2461,7 @@ void remember_main_camera(const na::camera::Matrix& m)
 
 bool same_camera(const na::camera::Matrix& m)
 {
-    na::camera::VpGeometry v{};
-    if (!g_jit_cam.valid || !na::camera::DecomposeViewProjection(m, v)) return false;
-    const auto& p = g_jit_cam.geo;
-    double dot = 0, d2 = 0, len2 = 0;
-    for (int j = 0; j < 3; ++j) {
-        dot += v.forward[j] * p.forward[j];
-        d2 += (v.position[j] - p.position[j]) * (v.position[j] - p.position[j]);
-        len2 += p.position[j] * p.position[j];
-    }
-    return dot > 0.98 && std::abs(v.sy - p.sy) <= 0.05 * std::abs(p.sy) && d2 <= 0.01 * len2 + 100.0;
+    return g_jit_cam.valid && na::camera::ContinuesCamera(g_jit_cam.geo, m); // shared with the native DX11 provider
 }
 
 // A block from the camera slot starts this frame's jitter only if it continues the last main
@@ -3121,44 +3113,16 @@ double continuity(const na::camera::Matrix& m, bool injected)
 // scene list's most-used constant block that keeps the same slot and moves like one camera
 // over consecutive scene frames is accepted as the first main camera. Any later inverse pair
 // relearns the slot as before; the interloper rule still judges the result.
-// The slot is logical (root parameter, table or not, byte offset inside the block), never the
-// physical buffer: translated upload rings rotate resource+offset every frame (Astra, p12724).
-// One verdict per frame: same-frame retries of the scan reuse it instead of restarting the streak.
-struct CameraBoot {
-    bool valid = false;
-    uint64_t byte_offset = 0;
-    uint32_t param = 0, size = 0; // block size tells apart descriptors of one table with the same in-block offset
-    bool table = false;
-    na::camera::Matrix vp{};
-    uint64_t frame = 0;
-    uint32_t streak = 0;
-    bool verdict = false;
-};
-CameraBoot g_boot;
-constexpr uint32_t kBootFrames = 4;
-bool boot_continues(const na::camera::Matrix& a, const na::camera::Matrix& b)
-{
-    na::camera::VpGeometry u{}, v{};
-    if (!na::camera::DecomposeViewProjection(a, u) || !na::camera::DecomposeViewProjection(b, v)) return false;
-    double dot = 0, d2 = 0;
-    for (int j = 0; j < 3; ++j) { dot += u.forward[j] * v.forward[j]; d2 += (u.position[j] - v.position[j]) * (u.position[j] - v.position[j]); }
-    return dot > 0.9 && d2 <= 2500.0 && std::abs(u.sy - v.sy) <= 0.05 * std::abs(v.sy);
-}
+// VARIANT: camera/no-inverse
+// The rule itself is shared with the native DX11 provider: providers/camera/camera_admission.hpp.
+// The slot is logical (root parameter, table or not, block size, byte offset inside the block),
+// never the physical buffer.
+na::camera::StartWithoutInverse g_boot;
 // Returns true when `c` (from block `o`, this frame) completes the streak.
 bool boot_camera(const Block* o, const na::camera::Candidate& c)
 {
-    const bool same_slot = g_boot.valid && g_boot.param == o->param && g_boot.table == o->table && g_boot.size == o->size &&
-                           g_boot.byte_offset == c.byte_offset;
-    if (g_boot.valid && g_boot.frame == g.frame) // already judged this frame: the verdict belongs to that slot and camera only
-        return same_slot && g_boot.verdict && boot_continues(g_boot.vp, c.matrix);
-    const bool consecutive = g_boot.valid && g.frame > g_boot.frame && g.frame - g_boot.frame <= 2; // a menu frame between is tolerated
-    if (same_slot && consecutive && boot_continues(g_boot.vp, c.matrix)) ++g_boot.streak;
-    else g_boot.streak = 1;
-    g_boot.valid = true;
-    g_boot.param = o->param; g_boot.table = o->table; g_boot.size = o->size;
-    g_boot.byte_offset = c.byte_offset; g_boot.vp = c.matrix; g_boot.frame = g.frame;
-    g_boot.verdict = g_boot.streak >= kBootFrames;
-    return g_boot.verdict;
+    const na::camera::StartSlot slot{uint64_t(o->param) | (o->table ? uint64_t(1) << 32 : 0), 0, o->size, c.byte_offset};
+    return g_boot.Judge(slot, c.matrix, g.frame);
 }
 const CamPick* best_pick(const std::vector<CamPick>& v)
 {

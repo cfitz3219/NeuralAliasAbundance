@@ -33,6 +33,7 @@
 #include "host_dx12/native11/frame_model.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
+#include "providers/camera/camera_admission.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
 #include <d3d11_4.h>
@@ -158,6 +159,14 @@ uint64_t g_stream = 0;                    // SceneFrame::stream; bumps when any 
 uint64_t g_stream_key[4] = {};            // colour and depth lifetime ids, camera buffer id and its lifetime id (0 = untagged)
 
 CameraPick g_camera;
+// The relative camera (providers/camera/relative_camera.hpp): where its two ranges sit. Seeded with the
+// places one known game uses, replaced by what this game's own draws show when the seed gives no vote.
+camera::RelativeLayout g_rel_layout = wwii::RelativeSeedLayout();
+camera::RelativeLearner g_rel_learner;
+bool g_rel_learned = false;  // the layout in use came from this game's draws, not from the seed
+uint32_t g_rel_silent = 0;   // consecutive scene frames on which no draw voted under the layout
+uint32_t g_rel_wait = 0;     // scene frames before the next learning attempt
+camera::NoInverseCamera g_no_inverse; // the shared start and continue rules (the same ones the DX12 host uses)
 Selection g_last_selection;
 uint64_t g_frame = 0;
 float g_next_jitter[2] = {0, 0};
@@ -341,18 +350,33 @@ inline const Originals& O(ID3D11DeviceContext* c, Ctx* x)
 // ---------------------------------------------------------------- the boundary
 // Order rejected candidates by how far they passed the WWII layout checks.
 // Count only the strongest result at a missed boundary, not every bound buffer.
-enum class PoseCheck { NoPacket, Extent, Repeat, Origin, Shape, Native, Legacy, Generic };
+enum class PoseCheck { NoPacket, Extent, Repeat, Origin, Shape, Native, Legacy, Generic, NoInverse, Started, Continued };
 
-CameraPick PickForScene(const std::vector<uint8_t>& bytes, const CameraPick& learned,
+// `learned_binding`: these bytes are the range the learned camera was found at.
+CameraPick PickForScene(const std::vector<uint8_t>& bytes, const CameraPick& learned, bool learned_binding,
                         uint32_t width, uint32_t height, uint64_t frame, PoseCheck& check)
 {
-    // WWII's camera-relative packet carries the world origin and redundant
-    // witnesses instead of a VP/inverse pair. Use the same decoder as the
-    // effects consumer before trying the generic inverse-pair rule.
+    // The general rules first: the learned place re-read, then a view-projection with its inverse.
+    // A camera learned without an inverse stays the camera only while it still fills the scene picture.
+    CameraPick pick;
+    if (CheckLearned(bytes, learned, &pick, learned_binding) &&
+        (!pick.derived_inverse || camera::MatchesSceneAspect(pick.vp, width, height))) {
+        check = pick.derived_inverse ? PoseCheck::NoInverse : PoseCheck::Generic;
+        return pick;
+    }
+    pick = FindCamera(bytes, frame);
+    if (pick.found) {
+        check = PoseCheck::Generic;
+        return pick;
+    }
+    // VARIANT: camera11/packed
+    // Then the known packed layouts (adapters/wwii): a camera-relative packet that carries the
+    // world origin and redundant witnesses instead of an inverse. An adapter only adds a
+    // candidate the general rules could not prove; it never replaces one they found.
     wwii::SceneCamera scene;
     const char* why = nullptr;
     if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(bytes.size()), width, height, scene, &why)) {
-        CameraPick pick;
+        pick = {};
         pick.found = pick.reversed = pick.camera_relative = true;
         pick.vp = scene.vp;
         pick.raster_jitter_qualified = scene.raster_jitter_qualified;
@@ -363,10 +387,7 @@ CameraPick PickForScene(const std::vector<uint8_t>& bytes, const CameraPick& lea
     else if (std::strcmp(why, "vp_repeat") == 0) check = PoseCheck::Repeat;
     else if (std::strncmp(why, "origin", 6) == 0 || std::strcmp(why, "empty_origin") == 0) check = PoseCheck::Origin;
     else if (std::strcmp(why, "extent") == 0) check = PoseCheck::Extent;
-    CameraPick pick;
-    if (!CheckLearned(bytes, learned, &pick)) pick = FindCamera(bytes, frame);
-    if (pick.found) check = PoseCheck::Generic;
-    return pick;
+    return {};
 }
 
 std::vector<uint8_t> BoundCameraBytes(const uint8_t* bytes, size_t size, uint32_t first, uint32_t count)
@@ -379,11 +400,12 @@ std::vector<uint8_t> BoundCameraBytes(const uint8_t* bytes, size_t size, uint32_
 bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uint8_t>*& bytes,
                  uint64_t& version, std::optional<CameraFacts::RelativePose>& pose)
 {
-    // VARIANT: camera11/split (the rule itself is in split_camera.hpp)
+    // VARIANT: camera/relative (the rule itself is providers/camera/relative_camera.hpp)
     auto chosen = g_split_votes.cend();
     camera::Matrix vp{};
     const SplitVerdict verdict = ChooseSplitCamera(
-        g_split_votes, [](const SplitVote& vote) { return vote.draws; }, w, h, g_model.SceneDrawsThisFrame(), chosen, vp);
+        g_rel_layout, g_split_votes, [](const SplitVote& vote) { return vote.draws; }, w, h,
+        g_model.SceneDrawsThisFrame(), chosen, vp);
     if (chosen != g_split_votes.cend()) pick.vp = vp;
     switch (verdict) {
     case SplitVerdict::Chosen: break;
@@ -398,7 +420,8 @@ bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uin
     const SplitVote* best = &chosen->second;
     const auto& b = best->projection;
     pose = CameraFacts::RelativePose{pick.vp, {best_key->second[0], best_key->second[1], best_key->second[2]}};
-    pick.found = pick.reversed = pick.camera_relative = true;
+    pick.found = pick.camera_relative = true;
+    pick.reversed = g_rel_layout.reversed;
     pick.raster_jitter_qualified = false;
     g_camera = pick;
     g_model.SetCamera(b.buffer, b.slot);
@@ -410,9 +433,72 @@ bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uin
     return true;
 }
 
+// VARIANT: camera/no-inverse
+// The game uploads no inverse beside its camera, so the inverse-pair rule can never find it. The
+// shared rules (providers/camera/camera_admission.hpp, the same ones the DX12 host uses) admit a
+// view-projection that continues the last main camera, or one that keeps its place and moves like
+// one camera over consecutive scene frames. Only the list of bound ranges is DX11's own.
+// The ranges this scene's draws bound, as the shared camera rules take them (best-ranked first).
+void SceneBlocks(const std::vector<FrameModel::CameraBinding>& bindings, std::vector<camera::AdmissionBlock>& blocks,
+                 std::vector<size_t>& source, std::vector<const std::vector<uint8_t>*>& uploads)
+{
+    for (size_t i = 0; i < bindings.size() && blocks.size() < camera::NoInverseCamera::kMaxBlocks; ++i) {
+        const auto& b = bindings[i];
+        const auto it = g_scene_uploads.find({b.buffer, b.slot, b.first, b.count});
+        if (it == g_scene_uploads.end() || it->second.version != b.version || !it->second.bytes) continue;
+        size_t start = 0, length = 0;
+        if (!SplitBoundRange(it->second.bytes->size(), b.first, b.count, start, length)) continue;
+        camera::AdmissionBlock block;
+        // The place as the shaders see it: stage and slot, and the bound range. Never the buffer.
+        block.slot.binding = static_cast<uint64_t>(b.slot);
+        block.slot.range = (uint64_t(b.first) << 32) | b.count;
+        block.slot.size = length;
+        block.bytes = it->second.bytes->data() + start;
+        block.size = length;
+        blocks.push_back(block);
+        source.push_back(i);
+        uploads.push_back(it->second.bytes.get());
+    }
+}
+bool AdmitWithoutInverse(const std::vector<FrameModel::CameraBinding>& bindings, uint32_t w, uint32_t h, CameraPick* out,
+                         const std::vector<uint8_t>** bytes_out, uint64_t* version_out, PoseCheck& result)
+{
+    std::vector<camera::AdmissionBlock> blocks;
+    std::vector<size_t> source;                       // blocks[i] came from bindings[source[i]]
+    std::vector<const std::vector<uint8_t>*> uploads; // ... and these kept bytes
+    SceneBlocks(bindings, blocks, source, uploads);
+    const camera::Admission a = g_no_inverse.Admit(blocks, w, h, g_frame);
+    if (a.how == camera::Admitted::None) {
+        switch (a.why) {
+        case camera::NotAdmitted::Admitted: break;
+        case camera::NotAdmitted::PositionGame: ++g_stats.start_position_game; break;
+        case camera::NotAdmitted::NoCandidate: ++g_stats.start_no_candidate; break;
+        case camera::NotAdmitted::InverseGame: ++g_stats.start_inverse_game; break;
+        case camera::NotAdmitted::Waiting: ++g_stats.start_waiting; break;
+        }
+        return false;
+    }
+    const auto& b = bindings[source[a.block]];
+    CameraPick pick;
+    pick.found = pick.derived_inverse = true;
+    pick.offset = a.candidate.byte_offset; // inside the bound range, as CheckLearned re-reads it
+    pick.layout = a.candidate.layout;
+    pick.vp = a.candidate.matrix;
+    pick.reversed = a.candidate.reversed;
+    result = a.how == camera::Admitted::Started ? PoseCheck::Started : PoseCheck::Continued;
+    g_camera = pick;
+    g_model.SetCamera(b.buffer, b.slot);
+    g_camera_first = b.first;
+    g_camera_num = b.count;
+    *out = pick;
+    *bytes_out = uploads[a.block];
+    *version_out = b.version;
+    return true;
+}
+
 // The camera for this frame (under g_mu): the learned block re-read, else a search of the candidates.
-bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out,
-               PoseCheck& result, std::optional<CameraFacts::RelativePose>& split_pose)
+bool CameraSearch(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out,
+                  PoseCheck& result, std::optional<CameraFacts::RelativePose>& split_pose)
 {
     const Selection& s = g_model.Current();
     const uint32_t w = g_scene_vp_w >= 1.f ? static_cast<uint32_t>(g_scene_vp_w + 0.5f) : s.color_info.width;
@@ -427,17 +513,18 @@ bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t
     if (viewport && split()) return true;
     auto bindings = g_model.SceneCameraBindings();
     // Prefer the learned range, but never substitute its last frame's bytes.
-    std::stable_partition(bindings.begin(), bindings.end(), [&](const auto& b) {
+    const auto is_learned = [&](const auto& b) {
         return b.buffer == s.camera_cb && b.slot == s.camera_slot &&
                b.first == g_camera_first && b.count == g_camera_num;
-    });
+    };
+    std::stable_partition(bindings.begin(), bindings.end(), is_learned);
     for (const auto& b : bindings) {
         const auto it = g_scene_uploads.find({b.buffer, b.slot, b.first, b.count});
         if (it == g_scene_uploads.end() || it->second.version != b.version || !it->second.bytes) continue;
         const auto* bytes = it->second.bytes.get();
         const auto bound = BoundCameraBytes(bytes->data(), bytes->size(), b.first, b.count);
         PoseCheck check = PoseCheck::NoPacket;
-        const CameraPick p = PickForScene(bound, g_camera, w, h, g_frame + 1, check);
+        const CameraPick p = PickForScene(bound, g_camera, is_learned(b), w, h, g_frame + 1, check);
         if (!p.found) {
             result = std::max(result, check);
             continue;
@@ -453,9 +540,76 @@ bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t
         return true;
     }
     if (!viewport && split()) return true;
+    if (AdmitWithoutInverse(bindings, w, h, out, bytes_out, version_out, result)) return true;
     g_camera = {};
     g_model.SetCamera(0, -1);
     return false;
+}
+// VARIANT: camera/relative (learning where the two ranges sit)
+// At the scene boundary. Runs only while the game lacks a camera position and the layout in use has
+// given no vote for several scene frames, so a game whose layout works pays nothing here.
+void LearnRelativeLayout(bool found, const CameraPick& cam)
+{
+    g_rel_silent = g_split_votes.empty() ? g_rel_silent + 1 : 0;
+    if (g_rel_learner.armed()) {
+        camera::RelativeLayout learned;
+        if (g_rel_learner.Finish(g_model.SceneDrawsThisFrame(), learned)) {
+            g_rel_layout = learned;
+            g_rel_learned = true;
+            g_rel_silent = 0;
+            ++g_stats.relative_learned;
+            na::eventlog::Emit("native11_relative",
+                               "learned frame=%llu world{slot=%d places=%u at=%u,%u form=%d} projection{slot=%d size=%u at=%u copies=%u layout=%s reversed=%d}",
+                               static_cast<unsigned long long>(g_frame), static_cast<int>(learned.world_binding), learned.witnesses,
+                               learned.witness[0].offset, learned.witness[1].offset, static_cast<int>(learned.witness[0].form),
+                               static_cast<int>(learned.projection_binding), learned.projection_size, learned.projection_offset,
+                               learned.projection_copies, learned.projection_layout == camera::Layout::RowMajor ? "row" : "column",
+                               learned.reversed ? 1 : 0);
+        } else {
+            ++g_stats.relative_learn_failed; // a projection, but no world range witnessed a position on enough draws
+            g_rel_wait = 64;
+        }
+        return;
+    }
+    if (g_rel_wait) { --g_rel_wait; return; }
+    const bool lacks_position = !found || (cam.derived_inverse && camera::IsCameraRelative(cam.vp));
+    if (!lacks_position) return;
+    if (g_rel_learned) {
+        // A learned layout that stops giving votes: back to the seed first. It costs nothing to
+        // try, and learning starts again from it if it stays silent too.
+        if (g_rel_silent < 2) return;
+        g_rel_layout = wwii::RelativeSeedLayout();
+        g_rel_learned = false;
+        g_rel_silent = 0;
+        return;
+    }
+    if (g_rel_silent < 8) return;
+    const Selection& s = g_model.Current();
+    const uint32_t w = g_scene_vp_w >= 1.f ? static_cast<uint32_t>(g_scene_vp_w + 0.5f) : s.color_info.width;
+    const uint32_t h = g_scene_vp_h >= 1.f ? static_cast<uint32_t>(g_scene_vp_h + 0.5f) : s.color_info.height;
+    std::vector<camera::AdmissionBlock> blocks;
+    std::vector<size_t> source;
+    std::vector<const std::vector<uint8_t>*> uploads;
+    SceneBlocks(g_model.SceneCameraBindings(), blocks, source, uploads);
+    if (g_rel_learner.FindProjection(blocks, w, h)) return;
+    g_rel_wait = 64; // not a camera-relative scene, or no block that says which matrix is this frame's
+    if (g_rel_learner.ambiguous()) {
+        ++g_stats.relative_ambiguous;
+        na::eventlog::Emit("native11_relative", "projection_ambiguous frame=%llu: blocks hold several different camera-relative scene projections and none holds exactly one",
+                           static_cast<unsigned long long>(g_frame));
+    }
+}
+
+bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out,
+               PoseCheck& result, std::optional<CameraFacts::RelativePose>& split_pose)
+{
+    const bool found = CameraSearch(out, bytes_out, version_out, result, split_pose);
+    LearnRelativeLayout(found, *out);
+    if (!found) return false;
+    // What the shared rules need to know about this game, whichever rule found the camera.
+    if (out->camera_relative) g_no_inverse.PositionWitnessed(); // the game shows where the camera is
+    g_no_inverse.Remember(out->vp, result == PoseCheck::Generic);
+    return true;
 }
 
 void CountPoseCheck(PoseCheck result)
@@ -469,6 +623,9 @@ void CountPoseCheck(PoseCheck result)
     case PoseCheck::Native: ++g_stats.pose_native; break;
     case PoseCheck::Legacy: ++g_stats.pose_legacy; break;
     case PoseCheck::Generic: ++g_stats.pose_generic; break;
+    case PoseCheck::NoInverse: ++g_stats.pose_no_inverse; break;
+    case PoseCheck::Started: ++g_stats.pose_started; break;
+    case PoseCheck::Continued: ++g_stats.pose_continued; break;
     }
 }
 
@@ -609,6 +766,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.camera.num_constants = g_camera_num;
     f.camera.version = version;
     f.camera.split_pose = split_pose;
+    if (cam.derived_inverse) f.camera.no_inverse_pose = cam.vp;
     f.camera.bytes = camera_bytes.data();
     f.camera.size = static_cast<uint32_t>(camera_bytes.size());
     const bool vpj_route = g_vpj_route.load(std::memory_order_relaxed);
@@ -664,21 +822,22 @@ void SaveCameraUpload(Id resource, uint32_t version, const uint8_t* data, size_t
     latest.version = version;
     latest.bytes = std::make_shared<const std::vector<uint8_t>>(data, data + size);
 }
-void RememberSplitDraw(const Event& e, const CameraUpload& world, const CameraUpload& projection)
+// `ws` and `ps`: the slots the relative layout names for the world range and the projection range.
+void RememberSplitDraw(const Event& e, int ws, int ps, const CameraUpload& world, const CameraUpload& projection)
 {
-    const BindingKey world_binding{e.cb[0], 0, e.cb_first[0], e.cb_count[0]};
-    const BindingKey projection_binding{e.cb[1], 1, e.cb_first[1], e.cb_count[1]};
+    const BindingKey world_binding{e.cb[ws], ws, e.cb_first[ws], e.cb_count[ws]};
+    const BindingKey projection_binding{e.cb[ps], ps, e.cb_first[ps], e.cb_count[ps]};
     if (world.bytes != g_split_draw.world || projection.bytes != g_split_draw.projection ||
         world_binding != g_split_draw.world_binding || projection_binding != g_split_draw.projection_binding) {
         g_split_draw = {world.bytes, projection.bytes, world_binding, projection_binding, nullptr};
         SplitKey key{};
-        if (!MakeSplitKey(world.bytes->data(), world.bytes->size(), e.cb_first[0], e.cb_count[0],
-                          projection.bytes->data(), projection.bytes->size(), e.cb_first[1], e.cb_count[1], key)) return;
+        if (!MakeSplitKey(g_rel_layout, world.bytes->data(), world.bytes->size(), e.cb_first[ws], e.cb_count[ws],
+                          projection.bytes->data(), projection.bytes->size(), e.cb_first[ps], e.cb_count[ps], key)) return;
         auto [it, inserted] = g_split_votes.try_emplace(key);
         if (inserted) {
-            it->second.projection = {e.cb[1], 1, e.cb_first[1], e.cb_count[1], projection.version, 0};
+            it->second.projection = {e.cb[ps], ps, e.cb_first[ps], e.cb_count[ps], projection.version, 0};
             it->second.projection_bytes = projection.bytes;
-            it->second.world_buffer = e.cb[0];
+            it->second.world_buffer = e.cb[ws];
         }
         g_split_draw.vote = &it->second;
     }
@@ -691,14 +850,35 @@ void RememberSceneUploads(const Event& e)
 {
     if (e.kind != Kind::Draw || !g_model.IsSceneDraw(e)) return;
     const CameraUpload* split[2]{};
+    const int ws = static_cast<int>(g_rel_layout.world_binding), ps = static_cast<int>(g_rel_layout.projection_binding);
+    // While the layout is being learned: this draw takes part if it binds the projection range found.
+    const bool learning = g_rel_learner.armed();
+    const int lp = learning ? static_cast<int>(g_rel_learner.projection_binding()) : -1;
+    bool learn_draw = false;
     for (int slot = 0; slot < kCbBindSlots; ++slot) {
         if (!e.cb[slot]) continue;
         const auto it = g_cb_latest.find(e.cb[slot]);
         if (it == g_cb_latest.end() || it->second.version != g_model.CbVersion(e.cb[slot])) continue;
         g_scene_uploads[{e.cb[slot], slot, e.cb_first[slot], e.cb_count[slot]}] = it->second;
-        if (slot < 2 && it->second.bytes) split[slot] = &it->second;
+        if (!it->second.bytes) continue;
+        if (slot == ws) split[0] = &it->second;
+        else if (slot == ps) split[1] = &it->second;
+        if (slot == lp) {
+            size_t start = 0, length = 0;
+            learn_draw = SplitBoundRange(it->second.bytes->size(), e.cb_first[slot], e.cb_count[slot], start, length) &&
+                         length == g_rel_learner.projection_size();
+        }
     }
-    if (split[0] && split[1]) RememberSplitDraw(e, *split[0], *split[1]);
+    if (split[0] && split[1]) RememberSplitDraw(e, ws, ps, *split[0], *split[1]);
+    if (!learn_draw) return;
+    for (int slot = 0; slot < kCbSlots; ++slot) { // vertex ranges: a world transform is a vertex input
+        if (slot == lp || !e.cb[slot]) continue;
+        const auto it = g_cb_latest.find(e.cb[slot]);
+        if (it == g_cb_latest.end() || it->second.version != g_model.CbVersion(e.cb[slot]) || !it->second.bytes) continue;
+        size_t start = 0, length = 0;
+        if (!SplitBoundRange(it->second.bytes->size(), e.cb_first[slot], e.cb_count[slot], start, length)) continue;
+        g_rel_learner.NoteDraw(static_cast<uint64_t>(slot), it->second.bytes->data() + start, length);
+    }
 }
 // Called in immediate draw order and while replaying executed command lists.
 void NoteViewportDraw(const Event& e)
@@ -953,7 +1133,7 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
         if (!na::camera::Invert(jittered, inv)) return false;
         StoreMatrix(dst, size, now.offset, now.layout, jittered);
         const int64_t io = static_cast<int64_t>(now.offset) + now.inverse_delta;
-        if (io >= 0) StoreMatrix(dst, size, static_cast<uint64_t>(io), now.layout, inv);
+        if (!now.derived_inverse && io >= 0) StoreMatrix(dst, size, static_cast<uint64_t>(io), now.layout, inv);
     }
     std::lock_guard<std::mutex> l(g_mu);
     ++g_stats.jitter_written;
@@ -1341,7 +1521,8 @@ bool OnPresent(IDXGISwapChain* swap)
     g_split_votes.clear();
     g_split_candidate.store(g_split_world, std::memory_order_relaxed);
     g_split_world = 0;
-    g_collect_camera.store(!g_camera.found, std::memory_order_relaxed);
+    // Learning the relative layout needs every scene range's upload for one frame.
+    g_collect_camera.store(!g_camera.found || g_rel_learner.armed(), std::memory_order_relaxed);
     // Retire upload shadows not in the next scene's acquisition set. Draw-time
     // snapshots keep their own ownership until this frame is closed.
     if (g_cb_latest.size() > 512) {
@@ -1597,11 +1778,21 @@ ProviderStats Stats()
 int FormatStatus(char* out, unsigned long n)
 {
     const ProviderStats s = Stats();
+    camera::RelativeLayout layout;
+    bool layout_learned = false;
+    {
+        std::lock_guard<std::mutex> l(g_mu);
+        layout = g_rel_layout;
+        layout_learned = g_rel_learned;
+    }
     return std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
                          "camera_found=%llu camera_missing=%llu jitter_written=%llu "
-                         "pose{native=%llu legacy=%llu generic=%llu no_packet=%llu extent=%llu vp_repeat=%llu origin=%llu vp_shape=%llu split=%llu} "
+                         "pose{native=%llu legacy=%llu generic=%llu no_packet=%llu extent=%llu vp_repeat=%llu origin=%llu vp_shape=%llu split=%llu "
+                         "started=%llu continued=%llu no_inverse=%llu} "
                          "split_rejected{no_votes=%llu no_projection=%llu few_draws=%llu no_majority=%llu small_share=%llu} "
+                         "start_rejected{no_candidate=%llu waiting=%llu inverse_game=%llu position_game=%llu} "
+                         "relative_layout{%s world=%d/%u@%u,%u projection=%d/%u@%u learned=%llu no_witness=%llu ambiguous=%llu} "
                          "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
@@ -1613,9 +1804,18 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(s.pose_extent), static_cast<unsigned long long>(s.pose_repeat),
                          static_cast<unsigned long long>(s.pose_origin), static_cast<unsigned long long>(s.pose_shape),
                          static_cast<unsigned long long>(s.pose_split),
+                         static_cast<unsigned long long>(s.pose_started), static_cast<unsigned long long>(s.pose_continued),
+                         static_cast<unsigned long long>(s.pose_no_inverse),
                          static_cast<unsigned long long>(s.split_no_votes), static_cast<unsigned long long>(s.split_no_projection),
                          static_cast<unsigned long long>(s.split_few_draws), static_cast<unsigned long long>(s.split_no_majority),
                          static_cast<unsigned long long>(s.split_small_share),
+                         static_cast<unsigned long long>(s.start_no_candidate), static_cast<unsigned long long>(s.start_waiting),
+                         static_cast<unsigned long long>(s.start_inverse_game), static_cast<unsigned long long>(s.start_position_game),
+                         layout_learned ? "learned" : "seed", static_cast<int>(layout.world_binding), layout.world_size,
+                         layout.witness[0].offset, layout.witness[1].offset, static_cast<int>(layout.projection_binding),
+                         layout.projection_size, layout.projection_offset,
+                         static_cast<unsigned long long>(s.relative_learned), static_cast<unsigned long long>(s.relative_learn_failed),
+                         static_cast<unsigned long long>(s.relative_ambiguous),
                          g_vpj_route.load() ? 1 : 0, g_vpj_sample.load() ? 1 : 0,
                          static_cast<unsigned long long>(g_vpj_frames.load()), static_cast<unsigned long long>(g_vpj_draws.load()),
                          g_vpj_last_frame_draws.load(), static_cast<unsigned long long>(g_vpj_sets.load()),
