@@ -117,7 +117,7 @@ def main(argv):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if "--self-test" in argv:
         folder = os.path.join(root, "tests", "replay", "sample-native11")
-        argv = [folder, "--expect", os.path.join(folder, "expect.json")]
+        argv = [os.path.join(folder, "status-sample.txt"), "--expect", os.path.join(folder, "expect.json")]
     if not argv or argv[0].startswith("--"):
         sys.exit(__doc__)
     result = score(load(argv[0]))
