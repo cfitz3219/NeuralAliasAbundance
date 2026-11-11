@@ -42,6 +42,10 @@ struct ExpandParams {
     float depth_clear = 1.0f;
     float depth_tolerance = 0.02f;        // |Î” raw depth| accepted as "same surface" (relative to |depth|+0.01)
     float consistency_px = 2.0f;          // max spread among depth-matching neighbours before validity = 0
+    bool sky = false;                     // clear depth counts as a surface (looser flow rules)
+    // Encoded image pixel q is the raw raster pixel q + this offset. Expand
+    // onto the RAW depth grid; neighbours' depth must use the inverse mapping.
+    float image_to_raster_px[2] = {};
 };
 
 class FlowExpand {
@@ -62,11 +66,12 @@ public:
     // Depth-aware expansion with validity.
     bool DispatchDepthAware(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_rg16_sint, uint32_t grid,
                             const ExpandParams& params, ID3D12Resource* out_rg32f, uint32_t out_w, uint32_t out_h,
-                            uint32_t frame_slot);
+                            uint32_t frame_slot, Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap=nullptr);
 
 private:
     bool dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* grid_tex, uint32_t grid, const ExpandParams* params,
-                  ID3D12Resource* out, uint32_t out_w, uint32_t out_h, uint32_t frame_slot);
+                  ID3D12Resource* out, uint32_t out_w, uint32_t out_h, uint32_t frame_slot,
+                  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap=nullptr);
     float vector_scale_ = 1.0f;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;

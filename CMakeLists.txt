@@ -28,6 +28,11 @@ add_library(abundance_core STATIC
   src/core/motion_arbiter.cpp)
 target_link_libraries(abundance_core PUBLIC abundance_options)
 
+# Bridge frame record (portable; the wire format between a DX11 game and the
+# DX12 helper, see src/bridge/).
+add_library(bridge_record STATIC src/bridge/frame_record.cpp)
+target_link_libraries(bridge_record PUBLIC abundance_options)
+
 # Astra's CPU regression suite (tests/cpu/CMakeLists.txt is Astra's; it links
 # `host_observe` when that target exists, so it is added after the host libs
 # on Windows and here on other platforms).
@@ -35,7 +40,12 @@ if(NOT WIN32)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/CMakeLists.txt")
     add_subdirectory(tests/cpu)
   endif()
-  message(STATUS "Non-Windows: portable core + CPU tests only (DX12 host needs Windows/MSVC x64)")
+  add_subdirectory(tests/bridge)
+  add_subdirectory(tests/host_dx11)
+  include(src/host_vk/host_vk.cmake) # Vulkan layer (portable)
+  add_subdirectory(tests/host_vk)
+  add_subdirectory(tests/dx9)
+  message(STATUS "Non-Windows: portable core + CPU tests + the Vulkan layer (DX12 host needs Windows/MSVC x64)")
   return()
 endif()
 
@@ -148,6 +158,17 @@ else()
 endif()
 target_link_libraries(host_nvof PUBLIC abundance_options d3d12 d3dcompiler)
 
+# AMD FidelityFX optical flow (third_party/ffx-opticalflow, MIT; taken unchanged from the DX12
+# host's branch). Compiled by DXC at build time (cmake/ffx_flow_shaders.cmake); without DXC it is a stub.
+include(cmake/ffx_flow_shaders.cmake)
+add_library(host_ffx_flow STATIC src/host_dx12/ffx_flow/ffx_flow_shaders.cpp src/host_dx12/ffx_flow/ffx_flow.cpp)
+target_link_libraries(host_ffx_flow PUBLIC abundance_options d3d12)
+if(NA_HAVE_FFX_FLOW)
+  target_compile_definitions(host_ffx_flow PUBLIC NA_HAVE_FFX_FLOW)
+  target_include_directories(host_ffx_flow PRIVATE "${CMAKE_BINARY_DIR}/generated/ffx_flow")
+  add_dependencies(host_ffx_flow ffx_flow_shaders)
+endif()
+
 # ---------------------------------------------------------------- host_dx12
 # The in-game host. These modules reference each other freely (overlay <->
 # ngx_observe <-> nr/fg/motion <-> latency <-> tlou1), so they form one library.
@@ -245,6 +266,47 @@ if(NOT NA_XESS_INCLUDE AND EXISTS "${NA_SDK_ROOT}/xess/inc/xess/xess_d3d12.h")
 endif()
 message(STATUS "DLSS backend (C6): headers=${NA_HAVE_NGX_SDK}  own NGX instance=${NA_HAVE_NGX_LIB}  nvngx_dlss.dll='${NA_DLSS_DLL}'")
 
+# ---------------------------------------------------------------- DX11 bridge
+# Game-agnostic DX11 -> DLSS bridge (src/bridge/): in-process NGX D3D11 when the
+# NGX library is present, otherwise (and for 32-bit games / neural rendering)
+# shared textures + fences to the 64-bit DX12 helper below. Rebuilt from the
+# recovered Alien bridge (recovered/dx11-enhancement).
+if(NA_HAVE_NGX_LIB)
+  set(NA_BRIDGE_INPROC_SRC src/bridge/dx11_dlss_inproc.cpp)
+else()
+  set(NA_BRIDGE_INPROC_SRC src/bridge/dx11_dlss_inproc_stub.cpp)
+endif()
+add_library(bridge_dx11 STATIC src/bridge/dx11_bridge.cpp ${NA_BRIDGE_INPROC_SRC})
+target_link_libraries(bridge_dx11 PUBLIC bridge_record d3d11 dxgi d3dcompiler)
+if(NA_HAVE_NGX_LIB)
+  target_include_directories(bridge_dx11 SYSTEM PRIVATE "${NA_NGX_SDK_INCLUDE}")
+  if(EXISTS "${NA_NGX_LIB_DEBUG}")
+    target_link_libraries(bridge_dx11 PUBLIC "$<IF:$<CONFIG:Debug>,${NA_NGX_LIB_DEBUG},${NA_NGX_LIB}>")
+  else()
+    target_link_libraries(bridge_dx11 PUBLIC "${NA_NGX_LIB}")
+  endif()
+elseif(NA_HAVE_NGX_SDK)
+  # Headers but no library (CI): compile the real NGX D3D11 code so it is
+  # checked, without linking it into anything.
+  add_library(bridge_dx11_ngx_check STATIC src/bridge/dx11_dlss_inproc.cpp)
+  target_link_libraries(bridge_dx11_ngx_check PRIVATE bridge_record)
+  target_include_directories(bridge_dx11_ngx_check SYSTEM PRIVATE "${NA_NGX_SDK_INCLUDE}")
+endif()
+
+# The DX12 end of the bridge (started hidden by the DX11 side).
+add_executable(na_bridge_helper64 WIN32 src/bridge/dx12_helper_main.cpp src/bridge/helper_flow.cpp)
+target_link_libraries(na_bridge_helper64 PRIVATE bridge_record host_dlss core_gpu host_ffx_flow host_nvof d3d12 dxgi d3dcompiler shell32)
+if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
+  add_custom_command(TARGET na_bridge_helper64 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:na_bridge_helper64>")
+endif()
+
+# DX11 host (src/host_dx11/): hooks a DX11 game's device, contexts and swap
+# chain, finds scene depth/colour/camera with the game-agnostic frame model,
+# and runs DLSS through the bridge at the point before the tonemap/HUD.
+add_library(host_dx11 STATIC src/host_dx11/dx11_host.cpp)
+target_link_libraries(host_dx11 PUBLIC abundance_options bridge_dx11 host_hooking d3d11 dxgi)
+
 # ------------------------------------------------------------- host_upscalers
 # C7: FSR 3.1+ (FidelityFX API, MIT headers vendored in third_party/ffx-api)
 # and XeSS (our own ABI declarations; Intel's headers are only used, when
@@ -264,7 +326,7 @@ target_link_libraries(NeuralAliasAbundance PRIVATE abundance_core d3d12 dxgi use
 # dxgi.dll proxy (deployed under that name by the deploy script; built as
 # NeuralAliasDXGI.dll so it is never auto-loaded by accident). Boots the host.
 add_library(NeuralAliasDXGI SHARED src/runtime/dxgi_proxy.cpp src/runtime/dxgi_proxy.def)
-target_link_libraries(NeuralAliasDXGI PRIVATE host_dx12)
+target_link_libraries(NeuralAliasDXGI PRIVATE host_dx12 host_dx11)
 
 # sl.interposer forwarding proxy (Route A, Streamline titles such as TLOU).
 add_library(NeuralAliasSLProxy SHARED src/host_dx12/sl_proxy/sl_proxy.cpp)
@@ -281,6 +343,13 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/host/CMakeLists.txt")
   add_subdirectory(tests/host)  # Claude (C3): GPU/host/proxy tests, stubs, fixture
 endif()
+add_subdirectory(tests/bridge)  # Claude: DX11 bridge (portable record test + DX11<->DX12 round trip)
+add_subdirectory(tests/host_dx11) # Claude: DX11 hooks (portable frame model + a synthetic DX11 game)
+include(src/host_vk/host_vk.cmake) # Claude: Vulkan layer (NeuralAliasVulkan.dll + manifest)
+add_subdirectory(tests/host_vk)    # Claude: Vulkan layer on a synthetic Vulkan game (where a loader exists)
+set(NA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+include(src/host_dx9/host_dx9.cmake)  # Claude: DX9 d3d9.dll proxy (D3D9On12); 32-bit copy in win32/
+add_subdirectory(tests/dx9)        # Claude: DX9 via D3D9On12 (D0 probe; 32-bit copy built separately in CI)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt")
   add_subdirectory(tools)       # Claude (C5): nr_replay (local-only, needs SDK lib)
 endif()

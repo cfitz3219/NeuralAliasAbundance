@@ -2,6 +2,7 @@
 #include <atomic>
 #include "proxy_api.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
+#include "host_dx11/dx11_host.hpp"
 namespace {
 std::atomic<uint64_t> factories{0};
 std::atomic<bool> loaded{false};
@@ -79,6 +80,8 @@ BOOL WINAPI DllMain(HINSTANCE instance,DWORD reason,LPVOID) {
     if(reason==DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
         na::host::StartFromIni(instance,L"NeuralAliasHost.ini","ROUTE B");
+        // DX11 games: [dx11] enabled=1 in the same ini starts the DX11 host (its own thread).
+        na::dx11::StartFromIni(instance,L"NeuralAliasHost.ini");
     }
     return TRUE;
 }

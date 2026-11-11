@@ -1,0 +1,52 @@
+// Camera motion vectors for the Vulkan layer (Vulkan twin of the motion
+// arbiter's tier 2, src/core/motion_arbiter_gpu.cpp `reproject`, which the DX12
+// helper runs for DX11). Per pixel: the depth's point, moved by ONE matrix
+// (current clip -> previous clip, composed in double on the CPU by
+// na::camera::ComposeReprojectionRow), gives where that point was last frame.
+// Output: previous - current, in render pixels (DLSS's convention).
+//
+// `flags` bit0: the game draws with a positive viewport height (Vulkan's own
+// clip space, +Y down); without it, the game flips the viewport (D3D-style,
+// +Y up). bit1: the matrix is valid (no camera -> zero motion).
+// Regenerate the header: scripts/gen-vk-shaders.sh
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_depth;
+layout(set = 0, binding = 1, rg32f) uniform writeonly image2D u_motion;
+layout(set = 0, binding = 2, std140) uniform Params {
+    layout(row_major) mat4 reproject; // row-major bytes, row-vector algebra: p_prev = p_cur * M
+    vec2 jitter;                      // render pixels, +X right, +Y down
+    float depth_clear;
+    uint flags;
+    uvec2 size;
+} p;
+
+bool finite1(float a) { return (floatBitsToUint(a) & 0x7fffffffu) < 0x7f800000u; }
+
+void main()
+{
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= p.size.x || id.y >= p.size.y) return;
+    vec2 v = vec2(0.0);
+    if ((p.flags & 2u) != 0u) {
+        float depth = texelFetch(u_depth, ivec2(id), 0).r;
+        if (finite1(depth) && depth >= 0.0 && depth <= 1.0) {
+            if (depth == p.depth_clear) depth = p.depth_clear == 0.0 ? 1e-6 : 0.999999;
+            const bool y_down = (p.flags & 1u) != 0u;
+            const float w = float(p.size.x), h = float(p.size.y);
+            const float px = float(id.x) + 0.5 - p.jitter.x;
+            const float py = float(id.y) + 0.5 - p.jitter.y;
+            const vec4 ndc = vec4(px / w * 2.0 - 1.0, y_down ? py / h * 2.0 - 1.0 : 1.0 - py / h * 2.0, depth, 1.0);
+            const vec4 q = ndc * p.reproject;
+            if (finite1(q.w) && abs(q.w) >= 1e-20) {
+                const float nx = q.x / q.w, ny = q.y / q.w;
+                const float ppx = (nx + 1.0) * 0.5 * w;
+                const float ppy = y_down ? (ny + 1.0) * 0.5 * h : (1.0 - ny) * 0.5 * h;
+                const vec2 r = vec2(ppx - px, ppy - py);
+                if (finite1(r.x) && finite1(r.y)) v = r;
+            }
+        }
+    }
+    imageStore(u_motion, ivec2(id), vec4(v, 0.0, 0.0));
+}

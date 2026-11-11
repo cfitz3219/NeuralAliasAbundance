@@ -14,6 +14,12 @@ function(na_host_test name)
 endfunction()
 
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
+na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
+# AMD optical-flow passes (DXC at build time): blobs, embedded root signatures, PSOs.
+na_host_test(ffx_flow_shaders_test SOURCES ffx_flow_shaders_test.cpp LIBS host_ffx_flow d3d12 dxgi)
+# The DLSS helper's optical-flow motion (bridge v4) on a moving block; SKIP without 32/64-lane waves (WARP).
+na_host_test(helper_flow_test SOURCES helper_flow_test.cpp ${CMAKE_SOURCE_DIR}/src/bridge/helper_flow.cpp
+             LIBS core_gpu host_ffx_flow host_nvof d3d12 dxgi d3dcompiler LABELS gpu)
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
