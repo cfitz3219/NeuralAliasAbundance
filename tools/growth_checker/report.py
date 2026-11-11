@@ -225,6 +225,9 @@ def _plain(answer, verdict, result):
     """One plain sentence for a card. The rule's own wording stays in the details below."""
     because = verdict.get("because") or []
     if answer == "failing":
+        continuity = result["jobs"].get("continuity", {})
+        if continuity.get("state") == "failed":
+            return continuity["note"]
         failed = [scoring.JOB_TITLES.get(j, j) for j, v in result["jobs"].items() if v["state"] == "failed"]
         return "Required checks failed: " + "; ".join(failed) + "." if failed else " ".join(because)
     if answer == "receded":
@@ -247,10 +250,8 @@ def _card_metrics(case, result, stale):
     m = result["measurements"] if result else {}
     fps = value(m, "fps_play_median")
     budget = (case.get("budget") or {}).get("fps_min")
-    cov = value(m, "delivered_share_of_scene")
-    cov_label = "of gameplay frames"
-    if cov is None:
-        cov, cov_label = value(m, "delivered_share_of_presented"), "of presented frames"
+    cov = value(m, "delivered_share_of_presented")
+    cov_label = "of all presents · includes menus and loading"
     scale = max(3.0 * (budget or 40), fps or 0)
     small = lambda tone: icon(tone).replace('<svg', '<svg style="width:12px;height:12px;vertical-align:-1px"')
     judged = ((result or {}).get("jobs") or {}).get("performance_budget", {}).get("state")
@@ -265,13 +266,30 @@ def _card_metrics(case, result, stale):
     else:
         fps_sub = (f"budget not judged: DLAA did not run" if not cov else f"budget of {budget} fps not judged")
     tone = "ok" if judged == "verified" else "low" if judged == "failed" else None
-    cov_tone = None if cov is None else "ok" if cov >= 90 else "low" if cov < 50 else None
+    continuity = ((result or {}).get("jobs") or {}).get("continuity", {})
+    reported = continuity.get("source") == "owner_verdict"
+    state = continuity.get("state")
+    if reported and state == "failed":
+        label, detail, colour = "Flickering reported", continuity.get("note", ""), "bad"
+    elif reported and state == "verified":
+        label, detail, colour = "Stable in this run", continuity.get("note", ""), "good"
+    else:
+        label, detail, colour = "Stability unverified", "Delivery totals cannot establish visible continuity.", "open"
+    scene_share = value(m, "delivered_share_of_scene")
+    missed_time = value(m, "not_delivering_share_of_play")
+    extra = []
+    if scene_share is not None:
+        extra.append(f"{scene_share:.1f}% of recognised scene opportunities received output.")
+    if missed_time is not None:
+        extra.append(f"{missed_time:.1f}% of observed time was in intervals with under 98% delivery.")
+    stability = (f'<div class="continuity"><p>{_pill(colour, label)}</p><p>{e(detail)}</p>'
+                 f'<p class="muted">{e(" ".join(extra))}</p></div>')
     return ('<div class="metrics">'
             + _metric("Whole-play fps", fps, "fps", fps_sub, None if fps is None else 100.0 * fps / scale,
                       100.0 * budget / scale if budget else None, tone, stale)
-            + _metric("DLAA frame coverage", cov, "%", cov_label if cov is not None else ("not measured" if result else "no run yet"),
-                      cov, None, cov_tone, stale)
-            + '</div>')
+            + _metric("Counted DLAA deliveries", cov, "%", cov_label if cov is not None else ("not measured" if result else "no run yet"),
+                      None, None, None, stale)
+            + '</div>' + (stability if result and case["route"] == "B" else ""))
 
 
 def _overview(comparison, cases, results, by_id):
