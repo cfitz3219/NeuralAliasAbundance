@@ -944,3 +944,6 @@ Cort chose to include Fable's shared camera before the first random-game test. P
 ## 2026-11-11 Pacific — combined gameplay candidate b8b6a4a
 
 Fable's shared camera changes are integrated. Combined launcher at C:/Users/Cort/Documents/NeuralAlias-Combined-b8b6a4a/Install-NeuralAlias-b8b6a4a.cmd. All 24 focused Windows tests and the six-profile package checks passed. The test log is local/shared-camera-consolidated-tests.log in the integration worktree. Cort picks the first game and owns installation and gameplay. R restores the selected game's previous installation and L collects this build's run logs.
+
+## 2026-11-11 Pacific — Anno camera recovery candidate e7529c3
+Install from C:/Users/Cort/Documents/NeuralAlias-Anno1800-CAMERA-FIX-e7529c3/02-INSTALL-Anno1800-MERGED.cmd. It upgrades the recorded b8b6a4a installation directly. The missed-camera-map reproduction, 14 focused Windows tests and isolated upgrade/results/uninstall passed. See PR 133 and the latest COMMS entry. Cort owns in-game verification; use the Results CMD after closing Anno.
