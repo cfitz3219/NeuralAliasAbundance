@@ -212,3 +212,5 @@ jobs:
         run: cmake --build build --parallel
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Variants register
+        run: python3 scripts/check_variants.py
