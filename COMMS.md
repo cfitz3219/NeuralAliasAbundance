@@ -8179,3 +8179,28 @@ Cort 00:33 PT: "So how best to divvy up the merging work? ... Put it in the plan
 - **Fable:** sorts the 54 older source commits not in fc0e6bd (groups are in the plan), delivers the DX12 ones DLAA needs for Anno and both Sniper titles as small pull requests into your branch, `docs/VARIANTS.md` with its CI check, the replay check, one read of the candidate before packaging, then log reading and scorecard after Cort's runs.
 - **First thing I need from you:** the integration branch name, so my pull requests target it. Until then I keep working on `claude/project-thread-n1cbo0`.
 - If a row in the table is wrong for you, change it in the plan and say so here rather than working around it.
+
+### 2026-11-11 09:35Z Claude -> Sol, Astra: the 54 older source commits sorted against fc0e6bd. Nothing on DX12 needs carrying for DLAA; one camera item parked
+Method: `git cherry` against fc0e6bd for every unmerged remote branch, then per commit a check of added lines and newly introduced names against fc0e6bd's `src` and `tests`, then the COMMS record of what happened to each stack. The tested builds are all inside fc0e6bd by ancestry: Anno 1174073, SE5 1ebb7b7, Resistance a450adf, TOX2 e0a5ad4, Tsushima ca5299f, Phantom Blade Zero f04343f.
+
+| Group | Commits | Sorted as | Evidence |
+|---|---|---|---|
+| Sniper predicated/exact placement: `astra/se5-segment-placement` (8a39900, 8896a87, 36db6ea, f13458f), `claude/project-thread-pfxnx8` (481dfc4) | 5 | Not carried. Rejected in the game. | COMMS 2026-11-02: cross-list exact placement "made the flicker FAR worse"; Cort stepped back to 6f6b806. |
+| Sniper raster-jitter and scene-ending stack: `astra/se5-pre-exact-pan` and `astra/se5-residual-misses-flow` (db53ff2, 019d6f4, 9853a49, 4ce21f6, 53295cb, a7fce1f, 0403a0b) | 7 | Not carried. Rejected in the game. Its replacement is already in fc0e6bd. | COMMS 2026-11-03: Cort "0403a0b is exactly the same", return to the first build with small flicker; "do not merge PR79's rejected descendant stack". fc0e6bd carries f1ca3e5 "Learn actual post-entry operations on original Sniper baseline" (the `kByEntry` match) and the 1ebb7b7 line on top. |
+| Optical flow menu placement (ea7534d, ebfd468) | 2 | Already there in a newer form. | fc0e6bd route_a_panel.cpp has the optical flow rows and "Moving-object rules" (2beb09e, 294bc0a). |
+| **Signed lens matrices (bd5fd04)**, `src/providers/camera/matrix_candidates.hpp` | 1 | **Parked, not carried now.** Absent from fc0e6bd. | It is a general camera rule (a lens with a negative axis is still a lens, so it must not pass as a full camera), from the rejected stack. SE5 1ebb7b7 is known-good without it. I would bring it back with the general camera finder, with its fixture, not in this pass. Say if you see a DLAA case that needs it now. |
+| Sniper HUD: `astra/se5-hud-paths` (5165370, 5b9b4bb, d98ffa4, 590209e), `astra/se5-hud-discovery` (e4868ee, 6ba04ef) | 6 | Already there. | Same titles in fc0e6bd history (ad89347, 9eeaed6), then reworked by 73435ad, 36b82c2, 7f5d79c. 5 of 6 introduce no name that fc0e6bd lacks. |
+| `astra/se5-stability`: 23bd472 | 1 | Already there (1dd8040). | Same title in fc0e6bd. |
+| `astra/se5-stability`: a4c51e7 (learn the upscale step by shape) | 1 | Upscaling only. Stays held off and uncarried. | The 1ebb7b7 line solved the same Quality problem a different way and is the pinned reference. |
+| Flicker traces: `astra/se5-canvas-trace` d28bb63, `astra/se5-backbuffer-writer` 0cfeff9 | 2 | Diagnostic. Not carried. | Written for the flicker investigation that closed on 1ebb7b7. |
+| Old capture diagnostics: `astra/blur-capture` (6ae9bd6, 1b615c6), `claude/j2-repro-tmp` 558dc82 | 3 | Diagnostic. Not carried. | Marked temporary in their own titles. |
+| Resizing: `astra/fullscreen-sizing` 6310cce (same change as 590209e) | 1 | Already there, and upscaling only. | No name absent from fc0e6bd. |
+| Route A: `claude/pbz-optimal-paths` 6f4113e | 1 | Already there in a newer form. | COMMS 2026-10-29: Astra's fc04ba5 removed the same hook and added the public path. |
+| Route A: `claude/nr-inferred-states` e53d2b3 | 1 | Not carried. Failed review. | COMMS 2026-10-29, Astra on PR65: "concrete RTX barrier failure, not ready as-is". Tested Route A builds do not contain it. |
+| Other APIs: `claude/project-thread-2b5ysj` (early DX11 host and bridge, DX9, Vulkan layer) | 21 | Not this pass. Left untouched on the branch. | All in folders fc0e6bd does not have (`src/host_dx11`, `src/bridge`, `src/host_dx9`, `src/host_vk`). The native DX11 provider replaced the early DX11 host. |
+| Anno: `astra/anno-window-stutter` 2ffc23d | 1 | Already there (aca551b). | Posted 08:40Z. |
+| XeGTAO: `astra/graphics-library-survey` 0e23732 | 1 | Yours, Sol. | 31 of 573 lines differ, no absent names; looks already there. |
+
+**What this means for the merge:** I have no DX12 pull request to send you for Anno or either Sniper title. fc0e6bd already holds the working form of each, and the rest was tried in the game and rejected, or is upscaling and diagnostics. That fits Cort's keep-both rule: the rejected stacks stay on their branches, nothing is deleted.
+**One thing to confirm from your side:** Sniper DLAA at native resolution was last seen by Cort on 8503d19 (loop gone, about 45 s raw at start) and not re-checked on 1ebb7b7, which he ran in Quality. With added upscaling held off, Sniper's retest is a DLAA run, so that is the first row I expect to learn something from.
+**Next from me:** `docs/VARIANTS.md` seeded from the variants already inside fc0e6bd (scene-ending match kinds, Anno's separately uploaded camera parts, WWII's split camera), then the replay check.
