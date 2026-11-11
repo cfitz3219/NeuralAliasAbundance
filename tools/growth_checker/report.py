@@ -452,7 +452,7 @@ def ledger_row(comparison, cases, results_by_id, date):
     return "| " + " | ".join(cells) + " |"
 
 
-def page(comparison, cases, results, date, title="GameCheck"):
+def page(comparison, cases, results, date, title="GameCheck", controls="", external_fonts=True):
     """-> the page as HTML (content only: the publishing skeleton or a browser supplies the rest)."""
     by_id = {r["manifest"]["evidence_id"]: r for r in results}
     verdict = comparison["verdict"]
@@ -460,9 +460,12 @@ def page(comparison, cases, results, date, title="GameCheck"):
     tone, word = STATUS[_status_key(verdict["answer"])]
     ran = sum(1 for c in comparison["cases"].values() if "missing" not in c)
     waiting = len(comparison["cases"]) - ran
+    fonts = ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+             'family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">'
+             if external_fonts else "")
     parts = [f'''<title>{e(title)} {e(short(comparison["build"]))}</title>
 <meta name="claude:viewport-fit-sides" content="cover">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+{fonts}
 <style>{CSS}</style>
 <div class="page">
 <header class="hero">
@@ -474,6 +477,8 @@ def page(comparison, cases, results, date, title="GameCheck"):
 </div>
 <div class="verdict"><span class="eyebrow">Overall result</span>{_pill(tone, word, "big")}</div>
 </header>''']
+    if controls:
+        parts.append(controls)
     parts.append(_overview(comparison, cases, results, by_id))
     parts.append('<section class="evidence"><h2>Full evidence</h2>')
     answer_box = [f'''<details><summary>The answer for this build, in the rules' own words</summary>

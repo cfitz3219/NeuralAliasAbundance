@@ -1,5 +1,16 @@
 # GameCheck (the growth checker)
 
+On Windows, double-click `GameCheck.cmd` at the project root to open the local
+dashboard in your browser. Click **Import Results** and select the folder saved by
+the game's Results CMD. GameCheck asks which game to use if the folder name
+does not identify a case. **Build history** lets you return to an older build.
+**Close GameCheck** stops the local app.
+
+Imports are stored in `%LOCALAPPDATA%/GameCheck/results`. The dashboard reads
+these alongside the bundled results and accepted floors. Reimporting a log for
+the same case keeps one run. GameCheck reads the original logs in their Results
+folder and saves the scored record. The accepted floors are separate from imports.
+
 GameCheck is a development tool, separate from NeuralAlias. It reads saved evidence (the logs
 a run leaves behind, test and replay results) and says, case by case, whether a
 build grew, held or receded. It is never loaded by a game and is not part of the
