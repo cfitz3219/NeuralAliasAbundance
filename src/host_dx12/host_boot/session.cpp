@@ -114,9 +114,9 @@ void ActivateSavedRequests(const wchar_t* ini){
     // Anisotropic filtering: live like the mip bias (twins of the game's objects).
     observe::SetSamplerAnisotropy(safe ? 0u : st.aniso16.load());
     if(GetPrivateProfileIntW(L"fsr",L"enabled",1,ini)==1)
-        ffx::SetMode(!safe && GetPrivateProfileIntW(L"fsr",L"replace",0,ini)==1?ffx::Mode::ReplaceWithDlss:ffx::Mode::Observe);
+        ffx::SetMode(settings::AddedUpscalingAllowed() && !safe && GetPrivateProfileIntW(L"fsr",L"replace",0,ini)==1?ffx::Mode::ReplaceWithDlss:ffx::Mode::Observe);
     if(GetPrivateProfileIntW(L"xess",L"enabled",1,ini)==1)
-        xess::SetMode(!safe && GetPrivateProfileIntW(L"xess",L"replace",0,ini)==1?xess::Mode::ReplaceWithDlss:xess::Mode::Observe);
+        xess::SetMode(settings::AddedUpscalingAllowed() && !safe && GetPrivateProfileIntW(L"xess",L"replace",0,ini)==1?xess::Mode::ReplaceWithDlss:xess::Mode::Observe);
     if(safe || !st.enabled.load())return;
     if(st.preset.load()>0 || st.rr_preset.load()>0)ngx::RequestReapply();
     // Engine render-size setters run only after the user's Apply button.

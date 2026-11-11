@@ -888,6 +888,10 @@ void write_status_line()
     const bool have_interval = g_status_last_tick != 0;
     const ULONGLONG elapsed = now - g_status_last_tick;
     g_status_last_tick = now;
+    if (na::j2::Configured() && !na::settings::AddedUpscalingAllowed()) {
+        constexpr char status[] = "added upscaling: held off\r\n";
+        append_status_text(status, sizeof status - 1);
+    }
     if (na::on12::NativeRoute()) {
         static uint64_t previous_frames = 0;
         const uint64_t frames = na::native11::Stats().frames;

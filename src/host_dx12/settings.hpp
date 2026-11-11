@@ -145,6 +145,10 @@ struct Settings {
 };
 
 Settings& Get();
+
+// Consolidation build policy. Keep saved modes and experimental code available
+// for future builds, but gate production activation before installing hooks.
+inline constexpr bool AddedUpscalingAllowed() { return false; }
 enum class NrWriteSource : uint32_t { DefaultIni=1, UserIni=2, Overlay=3, SafeStartup=4 };
 struct NrWrite {
     uint64_t sequence=0, tick_ms=0;

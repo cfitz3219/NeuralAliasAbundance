@@ -133,8 +133,11 @@ DWORD WINAPI InitThread(LPVOID)
     // P4-4 slider route (step 1): our menu's mode sets the game's render scale. The read hook
     // must be in before the game reads its settings file, so it goes in first. Opt-in per game
     // ([j2] read_hook=1, with J2 on); never in safe start. Its log beside the status log.
-    const bool native_scale_asked=GetPrivateProfileIntW(L"j2",L"native_scale",0,g_ini)==1;
-    if ((native_scale_asked || GetPrivateProfileIntW(L"j2", L"read_hook", 0, g_ini) == 1) && GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
+    const bool added_upscaling = na::settings::AddedUpscalingAllowed();
+    const bool native_scale_asked = added_upscaling && GetPrivateProfileIntW(L"j2", L"native_scale", 0, g_ini) == 1;
+    const bool read_hook_asked = added_upscaling && GetPrivateProfileIntW(L"j2", L"read_hook", 0, g_ini) == 1;
+    const bool render_small_asked = added_upscaling && GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
+    if ((native_scale_asked || read_hook_asked) && GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
         !na::settings::SafeStart()) {
         wchar_t scale_log[MAX_PATH];
         lstrcpynW(scale_log, g_ini, MAX_PATH);
@@ -177,7 +180,7 @@ DWORD WINAPI InitThread(LPVOID)
             const float user = -1.f;
             float wanted[5] = {user, user, user, user, user};
             int n = 1;
-            if (native_scale_asked || GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1) {
+            if (native_scale_asked || render_small_asked) {
                 n=native_scale_asked?5:4;
                 for (int m = 1; m < n; ++m) wanted[m] = na::j2::SmallMipBias(user, static_cast<float>(na::scale::FractionForMode(m)));
             }
@@ -258,13 +261,13 @@ DWORD WINAPI InitThread(LPVOID)
     // (read-only: records what the game gives FSR); replacing FSR's output with
     // DLSS is opt-in via [fsr] replace=1. Off entirely with [fsr] enabled=0.
     if (GetPrivateProfileIntW(L"fsr", L"enabled", 1, g_ini) == 1) {
-        na::ffx::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, g_ini) == 1 ? na::ffx::Mode::ReplaceWithDlss
+        na::ffx::SetMode(added_upscaling && !na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, g_ini) == 1 ? na::ffx::Mode::ReplaceWithDlss
                                                                                   : na::ffx::Mode::Observe);
         na::ffx::StartModuleWatch();
     }
     // C7b: XeSS interception, same policy ([xess] enabled / replace).
     if (GetPrivateProfileIntW(L"xess", L"enabled", 1, g_ini) == 1) {
-        na::xess::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, g_ini) == 1 ? na::xess::Mode::ReplaceWithDlss
+        na::xess::SetMode(added_upscaling && !na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, g_ini) == 1 ? na::xess::Mode::ReplaceWithDlss
                                                                                     : na::xess::Mode::Observe);
         na::xess::StartModuleWatch();
     }
@@ -315,8 +318,8 @@ DWORD WINAPI InitThread(LPVOID)
     // Scene-resource provision does not virtualize window/display geometry.
     // Retain full-size presentation proxies; J2 receives reduced companions
     // from its physical-input provider and writes back a native-size scene.
-    const bool scene_asked = !native_scale_asked && GetPrivateProfileIntW(L"present", L"scene_resources", 0, g_ini) == 1;
-    const bool small_asked = !native_scale_asked && !scene_asked && GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
+    const bool scene_asked = added_upscaling && !native_scale_asked && GetPrivateProfileIntW(L"present", L"scene_resources", 0, g_ini) == 1;
+    const bool small_asked = !native_scale_asked && !scene_asked && render_small_asked;
     // Render-small needs the presenter, which Route A normally switches on. A game with
     // [route_a] enabled=0 (Anno) still gets it here; [present] proxy=0 keeps it off.
     if ((small_asked || scene_asked) && !route_a && na::j2::Configured() &&
@@ -365,11 +368,11 @@ DWORD WINAPI InitThread(LPVOID)
         std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f requested after start; native DLAA until the game follows)", small_mode, small_f);
         boot_log(small_line);
     }
-    const bool projection_window = !native_scale_asked && !render_small && !scene_asked && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
+    const bool projection_window = added_upscaling && !native_scale_asked && !render_small && !scene_asked && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
     na::j2::SetProjectionWindow(projection_window);
     na::j2::SetProjectionWindowScissor(GetPrivateProfileIntW(L"j2", L"window_scissor", 1, g_ini) != 0);
     if (projection_window) { na::j2::InstallProjectionWindowScissor(); boot_log("projection window: enabled"); }
-    const bool scene_resources=!native_scale_asked&&!render_small&&!projection_window&&na::j2::Configured()&&
+    const bool scene_resources=added_upscaling&&!native_scale_asked&&!render_small&&!projection_window&&na::j2::Configured()&&
         (scene_asked||GetPrivateProfileIntW(L"layer2",L"enabled",0,g_ini)==1);
     na::scale::ConfigureAutomaticScene(scene_resources);
     if(scene_resources){
@@ -377,7 +380,10 @@ DWORD WINAPI InitThread(LPVOID)
         na::present::SetRenderScale(1.f,nullptr,nullptr);
         boot_log("scene-resources: reduced scene companions; native presentation; no virtual window resize or second Present DLAA");
     }
-    if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
+    if (na::j2::Configured()) {
+        if (!added_upscaling) boot_log("added upscaling: held off");
+        na::overlay::RegisterLiveDlaaMenu();
+    }
     na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);
     na::background::Start(); // two below-normal workers, never hardware_concurrency

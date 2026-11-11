@@ -943,12 +943,15 @@ void DrawLiveDlaa()
     if (Switch("j2", &on)) {
         na::j2::SetPaused(!on);
         const auto mip = na::observe::GetMipLiveStats();
-        if (mip.enabled && !na::j2::RenderSmall() && na::settings::Get().j2_scale_mode.load() == 0)
+        if (mip.enabled && !na::j2::RenderSmall() &&
+            (!na::settings::AddedUpscalingAllowed() || na::settings::Get().j2_scale_mode.load() == 0))
             na::observe::SetSamplerMipBiasLive(on ? -1.0f : 0.0f);
     }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
-    if (na::scale::native::Available()||na::scale::SliderRouteActive()||na::scale::GetAutomaticSceneStats().enabled||na::j2::ProjectionWindow()||na::j2::RenderSmall()) {
+    if (na::settings::AddedUpscalingAllowed() &&
+        (na::scale::native::Available() || na::scale::SliderRouteActive() ||
+         na::scale::GetAutomaticSceneStats().enabled || na::j2::ProjectionWindow() || na::j2::RenderSmall())) {
         // P4-4 slider route: the mode sets the game's own render scale (read at start-up; live
         // when the game allows it). The game's own Render Scale slider is left to the user.
         na::settings::Settings& ss = na::settings::Get();

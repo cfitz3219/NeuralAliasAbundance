@@ -10,6 +10,11 @@
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
+#include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
+#include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/native_control.hpp"
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <filesystem>
@@ -87,6 +92,7 @@ int main(int argc,char** argv) {
     const bool optional_input=argc>1 && !strcmp(argv[1],"--optional-input");
     const bool create_failure=argc>1 && !strcmp(argv[1],"--menu-create-failure");
     const bool recovery=argc>1 && !strcmp(argv[1],"--recovery");
+    const bool added_upscaling_off=argc>1 && !strcmp(argv[1],"--added-upscaling-off");
     const bool on12_ownership=argc>1 && !strcmp(argv[1],"--on12-ownership");
     const bool on12_present_order=argc>1 && !strcmp(argv[1],"--on12-present-order");
     SetEnvironmentVariableW(L"NEURALALIAS_TEST_WARP",on12_present_order?L"0":L"1");
@@ -110,6 +116,19 @@ int main(int argc,char** argv) {
     if(on12_ownership || on12_present_order)set(L"dx11on12",L"enabled",L"1");
     if(on12_present_order)set(L"dx11on12",L"keep_game_swapchain",L"1");
     if(on12_present_order)set(L"j2",L"enabled",L"1");
+    if (added_upscaling_off) {
+        set(L"route_a", L"enabled", L"0");
+        set(L"observe", L"producers", L"1");
+        set(L"j2", L"enabled", L"1");
+        set(L"j2", L"scale_mode", L"3");
+        set(L"j2", L"native_scale", L"1");
+        set(L"j2", L"read_hook", L"1");
+        set(L"j2", L"window", L"1");
+        set(L"present", L"proxy", L"1");
+        set(L"present", L"render_small", L"1");
+        set(L"present", L"scene_resources", L"1");
+        set(L"layer2", L"enabled", L"1");
+    }
     if(recovery){
         na::settings::SetIniPath(ini.c_str());na::settings::Load();
         const auto marker=std::wstring(na::settings::UserIniPath())+L".session";
@@ -208,6 +227,18 @@ int main(int argc,char** argv) {
     for(unsigned i=0;i<400 && !na::host::SessionReady();++i)Sleep(5);
     REQUIRE(na::host::SessionReady());
     CHECK(na::settings::SafeStart()==recovery);
+    if (added_upscaling_off) {
+        CHECK(na::j2::Configured());
+        CHECK(na::settings::Get().j2_scale_mode.load() == 3); // keep the old preference
+        CHECK(!na::j2::RenderSmall() && !na::j2::ProjectionWindow());
+        CHECK(!na::scale::SliderRouteActive() && !na::scale::native::Available());
+        CHECK(!na::scale::GetAutomaticSceneStats().enabled);
+        CHECK(!na::native_present::SizeProbeInstalled());
+        CHECK(!na::present::Scaling() && na::present::RenderScale() == 1.0f);
+        DXGI_SWAP_CHAIN_DESC1 actual{};
+        REQUIRE(SUCCEEDED(chain->GetDesc1(&actual)));
+        CHECK(actual.Width == desc.Width && actual.Height == desc.Height);
+    }
     CHECK(d.device->GetDeviceRemovedReason()==S_OK);
     na::host::StopSessionForTests();
     REQUIRE(na::overlay::Stop());chain.Reset();DestroyWindow(window);

@@ -98,12 +98,12 @@ DWORD WINAPI InitThread(LPVOID)
     // Gate 2: the Streamline entry point also hosts non-native upscalers.
     // Observe by default; replacement remains an explicit per-provider opt-in.
     if (GetPrivateProfileIntW(L"fsr", L"enabled", 1, ini) == 1) {
-        na::ffx::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
+        na::ffx::SetMode(na::settings::AddedUpscalingAllowed() && !na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
             ? na::ffx::Mode::ReplaceWithDlss : na::ffx::Mode::Observe);
         na::ffx::StartModuleWatch();
     }
     if (GetPrivateProfileIntW(L"xess", L"enabled", 1, ini) == 1) {
-        na::xess::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
+        na::xess::SetMode(na::settings::AddedUpscalingAllowed() && !na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
             ? na::xess::Mode::ReplaceWithDlss : na::xess::Mode::Observe);
         na::xess::StartModuleWatch();
     }
