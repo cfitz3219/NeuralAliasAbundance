@@ -224,3 +224,60 @@ def build_verdict(case_verdicts, impact):
 Until a rule module exists the tool answers with the cautious stand-ins in
 `defaults.py`: comparisons are "not judged", no floor moves, and the build's
 answer is "not proven".
+
+## 7. Comparison (what `compare` produces)
+
+```json
+{
+  "build": "b8b6a4a",
+  "rules_in_place": {"comparison": false, "guards": false, "transfer": false, "ambiguity": false},
+  "cases": {
+    "wwii-campaign-dlaa": {
+      "case": "wwii-campaign-dlaa",
+      "baseline": "<evidence_id>", "candidate": "<evidence_id>", "also_scored": [],
+      "comparison": { },
+      "measures": {"delivered_share_of_scene": {"baseline": 96.34, "candidate": 97.1, "change": 0.76, "unit": "percent",
+                                                 "floor": {"kind": "min", "value": 96.0}, "against_floor": "holds"}},
+      "jobs": {"jitter_applied": {"before": "verified", "after": "verified"}},
+      "guards": [ ],
+      "floor_action": { },
+      "verdict": {"answer": "...", "because": [ ]}
+    },
+    "se5-dlaa": {"missing": "No scored evidence of build b8b6a4a for this case.", "baseline": "<evidence_id>"}
+  },
+  "impact": { },
+  "verdict": {"answer": "...", "because": [ ]}
+}
+```
+
+Facts are computed by the tool; judgments come from `rules/`:
+
+- `comparison` is `rules.comparison.judge(baseline, candidate, case)`. Its
+  `tolerance` is applied to the floor checks.
+- `measures[...].against_floor` is `holds`, `below` or `unknown`. A measurement
+  the candidate lacks is `unknown`, with the reason in `why`; unknown never holds.
+- The baseline of a case is the evidence that set its floor; without a floor, the
+  latest scored result of another build. The candidate is the build's latest saved
+  result for the case; its other results are listed in `also_scored`.
+- `guards` is `rules.guards.check(...)`, `floor_action` is
+  `rules.comparison.floor_action(...)`, `verdict` is
+  `rules.ambiguity.case_verdict(...)`, the build's `verdict` is
+  `rules.ambiguity.build_verdict({case: verdict}, impact)`.
+
+`compare` exits 0 when no case receded, 1 when one did, 2 when the build has no
+scored evidence at all.
+
+## 8. Dependency map and impact (`growth.dependencies/1`)
+
+`growth/dependencies.json` lists areas: `{"id", "paths": [prefix or root-level
+glob], "reaches": [provider, ...], "variants"?: [names], "capability"?, "why"}`.
+The longest matching path classifies a changed file. `impact` answers per case:
+
+| Answer | Meaning |
+|---|---|
+| `affected` | A changed file belongs to an area that reaches the case's provider. Eligibility counts, not which rule won in the last run. |
+| `no_identified_dependency` | Every changed file is classified and none reaches the case. It rests on regression tests; it is not proof. |
+| `impact_unknown` | A changed file matches no area. Never reported as "no impact". |
+
+The list decides where play time is best spent. It does not renew any earlier
+live verification: a result keeps the build it came from.

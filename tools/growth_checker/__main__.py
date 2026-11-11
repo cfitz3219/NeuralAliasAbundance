@@ -2,10 +2,14 @@
 
   ingest <saved run folder or status log> [--case ID] [--type live_run|replay|fixture_test|synthetic]
          [--expect-build HASH] [--verdict JOB=STATE:"what the owner said"] [--save] [--json]
+  compare --build HASH [--changed FROM..TO | --files a b c] [--json]
+  report  --build HASH [--changed FROM..TO | --files a b c] [--out page.html] [--date YYYY-MM-DD]
+  impact  FROM..TO | --files a b c
   selftest
 
-Exit codes of ingest: 0 scored, 2 evidence unreadable, 3 evidence refused.
-(A regression is reported by `compare`, never by these codes.)
+Exit codes. ingest: 0 scored, 2 evidence unreadable, 3 evidence refused.
+compare: 0 no case receded, 1 a case receded, 2 no scored evidence for the build.
+The two are kept apart on purpose: unreadable evidence is never a result.
 """
 import json
 import os
@@ -63,11 +67,97 @@ def cmd_ingest(argv):
     return worst
 
 
+def _changed(argv):
+    """The changed files named on the command line, or None when none were named."""
+    if "--files" in argv:
+        files = []
+        for a in argv[argv.index("--files") + 1:]:
+            if a.startswith("--"):  # the next option ends the list
+                break
+            files.append(a)
+        return files
+    span = _option(argv, "--changed") or (argv[0] if argv and ".." in argv[0] else None)
+    if not span:
+        return None
+    import subprocess
+    done = subprocess.run(["git", "-C", store.ROOT, "diff", "--name-only", span], capture_output=True, text=True)
+    if done.returncode != 0:
+        sys.exit("git could not list the changed files: " + done.stderr.strip())
+    return [line for line in done.stdout.splitlines() if line]
+
+
+def _compare(argv):
+    import compare as comparing
+    build = _option(argv, "--build")
+    if not build:
+        sys.exit(__doc__)
+    cases = store.cases()
+    floors = {c: store.floor(c) for c in cases}
+    deps = store.load(os.path.join(store.GROWTH, "dependencies.json"))
+    results = store.results()
+    return comparing.compare_build(build, cases, results, floors, _changed(argv), deps), cases, results
+
+
+def cmd_compare(argv):
+    comparison, cases, _ = _compare(argv)
+    if "--json" in argv:
+        print(store.dump(comparison), end="")
+    else:
+        print(f"build {comparison['build']}: {comparison['verdict']['answer']}")
+        for line in comparison["verdict"]["because"]:
+            print("  " + line)
+        for cid, c in comparison["cases"].items():
+            if "missing" in c:
+                print(f"  {cid}: {c['missing']}")
+                continue
+            print(f"  {cid}: {c['verdict']['answer']}")
+            for name, row in c["measures"].items():
+                if row.get("against_floor") in ("below", "unknown"):
+                    print(f"      {name}: {row['candidate']} against floor {row['floor']['kind']} {row['floor']['value']} -> {row['against_floor']}")
+            for g in c["guards"]:
+                print(f"      {g['severity']}: {g['message']}")
+    answers = [c["verdict"]["answer"] for c in comparison["cases"].values() if "verdict" in c]
+    if not answers:
+        return 2
+    return 1 if any("reced" in a.lower() for a in answers) else 0
+
+
+def cmd_report(argv):
+    import datetime
+    import report
+    comparison, cases, results = _compare(argv)
+    date = _option(argv, "--date") or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    html = report.page(comparison, cases, results, date)
+    out = _option(argv, "--out")
+    if out:
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(html)
+        print("wrote " + out)
+    else:
+        print(html)
+    return 0
+
+
+def cmd_impact(argv):
+    import impact
+    files = _changed(argv)
+    if files is None:
+        sys.exit(__doc__)
+    deps = store.load(os.path.join(store.GROWTH, "dependencies.json"))
+    result = impact.impact(files, deps, store.cases())
+    for cid, v in result["cases"].items():
+        print(f"{v['answer']:26s} {cid}")
+        for line in v["because"]:
+            print("    " + line)
+    return 0
+
+
 def main(argv):
     if not argv:
         sys.exit(__doc__)
-    if argv[0] == "ingest":
-        return cmd_ingest(argv[1:])
+    commands = {"ingest": cmd_ingest, "compare": cmd_compare, "report": cmd_report, "impact": cmd_impact}
+    if argv[0] in commands:
+        return commands[argv[0]](argv[1:])
     if argv[0] == "selftest":
         import unittest
         suite = unittest.defaultTestLoader.discover(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))

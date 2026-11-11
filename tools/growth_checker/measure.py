@@ -215,6 +215,9 @@ def measure(parsed, provider=None):
     deliv = statuslog.series(samples, p["delivered"]) if p["delivered"] else None
     if pres is None or all(x is None for x in pres):
         return {"error": f"the log has no '{name}' counters", "detected_provider": detected}
+    # A counter the log never states is absent, not zero.
+    scene = None if scene is None or all(x is None for x in scene) else scene
+    deliv = None if deliv is None or all(x is None for x in deliv) else deliv
     spans = statuslog.sessions(samples, [c for c in (pres, scene, deliv) if c])
     steps = [(samples[i + 1]["t"] - samples[i]["t"]) % 86400 for i in range(len(samples) - 1)]
     steps = [s for s in steps if s > 0]
