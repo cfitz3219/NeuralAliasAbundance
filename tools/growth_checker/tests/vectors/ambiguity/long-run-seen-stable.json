@@ -67,7 +67,7 @@
       "dlaa_reaches_picture is now verified.",
       "delivered_share_of_scene improved beyond normal variation.",
       "The same gameplay scene is not confirmed in both runs.",
-      "fps_play_median is lower than the baseline run, whose scene is not confirmed alike.",
+      "fps_play_median is slower than in the baseline run, whose scene is not confirmed alike.",
       "Not settled by this run: cost.",
       "Not settled by this run: presentation_modes."
     ]

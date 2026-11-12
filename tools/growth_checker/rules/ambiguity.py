@@ -114,7 +114,7 @@ def case_verdict(comparison, measure_changes, jobs_before, jobs_after, guards):
             if limited_but_seen and name in SPEED:
                 # Different scenes run at different speeds: a menu-only baseline against hours of
                 # missions is not a slowdown. The fps budget job still judges speed on its own.
-                caveats.append(f"{name} is lower than the baseline run, whose scene is not confirmed alike.")
+                caveats.append(f"{name} is slower than in the baseline run, whose scene is not confirmed alike.")
             else:
                 losses.append(f"{name} worsened beyond normal variation.")
     if losses:
