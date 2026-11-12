@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import hashlib
 import subprocess
+import time
 import sys
 from tempfile import NamedTemporaryFile
 from threading import Lock
 from urllib.parse import parse_qs, urlencode, urlsplit
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 import webbrowser
 
 import compare
@@ -25,6 +27,22 @@ from rules._evidence import number, status_hash
 HOST = "127.0.0.1"
 PORT = 8765
 APP_MARKER = "GameCheck local dashboard"
+
+
+def code_fingerprint():
+    """Hash of this checker's Python files: tells a launcher whether the server that is already
+    running was started from the files now on disk (an update installed since must not be hidden)."""
+    digest = hashlib.sha256()
+    here = Path(__file__).resolve().parent
+    for path in sorted(here.rglob("*.py")):
+        if "tests" in path.relative_to(here).parts:
+            continue
+        digest.update(path.relative_to(here).as_posix().encode())
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n"))
+    return digest.hexdigest()[:16]
+
+
+CODE = code_fingerprint()
 
 
 def pick_folder():
@@ -271,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error(403)
         url = urlsplit(self.path)
         if url.path == "/health":
-            return self.send_body(APP_MARKER, "text/plain")
+            return self.send_body(APP_MARKER + "\n" + CODE, "text/plain")
         if url.path != "/":
             return self.send_error(404)
         build = parse_qs(url.query).get("build", [""])[0]
@@ -354,18 +372,49 @@ class GameCheckServer(ThreadingHTTPServer):
         self.import_lock = Lock()
 
 
+def close_running(history, address):
+    """Ask the GameCheck already running to close, using the token it left for its launcher."""
+    try:
+        token = (history / "server.token").read_text(encoding="utf-8").strip()
+        request = Request(address + "/close", data=urlencode({"token": token}).encode("ascii"),
+                          headers={"Origin": address, "Content-Type": "application/x-www-form-urlencoded"})
+        with urlopen(request, timeout=5):
+            pass
+    except (OSError, ValueError):
+        return False
+    for _ in range(50):
+        try:
+            with urlopen(address + "/health", timeout=1):
+                pass
+        except OSError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def main():
     history = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "GameCheck"
-    try:
-        server = GameCheckServer(Library(history))
-    except OSError:
-        address = f"http://{HOST}:{PORT}"
-        with urlopen(address + "/health", timeout=2) as response:
-            if response.read().decode("utf-8") != APP_MARKER:
+    address = f"http://{HOST}:{PORT}"
+    for attempt in range(2):
+        try:
+            server = GameCheckServer(Library(history))
+            break
+        except OSError:
+            with urlopen(address + "/health", timeout=2) as response:
+                marker, _, code = response.read().decode("utf-8").partition("\n")
+            if marker != APP_MARKER:
                 raise RuntimeError("Another application is using GameCheck's local address.")
-        webbrowser.open(address)
-        return
+            # The one running was started from older files: replace it, so an installed update
+            # shows when GameCheck is opened instead of the old rules answering forever.
+            if code == CODE or attempt or not close_running(history, address):
+                webbrowser.open(address)
+                return
     with server:
+        try:
+            history.mkdir(parents=True, exist_ok=True)
+            (history / "server.token").write_text(server.token, encoding="utf-8")
+        except OSError:
+            pass
         webbrowser.open("http://" + server.address)
         server.serve_forever()
 
