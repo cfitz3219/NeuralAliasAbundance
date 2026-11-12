@@ -76,6 +76,10 @@ def case_verdict(comparison, measure_changes, jobs_before, jobs_after, guards):
     if failed:
         return answer("failing", [f"{job} failed in this run." for job in failed])
     if not valid:
+        if verdict == "no_baseline" and _owner_saw_stable(after):
+            # A game's first run has nothing to compare with; stable by Cort's report or his
+            # 90% rule, it holds (Cort 2026-11-12: nothing may be impossible to call stable).
+            return answer("held", ["First run of this game, stable: " + after["continuity"].get("note", "").strip()])
         return answer("not proven", comparison.get("reasons") or ["A comparable baseline is needed."])
 
     unknown = sorted(name for name, row in measure_changes.items() if row.get("against_floor") == "unknown")
@@ -133,7 +137,16 @@ def build_verdict(case_verdicts, impact):
         if cases:
             return {"answer": word, "because": [f"{word.capitalize()}: " + ", ".join(cases) + "."]}
     if impact is None:
-        return {"answer": "not proven", "because": ["The scope of affected cases has not been established."]}
+        # No dependency map: judge the build on the games actually run on it. Games not run on
+        # it are shown on their own cards (with any earlier stable result), not held against it.
+        good = [a for a in answers.values() if a in {"held", "grew"}]
+        if not answers or len(good) < len(answers):
+            pending = sorted(c for c, a in answers.items() if a not in {"held", "grew"})
+            return {"answer": "not proven", "because": [f"Gameplay evidence is still incomplete for {', '.join(pending) or 'this build'}."]}
+        grew = sorted(c for c, a in answers.items() if a == "grew")
+        if grew:
+            return {"answer": "grew", "because": ["Improved cases: " + ", ".join(grew) + ". Only games run on this build are judged."]}
+        return {"answer": "held", "because": ["The games run on this build held. Only games run on this build are judged."]}
     if impact.get("unclassified"):
         return {"answer": "not proven", "because": ["Some changed files have unknown impact."]}
     scope = impact.get("cases", {})

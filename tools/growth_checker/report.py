@@ -197,9 +197,9 @@ ICON = {
 }
 STATUS = {
     "grew": ("good", "Improved"), "held": ("held", "Held"), "not proven": ("open", "Needs evidence"),
-    "missing": ("open", "Needs a retest"), "receded": ("bad", "Regressed"), "failing": ("bad", "Failing"),
+    "missing": ("open", "Needs a retest"), "earlier": ("held", "Stable on an earlier build"), "receded": ("bad", "Regressed"), "failing": ("bad", "Failing"),
 }
-ORDER = {"receded": 0, "failing": 1, "not proven": 2, "missing": 3, "held": 4, "grew": 5}
+ORDER = {"receded": 0, "failing": 1, "not proven": 2, "missing": 3, "earlier": 4, "held": 4, "grew": 5}
 
 
 def _status_key(answer):
@@ -304,6 +304,7 @@ def _overview(comparison, cases, results, by_id):
             result = earlier[-1] if earlier else None
             seen = ((result or {}).get("jobs") or {}).get("continuity", {}) if result else {}
             if result and seen.get("source") == "owner_verdict" and seen.get("state") == "verified":
+                key = "earlier"
                 said = (f'You saw it stable on build {short(result["manifest"]["producer"]["build"])}. '
                         f'It has not been played on {short(comparison["build"])} yet, so this build is unconfirmed for it.')
             elif result:
@@ -319,7 +320,7 @@ def _overview(comparison, cases, results, by_id):
             link = f'<a href="#{e(cid)}">Full evidence</a>'
         tone, word = STATUS[key]
         tally[tone] += 1
-        stale = key == "missing"
+        stale = key in {"missing", "earlier"}
         build_note = (f'Last run: build <span class="mono">{e(short(result["manifest"]["producer"]["build"]))}</span>'
                       if result else "No scored run")
         cards.append((ORDER[key], case["game"], f'''<article class="card s-{tone}">

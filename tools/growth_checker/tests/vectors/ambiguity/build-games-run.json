@@ -1,0 +1,21 @@
+{
+  "about": "Without a dependency map, the build is judged on the games run on it.",
+  "call": "build_verdict",
+  "args": [
+    {
+      "se5": {
+        "answer": "grew"
+      },
+      "ser": {
+        "answer": "held"
+      }
+    },
+    null
+  ],
+  "expect": {
+    "answer": "grew",
+    "because": [
+      "Improved cases: se5. Only games run on this build are judged."
+    ]
+  }
+}
