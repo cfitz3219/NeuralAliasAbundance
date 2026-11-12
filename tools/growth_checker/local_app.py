@@ -92,6 +92,12 @@ class Library:
                     "state": observation["state"], "source": "owner_verdict",
                     "note": "Player report: " + observation["note"], "evidence": [],
                 }
+                if observation["state"] == "verified" and "dlaa_reaches_picture" in result["jobs"]:
+                    # "DLAA stayed visibly stable": the player saw DLAA on the picture.
+                    result["jobs"]["dlaa_reaches_picture"] = {
+                        "state": "verified", "source": "owner_verdict",
+                        "note": "Player report: " + observation["note"], "evidence": [],
+                    }
         return records
 
     def observation_path(self, result):

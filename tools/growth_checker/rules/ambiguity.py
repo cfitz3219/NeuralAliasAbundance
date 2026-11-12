@@ -38,6 +38,18 @@ DIRECTIONS = {
 }
 
 
+# Jobs an ordinary play session does not exercise: they need a run made for them (an Off
+# stretch, a change of window mode, a setting changed mid-run, a status cross-check, a clean
+# exit record). They stay listed as not settled by the run, but their absence does not hold
+# back the game's verdict. A failure of one still counts in full.
+NOT_SETTLED_BY_PLAY = ("cost", "presentation_modes", "home_controls_take_effect", "status_truthful", "no_crash_or_hang")
+
+
+def _owner_saw_stable(jobs):
+    job = (jobs or {}).get("continuity", {})
+    return job.get("source") == "owner_verdict" and job.get("state") == "verified"
+
+
 def case_verdict(comparison, measure_changes, jobs_before, jobs_after, guards):
     def answer(word, because):
         return {"answer": word, "because": because}
@@ -64,11 +76,18 @@ def case_verdict(comparison, measure_changes, jobs_before, jobs_after, guards):
         return answer("not proven", comparison.get("reasons") or ["A comparable baseline is needed."])
 
     unknown = sorted(name for name, row in measure_changes.items() if row.get("against_floor") == "unknown")
-    missing_jobs = sorted(job for job in set(before) | set(after)
-                          if after.get(job, {}).get("state") not in {"verified", "not_applicable"})
+    unsettled = sorted(job for job in set(before) | set(after)
+                       if after.get(job, {}).get("state") not in {"verified", "not_applicable"})
+    missing_jobs = [job for job in unsettled if job not in NOT_SETTLED_BY_PLAY]
+    not_settled = [f"Not settled by this run: {job}." for job in unsettled if job in NOT_SETTLED_BY_PLAY]
+    # A limited comparison (scene, settings or hardware not confirmed alike) earns a verdict
+    # when the person at the screen saw this run stay stable; the limits are shown with it.
+    # Floors are decided separately and still never move on a limited comparison.
+    limited_but_seen = verdict == "comparable_with_limits" and _owner_saw_stable(after)
+    caveats = list(comparison.get("limits") or []) if limited_but_seen else []
     unresolved = [g["message"] for g in guards
                   if g["guard"] not in {"sampled_gap", "conditional_fps"}]
-    if unknown or missing_jobs or not after or verdict != "comparable" or unresolved:
+    if unknown or missing_jobs or not after or (verdict != "comparable" and not limited_but_seen) or unresolved:
         reasons = list(comparison.get("limits") or [])
         reasons += [f"No verified result for {job}." for job in missing_jobs]
         reasons += [f"No comparable measurement for the {name} floor." for name in unknown]
@@ -93,9 +112,9 @@ def case_verdict(comparison, measure_changes, jobs_before, jobs_after, guards):
     if losses:
         return answer("not proven", losses + gains)
     if gains:
-        return answer("grew", gains)
+        return answer("grew", gains + caveats + not_settled)
     if compared or any(row.get("against_floor") == "holds" for row in measure_changes.values()):
-        return answer("held", ["The measured case held within its accepted limits."])
+        return answer("held", ["The measured case held within its accepted limits."] + caveats + not_settled)
     return answer("not proven", ["There are no comparable measurements for this case."])
 
 

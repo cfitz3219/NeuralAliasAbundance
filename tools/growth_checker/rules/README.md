@@ -8,7 +8,7 @@ reached. They do not edit evidence, accepted floors, or game settings.
 | Evidence | Judgment |
 |---|---|
 | Confirmed case, scene, render mode, other case settings and test environment match. Both builds are identified by their own evidence and each run has at least three measured gameplay intervals. | Comparable |
-| Scene, settings, build attribution or gameplay boundaries are unconfirmed. Evidence is from automation, there are too few samples, sessions restart or time goes unlogged. | Comparable with limits. A directly recorded failure remains visible. The comparison cannot earn a positive gameplay verdict or change a floor. |
+| Scene, settings, build attribution or gameplay boundaries are unconfirmed. Evidence is from automation, there are too few samples, sessions restart or time goes unlogged. | Comparable with limits. A directly recorded failure remains visible. The comparison cannot change a floor. It earns a positive gameplay verdict only when the player reported this run visibly stable; the limits are listed with that verdict. |
 | Case, route, API, provider, scene, setting, environment or evidence kind differs. The log is reused or no scored run exists. | Not comparable |
 
 Whole-play FPS tolerates the greater of 1 FPS or 3%. Median frame time tolerates
@@ -30,6 +30,12 @@ reader. Existing results lack them and stay limited. A proposal's `awaits`
 must identify the scheduled confirmation evidence ID. Report any
 `floor_block` reason returned by the comparison in the floor decision.
 Conditional FPS, raw counters and sampled gap estimates cannot raise a floor.
+
+Jobs an ordinary play session does not exercise (cost, presentation modes, Home
+controls changed mid-run, status cross-check, clean-exit record) are listed as
+"not settled by this run" and do not hold back a held or improved verdict. A
+recorded failure of one still makes the case failing. Cort, 2026-11-12: a
+two-hour run he saw stable must not stay amber for checks it never covered.
 
 ## A2. Flag misleading results
 

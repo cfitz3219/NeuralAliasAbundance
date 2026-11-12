@@ -1,0 +1,64 @@
+{
+  "about": "Without the player's stable report a limited comparison still proves nothing.",
+  "call": "case_verdict",
+  "args": [
+    {
+      "verdict": "comparable_with_limits",
+      "limits": [
+        "The same gameplay scene is not confirmed in both runs."
+      ],
+      "reasons": [],
+      "tolerance": {
+        "fps_play_median": {
+          "absolute": 1,
+          "relative_percent": 3
+        }
+      }
+    },
+    {
+      "fps_play_median": {
+        "baseline": 55,
+        "change": 0.5,
+        "against_floor": "holds"
+      }
+    },
+    {
+      "continuity": {
+        "state": "failed",
+        "source": "owner_verdict"
+      },
+      "dlaa_reaches_picture": {
+        "state": "unknown"
+      },
+      "cost": {
+        "state": "unknown"
+      },
+      "presentation_modes": {
+        "state": "unknown"
+      }
+    },
+    {
+      "continuity": {
+        "state": "unknown"
+      },
+      "dlaa_reaches_picture": {
+        "state": "verified",
+        "source": "owner_verdict"
+      },
+      "cost": {
+        "state": "unknown"
+      },
+      "presentation_modes": {
+        "state": "unknown"
+      }
+    },
+    []
+  ],
+  "expect": {
+    "answer": "not proven",
+    "because": [
+      "The same gameplay scene is not confirmed in both runs.",
+      "No verified result for continuity."
+    ]
+  }
+}
