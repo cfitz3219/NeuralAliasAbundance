@@ -124,6 +124,8 @@ struct Game {
     UINT w = 320, h = 180;
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
+    uint32_t camera_ring_offset = 24576;
+    uint32_t camera_snapshot_size = 32768;
     bool campaign_mixed_ring = false;
     bool campaign_native_pose = false;
     bool campaign_single_origin = false;
@@ -255,7 +257,7 @@ void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp,
         std::memcpy(bytes.data() + 704, extent, sizeof extent);
     }
     auto* destination = static_cast<uint8_t*>(m.pData);
-    if (g.campaign_pixel_range) destination += 24576;
+    if (g.campaign_pixel_range) destination += g.camera_ring_offset;
     std::memcpy(destination, bytes.data(), bytes.size());
     c->Unmap(g.cam_cb.Get(), 0);
     if (remember) g.last_written = vp;
@@ -318,7 +320,7 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
         c->VSSetConstantBuffers(1, 1, &cbs[1]);
         ComPtr<ID3D11DeviceContext1> c1;
         if (SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c1)))) {
-            const UINT first = 24576 / 16, count = 1280 / 16;
+            const UINT first = g.camera_ring_offset / 16, count = 1280 / 16;
             c1->PSSetConstantBuffers1(0, 1, &cbs[0], &first, &count);
         }
     } else if (g.campaign_native_pose) {
@@ -437,7 +439,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     if (!inputs) ++s.wrong_inputs;
     if (g_tonemap_bound && f.boundary == na::native11::Boundary::BeforeRead) ++s.after_tonemap;
     if (f.scene_draws != 40) ++s.no_scene;
-    const UINT camera_size = g.campaign_split_camera ? 64u : g.campaign_pixel_range ? 32768u : g.campaign_camera ? 1280u : 512u;
+    const UINT camera_size = g.campaign_split_camera ? 64u : g.campaign_pixel_range ? g.camera_snapshot_size : g.campaign_camera ? 1280u : 512u;
     const int vs_slot = g.campaign_split_camera ? 1 : g.campaign_pixel_range ? -1 : g.campaign_native_pose ? 3 : 0;
     auto* expected_cb = g.campaign_split_camera ? g.split_projection.Get() : g.cam_cb.Get();
     if (!f.camera.bytes || f.camera.size != camera_size || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(expected_cb)) ||
@@ -906,6 +908,45 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     expect(evaluations == before_mixed_ring + 22 && g_seen.last.camera.first_constant == 24576 / 16,
            "mixed VS/PS ring retains camera range after another range and discard overwrite");
     g.campaign_mixed_ring = false;
+    // Battlefield-style large dynamic buffer with a shader-visible range far
+    // beyond 64 KiB. Keep the prior small-ring assertions above unchanged.
+    if (automatic) {
+        camera_desc.ByteWidth = 1024 * 1024;
+        expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
+               "create large native camera upload ring");
+        g.camera_ring_offset = 53056 * 16;
+        g.camera_snapshot_size = 1280 + 2 * 2048;
+        const auto before_large = evaluations;
+        for (int i = 0; i < 12; ++i) {
+            g.camera_ring_offset = 53056 * 16 + (i % 2) * 256;
+            present_campaign();
+        }
+        expect(evaluations >= before_large + 9 &&
+               g_seen.last.camera.first_constant == g.camera_ring_offset / 16 &&
+               g_seen.last.camera.bytes_first_constant < g_seen.last.camera.first_constant &&
+               g_seen.last.camera.size == g.camera_snapshot_size,
+               "DLAA receives the current high-offset binding without copying the whole ring");
+        // A write to an unfamiliar part of the allocation must never pair
+        // with the old window. Once observed, the new range is captured.
+        const auto before_jump = evaluations;
+        g.camera_ring_offset += 128 * 1024;
+        present_campaign();
+        expect(evaluations == before_jump, "a disjoint large-buffer binding cannot reuse old camera bytes");
+        for (int i = 0; i < 8; ++i) present_campaign();
+        expect(evaluations >= before_jump + 6 &&
+               g_seen.last.camera.first_constant == g.camera_ring_offset / 16,
+               "large-buffer capture follows the newly observed binding");
+        camera_desc.ByteWidth = 32768;
+        expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
+               "restore the small camera upload ring");
+        g.camera_ring_offset = 24576;
+        g.camera_snapshot_size = 32768;
+        const auto before_restore = evaluations;
+        for (int i = 0; i < 4; ++i) present_campaign();
+        expect(evaluations >= before_restore + 2 && g_seen.last.camera.size == 32768 &&
+               g_seen.last.camera.bytes_first_constant == 0,
+               "the original small-buffer capture resumes after returning to a new buffer");
+    }
     na::settings::Get().j2_sharpness.store(60);
     na::settings::Get().j2_preset.store(11);
     present_campaign();

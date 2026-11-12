@@ -221,7 +221,8 @@ bool Subresource(ID3D11Texture2D* texture, const native11::TextureFacts& facts,
 camera::CameraFrame Pose(Session& s, const native11::SceneFrame& frame, UINT w, UINT h)
 {
     const auto& c = frame.camera;
-    const size_t start = size_t(c.first_constant) * 16;
+    if (c.first_constant < c.bytes_first_constant) return {};
+    const size_t start = size_t(c.first_constant - c.bytes_first_constant) * 16;
     if (!c.bytes || start >= c.size) return {};
     const size_t length = c.num_constants ? (std::min)(size_t(c.num_constants) * 16, c.size - start) : c.size - start;
     std::vector<uint8_t> bytes(c.bytes + start, c.bytes + start + length);
