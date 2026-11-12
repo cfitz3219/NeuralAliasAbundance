@@ -277,7 +277,7 @@ struct State {
     na::j2::ClassKey fired_class;
     uint64_t fired_producer = 0;
     uint64_t fired_context = 0;
-    uint32_t fired_mode = 0;                    // 1 class, 2 pair, 3 barrier, 4 boundary matcher, 5 between-list reader
+    uint32_t fired_mode = 0;                    // 1 class, 2 pair, 3 barrier, 4 boundary matcher, 5 between-list reader, 6 between-list entry, 7 after the known last scene list
     bool fired_barrier_event = false;           // the placement was judged at a barrier event
     // First scene write after this frame's DLAA (the late writer): pipeline, depth bound, where
     // (1 same list after our insertion, 2 a later list of the same batch, 3 a later batch).
@@ -3552,12 +3552,12 @@ void note_late_writer(ID3D12CommandList* list, uint64_t color, uint32_t skip_wri
 }
 void note_late_frame()
 {
-    static const char* const kMode[] = {"none", "class", "pair", "barrier", "boundary", "between"};
+    static const char* const kMode[] = {"none", "class", "pair", "barrier", "boundary", "between", "between_entry", "known_ending"};
     static const char* const kWhere[] = {"?", "same_list", "later_list", "later_batch"};
     char one[200];
     const bool have = g.late_frame == g.frame;
     std::snprintf(one, sizeof one, "%llu:%s%s/op=%u/prod=%llu/ctx=%llu->late{%s pso=%llu depth=%u writes=%u} ",
-        static_cast<unsigned long long>(GetTickCount64() / 100 % 100000000), kMode[g.fired_mode < 6 ? g.fired_mode : 0],
+        static_cast<unsigned long long>(GetTickCount64() / 100 % 100000000), kMode[g.fired_mode < 8 ? g.fired_mode : 0],
         g.fired_barrier_event ? "@barrier" : "", static_cast<unsigned>(g.fired_class.op),
         (unsigned long long)g.fired_producer, (unsigned long long)g.fired_context,
         have ? kWhere[g.late_where < 4 ? g.late_where : 0] : "?", have ? (unsigned long long)g.late_pso : 0ull,
@@ -6070,6 +6070,31 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 saved.injected = g_injected;
                 g.frame_handoff |= kHoSaved;
                 ft("S");
+                // The list that ended the scene in delivered frames (same boundary writer and
+                // occurrence) has just ended with the picture handed off and unread. Its reader may
+                // sit in a later list without a traceable read of the colour: Sniper Elite 5's menu
+                // merges its last two scene lists for 5 s every 40 s, and on every second such frame
+                // no list after it shows a read, so waiting for a reader left the frame without DLSS
+                // (run p5820: every missed trace ends "L74:WbeWbS L76: L78:", every delivered one
+                // "...S L76:c1R" or "...S L78:c1R"). DLSS goes directly after this list, the same
+                // point a traced reader in the next list gets.
+                const auto ending = na::observe::ListInsertionDecision(lists[i], color);
+                if (na::j2::FindBoundary(g.insertion_learned, g.delivered_shapes, g.delivered_shape_count, color, depth, ending)) {
+                    const bool placed = record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, i + 1);
+                    ft("%s", placed ? "H" : "h");
+                    if (placed) {
+                        ++g.stats.between_predicted;
+                        g.frame_handoff |= kHoRecorded;
+                        g.class_fired = false;
+                        g.fired_mode = 7;
+                        g.fired_barrier_event = false;
+                        g.fired_producer = saved.producer;
+                        g.fired_context = 0;
+                        g.submitted_boundary = {color, depth, ending}; // a later scene write withdraws this remembered ending
+                        saved = {};
+                        return static_cast<int>(i + 1);
+                    }
+                }
             }
         }
     }
