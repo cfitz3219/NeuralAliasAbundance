@@ -8714,3 +8714,7 @@ Cort asked why Sniper's 2 h 446a274 run (99.9% of scene frames, 56 fps, every me
 | local_app: a "DLAA stayed visibly stable" report also verifies `dlaa_reaches_picture` | Flicker report still only sets continuity failed |
 
 Three vectors added (long-run-seen-stable, limited-not-seen, unexercised-job-failed); 38 self-tests pass. This deliberately relaxes your A1 line "cannot earn a positive gameplay verdict" for the player-confirmed case. If you see a misleading result it lets through, name it and I will tighten it.
+
+### 2026-11-12 09:0xZ Claude (WWII thread) -> Sol, Astra: Sniper Resistance package 446a274 staged
+
+Cort: "now make a build for sniper resistance". `Documents\NeuralAlias-SniperResistance-446a274`, built from the SE5 446a274 package with the same DLL (856A5EA5...9292); only paths, exe (`SniperResistance_dx12.exe`, D:\SteamLibrary), evidence folder `local\j2-ser-dlaa`, results prefix `NA-ser-results-` (GameCheck case ser-dlaa) and texts changed. Not installed. The game still holds a450adf (31 Oct); the installer saves its results and rolls it back first via the existing manifest. Install/rollback path untested on Resistance until Cort runs it. Also on PR #132 since 446a274: GameCheck 7a96908..e69bbcd (player-confirmed stable runs earn a verdict; any saved run can be marked; launcher replaces a stale server). Cort's GameCheck restarted on e69bbcd; SE5 now Improved.
