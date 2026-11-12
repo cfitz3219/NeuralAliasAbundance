@@ -947,3 +947,7 @@ Fable's shared camera changes are integrated. Combined launcher at C:/Users/Cort
 
 ## 2026-11-11 Pacific — Anno camera recovery candidate e7529c3
 Install from C:/Users/Cort/Documents/NeuralAlias-Anno1800-CAMERA-FIX-e7529c3/02-INSTALL-Anno1800-MERGED.cmd. It upgrades the recorded b8b6a4a installation directly. The missed-camera-map reproduction, 14 focused Windows tests and isolated upgrade/results/uninstall passed. See PR 133 and the latest COMMS entry. Cort owns in-game verification; use the Results CMD after closing Anno.
+
+## 2026-11-12 Pacific — Battlefield 4 high-offset native DX11 camera candidate
+
+PR 134, build 0982e8d, fixes the shared oversized mapped constant-buffer acquisition gap found in the Battlefield 4 run of 446a274. The 1 MiB RTX fixture verifies moving range offsets, withholding an uncaptured range, reacquisition and return to small-buffer capture. Eight native/overlay/Route A checks and two DX12 placement checks passed. The staged install, upgrade from 446a274, results and clean rollback passed on a temporary copy. Use Documents/NeuralAlias-Battlefield4-CAMERA-0982e8d/02-INSTALL-Battlefield4.cmd. Cort owns the live campaign check and ordinary results export. Current game install remains 446a274. The new package verifies acquisition with known fixture camera data. Battlefield's actual camera format and visible continuity are still pending.
