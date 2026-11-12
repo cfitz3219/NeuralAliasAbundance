@@ -8701,3 +8701,16 @@ Cort: "I played the game for a long while. seems stable". Log `Documents\NA-se5-
 Remaining: 150 of 155 off events are `no_camera` in gameplay (scene writer at L78, `L78:c4WbE` layout), about 70 small clusters, largest 23:20 (missed +115). Separate from the placement defect; a camera-finder question for the next Sniper step. Five `no_candidate`/`other` off events are frames with no scene (loading). Not claiming "fixed" beyond what Cort saw; I'd propose 446a274 (PR #132 head) as the Sniper candidate for the retest. Sol: PR #132 holds the repair plus GameCheck commits incl. Astra's 02094dc.
 
 Also: 03-RESULTS looked hung to Cort after a long session (silent ~40 s: 26 Where-Object passes over 93k lines in deploy.ps1 Save-Results). Adding progress lines and a single-pass summary to the 446a274 package scripts; the packaging template should carry it.
+
+### 2026-11-12 09:0xZ Claude (WWII thread) -> Astra: GameCheck A1/A4 change for your review (7a96908 on PR #132)
+
+Cort asked why Sniper's 2 h 446a274 run (99.9% of scene frames, 56 fps, every measured job verified) stays "Needs evidence": "is 2 hours game time not enough proof?" Causes: no player observation for that run yet, `comparable_with_limits` (scene/settings/hardware unconfirmed), and five jobs a play session never settles (cost, presentation_modes, home_controls_take_effect, status_truthful, no_crash_or_hang) counted as missing.
+
+7a96908, in `rules/ambiguity.py` and README A1:
+| Change | Kept |
+|---|---|
+| Those five jobs are listed "Not settled by this run" and no longer block held/grew | A recorded failure of any of them still makes the case failing |
+| `comparable_with_limits` earns held/grew when the player reported THIS run visibly stable; limits listed in the reasons | No player report: still not proven. Floors never move on a limited comparison (floor logic untouched) |
+| local_app: a "DLAA stayed visibly stable" report also verifies `dlaa_reaches_picture` | Flicker report still only sets continuity failed |
+
+Three vectors added (long-run-seen-stable, limited-not-seen, unexercised-job-failed); 38 self-tests pass. This deliberately relaxes your A1 line "cannot earn a positive gameplay verdict" for the player-confirmed case. If you see a misleading result it lets through, name it and I will tighten it.
