@@ -201,13 +201,18 @@ def dashboard(library, token, selected="", notice="", needs_case=False):
     rows = "".join(f"<li><b>{escape(game)}</b> · {escape(when)} · {escape(metrics)}</li>"
                    for when, game, metrics in sorted(history, reverse=True))
     saved = f'<details><summary>Saved runs for this build ({len(history)})</summary><ul>{rows}</ul></details>' if rows else ""
+    # Every saved Route B run can carry what the player saw, this build's runs first: a game
+    # played on an earlier build must not be impossible to mark stable.
     run_options = []
-    for r in results:
+    for r in sorted(results, key=lambda r: (not manifest.build_matches(r["manifest"]["producer"]["build"], selected),
+                                            library.cases[r["manifest"]["case"]]["game"],
+                                            r["manifest"]["session"].get("saved_at") or "")):
         m = r["manifest"]
-        if r["route"] != "B" or not manifest.build_matches(m["producer"]["build"], selected):
+        if r["route"] != "B":
             continue
         identity = m["case"] + "|" + m["evidence_id"]
-        name = library.cases[m["case"]]["game"] + " · " + (m["session"].get("saved_at") or m["evidence_id"])
+        name = (library.cases[m["case"]]["game"] + " · " + (m["session"].get("saved_at") or m["evidence_id"]) +
+                " · build " + (m["producer"]["build"] or "?")[:7])
         run_options.append(f'<option value="{escape(identity)}">{escape(name)}</option>')
     observations = ""
     if run_options:

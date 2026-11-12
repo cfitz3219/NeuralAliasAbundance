@@ -302,7 +302,11 @@ def _overview(comparison, cases, results, by_id):
             earlier = sorted((r for r in results if r["manifest"]["case"] == cid and r["status"] == "scored"),
                              key=lambda r: r["manifest"]["session"]["saved_at"] or "")
             result = earlier[-1] if earlier else None
-            if result:
+            seen = ((result or {}).get("jobs") or {}).get("continuity", {}) if result else {}
+            if result and seen.get("source") == "owner_verdict" and seen.get("state") == "verified":
+                said = (f'You saw it stable on build {short(result["manifest"]["producer"]["build"])}. '
+                        f'It has not been played on {short(comparison["build"])} yet, so this build is unconfirmed for it.')
+            elif result:
                 said = (f'Not run on {short(comparison["build"])} yet. The numbers are from the last scored run, build '
                         f'{short(result["manifest"]["producer"]["build"])}.')
             else:
