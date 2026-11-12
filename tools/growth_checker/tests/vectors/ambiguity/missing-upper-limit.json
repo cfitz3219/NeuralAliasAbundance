@@ -1,0 +1,12 @@
+{
+  "about": "Unknown does not pass a maximum.",
+  "call": "case_verdict",
+  "args": [
+    {"verdict": "comparable", "limits": [], "reasons": [], "tolerance": {}},
+    {"longest_gap_seconds": {"against_floor": "unknown"}},
+    {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+    {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+    []
+  ],
+  "expect": {"answer": "not proven", "because": ["No comparable measurement for the longest_gap_seconds floor."]}
+}

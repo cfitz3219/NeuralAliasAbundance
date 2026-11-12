@@ -1,0 +1,33 @@
+{
+  "schema": "growth.floor/1",
+  "case": "wwii-campaign-dlaa",
+  "floor": {
+    "delivered_share_of_scene": {
+      "kind": "min",
+      "value": 96.0
+    },
+    "fps_median_while_delivering": {
+      "kind": "min",
+      "value": 90.0
+    },
+    "frames_scene": {
+      "kind": "min",
+      "value": 5000
+    },
+    "longest_gap_seconds": {
+      "kind": "max",
+      "value": 8.0
+    },
+    "longest_gap_window_seconds": {
+      "kind": "max",
+      "value": 20
+    }
+  },
+  "set_by": {
+    "evidence_id": "fc0e6bdd-8b5d9bee2da8",
+    "build": "fc0e6bdd1bdc7f5e58027b2dd5dc2a9c9f3a6024",
+    "decided": "Carried over on 2026-11-11 from tests/replay/expected/wwii-native11-fc0e6bd.json with the new measurement names. It is the floor of that five-minute run, not a pass mark: Cort has not accepted a long session yet."
+  },
+  "proposal": null,
+  "history": []
+}

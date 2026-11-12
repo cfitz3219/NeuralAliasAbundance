@@ -144,6 +144,18 @@ struct ColorEvent {
     uint64_t producer = 0;     // consumer/barrier: pipeline of the preceding write in this recording
     bool list_start = false;   // first event of a recording (frame sequences span several lists)
 };
+// What one later list of a submission says about a scene ending placed before it:
+//  +1 the scene continues (a draw into the colour before the picture is copied onward),
+//  -1 the picture is copied onward here (anything later reuses the texture; stop looking),
+//   0 neither (empty, readers only, clears): keep looking in the next list.
+// The same meaning of "continues" as LabelFrame.
+inline int SceneTailVerdict(const std::vector<ColorEvent>& events) {
+    for (const auto& e : events) {
+        if (!e.write && e.op == Op::CopyRead) return -1;
+        if (e.write && e.op == Op::DrawWrite) return 1;
+    }
+    return 0;
+}
 class InsertionTrace {
 public:
     void Reset() { events_.clear(); complete_ = true; }

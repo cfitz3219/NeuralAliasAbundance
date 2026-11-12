@@ -1,0 +1,12 @@
+{
+  "about": "A previously verified job regressed.",
+  "call": "case_verdict",
+  "args": [
+    {"verdict": "comparable", "limits": [], "reasons": [], "tolerance": {}},
+    {},
+    {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+    {"dlaa_reaches_picture": {"state": "failed"}},
+    []
+  ],
+  "expect": {"answer": "receded", "because": ["dlaa_reaches_picture was verified and now fails."]}
+}

@@ -1,0 +1,19 @@
+{
+  "about": "A conditional FPS warning does not cancel a measured coverage gain.",
+  "call": "case_verdict",
+  "args": [
+    {"verdict": "comparable", "tolerance": {"delivered_share_of_presented": {"absolute": 1}}},
+    {"delivered_share_of_presented": {"baseline": 94, "change": 3, "against_floor": "holds"}},
+    {"dlaa_reaches_picture": {"state": "verified"}},
+    {"dlaa_reaches_picture": {"state": "verified"}},
+    [
+      {
+        "guard": "conditional_fps",
+        "severity": "warns",
+        "message": "Report whole-play FPS separately.",
+        "fields": []
+      }
+    ]
+  ],
+  "expect": {"answer": "grew", "because": ["delivered_share_of_presented improved beyond normal variation."]}
+}

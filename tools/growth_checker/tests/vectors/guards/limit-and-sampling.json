@@ -1,0 +1,69 @@
+{
+  "about": "Reset, omitted low-delivery time, missing maximum and sampled gap stay explicit.",
+  "call": "check",
+  "args": [
+    null,
+    {
+      "status": "scored",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "manifest": {
+        "case": "sample",
+        "evidence_type": "live_run",
+        "evidence_id": "abcdef12-bbbbbbbbbbbb",
+        "files": [{"role": "status", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+        "producer": {"build": "abcdef12", "build_source": "status_header"}
+      },
+      "sessions": [{"samples": 4}, {"samples": 7}],
+      "observed": {
+        "mode": {"last": "DLAA", "distinct": ["DLAA"]},
+        "scene_id": "harbor",
+        "test_environment": "pc1",
+        "play_intervals": true
+      },
+      "measurements": {
+        "fps_median_while_delivering": {"state": "measured", "value": 80, "basis": "derived"},
+        "not_delivering_share_of_play": {"state": "measured", "value": 30, "basis": "derived"},
+        "longest_gap_window_seconds": {"state": "measured", "value": 3, "basis": "sampled"}
+      }
+    },
+    {
+      "id": "sample",
+      "game": "One",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "engine": {"name": "One Engine", "source": "declared"},
+      "scene": {"id": "harbor"},
+      "settings": {"mode": "DLAA"},
+      "budget": {"longest_gap_seconds_max": 4}
+    }
+  ],
+  "expect": [
+    {
+      "guard": "counter_reset",
+      "severity": "warns",
+      "message": "The log contains counter resets. Only measurements within each session were counted.",
+      "fields": ["frames_presented", "frames_scene", "frames_delivered"]
+    },
+    {
+      "guard": "conditional_fps",
+      "severity": "warns",
+      "message": "FPS while delivering excludes low-delivery intervals. Use the whole-play measurement for performance.",
+      "fields": ["fps_median_while_delivering", "fps_play_median", "not_delivering_share_of_play"]
+    },
+    {
+      "guard": "missing_budget_measure",
+      "severity": "warns",
+      "message": "The run did not measure longest_gap_seconds needed for its budget.",
+      "fields": ["longest_gap_seconds"]
+    },
+    {
+      "guard": "sampled_gap",
+      "severity": "warns",
+      "message": "The reported gap is an estimate over sampled opportunities.",
+      "fields": ["longest_gap_window_seconds"]
+    }
+  ]
+}

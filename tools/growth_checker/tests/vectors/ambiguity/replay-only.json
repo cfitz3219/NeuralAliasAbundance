@@ -1,0 +1,6 @@
+{
+  "about": "A successful replay leaves live verification open.",
+  "call": "job_state",
+  "args": [[{"state": "verified", "evidence_type": "replay", "build": "abcdef12"}]],
+  "expect": {"state": "untested", "because": "The replay result was verified. Gameplay verification is still open."}
+}

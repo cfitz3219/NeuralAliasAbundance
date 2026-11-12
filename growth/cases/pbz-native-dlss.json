@@ -1,0 +1,25 @@
+{
+  "schema": "growth.case/1",
+  "id": "pbz-native-dlss",
+  "game": "Phantom Blade Zero",
+  "profile": "pbz",
+  "route": "A",
+  "api": "dx12",
+  "provider": "route_a",
+  "engine": {
+    "name": "Unreal Engine",
+    "source": "declared from public knowledge; the program does not observe it"
+  },
+  "settings": {
+    "mode": "the game's own DLSS"
+  },
+  "scene": {
+    "id": null,
+    "description": "Not fixed yet. The standard scene (one save, about three minutes: still, turning, moving, with DLAA off for about 20 seconds) is chosen with Cort."
+  },
+  "budget": {
+    "fps_min": 40,
+    "set_by": "Cort, 2026-11-09: at least 40 to 50 fps with the program on. Only Cort changes a case's budget."
+  },
+  "status": "retest case for Baseline 1 (candidate b8b6a4a)"
+}

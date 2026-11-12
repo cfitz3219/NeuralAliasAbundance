@@ -1,0 +1,17 @@
+{
+  "about": "A qualified gain beyond tolerance earns credit.",
+  "call": "case_verdict",
+  "args": [
+    {
+      "verdict": "comparable",
+      "limits": [],
+      "reasons": [],
+      "tolerance": {"fps_play_median": {"absolute": 1, "relative_percent": 3}}
+    },
+    {"fps_play_median": {"baseline": 50, "change": 6, "against_floor": "holds"}},
+    {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+    {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+    []
+  ],
+  "expect": {"answer": "grew", "because": ["fps_play_median improved beyond normal variation."]}
+}

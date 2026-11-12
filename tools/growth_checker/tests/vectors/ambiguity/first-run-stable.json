@@ -1,0 +1,30 @@
+{
+  "about": "A game's first run that is stable by Cort's report or 90% rule holds.",
+  "call": "case_verdict",
+  "args": [
+    {
+      "verdict": "no_baseline",
+      "limits": [],
+      "reasons": [
+        "This case has no earlier result to compare with."
+      ],
+      "tolerance": {}
+    },
+    {},
+    {},
+    {
+      "continuity": {
+        "state": "verified",
+        "source": "owner_verdict",
+        "note": "Cort's rule: 99.6% of game frames had DLAA (90% or more counts as stable)."
+      }
+    },
+    []
+  ],
+  "expect": {
+    "answer": "held",
+    "because": [
+      "First run of this game, stable: Cort's rule: 99.6% of game frames had DLAA (90% or more counts as stable)."
+    ]
+  }
+}
