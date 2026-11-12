@@ -21,6 +21,7 @@ import compare
 import ingest
 import manifest
 import report
+import scoring
 import store
 from rules._evidence import number, status_hash
 
@@ -104,6 +105,8 @@ class Library:
         }.values())
         for result in records:
             path = self.observation_path(result)
+            # Runs scored before Cort's 90% rule get it here; a report he recorded still wins below.
+            scoring.apply_stable_rule(result.get("route"), result.get("jobs") or {}, number(result, "delivered_share_of_scene"))
             if path.is_file():
                 observation = store.load(path)[-1]
                 result["jobs"]["continuity"] = {

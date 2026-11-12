@@ -40,6 +40,12 @@ On such a player-confirmed limited comparison a lower fps or longer frame time
 than the baseline is a caveat, not a loss (scenes differ); the fps budget job
 still judges speed.
 
+**Cort's stable rule (2026-11-12):** "if it's 90% or above with DLAA frames it's
+stable." A Route B run with at least 90% of its game (scene) frames given DLAA
+counts as seen stable (continuity and DLAA-on-picture verified), as if Cort had
+recorded it. A report he records on that run replaces it, so a run he saw
+flicker stays failed.
+
 ## A2. Flag misleading results
 
 | Guard | Trigger and effect |

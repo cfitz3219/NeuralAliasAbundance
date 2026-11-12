@@ -36,6 +36,24 @@ JOB_TITLES = {j[0]: j[1] for j in JOBS}
 SETTINGS = ("preset", "sharpness")
 NEEDS_OWNER = {"dlaa_reaches_picture", "home_controls_take_effect"}
 
+# Cort's standing rule (2026-11-12): "if it's 90% or above with DLAA frames it's stable."
+# A Route B run with at least this share of its game (scene) frames given DLAA counts as seen
+# stable, exactly as if he had recorded it. A report he does record on the run replaces it.
+STABLE_SHARE = 90.0
+STABLE_RULE_NOTE = "Cort's rule: {share:.1f}% of game frames had DLAA (90% or more counts as stable)."
+
+
+def apply_stable_rule(route, jobs, share):
+    """Mark continuity and DLAA-on-picture verified under Cort's 90% rule. -> True if applied."""
+    if route != "B" or share is None or share < STABLE_SHARE:
+        return False
+    note = STABLE_RULE_NOTE.format(share=share)
+    for job in ("continuity", "dlaa_reaches_picture"):
+        if job in jobs:
+            jobs[job] = {"state": "verified", "note": note, "evidence": ["delivered_share_of_scene"],
+                         "source": "owner_verdict", "rule": "stable_share_90"}
+    return True
+
 
 def required_jobs(route):
     return [j[0] for j in JOBS if route in j[2]]
@@ -166,6 +184,7 @@ def score(route, m, observed, case=None, owner_verdicts=None):
                                       ["longest_gap_seconds", "not_delivering_share_of_play"])
         jobs["cost"] = _job("unknown", "The run has no interval with the program switched off to compare against.")
 
+    apply_stable_rule(route, jobs, v("delivered_share_of_scene"))
     for verdict in owner_verdicts or []:
         job = verdict.get("job")
         if job in jobs and verdict.get("state") in STATES:
