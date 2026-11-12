@@ -51,6 +51,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <cstdarg>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -298,6 +299,9 @@ struct State {
     // recorded it before the previous Present: that frame gets no inline DLSS (diagnostic only).
     struct RefusedReader { const void* list = nullptr; uint64_t rec = 0, frame = 0; bool by_submitted = false; };
     RefusedReader refused_readers[4];
+    // The frame's placement story in submission/recording order (diagnostic only, see ft()).
+    char frame_trace[1200] = {};
+    uint32_t frame_trace_used = 0;
     uint32_t refused_next = 0;
     uint64_t dlss_tried_frame = ~0ull; // one early start attempt per frame
     bool inline_sample_locked = false; // NGX recorded: no new raster sample may start this frame
@@ -410,6 +414,23 @@ struct State {
 // Never destroyed: at process exit the observation hooks' own state may already
 // be gone, and releasing D3D12 objects then would call into them.
 State& g = *new State;
+// Append to the frame's placement trace (diagnostic only). Dropped silently when full.
+// Recording side (inline): " i<list>:<A accepted|M mid-scene|L learning|U unknown><context>" then
+// "+REC" when DLSS was recorded there, ":own<s|i>" frame number already had DLSS, ":notread".
+// Submission side (hand-off): " |" starts a submitted batch, "x<I|O|q|d|s|m>" hand-off not tried
+// (inline pending, frame owned, other queue, DLSS not ready, no selection, route mode), "T" a saved
+// scene from an earlier frame number was dropped, " L<list>:" then per event W write(s), e/E entry
+// not accepted/accepted, c<v> consumer with its class verdict number, b other, X no trace,
+// S scene saved at the list's end, R DLSS recorded before this reader, F record failed.
+void ft(const char* fmt, ...)
+{
+    if (g.frame_trace_used >= sizeof g.frame_trace - 1) return;
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = std::vsnprintf(g.frame_trace + g.frame_trace_used, sizeof g.frame_trace - g.frame_trace_used, fmt, ap);
+    va_end(ap);
+    if (n > 0) g.frame_trace_used = (std::min)(g.frame_trace_used + static_cast<uint32_t>(n), static_cast<uint32_t>(sizeof g.frame_trace - 1));
+}
 // Projection window, read by the scissor hook on game recording threads (no g.m there).
 std::atomic<bool> g_window_enabled{false};
 std::atomic<bool> g_render_small{false};
@@ -4713,10 +4734,11 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     na::observe::ListCurrentTargets(l, &cur_rt, &cur_ds);
     const bool reading = compute || cur_rt != color_id ||
                          (na::observe::ListLastStateSub(l, color_id, csub, &cst) && !(cst & D3D12_RESOURCE_STATE_RENDER_TARGET));
-    if (!reading) return;
+    if (!reading) { if (entry) ft(" i%llu:notread", (unsigned long long)na::observe::IdOf(l)); return; }
     ++g.stats.inline_candidates;
     if (g.inl_frame == g.frame || g.submitted_frame == g.frame) { // either placement path already owns this frame
         if (entry && g.submitted_frame == g.frame) ++g.frame_owned_entries; // recorded after that DLSS reached the queue
+        if (entry) ft(" i%llu:own%c", (unsigned long long)na::observe::IdOf(l), g.submitted_frame == g.frame ? 's' : 'i');
         bool known = false;
         for (const auto& r : g.refused_readers) known = known || (r.list == l && r.rec == rec);
         if (!known) g.refused_readers[g.refused_next++ % 4] = {l, rec, g.frame, g.submitted_frame == g.frame};
@@ -4739,6 +4761,8 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     if(entry) {
         using V=na::j2::PostEntryProfile::Verdict;
         const auto verdict=g.entries.Judge(*entry);
+        ft(" i%llu:%c%u", (unsigned long long)na::observe::IdOf(l),
+           verdict==V::Accepted?'A':verdict==V::Middle?'M':verdict==V::Learning?'L':'U', unsigned(entry->context));
         if(verdict==V::Accepted){by_class=true;matched_mode=kByEntry;if(g.entries.AcceptedByContext(*entry))++g.stats.entry_ctx_matched;}
         else {
             const char* why=verdict==V::Unknown?"new_or_unidentified":verdict==V::Learning?"learning":"seen_mid_scene";
@@ -4935,6 +4959,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     g.inl.valid = true;
     g.inl_frame = g.frame;
     ++g.stats.inline_recorded;
+    ft("+REC");
     if(matched_mode==kByEntry)++g.stats.entry_matched;
     else if (matched_mode == kByClass) ++g.stats.class_matched;
     else if (matched_mode == kByPair) ++g.stats.class_pair_matched;
@@ -5939,7 +5964,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
 {
     auto& saved = g.waiting_scene;
     if (saved.frame != g.frame || saved.color != color || saved.depth != depth) {
-        if (saved.color && saved.frame != g.frame) g.frame_handoff |= kHoStaleScene;
+        if (saved.color && saved.frame != g.frame) { g.frame_handoff |= kHoStaleScene; ft("T"); }
         saved = {};
     }
     // The first list of this submission that reads the finished image (any entry after the
@@ -5951,16 +5976,22 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
     for (UINT i = 0; i < count; ++i) {
         if (!lists[i]) continue;
         std::vector<na::j2::ColorEvent> events;
+        ft(" L%llu:", (unsigned long long)na::observe::IdOf(lists[i]));
         if (!na::observe::ListColorEvents(lists[i], color, events)) {
+            ft("X");
             if (saved.frame == g.frame) g.frame_handoff |= kHoUntraced;
             saved = {}; first_read = -1; continue;
         }
         bool writes = false, consumed = false;
         const na::j2::InsertionEvent* tail_unlearned = nullptr; // diagnostic: last unaccepted entry since the final write
         uint64_t producer = 0;
+        bool traced_write = false;
         for (const auto& e : events) {
-            if (e.write) { writes = true; consumed = false; producer = e.producer; tail_unlearned = nullptr; continue; }
+            if (e.write) { if (!traced_write) ft("W"); traced_write = true; writes = true; consumed = false; producer = e.producer; tail_unlearned = nullptr; continue; }
+            traced_write = false;
             const bool entry = na::j2::IsEntry(e.op);
+            if (entry) ft("%s", g.entries.Accepts(e.raw) ? "E" : "e");
+            else if (!na::j2::IsConsumer(e.op)) ft("b");
             if (entry && !writes && !consumed && saved.frame == g.frame && first_read < 0) first_read = static_cast<int>(i);
             if (entry && !consumed && !g.entries.Accepts(e.raw)) {
                 if (writes) { if (!tail_unlearned) tail_unlearned = &e.raw; }
@@ -5983,6 +6014,8 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 }
                 g.frame_handoff |= recorded ? kHoRecorded : (entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer)
                                                               ? kHoRecordFailed : kHoReaderUnjudged;
+                if (!entry) ft("c%u", unsigned(verdict));
+                ft("%s", recorded ? "R" : (entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer) ? "F" : "");
                 if (!recorded && !entry && verdict != V::Accepted && verdict != V::AcceptedWithProducer) {
                     // The reader that had the finished scene and was turned down: its class verdict and the tallies behind it.
                     uint32_t t[4];
@@ -6009,7 +6042,10 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                     return static_cast<int>(at);
                 }
             }
-            else if (!consumed) g.frame_handoff |= writes ? kHoReaderInWriter : kHoReaderNoScene;
+            else {
+                if (!entry) ft("%s", writes ? "cw" : consumed ? "cc" : "cn");
+                if (!consumed) g.frame_handoff |= writes ? kHoReaderInWriter : kHoReaderNoScene;
+            }
             consumed = true;
             saved = {}; // never insert later after a consumer already carried the image onward
             first_read = -1;
@@ -6033,6 +6069,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 saved.jitter[1] = g_injected ? g.jit.px[1] : 0;
                 saved.injected = g_injected;
                 g.frame_handoff |= kHoSaved;
+                ft("S");
             }
         }
     }
@@ -7844,14 +7881,14 @@ void OnPresent(ID3D12CommandQueue* queue)
                     char handoff[512];
                     na::eventlog::Emit("dlss", "delivered=%u why=%s inline=%u rejects=%u reject=\"%s\" later_scene_write=%u "
                                        "shape{writer=%llu occ=%u tr=%u cand=%u writes=%u dst=%llu} prev_shape{writer=%llu occ=%u tr=%u cand=%u} remembered=%d "
-                                       "handoff=%s handoff_reader=\"%s\" inline_recorded=%u entries_after_dlss{this=%u prev=%u}",
+                                       "handoff=%s handoff_reader=\"%s\" inline_recorded=%u entries_after_dlss{this=%u prev=%u} lists=\"%s\" trace=\"%s\"",
                                        o.executed ? 1u : 0u, why, g.inline_mode ? 1u : 0u, unsigned(g.frame_rejects),
                                        g.frame_reject_text, o.later_scene_write ? 1u : 0u,
                                        (unsigned long long)fs.boundary_writer, fs.writer_occurrence, fs.final_transition, fs.final_candidate, fs.writes,
                                        (unsigned long long)fs.destination, (unsigned long long)ls.boundary_writer, ls.writer_occurrence,
                                        ls.final_transition, ls.final_candidate, g.delivered_shape_count,
                                        handoff_words(g.frame_handoff, handoff, sizeof handoff), g.handoff_reader, g.inl_frame == g.frame ? 1u : 0u,
-                                       unsigned(g.frame_owned_entries), unsigned(g.prev_owned_entries));
+                                       unsigned(g.frame_owned_entries), unsigned(g.prev_owned_entries), g.insertion_trace, g.frame_trace);
                 }
             }
             {
@@ -8038,6 +8075,8 @@ void OnPresent(ID3D12CommandQueue* queue)
         g.frame_owned_entries = 0;
         g.frame_handoff = 0;
         g.handoff_reader[0] = 0;
+        g.frame_trace[0] = 0;
+        g.frame_trace_used = 0;
         if (g.scene_batches_cur) {
             g.batch_hist[g.batch_hist_n++ % 16] = static_cast<uint8_t>(g.scene_batches_cur > 255 ? 255 : g.scene_batches_cur);
             uint32_t votes[256] = {};
@@ -8232,12 +8271,17 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         ID3D12GraphicsCommandList* ours = nullptr;
         PendingHistory pending;
         int before=record_deferred_native(queue,lists,count,&ours,pending);
+        ft(" |");
         if (before<0 && !g_native_reduced.load(std::memory_order_relaxed) && !g.inl.valid &&
             g.submitted_frame != g.frame && g.queue.Get() == queue && g.dlss_ready &&
             selected_color && selected_depth && g.router.Mode() == na::j2::RouteMode::Auto)
             before=record_between_consumer(lists,count,selected_color,selected_depth,&ours,pending);
         else if (before<0 && !g_native_reduced.load(std::memory_order_relaxed))
+        {
             g.frame_handoff |= g.inl.valid ? kHoBlockedInline : g.submitted_frame == g.frame ? kHoBlockedOwned : kHoBlockedOther;
+            ft("x%c", g.inl.valid ? 'I' : g.submitted_frame == g.frame ? 'O' : g.queue.Get() != queue ? 'q' : !g.dlss_ready ? 'd'
+                          : !(selected_color && selected_depth) ? 's' : 'm');
+        }
         if (before >= 0) {
                 std::vector<ID3D12CommandList*> batch(lists, lists + count);
                 batch.insert(batch.begin() + before, ours);
@@ -8535,6 +8579,8 @@ void Shutdown()
     g.frame_reject_text[0] = 0;
     g.frame_handoff = 0;
     g.handoff_reader[0] = 0;
+    g.frame_trace[0] = 0;
+    g.frame_trace_used = 0;
     g.frame_owned_entries = 0;
     g.prev_owned_entries = 0;
     for (auto& r : g.refused_readers) r = {};
