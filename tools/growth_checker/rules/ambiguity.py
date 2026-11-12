@@ -45,6 +45,9 @@ DIRECTIONS = {
 NOT_SETTLED_BY_PLAY = ("cost", "presentation_modes", "home_controls_take_effect", "status_truthful", "no_crash_or_hang")
 
 
+SPEED = ("fps_play_median", "frame_ms_play_median")
+
+
 def _owner_saw_stable(jobs):
     job = (jobs or {}).get("continuity", {})
     return job.get("source") == "owner_verdict" and job.get("state") == "verified"
@@ -108,7 +111,12 @@ def case_verdict(comparison, measure_changes, jobs_before, jobs_after, guards):
         if direction * change > margin:
             gains.append(f"{name} improved beyond normal variation.")
         elif direction * change < -margin:
-            losses.append(f"{name} worsened beyond normal variation.")
+            if limited_but_seen and name in SPEED:
+                # Different scenes run at different speeds: a menu-only baseline against hours of
+                # missions is not a slowdown. The fps budget job still judges speed on its own.
+                caveats.append(f"{name} is lower than the baseline run, whose scene is not confirmed alike.")
+            else:
+                losses.append(f"{name} worsened beyond normal variation.")
     if losses:
         return answer("not proven", losses + gains)
     if gains:

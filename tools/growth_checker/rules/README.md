@@ -36,6 +36,9 @@ controls changed mid-run, status cross-check, clean-exit record) are listed as
 "not settled by this run" and do not hold back a held or improved verdict. A
 recorded failure of one still makes the case failing. Cort, 2026-11-12: a
 two-hour run he saw stable must not stay amber for checks it never covered.
+On such a player-confirmed limited comparison a lower fps or longer frame time
+than the baseline is a caveat, not a loss (scenes differ); the fps budget job
+still judges speed.
 
 ## A2. Flag misleading results
 

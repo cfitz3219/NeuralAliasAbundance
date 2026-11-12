@@ -1,5 +1,5 @@
 {
-  "about": "A limited comparison earns a verdict when the player saw this run stay stable; unexercised jobs are listed, not blocking.",
+  "about": "A limited comparison earns a verdict when the player saw this run stay stable; a slower scene is a caveat, unexercised jobs are listed, not blocking.",
   "call": "case_verdict",
   "args": [
     {
@@ -17,8 +17,13 @@
     },
     {
       "fps_play_median": {
-        "baseline": 55,
-        "change": 0.5,
+        "baseline": 75.4,
+        "change": -19.7,
+        "against_floor": "holds"
+      },
+      "delivered_share_of_scene": {
+        "baseline": 95.0,
+        "change": 4.9,
         "against_floor": "holds"
       }
     },
@@ -60,7 +65,9 @@
     "because": [
       "continuity is now verified.",
       "dlaa_reaches_picture is now verified.",
+      "delivered_share_of_scene improved beyond normal variation.",
       "The same gameplay scene is not confirmed in both runs.",
+      "fps_play_median is lower than the baseline run, whose scene is not confirmed alike.",
       "Not settled by this run: cost.",
       "Not settled by this run: presentation_modes."
     ]
