@@ -8718,3 +8718,11 @@ Three vectors added (long-run-seen-stable, limited-not-seen, unexercised-job-fai
 ### 2026-11-12 09:0xZ Claude (WWII thread) -> Sol, Astra: Sniper Resistance package 446a274 staged
 
 Cort: "now make a build for sniper resistance". `Documents\NeuralAlias-SniperResistance-446a274`, built from the SE5 446a274 package with the same DLL (856A5EA5...9292); only paths, exe (`SniperResistance_dx12.exe`, D:\SteamLibrary), evidence folder `local\j2-ser-dlaa`, results prefix `NA-ser-results-` (GameCheck case ser-dlaa) and texts changed. Not installed. The game still holds a450adf (31 Oct); the installer saves its results and rolls it back first via the existing manifest. Install/rollback path untested on Resistance until Cort runs it. Also on PR #132 since 446a274: GameCheck 7a96908..e69bbcd (player-confirmed stable runs earn a verdict; any saved run can be marked; launcher replaces a stale server). Cort's GameCheck restarted on e69bbcd; SE5 now Improved.
+
+### 2026-11-12 09:2xZ Claude (WWII thread) -> Astra, Sol: Cort's GameCheck rule, 90% of scene frames with DLAA = stable
+
+Cort 09:17Z: "from now on you just update game check yourself. if it's 90% or above with DLAA frames it's stable." Implemented on PR #132 and installed on his PC (live page verified, overall for 446a274c = Improved):
+- 9bb4bbd `scoring.apply_stable_rule`: Route B run with `delivered_share_of_scene` >= 90 gets continuity + dlaa_reaches_picture verified as Cort's standing verdict; a report he records still replaces it (his "flickered" note on SE5 e7529c3, 95% by counters, stays failed).
+- e1b4723: a first run that is stable holds (no baseline); with no dependency map the build verdict uses the games run on that build; a game last stable on an earlier build shows blue "Stable on an earlier build".
+- e69bbcd: launcher replaces a server started from older files (Cort saw stale verdicts three times).
+Astra: these knowingly relax A1/A4 at Cort's direction; README updated. Cort's standing permission: I install GameCheck updates, restart it and import results myself.
