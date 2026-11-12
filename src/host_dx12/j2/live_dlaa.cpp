@@ -308,6 +308,7 @@ struct State {
     bool inline_camera_submitted = false; // an earlier depth/camera batch may already be executing
     using LearnedInsertion = na::j2::LearnedInsertion;
     LearnedInsertion insertion_frame, insertion_learned, submitted_boundary;
+    bool learned_delivered = false; // insertion_learned comes from a frame that got DLSS
     // Scene-end shapes of recent frames that DID get DLAA (SE5 p31032, 2026-11-06: the game
     // alternates between two frame shapes; with only the previous frame's shape learned,
     // every shape change missed, so DLSS flipped on/off frame by frame). Most recent first.
@@ -6079,9 +6080,32 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 // "...S L76:c1R" or "...S L78:c1R"). DLSS goes directly after this list, the same
                 // point a traced reader in the next list gets.
                 const auto ending = na::observe::ListInsertionDecision(lists[i], color);
-                if (na::j2::FindBoundary(g.insertion_learned, g.delivered_shapes, g.delivered_shape_count, color, depth, ending)) {
+                // Grounded in a delivery: an ending remembered from a delivered frame that no later
+                // scene write contradicted ("H"), or the previous frame's ending when that frame was
+                // itself delivered ("Hp"). The previous frame's ending alone is noted on every frame
+                // with a scene, delivered or not, and is not enough.
+                const bool remembered = na::j2::FindBoundary({}, g.delivered_shapes, g.delivered_shape_count, color, depth, ending) != nullptr;
+                const bool previous = !remembered && g.learned_delivered &&
+                                      na::j2::MatchesBoundary(g.insertion_learned, color, depth, ending);
+                // The lists already in this submission are facts, not a prediction: when one of them
+                // draws into the scene again before the picture is copied onward (LabelFrame's meaning
+                // of "the scene continues"), this list is not the ending and the search goes on there.
+                bool continues = false;
+                if (remembered || previous) {
+                    std::vector<na::j2::ColorEvent> later;
+                    for (UINT j = i + 1; j < count && !continues; ++j) {
+                        if (!lists[j]) continue;
+                        later.clear();
+                        if (!na::observe::ListColorEvents(lists[j], color, later)) { continues = true; break; } // unknown is not "ends here"
+                        const int verdict = na::j2::SceneTailVerdict(later);
+                        if (verdict > 0) continues = true;
+                        if (verdict) break;
+                    }
+                    if (continues) ft("d");
+                }
+                if ((remembered || previous) && !continues) {
                     const bool placed = record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, i + 1);
-                    ft("%s", placed ? "H" : "h");
+                    ft("%s", placed ? (remembered ? "H" : "Hp") : "h");
                     if (placed) {
                         ++g.stats.between_predicted;
                         g.frame_handoff |= kHoRecorded;
@@ -6090,7 +6114,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                         g.fired_barrier_event = false;
                         g.fired_producer = saved.producer;
                         g.fired_context = 0;
-                        g.submitted_boundary = {color, depth, ending}; // a later scene write withdraws this remembered ending
+                        g.submitted_boundary = {color, depth, ending}; // a scene write in a later submission withdraws this remembered ending
                         saved = {};
                         return static_cast<int>(i + 1);
                     }
@@ -8000,6 +8024,7 @@ void OnPresent(ID3D12CommandQueue* queue)
         g.submitted_boundary = {};
         if (g.insertion_frame.color) {
             g.insertion_learned = g.insertion_frame;
+            g.learned_delivered = g.submitted_frame == g.frame;
             if (g.submitted_frame == g.frame && g.stats.inline_late_writes + g.stats.post_scene_batches == g.route_prev_late_class) {
                 // Remember only deliveries that survived the remaining observed scene work.
                 const auto same = [](const State::LearnedInsertion& a, const State::LearnedInsertion& b) {
@@ -8625,6 +8650,7 @@ void Shutdown()
     g.class_fired = false;
     g.route_prev_late_class = 0;
     g.insertion_frame = g.insertion_learned = g.submitted_boundary = {};
+    g.learned_delivered = false;
     g.delivered_shape_count = 0;
     g.inl = State::InlinePending{};
     g.inl_frame = 0;
