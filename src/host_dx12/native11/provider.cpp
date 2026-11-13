@@ -225,6 +225,16 @@ SplitDraw g_split_draw;
 Id g_split_world = 0;
 std::atomic<Id> g_split_candidate{0};
 std::atomic<bool> g_collect_camera{true};
+// VARIANT: camera11/all-uploads-when-buffers-rotate
+// Uploads are normally kept only for the buffers the last frame's scene ranked highest. A game
+// that takes its constant buffers from a rotating pool binds a different buffer object at the same
+// place every frame, so that short list never holds this frame's camera: it is found on a frame
+// that keeps every upload and lost on the next, on and on. Seen twice in a row, every upload is
+// kept from then on. The camera's place (stage, slot, range) is what stays; the object is not.
+bool g_collect_all = false;
+uint32_t g_rotation_misses = 0;   // found while keeping everything, then no bytes at all on the short list
+bool g_frame_fired = false, g_frame_found = false, g_frame_no_bytes = false; // this frame's boundary
+bool g_prev_found_collecting = false;
 std::unordered_map<Id, CameraUploads> g_cb_latest;
 std::unordered_map<Id, uint64_t> g_cb_incarnation; // candidate camera buffers: lifetime id, tagged at upload (live object)
 
@@ -942,6 +952,9 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     std::optional<CameraFacts::RelativePose> split_pose;
     const bool found = CameraNow(&cam, &upload, &version, pose_check, split_pose);
     CountPoseCheck(pose_check);
+    g_frame_fired = true;
+    g_frame_found = found;
+    g_frame_no_bytes = !found && pose_check == PoseCheck::NoPacket;
     bool held = false;
     if (!found) {
         DiagnoseCameraMiss();
@@ -2095,7 +2108,24 @@ bool OnPresent(IDXGISwapChain* swap)
     g_split_candidate.store(g_split_world, std::memory_order_relaxed);
     g_split_world = 0;
     // Learning the relative layout needs every scene range's upload for one frame.
-    g_collect_camera.store(!g_camera.found || g_rel_learner.armed(), std::memory_order_relaxed);
+    if (g_frame_fired && !g_collect_all) {
+        const bool collecting = g_collect_camera.load(std::memory_order_relaxed); // how this frame's uploads were kept
+        if (!collecting && g_frame_no_bytes && g_prev_found_collecting) {
+            if (++g_rotation_misses >= 2) {
+                g_collect_all = true;
+                na::eventlog::Emit("native11_camera_bytes",
+                                   "frame=%llu keep=all why=\"twice the camera was found on a frame that kept every upload and the next frame, keeping "
+                                   "only last frame's highest-ranked buffers, had no bytes for any range its scene bound: the game binds a different "
+                                   "buffer object each frame\" kept_buffers=%zu",
+                                   static_cast<unsigned long long>(g_frame), g_cb_latest.size());
+            }
+        } else if (!collecting && g_frame_found) {
+            g_rotation_misses = 0; // the short list held the camera: buffers keep their identity
+        }
+        g_prev_found_collecting = collecting && g_frame_found;
+    }
+    g_frame_fired = g_frame_found = g_frame_no_bytes = false;
+    g_collect_camera.store(!g_camera.found || g_rel_learner.armed() || g_collect_all, std::memory_order_relaxed);
     // Retire upload shadows not in the next scene's acquisition set. Draw-time
     // snapshots keep their own ownership until this frame is closed.
     if (g_cb_latest.size() > 512) {
@@ -2358,6 +2388,9 @@ void Uninstall()
     g_cb_user = nullptr;
     g_swap = nullptr;
     g_backbuffer = 0;
+    g_collect_all = false;
+    g_rotation_misses = 0;
+    g_frame_fired = g_frame_found = g_frame_no_bytes = g_prev_found_collecting = false;
     g_color_ref.Reset();
     g_depth_ref.Reset();
     g_lists.clear();
@@ -2402,6 +2435,7 @@ int FormatStatus(char* out, unsigned long n)
     uint32_t scene_format = 0;
     uint32_t color_samples = 0, depth_samples = 0;
     int is_backbuffer = -1;
+    bool keep_all = false;
     FrameModel::Stats placement;
     {
         std::lock_guard<std::mutex> l(g_mu);
@@ -2409,6 +2443,7 @@ int FormatStatus(char* out, unsigned long n)
         layout_learned = g_rel_learned;
         scene_layered = g_model.Layered();
         placement = g_model.GetStats();
+        keep_all = g_collect_all;
         scene_layered_frames = placement.layered_frames;
         const Selection& selection = g_model.Current();
         scene_format = selection.color_info.format;
@@ -2434,7 +2469,7 @@ int FormatStatus(char* out, unsigned long n)
                          "scene{picture=%s layered_frames=%llu colour_fmt=%u colour_float=%d} "
                          "scene_boundary{selected=%llu draws=%u scene_draws=%u reads=%u after_scene_read=%u after_scene_draw=%u "
                          "learned_read=%u learned_hud=%u backbuffer=%d color_samples=%u depth_samples=%u "
-                         "depth_tested=%u after_tested_untested=%u learned_untested_hud=%u fired_hud=%llu fired_untested_hud=%llu}%s%s%s",
+                         "depth_tested=%u after_tested_untested=%u learned_untested_hud=%u fired_hud=%llu fired_untested_hud=%llu} camera_bytes{keep_all=%d}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
@@ -2476,7 +2511,7 @@ int FormatStatus(char* out, unsigned long n)
                          placement.learned_read, placement.learned_overlay, is_backbuffer,
                          color_samples, depth_samples, placement.last_tested_draws, placement.last_untested_after_tested,
                          placement.learned_flat, static_cast<unsigned long long>(placement.fired_overlay),
-                         static_cast<unsigned long long>(placement.fired_flat),
+                         static_cast<unsigned long long>(placement.fired_flat), keep_all ? 1 : 0,
                          s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }

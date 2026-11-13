@@ -1474,6 +1474,20 @@ Tests: frame model test on Linux passes, with the recorded shape (picture found 
 
 Proof asked of the next run: the capture's DLAA input must look like the game, `color_format` a floating-point format and `hdr=true`; then Cort's eyes.
 
+## 2026-11-13 Pacific — Native DX11: the camera is found every frame when a game rotates its constant buffers (Claude)
+
+Hearts of Iron IV on 979d495, two runs by Cort.
+- p43648 (40 s, loading screen or main menu): 50 flat draws a frame onto the swap chain's buffer, none testing depth; `native11_point point=none`, correctly no DLAA.
+- p45540 (campaign map, 18,786 frames, about 140 fps): Cort: "it did run but without jitter". On the map the scene is NOT drawn onto the screen: it goes into a floating-point target (format 10) that is read afterwards, so the ordinary read point places DLAA (`point=before-read`). The capture's DLAA input is the lit map with no HUD, labels or counters, and the depth is a real depth picture. So the picture and the place are right, and the on-screen variants of the entry below were not what this game's map needed (they stay, tested, for the shape they describe).
+
+What is wrong on the map, from the log: `fired=14929 camera_found=7465 camera_missing=7464`, in lock-step, `pose{generic=7465 no_packet=7464}`, held 0. The camera is found on exactly every other frame. On the missed frames the top-ranked binding (PS slot 0, 2,094 of 2,201 scene draws) has `kept=0`: no upload was kept for that buffer at all. The provider keeps uploads only for the buffers last frame's scene ranked highest, except on the frame after a miss, when it keeps everything. A game that binds a different buffer object at the same place each frame is therefore found only on the keep-everything frames. Jitter follows from the same cause: the sample armed after a delivered frame is rasterised on the next frame, which is the one that finds no camera, so every delivered frame was drawn unjittered (`native11_jitter` 240 of 240 with `applied=0`, while `viewport_jitter{frames=7425}` counts the jittered, undelivered ones).
+
+Change (`camera11/all-uploads-when-buffers-rotate`, one row in docs/VARIANTS.md): when the found-then-no-bytes pair is seen twice, every upload is kept from then on. Event `native11_camera_bytes keep=all why=`, status `camera_bytes{keep_all=}`. A game whose short list holds its camera never switches, so nothing changes for it.
+
+Tests: DX11 GPU fixture case with the camera buffer alternating between two objects (delivery on every frame, jitter applied, status says keep_all). Not yet compiled on Windows or run.
+
+Proof asked of the next run: `camera_found` close to `fired`, `camera_missing` flat after the first seconds, `native11_jitter applied=1`, capture meta `jitter_px` non-zero; then Cort's eyes on a moving map.
+
 ## 2026-11-13 Pacific — Native DX11: a scene drawn straight onto the screen gets a place for DLAA (Claude)
 
 Hearts of Iron IV, taken over from Astra and Sol at Cort's word. Evidence is the saved log of p41576 on 496d691: 3,704 frames, `fired=0 missed=0 unplaceable=0`, no camera event, "Waiting for a native scene." `missed` only counts frames that had a learned place, so the model never learned one. The only place the DX11 model learns by itself is "before the n-th read of the picture"; the second rule in frame_model.hpp ("before the first HUD draw", written for pictures drawn straight onto the screen) needs `EnableOverlayRule`, and nothing on DX11 ever called it. The provider already fires at that point when the model asks (`Boundary::BeforeHud`); the model never asked.

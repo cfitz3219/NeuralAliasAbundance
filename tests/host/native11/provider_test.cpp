@@ -142,6 +142,9 @@ struct Game {
     // The scene drawn straight onto the screen, never read: 1 = the HUD is drawn with no depth
     // bound, 2 = the HUD keeps the scene depth bound with the depth test off.
     int on_screen = 0;
+    // The camera's constants come from a pool: a different buffer object every frame, same place.
+    bool rotate_camera = false;
+    ComPtr<ID3D11Buffer> cam_pool[2];
     ComPtr<ID3D11DepthStencilState> depth_off;
     ComPtr<ID3D11Texture2D> layer, layer2;
     ComPtr<ID3D11RenderTargetView> layer_rtv, layer2_rtv;
@@ -325,6 +328,7 @@ void Viewport(ID3D11DeviceContext* c, UINT w, UINT h)
 void Scene(ID3D11DeviceContext* c, Game& g, int frame)
 {
     g_tonemap_bound = false;
+    if (g.rotate_camera) g.cam_cb = g.cam_pool[frame & 1];
     ID3D11Buffer* cbs[2] = {g.cam_cb.Get(), g.obj_cb.Get()};
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     c->VSSetShader(g.vs.Get(), nullptr, 0);
@@ -1241,6 +1245,36 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         present_campaign();
         expect(evaluations == tied + 1, "fresh scene agreement restores split-camera DLAA");
         g.campaign_split_camera = false;
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
+    }
+    {
+        // Constant buffers taken from a rotating pool (seen on a real game: the camera was found on
+        // every other frame only, 7,465 of 14,929, and jitter never reached a delivered frame).
+        D3D11_BUFFER_DESC pool_desc{};
+        g.cam_cb->GetDesc(&pool_desc);
+        g.cam_pool[0] = g.cam_cb;
+        expect(SUCCEEDED(g.device->CreateBuffer(&pool_desc, nullptr, &g.cam_pool[1])), "create the second camera buffer of the pool");
+        const bool jitter_was = na::j2::Jitter();
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport); // the production route
+        na::j2::SetJitter(true);
+        g.rotate_camera = true;
+        for (int i = 0; i < 10; ++i) present_campaign(); // the rotation is seen twice, then every upload is kept
+        const auto before_pool = evaluations;
+        const auto jitter_before_pool = g_seen.jitter_reported;
+        const auto no_camera_before = g_seen.no_camera;
+        for (int i = 0; i < 30; ++i) present_campaign();
+        char pool_status[4096];
+        na::native11::FormatStatus(pool_status, sizeof pool_status);
+        std::printf("native rotating camera buffers: %s\n", pool_status);
+        expect(evaluations >= before_pool + 28 && g_seen.no_camera == no_camera_before,
+               "camera buffers from a rotating pool: the camera is found on every frame, not every other one");
+        expect(g_seen.jitter_reported >= jitter_before_pool + 24, "rotating camera buffers: delivered frames carry the applied jitter");
+        expect(std::strstr(pool_status, "camera_bytes{keep_all=1}") != nullptr, "the status says every upload is being kept");
+        g.rotate_camera = false;
+        g.cam_cb = g.cam_pool[0];
+        for (int i = 0; i < 4; ++i) present_campaign();
+        na::j2::SetJitter(jitter_was);
+        present_campaign();
         na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
     }
     // Real shader sampling: each mip is a different colour. Exact LOD 1
