@@ -135,6 +135,7 @@ public:
         uint32_t camera_scene_draws = 0; // scene draws with the camera cb bound (last frame)
         uint64_t tag_not_unique = 0;     // frames whose point's tag named more than one read
         uint32_t learned_overlay = 0;    // the HUD-rule point (n-th non-scene draw into the scene colour); 0 = none
+        uint32_t last_read_after_scene = 0, last_draw_after_scene = 0;
         uint64_t layered_frames = 0;     // frames whose picture came after material layers (scene/after-layers)
         double camera_share = 0;
         const char* last_miss = "";
@@ -340,14 +341,14 @@ public:
         stats_.last_scene_draws = scene_draws_;
         stats_.last_draws = draws_;
         stats_.last_reads = color_reads_;
+        stats_.last_read_after_scene = first_read_after_scene_pending_;
+        stats_.last_draw_after_scene = first_overlay_after_scene_pending_;
         if (sel_.valid()) ++stats_.selected_frames;
 
         // Learn the DLSS point for the next frame: the first read after the last scene draw.
         learned_read_ = sel_.valid() && first_read_after_scene_pending_ ? first_read_after_scene_pending_ : 0;
-        stats_.learned_read = learned_read_;
         // HUD rule: only when the scene colour had no read after its last scene draw.
         learned_overlay_ = overlay_rule_ && sel_.valid() && !learned_read_ && first_overlay_after_scene_pending_ ? first_overlay_after_scene_pending_ : 0;
-        stats_.learned_overlay = learned_overlay_;
         learned_tag_ = 0;
         if (learned_read_ && pending_tag_) {
             const auto it = read_tags_.find(pending_tag_);
@@ -359,6 +360,8 @@ public:
         }
 
         Choose();
+        stats_.learned_read = learned_read_;
+        stats_.learned_overlay = learned_overlay_;
 
         // Camera ranking for the next frame.
         last_cb_order_.clear();

@@ -1473,3 +1473,9 @@ Change (`scene/after-layers`, one row in docs/VARIANTS.md): chosen by shape, nev
 Tests: frame model test on Linux passes, with the recorded shape (picture found within five frames, DLSS before the tonemap's read, scene of 212 draws, indoor frames keep the picture, ten busier targets do not hide it) and six shapes that must keep the old rule. The DX11 fixture gained a layered case. Not yet compiled on Windows, not yet run on a GPU, and not yet seen by Cort.
 
 Proof asked of the next run: the capture's DLAA input must look like the game, `color_format` a floating-point format and `hdr=true`; then Cort's eyes.
+
+## 2026-11-12 Pacific — HOI4 with multisampling disabled, native DX11 placement evidence
+
+Cort reports DLAA still unavailable after restarting and loading a campaign. HOI4 system.log confirms DirectX 11 and no multisampling. Session p41576 on 496d691 has 3,704 presents, 643 overlay draws, 44,921 exact-range reads against selected colour draws, zero scene insertion attempts and zero deliveries. Camera admission and the DLAA backend were never reached.
+
+Follow-up continues from Claude's 56e49ef DX11 line, which distinguishes the material targets of a layered renderer from its lit picture. Reuse the existing frame model and add its selected scene draws, observed and learned read/draw boundaries, sample counts and swap-chain-buffer identity to the status line. Observe the buffer identity on swap-chain adoption and resize without keeping a reference. The counters distinguish a direct-to-backbuffer scene with a later draw from an offscreen scene missing a read or with an unusable command-list boundary. They do not arm an insertion point. The frame-model fixture checks that a draw boundary is reported even with the HUD rule disabled. No game launch or game installation performed by Astra.

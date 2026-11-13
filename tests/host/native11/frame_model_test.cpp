@@ -124,6 +124,20 @@ int main()
         expect(m.GetStats().camera_share > 0.99, "the camera block covers all scene draws");
         expect(m.GetStats().fired == 2, "fires every frame once learned");
     }
+    {
+        FrameModel m;
+        Setup(m);
+        std::vector<Event> direct(40, Draw(kBackBuffer, kDepth, 900));
+        direct.push_back(Draw(kBackBuffer, 0, 6, 0, 0));
+        RunImmediate(m, direct);
+        RunImmediate(m, direct);
+        const auto& stats = m.GetStats();
+        expect(stats.last_scene_draws == 40 && stats.last_reads == 0 &&
+               stats.last_read_after_scene == 0 && stats.last_draw_after_scene == 1,
+               "report the draw after the scene even when the host has not enabled the HUD rule");
+        expect(stats.learned_read == 0 && stats.learned_overlay == 0 && stats.fired == 0,
+               "reporting a possible draw boundary does not enable insertion");
+    }
     // ---- loading screen does not change the choice ----
     {
         FrameModel m;

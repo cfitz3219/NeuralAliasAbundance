@@ -196,6 +196,7 @@ std::map<ID3D11CommandList*, ListRecord> g_lists;
 uint64_t g_list_order = 0;
 std::atomic<ID3D11Device*> g_device_raw{nullptr};
 IDXGISwapChain* g_swap = nullptr; // identity only
+Id g_backbuffer = 0;              // identity only, never pins a swap-chain buffer
 std::atomic<Id> g_sel_color{0};    // readable from any thread
 // VARIANT: scene/after-layers (the rule is native11/frame_model.hpp)
 std::atomic<Id> g_sel_layer{0};         // the scene is drawn through material layers: their most-drawn target (0 = no layers)
@@ -2003,6 +2004,13 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
 }
 
 // ---------------------------------------------------------------- frame boundary
+void ObserveBackbuffer(IDXGISwapChain* swap)
+{
+    Inside in;
+    ComPtr<ID3D11Resource> buffer;
+    g_backbuffer = SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&buffer))) ? IdOf(buffer.Get()) : 0;
+}
+
 bool OnPresent(IDXGISwapChain* swap)
 {
     if (t_inside) return false;
@@ -2019,6 +2027,7 @@ bool OnPresent(IDXGISwapChain* swap)
         DXGI_SWAP_CHAIN_DESC sd{};
         swap->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
+        ObserveBackbuffer(swap);
     }
     ++g_frame;
     g_exact_frame.fetch_add(1, std::memory_order_relaxed);
@@ -2144,6 +2153,7 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
         g_color_ref.Reset();
         g_depth_ref.Reset();
+        g_backbuffer = 0;
         g_model.Forget(g_model.Current().color); // the scene targets are usually recreated with the new size
         g_split_draw = {};
         g_split_votes.clear();
@@ -2157,7 +2167,9 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
 void UpdateResizeExtent(IDXGISwapChain* s, long result)
 {
     std::lock_guard<std::mutex> l(g_mu);
-    if (s == g_swap && SUCCEEDED(result)) {
+    if (s == g_swap) {
+        ObserveBackbuffer(s);
+        if (FAILED(result)) return;
         DXGI_SWAP_CHAIN_DESC sd{};
         s->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
@@ -2299,6 +2311,8 @@ void Uninstall()
     std::lock_guard<std::mutex> l(g_mu);
     g_cb = nullptr;
     g_cb_user = nullptr;
+    g_swap = nullptr;
+    g_backbuffer = 0;
     g_color_ref.Reset();
     g_depth_ref.Reset();
     g_lists.clear();
@@ -2341,14 +2355,24 @@ int FormatStatus(char* out, unsigned long n)
     bool scene_layered = false, scene_float = false;
     uint64_t scene_layered_frames = 0;
     uint32_t scene_format = 0;
+    uint32_t color_samples = 0, depth_samples = 0;
+    int is_backbuffer = -1;
+    FrameModel::Stats placement;
     {
         std::lock_guard<std::mutex> l(g_mu);
         layout = g_rel_layout;
         layout_learned = g_rel_learned;
         scene_layered = g_model.Layered();
-        scene_layered_frames = g_model.GetStats().layered_frames;
-        scene_format = g_model.Current().color_info.format;
-        scene_float = g_model.Current().color_info.float_colour;
+        placement = g_model.GetStats();
+        scene_layered_frames = placement.layered_frames;
+        const Selection& selection = g_model.Current();
+        scene_format = selection.color_info.format;
+        scene_float = selection.color_info.float_colour;
+        if (selection.valid()) {
+            color_samples = selection.color_info.samples;
+            depth_samples = selection.depth_info.samples;
+            if (g_backbuffer) is_backbuffer = selection.color == g_backbuffer ? 1 : 0;
+        }
     }
     return std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
@@ -2362,7 +2386,9 @@ int FormatStatus(char* out, unsigned long n)
                          "exact_ranges{reads=%llu failed=%llu draws=%llu} "
                          "camera_path{steps=%llu reversals=%llu jumps=%llu} "
                          "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu} "
-                         "scene{picture=%s layered_frames=%llu colour_fmt=%u colour_float=%d}%s%s%s",
+                         "scene{picture=%s layered_frames=%llu colour_fmt=%u colour_float=%d} "
+                         "scene_boundary{selected=%llu draws=%u scene_draws=%u reads=%u after_scene_read=%u after_scene_draw=%u "
+                         "learned_read=%u learned_hud=%u backbuffer=%d color_samples=%u depth_samples=%u}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
@@ -2397,7 +2423,12 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(s.camera_jumps), told[0], told[1],
                          static_cast<unsigned long long>(g_vpj_unshifted.load()),
                          scene_layered ? "after-layers" : "most-drawn", static_cast<unsigned long long>(scene_layered_frames),
-                         scene_format, scene_float ? 1 : 0, s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
+                         scene_format, scene_float ? 1 : 0,
+                         static_cast<unsigned long long>(placement.selected_frames),
+                         placement.last_draws, placement.last_scene_draws, placement.last_reads,
+                         placement.last_read_after_scene, placement.last_draw_after_scene,
+                         placement.learned_read, placement.learned_overlay, is_backbuffer,
+                         color_samples, depth_samples, s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
 
