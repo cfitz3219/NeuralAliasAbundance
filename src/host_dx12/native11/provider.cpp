@@ -1136,8 +1136,15 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         auto it = g_cb_incarnation.find(cam_sel.camera_cb);
         if (it != g_cb_incarnation.end()) cam_inc = it->second;
     }
+    // VARIANT: camera11/all-uploads-when-buffers-rotate
+    // A game that binds a different buffer object every frame gives a new camera buffer on every
+    // frame; that says nothing about the scene, and counting it as a change of inputs made DLSS
+    // drop its history each frame (p40940: reset on 30 of 30 captured frames). A real cut is
+    // still found from the camera's own path.
+    const bool camera_changed = !g_collect_all &&
+        (cam_sel.camera_cb != g_stream_key[2] || (cam_inc && g_stream_key[3] && cam_inc != g_stream_key[3]));
     f.selection_changed = !g_stream || f.color.incarnation != g_stream_key[0] || f.depth.incarnation != g_stream_key[1] ||
-                          cam_sel.camera_cb != g_stream_key[2] || (cam_inc && g_stream_key[3] && cam_inc != g_stream_key[3]);
+                          camera_changed;
     if (f.selection_changed) ++g_stream;
     g_stream_key[0] = f.color.incarnation;
     g_stream_key[1] = f.depth.incarnation;

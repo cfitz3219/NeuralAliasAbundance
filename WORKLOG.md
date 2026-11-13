@@ -1474,6 +1474,21 @@ Tests: frame model test on Linux passes, with the recorded shape (picture found 
 
 Proof asked of the next run: the capture's DLAA input must look like the game, `color_format` a floating-point format and `hdr=true`; then Cort's eyes.
 
+## 2026-11-13 Pacific — Native DX11: DLSS keeps its history with rotating buffers; reprojection composed as on DX12 (Claude)
+
+Hearts of Iron IV on faad053 (p40940, capture j2-20261113-002205), Cort: "Better but now the whole map is shaking, like it tremors", and it stops with jitter off. The camera is now found on 7,530 of 7,532 attempts. Checked on the capture before any change:
+- Theory 1, borders and names drawn without the jitter while the terrain has it: ruled out. Letters, coast, terrain and city lights all move by the jitter difference, together.
+- The DLAA output moves every frame by about the jitter. It should be still.
+- Cause 1 (in the capture meta): `reset=1` on 30 of 30 consecutive frames, with camera_cut=0. The provider reports a change of inputs when the camera's buffer id differs from last frame's. This game binds a different buffer object every frame, so every frame was a "change", DLSS dropped its history every frame, and its output was the current jittered frame.
+- Cause 2 (motion plane): a constant (-0.11, +0.03) px on a still camera with vp_cur == vp_prev to every digit. Reproduced offline from the captured matrix: chaining inverse and previous view-projection as two float matrices through world coordinates of about 4,500 gives -0.04 to -0.17 px in x and +0.01 to +0.04 in y; in double it is exactly 0. The DX12 host already composes the two in double (`ComposeReprojectionRow`, Astra's Anno blur finding). The DX11 consumer did not.
+
+Change:
+- provider.cpp: with `camera11/all-uploads-when-buffers-rotate` in force, the camera's buffer object is not part of the input stream. Colour and depth changes still are, and a real cut is still found from the camera's path.
+- native_d3d11/live_dlaa.cpp: the reprojection is composed in double as on DX12. Status `native11_dlaa ... history_resets{camera_cut= inputs_changed= frame_gap=}` so a log says how often and why the history was dropped.
+- Fixture: the rotating-buffer case also requires no change of inputs over 30 frames.
+
+Not yet compiled on Windows or run. Proof asked of the next run: capture `reset=0` on consecutive frames, motion plane 0 on a still view, `history_resets{inputs_changed}` flat; then Cort's eyes: no tremor with jitter on.
+
 ## 2026-11-13 Pacific — Native DX11: the camera is found every frame when a game rotates its constant buffers (Claude)
 
 Hearts of Iron IV on 979d495, two runs by Cort.

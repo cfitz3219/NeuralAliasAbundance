@@ -1262,6 +1262,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         const auto before_pool = evaluations;
         const auto jitter_before_pool = g_seen.jitter_reported;
         const auto no_camera_before = g_seen.no_camera;
+        const auto changed_before_pool = g_seen.changed;
+        const auto streams_before_pool = g_seen.streams;
         for (int i = 0; i < 30; ++i) present_campaign();
         char pool_status[4096];
         na::native11::FormatStatus(pool_status, sizeof pool_status);
@@ -1270,6 +1272,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                "camera buffers from a rotating pool: the camera is found on every frame, not every other one");
         expect(g_seen.jitter_reported >= jitter_before_pool + 24, "rotating camera buffers: delivered frames carry the applied jitter");
         expect(std::strstr(pool_status, "camera_bytes{keep_all=1}") != nullptr, "the status says every upload is being kept");
+        expect(g_seen.changed == changed_before_pool && g_seen.streams == streams_before_pool,
+               "rotating camera buffers: a new buffer object is not a change of inputs, so DLSS keeps its history");
         g.rotate_camera = false;
         g.cam_cb = g.cam_pool[0];
         for (int i = 0; i < 4; ++i) present_campaign();
