@@ -269,6 +269,9 @@ std::atomic<uint64_t> g_vpj_sample{0}; // publish both float axes as one value
 std::atomic<Id> g_sel_depth{0};
 std::atomic<uint32_t> g_sel_depth_w{0}, g_sel_depth_h{0};
 uint32_t g_vpj_frame_draws = 0; // executed scene draws with a nonzero sample, under g_mu
+uint32_t g_vpj_frame_unshifted = 0; // draws into the scene colour left unshifted on a shifted frame, under g_mu
+std::atomic<uint64_t> g_vpj_unshifted{0};
+std::atomic<uint64_t> g_vpj_told{0}; // the sample last handed to the consumer (two floats, pixels)
 uint64_t g_vpj_executed_sample = 0;
 bool g_vpj_seen_draw = false, g_vpj_mixed = false;
 std::atomic<uint64_t> g_vpj_mixed_frames{0};
@@ -1041,6 +1044,58 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         f.camera.jitter_px[0] = static_cast<float>(g_jitter.x_pixels);
         f.camera.jitter_px[1] = static_cast<float>(g_jitter.y_pixels);
     }
+    {
+        // WHY log: what the consumer is told the jitter was, beside what the scene draws carried.
+        // The first frames of a session, then a burst of sixteen about every ten seconds, so one
+        // whole jitter cycle is on record each time.
+        static uint32_t logged = 0;
+        static uint64_t burst_tick = 0, burst_left = 48;
+        const uint64_t now = GetTickCount64();
+        if (!burst_left && now - burst_tick >= 10000) burst_left = 16;
+        if (burst_left && logged < 1500 && (f.camera.jitter_applied || vpj_route)) {
+            if (!--burst_left) burst_tick = now;
+            ++logged;
+            float shift[2]{};
+            std::memcpy(shift, &g_vpj_executed_sample, sizeof shift);
+            na::eventlog::Emit("native11_jitter",
+                               "frame=%llu route=%s told_px=%.4f,%.4f viewport_shift_px=%.4f,%.4f applied=%d shifted_draws=%u "
+                               "unshifted_colour_draws=%u scene_draws=%u held=%d scene=%.0fx%.0f depth=%ux%u",
+                               static_cast<unsigned long long>(g_frame), vpj_route ? "viewport" : "matrix",
+                               f.camera.jitter_px[0], f.camera.jitter_px[1], shift[0], shift[1], f.camera.jitter_applied ? 1 : 0,
+                               g_vpj_frame_draws, g_vpj_frame_unshifted, g_model.SceneDrawsThisFrame(), held ? 1 : 0,
+                               g_scene_vp_w, g_scene_vp_h, g_sel_depth_w.load(std::memory_order_relaxed),
+                               g_sel_depth_h.load(std::memory_order_relaxed));
+        }
+        uint64_t told = 0;
+        std::memcpy(&told, f.camera.jitter_px, sizeof told);
+        g_vpj_told.store(told, std::memory_order_relaxed);
+    }
+    {
+        // WHY log: the delivered camera's path. A camera read from one source moves smoothly; one
+        // that hops between two sources steps back and forth.
+        static bool have = false;
+        static double last_pos[3]{}, last_step[3]{};
+        camera::VpGeometry geo{};
+        if (camera::DecomposeViewProjection(cam.vp, geo)) {
+            if (have) {
+                double step[3], len2 = 0, prev2 = 0, dot = 0;
+                for (int j = 0; j < 3; ++j) {
+                    step[j] = geo.position[j] - last_pos[j];
+                    len2 += step[j] * step[j];
+                    prev2 += last_step[j] * last_step[j];
+                    dot += step[j] * last_step[j];
+                }
+                if (len2 > 2500.0) ++g_stats.camera_jumps;
+                else if (len2 > 1e-6) {
+                    ++g_stats.camera_steps;
+                    if (prev2 > 1e-6 && dot < -0.5 * std::sqrt(len2 * prev2)) ++g_stats.camera_reversals;
+                }
+                for (int j = 0; j < 3; ++j) last_step[j] = len2 > 2500.0 ? 0.0 : step[j];
+            }
+            for (int j = 0; j < 3; ++j) last_pos[j] = geo.position[j];
+            have = true;
+        }
+    }
     f.boundary = boundary;
     f.scene_draws = g_model.SceneDrawsThisFrame();
     // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
@@ -1161,8 +1216,12 @@ void RememberSceneUploads(const Event& e, const std::vector<ExactRange>* exact =
 // Called in immediate draw order and while replaying executed command lists.
 void NoteViewportDraw(const Event& e)
 {
-    if (!g_vpj_route.load(std::memory_order_relaxed) || e.kind != Kind::Draw ||
-        !e.depth_test || !g_model.IsSceneDraw(e)) return;
+    if (!g_vpj_route.load(std::memory_order_relaxed) || e.kind != Kind::Draw) return;
+    // WHY log: draws into the scene colour that kept the game's own viewport on a frame whose
+    // depth-tested scene draws were shifted (full-screen and untested passes).
+    if (!e.viewport_sample && g_vpj_executed_sample && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed))
+        ++g_vpj_frame_unshifted;
+    if (!e.depth_test || !g_model.IsSceneDraw(e)) return;
     if (!g_vpj_seen_draw) {
         g_vpj_seen_draw = true;
         g_vpj_executed_sample = e.viewport_sample;
@@ -1951,6 +2010,8 @@ bool OnPresent(IDXGISwapChain* swap)
     // Viewport route: the same one-frame request, applied on the scene draws of the frame starting here.
     const uint32_t jittered_draws = g_vpj_frame_draws;
     g_vpj_frame_draws = 0;
+    g_vpj_unshifted.fetch_add(g_vpj_frame_unshifted, std::memory_order_relaxed);
+    g_vpj_frame_unshifted = 0;
     g_vpj_seen_draw = g_vpj_mixed = false;
     g_vpj_executed_sample = 0;
     g_vpj_last_frame_draws.store(jittered_draws, std::memory_order_relaxed);
@@ -2186,6 +2247,9 @@ ProviderStats Stats()
 int FormatStatus(char* out, unsigned long n)
 {
     const ProviderStats s = Stats();
+    float told[2]{};
+    const uint64_t told_bits = g_vpj_told.load(std::memory_order_relaxed);
+    std::memcpy(told, &told_bits, sizeof told);
     camera::RelativeLayout layout;
     bool layout_learned = false;
     {
@@ -2202,7 +2266,9 @@ int FormatStatus(char* out, unsigned long n)
                          "start_rejected{no_candidate=%llu waiting=%llu inverse_game=%llu position_game=%llu} "
                          "relative_layout{%s world=%d/%u@%u,%u projection=%d/%u@%u learned=%llu no_witness=%llu ambiguous=%llu} "
                          "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu} "
-                         "exact_ranges{reads=%llu failed=%llu draws=%llu}%s%s%s",
+                         "exact_ranges{reads=%llu failed=%llu draws=%llu} "
+                         "camera_path{steps=%llu reversals=%llu jumps=%llu} "
+                         "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
@@ -2232,7 +2298,10 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(g_vpj_restores.load()),
                          static_cast<unsigned long long>(g_vpj_unknown.load()), static_cast<unsigned long long>(g_vpj_mixed_frames.load()),
                          static_cast<unsigned long long>(g_exact_reads.load()), static_cast<unsigned long long>(g_exact_failed.load()),
-                         static_cast<unsigned long long>(g_exact_draws.load()), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
+                         static_cast<unsigned long long>(g_exact_draws.load()),
+                         static_cast<unsigned long long>(s.camera_steps), static_cast<unsigned long long>(s.camera_reversals),
+                         static_cast<unsigned long long>(s.camera_jumps), told[0], told[1],
+                         static_cast<unsigned long long>(g_vpj_unshifted.load()), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
 
