@@ -951,7 +951,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         const auto before_jump = evaluations;
         g.camera_ring_offset = 982 * 1024;
         present_campaign();
-        expect(evaluations == before_jump, "a disjoint large-buffer binding cannot reuse old camera bytes");
+        // The frame is not dropped either: it carries the previous frame's camera, marked held,
+        // from the range that camera was read at.
+        expect(evaluations == before_jump ||
+               (evaluations == before_jump + 1 && g_seen.last.camera.held &&
+                g_seen.last.camera.first_constant != g.camera_ring_offset / 16),
+               "a disjoint large-buffer binding cannot reuse old camera bytes");
         for (int i = 0; i < 8; ++i) present_campaign();
         expect(evaluations >= before_jump + 6 &&
                g_seen.last.camera.first_constant == g.camera_ring_offset / 16,

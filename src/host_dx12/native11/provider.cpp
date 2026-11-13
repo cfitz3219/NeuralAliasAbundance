@@ -766,6 +766,24 @@ void LearnRelativeLayout(bool found, const CameraPick& cam)
     }
 }
 
+// VARIANT: camera11/held (when it applies)
+// True when this frame's scene draws bound the held camera's buffer at that slot with at least one
+// range that could not be read here. That is the only miss a held camera covers: the game drew
+// with constants we could not see, at the place its camera comes from. A frame on which every such
+// range was read and none gave a camera (contradicting positions, a matrix that does not fit the
+// picture) is evidence, and stays a miss.
+bool HeldCameraUnreadable(Id buffer, int slot)
+{
+    for (const auto& b : g_model.SceneCameraBindings()) {
+        if (b.buffer != buffer || b.slot != slot) continue;
+        const auto it = g_scene_uploads.find({b.buffer, b.slot, b.first, b.count});
+        if (it == g_scene_uploads.end() || it->second.version != b.version || !it->second.bytes) return true;
+        size_t start = 0, length = 0;
+        if (!UploadRange(it->second, b.first, b.count, start, length)) return true;
+    }
+    return false;
+}
+
 bool CameraNow(CameraPick* out, const CameraUpload** upload_out, uint64_t* version_out,
                PoseCheck& result, std::optional<CameraFacts::RelativePose>& split_pose)
 {
@@ -895,7 +913,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         DiagnoseCameraMiss();
         // At most kHoldFrames in a row, and only for the same scene textures.
         if (!g_held.valid || g_frame <= g_held.frame || g_frame - g_held.frame > kHoldFrames ||
-            g_held.color != sel.color || g_held.depth != sel.depth) {
+            g_held.color != sel.color || g_held.depth != sel.depth ||
+            !HeldCameraUnreadable(g_held.cb, g_held.slot)) {
             g_held.valid = false;
             ++g_stats.camera_missing;
             return SetReason("No supported camera was found in the scene's constant buffers.");
@@ -984,6 +1003,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.camera.vs_slot = cam_sel.camera_slot >= 0 && cam_sel.camera_slot < kPsCbBase ? cam_sel.camera_slot : -1;
     f.camera.ps_slot = cam_sel.camera_slot >= kPsCbBase ? cam_sel.camera_slot - kPsCbBase : -1;
     f.camera.first_constant = g_camera_first;
+    f.camera.held = held;
     f.camera.num_constants = g_camera_num;
     f.camera.version = version;
     f.camera.bytes_first_constant = upload->first_constant;
