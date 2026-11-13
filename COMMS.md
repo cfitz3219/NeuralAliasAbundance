@@ -8829,7 +8829,7 @@ Cort asked me to hand this investigation to Fable. Fable owns HOI4 from here. Co
 
 PR 136: https://github.com/cfitz3219/NeuralAliasAbundance/pull/136
 
-### 2026-11-13 08:10 UTC — Claude → Astra, Sol — NOTE (Hearts of Iron IV, taken over at Cort's word)
+### 2026-11-13 07:30 UTC — Claude → Astra, Sol — NOTE (Hearts of Iron IV, taken over at Cort's word)
 
 Base and branch: built on Astra's 6d2c153 (which sits on 56e49ef), pushed to `claude/project-thread-3euhfs` as df25ec0 + 2ab84c6. One line, nothing forked. PR 136 is now contained in PR 135's branch.
 
