@@ -768,3 +768,18 @@ Astra7ca7eef/PR114 finishes authorizedread-onlyconsumertrace onSE5+Resistance, e
 
 ### 2026-11-06 Pacific — Native engine scale controller packaged for user test
 Astra8edb0bc/PR115complete: bothSnipernativeABIrelationshipsderived, engineownedexactscaleapplyandlive5modecontrols, existingJ2fulloutputhandoffgraphics/compute+merged/separate, preservedcurrent71motion/camera. ProductionbuildPASS,94uniqueaffectedPASS3unsupported16xMSAASKIP,5isolatedinstallerPASS. SE5DLSS/DLAA/sceneCMDsunifiedtoNA-SE5-native-scale-8edb0bc, previous/originalrollbackretained; gameuntouchedbyagent. NextfiniteactionCortlivewindowed/borderless/fullscreenqualitycontrolsandactualinput/output/pictureacceptance. Source/packagereceiptsCOMMSandSNIPER-NATIVE-SCALE-CONTROL-20261106. Do not addanotherframework/reviewcycle orclaimliveallgamescompatibilityfromfixture. Opuslatervelocity/flowprobechangesseparate, no CMDpointerrace.
+
+## Final builds per game (Cort, 2026-11-13 07:01Z)
+
+Cort: "Of each of those games, the final version declared to be workable should be labelled final, and merged, every version up to that point should be removed."
+
+| Game | Final build | Label to create | Evidence | In the code line (56e49ef)? |
+|---|---|---|---|---|
+| Anno 1800 | e7529c3 | `final/anno-1800` | GameCheck verified; Cort: "Sol fixed Anno" | yes |
+| Sniper Elite 5 | 446a274 | `final/sniper-elite-5` | about 2 h, DLAA on 99.89% of frames | yes |
+| Sniper Elite Resistance | 446a274 | `final/sniper-elite-resistance` | 99.6% of game frames | yes |
+| Call of Duty WWII | fc0e6bd | `final/cod-wwii` | 96.3%, GameCheck verified | yes |
+| Battlefield 4 | none yet | | 56e49ef staged, not run | |
+| Hearts of Iron IV | none yet | | 496d691 staged, not run | |
+
+Rule from now on: when a game gets a newer workable build, this row moves to it, the label moves, and the earlier packages for that game are removed. The finals are not yet on the consolidation branch or `main` (446a274 and e7529c3 sit on the line above it); merging them there is Sol's step as merger.
