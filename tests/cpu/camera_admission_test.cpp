@@ -267,6 +267,20 @@ int main()
             for (uint64_t frame = 1; frame <= 4; ++frame) s = fresh.Admit({Bound(block, 2)}, kW, kH, frame);
             CHECK(s.how == Admitted::Started && s.candidate.byte_offset == 176);
         }},
+        {"the learned place is the most-drawn range of that shape, wherever it starts this frame", [] {
+            // Recorded (run p39980, frame 52464): the world view's block and two first-person
+            // blocks of the same size sit side by side at one slot; the world view had 43 draws.
+            const uint64_t ring = 7;
+            const std::vector<BoundRange> frame{{ring, 2, 21456, 32, 3}, {ring, 2, 21488, 32, 43}, {ring, 2, 21424, 32, 2},
+                                                {ring, 0, 29296, 800, 86}, {9, 2, 21456, 32, 500}};
+            // Last frame the camera was read at 21456: this frame that start holds the first-person block.
+            CHECK(LearnedRange(frame, ring, 2, 21456, 32) == 1);
+            CHECK(LearnedRange(frame, ring, 2, 13392, 32) == 1); // a start never seen before
+            CHECK(LearnedRange(frame, ring, 3, 21456, 32) == -1); // no range of that shape
+            const std::vector<BoundRange> tie{{ring, 2, 100, 32, 5}, {ring, 2, 200, 32, 5}};
+            CHECK(LearnedRange(tie, ring, 2, 200, 32) == 1);     // equal draws: the start it had
+            CHECK(LearnedRange(tie, ring, 2, 300, 32) == 0);
+        }},
         {"empty and short blocks are skipped, and only the first twelve are read", [] {
             NoInverseCamera rule;
             std::vector<AdmissionBlock> blocks(NoInverseCamera::kMaxBlocks);

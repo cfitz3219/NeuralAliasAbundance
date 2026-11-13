@@ -676,10 +676,24 @@ bool CameraSearch(CameraPick* out, const CameraUpload** upload_out, uint64_t* ve
     const bool viewport = g_vpj_route.load(std::memory_order_relaxed);
     if (viewport && split()) return true;
     auto bindings = g_model.SceneCameraBindings();
-    // Prefer the learned range, but never substitute its last frame's bytes.
+    // Best-ranked first: the ranges most scene draws read.
+    std::stable_sort(bindings.begin(), bindings.end(), [](const auto& l, const auto& r) { return l.draws > r.draws; });
+    // Prefer the learned place, but never substitute its last frame's bytes.
+    // VARIANT: camera/learned-place (the rule is providers/camera/camera_admission.hpp)
+    std::vector<camera::BoundRange> ranges;
+    ranges.reserve(bindings.size());
+    for (const auto& b : bindings) ranges.push_back({b.buffer, b.slot, b.first, b.count, b.draws});
+    const int learned_index = camera::LearnedRange(ranges, s.camera_cb, s.camera_slot, g_camera_first, g_camera_num);
+    uint32_t learned_first = 0, learned_count = 0;
+    Id learned_buffer = 0;
+    int learned_slot = -1;
+    if (learned_index >= 0) {
+        const auto& b = bindings[static_cast<size_t>(learned_index)];
+        learned_buffer = b.buffer; learned_slot = b.slot; learned_first = b.first; learned_count = b.count;
+    }
     const auto is_learned = [&](const auto& b) {
-        return b.buffer == s.camera_cb && b.slot == s.camera_slot &&
-               b.first == g_camera_first && b.count == g_camera_num;
+        return learned_index >= 0 && b.buffer == learned_buffer && b.slot == learned_slot &&
+               b.first == learned_first && b.count == learned_count;
     };
     std::stable_partition(bindings.begin(), bindings.end(), is_learned);
     for (const auto& b : bindings) {
@@ -943,7 +957,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         const bool relative = camera::IsCameraRelative(cam.vp);
         const uint64_t signature = (uint64_t(static_cast<int>(pose_check)) << 48) ^ (uint64_t(cam.offset) << 8) ^
                                    (uint64_t(cam_sel.camera_slot + 1) << 2) ^ (relative ? 2u : 0u) ^ (held ? 1u : 0u);
-        if (signature != last_signature && logged < 400) {
+        if (signature != last_signature && logged < 2000) {
             last_signature = signature;
             ++logged;
             camera::VpGeometry geo{};

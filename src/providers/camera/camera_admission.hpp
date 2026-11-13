@@ -218,6 +218,27 @@ struct Admission {
     uint32_t streak = 0;     // frames the start candidate has persisted (kFrames admits)
 };
 
+// VARIANT: camera/learned-place
+// Which of this frame's bound ranges is the place the camera was learned at. A game that carves
+// its per-frame constants out of one large buffer gives the camera block a new start every frame,
+// and often binds several blocks of the same shape (one per view: the world, a first-person pass).
+// The place is therefore the buffer, the slot and the size of the range, and among those the range
+// most scene draws read: the scene's camera is the one most of the scene was drawn with. The start
+// only breaks a tie. Returns the index into `ranges`, or -1 when none has that shape.
+struct BoundRange { uint64_t buffer; int slot; uint32_t first, count, draws; };
+inline int LearnedRange(const std::vector<BoundRange>& ranges, uint64_t buffer, int slot, uint32_t first, uint32_t count)
+{
+    int best = -1;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        const auto& r = ranges[i];
+        if (r.buffer != buffer || r.slot != slot || r.count != count) continue;
+        if (best < 0) { best = static_cast<int>(i); continue; }
+        const auto& b = ranges[static_cast<size_t>(best)];
+        if (r.draws > b.draws || (r.draws == b.draws && r.first == first && b.first != first)) best = static_cast<int>(i);
+    }
+    return best;
+}
+
 class NoInverseCamera {
 public:
     static constexpr size_t kMaxBlocks = 12;
