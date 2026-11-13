@@ -442,7 +442,8 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     const UINT camera_size = g.campaign_split_camera ? 64u : g.campaign_pixel_range ? g.camera_snapshot_size : g.campaign_camera ? 1280u : 512u;
     const int vs_slot = g.campaign_split_camera ? 1 : g.campaign_pixel_range ? -1 : g.campaign_native_pose ? 3 : 0;
     auto* expected_cb = g.campaign_split_camera ? g.split_projection.Get() : g.cam_cb.Get();
-    if (!f.camera.bytes || f.camera.size != camera_size || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(expected_cb)) ||
+    if (!f.camera.bytes || (g.campaign_pixel_range && g.camera_ring_offset >= 65536 ?
+        f.camera.size < 1280 || f.camera.size > 16 * 1024 : f.camera.size != camera_size) || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(expected_cb)) ||
         f.camera.vs_slot != vs_slot) {
         if (!s.no_camera)
             std::printf("camera handed over: bytes=%p size=%u buffer=%llx (game %llx) slot=%d first=%u num=%u version=%llu\n",
@@ -924,12 +925,27 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(evaluations >= before_large + 9 &&
                g_seen.last.camera.first_constant == g.camera_ring_offset / 16 &&
                g_seen.last.camera.bytes_first_constant < g_seen.last.camera.first_constant &&
-               g_seen.last.camera.size == g.camera_snapshot_size,
+               g_seen.last.camera.size <= 16 * 1024,
                "DLAA receives the current high-offset binding without copying the whole ring");
-        // A write to an unfamiliar part of the allocation must never pair
-        // with the old window. Once observed, the new range is captured.
+        // The real run rotates between distant ranges of the same buffer.
+        // After both have been observed, no frame may borrow stale bytes or
+        // drop out just because the range differs from the previous frame.
+        const uint32_t first_range = g.camera_ring_offset;
+        const uint32_t second_range = 46000 * 16;
+        g.camera_ring_offset = second_range;
+        present_campaign();
+        present_campaign();
+        const auto before_alternating = evaluations;
+        for (int i = 0; i < 12; ++i) {
+            g.camera_ring_offset = i % 2 ? first_range : second_range;
+            present_campaign();
+            expect(g_seen.last.camera.first_constant == g.camera_ring_offset / 16,
+                   "each alternating frame consumes its own camera range");
+        }
+        expect(evaluations == before_alternating + 12, "learned disjoint ranges sustain uninterrupted DLAA");
+        // An unfamiliar binding must never reuse a captured window.
         const auto before_jump = evaluations;
-        g.camera_ring_offset += 128 * 1024;
+        g.camera_ring_offset = 982 * 1024;
         present_campaign();
         expect(evaluations == before_jump, "a disjoint large-buffer binding cannot reuse old camera bytes");
         for (int i = 0; i < 8; ++i) present_campaign();
