@@ -136,6 +136,12 @@ struct Game {
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
     ComPtr<ID3D11ShaderResourceView> color_srv;
     bool campaign_split_camera = false, split_tie = false;
+    // A layered (deferred) renderer: the scene's geometry goes into two 8-bit material layers,
+    // lighting reads them into the picture, and the rest of the scene is drawn into the picture.
+    bool layered = false;
+    ComPtr<ID3D11Texture2D> layer, layer2;
+    ComPtr<ID3D11RenderTargetView> layer_rtv, layer2_rtv;
+    ComPtr<ID3D11ShaderResourceView> layer_srv;
     ComPtr<ID3D11Buffer> cam_cb, obj_cb, split_world, split_projection;
     ComPtr<ID3D11VertexShader> vs, vs_post;
     ComPtr<ID3D11PixelShader> ps_scene, ps_tonemap, ps_hud;
@@ -345,7 +351,9 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     // Main scene.
     UploadCamera(c, g, MainVp(frame), true);
     ID3D11RenderTargetView* rt = g.color_rtv.Get();
-    c->OMSetRenderTargets(1, &rt, g.dsv.Get());
+    ID3D11RenderTargetView* layers[2] = {g.layer_rtv.Get(), g.layer2_rtv.Get()};
+    if (g.layered) c->OMSetRenderTargets(2, layers, g.dsv.Get());
+    else c->OMSetRenderTargets(1, &rt, g.dsv.Get());
     const float clear[4] = {0.1f, 0.2f, 0.3f, 1.f};
     c->ClearRenderTargetView(g.color_rtv.Get(), clear);
     c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
@@ -372,6 +380,22 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
             }
         }
         SetObject(c, g, i); c->Draw(4, 0);
+    }
+    if (g.layered) {
+        // Lighting: reads the layers, writes the picture, no depth.
+        c->OMSetRenderTargets(1, &rt, nullptr);
+        ID3D11ShaderResourceView* layer = g.layer_srv.Get();
+        c->PSSetShaderResources(0, 1, &layer);
+        c->VSSetShader(g.vs_post.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_tonemap.Get(), nullptr, 0);
+        c->Draw(4, 0);
+        ID3D11ShaderResourceView* none = nullptr;
+        c->PSSetShaderResources(0, 1, &none);
+        // The rest of the scene (sky, glass, smoke): into the picture, with the scene depth.
+        c->VSSetShader(g.vs.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_scene.Get(), nullptr, 0);
+        c->OMSetRenderTargets(1, &rt, g.dsv.Get());
+        for (int i = 0; i < 4; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
     }
 }
 
@@ -997,6 +1021,43 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(evaluations >= before_restore + 2 && g_seen.last.camera.size == 32768 &&
                g_seen.last.camera.bytes_first_constant == 0,
                "the original small-buffer capture resumes after returning to a new buffer");
+    }
+    {
+        // A layered renderer (shape recorded from a real game: DLAA was handed the 8-bit normals
+        // layer, the most-drawn target, while the lit picture went to the screen untouched).
+        D3D11_TEXTURE2D_DESC layer_desc{};
+        g.color->GetDesc(&layer_desc);
+        layer_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        expect(SUCCEEDED(g.device->CreateTexture2D(&layer_desc, nullptr, &g.layer)) &&
+               SUCCEEDED(g.device->CreateRenderTargetView(g.layer.Get(), nullptr, &g.layer_rtv)) &&
+               SUCCEEDED(g.device->CreateShaderResourceView(g.layer.Get(), nullptr, &g.layer_srv)) &&
+               SUCCEEDED(g.device->CreateTexture2D(&layer_desc, nullptr, &g.layer2)) &&
+               SUCCEEDED(g.device->CreateRenderTargetView(g.layer2.Get(), nullptr, &g.layer2_rtv)),
+               "create two material layers");
+        g.layered = true;
+        for (int i = 0; i < 6; ++i) present_campaign(); // the layers are seen, then their read, then the whole scene
+        const auto before_layered = evaluations;
+        const auto calls_before_layered = g_seen.calls;
+        bool picture = true, whole_scene = true;
+        for (int i = 0; i < 14; ++i) {
+            const auto calls = g_seen.calls;
+            present_campaign();
+            if (g_seen.calls == calls) continue; // judged on the frames handed over; their number is checked below
+            picture = picture && g_seen.last.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get()) &&
+                      g_seen.last.color.format == kSceneFormat;
+            whole_scene = whole_scene && g_seen.last.scene_draws == 44;
+        }
+        char scene_status[4096]; // the scene field closes a line longer than the shared 512-byte buffer
+        na::native11::FormatStatus(scene_status, sizeof scene_status);
+        std::printf("native layered scene: %s\n", scene_status);
+        expect(picture && g_seen.calls >= calls_before_layered + 10 && evaluations >= before_layered + 10,
+               "a layered renderer: DLAA is handed the lit picture, never the most-drawn material layer");
+        expect(whole_scene && std::strstr(scene_status, "scene{picture=after-layers") != nullptr,
+               "the scene is the layers' draws and the picture's draws, and the status says which rule chose");
+        g.layered = false;
+        for (int i = 0; i < 4; ++i) present_campaign();
+        expect(g_seen.last.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get()) && g_seen.last.scene_draws == 40,
+               "a scene drawn into one target again keeps its picture");
     }
     na::settings::Get().j2_sharpness.store(60);
     na::settings::Get().j2_preset.store(11);

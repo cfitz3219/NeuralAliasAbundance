@@ -302,6 +302,195 @@ int main()
         expect(m.LearnedTag() == 22, "and is learned again once it is unique");
     }
 
+    // ---- scene/after-layers: a layered (deferred) renderer ----
+    // Shape recorded from a real game (run p15540): the most-drawn target with the scene depth is
+    // an 8-bit material layer (format 28) written with other targets; lighting reads it; the rest
+    // of the scene (sky, glass, smoke) is then drawn with the same depth into a floating-point
+    // target (format 10), which the tonemap reads. The picture is that later target.
+    {
+        enum : Id { kNormals = 20, kLit = 21, kGlow = 22, kOther = 30 };
+        const auto targets = [](Event e, uint8_t n) { e.rt_count = n; return e; };
+        struct Shape {
+            int layer_draws = 200, later_draws = 12;
+            uint8_t layer_targets = 4;
+            bool lit_read = true, late_world_marks = false;
+            int early_lit_draws = 0; // draws into the picture with the scene depth before the layers are read
+            int glow_draws = 0;      // a second floating-point target drawn with the scene depth before the layers are read
+            int other_targets = 0;   // more 8-bit targets of the same size, each drawn more than the picture
+        };
+        const auto frame = [&](const Shape& k) {
+            std::vector<Event> f;
+            f.push_back(Upd(kCamCb));
+            for (int i = 0; i < 30; ++i) f.push_back(Draw(kShadowRt, kShadowDepth, 300));
+            f.push_back(Upd(kCamCb));
+            for (int i = 0; i < k.layer_draws; ++i) f.push_back(targets(Draw(kNormals, kDepth, 900), k.layer_targets));
+            for (int t = 0; t < k.other_targets; ++t)
+                for (int i = 0; i < 20; ++i) f.push_back(targets(Draw(Id(kOther + t), kDepth, 90), 1));
+            for (int i = 0; i < k.early_lit_draws; ++i) f.push_back(targets(Draw(kLit, kDepth, 600), 1));
+            for (int i = 0; i < k.glow_draws; ++i) f.push_back(targets(Draw(kGlow, kDepth, 60), 1));
+            f.push_back(Read(kNormals));                       // lighting reads the layers
+            f.push_back(targets(Draw(kLit, 0, 3, 0, 0), 1));   // a full-screen pass into the picture, no depth
+            for (int i = 0; i < k.later_draws; ++i) f.push_back(targets(Draw(kLit, kDepth, 600), 1));
+            if (k.lit_read) f.push_back(Read(kLit));           // tonemap: <- DLSS point
+            f.push_back(Draw(kBackBuffer, 0, 3, 0, 0));
+            if (k.lit_read) f.push_back(Read(kLit));           // bloom reads it again
+            if (k.glow_draws) f.push_back(Read(kGlow));        // and adds the glow
+            if (k.late_world_marks)
+                for (int i = 0; i < 5; ++i) f.push_back(targets(Draw(kBackBuffer, kDepth, 30), 1)); // depth-tested marks after post
+            for (int i = 0; i < 20; ++i) f.push_back(Draw(kBackBuffer, 0, 6, 0, 0));
+            return f;
+        };
+        // As the DX11 hooks do: only reads of the scene colour and of the watched targets are reported.
+        const auto run = [](FrameModel& m, const std::vector<Event>& f) {
+            const Id color = m.Current().color;
+            const std::vector<Id> watch = m.Watch();
+            int fired = -1;
+            for (size_t i = 0; i < f.size(); ++i) {
+                if (f[i].kind == Kind::Read) {
+                    bool seen = f[i].resource == color;
+                    for (Id w : watch) seen = seen || w == f[i].resource;
+                    if (!seen) continue;
+                    if (m.ShouldFireBeforeRead(f[i].resource)) { m.MarkFired(); fired = int(i); }
+                }
+                m.Feed(f[i]);
+            }
+            m.EndFrame();
+            return fired;
+        };
+        const auto setup = [&](FrameModel& m, bool lit_float = true, bool layer_float = false) {
+            Setup(m);
+            m.SetInfo(kNormals, {1920, 1080, 28, 1, false, layer_float});
+            m.SetInfo(kLit, {1920, 1080, 10, 1, false, lit_float});
+            m.SetInfo(kGlow, {1920, 1080, 10, 1, false, true});
+            for (Id t = 0; t < 12; ++t) m.SetInfo(kOther + t, {1920, 1080, 28, 1, false, false});
+        };
+        const auto tonemap_index = [](const std::vector<Event>& f) {
+            int last_scene = -1;
+            for (size_t i = 0; i < f.size(); ++i)
+                if (f[i].kind == Kind::Draw && f[i].depth == kDepth && (f[i].rt0 == kNormals || f[i].rt0 == kLit)) last_scene = int(i);
+            for (size_t i = size_t(last_scene + 1); i < f.size(); ++i)
+                if (f[i].kind == Kind::Read && f[i].resource == kLit) return int(i);
+            return -1;
+        };
+        {
+            FrameModel m;
+            setup(m);
+            const Shape shape;
+            run(m, frame(shape));
+            expect(m.Current().color == kNormals && !m.Layered(), "layered game, frame 1: the most-drawn target is taken first, as before");
+            int fired = -1, frames = 1;
+            for (; frames < 12 && m.Current().color != kLit; ++frames) run(m, frame(shape));
+            expect(m.Current().color == kLit && m.Current().depth == kDepth && frames <= 5,
+                   "the picture becomes the floating-point target the scene goes on in after the layers are read");
+            expect(m.Layered() && m.Layer() == kNormals && m.LastChoice().rule == FrameModel::PictureRule::AfterLayers &&
+                   m.LastChoice().most_drawn == kNormals && m.LastChoice().picture == kLit,
+                   "and the choice says why: material layers, then the picture");
+            run(m, frame(shape)); // learns the point with the new selection
+            const auto f = frame(shape);
+            m.SetCamera(kCamCb, 0);
+            fired = run(m, f);
+            expect(fired == tonemap_index(f) && fired > 0, "DLSS runs right before the tonemap's read of the picture, not at the layers' read");
+            expect(m.GetStats().last_scene_draws == 212 && m.GetStats().camera_scene_draws == 212 && m.GetStats().contradictions == 0,
+                   "the scene is the layers' draws and the picture's draws: the camera is ranked over all of them");
+            // An indoor view: nothing more is drawn into the picture after lighting.
+            Shape indoor;
+            indoor.later_draws = 0;
+            bool kept = true, fired_all = true;
+            for (int i = 0; i < 6; ++i) {
+                const auto g = frame(indoor);
+                const int at = run(m, g);
+                kept = kept && m.Current().color == kLit && m.Layered();
+                fired_all = fired_all && at == tonemap_index(g);
+            }
+            expect(kept, "a frame with no draw of its own into the picture keeps the picture (it is still read after the layers)");
+            expect(fired_all && m.GetStats().selection_changes == 1, "and DLSS still runs before the tonemap on those frames");
+            // Depth-tested marks drawn into the back buffer after post do not move the point.
+            Shape marks;
+            marks.late_world_marks = true;
+            bool steady = true;
+            for (int i = 0; i < 4; ++i) {
+                const auto g = frame(marks);
+                steady = steady && run(m, g) == tonemap_index(g);
+            }
+            expect(steady && m.GetStats().contradictions == 0, "depth-tested draws into another target after post are not scene draws");
+            // The picture in use is drawn with the scene depth only before the lighting on some frames.
+            Shape early;
+            early.later_draws = 0;
+            early.early_lit_draws = 6;
+            bool held = true;
+            for (int i = 0; i < 6; ++i) {
+                const auto g = frame(early);
+                const int at = run(m, g);
+                held = held && m.Current().color == kLit && m.Layered() && at == tonemap_index(g);
+            }
+            expect(held && m.GetStats().selection_changes == 1,
+                   "the picture in use stays while it is still read after the layers, wherever its own draws fall");
+        }
+        {
+            // Ten more 8-bit targets of the same size, each drawn more than the picture: the picture
+            // is still watched and found, and an indoor frame keeps it.
+            FrameModel m;
+            setup(m);
+            Shape busy;
+            busy.other_targets = 10;
+            int frames = 0;
+            for (; frames < 12 && m.Current().color != kLit; ++frames) run(m, frame(busy));
+            bool listed = false;
+            for (const auto& n : m.LastChoice().candidates) listed = listed || n.id == kLit;
+            expect(m.Current().color == kLit && m.Layered() && frames <= 5 && listed,
+                   "a picture drawn less than many other targets is still followed, and the note lists it");
+            run(m, frame(busy)); // learns the point with the new selection
+            busy.later_draws = 0;
+            bool kept = true, fired_all = true;
+            for (int i = 0; i < 6; ++i) {
+                const auto g = frame(busy);
+                const int at = run(m, g);
+                kept = kept && m.Current().color == kLit && m.Layered();
+                fired_all = fired_all && at == tonemap_index(g);
+            }
+            expect(kept, "and it is kept on frames that draw nothing more into it");
+            expect(fired_all, "with DLSS still before the tonemap");
+        }
+        const auto settles_on = [&](const Shape& shape, bool lit_float, bool layer_float, const char** why) {
+            FrameModel m;
+            setup(m, lit_float, layer_float);
+            for (int i = 0; i < 8; ++i) run(m, frame(shape));
+            if (why) *why = m.LastChoice().why;
+            return m.Layered() ? Id(0) : m.Current().color;
+        };
+        const char* why = "";
+        Shape alone;
+        alone.layer_targets = 1;
+        expect(settles_on(alone, true, false, &why) == kNormals && std::strstr(why, "drawn alone"),
+               "a most-drawn target drawn alone is not a layer: the old rule stands (and says why)");
+        expect(settles_on(Shape{}, true, true, &why) == kNormals && std::strstr(why, "floating point"),
+               "a floating-point most-drawn target can be the picture: the old rule stands");
+        expect(settles_on(Shape{}, false, false, &why) == kNormals && std::strstr(why, "no floating-point target"),
+               "no floating-point target after the layers: the old rule stands");
+        Shape glow; // an 8-bit picture written with a second target, and a floating-point glow target drawn before the picture is read
+        glow.glow_draws = 8;
+        expect(settles_on(glow, false, false, &why) == kNormals && std::strstr(why, "only before"),
+               "a floating-point target drawn only before the most-drawn target is read is not the picture: the old rule stands");
+        Shape early_only; // from a fresh start, draws only before the lighting do not make a picture
+        early_only.later_draws = 0;
+        early_only.early_lit_draws = 6;
+        expect(settles_on(early_only, true, false, &why) == kNormals && std::strstr(why, "only before"),
+               "a target not yet in use must be drawn after the layers are read to become the picture");
+        Shape unread;
+        unread.lit_read = false;
+        expect(settles_on(unread, true, false, &why) == kNormals && std::strstr(why, "never read"),
+               "a later target that is never read gives no place to run: the old rule stands");
+    }
+    // The first shape in this file (one colour target, drawn alone) never becomes layered.
+    {
+        FrameModel m;
+        Setup(m);
+        for (int i = 0; i < 6; ++i) RunImmediate(m, Frame());
+        expect(m.Current().color == kColor && !m.Layered() && m.Layer() == 0 && m.GetStats().layered_frames == 0 &&
+               m.LastChoice().rule == FrameModel::PictureRule::MostDrawn,
+               "a game that draws its scene into one target keeps the most-drawn rule");
+    }
+
     std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: DX11 frame model\n", g_failed);
     return g_failed ? 1 : 0;
 }

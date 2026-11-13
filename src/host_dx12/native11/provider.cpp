@@ -138,6 +138,7 @@ struct Ctx {
     uint64_t sampler_policy = ~uint64_t{0};
     bool deferred = false;
     Id rt0 = 0, depth = 0;
+    uint8_t rt_count = 0;              // render targets bound together
     bool depth_test = true;
     Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
     uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
@@ -164,6 +165,7 @@ struct Ctx {
     {
         sampler_policy = ~uint64_t{0};
         rt0 = depth = 0;
+        rt_count = 0;
         depth_test = true;
         std::memset(cb, 0, sizeof(cb));
         std::memset(cb_first, 0, sizeof(cb_first));
@@ -195,6 +197,10 @@ uint64_t g_list_order = 0;
 std::atomic<ID3D11Device*> g_device_raw{nullptr};
 IDXGISwapChain* g_swap = nullptr; // identity only
 std::atomic<Id> g_sel_color{0};    // readable from any thread
+// VARIANT: scene/after-layers (the rule is native11/frame_model.hpp)
+std::atomic<Id> g_sel_layer{0};         // the scene is drawn through material layers: their most-drawn target (0 = no layers)
+constexpr size_t kWatch = 4;
+std::atomic<Id> g_watch[kWatch];        // targets whose reads the frame model needs besides the scene colour
 
 std::atomic<Id> g_cand[kMaxCandidates + 1] = {};
 // Only populated by uploads larger than kMaxCbBytes. An empty window
@@ -1402,6 +1408,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     Event e;
     e.kind = Kind::Draw;
     e.rt0 = x->rt0;
+    e.rt_count = x->rt_count;
     e.depth = x->depth;
     e.depth_test = x->depth_test;
     e.vertices = vertices;
@@ -1412,7 +1419,10 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         e.cb_first[i] = static_cast<uint16_t>(x->cb_first[i]);
         e.cb_count[i] = static_cast<uint16_t>(x->cb_num[i]);
     }
-    if (!x->deferred && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed)) {
+    const bool picture_draw = e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed);
+    const bool layer_draw = e.depth_test && e.rt0 && e.rt0 == g_sel_layer.load(std::memory_order_relaxed) &&
+                            e.depth == g_sel_depth.load(std::memory_order_relaxed);
+    if (!x->deferred && (picture_draw || layer_draw)) {
         // Scene-draw facts the frame model does not keep: viewport extent and the camera's offset binding.
         std::lock_guard<std::mutex> l(g_mu);
         const Selection& s = g_model.Current();
@@ -1424,15 +1434,39 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         }
     }
     ExactSet exact;
-    if (e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed)) exact = ExactForDraw(c, x);
+    if (picture_draw || layer_draw) exact = ExactForDraw(c, x);
     Emit(x, c, e, {}, exact);
+}
+// The scene colour first met through a read, before any bind as a render target: its view as read.
+ViewUse SrvUse(ID3D11ShaderResourceView* v)
+{
+    D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+    v->GetDesc(&d);
+    ViewUse u;
+    u.format = d.Format;
+    if (d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) u.mip = d.Texture2D.MostDetailedMip;
+    else if (d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) { u.mip = d.Texture2DArray.MostDetailedMip; u.slice = d.Texture2DArray.FirstArraySlice; }
+    else if (d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY) u.slice = d.Texture2DMSArray.FirstArraySlice;
+    return u;
+}
+// Reads of the scene colour, and of the few other targets the frame model watches (a material
+// layer's read is what shows that the scene goes on in another target).
+bool Watched(Id r, Id color)
+{
+    if (!r) return false;
+    if (r == color) return true;
+    for (const auto& w : g_watch)
+        if (w.load(std::memory_order_relaxed) == r) return true;
+    return false;
 }
 void ReadEvents(ID3D11DeviceContext* c, UINT n, ID3D11ShaderResourceView* const* views)
 {
     Ctx* x = Get(c);
     if (!x || !views) return;
     const Id color = g_sel_color.load(std::memory_order_relaxed);
-    if (!color) return;
+    if (!color && !g_watch[0].load(std::memory_order_relaxed)) return;
+    Id sent[kWatch + 1] = {};
+    size_t sent_n = 0;
     for (UINT i = 0; i < n; ++i) {
         if (!views[i]) continue;
         Id r = 0;
@@ -1440,20 +1474,27 @@ void ReadEvents(ID3D11DeviceContext* c, UINT n, ID3D11ShaderResourceView* const*
             Inside in;
             r = ResourceOfView(views[i]);
         }
-        if (r != color) continue;
-        if (!x->deferred) {
+        if (!Watched(r, color)) continue;
+        bool again = false;
+        for (size_t k = 0; k < sent_n; ++k) again = again || sent[k] == r;
+        if (again) continue; // one read of a target per bind call is enough
+        if (r == color && !x->deferred) {
             std::lock_guard<std::mutex> l(g_mu);
             if (IdOf(g_color_ref.Get()) != r) {
                 g_color_ref.Reset();
                 Inside in;
                 views[i]->GetResource(&g_color_ref);
+                // The view of the picture before this one must not describe it; the next bind as a
+                // render target says how the game writes it.
+                g_color_view = SrvUse(views[i]);
             }
         }
         Event e;
         e.kind = Kind::Read;
         e.resource = r;
         Emit(x, c, e);
-        return; // one read per bind call is enough
+        if (sent_n < kWatch + 1) sent[sent_n++] = r;
+        if (sent_n == kWatch + 1) return;
     }
 }
 void ReadResource(ID3D11DeviceContext* c, ID3D11Resource* src)
@@ -1461,7 +1502,7 @@ void ReadResource(ID3D11DeviceContext* c, ID3D11Resource* src)
     Ctx* x = Get(c);
     if (!x || !src) return;
     const Id r = IdOf(src);
-    if (!r || r != g_sel_color.load(std::memory_order_relaxed)) return;
+    if (!Watched(r, g_sel_color.load(std::memory_order_relaxed))) return;
     Event e;
     e.kind = Kind::Read;
     e.resource = r;
@@ -1780,10 +1821,21 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
     }
     x->rt0 = IdOf(rt);
     x->depth = IdOf(ds);
+    UINT bound = 0;
+    for (UINT i = 0; rtvs && i < n; ++i)
+        if (rtvs[i]) ++bound;
+    x->rt_count = static_cast<uint8_t>(bound);
     if (rt || ds) {
         std::lock_guard<std::mutex> l(g_mu);
         Inside in;
-        if (rt) g_model.SetInfo(IdOf(rt), InfoOf(rt, false));
+        if (rt) {
+            ResourceInfo info = InfoOf(rt, false);
+            // As the game writes it: the view's format, or the texture's when the view names none.
+            const uint32_t written = rt_use.format ? rt_use.format : info.format;
+            info.float_colour = written == DXGI_FORMAT_R16G16B16A16_FLOAT || written == DXGI_FORMAT_R11G11B10_FLOAT ||
+                                written == DXGI_FORMAT_R32G32B32A32_FLOAT || written == DXGI_FORMAT_R32G32B32_FLOAT;
+            g_model.SetInfo(IdOf(rt), info);
+        }
         if (ds) {
             g_model.SetInfo(IdOf(ds), InfoOf(ds, true));
             if (IdOf(ds) == g_model.Current().depth) {
@@ -2000,6 +2052,36 @@ bool OnPresent(IDXGISwapChain* swap)
         }
     }
     g_sel_color.store(s.color, std::memory_order_relaxed);
+    g_sel_layer.store(g_model.Layer(), std::memory_order_relaxed);
+    {
+        const auto& watch = g_model.Watch();
+        for (size_t i = 0; i < kWatch; ++i) g_watch[i].store(i < watch.size() ? watch[i] : 0, std::memory_order_relaxed);
+        // WHY log: which target is the picture and by which rule, whenever that changes.
+        const auto& note = g_model.LastChoice();
+        static uint64_t last_signature = ~uint64_t{0};
+        static uint32_t logged = 0;
+        const uint64_t signature = (s.color * 1099511628211ull) ^ (note.most_drawn << 1) ^ (note.picture * 31) ^
+                                   static_cast<uint64_t>(note.rule) ^ (reinterpret_cast<uintptr_t>(note.why) << 3);
+        if (signature != last_signature && logged < 300 && !note.candidates.empty()) {
+            last_signature = signature;
+            ++logged;
+            char list[2400] = "";
+            int at = 0;
+            for (const auto& n : note.candidates) {
+                if (at >= static_cast<int>(sizeof list) - 200) break;
+                at += std::snprintf(list + at, sizeof list - static_cast<size_t>(at), " [%s%s fmt=%u draws=%llu multi=%llu first=%llu last=%llu first_read=%llu read_after=%llu last_read=%llu float=%d same_size=%d]",
+                                    n.id == s.color ? "SELECTED " : "", n.id == note.picture ? "picture" : n.id == note.most_drawn ? "most-drawn" : "other",
+                                    n.format, static_cast<unsigned long long>(n.draws), static_cast<unsigned long long>(n.multi_target_draws),
+                                    static_cast<unsigned long long>(n.first_draw), static_cast<unsigned long long>(n.last_draw),
+                                    static_cast<unsigned long long>(n.first_read), static_cast<unsigned long long>(n.read_after),
+                                    static_cast<unsigned long long>(n.last_read), n.float_colour ? 1 : 0, n.same_size ? 1 : 0);
+            }
+            na::eventlog::Emit("native11_scene", "frame=%llu rule=%s layered=%d why=\"%s\" candidates:%s",
+                               static_cast<unsigned long long>(g_frame),
+                               note.rule == FrameModel::PictureRule::AfterLayers ? "after-layers" : "most-drawn",
+                               g_model.Layered() ? 1 : 0, note.why, list);
+        }
+    }
     g_scene_vp_x = g_scene_vp_y = g_scene_vp_w = g_scene_vp_h = 0;
     // Next frame's jitter: the backend's sample, written into the main camera's uploads.
     g_jitter_written = false;
@@ -2066,6 +2148,8 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
         g_split_draw = {};
         g_split_votes.clear();
         g_sel_color.store(0);
+        g_sel_layer.store(0);
+        for (auto& w : g_watch) w.store(0);
         g_sel_depth.store(0);
         g_vpj_sample.store(0);
     }
@@ -2220,6 +2304,8 @@ void Uninstall()
     g_lists.clear();
     g_ctx.clear();
     g_sel_color.store(0);
+    g_sel_layer.store(0);
+    for (auto& w : g_watch) w.store(0);
     g_sel_depth.store(0);
     g_vpj_sample.store(0);
 }
@@ -2252,10 +2338,17 @@ int FormatStatus(char* out, unsigned long n)
     std::memcpy(told, &told_bits, sizeof told);
     camera::RelativeLayout layout;
     bool layout_learned = false;
+    bool scene_layered = false, scene_float = false;
+    uint64_t scene_layered_frames = 0;
+    uint32_t scene_format = 0;
     {
         std::lock_guard<std::mutex> l(g_mu);
         layout = g_rel_layout;
         layout_learned = g_rel_learned;
+        scene_layered = g_model.Layered();
+        scene_layered_frames = g_model.GetStats().layered_frames;
+        scene_format = g_model.Current().color_info.format;
+        scene_float = g_model.Current().color_info.float_colour;
     }
     return std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
@@ -2268,7 +2361,8 @@ int FormatStatus(char* out, unsigned long n)
                          "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu} "
                          "exact_ranges{reads=%llu failed=%llu draws=%llu} "
                          "camera_path{steps=%llu reversals=%llu jumps=%llu} "
-                         "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu}%s%s%s",
+                         "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu} "
+                         "scene{picture=%s layered_frames=%llu colour_fmt=%u colour_float=%d}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
@@ -2301,7 +2395,9 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(g_exact_draws.load()),
                          static_cast<unsigned long long>(s.camera_steps), static_cast<unsigned long long>(s.camera_reversals),
                          static_cast<unsigned long long>(s.camera_jumps), told[0], told[1],
-                         static_cast<unsigned long long>(g_vpj_unshifted.load()), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
+                         static_cast<unsigned long long>(g_vpj_unshifted.load()),
+                         scene_layered ? "after-layers" : "most-drawn", static_cast<unsigned long long>(scene_layered_frames),
+                         scene_format, scene_float ? 1 : 0, s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
 

@@ -12,6 +12,18 @@
 //    draws or <= 3 vertices, and "frames" with a single depth and <= 8 draws
 //    (loading screens, menus);
 //  - colour: the render target drawn most with that depth bound, same size;
+//    VARIANT: scene/after-layers
+//    A layered (deferred) renderer draws most of the
+//    scene into material layers (several targets at once), reads them to light
+//    the scene, and only then draws the rest of the scene (sky, glass, smoke)
+//    into the picture with the same depth. There the most-drawn target is a
+//    layer, not the picture. Seen by shape, never by name: the most-drawn target
+//    is not floating point and is written together with other targets; it is
+//    read after being drawn; after that read a floating-point target of the
+//    same size is drawn with the same depth, and is read in turn. The picture
+//    is then that later target, and the scene is the draws into it plus the
+//    depth-tested draws into the layers, so the camera, the jitter and the DLSS
+//    point are taken over the whole scene. Anything else keeps the rule above;
 //  - camera blocks: VS/PS constant-buffer ranges actually bound by scene draws;
 //    stable buffers are ranked first, but frequently updated ranges remain
 //    candidates. The provider validates their draw-time snapshots;
@@ -75,6 +87,7 @@ constexpr int kCbBindSlots = 2 * kCbSlots;
 struct ResourceInfo {
     uint32_t width = 0, height = 0, format = 0, samples = 1;
     bool depth = false; // bound as a depth-stencil
+    bool float_colour = false; // the host saw it bound as a floating-point colour target (three or more channels)
 };
 
 enum class Kind : uint8_t {
@@ -88,6 +101,7 @@ struct Event {
     Kind kind = Kind::Draw;
     Id resource = 0;              // ClearDepth / Read / CbUpdate
     Id rt0 = 0, depth = 0;        // Draw: render target slot 0 and depth-stencil
+    uint8_t rt_count = 0;         // Draw: render targets bound together (0 = the host does not say)
     bool depth_test = false;      // Draw: depth test enabled in the bound state
     uint64_t vertices = 0;        // Draw: vertices (indices) x instances; 0 for indirect
     bool indirect = false;
@@ -121,6 +135,7 @@ public:
         uint32_t camera_scene_draws = 0; // scene draws with the camera cb bound (last frame)
         uint64_t tag_not_unique = 0;     // frames whose point's tag named more than one read
         uint32_t learned_overlay = 0;    // the HUD-rule point (n-th non-scene draw into the scene colour); 0 = none
+        uint64_t layered_frames = 0;     // frames whose picture came after material layers (scene/after-layers)
         double camera_share = 0;
         const char* last_miss = "";
     };
@@ -132,12 +147,36 @@ public:
     void Forget(Id id)
     {
         info_.erase(id);
+        if (sel_.depth == id || layer_ == id) { wide_ = false; layer_ = 0; }
         if (sel_.depth == id || sel_.color == id) { sel_ = Selection{}; learned_read_ = 0; learned_tag_ = 0; learned_overlay_ = 0; }
         if (sel_.camera_cb == id) { sel_.camera_cb = 0; sel_.camera_slot = -1; }
     }
     const Selection& Current() const { return sel_; }
     const Stats& GetStats() const { return stats_; }
     uint32_t SceneDrawsThisFrame() const { return scene_draws_; }
+    // The scene was seen to be drawn through material layers (kept until the scene depth changes).
+    bool Layered() const { return wide_; }
+    // The layers' first render target (the most-drawn one); 0 when the scene has no layers.
+    Id Layer() const { return wide_ ? layer_ : 0; }
+    // Targets whose reads the model needs besides the scene colour (same size, drawn with the scene depth).
+    const std::vector<Id>& Watch() const { return watch_; }
+    // WHY log: last frame's colour candidates for the scene depth, and why the picture was chosen.
+    struct ColourNote {
+        Id id = 0;
+        uint32_t format = 0;
+        // Event order within the frame (0 = never): its draws with the scene depth, the first read
+        // that followed a draw into it, the first read after its last draw, and its last read.
+        uint64_t draws = 0, multi_target_draws = 0, first_draw = 0, last_draw = 0, first_read = 0, read_after = 0, last_read = 0;
+        bool float_colour = false, same_size = false;
+    };
+    enum class PictureRule : uint8_t { MostDrawn, AfterLayers };
+    struct ChoiceNote {
+        PictureRule rule = PictureRule::MostDrawn;
+        const char* why = "";
+        Id most_drawn = 0, picture = 0;
+        std::vector<ColourNote> candidates; // most draws first: eight, and always the layer and the picture
+    };
+    const ChoiceNote& LastChoice() const { return note_; }
     bool FiredThisFrame() const { return fired_; }
     // The tag of the read learned as the DLSS point (Vulkan); 0 = none or not unique.
     uint64_t LearnedTag() const { return learned_tag_; }
@@ -204,7 +243,13 @@ public:
             ++d.clears;
             break;
         }
-        case Kind::Read:
+        case Kind::Read: {
+            // The first read of a target after its last draw (any target the host reports).
+            TargetUse& u = target_[e.resource];
+            u.last_read = events_;
+            if (u.last_draw && !u.read_after) u.read_after = events_;
+            if (u.last_draw && !u.first_read) u.first_read = events_;
+        }
             if (sel_.color && e.resource == sel_.color) {
                 ++color_reads_;
                 if (e.tag) ++read_tags_[e.tag];
@@ -342,6 +387,7 @@ public:
         // Reset per-frame counters.
         depth_.clear();
         color_.clear();
+        target_.clear();
         cb_scene_.clear();
         cb_ranges_.clear();
         camera_versions_.clear();
@@ -357,11 +403,17 @@ public:
         fired_at_scene_draws_ = 0;
     }
 
-    bool IsSceneDraw(const Event& e) const { return sel_.valid() && e.rt0 == sel_.color && e.depth == sel_.depth; }
+    // A draw of the scene: into the picture with the scene depth, or (with material layers) a
+    // depth-tested draw into the layers with the scene depth.
+    bool IsSceneDraw(const Event& e) const
+    {
+        return sel_.valid() && e.depth == sel_.depth && (e.rt0 == sel_.color || (wide_ && e.depth_test && e.rt0 == layer_));
+    }
 
 private:
     struct Cand { uint64_t draws = 0, vertices = 0, clears = 0; bool indirect = false; };
-    struct PairCount { uint64_t draws = 0; };
+    struct PairCount { uint64_t draws = 0, multi_target_draws = 0, first_draw = 0, last_draw = 0; };
+    struct TargetUse { uint64_t last_draw = 0, first_read = 0, read_after = 0, last_read = 0; }; // event order within the frame
 
     void Draw(const Event& e)
     {
@@ -371,7 +423,18 @@ private:
             ++d.draws;
             d.vertices += e.vertices;
             d.indirect = d.indirect || e.indirect;
-            if (e.rt0) ++color_[{e.depth, e.rt0}].draws;
+            if (e.rt0) {
+                PairCount& c = color_[{e.depth, e.rt0}];
+                ++c.draws;
+                if (e.rt_count > 1) ++c.multi_target_draws;
+                if (!c.first_draw) c.first_draw = events_;
+                c.last_draw = events_;
+            }
+        }
+        if (e.rt0) {
+            TargetUse& u = target_[e.rt0];
+            u.last_draw = events_;
+            u.read_after = 0; // a read before this draw was not the finished target
         }
         if (IsSceneDraw(e)) {
             ++scene_draws_;
@@ -446,11 +509,19 @@ private:
             }
         }
         if (!best_color) return; // nothing usable this frame: keep the old choice
+        const Id most_drawn = best_color;
+        const bool layered = AfterLayers(best_depth, best_color);
+        if (layered) {
+            ++stats_.layered_frames;
+            if (best_depth == sel_.depth && best_color == sel_.color) { wide_ = true; layer_ = most_drawn; }
+        }
         if (best_depth == sel_.depth && best_color == sel_.color) { pending_frames_ = 0; return; }
         if (best_depth == pending_.first && best_color == pending_.second) ++pending_frames_;
         else { pending_ = {best_depth, best_color}; pending_frames_ = 1; }
         if (pending_frames_ >= 3 || !sel_.valid()) {
             if (sel_.valid()) ++stats_.selection_changes;
+            if (sel_.depth != best_depth) { wide_ = false; layer_ = 0; }
+            if (layered) { wide_ = true; layer_ = most_drawn; }
             sel_.depth = best_depth;
             sel_.color = best_color;
             sel_.depth_info = info_[best_depth];
@@ -464,6 +535,106 @@ private:
         }
     }
 
+    // VARIANT: scene/after-layers (see the top of this file). `color` comes in as the most-drawn
+    // target and leaves as the picture; true when the picture came after material layers. Also
+    // fills the WHY note and the list of targets whose reads the next frame needs.
+    bool AfterLayers(Id depth, Id& color)
+    {
+        const ResourceInfo& di = info_[depth];
+        note_ = ChoiceNote{};
+        note_.most_drawn = note_.picture = color;
+        const auto note_of = [&](Id id, const PairCount* drawn) {
+            ColourNote n;
+            n.id = id;
+            if (drawn) {
+                n.draws = drawn->draws;
+                n.multi_target_draws = drawn->multi_target_draws;
+                n.first_draw = drawn->first_draw;
+                n.last_draw = drawn->last_draw;
+            }
+            const auto u = target_.find(id);
+            if (u != target_.end()) {
+                n.first_read = u->second.first_read;
+                n.read_after = u->second.read_after;
+                n.last_read = u->second.last_read;
+            }
+            const auto it = info_.find(id);
+            if (it != info_.end()) {
+                n.format = it->second.format;
+                n.float_colour = it->second.float_colour;
+                n.same_size = it->second.width == di.width && it->second.height == di.height;
+            }
+            return n;
+        };
+        std::vector<ColourNote> all;
+        bool selected_listed = false;
+        for (const auto& kv : color_) {
+            if (kv.first.first != depth) continue;
+            all.push_back(note_of(kv.first.second, &kv.second));
+            selected_listed = selected_listed || kv.first.second == sel_.color;
+        }
+        // The picture in use stays a candidate on a frame that draws nothing more into it (an
+        // indoor view with no sky, glass or smoke): it is still read after the layers.
+        const bool in_use_here = wide_ && depth == sel_.depth && sel_.color != 0;
+        if (in_use_here && !selected_listed) all.push_back(note_of(sel_.color, nullptr));
+        std::sort(all.begin(), all.end(), [](const ColourNote& a, const ColourNote& b) {
+            return a.draws != b.draws ? a.draws > b.draws : a.id < b.id;
+        });
+        // Reads the next frame needs, four targets in all: the picture in use, the most-drawn
+        // target, the floating-point targets (only they can be the picture), then the rest.
+        watch_.clear();
+        const auto watch = [&](Id id) {
+            if (id && watch_.size() < 4 && std::find(watch_.begin(), watch_.end(), id) == watch_.end()) watch_.push_back(id);
+        };
+        watch(sel_.color);
+        watch(color);
+        for (const auto& n : all)
+            if (n.same_size && n.float_colour) watch(n.id);
+        for (const auto& n : all)
+            if (n.same_size) watch(n.id);
+        const ColourNote* layer = nullptr;
+        for (const auto& n : all)
+            if (n.id == color) layer = &n;
+        const ColourNote* picture = nullptr;
+        const char* why = "";
+        if (!layer) why = "the most-drawn target is not listed";
+        else if (layer->float_colour) why = "the most-drawn target is floating point: it can be the picture";
+        else if (layer->multi_target_draws * 4 < layer->draws) why = "the most-drawn target is drawn alone: not a material layer";
+        else if (!layer->first_read) why = "the most-drawn target is not read after being drawn";
+        else {
+            why = "no floating-point target of the same size is drawn with the scene depth after the layers are read";
+            for (const auto& n : all) {
+                if (n.id == color || !n.same_size || !n.float_colour) continue;
+                // The scene goes on in it after the layers are read, and it is read in turn. The
+                // picture in use also stays while it is still read after the layers, on a frame
+                // that draws nothing more into it or draws into it only before the lighting.
+                const bool goes_on = n.draws && n.last_draw >= layer->first_read;
+                const bool still_read = in_use_here && n.id == sel_.color && n.last_read >= layer->first_read;
+                if (!(goes_on && n.read_after) && !still_read) {
+                    why = goes_on ? "the later floating-point target is never read after its draws"
+                                  : "a floating-point target is drawn with the scene depth only before the layers are read";
+                    continue;
+                }
+                if (!picture || n.draws > picture->draws) picture = &n;
+            }
+        }
+        // The note lists the most-drawn eight, and always the layer and the picture.
+        note_.candidates.assign(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(std::min<size_t>(all.size(), 8)));
+        for (const ColourNote* must : {layer, picture}) {
+            if (!must) continue;
+            bool listed = false;
+            for (const auto& n : note_.candidates) listed = listed || n.id == must->id;
+            if (!listed) note_.candidates.push_back(*must);
+        }
+        if (!picture) { note_.why = why; return false; }
+        note_.rule = PictureRule::AfterLayers;
+        note_.why = picture->draws && picture->last_draw >= layer->first_read
+                        ? "material layers are read, then the scene goes on in a floating-point target"
+                        : "material layers are read; the picture in use is still read after them and is kept (no scene draw into it after them this frame)";
+        note_.picture = color = picture->id;
+        return true;
+    }
+
     struct PairHash {
         size_t operator()(const std::pair<Id, Id>& p) const { return std::hash<Id>()(p.first) ^ static_cast<size_t>(std::hash<Id>()(p.second) * 1099511628211ull); }
     };
@@ -475,6 +646,11 @@ private:
     std::unordered_map<Id, ResourceInfo> info_;
     std::unordered_map<Id, Cand> depth_;
     std::unordered_map<std::pair<Id, Id>, PairCount, PairHash> color_;
+    std::unordered_map<Id, TargetUse> target_;
+    std::vector<Id> watch_;
+    ChoiceNote note_;
+    bool wide_ = false; // the scene is drawn through material layers (until the scene depth changes)
+    Id layer_ = 0;      // their most-drawn target
     struct CbUse { uint32_t draws = 0, versions = 0, last_version = 0, first = 0, count = 0; };
     std::unordered_map<std::pair<Id, int>, CbUse, CbHash> cb_scene_;
     std::map<std::tuple<Id, int, uint32_t, uint32_t>, CbUse> cb_ranges_;
