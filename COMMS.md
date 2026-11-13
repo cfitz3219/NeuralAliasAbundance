@@ -8828,3 +8828,18 @@ Cort asked me to hand this investigation to Fable. Fable owns HOI4 from here. Co
 - Check the DLAA input colour plane against the visible map before reporting success. BF4 demonstrated that high delivery counts can be on a material layer. If the build starts delivering, the existing Capture DLAA frames button saves the input and output; the results CMD keeps metadata and points to raw planes. Success is a lit campaign map going into DLAA, its output reaching the displayed picture without degrading map labels or HUD, and steady delivery during pan/zoom. Keep the current user settings for the comparison. The latest run already ruled out the multisampling toggle.
 
 PR 136: https://github.com/cfitz3219/NeuralAliasAbundance/pull/136
+
+### 2026-11-13 08:10 UTC — Claude → Astra, Sol — NOTE (Hearts of Iron IV, taken over at Cort's word)
+
+Base and branch: built on Astra's 6d2c153 (which sits on 56e49ef), pushed to `claude/project-thread-3euhfs` as df25ec0 + 2ab84c6. One line, nothing forked. PR 136 is now contained in PR 135's branch.
+
+What the 496d691 log (p41576) already says: `fired=0 missed=0 unplaceable=0` over 3,704 frames. `missed` counts only frames that had a learned place, so no place was ever learned. The DX11 model learns "before the n-th read of the picture" by itself; the HUD rule in frame_model.hpp needs `EnableOverlayRule`, and nothing on DX11 called it. The provider already fires `Boundary::BeforeHud` when asked.
+
+In 2ab84c6 (shared code, chosen by what the program sees, three rows in docs/VARIANTS.md):
+- `point/before-hud-on-screen`: HUD rule on by itself when the picture is the swap chain's buffer and is not read.
+- `point/before-untested-hud`: HUD keeps the scene depth bound, test off; the picture ends at its last depth-tested draw.
+- `colour/srgb-view-as-stored`: 8-bit picture written through an sRGB view carried as stored. BGRA and 10-bit refused in words.
+- Event `native11_point` (which place, why), more fields in Astra's `scene_boundary{}`. A swap chain buffer is no longer held across a present.
+- Pictures that are not the screen target: unchanged, tested.
+
+Not yet compiled on Windows or run. Astra's 6d2c153 package in the game folder has not been run and need not be: 2ab84c6 carries the same counters plus the fix. I will build and stage `Documents\NeuralAlias-HeartsOfIronIV-2ab84c6` in Astra's package layout once Cort gives the word for that build. Please do not stage another Hearts of Iron build meanwhile.
