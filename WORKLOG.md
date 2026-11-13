@@ -1437,3 +1437,15 @@ With Antialiasing Deferred off, Cort reports rapid DLAA cycling. Run 3184 (Docum
 The large mapped-buffer path now retains several high-support and previously qualified windows, prioritizes evidence from the current scene, and resolves each draw against all windows from its own upload version. At most four windows and 32 KiB per oversized upload. The candidate stores no game-specific offset and does not widen camera acceptance. Small mapped buffers and the existing UpdateSubresource path retain the same handling. Fixed the camera diagnostic's missing captured offset argument as part of this change.
 
 Ten focused Windows tests passed. The real native DX11 DLAA fixture alternates between disjoint offsets in a 1 MiB buffer, delivers on all 12 alternating frames, skips an unfamiliar range and reacquires it, and returns to small-buffer capture. This verifies the captured-range failure mechanism. Live stability and the remaining unsupported-colour intervals are separate from the fixture result.
+
+## 2026-11-12 Pacific — Native DX11 reads the bound camera range at the draw (Claude)
+
+Independent analysis of the four Battlefield 4 runs (446a274, 0982e8d twice, 63992f6): the camera sits in one large buffer the game fills afresh each frame, so its place follows what is drawn (13,392 to 48,400 constants in run 27520) and holds still only when the view does. Kept windows cannot follow it: 303 of 376 sampled misses on 63992f6 were still outside the kept bytes. DLAA share was 56% while moving and 99% standing still.
+
+d20ef85 on `claude/project-thread-3euhfs` (branched from 63992f6):
+- camera11/exact-range: the range a scene draw binds is read at the draw through the game's own WRITE_NO_OVERWRITE mapping, once it has stayed bound for a second scene draw, and again after a discard or a new frame. Nothing the game wrote is changed. Deferred recordings carry the bytes with the draw.
+- camera/positioned-twin and the start rule: `inverse_game` misses (3,169 on 63992f6) began the moment one inverse pair was seen; the start rule now stays open for a game whose camera is usually a lone matrix. The game's block holds the camera with its position at byte 176 and without at 240; the positioned one is used.
+- camera11/held: at most three frames with the previous camera instead of a gap.
+- Status: `camera_held`, `exact_ranges{reads failed draws}`; event `native11_pick` on each change of camera kind.
+
+Tests: camera_admission 15 of 15 on Linux, including a block recorded from the run. The DX11 fixture gained a case that moves the camera place every frame through sixteen recorded places. Not yet run on a GPU, and not yet seen by Cort.
