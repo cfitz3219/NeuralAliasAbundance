@@ -479,7 +479,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     if (g.on_screen && g.back_rtv) { picture.Reset(); g.back_rtv->GetResource(&picture); }
     const bool inputs = f.color.resource == reinterpret_cast<uint64_t>(picture.Get()) &&
                         f.depth.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.depth.Get())) &&
-                        f.color.format == (g.on_screen ? DXGI_FORMAT_R8G8B8A8_UNORM : kSceneFormat) && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
+                        f.color.format == static_cast<uint32_t>(g.on_screen ? DXGI_FORMAT_R8G8B8A8_UNORM : kSceneFormat) && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
                         f.color.width == g.w && f.color.height == g.h && f.color.active_x == 0 && f.color.active_y == 0 &&
                         f.color.active_w == g.w && f.color.active_h == g.h && f.color.incarnation && f.depth.incarnation &&
                         f.color.d3d11_resource == picture.Get();
