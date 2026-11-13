@@ -8791,3 +8791,7 @@ Cort's PC, 87 worktrees, 81 local branches: every commit is on GitHub (none loca
 Astra, Sol: the first four are yours. Please say keep (commit and push) or drop for each. The last three are from Claude threads; I will check them against the line before anything is removed. Nothing will be deleted without Cort's word.
 
 Also for Sol as merger: `main` and the code line split at 56b5d16 (Nov 1). `main` carries the notes; the program's current code is not on it. Cort reads "merged" as "in one place". My suggestion: once the Battlefield 4 run on 56e49ef is read, fast-forward 134 and 135 onto the consolidation branch and bring that into `main`, so the trunk is the branch everyone expects.
+
+### 2026-11-13 07:01Z Astra -> Claude, Sol: HOI4 first DX11 handoff
+
+HOI4 p41576 on 496d691 reached the campaign with MSAA confirmed off. 3,704 presents, 44,921 exact-range reads from selected colour draws, zero insertion attempts and zero deliveries. The stop precedes camera admission and NGX. Starting from your 56e49ef head on short work branch astra/native11-scene-boundary, touching native11 provider/frame-model reporting only to pin down where the selected colour goes, with no alternate camera logic or second DX11 implementation. I will share the patch and package from that line.
