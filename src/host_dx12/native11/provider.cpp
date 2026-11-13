@@ -41,6 +41,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -113,6 +114,21 @@ struct CameraUploads {
     std::vector<CameraUpload> additional;
 };
 using DeferredUpload = std::pair<size_t, CameraUploads>;
+// VARIANT: camera11/exact-range
+// A large buffer the game fills piece by piece (D3D11_MAP_WRITE_NO_OVERWRITE) places each frame's
+// constants wherever its allocator has reached, so the place moves with what is drawn. No kept
+// window can follow that. When a scene draw binds a range of such a buffer, the range itself is
+// read at the draw, through the same no-overwrite mapping the game uses: earlier contents are
+// preserved by that mapping's contract, and nothing the game wrote is changed.
+struct ExactRange {
+    int slot = -1;
+    CameraUpload upload; // windowed: exactly the bound range
+};
+using ExactSet = std::shared_ptr<const std::vector<ExactRange>>;
+using DeferredExact = std::pair<size_t, ExactSet>; // from this draw event on (an empty set clears)
+constexpr uint32_t kExactMaxConstants = 1024;      // 16 KiB per bound range
+std::atomic<uint32_t> g_exact_frame{1};            // bumps at Present: a range is read again each frame
+std::atomic<uint64_t> g_exact_reads{0}, g_exact_failed{0}, g_exact_draws{0};
 constexpr size_t kMaxListEvents = 200000; // per deferred recording; beyond this the list's tail is not modelled
 constexpr size_t kMaxCandidates = 8;       // constant buffers searched for the camera (VS and PS)
 constexpr size_t kMaxLists = 512;          // recorded command lists kept
@@ -134,6 +150,16 @@ struct Ctx {
     std::vector<Event> events;        // deferred recording
     std::vector<DeferredUpload> cb_bytes; // (event index, bytes) for CbUpdate events
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
+    // Large constant buffers this context has itself mapped for writing since its state began.
+    struct LargeMap { uint32_t size = 0, epoch = 0; bool no_overwrite = false; };
+    std::unordered_map<Id, LargeMap> large;
+    // The exact range last read for each bound slot, and how long the same range has stayed bound.
+    struct ExactSlot { Id id = 0; uint32_t first = 0, count = 0, epoch = 0, frame = 0, repeats = 0; CameraBytes bytes; };
+    ExactSlot exact[kCbBindSlots];
+    ExactSet exact_set;                     // what the current draw carries
+    const void* exact_recorded = nullptr;   // deferred: the set the last recorded entry named
+    bool exact_recorded_any = false;
+    std::vector<DeferredExact> draw_bytes;  // deferred recording
     void reset_state()
     {
         sampler_policy = ~uint64_t{0};
@@ -150,6 +176,7 @@ struct Ctx {
 struct ListRecord {
     std::vector<Event> events;
     std::vector<DeferredUpload> cb_bytes;
+    std::vector<DeferredExact> draw_bytes;
     uint64_t order = 0;
 };
 // The view the scene used on a selected texture (typed format, subresource).
@@ -202,6 +229,23 @@ uint64_t g_stream = 0;                    // SceneFrame::stream; bumps when any 
 uint64_t g_stream_key[4] = {};            // colour and depth lifetime ids, camera buffer id and its lifetime id (0 = untagged)
 
 CameraPick g_camera;
+// VARIANT: camera11/held
+// The last camera delivered, kept so a frame or two on which the game's camera could not be read
+// still gets DLAA with that camera instead of a gap (a gap resets the temporal history, which shows
+// as a flash of the unprocessed picture). The DX12 host holds its camera the same way.
+constexpr uint64_t kHoldFrames = 3;
+struct HeldCamera {
+    bool valid = false;
+    CameraPick cam;
+    CameraUpload upload;
+    uint64_t version = 0, frame = 0;
+    std::optional<CameraFacts::RelativePose> split;
+    Id cb = 0;
+    int slot = -1;
+    uint32_t first = 0, num = 0;
+    Id color = 0, depth = 0;
+};
+HeldCamera g_held;
 // The relative camera (providers/camera/relative_camera.hpp): where its two ranges sit. Seeded with the
 // places one known game uses, replaced by what this game's own draws show when the seed gives no vote.
 camera::RelativeLayout g_rel_layout = wwii::RelativeSeedLayout();
@@ -404,6 +448,15 @@ CameraPick PickForScene(const std::vector<uint8_t>& bytes, const CameraPick& lea
     CameraPick pick;
     if (CheckLearned(bytes, learned, &pick, learned_binding) &&
         (!pick.derived_inverse || camera::MatchesSceneAspect(pick.vp, width, height))) {
+        // VARIANT: camera/positioned-twin (the rule is providers/camera/camera_admission.hpp)
+        camera::Candidate twin;
+        if (pick.derived_inverse && camera::IsCameraRelative(pick.vp) &&
+            camera::PositionedTwin(bytes.data(), bytes.size(), pick.vp, width, height, twin)) {
+            pick.offset = twin.byte_offset;
+            pick.layout = twin.layout;
+            pick.vp = twin.matrix;
+            pick.reversed = twin.reversed;
+        }
         check = pick.derived_inverse ? PoseCheck::NoInverse : PoseCheck::Generic;
         return pick;
     }
@@ -721,7 +774,7 @@ bool CameraNow(CameraPick* out, const CameraUpload** upload_out, uint64_t* versi
     if (!found) return false;
     // What the shared rules need to know about this game, whichever rule found the camera.
     if (out->camera_relative) g_no_inverse.PositionWitnessed(); // the game shows where the camera is
-    g_no_inverse.Remember(out->vp, result == PoseCheck::Generic);
+    g_no_inverse.Remember(out->vp, result == PoseCheck::Generic, g_frame);
     return true;
 }
 
@@ -837,14 +890,67 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     std::optional<CameraFacts::RelativePose> split_pose;
     const bool found = CameraNow(&cam, &upload, &version, pose_check, split_pose);
     CountPoseCheck(pose_check);
+    bool held = false;
     if (!found) {
-        ++g_stats.camera_missing;
         DiagnoseCameraMiss();
-        return SetReason("No supported camera was found in the scene's constant buffers.");
+        // At most kHoldFrames in a row, and only for the same scene textures.
+        if (!g_held.valid || g_frame <= g_held.frame || g_frame - g_held.frame > kHoldFrames ||
+            g_held.color != sel.color || g_held.depth != sel.depth) {
+            g_held.valid = false;
+            ++g_stats.camera_missing;
+            return SetReason("No supported camera was found in the scene's constant buffers.");
+        }
+        held = true;
+        ++g_stats.camera_held;
+        cam = g_held.cam;
+        upload = &g_held.upload;
+        version = g_held.version;
+        split_pose = g_held.split;
+        // The learned place stays learned: the next frame re-reads it first.
+        g_camera = cam;
+        g_model.SetCamera(g_held.cb, g_held.slot);
+        g_camera_first = g_held.first;
+        g_camera_num = g_held.num;
+    } else {
+        ++g_stats.camera_found;
     }
-    ++g_stats.camera_found;
     if (split_pose) ++g_stats.pose_split;
     const Selection cam_sel = g_model.Current(); // CameraNow may have just chosen (or changed) the camera buffer
+    {
+        // WHY log: one line whenever the kind of camera in use changes (which rule, which place in
+        // the block, with or without a position), so a run that alternates between cameras shows it.
+        static uint64_t last_signature = ~uint64_t{0};
+        static uint32_t logged = 0;
+        const bool relative = camera::IsCameraRelative(cam.vp);
+        const uint64_t signature = (uint64_t(static_cast<int>(pose_check)) << 48) ^ (uint64_t(cam.offset) << 8) ^
+                                   (uint64_t(cam_sel.camera_slot + 1) << 2) ^ (relative ? 2u : 0u) ^ (held ? 1u : 0u);
+        if (signature != last_signature && logged < 400) {
+            last_signature = signature;
+            ++logged;
+            camera::VpGeometry geo{};
+            camera::DecomposeViewProjection(cam.vp, geo);
+            na::eventlog::Emit("native11_pick",
+                               "frame=%llu rule=%d held=%d slot=%d first=%u count=%u offset=%llu relative=%d position=%.1f,%.1f,%.1f exact=%d",
+                               static_cast<unsigned long long>(g_frame), static_cast<int>(pose_check), held ? 1 : 0,
+                               cam_sel.camera_slot, g_camera_first, g_camera_num, static_cast<unsigned long long>(cam.offset),
+                               relative ? 1 : 0, geo.position[0], geo.position[1], geo.position[2],
+                               upload->windowed && upload->first_constant == g_camera_first ? 1 : 0);
+        }
+    }
+    if (!held) {
+        g_held.valid = true;
+        g_held.cam = cam;
+        g_held.upload = *upload;
+        g_held.version = version;
+        g_held.split = split_pose;
+        g_held.cb = cam_sel.camera_cb;
+        g_held.slot = cam_sel.camera_slot;
+        g_held.first = g_camera_first;
+        g_held.num = g_camera_num;
+        g_held.color = sel.color;
+        g_held.depth = sel.depth;
+        g_held.frame = g_frame;
+    }
     SceneFrame f;
     f.frame = g_frame;
     const auto texture = [](TextureFacts& t, ID3D11Resource* r, const ResourceInfo& info, const ViewUse& view) {
@@ -971,9 +1077,24 @@ void RememberSplitDraw(const Event& e, int ws, int ps, const CameraUpload& world
 
 // Pin the immutable upload actually used by each scene range. A later upload
 // or a different binding in the same ring cannot erase this draw's evidence.
-void RememberSceneUploads(const Event& e)
+void RememberSceneUploads(const Event& e, const std::vector<ExactRange>* exact = nullptr)
 {
     if (e.kind != Kind::Draw || !g_model.IsSceneDraw(e)) return;
+    // Ranges read at this very draw stand for the draw's own upload version.
+    std::array<CameraUpload, kCbBindSlots> exact_upload;
+    if (exact) {
+        for (const auto& r : *exact) {
+            if (r.slot < 0 || r.slot >= kCbBindSlots || !r.upload.bytes || !e.cb[r.slot] ||
+                r.upload.first_constant != e.cb_first[r.slot] ||
+                r.upload.bytes->size() != size_t(e.cb_count[r.slot]) * 16) continue;
+            exact_upload[r.slot] = r.upload;
+            exact_upload[r.slot].version = g_model.CbVersion(e.cb[r.slot]);
+        }
+    }
+    const auto upload_for = [&](int slot) -> const CameraUpload* {
+        if (exact_upload[slot].bytes) return &exact_upload[slot];
+        return UploadForDraw(e.cb[slot], e.cb_first[slot], e.cb_count[slot]);
+    };
     const CameraUpload* split[2]{};
     const int ws = static_cast<int>(g_rel_layout.world_binding), ps = static_cast<int>(g_rel_layout.projection_binding);
     // While the layout is being learned: this draw takes part if it binds the projection range found.
@@ -982,7 +1103,7 @@ void RememberSceneUploads(const Event& e)
     bool learn_draw = false;
     for (int slot = 0; slot < kCbBindSlots; ++slot) {
         if (!e.cb[slot]) continue;
-        const auto* upload = UploadForDraw(e.cb[slot], e.cb_first[slot], e.cb_count[slot]);
+        const auto* upload = upload_for(slot);
         if (!upload || !upload->bytes) continue;
         g_scene_uploads[{e.cb[slot], slot, e.cb_first[slot], e.cb_count[slot]}] = *upload;
         if (slot == ws) split[0] = upload;
@@ -997,7 +1118,7 @@ void RememberSceneUploads(const Event& e)
     if (!learn_draw) return;
     for (int slot = 0; slot < kCbSlots; ++slot) { // vertex ranges: a world transform is a vertex input
         if (slot == lp || !e.cb[slot]) continue;
-        const auto* upload = UploadForDraw(e.cb[slot], e.cb_first[slot], e.cb_count[slot]);
+        const auto* upload = upload_for(slot);
         size_t start = 0, length = 0;
         if (!upload || !UploadRange(*upload, e.cb_first[slot], e.cb_count[slot], start, length)) continue;
         g_rel_learner.NoteDraw(static_cast<uint64_t>(slot), upload->bytes->data() + start, length);
@@ -1018,11 +1139,17 @@ void NoteViewportDraw(const Event& e)
 }
 
 // ---------------------------------------------------------------- events
-void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {})
+void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {}, const ExactSet& exact = {})
 {
     if (x->deferred) {
         if (x->events.size() >= kMaxListEvents) return;
         x->events.push_back(e);
+        if (e.kind == Kind::Draw && (exact.get() != x->exact_recorded || !x->exact_recorded_any) &&
+            (exact || x->exact_recorded)) {
+            x->draw_bytes.emplace_back(x->events.size() - 1, exact);
+            x->exact_recorded = exact.get();
+            x->exact_recorded_any = true;
+        }
         if (e.kind == Kind::CbUpdate && uploads.primary.bytes)
             x->cb_bytes.emplace_back(x->events.size() - 1, std::move(uploads));
         return;
@@ -1036,7 +1163,7 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
         Fire(c, l, Boundary::BeforeHud);
     }
     const uint32_t v = g_model.Feed(e);
-    RememberSceneUploads(e);
+    RememberSceneUploads(e, exact.get());
     NoteViewportDraw(e);
     if (e.kind == Kind::CbUpdate && uploads.primary.bytes)
         SaveCameraUpload(e.resource, v, std::move(uploads));
@@ -1091,6 +1218,84 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
     O(c, x).rs_vp(c, n, v); // the original: not a change of the game's viewports
 }
 
+// The ranges of large no-overwrite buffers this draw binds, read now. A range is read once it has
+// stayed bound for a second scene draw (per-object constants change every draw and are left alone;
+// the constants a whole view shares stay), and again after a discard or a new frame.
+ExactSet ExactForDraw(ID3D11DeviceContext* c, Ctx* x)
+{
+    if (x->large.empty()) return {};
+    const uint32_t frame = g_exact_frame.load(std::memory_order_relaxed);
+    bool changed = false;
+    int want[kCbBindSlots];
+    int wanted = 0;
+    for (int s = 0; s < kCbBindSlots; ++s) {
+        Ctx::ExactSlot& k = x->exact[s];
+        const Id id = x->cb[s];
+        const uint32_t first = x->cb_first[s], count = x->cb_num[s];
+        const auto it = id ? x->large.find(id) : x->large.end();
+        if (it == x->large.end() || !it->second.no_overwrite || !count || count > kExactMaxConstants ||
+            first > UINT16_MAX || (uint64_t(first) + count) * 16 > it->second.size || x->mapped.count(id)) {
+            if (k.id) { changed = changed || k.bytes; k = {}; }
+            continue;
+        }
+        if (k.id == id && k.first == first && k.count == count && k.epoch == it->second.epoch && k.frame == frame) {
+            if (k.bytes) continue;
+            if (++k.repeats >= 1) want[wanted++] = s;
+            continue;
+        }
+        changed = changed || k.bytes;
+        k = {};
+        k.id = id; k.first = first; k.count = count; k.epoch = it->second.epoch; k.frame = frame;
+    }
+    // One mapping per buffer per draw serves every slot that waits on it.
+    for (int i = 0; i < wanted; ++i) {
+        Ctx::ExactSlot& k = x->exact[want[i]];
+        if (k.bytes) continue;
+        auto* buffer = reinterpret_cast<ID3D11Buffer*>(k.id); // bound on this context now, so alive
+        D3D11_MAPPED_SUBRESOURCE m{};
+        HRESULT hr = E_FAIL;
+        {
+            Inside in;
+            // The object at this address must still be the buffer the game mapped (same kind and size).
+            D3D11_BUFFER_DESC d{};
+            buffer->GetDesc(&d);
+            const auto known = x->large.find(k.id);
+            if (known != x->large.end() && d.Usage == D3D11_USAGE_DYNAMIC && (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) &&
+                d.ByteWidth == known->second.size)
+                hr = O(c, x).map(c, buffer, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m);
+        }
+        if (FAILED(hr) || !m.pData) {
+            g_exact_failed.fetch_add(1, std::memory_order_relaxed);
+            x->large.erase(k.id); // this context cannot map it this way now; the kept windows remain
+            k = {};
+            continue;
+        }
+        const auto* base = static_cast<const uint8_t*>(m.pData);
+        for (int j = i; j < wanted; ++j) {
+            Ctx::ExactSlot& o = x->exact[want[j]];
+            if (o.id != k.id || o.bytes) continue;
+            o.bytes = std::make_shared<const std::vector<uint8_t>>(base + size_t(o.first) * 16,
+                                                                 base + (size_t(o.first) + o.count) * 16);
+            g_exact_reads.fetch_add(1, std::memory_order_relaxed);
+            changed = true;
+        }
+        {
+            Inside in;
+            O(c, x).unmap(c, buffer, 0);
+        }
+    }
+    if (changed) {
+        auto set = std::make_shared<std::vector<ExactRange>>();
+        for (int s = 0; s < kCbBindSlots; ++s) {
+            const Ctx::ExactSlot& k = x->exact[s];
+            if (k.bytes) set->push_back({s, CameraUpload{0, k.bytes, k.first, true}});
+        }
+        if (set->empty()) x->exact_set.reset(); else x->exact_set = std::move(set);
+    }
+    if (x->exact_set) g_exact_draws.fetch_add(1, std::memory_order_relaxed);
+    return x->exact_set;
+}
+
 void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
 {
     Ctx* x = Get(c);
@@ -1125,7 +1330,9 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
             g_scene_vp_h = x->vp_h;
         }
     }
-    Emit(x, c, e);
+    ExactSet exact;
+    if (e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed)) exact = ExactForDraw(c, x);
+    Emit(x, c, e, {}, exact);
 }
 void ReadEvents(ID3D11DeviceContext* c, UINT n, ID3D11ShaderResourceView* const* views)
 {
@@ -1368,8 +1575,18 @@ HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT 
                                     type == D3D11_MAP_READ_WRITE)) {
         const Id id = IdOf(r);
         UINT size = 0;
-        if (IsCandidate(id) && IsConstantBuffer(r, &size)) x->mapped[id] = m->pData;
-        else if (!x->mapped.empty()) x->mapped.erase(id);
+        if (IsCandidate(id) && IsConstantBuffer(r, &size)) {
+            x->mapped[id] = m->pData;
+            if (size > kMaxCbBytes && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE)) {
+                if (x->large.size() >= 64 && !x->large.count(id)) x->large.clear();
+                auto& large = x->large[id];
+                large.size = size;
+                if (type == D3D11_MAP_WRITE_DISCARD) ++large.epoch; // old contents are gone
+                else large.no_overwrite = true;                    // the game itself proves this mapping works here
+            } else if (!x->large.empty()) {
+                x->large.erase(id);
+            }
+        } else if (!x->mapped.empty()) x->mapped.erase(id);
     }
     return hr;
 }
@@ -1579,6 +1796,7 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
             ListRecord& rec = g_lists[*out];
             rec.events = std::move(x->events);
             rec.cb_bytes = std::move(x->cb_bytes);
+            rec.draw_bytes = std::move(x->draw_bytes);
             rec.order = ++g_list_order;
             if (g_lists.size() > kMaxLists) {
                 auto oldest = g_lists.begin();
@@ -1589,6 +1807,13 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
         }
         x->events.clear();
         x->cb_bytes.clear();
+        x->draw_bytes.clear();
+        // A new recording must map with discard before it may map without overwrite again.
+        x->large.clear();
+        for (auto& k : x->exact) k = {};
+        x->exact_set.reset();
+        x->exact_recorded = nullptr;
+        x->exact_recorded_any = false;
         if (!restore) x->reset_state();
     }
     return hr;
@@ -1608,9 +1833,13 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
             size_t next_bytes = 0;
             const auto& events = it->second.events;
             const auto& bytes = it->second.cb_bytes;
+            const auto& exact = it->second.draw_bytes;
+            size_t next_exact = 0;
+            const std::vector<ExactRange>* current_exact = nullptr;
             for (size_t i = 0; i < events.size(); ++i) {
                 const uint32_t v = g_model.Feed(events[i]);
-                RememberSceneUploads(events[i]);
+                if (next_exact < exact.size() && exact[next_exact].first == i) current_exact = exact[next_exact++].second.get();
+                RememberSceneUploads(events[i], current_exact);
                 NoteViewportDraw(events[i]);
                 if (events[i].kind == Kind::CbUpdate && next_bytes < bytes.size() && bytes[next_bytes].first == i) {
                     const auto& upload = bytes[next_bytes++].second;
@@ -1647,6 +1876,7 @@ bool OnPresent(IDXGISwapChain* swap)
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
     }
     ++g_frame;
+    g_exact_frame.fetch_add(1, std::memory_order_relaxed);
     ++g_stats.frames;
     LearnLargeCbWindows();
     g_model.EndFrame();
@@ -1931,17 +2161,19 @@ int FormatStatus(char* out, unsigned long n)
     }
     return std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
-                         "camera_found=%llu camera_missing=%llu jitter_written=%llu "
+                         "camera_found=%llu camera_missing=%llu camera_held=%llu jitter_written=%llu "
                          "pose{native=%llu legacy=%llu generic=%llu no_packet=%llu extent=%llu vp_repeat=%llu origin=%llu vp_shape=%llu split=%llu "
                          "started=%llu continued=%llu no_inverse=%llu} "
                          "split_rejected{no_votes=%llu no_projection=%llu few_draws=%llu no_majority=%llu small_share=%llu} "
                          "start_rejected{no_candidate=%llu waiting=%llu inverse_game=%llu position_game=%llu} "
                          "relative_layout{%s world=%d/%u@%u,%u projection=%d/%u@%u learned=%llu no_witness=%llu ambiguous=%llu} "
-                         "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu}%s%s%s",
+                         "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu} "
+                         "exact_ranges{reads=%llu failed=%llu draws=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
                          static_cast<unsigned long long>(s.camera_found), static_cast<unsigned long long>(s.camera_missing),
+                         static_cast<unsigned long long>(s.camera_held),
                          static_cast<unsigned long long>(s.jitter_written),
                          static_cast<unsigned long long>(s.pose_native), static_cast<unsigned long long>(s.pose_legacy),
                          static_cast<unsigned long long>(s.pose_generic), static_cast<unsigned long long>(s.pose_no_packet),
@@ -1964,7 +2196,9 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(g_vpj_frames.load()), static_cast<unsigned long long>(g_vpj_draws.load()),
                          g_vpj_last_frame_draws.load(), static_cast<unsigned long long>(g_vpj_sets.load()),
                          static_cast<unsigned long long>(g_vpj_restores.load()),
-                         static_cast<unsigned long long>(g_vpj_unknown.load()), static_cast<unsigned long long>(g_vpj_mixed_frames.load()), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
+                         static_cast<unsigned long long>(g_vpj_unknown.load()), static_cast<unsigned long long>(g_vpj_mixed_frames.load()),
+                         static_cast<unsigned long long>(g_exact_reads.load()), static_cast<unsigned long long>(g_exact_failed.load()),
+                         static_cast<unsigned long long>(g_exact_draws.load()), s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
 

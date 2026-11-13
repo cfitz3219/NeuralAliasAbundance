@@ -127,6 +127,7 @@ struct Game {
     uint32_t camera_ring_offset = 24576;
     uint32_t camera_snapshot_size = 32768;
     bool campaign_mixed_ring = false;
+    bool camera_no_overwrite = false; // the scene camera is appended with D3D11_MAP_WRITE_NO_OVERWRITE
     bool campaign_native_pose = false;
     bool campaign_single_origin = false;
     bool campaign_blank_witness = false; // native p37752: the origin copy at 928 left all zero
@@ -233,7 +234,10 @@ bool MakeGame(Game& g, bool warp)
 void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp, bool remember)
 {
     D3D11_MAPPED_SUBRESOURCE m{};
-    if (FAILED(c->Map(g.cam_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    // A frame allocator: one discard at the start of the frame (the shadow upload here), then
+    // pieces appended without overwrite wherever the allocator has reached.
+    const D3D11_MAP how = g.camera_no_overwrite && remember ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD;
+    if (FAILED(c->Map(g.cam_cb.Get(), 0, how, 0, &m))) return;
     std::vector<uint8_t> bytes(g.campaign_camera ? 1280 : 512, 0);
     const float pad[4] = {1.f, 2.f, 3.f, 4.f};
     std::memcpy(bytes.data(), pad, 16);
@@ -952,6 +956,32 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(evaluations >= before_jump + 6 &&
                g_seen.last.camera.first_constant == g.camera_ring_offset / 16,
                "large-buffer capture follows the newly observed binding");
+        // A frame allocator puts the camera wherever this frame's earlier constants ended, so the
+        // place follows what is drawn and never has to repeat (places below are from a recorded
+        // run, in 16-byte constants). The bound range is read at the draw: every frame gets its
+        // own camera, including the first frame at a place never seen before.
+        D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+        if (SUCCEEDED(g.device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof options)) &&
+            options.MapNoOverwriteOnDynamicConstantBuffer) {
+            expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
+                   "create a fresh large frame-allocator buffer");
+            g.camera_no_overwrite = true;
+            const uint32_t recorded[] = {13392, 34192, 33536, 21952, 15408, 29696, 30160, 21488,
+                                         48288, 46704, 48400, 46656, 46080, 44128, 46880, 46832};
+            g.camera_ring_offset = recorded[0] * 16;
+            for (int i = 0; i < 3; ++i) present_campaign(); // the buffer becomes a camera candidate
+            const auto before_moving = evaluations;
+            for (const uint32_t place : recorded) {
+                g.camera_ring_offset = place * 16;
+                present_campaign();
+                expect(g_seen.last.camera.first_constant == place && g_seen.last.camera.bytes_first_constant == place &&
+                       g_seen.last.camera.size == 1280,
+                       "the frame's camera is exactly the range its scene draws bound");
+            }
+            expect(evaluations == before_moving + std::size(recorded),
+                   "a camera whose place moves every frame gets DLAA on every frame");
+            g.camera_no_overwrite = false;
+        }
         camera_desc.ByteWidth = 32768;
         expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
                "restore the small camera upload ring");

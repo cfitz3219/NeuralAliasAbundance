@@ -108,6 +108,17 @@ inline bool ContinuesCamera(const VpGeometry& last, const Matrix& m)
     return dot > 0.98 && std::abs(v.sy - last.sy) <= 0.05 * std::abs(last.sy) && d2 <= 0.01 * len2 + 100.0;
 }
 
+// Direction and lens only: for comparing a matrix that carries the camera position with one that has
+// it removed. Their positions cannot be compared, everything else about one camera can.
+inline bool ContinuesView(const VpGeometry& last, const Matrix& m)
+{
+    VpGeometry v{};
+    if (!DecomposeViewProjection(m, v)) return false;
+    double dot = 0;
+    for (int j = 0; j < 3; ++j) dot += v.forward[j] * last.forward[j];
+    return dot > 0.98 && std::abs(v.sy - last.sy) <= 0.05 * std::abs(last.sy);
+}
+
 // The matrix has the camera position removed (the game renders relative to the
 // camera). It gives direction and lens; the position must be witnessed elsewhere.
 inline bool IsCameraRelative(const Matrix& m)
@@ -115,6 +126,18 @@ inline bool IsCameraRelative(const Matrix& m)
     VpGeometry g{};
     return DecomposeViewProjection(m, g) && std::abs(g.position[0]) <= 1e-5 && std::abs(g.position[1]) <= 1e-5 &&
            std::abs(g.position[2]) <= 1e-5;
+}
+
+// `full` is `relative` with the camera position put back: the same direction and the same lens to
+// float precision, and a position. Engines that render relative to the camera often upload both.
+inline bool IsPositionedTwin(const Matrix& full, const Matrix& relative)
+{
+    VpGeometry f{}, r{};
+    if (!DecomposeViewProjection(full, f) || !DecomposeViewProjection(relative, r)) return false;
+    if (!IsCameraRelative(relative) || IsCameraRelative(full)) return false;
+    double dot = 0;
+    for (int j = 0; j < 3; ++j) dot += f.forward[j] * r.forward[j];
+    return dot > 0.99999 && std::abs(f.sx - r.sx) <= 1e-3 * std::abs(r.sx) && std::abs(f.sy - r.sy) <= 1e-3 * std::abs(r.sy);
 }
 
 // A main camera fills the scene picture: its aspect is the picture's.
@@ -125,6 +148,27 @@ inline bool MatchesSceneAspect(const Matrix& m, uint32_t width, uint32_t height,
            std::abs(g.sy / g.sx - double(width) / height) <= tolerance;
 }
 
+// VARIANT: camera/positioned-twin
+// The block that holds the camera-relative `relative` also holds the same camera with its position:
+// that one is the camera to use (motion from the camera's own movement needs the position).
+inline bool PositionedTwin(const uint8_t* bytes, size_t size, const Matrix& relative, uint32_t width, uint32_t height,
+                           Candidate& out)
+{
+    const size_t usable = size & ~size_t(3);
+    if (!bytes || usable < 64) return false;
+    Snapshot s{};
+    s.session = s.epoch = 1;
+    s.submission = s.content_version = s.resource = 1;
+    s.complete = s.lifetime_valid = true;
+    s.sync = Sync::AppSyncUnknown;
+    s.bytes.assign(bytes, bytes + usable);
+    for (const auto& c : FindMatrices(s).candidates) {
+        if (c.kind != Kind::ViewProjection || c.has_inverse_pair || !MatchesSceneAspect(c.matrix, width, height)) continue;
+        if (IsPositionedTwin(c.matrix, relative)) { out = c; return true; }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // The two rules applied to one frame's constant blocks, for a provider that has
 // found no camera on this frame by a stronger proof.
@@ -133,7 +177,12 @@ inline bool MatchesSceneAspect(const Matrix& m, uint32_t width, uint32_t height,
 // decides which rules stay open:
 //  - it uploads inverse pairs: the camera is always found by them. A lone matrix
 //    may continue that camera for a frame, but never start a new one (a shadow or
-//    reflection camera would qualify during a short loss).
+//    reflection camera would qualify during a short loss). This holds while pairs
+//    are how the game's camera is usually found, or one was seen in the last
+//    kPairMemory scene frames. A game whose camera is usually a lone matrix and
+//    which showed a pair now and then (2026-11-12: one such sighting closed the
+//    start rule for the rest of the session, 950 of 995 frames lost after a turn)
+//    keeps its start rule.
 //  - it renders relative to the camera and witnesses the position elsewhere
 //    (the relative-camera vote): the camera is that pair. A frame without the witness
 //    is a miss with that reason, never a camera at the wrong place, so both rules
@@ -173,12 +222,31 @@ class NoInverseCamera {
 public:
     static constexpr size_t kMaxBlocks = 12;
 
-    // Every accepted main camera, whichever rule found it.
-    void Remember(const Matrix& main_camera, bool by_inverse_pair)
+    static constexpr uint64_t kPairMemory = 30;
+
+    // Every accepted main camera, whichever rule found it, on scene frame `frame`.
+    void Remember(const Matrix& main_camera, bool by_inverse_pair, uint64_t frame = 0)
     {
         VpGeometry g{};
-        if (DecomposeViewProjection(main_camera, g)) { last_ = g; have_last_ = true; }
-        inverse_pairs_ = inverse_pairs_ || by_inverse_pair;
+        if (DecomposeViewProjection(main_camera, g)) {
+            last_ = g;
+            have_last_ = true;
+            last_relative_ = IsCameraRelative(main_camera);
+        }
+        if (by_inverse_pair) {
+            inverse_pairs_ = true;
+            ++pair_frames_;
+            last_pair_frame_ = frame;
+        } else {
+            ++lone_frames_;
+        }
+    }
+    // The start rule is closed on `frame` (see the first case above).
+    bool StartClosed(uint64_t frame) const
+    {
+        if (!inverse_pairs_) return false;
+        if (pair_frames_ >= lone_frames_) return true;
+        return frame >= last_pair_frame_ && frame - last_pair_frame_ <= kPairMemory;
     }
     // The game showed where the camera is by other means (the relative-camera vote).
     void PositionWitnessed() { positions_ = true; }
@@ -213,10 +281,23 @@ public:
             return r;
         };
         if (found.empty()) return r;
-        if (have_last_)
+        if (have_last_) {
+            const Found* pick = nullptr;
             for (const auto& f : found)
-                if (ContinuesCamera(last_, f.c.matrix)) return admit(f, Admitted::Continued);
-        if (inverse_pairs_) { r.why = NotAdmitted::InverseGame; return r; }
+                if (ContinuesCamera(last_, f.c.matrix)) { pick = &f; break; }
+            // One of the two carries no position (the last camera or the candidate): the same
+            // camera is then known by its direction and lens.
+            if (!pick)
+                for (const auto& f : found)
+                    if (IsCameraRelative(f.c.matrix) != last_relative_ && ContinuesView(last_, f.c.matrix)) { pick = &f; break; }
+            if (pick) {
+                if (IsCameraRelative(pick->c.matrix))
+                    for (const auto& f : found)
+                        if (f.block == pick->block && IsPositionedTwin(f.c.matrix, pick->c.matrix)) { pick = &f; break; }
+                return admit(*pick, Admitted::Continued);
+            }
+        }
+        if (StartClosed(frame)) { r.why = NotAdmitted::InverseGame; return r; }
         const Found& f = found.front(); // the best-ranked block's first candidate, once per frame
         StartSlot slot = blocks[f.block].slot;
         slot.byte_offset = f.c.byte_offset;
@@ -230,7 +311,8 @@ public:
 private:
     StartWithoutInverse start_;
     VpGeometry last_{};
-    bool have_last_ = false, inverse_pairs_ = false, positions_ = false;
+    bool have_last_ = false, last_relative_ = false, inverse_pairs_ = false, positions_ = false;
+    uint64_t pair_frames_ = 0, lone_frames_ = 0, last_pair_frame_ = 0;
 };
 
 } // namespace na::camera
