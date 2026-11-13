@@ -48,6 +48,21 @@
 // before it (ShouldFireBeforeDraw). It is used only when no read point exists.
 // With neither, a host may fire at Present (the HUD is then inside the picture).
 //
+// VARIANT: point/before-hud-on-screen
+// The rule above is on by itself when the
+// picture is the target the host named as the one shown on screen
+// (SetScreenTarget): a picture drawn straight onto the screen is never read, so
+// without it such a game has no place for DLSS at all. A picture that is any
+// other target keeps the read point alone, as before.
+//
+// VARIANT: point/before-untested-hud
+// Some of those games leave the scene depth
+// bound while they draw the HUD with the depth test off, so every draw of the
+// frame looks like a scene draw and the rule above finds nothing. Then, and
+// only then, the picture ends at its last depth-tested draw, and the point is
+// "the n-th draw into the picture that does not test depth", learned the same
+// way. Order of choice each frame: read point, then the rule above, then this.
+//
 // Selection changes need 3 frames in a row (hysteresis), so one odd frame (a
 // loading screen, a menu) does not flip the choice.
 //
@@ -136,6 +151,9 @@ public:
         uint64_t tag_not_unique = 0;     // frames whose point's tag named more than one read
         uint32_t learned_overlay = 0;    // the HUD-rule point (n-th non-scene draw into the scene colour); 0 = none
         uint32_t last_read_after_scene = 0, last_draw_after_scene = 0;
+        uint32_t last_tested_draws = 0, last_untested_after_tested = 0, learned_flat = 0;
+        uint64_t fired_overlay = 0, fired_flat = 0; // frames fired by each HUD rule
+        bool on_screen = false;                      // the picture is the target shown on screen
         uint64_t layered_frames = 0;     // frames whose picture came after material layers (scene/after-layers)
         double camera_share = 0;
         const char* last_miss = "";
@@ -144,12 +162,16 @@ public:
     void SetSwapChainSize(uint32_t w, uint32_t h) { swap_w_ = w; swap_h_ = h; }
     // Opt in to the HUD rule (a host that calls ShouldFireBeforeDraw). Off by default.
     void EnableOverlayRule(bool on) { overlay_rule_ = on; }
+    // The target shown on screen (the swap chain's back buffer), 0 = unknown. When the picture is
+    // this target the HUD rule is on by itself (VARIANT: point/before-hud-on-screen).
+    void SetScreenTarget(Id id) { screen_ = id; }
+    bool OnScreen() const { return sel_.valid() && screen_ && sel_.color == screen_; }
     void SetInfo(Id id, const ResourceInfo& info) { info_[id] = info; }
     void Forget(Id id)
     {
         info_.erase(id);
         if (sel_.depth == id || layer_ == id) { wide_ = false; layer_ = 0; }
-        if (sel_.depth == id || sel_.color == id) { sel_ = Selection{}; learned_read_ = 0; learned_tag_ = 0; learned_overlay_ = 0; }
+        if (sel_.depth == id || sel_.color == id) { sel_ = Selection{}; learned_read_ = 0; learned_tag_ = 0; learned_overlay_ = 0; learned_flat_ = 0; }
         if (sel_.camera_cb == id) { sel_.camera_cb = 0; sel_.camera_slot = -1; }
     }
     const Selection& Current() const { return sel_; }
@@ -208,14 +230,26 @@ public:
     // back buffer, no read of it). Only when no read point was learned.
     bool ShouldFireBeforeDraw(const Event& e) const
     {
-        if (fired_ || !sel_.valid() || learned_read_ || !learned_overlay_ || !scene_draws_) return false;
-        if (e.kind != Kind::Draw || e.rt0 != sel_.color || IsSceneDraw(e)) return false;
-        return overlay_draws_ + 1 == learned_overlay_;
+        if (fired_ || !sel_.valid() || learned_read_ || !scene_draws_) return false;
+        if (e.kind != Kind::Draw || e.rt0 != sel_.color) return false;
+        if (learned_overlay_) return !IsSceneDraw(e) && overlay_draws_ + 1 == learned_overlay_;
+        // VARIANT: point/before-untested-hud
+        return learned_flat_ && tested_draws_ && IsSceneDraw(e) && !e.depth_test && flat_draws_ + 1 == learned_flat_;
     }
     // Which point the next frame will fire at: 1 = before a read, 2 = before the
-    // first HUD draw (HUD rule), 0 = none learned.
-    int LearnedPointKind() const { return learned_read_ ? 1 : learned_overlay_ ? 2 : 0; }
-    void MarkFired() { fired_ = true; ++stats_.fired; fired_at_scene_draws_ = scene_draws_; }
+    // first HUD draw (HUD rule), 3 = before the first HUD draw that keeps the scene
+    // depth bound without testing it, 0 = none learned.
+    int LearnedPointKind() const { return learned_read_ ? 1 : learned_overlay_ ? 2 : learned_flat_ ? 3 : 0; }
+    void MarkFired()
+    {
+        fired_ = true;
+        ++stats_.fired;
+        fired_at_scene_draws_ = scene_draws_;
+        fired_flat_ = !learned_read_ && !learned_overlay_ && learned_flat_;
+        fired_at_tested_draws_ = tested_draws_;
+        if (fired_flat_) ++stats_.fired_flat;
+        else if (!learned_read_ && learned_overlay_) ++stats_.fired_overlay;
+    }
 
     // Summary of a recorded list against the CURRENT selection (for ShouldFireBeforeList).
     ListSummary Summarize(const std::vector<Event>& events) const
@@ -328,11 +362,13 @@ public:
     void EndFrame()
     {
         ++stats_.frames;
-        if (fired_ && scene_draws_ > fired_at_scene_draws_) {
+        // At the untested-HUD point the HUD draws that follow still carry the scene depth; only a
+        // depth-tested draw after the point says the point was too early.
+        if (fired_ && (fired_flat_ ? tested_draws_ > fired_at_tested_draws_ : scene_draws_ > fired_at_scene_draws_)) {
             ++stats_.contradictions;
             stats_.last_miss = "The scene was still being drawn after DLSS ran (the point was too early); re-learning.";
         }
-        if (!fired_ && sel_.valid() && (learned_read_ || learned_overlay_)) {
+        if (!fired_ && sel_.valid() && (learned_read_ || learned_overlay_ || learned_flat_)) {
             ++stats_.missed;
             if (!unplaceable_this_frame_)
                 stats_.last_miss = color_reads_ < learned_read_ ? "The scene colour was read fewer times than last frame; no point found."
@@ -343,12 +379,17 @@ public:
         stats_.last_reads = color_reads_;
         stats_.last_read_after_scene = first_read_after_scene_pending_;
         stats_.last_draw_after_scene = first_overlay_after_scene_pending_;
+        stats_.last_tested_draws = tested_draws_;
+        stats_.last_untested_after_tested = first_flat_after_tested_pending_;
         if (sel_.valid()) ++stats_.selected_frames;
 
         // Learn the DLSS point for the next frame: the first read after the last scene draw.
         learned_read_ = sel_.valid() && first_read_after_scene_pending_ ? first_read_after_scene_pending_ : 0;
         // HUD rule: only when the scene colour had no read after its last scene draw.
-        learned_overlay_ = overlay_rule_ && sel_.valid() && !learned_read_ && first_overlay_after_scene_pending_ ? first_overlay_after_scene_pending_ : 0;
+        const bool hud_rule = sel_.valid() && !learned_read_ && (overlay_rule_ || OnScreen());
+        learned_overlay_ = hud_rule && first_overlay_after_scene_pending_ ? first_overlay_after_scene_pending_ : 0;
+        // VARIANT: point/before-untested-hud: only when the frame had no HUD draw the rule above knows.
+        learned_flat_ = hud_rule && !learned_overlay_ && first_flat_after_tested_pending_ ? first_flat_after_tested_pending_ : 0;
         learned_tag_ = 0;
         if (learned_read_ && pending_tag_) {
             const auto it = read_tags_.find(pending_tag_);
@@ -362,6 +403,8 @@ public:
         Choose();
         stats_.learned_read = learned_read_;
         stats_.learned_overlay = learned_overlay_;
+        stats_.learned_flat = learned_flat_;
+        stats_.on_screen = OnScreen();
 
         // Camera ranking for the next frame.
         last_cb_order_.clear();
@@ -401,6 +444,9 @@ public:
         read_tags_.clear();
         overlay_draws_ = 0;
         first_overlay_after_scene_pending_ = 0;
+        tested_draws_ = flat_draws_ = first_flat_after_tested_pending_ = 0;
+        fired_flat_ = false;
+        fired_at_tested_draws_ = 0;
         unplaceable_this_frame_ = false;
         fired_ = false;
         fired_at_scene_draws_ = 0;
@@ -445,6 +491,15 @@ private:
             first_read_after_scene_pending_ = 0; // a read before this draw was mid-scene
             pending_tag_ = 0;
             first_overlay_after_scene_pending_ = 0; // so was a non-scene draw into the colour
+            if (e.rt0 == sel_.color) {
+                if (e.depth_test) {
+                    ++tested_draws_;
+                    first_flat_after_tested_pending_ = 0; // an untested draw before this one was mid-scene
+                } else {
+                    ++flat_draws_;
+                    if (tested_draws_ && !first_flat_after_tested_pending_) first_flat_after_tested_pending_ = flat_draws_;
+                }
+            }
             CountCbs(e);
             if (sel_.camera_cb && sel_.camera_slot >= 0 && e.cb[sel_.camera_slot] == sel_.camera_cb)
                 ++camera_versions_[CbVersion(sel_.camera_cb)];
@@ -534,6 +589,7 @@ private:
             learned_read_ = 0; // learn the point with the new selection first
             learned_tag_ = 0;
             learned_overlay_ = 0;
+            learned_flat_ = 0;
             pending_frames_ = 0;
         }
     }
@@ -670,6 +726,10 @@ private:
     uint64_t pending_tag_ = 0, learned_tag_ = 0;
     bool overlay_rule_ = false;
     uint32_t overlay_draws_ = 0, first_overlay_after_scene_pending_ = 0, learned_overlay_ = 0;
+    Id screen_ = 0;
+    uint32_t tested_draws_ = 0, flat_draws_ = 0, first_flat_after_tested_pending_ = 0, learned_flat_ = 0;
+    uint32_t fired_at_tested_draws_ = 0;
+    bool fired_flat_ = false;
     std::unordered_map<uint64_t, uint32_t> read_tags_;
     bool fired_ = false;
     uint32_t fired_at_scene_draws_ = 0;

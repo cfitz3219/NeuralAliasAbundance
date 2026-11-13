@@ -138,6 +138,92 @@ int main()
         expect(stats.learned_read == 0 && stats.learned_overlay == 0 && stats.fired == 0,
                "reporting a possible draw boundary does not enable insertion");
     }
+    // ---- VARIANT point/before-hud-on-screen: the scene is drawn straight onto the screen ----
+    {
+        const auto run = [](FrameModel& m, const std::vector<Event>& f) {
+            int fired = -1;
+            for (size_t i = 0; i < f.size(); ++i) {
+                if (f[i].kind == Kind::Read && m.ShouldFireBeforeRead(f[i].resource)) { m.MarkFired(); fired = int(i); }
+                else if (f[i].kind == Kind::Draw && m.ShouldFireBeforeDraw(f[i])) { m.MarkFired(); fired = int(i); }
+                m.Feed(f[i]);
+            }
+            m.EndFrame();
+            return fired;
+        };
+        const auto flat = [](Id rt, Id depth) { Event e = Draw(rt, depth, 6, 0, 0); e.depth_test = false; return e; };
+        // HUD drawn with no depth bound: the first such draw after the scene is the point.
+        std::vector<Event> direct(40, Draw(kBackBuffer, kDepth, 900));
+        for (int i = 0; i < 12; ++i) direct.push_back(Draw(kBackBuffer, 0, 6, 0, 0));
+        {
+            FrameModel m;
+            Setup(m);
+            m.SetScreenTarget(kBackBuffer);
+            expect(run(m, direct) == -1 && run(m, direct) == -1, "on screen: selects, then learns, without guessing");
+            expect(m.LearnedPointKind() == 2 && m.GetStats().on_screen, "on screen: the HUD rule turns on by itself");
+            expect(run(m, direct) == 40 && run(m, direct) == 40, "on screen: fires before the first HUD draw, every frame");
+            expect(m.GetStats().fired_overlay == 2 && m.GetStats().contradictions == 0 && m.GetStats().missed == 0,
+                   "on screen: counted under the HUD rule, no contradiction, no miss");
+        }
+        {
+            // The same frames with a picture that is NOT the screen target: nothing changes.
+            FrameModel m;
+            Setup(m);
+            m.SetScreenTarget(kBloom);
+            for (int i = 0; i < 4; ++i) run(m, direct);
+            expect(m.GetStats().fired == 0 && m.LearnedPointKind() == 0, "not on screen: the HUD rule stays off, as before");
+        }
+        {
+            // A picture on screen that IS read keeps the read point.
+            FrameModel m;
+            Setup(m);
+            m.SetScreenTarget(kBackBuffer);
+            std::vector<Event> read = direct;
+            read.insert(read.begin() + 40, Read(kBackBuffer));
+            run(m, read); run(m, read);
+            expect(m.LearnedPointKind() == 1 && run(m, read) == 40, "on screen and read: the read point wins");
+            expect(m.GetStats().fired_overlay == 0 && m.GetStats().fired_flat == 0, "on screen and read: no HUD rule used");
+        }
+        // ---- VARIANT point/before-untested-hud: the HUD keeps the scene depth bound, test off ----
+        std::vector<Event> bound;
+        for (int i = 0; i < 10; ++i) bound.push_back(Draw(kBackBuffer, kDepth, 900));
+        bound.push_back(flat(kBackBuffer, kDepth)); // an untested draw inside the scene (a sky, a border layer)
+        bound.push_back(flat(kBackBuffer, kDepth));
+        for (int i = 0; i < 30; ++i) bound.push_back(Draw(kBackBuffer, kDepth, 900));
+        for (int i = 0; i < 12; ++i) bound.push_back(flat(kBackBuffer, kDepth)); // HUD, at index 42
+        {
+            FrameModel m;
+            Setup(m);
+            m.SetScreenTarget(kBackBuffer);
+            expect(run(m, bound) == -1 && run(m, bound) == -1, "untested HUD: selects, then learns");
+            expect(m.LearnedPointKind() == 3 && m.GetStats().learned_flat == 3 && m.GetStats().last_tested_draws == 40,
+                   "untested HUD: the point is the first untested draw after the last depth-tested draw");
+            expect(run(m, bound) == 42 && run(m, bound) == 42, "untested HUD: fires before the HUD, not inside the scene");
+            expect(m.GetStats().fired_flat == 2 && m.GetStats().contradictions == 0 && m.GetStats().missed == 0,
+                   "untested HUD: the HUD draws after the point are not counted as scene drawn too late");
+            // A depth-tested draw after the point says the point was too early.
+            std::vector<Event> late = bound;
+            late.push_back(Draw(kBackBuffer, kDepth, 900));
+            run(m, late);
+            expect(m.GetStats().contradictions == 1, "untested HUD: a depth-tested draw after the point is reported");
+        }
+        {
+            // A frame that also has a HUD draw without the scene depth uses the older rule.
+            FrameModel m;
+            Setup(m);
+            m.SetScreenTarget(kBackBuffer);
+            std::vector<Event> both = bound;
+            both.push_back(Draw(kBackBuffer, 0, 6, 0, 0));
+            run(m, both); run(m, both);
+            expect(m.LearnedPointKind() == 2 && run(m, both) == int(both.size()) - 1, "both HUD kinds: the older HUD rule is chosen first");
+        }
+        {
+            FrameModel m;
+            Setup(m);
+            for (int i = 0; i < 4; ++i) run(m, bound);
+            expect(m.GetStats().fired == 0 && m.LearnedPointKind() == 0 && m.GetStats().last_untested_after_tested == 3,
+                   "untested HUD, picture not on screen: reported, never used");
+        }
+    }
     // ---- loading screen does not change the choice ----
     {
         FrameModel m;

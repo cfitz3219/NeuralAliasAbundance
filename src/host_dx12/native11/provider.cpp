@@ -921,6 +921,16 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     if (!g_cb) return SetReason("No consumer is attached.");
     // CameraNow may learn the camera for this very callback.
     const Selection& sel = g_model.Current();
+    if (boundary == Boundary::BeforeHud && IdOf(g_color_ref.Get()) != sel.color && immediate) {
+        // A picture drawn straight onto the screen is not held between frames (see OnPresent). The
+        // draw about to happen is into the picture, so the context has it bound: take it from there.
+        Inside in;
+        ComPtr<ID3D11RenderTargetView> bound;
+        immediate->OMGetRenderTargets(1, &bound, nullptr);
+        ComPtr<ID3D11Resource> picture;
+        if (bound) bound->GetResource(&picture);
+        if (picture && IdOf(picture.Get()) == sel.color) g_color_ref = picture;
+    }
     if (!g_color_ref || IdOf(g_color_ref.Get()) != sel.color || !g_depth_ref || IdOf(g_depth_ref.Get()) != sel.depth) {
         ++g_stats.missed;
         return SetReason("The scene colour or depth is not held from a live game view yet.");
@@ -2033,8 +2043,43 @@ bool OnPresent(IDXGISwapChain* swap)
     g_exact_frame.fetch_add(1, std::memory_order_relaxed);
     ++g_stats.frames;
     LearnLargeCbWindows();
+    // A swap chain's buffer is never held across a present: a game may let go of its swap chain at
+    // any time, and a reference of ours would keep the old one alive. Fire takes it again.
+    if (g_backbuffer && g_color_ref && IdOf(g_color_ref.Get()) == g_backbuffer) g_color_ref.Reset();
+    // VARIANT: point/before-hud-on-screen
+    // VARIANT: point/before-untested-hud
+    // (frame_model.hpp) the model
+    // is told which target is the screen; a picture drawn straight onto it has no read to wait for.
+    g_model.SetScreenTarget(g_backbuffer);
     g_model.EndFrame();
     const auto& ms = g_model.GetStats();
+    {
+        // WHY log: one line whenever the place DLSS runs at changes kind, with what the frame showed.
+        static int last_kind = -1;
+        static bool last_on_screen = false;
+        static uint32_t logged = 0;
+        const int kind = g_model.LearnedPointKind();
+        const bool selected = g_model.Current().valid();
+        if (selected && (kind != last_kind || ms.on_screen != last_on_screen) && logged < 500) {
+            last_kind = kind;
+            last_on_screen = ms.on_screen;
+            ++logged;
+            const char* name = kind == 1 ? "before-read" : kind == 2 ? "before-hud-on-screen" : kind == 3 ? "before-untested-hud" : "none";
+            const char* why =
+                kind == 1 ? "the picture is read after its last scene draw" :
+                kind == 2 ? "the picture is the screen target and is not read; the first draw into it without the scene depth ends the scene" :
+                kind == 3 ? "the picture is the screen target, is not read, and every draw into it keeps the scene depth; the first draw after the last depth-tested one that does not test depth ends the scene" :
+                !ms.on_screen ? "the picture is not read after its last scene draw and is not the screen target" :
+                !ms.last_tested_draws ? "the picture is the screen target but no draw into it tested depth" :
+                "the picture is the screen target but nothing was drawn into it after its last depth-tested draw (no HUD this frame)";
+            na::eventlog::Emit("native11_point",
+                               "frame=%llu point=%s on_screen=%d draws=%u scene_draws=%u depth_tested=%u reads=%u read_after_scene=%u "
+                               "hud_draw_after_scene=%u untested_draw_after_tested=%u why=\"%s\"",
+                               static_cast<unsigned long long>(g_frame), name, ms.on_screen ? 1 : 0, ms.last_draws,
+                               ms.last_scene_draws, ms.last_tested_draws, ms.last_reads, ms.last_read_after_scene,
+                               ms.last_draw_after_scene, ms.last_untested_after_tested, why);
+        }
+    }
     g_stats.unplaceable = ms.unplaceable;
     g_stats.contradictions = ms.contradictions;
     g_stats.selection_changes = ms.selection_changes;
@@ -2388,7 +2433,8 @@ int FormatStatus(char* out, unsigned long n)
                          "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu} "
                          "scene{picture=%s layered_frames=%llu colour_fmt=%u colour_float=%d} "
                          "scene_boundary{selected=%llu draws=%u scene_draws=%u reads=%u after_scene_read=%u after_scene_draw=%u "
-                         "learned_read=%u learned_hud=%u backbuffer=%d color_samples=%u depth_samples=%u}%s%s%s",
+                         "learned_read=%u learned_hud=%u backbuffer=%d color_samples=%u depth_samples=%u "
+                         "depth_tested=%u after_tested_untested=%u learned_untested_hud=%u fired_hud=%llu fired_untested_hud=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
@@ -2428,7 +2474,10 @@ int FormatStatus(char* out, unsigned long n)
                          placement.last_draws, placement.last_scene_draws, placement.last_reads,
                          placement.last_read_after_scene, placement.last_draw_after_scene,
                          placement.learned_read, placement.learned_overlay, is_backbuffer,
-                         color_samples, depth_samples, s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
+                         color_samples, depth_samples, placement.last_tested_draws, placement.last_untested_after_tested,
+                         placement.learned_flat, static_cast<unsigned long long>(placement.fired_overlay),
+                         static_cast<unsigned long long>(placement.fired_flat),
+                         s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
 

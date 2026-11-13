@@ -139,6 +139,10 @@ struct Game {
     // A layered (deferred) renderer: the scene's geometry goes into two 8-bit material layers,
     // lighting reads them into the picture, and the rest of the scene is drawn into the picture.
     bool layered = false;
+    // The scene drawn straight onto the screen, never read: 1 = the HUD is drawn with no depth
+    // bound, 2 = the HUD keeps the scene depth bound with the depth test off.
+    int on_screen = 0;
+    ComPtr<ID3D11DepthStencilState> depth_off;
     ComPtr<ID3D11Texture2D> layer, layer2;
     ComPtr<ID3D11RenderTargetView> layer_rtv, layer2_rtv;
     ComPtr<ID3D11ShaderResourceView> layer_srv;
@@ -350,12 +354,12 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     for (int i = 0; i < 20; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
     // Main scene.
     UploadCamera(c, g, MainVp(frame), true);
-    ID3D11RenderTargetView* rt = g.color_rtv.Get();
+    ID3D11RenderTargetView* rt = g.on_screen ? g.back_rtv.Get() : g.color_rtv.Get();
     ID3D11RenderTargetView* layers[2] = {g.layer_rtv.Get(), g.layer2_rtv.Get()};
     if (g.layered) c->OMSetRenderTargets(2, layers, g.dsv.Get());
     else c->OMSetRenderTargets(1, &rt, g.dsv.Get());
     const float clear[4] = {0.1f, 0.2f, 0.3f, 1.f};
-    c->ClearRenderTargetView(g.color_rtv.Get(), clear);
+    c->ClearRenderTargetView(rt, clear);
     c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
     Viewport(c, g.w, g.h);
     if (g.campaign_split_camera) BindSplitCamera(c, g);
@@ -407,6 +411,19 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
     c->VSSetShader(g.vs_post.Get(), nullptr, 0);
     // Tonemap: reads the scene colour (the insertion point is just before this bind).
     ID3D11RenderTargetView* bb = g.back_rtv.Get();
+    if (g.on_screen) {
+        // No tonemap and no read: the picture is already on the screen. Only the HUD follows.
+        c->OMSetRenderTargets(1, &bb, g.on_screen == 2 ? g.dsv.Get() : nullptr);
+        if (g.on_screen == 2) c->OMSetDepthStencilState(g.depth_off.Get(), 0);
+        const float factor[4] = {};
+        c->OMSetBlendState(g.blend.Get(), factor, 0xffffffffu);
+        c->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+        Viewport(c, g.w, g.h);
+        for (int i = 0; i < 6; ++i) c->Draw(4, 0);
+        c->OMSetBlendState(nullptr, factor, 0xffffffffu);
+        c->OMSetDepthStencilState(nullptr, 0);
+        return;
+    }
     c->OMSetRenderTargets(1, &bb, nullptr);
     ID3D11ShaderResourceView* srv = g.color_srv.Get();
     c->PSSetShaderResources(0, 1, &srv);
@@ -458,12 +475,14 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     ++s.calls;
     if (f.frame == s.last_frame) ++s.twice;
     s.last_frame = f.frame;
-    const bool inputs = f.color.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.color.Get())) &&
+    ComPtr<ID3D11Resource> picture = g.color;
+    if (g.on_screen && g.back_rtv) { picture.Reset(); g.back_rtv->GetResource(&picture); }
+    const bool inputs = f.color.resource == reinterpret_cast<uint64_t>(picture.Get()) &&
                         f.depth.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.depth.Get())) &&
-                        f.color.format == kSceneFormat && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
+                        f.color.format == (g.on_screen ? DXGI_FORMAT_R8G8B8A8_UNORM : kSceneFormat) && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
                         f.color.width == g.w && f.color.height == g.h && f.color.active_x == 0 && f.color.active_y == 0 &&
                         f.color.active_w == g.w && f.color.active_h == g.h && f.color.incarnation && f.depth.incarnation &&
-                        f.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get());
+                        f.color.d3d11_resource == picture.Get();
     if (!inputs) ++s.wrong_inputs;
     if (g_tonemap_bound && f.boundary == na::native11::Boundary::BeforeRead) ++s.after_tonemap;
     if (f.scene_draws != 40) ++s.no_scene;
@@ -510,7 +529,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
         d.Usage = D3D11_USAGE_DEFAULT;
         g.device->CreateTexture2D(&d, nullptr, &s.copy);
     }
-    if (s.copy) c->CopyResource(s.copy.Get(), static_cast<ID3D11Resource*>(f.color.d3d11_resource));
+    if (s.copy && !g.on_screen) c->CopyResource(s.copy.Get(), static_cast<ID3D11Resource*>(f.color.d3d11_resource));
 #if defined(NA_TEST_NATIVE_DLAA)
     if (na::native_d3d11::EvaluateFrame(nullptr, context, f)) ++evaluations;
 #endif
@@ -1058,6 +1077,44 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         for (int i = 0; i < 4; ++i) present_campaign();
         expect(g_seen.last.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get()) && g_seen.last.scene_draws == 40,
                "a scene drawn into one target again keeps its picture");
+    }
+    {
+        // The scene drawn straight onto the screen and never read (a shape seen on a real game:
+        // 3,704 frames, no place for DLAA ever learned). Two kinds of HUD after it.
+        D3D11_DEPTH_STENCIL_DESC off{};
+        off.DepthEnable = FALSE;
+        off.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        off.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        expect(SUCCEEDED(g.device->CreateDepthStencilState(&off, &g.depth_off)), "create a depth-test-off state");
+        for (int mode = 1; mode <= 2; ++mode) {
+            g.on_screen = mode;
+            for (int i = 0; i < 8; ++i) present_campaign(); // the new picture is chosen, then its HUD is learned
+            const auto before_screen = evaluations;
+            const auto calls_before_screen = g_seen.calls;
+            const auto wrong_before = g_seen.wrong_inputs;
+            bool before_hud = true;
+            for (int i = 0; i < 14; ++i) {
+                const auto calls = g_seen.calls;
+                present_campaign();
+                if (g_seen.calls == calls) continue;
+                before_hud = before_hud && g_seen.last.boundary == na::native11::Boundary::BeforeHud && g_seen.last.scene_draws == 40;
+            }
+            char screen_status[4096];
+            na::native11::FormatStatus(screen_status, sizeof screen_status);
+            std::printf("native scene on screen (HUD kind %d): %s\n", mode, screen_status);
+            expect(before_hud && g_seen.wrong_inputs == wrong_before && g_seen.calls >= calls_before_screen + 10 &&
+                   evaluations >= before_screen + 10,
+                   mode == 1 ? "a scene drawn straight onto the screen: DLAA runs on it before a HUD drawn without depth"
+                             : "a scene drawn straight onto the screen: DLAA runs on it before a HUD that keeps the scene depth, test off");
+            expect(std::strstr(screen_status, "backbuffer=1") != nullptr &&
+                   std::strstr(screen_status, mode == 1 ? " learned_hud=1 " : " learned_untested_hud=1 ") != nullptr,
+                   "the status names the screen target and which HUD rule placed DLAA");
+        }
+        g.on_screen = 0;
+        for (int i = 0; i < 8; ++i) present_campaign();
+        expect(g_seen.last.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get()) &&
+               g_seen.last.boundary == na::native11::Boundary::BeforeRead && g_seen.last.scene_draws == 40,
+               "a scene drawn into its own target again goes back to the read point");
     }
     na::settings::Get().j2_sharpness.store(60);
     na::settings::Get().j2_preset.store(11);

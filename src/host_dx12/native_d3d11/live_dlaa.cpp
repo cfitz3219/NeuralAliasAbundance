@@ -291,9 +291,20 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     UINT csub, dsub, cw, ch, dw, dh;
     if (!Subresource(color.Get(), c, cd, csub, cw, ch) ||
         !Subresource(depth.Get(), d, dd, dsub, dw, dh)) return Skip("Scene texture layout unsupported.");
-    const auto cf = static_cast<DXGI_FORMAT>(c.view_format);
+    auto cf = static_cast<DXGI_FORMAT>(c.view_format);
+    // VARIANT: colour/srgb-view-as-stored
+    // A picture the game writes through an sRGB view holds
+    // the same display-ready bytes as one written plainly; they are carried as stored, through
+    // the plain 8-bit sibling, so nothing is converted on the way in or out.
+    if (cf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) cf = DXGI_FORMAT_R8G8B8A8_UNORM;
     const bool hdr = cf == DXGI_FORMAT_R11G11B10_FLOAT || cf == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (!hdr && cf != DXGI_FORMAT_R8G8B8A8_UNORM) return Skip("Scene colour format unsupported.");
+    if (!hdr && cf != DXGI_FORMAT_R8G8B8A8_UNORM) {
+        if (cf == DXGI_FORMAT_B8G8R8A8_UNORM || cf == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || cf == DXGI_FORMAT_B8G8R8X8_UNORM ||
+            cf == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB)
+            return Skip("Scene colour is an 8-bit picture stored blue-first (BGRA); that order is not supported yet.");
+        if (cf == DXGI_FORMAT_R10G10B10A2_UNORM) return Skip("Scene colour is a 10-bit picture (R10G10B10A2); not supported yet.");
+        return Skip("Scene colour format unsupported.");
+    }
     ImageDesc ci{c.active_w, c.active_h, cf, true};
     const DXGI_FORMAT df = na::depth::IsDepth24(dd.Format) ? DXGI_FORMAT_R24G8_TYPELESS :
         dd.Format == DXGI_FORMAT_R32G8X24_TYPELESS || dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT

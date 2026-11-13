@@ -1474,6 +1474,27 @@ Tests: frame model test on Linux passes, with the recorded shape (picture found 
 
 Proof asked of the next run: the capture's DLAA input must look like the game, `color_format` a floating-point format and `hdr=true`; then Cort's eyes.
 
+## 2026-11-13 Pacific — Native DX11: a scene drawn straight onto the screen gets a place for DLAA (Claude)
+
+Hearts of Iron IV, taken over from Astra and Sol at Cort's word. Evidence is the saved log of p41576 on 496d691: 3,704 frames, `fired=0 missed=0 unplaceable=0`, no camera event, "Waiting for a native scene." `missed` only counts frames that had a learned place, so the model never learned one. The only place the DX11 model learns by itself is "before the n-th read of the picture"; the second rule in frame_model.hpp ("before the first HUD draw", written for pictures drawn straight onto the screen) needs `EnableOverlayRule`, and nothing on DX11 ever called it. The provider already fires at that point when the model asks (`Boundary::BeforeHud`); the model never asked.
+
+Theories, each handled or made readable in this one build:
+1. The picture is the swap chain's buffer and is never read. Handled: `point/before-hud-on-screen`.
+2. The HUD keeps the scene depth bound with the depth test off, so every draw of the frame counts as a scene draw and rule 1 finds nothing. Handled: `point/before-untested-hud`.
+3. The screen picture is written through an sRGB view, which the consumer refused. Handled: `colour/srgb-view-as-stored`. A blue-first (BGRA) or 10-bit picture is still refused, now with its own reason in words.
+4. The camera is not found once DLAA is attempted. Not knowable before the first attempt; the existing `native11_cam` events list every candidate and why it was refused.
+5. The picture chosen is not the map. Readable from the auto-capture's DLAA input and `scene{}`.
+
+Change, all in shared code, chosen by what the program sees, no game name:
+- frame_model.hpp: `SetScreenTarget`; the HUD rule is on by itself when the picture is that target; the untested-HUD point with its own counters and its own "too early" test.
+- provider.cpp: tells the model the screen target each frame; a swap chain buffer is never held across a present (taken again from the bound target at the HUD point); event `native11_point` whenever the kind of place changes, with the reason in words; five more fields in `scene_boundary{}`.
+- live_dlaa.cpp (native DX11 consumer): the sRGB view case and the two worded refusals.
+- Pictures that are not the screen target: unchanged (the rule stays off; tested).
+
+Tests: frame model test on Linux passes with the new cases. DX11 GPU fixture gained two on-screen cases (HUD without depth, HUD with depth bound and test off) and a return to the read point. Not yet compiled on Windows, not yet run on a GPU, and not yet seen by Cort.
+
+Proof asked of the first run: `native11_point` names the place and why; `fired` and `delivered` move; the capture's DLAA input is the lit map (colour format 28, `hdr=false` is right for a screen picture); labels and HUD are outside the picture; then Cort's eyes.
+
 ## 2026-11-12 Pacific — HOI4 with multisampling disabled, native DX11 placement evidence
 
 Cort reports DLAA still unavailable after restarting and loading a campaign. HOI4 system.log confirms DirectX 11 and no multisampling. Session p41576 on 496d691 has 3,704 presents, 643 overlay draws, 44,921 exact-range reads against selected colour draws, zero scene insertion attempts and zero deliveries. Camera admission and the DLAA backend were never reached.
