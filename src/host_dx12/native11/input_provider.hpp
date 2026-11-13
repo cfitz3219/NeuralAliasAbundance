@@ -92,6 +92,7 @@ using SceneCallback = bool (*)(void* user, void* context, const SceneFrame& fram
 
 struct ProviderStats {
     uint64_t frames = 0, fired = 0, missed = 0, unplaceable = 0, contradictions = 0, selection_changes = 0;
+    uint64_t twin_across_ranges = 0; // frames whose camera was the positioned copy found in another range
     uint64_t camera_found = 0, camera_missing = 0, jitter_written = 0;
     // The delivered camera's path, frame to frame: `steps` moved, `reversals` moved back against the
     // previous step (a camera that hops between two sources), `jumps` moved more than 50 units.

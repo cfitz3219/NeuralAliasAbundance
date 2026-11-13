@@ -1271,7 +1271,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(evaluations >= before_pool + 28 && g_seen.no_camera == no_camera_before,
                "camera buffers from a rotating pool: the camera is found on every frame, not every other one");
         expect(g_seen.jitter_reported >= jitter_before_pool + 24, "rotating camera buffers: delivered frames carry the applied jitter");
-        expect(std::strstr(pool_status, "camera_bytes{keep_all=1}") != nullptr, "the status says every upload is being kept");
+        expect(std::strstr(pool_status, "camera_bytes{keep_all=1 ") != nullptr, "the status says every upload is being kept");
         expect(g_seen.changed == changed_before_pool && g_seen.streams == streams_before_pool,
                "rotating camera buffers: a new buffer object is not a change of inputs, so DLSS keeps its history");
         g.rotate_camera = false;

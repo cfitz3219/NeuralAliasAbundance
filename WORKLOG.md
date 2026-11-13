@@ -1474,6 +1474,17 @@ Tests: frame model test on Linux passes, with the recorded shape (picture found 
 
 Proof asked of the next run: the capture's DLAA input must look like the game, `color_format` a floating-point format and `hdr=true`; then Cort's eyes.
 
+## 2026-11-13 Pacific — Native DX11: the camera keeps its position when two ranges hold it (Claude)
+
+Hearts of Iron IV on 3be35e3 (p45020, 25 minutes, 22 with DLAA), Cort: "pretty close, but there is still minor tremors, that suddenly become much worse later on".
+- 00:52:43 to 01:07:30, fifteen minutes: camera_cut flat at 30 to 31, inputs_changed 0. Captures at 00:49:16 and 01:08:08: reset=0 on 30 of 30 frames, DLAA output and screen steady to 0.05 px on a still view, motion 0. The two causes of the entry below are gone.
+- 01:10:00, the sudden worsening: camera_cut 35 to 789 and camera_path jumps 6 to 760 in 55 s. Capture 01:10:42: the camera alternates on a three-frame cycle between eye (4648, 215, 1063) and eye (0, 0, 0) with a zero translation row; reset=1 on 21 of 30 frames; output jumps up to 1.2 px. The game uploads its camera twice, with its position and relative to the camera, in different ranges. The search takes the first range that gives a camera, most-drawn first, and which is most drawn changed with what was on screen.
+- Not explained yet: the "minor tremors" in the steady stretch (not visible in a still capture; a guess is that they belong to camera motion), and 2,010 frames in bursts (00:50 to 00:52, 01:08) on which the scene was not held at the boundary, near menu changes.
+
+Change (extends `camera/positioned-twin`, row updated): a position-less camera found by the general rules is kept aside while the rest of the scene's ranges are looked through for its positioned twin (same direction and lens, `IsPositionedTwin`). Status `camera_bytes{... twin_across_ranges=}`. A game with only a position-less camera pays for the wider look once in 64 frames. The packed-layout adapter path is untouched.
+
+No fixture case for this yet (the DX11 fixture's DLAA section runs on the packed layout); the proof is the next run: `history_resets{camera_cut}` flat over the whole session, `twin_across_ranges` counting when the position-less range is the most drawn. Not yet compiled on Windows.
+
 ## 2026-11-13 Pacific — Native DX11: DLSS keeps its history with rotating buffers; reprojection composed as on DX12 (Claude)
 
 Hearts of Iron IV on faad053 (p40940, capture j2-20261113-002205), Cort: "Better but now the whole map is shaking, like it tremors", and it stops with jitter off. The camera is now found on 7,530 of 7,532 attempts. Checked on the capture before any change:

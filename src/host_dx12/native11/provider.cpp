@@ -232,6 +232,7 @@ std::atomic<bool> g_collect_camera{true};
 // that keeps every upload and lost on the next, on and on. Seen twice in a row, every upload is
 // kept from then on. The camera's place (stage, slot, range) is what stays; the object is not.
 bool g_collect_all = false;
+uint64_t g_twin_wait_until = 0;   // camera/positioned-twin (across ranges): no twin was found; next look at this frame
 uint32_t g_rotation_misses = 0;   // found while keeping everything, then no bytes at all on the short list
 bool g_frame_fired = false, g_frame_found = false, g_frame_no_bytes = false; // this frame's boundary
 bool g_prev_found_collecting = false;
@@ -716,6 +717,18 @@ bool CameraSearch(CameraPick* out, const CameraUpload** upload_out, uint64_t* ve
                b.first == learned_first && b.count == learned_count;
     };
     std::stable_partition(bindings.begin(), bindings.end(), is_learned);
+    struct Found { CameraPick pick; const FrameModel::CameraBinding* binding; const CameraUpload* upload; PoseCheck check; };
+    const auto accept = [&](const Found& f) {
+        result = f.check;
+        g_camera = f.pick;
+        g_model.SetCamera(f.binding->buffer, f.binding->slot);
+        g_camera_first = f.binding->first;
+        g_camera_num = f.binding->count;
+        *out = f.pick;
+        *upload_out = f.upload;
+        *version_out = f.binding->version;
+    };
+    std::optional<Found> relative_first;
     for (const auto& b : bindings) {
         const auto it = g_scene_uploads.find({b.buffer, b.slot, b.first, b.count});
         if (it == g_scene_uploads.end() || it->second.version != b.version || !it->second.bytes) continue;
@@ -726,17 +739,33 @@ bool CameraSearch(CameraPick* out, const CameraUpload** upload_out, uint64_t* ve
         PoseCheck check = PoseCheck::NoPacket;
         const CameraPick p = PickForScene(bound, g_camera, is_learned(b), w, h, g_frame + 1, check);
         if (!p.found) {
-            result = std::max(result, check);
+            if (!relative_first) result = std::max(result, check);
             continue;
         }
-        result = check;
-        g_camera = p;
-        g_model.SetCamera(b.buffer, b.slot);
-        g_camera_first = b.first;
-        g_camera_num = b.count;
-        *out = p;
-        *upload_out = &upload;
-        *version_out = b.version;
+        // VARIANT: camera/positioned-twin (across ranges)
+        // A game may upload its camera twice in different ranges: once with its position and once
+        // relative to the camera. Which range most draws read changes with what is on screen, so
+        // the first one found can flip between the two from frame to frame, and each flip looks
+        // like a camera cut (p45020: 754 cuts in 55 s, history reset on two frames of every three).
+        // A position-less camera found by the general rules is therefore kept aside while the rest
+        // of the scene's ranges are looked through for the same camera with its position.
+        const bool general = check == PoseCheck::Generic || check == PoseCheck::NoInverse;
+        if (!relative_first && general && g_frame >= g_twin_wait_until && camera::IsCameraRelative(p.vp)) {
+            relative_first = Found{p, &b, &upload, check};
+            continue;
+        }
+        if (relative_first) {
+            if (!camera::IsPositionedTwin(p.vp, relative_first->pick.vp)) continue;
+            ++g_stats.twin_across_ranges;
+        }
+        accept(Found{p, &b, &upload, check});
+        return true;
+    }
+    if (relative_first) {
+        // No range holds it with a position: the game has only the relative one. Not looked for
+        // again for a while, so such a game pays for the wider search about once a second.
+        g_twin_wait_until = g_frame + 64;
+        accept(*relative_first);
         return true;
     }
     if (!viewport && split()) return true;
@@ -2396,6 +2425,7 @@ void Uninstall()
     g_swap = nullptr;
     g_backbuffer = 0;
     g_collect_all = false;
+    g_twin_wait_until = 0;
     g_rotation_misses = 0;
     g_frame_fired = g_frame_found = g_frame_no_bytes = g_prev_found_collecting = false;
     g_color_ref.Reset();
@@ -2476,7 +2506,7 @@ int FormatStatus(char* out, unsigned long n)
                          "scene{picture=%s layered_frames=%llu colour_fmt=%u colour_float=%d} "
                          "scene_boundary{selected=%llu draws=%u scene_draws=%u reads=%u after_scene_read=%u after_scene_draw=%u "
                          "learned_read=%u learned_hud=%u backbuffer=%d color_samples=%u depth_samples=%u "
-                         "depth_tested=%u after_tested_untested=%u learned_untested_hud=%u fired_hud=%llu fired_untested_hud=%llu} camera_bytes{keep_all=%d}%s%s%s",
+                         "depth_tested=%u after_tested_untested=%u learned_untested_hud=%u fired_hud=%llu fired_untested_hud=%llu} camera_bytes{keep_all=%d twin_across_ranges=%llu}%s%s%s",
                          static_cast<unsigned long long>(s.frames), static_cast<unsigned long long>(s.fired),
                          static_cast<unsigned long long>(s.missed), static_cast<unsigned long long>(s.unplaceable),
                          static_cast<unsigned long long>(s.contradictions), static_cast<unsigned long long>(s.selection_changes),
@@ -2519,6 +2549,7 @@ int FormatStatus(char* out, unsigned long n)
                          color_samples, depth_samples, placement.last_tested_draws, placement.last_untested_after_tested,
                          placement.learned_flat, static_cast<unsigned long long>(placement.fired_overlay),
                          static_cast<unsigned long long>(placement.fired_flat), keep_all ? 1 : 0,
+                         static_cast<unsigned long long>(s.twin_across_ranges),
                          s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
 }
