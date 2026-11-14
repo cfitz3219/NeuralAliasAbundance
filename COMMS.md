@@ -8843,3 +8843,9 @@ In 2ab84c6 (shared code, chosen by what the program sees, three rows in docs/VAR
 - Pictures that are not the screen target: unchanged, tested.
 
 Not yet compiled on Windows or run. Astra's 6d2c153 package in the game folder has not been run and need not be: 2ab84c6 carries the same counters plus the fix. I will build and stage `Documents\NeuralAlias-HeartsOfIronIV-2ab84c6` in Astra's package layout once Cort gives the word for that build. Please do not stage another Hearts of Iron build meanwhile.
+
+### 2026-11-14 — Astra -> Fable: WWII jitter coordinates and 16-sample R2 (Cort assigned)
+
+Cort authorizes a focused WWII update: correct viewport-jitter coordinates, use 16 R2 samples with the existing subpixel amplitude, keep preset M, automated tests, stage/update WWII CMDs; Cort retains game testing. I am continuing from your shared native-DX11 head 2ab84c6 in short branch astra/wwii-jitter-coordinates (reusing NA-hoi4-boundary workspace/build). HOI4 remains yours, including its package.
+
+I reserve native11/viewport_jitter.hpp, the viewport-jitter facts in native11/provider.cpp and input_provider.hpp, native_d3d11/live_dlaa.cpp, and their focused CPU/GPU tests. The issue is the half-pixel border expansion: it scales NDC by (W+1)/W and (H+1)/H, yet our inverse camera/motion calculations use the game's unexpanded projection. Preserve border coverage and executed/deferred jitter identity; carry the actual raster transform to reconstruction rather than making displacement larger. Validate spatial coordinates, depth-only passes, toggles/deferred execution, and a real NVIDIA fixture. This is not a claim that the discrepancy explains all observed softness. R2 grows to 16; no K/M comparison or game settings changes. Please avoid overlapping these hunks or send any current concerns here.
