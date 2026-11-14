@@ -1540,3 +1540,15 @@ Proof asked of the first run: `native11_point` names the place and why; `fired` 
 Cort reports DLAA still unavailable after restarting and loading a campaign. HOI4 system.log confirms DirectX 11 and no multisampling. Session p41576 on 496d691 has 3,704 presents, 643 overlay draws, 44,921 exact-range reads against selected colour draws, zero scene insertion attempts and zero deliveries. Camera admission and the DLAA backend were never reached.
 
 Follow-up continues from Claude's 56e49ef DX11 line, which distinguishes the material targets of a layered renderer from its lit picture. Reuse the existing frame model and add its selected scene draws, observed and learned read/draw boundaries, sample counts and swap-chain-buffer identity to the status line. Observe the buffer identity on swap-chain adoption and resize without keeping a reference. The counters distinguish a direct-to-backbuffer scene with a later draw from an offscreen scene missing a read or with an unusable command-list boundary. They do not arm an insertion point. The frame-model fixture checks that a draw boundary is reported even with the HUD rule disabled. No game launch or game installation performed by Astra.
+
+## 2026-11-14 UTC — native DX11: texture detail and filtering end where the scene ends
+
+Cort, Hearts of Iron IV: "when i turned on anisotropic filtering, there was red pixels everywhere, which got worse when you go higher on the filtering multiplier."
+
+Evidence, read from a saved capture of p45020 on 3be35e3 (`j2-20261113-004916-hoi4-p45020`, taken between the logged `mip_af live ... af=16` and `af=0` events): the picture given to DLAA is clean, the DLAA output is clean, the presented frame is covered in red speckle on land, sea, borders and outlined letters. So the speckle is made in the game's passes that run after the DLSS point, which sampled through our anisotropic variants. Which of those passes and which texture is not known.
+
+Change, shared code, no game name: once the frame's picture has been handed to DLSS (`Fire`), sampler binds on the immediate context keep the game's own samplers until Present, for mip bias and for filtering alike. The bindings are refreshed at the first draw after the hand-over and at the first draw of the next frame, with no new bind by the game. Frames with no DLSS point behave as before. Deferred contexts behave as before. Status: `native11_samplers{... after_scene_own=}` counts eligible binds left as the game's own for this reason. This restates the DX12 rule ("applied where the game samples its textures, before DLSS") on DX11, where it was applied to the whole frame.
+
+Not covered: a pass before the DLSS point that samples a data texture through a linear mipmapped sampler would still be made anisotropic. The capture shows no such defect in this game.
+
+Tests: one more GPU fixture case (after the hand-over the bound sampler is the game's own; the next frame gets 16x and -1 back). Not yet compiled on Windows, not run, not seen by Cort.

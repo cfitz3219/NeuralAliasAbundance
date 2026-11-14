@@ -957,6 +957,7 @@ void DiagnoseCameraMiss()
 void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary)
 {
     ++g_stats.fired;
+    SetSceneHanded(true); // whatever the outcome below, the game's scene draws for this frame are over
     if (!g_cb) return SetReason("No consumer is attached.");
     // CameraNow may learn the camera for this very callback.
     const Selection& sel = g_model.Current();
@@ -1460,11 +1461,14 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     Ctx* x = Get(c);
     if (!x) return;
     VpjBeforeDraw(c, x);
-    const uint64_t policy = SamplerPolicyKey();
-    if (x->sampler_policy != policy) {
-        RefreshSamplers(c);
-        x->sampler_policy = policy;
-    }
+    const auto refresh_samplers = [&] {
+        const uint64_t policy = SamplerPolicyKey();
+        if (x->sampler_policy != policy) {
+            RefreshSamplers(c);
+            x->sampler_policy = policy;
+        }
+    };
+    refresh_samplers();
     Event e;
     e.kind = Kind::Draw;
     e.rt0 = x->rt0;
@@ -1496,6 +1500,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     ExactSet exact;
     if (picture_draw || layer_draw) exact = ExactForDraw(c, x);
     Emit(x, c, e, {}, exact);
+    if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
 }
 // The scene colour first met through a read, before any bind as a render target: its view as read.
 ViewUse SrvUse(ID3D11ShaderResourceView* v)
@@ -2161,6 +2166,7 @@ bool OnPresent(IDXGISwapChain* swap)
         g_prev_found_collecting = collecting && g_frame_found;
     }
     g_frame_fired = g_frame_found = g_frame_no_bytes = false;
+    SetSceneHanded(false);
     g_collect_camera.store(!g_camera.found || g_rel_learner.armed() || g_collect_all, std::memory_order_relaxed);
     // Retire upload shadows not in the next scene's acquisition set. Draw-time
     // snapshots keep their own ownership until this frame is closed.
@@ -2428,6 +2434,7 @@ void Uninstall()
     g_twin_wait_until = 0;
     g_rotation_misses = 0;
     g_frame_fired = g_frame_found = g_frame_no_bytes = g_prev_found_collecting = false;
+    SetSceneHanded(false);
     g_color_ref.Reset();
     g_depth_ref.Reset();
     g_lists.clear();

@@ -1375,6 +1375,26 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.MipLODBias == -1.f && na::native11::GetSamplerStats().original_bias == -1.f,
            "native mip total avoids double bias when the game already requests -1");
+    // After the frame's picture is handed to DLSS the game's later passes keep its own samplers;
+    // the next frame's scene gets the policy again. Neither needs a new sampler bind by the game.
+    na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(16);
+    material_raw = material.Get();
+    g.ctx->PSSetSamplers(0, 1, &material_raw);
+    g.ctx->Draw(4, 0);
+    const uint64_t own_before = na::native11::GetSamplerStats().after_scene;
+    na::native11::SetSceneHanded(true);
+    g.ctx->Draw(4, 0);
+    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+    if (bound) bound->GetDesc(&applied);
+    expect(bound && applied.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && applied.MipLODBias == 0.f &&
+           na::native11::GetSamplerStats().after_scene > own_before,
+           "draws after the scene is handed to DLSS sample with the game's own sampler");
+    na::native11::SetSceneHanded(false);
+    g.ctx->Draw(4, 0);
+    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+    if (bound) bound->GetDesc(&applied);
+    expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
+           "the next frame's scene draws get 16x AF and the -1 mip bias back");
     na::capture::j2::Shutdown();
     na::capture::Shutdown();
     DeleteFileW(ini.c_str());

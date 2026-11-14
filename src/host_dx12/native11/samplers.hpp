@@ -23,6 +23,9 @@ bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af);
 
 uint64_t SamplerPolicyKey();
 void RefreshSamplers(void* context);
+// True from the moment the frame's picture is handed to DLSS until Present: binds on the immediate
+// context then keep the game's own samplers (post-processing, overlays and HUD are not the scene).
+void SetSceneHanded(bool handed);
 
 struct SamplerStats {
     uint64_t created = 0;          // game CreateSamplerState calls seen
@@ -34,6 +37,7 @@ struct SamplerStats {
     uint64_t swapped = 0;          // of those, bound as our variant
     uint64_t unknown = 0;          // bound samplers we never saw created (passed through)
     uint64_t material_binds = 0;
+    uint64_t after_scene = 0;      // eligible binds left as the game's own after the scene was handed to DLSS
     float original_bias = 0.0f;
     float bias = 0.0f;             // actual total bias at the last eligible material bind
     uint32_t af = 0;
