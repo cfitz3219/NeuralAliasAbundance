@@ -26,6 +26,7 @@ Columns: name | what it does | first seen in | observed condition that selects i
 
 | Name | What it does | First seen in | Selected when | Proof | Log field | Arrived in | Owner |
 |---|---|---|---|---|---|---|---|
+| jitter11/expanded-raster | Accounts for the half-pixel raster border in camera, depth and motion reconstruction | WWII jitter quality audit | Executed scene draws carry full-target viewport expansion; partial/multiple viewports and jitter-off retain the original projection | tests/cpu/native11_viewport_jitter_test.cpp; tests/host/native11/provider_test.cpp | Capture current/inverse/previous camera matrices; viewport jitter sample counters | WWII jitter coordinate update, 2026-11-14 | Astra |
 | scene-end/entry | Starts DLAA at the operation that has been the first one after the finished scene on earlier frames | Sniper Elite 5 | The operation is one the entry profile has learned and accepts | tests/cpu/post_entry_test.cpp | `j2_entry matched` | f1ca3e5 | Astra |
 | scene-end/class | Starts DLAA at the real consumer of the scene picture when its kind of reader is accepted | Anno 1800 | No accepted entry; the consumer's class is accepted by the learned consumer profile | tests/cpu/consumer_profile_test.cpp | `class_matched` | e19f7a4 | Claude |
 | scene-end/pair | Same as scene-end/class, accepted for a known producer and consumer pair | Anno 1800 | No accepted entry; the class is accepted only together with its producer | tests/cpu/consumer_profile_test.cpp | `class_pair_matched` | e19f7a4 | Claude |

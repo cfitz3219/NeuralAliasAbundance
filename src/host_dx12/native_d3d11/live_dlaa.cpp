@@ -2,6 +2,7 @@
 #include "shared_resources.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
+#include "host_dx12/native11/viewport_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
@@ -239,21 +240,24 @@ camera::CameraFrame Pose(Session& s, const native11::SceneFrame& frame, UINT w, 
     const double jitter[2]{matrix_jitter ? c.jitter_px[0] : 0, matrix_jitter ? c.jitter_px[1] : 0};
     camera::CameraFrame result;
     wwii::SceneCamera scene;
+    const auto raster = [&](const camera::Matrix& vp) {
+        return native11::RasterViewProjection(vp, c.viewport_jitter && c.viewport_expanded, w, h);
+    };
     if (c.split_pose) {
-        result = s.camera.UpdateCameraRelative(c.split_pose->projection, c.split_pose->origin,
+        result = s.camera.UpdateCameraRelative(raster(c.split_pose->projection), c.split_pose->origin,
                                                frame.frame, w, h, jitter);
     } else if (c.no_inverse_pose) {
         // Admitted by the shared no-inverse rules in the provider: a proof over several frames.
-        result = s.camera.Update(*c.no_inverse_pose, frame.frame, w, h, jitter);
+        result = s.camera.Update(raster(*c.no_inverse_pose), frame.frame, w, h, jitter);
     } else if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(length), w, h, scene)) {
-        result = s.camera.UpdateCameraRelative(scene.vp, scene.origin, frame.frame, w, h, jitter);
+        result = s.camera.UpdateCameraRelative(raster(scene.vp), scene.origin, frame.frame, w, h, jitter);
     } else {
         native11::CameraPick pick;
         if (!native11::CheckLearned(bytes, s.pick, &pick))
             pick = native11::FindCamera(bytes, c.version ? c.version : frame.frame + 1);
         if (!pick.found) return {};
         s.pick = pick;
-        result = s.camera.Update(pick.vp, frame.frame, w, h, jitter);
+        result = s.camera.Update(raster(pick.vp), frame.frame, w, h, jitter);
     }
     if (c.viewport_jitter && c.jitter_applied) {
         result.jitter_px_x = c.jitter_px[0];
@@ -531,8 +535,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     delivered_at.store(GetTickCount64(), std::memory_order_relaxed);
     if (frame.camera.raster_jitter_qualified && j2::Jitter()) {
         const auto phase = static_cast<uint32_t>(frame.frame);
-        const auto sample = settings::Get().j2_jitter_r2.load()
-            ? neural_alias::temporal_jitter_r2(phase, 8) : neural_alias::temporal_jitter(phase, 8);
+        const auto sample = native11::DlaaJitterSample(phase, settings::Get().j2_jitter_r2.load() != 0);
         native11::SetNextJitter(static_cast<float>(sample.x_pixels), static_cast<float>(sample.y_pixels));
     }
     reason.store("Native DX11 DLAA delivered before the scene consumer.", std::memory_order_relaxed);
