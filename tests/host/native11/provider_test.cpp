@@ -124,7 +124,10 @@ struct Game {
     UINT w = 320, h = 180;
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
+    uint32_t camera_ring_offset = 24576;
+    uint32_t camera_snapshot_size = 32768;
     bool campaign_mixed_ring = false;
+    bool camera_no_overwrite = false; // the scene camera is appended with D3D11_MAP_WRITE_NO_OVERWRITE
     bool campaign_native_pose = false;
     bool campaign_single_origin = false;
     bool campaign_blank_witness = false; // native p37752: the origin copy at 928 left all zero
@@ -133,6 +136,19 @@ struct Game {
     ComPtr<ID3D11RenderTargetView> shadow_rtv, color_rtv, back_rtv;
     ComPtr<ID3D11ShaderResourceView> color_srv;
     bool campaign_split_camera = false, split_tie = false;
+    // A layered (deferred) renderer: the scene's geometry goes into two 8-bit material layers,
+    // lighting reads them into the picture, and the rest of the scene is drawn into the picture.
+    bool layered = false;
+    // The scene drawn straight onto the screen, never read: 1 = the HUD is drawn with no depth
+    // bound, 2 = the HUD keeps the scene depth bound with the depth test off.
+    int on_screen = 0;
+    // The camera's constants come from a pool: a different buffer object every frame, same place.
+    bool rotate_camera = false;
+    ComPtr<ID3D11Buffer> cam_pool[2];
+    ComPtr<ID3D11DepthStencilState> depth_off;
+    ComPtr<ID3D11Texture2D> layer, layer2;
+    ComPtr<ID3D11RenderTargetView> layer_rtv, layer2_rtv;
+    ComPtr<ID3D11ShaderResourceView> layer_srv;
     ComPtr<ID3D11Buffer> cam_cb, obj_cb, split_world, split_projection;
     ComPtr<ID3D11VertexShader> vs, vs_post;
     ComPtr<ID3D11PixelShader> ps_scene, ps_tonemap, ps_hud;
@@ -231,7 +247,10 @@ bool MakeGame(Game& g, bool warp)
 void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp, bool remember)
 {
     D3D11_MAPPED_SUBRESOURCE m{};
-    if (FAILED(c->Map(g.cam_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    // A frame allocator: one discard at the start of the frame (the shadow upload here), then
+    // pieces appended without overwrite wherever the allocator has reached.
+    const D3D11_MAP how = g.camera_no_overwrite && remember ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD;
+    if (FAILED(c->Map(g.cam_cb.Get(), 0, how, 0, &m))) return;
     std::vector<uint8_t> bytes(g.campaign_camera ? 1280 : 512, 0);
     const float pad[4] = {1.f, 2.f, 3.f, 4.f};
     std::memcpy(bytes.data(), pad, 16);
@@ -255,7 +274,7 @@ void UploadCamera(ID3D11DeviceContext* c, Game& g, const na::camera::Matrix& vp,
         std::memcpy(bytes.data() + 704, extent, sizeof extent);
     }
     auto* destination = static_cast<uint8_t*>(m.pData);
-    if (g.campaign_pixel_range) destination += 24576;
+    if (g.campaign_pixel_range) destination += g.camera_ring_offset;
     std::memcpy(destination, bytes.data(), bytes.size());
     c->Unmap(g.cam_cb.Get(), 0);
     if (remember) g.last_written = vp;
@@ -309,6 +328,7 @@ void Viewport(ID3D11DeviceContext* c, UINT w, UINT h)
 void Scene(ID3D11DeviceContext* c, Game& g, int frame)
 {
     g_tonemap_bound = false;
+    if (g.rotate_camera) g.cam_cb = g.cam_pool[frame & 1];
     ID3D11Buffer* cbs[2] = {g.cam_cb.Get(), g.obj_cb.Get()};
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     c->VSSetShader(g.vs.Get(), nullptr, 0);
@@ -318,7 +338,7 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
         c->VSSetConstantBuffers(1, 1, &cbs[1]);
         ComPtr<ID3D11DeviceContext1> c1;
         if (SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c1)))) {
-            const UINT first = 24576 / 16, count = 1280 / 16;
+            const UINT first = g.camera_ring_offset / 16, count = 1280 / 16;
             c1->PSSetConstantBuffers1(0, 1, &cbs[0], &first, &count);
         }
     } else if (g.campaign_native_pose) {
@@ -338,10 +358,12 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     for (int i = 0; i < 20; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
     // Main scene.
     UploadCamera(c, g, MainVp(frame), true);
-    ID3D11RenderTargetView* rt = g.color_rtv.Get();
-    c->OMSetRenderTargets(1, &rt, g.dsv.Get());
+    ID3D11RenderTargetView* rt = g.on_screen ? g.back_rtv.Get() : g.color_rtv.Get();
+    ID3D11RenderTargetView* layers[2] = {g.layer_rtv.Get(), g.layer2_rtv.Get()};
+    if (g.layered) c->OMSetRenderTargets(2, layers, g.dsv.Get());
+    else c->OMSetRenderTargets(1, &rt, g.dsv.Get());
     const float clear[4] = {0.1f, 0.2f, 0.3f, 1.f};
-    c->ClearRenderTargetView(g.color_rtv.Get(), clear);
+    c->ClearRenderTargetView(rt, clear);
     c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
     Viewport(c, g.w, g.h);
     if (g.campaign_split_camera) BindSplitCamera(c, g);
@@ -367,6 +389,22 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
         }
         SetObject(c, g, i); c->Draw(4, 0);
     }
+    if (g.layered) {
+        // Lighting: reads the layers, writes the picture, no depth.
+        c->OMSetRenderTargets(1, &rt, nullptr);
+        ID3D11ShaderResourceView* layer = g.layer_srv.Get();
+        c->PSSetShaderResources(0, 1, &layer);
+        c->VSSetShader(g.vs_post.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_tonemap.Get(), nullptr, 0);
+        c->Draw(4, 0);
+        ID3D11ShaderResourceView* none = nullptr;
+        c->PSSetShaderResources(0, 1, &none);
+        // The rest of the scene (sky, glass, smoke): into the picture, with the scene depth.
+        c->VSSetShader(g.vs.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_scene.Get(), nullptr, 0);
+        c->OMSetRenderTargets(1, &rt, g.dsv.Get());
+        for (int i = 0; i < 4; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
+    }
 }
 
 
@@ -377,6 +415,19 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
     c->VSSetShader(g.vs_post.Get(), nullptr, 0);
     // Tonemap: reads the scene colour (the insertion point is just before this bind).
     ID3D11RenderTargetView* bb = g.back_rtv.Get();
+    if (g.on_screen) {
+        // No tonemap and no read: the picture is already on the screen. Only the HUD follows.
+        c->OMSetRenderTargets(1, &bb, g.on_screen == 2 ? g.dsv.Get() : nullptr);
+        if (g.on_screen == 2) c->OMSetDepthStencilState(g.depth_off.Get(), 0);
+        const float factor[4] = {};
+        c->OMSetBlendState(g.blend.Get(), factor, 0xffffffffu);
+        c->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+        Viewport(c, g.w, g.h);
+        for (int i = 0; i < 6; ++i) c->Draw(4, 0);
+        c->OMSetBlendState(nullptr, factor, 0xffffffffu);
+        c->OMSetDepthStencilState(nullptr, 0);
+        return;
+    }
     c->OMSetRenderTargets(1, &bb, nullptr);
     ID3D11ShaderResourceView* srv = g.color_srv.Get();
     c->PSSetShaderResources(0, 1, &srv);
@@ -428,19 +479,22 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     ++s.calls;
     if (f.frame == s.last_frame) ++s.twice;
     s.last_frame = f.frame;
-    const bool inputs = f.color.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.color.Get())) &&
+    ComPtr<ID3D11Resource> picture = g.color;
+    if (g.on_screen && g.back_rtv) { picture.Reset(); g.back_rtv->GetResource(&picture); }
+    const bool inputs = f.color.resource == reinterpret_cast<uint64_t>(picture.Get()) &&
                         f.depth.resource == reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(g.depth.Get())) &&
-                        f.color.format == kSceneFormat && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
+                        f.color.format == static_cast<uint32_t>(g.on_screen ? DXGI_FORMAT_R8G8B8A8_UNORM : kSceneFormat) && f.depth.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
                         f.color.width == g.w && f.color.height == g.h && f.color.active_x == 0 && f.color.active_y == 0 &&
                         f.color.active_w == g.w && f.color.active_h == g.h && f.color.incarnation && f.depth.incarnation &&
-                        f.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get());
+                        f.color.d3d11_resource == picture.Get();
     if (!inputs) ++s.wrong_inputs;
     if (g_tonemap_bound && f.boundary == na::native11::Boundary::BeforeRead) ++s.after_tonemap;
     if (f.scene_draws != 40) ++s.no_scene;
-    const UINT camera_size = g.campaign_split_camera ? 64u : g.campaign_pixel_range ? 32768u : g.campaign_camera ? 1280u : 512u;
+    const UINT camera_size = g.campaign_split_camera ? 64u : g.campaign_pixel_range ? g.camera_snapshot_size : g.campaign_camera ? 1280u : 512u;
     const int vs_slot = g.campaign_split_camera ? 1 : g.campaign_pixel_range ? -1 : g.campaign_native_pose ? 3 : 0;
     auto* expected_cb = g.campaign_split_camera ? g.split_projection.Get() : g.cam_cb.Get();
-    if (!f.camera.bytes || f.camera.size != camera_size || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(expected_cb)) ||
+    if (!f.camera.bytes || (g.campaign_pixel_range && g.camera_ring_offset >= 65536 ?
+        f.camera.size < 1280 || f.camera.size > 16 * 1024 : f.camera.size != camera_size) || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(expected_cb)) ||
         f.camera.vs_slot != vs_slot) {
         if (!s.no_camera)
             std::printf("camera handed over: bytes=%p size=%u buffer=%llx (game %llx) slot=%d first=%u num=%u version=%llu\n",
@@ -479,7 +533,7 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
         d.Usage = D3D11_USAGE_DEFAULT;
         g.device->CreateTexture2D(&d, nullptr, &s.copy);
     }
-    if (s.copy) c->CopyResource(s.copy.Get(), static_cast<ID3D11Resource*>(f.color.d3d11_resource));
+    if (s.copy && !g.on_screen) c->CopyResource(s.copy.Get(), static_cast<ID3D11Resource*>(f.color.d3d11_resource));
 #if defined(NA_TEST_NATIVE_DLAA)
     if (na::native_d3d11::EvaluateFrame(nullptr, context, f)) ++evaluations;
 #endif
@@ -906,6 +960,166 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     expect(evaluations == before_mixed_ring + 22 && g_seen.last.camera.first_constant == 24576 / 16,
            "mixed VS/PS ring retains camera range after another range and discard overwrite");
     g.campaign_mixed_ring = false;
+    // Battlefield-style large dynamic buffer with a shader-visible range far
+    // beyond 64 KiB. Keep the prior small-ring assertions above unchanged.
+    if (automatic) {
+        camera_desc.ByteWidth = 1024 * 1024;
+        expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
+               "create large native camera upload ring");
+        g.camera_ring_offset = 53056 * 16;
+        g.camera_snapshot_size = 1280 + 2 * 2048;
+        const auto before_large = evaluations;
+        for (int i = 0; i < 12; ++i) {
+            g.camera_ring_offset = 53056 * 16 + (i % 2) * 256;
+            present_campaign();
+        }
+        expect(evaluations >= before_large + 9 &&
+               g_seen.last.camera.first_constant == g.camera_ring_offset / 16 &&
+               g_seen.last.camera.bytes_first_constant < g_seen.last.camera.first_constant &&
+               g_seen.last.camera.size <= 16 * 1024,
+               "DLAA receives the current high-offset binding without copying the whole ring");
+        // The real run rotates between distant ranges of the same buffer.
+        // After both have been observed, no frame may borrow stale bytes or
+        // drop out just because the range differs from the previous frame.
+        const uint32_t first_range = g.camera_ring_offset;
+        const uint32_t second_range = 46000 * 16;
+        g.camera_ring_offset = second_range;
+        present_campaign();
+        present_campaign();
+        const auto before_alternating = evaluations;
+        for (int i = 0; i < 12; ++i) {
+            g.camera_ring_offset = i % 2 ? first_range : second_range;
+            present_campaign();
+            expect(g_seen.last.camera.first_constant == g.camera_ring_offset / 16,
+                   "each alternating frame consumes its own camera range");
+        }
+        expect(evaluations == before_alternating + 12, "learned disjoint ranges sustain uninterrupted DLAA");
+        // An unfamiliar binding must never reuse a captured window.
+        const auto before_jump = evaluations;
+        g.camera_ring_offset = 982 * 1024;
+        present_campaign();
+        // The frame is not dropped either: it carries the previous frame's camera, marked held,
+        // from the range that camera was read at.
+        expect(evaluations == before_jump ||
+               (evaluations == before_jump + 1 && g_seen.last.camera.held &&
+                g_seen.last.camera.first_constant != g.camera_ring_offset / 16),
+               "a disjoint large-buffer binding cannot reuse old camera bytes");
+        for (int i = 0; i < 8; ++i) present_campaign();
+        expect(evaluations >= before_jump + 6 &&
+               g_seen.last.camera.first_constant == g.camera_ring_offset / 16,
+               "large-buffer capture follows the newly observed binding");
+        // A frame allocator puts the camera wherever this frame's earlier constants ended, so the
+        // place follows what is drawn and never has to repeat (places below are from a recorded
+        // run, in 16-byte constants). The bound range is read at the draw: every frame gets its
+        // own camera, including the first frame at a place never seen before.
+        D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+        if (SUCCEEDED(g.device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof options)) &&
+            options.MapNoOverwriteOnDynamicConstantBuffer) {
+            expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
+                   "create a fresh large frame-allocator buffer");
+            g.camera_no_overwrite = true;
+            const uint32_t recorded[] = {13392, 34192, 33536, 21952, 15408, 29696, 30160, 21488,
+                                         48288, 46704, 48400, 46656, 46080, 44128, 46880, 46832};
+            g.camera_ring_offset = recorded[0] * 16;
+            for (int i = 0; i < 3; ++i) present_campaign(); // the buffer becomes a camera candidate
+            const auto before_moving = evaluations;
+            for (const uint32_t place : recorded) {
+                g.camera_ring_offset = place * 16;
+                present_campaign();
+                expect(g_seen.last.camera.first_constant == place && g_seen.last.camera.bytes_first_constant == place &&
+                       g_seen.last.camera.size == 1280,
+                       "the frame's camera is exactly the range its scene draws bound");
+            }
+            expect(evaluations == before_moving + std::size(recorded),
+                   "a camera whose place moves every frame gets DLAA on every frame");
+            g.camera_no_overwrite = false;
+        }
+        camera_desc.ByteWidth = 32768;
+        expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, g.cam_cb.ReleaseAndGetAddressOf())),
+               "restore the small camera upload ring");
+        g.camera_ring_offset = 24576;
+        g.camera_snapshot_size = 32768;
+        const auto before_restore = evaluations;
+        for (int i = 0; i < 4; ++i) present_campaign();
+        expect(evaluations >= before_restore + 2 && g_seen.last.camera.size == 32768 &&
+               g_seen.last.camera.bytes_first_constant == 0,
+               "the original small-buffer capture resumes after returning to a new buffer");
+    }
+    {
+        // A layered renderer (shape recorded from a real game: DLAA was handed the 8-bit normals
+        // layer, the most-drawn target, while the lit picture went to the screen untouched).
+        D3D11_TEXTURE2D_DESC layer_desc{};
+        g.color->GetDesc(&layer_desc);
+        layer_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        expect(SUCCEEDED(g.device->CreateTexture2D(&layer_desc, nullptr, &g.layer)) &&
+               SUCCEEDED(g.device->CreateRenderTargetView(g.layer.Get(), nullptr, &g.layer_rtv)) &&
+               SUCCEEDED(g.device->CreateShaderResourceView(g.layer.Get(), nullptr, &g.layer_srv)) &&
+               SUCCEEDED(g.device->CreateTexture2D(&layer_desc, nullptr, &g.layer2)) &&
+               SUCCEEDED(g.device->CreateRenderTargetView(g.layer2.Get(), nullptr, &g.layer2_rtv)),
+               "create two material layers");
+        g.layered = true;
+        for (int i = 0; i < 6; ++i) present_campaign(); // the layers are seen, then their read, then the whole scene
+        const auto before_layered = evaluations;
+        const auto calls_before_layered = g_seen.calls;
+        bool picture = true, whole_scene = true;
+        for (int i = 0; i < 14; ++i) {
+            const auto calls = g_seen.calls;
+            present_campaign();
+            if (g_seen.calls == calls) continue; // judged on the frames handed over; their number is checked below
+            picture = picture && g_seen.last.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get()) &&
+                      g_seen.last.color.format == kSceneFormat;
+            whole_scene = whole_scene && g_seen.last.scene_draws == 44;
+        }
+        char scene_status[4096]; // the scene field closes a line longer than the shared 512-byte buffer
+        na::native11::FormatStatus(scene_status, sizeof scene_status);
+        std::printf("native layered scene: %s\n", scene_status);
+        expect(picture && g_seen.calls >= calls_before_layered + 10 && evaluations >= before_layered + 10,
+               "a layered renderer: DLAA is handed the lit picture, never the most-drawn material layer");
+        expect(whole_scene && std::strstr(scene_status, "scene{picture=after-layers") != nullptr,
+               "the scene is the layers' draws and the picture's draws, and the status says which rule chose");
+        g.layered = false;
+        for (int i = 0; i < 4; ++i) present_campaign();
+        expect(g_seen.last.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get()) && g_seen.last.scene_draws == 40,
+               "a scene drawn into one target again keeps its picture");
+    }
+    {
+        // The scene drawn straight onto the screen and never read (a shape seen on a real game:
+        // 3,704 frames, no place for DLAA ever learned). Two kinds of HUD after it.
+        D3D11_DEPTH_STENCIL_DESC off{};
+        off.DepthEnable = FALSE;
+        off.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        off.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        expect(SUCCEEDED(g.device->CreateDepthStencilState(&off, &g.depth_off)), "create a depth-test-off state");
+        for (int mode = 1; mode <= 2; ++mode) {
+            g.on_screen = mode;
+            for (int i = 0; i < 8; ++i) present_campaign(); // the new picture is chosen, then its HUD is learned
+            const auto before_screen = evaluations;
+            const auto calls_before_screen = g_seen.calls;
+            const auto wrong_before = g_seen.wrong_inputs;
+            bool before_hud = true;
+            for (int i = 0; i < 14; ++i) {
+                const auto calls = g_seen.calls;
+                present_campaign();
+                if (g_seen.calls == calls) continue;
+                before_hud = before_hud && g_seen.last.boundary == na::native11::Boundary::BeforeHud && g_seen.last.scene_draws == 40;
+            }
+            char screen_status[4096];
+            na::native11::FormatStatus(screen_status, sizeof screen_status);
+            std::printf("native scene on screen (HUD kind %d): %s\n", mode, screen_status);
+            expect(before_hud && g_seen.wrong_inputs == wrong_before && g_seen.calls >= calls_before_screen + 10 &&
+                   evaluations >= before_screen + 10,
+                   mode == 1 ? "a scene drawn straight onto the screen: DLAA runs on it before a HUD drawn without depth"
+                             : "a scene drawn straight onto the screen: DLAA runs on it before a HUD that keeps the scene depth, test off");
+            expect(std::strstr(screen_status, "backbuffer=1") != nullptr &&
+                   std::strstr(screen_status, mode == 1 ? " learned_hud=1 " : " learned_untested_hud=1 ") != nullptr,
+                   "the status names the screen target and which HUD rule placed DLAA");
+        }
+        g.on_screen = 0;
+        for (int i = 0; i < 8; ++i) present_campaign();
+        expect(g_seen.last.color.d3d11_resource == static_cast<ID3D11Resource*>(g.color.Get()) &&
+               g_seen.last.boundary == na::native11::Boundary::BeforeRead && g_seen.last.scene_draws == 40,
+               "a scene drawn into its own target again goes back to the read point");
+    }
     na::settings::Get().j2_sharpness.store(60);
     na::settings::Get().j2_preset.store(11);
     present_campaign();
@@ -1033,6 +1247,40 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         g.campaign_split_camera = false;
         na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
     }
+    {
+        // Constant buffers taken from a rotating pool (seen on a real game: the camera was found on
+        // every other frame only, 7,465 of 14,929, and jitter never reached a delivered frame).
+        D3D11_BUFFER_DESC pool_desc{};
+        g.cam_cb->GetDesc(&pool_desc);
+        g.cam_pool[0] = g.cam_cb;
+        expect(SUCCEEDED(g.device->CreateBuffer(&pool_desc, nullptr, &g.cam_pool[1])), "create the second camera buffer of the pool");
+        const bool jitter_was = na::j2::Jitter();
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport); // the production route
+        na::j2::SetJitter(true);
+        g.rotate_camera = true;
+        for (int i = 0; i < 10; ++i) present_campaign(); // the rotation is seen twice, then every upload is kept
+        const auto before_pool = evaluations;
+        const auto jitter_before_pool = g_seen.jitter_reported;
+        const auto no_camera_before = g_seen.no_camera;
+        const auto changed_before_pool = g_seen.changed;
+        const auto streams_before_pool = g_seen.streams;
+        for (int i = 0; i < 30; ++i) present_campaign();
+        char pool_status[4096];
+        na::native11::FormatStatus(pool_status, sizeof pool_status);
+        std::printf("native rotating camera buffers: %s\n", pool_status);
+        expect(evaluations >= before_pool + 28 && g_seen.no_camera == no_camera_before,
+               "camera buffers from a rotating pool: the camera is found on every frame, not every other one");
+        expect(g_seen.jitter_reported >= jitter_before_pool + 24, "rotating camera buffers: delivered frames carry the applied jitter");
+        expect(std::strstr(pool_status, "camera_bytes{keep_all=1 ") != nullptr, "the status says every upload is being kept");
+        expect(g_seen.changed == changed_before_pool && g_seen.streams == streams_before_pool,
+               "rotating camera buffers: a new buffer object is not a change of inputs, so DLSS keeps its history");
+        g.rotate_camera = false;
+        g.cam_cb = g.cam_pool[0];
+        for (int i = 0; i < 4; ++i) present_campaign();
+        na::j2::SetJitter(jitter_was);
+        present_campaign();
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
+    }
     // Real shader sampling: each mip is a different colour. Exact LOD 1
     // produces green; a total bias of -1 selects red mip 0. No counters stand
     // in for the pixel result, and the sampler is bound only once.
@@ -1127,6 +1375,26 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.MipLODBias == -1.f && na::native11::GetSamplerStats().original_bias == -1.f,
            "native mip total avoids double bias when the game already requests -1");
+    // After the frame's picture is handed to DLSS the game's later passes keep its own samplers;
+    // the next frame's scene gets the policy again. Neither needs a new sampler bind by the game.
+    na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(16);
+    material_raw = material.Get();
+    g.ctx->PSSetSamplers(0, 1, &material_raw);
+    g.ctx->Draw(4, 0);
+    const uint64_t own_before = na::native11::GetSamplerStats().after_scene;
+    na::native11::SetSceneHanded(true);
+    g.ctx->Draw(4, 0);
+    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+    if (bound) bound->GetDesc(&applied);
+    expect(bound && applied.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && applied.MipLODBias == 0.f &&
+           na::native11::GetSamplerStats().after_scene > own_before,
+           "draws after the scene is handed to DLSS sample with the game's own sampler");
+    na::native11::SetSceneHanded(false);
+    g.ctx->Draw(4, 0);
+    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+    if (bound) bound->GetDesc(&applied);
+    expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
+           "the next frame's scene draws get 16x AF and the -1 mip bias back");
     na::capture::j2::Shutdown();
     na::capture::Shutdown();
     DeleteFileW(ini.c_str());

@@ -63,6 +63,30 @@ AdmissionBlock Bound(const std::vector<uint8_t>& bytes, uint64_t binding)
     return b;
 }
 
+// One 512-byte view block as a game uploaded it (recorded in a run log, 2026-11-12): a view matrix,
+// a projection, the view-projection WITH the camera position at byte 176, the same view-projection
+// with the position removed at byte 240, and the position itself. Numbers only.
+const char kRecordedViewBlock[] =
+    "9741ce438f41ce430000000000000000000057450000b444c8689839610b363a00000000000000000000000000000000"
+    "2fad783f3688c0b9c32d733ed88016c3efc6d3bbf8e47f3f343ae53c12a47bc3c71673be2f3eebbcc592783f57912144"
+    "0000000000000000000000000000803f5f5b813f0000000000000000000000000000000079821a400000000000000000"
+    "0000000000000000190080bfbfc275bd0000000000000000000080bf000000000d507b3fb692c2b9b6c1753e491918c3"
+    "36a37fbc28721a40d7598a3df3e017c4f616733e5d3eeb3cf69278bf4e9521c4c716733e2f3eeb3cc59278bf579121c4"
+    "0d507b3fb692c2b9b6c1753e0000000036a37fbc28721a40d7598a3d00000000f616733e5d3eeb3cf69278bfbfc275bd"
+    "c716733e2f3eeb3cc59278bf000000005f5b813f79821a401900803fbfc275bdcffe944328058743542f12c400000000"
+    "00000000000020410000000000000000000000000000000000000000000000000000803f000000000000000000000000"
+    "000000000000803f00000000000000000000000000000000344883bf200d52be0000000000000000000080bf00000000"
+    "fb839bbd118766bd9cda7e3f35bd1a4448c87d3f9008d33dd1caa63dc4058ac37f1ae13dc05f82bfce8449bd00915643"
+    "d679db3db83a7ebf167b44bdfa665143fb839bbd118766bd9cda7e3f00000000";
+std::vector<uint8_t> Recorded()
+{
+    std::vector<uint8_t> bytes;
+    const auto nibble = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+    for (size_t i = 0; kRecordedViewBlock[i] && kRecordedViewBlock[i + 1]; i += 2)
+        bytes.push_back(static_cast<uint8_t>(nibble(kRecordedViewBlock[i]) * 16 + nibble(kRecordedViewBlock[i + 1])));
+    return bytes;
+}
+
 } // namespace
 
 int main()
@@ -188,6 +212,74 @@ int main()
                 a = rule.Admit({Bound(relative, 1)}, kW, kH, frame);
                 CHECK(a.how == Admitted::None && a.why == NotAdmitted::PositionGame);
             }
+        }},
+        {"one sighting of an inverse pair does not close the start rule of a game whose camera is a lone matrix", [] {
+            NoInverseCamera rule;
+            for (uint64_t frame = 1; frame <= 200; ++frame) rule.Remember(Camera(0.3, {500, 60, 20}), false, frame);
+            rule.Remember(Camera(0.3, {500, 60, 20}), true, 201); // some other block held a matrix with its inverse, once
+            const auto turned = Block(256, 64, Camera(1.2, {500, 60, 20})); // the player turned: no candidate continues
+            CHECK(rule.StartClosed(202));
+            Admission a = rule.Admit({Bound(turned, 2)}, kW, kH, 202);
+            CHECK(a.how == Admitted::None && a.why == NotAdmitted::InverseGame);
+            const uint64_t open = 201 + NoInverseCamera::kPairMemory + 1;
+            CHECK(!rule.StartClosed(open));
+            for (uint64_t frame = open; frame < open + 4; ++frame) a = rule.Admit({Bound(turned, 2)}, kW, kH, frame);
+            CHECK(a.how == Admitted::Started);
+        }},
+        {"a game whose camera is usually found by inverse pairs keeps its start rule closed", [] {
+            NoInverseCamera rule;
+            for (uint64_t frame = 1; frame <= 200; ++frame) rule.Remember(Camera(0.3, {500, 60, 20}), true, frame);
+            for (uint64_t frame = 201; frame <= 220; ++frame) rule.Remember(Camera(0.3, {500, 60, 20}), false, frame);
+            const auto other = Block(256, 64, Camera(1.2, {900, 60, 20}));
+            for (uint64_t frame = 300; frame <= 308; ++frame) {
+                const Admission a = rule.Admit({Bound(other, 2)}, kW, kH, frame);
+                CHECK(a.how == Admitted::None && a.why == NotAdmitted::InverseGame);
+            }
+        }},
+        {"a camera with its position continues one without, by direction and lens", [] {
+            NoInverseCamera rule;
+            rule.Remember(Camera(0.3), false, 1); // camera-relative last frame
+            const auto positioned = Block(256, 64, Camera(0.31, {500, 60, 20}));
+            const Admission a = rule.Admit({Bound(positioned, 2)}, kW, kH, 2);
+            CHECK(a.how == Admitted::Continued && !a.relative);
+            NoInverseCamera other;
+            other.Remember(Camera(0.3), false, 1);
+            const auto elsewhere = Block(256, 64, Camera(1.2, {500, 60, 20})); // another direction is another camera
+            CHECK(other.Admit({Bound(elsewhere, 2)}, kW, kH, 2).how != Admitted::Continued);
+        }},
+        {"a recorded block that holds the camera with and without its position gives the one with it", [] {
+            const auto block = Recorded();
+            CHECK(block.size() == 512);
+            const Matrix relative = LoadMatrix(block, 240, Layout::RowMajor);
+            CHECK(IsCameraRelative(relative));
+            Candidate twin;
+            CHECK(PositionedTwin(block.data(), block.size(), relative, kW, kH, twin));
+            CHECK(twin.byte_offset == 176 && !IsCameraRelative(twin.matrix));
+            VpGeometry g{};
+            CHECK(DecomposeViewProjection(twin.matrix, g));
+            CHECK(std::abs(g.position[0] - 298.0) < 0.5 && std::abs(g.position[1] - 270.0) < 0.5 && std::abs(g.position[2] + 584.7) < 0.5);
+            NoInverseCamera rule;
+            rule.Remember(relative, false, 1); // the position-less copy was the camera so far
+            const Admission a = rule.Admit({Bound(block, 2)}, kW, kH, 2);
+            CHECK(a.how == Admitted::Continued && a.candidate.byte_offset == 176 && !a.relative);
+            NoInverseCamera fresh; // and a fresh start takes the positioned one too
+            Admission s;
+            for (uint64_t frame = 1; frame <= 4; ++frame) s = fresh.Admit({Bound(block, 2)}, kW, kH, frame);
+            CHECK(s.how == Admitted::Started && s.candidate.byte_offset == 176);
+        }},
+        {"the learned place is the most-drawn range of that shape, wherever it starts this frame", [] {
+            // Recorded (run p39980, frame 52464): the world view's block and two first-person
+            // blocks of the same size sit side by side at one slot; the world view had 43 draws.
+            const uint64_t ring = 7;
+            const std::vector<BoundRange> frame{{ring, 2, 21456, 32, 3}, {ring, 2, 21488, 32, 43}, {ring, 2, 21424, 32, 2},
+                                                {ring, 0, 29296, 800, 86}, {9, 2, 21456, 32, 500}};
+            // Last frame the camera was read at 21456: this frame that start holds the first-person block.
+            CHECK(LearnedRange(frame, ring, 2, 21456, 32) == 1);
+            CHECK(LearnedRange(frame, ring, 2, 13392, 32) == 1); // a start never seen before
+            CHECK(LearnedRange(frame, ring, 3, 21456, 32) == -1); // no range of that shape
+            const std::vector<BoundRange> tie{{ring, 2, 100, 32, 5}, {ring, 2, 200, 32, 5}};
+            CHECK(LearnedRange(tie, ring, 2, 200, 32) == 1);     // equal draws: the start it had
+            CHECK(LearnedRange(tie, ring, 2, 300, 32) == 0);
         }},
         {"empty and short blocks are skipped, and only the first twelve are read", [] {
             NoInverseCamera rule;

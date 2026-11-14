@@ -50,6 +50,8 @@ struct CameraFacts {
     uint64_t version = 0;          // content version of the bytes below (bumps on every update)
     const uint8_t* bytes = nullptr; // CPU copy of the bytes the game uploaded (Map/Unmap or UpdateSubresource
     uint32_t size = 0;              // source data), never a GPU readback; valid for the callback only
+    uint32_t bytes_first_constant = 0; // position of bytes[0] within the buffer
+    bool held = false;             // this frame's camera range could not be read: the previous frame's camera, at most 3 frames
     bool raster_jitter_qualified = false; // this vertex binding and layout support the jitter write
     bool viewport_jitter = false;  // the raster sample is external to the camera matrix
     bool jitter_applied = false;   // the provider wrote this frame's jitter into the scene camera
@@ -90,7 +92,12 @@ using SceneCallback = bool (*)(void* user, void* context, const SceneFrame& fram
 
 struct ProviderStats {
     uint64_t frames = 0, fired = 0, missed = 0, unplaceable = 0, contradictions = 0, selection_changes = 0;
+    uint64_t twin_across_ranges = 0; // frames whose camera was the positioned copy found in another range
     uint64_t camera_found = 0, camera_missing = 0, jitter_written = 0;
+    // The delivered camera's path, frame to frame: `steps` moved, `reversals` moved back against the
+    // previous step (a camera that hops between two sources), `jumps` moved more than 50 units.
+    uint64_t camera_steps = 0, camera_reversals = 0, camera_jumps = 0;
+    uint64_t camera_held = 0; // frames delivered with the previous frame's camera (at most three in a row)
     uint64_t pose_native = 0, pose_legacy = 0, pose_generic = 0, pose_split = 0;
     // Cameras without an inverse beside them, by the shared rule that admitted them, and re-reads of
     // the place learned from one.

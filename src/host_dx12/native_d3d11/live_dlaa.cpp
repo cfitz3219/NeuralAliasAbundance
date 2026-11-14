@@ -66,6 +66,9 @@ Session& State() { static auto* s = new Session; return *s; }
 std::mutex mutex;
 std::atomic<const char*> reason{"Waiting for a native scene."};
 std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
+// WHY log: frames on which DLSS was told to drop its history, by cause. A reset on every frame
+// leaves nothing to accumulate, and the output is then just the jittered frame.
+std::atomic<uint64_t> resets_cut{0}, resets_changed{0}, resets_gap{0};
 std::atomic<uint64_t> delivered_size{0}, delivered_at{0};
 std::atomic<uint32_t> applied_preset{0}, applied_sharpness{0};
 std::atomic<int> raster_slot{-1};
@@ -221,7 +224,8 @@ bool Subresource(ID3D11Texture2D* texture, const native11::TextureFacts& facts,
 camera::CameraFrame Pose(Session& s, const native11::SceneFrame& frame, UINT w, UINT h)
 {
     const auto& c = frame.camera;
-    const size_t start = size_t(c.first_constant) * 16;
+    if (c.first_constant < c.bytes_first_constant) return {};
+    const size_t start = size_t(c.first_constant - c.bytes_first_constant) * 16;
     if (!c.bytes || start >= c.size) return {};
     const size_t length = c.num_constants ? (std::min)(size_t(c.num_constants) * 16, c.size - start) : c.size - start;
     std::vector<uint8_t> bytes(c.bytes + start, c.bytes + start + length);
@@ -290,9 +294,20 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     UINT csub, dsub, cw, ch, dw, dh;
     if (!Subresource(color.Get(), c, cd, csub, cw, ch) ||
         !Subresource(depth.Get(), d, dd, dsub, dw, dh)) return Skip("Scene texture layout unsupported.");
-    const auto cf = static_cast<DXGI_FORMAT>(c.view_format);
+    auto cf = static_cast<DXGI_FORMAT>(c.view_format);
+    // VARIANT: colour/srgb-view-as-stored
+    // A picture the game writes through an sRGB view holds
+    // the same display-ready bytes as one written plainly; they are carried as stored, through
+    // the plain 8-bit sibling, so nothing is converted on the way in or out.
+    if (cf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) cf = DXGI_FORMAT_R8G8B8A8_UNORM;
     const bool hdr = cf == DXGI_FORMAT_R11G11B10_FLOAT || cf == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (!hdr && cf != DXGI_FORMAT_R8G8B8A8_UNORM) return Skip("Scene colour format unsupported.");
+    if (!hdr && cf != DXGI_FORMAT_R8G8B8A8_UNORM) {
+        if (cf == DXGI_FORMAT_B8G8R8A8_UNORM || cf == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || cf == DXGI_FORMAT_B8G8R8X8_UNORM ||
+            cf == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB)
+            return Skip("Scene colour is an 8-bit picture stored blue-first (BGRA); that order is not supported yet.");
+        if (cf == DXGI_FORMAT_R10G10B10A2_UNORM) return Skip("Scene colour is a 10-bit picture (R10G10B10A2); not supported yet.");
+        return Skip("Scene colour format unsupported.");
+    }
     ImageDesc ci{c.active_w, c.active_h, cf, true};
     const DXGI_FORMAT df = na::depth::IsDepth24(dd.Format) ? DXGI_FORMAT_R24G8_TYPELESS :
         dd.Format == DXGI_FORMAT_R32G8X24_TYPELESS || dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
@@ -340,13 +355,22 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     in.depth = shared_depth;
     in.tier2_valid_flag = true;
     in.depth_clear = frame.reversed_depth ? 0.f : 1.f;
-    for (size_t i = 0; i < 16; ++i) {
-        in.inv_view_proj_current.m[i] = static_cast<float>(cam.inv_view_proj_current_row[i]);
-        in.view_proj_previous.m[i] = static_cast<float>(cam.view_proj_previous_row[i]);
+    {
+        // The same as the DX12 host (j2/live_dlaa.cpp): current clip to previous clip as ONE matrix
+        // composed in double. Chained per pixel as two float matrices through large world
+        // coordinates, a still camera gave about 0.1 px of false motion on every frame.
+        const camera::Matrix composed = camera::ComposeReprojectionRow(cam.inv_view_proj_current_row, cam.view_proj_previous_row);
+        for (size_t i = 0; i < 16; ++i) {
+            in.inv_view_proj_current.m[i] = static_cast<float>(composed[i]);
+            in.view_proj_previous.m[i] = i % 5 == 0 ? 1.f : 0.f;
+        }
     }
     in.jitter_current_px[0] = static_cast<float>(cam.jitter_px_x);
     in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
     const bool reset_history = cam.camera_cut || frame.selection_changed || frame.frame != s.last_frame + 1;
+    if (cam.camera_cut) resets_cut.fetch_add(1, std::memory_order_relaxed);
+    else if (frame.selection_changed) resets_changed.fetch_add(1, std::memory_order_relaxed);
+    else if (reset_history) resets_gap.fetch_add(1, std::memory_order_relaxed);
     j2::compute_flow::Ticket flow;
     if (j2::flow::Enabled()) {
         j2::compute_flow::Frame ff;
@@ -577,11 +601,13 @@ int FormatStatus(char* out, size_t capacity)
     // `reason` at its last success, so this is what shows DLAA has stopped.
     const auto last = delivered_at.load(std::memory_order_relaxed);
     const long long last_ms = last ? static_cast<long long>(GetTickCount64() - last) : -1;
-    return std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d \"%s\"",
+    return std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d history_resets{camera_cut=%llu inputs_changed=%llu frame_gap=%llu} \"%s\"",
                          static_cast<unsigned long long>(delivered.load()), last_ms,
                          static_cast<unsigned long long>(busy.load()),
                          static_cast<unsigned long long>(rejected.load()), applied_preset.load(), applied_sharpness.load(),
-                         raster_slot.load(), reason.load());
+                         raster_slot.load(), static_cast<unsigned long long>(resets_cut.load()),
+                         static_cast<unsigned long long>(resets_changed.load()), static_cast<unsigned long long>(resets_gap.load()),
+                         reason.load());
 }
 bool FormatMenuStatus(char* out, size_t capacity)
 {

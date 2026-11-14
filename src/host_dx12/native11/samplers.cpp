@@ -56,6 +56,12 @@ std::atomic<uint64_t> g_binds{0}, g_swapped{0}, g_unknown{0};
 std::atomic<float> g_last_bias{0.0f};
 std::atomic<uint32_t> g_last_af{0};
 std::atomic<uint64_t> g_material_binds{0};
+// The frame's picture has been handed to DLSS: until Present the game draws its post-processing,
+// map overlays and HUD, which keep the game's own samplers. Texture detail and filtering are for
+// the scene that DLSS resolves; later passes are never resolved by it. Immediate context only: a
+// deferred list's place in the frame is not known when it is recorded.
+std::atomic<bool> g_scene_handed{false};
+std::atomic<uint64_t> g_after_scene{0}; // eligible binds left as the game's own for that reason
 std::atomic<float> g_original_bias{0};
 
 uint64_t Key(float bias, uint32_t af)
@@ -134,8 +140,10 @@ void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n, 
 {
     if (!IsGameWork(c) || !s || !n || start >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
         n > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT - start) return original(c, start, n, s);
-    const float bias = g_bias_fn ? g_bias_fn() : 0.0f;
-    const uint32_t af = g_af_fn ? g_af_fn() : 0u;
+    const bool after_scene = g_scene_handed.load(std::memory_order_relaxed) && c->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    const float bias = after_scene ? 0.0f : g_bias_fn ? g_bias_fn() : 0.0f;
+    const uint32_t af = after_scene ? 0u : g_af_fn ? g_af_fn() : 0u;
+    uint64_t kept_own = 0;
     ID3D11SamplerState* swapped[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
     std::shared_ptr<Entry> entries[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
     {
@@ -161,6 +169,10 @@ void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n, 
             }
         }
         if (swapped[i] != e->original.Get()) ++changed;
+        if (after_scene) {
+            if (e->wants_bias || e->wants_af) ++kept_own;
+            continue; // the menu's "applied" readout stays the scene's
+        }
         if (e->wants_bias || e->wants_af) {
             D3D11_SAMPLER_DESC applied{};
             swapped[i]->GetDesc(&applied);
@@ -176,6 +188,7 @@ void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n, 
     g_binds.fetch_add(n, std::memory_order_relaxed);
     if (unknown) g_unknown.fetch_add(unknown, std::memory_order_relaxed);
     if (changed) g_swapped.fetch_add(changed, std::memory_order_relaxed);
+    if (kept_own) g_after_scene.fetch_add(kept_own, std::memory_order_relaxed);
     original(c, start, n, swapped);
 }
 
@@ -243,9 +256,13 @@ bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af)
 
 uint64_t SamplerPolicyKey()
 {
-    return g_installed.load(std::memory_order_relaxed)
-        ? Key(g_bias_fn ? g_bias_fn() : 0.f, g_af_fn ? g_af_fn() : 0u) : 0;
+    if (!g_installed.load(std::memory_order_relaxed)) return 0;
+    // A value no (bias, af) pair has, so the first draw after the scene is handed over, and the first
+    // draw of the next frame, each refresh what is bound.
+    if (g_scene_handed.load(std::memory_order_relaxed)) return ~uint64_t{1};
+    return Key(g_bias_fn ? g_bias_fn() : 0.f, g_af_fn ? g_af_fn() : 0u);
 }
+void SetSceneHanded(bool handed) { g_scene_handed.store(handed, std::memory_order_relaxed); }
 void RefreshSamplers(void* context)
 {
     auto* c = static_cast<ID3D11DeviceContext*>(context);
@@ -272,6 +289,7 @@ SamplerStats GetSamplerStats()
     s.swapped = g_swapped.load();
     s.unknown = g_unknown.load();
     s.material_binds = g_material_binds.load();
+    s.after_scene = g_after_scene.load();
     s.original_bias = g_original_bias.load();
     s.bias = g_last_bias.load();
     s.af = g_last_af.load();
@@ -286,12 +304,13 @@ int FormatSamplerStatus(char* out, unsigned long n)
     const uint32_t want_af = g_af_fn ? g_af_fn() : 0u;
     return std::snprintf(out, n,
                          "native11_samplers{installed=%d want_bias=%.3f want_af=%u applied_bias=%.3f applied_af=%u created=%llu "
-                         "material=%llu af_eligible=%llu variants=%llu variant_failures=%llu binds=%llu swapped=%llu unknown=%llu}",
+                         "material=%llu af_eligible=%llu variants=%llu variant_failures=%llu binds=%llu swapped=%llu unknown=%llu "
+                         "after_scene_own=%llu}",
                          s.installed ? 1 : 0, want_bias, want_af, s.bias, s.af, static_cast<unsigned long long>(s.created),
                          static_cast<unsigned long long>(s.eligible_bias), static_cast<unsigned long long>(s.eligible_af),
                          static_cast<unsigned long long>(s.variants), static_cast<unsigned long long>(s.variant_failures),
                          static_cast<unsigned long long>(s.binds), static_cast<unsigned long long>(s.swapped),
-                         static_cast<unsigned long long>(s.unknown));
+                         static_cast<unsigned long long>(s.unknown), static_cast<unsigned long long>(s.after_scene));
 }
 
 } // namespace na::native11

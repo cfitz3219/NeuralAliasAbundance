@@ -1421,3 +1421,134 @@ Cort reports DLAA no longer runs and asks for fault, exact change and game conte
 ## 2026-11-11 — Anno camera map recovery candidate e7529c3
 Cort authorized fixing the merged Anno DLAA failure. Reproduced the missed persistent Map in the Anno-shaped between-list test on RTX 5070 Ti: before the patch, zero delivered frames, four camera misses after route learning. After the patch, four of four delivered, zero camera misses, 12 jitter writes and three complete captures without errors. The ordinary camera scan keeps priority. If it finds no qualifying camera, retry up to 32 already bound CPU-visible ranges, requiring an inverse pair. Subsequent camera/jitter access can temporarily map the qualified resource. App mapping observation and general snapshots retain their previous rules. Temporary mapping follows the existing bounded Map/copy/Unmap path (https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12resource-map). This addresses the demonstrated acquisition defect regardless of the startup timing that exposed it; the exact in-game trigger commit remains unproven.
 Release built, 14/14 focused Windows tests pass including real NVIDIA DX12 delivery, native DX11 explicit/automatic, Sniper-shaped paths and Ghost Apply. Missed-map test uses a fake model on actual D3D12. Before/after and full suite receipts local/anno-merged-camera-investigation. Dedicated Documents/NeuralAlias-Anno1800-CAMERA-FIX-e7529c3 package SHA256 6482DF43C514513960E109D75A94760A07F71B0C4DF8096C9183DA0FC47ACA35. Direct upgrade of a mock of the current b8b6a4a install, payload hashes, build receipt, results and uninstall all pass. PR 133 targets the consolidation branch. Cort retains game launch, installation and gameplay validation.
+
+## 2026-11-12 Pacific — Native DX11 captures ranged camera uploads beyond 64 KiB
+
+Battlefield 4 test 446a274 reached the native DX11 provider and 19,428 scene handoffs with zero camera snapshots or DLAA deliveries. The retained results show a 512-byte vertex/pixel binding used by 238 of 244 scene draws with high offsets that move by small amounts. The old mapped-buffer path rejected the entire allocation once it exceeded 64 KiB.
+
+The provider now learns a bounded capture window from the most used explicit scene binding of an oversized mapped buffer. The window starts near the observed offset and includes limited room for binding movement. Its snapshot is taken while mapped and retains its byte origin and actual upload version through immediate or deferred draw association. The provider decodes a complete covered binding. A disjoint binding waits for its own bytes. Small mapped buffers and the UpdateSubresource path retain their prior behavior. The change is shared and has no title check. Maximum retained size is 16 KiB per captured large upload.
+
+The real RTX test delivered DLAA with a shifting high-offset binding in a 1 MiB DX11 buffer, withheld it on a disjoint binding and resumed once the new range was observed. The fixture also verified a return to the existing small-buffer path. Initial test setup restored a newly allocated small buffer and checked RCAS before camera reacquisition. The final fixture checks the reacquisition first. Native DX11, overlay startup and native DLSS menu checks passed. This tests acquisition and delivery with a known camera packet. Live Battlefield camera layout and continuity are still pending.
+
+## 2026-11-12 Pacific — Battlefield 4 camera ranges alternate during campaign
+
+With Antialiasing Deferred off, Cort reports rapid DLAA cycling. Run 3184 (Documents/NA-bf4-results-20261112-175319-136) reached 27,388 deliveries versus 1,299 in the preceding run. In a five-second mission interval, 972 handoffs split into 84 deliveries and 888 camera misses with no consumer rejections. In frame 41450, 233 of 239 selected scene draws bound constants 46000–46031, while the captured upload began at 676 and did not cover that range. 374 of 420 logged binding candidates on sampled camera misses were outside the kept range. The game did also select unsupported colour during separate intervals. No change to colour format handling in this increment.
+
+The large mapped-buffer path now retains several high-support and previously qualified windows, prioritizes evidence from the current scene, and resolves each draw against all windows from its own upload version. At most four windows and 32 KiB per oversized upload. The candidate stores no game-specific offset and does not widen camera acceptance. Small mapped buffers and the existing UpdateSubresource path retain the same handling. Fixed the camera diagnostic's missing captured offset argument as part of this change.
+
+Ten focused Windows tests passed. The real native DX11 DLAA fixture alternates between disjoint offsets in a 1 MiB buffer, delivers on all 12 alternating frames, skips an unfamiliar range and reacquires it, and returns to small-buffer capture. This verifies the captured-range failure mechanism. Live stability and the remaining unsupported-colour intervals are separate from the fixture result.
+
+## 2026-11-12 Pacific — Native DX11 reads the bound camera range at the draw (Claude)
+
+Independent analysis of the four Battlefield 4 runs (446a274, 0982e8d twice, 63992f6): the camera sits in one large buffer the game fills afresh each frame, so its place follows what is drawn (13,392 to 48,400 constants in run 27520) and holds still only when the view does. Kept windows cannot follow it: 303 of 376 sampled misses on 63992f6 were still outside the kept bytes. DLAA share was 56% while moving and 99% standing still.
+
+d20ef85 on `claude/project-thread-3euhfs` (branched from 63992f6):
+- camera11/exact-range: the range a scene draw binds is read at the draw through the game's own WRITE_NO_OVERWRITE mapping, once it has stayed bound for a second scene draw, and again after a discard or a new frame. Nothing the game wrote is changed. Deferred recordings carry the bytes with the draw.
+- camera/positioned-twin and the start rule: `inverse_game` misses (3,169 on 63992f6) began the moment one inverse pair was seen; the start rule now stays open for a game whose camera is usually a lone matrix. The game's block holds the camera with its position at byte 176 and without at 240; the positioned one is used.
+- camera11/held: at most three frames with the previous camera instead of a gap.
+- Status: `camera_held`, `exact_ranges{reads failed draws}`; event `native11_pick` on each change of camera kind.
+
+Tests: camera_admission 15 of 15 on Linux, including a block recorded from the run. The DX11 fixture gained a case that moves the camera place every frame through sixteen recorded places. Not yet run on a GPU, and not yet seen by Cort.
+
+## 2026-11-12 Pacific — Native DX11: the learned camera place follows the most-drawn range (Claude)
+
+Run p39980 on 496d691 (Battlefield 4): DLAA on 94.8% of scene frames, every frame for the last 5.5 minutes, but Cort saw warbling textures and shimmering edges. The log shows why the picture can be wrong while coverage is right: the camera block's start moves every frame, so the "learned range" (which compared the start) matched only by accident. On most moving frames the camera came from the continuation rule instead, which takes the first continuing matrix in any bound block, including copies inside large per-draw blocks whose position differs from the view block's by 0.1 to 0.2 units frame to frame. On four logged frames the old start held the first-person pass's block (local position 0.7, 2.2, 1.3), a 660-unit jump. Change: the learned place is buffer + slot + range size, and among those the range most scene draws read (camera/learned-place); ranges are tried most-drawn first. Expected in the next log: `pose{continued}` close to flat, `no_inverse` carrying the frames, `native11_pick` staying on slot 2 offset 176. Not yet checked: whether the jitter value told to DLSS matches the viewport shift (not logged); Cort's live "Camera jitter" switch separates that if the look stays.
+Same build, logging only (Cort: "make the log gather those values"): event `native11_jitter` (what the consumer is told beside the viewport shift the scene draws carried, shifted and unshifted draw counts, scene and depth sizes; first 48 frames, then 16 about every 10 s), and on the status line `camera_path{steps reversals jumps}` (a camera hopping between sources shows as reversals) and `jitter_told{px unshifted_colour_draws}`.
+
+## 2026-11-13 Pacific — Native DX11: DLAA follows a layered renderer to the finished picture (Claude)
+
+Run p15540 on 3272e4a (Battlefield 4), Cort: "it all looked exactly the same as before" (warbling textures, silver strings on edges). Every theory was checked against the log and the saved captures before another build:
+- camera path: steady (`continued` 35,217, 46 other; reversals 18 and jumps 25, all in the first seconds). Not the cause.
+- jitter told against jitter drawn: equal on all 240 sampled `native11_jitter` events, same convention as the DX12 path. Not the cause.
+- texture detail setting: the product's standard at DLAA on every game. Not the cause.
+- the image DLAA receives: the capture planes (`dlssdebug` and `j2` folders of this run, and of 496d691 and 63992f6) show a world-space normals map, format 28, `hdr=false`. DLAA's output is the same map anti-aliased, written back before lighting; the lit picture went to the screen with the raw jitter in it. This is the cause, and it has been so since the first Battlefield 4 build: coverage climbed from 0% to 94.8% on the wrong image. Blended normals on edges explain the silver strings, unresolved jitter the warble.
+
+Why: the frame model takes "the render target drawn most with the scene depth" as the scene colour. In a layered (deferred) renderer that target is a material layer.
+
+Change (`scene/after-layers`, one row in docs/VARIANTS.md): chosen by shape, never by name. When the most-drawn target is not floating point, is written together with other targets and is read after being drawn, and a floating-point target of the same size is then drawn with the same depth and read in turn, that later target is the picture. The scene is then its draws plus the depth-tested draws into the layers, so the camera, the jitter sample and the DLSS point cover the whole scene. The picture in use is kept on frames that draw nothing more into it. Any other shape keeps the most-drawn rule, so a game that draws its scene into one target (the WWII shape in the fixture) is untouched; the DX12 path does not use this file.
+- Hooks: draws carry how many targets are bound; a target's floating-point kind comes from the view it is written through; reads are reported for up to four watched targets (the picture, the most-drawn target, floating-point candidates first).
+- WHY log: event `native11_scene` on every change (rule, reason in words, each candidate with format, draws, multi-target draws, draw and read order), and `scene{picture= layered_frames= colour_fmt= colour_float=}` on the status line. The status buffers grew from 2 KiB to 4 KiB so the added field cannot push an older one out.
+- Also: a picture first met through a read no longer carries the previous picture's view description.
+
+Tests: frame model test on Linux passes, with the recorded shape (picture found within five frames, DLSS before the tonemap's read, scene of 212 draws, indoor frames keep the picture, ten busier targets do not hide it) and six shapes that must keep the old rule. The DX11 fixture gained a layered case. Not yet compiled on Windows, not yet run on a GPU, and not yet seen by Cort.
+
+Proof asked of the next run: the capture's DLAA input must look like the game, `color_format` a floating-point format and `hdr=true`; then Cort's eyes.
+
+## 2026-11-13 Pacific — Native DX11: the camera keeps its position when two ranges hold it (Claude)
+
+Hearts of Iron IV on 3be35e3 (p45020, 25 minutes, 22 with DLAA), Cort: "pretty close, but there is still minor tremors, that suddenly become much worse later on".
+- 00:52:43 to 01:07:30, fifteen minutes: camera_cut flat at 30 to 31, inputs_changed 0. Captures at 00:49:16 and 01:08:08: reset=0 on 30 of 30 frames, DLAA output and screen steady to 0.05 px on a still view, motion 0. The two causes of the entry below are gone.
+- 01:10:00, the sudden worsening: camera_cut 35 to 789 and camera_path jumps 6 to 760 in 55 s. Capture 01:10:42: the camera alternates on a three-frame cycle between eye (4648, 215, 1063) and eye (0, 0, 0) with a zero translation row; reset=1 on 21 of 30 frames; output jumps up to 1.2 px. The game uploads its camera twice, with its position and relative to the camera, in different ranges. The search takes the first range that gives a camera, most-drawn first, and which is most drawn changed with what was on screen.
+- Not explained yet: the "minor tremors" in the steady stretch (not visible in a still capture; a guess is that they belong to camera motion), and 2,010 frames in bursts (00:50 to 00:52, 01:08) on which the scene was not held at the boundary, near menu changes.
+
+Change (extends `camera/positioned-twin`, row updated): a position-less camera found by the general rules is kept aside while the rest of the scene's ranges are looked through for its positioned twin (same direction and lens, `IsPositionedTwin`). Status `camera_bytes{... twin_across_ranges=}`. A game with only a position-less camera pays for the wider look once in 64 frames. The packed-layout adapter path is untouched.
+
+No fixture case for this yet (the DX11 fixture's DLAA section runs on the packed layout); the proof is the next run: `history_resets{camera_cut}` flat over the whole session, `twin_across_ranges` counting when the position-less range is the most drawn. Not yet compiled on Windows.
+
+## 2026-11-13 Pacific — Native DX11: DLSS keeps its history with rotating buffers; reprojection composed as on DX12 (Claude)
+
+Hearts of Iron IV on faad053 (p40940, capture j2-20261113-002205), Cort: "Better but now the whole map is shaking, like it tremors", and it stops with jitter off. The camera is now found on 7,530 of 7,532 attempts. Checked on the capture before any change:
+- Theory 1, borders and names drawn without the jitter while the terrain has it: ruled out. Letters, coast, terrain and city lights all move by the jitter difference, together.
+- The DLAA output moves every frame by about the jitter. It should be still.
+- Cause 1 (in the capture meta): `reset=1` on 30 of 30 consecutive frames, with camera_cut=0. The provider reports a change of inputs when the camera's buffer id differs from last frame's. This game binds a different buffer object every frame, so every frame was a "change", DLSS dropped its history every frame, and its output was the current jittered frame.
+- Cause 2 (motion plane): a constant (-0.11, +0.03) px on a still camera with vp_cur == vp_prev to every digit. Reproduced offline from the captured matrix: chaining inverse and previous view-projection as two float matrices through world coordinates of about 4,500 gives -0.04 to -0.17 px in x and +0.01 to +0.04 in y; in double it is exactly 0. The DX12 host already composes the two in double (`ComposeReprojectionRow`, Astra's Anno blur finding). The DX11 consumer did not.
+
+Change:
+- provider.cpp: with `camera11/all-uploads-when-buffers-rotate` in force, the camera's buffer object is not part of the input stream. Colour and depth changes still are, and a real cut is still found from the camera's path.
+- native_d3d11/live_dlaa.cpp: the reprojection is composed in double as on DX12. Status `native11_dlaa ... history_resets{camera_cut= inputs_changed= frame_gap=}` so a log says how often and why the history was dropped.
+- Fixture: the rotating-buffer case also requires no change of inputs over 30 frames.
+
+Not yet compiled on Windows or run. Proof asked of the next run: capture `reset=0` on consecutive frames, motion plane 0 on a still view, `history_resets{inputs_changed}` flat; then Cort's eyes: no tremor with jitter on.
+
+## 2026-11-13 Pacific — Native DX11: the camera is found every frame when a game rotates its constant buffers (Claude)
+
+Hearts of Iron IV on 979d495, two runs by Cort.
+- p43648 (40 s, loading screen or main menu): 50 flat draws a frame onto the swap chain's buffer, none testing depth; `native11_point point=none`, correctly no DLAA.
+- p45540 (campaign map, 18,786 frames, about 140 fps): Cort: "it did run but without jitter". On the map the scene is NOT drawn onto the screen: it goes into a floating-point target (format 10) that is read afterwards, so the ordinary read point places DLAA (`point=before-read`). The capture's DLAA input is the lit map with no HUD, labels or counters, and the depth is a real depth picture. So the picture and the place are right, and the on-screen variants of the entry below were not what this game's map needed (they stay, tested, for the shape they describe).
+
+What is wrong on the map, from the log: `fired=14929 camera_found=7465 camera_missing=7464`, in lock-step, `pose{generic=7465 no_packet=7464}`, held 0. The camera is found on exactly every other frame. On the missed frames the top-ranked binding (PS slot 0, 2,094 of 2,201 scene draws) has `kept=0`: no upload was kept for that buffer at all. The provider keeps uploads only for the buffers last frame's scene ranked highest, except on the frame after a miss, when it keeps everything. A game that binds a different buffer object at the same place each frame is therefore found only on the keep-everything frames. Jitter follows from the same cause: the sample armed after a delivered frame is rasterised on the next frame, which is the one that finds no camera, so every delivered frame was drawn unjittered (`native11_jitter` 240 of 240 with `applied=0`, while `viewport_jitter{frames=7425}` counts the jittered, undelivered ones).
+
+Change (`camera11/all-uploads-when-buffers-rotate`, one row in docs/VARIANTS.md): when the found-then-no-bytes pair is seen twice, every upload is kept from then on. Event `native11_camera_bytes keep=all why=`, status `camera_bytes{keep_all=}`. A game whose short list holds its camera never switches, so nothing changes for it.
+
+Tests: DX11 GPU fixture case with the camera buffer alternating between two objects (delivery on every frame, jitter applied, status says keep_all). Not yet compiled on Windows or run.
+
+Proof asked of the next run: `camera_found` close to `fired`, `camera_missing` flat after the first seconds, `native11_jitter applied=1`, capture meta `jitter_px` non-zero; then Cort's eyes on a moving map.
+
+## 2026-11-13 Pacific — Native DX11: a scene drawn straight onto the screen gets a place for DLAA (Claude)
+
+Hearts of Iron IV, taken over from Astra and Sol at Cort's word. Evidence is the saved log of p41576 on 496d691: 3,704 frames, `fired=0 missed=0 unplaceable=0`, no camera event, "Waiting for a native scene." `missed` only counts frames that had a learned place, so the model never learned one. The only place the DX11 model learns by itself is "before the n-th read of the picture"; the second rule in frame_model.hpp ("before the first HUD draw", written for pictures drawn straight onto the screen) needs `EnableOverlayRule`, and nothing on DX11 ever called it. The provider already fires at that point when the model asks (`Boundary::BeforeHud`); the model never asked.
+
+Theories, each handled or made readable in this one build:
+1. The picture is the swap chain's buffer and is never read. Handled: `point/before-hud-on-screen`.
+2. The HUD keeps the scene depth bound with the depth test off, so every draw of the frame counts as a scene draw and rule 1 finds nothing. Handled: `point/before-untested-hud`.
+3. The screen picture is written through an sRGB view, which the consumer refused. Handled: `colour/srgb-view-as-stored`. A blue-first (BGRA) or 10-bit picture is still refused, now with its own reason in words.
+4. The camera is not found once DLAA is attempted. Not knowable before the first attempt; the existing `native11_cam` events list every candidate and why it was refused.
+5. The picture chosen is not the map. Readable from the auto-capture's DLAA input and `scene{}`.
+
+Change, all in shared code, chosen by what the program sees, no game name:
+- frame_model.hpp: `SetScreenTarget`; the HUD rule is on by itself when the picture is that target; the untested-HUD point with its own counters and its own "too early" test.
+- provider.cpp: tells the model the screen target each frame; a swap chain buffer is never held across a present (taken again from the bound target at the HUD point); event `native11_point` whenever the kind of place changes, with the reason in words; five more fields in `scene_boundary{}`.
+- live_dlaa.cpp (native DX11 consumer): the sRGB view case and the two worded refusals.
+- Pictures that are not the screen target: unchanged (the rule stays off; tested).
+
+Tests: frame model test on Linux passes with the new cases. DX11 GPU fixture gained two on-screen cases (HUD without depth, HUD with depth bound and test off) and a return to the read point. Not yet compiled on Windows, not yet run on a GPU, and not yet seen by Cort.
+
+Proof asked of the first run: `native11_point` names the place and why; `fired` and `delivered` move; the capture's DLAA input is the lit map (colour format 28, `hdr=false` is right for a screen picture); labels and HUD are outside the picture; then Cort's eyes.
+
+## 2026-11-12 Pacific — HOI4 with multisampling disabled, native DX11 placement evidence
+
+Cort reports DLAA still unavailable after restarting and loading a campaign. HOI4 system.log confirms DirectX 11 and no multisampling. Session p41576 on 496d691 has 3,704 presents, 643 overlay draws, 44,921 exact-range reads against selected colour draws, zero scene insertion attempts and zero deliveries. Camera admission and the DLAA backend were never reached.
+
+Follow-up continues from Claude's 56e49ef DX11 line, which distinguishes the material targets of a layered renderer from its lit picture. Reuse the existing frame model and add its selected scene draws, observed and learned read/draw boundaries, sample counts and swap-chain-buffer identity to the status line. Observe the buffer identity on swap-chain adoption and resize without keeping a reference. The counters distinguish a direct-to-backbuffer scene with a later draw from an offscreen scene missing a read or with an unusable command-list boundary. They do not arm an insertion point. The frame-model fixture checks that a draw boundary is reported even with the HUD rule disabled. No game launch or game installation performed by Astra.
+
+## 2026-11-14 UTC — native DX11: texture detail and filtering end where the scene ends
+
+Cort, Hearts of Iron IV: "when i turned on anisotropic filtering, there was red pixels everywhere, which got worse when you go higher on the filtering multiplier."
+
+Evidence, read from a saved capture of p45020 on 3be35e3 (`j2-20261113-004916-hoi4-p45020`, taken between the logged `mip_af live ... af=16` and `af=0` events): the picture given to DLAA is clean, the DLAA output is clean, the presented frame is covered in red speckle on land, sea, borders and outlined letters. So the speckle is made in the game's passes that run after the DLSS point, which sampled through our anisotropic variants. Which of those passes and which texture is not known.
+
+Change, shared code, no game name: once the frame's picture has been handed to DLSS (`Fire`), sampler binds on the immediate context keep the game's own samplers until Present, for mip bias and for filtering alike. The bindings are refreshed at the first draw after the hand-over and at the first draw of the next frame, with no new bind by the game. Frames with no DLSS point behave as before. Deferred contexts behave as before. Status: `native11_samplers{... after_scene_own=}` counts eligible binds left as the game's own for this reason. This restates the DX12 rule ("applied where the game samples its textures, before DLSS") on DX11, where it was applied to the whole frame.
+
+Not covered: a pass before the DLSS point that samples a data texture through a linear mipmapped sampler would still be made anisotropic. The capture shows no such defect in this game.
+
+Tests: one more GPU fixture case (after the hand-over the bound sampler is the game's own; the next frame gets 16x and -1 back). Not yet compiled on Windows, not run, not seen by Cort.
