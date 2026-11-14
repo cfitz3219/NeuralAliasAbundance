@@ -446,6 +446,11 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         planes.depth = shared_depth;
         planes.motion = slot.motion.Get();
         planes.output = slot.output.Effects();
+        // Flow saw the original scene, before optional AO/tone mapping. Keep
+        // that source available in an armed capture instead of judging flow
+        // against a differently shaded image. No extra live readback.
+        if (eval.color != slot.color.Effects())
+            planes.extra[planes.extra_count++] = {"source_color", slot.color.Effects(), kRead};
         capture::j2::Identity id;
         id.present_ordinal = id.inputs_frame = frame.frame;
         id.view_color = c.incarnation;
@@ -455,6 +460,17 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.color_format = cf;
         id.jitter_x = eval.jitter_x;
         id.jitter_y = eval.jitter_y;
+        id.raster_jitter_x = eval.jitter_x;
+        id.raster_jitter_y = eval.jitter_y;
+        id.depth_reversed = frame.reversed_depth;
+        id.camera_cut = cam.camera_cut;
+        id.cut_reason = cam.cut_reason;
+        id.flow_ran = in.tier3_valid_flag;
+        id.flow_loosen = settings::Get().j2_flow_loosen.load();
+        id.flow_jitter_x = flow.frame.jitter[0];
+        id.flow_jitter_y = flow.frame.jitter[1];
+        id.flow_jitter_convention = flow.colour_convention;
+        id.flow_jitter_epoch = flow.colour_epoch;
         id.preset = eval.preset;
         id.sharpness = settings::Get().j2_sharpness.load();
         id.dlss_hdr = eval.hdr;

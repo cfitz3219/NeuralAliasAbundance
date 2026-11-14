@@ -111,10 +111,12 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 // Camera alone, under both jitter conventions: when the colour carries no jitter,
                 // the stabilised pair is shifted by dj and that shift is not object motion.
                 float e_cam = min(image_error(p, raw - r), image_error(p, raw - r + float2(dj_x, dj_y)));
-                // Rejected when the image contradicts the flow, or does not clearly prefer it
-                // over the camera alone; accepted where the image cannot tell (flat interiors
-                // of moving objects: both errors within image_margin), cost permitting.
-                if (!(e_flow <= image_abs && e_flow <= max(image_margin, image_ratio * e_cam))) why = 5;
+                // Camera wins an ambiguous match. The old absolute .02 allowance
+                // admitted nonzero motion even when camera-only was exact (WWII
+                // still timber). Requiring actual improvement preserves real slow
+                // motion without imposing a larger displacement cutoff. At the
+                // loosest ratio (1), equal matches still cannot invent movement.
+                if (!(e_flow <= image_abs && e_flow < e_cam && e_flow <= image_ratio * e_cam)) why = 5;
             }
         }
         if (why == 0) {

@@ -6,7 +6,7 @@ param([ValidateSet('Deploy','Rollback','Results')] [string] $Action = 'Deploy',
 $ErrorActionPreference = 'Stop'
 $Docs = $DocumentsDirectory
 $Log = Join-Path $Docs 'NA-wwii-log.txt'
-$TestCommit = 'a11c16786f3cc9864a553feeac45ecba207c41b3'
+$TestCommit = '0e2261c17a0f47031fb7176795d11010ebacbc58'
 $Evid = [IO.Path]::GetFullPath($EvidenceDirectory)
 $Manifest = Join-Path $Evid 'manifest.json'
 $Keep = @{ sharpness = '100'; preset = 'M'; mip_bias = '-1.0'; flow_loosen = '50' }
@@ -242,7 +242,7 @@ enabled=0
     Write-Host "`nREADY. Start Call of Duty WWII campaign from Steam as usual." -ForegroundColor Green
     Write-Host "Game graphics: leave the game on DirectX 11 (native DX11; the translation bridge stays off), Anti-aliasing OFF (no FXAA/MSAA), 3D resolution scale at 1.0 (full)." -ForegroundColor Green
     Write-Host "In the game press Home and set Picture > Render mode to DLAA. It switches live." -ForegroundColor Yellow
-    Write-Host "Keep model M and choose R2 with jitter on for the 16-position sequence. Changes apply live." -ForegroundColor Green
+    Write-Host "Preset M and your saved settings are preserved. This build corrects false motion on stationary details." -ForegroundColor Green
     Write-Host "This run is DLAA only. Play a few minutes (campaign only), pan and zoom the camera, open a menu once, then quit." -ForegroundColor Green
     Write-Host "Then run Documents\NA-wwii-on12-results.cmd: it saves the logs to a Documents\NA-wwii-results-... folder." -ForegroundColor Green
     Write-Host "To restore the original game files: Documents\NA-wwii-on12-rollback.cmd (it saves the results first)." -ForegroundColor Green
