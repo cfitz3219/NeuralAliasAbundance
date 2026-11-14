@@ -963,3 +963,7 @@ The existing shared 496d691 Release DLL is staged in Documents/NeuralAlias-Heart
 ## 2026-11-12 Pacific — Hearts of Iron IV no-MSAA result and follow-up candidate
 
 Cort confirmed DLAA still unavailable on a campaign map. The game logged no multisampling and native DX11. NeuralAlias 496d691 recorded 3,704 presents with zero scene handoffs or DLAA deliveries. The renderer had selected a target and captured constant ranges from its draws. PR 136 on the shared 56e49ef line adds the actual backbuffer match, scene draw/read boundaries and sample counts to ordinary status logs. Documents/NeuralAlias-HeartsOfIronIV-6d2c153 is staged for the user, with seven focused Windows tests and isolated upgrade/results/rollback passed. Live delivery is pending and this is not a final build.
+
+### 2026-11-14 — WWII jitter update ready for user testing
+
+Astra code a11c167 and packaging a3183eb on astra/wwii-jitter-coordinates, PR 137 stacked on Fable's shared branch at 502f6bf. Native DX11 camera/depth/motion coordinates now follow the actual expanded viewport; R2 uses 16 samples, M unchanged. Eight automated CPU/DX11/real-NVIDIA fixture tests and isolated installer transactions pass. C:\Users\Cort\Documents\NA-wwii-on12-update.cmd targets the staged a11c167 package; results/rollback links also updated, exact fc0e6bd fallback preserved. Game remains unmodified and unlaunched by this task; Cort performs visual testing. Details and evidence paths in the matching COMMS completion entry. HOI4 remains Fable's assignment.

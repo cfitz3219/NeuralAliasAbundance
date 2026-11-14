@@ -783,3 +783,7 @@ Cort: "Of each of those games, the final version declared to be workable should 
 | Hearts of Iron IV | none yet | | 496d691 staged, not run | |
 
 Rule from now on: when a game gets a newer workable build, this row moves to it, the label moves, and the earlier packages for that game are removed. The finals are not yet on the consolidation branch or `main` (446a274 and e7529c3 sit on the line above it); merging them there is Sol's step as merger.
+
+### 2026-11-14 — WWII native-DX11 jitter task status
+
+Astra's authorized coordinate fix and 16-phase R2 implementation are complete, tested and staged at a11c167 (packaging a3183eb / PR 137). M is unchanged. Existing WWII update/results/rollback CMDs now point at the new package. Automated proof and reversible installer checks pass; actual WWII quality comparison is Cort's remaining test. No new engine route or game-specific jitter selector added. See COMMS/HANDOFF completion entry.
