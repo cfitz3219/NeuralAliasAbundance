@@ -54,6 +54,7 @@ struct CameraFacts {
     bool held = false;             // this frame's camera range could not be read: the previous frame's camera, at most 3 frames
     bool raster_jitter_qualified = false; // this vertex binding and layout support the jitter write
     bool viewport_jitter = false;  // the raster sample is external to the camera matrix
+    bool viewport_expanded = false; // executed scene viewport includes the half-pixel border on each side
     bool jitter_applied = false;   // the provider wrote this frame's jitter into the scene camera
     float jitter_px[2] = {0, 0};   // the jitter written, in pixels of the scene extent (DLSS convention)
     struct RelativePose {

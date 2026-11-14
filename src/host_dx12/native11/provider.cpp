@@ -146,6 +146,7 @@ struct Ctx {
     D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {}; // the game's own viewports
     UINT vp_n = 0;
     bool vpj_applied = false;          // our offset copies are bound on this context now
+    bool vpj_expanded = false;
     uint64_t vpj_sample = 0;          // the exact sample they carry
     uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
@@ -291,6 +292,7 @@ uint32_t g_vpj_frame_unshifted = 0; // draws into the scene colour left unshifte
 std::atomic<uint64_t> g_vpj_unshifted{0};
 std::atomic<uint64_t> g_vpj_told{0}; // the sample last handed to the consumer (two floats, pixels)
 uint64_t g_vpj_executed_sample = 0;
+bool g_vpj_executed_expanded = false;
 bool g_vpj_seen_draw = false, g_vpj_mixed = false;
 std::atomic<uint64_t> g_vpj_mixed_frames{0};
 std::atomic<uint64_t> g_vpj_frames{0}, g_vpj_draws{0}, g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_unknown{0};
@@ -1092,10 +1094,11 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     if (vpj_route && g_vpj_mixed) {
         ++g_vpj_mixed_frames;
         ++g_stats.missed;
-        return SetReason("Scene draws used different viewport jitter samples.");
+        return SetReason("Scene draws used different viewport jitter samples or raster footprints.");
     }
     f.camera.raster_jitter_qualified = vpj_route || (f.camera.vs_slot >= 0 && cam.raster_jitter_qualified);
     f.camera.viewport_jitter = vpj_route;
+    f.camera.viewport_expanded = vpj_route && g_vpj_executed_expanded;
     f.camera.jitter_applied = vpj_route ? g_vpj_executed_sample != 0 : (f.camera.raster_jitter_qualified && g_jitter_written);
     if (vpj_route) {
         static_assert(sizeof(f.camera.jitter_px) == sizeof(g_vpj_executed_sample));
@@ -1292,7 +1295,8 @@ void NoteViewportDraw(const Event& e)
     if (!g_vpj_seen_draw) {
         g_vpj_seen_draw = true;
         g_vpj_executed_sample = e.viewport_sample;
-    } else if (g_vpj_executed_sample != e.viewport_sample) {
+        g_vpj_executed_expanded = e.viewport_expanded;
+    } else if (g_vpj_executed_sample != e.viewport_sample || g_vpj_executed_expanded != e.viewport_expanded) {
         g_vpj_mixed = true;
     }
     if (e.viewport_sample) ++g_vpj_frame_draws;
@@ -1358,7 +1362,7 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
     if (want) {
         ViewportRect r[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
         for (UINT i = 0; i < n; ++i) r[i] = {x->vps[i].TopLeftX, x->vps[i].TopLeftY, x->vps[i].Width, x->vps[i].Height};
-        JitterViewports(r, n, offset[0], offset[1], g_sel_depth_w.load(std::memory_order_relaxed), g_sel_depth_h.load(std::memory_order_relaxed));
+        x->vpj_expanded = JitterViewports(r, n, offset[0], offset[1], g_sel_depth_w.load(std::memory_order_relaxed), g_sel_depth_h.load(std::memory_order_relaxed));
         for (UINT i = 0; i < n; ++i) {
             v[i] = x->vps[i];
             v[i].TopLeftX = r[i].x;
@@ -1478,6 +1482,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.vertices = vertices;
     e.indirect = indirect;
     e.viewport_sample = x->vpj_applied ? x->vpj_sample : 0;
+    e.viewport_expanded = x->vpj_applied && x->vpj_expanded;
     std::memcpy(e.cb, x->cb, sizeof(e.cb));
     for (int i = 0; i < kCbBindSlots; ++i) {
         e.cb_first[i] = static_cast<uint16_t>(x->cb_first[i]);
@@ -2222,6 +2227,7 @@ bool OnPresent(IDXGISwapChain* swap)
     g_vpj_frame_unshifted = 0;
     g_vpj_seen_draw = g_vpj_mixed = false;
     g_vpj_executed_sample = 0;
+    g_vpj_executed_expanded = false;
     g_vpj_last_frame_draws.store(jittered_draws, std::memory_order_relaxed);
     if (jittered_draws) g_vpj_frames.fetch_add(1, std::memory_order_relaxed);
     g_sel_depth.store(s.depth, std::memory_order_relaxed);

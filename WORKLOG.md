@@ -1552,3 +1552,13 @@ Change, shared code, no game name: once the frame's picture has been handed to D
 Not covered: a pass before the DLSS point that samples a data texture through a linear mipmapped sampler would still be made anisotropic. The capture shows no such defect in this game.
 
 Tests: one more GPU fixture case (after the hand-over the bound sampler is the game's own; the next frame gets 16x and -1 back). Not yet compiled on Windows, not run, not seen by Cort.
+
+## 2026-11-14 — Astra: native DX11 jitter coordinates and 16-phase R2
+
+Cort requested coordinate correction and 16-sample R2 with preset M unchanged, automated tests, and an updated WWII CMD; game testing remains his. Coordinated ownership in central COMMS before editing. Based on shared native-DX11 head 2ab84c6, preserving Fable's boundary/colour work; no HOI4 package change.
+
+The existing full-target viewport expansion changes the raster projection by (W+1)/W and (H+1)/H. Depth and colour used that raster footprint while camera reconstruction used the unexpanded game projection. Carry actual expansion from executed immediate/deferred scene draws and apply its X/Y transform to the unjittered camera before tracking. Current, inverse and previous matrices now share that coordinate system. Keep pixel jitter separate, preserve the border coverage, and preserve original projection when expansion is absent. Mixed expansion/sample draws use the existing mixed-jitter rejection. No game-name selector.
+
+Native DX11 R2 uses 16 positions at the same subpixel amplitude; Halton remains 8 and the DX12 route is unchanged. All camera admission paths use the same raster correction. Cached source matrices remain original. Preset/model and NGX flags are unchanged.
+
+Validation: Release build of NeuralAliasDXGI and focused targets passed with the real NGX SDK. Eight CTest cases passed (50.36 s): temporal_jitter, camera_tracker, native11_viewport_jitter, host_dlss_real_test, host_native11_frame_model_test, host_native11_provider_test, host_native11_dlaa_test, host_native11_dlaa_automatic_test. New independent math checks cover off-centre raster points at 64x36 and 3440x1440, normal/reversed depth, all 16 phases, camera reprojection through jitter toggles, plus partial/multiple viewports. Provider fixtures check immediate/deferred expansion identity; the real NVIDIA fixture delivers 34 successive frames with M and checks the executed 16-phase sample. R2 uniqueness/wrap and unchanged Halton are checked. These synthetic fixtures establish coordinate/handoff correctness, not WWII visual improvement. Logs: local workspace build-jitter.log, test-jitter.log and build/Testing/Temporary/LastTest.log. User performs the real-game comparison.

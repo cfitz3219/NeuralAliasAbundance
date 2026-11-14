@@ -16,6 +16,7 @@
 // Hardware first, then WARP; exit 77 (SKIP) only without any DX11 device.
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native11/viewport_jitter.hpp"
 #if defined(NA_TEST_NATIVE_DLAA)
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/capture/frame_capture.hpp"
@@ -754,6 +755,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(depth_only_same, "a depth-only draw into the scene depth carries the same offset as the colour draws");
         expect(restored, "the post pass gets the game's own viewport back");
         expect(g_seen.jitter_reported >= reported + 5, "the consumer is told the jitter the scene draws carried");
+        expect(g_seen.last.camera.viewport_expanded, "the consumer receives the actual expanded raster footprint");
         expect(na::native11::Stats().jitter_written == written, "the camera upload is left alone on the viewport route");
         // No request: the next frame's scene is the game's own.
         Scene(g.ctx.Get(), g, frame++);
@@ -765,6 +767,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         g.swap->Present(0, 0);
         expect(plain.TopLeftX == 0.f && plain.TopLeftY == 0.f && plain.Width == float(g.w) && plain.Height == float(g.h),
                "a frame with no jitter request renders through the game's own viewports");
+        expect(!g_seen.last.camera.viewport_expanded, "jitter off restores the original reconstruction footprint");
         // Submit a list after Present advances the armed offset. DLAA needs
         // the offset recorded into the executed draws, not the newer request.
         ComPtr<ID3D11DeviceContext> delayed;
@@ -787,7 +790,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                 Post(g.ctx.Get(), g, true);
                 expect(g_seen.calls == before + 1 && g_seen.last.camera.viewport_jitter &&
                        g_seen.last.camera.jitter_applied && g_seen.last.camera.jitter_px[0] == 0.25f &&
-                       g_seen.last.camera.jitter_px[1] == -0.25f,
+                       g_seen.last.camera.jitter_px[1] == -0.25f && g_seen.last.camera.viewport_expanded,
                        "delayed list reports the executed viewport sample after Present advances");
                 g.swap->Present(0, 0);
             }
@@ -1211,12 +1214,27 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     {
         na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
         na::j2::SetJitter(true);
+        const auto prior_r2 = na::settings::Get().j2_jitter_r2.load();
+        const auto prior_preset = na::settings::Get().j2_preset.load();
+        na::settings::Get().j2_jitter_r2.store(1);
+        na::settings::Get().j2_preset.store(13); // Cort keeps M throughout the new R2 cycle.
         const auto jitter_before_viewport = g_seen.jitter_reported;
         const auto delivered_before_viewport = evaluations;
-        for (int i = 0; i < 12; ++i) present_campaign();
+        bool exact_r2 = true;
+        for (int i = 0; i < 34; ++i) {
+            present_campaign();
+            if (i < 2) continue; // previous request was armed before this switch
+            const auto& f = g_seen.last;
+            const auto want = na::native11::DlaaJitterSample(uint32_t(f.frame - 1), true);
+            exact_r2 = exact_r2 && f.camera.viewport_expanded && f.camera.jitter_applied &&
+                f.camera.jitter_px[0] == float(want.x_pixels) && f.camera.jitter_px[1] == float(want.y_pixels);
+        }
         na::native11::FormatStatus(status, sizeof status);
         std::printf("native campaign viewport jitter: %s\n", status);
-        expect(evaluations == delivered_before_viewport + 12, "DLAA keeps delivering every frame with viewport jitter on");
+        expect(evaluations == delivered_before_viewport + 34, "DLAA keeps delivering through two complete R2 cycles");
+        expect(exact_r2, "actual DX11 draws and DLAA handoff carry the same sixteen-sample R2 sequence and footprint");
+        na::native_d3d11::FormatStatus(status, sizeof status);
+        expect(std::strstr(status, "preset=13") != nullptr, "NVIDIA DLAA keeps preset M during sixteen-sample R2");
         expect(g_seen.last.camera.jitter_applied && g_seen.jitter_reported >= jitter_before_viewport + 8,
                "the native campaign pose gets real jitter through the viewports");
         na::j2::SetJitter(false);
@@ -1224,6 +1242,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         const auto viewport_off = g_seen.jitter_reported;
         for (int i = 0; i < 4; ++i) present_campaign();
         expect(g_seen.jitter_reported == viewport_off, "the jitter switch stops the viewport offsets");
+        expect(!g_seen.last.camera.viewport_expanded, "native DLAA returns to the original footprint with jitter off");
+        na::settings::Get().j2_jitter_r2.store(prior_r2);
+        na::settings::Get().j2_preset.store(prior_preset);
 
         camera_desc.ByteWidth = 160;
         expect(SUCCEEDED(g.device->CreateBuffer(&camera_desc, nullptr, &g.split_world)), "create split world block");
