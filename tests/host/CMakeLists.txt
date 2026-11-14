@@ -376,6 +376,10 @@ if(NA_HAVE_NGX_LIB)
   endif()
   na_host_test(dlss_real_test SOURCES dlss_real_test.cpp LIBS host_dlss dxgi
                ARGS "${CMAKE_CURRENT_BINARY_DIR}/dlss-real-test" LABELS "gpu;nvidia")
+  add_test(NAME host_dlss_stationary_stability_test
+           COMMAND dlss_real_test "${CMAKE_CURRENT_BINARY_DIR}/dlss-stationary-test" --stationary)
+  set_tests_properties(host_dlss_stationary_stability_test
+    PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   if(NA_DLSS_DLL)
     add_custom_command(TARGET dlss_real_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")
