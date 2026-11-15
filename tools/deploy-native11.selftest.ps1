@@ -7,8 +7,11 @@ $pkg = Join-Path $root 'pkg'; $docs = Join-Path $root 'docs'; $runs = Join-Path 
 New-Item -ItemType Directory -Force -Path $pkg, $docs, $runs | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'deploy-native11.ps1') -Destination $pkg
 Copy-Item -LiteralPath $Dll -Destination (Join-Path $pkg 'NeuralAliasDXGI.dll')
-@{ source_commit = '0123abc'; payload = @(@{ name = 'NeuralAliasDXGI.dll'; sha256 = (Get-FileHash -LiteralPath (Join-Path $pkg 'NeuralAliasDXGI.dll')).Hash }) } |
-    ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $pkg 'package.json')
+function Write-Package([object[]] $components) {
+    @{ source_commit = '0123abc'; payload = @(@{ name = 'NeuralAliasDXGI.dll'; sha256 = (Get-FileHash -LiteralPath (Join-Path $pkg 'NeuralAliasDXGI.dll')).Hash }); components = $components } |
+        ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $pkg 'package.json')
+}
+Write-Package @()
 $fs = [IO.File]::OpenRead($Dll); $br = New-Object IO.BinaryReader($fs); $fs.Position = 0x3c; $fs.Position = $br.ReadInt32() + 4; $dllIs32 = ($br.ReadUInt16() -eq 0x014c); $fs.Dispose()
 $exe32 = Join-Path $env:WINDIR 'SysWOW64\notepad.exe'; $exe64 = Join-Path $env:WINDIR 'System32\notepad.exe'
 $fail = 0
@@ -39,6 +42,23 @@ Check ($sum -and ((Get-Content -LiteralPath $sum.FullName -Raw) -match 'NO RUN L
 Check ((Run 'Rollback' $same 'same') -eq 0) 'uninstalls'
 $after = @(Get-ChildItem -LiteralPath $same -Force | ForEach-Object Name)
 Check (-not (Compare-Object $before $after)) 'game folder is exactly as before'
+# The DLAA pieces and another lane's component (stand-ins: any 64-bit program and library will do).
+Copy-Item -LiteralPath $exe64 -Destination (Join-Path $pkg 'NeuralAliasDlaa64.exe')
+Copy-Item -LiteralPath (Join-Path $env:WINDIR 'System32\version.dll') -Destination (Join-Path $pkg 'nvngx_dlss.dll')
+Set-Content -LiteralPath (Join-Path $pkg 'extra.pack') -Value 'component payload'
+New-Item -ItemType Directory -Force -Path (Join-Path $same 'data') | Out-Null
+Write-Package @(@{ name = 'extra.pack'; sha256 = (Get-FileHash -LiteralPath (Join-Path $pkg 'extra.pack')).Hash; dest = 'data\extra.pack' })
+$before = @(Get-ChildItem -LiteralPath $same -Force -Recurse | ForEach-Object FullName)
+Check ((Run 'Deploy' $same 'same') -eq 0) 'installs with the DLAA pieces and a component'
+Check (Test-Path -LiteralPath (Join-Path $same 'data\extra.pack')) 'the component is at its place below the game folder'
+Check ((Test-Path -LiteralPath (Join-Path $same 'nvngx_dlss.dll')) -eq $true) 'the DLSS runtime is installed'
+Check ((Test-Path -LiteralPath (Join-Path $same 'NeuralAliasDlaa64.exe')) -eq $dllIs32) 'the 64-bit companion is installed for a 32-bit game only'
+Check ((Run 'Rollback' $same 'same') -eq 0) 'uninstalls all of it'
+$after = @(Get-ChildItem -LiteralPath $same -Force -Recurse | ForEach-Object FullName)
+Check (-not (Compare-Object $before $after)) 'game folder and its subfolders are exactly as before'
+Write-Package @(@{ name = 'extra.pack'; sha256 = (Get-FileHash -LiteralPath (Join-Path $pkg 'extra.pack')).Hash; dest = '..\escape.pack' })
+Check ((Run 'Deploy' $same 'same') -ne 0) 'refuses a component that points outside the game folder'
+Check (-not (Test-Path -LiteralPath (Join-Path $same 'dxgi.dll'))) 'and installs nothing in that case'
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 if ($fail) { Write-Output "deploy-native11 selftest: $fail failed"; exit 1 }
 Write-Output 'deploy-native11 selftest: all passed'

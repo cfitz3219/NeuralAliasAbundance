@@ -15,7 +15,7 @@ $Log = Join-Path $Docs "NA-$Label-log.txt"
 $Evid = Join-Path ([IO.Path]::GetFullPath($EvidenceRoot)) $Label
 $Manifest = Join-Path $Evid 'manifest.json'
 $ExeBase = [IO.Path]::GetFileNameWithoutExtension($Exe)
-$Owned = 'dxgi.dll', 'nvngx_dlss.dll', 'NeuralAliasHost.ini', 'NeuralAlias-AMD-OpticalFlow-LICENSE.txt'
+$Owned = 'dxgi.dll', 'nvngx_dlss.dll', 'NeuralAliasDlaa64.exe', 'NeuralAliasHost.ini', 'NeuralAlias-AMD-OpticalFlow-LICENSE.txt'
 function Log([string] $m) { $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m; Write-Host $line; Add-Content -LiteralPath $Log -Value $line }
 # 0x8664 = 64-bit, 0x014c = 32-bit. A proxy of the wrong kind is never loaded by the game, silently.
 function Get-PEMachine([string] $path) {
@@ -86,7 +86,10 @@ function Invoke-Rollback {
     if ($m.restoredUtc) { Log 'Already removed.'; return }
     foreach ($f in $m.files) {
         $name = [IO.Path]::GetFileName($f.path)
-        if ($name -notin $Owned -or [IO.Path]::GetFullPath($f.path) -ne (Join-Path $GameDir $name)) { throw 'The installation record does not match this game folder. Nothing removed.' }
+        $full = [IO.Path]::GetFullPath($f.path)
+        # Our own files sit beside the exe; a component (another lane's file, e.g. a material pack) sits at its recorded place below it.
+        $mine = if ($f.component) { $full.StartsWith($GameDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) } else { $name -in $Owned -and $full -eq (Join-Path $GameDir $name) }
+        if (-not $mine) { throw 'The installation record does not match this game folder. Nothing removed.' }
         if ($name -eq 'NeuralAliasHost.ini') { continue } # menu settings are saved into it: no hash guard
         if ((Test-Path -LiteralPath $f.path) -and (Get-FileHash -LiteralPath $f.path).Hash -ne $f.deployedHash) { throw "Changed since install, left untouched: $($f.path)" }
     }
@@ -124,9 +127,23 @@ try {
     $gameBits = Bits (Get-PEMachine $gameExe); $proxyBits = Bits (Get-PEMachine $dll)
     Log "Build $commit. Game is $gameBits, program is $proxyBits."
     if ($gameBits -ne $proxyBits) { throw "The game is $gameBits and this package's program is $proxyBits; the game would never load it. Nothing changed." }
+    # DLSS exists only as a 64-bit runtime. A 64-bit game loads it itself; a 32-bit game needs the
+    # 64-bit companion program beside it, which loads it instead.
     $sdkDll = Join-Path $PSScriptRoot 'nvngx_dlss.dll'
-    $haveDlss = (Test-Path -LiteralPath $sdkDll) -and ((Bits (Get-PEMachine $sdkDll)) -eq $gameBits)
-    if (-not $haveDlss) { Log 'No DLSS runtime of the game''s kind in this package: hooks and the Home menu run, DLAA stays off and the log says why.' }
+    $companion = Join-Path $PSScriptRoot 'NeuralAliasDlaa64.exe'
+    $sdk64 = (Test-Path -LiteralPath $sdkDll) -and ((Bits (Get-PEMachine $sdkDll)) -eq '64-bit')
+    $haveCompanion = $gameBits -eq '32-bit' -and (Test-Path -LiteralPath $companion) -and ((Bits (Get-PEMachine $companion)) -eq '64-bit')
+    $haveDlss = $sdk64 -and ($gameBits -eq '64-bit' -or $haveCompanion)
+    if ($haveCompanion -and $haveDlss) { Log 'The game is 32-bit: DLAA runs in the 64-bit companion program installed beside it.' }
+    if (-not $haveDlss) { Log 'This package cannot run DLAA in this game (no 64-bit DLSS runtime, or no companion for a 32-bit game): hooks and the Home menu run, DLAA stays off and the log says why.' }
+    $components = @($package.components | Where-Object { $_ })
+    foreach ($c in $components) {
+        $rel = [string]$c.dest
+        if (-not $rel -or [IO.Path]::IsPathRooted($rel) -or $rel -match '(^|[\\/])\.\.([\\/]|$)') { throw "Component $($c.name) has no safe destination. Nothing changed." }
+        $src = Join-Path $PSScriptRoot $c.name
+        if ($c.name -ne [IO.Path]::GetFileName($c.name) -or -not (Test-Path -LiteralPath $src) -or (Get-FileHash -LiteralPath $src).Hash -ne $c.sha256) { throw "Component mismatch: $($c.name). Nothing changed." }
+        if (-not (Test-Path -LiteralPath (Split-Path -Parent (Join-Path $GameDir $rel)))) { throw "Component $($c.name): the folder for $rel does not exist in the game. Nothing changed." }
+    }
 
     $keep = @{ sharpness = '100'; preset = 'M'; mip_bias = '-1.0'; flow_loosen = '50' }
     if (Test-Path -LiteralPath $Manifest) {
@@ -140,7 +157,7 @@ try {
         Move-Item -LiteralPath $Evid -Destination ($Evid + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
     }
     New-Item -ItemType Directory -Force -Path $Evid | Out-Null
-    foreach ($n in $Owned + 'd3d11.dll') { if (Test-Path -LiteralPath (Join-Path $GameDir $n)) { throw "$n already exists in the game folder. This script never overwrites game files. Nothing changed." } }
+    foreach ($n in $Owned + 'd3d11.dll' + @($components | ForEach-Object { [string]$_.dest })) { if (Test-Path -LiteralPath (Join-Path $GameDir $n)) { throw "$n already exists in the game folder. This script never overwrites game files. Nothing changed." } }
 
     $ini = Join-Path $Evid 'NeuralAliasHost.ini'
     @"
@@ -216,9 +233,11 @@ enabled=0
 "@ | Set-Content -LiteralPath $ini -Encoding ascii
     $sources = [ordered]@{ 'dxgi.dll' = $dll; 'NeuralAliasHost.ini' = $ini }
     if ($haveDlss) { $sources['nvngx_dlss.dll'] = $sdkDll }
+    if ($haveDlss -and $haveCompanion) { $sources['NeuralAliasDlaa64.exe'] = $companion }
     $lic = Join-Path $PSScriptRoot 'AMD-OpticalFlow-LICENSE.txt'
     if (Test-Path -LiteralPath $lic) { $sources['NeuralAlias-AMD-OpticalFlow-LICENSE.txt'] = $lic }
     $files = @(foreach ($n in $sources.Keys) { @{ path = (Join-Path $GameDir $n); source = $sources[$n]; deployedHash = (Get-FileHash -LiteralPath $sources[$n]).Hash } })
+    $files += @(foreach ($c in $components) { @{ path = (Join-Path $GameDir ([string]$c.dest)); source = (Join-Path $PSScriptRoot $c.name); deployedHash = [string]$c.sha256; component = $true } })
     $snapshot = @(Get-ChildItem -LiteralPath $GameDir -Force | ForEach-Object { "{0}|{1}" -f $_.Name, $(if ($_.PSIsContainer) { 'dir' } else { $_.Length }) })
     @{ createdUtc = [DateTime]::UtcNow.ToString('o'); sourceCommit = $commit; gameBits = $gameBits; proxyBits = $proxyBits; dlssRuntime = $haveDlss
        folderSnapshot = $snapshot; gameExeHash = (Get-FileHash -LiteralPath $gameExe).Hash; files = $files } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Manifest
@@ -230,7 +249,8 @@ enabled=0
     $installStarted = $false
     Log "READY: build $commit installed for $Title."
     Write-Host "`nREADY. Build $commit is installed. Start $Title as usual; press Home in the game for the menu." -ForegroundColor Green
-    if (-not $haveDlss) { Write-Host 'This package has no DLAA yet: it checks that the program loads, the Home menu shows and the game stays stable.' -ForegroundColor Yellow }
+    if (-not $haveDlss) { Write-Host 'This package has no DLAA: it checks that the program loads, the Home menu shows and the game stays stable.' -ForegroundColor Yellow }
+    foreach ($c in $components) { Write-Host "Also installed: $($c.dest)" -ForegroundColor Green }
 } catch {
     if ($installStarted) { try { Invoke-Rollback } catch { Log "Partial installation record kept for recovery: $_" } }
     Log "STOPPED: $($_.Exception.Message)"

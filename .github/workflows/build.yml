@@ -54,6 +54,18 @@ jobs:
           & .\tools\deploy-native11.selftest.ps1 -Dll $dll.FullName
           Write-Output "X86-SCOPE install selftest exit code: $LASTEXITCODE"
           exit 0
+      - name: 32-bit in-game half with the 64-bit DLAA companion, software device
+        shell: pwsh
+        run: |
+          cmake -S . -B build64c -A x64 | Select-Object -Last 3
+          cmake --build build64c --config Release --parallel --target NeuralAliasDlaa64 2>&1 | Select-Object -Last 5
+          $companion = Get-ChildItem -Path build64c -Recurse -Filter NeuralAliasDlaa64.exe | Select-Object -First 1
+          $test = Get-ChildItem -Path build32 -Recurse -Filter dlaa_companion_test.exe | Select-Object -First 1
+          if (-not $companion -or -not $test) { Write-Output "X86-SCOPE handoff: missing companion=$($companion.FullName) test=$($test.FullName)"; exit 0 }
+          Copy-Item $companion.FullName (Split-Path $test.FullName)
+          & $test.FullName --warp
+          Write-Output "X86-SCOPE 32-bit to 64-bit handoff exit code: $LASTEXITCODE"
+          exit 0
 
   windows:
     name: Windows x64 (MSVC) build + non-GPU tests

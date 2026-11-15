@@ -16,13 +16,18 @@ endfunction()
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
 na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
 na_host_test(dlaa_channel_test SOURCES dlaa_channel_test.cpp LIBS dlaa_remote_client)
+# The handoff to the 64-bit DLAA companion with real programs and no game. The copy variants need
+# no DLSS; the DLSS variant runs where an RTX card and the DLSS runtime are present. The test
+# program itself builds for both kinds: a 32-bit one beside a 64-bit NeuralAliasDlaa64.exe is the
+# real 32-bit-game arrangement.
+add_executable(dlaa_companion_test dlaa_companion_test.cpp)
+target_link_libraries(dlaa_companion_test PRIVATE abundance_options dlaa_remote_client dxgi)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-  # The handoff to the 64-bit DLAA companion with real programs and no game. The copy variants need
-  # no DLSS; the DLSS variant runs where an RTX card and the DLSS runtime are present.
-  na_host_test(dlaa_companion_test SOURCES dlaa_companion_test.cpp LIBS dlaa_remote_client dxgi LABELS gpu)
   add_dependencies(dlaa_companion_test NeuralAliasDlaa64)
   add_custom_command(TARGET dlaa_companion_test POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:NeuralAliasDlaa64>" "$<TARGET_FILE_DIR:dlaa_companion_test>")
+  add_test(NAME host_dlaa_companion_test COMMAND dlaa_companion_test)
+  set_tests_properties(host_dlaa_companion_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_dlaa_companion_warp_test COMMAND dlaa_companion_test --warp)
   set_tests_properties(host_dlaa_companion_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_dlaa_companion_dlss_test COMMAND dlaa_companion_test --dlss)
