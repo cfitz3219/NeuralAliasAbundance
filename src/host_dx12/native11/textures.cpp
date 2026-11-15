@@ -5,6 +5,7 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/texture_policy.hpp"
 #include "materials/texture_subresources_v1.hpp"
 
@@ -30,7 +31,7 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-enum : uint32_t { kCreateShaderResourceView = 7 }; // ID3D11Device
+enum : uint32_t { kCreateTexture2D = 5, kCreateShaderResourceView = 7 }; // ID3D11Device
 enum : uint32_t { kPSGetShaderResources = 73 };    // ID3D11DeviceContext
 constexpr unsigned kSlots = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
 constexpr uint64_t kCensusEvery = 16;   // frames; binds are counted on one frame in this many
@@ -48,7 +49,10 @@ using PFN_CreateSrv = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, ID3D11Resource*
                                                   ID3D11ShaderResourceView**);
 using PFN_GetSrvs = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView**);
 
+using PFN_CreateTex2D = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_TEXTURE2D_DESC*, const D3D11_SUBRESOURCE_DATA*,
+                                                    ID3D11Texture2D**);
 PFN_CreateSrv g_create = nullptr;
+PFN_CreateTex2D g_create_texture = nullptr;
 PFN_GetSrvs g_get[2] = {}; // [0] immediate class, [1] deferred class
 
 struct Entry {
@@ -256,6 +260,17 @@ HRESULT STDMETHODCALLTYPE CreateShaderResourceView_d(ID3D11Device* dev, ID3D11Re
     Life* life = new Life(view, e->serial);
     view->SetPrivateDataInterface(kLifeGuid, life); // the view now holds the only lasting reference
     life->Release();
+    if (e->verdict == TextureVerdict::Candidate) MaterialsOnViewCreated(r, view, e->serial, e->facts);
+    return hr;
+}
+
+// The game's creation data is the one cheap moment a texture's bytes are in hand (texture_loader.hpp).
+HRESULT STDMETHODCALLTYPE CreateTexture2D_d(ID3D11Device* dev, const D3D11_TEXTURE2D_DESC* desc, const D3D11_SUBRESOURCE_DATA* initial,
+                                            ID3D11Texture2D** out)
+{
+    const HRESULT hr = g_create_texture(dev, desc, initial, out);
+    if (FAILED(hr) || !desc || !out || !*out || dev != g_device.load(std::memory_order_acquire) || IsOwnWork()) return hr;
+    MaterialsOnTextureCreated(dev, *desc, initial, *out);
     return hr;
 }
 
@@ -659,6 +674,8 @@ bool InstallTextures(void* device)
     bool ok = imm && na::hooking::BeginInstallWait("native11_textures");
     ok = ok && na::hooking::PrepareVTableSlot(dev, kCreateShaderResourceView, reinterpret_cast<void*>(&CreateShaderResourceView_d),
                                               reinterpret_cast<void**>(&g_create));
+    ok = ok && na::hooking::PrepareVTableSlot(dev, kCreateTexture2D, reinterpret_cast<void*>(&CreateTexture2D_d),
+                                              reinterpret_cast<void**>(&g_create_texture));
     ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kPSGetShaderResources, reinterpret_cast<void*>(&PSGetShaderResources_d),
                                               reinterpret_cast<void**>(&g_get[0]));
     if (ok && def) {
@@ -674,6 +691,7 @@ bool InstallTextures(void* device)
     if (!g_get[1]) g_get[1] = g_get[0];
     g_installed.store(ok);
     na::eventlog::Emit("native11_textures", "install ok=%d deferred=%d", ok ? 1 : 0, def ? 1 : 0);
+    if (ok) LoadMaterialCache(nullptr); // manifests only; an absent folder leaves the loader idle
     return ok;
 }
 
@@ -865,6 +883,35 @@ bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView
         }
     }
     return true;
+}
+
+size_t PublishTextures(const TexturePublication* items, size_t count)
+{
+    if (!items || !count) return 0;
+    State& s = S();
+    std::vector<ComPtr<ID3D11ShaderResourceView>> displaced; // released after the lock
+    size_t taken = 0;
+    {
+        std::unique_lock<std::shared_mutex> l(s.mu);
+        for (size_t i = 0; i < count; ++i) {
+            const TexturePublication& p = items[i];
+            if (!p.original || !p.replacement || p.original == p.replacement.Get()) continue;
+            const auto it = s.entries.find(p.original);
+            if (it == s.entries.end() || it->second->serial != p.serial) continue; // that view is gone
+            Entry& e = *it->second;
+            ++taken;
+            if (e.replacement == p.replacement && !e.pending_set) continue; // already visible as asked
+            displaced.push_back(std::move(e.pending));
+            e.pending = p.replacement;
+            e.pending_bytes = p.bytes;
+            if (!e.pending_set) {
+                e.pending_set = true;
+                s.pending.push_back(p.original);
+                g_pending.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    return taken;
 }
 
 bool RemoveTexture(ID3D11ShaderResourceView* original)
