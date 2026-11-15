@@ -68,6 +68,7 @@ set(NA_SDK_ROOT "${NA_SDK_ROOT}" CACHE PATH "Folder holding the local NVIDIA SDK
 # game: it never links them (DLAA for it runs in the 64-bit companion), whatever is on disk.
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
   set(NA_SDK_ROOT "" CACHE PATH "" FORCE)
+  set(NA_SDK_ROOT "") # the folder search above sets the plain variable, which would win over the cache
   foreach(v NA_NGX_SDK_INCLUDE NA_NVOF_INCLUDE NA_PCL_INCLUDE NA_NGX_LIB NA_DLSS_DLL NA_XESS_INCLUDE)
     unset(${v} CACHE)
     unset(${v})
