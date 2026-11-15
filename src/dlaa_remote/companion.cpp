@@ -43,12 +43,12 @@ Reply Fail(HRESULT hr, const char* why)
     return r;
 }
 
-template <class T> HRESULT OpenAndClose(ID3D12Device* device, uint64_t handle, ComPtr<T>* out)
+template <class T> HRESULT OpenAndClose(ID3D12Device* device, uint64_t handle, ComPtr<T>& out)
 {
     // The in-game half duplicated this handle into this process for us; once opened (or refused)
     // it has no further use here.
     const HANDLE h = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(handle));
-    const HRESULT hr = h ? device->OpenSharedHandle(h, IID_PPV_ARGS(out->ReleaseAndGetAddressOf())) : E_HANDLE;
+    const HRESULT hr = h ? device->OpenSharedHandle(h, IID_PPV_ARGS(out.ReleaseAndGetAddressOf())) : E_HANDLE;
     if (h) CloseHandle(h);
     return hr;
 }
@@ -81,8 +81,8 @@ Reply OnHello(State& s, const Hello& h)
     q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     hr = s.device->CreateCommandQueue(&q, IID_PPV_ARGS(&s.queue));
     if (FAILED(hr)) return Fail(hr, "The companion could not create its command queue.");
-    hr = OpenAndClose(s.device.Get(), h.ready_fence, &s.ready);
-    const HRESULT hr2 = OpenAndClose(s.device.Get(), h.done_fence, &s.done);
+    hr = OpenAndClose(s.device.Get(), h.ready_fence, s.ready);
+    const HRESULT hr2 = OpenAndClose(s.device.Get(), h.done_fence, s.done);
     if (FAILED(hr) || FAILED(hr2)) return Fail(FAILED(hr) ? hr : hr2, "The companion could not open the shared frame fences.");
     s.copy = h.copy_for_tests != 0;
     Reply r{};
@@ -108,11 +108,11 @@ Reply OnBind(State& s, const Bind& b)
     Slot& slot = s.slots[b.slot];
     if (!Idle(s, slot)) return Fail(E_FAIL, "The previous frame in this slot never finished.");
     HRESULT first = S_OK;
-    const auto open = [&](uint64_t handle, ComPtr<ID3D12Resource>* out) {
+    const auto open = [&](uint64_t handle, ComPtr<ID3D12Resource>& out) {
         const HRESULT hr = OpenAndClose(s.device.Get(), handle, out);
         if (FAILED(hr) && SUCCEEDED(first)) first = hr;
     };
-    open(b.color, &slot.color); open(b.depth, &slot.depth); open(b.motion, &slot.motion); open(b.output, &slot.output);
+    open(b.color, slot.color); open(b.depth, slot.depth); open(b.motion, slot.motion); open(b.output, slot.output);
     if (FAILED(first)) { slot = Slot{}; return Fail(first, "The companion could not open a shared frame texture."); }
     if (!slot.allocator) {
         HRESULT hr = s.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator));
