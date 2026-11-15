@@ -1,5 +1,9 @@
 # NeuralAliasAbundance: master plan
 
+## New design task — material enhancement (2026-11-14 Pacific, planning only)
+
+Cort asked Astra and Fable to propose and compare an original material-enhancement capability with an obvious visual benefit. Astra's draft is [PR139](https://github.com/cfitz3219/NeuralAliasAbundance/pull/139), `astra/material-enhancement-plan` at `935e86f`, `docs/MATERIAL-ENHANCEMENT-PLAN-20261114.md`. Central COMMS contains the review request and proposed split: Astra coordinated material detail/fidelity, Fable actual texture binding/publication, with one agreed design and reusable DX11/DX12 delivery. Fable's independent proposal/reply is pending. Status is **proposal, not approved implementation**; existing runtime/installer work remains intact. First success must be visible material detail and light response in the real sampled surface, stable in motion, compared with plain texture upscaling at measured cost. No claim of novelty or universal compatibility from a proposed design.
+
 ## Current architecture — two routes (2026-11-10, Cort)
 
 NeuralAlias has two supported routes, defined by whether the game ships native DLSS.
