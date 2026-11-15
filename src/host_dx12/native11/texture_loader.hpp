@@ -2,12 +2,13 @@
 // textures.hpp's swap was built for). The cache is docs/MATERIAL-CACHE-V1.md: one folder per entry,
 // named by its entry_key, holding manifest.json and one DDS per map.
 //
-// How a game texture gets its prepared map, without a GPU read-back and without work in a game call:
+// How a game texture gets its prepared map:
 //  1. At the game's CreateTexture2D: only when the cache holds an entry of this exact shape
 //     (format, size, mip count), the creation data is copied (a memory copy) and handed to the
 //     loader's thread, which computes the "texture-subresources-v1" digest for the view formats the
-//     cache asks about. A texture created empty and filled later has no identity here yet; it is
-//     counted (`no_creation_data`) and keeps its own content.
+//     cache asks about. Empty-created sources of prepared shapes use the existing asynchronous
+//     capture after they are bound in the scene: one copy, read on a later Present with DO_NOT_WAIT,
+//     then worker hashing. No GPU wait, files or model inference in a game callback.
 //  2. At the game's CreateShaderResourceView of a candidate view (texture_policy.hpp): the view
 //     waits on, or is matched against, its texture's digest.
 //  3. A match names one map of one entry. The loader's thread reads that map's file, checks it
@@ -16,14 +17,15 @@
 //     created texture, all are published in one step, so colour, normal and roughness of a material
 //     change on the same Present. Views that arrive later for a shown entry join it at once.
 //
-// v1 replaces only where the prepared map means the same to the game's shader as its own texture
-// (materials/cache_index.hpp Qualified): same size and mip count, sRGB colour for sRGB colour, BC5
-// for BC5, BC4 for BC4. Everything else is listed in the log with its reason and left alone.
+// Replacement requires matching source encoding; larger maps also require plain pixel-shader
+// sampling. Writes after identification invalidate the source and restore its original views.
+// This supports static materials uploaded after creation, not arbitrary mutable texture streaming.
 #pragma once
 
 #include <d3d11.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace na::native11 {
 
@@ -39,7 +41,11 @@ size_t LoadMaterialCache(const wchar_t* dir);
 // From textures.cpp's device hooks, after the game's successful calls.
 void MaterialsOnTextureCreated(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& asked, const D3D11_SUBRESOURCE_DATA* initial,
                                ID3D11Texture2D* texture);
-void MaterialsOnViewCreated(ID3D11Resource* resource, ID3D11ShaderResourceView* view, uint64_t serial, const MaterialTextureFacts& facts);
+bool MaterialsOnViewCreated(ID3D11Resource* resource, ID3D11ShaderResourceView* view, uint64_t serial, const MaterialTextureFacts& facts);
+// Reuse the bounded asynchronous source capture for empty-created textures.
+bool MaterialsBeginLateRead(ID3D11Resource* resource);
+void MaterialsFinishLateRead(ID3D11Resource* resource, std::vector<uint8_t>&& bytes);
+void MaterialsOnResourceWritten(ID3D11Resource* resource);
 
 struct MaterialStats {
     uint64_t entries = 0, findable_maps = 0, refused_maps = 0, unreadable_entries = 0; // the loaded index

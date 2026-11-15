@@ -1388,15 +1388,11 @@ void DrawDlssDebug()
 static void DrawExperimentalGpu();
 static void DrawDonutLighting();
 static void DrawAmbientOcclusion();
+static void DrawMaterialEnhancement();
 
-void RegisterLiveDlaaMenu()
+static void RegisterSharedEnhancementMenu()
 {
-    na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
-    na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
-    na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
-    // XeGTAO and Lighting run inside live DLAA too, but their rows were only registered with
-    // the Route A menu, so a live-DLAA-only game (Sniper Elite 5, Cort 2026-11-05) never showed
-    // them. Register them here unless the Route A menu already did.
+    // Shared effects have one registration path, including native DX11 DLAA.
     const auto registered = [](void (*draw)()) {
         for (int i = 0; i < na::menu::Count(); ++i)
             if (const na::menu::Section* s = na::menu::At(i); s && s->draw == draw) return true;
@@ -1408,6 +1404,16 @@ void RegisterLiveDlaaMenu()
         na::menu::Register({"Lighting", na::menu::Availability::Available, nullptr, &DrawDonutLighting, na::menu::Page::Experimental});
     if (!registered(&DrawExperimentalGpu))
         na::menu::Register({"GPU infrastructure", na::menu::Availability::Available, nullptr, &DrawExperimentalGpu, na::menu::Page::Experimental});
+    if (!registered(&DrawMaterialEnhancement))
+        na::menu::Register({"Material enhancement", na::menu::Availability::Available, nullptr, &DrawMaterialEnhancement, na::menu::Page::Experimental});
+}
+
+void RegisterLiveDlaaMenu()
+{
+    na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+    na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
+    na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
+    RegisterSharedEnhancementMenu();
 }
 
 static void DrawExperimentalGpu()
@@ -1501,7 +1507,7 @@ static void DrawAmbientOcclusion()
     ImGui::EndPopup();
 }
 
-void DrawMaterialEnhancement()
+static void DrawMaterialEnhancement()
 {
     using namespace na::ui;
     auto& setting=na::settings::Get().material_enhancement;
@@ -1543,10 +1549,7 @@ void RegisterRouteAMenu()
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
-    na::menu::Register({"XeGTAO (Ambient Occlusion)", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
-    na::menu::Register({"GPU infrastructure", Availability::Available, nullptr, &DrawExperimentalGpu, Page::Experimental});
-    na::menu::Register({"Lighting", Availability::Available, nullptr, &DrawDonutLighting, Page::Experimental});
-    na::menu::Register({"Material enhancement", Availability::Available, nullptr, &DrawMaterialEnhancement, Page::Experimental});
+    RegisterSharedEnhancementMenu();
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});

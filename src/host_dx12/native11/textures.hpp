@@ -107,6 +107,7 @@ void TexturesOnPresent();
 // view (several views of one texture); `bytes` is then counted once per original.
 bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView* replacement, uint64_t bytes);
 bool RemoveTexture(ID3D11ShaderResourceView* original);
+void InvalidateTexture(ID3D11ShaderResourceView* original, uint64_t serial);
 // Several publications in one step, so they become visible on the same Present (the maps of one
 // material). Each names the game view by address and by the serial its creation was given: an
 // entry whose view has since been destroyed (or whose address now belongs to another view) is

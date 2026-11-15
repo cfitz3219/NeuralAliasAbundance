@@ -25,6 +25,7 @@
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/native11/textures.hpp"
+#include "host_dx12/native11/texture_loader.hpp"
 
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
@@ -68,7 +69,7 @@ enum CtxSlot : uint32_t {
     kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
     kClearState = 110, kFinishCommandList = 114,
     // ID3D11DeviceContext1
-    kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
+    kCopySubresourceRegion1 = 115, kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
 };
 enum SwapSlot : uint32_t { kPresent = 8, kResizeBuffers = 13, kPresent1 = 22 };
 
@@ -415,6 +416,7 @@ using PFN_RSSetViewports = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, 
 using PFN_CopyRegion = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT,
                                                 const D3D11_BOX*);
 using PFN_CopyResource = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
+using PFN_CopyRegion1 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT, const D3D11_BOX*, UINT);
 using PFN_UpdateSub = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT);
 using PFN_UpdateSub1 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT, UINT);
 using PFN_ClearDSV = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
@@ -444,6 +446,7 @@ struct Originals {
     PFN_RSSetViewports rs_vp = nullptr;
     PFN_CopyRegion copy_region = nullptr;
     PFN_CopyResource copy_resource = nullptr;
+    PFN_CopyRegion1 copy_region1 = nullptr;
     PFN_UpdateSub update = nullptr;
     PFN_UpdateSub1 update1 = nullptr;
     PFN_ClearDSV clear_dsv = nullptr;
@@ -1848,6 +1851,7 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
         } else if (cb) {
             CbUpdate(c, r, nullptr, 0); // not a candidate: still a version change for the model
         }
+        if(!cb) MaterialsOnResourceWritten(r);
     }
     O(c, x).unmap(c, r, sub);
 }
@@ -1860,7 +1864,7 @@ void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11
         Inside in;
         cb = IsConstantBuffer(r, &size);
     }
-    if (!cb) return;
+    if (!cb) { MaterialsOnResourceWritten(r);return; }
     if (box || !IsCandidate(IdOf(r))) { CbUpdate(c, r, nullptr, 0); return; } // constant buffers are updated whole
     tmp.assign(static_cast<const uint8_t*>(src), static_cast<const uint8_t*>(src) + size);
     if (JitterUpload(tmp.data(), tmp.size(), IdOf(r))) src = tmp.data(); // the game's upload, jittered
@@ -1992,12 +1996,21 @@ void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Res
                                                UINT ss, const D3D11_BOX* box)
 {
     ReadResource(c, src);
+    if(!t_inside && Get(c)) MaterialsOnResourceWritten(dst);
     O(c, t_inside ? nullptr : Get(c)).copy_region(c, dst, ds, x0, y0, z0, src, ss, box);
 }
 void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src)
 {
     ReadResource(c, src);
+    if(!t_inside && Get(c)) MaterialsOnResourceWritten(dst);
     O(c, t_inside ? nullptr : Get(c)).copy_resource(c, dst, src);
+}
+void STDMETHODCALLTYPE CopySubresourceRegion1_d(ID3D11DeviceContext1* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y0, UINT z0,
+                                                ID3D11Resource* src, UINT ss, const D3D11_BOX* box, UINT flags)
+{
+    Ctx* context=t_inside?nullptr:Get(c);
+    if(context) MaterialsOnResourceWritten(dst);
+    O(c,context).copy_region1(c,dst,ds,x0,y0,z0,src,ss,box,flags);
 }
 void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT f)
 {
@@ -2362,6 +2375,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     else hooks.push_back({kExecuteCommandList, reinterpret_cast<void*>(&ExecuteCommandList_d), reinterpret_cast<void**>(&o.execute)});
     ComPtr<ID3D11DeviceContext1> c1;
     if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) {
+        hooks.push_back({kCopySubresourceRegion1, reinterpret_cast<void*>(&CopySubresourceRegion1_d), reinterpret_cast<void**>(&o.copy_region1)});
         hooks.push_back({kUpdateSubresource1, reinterpret_cast<void*>(&UpdateSubresource1_d), reinterpret_cast<void**>(&o.update1)});
         hooks.push_back({kVSSetConstantBuffers1, reinterpret_cast<void*>(&VSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.vs_cb1)});
         hooks.push_back({kPSSetConstantBuffers1, reinterpret_cast<void*>(&PSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.ps_cb1)});

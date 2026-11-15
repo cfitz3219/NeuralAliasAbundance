@@ -87,6 +87,9 @@ struct Entry {
     uint64_t bytes = 0, pending_bytes = 0;
     bool pending_set = false; // a publish or a removal waits for the next Present
     bool larger = false, pending_larger = false;
+    bool invalid = false; // source written after identification; original wins immediately
+    bool late_read = false; // exact prepared shape, but no creation bytes
+    std::atomic<bool> late_taken{false};
     std::atomic<bool> dump_taken{false}; // noted for the running source dump
 };
 
@@ -156,6 +159,14 @@ Dump& D()
 }
 std::atomic<int> g_dump_phase{0}; // 0 idle, 1 noting binds, 2 reading and writing
 std::atomic<uint64_t> g_dump_written{0}, g_dump_failed{0};
+
+struct LateSources {
+    std::mutex mu;
+    std::deque<DumpItem> queue;
+    uint64_t bytes=0; // queue plus the one staging copy, at most 64 MiB
+    std::unique_ptr<DumpRead> read; // Present thread only
+};
+LateSources& Late() { static auto* state=new LateSources;return *state; }
 
 // {3f9c2d71-8a54-4b0e-b6c3-5e1a9d7f2c48}: a view's entry, by the lifetime of its private data.
 const GUID kLifeGuid = {0x3f9c2d71, 0x8a54, 0x4b0e, {0xb6, 0xc3, 0x5e, 0x1a, 0x9d, 0x7f, 0x2c, 0x48}};
@@ -283,7 +294,7 @@ HRESULT STDMETHODCALLTYPE CreateShaderResourceView_d(ID3D11Device* dev, ID3D11Re
     Life* life = new Life(view, e->serial);
     view->SetPrivateDataInterface(kLifeGuid, life); // the view now holds the only lasting reference
     life->Release();
-    if (e->verdict == TextureVerdict::Candidate) MaterialsOnViewCreated(r, view, e->serial, e->facts);
+    if (e->verdict == TextureVerdict::Candidate) e->late_read=MaterialsOnViewCreated(r, view, e->serial, e->facts);
     return hr;
 }
 
@@ -583,6 +594,42 @@ int FinishRead(DumpRead& read, DumpJob& job)
     return 1;
 }
 
+// Same source bytes and nonblocking readback as the user capture, but only for
+// exact prepared shapes seen bound in a scene. No files, no model, one copy at a time.
+void LateSourcesOnPresent(uint64_t frame)
+{
+    auto& late=Late();
+    if(late.read) {
+        DumpJob job=JobOf(late.read->item);
+        const int ready=FinishRead(*late.read,job);
+        if(!ready && frame-late.read->since_frame<=kDumpReadFrames) return;
+        if(ready==1) {
+            ComPtr<ID3D11Resource> source;late.read->item.view->GetResource(&source);
+            MaterialsFinishLateRead(source.Get(),std::move(job.body));
+        } else na::eventlog::Emit("native11_materials","late source read skipped why=\"%s\"",job.why?job.why:"GPU copy not ready within bounded frames");
+        {
+            const auto& f=late.read->item.entry->facts;
+            std::lock_guard<std::mutex> lock(late.mu);
+            late.bytes-=ChainBytes(f.width,f.height,f.mips,f.view_format);
+        }
+        late.read.reset(); // release outside locks
+    }
+    std::unique_ptr<DumpRead> read;
+    {
+        std::lock_guard<std::mutex> lock(late.mu);
+        if(late.queue.empty()) return;
+        read=std::make_unique<DumpRead>();
+        read->item=std::move(late.queue.front());late.queue.pop_front();
+    }
+    ComPtr<ID3D11Resource> source;read->item.view->GetResource(&source);
+    const char* why=MaterialsBeginLateRead(source.Get())?StartRead(*read,frame):"already identified or modified";
+    if(why) {
+        const auto& f=read->item.entry->facts;
+        std::lock_guard<std::mutex> lock(late.mu);
+        late.bytes-=ChainBytes(f.width,f.height,f.mips,f.view_format);
+    } else late.read=std::move(read);
+}
+
 // Present thread. Phase 1 ends after its frames (or when enough is noted): the most used within the
 // budget are kept. Phase 2 has one staging copy in flight: it is queued on one Present and read on a
 // later one with DO_NOT_WAIT, so the GPU is never waited for here; the bytes (memory copies only)
@@ -763,6 +810,14 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
             const auto it = s.entries.find(views[i]);
             if (it == s.entries.end()) continue;
             Entry& e = *it->second;
+            if(in_scene && e.late_read && !e.late_taken.load(std::memory_order_relaxed)) {
+                auto& late=Late();
+                std::lock_guard<std::mutex> lock(late.mu);
+                const auto bytes=ChainBytes(e.facts.width,e.facts.height,e.facts.mips,e.facts.view_format);
+                if(late.queue.size()<32 && late.bytes+bytes<=(64ull<<20) && !e.late_taken.exchange(true)) {
+                    late.queue.push_back({ComPtr<ID3D11ShaderResourceView>(views[i]),it->second});late.bytes+=bytes;
+                }
+            }
             if (census) {
                 e.binds.fetch_add(1, std::memory_order_relaxed);
                 if (in_scene) e.scene_binds.fetch_add(1, std::memory_order_relaxed);
@@ -778,7 +833,7 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
                 if (g_dump_phase.load(std::memory_order_relaxed) == 1 && d.queue.size() < kDumpCollectMax)
                     d.queue.push_back({ComPtr<ID3D11ShaderResourceView>(views[i]), it->second});
             }
-            if (replace && e.replacement && (!e.larger || shadow.larger_safe[start+i])) {
+            if (replace && !e.invalid && e.replacement && (!e.larger || shadow.larger_safe[start+i])) {
                 scratch[i] = e.replacement.Get();
                 scratch[i]->AddRef(); // held until EndTextureSwap, after the real bind has taken its own
                 ++changed;
@@ -837,7 +892,7 @@ void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn orig
             game[i] = shadow.game[i] ? shadow.game[i] : bound[i];
             want[i] = game[i];
             const auto it = s.entries.find(game[i]);
-            if (replace && it != s.entries.end() && it->second->replacement &&
+            if (replace && it != s.entries.end() && !it->second->invalid && it->second->replacement &&
                 (!it->second->larger || shadow.larger_safe[i])) {
                 want[i] = it->second->replacement.Get();
                 want[i]->AddRef();
@@ -898,6 +953,7 @@ void TexturesOnPresent()
     }
     release.clear();
     DumpOnPresent(frame);
+    LateSourcesOnPresent(frame);
     const uint64_t now = GetTickCount64();
     if (!g_census_next_ms) g_census_next_ms = now + 45000;
     if (now >= g_census_next_ms) {
@@ -950,6 +1006,7 @@ size_t PublishTextures(const TexturePublication* items, size_t count)
             const auto it = s.entries.find(p.original);
             if (it == s.entries.end() || it->second->serial != p.serial) continue; // that view is gone
             Entry& e = *it->second;
+            if(e.invalid) continue;
             ++taken;
             if (e.replacement == p.replacement && !e.pending_set) continue; // already visible as asked
             displaced.push_back(std::move(e.pending));
@@ -964,6 +1021,20 @@ size_t PublishTextures(const TexturePublication* items, size_t count)
         }
     }
     return taken;
+}
+
+void InvalidateTexture(ID3D11ShaderResourceView* original,uint64_t serial)
+{
+    State& state=S();
+    std::unique_lock<std::shared_mutex> lock(state.mu);
+    const auto it=state.entries.find(original);
+    if(it==state.entries.end() || it->second->serial!=serial) return;
+    auto& e=*it->second;
+    e.invalid=true;
+    if(e.pending) state.grave.emplace_back(g_frame.load(),std::move(e.pending));
+    e.pending_bytes=0;
+    if(!e.pending_set){e.pending_set=true;state.pending.push_back(original);++g_pending;}
+    ++g_generation; // next draw restores originals, even before the next Present
 }
 
 bool RemoveTexture(ID3D11ShaderResourceView* original)

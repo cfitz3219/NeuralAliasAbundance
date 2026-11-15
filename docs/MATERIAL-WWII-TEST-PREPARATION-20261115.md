@@ -91,4 +91,38 @@ The real game installation and running game were not touched.
 
 No model runs per frame. Current acquisition requires captured textures;
 automatic whole-game extraction and background model inference are not built.
+
+## 2026-11-14 Pacific correction after the first user run
+
+Cort reported no material control in Experimental. Installed DLL SHA256 matched
+the 58313bb package. `RegisterRouteAMenu` registered the control but
+`RegisterLiveDlaaMenu` did not. Earlier GPU tests opened Home and tested the
+material binding directly; that did not prove the native Experimental section
+contained the control. Shared effect registration now has one idempotent path
+used by both menu registrations. Regression checks assert the material section
+on Experimental in each route, render native Experimental, and reject duplication
+when both routes register.
+
+The same real run, status-32048.log, exposed the source-acquisition gap:
+2 entries/4 findable maps, 302 matching-shape textures created without data,
+0 textures hashed and 0 maps loaded. Creation-data matching could not deliver
+the first pack in this run. Empty-created matching shapes now attach a source
+note; their scene bindings reuse the existing source dump's asynchronous copy
+and `DO_NOT_WAIT` read on a later Present. Only one staging copy at once, at
+most 32 pending views and 64 MiB source bytes retained, then worker-thread
+digesting. No file writes, inference, synchronous GPU waits or new DLAA boundary
+selection. Completed sources are not scanned each frame.
+
+Updates/copies after identification invalidate the old source and restore the
+game's current texture at the next draw. Pending publications cannot revive it.
+Ordinary uploads before first identification are accepted. This is support for
+static material assets uploaded after creation, not a claim of arbitrary mutable
+texture-streaming support. A failed/changed source remains original.
+
+The actual four-map GPU fixture now creates views before supplying the texture
+bytes and exercises UpdateSubresource, UpdateSubresource1, CopyResource and
+CopySubresourceRegion1. It waits for actual bound replacements, checks direct
+pixels and live off/shader fallback, then rewrites an identified source and
+verifies its new original pixels return without a bind. No new user capture
+was requested to discover or exercise these two concrete failures.
 The first package is two terrain materials, not a whole-game enhancement.

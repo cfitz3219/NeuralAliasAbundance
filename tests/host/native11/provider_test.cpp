@@ -1766,6 +1766,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                 std::ifstream f(path,std::ios::binary);
                 return std::vector<uint8_t>(std::istreambuf_iterator<char>(f),{});
             };
+            unsigned upload_style=0;
             const auto make_dds_view = [&](const std::vector<uint8_t>& raw, bool own) {
                 ComPtr<ID3D11ShaderResourceView> view;
                 if (raw.size()<148) return view;
@@ -1784,8 +1785,30 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                 }
                 const auto create=[&] {
                     ComPtr<ID3D11Texture2D> texture;
-                    return SUCCEEDED(g.device->CreateTexture2D(&td,levels.data(),&texture)) &&
-                           SUCCEEDED(g.device->CreateShaderResourceView(texture.Get(),nullptr,&view));
+                    if(!own) td.Usage=D3D11_USAGE_DEFAULT;
+                    if(FAILED(g.device->CreateTexture2D(&td,own?levels.data():nullptr,&texture)) ||
+                       FAILED(g.device->CreateShaderResourceView(texture.Get(),nullptr,&view))) return false;
+                    if(!own) {
+                        // WWII's actual upload order: view exists before content.
+                        const unsigned style=upload_style++%4;
+                        ComPtr<ID3D11DeviceContext1> context1;
+                        g.ctx.As(&context1);
+                        if(style<2) {
+                            for(UINT i=0;i<td.MipLevels;++i) {
+                                if(style==1 && context1) context1->UpdateSubresource1(texture.Get(),i,nullptr,levels[i].pSysMem,levels[i].SysMemPitch,0,0);
+                                else g.ctx->UpdateSubresource(texture.Get(),i,nullptr,levels[i].pSysMem,levels[i].SysMemPitch,0);
+                            }
+                        } else {
+                            ComPtr<ID3D11Texture2D> upload;
+                            {na::native11::OwnWorkScope material_scope;if(FAILED(g.device->CreateTexture2D(&td,levels.data(),&upload)))return false;}
+                            if(style==2) g.ctx->CopyResource(texture.Get(),upload.Get());
+                            else for(UINT i=0;i<td.MipLevels;++i) {
+                                if(context1) context1->CopySubresourceRegion1(texture.Get(),i,0,0,0,upload.Get(),i,nullptr,0);
+                                else g.ctx->CopySubresourceRegion(texture.Get(),i,0,0,0,upload.Get(),i,nullptr);
+                            }
+                        }
+                    }
+                    return true;
                 };
                 bool ok=false;
                 if(own){na::native11::OwnWorkScope scope;ok=create();}else ok=create();
@@ -1821,6 +1844,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             }
             for(int i=0;i<2500 && (na::native11::GetMaterialStats().entries_shown<shown_before+entries ||
                                   na::native11::GetTextureStats().replaced<replacements_before+entries*2);++i) {
+                na::native11::SetSceneHanded(false);
+                for(const auto& pair:pairs) { auto* raw=pair.game.Get();g.ctx->PSSetShaderResources(0,1,&raw); }
                 na::native11::TexturesOnPresent();Sleep(2);
             }
             expect(entries>0 && pairs.size()==entries*2 &&
@@ -1852,6 +1877,19 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                        "actual material reaches rendered pixels, off restores them, integer-load shader restores its own map");
             }
             expect(largest_change>.001f,"actual prepared maps change rendered pixels");
+            if(!pairs.empty()) {
+                auto& pair=pairs.back();auto* raw=pair.game.Get();
+                g.ctx->PSSetShader(probe.Get(),nullptr,0);g.ctx->PSSetShaderResources(0,1,&raw);
+                g.ctx->Draw(4,0);
+                ComPtr<ID3D11Resource> source;raw->GetResource(&source);
+                std::vector<uint8_t> new_blocks(1024*1024,0);
+                g.ctx->UpdateSubresource(source.Get(),0,nullptr,new_blocks.data(),(1024/4)*16,0);
+                float changed_source[4]{},direct_changed[4]{};
+                g.ctx->Draw(4,0);ReadCopy(g,changed_source,g.color.Get());
+                {na::native11::OwnWorkScope material_scope;g.ctx->PSSetShaderResources(0,1,&raw);g.ctx->Draw(4,0);ReadCopy(g,direct_changed,g.color.Get());}
+                float error=0;for(int c=0;c<3;++c) error=(std::max)(error,std::abs(changed_source[c]-direct_changed[c]));
+                expect(error<.001f,"rewriting an identified source immediately restores the updated game pixels without a rebind");
+            }
         }
     }
     na::capture::j2::Shutdown();
