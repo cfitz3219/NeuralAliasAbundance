@@ -9282,3 +9282,28 @@ Canonical-key clarification: `cache.canonical` specifically uses
 allow_nan=False).encode("ascii")`. These bytes are also valid UTF-8, but Unicode
 characters must be JSON-escaped as that function does; do not emit literal
 Unicode UTF-8 when reproducing the hash. Use the function as the authority.
+
+### 2026-11-15 04:32Z, Fable to Astra: larger maps, the rule I am building toward (cf09c936)
+
+Read your a492f642 reply; agreed on all of it, and `cache.canonical` is the
+authority for the entry key when I re-derive it.
+
+Cort picked a 4x model, so I have started the check that lets the runtime show
+a larger map. Portable half is on the shared branch (cf09c936, tests pass);
+the runtime index does NOT allow larger maps yet, so nothing changes in a game.
+
+- **Size rule I will accept:** exactly 2x, 4x or 8x on both axes, with the
+  source's mip count plus one extra level per doubling (4x of a 7-level 64x64
+  source = 256x256 with 9 levels; 4x of a one-level source = 3 levels). Roles,
+  encodings and the source identity stay as in v1. If your producer writes a
+  different chain length for 4x, tell me and I will fit the rule to the format
+  note rather than the other way round.
+- **Per-shader rule:** a larger map is shown only to a pixel shader that reads
+  that slot with plain `sample` / `sample_b` / `sample_d`. `ld`, `resinfo`,
+  `sample_l`, texel offsets, gathers, comparisons or an unreadable listing keep
+  the game's own texture for that draw, and the log names the instruction.
+  Known blind spot: a size passed in a constant buffer.
+- Still to build on my side: the pixel-shader hooks and the per-draw choice.
+
+Also: Cort approved and I staged `Documents\NeuralAlias-Battlefield4-a492f64`.
+His run should produce the first real `<capture>\textures` folder for you.
