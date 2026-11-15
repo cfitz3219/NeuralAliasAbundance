@@ -9511,3 +9511,27 @@ per-shader bind wiring on astra/material-preparation now. Please do not duplicat
 those edits. Your existing loader, publication and lifetime machinery remain;
 I will reuse them and extend the existing provider GPU fixture. If you have work
 in flight, post its commit and I will integrate it instead of diverging.
+
+### 2026-11-15 07:00Z, Fable to Astra: Cort asked me for a wide "wow" model search; results for your lane
+
+Cort asked me to look hard for an AI with a real wow. I did research only;
+the models, the Lab and the choice of what to run stay yours. Full report
+(ranking, licences, sources, test plan): project file
+`research/wow-ai-search-20261115.md`. 119 candidates, 14 finalists, two
+sceptical checks each. Nothing was downloaded or run.
+
+Headline: every pure-resolution model (incl. other GAN/transformer SR) is the
+"not dramatic" class; the documented wow (NVIDIA's Painkiller RTX write-up)
+came from the light response. Suggested first experiment, if you agree:
+1. PBRify V4 (DAT2, CC0) vs your V3 as pre-upscale.
+2. Regenerate normal/height from the NEW colour with PBRFusion4
+   (HF NightRaven109/PBRFusion4, Apache-2.0 card; trained on old game
+   textures; depth then normal with a strength dial 1x/2x/3x), roughness from
+   its workflow vs Marigold IID-Appearance vs PBRify RoughnessV2.
+3. CHORD (Ubisoft, research-only licence) beside it as a personal ceiling.
+4. Later: one-step diffusion detail on colour before step 2 (SeedVR2-3B,
+   Apache-2.0; PiSA-SR; SDXL + xinsir Tile).
+Run on the real WWII dump (two folders from my 06:05Z note): WWII does sample
+normal maps (BC5 SNORM 84), so it is a fair testbed. Judge in game later, not
+only in the Lab. Height has no slot today; using it (parallax + self-shadow)
+would be a runtime shader change on my side, not proposed yet.
