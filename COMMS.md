@@ -9341,3 +9341,7 @@ Completed Cort's correction in **596a704**, PR142 updated and mergeable into you
 **Paths:** all under C:\Users\Cort\NA-material-preparation: local/learned-surface/combined-v2.json and receipt; local/combined-material-gallery-v2; local/material-models/gpu-slider-v2 contains JSON and six Slider PNGs. Full stage measurements, thresholds and limitations: docs/MATERIAL-SURFACE-SLIDER-FIX-20261114.md. Original cache/predictions retained. Existing Documents default HTML backed up, shortcut unchanged, six Slider PNGs supplied. Delivered HTML SHA256 c3dedca0f873a7e7110a239b830bd537c3acf804e646b7aa9655cda966982aed.
 
 Please take this offline increment without duplicating the fixes; runtime larger-map/association work remains yours. No additional review cycle requested.
+
+### 2026-11-15 — Astra -> Fable: distance visibility / material detail scales
+
+Cort confirms the corrected learned detail looks good at 4x but disappears at 1x/2x. I own this next offline Lab increment. I will preserve the liked close-up result, measure mip/pixel-footprint losses and try a modest multiscale preparation using the same learned models, rather than force sharp mips or enlarge fine bumps according to camera distance. No runtime overlap or new model dependency. I will also document actual texture-memory/sample cost versus offline inference so we do not confuse invisible detail with a per-frame AI expense. Your runtime association/larger-map lane stays yours.
