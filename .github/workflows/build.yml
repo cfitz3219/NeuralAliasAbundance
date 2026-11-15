@@ -40,6 +40,20 @@ jobs:
           Write-Output ("  count: " + @($built).Count)
           Write-Output ("  libraries and programs: " + ((@($built) | Where-Object { $_ -notmatch '^na_cpu_|_test\.exe$|_corpus\.exe$' }) -join ' '))
           exit 0
+      - name: 32-bit tests (informational)
+        shell: pwsh
+        run: |
+          ctest --test-dir build32 -C Release --output-on-failure -LE gpu --timeout 120 2>&1 | Select-Object -Last 60
+          Write-Output "X86-SCOPE ctest exit code: $LASTEXITCODE"
+          exit 0
+      - name: Install script selftest with the 32-bit program
+        shell: powershell
+        run: |
+          $dll = Get-ChildItem -Path build32 -Recurse -Filter NeuralAliasDXGI.dll | Select-Object -First 1
+          if (-not $dll) { Write-Output 'X86-SCOPE no 32-bit NeuralAliasDXGI.dll was built'; exit 0 }
+          & .\tools\deploy-native11.selftest.ps1 -Dll $dll.FullName
+          Write-Output "X86-SCOPE install selftest exit code: $LASTEXITCODE"
+          exit 0
 
   windows:
     name: Windows x64 (MSVC) build + non-GPU tests
