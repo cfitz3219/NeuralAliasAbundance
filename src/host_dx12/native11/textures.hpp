@@ -13,17 +13,57 @@
 // recorded before that Present keeps what it recorded, for as long as the game replays it; the
 // status line counts deferred swaps separately for that reason.
 //
-// Lifetime: nothing here holds a reference on a game object. A view's destruction is seen through
-// its private data and retires its entry and replacement. A retired replacement is released eight
-// Presents later, so a thread recording a deferred list never binds a freed view.
+// Lifetime: the table of judged views holds no reference on a game object; a view's destruction is
+// seen through its private data and retires its entry and replacement. A retired replacement is
+// released eight Presents later, so a thread recording a deferred list never binds a freed view.
+// The one reference taken on a game view is the bind reference D3D itself would have held: while a
+// replacement sits in a slot in the game's view's place, that context's PsShadow keeps the game's
+// view alive, taken on the game's own bind call. It is what the slot is restored from and what
+// PSGetShaderResources answers with, so neither ever works from a pointer of unknown lifetime.
 #pragma once
+
+#include <d3d11.h>
 
 #include <cstdint>
 
-struct ID3D11DeviceContext;
-struct ID3D11ShaderResourceView;
-
 namespace na::native11 {
+
+// Per context: for each pixel-shader slot where a replacement is bound, the game's own view.
+// Owned by the provider's per-context state; touched only on that context's thread.
+struct PsShadow {
+    ID3D11ShaderResourceView* game[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+    unsigned held = 0;
+    PsShadow() = default;
+    PsShadow(const PsShadow&) = delete;
+    PsShadow& operator=(const PsShadow&) = delete;
+    ~PsShadow() { Clear(); }
+    void Set(unsigned slot, ID3D11ShaderResourceView* view) // null clears the slot
+    {
+        if (game[slot] == view) return;
+        if (view) {
+            view->AddRef();
+            ++held;
+        }
+        if (ID3D11ShaderResourceView* old = game[slot]) {
+            game[slot] = view;
+            --held;
+            old->Release();
+        } else {
+            game[slot] = view;
+        }
+    }
+    void Clear() // the context's state was reset (ClearState, a list finished or executed without restore)
+    {
+        if (!held) return;
+        for (auto*& kept : game)
+            if (kept) {
+                ID3D11ShaderResourceView* old = kept;
+                kept = nullptr;
+                old->Release();
+            }
+        held = 0;
+    }
+};
 
 // Hooks the game's device (ID3D11Device*) CreateShaderResourceView and its contexts'
 // PSGetShaderResources. Idempotent. The bind itself is hooked by the provider, which calls
@@ -31,22 +71,26 @@ namespace na::native11 {
 bool InstallTextures(void* device);
 
 // From the provider's PSSetShaderResources detour, before forwarding. Returns `views`, or `scratch`
-// (at least `count` entries) holding the views to bind instead.
-ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, unsigned start, unsigned count,
+// (at least `count` entries) holding the views to bind instead. `shadow` is that context's.
+ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& shadow, unsigned start, unsigned count,
                                               ID3D11ShaderResourceView* const* views, ID3D11ShaderResourceView** scratch);
+// The provider's per-context shadow for a context of the game's device (null otherwise). Implemented
+// by the provider; used by the PSGetShaderResources hook.
+PsShadow* TextureShadowOf(ID3D11DeviceContext* c);
 
 // Changes whenever what should be bound may have changed; the provider compares it per context at
 // each draw and calls RefreshTextures with that context's original PSSetShaderResources.
 uint64_t TexturePolicyKey();
 using TextureSetFn = void (__stdcall*)(ID3D11DeviceContext*, unsigned, unsigned, ID3D11ShaderResourceView* const*);
-void RefreshTextures(ID3D11DeviceContext* c, TextureSetFn original_set);
+void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn original_set);
 
 // From the provider's Present handler.
 void TexturesOnPresent();
 
 // Publication (the runtime's cache loader, and the fixture). `original` must be a view the game
 // created after InstallTextures; `replacement` is a view on the same device. False when the
-// original is not known. Visible from the next Present.
+// original is not known. Visible from the next Present. Several originals may share one replacement
+// view (several views of one texture); `bytes` is then counted once per original.
 bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView* replacement, uint64_t bytes);
 bool RemoveTexture(ID3D11ShaderResourceView* original);
 void SetTexturesEnabled(bool on); // one switch for every replacement; the census is not affected

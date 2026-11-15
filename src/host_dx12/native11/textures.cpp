@@ -55,7 +55,6 @@ struct Entry {
 struct State {
     std::shared_mutex mu;
     std::unordered_map<ID3D11ShaderResourceView*, std::shared_ptr<Entry>> entries;
-    std::unordered_map<ID3D11ShaderResourceView*, ID3D11ShaderResourceView*> reverse; // replacement -> game view
     std::vector<ID3D11ShaderResourceView*> pending;                                   // game views with pending_set
     std::vector<std::pair<uint64_t, ComPtr<ID3D11ShaderResourceView>>> grave;         // (frame retired, view)
 };
@@ -87,7 +86,6 @@ void Retire(ID3D11ShaderResourceView* key, uint64_t serial)
     Entry& e = *it->second;
     const uint64_t frame = g_frame.load(std::memory_order_relaxed);
     if (e.replacement) {
-        s.reverse.erase(e.replacement.Get());
         g_replaced.fetch_sub(1, std::memory_order_relaxed);
         g_replaced_bytes.fetch_sub(e.bytes, std::memory_order_relaxed);
         s.grave.emplace_back(frame, std::move(e.replacement)); // no D3D release inside a destruction
@@ -205,21 +203,21 @@ HRESULT STDMETHODCALLTYPE CreateShaderResourceView_d(ID3D11Device* dev, ID3D11Re
     return hr;
 }
 
-// What the game asked for, slot by slot, with replacements turned back into the game's own views.
+// What the game asked for, slot by slot: where a replacement is bound in its place, the game's own
+// view from this context's shadow (which holds the reference that makes handing it out safe).
 void GetShaderResources(PFN_GetSrvs original, ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView** out)
 {
     original(c, start, n, out);
-    if (!out || !n || g_replaced.load(std::memory_order_relaxed) == 0 || IsOwnWork()) return;
-    State& s = S();
+    if (!out || !n || start >= kSlots || n > kSlots - start || IsOwnWork()) return;
+    PsShadow* shadow = TextureShadowOf(c);
+    if (!shadow || !shadow->held) return;
     uint64_t returned = 0;
-    std::shared_lock<std::shared_mutex> l(s.mu);
     for (UINT i = 0; i < n; ++i) {
-        if (!out[i]) continue;
-        const auto it = s.reverse.find(out[i]);
-        if (it == s.reverse.end()) continue;
-        it->second->AddRef();
-        out[i]->Release(); // not the last reference: the entry holds one
-        out[i] = it->second;
+        ID3D11ShaderResourceView* game = shadow->game[start + i];
+        if (!game || !out[i] || out[i] == game) continue;
+        game->AddRef();
+        out[i]->Release(); // not the last reference: the slot still binds it
+        out[i] = game;
         ++returned;
     }
     if (returned) g_returned.fetch_add(returned, std::memory_order_relaxed);
@@ -320,13 +318,20 @@ bool InstallTextures(void* device)
     return ok;
 }
 
-ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, unsigned start, unsigned count,
+ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& shadow, unsigned start, unsigned count,
                                               ID3D11ShaderResourceView* const* views, ID3D11ShaderResourceView** scratch)
 {
-    if (!views || !count || count > kSlots || !g_installed.load(std::memory_order_relaxed)) return views;
+    if (!views || !count || start >= kSlots || count > kSlots - start || !g_installed.load(std::memory_order_relaxed))
+        return views;
     const bool census = g_census_frame.load(std::memory_order_relaxed);
     const bool replace = g_enabled.load(std::memory_order_relaxed) && g_replaced.load(std::memory_order_relaxed) != 0;
-    if ((!census && !replace) || !IsGameWork(c)) return views;
+    if (!census && !replace) {
+        // Nothing to bind in place of anything: the game's views go in as they are, so no slot of
+        // this call holds a replacement any more.
+        if (shadow.held)
+            for (unsigned i = 0; i < count; ++i) shadow.Set(start + i, nullptr);
+        return views;
+    }
     uint32_t set_key = 0;
     if (census && count > 1) {
         uint64_t h = 1469598103934665603ull; // FNV-1a over the bound views of this call
@@ -359,6 +364,9 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, unsigned s
             }
         }
     }
+    // The game's own view is kept for exactly the slots that now hold a replacement.
+    if (changed || shadow.held)
+        for (unsigned i = 0; i < count; ++i) shadow.Set(start + i, scratch[i] != views[i] ? views[i] : nullptr);
     if (!changed) return views;
     if (c->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) g_swapped.fetch_add(changed, std::memory_order_relaxed);
     else g_swapped_deferred.fetch_add(changed, std::memory_order_relaxed);
@@ -367,11 +375,14 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, unsigned s
 
 uint64_t TexturePolicyKey() { return g_installed.load(std::memory_order_relaxed) ? g_generation.load(std::memory_order_relaxed) : 0; }
 
-void RefreshTextures(ID3D11DeviceContext* c, TextureSetFn original_set)
+void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn original_set)
 {
-    if (!c || !original_set || !g_installed.load() || !IsGameWork(c)) return;
+    if (!c || !original_set || !g_installed.load()) return;
+    // Nothing is bound in place of anything on this context, and nothing could be: leave it alone.
+    if (!shadow.held && (!g_enabled.load(std::memory_order_relaxed) || g_replaced.load(std::memory_order_relaxed) == 0)) return;
     const int deferred = c->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED ? 1 : 0;
-    ID3D11ShaderResourceView* bound[kSlots]{};
+    ID3D11ShaderResourceView* bound[kSlots]{}; // referenced until the end of this call
+    ID3D11ShaderResourceView* game[kSlots]{};
     ID3D11ShaderResourceView* want[kSlots]{};
     g_get[deferred](c, 0, kSlots, bound); // what is really bound: replacements included
     const bool replace = g_enabled.load(std::memory_order_relaxed);
@@ -380,17 +391,19 @@ void RefreshTextures(ID3D11DeviceContext* c, TextureSetFn original_set)
     {
         std::shared_lock<std::shared_mutex> l(s.mu);
         for (unsigned i = 0; i < kSlots; ++i) {
-            ID3D11ShaderResourceView* game = bound[i];
-            if (!game) continue;
-            const auto back = s.reverse.find(game);
-            if (back != s.reverse.end()) game = back->second;
-            want[i] = game;
-            const auto it = s.entries.find(game);
+            if (!bound[i]) continue; // an empty slot has no game view behind it (the shadow is dropped below)
+            // The game's view for this slot: the shadow's where a replacement is bound, else what is bound.
+            game[i] = shadow.game[i] ? shadow.game[i] : bound[i];
+            want[i] = game[i];
+            const auto it = s.entries.find(game[i]);
             if (replace && it != s.entries.end() && it->second->replacement) want[i] = it->second->replacement.Get();
             if (want[i] != bound[i]) differs = true;
         }
     }
+    // want[] holds only views kept alive here: game views by `bound` or the shadow, replacements by
+    // the table or, if just retired, by the grave for kGraveFrames more Presents.
     if (differs) original_set(c, 0, kSlots, want);
+    for (unsigned i = 0; i < kSlots; ++i) shadow.Set(i, want[i] != game[i] ? game[i] : nullptr);
     for (auto* v : bound)
         if (v) v->Release();
 }
@@ -411,7 +424,6 @@ void TexturesOnPresent()
             Entry& e = *it->second;
             if (!e.pending_set) continue;
             if (e.replacement) {
-                s.reverse.erase(e.replacement.Get());
                 g_replaced.fetch_sub(1, std::memory_order_relaxed);
                 g_replaced_bytes.fetch_sub(e.bytes, std::memory_order_relaxed);
                 s.grave.emplace_back(frame, std::move(e.replacement));
@@ -420,7 +432,6 @@ void TexturesOnPresent()
             e.bytes = e.pending_bytes;
             e.pending_set = false;
             if (e.replacement) {
-                s.reverse[e.replacement.Get()] = key;
                 g_replaced.fetch_add(1, std::memory_order_relaxed);
                 g_replaced_bytes.fetch_add(e.bytes, std::memory_order_relaxed);
             }
@@ -461,6 +472,7 @@ bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView
             s.entries.erase(own);
         }
         Entry& e = *it->second;
+        if (e.replacement.Get() == replacement && !e.pending_set) return true; // already visible as asked
         displaced = std::move(e.pending);
         e.pending = replacement;
         e.pending_bytes = bytes;

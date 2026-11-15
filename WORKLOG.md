@@ -1604,3 +1604,14 @@ What this increment is: the delivery mechanism, proved with a marker texture. It
 Known limits, stated rather than hidden: a deferred command list recorded before a Present keeps what it recorded while the game replays it; a replacement with different dimensions is not checked against `Load`/`GetDimensions`/explicit LOD in the shader yet (the fixture keeps dimensions); VS/CS binds are not swapped; the bind-time lookup's cost per frame is not measured yet.
 
 Tests: CPU policy test passes on Linux. GPU fixture case added (not sampled before Present; sampled after it with no new bind; read back as the game's view; off and on live; withdrawn; memory accounted). Not yet compiled on Windows, not run on a GPU, not run in a game.
+
+### Same day — review of the first increment, three defects repaired before any run
+
+An independent review (three readers, each finding then argued against by another) confirmed three defects by tracing the code; none had run yet. All three came from one design choice, a table mapping a replacement back to the game's view.
+1. A withdrawn or superseded replacement stayed bound: the mapping was erased at Present, before the already-bound slot was repaired from it. The fixture's last check would have failed.
+2. While a replacement was bound in a game view's place, nothing kept the game's view alive (D3D's own bind reference was on the replacement), so restoring it or answering PSGetShaderResources could touch a view another thread was destroying.
+3. One replacement published for two game views corrupted the mapping.
+
+Repair: the mapping is gone. Each context keeps, per pixel-shader slot where a replacement is bound, the game's own view with one reference (`PsShadow`, in the provider's per-context state), taken on the game's own bind call: the reference D3D would have held. Restoration and read-back work from it. Cleared wherever the context's state is reset. Several game views may now share one replacement. A context with nothing replaced and nothing replaceable is no longer re-bound when the policy key changes.
+
+Also from CI: the judged-texture facts type clashed with the scene `TextureFacts` in the same namespace; renamed `MaterialTextureFacts` (e4c6ca7, Windows build and non-GPU tests green).

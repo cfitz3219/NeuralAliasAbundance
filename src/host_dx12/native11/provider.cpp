@@ -138,6 +138,7 @@ struct Ctx {
     bool game = false; // a context of the game's device
     uint64_t sampler_policy = ~uint64_t{0};
     uint64_t texture_policy = ~uint64_t{0};
+    PsShadow ps_shadow;                // the game's views behind bound material replacements (textures.hpp)
     bool deferred = false;
     Id rt0 = 0, depth = 0;
     uint8_t rt_count = 0;              // render targets bound together
@@ -168,6 +169,7 @@ struct Ctx {
     {
         sampler_policy = ~uint64_t{0};
         texture_policy = ~uint64_t{0};
+        ps_shadow.Clear();
         rt0 = depth = 0;
         rt_count = 0;
         depth_test = true;
@@ -1477,7 +1479,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         // Material textures published or withdrawn since this context last bound: re-bind what it holds.
         const uint64_t textures = TexturePolicyKey();
         if (x->texture_policy != textures) {
-            RefreshTextures(c, O(c, x).ps_srv);
+            RefreshTextures(c, x->ps_shadow, O(c, x).ps_srv);
             x->texture_policy = textures;
         }
     };
@@ -1740,8 +1742,9 @@ void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start
     ReadEvents(c, n, v);
     // Material textures: a published replacement is bound in place of the game's view (textures.hpp).
     ID3D11ShaderResourceView* swapped[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
-    const auto* bind = t_inside ? v : SwapTextures(c, start, n, v, swapped);
-    O(c, t_inside ? nullptr : Get(c)).ps_srv(c, start, n, bind);
+    Ctx* x = Get(c); // null inside our own work and on other devices' contexts: bound as given
+    const auto* bind = x ? SwapTextures(c, x->ps_shadow, start, n, v, swapped) : v;
+    O(c, x).ps_srv(c, start, n, bind);
 }
 void STDMETHODCALLTYPE CSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
@@ -2437,6 +2440,11 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present)
 }
 
 bool IsGameWork(void* context) { return Get(static_cast<ID3D11DeviceContext*>(context)) != nullptr; }
+PsShadow* TextureShadowOf(ID3D11DeviceContext* c)
+{
+    Ctx* x = Get(c);
+    return x ? &x->ps_shadow : nullptr;
+}
 bool IsOwnWork() { return t_inside; }
 void Uninstall()
 {
