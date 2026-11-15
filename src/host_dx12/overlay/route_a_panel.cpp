@@ -1523,9 +1523,11 @@ static void DrawMaterialEnhancement()
     const auto t=na::native11::GetTextureStats();
     if(!m.entries) { Hint("No prepared material pack is installed for this route.");return; }
     char line[256];
-    std::snprintf(line,sizeof(line),"%llu material sets prepared; %llu loaded; %llu texture bindings replaced.",
-        static_cast<unsigned long long>(m.entries),static_cast<unsigned long long>(m.entries_shown),
-        static_cast<unsigned long long>(t.swapped));
+    std::snprintf(line,sizeof(line),"%llu material sets prepared; %llu loaded. Only matching materials can change.",
+        static_cast<unsigned long long>(m.entries),static_cast<unsigned long long>(m.entries_shown));
+    Hint(line);
+    std::snprintf(line,sizeof(line),"Shaders referenced replacements in %llu draws. This does not measure visible improvement.",
+        static_cast<unsigned long long>(t.read_draws));
     Hint(line);
     if(!on) Hint("Off. The game uses its original materials.");
     else if(m.maps_failed || m.unreadable_entries || m.refused_maps) Hint("Some prepared maps could not be used. Details are saved in the results log.");

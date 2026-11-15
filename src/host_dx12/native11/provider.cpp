@@ -1523,6 +1523,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     if (picture_draw || layer_draw) exact = ExactForDraw(c, x);
     Emit(x, c, e, {}, exact);
     if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
+    NoteTextureDraw(x->ps_shadow, x->deferred);
 }
 // The scene colour first met through a read, before any bind as a render target: its view as read.
 ViewUse SrvUse(ID3D11ShaderResourceView* v)

@@ -58,7 +58,7 @@ PFN_CreateTex2D g_create_texture = nullptr;
 using PFN_CreatePs = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
 PFN_CreatePs g_create_ps = nullptr;
 const GUID kShaderUseGuid = {0xb5db2c27,0x2ecb,0x4868,{0xa3,0x60,0x3c,0xed,0xa2,0x19,0xc4,0x5e}};
-struct ShaderUseBits { uint64_t safe[2] = {}; };
+struct ShaderUseBits { uint64_t safe[2] = {}, reads[2] = {}; uint32_t known = 0; };
 
 HRESULT STDMETHODCALLTYPE CreatePixelShader_d(ID3D11Device* dev, const void* bytes, SIZE_T size,
                                                ID3D11ClassLinkage* linkage, ID3D11PixelShader** out)
@@ -71,6 +71,9 @@ HRESULT STDMETHODCALLTYPE CreatePixelShader_d(ID3D11Device* dev, const void* byt
         const auto use = na::materials::ReadShaderTextureUse(std::string_view(
             static_cast<const char*>(listing->GetBufferPointer()), listing->GetBufferSize()));
         for (unsigned i=0;i<128;++i) if (use.SafeForLarger(i)) bits.safe[i/64] |= uint64_t{1} << (i%64);
+        bits.known=use.known ? 1u : 0u;
+        if(use.known) for (unsigned i=0;i<128;++i)
+            if(use.sampled_plainly[i] || use.read_otherwise[i]) bits.reads[i/64] |= uint64_t{1} << (i%64);
     }
     (*out)->SetPrivateData(kShaderUseGuid,sizeof(bits),&bits);
     return hr;
@@ -113,6 +116,7 @@ std::atomic<uint64_t> g_serial{1}, g_generation{1}, g_frame{0};
 std::atomic<uint64_t> g_views{0}, g_candidates{0}, g_retired{0}, g_overflow{0};
 std::atomic<uint64_t> g_replaced{0}, g_replaced_bytes{0}, g_pending{0};
 std::atomic<uint64_t> g_swapped{0}, g_swapped_deferred{0}, g_returned{0};
+std::atomic<uint64_t> g_read_draws{0}, g_unread_draws{0}, g_unknown_draws{0}, g_read_draws_deferred{0};
 std::atomic<uint64_t> g_verdicts[static_cast<size_t>(TextureVerdict::kCount)]{};
 uint64_t g_census_next_ms = 0; // Present thread only
 
@@ -864,9 +868,23 @@ void NoteTextureShader(PsShadow& shadow, ID3D11PixelShader* shader)
     UINT bytes=sizeof(bits);
     if (!shader || FAILED(shader->GetPrivateData(kShaderUseGuid,&bytes,&bits)) || bytes!=sizeof(bits)) bits={};
     const auto safe = std::bitset<128>(bits.safe[0]) | (std::bitset<128>(bits.safe[1]) << 64);
+    shadow.shader_reads = std::bitset<128>(bits.reads[0]) | (std::bitset<128>(bits.reads[1]) << 64);
+    shadow.shader_known = bits.known != 0;
     if (safe != shadow.larger_safe) {
         shadow.larger_safe=safe;
         shadow.shader_changed=true;
+    }
+}
+
+void NoteTextureDraw(const PsShadow& shadow, bool deferred)
+{
+    if (!shadow.held) return;
+    if (!shadow.shader_known) {
+        if (!deferred) g_unknown_draws.fetch_add(1, std::memory_order_relaxed);
+    } else if ((shadow.replacement_slots & shadow.shader_reads).any()) {
+        (deferred ? g_read_draws_deferred : g_read_draws).fetch_add(1, std::memory_order_relaxed);
+    } else if (!deferred) {
+        g_unread_draws.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -1073,6 +1091,10 @@ TextureStats GetTextureStats()
     t.swapped = g_swapped.load();
     t.swapped_deferred = g_swapped_deferred.load();
     t.returned_original = g_returned.load();
+    t.read_draws = g_read_draws.load();
+    t.unread_draws = g_unread_draws.load();
+    t.unknown_draws = g_unknown_draws.load();
+    t.read_draws_deferred = g_read_draws_deferred.load();
     t.replaced_bytes = g_replaced_bytes.load();
     t.generation = g_generation.load();
     t.installed = g_installed.load();
@@ -1096,7 +1118,8 @@ int FormatTextureStatus(char* out, unsigned long n)
                          "native11_textures{installed=%d enabled=%d views=%llu candidates=%llu not{rendered_to=%llu rewritten=%llu "
                          "data_format=%llu too_small=%llu no_mips=%llu partial_view=%llu cube=%llu array=%llu multisampled=%llu "
                          "not_2d=%llu} untracked=%llu live=%llu retired=%llu replaced=%llu replaced_bytes=%llu pending=%llu "
-                         "swapped=%llu swapped_deferred=%llu returned_original=%llu generation=%llu dump{active=%d written=%llu skipped=%llu}}",
+                         "swapped=%llu swapped_deferred=%llu returned_original=%llu generation=%llu "
+                         "draw_refs{read=%llu unread=%llu unknown=%llu deferred=%llu} dump{active=%d written=%llu skipped=%llu}}",
                          t.installed ? 1 : 0, t.enabled ? 1 : 0, static_cast<unsigned long long>(t.views),
                          static_cast<unsigned long long>(t.candidates), v(TextureVerdict::RenderedTo), v(TextureVerdict::Rewritten),
                          v(TextureVerdict::DataFormat), v(TextureVerdict::TooSmall), v(TextureVerdict::NoMips),
@@ -1107,6 +1130,8 @@ int FormatTextureStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(t.replaced_bytes), static_cast<unsigned long long>(t.pending),
                          static_cast<unsigned long long>(t.swapped), static_cast<unsigned long long>(t.swapped_deferred),
                          static_cast<unsigned long long>(t.returned_original), static_cast<unsigned long long>(t.generation),
+                         static_cast<unsigned long long>(t.read_draws), static_cast<unsigned long long>(t.unread_draws),
+                         static_cast<unsigned long long>(t.unknown_draws), static_cast<unsigned long long>(t.read_draws_deferred),
                          t.dump_active ? 1 : 0, static_cast<unsigned long long>(t.dump_written),
                          static_cast<unsigned long long>(t.dump_failed));
 }

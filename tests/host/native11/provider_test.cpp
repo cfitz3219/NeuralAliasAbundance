@@ -96,6 +96,9 @@ float4 ps_mips(float4 p : SV_Position) : SV_Target {
 float4 ps_material_probe(float4 p : SV_Position) : SV_Target {
     return .5 + .5 * scene.SampleGrad(material, float2(.371,.613), float2(0,0), float2(0,0));
 }
+float4 ps_material_mip_probe(float4 p : SV_Position) : SV_Target {
+    return .5 + .5 * scene.SampleGrad(material, float2(.371,.613), float2(1.0/256,0), float2(0,1.0/256));
+}
 )";
 
 ComPtr<ID3DBlob> Compile(const char* entry, const char* target)
@@ -1818,10 +1821,16 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             const std::filesystem::path root(cache_dir),sources(source_dir);
             auto probe_code=Compile("ps_material_probe","ps_5_0");
             auto load_code=Compile("ps_tonemap","ps_5_0");
-            ComPtr<ID3D11PixelShader> probe,load_shader;
+            auto unread_code=Compile("ps_scene","ps_5_0");
+            auto material_mip_code=Compile("ps_material_mip_probe","ps_5_0");
+            ComPtr<ID3D11PixelShader> probe,load_shader,unread_shader,material_mip_shader;
             expect(probe_code && load_code && SUCCEEDED(g.device->CreatePixelShader(probe_code->GetBufferPointer(),probe_code->GetBufferSize(),nullptr,&probe)) &&
                    SUCCEEDED(g.device->CreatePixelShader(load_code->GetBufferPointer(),load_code->GetBufferSize(),nullptr,&load_shader)),
                    "create plain-sampling and integer-load shaders under real hooks");
+            expect(unread_code && material_mip_code &&
+                   SUCCEEDED(g.device->CreatePixelShader(unread_code->GetBufferPointer(),unread_code->GetBufferSize(),nullptr,&unread_shader)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(material_mip_code->GetBufferPointer(),material_mip_code->GetBufferSize(),nullptr,&material_mip_shader)),
+                   "create unread-slot and nonzero-footprint material shaders under real hooks");
             const uint64_t shown_before=na::native11::GetMaterialStats().entries_shown;
             const uint64_t replacements_before=na::native11::GetTextureStats().replaced;
             const size_t entries=na::native11::LoadMaterialCache(root.c_str());
@@ -1875,6 +1884,28 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                 std::printf("actual material %s: prepared/direct error %.6f, off/original %.6f, integer-load/original %.6f, changed %.6f\n",pair.name.c_str(),error,restore,refused,change);
                 expect(error<.001f && restore<.001f && refused<.001f && na::native11::GetTextureStats().swapped>swaps_before,
                        "actual material reaches rendered pixels, off restores them, integer-load shader restores its own map");
+                // A bound replacement is not proof the drawing shader uses it.
+                // Keep exactly the same texture binding while changing shader,
+                // then reject a late incompatible shader before its Draw.
+                draw(pair.game.Get(),probe.Get(),replaced);
+                const auto reads_before=na::native11::GetTextureStats();
+                g.ctx->PSSetShader(unread_shader.Get(),nullptr,0);
+                g.ctx->Draw(4,0);
+                const auto unread=na::native11::GetTextureStats();
+                expect(unread.read_draws==reads_before.read_draws && unread.unread_draws==reads_before.unread_draws+1,
+                       "unused texture bindings are not counted as shader-referenced draws");
+                g.ctx->PSSetShader(probe.Get(),nullptr,0);g.ctx->Draw(4,0);
+                const auto sampled=na::native11::GetTextureStats();
+                expect(sampled.read_draws==unread.read_draws+1,"shader change alone records the referenced replacement");
+                g.ctx->PSSetShader(load_shader.Get(),nullptr,0);g.ctx->Draw(4,0);
+                expect(na::native11::GetTextureStats().read_draws==sampled.read_draws,
+                       "shader fallback restored before Draw is not counted as replacement use");
+                float direct_mip[4]{},hooked_mip[4]{};
+                {na::native11::OwnWorkScope material_scope;draw(pair.prepared.Get(),material_mip_shader.Get(),direct_mip);}
+                draw(pair.game.Get(),material_mip_shader.Get(),hooked_mip);
+                float mip_error=0;
+                for(int c=0;c<3;++c)mip_error=(std::max)(mip_error,std::abs(direct_mip[c]-hooked_mip[c]));
+                expect(mip_error<.001f,"nonzero screen footprint samples the prepared mip chain through actual hooks");
             }
             expect(largest_change>.001f,"actual prepared maps change rendered pixels");
             if(!pairs.empty()) {
