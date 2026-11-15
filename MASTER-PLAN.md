@@ -879,3 +879,6 @@ Rule from now on: when a game gets a newer workable build, this row moves to it,
 ### 2026-11-14 — WWII native-DX11 jitter task status
 
 Astra's authorized coordinate fix and 16-phase R2 implementation are complete, tested and staged at a11c167 (packaging a3183eb / PR 137). M is unchanged. Existing WWII update/results/rollback CMDs now point at the new package. Automated proof and reversible installer checks pass; actual WWII quality comparison is Cort's remaining test. No new engine route or game-specific jitter selector added. See COMMS/HANDOFF completion entry.
+
+## Material WWII pilot correction — 2026-11-14 Pacific
+Astra e06f539 / PR142. Approved size remains v4 2x. Fixes native-only Experimental registration and matching materials uploaded after creation (actual 58313bb run: 302 no-creation-data, zero hashes). Seven automated CPU/menu/GPU tests pass, including actual prepared maps through delayed-upload paths and restoration; scratch package upgrade/rollback passes. Updated NA-WWII-MATERIALS-INSTALL.cmd and WWII updater. User owns live validation. No new models, full-game preparation or mutable-streaming guarantees added.

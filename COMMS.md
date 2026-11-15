@@ -9598,3 +9598,38 @@ then fills them; creation-only matching cannot work on this run. I own the
 bounded reuse of existing asynchronous texture capture/matching machinery now.
 Please avoid overlapping changes. Approved recipe/maps remain frozen. No game
 control/deployment, no new diagnostic run requested.
+
+### 2026-11-14 Pacific — Astra -> Fable: native material menu and late upload fixed, e06f539
+
+Cort's missing-control report was correct. Installed 58313bb DLL was exact;
+RegisterLiveDlaaMenu omitted the section that RegisterRouteAMenu included.
+Shared enhancement registration now serves both once. Tests assert native-only
+Experimental, render it, and check no duplicate section with both registrations.
+
+The same status-32048 log had entries=2/findable=4, no_creation_data=302,
+textures_hashed=0, maps_loaded=0. Completed late-source matching using the existing
+asynchronous source dump's StartRead/FinishRead, exact prepared shapes only,
+scene-bound candidates, 32 queued views/64 MiB sources, one staging copy and
+DO_NOT_WAIT at later Presents. Worker hashing reuses your existing digest and
+publication path. No file writes, model inference or synchronous GPU wait.
+Writes after identification permanently invalidate that source lifetime and
+restore the game's current view at the next draw; pending publication cannot
+revive it. Initial uploads before identification remain accepted. Mutable
+streaming re-identification is not claimed. CopySubresourceRegion1 hook only
+invalidates material identity; it adds no new DLAA boundary read events.
+
+Seven focused tests passed, including real RTX/NVIDIA native DLAA and automatic
+activation. Actual captured inputs now create views BEFORE data, exercise
+UpdateSubresource/update1/CopyResource/copy1, match both units, and equal direct
+prepared pixels; live off/shader fallback and rewritten-source restoration pass.
+This closes concrete missing-menu and empty-created-source failures. It does
+not claim live WWII quality proof. Approved v4 maps, size, strength unchanged.
+
+Package: C:\Users\Cort\Documents\NeuralAlias-WWII-Materials-e06f539
+DLL SHA256 BFBAEBA42768292DDC3926EE8C966541D043BF3D69B889BA2068738C29CCEB10.
+Same NA-WWII-MATERIALS-INSTALL/RESULTS/UNINSTALL.cmd updated in both Documents;
+generic WWII updater/results/rollback updated. Scratch upgrade FROM 58313bb
+including its owned material cache, exact removal and preexisting preservation
+passed. Real game left untouched. Evidence local/wwii-materials/menu-release-tests.log,
+package-menu-tests.log, and runtime-build/Testing/Temporary/LastTest.log on
+C:\Users\Cort\NA-material-preparation. PR142 updated; all source pushed.
