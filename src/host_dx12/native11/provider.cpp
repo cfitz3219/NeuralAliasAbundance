@@ -24,6 +24,7 @@
 //   * native sampler policy is handled by samplers.cpp, sharing the own-work exclusion.
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/textures.hpp"
 
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
@@ -136,6 +137,7 @@ constexpr size_t kMaxLists = 512;          // recorded command lists kept
 struct Ctx {
     bool game = false; // a context of the game's device
     uint64_t sampler_policy = ~uint64_t{0};
+    uint64_t texture_policy = ~uint64_t{0};
     bool deferred = false;
     Id rt0 = 0, depth = 0;
     uint8_t rt_count = 0;              // render targets bound together
@@ -165,6 +167,7 @@ struct Ctx {
     void reset_state()
     {
         sampler_policy = ~uint64_t{0};
+        texture_policy = ~uint64_t{0};
         rt0 = depth = 0;
         rt_count = 0;
         depth_test = true;
@@ -1471,6 +1474,12 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
             RefreshSamplers(c);
             x->sampler_policy = policy;
         }
+        // Material textures published or withdrawn since this context last bound: re-bind what it holds.
+        const uint64_t textures = TexturePolicyKey();
+        if (x->texture_policy != textures) {
+            RefreshTextures(c, O(c, x).ps_srv);
+            x->texture_policy = textures;
+        }
     };
     refresh_samplers();
     Event e;
@@ -1729,7 +1738,10 @@ void STDMETHODCALLTYPE PSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT sta
 void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
     ReadEvents(c, n, v);
-    O(c, t_inside ? nullptr : Get(c)).ps_srv(c, start, n, v);
+    // Material textures: a published replacement is bound in place of the game's view (textures.hpp).
+    ID3D11ShaderResourceView* swapped[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+    const auto* bind = t_inside ? v : SwapTextures(c, start, n, v, swapped);
+    O(c, t_inside ? nullptr : Get(c)).ps_srv(c, start, n, bind);
 }
 void STDMETHODCALLTYPE CSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
@@ -2172,6 +2184,7 @@ bool OnPresent(IDXGISwapChain* swap)
     }
     g_frame_fired = g_frame_found = g_frame_no_bytes = false;
     SetSceneHanded(false);
+    TexturesOnPresent();
     g_collect_camera.store(!g_camera.found || g_rel_learner.armed() || g_collect_all, std::memory_order_relaxed);
     // Retire upload shadows not in the next scene's acquisition set. Draw-time
     // snapshots keep their own ownership until this frame is closed.

@@ -33,6 +33,7 @@
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/textures.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <DirectXPackedVector.h>
 #include <d3d11on12.h>
@@ -1416,6 +1417,58 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
            "the next frame's scene draws get 16x AF and the -1 mip bias back");
+    // Material textures: a published replacement is sampled in place of the game's view from the
+    // next Present on, with no new bind by the game, and the game still reads back its own view.
+    // The game's texture samples green at this LOD; the marker is white on every texel.
+    na::observe::SetSamplerMipBias(0.f); na::observe::SetSamplerAnisotropy(0);
+    D3D11_TEXTURE2D_DESC marker_desc = td;
+    marker_desc.MipLevels = 1;
+    std::vector<uint32_t> white(size_t(64) * 64, 0xffffffffu);
+    D3D11_SUBRESOURCE_DATA marker_data{white.data(), 64 * 4, 0};
+    ComPtr<ID3D11Texture2D> marker;
+    ComPtr<ID3D11ShaderResourceView> marker_view;
+    expect(SUCCEEDED(g.device->CreateTexture2D(&marker_desc, &marker_data, &marker)) &&
+           SUCCEEDED(g.device->CreateShaderResourceView(marker.Get(), nullptr, &marker_view)),
+           "create the marker texture");
+    g.ctx->PSSetShaderResources(0, 1, &texture_view);
+    float tex_own[4]{}, tex_early[4]{}, tex_swapped[4]{}, tex_off[4]{}, tex_on[4]{}, tex_removed[4]{};
+    g.ctx->Draw(4, 0); ReadCopy(g, tex_own, g.color.Get());
+    const auto textures_before = na::native11::GetTextureStats();
+    expect(textures_before.installed && textures_before.candidates > 0,
+           "the game's mipmapped colour texture is judged a candidate");
+    expect(na::native11::PublishTexture(mip_view.Get(), marker_view.Get(), uint64_t(64) * 64 * 4),
+           "publish a replacement for a view the game created");
+    g.ctx->Draw(4, 0); ReadCopy(g, tex_early, g.color.Get());
+    na::native11::TexturesOnPresent();
+    g.ctx->Draw(4, 0); ReadCopy(g, tex_swapped, g.color.Get());
+    ComPtr<ID3D11ShaderResourceView> seen;
+    g.ctx->PSGetShaderResources(0, 1, &seen);
+    na::native11::SetTexturesEnabled(false);
+    g.ctx->Draw(4, 0); ReadCopy(g, tex_off, g.color.Get());
+    na::native11::SetTexturesEnabled(true);
+    g.ctx->Draw(4, 0); ReadCopy(g, tex_on, g.color.Get());
+    const auto textures_on = na::native11::GetTextureStats();
+    expect(na::native11::RemoveTexture(mip_view.Get()), "withdraw the replacement");
+    na::native11::TexturesOnPresent();
+    g.ctx->Draw(4, 0); ReadCopy(g, tex_removed, g.color.Get());
+    const auto textures_after = na::native11::GetTextureStats();
+    std::printf("native texture pixels (r/g/b): own %.2f/%.2f/%.2f, before present %.2f/%.2f/%.2f, replaced %.2f/%.2f/%.2f, "
+                "off %.2f/%.2f/%.2f, on %.2f/%.2f/%.2f, withdrawn %.2f/%.2f/%.2f\n",
+                tex_own[0], tex_own[1], tex_own[2], tex_early[0], tex_early[1], tex_early[2], tex_swapped[0], tex_swapped[1],
+                tex_swapped[2], tex_off[0], tex_off[1], tex_off[2], tex_on[0], tex_on[1], tex_on[2], tex_removed[0],
+                tex_removed[1], tex_removed[2]);
+    expect(tex_own[1] > .9f && tex_own[0] < .1f && tex_early[1] > .9f && tex_early[0] < .1f,
+           "a published replacement is not sampled before the next Present");
+    expect(tex_swapped[0] > .9f && tex_swapped[1] > .9f && tex_swapped[2] > .9f,
+           "after the Present the draw samples the replacement without a new bind by the game");
+    expect(seen.Get() == mip_view.Get() && textures_on.returned_original > textures_before.returned_original,
+           "the game reads back its own view while the replacement is bound");
+    expect(tex_off[1] > .9f && tex_off[0] < .1f && tex_on[0] > .9f && tex_on[2] > .9f,
+           "the switch restores the game's texture and brings the replacement back, live");
+    expect(textures_on.replaced == 1 && textures_on.replaced_bytes == uint64_t(64) * 64 * 4,
+           "the status counts the visible replacement and its memory");
+    expect(tex_removed[1] > .9f && tex_removed[0] < .1f && textures_after.replaced == 0 && textures_after.replaced_bytes == 0,
+           "a withdrawn replacement leaves the game's texture and no accounted memory");
     na::capture::j2::Shutdown();
     na::capture::Shutdown();
     DeleteFileW(ini.c_str());

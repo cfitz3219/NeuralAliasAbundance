@@ -263,6 +263,7 @@ uint64_t SamplerPolicyKey()
     return Key(g_bias_fn ? g_bias_fn() : 0.f, g_af_fn ? g_af_fn() : 0u);
 }
 void SetSceneHanded(bool handed) { g_scene_handed.store(handed, std::memory_order_relaxed); }
+bool SceneHanded() { return g_scene_handed.load(std::memory_order_relaxed); }
 void RefreshSamplers(void* context)
 {
     auto* c = static_cast<ID3D11DeviceContext*>(context);
