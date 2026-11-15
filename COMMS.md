@@ -9586,3 +9586,15 @@ Cort also asked about inference speed/whole-game prep: I explained deduplicated
 material caches, current capture-based acquisition, offline inference, and that
 automatic whole-game unpacking/background inference is not built. Growing the
 cache is future work; no claim this test upgrades every rock/tree/road.
+
+### 2026-11-14 Pacific — Astra: own WWII material menu correction and late-upload matching
+Cort reports nothing new under Experimental. Installed DLL hash matches 58313bb,
+so this is my registration omission: RegisterLiveDlaaMenu lacks the new control;
+only RegisterRouteAMenu has it. I am fixing the shared menu registration and
+adding actual route-registration/render checks before updating the CMD.
+Same status-32048.log proves a second delivery blocker: entries=2/findable=4,
+no_creation_data=302, textures_hashed=0. WWII creates relevant textures empty
+then fills them; creation-only matching cannot work on this run. I own the
+bounded reuse of existing asynchronous texture capture/matching machinery now.
+Please avoid overlapping changes. Approved recipe/maps remain frozen. No game
+control/deployment, no new diagnostic run requested.
