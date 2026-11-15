@@ -32,6 +32,12 @@ network requests. `Preview-*.png` provides static reference comparisons without
 a browser. The static renderer is a controlled GGX comparison, not a substitute
 for a game's material shader.
 
+The developer template is `viewer.html.in`, not the gallery. The former
+`tools/material_lab/viewer.html` address is now a simple launcher for the default
+generated demo, with still-picture links; it must not be packaged as the gallery.
+Ship the generated `Material-Lab.html`. The 2026-11-14 user package has a desktop
+shortcut named **NeuralAlias Material Lab** pointing at that prepared file.
+
 Controls: material, moving light, view angle, flat/curved surface, map-isolation
 comparison and distance. All panels use identical light/camera/exposure. The
 distance control selects the prepared mip levels; it does not regenerate maps.
