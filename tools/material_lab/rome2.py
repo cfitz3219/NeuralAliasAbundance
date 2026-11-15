@@ -18,11 +18,28 @@ from PIL import Image
 
 from . import cache, dds, viewer
 from .detail import Material, down2, linear, mip_chain, srgb, unit
-from .learned_surface import combine, SETTINGS
+from .learned_surface import combine, lowpass, preserve_authored_direction, resize_wrap, slopes, SETTINGS
 from .runtime_prepare import predict_pair
 
 
 LEGACY = {b'DXT1': (71, 8, 'BC1_UNORM'), b'DXT5': (77, 16, 'BC3_UNORM')}
+TERRAIN_RELIEF = dict(near_sigma=5., far_sigma=32., gain=14., max_slope=.55)
+
+
+def add_terrain_relief(material, authored_normal, prediction):
+    """Keep bigger learned shapes in terrain space so mips retain the relief."""
+    if authored_normal.shape != prediction.shape:
+        raise ValueError('Terrain prediction must match the authored texture size')
+    opts = TERRAIN_RELIEF
+    predicted = slopes(prediction)
+    broad = lowpass(predicted, opts['near_sigma']) - lowpass(predicted, opts['far_sigma'])
+    authored = lowpass(slopes(authored_normal), opts['near_sigma'])
+    broad = preserve_authored_direction(broad, authored) * opts['gain']
+    magnitude = np.linalg.norm(broad, axis=-1, keepdims=True)
+    broad *= np.minimum(1., opts['max_slope']/np.maximum(magnitude, 1e-12))
+    h, w = material.normal.shape[:2]
+    xy = slopes(material.normal) + resize_wrap(broad, h, w)
+    return Material(material.color, unit(np.dstack((xy, np.ones((h,w))))), material.roughness)
 
 
 def read_dds(path):
@@ -137,6 +154,11 @@ def prepare(row, input_root, output, texconv, colour_model, normal_model):
     # Preserve the existing v4 detail scale in UV space, then ship the next mip
     # as the top level. This caps the asset at 2x dimensions rather than 4x.
     chain = mip_chain(enhanced)[1:]
+    broad_relief = bool(row.get('broad_relief'))
+    if broad_relief:
+        # Bake at the shipping resolution, then filter the widened relief into
+        # every mip. Chain[0] retains the old result as the close-detail base.
+        chain = mip_chain(add_terrain_relief(chain[0], normal, medium))
     targets = [output/'overrides'/p for p in paths]
     encode([colour_bytes(m) for m in chain], c, targets[0], texconv)
     encode([normal_bytes(m) for m in chain], n, targets[1], texconv)
@@ -149,9 +171,11 @@ def prepare(row, input_root, output, texconv, colour_model, normal_model):
     del after['maps']['base_color']
     retained = dict(material=row['name'], paths=list(map(str, paths)),
                     source_sha256=list(map(cache.digest, (c,n))), output_sha256=[cache.digest(p.read_bytes()) for p in targets],
-                    source_bytes=before['bytes'], output_bytes=after['bytes'], inference=inference)
+                    source_bytes=before['bytes'], output_bytes=after['bytes'], inference=inference,
+                    terrain_relief=TERRAIN_RELIEF if broad_relief else None)
     display = dict(name=row['name'], family=row['family'], game_asset=True, combined=True,
-                   original=before, comparisons={'baseline':baseline}, coordinated=after)
+                   original=before, comparisons={'baseline':baseline}, coordinated=after,
+                   broad_relief=broad_relief)
     return display, retained
 
 

@@ -70,7 +70,7 @@ async function main(){
   assert.equal(textures.size,count);
   if(data[0].combined){
     assert.equal(count,1);
-    assert.equal(get('right-title').textContent,'Combined result');
+    assert.equal(get('right-title').textContent,data[0].broad_relief?'Stronger terrain relief':'Combined result');
     assert.equal(get('ai-control').hidden,true);
     const state=context.inspect();
     assert.equal(state.states.coordinated.bound.base_color.images[0],state.states.baseline.bound.base_color.images[0]);

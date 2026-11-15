@@ -65,6 +65,11 @@ async function show(index){
         $('right-caption').textContent='Same PBRify colour with extra surface relief over the original normal map.';
         $('footnote').textContent='These textures come from the installed Rome II archives. The Lab uses its own lighting and a shared gloss setting. Rome II keeps its original gloss, specular, masks and decals.';
         $('comparison-note').textContent='Start at 1× and move Distance to see what survives at smaller sizes. The right panel previews the baked gain at 100%. Move Surface detail to 0% to compare colour alone.';
+        if(row.broad_relief){
+            $('right-title').textContent='Stronger terrain relief';
+            $('right-caption').textContent='Larger shapes catch the light from farther away. Colour matches the middle panel.';
+            $('comparison-note').textContent='Try Distance 3 or 4 at 1×. Pause the light and select the earlier grass sample for a direct comparison.';
+        }
     }
     choice.replaceChildren();
     for(const [key,item] of Object.entries(comparisons)){

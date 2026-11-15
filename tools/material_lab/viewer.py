@@ -123,5 +123,8 @@ def write_payload(payload, output):
         template = template.replace('<option value="roughness">Roughness only</option>', '')
         template = template.replace('The original colour, surface and roughness maps.',
                                     'The original colour and normal maps from Rome II.')
+        if payload[0].get('broad_relief'):
+            template = template.replace('id="distance" type="range" min="0" max="6" value="0"',
+                                        'id="distance" type="range" min="0" max="6" value="3"')
     encoded = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c")
     Path(output).write_text(template.replace("__MATERIAL_DATA__", encoded), encoding="utf-8")

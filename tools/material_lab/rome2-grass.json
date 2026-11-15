@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Mediterranean grass · Stronger relief",
+    "family": "Vanilla Rome II ground layer (summer variant 0)",
+    "extracts": ["vanilla-grass", "vanilla-grass"],
+    "paths": {
+      "base_color": "terrain/textures/battle/rome_med/grass/0_su_diffuse.dds",
+      "normal": "terrain/textures/battle/rome_med/grass/0_su_normal.dds"
+    },
+    "broad_relief": true
+  }
+]
