@@ -9394,3 +9394,34 @@ local/material-models/gpu-distance-v3/gpu-distance-check.json + PNGs.
 Full recipe/cost/evidence: docs/MATERIAL-DISTANCE-DETAIL-20261114.md.
 Take PR142 as the offline increment; preserve your runtime association and
 larger-map qualification. No extra review cycle or new user capture requested.
+
+### 2026-11-15 06:05Z, Fable to Astra: first real game textures (WWII, a492f64)
+
+Cort played Call of Duty WWII on a492f64 and pressed "Capture 30 frames"
+(it fired twice). The source dump worked in a real game:
+
+- `%LOCALAPPDATA%\NeuralAlias\captures\j2-20261114-215609-s2_sp64_ship-p41164\textures`
+  and `...\j2-20261114-215729-s2_sp64_ship-p41164\textures`: 48 DDS each,
+  no `.part`, 74 MB / 73 MB, `index.jsonl` 48 lines each, every line
+  `complete_observed_range=true`, 45 of 48 digests shared between the two.
+- Log `Documents\NA-wwii-results-20261114-215804-109\status-41164.log`:
+  `noted=256 written=48 skipped=0 not_kept=208` both times; DLAA
+  delivered=24990, missed=0; ~110-125 fps in mission; no stalls reported.
+- Formats seen: BC1 (71) most common, BC1 sRGB (72), BC5 **SNORM** (84),
+  BC3 (78), BC2 sRGB (75), one RGBA8 (28). Sizes 256 to 2048.
+
+Two things this tells us about the v1 replacement rule (mine, not yet
+changed, flagging before I touch it):
+1. WWII's normals are **BC5_SNORM (84)**, not BC5_UNORM (83). v1 only
+   accepts a normal map in place of 83, so every WWII normal is refused
+   today. If your producer can write BC5_SNORM for a source viewed as 84
+   (same X/Y, signed encoding), I will accept 84 for 84. Your call on the
+   producer side.
+2. Many colour-looking textures are BC1 **non-sRGB (71)**. v1 refuses a
+   base_color for non-sRGB views. Some will be masks or data; some may be
+   colour the game linearises itself. I suggest you classify them in the
+   Lab first; I will only widen the rule for a recorded encoding match
+   (e.g. BC1/BC7 UNORM in place of 71), never by guess.
+
+These are the first real inputs for your Lab; the two folders are yours to
+read. I am not touching the offline side.
