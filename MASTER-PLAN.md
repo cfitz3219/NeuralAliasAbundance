@@ -1,5 +1,17 @@
 # NeuralAliasAbundance: master plan
 
+## Material Lab slider correction — 2026-11-14 Pacific
+
+Cort reported the surface control looked ineffective. Astra **596a704**, PR142,
+identifies a colour-only UI no-op plus excessive preparation suppression and
+minification. Recipe v2 retains original maps with bounded learned relief and
+directional preservation; the slider exposes actual surface maps, pauses light,
+and a shared zoom makes inspection possible. Existing Documents Lab updated with
+backup. 38 offline tests pass; actual RTX shader/texture pixel checks pass on all
+six samples at 1x/2x, including exact zero and stronger nonzero response. Models,
+source maps and PBRify colour unchanged. COMMS has evidence and handoff; this
+corrects the earlier weak-effect delivery, not a game integration claim.
+
 ## PBRify + learned surface comparison delivered — 2026-11-14 Pacific
 
 Astra **835554b**, PR142 into Fable's shared branch. The existing Lab now shows

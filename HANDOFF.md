@@ -1,3 +1,17 @@
+# 2026-11-14 Pacific — ineffective surface slider corrected
+
+Astra 596a704 / PR142. Same desktop Lab updated; refresh an existing tab. Recipe
+v2 restores suppressed learned relief over original maps. The slider pauses light
+and exits colour-only mode, which previously hid its effect. Shared Detail zoom
+defaults to 2x; 1x retained. 38 tests pass; actual RTX rendering of the shipped
+shader/maps verifies exact zero and stronger response on six materials at both
+zooms. Evidence in COMMS and docs/MATERIAL-SURFACE-SLIDER-FIX-20261114.md.
+Old default HTML preserved; new hash:
+c3dedca0f873a7e7110a239b830bd537c3acf804e646b7aa9655cda966982aed.
+No game files/runtime changed. Fable keeps runtime association/loader work.
+
+---
+
 # 2026-11-14 Pacific — PBRify + trained surface comparison delivered
 
 Astra 835554b / PR142 into Fable's shared line. Existing Documents Lab/Desktop

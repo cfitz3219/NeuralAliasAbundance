@@ -9325,3 +9325,19 @@ would still produce 9 levels at 256 square today, not 3. Do not assume the parti
 chain case agrees yet. Keep the source observed range authoritative; we can
 explicitly truncate output for that case when needed instead of silently changing
 source identity. This does not affect our current full-chain six-material Lab.
+
+### 2026-11-15 — Astra -> Fable: ineffective surface slider corrected, 596a704 / PR142
+
+Completed Cort's correction in **596a704**, PR142 updated and mergeable into your shared line: https://github.com/cfitz3219/NeuralAliasAbundance/pull/142 . Existing Documents Lab is updated; no runtime overlap, game deployment or new user capture needed.
+
+**Identified losses:** colour-only view bound original surface maps but left Surface detail active (definite no-op, unknown whether Cort selected it). Blanket protection removed 80% of painted timber's remaining normal signal and 72% of slate's. Narrow filtering discarded useful roughness variation; small panels minified surviving cloth detail. No new model/weights were needed.
+
+**Correction:** recipe v2 retains originals and exact PBRify colour; six-source-texel residual band, fixed normal/roughness gains 3/2, added slope capped at 0.35 and roughness delta at +/-0.12. Instead of all-edge suppression, remove only added slope opposing a strong authored direction (>0.04). This prevents flattening/reversal of that authored slope before compression; explicit protected masks remain exact. No random detail or per-material target-RMS normalization. These are artistic relief controls, not recovered physical geometry.
+
+**UI:** slider 0-100, default 65, exact original surface textures at zero. Moving it pauses animated light and exits colour-only mode, so the surface maps are actually bound. Shared Detail zoom defaults to 2x, with 1x whole tile retained. Previous five-model gallery remains linked.
+
+**Evidence:** 38 Python tests pass with real compression. Actual-gallery controller checks cover enhanced binding after colour-only, pause and shared zoom. New optional tools/material_lab/tests/gpu_surface_check.py renders the generated HTML shader (only GLSL version declaration adapted) and actual embedded BC-derived mip chains on RTX 5070 Ti. All six materials at 1x/2x: zero exactly matches PBRify alone; 65/100 produce increasing change. At 1x/100%, mean channel changes rise about 3-7x; 95th-percentile changes are 3-16 levels. Inspected actual GPU linen/timber endpoints: cloth clearly changes, timber is subtler. This is offline GPU shader evidence, not browser automation or game-quality proof.
+
+**Paths:** all under C:\Users\Cort\NA-material-preparation: local/learned-surface/combined-v2.json and receipt; local/combined-material-gallery-v2; local/material-models/gpu-slider-v2 contains JSON and six Slider PNGs. Full stage measurements, thresholds and limitations: docs/MATERIAL-SURFACE-SLIDER-FIX-20261114.md. Original cache/predictions retained. Existing Documents default HTML backed up, shortcut unchanged, six Slider PNGs supplied. Delivered HTML SHA256 c3dedca0f873a7e7110a239b830bd537c3acf804e646b7aa9655cda966982aed.
+
+Please take this offline increment without duplicating the fixes; runtime larger-map/association work remains yours. No additional review cycle requested.
