@@ -13,6 +13,32 @@ permissions:
   pull-requests: write # failing-test output is posted on the branch's PR (annotations cap at 10 lines)
 
 jobs:
+  windows-x86-scope:
+    # Bring-up of 32-bit game support: lists what in the host does not build for Win32 yet.
+    # Informational until the 32-bit in-game half builds; it never fails the run.
+    name: Windows x86 (MSVC) scope listing, informational
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Win32
+        run: cmake -S . -B build32 -A Win32 -DNA_ALLOW_X86=ON
+      - name: Build Release, keep going, summarise errors
+        shell: pwsh
+        run: |
+          cmake --build build32 --config Release --parallel -- /p:StopOnFirstFailure=false 2>&1 | Out-File -FilePath build32-log.txt -Encoding utf8
+          $errs = Select-String -Path build32-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|LINK : fatal|error MSB'
+          Write-Output "X86-SCOPE total error lines: $($errs.Count)"
+          Write-Output "X86-SCOPE errors by project:"
+          $errs | ForEach-Object { if ($_.Line -match '\[([^\]]*\\)?([^\\\]]+)\.vcxproj\]') { $Matches[2] } else { '(none)' } } | Group-Object | Sort-Object Count -Descending | ForEach-Object { Write-Output ("  {0,5}  {1}" -f $_.Count, $_.Name) }
+          Write-Output "X86-SCOPE errors by code:"
+          $errs | ForEach-Object { if ($_.Line -match 'error ([A-Z]+[0-9]+)') { $Matches[1] } } | Group-Object | Sort-Object Count -Descending | ForEach-Object { Write-Output ("  {0,5}  {1}" -f $_.Count, $_.Name) }
+          Write-Output "X86-SCOPE first 300 distinct error lines:"
+          $errs | ForEach-Object { ($_.Line -replace '^\s+','') -replace '\(\d+,\d+\)','' } | Sort-Object -Unique | Select-Object -First 300 | ForEach-Object { Write-Output "  $_" }
+          Write-Output "X86-SCOPE targets built:"
+          Select-String -Path build32-log.txt -Pattern '\.vcxproj -> ' | ForEach-Object { Write-Output ("  " + ($_.Line.Trim() -replace '^.*-> ','')) }
+          exit 0
+
   windows:
     name: Windows x64 (MSVC) build + non-GPU tests
     runs-on: windows-latest

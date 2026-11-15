@@ -39,7 +39,10 @@ if(NOT WIN32)
   return()
 endif()
 
-if(NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+# 32-bit games (a 32-bit copy of the in-game half beside a 64-bit DLAA companion) are being
+# brought up: NA_ALLOW_X86 lets a Win32 configure through so CI can list what does not build yet.
+option(NA_ALLOW_X86 "Allow a 32-bit (Win32) configure of the host while 32-bit support is brought up" OFF)
+if(NOT MSVC OR (NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT NA_ALLOW_X86))
   message(FATAL_ERROR "The DX12 host requires MSVC and x64.")
 endif()
 enable_language(C)
