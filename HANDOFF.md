@@ -1104,3 +1104,6 @@ Cort tested e06f539: only matching ground area activated, no visible benefit. PI
 
 ### 2026-11-15 — Rome II materials ready for the combined package
 Astra 102bfda / PR142 prepared four original Rome II DDS overrides for early legionary shield and Greek high pavement, retaining DXT1 colour and alpha/green DXT5 normals at 2x dimensions. Lab is updated and browser/GPU verified. RPFM Mod pack and SHA receipt are staged in C:\Users\Cort\NA-material-preparation\local\rome2-materials\prepared. See COMMS for the exact combined installer input and Workshop overlaps. Fable's 32-bit DLAA port is the joint-package dependency. No game files installed or game launched.
+
+### 2026-11-15 — Rome II landscape component supersedes shield/pavement for combined test
+Astra 2a22864 / PR142 staged the approved stronger grass family and Grand Campaign/Imperator Augustus ocean colour together as one verified 16,196,011-byte PFH4 Mod pack. Exact component manifest and hash in COMMS b3fe906. Four native-size grass pairs, two campaign sea maps with original alpha blocks and mips. Lab comparisons published and browser verified. Rome II assets not installed. Fable owns the one combined installer and companion. His current hooks-only install cannot meet the requested DLAA test. No additional game launch requested. Source/evidence in docs/MATERIAL-ROME2-LANDSCAPE-20261115.md.
