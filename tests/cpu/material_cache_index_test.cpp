@@ -63,7 +63,9 @@ int main()
             Map larger = MakeMap(Role::BaseColor, kA, 70, 72, 128);
             larger.source.width = larger.source.height = 64;
             larger.source.mip_count = 7;
-            CHECK(std::string(Qualified(larger)) == "prepared at a different size or mip count than the game's texture");
+            CHECK(std::string(Qualified(larger)) == "prepared larger than the game's texture, which this runtime cannot check per shader");
+            larger.width = 96; // not a whole doubling
+            CHECK(std::string(Qualified(larger, true)) == "prepared at a size that is not the game's texture or a whole 2x, 4x or 8x of it");
             Map file = MakeMap(Role::BaseColor, kA, 70, 72);
             file.source.identity_domain = "file-bytes";
             CHECK(std::string(Qualified(file)) == "prepared from a file, not from a game texture");
@@ -90,6 +92,32 @@ int main()
             // The same bytes viewed two ways are two sources.
             CHECK(index.Add(MakeRecord(kC, {MakeMap(Role::BaseColor, kA, 70, 72, 32), MakeMap(Role::BaseColor, kA, 97, 99, 32)})));
             CHECK(index.Find(kA, {97, 32, 32, 6}, 99, hit) && hit.record == 2 && hit.map == 1);
+        }},
+        {"a 2x, 4x or 8x map with the extra levels is findable only in an index that allows larger maps, and marked", [] {
+            auto Larger = [](uint32_t side, uint32_t source_side) {
+                Map m = MakeMap(Role::BaseColor, kA, 70, 72, side);
+                m.source.width = m.source.height = source_side;
+                m.source.mip_count = 0;
+                for (uint32_t s = source_side; s; s /= 2) ++m.source.mip_count;
+                return m;
+            };
+            CHECK(LargerLog2(Larger(64, 64)) == 0 && LargerLog2(Larger(256, 64)) == 2 && LargerLog2(Larger(512, 64)) == 3);
+            CHECK(LargerLog2(Larger(1024, 64)) == -1 && LargerLog2(Larger(32, 64)) == -1);
+            Map short_chain = Larger(256, 64);
+            short_chain.mips.resize(7); // 4x the size with only the game's level count
+            CHECK(LargerLog2(short_chain) == -1);
+            Map one_level = Larger(256, 64); // a game texture with one level: the map has it plus two
+            one_level.source.mip_count = 1;
+            one_level.mips.resize(3);
+            CHECK(LargerLog2(one_level) == 2);
+            CHECK(std::string(Qualified(Larger(256, 64))) == "prepared larger than the game's texture, which this runtime cannot check per shader");
+            CHECK(Qualified(Larger(256, 64), true) == nullptr);
+            CacheIndex plain, allowing(true);
+            CHECK(plain.Add(MakeRecord(kA, {Larger(256, 64)})) && plain.findable() == 0 && plain.refusals().size() == 1);
+            CHECK(allowing.Add(MakeRecord(kA, {Larger(256, 64)})) && allowing.findable() == 1);
+            CacheIndex::Hit hit;
+            CHECK(allowing.WantedViews({70, 64, 64, 7}) == std::vector<uint32_t>{72}); // keyed by the game's shape
+            CHECK(allowing.Find(kA, {70, 64, 64, 7}, 72, hit) && hit.larger_log2 == 2);
         }},
     });
 }

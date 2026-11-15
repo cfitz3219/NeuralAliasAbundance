@@ -8,8 +8,12 @@
 //
 // Qualified(): which maps the v1 runtime may put in a game texture's place at all. A replacement is
 // sampled by the game's own shader through the game's own sampler, so it has to mean the same
-// thing channel for channel and have the same extent and mip count. Anything else is refused with
-// the reason, not adapted.
+// thing channel for channel. Anything else is refused with the reason, not adapted.
+//
+// Size: the same extent and mip count always qualifies. A larger map (2x, 4x or 8x on both axes,
+// with that many extra levels on top of the game's chain) qualifies only for an index built with
+// `allow_larger`, and is marked in the Hit: the runtime may show it only to a pixel shader that
+// reads the texture by plain filtered sampling (materials/shader_texture_use.hpp).
 #pragma once
 
 #include "materials/manifest_reader.hpp"
@@ -29,18 +33,31 @@ struct TextureShape {
     }
 };
 
+// How many times the map doubles its source on both axes, with one extra level per doubling:
+// 0 = the same size, 1..3 = larger, -1 = neither.
+inline int LargerLog2(const Map& map)
+{
+    const Source& s = map.source;
+    for (uint32_t k = 0; k <= 3; ++k)
+        if (s.width && s.height && map.width == uint64_t(s.width) << k && map.height == uint64_t(s.height) << k &&
+            map.mips.size() == size_t(s.mip_count) + k)
+            return static_cast<int>(k);
+    return -1;
+}
+
 // Null when `map` may replace a game texture described by its own source; otherwise why not.
-inline const char* Qualified(const Map& map)
+inline const char* Qualified(const Map& map, bool allow_larger = false)
 {
     const Source& s = map.source;
     if (s.identity_domain != "texture-subresources-v1") return "prepared from a file, not from a game texture";
     if (!s.complete_observed_range) return "the source's levels were not all observed";
     if (s.first_mip != 0 || s.first_array_slice != 0 || s.array_size != 1) return "the source is a partial view or an array";
     if (!s.resource_format || !s.view_format) return "the source's formats are not recorded";
-    // Same extent and mip count: a shader may address texels or read the size, and the first
-    // generator preserves dimensions. Larger maps wait for a per-shader check.
-    if (map.width != s.width || map.height != s.height || map.mips.size() != s.mip_count)
-        return "prepared at a different size or mip count than the game's texture";
+    // A shader may address texels or read the size, so a larger map is not the same thing to
+    // every shader: see the header note.
+    const int larger = LargerLog2(map);
+    if (larger < 0) return "prepared at a size that is not the game's texture or a whole 2x, 4x or 8x of it";
+    if (larger > 0 && !allow_larger) return "prepared larger than the game's texture, which this runtime cannot check per shader";
     switch (map.role) {
     case Role::BaseColor: // BC7 sRGB in place of an sRGB colour view: same decode, all four channels
         switch (s.view_format) {
@@ -57,8 +74,11 @@ inline const char* Qualified(const Map& map)
 
 class CacheIndex {
 public:
+    explicit CacheIndex(bool allow_larger = false) : allow_larger_(allow_larger) {}
+
     struct Hit {
         size_t record = 0, map = 0;
+        int larger_log2 = 0; // above 0: show only to shaders that sample it plainly
     };
     struct Refusal {
         std::string entry_key, map_id, why;
@@ -73,7 +93,7 @@ public:
         const size_t ri = records_.size();
         for (size_t mi = 0; mi < record.maps.size(); ++mi) {
             const Map& m = record.maps[mi];
-            if (const char* why = Qualified(m)) {
+            if (const char* why = Qualified(m, allow_larger_)) {
                 refusals_.push_back({record.entry_key, m.id, why});
                 continue;
             }
@@ -84,7 +104,7 @@ public:
                 refusals_.push_back({record.entry_key, m.id, "another entry already covers this game texture"});
                 continue;
             }
-            keys_.push_back({s.content_sha256, {s.resource_format, s.width, s.height, s.mip_count}, s.view_format, {ri, mi}});
+            keys_.push_back({s.content_sha256, {s.resource_format, s.width, s.height, s.mip_count}, s.view_format, {ri, mi, LargerLog2(m)}});
         }
         records_.push_back(std::move(record));
         return true;
@@ -135,6 +155,7 @@ private:
             if (k.view_format == view_format && k.shape == shape && k.digest == digest) return &k;
         return nullptr;
     }
+    bool allow_larger_ = false;
     std::vector<Record> records_;
     std::vector<Key> keys_;
     std::vector<Refusal> refusals_;
