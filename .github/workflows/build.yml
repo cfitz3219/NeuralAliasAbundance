@@ -27,7 +27,7 @@ jobs:
         shell: pwsh
         run: |
           cmake --build build32 --config Release --parallel -- /p:StopOnFirstFailure=false 2>&1 | Out-File -FilePath build32-log.txt -Encoding utf8
-          $errs = Select-String -Path build32-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|LINK : fatal|error MSB'
+          $errs = Select-String -Path build32-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|LINK : fatal|error MSB|: warning C[0-9]+'
           Write-Output "X86-SCOPE total error lines: $($errs.Count)"
           Write-Output "X86-SCOPE errors by project:"
           $errs | ForEach-Object { if ($_.Line -match '\[([^\]]*\\)?([^\\\]]+)\.vcxproj\]') { $Matches[2] } else { '(none)' } } | Group-Object | Sort-Object Count -Descending | ForEach-Object { Write-Output ("  {0,5}  {1}" -f $_.Count, $_.Name) }

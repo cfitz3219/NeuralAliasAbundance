@@ -45,9 +45,9 @@ inline Image mapped_image(const uint8_t* bytes, size_t size, uint64_t address) {
         if((s.Characteristics&IMAGE_SCN_MEM_READ) && !(s.Characteristics&IMAGE_SCN_MEM_DISCARDABLE))image.ranges.push_back({s.VirtualAddress,s.Misc.VirtualSize,(s.Characteristics&IMAGE_SCN_MEM_EXECUTE)!=0});
     }
     const auto d=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-    if(!d.Size || d.Size%sizeof(RUNTIME_FUNCTION) || !image.contains(d.VirtualAddress,d.Size,false))return {};
-    for(uint32_t off=0;off<d.Size;off+=sizeof(RUNTIME_FUNCTION)) {
-        const auto f=image.read<RUNTIME_FUNCTION>(d.VirtualAddress+off);
+    if(!d.Size || d.Size%sizeof(_IMAGE_RUNTIME_FUNCTION_ENTRY) || !image.contains(d.VirtualAddress,d.Size,false))return {};
+    for(uint32_t off=0;off<d.Size;off+=sizeof(_IMAGE_RUNTIME_FUNCTION_ENTRY)) {
+        const auto f=image.read<_IMAGE_RUNTIME_FUNCTION_ENTRY>(d.VirtualAddress+off);
         if(f.EndAddress<=f.BeginAddress || !image.contains(f.BeginAddress,f.EndAddress-f.BeginAddress,true))return {};
         image.functions.push_back({f.BeginAddress,f.EndAddress-f.BeginAddress});
     }

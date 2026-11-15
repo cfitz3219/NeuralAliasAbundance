@@ -97,7 +97,13 @@ add_library(minhook STATIC
   third_party/minhook/src/buffer.c
   third_party/minhook/src/hook.c
   third_party/minhook/src/trampoline.c
-  third_party/minhook/src/hde/hde64.c)
+  third_party/minhook/src/hde/hde64.c
+  third_party/minhook/src/hde/hde32.c) # each file is empty on the other architecture
+# The x64 code readers (scale/native_locator.hpp, adapters/tsushima/locator.hpp) parse x64
+# instruction bytes with hde64 whatever the host is built for.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  target_sources(minhook PRIVATE src/host_dx12/hooking/hde64_any_host.c)
+endif()
 target_include_directories(minhook PUBLIC third_party/minhook/include)
 target_compile_definitions(minhook PRIVATE WIN32_LEAN_AND_MEAN)
 
