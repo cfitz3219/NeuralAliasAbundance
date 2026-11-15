@@ -126,4 +126,3 @@ footprint; a 1024-pixel colour map does not force 256-pixel normals to mip 2.
 For raw runtime-source preparation, see [the shared capture contract](../../docs/MATERIAL-SOURCE-CAPTURE-V1.md).
 The same `prepare` command accepts explicit `runtime_maps` in `source.json`,
 reusing Fable's source digest and retaining the original view/mip identity.
-
