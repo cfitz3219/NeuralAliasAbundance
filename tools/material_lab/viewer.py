@@ -43,6 +43,8 @@ def candidate(folder):
     record = cache.validate(folder)
     return dict(key=record["entry_key"], algorithm=record["algorithm"],
                 bytes=record["payload_bytes"], fixture=record["fixture"],
+                model=record["settings"].get("model", ""),
+                dimensions={m["role"]: [m["width"], m["height"]] for m in record["maps"]},
                 maps={m["role"]: embedded_map(folder, m) for m in record["maps"]})
 
 
@@ -50,12 +52,14 @@ def write(cases, output):
     # An optional Fable cache manifest can fill the middle panel using identical source inputs.
     payload = []
     for case in cases:
-        if case.get("baseline"):
-            check_baseline(cache.validate(case["original"]), cache.validate(case["baseline"]))
+        for name in ("baseline", "conventional"):
+            if case.get(name):
+                check_baseline(cache.validate(case["original"]), cache.validate(case[name]))
         row = {k: case[k] for k in ("name", "family", "split")}
         row["original"] = candidate(case["original"])
         row["coordinated"] = candidate(case["coordinated"])
         row["baseline"] = candidate(case["baseline"]) if case.get("baseline") else None
+        row["conventional"] = candidate(case["conventional"]) if case.get("conventional") else None
         payload.append(row)
     template = Path(__file__).with_name("viewer.html.in").read_text(encoding="utf-8")
     encoded = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c")

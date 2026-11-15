@@ -15,10 +15,13 @@ def maps(folder, level=0):
     result = {}
     for m in record["maps"]:
         images = list(viewer.decoded_mips(folder, m))
-        pixels = np.asarray(images[min(level, len(images)-1)], dtype=np.float64)/255
-        if m["role"] == "base_color":
-            pixels[..., :3] = linear(pixels[..., :3])
-        result[m["role"]] = pixels
+        decoded = []
+        for image in images if level is None else [images[min(level, len(images)-1)]]:
+            pixels = np.asarray(image, dtype=np.float64)/255
+            if m["role"] == "base_color":
+                pixels[..., :3] = linear(pixels[..., :3])
+            decoded.append(pixels)
+        result[m["role"]] = decoded if level is None else decoded[0]
     return result
 
 
@@ -31,6 +34,31 @@ def sample(a, uv):
     dx, dy = fraction[..., 0:1], fraction[..., 1:2]
     return ((a[y % h, x % w]*(1-dx) + a[y % h, (x+1) % w]*dx)*(1-dy) +
             (a[(y+1) % h, x % w]*(1-dx) + a[(y+1) % h, (x+1) % w]*dx)*dy)
+
+
+def sample_mips(levels, uv):
+    """Trilinear reference sampling at the actual UV footprint for EACH map.
+
+    A 4x colour upscale selects two mips deeper at the same footprint; original
+    normal/roughness maps keep their own LOD. No forced shared integer mip.
+    """
+    if isinstance(levels, np.ndarray):
+        return sample(levels, uv)
+    h, w = levels[0].shape[:2]
+    dy, dx = np.gradient(uv, axis=(0, 1))
+    extent = np.array([w, h])
+    rho = np.maximum(np.linalg.norm(dx*extent, axis=-1), np.linalg.norm(dy*extent, axis=-1))
+    lod = np.clip(np.log2(np.maximum(rho, 1e-12)), 0, len(levels)-1)
+    low = np.floor(lod).astype(int)
+    high = np.minimum(low+1, len(levels)-1)
+    fraction = lod-low
+    result = np.zeros((*uv.shape[:-1], levels[0].shape[-1]))
+    for index, pixels in enumerate(levels):
+        weight = (low == index)*(1-fraction) + (high == index)*fraction
+        mask = weight > 0
+        if mask.any():
+            result[mask] += sample(pixels, uv[mask])*weight[mask, None]
+    return result
 
 
 def render(material, size=384, light_phase=1.35, yaw_degrees=-18):
@@ -48,11 +76,11 @@ def render(material, size=384, light_phase=1.35, yaw_degrees=-18):
     inside = np.max(np.abs(q), -1) <= 1
     st = q*.5+.5
     st[..., 1] = 1-st[..., 1]
-    albedo = sample(material["base_color"], st)[..., :3]
-    xy = sample(material["normal"], st)[..., :2]*2-1
+    albedo = sample_mips(material["base_color"], st)[..., :3]
+    xy = sample_mips(material["normal"], st)[..., :2]*2-1
     z = np.sqrt(np.maximum(.001, 1-np.sum(xy*xy, -1)))
     normal = unit(tangent*xy[..., 0:1] - bitangent*xy[..., 1:2] + n0*z[..., None])
-    rough = np.maximum(.06, sample(material["roughness"], st)[..., 0])
+    rough = np.maximum(.06, sample_mips(material["roughness"], st)[..., 0])
     view = unit(np.array([0, 0, 3])-point)
     light = unit(np.array([1.7*np.cos(light_phase), 1., 1.25+.65*np.sin(light_phase)]))
     half = unit(view+light)
@@ -86,8 +114,8 @@ def font(size):
 def previews(cases, output, size=384):
     output = Path(output)
     for case in cases:
-        original, coordinated = maps(case["original"]), maps(case["coordinated"])
-        baseline = {**original, **maps(case["baseline"])} if case.get("baseline") else {
+        original, coordinated = maps(case["original"], None), maps(case["coordinated"], None)
+        baseline = {**original, **maps(case["baseline"], None)} if case.get("baseline") else {
             **original, "base_color": coordinated["base_color"]}
         normal_only = {**original, "normal": coordinated["normal"]}
         width, padding = size*3+64, 16
@@ -98,7 +126,7 @@ def previews(cases, output, size=384):
         draw.text((24, 86), "Identical light, camera and exposure. Rendered from the compressed cache.",
                   font=font(16), fill="#a8b9c1")
         entries = [("Original", original),
-                   ("Independent baseline" if case.get("baseline") else "Colour-only control", baseline),
+                   ("AI colour upscale" if case.get("baseline") else "Colour-only control", baseline),
                    ("Coordinated material", coordinated),
                    ("Original | grazing light", original),
                    ("New normals only | grazing light", normal_only),

@@ -9,6 +9,22 @@ from tools.material_lab.detail import enhance, mip_chain, Material, down2, linea
 
 
 class MaterialMath(unittest.TestCase):
+    def test_sampling_uses_same_footprint_for_different_map_resolutions(self):
+        # A checker collapses to its actual prepared mean, even for a 4x map.
+        uv = np.stack(np.meshgrid((np.arange(8)+.5)/8, (np.arange(8)+.5)/8), -1)
+        for size in (32, 128):
+            a = (np.indices((size, size)).sum(0) % 2)[..., None].astype(float)
+            chain = [a]
+            while chain[-1].shape[0] > 1:
+                chain.append(down2(chain[-1]))
+            np.testing.assert_allclose(render.sample_mips(chain, uv), .5)
+
+    def test_fractional_mip_blend_and_magnification(self):
+        uv = np.stack(np.meshgrid(np.arange(8)*2**.5/8, np.arange(8)*2**.5/8), -1)
+        chain = [np.zeros((8,8,4)), np.ones((4,4,4)), np.ones((2,2,4)), np.ones((1,1,4))]
+        np.testing.assert_allclose(render.sample_mips(chain, uv), .5, atol=1e-12)
+        np.testing.assert_allclose(render.sample_mips(chain, uv/4), 0)
+
     def setUp(self):
         self.source = corpus.make("wood", 12, 64)
 
@@ -124,6 +140,7 @@ class CompressedCache(unittest.TestCase):
         data = json.loads(encoded.group(1))
         self.assertEqual(data[0]["name"], "oak_boards")
         for candidate in ("original", "coordinated"):
+            self.assertEqual(data[0][candidate]["dimensions"]["base_color"], [32, 32])
             self.assertEqual(set(data[0][candidate]["maps"]), {"base_color", "normal", "roughness"})
             for images in data[0][candidate]["maps"].values():
                 self.assertEqual(len(images), 6)
