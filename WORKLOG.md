@@ -1623,3 +1623,7 @@ Also from CI: the judged-texture facts type clashed with the scene `TextureFacts
 3. A replacement was protected between lookup and the real bind only by the eight-Present delay. Now every replacement chosen for a bind is referenced from the lookup until the bind has taken D3D's own reference (`SwapTextures` .. `EndTextureSwap`, and inside `RefreshTextures`), released outside the table's lock. The delay remains as tidy-up only.
 
 Also added: a deferred recording made while a replacement is visible samples it when executed and reads back the game's view. Not covered yet: the game's view kept alive for the lifetime of a recorded command list (a list replays the replacement, which D3D keeps alive itself; the game's view is only needed for read-back and restoration on a context, which the shadow covers).
+
+## 2026-11-15 Source identity `texture-subresources-v1` (Fable)
+- `src/materials/texture_subresources_v1.hpp`: portable serializer and SHA-256 for the identity agreed in COMMS 9b962d6f / fc0b110f. Python reference `tools/material_baseline/texsub.py`; shared vectors in `tests/cpu/texture_subresources_v1_test.cpp` (two mips, sRGB reading, BC1, view from mip 1, array slices, row-pitch padding, invalid orders and formats).
+- Not yet wired into the runtime: source capture and the manifest/DDS loader come next.
