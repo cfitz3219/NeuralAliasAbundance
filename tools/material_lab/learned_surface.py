@@ -5,7 +5,13 @@ not RGB averaging. The broad prediction is discarded; original normals and
 roughness remain the base. Periodic filtering matches declared wrap materials.
 """
 import numpy as np
-from .detail import Material, check, gradient, unit
+from .detail import Material, check, unit
+
+
+VERSION = '2'
+SETTINGS = dict(sigma_source_texels=6., normal_detail_gain=3., roughness_detail_gain=2.,
+                max_added_slope=.35, max_roughness_delta=.12, protected_slope_threshold=.04,
+                method='band-limited learned residual; preserve authored slope direction')
 
 
 def resize_wrap(a, height, width):
@@ -40,6 +46,20 @@ def original_at_size(original, colour):
     return Material(colour.copy(),n,r)
 
 
+def preserve_authored_direction(detail, base_slopes):
+    """Keep the authored groove instead of blanking all model detail near it.
+
+    Remove only the opposing component at a non-flat authored normal. Coherent
+    and perpendicular detail survives. This is a geometric constraint, not a
+    material classifier; explicit semantic protection still uses the mask.
+    """
+    squared = np.sum(base_slopes*base_slopes, axis=-1, keepdims=True)
+    opposing = np.minimum(0., np.sum(detail*base_slopes, axis=-1, keepdims=True))
+    correction = np.where(squared > SETTINGS['protected_slope_threshold']**2,
+                          opposing/np.maximum(squared,1e-12), 0.)
+    return detail-correction*base_slopes
+
+
 def combine(original, colour, predicted_normal, predicted_roughness, strength=1., mask=None):
     base = original_at_size(original,colour)
     h,w = base.roughness.shape
@@ -57,25 +77,22 @@ def combine(original, colour, predicted_normal, predicted_roughness, strength=1.
         raise ValueError('invalid protected-region mask')
     if strength == 0:
         return base
-    # Retain authored seams, material boundaries and sharp painted markings.
-    nx,ny = gradient(original.normal)
-    rx,ry = gradient(original.roughness)
-    cx,cy = gradient(original.color[...,:3])
-    edges = (np.sum(nx*nx+ny*ny,-1)/.05**2 + (rx*rx+ry*ry)/.08**2
-             + np.sum(cx*cx+cy*cy,-1)/.08**2)
-    protection = resize_wrap(1/(1+edges*edges),h,w)*mask
     scale = max(h/original.roughness.shape[0],w/original.roughness.shape[1])
-    sigma = 1.5*scale
+    sigma = SETTINGS['sigma_source_texels']*scale
     pred_slope = slopes(unit(predicted_normal))
-    detail = pred_slope-lowpass(pred_slope,sigma)
-    # Limits bound the addition; weak predictions are never amplified to a target RMS.
+    detail = (pred_slope-lowpass(pred_slope,sigma))*SETTINGS['normal_detail_gain']
+    base_slopes = slopes(base.normal)
+    detail = preserve_authored_direction(detail,base_slopes)
+    # A fixed, documented relief range; no per-material RMS normalization, noise
+    # injection or automatic gain escalation for weak/flat model predictions.
     length = np.linalg.norm(detail,axis=-1,keepdims=True)
-    detail *= np.minimum(1.,.22/np.maximum(length,1e-12))
-    detail *= (protection*strength)[...,None]
-    xy = slopes(base.normal)+detail
+    detail *= np.minimum(1.,SETTINGS['max_added_slope']/np.maximum(length,1e-12))
+    detail *= (mask*strength)[...,None]
+    xy = base_slopes+detail
     result_normal = unit(np.concatenate([xy,np.ones((h,w,1))],-1))
-    rough_detail = predicted_roughness-lowpass(predicted_roughness,sigma)
-    rough_detail = np.clip(rough_detail,-.12,.12)*protection*strength
+    rough_detail = (predicted_roughness-lowpass(predicted_roughness,sigma))*SETTINGS['roughness_detail_gain']
+    limit = SETTINGS['max_roughness_delta']
+    rough_detail = np.clip(rough_detail,-limit,limit)*mask*strength
     result_rough = np.clip(base.roughness+rough_detail,0,1)
     protected = mask == 0
     result_normal[protected] = base.normal[protected]

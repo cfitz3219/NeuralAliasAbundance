@@ -10,7 +10,7 @@ import time
 import numpy as np
 from . import cache, dds, render, viewer
 from .detail import Material, mip_chain, unit
-from .learned_surface import combine
+from .learned_surface import combine, SETTINGS, VERSION
 from .model_runner import ModelUpscale
 
 
@@ -26,11 +26,10 @@ def prepare(source, colour_entry, estimates, cache_root, texconv, normal_model, 
                     (('normal',normal_model),('roughness',rough_model))}
     settings = dict(colour_entry=colour_record['entry_key'], authored_entry=original_record['entry_key'], models=model_hashes,
                     strength=1., normal_convention='DirectX: +Y along texture V',
-                    sigma_source_texels=1.5, max_added_slope=.22, max_roughness_delta=.12,
-                    method='fine-scale partial-derivative residual over authored maps',
+                    **SETTINGS,
                     prediction_key=estimates.stem, prediction_sha256=cache.digest(estimates.read_bytes()))
     recipe = dict(schema_version=1,material_id=metadata['material_id'],algorithm='na-pbrify-authored-surface',
-                  algorithm_version='1',settings=settings,seed=metadata['seed'],fixture=metadata['fixture'],
+                  algorithm_version=VERSION,settings=settings,seed=metadata['seed'],fixture=metadata['fixture'],
                   sources=original_record['recipe']['sources'],
                   encoder_sha256=cache.digest(Path(texconv).read_bytes()),numpy_version=np.__version__)
     key = cache.digest(cache.canonical(recipe)); target = cache_root/key

@@ -61,7 +61,7 @@ def sample_mips(levels, uv):
     return result
 
 
-def render(material, size=384, light_phase=1.35, yaw_degrees=-18):
+def render(material, size=384, light_phase=1.35, yaw_degrees=-18, texture_zoom=1.):
     grid = (np.arange(size)+.5)/size
     u, v = np.meshgrid(grid, 1-grid)
     p = np.stack([(u-.5)*2.35, (v-.5)*2.35, np.full_like(u, -3)], -1)
@@ -76,6 +76,7 @@ def render(material, size=384, light_phase=1.35, yaw_degrees=-18):
     inside = np.max(np.abs(q), -1) <= 1
     st = q*.5+.5
     st[..., 1] = 1-st[..., 1]
+    st = (st-.5)/texture_zoom+.5
     albedo = sample_mips(material["base_color"], st)[..., :3]
     xy = sample_mips(material["normal"], st)[..., :2]*2-1
     strength = material.get('surface_strength',1.)
@@ -152,7 +153,8 @@ def previews(cases, output, size=384):
             col, row = i % 3, i // 3
             x, y = padding+col*(size+16), 122+row*(size+56)
             draw.text((x, y), label, font=font(16), fill="#edf3f4")
-            sheet.paste(render(material, size, 1.35 if row == 0 else .15), (x, y+28))
+            sheet.paste(render(material, size, 1.35 if row == 0 else .15,
+                               texture_zoom=2. if case.get('combined') else 1.), (x, y+28))
         draw.text((24, size*2+244), "Learned detail over original maps / synthetic samples" if case.get('combined') else "Procedural candidate / synthetic source / no in-game result claimed",
                   font=font(14), fill="#a8b9c1")
         sheet.save(output/f"Preview-{case['name']}.png")

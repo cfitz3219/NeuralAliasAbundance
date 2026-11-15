@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 from tools.material_lab import corpus, render
 from tools.material_lab.detail import unit
-from tools.material_lab.learned_surface import combine, original_at_size, resize_wrap, slopes
+from tools.material_lab.learned_surface import combine, original_at_size, resize_wrap, slopes, SETTINGS
 
 
 class AuthoredSurface(unittest.TestCase):
@@ -35,11 +35,21 @@ class AuthoredSurface(unittest.TestCase):
         out=combine(self.original,self.colour,self.prediction,self.rough,mask=mask)
         np.testing.assert_array_equal(out.normal[:,30:60],base.normal[:,30:60])
         np.testing.assert_array_equal(out.roughness[:,30:60],base.roughness[:,30:60])
-        self.assertLessEqual(float(np.linalg.norm(slopes(out.normal)-slopes(base.normal),axis=-1).max()),.2200001)
+        self.assertLessEqual(float(np.linalg.norm(slopes(out.normal)-slopes(base.normal),axis=-1).max()),SETTINGS['max_added_slope']+1e-7)
         self.assertLessEqual(float(abs(out.roughness-base.roughness).max()),.1200001)
         self.assertGreater(float(abs(out.normal-base.normal).mean()),.001)
         np.testing.assert_array_equal(out.color,self.colour)
         np.testing.assert_allclose(np.linalg.norm(out.normal,axis=-1),1,atol=1e-12)
+
+    def test_learned_relief_cannot_flatten_an_authored_groove(self):
+        base=original_at_size(self.original,self.colour)
+        bs=slopes(base.normal)
+        out=combine(self.original,self.colour,self.prediction,self.rough)
+        added=slopes(out.normal)-bs
+        strong=np.sum(bs*bs,-1)>SETTINGS['protected_slope_threshold']**2
+        self.assertGreater(int(strong.sum()),100)
+        self.assertGreaterEqual(float(np.sum(added*bs,-1)[strong].min()),-1e-12)
+        self.assertGreater(float(np.linalg.norm(added,axis=-1)[strong].mean()),.01)
 
     def test_periodic_shift_does_not_change_detail_response(self):
         original=self.original.copy()

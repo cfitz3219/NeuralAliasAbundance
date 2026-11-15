@@ -38,6 +38,7 @@ get('data').textContent=JSON.stringify(data);
 get('compare').value='all';get('angle').value='-18';get('distance').value='2.3';
 get('animate').checked=false;
 get('surface-strength').value='65';
+get('texture-zoom').value='2';
 const document = {getElementById:get,createElement:element,body:element('body'),
   querySelectorAll:()=>get('materials').children};
 class Image {set src(value){this._src=value;queueMicrotask(()=>this.onload());}get src(){return this._src;}}
@@ -74,13 +75,25 @@ async function main(){
     const state=context.inspect();
     assert.equal(state.states.coordinated.bound.base_color.images[0],state.states.baseline.bound.base_color.images[0]);
     assert.equal(state.states.coordinated.bound.authored_normal.images[0],state.states.baseline.bound.normal.images[0]);
+    get('animate').checked=true;
     get('surface-strength').value='0';get('surface-strength').oninput();
+    assert.equal(get('animate').checked,false);
     context.drawFrame(0);
     assert.equal(state.states.coordinated.gl.uniforms.surfaceStrength,0);
     assert.equal(state.states.baseline.gl.uniforms.surfaceStrength,1);
     assert.equal(get('surface-value').textContent,'0%');
     get('surface-strength').value='100';context.drawFrame(0);
     assert.equal(state.states.coordinated.gl.uniforms.surfaceStrength,1);
+    assert.equal(state.states.coordinated.gl.uniforms.textureZoom,2);
+    assert.equal(state.states.baseline.gl.uniforms.textureZoom,2);
+    assert.equal(state.states.original.gl.uniforms.textureZoom,2);
+    // A surface control must not silently operate while its maps are hidden.
+    get('compare').value='color';await get('compare').onchange();
+    assert.equal(state.states.coordinated.bound.normal.images[0],data[0].original.maps.normal[0]);
+    get('surface-strength').value='75';await get('surface-strength').oninput();
+    assert.equal(get('compare').value,'all');
+    assert.equal(state.states.coordinated.bound.normal.images[0],data[0].coordinated.maps.normal[0]);
+    assert.equal(state.states.coordinated.bound.roughness.images[0],data[0].coordinated.maps.roughness[0]);
   }
   const selected=get('baseline-choice').value;
   await context.select(1);

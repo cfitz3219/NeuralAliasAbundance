@@ -1,5 +1,38 @@
 # Material Lab
 
+## Surface slider correction (2026-11-14 Pacific, v2)
+
+The combined candidate now uses the `learned_surface.VERSION == '2'` recipe.
+Original maps remain the base. Instead of suppressing model detail at all edges,
+it removes only the added component that would flatten a non-flat authored
+normal. Broad prediction offsets still do not replace authored material values.
+A wider residual band and documented fixed relief range retain visible detail.
+0% remains exactly PBRify alone. Prepared prediction arrays are reused; the model
+weights, PBRify colour and original textures are unchanged.
+
+The **Surface detail** slider automatically pauses the moving light and returns
+from Colour detail only to Complete material. The previous UI allowed a surface
+control to change while its surface maps were deliberately hidden. **Detail zoom**
+starts at 2x and magnifies the same region in all panels; 1x shows the whole tile.
+It uses ordinary derivative-based mip selection, not sharpened or forced mips.
+
+New output index: `local/learned-surface/combined-v2.json`; generated gallery:
+`local/combined-material-gallery-v2`. Use these paths with the commands below.
+Details, measured signal losses and before/after GPU evidence are in
+`docs/MATERIAL-SURFACE-SLIDER-FIX-20261114.md`.
+
+The optional actual-GPU check requires `moderngl==5.12.0` in the preparation
+environment; this dependency is never linked into the game runtime:
+
+```powershell
+python tools/material_lab/tests/gpu_surface_check.py local/combined-material-gallery-v2/Material-Lab.html --output local/material-models/gpu-slider-v2
+node tools/material_lab/tests/model_selector_test.cjs local/combined-material-gallery-v2/Material-Lab.html
+```
+
+The GPU test renders the shipped shader with the prepared compressed textures
+on a standalone OpenGL context. The only shader adaptation is the GLSL version
+declaration. This tests shader pixels, not the user's browser UI or a game.
+
 ## Current comparison: PBRify colour + learned surface detail
 
 The default prepared Lab now compares **Original**, **PBRify alone**, and

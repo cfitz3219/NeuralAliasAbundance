@@ -222,3 +222,35 @@ superiority from tests. No interactive browser GPU render or real-game result.
 The published surface maps are 1024 square; Fable's same-size-only runtime loader
 must not accept them blindly. Its extent/format/role work remains separate.
 No game runtime, game files, game testing or installation changed.
+
+## 2026-11-14 Pacific — Surface slider visible-result correction
+
+Cort reports Surface detail does nothing; explicitly requested tracing the loss,
+preserving original material and updating the Lab. Claimed the offline lane in
+central COMMS 940b8e1, also answered Fable's partial-mip question. Retained actual
+PBRify predictions, model weights, colour output and original source files.
+Measured filtering, clipping, protection and actual GPU output independently.
+Found definite colour-only UI no-effect case; blanket edge suppression removes
+80% of painted timber's remaining normal detail and 72% of slate's; narrow band
+removes much roughness variation. Fine cloth detail minifies in a whole-tile view.
+
+Recipe v2 keeps original maps and adds wider-band learned relief at a documented
+fixed strength, with opposing-to-authored slope removed instead of all-edge
+suppression. Still bounded, no random detail, no per-material automatic gain.
+0% samples originals exactly; same colour DDS in both enhanced arms. Added shared
+detail zoom, automatic light pause and return from colour-only when adjusting
+surface strength. No other model, runtime path or game installation changes.
+
+Used actual shipped GLSL and embedded maps on RTX 5070 Ti via optional standalone
+ModernGL, not browser automation. All six cases at 1x/2x: 0% exactly matches the
+colour-only image; 65/100% yield increasing signal. Whole-tile mean pixel changes
+rise about 3–7x. Inspected actual GPU linen/timber endpoints; fabric visibly
+changes, wood remains subtler. 38 Python tests with real compression pass; actual
+gallery and legacy controller checks pass. Temporary UTF-8 helper failure caught
+before delivery, restored original UTF-8 source and regenerated successfully.
+Detailed evidence and thresholds: docs/MATERIAL-SURFACE-SLIDER-FIX-20261114.md.
+
+Updated existing Documents Lab with previous default backed up, six actual-GPU
+Slider PNGs, six updated static previews and current evidence/Read Me. New HTML
+hash c3dedca0f873a7e7110a239b830bd537c3acf804e646b7aa9655cda966982aed. No claim
+of browser UI automation, game-material quality, or in-game replacement testing.
