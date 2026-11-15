@@ -311,6 +311,6 @@ prediction paths, shader source and output sizes/bytes. No game tests/deployment
 Updated existing Lab with prior v3 backed up as
 Material-Lab-before-fine-size-2x.html and explicit 2x-trial caption. Fine-size PNGs
 show previous/current at identical light and strength. HTML hash
-84f85850b2362158fb668a441c01d637ef5332b4421ce4b56aaf86a667461a49.
+8af46a7475118afaaa37063d224461013bbeb28d050f2f00b574663869684d7e.
 Fable's separate WWII capture handoff noted; signed BC5 and non-sRGB colour
 qualification are not silently widened as part of this visual size trial.

@@ -36,7 +36,7 @@ Existing Documents Lab updated in place, with v3 saved as
 2x size trial. Default view remains 1x and strength65%. Fine-size-*.png compares
 PBRify alone / previous size / 2x fine size, with unchanged medium detail.
 Delivered HTML SHA256:
-`84f85850b2362158fb668a441c01d637ef5332b4421ce4b56aaf86a667461a49`.
+`8af46a7475118afaaa37063d224461013bbeb28d050f2f00b574663869684d7e`.
 
 No new texture layer or shader work: this remains offline preparation into the
 same normal/roughness maps. This is a look-development trial awaiting Cort's
