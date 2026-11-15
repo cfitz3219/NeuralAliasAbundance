@@ -17,6 +17,7 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native11/textures.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
 #include <d3dcompiler.h>
@@ -26,6 +27,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace na::native_d3d11 {
 using Microsoft::WRL::ComPtr;
@@ -441,6 +443,12 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const bool evaluated = dlss::Evaluate(list, eval);
     uint32_t capture_token = 0;
     if (evaluated && capture::j2::Armed()) {
+        // A saved capture also takes the scene's source textures, once per capture folder.
+        static std::wstring texture_dump_for;
+        if (const wchar_t* folder = capture::j2::Directory(); folder && *folder && texture_dump_for != folder) {
+            texture_dump_for = folder;
+            native11::RequestTextureDump((texture_dump_for + L"\\textures").c_str());
+        }
         capture::j2::Planes planes;
         planes.color = eval.color;
         planes.depth = shared_depth;

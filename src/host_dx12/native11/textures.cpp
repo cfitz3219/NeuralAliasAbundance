@@ -6,6 +6,7 @@
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/native11/texture_policy.hpp"
+#include "materials/texture_subresources_v1.hpp"
 
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -33,6 +35,10 @@ constexpr uint64_t kGraveFrames = 8;    // tidy-up delay only: a retired replace
                                         // Safety does not rest on it: every use between lookup and the real bind holds a reference.
 constexpr size_t kMaxEntries = 262144;  // views tracked at once; beyond it new views are not judged
 constexpr size_t kCensusRows = 48;
+constexpr uint64_t kDumpCollectFrames = 32;        // Presents during which bound candidates are noted (two census frames)
+constexpr size_t kDumpCollectMax = 256;            // noted at most; the most used are then kept
+constexpr size_t kDumpTextures = 48;               // written per request
+constexpr uint64_t kDumpBytes = 512ull << 20;      // and at most this much texture data per request
 
 using PFN_CreateSrv = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*,
                                                   ID3D11ShaderResourceView**);
@@ -50,6 +56,7 @@ struct Entry {
     ComPtr<ID3D11ShaderResourceView> replacement, pending; // under State::mu
     uint64_t bytes = 0, pending_bytes = 0;
     bool pending_set = false; // a publish or a removal waits for the next Present
+    std::atomic<bool> dump_taken{false}; // noted for the running source dump
 };
 
 // Never destroyed: a view's destruction can reach Retire after this module's statics are gone.
@@ -74,6 +81,27 @@ std::atomic<uint64_t> g_replaced{0}, g_replaced_bytes{0}, g_pending{0};
 std::atomic<uint64_t> g_swapped{0}, g_swapped_deferred{0}, g_returned{0};
 std::atomic<uint64_t> g_verdicts[static_cast<size_t>(TextureVerdict::kCount)]{};
 uint64_t g_census_next_ms = 0; // Present thread only
+
+// Source dump (RequestTextureDump). A view is noted, with a reference, only inside the game's own
+// bind call, where the game's view is certainly alive; it is read and written on the Present thread.
+struct DumpItem {
+    ComPtr<ID3D11ShaderResourceView> view;
+    std::shared_ptr<Entry> entry;
+};
+struct Dump {
+    std::mutex mu;
+    std::vector<DumpItem> queue; // under mu while collecting; Present thread only while writing
+    std::wstring dir;
+    uint64_t until_frame = 0;
+    uint64_t written = 0, duplicates = 0, failed = 0, bytes = 0, noted = 0, over_budget = 0;
+};
+Dump& D()
+{
+    static Dump* d = new Dump;
+    return *d;
+}
+std::atomic<int> g_dump_phase{0}; // 0 idle, 1 noting binds, 2 writing one texture per Present
+std::atomic<uint64_t> g_dump_written{0}, g_dump_failed{0};
 
 // {3f9c2d71-8a54-4b0e-b6c3-5e1a9d7f2c48}: a view's entry, by the lifetime of its private data.
 const GUID kLifeGuid = {0x3f9c2d71, 0x8a54, 0x4b0e, {0xb6, 0xc3, 0x5e, 0x1a, 0x9d, 0x7f, 0x2c, 0x48}};
@@ -285,7 +313,198 @@ void EmitCensus()
                            r.replaced ? 1 : 0);
 }
 
+bool WriteAll(const std::wstring& path, const void* head, size_t head_n, const std::vector<uint8_t>& body)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"wb") || !f) return false;
+    const bool ok = std::fwrite(head, 1, head_n, f) == head_n && (body.empty() || std::fwrite(body.data(), 1, body.size(), f) == body.size());
+    return std::fclose(f) == 0 && ok;
+}
+
+// Reads one noted view's levels through a staging copy, names them by "texture-subresources-v1"
+// and writes <digest>.dds (DX10 header, the view's typed format, bytes as stored) plus one index line.
+// Returns the reason it could not, or null.
+const char* DumpOne(const DumpItem& item, Dump& d)
+{
+    const MaterialTextureFacts& f = item.entry->facts;
+    uint32_t block = 0, texel = 0;
+    if (!na::materials::TexSubLayout(f.view_format, block, texel)) return "format has no v1 identity";
+    ComPtr<ID3D11Resource> resource;
+    item.view->GetResource(&resource);
+    ComPtr<ID3D11Texture2D> texture;
+    if (!resource || FAILED(resource.As(&texture))) return "not a 2D texture any more";
+    ComPtr<ID3D11Device> device;
+    item.view->GetDevice(&device);
+    ComPtr<ID3D11DeviceContext> ctx;
+    device->GetImmediateContext(&ctx);
+    D3D11_TEXTURE2D_DESC td{};
+    texture->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    OwnWorkScope own; // our copy and maps are not the game's work
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &staging)) || !staging) return "no staging copy (memory or format)";
+    ctx->CopyResource(staging.Get(), texture.Get());
+    na::materials::TexSubHeader h;
+    h.resource_format = f.format;
+    h.view_format = f.view_format;
+    h.width = f.width;
+    h.height = f.height;
+    h.first_mip = 0;
+    h.mip_count = f.mips;
+    na::materials::TextureSubresourcesV1 digest(h);
+    std::vector<uint8_t> body;
+    body.reserve(static_cast<size_t>(ChainBytes(f.width, f.height, f.mips, f.view_format)));
+    uint32_t first_level_bytes = 0;
+    for (uint32_t mip = 0; mip < f.mips; ++mip) {
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(staging.Get(), mip, D3D11_MAP_READ, 0, &m)) || !m.pData) return "a level could not be read back";
+        const uint32_t w = (std::max)(1u, f.width >> mip), ht = (std::max)(1u, f.height >> mip);
+        const uint32_t row = block ? ((w + 3) / 4) * block : w * texel, rows = block ? (ht + 3) / 4 : ht;
+        const bool fed = m.RowPitch >= row && digest.AddLevel(0, mip, m.pData, m.RowPitch);
+        if (fed)
+            for (uint32_t r = 0; r < rows; ++r) {
+                const auto* p = static_cast<const uint8_t*>(m.pData) + size_t(r) * m.RowPitch;
+                body.insert(body.end(), p, p + row);
+            }
+        ctx->Unmap(staging.Get(), mip);
+        if (!fed) return "a level's row layout was not the expected one";
+        if (!mip) first_level_bytes = row * rows;
+    }
+    const std::string name = digest.Finish();
+    if (name.empty()) return "levels incomplete";
+    const std::wstring wide(name.begin(), name.end());
+    const std::wstring path = d.dir + L"\\" + wide + L".dds";
+    const bool duplicate = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; // another view of the same content
+    if (!duplicate) {
+        uint32_t head[37] = {};
+        head[0] = 0x20534444; // "DDS "
+        head[1] = 124;
+        head[2] = 0x1 | 0x2 | 0x4 | 0x1000 | (block ? 0x80000u : 0x8u) | (f.mips > 1 ? 0x20000u : 0u);
+        head[3] = f.height;
+        head[4] = f.width;
+        head[5] = block ? first_level_bytes : f.width * texel;
+        head[7] = f.mips;
+        head[19] = 32;
+        head[20] = 0x4;
+        head[21] = 0x30315844; // "DX10"
+        head[27] = 0x1000 | (f.mips > 1 ? 0x8u | 0x400000u : 0u);
+        head[32] = f.view_format;
+        head[33] = 3; // 2D
+        head[35] = 1;
+        if (!WriteAll(path, head, sizeof(head), body)) return "the file could not be written";
+        d.bytes += body.size();
+    } else {
+        ++d.duplicates;
+    }
+    const Entry& e = *item.entry;
+    char line[1024];
+    const int n = std::snprintf(line, sizeof(line),
+                                "{\"content_sha256\":\"%s\",\"identity_domain\":\"texture-subresources-v1\",\"file\":\"%s.dds\","
+                                "\"resource_format\":%u,\"view_format\":%u,\"width\":%u,\"height\":%u,\"first_mip\":0,\"mip_count\":%u,"
+                                "\"first_array_slice\":0,\"array_size\":1,\"class\":\"%s\",\"slot\":%u,\"scene_binds\":%llu,\"binds\":%llu,"
+                                "\"set\":\"%08x\",\"set_size\":%u,\"bytes\":%zu,\"duplicate\":%s}\n",
+                                name.c_str(), name.c_str(), f.format, f.view_format, f.width, f.height, f.mips, Name(ClassOf(f.view_format)),
+                                e.slot.load(std::memory_order_relaxed), static_cast<unsigned long long>(e.scene_binds.load(std::memory_order_relaxed)),
+                                static_cast<unsigned long long>(e.binds.load(std::memory_order_relaxed)), e.set_key.load(std::memory_order_relaxed),
+                                e.set_size.load(std::memory_order_relaxed), body.size(), duplicate ? "true" : "false");
+    FILE* index = nullptr;
+    if (n <= 0 || n >= static_cast<int>(sizeof(line)) || _wfopen_s(&index, (d.dir + L"\\index.jsonl").c_str(), L"ab") || !index) return "the index could not be written";
+    std::fwrite(line, 1, static_cast<size_t>(n), index);
+    std::fclose(index);
+    return nullptr;
+}
+
+// Present thread. Phase 1 ends after its frames (or when enough is noted): keep the most used within
+// the budget. Phase 2 writes one texture per Present, so a dump never stalls more than one frame's worth.
+void DumpOnPresent(uint64_t frame)
+{
+    const int phase = g_dump_phase.load(std::memory_order_relaxed);
+    if (!phase) return;
+    Dump& d = D();
+    if (phase == 1) {
+        std::vector<DumpItem> dropped; // released after the lock
+        {
+            std::lock_guard<std::mutex> l(d.mu);
+            if (frame < d.until_frame && d.queue.size() < kDumpCollectMax) return;
+            d.noted = d.queue.size();
+            // Least used first, so the next texture to write is taken from the back.
+            std::sort(d.queue.begin(), d.queue.end(), [](const DumpItem& a, const DumpItem& b) {
+                return a.entry->scene_binds.load(std::memory_order_relaxed) < b.entry->scene_binds.load(std::memory_order_relaxed);
+            });
+            std::vector<DumpItem> keep;
+            uint64_t bytes = 0;
+            for (auto it = d.queue.rbegin(); it != d.queue.rend(); ++it) {
+                const MaterialTextureFacts& f = it->entry->facts;
+                const uint64_t size = ChainBytes(f.width, f.height, f.mips, f.view_format);
+                if (keep.size() < kDumpTextures && bytes + size <= kDumpBytes) {
+                    bytes += size;
+                    keep.push_back(std::move(*it));
+                } else {
+                    ++d.over_budget;
+                    dropped.push_back(std::move(*it));
+                }
+            }
+            std::reverse(keep.begin(), keep.end());
+            d.queue = std::move(keep);
+            g_dump_phase.store(2, std::memory_order_relaxed);
+        }
+        dropped.clear();
+        CreateDirectoryW(d.dir.c_str(), nullptr);
+        return;
+    }
+    if (!d.queue.empty()) {
+        DumpItem item = std::move(d.queue.back());
+        d.queue.pop_back();
+        if (const char* why = DumpOne(item, d)) {
+            ++d.failed;
+            g_dump_failed.fetch_add(1, std::memory_order_relaxed);
+            const MaterialTextureFacts& f = item.entry->facts;
+            na::eventlog::Emit("native11_texture_dump", "skipped w=%u h=%u mips=%u format=%u view_format=%u why=\"%s\"", f.width,
+                               f.height, f.mips, f.format, f.view_format, why);
+        } else {
+            ++d.written;
+            g_dump_written.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    na::eventlog::Emit("native11_texture_dump",
+                       "done noted=%llu written=%llu same_content=%llu skipped=%llu not_kept=%llu file_bytes=%llu "
+                       "note=\"candidates bound to pixel shaders before the picture was handed to DLSS over %llu frames, most used first; "
+                       "at most %zu textures and %llu MiB per request; names are texture-subresources-v1 digests; index.jsonl lists them\"",
+                       static_cast<unsigned long long>(d.noted), static_cast<unsigned long long>(d.written - d.duplicates),
+                       static_cast<unsigned long long>(d.duplicates), static_cast<unsigned long long>(d.failed),
+                       static_cast<unsigned long long>(d.over_budget), static_cast<unsigned long long>(d.bytes),
+                       static_cast<unsigned long long>(kDumpCollectFrames), kDumpTextures, static_cast<unsigned long long>(kDumpBytes >> 20));
+    g_dump_phase.store(0, std::memory_order_relaxed);
+}
+
 } // namespace
+
+bool RequestTextureDump(const wchar_t* dir)
+{
+    if (!dir || !*dir || !g_installed.load(std::memory_order_relaxed)) return false;
+    if (g_dump_phase.load(std::memory_order_relaxed) != 0) return false; // one at a time
+    {
+        // Lock order everywhere: the entry table, then the dump. Never both here.
+        State& s = S();
+        std::shared_lock<std::shared_mutex> sl(s.mu);
+        for (const auto& kv : s.entries) kv.second->dump_taken.store(false, std::memory_order_relaxed);
+    }
+    Dump& d = D();
+    {
+        std::lock_guard<std::mutex> l(d.mu);
+        if (g_dump_phase.load(std::memory_order_relaxed) != 0) return false;
+        d.dir = dir;
+        d.until_frame = g_frame.load(std::memory_order_relaxed) + kDumpCollectFrames;
+        d.written = d.duplicates = d.failed = d.bytes = d.noted = d.over_budget = 0;
+        g_dump_phase.store(1, std::memory_order_relaxed);
+    }
+    na::eventlog::Emit("native11_texture_dump", "requested frames=%llu", static_cast<unsigned long long>(kDumpCollectFrames));
+    return true;
+}
 
 bool InstallTextures(void* device)
 {
@@ -326,7 +545,8 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
         return views;
     const bool census = g_census_frame.load(std::memory_order_relaxed);
     const bool replace = g_enabled.load(std::memory_order_relaxed) && g_replaced.load(std::memory_order_relaxed) != 0;
-    if (!census && !replace) {
+    const bool dump = g_dump_phase.load(std::memory_order_relaxed) == 1 && !SceneHanded();
+    if (!census && !replace && !dump) {
         // Nothing to bind in place of anything: the game's views go in as they are, so no slot of
         // this call holds a replacement any more.
         if (shadow.held)
@@ -358,6 +578,12 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
                     e.set_key.store(set_key, std::memory_order_relaxed);
                     e.set_size.store(count, std::memory_order_relaxed);
                 }
+            }
+            if (dump && e.verdict == TextureVerdict::Candidate && !e.dump_taken.exchange(true, std::memory_order_relaxed)) {
+                Dump& d = D();
+                std::lock_guard<std::mutex> dl(d.mu);
+                if (g_dump_phase.load(std::memory_order_relaxed) == 1 && d.queue.size() < kDumpCollectMax)
+                    d.queue.push_back({ComPtr<ID3D11ShaderResourceView>(views[i]), it->second});
             }
             if (replace && e.replacement) {
                 scratch[i] = e.replacement.Get();
@@ -464,6 +690,7 @@ void TexturesOnPresent()
         s.grave.resize(kept);
     }
     release.clear();
+    DumpOnPresent(frame);
     const uint64_t now = GetTickCount64();
     if (!g_census_next_ms) g_census_next_ms = now + 45000;
     if (now >= g_census_next_ms) {
@@ -541,6 +768,9 @@ TextureStats GetTextureStats()
     t.generation = g_generation.load();
     t.installed = g_installed.load();
     t.enabled = g_enabled.load();
+    t.dump_written = g_dump_written.load();
+    t.dump_failed = g_dump_failed.load();
+    t.dump_active = g_dump_phase.load() != 0;
     {
         State& s = S();
         std::shared_lock<std::shared_mutex> l(s.mu);
@@ -557,7 +787,7 @@ int FormatTextureStatus(char* out, unsigned long n)
                          "native11_textures{installed=%d enabled=%d views=%llu candidates=%llu not{rendered_to=%llu rewritten=%llu "
                          "data_format=%llu too_small=%llu no_mips=%llu partial_view=%llu cube=%llu array=%llu multisampled=%llu "
                          "not_2d=%llu} untracked=%llu live=%llu retired=%llu replaced=%llu replaced_bytes=%llu pending=%llu "
-                         "swapped=%llu swapped_deferred=%llu returned_original=%llu generation=%llu}",
+                         "swapped=%llu swapped_deferred=%llu returned_original=%llu generation=%llu dump{active=%d written=%llu skipped=%llu}}",
                          t.installed ? 1 : 0, t.enabled ? 1 : 0, static_cast<unsigned long long>(t.views),
                          static_cast<unsigned long long>(t.candidates), v(TextureVerdict::RenderedTo), v(TextureVerdict::Rewritten),
                          v(TextureVerdict::DataFormat), v(TextureVerdict::TooSmall), v(TextureVerdict::NoMips),
@@ -567,7 +797,9 @@ int FormatTextureStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(t.retired), static_cast<unsigned long long>(t.replaced),
                          static_cast<unsigned long long>(t.replaced_bytes), static_cast<unsigned long long>(t.pending),
                          static_cast<unsigned long long>(t.swapped), static_cast<unsigned long long>(t.swapped_deferred),
-                         static_cast<unsigned long long>(t.returned_original), static_cast<unsigned long long>(t.generation));
+                         static_cast<unsigned long long>(t.returned_original), static_cast<unsigned long long>(t.generation),
+                         t.dump_active ? 1 : 0, static_cast<unsigned long long>(t.dump_written),
+                         static_cast<unsigned long long>(t.dump_failed));
 }
 
 } // namespace na::native11

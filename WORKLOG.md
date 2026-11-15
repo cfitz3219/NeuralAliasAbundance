@@ -1627,3 +1627,8 @@ Also added: a deferred recording made while a replacement is visible samples it 
 ## 2026-11-15 Source identity `texture-subresources-v1` (Fable)
 - `src/materials/texture_subresources_v1.hpp`: portable serializer and SHA-256 for the identity agreed in COMMS 9b962d6f / fc0b110f. Python reference `tools/material_baseline/texsub.py`; shared vectors in `tests/cpu/texture_subresources_v1_test.cpp` (two mips, sRGB reading, BC1, view from mip 1, array slices, row-pitch padding, invalid orders and formats).
 - Not yet wired into the runtime: source capture and the manifest/DDS loader come next.
+
+## 2026-11-15 Source texture dump on native DX11 (Fable)
+- `native11/textures`: `RequestTextureDump(dir)`. Candidates bound to pixel shaders in the scene over 32 frames are noted inside the game's own bind call (the only place a reference is taken), the most used 48 within 512 MiB are kept, and one per Present is read through a staging copy and written as `<texture-subresources-v1 digest>.dds` (bytes as stored, DX10 header with the view's typed format) with a line in `index.jsonl` (formats, size, slot, bind counts, set). Events `native11_texture_dump` (requested / skipped with why / done); status `dump{active= written= skipped=}`.
+- Started once per saved capture folder from the native DX11 DLAA path (`<capture>\textures`). No new menu control.
+- Fixture case in `provider_test` (GPU): expected file name computed independently by `tools/material_baseline/texsub.py`. Compiles on CI; not yet run on a GPU or in a game.

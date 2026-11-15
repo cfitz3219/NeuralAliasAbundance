@@ -50,6 +50,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -1564,6 +1565,38 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     } else expect(false, "create deferred texture context");
     na::native11::RemoveTexture(mip_view.Get());
     na::native11::TexturesOnPresent();
+    // Source dump: the texture the game binds in its scene is written as stored, under the name the
+    // shared identity gives its bytes (the digest below is from tools/material_baseline/texsub.py
+    // for this 64x64 RGBA8 chain: red, green, then blue levels).
+    {
+        wchar_t temp[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, temp);
+        const std::wstring dump_dir = std::wstring(temp) + L"na-texture-dump-" + std::to_wstring(GetCurrentProcessId());
+        const std::wstring dump_file = dump_dir + L"\\2377209502e7d867be939510f289f7a973418330e52ba7181ec5b703ada80598.dds";
+        const std::wstring dump_index = dump_dir + L"\\index.jsonl";
+        DeleteFileW(dump_file.c_str()); DeleteFileW(dump_index.c_str());
+        const auto dump_before = na::native11::GetTextureStats();
+        expect(na::native11::RequestTextureDump(dump_dir.c_str()) && !na::native11::RequestTextureDump(dump_dir.c_str()),
+               "a source dump starts, and a second request waits for the first");
+        g.ctx->PSSetShaderResources(0, 1, &texture_view);
+        g.ctx->Draw(4, 0);
+        for (int i = 0; i < 96 && na::native11::GetTextureStats().dump_active; ++i) na::native11::TexturesOnPresent();
+        const auto dump_after = na::native11::GetTextureStats();
+        WIN32_FILE_ATTRIBUTE_DATA written{}, index{};
+        const bool have_file = GetFileAttributesExW(dump_file.c_str(), GetFileExInfoStandard, &written) != 0;
+        const bool have_index = GetFileAttributesExW(dump_index.c_str(), GetFileExInfoStandard, &index) != 0;
+        std::printf("native texture dump: active %d, written %llu, skipped %llu, file %d (%lu bytes), index %d (%lu bytes)\n",
+                    dump_after.dump_active ? 1 : 0, static_cast<unsigned long long>(dump_after.dump_written - dump_before.dump_written),
+                    static_cast<unsigned long long>(dump_after.dump_failed - dump_before.dump_failed), have_file ? 1 : 0,
+                    written.nFileSizeLow, have_index ? 1 : 0, index.nFileSizeLow);
+        expect(!dump_after.dump_active && dump_after.dump_written == dump_before.dump_written + 1 &&
+               dump_after.dump_failed == dump_before.dump_failed,
+               "the dump finishes with the one scene texture written and none skipped");
+        expect(have_file && written.nFileSizeLow == 148 + 21844,
+               "the file is named by the texture-subresources-v1 digest of the game's bytes and holds every level");
+        expect(have_index && index.nFileSizeLow > 0, "the dump's index lists it");
+        DeleteFileW(dump_file.c_str()); DeleteFileW(dump_index.c_str()); RemoveDirectoryW(dump_dir.c_str());
+    }
     na::capture::j2::Shutdown();
     na::capture::Shutdown();
     DeleteFileW(ini.c_str());

@@ -99,6 +99,13 @@ bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView
 bool RemoveTexture(ID3D11ShaderResourceView* original);
 void SetTexturesEnabled(bool on); // one switch for every replacement; the census is not affected
 
+// Source dump: for the candidate textures the game binds to pixel shaders in its scene over the next
+// frames, most used first and within a fixed budget, writes <dir>\<digest>.dds (the bytes as stored,
+// named by "texture-subresources-v1", materials/texture_subresources_v1.hpp) and <dir>\index.jsonl.
+// One texture is read per Present. False when a dump is already running. The files are a capture:
+// they stay on the user's machine and are the preparer's input, never part of the program.
+bool RequestTextureDump(const wchar_t* dir);
+
 struct TextureStats {
     uint64_t views = 0;            // game views judged
     uint64_t candidates = 0;       // of those: may take a replacement
@@ -111,6 +118,8 @@ struct TextureStats {
     uint64_t returned_original = 0;// PSGetShaderResources answers turned back to the game's view
     uint64_t replaced_bytes = 0;   // memory of visible replacements, as their publisher declared it
     uint64_t generation = 0;
+    uint64_t dump_written = 0, dump_failed = 0; // source dump: textures written, and skipped with a logged reason
+    bool dump_active = false;
     bool installed = false, enabled = true;
 };
 TextureStats GetTextureStats();
