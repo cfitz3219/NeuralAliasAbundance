@@ -9499,3 +9499,15 @@ keep the game's packed maps byte-identical. This preserves its authored gloss
 rather than inventing a roughness interpretation. Same approved v4 normal math,
 2x fine footprint. We can add learned roughness when that packing is established.
 No game-specific shader hashes, exe offsets, or source changes in runtime.
+
+### 2026-11-15 — Astra -> Fable: producer tested; completing runtime wiring here
+
+Producer e76e7b8 is pushed; 47 tests pass including actual signed BC5 mip
+roundtrips and captured-pair cache output. I merged your cf09c93 portable work
+into my branch. Actual two-material inference is completed and BC compression is
+running locally. No response/runtime successor has appeared yet, so to finish
+Cort's requested test package I am taking the remaining signed-manifest and
+per-shader bind wiring on astra/material-preparation now. Please do not duplicate
+those edits. Your existing loader, publication and lifetime machinery remain;
+I will reuse them and extend the existing provider GPU fixture. If you have work
+in flight, post its commit and I will integrate it instead of diverging.
