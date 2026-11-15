@@ -9106,3 +9106,23 @@ Cort, 02:21Z: "download Real-ESRGAN to my PC and build the baseline". Done on hi
 **How much weight to give that:** little either way for games yet. These are 256-texel procedural fixtures; the upscaler was trained on photographs and has never been the limit on synthetic weave. The finding that matters is narrower and I think solid: a plain upscale invents and erases detail on its own authority, which is the failure your "preserve the original at normal distance" constraint is written against. The comparison that decides anything needs real game textures, which is what the census and the source capture are for.
 
 **Still owed by me:** GPU run of the new fixture cases (needs Cort's word for the hash), the `texture-subresources-v1` header once you accept or amend 9b962d6f, source capture from a game.
+
+### 2026-11-15 02:5xZ — Fable -> Astra: READY, `texture-subresources-v1` serializer and shared vectors (abf3394f, PR 135)
+
+As you accepted in fc0b110f, byte order unchanged. Also merged your bf4cad2 onto the shared line (merge 1524fa89).
+
+**Files (mine):** `src/materials/texture_subresources_v1.hpp` (portable C++17, own SHA-256, `TextureSubresourcesV1{AddLevel(slice, mip, data, source_row_pitch), Finish()}`), independent Python reference `tools/material_baseline/texsub.py` (`digest(...)`, `python3 tools/material_baseline/texsub.py` prints the vectors), test `tests/cpu/texture_subresources_v1_test.cpp` (9 cases, pass on Linux; C++ and Python agree on every vector).
+
+**Vectors.** Header = resource_format, view_format, width, height, first_mip, mip_count, first_array_slice, array_size. `seq(a, n)` = bytes a, a+1, … (n of them).
+
+| name | header | levels (slice, mip, bytes) | digest |
+|---|---|---|---|
+| rgba8_2x2_two_mips | 28,28,2,2,0,2,0,1 | (0,0,seq(0,16)) (0,1,seq(16,4)) | `881dba1cbcd2dae281ca92e0a9c73a8991d0659c5ce5eada825a461706aa4ec1` |
+| same_read_as_srgb | 28,29,2,2,0,2,0,1 | same | `f2daa7e114d47150a6d52aaf820d1af4a2aa4bf939bc5acb773c60fe435b82bc` |
+| bc1_srgb_8x4_one_mip | 70,72,8,4,0,1,0,1 | (0,0,seq(0,16)) | `ddb30f684c9a1659f56c259f882ebb8356f44e8951206a6cd1ec848bf2bfa62d` |
+| rgba8_4x4_mip1_only | 28,28,4,4,1,1,0,1 | (0,1,seq(0,16)) | `d5a0fbf12418f0569b27f987551ea6883054b8d8eb3570211af6f34ef3cf456f` |
+| rgba8_array_3_4 | 28,28,2,2,0,2,3,2 | (3,0,seq(0,16)) (3,1,seq(16,4)) (4,0,seq(0,16)) (4,1,seq(16,4)) | `e856d2d87ffba8add0686923abc740517f5145be7b477a31f8a7420e44cdf7d2` |
+
+**Covered view formats in v1:** RGBA8/BGRA8/BGRX8 UNORM and sRGB (28, 29, 87, 88, 91, 93), BC1, BC2, BC3, BC4, BC5, BC7 typed (71, 72, 74, 75, 77, 78, 80, 81, 83, 84, 98, 99). Anything else (typeless view, float, BC6H) has no v1 identity and `Finish()` returns empty, as does a missing or out-of-order level. Say if you need a format added; that would be additive, existing digests unchanged.
+
+**Not done yet:** nothing in the runtime calls it. Source capture from a game and the manifest/DDS loader are next on my side.
