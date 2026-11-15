@@ -1,6 +1,21 @@
 # NeuralAliasAbundance: master plan
 
-## New design task — material enhancement (2026-11-14 Pacific, planning only)
+## Active task — material enhancement (2026-11-14 Pacific, implementation authorized)
+
+Cort approved Fable's combined plan and told Astra to begin. Owners: Fable material
+acquisition/identity, DX11 replacement then DX12, and independent plain-upscale
+baseline; Astra shared format, coordinated detail, mip filtering and comparison.
+One shared runtime history. Astra's `astra/material-preparation` at **7643b09**
+has the first working offline candidate; e8cbd44 defines the record and 4f10137
+adds Fable-requested source provenance. Twenty offline tests pass; no game
+material enhancement is claimed yet. `docs/MATERIAL-ENHANCEMENT-PLAN-20261114.md`
+on that branch contains the approved amendments. Six-material preview is in
+`OneDrive/Documents/NeuralAlias-Material-Lab-20261114`. Fable's delivery increment
+7e4c41b/e4c6ca7 is on the shared line; COMMS f55ee3e gives three concrete ownership/
+reverse-mapping corrections for him. Next: integrate preparation outputs and
+his baseline with the sampled-binding fixture, then the agreed game demonstration.
+
+### Initial planning entry, preserved
 
 Cort asked Astra and Fable to propose and compare an original material-enhancement capability with an obvious visual benefit. Astra's draft is [PR139](https://github.com/cfitz3219/NeuralAliasAbundance/pull/139), `astra/material-enhancement-plan` at `935e86f`, `docs/MATERIAL-ENHANCEMENT-PLAN-20261114.md`. Central COMMS contains the review request and proposed split: Astra coordinated material detail/fidelity, Fable actual texture binding/publication, with one agreed design and reusable DX11/DX12 delivery. Fable's independent proposal/reply is pending. Status is **proposal, not approved implementation**; existing runtime/installer work remains intact. First success must be visible material detail and light response in the real sampled surface, stable in motion, compared with plain texture upscaling at measured cost. No claim of novelty or universal compatibility from a proposed design.
 

@@ -1,3 +1,25 @@
+# 2026-11-14 Pacific — material enhancement first candidate handed to Fable
+
+Cort authorized the combined plan. Astra replied in COMMS, shipped shared
+record/cache e8cbd44 + optional provenance 4f10137 and offline preparation/viewer
+**7643b09**, branch `astra/material-preparation`, workspace
+`C:\Users\Cort\NA-material-preparation`. Fable owns runtime binding/publication and
+plain-upscale baseline; Astra owns coordinated detail/mips/comparison. Twenty
+offline tests, real BC compression and C++17 header build pass. Six synthetic
+examples and static reference comparisons are generated; no AI model or game
+result is claimed. Preview: `C:\Users\Cort\OneDrive\Documents\NeuralAlias-Material-Lab-20261114`.
+
+Fable's e4c6ca7 module was read, not edited. COMMS f55ee3e answers his record
+question and identifies exact old-version reverse mapping, original-view
+ownership and lookup-to-bind lease corrections. He retains those files.
+Next handoff: take 4f10137/7643b09 onto his e8cbd44-based shared line, use the
+same six source PNGs for his comparison arm, finish the marker/delivery fixture.
+Interactive HTML source syntax checked; automated local-file browser opening was
+blocked, so visual inspection used decoded-BC offline PNG renders. Game testing
+remains with Cort. Existing game builds/installers were not changed by this task.
+
+---
+
 # 2026-10-27 02:05 — SER live DLAA handed to Astra (Cort)
 
 Run 6 (inline DLAA, 9f7dd95): the debug image shows about once every 1.5–2 s. Inline DLAA ran on about 30% of frames. Depth state was unknown on about a third of candidates. Cuts were about 20%. The learned target of 1 candidate per frame suggests DLAA mostly lands at a mid-frame colour read rather than the start of post-processing.
