@@ -17,6 +17,10 @@ struct Source {
     uint32_t first_mip = 0, mip_count = 0;
     uint32_t view_format = 0; // original typed DXGI format, zero = not qualified
     bool complete_observed_range = false; // not a claim that all possible streamed mips exist
+    // Optional v1 provenance, requested by the runtime owner. Zero format is
+    // unknown/file input. The v1 preparer still handles one ordinary 2D slice.
+    uint32_t resource_format = 0;
+    uint32_t first_array_slice = 0, array_size = 1;
 };
 struct Mip {
     uint32_t level = 0, width = 0, height = 0;
