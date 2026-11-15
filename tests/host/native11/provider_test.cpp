@@ -1642,8 +1642,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         const std::string mat_source = mat_digest.Finish();
         // The cache entry: one base_color map, written the way the preparer lays a DDS out.
         std::vector<uint8_t> mat_file(148, 0);
-        const auto mat_put = [&](size_t byte, uint32_t v) {
-            for (int k = 0; k < 4; ++k) mat_file[byte + static_cast<size_t>(k)] = static_cast<uint8_t>(v >> (8 * k));
+        const auto mat_put = [&](size_t mat_at, uint32_t mat_v) {
+            for (int mat_k = 0; mat_k < 4; ++mat_k) mat_file[mat_at + static_cast<size_t>(mat_k)] = static_cast<uint8_t>(mat_v >> (8 * mat_k));
         };
         std::memcpy(mat_file.data(), "DDS ", 4);
         mat_put(4, 124); mat_put(8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000 | 0x20000); mat_put(12, mat_side); mat_put(16, mat_side);
