@@ -79,3 +79,29 @@ Each finding includes a failing sequence and a concrete correction for Fable's
 owned files. Confirmed API reference ownership in Microsoft's PSSet/Get docs.
 No edits to Fable's module or game deployment. Node's JavaScript syntax check on
 the viewer passes; that does not claim browser/WebGL execution was tested.
+
+## 2026-11-14 Pacific — blank preview handoff corrected
+
+Cort reported the lab could only be opened by pasting a path, then showed three
+empty panels with no material buttons. Browser inventory (read only, no local
+file navigation) established the exact open URL was the developer source
+`C:/Users/Cort/NA-material-preparation/tools/material_lab/viewer.html`, not the
+generated Documents gallery. That template still contained __MATERIAL_DATA__;
+its JSON.parse failed before material buttons or rendering could start. This
+identifies the screenshot's failure without blaming WebGL or the generator.
+
+Renamed the internal template to viewer.html.in. The already-open source address
+now serves a static launcher linking to the actual prepared gallery and three
+existing PNG comparisons. Moved initialization errors above the panels and put
+JSON parsing inside the startup error handler. Regenerated the real gallery and
+copied it to the existing Documents package. Added a Windows desktop shortcut,
+NeuralAlias Material Lab, directly targeting installed Chrome with the correct
+prepared HTML. Read back its target/arguments; checked the file and identical
+source/package hashes. No shortcut execution or browser file-navigation bypass.
+
+Verified six materials, 324 embedded mip images, no unexpanded placeholder and
+all launcher file links. Added a regression that decodes the generated viewer's
+embedded PNG mip chains from real compressed cache inputs. This checks delivery
+of images, not just script syntax. No material math, cache schema, game hooks or
+game installation changed. Interactive WebGL rendering remains separately
+unverified by automation; the user's screenshot was of the unpopulated template.

@@ -57,6 +57,6 @@ def write(cases, output):
         row["coordinated"] = candidate(case["coordinated"])
         row["baseline"] = candidate(case["baseline"]) if case.get("baseline") else None
         payload.append(row)
-    template = Path(__file__).with_name("viewer.html").read_text(encoding="utf-8")
+    template = Path(__file__).with_name("viewer.html.in").read_text(encoding="utf-8")
     encoded = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c")
     Path(output).write_text(template.replace("__MATERIAL_DATA__", encoded), encoding="utf-8")

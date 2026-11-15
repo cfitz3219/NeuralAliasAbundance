@@ -110,6 +110,28 @@ class CompressedCache(unittest.TestCase):
         self.assertTrue(hit); self.assertEqual(p, self.entry); self.assertEqual(r, self.record)
         self.assertEqual(before, (p/"normal.dds").stat().st_mtime_ns)
 
+    def test_packaged_viewer_has_decodable_material_images(self):
+        import base64
+        import io
+        import re
+        from PIL import Image
+        output = self.root/"Material-Lab.html"
+        viewer.write([dict(name="oak_boards", family="wood", split="development",
+                           original=str(self.entry), coordinated=str(self.entry))], output)
+        html = output.read_text(encoding="utf-8")
+        self.assertNotIn("__MATERIAL_DATA__", html)
+        encoded = re.search(r'<script id="data" type="application/json">(.*?)</script>', html, re.S)
+        data = json.loads(encoded.group(1))
+        self.assertEqual(data[0]["name"], "oak_boards")
+        for candidate in ("original", "coordinated"):
+            self.assertEqual(set(data[0][candidate]["maps"]), {"base_color", "normal", "roughness"})
+            for images in data[0][candidate]["maps"].values():
+                self.assertEqual(len(images), 6)
+                for mip, url in enumerate(images):
+                    image = Image.open(io.BytesIO(base64.b64decode(url.split(",",1)[1])))
+                    self.assertEqual(image.size, (max(1,32 >> mip),)*2)
+                    image.verify()
+
     def test_truncation_and_format_corruption_rejected(self):
         raw = (self.entry/"normal.dds").read_bytes()
         with self.assertRaises(ValueError): dds.layout(raw[:-1])
