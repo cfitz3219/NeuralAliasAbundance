@@ -21,9 +21,16 @@ def resize_wrap(a, height, width):
     from .render import sample
     if a.shape[:2] == (height, width):
         return a.copy()
-    x, y = np.meshgrid((np.arange(width)+.5)/width, (np.arange(height)+.5)/height)
     scalar = a.ndim == 2
-    result = sample(a[...,None] if scalar else a, np.stack([x,y],-1))
+    # Large game maps otherwise allocate several full 4K/8K float64 grids and
+    # four gathered copies simultaneously. Same texel centres/filter, bounded
+    # temporary memory; no change to the approved detail's scale or values.
+    source = a[...,None] if scalar else a
+    result = np.empty((height,width,source.shape[-1]), dtype=np.float64)
+    for start in range(0,height,64):
+        end = min(height,start+64)
+        x,y = np.meshgrid((np.arange(width)+.5)/width,(np.arange(start,end)+.5)/height)
+        result[start:end] = sample(source,np.stack([x,y],-1))
     return result[...,0] if scalar else result
 
 
