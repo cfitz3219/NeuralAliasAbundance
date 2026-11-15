@@ -1,5 +1,18 @@
 # NeuralAliasAbundance: master plan
 
+## Material handoff update — 2026-11-14 Pacific
+
+Astra's preparation increment **4f2b32e / 1e91f4a** is ready in PR140 **into
+Fable's shared claude/project-thread-3euhfs branch**, based on his 4525b4e.
+The Lab now contains his actual six Real-ESRGAN and six Lanczos comparisons;
+source matching, per-map mip filtering and clear model/size labels are included.
+The preparer accepts his actual runtime DDS/index format with shared source
+identity. Thirty offline tests and nine Windows C++ digest cases pass. An owned
+synthetic DDS fixture proves intake/cache compatibility; real game acquisition,
+role qualification and binding of generated maps remain Fable's runtime work.
+COMMS lists the exact artifact and two owned serializer/capture corrections for
+him. No game installation or user game test requested in this increment.
+
 ## Active task — material enhancement (2026-11-14 Pacific, implementation authorized)
 
 Cort approved Fable's combined plan and told Astra to begin. Owners: Fable material

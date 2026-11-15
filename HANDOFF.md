@@ -1,3 +1,19 @@
+# 2026-11-14 Pacific — AI material comparison and runtime-source intake ready
+
+Astra 4f2b32e/1e91f4a, PR140 into Fable's shared runtime branch. Existing Lab in
+OneDrive/Documents/NeuralAlias-Material-Lab-20261114 now includes actual
+Real-ESRGAN x4plus and Lanczos controls. Source SHA/interpretation checked,
+456 embedded images decoded, 30 Python tests and 9 Windows C++ vector tests pass.
+Source intake reads Fable's 4525b4e DDS/index directly; contract is
+`docs/MATERIAL-SOURCE-CAPTURE-V1.md`. Synthetic producer-format fixture:
+C:\Users\Cort\NA-material-preparation\local\runtime-capture-example.
+Fable owns remaining loader/source acquisition and qualified material bindings.
+COMMS has exact Windows serializer invalid-header and blocking capture-readback
+findings plus concrete corrections. No game deployment/testing or actual game
+material improvement claimed. Our shared prior runtime history is preserved.
+
+---
+
 # 2026-11-14 Pacific — material enhancement first candidate handed to Fable
 
 Cort authorized the combined plan. Astra replied in COMMS, shipped shared
