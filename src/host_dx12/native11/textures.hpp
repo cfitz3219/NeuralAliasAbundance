@@ -29,6 +29,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <bitset>
 
 namespace na::native11 {
 
@@ -37,6 +38,10 @@ namespace na::native11 {
 struct PsShadow {
     ID3D11ShaderResourceView* game[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
     unsigned held = 0;
+    std::bitset<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> larger_safe;
+    std::bitset<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> replacement_slots, shader_reads;
+    bool shader_known = false;
+    bool shader_changed = false;
     PsShadow() = default;
     PsShadow(const PsShadow&) = delete;
     PsShadow& operator=(const PsShadow&) = delete;
@@ -44,6 +49,7 @@ struct PsShadow {
     void Set(unsigned slot, ID3D11ShaderResourceView* view) // null clears the slot
     {
         if (game[slot] == view) return;
+        replacement_slots.set(slot, view != nullptr);
         if (view) {
             view->AddRef();
             ++held;
@@ -58,6 +64,11 @@ struct PsShadow {
     }
     void Clear() // the context's state was reset (ClearState, a list finished or executed without restore)
     {
+        larger_safe.reset();
+        replacement_slots.reset();
+        shader_reads.reset();
+        shader_known = false;
+        shader_changed = true;
         if (!held) return;
         for (auto*& kept : game)
             if (kept) {
@@ -87,8 +98,15 @@ PsShadow* TextureShadowOf(ID3D11DeviceContext* c);
 // Changes whenever what should be bound may have changed; the provider compares it per context at
 // each draw and calls RefreshTextures with that context's original PSSetShaderResources.
 uint64_t TexturePolicyKey();
+// Recorded on the game's PSSetShader; creation-time disassembly is private data
+// on the shader itself. No parsing, allocation or shared shader map at a draw.
+void NoteTextureShader(PsShadow& shadow, ID3D11PixelShader* shader);
 using TextureSetFn = void (__stdcall*)(ID3D11DeviceContext*, unsigned, unsigned, ID3D11ShaderResourceView* const*);
 void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn original_set);
+// Draw-time static shader references, after policy refresh. No API lookup, GPU
+// query, lock or allocation. These are NOT pixel contribution/visibility claims:
+// shader branches, clipping, depth, blending and later passes can suppress them.
+void NoteTextureDraw(const PsShadow& shadow, bool deferred);
 
 // From the provider's Present handler.
 void TexturesOnPresent();
@@ -99,6 +117,7 @@ void TexturesOnPresent();
 // view (several views of one texture); `bytes` is then counted once per original.
 bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView* replacement, uint64_t bytes);
 bool RemoveTexture(ID3D11ShaderResourceView* original);
+void InvalidateTexture(ID3D11ShaderResourceView* original, uint64_t serial);
 // Several publications in one step, so they become visible on the same Present (the maps of one
 // material). Each names the game view by address and by the serial its creation was given: an
 // entry whose view has since been destroyed (or whose address now belongs to another view) is
@@ -108,6 +127,7 @@ struct TexturePublication {
     uint64_t serial = 0;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> replacement;
     uint64_t bytes = 0;
+    bool larger = false;
 };
 size_t PublishTextures(const TexturePublication* items, size_t count);
 void SetTexturesEnabled(bool on); // one switch for every replacement; the census is not affected
@@ -130,6 +150,8 @@ struct TextureStats {
     uint64_t swapped = 0;          // binds forwarded with a replacement (immediate context)
     uint64_t swapped_deferred = 0; // the same on deferred contexts (recorded; see the header note)
     uint64_t returned_original = 0;// PSGetShaderResources answers turned back to the game's view
+    uint64_t read_draws = 0, unread_draws = 0, unknown_draws = 0;
+    uint64_t read_draws_deferred = 0; // recorded, not proof the list executed
     uint64_t replaced_bytes = 0;   // memory of visible replacements, as their publisher declared it
     uint64_t generation = 0;
     uint64_t dump_written = 0, dump_failed = 0; // source dump: textures written, and skipped with a logged reason

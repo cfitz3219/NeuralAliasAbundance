@@ -1,4 +1,93 @@
-# Material Lab: first coordinated-detail candidate
+# Material Lab
+
+
+## Current: 2x fine-detail size trial (recipe v4)
+
+Cort requested larger fine detail after approving the normal-distance result.
+Fine inference now runs at half size; the existing medium layer and output
+texture budget stay unchanged. Current index/gallery end in `combined-v4.json`
+and `combined-material-gallery-v4`. Previous v3 remains available. See
+`docs/MATERIAL-FINE-SIZE-TRIAL-20261114.md` for the change and evidence.
+
+## Normal-distance detail update (recipe v3)
+
+The current Lab bakes fine AND medium-size learned detail into the same maps.
+The same surface models also run on quarter-size, linear-filtered colour;
+material coordinates, original surface foundation, strength bounds and mip
+filtering are retained. No new runtime texture or shader pass. The viewer now
+starts at 1x. See `docs/MATERIAL-DISTANCE-DETAIL-20261114.md` for the evidence,
+cost comparison and exact limits. Earlier sections below record prior versions.
+
+Current paths: `local/learned-surface/combined-v3.json` and
+`local/combined-material-gallery-v3`. Use these with the existing prepare/compare
+commands. Test distance preservation against the previous delivered gallery:
+
+```powershell
+python -m tools.material_lab.tests.gpu_distance_check --previous local/combined-material-gallery-v2/Material-Lab.html --current local/combined-material-gallery-v3/Material-Lab.html --output local/material-models/gpu-distance-v3
+```
+
+
+## Surface slider correction (2026-11-14 Pacific, v2)
+
+The combined candidate now uses the `learned_surface.VERSION == '2'` recipe.
+Original maps remain the base. Instead of suppressing model detail at all edges,
+it removes only the added component that would flatten a non-flat authored
+normal. Broad prediction offsets still do not replace authored material values.
+A wider residual band and documented fixed relief range retain visible detail.
+0% remains exactly PBRify alone. Prepared prediction arrays are reused; the model
+weights, PBRify colour and original textures are unchanged.
+
+The **Surface detail** slider automatically pauses the moving light and returns
+from Colour detail only to Complete material. The previous UI allowed a surface
+control to change while its surface maps were deliberately hidden. **Detail zoom**
+starts at 2x and magnifies the same region in all panels; 1x shows the whole tile.
+It uses ordinary derivative-based mip selection, not sharpened or forced mips.
+
+New output index: `local/learned-surface/combined-v2.json`; generated gallery:
+`local/combined-material-gallery-v2`. Use these paths with the commands below.
+Details, measured signal losses and before/after GPU evidence are in
+`docs/MATERIAL-SURFACE-SLIDER-FIX-20261114.md`.
+
+The optional actual-GPU check requires `moderngl==5.12.0` in the preparation
+environment; this dependency is never linked into the game runtime:
+
+```powershell
+python tools/material_lab/tests/gpu_surface_check.py local/combined-material-gallery-v2/Material-Lab.html --output local/material-models/gpu-slider-v2
+node tools/material_lab/tests/model_selector_test.cjs local/combined-material-gallery-v2/Material-Lab.html
+```
+
+The GPU test renders the shipped shader with the prepared compressed textures
+on a standalone OpenGL context. The only shader adaptation is the GLSL version
+declaration. This tests shader pixels, not the user's browser UI or a game.
+
+## Current comparison: PBRify colour + learned surface detail
+
+The default prepared Lab now compares **Original**, **PBRify alone**, and
+**Combined result**. PBRify RPLKSRd V3 supplies identical colour to the two enhanced
+panels. Author-provided PBRify NormalV3 and RoughnessV2 models supply fine detail
+for the combined panel, with original normal/roughness maps retained as its base.
+There is no procedural noise in this new candidate. Surface detail defaults to
+65%; 0% uses the original surface textures directly and exactly matches PBRify
+alone. The prior five-model comparison remains at `AI-model-comparison.html` in
+the user package, linked from the new page.
+
+These models run offline through the existing PyTorch/Spandrel environment.
+The browser only displays prepared maps. Dependencies, weights and prepared
+assets stay local; the game DLL is unchanged. See
+[model provenance and combination details](../../docs/MATERIAL-LEARNED-SURFACE-20261114.md).
+
+```powershell
+python -m tools.material_lab.surface_runner --sources local/material-demo/sources --colour-index local/model-comparisons/pbrify-v3.json --cache local/learned-surface/cache --predictions local/learned-surface/predictions --index local/learned-surface/combined.json --texconv local/tools/texconv.exe --normal-model local/material-models/1x-PBRify_NormalV3.pth --rough-model local/material-models/1x-PBRify_RoughnessV2.pth
+python -m tools.material_lab compare --comparison local/material-demo/comparison.json --output local/combined-material-gallery --baseline-index local/model-comparisons/pbrify-v3.json --combined-index local/learned-surface/combined.json
+```
+
+The surface runner requires declared periodic positive-Z tangent materials and
+the paired 1x SPAN models. It reuses existing source identities, BC compression,
+mip generation and immutable publication. It never overwrites authored sources.
+Generated HTML embeds all needed maps; when packaging it, also preserve the
+earlier five-model gallery as `AI-model-comparison.html` for the comparison link.
+
+## Earlier procedural candidate (retained for comparison)
 
 Owner: Astra. Runtime acquisition and binding: Fable. This is the offline M1
 prototype from the approved material-enhancement plan, not an injected effect.

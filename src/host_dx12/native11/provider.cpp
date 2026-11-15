@@ -25,6 +25,7 @@
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/native11/textures.hpp"
+#include "host_dx12/native11/texture_loader.hpp"
 
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
@@ -61,14 +62,14 @@ using Microsoft::WRL::ComPtr;
 
 // ID3D11DeviceContext vtable (d3d11.h order).
 enum CtxSlot : uint32_t {
-    kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kPSSetConstantBuffers = 16, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
+    kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kPSSetShader = 9, kPSSetConstantBuffers = 16, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
     kDrawIndexedInstanced = 20, kDrawInstanced = 21, kVSSetShaderResources = 25, kOMSetRenderTargets = 33,
     kOMSetRenderTargetsAndUAVs = 34, kOMSetDepthStencilState = 36, kDrawIndexedInstancedIndirect = 39,
     kDrawInstancedIndirect = 40, kRSSetViewports = 44, kCopySubresourceRegion = 46, kCopyResource = 47, kUpdateSubresource = 48,
     kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
     kClearState = 110, kFinishCommandList = 114,
     // ID3D11DeviceContext1
-    kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
+    kCopySubresourceRegion1 = 115, kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
 };
 enum SwapSlot : uint32_t { kPresent = 8, kResizeBuffers = 13, kPresent1 = 22 };
 
@@ -399,6 +400,7 @@ Ctx* Get(ID3D11DeviceContext* c)
 using PFN_VSSetCB = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11Buffer* const*);
 using PFN_VSSetCB1 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*);
 using PFN_SetSRV = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
+using PFN_SetPS = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT);
 using PFN_DrawIndexed = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using PFN_Draw = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using PFN_DrawIndexedInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
@@ -414,6 +416,7 @@ using PFN_RSSetViewports = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, 
 using PFN_CopyRegion = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT,
                                                 const D3D11_BOX*);
 using PFN_CopyResource = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
+using PFN_CopyRegion1 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT, const D3D11_BOX*, UINT);
 using PFN_UpdateSub = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT);
 using PFN_UpdateSub1 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT, UINT);
 using PFN_ClearDSV = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
@@ -429,6 +432,7 @@ struct Originals {
     PFN_VSSetCB vs_cb = nullptr, ps_cb = nullptr;
     PFN_VSSetCB1 vs_cb1 = nullptr, ps_cb1 = nullptr;
     PFN_SetSRV ps_srv = nullptr, cs_srv = nullptr, vs_srv = nullptr;
+    PFN_SetPS ps_shader = nullptr;
     PFN_DrawIndexed draw_indexed = nullptr;
     PFN_Draw draw = nullptr;
     PFN_DrawIndexedInstanced draw_indexed_instanced = nullptr;
@@ -442,6 +446,7 @@ struct Originals {
     PFN_RSSetViewports rs_vp = nullptr;
     PFN_CopyRegion copy_region = nullptr;
     PFN_CopyResource copy_resource = nullptr;
+    PFN_CopyRegion1 copy_region1 = nullptr;
     PFN_UpdateSub update = nullptr;
     PFN_UpdateSub1 update1 = nullptr;
     PFN_ClearDSV clear_dsv = nullptr;
@@ -1478,9 +1483,10 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         }
         // Material textures published or withdrawn since this context last bound: re-bind what it holds.
         const uint64_t textures = TexturePolicyKey();
-        if (x->texture_policy != textures) {
+        if (x->texture_policy != textures || x->ps_shadow.shader_changed) {
             RefreshTextures(c, x->ps_shadow, O(c, x).ps_srv);
             x->texture_policy = textures;
+            x->ps_shadow.shader_changed = false;
         }
     };
     refresh_samplers();
@@ -1517,6 +1523,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     if (picture_draw || layer_draw) exact = ExactForDraw(c, x);
     Emit(x, c, e, {}, exact);
     if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
+    NoteTextureDraw(x->ps_shadow, x->deferred);
 }
 // The scene colour first met through a read, before any bind as a render target: its view as read.
 ViewUse SrvUse(ID3D11ShaderResourceView* v)
@@ -1737,6 +1744,12 @@ void STDMETHODCALLTYPE PSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT sta
     NoteCbs(x, kPsCbBase, start, n, b, first, num);
     O(c, x).ps_cb1(c, start, n, b, first, num);
 }
+void STDMETHODCALLTYPE PSSetShader_d(ID3D11DeviceContext* c, ID3D11PixelShader* shader, ID3D11ClassInstance* const* classes, UINT count)
+{
+    Ctx* x=Get(c);
+    O(c,x).ps_shader(c,shader,classes,count);
+    if (x) NoteTextureShader(x->ps_shadow,shader);
+}
 void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
     ReadEvents(c, n, v);
@@ -1839,6 +1852,7 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
         } else if (cb) {
             CbUpdate(c, r, nullptr, 0); // not a candidate: still a version change for the model
         }
+        if(!cb) MaterialsOnResourceWritten(r);
     }
     O(c, x).unmap(c, r, sub);
 }
@@ -1851,7 +1865,7 @@ void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11
         Inside in;
         cb = IsConstantBuffer(r, &size);
     }
-    if (!cb) return;
+    if (!cb) { MaterialsOnResourceWritten(r);return; }
     if (box || !IsCandidate(IdOf(r))) { CbUpdate(c, r, nullptr, 0); return; } // constant buffers are updated whole
     tmp.assign(static_cast<const uint8_t*>(src), static_cast<const uint8_t*>(src) + size);
     if (JitterUpload(tmp.data(), tmp.size(), IdOf(r))) src = tmp.data(); // the game's upload, jittered
@@ -1983,12 +1997,21 @@ void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Res
                                                UINT ss, const D3D11_BOX* box)
 {
     ReadResource(c, src);
+    if(!t_inside && Get(c)) MaterialsOnResourceWritten(dst);
     O(c, t_inside ? nullptr : Get(c)).copy_region(c, dst, ds, x0, y0, z0, src, ss, box);
 }
 void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src)
 {
     ReadResource(c, src);
+    if(!t_inside && Get(c)) MaterialsOnResourceWritten(dst);
     O(c, t_inside ? nullptr : Get(c)).copy_resource(c, dst, src);
+}
+void STDMETHODCALLTYPE CopySubresourceRegion1_d(ID3D11DeviceContext1* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y0, UINT z0,
+                                                ID3D11Resource* src, UINT ss, const D3D11_BOX* box, UINT flags)
+{
+    Ctx* context=t_inside?nullptr:Get(c);
+    if(context) MaterialsOnResourceWritten(dst);
+    O(c,context).copy_region1(c,dst,ds,x0,y0,z0,src,ss,box,flags);
 }
 void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT f)
 {
@@ -2327,6 +2350,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
         {kVSSetConstantBuffers, reinterpret_cast<void*>(&VSSetConstantBuffers_d), reinterpret_cast<void**>(&o.vs_cb)},
         {kPSSetConstantBuffers, reinterpret_cast<void*>(&PSSetConstantBuffers_d), reinterpret_cast<void**>(&o.ps_cb)},
         {kPSSetShaderResources, reinterpret_cast<void*>(&PSSetShaderResources_d), reinterpret_cast<void**>(&o.ps_srv)},
+        {kPSSetShader, reinterpret_cast<void*>(&PSSetShader_d), reinterpret_cast<void**>(&o.ps_shader)},
         {kCSSetShaderResources, reinterpret_cast<void*>(&CSSetShaderResources_d), reinterpret_cast<void**>(&o.cs_srv)},
         {kVSSetShaderResources, reinterpret_cast<void*>(&VSSetShaderResources_d), reinterpret_cast<void**>(&o.vs_srv)},
         {kDrawIndexed, reinterpret_cast<void*>(&DrawIndexed_d), reinterpret_cast<void**>(&o.draw_indexed)},
@@ -2352,6 +2376,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     else hooks.push_back({kExecuteCommandList, reinterpret_cast<void*>(&ExecuteCommandList_d), reinterpret_cast<void**>(&o.execute)});
     ComPtr<ID3D11DeviceContext1> c1;
     if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) {
+        hooks.push_back({kCopySubresourceRegion1, reinterpret_cast<void*>(&CopySubresourceRegion1_d), reinterpret_cast<void**>(&o.copy_region1)});
         hooks.push_back({kUpdateSubresource1, reinterpret_cast<void*>(&UpdateSubresource1_d), reinterpret_cast<void**>(&o.update1)});
         hooks.push_back({kVSSetConstantBuffers1, reinterpret_cast<void*>(&VSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.vs_cb1)});
         hooks.push_back({kPSSetConstantBuffers1, reinterpret_cast<void*>(&PSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.ps_cb1)});

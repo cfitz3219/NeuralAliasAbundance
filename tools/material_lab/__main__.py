@@ -21,6 +21,7 @@ def main():
     compare.add_argument("--baseline-index", type=Path)
     compare.add_argument("--conventional-index", type=Path)
     compare.add_argument("--models-index", type=Path, help="List of {id,label,description,index} model comparisons")
+    compare.add_argument("--combined-index", type=Path, help="Authored-surface combinations; requires matching --baseline-index")
     prepare = sub.add_parser("prepare", help="prepare a source.json + PNG material folder")
     prepare.add_argument("source", type=Path)
     prepare.add_argument("--cache", type=Path, required=True)
@@ -43,10 +44,18 @@ def main():
                 external = json.loads(path.read_text(encoding="utf-8"))
                 for row in index:
                     row[key] = str(Path(external[row["name"]]).resolve())
+        if args.combined_index:
+            if not args.baseline_index:
+                raise ValueError('combined comparison requires an explicit colour baseline')
+            combined = json.loads(args.combined_index.read_text(encoding='utf-8'))
+            for row in index:
+                row['coordinated'] = str((args.combined_index.parent/combined[row['name']]).resolve())
+                row['combined'] = True
         args.output.mkdir(parents=True, exist_ok=True)
         viewer.write(index, args.output/"Material-Lab.html")
         render.previews(index, args.output)
-        render.model_previews(index, args.output)
+        if not args.combined_index:
+            render.model_previews(index, args.output)
         (args.output/"comparison.json").write_text(json.dumps(index, indent=2)+"\n", encoding="utf-8")
         print(json.dumps(dict(viewer=str((args.output/"Material-Lab.html").resolve()), materials=len(index))))
     else:

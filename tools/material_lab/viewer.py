@@ -80,6 +80,24 @@ def write(cases, output):
         row = {k: case[k] for k in ("name", "family", "split")}
         row["original"] = candidate(case["original"])
         row["coordinated"] = candidate(case["coordinated"])
+        row['combined'] = bool(case.get('combined'))
+        if row['combined']:
+            combined = cache.validate(case['coordinated'])
+            base = cache.validate(case['baseline'])
+            viewer_source = cache.validate(case['original'])
+            check_baseline(viewer_source,combined)
+            if combined['settings'].get('colour_entry') != base['entry_key']:
+                raise ValueError('combined surface does not belong to selected colour model')
+            a=next(m['sha256'] for m in combined['maps'] if m['role']=='base_color')
+            b=next(m['sha256'] for m in base['maps'] if m['role']=='base_color')
+            if a != b:
+                raise ValueError('combined comparison changed the colour baseline')
+            row['comparisons']={'baseline':{**candidate(case['baseline']), 'label':'PBRify alone',
+                                          'description':'PBRify colour with the original surface details.'}}
+            # Same colour in both panels: embed once and bind it explicitly in the viewer.
+            del row['coordinated']['maps']['base_color']
+            payload.append(row)
+            continue
         row["baseline"] = candidate(case["baseline"]) if case.get("baseline") else None
         row["conventional"] = candidate(case["conventional"]) if case.get("conventional") else None
         row["comparisons"] = {}
@@ -93,6 +111,20 @@ def write(cases, output):
                 row["comparisons"][key] = {**row[key], "label":label, "description":description}
         del row["baseline"], row["conventional"]  # Embed each large candidate once.
         payload.append(row)
+    write_payload(payload, output)
+
+
+def write_payload(payload, output):
     template = Path(__file__).with_name("viewer.html.in").read_text(encoding="utf-8")
+    if payload and all(row.get('game_asset') for row in payload):
+        template = template.replace('value="65" step="1"><output id="surface-value">65%',
+                                    'value="100" step="1"><output id="surface-value">100%')
+        template = template.replace('<nav id="materials"', '<a class="badge" href="Material-Lab.html">Back to Material Lab</a>\n<nav id="materials"')
+        template = template.replace('<option value="roughness">Roughness only</option>', '')
+        template = template.replace('The original colour, surface and roughness maps.',
+                                    'The original colour and normal maps from Rome II.')
+        if payload[0].get('broad_relief'):
+            template = template.replace('id="distance" type="range" min="0" max="6" value="0"',
+                                        'id="distance" type="range" min="0" max="6" value="3"')
     encoded = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c")
     Path(output).write_text(template.replace("__MATERIAL_DATA__", encoded), encoding="utf-8")

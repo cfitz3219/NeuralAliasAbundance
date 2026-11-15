@@ -65,7 +65,9 @@ inline const char* Qualified(const Map& map, bool allow_larger = false)
         default: return "the game reads this colour texture without sRGB decoding";
         }
     case Role::Normal: // BC5 holds X and Y only; right only where the game's texture is BC5 too
-        return s.view_format == 83 ? nullptr : "the game's normal texture is not two-channel BC5";
+        if (s.view_format == 84 && map.dxgi_format == 84 && map.encoding == "tangent_xy_snorm_positive_z") return nullptr;
+        if (s.view_format == 83 && map.dxgi_format == 83 && map.encoding == "tangent_xy_unorm_positive_z") return nullptr;
+        return "the normal map's signed encoding does not match the game's BC5 view";
     case Role::Roughness: // BC4 holds one channel
         return s.view_format == 80 ? nullptr : "the game's roughness texture is not one-channel BC4";
     default: return "packed maps are not loadable in v1";

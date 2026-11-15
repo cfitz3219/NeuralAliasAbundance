@@ -19,7 +19,10 @@ const data = embedded==='__MATERIAL_DATA__'?example:JSON.parse(embedded);
 const script = [...template.matchAll(/<script>(.*?)<\/script>/sg)][0][1];
 function fakeGL(){
   let texture;
+  const uniforms={};
   return new Proxy({
+    uniforms,getUniformLocation:(_program,name)=>name,
+    uniform1f:(name,value)=>{uniforms[name]=value;},
     createTexture:()=>({images:[]}),bindTexture:(_target,value)=>{texture=value;},
     texImage2D:(...args)=>texture.images.push(args.at(-1).src),
     getShaderParameter:()=>true,getProgramParameter:()=>true,
@@ -34,16 +37,19 @@ const get=id=>{if(!elements.has(id))elements.set(id,element(id));return elements
 get('data').textContent=JSON.stringify(data);
 get('compare').value='all';get('angle').value='-18';get('distance').value='2.3';
 get('animate').checked=false;
+get('surface-strength').value='65';
+get('texture-zoom').value='2';
 const document = {getElementById:get,createElement:element,body:element('body'),
   querySelectorAll:()=>get('materials').children};
 class Image {set src(value){this._src=value;queueMicrotask(()=>this.onload());}get src(){return this._src;}}
 const context=vm.createContext({document,Image,requestAnimationFrame(){},console,devicePixelRatio:1});
-vm.runInContext(script+'\nglobalThis.inspect=()=>({states,current,lightTime});globalThis.select=show;',context);
+vm.runInContext(script+'\nglobalThis.inspect=()=>({states,current,lightTime});globalThis.select=show;globalThis.drawFrame=frame;',context);
 async function main(){
   // Finish initial asynchronous texture uploads.
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(document.body.dataset.state,'ready',get('error').textContent);
-  assert.equal(get('baseline-choice').options.length,5);
+  const count=Object.keys(data[0].comparisons).length;
+  assert.equal(get('baseline-choice').options.length,count);
   const initial=context.inspect();
   const original=initial.states.original.bound.base_color;
   const normals=initial.states.baseline.bound.normal;
@@ -61,7 +67,34 @@ async function main(){
     assert.equal(get('distance').value,'2.3');
     assert.equal(get('middle-title').textContent,data[0].comparisons[key].label);
   }
-  assert.equal(textures.size,5);
+  assert.equal(textures.size,count);
+  if(data[0].combined){
+    assert.equal(count,1);
+    assert.equal(get('right-title').textContent,data[0].broad_relief?'Stronger terrain relief':'Combined result');
+    assert.equal(get('ai-control').hidden,true);
+    const state=context.inspect();
+    assert.equal(state.states.coordinated.bound.base_color.images[0],state.states.baseline.bound.base_color.images[0]);
+    assert.equal(state.states.coordinated.bound.authored_normal.images[0],state.states.baseline.bound.normal.images[0]);
+    get('animate').checked=true;
+    get('surface-strength').value='0';get('surface-strength').oninput();
+    assert.equal(get('animate').checked,false);
+    context.drawFrame(0);
+    assert.equal(state.states.coordinated.gl.uniforms.surfaceStrength,0);
+    assert.equal(state.states.baseline.gl.uniforms.surfaceStrength,1);
+    assert.equal(get('surface-value').textContent,'0%');
+    get('surface-strength').value='100';context.drawFrame(0);
+    assert.equal(state.states.coordinated.gl.uniforms.surfaceStrength,1);
+    assert.equal(state.states.coordinated.gl.uniforms.textureZoom,2);
+    assert.equal(state.states.baseline.gl.uniforms.textureZoom,2);
+    assert.equal(state.states.original.gl.uniforms.textureZoom,2);
+    // A surface control must not silently operate while its maps are hidden.
+    get('compare').value='color';await get('compare').onchange();
+    assert.equal(state.states.coordinated.bound.normal.images[0],data[0].original.maps.normal[0]);
+    get('surface-strength').value='75';await get('surface-strength').oninput();
+    assert.equal(get('compare').value,'all');
+    assert.equal(state.states.coordinated.bound.normal.images[0],data[0].coordinated.maps.normal[0]);
+    assert.equal(state.states.coordinated.bound.roughness.images[0],data[0].coordinated.maps.roughness[0]);
+  }
   const selected=get('baseline-choice').value;
   await context.select(1);
   assert.equal(get('baseline-choice').value,selected);
@@ -69,6 +102,6 @@ async function main(){
   get('compare').value='normal';await get('compare').onchange();
   assert.match(get('middle-caption').textContent,/Colour models are hidden/);
   assert.equal(context.inspect().states.baseline.bound.base_color.images[0],data[1].original.maps.base_color[0]);
-  console.log('PASS: five actual model selections, original/normal preservation, camera/light preservation, material switch and isolated views');
+  console.log('PASS: '+count+' model selections; original/normal and camera/light preservation; material/isolation views; combined controls where present');
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

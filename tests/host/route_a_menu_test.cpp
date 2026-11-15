@@ -21,7 +21,7 @@ int main() {
     CHECK(na::mode::BuildSavedRequest(0,13,3440,1440,saved) && saved.render_w==3440 && saved.render_h==1440);
     CHECK(!na::mode::BuildSavedRequest(99,13,3440,1440,saved));
     auto& st=na::settings::Get();
-    CHECK(!st.donut_tone && !st.donut_bloom && !st.xegtao_enabled);
+    CHECK(!st.donut_tone && !st.donut_bloom && !st.xegtao_enabled && !st.material_enhancement);
     st.motion_enabled=0; st.nr_paper_white=200; st.dlss_mode=4; st.fg_preset=3;
     auto ms=na::motion::GetStats();
     std::printf("motion requested=0 observed=%u\n",ms.enabled);
@@ -38,11 +38,11 @@ int main() {
     int experimental=0;
     for(int i=0;i<na::menu::Count();++i){
         const auto* section=na::menu::At(i);
-        if(!strcmp(section->title,"XeGTAO (Ambient Occlusion)") || !strcmp(section->title,"Lighting")){
+        if(!strcmp(section->title,"XeGTAO (Ambient Occlusion)") || !strcmp(section->title,"Lighting") || !strcmp(section->title,"Material enhancement")){
             CHECK(na::menu::ResolvePage(*section)==(!strcmp(section->title,"XeGTAO (Ambient Occlusion)")?na::menu::Page::Enhancements:na::menu::Page::Experimental));++experimental;
         }
     }
-    CHECK(experimental==2);
+    CHECK(experimental==3);
     // Draw the real DLAA enhancements too, including the large automatic total.
     na::j2::SetEnabled(true);na::observe::SetSamplerMipBiasLive(-1.f);
     for(auto page:na::menu::kPages) {
@@ -56,9 +56,17 @@ int main() {
     na::menu::Clear();na::overlay::RegisterLiveDlaaMenu();int effects=0;
     for(int i=0;i<na::menu::Count();++i){const auto* section=na::menu::At(i);
         if(!strcmp(section->title,"XeGTAO (Ambient Occlusion)")){CHECK(section->page==na::menu::Page::Enhancements);++effects;}
-        if(!strcmp(section->title,"Lighting")||!strcmp(section->title,"GPU infrastructure")){CHECK(section->page==na::menu::Page::Experimental);++effects;}
+        if(!strcmp(section->title,"Lighting")||!strcmp(section->title,"GPU infrastructure")||!strcmp(section->title,"Material enhancement")){CHECK(section->page==na::menu::Page::Experimental);++effects;}
     }
-    CHECK(effects==3);
+    CHECK(effects==4);
+    ImGui::NewFrame();ImGui::SetNextWindowSize({1400,800});ImGui::Begin("Native DLAA");
+    na::menu::DrawPage(na::menu::Page::Experimental,true);
+    ImGui::End();ImGui::Render();
+    CHECK(ImGui::GetDrawData()->TotalVtxCount>0);
+    na::overlay::RegisterRouteAMenu();na::overlay::RegisterLiveDlaaMenu();
+    int materials=0;
+    for(int i=0;i<na::menu::Count();++i) if(!strcmp(na::menu::At(i)->title,"Material enhancement")) ++materials;
+    CHECK(materials==1);
     na::j2::SetEnabled(false);na::observe::SetProcessExiting();
     ImGui::DestroyContext();
     return test::finish("route_a_menu_test");

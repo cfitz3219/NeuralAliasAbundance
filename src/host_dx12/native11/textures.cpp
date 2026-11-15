@@ -8,8 +8,10 @@
 #include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/texture_policy.hpp"
 #include "materials/texture_subresources_v1.hpp"
+#include "materials/shader_texture_use.hpp"
 
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -31,7 +33,7 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-enum : uint32_t { kCreateTexture2D = 5, kCreateShaderResourceView = 7 }; // ID3D11Device
+enum : uint32_t { kCreateTexture2D = 5, kCreateShaderResourceView = 7, kCreatePixelShader = 15 }; // ID3D11Device
 enum : uint32_t { kPSGetShaderResources = 73 };    // ID3D11DeviceContext
 constexpr unsigned kSlots = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
 constexpr uint64_t kCensusEvery = 16;   // frames; binds are counted on one frame in this many
@@ -53,6 +55,29 @@ using PFN_CreateTex2D = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_T
                                                     ID3D11Texture2D**);
 PFN_CreateSrv g_create = nullptr;
 PFN_CreateTex2D g_create_texture = nullptr;
+using PFN_CreatePs = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
+PFN_CreatePs g_create_ps = nullptr;
+const GUID kShaderUseGuid = {0xb5db2c27,0x2ecb,0x4868,{0xa3,0x60,0x3c,0xed,0xa2,0x19,0xc4,0x5e}};
+struct ShaderUseBits { uint64_t safe[2] = {}, reads[2] = {}; uint32_t known = 0; };
+
+HRESULT STDMETHODCALLTYPE CreatePixelShader_d(ID3D11Device* dev, const void* bytes, SIZE_T size,
+                                               ID3D11ClassLinkage* linkage, ID3D11PixelShader** out)
+{
+    const HRESULT hr = g_create_ps(dev,bytes,size,linkage,out);
+    if (FAILED(hr) || !out || !*out || IsOwnWork()) return hr;
+    ComPtr<ID3DBlob> listing;
+    ShaderUseBits bits;
+    if (SUCCEEDED(D3DDisassemble(bytes,size,D3D_DISASM_DISABLE_DEBUG_INFO,nullptr,&listing))) {
+        const auto use = na::materials::ReadShaderTextureUse(std::string_view(
+            static_cast<const char*>(listing->GetBufferPointer()), listing->GetBufferSize()));
+        for (unsigned i=0;i<128;++i) if (use.SafeForLarger(i)) bits.safe[i/64] |= uint64_t{1} << (i%64);
+        bits.known=use.known ? 1u : 0u;
+        if(use.known) for (unsigned i=0;i<128;++i)
+            if(use.sampled_plainly[i] || use.read_otherwise[i]) bits.reads[i/64] |= uint64_t{1} << (i%64);
+    }
+    (*out)->SetPrivateData(kShaderUseGuid,sizeof(bits),&bits);
+    return hr;
+}
 PFN_GetSrvs g_get[2] = {}; // [0] immediate class, [1] deferred class
 
 struct Entry {
@@ -64,6 +89,10 @@ struct Entry {
     ComPtr<ID3D11ShaderResourceView> replacement, pending; // under State::mu
     uint64_t bytes = 0, pending_bytes = 0;
     bool pending_set = false; // a publish or a removal waits for the next Present
+    bool larger = false, pending_larger = false;
+    bool invalid = false; // source written after identification; original wins immediately
+    bool late_read = false; // exact prepared shape, but no creation bytes
+    std::atomic<bool> late_taken{false};
     std::atomic<bool> dump_taken{false}; // noted for the running source dump
 };
 
@@ -87,6 +116,7 @@ std::atomic<uint64_t> g_serial{1}, g_generation{1}, g_frame{0};
 std::atomic<uint64_t> g_views{0}, g_candidates{0}, g_retired{0}, g_overflow{0};
 std::atomic<uint64_t> g_replaced{0}, g_replaced_bytes{0}, g_pending{0};
 std::atomic<uint64_t> g_swapped{0}, g_swapped_deferred{0}, g_returned{0};
+std::atomic<uint64_t> g_read_draws{0}, g_unread_draws{0}, g_unknown_draws{0}, g_read_draws_deferred{0};
 std::atomic<uint64_t> g_verdicts[static_cast<size_t>(TextureVerdict::kCount)]{};
 uint64_t g_census_next_ms = 0; // Present thread only
 
@@ -133,6 +163,14 @@ Dump& D()
 }
 std::atomic<int> g_dump_phase{0}; // 0 idle, 1 noting binds, 2 reading and writing
 std::atomic<uint64_t> g_dump_written{0}, g_dump_failed{0};
+
+struct LateSources {
+    std::mutex mu;
+    std::deque<DumpItem> queue;
+    uint64_t bytes=0; // queue plus the one staging copy, at most 64 MiB
+    std::unique_ptr<DumpRead> read; // Present thread only
+};
+LateSources& Late() { static auto* state=new LateSources;return *state; }
 
 // {3f9c2d71-8a54-4b0e-b6c3-5e1a9d7f2c48}: a view's entry, by the lifetime of its private data.
 const GUID kLifeGuid = {0x3f9c2d71, 0x8a54, 0x4b0e, {0xb6, 0xc3, 0x5e, 0x1a, 0x9d, 0x7f, 0x2c, 0x48}};
@@ -260,7 +298,7 @@ HRESULT STDMETHODCALLTYPE CreateShaderResourceView_d(ID3D11Device* dev, ID3D11Re
     Life* life = new Life(view, e->serial);
     view->SetPrivateDataInterface(kLifeGuid, life); // the view now holds the only lasting reference
     life->Release();
-    if (e->verdict == TextureVerdict::Candidate) MaterialsOnViewCreated(r, view, e->serial, e->facts);
+    if (e->verdict == TextureVerdict::Candidate) e->late_read=MaterialsOnViewCreated(r, view, e->serial, e->facts);
     return hr;
 }
 
@@ -560,6 +598,42 @@ int FinishRead(DumpRead& read, DumpJob& job)
     return 1;
 }
 
+// Same source bytes and nonblocking readback as the user capture, but only for
+// exact prepared shapes seen bound in a scene. No files, no model, one copy at a time.
+void LateSourcesOnPresent(uint64_t frame)
+{
+    auto& late=Late();
+    if(late.read) {
+        DumpJob job=JobOf(late.read->item);
+        const int ready=FinishRead(*late.read,job);
+        if(!ready && frame-late.read->since_frame<=kDumpReadFrames) return;
+        if(ready==1) {
+            ComPtr<ID3D11Resource> source;late.read->item.view->GetResource(&source);
+            MaterialsFinishLateRead(source.Get(),std::move(job.body));
+        } else na::eventlog::Emit("native11_materials","late source read skipped why=\"%s\"",job.why?job.why:"GPU copy not ready within bounded frames");
+        {
+            const auto& f=late.read->item.entry->facts;
+            std::lock_guard<std::mutex> lock(late.mu);
+            late.bytes-=ChainBytes(f.width,f.height,f.mips,f.view_format);
+        }
+        late.read.reset(); // release outside locks
+    }
+    std::unique_ptr<DumpRead> read;
+    {
+        std::lock_guard<std::mutex> lock(late.mu);
+        if(late.queue.empty()) return;
+        read=std::make_unique<DumpRead>();
+        read->item=std::move(late.queue.front());late.queue.pop_front();
+    }
+    ComPtr<ID3D11Resource> source;read->item.view->GetResource(&source);
+    const char* why=MaterialsBeginLateRead(source.Get())?StartRead(*read,frame):"already identified or modified";
+    if(why) {
+        const auto& f=read->item.entry->facts;
+        std::lock_guard<std::mutex> lock(late.mu);
+        late.bytes-=ChainBytes(f.width,f.height,f.mips,f.view_format);
+    } else late.read=std::move(read);
+}
+
 // Present thread. Phase 1 ends after its frames (or when enough is noted): the most used within the
 // budget are kept. Phase 2 has one staging copy in flight: it is queued on one Present and read on a
 // later one with DO_NOT_WAIT, so the GPU is never waited for here; the bytes (memory copies only)
@@ -687,6 +761,8 @@ bool InstallTextures(void* device)
                                               reinterpret_cast<void**>(&g_create));
     ok = ok && na::hooking::PrepareVTableSlot(dev, kCreateTexture2D, reinterpret_cast<void*>(&CreateTexture2D_d),
                                               reinterpret_cast<void**>(&g_create_texture));
+    ok = ok && na::hooking::PrepareVTableSlot(dev, kCreatePixelShader, reinterpret_cast<void*>(&CreatePixelShader_d),
+                                              reinterpret_cast<void**>(&g_create_ps));
     ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kPSGetShaderResources, reinterpret_cast<void*>(&PSGetShaderResources_d),
                                               reinterpret_cast<void**>(&g_get[0]));
     if (ok && def) {
@@ -738,6 +814,14 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
             const auto it = s.entries.find(views[i]);
             if (it == s.entries.end()) continue;
             Entry& e = *it->second;
+            if(in_scene && e.late_read && !e.late_taken.load(std::memory_order_relaxed)) {
+                auto& late=Late();
+                std::lock_guard<std::mutex> lock(late.mu);
+                const auto bytes=ChainBytes(e.facts.width,e.facts.height,e.facts.mips,e.facts.view_format);
+                if(late.queue.size()<32 && late.bytes+bytes<=(64ull<<20) && !e.late_taken.exchange(true)) {
+                    late.queue.push_back({ComPtr<ID3D11ShaderResourceView>(views[i]),it->second});late.bytes+=bytes;
+                }
+            }
             if (census) {
                 e.binds.fetch_add(1, std::memory_order_relaxed);
                 if (in_scene) e.scene_binds.fetch_add(1, std::memory_order_relaxed);
@@ -753,7 +837,7 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
                 if (g_dump_phase.load(std::memory_order_relaxed) == 1 && d.queue.size() < kDumpCollectMax)
                     d.queue.push_back({ComPtr<ID3D11ShaderResourceView>(views[i]), it->second});
             }
-            if (replace && e.replacement) {
+            if (replace && !e.invalid && e.replacement && (!e.larger || shadow.larger_safe[start+i])) {
                 scratch[i] = e.replacement.Get();
                 scratch[i]->AddRef(); // held until EndTextureSwap, after the real bind has taken its own
                 ++changed;
@@ -778,6 +862,32 @@ void EndTextureSwap(unsigned count, ID3D11ShaderResourceView* const* views, ID3D
 
 uint64_t TexturePolicyKey() { return g_installed.load(std::memory_order_relaxed) ? g_generation.load(std::memory_order_relaxed) : 0; }
 
+void NoteTextureShader(PsShadow& shadow, ID3D11PixelShader* shader)
+{
+    ShaderUseBits bits;
+    UINT bytes=sizeof(bits);
+    if (!shader || FAILED(shader->GetPrivateData(kShaderUseGuid,&bytes,&bits)) || bytes!=sizeof(bits)) bits={};
+    const auto safe = std::bitset<128>(bits.safe[0]) | (std::bitset<128>(bits.safe[1]) << 64);
+    shadow.shader_reads = std::bitset<128>(bits.reads[0]) | (std::bitset<128>(bits.reads[1]) << 64);
+    shadow.shader_known = bits.known != 0;
+    if (safe != shadow.larger_safe) {
+        shadow.larger_safe=safe;
+        shadow.shader_changed=true;
+    }
+}
+
+void NoteTextureDraw(const PsShadow& shadow, bool deferred)
+{
+    if (!shadow.held) return;
+    if (!shadow.shader_known) {
+        if (!deferred) g_unknown_draws.fetch_add(1, std::memory_order_relaxed);
+    } else if ((shadow.replacement_slots & shadow.shader_reads).any()) {
+        (deferred ? g_read_draws_deferred : g_read_draws).fetch_add(1, std::memory_order_relaxed);
+    } else if (!deferred) {
+        g_unread_draws.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn original_set)
 {
     if (!c || !original_set || !g_installed.load()) return;
@@ -800,7 +910,8 @@ void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn orig
             game[i] = shadow.game[i] ? shadow.game[i] : bound[i];
             want[i] = game[i];
             const auto it = s.entries.find(game[i]);
-            if (replace && it != s.entries.end() && it->second->replacement) {
+            if (replace && it != s.entries.end() && !it->second->invalid && it->second->replacement &&
+                (!it->second->larger || shadow.larger_safe[i])) {
                 want[i] = it->second->replacement.Get();
                 want[i]->AddRef();
                 leased[i] = true;
@@ -840,6 +951,7 @@ void TexturesOnPresent()
             }
             e.replacement = std::move(e.pending);
             e.bytes = e.pending_bytes;
+            e.larger = e.pending_larger;
             e.pending_set = false;
             if (e.replacement) {
                 g_replaced.fetch_add(1, std::memory_order_relaxed);
@@ -859,6 +971,7 @@ void TexturesOnPresent()
     }
     release.clear();
     DumpOnPresent(frame);
+    LateSourcesOnPresent(frame);
     const uint64_t now = GetTickCount64();
     if (!g_census_next_ms) g_census_next_ms = now + 45000;
     if (now >= g_census_next_ms) {
@@ -887,6 +1000,7 @@ bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView
         displaced = std::move(e.pending);
         e.pending = replacement;
         e.pending_bytes = bytes;
+        e.pending_larger = false; // same-size fixture/legacy publication
         if (!e.pending_set) {
             e.pending_set = true;
             s.pending.push_back(original);
@@ -910,11 +1024,13 @@ size_t PublishTextures(const TexturePublication* items, size_t count)
             const auto it = s.entries.find(p.original);
             if (it == s.entries.end() || it->second->serial != p.serial) continue; // that view is gone
             Entry& e = *it->second;
+            if(e.invalid) continue;
             ++taken;
             if (e.replacement == p.replacement && !e.pending_set) continue; // already visible as asked
             displaced.push_back(std::move(e.pending));
             e.pending = p.replacement;
             e.pending_bytes = p.bytes;
+            e.pending_larger = p.larger;
             if (!e.pending_set) {
                 e.pending_set = true;
                 s.pending.push_back(p.original);
@@ -923,6 +1039,20 @@ size_t PublishTextures(const TexturePublication* items, size_t count)
         }
     }
     return taken;
+}
+
+void InvalidateTexture(ID3D11ShaderResourceView* original,uint64_t serial)
+{
+    State& state=S();
+    std::unique_lock<std::shared_mutex> lock(state.mu);
+    const auto it=state.entries.find(original);
+    if(it==state.entries.end() || it->second->serial!=serial) return;
+    auto& e=*it->second;
+    e.invalid=true;
+    if(e.pending) state.grave.emplace_back(g_frame.load(),std::move(e.pending));
+    e.pending_bytes=0;
+    if(!e.pending_set){e.pending_set=true;state.pending.push_back(original);++g_pending;}
+    ++g_generation; // next draw restores originals, even before the next Present
 }
 
 bool RemoveTexture(ID3D11ShaderResourceView* original)
@@ -961,6 +1091,10 @@ TextureStats GetTextureStats()
     t.swapped = g_swapped.load();
     t.swapped_deferred = g_swapped_deferred.load();
     t.returned_original = g_returned.load();
+    t.read_draws = g_read_draws.load();
+    t.unread_draws = g_unread_draws.load();
+    t.unknown_draws = g_unknown_draws.load();
+    t.read_draws_deferred = g_read_draws_deferred.load();
     t.replaced_bytes = g_replaced_bytes.load();
     t.generation = g_generation.load();
     t.installed = g_installed.load();
@@ -984,7 +1118,8 @@ int FormatTextureStatus(char* out, unsigned long n)
                          "native11_textures{installed=%d enabled=%d views=%llu candidates=%llu not{rendered_to=%llu rewritten=%llu "
                          "data_format=%llu too_small=%llu no_mips=%llu partial_view=%llu cube=%llu array=%llu multisampled=%llu "
                          "not_2d=%llu} untracked=%llu live=%llu retired=%llu replaced=%llu replaced_bytes=%llu pending=%llu "
-                         "swapped=%llu swapped_deferred=%llu returned_original=%llu generation=%llu dump{active=%d written=%llu skipped=%llu}}",
+                         "swapped=%llu swapped_deferred=%llu returned_original=%llu generation=%llu "
+                         "draw_refs{read=%llu unread=%llu unknown=%llu deferred=%llu} dump{active=%d written=%llu skipped=%llu}}",
                          t.installed ? 1 : 0, t.enabled ? 1 : 0, static_cast<unsigned long long>(t.views),
                          static_cast<unsigned long long>(t.candidates), v(TextureVerdict::RenderedTo), v(TextureVerdict::Rewritten),
                          v(TextureVerdict::DataFormat), v(TextureVerdict::TooSmall), v(TextureVerdict::NoMips),
@@ -995,6 +1130,8 @@ int FormatTextureStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(t.replaced_bytes), static_cast<unsigned long long>(t.pending),
                          static_cast<unsigned long long>(t.swapped), static_cast<unsigned long long>(t.swapped_deferred),
                          static_cast<unsigned long long>(t.returned_original), static_cast<unsigned long long>(t.generation),
+                         static_cast<unsigned long long>(t.read_draws), static_cast<unsigned long long>(t.unread_draws),
+                         static_cast<unsigned long long>(t.unknown_draws), static_cast<unsigned long long>(t.read_draws_deferred),
                          t.dump_active ? 1 : 0, static_cast<unsigned long long>(t.dump_written),
                          static_cast<unsigned long long>(t.dump_failed));
 }

@@ -47,7 +47,12 @@ def validate(folder):
         if digest(raw) != m["sha256"]:
             raise ValueError("prepared map digest mismatch")
         fmt, levels = dds.layout(raw)
-        if fmt != m["dxgi_format"] or fmt != dds.FORMATS[m["role"]][0] or levels != m["mips"]:
+        expected_fmt = dds.FORMATS[m["role"]][0]
+        if m["role"] == "normal" and m["encoding"] == "tangent_xy_snorm_positive_z":
+            expected_fmt = 84
+            if m["source"]["view_format"] != 84:
+                raise ValueError("signed normal output requires a signed source view")
+        if fmt != m["dxgi_format"] or fmt != expected_fmt or levels != m["mips"]:
             raise ValueError("prepared map layout mismatch")
         if levels[0]["width"] != m["width"] or levels[0]["height"] != m["height"]:
             raise ValueError("prepared map dimensions mismatch")

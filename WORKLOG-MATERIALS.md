@@ -185,3 +185,132 @@ Updated the EXISTING OneDrive Documents Lab and verified its HTML hash matches
 Chrome shortcut still points there. Preserved previous HTML, added six model
 contact sheets, updated Read Me and copied author notices/provenance/receipts.
 No game launch, control, deployment or runtime edits in this increment.
+
+## 2026-11-14 Pacific — PBRify plus trained surface models, original maps retained
+
+Cort chose PBRify and requested a suitable existing material model, preservation
+of original surface detail and a direct combined comparison. Claimed the offline
+lane in COMMS 427aea9, leaving runtime acquisition/association/loader with Fable.
+Selected the author's CC0 PBRify NormalV3 and RoughnessV2 SPAN models, also used by
+NVIDIA's RTX Remix reference workflow. Downloaded the official 1.7.1 release and
+verified weights/hashes; colour stays the existing preferred RPLKSRd V3. Actual
+inference on all six unchanged Lab sources completed (twelve surface estimates)
+on RTX 5070 Ti. Models/environment/predictions remain local.
+
+Implemented fine residuals over original normal/roughness, bounded slope/roughness
+additions and original-edge suppression. No procedural noise or replacement of
+the entire authored surface. Exact PBRify colour DDS is shared byte-for-byte.
+Reused original identity/cache, mip filtering, BC compression and publication.
+The author's DirectX normal orientation matches the Lab's +V tangent direction;
+no Y flip. Protection is a heuristic, not semantic recognition. Full details and
+repeatable commands are in docs/MATERIAL-LEARNED-SURFACE-20261114.md.
+
+Default page now shows Original / PBRify alone / Combined result, with a live
+surface slider starting at 65%. At 0 it directly samples original surface maps,
+not a resampled approximation, keeping the two arms identical. Old five-model
+gallery is preserved as AI-model-comparison.html with a link from the new page.
+Existing desktop shortcut and Documents entry point retained. New HTML SHA256
+7eed792a81467bc11e0298096b16e94cd29b35136f50ed76e4ad389e4234d3db.
+
+Validation: 37 Python tests PASS with actual texconv, no skips; actual-gallery
+controller and legacy five-choice controller PASS using mock DOM/GL. All 360
+embedded mip images decode. Six output colour DDS files exactly match PBRify;
+18 actual-cache reference renders at zero strength exactly match the middle arm.
+All six nonzero-strength outputs differ. Inspected linen/slate static renders:
+surface changes are restrained, not a dramatic transformation. No claimed
+superiority from tests. No interactive browser GPU render or real-game result.
+The published surface maps are 1024 square; Fable's same-size-only runtime loader
+must not accept them blindly. Its extent/format/role work remains separate.
+No game runtime, game files, game testing or installation changed.
+
+## 2026-11-14 Pacific — Surface slider visible-result correction
+
+Cort reports Surface detail does nothing; explicitly requested tracing the loss,
+preserving original material and updating the Lab. Claimed the offline lane in
+central COMMS 940b8e1, also answered Fable's partial-mip question. Retained actual
+PBRify predictions, model weights, colour output and original source files.
+Measured filtering, clipping, protection and actual GPU output independently.
+Found definite colour-only UI no-effect case; blanket edge suppression removes
+80% of painted timber's remaining normal detail and 72% of slate's; narrow band
+removes much roughness variation. Fine cloth detail minifies in a whole-tile view.
+
+Recipe v2 keeps original maps and adds wider-band learned relief at a documented
+fixed strength, with opposing-to-authored slope removed instead of all-edge
+suppression. Still bounded, no random detail, no per-material automatic gain.
+0% samples originals exactly; same colour DDS in both enhanced arms. Added shared
+detail zoom, automatic light pause and return from colour-only when adjusting
+surface strength. No other model, runtime path or game installation changes.
+
+Used actual shipped GLSL and embedded maps on RTX 5070 Ti via optional standalone
+ModernGL, not browser automation. All six cases at 1x/2x: 0% exactly matches the
+colour-only image; 65/100% yield increasing signal. Whole-tile mean pixel changes
+rise about 3–7x. Inspected actual GPU linen/timber endpoints; fabric visibly
+changes, wood remains subtler. 38 Python tests with real compression pass; actual
+gallery and legacy controller checks pass. Temporary UTF-8 helper failure caught
+before delivery, restored original UTF-8 source and regenerated successfully.
+Detailed evidence and thresholds: docs/MATERIAL-SURFACE-SLIDER-FIX-20261114.md.
+
+Updated existing Documents Lab with previous default backed up, six actual-GPU
+Slider PNGs, six updated static previews and current evidence/Read Me. New HTML
+hash c3dedca0f873a7e7110a239b830bd537c3acf804e646b7aa9655cda966982aed. No claim
+of browser UI automation, game-material quality, or in-game replacement testing.
+
+
+## 2026-11-14 Pacific — visible material detail at ordinary viewing distance
+
+Cort confirmed v2 looks good at 4x but loses its useful detail at 1x/2x and raised
+GPU cost. Claimed offline preparation in central COMMS 60400fa; Fable keeps
+runtime association/loader work. Inspected actual one-scale predictions, existing
+normal-variance mip filtering and rendered v2. The old signal was concentrated
+at fine texel scale. Do not mislabel existing filtering as absent, or equate
+nonzero pixels with a satisfying visible result.
+
+Added medium-scale inference using the SAME NormalV3/RoughnessV2 weights on
+quarter-size linear-filtered PBRify colour. Twelve small offline inferences;
+fine predictions reused exactly. Fixed-coordinate, band-limited medium detail
+joins fine detail before the existing total cap and original-direction/mask
+preservation. No source/material-colour change, new game code, new shader, new
+texture sample, or extra output allocation. Existing mip approximation remains.
+Recipe v3 immutable caches retain v1/v2. Viewer starts at whole-tile 1x.
+
+41 Python tests with real BC compression pass, actual-gallery/legacy controller
+checks pass, real RTX shader tests pass across six materials/three zooms/two
+panel sizes plus three mip boundaries. Mean 1x pixel effect at 65% is 1.8–5.0x
+v2 on 512-square panels; effect strength, not a perceptual score. Inspected wood,
+stone and cloth at 1x/4x: medium relief survives normal distance and fine texture
+remains. Exact zero and identical colour/originals/shaders/output byte budgets
+are checked. Existing enhanced surface maps still cost more than originals:
+2 MiB versus ~0.125 MiB per normal/roughness pair. This revision adds no further
+map bytes or rendering samples; actual game timing is unmeasured.
+
+Existing Documents Lab updated with old default saved as
+Material-Lab-before-distance-detail.html; previous model comparison retained.
+GPU Distance PNGs and detailed report supplied. HTML SHA256
+6dcc35ddf16382509e58033fbd938cf396b0438d4b55b966be2d1aa0e3363dfa.
+Full procedure/evidence: docs/MATERIAL-DISTANCE-DETAIL-20261114.md.
+No game deployment or browser UI automation occurred. Tiny detail must still
+filter naturally at distance; not all added medium relief is guaranteed to be
+physically correct for an arbitrary material.
+
+
+## 2026-11-14 Pacific — requested 2x fine-detail size trial
+
+Cort confirms v3 is better, asks to double fine detail size before final selection.
+Coordinated lane in COMMS dc9f4f4. Recipe v4 uses existing cached-inference path at
+half size for fine normal/roughness predictions, resampling residuals back into
+same UVs/output maps. Medium predictions remain byte-identical; gains and total
+bounds unchanged. No texture crop or camera-dependent pattern. This doubles
+model texel footprint, not every individual AI-predicted feature exactly.
+
+43 Python tests pass with actual compression, including doubled feature spacing
+and material-space alignment. Actual-gallery controller and six-material actual
+RTX slider checks pass; previous/new 1x/4x comparisons rendered, wood/cloth
+inspected. Verified identical original identity, PBRify colour bytes, medium
+prediction paths, shader source and output sizes/bytes. No game tests/deployment.
+
+Updated existing Lab with prior v3 backed up as
+Material-Lab-before-fine-size-2x.html and explicit 2x-trial caption. Fine-size PNGs
+show previous/current at identical light and strength. HTML hash
+8af46a7475118afaaa37063d224461013bbeb28d050f2f00b574663869684d7e.
+Fable's separate WWII capture handoff noted; signed BC5 and non-sRGB colour
+qualification are not silently widened as part of this visual size trial.

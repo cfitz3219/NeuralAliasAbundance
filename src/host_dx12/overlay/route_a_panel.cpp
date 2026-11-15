@@ -1,4 +1,6 @@
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/textures.hpp"
+#include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
@@ -1386,15 +1388,11 @@ void DrawDlssDebug()
 static void DrawExperimentalGpu();
 static void DrawDonutLighting();
 static void DrawAmbientOcclusion();
+static void DrawMaterialEnhancement();
 
-void RegisterLiveDlaaMenu()
+static void RegisterSharedEnhancementMenu()
 {
-    na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
-    na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
-    na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
-    // XeGTAO and Lighting run inside live DLAA too, but their rows were only registered with
-    // the Route A menu, so a live-DLAA-only game (Sniper Elite 5, Cort 2026-11-05) never showed
-    // them. Register them here unless the Route A menu already did.
+    // Shared effects have one registration path, including native DX11 DLAA.
     const auto registered = [](void (*draw)()) {
         for (int i = 0; i < na::menu::Count(); ++i)
             if (const na::menu::Section* s = na::menu::At(i); s && s->draw == draw) return true;
@@ -1406,6 +1404,16 @@ void RegisterLiveDlaaMenu()
         na::menu::Register({"Lighting", na::menu::Availability::Available, nullptr, &DrawDonutLighting, na::menu::Page::Experimental});
     if (!registered(&DrawExperimentalGpu))
         na::menu::Register({"GPU infrastructure", na::menu::Availability::Available, nullptr, &DrawExperimentalGpu, na::menu::Page::Experimental});
+    if (!registered(&DrawMaterialEnhancement))
+        na::menu::Register({"Material enhancement", na::menu::Availability::Available, nullptr, &DrawMaterialEnhancement, na::menu::Page::Experimental});
+}
+
+void RegisterLiveDlaaMenu()
+{
+    na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+    na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
+    na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
+    RegisterSharedEnhancementMenu();
 }
 
 static void DrawExperimentalGpu()
@@ -1499,6 +1507,35 @@ static void DrawAmbientOcclusion()
     ImGui::EndPopup();
 }
 
+static void DrawMaterialEnhancement()
+{
+    using namespace na::ui;
+    auto& setting=na::settings::Get().material_enhancement;
+    bool on=setting.load()!=0;
+    BeginRow("Material enhancement", "Prepared texture detail and surface relief. Original game materials return when switched off.", S(90));
+    if(ImGui::Checkbox("##material_enhancement",&on)) {
+        setting.store(on?1u:0u);
+        na::native11::SetTexturesEnabled(on);
+        na::settings::Save();
+    }
+    EndRow();
+    const auto m=na::native11::GetMaterialStats();
+    const auto t=na::native11::GetTextureStats();
+    if(!m.entries) { Hint("No prepared material pack is installed for this route.");return; }
+    char line[256];
+    std::snprintf(line,sizeof(line),"%llu material sets prepared; %llu loaded. Only matching materials can change.",
+        static_cast<unsigned long long>(m.entries),static_cast<unsigned long long>(m.entries_shown));
+    Hint(line);
+    std::snprintf(line,sizeof(line),"Shaders referenced replacements in %llu draws. This does not measure visible improvement.",
+        static_cast<unsigned long long>(t.read_draws));
+    Hint(line);
+    if(!on) Hint("Off. The game uses its original materials.");
+    else if(m.maps_failed || m.unreadable_entries || m.refused_maps) Hint("Some prepared maps could not be used. Details are saved in the results log.");
+    else if(!m.entries_shown) Hint("Waiting for the matching surfaces to load in the game.");
+    else Hint("Prepared surfaces are available. Compare on the matching terrain; other materials remain original.");
+    Hint("This test keeps the approved 2x fine-detail size and 65% surface strength. The game's packed gloss maps are preserved.");
+}
+
 void RegisterRouteAMenu()
 {
     using na::menu::Availability;
@@ -1514,9 +1551,7 @@ void RegisterRouteAMenu()
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
-    na::menu::Register({"XeGTAO (Ambient Occlusion)", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
-    na::menu::Register({"GPU infrastructure", Availability::Available, nullptr, &DrawExperimentalGpu, Page::Experimental});
-    na::menu::Register({"Lighting", Availability::Available, nullptr, &DrawDonutLighting, Page::Experimental});
+    RegisterSharedEnhancementMenu();
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});

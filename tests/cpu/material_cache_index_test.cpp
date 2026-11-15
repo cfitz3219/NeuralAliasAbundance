@@ -12,6 +12,9 @@ Map MakeMap(Role role, const std::string& digest, uint32_t resource_format, uint
     Map m;
     m.id = role == Role::BaseColor ? "base_color" : role == Role::Normal ? "normal" : "roughness";
     m.role = role;
+    uint32_t block = 0;
+    m.dxgi_format = FormatOf(role, block);
+    m.encoding = role == Role::Normal ? "tangent_xy_unorm_positive_z" : role == Role::BaseColor ? "srgb" : "perceptual_roughness";
     m.width = m.height = side;
     for (uint32_t s = side, level = 0; s; s /= 2, ++level) {
         Mip mip;
@@ -58,7 +61,14 @@ int main()
             CHECK(Qualified(MakeMap(Role::BaseColor, kA, 70, 72)) == nullptr);
             CHECK(Qualified(MakeMap(Role::BaseColor, kA, 27, 29)) == nullptr);
             CHECK(std::string(Qualified(MakeMap(Role::BaseColor, kA, 70, 71))) == "the game reads this colour texture without sRGB decoding");
-            CHECK(std::string(Qualified(MakeMap(Role::Normal, kA, 76, 77))) == "the game's normal texture is not two-channel BC5");
+            CHECK(Qualified(MakeMap(Role::Normal, kA, 76, 77)) != nullptr);
+            Map signed_normal = MakeMap(Role::Normal,kA,84,84);
+            CHECK(Qualified(signed_normal) != nullptr);
+            signed_normal.dxgi_format = 84;
+            signed_normal.encoding = "tangent_xy_snorm_positive_z";
+            CHECK(Qualified(signed_normal) == nullptr);
+            signed_normal.source.view_format = 83;
+            CHECK(Qualified(signed_normal) != nullptr);
             CHECK(std::string(Qualified(MakeMap(Role::Roughness, kA, 27, 28))) == "the game's roughness texture is not one-channel BC4");
             Map larger = MakeMap(Role::BaseColor, kA, 70, 72, 128);
             larger.source.width = larger.source.height = 64;

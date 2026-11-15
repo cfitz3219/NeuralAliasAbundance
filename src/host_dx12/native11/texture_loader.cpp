@@ -52,6 +52,9 @@ struct Note : IUnknown { // not final: WRL's ComPtr derives from its target for 
     TextureShape shape;
     uint64_t index_generation = 0;
     bool done = false;                                       // digests are final
+    bool started = false, invalid = false;
+    std::vector<uint32_t> wanted;
+    std::vector<WaitingView> observed; // addresses + lifetime serials only
     std::vector<std::pair<uint32_t, std::string>> digests;   // view format -> digest
     std::vector<WaitingView> waiting;                        // views created before the digest was known
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override
@@ -78,6 +81,7 @@ struct MapState {
     ComPtr<ID3D11ShaderResourceView> replacement; // created by the loader's thread
     uint64_t bytes = 0;
     bool requested = false, failed = false;
+    bool larger = false;
     std::vector<WaitingView> views; // matched game views not yet published
 };
 struct EntryState {
@@ -167,7 +171,7 @@ void Matched(Loader& l, ID3D11Device* device, const CacheIndex::Hit& hit, const 
     g_matched.fetch_add(1, std::memory_order_relaxed);
     if (e.refused || m.failed) return;
     if (e.shown) { // the unit is already visible: this view joins it
-        publish.push_back({view.view, view.serial, m.replacement.Get(), m.bytes});
+        publish.push_back({view.view, view.serial, m.replacement.Get(), m.bytes, m.larger});
         return;
     }
     m.views.push_back(view);
@@ -221,7 +225,7 @@ void ShowIfComplete(Loader& l, size_t record, std::vector<TexturePublication>& p
     for (const MapState& m : e.maps) ready += (m.replacement && !m.views.empty()) ? 1u : 0u;
     if (ready < e.needed) return;
     for (MapState& m : e.maps) {
-        for (const WaitingView& v : m.views) publish.push_back({v.view, v.serial, m.replacement.Get(), m.bytes});
+        for (const WaitingView& v : m.views) publish.push_back({v.view, v.serial, m.replacement.Get(), m.bytes, m.larger});
         m.views.clear();
     }
     e.shown = true;
@@ -261,6 +265,7 @@ void Digest(Job& job)
     std::vector<WaitingView> waiting;
     {
         std::lock_guard<std::mutex> g(job.note->mu);
+        if (job.note->invalid) return;
         job.note->digests = digests;
         job.note->done = true;
         waiting.swap(job.note->waiting);
@@ -335,6 +340,7 @@ void Load(Job& job)
         } else if (view) {
             m.replacement = view;
             m.bytes = file_bytes;
+            m.larger = na::materials::LargerLog2(map) > 0;
             g_loaded.fetch_add(1, std::memory_order_relaxed);
             ShowIfComplete(l, job.record, publish);
         } else {
@@ -393,7 +399,7 @@ size_t LoadMaterialCache(const wchar_t* dir)
         root = std::wstring(local) + L"\\NeuralAlias\\materials";
     }
     const uint64_t began = GetTickCount64();
-    auto index = std::make_shared<CacheIndex>();
+    auto index = std::make_shared<CacheIndex>(true); // texture binds qualify larger maps per pixel shader
     std::vector<std::wstring> folders;
     uint64_t unreadable = 0;
     WIN32_FIND_DATAW found{};
@@ -477,6 +483,12 @@ void MaterialsOnTextureCreated(ID3D11Device* device, const D3D11_TEXTURE2D_DESC&
         generation = l.generation;
     }
     if (wanted.empty()) return; // nearly every texture ends here
+    ComPtr<Note> note;
+    note.Attach(new Note);
+    note->shape = shape;
+    note->index_generation = generation;
+    note->wanted = wanted;
+    texture->SetPrivateDataInterface(kNoteGuid, note.Get());
     if (!initial) {
         g_no_data.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -513,30 +525,29 @@ void MaterialsOnTextureCreated(ID3D11Device* device, const D3D11_TEXTURE2D_DESC&
             job.body.insert(job.body.end(), p, p + row);
         }
     }
-    Note* note = new Note;
-    note->shape = shape;
-    note->index_generation = generation;
-    texture->SetPrivateDataInterface(kNoteGuid, note); // the texture and the job each hold it
-    job.note.Attach(note);
+    note->started = true;
+    job.note = note;
     g_backlog_bytes.fetch_add(job.body.size(), std::memory_order_relaxed);
     Post(std::move(job));
 }
 
-void MaterialsOnViewCreated(ID3D11Resource* resource, ID3D11ShaderResourceView* view, uint64_t serial, const MaterialTextureFacts& facts)
+bool MaterialsOnViewCreated(ID3D11Resource* resource, ID3D11ShaderResourceView* view, uint64_t serial, const MaterialTextureFacts& facts)
 {
-    if (!g_active.load(std::memory_order_acquire) || !resource || !view) return;
+    if (!g_active.load(std::memory_order_acquire) || !resource || !view) return false;
     IUnknown* raw = nullptr;
     UINT size = sizeof(raw);
-    if (FAILED(resource->GetPrivateData(kNoteGuid, &size, &raw)) || !raw) return; // not a texture of a prepared shape
+    if (FAILED(resource->GetPrivateData(kNoteGuid, &size, &raw)) || !raw) return false; // not a texture of a prepared shape
     ComPtr<Note> note;
     note.Attach(static_cast<Note*>(raw));
     const WaitingView waiting{view, serial, facts.view_format};
     std::vector<std::pair<uint32_t, std::string>> digests;
     {
         std::lock_guard<std::mutex> g(note->mu);
+        if (note->invalid) return false;
+        note->observed.push_back(waiting);
         if (!note->done) {
             note->waiting.push_back(waiting); // matched by the loader's thread when the digest lands
-            return;
+            return !note->started;
         }
         digests = note->digests;
     }
@@ -547,7 +558,7 @@ void MaterialsOnViewCreated(ID3D11Resource* resource, ID3D11ShaderResourceView* 
     std::vector<TexturePublication> publish;
     {
         std::lock_guard<std::mutex> g(l.mu);
-        if (l.generation != note->index_generation || !l.index) return;
+        if (l.generation != note->index_generation || !l.index) return false;
         for (const auto& d : digests) {
             CacheIndex::Hit hit;
             if (d.first == facts.view_format && l.index->Find(d.second, note->shape, facts.view_format, hit))
@@ -556,6 +567,66 @@ void MaterialsOnViewCreated(ID3D11Resource* resource, ID3D11ShaderResourceView* 
     }
     if (!publish.empty()) PublishTextures(publish.data(), publish.size());
     for (Job& j : load) Post(std::move(j));
+    return false;
+}
+
+static ComPtr<Note> NoteOf(ID3D11Resource* resource)
+{
+    ComPtr<Note> note;
+    IUnknown* raw=nullptr;UINT size=sizeof(raw);
+    if(resource && SUCCEEDED(resource->GetPrivateData(kNoteGuid,&size,&raw)) && raw)
+        note.Attach(static_cast<Note*>(raw));
+    return note;
+}
+
+bool MaterialsBeginLateRead(ID3D11Resource* resource)
+{
+    auto note=NoteOf(resource);
+    if(!note) return false;
+    std::lock_guard<std::mutex> lock(note->mu);
+    if(note->started || note->invalid) return false;
+    note->started=true;
+    return true;
+}
+
+void MaterialsFinishLateRead(ID3D11Resource* resource,std::vector<uint8_t>&& bytes)
+{
+    auto note=NoteOf(resource);
+    if(!note) return;
+    Job job;
+    {
+        std::lock_guard<std::mutex> lock(note->mu);
+        if(note->invalid || note->done || !note->started || note->wanted.empty()) return;
+        job.note=note;job.index_generation=note->index_generation;
+        job.resource_format=note->shape.resource_format;
+        job.width=note->shape.width;job.height=note->shape.height;job.mips=note->shape.mip_count;
+        job.view_formats=note->wanted;
+    }
+    if(!na::materials::TexSubLayout(job.view_formats[0],job.block,job.texel) ||
+       bytes.size()!=ChainBytes(job.width,job.height,job.mips,job.view_formats[0])) return;
+    if(g_backlog_bytes.load()+bytes.size()>kHashBacklogBytes){++g_backlog_skipped;return;}
+    resource->GetDevice(&job.device);
+    job.body=std::move(bytes);
+    g_backlog_bytes.fetch_add(job.body.size());
+    Post(std::move(job));
+}
+
+void MaterialsOnResourceWritten(ID3D11Resource* resource)
+{
+    if(!g_active.load(std::memory_order_acquire) || !resource) return;
+    D3D11_RESOURCE_DIMENSION kind{};resource->GetType(&kind);
+    if(kind!=D3D11_RESOURCE_DIMENSION_TEXTURE2D) return;
+    auto note=NoteOf(resource);
+    if(!note) return;
+    std::vector<WaitingView> views;
+    {
+        std::lock_guard<std::mutex> lock(note->mu);
+        // Ordinary uploads before the first sampled capture are allowed.
+        // A source modified after identification is no longer that material.
+        if(!note->started || note->invalid) return;
+        note->invalid=true;views=note->observed;
+    }
+    for(const auto& v:views) InvalidateTexture(v.view,v.serial);
 }
 
 MaterialStats GetMaterialStats()

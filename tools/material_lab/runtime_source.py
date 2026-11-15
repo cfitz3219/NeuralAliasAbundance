@@ -129,9 +129,14 @@ def load_capture(path):
     return source, levels[0][2]
 
 
-def decode(source, raw):
+def decode(source, raw, texconv=None):
     w, h = (max(1, source[k] >> source["first_mip"]) for k in ("width", "height"))
     fmt = source["view_format"]
+    if fmt == 84:
+        if texconv is None:
+            raise ValueError("signed BC5 decoding requires the DirectXTex offline converter")
+        xy = dds.decode_signed_bc5(raw, w, h, texconv)
+        return np.dstack((xy, np.zeros((h, w)), np.ones((h, w))))
     if fmt in (28, 29, 87, 88, 91, 93):
         pixels = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4).copy()
         if fmt in (87, 88, 91, 93):
@@ -143,7 +148,10 @@ def decode(source, raw):
         return np.asarray(Image.frombytes("L", (w, h), raw).convert("RGBA"), dtype=float)/255
     if fmt not in (71, 72, 74, 75, 77, 78, 80, 83, 98, 99):
         raise ValueError("source identity supported, but this decoder/packing is not qualified")
-    image = Image.open(io.BytesIO(dds.header(w, h, 1, fmt, len(raw))+raw))
+    # Decode storage values. Pillow does not implement every sRGB DXGI alias;
+    # transfer-function conversion is performed explicitly by read_material.
+    storage_fmt = {72: 71, 75: 74, 78: 77, 99: 98}.get(fmt, fmt)
+    image = Image.open(io.BytesIO(dds.header(w, h, 1, storage_fmt, len(raw))+raw))
     return np.asarray(image.convert("RGBA"), dtype=float)/255
 
 
