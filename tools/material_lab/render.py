@@ -139,3 +139,28 @@ def previews(cases, output, size=384):
         draw.text((24, size*2+244), "Procedural candidate / synthetic source / no in-game result claimed",
                   font=font(14), fill="#a8b9c1")
         sheet.save(output/f"Preview-{case['name']}.png")
+
+
+def model_previews(cases, output, size=384):
+    """Fixed-camera, fixed-light reference sheets for the model selector."""
+    for case in cases:
+        if not case.get("models"):
+            continue
+        original = maps(case["original"], None)
+        entries = [("Original", case["original"])]
+        entries += [(item["label"], item["entry"]) for item in case["models"].values()]
+        entries += [(label, case[key]) for key, label in
+                    (("baseline", "Real-ESRGAN"), ("conventional", "Lanczos - no AI")) if case.get(key)]
+        rows = (len(entries)+2)//3
+        sheet = Image.new("RGB", (size*3+64, rows*(size+54)+146), "#11171b")
+        draw = ImageDraw.Draw(sheet)
+        draw.text((24,16), "NeuralAlias | AI model comparisons", font=font(26), fill="#8dd8bc")
+        draw.text((24,54), case["name"].replace("_"," ").title(), font=font(22), fill="#edf3f4")
+        draw.text((24,86), "Same light, camera, original normals and roughness. Only the colour map changes.",
+                  font=font(16), fill="#a8b9c1")
+        for i, (label, entry) in enumerate(entries):
+            x, y = 16+(i%3)*(size+16), 122+(i//3)*(size+54)
+            material = {**original, "base_color": maps(entry,None)["base_color"]}
+            draw.text((x,y), label, font=font(16), fill="#edf3f4")
+            sheet.paste(render(material,size,light_phase=1.35), (x,y+28))
+        sheet.save(Path(output)/f"Models-{case['name']}.png")

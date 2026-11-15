@@ -126,3 +126,63 @@ footprint; a 1024-pixel colour map does not force 256-pixel normals to mip 2.
 For raw runtime-source preparation, see [the shared capture contract](../../docs/MATERIAL-SOURCE-CAPTURE-V1.md).
 The same `prepare` command accepts explicit `runtime_maps` in `source.json`,
 reusing Fable's source digest and retaining the original view/mip identity.
+
+## Multiple AI models in the same Lab
+
+The **AI model** selector changes only the middle panel. Original (left) and
+coordinated mathematical detail (right) stay available as references. Pause
+**Move the light** for a fixed-light A/B comparison; material, view, distance and
+light phase stay unchanged when a model is selected. Use **Complete material**
+or **Colour detail only** to see colour-upscaler differences. Normal/roughness
+isolation deliberately hides colour changes. Every AI comparison retains the
+original normal and roughness maps. Results are prepared once, not inferred in
+the browser or a game.
+
+Use the existing source PNGs, not newly regenerated fixtures. The optional
+PyTorch/Spandrel runner shares `material_baseline.prepare`, including source
+identity, 16-source-texel periodic padding, alpha preservation, linear-light
+mips, compression, validation and immutable cache publication:
+
+```powershell
+python -m tools.material_lab.model_runner --sources local/material-demo/sources --cache local/model-comparisons/cache --index local/model-comparisons/pbrify-v3.json --texconv local/tools/texconv.exe --weights local/model-downloads/4x-PBRify_RPLKSRd_V3.pth --model-id pbrify-v3
+```
+
+The runner uses restricted weights-only loading, float32 whole-image inference,
+and records the model SHA-256, inference-library versions, architecture and
+padding in the cache recipe. It validates output size and finite values. CUDA
+is the default; `--device cpu` is explicit. Dependencies are local preparation
+tools and never part of the game DLL. Install compatible CUDA PyTorch and
+torchvision first, then Spandrel in the same isolated environment; never run
+two package installers in that environment concurrently.
+
+The model catalogue is a JSON list, for example:
+
+```json
+[
+  {"id":"pbrify-v3","label":"PBRify · game textures","description":"PBRify RPLKSRd V3 colour upscale.","index":"pbrify-v3.json"},
+  {"id":"hat-fidelity","label":"Real-HAT · fidelity","description":"Real-HAT GAN SRx4 colour upscale.","index":"hat-fidelity.json"},
+  {"id":"hat-sharper","label":"Real-HAT · sharper","description":"Real-HAT GAN sharper colour upscale.","index":"hat-sharper.json"}
+]
+```
+
+Index paths are relative to the catalogue; cache-entry paths in each index are
+relative to that index (absolute paths also work). Every model must have every
+listed material, with matching source identity and interpretation. Legacy
+Real-ESRGAN and Lanczos comparisons remain available automatically.
+
+```powershell
+python -m tools.material_lab compare --comparison local/material-demo/comparison.json --output local/material-model-gallery --models-index local/model-comparisons/models.json
+node tools/material_lab/tests/model_selector_test.cjs local/material-model-gallery/Material-Lab.html
+```
+
+The JavaScript test runs the real selection controller with a mocked DOM/GL;
+it checks changed model images, retained original normal/roughness, fixed camera
+and lighting, material switching and isolated-map views. It is not a browser
+pixel-render test. Actual model runs have separate `.receipt.json` records.
+
+Author sources: [PBRify RPLKSRd V3](https://github.com/Kim2091/Kim2091-Models/releases/tag/4x-PBRify_RPLKSRd_V3)
+(CC0), [HAT](https://github.com/XPixelGroup/HAT) (Apache-2.0 repository;
+official weights linked by its README), and [Spandrel](https://github.com/chaiNNer-org/spandrel).
+Keep the downloaded authors' notices beside the local models. No weights are
+vendored. These six procedural examples compare behaviours; they do not select
+a universal winner for real game materials.

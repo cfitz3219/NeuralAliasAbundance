@@ -7,10 +7,10 @@
 <header><div><div class="eyebrow">NeuralAlias · Material research</div><h1>A surface, with more to see.</h1><div class="subtle">Same material. Same camera. Same light. Compare detail and how it catches the light.</div></div><span class="badge">Working prototype · synthetic examples</span></header>
 <div id="error" role="alert" hidden></div>
 <nav id="materials" aria-label="Material examples"></nav>
-<div class="controls"><label>Middle panel <select id="baseline-choice"><option value="baseline">AI upscale</option><option value="conventional">Conventional upscale</option></select></label><label><input id="animate" type="checkbox" checked> Move the light</label><label>View <input id="angle" type="range" min="-55" max="55" value="-18"></label><label>Surface <select id="surface"><option value="0">Flat tile</option><option value="1">Curved sample</option></select></label><label>Compare <select id="compare"><option value="all">Complete material</option><option value="normal">Surface bumps only</option><option value="color">Colour detail only</option><option value="roughness">Roughness only</option></select></label><label>Distance <input id="distance" type="range" min="0" max="6" value="0" step=".1"></label></div>
+<div class="controls"><label>AI model <select id="baseline-choice" aria-label="AI model comparison"></select></label><label><input id="animate" type="checkbox" checked> Move the light</label><label>View <input id="angle" type="range" min="-55" max="55" value="-18"></label><label>Surface <select id="surface"><option value="0">Flat tile</option><option value="1">Curved sample</option></select></label><label>Compare <select id="compare"><option value="all">Complete material</option><option value="normal">Surface bumps only</option><option value="color">Colour detail only</option><option value="roughness">Roughness only</option></select></label><label>Distance <input id="distance" type="range" min="0" max="6" value="0" step=".1"></label></div>
 <div class="panels"><section class="panel"><h2>Original</h2><p>The original colour, surface and roughness maps.</p><canvas id="original"></canvas><div class="legend" id="original-info"></div></section><section class="panel"><h2 id="middle-title">Colour-only control</h2><p id="middle-caption">Our new colour detail with the original bumps and roughness. Fable's AI baseline is not supplied yet.</p><canvas id="baseline"></canvas><div class="legend" id="baseline-info"></div></section><section class="panel"><h2>Coordinated detail</h2><p>One fine-detail pattern changes colour, surface bumps and roughness together.</p><canvas id="coordinated"></canvas><div class="legend" id="coordinated-info"></div></section></div>
-<div class="notes"><div><strong>Look at the surface while the light moves.</strong>The new detail should stay attached to the material. The surface-only comparison separates improved light response from extra colour contrast. Distance uses each texture's actual prepared mip chain. The AI panel changes colour detail; the coordinated panel also changes how the surface catches light.</div><div><strong id="sample-name"></strong><span id="sample-info" class="subtle"></span></div></div>
-<footer>Guided mathematical candidate, not a trained AI model. Examples are original procedural fixtures, not captured game materials. No game compatibility or performance claim. The viewer decodes the exact BC-compressed cache maps. No network connection.</footer>
+<div class="notes"><div><strong>Look at the surface while the light moves.</strong>The new detail should stay attached to the material. The surface-only comparison separates improved light response from extra colour contrast. Distance uses each texture's actual prepared mip chain. Switch AI model to compare the prepared results instantly. Uncheck Move the light to compare at exactly the same lighting. The AI panel changes colour detail; the coordinated panel also changes how the surface catches light.</div><div><strong id="sample-name"></strong><span id="sample-info" class="subtle"></span></div></div>
+<footer>The middle panel uses the selected upscale model. The right panel is a guided mathematical candidate, not a trained AI model. Examples are original procedural fixtures, not captured game materials. The viewer decodes the prepared BC-compressed maps and works offline.</footer>
 <script id="data" type="application/json">__MATERIAL_DATA__</script>
 <script>
 "use strict";
@@ -37,7 +37,7 @@ function describe(candidate){
                   'na-guided-material-detail':'Coordinated surface detail',
                   'na-original-repack':'Original material'};
     const size=candidate.dimensions.base_color;
-    return `${size[0]} × ${size[1]} colour · ${(candidate.bytes/1048576).toFixed(2)} MiB prepared maps · ${labels[candidate.algorithm]||candidate.algorithm}`;
+    return `${size[0]} × ${size[1]} colour · ${(candidate.bytes/1048576).toFixed(2)} MiB prepared maps · ${candidate.label||labels[candidate.algorithm]||candidate.model||candidate.algorithm}`;
 }
 async function show(index){
     const epoch=++generation;current=index;const row=data[index];
@@ -46,13 +46,19 @@ async function show(index){
     $('sample-info').textContent=`${row.family} · ${row.split==='held_out'?'held-out example':'development example'}`;
     document.querySelectorAll('nav button').forEach((b,i)=>b.classList.toggle('active',i===index));
     const choice=$('baseline-choice');
-    for(const option of choice.options)option.disabled=!row[option.value];
-    if(!row[choice.value])choice.value=row.baseline?'baseline':'conventional';
-    choice.disabled=!row.baseline&&!row.conventional;
-    const middle=row[choice.value]||null;
-    $('middle-title').textContent=middle?(choice.value==='baseline'?'AI colour upscale':'Conventional colour upscale'):'Colour-only control';
-    $('middle-caption').textContent=middle?'Enlarged colour texture, with the original surface bumps and roughness.':
+    const previous=choice.value;const comparisons=row.comparisons;
+    choice.replaceChildren();
+    for(const [key,item] of Object.entries(comparisons)){
+        const option=document.createElement('option');option.value=key;option.textContent=item.label;choice.appendChild(option);
+    }
+    if(comparisons[previous])choice.value=previous;
+    choice.disabled=choice.options.length===0;
+    const middle=comparisons[choice.value]||null;
+    $('middle-title').textContent=middle?middle.label:'Colour-only control';
+    $('middle-caption').textContent=middle?middle.description+' Original surface bumps and roughness are retained.':
         'Our new colour detail with the original bumps and roughness. No independent upscale supplied yet.';
+    if(middle && ['normal','roughness'].includes($('compare').value))
+        $('middle-caption').textContent='Colour models are hidden in this view. Choose Complete material or Colour detail only to compare AI results.';
     for(const id of ['original','baseline','coordinated']){
         const s=states[id];const c=id==='original'?row.original:id==='coordinated'?row.coordinated:middle;
         const selected=$('compare').value;const set={};

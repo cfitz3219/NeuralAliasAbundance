@@ -48,6 +48,28 @@ def candidate(folder):
                 maps={m["role"]: embedded_map(folder, m) for m in record["maps"]})
 
 
+def attach_models(cases, catalog_path):
+    """Resolve prepared alternatives, rejecting duplicate/missing/source-mismatched entries."""
+    catalog_path = Path(catalog_path)
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    ids = set()
+    result = [{**case, "models": {}} for case in cases]
+    for model in catalog:
+        key = model["id"]
+        if not key or key in ids or key in ("baseline", "conventional"):
+            raise ValueError("model ids must be distinct from legacy comparison names")
+        ids.add(key)
+        index_path = catalog_path.parent/model["index"]
+        entries = json.loads(index_path.read_text(encoding="utf-8"))
+        for case in result:
+            if case["name"] not in entries:
+                raise ValueError(f"model {key} has no result for {case['name']}")
+            entry = (index_path.parent/entries[case["name"]]).resolve()
+            check_baseline(cache.validate(case["original"]), cache.validate(entry))
+            case["models"][key] = dict(entry=str(entry), label=model["label"], description=model.get("description", ""))
+    return result
+
+
 def write(cases, output):
     # An optional Fable cache manifest can fill the middle panel using identical source inputs.
     payload = []
@@ -60,6 +82,16 @@ def write(cases, output):
         row["coordinated"] = candidate(case["coordinated"])
         row["baseline"] = candidate(case["baseline"]) if case.get("baseline") else None
         row["conventional"] = candidate(case["conventional"]) if case.get("conventional") else None
+        row["comparisons"] = {}
+        for key, item in case.get("models", {}).items():
+            check_baseline(cache.validate(case["original"]), cache.validate(item["entry"]))
+            row["comparisons"][key] = {**candidate(item["entry"]), "label": item["label"],
+                                        "description": item["description"]}
+        for key, label, description in (("baseline", "Real-ESRGAN · original comparison", "The general-purpose model previously shown in the Lab."),
+                                        ("conventional", "Lanczos · conventional upscale", "A conventional upscale with no AI model.")):
+            if row[key]:
+                row["comparisons"][key] = {**row[key], "label":label, "description":description}
+        del row["baseline"], row["conventional"]  # Embed each large candidate once.
         payload.append(row)
     template = Path(__file__).with_name("viewer.html.in").read_text(encoding="utf-8")
     encoded = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c")

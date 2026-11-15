@@ -20,6 +20,7 @@ def main():
     compare.add_argument("--output", type=Path, required=True)
     compare.add_argument("--baseline-index", type=Path)
     compare.add_argument("--conventional-index", type=Path)
+    compare.add_argument("--models-index", type=Path, help="List of {id,label,description,index} model comparisons")
     prepare = sub.add_parser("prepare", help="prepare a source.json + PNG material folder")
     prepare.add_argument("source", type=Path)
     prepare.add_argument("--cache", type=Path, required=True)
@@ -35,6 +36,8 @@ def main():
         print(json.dumps(dict(entry=str(p), reused=hit)))
     elif args.command == "compare":
         index = json.loads(args.comparison.read_text(encoding="utf-8"))
+        if args.models_index:
+            index = viewer.attach_models(index, args.models_index)
         for key, path in (("baseline", args.baseline_index), ("conventional", args.conventional_index)):
             if path:
                 external = json.loads(path.read_text(encoding="utf-8"))
@@ -43,6 +46,7 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
         viewer.write(index, args.output/"Material-Lab.html")
         render.previews(index, args.output)
+        render.model_previews(index, args.output)
         (args.output/"comparison.json").write_text(json.dumps(index, indent=2)+"\n", encoding="utf-8")
         print(json.dumps(dict(viewer=str((args.output/"Material-Lab.html").resolve()), materials=len(index))))
     else:
