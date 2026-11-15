@@ -52,8 +52,8 @@ class Renderer:
             tex.filter=(self.gl.LINEAR_MIPMAP_LINEAR,self.gl.LINEAR)
             tex.use(i);self.program[role].value=i;self.textures.append(tex)
 
-    def draw(self,strength,zoom=2,light=.15):
-        values=dict(time=light,yaw=-18*np.pi/180,distanceLod=0.,surfaceStrength=strength,
+    def draw(self,strength,zoom=2,light=.15,lod=0.,yaw=-18):
+        values=dict(time=light,yaw=yaw*np.pi/180,distanceLod=lod,surfaceStrength=strength,
                     curved=0,textureZoom=zoom)
         for key,value in values.items():self.program[key].value=value
         self.vao.render(self.gl.TRIANGLES)

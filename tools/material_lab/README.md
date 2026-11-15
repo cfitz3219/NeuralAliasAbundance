@@ -1,5 +1,23 @@
 # Material Lab
 
+## Normal-distance detail update (recipe v3)
+
+The current Lab bakes fine AND medium-size learned detail into the same maps.
+The same surface models also run on quarter-size, linear-filtered colour;
+material coordinates, original surface foundation, strength bounds and mip
+filtering are retained. No new runtime texture or shader pass. The viewer now
+starts at 1x. See `docs/MATERIAL-DISTANCE-DETAIL-20261114.md` for the evidence,
+cost comparison and exact limits. Earlier sections below record prior versions.
+
+Current paths: `local/learned-surface/combined-v3.json` and
+`local/combined-material-gallery-v3`. Use these with the existing prepare/compare
+commands. Test distance preservation against the previous delivered gallery:
+
+```powershell
+python -m tools.material_lab.tests.gpu_distance_check --previous local/combined-material-gallery-v2/Material-Lab.html --current local/combined-material-gallery-v3/Material-Lab.html --output local/material-models/gpu-distance-v3
+```
+
+
 ## Surface slider correction (2026-11-14 Pacific, v2)
 
 The combined candidate now uses the `learned_surface.VERSION == '2'` recipe.

@@ -9,16 +9,17 @@ import tempfile
 import time
 import numpy as np
 from . import cache, dds, render, viewer
-from .detail import Material, mip_chain, unit
+from .detail import Material, mip_chain, unit, linear, srgb, down2
 from .learned_surface import combine, SETTINGS, VERSION
 from .model_runner import ModelUpscale
 
 
-def prepare(source, colour_entry, estimates, cache_root, texconv, normal_model, rough_model):
+def prepare(source, colour_entry, estimates, cache_root, texconv, normal_model, rough_model, medium_estimates):
     source, colour_entry, cache_root, estimates = map(Path,(source,colour_entry,cache_root,estimates))
     metadata = json.loads((source/'source.json').read_text(encoding='utf-8'))
     if metadata.get('address') != 'wrap' or metadata.get('normal_convention') != 'tangent_xyz_positive_z':
-        raise ValueError('learned detail v1 requires declared periodic positive-Z tangent materials')
+        raise ValueError('learned detail requires declared periodic positive-Z tangent materials')
+    medium_estimates = Path(medium_estimates)
     original_entry, original_record, _ = cache.prepare(source,cache_root,texconv,candidate='original')
     colour_record = cache.validate(colour_entry)
     viewer.check_baseline(original_record,colour_record)
@@ -27,7 +28,9 @@ def prepare(source, colour_entry, estimates, cache_root, texconv, normal_model, 
     settings = dict(colour_entry=colour_record['entry_key'], authored_entry=original_record['entry_key'], models=model_hashes,
                     strength=1., normal_convention='DirectX: +Y along texture V',
                     **SETTINGS,
-                    prediction_key=estimates.stem, prediction_sha256=cache.digest(estimates.read_bytes()))
+                    prediction_key=estimates.stem, prediction_sha256=cache.digest(estimates.read_bytes()),
+                    medium_prediction_key=medium_estimates.stem,
+                    medium_prediction_sha256=cache.digest(medium_estimates.read_bytes()))
     recipe = dict(schema_version=1,material_id=metadata['material_id'],algorithm='na-pbrify-authored-surface',
                   algorithm_version=VERSION,settings=settings,seed=metadata['seed'],fixture=metadata['fixture'],
                   sources=original_record['recipe']['sources'],
@@ -42,7 +45,10 @@ def prepare(source, colour_entry, estimates, cache_root, texconv, normal_model, 
     colour = render.maps(colour_entry)['base_color']
     with np.load(estimates,allow_pickle=False) as p:
         predicted_normal,predicted_roughness = p['normal'],p['roughness']
-    result = combine(original,colour,predicted_normal,predicted_roughness)
+    with np.load(medium_estimates,allow_pickle=False) as p:
+        medium_normal,medium_roughness=p['normal'],p['roughness']
+    result = combine(original,colour,predicted_normal,predicted_roughness,
+                     medium_normal=medium_normal,medium_roughness=medium_roughness)
     chain = mip_chain(result)
     cache_root.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.preparing-',dir=cache_root) as tmp:
@@ -70,6 +76,30 @@ def prepare(source, colour_entry, estimates, cache_root, texconv, normal_model, 
     return target,record,False
 
 
+def predict(colour_entry, rec, identity, runners, predictions, downsample=1):
+    key_identity=dict(colour=rec['entry_key'],**identity)
+    if downsample!=1:
+        key_identity.update(downsample=downsample,filter='linear-light box pyramid v1')
+    prediction=predictions/(cache.digest(cache.canonical(key_identity))+'.npz')
+    if prediction.exists():return prediction
+    descriptor=next(m for m in rec['maps'] if m['role']=='base_color')
+    rgb=np.asarray(next(viewer.decoded_mips(colour_entry,descriptor)),dtype=np.uint8)[...,:3]
+    if downsample!=1:
+        if downsample<1 or downsample & (downsample-1) or min(rgb.shape[:2])<downsample*8:
+            raise ValueError('medium inference requires power-of-two scale and at least 8x8 input')
+        reduced=linear(rgb.astype(np.float64)/255)
+        for _ in range(downsample.bit_length()-1):reduced=down2(reduced)
+        rgb=np.round(srgb(reduced)*255).clip(0,255).astype(np.uint8)
+    normal=runners['normal'](rgb,1,None,None,None).astype(np.float64)/127.5-1
+    normal[...,2]=np.maximum(normal[...,2],.05);normal=unit(normal)
+    rough=runners['roughness'](rgb,1,None,None,None).astype(np.float64).mean(axis=-1)/255
+    with tempfile.NamedTemporaryFile(dir=predictions,suffix='.npz',delete=False) as tmp:
+        np.savez_compressed(tmp,normal=normal.astype(np.float32),roughness=rough.astype(np.float32))
+        temp=Path(tmp.name)
+    os.replace(temp,prediction)
+    return prediction
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('sources','colour-index','cache','predictions','index','texconv','normal-model','rough-model'):
@@ -89,22 +119,12 @@ def main():
         start=time.perf_counter(); name=json.loads((source/'source.json').read_text())['material_id']
         colour_entry=(args.colour_index.parent/colours[name]).resolve()
         rec=cache.validate(colour_entry)
-        prediction_key=cache.digest(cache.canonical(dict(colour=rec['entry_key'],**identity)))
-        prediction=args.predictions/(prediction_key+'.npz')
-        if not prediction.exists():
-            descriptor=next(m for m in rec['maps'] if m['role']=='base_color')
-            rgb=np.asarray(next(viewer.decoded_mips(colour_entry,descriptor)),dtype=np.uint8)[...,:3]
-            normal=runners['normal'](rgb,1,None,None,None).astype(np.float64)/127.5-1
-            # Author's pipeline labels this output normal_dx. Our +V tangent basis matches it.
-            normal[...,2]=np.maximum(normal[...,2],.05); normal=unit(normal)
-            rough=runners['roughness'](rgb,1,None,None,None).astype(np.float64).mean(axis=-1)/255
-            with tempfile.NamedTemporaryFile(dir=args.predictions,suffix='.npz',delete=False) as tmp:
-                np.savez_compressed(tmp,normal=normal.astype(np.float32),roughness=rough.astype(np.float32))
-                temp=Path(tmp.name)
-            os.replace(temp,prediction)
-        entry,record,hit=prepare(source,colour_entry,prediction,args.cache,args.texconv,args.normal_model,args.rough_model)
+        prediction=predict(colour_entry,rec,identity,runners,args.predictions)
+        medium=predict(colour_entry,rec,identity,runners,args.predictions,SETTINGS['medium_downsample'])
+        entry,record,hit=prepare(source,colour_entry,prediction,args.cache,args.texconv,args.normal_model,args.rough_model,medium)
         index[name]=str(entry.resolve())
         receipts.append(dict(material=name,entry=str(entry.resolve()),prediction=str(prediction.resolve()),
+                             medium_prediction=str(medium.resolve()),
                              seconds=round(time.perf_counter()-start,3),reused=hit))
         print(json.dumps(receipts[-1]),flush=True)
     args.index.parent.mkdir(parents=True,exist_ok=True)

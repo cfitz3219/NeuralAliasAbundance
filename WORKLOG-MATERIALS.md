@@ -254,3 +254,40 @@ Updated existing Documents Lab with previous default backed up, six actual-GPU
 Slider PNGs, six updated static previews and current evidence/Read Me. New HTML
 hash c3dedca0f873a7e7110a239b830bd537c3acf804e646b7aa9655cda966982aed. No claim
 of browser UI automation, game-material quality, or in-game replacement testing.
+
+
+## 2026-11-14 Pacific — visible material detail at ordinary viewing distance
+
+Cort confirmed v2 looks good at 4x but loses its useful detail at 1x/2x and raised
+GPU cost. Claimed offline preparation in central COMMS 60400fa; Fable keeps
+runtime association/loader work. Inspected actual one-scale predictions, existing
+normal-variance mip filtering and rendered v2. The old signal was concentrated
+at fine texel scale. Do not mislabel existing filtering as absent, or equate
+nonzero pixels with a satisfying visible result.
+
+Added medium-scale inference using the SAME NormalV3/RoughnessV2 weights on
+quarter-size linear-filtered PBRify colour. Twelve small offline inferences;
+fine predictions reused exactly. Fixed-coordinate, band-limited medium detail
+joins fine detail before the existing total cap and original-direction/mask
+preservation. No source/material-colour change, new game code, new shader, new
+texture sample, or extra output allocation. Existing mip approximation remains.
+Recipe v3 immutable caches retain v1/v2. Viewer starts at whole-tile 1x.
+
+41 Python tests with real BC compression pass, actual-gallery/legacy controller
+checks pass, real RTX shader tests pass across six materials/three zooms/two
+panel sizes plus three mip boundaries. Mean 1x pixel effect at 65% is 1.8–5.0x
+v2 on 512-square panels; effect strength, not a perceptual score. Inspected wood,
+stone and cloth at 1x/4x: medium relief survives normal distance and fine texture
+remains. Exact zero and identical colour/originals/shaders/output byte budgets
+are checked. Existing enhanced surface maps still cost more than originals:
+2 MiB versus ~0.125 MiB per normal/roughness pair. This revision adds no further
+map bytes or rendering samples; actual game timing is unmeasured.
+
+Existing Documents Lab updated with old default saved as
+Material-Lab-before-distance-detail.html; previous model comparison retained.
+GPU Distance PNGs and detailed report supplied. HTML SHA256
+6dcc35ddf16382509e58033fbd938cf396b0438d4b55b966be2d1aa0e3363dfa.
+Full procedure/evidence: docs/MATERIAL-DISTANCE-DETAIL-20261114.md.
+No game deployment or browser UI automation occurred. Tiny detail must still
+filter naturally at distance; not all added medium relief is guaranteed to be
+physically correct for an arbitrary material.

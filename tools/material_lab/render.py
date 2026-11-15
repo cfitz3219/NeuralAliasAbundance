@@ -154,7 +154,7 @@ def previews(cases, output, size=384):
             x, y = padding+col*(size+16), 122+row*(size+56)
             draw.text((x, y), label, font=font(16), fill="#edf3f4")
             sheet.paste(render(material, size, 1.35 if row == 0 else .15,
-                               texture_zoom=2. if case.get('combined') else 1.), (x, y+28))
+                               texture_zoom=1.), (x, y+28))
         draw.text((24, size*2+244), "Learned detail over original maps / synthetic samples" if case.get('combined') else "Procedural candidate / synthetic source / no in-game result claimed",
                   font=font(14), fill="#a8b9c1")
         sheet.save(output/f"Preview-{case['name']}.png")

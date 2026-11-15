@@ -80,5 +80,50 @@ class AuthoredSurface(unittest.TestCase):
                 b=np.asarray(render.render(combined,64,light,angle))
                 np.testing.assert_array_equal(a,b)
 
+    def test_medium_scale_preserves_base_and_survives_minification(self):
+        from tools.material_lab.detail import mip_chain, Material
+        y,x=np.mgrid[:32,:32]
+        medium=unit(np.stack([.06*np.sin(x*2*np.pi/8),.04*np.cos(y*2*np.pi/8),np.ones_like(x)],-1))
+        rough=.5+.03*np.sin(x*2*np.pi/8)
+        # Flat authored material isolates frequency survival from existing grooves.
+        original=Material(self.original.color,np.broadcast_to([0.,0.,1.],(32,32,3)).copy(),np.full((32,32),.6))
+        flat=np.broadcast_to([0.,0.,1.],(128,128,3)).copy()
+        fine=combine(original,self.colour,flat,np.full((128,128),.5))
+        both=combine(original,self.colour,flat,np.full((128,128),.5),medium_normal=medium,medium_roughness=rough)
+        np.testing.assert_array_equal(both.color,self.colour)
+        coarse=mip_chain(both)[2];old=mip_chain(fine)[2]
+        self.assertGreater(float(abs(coarse.normal-old.normal).mean()),.02)
+        self.assertLess(float(abs(coarse.roughness.mean()-.6)),.02)
+        zero=combine(original,self.colour,self.prediction,self.rough,0,medium_normal=medium,medium_roughness=rough)
+        np.testing.assert_array_equal(zero.normal,fine.normal)
+        np.testing.assert_array_equal(zero.roughness,fine.roughness)
+
+    def test_medium_cannot_replace_original_shape_or_overrun_detail_budget(self):
+        medium=self.prediction[::4,::4];rough=self.rough[::4,::4]
+        base=original_at_size(self.original,self.colour)
+        mask=np.ones((128,128));mask[:,:16]=0
+        out=combine(self.original,self.colour,self.prediction,self.rough,mask=mask,
+                    medium_normal=medium,medium_roughness=rough)
+        added=slopes(out.normal)-slopes(base.normal)
+        self.assertLessEqual(float(np.linalg.norm(added,axis=-1).max()),SETTINGS['max_added_slope']+1e-7)
+        self.assertLessEqual(float(abs(out.roughness-base.roughness).max()),.1200001)
+        strong=np.sum(slopes(base.normal)**2,-1)>SETTINGS['protected_slope_threshold']**2
+        self.assertGreaterEqual(float(np.sum(added*slopes(base.normal),-1)[strong].min()),-1e-12)
+        np.testing.assert_array_equal(out.normal[:,:16],base.normal[:,:16])
+        np.testing.assert_array_equal(out.roughness[:,:16],base.roughness[:,:16])
+        constant=np.broadcast_to(unit(np.array([.3,-.2,1.])),(32,32,3))
+        a=combine(self.original,self.colour,self.prediction,self.rough)
+        b=combine(self.original,self.colour,self.prediction,self.rough,
+                  medium_normal=constant,medium_roughness=np.full((32,32),.2))
+        np.testing.assert_allclose(a.normal,b.normal,atol=1e-12)
+        np.testing.assert_allclose(a.roughness,b.roughness,atol=1e-12)
+
+    def test_medium_prediction_pair_is_validated(self):
+        for n,r in [(self.prediction,None),(self.prediction,self.rough),
+                    (np.full((32,32,3),np.nan),self.rough[::4,::4]),
+                    (-self.prediction[::4,::4],self.rough[::4,::4])]:
+            with self.assertRaises(ValueError):
+                combine(self.original,self.colour,self.prediction,self.rough,medium_normal=n,medium_roughness=r)
+
 
 if __name__=='__main__':unittest.main()

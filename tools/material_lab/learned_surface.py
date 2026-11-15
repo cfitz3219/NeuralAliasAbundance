@@ -1,17 +1,20 @@
-"""Authored surface + bounded, fine-scale learned detail. No procedural noise.
+"""Authored surface + bounded fine/medium learned detail. No procedural noise.
 
 The normal-map combination uses partial derivatives (normal.xy / normal.z),
 not RGB averaging. The broad prediction is discarded; original normals and
-roughness remain the base. Periodic filtering matches declared wrap materials.
+roughness remain the base. Both scales are fixed in material space and baked
+into the same maps. Periodic filtering matches declared wrap materials.
 """
 import numpy as np
 from .detail import Material, check, unit
 
 
-VERSION = '2'
+VERSION = '3'
 SETTINGS = dict(sigma_source_texels=6., normal_detail_gain=3., roughness_detail_gain=2.,
                 max_added_slope=.35, max_roughness_delta=.12, protected_slope_threshold=.04,
-                method='band-limited learned residual; preserve authored slope direction')
+                medium_downsample=4, medium_blur_texels=.75, medium_normal_gain=3.,
+                medium_roughness_gain=2.,
+                method='fine and medium learned residuals; preserve authored slope direction')
 
 
 def resize_wrap(a, height, width):
@@ -60,7 +63,16 @@ def preserve_authored_direction(detail, base_slopes):
     return detail-correction*base_slopes
 
 
-def combine(original, colour, predicted_normal, predicted_roughness, strength=1., mask=None):
+def medium_residual(prediction, height, width, sigma):
+    # Same material UVs at a coarser inference scale. Reject both pixel-scale
+    # noise and broad shape; never change the field with camera distance.
+    scale = height/prediction.shape[0]
+    band = lowpass(prediction,SETTINGS['medium_blur_texels'])-lowpass(prediction,sigma/scale)
+    return resize_wrap(band,height,width)
+
+
+def combine(original, colour, predicted_normal, predicted_roughness, strength=1., mask=None,
+            medium_normal=None, medium_roughness=None):
     base = original_at_size(original,colour)
     h,w = base.roughness.shape
     if not np.isfinite(strength) or not 0 <= strength <= 1:
@@ -71,6 +83,14 @@ def combine(original, colour, predicted_normal, predicted_roughness, strength=1.
         raise ValueError('non-finite material prediction')
     if np.min(predicted_normal[...,2]) <= 0:
         raise ValueError('prediction must use positive-Z tangent normals')
+    if (medium_normal is None) != (medium_roughness is None):
+        raise ValueError('medium normal and roughness must be supplied together')
+    if medium_normal is not None:
+        mh,mw = h//SETTINGS['medium_downsample'],w//SETTINGS['medium_downsample']
+        if medium_normal.shape!=(mh,mw,3) or medium_roughness.shape!=(mh,mw):
+            raise ValueError('medium prediction dimensions do not match inference scale')
+        if not np.isfinite(medium_normal).all() or not np.isfinite(medium_roughness).all() or np.min(medium_normal[...,2])<=0:
+            raise ValueError('invalid medium prediction')
     if mask is None:
         mask = np.ones((h,w))
     if mask.shape != (h,w) or not np.isfinite(mask).all() or np.min(mask)<0 or np.max(mask)>1:
@@ -81,6 +101,8 @@ def combine(original, colour, predicted_normal, predicted_roughness, strength=1.
     sigma = SETTINGS['sigma_source_texels']*scale
     pred_slope = slopes(unit(predicted_normal))
     detail = (pred_slope-lowpass(pred_slope,sigma))*SETTINGS['normal_detail_gain']
+    if medium_normal is not None:
+        detail += medium_residual(slopes(unit(medium_normal)),h,w,sigma)*SETTINGS['medium_normal_gain']
     base_slopes = slopes(base.normal)
     detail = preserve_authored_direction(detail,base_slopes)
     # A fixed, documented relief range; no per-material RMS normalization, noise
@@ -91,6 +113,8 @@ def combine(original, colour, predicted_normal, predicted_roughness, strength=1.
     xy = base_slopes+detail
     result_normal = unit(np.concatenate([xy,np.ones((h,w,1))],-1))
     rough_detail = (predicted_roughness-lowpass(predicted_roughness,sigma))*SETTINGS['roughness_detail_gain']
+    if medium_roughness is not None:
+        rough_detail += medium_residual(medium_roughness,h,w,sigma)*SETTINGS['medium_roughness_gain']
     limit = SETTINGS['max_roughness_delta']
     rough_detail = np.clip(rough_detail,-limit,limit)*mask*strength
     result_rough = np.clip(base.roughness+rough_detail,0,1)
