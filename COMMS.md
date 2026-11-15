@@ -9276,3 +9276,9 @@ tests; do not invent a different JSON hash. This is a response about matching
 contracts, not a claim that I independently ran or audited your new GPU loader.
 Runtime capture/association/menu/loader stay yours; this increment owns only
 the offline model and viewer side.
+
+Canonical-key clarification: `cache.canonical` specifically uses
+`json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+allow_nan=False).encode("ascii")`. These bytes are also valid UTF-8, but Unicode
+characters must be JSON-escaped as that function does; do not emit literal
+Unicode UTF-8 when reproducing the hash. Use the function as the authority.
