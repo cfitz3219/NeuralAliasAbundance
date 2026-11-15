@@ -46,7 +46,7 @@ struct WaitingView {
 };
 
 // Lives in a game texture's private data (and in its digest job): what the loader knows of it.
-struct Note final : IUnknown {
+struct Note : IUnknown { // not final: WRL's ComPtr derives from its target for operator->
     std::atomic<ULONG> refs{1};
     std::mutex mu;
     TextureShape shape;
@@ -83,6 +83,7 @@ struct MapState {
 struct EntryState {
     std::vector<MapState> maps; // by the record's map index
     size_t needed = 0;          // qualified maps: all must be matched and created before any is shown
+    uint64_t claimed = 0;       // bytes of the budget this entry holds
     bool shown = false, counted_waiting = false, refused = false;
 };
 
@@ -181,8 +182,13 @@ void Matched(Loader& l, ID3D11Device* device, const CacheIndex::Hit& hit, const 
     if (first) {
         uint64_t bytes = 0;
         const na::materials::Record& r = l.index->records()[hit.record];
-        for (size_t i = 0; i < r.maps.size(); ++i)
-            if (na::materials::Qualified(r.maps[i]) == nullptr) bytes += r.maps[i].mips.back().offset + r.maps[i].mips.back().byte_size;
+        for (size_t i = 0; i < r.maps.size(); ++i) { // the maps this entry can actually be asked for
+            const na::materials::Source& src = r.maps[i].source;
+            CacheIndex::Hit own;
+            if (l.index->Find(src.content_sha256, {src.resource_format, src.width, src.height, src.mip_count}, src.view_format, own) &&
+                own.record == hit.record && own.map == i)
+                bytes += r.maps[i].mips.back().offset + r.maps[i].mips.back().byte_size;
+        }
         if (l.loaded_bytes + bytes > kBudgetBytes) {
             e.refused = true;
             g_over_budget.fetch_add(1, std::memory_order_relaxed);
@@ -193,6 +199,7 @@ void Matched(Loader& l, ID3D11Device* device, const CacheIndex::Hit& hit, const 
             return;
         }
         l.loaded_bytes += bytes;
+        e.claimed = bytes;
         g_loaded_bytes.store(l.loaded_bytes, std::memory_order_relaxed);
     }
     m.requested = true;
@@ -317,12 +324,15 @@ void Load(Job& job)
             why = "the graphics device refused the texture (memory or format support)";
     }
     std::vector<TexturePublication> publish;
+    std::vector<ComPtr<ID3D11ShaderResourceView>> dropped; // released after the lock
     {
         std::lock_guard<std::mutex> g(l.mu);
         if (l.generation != job.index_generation) return;
         EntryState& e = l.entries[job.record];
         MapState& m = e.maps[job.map];
-        if (view) {
+        if (view && e.refused) {
+            dropped.push_back(view); // a sibling map failed meanwhile: this one is not kept
+        } else if (view) {
             m.replacement = view;
             m.bytes = file_bytes;
             g_loaded.fetch_add(1, std::memory_order_relaxed);
@@ -333,8 +343,17 @@ void Load(Job& job)
             g_failed.fetch_add(1, std::memory_order_relaxed);
             if (!e.refused && !e.shown && e.counted_waiting) g_waiting.fetch_sub(1, std::memory_order_relaxed);
             e.refused = true;
+            // The unit will never be shown: its sibling maps and its share of the budget are given back.
+            for (MapState& sibling : e.maps) {
+                if (sibling.replacement) dropped.push_back(std::move(sibling.replacement));
+                sibling.views.clear();
+            }
+            l.loaded_bytes -= e.claimed;
+            e.claimed = 0;
+            g_loaded_bytes.store(l.loaded_bytes, std::memory_order_relaxed);
         }
     }
+    dropped.clear();
     if (!view)
         na::eventlog::Emit("native11_materials", "entry=%s map=%s not loaded why=\"%s\"", entry_key.c_str(), map.id.c_str(), why.c_str());
     if (!publish.empty()) {
@@ -440,10 +459,13 @@ size_t LoadMaterialCache(const wchar_t* dir)
     return entries;
 }
 
-void MaterialsOnTextureCreated(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& desc, const D3D11_SUBRESOURCE_DATA* initial,
+void MaterialsOnTextureCreated(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& asked, const D3D11_SUBRESOURCE_DATA* initial,
                                ID3D11Texture2D* texture)
 {
-    if (!g_active.load(std::memory_order_acquire) || !texture || desc.ArraySize != 1 || desc.SampleDesc.Count != 1) return;
+    if (!g_active.load(std::memory_order_acquire) || !texture || asked.ArraySize != 1 || asked.SampleDesc.Count != 1) return;
+    // The texture as created: a request for "all levels" (MipLevels 0) has its real count here.
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
     Loader& l = Ldr();
     const TextureShape shape{static_cast<uint32_t>(desc.Format), desc.Width, desc.Height, desc.MipLevels};
     std::vector<uint32_t> wanted;

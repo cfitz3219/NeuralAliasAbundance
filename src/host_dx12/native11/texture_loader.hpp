@@ -30,13 +30,14 @@ namespace na::native11 {
 struct MaterialTextureFacts;
 
 // Reads every entry under `dir` (null: %LOCALAPPDATA%\NeuralAlias\materials) and replaces the
-// loaded index. Manifests only; no map file is read until a game texture matches. Textures the game
+// loaded index, dropping every map made for the previous one (they belong to the device and index
+// they were made for). Manifests only; no map file is read until a game texture matches. Textures the game
 // created before the call are not matched (their creation data is gone). Returns the entries read.
 // Call before the game creates its textures; InstallTextures does, with the default folder.
 size_t LoadMaterialCache(const wchar_t* dir);
 
 // From textures.cpp's device hooks, after the game's successful calls.
-void MaterialsOnTextureCreated(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& desc, const D3D11_SUBRESOURCE_DATA* initial,
+void MaterialsOnTextureCreated(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& asked, const D3D11_SUBRESOURCE_DATA* initial,
                                ID3D11Texture2D* texture);
 void MaterialsOnViewCreated(ID3D11Resource* resource, ID3D11ShaderResourceView* view, uint64_t serial, const MaterialTextureFacts& facts);
 

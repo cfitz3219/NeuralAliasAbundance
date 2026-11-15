@@ -575,10 +575,17 @@ void DumpOnPresent(uint64_t frame)
             std::lock_guard<std::mutex> l(d.mu);
             if (frame < d.until_frame && d.queue.size() < kDumpCollectMax) return;
             d.noted = d.queue.size();
-            // Least used first, so the next texture to read is taken from the back.
-            std::sort(d.queue.begin(), d.queue.end(), [](const DumpItem& a, const DumpItem& b) {
-                return a.entry->scene_binds.load(std::memory_order_relaxed) < b.entry->scene_binds.load(std::memory_order_relaxed);
-            });
+            // Least used first, so the next texture to read is taken from the back. The counts are
+            // read once: game threads keep counting, and a sort must see values that hold still.
+            std::vector<std::pair<uint64_t, size_t>> order;
+            order.reserve(d.queue.size());
+            for (size_t i = 0; i < d.queue.size(); ++i)
+                order.emplace_back(d.queue[i].entry->scene_binds.load(std::memory_order_relaxed), i);
+            std::sort(order.begin(), order.end());
+            std::vector<DumpItem> sorted;
+            sorted.reserve(order.size());
+            for (const auto& o : order) sorted.push_back(std::move(d.queue[o.second]));
+            d.queue = std::move(sorted);
             std::vector<DumpItem> keep;
             uint64_t bytes = 0;
             d.over_budget = 0;
@@ -665,8 +672,12 @@ bool InstallTextures(void* device)
     std::lock_guard<std::mutex> g(g_install_mu);
     auto* dev = static_cast<ID3D11Device*>(device);
     if (!dev) return false;
-    g_device.store(dev, std::memory_order_release);
-    if (g_installed.load()) return true;
+    ID3D11Device* const before = g_device.exchange(dev, std::memory_order_acq_rel);
+    if (g_installed.load()) {
+        // The game made a new device: maps created on the old one must never reach the new one's views.
+        if (before && before != dev) LoadMaterialCache(nullptr);
+        return true;
+    }
     if (!na::hooking::Initialize()) return false;
     ComPtr<ID3D11DeviceContext> imm, def;
     dev->GetImmediateContext(&imm);

@@ -1714,12 +1714,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         g.ctx->Draw(4, 0); ReadCopy(g, mat_own, g.color.Get());
         // The digest, the file read and the texture creation happen on the loader's thread; the
         // entry becomes visible at a Present after they finish.
-        for (int mat_i = 0; mat_i < 1500 && na::native11::GetMaterialStats().entries_shown == 0 &&
-                            na::native11::GetMaterialStats().maps_failed == 0; ++mat_i) {
+        // Waits for what the checks below read: both digests done, and the publication visible.
+        for (int mat_i = 0; mat_i < 2500 && na::native11::GetMaterialStats().maps_failed == 0 &&
+                            (na::native11::GetMaterialStats().textures_hashed < 2 || na::native11::GetTextureStats().replaced == 0); ++mat_i) {
             na::native11::TexturesOnPresent();
             Sleep(2);
         }
-        na::native11::TexturesOnPresent();
         g.ctx->Draw(4, 0); ReadCopy(g, mat_shown, g.color.Get());
         ComPtr<ID3D11ShaderResourceView> mat_seen;
         g.ctx->PSGetShaderResources(0, 1, &mat_seen);
