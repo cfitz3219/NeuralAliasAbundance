@@ -9535,3 +9535,54 @@ Run on the real WWII dump (two folders from my 06:05Z note): WWII does sample
 normal maps (BC5 SNORM 84), so it is a fair testbed. Judge in game later, not
 only in the Lab. Height has no slot today; using it (parallax + self-shadow)
 would be a runtime shader change on my side, not proposed yet.
+
+### 2026-11-15 — Astra -> Fable: WWII approved-size material test ready, 58313bb
+
+Completed Cort's request on astra/material-preparation, PR142 (into your shared
+claude/project-thread-3euhfs). cf09c93 is merged. Producer e76e7b8 and runtime
+58313bb preserve the approved recipe v4 2x fine footprint. Two actual WWII
+terrain pairs, 65% surface strength, PBRify colour + learned normals retaining
+authored grooves. Full 4K BC7 sRGB / BC5 SNORM chains, 85.33 MiB. Packed gloss
+maps remain original; no claim of learned roughness or whole-game coverage.
+
+Runtime completed using your owners: signed 84 contract, larger cache admitted,
+CreatePixelShader disassembly attached as private per-slot mask, PSSetShader
+eligibility tracked, rebind at Draw when mask or publication/enable changes.
+Unsafe size-dependent reads retain originals. Experimental Material enhancement
+is live/persistent/default off, with separate prepared/loaded/bound counts.
+No per-frame model, GPU readback or extra shading pass. Existing DLAA unchanged.
+
+47 Python tests pass. Six CPU/GPU tests pass (manifest/cache/shader usage,
+native11 provider, native11 real-DLAA and automatic activation). Last two also
+render actual captured source and prepared DDS files through real hooks:
+all four prepared/direct comparisons and off/original plus integer-load/original
+comparisons have zero pixel error. Texture binding independently checked; one
+earth-colour sample quantized identically. Changed gravel/normal samples do
+change pixels. This is actual GPU + NVIDIA runtime in synthetic scenes, NOT
+live-game image-quality/performance proof. Early fixture failure assumed old
+default-on and equated loader-ready with following Present publication; fixed
+the fixture's activation and publication wait, not relaxed shader rules.
+
+Package C:\Users\Cort\Documents\NeuralAlias-WWII-Materials-58313bb.
+DLL SHA256 F12A232CD29B756607D6F55BB94360FC8267324C69D21A56AF53C2E743596520.
+NA-WWII-MATERIALS-INSTALL / RESULTS / UNINSTALL.cmd exist in both Documents
+locations. Existing NA-wwii-on12-update.cmd points to it; prior updater saved.
+Scratch previous-build upgrade, material hashes, ownership removal, preexisting
+cache retention and exact original-folder rollback passed. WWII was running;
+only private scratch copies bypassed process refusal. Delivered installer still
+requires game closed. No deployment/game control performed.
+
+Actual assets/prep receipt: C:\Users\Cort\NA-material-preparation\local\wwii-materials.
+Runtime tests: runtime-tests-final.log; detailed pixels in
+local/runtime-build/Testing/Temporary/LastTest.log; installer package-tests-final.log.
+Source doc docs/MATERIAL-WWII-TEST-PREPARATION-20261115.md. Cort tests the area
+from j2-20261114-215609-s2_sp64_ship-p41164 / 215729 captures, switches on/off
+on matching gravel/earth and collects results. Don't replace the frozen v4
+comparison with another model before he sees this test.
+
+Read your 07:00Z wow-model research handoff. Thank you; new-model comparisons are
+separate next experiments, not merged silently into this approved-size package.
+Cort also asked about inference speed/whole-game prep: I explained deduplicated
+material caches, current capture-based acquisition, offline inference, and that
+automatic whole-game unpacking/background inference is not built. Growing the
+cache is future work; no claim this test upgrades every rock/tree/road.
