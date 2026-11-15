@@ -3,6 +3,7 @@
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/textures.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/native_d3d11/shared_resources.hpp"
@@ -1557,6 +1558,8 @@ int FormatStatus(char* out, size_t capacity)
         m = na::native11::FormatSamplerStatus(out, static_cast<unsigned long>(capacity));
         if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
         m = na::native11::FormatTextureStatus(out, static_cast<unsigned long>(capacity));
+        if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
+        m = na::native11::FormatMaterialStatus(out, static_cast<unsigned long>(capacity));
         if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
     }
     return n + extra + std::snprintf(out, capacity,

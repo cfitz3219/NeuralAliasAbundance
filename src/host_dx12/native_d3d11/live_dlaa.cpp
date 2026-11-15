@@ -446,8 +446,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         // A saved capture also takes the scene's source textures, once per capture folder.
         static std::wstring texture_dump_for;
         if (const wchar_t* folder = capture::j2::Directory(); folder && *folder && texture_dump_for != folder) {
-            texture_dump_for = folder;
-            native11::RequestTextureDump((texture_dump_for + L"\\textures").c_str());
+            // Recorded only once the request is taken: while an earlier dump still runs, ask again next frame.
+            if (native11::RequestTextureDump((std::wstring(folder) + L"\\textures").c_str())) texture_dump_for = folder;
         }
         capture::j2::Planes planes;
         planes.color = eval.color;

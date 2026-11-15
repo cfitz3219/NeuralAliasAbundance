@@ -25,7 +25,9 @@
 #pragma once
 
 #include <d3d11.h>
+#include <wrl/client.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace na::native11 {
@@ -97,6 +99,17 @@ void TexturesOnPresent();
 // view (several views of one texture); `bytes` is then counted once per original.
 bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView* replacement, uint64_t bytes);
 bool RemoveTexture(ID3D11ShaderResourceView* original);
+// Several publications in one step, so they become visible on the same Present (the maps of one
+// material). Each names the game view by address and by the serial its creation was given: an
+// entry whose view has since been destroyed (or whose address now belongs to another view) is
+// skipped. Returns how many were taken.
+struct TexturePublication {
+    ID3D11ShaderResourceView* original = nullptr; // an address to look up, never dereferenced
+    uint64_t serial = 0;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> replacement;
+    uint64_t bytes = 0;
+};
+size_t PublishTextures(const TexturePublication* items, size_t count);
 void SetTexturesEnabled(bool on); // one switch for every replacement; the census is not affected
 
 // Source dump: for the candidate textures the game binds to pixel shaders in its scene over the next

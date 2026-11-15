@@ -33,7 +33,9 @@
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/textures.hpp"
+#include "materials/texture_subresources_v1.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <DirectXPackedVector.h>
 #include <d3d11on12.h>
@@ -1602,6 +1604,149 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                "the file is named by the texture-subresources-v1 digest of the game's bytes and holds every level");
         expect(have_index && dump_index_file.nFileSizeLow > 0, "the dump's index lists it");
         DeleteFileW(dump_file.c_str()); DeleteFileW(dump_index.c_str()); RemoveDirectoryW(dump_dir.c_str());
+    }
+    // Material cache: a game texture whose creation bytes are a prepared source gets the cache's map,
+    // found by digest (no read-back), created on the loader's thread and shown with no bind by the game.
+    // The game's texture is BC1 sRGB, every block green; the prepared map is BC7 sRGB, every block white.
+    {
+        const UINT mat_side = 64, mat_mips = 7;
+        std::vector<uint8_t> mat_game, mat_other, mat_prepared;
+        std::vector<D3D11_SUBRESOURCE_DATA> mat_levels(mat_mips), mat_other_levels(mat_mips);
+        std::vector<size_t> mat_game_at, mat_prepared_at;
+        static const uint8_t mat_green[8] = {0xE0, 0x07, 0xE0, 0x07, 0, 0, 0, 0};
+        static const uint8_t mat_white[16] = {0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0, 0, 0, 0, 0, 0, 0}; // mode 6, endpoints 255
+        for (UINT mat_mip = 0; mat_mip < mat_mips; ++mat_mip) {
+            const UINT mat_blocks = ((std::max)(1u, mat_side >> mat_mip) + 3) / 4;
+            mat_game_at.push_back(mat_game.size());
+            mat_prepared_at.push_back(mat_prepared.size());
+            for (UINT mat_b = 0; mat_b < mat_blocks * mat_blocks; ++mat_b) {
+                mat_game.insert(mat_game.end(), mat_green, mat_green + 8);
+                mat_prepared.insert(mat_prepared.end(), mat_white, mat_white + 16);
+            }
+        }
+        mat_other = mat_game;
+        mat_other[0] = 0x1F; mat_other[1] = 0x00; mat_other[2] = 0x1F; mat_other[3] = 0x00; // one block differs: another source
+        for (UINT mat_mip = 0; mat_mip < mat_mips; ++mat_mip) {
+            const UINT mat_blocks = ((std::max)(1u, mat_side >> mat_mip) + 3) / 4;
+            mat_levels[mat_mip] = {mat_game.data() + mat_game_at[mat_mip], mat_blocks * 8, 0};
+            mat_other_levels[mat_mip] = {mat_other.data() + mat_game_at[mat_mip], mat_blocks * 8, 0};
+        }
+        // The identity the preparer would have recorded for the game's texture.
+        na::materials::TexSubHeader mat_header;
+        mat_header.resource_format = mat_header.view_format = 72;
+        mat_header.width = mat_header.height = mat_side;
+        mat_header.mip_count = mat_mips;
+        na::materials::TextureSubresourcesV1 mat_digest(mat_header);
+        for (UINT mat_mip = 0; mat_mip < mat_mips; ++mat_mip)
+            mat_digest.AddLevel(0, mat_mip, mat_levels[mat_mip].pSysMem, mat_levels[mat_mip].SysMemPitch);
+        const std::string mat_source = mat_digest.Finish();
+        // The cache entry: one base_color map, written the way the preparer lays a DDS out.
+        std::vector<uint8_t> mat_file(148, 0);
+        const auto mat_put = [&](size_t mat_at, uint32_t mat_v) {
+            for (int mat_k = 0; mat_k < 4; ++mat_k) mat_file[mat_at + static_cast<size_t>(mat_k)] = static_cast<uint8_t>(mat_v >> (8 * mat_k));
+        };
+        std::memcpy(mat_file.data(), "DDS ", 4);
+        mat_put(4, 124); mat_put(8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000 | 0x20000); mat_put(12, mat_side); mat_put(16, mat_side);
+        mat_put(20, 16 * 16 * 16); mat_put(28, mat_mips); mat_put(76, 32); mat_put(80, 4);
+        std::memcpy(mat_file.data() + 84, "DX10", 4);
+        mat_put(108, 0x1000 | 0x8 | 0x400000); mat_put(128, 99); mat_put(132, 3); mat_put(140, 1); mat_put(144, 1);
+        mat_file.insert(mat_file.end(), mat_prepared.begin(), mat_prepared.end());
+        na::materials::Sha256 mat_sha;
+        mat_sha.Update(mat_file.data(), mat_file.size());
+        std::string mat_file_sha;
+        for (uint8_t mat_byte : mat_sha.Final()) {
+            char mat_hex[3];
+            std::snprintf(mat_hex, sizeof(mat_hex), "%02x", mat_byte);
+            mat_file_sha += mat_hex;
+        }
+        const std::string mat_key(64, 'e'); // a fixture's key; the runtime does not re-derive it from a recipe
+        std::string mat_manifest =
+            "{\"schema_version\":1,\"material_id\":\"fixture_green\",\"entry_key\":\"" + mat_key +
+            "\",\"algorithm\":\"fixture\",\"algorithm_version\":\"1\",\"settings\":{},\"seed\":0,\"fixture\":true,\"recipe\":{},"
+            "\"maps\":[{\"id\":\"base_color\",\"role\":\"base_color\",\"source\":{\"content_sha256\":\"" + mat_source +
+            "\",\"identity_domain\":\"texture-subresources-v1\",\"width\":64,\"height\":64,\"first_mip\":0,\"mip_count\":7,"
+            "\"view_format\":72,\"complete_observed_range\":true,\"resource_format\":72,\"first_array_slice\":0,\"array_size\":1},"
+            "\"channels\":[\"color_r\",\"color_g\",\"color_b\",\"opacity\"],\"encoding\":\"srgb\",\"address\":\"wrap\","
+            "\"dxgi_format\":99,\"width\":64,\"height\":64,\"file\":\"base_color.dds\",\"sha256\":\"" + mat_file_sha + "\",\"mips\":[";
+        for (UINT mat_mip = 0; mat_mip < mat_mips; ++mat_mip) {
+            const UINT mat_extent = (std::max)(1u, mat_side >> mat_mip), mat_blocks = (mat_extent + 3) / 4;
+            char mat_line[192];
+            std::snprintf(mat_line, sizeof(mat_line), "%s{\"level\":%u,\"width\":%u,\"height\":%u,\"offset\":%zu,\"row_pitch\":%u,\"byte_size\":%u}",
+                          mat_mip ? "," : "", mat_mip, mat_extent, mat_extent, size_t(148) + mat_prepared_at[mat_mip], mat_blocks * 16,
+                          mat_blocks * mat_blocks * 16);
+            mat_manifest += mat_line;
+        }
+        mat_manifest += "]}],\"payload_bytes\":" + std::to_string(mat_prepared.size()) + "}";
+        wchar_t mat_temp[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, mat_temp);
+        const std::wstring mat_root = std::wstring(mat_temp) + L"na-material-cache-" + std::to_wstring(GetCurrentProcessId());
+        const std::wstring mat_entry = mat_root + L"\\" + std::wstring(mat_key.begin(), mat_key.end());
+        CreateDirectoryW(mat_root.c_str(), nullptr);
+        CreateDirectoryW(mat_entry.c_str(), nullptr);
+        const auto mat_write = [](const std::wstring& mat_path, const void* mat_data, size_t mat_size) {
+            FILE* mat_f = nullptr;
+            if (_wfopen_s(&mat_f, mat_path.c_str(), L"wb") || !mat_f) return false;
+            const bool mat_ok = std::fwrite(mat_data, 1, mat_size, mat_f) == mat_size;
+            return std::fclose(mat_f) == 0 && mat_ok;
+        };
+        expect(mat_write(mat_entry + L"\\base_color.dds", mat_file.data(), mat_file.size()) &&
+               mat_write(mat_entry + L"\\manifest.json", mat_manifest.data(), mat_manifest.size()),
+               "write the fixture cache entry");
+        const size_t mat_read = na::native11::LoadMaterialCache(mat_root.c_str());
+        const auto mat_before = na::native11::GetMaterialStats();
+        expect(mat_read == 1 && mat_before.entries == 1 && mat_before.findable_maps == 1 && mat_before.refused_maps == 0,
+               "the cache entry is read and its map is findable");
+        // The game now creates its textures: one the prepared source, one of the same shape with other bytes.
+        D3D11_TEXTURE2D_DESC mat_desc{};
+        mat_desc.Width = mat_desc.Height = mat_side; mat_desc.MipLevels = mat_mips; mat_desc.ArraySize = 1;
+        mat_desc.Format = DXGI_FORMAT_BC1_UNORM_SRGB; mat_desc.SampleDesc.Count = 1;
+        mat_desc.Usage = D3D11_USAGE_IMMUTABLE; mat_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> mat_texture, mat_other_texture;
+        ComPtr<ID3D11ShaderResourceView> mat_view, mat_other_view;
+        expect(SUCCEEDED(g.device->CreateTexture2D(&mat_desc, mat_levels.data(), &mat_texture)) &&
+               SUCCEEDED(g.device->CreateShaderResourceView(mat_texture.Get(), nullptr, &mat_view)) &&
+               SUCCEEDED(g.device->CreateTexture2D(&mat_desc, mat_other_levels.data(), &mat_other_texture)) &&
+               SUCCEEDED(g.device->CreateShaderResourceView(mat_other_texture.Get(), nullptr, &mat_other_view)),
+               "the game creates its block-compressed textures");
+        ID3D11ShaderResourceView* mat_raw = mat_view.Get();
+        g.ctx->PSSetShaderResources(0, 1, &mat_raw);
+        float mat_own[4]{}, mat_shown[4]{}, mat_unprepared[4]{};
+        g.ctx->Draw(4, 0); ReadCopy(g, mat_own, g.color.Get());
+        // The digest, the file read and the texture creation happen on the loader's thread; the
+        // entry becomes visible at a Present after they finish.
+        // Waits for what the checks below read: both digests done, and the publication visible.
+        for (int mat_i = 0; mat_i < 2500 && na::native11::GetMaterialStats().maps_failed == 0 &&
+                            (na::native11::GetMaterialStats().textures_hashed < 2 || na::native11::GetTextureStats().replaced == 0); ++mat_i) {
+            na::native11::TexturesOnPresent();
+            Sleep(2);
+        }
+        g.ctx->Draw(4, 0); ReadCopy(g, mat_shown, g.color.Get());
+        ComPtr<ID3D11ShaderResourceView> mat_seen;
+        g.ctx->PSGetShaderResources(0, 1, &mat_seen);
+        ID3D11ShaderResourceView* mat_other_raw = mat_other_view.Get();
+        g.ctx->PSSetShaderResources(0, 1, &mat_other_raw);
+        g.ctx->Draw(4, 0); ReadCopy(g, mat_unprepared, g.color.Get());
+        const auto mat_after = na::native11::GetMaterialStats();
+        std::printf("native material cache (r/g/b): own %.2f/%.2f/%.2f, shown %.2f/%.2f/%.2f, other texture %.2f/%.2f/%.2f; "
+                    "hashed %llu, matched %llu, loaded %llu, failed %llu, shown entries %llu, bytes %llu\n",
+                    mat_own[0], mat_own[1], mat_own[2], mat_shown[0], mat_shown[1], mat_shown[2], mat_unprepared[0], mat_unprepared[1],
+                    mat_unprepared[2], static_cast<unsigned long long>(mat_after.textures_hashed),
+                    static_cast<unsigned long long>(mat_after.views_matched), static_cast<unsigned long long>(mat_after.maps_loaded),
+                    static_cast<unsigned long long>(mat_after.maps_failed), static_cast<unsigned long long>(mat_after.entries_shown),
+                    static_cast<unsigned long long>(mat_after.loaded_bytes));
+        expect(mat_own[0] < .1f && mat_own[1] > .9f && mat_own[2] < .1f, "before the entry is shown the game's own texture is sampled");
+        expect(mat_after.textures_hashed == 2 && mat_after.views_matched == 1 && mat_after.maps_loaded == 1 && mat_after.maps_failed == 0 &&
+               mat_after.entries_shown == 1 && mat_after.loaded_bytes == mat_file.size(),
+               "both textures of the prepared shape are digested from creation data; only the prepared source matches and loads");
+        expect(mat_shown[0] > .9f && mat_shown[1] > .9f && mat_shown[2] > .9f && mat_seen.Get() == mat_view.Get(),
+               "the prepared map is sampled with no new bind, and the game reads back its own view");
+        expect(mat_unprepared[0] < .1f && mat_unprepared[1] > .9f && mat_unprepared[2] < .1f,
+               "a texture of the same shape with other bytes keeps its own content");
+        na::native11::RemoveTexture(mat_view.Get());
+        na::native11::TexturesOnPresent();
+        DeleteFileW((mat_entry + L"\\base_color.dds").c_str()); DeleteFileW((mat_entry + L"\\manifest.json").c_str());
+        RemoveDirectoryW(mat_entry.c_str()); RemoveDirectoryW(mat_root.c_str());
+        na::native11::LoadMaterialCache(mat_root.c_str()); // the folder is gone: the loader is idle again
     }
     na::capture::j2::Shutdown();
     na::capture::Shutdown();
