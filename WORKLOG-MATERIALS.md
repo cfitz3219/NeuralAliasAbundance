@@ -105,3 +105,49 @@ embedded PNG mip chains from real compressed cache inputs. This checks delivery
 of images, not just script syntax. No material math, cache schema, game hooks or
 game installation changed. Interactive WebGL rendering remains separately
 unverified by automation; the user's screenshot was of the unpopulated template.
+
+## 2026-11-14 Pacific — Fable handoff integrated: AI comparison and runtime-source intake
+
+Cort said Fable had supplied what was needed. Read central COMMS and pulled the
+actual handoffs: e3b220b's Real-ESRGAN/Lanczos indices, abf3394's shared serializer,
+8b7bfbc's Windows narrowing correction and 4525b4e's actual DDS/index source dump.
+Fast-forwarded onto that shared history rather than copying runtime modules.
+No edits to Fable's hooks, producer, loader, or model executable.
+
+The Lab now compares the actual six Real-ESRGAN x4plus results (1024-square colour)
+with the same 256-square original sources and our coordinated candidate. Added
+an optional Lanczos middle-panel selection, explicit model/dimensions and original
+normal/roughness wording. A compare command updates existing entries without
+regenerating source PNGs. All twelve external entries passed original source and
+interpretation matching. Corrected offline reference renders: they previously
+sampled only the highest mip and thus minified the larger AI map unfairly. Each
+map now uses its own UV-derived trilinear mip footprint. The existing WebGL shader
+already used implicit derivatives; it did not need a common integer LOD fix.
+
+Visually inspected the updated brown-linen and painted-timber BC-decoded sheets.
+Linen's AI colour result smooths the weave into diagonal bands; painted timber's
+AI colour has extra fine vertical markings. Coordinated normal changes produce
+larger lighting differences, especially under grazing light. These are synthetic
+examples, not proof of superior real-game quality or a trained neural generator.
+Six panels and the common viewer remain a comparison, not a selected final look.
+
+Added runtime_source.py using Fable's texsub.digest unchanged. It consumes his
+actual 4525b4e index.jsonl + DDS format directly and the earlier proposed raw-row
+format for portable fixtures. Both yield the same GPU-content identity and cache
+entry, with source view/range retained. Files are read once for hashing/decoding;
+padding never enters identity. Roles and packing must be explicitly associated.
+No automatic semantic material identification or capture hook is invented here.
+Documented exact producer/consumer contract in MATERIAL-SOURCE-CAPTURE-V1.md.
+Generated local/runtime-capture-example from our own oak fixture and prepared it
+through the actual DDS/index intake into the immutable compressed cache.
+
+Validation: 30 offline tests PASS including the shared digest vectors, padded
+rows, altered texels, partial views, BGRA/BGRX, invalid layouts, raw-vs-DDS cache
+identity, actual compression and different-resolution trilinear comparisons.
+All 456 embedded images in the six-case generated gallery decode; the script
+passes Node syntax check. C++ shared-vector test first failed MSVC /W4 /WX at
+abf3394, reported to Fable; took his existing 8b7bfbc fix and the same nine cases
+then passed on Windows. Reported separate malformed-header division/shift issue
+for his owned serializer. Interactive browser execution remains unverified by
+our automation; static reference renders were inspected. No game launch, install,
+SDK/runtime replacement, in-game quality or performance claim.

@@ -108,3 +108,22 @@ functional checks, not game compatibility or visual-benefit proof.
 - Rendering uses standard microfacet lighting for comparison. This is not a
   claim that NeuralAlias invented microfacet rendering or AI material generation.
 - No borrowed GPL implementation, model weights or proprietary SDK is included.
+# Fable baseline and runtime capture handoff
+
+To update the existing gallery without regenerating any inputs:
+
+```powershell
+python -m tools.material_lab compare --comparison local/material-demo/comparison.json --output local/material-demo --baseline-index C:/Users/Cort/NA-material-baseline/baselines.json --conventional-index C:/Users/Cort/NA-material-baseline/baselines-lanczos.json
+```
+
+The middle panel switches between the supplied Real-ESRGAN colour upscale and
+Lanczos. Both retain original normals and roughness. Captions report actual
+colour size and model; source identities must match. The right panel is the
+coordinated mathematical candidate, not Real-ESRGAN applied to all maps.
+Offline PNG comparisons now sample each map's real mip chain at its screen
+footprint; a 1024-pixel colour map does not force 256-pixel normals to mip 2.
+
+For raw runtime-source preparation, see [the shared capture contract](../../docs/MATERIAL-SOURCE-CAPTURE-V1.md).
+The same `prepare` command accepts explicit `runtime_maps` in `source.json`,
+reusing Fable's source digest and retaining the original view/mip identity.
+

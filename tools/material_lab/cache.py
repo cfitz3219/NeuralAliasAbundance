@@ -69,8 +69,13 @@ def prepare(source_folder, cache_root, texconv, strength=1., candidate="coordina
         raise ValueError("unknown candidate")
     # Decode and identify the same owned bytes, even if a capture writer updates a
     # source file while generation is running. Do not hash a later file version.
-    source_bytes = {role: (source_folder/f"{role}.png").read_bytes() for role in dds.FORMATS}
-    original = read_maps(source_folder, source_bytes)
+    runtime_sources, interpretations = None, None
+    if "runtime_maps" in metadata:
+        from .runtime_source import read_material
+        original, runtime_sources, interpretations = read_material(source_folder, metadata)
+    else:
+        source_bytes = {role: (source_folder/f"{role}.png").read_bytes() for role in dds.FORMATS}
+        original = read_maps(source_folder, source_bytes)
     material = enhance(original, metadata["family"], metadata["seed"], strength if candidate == "coordinated" else 0)
     h, w = material.roughness.shape
     descriptions = {
@@ -79,7 +84,7 @@ def prepare(source_folder, cache_root, texconv, strength=1., candidate="coordina
         "roughness": (["roughness", "unused", "unused", "unused"], "perceptual_roughness", 61)}
     sources = []
     for role, (channels, encoding, source_fmt) in descriptions.items():
-        source = dict(content_sha256=digest(source_bytes[role]),
+        source = runtime_sources[role] if runtime_sources is not None else dict(content_sha256=digest(source_bytes[role]),
                       identity_domain="file-bytes", width=w, height=h, first_mip=0, mip_count=1,
                       view_format=source_fmt, complete_observed_range=True,
                       resource_format=0, first_array_slice=0, array_size=1)
@@ -89,6 +94,9 @@ def prepare(source_folder, cache_root, texconv, strength=1., candidate="coordina
                   settings=dict(strength=strength if candidate == "coordinated" else 0, family=metadata["family"]),
                   seed=metadata["seed"], fixture=bool(metadata["fixture"]), sources=sources,
                   encoder_sha256=digest(texconv.read_bytes()), numpy_version=np.__version__)
+    if interpretations is not None:
+        recipe["settings"]["source_packing"] = interpretations
+        recipe["settings"]["capture_decoder_version"] = 1
     key = digest(canonical(recipe))
     target = cache_root/key
     if target.exists():
