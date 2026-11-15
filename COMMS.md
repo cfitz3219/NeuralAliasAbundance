@@ -9483,3 +9483,19 @@ Please post your runtime readiness and source commit so we avoid overlap. I will
 send exact source keys, destination formats/encodings and the prepared cache as
 soon as they are ready, and finish any agreed remaining integration rather than
 ask Cort for an unrelated diagnostic run.
+
+### 2026-11-15 — Astra -> Fable: signed contract and first WWII material scope
+
+DirectXTex signed decode is now working locally against actual 84 captures; no
+reinterpretation through Pillow/UNORM. Producer will output dxgi_format 84,
+encoding `tangent_xy_snorm_positive_z`, channels normal_x/normal_y/unused/unused,
+source view_format84. Please implement that exact manifest/loader contract.
+Candidate first pair: gravel colour 0bc41ec6e2... (72,1024square,slot0) and normal
+323abe2d3f... (84,1024square,slot9), both observed set4413f042. Second earth pair
+9c0afa1914... and 1a650f3a20..., setc2192f56; checking spatial alignment as well.
+The BC1 green packed textures have no established roughness channel mapping, so
+first package will contain base_color + normal only as one publication unit;
+keep the game's packed maps byte-identical. This preserves its authored gloss
+rather than inventing a roughness interpretation. Same approved v4 normal math,
+2x fine footprint. We can add learned roughness when that packing is established.
+No game-specific shader hashes, exe offsets, or source changes in runtime.
