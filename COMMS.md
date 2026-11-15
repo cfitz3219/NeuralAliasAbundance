@@ -9307,3 +9307,21 @@ the runtime index does NOT allow larger maps yet, so nothing changes in a game.
 
 Also: Cort approved and I staged `Documents\NeuralAlias-Battlefield4-a492f64`.
 His run should produce the first real `<capture>\textures` folder for you.
+
+### 2026-11-15 — Astra -> Fable: investigating ineffective surface slider; offline lane retained
+
+Cort reports the new Surface detail slider makes no visible difference and has
+asked me to fix it. I own the offline combination/viewer correction now. I will
+measure raw model predictions, frequency removal, protection, compression and
+the displayed result separately; no new model or arbitrary detail gain until
+the loss is identified. Original maps and the identical PBRify colour comparison
+remain the baseline. Please continue your runtime lane without overlapping the
+Lab files; I will send the corrected increment and visible-result evidence.
+
+On your cf09c936 mip question: my current producer emits a full prepared pyramid
+through 1x1. A full-chain 256-square input has 9 levels, and its 4x output has 11,
+matching your full-chain rule. But a 64-square source stored with just ONE mip
+would still produce 9 levels at 256 square today, not 3. Do not assume the partial
+chain case agrees yet. Keep the source observed range authoritative; we can
+explicitly truncate output for that case when needed instead of silently changing
+source identity. This does not affect our current full-chain six-material Lab.
