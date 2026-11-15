@@ -201,6 +201,43 @@ class CompressedCache(unittest.TestCase):
         baseline["maps"][0]["source"]["view_format"] = 28
         with self.assertRaises(ValueError): viewer.check_baseline(self.record, baseline)
 
+    def test_model_catalog_binds_distinct_prepared_entries(self):
+        import re
+        from tools.material_baseline.__main__ import prepare
+        calls = []
+        def fake_inference(rgb, scale, *_):
+            calls.append(scale)
+            return np.repeat(np.repeat(rgb,scale,axis=0),scale,axis=1)
+        identity = dict(algorithm="fixture-upscale", version="1", upscaler_sha256="tool",model_sha256="weights",
+                        inference=dict(precision="float32"))
+        baseline, record, _ = prepare(self.source,self.root/"baselines",self.texconv,"test","fixture-model",2,
+                                       identity,upscale=fake_inference)
+        self.assertEqual(calls,[2])
+        self.assertEqual(record["settings"]["inference"],identity["inference"])
+        self.assertEqual(record["maps"][0]["width"],64)
+        viewer.check_baseline(self.record,record)
+        prepare(self.source,self.root/"baselines",self.texconv,"test","fixture-model",2,identity,upscale=fake_inference)
+        self.assertEqual(calls,[2])  # cached selection never reruns inference
+        index=self.root/"models.json"
+        index.write_text(json.dumps({self.record["material_id"]:str(baseline)}))
+        catalog=self.root/"catalog.json"
+        catalog.write_text(json.dumps([dict(id="model-a",label="Model A",description="A",index="models.json"),
+                                       dict(id="model-b",label="Model B",description="B",index="models.json")]))
+        cases=[dict(name=self.record["material_id"],family="wood",split="development",
+                    original=str(self.entry),coordinated=str(self.entry))]
+        attached=viewer.attach_models(cases,catalog)
+        self.assertNotIn("models",cases[0])
+        output=self.root/"models.html";viewer.write(attached,output)
+        data=json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>',output.read_text(encoding="utf-8"),re.S)[1])
+        self.assertEqual(list(data[0]["comparisons"]),["model-a","model-b"])
+        self.assertEqual(data[0]["comparisons"]["model-b"]["label"],"Model B")
+        self.assertEqual(data[0]["comparisons"]["model-a"]["dimensions"]["base_color"],[64,64])
+        catalog.write_text(json.dumps([dict(id="x",label="X",index="models.json")]*2))
+        with self.assertRaisesRegex(ValueError,"distinct"):viewer.attach_models(cases,catalog)
+        catalog.write_text(json.dumps([dict(id="x",label="X",index="models.json")]))
+        index.write_text("{}")
+        with self.assertRaisesRegex(ValueError,"no result"):viewer.attach_models(cases,catalog)
+
     def test_source_updated_during_prepare_keeps_decoded_identity(self):
         import shutil
         from unittest.mock import patch

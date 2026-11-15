@@ -151,3 +151,37 @@ then passed on Windows. Reported separate malformed-header division/shift issue
 for his owned serializer. Interactive browser execution remains unverified by
 our automation; static reference renders were inspected. No game launch, install,
 SDK/runtime replacement, in-game quality or performance claim.
+
+## 2026-11-14 Pacific — five-choice AI comparison delivered
+
+Cort requested all three shortlisted AI models and a direct selector. Claimed
+this offline lane in central COMMS (61454f5), leaving Fable's runtime capture and
+loader lane untouched. Based on his 6db3a8d shared history, added an optional
+inference callback to his baseline preparer, a Spandrel model runner, strict
+same-source model catalogue, selector and fixed-light contact sheets. Existing
+Real-ESRGAN and Lanczos stay available. Camera/light and original normal/roughness
+are preserved across model changes. Colour-hidden isolation modes explain it.
+
+Downloaded PBRify V3 and both HAT weights from author links. Ran all three on the
+six existing sources, without regenerating them: 18 actual RTX 5070 Ti results,
+1024-square colour. Same wrap padding, source identity, alpha, linear mips and
+BC7 compression. Weights/libraries/cache remain local, not in game or git.
+Initial environment install failed due to overlapping pip processes; repaired
+sequentially with pinned CUDA torch/vision, then installed Spandrel. CUDA and
+pip dependency check passed. Exact hashes, provenance and limitations are in
+docs/MATERIAL-MODEL-COMPARISON-20261114.md.
+
+31 offline regressions PASS with real compression. Generated-gallery validation
+PASS: six cases, five selections, 654 decoded mips, all five colour outputs
+pixel-distinct per case. Node test of the actual controller and generated data
+PASS: selected pixels, retained originals/normals, fixed camera/light, retained
+model across materials and isolated-view explanation. Mock DOM/GL is not a
+browser renderer. Inspected actual BC-decoded timber and linen contact sheets.
+PBRify retains a much stronger linen weave; HAT variants differ, with sharper
+adding timber markings. No universal winner or game-benefit claim.
+
+Updated the EXISTING OneDrive Documents Lab and verified its HTML hash matches
+3a7890e3f85535e225519d8fe4321f2719b5a7d49988a4cbd7ea9d64ebb91ff5. Existing desktop
+Chrome shortcut still points there. Preserved previous HTML, added six model
+contact sheets, updated Read Me and copied author notices/provenance/receipts.
+No game launch, control, deployment or runtime edits in this increment.

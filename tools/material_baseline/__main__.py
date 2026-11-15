@@ -42,7 +42,7 @@ def upscale_rgb(rgb, scale, upscaler, model, work):
     return out
 
 
-def prepare(source_folder, cache_root, texconv, upscaler, model, scale, tool_identity):
+def prepare(source_folder, cache_root, texconv, upscaler, model, scale, tool_identity, upscale=None):
     source_folder, cache_root, texconv = Path(source_folder), Path(cache_root), Path(texconv)
     metadata = json.loads((source_folder/"source.json").read_text(encoding="utf-8"))
     if metadata.get("address") != "wrap":
@@ -63,6 +63,8 @@ def prepare(source_folder, cache_root, texconv, upscaler, model, scale, tool_ide
                                 model_sha256=tool_identity["model_sha256"]),
                   seed=metadata["seed"], fixture=bool(metadata["fixture"]), sources=[entry],
                   encoder_sha256=sha256(texconv.read_bytes()), numpy_version=np.__version__)
+    if tool_identity.get("inference"):
+        recipe["settings"]["inference"] = tool_identity["inference"]
     key = sha256(cache.canonical(recipe))
     target = cache_root/key
     if target.exists():
@@ -70,7 +72,7 @@ def prepare(source_folder, cache_root, texconv, upscaler, model, scale, tool_ide
     cache_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".preparing-", dir=cache_root) as tmp:
         folder = Path(tmp)
-        big = upscale_rgb(rgba[..., :3], scale, upscaler, model, folder)
+        big = (upscale or upscale_rgb)(rgba[..., :3], scale, upscaler, model, folder)
         alpha = np.asarray(Image.fromarray(rgba[..., 3]).resize((w*scale, h*scale), Image.BICUBIC), dtype=float)/255
         for leftover in ("in.png", "out.png"):
             if (folder/leftover).exists():
