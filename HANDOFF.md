@@ -1,3 +1,17 @@
+# 2026-11-14 Pacific — three additional AI models and selector delivered
+
+Astra 78c58ae / PR141 into Fable's shared branch. Existing desktop Material Lab
+now contains actual PBRify V3, HAT fidelity and HAT sharper, plus Real-ESRGAN and
+Lanczos. All three new models ran on the same six source materials. Same camera,
+light and original normal/roughness retained while switching. Six Models PNGs
+provide fixed-light comparisons. Previous HTML preserved; delivered HTML hash
+3a7890e3f85535e225519d8fe4321f2719b5a7d49988a4cbd7ea9d64ebb91ff5.
+31 offline tests pass; 654 embedded mips validate; actual-gallery controller
+tests pass with mock DOM/GL. No game deployment or actual browser-render claim.
+COMMS has full handoff and local evidence; runtime loader remains Fable's lane.
+
+---
+
 # 2026-11-14 Pacific — AI material comparison and runtime-source intake ready
 
 Astra 4f2b32e/1e91f4a, PR140 into Fable's shared runtime branch. Existing Lab in

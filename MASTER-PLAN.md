@@ -1,5 +1,18 @@
 # NeuralAliasAbundance: master plan
 
+## Material AI model selection delivered — 2026-11-14 Pacific
+
+Astra **78c58ae**, PR141 into Fable's shared branch, adds the three requested
+models and a direct selector to the existing Material Lab. PBRify V3, HAT
+fidelity and HAT sharper actually ran on all six existing sources; Real-ESRGAN
+and Lanczos are retained. Eighteen new results, 31 offline regressions passing,
+654 embedded mip images validated, actual-gallery controller checks passing.
+Existing Documents Lab/Desktop shortcut updated in place; preceding HTML saved.
+Model provenance, receipts and local paths are recorded in COMMS and
+`docs/MATERIAL-MODEL-COMPARISON-20261114.md` at that commit. No game runtime or
+installation changed. Fable retains acquisition/loader work; this is an offline
+comparison of the synthetic fixtures, not game-material improvement evidence.
+
 ## Material handoff update — 2026-11-14 Pacific
 
 Astra's preparation increment **4f2b32e / 1e91f4a** is ready in PR140 **into
