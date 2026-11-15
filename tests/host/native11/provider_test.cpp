@@ -1469,6 +1469,101 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
            "the status counts the visible replacement and its memory");
     expect(tex_removed[1] > .9f && tex_removed[0] < .1f && textures_after.replaced == 0 && textures_after.replaced_bytes == 0,
            "a withdrawn replacement leaves the game's texture and no accounted memory");
+    // A second version published over a visible one, then removal, all without a bind by the game
+    // (Astra's sequence, COMMS f55ee3e3): pixels and the game-facing view at each step.
+    std::vector<uint32_t> blue(size_t(64) * 64, 0xffff0000u);
+    D3D11_SUBRESOURCE_DATA blue_data{blue.data(), 64 * 4, 0};
+    ComPtr<ID3D11Texture2D> marker_b;
+    ComPtr<ID3D11ShaderResourceView> marker_b_view;
+    expect(SUCCEEDED(g.device->CreateTexture2D(&marker_desc, &blue_data, &marker_b)) &&
+           SUCCEEDED(g.device->CreateShaderResourceView(marker_b.Get(), nullptr, &marker_b_view)),
+           "create the second marker texture");
+    float ver_a[4]{}, ver_b[4]{}, ver_none[4]{};
+    ComPtr<ID3D11ShaderResourceView> seen_a, seen_b, seen_none;
+    na::native11::PublishTexture(mip_view.Get(), marker_view.Get(), 1);
+    na::native11::TexturesOnPresent();
+    g.ctx->Draw(4, 0); ReadCopy(g, ver_a, g.color.Get());
+    g.ctx->PSGetShaderResources(0, 1, &seen_a);
+    na::native11::PublishTexture(mip_view.Get(), marker_b_view.Get(), 1);
+    na::native11::TexturesOnPresent();
+    g.ctx->Draw(4, 0); ReadCopy(g, ver_b, g.color.Get());
+    g.ctx->PSGetShaderResources(0, 1, &seen_b);
+    na::native11::RemoveTexture(mip_view.Get());
+    na::native11::TexturesOnPresent();
+    g.ctx->PSGetShaderResources(0, 1, &seen_none); // before any draw has repaired the slot
+    g.ctx->Draw(4, 0); ReadCopy(g, ver_none, g.color.Get());
+    std::printf("native texture versions (r/g/b): A %.2f/%.2f/%.2f, B %.2f/%.2f/%.2f, removed %.2f/%.2f/%.2f\n", ver_a[0],
+                ver_a[1], ver_a[2], ver_b[0], ver_b[1], ver_b[2], ver_none[0], ver_none[1], ver_none[2]);
+    expect(ver_a[0] > .9f && ver_a[1] > .9f && ver_b[2] > .9f && ver_b[0] < .1f && ver_b[1] < .1f,
+           "a newer version replaces a visible one without a new bind by the game");
+    expect(ver_none[1] > .9f && ver_none[0] < .1f && ver_none[2] < .1f,
+           "removal after two versions restores the game's texture without a new bind");
+    expect(seen_a.Get() == mip_view.Get() && seen_b.Get() == mip_view.Get() && seen_none.Get() == mip_view.Get(),
+           "the game reads back its own view under each version and after removal");
+    seen_a.Reset(); seen_b.Reset(); seen_none.Reset();
+    // The game may drop its last reference to a view it has bound: D3D keeps a bound view alive, and
+    // so must the swap while a replacement sits in its place.
+    ComPtr<ID3D11Texture2D> second;
+    ComPtr<ID3D11ShaderResourceView> second_view;
+    expect(SUCCEEDED(g.device->CreateTexture2D(&td, initial, &second)) &&
+           SUCCEEDED(g.device->CreateShaderResourceView(second.Get(), nullptr, &second_view)),
+           "create a second game texture");
+    ID3D11ShaderResourceView* second_raw = second_view.Get();
+    g.ctx->PSSetShaderResources(0, 1, &second_raw);
+    na::native11::PublishTexture(second_raw, marker_view.Get(), 1);
+    na::native11::TexturesOnPresent();
+    float gone_on[4]{}, gone_off[4]{};
+    g.ctx->Draw(4, 0); ReadCopy(g, gone_on, g.color.Get());
+    const uint64_t retired_bound = na::native11::GetTextureStats().retired;
+    second_view.Reset(); second.Reset(); // the game's last references; the slot still binds it
+    ComPtr<ID3D11ShaderResourceView> seen_gone;
+    g.ctx->PSGetShaderResources(0, 1, &seen_gone);
+    const bool gone_identity = seen_gone.Get() == second_raw;
+    seen_gone.Reset();
+    na::native11::SetTexturesEnabled(false);
+    g.ctx->Draw(4, 0); ReadCopy(g, gone_off, g.color.Get());
+    na::native11::SetTexturesEnabled(true);
+    g.ctx->Draw(4, 0);
+    const uint64_t retired_held = na::native11::GetTextureStats().retired;
+    ID3D11ShaderResourceView* nothing = nullptr;
+    g.ctx->PSSetShaderResources(0, 1, &nothing); // the real unbind: now the view may die
+    g.ctx->Flush(); // D3D11 destroys released objects lazily; a flush completes it
+    const uint64_t retired_unbound = na::native11::GetTextureStats().retired;
+    std::printf("native texture released-while-bound (r/g/b): replaced %.2f/%.2f/%.2f, off %.2f/%.2f/%.2f, retired %llu -> %llu -> %llu\n",
+                gone_on[0], gone_on[1], gone_on[2], gone_off[0], gone_off[1], gone_off[2],
+                static_cast<unsigned long long>(retired_bound), static_cast<unsigned long long>(retired_held),
+                static_cast<unsigned long long>(retired_unbound));
+    expect(gone_on[0] > .9f && gone_on[2] > .9f && gone_identity && gone_off[1] > .9f && gone_off[0] < .1f,
+           "a bound view the game has released is still read back and restored while it is bound");
+    expect(retired_held == retired_bound && retired_unbound == retired_bound + 1,
+           "that view lives exactly until the game's slot lets go of it");
+    // A deferred recording made while a replacement is visible samples it when executed.
+    g.ctx->PSSetShaderResources(0, 1, &texture_view);
+    na::native11::PublishTexture(mip_view.Get(), marker_view.Get(), 1);
+    na::native11::TexturesOnPresent();
+    ComPtr<ID3D11DeviceContext> texture_deferred;
+    g.device->CreateDeferredContext(0, &texture_deferred);
+    if (texture_deferred) {
+        auto* dc = texture_deferred.Get();
+        dc->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        dc->RSSetState(no_cull.Get()); dc->OMSetRenderTargets(1, &rt, nullptr);
+        dc->VSSetShader(g.vs_post.Get(), nullptr, 0); dc->PSSetShader(mip_shader.Get(), nullptr, 0);
+        dc->PSSetShaderResources(0, 1, &texture_view); material_raw = material.Get();
+        dc->PSSetSamplers(0, 1, &material_raw); Viewport(dc, g.w, g.h);
+        ComPtr<ID3D11ShaderResourceView> seen_deferred;
+        dc->PSGetShaderResources(0, 1, &seen_deferred);
+        dc->Draw(4, 0);
+        ComPtr<ID3D11CommandList> recorded;
+        float deferred_tex[4]{};
+        expect(SUCCEEDED(dc->FinishCommandList(FALSE, &recorded)), "record a draw with a replaced texture");
+        if (recorded) g.ctx->ExecuteCommandList(recorded.Get(), TRUE);
+        ReadCopy(g, deferred_tex, g.color.Get());
+        expect(deferred_tex[0] > .9f && deferred_tex[1] > .9f && deferred_tex[2] > .9f && seen_deferred.Get() == mip_view.Get() &&
+               na::native11::GetTextureStats().swapped_deferred > 0,
+               "a deferred recording samples the replacement and reads back the game's view");
+    } else expect(false, "create deferred texture context");
+    na::native11::RemoveTexture(mip_view.Get());
+    na::native11::TexturesOnPresent();
     na::capture::j2::Shutdown();
     na::capture::Shutdown();
     DeleteFileW(ini.c_str());

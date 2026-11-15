@@ -14,8 +14,10 @@
 // status line counts deferred swaps separately for that reason.
 //
 // Lifetime: the table of judged views holds no reference on a game object; a view's destruction is
-// seen through its private data and retires its entry and replacement. A retired replacement is
-// released eight Presents later, so a thread recording a deferred list never binds a freed view.
+// seen through its private data and retires its entry and replacement. A replacement chosen for a
+// bind is referenced from the lookup until the real bind has taken D3D's own reference
+// (SwapTextures .. EndTextureSwap, and inside RefreshTextures), so a thread recording a deferred
+// list can be held up for any length of time without binding a freed view.
 // The one reference taken on a game view is the bind reference D3D itself would have held: while a
 // replacement sits in a slot in the game's view's place, that context's PsShadow keeps the game's
 // view alive, taken on the game's own bind call. It is what the slot is restored from and what
@@ -74,6 +76,8 @@ bool InstallTextures(void* device);
 // (at least `count` entries) holding the views to bind instead. `shadow` is that context's.
 ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& shadow, unsigned start, unsigned count,
                                               ID3D11ShaderResourceView* const* views, ID3D11ShaderResourceView** scratch);
+// After the real bind of what SwapTextures returned: lets go of the replacements it referenced.
+void EndTextureSwap(unsigned count, ID3D11ShaderResourceView* const* views, ID3D11ShaderResourceView* const* bound);
 // The provider's per-context shadow for a context of the game's device (null otherwise). Implemented
 // by the provider; used by the PSGetShaderResources hook.
 PsShadow* TextureShadowOf(ID3D11DeviceContext* c);

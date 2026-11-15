@@ -29,7 +29,8 @@ enum : uint32_t { kCreateShaderResourceView = 7 }; // ID3D11Device
 enum : uint32_t { kPSGetShaderResources = 73 };    // ID3D11DeviceContext
 constexpr unsigned kSlots = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
 constexpr uint64_t kCensusEvery = 16;   // frames; binds are counted on one frame in this many
-constexpr uint64_t kGraveFrames = 8;    // a retired replacement is released this many Presents later
+constexpr uint64_t kGraveFrames = 8;    // tidy-up delay only: a retired replacement is released this many Presents later.
+                                        // Safety does not rest on it: every use between lookup and the real bind holds a reference.
 constexpr size_t kMaxEntries = 262144;  // views tracked at once; beyond it new views are not judged
 constexpr size_t kCensusRows = 48;
 
@@ -359,7 +360,8 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
                 }
             }
             if (replace && e.replacement) {
-                scratch[i] = e.replacement.Get(); // stays alive at least kGraveFrames Presents
+                scratch[i] = e.replacement.Get();
+                scratch[i]->AddRef(); // held until EndTextureSwap, after the real bind has taken its own
                 ++changed;
             }
         }
@@ -373,6 +375,13 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
     return scratch;
 }
 
+void EndTextureSwap(unsigned count, ID3D11ShaderResourceView* const* views, ID3D11ShaderResourceView* const* bound)
+{
+    if (!views || !bound || bound == views) return;
+    for (unsigned i = 0; i < count; ++i)
+        if (bound[i] && bound[i] != views[i]) bound[i]->Release();
+}
+
 uint64_t TexturePolicyKey() { return g_installed.load(std::memory_order_relaxed) ? g_generation.load(std::memory_order_relaxed) : 0; }
 
 void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn original_set)
@@ -384,6 +393,7 @@ void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn orig
     ID3D11ShaderResourceView* bound[kSlots]{}; // referenced until the end of this call
     ID3D11ShaderResourceView* game[kSlots]{};
     ID3D11ShaderResourceView* want[kSlots]{};
+    bool leased[kSlots]{}; // want[i] is a replacement referenced here until the bind below has taken its own
     g_get[deferred](c, 0, kSlots, bound); // what is really bound: replacements included
     const bool replace = g_enabled.load(std::memory_order_relaxed);
     bool differs = false;
@@ -396,16 +406,22 @@ void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn orig
             game[i] = shadow.game[i] ? shadow.game[i] : bound[i];
             want[i] = game[i];
             const auto it = s.entries.find(game[i]);
-            if (replace && it != s.entries.end() && it->second->replacement) want[i] = it->second->replacement.Get();
+            if (replace && it != s.entries.end() && it->second->replacement) {
+                want[i] = it->second->replacement.Get();
+                want[i]->AddRef();
+                leased[i] = true;
+            }
             if (want[i] != bound[i]) differs = true;
         }
     }
-    // want[] holds only views kept alive here: game views by `bound` or the shadow, replacements by
-    // the table or, if just retired, by the grave for kGraveFrames more Presents.
+    // Every view in want[] is referenced here: game views by `bound` or the shadow, replacements by
+    // the lease just taken. Released only after the bind, and outside the table's lock.
     if (differs) original_set(c, 0, kSlots, want);
     for (unsigned i = 0; i < kSlots; ++i) shadow.Set(i, want[i] != game[i] ? game[i] : nullptr);
-    for (auto* v : bound)
-        if (v) v->Release();
+    for (unsigned i = 0; i < kSlots; ++i) {
+        if (leased[i]) want[i]->Release();
+        if (bound[i]) bound[i]->Release();
+    }
 }
 
 void TexturesOnPresent()

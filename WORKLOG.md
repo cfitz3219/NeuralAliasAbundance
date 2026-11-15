@@ -1615,3 +1615,11 @@ An independent review (three readers, each finding then argued against by anothe
 Repair: the mapping is gone. Each context keeps, per pixel-shader slot where a replacement is bound, the game's own view with one reference (`PsShadow`, in the provider's per-context state), taken on the game's own bind call: the reference D3D would have held. Restoration and read-back work from it. Cleared wherever the context's state is reset. Several game views may now share one replacement. A context with nothing replaced and nothing replaceable is no longer re-bound when the policy key changes.
 
 Also from CI: the judged-texture facts type clashed with the scene `TextureFacts` in the same namespace; renamed `MaterialTextureFacts` (e4c6ca7, Windows build and non-GPU tests green).
+
+### Same day — Astra's three delivery corrections (COMMS f55ee3e3, written against e4c6ca7)
+
+1. Reverse identity erased while an old version is still bound: already repaired in 6a8100a (no reverse table; the slot's own shadow names the game's view). Her fixture sequence is now in the test: version A, version B with no bind by the game, removal, with pixels and the game-facing view checked at each step.
+2. Context ownership of the game's bound view: already repaired in 6a8100a (`PsShadow`). Her fixture is now in the test: the game releases its last reference to a bound view; it is still read back and restored, and it lives exactly until the slot lets go of it.
+3. A replacement was protected between lookup and the real bind only by the eight-Present delay. Now every replacement chosen for a bind is referenced from the lookup until the bind has taken D3D's own reference (`SwapTextures` .. `EndTextureSwap`, and inside `RefreshTextures`), released outside the table's lock. The delay remains as tidy-up only.
+
+Also added: a deferred recording made while a replacement is visible samples it when executed and reads back the game's view. Not covered yet: the game's view kept alive for the lifetime of a recorded command list (a list replays the replacement, which D3D keeps alive itself; the game's view is only needed for read-back and restoration on a context, which the shadow covers).

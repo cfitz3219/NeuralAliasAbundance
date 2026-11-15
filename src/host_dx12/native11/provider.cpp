@@ -1745,6 +1745,7 @@ void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start
     Ctx* x = Get(c); // null inside our own work and on other devices' contexts: bound as given
     const auto* bind = x ? SwapTextures(c, x->ps_shadow, start, n, v, swapped) : v;
     O(c, x).ps_srv(c, start, n, bind);
+    if (bind != v) EndTextureSwap(n, v, bind);
 }
 void STDMETHODCALLTYPE CSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
