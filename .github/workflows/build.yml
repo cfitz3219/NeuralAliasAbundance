@@ -34,9 +34,11 @@ jobs:
           Write-Output "X86-SCOPE errors by code:"
           $errs | ForEach-Object { if ($_.Line -match 'error ([A-Z]+[0-9]+)') { $Matches[1] } } | Group-Object | Sort-Object Count -Descending | ForEach-Object { Write-Output ("  {0,5}  {1}" -f $_.Count, $_.Name) }
           Write-Output "X86-SCOPE first 300 distinct error lines:"
-          $errs | ForEach-Object { ($_.Line -replace '^\s+','') -replace '\(\d+,\d+\)','' } | Sort-Object -Unique | Select-Object -First 300 | ForEach-Object { Write-Output "  $_" }
+          $errs | ForEach-Object { ($_.Line -replace '^\s+','') -replace ',\d+\)',')' } | Sort-Object -Unique | Select-Object -First 300 | ForEach-Object { Write-Output "  $_" }
           Write-Output "X86-SCOPE targets built:"
-          Select-String -Path build32-log.txt -Pattern '\.vcxproj -> ' | ForEach-Object { Write-Output ("  " + ($_.Line.Trim() -replace '^.*-> ','')) }
+          $built = Select-String -Path build32-log.txt -Pattern '\.vcxproj -> ' | ForEach-Object { ($_.Line.Trim() -replace '^.*-> ','') -replace '^.*\\','' }
+          Write-Output ("  count: " + @($built).Count)
+          Write-Output ("  libraries and programs: " + ((@($built) | Where-Object { $_ -notmatch '^na_cpu_|_test\.exe$|_corpus\.exe$' }) -join ' '))
           exit 0
 
   windows:

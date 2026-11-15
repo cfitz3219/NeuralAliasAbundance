@@ -46,8 +46,8 @@ struct Fixture {
         if(!inlined){auto h=code(helper);h.rip({0x8b,0x05},upcache);h.rip({0xf3,0x0f,0x10,0x0d},cache);dims(h);h.finish();}
         auto u=code(update);u.finish();
         IMAGE_DOS_HEADER dos{};dos.e_magic=IMAGE_DOS_SIGNATURE;dos.e_lfanew=0x80;put(0,dos);
-        IMAGE_NT_HEADERS64 nt{};nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION]={0x4800,uint32_t(image.functions.size()*sizeof(RUNTIME_FUNCTION))};put(0x80,nt);
-        for(unsigned n=0;n<image.functions.size();++n){auto f=image.functions[n];RUNTIME_FUNCTION rf{f.start,f.start+f.size,0x4a00};put(0x4800+n*uint32_t(sizeof rf),rf);}bytes[0x4a00]=1;
+        IMAGE_NT_HEADERS64 nt{};nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION]={0x4800,uint32_t(image.functions.size()*sizeof(_IMAGE_RUNTIME_FUNCTION_ENTRY))};put(0x80,nt);
+        for(unsigned n=0;n<image.functions.size();++n){auto f=image.functions[n];_IMAGE_RUNTIME_FUNCTION_ENTRY rf{f.start,f.start+f.size,0x4a00};put(0x4800+n*uint32_t(sizeof rf),rf);}bytes[0x4a00]=1;
         put(setting,1.f);put(cache,1.f);put(active,1.f);put(fw,3440u);put(fh,1440u);put(sw,3440u);put(sh,1440u);put(up,3u);put(upcache,3u);
     }
 };

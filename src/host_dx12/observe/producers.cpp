@@ -2314,7 +2314,7 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
             if (!recipe) continue;
             float total = biased(recipe->native_bias, target);
             if (total != recipe->stored_bias) {
-                const D3D12_CPU_DESCRIPTOR_HANDLE handle{dst + uint64_t(copied + i) * inc};
+                const D3D12_CPU_DESCRIPTOR_HANDLE handle{static_cast<SIZE_T>(dst + uint64_t(copied + i) * inc)};
 #if defined(__ID3D12Device11_INTERFACE_DEFINED__)
                 if (recipe->modern) {
                     if (!device11) dev->QueryInterface(IID_PPV_ARGS(&device11));
