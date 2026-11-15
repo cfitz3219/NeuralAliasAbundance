@@ -1101,3 +1101,6 @@ Supersedes 58313bb package: e06f539 fixes Material enhancement missing from nati
 
 ### 2026-11-15 — WWII material pilot visual result failed
 Cort tested e06f539: only matching ground area activated, no visible benefit. PID33868 four maps loaded and 701904 bindings; these do not prove shader consumption. Astra675afa6/PR142 adds draw-time static-reference counts and matched-footprint regressions; seven tests pass. Runtime recipe unchanged, installer remains e06f539. Complete report docs/MATERIAL-WWII-VISUAL-FAILURE-20261115.md on material branch; COMMS directs Fable to existing terrain shader/packing evidence. The in-game visual cause remains unresolved; no new user run requested and no deployment.
+
+### 2026-11-15 — Rome II materials ready for the combined package
+Astra 102bfda / PR142 prepared four original Rome II DDS overrides for early legionary shield and Greek high pavement, retaining DXT1 colour and alpha/green DXT5 normals at 2x dimensions. Lab is updated and browser/GPU verified. RPFM Mod pack and SHA receipt are staged in C:\Users\Cort\NA-material-preparation\local\rome2-materials\prepared. See COMMS for the exact combined installer input and Workshop overlaps. Fable's 32-bit DLAA port is the joint-package dependency. No game files installed or game launched.
