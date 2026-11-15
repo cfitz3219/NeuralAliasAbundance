@@ -80,6 +80,24 @@ def write(cases, output):
         row = {k: case[k] for k in ("name", "family", "split")}
         row["original"] = candidate(case["original"])
         row["coordinated"] = candidate(case["coordinated"])
+        row['combined'] = bool(case.get('combined'))
+        if row['combined']:
+            combined = cache.validate(case['coordinated'])
+            base = cache.validate(case['baseline'])
+            viewer_source = cache.validate(case['original'])
+            check_baseline(viewer_source,combined)
+            if combined['settings'].get('colour_entry') != base['entry_key']:
+                raise ValueError('combined surface does not belong to selected colour model')
+            a=next(m['sha256'] for m in combined['maps'] if m['role']=='base_color')
+            b=next(m['sha256'] for m in base['maps'] if m['role']=='base_color')
+            if a != b:
+                raise ValueError('combined comparison changed the colour baseline')
+            row['comparisons']={'baseline':{**candidate(case['baseline']), 'label':'PBRify alone',
+                                          'description':'PBRify colour with the original surface details.'}}
+            # Same colour in both panels: embed once and bind it explicitly in the viewer.
+            del row['coordinated']['maps']['base_color']
+            payload.append(row)
+            continue
         row["baseline"] = candidate(case["baseline"]) if case.get("baseline") else None
         row["conventional"] = candidate(case["conventional"]) if case.get("conventional") else None
         row["comparisons"] = {}

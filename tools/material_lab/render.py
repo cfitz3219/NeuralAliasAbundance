@@ -78,9 +78,22 @@ def render(material, size=384, light_phase=1.35, yaw_degrees=-18):
     st[..., 1] = 1-st[..., 1]
     albedo = sample_mips(material["base_color"], st)[..., :3]
     xy = sample_mips(material["normal"], st)[..., :2]*2-1
+    strength = material.get('surface_strength',1.)
+    if 'authored_normal' in material and strength < 1:
+        original_xy = sample_mips(material['authored_normal'],st)[...,:2]*2-1
+        if strength <= 0:
+            xy = original_xy
+        else:
+            old_slope = original_xy/np.sqrt(np.maximum(.001,1-np.sum(original_xy*original_xy,-1)))[...,None]
+            new_slope = xy/np.sqrt(np.maximum(.001,1-np.sum(xy*xy,-1)))[...,None]
+            mixed = old_slope*(1-strength)+new_slope*strength
+            xy = unit(np.dstack((mixed,np.ones(mixed.shape[:2]))))[...,:2]
     z = np.sqrt(np.maximum(.001, 1-np.sum(xy*xy, -1)))
     normal = unit(tangent*xy[..., 0:1] - bitangent*xy[..., 1:2] + n0*z[..., None])
     rough = np.maximum(.06, sample_mips(material["roughness"], st)[..., 0])
+    if 'authored_roughness' in material:
+        rough = np.maximum(.06, sample_mips(material['authored_roughness'],st)[...,0]*(1-strength)
+                           + sample_mips(material['roughness'],st)[...,0]*strength)
     view = unit(np.array([0, 0, 3])-point)
     light = unit(np.array([1.7*np.cos(light_phase), 1., 1.25+.65*np.sin(light_phase)]))
     half = unit(view+light)
@@ -117,7 +130,11 @@ def previews(cases, output, size=384):
         original, coordinated = maps(case["original"], None), maps(case["coordinated"], None)
         baseline = {**original, **maps(case["baseline"], None)} if case.get("baseline") else {
             **original, "base_color": coordinated["base_color"]}
+        if case.get('combined'):
+            coordinated.update(authored_normal=original['normal'],authored_roughness=original['roughness'],surface_strength=.65)
         normal_only = {**original, "normal": coordinated["normal"]}
+        if case.get('combined'):
+            normal_only = {**coordinated,'roughness':original['roughness']}
         width, padding = size*3+64, 16
         sheet = Image.new("RGB", (width, size*2+270), "#11171b")
         draw = ImageDraw.Draw(sheet)
@@ -126,17 +143,17 @@ def previews(cases, output, size=384):
         draw.text((24, 86), "Identical light, camera and exposure. Rendered from the compressed cache.",
                   font=font(16), fill="#a8b9c1")
         entries = [("Original", original),
-                   ("AI colour upscale" if case.get("baseline") else "Colour-only control", baseline),
-                   ("Coordinated material", coordinated),
-                   ("Original | grazing light", original),
-                   ("New normals only | grazing light", normal_only),
-                   ("Coordinated | grazing light", coordinated)]
+                   ("PBRify alone" if case.get('combined') else "AI colour upscale" if case.get("baseline") else "Colour-only control", baseline),
+                   ("Combined result | 65%" if case.get('combined') else "Coordinated material", coordinated),
+                   ("PBRify | grazing light" if case.get('combined') else "Original | grazing light", baseline if case.get('combined') else original),
+                   ("Added surface only | grazing light" if case.get('combined') else "New normals only | grazing light", normal_only),
+                   ("Combined | grazing light" if case.get('combined') else "Coordinated | grazing light", coordinated)]
         for i, (label, material) in enumerate(entries):
             col, row = i % 3, i // 3
             x, y = padding+col*(size+16), 122+row*(size+56)
             draw.text((x, y), label, font=font(16), fill="#edf3f4")
             sheet.paste(render(material, size, 1.35 if row == 0 else .15), (x, y+28))
-        draw.text((24, size*2+244), "Procedural candidate / synthetic source / no in-game result claimed",
+        draw.text((24, size*2+244), "Learned detail over original maps / synthetic samples" if case.get('combined') else "Procedural candidate / synthetic source / no in-game result claimed",
                   font=font(14), fill="#a8b9c1")
         sheet.save(output/f"Preview-{case['name']}.png")
 

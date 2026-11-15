@@ -185,3 +185,40 @@ Updated the EXISTING OneDrive Documents Lab and verified its HTML hash matches
 Chrome shortcut still points there. Preserved previous HTML, added six model
 contact sheets, updated Read Me and copied author notices/provenance/receipts.
 No game launch, control, deployment or runtime edits in this increment.
+
+## 2026-11-14 Pacific — PBRify plus trained surface models, original maps retained
+
+Cort chose PBRify and requested a suitable existing material model, preservation
+of original surface detail and a direct combined comparison. Claimed the offline
+lane in COMMS 427aea9, leaving runtime acquisition/association/loader with Fable.
+Selected the author's CC0 PBRify NormalV3 and RoughnessV2 SPAN models, also used by
+NVIDIA's RTX Remix reference workflow. Downloaded the official 1.7.1 release and
+verified weights/hashes; colour stays the existing preferred RPLKSRd V3. Actual
+inference on all six unchanged Lab sources completed (twelve surface estimates)
+on RTX 5070 Ti. Models/environment/predictions remain local.
+
+Implemented fine residuals over original normal/roughness, bounded slope/roughness
+additions and original-edge suppression. No procedural noise or replacement of
+the entire authored surface. Exact PBRify colour DDS is shared byte-for-byte.
+Reused original identity/cache, mip filtering, BC compression and publication.
+The author's DirectX normal orientation matches the Lab's +V tangent direction;
+no Y flip. Protection is a heuristic, not semantic recognition. Full details and
+repeatable commands are in docs/MATERIAL-LEARNED-SURFACE-20261114.md.
+
+Default page now shows Original / PBRify alone / Combined result, with a live
+surface slider starting at 65%. At 0 it directly samples original surface maps,
+not a resampled approximation, keeping the two arms identical. Old five-model
+gallery is preserved as AI-model-comparison.html with a link from the new page.
+Existing desktop shortcut and Documents entry point retained. New HTML SHA256
+7eed792a81467bc11e0298096b16e94cd29b35136f50ed76e4ad389e4234d3db.
+
+Validation: 37 Python tests PASS with actual texconv, no skips; actual-gallery
+controller and legacy five-choice controller PASS using mock DOM/GL. All 360
+embedded mip images decode. Six output colour DDS files exactly match PBRify;
+18 actual-cache reference renders at zero strength exactly match the middle arm.
+All six nonzero-strength outputs differ. Inspected linen/slate static renders:
+surface changes are restrained, not a dramatic transformation. No claimed
+superiority from tests. No interactive browser GPU render or real-game result.
+The published surface maps are 1024 square; Fable's same-size-only runtime loader
+must not accept them blindly. Its extent/format/role work remains separate.
+No game runtime, game files, game testing or installation changed.

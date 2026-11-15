@@ -1,4 +1,33 @@
-# Material Lab: first coordinated-detail candidate
+# Material Lab
+
+## Current comparison: PBRify colour + learned surface detail
+
+The default prepared Lab now compares **Original**, **PBRify alone**, and
+**Combined result**. PBRify RPLKSRd V3 supplies identical colour to the two enhanced
+panels. Author-provided PBRify NormalV3 and RoughnessV2 models supply fine detail
+for the combined panel, with original normal/roughness maps retained as its base.
+There is no procedural noise in this new candidate. Surface detail defaults to
+65%; 0% uses the original surface textures directly and exactly matches PBRify
+alone. The prior five-model comparison remains at `AI-model-comparison.html` in
+the user package, linked from the new page.
+
+These models run offline through the existing PyTorch/Spandrel environment.
+The browser only displays prepared maps. Dependencies, weights and prepared
+assets stay local; the game DLL is unchanged. See
+[model provenance and combination details](../../docs/MATERIAL-LEARNED-SURFACE-20261114.md).
+
+```powershell
+python -m tools.material_lab.surface_runner --sources local/material-demo/sources --colour-index local/model-comparisons/pbrify-v3.json --cache local/learned-surface/cache --predictions local/learned-surface/predictions --index local/learned-surface/combined.json --texconv local/tools/texconv.exe --normal-model local/material-models/1x-PBRify_NormalV3.pth --rough-model local/material-models/1x-PBRify_RoughnessV2.pth
+python -m tools.material_lab compare --comparison local/material-demo/comparison.json --output local/combined-material-gallery --baseline-index local/model-comparisons/pbrify-v3.json --combined-index local/learned-surface/combined.json
+```
+
+The surface runner requires declared periodic positive-Z tangent materials and
+the paired 1x SPAN models. It reuses existing source identities, BC compression,
+mip generation and immutable publication. It never overwrites authored sources.
+Generated HTML embeds all needed maps; when packaging it, also preserve the
+earlier five-model gallery as `AI-model-comparison.html` for the comparison link.
+
+## Earlier procedural candidate (retained for comparison)
 
 Owner: Astra. Runtime acquisition and binding: Fable. This is the offline M1
 prototype from the approved material-enhancement plan, not an injected effect.
