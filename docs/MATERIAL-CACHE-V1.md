@@ -8,6 +8,13 @@ Each immutable cache directory is named by `entry_key`, a lowercase SHA256 of th
 
 First outputs: BC7_UNORM_SRGB (99) for base colour, BC5_UNORM (83) for positive-Z tangent normal XY, BC4_UNORM (80) for perceptual roughness. Input conventions must be explicitly converted before generation. The normal XY direction is preserved from the source; no assumption that every game's green channel has the same sign. Packed destination maps require repacking and a proved shader interpretation by the runtime owner; do not bind a BC4 roughness image to an unrelated packed slot. Larger prepared dimensions are allowed by the file format, not automatically qualified for a particular shader. The first generator preserves dimensions.
 
+Fable's follow-up adds optional v1 source provenance: `resource_format` (0 means
+unknown/file input), `first_array_slice` (default 0), and `array_size` (default 1).
+Older v1 records may omit these fields. Hash the stored recipe exactly as written;
+do not inject defaults before checking its digest. Defaults apply when interpreting
+the record or comparing sources. The preparer remains ordinary 2D/single-slice;
+these fields prevent discarding capture facts, not a claim of array processing.
+
 Writer creates all maps in a private temporary directory, checks bytes/headers/hashes, writes the manifest last, and renames the completed directory into the content cache. Never mutate an existing entry. Incomplete directories have no published manifest and are not candidates. The runtime loads one record/map set, then publishes it as a unit under its own exact recording/submission lifetime policy. Preparing a valid record is not proof of bound shader use.
 
 The generation source may be file bytes (prototype inputs) or a normalized owned subresource dump (runtime census). Identity domains cannot be interchanged. Source association with actual game SRVs is the acquisition owner's job; no fixture filename or content key automatically identifies a game material. Source mutation, changed mip ranges, role decoding, settings or generator version produce a different entry. Runtime maps process-local resource generations to these immutable entries and accounts for old submitted versions separately.
