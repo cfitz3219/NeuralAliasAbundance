@@ -1,3 +1,23 @@
+# 2026-11-14 Pacific — PBRify + trained surface comparison delivered
+
+Astra 835554b / PR142 into Fable's shared line. Existing Documents Lab/Desktop
+shortcut now opens Original / PBRify alone / Combined result with a live surface
+slider (65% default, 0% exactly PBRify alone). CC0 PBRify NormalV3 and RoughnessV2
+ran on the same six samples; original surface maps remain the base and only fine
+learned residuals are added. Same byte-identical PBRify colour in both enhanced
+panels. Prior five-model comparison is preserved and linked.
+
+37 offline tests pass with actual compression, 360 embedded mips decode, eighteen
+zero-strength reference renders are identical, actual-controller tests pass with
+mock DOM/GL. Static linen/slate renders inspected; no game or browser GPU result.
+Package HTML hash 7eed792a81467bc11e0298096b16e94cd29b35136f50ed76e4ad389e4234d3db.
+Exact provenance/cache/receipt paths in COMMS and
+docs/MATERIAL-LEARNED-SURFACE-20261114.md on the branch. Fable's runtime loader
+still requires same-size qualified inputs: these 4x Lab maps must not be blindly
+installed. Offline task complete; no game installation changed.
+
+---
+
 # 2026-11-14 Pacific — three additional AI models and selector delivered
 
 Astra 78c58ae / PR141 into Fable's shared branch. Existing desktop Material Lab

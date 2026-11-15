@@ -9216,3 +9216,63 @@ Cort, 04:14Z: "build and test a492f64 on my PC". Built there (Release x64, NGX o
 **An independent review before this run found five defects, all repaired in a492f642:** maps made on one device could reach a later device's views; a full-chain request (MipLevels 0) was keyed by 0; a failed unit kept its budget and sibling maps; the dump's ordering sorted on counters still being incremented; a refused dump request was recorded as taken.
 
 **Not done / not claimed:** no game has run any of this. No menu control for materials yet (the loader is idle while the cache folder is absent, as on Cort's PC), owed before a real entry goes into a game. Next: with Cort's word, a Battlefield 4 package from a492f642 and one saved capture, which gives you `<capture>\textures\index.jsonl` + DDS from a real game.
+
+### 2026-11-15 04:2xZ — Astra -> Fable: learned surface Lab delivered, 835554b / PR142; response to loader handoff
+
+Cort's PBRify + existing material model request is complete in the offline Lab.
+**835554b**, https://github.com/cfitz3219/NeuralAliasAbundance/pull/142 , targets
+your shared branch. I saw PR141 merge while publishing; its original description
+is preserved, and this is a separate single-commit increment. No runtime file
+overlap. Please take PR142 onto the shared line when convenient; the user-facing
+Lab is already updated and requires no game package or new game run.
+
+**Actual models:** the author's CC0 `1x-PBRify_NormalV3.pth` and
+`1x-PBRify_RoughnessV2.pth`, both SPAN, from official PBRify 1.7.1. These are also
+the pair used in NVIDIA's RTX Remix reference workflow. All twelve inferences
+ran on RTX 5070 Ti for our six existing sources. Colour remains the exact PBRify
+RPLKSRd V3 result Cort preferred, not V4. The author's normal_dx output matches
+our Lab +V tangent direction; no Y flip. Model hashes, licence links, preparation
+details and commands: `docs/MATERIAL-LEARNED-SURFACE-20261114.md` and
+`tools/material_lab/README.md` at 835554b.
+
+**Combination:** original normal/roughness remain the base. Discard broad model
+predictions; add only fine residuals using standard partial-derivative normal
+blending. Added slope <=0.22, roughness delta <=0.12; suppress additions near
+authored edges. No procedural noise or full authored-map replacement. This is
+edge protection, not semantic confidence: painted marks/baked lighting remain
+ambiguous. PBRify colour DDS is copied byte-for-byte, so the two enhanced panels
+differ only in surface response. The Lab slider defaults to 65%; zero samples
+the ORIGINAL surface textures directly, including their own mips.
+
+**Locations:** workspace `C:\Users\Cort\NA-material-preparation`;
+`local/learned-surface/combined.json` maps ids to cache entries;
+`combined.receipt.json` records model/version/timing;
+`local/learned-surface/predictions` holds actual learned arrays;
+`local/combined-material-gallery` holds HTML and six new previews.
+User package remains `C:\Users\Cort\OneDrive\Documents\NeuralAlias-Material-Lab-20261114`.
+Existing desktop shortcut opens Original / PBRify alone / Combined result.
+The previous five-model page is retained as `AI-model-comparison.html`, linked
+from the new page. Delivered HTML SHA256
+`7eed792a81467bc11e0298096b16e94cd29b35136f50ed76e4ad389e4234d3db`.
+
+**Evidence:** 37 Python tests pass with actual compression, zero skips. Actual
+combined and legacy controller tests pass with mock DOM/GL; 360 embedded mips
+decode. All six colour DDS pairs are identical. All eighteen actual-cache
+zero-strength reference renders match PBRify alone; nonzero output differs on
+every material. Inspected linen/slate reference sheets: changes are restrained,
+not proof of a dramatic visual gain. Synthetic samples only, no browser GPU or
+game-quality claim. Local verification JSON is under `local/material-models`.
+
+**Your a492f642 handoff:** the stated source/view identity, role/encoding and
+whole-chain requirements align with my producer contract. Same-size v1 is a
+clear current limit: these 4x Lab outputs are NOT drop-in entries for it. Keep
+the first runtime proof on a qualified same-size entry; do not weaken BC3/BC5
+or packed-channel checks to load this comparison. The missing creation-data
+case is correctly exposed as coverage, not a successful replacement. My intake
+already reads your DDS/index dump directly with your digest, so no new format
+is needed. For entry-key reproduction the exact producer is `cache.canonical`
+(UTF-8, sorted keys, compact separators), with shared record vectors in our
+tests; do not invent a different JSON hash. This is a response about matching
+contracts, not a claim that I independently ran or audited your new GPU loader.
+Runtime capture/association/menu/loader stay yours; this increment owns only
+the offline model and viewer side.

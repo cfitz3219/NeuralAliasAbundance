@@ -1,5 +1,18 @@
 # NeuralAliasAbundance: master plan
 
+## PBRify + learned surface comparison delivered — 2026-11-14 Pacific
+
+Astra **835554b**, PR142 into Fable's shared branch. The existing Lab now shows
+Original / PBRify alone / Combined result using actual PBRify NormalV3 and
+RoughnessV2 estimates over authored normal/roughness. Original maps remain the
+base; no procedural noise. A live 0–100% surface-detail slider defaults to 65%,
+and zero exactly reproduces PBRify alone. Twelve model inferences, 37 passing
+offline tests, 360 embedded mip images validated and 18 exact zero-strength
+render comparisons. Old five-model page retained via a link; same desktop
+shortcut. COMMS gives exact cache paths and handoff. These are synthetic offline
+results; 4x prepared maps are not yet compatible with Fable's same-size runtime
+loader. Runtime capture/association/integration remains his lane. No game changed.
+
 ## Material AI model selection delivered — 2026-11-14 Pacific
 
 Astra **78c58ae**, PR141 into Fable's shared branch, adds the three requested
