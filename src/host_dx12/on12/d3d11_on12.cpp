@@ -8,6 +8,7 @@
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/native_d3d11/shared_resources.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/settings.hpp"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -314,6 +315,7 @@ void install_native(ID3D11Device* device)
     // Material textures: census of what the game draws its surfaces with, and prepared replacements.
     if (!na::native11::InstallTextures(device))
         note("native DX11 route: the material texture hooks could not be installed");
+    na::native11::SetTexturesEnabled(na::settings::Get().material_enhancement.load()!=0);
     // Jitter through the game's viewports: no camera layout has to be proven per game.
     na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
     if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true)) {

@@ -8,8 +8,10 @@
 #include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/texture_policy.hpp"
 #include "materials/texture_subresources_v1.hpp"
+#include "materials/shader_texture_use.hpp"
 
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -31,7 +33,7 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-enum : uint32_t { kCreateTexture2D = 5, kCreateShaderResourceView = 7 }; // ID3D11Device
+enum : uint32_t { kCreateTexture2D = 5, kCreateShaderResourceView = 7, kCreatePixelShader = 15 }; // ID3D11Device
 enum : uint32_t { kPSGetShaderResources = 73 };    // ID3D11DeviceContext
 constexpr unsigned kSlots = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
 constexpr uint64_t kCensusEvery = 16;   // frames; binds are counted on one frame in this many
@@ -53,6 +55,26 @@ using PFN_CreateTex2D = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_T
                                                     ID3D11Texture2D**);
 PFN_CreateSrv g_create = nullptr;
 PFN_CreateTex2D g_create_texture = nullptr;
+using PFN_CreatePs = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
+PFN_CreatePs g_create_ps = nullptr;
+const GUID kShaderUseGuid = {0xb5db2c27,0x2ecb,0x4868,{0xa3,0x60,0x3c,0xed,0xa2,0x19,0xc4,0x5e}};
+struct ShaderUseBits { uint64_t safe[2] = {}; };
+
+HRESULT STDMETHODCALLTYPE CreatePixelShader_d(ID3D11Device* dev, const void* bytes, SIZE_T size,
+                                               ID3D11ClassLinkage* linkage, ID3D11PixelShader** out)
+{
+    const HRESULT hr = g_create_ps(dev,bytes,size,linkage,out);
+    if (FAILED(hr) || !out || !*out || IsOwnWork()) return hr;
+    ComPtr<ID3DBlob> listing;
+    ShaderUseBits bits;
+    if (SUCCEEDED(D3DDisassemble(bytes,size,D3D_DISASM_DISABLE_DEBUG_INFO,nullptr,&listing))) {
+        const auto use = na::materials::ReadShaderTextureUse(std::string_view(
+            static_cast<const char*>(listing->GetBufferPointer()), listing->GetBufferSize()));
+        for (unsigned i=0;i<128;++i) if (use.SafeForLarger(i)) bits.safe[i/64] |= uint64_t{1} << (i%64);
+    }
+    (*out)->SetPrivateData(kShaderUseGuid,sizeof(bits),&bits);
+    return hr;
+}
 PFN_GetSrvs g_get[2] = {}; // [0] immediate class, [1] deferred class
 
 struct Entry {
@@ -64,6 +86,7 @@ struct Entry {
     ComPtr<ID3D11ShaderResourceView> replacement, pending; // under State::mu
     uint64_t bytes = 0, pending_bytes = 0;
     bool pending_set = false; // a publish or a removal waits for the next Present
+    bool larger = false, pending_larger = false;
     std::atomic<bool> dump_taken{false}; // noted for the running source dump
 };
 
@@ -687,6 +710,8 @@ bool InstallTextures(void* device)
                                               reinterpret_cast<void**>(&g_create));
     ok = ok && na::hooking::PrepareVTableSlot(dev, kCreateTexture2D, reinterpret_cast<void*>(&CreateTexture2D_d),
                                               reinterpret_cast<void**>(&g_create_texture));
+    ok = ok && na::hooking::PrepareVTableSlot(dev, kCreatePixelShader, reinterpret_cast<void*>(&CreatePixelShader_d),
+                                              reinterpret_cast<void**>(&g_create_ps));
     ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kPSGetShaderResources, reinterpret_cast<void*>(&PSGetShaderResources_d),
                                               reinterpret_cast<void**>(&g_get[0]));
     if (ok && def) {
@@ -753,7 +778,7 @@ ID3D11ShaderResourceView* const* SwapTextures(ID3D11DeviceContext* c, PsShadow& 
                 if (g_dump_phase.load(std::memory_order_relaxed) == 1 && d.queue.size() < kDumpCollectMax)
                     d.queue.push_back({ComPtr<ID3D11ShaderResourceView>(views[i]), it->second});
             }
-            if (replace && e.replacement) {
+            if (replace && e.replacement && (!e.larger || shadow.larger_safe[start+i])) {
                 scratch[i] = e.replacement.Get();
                 scratch[i]->AddRef(); // held until EndTextureSwap, after the real bind has taken its own
                 ++changed;
@@ -778,6 +803,18 @@ void EndTextureSwap(unsigned count, ID3D11ShaderResourceView* const* views, ID3D
 
 uint64_t TexturePolicyKey() { return g_installed.load(std::memory_order_relaxed) ? g_generation.load(std::memory_order_relaxed) : 0; }
 
+void NoteTextureShader(PsShadow& shadow, ID3D11PixelShader* shader)
+{
+    ShaderUseBits bits;
+    UINT bytes=sizeof(bits);
+    if (!shader || FAILED(shader->GetPrivateData(kShaderUseGuid,&bytes,&bits)) || bytes!=sizeof(bits)) bits={};
+    const auto safe = std::bitset<128>(bits.safe[0]) | (std::bitset<128>(bits.safe[1]) << 64);
+    if (safe != shadow.larger_safe) {
+        shadow.larger_safe=safe;
+        shadow.shader_changed=true;
+    }
+}
+
 void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn original_set)
 {
     if (!c || !original_set || !g_installed.load()) return;
@@ -800,7 +837,8 @@ void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn orig
             game[i] = shadow.game[i] ? shadow.game[i] : bound[i];
             want[i] = game[i];
             const auto it = s.entries.find(game[i]);
-            if (replace && it != s.entries.end() && it->second->replacement) {
+            if (replace && it != s.entries.end() && it->second->replacement &&
+                (!it->second->larger || shadow.larger_safe[i])) {
                 want[i] = it->second->replacement.Get();
                 want[i]->AddRef();
                 leased[i] = true;
@@ -840,6 +878,7 @@ void TexturesOnPresent()
             }
             e.replacement = std::move(e.pending);
             e.bytes = e.pending_bytes;
+            e.larger = e.pending_larger;
             e.pending_set = false;
             if (e.replacement) {
                 g_replaced.fetch_add(1, std::memory_order_relaxed);
@@ -887,6 +926,7 @@ bool PublishTexture(ID3D11ShaderResourceView* original, ID3D11ShaderResourceView
         displaced = std::move(e.pending);
         e.pending = replacement;
         e.pending_bytes = bytes;
+        e.pending_larger = false; // same-size fixture/legacy publication
         if (!e.pending_set) {
             e.pending_set = true;
             s.pending.push_back(original);
@@ -915,6 +955,7 @@ size_t PublishTextures(const TexturePublication* items, size_t count)
             displaced.push_back(std::move(e.pending));
             e.pending = p.replacement;
             e.pending_bytes = p.bytes;
+            e.pending_larger = p.larger;
             if (!e.pending_set) {
                 e.pending_set = true;
                 s.pending.push_back(p.original);

@@ -29,6 +29,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <bitset>
 
 namespace na::native11 {
 
@@ -37,6 +38,8 @@ namespace na::native11 {
 struct PsShadow {
     ID3D11ShaderResourceView* game[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
     unsigned held = 0;
+    std::bitset<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> larger_safe;
+    bool shader_changed = false;
     PsShadow() = default;
     PsShadow(const PsShadow&) = delete;
     PsShadow& operator=(const PsShadow&) = delete;
@@ -58,6 +61,8 @@ struct PsShadow {
     }
     void Clear() // the context's state was reset (ClearState, a list finished or executed without restore)
     {
+        larger_safe.reset();
+        shader_changed = true;
         if (!held) return;
         for (auto*& kept : game)
             if (kept) {
@@ -87,6 +92,9 @@ PsShadow* TextureShadowOf(ID3D11DeviceContext* c);
 // Changes whenever what should be bound may have changed; the provider compares it per context at
 // each draw and calls RefreshTextures with that context's original PSSetShaderResources.
 uint64_t TexturePolicyKey();
+// Recorded on the game's PSSetShader; creation-time disassembly is private data
+// on the shader itself. No parsing, allocation or shared shader map at a draw.
+void NoteTextureShader(PsShadow& shadow, ID3D11PixelShader* shader);
 using TextureSetFn = void (__stdcall*)(ID3D11DeviceContext*, unsigned, unsigned, ID3D11ShaderResourceView* const*);
 void RefreshTextures(ID3D11DeviceContext* c, PsShadow& shadow, TextureSetFn original_set);
 
@@ -108,6 +116,7 @@ struct TexturePublication {
     uint64_t serial = 0;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> replacement;
     uint64_t bytes = 0;
+    bool larger = false;
 };
 size_t PublishTextures(const TexturePublication* items, size_t count);
 void SetTexturesEnabled(bool on); // one switch for every replacement; the census is not affected

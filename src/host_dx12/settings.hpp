@@ -66,6 +66,7 @@ struct Settings {
     std::atomic<int32_t> win_x{0}, win_y{0}, win_w{0}, win_h{0};
     // Neural Rendering (A30, [nr] section). Off by default; percentages 0..100.
     std::atomic<uint32_t> nr_enabled{0};
+    std::atomic<uint32_t> material_enhancement{0}; // offline-prepared texture replacements, opt-in
     // Optional Donut scene grade/Bloom; disabled by default, [donut].
     std::atomic<uint32_t> donut_tone{0},donut_bloom{0},donut_amount{100},donut_bias{800},donut_white{3000};
     std::atomic<uint32_t> donut_speed_up{1000},donut_speed_down{500},donut_curve{0};

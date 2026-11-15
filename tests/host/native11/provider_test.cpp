@@ -36,6 +36,7 @@
 #include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/textures.hpp"
 #include "materials/texture_subresources_v1.hpp"
+#include "materials/manifest_reader.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <DirectXPackedVector.h>
 #include <d3d11on12.h>
@@ -91,6 +92,9 @@ float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5);
 SamplerState material : register(s0);
 float4 ps_mips(float4 p : SV_Position) : SV_Target {
     return scene.SampleGrad(material, float2(0.5, 0.5), float2(2.0/64.0,0), float2(0,2.0/64.0));
+}
+float4 ps_material_probe(float4 p : SV_Position) : SV_Target {
+    return .5 + .5 * scene.SampleGrad(material, float2(.371,.613), float2(0,0), float2(0,0));
 }
 )";
 
@@ -1334,6 +1338,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     ComPtr<ID3D11SamplerState> material;
     expect(SUCCEEDED(g.device->CreateSamplerState(&sampler, &material)), "create native material sampler");
     na::observe::SetSamplerMipBias(0.f); na::observe::SetSamplerAnisotropy(0);
+    na::native11::SetTexturesEnabled(true); // material enhancement is now off by default
     auto* material_raw = material.Get();
     g.ctx->PSSetSamplers(0, 1, &material_raw);
     g.ctx->ClearState();
@@ -1747,6 +1752,107 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         DeleteFileW((mat_entry + L"\\base_color.dds").c_str()); DeleteFileW((mat_entry + L"\\manifest.json").c_str());
         RemoveDirectoryW(mat_entry.c_str()); RemoveDirectoryW(mat_root.c_str());
         na::native11::LoadMaterialCache(mat_root.c_str()); // the folder is gone: the loader is idle again
+    }
+    // Optional real captured-material evidence. These bytes stay local. The
+    // ordinary fixture above still runs without them. Compare actual rendered
+    // pixels with direct prepared-map sampling, then restore and change shaders.
+    char cache_dir[32768]{};
+    if (GetEnvironmentVariableA("NA_MATERIAL_TEST_CACHE", cache_dir, DWORD(sizeof(cache_dir)))) {
+        char source_dir[32768]{};
+        GetEnvironmentVariableA("NA_MATERIAL_TEST_SOURCES", source_dir, DWORD(sizeof(source_dir)));
+        expect(source_dir[0] != 0,"actual material test declares its source capture folder");
+        if (source_dir[0]) {
+            const auto read_file = [](const std::filesystem::path& path) {
+                std::ifstream f(path,std::ios::binary);
+                return std::vector<uint8_t>(std::istreambuf_iterator<char>(f),{});
+            };
+            const auto make_dds_view = [&](const std::vector<uint8_t>& raw, bool own) {
+                ComPtr<ID3D11ShaderResourceView> view;
+                if (raw.size()<148) return view;
+                const auto word=[&](size_t at) { uint32_t v;std::memcpy(&v,raw.data()+at,4);return v; };
+                D3D11_TEXTURE2D_DESC td{};
+                td.Width=word(16);td.Height=word(12);td.MipLevels=word(28);td.ArraySize=1;
+                td.Format=static_cast<DXGI_FORMAT>(word(128));td.SampleDesc.Count=1;
+                td.Usage=D3D11_USAGE_IMMUTABLE;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+                const uint32_t block=td.Format==DXGI_FORMAT_BC1_UNORM_SRGB ? 8u : 16u;
+                std::vector<D3D11_SUBRESOURCE_DATA> levels;size_t at=148;
+                for(UINT i=0;i<td.MipLevels;++i) {
+                    const UINT w=(std::max)(1u,td.Width>>i),h=(std::max)(1u,td.Height>>i),pitch=((w+3)/4)*block;
+                    const size_t size=size_t(pitch)*((h+3)/4);
+                    if(at+size>raw.size())return view;
+                    levels.push_back({raw.data()+at,pitch,0});at+=size;
+                }
+                const auto create=[&] {
+                    ComPtr<ID3D11Texture2D> texture;
+                    return SUCCEEDED(g.device->CreateTexture2D(&td,levels.data(),&texture)) &&
+                           SUCCEEDED(g.device->CreateShaderResourceView(texture.Get(),nullptr,&view));
+                };
+                bool ok=false;
+                if(own){na::native11::OwnWorkScope scope;ok=create();}else ok=create();
+                expect(ok,"create an actual material source/control texture");
+                return view;
+            };
+            const std::filesystem::path root(cache_dir),sources(source_dir);
+            auto probe_code=Compile("ps_material_probe","ps_5_0");
+            auto load_code=Compile("ps_tonemap","ps_5_0");
+            ComPtr<ID3D11PixelShader> probe,load_shader;
+            expect(probe_code && load_code && SUCCEEDED(g.device->CreatePixelShader(probe_code->GetBufferPointer(),probe_code->GetBufferSize(),nullptr,&probe)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(load_code->GetBufferPointer(),load_code->GetBufferSize(),nullptr,&load_shader)),
+                   "create plain-sampling and integer-load shaders under real hooks");
+            const uint64_t shown_before=na::native11::GetMaterialStats().entries_shown;
+            const uint64_t replacements_before=na::native11::GetTextureStats().replaced;
+            const size_t entries=na::native11::LoadMaterialCache(root.c_str());
+            struct Pair { ComPtr<ID3D11ShaderResourceView> game,prepared;std::string name; };
+            std::vector<Pair> pairs;
+            for (const auto& entry:std::filesystem::directory_iterator(root)) {
+                if (!entry.is_directory() || !std::filesystem::exists(entry.path()/"manifest.json"))continue;
+                const auto bytes=read_file(entry.path()/"manifest.json");
+                na::materials::Record rec;std::string why;
+                if (!na::materials::ReadManifest(std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size()),rec,why)) {
+                    expect(false,"actual prepared manifest parses");continue;
+                }
+                for (const auto& map:rec.maps) {
+                    Pair p;
+                    p.name=rec.material_id+"/"+map.id;
+                    p.game=make_dds_view(read_file(sources/(map.source.content_sha256+".dds")),false);
+                    p.prepared=make_dds_view(read_file(entry.path()/map.file),true);
+                    if(p.game && p.prepared)pairs.push_back(std::move(p));
+                }
+            }
+            for(int i=0;i<2500 && (na::native11::GetMaterialStats().entries_shown<shown_before+entries ||
+                                  na::native11::GetTextureStats().replaced<replacements_before+entries*2);++i) {
+                na::native11::TexturesOnPresent();Sleep(2);
+            }
+            expect(entries>0 && pairs.size()==entries*2 &&
+                   na::native11::GetMaterialStats().entries_shown==shown_before+entries &&
+                   na::native11::GetTextureStats().replaced==replacements_before+entries*2,
+                   "every actual two-map unit loads and publishes from exact captured source identities");
+            float largest_change=0;
+            for(const auto& pair:pairs) {
+                const auto draw=[&](ID3D11ShaderResourceView* view,ID3D11PixelShader* shader,float* pixels) {
+                    g.ctx->PSSetShader(shader,nullptr,0);g.ctx->PSSetShaderResources(0,1,&view);
+                    g.ctx->Draw(4,0);ReadCopy(g,pixels,g.color.Get());
+                };
+                float prepared[4]{},replaced[4]{},off[4]{},original[4]{},blocked[4]{},blocked_original[4]{};
+                {na::native11::OwnWorkScope material_scope;draw(pair.prepared.Get(),probe.Get(),prepared);draw(pair.game.Get(),probe.Get(),original);}
+                const uint64_t swaps_before=na::native11::GetTextureStats().swapped;
+                na::native11::SetTexturesEnabled(true);draw(pair.game.Get(),probe.Get(),replaced);
+                na::native11::SetTexturesEnabled(false);
+                g.ctx->Draw(4,0);ReadCopy(g,off,g.color.Get()); // no texture or shader rebind
+                na::native11::SetTexturesEnabled(true);
+                draw(pair.game.Get(),probe.Get(),replaced);
+                g.ctx->PSSetShader(load_shader.Get(),nullptr,0); // shader changes, SRV does not
+                g.ctx->Draw(4,0);ReadCopy(g,blocked,g.color.Get());
+                {na::native11::OwnWorkScope material_scope;draw(pair.game.Get(),load_shader.Get(),blocked_original);}
+                float error=0,restore=0,refused=0,change=0;
+                for(int c=0;c<3;++c){error=(std::max)(error,std::abs(prepared[c]-replaced[c]));restore=(std::max)(restore,std::abs(off[c]-original[c]));refused=(std::max)(refused,std::abs(blocked[c]-blocked_original[c]));change=(std::max)(change,std::abs(prepared[c]-original[c]));}
+                largest_change=(std::max)(largest_change,change);
+                std::printf("actual material %s: prepared/direct error %.6f, off/original %.6f, integer-load/original %.6f, changed %.6f\n",pair.name.c_str(),error,restore,refused,change);
+                expect(error<.001f && restore<.001f && refused<.001f && na::native11::GetTextureStats().swapped>swaps_before,
+                       "actual material reaches rendered pixels, off restores them, integer-load shader restores its own map");
+            }
+            expect(largest_change>.001f,"actual prepared maps change rendered pixels");
+        }
     }
     na::capture::j2::Shutdown();
     na::capture::Shutdown();

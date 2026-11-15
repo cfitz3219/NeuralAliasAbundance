@@ -50,8 +50,45 @@ first preparation adapter, not silently converted into compatible sources.
 ## Verification and delivery state
 
 47 Python tests passed, including real DirectXTex compression and signed float
-roundtrips. The approved synthetic Lab remains intact. Actual WWII map generation
-is underway; runtime signed loader and per-shader larger-map integration are
-coordinated with Fable in COMMS. A test package is not ready until those actual
-prepared maps pass loading/binding checks and additive upgrade/rollback checks.
-No game deployment or game launch has been performed by Astra.
+roundtrips. The approved synthetic Lab remains intact. Both actual WWII units
+are generated (4096-square, full mips, four compressed maps, 85.33 MiB total).
+The local preparation receipt, selection and output keys are under
+`local/wwii-materials`; no proprietary input/output is committed.
+
+Astra merged Fable's cf09c93, then completed the runtime half after announcing
+ownership in COMMS. Pixel-shader creation attaches its plain-sampling mask to
+the shader. Shader changes and live enable/disable refresh bound textures on
+the next draw, including when the game has not rebound its SRVs. Integer loads,
+explicit mip levels and other size-dependent reads keep original maps. Signed
+normal manifests require matching 84 source/output and the signed encoding.
+The existing loader, unit publication, serial checks and GPU ownership remain.
+Experimental > Material enhancement is persistent, off by default; status
+separates prepared entries, loaded units and replacement binding counts.
+
+Six focused C++/GPU tests pass: manifest, cache, shader texture usage, native11
+provider, native11 DLAA and automatic native11 DLAA. The latter two also run
+the exact prepared DDS bytes through real DX11 hooks on the RTX GPU. All four
+replacement samples match direct prepared-map samples exactly; off restores
+the original pixels exactly; changing to an integer-load shader restores them
+without an SRV rebind. Measured normal sample changes are 0.0625/0.09375 and
+gravel colour 0.015625 (fixture output encoding), not quality scores. Earth
+colour's chosen sample quantizes identically; binding is independently checked.
+These are synthetic-scene regressions using actual source/prepared textures and
+the NVIDIA DLAA runtime, not live WWII quality/performance evidence.
+
+Initial test failures exposed two fixture assumptions: it had relied on the
+old default-on material policy, and it treated a loader-ready count as proof
+that the following Present had published the unit. Explicit enable and waiting
+for all four actual published replacements resolved those, without weakening
+the production shader rules. Earlier parallel MSVC child processes failed;
+the single-worker production build succeeded.
+
+Scratch installation tests passed previous-build upgrade, payload hashes,
+owned-entry uninstall, preservation of byte-identical preexisting cache and
+exact original game-file restoration. Because WWII was running, only private
+scratch script copies bypassed the process check; delivered scripts retain it.
+The real game installation and running game were not touched.
+
+No model runs per frame. Current acquisition requires captured textures;
+automatic whole-game extraction and background model inference are not built.
+The first package is two terrain materials, not a whole-game enhancement.

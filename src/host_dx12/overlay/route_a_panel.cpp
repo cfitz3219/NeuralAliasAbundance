@@ -1,4 +1,6 @@
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/textures.hpp"
+#include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
@@ -1499,6 +1501,33 @@ static void DrawAmbientOcclusion()
     ImGui::EndPopup();
 }
 
+void DrawMaterialEnhancement()
+{
+    using namespace na::ui;
+    auto& setting=na::settings::Get().material_enhancement;
+    bool on=setting.load()!=0;
+    BeginRow("Material enhancement", "Prepared texture detail and surface relief. Original game materials return when switched off.", S(90));
+    if(ImGui::Checkbox("##material_enhancement",&on)) {
+        setting.store(on?1u:0u);
+        na::native11::SetTexturesEnabled(on);
+        na::settings::Save();
+    }
+    EndRow();
+    const auto m=na::native11::GetMaterialStats();
+    const auto t=na::native11::GetTextureStats();
+    if(!m.entries) { Hint("No prepared material pack is installed for this route.");return; }
+    char line[256];
+    std::snprintf(line,sizeof(line),"%llu material sets prepared; %llu loaded; %llu texture bindings replaced.",
+        static_cast<unsigned long long>(m.entries),static_cast<unsigned long long>(m.entries_shown),
+        static_cast<unsigned long long>(t.swapped));
+    Hint(line);
+    if(!on) Hint("Off. The game uses its original materials.");
+    else if(m.maps_failed || m.unreadable_entries || m.refused_maps) Hint("Some prepared maps could not be used. Details are saved in the results log.");
+    else if(!m.entries_shown) Hint("Waiting for the matching surfaces to load in the game.");
+    else Hint("Prepared surfaces are available. Compare on the matching terrain; other materials remain original.");
+    Hint("This test keeps the approved 2x fine-detail size and 65% surface strength. The game's packed gloss maps are preserved.");
+}
+
 void RegisterRouteAMenu()
 {
     using na::menu::Availability;
@@ -1517,6 +1546,7 @@ void RegisterRouteAMenu()
     na::menu::Register({"XeGTAO (Ambient Occlusion)", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
     na::menu::Register({"GPU infrastructure", Availability::Available, nullptr, &DrawExperimentalGpu, Page::Experimental});
     na::menu::Register({"Lighting", Availability::Available, nullptr, &DrawDonutLighting, Page::Experimental});
+    na::menu::Register({"Material enhancement", Availability::Available, nullptr, &DrawMaterialEnhancement, Page::Experimental});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});

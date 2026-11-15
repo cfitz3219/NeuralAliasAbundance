@@ -78,6 +78,7 @@ struct MapState {
     ComPtr<ID3D11ShaderResourceView> replacement; // created by the loader's thread
     uint64_t bytes = 0;
     bool requested = false, failed = false;
+    bool larger = false;
     std::vector<WaitingView> views; // matched game views not yet published
 };
 struct EntryState {
@@ -167,7 +168,7 @@ void Matched(Loader& l, ID3D11Device* device, const CacheIndex::Hit& hit, const 
     g_matched.fetch_add(1, std::memory_order_relaxed);
     if (e.refused || m.failed) return;
     if (e.shown) { // the unit is already visible: this view joins it
-        publish.push_back({view.view, view.serial, m.replacement.Get(), m.bytes});
+        publish.push_back({view.view, view.serial, m.replacement.Get(), m.bytes, m.larger});
         return;
     }
     m.views.push_back(view);
@@ -221,7 +222,7 @@ void ShowIfComplete(Loader& l, size_t record, std::vector<TexturePublication>& p
     for (const MapState& m : e.maps) ready += (m.replacement && !m.views.empty()) ? 1u : 0u;
     if (ready < e.needed) return;
     for (MapState& m : e.maps) {
-        for (const WaitingView& v : m.views) publish.push_back({v.view, v.serial, m.replacement.Get(), m.bytes});
+        for (const WaitingView& v : m.views) publish.push_back({v.view, v.serial, m.replacement.Get(), m.bytes, m.larger});
         m.views.clear();
     }
     e.shown = true;
@@ -335,6 +336,7 @@ void Load(Job& job)
         } else if (view) {
             m.replacement = view;
             m.bytes = file_bytes;
+            m.larger = na::materials::LargerLog2(map) > 0;
             g_loaded.fetch_add(1, std::memory_order_relaxed);
             ShowIfComplete(l, job.record, publish);
         } else {
@@ -393,7 +395,7 @@ size_t LoadMaterialCache(const wchar_t* dir)
         root = std::wstring(local) + L"\\NeuralAlias\\materials";
     }
     const uint64_t began = GetTickCount64();
-    auto index = std::make_shared<CacheIndex>();
+    auto index = std::make_shared<CacheIndex>(true); // texture binds qualify larger maps per pixel shader
     std::vector<std::wstring> folders;
     uint64_t unreadable = 0;
     WIN32_FIND_DATAW found{};

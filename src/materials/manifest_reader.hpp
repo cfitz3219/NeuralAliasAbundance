@@ -348,7 +348,8 @@ inline bool ReadManifest(std::string_view json, Record& out, std::string& why)
         if (js->Get("array_size") && !U32(*js, "array_size", s.array_size)) return Fail(why, at + "source array_size malformed");
         // The payload.
         uint32_t block = 0;
-        const uint32_t want = FormatOf(m.role, block);
+        uint32_t want = FormatOf(m.role, block);
+        if (m.role == Role::Normal && m.encoding == "tangent_xy_snorm_positive_z") want = 84;
         if (!U32(jm, "dxgi_format", m.dxgi_format) || !U32(jm, "width", m.width) || !U32(jm, "height", m.height))
             return Fail(why, at + "dxgi_format or extent missing");
         if (!want) return Fail(why, at + "packed maps are not loadable in v1");
