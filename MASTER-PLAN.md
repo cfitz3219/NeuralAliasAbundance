@@ -1,6 +1,15 @@
 # NeuralAliasAbundance: master plan
 
 
+## Fine-detail size trial — 2026-11-14 Pacific
+
+Astra 770a4b3 / 725b021, PR142: Cort approves v3 and asks to double fine size.
+Recipe v4 uses half-size fine inference, same UVs and existing medium layer.
+43 tests and actual RTX slider/comparison checks pass. Existing Lab updated with
+v3 backup. Final size is for Cort to choose; no game/runtime change. See COMMS
+and docs/MATERIAL-FINE-SIZE-TRIAL-20261114.md for exact evidence and limits.
+
+
 ## Normal-distance material detail — 2026-11-14 Pacific
 
 Astra **cf4b491**, PR142. Cort likes fine relief at 4x but needs it visible at

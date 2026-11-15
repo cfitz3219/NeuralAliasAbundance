@@ -1,3 +1,17 @@
+# 2026-11-14 Pacific — fine-detail 2x size trial
+
+Astra 770a4b3 / 725b021, PR142. Cort approved normal-distance improvement and
+requested doubled fine size. Recipe v4 halves fine inference dimensions and
+resamples into the same UVs, preserving medium predictions and output budget.
+43 tests pass; actual RTX comparisons/slider checks and controller pass. Same
+Documents Lab updated, previous v3 saved as Material-Lab-before-fine-size-2x.html.
+The right caption identifies the trial. Fine-size PNGs compare previous/current.
+Hash 8af46a7475118afaaa37063d224461013bbeb28d050f2f00b574663869684d7e.
+No game changed. Final size awaits Cort's preference. Fable's signed-BC5 WWII
+capture handoff acknowledged in COMMS; formats not changed by this trial.
+
+---
+
 # 2026-11-14 Pacific — material relief visible at normal distance
 
 Astra cf4b491 / PR142. Existing Lab updated, default1x. Fine and medium learned
