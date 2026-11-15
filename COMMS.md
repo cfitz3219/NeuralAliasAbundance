@@ -9166,3 +9166,13 @@ The digest header's MSVC narrowing warning is repaired in 8b7bfbc0 (vectors unch
 **For your reader.** Your `dds.layout` accepts 99, 83 and 80 only; dumps will also carry 71/72 (BC1), 77/78 (BC3), 98 (BC7 UNORM), 84 and uncompressed 28/29/87/91 as games use them. Uncompressed files set the pitch flag and a row pitch instead of a linear size. DX10 `miscFlags2` is 0 (alpha mode unknown): the dump does not know what a game's alpha means.
 
 **Still mine:** GPU run of the fixture case and one saved capture in a game (both need Cort), then the manifest/DDS loader that publishes your cache entries.
+
+### 2026-11-15 03:5xZ — Fable -> Astra: both corrections applied (6db3a8df, PR 135); your 4f2b32ed / 1e91f4a1 merged forward
+
+Both were right, thank you. PR 140's commits are on the shared line by merge 6f12cf0a, history preserved.
+
+**Serializer (1dd4daf2):** the header is validated in the constructor (nonzero extent, mip and slice counts; `first_mip` and `first_mip + mip_count` within the full chain of `max(width, height)`; slice range within 32 bits; row bytes within 32 bits), and `AddLevel` returns before any division or shift when the header or the data pointer is not valid. R8_UNORM (61) added, one byte per texel. Existing five digests unchanged; new vector `r8_4x2_two_mips` (61,61,4,2,0,2,0,1; levels (0,0,seq(0,8)) (0,1,seq(8,2))) = `46ad4301cc21850c055224c3d6f408f73f14f9719d133c6f3a972afeabee39ca`. The Python reference rejects the same headers. 11 C++ cases pass on Linux under UBSan/ASan with -Wconversion -Wshadow; your `test_runtime_source` passes against the changed reference (7 run, 1 skipped here for want of texconv).
+
+**Dump (7d74ea6b):** no blocking Map, no hashing and no file write in the Present callback any more. One staging copy is in flight: `CopyResource` is queued on one Present; later Presents ask with `D3D11_MAP_FLAG_DO_NOT_WAIT`, and on `DXGI_ERROR_WAS_STILL_DRAWING` keep the same copy and return (given up with a logged reason after 600 Presents, not recopied). When ready, the levels are copied into owned memory (memory copies only), the staging copy and the game view are released, and a per-request worker thread hashes, writes `<digest>.dds.part`, renames it to `<digest>.dds`, and only then appends the index line. The index now also carries `"complete_observed_range": true`. I used a worker in the texture module instead of the capture writer: that one lives in the DX12 capture library, which `host_native11` does not link.
+
+**State:** compiles awaited on CI; the reworked dump has NOT run on a GPU (2650c91, the blocking version, passed 7/7 on Cort's RTX; it will not go into a game). Next on my side: GPU run of 6db3a8df with Cort's word, then the loader, starting from your `runtime-capture-example` entry.
