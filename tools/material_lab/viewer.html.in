@@ -4,7 +4,7 @@
 <style>
 :root{color-scheme:dark;font:16px/1.5 "Segoe UI",sans-serif;background:#11171b;color:#e4ebee}*{box-sizing:border-box}body{max-width:1580px;margin:auto;padding:34px}header{display:flex;justify-content:space-between;gap:30px;align-items:center}h1{font-size:36px;margin:4px 0;font-weight:550;letter-spacing:-1px}.eyebrow{color:#8dd8bc;letter-spacing:2px;font-size:12px;text-transform:uppercase}.subtle{color:#9eafb6;font-size:14px}.badge{border:1px solid #436257;border-radius:30px;padding:7px 14px;color:#acd6c5;white-space:nowrap}nav{display:flex;gap:8px;flex-wrap:wrap;margin:28px 0 20px}button,select{font:inherit;background:#243137;color:#dce5e8;border:1px solid #3b4d55;border-radius:9px;padding:9px 14px;cursor:pointer}button.active{background:#296652;border-color:#73b398;color:white}.controls{display:flex;gap:22px;align-items:center;flex-wrap:wrap;padding:18px 20px;border-radius:12px;background:#1b252a;margin-bottom:20px}label{display:flex;align-items:center;gap:9px}[hidden]{display:none!important}a{color:#8dd8bc}input{accent-color:#89d7b5}.panels{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.panel{background:#1a2429;border:1px solid #34434b;border-radius:14px;overflow:hidden}.panel h2{font-size:18px;font-weight:550;margin:16px 18px 4px}.panel p{margin:0 18px 14px;font-size:13px;color:#a8b9c1;min-height:40px}canvas{width:100%;aspect-ratio:1;display:block;background:#11181d}.legend{padding:12px 18px;border-top:1px solid #34434b;font-size:12px;color:#a1b2ba}.notes{display:grid;grid-template-columns:2fr 1fr;gap:24px;margin-top:22px;padding:20px;background:#192329;border-radius:12px}.notes strong{display:block;margin-bottom:6px}#error{color:#ffc3b1;white-space:pre-wrap}footer{color:#8599a3;font-size:12px;margin-top:24px}@media(max-width:950px){body{padding:18px}.panels{grid-template-columns:1fr}.notes{grid-template-columns:1fr}header{align-items:flex-start}.badge{display:none}}
 </style>
-<header><div><div class="eyebrow">NeuralAlias · Material research</div><h1>A surface, with more to see.</h1><div class="subtle">Same material. Same camera. Same light. Compare detail and how it catches the light.</div></div><span class="badge">Working prototype · synthetic examples</span></header>
+<header><div><div class="eyebrow">NeuralAlias · Material research</div><h1>A surface, with more to see.</h1><div class="subtle">Same material. Same camera. Same light. Compare detail and how it catches the light.</div></div><span id="material-badge" class="badge">Working prototype · synthetic examples</span></header>
 <div id="error" role="alert" hidden></div>
 <nav id="materials" aria-label="Material examples"></nav>
 <div class="controls"><label id="ai-control">AI model <select id="baseline-choice" aria-label="AI model comparison"></select></label><label id="surface-control" hidden>Surface detail <input id="surface-strength" type="range" min="0" max="100" value="65" step="1"><output id="surface-value">65%</output></label><label id="zoom-control" hidden>Detail zoom <input id="texture-zoom" type="range" min="1" max="4" value="1" step=".25"><output id="zoom-value">1×</output></label><a id="model-history" hidden href="AI-model-comparison.html">Compare other AI models</a><label><input id="animate" type="checkbox" checked> Move the light</label><label>View <input id="angle" type="range" min="-55" max="55" value="-18"></label><label>Surface <select id="surface"><option value="0">Flat tile</option><option value="1">Curved sample</option></select></label><label>Compare <select id="compare"><option value="all">Complete material</option><option value="normal">Surface bumps only</option><option value="color">Colour detail only</option><option value="roughness">Roughness only</option></select></label><label>Distance <input id="distance" type="range" min="0" max="6" value="0" step=".1"></label></div>
@@ -45,18 +45,26 @@ async function show(index){
     for(const s of Object.values(states))s.ready=false;
     $('sample-name').textContent=row.name.replaceAll('_',' ');
     $('sample-info').textContent=`${row.family} · ${row.split==='held_out'?'held-out example':'development example'}`;
+    const gameAsset=Boolean(row.game_asset);
+    $('material-badge').textContent=gameAsset?'Total War: Rome II · original game assets':'Working prototype · synthetic examples';
+    if(gameAsset)$('sample-info').textContent=row.family+' · original game texture';
     document.querySelectorAll('nav button').forEach((b,i)=>b.classList.toggle('active',i===index));
     const choice=$('baseline-choice');
     const previous=choice.value;const comparisons=row.comparisons;
     $('ai-control').hidden=row.combined;
     $('surface-control').hidden=!row.combined;
     $('zoom-control').hidden=!row.combined;
-    $('model-history').hidden=!row.combined;
+    $('model-history').hidden=!row.combined||gameAsset;
     if(row.combined){
         $('right-title').textContent='Combined result';
         $('right-caption').textContent='Fine-detail size trial: 2× larger. Same PBRify colour, original surface and medium-detail layer.';
         $('footnote').textContent='PBRify colour + trained PBRify normal/roughness models. Original surface maps remain the base. These are synthetic Lab samples; no game installation has changed.';
         $('comparison-note').textContent='Start at 1× to compare the whole material. Medium-sized grain and relief are now included alongside the fine close-up detail. Surface detail changes only the right panel: 0% is exactly PBRify alone. Moving it pauses the light. Original cracks and grooves stay as the base. Detail zoom magnifies the same region in all panels; Distance filters tiny detail naturally instead of forcing it to shimmer.';
+    }
+    if(gameAsset){
+        $('right-caption').textContent='Same PBRify colour with extra surface relief over the original normal map.';
+        $('footnote').textContent='These textures come from the installed Rome II archives. The Lab uses its own lighting and a shared gloss setting. Rome II keeps its original gloss, specular, masks and decals.';
+        $('comparison-note').textContent='Start at 1× and move Distance to see what survives at smaller sizes. The right panel previews the baked gain at 100%. Move Surface detail to 0% to compare colour alone.';
     }
     choice.replaceChildren();
     for(const [key,item] of Object.entries(comparisons)){

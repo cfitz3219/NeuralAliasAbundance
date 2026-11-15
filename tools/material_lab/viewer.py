@@ -111,6 +111,17 @@ def write(cases, output):
                 row["comparisons"][key] = {**row[key], "label":label, "description":description}
         del row["baseline"], row["conventional"]  # Embed each large candidate once.
         payload.append(row)
+    write_payload(payload, output)
+
+
+def write_payload(payload, output):
     template = Path(__file__).with_name("viewer.html.in").read_text(encoding="utf-8")
+    if payload and all(row.get('game_asset') for row in payload):
+        template = template.replace('value="65" step="1"><output id="surface-value">65%',
+                                    'value="100" step="1"><output id="surface-value">100%')
+        template = template.replace('<nav id="materials"', '<a class="badge" href="Material-Lab.html">Back to Material Lab</a>\n<nav id="materials"')
+        template = template.replace('<option value="roughness">Roughness only</option>', '')
+        template = template.replace('The original colour, surface and roughness maps.',
+                                    'The original colour and normal maps from Rome II.')
     encoded = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c")
     Path(output).write_text(template.replace("__MATERIAL_DATA__", encoded), encoding="utf-8")

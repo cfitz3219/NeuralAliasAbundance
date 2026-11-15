@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Roman legionary shield",
+    "family": "Early scutum",
+    "extracts": ["models3_rome2", "models3_rome2"],
+    "paths": {
+      "base_color": "variantmeshes/_variantmodels/man/shield/tex/roman_early_scutuma_diffuse.dds",
+      "normal": "variantmeshes/_variantmodels/man/shield/tex/roman_early_scutuma_normal.dds"
+    }
+  },
+  {
+    "name": "Greek stone pavement",
+    "family": "High pavement masonry",
+    "extracts": ["models2", "models2"],
+    "paths": {
+      "base_color": "rigidmodels/buildings/textures/pavement_centre_diffuse.dds",
+      "normal": "rigidmodels/buildings/textures/pavement_centre_normal.dds"
+    }
+  }
+]
