@@ -64,6 +64,15 @@ if(NOT NA_SDK_ROOT)
   endif()
 endif()
 set(NA_SDK_ROOT "${NA_SDK_ROOT}" CACHE PATH "Folder holding the local NVIDIA SDKs (see third_party/README.md)")
+# The NVIDIA SDKs ship 64-bit libraries only. A 32-bit build is the in-game half for a 32-bit
+# game: it never links them (DLAA for it runs in the 64-bit companion), whatever is on disk.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  set(NA_SDK_ROOT "" CACHE PATH "" FORCE)
+  foreach(v NA_NGX_SDK_INCLUDE NA_NVOF_INCLUDE NA_PCL_INCLUDE NA_NGX_LIB NA_DLSS_DLL NA_XESS_INCLUDE)
+    unset(${v} CACHE)
+    unset(${v})
+  endforeach()
+endif()
 
 set(NA_NGX_SDK_INCLUDE "" CACHE PATH "NVIDIA NGX/DLSS SDK include dir (nvsdk_ngx.h)")
 if(NOT NA_NGX_SDK_INCLUDE AND EXISTS "${NA_SDK_ROOT}/nvidia-dlss-sdk/include/nvsdk_ngx.h")
