@@ -1655,3 +1655,9 @@ Also added: a deferred recording made while a replacement is visible samples it 
 - Not yet on the companion route: ambient shading (XeGTAO) and tone/bloom before DLSS (they hand DLSS a different colour image). The menu says so for ambient shading.
 - If the companion ends or stops answering, the in-game half releases the fence itself, DLAA latches off with the reason, and the game's picture continues.
 - Tests: `host_dlaa_channel_test` (no graphics, both kinds of build), `host_dlaa_companion_test` / `_warp_test` (copy mode), `host_dlaa_companion_dlss_test` (RTX only). None has run on a real GPU yet.
+
+## 2026-11-15: a game that moves to a second device (Fable)
+- Rome II run on 3a186fc9: the program loaded on DX11 and the Home menu worked, but from the moment the game made its second D3D11 device the provider saw no draws and no sampler binds at all (presents still counted), so DLAA waited for a scene for the whole session.
+- Cause: `native11::Get` remembered "is this context the game's?" per context for ever. A context first met while another device was the watched one stayed "not the game's".
+- Fix (`native11/provider.cpp`): the answer carries a game-device generation; `Install` with a different device raises it and every context is asked again (its remembered state is cleared). Event `native11_device`, status `game_device{generation contexts_rechecked became_game other_device_calls}`.
+- Test: `provider_test` starts on a first device, meets the real context early, then installs on the real device; all phases run behind that.

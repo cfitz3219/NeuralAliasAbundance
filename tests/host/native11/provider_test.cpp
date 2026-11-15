@@ -646,7 +646,33 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     na::j2::SetJitter(true);
 #endif
     g_seen.game = &g;
+#if !defined(NA_TEST_NATIVE_DLAA)
+    // A game that makes a device, then a second one and draws on that: the second device's context
+    // is first met while the first device is still the one watched. Every phase below would see
+    // nothing if that first answer stood.
+    {
+        ComPtr<ID3D11Device> first;
+        ComPtr<ID3D11DeviceContext> first_ctx;
+        const D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+        const HRESULT hr = D3D11CreateDevice(nullptr, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1,
+                                             D3D11_SDK_VERSION, &first, nullptr, &first_ctx);
+        expect(SUCCEEDED(hr) && na::native11::Install(first.Get(), &Consume, &g_seen), "the provider installs on a first device");
+        if (g_failed) return 1;
+        ID3D11RenderTargetView* none = nullptr;
+        g.ctx->OMSetRenderTargets(1, &none, nullptr); // met as another device's context
+        expect(!na::native11::IsGameWork(g.ctx.Get()), "a context of a device that is not the watched one is left alone");
+    }
+#endif
     const bool installed = na::native11::Install(g.device.Get(), &Consume, &g_seen);
+#if !defined(NA_TEST_NATIVE_DLAA)
+    expect(na::native11::IsGameWork(g.ctx.Get()), "a context met before its device became the game's is asked again and now counts");
+    {
+        char moved[4096];
+        na::native11::FormatStatus(moved, sizeof moved);
+        expect(std::strstr(moved, "game_device{generation=3 contexts_rechecked=1 became_game=1") != nullptr,
+               "the status line names the move to a second device");
+    }
+#endif
     expect(installed, "the provider's hooks install on the game's device");
     if (!installed) return 1;
     // The production host selects the viewport route. The camera-matrix checks below exercise the

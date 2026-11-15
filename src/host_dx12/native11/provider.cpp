@@ -136,6 +136,7 @@ constexpr size_t kMaxLists = 512;          // recorded command lists kept
 
 struct Ctx {
     bool game = false; // a context of the game's device
+    uint32_t gen = 0;  // the game-device generation that answer was given in
     uint64_t sampler_policy = ~uint64_t{0};
     uint64_t texture_policy = ~uint64_t{0};
     PsShadow ps_shadow;                // the game's views behind bound material replacements (textures.hpp)
@@ -309,6 +310,12 @@ thread_local bool t_inside = false; // our own and the consumer's calls are not 
 thread_local bool t_in_present = false;
 thread_local ID3D11DeviceContext* t_last_ctx = nullptr;
 thread_local Ctx* t_last = nullptr;
+thread_local uint32_t t_last_gen = 0;
+// Which device is "the game's" can change while the game runs (a game may make a second device and
+// move to it). Every remembered answer to "is this context the game's?" carries the generation it was
+// given in; a new game device makes all of them be asked again.
+std::atomic<uint32_t> g_device_gen{1};
+std::atomic<uint64_t> g_ctx_rechecked{0}, g_ctx_became_game{0}, g_foreign_calls{0};
 
 struct Inside {
     bool was;
@@ -377,22 +384,48 @@ bool IsCandidate(Id id)
 Ctx* Get(ID3D11DeviceContext* c)
 {
     if (t_inside || !c) return nullptr;
-    if (t_last_ctx == c) return t_last && t_last->game ? t_last : nullptr;
+    const uint32_t gen = g_device_gen.load(std::memory_order_acquire);
+    if (t_last_ctx == c && t_last_gen == gen) {
+        if (t_last && t_last->game) return t_last;
+        g_foreign_calls.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
     ID3D11Device* game = g_device_raw.load(std::memory_order_acquire);
     if (!game) return nullptr;
     std::lock_guard<std::mutex> l(g_mu);
     auto& slot = g_ctx[c];
-    if (!slot) {
-        slot = std::make_unique<Ctx>();
+    const bool fresh = !slot;
+    if (fresh) slot = std::make_unique<Ctx>();
+    if (fresh || slot->gen != gen) {
+        // Asked again for every new game device: an answer given while another device was the game's
+        // (or before this one was announced) must not stand, or a game that moves to a second device
+        // is never seen again.
         Inside in;
         ComPtr<ID3D11Device> d;
         c->GetDevice(&d);
-        slot->game = d.Get() == game;
+        const bool was = slot->game;
+        const bool is = d.Get() == game;
+        if (!fresh) {
+            g_ctx_rechecked.fetch_add(1, std::memory_order_relaxed);
+            if (is && !was) g_ctx_became_game.fetch_add(1, std::memory_order_relaxed);
+            // What was remembered belongs to the other device's objects.
+            slot->reset_state();
+            slot->events.clear();
+            slot->cb_bytes.clear();
+            slot->mapped.clear();
+            slot->large.clear();
+            slot->draw_bytes.clear();
+        }
+        slot->game = is;
+        slot->gen = gen;
         slot->deferred = c->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED;
     }
     t_last_ctx = c;
     t_last = slot.get();
-    return slot->game ? slot.get() : nullptr;
+    t_last_gen = gen;
+    if (slot->game) return slot.get();
+    g_foreign_calls.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
 }
 
 // ---------------------------------------------------------------- originals
@@ -2433,7 +2466,16 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present)
         g_cb = cb;
         g_cb_user = user;
     }
-    if (device) g_device_raw.store(static_cast<ID3D11Device*>(device), std::memory_order_release);
+    if (device) {
+        ID3D11Device* was = g_device_raw.exchange(static_cast<ID3D11Device*>(device), std::memory_order_acq_rel);
+        if (was != device) {
+            const uint32_t gen = g_device_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+            // WHY log: a game that makes more than one device is named, with what changes for us.
+            na::eventlog::Emit("native11_device", "generation=%u first=%d why=\"%s\"", gen, was ? 0 : 1,
+                               was ? "the game made another device: it is now the one watched, and every context is asked again whose it is"
+                                   : "the game's first device");
+        }
+    }
     if (g_installed.load()) return true;
     if (!InstallHooks(host_owns_present)) return false;
     g_installed.store(true);
@@ -2526,7 +2568,7 @@ int FormatStatus(char* out, unsigned long n)
             if (g_backbuffer) is_backbuffer = selection.color == g_backbuffer ? 1 : 0;
         }
     }
-    return std::snprintf(out, n,
+    const int head = std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
                          "camera_found=%llu camera_missing=%llu camera_held=%llu jitter_written=%llu "
                          "pose{native=%llu legacy=%llu generic=%llu no_packet=%llu extent=%llu vp_repeat=%llu origin=%llu vp_shape=%llu split=%llu "
@@ -2587,6 +2629,16 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(s.twin_across_ranges),
                          s.last_miss && s.last_miss[0] ? " last_miss=\"" : "",
                          s.last_miss && s.last_miss[0] ? s.last_miss : "", s.last_miss && s.last_miss[0] ? "\"" : "");
+    if (head < 0 || static_cast<size_t>(head) >= n) return head;
+    // Whose contexts the calls came from: a game drawing on a device we do not watch shows here as
+    // other_device_calls rising while draws stay at zero.
+    const int tail = std::snprintf(out + head, n - head,
+                                   " game_device{generation=%u contexts_rechecked=%llu became_game=%llu other_device_calls=%llu}",
+                                   g_device_gen.load(std::memory_order_relaxed),
+                                   static_cast<unsigned long long>(g_ctx_rechecked.load(std::memory_order_relaxed)),
+                                   static_cast<unsigned long long>(g_ctx_became_game.load(std::memory_order_relaxed)),
+                                   static_cast<unsigned long long>(g_foreign_calls.load(std::memory_order_relaxed)));
+    return tail < 0 ? head : head + tail;
 }
 
 } // namespace na::native11
