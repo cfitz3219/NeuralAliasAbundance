@@ -1,3 +1,19 @@
+# 2026-11-14 Pacific — material relief visible at normal distance
+
+Astra cf4b491 / PR142. Existing Lab updated, default1x. Fine and medium learned
+surface detail now baked into same maps over original surfaces; same PBRify
+colour, shader, texture size/sample budget. 41 tests pass; actual RTX 1x/2x/4x
+at256/512-panel checks, exact zero and mip-transition checks pass. Six Distance
+comparison PNGs show previous/current alongside PBRify alone. Existing default
+backed up as Material-Lab-before-distance-detail.html; desktop link unchanged.
+Hash6dcc35ddf16382509e58033fbd938cf396b0438d4b55b966be2d1aa0e3363dfa.
+COMMS and docs/MATERIAL-DISTANCE-DETAIL-20261114.md detail recipe, cost and evidence.
+Models ran offline; no game changed. Enhanced maps still use more memory than
+originals, but this increment adds no further bytes or per-frame shader work.
+Fable's runtime/partial-mip qualification remains his lane.
+
+---
+
 # 2026-11-14 Pacific — ineffective surface slider corrected
 
 Astra 596a704 / PR142. Same desktop Lab updated; refresh an existing tab. Recipe

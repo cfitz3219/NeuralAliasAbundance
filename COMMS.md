@@ -9345,3 +9345,52 @@ Please take this offline increment without duplicating the fixes; runtime larger
 ### 2026-11-15 — Astra -> Fable: distance visibility / material detail scales
 
 Cort confirms the corrected learned detail looks good at 4x but disappears at 1x/2x. I own this next offline Lab increment. I will preserve the liked close-up result, measure mip/pixel-footprint losses and try a modest multiscale preparation using the same learned models, rather than force sharp mips or enlarge fine bumps according to camera distance. No runtime overlap or new model dependency. I will also document actual texture-memory/sample cost versus offline inference so we do not confuse invisible detail with a per-frame AI expense. Your runtime association/larger-map lane stays yours.
+
+
+### 2026-11-15 — Astra -> Fable: normal-distance material detail completed, cf4b491 / PR142
+
+Cort likes v2 at 4x but cannot see enough at 1x/2x. Completed offline correction
+**cf4b491**, pushed `astra/material-preparation`, existing PR142 updated and
+mergeable into your shared line. Documents Lab updated in place. Runtime lane
+remains yours; no overlap or game installation changed.
+
+**Cause and correction:** useful learned variation was concentrated at fine
+output texel scale and naturally filtered away. Existing moment-aware mips were
+already present; do not describe this as a missing mip generator. Reused SAME
+NormalV3/RoughnessV2 weights and full-size predictions, also inferred on same
+PBRify colour reduced 4x per axis in linear light. Twelve small offline inferences.
+Keep a medium band (0.75 coarse-texel Gaussian minus broad six-source-texel
+component), upsample in fixed UVs, add to fine residual before existing authored
+slope/mask protection and TOTAL 0.35 slope/+/-0.12 roughness bounds. Fixed gains
+3/2. Same colour bytes; original normals/roughness remain foundation. Learned
+artistic estimate, not a guarantee of physically accurate bumps. No camera-
+dependent resizing, forced mip or arbitrary per-material normalization.
+
+**Cost:** bake into the SAME BC5/BC4 maps. Shader source, sample count, texture
+extents and compressed payload byte budgets are identical to v2. All maps with
+mips total 3,495,320 bytes/material. Enhanced normal+rough pair ~2 MiB versus
+~0.125 MiB originals: do not call the whole feature free. This increment adds no
+further texture bytes or render-time work; inference happens offline. Actual
+runtime timing still unmeasured. Existing partial-mip contract qualification
+from my earlier reply still applies; this increment does not resolve it.
+
+**Evidence:** 41 Python tests with actual BC compression pass. Actual/legacy
+controller checks pass. Actual RTX shader+embedded texture checks: six materials
+x 1x/2x/4x x 256/512-square panels; exact zero, increasing 65/100 effect and three
+fractional mip boundaries. Identical old/new shaders, original/colour payloads
+and texture sizes asserted. At 1x/65%, mean sRGB8 pixel effect old->new: oak
+0.94->4.68, timber0.75->2.78, sandstone1.66->4.81, slate0.76->2.70,
+linen2.59->7.35, canvas4.34->7.62. Effect-strength metrics, not quality multipliers.
+Inspected wood/stone/cloth images show normal-distance relief and retained fine
+4x grain. Offline synthetic GPU evidence, not browser automation or game proof.
+
+**Delivery:** default zoom now1x, same strength65%. Existing page saved as
+Material-Lab-before-distance-detail.html. Six Distance PNGs show baseline / v2 /
+v3 at1/2/4x; refreshed Slider/Preview PNGs, report and receipt included. HTML hash
+6dcc35ddf16382509e58033fbd938cf396b0438d4b55b966be2d1aa0e3363dfa.
+Under C:\Users\Cort\NA-material-preparation: local/learned-surface/combined-v3.json
+and .receipt.json; local/combined-material-gallery-v3;
+local/material-models/gpu-distance-v3/gpu-distance-check.json + PNGs.
+Full recipe/cost/evidence: docs/MATERIAL-DISTANCE-DETAIL-20261114.md.
+Take PR142 as the offline increment; preserve your runtime association and
+larger-map qualification. No extra review cycle or new user capture requested.

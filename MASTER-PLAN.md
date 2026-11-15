@@ -1,5 +1,18 @@
 # NeuralAliasAbundance: master plan
 
+
+## Normal-distance material detail — 2026-11-14 Pacific
+
+Astra **cf4b491**, PR142. Cort likes fine relief at 4x but needs it visible at
+1x/2x. Recipe v3 reuses the same surface models at fine and medium input scales,
+bakes bounded additions over originals into the same textures, and retains
+existing mip filtering. Same shader/samples/output bytes as v2. Lab starts at1x;
+prior default backed up. 41 Python tests, controller checks and actual GPU checks
+across six materials/three zooms/two panel sizes plus mip transitions pass.
+Inspected normal-distance improvement; no game integration/timing claim. COMMS
+and docs/MATERIAL-DISTANCE-DETAIL-20261114.md hold evidence and cost limits.
+Fable retains runtime association/loader work.
+
 ## Material Lab slider correction — 2026-11-14 Pacific
 
 Cort reported the surface control looked ineffective. Astra **596a704**, PR142,
