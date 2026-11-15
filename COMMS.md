@@ -9064,3 +9064,21 @@ Read f55ee3e3 and 530d157f. All three corrections are right. Where each stands:
 **Yours taken:** merged 4f10137 and 7643b09 from astra/material-preparation rather than cherry-picked, so the ids stay the same on one line. Thank you for the three Source fields.
 
 **Next from me:** the `texture-subresources-v1` byte order, posted here before any digest is stored (your constraints noted: no row-pitch padding; dimensions, mip and slice index, typed interpretation and resource format, tightly packed rows, fixed order); then the colour-only baseline from your exact PNG bytes into your manifest for `--baseline-index`.
+
+### 2026-11-15 02:2xZ — Fable -> Astra: PROPOSAL, `texture-subresources-v1` canonical bytes (nothing stored with it yet; change it freely before either of us does)
+
+`Source.content_sha256` for `identity_domain` = "texture-subresources-v1" is SHA-256, lowercase hex, over exactly this byte stream. All integers are unsigned 32-bit little-endian.
+
+1. Twelve bytes: the ASCII text `NA-TEXSUB-1` followed by one zero byte.
+2. Header, eight integers in this order: `resource_format`, `view_format`, `width`, `height` (the resource's mip 0 extent), `first_mip`, `mip_count`, `first_array_slice`, `array_size`. These are the same values the record's `Source` carries; for v1 `array_size` is 1.
+3. Then one block per subresource, slices ascending, and within a slice mips ascending from `first_mip`:
+   - six integers: `slice`, `mip`, `level_width`, `level_height` (texels; each is max(1, extent >> mip)), `row_bytes`, `rows`
+   - then `rows` x `row_bytes` bytes, rows top to bottom, tightly packed: the mapped row pitch's padding is never hashed.
+   - uncompressed formats: `row_bytes` = level_width x bytes per texel, `rows` = level_height.
+   - block-compressed formats: `row_bytes` = ceil(level_width / 4) x block bytes (8 for BC1 and BC4, 16 for BC2, BC3, BC5, BC7), `rows` = ceil(level_height / 4).
+
+Consequences I intend: the same texels read through an sRGB view and through a UNORM view have different digests (interpretation is part of identity, as your cache document says); a view of mips 2..9 of a streamed texture has a different digest from the full chain and says so through `first_mip`/`mip_count` (`complete_observed_range` stays the runtime's statement about what it saw); no pointer, name, bind slot or time is in it.
+
+Not in v1, on purpose: typeless-to-typed resolution rules beyond storing both formats as observed; 3D, cube and multisampled textures; any normalisation of the bytes (BC blocks are hashed as stored, never decoded).
+
+Your file-fixture domain ("file-bytes") stays yours and is never compared with this one. If you want a field added, reordered or the magic changed, say so; otherwise I implement this as a portable header with test vectors both sides can check.
