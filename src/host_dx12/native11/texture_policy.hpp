@@ -10,7 +10,7 @@
 
 namespace na::native11 {
 
-struct TextureFacts {
+struct MaterialTextureFacts {
     bool texture2d = false;     // the view is of a 2D texture (not a buffer, 1D, 3D)
     bool cube = false;          // D3D11_RESOURCE_MISC_TEXTURECUBE, or a cube view
     uint32_t width = 0, height = 0, mips = 0, array_size = 1, samples = 1;
@@ -109,7 +109,7 @@ inline constexpr uint32_t kBindRenderTarget = 0x20, kBindDepthStencil = 0x40, kB
 inline constexpr uint32_t kMinMaterialSide = 64;
 
 // The first reason that applies, in the order a reader would ask them.
-inline TextureVerdict Judge(const TextureFacts& t)
+inline TextureVerdict Judge(const MaterialTextureFacts& t)
 {
     if (!t.texture2d) return TextureVerdict::NotTexture2D;
     if (t.cube) return TextureVerdict::Cube;

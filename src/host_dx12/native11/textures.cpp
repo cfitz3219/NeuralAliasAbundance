@@ -42,7 +42,7 @@ PFN_GetSrvs g_get[2] = {}; // [0] immediate class, [1] deferred class
 
 struct Entry {
     uint64_t serial = 0;
-    TextureFacts facts;
+    MaterialTextureFacts facts;
     TextureVerdict verdict = TextureVerdict::NotTexture2D;
     std::atomic<uint64_t> binds{0}, scene_binds{0};
     std::atomic<uint32_t> slot{~0u}, set_key{0}, set_size{0};
@@ -131,9 +131,9 @@ struct Life final : IUnknown {
     }
 };
 
-TextureFacts FactsOf(ID3D11Resource* resource, ID3D11ShaderResourceView* view)
+MaterialTextureFacts FactsOf(ID3D11Resource* resource, ID3D11ShaderResourceView* view)
 {
-    TextureFacts t;
+    MaterialTextureFacts t;
     D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     resource->GetType(&dim);
     if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return t;
@@ -236,7 +236,7 @@ void STDMETHODCALLTYPE PSGetShaderResourcesDeferred_d(ID3D11DeviceContext* c, UI
 void EmitCensus()
 {
     struct Row {
-        TextureFacts f;
+        MaterialTextureFacts f;
         uint64_t scene_binds, binds;
         uint32_t slot, set_key, set_size;
         bool replaced;

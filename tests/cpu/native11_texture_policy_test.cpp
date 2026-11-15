@@ -6,9 +6,9 @@
 using namespace na::native11;
 
 namespace {
-TextureFacts Material(uint32_t view_format = 99, uint32_t side = 1024, uint32_t mips = 11)
+MaterialTextureFacts Material(uint32_t view_format = 99, uint32_t side = 1024, uint32_t mips = 11)
 {
-    TextureFacts t;
+    MaterialTextureFacts t;
     t.texture2d = true;
     t.width = t.height = side;
     t.mips = t.view_mips = mips;
