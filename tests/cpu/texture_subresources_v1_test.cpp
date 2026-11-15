@@ -97,6 +97,34 @@ int main()
                 CHECK(d.Finish().empty());
             }
         }},
+        {"single-channel R8 is covered", [] {
+            const auto a = Seq(0, 8), b = Seq(8, 2);
+            TextureSubresourcesV1 d(Header(61, 61, 4, 2, 0, 2));
+            CHECK(d.AddLevel(0, 0, a.data(), 4));
+            CHECK(d.AddLevel(0, 1, b.data(), 2));
+            CHECK(d.Finish() == "46ad4301cc21850c055224c3d6f408f73f14f9719d133c6f3a972afeabee39ca");
+        }},
+        {"a header describing levels or slices that cannot exist gives no identity and computes nothing", [] {
+            const auto a = Seq(0, 64);
+            auto none = Header(28, 28, 2, 2, 0, 0); // no mips: must not divide by the count
+            auto deep = Header(28, 28, 2, 2, 40, 1); // first mip far below the 1x1 level: must not shift by it
+            auto past = Header(28, 28, 4, 4, 2, 2);  // the chain has three levels; this asks for a fourth
+            auto wrap = Header(28, 28, 2, 2, 0, 1);
+            wrap.first_array_slice = 0xffffffffu;
+            wrap.array_size = 2; // slice numbers past 32 bits
+            auto empty = Header(28, 28, 2, 2, 0, 1);
+            empty.array_size = 0;
+            for (const TexSubHeader& h : {none, deep, past, wrap, empty}) {
+                TextureSubresourcesV1 d(h);
+                CHECK(!d.ok());
+                CHECK(!d.AddLevel(h.first_array_slice, h.first_mip, a.data(), 64));
+                CHECK(d.Finish().empty());
+            }
+            TextureSubresourcesV1 last(Header(28, 28, 4, 4, 2, 1)); // the 1x1 level alone is a real view
+            CHECK(last.ok() && last.AddLevel(0, 2, a.data(), 4) && !last.Finish().empty());
+            TextureSubresourcesV1 null_data(Header(28, 28, 2, 2, 0, 1));
+            CHECK(!null_data.AddLevel(0, 0, nullptr, 8));
+        }},
         {"array slices run in ascending order, mips within each", [] {
             const auto a = Seq(0, 16), b = Seq(16, 4);
             auto h = Header(28, 28, 2, 2, 0, 2);

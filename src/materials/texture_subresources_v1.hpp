@@ -108,6 +108,7 @@ inline bool TexSubLayout(uint32_t view_format, uint32_t& block_bytes, uint32_t& 
     block_bytes = texel_bytes = 0;
     switch (view_format) {
     case 28: case 29: case 87: case 88: case 91: case 93: texel_bytes = 4; return true; // RGBA8 / BGRA8 / BGRX8, UNORM and sRGB
+    case 61: texel_bytes = 1; return true;                                              // R8_UNORM
     case 71: case 72: case 80: case 81: block_bytes = 8; return true;                   // BC1, BC4
     case 74: case 75: case 77: case 78: case 83: case 84: case 98: case 99: block_bytes = 16; return true; // BC2, BC3, BC5, BC7
     default: return false;
@@ -119,7 +120,14 @@ class TextureSubresourcesV1 {
 public:
     explicit TextureSubresourcesV1(const TexSubHeader& h) : h_(h)
     {
-        ok_ = TexSubLayout(h.view_format, block_, texel_) && h.width && h.height && h.mip_count && h.array_size;
+        // The range must exist: levels below the 1x1 level, or a slice range past 32 bits, have no identity.
+        const uint32_t longest = h.width > h.height ? h.width : h.height;
+        uint32_t full = 0; // levels of the full chain
+        for (uint32_t v = longest; v; v >>= 1) ++full;
+        ok_ = TexSubLayout(h.view_format, block_, texel_) && h.width && h.height && h.mip_count && h.array_size &&
+              h.first_mip < full && h.mip_count <= full - h.first_mip &&
+              uint64_t(h.first_array_slice) + h.array_size <= 0x100000000ull &&
+              uint64_t(h.width) * (block_ ? block_ : texel_) <= 0xffffffffull;
         sha_.Update("NA-TEXSUB-1", 12); // the literal's own terminating zero is the twelfth byte
         const uint32_t fields[8] = {h.resource_format, h.view_format, h.width, h.height,
                                     h.first_mip, h.mip_count, h.first_array_slice, h.array_size};
@@ -128,10 +136,12 @@ public:
     // `data` is the level's first row; rows are `source_row_pitch` bytes apart (>= the tight row).
     bool AddLevel(uint32_t slice, uint32_t mip, const void* data, size_t source_row_pitch)
     {
+        // Nothing is computed from the header before it is known to be valid (mip_count is then
+        // nonzero, and the quotient below is under array_size, so both sums fit 32 bits).
+        if (!ok_ || !data || next_ >= uint64_t(h_.mip_count) * h_.array_size) return ok_ = false;
         const uint32_t want_slice = h_.first_array_slice + static_cast<uint32_t>(next_ / h_.mip_count);
         const uint32_t want_mip = h_.first_mip + static_cast<uint32_t>(next_ % h_.mip_count);
-        if (!ok_ || !data || next_ >= uint64_t(h_.mip_count) * h_.array_size || slice != want_slice || mip != want_mip)
-            return ok_ = false;
+        if (slice != want_slice || mip != want_mip) return ok_ = false;
         const uint32_t w = (h_.width >> mip) ? (h_.width >> mip) : 1, h = (h_.height >> mip) ? (h_.height >> mip) : 1;
         const uint32_t row_bytes = block_ ? ((w + 3) / 4) * block_ : w * texel_;
         const uint32_t rows = block_ ? (h + 3) / 4 : h;

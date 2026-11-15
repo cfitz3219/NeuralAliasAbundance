@@ -1580,7 +1580,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                "a source dump starts, and a second request waits for the first");
         g.ctx->PSSetShaderResources(0, 1, &texture_view);
         g.ctx->Draw(4, 0);
-        for (int i = 0; i < 96 && na::native11::GetTextureStats().dump_active; ++i) na::native11::TexturesOnPresent();
+        // The game's Present submits the queued copy; here a flush stands in for it. The copy is read
+        // back without waiting, and the file is written on the dump's own thread.
+        for (int i = 0; i < 1500 && na::native11::GetTextureStats().dump_active; ++i) {
+            na::native11::TexturesOnPresent();
+            g.ctx->Flush();
+            Sleep(2);
+        }
         const auto dump_after = na::native11::GetTextureStats();
         WIN32_FILE_ATTRIBUTE_DATA dump_written_file{}, dump_index_file{};
         const bool have_file = GetFileAttributesExW(dump_file.c_str(), GetFileExInfoStandard, &dump_written_file) != 0;

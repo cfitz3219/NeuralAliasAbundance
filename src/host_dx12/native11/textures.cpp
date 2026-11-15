@@ -13,11 +13,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -39,6 +42,7 @@ constexpr uint64_t kDumpCollectFrames = 32;        // Presents during which boun
 constexpr size_t kDumpCollectMax = 256;            // noted at most; the most used are then kept
 constexpr size_t kDumpTextures = 48;               // written per request
 constexpr uint64_t kDumpBytes = 512ull << 20;      // and at most this much texture data per request
+constexpr uint64_t kDumpReadFrames = 600;          // a queued copy not readable after this many Presents is given up
 
 using PFN_CreateSrv = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*,
                                                   ID3D11ShaderResourceView**);
@@ -83,24 +87,47 @@ std::atomic<uint64_t> g_verdicts[static_cast<size_t>(TextureVerdict::kCount)]{};
 uint64_t g_census_next_ms = 0; // Present thread only
 
 // Source dump (RequestTextureDump). A view is noted, with a reference, only inside the game's own
-// bind call, where the game's view is certainly alive; it is read and written on the Present thread.
+// bind call, where the game's view is certainly alive. Its copy is queued and later read on the Present thread
+// without waiting for the GPU; hashing and file writes happen on the dump's own worker thread.
 struct DumpItem {
     ComPtr<ID3D11ShaderResourceView> view;
     std::shared_ptr<Entry> entry;
 };
+// One texture's bytes on their way to disk: filled on the Present thread (memory copies only),
+// hashed and written by the dump's worker thread.
+struct DumpJob {
+    MaterialTextureFacts facts;
+    uint32_t slot = 0, set_key = 0, set_size = 0;
+    uint64_t scene_binds = 0, binds = 0;
+    std::vector<uint8_t> body;  // the levels, tightly packed, in order
+    const char* why = nullptr;  // set when the texture could not be read: logged, nothing written
+    bool last = false;          // no texture: the request is finished
+};
+// The one staging copy in flight. The copy is queued on the GPU and read back on a later Present,
+// never waited for.
+struct DumpRead {
+    DumpItem item;
+    ComPtr<ID3D11Texture2D> staging;
+    uint64_t since_frame = 0;
+};
 struct Dump {
     std::mutex mu;
-    std::vector<DumpItem> queue; // under mu while collecting; Present thread only while writing
-    std::wstring dir;
+    std::vector<DumpItem> queue; // under mu while collecting; Present thread only while reading
+    std::wstring dir;            // set under mu at the request; read by the worker after it
     uint64_t until_frame = 0;
-    uint64_t written = 0, duplicates = 0, failed = 0, bytes = 0, noted = 0, over_budget = 0;
+    uint64_t noted = 0, over_budget = 0;
+    std::unique_ptr<DumpRead> read; // Present thread only
+    bool finishing = false;         // Present thread only: the last job has been handed over
+    std::mutex work_mu;
+    std::condition_variable work_cv;
+    std::deque<DumpJob> work;
 };
 Dump& D()
 {
     static Dump* d = new Dump;
     return *d;
 }
-std::atomic<int> g_dump_phase{0}; // 0 idle, 1 noting binds, 2 writing one texture per Present
+std::atomic<int> g_dump_phase{0}; // 0 idle, 1 noting binds, 2 reading and writing
 std::atomic<uint64_t> g_dump_written{0}, g_dump_failed{0};
 
 // {3f9c2d71-8a54-4b0e-b6c3-5e1a9d7f2c48}: a view's entry, by the lifetime of its private data.
@@ -321,32 +348,14 @@ bool WriteAll(const std::wstring& path, const void* head, size_t head_n, const s
     return std::fclose(f) == 0 && ok;
 }
 
-// Reads one noted view's levels through a staging copy, names them by "texture-subresources-v1"
-// and writes <digest>.dds (DX10 header, the view's typed format, bytes as stored) plus one index line.
-// Returns the reason it could not, or null.
-const char* DumpOne(const DumpItem& item, Dump& d)
+// Worker thread: names one texture's bytes by "texture-subresources-v1", writes <digest>.dds (DX10
+// header, the view's typed format, bytes as stored) and then its index line. Returns the reason it
+// could not, or null. `duplicate`: another view had the same content, so only the index line is new.
+const char* WriteDumped(const DumpJob& job, const std::wstring& dir, bool& duplicate, uint64_t& file_bytes)
 {
-    const MaterialTextureFacts& f = item.entry->facts;
+    const MaterialTextureFacts& f = job.facts;
     uint32_t block = 0, texel = 0;
     if (!na::materials::TexSubLayout(f.view_format, block, texel)) return "format has no v1 identity";
-    ComPtr<ID3D11Resource> resource;
-    item.view->GetResource(&resource);
-    ComPtr<ID3D11Texture2D> texture;
-    if (!resource || FAILED(resource.As(&texture))) return "not a 2D texture any more";
-    ComPtr<ID3D11Device> device;
-    item.view->GetDevice(&device);
-    ComPtr<ID3D11DeviceContext> ctx;
-    device->GetImmediateContext(&ctx);
-    D3D11_TEXTURE2D_DESC td{};
-    texture->GetDesc(&td);
-    td.Usage = D3D11_USAGE_STAGING;
-    td.BindFlags = 0;
-    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    td.MiscFlags = 0;
-    OwnWorkScope own; // our copy and maps are not the game's work
-    ComPtr<ID3D11Texture2D> staging;
-    if (FAILED(device->CreateTexture2D(&td, nullptr, &staging)) || !staging) return "no staging copy (memory or format)";
-    ctx->CopyResource(staging.Get(), texture.Get());
     na::materials::TexSubHeader h;
     h.resource_format = f.format;
     h.view_format = f.view_format;
@@ -355,29 +364,20 @@ const char* DumpOne(const DumpItem& item, Dump& d)
     h.first_mip = 0;
     h.mip_count = f.mips;
     na::materials::TextureSubresourcesV1 digest(h);
-    std::vector<uint8_t> body;
-    body.reserve(static_cast<size_t>(ChainBytes(f.width, f.height, f.mips, f.view_format)));
+    size_t at = 0;
     uint32_t first_level_bytes = 0;
     for (uint32_t mip = 0; mip < f.mips; ++mip) {
-        D3D11_MAPPED_SUBRESOURCE m{};
-        if (FAILED(ctx->Map(staging.Get(), mip, D3D11_MAP_READ, 0, &m)) || !m.pData) return "a level could not be read back";
         const uint32_t w = (std::max)(1u, f.width >> mip), ht = (std::max)(1u, f.height >> mip);
         const uint32_t row = block ? ((w + 3) / 4) * block : w * texel, rows = block ? (ht + 3) / 4 : ht;
-        const bool fed = m.RowPitch >= row && digest.AddLevel(0, mip, m.pData, m.RowPitch);
-        if (fed)
-            for (uint32_t r = 0; r < rows; ++r) {
-                const auto* p = static_cast<const uint8_t*>(m.pData) + size_t(r) * m.RowPitch;
-                body.insert(body.end(), p, p + row);
-            }
-        ctx->Unmap(staging.Get(), mip);
-        if (!fed) return "a level's row layout was not the expected one";
+        const size_t size = size_t(row) * rows;
+        if (at + size > job.body.size() || !digest.AddLevel(0, mip, job.body.data() + at, row)) return "levels incomplete";
         if (!mip) first_level_bytes = row * rows;
+        at += size;
     }
     const std::string name = digest.Finish();
-    if (name.empty()) return "levels incomplete";
-    const std::wstring wide(name.begin(), name.end());
-    const std::wstring path = d.dir + L"\\" + wide + L".dds";
-    const bool duplicate = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; // another view of the same content
+    if (name.empty() || at != job.body.size()) return "levels incomplete";
+    const std::wstring path = dir + L"\\" + std::wstring(name.begin(), name.end()) + L".dds";
+    duplicate = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
     if (!duplicate) {
         uint32_t head[37] = {};
         head[0] = 0x20534444; // "DDS "
@@ -394,34 +394,164 @@ const char* DumpOne(const DumpItem& item, Dump& d)
         head[32] = f.view_format;
         head[33] = 3; // 2D
         head[35] = 1;
-        if (!WriteAll(path, head, sizeof(head), body)) return "the file could not be written";
-        d.bytes += body.size();
-    } else {
-        ++d.duplicates;
+        // Written under a temporary name: a file with the digest's name is always complete.
+        const std::wstring partial = path + L".part";
+        if (!WriteAll(partial, head, sizeof(head), job.body) || !MoveFileExW(partial.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            DeleteFileW(partial.c_str());
+            return "the file could not be written";
+        }
+        file_bytes += job.body.size();
     }
-    const Entry& e = *item.entry;
     char line[1024];
     const int n = std::snprintf(line, sizeof(line),
                                 "{\"content_sha256\":\"%s\",\"identity_domain\":\"texture-subresources-v1\",\"file\":\"%s.dds\","
                                 "\"resource_format\":%u,\"view_format\":%u,\"width\":%u,\"height\":%u,\"first_mip\":0,\"mip_count\":%u,"
-                                "\"first_array_slice\":0,\"array_size\":1,\"class\":\"%s\",\"slot\":%u,\"scene_binds\":%llu,\"binds\":%llu,"
-                                "\"set\":\"%08x\",\"set_size\":%u,\"bytes\":%zu,\"duplicate\":%s}\n",
+                                "\"first_array_slice\":0,\"array_size\":1,\"complete_observed_range\":true,\"class\":\"%s\",\"slot\":%u,"
+                                "\"scene_binds\":%llu,\"binds\":%llu,\"set\":\"%08x\",\"set_size\":%u,\"bytes\":%zu,\"duplicate\":%s}\n",
                                 name.c_str(), name.c_str(), f.format, f.view_format, f.width, f.height, f.mips, Name(ClassOf(f.view_format)),
-                                e.slot.load(std::memory_order_relaxed), static_cast<unsigned long long>(e.scene_binds.load(std::memory_order_relaxed)),
-                                static_cast<unsigned long long>(e.binds.load(std::memory_order_relaxed)), e.set_key.load(std::memory_order_relaxed),
-                                e.set_size.load(std::memory_order_relaxed), body.size(), duplicate ? "true" : "false");
-    FILE* index = nullptr;
-    if (n <= 0 || n >= static_cast<int>(sizeof(line)) || _wfopen_s(&index, (d.dir + L"\\index.jsonl").c_str(), L"ab") || !index) return "the index could not be written";
-    std::fwrite(line, 1, static_cast<size_t>(n), index);
-    std::fclose(index);
+                                job.slot, static_cast<unsigned long long>(job.scene_binds), static_cast<unsigned long long>(job.binds),
+                                job.set_key, job.set_size, job.body.size(), duplicate ? "true" : "false");
+    FILE* index = nullptr; // the index line follows the finished file, never precedes it
+    if (n <= 0 || n >= static_cast<int>(sizeof(line)) || _wfopen_s(&index, (dir + L"\\index.jsonl").c_str(), L"ab") || !index)
+        return "the index could not be written";
+    const bool ok = std::fwrite(line, 1, static_cast<size_t>(n), index) == static_cast<size_t>(n);
+    return std::fclose(index) == 0 && ok ? nullptr : "the index could not be written";
+}
+
+// One per request; ends with it. Hashing and file writes happen here, never in a game callback.
+void DumpWorker(std::wstring dir, uint64_t noted, uint64_t over_budget)
+{
+    Dump& d = D();
+    CreateDirectoryW(dir.c_str(), nullptr);
+    uint64_t written = 0, duplicates = 0, failed = 0, file_bytes = 0;
+    for (;;) {
+        DumpJob job;
+        {
+            std::unique_lock<std::mutex> l(d.work_mu);
+            d.work_cv.wait(l, [&] { return !d.work.empty(); });
+            job = std::move(d.work.front());
+            d.work.pop_front();
+        }
+        if (job.last) break;
+        bool duplicate = false;
+        const char* why = job.why ? job.why : WriteDumped(job, dir, duplicate, file_bytes);
+        if (why) {
+            ++failed;
+            g_dump_failed.fetch_add(1, std::memory_order_relaxed);
+            const MaterialTextureFacts& f = job.facts;
+            na::eventlog::Emit("native11_texture_dump", "skipped w=%u h=%u mips=%u format=%u view_format=%u why=\"%s\"", f.width,
+                               f.height, f.mips, f.format, f.view_format, why);
+        } else {
+            ++(duplicate ? duplicates : written);
+            g_dump_written.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    na::eventlog::Emit("native11_texture_dump",
+                       "done noted=%llu written=%llu same_content=%llu skipped=%llu not_kept=%llu file_bytes=%llu "
+                       "note=\"candidates bound to pixel shaders before the picture was handed to DLSS over %llu frames, most used first; "
+                       "at most %zu textures and %llu MiB per request; names are texture-subresources-v1 digests; index.jsonl lists them\"",
+                       static_cast<unsigned long long>(noted), static_cast<unsigned long long>(written),
+                       static_cast<unsigned long long>(duplicates), static_cast<unsigned long long>(failed),
+                       static_cast<unsigned long long>(over_budget), static_cast<unsigned long long>(file_bytes),
+                       static_cast<unsigned long long>(kDumpCollectFrames), kDumpTextures, static_cast<unsigned long long>(kDumpBytes >> 20));
+    g_dump_phase.store(0, std::memory_order_release);
+}
+
+void HandToWorker(Dump& d, DumpJob&& job)
+{
+    {
+        std::lock_guard<std::mutex> l(d.work_mu);
+        d.work.push_back(std::move(job));
+    }
+    d.work_cv.notify_one();
+}
+
+DumpJob JobOf(const DumpItem& item)
+{
+    const Entry& e = *item.entry;
+    DumpJob job;
+    job.facts = e.facts;
+    job.slot = e.slot.load(std::memory_order_relaxed);
+    job.set_key = e.set_key.load(std::memory_order_relaxed);
+    job.set_size = e.set_size.load(std::memory_order_relaxed);
+    job.scene_binds = e.scene_binds.load(std::memory_order_relaxed);
+    job.binds = e.binds.load(std::memory_order_relaxed);
+    return job;
+}
+
+// Present thread: queues the GPU copy of the next texture and returns the reason it could not, or null.
+const char* StartRead(DumpRead& read, uint64_t frame)
+{
+    uint32_t block = 0, texel = 0;
+    if (!na::materials::TexSubLayout(read.item.entry->facts.view_format, block, texel)) return "format has no v1 identity";
+    ComPtr<ID3D11Resource> resource;
+    read.item.view->GetResource(&resource);
+    ComPtr<ID3D11Texture2D> texture;
+    if (!resource || FAILED(resource.As(&texture))) return "not a 2D texture any more";
+    ComPtr<ID3D11Device> device;
+    read.item.view->GetDevice(&device);
+    ComPtr<ID3D11DeviceContext> ctx;
+    device->GetImmediateContext(&ctx);
+    D3D11_TEXTURE2D_DESC td{};
+    texture->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    OwnWorkScope own; // our copy is not the game's work
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &read.staging)) || !read.staging) return "no staging copy (memory or format)";
+    ctx->CopyResource(read.staging.Get(), texture.Get());
+    read.since_frame = frame;
     return nullptr;
 }
 
-// Present thread. Phase 1 ends after its frames (or when enough is noted): keep the most used within
-// the budget. Phase 2 writes one texture per Present, so a dump never stalls more than one frame's worth.
+// Present thread: reads the finished copy without waiting. 0 = not ready yet (same copy, ask again
+// next Present), 1 = `job.body` holds every level, -1 = failed (`job.why`).
+int FinishRead(DumpRead& read, DumpJob& job)
+{
+    const MaterialTextureFacts& f = job.facts;
+    uint32_t block = 0, texel = 0;
+    na::materials::TexSubLayout(f.view_format, block, texel);
+    ComPtr<ID3D11Device> device;
+    read.staging->GetDevice(&device);
+    ComPtr<ID3D11DeviceContext> ctx;
+    device->GetImmediateContext(&ctx);
+    OwnWorkScope own;
+    job.body.clear();
+    for (uint32_t mip = 0; mip < f.mips; ++mip) {
+        D3D11_MAPPED_SUBRESOURCE m{};
+        const HRESULT hr = ctx->Map(read.staging.Get(), mip, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return 0; // nothing kept: levels already copied are read again when ready
+        if (FAILED(hr) || !m.pData) {
+            job.why = "a level could not be read back";
+            return -1;
+        }
+        const uint32_t w = (std::max)(1u, f.width >> mip), ht = (std::max)(1u, f.height >> mip);
+        const uint32_t row = block ? ((w + 3) / 4) * block : w * texel, rows = block ? (ht + 3) / 4 : ht;
+        const bool fits = m.RowPitch >= row;
+        if (fits) {
+            if (!mip) job.body.reserve(static_cast<size_t>(ChainBytes(f.width, f.height, f.mips, f.view_format)));
+            for (uint32_t r = 0; r < rows; ++r) {
+                const auto* p = static_cast<const uint8_t*>(m.pData) + size_t(r) * m.RowPitch;
+                job.body.insert(job.body.end(), p, p + row);
+            }
+        }
+        ctx->Unmap(read.staging.Get(), mip);
+        if (!fits) {
+            job.why = "a level's row layout was not the expected one";
+            return -1;
+        }
+    }
+    return 1;
+}
+
+// Present thread. Phase 1 ends after its frames (or when enough is noted): the most used within the
+// budget are kept. Phase 2 has one staging copy in flight: it is queued on one Present and read on a
+// later one with DO_NOT_WAIT, so the GPU is never waited for here; the bytes (memory copies only)
+// then go to the worker thread, which hashes and writes them.
 void DumpOnPresent(uint64_t frame)
 {
-    const int phase = g_dump_phase.load(std::memory_order_relaxed);
+    const int phase = g_dump_phase.load(std::memory_order_acquire);
     if (!phase) return;
     Dump& d = D();
     if (phase == 1) {
@@ -430,12 +560,13 @@ void DumpOnPresent(uint64_t frame)
             std::lock_guard<std::mutex> l(d.mu);
             if (frame < d.until_frame && d.queue.size() < kDumpCollectMax) return;
             d.noted = d.queue.size();
-            // Least used first, so the next texture to write is taken from the back.
+            // Least used first, so the next texture to read is taken from the back.
             std::sort(d.queue.begin(), d.queue.end(), [](const DumpItem& a, const DumpItem& b) {
                 return a.entry->scene_binds.load(std::memory_order_relaxed) < b.entry->scene_binds.load(std::memory_order_relaxed);
             });
             std::vector<DumpItem> keep;
             uint64_t bytes = 0;
+            d.over_budget = 0;
             for (auto it = d.queue.rbegin(); it != d.queue.rend(); ++it) {
                 const MaterialTextureFacts& f = it->entry->facts;
                 const uint64_t size = ChainBytes(f.width, f.height, f.mips, f.view_format);
@@ -449,36 +580,44 @@ void DumpOnPresent(uint64_t frame)
             }
             std::reverse(keep.begin(), keep.end());
             d.queue = std::move(keep);
-            g_dump_phase.store(2, std::memory_order_relaxed);
+            d.finishing = false;
+            g_dump_phase.store(2, std::memory_order_release);
         }
         dropped.clear();
-        CreateDirectoryW(d.dir.c_str(), nullptr);
+        std::thread(&DumpWorker, d.dir, d.noted, d.over_budget).detach();
+        return;
+    }
+    if (d.finishing) return; // the worker ends the request
+    if (d.read) {
+        DumpJob job = JobOf(d.read->item);
+        int state = FinishRead(*d.read, job);
+        if (!state && frame - d.read->since_frame > kDumpReadFrames) {
+            job.why = "the copy was not ready within the allowed frames";
+            state = -1;
+        }
+        if (!state) return;
+        if (state < 0) job.body.clear();
+        d.read.reset(); // lets go of the game's view and the staging copy
+        HandToWorker(d, std::move(job));
         return;
     }
     if (!d.queue.empty()) {
-        DumpItem item = std::move(d.queue.back());
+        auto read = std::make_unique<DumpRead>();
+        read->item = std::move(d.queue.back());
         d.queue.pop_back();
-        if (const char* why = DumpOne(item, d)) {
-            ++d.failed;
-            g_dump_failed.fetch_add(1, std::memory_order_relaxed);
-            const MaterialTextureFacts& f = item.entry->facts;
-            na::eventlog::Emit("native11_texture_dump", "skipped w=%u h=%u mips=%u format=%u view_format=%u why=\"%s\"", f.width,
-                               f.height, f.mips, f.format, f.view_format, why);
+        if (const char* why = StartRead(*read, frame)) {
+            DumpJob job = JobOf(read->item);
+            job.why = why;
+            HandToWorker(d, std::move(job));
         } else {
-            ++d.written;
-            g_dump_written.fetch_add(1, std::memory_order_relaxed);
+            d.read = std::move(read);
         }
         return;
     }
-    na::eventlog::Emit("native11_texture_dump",
-                       "done noted=%llu written=%llu same_content=%llu skipped=%llu not_kept=%llu file_bytes=%llu "
-                       "note=\"candidates bound to pixel shaders before the picture was handed to DLSS over %llu frames, most used first; "
-                       "at most %zu textures and %llu MiB per request; names are texture-subresources-v1 digests; index.jsonl lists them\"",
-                       static_cast<unsigned long long>(d.noted), static_cast<unsigned long long>(d.written - d.duplicates),
-                       static_cast<unsigned long long>(d.duplicates), static_cast<unsigned long long>(d.failed),
-                       static_cast<unsigned long long>(d.over_budget), static_cast<unsigned long long>(d.bytes),
-                       static_cast<unsigned long long>(kDumpCollectFrames), kDumpTextures, static_cast<unsigned long long>(kDumpBytes >> 20));
-    g_dump_phase.store(0, std::memory_order_relaxed);
+    DumpJob last;
+    last.last = true;
+    d.finishing = true;
+    HandToWorker(d, std::move(last));
 }
 
 } // namespace
@@ -499,7 +638,7 @@ bool RequestTextureDump(const wchar_t* dir)
         if (g_dump_phase.load(std::memory_order_relaxed) != 0) return false;
         d.dir = dir;
         d.until_frame = g_frame.load(std::memory_order_relaxed) + kDumpCollectFrames;
-        d.written = d.duplicates = d.failed = d.bytes = d.noted = d.over_budget = 0;
+        d.noted = d.over_budget = 0;
         g_dump_phase.store(1, std::memory_order_relaxed);
     }
     na::eventlog::Emit("native11_texture_dump", "requested frames=%llu", static_cast<unsigned long long>(kDumpCollectFrames));

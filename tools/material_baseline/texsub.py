@@ -6,10 +6,14 @@ import hashlib
 import struct
 
 BLOCK = {71: 8, 72: 8, 80: 8, 81: 8, 74: 16, 75: 16, 77: 16, 78: 16, 83: 16, 84: 16, 98: 16, 99: 16}
-TEXEL = {28: 4, 29: 4, 87: 4, 88: 4, 91: 4, 93: 4}
+TEXEL = {28: 4, 29: 4, 87: 4, 88: 4, 91: 4, 93: 4, 61: 1}
 
 
 def digest(resource_format, view_format, width, height, first_mip, mip_count, first_array_slice, array_size, levels):
+    full = max(width, height).bit_length()
+    if (width < 1 or height < 1 or mip_count < 1 or array_size < 1 or first_mip >= full or mip_count > full-first_mip
+            or first_array_slice+array_size > 2**32 or view_format not in BLOCK and view_format not in TEXEL):
+        raise ValueError("header has no v1 identity")
     h = hashlib.sha256(b"NA-TEXSUB-1\0")
     h.update(struct.pack("<8I", resource_format, view_format, width, height, first_mip, mip_count, first_array_slice, array_size))
     expected = [(first_array_slice+s, first_mip+m) for s in range(array_size) for m in range(mip_count)]
@@ -37,4 +41,5 @@ if __name__ == "__main__":
     print("bc1_srgb_8x4_one_mip", digest(70, 72, 8, 4, 0, 1, 0, 1, [(0, 0, seq(0, 16))]))
     print("rgba8_4x4_mip1_only ", digest(28, 28, 4, 4, 1, 1, 0, 1, [(0, 1, seq(0, 16))]))
     print("rgba8_array_3_4     ", digest(28, 28, 2, 2, 0, 2, 3, 2, [(3, 0, seq(0, 16)), (3, 1, seq(16, 4)), (4, 0, seq(0, 16)), (4, 1, seq(16, 4))]))
+    print("r8_4x2_two_mips     ", digest(61, 61, 4, 2, 0, 2, 0, 1, [(0, 0, seq(0, 8)), (0, 1, seq(8, 2))]))
     print("sha256_abc          ", hashlib.sha256(b"abc").hexdigest())

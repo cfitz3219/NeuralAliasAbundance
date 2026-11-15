@@ -102,7 +102,8 @@ void SetTexturesEnabled(bool on); // one switch for every replacement; the censu
 // Source dump: for the candidate textures the game binds to pixel shaders in its scene over the next
 // frames, most used first and within a fixed budget, writes <dir>\<digest>.dds (the bytes as stored,
 // named by "texture-subresources-v1", materials/texture_subresources_v1.hpp) and <dir>\index.jsonl.
-// One texture is read per Present. False when a dump is already running. The files are a capture:
+// One texture's GPU copy is in flight at a time: queued on one Present, read on a later one without
+// waiting for the GPU, then hashed and written on a worker thread. False when a dump is already running. The files are a capture:
 // they stay on the user's machine and are the preparer's input, never part of the program.
 bool RequestTextureDump(const wchar_t* dir);
 
