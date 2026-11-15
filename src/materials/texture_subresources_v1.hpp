@@ -128,8 +128,8 @@ public:
     // `data` is the level's first row; rows are `source_row_pitch` bytes apart (>= the tight row).
     bool AddLevel(uint32_t slice, uint32_t mip, const void* data, size_t source_row_pitch)
     {
-        const uint32_t want_slice = h_.first_array_slice + next_ / h_.mip_count;
-        const uint32_t want_mip = h_.first_mip + next_ % h_.mip_count;
+        const uint32_t want_slice = h_.first_array_slice + static_cast<uint32_t>(next_ / h_.mip_count);
+        const uint32_t want_mip = h_.first_mip + static_cast<uint32_t>(next_ % h_.mip_count);
         if (!ok_ || !data || next_ >= uint64_t(h_.mip_count) * h_.array_size || slice != want_slice || mip != want_mip)
             return ok_ = false;
         const uint32_t w = (h_.width >> mip) ? (h_.width >> mip) : 1, h = (h_.height >> mip) ? (h_.height >> mip) : 1;
