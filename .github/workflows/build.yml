@@ -89,6 +89,12 @@ jobs:
               if ($l -match 'Failed|Timeout|\*\*\*|Not Run|tests failed') { Write-Output "::error::$l" }
             }
           exit $code
+      - name: DLAA companion handoff on the software device (informational)
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure -R host_dlaa_companion_warp_test --timeout 120 2>&1 | Select-Object -Last 30
+          Write-Output "DLAA-COMPANION warp ctest exit code: $LASTEXITCODE"
+          exit 0
       - name: Deployment script tests (C5)
         shell: pwsh
         run: |

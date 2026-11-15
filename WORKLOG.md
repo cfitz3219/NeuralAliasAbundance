@@ -1648,3 +1648,10 @@ Also added: a deferred recording made while a replacement is visible samples it 
 - `src/materials/shader_texture_use.hpp`: reads a pixel shader's disassembly listing and says, per texture slot, whether it is only sampled plainly (`sample`, `sample_b`, `sample_d`) or read some other way (the mnemonic is kept as the reason). Unknown listing = nothing safe.
 - `src/materials/cache_index.hpp`: `LargerLog2`, `Qualified(map, allow_larger)`, `CacheIndex(allow_larger)`, `Hit::larger_log2`. A 2x/4x/8x map needs one extra level per doubling. The runtime still builds its index without `allow_larger`, so behaviour in a game is unchanged until the pixel-shader hooks and the per-draw choice exist.
 - Tests: `na.cpu.shader_texture_use` (4 cases), `na.cpu.material_cache_index` (4 cases). Not yet: the native11 hooks, a real listing from D3DDisassemble on Windows.
+
+## 2026-11-15 — DLAA for 32-bit games: companion program and handoff (Fable)
+- `src/dlaa_remote/`: `protocol.hpp` (fixed-width contract), `channel.*` (one shared block, two events), `client.*` (in-game half: starts the companion, shares fences and textures by duplicated handles, per-frame request, handoff timing), `companion*.cpp` (`NeuralAliasDlaa64.exe`: opens the shared objects, runs the unchanged `dlss::` backend, always signals `done`).
+- `native_d3d11/live_dlaa.cpp`, variant `dlss/in-companion`: on that route one frame is two command lists with the companion's DLSS between them, ordered by two shared fences (`ready`, `done`); no pixels cross as bytes. The game thread waits for the companion's answer each frame; that wait is the logged `handoff_us`.
+- Not yet on the companion route: ambient shading (XeGTAO) and tone/bloom before DLSS (they hand DLSS a different colour image). The menu says so for ambient shading.
+- If the companion ends or stops answering, the in-game half releases the fence itself, DLAA latches off with the reason, and the game's picture continues.
+- Tests: `host_dlaa_channel_test` (no graphics, both kinds of build), `host_dlaa_companion_test` / `_warp_test` (copy mode), `host_dlaa_companion_dlss_test` (RTX only). None has run on a real GPU yet.

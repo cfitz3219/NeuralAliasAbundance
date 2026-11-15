@@ -396,6 +396,18 @@ target_link_libraries(NeuralAliasAbundance PRIVATE abundance_core d3d12 dxgi use
 
 # dxgi.dll proxy (deployed under that name by the deploy script; built as
 # NeuralAliasDXGI.dll so it is never auto-loaded by accident). Boots the host.
+# DLAA for 32-bit games (src/dlaa_remote/protocol.hpp): the in-game half talks to a 64-bit
+# companion program that runs the same DLSS backend. The client builds for both kinds, so a
+# 64-bit build can measure the handoff; the companion exists only as a 64-bit program.
+add_library(dlaa_remote_client STATIC src/dlaa_remote/channel.cpp src/dlaa_remote/client.cpp)
+target_include_directories(dlaa_remote_client PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(dlaa_remote_client PUBLIC abundance_options d3d12)
+target_link_libraries(host_dx12 PUBLIC dlaa_remote_client)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  add_executable(NeuralAliasDlaa64 WIN32 src/dlaa_remote/companion_main.cpp src/dlaa_remote/companion.cpp src/dlaa_remote/channel.cpp)
+  target_include_directories(NeuralAliasDlaa64 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(NeuralAliasDlaa64 PRIVATE abundance_options host_dlss d3d12 dxgi shell32)
+endif()
 add_library(NeuralAliasDXGI SHARED src/runtime/dxgi_proxy.cpp src/runtime/dxgi_proxy.def)
 target_link_libraries(NeuralAliasDXGI PRIVATE host_dx12)
 
