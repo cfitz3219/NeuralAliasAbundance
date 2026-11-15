@@ -291,3 +291,26 @@ Full procedure/evidence: docs/MATERIAL-DISTANCE-DETAIL-20261114.md.
 No game deployment or browser UI automation occurred. Tiny detail must still
 filter naturally at distance; not all added medium relief is guaranteed to be
 physically correct for an arbitrary material.
+
+
+## 2026-11-14 Pacific — requested 2x fine-detail size trial
+
+Cort confirms v3 is better, asks to double fine detail size before final selection.
+Coordinated lane in COMMS dc9f4f4. Recipe v4 uses existing cached-inference path at
+half size for fine normal/roughness predictions, resampling residuals back into
+same UVs/output maps. Medium predictions remain byte-identical; gains and total
+bounds unchanged. No texture crop or camera-dependent pattern. This doubles
+model texel footprint, not every individual AI-predicted feature exactly.
+
+43 Python tests pass with actual compression, including doubled feature spacing
+and material-space alignment. Actual-gallery controller and six-material actual
+RTX slider checks pass; previous/new 1x/4x comparisons rendered, wood/cloth
+inspected. Verified identical original identity, PBRify colour bytes, medium
+prediction paths, shader source and output sizes/bytes. No game tests/deployment.
+
+Updated existing Lab with prior v3 backed up as
+Material-Lab-before-fine-size-2x.html and explicit 2x-trial caption. Fine-size PNGs
+show previous/current at identical light and strength. HTML hash
+84f85850b2362158fb668a441c01d637ef5332b4421ce4b56aaf86a667461a49.
+Fable's separate WWII capture handoff noted; signed BC5 and non-sRGB colour
+qualification are not silently widened as part of this visual size trial.

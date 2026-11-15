@@ -48,7 +48,8 @@ def prepare(source, colour_entry, estimates, cache_root, texconv, normal_model, 
     with np.load(medium_estimates,allow_pickle=False) as p:
         medium_normal,medium_roughness=p['normal'],p['roughness']
     result = combine(original,colour,predicted_normal,predicted_roughness,
-                     medium_normal=medium_normal,medium_roughness=medium_roughness)
+                     medium_normal=medium_normal,medium_roughness=medium_roughness,
+                     fine_downsample=SETTINGS['fine_downsample'])
     chain = mip_chain(result)
     cache_root.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.preparing-',dir=cache_root) as tmp:
@@ -86,7 +87,7 @@ def predict(colour_entry, rec, identity, runners, predictions, downsample=1):
     rgb=np.asarray(next(viewer.decoded_mips(colour_entry,descriptor)),dtype=np.uint8)[...,:3]
     if downsample!=1:
         if downsample<1 or downsample & (downsample-1) or min(rgb.shape[:2])<downsample*8:
-            raise ValueError('medium inference requires power-of-two scale and at least 8x8 input')
+            raise ValueError('scaled inference requires power-of-two scale and at least 8x8 input')
         reduced=linear(rgb.astype(np.float64)/255)
         for _ in range(downsample.bit_length()-1):reduced=down2(reduced)
         rgb=np.round(srgb(reduced)*255).clip(0,255).astype(np.uint8)
@@ -119,7 +120,7 @@ def main():
         start=time.perf_counter(); name=json.loads((source/'source.json').read_text())['material_id']
         colour_entry=(args.colour_index.parent/colours[name]).resolve()
         rec=cache.validate(colour_entry)
-        prediction=predict(colour_entry,rec,identity,runners,args.predictions)
+        prediction=predict(colour_entry,rec,identity,runners,args.predictions,SETTINGS['fine_downsample'])
         medium=predict(colour_entry,rec,identity,runners,args.predictions,SETTINGS['medium_downsample'])
         entry,record,hit=prepare(source,colour_entry,prediction,args.cache,args.texconv,args.normal_model,args.rough_model,medium)
         index[name]=str(entry.resolve())

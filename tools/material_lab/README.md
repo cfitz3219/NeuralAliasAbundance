@@ -1,5 +1,14 @@
 # Material Lab
 
+
+## Current: 2x fine-detail size trial (recipe v4)
+
+Cort requested larger fine detail after approving the normal-distance result.
+Fine inference now runs at half size; the existing medium layer and output
+texture budget stay unchanged. Current index/gallery end in `combined-v4.json`
+and `combined-material-gallery-v4`. Previous v3 remains available. See
+`docs/MATERIAL-FINE-SIZE-TRIAL-20261114.md` for the change and evidence.
+
 ## Normal-distance detail update (recipe v3)
 
 The current Lab bakes fine AND medium-size learned detail into the same maps.

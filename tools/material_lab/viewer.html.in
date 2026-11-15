@@ -54,7 +54,7 @@ async function show(index){
     $('model-history').hidden=!row.combined;
     if(row.combined){
         $('right-title').textContent='Combined result';
-        $('right-caption').textContent='The same PBRify colour and original surface, with fine and medium-sized learned detail.';
+        $('right-caption').textContent='Fine-detail size trial: 2× larger. Same PBRify colour, original surface and medium-detail layer.';
         $('footnote').textContent='PBRify colour + trained PBRify normal/roughness models. Original surface maps remain the base. These are synthetic Lab samples; no game installation has changed.';
         $('comparison-note').textContent='Start at 1× to compare the whole material. Medium-sized grain and relief are now included alongside the fine close-up detail. Surface detail changes only the right panel: 0% is exactly PBRify alone. Moving it pauses the light. Original cracks and grooves stay as the base. Detail zoom magnifies the same region in all panels; Distance filters tiny detail naturally instead of forcing it to shimmer.';
     }

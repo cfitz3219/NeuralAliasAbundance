@@ -9,10 +9,10 @@ import numpy as np
 from .detail import Material, check, unit
 
 
-VERSION = '3'
+VERSION = '4'
 SETTINGS = dict(sigma_source_texels=6., normal_detail_gain=3., roughness_detail_gain=2.,
                 max_added_slope=.35, max_roughness_delta=.12, protected_slope_threshold=.04,
-                medium_downsample=4, medium_blur_texels=.75, medium_normal_gain=3.,
+                fine_downsample=2, medium_downsample=4, medium_blur_texels=.75, medium_normal_gain=3.,
                 medium_roughness_gain=2.,
                 method='fine and medium learned residuals; preserve authored slope direction')
 
@@ -72,13 +72,16 @@ def medium_residual(prediction, height, width, sigma):
 
 
 def combine(original, colour, predicted_normal, predicted_roughness, strength=1., mask=None,
-            medium_normal=None, medium_roughness=None):
+            medium_normal=None, medium_roughness=None, fine_downsample=1):
     base = original_at_size(original,colour)
     h,w = base.roughness.shape
     if not np.isfinite(strength) or not 0 <= strength <= 1:
         raise ValueError('surface strength must be in [0,1]')
-    if predicted_normal.shape != (h,w,3) or predicted_roughness.shape != (h,w):
-        raise ValueError('prediction dimensions do not match colour')
+    if fine_downsample not in (1,2) or h%fine_downsample or w%fine_downsample:
+        raise ValueError('fine inference scale must be 1 or 2 and divide the output')
+    fh,fw=h//fine_downsample,w//fine_downsample
+    if predicted_normal.shape != (fh,fw,3) or predicted_roughness.shape != (fh,fw):
+        raise ValueError('prediction dimensions do not match fine inference scale')
     if not np.isfinite(predicted_normal).all() or not np.isfinite(predicted_roughness).all():
         raise ValueError('non-finite material prediction')
     if np.min(predicted_normal[...,2]) <= 0:
@@ -100,7 +103,9 @@ def combine(original, colour, predicted_normal, predicted_roughness, strength=1.
     scale = max(h/original.roughness.shape[0],w/original.roughness.shape[1])
     sigma = SETTINGS['sigma_source_texels']*scale
     pred_slope = slopes(unit(predicted_normal))
-    detail = (pred_slope-lowpass(pred_slope,sigma))*SETTINGS['normal_detail_gain']
+    # Half-size inference doubles the model's texel-scale detail in material
+    # space without zooming/cropping the original map or moving its features.
+    detail = resize_wrap(pred_slope-lowpass(pred_slope,sigma/fine_downsample),h,w)*SETTINGS['normal_detail_gain']
     if medium_normal is not None:
         detail += medium_residual(slopes(unit(medium_normal)),h,w,sigma)*SETTINGS['medium_normal_gain']
     base_slopes = slopes(base.normal)
@@ -112,7 +117,7 @@ def combine(original, colour, predicted_normal, predicted_roughness, strength=1.
     detail *= (mask*strength)[...,None]
     xy = base_slopes+detail
     result_normal = unit(np.concatenate([xy,np.ones((h,w,1))],-1))
-    rough_detail = (predicted_roughness-lowpass(predicted_roughness,sigma))*SETTINGS['roughness_detail_gain']
+    rough_detail = resize_wrap(predicted_roughness-lowpass(predicted_roughness,sigma/fine_downsample),h,w)*SETTINGS['roughness_detail_gain']
     if medium_roughness is not None:
         rough_detail += medium_residual(medium_roughness,h,w,sigma)*SETTINGS['medium_roughness_gain']
     limit = SETTINGS['max_roughness_delta']

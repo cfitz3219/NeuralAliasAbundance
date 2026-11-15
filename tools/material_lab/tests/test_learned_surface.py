@@ -125,5 +125,35 @@ class AuthoredSurface(unittest.TestCase):
             with self.assertRaises(ValueError):
                 combine(self.original,self.colour,self.prediction,self.rough,medium_normal=n,medium_roughness=r)
 
+    def test_half_size_fine_prediction_doubles_grain_spacing_not_strength(self):
+        from tools.material_lab.detail import Material
+        original=Material(self.original.color,np.broadcast_to([0.,0.,1.],(32,32,3)).copy(),np.full((32,32),.6))
+        peaks=[];amplitudes=[]
+        for scale in (1,2):
+            side=128//scale;y,x=np.mgrid[:side,:side]
+            n=unit(np.stack([.025*np.sin(x*2*np.pi/8),np.zeros_like(x),np.ones_like(x)],-1))
+            r=.5+.015*np.sin(x*2*np.pi/8)
+            out=combine(original,self.colour,n,r,fine_downsample=scale)
+            signal=slopes(out.normal)[64,:,0]
+            peaks.append(int(np.argmax(abs(np.fft.rfft(signal))[1:]))+1)
+            amplitudes.append(float(np.max(abs(signal))))
+            self.assertEqual(int(np.argmax(abs(np.fft.rfft(out.roughness[64]-.6))[1:]))+1,peaks[-1])
+            np.testing.assert_array_equal(out.color,self.colour)
+            zero=combine(original,self.colour,n,r,0,fine_downsample=scale)
+            np.testing.assert_array_equal(zero.normal,original_at_size(original,self.colour).normal)
+        self.assertEqual(peaks,[16,8])
+        self.assertGreater(amplitudes[1]/amplitudes[0],.9)
+        self.assertLessEqual(amplitudes[1]/amplitudes[0],1.01)
+
+    def test_half_size_detail_stays_aligned_to_material_uvs(self):
+        n=self.prediction[::2,::2];r=self.rough[::2,::2]
+        original=self.original.copy()
+        for field in ('color','normal','roughness'):
+            setattr(original,field,np.roll(getattr(original,field),3,axis=1))
+        a=combine(self.original,self.colour,n,r,fine_downsample=2)
+        b=combine(original,np.roll(self.colour,12,axis=1),np.roll(n,6,axis=1),np.roll(r,6,axis=1),fine_downsample=2)
+        np.testing.assert_allclose(b.normal,np.roll(a.normal,12,axis=1),atol=1e-12)
+        np.testing.assert_allclose(b.roughness,np.roll(a.roughness,12,axis=1),atol=1e-12)
+
 
 if __name__=='__main__':unittest.main()
