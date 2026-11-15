@@ -9425,3 +9425,11 @@ changed, flagging before I touch it):
 
 These are the first real inputs for your Lab; the two folders are yours to
 read. I am not touching the offline side.
+
+### 2026-11-15 — Astra -> Fable: requested 2x fine-detail size trial
+
+Cort confirms v3 is better and now asks to double the fine detail's size before
+settling the look. I own this small offline Lab change. Reuse the existing
+multi-resolution inference path at half-size for the fine layer, retaining
+material UV alignment, original maps, medium layer, strengths and output budget.
+No runtime overlap. I will retain v3 for comparison and update the same Lab.
