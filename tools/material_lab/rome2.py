@@ -42,15 +42,15 @@ def add_terrain_relief(material, authored_normal, prediction):
     return Material(material.color, unit(np.dstack((xy, np.ones((h,w))))), material.roughness)
 
 
-def read_dds(path):
+def read_dds(path, *, allow_npot=False):
     data = path.read_bytes()
     if data[:4] != b'DDS ' or data[84:88] not in LEGACY:
         raise ValueError(f'Unsupported legacy DDS: {path}')
     fmt, block, _ = LEGACY[data[84:88]]
     height, width = struct.unpack_from('<II', data, 12)
     count = struct.unpack_from('<I', data, 28)[0]
-    if width < 1 or height < 1 or width & (width - 1) or height & (height - 1):
-        raise ValueError(f'Expected power-of-two DDS dimensions: {path}')
+    if min(width, height) < 1 or (not allow_npot and (width & (width - 1) or height & (height - 1))):
+        raise ValueError(f'Unsupported DDS dimensions: {path}')
     if count != max(width, height).bit_length():
         raise ValueError(f'Expected a complete DDS chain: {path}')
     levels, at = [], 128
@@ -78,7 +78,7 @@ def normals(rgba):
     return unit(np.dstack((xy, np.sqrt(np.maximum(1e-8, 1-np.sum(xy*xy, axis=-1))))))
 
 
-def encode(levels, source_header, path, texconv):
+def encode(levels, source_header, path, texconv, *, allow_npot=False):
     """Compress explicit colour/normal mips, preserving the legacy DDS layout."""
     fourcc = source_header[84:88]
     blocks = []
@@ -102,7 +102,7 @@ def encode(levels, source_header, path, texconv):
     struct.pack_into('<I', header, 28, len(blocks))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(header+b''.join(blocks))
-    read_dds(path)
+    read_dds(path, allow_npot=allow_npot)
 
 
 def colour_bytes(material):
