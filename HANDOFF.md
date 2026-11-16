@@ -1113,3 +1113,6 @@ Cort prioritises the campaign map. The verified campaign-only pack contains sixt
 
 ### 2026-11-15 Pacific — Optional Rome II rocky ground prepared ahead of combined test
 Astra 6df3cb8 / PR142 staged an optional 5,593,720-byte native rock normal component. Preserves original colour, DDS layout and mip count. Lab shows actual packed relief versus original and is linked from the Rome II material page. Four paths and hashes verified, RTX mips and browser controls checked, 47 prep tests passed and baseline grass sample reproduced byte for byte. Both campaign texture packs installed and rolled back in a scratch folder alongside Fable's 2f539a9. COMMS has exact add-on manifest and Orbis overlap. Game files untouched. Fable retains combined staging and DLAA. No new game session requested.
+
+### 2026-11-15 Pacific — Rome II combined package handed to Fable
+Cort confirmed DLAA works and authorized the handoff. Latest saved run identifies 2f539a9. Fable received the two rehashed campaign components (grass/ocean and authored rock relief), exact manifest destinations and test instructions in COMMS. Both packs have passed installation and exact rollback together in scratch. Fable owns the user-facing install/uninstall/results CMDs. The rock PBRify colour comparison remains a Lab preview.
