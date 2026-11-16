@@ -74,6 +74,15 @@ int wmain(int argc,wchar_t** argv){
     na::host::ActivateSavedRequests(ini.c_str());
     CHECK(na::observe::SamplerMipBias()==(recovery?0.f:-1.f));
     CHECK(na::settings::Get().j2_mip_bias_x100==(recovery?0:-100));
+    // The menu's Texture mip bias choice is what start-up applies (Cort 2026-11-16: the changer is
+    // back, with stronger steps). Recovery still leaves the game's own sampling.
+    na::settings::Get().j2_texture_detail_x100=-200;na::settings::Get().j2_mip_bias_x100=0;
+    na::host::ActivateSavedRequests(ini.c_str());
+    CHECK(na::observe::SamplerMipBias()==(recovery?0.f:-2.f));
+    CHECK(na::settings::Get().j2_mip_bias_x100==(recovery?0:-200));
+    CHECK(na::j2::SmallMipBias(na::settings::DlaaMipBias(na::settings::Get()),1.f)==-2.f);
+    CHECK(na::j2::SmallMipBias(na::settings::DlaaMipBias(na::settings::Get()),.5f)==-2.25f);
+    na::settings::Get().j2_texture_detail_x100=na::settings::kTextureDetailAuto;
     na::j2::SetEnabled(false);na::observe::SetSamplerMipBias(0.f);
     CHECK(na::mode::GetStatus().request_id==0);
     std::thread worker([]{na::host::RunSessionWorker([]{++activations;});});

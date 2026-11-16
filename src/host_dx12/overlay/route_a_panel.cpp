@@ -945,7 +945,7 @@ void DrawLiveDlaa()
         const auto mip = na::observe::GetMipLiveStats();
         if (mip.enabled && !na::j2::RenderSmall() &&
             (!na::settings::AddedUpscalingAllowed() || na::settings::Get().j2_scale_mode.load() == 0))
-            na::observe::SetSamplerMipBiasLive(on ? -1.0f : 0.0f);
+            na::observe::SetSamplerMipBiasLive(on ? na::settings::DlaaMipBias(na::settings::Get()) : 0.0f);
     }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
@@ -1208,12 +1208,45 @@ void DrawLiveDlaaEnhancements()
     }
     {
         const auto ml = na::observe::GetMipLiveStats();
-        BeginRow("Texture mip bias", "The total we target on eligible material samplers. DLAA targets -1.00. A sampler already at the target keeps its value.", S(120));
-        PushTitle();
-        if (ml.want_bias == 0.0f) ImGui::TextColored(kText, "Game's own");
-        else ImGui::TextColored(kText, "Target %.2f", ml.want_bias);
-        PopFont();
+        na::settings::Settings& ss = na::settings::Get();
+        // Cort 2026-11-16: the changer is back, with stronger steps than the automatic -1.00. At full
+        // resolution the menu chooses the total; added upscaling modes keep their own automatic
+        // totals, so there the row only shows the value in use.
+        const bool chooses = !na::j2::RenderSmall() && (!na::settings::AddedUpscalingAllowed() || ss.j2_scale_mode.load() == 0);
+        BeginRow("Texture mip bias", "How much sharper the game's surface textures are sampled, as a total that includes the game's own bias. DLAA rebuilds the extra detail over several frames. Automatic is -1.00, the standard at full resolution. Stronger steps show more texture detail; very fine patterns can start to shimmer. A sampler already at the target keeps its value. Live, and remembered for this game.", S(220));
+        if (chooses) {
+            static const char* kDetail[] = {"Off (game's own)", "-0.50", "Automatic (-1.00)", "-1.58", "-2.00", "-2.25 (strongest)"};
+            static const int32_t kDetailX100[] = {0, -50, na::settings::kTextureDetailAuto, -158, -200, -225};
+            const int32_t cur = ss.j2_texture_detail_x100.load();
+            int idx = 2;
+            if (cur <= 0) { // a hand-written value in between shows as the nearest step
+                int best = 1 << 30;
+                for (int i = 0; i < 6; ++i) {
+                    if (i == 2) continue;
+                    const int d = kDetailX100[i] > cur ? kDetailX100[i] - cur : cur - kDetailX100[i];
+                    if (d < best) { best = d; idx = i; }
+                }
+            }
+            ImGui::SetNextItemWidth(S(220));
+            if (ImGui::Combo("##j2detail", &idx, kDetail, 6)) {
+                ss.j2_texture_detail_x100.store(kDetailX100[idx]);
+                ss.j2_mip_bias_x100.store(na::settings::DlaaMipBiasX100(ss));
+                na::settings::Save();
+                // With DLAA switched off the game's own sampling stays; the choice applies when it is switched on.
+                if (!na::j2::Paused()) na::observe::SetSamplerMipBiasLive(na::settings::DlaaMipBias(ss));
+            }
+        } else {
+            PushTitle();
+            if (ml.want_bias == 0.0f) ImGui::TextColored(kText, "Game's own");
+            else ImGui::TextColored(kText, "Target %.2f", ml.want_bias);
+            PopFont();
+        }
         EndRow();
+        if (chooses && ml.want_bias != ml.live_bias) {
+            char text[128];
+            std::snprintf(text, sizeof text, "Applying %.2f; the current total is %.2f until preparation finishes.", ml.want_bias, ml.live_bias);
+            Hint(text);
+        }
         if (native) {
             const auto applied = na::native11::GetSamplerStats();
             char detail[180]{};

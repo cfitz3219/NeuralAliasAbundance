@@ -53,6 +53,8 @@ inline const char* NameForMode(DlssMode m)
     }
 }
 
+// "Texture mip bias" left on automatic (any value above 0 reads as automatic).
+constexpr int32_t kTextureDetailAuto = 1;
 struct Settings {
     std::atomic<uint32_t> enabled{1};   // master switch (NeuralAlias controls DLSS)
     std::atomic<uint32_t> dlss_mode{0}; // DlssMode
@@ -83,7 +85,13 @@ struct Settings {
     std::atomic<uint32_t> j2_flow_loosen{50}; // J2 moving-object flow: 0 = the original acceptance rules, 100 = loosest (Cort 2026-11-03)
     std::atomic<uint32_t> j2_jitter_r2{0}; // jitter sequence: 0 Halton 2,3 (default), 1 R2; [j2] jitter_sequence; live
     std::atomic<uint32_t> aniso16{0}; // anisotropic filtering level on the game's surface textures: 0 off, 4, 8, 16; [j2] anisotropic; read at game start
-    std::atomic<int32_t> j2_mip_bias_x100{-100}; // J2 texture detail: [j2] mip_bias x 100 (0, -50, -100); read at game start
+    // J2 texture detail in effect at full resolution, x 100: a mirror of the choice below, written at
+    // game start and when the menu changes it. The old [j2] mip_bias key no longer chooses anything.
+    std::atomic<int32_t> j2_mip_bias_x100{-100};
+    // The menu's "Texture mip bias" choice ([j2] texture_detail): kTextureDetailAuto = the automatic
+    // total (-1.00 at full resolution), otherwise the chosen total x 100 (0 = the game's own, -50,
+    // -158, -200, -225). Live; remembered per game (Cort 2026-11-16: bring the changer back, stronger).
+    std::atomic<int32_t> j2_texture_detail_x100{kTextureDetailAuto};
     std::atomic<bool> j2_inline{false}; // legacy [j2] inline=1: same as route=inline (diagnostic override)
     std::atomic<uint32_t> j2_route{0};  // [j2] route: 0 auto (default), 1 between, 2 inline (diagnostic overrides)
     // J2 evidence capture ([j2] per game): frames per capture, hotkey (virtual-key code),
@@ -145,6 +153,14 @@ struct Settings {
 };
 
 Settings& Get();
+// The total mip bias full-resolution DLAA aims for on the game's material samplers: the menu's
+// choice, or -1.00 when it is left on automatic.
+inline int32_t DlaaMipBiasX100(const Settings& s)
+{
+    const int32_t c = s.j2_texture_detail_x100.load(std::memory_order_relaxed);
+    return c > 0 ? -100 : (c < -225 ? -225 : c);
+}
+inline float DlaaMipBias(const Settings& s) { return static_cast<float>(DlaaMipBiasX100(s)) / 100.0f; }
 
 // Consolidation build policy. Keep saved modes and experimental code available
 // for future builds, but gate production activation before installing hooks.

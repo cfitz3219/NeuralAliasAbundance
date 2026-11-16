@@ -98,8 +98,10 @@ void ActivateSavedRequests(const wchar_t* ini){
     j2::SetPaused(safe);
     if(safe)j2::flow::SetEnabled(false);
     if(j2::Configured()){
-        const float user=-1.f;
-        if(!safe)st.j2_mip_bias_x100.store(-100);
+        // The menu's Texture mip bias choice (automatic = total -1). The old [j2] mip_bias key
+        // chooses nothing: a legacy saved Off must not switch texture detail off.
+        const float user=settings::DlaaMipBias(st);
+        if(!safe)st.j2_mip_bias_x100.store(settings::DlaaMipBiasX100(st));
         float bias=safe?0.f:user;
         if(!safe&&j2::RenderSmall()){
             // Render-small: apply the mode's existing total live, including the
