@@ -320,6 +320,21 @@ struct Stats {
     // SE5 flashing: frames whose camera could not be read ran DLAA on a camera predicted
     // from the last two (extrapolated) or the last one (held), instead of showing the raw frame.
     uint64_t camera_held = 0, camera_extrapolated = 0;
+    // Camera-free DLAA (VARIANTS camera/optional, motion/measured-total, depth/direction-from-depth-writes).
+    // Delivered frames by whose motion they got; the measured supplier's own resets (no pair yet, by
+    // compute_flow's Ticket::no_pair code, and a scene cut seen in the pictures); frames left alone
+    // because nothing could be measured; cameras that came back after measured frames.
+    uint64_t supplied_camera = 0, supplied_measured = 0;
+    uint64_t measured_no_pair = 0, measured_cut_resets = 0, measured_unavailable = 0, cut_after_measured = 0;
+    uint32_t measured_last_no_pair = 0;
+    // Which end of the depth is near, with no camera to say: the last decision (0 not proven,
+    // 1 smaller is nearer, 2 larger is nearer; native11/depth_direction.hpp DepthVerdict for why),
+    // the evidence it saw, frames that waited for a proof, and proofs that disagreed with a camera.
+    bool depth_evidence = false;
+    uint32_t depth_near = 0, depth_verdict = 0;
+    uint32_t depth_writes_less = 0, depth_writes_greater = 0, depth_writes_equal = 0, depth_clears = 0;
+    float depth_clear = 0;
+    uint64_t depth_unproven = 0, depth_camera_disagrees = 0, depth_flips = 0;
     // Cuts at record time by cause (restart = tracker reset by resume/gap; gap = tracker frame gap;
     // motion = translation/rotation/fov jump), and the last few as "tick100ms:why=value[/held][/j1]".
     uint64_t cut_restarts = 0, cut_gap = 0, cut_motion = 0;

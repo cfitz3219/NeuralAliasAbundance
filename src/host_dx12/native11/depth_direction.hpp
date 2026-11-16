@@ -21,7 +21,9 @@
 // is assumed: the caller reports why and does not guess. The depth values themselves are never
 // touched (raw z/w goes on as the game wrote it).
 //
-// Portable C++17 (Linux-tested, tests/cpu/depth_direction_test.cpp); the DX11 provider fills it.
+// Portable C++17 (Linux-tested, tests/cpu/depth_direction_test.cpp). One rule for both hosts: the
+// DX11 provider fills it from its draw events, the DX12 host (j2/live_dlaa.cpp) from the sums the
+// observe layer counts while asked (observe/producers.hpp DepthWriteEvidence).
 #pragma once
 
 #include <cstdint>
@@ -116,6 +118,16 @@ public:
         if (frame_.clears && frame_.clear != value) frame_.clear_mixed = true;
         frame_.clear = value;
         ++frame_.clears;
+    }
+    // The same evidence, already summed by its gatherer (the DX12 host: observe's DepthWriteEvidence
+    // counts the draws as they are recorded; the DX11 provider notes them one by one above).
+    void NoteSummed(const DepthEvidence& e)
+    {
+        frame_.less += e.less; frame_.greater += e.greater; frame_.equal += e.equal; frame_.other += e.other;
+        if (!e.clears) return;
+        if (e.clear_mixed || (frame_.clears && frame_.clear != e.clear)) frame_.clear_mixed = true;
+        frame_.clear = e.clear;
+        frame_.clears += e.clears;
     }
     // Once per frame, when the scene is handed over. `depth` names the selected depth buffer (its
     // lifetime id): another buffer starts from nothing. Returns the direction to use, None while

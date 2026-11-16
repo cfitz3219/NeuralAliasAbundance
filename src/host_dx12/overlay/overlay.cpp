@@ -72,6 +72,7 @@
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -1319,6 +1320,26 @@ void write_status_line()
                 static_cast<unsigned long long>(j2.camera_extrapolated), static_cast<unsigned long long>(j2.depth_state_assumed),
                 static_cast<unsigned long long>(j2.camera_from_j1));
             if (mn > 0) WriteFile(f, ml, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml) - 1))), &written, nullptr);
+            {
+                // Camera-free DLAA on this route: whose motion the delivered frames got, the measured
+                // supplier's own resets, and how the depth direction was decided without a camera.
+                static const char* const kDepthEnd[] = {"not_proven", "smaller_is_nearer", "larger_is_nearer"};
+                char fl[640];
+                const int fn = snprintf(fl, sizeof(fl),
+                    "j2_camera_free camera_setting=%d motion_supplier{camera=%llu measured=%llu} measured{reset_first_picture=%llu last_no_pair=%u reset_scene_cut=%llu unavailable=%llu camera_back=%llu} "
+                    "depth_direction{counting=%u decided=%s why=%s writes_less=%u writes_greater=%u equal=%u clears=%u clear=%.3f unproven_frames=%llu flips=%llu camera_disagrees=%llu}\r\n",
+                    na::settings::Get().j2_camera.load(std::memory_order_relaxed),
+                    static_cast<unsigned long long>(j2.supplied_camera), static_cast<unsigned long long>(j2.supplied_measured),
+                    static_cast<unsigned long long>(j2.measured_no_pair), j2.measured_last_no_pair,
+                    static_cast<unsigned long long>(j2.measured_cut_resets), static_cast<unsigned long long>(j2.measured_unavailable),
+                    static_cast<unsigned long long>(j2.cut_after_measured),
+                    j2.depth_evidence ? 1u : 0u, kDepthEnd[j2.depth_near < 3 ? j2.depth_near : 0],
+                    na::native11::DepthVerdictName(static_cast<na::native11::DepthVerdict>(j2.depth_verdict)),
+                    j2.depth_writes_less, j2.depth_writes_greater, j2.depth_writes_equal, j2.depth_clears, static_cast<double>(j2.depth_clear),
+                    static_cast<unsigned long long>(j2.depth_unproven), static_cast<unsigned long long>(j2.depth_flips),
+                    static_cast<unsigned long long>(j2.depth_camera_disagrees));
+                if (fn > 0) WriteFile(f, fl, static_cast<DWORD>((std::min)(fn, static_cast<int>(sizeof(fl) - 1))), &written, nullptr);
+            }
             char sources[640];
             const int sn=snprintf(sources,sizeof sources,
                 "j2_input_sources evaluated{depth_local=%llu depth_inherited=%llu depth_supplied=%llu depth_submitted=%llu camera_fresh=%llu camera_j1=%llu camera_still=%llu camera_moving=%llu camera_predicted=%llu camera_saved=%llu} last{depth=%u camera=%u age=%llu max_age=%llu}\r\n",

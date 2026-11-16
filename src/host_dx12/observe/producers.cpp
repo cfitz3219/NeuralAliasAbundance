@@ -66,6 +66,40 @@ struct DescHeap;
 // Recordings with a pinned viewport sample may still need it after the global
 // request goes away. Only an entirely idle jitter path can skip the list locks.
 std::atomic<uint64_t> g_vpj_recordings{0};
+// Depth direction evidence (SetDepthWriteEvidence): recording-time sums for the live scene depth
+// since the last Take. Approximate under races by design: it is a vote, not a ledger.
+std::atomic<bool> g_de_on{false};
+std::atomic<uint64_t> g_de_depth{0};
+std::atomic<uint32_t> g_de_less{0}, g_de_greater{0}, g_de_equal{0}, g_de_other{0}, g_de_clears{0}, g_de_clear_bits{0};
+std::atomic<bool> g_de_clear_mixed{false};
+void de_select(uint64_t depth)
+{
+    if (g_de_depth.load(std::memory_order_relaxed) == depth) return;
+    g_de_depth.store(depth, std::memory_order_relaxed);
+    g_de_less.store(0, std::memory_order_relaxed); g_de_greater.store(0, std::memory_order_relaxed);
+    g_de_equal.store(0, std::memory_order_relaxed); g_de_other.store(0, std::memory_order_relaxed);
+    g_de_clears.store(0, std::memory_order_relaxed); g_de_clear_mixed.store(false, std::memory_order_relaxed);
+}
+void de_write(uint64_t depth, uint32_t func)
+{
+    de_select(depth);
+    auto& n = func == D3D12_COMPARISON_FUNC_LESS || func == D3D12_COMPARISON_FUNC_LESS_EQUAL ? g_de_less
+            : func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL ? g_de_greater
+            : func == D3D12_COMPARISON_FUNC_EQUAL ? g_de_equal : g_de_other;
+    n.fetch_add(1, std::memory_order_relaxed);
+}
+void de_clear(uint64_t resource, float value)
+{
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!resource || resource != sel_depth) return;
+    de_select(sel_depth);
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof bits);
+    const uint32_t before = g_de_clear_bits.exchange(bits, std::memory_order_relaxed);
+    if (g_de_clears.fetch_add(1, std::memory_order_relaxed) && before != bits) g_de_clear_mixed.store(true, std::memory_order_relaxed);
+}
+float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
 struct ListState {
     uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
     std::atomic<uint64_t> generation{0};
@@ -4551,6 +4585,7 @@ struct On<sl::list::ClearDepthStencilView> {
         if (!begin_op(l, &r)) return;
         const na_view_ref v = cpu_ref(h);
         emit_op(r, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(f), float_bits(depth, 0.f), stencil}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
+        if ((f & D3D12_CLEAR_FLAG_DEPTH) && g_de_on.load(std::memory_order_relaxed)) de_clear(v.resource, depth);
         note_uses(l, {v.resource});
         if ((f & D3D12_CLEAR_FLAG_DEPTH) && v.resource && v.first_subresource != NA_UNKNOWN_U32)
             with_list_state(l, [&](ListState& ls) {
@@ -4675,6 +4710,7 @@ struct On<sl::list::BeginRenderPass> {
                 const auto& v = ds->DepthBeginningAccess.Clear.ClearValue.DepthStencil;
                 emit_op(rc, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(D3D12_CLEAR_FLAG_DEPTH), float_bits(v.Depth, 0.f), v.Stencil}, &refs[m - 1],
                         sizeof(refs[m - 1]), sizeof(refs[m - 1]), 0, NA_GROUP_RESOURCE_USE);
+                if (g_de_on.load(std::memory_order_relaxed)) de_clear(refs[m - 1].resource, v.Depth);
             }
         }
         with_list_state(l, [&](ListState& ls) {
@@ -5199,7 +5235,6 @@ std::atomic<uint64_t> g_vpj{0};
 std::atomic<bool> g_vpj_ever{false};
 std::atomic<uint64_t> g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_draws{0}, g_vpj_unknown{0};
 thread_local bool t_vpj_self = false; // our own RSSetViewports: not a change of the game's
-float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
 // The game (or host work restoring the game's state) set viewports, or the list restarted:
 // our offset copies are no longer bound.
 void vpj_viewports_replaced(GL* l, bool reset)
@@ -5218,9 +5253,13 @@ void vpj_viewports_replaced(GL* l, bool reset)
 }
 void vpj_before_draw(GL* l)
 {
-    if (!g_vpj_ever.load(std::memory_order_relaxed)) return;
-    const uint64_t cur = g_vpj.load(std::memory_order_acquire);
-    if (!cur && !g_vpj_recordings.load(std::memory_order_acquire)) return;
+    // Two readers of the same per-draw facts: viewport jitter, and (only while asked for) the depth
+    // direction evidence. With the evidence off this is the viewport jitter's own early return.
+    const bool evidence = g_de_on.load(std::memory_order_relaxed);
+    const bool vpj = g_vpj_ever.load(std::memory_order_relaxed);
+    const uint64_t cur = vpj ? g_vpj.load(std::memory_order_acquire) : 0;
+    const bool moving = vpj && (cur || g_vpj_recordings.load(std::memory_order_acquire));
+    if (!moving && !evidence) return;
     D3D12_VIEWPORT v[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     UINT n = 0;
     {
@@ -5233,12 +5272,12 @@ void vpj_before_draw(GL* l)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         // A Present on another thread must not change half a scene recording's
         // sample. The first eligible draw owns it until this list is Reset.
+        const na_ev_pipeline_created* pc = sel_depth && ls->cur_ds == sel_depth ? pso_created_locked(*ls) : nullptr;
+        if (evidence && pc && pc->depth_enable == 1 && pc->depth_write == 1) de_write(sel_depth, pc->depth_func);
+        if (!moving) return; // counted only: no viewport of the game's is touched
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
         bool want = sample && sel_depth && ls->cur_ds == sel_depth;
-        if (want) {
-            const na_ev_pipeline_created* pc = pso_created_locked(*ls);
-            want = pc && pc->depth_enable == 1;
-        }
+        if (want) want = pc && pc->depth_enable == 1;
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
             if (!ls->vpj_scene) g_vpj_recordings.fetch_add(1, std::memory_order_release);
@@ -9076,6 +9115,26 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y)
     if (!f32) f32 = 1;
     g_vpj_ever.store(true, std::memory_order_relaxed);
     g_vpj.store(uint64_t(f32) << 32 | uint64_t(q(x)) << 16 | q(y), std::memory_order_release);
+}
+void SetDepthWriteEvidence(bool on) { g_de_on.store(on, std::memory_order_relaxed); }
+DepthWriteEvidence TakeDepthWriteEvidence(uint64_t depth)
+{
+    DepthWriteEvidence e;
+    e.depth = g_de_depth.load(std::memory_order_relaxed);
+    e.less = g_de_less.exchange(0, std::memory_order_relaxed);
+    e.greater = g_de_greater.exchange(0, std::memory_order_relaxed);
+    e.equal = g_de_equal.exchange(0, std::memory_order_relaxed);
+    e.other = g_de_other.exchange(0, std::memory_order_relaxed);
+    e.clears = g_de_clears.exchange(0, std::memory_order_relaxed);
+    const uint32_t bits = g_de_clear_bits.load(std::memory_order_relaxed);
+    std::memcpy(&e.clear, &bits, sizeof bits);
+    e.clear_mixed = g_de_clear_mixed.exchange(false, std::memory_order_relaxed);
+    if (e.depth != depth) { // counted for another depth: no evidence about this one
+        const uint64_t counted_for = e.depth;
+        e = DepthWriteEvidence{};
+        e.depth = counted_for;
+    }
+    return e;
 }
 void SetReplayProbe(bool on) { g_rp_on.store(on, std::memory_order_relaxed); }
 bool ReplayProbeFrame(ReplayProbeStats* out)

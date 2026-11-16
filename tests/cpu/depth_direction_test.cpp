@@ -140,6 +140,36 @@ int main()
             CHECK(Play(d, menu, 8, &why) == DepthCompare::None && why == DepthVerdict::NoWrites);
             CHECK(Play(d, Reversed(), 8, &why) == DepthCompare::NearIsGreater && why == DepthVerdict::Proven);
         }},
+        {"evidence summed by its gatherer decides as the same evidence noted draw by draw", [] {
+            // The DX12 host hands over sums (observe counts the draws as they are recorded).
+            DepthDirection one, sum;
+            DepthVerdict a{}, b{};
+            DepthEvidence e;
+            e.less = 390; e.greater = 10; e.equal = 25; e.other = 3; e.clears = 2; e.clear = 1.f;
+            FrameSpec f;
+            f.clear = true; f.clear_value = 1; f.less_equal = 390; f.greater = 10; f.equal = 25; f.always = 3;
+            one.NoteClear(1.f); // the second clear of the two
+            sum.NoteSummed(e);
+            CHECK(Play(one, f, 1, &a) == sum.Decide(1, &b) && a == b && a == DepthVerdict::Proven);
+            CHECK(sum.Last().less == 390 && sum.Last().greater == 10 && sum.Last().equal == 25 && sum.Last().other == 3 && sum.Last().clears == 2);
+            sum.EndFrame();
+            // Clears to different values across two sums are no evidence; the writes still are.
+            DepthDirection mixed;
+            DepthEvidence first, second;
+            first.clears = 1; first.clear = 0.f;
+            second.clears = 1; second.clear = 1.f; second.less = 50;
+            mixed.NoteSummed(first);
+            mixed.NoteSummed(second);
+            CHECK(mixed.Decide(1, &a) == DepthCompare::NearIsLess && a == DepthVerdict::Proven && mixed.Last().clear_mixed);
+            // A sum without a clear leaves an earlier clear standing: here it contradicts the writes.
+            DepthDirection kept;
+            DepthEvidence clear_zero, writes;
+            clear_zero.clears = 1; clear_zero.clear = 0.f;
+            writes.less = 50;
+            kept.NoteSummed(clear_zero);
+            kept.NoteSummed(writes);
+            CHECK(kept.Decide(1, &a) == DepthCompare::None && a == DepthVerdict::ClearDisagrees);
+        }},
         {"comparisons are read as D3D11 numbers them", [] {
             CHECK(CompareOf(2) == DepthCompare::NearIsLess && CompareOf(4) == DepthCompare::NearIsLess);
             CHECK(CompareOf(5) == DepthCompare::NearIsGreater && CompareOf(7) == DepthCompare::NearIsGreater);
