@@ -58,3 +58,13 @@ The shell did not have CMake on PATH; the actual calls used its absolute Visual 
 ## Next ownership handoff
 
 Fable owns production APIs and the runtime. Astra owns these three regression files and this audit document. Requested next artifact: total-motion API/first runtime commit. Then wire the same independent expectations into the actual new provider, test seed-only startup and source transitions, and run one focused final audit. No additional broad review gate or new user capture is requested. Game testing remains with Cort.
+
+## Proposed runtime seam response (COMMS cc0c6c3)
+
+Fable posted the first proposed API after this test increment: a total-mode flag, total RG32F/valid R32F outputs, separate raster facts, comparison/clear-based depth convention, reset delivery for no-pair frames, and a real camera-off switch. Approved that direction with the concrete corrections in COMMS. The response is implementation guidance, not a finding against code that has not yet been written.
+
+The important unresolved boundaries are: (1) integer zero is not verified still, so bounded subpixel refinement must consider zero candidates before admission; (2) whole-field invalid motion does not reset NGX history, since the submitted xy field omits our provenance; (3) submitted first-image acquisition must advance independently of successful DLAA delivery; and (4) estimated total flow must not be reported as ENGINE ground truth. Preserve the residual path's existing semantics. Native DX11 first and DX12 second remain the agreed delivery order.
+
+NVIDIA's [DLSS Programming Guide](https://raw.githubusercontent.com/NVIDIA/DLSS/main/doc/DLSS_Programming_Guide_Release.pdf), 31 March 2026, sections 3.13 and 3.15, prescribes InReset for major transitions and warns that BiasCurrentColorMask is unavailable for the latest models (legacy Preset F only). Therefore the existence of a mask parameter in the SDK does not make it a current-model solution for invalid/cut regions. The COMMS response proposes a GPU current-image transition with an asynchronously acknowledged reset epoch if the cut cannot be known at CPU evaluation time; that remains a suggested implementation requiring its own transition test, not verified runtime behavior. No synchronous diagnostic readback or repeated history reset in ordinary play is acceptable.
+
+The 11-coefficient image/depth projective fit is deferred; it is not the current six-parameter camera correction and is not needed to expose and refine existing total flow. Fable retains production ownership. PR144 carries these independent tests; PR143 remains the earlier architecture audit.
