@@ -57,3 +57,49 @@ in Fable's combined manifest. The first shared test should cover a coastal
 Grand Campaign view and a Mediterranean summer land battle during one game
 launch. Start with sharpness disabled and test DLAA live once the companion is
 available. The current hooks-only package does not provide DLAA.
+
+## Campaign map pack for the combined DLAA test
+
+Cort made the campaign map the priority. Use
+`neuralalias_rome2_campaign_pilot.pack` for this test. The Mod pack contains
+eight summer campaign ground materials from `terrain2.pack`, with four
+diffuse and alpha/green normal pairs per family. The two sea maps above
+carry forward byte for byte.
+
+```text
+terrain/textures/campaign/default/grass_a/{0..3}_su_{diffuse,normal}.dds
+terrain/textures/campaign/default/grass_b/{0..3}_su_{diffuse,normal}.dds
+terrain/campaigns/main_rome_map/lf_sea_colour.dds
+terrain/campaigns/main_emperor/lf_sea_colour.dds
+```
+
+Select the grass pairs with `broad_relief` and `native_extent` both true
+when running `tools.material_lab.rome2`. The export keeps their original
+1024×1024 layouts, legacy DXT encodings, headers, and eleven mip levels.
+The grass uses the same PBRify models and relief settings Cort approved.
+It changes the ground surface. Grass blade geometry, other land materials
+and winter tiles keep their existing game assets.
+
+Re-extraction verified all 18 packed asset paths and hashes. The Lab
+shows the actual compressed grass A and B variant 0 from this pack, and
+links to the campaign ocean. At 1× and Lab Distance 3 on the RTX 5070 Ti,
+the added relief changed the eight samples by a mean of 1.85–3.88/255
+across four fixed light angles. The zero-relief comparison matches the
+same colour with original surface relief. The Lab setting is a coarse
+mip comparison. In-game visibility is still to be established.
+
+Pack size is 24,586,327 bytes. SHA-256:
+
+```text
+E2A6F35CAF526ABF0DC29C27A95F30A5C1C87DB24FB0EF5EC3689AE0A655AC52
+```
+
+Staging is at
+`C:\Users\Cort\NA-material-preparation\local\rome2-materials\landscape\campaign-component`.
+Use both entries from `package-components.json`. Test install and rollback
+with the 2f539a9 runtime in a scratch folder preserved the original
+executable and an unrelated pack byte for byte. Fable owns staging the
+user-facing combined CMD. Enable the mod pack in the Rome II launcher, then
+view a coastline with inland grass in Grand Campaign or Imperator Augustus.
+A clean launcher preset avoids the grass and sea overlaps from Orbis
+Terrarum II and the sea overlap from Orbis Aquarum while retaining both mods.

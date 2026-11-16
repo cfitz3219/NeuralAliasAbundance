@@ -105,6 +105,17 @@ def encode(levels, source_header, path, texconv, *, allow_npot=False):
     read_dds(path, allow_npot=allow_npot)
 
 
+def keep_native_mips(prepared, original, output):
+    """Deliver the baked levels that fit the authored terrain texture layout."""
+    _, prepared_format, prepared_mips = read_dds(prepared)
+    source, source_format, source_mips = read_dds(original)
+    if prepared_format != source_format or [mip[:2] for mip in prepared_mips[1:]] != [mip[:2] for mip in source_mips]:
+        raise ValueError('Prepared DDS is not a 2x bake of the authored layout')
+    payload = b''.join(blocks for _, _, blocks in prepared_mips[1:])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(source[:128]+payload+source[128+len(payload):])
+
+
 def colour_bytes(material):
     return np.rint(srgb(material.color[..., :3])*255).clip(0,255).astype(np.uint8)
 
@@ -162,6 +173,9 @@ def prepare(row, input_root, output, texconv, colour_model, normal_model):
     targets = [output/'overrides'/p for p in paths]
     encode([colour_bytes(m) for m in chain], c, targets[0], texconv)
     encode([normal_bytes(m) for m in chain], n, targets[1], texconv)
+    if row.get('native_extent'):
+        for target, source in zip(targets, sources, strict=True):
+            keep_native_mips(target, source, target)
     gloss = [png_url(np.full((1,1,3), 166, dtype=np.uint8))]
     before = preview(*sources, 'Original archive textures', gloss)
     after = preview(*targets, 'Prepared archive textures', gloss)
