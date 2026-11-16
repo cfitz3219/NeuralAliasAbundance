@@ -150,3 +150,23 @@ different files. Orbis Aquarum and the four other indexed Workshop packs
 have zero overlaps with the rock component. Use the same temporary clean
 preset planned for grass and ocean when comparing rock. The test view can be
 an exposed ridge beside the coast during the same campaign launch.
+
+### PBRify comparison at campaign distance
+
+The current Campaign Rock Lab shows original, PBRify colour with the
+original relief, and that same colour with the staged rock relief. For
+this preview, PBRify RPLKSRd V3 ran offline on the game's 256×256 colour
+mip and produced a 1024×1024 BC1 texture with the full mip chain. The
+original panel uses the game's original native colour chain. Set Compare
+to Relief only to see the exact authored-colour combination from the
+staged pack. The PBRify colour files are a preview experiment.
+
+At the default 1×/Distance 3 fixed-light browser view, the mean displayed
+channel difference from PBRify alone was 1.45–1.97/255 across the three
+examples. Adding the rock relief to the same colour changed the shown
+pixels by a mean of 5.04–5.89/255. In this comparison the relief contributes
+the larger visible difference. These numbers measure change in the Lab,
+and the game camera, lighting, and materials can produce a different result.
+Offline source hashes and mips, controller verification, and the browser
+pixel comparison are saved in the campaign-rock/pbrify-map-comparison
+staging directory.
