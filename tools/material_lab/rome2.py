@@ -26,8 +26,8 @@ LEGACY = {b'DXT1': (71, 8, 'BC1_UNORM'), b'DXT5': (77, 16, 'BC3_UNORM')}
 TERRAIN_RELIEF = dict(near_sigma=5., far_sigma=32., gain=14., max_slope=.55)
 
 
-def add_terrain_relief(material, authored_normal, prediction):
-    """Keep bigger learned shapes in terrain space so mips retain the relief."""
+def terrain_relief_slopes(authored_normal, prediction):
+    """Extract and bound broader relief in the original texture coordinates."""
     if authored_normal.shape != prediction.shape:
         raise ValueError('Terrain prediction must match the authored texture size')
     opts = TERRAIN_RELIEF
@@ -36,7 +36,11 @@ def add_terrain_relief(material, authored_normal, prediction):
     authored = lowpass(slopes(authored_normal), opts['near_sigma'])
     broad = preserve_authored_direction(broad, authored) * opts['gain']
     magnitude = np.linalg.norm(broad, axis=-1, keepdims=True)
-    broad *= np.minimum(1., opts['max_slope']/np.maximum(magnitude, 1e-12))
+    return broad * np.minimum(1., opts['max_slope']/np.maximum(magnitude, 1e-12))
+
+
+def add_terrain_relief(material, authored_normal, prediction):
+    broad = terrain_relief_slopes(authored_normal, prediction)
     h, w = material.normal.shape[:2]
     xy = slopes(material.normal) + resize_wrap(broad, h, w)
     return Material(material.color, unit(np.dstack((xy, np.ones((h,w))))), material.roughness)
@@ -120,8 +124,8 @@ def colour_bytes(material):
     return np.rint(srgb(material.color[..., :3])*255).clip(0,255).astype(np.uint8)
 
 
-def normal_bytes(material):
-    xy = np.rint((material.normal[..., :2]*.5+.5)*255).clip(0,255).astype(np.uint8)
+def normal_bytes(normal):
+    xy = np.rint((normal[..., :2]*.5+.5)*255).clip(0,255).astype(np.uint8)
     r = np.full(xy.shape[:2], 255, np.uint8)
     return np.stack((r, xy[..., 1], np.zeros_like(r), xy[..., 0]), axis=-1)
 
@@ -172,7 +176,7 @@ def prepare(row, input_root, output, texconv, colour_model, normal_model):
         chain = mip_chain(add_terrain_relief(chain[0], normal, medium))
     targets = [output/'overrides'/p for p in paths]
     encode([colour_bytes(m) for m in chain], c, targets[0], texconv)
-    encode([normal_bytes(m) for m in chain], n, targets[1], texconv)
+    encode([normal_bytes(m.normal) for m in chain], n, targets[1], texconv)
     if row.get('native_extent'):
         for target, source in zip(targets, sources, strict=True):
             keep_native_mips(target, source, target)

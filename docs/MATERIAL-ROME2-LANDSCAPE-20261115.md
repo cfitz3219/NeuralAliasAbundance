@@ -103,3 +103,50 @@ user-facing combined CMD. Enable the mod pack in the Rome II launcher, then
 view a coastline with inland grass in Grand Campaign or Imperator Augustus.
 A clean launcher preset avoids the grass and sea overlaps from Orbis
 Terrarum II and the sea overlap from Orbis Aquarum while retaining both mods.
+
+## Rocky ground candidate
+
+The next campaign surface is the base summer rocky ground family
+`terrain/textures/campaign/default/rock_b` from the installed vanilla
+`terrain2.pack`. The four variants show weathered, fractured and gravelly
+surfaces in the source mips. The adjacent `rock` family includes much flatter
+and partially neutral maps. The add-on targets `rock_b` only.
+
+Extract the `rock_b` directory from `terrain2.pack` with RPFM. Reuse the
+grass pipeline's broad slope calculation on the existing rock normal map at
+65% of its full slope adjustment. Carry only the added broad detail into
+each smaller mip, on top of the game's authored normal at that mip. Export
+four native 1024×1024 DXT5 normal textures with their original headers,
+eleven mip levels, and alpha/green encoding. The original rock colour
+textures supply both sides of the Lab comparison.
+
+```text
+python -m tools.material_lab.rome2_rock ROCK_B_SOURCE_DIR OVERRIDE_ROCK_B_DIR PATH_TO_TEXCONV
+```
+
+On the RTX Lab renderer at 1×, the prepared normal maps changed 70.9% of
+the tile pixels by more than two channel values at Distance 3, and 50.1%
+at Distance 4, averaged over four variants and four fixed lights. The
+default preview shows the packed strength. Zero strength pixel-matches
+the original. The Lab offers weathered, fractured and gravelly examples.
+Variants 2 and 3 have byte-identical original colour and normals. These
+measurements describe the Lab's coarse mip view. In-game visibility is
+pending.
+
+Verified the four exact packed paths and hashes on RPFM re-extraction.
+Pack `neuralalias_rome2_campaign_rock.pack` is 5,593,720 bytes and uses the
+existing additive installer component contract.
+
+```text
+338711A25B79612A678F3F9C4760384D2DD2572268FA314DA7173D18AB492191
+```
+
+Staging and `package-components.json` are in
+`C:/Users/Cort/NA-material-preparation/local/rome2-materials/landscape/campaign-rock/authored-component`.
+The rock pack is an optional addition to the combined campaign test.
+
+The installed Orbis Terrarum II archive overrides all eight paths with
+different files. Orbis Aquarum and the four other indexed Workshop packs
+have zero overlaps with the rock component. Use the same temporary clean
+preset planned for grass and ocean when comparing rock. The test view can be
+an exposed ridge beside the coast during the same campaign launch.
