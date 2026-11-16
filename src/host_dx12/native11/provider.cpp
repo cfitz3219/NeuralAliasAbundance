@@ -2259,8 +2259,32 @@ bool OnPresent(IDXGISwapChain* swap)
             }
             na::eventlog::Emit("native11_scene", "frame=%llu rule=%s layered=%d why=\"%s\" candidates:%s",
                                static_cast<unsigned long long>(g_frame),
-                               note.rule == FrameModel::PictureRule::AfterLayers ? "after-layers" : "most-drawn",
+                               note.rule != FrameModel::PictureRule::AfterLayers ? "most-drawn" : note.plain ? "after-layers-on-8-bit" : "after-layers",
                                g_model.Layered() ? 1 : 0, note.why, list);
+            // WHY log: the order of that frame, so a renderer we have not met shows where its picture
+            // is finished. Runs of draws into one target (d) and the reads we watch (r), in order;
+            // #id tells two targets of the same format apart; z = drawn with the scene depth.
+            static uint32_t flows = 0;
+            if (flows < 16) {
+                ++flows;
+                char flow[3600] = "";
+                int fa = 0;
+                for (const auto& f : g_model.LastFlow()) {
+                    if (fa >= static_cast<int>(sizeof flow) - 120) break;
+                    ResourceInfo ri{};
+                    g_model.InfoOf(f.target, ri);
+                    const unsigned tag = static_cast<unsigned>((f.target >> 4) & 0xfff);
+                    const char* role = f.target == s.color ? "PICTURE" : f.target == g_backbuffer ? "screen" : f.target == note.most_drawn ? "most-drawn" : "";
+                    if (f.read)
+                        fa += std::snprintf(flow + fa, sizeof flow - fa, " [r #%03x fmt=%u %s]", tag, ri.format, role);
+                    else
+                        fa += std::snprintf(flow + fa, sizeof flow - fa, " [d #%03x fmt=%u %ux%u %s n=%u multi=%u tested=%u %s]", tag, ri.format,
+                                            ri.width, ri.height, !f.depth ? "no-depth" : f.depth == s.depth ? "z" : "other-depth",
+                                            f.draws, f.multi, f.tested, role);
+                }
+                na::eventlog::Emit("native11_flow", "frame=%llu steps=%u dropped=%u:%s", static_cast<unsigned long long>(g_frame),
+                                   static_cast<unsigned>(g_model.LastFlow().size()), g_model.LastFlowDropped(), flow);
+            }
         }
     }
     g_scene_vp_x = g_scene_vp_y = g_scene_vp_w = g_scene_vp_h = 0;

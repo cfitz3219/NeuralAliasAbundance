@@ -1661,3 +1661,9 @@ Also added: a deferred recording made while a replacement is visible samples it 
 - Cause: `native11::Get` remembered "is this context the game's?" per context for ever. A context first met while another device was the watched one stayed "not the game's".
 - Fix (`native11/provider.cpp`): the answer carries a game-device generation; `Install` with a different device raises it and every context is asked again (its remembered state is cleared). Event `native11_device`, status `game_device{generation contexts_rechecked became_game other_device_calls}`.
 - Test: `provider_test` starts on a first device, meets the real context early, then installs on the real device; all phases run behind that.
+
+## 2026-11-16: Rome II second run; 8-bit layered renderers; frame order in the log (Fable)
+- Run p33844 on 00f3455b: one device this time (the device move was not exercised), scene and camera found on every frame, but the picture chosen was a format 87 (BGRA) material layer and DLAA refused it. Rome II is a layered renderer with no floating-point target: two sets of 8-bit layers, then draws with the scene depth on the screen target.
+- `frame_model.hpp`, variant `scene/after-layers-on-8-bit`: two or more finished sets of 8-bit layers and the scene going on in the screen target make the screen target the picture. One set alone keeps the old rule.
+- `native11_flow` event: the last frame as runs of draws per target and the watched reads, in order, with each picture-choice change (16 at most). Whether the lit picture really is finished on the screen target in Rome II is NOT known yet; this line shows it either way.
+- Not done: more than one layer set is not yet counted as scene draws (jitter covers the most-drawn set only); BGRA scene colour is still refused.

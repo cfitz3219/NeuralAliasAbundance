@@ -24,6 +24,10 @@
 //    is then that later target, and the scene is the draws into it plus the
 //    depth-tested draws into the layers, so the camera, the jitter and the DLSS
 //    point are taken over the whole scene. Anything else keeps the rule above;
+//    VARIANT: scene/after-layers-on-8-bit
+//    The same shape in a renderer with no floating-point picture at all: two or
+//    more separate sets of 8-bit layers, each finished before it is read, and
+//    the scene goes on with the same depth in the target shown on screen;
 //  - camera blocks: VS/PS constant-buffer ranges actually bound by scene draws;
 //    stable buffers are ranked first, but frequently updated ranges remain
 //    candidates. The provider validates their draw-time snapshots;
@@ -199,6 +203,7 @@ public:
         const char* why = "";
         Id most_drawn = 0, picture = 0;
         std::vector<ColourNote> candidates; // most draws first: eight, and always the layer and the picture
+        bool plain = false;                 // the picture after the layers is an 8-bit target (scene/after-layers-on-8-bit)
     };
     const ChoiceNote& LastChoice() const { return note_; }
     bool FiredThisFrame() const { return fired_; }
@@ -267,6 +272,23 @@ public:
         return s;
     }
 
+    // WHY log: the order of the last whole frame, as runs of draws into one set of targets and the
+    // reads between them. It is what a person needs to see where a new renderer finishes its picture.
+    struct FlowStep {
+        bool read = false;      // a read of `target` (only targets the host reports reads for)
+        Id target = 0, depth = 0;
+        uint32_t draws = 0, multi = 0, tested = 0;
+    };
+    const std::vector<FlowStep>& LastFlow() const { return last_flow_; }
+    uint32_t LastFlowDropped() const { return last_flow_dropped_; }
+    bool InfoOf(Id id, ResourceInfo& out) const
+    {
+        const auto it = info_.find(id);
+        if (it == info_.end()) return false;
+        out = it->second;
+        return true;
+    }
+
     // ---- feeding (in GPU order: immediate events live, list events at execute) ----
     // Returns, for CbUpdate, the buffer's new version (the engine files its bytes under it).
     uint32_t Feed(const Event& e)
@@ -280,6 +302,7 @@ public:
             break;
         }
         case Kind::Read: {
+            NoteFlow(true, e.resource, 0, false, false);
             // The first read of a target after its last draw (any target the host reports).
             TargetUse& u = target_[e.resource];
             u.last_read = events_;
@@ -432,6 +455,10 @@ public:
         stats_.camera_share = scene_draws_ ? double(stats_.camera_scene_draws) / scene_draws_ : 0;
 
         // Reset per-frame counters.
+        last_flow_.swap(flow_);
+        flow_.clear();
+        last_flow_dropped_ = flow_dropped_;
+        flow_dropped_ = 0;
         depth_.clear();
         color_.clear();
         target_.clear();
@@ -465,9 +492,27 @@ private:
     struct PairCount { uint64_t draws = 0, multi_target_draws = 0, first_draw = 0, last_draw = 0; };
     struct TargetUse { uint64_t last_draw = 0, first_read = 0, read_after = 0, last_read = 0; }; // event order within the frame
 
+    static constexpr size_t kFlowSteps = 96;
+    void NoteFlow(bool read, Id target, Id depth, bool multi, bool tested)
+    {
+        if (!flow_.empty()) {
+            FlowStep& b = flow_.back();
+            if (b.read == read && b.target == target && b.depth == depth) {
+                if (!read) { ++b.draws; b.multi += multi; b.tested += tested; }
+                return;
+            }
+        }
+        if (flow_.size() >= kFlowSteps) { ++flow_dropped_; return; }
+        FlowStep f;
+        f.read = read; f.target = target; f.depth = depth;
+        if (!read) { f.draws = 1; f.multi = multi; f.tested = tested; }
+        flow_.push_back(f);
+    }
+
     void Draw(const Event& e)
     {
         ++draws_;
+        NoteFlow(false, e.rt0, e.depth, e.rt_count > 1, e.depth_test);
         if (e.depth) {
             Cand& d = depth_[e.depth];
             ++d.draws;
@@ -678,6 +723,32 @@ private:
                 if (!picture || n.draws > picture->draws) picture = &n;
             }
         }
+        // VARIANT: scene/after-layers-on-8-bit
+        // A layered renderer that never uses a floating-point picture. One 8-bit target written
+        // with others can be the picture itself (colour plus a helper), so this needs more: two
+        // or more separate sets of layers, each finished before it is read (a picture is never
+        // two), and after them the scene goes on with the same depth in a plain 8-bit target of
+        // the same size that is the target shown on screen. Only when no floating-point target
+        // took the picture above.
+        bool plain = false;
+        if (!picture && layer && !layer->float_colour && layer->multi_target_draws * 4 >= layer->draws && layer->first_read) {
+            const auto finished_layer = [](const ColourNote& n) {
+                return n.same_size && !n.float_colour && n.draws && n.multi_target_draws * 4 >= n.draws && n.first_read &&
+                       n.last_draw < n.first_read;
+            };
+            uint32_t sets = 0;
+            for (const auto& n : all) sets += finished_layer(n) ? 1 : 0;
+            // One set only: it may be the picture itself, and the reason found above stands.
+            if (finished_layer(*layer) && sets >= 2) {
+                why = "several sets of 8-bit layers are read, but the scene does not go on with the scene depth in the target shown on screen";
+                for (const auto& n : all) {
+                    if (n.id == color || !n.same_size || n.float_colour || finished_layer(n)) continue;
+                    if (!screen_ || n.id != screen_) continue;
+                    if (n.draws && n.last_draw >= layer->first_read) picture = &n;
+                }
+                plain = picture != nullptr;
+            }
+        }
         // The note lists the most-drawn eight, and always the layer and the picture.
         note_.candidates.assign(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(std::min<size_t>(all.size(), 8)));
         for (const ColourNote* must : {layer, picture}) {
@@ -688,7 +759,9 @@ private:
         }
         if (!picture) { note_.why = why; return false; }
         note_.rule = PictureRule::AfterLayers;
-        note_.why = picture->draws && picture->last_draw >= layer->first_read
+        note_.plain = plain;
+        note_.why = plain ? "several sets of 8-bit material layers are finished and read, then the scene goes on in the target shown on screen (no floating-point picture in this renderer)" :
+                    picture->draws && picture->last_draw >= layer->first_read
                         ? "material layers are read, then the scene goes on in a floating-point target"
                         : "material layers are read; the picture in use is still read after them and is kept (no scene draw into it after them this frame)";
         note_.picture = color = picture->id;
@@ -708,6 +781,8 @@ private:
     std::unordered_map<std::pair<Id, Id>, PairCount, PairHash> color_;
     std::unordered_map<Id, TargetUse> target_;
     std::vector<Id> watch_;
+    std::vector<FlowStep> flow_, last_flow_;
+    uint32_t flow_dropped_ = 0, last_flow_dropped_ = 0;
     ChoiceNote note_;
     bool wide_ = false; // the scene is drawn through material layers (until the scene depth changes)
     Id layer_ = 0;      // their most-drawn target
