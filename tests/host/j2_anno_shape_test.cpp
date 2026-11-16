@@ -635,9 +635,12 @@ int main(int argc, char** argv)
             // be chosen since live variants are built on demand (Cort 2026-11-05), so -0.6 picks Light (-0.5).
             const float wanted[4] = {-1.0f, na::j2::SmallMipBias(-1.0f, 1.0f / 1.5f), na::j2::SmallMipBias(-1.0f, 1.0f / 1.72f),
                                      na::j2::SmallMipBias(-1.0f, 0.5f)};
-            CHECK(na::j2::SmallMipBias(0.f,1.f)==-1.f);
-            CHECK(na::j2::SmallMipBias(-.5f,1.f)==-1.f);
-            CHECK(na::j2::SmallMipBias(-2.f,1.f)==-1.f);
+            // Full resolution uses the DLAA total it is given (the menu's Texture mip bias choice, -1 when
+            // automatic; Cort 2026-11-16). The reduced modes keep their own totals whatever that choice is.
+            CHECK(na::j2::SmallMipBias(-1.f,1.f)==-1.f);
+            CHECK(na::j2::SmallMipBias(-2.f,1.f)==-2.f);
+            CHECK(na::j2::SmallMipBias(0.f,1.f)==0.f);
+            CHECK(na::j2::SmallMipBias(-2.f,.5f)==wanted[3]&&na::j2::SmallMipBias(0.f,1.0f/1.5f)==wanted[1]);
             na::observe::SetSamplerMipLevelsWanted(wanted, 4);
             na::observe::SetSamplerMipBiasLive(wanted[1]);
             CHECK(std::fabs(na::observe::SamplerMipBias() + 1.585f) < 0.001f);

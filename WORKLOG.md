@@ -1691,6 +1691,7 @@ Also added: a deferred recording made while a replacement is visible samples it 
 - Saved per game in a new key `[j2] texture_detail` (`auto` or the total). The old `[j2] mip_bias` key still chooses nothing, so an Off or Light saved by the pre-85016075 menu cannot switch texture detail off; it stays a mirror of the total in use. Start-up (`session.cpp`, `host_boot.cpp`), the DLAA switch and `j2::SmallMipBias` at scale 1 use `settings::DlaaMipBias`. Added upscaling modes keep their automatic totals.
 - Log: `setting j2_texture_detail_x100=` (who changed it), `mip requested bias=`, and on native DX11 `native11_samplers{want_bias= applied_bias=}`.
 - Tests: `pbz_settings_test` (default auto, save and load, clamp, old key ignored), `session_init_test` (start-up applies the choice; recovery does not). Not yet built or run on Windows here; CI builds it.
+- CI on 0669b90d: every `j2_anno_shape_test` variant failed on three checks that still held the 85016075 rule (`SmallMipBias(x, 1) == -1` for any x). They now state the new rule: full resolution returns the total it is given, the reduced modes keep their own totals.
 
 ## 2026-11-16: Ambient shading and bloom when DLAA runs in the 64-bit companion (Fable)
 - Was: on the companion route (32-bit games) both passes were skipped, because each hands DLSS a picture of its own and the companion reads the shared scene colour. The menu offered them and nothing happened.
