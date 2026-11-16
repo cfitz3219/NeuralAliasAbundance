@@ -24,10 +24,11 @@
 //    is then that later target, and the scene is the draws into it plus the
 //    depth-tested draws into the layers, so the camera, the jitter and the DLSS
 //    point are taken over the whole scene. Anything else keeps the rule above;
-//    VARIANT: scene/after-layers-on-8-bit
-//    The same shape in a renderer with no floating-point picture at all: two or
-//    more separate sets of 8-bit layers, each finished before it is read, and
-//    the scene goes on with the same depth in the target shown on screen;
+//    VARIANT: scene/after-layers-second-depth
+//    The same shape in a renderer that goes on with a second depth buffer of
+//    the same size after the layers are read: the picture is the floating-point
+//    target drawn with that second depth and read in turn; draws into it with
+//    either depth are scene draws, and both depths take the jitter;
 //  - camera blocks: VS/PS constant-buffer ranges actually bound by scene draws;
 //    stable buffers are ranked first, but frequently updated ranges remain
 //    candidates. The provider validates their draw-time snapshots;
@@ -175,7 +176,8 @@ public:
     void Forget(Id id)
     {
         info_.erase(id);
-        if (sel_.depth == id || layer_ == id) { wide_ = false; layer_ = 0; }
+        if (sel_.depth == id || layer_ == id) { wide_ = false; layer_ = 0; second_depth_ = 0; more_layers_.clear(); }
+        if (second_depth_ == id) second_depth_ = 0;
         if (sel_.depth == id || sel_.color == id) { sel_ = Selection{}; learned_read_ = 0; learned_tag_ = 0; learned_overlay_ = 0; learned_flat_ = 0; }
         if (sel_.camera_cb == id) { sel_.camera_cb = 0; sel_.camera_slot = -1; }
     }
@@ -186,6 +188,8 @@ public:
     bool Layered() const { return wide_; }
     // The layers' first render target (the most-drawn one); 0 when the scene has no layers.
     Id Layer() const { return wide_ ? layer_ : 0; }
+    // The second depth buffer the picture is drawn with after the layers; 0 = none.
+    Id SecondDepth() const { return wide_ ? second_depth_ : 0; }
     // Targets whose reads the model needs besides the scene colour (same size, drawn with the scene depth).
     const std::vector<Id>& Watch() const { return watch_; }
     // WHY log: last frame's colour candidates for the scene depth, and why the picture was chosen.
@@ -203,7 +207,8 @@ public:
         const char* why = "";
         Id most_drawn = 0, picture = 0;
         std::vector<ColourNote> candidates; // most draws first: eight, and always the layer and the picture
-        bool plain = false;                 // the picture after the layers is an 8-bit target (scene/after-layers-on-8-bit)
+        Id second_depth = 0;                // the picture is drawn with this other depth of the same size (scene/after-layers-second-depth)
+        std::vector<Id> more_layers;        // other sets of layers written with the scene depth
     };
     const ChoiceNote& LastChoice() const { return note_; }
     bool FiredThisFrame() const { return fired_; }
@@ -484,7 +489,15 @@ public:
     // depth-tested draw into the layers with the scene depth.
     bool IsSceneDraw(const Event& e) const
     {
-        return sel_.valid() && e.depth == sel_.depth && (e.rt0 == sel_.color || (wide_ && e.depth_test && e.rt0 == layer_));
+        if (!sel_.valid()) return false;
+        if (e.depth == sel_.depth) {
+            if (e.rt0 == sel_.color) return true;
+            if (!wide_ || !e.depth_test) return false;
+            if (e.rt0 == layer_) return true;
+            for (Id l : more_layers_) if (e.rt0 == l) return true;
+            return false;
+        }
+        return wide_ && second_depth_ && e.depth == second_depth_ && e.rt0 == sel_.color;
     }
 
 private:
@@ -617,7 +630,10 @@ private:
         const bool layered = AfterLayers(best_depth, best_color);
         if (layered) {
             ++stats_.layered_frames;
-            if (best_depth == sel_.depth && best_color == sel_.color) { wide_ = true; layer_ = most_drawn; }
+            if (best_depth == sel_.depth && best_color == sel_.color) {
+                wide_ = true; layer_ = most_drawn;
+                second_depth_ = note_.second_depth; more_layers_ = note_.more_layers;
+            }
         }
         if (best_depth == sel_.depth && best_color == sel_.color) { pending_frames_ = 0; return; }
         if (best_depth == pending_.first && best_color == pending_.second) ++pending_frames_;
@@ -625,7 +641,9 @@ private:
         if (pending_frames_ >= 3 || !sel_.valid()) {
             if (sel_.valid()) ++stats_.selection_changes;
             if (sel_.depth != best_depth) { wide_ = false; layer_ = 0; }
-            if (layered) { wide_ = true; layer_ = most_drawn; }
+            second_depth_ = 0;
+            more_layers_.clear();
+            if (layered) { wide_ = true; layer_ = most_drawn; second_depth_ = note_.second_depth; more_layers_ = note_.more_layers; }
             sel_.depth = best_depth;
             sel_.color = best_color;
             sel_.depth_info = info_[best_depth];
@@ -695,6 +713,15 @@ private:
         watch(color);
         for (const auto& n : all)
             if (n.same_size && n.float_colour) watch(n.id);
+        // ... including those drawn with a second depth of the same size (scene/after-layers-second-depth).
+        for (const auto& kv : color_) {
+            if (kv.first.first == depth) continue;
+            const auto dit = info_.find(kv.first.first), cit = info_.find(kv.first.second);
+            if (dit == info_.end() || cit == info_.end() || !cit->second.float_colour) continue;
+            if (dit->second.width != di.width || dit->second.height != di.height || cit->second.width != di.width ||
+                cit->second.height != di.height) continue;
+            watch(kv.first.second);
+        }
         for (const auto& n : all)
             if (n.same_size) watch(n.id);
         const ColourNote* layer = nullptr;
@@ -723,30 +750,35 @@ private:
                 if (!picture || n.draws > picture->draws) picture = &n;
             }
         }
-        // VARIANT: scene/after-layers-on-8-bit
-        // A layered renderer that never uses a floating-point picture. One 8-bit target written
-        // with others can be the picture itself (colour plus a helper), so this needs more: two
-        // or more separate sets of layers, each finished before it is read (a picture is never
-        // two), and after them the scene goes on with the same depth in a plain 8-bit target of
-        // the same size that is the target shown on screen. Only when no floating-point target
-        // took the picture above.
-        bool plain = false;
-        if (!picture && layer && !layer->float_colour && layer->multi_target_draws * 4 >= layer->draws && layer->first_read) {
-            const auto finished_layer = [](const ColourNote& n) {
-                return n.same_size && !n.float_colour && n.draws && n.multi_target_draws * 4 >= n.draws && n.first_read &&
-                       n.last_draw < n.first_read;
-            };
-            uint32_t sets = 0;
-            for (const auto& n : all) sets += finished_layer(n) ? 1 : 0;
-            // One set only: it may be the picture itself, and the reason found above stands.
-            if (finished_layer(*layer) && sets >= 2) {
-                why = "several sets of 8-bit layers are read, but the scene does not go on with the scene depth in the target shown on screen";
-                for (const auto& n : all) {
-                    if (n.id == color || !n.same_size || n.float_colour || finished_layer(n)) continue;
-                    if (!screen_ || n.id != screen_) continue;
-                    if (n.draws && n.last_draw >= layer->first_read) picture = &n;
+        // VARIANT: scene/after-layers-second-depth
+        // A layered renderer that goes on with a second depth buffer of the same size once the
+        // layers are read (the first one is then being read by the lighting): the picture is the
+        // floating-point target the scene goes on in with that second depth, read in turn. Only
+        // when no floating-point target drawn with the scene depth took the picture above.
+        Id second_depth = 0;
+        ColourNote second;
+        if (layer && !layer->float_colour && layer->multi_target_draws * 4 >= layer->draws && layer->first_read) {
+            const char* why_first = why;
+            for (const auto& kv : color_) {
+                if (kv.first.first == depth) continue;
+                const auto dit = info_.find(kv.first.first);
+                if (dit == info_.end() || dit->second.width != di.width || dit->second.height != di.height) continue;
+                const ColourNote n = note_of(kv.first.second, &kv.second);
+                if (!n.same_size || !n.float_colour) continue;
+                const bool goes_on = n.draws && n.last_draw >= layer->first_read;
+                const bool still_read = wide_ && n.id == sel_.color && n.last_read >= layer->first_read;
+                if (!(goes_on && n.read_after) && !still_read) {
+                    why = goes_on ? "a floating-point target follows the layers with a second depth of the same size, but is never read after its draws"
+                                  : "a floating-point target is drawn with a second depth of the same size only before the layers are read";
+                    continue;
                 }
-                plain = picture != nullptr;
+                if (!second_depth || n.draws > second.draws) { second = n; second_depth = kv.first.first; }
+            }
+            // The picture in use, kept above only because it is still read, is this same target.
+            if (second_depth && (!picture || picture->id == second.id)) picture = &second;
+            else {
+                second_depth = 0;
+                if (picture) why = why_first;
             }
         }
         // The note lists the most-drawn eight, and always the layer and the picture.
@@ -759,8 +791,14 @@ private:
         }
         if (!picture) { note_.why = why; return false; }
         note_.rule = PictureRule::AfterLayers;
-        note_.plain = plain;
-        note_.why = plain ? "several sets of 8-bit material layers are finished and read, then the scene goes on in the target shown on screen (no floating-point picture in this renderer)" :
+        note_.second_depth = second_depth;
+        // The other sets of layers written with the scene depth: their depth-tested draws are scene too.
+        note_.more_layers.clear();
+        for (const auto& n : all)
+            if (n.id != color && n.id != picture->id && n.same_size && !n.float_colour && n.draws && n.multi_target_draws * 4 >= n.draws &&
+                note_.more_layers.size() < 4)
+                note_.more_layers.push_back(n.id);
+        note_.why = second_depth ? "material layers are read, then the scene goes on in a floating-point target with a second depth buffer of the same size" :
                     picture->draws && picture->last_draw >= layer->first_read
                         ? "material layers are read, then the scene goes on in a floating-point target"
                         : "material layers are read; the picture in use is still read after them and is kept (no scene draw into it after them this frame)";
@@ -786,6 +824,8 @@ private:
     ChoiceNote note_;
     bool wide_ = false; // the scene is drawn through material layers (until the scene depth changes)
     Id layer_ = 0;      // their most-drawn target
+    Id second_depth_ = 0;           // scene/after-layers-second-depth
+    std::vector<Id> more_layers_;   // the other sets of layers
     struct CbUse { uint32_t draws = 0, versions = 0, last_version = 0, first = 0, count = 0; };
     std::unordered_map<std::pair<Id, int>, CbUse, CbHash> cb_scene_;
     std::map<std::tuple<Id, int, uint32_t, uint32_t>, CbUse> cb_ranges_;

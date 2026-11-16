@@ -292,6 +292,8 @@ bool g_jitter_written = false; // this frame's camera upload carried our sample
 std::atomic<bool> g_vpj_route{false}; // SetJitterRoute; the host turns it on for the native path
 std::atomic<uint64_t> g_vpj_sample{0}; // publish both float axes as one value
 std::atomic<Id> g_sel_depth{0};
+std::atomic<uint64_t> g_vpj_stopped_after_scene{0};
+std::atomic<Id> g_sel_depth2{0}; // the second depth the picture is drawn with (scene/after-layers-second-depth)
 std::atomic<uint32_t> g_sel_depth_w{0}, g_sel_depth_h{0};
 uint32_t g_vpj_frame_draws = 0; // executed scene draws with a nonzero sample, under g_mu
 uint32_t g_vpj_frame_unshifted = 0; // draws into the scene colour left unshifted on a shifted frame, under g_mu
@@ -1341,6 +1343,7 @@ void NoteViewportDraw(const Event& e)
 }
 
 // ---------------------------------------------------------------- events
+void StopViewportJitterAfterScene();
 void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {}, const ExactSet& exact = {})
 {
     if (x->deferred) {
@@ -1360,9 +1363,11 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
     if (e.kind == Kind::Read && g_model.ShouldFireBeforeRead(e.resource)) {
         g_model.MarkFired();
         Fire(c, l, Boundary::BeforeRead);
+        StopViewportJitterAfterScene();
     } else if (e.kind == Kind::Draw && g_model.ShouldFireBeforeDraw(e)) {
         g_model.MarkFired();
         Fire(c, l, Boundary::BeforeHud);
+        StopViewportJitterAfterScene();
     }
     const uint32_t v = g_model.Feed(e);
     RememberSceneUploads(e, exact.get());
@@ -1373,12 +1378,25 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
 
 // Viewport jitter, before a game draw is forwarded: a depth-tested draw into the scene depth gets
 // the game's viewports moved by this frame's sample; any other draw gets the game's own back.
+// The picture has been handed over: what the game draws after that (marks and HUD that still test
+// the scene depth) is not part of what DLSS resolves, so it must not move with the sample.
+// Bound offset copies go back to the game's own viewports at the next draw.
+void StopViewportJitterAfterScene()
+{
+    if (g_vpj_sample.load(std::memory_order_relaxed)) {
+        g_vpj_sample.store(0, std::memory_order_release);
+        g_vpj_stopped_after_scene.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
 {
     const uint64_t sample = g_vpj_sample.load(std::memory_order_acquire);
     const bool on = sample != 0;
     if (!on && !x->vpj_applied) return;
-    const Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
+    Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
+    // VARIANT: scene/after-layers-second-depth
+    // The scene goes on with a second depth buffer: draws tested against it take the same sample.
+    if (const Id second = g_sel_depth2.load(std::memory_order_relaxed); second && x->depth == second && scene_depth) scene_depth = second;
     // Every depth-tested draw into the scene depth moves, whatever colour target is bound: a depth
     // prepass (no colour target) and the colour passes tested against it must rasterise at the same
     // sub-pixel position, or the later passes fail their depth test over whole surfaces
@@ -2091,6 +2109,7 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
         if (it != g_lists.end() && g_model.ShouldFireBeforeList(g_model.Summarize(it->second.events))) {
             g_model.MarkFired();
             Fire(c, l, Boundary::BeforeList);
+            StopViewportJitterAfterScene();
             it = g_lists.find(list); // g_mu was let go during the callback
         }
         if (it != g_lists.end()) {
@@ -2234,6 +2253,7 @@ bool OnPresent(IDXGISwapChain* swap)
     }
     g_sel_color.store(s.color, std::memory_order_relaxed);
     g_sel_layer.store(g_model.Layer(), std::memory_order_relaxed);
+    g_sel_depth2.store(g_model.SecondDepth(), std::memory_order_relaxed);
     {
         const auto& watch = g_model.Watch();
         for (size_t i = 0; i < kWatch; ++i) g_watch[i].store(i < watch.size() ? watch[i] : 0, std::memory_order_relaxed);
@@ -2259,11 +2279,11 @@ bool OnPresent(IDXGISwapChain* swap)
             }
             na::eventlog::Emit("native11_scene", "frame=%llu rule=%s layered=%d why=\"%s\" candidates:%s",
                                static_cast<unsigned long long>(g_frame),
-                               note.rule != FrameModel::PictureRule::AfterLayers ? "most-drawn" : note.plain ? "after-layers-on-8-bit" : "after-layers",
+                               note.rule != FrameModel::PictureRule::AfterLayers ? "most-drawn" : note.second_depth ? "after-layers-second-depth" : "after-layers",
                                g_model.Layered() ? 1 : 0, note.why, list);
             // WHY log: the order of that frame, so a renderer we have not met shows where its picture
             // is finished. Runs of draws into one target (d) and the reads we watch (r), in order;
-            // #id tells two targets of the same format apart; z = drawn with the scene depth.
+            // #id tells two targets of the same format apart; z#id is the depth buffer bound.
             static uint32_t flows = 0;
             if (flows < 16) {
                 ++flows;
@@ -2278,9 +2298,14 @@ bool OnPresent(IDXGISwapChain* swap)
                     if (f.read)
                         fa += std::snprintf(flow + fa, sizeof flow - fa, " [r #%03x fmt=%u %s]", tag, ri.format, role);
                     else
+                    {
+                        char z[24] = "no-depth";
+                        if (f.depth)
+                            std::snprintf(z, sizeof z, "z#%03x%s", static_cast<unsigned>((f.depth >> 4) & 0xfff),
+                                          f.depth == s.depth ? "=scene" : f.depth == note.second_depth ? "=second" : "");
                         fa += std::snprintf(flow + fa, sizeof flow - fa, " [d #%03x fmt=%u %ux%u %s n=%u multi=%u tested=%u %s]", tag, ri.format,
-                                            ri.width, ri.height, !f.depth ? "no-depth" : f.depth == s.depth ? "z" : "other-depth",
-                                            f.draws, f.multi, f.tested, role);
+                                            ri.width, ri.height, z, f.draws, f.multi, f.tested, role);
+                    }
                 }
                 na::eventlog::Emit("native11_flow", "frame=%llu steps=%u dropped=%u:%s", static_cast<unsigned long long>(g_frame),
                                    static_cast<unsigned>(g_model.LastFlow().size()), g_model.LastFlowDropped(), flow);
@@ -2358,6 +2383,7 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
         g_sel_layer.store(0);
         for (auto& w : g_watch) w.store(0);
         g_sel_depth.store(0);
+        g_sel_depth2.store(0);
         g_vpj_sample.store(0);
     }
 }
@@ -2537,6 +2563,7 @@ void Uninstall()
     g_sel_layer.store(0);
     for (auto& w : g_watch) w.store(0);
     g_sel_depth.store(0);
+    g_sel_depth2.store(0);
     g_vpj_sample.store(0);
 }
 
@@ -2657,11 +2684,13 @@ int FormatStatus(char* out, unsigned long n)
     // Whose contexts the calls came from: a game drawing on a device we do not watch shows here as
     // other_device_calls rising while draws stay at zero.
     const int tail = std::snprintf(out + head, n - head,
-                                   " game_device{generation=%u contexts_rechecked=%llu became_game=%llu other_device_calls=%llu}",
+                                   " game_device{generation=%u contexts_rechecked=%llu became_game=%llu other_device_calls=%llu} second_depth=%d jitter_stopped_after_scene=%llu",
                                    g_device_gen.load(std::memory_order_relaxed),
                                    static_cast<unsigned long long>(g_ctx_rechecked.load(std::memory_order_relaxed)),
                                    static_cast<unsigned long long>(g_ctx_became_game.load(std::memory_order_relaxed)),
-                                   static_cast<unsigned long long>(g_foreign_calls.load(std::memory_order_relaxed)));
+                                   static_cast<unsigned long long>(g_foreign_calls.load(std::memory_order_relaxed)),
+                                   g_sel_depth2.load(std::memory_order_relaxed) ? 1 : 0,
+                                   static_cast<unsigned long long>(g_vpj_stopped_after_scene.load(std::memory_order_relaxed)));
     return tail < 0 ? head : head + tail;
 }
 

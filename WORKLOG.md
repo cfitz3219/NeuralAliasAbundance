@@ -1667,3 +1667,9 @@ Also added: a deferred recording made while a replacement is visible samples it 
 - `frame_model.hpp`, variant `scene/after-layers-on-8-bit`: two or more finished sets of 8-bit layers and the scene going on in the screen target make the screen target the picture. One set alone keeps the old rule.
 - `native11_flow` event: the last frame as runs of draws per target and the watched reads, in order, with each picture-choice change (16 at most). Whether the lit picture really is finished on the screen target in Rome II is NOT known yet; this line shows it either way.
 - Not done: more than one layer set is not yet counted as scene draws (jitter covers the most-drawn set only); BGRA scene colour is still refused.
+
+## 2026-11-16: Rome II third run; the picture behind a second depth buffer (Fable)
+- Run p3624 on a3472dc8: the DLAA companion ran in the game for the first time (72,426 frames, 0 refused, handoff avg 0.28 ms). But the on-screen 8-bit rule was wrong: `native11_flow` showed the lit picture is a format 26 floating-point target drawn with a SECOND depth buffer after the layers are read, then tonemapped. DLAA ran on the finished screen image with only 7 map marks jittered; Cort saw wobble and no gain.
+- Removed `scene/after-layers-on-8-bit`. Added `scene/after-layers-second-depth` (frame_model.hpp): floating-point picture drawn with another same-size depth after the layers; both depths take the jitter; depth-tested draws into every layer set are scene draws.
+- Viewport jitter now stops for the rest of the frame once the picture is handed over (marks and HUD that test the scene depth no longer move). Status `second_depth= jitter_stopped_after_scene=`. Flow steps print the depth buffer bound.
+- Open: which of the two depths is the complete one for DLSS (the first is handed now); the 565 untested draws into the most-drawn layer set are not jittered.

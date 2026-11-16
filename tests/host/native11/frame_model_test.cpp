@@ -581,23 +581,28 @@ int main()
         expect(settles_on(unread, true, false, &why) == kNormals && std::strstr(why, "never read"),
                "a later target that is never read gives no place to run: the old rule stands");
     }
-    // ---- scene/after-layers-on-8-bit: a layered renderer with no floating-point picture ----
-    // Shape recorded from a real game (run p33844): two separate sets of 8-bit layers (format 87)
-    // written together, both read by the lighting, then the scene goes on with the same depth in
-    // the target shown on screen, and the HUD follows there without the depth.
+    // ---- scene/after-layers-second-depth: the scene goes on with a second depth buffer ----
+    // Shape recorded from a real game (run p3624): two sets of 8-bit layers (format 87) written
+    // with the scene depth and read by the lighting; the scene then goes on with a second depth
+    // buffer of the same size in a floating-point target (format 26), which the tonemap reads;
+    // the HUD is drawn on the screen target, a few marks of it with the first depth.
     {
-        enum : Id { kSetA = 40, kSetB = 41 };
-        const auto targets = [](Event e, uint8_t n) { e.rt_count = n; return e; };
-        const auto frame = [&](bool two_sets, bool on_screen_scene) {
+        enum : Id { kSetA = 40, kSetB = 41, kHdr = 42, kDepth2 = 43 };
+        const auto targets = [](Event e, uint8_t n, bool tested = true) { e.rt_count = n; e.depth_test = tested; return e; };
+        const auto frame = [&](int transparents, bool hdr_read = true) {
             std::vector<Event> f;
             f.push_back(Upd(kCamCb));
-            if (two_sets) for (int i = 0; i < 120; ++i) f.push_back(targets(Draw(kSetB, kDepth, 900), 3));
-            for (int i = 0; i < 200; ++i) f.push_back(targets(Draw(kSetA, kDepth, 900), 3));
+            for (int i = 0; i < 120; ++i) f.push_back(targets(Draw(kSetB, kDepth, 900), 3));
+            for (int i = 0; i < 200; ++i) f.push_back(targets(Draw(kSetA, kDepth, 900), 3, false));
             f.push_back(Read(kSetB));
             f.push_back(Read(kSetA));
-            f.push_back(Draw(kBackBuffer, 0, 3, 0, 0)); // lighting, full screen, no depth
-            if (on_screen_scene) for (int i = 0; i < 15; ++i) f.push_back(targets(Draw(kBackBuffer, kDepth, 300), 1));
-            for (int i = 0; i < 20; ++i) f.push_back(Draw(kBackBuffer, 0, 6, 0, 0)); // HUD
+            for (int i = 0; i < 2; ++i) f.push_back(targets(Draw(kHdr, kDepth2, 3), 1, false));
+            f.push_back(targets(Draw(kHdr, 0, 3, 0, 0), 1, false)); // lighting, no depth
+            for (int i = 0; i < transparents; ++i) f.push_back(targets(Draw(kHdr, kDepth2, 300), 1));
+            if (hdr_read) f.push_back(Read(kHdr));              // tonemap: <- DLSS point
+            f.push_back(Draw(kBackBuffer, 0, 3, 0, 0));
+            for (int i = 0; i < 7; ++i) f.push_back(targets(Draw(kBackBuffer, kDepth, 30), 1)); // marks on the map
+            for (int i = 0; i < 20; ++i) f.push_back(targets(Draw(kBackBuffer, kDepth, 6), 1, false)); // HUD
             return f;
         };
         const auto run = [](FrameModel& m, const std::vector<Event>& f) {
@@ -609,8 +614,8 @@ int main()
                     bool seen = f[i].resource == color;
                     for (Id w : watch) seen = seen || w == f[i].resource;
                     if (!seen) continue;
+                    if (m.ShouldFireBeforeRead(f[i].resource)) { m.MarkFired(); fired = int(i); }
                 }
-                if (f[i].kind == Kind::Draw && m.ShouldFireBeforeDraw(f[i])) { m.MarkFired(); fired = int(i); }
                 m.Feed(f[i]);
             }
             m.EndFrame();
@@ -620,43 +625,55 @@ int main()
             Setup(m);
             m.SetInfo(kSetA, {1920, 1080, 87, 1, false, false});
             m.SetInfo(kSetB, {1920, 1080, 87, 1, false, false});
+            m.SetInfo(kHdr, {1920, 1080, 26, 1, false, true});
+            m.SetInfo(kDepth2, {1920, 1080, 45, 1, true});
             m.SetInfo(kBackBuffer, {1920, 1080, 28, 1, false, false});
             m.SetScreenTarget(kBackBuffer);
+        };
+        const auto read_index = [](const std::vector<Event>& f) {
+            for (size_t i = 0; i < f.size(); ++i)
+                if (f[i].kind == Kind::Read && f[i].resource == kHdr) return int(i);
+            return -1;
         };
         {
             FrameModel m;
             setup(m);
-            for (int i = 0; i < 8; ++i) run(m, frame(true, true));
-            expect(m.Current().color == kBackBuffer && m.Layered() && m.Layer() == kSetA && m.LastChoice().plain &&
-                   m.LastChoice().rule == FrameModel::PictureRule::AfterLayers,
-                   "two finished sets of 8-bit layers, then the scene on screen: the picture is the screen target");
+            int frames = 0;
+            for (; frames < 12 && m.Current().color != kHdr; ++frames) run(m, frame(40));
+            expect(m.Current().color == kHdr && m.Current().depth == kDepth && m.Layered() && m.SecondDepth() == kDepth2 && frames <= 6 &&
+                   m.LastChoice().rule == FrameModel::PictureRule::AfterLayers && m.LastChoice().second_depth == kDepth2,
+                   "layers, then a floating-point target with a second depth: that target is the picture");
+            run(m, frame(40));
             m.SetCamera(kCamCb, 0);
-            const auto f = frame(true, true);
+            const auto f = frame(40);
             const int fired = run(m, f);
-            int first_hud = -1, last_scene = -1;
-            for (size_t i = 0; i < f.size(); ++i)
-                if (f[i].kind == Kind::Draw && f[i].rt0 == kBackBuffer && f[i].depth == kDepth) last_scene = int(i);
-            for (size_t i = size_t(last_scene + 1); i < f.size() && first_hud < 0; ++i)
-                if (f[i].kind == Kind::Draw && f[i].rt0 == kBackBuffer) first_hud = int(i);
-            expect(fired == first_hud && fired > 0 && m.GetStats().contradictions == 0,
-                   "DLSS runs right before the first HUD draw, after the last scene draw on screen");
-            expect(!m.LastFlow().empty() && m.LastFlow().size() <= 8 && !m.LastFlow()[0].read && m.LastFlow()[0].target == kSetB &&
-                   m.LastFlow()[0].draws == 120 && m.LastFlow()[0].multi == 120,
+            expect(fired == read_index(f) && fired > 0 && m.GetStats().contradictions == 0,
+                   "DLSS runs right before the tonemap reads the picture, not on the screen target");
+
+            expect(m.GetStats().last_scene_draws == 120 + 2 + 40,
+                   "the scene is the picture's draws with either depth plus the depth-tested draws into every set of layers");
+            Event second = targets(Draw(kSetB, kDepth2, 300), 1);
+            Event hud = targets(Draw(kBackBuffer, kDepth, 30), 1);
+            expect(m.IsSceneDraw(targets(Draw(kHdr, kDepth2, 300), 1)) && !m.IsSceneDraw(second) && !m.IsSceneDraw(hud),
+                   "only the picture counts with the second depth; marks on the screen target are not scene");
+            // A view with nothing transparent: the picture is still found and the point still holds.
+            bool kept = true;
+            for (int i = 0; i < 5; ++i) {
+                const auto g = frame(0);
+                const int at = run(m, g);
+                kept = kept && m.Current().color == kHdr && (i == 0 || at == read_index(g));
+            }
+            expect(kept, "a frame with no transparent draws keeps the picture and the point");
+            expect(!m.LastFlow().empty() && !m.LastFlow()[0].read && m.LastFlow()[0].target == kSetB && m.LastFlow()[0].draws == 120 &&
+                   m.LastFlow()[0].depth == kDepth,
                    "the frame's order is kept as runs of draws and reads for the log");
         }
         {
             FrameModel m;
             setup(m);
-            for (int i = 0; i < 8; ++i) run(m, frame(false, true));
-            expect(m.Current().color == kSetA && !m.Layered() && std::strstr(m.LastChoice().why, "no floating-point target"),
-                   "one 8-bit set written together may be the picture itself: the old rule stands");
-        }
-        {
-            FrameModel m;
-            setup(m);
-            for (int i = 0; i < 8; ++i) run(m, frame(true, false));
-            expect(m.Current().color == kSetA && !m.Layered() && std::strstr(m.LastChoice().why, "does not go on"),
-                   "layers with no scene draw on screen after them: the old rule stands (and says why)");
+            for (int i = 0; i < 8; ++i) run(m, frame(40, false));
+            expect(m.Current().color == kSetA && !m.Layered() && std::strstr(m.LastChoice().why, "never read"),
+                   "a later target with a second depth that is never read gives no place to run: the old rule stands");
         }
     }
     // The first shape in this file (one colour target, drawn alone) never becomes layered.
