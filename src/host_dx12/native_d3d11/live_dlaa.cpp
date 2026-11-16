@@ -311,8 +311,17 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         FAILED(dr->QueryInterface(IID_PPV_ARGS(&depth)))) return Skip("Scene textures unavailable.");
     D3D11_TEXTURE2D_DESC cd{}, dd{};
     UINT csub, dsub, cw, ch, dw, dh;
-    if (!Subresource(color.Get(), c, cd, csub, cw, ch) ||
-        !Subresource(depth.Get(), d, dd, dsub, dw, dh)) return Skip("Scene texture layout unsupported.");
+    if (!Subresource(color.Get(), c, cd, csub, cw, ch) || !Subresource(depth.Get(), d, dd, dsub, dw, dh)) {
+        // Says WHY: the common case is the game's own multisample anti-aliasing.
+        if (cd.SampleDesc.Count > 1 || dd.SampleDesc.Count > 1) {
+            static char why[160];
+            std::snprintf(why, sizeof why,
+                          "The game's own anti-aliasing is on (scene picture %ux, depth %ux multisampled): DLAA needs it off in the game's settings.",
+                          cd.SampleDesc.Count, dd.SampleDesc.Count ? dd.SampleDesc.Count : 1);
+            return Skip(why);
+        }
+        return Skip("Scene texture layout unsupported (mip, array slice or active area outside the texture).");
+    }
     auto cf = static_cast<DXGI_FORMAT>(c.view_format);
     // VARIANT: colour/srgb-view-as-stored
     // A picture the game writes through an sRGB view holds
