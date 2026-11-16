@@ -9760,3 +9760,20 @@ Use these two verified components. For each, copy the pack to payload and includ
 - Rock relief: C:\Users\Cort\NA-material-preparation\local\rome2-materials\landscape\campaign-rock\authored-component\neuralalias_rome2_campaign_rock.pack -> data\neuralalias_rome2_campaign_rock.pack. SHA-256 338711A25B79612A678F3F9C4760384D2DD2572268FA314DA7173D18AB492191, 5,593,720 bytes.
 
 These two exact files passed combined install and rollback with 2f539a9 in scratch (installer-check-bdd57a11); rechecked their hashes for this handoff. The stand-alone PBRify rock colour is a Lab preview (c8ff928) and stays outside the install. In the readme, tell Cort to enable both campaign packs in the Rome II launcher, use the game's AA Off for the tested DLAA configuration, and use a coastal Grand Campaign or Imperator Augustus save with exposed rock and grass inland. Orbis Terrarum II overlaps grass, rock and ocean. Orbis Aquarum overlaps ocean. Use a temporary launcher preset for this run and retain the Workshop subscriptions. No battle or separate material-only install is needed.
+
+### 2026-11-16 03:4xZ — Fable -> Astra, Sol: combined Rome II campaign package staged (2f539a9 + both packs); mip bias selector and companion shading on the branch
+Cort, 03:28Z: "Once finished- don't build. Implement Sol's package". Read as your handoff above (548e642a). No build was made; the package reuses the game-tested 2f539a9 binaries unchanged.
+
+**Staged, not yet run by Cort:** `C:\Users\Cort\Documents\NeuralAlias-RomeII-Campaign-2f539a9`
+- `02-INSTALL.cmd` (removes the installed 2f539a9 first, keeps its logs), `01-UNINSTALL.cmd`, `03-RESULTS.cmd`, `00-READ-ME.txt`.
+- `payload\package.json`: `source_commit` 2f539a98, the five original files plus both packs under `payload`, and two `components`: `data\neuralalias_rome2_campaign_pilot.pack` (E2A6F35C…AC52, 24,586,327 bytes) and `data\neuralalias_rome2_campaign_rock.pack` (338711A2…2191, 5,593,720 bytes). Both read from your two component folders; hashes, sizes and destinations matched your notes and your `package-components.json` files. Your workspace was only read.
+- Checked on Cort's PC with the package's own installer into a throwaway 32-bit folder (private label and records folders): installs, both packs land in `data\` with the right hashes, settings file names 2f539a98, uninstalls, folder and `data\` exactly as before. Nothing touched the real game folder.
+- The read-me carries your notes: tick both packs in the launcher's Mod Manager, untick Orbis Terrarum II and Orbis Aquarum for the run (stay subscribed), game anti-aliasing off, coastal Grand Campaign or Imperator Augustus save with exposed rock and grass inland.
+
+Two things seen while staging, for whoever knows:
+- Rome II was open during staging (pid 12372, started 03:25Z, before it pid 11056 from 03:12Z). Both sessions stayed in the menus (under 75 draws a frame, "Waiting for a native scene"), so they say nothing about DLAA.
+- `steam_appid.txt` (8 bytes) appeared in the game folder at 03:25:19Z. It is not from `deploy-native11.ps1`. The next uninstall will log one warning line that the folder differs from its pre-install listing by that file, and continue. If one of you made it, say so here so the warning is not chased.
+
+Also on `claude/project-thread-3euhfs`, head b36d2614 (PR 135), NOT in this package and not built on the PC by Cort's word:
+- Menu row "Texture mip bias" is a selector again at full resolution (Off, -0.50, Automatic -1.00, -1.58, -2.00, -2.25), saved in a new key `[j2] texture_detail`; the old `[j2] mip_bias` key still chooses nothing. `j2::SmallMipBias(total, 1)` now returns the total it is given; reduced modes keep their own totals.
+- Ambient shading and bloom now reach the picture when DLAA runs in the 64-bit companion (`companion_shaded=` in the status line). New test `host_native11_dlaa_companion_test` registers only where the NGX library and DLSS DLL exist, so its first real run is on Cort's PC.
