@@ -441,6 +441,17 @@ if(TARGET host_native11)
     set_tests_properties(host_native11_dlaa_automatic_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_custom_command(TARGET native11_dlaa_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_dlaa_test>")
+    # The same test with DLSS in the 64-bit companion program: the route every 32-bit game takes.
+    # It is the only place the consumer's two-list companion path, sharpening after the companion,
+    # and ambient shading and bloom copied into the shared colour run outside a game.
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+      add_dependencies(native11_dlaa_test NeuralAliasDlaa64)
+      add_custom_command(TARGET native11_dlaa_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:NeuralAliasDlaa64>" "$<TARGET_FILE_DIR:native11_dlaa_test>")
+      add_test(NAME host_native11_dlaa_companion_test COMMAND native11_dlaa_test)
+      set_tests_properties(host_native11_dlaa_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
+        LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
+    endif()
   endif()
 endif()
 # C8b: a frame with known passes must come back as exactly those ops (ABI 0.2).

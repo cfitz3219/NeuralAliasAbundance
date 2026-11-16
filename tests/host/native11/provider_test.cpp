@@ -1187,6 +1187,16 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
            "native optical-flow switch submits consecutive paired frames with retired recording ownership");
     expect(ao_live.recorded >= 20 && lighting_live.recorded >= 20 && evaluations == effects_before + 21,
            "native XeGTAO and lighting run before real DLAA without missing frames");
+    static char route_status[2048]{};
+    na::native_d3d11::FormatStatus(route_status, sizeof route_status);
+    if (std::strstr(route_status, "dlaa_companion started=1")) {
+        // With DLSS in the companion program (NA_DLAA_COMPANION=1), the companion reads the shared
+        // scene colour, so the passes' picture has to be copied into it on every frame.
+        const char* shaded = std::strstr(route_status, "companion_shaded=");
+        std::printf("companion route: %s\n", shaded ? shaded : "(no companion_shaded in the status)");
+        expect(shaded && std::strtoull(shaded + std::strlen("companion_shaded="), nullptr, 10) >= 20,
+               "ambient shading and bloom reach the picture the 64-bit companion reads");
+    }
     na::j2::flow::SetEnabled(false);
     na::settings::Get().xegtao_enabled.store(0);
     na::settings::Get().donut_bloom.store(0);

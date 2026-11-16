@@ -82,6 +82,8 @@ std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
 std::atomic<uint64_t> resets_cut{0}, resets_changed{0}, resets_gap{0};
 std::atomic<uint64_t> delivered_size{0}, delivered_at{0};
 std::atomic<uint32_t> applied_preset{0}, applied_sharpness{0};
+// Frames whose ambient shading or bloom picture was copied into the shared colour for the companion.
+std::atomic<uint64_t> companion_shaded{0};
 std::atomic<int> raster_slot{-1};
 std::atomic<bool> evaluation_capture_pending{false};
 
@@ -436,11 +438,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     Barrier(list, slot.motion.Get(), kWrite, kRead);
     dlss::EvalDesc eval{};
     eval.color = slot.color.Effects();
-    // The companion reads the shared scene colour itself, so the two optional passes that hand DLSS
-    // a different colour image (ambient shading, tone and bloom) wait for a later step on that route.
-    if (s.companion) {
-        if (settings::Get().xegtao_enabled.load()) xegtao::ScenePass().Unavailable("Not yet available when DLAA runs in the 64-bit companion.");
-    } else if (settings::Get().xegtao_enabled.load()) {
+    // The two optional passes (ambient shading, bloom) each hand DLSS a picture of their own. On the
+    // companion route that picture is copied into the shared scene colour below, because the shared
+    // colour is the one the companion reads.
+    if (settings::Get().xegtao_enabled.load()) {
         xegtao::Inputs ai;
         ai.color = eval.color; ai.depth = shared_depth; ai.motion = slot.motion.Get();
         ai.color_format = cf; ai.width = ci.width; ai.height = ci.height;
@@ -470,7 +471,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     constexpr uint64_t kNativeView = 0x4e41544956453131ull;
     eval.view_id = kNativeView;
     const auto lighting = donut::CurrentOptions();
-    if (!s.companion && (lighting.tone || lighting.bloom)) {
+    if (lighting.tone || lighting.bloom) {
         donut::Inputs gi;
         gi.color = eval.color; gi.format = cf; gi.width = ci.width; gi.height = ci.height;
         gi.srgb = !hdr; gi.reset = reset_history; gi.stream = kNativeView;
@@ -483,6 +484,24 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     ID3D12GraphicsCommandList* before_dlss = nullptr;
     bool evaluated = false;
     if (s.companion) {
+        if (eval.color != slot.color.Effects()) {
+            // Motion and flow above have already read the game's own picture from the shared colour,
+            // and sharpening later uses it only as its target, so nothing else needs the original.
+            constexpr auto kCopyFrom = D3D12_RESOURCE_STATE_COPY_SOURCE, kCopyTo = D3D12_RESOURCE_STATE_COPY_DEST;
+            Barrier(list, eval.color, kRead, kCopyFrom);
+            Barrier(list, slot.color.Effects(), kRead, kCopyTo);
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = slot.color.Effects();
+            to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.pResource = eval.color;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const D3D12_BOX all{0, 0, 0, ci.width, ci.height, 1};
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, &all);
+            Barrier(list, eval.color, kCopyFrom, kRead);
+            Barrier(list, slot.color.Effects(), kCopyTo, kRead);
+            eval.color = slot.color.Effects();
+            companion_shaded.fetch_add(1, std::memory_order_relaxed);
+        }
         Barrier(list, slot.color.Effects(), kRead, kCommon);
         Barrier(list, shared_depth, kRead, kCommon);
         Barrier(list, slot.motion.Get(), kRead, kCommon);
@@ -729,6 +748,12 @@ int FormatStatus(char* out, size_t capacity)
         out[n++] = ' ';
         const int more = dlaa_remote::FormatStatus(out + n, capacity - static_cast<size_t>(n));
         if (more > 0) n += more;
+        // Proof that ambient shading or bloom reached the picture the companion reads.
+        if (static_cast<size_t>(n) + 40 < capacity) {
+            const int tail = std::snprintf(out + n, capacity - static_cast<size_t>(n), " companion_shaded=%llu",
+                                           static_cast<unsigned long long>(companion_shaded.load(std::memory_order_relaxed)));
+            if (tail > 0) n += tail;
+        }
     }
     return n;
 }
