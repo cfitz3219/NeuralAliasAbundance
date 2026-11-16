@@ -1,7 +1,9 @@
 # Camera-independent runtime: independent hardware audit
 
 2026-11-16 — Astra. Audited Fable's `3141125d` runtime at `77afc711`, PR145.
-Audit branch: `astra/camera-independent-runtime-audit`. No production edits, packaging, deployment or game testing.
+Audit branch: `astra/camera-independent-runtime-audit`. No retained production edits, packaging, deployment or game testing. The isolated temporary runtime experiment below was restored after measurement.
+
+**Later increment audited during this task:** Fable's DX12 `9bc4bcd` arrived after the first handoff. Its two blocking findings and a verified correction are in the addendum below. The first DX11 success does not approve the newer DX12 increment for packaging.
 
 ## Verdict
 
@@ -83,3 +85,33 @@ local/audit-build/tests/host/Release/j2_compute_flow_test.exe 1920
 New cold-start CTests are registered in `tests/host/CMakeLists.txt`; no root CMake changes. Tests extend the existing fixtures rather than add a second runtime implementation.
 
 Receipts in `local/audit-build`: `audit-final-build.log`, `audit-final-tests.log`, `audit-final-tests-detail.log`, `flow-audit-detail.log`, `flow-audit-1080p.log`, `flow-baseline-1080p.log`, `cold-direct.log`, `cold-companion.log`, `depth-repro.log`. The first parallel-8 build hit MSVC child-process/communication failures; rebuilding unchanged source at parallel-2 succeeded. The depth-interruption repro was temporary and its source restored; it is not silently included as a passing check. No game run is being claimed and no capture request is needed for R1-R3.
+
+## Addendum: DX12 9bc4bcd — two blocking findings
+
+Built the new increment with the same SDKs and hardware. `na.cpu.depth_direction` and `host_j2_live_test` pass. **`host_j2_no_camera_test` fails ten assertions**. This fixture uses the actual GPU flow/provider but a fake NGX evaluator; it proves runtime delivery/order, not DLSS image quality. I added flow-status output and an optional `--recording-proof` reproduction, not altered expectations to make it pass.
+
+### R4 — P1: private-list reuse permanently stalls the camera-independent path
+
+**Observed:** camera Off delivers frames 2-7, then frame 8 onward reports measurement unavailable. The flow status is precise: `AMD flow already belongs to this executable recording; camera motion used`. Submitted count stays six; busy count rises. When the camera is found it eventually delivers again; when it disappears, six of ten frames are missed. This is a concrete failure of the new path's continuity.
+
+**Cause:** `j2/live_dlaa.cpp` resets its private six-slot command-list ring at the original new line 4205, but does not reset the native recording identity. These private lists do not get that notification through the game's observed Reset hook. `compute_flow::Record` therefore sees an earlier still-executable lease with the same recording token and correctly refuses another use. The missing bookkeeping belongs at private-list reuse, not in the flow validator.
+
+**Verified correction for Fable:** immediately AFTER a successful private allocator/list reset, BEFORE any `RetainRecording`/flow recording on it:
+
+```cpp
+if (!inl) na::nr::native::Reset(s.list.Get());
+```
+
+The slot's existing completed-fence check remains in place. Do not reset a game-owned inline recording here; do not weaken `SameRecording` or grow the six-slot ring.
+
+I applied only that line temporarily, rebuilt, and ran the unchanged expectation set. **Both `host_j2_live_test` and `host_j2_no_camera_test` pass, zero failures, 8.22 seconds.** Thus the runtime intervention resolves the observed stall and the transition cases, rather than merely changing a message. The production source was restored afterwards: Fable owns the production commit. Receipts `dx12-flow-repro.log`, `dx12-reset-experiment-build.log`, `dx12-reset-experiment-tests.log`, `dx12-reset-experiment-detail.log`. The experiment does not fix R5.
+
+### R5 — P1: depth evidence includes command lists which never execute
+
+**Owning code:** `observe/producers.cpp`, new global `g_de_*`, `de_write`, `de_clear`, `vpj_before_draw`, `TakeDepthWriteEvidence`. It counts while commands are recorded and consumes global sums as if they described the chosen scene. The source explicitly calls races approximate. This is insufficient for choosing the depth convention: future, abandoned or other recordings can change the convention used for the current image.
+
+**Executed reproduction:** the new optional mode `j2_no_camera_test.exe --recording-proof` selects the depth, enables evidence, records one GREATER_EQUAL draw and clear0 into a command list, closes it, and **never submits it**. `TakeDepthWriteEvidence` returns **greater=1, clears=1**. The zero-evidence assertion fails. The unused recording alone can therefore provide a convention that the GPU image never used. No race or simulated counters are needed to demonstrate it. Receipt `dx12-recording-proof.log`.
+
+**Correction for Fable:** reuse the existing per-list recording generation/lifetime metadata. Accumulate the small depth summary on that exact recording; associate it with depth incarnation/view; select/combine only the recordings or prefix belonging to the actual scene submission, in execution order. Ignore abandoned recordings, clear their facts on Reset, and preserve a replayed executable recording's facts when it is submitted again. For inline recording, retain the exact scene prefix facts with the pending submission and commit the convention with it, rather than consume arbitrary global writers. This requires no GPU readback and no new graph framework. Keep the last proven convention across a genuinely unknown frame. Add discard/reset, record-ahead and reversed-submission-order cases to this existing fixture.
+
+**DX12 verdict:** request these corrections before packaging. R4 has an already-tested fix; R5 has an exact failing reproduction and an implementation seam. R1's interrupted-proof behavior also remains in the shared depth rule. No additional user run is needed to work on any of these findings.
