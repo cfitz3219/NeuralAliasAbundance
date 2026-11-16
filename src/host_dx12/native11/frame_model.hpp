@@ -283,6 +283,7 @@ public:
         bool read = false;      // a read of `target` (only targets the host reports reads for)
         Id target = 0, depth = 0;
         uint32_t draws = 0, multi = 0, tested = 0;
+        uint64_t vertices = 0;  // of all the run's draws: a few per draw is a full-screen pass, many is geometry
     };
     const std::vector<FlowStep>& LastFlow() const { return last_flow_; }
     uint32_t LastFlowDropped() const { return last_flow_dropped_; }
@@ -506,26 +507,26 @@ private:
     struct TargetUse { uint64_t last_draw = 0, first_read = 0, read_after = 0, last_read = 0; }; // event order within the frame
 
     static constexpr size_t kFlowSteps = 96;
-    void NoteFlow(bool read, Id target, Id depth, bool multi, bool tested)
+    void NoteFlow(bool read, Id target, Id depth, bool multi, bool tested, uint64_t vertices = 0)
     {
         if (!flow_.empty()) {
             FlowStep& b = flow_.back();
             if (b.read == read && b.target == target && b.depth == depth) {
-                if (!read) { ++b.draws; b.multi += multi; b.tested += tested; }
+                if (!read) { ++b.draws; b.multi += multi; b.tested += tested; b.vertices += vertices; }
                 return;
             }
         }
         if (flow_.size() >= kFlowSteps) { ++flow_dropped_; return; }
         FlowStep f;
         f.read = read; f.target = target; f.depth = depth;
-        if (!read) { f.draws = 1; f.multi = multi; f.tested = tested; }
+        if (!read) { f.draws = 1; f.multi = multi; f.tested = tested; f.vertices = vertices; }
         flow_.push_back(f);
     }
 
     void Draw(const Event& e)
     {
         ++draws_;
-        NoteFlow(false, e.rt0, e.depth, e.rt_count > 1, e.depth_test);
+        NoteFlow(false, e.rt0, e.depth, e.rt_count > 1, e.depth_test, e.vertices);
         if (e.depth) {
             Cand& d = depth_[e.depth];
             ++d.draws;

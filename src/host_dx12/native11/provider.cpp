@@ -297,6 +297,12 @@ std::atomic<Id> g_sel_depth2{0}; // the second depth the picture is drawn with (
 std::atomic<uint32_t> g_sel_depth_w{0}, g_sel_depth_h{0};
 uint32_t g_vpj_frame_draws = 0; // executed scene draws with a nonzero sample, under g_mu
 uint32_t g_vpj_frame_unshifted = 0; // draws into the scene colour left unshifted on a shifted frame, under g_mu
+// WHY log, under g_mu: how much of a shifted frame's geometry carried the sample, by vertices, and
+// the meshes drawn with the scene depth bound that kept the game's own viewport (DLSS gets no
+// sub-pixel samples for those: their edges stay as the game drew them).
+uint64_t g_vpj_frame_shifted_vertices = 0, g_vpj_frame_still_vertices = 0;
+uint32_t g_vpj_frame_still_meshes = 0, g_vpj_frame_still_untested = 0;
+constexpr uint64_t kFullScreenPassVertices = 6; // two triangles: more than this is a mesh
 std::atomic<uint64_t> g_vpj_unshifted{0};
 std::atomic<uint64_t> g_vpj_told{0}; // the sample last handed to the consumer (two floats, pixels)
 uint64_t g_vpj_executed_sample = 0;
@@ -1162,12 +1168,15 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
             std::memcpy(shift, &g_vpj_executed_sample, sizeof shift);
             na::eventlog::Emit("native11_jitter",
                                "frame=%llu route=%s told_px=%.4f,%.4f viewport_shift_px=%.4f,%.4f applied=%d shifted_draws=%u "
-                               "unshifted_colour_draws=%u scene_draws=%u held=%d scene=%.0fx%.0f depth=%ux%u",
+                               "unshifted_colour_draws=%u scene_draws=%u held=%d scene=%.0fx%.0f depth=%ux%u "
+                               "shifted_vertices=%llu still_meshes{draws=%u untested=%u vertices=%llu}",
                                static_cast<unsigned long long>(g_frame), vpj_route ? "viewport" : "matrix",
                                f.camera.jitter_px[0], f.camera.jitter_px[1], shift[0], shift[1], f.camera.jitter_applied ? 1 : 0,
                                g_vpj_frame_draws, g_vpj_frame_unshifted, g_model.SceneDrawsThisFrame(), held ? 1 : 0,
                                g_scene_vp_w, g_scene_vp_h, g_sel_depth_w.load(std::memory_order_relaxed),
-                               g_sel_depth_h.load(std::memory_order_relaxed));
+                               g_sel_depth_h.load(std::memory_order_relaxed),
+                               static_cast<unsigned long long>(g_vpj_frame_shifted_vertices), g_vpj_frame_still_meshes,
+                               g_vpj_frame_still_untested, static_cast<unsigned long long>(g_vpj_frame_still_vertices));
         }
         uint64_t told = 0;
         std::memcpy(&told, f.camera.jitter_px, sizeof told);
@@ -1331,6 +1340,15 @@ void NoteViewportDraw(const Event& e)
     // depth-tested scene draws were shifted (full-screen and untested passes).
     if (!e.viewport_sample && g_vpj_executed_sample && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed))
         ++g_vpj_frame_unshifted;
+    if (e.viewport_sample) {
+        g_vpj_frame_shifted_vertices += e.vertices;
+    } else if (g_vpj_sample.load(std::memory_order_relaxed) && e.depth && e.vertices > kFullScreenPassVertices &&
+               (e.depth == g_sel_depth.load(std::memory_order_relaxed) || e.depth == g_sel_depth2.load(std::memory_order_relaxed))) {
+        // The sample is still live (the picture has not been handed over) and this mesh did not take it.
+        ++g_vpj_frame_still_meshes;
+        g_vpj_frame_still_untested += e.depth_test ? 0u : 1u;
+        g_vpj_frame_still_vertices += e.vertices;
+    }
     if (!e.depth_test || !g_model.IsSceneDraw(e)) return;
     if (!g_vpj_seen_draw) {
         g_vpj_seen_draw = true;
@@ -2287,10 +2305,18 @@ bool OnPresent(IDXGISwapChain* swap)
             static uint32_t flows = 0;
             if (flows < 16) {
                 ++flows;
+                // A long frame goes out as several lines (part=1, 2, ...): one event line holds about 4,000 characters.
                 char flow[3600] = "";
                 int fa = 0;
+                unsigned part = 1;
+                const auto emit = [&] {
+                    na::eventlog::Emit("native11_flow", "frame=%llu steps=%u dropped=%u part=%u:%s", static_cast<unsigned long long>(g_frame),
+                                       static_cast<unsigned>(g_model.LastFlow().size()), g_model.LastFlowDropped(), part++, flow);
+                    fa = 0;
+                    flow[0] = 0;
+                };
                 for (const auto& f : g_model.LastFlow()) {
-                    if (fa >= static_cast<int>(sizeof flow) - 120) break;
+                    if (fa >= static_cast<int>(sizeof flow) - 140) emit();
                     ResourceInfo ri{};
                     g_model.InfoOf(f.target, ri);
                     const unsigned tag = static_cast<unsigned>((f.target >> 4) & 0xfff);
@@ -2303,12 +2329,12 @@ bool OnPresent(IDXGISwapChain* swap)
                         if (f.depth)
                             std::snprintf(z, sizeof z, "z#%03x%s", static_cast<unsigned>((f.depth >> 4) & 0xfff),
                                           f.depth == s.depth ? "=scene" : f.depth == note.second_depth ? "=second" : "");
-                        fa += std::snprintf(flow + fa, sizeof flow - fa, " [d #%03x fmt=%u %ux%u %s n=%u multi=%u tested=%u %s]", tag, ri.format,
-                                            ri.width, ri.height, z, f.draws, f.multi, f.tested, role);
+                        // v= all the run's vertices: a few per draw is a full-screen pass, many is geometry.
+                        fa += std::snprintf(flow + fa, sizeof flow - fa, " [d #%03x fmt=%u %ux%u %s n=%u multi=%u tested=%u v=%llu %s]", tag, ri.format,
+                                            ri.width, ri.height, z, f.draws, f.multi, f.tested, static_cast<unsigned long long>(f.vertices), role);
                     }
                 }
-                na::eventlog::Emit("native11_flow", "frame=%llu steps=%u dropped=%u:%s", static_cast<unsigned long long>(g_frame),
-                                   static_cast<unsigned>(g_model.LastFlow().size()), g_model.LastFlowDropped(), flow);
+                if (fa || part == 1) emit();
             }
         }
     }
@@ -2324,6 +2350,8 @@ bool OnPresent(IDXGISwapChain* swap)
     g_vpj_frame_draws = 0;
     g_vpj_unshifted.fetch_add(g_vpj_frame_unshifted, std::memory_order_relaxed);
     g_vpj_frame_unshifted = 0;
+    g_vpj_frame_shifted_vertices = g_vpj_frame_still_vertices = 0;
+    g_vpj_frame_still_meshes = g_vpj_frame_still_untested = 0;
     g_vpj_seen_draw = g_vpj_mixed = false;
     g_vpj_executed_sample = 0;
     g_vpj_executed_expanded = false;
