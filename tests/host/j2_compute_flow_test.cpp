@@ -150,6 +150,15 @@ int main(int argc,char**){
                 if(i>0&&i<8){still+=error/n;++sn;}if(i>=8){moving+=error/n;++mn;}
             }
             std::printf("real raster + remembered Unjittered, confirmed=%d: stationary motion %.4f px, moving error %.4f px\n",confirmed,still/sn,moving/mn);
+            // R3 (Astra's audit, 2026-11-16): at 1920x1080 the moving error is the whole pan, i.e. no
+            // correction was applied. These are the fit's own admission counters (running totals, and
+            // the last fit's numbers), so one run names the gate that refused it. Diagnostic only.
+            {const auto fs=cf::GetStats();
+             std::printf("  camera fit %ux%u: recorded %llu collected %llu accepted %llu | flow test passed %llu, refused by the image check %llu, by the jitter test %llu | last fit: samples %u -> %u, energy %.4f -> %.4f (other hypothesis %.4f), accepted %d | image check: cells %u better %u worse %u, regions %u good %u, error fit %.4f camera %.4f\n",
+                 w,h,(unsigned long long)fs.fit_recorded,(unsigned long long)fs.fit_collected,(unsigned long long)fs.fit_accepted,
+                 (unsigned long long)fs.fit_flow_passed,(unsigned long long)fs.fit_rejected_image,(unsigned long long)fs.fit_rejected_jitter,
+                 fs.fit_n0,fs.fit_n,fs.fit_e0,fs.fit_e,fs.fit_e_alt,fs.fit_last_accepted?1:0,
+                 fs.fit_photo_tested,fs.fit_photo_better,fs.fit_photo_worse,fs.fit_photo_regions,fs.fit_photo_good,fs.fit_photo_e_fit,fs.fit_photo_e_cam);}
             if(confirmed){CHECK(still/sn<.08);CHECK(moving/mn<.35);}
             else CHECK(still/sn>.15); // old failure is reproduced on the identical pictures
         }

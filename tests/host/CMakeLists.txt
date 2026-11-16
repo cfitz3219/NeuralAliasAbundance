@@ -237,9 +237,9 @@ if(NA_HAVE_NGX_SDK)
   # The same host with no scene camera: never looked for, lost mid-play, required (fake runtime, WARP-capable).
   na_host_test(j2_no_camera_test SOURCES j2_no_camera_test.cpp LIBS host_dx12 dxgi d3dcompiler)
   # Only recordings the queue was really given prove the depth direction (never submitted, Reset,
-  # recorded ahead, submitted in reverse order).
+  # recorded ahead, submitted in reverse order). Needs no measured motion: WARP-capable, runs in CI.
   add_test(NAME host_j2_no_camera_recording_proof_test COMMAND j2_no_camera_test --recording-proof)
-  set_tests_properties(host_j2_no_camera_recording_proof_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  set_tests_properties(host_j2_no_camera_recording_proof_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host")
   add_test(NAME host_j2_native_scale_test COMMAND j2_live_test --native-scale)
   add_test(NAME host_j2_native_scale_merged_test COMMAND j2_live_test --native-scale-merged)
   add_test(NAME host_j2_native_scale_graphics_test COMMAND j2_live_test --native-scale-graphics)
