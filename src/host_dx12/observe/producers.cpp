@@ -66,39 +66,34 @@ struct DescHeap;
 // Recordings with a pinned viewport sample may still need it after the global
 // request goes away. Only an entirely idle jitter path can skip the list locks.
 std::atomic<uint64_t> g_vpj_recordings{0};
-// Depth direction evidence (SetDepthWriteEvidence): recording-time sums for the live scene depth
-// since the last Take. Approximate under races by design: it is a vote, not a ledger.
+// Depth direction evidence (SetDepthWriteEvidence). The facts belong to the RECORDING they were
+// recorded in (ListState::de, cleared when the list is Reset) and say nothing until that recording
+// is submitted: a list recorded ahead, discarded or reset proves nothing about the picture on
+// screen (Astra's R5, 2026-11-16). The host adds up the recordings it actually submits, in
+// execution order (ListDepthWriteEvidence). This switch only says whether recordings keep them.
 std::atomic<bool> g_de_on{false};
-std::atomic<uint64_t> g_de_depth{0};
-std::atomic<uint32_t> g_de_less{0}, g_de_greater{0}, g_de_equal{0}, g_de_other{0}, g_de_clears{0}, g_de_clear_bits{0};
-std::atomic<bool> g_de_clear_mixed{false};
-void de_select(uint64_t depth)
-{
-    if (g_de_depth.load(std::memory_order_relaxed) == depth) return;
-    g_de_depth.store(depth, std::memory_order_relaxed);
-    g_de_less.store(0, std::memory_order_relaxed); g_de_greater.store(0, std::memory_order_relaxed);
-    g_de_equal.store(0, std::memory_order_relaxed); g_de_other.store(0, std::memory_order_relaxed);
-    g_de_clears.store(0, std::memory_order_relaxed); g_de_clear_mixed.store(false, std::memory_order_relaxed);
-}
-void de_write(uint64_t depth, uint32_t func)
-{
-    de_select(depth);
-    auto& n = func == D3D12_COMPARISON_FUNC_LESS || func == D3D12_COMPARISON_FUNC_LESS_EQUAL ? g_de_less
-            : func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL ? g_de_greater
-            : func == D3D12_COMPARISON_FUNC_EQUAL ? g_de_equal : g_de_other;
-    n.fetch_add(1, std::memory_order_relaxed);
-}
-void de_clear(uint64_t resource, float value)
-{
-    uint64_t sel_depth = 0, sel_color = 0;
-    GetLiveSelection(&sel_depth, &sel_color);
-    if (!resource || resource != sel_depth) return;
-    de_select(sel_depth);
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof bits);
-    const uint32_t before = g_de_clear_bits.exchange(bits, std::memory_order_relaxed);
-    if (g_de_clears.fetch_add(1, std::memory_order_relaxed) && before != bits) g_de_clear_mixed.store(true, std::memory_order_relaxed);
-}
+struct DepthWrites {
+    uint64_t depth = 0;             // the scene depth these facts are about (0 = none yet)
+    uint32_t less = 0, greater = 0, equal = 0, other = 0, clears = 0, clear_bits = 0;
+    bool clear_mixed = false;
+    void select(uint64_t d) { if (depth != d) { *this = DepthWrites{}; depth = d; } }
+    void write(uint64_t d, uint32_t func)
+    {
+        select(d);
+        ++(func == D3D12_COMPARISON_FUNC_LESS || func == D3D12_COMPARISON_FUNC_LESS_EQUAL ? less
+         : func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL ? greater
+         : func == D3D12_COMPARISON_FUNC_EQUAL ? equal : other);
+    }
+    void clear(uint64_t d, float value)
+    {
+        select(d);
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof bits);
+        if (clears && clear_bits != bits) clear_mixed = true;
+        clear_bits = bits;
+        ++clears;
+    }
+};
 float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
 struct ListState {
     uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
@@ -221,6 +216,7 @@ struct ListState {
     // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
     bool vpj_applied = false;
     uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
+    DepthWrites de; // this recording's depth-writing draws and clears of the scene depth (bind_m)
     ~ListState() { if (vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release); }
 };
 
@@ -3630,6 +3626,17 @@ void with_list_state(const void* l, F&& f)
     na_object_id id = 0;
     if (ListState* ls = list_state_locked(l, &id)) f(*ls);
 }
+// A clear of the live scene depth, kept with the recording it was recorded in.
+void de_clear(const void* l, uint64_t resource, float value)
+{
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!resource || resource != sel_depth) return;
+    with_list_state(l, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        ls.de.clear(sel_depth, value);
+    });
+}
 
 constexpr size_t kMaxListUses = 4096;
 void add_use_locked(ListState& ls, na_object_id id)
@@ -3890,6 +3897,7 @@ struct On<sl::list::Reset> {
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
                     ls->cur_nrt = 0;
+                    ls->de = DepthWrites{}; // a new recording: the old one's depth facts go with it
                     ls->native_colors.clear();
                     ls->native_depth.reset();
                     ls->restorable = true;
@@ -4585,7 +4593,7 @@ struct On<sl::list::ClearDepthStencilView> {
         if (!begin_op(l, &r)) return;
         const na_view_ref v = cpu_ref(h);
         emit_op(r, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(f), float_bits(depth, 0.f), stencil}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
-        if ((f & D3D12_CLEAR_FLAG_DEPTH) && g_de_on.load(std::memory_order_relaxed)) de_clear(v.resource, depth);
+        if ((f & D3D12_CLEAR_FLAG_DEPTH) && g_de_on.load(std::memory_order_relaxed)) de_clear(l, v.resource, depth);
         note_uses(l, {v.resource});
         if ((f & D3D12_CLEAR_FLAG_DEPTH) && v.resource && v.first_subresource != NA_UNKNOWN_U32)
             with_list_state(l, [&](ListState& ls) {
@@ -4710,7 +4718,7 @@ struct On<sl::list::BeginRenderPass> {
                 const auto& v = ds->DepthBeginningAccess.Clear.ClearValue.DepthStencil;
                 emit_op(rc, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(D3D12_CLEAR_FLAG_DEPTH), float_bits(v.Depth, 0.f), v.Stencil}, &refs[m - 1],
                         sizeof(refs[m - 1]), sizeof(refs[m - 1]), 0, NA_GROUP_RESOURCE_USE);
-                if (g_de_on.load(std::memory_order_relaxed)) de_clear(refs[m - 1].resource, v.Depth);
+                if (g_de_on.load(std::memory_order_relaxed)) de_clear(l, refs[m - 1].resource, v.Depth);
             }
         }
         with_list_state(l, [&](ListState& ls) {
@@ -5273,7 +5281,7 @@ void vpj_before_draw(GL* l)
         // A Present on another thread must not change half a scene recording's
         // sample. The first eligible draw owns it until this list is Reset.
         const na_ev_pipeline_created* pc = sel_depth && ls->cur_ds == sel_depth ? pso_created_locked(*ls) : nullptr;
-        if (evidence && pc && pc->depth_enable == 1 && pc->depth_write == 1) de_write(sel_depth, pc->depth_func);
+        if (evidence && pc && pc->depth_enable == 1 && pc->depth_write == 1) ls->de.write(sel_depth, pc->depth_func);
         if (!moving) return; // counted only: no viewport of the game's is touched
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
         bool want = sample && sel_depth && ls->cur_ds == sel_depth;
@@ -9117,23 +9125,21 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y)
     g_vpj.store(uint64_t(f32) << 32 | uint64_t(q(x)) << 16 | q(y), std::memory_order_release);
 }
 void SetDepthWriteEvidence(bool on) { g_de_on.store(on, std::memory_order_relaxed); }
-DepthWriteEvidence TakeDepthWriteEvidence(uint64_t depth)
+DepthWriteEvidence ListDepthWriteEvidence(ID3D12CommandList* list, uint64_t depth)
 {
     DepthWriteEvidence e;
-    e.depth = g_de_depth.load(std::memory_order_relaxed);
-    e.less = g_de_less.exchange(0, std::memory_order_relaxed);
-    e.greater = g_de_greater.exchange(0, std::memory_order_relaxed);
-    e.equal = g_de_equal.exchange(0, std::memory_order_relaxed);
-    e.other = g_de_other.exchange(0, std::memory_order_relaxed);
-    e.clears = g_de_clears.exchange(0, std::memory_order_relaxed);
-    const uint32_t bits = g_de_clear_bits.load(std::memory_order_relaxed);
-    std::memcpy(&e.clear, &bits, sizeof bits);
-    e.clear_mixed = g_de_clear_mixed.exchange(false, std::memory_order_relaxed);
-    if (e.depth != depth) { // counted for another depth: no evidence about this one
-        const uint64_t counted_for = e.depth;
-        e = DepthWriteEvidence{};
-        e.depth = counted_for;
-    }
+    if (!list || !depth) return e;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list_state_locked(list, &id);
+    if (!ls) return e;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    const DepthWrites& d = ls->de;
+    if (d.depth != depth) return e; // nothing recorded about this depth
+    e.depth = d.depth;
+    e.less = d.less; e.greater = d.greater; e.equal = d.equal; e.other = d.other;
+    e.clears = d.clears; e.clear_mixed = d.clear_mixed;
+    std::memcpy(&e.clear, &d.clear_bits, sizeof d.clear_bits);
     return e;
 }
 void SetReplayProbe(bool on) { g_rp_on.store(on, std::memory_order_relaxed); }

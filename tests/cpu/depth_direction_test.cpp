@@ -132,6 +132,33 @@ int main()
             CHECK(Play(d, Reversed(), 1, &why) == DepthCompare::NearIsGreater && why == DepthVerdict::Proven);
             CHECK(d.Flips() == 1);
         }},
+        {"opposite proofs must be in a row: a frame that proves nothing, or is skipped, starts the count again", [] {
+            // Astra's R1 (2026-11-16): LESS proven; GREATER; empty; GREATER; empty; GREATER must not flip.
+            DepthDirection d;
+            DepthVerdict why{};
+            FrameSpec menu;
+            CHECK(Play(d, Standard()) == DepthCompare::NearIsLess);
+            for (int i = 0; i < 3; ++i) {
+                CHECK(Play(d, Reversed(), 1, &why) == DepthCompare::NearIsLess && why == DepthVerdict::Kept);
+                CHECK(Play(d, menu, 1, &why) == DepthCompare::NearIsLess && why == DepthVerdict::Kept);
+            }
+            CHECK(d.Flips() == 0);
+            // The same with frames that were never decided (not handed over): only EndFrame ran.
+            DepthDirection s;
+            CHECK(Play(s, Standard()) == DepthCompare::NearIsLess);
+            for (int i = 0; i < 3; ++i) {
+                CHECK(Play(s, Reversed()) == DepthCompare::NearIsLess);
+                s.NoteClear(0.f);
+                for (int k = 0; k < 40; ++k) s.NoteWrite(kCompareGreaterEqual);
+                s.EndFrame(); // gathered, never decided
+            }
+            CHECK(s.Flips() == 0);
+            // Three in a row still turn it round, also right after such an interrupted run.
+            CHECK(Play(s, Reversed()) == DepthCompare::NearIsLess);
+            CHECK(Play(s, Reversed()) == DepthCompare::NearIsLess);
+            CHECK(Play(s, Reversed(), 1, &why) == DepthCompare::NearIsGreater && why == DepthVerdict::Proven);
+            CHECK(s.Flips() == 1);
+        }},
         {"another depth buffer starts from nothing", [] {
             DepthDirection d;
             DepthVerdict why{};

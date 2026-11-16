@@ -17,13 +17,16 @@
 //  - writes that all agree while the clear says the opposite.
 // A direction, once proven for a depth buffer, is kept across frames that prove nothing (a menu,
 // a frame of EQUAL-only draws). It changes only when the opposite is proven on kFlipFrames frames
-// in a row, and it is forgotten when another depth buffer is selected. Until one is proven nothing
-// is assumed: the caller reports why and does not guess. The depth values themselves are never
-// touched (raw z/w goes on as the game wrote it).
+// in a row: a frame in between that proves nothing, or that was never decided at all, starts that
+// count again (Astra's R1, 2026-11-16). It is forgotten when another depth buffer is selected.
+// Until one is proven nothing is assumed: the caller reports why and does not guess. The depth
+// values themselves are never touched (raw z/w goes on as the game wrote it).
 //
 // Portable C++17 (Linux-tested, tests/cpu/depth_direction_test.cpp). One rule for both hosts: the
-// DX11 provider fills it from its draw events, the DX12 host (j2/live_dlaa.cpp) from the sums the
-// observe layer counts while asked (observe/producers.hpp DepthWriteEvidence).
+// DX11 provider fills it from its draw events (immediate order is execution order there). The DX12
+// host (j2/live_dlaa.cpp) fills it from the facts each recording keeps (observe/producers.hpp
+// DepthWriteEvidence), and only for the recordings the queue is really given, in that order
+// (Astra's R5): the rule advances once a frame, at Present, and a hand-over asks a copy of it.
 #pragma once
 
 #include <cstdint>
@@ -119,8 +122,8 @@ public:
         frame_.clear = value;
         ++frame_.clears;
     }
-    // The same evidence, already summed by its gatherer (the DX12 host: observe's DepthWriteEvidence
-    // counts the draws as they are recorded; the DX11 provider notes them one by one above).
+    // The same evidence, already summed by its gatherer (the DX12 host adds the sums of the
+    // recordings it submits; the DX11 provider notes its draws one by one above).
     void NoteSummed(const DepthEvidence& e)
     {
         frame_.less += e.less; frame_.greater += e.greater; frame_.equal += e.equal; frame_.other += e.other;
@@ -150,14 +153,22 @@ public:
                 against_ = 0;
                 ++flips_;
             } else why = DepthVerdict::Kept; // the opposite, not yet for long enough
-        } else if (proven_ != DepthCompare::None) {
-            why = DepthVerdict::Kept;
+        } else {
+            against_ = 0; // nothing proven this frame: opposite proofs so far were not in a row
+            if (proven_ != DepthCompare::None) why = DepthVerdict::Kept;
         }
+        decided_ = true;
         if (verdict) *verdict = why;
         return proven_;
     }
-    // The frame is over (Present): the next frame's evidence starts empty. What is proven stays.
-    void EndFrame() { frame_ = {}; }
+    // The frame is over (Present): the next frame's evidence starts empty. What is proven stays. A
+    // frame that was never decided (not handed over) also ends a run of opposite proofs.
+    void EndFrame()
+    {
+        if (!decided_) against_ = 0;
+        decided_ = false;
+        frame_ = {};
+    }
     void Reset() { *this = {}; }
 
     DepthCompare Proven() const { return proven_; }
@@ -170,6 +181,7 @@ private:
     DepthCompare proven_ = DepthCompare::None;
     uint64_t depth_ = 0, flips_ = 0;
     uint32_t against_ = 0;
+    bool decided_ = false; // Decide ran since the last EndFrame
 };
 
 } // namespace na::native11

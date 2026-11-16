@@ -17,6 +17,11 @@
 //     frames as before, then measured, with the raster sample moved to the viewports). No frame
 //     waits for the camera.
 //  4. [j2] camera = 2: a frame without a camera waits for one, as before 2026-11-16.
+// --recording-proof (Astra's R5, 2026-11-16): the depth direction is proven only by recordings the
+// queue was really given, in the order it was given them. A recording that is closed and never
+// submitted, one that is Reset, and one recorded a frame ahead prove nothing until (and unless)
+// they are submitted; two recordings submitted in the reverse of their recording order count in
+// submission order. This needs no measured motion: it runs the same on WARP and on a real card.
 // Where this build or device cannot measure motion at all (the flow engine's shaders need DXC at
 // build time), frames without a camera are left as the game drew them with that reason, nothing is
 // latched, and the camera phases still deliver: the test says which of the two it saw.
@@ -145,8 +150,8 @@ int main(int argc, char** argv)
     }
     // The scene's one pipeline: tests the depth with GREATER_EQUAL and writes it (a reversed-depth
     // game), and paints a blocky pattern that `shift` slides across the picture.
-    test::ComPtr<ID3D12PipelineState> pso;
-    {
+    test::ComPtr<ID3D12PipelineState> pso, pso_no_write, pso_less;
+    const auto make_pso = [&](D3D12_DEPTH_WRITE_MASK write, D3D12_COMPARISON_FUNC func, test::ComPtr<ID3D12PipelineState>& out) {
         constexpr char code[] = R"(cbuffer C : register(b0) { float4 other[4]; float2 shift; };
 float4 VS(uint i : SV_VertexID) : SV_Position { float2 uv = float2((i << 1) & 2, i & 2); return float4(uv.x * 2 - 1, 1 - uv.y * 2, .5, 1); }
 float4 PS(float4 p : SV_Position) : SV_Target
@@ -173,10 +178,16 @@ float4 PS(float4 p : SV_Position) : SV_Target
         pd.RTVFormats[0] = kColor;
         pd.DSVFormat = kDepthView;
         pd.DepthStencilState.DepthEnable = TRUE;
-        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-        REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso))));
-    }
+        pd.DepthStencilState.DepthWriteMask = write;
+        pd.DepthStencilState.DepthFunc = func;
+        REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&out))));
+        return 0;
+    };
+    REQUIRE(make_pso(D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_GREATER_EQUAL, pso) == 0);
+    // For --recording-proof: a scene that only tests the depth (proves nothing), and one that
+    // writes it the other way round.
+    REQUIRE(make_pso(D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_GREATER_EQUAL, pso_no_write) == 0);
+    REQUIRE(make_pso(D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_LESS_EQUAL, pso_less) == 0);
     uint8_t* cpu = nullptr;
     REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu); // persistent, like a game's upload ring
     const D3D12_GPU_VIRTUAL_ADDRESS va = cb->GetGPUVirtualAddress();
@@ -187,8 +198,29 @@ float4 PS(float4 p : SV_Position) : SV_Target
     bool camera_in_scene = true;
     uint8_t camera_bytes[64]{}; // the camera matrix as the game wrote it this frame
     int number = 0;
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(W), static_cast<float>(H), 0, 1};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(W), static_cast<LONG>(H)};
+    // The scene's one draw with a pipeline, into the bound colour and depth.
+    const auto draw = [&](ID3D12GraphicsCommandList* l, ID3D12PipelineState* with) {
+        l->SetGraphicsRootSignature(rs.Get());
+        ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
+        l->SetDescriptorHeaps(1, heaps);
+        l->SetGraphicsRootConstantBufferView(0, va + 1024);
+        l->SetGraphicsRootDescriptorTable(1, cbvh->GetGPUDescriptorHandleForHeapStart()); // camera (table CBV)
+        l->SetPipelineState(with);
+        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        l->RSSetViewports(1, &viewport);
+        l->RSSetScissorRects(1, &scissor);
+        l->DrawInstanced(3, 1, 0, 0);
+    };
+    struct FrameOptions {
+        ID3D12PipelineState* with = nullptr; // the scene draw's pipeline (none = the depth-writing one)
+        bool clear_depth = true;
+        ID3D12CommandList* ahead = nullptr;  // a closed recording of the game's, submitted before the scene list
+    };
+    size_t lists_given = 0;
     // One game frame: Present, the scene list (clear, the draw), the list that reads the scene.
-    const auto frame = [&](const char* what) {
+    const auto frame = [&](const char* what, const FrameOptions& o = FrameOptions{}) {
         d.WaitIdle();
         if (number) na::j2::OnPresent(d.queue.Get());
         ++number;
@@ -213,19 +245,8 @@ float4 PS(float4 p : SV_Position) : SV_Target
         l->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         const float clear[4] = {0.2f, 0.3f, 0.4f, 1};
         l->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
-        l->SetGraphicsRootSignature(rs.Get());
-        ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
-        l->SetDescriptorHeaps(1, heaps);
-        l->SetGraphicsRootConstantBufferView(0, va + 1024);
-        l->SetGraphicsRootDescriptorTable(1, cbvh->GetGPUDescriptorHandleForHeapStart()); // camera (table CBV)
-        l->SetPipelineState(pso.Get());
-        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(W), static_cast<float>(H), 0, 1};
-        const D3D12_RECT scissor{0, 0, static_cast<LONG>(W), static_cast<LONG>(H)};
-        l->RSSetViewports(1, &viewport);
-        l->RSSetScissorRects(1, &scissor);
-        l->DrawInstanced(3, 1, 0, 0);
+        if (o.clear_depth) l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+        draw(l, o.with ? o.with : pso.Get());
         D3D12_RESOURCE_BARRIER out = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         l->ResourceBarrier(1, &out);
         REQUIRE(SUCCEEDED(l->Close()));
@@ -234,10 +255,15 @@ float4 PS(float4 p : SV_Position) : SV_Target
                                           test::Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON)};
         consumer.list->ResourceBarrier(2, back);
         REQUIRE(SUCCEEDED(consumer.list->Close()));
-        ID3D12CommandList* lists[] = {scene.list.Get(), consumer.list.Get()};
+        ID3D12CommandList* lists[3] = {};
+        UINT count = 0;
+        if (o.ahead) lists[count++] = o.ahead;
+        lists[count++] = scene.list.Get();
+        lists[count++] = consumer.list.Get();
+        lists_given = count;
         g_forwarded.clear();
         const int evals = fake::evals;
-        na::j2::Execute(d.queue.Get(), 2, lists, &Forward);
+        na::j2::Execute(d.queue.Get(), count, lists, &Forward);
         d.WaitIdle();
         const auto s = na::j2::GetStats();
         const auto flow = na::j2::compute_flow::GetStats();
@@ -266,39 +292,112 @@ float4 PS(float4 p : SV_Position) : SV_Target
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
 
     if (argc > 1 && std::strcmp(argv[1], "--recording-proof") == 0) {
-        // Audit regression: a recording which is never executed cannot prove how the selected
-        // scene depth was written. This mode intentionally exposes the 9bc4bcd global vote bug.
-        na::observe::SetDepthWriteEvidence(true);
+        // Astra's R5: which recordings may prove the depth direction. The scene list itself only
+        // TESTS the depth here (no write, no clear), so whatever is proven comes from the other
+        // recordings, and only once the queue has been given them.
         const auto depth_id = na::observe::IdOf(depth.Get());
-        na::observe::TakeDepthWriteEvidence(depth_id);
-        scene.Reset();
-        auto* l = scene.list.Get();
-        const D3D12_RESOURCE_BARRIER transitions[2] = {
-            test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
-            test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
-        l->ResourceBarrier(2, transitions);
-        l->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-        l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.f, 0, 0, nullptr);
-        l->SetGraphicsRootSignature(rs.Get());
-        ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
-        l->SetDescriptorHeaps(1, heaps);
-        l->SetGraphicsRootConstantBufferView(0, va + 1024);
-        l->SetGraphicsRootDescriptorTable(1, cbvh->GetGPUDescriptorHandleForHeapStart());
-        l->SetPipelineState(pso.Get());
-        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const D3D12_VIEWPORT vp{0, 0, float(W), float(H), 0, 1};
-        const D3D12_RECT rect{0, 0, LONG(W), LONG(H)};
-        l->RSSetViewports(1, &vp); l->RSSetScissorRects(1, &rect);
-        l->DrawInstanced(3, 1, 0, 0);
-        REQUIRE(SUCCEEDED(l->Close()));
-        const auto evidence = na::observe::TakeDepthWriteEvidence(depth_id);
-        std::printf("never-submitted depth recording: less=%u greater=%u clears=%u (all must be zero)\n",
-                    evidence.less, evidence.greater, evidence.clears);
-        CHECK(evidence.less == 0 && evidence.greater == 0 && evidence.clears == 0);
-        na::observe::SetDepthWriteEvidence(false);
-        na::j2::SetEnabled(false); na::j2::Shutdown(); na::dlss::Shutdown();
+        na::settings::Get().j2_camera.store(0);
+        FrameOptions plain; // a scene that proves nothing by itself
+        plain.with = pso_no_write.Get();
+        plain.clear_depth = false;
+        // A recording of the game's that clears the scene depth and writes it with one draw. It
+        // leaves both textures as it found them, so it can go to the queue before the scene list.
+        const auto record_writes = [&](test::List& t, ID3D12PipelineState* with, float clear_to) {
+            t.Reset();
+            ID3D12GraphicsCommandList* l = t.list.Get();
+            D3D12_RESOURCE_BARRIER in[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                                            test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
+            l->ResourceBarrier(2, in);
+            l->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+            l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, clear_to, 0, 0, nullptr);
+            draw(l, with);
+            D3D12_RESOURCE_BARRIER out[2] = {test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON),
+                                             test::Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON)};
+            l->ResourceBarrier(2, out);
+            return SUCCEEDED(l->Close());
+        };
+        const auto facts = [&](const char* what, test::List& t) {
+            const auto e = na::observe::ListDepthWriteEvidence(t.list.Get(), depth_id);
+            std::printf("%-46s recording holds: less %u greater %u clears %u clear %.1f\n", what, e.less, e.greater, e.clears, e.clear);
+            return e;
+        };
+        test::List a, b;
+        REQUIRE(a.Create(dev) && b.Create(dev));
+        REQUIRE(SUCCEEDED(a.list->Close()) && SUCCEEDED(b.list->Close()));
+
+        // The counting starts with the first frame that has no camera.
+        REQUIRE(frame("proof: counting starts", plain) == 0);
+        auto st = na::j2::GetStats();
+        CHECK(st.depth_evidence && st.depth_near == 0 && st.depth_unproven == 1);
+
+        // 1. Recorded and closed, never submitted: the recording holds its facts, the frame has none.
+        REQUIRE(record_writes(a, pso.Get(), 0.0f));
+        auto e = facts("recorded, closed, not submitted:", a);
+        CHECK(e.greater == 1 && e.less == 0 && e.clears == 1 && e.clear == 0.0f);
+        REQUIRE(frame("proof: never submitted", plain) == 0);
+        st = na::j2::GetStats();
+        CHECK(st.depth_near == 0 && st.depth_writes_greater == 0 && st.depth_writes_less == 0 && st.depth_clears == 0);
+        CHECK(st.depth_unproven == 2 && std::strstr(st.reason, "not proven") != nullptr);
+
+        // 2. That recording is Reset (discarded): its facts go with it, also when the list itself
+        //    is submitted afterwards with a new, empty recording.
+        a.Reset();
+        e = facts("after Reset:", a);
+        CHECK(e.greater == 0 && e.less == 0 && e.clears == 0);
+        REQUIRE(SUCCEEDED(a.list->Close()));
+        FrameOptions with_a = plain;
+        with_a.ahead = a.list.Get();
+        REQUIRE(frame("proof: Reset, then submitted", with_a) == 0);
+        st = na::j2::GetStats();
+        CHECK(lists_given == 3);
+        CHECK(st.depth_near == 0 && st.depth_writes_greater == 0 && st.depth_clears == 0 && st.depth_unproven == 3);
+
+        // 3. Recorded a frame ahead: nothing in the frame it was recorded in, proof in the frame
+        //    the queue is given it.
+        REQUIRE(record_writes(a, pso.Get(), 0.0f));
+        REQUIRE(frame("proof: recorded ahead", plain) == 0);
+        st = na::j2::GetStats();
+        CHECK(st.depth_near == 0 && st.depth_writes_greater == 0 && st.depth_unproven == 4);
+        REQUIRE(frame("proof: now submitted", with_a) == 0);
+        st = na::j2::GetStats();
+        CHECK(st.depth_near == 2 && st.depth_verdict == 0 && st.depth_writes_greater == 1 && st.depth_writes_less == 0 && st.depth_clears == 1);
+        CHECK(st.depth_unproven == 4);
+        // The same closed recording goes to the queue again: it draws again, so it counts again.
+        REQUIRE(frame("proof: submitted again", with_a) == 0);
+        st = na::j2::GetStats();
+        CHECK(st.depth_near == 2 && st.depth_verdict == 0 && st.depth_writes_greater == 1);
+
+        // 4. Two recordings, recorded A (smaller is nearer) then B (larger is nearer), submitted B
+        //    then A: each frame sees what was submitted in it, whatever the recording order.
+        REQUIRE(record_writes(a, pso_less.Get(), 1.0f));
+        REQUIRE(record_writes(b, pso.Get(), 0.0f));
+        facts("A, recorded first:", a);
+        facts("B, recorded second:", b);
+        FrameOptions with_b = plain;
+        with_b.ahead = b.list.Get();
+        REQUIRE(frame("proof: B submitted first", with_b) == 0);
+        st = na::j2::GetStats();
+        CHECK(st.depth_near == 2 && st.depth_writes_greater == 1 && st.depth_writes_less == 0 && st.depth_clear == 0.0f);
+        REQUIRE(frame("proof: A submitted second", with_a) == 0);
+        st = na::j2::GetStats();
+        // The opposite on one frame: seen, and the proven direction is kept (three in a row change it).
+        CHECK(st.depth_writes_less == 1 && st.depth_writes_greater == 0 && st.depth_clear == 1.0f);
+        CHECK(st.depth_near == 2 && st.depth_verdict == 1);
+        REQUIRE(frame("proof: nothing new", plain) == 0);
+        st = na::j2::GetStats();
+        CHECK(st.depth_near == 2 && st.depth_verdict == 1 && st.depth_writes_less == 0 && st.depth_writes_greater == 0);
+        CHECK(st.depth_flips == 0 && st.depth_unproven == 4);
+        CHECK(std::strncmp(st.reason, "Stopped", 7) != 0);
+
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+        na::settings::Get().j2_camera.store(1);
+        na::j2::SetEnabled(false);
+        d.WaitIdle();
+        na::j2::Shutdown();
+        na::dlss::Shutdown();
         na::dlss::SetInitOwnOverrideForTests(nullptr);
-        na_observe_stop(); na::observe::SetProcessExiting();
+        na_observe_stop();
+        na::observe::SetProcessExiting();
         return test::finish("j2_no_camera_recording_proof_test");
     }
 

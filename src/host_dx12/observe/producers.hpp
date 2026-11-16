@@ -381,18 +381,22 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y);
 // depth/direction-from-depth-writes, decided by native11/depth_direction.hpp). While on, every
 // game draw whose bound depth is the live scene depth and whose pipeline tests AND writes depth is
 // counted by its comparison, and every clear of that depth with its value. Off (the default) adds
-// nothing to the draw path. The sums are recording-time counts since the last Take; a different
-// live depth starts from nothing, and a Take for another depth returns no counts.
+// nothing to the draw path.
+// The counts belong to the recording they were recorded in and are cleared when that list is
+// Reset. A recording proves nothing until it is submitted: the host asks for the facts of each
+// list it actually submits, in execution order, and adds them up itself (a closed list that is
+// executed again counts again, as it draws again). Nothing here is a frame total.
 struct DepthWriteEvidence {
-    uint64_t depth = 0;             // the depth the counts below belong to
+    uint64_t depth = 0;             // the depth the counts below belong to (0 = none recorded about it)
     uint32_t less = 0, greater = 0; // depth-writing draws by the way their comparison runs
     uint32_t equal = 0, other = 0;  // such draws comparing EQUAL, and ALWAYS / NEVER / NOT_EQUAL
     uint32_t clears = 0;
     float clear = 0;                // the last clear's value
-    bool clear_mixed = false;       // cleared to different values since the last Take
+    bool clear_mixed = false;       // cleared to different values within the recording
 };
 void SetDepthWriteEvidence(bool on);
-DepthWriteEvidence TakeDepthWriteEvidence(uint64_t depth);
+// This recording's facts about `depth` (empty when it recorded none, or recorded another depth).
+DepthWriteEvidence ListDepthWriteEvidence(ID3D12CommandList* list, uint64_t depth);
 // Draw-replay probe: per frame, the scene-depth draws and how many match a draw of the frame
 // before (same pipeline, vertex shader, counts, vertex layout); of those, how many kept the same
 // vertex/index buffers. untracked: vertex buffers unknown ([observe] raster tracking off).

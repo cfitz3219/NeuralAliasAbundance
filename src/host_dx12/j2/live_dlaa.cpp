@@ -129,6 +129,14 @@ struct PendingHistory {
     bool measured = false, reset = false;
     bool no_camera = false; // the tracker was not given a camera on this frame
     uint64_t frame = 0;
+    // Depth direction evidence this hand-over closes when it is submitted (see State::depth_batch):
+    // between lists, the lists [0, depth_lists) of Execute number depth_submission come before it;
+    // inline, depth_prefix is what its own recording had drawn up to it. Nothing of this counts
+    // until the submission happens.
+    bool depth_cut = false, depth_inline = false;
+    UINT depth_lists = 0;
+    uint64_t depth_submission = 0, depth_id = 0;
+    na::native11::DepthEvidence depth_prefix{};
 };
 
 // CPU metadata of this frame's last submitted scene. No pooled command-list
@@ -232,7 +240,21 @@ struct State {
     uint64_t last_reset_frame = 0;  // newest delivered frame that carried a DLSS reset
     bool depth_evidence = false;    // observe is counting how the game writes the scene depth
     uint32_t camera_streak = 0;     // frames in a row with a camera while that counting is on
-    na::native11::DepthDirection depth_dir; // the rule the DX11 provider uses, fed from observe here
+    // The rule the DX11 provider uses. What it is fed here is only what the queue was really given
+    // (Astra's R5, 2026-11-16): every recording keeps its own depth facts (observe), Execute reads
+    // them for the lists it is about to forward, and they are added in submission order up to the
+    // hand-over of the scene. A list recorded ahead, discarded or Reset adds nothing until, and
+    // unless, it is submitted. The rule itself is advanced once a frame, at Present; record()
+    // only asks what it would say (depth_weigh_locked) and changes nothing.
+    na::native11::DepthDirection depth_dir;
+    struct DepthBatch {
+        ID3D12CommandList* const* lists = nullptr;     // the Execute batch being submitted (identity only)
+        uint64_t submission = 0;                       // its number (stats.submissions)
+        std::vector<na::native11::DepthEvidence> sums; // per list, in submission order
+        UINT fed = 0;                                  // lists [0, fed) are already in depth_dir
+    } depth_batch;
+    uint64_t depth_fed_id = 0;      // the depth the facts gathered this frame are about
+    bool depth_post_scene = false;  // this frame's scene was handed over and submitted: later lists are not evidence for it
     uint64_t eval_selection_version = 0; // live selection version of the last committed evaluation
     // Games may draw the scene across several submissions per frame (Sniper Elite
     // Resistance). DLAA belongs after the LAST of them, before post-processing
@@ -1644,6 +1666,7 @@ void reason(const char* r)
         n.n = 1;
     }
 }
+void depth_feed_locked(UINT upto); // below, with the rest of the depth direction evidence
 void committed_sources(const PendingHistory& p) {
     if(p.native_source) {
         const auto order=p.native_source.SubmissionOrder(g.queue.Get());
@@ -1659,6 +1682,12 @@ void committed_sources(const PendingHistory& p) {
     g.no_camera_last=p.no_camera;g.measured_refused=false;
     if(p.measured)++g.stats.supplied_measured;else ++g.stats.supplied_camera;
     if(p.reset)g.last_reset_frame=p.frame;
+    // The hand-over is on the queue: the lists before it are this frame's depth evidence, the
+    // lists after it are not (an inline hand-over was already cut at its list in Execute).
+    if(p.depth_cut && g.depth_evidence) {
+        if(!p.depth_inline && !g.depth_post_scene && p.depth_submission && p.depth_submission==g.depth_batch.submission)depth_feed_locked(p.depth_lists);
+        g.depth_post_scene=true;
+    }
 }
 
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, UINT before, UINT after)
@@ -2308,8 +2337,96 @@ void depth_evidence_want(bool on)
     if (g.depth_evidence == on) return;
     g.depth_evidence = g.stats.depth_evidence = on;
     na::observe::SetDepthWriteEvidence(on);
-    if (!on) { g.depth_dir.Reset(); g.stats.depth_near = 0; } // nothing is decided while nothing is counted
+    if (!on) { // nothing is decided while nothing is counted
+        g.depth_dir.Reset();
+        g.depth_batch = State::DepthBatch{};
+        g.depth_fed_id = 0;
+        g.depth_post_scene = false;
+        g.stats.depth_near = 0;
+    }
     na::eventlog::Emit("j2_depth_evidence", "on=%u camera_setting=%d", on ? 1u : 0u, camera_setting());
+}
+na::native11::DepthEvidence depth_facts(const na::observe::DepthWriteEvidence& seen)
+{
+    na::native11::DepthEvidence de{};
+    de.less = seen.less; de.greater = seen.greater; de.equal = seen.equal; de.other = seen.other;
+    de.clears = seen.clears; de.clear = seen.clear; de.clear_mixed = seen.clear_mixed;
+    return de;
+}
+// Lists [fed, upto) of the batch being submitted become part of this frame's evidence. g.m held.
+void depth_feed_locked(UINT upto)
+{
+    auto& b = g.depth_batch;
+    if (upto > b.sums.size()) upto = static_cast<UINT>(b.sums.size());
+    for (; b.fed < upto; ++b.fed) g.depth_dir.NoteSummed(b.sums[b.fed]);
+}
+// The batch has gone to the queue whole. What no hand-over cut off belongs to the frame as well,
+// unless the frame's scene is already handed over. g.m held.
+void depth_batch_close_locked()
+{
+    if (!g.depth_post_scene) depth_feed_locked(UINT_MAX);
+    g.depth_batch = State::DepthBatch{};
+}
+// Execute, before anything is forwarded: read the depth facts of exactly the recordings in this
+// batch. An inline hand-over recorded in one of them is being submitted with it: that list counts
+// up to the hand-over only, and closes the frame's evidence. g.m held.
+void depth_batch_open_locked(ID3D12CommandList* const* lists, UINT count, uint64_t selected_depth)
+{
+    depth_batch_close_locked();
+    if (!g.depth_evidence || !selected_depth) return;
+    if (g.depth_fed_id != selected_depth) { // another depth: what was gathered is not about it
+        g.depth_dir.EndFrame();
+        g.depth_fed_id = selected_depth;
+    }
+    auto& b = g.depth_batch;
+    b.lists = lists;
+    b.submission = g.stats.submissions;
+    b.sums.reserve(count);
+    UINT handed = 0; // one past the list that carries a submitted inline hand-over
+    for (UINT i = 0; i < count; ++i) {
+        na::native11::DepthEvidence e{};
+        if (lists[i]) {
+            if (!handed && g.inl.valid && g.inl.history.depth_inline && g.inl.history.depth_id == selected_depth &&
+                lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec) {
+                e = g.inl.history.depth_prefix;
+                handed = i + 1;
+            } else e = depth_facts(na::observe::ListDepthWriteEvidence(lists[i], selected_depth));
+        }
+        b.sums.push_back(e);
+    }
+    if (handed && !g.depth_post_scene) {
+        depth_feed_locked(handed);
+        g.depth_post_scene = true;
+    }
+}
+// What the rule would say for a hand-over of `depth_id` placed after lists [0, upto) of the batch
+// being submitted, plus `extra` (an inline recording's own facts so far). Changes nothing: the rule
+// advances at Present, on what was submitted. g.m held.
+na::native11::DepthCompare depth_weigh_locked(uint64_t depth_id, UINT upto, const na::native11::DepthEvidence* extra,
+                                              na::native11::DepthVerdict* verdict, na::native11::DepthEvidence* seen)
+{
+    na::native11::DepthDirection weigh;
+    if (g.depth_fed_id == depth_id) {
+        weigh = g.depth_dir;
+        const auto& b = g.depth_batch;
+        if (upto > b.sums.size()) upto = static_cast<UINT>(b.sums.size());
+        if (!g.depth_post_scene) for (UINT i = b.fed; i < upto; ++i) weigh.NoteSummed(b.sums[i]);
+    }
+    if (extra) weigh.NoteSummed(*extra);
+    const na::native11::DepthCompare near_end = weigh.Decide(depth_id, verdict);
+    if (seen) *seen = weigh.Last();
+    return near_end;
+}
+// Present: the frame's submitted evidence is complete. The rule advances once, on that. g.m held.
+void depth_frame_end_locked()
+{
+    if (g.depth_evidence) {
+        depth_batch_close_locked();
+        if (g.depth_fed_id) g.depth_dir.Decide(g.depth_fed_id);
+        g.depth_dir.EndFrame();
+        g.stats.depth_flips = g.depth_dir.Flips();
+    }
+    g.depth_post_scene = false;
 }
 // Draw-replay probe (SE5 smear, 2026-11-06): while DLAA/upscaling runs, count the scene draws that
 // match a draw of the previous frame, and whether their vertex buffers stayed put. One
@@ -3959,14 +4076,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     else if (camera_off || no_camera) { g.camera_streak = 0; depth_evidence_want(true); }
     else if (g.depth_evidence && ++g.camera_streak >= 300) depth_evidence_want(false);
     if (g.depth_evidence) {
-        const auto seen = na::observe::TakeDepthWriteEvidence(depth_id);
-        na::native11::DepthEvidence de{};
-        de.less = seen.less; de.greater = seen.greater; de.equal = seen.equal; de.other = seen.other;
-        de.clears = seen.clears; de.clear = seen.clear; de.clear_mixed = seen.clear_mixed;
-        g.depth_dir.NoteSummed(de);
+        // Weighed on what the queue has been given this frame, up to this hand-over: the batch
+        // being submitted counts up to the insertion point; an inline hand-over adds what its own
+        // recording has drawn so far, which only becomes evidence if that recording is submitted.
+        const bool at_present = saved && saved->at_present;
+        const bool in_batch = !inl && lists && lists == g.depth_batch.lists && g.depth_batch.submission == g.stats.submissions;
+        const UINT before = in_batch ? (saved ? prefix : scene + 1) : UINT_MAX;
+        na::native11::DepthEvidence own{}, de{};
+        if (inl) own = depth_facts(na::observe::ListDepthWriteEvidence(inl, depth_id));
         na::native11::DepthVerdict verdict = na::native11::DepthVerdict::NoWrites;
-        const na::native11::DepthCompare near_end = g.depth_dir.Decide(depth_id, &verdict);
-        g.depth_dir.EndFrame();
+        const na::native11::DepthCompare near_end = depth_weigh_locked(depth_id, before, inl ? &own : nullptr, &verdict, &de);
+        if (!at_present) { // (a Present-time evaluation belongs to the frame that has just closed)
+            pending.depth_cut = true;
+            pending.depth_inline = inl != nullptr;
+            pending.depth_lists = in_batch ? before : 0;
+            pending.depth_submission = in_batch ? g.depth_batch.submission : 0;
+            pending.depth_id = depth_id;
+            pending.depth_prefix = own;
+        }
         const uint32_t near_code = static_cast<uint32_t>(near_end), verdict_code = static_cast<uint32_t>(verdict);
         if (near_code != g.stats.depth_near) // a decision made or changed: once, with the evidence that made it
             na::eventlog::Emit("j2_depth_direction", "near=%s verdict=%s writes_less=%u writes_greater=%u equal=%u other=%u clears=%u clear=%.3f mixed=%u camera=%u",
@@ -3976,7 +4103,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.stats.depth_near = near_code; g.stats.depth_verdict = verdict_code;
         g.stats.depth_writes_less = de.less; g.stats.depth_writes_greater = de.greater;
         g.stats.depth_writes_equal = de.equal; g.stats.depth_clears = de.clears; g.stats.depth_clear = de.clear;
-        g.stats.depth_flips = g.depth_dir.Flips();
         if (no_camera) {
             if (near_end == na::native11::DepthCompare::None) {
                 ++g.stats.depth_unproven;
@@ -4203,6 +4329,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     if (!inl) s.physical = phys; // the previous use of this slot has completed (checked above)
     if (!inl && (FAILED(s.alloc->Reset()) || FAILED(s.list->Reset(s.alloc.Get(), nullptr)))) { reason("Could not reset the DLAA command list."); return false; }
+    // Our own list starts a new recording here. The game's lists tell the recording tracker so
+    // through the Reset hook; ours do not pass through it, so the slot's list kept the token of its
+    // previous use, and from the second time round the ring (frame 7) the measuring pass refused
+    // it as "already belongs to this executable recording" (Astra's R4, 2026-11-16, shown by
+    // applying and removing exactly this line). Never for a game-owned inline recording.
+    if (!inl) na::nr::native::Reset(s.list.Get());
     ID3D12GraphicsCommandList* l = inl ? inl : s.list.Get();
     if (touched) *touched = true;
     std::vector<D3D12_RESOURCE_BARRIER> b;
@@ -8277,6 +8409,7 @@ void OnPresent(ID3D12CommandQueue* queue)
             if (g.q_ok_frame.load(std::memory_order_relaxed)==g.frame) ++g.q_run;
             else { if (g.q_run>=g_quality_warmup) g_nb.q_drops.fetch_add(1,std::memory_order_relaxed); g.q_run=0; }
         }
+        depth_frame_end_locked();
         ++g.frame;
         g.wwii_submitted_camera = {};
         g.native_deferred = {};
@@ -8338,6 +8471,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     }
     uint64_t selected_depth = 0, selected_color = 0;
     na::observe::GetLiveSelection(&selected_depth, &selected_color);
+    depth_batch_open_locked(lists, count, selected_depth);
     if(vpj_mode()&&selected_depth)for(UINT i=0;i<count;++i){
         const auto sample=na::observe::ListSceneViewportJitter(lists[i],selected_depth);
         if(sample){g.vpj_submitted_sample=sample;g.vpj_submitted_frame=g.frame;g.vpj_submitted_depth=selected_depth;}
