@@ -471,11 +471,17 @@ struct Seen {
     uint64_t calls = 0, wrong_inputs = 0, after_tonemap = 0, no_scene = 0, no_camera = 0, twice = 0;
     uint64_t before_read = 0, before_list = 0, jitter_reported = 0, changed = 0;
     uint64_t last_frame = ~0ull, last_stream = 0, streams = 0;
+    // No-camera phase: frames handed over without a camera, frames that broke what the phase expects
+    // (a camera where none may be, or camera facts on a frame that says it has none), scene changes
+    // (colour or depth object) as the provider reports them apart from camera changes.
+    uint64_t without_camera = 0, camera_leak = 0, scene_changed = 0, reversed_depth = 0;
     uint32_t color_w = 0, color_h = 0;
     uint64_t color_inc = 0, depth_inc = 0;
     na::native11::SceneFrame last{};
 };
 Seen g_seen;
+// 0: every frame carries the camera (all phases but one). 1: no frame may carry one. 2: either.
+int g_no_camera_phase = 0;
 
 bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
 {
@@ -498,7 +504,18 @@ bool Consume(void* user, void* context, const na::native11::SceneFrame& f)
     const UINT camera_size = g.campaign_split_camera ? 64u : g.campaign_pixel_range ? g.camera_snapshot_size : g.campaign_camera ? 1280u : 512u;
     const int vs_slot = g.campaign_split_camera ? 1 : g.campaign_pixel_range ? -1 : g.campaign_native_pose ? 3 : 0;
     auto* expected_cb = g.campaign_split_camera ? g.split_projection.Get() : g.cam_cb.Get();
-    if (!f.camera.bytes || (g.campaign_pixel_range && g.camera_ring_offset >= 65536 ?
+    if (f.scene_changed) ++s.scene_changed;
+    if (f.reversed_depth) ++s.reversed_depth;
+    const bool camera_absent = g_no_camera_phase != 0 && !f.camera_known;
+    if (camera_absent) {
+        ++s.without_camera;
+        if (f.camera.bytes || f.camera.size || f.camera.buffer || f.camera.vs_slot >= 0 || f.camera.ps_slot >= 0) ++s.camera_leak;
+    } else if (g_no_camera_phase == 1) {
+        ++s.camera_leak;
+    }
+    if (camera_absent) {
+        // nothing camera-related to check: the frame says it has none
+    } else if (!f.camera.bytes || (g.campaign_pixel_range && g.camera_ring_offset >= 65536 ?
         f.camera.size < 1280 || f.camera.size > 16 * 1024 : f.camera.size != camera_size) || f.camera.buffer != reinterpret_cast<uint64_t>(static_cast<ID3D11Resource*>(expected_cb)) ||
         f.camera.vs_slot != vs_slot) {
         if (!s.no_camera)
@@ -607,6 +624,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
+        !set(L"j2", L"camera", L"2") || // the phases below test the camera itself; the no-camera phase switches it live
+
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
     na::host::WaitForObserveInstall();
     const ULONGLONG init_deadline = GetTickCount64() + 20000;
@@ -745,6 +764,90 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         }
         expect(rows23 && sub_pixel, "the GPU's camera carries a sub-pixel jitter in rows 0/1 only");
         ++frame;
+    }
+
+    // ---- no camera (2026-11-16): a frame is handed over without one, and without looking for one ----
+    // The scene clears its depth to 1 and draws with the default depth state (LESS, writing), so the
+    // depth direction is proven from the depth's own writes. The jitter route is still the matrix
+    // one here, which needs a camera: with none looked for, nothing may be written.
+    {
+        const auto set_use = [&](na::native11::CameraUse use) {
+#if defined(NA_TEST_NATIVE_DLAA)
+            na::settings::Get().j2_camera.store(use == na::native11::CameraUse::Off ? 0 : use == na::native11::CameraUse::Optional ? 1 : 2);
+            na::native_d3d11::SyncCameraUse();
+#else
+            na::native11::SetCameraUse(use);
+#endif
+        };
+        const auto run = [&](int frames) {
+            for (int i = 0; i < frames; ++i, ++frame) {
+                Pump();
+                na::native11::SetNextJitter(0.25f, -0.25f);
+                Scene(g.ctx.Get(), g, frame);
+                Post(g.ctx.Get(), g, true);
+                g.swap->Present(0, 0);
+            }
+        };
+        static char wide[8192];
+        const auto stats0 = na::native11::Stats();
+        const auto calls0 = g_seen.calls, streams0 = g_seen.streams, changed0 = g_seen.changed, scene0 = g_seen.scene_changed;
+        const auto wrong0 = g_seen.wrong_inputs, no_scene0 = g_seen.no_scene, reversed0 = g_seen.reversed_depth;
+        expect(scene0 == 1, "the scene's own identity changed once so far (the first frame), like the input stream");
+#if defined(NA_TEST_NATIVE_DLAA)
+        const auto evaluations0 = evaluations;
+#endif
+        g_no_camera_phase = 1;
+        set_use(na::native11::CameraUse::Off);
+        run(12);
+        const auto stats1 = na::native11::Stats();
+        na::native11::FormatStatus(wide, sizeof wide);
+        std::printf("no camera looked for: calls=%llu without_camera=%llu | %s\n", static_cast<unsigned long long>(g_seen.calls - calls0),
+                    static_cast<unsigned long long>(g_seen.without_camera), wide);
+        expect(g_seen.calls >= calls0 + 11, "with no camera looked for, every frame is still handed over");
+        expect(g_seen.without_camera == g_seen.calls - calls0 && g_seen.camera_leak == 0,
+               "none of those frames carries a camera or any camera fact");
+        expect(g_seen.wrong_inputs == wrong0 && g_seen.no_scene == no_scene0, "the scene colour, depth and draw count are the same facts as with a camera");
+        expect(g_seen.reversed_depth == reversed0 && !g_seen.last.reversed_depth,
+               "the depth direction comes from the depth's own writes (cleared to 1, drawn with LESS)");
+        expect(stats1.camera_off >= stats0.camera_off + 11 && stats1.camera_found == stats0.camera_found &&
+               stats1.camera_missing == stats0.camera_missing && stats1.camera_held == stats0.camera_held,
+               "no camera search ran on those frames");
+        expect(stats1.jitter_written == stats0.jitter_written && !g_seen.last.raster.applied && !g_seen.last.raster.qualified,
+               "nothing is written into a camera that is not looked for, and the frame says its picture is unjittered");
+        expect(g_seen.streams == streams0 && g_seen.changed == changed0 && g_seen.scene_changed == scene0,
+               "a camera that goes away is not a change of scene: no history reset");
+        expect(stats1.depth_unproven == stats0.depth_unproven, "no frame waited for the depth direction");
+        expect(std::strstr(wide, "camera_use{mode=off") != nullptr && std::strstr(wide, "depth_direction{near_is_less") != nullptr,
+               "the status line names the camera mode and the proven depth direction");
+#if defined(NA_TEST_NATIVE_DLAA)
+        // End to end on the GPU: DLAA keeps running with motion measured from the picture. (Written
+        // 2026-11-16 without an NVIDIA GPU to run it on: first run of this check is still owed.)
+        na::native_d3d11::FormatStatus(wide, sizeof wide);
+        std::printf("native DLAA with no camera: %s\n", wide);
+        expect(evaluations >= evaluations0 + 10, "DLAA keeps delivering with no camera (motion measured from the picture)");
+        expect(std::strstr(wide, "camera_setting=0") != nullptr && std::strstr(wide, "measured=0}") == nullptr,
+               "the DLAA status counts frames whose motion was measured");
+#endif
+        // Optional: the camera is looked for again and handed over when found, as when it is required.
+        g_no_camera_phase = 2; // the two frames around the switch may go either way
+        set_use(na::native11::CameraUse::Optional);
+        run(2);
+        g_no_camera_phase = 0;
+        const auto calls2 = g_seen.calls, no_camera2 = g_seen.no_camera;
+        const auto stats2 = na::native11::Stats();
+        run(8);
+        const auto stats3 = na::native11::Stats();
+        na::native11::FormatStatus(wide, sizeof wide);
+        std::printf("camera optional: calls=%llu | %s\n", static_cast<unsigned long long>(g_seen.calls - calls2), wide);
+        expect(g_seen.calls >= calls2 + 7 && g_seen.no_camera == no_camera2 && g_seen.last.camera_known,
+               "optional: a camera that is found is handed over exactly as when it is required");
+        expect(stats3.camera_found >= stats2.camera_found + 7 && stats3.camera_absent == stats2.camera_absent,
+               "optional: the camera was found on those frames");
+        expect(g_seen.streams == streams0 && g_seen.changed == changed0 && g_seen.scene_changed == scene0,
+               "the same camera buffer met again is not a change of inputs either");
+        expect(std::strstr(wide, "camera_use{mode=optional") != nullptr, "the status line names the optional mode");
+        set_use(na::native11::CameraUse::Required); // the phases below test the camera itself
+        run(1);
     }
 
 #if !defined(NA_TEST_NATIVE_DLAA)

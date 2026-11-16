@@ -41,6 +41,10 @@ struct Inputs {
     ID3D12Resource* tier3_valid = nullptr;
     // Same meaning as the CPU structs; `valid` flags decide which tiers run.
     bool tier1_valid_flag = false;
+    // Whose field tier 1 is (motion_arbiter.hpp). Engine, the default, is the behaviour before the
+    // tag. Estimated = measured TOTAL motion: same arithmetic, provenance NA_MOTION_ESTIMATED,
+    // counted in Stats::pixels_estimated, never as engine.
+    Tier1Source tier1_source = Tier1Source::Engine;
     bool tier2_valid_flag = false;
     bool tier3_valid_flag = false;
     float depth_clear = 1.0f;
@@ -104,6 +108,7 @@ private:
     static constexpr uint32_t kDescriptors = 11; // per slot: SRV t0..t6, UAV u0..u3
     void fix_srv(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* fix);
     uint64_t whole_rejects_last_ = 0;
+    Tier1Source tier1_source_last_ = Tier1Source::Engine;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_, pso_derive_;

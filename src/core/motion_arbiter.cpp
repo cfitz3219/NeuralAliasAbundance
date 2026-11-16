@@ -161,8 +161,13 @@ bool Arbitrate(const Tier1Input& t1, const Tier2Input& t2, const Tier3Input& t3,
                     if (finite2(e[0], e[1])) {
                         o[0] = e[0];
                         o[1] = e[1];
-                        prov = NA_MOTION_ENGINE;
-                        ++s->pixels_engine;
+                        if (t1.source == Tier1Source::Estimated) {
+                            prov = NA_MOTION_ESTIMATED;
+                            ++s->pixels_estimated;
+                        } else {
+                            prov = NA_MOTION_ENGINE;
+                            ++s->pixels_engine;
+                        }
                         continue;
                     }
                     ++s->pixels_rejected;
@@ -216,6 +221,7 @@ bool Arbitrate(const Tier1Input& t1, const Tier2Input& t2, const Tier3Input& t3,
         }
     }
     if (s->pixels_engine) s->tier_used = Tier::EngineDxil;
+    else if (s->pixels_estimated) s->tier_used = Tier::EstimatedTotal;
     else if (s->pixels_residual_added) s->tier_used = Tier::ResidualOpticalFlow;
     else if (s->pixels_camera) s->tier_used = Tier::CameraReprojection;
     else s->tier_used = Tier::None;

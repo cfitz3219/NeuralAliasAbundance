@@ -189,6 +189,8 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         const int vj = static_cast<int>(GetPrivateProfileIntW(L"j2", L"viewport_jitter", 1, ini));
         target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
         target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);
+        const int cam = static_cast<int>(GetPrivateProfileIntW(L"j2", L"camera", 1, ini));
+        target.j2_camera.store(cam < 0 || cam > 2 ? 1 : cam);
     }
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
@@ -262,7 +264,7 @@ void describe_effective()
     // game ran 0/M from the saved user choices. Log every effective value with its source.
     std::snprintf(g_effective, sizeof g_effective,
         "settings_effective game_ini=\"%ls\" user_ini=\"%ls\" j2.flow_loosen=%u(%s) j2.preset=%u(%s) j2.sharpen=%u(%s) "
-        "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s)",
+        "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s) j2.camera=%d(%s)",
         g_ini_defaults, g_ini_user,
         g_settings.j2_flow_loosen.load(), source_of(L"j2", L"flow_loosen"),
         g_settings.j2_preset.load(), [] { const char* s = source_of(L"j2", L"preset_v2"); return strcmp(s, "builtin") ? s : source_of(L"j2", L"preset"); }(),
@@ -271,7 +273,8 @@ void describe_effective()
         g_settings.j2_scale_mode.load(), source_of(L"j2", L"scale_mode"),
         g_settings.j2_mip_bias_x100.load(), source_of(L"j2", L"mip_bias"),
         g_settings.dlss_mode.load(), source_of(L"dlss", L"mode"),
-        g_settings.preset.load(), source_of(L"dlss", L"preset"));
+        g_settings.preset.load(), source_of(L"dlss", L"preset"),
+        g_settings.j2_camera.load(), source_of(L"j2", L"camera"));
 }
 } // namespace
 const char* EffectiveSummary() { return g_effective; }
@@ -408,6 +411,8 @@ bool SaveFromWorker()
     ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", v, ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"jitter_sequence", g_settings.j2_jitter_r2.load() ? L"r2" : L"halton", ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"draw_replay", g_settings.j2_draw_replay.load() ? L"1" : L"0", ini) != 0;
+    swprintf_s(v, L"%d", g_settings.j2_camera.load());
+    ok &= WritePrivateProfileStringW(L"j2", L"camera", v, ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
         if (pv == 255) swprintf_s(v, L"auto");

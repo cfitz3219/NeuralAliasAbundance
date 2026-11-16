@@ -114,6 +114,13 @@ struct Settings {
     // the opposite sign, 0 = off: the camera-matrix route). Cort 2026-11-04. Loading the ini
     // turns it on unless the ini says otherwise; without a Load (tests) the camera-matrix route stays.
     std::atomic<int32_t> j2_viewport_jitter{0};
+    // VARIANT: camera/optional
+    // [j2] camera: what the scene camera is to DLAA on the native DX11 route (2026-11-16, Cort:
+    // "eliminate the dependency"). 1 = used when found (default): a frame without one still gets DLAA,
+    // with motion measured from the picture. 0 = never looked for: nothing camera-related runs.
+    // 2 = required: a frame without a camera is left alone (the behaviour before this setting).
+    // Live, saved per game.
+    std::atomic<int32_t> j2_camera{1};
     // Draw replay ([j2] draw_replay, 1 = on): per-object motion from the game's own draws replayed with
     // stream output, fed as engine motion (Cort 2026-11-06, SE5 sweatshirt smear). Off by default (Cort).
     std::atomic<uint32_t> j2_draw_replay{0};

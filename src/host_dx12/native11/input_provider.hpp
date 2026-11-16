@@ -68,6 +68,16 @@ struct CameraFacts {
     std::optional<std::array<double, 16>> no_inverse_pose;
 };
 
+// The raster sample of this frame's scene: how the scene was drawn, known whether or not any camera
+// was found (2026-11-16: moved out of CameraFacts, whose copies stay filled for its readers).
+struct RasterFacts {
+    bool qualified = false;  // a sample asked for with SetNextJitter can reach the next frame's scene draws
+    bool viewport = false;   // the sample moves the game's viewports: no camera is involved
+    bool expanded = false;   // executed scene viewport includes the half-pixel border on each side
+    bool applied = false;    // this frame's scene draws carried jitter_px (false: the picture is exactly unjittered)
+    float jitter_px[2] = {0, 0}; // the sample, in pixels of the scene extent (DLSS convention)
+};
+
 enum class Boundary : uint8_t {
     BeforeRead,  // before the first read of the scene colour after its last scene draw (preferred)
     BeforeList,  // before ExecuteCommandList whose first colour read is that read (deferred contexts);
@@ -80,8 +90,19 @@ struct SceneFrame {
     uint64_t frame = 0;            // provider frame counter (advances at Present)
     uint64_t stream = 0;           // input stream id: stays while colour/depth/camera objects stay; new on any change
     TextureFacts color, depth;
-    bool reversed_depth = false;   // from the depth func/clear value of the scene draws
+    // Which end of the depth is near: the camera's own answer when a camera is known (as before);
+    // with no camera, proven from the depth's own scene writes (depth_direction.hpp). A frame with
+    // neither is not handed over.
+    bool reversed_depth = false;
+    // No camera is needed for a frame to be handed over (SetCameraUse). false: none was looked for,
+    // or none was found, and `camera` is empty; everything else in the frame is still this scene's.
+    bool camera_known = false;
     CameraFacts camera;
+    RasterFacts raster;            // independent of `camera`
+    // The scene's own identity: stays while the colour and depth objects stay. A camera buffer that
+    // changes, appears or goes does not move it (it moves `stream`, which the camera's consumer reads).
+    uint64_t scene_stream = 0;
+    bool scene_changed = false;    // scene_stream differs from the previous fired frame
     Boundary boundary = Boundary::BeforeRead;
     uint32_t scene_draws = 0;      // scene draws this frame before the boundary
     bool selection_changed = false; // stream differs from the previous fired frame (reset history)
@@ -111,6 +132,12 @@ struct ProviderStats {
     uint64_t relative_learned = 0, relative_learn_failed = 0, relative_ambiguous = 0;
     // Frames on which the relative-camera vote gave no camera, by reason (relative_camera.hpp RelativeVerdict).
     uint64_t split_no_votes = 0, split_no_projection = 0, split_few_draws = 0, split_no_majority = 0, split_small_share = 0;
+    // Frames handed over with no camera: because none is looked for (SetCameraUse Off), or because
+    // none was found and one is not required (Optional).
+    uint64_t camera_off = 0, camera_absent = 0;
+    // Depth direction with no camera (depth_direction.hpp): frames not handed over because it is not
+    // proven yet, and frames on which a proven direction and the camera's own answer disagreed.
+    uint64_t depth_unproven = 0, depth_camera_disagrees = 0;
     const char* last_miss = "";
 };
 
@@ -145,6 +172,17 @@ void SetNextJitter(float x_px, float y_px);
 //                     CameraFacts::jitter_applied then means this frame's scene draws carried it.
 enum class JitterRoute { Matrix, Viewport };
 void SetJitterRoute(JitterRoute route);
+// Whether a frame needs a camera to be handed over.
+//  Required (default here): as before 2026-11-16, a frame with no camera is a miss. Kept as the
+//             provider's default so its own tests and any consumer that cannot work without a
+//             camera see no change; the live host asks for one of the other two.
+//  Optional:  the camera is looked for exactly as before and handed over when found; a frame
+//             without one is handed over all the same (SceneFrame::camera_known = false).
+//  Off:       nothing camera-related runs: no constant buffer bytes are kept or read, no search,
+//             no matrix write. Every frame is handed over without a camera.
+// Live: takes effect on the next frame, either way round.
+enum class CameraUse : uint8_t { Required = 0, Optional = 1, Off = 2 };
+void SetCameraUse(CameraUse use);
 ProviderStats Stats();
 int FormatStatus(char* out, unsigned long n); // one status line: "native11 frames= fired= ..."
 

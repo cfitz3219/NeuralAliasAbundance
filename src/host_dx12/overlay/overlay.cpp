@@ -1857,6 +1857,16 @@ void write_menu_progress(HANDLE log)
         (unsigned long long)cf.sum_pairs,(unsigned long long)cf.sum[0],(unsigned long long)cf.sum[1],(unsigned long long)cf.sum[2],(unsigned long long)cf.sum[3],
         (unsigned long long)cf.sum[4],(unsigned long long)cf.sum[5],(unsigned long long)cf.sum[6]);
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
+    // Measured total motion (no camera; compute_flow.hpp Frame::total). Pixel counts are sums over
+    // every completed pair, by the measure program's code; no_pair by Ticket::no_pair's code.
+    {char line[700];const int n=snprintf(line,sizeof line,"j2measured mode=%d pictures=%llu pairs=%llu completed_pairs=%llu pixels{moving=%llu still=%llu approximate_unconfirmed=%llu approximate_from_outside=%llu not_known=%llu} "
+        "scene_cuts=%llu last_cut_frame=%llu resets_asked=%llu no_pair{reset_asked=%llu no_picture=%llu not_frame_before=%llu other_scene=%llu colour_convention=%llu raster_kind=%llu not_submitted=%llu} last_ms=%.3f\r\n",
+        cf.total_mode?1:0,(unsigned long long)cf.total_frames,(unsigned long long)cf.total_pairs,(unsigned long long)cf.total_sum_pairs,
+        (unsigned long long)cf.total_sum[0],(unsigned long long)cf.total_sum[7],(unsigned long long)cf.total_sum[5],(unsigned long long)cf.total_sum[4],(unsigned long long)cf.total_sum[1],
+        (unsigned long long)cf.total_cuts,(unsigned long long)cf.total_cut_frame,(unsigned long long)cf.total_cut_resets,
+        (unsigned long long)cf.no_pair[1],(unsigned long long)cf.no_pair[2],(unsigned long long)cf.no_pair[3],(unsigned long long)cf.no_pair[4],
+        (unsigned long long)cf.no_pair[5],(unsigned long long)cf.no_pair[6],(unsigned long long)cf.no_pair[7],cf.total_mode?cf.ms:0.0);
+        if(n>0)WriteFile(log,line,DWORD((std::min)(n,int(sizeof(line)-1))),&cfw,nullptr);}
     {char line[160];const int n=snprintf(line,sizeof line,"j2jitter source=flow convention=%u epoch=%llu changes=%llu\r\n",
         cf.colour_jitter_convention,(unsigned long long)cf.colour_jitter_epoch,(unsigned long long)cf.colour_jitter_changes);
         if(n>0)WriteFile(log,line,DWORD((std::min)(n,int(sizeof(line)-1))),&cfw,nullptr);}
@@ -3675,6 +3685,7 @@ struct Native11Present {
         t_native11_present = true;
         if (flags & DXGI_PRESENT_TEST) return;
         na::on12::AttachNativePresentation(sc);
+        na::native_d3d11::SyncCameraUse(); // [j2] camera, live: before this present closes the frame
         if (!na::native11::ObservePresent(sc)) return;
         std::lock_guard<std::mutex> lock(g_state.mutex);
         ComPtr<ID3D12CommandQueue> retained;

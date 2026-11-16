@@ -44,11 +44,13 @@ cbuffer C : register(b0) {
 #define F_T3VALID 32u
 #define F_STATS   64u
 #define F_FIX     128u
+#define F_T1EST   256u   // tier 1 is measured total motion (Tier1Source::Estimated), not the game's own vectors
 
 #define PROV_INVALID 0u
 #define PROV_ENGINE 1u
 #define PROV_CAMERA 2u
 #define PROV_CAMERA_RESIDUAL 3u
+#define PROV_ESTIMATED 4u
 #define PROV_F_FILTERED 0x10u
 #define PROV_F_OFFSCREEN 0x20u
 
@@ -123,7 +125,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             float2 e = t_engine[p];
             if (finite2(e)) {
                 u_xy[p] = e;
-                u_prov[p] = PROV_ENGINE;
+                u_prov[p] = (flags & F_T1EST) ? PROV_ESTIMATED : PROV_ENGINE;
                 stat(0);
                 return;
             }
@@ -364,6 +366,7 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     if (use3 && in.tier3_valid) flags |= 32u;
     if (out.stats) flags |= 64u;
     if (use2 && in.fix) flags |= 128u;
+    if (use1 && in.tier1_source == Tier1Source::Estimated) flags |= 256u; // label and counter only
     // Whole-tier rejections are counted by the caller-visible stats exactly
     // like the CPU (motion_arbiter.cpp:138-140): add width*height per rejected tier.
     uint32_t whole_rejects = 0;
@@ -433,6 +436,7 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     // Whole-tier rejections are known on the CPU side (extent checks) and are
     // added by DecodeStats, exactly like motion_arbiter.cpp:138-140.
     whole_rejects_last_ = whole_rejects * static_cast<uint64_t>(out.width) * out.height;
+    tier1_source_last_ = in.tier1_source;
     return true;
 }
 
@@ -523,7 +527,9 @@ bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Reso
 Stats Arbiter::DecodeStats(const uint32_t counters[8]) const
 {
     Stats s{};
-    s.pixels_engine = counters[STAT_ENGINE];
+    // Counter 0 is "tier 1 taken"; whose field that was decides which total it joins.
+    if (tier1_source_last_ == Tier1Source::Estimated) s.pixels_estimated = counters[STAT_ENGINE];
+    else s.pixels_engine = counters[STAT_ENGINE];
     s.pixels_camera = counters[STAT_CAMERA];
     s.pixels_residual_added = counters[STAT_RESIDUAL_ADDED];
     s.pixels_residual_snapped = counters[STAT_RESIDUAL_SNAPPED];
@@ -532,6 +538,7 @@ Stats Arbiter::DecodeStats(const uint32_t counters[8]) const
     s.pixels_invalid = counters[STAT_INVALID];
     s.pixels_rejected = counters[STAT_REJECTED] + whole_rejects_last_;
     if (s.pixels_engine) s.tier_used = Tier::EngineDxil;
+    else if (s.pixels_estimated) s.tier_used = Tier::EstimatedTotal;
     else if (s.pixels_residual_added) s.tier_used = Tier::ResidualOpticalFlow;
     else if (s.pixels_camera) s.tier_used = Tier::CameraReprojection;
     else s.tier_used = Tier::None;

@@ -56,7 +56,15 @@
 
 namespace na::motion {
 
-enum class Tier : uint32_t { None = 0, EngineDxil = 1, CameraReprojection = 2, ResidualOpticalFlow = 3 };
+enum class Tier : uint32_t { None = 0, EngineDxil = 1, CameraReprojection = 2, ResidualOpticalFlow = 3,
+                             EstimatedTotal = 4 }; // Tier 1 filled by a Tier1Source::Estimated supplier
+
+// Who supplied the Tier 1 field. The arithmetic is the same for both (a complete vector per pixel,
+// taken as it is, never snapped, clamped or combined with a camera); only the label and the counter
+// differ, so a measured field can never be reported as the game's own motion vectors.
+//   Engine     the game's own motion vectors (the default; behaviour exactly as before the tag).
+//   Estimated  TOTAL motion measured from the pictures (core/total_motion.hpp). Never a residual.
+enum class Tier1Source : uint8_t { Engine = 0, Estimated = 1 };
 
 struct Field2 {          // 2 floats per pixel
     const float* xy = nullptr;
@@ -76,6 +84,7 @@ struct Tier1Input {
     Field1 valid_mask;       // per-pixel: finite value in (0,1] = written by
                              // the engine; 0 = not written; anything else
                              // (NaN/Inf/<0/>1) = malformed -> INVALID; null = all
+    Tier1Source source = Tier1Source::Engine; // last on purpose: existing aggregate initialisers keep meaning Engine
 };
 
 struct Tier2Input {
@@ -109,6 +118,7 @@ enum Provenance : uint8_t {
     NA_MOTION_ENGINE = 1,           // Tier 1
     NA_MOTION_CAMERA = 2,           // Tier 2 only (static geometry assumption)
     NA_MOTION_CAMERA_RESIDUAL = 3,  // Tier 2 + Tier 3 (estimated)
+    NA_MOTION_ESTIMATED = 4,        // Tier 1 from a Tier1Source::Estimated supplier (measured total motion)
 };
 enum ProvenanceFlags : uint8_t {
     NA_MOTION_F_FILTERED = 0x10,    // residual was snapped or clamped
@@ -123,7 +133,8 @@ struct Output {
 
 struct Stats {
     Tier tier_used = Tier::None;
-    uint64_t pixels_engine = 0;
+    uint64_t pixels_engine = 0;      // Tier 1, Tier1Source::Engine
+    uint64_t pixels_estimated = 0;   // Tier 1, Tier1Source::Estimated (never counted as engine)
     uint64_t pixels_camera = 0;
     uint64_t pixels_residual_added = 0;
     uint64_t pixels_residual_snapped = 0;

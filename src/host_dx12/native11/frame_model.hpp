@@ -130,6 +130,9 @@ struct Event {
     uint64_t viewport_sample = 0; // Draw: actual native viewport offset encoded as two floats
     bool viewport_expanded = false; // Draw: actual viewport border expansion, travels with deferred recording
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
+    // Depth direction evidence (depth_direction.hpp). Last on purpose: hosts that do not say leave them 0.
+    uint8_t depth_func = 0;       // Draw: the depth comparison (D3D11 numbering, 1..8) when this draw tests AND WRITES the depth; 0 otherwise
+    float clear_depth = 0;        // ClearDepth: the value the depth was cleared to
 };
 
 struct Selection {

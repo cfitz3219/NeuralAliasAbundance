@@ -1164,6 +1164,22 @@ void DrawLiveDlaaEnhancements()
     BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
     if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
     EndRow();
+    if (native) {
+        // VARIANT: camera/optional
+        // One control, live, saved per game ([j2] camera).
+        na::settings::Settings& cs = na::settings::Get();
+        static const char* kCameraUse[] = {"Use it when found", "Never look for it", "Require it (old behaviour)"};
+        static const int kCameraValue[] = {1, 0, 2};
+        const int now = cs.j2_camera.load();
+        int pick = now == 0 ? 1 : now == 2 ? 2 : 0;
+        BeginRow("Scene camera", "DLAA no longer needs to find the game's camera. Use it when found: the camera's exact motion is used on frames where it is found, and motion measured from the picture on frames where it is not. Never look for it: motion is always measured from the picture. Require it: frames without a camera are left as the game drew them, as before. Takes effect on the next frame.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2camera", &pick, kCameraUse, 3)) {
+            cs.j2_camera.store(kCameraValue[pick]);
+            na::settings::Save();
+        }
+        EndRow();
+    }
     {
         // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
         bool fl = na::j2::flow::Enabled();

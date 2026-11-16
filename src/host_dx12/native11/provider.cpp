@@ -31,6 +31,7 @@
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
+#include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/native11/frame_model.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
@@ -144,6 +145,7 @@ struct Ctx {
     Id rt0 = 0, depth = 0;
     uint8_t rt_count = 0;              // render targets bound together
     bool depth_test = true;
+    uint8_t depth_func = kCompareLess; // the bound state's comparison when it tests AND writes depth, else 0 (default state: LESS, writing)
     Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
     uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
     float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0; // viewport 0
@@ -174,6 +176,7 @@ struct Ctx {
         rt0 = depth = 0;
         rt_count = 0;
         depth_test = true;
+        depth_func = kCompareLess;
         std::memset(cb, 0, sizeof(cb));
         std::memset(cb_first, 0, sizeof(cb_first));
         std::memset(cb_num, 0, sizeof(cb_num));
@@ -252,6 +255,17 @@ float g_scene_vp_x = 0, g_scene_vp_y = 0, g_scene_vp_w = 0, g_scene_vp_h = 0; //
 uint32_t g_camera_first = 0, g_camera_num = 0; // exact bound range of the selected camera
 uint64_t g_stream = 0;                    // SceneFrame::stream; bumps when any input object changes
 uint64_t g_stream_key[4] = {};            // colour and depth lifetime ids, camera buffer id and its lifetime id (0 = untagged)
+uint64_t g_scene_stream = 0;              // SceneFrame::scene_stream; bumps when the colour or depth object changes, never for a camera
+uint64_t g_scene_key[2] = {};             // colour and depth lifetime ids
+// VARIANT: camera/optional
+// Whether a frame needs a camera to be handed over (input_provider.hpp CameraUse). Off: nothing
+// camera-related runs at all, on any thread, so it is read without g_mu.
+std::atomic<uint8_t> g_camera_use{static_cast<uint8_t>(CameraUse::Required)};
+bool CameraOff() { return g_camera_use.load(std::memory_order_relaxed) == static_cast<uint8_t>(CameraUse::Off); }
+// VARIANT: depth/direction-from-depth-writes
+// Which end of the selected depth is near, from that depth's own scene writes (depth_direction.hpp).
+// Gathered on every frame, under g_mu; used when the frame has no camera to say it.
+DepthDirection g_depth_dir;
 
 CameraPick g_camera;
 // VARIANT: camera11/held
@@ -381,7 +395,7 @@ ResourceInfo InfoOf(ID3D11Resource* r, bool depth)
 }
 bool IsCandidate(Id id)
 {
-    if (!id) return false;
+    if (!id || CameraOff()) return false; // no camera is looked for: no constant buffer bytes are kept
     if (g_collect_camera.load(std::memory_order_relaxed) ||
         g_split_candidate.load(std::memory_order_relaxed) == id) return true;
     for (auto& c : g_cand)
@@ -1028,13 +1042,25 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     uint64_t version = 0;
     PoseCheck pose_check = PoseCheck::NoPacket;
     std::optional<CameraFacts::RelativePose> split_pose;
-    const bool found = CameraNow(&cam, &upload, &version, pose_check, split_pose);
-    CountPoseCheck(pose_check);
+    // VARIANT: camera/optional
+    // A camera is looked for exactly as before unless the host said never to (Off). What changes is
+    // what a frame without one means: Required, a miss (as before); Optional and Off, the frame is
+    // handed over all the same with camera_known = false, and nothing below reads a camera.
+    const auto use = static_cast<CameraUse>(g_camera_use.load(std::memory_order_relaxed));
+    bool found = false;
+    if (use != CameraUse::Off) {
+        found = CameraNow(&cam, &upload, &version, pose_check, split_pose);
+        CountPoseCheck(pose_check);
+    }
     g_frame_fired = true;
     g_frame_found = found;
-    g_frame_no_bytes = !found && pose_check == PoseCheck::NoPacket;
+    g_frame_no_bytes = use != CameraUse::Off && !found && pose_check == PoseCheck::NoPacket;
     bool held = false;
-    if (!found) {
+    bool have_camera = found;
+    if (use == CameraUse::Off) {
+        g_held.valid = false;
+        ++g_stats.camera_off;
+    } else if (!found) {
         DiagnoseCameraMiss();
         // At most kHoldFrames in a row, and only for the same scene textures.
         if (!g_held.valid || g_frame <= g_held.frame || g_frame - g_held.frame > kHoldFrames ||
@@ -1042,25 +1068,29 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
             !HeldCameraUnreadable(g_held.cb, g_held.slot)) {
             g_held.valid = false;
             ++g_stats.camera_missing;
-            return SetReason("No supported camera was found in the scene's constant buffers.");
+            if (use == CameraUse::Required)
+                return SetReason("No supported camera was found in the scene's constant buffers.");
+            ++g_stats.camera_absent; // handed over without one
+        } else {
+            held = true;
+            have_camera = true;
+            ++g_stats.camera_held;
+            cam = g_held.cam;
+            upload = &g_held.upload;
+            version = g_held.version;
+            split_pose = g_held.split;
+            // The learned place stays learned: the next frame re-reads it first.
+            g_camera = cam;
+            g_model.SetCamera(g_held.cb, g_held.slot);
+            g_camera_first = g_held.first;
+            g_camera_num = g_held.num;
         }
-        held = true;
-        ++g_stats.camera_held;
-        cam = g_held.cam;
-        upload = &g_held.upload;
-        version = g_held.version;
-        split_pose = g_held.split;
-        // The learned place stays learned: the next frame re-reads it first.
-        g_camera = cam;
-        g_model.SetCamera(g_held.cb, g_held.slot);
-        g_camera_first = g_held.first;
-        g_camera_num = g_held.num;
     } else {
         ++g_stats.camera_found;
     }
     if (split_pose) ++g_stats.pose_split;
     const Selection cam_sel = g_model.Current(); // CameraNow may have just chosen (or changed) the camera buffer
-    {
+    if (have_camera) {
         // WHY log: one line whenever the kind of camera in use changes (which rule, which place in
         // the block, with or without a position), so a run that alternates between cameras shows it.
         static uint64_t last_signature = ~uint64_t{0};
@@ -1081,7 +1111,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
                                upload->windowed && upload->first_constant == g_camera_first ? 1 : 0);
         }
     }
-    if (!held) {
+    if (have_camera && !held) {
         g_held.valid = true;
         g_held.cam = cam;
         g_held.upload = *upload;
@@ -1122,37 +1152,92 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     const ComPtr<ID3D11Resource> color = g_color_ref, depth = g_depth_ref;
     texture(f.color, color.Get(), sel.color_info, g_color_view);
     texture(f.depth, depth.Get(), sel.depth_info, g_depth_view);
-    f.reversed_depth = cam.reversed;
-    std::vector<uint8_t> camera_bytes(*upload->bytes); // the callback runs without g_mu
-    f.camera.buffer = cam_sel.camera_cb;
-    f.camera.vs_slot = cam_sel.camera_slot >= 0 && cam_sel.camera_slot < kPsCbBase ? cam_sel.camera_slot : -1;
-    f.camera.ps_slot = cam_sel.camera_slot >= kPsCbBase ? cam_sel.camera_slot - kPsCbBase : -1;
-    f.camera.first_constant = g_camera_first;
-    f.camera.held = held;
-    f.camera.num_constants = g_camera_num;
-    f.camera.version = version;
-    f.camera.bytes_first_constant = upload->first_constant;
-    f.camera.split_pose = split_pose;
-    if (cam.derived_inverse) f.camera.no_inverse_pose = cam.vp;
-    f.camera.bytes = camera_bytes.data();
-    f.camera.size = static_cast<uint32_t>(camera_bytes.size());
+    {
+        // VARIANT: depth/direction-from-depth-writes
+        // Which end of the depth is near. The evidence of the depth's own writes is weighed on every
+        // frame; a frame with a camera keeps the camera's answer (as before), a frame without one
+        // uses what the writes have proven, and is not handed over while nothing is proven.
+        DepthVerdict verdict = DepthVerdict::NoWrites;
+        const DepthCompare proven = g_depth_dir.Decide(f.depth.incarnation, &verdict);
+        const DepthEvidence& ev = g_depth_dir.Last();
+        {
+            // WHY log: one line whenever the answer or the reason for it changes, with the evidence.
+            static uint64_t last_signature = ~uint64_t{0};
+            static uint32_t logged = 0;
+            const uint64_t signature = (f.depth.incarnation << 8) ^ (uint64_t(static_cast<int>(proven)) << 4) ^
+                                       uint64_t(static_cast<int>(verdict)) ^ (have_camera ? 0x80u : 0u) ^
+                                       (have_camera && cam.reversed ? 0x40u : 0u);
+            if (signature != last_signature && logged < 400) {
+                last_signature = signature;
+                ++logged;
+                na::eventlog::Emit("native11_depth",
+                                   "frame=%llu direction=%s verdict=%s writes{near_is_less=%u near_is_greater=%u equal=%u other=%u} "
+                                   "clears=%u clear=%.6g clear_mixed=%d flips=%llu camera=%s",
+                                   static_cast<unsigned long long>(g_frame),
+                                   proven == DepthCompare::NearIsLess ? "near_is_less" : proven == DepthCompare::NearIsGreater ? "near_is_greater" : "unproven",
+                                   DepthVerdictName(verdict), ev.less, ev.greater, ev.equal, ev.other, ev.clears, ev.clear,
+                                   ev.clear_mixed ? 1 : 0, static_cast<unsigned long long>(g_depth_dir.Flips()),
+                                   !have_camera ? "none" : cam.reversed ? "says_near_is_greater" : "says_near_is_less");
+            }
+        }
+        if (have_camera) {
+            f.reversed_depth = cam.reversed;
+            if (proven != DepthCompare::None && (proven == DepthCompare::NearIsGreater) != cam.reversed)
+                ++g_stats.depth_camera_disagrees;
+        } else if (proven == DepthCompare::None) {
+            ++g_stats.depth_unproven;
+            ++g_stats.missed;
+            static char why[192];
+            std::snprintf(why, sizeof why,
+                          "No camera, and the depth direction is not proven yet from the scene's own depth writes (%s: %u and %u writing draws either way, %u clears).",
+                          DepthVerdictName(verdict), ev.less, ev.greater, ev.clears);
+            return SetReason(why);
+        } else {
+            f.reversed_depth = proven == DepthCompare::NearIsGreater;
+        }
+    }
+    f.camera_known = have_camera;
+    std::vector<uint8_t> camera_bytes; // the callback runs without g_mu
+    if (have_camera) {
+        camera_bytes = *upload->bytes;
+        f.camera.buffer = cam_sel.camera_cb;
+        f.camera.vs_slot = cam_sel.camera_slot >= 0 && cam_sel.camera_slot < kPsCbBase ? cam_sel.camera_slot : -1;
+        f.camera.ps_slot = cam_sel.camera_slot >= kPsCbBase ? cam_sel.camera_slot - kPsCbBase : -1;
+        f.camera.first_constant = g_camera_first;
+        f.camera.held = held;
+        f.camera.num_constants = g_camera_num;
+        f.camera.version = version;
+        f.camera.bytes_first_constant = upload->first_constant;
+        f.camera.split_pose = split_pose;
+        if (cam.derived_inverse) f.camera.no_inverse_pose = cam.vp;
+        f.camera.bytes = camera_bytes.data();
+        f.camera.size = static_cast<uint32_t>(camera_bytes.size());
+    }
     const bool vpj_route = g_vpj_route.load(std::memory_order_relaxed);
     if (vpj_route && g_vpj_mixed) {
         ++g_vpj_mixed_frames;
         ++g_stats.missed;
         return SetReason("Scene draws used different viewport jitter samples or raster footprints.");
     }
-    f.camera.raster_jitter_qualified = vpj_route || (f.camera.vs_slot >= 0 && cam.raster_jitter_qualified);
-    f.camera.viewport_jitter = vpj_route;
-    f.camera.viewport_expanded = vpj_route && g_vpj_executed_expanded;
-    f.camera.jitter_applied = vpj_route ? g_vpj_executed_sample != 0 : (f.camera.raster_jitter_qualified && g_jitter_written);
+    // The raster sample is a fact about how the scene was drawn. Only the matrix route needs a camera
+    // (it writes the sample into one); the viewport route never does.
+    f.raster.viewport = vpj_route;
+    f.raster.qualified = vpj_route || (have_camera && f.camera.vs_slot >= 0 && cam.raster_jitter_qualified);
+    f.raster.expanded = vpj_route && g_vpj_executed_expanded;
+    f.raster.applied = vpj_route ? g_vpj_executed_sample != 0 : (f.raster.qualified && g_jitter_written);
     if (vpj_route) {
-        static_assert(sizeof(f.camera.jitter_px) == sizeof(g_vpj_executed_sample));
-        std::memcpy(f.camera.jitter_px, &g_vpj_executed_sample, sizeof(f.camera.jitter_px));
-    } else if (f.camera.jitter_applied) {
-        f.camera.jitter_px[0] = static_cast<float>(g_jitter.x_pixels);
-        f.camera.jitter_px[1] = static_cast<float>(g_jitter.y_pixels);
+        static_assert(sizeof(f.raster.jitter_px) == sizeof(g_vpj_executed_sample));
+        std::memcpy(f.raster.jitter_px, &g_vpj_executed_sample, sizeof(f.raster.jitter_px));
+    } else if (f.raster.applied) {
+        f.raster.jitter_px[0] = static_cast<float>(g_jitter.x_pixels);
+        f.raster.jitter_px[1] = static_cast<float>(g_jitter.y_pixels);
     }
+    // The same facts where the camera's readers have always found them.
+    f.camera.raster_jitter_qualified = f.raster.qualified;
+    f.camera.viewport_jitter = f.raster.viewport;
+    f.camera.viewport_expanded = f.raster.expanded;
+    f.camera.jitter_applied = f.raster.applied;
+    std::memcpy(f.camera.jitter_px, f.raster.jitter_px, sizeof(f.camera.jitter_px));
     {
         // WHY log: what the consumer is told the jitter was, beside what the scene draws carried.
         // The first frames of a session, then a burst of sixteen about every ten seconds, so one
@@ -1182,7 +1267,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         std::memcpy(&told, f.camera.jitter_px, sizeof told);
         g_vpj_told.store(told, std::memory_order_relaxed);
     }
-    {
+    if (have_camera) {
         // WHY log: the delivered camera's path. A camera read from one source moves smoothly; one
         // that hops between two sources steps back and forth.
         static bool have = false;
@@ -1214,24 +1299,35 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     // tagged when the game last uploaded to it.
     // A buffer selected before its first candidate upload has no tag yet: its first tag is not a change.
     uint64_t cam_inc = 0;
-    if (cam_sel.camera_cb) {
+    if (have_camera && cam_sel.camera_cb) {
         auto it = g_cb_incarnation.find(cam_sel.camera_cb);
         if (it != g_cb_incarnation.end()) cam_inc = it->second;
     }
+    // The scene's own identity (colour and depth objects). A camera buffer that changes, appears or
+    // goes is not a change of scene: it moves `stream` below, which only the camera's consumer reads.
+    f.scene_changed = !g_scene_stream || f.color.incarnation != g_scene_key[0] || f.depth.incarnation != g_scene_key[1];
+    if (f.scene_changed) ++g_scene_stream;
+    g_scene_key[0] = f.color.incarnation;
+    g_scene_key[1] = f.depth.incarnation;
+    f.scene_stream = g_scene_stream;
     // VARIANT: camera11/all-uploads-when-buffers-rotate
     // A game that binds a different buffer object every frame gives a new camera buffer on every
     // frame; that says nothing about the scene, and counting it as a change of inputs made DLSS
     // drop its history each frame (p40940: reset on 30 of 30 captured frames). A real cut is
     // still found from the camera's own path.
-    const bool camera_changed = !g_collect_all &&
+    // A frame handed over without a camera neither changes nor forgets the camera's key: the same
+    // camera buffer met again afterwards is not a change of inputs.
+    const bool camera_changed = have_camera && !g_collect_all &&
         (cam_sel.camera_cb != g_stream_key[2] || (cam_inc && g_stream_key[3] && cam_inc != g_stream_key[3]));
     f.selection_changed = !g_stream || f.color.incarnation != g_stream_key[0] || f.depth.incarnation != g_stream_key[1] ||
                           camera_changed;
     if (f.selection_changed) ++g_stream;
     g_stream_key[0] = f.color.incarnation;
     g_stream_key[1] = f.depth.incarnation;
-    g_stream_key[2] = cam_sel.camera_cb;
-    if (cam_inc || f.selection_changed) g_stream_key[3] = cam_inc;
+    if (have_camera) {
+        g_stream_key[2] = cam_sel.camera_cb;
+        if (cam_inc || f.selection_changed) g_stream_key[3] = cam_inc;
+    }
     f.stream = g_stream;
     g_last_selection = cam_sel;
     const SceneCallback cb = g_cb;
@@ -1360,6 +1456,20 @@ void NoteViewportDraw(const Event& e)
     if (e.viewport_sample) ++g_vpj_frame_draws;
 }
 
+// Depth direction evidence (depth_direction.hpp), in immediate draw order and while replaying
+// executed command lists, under g_mu: writes into the selected depth and its clears. Draws after
+// the scene was handed over are the HUD's and are not evidence about the scene.
+void NoteDepthDirection(const Event& e)
+{
+    const Id depth = g_model.Current().depth;
+    if (!depth) return;
+    if (e.kind == Kind::Draw) {
+        if (e.depth == depth && e.depth_func && !g_frame_fired) g_depth_dir.NoteWrite(e.depth_func);
+    } else if (e.kind == Kind::ClearDepth && e.resource == depth && !g_frame_fired) {
+        g_depth_dir.NoteClear(e.clear_depth);
+    }
+}
+
 // ---------------------------------------------------------------- events
 void StopViewportJitterAfterScene();
 void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {}, const ExactSet& exact = {})
@@ -1390,6 +1500,7 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
     const uint32_t v = g_model.Feed(e);
     RememberSceneUploads(e, exact.get());
     NoteViewportDraw(e);
+    NoteDepthDirection(e);
     if (e.kind == Kind::CbUpdate && uploads.primary.bytes)
         SaveCameraUpload(e.resource, v, std::move(uploads));
 }
@@ -1559,6 +1670,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.rt_count = x->rt_count;
     e.depth = x->depth;
     e.depth_test = x->depth_test;
+    e.depth_func = x->depth_func;
     e.vertices = vertices;
     e.indirect = indirect;
     e.viewport_sample = x->vpj_applied ? x->vpj_sample : 0;
@@ -1583,7 +1695,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         }
     }
     ExactSet exact;
-    if (picture_draw || layer_draw) exact = ExactForDraw(c, x);
+    if ((picture_draw || layer_draw) && !CameraOff()) exact = ExactForDraw(c, x); // camera bytes: not read when no camera is looked for
     Emit(x, c, e, {}, exact);
     if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
 }
@@ -1716,6 +1828,7 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
     {
         std::lock_guard<std::mutex> l(g_mu);
         if (g_vpj_route.load(std::memory_order_relaxed)) return false; // jitter goes through the viewports; never both
+        if (CameraOff()) return false; // no camera is looked for: none is written to, from the frame the switch is made
         const auto& selection = g_model.Current();
         // A PS-only pose can reconstruct camera motion. Rewriting it cannot
         // move the scene's raster samples and must not be reported as jitter.
@@ -2023,12 +2136,14 @@ void STDMETHODCALLTYPE OMSetDepthStencilState_d(ID3D11DeviceContext* c, ID3D11De
 {
     Ctx* x = Get(c);
     if (x) {
-        if (!s) x->depth_test = true; // default state: depth test on
+        if (!s) { x->depth_test = true; x->depth_func = kCompareLess; } // default state: depth test on, LESS, writing
         else {
             D3D11_DEPTH_STENCIL_DESC d{};
             Inside in;
             s->GetDesc(&d);
             x->depth_test = d.DepthEnable != FALSE;
+            // Depth direction evidence: the comparison counts only on draws that also write the depth.
+            x->depth_func = d.DepthEnable && d.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL ? static_cast<uint8_t>(d.DepthFunc) : uint8_t{0};
         }
     }
     O(c, x).om_dss(c, s, ref);
@@ -2076,6 +2191,7 @@ void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11Dep
         Event e;
         e.kind = Kind::ClearDepth;
         e.resource = id;
+        e.clear_depth = d;
         Emit(x, c, e);
     }
     O(c, x).clear_dsv(c, v, flags, d, s);
@@ -2142,6 +2258,7 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
                 if (next_exact < exact.size() && exact[next_exact].first == i) current_exact = exact[next_exact++].second.get();
                 RememberSceneUploads(events[i], current_exact);
                 NoteViewportDraw(events[i]);
+                NoteDepthDirection(events[i]);
                 if (events[i].kind == Kind::CbUpdate && next_bytes < bytes.size() && bytes[next_bytes].first == i) {
                     const auto& upload = bytes[next_bytes++].second;
                     SaveCameraUpload(events[i].resource, v, upload);
@@ -2257,9 +2374,10 @@ bool OnPresent(IDXGISwapChain* swap)
         g_prev_found_collecting = collecting && g_frame_found;
     }
     g_frame_fired = g_frame_found = g_frame_no_bytes = false;
+    g_depth_dir.EndFrame(); // the next frame's evidence starts empty; what is proven stays
     SetSceneHanded(false);
     TexturesOnPresent();
-    g_collect_camera.store(!g_camera.found || g_rel_learner.armed() || g_collect_all, std::memory_order_relaxed);
+    g_collect_camera.store(!CameraOff() && (!g_camera.found || g_rel_learner.armed() || g_collect_all), std::memory_order_relaxed);
     // Retire upload shadows not in the next scene's acquisition set. Draw-time
     // snapshots keep their own ownership until this frame is closed.
     if (g_cb_latest.size() > 512) {
@@ -2343,7 +2461,7 @@ bool OnPresent(IDXGISwapChain* swap)
     g_jitter_written = false;
     // A request covers exactly the frame that starts here: without a new one (a missed or failed
     // evaluation), the next frame's camera is the game's own, unjittered.
-    g_jitter_active = g_jitter_requested && g_camera.found;
+    g_jitter_active = g_jitter_requested && g_camera.found && !CameraOff(); // the matrix write needs a camera that is being looked for
     g_jitter = neural_alias::JitterSample{g_next_jitter[0], g_next_jitter[1]};
     // Viewport route: the same one-frame request, applied on the scene draws of the frame starting here.
     const uint32_t jittered_draws = g_vpj_frame_draws;
@@ -2593,12 +2711,23 @@ void Uninstall()
     g_sel_depth.store(0);
     g_sel_depth2.store(0);
     g_vpj_sample.store(0);
+    g_depth_dir.Reset();
 }
 
 void SetJitterRoute(JitterRoute route)
 {
     g_vpj_route.store(route == JitterRoute::Viewport, std::memory_order_relaxed);
     if (route != JitterRoute::Viewport) g_vpj_sample.store(0, std::memory_order_release); // bound copies restore at the next draw
+}
+
+void SetCameraUse(CameraUse use)
+{
+    const auto next = static_cast<uint8_t>(use);
+    if (g_camera_use.exchange(next, std::memory_order_relaxed) == next) return;
+    std::lock_guard<std::mutex> l(g_mu);
+    g_held.valid = false; // a camera held from before the change is not carried across it
+    na::eventlog::Emit("native11_camera_use", "frame=%llu use=%s", static_cast<unsigned long long>(g_frame),
+                       use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required");
 }
 
 void SetNextJitter(float x_px, float y_px)
@@ -2630,8 +2759,14 @@ int FormatStatus(char* out, unsigned long n)
     int is_backbuffer = -1;
     bool keep_all = false;
     FrameModel::Stats placement;
+    DepthCompare depth_proven = DepthCompare::None;
+    DepthEvidence depth_seen;
+    uint64_t depth_flips = 0;
     {
         std::lock_guard<std::mutex> l(g_mu);
+        depth_proven = g_depth_dir.Proven();
+        depth_seen = g_depth_dir.Last();
+        depth_flips = g_depth_dir.Flips();
         layout = g_rel_layout;
         layout_learned = g_rel_learned;
         scene_layered = g_model.Layered();
@@ -2719,7 +2854,19 @@ int FormatStatus(char* out, unsigned long n)
                                    static_cast<unsigned long long>(g_foreign_calls.load(std::memory_order_relaxed)),
                                    g_sel_depth2.load(std::memory_order_relaxed) ? 1 : 0,
                                    static_cast<unsigned long long>(g_vpj_stopped_after_scene.load(std::memory_order_relaxed)));
-    return tail < 0 ? head : head + tail;
+    if (tail < 0 || static_cast<size_t>(head + tail) >= n) return tail < 0 ? head : head + tail;
+    // The camera's part in handing frames over, and the depth direction learned without one.
+    const auto use = static_cast<CameraUse>(g_camera_use.load(std::memory_order_relaxed));
+    const int more = std::snprintf(out + head + tail, n - head - tail,
+                                   " camera_use{mode=%s handed_without_looking=%llu handed_none_found=%llu} "
+                                   "depth_direction{%s writes_less=%u writes_greater=%u equal=%u clears=%u clear=%.6g unproven_frames=%llu flips=%llu camera_disagrees=%llu}",
+                                   use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required",
+                                   static_cast<unsigned long long>(s.camera_off), static_cast<unsigned long long>(s.camera_absent),
+                                   depth_proven == DepthCompare::NearIsLess ? "near_is_less" : depth_proven == DepthCompare::NearIsGreater ? "near_is_greater" : "unproven",
+                                   depth_seen.less, depth_seen.greater, depth_seen.equal, depth_seen.clears, depth_seen.clear,
+                                   static_cast<unsigned long long>(s.depth_unproven), static_cast<unsigned long long>(depth_flips),
+                                   static_cast<unsigned long long>(s.depth_camera_disagrees));
+    return more < 0 ? head + tail : head + tail + more;
 }
 
 } // namespace na::native11

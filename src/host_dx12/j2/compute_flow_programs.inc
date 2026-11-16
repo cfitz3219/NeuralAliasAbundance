@@ -1,8 +1,14 @@
 // Shared pipeline construction adapted from j2_flow.cpp.
-    ComPtr<ID3DBlob> cs_encode, cs_accept, err;
+    ComPtr<ID3DBlob> cs_encode, cs_accept, cs_measure, cs_cut_state, cs_cut_show, err;
     if (FAILED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "encode", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_encode, &err)) ||
         FAILED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "accept", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_accept, &err)))
         return false;
+    // The camera-free programs. A failure here leaves the residual path above working: measured
+    // motion is then unavailable and says so (Record, Frame::total).
+    const bool camera_free =
+        SUCCEEDED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "measure", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_measure, &err)) &&
+        SUCCEEDED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "cut_state", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_cut_state, &err)) &&
+        SUCCEEDED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "cut_show", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_cut_show, &err));
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 8;
@@ -38,4 +44,13 @@
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_encode)))) return false;
     pd.CS = {cs_accept->GetBufferPointer(), cs_accept->GetBufferSize()};
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_accept)))) return false;
+    if (camera_free) {
+        pd.CS = {cs_measure->GetBufferPointer(), cs_measure->GetBufferSize()};
+        const bool a = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_measure)));
+        pd.CS = {cs_cut_state->GetBufferPointer(), cs_cut_state->GetBufferSize()};
+        const bool b = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_cut_state)));
+        pd.CS = {cs_cut_show->GetBufferPointer(), cs_cut_show->GetBufferSize()};
+        const bool c = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_cut_show)));
+        if (!a || !b || !c) { g.pso_measure.Reset(); g.pso_cut_state.Reset(); g.pso_cut_show.Reset(); }
+    }
     return true;
