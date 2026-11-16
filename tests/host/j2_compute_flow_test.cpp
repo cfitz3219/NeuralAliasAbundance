@@ -8,9 +8,12 @@
 #include "core/camera_fit_gpu.hpp"
 #include <vector>
 #include <cmath>
+#include <limits>
+#include "total_motion_gpu_audit.hpp"
 int main(int argc,char**){
     if(!na::ffx_flow::Built())return test::kSkip;
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    REQUIRE(AuditTotalMotionShader(d)==0);
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
     const unsigned w=argc>1?1920:512,h=argc>1?1080:256;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     test::List l;REQUIRE(l.Create(d.device.Get()));std::vector<test::ComPtr<ID3D12Resource>> uploads;
@@ -151,6 +154,101 @@ int main(int argc,char**){
             else CHECK(still/sn>.15); // old failure is reproduced on the identical pictures
         }
         camera.fix=nullptr;camera.fit_basis=nullptr;na::jitter::Remembered().enabled=false;
+    }
+    // Independent audit: the actual AMD search -> expansion -> total refinement -> arbiter,
+    // with all camera data absent/poisoned. Readbacks and waits are test-only.
+    {
+        cf::Reset();
+        auto total_image=[&](float dx,float jx,float jy,int solid=-1){
+            auto r=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_NONE);
+            auto up=test::CreateBuffer(d.device.Get(),w*h*4,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+            unsigned* data=nullptr;up->Map(0,nullptr,reinterpret_cast<void**>(&data));
+            for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){
+                const float X=float(x)-dx-jx,Y=float(y)-jy;
+                const float z=.5f+.18f*std::sin(.17f*X)+.14f*std::sin(.11f*X+.13f*Y)+.12f*std::cos(.07f*Y)+.05f*std::sin(.09f*X-.21f*Y);
+                const unsigned v=solid>=0?unsigned(solid):unsigned(std::lround(255.f*z));
+                data[y*w+x]=0xff000000u|v*0x010101u;
+            }
+            up->Unmap(0,nullptr);D3D12_TEXTURE_COPY_LOCATION a{},b{};
+            a.pResource=up.Get();a.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;a.PlacedFootprint.Footprint={DXGI_FORMAT_R8G8B8A8_UNORM,w,h,1,w*4};
+            b.pResource=r.Get();b.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;l.list->CopyTextureRegion(&b,0,0,0,&a,nullptr);
+            auto bar=test::Transition(r.Get(),D3D12_RESOURCE_STATE_COPY_DEST,S);l.list->ResourceBarrier(1,&bar);uploads.push_back(up);return r;
+        };
+        na::motion::gpu::Inputs independent{};
+        const float nan=std::numeric_limits<float>::quiet_NaN();
+        for(int i=0;i<16;++i)independent.inv_view_proj_current.m[i]=independent.view_proj_previous.m[i]=nan;
+        independent.jitter_current_px[0]=independent.jitter_current_px[1]=nan;
+        independent.depth_clear=1.f;
+        independent.tier1_source=na::motion::Tier1Source::Estimated;
+        auto motion=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R32G32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto provenance=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R8_UINT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto read=test::CreateBuffer(d.device.Get(),w*h*8,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        const unsigned prov_stride=(w+255u)&~255u;
+        auto read_prov=test::CreateBuffer(d.device.Get(),prov_stride*h,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        auto copy=[&](ID3D12Resource* texture,DXGI_FORMAT format,unsigned row,ID3D12Resource* target){
+            auto bar=test::Transition(texture,U,D3D12_RESOURCE_STATE_COPY_SOURCE);l.list->ResourceBarrier(1,&bar);
+            D3D12_TEXTURE_COPY_LOCATION a{},b{};a.pResource=texture;a.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            b.pResource=target;b.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;b.PlacedFootprint.Footprint={format,w,h,1,row};
+            l.list->CopyTextureRegion(&b,0,0,0,&a,nullptr);std::swap(bar.Transition.StateBefore,bar.Transition.StateAfter);l.list->ResourceBarrier(1,&bar);
+        };
+        const float shifts[]={0,0,.125f,.375f,.125f,3.125f,3.125f};
+        const float jitx[]={.25f,-.375f,.125f,-.25f,.375f,-.125f,.25f};
+        const float jity[]={-.25f,.125f,.375f,-.125f,.25f,-.375f,-.25f};
+        for(unsigned i=0;i<7;++i){
+            auto scene=total_image(shifts[i],jitx[i],jity[i]);
+            cf::Frame tf;tf.total=true;tf.frame=5000+i;tf.previous=i?tf.frame-1:0;tf.generation=99;tf.source_generation=99;
+            tf.raster_sample=tf.raster_confirmed=true;tf.raster_jitter[0]=tf.jitter[0]=jitx[i];tf.raster_jitter[1]=tf.jitter[1]=jity[i];
+            tf.last_reset_frame=5000;
+            cf::Tier3 total_tier;auto ticket=cf::Record(l.list.Get(),d.queue.Get(),scene.Get(),depth.Get(),independent,tf,total_tier);
+            REQUIRE(ticket.context);CHECK(ticket.pair==(i!=0));CHECK(!total_tier.residual && !total_tier.fix);
+            if(i){
+                REQUIRE(total_tier.total && total_tier.total_valid);
+                independent.tier1_motion=total_tier.total;independent.tier1_valid=total_tier.total_valid;independent.tier1_valid_flag=true;
+                na::motion::gpu::Outputs mo{motion.Get(),provenance.Get(),nullptr,w,h};REQUIRE(arbiter.Dispatch(l.list.Get(),independent,mo,0));
+                copy(motion.Get(),DXGI_FORMAT_R32G32_FLOAT,w*8,read.Get());copy(provenance.Get(),DXGI_FORMAT_R8_UINT,prov_stride,read_prov.Get());
+            }
+            execute();cf::Committed(ticket);reset();
+            if(i){
+                float* data=nullptr;unsigned char* tags=nullptr;REQUIRE(SUCCEEDED(read->Map(0,nullptr,reinterpret_cast<void**>(&data))));
+                REQUIRE(SUCCEEDED(read_prov->Map(0,nullptr,reinterpret_cast<void**>(&tags))));
+                double err=0,meanx=0,meany=0;unsigned count=0,estimated=0,wrong_tag=0;
+                const double expected=shifts[i-1]-shifts[i];
+                for(unsigned y=16;y<h-16;++y)for(unsigned x=16;x<w-16;++x){const size_t k=size_t(y)*w+x;
+                    err+=std::hypot(data[k*2]-expected,data[k*2+1]);meanx+=data[k*2];meany+=data[k*2+1];++count;
+                    const auto tag=tags[size_t(y)*prov_stride+x];
+                    if(tag==na::motion::NA_MOTION_ESTIMATED)++estimated;
+                    else if(tag!=na::motion::NA_MOTION_INVALID)++wrong_tag;
+                }
+                read->Unmap(0,nullptr);read_prov->Unmap(0,nullptr);
+                const auto s=cf::GetStats();
+                std::printf("total pipeline i=%u expected=%.3f mean=(%.4f,%.4f) error=%.4f estimated=%u/%u wrong_tag=%u GPU=%.3fms cuts=%llu\n",
+                    i,expected,meanx/count,meany/count,err/count,estimated,count,wrong_tag,s.ms,(unsigned long long)s.total_cuts);
+                CHECK(wrong_tag==0);CHECK(estimated>count*9/10);CHECK(err/count<.13);
+            }
+        }
+        // A strong image cut must hide the old temporal picture on the cut frame and stop hiding it
+        // when the caller submits the requested reset. Grey 47 is the synthetic DLSS output witness.
+        auto show=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R8G8B8A8_UNORM,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto shown=test::CreateBuffer(d.device.Get(),w*h*4,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        auto marker=total_image(0,0,0,47);auto white=total_image(0,0,0,250);
+        auto mark=[&]{
+            auto a=test::Transition(marker.Get(),S,D3D12_RESOURCE_STATE_COPY_SOURCE),b=test::Transition(show.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_RESOURCE_BARRIER bars[]={a,b};l.list->ResourceBarrier(2,bars);l.list->CopyResource(show.Get(),marker.Get());
+            for(auto& bar:bars)std::swap(bar.Transition.StateBefore,bar.Transition.StateAfter);l.list->ResourceBarrier(2,bars);
+        };
+        for(unsigned i=0;i<3;++i){
+            cf::Frame tf;tf.total=true;tf.frame=5007+i;tf.previous=tf.frame-1;tf.generation=99;tf.source_generation=99;
+            tf.raster_sample=tf.raster_confirmed=true;tf.last_reset_frame=i==2?5008:5000;
+            cf::Tier3 total_tier;auto ticket=cf::Record(l.list.Get(),d.queue.Get(),white.Get(),depth.Get(),independent,tf,total_tier);
+            REQUIRE(ticket.context && ticket.pair && total_tier.total);
+            mark();cf::RecordCutShow(l.list.Get(),ticket,white.Get(),show.Get());copy(show.Get(),DXGI_FORMAT_R8G8B8A8_UNORM,w*4,shown.Get());
+            execute();cf::Committed(ticket);reset();
+            unsigned* data=nullptr;REQUIRE(SUCCEEDED(shown->Map(0,nullptr,reinterpret_cast<void**>(&data))));
+            const unsigned pixel=data[(h/2)*w+w/2]&255u;shown->Unmap(0,nullptr);
+            const auto s=cf::GetStats();std::printf("cut show i=%u reset=%d pixel=%u cuts=%llu cut_frame=%llu\n",i,ticket.cut_reset,pixel,(unsigned long long)s.total_cuts,(unsigned long long)s.total_cut_frame);
+            if(i==0){CHECK(s.total_cuts>0);CHECK(pixel==250);}
+            else {CHECK(pixel==47);CHECK(ticket.cut_reset==(i==1));}
+        }
     }
     cf::Reset();CHECK(d.device->GetDeviceRemovedReason()==S_OK);execute();return test::finish("j2_compute_flow_test");
 }

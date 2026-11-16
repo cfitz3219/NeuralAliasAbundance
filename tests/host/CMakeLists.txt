@@ -441,6 +441,8 @@ if(TARGET host_native11)
     target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
     add_test(NAME host_native11_dlaa_automatic_test COMMAND native11_dlaa_test --automatic)
     set_tests_properties(host_native11_dlaa_automatic_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    add_test(NAME host_native11_dlaa_camera_off_start_test COMMAND native11_dlaa_test --camera-off-start)
+    set_tests_properties(host_native11_dlaa_camera_off_start_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_custom_command(TARGET native11_dlaa_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_dlaa_test>")
     # The same test with DLSS in the 64-bit companion program: the route every 32-bit game takes.
@@ -452,6 +454,9 @@ if(TARGET host_native11)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:NeuralAliasDlaa64>" "$<TARGET_FILE_DIR:native11_dlaa_test>")
       add_test(NAME host_native11_dlaa_companion_test COMMAND native11_dlaa_test)
       set_tests_properties(host_native11_dlaa_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
+        LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
+      add_test(NAME host_native11_dlaa_camera_off_start_companion_test COMMAND native11_dlaa_test --camera-off-start)
+      set_tests_properties(host_native11_dlaa_camera_off_start_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
         LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
     endif()
   endif()
