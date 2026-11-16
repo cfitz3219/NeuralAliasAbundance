@@ -86,7 +86,7 @@ void Store(uint8_t* dst, const M& m)
 }
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     na::gpu::SetBackendForTests(na::gpu::TestBackend::Native);
     setvbuf(stdout, nullptr, _IONBF, 0); // progress survives a timeout kill
@@ -240,6 +240,10 @@ float4 PS(float4 p : SV_Position) : SV_Target
         na::j2::Execute(d.queue.Get(), 2, lists, &Forward);
         d.WaitIdle();
         const auto s = na::j2::GetStats();
+        const auto flow = na::j2::compute_flow::GetStats();
+        std::printf("measured flow: submitted=%llu pairs=%llu busy=%llu unavailable=%llu reason=%s\n",
+                    static_cast<unsigned long long>(flow.submitted), static_cast<unsigned long long>(flow.pairs),
+                    static_cast<unsigned long long>(flow.busy), static_cast<unsigned long long>(flow.unavailable), flow.reason);
         const bool ran = fake::evals > evals;
         std::printf("frame %2d %-22s forwarded %zu dlss %d reset %d jitter %+.3f %+.3f | camera %llu measured %llu (no pair %llu why %u, cut %llu, unavailable %llu, camera back %llu) held %llu waiting %llu | depth counting %u near %u verdict %u greater %u less %u clears %u unproven %llu | \"%s\"\n",
                     number, what, g_forwarded.size(), ran ? 1 : 0, ran ? fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) : -1,
@@ -260,6 +264,43 @@ float4 PS(float4 p : SV_Position) : SV_Target
     na::settings::Get().j2_route.store(1); // the fixed between-list route, as in j2_live_test
     na::j2::SetJitter(true);
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
+
+    if (argc > 1 && std::strcmp(argv[1], "--recording-proof") == 0) {
+        // Audit regression: a recording which is never executed cannot prove how the selected
+        // scene depth was written. This mode intentionally exposes the 9bc4bcd global vote bug.
+        na::observe::SetDepthWriteEvidence(true);
+        const auto depth_id = na::observe::IdOf(depth.Get());
+        na::observe::TakeDepthWriteEvidence(depth_id);
+        scene.Reset();
+        auto* l = scene.list.Get();
+        const D3D12_RESOURCE_BARRIER transitions[2] = {
+            test::Transition(color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            test::Transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
+        l->ResourceBarrier(2, transitions);
+        l->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.f, 0, 0, nullptr);
+        l->SetGraphicsRootSignature(rs.Get());
+        ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
+        l->SetDescriptorHeaps(1, heaps);
+        l->SetGraphicsRootConstantBufferView(0, va + 1024);
+        l->SetGraphicsRootDescriptorTable(1, cbvh->GetGPUDescriptorHandleForHeapStart());
+        l->SetPipelineState(pso.Get());
+        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VIEWPORT vp{0, 0, float(W), float(H), 0, 1};
+        const D3D12_RECT rect{0, 0, LONG(W), LONG(H)};
+        l->RSSetViewports(1, &vp); l->RSSetScissorRects(1, &rect);
+        l->DrawInstanced(3, 1, 0, 0);
+        REQUIRE(SUCCEEDED(l->Close()));
+        const auto evidence = na::observe::TakeDepthWriteEvidence(depth_id);
+        std::printf("never-submitted depth recording: less=%u greater=%u clears=%u (all must be zero)\n",
+                    evidence.less, evidence.greater, evidence.clears);
+        CHECK(evidence.less == 0 && evidence.greater == 0 && evidence.clears == 0);
+        na::observe::SetDepthWriteEvidence(false);
+        na::j2::SetEnabled(false); na::j2::Shutdown(); na::dlss::Shutdown();
+        na::dlss::SetInitOwnOverrideForTests(nullptr);
+        na_observe_stop(); na::observe::SetProcessExiting();
+        return test::finish("j2_no_camera_recording_proof_test");
+    }
 
     // 1. The camera is never looked for.
     na::settings::Get().j2_camera.store(0);

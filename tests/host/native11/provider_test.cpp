@@ -602,6 +602,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 {
 #if defined(NA_TEST_NATIVE_DLAA)
     const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
+    const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const auto dir = std::filesystem::path(exe).parent_path();
@@ -624,7 +625,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
-        !set(L"j2", L"camera", L"2") || // the phases below test the camera itself; the no-camera phase switches it live
+        !set(L"j2", L"camera", camera_off_start ? L"0" : L"2") ||
 
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
     na::host::WaitForObserveInstall();
@@ -696,6 +697,44 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #endif
     expect(installed, "the provider's hooks install on the game's device");
     if (!installed) return 1;
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (camera_off_start) {
+        // Cold start: no earlier camera-backed frame, no hand-written next jitter, no warm flow pair.
+        // Run the production host and real NGX (also via NA_DLAA_COMPANION=1). Camera bytes exist in
+        // this synthetic game's rendering, but discovery must never read or publish them.
+        g_no_camera_phase = 1;
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        unsigned raster_samples = 0;
+        for (int frame = 0; frame < 48; ++frame) {
+            Pump();
+            const auto before = g_seen.calls;
+            Scene(g.ctx.Get(), g, frame);
+            Post(g.ctx.Get(), g, true);
+            g.swap->Present(0, 0);
+            if (g_seen.calls > before && g_seen.last.raster.applied &&
+                (g_seen.last.raster.jitter_px[0] != 0 || g_seen.last.raster.jitter_px[1] != 0)) ++raster_samples;
+        }
+        const auto s = na::native11::Stats();
+        char wide[8192]{};
+        na::native_d3d11::FormatStatus(wide, sizeof wide);
+        std::printf("cold camera-off: calls=%llu delivered=%llu raster_samples=%u | %s\n",
+                    static_cast<unsigned long long>(g_seen.calls), static_cast<unsigned long long>(evaluations), raster_samples, wide);
+        expect(g_seen.calls >= 30 && evaluations >= g_seen.calls - 2,
+               "camera-free cold start delivers real DLAA for every acquired frame after at most two seed frames");
+        expect(g_seen.without_camera == g_seen.calls && g_seen.camera_leak == 0 &&
+               s.camera_found == 0 && s.camera_missing == 0 && s.camera_held == 0,
+               "no discovered camera or camera-derived fact was used, even during bootstrap");
+        expect(g_seen.wrong_inputs == 0 && g_seen.no_scene == 0 && g_seen.scene_changed == 1 && g_seen.twice == 0,
+               "correct scene/depth identity survives bootstrap without repeated resets or duplicate deliveries");
+        expect(raster_samples >= 20, "production delivery schedules actual viewport samples without a test-provided jitter");
+        expect(std::strstr(wide, "camera_setting=0") && std::strstr(wide, "measured=0}") == nullptr,
+               "the production consumer names camera-independent measured motion");
+        DeleteFileW(ini.c_str());
+        std::printf(g_failed ? "FAIL: %d cold-start check(s) failed\n" : "PASS: camera-free cold start with real NGX\n", g_failed);
+        std::fflush(stdout);
+        ExitProcess(g_failed ? 1u : 0u);
+    }
+#endif
     // The production host selects the viewport route. The camera-matrix checks below exercise the
     // matrix route explicitly; the viewport route has its own phases.
     na::native11::SetJitterRoute(na::native11::JitterRoute::Matrix);
