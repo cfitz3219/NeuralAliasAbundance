@@ -26,6 +26,7 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/observe/producers.hpp"
 
@@ -93,6 +94,9 @@ int main()
     if (!test::CreateDevice(d)) return test::SkipNoDevice("j2_no_camera_test");
     ID3D12Device* dev = d.device.Get();
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
+    // As in the game: the measuring pass keeps its working memory on recording leases, and a list
+    // Reset starts a new one (without this it reports "recording lifetime unavailable").
+    REQUIRE(na::observe::InstallListResetTracking(dev, na::nr::OnCommandListReset));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
@@ -272,7 +276,13 @@ float4 PS(float4 p : SV_Position) : SV_Target
     CHECK(st.depth_near == 2 && st.depth_verdict == 0 && st.depth_writes_greater >= 1 && st.depth_writes_less == 0 && st.depth_clears >= 1);
     CHECK(st.depth_unproven == 1);
     const bool can_measure = st.measured_unavailable == 0;
-    std::printf("measured motion on this build and device: %s\n", can_measure ? "available" : "NOT available (frames without a camera are left as drawn)");
+    {
+        const auto fs = na::j2::compute_flow::GetStats();
+        std::printf("measured motion on this build and device: %s | measuring pass: pictures %llu pairs %llu unavailable %llu \"%s\"\n",
+                    can_measure ? "available" : "NOT available (frames without a camera are left as drawn)",
+                    static_cast<unsigned long long>(fs.total_frames), static_cast<unsigned long long>(fs.total_pairs),
+                    static_cast<unsigned long long>(fs.unavailable), fs.reason);
+    }
     if (can_measure) {
         // The first picture has nothing to be measured against: DLSS starts its history on it.
         CHECK(delivered() && fake::evals == evals + 1);
@@ -378,6 +388,14 @@ float4 PS(float4 p : SV_Position) : SV_Target
     CHECK(std::strncmp(st.reason, "Stopped", 7) != 0);
 
     na::settings::Get().j2_camera.store(1);
+    {
+        const auto fs = na::j2::compute_flow::GetStats();
+        std::printf("measuring pass at the end: pictures %llu pairs %llu scene cuts %llu unavailable %llu no pair by reason 1..7 = %llu %llu %llu %llu %llu %llu %llu \"%s\"\n",
+                    static_cast<unsigned long long>(fs.total_frames), static_cast<unsigned long long>(fs.total_pairs), static_cast<unsigned long long>(fs.total_cuts),
+                    static_cast<unsigned long long>(fs.unavailable), static_cast<unsigned long long>(fs.no_pair[1]), static_cast<unsigned long long>(fs.no_pair[2]),
+                    static_cast<unsigned long long>(fs.no_pair[3]), static_cast<unsigned long long>(fs.no_pair[4]), static_cast<unsigned long long>(fs.no_pair[5]),
+                    static_cast<unsigned long long>(fs.no_pair[6]), static_cast<unsigned long long>(fs.no_pair[7]), fs.reason);
+    }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
     na::j2::SetEnabled(false);
     d.WaitIdle();
