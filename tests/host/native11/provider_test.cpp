@@ -637,8 +637,10 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(!na::on12::AcceptPresentation(na::on12::GraphicsApi::Dx12),
                "a helper chain cannot replace the native device with DX12");
     }
-    char activation[2048]{};
+    static char activation[8192]{}; // the whole status line; it grows with every counter added
     na::on12::FormatStatus(activation, sizeof activation);
+    if (!std::strstr(activation, "native11_route=active installs=1 install_failures=0") || !std::strstr(activation, "wrapped=0"))
+        std::printf("activation status: %s\n", activation);
     expect(std::strstr(activation, "native11_route=active installs=1 install_failures=0") != nullptr &&
            std::strstr(activation, "dx11on12 enabled=0") != nullptr && std::strstr(activation, "wrapped=0") != nullptr,
            "production host installed the native provider exactly once");
