@@ -1164,9 +1164,9 @@ void DrawLiveDlaaEnhancements()
     BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
     if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
     EndRow();
-    if (native) {
+    {
         // VARIANT: camera/optional
-        // One control, live, saved per game ([j2] camera).
+        // One control, live, saved per game ([j2] camera), on both routes.
         na::settings::Settings& cs = na::settings::Get();
         static const char* kCameraUse[] = {"Use it when found", "Never look for it", "Require it (old behaviour)"};
         static const int kCameraValue[] = {1, 0, 2};

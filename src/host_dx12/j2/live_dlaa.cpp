@@ -23,6 +23,7 @@
 #include "host_dx12/j2/jitter_writes.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -123,6 +124,11 @@ struct PendingHistory {
     uint64_t camera_age=0;
     bool keep_reset = false; // a repeated frame: DLSS did not run, a pending history reset still applies
     uint64_t selection_version = 0; // live scene selection this evaluation used (same epoch = same version)
+    // Camera-free DLAA: this frame's motion was measured on the pictures (no camera gave it), and
+    // whether the frame carried a DLSS reset (the reset a measured scene cut waits for).
+    bool measured = false, reset = false;
+    bool no_camera = false; // the tracker was not given a camera on this frame
+    uint64_t frame = 0;
 };
 
 // CPU metadata of this frame's last submitted scene. No pooled command-list
@@ -220,6 +226,13 @@ struct State {
     na::wwii::SceneCameraReceipt wwii_submitted_camera;
     uint64_t frame = 1;             // game Present interval, not Execute attempt
     uint64_t submitted_frame = 0;   // last interval that actually submitted DLAA
+    // Camera-free DLAA (VARIANTS camera/optional, motion/measured-total, depth/direction-from-depth-writes).
+    bool no_camera_last = false;    // the last delivered frame had no camera: the tracker is a frame or more behind
+    bool measured_refused = false;  // the camera came back and that frame could not be measured: it starts with a reset instead
+    uint64_t last_reset_frame = 0;  // newest delivered frame that carried a DLSS reset
+    bool depth_evidence = false;    // observe is counting how the game writes the scene depth
+    uint32_t camera_streak = 0;     // frames in a row with a camera while that counting is on
+    na::native11::DepthDirection depth_dir; // the rule the DX11 provider uses, fed from observe here
     uint64_t eval_selection_version = 0; // live selection version of the last committed evaluation
     // Games may draw the scene across several submissions per frame (Sniper Elite
     // Resistance). DLAA belongs after the LAST of them, before post-processing
@@ -1642,6 +1655,10 @@ void committed_sources(const PendingHistory& p) {
     g.stats.depth_source_last=p.depth_source;g.stats.camera_source_last=p.camera_source;
     g.stats.camera_age_last=p.camera_age;
     g.stats.camera_age_max=(std::max)(g.stats.camera_age_max,p.camera_age);
+    // Whose motion the delivered frame got, and the newest delivered DLSS reset.
+    g.no_camera_last=p.no_camera;g.measured_refused=false;
+    if(p.measured)++g.stats.supplied_measured;else ++g.stats.supplied_camera;
+    if(p.reset)g.last_reset_frame=p.frame;
 }
 
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, UINT before, UINT after)
@@ -2273,8 +2290,27 @@ uint32_t jitter_phases()
     if (g_render_small.load(std::memory_order_relaxed) && g.rw && g.stats.small_ow) return JitterPhasesFor(g.rw, g.stats.small_ow);
     return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kDlaaJitterPhases;
 }
-// Viewport jitter ([j2] viewport_jitter): real samples through the game's own viewports.
-bool vpj_mode() { return na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed) != 0; }
+// VARIANT: camera/optional
+// [j2] camera: 1 = a found scene camera is used and a frame without one is no longer left alone,
+// 0 = never look for one, 2 = a camera is required (the behaviour before 2026-11-16).
+int camera_setting() { return na::settings::Get().j2_camera.load(std::memory_order_relaxed); }
+// Viewport jitter ([j2] viewport_jitter): real samples through the game's own viewports. Without a
+// camera there is no matrix to carry a sample, so the viewports carry it: always with the camera
+// never looked for, and otherwise from the frame after one delivered with no camera until the
+// frame a camera is delivered with again (DLAA without a sample is hardly DLAA).
+bool vpj_mode()
+{
+    return na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed) != 0 || camera_setting() == 0 || g.no_camera_last;
+}
+// Depth direction evidence costs draw time, so it is gathered only while asked for.
+void depth_evidence_want(bool on)
+{
+    if (g.depth_evidence == on) return;
+    g.depth_evidence = g.stats.depth_evidence = on;
+    na::observe::SetDepthWriteEvidence(on);
+    if (!on) { g.depth_dir.Reset(); g.stats.depth_near = 0; } // nothing is decided while nothing is counted
+    na::eventlog::Emit("j2_depth_evidence", "on=%u camera_setting=%d", on ? 1u : 0u, camera_setting());
+}
 // Draw-replay probe (SE5 smear, 2026-11-06): while DLAA/upscaling runs, count the scene draws that
 // match a draw of the previous frame, and whether their vertex buffers stayed put. One
 // replay_probe event at the first frame, then every 600 frames, with sums since the last one.
@@ -3041,6 +3077,7 @@ na::wwii::SceneCameraReceipt wwii_scene_camera(ID3D12CommandList* list, uint64_t
                                               uint64_t depth, uint32_t writes)
 {
     if (!writes || !na::observe::ListRendersTo(list, color, depth)) return {};
+    if (na::settings::Get().j2_camera.load(std::memory_order_relaxed) == 0) return {}; // never look for one
     const auto binds = na::observe::ListRootConstantBuffers(list);
     std::map<std::pair<uint64_t, uint64_t>, Block> candidates;
     for (const auto& b : binds) {
@@ -3292,6 +3329,7 @@ bool find_camera(ID3D12CommandList* const* lists, UINT scene, na_object_id depth
                  na::j2::InterloperFilter* judged)
 {
     *judged = g.interlopers;
+    if (camera_setting() == 0) return false; // never look for one: no block is read
     if (!find_camera_scan(lists, scene, depth_id, vp, reversed)) return false;
     na::j2::CameraPose p;
     if (!pose_of(*vp, &p)) return true;
@@ -3827,12 +3865,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     na::camera::Matrix vp{};
     bool reversed = false;
     bool held = false, from_j1 = false, held_still=false, extrapolated=false;
-    if (saved && saved->has_camera) { vp = saved->vp; reversed = saved->reversed; }
+    const int camera_use = camera_setting(); // 1 use when found, 0 never look, 2 required
+    const bool camera_off = camera_use == 0; // nothing below reads a camera
+    if (saved && saved->has_camera && !camera_off) { vp = saved->vp; reversed = saved->reversed; }
     if (repeat_only) { vp = g.cam_u1; reversed = g.cam_rev; held = true; } // no camera search: the last one is only a placeholder
     na::j2::InterloperFilter judged = g.interlopers;
     if (t_ic) t_ic->mark(kIcCamera);
     na::wwii::SceneCameraReceipt world_camera;
-    if (inl && !repeat_only && vpj_mode() && g.wwii_scene_camera.load(std::memory_order_relaxed)) {
+    if (inl && !repeat_only && !camera_off && vpj_mode() && g.wwii_scene_camera.load(std::memory_order_relaxed)) {
         if (g.wwii_submitted_camera.Matches(g.frame, color_id, depth_id))
             world_camera = g.wwii_submitted_camera;
         if (lists && lists[scene]) {
@@ -3847,11 +3887,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         vp = world_camera.camera.vp;
         reversed = true;
     }
-    const bool found = world_camera.writes || repeat_only ||
-        (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed, &judged));
+    const bool found = !camera_off && (world_camera.writes || repeat_only ||
+        (saved ? saved->has_camera : find_camera(lists, scene, depth_id, &vp, &reversed, &judged)));
     if (!world_camera.writes && saved && saved->judged && !repeat_only) judged = saved->interlopers;
     if (t_ic) t_ic->mark(kIcRecord);
-    if (!found && g.jit.valid && g.jit.applied && g.cam_f1) {
+    if (!found && !camera_off && g.jit.valid && g.jit.applied && g.cam_f1) {
         // Astra (COMMS 2026-11-02): the scene list's own blocks may not hold the camera, but
         // J1 found this frame's camera in an earlier batch and rewrote it with this sample:
         // that is the camera the frame was rendered with, and its jitter is known.
@@ -3866,7 +3906,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             ++g.stats.camera_from_j1;
         }
     }
-    if (!found && !from_j1) {
+    if (!found && !from_j1 && !camera_off) {
         // A camera read within the last few frames: predict this frame's (unjittered,
         // so no jitter is claimed for it) rather than leave the game's raw picture showing.
         // A still camera (the last two reads identical: SE5's menu) holds much longer; a
@@ -3888,19 +3928,73 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             if (velocity) ++g.stats.camera_extrapolated;
         }
     }
-    if (!found && !held && !from_j1) {
+    // VARIANT: camera/optional
+    // No camera this frame. Required: the frame waits for one, as before. Otherwise the pair's
+    // motion is measured on the two pictures (compute_flow, Frame::total) wherever this path can do
+    // that; where it cannot yet, the frame waits and the reason names the path.
+    const bool no_camera = !found && !held && !from_j1;
+    const char* cannot_measure = !g.arbiter_ok ? "the motion pass is unavailable" : windowed ? "projection window" :
+        deferred ? "render-small runs DLSS at Present" : upscaling ? "upscaling" : phys ? "Layer2 input" :
+        (saved && saved->at_present) ? "Present-time source" : nullptr;
+    if (no_camera && !camera_off) g.camera_offset = g.camera_param = -1; // relearn
+    if (camera_use == 2) depth_evidence_want(false); // a camera is required: its own answer is the only one used
+    if (no_camera && (camera_use == 2 || cannot_measure)) {
         ++g.stats.no_camera;
-        g.camera_offset = g.camera_param = -1; // relearn
-        char why[160];
-        std::snprintf(why, sizeof why, "Waiting for the camera (lists %zu, binds %zu, blocks %zu, read %zu, matrices %zu, view-proj %zu).",
-                      g_cd.lists, g_cd.binds, g_cd.blocks, g_cd.read, g_cd.cands, g_cd.vp);
+        char why[200];
+        if (!camera_off)
+            std::snprintf(why, sizeof why, "Waiting for the camera (lists %zu, binds %zu, blocks %zu, read %zu, matrices %zu, view-proj %zu).",
+                          g_cd.lists, g_cd.binds, g_cd.blocks, g_cd.read, g_cd.cands, g_cd.vp);
+        else
+            std::snprintf(why, sizeof why, "No camera is looked for, and motion cannot be measured on this path yet (%s).", cannot_measure);
         reason(why);
         return false;
     }
+    // VARIANT: depth/direction-from-depth-writes
+    // Which end of the depth is near. With a camera: its own answer, as before. Without one it is
+    // proven from how the game writes this depth (observe's DepthWriteEvidence, decided by the rule
+    // the DX11 provider uses). The counting runs only while a frame may have to do without a camera:
+    // always with the camera never looked for, otherwise from the first frame that has none until
+    // 300 frames in a row have had one.
+    if (camera_use == 2) {} // switched off above
+    else if (camera_off || no_camera) { g.camera_streak = 0; depth_evidence_want(true); }
+    else if (g.depth_evidence && ++g.camera_streak >= 300) depth_evidence_want(false);
+    if (g.depth_evidence) {
+        const auto seen = na::observe::TakeDepthWriteEvidence(depth_id);
+        na::native11::DepthEvidence de{};
+        de.less = seen.less; de.greater = seen.greater; de.equal = seen.equal; de.other = seen.other;
+        de.clears = seen.clears; de.clear = seen.clear; de.clear_mixed = seen.clear_mixed;
+        g.depth_dir.NoteSummed(de);
+        na::native11::DepthVerdict verdict = na::native11::DepthVerdict::NoWrites;
+        const na::native11::DepthCompare near_end = g.depth_dir.Decide(depth_id, &verdict);
+        g.depth_dir.EndFrame();
+        const uint32_t near_code = static_cast<uint32_t>(near_end), verdict_code = static_cast<uint32_t>(verdict);
+        if (near_code != g.stats.depth_near) // a decision made or changed: once, with the evidence that made it
+            na::eventlog::Emit("j2_depth_direction", "near=%s verdict=%s writes_less=%u writes_greater=%u equal=%u other=%u clears=%u clear=%.3f mixed=%u camera=%u",
+                               near_end == na::native11::DepthCompare::NearIsLess ? "less" : near_end == na::native11::DepthCompare::NearIsGreater ? "greater" : "none",
+                               na::native11::DepthVerdictName(verdict), de.less, de.greater, de.equal, de.other, de.clears, de.clear,
+                               de.clear_mixed ? 1u : 0u, no_camera ? 0u : 1u);
+        g.stats.depth_near = near_code; g.stats.depth_verdict = verdict_code;
+        g.stats.depth_writes_less = de.less; g.stats.depth_writes_greater = de.greater;
+        g.stats.depth_writes_equal = de.equal; g.stats.depth_clears = de.clears; g.stats.depth_clear = de.clear;
+        g.stats.depth_flips = g.depth_dir.Flips();
+        if (no_camera) {
+            if (near_end == na::native11::DepthCompare::None) {
+                ++g.stats.depth_unproven;
+                char why[224];
+                std::snprintf(why, sizeof why, "No camera, and which end of the depth is near is not proven yet (%s: depth-writing draws less %u, greater %u, equal %u; clears %u).",
+                              na::native11::DepthVerdictName(verdict), de.less, de.greater, de.equal, de.clears);
+                reason(why);
+                return false;
+            }
+            reversed = near_end == na::native11::DepthCompare::NearIsGreater;
+        } else if (near_end != na::native11::DepthCompare::None && (near_end == na::native11::DepthCompare::NearIsGreater) != reversed) {
+            ++g.stats.depth_camera_disagrees;
+        }
+    }
     if(t_ic) t_ic->mark(kIcSetup);
-    pending.camera_source=(saved && saved->has_camera)?6u:from_j1?2u:held?(extrapolated?5u:held_still?3u:4u):1u;
+    pending.camera_source=no_camera?0u:(saved && saved->has_camera)?6u:from_j1?2u:held?(extrapolated?5u:held_still?3u:4u):1u;
     pending.camera_age=held?g.frame-g.cam_f1:0u;
-    if (!held) remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
+    if (!held && !no_camera) remember_main_camera(vp); // J1: the main camera, for earlier batches next frame
     // Ring slot (never wait) and size/format changes (only once the GPU is done with the old set).
     const UINT64 done = g.fence->GetCompletedValue();
     Slot& s = g.slots[g.slot];
@@ -4007,7 +4101,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     pending.selection_version = na::observe::LiveSelectionVersion();
     const bool same_epoch = g.eval_selection_version && g.eval_selection_version == pending.selection_version;
     const uint64_t max_gap = same_epoch ? kMaxSameEpochGapFrames : kMaxGapFrames;
-    const bool tracker_restart = g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + max_gap);
+    const bool gap_restart = g.resume_reset || (g.submitted_frame && g.frame > g.submitted_frame + max_gap);
+    // After a frame delivered with no camera the tracker's previous camera is older than the frame
+    // DLSS saw last. (The frame the camera comes back on feeds the tracker, so the one after it pairs
+    // with it as usual.)
+    const bool tracker_stale = !no_camera && g.no_camera_last;
+    const bool tracker_restart = gap_restart || tracker_stale;
     if (tracker_restart) pending.tracker.Reset();
     na::camera::CameraTracker::Limits lim{};
     lim.max_frame_gap = max_gap;
@@ -4019,8 +4118,24 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     if (same_epoch && g.submitted_frame && g.frame > g.submitted_frame + kMaxGapFrames && !tracker_restart) ++g.stats.gap_bridged;
     const auto* origin = world_camera.writes ? &world_camera.camera.origin : nullptr;
-    na::camera::CameraFrame cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim, origin);
-    if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
+    na::camera::CameraFrame cam{}; // no camera: stays empty, and nothing below reads its matrices
+    if (!no_camera) {
+        cam = pending.tracker.Update(vp, g.frame, rw, rh, injected, lim, origin);
+        if (!cam.valid) { ++g.stats.no_camera; reason("The camera matrix could not be inverted."); return false; }
+    }
+    // VARIANT: motion/measured-total
+    // This frame's motion is measured on the pictures: there is no camera, or the camera has just
+    // come back after measured frames. In the second case its tracker has no previous camera yet and
+    // would ask for a reset the pictures do not need: the frame still pairs with the measured one
+    // before it, and the camera takes over on the next.
+    const bool measured = no_camera || (tracker_stale && cam.camera_cut && camera_use != 2 && !cannot_measure && !gap_restart && !resize &&
+                                        !g.measured_refused);
+    // Reasons to start a new DLSS history. Camera: as before. Measured: a camera cut is not one (the
+    // measured supplier adds its own two below: no pair yet, and a scene cut seen in the pictures).
+    const bool hist_reset = measured ? (gap_restart || resize) : (cam.camera_cut || resize || g.resume_reset);
+    pending.measured = measured;
+    pending.no_camera = no_camera;
+    pending.frame = g.frame;
     bool viewport_sample_known=false;
     if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
         float vx = 0.f, vy = 0.f;
@@ -4031,18 +4146,18 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         } else viewport_sample_known=vpj_declared(lists, scene, &vx, &vy);
         cam.jitter_px_x = vx; cam.jitter_px_y = vy; cam.jitter_known = true;
     }
-    if (!held) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
+    if (!held && !no_camera) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
         if (g.cam_f1 != g.frame) { g.cam_u0 = g.cam_u1; g.cam_f0 = g.cam_f1; }
         g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
     }
-    pending.cut = cam.camera_cut;
+    pending.cut = cam.camera_cut && !measured;
     if (cam.cut_deferred) {
         static const char* const kHeld[] = {"none", "no_history", "gap", "translation", "rotation", "fov", "origin"};
         na::eventlog::Emit("camera_cut_held", "why=%s value=%.4g", kHeld[cam.cut_reason < 7 ? cam.cut_reason : 0], cam.cut_value);
     }
     if (cam.camera_cut) { // Cort 2026-11-02: an on/off blink every ~30 s matched cuts while standing still: record why
         static const char* const kWhy[] = {"none", "no_history", "gap", "translation", "rotation", "fov", "origin"};
-        const char* why = tracker_restart ? (g.resume_reset ? "restart_resume" : "restart_gap") : kWhy[cam.cut_reason < 7 ? cam.cut_reason : 0];
+        const char* why = gap_restart ? (g.resume_reset ? "restart_resume" : "restart_gap") : tracker_stale ? "after_measured" : kWhy[cam.cut_reason < 7 ? cam.cut_reason : 0];
         char one[120];
         std::snprintf(one, sizeof one, "%llu:%s=%.3g%s%s ", static_cast<unsigned long long>(GetTickCount64() / 100 % 100000000),
                       why, cam.cut_value, held ? "/held" : "", from_j1 ? "/j1" : "");
@@ -4052,7 +4167,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         std::memcpy(g.stats.recent_cuts, merged, sizeof merged);
         // Event log: every camera cut, timed to the frame (a "fov" cut is a zoom, e.g. a scope).
         na::eventlog::Emit("camera_cut", "why=%s value=%.4g held=%u from_j1=%u", why, cam.cut_value, held ? 1u : 0u, from_j1 ? 1u : 0u);
-        if (tracker_restart) ++g.stats.cut_restarts;
+        if (gap_restart) ++g.stats.cut_restarts;
+        else if (tracker_stale) ++g.stats.cut_after_measured; // the camera returning after measured frames: no reset when that frame is measured too
         else if (cam.cut_reason == 2) ++g.stats.cut_gap;
         else if (cam.cut_reason >= 3 && cam.cut_reason <= 5) ++g.stats.cut_motion;
     }
@@ -4060,7 +4176,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // submitted right before this list; the flow pairs with the frame the camera
     // history pairs with. Any failure leaves this frame camera-only.
     // Flow works on the whole colour at DLAA size; upscaled frames stay camera-only for now.
-    if (flow_ticket && !inl && !color_msaa && !upscaling && !windowed && na::j2::flow::Enabled()) {
+    if (flow_ticket && !measured && !inl && !color_msaa && !upscaling && !windowed && na::j2::flow::Enabled()) {
         na::j2::flow::Source fs;
         fs.color = color.Get();
         fs.subresource = csub;
@@ -4162,23 +4278,25 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (!deferred && !(saved && saved->at_present)) smear_step(); // smear test variants: native DLAA only
     bool have_motion = false;
     bool in_tier1_fed = false;
+    bool measured_failed = false, measured_no_pair = false, measured_cut = false;
     na::j2::compute_flow::Tier3 flow_tier{}; // evidence capture
     if (g.arbiter_ok) {
         na::motion::gpu::Inputs in{};
         in.depth = g.depth32.Get();
-        in.tier2_valid_flag = true;
+        in.tier2_valid_flag = !measured; // measured: no reprojection, no matrices, no identity stand-in
         in.depth_clear = reversed ? 0.0f : 1.0f;
-        // One composed current->previous clip matrix (double, then float); the
-        // arbiter's second matrix is identity. Never chain two float matrices
-        // through world space (false motion on a still camera -> DLAA blur).
-        const na::camera::Matrix composed = na::camera::ComposeReprojectionRow(cam.inv_view_proj_current_row, cam.view_proj_previous_row);
-        in.inv_view_proj_current = to_mat4(composed);
-        // M3 (camera_fit_gpu.hpp): basis of the six rigid camera corrections around this composed
-        // matrix; compute_flow fits them on the GPU from depth + this pair's flow.
-        const na::motion::gpu::FitBasis fit_basis = na::motion::gpu::MakeFitBasis(
-            composed.data(), cam.inv_view_proj_current_row.data(), cam.view_proj_previous_row.data(), cam.position.data());
-        in.fit_basis = &fit_basis;
-        {
+        na::motion::gpu::FitBasis fit_basis{};
+        if (!measured) {
+            // One composed current->previous clip matrix (double, then float); the
+            // arbiter's second matrix is identity. Never chain two float matrices
+            // through world space (false motion on a still camera -> DLAA blur).
+            const na::camera::Matrix composed = na::camera::ComposeReprojectionRow(cam.inv_view_proj_current_row, cam.view_proj_previous_row);
+            in.inv_view_proj_current = to_mat4(composed);
+            // M3 (camera_fit_gpu.hpp): basis of the six rigid camera corrections around this composed
+            // matrix; compute_flow fits them on the GPU from depth + this pair's flow.
+            fit_basis = na::motion::gpu::MakeFitBasis(
+                composed.data(), cam.inv_view_proj_current_row.data(), cam.view_proj_previous_row.data(), cam.position.data());
+            in.fit_basis = &fit_basis;
             na::camera::Matrix id{};
             id[0] = id[5] = id[10] = id[15] = 1.0;
             in.view_proj_previous = to_mat4(id);
@@ -4196,26 +4314,44 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // view end it. Games with a real camera matrix are unaffected.
         static int no_view_streak = 0, view_streak = 0;
         static bool reconstruct = false;
-        if (na::motion::gpu::CarriesNoView(cam.view_proj_current_row.data())) { ++no_view_streak; view_streak = 0; }
+        if (no_camera) {} // no matrix this frame: it says nothing about the camera's own matrices
+        else if (na::motion::gpu::CarriesNoView(cam.view_proj_current_row.data())) { ++no_view_streak; view_streak = 0; }
         else { ++view_streak; no_view_streak = 0; }
         if (!reconstruct && no_view_streak >= 30) reconstruct = true;
         if (reconstruct && view_streak >= 30) reconstruct = false;
         const bool object_flow = na::j2::flow::Enabled();
-        if((object_flow || reconstruct) && !windowed && !(saved && saved->at_present) && (inl || !flow_ticket || !flow_ticket->valid)){
+        if(measured || ((object_flow || reconstruct) && !windowed && !(saved && saved->at_present) && (inl || !flow_ticket || !flow_ticket->valid))){
+            // Both suppliers pair this picture with the last DELIVERED frame's: that is the frame
+            // DLSS's history holds, so the motion and the history always span the same step.
             na::j2::compute_flow::Frame frame;frame.frame=g.frame;frame.previous=g.submitted_frame;
             frame.generation=g.router.Current().history_generation;frame.slot=g.slot;
-            frame.reset=cam.camera_cut || resize || g.resume_reset;frame.hdr=is_float_color(cf);
+            frame.reset=hist_reset;frame.hdr=is_float_color(cf);
             frame.jitter[0]=in.jitter_current_px[0];frame.jitter[1]=in.jitter_current_px[1];
             frame.raster_jitter[0]=frame.jitter[0];frame.raster_jitter[1]=frame.jitter[1];frame.raster_sample=true;
-            frame.raster_confirmed=viewport_sample_known;
+            // Measured with viewport jitter: the sample is the viewports' own, exactly zero when no
+            // draw carried one, so an unjittered first picture pairs with the jittered one after it.
+            frame.raster_confirmed=measured ? (vpj_mode() || (frame.jitter[0]==0.f && frame.jitter[1]==0.f)) : viewport_sample_known;
             frame.source_generation=pending.selection_version;
-            frame.residual=object_flow;frame.camera_reconstruct=reconstruct;
+            frame.residual=object_flow;frame.camera_reconstruct=reconstruct && !measured;
+            frame.total=measured;frame.last_reset_frame=g.last_reset_frame;
             na::j2::compute_flow::Tier3 tier;
             na::j2::compute_flow::SetLoosen(na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed));
             pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),g.color_in.Get(),g.depth32.Get(),in,frame,tier);
-            // The residual was derived against the fitted camera: tier 2 must use the same fix.
-            if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;}
-            in.fix=tier.fix; // also without a residual (camera reconstruction only)
+            if(measured){
+                // Nothing can be measured at all (the programs or working memory are missing, or the
+                // pair's own pass failed): the frame is left as the game drew it, and tried again.
+                if(!pending.compute_flow.context || (pending.compute_flow.pair && !tier.total))measured_failed=true;
+                else if(pending.compute_flow.pair){
+                    // TOTAL motion through tier 1's arithmetic, labelled as estimated (never as the game's own).
+                    in.tier1_valid_flag=true;in.tier1_motion=tier.total;in.tier1_valid=tier.total_valid;
+                    in.tier1_source=na::motion::Tier1Source::Estimated;
+                    measured_cut=pending.compute_flow.cut_reset;
+                }else measured_no_pair=true; // the first picture of a pair
+            }else{
+                // The residual was derived against the fitted camera: tier 2 must use the same fix.
+                if(tier.residual){in.tier3_valid_flag=true;in.tier3_residual=tier.residual;in.tier3_valid=tier.valid;in.tier3_mask=tier.mask;}
+                in.fix=tier.fix; // also without a residual (camera reconstruction only)
+            }
             flow_tier=tier;
         }
         // P4-0b: camera + accepted moving-object residual (tier 3) when this frame's pair ran.
@@ -4257,13 +4393,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 ++nc;
             }
             g.game_motion.SetForce(smear_mode() == 5);
-            const auto gm = g.game_motion.Record(l, g.slot, cands, nc, g.color_in.Get(), rw, rh,
-                                                 cam.camera_cut || resize || g.resume_reset);
-            if (gm.motion) {
+            const auto gm = g.game_motion.Record(l, g.slot, cands, nc, g.color_in.Get(), rw, rh, hist_reset);
+            if (gm.motion) { // the game's own vectors come before a measured field, and keep their own label
                 in_tier1_fed = true;
                 in.tier1_motion = gm.motion;
                 in.tier1_valid = gm.valid;
                 in.tier1_valid_flag = true;
+                in.tier1_source = na::motion::Tier1Source::Engine;
             }
             const auto gs = g.game_motion.GetStats();
             const int used = gs.used_candidate < 0 ? -1 : gs.used_candidate * 16 + gs.used_encoding;
@@ -4283,7 +4419,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (g.replay_ok && inl && !(saved && saved->at_present)) {
             const float viewport_jitter[2] = {static_cast<float>(cam.jitter_px_x), static_cast<float>(cam.jitter_px_y)};
             const auto rm = g.replay.Record(l, g.queue.Get(), g.depth32.Get(), rw, rh, reversed,
-                                            cam.camera_cut || resize || g.resume_reset || in_tier1_fed ||
+                                            hist_reset || in_tier1_fed ||
                                             depth_msaa || !vpj_mode() || (g.jitter_on && !viewport_sample_known), viewport_jitter);
             if (rm.motion && !in_tier1_fed && na::settings::Get().j2_draw_replay.load(std::memory_order_relaxed)) {
                 in_tier1_fed = true;
@@ -4291,6 +4427,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 in.tier1_motion = rm.motion;
                 in.tier1_valid = rm.valid;
                 in.tier1_valid_flag = true;
+                in.tier1_source = na::motion::Tier1Source::Engine;
             }
         }
         if (smear_mode() == 1) { // smear test: no motion at all (identity reprojection, no other tier)
@@ -4306,7 +4443,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         o.provenance = g.provenance.Get();
         o.width = rw; // the active extent (top left); render pixels
         o.height = rh;
-        have_motion = g.arbiter.Dispatch(l, in, o, g.slot);
+        have_motion = !measured_failed && g.arbiter.Dispatch(l, in, o, g.slot);
         if (have_motion && use_replay_motion && in.tier1_valid_flag) g.replay_fed_frame = g.frame;
     }
     if(t_ic) t_ic->mark(kIcAO);
@@ -4317,6 +4454,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         } else {
             l->Close();
         }
+        if (measured_failed) { // not a fault of the list: nothing is latched, the next frame tries again
+            ++g.stats.measured_unavailable;
+            if (!no_camera) g.measured_refused = true; // a camera is there: the next frame uses it, with a reset
+            reason(!pending.compute_flow.context ? "No camera in use, and motion could not be measured: the measuring pass is not available (see the j2measured line)."
+                                                 : "No camera in use, and motion could not be measured: this pair's pass failed (see the j2measured line).");
+            return false;
+        }
         reason("Stopped: motion vectors could not be built.");
         g.latched = true;
         return false;
@@ -4325,7 +4469,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     add(b, g.motion.Get(), UAV, NPSR);
     flush(l, b);
     std::shared_ptr<na::xegtao::Frame> ambient;
-    if (na::settings::Get().xegtao_enabled.load(std::memory_order_relaxed) && !skip_color) {
+    if (no_camera && na::settings::Get().xegtao_enabled.load(std::memory_order_relaxed))
+        na::xegtao::ScenePass().Unavailable("Ambient shading needs the scene camera; this frame has none.");
+    if (na::settings::Get().xegtao_enabled.load(std::memory_order_relaxed) && !skip_color && !no_camera) {
         na::xegtao::Inputs ai;ai.color=g.color_in.Get();ai.depth=g.depth32.Get();ai.width=rw;ai.height=rh;
         ai.color_format=typed(cf);ai.clear_depth=reversed?0.f:1.f;
         ai.jitter_x=static_cast<float>(cam.jitter_px_x);ai.jitter_y=static_cast<float>(cam.jitter_px_y);
@@ -4423,7 +4569,19 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g.stats.inline_jitter_x = e.jitter_x;
         g.stats.inline_jitter_y = e.jitter_y;
     }
-    e.reset = cam.camera_cut || resize || g.resume_reset;
+    e.reset = hist_reset;
+    if (measured_no_pair) {
+        // The first picture of a pair: nothing to measure against yet. DLSS starts a new history on
+        // it (a reset needs no motion), and the next frame is measured against it.
+        if (!e.reset) ++g.stats.measured_no_pair;
+        g.stats.measured_last_no_pair = pending.compute_flow.no_pair;
+        e.reset = true;
+    } else if (measured_cut && !e.reset) {
+        // A scene cut measured on an earlier pair, learned without waiting on the GPU: this frame
+        // carries the reset. Until now those frames showed their own picture (RecordCutShow below).
+        ++g.stats.measured_cut_resets;
+        e.reset = true;
+    }
     e.hdr = is_float_color(cf);
     e.depth_inverted = reversed;
     g.stats.depth_reversed = reversed;
@@ -4451,7 +4609,16 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (smear == 4) e.preset = 12; // NVSDK_NGX_DLSS_Hint_Render_Preset_L
     }
     if (t_ic) t_ic->mark(kIcEvaluate);
+    pending.reset = e.reset;
     const bool evaluated = na::dlss::Evaluate(l, e);
+    // A measured scene cut that DLSS has not been reset for yet: the temporal output still holds the
+    // old scene, so those frames show the picture DLSS was given instead. Decided on the GPU, in
+    // execution order, with no wait (compute_flow.hpp RecordCutShow). Nothing happens on other frames.
+    if (measured && evaluated && pending.compute_flow.pair) {
+        b.push_back(uav_barrier(g.output.Get()));
+        flush(l, b);
+        na::j2::compute_flow::RecordCutShow(l, pending.compute_flow, e.color, g.output.Get());
+    }
     if (t_ic) t_ic->mark(kIcFinish);
     if (!evaluated) ++g.stats.dlss_failed;
     if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
@@ -4502,7 +4669,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ci.entry_barrier=g.capture_entry.barrier;ci.entry_kind=static_cast<uint32_t>(g.capture_entry.op);
         // The native path's own camera and DLSS facts (were blank here; RC 2026-11-06).
         ci.inputs_frame = g.frame;
-        ci.camera_valid = true;
+        ci.camera_valid = !no_camera;
         for (int i = 0; i < 16; ++i) { ci.vp_cur[i] = cam.view_proj_current_row[i]; ci.vp_prev[i] = cam.view_proj_previous_row[i]; ci.inv_vp_cur[i] = cam.inv_view_proj_current_row[i]; }
         for (int i = 0; i < 3; ++i) ci.eye[i] = cam.position[i];
         ci.camera_source = pending.camera_source; ci.camera_age = pending.camera_age;
@@ -8657,6 +8824,10 @@ void Shutdown()
     g.inline_sample_locked = false;
     g.inline_camera_submitted = false;
     g.resume_reset = false;
+    g.no_camera_last = g.measured_refused = false;
+    g.last_reset_frame = 0;
+    g.camera_streak = 0;
+    depth_evidence_want(false);
     g.w = g.h = 0;
     g.rw = g.rh = g.ow = g.oh = 0;
 }

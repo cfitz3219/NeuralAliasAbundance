@@ -377,6 +377,22 @@ uint64_t LiveSelectionVersion();
 // is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
 // by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
+// Depth direction evidence (camera-free DLAA; the DX12 half of VARIANT
+// depth/direction-from-depth-writes, decided by native11/depth_direction.hpp). While on, every
+// game draw whose bound depth is the live scene depth and whose pipeline tests AND writes depth is
+// counted by its comparison, and every clear of that depth with its value. Off (the default) adds
+// nothing to the draw path. The sums are recording-time counts since the last Take; a different
+// live depth starts from nothing, and a Take for another depth returns no counts.
+struct DepthWriteEvidence {
+    uint64_t depth = 0;             // the depth the counts below belong to
+    uint32_t less = 0, greater = 0; // depth-writing draws by the way their comparison runs
+    uint32_t equal = 0, other = 0;  // such draws comparing EQUAL, and ALWAYS / NEVER / NOT_EQUAL
+    uint32_t clears = 0;
+    float clear = 0;                // the last clear's value
+    bool clear_mixed = false;       // cleared to different values since the last Take
+};
+void SetDepthWriteEvidence(bool on);
+DepthWriteEvidence TakeDepthWriteEvidence(uint64_t depth);
 // Draw-replay probe: per frame, the scene-depth draws and how many match a draw of the frame
 // before (same pipeline, vertex shader, counts, vertex layout); of those, how many kept the same
 // vertex/index buffers. untracked: vertex buffers unknown ([observe] raster tracking off).
