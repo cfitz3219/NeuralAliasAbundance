@@ -156,12 +156,12 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
             // [j2] texture_detail: "auto" (default) or the total the menu's Texture mip bias row
             // chose, 0 to -2.25. Separate from the old mip_bias key on purpose: values saved by
             // the earlier menu (Off, Light) must not come back as today's choice.
-            wchar_t td[32] = {};
-            GetPrivateProfileStringW(L"j2", L"texture_detail", L"auto", td, 32, ini);
-            wchar_t* end = nullptr;
-            const double v = wcstod(td, &end);
-            if (end == td || !(v <= 0.0)) target.j2_texture_detail_x100.store(kTextureDetailAuto);
-            else target.j2_texture_detail_x100.store(static_cast<int32_t>((v < -2.25 ? -2.25 : v) * 100.0 - 0.5));
+            wchar_t detail_text[32] = {};
+            GetPrivateProfileStringW(L"j2", L"texture_detail", L"auto", detail_text, 32, ini);
+            wchar_t* detail_end = nullptr;
+            const double detail_total = wcstod(detail_text, &detail_end);
+            if (detail_end == detail_text || !(detail_total <= 0.0)) target.j2_texture_detail_x100.store(kTextureDetailAuto);
+            else target.j2_texture_detail_x100.store(static_cast<int32_t>((detail_total < -2.25 ? -2.25 : detail_total) * 100.0 - 0.5));
         }
         // [j2] preset_v2: "auto", a letter J..M (NGX value = letter - 'A' + 1), "default", or a
         // number. Without it, the old [j2] preset key: its "L" was the old default (every save
