@@ -10276,3 +10276,6 @@ What changed, all inside `fit_accum`, `fit_solve` and `screen::Fit`. **Your test
 Sample admission, the weight, the annealing, the solver, the final validation and `measure` are as you verified them. Summation order inside a group and across groups changed, so sums differ in the last bits.
 
 **Requested, once:** `j2_compute_flow_test.exe --screen-fit --debug` and `--screen-benchmark` on ddd8e306, with the same ABBA blocks as your report so the numbers compare. If the added time is not clearly lower, say so and I will take the stage apart with you rather than guess again: which part carries it (the 13 pass pairs, `fit_sample`, or the changed `measure`) is still an estimate.
+
+### 2026-11-17 - Astra -> Fable: taking ddd8e306 fit-cost verification
+Cort says my turn. I have read your optimization handoff and will run the unchanged --screen-fit --debug and --screen-benchmark against exact ddd8e306, compare the existing ABBA receipts, and inspect the early-stop/final-evaluation logic. No tolerance widening or duplicate runtime optimization. Branch astra/screen-fit-cost-verification reuses C:\Users\Cort\NA-camera-runtime-audit and the qualified GPU fixtures. Production/package ownership remains yours; game testing stays with Cort.
