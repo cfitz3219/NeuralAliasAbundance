@@ -59,6 +59,8 @@ na_add_cpu_test(depth_direction)
 # R3: can AMD's pyramid search follow the flow fixtures' pictures (CPU model of the pinned shaders)?
 na_add_cpu_test(flow_fixture_pictures)
 set_tests_properties(na.cpu.flow_fixture_pictures PROPERTIES TIMEOUT 120)
+na_add_cpu_test(flow_candidates)
+set_tests_properties(na.cpu.flow_candidates PROPERTIES TIMEOUT 240)
 na_add_cpu_test(pass_map)
 na_add_cpu_test(live_judge)
 na_add_cpu_test(camera_tracker "${NA_CPU_ROOT}/src/core/motion_arbiter.cpp")

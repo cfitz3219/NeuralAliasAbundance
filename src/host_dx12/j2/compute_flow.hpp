@@ -64,6 +64,11 @@ void RecordCutShow(ID3D12GraphicsCommandList*,const Ticket&,ID3D12Resource* colo
 // widen the image, temporal and depth-neighbour tests and let objects against clear depth (sky)
 // through. Read at each Record.
 void SetLoosen(uint32_t percent);
+// VARIANT: flow/frame-candidates
+// On by default. The block search's grid is reconsidered against the frame's own most common
+// vectors before anything reads it (core/flow_candidates.hpp); off, the grid is used as the search
+// left it. For the GPU fixtures' with/without comparison; no setting reaches it. Read at each Record.
+void SetFrameCandidates(bool on);
 struct Gates { float image_ratio, image_abs, texture_min, agree_px, agree_cos, consistency_px; uint32_t agree_min; bool sky; };
 Gates GatesFor(uint32_t percent); // pure, for tests and the panel
 void Reset(); // old contexts stay retained by their executable/GPU recordings
@@ -99,6 +104,13 @@ struct Stats {
     bool camera_reconstruct=false;uint64_t reconstruct_frames=0;
     uint64_t fit_flow_passed=0,fit_rejected_jitter=0,fit_rejected_image=0,fit_only=0;
     float fit_e_alt=0;uint32_t fit_photo_tested=0,fit_photo_better=0,fit_photo_worse=0,fit_photo_regions=0,fit_photo_good=0;float fit_photo_e_fit=0,fit_photo_e_cam=0;
+    // VARIANT flow/frame-candidates (core/flow_candidates.hpp), over completed pairs: pairs the pass ran
+    // on, pairs where a block took a candidate, blocks that had a candidate to compare, blocks that
+    // took one. The newest completed pair: its frame, its candidates strongest first, packed as
+    // flow_candidates.hpp Pack (support << 16 | key; 0 = none), and its two block counts.
+    bool cand_on=false; // the latest recording ran the pass
+    uint64_t cand_pairs=0,cand_pairs_changed=0,cand_offered=0,cand_changed=0,cand_frame=0;
+    uint32_t cand_top[8]{},cand_last_offered=0,cand_last_changed=0;
     double ms=0;char reason[160]{};
     uint32_t stabilized_format=0; // DXGI_FORMAT of the actual motion-history pictures, not the game's input
 };

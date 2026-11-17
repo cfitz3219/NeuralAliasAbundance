@@ -1888,6 +1888,15 @@ void write_menu_progress(HANDLE log)
         (unsigned long long)cf.no_pair[1],(unsigned long long)cf.no_pair[2],(unsigned long long)cf.no_pair[3],(unsigned long long)cf.no_pair[4],
         (unsigned long long)cf.no_pair[5],(unsigned long long)cf.no_pair[6],(unsigned long long)cf.no_pair[7],cf.total_mode?cf.ms:0.0);
         if(n>0)WriteFile(log,line,DWORD((std::min)(n,int(sizeof(line)-1))),&cfw,nullptr);}
+    // VARIANT flow/frame-candidates (core/flow_candidates.hpp): why blocks changed. The newest completed
+    // pair's candidates, strongest first, as (x,y)xblocks; a block takes one only when it explains
+    // the two pictures clearly better than the block's own vector.
+    {char line[560];int n=snprintf(line,sizeof line,"j2candidates on=%d pairs=%llu pairs_changed=%llu blocks_compared=%llu blocks_changed=%llu last{frame=%llu compared=%u changed=%u vectors=",
+        cf.cand_on?1:0,(unsigned long long)cf.cand_pairs,(unsigned long long)cf.cand_pairs_changed,(unsigned long long)cf.cand_offered,(unsigned long long)cf.cand_changed,
+        (unsigned long long)cf.cand_frame,cf.cand_last_offered,cf.cand_last_changed);
+        for(unsigned k=0;k<8 && cf.cand_top[k] && n>0 && n<int(sizeof line)-40;++k)
+            n+=snprintf(line+n,sizeof line-size_t(n),"%s(%d,%d)x%u",k?",":"",int(cf.cand_top[k]&255u)-128,int((cf.cand_top[k]>>8)&255u)-128,cf.cand_top[k]>>16);
+        if(n>0 && n<int(sizeof line)-4){n+=snprintf(line+n,sizeof line-size_t(n),"}\r\n");WriteFile(log,line,DWORD(n),&cfw,nullptr);}}
     {char line[160];const int n=snprintf(line,sizeof line,"j2jitter source=flow convention=%u epoch=%llu changes=%llu\r\n",
         cf.colour_jitter_convention,(unsigned long long)cf.colour_jitter_epoch,(unsigned long long)cf.colour_jitter_changes);
         if(n>0)WriteFile(log,line,DWORD((std::min)(n,int(sizeof(line)-1))),&cfw,nullptr);}

@@ -16,6 +16,7 @@
 
 namespace na::j2::compute_flow {
 std::atomic<uint32_t> g_loosen{50}; // SetLoosen; read at each Record
+std::atomic<bool> g_candidates{true}; // SetFrameCandidates; read at each Record
 using Microsoft::WRL::ComPtr;using Lease=na::nr::native::RecordingLease;
 namespace {
 constexpr unsigned warm_images=8;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -40,11 +41,13 @@ struct Constants {unsigned w,h,ew,eh,mode,block,cost,cost_max,offset,gw,gh;float
     float history_dx=0,history_dy=0;unsigned frame_now=0,frame_reset=0;}; // frame_*: the scene-cut state pass (flow_shaders.hpp cut_state)
 static_assert(sizeof(Constants)==28*4,"root constants");
 constexpr unsigned kTable=12,kUav=8; // descriptors per table: SRVs t0..t7, then UAVs u0..u3
-constexpr unsigned kTables=4; // per recording: encode, accept or measure, the scene-cut state, the scene-cut picture
+constexpr unsigned kTables=5; // per recording: encode, accept or measure, the scene-cut state, the scene-cut picture, the frame candidates
+constexpr unsigned kReadback=112; // counters 0..39, timestamps 48..63, the frame candidates' words 64..103
 struct Image {ComPtr<ID3D12Resource> tex,raw_color;std::vector<Lease> uses;Lease producer;uint64_t frame=0,colour_epoch=0;unsigned generation=0;float jitter[2]{},raster_jitter[2]{};bool raster_confirmed=false;};
 struct Slot {
     Lease lease;bool pair=false,submitted=false,fit_only=false,probe=false;uint64_t frame=0;
     bool total=false,cut_seed=false; // a measured-total recording; it also zeroes the scene-cut state for the first time
+    bool candidates=false; // the frame-candidates pass ran in this recording (its words are in the readback)
     Lease after; // RecordCutShow on another list than Record's: the descriptors stay this recording's until that one has run
     ComPtr<ID3D12DescriptorHeap> heap,engine_heap,expand_heap,derive_heap;
     ComPtr<ID3D12Resource> readback;ComPtr<ID3D12QueryHeap> timestamps;
@@ -58,6 +61,9 @@ struct Context {
     ComPtr<ID3D12PipelineState> pso_measure,pso_cut_state,pso_cut_show; // the camera-free programs; null when they did not build
     ComPtr<ID3D12Resource> raw,expanded,residual,valid,mask,counters,zero,hist[2];
     ComPtr<ID3D12Resource> total,cut_state; // measured total motion (RG32F); the scene cut's 16-byte state, always UAV
+    // VARIANT: flow/frame-candidates (flow_shaders.hpp kCandidateShader). All four programs or none.
+    ComPtr<ID3D12PipelineState> pso_cand_clear,pso_cand_count,pso_cand_pick,pso_cand_apply;
+    ComPtr<ID3D12Resource> votes,grid,top; // 256x256 R32_UINT, always UAV; the grid handed on (R16G16_SINT, one vector per 8x8 block); 48 bytes, always UAV
     bool cut_seeded=false; // cut_state has been zeroed by a submitted recording
     unsigned hist_read=0;uint64_t hist_frame=0;unsigned hist_generation=0; // last committed pair's candidates
     UINT64 frequency=0;
@@ -67,10 +73,11 @@ struct Context {
     std::vector<std::unique_ptr<Image>> images;std::vector<std::unique_ptr<Slot>> leases;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(unsigned slot,unsigned table,unsigned i){auto a=leases[slot]->heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=SIZE_T(table*kTable+i)*stride;return a;}
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(unsigned slot,unsigned table){auto a=leases[slot]->heap->GetGPUDescriptorHandleForHeapStart();a.ptr+=UINT64(table*kTable)*stride;return a;}
-    bool tex(DXGI_FORMAT f,ComPtr<ID3D12Resource>& r){
+    bool tex(DXGI_FORMAT f,ComPtr<ID3D12Resource>& r){return tex(f,r,w,h,S);}
+    bool tex(DXGI_FORMAT f,ComPtr<ID3D12Resource>& r,unsigned width,unsigned height,D3D12_RESOURCE_STATES state){
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        d.Width=w;d.Height=h;d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Format=f;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        return SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,S,nullptr,IID_PPV_ARGS(&r)));
+        d.Width=width;d.Height=height;d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Format=f;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        return SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&r)));
     }
     bool buffer(unsigned bytes,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,ComPtr<ID3D12Resource>& r){
         D3D12_HEAP_PROPERTIES hp{};hp.Type=type;D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;d.Width=bytes;d.Height=d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -91,11 +98,11 @@ struct Context {
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=DXGI_FORMAT_R32_TYPELESS;d.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;d.Buffer.NumElements=words;d.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
         device->CreateUnorderedAccessView(r,nullptr,&d,cpu(slot,table,i));
     }
-    // one=true: a single thread group (the scene-cut state), otherwise the whole picture.
-    void dispatch(ID3D12GraphicsCommandList* l,unsigned slot,unsigned table,ID3D12PipelineState* pso,const Constants& c,bool one=false){
+    // one=true: a single thread group (the scene-cut state); groups_x given: that many groups; otherwise the whole picture.
+    void dispatch(ID3D12GraphicsCommandList* l,unsigned slot,unsigned table,ID3D12PipelineState* pso,const Constants& c,bool one=false,unsigned groups_x=0,unsigned groups_y=0){
         ID3D12DescriptorHeap* heaps[]={leases[slot]->heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetComputeRootSignature(root.Get());l->SetPipelineState(pso);
         l->SetComputeRootDescriptorTable(0,gpu(slot,table));l->SetComputeRoot32BitConstants(1,sizeof(Constants)/4,&c,0);
-        if(one)l->Dispatch(1,1,1);else l->Dispatch((w+7)/8,(h+7)/8,1);
+        if(one)l->Dispatch(1,1,1);else if(groups_x)l->Dispatch(groups_x,groups_y,1);else l->Dispatch((w+7)/8,(h+7)/8,1);
     }
 };
 std::mutex mutex;std::shared_ptr<Context> current;Stats stats;uint64_t last_submit_tick=0,sample_tick=0;
@@ -116,6 +123,9 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
        !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[0]) || !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[1]) ||
        !c.buffer(48,D3D12_HEAP_TYPE_DEFAULT,U,c.counters) || !c.buffer(48,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ,c.zero))return false;
     void* p=nullptr;if(FAILED(c.zero->Map(0,nullptr,&p)))return false;memset(p,0,48);c.zero->Unmap(0,nullptr);
+    // The frame candidates are optional: without their programs or working memory the search's grid is used as it is.
+    if(c.pso_cand_apply && !(c.tex(DXGI_FORMAT_R32_UINT,c.votes,256,256,U) && c.tex(DXGI_FORMAT_R16G16_SINT,c.grid,(w+7)/8,(h+7)/8,S) && c.buffer(48,D3D12_HEAP_TYPE_DEFAULT,U,c.top))){
+        c.pso_cand_clear.Reset();c.pso_cand_count.Reset();c.pso_cand_pick.Reset();c.pso_cand_apply.Reset();}
     queue->GetTimestampFrequency(&c.frequency);return true;
 }
 bool free(Image& i){i.uses.erase(std::remove_if(i.uses.begin(),i.uses.end(),[](const Lease& l){return l.Retired();}),i.uses.end());return i.uses.empty();}
@@ -139,6 +149,11 @@ void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto&
         else if(r.samples>=256 && r.samples0>=256 && r.energy0>.05f && r.energy<.7f*r.energy0)++stats.fit_rejected_jitter; // plain test passed, quantised/jitter test refused
         stats.fit_e_alt=r.energy_alt;stats.fit_photo_tested=r.photo_tested;stats.fit_photo_better=r.photo_better;stats.fit_photo_worse=r.photo_worse;
         stats.fit_photo_regions=r.photo_regions;stats.fit_photo_good=r.photo_regions_good;stats.fit_photo_e_fit=r.photo_e_fit;stats.fit_photo_e_cam=r.photo_e_cam;}}
+    if(s.candidates){void* p=nullptr;D3D12_RANGE range{64,104}; // the frame candidates of this pair (flow_shaders.hpp kCandidateShader, u2)
+        if(SUCCEEDED(s.readback->Map(0,&range,&p))){unsigned v[10];memcpy(v,static_cast<const unsigned char*>(p)+64,sizeof v);
+            ++stats.cand_pairs;if(v[8])++stats.cand_pairs_changed;stats.cand_changed+=v[8];stats.cand_offered+=v[9];
+            if(s.frame>=stats.cand_frame){stats.cand_frame=s.frame;memcpy(stats.cand_top,v,sizeof stats.cand_top);stats.cand_last_changed=v[8];stats.cand_last_offered=v[9];}
+            D3D12_RANGE none{};s.readback->Unmap(0,&none);}}
     if(!s.fit_only){void* p=nullptr;D3D12_RANGE range{0,64};
         if(SUCCEEDED(s.readback->Map(0,&range,&p))){const auto* b=static_cast<const unsigned char*>(p);const auto* v=reinterpret_cast<const unsigned*>(b);
             if(s.total){for(unsigned j=0;j<8;++j)stats.total_sum[j]+=v[j];++stats.total_sum_pairs;
@@ -159,7 +174,7 @@ bool prepare_slot(Context& c,Slot& slot){
     if(slot.heap)return true;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,kTables*kTable,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
     if(FAILED(c.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&slot.heap))) ||
-       !c.buffer(64,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST,slot.readback)){slot.heap.Reset();return false;}
+       !c.buffer(kReadback,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST,slot.readback)){slot.heap.Reset();return false;}
     D3D12_QUERY_HEAP_DESC qd{};qd.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;qd.Count=2;
     c.device->CreateQueryHeap(&qd,IID_PPV_ARGS(&slot.timestamps));return true;
 }
@@ -201,7 +216,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     int image=-1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)!=c->last && free(*c->images[j])){image=static_cast<int>(j);break;}
     if(image<0){auto next=std::make_unique<Image>();if(!c->tex(c->image_format,next->tex) || !c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->raw_color)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
         image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));}
-    slot.lease=lease;slot.after={};slot.pair=slot.probe=false;slot.submitted=false;slot.fit_only=!f.residual && !f.total;slot.total=f.total;slot.cut_seed=false;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
+    slot.lease=lease;slot.after={};slot.pair=slot.probe=false;slot.submitted=false;slot.fit_only=!f.residual && !f.total;slot.total=f.total;slot.cut_seed=false;slot.candidates=false;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
     slot.color_input=color;slot.depth_input=depth;
     stats.recording_slots=static_cast<uint32_t>(c->leases.size());stats.image_slots=static_cast<uint32_t>(c->images.size());
     stats.stabilized_format=static_cast<uint32_t>(c->image_format);
@@ -238,12 +253,34 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     slot.probe=c->jitter_probe.Record(l,work,im.raw_color.Get(),prev.raw_color.Get(),colour_key,f.frame,
         {raster.x-prev.raster_jitter[0],raster.y-prev.raster_jitter[1]},{});
     if(!c->engine.Record(l,im.tex.Get(),prev.tex.Get(),0,&slot.engine_heap)){++stats.unavailable;reason("AMD flow refused image pair; camera motion used");return t;}
+    // VARIANT: flow/frame-candidates
+    // The search's grid reconsidered against the frame's own most common vectors (core/flow_candidates.hpp),
+    // before the expansion, the camera fit and `measure` read it. A block keeps its own vector unless a
+    // candidate explains the two pictures clearly better; blocks the search called still are not touched.
+    ID3D12Resource* grid=c->engine.Grid();
+    stats.cand_on=c->pso_cand_apply && g_candidates.load(std::memory_order_relaxed);
+    if(stats.cand_on){
+        Constants cc=cb;cc.cost_max=(std::max)(8u,cb.gw*cb.gh/100u); // the support a vector needs to be offered (flow_candidates.hpp MinimumSupport)
+        const unsigned groups_x=(cb.gw+7)/8,groups_y=(cb.gh+7)/8;
+        move(l,c->grid.Get(),S,U);
+        move(l,c->top.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->top.Get(),0,c->zero.Get(),0,48);move(l,c->top.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
+        c->defaults(work,4);c->srv(work,4,0,c->engine.Grid(),DXGI_FORMAT_R16G16_SINT);
+        c->srv(work,4,5,im.tex.Get(),c->image_format);c->srv(work,4,6,prev.tex.Get(),c->image_format);
+        c->uav(work,4,kUav+0,c->votes.Get(),DXGI_FORMAT_R32_UINT);c->uav(work,4,kUav+1,c->grid.Get(),DXGI_FORMAT_R16G16_SINT);c->raw_uav(work,4,kUav+2,c->top.Get(),12);
+        c->dispatch(l,work,4,c->pso_cand_clear.Get(),cc,false,32,32);order(l);
+        c->dispatch(l,work,4,c->pso_cand_count.Get(),cc,false,groups_x,groups_y);order(l);
+        for(unsigned round=0;round<8;++round){cc.mode=round;c->dispatch(l,work,4,c->pso_cand_pick.Get(),cc,false,groups_x,groups_y);order(l);}
+        c->dispatch(l,work,4,c->pso_cand_apply.Get(),cc,false,groups_x,groups_y);order(l);
+        move(l,c->grid.Get(),U,S);
+        move(l,c->top.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),64,c->top.Get(),0,40);move(l,c->top.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
+        grid=c->grid.Get();slot.candidates=true;
+    }
     move(l,c->raw.Get(),S,U);move(l,c->expanded.Get(),S,U);
     // AMD outputs integral pixels; FlowExpand decodes NVOFA S10.5. Cancel
     // its /32 here. Grid spacing and value scale are separate conventions.
     c->expand.SetVectorScale(32.f);na::nvof::ExpandParams ep;ep.depth=depth;ep.validity_out=c->expanded.Get();ep.depth_clear=camera.depth_clear;ep.consistency_px=gates.consistency_px;ep.sky=gates.sky || f.total; // measured total: the sky moves too, and nothing else would give it a vector
     ep.image_to_raster_px[0]=encode.x;ep.image_to_raster_px[1]=encode.y;
-    bool ok=c->expand.DispatchDepthAware(l,c->engine.Grid(),8,ep,c->raw.Get(),w,h,0,&slot.expand_heap);
+    bool ok=c->expand.DispatchDepthAware(l,grid,8,ep,c->raw.Get(),w,h,0,&slot.expand_heap);
     order(l);move(l,c->raw.Get(),U,S);move(l,c->expanded.Get(),U,S);
     // M3 (camera_fit_gpu.hpp): fit the rigid camera correction on this exact pair, on the GPU, before
     // the residual is derived, so the residual and the arbiter's tier 2 use the same corrected camera.
@@ -343,6 +380,7 @@ void RecordCutShow(ID3D12GraphicsCommandList* l,const Ticket& t,ID3D12Resource* 
     l->SetComputeRootDescriptorTable(0,c->gpu(t.slot,3));l->SetComputeRoot32BitConstants(1,sizeof(Constants)/4,&cb,0);l->Dispatch((cb.w+7)/8,(cb.h+7)/8,1);order(l);
 }
 void SetLoosen(uint32_t percent){g_loosen.store(percent>100?100u:percent,std::memory_order_relaxed);}
+void SetFrameCandidates(bool on){g_candidates.store(on,std::memory_order_relaxed);}
 void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current)return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);memcpy(im.raster_jitter,t.frame.raster_jitter,sizeof im.raster_jitter);im.colour_epoch=t.colour_epoch;im.raster_confirmed=t.frame.raster_confirmed;c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
     if(slot.cut_seed){c->cut_seeded=true;slot.cut_seed=false;}
     if(slot.pair && slot.hist_written>=0){c->hist_read=static_cast<unsigned>(slot.hist_written);c->hist_frame=t.frame.frame;c->hist_generation=t.frame.generation;slot.hist_written=-1;}stats.last_submitted_frame=t.frame.frame;last_submit_tick=GetTickCount64();}

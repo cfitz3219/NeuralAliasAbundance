@@ -53,4 +53,20 @@
         const bool c = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_cut_show)));
         if (!a || !b || !c) { g.pso_measure.Reset(); g.pso_cut_state.Reset(); g.pso_cut_show.Reset(); }
     }
+    {
+        // VARIANT: flow/frame-candidates (flow_shaders.hpp kCandidateShader). All four programs or
+        // none: without them the search's grid is used as it is, and the j2candidates line says on=0.
+        static const char* const entries[4] = {"cand_clear", "cand_count", "cand_pick", "cand_apply"};
+        ComPtr<ID3D12PipelineState>* const states[4] = {&g.pso_cand_clear, &g.pso_cand_count, &g.pso_cand_pick, &g.pso_cand_apply};
+        bool all = true;
+        for (int i = 0; i < 4 && all; ++i) {
+            ComPtr<ID3DBlob> cs;
+            all = SUCCEEDED(D3DCompile(na::j2::kCandidateShader, sizeof na::j2::kCandidateShader - 1, "j2_candidates", nullptr, nullptr, entries[i], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err));
+            if (all) {
+                pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+                all = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(states[i]->ReleaseAndGetAddressOf())));
+            }
+        }
+        if (!all) for (auto* state : states) state->Reset();
+    }
     return true;

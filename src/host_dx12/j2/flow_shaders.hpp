@@ -306,4 +306,127 @@ void cut_show(uint3 id : SV_DispatchThreadID) {
     u_enc[id.xy] = t_color.SampleLevel(s_lin, (float2(id.xy) + 0.5) / float2(w, h), 0);
 }
 )";
+
+// VARIANT: flow/frame-candidates
+// The block search's grid reconsidered against the frame's own most common vectors, before the
+// expansion, the camera fit and `measure` read it. core/flow_candidates.hpp is this pass on the CPU
+// and says why it exists and what it keeps; the two are kept in step by hand: same candidates, same
+// samples, same order of decisions, same constants. Same root signature and constants block as
+// kFlowShader (a separate source because its registers hold other kinds of resource):
+//   t0 the search's grid (R16G16_SINT, one vector per 8x8 block)   t5 / t6 the pair's pictures
+//   u0 votes, 256 x 256 R32_UINT, one cell per vector within 127 pixels
+//   u1 the grid handed on
+//   u2 words 0..7 the candidates, strongest first, as (support << 16) | (y + 128) << 8 | (x + 128);
+//      word 8 blocks that took a candidate, word 9 blocks that had one to compare
+//   mode: cand_pick's round (0..7)      cost_max: the support a vector needs to be offered
+inline const char kCandidateShader[] = R"(
+Texture2D<int2>   t_grid : register(t0);
+Texture2D<float4> t_cur  : register(t5);
+Texture2D<float4> t_prev : register(t6);
+RWTexture2D<uint> u_votes : register(u0);
+RWTexture2D<int2> u_grid  : register(u1);
+RWByteAddressBuffer u_top : register(u2);
+SamplerState s_lin : register(s0);
+cbuffer C : register(b0) {
+    uint w, h, ew, eh;
+    uint mode, block, has_cost, cost_max;
+    uint cnt_off, gw, gh; float image_ratio;
+    float snap_px, image_margin, image_abs, texture_min;
+    uint have_hist, agree_min; float dj_x, dj_y;
+    float agree_px, agree_cos, jitter_x, jitter_y;
+    float history_dx, history_dy; uint frame_now, frame_reset;
+};
+static const int kWindow = 127, kReach = 8;
+static const uint kCount = 8;
+static const float kRatio = 0.8, kGain = 0.001;
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+bool votes(int2 v) { return any(v != 0) && abs(v.x) <= kWindow && abs(v.y) <= kWindow; }
+uint key_of(int2 v) { return (uint(v.y + 128) << 8) | uint(v.x + 128); }
+int2 vector_of(uint packed) { return int2(int(packed & 255u) - 128, int((packed >> 8) & 255u) - 128); }
+[numthreads(8, 8, 1)]
+void cand_clear(uint3 id : SV_DispatchThreadID) {
+    if (id.x < 256 && id.y < 256) u_votes[id.xy] = 0u;
+}
+[numthreads(8, 8, 1)]
+void cand_count(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= gw || id.y >= gh) return;
+    int2 v = t_grid.Load(int3(id.xy, 0));
+    if (votes(v)) InterlockedAdd(u_votes[uint2(v + 128)], 1u);
+}
+// One round per candidate: the strongest vector not already taken by an earlier round.
+[numthreads(8, 8, 1)]
+void cand_pick(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= gw || id.y >= gh) return;
+    int2 v = t_grid.Load(int3(id.xy, 0));
+    if (!votes(v)) return;
+    uint n = u_votes[uint2(v + 128)];
+    if (n < cost_max) return;
+    uint packed = (min(n, 65535u) << 16) | key_of(v);
+    bool taken = false;
+    [unroll] for (uint j = 0; j < 7; ++j) {
+        if (j < mode && u_top.Load(j * 4) == packed) taken = true;
+    }
+    if (!taken) u_top.InterlockedMax(mode * 4, packed);
+}
+// Mean |luma| difference between block b of the current picture and the previous picture moved by v.
+float block_error(uint2 b, float2 v) {
+    float e = 0, n = 0;
+    [loop] for (uint j = 0; j < 8; ++j) {
+        [loop] for (uint i = 0; i < 8; ++i) {
+            uint2 q = b * 8 + uint2(i, j);
+            if (q.x < w && q.y < h) {
+                float c = luma(t_cur.Load(int3(q, 0)).rgb);
+                e += abs(c - luma(t_prev.SampleLevel(s_lin, (float2(q) + 0.5 + v) / float2(w, h), 0).rgb));
+                n += 1.0;
+            }
+        }
+    }
+    return e / max(n, 1.0);
+}
+// A whole-pixel vector at itself and at the eight half-pixel places around it: the best counts.
+float best_of_nine(uint2 b, int2 v) {
+    float least = 1e9;
+    [loop] for (int sj = -1; sj <= 1; ++sj) {
+        [loop] for (int si = -1; si <= 1; ++si) least = min(least, block_error(b, float2(v) + 0.5 * float2(si, sj)));
+    }
+    return least;
+}
+groupshared uint gc[2];
+[numthreads(8, 8, 1)]
+void cand_apply(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    if (gi < 2) gc[gi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x < gw && id.y < gh) {
+        int2 own = t_grid.Load(int3(id.xy, 0));
+        int2 chosen = own;
+        if (any(own != 0)) { // a block the search called still stays still
+            int2 lo = int2(id.xy) * 8, hi = min(lo + 8, int2(w, h));
+            float least = 1e9;
+            int2 best = own;
+            bool found = false;
+            [loop] for (uint k = 0; k < kCount; ++k) {
+                uint packed = u_top.Load(k * 4);
+                if (packed != 0u) {
+                    int2 c = vector_of(packed);
+                    int2 d = abs(c - own);
+                    // nearer than the search's own reach: the search compared those itself;
+                    // and the whole block must come from inside the picture
+                    if (max(d.x, d.y) > kReach && all(lo + c >= 0) && all(hi + c <= int2(w, h))) {
+                        float e = block_error(id.xy, float2(c));
+                        if (e < least) { least = e; best = c; found = true; }
+                    }
+                }
+            }
+            if (found) {
+                InterlockedAdd(gc[1], 1u);
+                float e_own = best_of_nine(id.xy, own), e_best = best_of_nine(id.xy, best);
+                if (e_best <= kRatio * e_own && e_own - e_best >= kGain) { chosen = best; InterlockedAdd(gc[0], 1u); }
+            }
+        }
+        u_grid[id.xy] = chosen;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 2 && gc[gi] != 0) u_top.InterlockedAdd(32 + gi * 4, gc[gi]);
+}
+)";
 }
