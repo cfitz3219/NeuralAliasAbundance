@@ -332,6 +332,27 @@ int main(int argc,char** argv) {
              for (size_t i = 1; i < blocks.size(); ++i) CHECK(blocks[i].resource == 21 && blocks[i].draws * 4 < blocks[0].draws);
              CHECK(f.h.CameraRank(20, 256) == 1 && f.h.CameraRank(21, 0) == 0);
          }},
+        {"camera discovery can stop and resume without changing depth and colour selection", [] {
+             Feed on,off;off.h.SetCameraDiscovery(false); // also survives the first session/epoch reset
+             for(auto* f:{&on,&off}){
+                 f->Swapchain(1920,1080);f->Resource(3,1920,1080,40);f->Resource(6,1920,1080,10);
+                 f->Pipeline(10,1,1,0);f->Pipeline(11,0,0,1);
+             }
+             for(unsigned frame=0;frame<5;++frame){
+                 on.Frame();off.Frame();
+                 CHECK(off.h.RankCameraBlocks(512).empty() && off.h.CameraRank(20,256)==0);
+                 const auto a=on.h.RankDepth(8),b=off.h.RankDepth(8);
+                 CHECK(a.size()==b.size());
+                 for(size_t i=0;i<std::min(a.size(),b.size());++i){CHECK(a[i].resource==b[i].resource && a[i].score==b[i].score && a[i].draws==b[i].draws);}
+                 const auto x=on.h.RankSceneColor(8,3),y=off.h.RankSceneColor(8,3);
+                 CHECK(x.size()==y.size());
+                 for(size_t i=0;i<std::min(x.size(),y.size());++i){CHECK(x[i].resource==y[i].resource && x[i].score==y[i].score && x[i].draws==y[i].draws);}
+             }
+             CHECK(on.h.CameraRank(20,256)==1);
+             off.h.SetCameraDiscovery(true);off.Frame();CHECK(off.h.CameraRank(20,256)==1);
+             off.h.SetCameraDiscovery(false);CHECK(off.h.RankCameraBlocks(512).empty());
+             off.Execute();off.Present();CHECK(off.h.RankCameraBlocks(512).empty()); // cached recording cannot revive camera data
+         }},
         {"R41-1: a truncated target array with a wide stride reads only the carried prefix", [] {
              Feed f;
              f.Reset();

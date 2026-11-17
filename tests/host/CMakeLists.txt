@@ -451,6 +451,8 @@ target_include_directories(upscaler_jitter_test PRIVATE "${PROJECT_SOURCE_DIR}/s
 na_host_test(observe_producers_test SOURCES observe_producers_test.cpp LIBS host_observe_producers dxgi)
 na_host_test(observe_bookkeeping_test SOURCES observe_bookkeeping_test.cpp LIBS host_observe_producers d3d12 dxgi)
 add_test(NAME host_observe_snapshot_budget_test COMMAND observe_snapshot_test --budget)
+add_test(NAME host_observe_snapshot_suppression_test COMMAND observe_snapshot_test --suppression)
+set_tests_properties(host_observe_snapshot_suppression_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
 set_tests_properties(host_observe_snapshot_budget_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
 # Native DX11 route (WWII plan B1): the portable frame model of the DX11 input provider.
 na_host_test(native11_frame_model_test SOURCES native11/frame_model_test.cpp)

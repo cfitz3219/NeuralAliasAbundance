@@ -76,9 +76,53 @@ int budget_test()
     std::printf("snapshot count budget: total=%u budget=%u per_list=%u,%u,%u\n",total,budget,count[0],count[1],count[2]);
     return test::finish("observe_snapshot_budget_test");
 }
+int suppression_test()
+{
+    test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("observe_snapshot_suppression_test");
+    auto* dev=d.device.Get();REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),true));
+    na_observe_config cfg{};cfg.size_bytes=sizeof cfg;REQUIRE(na_observe_start(&cfg,&Sink,nullptr)==NA_OK);
+    auto upload=test::CreateBuffer(dev,4096,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(upload);
+    void* mapped=nullptr;REQUIRE(SUCCEEDED(upload->Map(0,nullptr,&mapped)));std::memset(mapped,0x42,4096);
+    D3D12_ROOT_PARAMETER p{};p.ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    D3D12_ROOT_SIGNATURE_DESC desc{1,&p,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    test::ComPtr<ID3DBlob> blob,err;test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&desc,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&err)));
+    REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))));
+    test::List list;REQUIRE(list.Create(dev));REQUIRE(SUCCEEDED(list.list->Close()));
+    REQUIRE(SUCCEEDED(list.list->Reset(list.alloc.Get(),nullptr)));
+    list.list->SetGraphicsRootSignature(root.Get());
+    for(unsigned i=0;i<64;++i)list.list->SetGraphicsRootConstantBufferView(0,upload->GetGPUVirtualAddress());
+    REQUIRE(SUCCEEDED(list.list->Close()));ID3D12CommandList* submitted[]={list.list.Get()};
+    unsigned copies=0;na::observe::SetSnapshotCopyProbeForTests([](void* p){++*static_cast<unsigned*>(p);},&copies);
+    uint64_t tickets[3]{};
+    // CPU submission observation only: no GPU commands are executed, and the
+    // same executable recording is inspected before/after the live switch.
+    for(unsigned phase=0;phase<3;++phase){
+        REQUIRE(na_observe_skip_kinds(phase==1?(1ull<<NA_EV_SNAPSHOT):0)==NA_OK);
+        auto token=na::observe::ExecuteBegin(d.queue.Get(),1,submitted);tickets[phase]=token.ticket;
+        na::observe::ExecuteEnd(token,d.queue.Get(),1,submitted);
+        CHECK(copies==(phase==2?128u:64u));
+    }
+    na::observe::SetSnapshotCopyProbeForTests(nullptr,nullptr);upload->Unmap(0,nullptr);
+    REQUIRE(na_observe_stop()==NA_OK);
+    unsigned snapshots[3]{};uint64_t last_sequence=0;
+    for(const auto& bytes:g_events){
+        const auto& h=*reinterpret_cast<const na_event_header*>(bytes.data());
+        if(h.producer_thread==GetCurrentThreadId()&&h.thread_seq){
+            if(last_sequence)CHECK(h.thread_seq==last_sequence+1);last_sequence=h.thread_seq;
+        }
+        if(h.kind!=NA_EV_SNAPSHOT)continue;
+        const auto& e=*reinterpret_cast<const na_ev_snapshot*>(bytes.data());
+        for(unsigned phase=0;phase<3;++phase)if(e.queue_ticket==tickets[phase])++snapshots[phase];
+    }
+    CHECK(snapshots[0]==64&&snapshots[1]==0&&snapshots[2]==64);
+    std::printf("snapshot policy copies=%u snapshots=%u/%u/%u; sequence remains contiguous\n",copies,snapshots[0],snapshots[1],snapshots[2]);
+    return test::finish("observe_snapshot_suppression_test");
+}
 int main(int argc,char** argv)
 {
     if(argc>1&&!std::strcmp(argv[1],"--budget"))return budget_test();
+    if(argc>1&&!std::strcmp(argv[1],"--suppression"))return suppression_test();
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("observe_snapshot_test");
     ID3D12Device* dev = d.device.Get();
