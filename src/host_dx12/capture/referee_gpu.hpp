@@ -15,6 +15,7 @@
 // starts, stops, or cannot run (with the reason).
 #include <d3d12.h>
 #include <cstdint>
+#include <vector>
 
 namespace na::referee::gpu {
 
@@ -48,5 +49,14 @@ struct Stats {
     char why[160] = "";
 };
 Stats GetStats();
+
+// The last sample as read back (core/referee.hpp layout) and what it holds; for tests and tools.
+struct LastSample {
+    std::vector<float> data;
+    bool screen = false, tiles = false, pair = false;
+    float jitter_change = 0;
+    uint64_t number = 0; // GetStats().samples when it was read
+};
+LastSample GetLastSample();
 
 } // namespace na::referee::gpu

@@ -8,6 +8,8 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -59,6 +61,7 @@ struct State {
     na::referee::Window window;
     std::vector<float> data = std::vector<float>(na::referee::kResultFloats, 0.f);
     Stats stats;
+    LastSample last;
 };
 State& g = *new State; // never destroyed: its D3D12 objects must not be released by the CRT at exit
 
@@ -263,6 +266,10 @@ void collect()
         s.jitter_change = g.done_jitter_change;
         g.window.Add(na::referee::Score(s));
         ++g.stats.samples;
+        g.last.data = g.data;
+        g.last.screen = g.done_screen; g.last.tiles = g.done_tiles; g.last.pair = g.done_pair;
+        g.last.jitter_change = g.done_jitter_change;
+        g.last.number = g.stats.samples;
         if (g.done_pair) ++g.stats.pairs;
         if (g.done_screen) ++g.stats.screens;
     } else {
@@ -516,6 +523,12 @@ Stats GetStats()
 {
     std::lock_guard<std::mutex> lock(g.m);
     return g.stats;
+}
+
+LastSample GetLastSample()
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.last;
 }
 
 } // namespace na::referee::gpu
