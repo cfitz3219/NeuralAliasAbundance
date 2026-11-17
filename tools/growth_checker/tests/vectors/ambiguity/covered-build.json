@@ -1,0 +1,12 @@
+{
+  "about": "The known impacted case grew. The omitted case keeps its own prior evidence.",
+  "call": "build_verdict",
+  "args": [
+    {"sample": {"answer": "grew"}},
+    {
+      "unclassified": [],
+      "cases": {"sample": {"answer": "affected"}, "other": {"answer": "no_identified_dependency"}}
+    }
+  ],
+  "expect": {"answer": "grew", "because": ["Improved cases: sample."]}
+}

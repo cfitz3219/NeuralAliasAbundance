@@ -1,0 +1,52 @@
+{
+  "about": "The scheduled independent run meets the proposal.",
+  "call": "floor_action",
+  "args": [
+    {
+      "id": "sample",
+      "game": "One",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "engine": {"name": "One Engine", "source": "declared"},
+      "scene": {"id": "harbor"},
+      "settings": {"mode": "DLAA"}
+    },
+    {"case": "sample", "floor": {"delivered_share_of_presented": {"kind": "min", "value": 90}}},
+    {
+      "status": "scored",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "manifest": {
+        "case": "sample",
+        "evidence_type": "live_run",
+        "evidence_id": "abcdef12-cccccccccccc",
+        "files": [{"role": "status", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}],
+        "producer": {"build": "abcdef12", "build_source": "status_header"}
+      },
+      "sessions": [{"samples": 4}],
+      "observed": {
+        "mode": {"last": "DLAA", "distinct": ["DLAA"]},
+        "scene_id": "harbor",
+        "test_environment": "pc1",
+        "play_intervals": true
+      },
+      "measurements": {
+        "frames_delivered": {"state": "measured", "value": 900, "basis": "counter"},
+        "delivered_share_of_presented": {"state": "measured", "value": 98, "basis": "derived"}
+      }
+    },
+    {"verdict": "comparable", "limits": [], "reasons": [], "tolerance": {}},
+    {
+      "floor": {"delivered_share_of_presented": {"kind": "min", "value": 96}},
+      "from": "abcdef12-bbbbbbbbbbbb",
+      "awaits": "abcdef12-cccccccccccc"
+    }
+  ],
+  "expect": {
+    "action": "confirm",
+    "floor": {"delivered_share_of_presented": {"kind": "min", "value": 96}},
+    "reason": "An independent scheduled run on the same build met the proposed floor."
+  }
+}

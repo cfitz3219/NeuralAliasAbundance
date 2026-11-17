@@ -1,0 +1,28 @@
+{
+  "about": "A first run without a stable verdict proves nothing.",
+  "call": "case_verdict",
+  "args": [
+    {
+      "verdict": "no_baseline",
+      "limits": [],
+      "reasons": [
+        "This case has no earlier result to compare with."
+      ],
+      "tolerance": {}
+    },
+    {},
+    {},
+    {
+      "continuity": {
+        "state": "unknown"
+      }
+    },
+    []
+  ],
+  "expect": {
+    "answer": "not proven",
+    "because": [
+      "This case has no earlier result to compare with."
+    ]
+  }
+}

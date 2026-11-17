@@ -1,0 +1,6 @@
+{
+  "about": "A current failure is shown with no claim of regression.",
+  "call": "case_verdict",
+  "args": [{"verdict": "no_baseline"}, {}, {}, {"dlaa_reaches_picture": {"state": "failed"}}, []],
+  "expect": {"answer": "failing", "because": ["dlaa_reaches_picture failed in this run."]}
+}

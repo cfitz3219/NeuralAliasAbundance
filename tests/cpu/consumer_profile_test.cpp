@@ -186,6 +186,38 @@ int main()
         for (uint64_t f = 1; f <= 200; ++f) learn(p, {write(), consumer(1000 + f, 1, W, H, 10, kGeo)}, f);
         check(p.Size() <= ConsumerProfile::kMaxEntries, "profile is bounded");
     }
+    // Sniper Elite 5 main menu (2026-11-11): a completion pattern seen only in a short burst
+    // every 40 s must still be accepted at the next burst, although hundreds of other
+    // (class, producer) pairs are observed in between. The old cap of 256 dropped it.
+    {
+        ConsumerProfile p;
+        const ColorEvent burst_reader = tonemap(777, kGeo2);
+        for (uint64_t f = 1; f <= 3; ++f) learn(p, {write(true, kGeo2), burst_reader}, f);
+        check(p.Judge(cls_of(burst_reader), kGeo2) == ConsumerProfile::Verdict::Accepted, "burst pattern learned");
+        uint64_t f = 4;
+        for (uint64_t n = 0; n < 1500; ++n, ++f) // calm period: other roots and producers every frame
+            learn(p, {write(true, 5000 + n), consumer(9000 + n % 700, 1, W / 2, H / 2, 10, 5000 + n)}, f);
+        check(p.Evictions() == 0, "nothing is forgotten in a calm period of 1500 frames");
+        check(p.Judge(cls_of(burst_reader), kGeo2) == ConsumerProfile::Verdict::Accepted,
+              "burst pattern still accepted when the burst returns");
+    }
+    // At the memory bound the table stays consistent: the oldest entries go, recent ones are
+    // found, and a dropped class can be learned again.
+    {
+        ConsumerProfile p;
+        const size_t n = ConsumerProfile::kMaxEntries + 500;
+        for (uint64_t f = 1; f <= n; ++f) learn(p, {write(), consumer(100000 + f, 1, W, H, 10, 0)}, f);
+        check(p.Size() == ConsumerProfile::kMaxEntries, "table stops at its bound");
+        check(p.Evictions() == 500, "each insertion beyond the bound drops exactly one entry");
+        const auto recent = cls_of(consumer(100000 + n, 1, W, H, 10, 0));
+        const auto oldest = cls_of(consumer(100000 + 1, 1, W, H, 10, 0));
+        check(p.Judge(oldest, 0) == ConsumerProfile::Verdict::Unknown, "the oldest class was the one dropped");
+        for (uint64_t f = n + 1; f <= n + 2; ++f) learn(p, {write(), consumer(100000 + n, 1, W, H, 10, 0)}, f);
+        check(p.Judge(recent, 0) == ConsumerProfile::Verdict::Accepted, "a recent class is found and reaches acceptance");
+        for (uint64_t f = n + 3; f <= n + 5; ++f) learn(p, {write(), consumer(100000 + 1, 1, W, H, 10, 0)}, f);
+        check(p.Judge(oldest, 0) == ConsumerProfile::Verdict::Accepted, "a dropped class is learned again");
+        check(p.Size() == ConsumerProfile::kMaxEntries, "still at the bound afterwards");
+    }
     if (failures) { std::printf("consumer_profile_test: FAILED (%d)\n", failures); return 1; }
     std::printf("consumer_profile_test: OK\n");
     return 0;

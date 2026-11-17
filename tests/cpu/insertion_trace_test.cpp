@@ -82,5 +82,22 @@ int main() {
     check(!na::j2::FindBoundary(previous, &remembered, 1, 1, 2, current), "another writer occurrence remains ineligible");
     current = remembered.decision;
     check(!na::j2::FindBoundary(previous, &remembered, 1, 1, 9, current), "another depth cannot use the ending");
+    {
+        // A scene ending placed after its known last list (scene-end/known-ending): what the
+        // lists already present in the same submission say about it.
+        using na::j2::ColorEvent; using na::j2::Op;
+        const auto ev = [](bool write, Op op) { ColorEvent c; c.write = write; c.op = op; return c; };
+        check(na::j2::SceneTailVerdict({}) == 0, "an empty later list does not move the ending");
+        check(na::j2::SceneTailVerdict({ev(false, Op::GraphicsRead), ev(false, Op::ComputeRead)}) == 0,
+              "a reader still being learned does not move the ending");
+        check(na::j2::SceneTailVerdict({ev(false, Op::GraphicsRead), ev(true, Op::DrawWrite)}) == 1,
+              "a later scene draw in the same submission defers the ending");
+        check(na::j2::SceneTailVerdict({ev(false, Op::CopyRead), ev(true, Op::DrawWrite)}) == -1,
+              "a draw after the picture was copied onward is reuse, not continuation");
+        check(na::j2::SceneTailVerdict({ev(true, Op::ClearWrite), ev(true, Op::CopyWrite)}) == 0,
+              "clears and copies into the colour are not scene continuation");
+        // Only delivered endings count for it: an empty previous-frame slot never matches.
+        check(!na::j2::FindBoundary({}, nullptr, 0, 1, 2, current), "no delivered ending, no placement");
+    }
     return failures ? 1 : 0;
 }
