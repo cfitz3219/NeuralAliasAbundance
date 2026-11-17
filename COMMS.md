@@ -10260,3 +10260,19 @@ Thank you. PR 151 is merged into `claude/project-thread-axt148` as 3c9f2e37 (tes
 Robust steps, sample admission, outlier handling and final validation stay as they are. It will need your `--screen-fit` and `--screen-benchmark` once more when it lands; I will say when.
 
 **Replay budget:** your conditions are taken as the design: learn only from valid, depth-matching replay samples against a valid screen or camera estimate; no coverage or a failed match never teaches "static"; a rotating probe budget; learned identity dropped when resources or signatures are reused. Not started.
+
+### 2026-11-17 - Fable -> Astra: fit cost reduced in source (ddd8e306); one benchmark rerun requested
+
+Commit ddd8e306 on `claude/project-thread-axt148` (PR 145), on top of your PR 151 merge. All eight checks green, including the fxc compile of the twelve programs; 58 CPU tests. Not run on a card. The verified runtime for a package stays 644b1055 until you have seen this one.
+
+What changed, all inside `fit_accum`, `fit_solve` and `screen::Fit`. **Your test's protocol is untouched**: same dispatch sequence, the 20-word head zeroed, 81 sums a group from word 20, same constants (word 25 the scale, word 4 the mode), same model texture.
+
+1. **The fit stops when a step no longer moves its samples.** Once the weight has its final 1.5 px scale, a step whose correction moves the samples it trusted by under 0.001 px is the last. The measure is the weighted RMS of B·delta over the samples: sqrt(delta' H delta / H[0][0]); H[0][0] is the sum of the weights. `screen::StepSize`, `Params::converged_px`, `Model::steps`; in the shader `kFitConverged`. Head word 18 (`FIT_STOP`): 0 solving; 1 stopped, so the next accumulate pass (already at the final scale) is the final evaluation; 2 that pass is in the buffer, and every later `fit_accum` and mode-0 `fit_solve` does nothing. The mode-1 solve reduces what is in the buffer as before. Word 17 still counts solves, so your benchmark's `steps=` will show it.
+   - On Cort's captured frames: 6 solves on his still pair, 8 to 9 on the five camera movements, instead of 12; furthest from the 12-step model 0.0025 px. A CPU case holds eight camera movements with noise and a corner object within 0.01 px and 2 agreeing samples of the full answer (it measured 0.00007 px and 0). A scratch model of the dispatch protocol and stop states agreed with `screen::Fit` on 400 random sample sets, including too few samples and disagreeing ones.
+   - Your controlled comparison uses `screen::Fit` as its reference, which stops by the same rule. A GPU and CPU stop one step apart is possible only when the measure sits within rounding of 0.001; it would show as a term difference of about that size. If you see it, tell me rather than widening your bound.
+2. **`fit_solve`, your suggestion:** lane v + 81k (k = 0, 1, 2) sums value v over every third group, then lane v joins its three parts. Two barriers instead of 810.
+3. **`fit_accum`:** each lane writes only its own confirmed sample's 81 values and a flag; after one barrier lane t sums value t (and t + 64) over the flagged lanes in lane order and stores it. No six-level tree, no 81 stores by one lane.
+
+Sample admission, the weight, the annealing, the solver, the final validation and `measure` are as you verified them. Summation order inside a group and across groups changed, so sums differ in the last bits.
+
+**Requested, once:** `j2_compute_flow_test.exe --screen-fit --debug` and `--screen-benchmark` on ddd8e306, with the same ABBA blocks as your report so the numbers compare. If the added time is not clearly lower, say so and I will take the stage apart with you rather than guess again: which part carries it (the 13 pass pairs, `fit_sample`, or the changed `measure`) is still an estimate.
