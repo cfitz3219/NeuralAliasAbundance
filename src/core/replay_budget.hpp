@@ -39,17 +39,40 @@ inline uint32_t DrawValue(uint64_t sig, uint64_t vb, uint64_t frame, uint32_t ro
     return static_cast<uint32_t>(Mix(Mix(Mix(0x243f6a8885a308d3ull, sig), vb), epoch) >> 48);
 }
 
+// The rotating share's number (core/replay_movers.hpp): the draw's fixed number seen from `phase`.
+// The caller moves `phase` on by the threshold at each period, so each period takes the next slice
+// of draws and every draw is tried once in kFull / threshold periods, none twice before that.
+inline uint32_t SweepValue(uint64_t sig, uint64_t vb, uint32_t phase)
+{
+    return (DrawValue(sig, vb, 0, 0) - phase) & (kFull - 1);
+}
+inline uint32_t NextPhase(uint32_t phase, uint32_t threshold) { return (phase + threshold) & (kFull - 1); }
+
 inline uint64_t DrawLimit(uint64_t budget) { return budget / 2; }
 inline uint64_t FrameLimit(uint64_t budget) { return budget + budget / 4; }
 
-// `used`: vertices already admitted this frame.
+// The same decision against limits given outright. `used`: vertices already admitted this frame.
+inline Verdict DecideWithin(uint32_t value, uint32_t threshold, uint64_t verts, uint64_t used, uint64_t draw_limit, uint64_t frame_limit)
+{
+    if (verts > draw_limit) return Verdict::DrawTooLarge;
+    if (value >= threshold) return Verdict::NotSampled;
+    if (used + verts > frame_limit) return Verdict::FrameFull;
+    return Verdict::Admit;
+}
+
 inline Verdict Decide(uint32_t value, uint32_t threshold, uint64_t verts, uint64_t used, uint64_t budget)
 {
     if (!budget) return Verdict::Admit;
-    if (verts > DrawLimit(budget)) return Verdict::DrawTooLarge;
-    if (value >= threshold) return Verdict::NotSampled;
-    if (used + verts > FrameLimit(budget)) return Verdict::FrameFull;
-    return Verdict::Admit;
+    return DecideWithin(value, threshold, verts, used, DrawLimit(budget), FrameLimit(budget));
+}
+
+// The rotating share (core/replay_movers.hpp: known movers are replayed first, every other draw is
+// tried in turn on `share` vertices a frame). A draw may still be as large as half the whole budget,
+// or a detailed character could never be tried, so a frame's limit is never under that.
+inline uint64_t ProbeFrameLimit(uint64_t budget, uint64_t share)
+{
+    const uint64_t a = FrameLimit(share), b = DrawLimit(budget);
+    return a > b ? a : b;
 }
 
 // The next frame's threshold. `offered`: vertices of every draw that asked last frame and was not

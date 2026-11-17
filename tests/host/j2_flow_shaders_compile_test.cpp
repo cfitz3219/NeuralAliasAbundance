@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "host_dx12/j2/flow_shaders.hpp"
+#include "host_dx12/j2/replay_motion_shader.hpp"
 
 int main()
 {
@@ -42,7 +43,24 @@ int main()
         }
         if (!ok) ++failures;
     }
+    // The draw-replay motion pass (replay_motion.cpp), with its own targets and flags: its pixel
+    // program also counts, per draw, the pixels apart from the screen's own motion (core/replay_movers.hpp).
+    static const char* const kReplay[][2] = {{"vs", "vs_5_0"}, {"ps", "ps_5_0"}};
+    for (const auto& e : kReplay) {
+        Microsoft::WRL::ComPtr<ID3DBlob> code, messages;
+        const HRESULT hr = D3DCompile(na::j2::replay_motion::kShader, sizeof na::j2::replay_motion::kShader - 1, "replay_motion.hlsl", nullptr, nullptr,
+                                      e[0], e[1], D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &messages);
+        const bool ok = SUCCEEDED(hr) && code && code->GetBufferSize() > 0;
+        std::printf("j2_flow_shaders_compile_test: replay_motion %s %s (%zu bytes, hr=0x%08lx)\n", e[0], ok ? "compiles" : "DOES NOT COMPILE",
+                    code ? static_cast<size_t>(code->GetBufferSize()) : size_t(0), static_cast<unsigned long>(hr));
+        if (messages && messages->GetBufferSize()) {
+            const char* text = static_cast<const char*>(messages->GetBufferPointer());
+            const size_t n = strnlen(text, messages->GetBufferSize());
+            std::printf("%.*s\n", static_cast<int>(n < 1800 ? n : 1800), text);
+        }
+        if (!ok) ++failures;
+    }
     std::printf("j2_flow_shaders_compile_test: %s (%d of %zu programs failed)\n", failures ? "FAIL" : "PASS", failures,
-                sizeof kEntries / sizeof kEntries[0]);
+                sizeof kEntries / sizeof kEntries[0] + sizeof kReplay / sizeof kReplay[0]);
     return failures ? 1 : 0;
 }

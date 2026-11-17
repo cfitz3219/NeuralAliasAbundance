@@ -68,6 +68,7 @@ set_tests_properties(na.cpu.screen_motion PROPERTIES TIMEOUT 120)
 na_add_cpu_test(capture_retention)
 # Draw replay's vertex budget: about the budget a frame, the same draws in adjacent frames.
 na_add_cpu_test(replay_budget)
+na_add_cpu_test(replay_movers)
 na_add_cpu_test(pass_map)
 na_add_cpu_test(live_judge)
 na_add_cpu_test(camera_tracker "${NA_CPU_ROOT}/src/core/motion_arbiter.cpp")

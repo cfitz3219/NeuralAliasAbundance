@@ -1,7 +1,9 @@
 #include "host_dx12/j2/replay_motion.hpp"
+#include "host_dx12/j2/replay_motion_shader.hpp"
 
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstring>
 #include <unordered_map>
@@ -13,56 +15,10 @@ using Microsoft::WRL::ComPtr;
 namespace na::j2::replay_motion {
 namespace {
 
-const char kSource[] = R"(
-ByteAddressBuffer t_cur   : register(t0);
-ByteAddressBuffer t_prev  : register(t1);
-Texture2D<float>  t_depth : register(t2);
-ByteAddressBuffer t_stamp : register(t3);
-cbuffer C : register(b0) {
-    uint cur_first, prev_first; // per draw (float4 elements from the buffers' view start)
-    uint check, token;          // per draw: check != 0 -> positions valid only if stamp[check-1] == token
-    uint prev_check, prev_token; // same for the previous frame's positions
-    uint w, h;
-    float jx, jy;               // current viewport jitter, absent from the saved clip positions
-    uint pad0, pad1;
-};
-struct V { float4 pos : SV_Position; float4 prev : PREV; };
-V vs(uint id : SV_VertexID) {
-    V o;
-    // The writer list ran after this one (or never): its positions are stale.
-    // Clip the whole draw (z < 0) so it leaves no motion and no mask.
-    if ((check != 0u && t_stamp.Load((check - 1u) * 4u) != token) ||
-        (prev_check != 0u && t_stamp.Load((prev_check - 1u) * 4u) != prev_token)) {
-        o.pos = float4(0, 0, -1, 1);
-        o.prev = float4(0, 0, 0, 0);
-        return o;
-    }
-    o.pos = asfloat(t_cur.Load4((cur_first + id) * 16u));
-    o.prev = asfloat(t_prev.Load4((prev_first + id) * 16u));
-    return o;
-}
-RWByteAddressBuffer u_count : register(u2);
-struct O { float2 v : SV_Target0; float m : SV_Target1; };
-O ps(V i) {
-    const uint2 p = uint2(i.pos.xy);
-    const float d = t_depth[p];
-    const float z = i.pos.z;
-    // Only where this draw is the visible surface (its depth is the scene's).
-    if (!isfinite(d) || abs(z - d) > 2e-6) discard;
-    if (!(i.prev.w > 1e-6)) discard;
-    const float2 n = i.prev.xy / i.prev.w;
-    const float2 q = float2((n.x * 0.5 + 0.5) * w, (0.5 - n.y * 0.5) * h);
-    const float2 v = q - (i.pos.xy - float2(jx, jy));
-    if (!all(isfinite(v)) || dot(v, v) > 65536.0) discard;
-    O o;
-    o.v = v;
-    o.m = 1.0;
-    if (((p.x | p.y) & 7u) == 0u) u_count.InterlockedAdd(0, 1u);
-    return o;
-}
-)";
 
-struct Globals { uint32_t w, h; float jx, jy; uint32_t pad0, pad1; };
+// The constants after the eight per-draw words, as the cbuffer packs them.
+struct Globals { uint32_t w, h; float jx, jy; uint32_t ref_mode; float depth_far, apart_px, apart_rel; float reproj[16]; };
+constexpr UINT kPerDraw = 8, kTable = 6; // per-draw words; descriptors a set binds (t0..t5)
 
 
 D3D12_RESOURCE_BARRIER tr(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
@@ -134,7 +90,7 @@ std::vector<Pair> Match(const std::vector<na::observe::ReplayRecord>& cur,
         if (p == prior.end() || !p->second || p->second->verts != draw.verts) continue;
         out.push_back({draw.first, p->second->first, draw.verts,
                        {draw.scissor[0], draw.scissor[1], draw.scissor[2], draw.scissor[3]}, draw.check, draw.token,
-                       p->second->check, p->second->token});
+                       p->second->check, p->second->token, draw.sig, draw.vb});
     }
     return out;
 }
@@ -144,13 +100,13 @@ bool Pass::Init(ID3D12Device* device)
     if (!device) return false;
     device_ = device;
     D3D12_DESCRIPTOR_RANGE range{};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 4;
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = kTable;
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 1;
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 6 + sizeof(Globals) / 4;
+    params[1].Constants.Num32BitValues = kPerDraw + sizeof(Globals) / 4;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[2].Descriptor.ShaderRegister = 2;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
@@ -161,8 +117,8 @@ bool Pass::Init(ID3D12Device* device)
     if (FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_)))) return false;
     const UINT cf = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS;
     ComPtr<ID3DBlob> vs, ps;
-    if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "replay_motion.hlsl", nullptr, nullptr, "vs", "vs_5_0", cf, 0, &vs, &err))) return false;
-    if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "replay_motion.hlsl", nullptr, nullptr, "ps", "ps_5_0", cf, 0, &ps, &err))) return false;
+    if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "replay_motion.hlsl", nullptr, nullptr, "vs", "vs_5_0", cf, 0, &vs, &err))) return false;
+    if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "replay_motion.hlsl", nullptr, nullptr, "ps", "ps_5_0", cf, 0, &ps, &err))) return false;
     for (int rev = 0; rev < 2; ++rev) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
         d.pRootSignature = root_.Get();
@@ -185,7 +141,7 @@ bool Pass::Init(ID3D12Device* device)
         if (FAILED(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso_[rev])))) { pso_[0].Reset(); return false; }
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 4 * kSets; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = kTable * kSets; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_)))) { pso_[0].Reset(); return false; }
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 2; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_)))) { pso_[0].Reset(); return false; }
@@ -194,13 +150,13 @@ bool Pass::Init(ID3D12Device* device)
     srv_stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     {
         D3D12_HEAP_PROPERTIES hp{}; D3D12_RESOURCE_DESC bd{};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 256; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = kCountBytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
         bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&zeros_)))) { pso_[0].Reset(); return false; }
         void* z = nullptr;
         if (FAILED(zeros_->Map(0, nullptr, &z))) { pso_[0].Reset(); return false; }
-        std::memset(z, 0, 256);
+        std::memset(z, 0, kCountBytes);
         zeros_->Unmap(0, nullptr);
         for (uint32_t i = 0; i < kSets; ++i) {
             hp.Type = D3D12_HEAP_TYPE_DEFAULT; bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -241,22 +197,36 @@ void Pass::harvest()
     for (uint32_t i = 0; i < kSets; ++i) {
         if (!pending_read_[i] || !descriptor_use_[i] || !descriptor_use_[i].Completed()) continue;
         pending_read_[i] = false;
-        const D3D12_RANGE range{0, 4};
+        const size_t learned = learned_[i].size();
+        const D3D12_RANGE range{0, 8 + learned * 8};
         void* m = nullptr;
         if (FAILED(readback_[i]->Map(0, &range, &m)) || !m) continue;
         uint32_t v = 0;
         std::memcpy(&v, m, 4);
+        std::vector<na::observe::ReplayObservation> seen(learned);
+        for (size_t k = 0; k < learned; ++k) {
+            uint32_t c[2];
+            std::memcpy(c, static_cast<const uint8_t*>(m) + 8 + k * 8, 8);
+            seen[k] = {learned_[i][k].sig, learned_[i][k].vb, c[0], c[1]};
+            stats_.learn_visible += c[0];
+            stats_.learn_apart += c[1];
+        }
         const D3D12_RANGE none{0, 0};
         readback_[i]->Unmap(0, &none);
         ++stats_.gpu_read;
         if (v) ++stats_.gpu_nonzero;
         stats_.gpu_samples += v;
         stats_.gpu_last = v;
+        if (learned) {
+            ++stats_.learn_read;
+            na::observe::ReplayLearn(seen.data(), seen.size());
+            learned_[i].clear();
+        }
     }
 }
 
 Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
-                    const float viewport_jitter[2])
+                    const float viewport_jitter[2], const Reference* reference)
 {
     Output out;
     if (!Ready() || !l || !depth || !rw || !rh) return out;
@@ -283,7 +253,16 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     auto resources = std::make_shared<std::vector<ComPtr<IUnknown>>>();
     resources->assign({srv_, rtv_, dsv_, motion_, valid_, zdepth_, root_,
                        pso_[reversed ? 1 : 0], ComPtr<IUnknown>(depth), count_[set], readback_[set], zeros_});
+    // What to learn against (core/replay_movers.hpp): the camera's matrix, or the fitted screen motion.
+    Reference ref;
+    if (reference && ((reference->mode == 1) || (reference->mode == 2 && reference->model))) ref = *reference;
+    else ref.mode = 0;
+    ID3D12Resource* const model = ref.mode == 2 ? ref.model : nullptr;
+    ID3D12Resource* const fix = ref.mode == 1 ? ref.fix : nullptr;
+    if (model) resources->push_back(ComPtr<IUnknown>(model));
+    if (fix) resources->push_back(ComPtr<IUnknown>(fix));
     pending_read_[set] = false; // an unread result of a retired, never-completed use is lost
+    learned_[set].clear();
     auto lease = na::nr::native::RetainRecording(l, resources);
     if (!lease) return out;
     descriptor_use_[set] = std::move(lease);
@@ -306,17 +285,21 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     std::vector<D3D12_RESOURCE_BARRIER> b = {tr(depth, NPSR, NPSR | PSR), tr(motion_.Get(), NPSR, RT), tr(valid_.Get(), NPSR, RT),
                                              tr(f.cur, f.cur_in_list ? SO : COMMON, NPSR), tr(f.prev, COMMON, NPSR)};
     if (f.stamps) b.push_back(tr(f.stamps, COMMON, NPSR));
+    if (model) b.push_back(tr(model, NPSR, NPSR | PSR));
+    if (fix) b.push_back(tr(fix, NPSR, NPSR | PSR));
     l->ResourceBarrier(static_cast<UINT>(b.size()), b.data());
-    l->CopyBufferRegion(count_[set].Get(), 0, zeros_.Get(), 0, 4);
+    const uint32_t learn = ref.mode ? static_cast<uint32_t>((std::min)(pairs.size(), size_t(kLearn))) : 0;
+    const uint32_t count_bytes = 8 + learn * 8;
+    l->CopyBufferRegion(count_[set].Get(), 0, zeros_.Get(), 0, count_bytes);
     {
         const D3D12_RESOURCE_BARRIER c = tr(count_[set].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         l->ResourceBarrier(1, &c);
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE h = srv_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += static_cast<SIZE_T>(set) * 4 * srv_stride_;
+    h.ptr += static_cast<SIZE_T>(set) * kTable * srv_stride_;
     D3D12_GPU_DESCRIPTOR_HANDLE gh = srv_->GetGPUDescriptorHandleForHeapStart();
-    gh.ptr += static_cast<UINT64>(set) * 4 * srv_stride_;
+    gh.ptr += static_cast<UINT64>(set) * kTable * srv_stride_;
     raw_srv(device_.Get(), f.cur, f.data_offset, h);
     h.ptr += srv_stride_;
     raw_srv(device_.Get(), f.prev, f.data_offset, h);
@@ -330,6 +313,15 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     h.ptr += srv_stride_;
     if (f.stamps) raw_srv(device_.Get(), f.stamps, 0, h);
     else raw_srv(device_.Get(), f.cur, f.data_offset, h); // never read: no pair has a check
+    h.ptr += srv_stride_;
+    if (model) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC ms = ds;
+        ms.Format = DXGI_FORMAT_R32G32_FLOAT;
+        device_->CreateShaderResourceView(model, &ms, h);
+    } else device_->CreateShaderResourceView(depth, &ds, h); // never read: ref_mode is not 2
+    h.ptr += srv_stride_;
+    if (fix) raw_srv(device_.Get(), fix, 0, h);
+    else raw_srv(device_.Get(), f.cur, f.data_offset, h); // never read: bit 8 of ref_mode is clear
 
     D3D12_CPU_DESCRIPTOR_HANDLE rt[2] = {rtv_->GetCPUDescriptorHandleForHeapStart(), rtv_->GetCPUDescriptorHandleForHeapStart()};
     rt[1].ptr += rtv_stride_;
@@ -344,16 +336,25 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     l->SetPipelineState(pso_[reversed ? 1 : 0].Get());
     l->SetGraphicsRootDescriptorTable(0, gh);
     l->SetGraphicsRootUnorderedAccessView(2, count_[set]->GetGPUVirtualAddress());
-    const Globals g{rw, rh, viewport_jitter ? viewport_jitter[0] : 0.f, viewport_jitter ? viewport_jitter[1] : 0.f, 0, 0};
-    l->SetGraphicsRoot32BitConstants(1, sizeof(Globals) / 4, &g, 6);
+    Globals g{};
+    g.w = rw; g.h = rh;
+    g.jx = viewport_jitter ? viewport_jitter[0] : 0.f; g.jy = viewport_jitter ? viewport_jitter[1] : 0.f;
+    g.ref_mode = ref.mode | (fix ? 256u : 0u);
+    g.depth_far = ref.depth_far; g.apart_px = ref.apart_px; g.apart_rel = ref.apart_rel;
+    std::memcpy(g.reproj, ref.matrix, sizeof g.reproj);
+    l->SetGraphicsRoot32BitConstants(1, sizeof(Globals) / 4, &g, kPerDraw);
+    if (ref.mode == 1) ++stats_.learn_camera; else if (ref.mode == 2) ++stats_.learn_screen; else ++stats_.learn_none;
+    learned_[set].reserve(learn);
     const D3D12_VIEWPORT vp{g.jx, g.jy, static_cast<float>(rw), static_cast<float>(rh), 0.f, 1.f};
     l->RSSetViewports(1, &vp);
     l->OMSetRenderTargets(2, rt, FALSE, &dsv);
     l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     for (const Pair& p : pairs) {
         l->RSSetScissorRects(1, &p.scissor);
-        const uint32_t per_draw[6] = {p.cur_first, p.prev_first, p.check, p.token, p.prev_check, p.prev_token};
-        l->SetGraphicsRoot32BitConstants(1, 6, per_draw, 0);
+        uint32_t slot = 0xffffffffu;
+        if (learned_[set].size() < learn) { slot = static_cast<uint32_t>(learned_[set].size()); learned_[set].push_back({p.sig, p.vb}); }
+        const uint32_t per_draw[kPerDraw] = {p.cur_first, p.prev_first, p.check, p.token, p.prev_check, p.prev_token, slot, 0};
+        l->SetGraphicsRoot32BitConstants(1, kPerDraw, per_draw, 0);
         l->DrawInstanced(p.verts, 1, 0, 0);
         stats_.verts += p.verts;
         if (p.check || p.prev_check) ++stats_.checked;
@@ -361,7 +362,7 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
     b.push_back(tr(count_[set].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
     l->ResourceBarrier(static_cast<UINT>(b.size()), b.data());
-    l->CopyBufferRegion(readback_[set].Get(), 0, count_[set].Get(), 0, 4);
+    l->CopyBufferRegion(readback_[set].Get(), 0, count_[set].Get(), 0, count_bytes);
     {
         const D3D12_RESOURCE_BARRIER c = tr(count_[set].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         l->ResourceBarrier(1, &c);

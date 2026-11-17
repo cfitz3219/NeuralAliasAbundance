@@ -420,7 +420,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         c->engine.Finish(l);
         move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),0,c->counters.Get(),0,40);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
         if(slot.timestamps){l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);l->ResolveQueryData(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,slot.readback.Get(),48);}
-        if(ok){out.total=c->total.Get();out.total_valid=c->mask.Get();slot.pair=true;++stats.pairs;++stats.total_pairs;reason("Measured motion recorded before DLAA (no camera used)");}
+        if(ok){out.total=c->total.Get();out.total_valid=c->mask.Get();out.screen_model=model;slot.pair=true;++stats.pairs;++stats.total_pairs;reason("Measured motion recorded before DLAA (no camera used)");}
         else {++stats.unavailable;reason("Measured motion: the flow expansion failed for this pair");}
         return t;
     }

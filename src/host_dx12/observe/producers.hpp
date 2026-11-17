@@ -439,11 +439,26 @@ struct DrawReplayStats {
     // draws after a frame reached its limit; the budget in force and the last threshold (65536 = every draw).
     uint64_t not_sampled = 0, draw_too_large = 0, frame_full = 0, budget = 0;
     uint32_t budget_threshold = 0;
+    // Movers (core/replay_movers.hpp): draws known to move by themselves now, draws seen moving but not
+    // three times yet, draws ever made movers and let go again; mover draws and their vertices replayed,
+    // mover draws left out because the movers alone were over the budget; the rotating share's vertices;
+    // draw reports received from the replay pass.
+    bool movers_on = false;
+    uint64_t movers = 0, suspects = 0, promoted = 0, let_go = 0, mover_draws = 0, mover_verts = 0, movers_left_out = 0, probe_verts = 0, reports = 0;
     char gates[256] = {}; // why scene draws were not replayed: "name=count ..." (only non-zero)
 };
 void SetDrawReplay(uint64_t frame, ReplayRetain retain);
 // Expanded vertices a frame may replay (0 = no budget). Live.
 void SetDrawReplayBudget(uint64_t expanded_vertices);
+// VARIANT: replay/movers-first
+// On: within the budget, draws known to move by themselves are replayed first and every other draw
+// is tried in turn on a quarter of the budget (core/replay_movers.hpp). Off: the budget's hashed
+// sample alone (core/replay_budget.hpp). No budget: every draw, as before. Live.
+void SetDrawReplayMovers(bool on);
+// What the replay pass saw of the draws it rasterised, compared with the screen's own motion:
+// sampled pixels where the draw is the visible surface, and those of them apart from the screen.
+struct ReplayObservation { uint64_t sig = 0, vb = 0; uint32_t visible = 0, apart = 0; };
+void ReplayLearn(const ReplayObservation* seen, size_t count);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);
 void GetDrawReplayStats(DrawReplayStats* out);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);

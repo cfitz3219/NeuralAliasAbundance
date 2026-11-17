@@ -2456,6 +2456,7 @@ void update_draw_replay()
         if (replay) na::observe::SetRasterStateTracking(true);
     }
     na::observe::SetDrawReplayBudget(na::settings::Get().j2_replay_budget.load(std::memory_order_relaxed));
+    na::observe::SetDrawReplayMovers(na::settings::Get().j2_replay_movers.load(std::memory_order_relaxed) != 0);
     na::observe::SetDrawReplay(replay ? g.frame : 0, retain_replay);
     {
         static uint64_t next_log = 0, logs = 0;
@@ -2482,6 +2483,23 @@ void update_draw_replay()
             na::eventlog::Emit("draw_replay_budget", "budget=%llu threshold=%u of 65536 not_sampled=%llu draw_too_large=%llu frame_full=%llu replayed=%llu verts=%llu",
                 (unsigned long long)d.budget, d.budget_threshold, (unsigned long long)d.not_sampled, (unsigned long long)d.draw_too_large,
                 (unsigned long long)d.frame_full, (unsigned long long)d.replayed, (unsigned long long)d.vertices);
+            // VARIANT: replay/movers-first (core/replay_movers.hpp). What a frame replays now (since the
+            // last line), who it is spent on, and what the pass could compare its draws with.
+            {
+                static uint64_t last_frames = 0, last_verts = 0, last_mover = 0, last_probe = 0;
+                const uint64_t frames = p.frames > last_frames ? p.frames - last_frames : 0;
+                const auto per = [&](uint64_t now, uint64_t before) { return frames && now > before ? (now - before) / frames : 0ull; };
+                na::eventlog::Emit("draw_replay_movers", "variant=replay/movers-first on=%d movers=%llu suspects=%llu promoted=%llu let_go=%llu "
+                    "a_frame_now{verts=%llu mover_verts=%llu rotating_share_verts=%llu over %llu frames} mover_draws=%llu movers_left_out=%llu reports=%llu "
+                    "compared_with{camera=%llu screen_fit=%llu nothing=%llu} read=%llu samples{seen=%llu apart=%llu}",
+                    d.movers_on ? 1 : 0, (unsigned long long)d.movers, (unsigned long long)d.suspects, (unsigned long long)d.promoted, (unsigned long long)d.let_go,
+                    (unsigned long long)per(d.vertices, last_verts), (unsigned long long)per(d.mover_verts, last_mover),
+                    (unsigned long long)per(d.probe_verts, last_probe), (unsigned long long)frames,
+                    (unsigned long long)d.mover_draws, (unsigned long long)d.movers_left_out, (unsigned long long)d.reports,
+                    (unsigned long long)p.learn_camera, (unsigned long long)p.learn_screen, (unsigned long long)p.learn_none,
+                    (unsigned long long)p.learn_read, (unsigned long long)p.learn_visible, (unsigned long long)p.learn_apart);
+                last_frames = p.frames; last_verts = d.vertices; last_mover = d.mover_verts; last_probe = d.probe_verts;
+            }
         }
     }
 }
@@ -4550,9 +4568,22 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // Seal the current recording even when this evaluation must reset history.
         if (g.replay_ok && inl && !(saved && saved->at_present)) {
             const float viewport_jitter[2] = {static_cast<float>(cam.jitter_px_x), static_cast<float>(cam.jitter_px_y)};
+            // The screen's own motion the pass compares each draw with, to learn which draws move by
+            // themselves (core/replay_movers.hpp): the camera this frame used, or with no camera the
+            // screen motion fitted for this pair. Neither: nothing is learned from this frame.
+            na::j2::replay_motion::Reference learn{};
+            learn.depth_far = in.depth_clear;
+            if (!measured && in.tier2_valid_flag) {
+                learn.mode = 1;
+                std::memcpy(learn.matrix, in.inv_view_proj_current.m, sizeof learn.matrix);
+                learn.fix = in.fix;
+            } else if (measured && flow_tier.screen_model) {
+                learn.mode = 2;
+                learn.model = flow_tier.screen_model;
+            }
             const auto rm = g.replay.Record(l, g.queue.Get(), g.depth32.Get(), rw, rh, reversed,
                                             hist_reset || in_tier1_fed ||
-                                            depth_msaa || !vpj_mode() || (g.jitter_on && !viewport_sample_known), viewport_jitter);
+                                            depth_msaa || !vpj_mode() || (g.jitter_on && !viewport_sample_known), viewport_jitter, &learn);
             if (rm.motion && !in_tier1_fed && na::settings::Get().j2_draw_replay.load(std::memory_order_relaxed)) {
                 in_tier1_fed = true;
                 use_replay_motion = true;

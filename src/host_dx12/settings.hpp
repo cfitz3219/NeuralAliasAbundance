@@ -127,6 +127,10 @@ struct Settings {
     // Expanded vertices draw replay may run again per frame ([j2] replay_vertex_budget, 0 = no budget).
     // 3 million a frame cost about 10 ms on an RTX 5070 Ti at 3440x1440 (Cort's Resistance run, 2026-11-17).
     std::atomic<uint32_t> j2_replay_budget{1000000};
+    // VARIANT: replay/movers-first ([j2] replay_movers, 1 = on): within the budget, draws known to move
+    // by themselves are replayed first and the rest are tried in turn (core/replay_movers.hpp).
+    // 0 = the budget's hashed sample alone.
+    std::atomic<uint32_t> j2_replay_movers{1};
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};

@@ -49,7 +49,12 @@ struct Tier3 {ID3D12Resource *residual=nullptr,*valid=nullptr,*mask=nullptr,*fix
     // `total` is 0 and that zero is not "still". The block search's raw vector is never handed on.
     // On a scene cut every pixel is 0 / 0.
     // RG32_FLOAT / R32_FLOAT, NON_PIXEL_SHADER_RESOURCE.
-    ID3D12Resource *total=nullptr,*total_valid=nullptr;};
+    ID3D12Resource *total=nullptr,*total_valid=nullptr;
+    // Frame::total with the screen fit: the fitted screen motion `measure` followed for this pair
+    // (flow_shaders.hpp fit_solve's model: RG32_FLOAT 8x1, texels 0..5 the eleven terms and the
+    // nearness limit, 6.x valid; NON_PIXEL_SHADER_RESOURCE). Null when the fit did not run. The draw
+    // replay compares its draws with it (core/replay_movers.hpp).
+    ID3D12Resource *screen_model=nullptr;};
 // Called inside J2's restorable inline scope, AFTER its colour/depth resolve.
 // All inputs NPSR. No CPU waits; allocations/retirement reuse RecordingLease.
 Ticket Record(ID3D12GraphicsCommandList*,ID3D12CommandQueue*,ID3D12Resource* color,ID3D12Resource* depth,

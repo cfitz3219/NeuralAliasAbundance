@@ -190,6 +190,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
         target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);
         target.j2_replay_budget.store(GetPrivateProfileIntW(L"j2", L"replay_vertex_budget", 1000000, ini));
+        target.j2_replay_movers.store(GetPrivateProfileIntW(L"j2", L"replay_movers", 1, ini) ? 1u : 0u);
         const int cam = static_cast<int>(GetPrivateProfileIntW(L"j2", L"camera", 1, ini));
         target.j2_camera.store(cam < 0 || cam > 2 ? 1 : cam);
     }
