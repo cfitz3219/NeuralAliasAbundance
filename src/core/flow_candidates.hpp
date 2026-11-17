@@ -153,6 +153,9 @@ inline Vector Decide(const Result& top, Vector own, const Picture& current, cons
     }
     if (!found) return own;
     if (offered) *offered = true;
+    // Exact shortcut (Astra, COMMS dc69b00a): the own vector's best of nine is never above its
+    // whole-pixel error, and no error is below zero, so under kGain no candidate can be better by kGain.
+    if (BlockError(current, previous, bx, by, float(own.x), float(own.y)) < kGain) return own;
     const float e_own = BestOfNine(current, previous, bx, by, own), e_best = BestOfNine(current, previous, bx, by, best);
     return e_best <= kRatio * e_own && e_own - e_best >= kGain ? best : own;
 }

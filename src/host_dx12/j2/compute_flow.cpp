@@ -270,7 +270,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         c->dispatch(l,work,4,c->pso_cand_clear.Get(),cc,false,32,32);order(l);
         c->dispatch(l,work,4,c->pso_cand_count.Get(),cc,false,groups_x,groups_y);order(l);
         for(unsigned round=0;round<8;++round){cc.mode=round;c->dispatch(l,work,4,c->pso_cand_pick.Get(),cc,false,groups_x,groups_y);order(l);}
-        c->dispatch(l,work,4,c->pso_cand_apply.Get(),cc,false,groups_x,groups_y);order(l);
+        c->dispatch(l,work,4,c->pso_cand_apply.Get(),cc,false,cb.gw,cb.gh);order(l); // one thread group per block, one thread per pixel
         move(l,c->grid.Get(),U,S);
         move(l,c->top.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),64,c->top.Get(),0,40);move(l,c->top.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
         grid=c->grid.Get();slot.candidates=true;

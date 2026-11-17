@@ -319,6 +319,7 @@ void cut_show(uint3 id : SV_DispatchThreadID) {
 //   u2 words 0..7 the candidates, strongest first, as (support << 16) | (y + 128) << 8 | (x + 128);
 //      word 8 blocks that took a candidate, word 9 blocks that had one to compare
 //   mode: cand_pick's round (0..7)      cost_max: the support a vector needs to be offered
+// cand_clear, cand_count and cand_pick run one thread per block; cand_apply one thread GROUP per block.
 inline const char kCandidateShader[] = R"(
 Texture2D<int2>   t_grid : register(t0);
 Texture2D<float4> t_cur  : register(t5);
@@ -368,65 +369,96 @@ void cand_pick(uint3 id : SV_DispatchThreadID) {
     }
     if (!taken) u_top.InterlockedMax(mode * 4, packed);
 }
-// Mean |luma| difference between block b of the current picture and the previous picture moved by v.
-float block_error(uint2 b, float2 v) {
-    float e = 0, n = 0;
-    [loop] for (uint j = 0; j < 8; ++j) {
-        [loop] for (uint i = 0; i < 8; ++i) {
-            uint2 q = b * 8 + uint2(i, j);
-            if (q.x < w && q.y < h) {
-                float c = luma(t_cur.Load(int3(q, 0)).rgb);
-                e += abs(c - luma(t_prev.SampleLevel(s_lin, (float2(q) + 0.5 + v) / float2(w, h), 0).rgb));
-                n += 1.0;
-            }
-        }
-    }
-    return e / max(n, 1.0);
-}
-// A whole-pixel vector at itself and at the eight half-pixel places around it: the best counts.
-float best_of_nine(uint2 b, int2 v) {
-    float least = 1e9;
-    [loop] for (int sj = -1; sj <= 1; ++sj) {
-        [loop] for (int si = -1; si <= 1; ++si) least = min(least, block_error(b, float2(v) + 0.5 * float2(si, sj)));
-    }
-    return least;
-}
-groupshared uint gc[2];
+// One thread group is one 8x8 block and one thread is one of its pixels, so a block's 64 pixels are
+// compared side by side (the first version walked them one after another in a single thread and
+// cost about 1.2 ms on a busy 1920x1080 pair on the RTX card; Astra's timing, COMMS dc69b00a).
+// The decisions are flow_candidates.hpp Decide exactly: each pixel writes its own differences, and
+// thread 0 adds them up in the same order (rows, then columns) the CPU reference does.
+//   step 1  per pixel: the block's own vector at whole pixels, and every candidate that may be offered
+//   thread 0: the candidate with the least block error; nothing more to do when there is none, or
+//           when the own vector's whole-pixel error is already under kGain (no candidate can then
+//           be better by kGain: the exact shortcut Astra pointed out)
+//   step 2  per pixel: the own vector and that candidate at their nine half-pixel places
+//   thread 0: the decision, the grid and the two counters
+// Dispatched as gw x gh groups. No thread leaves before the last barrier.
+float prev_at(uint2 q, float2 v) { return luma(t_prev.SampleLevel(s_lin, (float2(q) + 0.5 + v) / float2(w, h), 0).rgb); }
+groupshared float gc_err[18 * 64]; // step 1: slot 0 the own vector, slots 1..8 the candidates; step 2: slots 0..8 own, 9..17 the candidate
+groupshared int gc_pick;           // the candidate chosen for step 2 (its index), or -1
+groupshared uint gc_step2;         // 1 when step 2 is needed
 [numthreads(8, 8, 1)]
-void cand_apply(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    if (gi < 2) gc[gi] = 0;
-    GroupMemoryBarrierWithGroupSync();
-    if (id.x < gw && id.y < gh) {
-        int2 own = t_grid.Load(int3(id.xy, 0));
-        int2 chosen = own;
-        if (any(own != 0)) { // a block the search called still stays still
-            int2 lo = int2(id.xy) * 8, hi = min(lo + 8, int2(w, h));
-            float least = 1e9;
-            int2 best = own;
-            bool found = false;
-            [loop] for (uint k = 0; k < kCount; ++k) {
-                uint packed = u_top.Load(k * 4);
-                if (packed != 0u) {
-                    int2 c = vector_of(packed);
-                    int2 d = abs(c - own);
-                    // nearer than the search's own reach: the search compared those itself;
-                    // and the whole block must come from inside the picture
-                    if (max(d.x, d.y) > kReach && all(lo + c >= 0) && all(hi + c <= int2(w, h))) {
-                        float e = block_error(id.xy, float2(c));
-                        if (e < least) { least = e; best = c; found = true; }
-                    }
-                }
-            }
-            if (found) {
-                InterlockedAdd(gc[1], 1u);
-                float e_own = best_of_nine(id.xy, own), e_best = best_of_nine(id.xy, best);
-                if (e_best <= kRatio * e_own && e_own - e_best >= kGain) { chosen = best; InterlockedAdd(gc[0], 1u); }
-            }
+void cand_apply(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID, uint lane : SV_GroupIndex) {
+    uint2 b = group.xy;
+    bool in_grid = b.x < gw && b.y < gh;
+    uint2 q = b * 8 + thread.xy;
+    bool inside = in_grid && q.x < w && q.y < h;
+    int2 own = in_grid ? t_grid.Load(int3(b, 0)) : int2(0, 0);
+    bool moving = in_grid && any(own != 0); // a block the search called still stays still
+    int2 lo = int2(b) * 8, hi = min(lo + 8, int2(w, h));
+    float c = inside ? luma(t_cur.Load(int3(q, 0)).rgb) : 0.0;
+    uint offered = 0; // bit k: candidate k may be offered to this block (the same in every thread of the group)
+    gc_err[lane] = inside && moving ? abs(c - prev_at(q, float2(own))) : 0.0;
+    [unroll] for (uint k = 0; k < kCount; ++k) {
+        uint packed = u_top.Load(k * 4);
+        int2 cv = vector_of(packed);
+        int2 d = abs(cv - own);
+        // nearer than the search's own reach: the search compared those itself;
+        // and the whole block must come from inside the picture
+        bool may = moving && packed != 0u && max(d.x, d.y) > kReach && all(lo + cv >= 0) && all(hi + cv <= int2(w, h));
+        if (may) { // slots of candidates not offered are never read
+            offered |= 1u << k;
+            gc_err[(k + 1) * 64 + lane] = inside ? abs(c - prev_at(q, float2(cv))) : 0.0;
         }
-        u_grid[id.xy] = chosen;
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi < 2 && gc[gi] != 0) u_top.InterlockedAdd(32 + gi * 4, gc[gi]);
+    float pixels = float(max(hi.x - lo.x, 0) * max(hi.y - lo.y, 0));
+    if (lane == 0) {
+        int pick = -1;
+        float least = 1e9;
+        [loop] for (uint k1 = 0; k1 < kCount; ++k1) {
+            if ((offered >> k1) & 1u) {
+                float e = 0;
+                [loop] for (uint i1 = 0; i1 < 64; ++i1) e += gc_err[(k1 + 1) * 64 + i1];
+                e /= max(pixels, 1.0);
+                if (e < least) { least = e; pick = int(k1); }
+            }
+        }
+        float e_whole = 0;
+        [loop] for (uint i0 = 0; i0 < 64; ++i0) e_whole += gc_err[i0];
+        e_whole /= max(pixels, 1.0);
+        gc_pick = pick;
+        gc_step2 = pick >= 0 && !(e_whole < kGain) ? 1u : 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    int picked = gc_pick;
+    bool step2 = gc_step2 != 0u;
+    int2 best = picked >= 0 ? vector_of(u_top.Load(uint(max(picked, 0)) * 4)) : own;
+    if (step2) { // the slots are read only when step 2 ran
+        [unroll] for (int sj = -1; sj <= 1; ++sj) {
+            [unroll] for (int si = -1; si <= 1; ++si) {
+                uint s = uint((sj + 1) * 3 + (si + 1));
+                float2 half_pixel = 0.5 * float2(si, sj);
+                gc_err[s * 64 + lane] = inside ? abs(c - prev_at(q, float2(own) + half_pixel)) : 0.0;
+                gc_err[(9 + s) * 64 + lane] = inside ? abs(c - prev_at(q, float2(best) + half_pixel)) : 0.0;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane == 0 && in_grid) {
+        int2 chosen = own;
+        if (picked >= 0) u_top.InterlockedAdd(36, 1u); // the block had a candidate to compare
+        if (step2) {
+            // each vector at its best of the nine half-pixel places
+            float e_own = 1e9, e_best = 1e9;
+            [loop] for (uint s2 = 0; s2 < 9; ++s2) {
+                float a = 0, o = 0;
+                [loop] for (uint i2 = 0; i2 < 64; ++i2) { o += gc_err[s2 * 64 + i2]; a += gc_err[(9 + s2) * 64 + i2]; }
+                e_own = min(e_own, o / max(pixels, 1.0));
+                e_best = min(e_best, a / max(pixels, 1.0));
+            }
+            if (e_best <= kRatio * e_own && e_own - e_best >= kGain) { chosen = best; u_top.InterlockedAdd(32, 1u); }
+        }
+        u_grid[b] = chosen;
+    }
 }
 )";
 }
