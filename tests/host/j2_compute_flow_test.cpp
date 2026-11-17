@@ -12,13 +12,19 @@
 #include <cstring>
 #include <d3d12sdklayers.h>
 #include "total_motion_gpu_audit.hpp"
+#include "flow_ambiguity_gpu_audit.hpp"
 #include "flow_fixture_pictures.hpp"
 int main(int argc,char** argv){
     if(!na::ffx_flow::Built())return test::kSkip;
-    const bool debug_mode=argc>1 && !std::strcmp(argv[1],"--debug");
+    const bool debug_mode=(argc>1 && !std::strcmp(argv[1],"--debug")) || (argc>2 && !std::strcmp(argv[2],"--debug"));
     test::ComPtr<ID3D12Debug> debug;
     if(debug_mode){REQUIRE(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))));debug->EnableDebugLayer();}
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    if(argc>1 && !std::strcmp(argv[1],"--ambiguity")){
+        if(!na::ffx_flow::DeviceSupported(d.device.Get()))return test::kSkip;
+        REQUIRE(AuditFlowAmbiguity(d,512,256)==0);REQUIRE(AuditFlowAmbiguity(d,1920,1080)==0);
+        return test::finish("j2_compute_flow_ambiguity");
+    }
     test::ComPtr<ID3D12InfoQueue> info;if(debug_mode)REQUIRE(SUCCEEDED(d.device.As(&info)));
     REQUIRE(AuditTotalMotionShader(d)==0);
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
@@ -177,7 +183,19 @@ int main(int argc,char** argv){
                  w,h,(unsigned long long)fs.fit_recorded,(unsigned long long)fs.fit_collected,(unsigned long long)fs.fit_accepted,
                  (unsigned long long)fs.fit_flow_passed,(unsigned long long)fs.fit_rejected_image,(unsigned long long)fs.fit_rejected_jitter,
                  fs.fit_n0,fs.fit_n,fs.fit_e0,fs.fit_e,fs.fit_e_alt,fs.fit_last_accepted?1:0,
-                 fs.fit_photo_tested,fs.fit_photo_better,fs.fit_photo_worse,fs.fit_photo_regions,fs.fit_photo_good,fs.fit_photo_e_fit,fs.fit_photo_e_cam);}
+                 fs.fit_photo_tested,fs.fit_photo_better,fs.fit_photo_worse,fs.fit_photo_regions,fs.fit_photo_good,fs.fit_photo_e_fit,fs.fit_photo_e_cam);
+             // Inspect the computed transform independently of its admission. This distinguishes
+             // "solver found the wrong camera" from "right camera rejected because most flow is wrong".
+             double fit_error=0,fit_x=0,fit_y=0;unsigned fit_count=0;
+             for(unsigned y=32;y<h-32;y+=16)for(unsigned x=48;x<w-48;x+=16){
+                 const double px=x+.5-camera.jitter_current_px[0],py=y+.5-camera.jitter_current_px[1];
+                 const double ndc_point[]={2*px/w-1,1-2*py/h,.5,1};double clip[4]{};
+                 for(unsigned row=0;row<4;++row)for(unsigned col=0;col<4;++col){double m=basis.C[row*4+col];
+                     for(unsigned k=0;k<6;++k)m+=fs.fit_theta[k]*basis.G[k][row*4+col];clip[col]+=ndc_point[row]*m;}
+                 const double vx=(clip[0]/clip[3]+1)*.5*w-px,vy=(1-clip[1]/clip[3])*.5*h-py;
+                 fit_error+=std::hypot(vx+6,vy);fit_x+=vx;fit_y+=vy;++fit_count;
+             }
+             std::printf("  computed fit before admission: mean=(%.4f,%.4f) error=%.4f px\n",fit_x/fit_count,fit_y/fit_count,fit_error/fit_count);}
             if(confirmed){CHECK(still/sn<.08);
                 if(picture.followed)CHECK(moving/mn<.35);
                 else {std::printf("  known limit (R3): the search loses this repeating picture at this size, so the pan is not asserted on it; a refused fit must leave the motion alone\n");
