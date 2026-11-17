@@ -64,8 +64,10 @@ Timing covers the whole flow stage, not just the solver and not total game frame
 |---|---|---|---:|
 | 1920x1080, initial run | 0.5867 / 0.5855 ms | 1.7984 / 1.7961 ms | 1.211 ms |
 | 1920x1080, output-checked run | 0.5868 / 0.5892 ms | 1.7985 / 1.8003 ms | 1.211 ms |
+| 1920x1080, explicit-finiteness rerun | 0.5903 / 0.5883 ms | 1.8052 / 1.7601 ms | 1.193 ms |
 | 3440x1440, initial run | 1.2662 / 1.2700 ms | 3.5452 / 3.5483 ms | 2.279 ms |
 | 3440x1440, output-checked run | 1.2700 / 1.2714 ms | 3.6387 / 3.7161 ms | 2.407 ms |
+| 3440x1440, explicit-finiteness rerun | 1.2731 / 1.2726 ms | 3.4057 / 3.5581 ms | 2.209 ms |
 
 All ON warm pairs have a valid model, 12 steps, 7,826/18,773 samples and 7,458/17,841 agreeing samples respectively. The spread between runs is disclosed rather than choosing only the fastest result. This repair is useful but not free; these numbers do not predict an exact game FPS change.
 
