@@ -385,11 +385,16 @@ void fit_solve(uint gi : SV_GroupIndex) {
         if (failed) return;
         u_cnt.Store(13 * 4, asuint(n));
         bool ok = n >= kFitMinSamples;
-        // Plain loops, not unrolled: one thread runs this once a step, and the program stays small to compile.
+        // Plain loops, not unrolled: one thread runs this once a step, and the program stays small to
+        // compile. Every loop runs over all the terms and tests its own range inside: fxc tries a loop's
+        // body once before its condition, and a loop that starts beyond the last term (i = j + 1 at the
+        // last j) is refused as an out-of-bounds access (X3504).
         float A[FIT_TERMS][FIT_TERMS], b[FIT_TERMS], sc[FIT_TERMS];
         uint idx = 0;
         [loop] for (uint a = 0; a < FIT_TERMS; ++a) {
-            [loop] for (uint c = a; c < FIT_TERMS; ++c) { A[a][c] = gt[idx]; A[c][a] = gt[idx]; ++idx; }
+            [loop] for (uint c = 0; c < FIT_TERMS; ++c) {
+                if (c >= a) { A[a][c] = gt[idx]; A[c][a] = gt[idx]; ++idx; }
+            }
         }
         [loop] for (uint a1 = 0; a1 < FIT_TERMS; ++a1) { b[a1] = gt[FIT_PAIRS + a1]; sc[a1] = A[a1][a1] > 1e-20 ? rsqrt(A[a1][a1]) : 0.0; }
         [loop] for (uint a2 = 0; a2 < FIT_TERMS; ++a2) {
@@ -398,28 +403,34 @@ void fit_solve(uint gi : SV_GroupIndex) {
             A[a2][a2] = (sc[a2] > 0 ? A[a2][a2] : 0.0) + kFitDamping + (sc[a2] > 0 ? 0.0 : 1.0);
             b[a2] *= sc[a2];
         }
-        float L[FIT_TERMS][FIT_TERMS];
-        [loop] for (uint r0 = 0; r0 < FIT_TERMS; ++r0) { [loop] for (uint c3 = 0; c3 < FIT_TERMS; ++c3) L[r0][c3] = 0; }
+        float L[FIT_TERMS][FIT_TERMS], yv[FIT_TERMS], xv[FIT_TERMS];
+        [loop] for (uint r0 = 0; r0 < FIT_TERMS; ++r0) {
+            yv[r0] = 0; xv[r0] = 0;
+            [loop] for (uint c3 = 0; c3 < FIT_TERMS; ++c3) L[r0][c3] = 0;
+        }
         [loop] for (uint j = 0; j < FIT_TERMS; ++j) {
             float d = A[j][j];
-            [loop] for (uint m = 0; m < j; ++m) d -= L[j][m] * L[j][m];
+            [loop] for (uint m = 0; m < FIT_TERMS; ++m) { if (m < j) d -= L[j][m] * L[j][m]; }
             if (!(d > 1e-12)) ok = false;
-            L[j][j] = sqrt(max(d, 1e-12));
-            [loop] for (uint i5 = j + 1; i5 < FIT_TERMS; ++i5) {
-                float t = A[i5][j];
-                [loop] for (uint m2 = 0; m2 < j; ++m2) t -= L[i5][m2] * L[j][m2];
-                L[i5][j] = t / L[j][j];
+            const float dj = sqrt(max(d, 1e-12));
+            L[j][j] = dj;
+            [loop] for (uint i5 = 0; i5 < FIT_TERMS; ++i5) {
+                if (i5 > j) {
+                    float t = A[i5][j];
+                    [loop] for (uint m2 = 0; m2 < FIT_TERMS; ++m2) { if (m2 < j) t -= L[i5][m2] * L[j][m2]; }
+                    L[i5][j] = t / dj;
+                }
             }
         }
-        float yv[FIT_TERMS], xv[FIT_TERMS];
         [loop] for (uint i6 = 0; i6 < FIT_TERMS; ++i6) {
             float t = b[i6];
-            [loop] for (uint m3 = 0; m3 < i6; ++m3) t -= L[i6][m3] * yv[m3];
+            [loop] for (uint m3 = 0; m3 < FIT_TERMS; ++m3) { if (m3 < i6) t -= L[i6][m3] * yv[m3]; }
             yv[i6] = t / L[i6][i6];
         }
-        [loop] for (int i7 = FIT_TERMS - 1; i7 >= 0; --i7) {
+        [loop] for (uint q7 = 0; q7 < FIT_TERMS; ++q7) {
+            const uint i7 = FIT_TERMS - 1 - q7;
             float t = yv[i7];
-            [loop] for (int m4 = i7 + 1; m4 < FIT_TERMS; ++m4) t -= L[m4][i7] * xv[m4];
+            [loop] for (uint m4 = 0; m4 < FIT_TERMS; ++m4) { if (m4 > i7) t -= L[m4][i7] * xv[m4]; }
             xv[i7] = t / L[i7][i7];
         }
         float th[FIT_TERMS];
