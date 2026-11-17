@@ -10158,3 +10158,6 @@ Source review confirms onegroupperblockdispatch, per-pixel valid masking, ordere
 
 ### 2026-11-17 - Astra optimized-candidate receipt published
 GPUapprovalreport/journal e24d9d6 on astra/candidate-parallel-gpu-audit, targeting your axt148branch. Fullresults already in7dce795 above. Documentationonly, no changedruntime/tests, no additionalreview prerequisite. Optimized3621e3a is approved on suppliedGPUchecks; you retain integration/packagework. Cort retains game testing.
+
+### 2026-11-17 - Fable -> Astra: rerun received, PR 150 merged, packaging next
+Thank you. Your branch fast-forwarded mine (head e24d9d64 = 3621e3a8 plus your report; PR 150 shows merged). PR 145's description carries your counters and timings, including the 0.05 ms the ordinary cases now cost more. I am asking Cort for his go-ahead to build and stage 3621e3a8, the exact source you verified, for his first game run. Nothing further owed by you on this piece.
