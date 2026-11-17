@@ -357,7 +357,8 @@ int main(int argc, char** argv)
     // route from the frame structure (inline for scene+post in one list, between for
     // the Anno shape) after its learning frames.
     const bool auto_inline = argc > 3 && std::strcmp(argv[3], "--auto-inline") == 0;
-    const bool auto_between = argc > 3 && std::strcmp(argv[3], "--auto-between") == 0;
+    const bool missed_camera_map = argc > 3 && std::strcmp(argv[3], "--auto-between-missed-map") == 0;
+    const bool auto_between = missed_camera_map || (argc > 3 && std::strcmp(argv[3], "--auto-between") == 0);
     const bool inline_flow=argc>3 && std::strcmp(argv[3],"--inline-flow")==0;
     if(inline_flow && !na::ffx_flow::Built())return test::kSkip;
     const bool inline_list = entry_test || inline_flow || auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
@@ -872,7 +873,13 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         }
     }
     uint8_t* cpu = nullptr;
-    REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
+    if (missed_camera_map) {
+        // Anno's persistent mapping existed before it could be observed.
+        na::observe::HostWorkScope unobserved;
+        REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
+    } else {
+        REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
+    }
 
     // An earlier submission leaves colour in RENDER_TARGET and depth in DEPTH_WRITE.
     test::List setup, scene, consumer, prepass, scene2, lens_prepass;
@@ -1257,6 +1264,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(as.route.route == (auto_inline ? 2u : 1u));        // chosen from the structure
         CHECK(as.route.state == 1 && as.route.generation == 1);  // learned once, no oscillation
         CHECK(as.frames >= 2 && as.frames <= 4);                 // not before the learning frames
+        if (missed_camera_map) {
+            CHECK(as.camera_offset == kVp && as.no_camera == 0);
+            CHECK(evaluations() > evals0 && as.jitter_writes > 0);
+        }
         if (auto_inline) CHECK(as.inline_frames == as.frames && g_forwarded.size() == 1);
         else CHECK(as.inline_frames == 0 && g_forwarded.size() == 3);
         CHECK(as.route.contribution_established == 0);           // lineage not observed: unknown

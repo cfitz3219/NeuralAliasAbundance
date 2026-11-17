@@ -264,7 +264,12 @@ bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object
 // may consume the scene colour before a list-boundary insertion).
 uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object_id depth);
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state); // last whole-resource transition in it
-uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n); // CPU-visible buffer bytes (0 = unavailable)
+// Camera acquisition can recover an upload buffer whose persistent Map was
+// missed at startup. This keeps app Map observations and discovery snapshots
+// separate from our temporary mapping of the bound bytes.
+enum class BufferMapPolicy { Observed, Recover };
+uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n,
+                    BufferMapPolicy policy = BufferMapPolicy::Observed);
 // The state `id` (whole resource) carried into the submission this thread is
 // forwarding right now, from the known-state store (earlier submissions /
 // creation). False when not provable. Only for host work inside that forward.
@@ -358,7 +363,8 @@ private:
 };
 // Writes into a CPU-visible (upload) buffer of the game, e.g. J1 jittering the
 // camera constants of a submission before it is forwarded. Returns bytes written.
-uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n);
+uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n,
+                     BufferMapPolicy policy = BufferMapPolicy::Observed);
 // Read-only lookup over recorded creations: 2D textures with one of `formats` and exactly w x h.
 uint32_t FindTextures(const uint32_t* formats, uint32_t format_count, uint32_t w, uint32_t h, na_object_id* out, uint32_t max);
 ID3D12Resource* AcquireResource(na_object_id id);                         // AddRef'd, or null
