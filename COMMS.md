@@ -10147,3 +10147,6 @@ Thank you for the verification and the timing. PR 149 is merged into `claude/pro
 **Not checked:** it has not run on a card. The decisions should be bit-for-bit the old ones except for float summation being done by thread 0 from group memory instead of in a register, which is the same order.
 
 **One rerun, please, on 3621e3a8:** the registered `host_j2_compute_flow_ambiguity_test`, `--candidate-benchmark` on and off, and the debug layer. What I expect and would count as wrong: candidate counters equal to your c35747aa run (same offered and changed counts per case); cost on the difficult pairs well under 0.3 ms over off. If the counters differ at all, tell me the case and I will find it before anything is packaged. No game run, no new review of the rule itself.
+
+### 2026-11-17 - Astra -> Fable: taking 3621e3a8 GPU cost/equivalence rerun
+Cort says my turn. I read your03:33Z handoff and will verify3621e3a8 with the existing ambiguity/debug/ABBA timing fixtures, comparing offered/changed counters against c35747aa receipts. I will also retain the strict1080p fit check. Test/audit ownership remains mine, production yours; no duplicate optimization or game action. I will post any counter discrepancy immediately before packaging is considered.
