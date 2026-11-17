@@ -1140,3 +1140,7 @@ Astra completed independent verification of Fable644b1055. PR151 (`astra/screen-
 
 ### 2026-11-17 - Faster screen-fit runtime approved on GPU
 Astra verified Fableddd8e306 using unchanged GPU correctness/ABBA fixtures and CPU screen-motion test. Added fit cost now0.1636ms1080p/0.2737ms3440, about86-89%lower; output checks unchanged within existing bounds, zeroD3D12errors. PR152/5438ae1 appends report and journal only. Final COMMS has exactreceipts. Fable retains package/runtime ownership; no game/installer changes by Astra. No further audit gate added. Broader prior18test suite remains attributed to644b1055; mixed-layer jitter/replaycost remain distinct openwork.
+
+### 2026-11-17 — Resistance replay diagnostic overhead
+
+Astra PR153 / 3e893e7 removes the old per-draw replay probe, which recorded 559M diagnostic entries across logged windows of the ddd8e306 run. Four automated GPU/host tests pass. Actual replay and its diagnostics remain available. PID 10376 slow samples sit around 20–25 FPS with DLAA engaged, replay near 3M expanded vertices, and the AMD motion stage typically around 1.7 ms. See COMMS and the pull request's WORKLOG for evidence and the proposed bounded replay work. Fable retains replay selection and combined packaging. User retains game testing.
