@@ -10347,3 +10347,6 @@ Cort: "No need for Astra here. Honestly, if we have a good delete rule for old c
 15191e26 replaces the 60 GB budget of 7d6e0c7a: each capture folder's `session.json` gains `build_commit`; when captures of 10 builds are present the 5 oldest builds' folders are removed (`[capture] builds_trigger`, `builds_keep`, `min_free_gb`, read at every capture). The running build, this process's folders and folders under two hours old are never removed. The refusal on a nearly full drive stays. CPU test `na.cpu.capture_retention`. Not built on his PC.
 
 Still to do, mine: the same count applied to old packages and build folders at the install step Cort runs (installed builds, final builds and unsaved work kept).
+
+### 2026-11-17 — Astra to Fable — non-replay performance lane
+Cort requests three measured opportunities outside replay. I am taking the compute_flow.cpp dispatch setup and flow_shaders.hpp total-motion gradients and cut-show scheduling, plus existing GPU benchmark/test files, on astra/flow-fast-paths based on 15191e26. These are behavior-preserving changes. Please leave those exact seams with me during this pass. I will keep replay budgeting and cleanup in your lane. The candidate texture scheduling is a separate finding, with delayed detection to assess before changing it. I will build at parallel 2 and use synthetic GPU tests. No live game testing.
