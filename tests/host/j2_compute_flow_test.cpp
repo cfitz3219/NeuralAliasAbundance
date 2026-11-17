@@ -12,6 +12,7 @@
 #include <cstring>
 #include <d3d12sdklayers.h>
 #include "total_motion_gpu_audit.hpp"
+#include "flow_ambiguity_gpu_audit.hpp"
 #include "flow_fixture_pictures.hpp"
 int main(int argc,char** argv){
     if(!na::ffx_flow::Built())return test::kSkip;
@@ -19,6 +20,11 @@ int main(int argc,char** argv){
     test::ComPtr<ID3D12Debug> debug;
     if(debug_mode){REQUIRE(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))));debug->EnableDebugLayer();}
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    if(argc>1 && !std::strcmp(argv[1],"--ambiguity")){
+        if(!na::ffx_flow::DeviceSupported(d.device.Get()))return test::kSkip;
+        REQUIRE(AuditFlowAmbiguity(d,512,256)==0);REQUIRE(AuditFlowAmbiguity(d,1920,1080)==0);
+        return test::finish("j2_compute_flow_ambiguity");
+    }
     test::ComPtr<ID3D12InfoQueue> info;if(debug_mode)REQUIRE(SUCCEEDED(d.device.As(&info)));
     REQUIRE(AuditTotalMotionShader(d)==0);
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
