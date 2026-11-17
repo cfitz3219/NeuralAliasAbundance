@@ -21,6 +21,8 @@ Built Release x64 MSVC 19.51 with the existing SDK-enabled audit build. Both Fab
 
 Fable changed the repeating-picture large-case assertion from accuracy below .35 px to a labelled known-limit bound below 6.5 px. I accept adding the non-repeating control to isolate the fit. **The changed bound does not fix or qualify the repeating-picture case.** A mean below 6.5 also does not prove every pixel is left unchanged. Our new optional ambiguity regression grades actual vector distributions and stays red on the current runtime.
 
+An additional GPU diagnostic reconstructs the projected vectors from the fit's actual six parameters before admission. In the rejected confirmed-raster wave case at1080p, the computed transform predicts mean motion **(-6.0044,-0.0859) px**, mean error **0.0865 px**. Thus the solver really did find approximately the correct camera; this is not only a CPU-model inference. The accepted non-repeating transform has error0.0011px. Unconfirmed jitter cases remain wrong by~1.2-1.3px, reinforcing the need to preserve the jitter/image controls when changing admission. Receipt: `fit-transform-1080p.log`.
+
 ## Actual camera-free GPU results
 
 `j2_compute_flow_test.exe --ambiguity` uses the real AMD search, packed10 stabilization and total-motion shader, with no camera and no jitter. It reads the produced motion and validity on the GPU and separately reads the same pair's raw integer search. Readbacks and waits are test-only. The existing test still covers alternating jitter and fractional pans separately.
@@ -69,5 +71,7 @@ AMD's [Optical Flow description](https://gpuopen.com/manuals/fidelityfx_sdk/tech
 ## Receipts and scope
 
 Worktree: `C:\Users\Cort\NA-camera-runtime-audit`; branch `astra/flow-ambiguity-audit`. Existing `local/audit-build` and SDKs reused. Logs under `local/ambiguity-audit`: `baseline-build.log`, `baseline-tests.log`, `audit-build.log`, `ambiguity.log`, `ambiguity-regression.log`, `ambiguity-extended.log`, `ambiguity-candidates.log`.
+
+`--ambiguity --debug` reports zero D3D12 validation errors at both sizes while retaining the same twelve intentional numerical failures on the uncorrected runtime. Receipt `ambiguity-debug.log`. This separates incorrect estimated motion from invalid resource/view usage in the audit. Additional fit-transform diagnostic builds and runs are recorded in `fit-diagnostic-build.log` and `fit-transform-1080p.log`.
 
 Build `j2_compute_flow_test` Release, run its default/`1920` cases for the camera fit, and `--ambiguity` for the actual total-motion defect and candidate comparisons. The optional ambiguity run intentionally fails current production; it is not registered as a passing CTest or disguised as expected success. No installer was made, no game was started, and no game quality claim is inferred from these fixtures.

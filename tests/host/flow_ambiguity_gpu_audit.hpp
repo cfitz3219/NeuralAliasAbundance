@@ -110,5 +110,11 @@ inline int AuditFlowAmbiguity(test::Device& d,unsigned w,unsigned h)
         if(object_n)CHECK(double(object_right[0])/object_n>.95);
         raw->Unmap(0,nullptr);motion->Unmap(0,nullptr);valid->Unmap(0,nullptr);cf::Reset();
     }
+    test::ComPtr<ID3D12InfoQueue> info;d.device.As(&info);
+    if(info){unsigned errors=0;for(UINT64 i=0;i<info->GetNumStoredMessages();++i){
+        SIZE_T bytes=0;info->GetMessage(i,nullptr,&bytes);std::vector<uint8_t> data(bytes);auto* message=reinterpret_cast<D3D12_MESSAGE*>(data.data());
+        if(SUCCEEDED(info->GetMessage(i,message,&bytes)) && message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){
+            std::printf("D3D12 ambiguity: %s\n",message->pDescription);++errors;}}
+        std::printf("D3D12 ambiguity %ux%u errors=%u\n",w,h,errors);CHECK(errors==0);info->ClearStoredMessages();}
     return 0;
 }
