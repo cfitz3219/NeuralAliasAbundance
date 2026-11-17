@@ -4,6 +4,7 @@
 #include <shlobj.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <cwchar>
 #include <atomic>
@@ -50,14 +51,49 @@ void retention_log(const char* fmt, ...)
     log(line);
 }
 
-void retention_limits(uint64_t* keep_bytes, uint64_t* min_free_bytes)
+struct Limits { uint32_t trigger_builds = 10, keep_builds = 5; uint64_t min_free_bytes = 20ull << 30; };
+Limits retention_limits()
 {
     wchar_t ini[MAX_PATH];
     { std::lock_guard<std::mutex> lock(R().m); wcscpy_s(ini, R().ini); }
-    const UINT keep = ini[0] ? GetPrivateProfileIntW(L"capture", L"keep_gb", 60, ini) : 60u;
-    const UINT floor_gb = ini[0] ? GetPrivateProfileIntW(L"capture", L"min_free_gb", 20, ini) : 20u;
-    *keep_bytes = static_cast<uint64_t>(keep) << 30;
-    *min_free_bytes = static_cast<uint64_t>(floor_gb) << 30;
+    Limits l;
+    if (!ini[0]) return l;
+    l.trigger_builds = GetPrivateProfileIntW(L"capture", L"builds_trigger", 10, ini);
+    l.keep_builds = GetPrivateProfileIntW(L"capture", L"builds_keep", 5, ini);
+    if (l.keep_builds < 1) l.keep_builds = 1;
+    if (l.trigger_builds && l.trigger_builds <= l.keep_builds) l.trigger_builds = l.keep_builds + 1;
+    l.min_free_bytes = static_cast<uint64_t>(GetPrivateProfileIntW(L"capture", L"min_free_gb", 20, ini)) << 30;
+    return l;
+}
+
+// This build's commit ([host] build_commit, written by the installer); "" when the INI does not say.
+void this_build(char* out, size_t n)
+{
+    out[0] = 0;
+    wchar_t ini[MAX_PATH], build[64] = {};
+    { std::lock_guard<std::mutex> lock(R().m); wcscpy_s(ini, R().ini); }
+    if (ini[0]) GetPrivateProfileStringW(L"host", L"build_commit", L"", build, 64, ini);
+    size_t o = 0;
+    for (const wchar_t* c = build; *c && o + 1 < n; ++c)
+        if ((*c >= L'0' && *c <= L'9') || (*c >= L'a' && *c <= L'f') || (*c >= L'A' && *c <= L'F')) out[o++] = static_cast<char>(*c);
+    out[o] = 0;
+}
+
+// The build recorded in <dir>\\session.json; "" when the folder has none (made before 2026-11-17).
+std::string folder_build(const std::wstring& dir)
+{
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, (dir + L"\\session.json").c_str(), L"rb") != 0 || !fp) return {};
+    char text[4096];
+    const size_t n = std::fread(text, 1, sizeof text - 1, fp);
+    std::fclose(fp);
+    text[n] = 0;
+    const char* key = std::strstr(text, "\"build_commit\"");
+    if (!key) return {};
+    const char* q = std::strchr(key + 14, '"');
+    if (!q) return {};
+    const char* e = std::strchr(q + 1, '"');
+    return e ? std::string(q + 1, e) : std::string();
 }
 
 uint64_t filetime(const FILETIME& t) { return (static_cast<uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
@@ -101,10 +137,11 @@ bool remove_tree(const std::wstring& dir)
 }
 
 // One pass over LocalAppData\NeuralAlias\captures, on its own low-priority thread.
-void retention_pass(std::wstring base, uint64_t keep_bytes, uint64_t process_started)
+void retention_pass(std::wstring base, Limits limits, uint64_t process_started)
 {
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
-    struct Folder { std::wstring name; };
+    struct Folder { std::wstring name; std::string build; };
+    std::vector<std::string> builds{std::string()}; // number 0 = not recorded
     constexpr uint64_t kRecent = 2ull * 3600ull * 10000000ull; // two hours, in FILETIME units
     FILETIME now_ft{};
     GetSystemTimeAsFileTime(&now_ft);
@@ -123,13 +160,18 @@ void retention_pass(std::wstring base, uint64_t keep_bytes, uint64_t process_sta
             // the run that has only just ended and is about to be read).
             e.current_run = (process_started && e.created >= process_started) || e.created + kRecent >= now;
             e.bytes = tree_bytes(base + L"\\" + f.cFileName);
-            folders.push_back({f.cFileName});
+            const std::string build = folder_build(base + L"\\" + f.cFileName);
+            size_t b = 0;
+            while (b < builds.size() && builds[b] != build) ++b;
+            if (b == builds.size()) builds.push_back(build);
+            e.build = static_cast<uint32_t>(b);
+            folders.push_back({f.cFileName, build});
             entries.push_back(e);
         } while (FindNextFileW(h, &f));
         FindClose(h);
     }
     const std::unique_ptr<bool[]> remove(new bool[entries.size() + 1]);
-    const retention::Plan plan = retention::Decide(entries.data(), entries.size(), keep_bytes, remove.get());
+    const retention::Plan plan = retention::Decide(entries.data(), entries.size(), limits.trigger_builds, limits.keep_builds, remove.get());
     uint64_t removed = 0, removed_bytes = 0, errors = 0;
     for (size_t i = 0; i < entries.size(); ++i) {
         if (!remove[i]) continue;
@@ -138,11 +180,13 @@ void retention_pass(std::wstring base, uint64_t keep_bytes, uint64_t process_sta
         if (remove_tree(base + L"\\" + folders[i].name)) {
             ++removed;
             removed_bytes += entries[i].bytes;
-            retention_log("removed folder=%s mb=%llu why=captures_over_budget_oldest_first", name,
-                          static_cast<unsigned long long>(entries[i].bytes >> 20));
+            retention_log("removed folder=%s build=%s mb=%llu why=older_than_the_newest_%u_builds", name,
+                          folders[i].build.empty() ? "not_recorded" : folders[i].build.c_str(),
+                          static_cast<unsigned long long>(entries[i].bytes >> 20), limits.keep_builds);
         } else {
             ++errors;
-            retention_log("not_removed folder=%s mb=%llu why=delete_failed error=%lu", name,
+            retention_log("not_removed folder=%s build=%s mb=%llu why=delete_failed error=%lu", name,
+                          folders[i].build.empty() ? "not_recorded" : folders[i].build.c_str(),
                           static_cast<unsigned long long>(entries[i].bytes >> 20), GetLastError());
         }
     }
@@ -152,13 +196,12 @@ void retention_pass(std::wstring base, uint64_t keep_bytes, uint64_t process_sta
     r.remove_errors.fetch_add(errors);
     r.last_total.store(plan.total_before - removed_bytes);
     r.passes.fetch_add(1);
-    retention_log("pass folders=%zu total_mb=%llu budget_mb=%llu removed=%llu removed_mb=%llu errors=%llu current_run_folders=%u current_run_mb=%llu after_mb=%llu%s",
-                  entries.size(), static_cast<unsigned long long>(plan.total_before >> 20),
-                  static_cast<unsigned long long>(keep_bytes >> 20), static_cast<unsigned long long>(removed),
+    retention_log("pass folders=%zu builds=%u total_mb=%llu trigger_builds=%u keep_builds=%u removed_builds=%u removed=%llu removed_mb=%llu errors=%llu after_mb=%llu why=%s",
+                  entries.size(), plan.builds_before, static_cast<unsigned long long>(plan.total_before >> 20),
+                  limits.trigger_builds, limits.keep_builds, plan.removed_builds, static_cast<unsigned long long>(removed),
                   static_cast<unsigned long long>(removed_bytes >> 20), static_cast<unsigned long long>(errors),
-                  plan.protected_count, static_cast<unsigned long long>(plan.protected_bytes >> 20),
                   static_cast<unsigned long long>((plan.total_before - removed_bytes) >> 20),
-                  !keep_bytes ? " why=budget_off" : (plan.over_after ? " why=still_over_only_this_run_is_left" : ""));
+                  !limits.trigger_builds ? "rule_off" : (plan.triggered ? "trigger_reached" : "fewer_builds_than_the_trigger"));
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
     r.running.store(false);
 }
@@ -226,31 +269,33 @@ bool MakeDir(const wchar_t* kind, wchar_t* out, size_t out_chars)
     CreateDirectoryW(base, nullptr);
     CoTaskMemFree(local);
     const Session& s = ThisProcess();
-    {   // The budget: no capture onto a nearly full drive, and the oldest folders make room.
-        uint64_t keep_bytes = 0, min_free_bytes = 0;
-        retention_limits(&keep_bytes, &min_free_bytes);
+    {   // No capture onto a nearly full drive; and captures of old builds make room.
+        const Limits limits = retention_limits();
         ULARGE_INTEGER free_bytes{};
-        if (GetDiskFreeSpaceExW(base, &free_bytes, nullptr, nullptr)) {
-            R().last_free.store(free_bytes.QuadPart);
-            if (retention::DiskTooFull(free_bytes.QuadPart, min_free_bytes)) {
-                R().refused.fetch_add(1);
-                char k[64];
-                json_escape(kind ? kind : L"capture", k, sizeof k);
-                retention_log("capture_refused kind=%s why=drive_nearly_full free_mb=%llu floor_mb=%llu", k,
-                              static_cast<unsigned long long>(free_bytes.QuadPart >> 20),
-                              static_cast<unsigned long long>(min_free_bytes >> 20));
-                // Old folders may be what filled it: make room for the next request.
-                if (keep_bytes && !R().running.exchange(true)) std::thread(retention_pass, std::wstring(base), keep_bytes, s.started_utc).detach();
-                return false;
-            }
+        const bool measured = GetDiskFreeSpaceExW(base, &free_bytes, nullptr, nullptr) != 0;
+        if (measured) R().last_free.store(free_bytes.QuadPart);
+        const bool full = measured && retention::DiskTooFull(free_bytes.QuadPart, limits.min_free_bytes);
+        if (limits.trigger_builds && !R().running.exchange(true)) std::thread(retention_pass, std::wstring(base), limits, s.started_utc).detach();
+        if (full) {
+            R().refused.fetch_add(1);
+            char k[64];
+            json_escape(kind ? kind : L"capture", k, sizeof k);
+            retention_log("capture_refused kind=%s why=drive_nearly_full free_mb=%llu floor_mb=%llu", k,
+                          static_cast<unsigned long long>(free_bytes.QuadPart >> 20),
+                          static_cast<unsigned long long>(limits.min_free_bytes >> 20));
+            return false;
         }
-        if (keep_bytes && !R().running.exchange(true)) std::thread(retention_pass, std::wstring(base), keep_bytes, s.started_utc).detach();
     }
     SYSTEMTIME t{};
     GetLocalTime(&t);
     swprintf_s(out, out_chars, L"%s\\%s-%04u%02u%02u-%02u%02u%02u-%s-p%u", base, kind ? kind : L"capture", t.wYear, t.wMonth,
                t.wDay, t.wHour, t.wMinute, t.wSecond, s.exe, s.pid);
     CreateDirectoryW(out, nullptr);
+    {   // Every capture folder says which build made it: the cleanup counts builds.
+        char k[64];
+        json_escape(kind ? kind : L"capture", k, sizeof k);
+        TagDir(out, k);
+    }
     return true;
 }
 
@@ -261,14 +306,15 @@ void TagDir(const wchar_t* dir, const char* kind)
     swprintf_s(path, L"%s\\session.json", dir);
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;
     const Session& s = ThisProcess();
-    char exe[200], full[700];
+    char exe[200], full[700], build[48];
+    this_build(build, sizeof build);
     json_escape(s.exe, exe, sizeof exe);
     json_escape(s.path, full, sizeof full);
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path, L"wb") != 0 || !fp) return;
     std::fprintf(fp, "{\n  \"format\": \"na-capture-session-1\",\n  \"kind\": \"%s\",\n  \"exe\": \"%s\",\n  \"path\": \"%s\",\n"
-                     "  \"pid\": %u,\n  \"process_started_utc\": \"%s\",\n  \"process_started_filetime\": %llu\n}\n",
-                 kind ? kind : "capture", exe, full, s.pid, s.started_iso, static_cast<unsigned long long>(s.started_utc));
+                     "  \"pid\": %u,\n  \"process_started_utc\": \"%s\",\n  \"process_started_filetime\": %llu,\n  \"build_commit\": \"%s\"\n}\n",
+                 kind ? kind : "capture", exe, full, s.pid, s.started_iso, static_cast<unsigned long long>(s.started_utc), build);
     std::fclose(fp);
 }
 }
