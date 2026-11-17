@@ -63,6 +63,7 @@ struct Params {
     float min_agree = 0.5f;        // share of them that must agree with the fitted model
     float max_vector = 512.0f;     // a sample's vector beyond this is not one (pixels, each axis)
     float damping = 1e-4f;         // on the scaled normal matrix's diagonal
+    float converged_px = 0.001f;   // a step that moves its samples less than this (weighted RMS) is the last one
 };
 
 // One 8x8 block centre. `nearness` is the model's e: |depth - the depth's far end|, 0 for sky or an
@@ -79,6 +80,7 @@ struct Model {
     float nearness_limit = 0; // the model is evaluated at min(e, nearness_limit)
     bool valid = false;
     float samples = 0, agree = 0, energy = 0; // confirmed samples, those agreeing, mean robust error at the fit
+    int steps = 0;                            // solves made
 };
 
 // The two rows of one pixel's terms. `scale` = 2 / height for both axes.
@@ -195,6 +197,18 @@ inline bool Solve(const double sums[kValues], const Params& p, float delta[kTerm
     return true;
 }
 
+// How far a correction moves the samples its step trusted: the weighted RMS of B * delta over them,
+// in pixels. delta' H delta is that weighted sum of squares, and H[0][0] is the sum of the weights
+// (the first term's row is the constant 1).
+inline float StepSize(const double sums[kValues], const float delta[kTerms])
+{
+    double q = 0;
+    int idx = 0;
+    for (int i = 0; i < kTerms; ++i)
+        for (int j = i; j < kTerms; ++j) { q += (i == j ? 1.0 : 2.0) * double(delta[i]) * double(delta[j]) * sums[idx]; ++idx; }
+    return sums[0] > 1e-20 ? float(std::sqrt((std::max)(q, 0.0) / sums[0])) : 0.0f;
+}
+
 inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t height, const Params& p = {})
 {
     Model m;
@@ -203,11 +217,17 @@ inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t h
     float theta[kTerms] = {};
     bool ok = true;
     for (int step = 0; step < p.steps && ok; ++step) {
-        Accumulate(samples, count, width, height, theta, step > 0 ? ScaleAt(step, p) : 0.0f, p, sums);
+        const float scale = step > 0 ? ScaleAt(step, p) : 0.0f;
+        Accumulate(samples, count, width, height, theta, scale, p, sums);
         if (sums[kCount] < double(p.min_samples)) { ok = false; break; }
         float delta[kTerms];
         ok = Solve(sums, p, delta);
-        if (ok) for (int k = 0; k < kTerms; ++k) theta[k] += delta[k];
+        if (!ok) break;
+        for (int k = 0; k < kTerms; ++k) theta[k] += delta[k];
+        ++m.steps;
+        // Once the weight has its final scale, a step that no longer moves its samples is the last:
+        // further steps would repeat it. (Measured on Cort's captured frames: 6 to 9 solves of 12.)
+        if (scale > 0 && scale <= p.robust_px && StepSize(sums, delta) < p.converged_px) break;
     }
     // The fitted terms against the samples once more: how many agree, and how near the nearest of those is.
     if (ok) Accumulate(samples, count, width, height, theta, p.robust_px, p, sums);

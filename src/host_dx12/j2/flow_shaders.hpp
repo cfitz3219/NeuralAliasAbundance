@@ -271,9 +271,13 @@ static const float kFitRobust = 1.5, kFitMinSamples = 256.0, kFitMinAgree = 0.5,
 #define FIT_VALUES 81
 // The fit's buffer (u_cnt in fit_accum and fit_solve), in words: 0..10 the terms, 11 nearness_limit,
 // 12 valid, 13 confirmed samples, 14 those agreeing, 15 their mean robust error, 16 the fit failed
-// (too few samples, or a step could not be solved), 17 steps solved; from FIT_HEAD each thread
-// group's FIT_VALUES partial sums.
+// (too few samples, or a step could not be solved), 17 steps solved, 18 the stop state (FIT_STOP: 0
+// solving; 1 the last step no longer moved its samples, so the next pass over them is the final
+// evaluation; 2 that pass is in the buffer and the remaining passes do nothing); from FIT_HEAD each
+// thread group's FIT_VALUES partial sums.
 #define FIT_HEAD 20
+#define FIT_STOP 18
+static const float kFitConverged = 0.001; // screen_motion.hpp Params::converged_px
 bool fin(float a) { return (asuint(a) & 0x7fffffffu) < 0x7f800000u; }
 // A depth value's distance from the far end; 0 for a value that is not a depth.
 float nearness_of(float d) { return fin(d) && d >= 0.0 && d <= 1.0 ? abs(d - depth_far) : 0.0; }
@@ -308,18 +312,24 @@ void fit_sample(uint3 id : SV_DispatchThreadID) {
     u_enc[id.xy] = o;
 }
 // One pass over the samples at the buffer's terms (screen_motion.hpp Accumulate): 64 samples a
-// thread group, their sums stored per group. t_hist is bound as the fit's grid.
+// thread group, their sums stored per group. t_hist is bound as the fit's grid. Each lane writes
+// its own sample's values, then lane t sums value t (and t + 64) over the group's samples in lane
+// order: one barrier, and the 81 sums are made and stored side by side.
 groupshared float gf[64 * FIT_VALUES];
+groupshared uint gc[64];
 [numthreads(64, 1, 1)]
 void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
-    float v[FIT_VALUES];
-    uint i;
-    for (i = 0; i < FIT_VALUES; ++i) v[i] = 0;
+    // The fit has stopped and its final pass is already in the buffer: nothing to do. (No lane
+    // leaves before the barrier.)
+    const bool idle = u_cnt.Load(FIT_STOP * 4) >= 2u;
     const uint s = gid.x * 64 + gi;
-    if (s < gw * gh) {
+    uint used = 0u;
+    if (!idle && s < gw * gh) {
         const uint2 cell = uint2(s % gw, s / gw);
         const float4 a = t_hist[cell];
         if (a.w > 0.5 && fin(a.x) && fin(a.y) && fin(a.z) && abs(a.x) < kFitMaxVector && abs(a.y) < kFitMaxVector) {
+            used = 1u;
+            const uint base = gi * FIT_VALUES;
             const float2 p = float2(cell * block + block / 2) + 0.5 - float2(jitter_x, jitter_y);
             float bu[FIT_TERMS], bv[FIT_TERMS];
             fit_terms(p, a.z, bu, bv);
@@ -332,25 +342,34 @@ void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
             const float wgt = qw * qw;
             uint idx = 0;
             [unroll] for (uint ia = 0; ia < FIT_TERMS; ++ia) {
-                [unroll] for (uint ib = ia; ib < FIT_TERMS; ++ib) { v[idx] = wgt * (bu[ia] * bu[ib] + bv[ia] * bv[ib]); ++idx; }
+                [unroll] for (uint ib = ia; ib < FIT_TERMS; ++ib) { gf[base + idx] = wgt * (bu[ia] * bu[ib] + bv[ia] * bv[ib]); ++idx; }
             }
             // The right-hand side holds what the terms so far leave unexplained: each step solves for a correction.
-            [unroll] for (uint ic = 0; ic < FIT_TERMS; ++ic) v[FIT_PAIRS + ic] = wgt * (bu[ic] * r.x + bv[ic] * r.y);
-            v[FIT_COUNT] = 1.0;
-            v[FIT_ENERGY] = 0.5 * rr / (1.0 + rr / c2);
-            if (rr <= c2) { v[FIT_INLIERS] = 1.0; v[FIT_NEAREST] = a.z; }
+            [unroll] for (uint ic = 0; ic < FIT_TERMS; ++ic) gf[base + FIT_PAIRS + ic] = wgt * (bu[ic] * r.x + bv[ic] * r.y);
+            const bool agrees = rr <= c2;
+            gf[base + FIT_COUNT] = 1.0;
+            gf[base + FIT_ENERGY] = 0.5 * rr / (1.0 + rr / c2);
+            gf[base + FIT_INLIERS] = agrees ? 1.0 : 0.0;
+            gf[base + FIT_NEAREST] = agrees ? a.z : 0.0;
         }
     }
-    for (i = 0; i < FIT_VALUES; ++i) gf[gi * FIT_VALUES + i] = v[i];
+    gc[gi] = used;
     GroupMemoryBarrierWithGroupSync();
-    for (uint st = 32; st > 0; st >>= 1) {
-        if (gi < st) {
-            for (i = 0; i < FIT_NEAREST; ++i) gf[gi * FIT_VALUES + i] += gf[(gi + st) * FIT_VALUES + i];
-            gf[gi * FIT_VALUES + FIT_NEAREST] = max(gf[gi * FIT_VALUES + FIT_NEAREST], gf[(gi + st) * FIT_VALUES + FIT_NEAREST]);
+    if (!idle) {
+        [unroll] for (uint part = 0; part < 2; ++part) {
+            const uint t = gi + part * 64;
+            if (t < FIT_VALUES) {
+                float sum = 0;
+                [loop] for (uint lane = 0; lane < 64; ++lane) {
+                    if (gc[lane] != 0u) {
+                        const float x = gf[lane * FIT_VALUES + t];
+                        sum = t == FIT_NEAREST ? max(sum, x) : sum + x;
+                    }
+                }
+                u_cnt.Store((FIT_HEAD + gid.x * FIT_VALUES + t) * 4, asuint(sum));
+            }
         }
-        GroupMemoryBarrierWithGroupSync();
     }
-    if (gi == 0) for (i = 0; i < FIT_VALUES; ++i) u_cnt.Store((FIT_HEAD + gid.x * FIT_VALUES + i) * 4, asuint(gf[i]));
 }
 )" R"(
 // One thread group: the groups' sums reduced, then one step of the fit (screen_motion.hpp Solve:
@@ -358,27 +377,37 @@ void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
 // the final evaluation (screen_motion.hpp Fit's last pass). u_enc is bound as the model `measure`
 // reads (RG32F, 8 x 1): texels 0..4 the terms in pairs, 5 the last term and nearness_limit, 6 valid and
 // the confirmed samples, 7 those agreeing and their mean robust error.
+// The 81 values are reduced side by side: lane v + 81 k (k = 0, 1, 2) sums value v over every third
+// group, then lane v joins its three parts. Two barriers in all.
 groupshared float gr[256];
 groupshared float gt[FIT_VALUES];
 [numthreads(256, 1, 1)]
 void fit_solve(uint gi : SV_GroupIndex) {
     const uint groups = (gw * gh + 63) / 64;
-    for (uint i = 0; i < FIT_VALUES; ++i) {
-        float s = 0;
-        for (uint g = gi; g < groups; g += 256) {
-            const float x = asfloat(u_cnt.Load((FIT_HEAD + g * FIT_VALUES + i) * 4));
-            s = i == FIT_NEAREST ? max(s, x) : s + x;
+    const uint stop = u_cnt.Load(FIT_STOP * 4);
+    // A solving step after the fit has stopped: 1 keeps this pass's sums as the final evaluation,
+    // 2 has nothing left to do. Either way nothing is reduced or solved.
+    const bool idle = mode == 0u && stop >= 1u;
+    float part = 0;
+    if (!idle && gi < 3 * FIT_VALUES) {
+        const uint value = gi % FIT_VALUES;
+        [loop] for (uint g = gi / FIT_VALUES; g < groups; g += 3) {
+            const float x = asfloat(u_cnt.Load((FIT_HEAD + g * FIT_VALUES + value) * 4));
+            part = value == FIT_NEAREST ? max(part, x) : part + x;
         }
-        gr[gi] = s;
-        GroupMemoryBarrierWithGroupSync();
-        for (uint st = 128; st > 0; st >>= 1) {
-            if (gi < st) gr[gi] = i == FIT_NEAREST ? max(gr[gi], gr[gi + st]) : gr[gi] + gr[gi + st];
-            GroupMemoryBarrierWithGroupSync();
-        }
-        if (gi == 0) gt[i] = gr[0];
-        GroupMemoryBarrierWithGroupSync();
     }
+    gr[gi] = part;
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < FIT_VALUES) {
+        const float x0 = gr[gi], x1 = gr[gi + FIT_VALUES], x2 = gr[gi + 2 * FIT_VALUES];
+        gt[gi] = gi == FIT_NEAREST ? max(x0, max(x1, x2)) : x0 + x1 + x2;
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (gi != 0) return;
+    if (idle) {
+        if (stop == 1u) u_cnt.Store(FIT_STOP * 4, 2u);
+        return;
+    }
     const float n = gt[FIT_COUNT];
     bool failed = u_cnt.Load(16 * 4) != 0u;
     if (mode == 0u) {
@@ -442,6 +471,18 @@ void fit_solve(uint gi : SV_GroupIndex) {
         if (ok) {
             [unroll] for (uint k2 = 0; k2 < FIT_TERMS; ++k2) u_cnt.Store(k2 * 4, asuint(th[k2]));
             u_cnt.Store(17 * 4, u_cnt.Load(17 * 4) + 1u);
+            // How far this correction moved the samples the step trusted (screen_motion.hpp StepSize):
+            // delta' H delta over the sum of the weights, which is H's first entry. Once the weight
+            // has its final scale, a step that no longer moves them is the last.
+            float q = 0;
+            uint hi = 0;
+            [loop] for (uint qa = 0; qa < FIT_TERMS; ++qa) {
+                [loop] for (uint qb = 0; qb < FIT_TERMS; ++qb) {
+                    if (qb >= qa) { q += (qa == qb ? 1.0 : 2.0) * (xv[qa] * sc[qa]) * (xv[qb] * sc[qb]) * gt[hi]; ++hi; }
+                }
+            }
+            const float moved = gt[0] > 1e-20 ? sqrt(max(q, 0.0) / gt[0]) : 0.0;
+            if (fit_scale > 0.0 && fit_scale <= kFitRobust && moved < kFitConverged) u_cnt.Store(FIT_STOP * 4, 1u);
         } else {
             u_cnt.Store(16 * 4, 1u);
         }

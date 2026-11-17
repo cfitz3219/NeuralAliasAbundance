@@ -203,6 +203,36 @@ int main()
             std::printf("  the first, unweighted step alone: mean %.4f worst %.4f\n", p.mean, p.worst);
             CHECK(p.mean > 4 * e.mean);
         }},
+        {"the fit stops when a step no longer moves its samples, with the answer of all twelve", [] {
+            int i = 0;
+            for (const Camera& c : kMoves) {
+                auto samples = BlockSamples(c);
+                Rng rng{4242};
+                for (auto& a : samples) {
+                    a.vx += 0.15f * rng.Gauss();
+                    a.vy += 0.15f * rng.Gauss();
+                    if (a.px > 0.8f * kW && a.py < 0.25f * kH) { a.vx -= 7.0f; a.vy += 3.0f; } // something moving by itself in a corner
+                }
+                screen::Params all;
+                all.converged_px = 0; // never stops early
+                const screen::Model full = screen::Fit(samples.data(), samples.size(), kW, kH, all);
+                const screen::Model m = screen::Fit(samples.data(), samples.size(), kW, kH);
+                float apart = 0;
+                for (const auto& a : samples) {
+                    float fx, fy, mx, my;
+                    screen::Evaluate(full, a.px, a.py, a.nearness, kW, kH, fx, fy);
+                    screen::Evaluate(m, a.px, a.py, a.nearness, kW, kH, mx, my);
+                    apart = (std::max)(apart, std::hypot(fx - mx, fy - my));
+                }
+                std::printf("  %-24s %2d solves instead of %2d; furthest from the full answer %.5f px; agree %.0f against %.0f\n", kMoveNames[i], m.steps,
+                            full.steps, apart, m.agree, full.agree);
+                CHECK(full.steps == all.steps);
+                CHECK(m.valid && full.valid && m.steps < full.steps);
+                CHECK(apart < 0.01f);
+                CHECK(std::fabs(m.agree - full.agree) <= 2.0f);
+                ++i;
+            }
+        }},
         {"too few samples or samples that do not agree give no model", [] {
             auto samples = BlockSamples(kMoves[3]);
             size_t kept = 0;
