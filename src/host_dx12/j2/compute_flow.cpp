@@ -19,6 +19,17 @@ std::atomic<uint32_t> g_loosen{50}; // SetLoosen; read at each Record
 using Microsoft::WRL::ComPtr;using Lease=na::nr::native::RecordingLease;
 namespace {
 constexpr unsigned warm_images=8;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+// Preserve small luminance differences at the same 32-bit storage cost as RGBA8. Alpha is
+// always 1 and motion reads RGB only. Query once per context, not from the per-frame hot path.
+DXGI_FORMAT stabilized_format(ID3D12Device* device){
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};support.Format=DXGI_FORMAT_R10G10B10A2_UNORM;
+    constexpr UINT required=D3D12_FORMAT_SUPPORT1_TEXTURE2D|D3D12_FORMAT_SUPPORT1_SHADER_LOAD|
+        D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE|D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+    if(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&support,sizeof support)) &&
+       (support.Support1&required)==required && (support.Support2&D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
+        return support.Format;
+    return DXGI_FORMAT_R8G8B8A8_UNORM; // retain the existing path if packed10 is unsupported
+}
 D3D12_RESOURCE_BARRIER tr(ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){D3D12_RESOURCE_BARRIER x{};x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;x.Transition={r,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b};return x;}
 void move(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){auto x=tr(r,a,b);l->ResourceBarrier(1,&x);}
 void order(ID3D12GraphicsCommandList* l){D3D12_RESOURCE_BARRIER x{};x.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;l->ResourceBarrier(1,&x);}
@@ -42,6 +53,7 @@ struct Slot {
 };
 struct Context {
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;unsigned w=0,h=0,stride=0;int last=-1;
+    DXGI_FORMAT image_format=DXGI_FORMAT_R8G8B8A8_UNORM;
     ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> pso_encode,pso_accept;
     ComPtr<ID3D12PipelineState> pso_measure,pso_cut_state,pso_cut_show; // the camera-free programs; null when they did not build
     ComPtr<ID3D12Resource> raw,expanded,residual,valid,mask,counters,zero,hist[2];
@@ -93,11 +105,12 @@ bool programs(Context& g){
 }
 bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,unsigned h){
     c.device=device;c.queue=queue;c.w=w;c.h=h;c.stride=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    c.image_format=stabilized_format(device);
     if(!c.engine.Init(device,w,h,1)){reason(c.engine.Error());return false;}
     if(!programs(c) || !c.expand.Init(device,1) || !c.derive.Init(device,1))return false;
     c.fit.Init(device); // optional: without it the camera motion is used unchanged (Ready() false)
     c.jitter_probe.Init(device);
-    for(unsigned i=0;i<warm_images;++i){auto image=std::make_unique<Image>();if(!c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,image->tex) || !c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,image->raw_color))return false;c.images.push_back(std::move(image));}
+    for(unsigned i=0;i<warm_images;++i){auto image=std::make_unique<Image>();if(!c.tex(c.image_format,image->tex) || !c.tex(DXGI_FORMAT_R8G8B8A8_UNORM,image->raw_color))return false;c.images.push_back(std::move(image));}
     if(!c.tex(DXGI_FORMAT_R32G32_FLOAT,c.raw) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.expanded) || !c.tex(DXGI_FORMAT_R32G32_FLOAT,c.residual) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.valid) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.mask) ||
        !c.tex(DXGI_FORMAT_R32G32_FLOAT,c.total) || !c.buffer(16,D3D12_HEAP_TYPE_DEFAULT,U,c.cut_state) ||
        !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[0]) || !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[1]) ||
@@ -186,11 +199,12 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     if(work==c->leases.size())c->leases.push_back(std::make_unique<Slot>());
     auto& slot=*c->leases[work];if(!prepare_slot(*c,slot)){++stats.unavailable;reason("AMD recording descriptor allocation failed; camera motion used");return {};}
     int image=-1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)!=c->last && free(*c->images[j])){image=static_cast<int>(j);break;}
-    if(image<0){auto next=std::make_unique<Image>();if(!c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->tex) || !c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->raw_color)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
+    if(image<0){auto next=std::make_unique<Image>();if(!c->tex(c->image_format,next->tex) || !c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->raw_color)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
         image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));}
     slot.lease=lease;slot.after={};slot.pair=slot.probe=false;slot.submitted=false;slot.fit_only=!f.residual && !f.total;slot.total=f.total;slot.cut_seed=false;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
     slot.color_input=color;slot.depth_input=depth;
     stats.recording_slots=static_cast<uint32_t>(c->leases.size());stats.image_slots=static_cast<uint32_t>(c->images.size());
+    stats.stabilized_format=static_cast<uint32_t>(c->image_format);
     const int previous=c->last;
     // Why there is no pair, in the order the conditions are tested (Ticket::no_pair).
     const auto no_pair=static_cast<uint8_t>(f.reset?1:previous<0?2:(c->images[previous]->frame!=f.previous || !f.previous)?3:c->images[previous]->generation!=f.generation?4:
@@ -214,7 +228,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     cb.jitter_x=encode.x;cb.jitter_y=encode.y;
     if(slot.timestamps)l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
     move(l,im.tex.Get(),S,U);move(l,im.raw_color.Get(),S,U);
-    c->defaults(work,0);c->srv(work,0,0,color,d.Format);c->uav(work,0,kUav+0,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
+    c->defaults(work,0);c->srv(work,0,0,color,d.Format);c->uav(work,0,kUav+0,im.tex.Get(),c->image_format);
     c->uav(work,0,kUav+3,im.raw_color.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
     c->dispatch(l,work,0,c->pso_encode.Get(),cb);order(l);move(l,im.tex.Get(),U,S);move(l,im.raw_color.Get(),U,S);++stats.recorded;
     if(!pair){++stats.waiting_history;reason(f.total?"Measured motion: this is the first picture of a pair":"AMD flow capturing matching scene history; camera motion used");return t;}
@@ -254,7 +268,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         cb.cost=2;cb.frame_now=static_cast<unsigned>(f.frame);cb.frame_reset=static_cast<unsigned>(t.cut_reset?f.frame:f.last_reset_frame);
         c->defaults(work,1);c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
         c->srv(work,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,1,3,c->expanded.Get(),DXGI_FORMAT_R32_FLOAT);
-        c->srv(work,1,5,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);c->srv(work,1,6,prev.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
+        c->srv(work,1,5,im.tex.Get(),c->image_format);c->srv(work,1,6,prev.tex.Get(),c->image_format);
         c->uav(work,1,kUav+0,c->total.Get(),DXGI_FORMAT_R32G32_FLOAT);c->uav(work,1,kUav+1,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
         if(ok)c->dispatch(l,work,1,c->pso_measure.Get(),cb);
         order(l);move(l,c->mask.Get(),U,S);move(l,c->total.Get(),U,S);
@@ -287,7 +301,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->counters.Get(),0,c->zero.Get(),0,40);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
     cb.cost=2;c->defaults(work,1);c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
     c->srv(work,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,1,2,c->residual.Get(),DXGI_FORMAT_R32G32_FLOAT);
-    c->srv(work,1,3,c->valid.Get(),DXGI_FORMAT_R32_FLOAT);c->srv(work,1,5,im.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);c->srv(work,1,6,prev.tex.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);c->uav(work,1,kUav+1,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
+    c->srv(work,1,3,c->valid.Get(),DXGI_FORMAT_R32_FLOAT);c->srv(work,1,5,im.tex.Get(),c->image_format);c->srv(work,1,6,prev.tex.Get(),c->image_format);c->uav(work,1,kUav+1,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
     // Temporal agreement (j2_flow 5c5fb0d/319e2ae): the previous pair's candidates, only when that
     // pair's current image is this pair's previous one (same generation); written here, published at Committed.
     const unsigned hist_out=c->hist_read^1u;
