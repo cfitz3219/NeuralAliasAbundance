@@ -86,6 +86,10 @@ if(NA_HAVE_NGX_SDK)
   # only, like the line above: the AMD search needs 32/64-lane wave operations.
   add_test(NAME host_j2_compute_flow_1080p_test COMMAND j2_compute_flow_test 1920)
   set_tests_properties(host_j2_compute_flow_1080p_test PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  # Actual search -> shared candidate correction -> total motion, including reversed repeated
+  # patterns and an independently moving region. CPU candidate experiments cannot satisfy it.
+  add_test(NAME host_j2_compute_flow_ambiguity_test COMMAND j2_compute_flow_test --ambiguity)
+  set_tests_properties(host_j2_compute_flow_ambiguity_test PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
   na_host_test(draw_replay_test SOURCES draw_replay_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
 endif()

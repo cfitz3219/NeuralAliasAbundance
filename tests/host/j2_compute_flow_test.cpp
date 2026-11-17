@@ -25,6 +25,11 @@ int main(int argc,char** argv){
         REQUIRE(AuditFlowAmbiguity(d,512,256)==0);REQUIRE(AuditFlowAmbiguity(d,1920,1080)==0);
         return test::finish("j2_compute_flow_ambiguity");
     }
+    if(argc>1 && !std::strcmp(argv[1],"--candidate-benchmark")){
+        if(!na::ffx_flow::DeviceSupported(d.device.Get()))return test::kSkip;
+        REQUIRE(AuditFlowAmbiguity(d,1920,1080,true)==0);
+        return test::finish("j2_compute_flow_candidate_benchmark");
+    }
     test::ComPtr<ID3D12InfoQueue> info;if(debug_mode)REQUIRE(SUCCEEDED(d.device.As(&info)));
     REQUIRE(AuditTotalMotionShader(d)==0);
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
@@ -141,17 +146,11 @@ int main(int argc,char** argv){
         const float jx[]={-.4375f,.4375f,-.375f,.375f,-.3125f,.3125f,-.25f,.25f};
         const float jy[]={.3889f,-.3889f,.2778f,-.2778f,.1667f,-.1667f,.0556f,-.0556f};
         auto barrier=test::Transition(output.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);l.list->ResourceBarrier(1,&barrier);execute();reset();
-        // R3 (Astra's audit, 2026-11-16): the four-sine picture nearly repeats about 94 pixels away.
-        // At 1920x1080 a 6 pixel pan makes AMD's pyramid search lock onto that repeat on most of the
-        // frame (tests/cpu/flow_fixture_pictures_test.cpp shows it on a CPU model of the search), so
-        // most flow vectors are ones no camera explains and the fit's flow test refuses a fit that did
-        // find the pan. That is the search losing a repeating picture, upstream of what this case is
-        // about (real viewport jitter, a remembered Unjittered verdict, a projection-only camera).
-        // So the pan is asserted on a picture the search can follow, at both sizes; the four-sine
-        // picture keeps its assertion where the search follows it (512x256) and at 1920x1080 is run
-        // and printed as the known limit it is, with the one thing that must still hold there.
-        struct Picture {int kind;const char* name;bool followed;};
-        for(const Picture picture:{Picture{1,"four-sine",!large},Picture{2,"non-repeating",true}}){
+        // R3: the raw search locks onto a repetition about 94 pixels away at 1080p.
+        // The shared frame-candidate correction must make the camera fit follow the real pan,
+        // with the same strict bound as the ordinary picture. A refused fit is not a pass.
+        struct Picture {int kind;const char* name;};
+        for(const Picture picture:{Picture{1,"four-sine"},Picture{2,"non-repeating"}}){
         std::vector<test::ComPtr<ID3D12Resource>> scenes;
         for(int i=0;i<12;++i)scenes.push_back(image(i<8?0:(i-7)*6,false,jx[i%8],jy[i%8],picture.kind));
         execute();reset();
@@ -196,11 +195,7 @@ int main(int argc,char** argv){
                  fit_error+=std::hypot(vx+6,vy);fit_x+=vx;fit_y+=vy;++fit_count;
              }
              std::printf("  computed fit before admission: mean=(%.4f,%.4f) error=%.4f px\n",fit_x/fit_count,fit_y/fit_count,fit_error/fit_count);}
-            if(confirmed){CHECK(still/sn<.08);
-                if(picture.followed)CHECK(moving/mn<.35);
-                else {std::printf("  known limit (R3): the search loses this repeating picture at this size, so the pan is not asserted on it; a refused fit must leave the motion alone\n");
-                    CHECK(moving/mn<6.5);} // never worse than no correction (the pan is 6 pixels)
-            }
+            if(confirmed){CHECK(still/sn<.08);CHECK(moving/mn<.35);}
             else CHECK(still/sn>.15); // old failure is reproduced on the identical pictures
         }
         }
