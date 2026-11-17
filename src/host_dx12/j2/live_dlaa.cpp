@@ -4474,9 +4474,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 // pair's own pass failed): the frame is left as the game drew it, and tried again.
                 if(!pending.compute_flow.context || (pending.compute_flow.pair && !tier.total))measured_failed=true;
                 else if(pending.compute_flow.pair){
-                    // TOTAL motion through tier 1's arithmetic, labelled as estimated (never as the game's own).
-                    in.tier1_valid_flag=true;in.tier1_motion=tier.total;in.tier1_valid=tier.total_valid;
-                    in.tier1_source=na::motion::Tier1Source::Estimated;
+                    // TOTAL motion, labelled as estimated (never as the game's own), standing BEHIND tier 1:
+                    // the game's own vectors or the draw replay's, when there are any below, take the pixels
+                    // they cover, and every other pixel keeps its measured vector. Before, either of them
+                    // replaced the measured field whole, and with no camera tier on this path everything
+                    // outside their mask was handed no motion at all (Astra, 2026-11-17; Cort's Sniper Elite
+                    // Resistance run of 3621e3a8: draw replay on stilled the shimmer while standing and
+                    // lost the picture's motion while walking).
+                    in.estimated_valid_flag=true;in.estimated_motion=tier.total;in.estimated_valid=tier.total_valid;
                     measured_cut=pending.compute_flow.cut_reset;
                 }else measured_no_pair=true; // the first picture of a pair
             }else{
@@ -4566,7 +4571,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             na::camera::Matrix unit{};
             unit[0] = unit[5] = unit[10] = unit[15] = 1.0;
             in.inv_view_proj_current = to_mat4(unit);
-            in.tier1_valid_flag = in.tier3_valid_flag = false;
+            in.tier1_valid_flag = in.tier3_valid_flag = in.estimated_valid_flag = false;
             in.fix = nullptr;
             in.jitter_current_px[0] = in.jitter_current_px[1] = 0.f;
         }

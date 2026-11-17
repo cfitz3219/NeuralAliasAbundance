@@ -495,10 +495,11 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                 return Skip(why);
             }
             if (flow.pair) {
-                // TOTAL motion, through tier 1's arithmetic, labelled as estimated (never as the game's own).
-                in.tier1_valid_flag = true;
-                in.tier1_motion = tier.total; in.tier1_valid = tier.total_valid;
-                in.tier1_source = motion::Tier1Source::Estimated;
+                // TOTAL motion, labelled as estimated (never as the game's own), in the slot that stands
+                // behind tier 1 (motion_arbiter.hpp EstimatedInput): the same slot the DX12 host uses, so
+                // a tier-1 supplier added here later covers its own pixels and cannot erase the rest.
+                in.estimated_valid_flag = true;
+                in.estimated_motion = tier.total; in.estimated_valid = tier.total_valid;
                 if (flow.cut_reset && !reset_history) {
                     // A scene cut measured on an earlier pair, learned without waiting on the GPU:
                     // this frame carries the reset. Until then those frames showed their own picture.
@@ -647,7 +648,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.depth_reversed = frame.reversed_depth;
         id.camera_cut = !measured && cam.camera_cut;
         id.cut_reason = measured ? 0u : static_cast<uint32_t>(cam.cut_reason);
-        id.flow_ran = in.tier3_valid_flag || in.tier1_valid_flag;
+        id.flow_ran = in.tier3_valid_flag || in.tier1_valid_flag || in.estimated_valid_flag;
         id.flow_loosen = settings::Get().j2_flow_loosen.load();
         id.flow_jitter_x = flow.frame.jitter[0];
         id.flow_jitter_y = flow.frame.jitter[1];

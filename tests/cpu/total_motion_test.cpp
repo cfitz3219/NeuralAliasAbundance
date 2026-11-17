@@ -322,5 +322,52 @@ int main()
             for (int i = 0; i < 4; ++i) CHECK(provenance[i] == NA_MOTION_ENGINE && out[i * 2] == field[i * 2]);
             CHECK(s.pixels_engine == 4 && s.pixels_estimated == 0 && s.tier_used == Tier::EngineDxil);
         }},
+        {"the game's or a replay's vectors cover their own pixels and the measured field keeps the rest", [] {
+            // Astra, 2026-11-17, on Cort's Sniper Elite Resistance run of 3621e3a8: with no camera, draw
+            // replay's partial field replaced the measured one whole, and every pixel outside its mask
+            // was handed no motion at all. The measured field now stands behind tier 1, per pixel.
+            using namespace na::motion;
+            const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+            //                 replay    replay    hole      hole      hole     replay nan  replay nan  malformed
+            float replay[]{    6, -2,    0, 0,     77, 77,   77, 77,   77, 77,  nan, 1,     2, inf,     5, 5};
+            float covered[]{   1,        1,        0,        0,        0,       1,          1,          -3};
+            float measured[]{  -1, -1,   -1, -1,   0.5f, 3,  -4, 0.25f, 9, 9,   1.5f, -2,   8, 8,       0.75f, 0};
+            float confirmed[]{ kMeasured, kMeasured, kMeasured, kApproximate, 0, kMeasured, 0,          kMeasured};
+            float out[16]{};
+            uint8_t provenance[8]{};
+            Tier1Input engine{true, {replay, 8, 1, 16}, {covered, 8, 1, 8}};
+            EstimatedInput behind{true, {measured, 8, 1, 16}, {confirmed, 8, 1, 8}};
+            Tier2Input no_camera{};
+            Tier3Input none{};
+            Output o{out, provenance, 8, 1};
+            Stats s;
+            CHECK(Arbitrate(engine, behind, no_camera, none, {}, o, &s));
+            // Where the replay has a vector it is the replay's, zero included, and labelled the game's own.
+            CHECK(provenance[0] == NA_MOTION_ENGINE && out[0] == 6 && out[1] == -2);
+            CHECK(provenance[1] == NA_MOTION_ENGINE && out[2] == 0 && out[3] == 0);
+            // A hole in the replay keeps its measured vector, measured or following the screen, labelled estimated.
+            CHECK(provenance[2] == NA_MOTION_ESTIMATED && out[4] == 0.5f && out[5] == 3);
+            CHECK(provenance[3] == NA_MOTION_ESTIMATED && out[6] == -4 && out[7] == 0.25f);
+            // Neither has anything: not known, and never the stale numbers either field carries there.
+            CHECK(provenance[4] == NA_MOTION_INVALID && out[8] == 0 && out[9] == 0);
+            // A replay vector that is not a number is no vector: the measured one stands in ...
+            CHECK(provenance[5] == NA_MOTION_ESTIMATED && out[10] == 1.5f && out[11] == -2);
+            // ... and with no measured one either, nothing is known.
+            CHECK(provenance[6] == NA_MOTION_INVALID && out[12] == 0 && out[13] == 0);
+            // A malformed replay mask rejects the replay's pixel, not the measured one behind it.
+            CHECK(provenance[7] == NA_MOTION_ESTIMATED && out[14] == 0.75f && out[15] == 0);
+            CHECK(s.pixels_engine == 2 && s.pixels_estimated == 4 && s.pixels_invalid == 2 && s.pixels_camera == 0);
+            CHECK(s.pixels_rejected == 3); // two vectors that are not numbers, one malformed mask
+            // Without the slot (how 3621e3a8 called it) the same replay field leaves every hole with nothing.
+            CHECK(Arbitrate(engine, no_camera, none, {}, o, &s));
+            CHECK(s.pixels_engine == 2 && s.pixels_estimated == 0 && s.pixels_invalid == 6);
+            // The measured field alone, with no tier 1 at all: every confirmed pixel, as before.
+            CHECK(Arbitrate(Tier1Input{}, behind, no_camera, none, {}, o, &s));
+            CHECK(s.pixels_estimated == 6 && s.pixels_engine == 0 && s.pixels_invalid == 2 && s.tier_used == Tier::EstimatedTotal);
+            // A measured field of the wrong size is refused whole and counted.
+            EstimatedInput wrong{true, {measured, 4, 2, 8}, {confirmed, 8, 1, 8}};
+            CHECK(Arbitrate(engine, wrong, no_camera, none, {}, o, &s));
+            CHECK(s.pixels_estimated == 0 && s.pixels_engine == 2 && s.pixels_rejected == 8 + 3);
+        }},
     });
 }

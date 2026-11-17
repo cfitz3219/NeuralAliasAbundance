@@ -130,6 +130,12 @@ bool DeriveResidual(const Field2& raw_flow, const Tier2Input& t2, const float ji
 bool Arbitrate(const Tier1Input& t1, const Tier2Input& t2, const Tier3Input& t3, const Config& cfg,
                Output& out, Stats* stats)
 {
+    return Arbitrate(t1, EstimatedInput{}, t2, t3, cfg, out, stats);
+}
+
+bool Arbitrate(const Tier1Input& t1, const EstimatedInput& te, const Tier2Input& t2, const Tier3Input& t3, const Config& cfg,
+               Output& out, Stats* stats)
+{
     if (!out.xy || !out.provenance || out.width == 0 || out.height == 0 || !ValidateConfig(cfg)) return false;
     const uint32_t w = out.width, h = out.height;
     Stats local{};
@@ -137,11 +143,13 @@ bool Arbitrate(const Tier1Input& t1, const Tier2Input& t2, const Tier3Input& t3,
     *s = Stats{};
 
     bool use1 = t1.valid && field_ok(t1.motion, w, h) && (!t1.valid_mask.v || field_ok(t1.valid_mask, w, h));
+    bool use_est = te.valid && field_ok(te.motion, w, h) && (!te.valid_mask.v || field_ok(te.valid_mask, w, h));
     bool use2 = t2.valid && field_ok(t2.depth, w, h);
     bool use3 = t3.valid && field_ok(t3.residual, w, h) && (!t3.mask.v || field_ok(t3.mask, w, h)) &&
                 (!t3.valid_mask.v || field_ok(t3.valid_mask, w, h));
     const uint64_t all = static_cast<uint64_t>(w) * h;
     if (t1.valid && !use1) s->pixels_rejected += all;
+    if (te.valid && !use_est) s->pixels_rejected += all;
     if (t2.valid && !use2) s->pixels_rejected += all;
     if (t3.valid && !use3) s->pixels_rejected += all;
 
@@ -168,6 +176,23 @@ bool Arbitrate(const Tier1Input& t1, const Tier2Input& t2, const Tier3Input& t3,
                             prov = NA_MOTION_ENGINE;
                             ++s->pixels_engine;
                         }
+                        continue;
+                    }
+                    ++s->pixels_rejected;
+                }
+            }
+
+            // Measured total motion behind tier 1: where tier 1 gave nothing at this pixel.
+            if (use_est) {
+                MaskState ms = te.valid_mask.v ? mask_state(at1(te.valid_mask, x, y)) : MaskState::Valid;
+                if (ms == MaskState::Malformed) ++s->pixels_rejected;
+                if (ms == MaskState::Valid) {
+                    const float* e = at2(te.motion, x, y);
+                    if (finite2(e[0], e[1])) {
+                        o[0] = e[0];
+                        o[1] = e[1];
+                        prov = NA_MOTION_ESTIMATED;
+                        ++s->pixels_estimated;
                         continue;
                     }
                     ++s->pixels_rejected;

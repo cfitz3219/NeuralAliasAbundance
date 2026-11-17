@@ -13,9 +13,12 @@
 //   tier3 residual     RG32_FLOAT   SRV   (optional; flag TIER3)
 //   tier3 mask         R32_FLOAT    SRV   (optional; flag TIER3_MASK)
 //   tier3 valid mask   R32_FLOAT    SRV   (optional; flag TIER3_VALID)
+//   estimated motion   RG32_FLOAT   SRV   (optional; measured total motion behind tier 1)
+//   estimated valid    R32_FLOAT    SRV   (optional)
 //   output xy          RG32_FLOAT   UAV
 //   output provenance  R8_UINT      UAV
-//   stats              32-byte raw UAV buffer of 8 uint32 counters (optional)
+//   stats              raw UAV buffer of uint32 counters (optional): 32 bytes for the first eight,
+//                      36 bytes when the ninth (measured motion behind tier 1) is wanted
 // All SRVs must be in NON_PIXEL_SHADER_RESOURCE, UAVs in UNORDERED_ACCESS,
 // when Dispatch records. The caller owns every resource and all barriers
 // before/after; Dispatch records only the dispatch (no waits, no readback).
@@ -45,6 +48,12 @@ struct Inputs {
     // tag. Estimated = measured TOTAL motion: same arithmetic, provenance NA_MOTION_ESTIMATED,
     // counted in Stats::pixels_estimated, never as engine.
     Tier1Source tier1_source = Tier1Source::Engine;
+    // Measured TOTAL motion standing behind tier 1 (motion_arbiter.hpp EstimatedInput): used at a
+    // pixel only where tier 1 gave nothing. A game's or a replay's vectors go in tier 1 and keep
+    // their label; the measured field is no longer replaced by them.
+    ID3D12Resource* estimated_motion = nullptr;
+    ID3D12Resource* estimated_valid = nullptr;
+    bool estimated_valid_flag = false;
     bool tier2_valid_flag = false;
     bool tier3_valid_flag = false;
     float depth_clear = 1.0f;
@@ -63,15 +72,18 @@ struct Inputs {
 struct Outputs {
     ID3D12Resource* xy = nullptr;          // RG32_FLOAT, UAV
     ID3D12Resource* provenance = nullptr;  // R8_UINT, UAV
-    ID3D12Resource* stats = nullptr;       // optional raw buffer, >= 32 bytes, UAV, zeroed by caller
+    ID3D12Resource* stats = nullptr;       // optional raw buffer, >= 32 bytes (36 for the ninth counter), UAV, zeroed by caller
     uint32_t width = 0, height = 0;
 };
 
-// Order of the 8 counters in the stats buffer (uint32 each).
+// Order of the counters in the stats buffer (uint32 each). The ninth is written only into a buffer
+// of 36 bytes or more.
 enum StatSlot : uint32_t {
     STAT_ENGINE = 0, STAT_CAMERA = 1, STAT_RESIDUAL_ADDED = 2, STAT_RESIDUAL_SNAPPED = 3,
-    STAT_RESIDUAL_CLAMPED = 4, STAT_OFFSCREEN = 5, STAT_INVALID = 6, STAT_REJECTED = 7
+    STAT_RESIDUAL_CLAMPED = 4, STAT_OFFSCREEN = 5, STAT_INVALID = 6, STAT_REJECTED = 7,
+    STAT_ESTIMATED_BEHIND = 8 // measured total motion taken behind tier 1
 };
+constexpr uint32_t kStatCounters = 9;
 
 class Arbiter {
 public:
@@ -100,12 +112,13 @@ public:
                                 Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>* recording_heap = nullptr);
     // Converts a read-back stats buffer (from the most recent Dispatch) into
     // the shared Stats struct, adding whole-tier extent rejections that were
-    // decided on the CPU side.
-    Stats DecodeStats(const uint32_t counters[8]) const;
+    // decided on the CPU side. `count`: how many counters were read back (8, or kStatCounters).
+    Stats DecodeStats(const uint32_t* counters, uint32_t count = 8) const;
     ID3D12Device* Device() const { return device_.Get(); }
 
 private:
-    static constexpr uint32_t kDescriptors = 11; // per slot: SRV t0..t6, UAV u0..u3
+    static constexpr uint32_t kSrvs = 9;                // t0..t8
+    static constexpr uint32_t kDescriptors = kSrvs + 4; // per slot: the SRVs, then UAV u0..u3
     void fix_srv(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* fix);
     uint64_t whole_rejects_last_ = 0;
     Tier1Source tier1_source_last_ = Tier1Source::Engine;

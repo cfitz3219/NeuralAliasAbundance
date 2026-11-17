@@ -87,6 +87,18 @@ struct Tier1Input {
     Tier1Source source = Tier1Source::Engine; // last on purpose: existing aggregate initialisers keep meaning Engine
 };
 
+// TOTAL motion measured from the pictures (core/total_motion.hpp), standing BEHIND tier 1: at a
+// pixel where tier 1 gives no vector (no tier 1, not written there, malformed, not finite) the
+// measured vector is taken as it is, with provenance NA_MOTION_ESTIMATED. A game's or a replay's
+// vectors cover only what they cover; before this slot a partial tier-1 field replaced the measured
+// one whole, and everything outside it was left with no motion (Astra, 2026-11-17, on Cort's
+// Sniper Elite Resistance run of 3621e3a8). Never a residual, never combined with a camera.
+struct EstimatedInput {
+    bool valid = false;
+    Field2 motion;           // arbiter convention, complete vector per pixel
+    Field1 valid_mask;       // same domain rule as tier 1's; null = all
+};
+
 struct Tier2Input {
     bool valid = false;
     Field1 depth;            // raw z/w in [0,1]
@@ -134,7 +146,7 @@ struct Output {
 struct Stats {
     Tier tier_used = Tier::None;
     uint64_t pixels_engine = 0;      // Tier 1, Tier1Source::Engine
-    uint64_t pixels_estimated = 0;   // Tier 1, Tier1Source::Estimated (never counted as engine)
+    uint64_t pixels_estimated = 0;   // measured total motion: Tier1Source::Estimated or the EstimatedInput (never counted as engine)
     uint64_t pixels_camera = 0;
     uint64_t pixels_residual_added = 0;
     uint64_t pixels_residual_snapped = 0;
@@ -151,6 +163,10 @@ bool ValidateConfig(const Config& cfg);
 // Runs the arbitration for one frame. A tier whose extent mismatches `out`
 // is rejected as a whole. Returns false only if `out` or `cfg` is unusable.
 bool Arbitrate(const Tier1Input& t1, const Tier2Input& t2, const Tier3Input& t3,
+               const Config& cfg, Output& out, Stats* stats);
+// The same with measured total motion behind tier 1 (EstimatedInput): per pixel tier 1, then the
+// measured vector, then the camera tiers, then nothing.
+bool Arbitrate(const Tier1Input& t1, const EstimatedInput& estimated, const Tier2Input& t2, const Tier3Input& t3,
                const Config& cfg, Output& out, Stats* stats);
 
 // Analytical reprojection for one pixel: v = p_prev - p_cur in pixels using
