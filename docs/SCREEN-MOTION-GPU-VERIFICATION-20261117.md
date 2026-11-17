@@ -94,3 +94,30 @@ ctest --test-dir local/audit-build -C Release -R 'host_j2_compute_flow|host_j2_s
 ```
 
 The audit branch contains no installer or game modification. Fable retains runtime and combined-package ownership.
+
+## Optimization verified on ddd8e306
+
+Fable's follow-up `ddd8e306` keeps the pass protocol and changes only the accumulation/reduction layout and early stopping. Astra rebuilt and ran the requested **unchanged** `--screen-fit --debug` and `--screen-benchmark` on the RTX 5070 Ti, plus the rebuilt `na.cpu.screen_motion` test. All pass. No assertions or tolerances were changed and no runtime edits were needed. Approve this optimization for integration.
+
+The same OFF/ON/ON/OFF benchmark, twenty warm samples per block:
+
+| Resolution | OFF block medians | ON block medians | Added fit cost | Previous added fit cost |
+|---|---|---|---:|---:|
+| 1920x1080 | 0.5928 / 0.5899 ms | 0.7555 / 0.7544 ms | **0.1636 ms** | 1.193-1.211 ms |
+| 3440x1440 | 1.2726 / 1.2735 ms | 1.5479 / 1.5456 ms | **0.2737 ms** | 2.209-2.407 ms |
+
+This reduces the incremental cost of the screen fit by approximately **86-89%** in these workloads, saving about 1.0 ms at 1080p and 1.9-2.1 ms at 3440x1440. It is not an 86-89% improvement to whole-game frame rate. The fit took six solves instead of twelve in both benchmark sizes. Confirmed/agreeing sample counts are unchanged: 7,826/7,458 and 18,773/17,841.
+
+Correctness is retained at the existing bounds:
+
+- All eight replay/camera/counter-layout combinations still have zero vector/provenance errors.
+- Controlled GPU fit versus CPU coefficients differ by about 2e-7 at most, with identical validity, counts, agreement and depth limit.
+- Image-derived fit coefficient differences versus the updated CPU reference are at most 1e-6 in the printed results. All flat-area validity checks pass. Flat-motion mean errors change from 0.04160 to 0.04163 px in the varying-depth case, and 0.08428 to 0.08434 px in the all-far case. The independent object's result remains 2,292/2,348 within 0.75 px. Nonzero-jitter and conventional-depth cases pass.
+- Complete production pipeline: all 634,352 and 1,506,464 checked flat pixels still pass. ON mean errors are 0.015580 and 0.016160 px, versus 0.015572 and 0.016150 before; OFF remains exactly zero/unknown.
+- D3D12 validation reports zero errors. The CPU regression comparing early stopping to all twelve iterations passes, including its noisy camera movements and independent corner object.
+
+The source audit confirms the early stop uses **weighted RMS sample displacement**, not a maximum-error bound over every screen pixel. Stopping is allowed only at the final robust scale. Stop state 1 permits the next accumulation at the updated coefficients; state 2 retains that final evaluation while later solving passes do no further work. The final mode-1 pass still reduces and validates those sums. Neither shader returns a subset of its group before a group barrier. The reduction maps all 81 statistics and preserves maximum reduction for the nearest agreeing depth. This review found no protocol defect requiring a correction.
+
+This is the requested narrow optimization rerun. The earlier 18-test delivery suite and sixteen ambiguity cases remain attributed to 644b1055; they were not repeated or relabelled as a new full-suite result. Production host wiring, `measure`, admission rules and resource ownership are unchanged. Existing partial-layer jitter/replay-performance limits remain. No game, installer or installed DLL changed.
+
+Receipts: `local/screen-fit-cost-verification/build.log`, `screen-fit-debug.log`, `cpu.log`, and `benchmark.log` in `C:\Users\Cort\NA-camera-runtime-audit`. An initial mistyped CTest filter matched no tests; corrected to `^na\.cpu\.screen_motion$` with `--no-tests=error`, and the actual test passed in 0.30 seconds. The empty selection is not counted as a pass.
