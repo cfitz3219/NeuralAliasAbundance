@@ -46,11 +46,11 @@ struct Camera {
     float wx = 0, wy = 0, wz = 0; // rotation about x, y, z (radians), applied in that order
     float tx = 0, ty = 0, tz = 0; // world units
 };
-// v = previous position - current position, for the pixel (px, py) whose depth value is `far` from
+// v = previous position - current position, for the pixel (px, py) whose depth value is `nearness` from
 // the far end (near / distance; 0 = infinitely far).
-void TrueFlow(const Camera& c, float px, float py, float far, float& vx, float& vy)
+void TrueFlow(const Camera& c, float px, float py, float nearness, float& vx, float& vy)
 {
-    const double e = (std::max)(double(far), 1e-9), z = double(kNear) / e;
+    const double e = (std::max)(double(nearness), 1e-9), z = double(kNear) / e;
     double X = (double(px) - 0.5 * kW) / c.focal * z, Y = (double(py) - 0.5 * kH) / c.focal * z, Z = z;
     { const double cs = std::cos(double(c.wx)), sn = std::sin(double(c.wx)); const double y = Y * cs - Z * sn, zz = Y * sn + Z * cs; Y = y; Z = zz; }
     { const double cs = std::cos(double(c.wy)), sn = std::sin(double(c.wy)); const double x = X * cs + Z * sn, zz = -X * sn + Z * cs; X = x; Z = zz; }
@@ -77,8 +77,8 @@ std::vector<screen::Sample> BlockSamples(const Camera& c)
             screen::Sample a;
             a.px = float(x) + 0.5f;
             a.py = float(y) + 0.5f;
-            a.far = FarAt(a.px, a.py);
-            TrueFlow(c, a.px, a.py, a.far, a.vx, a.vy);
+            a.nearness = FarAt(a.px, a.py);
+            TrueFlow(c, a.px, a.py, a.nearness, a.vx, a.vy);
             a.confirmed = true;
             s.push_back(a);
         }
@@ -86,7 +86,7 @@ std::vector<screen::Sample> BlockSamples(const Camera& c)
 }
 
 struct Errors { float mean = 0, worst = 0; };
-// `measured_depths_only`: leave out the pixels nearer than the model's far_limit, where it carries the
+// `measured_depths_only`: leave out the pixels nearer than the model's nearness_limit, where it carries the
 // nearest measured depth's motion on purpose.
 Errors Against(const screen::Model& m, const Camera& c, bool measured_depths_only = false)
 {
@@ -94,11 +94,11 @@ Errors Against(const screen::Model& m, const Camera& c, bool measured_depths_onl
     int n = 0;
     for (uint32_t y = 0; y < kH; y += 3)
         for (uint32_t x = 0; x < kW; x += 3) {
-            const float px = float(x) + 0.5f, py = float(y) + 0.5f, far = FarAt(px, py);
-            if (measured_depths_only && far > m.far_limit) continue;
+            const float px = float(x) + 0.5f, py = float(y) + 0.5f, nearness = FarAt(px, py);
+            if (measured_depths_only && nearness > m.nearness_limit) continue;
             float tx, ty, mx, my;
-            TrueFlow(c, px, py, far, tx, ty);
-            screen::Evaluate(m, px, py, far, kW, kH, mx, my);
+            TrueFlow(c, px, py, nearness, tx, ty);
+            screen::Evaluate(m, px, py, nearness, kW, kH, mx, my);
             const float d = std::hypot(mx - tx, my - ty);
             e.mean += d;
             e.worst = (std::max)(e.worst, d);
@@ -227,26 +227,26 @@ int main()
             const Camera still = kMoves[0];
             auto samples = BlockSamples(still);
             Rng rng{7};
-            float far_kept = 0;
+            float nearness_kept = 0;
             for (auto& a : samples) {
-                a.confirmed = a.far < 0.004f;
+                a.confirmed = a.nearness < 0.004f;
                 a.vx += 0.08f * rng.Gauss();
                 a.vy += 0.08f * rng.Gauss();
-                if (a.confirmed) far_kept = (std::max)(far_kept, a.far);
+                if (a.confirmed) nearness_kept = (std::max)(nearness_kept, a.nearness);
             }
             const screen::Model m = screen::Fit(samples.data(), samples.size(), kW, kH);
-            CHECK(m.valid && m.far_limit <= far_kept && m.far_limit > 0);
+            CHECK(m.valid && m.nearness_limit <= nearness_kept && m.nearness_limit > 0);
             const Errors limited = Against(m, still);
             // The same terms asked about every depth: the parallax terms carry their noise ten times further.
             screen::Model open = m;
-            open.far_limit = 1.0f;
+            open.nearness_limit = 1.0f;
             const Errors unlimited = Against(open, still);
             std::printf("  still scene, only depths under 0.004 measurable: worst false motion %.4f px limited, %.4f px if asked anyway\n", limited.worst,
                         unlimited.worst);
             CHECK(limited.worst < 0.08f);
             CHECK(unlimited.worst > 2 * limited.worst);
             float a0, a1, b0, b1;
-            screen::Evaluate(m, 100.5f, 300.5f, m.far_limit, kW, kH, a0, a1);
+            screen::Evaluate(m, 100.5f, 300.5f, m.nearness_limit, kW, kH, a0, a1);
             screen::Evaluate(m, 100.5f, 300.5f, 0.04f, kW, kH, b0, b1);
             CHECK(a0 == b0 && a1 == b1);
         }},
@@ -276,7 +276,7 @@ int main()
                         screen::Sample a;
                         a.px = float(bx * 8 + 4) + 0.5f;
                         a.py = float(by * 8 + 4) + 0.5f;
-                        a.far = FarAt(a.px, a.py);
+                        a.nearness = FarAt(a.px, a.py);
                         const float* r = &raw[(size_t(by) * (kW / 8) + bx) * 2];
                         a.confirmed = total::SamplePixel(cur, prev, a.px, a.py, true, r[0], r[1], a.vx, a.vy);
                         samples.push_back(a);
@@ -287,11 +287,11 @@ int main()
                 double err_new = 0, err_old = 0, err_nearer = 0;
                 for (uint32_t y = 12; y < kH - 12; y += 2)
                     for (uint32_t x = 12; x < kW - 12; x += 2) {
-                        const float px = float(x) + 0.5f, py = float(y) + 0.5f, far = FarAt(px, py);
+                        const float px = float(x) + 0.5f, py = float(y) + 0.5f, nearness = FarAt(px, py);
                         const float* r = &raw[(size_t(y / 8) * (kW / 8) + x / 8) * 2];
                         float sx, sy, tx, ty;
-                        screen::Evaluate(model, px, py, far, kW, kH, sx, sy);
-                        TrueFlow(c, px, py, far, tx, ty);
+                        screen::Evaluate(model, px, py, nearness, kW, kH, sx, sy);
+                        TrueFlow(c, px, py, nearness, tx, ty);
                         const total::Result now = total::MeasurePixel(cur, prev, px, py, true, r[0], r[1], {}, true, sx, sy);
                         ++pixels;
                         if (now.why == total::kScreen) { ++follows; CHECK(now.x == sx && now.y == sy && now.valid == total::kApproximate); }
@@ -299,10 +299,10 @@ int main()
                         else if (now.why == total::kMoving) ++own;
                         else ++nothing;
                         const float en = std::hypot(now.x - tx, now.y - ty);
-                        if (far > model.far_limit && now.why == total::kScreen) {
+                        if (nearness > model.nearness_limit && now.why == total::kScreen) {
                             // Nearer than anything measured: the motion of the nearest measured depth, no more.
                             float lx, ly;
-                            TrueFlow(c, px, py, model.far_limit, lx, ly);
+                            TrueFlow(c, px, py, model.nearness_limit, lx, ly);
                             CHECK(std::hypot(now.x - lx, now.y - ly) < 0.3f);
                             ++nearer;
                             err_nearer += en;

@@ -24,8 +24,10 @@
 //
 // The fit. Samples are the 8x8 block centres the pictures can measure (total_motion.hpp
 // SamplePixel: the best vector itself, with no preference for stillness). One plain least-squares
-// step, then reweighted steps, each a full solve (the model is linear, so every step starts from the
-// samples, not from the last answer). The weight is 1 / (1 + r^2 / s^2)^2 (Geman-McClure), whose
+// step, then reweighted steps. The model is linear, so each step is a complete weighted solve; it is
+// written as a correction to the terms so far (the right-hand side holds what the terms leave
+// unexplained), which gives the same answer and lets the GPU's 32-bit sums correct their own
+// rounding from one step to the next. The weight is 1 / (1 + r^2 / s^2)^2 (Geman-McClure), whose
 // scale s starts wide and halves down to robust_px. Its pull on the fit falls as 1 / r^3: something
 // moving by itself across a corner of the screen, where a sample has the most leverage, lets go of
 // the fit. The plain 1 / (1 + r^2 / s^2) keeps a pull of 1 / r and was still bent by it after forty
@@ -33,7 +35,7 @@
 // Things that move by themselves are down-weighted and keep their own measured vectors later.
 // The model is used only when enough samples agree with it. It is never asked about a depth nearer
 // than the nearest sample that agrees: beyond that it has no evidence, and the parallax terms would
-// only carry their noise further (far_limit).
+// only carry their noise further (nearness_limit).
 #pragma once
 
 #include <algorithm>
@@ -45,11 +47,12 @@ namespace na::motion::screen {
 
 constexpr int kTerms = 11;
 constexpr int kPairs = kTerms * (kTerms + 1) / 2; // the normal matrix's upper triangle, row by row
-// One sample's accumulators, in the GPU's layout: 0..65 H, 66..76 g, then
+// One sample's accumulators, in the GPU's layout: 0..65 H, 66..76 g (against what the current terms
+// leave unexplained), then
 constexpr int kCount = 77;   // confirmed samples
 constexpr int kEnergy = 78;  // their robust error at the current terms
 constexpr int kInliers = 79; // those within the robust scale of the model
-constexpr int kFar = 80;     // the largest e among the inliers (a maximum, not a sum)
+constexpr int kNearest = 80;     // the largest e among the inliers (a maximum, not a sum)
 constexpr int kValues = 81;
 
 struct Params {
@@ -62,41 +65,43 @@ struct Params {
     float damping = 1e-4f;         // on the scaled normal matrix's diagonal
 };
 
-// One 8x8 block centre. `far`: |depth - the depth's far end|, 0 for sky or an unusable depth value.
+// One 8x8 block centre. `nearness` is the model's e: |depth - the depth's far end|, 0 for sky or an
+// unusable depth value; it grows as things come nearer. (Not called `far`: that bare word is a macro
+// in the Windows headers.)
 struct Sample {
-    float px = 0, py = 0, far = 0;
+    float px = 0, py = 0, nearness = 0;
     float vx = 0, vy = 0;
     bool confirmed = false;
 };
 
 struct Model {
     float theta[kTerms] = {};
-    float far_limit = 0; // the model is evaluated at min(e, far_limit)
+    float nearness_limit = 0; // the model is evaluated at min(e, nearness_limit)
     bool valid = false;
     float samples = 0, agree = 0, energy = 0; // confirmed samples, those agreeing, mean robust error at the fit
 };
 
 // The two rows of one pixel's terms. `scale` = 2 / height for both axes.
-inline void Terms(float px, float py, float far, uint32_t width, uint32_t height, float bu[kTerms], float bv[kTerms])
+inline void Terms(float px, float py, float nearness, uint32_t width, uint32_t height, float bu[kTerms], float bv[kTerms])
 {
     const float scale = 2.0f / float(height);
     const float X = (px - 0.5f * float(width)) * scale, Y = (py - 0.5f * float(height)) * scale;
-    bu[0] = 1; bu[1] = X; bu[2] = Y; bu[3] = 0; bu[4] = 0; bu[5] = 0; bu[6] = X * X; bu[7] = X * Y; bu[8] = far; bu[9] = 0;   bu[10] = far * X;
-    bv[0] = 0; bv[1] = 0; bv[2] = 0; bv[3] = 1; bv[4] = X; bv[5] = Y; bv[6] = X * Y; bv[7] = Y * Y; bv[8] = 0;   bv[9] = far; bv[10] = far * Y;
+    bu[0] = 1; bu[1] = X; bu[2] = Y; bu[3] = 0; bu[4] = 0; bu[5] = 0; bu[6] = X * X; bu[7] = X * Y; bu[8] = nearness; bu[9] = 0;   bu[10] = nearness * X;
+    bv[0] = 0; bv[1] = 0; bv[2] = 0; bv[3] = 1; bv[4] = X; bv[5] = Y; bv[6] = X * Y; bv[7] = Y * Y; bv[8] = 0;   bv[9] = nearness; bv[10] = nearness * Y;
 }
 
 // The screen's motion at a pixel. Only for a valid model.
-inline void Evaluate(const Model& m, float px, float py, float far, uint32_t width, uint32_t height, float& vx, float& vy)
+inline void Evaluate(const Model& m, float px, float py, float nearness, uint32_t width, uint32_t height, float& vx, float& vy)
 {
     float bu[kTerms], bv[kTerms];
-    Terms(px, py, (std::min)(far, m.far_limit), width, height, bu, bv);
+    Terms(px, py, (std::min)(nearness, m.nearness_limit), width, height, bu, bv);
     vx = vy = 0;
     for (int k = 0; k < kTerms; ++k) { vx += m.theta[k] * bu[k]; vy += m.theta[k] * bv[k]; }
 }
 
 inline bool Usable(const Sample& s, const Params& p)
 {
-    return s.confirmed && std::isfinite(s.vx) && std::isfinite(s.vy) && std::isfinite(s.far) && std::fabs(s.vx) < p.max_vector &&
+    return s.confirmed && std::isfinite(s.vx) && std::isfinite(s.vy) && std::isfinite(s.nearness) && std::fabs(s.vx) < p.max_vector &&
            std::fabs(s.vy) < p.max_vector;
 }
 
@@ -121,7 +126,7 @@ inline void Accumulate(const Sample* samples, size_t count, uint32_t width, uint
         const Sample& a = samples[s];
         if (!Usable(a, p)) continue;
         float bu[kTerms], bv[kTerms];
-        Terms(a.px, a.py, a.far, width, height, bu, bv);
+        Terms(a.px, a.py, a.nearness, width, height, bu, bv);
         float mx = 0, my = 0;
         for (int k = 0; k < kTerms; ++k) { mx += theta[k] * bu[k]; my += theta[k] * bv[k]; }
         const float rx = a.vx - mx, ry = a.vy - my;
@@ -131,18 +136,19 @@ inline void Accumulate(const Sample* samples, size_t count, uint32_t width, uint
         int idx = 0;
         for (int i = 0; i < kTerms; ++i)
             for (int j = i; j < kTerms; ++j) sums[idx++] += double(w * (bu[i] * bu[j] + bv[i] * bv[j]));
-        for (int i = 0; i < kTerms; ++i) sums[kPairs + i] += double(w * (bu[i] * a.vx + bv[i] * a.vy));
+        for (int i = 0; i < kTerms; ++i) sums[kPairs + i] += double(w * (bu[i] * rx + bv[i] * ry));
         sums[kCount] += 1.0;
         sums[kEnergy] += double(0.5f * rr / (1.0f + rr / c2));
         if (rr <= c2) {
             sums[kInliers] += 1.0;
-            sums[kFar] = (std::max)(sums[kFar], double(a.far));
+            sums[kNearest] = (std::max)(sums[kNearest], double(a.nearness));
         }
     }
 }
 
-// The scaled, damped normal equations by Cholesky. False when they cannot be solved.
-inline bool Solve(const double sums[kValues], const Params& p, float theta[kTerms])
+// The scaled, damped normal equations by Cholesky: the correction to add to the terms the sums were
+// taken at. False when they cannot be solved.
+inline bool Solve(const double sums[kValues], const Params& p, float delta[kTerms])
 {
     double A[kTerms][kTerms], b[kTerms], sc[kTerms];
     int idx = 0;
@@ -184,7 +190,7 @@ inline bool Solve(const double sums[kValues], const Params& p, float theta[kTerm
     for (int i = 0; i < kTerms; ++i) {
         const float v = float(x[i] * sc[i]);
         if (!std::isfinite(v)) return false;
-        theta[i] = v;
+        delta[i] = v;
     }
     return true;
 }
@@ -199,7 +205,9 @@ inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t h
     for (int step = 0; step < p.steps && ok; ++step) {
         Accumulate(samples, count, width, height, theta, step > 0 ? ScaleAt(step, p) : 0.0f, p, sums);
         if (sums[kCount] < double(p.min_samples)) { ok = false; break; }
-        ok = Solve(sums, p, theta);
+        float delta[kTerms];
+        ok = Solve(sums, p, delta);
+        if (ok) for (int k = 0; k < kTerms; ++k) theta[k] += delta[k];
     }
     // The fitted terms against the samples once more: how many agree, and how near the nearest of those is.
     if (ok) Accumulate(samples, count, width, height, theta, p.robust_px, p, sums);
@@ -207,7 +215,7 @@ inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t h
     if (!ok) return m;
     m.agree = float(sums[kInliers]);
     m.energy = float(sums[kEnergy] / sums[kCount]);
-    m.far_limit = float(sums[kFar]);
+    m.nearness_limit = float(sums[kNearest]);
     for (int k = 0; k < kTerms; ++k) m.theta[k] = theta[k];
     m.valid = m.agree >= p.min_agree * m.samples;
     return m;

@@ -7,6 +7,7 @@
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/camera_fit_gpu.hpp"
 #include "core/jitter_probe_gpu.hpp"
+#include "core/screen_motion.hpp"
 #include <d3dcompiler.h>
 #include <mutex>
 #include <atomic>
@@ -17,6 +18,7 @@
 namespace na::j2::compute_flow {
 std::atomic<uint32_t> g_loosen{50}; // SetLoosen; read at each Record
 std::atomic<bool> g_candidates{true}; // SetFrameCandidates; read at each Record
+std::atomic<bool> g_screen_fit{true}; // SetScreenFit; read at each Record
 using Microsoft::WRL::ComPtr;using Lease=na::nr::native::RecordingLease;
 namespace {
 constexpr unsigned warm_images=8;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -41,13 +43,16 @@ struct Constants {unsigned w,h,ew,eh,mode,block,cost,cost_max,offset,gw,gh;float
     float history_dx=0,history_dy=0;unsigned frame_now=0,frame_reset=0;}; // frame_*: the scene-cut state pass (flow_shaders.hpp cut_state)
 static_assert(sizeof(Constants)==28*4,"root constants");
 constexpr unsigned kTable=12,kUav=8; // descriptors per table: SRVs t0..t7, then UAVs u0..u3
-constexpr unsigned kTables=5; // per recording: encode, accept or measure, the scene-cut state, the scene-cut picture, the frame candidates
-constexpr unsigned kReadback=112; // counters 0..39, timestamps 48..63, the frame candidates' words 64..103
+constexpr unsigned kTables=8; // per recording: encode, accept or measure, the scene-cut state, the scene-cut picture, the frame candidates, the screen fit's three programs
+constexpr unsigned kFitHead=20,kFitValues=na::motion::screen::kValues; // flow_shaders.hpp FIT_HEAD, FIT_VALUES
+constexpr unsigned kReadback=192; // counters 0..39, timestamps 48..63, the frame candidates' words 64..103, the screen fit's head 112..191
+static_assert(kFitValues==81,"flow_shaders.hpp FIT_VALUES");
 struct Image {ComPtr<ID3D12Resource> tex,raw_color;std::vector<Lease> uses;Lease producer;uint64_t frame=0,colour_epoch=0;unsigned generation=0;float jitter[2]{},raster_jitter[2]{};bool raster_confirmed=false;};
 struct Slot {
     Lease lease;bool pair=false,submitted=false,fit_only=false,probe=false;uint64_t frame=0;
     bool total=false,cut_seed=false; // a measured-total recording; it also zeroes the scene-cut state for the first time
     bool candidates=false; // the frame-candidates pass ran in this recording (its words are in the readback)
+    bool screen=false; // the screen fit ran in this recording (its head is in the readback)
     Lease after; // RecordCutShow on another list than Record's: the descriptors stay this recording's until that one has run
     ComPtr<ID3D12DescriptorHeap> heap,engine_heap,expand_heap,derive_heap;
     ComPtr<ID3D12Resource> readback;ComPtr<ID3D12QueryHeap> timestamps;
@@ -64,6 +69,10 @@ struct Context {
     // VARIANT: flow/frame-candidates (flow_shaders.hpp kCandidateShader). All four programs or none.
     ComPtr<ID3D12PipelineState> pso_cand_clear,pso_cand_count,pso_cand_pick,pso_cand_apply;
     ComPtr<ID3D12Resource> votes,grid,top; // 256x256 R32_UINT, always UAV; the grid handed on (R16G16_SINT, one vector per 8x8 block); 48 bytes, always UAV
+    // VARIANT: motion/screen-fit (flow_shaders.hpp fit_sample / fit_accum / fit_solve). All three programs or none.
+    ComPtr<ID3D12PipelineState> pso_fit_sample,pso_fit_accum,pso_fit_solve;
+    ComPtr<ID3D12Resource> fit_grid,fit_model,fit_state; // RGBA32F, one sample per 8x8 block; RG32F 8x1, the model `measure` reads; the terms and the groups' sums, always UAV
+    unsigned fit_words=0; // fit_state's size in words
     bool cut_seeded=false; // cut_state has been zeroed by a submitted recording
     unsigned hist_read=0;uint64_t hist_frame=0;unsigned hist_generation=0; // last committed pair's candidates
     UINT64 frequency=0;
@@ -121,8 +130,14 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     if(!c.tex(DXGI_FORMAT_R32G32_FLOAT,c.raw) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.expanded) || !c.tex(DXGI_FORMAT_R32G32_FLOAT,c.residual) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.valid) || !c.tex(DXGI_FORMAT_R32_FLOAT,c.mask) ||
        !c.tex(DXGI_FORMAT_R32G32_FLOAT,c.total) || !c.buffer(16,D3D12_HEAP_TYPE_DEFAULT,U,c.cut_state) ||
        !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[0]) || !c.tex(DXGI_FORMAT_R16G16B16A16_FLOAT,c.hist[1]) ||
-       !c.buffer(48,D3D12_HEAP_TYPE_DEFAULT,U,c.counters) || !c.buffer(48,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ,c.zero))return false;
-    void* p=nullptr;if(FAILED(c.zero->Map(0,nullptr,&p)))return false;memset(p,0,48);c.zero->Unmap(0,nullptr);
+       !c.buffer(48,D3D12_HEAP_TYPE_DEFAULT,U,c.counters) || !c.buffer(96,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ,c.zero))return false;
+    void* p=nullptr;if(FAILED(c.zero->Map(0,nullptr,&p)))return false;memset(p,0,96);c.zero->Unmap(0,nullptr);
+    // The screen fit is optional: without its programs or working memory `measure` has no model to
+    // follow, pixels the pictures cannot measure are not known, and the j2screenfit line says on=0.
+    c.fit_words=kFitHead+(((w+7)/8)*((h+7)/8)+63)/64*kFitValues;
+    if(c.pso_fit_solve && !(c.tex(DXGI_FORMAT_R32G32B32A32_FLOAT,c.fit_grid,(w+7)/8,(h+7)/8,S) && c.tex(DXGI_FORMAT_R32G32_FLOAT,c.fit_model,8,1,S) &&
+        c.buffer(c.fit_words*4,D3D12_HEAP_TYPE_DEFAULT,U,c.fit_state))){
+        c.pso_fit_sample.Reset();c.pso_fit_accum.Reset();c.pso_fit_solve.Reset();}
     // The frame candidates are optional: without their programs or working memory the search's grid is used as it is.
     if(c.pso_cand_apply && !(c.tex(DXGI_FORMAT_R32_UINT,c.votes,256,256,U) && c.tex(DXGI_FORMAT_R16G16_SINT,c.grid,(w+7)/8,(h+7)/8,S) && c.buffer(48,D3D12_HEAP_TYPE_DEFAULT,U,c.top))){
         c.pso_cand_clear.Reset();c.pso_cand_count.Reset();c.pso_cand_pick.Reset();c.pso_cand_apply.Reset();}
@@ -149,6 +164,15 @@ void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto&
         else if(r.samples>=256 && r.samples0>=256 && r.energy0>.05f && r.energy<.7f*r.energy0)++stats.fit_rejected_jitter; // plain test passed, quantised/jitter test refused
         stats.fit_e_alt=r.energy_alt;stats.fit_photo_tested=r.photo_tested;stats.fit_photo_better=r.photo_better;stats.fit_photo_worse=r.photo_worse;
         stats.fit_photo_regions=r.photo_regions;stats.fit_photo_good=r.photo_regions_good;stats.fit_photo_e_fit=r.photo_e_fit;stats.fit_photo_e_cam=r.photo_e_cam;}}
+    if(s.screen){void* p=nullptr;D3D12_RANGE range{112,192}; // the screen fit of this pair (flow_shaders.hpp FIT_HEAD: the fit buffer's first words)
+        if(SUCCEEDED(s.readback->Map(0,&range,&p))){unsigned v[kFitHead];float f[kFitHead];memcpy(v,static_cast<const unsigned char*>(p)+112,sizeof v);memcpy(f,v,sizeof f);
+            const na::motion::screen::Params fp;
+            ++stats.screen_pairs;
+            // Why a pair has no model, in the order the fit decides it.
+            if(v[12])++stats.screen_valid;else if(f[13]<fp.min_samples)++stats.screen_few;else if(v[16])++stats.screen_unsolved;else ++stats.screen_disagree;
+            if(s.frame>=stats.screen_frame){stats.screen_frame=s.frame;memcpy(stats.screen_theta,f,sizeof stats.screen_theta);stats.screen_nearness_limit=f[11];
+                stats.screen_last_valid=v[12]!=0;stats.screen_samples=f[13];stats.screen_agree=f[14];stats.screen_energy=f[15];stats.screen_last_unsolved=v[16]!=0;stats.screen_steps=v[17];}
+            D3D12_RANGE none{};s.readback->Unmap(0,&none);}}
     if(s.candidates){void* p=nullptr;D3D12_RANGE range{64,104}; // the frame candidates of this pair (flow_shaders.hpp kCandidateShader, u2)
         if(SUCCEEDED(s.readback->Map(0,&range,&p))){unsigned v[10];memcpy(v,static_cast<const unsigned char*>(p)+64,sizeof v);
             ++stats.cand_pairs;if(v[8])++stats.cand_pairs_changed;stats.cand_changed+=v[8];stats.cand_offered+=v[9];
@@ -160,8 +184,8 @@ void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto&
                 if(v[8]){++stats.total_cuts;if(s.frame>stats.total_cut_frame)stats.total_cut_frame=s.frame;}} // a scene cut, learned here with no wait
             else {for(unsigned j=0;j<7;++j)stats.sum[j]+=v[j];++stats.sum_pairs;}
             if(s.frame<stats.sample_frame){D3D12_RANGE none0{};s.readback->Unmap(0,&none0);s.pair=false;continue;}
-            if(s.total){ // the last sample in the menu's terms: measured, nothing known, from outside, unconfirmed
-                stats.accepted=v[0]+v[7];stats.rejected_invalid=v[1];stats.rejected_small=stats.rejected_cost=stats.rejected_flicker=0;stats.rejected_offscreen=v[4];stats.rejected_image=v[5];
+            if(s.total){ // the last sample in the menu's terms: measured, nothing known, following the screen's motion
+                stats.accepted=v[0]+v[7];stats.rejected_invalid=v[1];stats.rejected_small=stats.rejected_cost=stats.rejected_flicker=0;stats.rejected_offscreen=v[4];stats.rejected_image=v[2]+v[5];
                 stats.total=0;for(unsigned j=0;j<8;++j)stats.total+=v[j];}
             else {stats.accepted=v[0];stats.rejected_invalid=v[1];stats.rejected_small=v[2];stats.rejected_cost=v[3];stats.rejected_offscreen=v[4];stats.rejected_image=v[5];stats.rejected_flicker=v[6];
                 stats.total=0;for(unsigned j=0;j<7;++j)stats.total+=v[j];}
@@ -216,7 +240,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     int image=-1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)!=c->last && free(*c->images[j])){image=static_cast<int>(j);break;}
     if(image<0){auto next=std::make_unique<Image>();if(!c->tex(c->image_format,next->tex) || !c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->raw_color)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
         image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));}
-    slot.lease=lease;slot.after={};slot.pair=slot.probe=false;slot.submitted=false;slot.fit_only=!f.residual && !f.total;slot.total=f.total;slot.cut_seed=false;slot.candidates=false;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
+    slot.lease=lease;slot.after={};slot.pair=slot.probe=false;slot.submitted=false;slot.fit_only=!f.residual && !f.total;slot.total=f.total;slot.cut_seed=false;slot.candidates=false;slot.screen=false;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
     slot.color_input=color;slot.depth_input=depth;
     stats.recording_slots=static_cast<uint32_t>(c->leases.size());stats.image_slots=static_cast<uint32_t>(c->images.size());
     stats.stabilized_format=static_cast<uint32_t>(c->image_format);
@@ -303,7 +327,41 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         move(l,c->mask.Get(),S,U);move(l,c->total.Get(),S,U);
         move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->counters.Get(),0,c->zero.Get(),0,40);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
         cb.cost=2;cb.frame_now=static_cast<unsigned>(f.frame);cb.frame_reset=static_cast<unsigned>(t.cut_reset?f.frame:f.last_reset_frame);
+        // `measure` and the fit read the depth's far end and the fit's step scale in these two words (flow_shaders.hpp depth_far, fit_scale).
+        cb.history_dx=camera.depth_clear;cb.history_dy=0;
+        // VARIANT: motion/screen-fit
+        // The screen's own motion: one whole-picture camera movement fitted to the block centres the
+        // two pictures can measure, with no camera and no lens from the game (core/screen_motion.hpp
+        // is these programs on the CPU and says why). `measure` then follows it wherever the pictures
+        // cannot measure, and the search's raw vector is never handed on. Cort's Sniper Elite
+        // Resistance run of 2026-11-17 (3621e3a8): about two thirds of a real frame is in that case.
+        ID3D12Resource* model=nullptr;
+        stats.screen_on=c->pso_fit_solve && g_screen_fit.load(std::memory_order_relaxed);
+        if(ok && stats.screen_on){
+            const na::motion::screen::Params fp;
+            Constants fc=cb;
+            move(l,c->fit_grid.Get(),S,U);
+            c->defaults(work,5);c->srv(work,5,0,depth,DXGI_FORMAT_R32_FLOAT);c->srv(work,5,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,5,3,c->expanded.Get(),DXGI_FORMAT_R32_FLOAT);
+            c->srv(work,5,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);c->srv(work,5,5,im.tex.Get(),c->image_format);c->srv(work,5,6,prev.tex.Get(),c->image_format);
+            c->uav(work,5,kUav+0,c->fit_grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);
+            c->dispatch(l,work,5,c->pso_fit_sample.Get(),fc,false,(cb.gw+7)/8,(cb.gh+7)/8);order(l);move(l,c->fit_grid.Get(),U,S);
+            // The terms start at zero; the head's other words are this pair's own.
+            move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->fit_state.Get(),0,c->zero.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
+            move(l,c->fit_model.Get(),S,U);
+            c->defaults(work,6);c->srv(work,6,7,c->fit_grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);c->raw_uav(work,6,kUav+2,c->fit_state.Get(),c->fit_words);
+            c->defaults(work,7);c->raw_uav(work,7,kUav+2,c->fit_state.Get(),c->fit_words);c->uav(work,7,kUav+0,c->fit_model.Get(),DXGI_FORMAT_R32G32_FLOAT);
+            const unsigned groups=(cb.gw*cb.gh+63)/64;
+            // screen_motion.hpp Fit: one plain step, the reweighted ones, then the fitted terms against the samples once more.
+            for(int step=0;step<=fp.steps;++step){const bool last=step==fp.steps;
+                fc.history_dy=last?fp.robust_px:step>0?na::motion::screen::ScaleAt(step,fp):0.f;fc.mode=0;
+                c->dispatch(l,work,6,c->pso_fit_accum.Get(),fc,false,groups,1);order(l);
+                fc.mode=last?1u:0u;c->dispatch(l,work,7,c->pso_fit_solve.Get(),fc,true);order(l);}
+            move(l,c->fit_model.Get(),U,S);
+            move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),112,c->fit_state.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
+            model=c->fit_model.Get();slot.screen=true;
+        }
         c->defaults(work,1);c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
+        c->srv(work,1,0,depth,DXGI_FORMAT_R32_FLOAT);if(model)c->srv(work,1,2,model,DXGI_FORMAT_R32G32_FLOAT);
         c->srv(work,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,1,3,c->expanded.Get(),DXGI_FORMAT_R32_FLOAT);
         c->srv(work,1,5,im.tex.Get(),c->image_format);c->srv(work,1,6,prev.tex.Get(),c->image_format);
         c->uav(work,1,kUav+0,c->total.Get(),DXGI_FORMAT_R32G32_FLOAT);c->uav(work,1,kUav+1,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
@@ -381,6 +439,7 @@ void RecordCutShow(ID3D12GraphicsCommandList* l,const Ticket& t,ID3D12Resource* 
 }
 void SetLoosen(uint32_t percent){g_loosen.store(percent>100?100u:percent,std::memory_order_relaxed);}
 void SetFrameCandidates(bool on){g_candidates.store(on,std::memory_order_relaxed);}
+void SetScreenFit(bool on){g_screen_fit.store(on,std::memory_order_relaxed);}
 void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current)return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);memcpy(im.raster_jitter,t.frame.raster_jitter,sizeof im.raster_jitter);im.colour_epoch=t.colour_epoch;im.raster_confirmed=t.frame.raster_confirmed;c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
     if(slot.cut_seed){c->cut_seeded=true;slot.cut_seed=false;}
     if(slot.pair && slot.hist_written>=0){c->hist_read=static_cast<unsigned>(slot.hist_written);c->hist_frame=t.frame.frame;c->hist_generation=t.frame.generation;slot.hist_written=-1;}stats.last_submitted_frame=t.frame.frame;last_submit_tick=GetTickCount64();}
@@ -389,12 +448,12 @@ Stats GetStats(){na::nr::native::Maintain();std::lock_guard<std::mutex> lock(mut
 void DescribeStats(const Stats& s,char* text,size_t capacity){
     if(!text || !capacity)return;
     if(s.total_mode){ // no camera: the picture pair is measured, nothing is "accepted" against a camera
-        const double all=double(s.total_sum[0]+s.total_sum[1]+s.total_sum[4]+s.total_sum[5]+s.total_sum[7]);
+        const double all=double(s.total_sum[0]+s.total_sum[1]+s.total_sum[2]+s.total_sum[4]+s.total_sum[5]+s.total_sum[7]);
         if(!s.total_sum_pairs || all<=0){std::snprintf(text,capacity,"Measured motion (no camera): %llu pictures taken, %llu pairs measured. Waiting for the first completed pair. %s",
             (unsigned long long)s.total_frames,(unsigned long long)s.total_pairs,s.reason);return;}
-        std::snprintf(text,capacity,"Measured motion (no camera): %llu pairs. Over all of them %.1f%% of the picture measured (%.1f%% moving, %.1f%% still), %.1f%% approximate, %.1f%% not known. %llu scene cuts. Last pair %.2f ms.",
+        std::snprintf(text,capacity,"Measured motion (no camera): %llu pairs. Over all of them %.1f%% of the picture measured (%.1f%% moving by itself, %.1f%% with the screen), %.1f%% following the screen's motion, %.1f%% not known. Screen motion fitted on %llu of %llu pairs. %llu scene cuts. Last pair %.2f ms.",
             (unsigned long long)s.total_sum_pairs,100.0*double(s.total_sum[0]+s.total_sum[7])/all,100.0*double(s.total_sum[0])/all,100.0*double(s.total_sum[7])/all,
-            100.0*double(s.total_sum[4]+s.total_sum[5])/all,100.0*double(s.total_sum[1])/all,(unsigned long long)s.total_cuts,s.ms);return;}
+            100.0*double(s.total_sum[2]+s.total_sum[4]+s.total_sum[5])/all,100.0*double(s.total_sum[1])/all,(unsigned long long)s.screen_valid,(unsigned long long)s.screen_pairs,(unsigned long long)s.total_cuts,s.ms);return;}
     if(!s.submitted || s.submit_age_ms>2000){std::snprintf(text,capacity,"AMD flow: no new submission%s. %s Frames submitted %llu, paired %llu, skipped %llu.",
         s.submitted?" recently":" yet",s.reason,(unsigned long long)s.submitted,(unsigned long long)s.submitted_pairs,(unsigned long long)(s.busy+s.unavailable));return;}
     if(!s.samples || !s.total){std::snprintf(text,capacity,"AMD flow: frames submitting. Paired %llu / %llu, skipped %llu. Waiting for a completed pixel sample.",

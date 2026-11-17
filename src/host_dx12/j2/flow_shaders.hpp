@@ -7,6 +7,8 @@
 // `measure`, `cut_state` and `cut_show` are the camera-free path (2026-11-16): the pair's TOTAL
 // motion measured on the two pictures, and what a scene cut does to the picture shown. `accept`
 // and its gates are the residual path against a camera and are not changed by them.
+// `fit_sample`, `fit_accum` and `fit_solve` (2026-11-17) fit the screen's own motion for `measure`
+// to follow where the pictures cannot measure (core/screen_motion.hpp, VARIANT motion/screen-fit).
 namespace na::j2 {
 inline const char kFlowShader[] = R"(
 Texture2D<float4> t_color : register(t0);
@@ -153,8 +155,11 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 //  - The block search's whole-pixel vector, zero included, is a hypothesis. Each hypothesis is
 //    refined below a pixel on the pictures, and "nothing moved" is always one of them.
 //  - No small-motion cutoff, no temporal rule.
-//  - Validity written: 1 measured (moving or still), 0.5 the search's vector handed on because the
-//    pictures could not confirm it (flat, or neither hypothesis explains them), 0 nothing known.
+//  - Where the pictures cannot measure (flat, or no hypothesis explains them) the pixel follows the
+//    screen's own motion (the model fit_solve wrote), and the search's raw vector is never handed
+//    on. With a model, IT is the hypothesis "nothing moved by itself" in place of exact stillness.
+//  - Validity written: 1 measured (with the screen, or moving by itself), 0.5 the screen's own
+//    motion where the pictures could not measure, 0 nothing known (no model to follow).
 static const float kTotalImageAbs = 0.08, kTotalImageRel = 0.15, kTotalTextureMin = 0.03;
 static const float kTotalStillRatio = 0.5, kTotalBound = 1.0, kTotalDamp = 2e-5, kTotalEdge = 0.05;
 static const float kTotalApproximate = 0.5;
@@ -227,15 +232,250 @@ float4 refine(float2 p, float2 v0, Window win) {
     }
     return float4(best, e, e0);
 }
-// t_raw: the search's vector after the depth-aware expansion; t_valid: that expansion's validity.
-// u_enc is bound as the RG32F total field here, u_mask as its validity.
+// The vector that explains the window best, among the refined hypothesis `hyp` and the refined
+// search vector (total_motion.hpp BestVector). False: the pictures cannot measure here (flat, or
+// neither explains them). e_with: the error `hyp` leaves exactly; limit: what counts as explaining.
+bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, out float2 best, out float e_best, out float e_with, out float limit) {
+    best = hyp; e_best = 0; e_with = 0; limit = 0;
+    Window win = window_at(p);
+    bool textured = win.contrast >= kTotalTextureMin;
+    if (textured) {
+        float4 z = refine(p, hyp, win);
+        best = z.xy; e_best = z.z; e_with = z.w;
+        if (raw_on && any(raw != hyp)) {
+            float4 r = refine(p, raw, win);
+            if (r.z <= z.z) { best = r.xy; e_best = r.z; }
+        }
+        // Explaining the picture: a small error in itself and small beside the window's own contrast.
+        limit = min(kTotalImageAbs, kTotalImageRel * win.contrast);
+    }
+    return textured && e_best <= limit;
+}
+)" R"(
+// ---- The screen's own motion. core/screen_motion.hpp is these programs on the CPU (and says why
+// they exist and what the eleven terms are); the two are kept in step by hand: same samples, same
+// terms, same weights, same order of decisions, same constants.
+// VARIANT: motion/screen-fit
+// The fit's programs and `measure` read three of the residual path's constants under other names
+// (their own meaning is not used by them, and the block stays the 28 words every user binds):
+#define depth_far history_dx  // the depth value at the far end: 0 for reversed depth, 1 otherwise
+#define fit_scale history_dy  // fit_accum: this step's weight scale in pixels; 0 = the plain first step
+//      mode                     fit_solve: 0 a solving step, 1 the final evaluation
+static const float kFitRobust = 1.5, kFitMinSamples = 256.0, kFitMinAgree = 0.5, kFitMaxVector = 512.0, kFitDamping = 1e-4;
+#define FIT_TERMS 11
+#define FIT_PAIRS 66   // the normal matrix's upper triangle, row by row
+#define FIT_COUNT 77   // confirmed samples
+#define FIT_ENERGY 78  // their robust error at the current terms
+#define FIT_INLIERS 79 // those within kFitRobust of the model
+#define FIT_NEAREST 80     // the largest depth distance among those (a maximum, not a sum)
+#define FIT_VALUES 81
+// The fit's buffer (u_cnt in fit_accum and fit_solve), in words: 0..10 the terms, 11 nearness_limit,
+// 12 valid, 13 confirmed samples, 14 those agreeing, 15 their mean robust error, 16 the fit failed
+// (too few samples, or a step could not be solved), 17 steps solved; from FIT_HEAD each thread
+// group's FIT_VALUES partial sums.
+#define FIT_HEAD 20
+bool fin(float a) { return (asuint(a) & 0x7fffffffu) < 0x7f800000u; }
+// A depth value's distance from the far end; 0 for a value that is not a depth.
+float nearness_of(float d) { return fin(d) && d >= 0.0 && d <= 1.0 ? abs(d - depth_far) : 0.0; }
+// The two rows of one position's terms (screen_motion.hpp Terms).
+void fit_terms(float2 p, float nearness, out float bu[FIT_TERMS], out float bv[FIT_TERMS]) {
+    float sc = 2.0 / float(h);
+    float X = (p.x - 0.5 * float(w)) * sc, Y = (p.y - 0.5 * float(h)) * sc;
+    bu[0] = 1; bu[1] = X; bu[2] = Y; bu[3] = 0; bu[4] = 0; bu[5] = 0; bu[6] = X * X; bu[7] = X * Y; bu[8] = nearness; bu[9] = 0;   bu[10] = nearness * X;
+    bv[0] = 0; bv[1] = 0; bv[2] = 0; bv[3] = 1; bv[4] = X; bv[5] = Y; bv[6] = X * Y; bv[7] = Y * Y; bv[8] = 0;   bv[9] = nearness; bv[10] = nearness * Y;
+}
+// One sample per 8x8 block, at its centre: the best vector itself, with no preference for
+// stillness (total_motion.hpp SamplePixel). t_color is bound as the depth; u_enc as the fit's grid
+// (RGBA32F, one texel per block): xy the vector, z the depth's distance from its far end, w 1 when
+// the pictures confirm the vector.
+[numthreads(8, 8, 1)]
+void fit_sample(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= gw || id.y >= gh) return;
+    uint2 c = id.xy * block + block / 2;
+    float4 o = 0;
+    bool cut = has_cost == 2 && (t_cost[int2(1, 0)] & 15u) != 0; // a scene change: no vector of this pair means anything
+    if (!cut && c.x < w && c.y < h) {
+        float ev = t_valid[c];
+        float2 raw = t_raw[c];
+        bool have_raw = ev > 0.0 && ev <= 1.0 && !any(isnan(raw)) && !any(isinf(raw));
+        float2 p = float2(c) + 0.5 - float2(jitter_x, jitter_y);
+        float2 q = p + raw;
+        bool raw_on = have_raw && q.x >= 0.0 && q.y >= 0.0 && q.x <= float(w) && q.y <= float(h);
+        float2 best; float e_best, e_with, limit;
+        bool confirmed = best_vector(p, float2(0, 0), raw_on, raw, best, e_best, e_with, limit);
+        o = float4(best, nearness_of(t_color[c].x), confirmed ? 1.0 : 0.0);
+    }
+    u_enc[id.xy] = o;
+}
+// One pass over the samples at the buffer's terms (screen_motion.hpp Accumulate): 64 samples a
+// thread group, their sums stored per group. t_hist is bound as the fit's grid.
+groupshared float gf[64 * FIT_VALUES];
+[numthreads(64, 1, 1)]
+void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    float v[FIT_VALUES];
+    uint i;
+    for (i = 0; i < FIT_VALUES; ++i) v[i] = 0;
+    const uint s = gid.x * 64 + gi;
+    if (s < gw * gh) {
+        const uint2 cell = uint2(s % gw, s / gw);
+        const float4 a = t_hist[cell];
+        if (a.w > 0.5 && fin(a.x) && fin(a.y) && fin(a.z) && abs(a.x) < kFitMaxVector && abs(a.y) < kFitMaxVector) {
+            const float2 p = float2(cell * block + block / 2) + 0.5 - float2(jitter_x, jitter_y);
+            float bu[FIT_TERMS], bv[FIT_TERMS];
+            fit_terms(p, a.z, bu, bv);
+            float2 m = 0;
+            [unroll] for (uint k = 0; k < FIT_TERMS; ++k) m += asfloat(u_cnt.Load(k * 4)) * float2(bu[k], bv[k]);
+            const float2 r = a.xy - m;
+            const float rr = dot(r, r), c2 = kFitRobust * kFitRobust;
+            // 1 / (1 + r^2 / s^2)^2: its pull on the fit falls as 1 / r^3 (screen_motion.hpp).
+            const float qw = fit_scale > 0.0 ? 1.0 / (1.0 + rr / (fit_scale * fit_scale)) : 1.0;
+            const float wgt = qw * qw;
+            uint idx = 0;
+            [unroll] for (uint ia = 0; ia < FIT_TERMS; ++ia) {
+                [unroll] for (uint ib = ia; ib < FIT_TERMS; ++ib) { v[idx] = wgt * (bu[ia] * bu[ib] + bv[ia] * bv[ib]); ++idx; }
+            }
+            // The right-hand side holds what the terms so far leave unexplained: each step solves for a correction.
+            [unroll] for (uint ic = 0; ic < FIT_TERMS; ++ic) v[FIT_PAIRS + ic] = wgt * (bu[ic] * r.x + bv[ic] * r.y);
+            v[FIT_COUNT] = 1.0;
+            v[FIT_ENERGY] = 0.5 * rr / (1.0 + rr / c2);
+            if (rr <= c2) { v[FIT_INLIERS] = 1.0; v[FIT_NEAREST] = a.z; }
+        }
+    }
+    for (i = 0; i < FIT_VALUES; ++i) gf[gi * FIT_VALUES + i] = v[i];
+    GroupMemoryBarrierWithGroupSync();
+    for (uint st = 32; st > 0; st >>= 1) {
+        if (gi < st) {
+            for (i = 0; i < FIT_NEAREST; ++i) gf[gi * FIT_VALUES + i] += gf[(gi + st) * FIT_VALUES + i];
+            gf[gi * FIT_VALUES + FIT_NEAREST] = max(gf[gi * FIT_VALUES + FIT_NEAREST], gf[(gi + st) * FIT_VALUES + FIT_NEAREST]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) for (i = 0; i < FIT_VALUES; ++i) u_cnt.Store((FIT_HEAD + gid.x * FIT_VALUES + i) * 4, asuint(gf[i]));
+}
+)" R"(
+// One thread group: the groups' sums reduced, then one step of the fit (screen_motion.hpp Solve:
+// the scaled, damped normal equations by Cholesky, as a correction to the terms) or, with mode 1,
+// the final evaluation (screen_motion.hpp Fit's last pass). u_enc is bound as the model `measure`
+// reads (RG32F, 8 x 1): texels 0..4 the terms in pairs, 5 the last term and nearness_limit, 6 valid and
+// the confirmed samples, 7 those agreeing and their mean robust error.
+groupshared float gr[256];
+groupshared float gt[FIT_VALUES];
+[numthreads(256, 1, 1)]
+void fit_solve(uint gi : SV_GroupIndex) {
+    const uint groups = (gw * gh + 63) / 64;
+    for (uint i = 0; i < FIT_VALUES; ++i) {
+        float s = 0;
+        for (uint g = gi; g < groups; g += 256) {
+            const float x = asfloat(u_cnt.Load((FIT_HEAD + g * FIT_VALUES + i) * 4));
+            s = i == FIT_NEAREST ? max(s, x) : s + x;
+        }
+        gr[gi] = s;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint st = 128; st > 0; st >>= 1) {
+            if (gi < st) gr[gi] = i == FIT_NEAREST ? max(gr[gi], gr[gi + st]) : gr[gi] + gr[gi + st];
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (gi == 0) gt[i] = gr[0];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi != 0) return;
+    const float n = gt[FIT_COUNT];
+    bool failed = u_cnt.Load(16 * 4) != 0u;
+    if (mode == 0u) {
+        if (failed) return;
+        u_cnt.Store(13 * 4, asuint(n));
+        bool ok = n >= kFitMinSamples;
+        // Plain loops, not unrolled: one thread runs this once a step, and the program stays small to compile.
+        float A[FIT_TERMS][FIT_TERMS], b[FIT_TERMS], sc[FIT_TERMS];
+        uint idx = 0;
+        [loop] for (uint a = 0; a < FIT_TERMS; ++a) {
+            [loop] for (uint c = a; c < FIT_TERMS; ++c) { A[a][c] = gt[idx]; A[c][a] = gt[idx]; ++idx; }
+        }
+        [loop] for (uint a1 = 0; a1 < FIT_TERMS; ++a1) { b[a1] = gt[FIT_PAIRS + a1]; sc[a1] = A[a1][a1] > 1e-20 ? rsqrt(A[a1][a1]) : 0.0; }
+        [loop] for (uint a2 = 0; a2 < FIT_TERMS; ++a2) {
+            [loop] for (uint c2 = 0; c2 < FIT_TERMS; ++c2) A[a2][c2] *= sc[a2] * sc[c2];
+            // A term no sample carries (every depth at the far end, say) keeps its value.
+            A[a2][a2] = (sc[a2] > 0 ? A[a2][a2] : 0.0) + kFitDamping + (sc[a2] > 0 ? 0.0 : 1.0);
+            b[a2] *= sc[a2];
+        }
+        float L[FIT_TERMS][FIT_TERMS];
+        [loop] for (uint r0 = 0; r0 < FIT_TERMS; ++r0) { [loop] for (uint c3 = 0; c3 < FIT_TERMS; ++c3) L[r0][c3] = 0; }
+        [loop] for (uint j = 0; j < FIT_TERMS; ++j) {
+            float d = A[j][j];
+            [loop] for (uint m = 0; m < j; ++m) d -= L[j][m] * L[j][m];
+            if (!(d > 1e-12)) ok = false;
+            L[j][j] = sqrt(max(d, 1e-12));
+            [loop] for (uint i5 = j + 1; i5 < FIT_TERMS; ++i5) {
+                float t = A[i5][j];
+                [loop] for (uint m2 = 0; m2 < j; ++m2) t -= L[i5][m2] * L[j][m2];
+                L[i5][j] = t / L[j][j];
+            }
+        }
+        float yv[FIT_TERMS], xv[FIT_TERMS];
+        [loop] for (uint i6 = 0; i6 < FIT_TERMS; ++i6) {
+            float t = b[i6];
+            [loop] for (uint m3 = 0; m3 < i6; ++m3) t -= L[i6][m3] * yv[m3];
+            yv[i6] = t / L[i6][i6];
+        }
+        [loop] for (int i7 = FIT_TERMS - 1; i7 >= 0; --i7) {
+            float t = yv[i7];
+            [loop] for (int m4 = i7 + 1; m4 < FIT_TERMS; ++m4) t -= L[m4][i7] * xv[m4];
+            xv[i7] = t / L[i7][i7];
+        }
+        float th[FIT_TERMS];
+        [unroll] for (uint k = 0; k < FIT_TERMS; ++k) {
+            const float delta = xv[k] * sc[k];
+            if (!fin(delta)) ok = false;
+            th[k] = asfloat(u_cnt.Load(k * 4)) + delta;
+        }
+        if (ok) {
+            [unroll] for (uint k2 = 0; k2 < FIT_TERMS; ++k2) u_cnt.Store(k2 * 4, asuint(th[k2]));
+            u_cnt.Store(17 * 4, u_cnt.Load(17 * 4) + 1u);
+        } else {
+            u_cnt.Store(16 * 4, 1u);
+        }
+        return;
+    }
+    // The fitted terms against the samples once more: how many agree, and how near the nearest of those is.
+    const float agree = gt[FIT_INLIERS];
+    const bool valid = !failed && n >= kFitMinSamples && agree >= kFitMinAgree * n;
+    const float energy = n > 0.0 ? gt[FIT_ENERGY] / n : 0.0, nearness_limit = failed ? 0.0 : gt[FIT_NEAREST];
+    u_cnt.Store(11 * 4, asuint(nearness_limit));
+    u_cnt.Store(12 * 4, valid ? 1u : 0u);
+    u_cnt.Store(13 * 4, asuint(n));
+    u_cnt.Store(14 * 4, asuint(failed ? 0.0 : agree));
+    u_cnt.Store(15 * 4, asuint(failed ? 0.0 : energy));
+    float th2[FIT_TERMS + 1];
+    [unroll] for (uint k3 = 0; k3 < FIT_TERMS; ++k3) th2[k3] = valid ? asfloat(u_cnt.Load(k3 * 4)) : 0.0;
+    th2[FIT_TERMS] = valid ? nearness_limit : 0.0;
+    [unroll] for (uint k4 = 0; k4 < 6; ++k4) u_enc[uint2(k4, 0)] = float4(th2[2 * k4], th2[2 * k4 + 1], 0, 0);
+    u_enc[uint2(6, 0)] = float4(valid ? 1.0 : 0.0, n, 0, 0);
+    u_enc[uint2(7, 0)] = float4(agree, energy, 0, 0);
+}
+// The model at a position (screen_motion.hpp Evaluate). t_res is bound as fit_solve's model; with
+// nothing bound there every read is 0 and there is no model.
+float2 screen_at(float2 p, float nearness) {
+    float bu[FIT_TERMS], bv[FIT_TERMS];
+    fit_terms(p, nearness, bu, bv);
+    float2 v = 0;
+    [unroll] for (uint k = 0; k < FIT_TERMS; ++k) {
+        const float2 pr = t_res[int2(k / 2, 0)];
+        v += ((k & 1u) != 0u ? pr.y : pr.x) * float2(bu[k], bv[k]);
+    }
+    return v;
+}
+)" R"(
+// t_raw: the search's vector after the depth-aware expansion; t_valid: that expansion's validity;
+// t_res: the screen's own motion (fit_solve's model), or nothing; t_color: the depth, read only
+// with a model. u_enc is bound as the RG32F total field here, u_mask as its validity.
 [numthreads(8, 8, 1)]
 void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi < 10) gs[gi] = 0;
     GroupMemoryBarrierWithGroupSync();
     if (id.x < w && id.y < h) {
-        // 0 measured moving, 1 nothing known, 4 the search's vector from outside the frame,
-        // 5 the search's vector unconfirmed, 7 measured still. Slot 8: this pair is a scene cut.
+        // 0 measured, moving by itself; 1 nothing known; 2 not measurable, follows the screen's
+        // motion; 7 measured, moving with the screen (exactly still when there is no model).
+        // 4 and 5 (the search's vector handed on) are no longer written. Slot 8: a scene cut.
         uint why = 1;
         float2 v = 0;
         float valid = 0;
@@ -250,28 +490,19 @@ void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             float2 p = float2(id.xy) + 0.5 - float2(jitter_x, jitter_y);
             float2 q = p + raw;
             bool raw_on = have_raw && q.x >= 0.0 && q.y >= 0.0 && q.x <= float(w) && q.y <= float(h);
-            Window win = window_at(p);
-            bool measured = false;
-            if (win.contrast >= kTotalTextureMin) {
-                float4 z = refine(p, float2(0, 0), win);
-                float2 best = z.xy;
-                float e_best = z.z, e_still = z.w;
-                if (raw_on && any(raw != 0.0)) {
-                    float4 r = refine(p, raw, win);
-                    if (r.z <= z.z) { best = r.xy; e_best = r.z; }
-                }
-                // Explaining the picture: a small error in itself and small beside the window's own contrast.
-                float limit = min(kTotalImageAbs, kTotalImageRel * win.contrast);
-                if (e_best <= limit) {
-                    measured = true;
-                    valid = 1.0;
-                    // Exact stillness is a hypothesis too: a vector replaces it only by explaining the picture clearly better.
-                    bool still = all(best == 0.0) || (e_still <= limit && !(e_best <= kTotalStillRatio * e_still));
-                    if (still) why = 7;
-                    else { why = 0; v = best; }
-                }
-            }
-            if (!measured && have_raw) { v = raw; valid = kTotalApproximate; why = raw_on ? 5 : 4; }
+            // The hypothesis "nothing moved by itself": the screen's own motion here, never asked
+            // about a depth nearer than its nearest agreeing sample; exact stillness with no model.
+            bool have_screen = t_res[int2(6, 0)].x > 0.5;
+            float2 hyp = 0;
+            if (have_screen) hyp = screen_at(p, min(nearness_of(t_color[id.xy].x), t_res[int2(5, 0)].y));
+            float2 best; float e_best, e_with, limit;
+            if (best_vector(p, hyp, raw_on, raw, best, e_best, e_with, limit)) {
+                valid = 1.0;
+                // The hypothesis stands unless the pixel's own vector explains the picture clearly better.
+                bool with_screen = all(best == hyp) || (e_with <= limit && !(e_best <= kTotalStillRatio * e_with));
+                if (with_screen) { why = 7; v = hyp; }
+                else { why = 0; v = best; }
+            } else if (have_screen) { v = hyp; valid = kTotalApproximate; why = 2; }
         }
         u_enc[id.xy] = float4(v, 0, 0);
         u_mask[id.xy] = valid;

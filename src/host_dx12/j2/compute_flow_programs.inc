@@ -54,6 +54,23 @@
         if (!a || !b || !c) { g.pso_measure.Reset(); g.pso_cut_state.Reset(); g.pso_cut_show.Reset(); }
     }
     {
+        // VARIANT: motion/screen-fit (flow_shaders.hpp fit_sample / fit_accum / fit_solve). All three
+        // programs or none: without them `measure` has no model to follow, and the j2screenfit line
+        // says on=0.
+        static const char* const entries[3] = {"fit_sample", "fit_accum", "fit_solve"};
+        ComPtr<ID3D12PipelineState>* const states[3] = {&g.pso_fit_sample, &g.pso_fit_accum, &g.pso_fit_solve};
+        bool all = camera_free && g.pso_measure;
+        for (int i = 0; i < 3 && all; ++i) {
+            ComPtr<ID3DBlob> cs;
+            all = SUCCEEDED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, entries[i], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err));
+            if (all) {
+                pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+                all = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(states[i]->ReleaseAndGetAddressOf())));
+            }
+        }
+        if (!all) for (auto* state : states) state->Reset();
+    }
+    {
         // VARIANT: flow/frame-candidates (flow_shaders.hpp kCandidateShader). All four programs or
         // none: without them the search's grid is used as it is, and the j2candidates line says on=0.
         static const char* const entries[4] = {"cand_clear", "cand_count", "cand_pick", "cand_apply"};

@@ -43,10 +43,11 @@ struct Tier3 {ID3D12Resource *residual=nullptr,*valid=nullptr,*mask=nullptr,*fix
     // measured from the two pictures with no camera: v = p_previous - p_current in render pixels,
     // +x right, +y down, in the unjittered frame at raster pixel centres (the arbiter's convention
     // for a tier-1 supplier, to be passed with Tier1Source::Estimated; the same quantity as camera
-    // + residual, never a residual). `total_valid` per pixel: 1 measured (moving, or still with the
-    // pictures confirming it), 0.5 the block search's vector handed on because the pictures could
-    // not confirm it (flat area, newly uncovered, from outside the frame), 0 nothing known: there
-    // `total` is 0 and that zero is not "still". On a scene cut every pixel is 0 / 0.
+    // + residual, never a residual). `total_valid` per pixel: 1 measured (moving by itself, or with
+    // the screen, the pictures confirming it), 0.5 the screen's own motion where the pictures could
+    // not measure (flat area, newly uncovered; core/screen_motion.hpp), 0 nothing known: there
+    // `total` is 0 and that zero is not "still". The block search's raw vector is never handed on.
+    // On a scene cut every pixel is 0 / 0.
     // RG32_FLOAT / R32_FLOAT, NON_PIXEL_SHADER_RESOURCE.
     ID3D12Resource *total=nullptr,*total_valid=nullptr;};
 // Called inside J2's restorable inline scope, AFTER its colour/depth resolve.
@@ -69,6 +70,12 @@ void SetLoosen(uint32_t percent);
 // vectors before anything reads it (core/flow_candidates.hpp); off, the grid is used as the search
 // left it. For the GPU fixtures' with/without comparison; no setting reaches it. Read at each Record.
 void SetFrameCandidates(bool on);
+// VARIANT: motion/screen-fit
+// On by default. Frame::total only: the screen's own motion is fitted to the block centres the
+// pictures can measure, and `measure` follows it where they cannot (core/screen_motion.hpp). Off,
+// such pixels are not known (validity 0). For the GPU fixtures' with/without comparison; no setting
+// reaches it. Read at each Record.
+void SetScreenFit(bool on);
 struct Gates { float image_ratio, image_abs, texture_min, agree_px, agree_cos, consistency_px; uint32_t agree_min; bool sky; };
 Gates GatesFor(uint32_t percent); // pure, for tests and the panel
 void Reset(); // old contexts stay retained by their executable/GPU recordings
@@ -84,9 +91,10 @@ struct Stats {
     // small, cost, offscreen, image, flicker; and the pairs counted.
     uint64_t sum[7]{}; uint64_t sum_pairs=0;
     // Frame::total recordings (no camera): recordings asked for, pairs measured, and every completed
-    // pair's pixel counts by the measure program's code (0 measured moving, 1 nothing known, 4 the
-    // search's vector from outside the frame, 5 the search's vector unconfirmed, 7 measured still;
-    // 2, 3 and 6 are not used). Kept apart from `sum`: those count residuals against a camera.
+    // pair's pixel counts by the measure program's code (0 measured, moving by itself; 1 nothing
+    // known; 2 not measurable, follows the screen's motion; 7 measured, moving with the screen, which
+    // is exactly still when there is no model; 4 and 5, the search's vector handed on, are no longer
+    // written; 3 and 6 are not used). Kept apart from `sum`: those count residuals against a camera.
     uint64_t total_frames=0,total_pairs=0,total_sum[8]{},total_sum_pairs=0;
     bool total_mode=false; // the latest recording was a Frame::total one (the last sample's counts are then the measure codes)
     // Scene cuts measured (AMD's whole-frame scene change on a total pair), the newest one's frame,
@@ -109,6 +117,16 @@ struct Stats {
     // took one. The newest completed pair: its frame, its candidates strongest first, packed as
     // flow_candidates.hpp Pack (support << 16 | key; 0 = none), and its two block counts.
     bool cand_on=false; // the latest recording ran the pass
+    // VARIANT motion/screen-fit (core/screen_motion.hpp), over completed Frame::total pairs: pairs
+    // the fit ran on, pairs with a model, and the pairs without one by reason (fewer confirmed samples
+    // than the fit needs; a step could not be solved; fewer than half the samples agree with it).
+    // The newest completed pair: its frame, the eleven terms, the nearest depth distance it answers
+    // for, whether it is a model, its confirmed samples, those agreeing, their mean robust error
+    // (pixels squared), and the steps solved.
+    bool screen_on=false; // the latest Frame::total recording ran the fit
+    uint64_t screen_pairs=0,screen_valid=0,screen_few=0,screen_unsolved=0,screen_disagree=0,screen_frame=0;
+    float screen_theta[11]{},screen_nearness_limit=0,screen_samples=0,screen_agree=0,screen_energy=0;
+    bool screen_last_valid=false,screen_last_unsolved=false;uint32_t screen_steps=0;
     uint64_t cand_pairs=0,cand_pairs_changed=0,cand_offered=0,cand_changed=0,cand_frame=0;
     uint32_t cand_top[8]{},cand_last_offered=0,cand_last_changed=0;
     double ms=0;char reason[160]{};

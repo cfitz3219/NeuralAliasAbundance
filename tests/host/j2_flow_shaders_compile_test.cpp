@@ -1,6 +1,7 @@
 // The J2 flow programs compile with the real HLSL compiler: every entry point of both sources, with the target and
 // flags compute_flow uses (compute_flow_programs.inc). No device needed, so this runs in CI.
-// Why it exists: the camera-free programs (`measure`, `cut_state`, `cut_show`) are compiled when the
+// Why it exists: the camera-free programs (`measure`, `cut_state`, `cut_show`, and the screen fit's
+// `fit_sample`, `fit_accum`, `fit_solve`) are compiled when the
 // game starts, and a failure there is quiet by design (the residual path keeps working and measured
 // motion reports itself unavailable). Here a program that does not compile is a failed test, with
 // the compiler's own message.
@@ -19,6 +20,8 @@ int main()
     static const Entry kEntries[] = {
         {"encode", na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1},       {"accept", na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1},
         {"measure", na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1},      {"cut_state", na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1},
+        {"fit_sample", na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1},   {"fit_accum", na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1},
+        {"fit_solve", na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1},
         {"cut_show", na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1},     {"cand_clear", na::j2::kCandidateShader, sizeof na::j2::kCandidateShader - 1},
         {"cand_count", na::j2::kCandidateShader, sizeof na::j2::kCandidateShader - 1}, {"cand_pick", na::j2::kCandidateShader, sizeof na::j2::kCandidateShader - 1},
         {"cand_apply", na::j2::kCandidateShader, sizeof na::j2::kCandidateShader - 1},

@@ -1880,14 +1880,25 @@ void write_menu_progress(HANDLE log)
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
     // Measured total motion (no camera; compute_flow.hpp Frame::total). Pixel counts are sums over
     // every completed pair, by the measure program's code; no_pair by Ticket::no_pair's code.
-    {char line[700];const int n=snprintf(line,sizeof line,"j2measured mode=%d pictures=%llu pairs=%llu completed_pairs=%llu pixels{moving=%llu still=%llu approximate_unconfirmed=%llu approximate_from_outside=%llu not_known=%llu} "
+    {char line[700];const int n=snprintf(line,sizeof line,"j2measured mode=%d pictures=%llu pairs=%llu completed_pairs=%llu pixels{moving=%llu still=%llu follows_screen=%llu approximate_unconfirmed=%llu approximate_from_outside=%llu not_known=%llu} "
         "scene_cuts=%llu last_cut_frame=%llu resets_asked=%llu no_pair{reset_asked=%llu no_picture=%llu not_frame_before=%llu other_scene=%llu colour_convention=%llu raster_kind=%llu not_submitted=%llu} last_ms=%.3f\r\n",
         cf.total_mode?1:0,(unsigned long long)cf.total_frames,(unsigned long long)cf.total_pairs,(unsigned long long)cf.total_sum_pairs,
-        (unsigned long long)cf.total_sum[0],(unsigned long long)cf.total_sum[7],(unsigned long long)cf.total_sum[5],(unsigned long long)cf.total_sum[4],(unsigned long long)cf.total_sum[1],
+        (unsigned long long)cf.total_sum[0],(unsigned long long)cf.total_sum[7],(unsigned long long)cf.total_sum[2],(unsigned long long)cf.total_sum[5],(unsigned long long)cf.total_sum[4],(unsigned long long)cf.total_sum[1],
         (unsigned long long)cf.total_cuts,(unsigned long long)cf.total_cut_frame,(unsigned long long)cf.total_cut_resets,
         (unsigned long long)cf.no_pair[1],(unsigned long long)cf.no_pair[2],(unsigned long long)cf.no_pair[3],(unsigned long long)cf.no_pair[4],
         (unsigned long long)cf.no_pair[5],(unsigned long long)cf.no_pair[6],(unsigned long long)cf.no_pair[7],cf.total_mode?cf.ms:0.0);
         if(n>0)WriteFile(log,line,DWORD((std::min)(n,int(sizeof(line)-1))),&cfw,nullptr);}
+    // VARIANT motion/screen-fit (core/screen_motion.hpp): the screen's own motion that pixels the pictures
+    // cannot measure follow. Why pairs had no model, and the newest completed pair's fit: its samples,
+    // how many agree, their mean robust error (px^2), the nearest depth distance it answers for, and
+    // the eleven terms (a0..a7 the picture's own flow in pixels, c1..c3 the parallax per unit of depth distance).
+    {char line[620];int n=snprintf(line,sizeof line,"j2screenfit on=%d pairs=%llu with_model=%llu no_model{too_few_samples=%llu not_solved=%llu samples_disagree=%llu} "
+        "last{frame=%llu model=%d samples=%.0f agree=%.0f error=%.4f nearness_limit=%.6f steps=%u terms=",
+        cf.screen_on?1:0,(unsigned long long)cf.screen_pairs,(unsigned long long)cf.screen_valid,(unsigned long long)cf.screen_few,(unsigned long long)cf.screen_unsolved,
+        (unsigned long long)cf.screen_disagree,(unsigned long long)cf.screen_frame,cf.screen_last_valid?1:0,cf.screen_samples,cf.screen_agree,cf.screen_energy,
+        cf.screen_nearness_limit,cf.screen_steps);
+        for(unsigned k=0;k<11 && n>0 && n<int(sizeof line)-24;++k)n+=snprintf(line+n,sizeof line-size_t(n),"%s%.5g",k?",":"",cf.screen_theta[k]);
+        if(n>0 && n<int(sizeof line)-4){n+=snprintf(line+n,sizeof line-size_t(n),"}\r\n");WriteFile(log,line,DWORD(n),&cfw,nullptr);}}
     // VARIANT flow/frame-candidates (core/flow_candidates.hpp): why blocks changed. The newest completed
     // pair's candidates, strongest first, as (x,y)xblocks; a block takes one only when it explains
     // the two pictures clearly better than the block's own vector.
