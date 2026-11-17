@@ -1144,3 +1144,7 @@ Astra verified Fableddd8e306 using unchanged GPU correctness/ABBA fixtures and C
 ### 2026-11-17 — Resistance replay diagnostic overhead
 
 Astra PR153 / 3e893e7 removes the old per-draw replay probe, which recorded 559M diagnostic entries across logged windows of the ddd8e306 run. Four automated GPU/host tests pass. Actual replay and its diagnostics remain available. PID 10376 slow samples sit around 20–25 FPS with DLAA engaged, replay near 3M expanded vertices, and the AMD motion stage typically around 1.7 ms. See COMMS and the pull request's WORKLOG for evidence and the proposed bounded replay work. Fable retains replay selection and combined packaging. User retains game testing.
+
+### 2026-11-17 — Non-replay performance cuts ready for integration
+
+Astra PR154 / 725f57e. GPU benchmarks show warm context block 2.58 to .78 s, FP16 rejected-candidate mean .0912 to .0141 ms, motion stage 1.545 to 1.518 ms, ordinary cut guard .0123 to .0047 ms. Ten tests pass, production debug zero errors. CPU setup calls are reduced; direct CPU recording median remains within run variance. No in-game FPS or latency verification yet. Fable owns combined integration. Details in COMMS and PR154 WORKLOG.
