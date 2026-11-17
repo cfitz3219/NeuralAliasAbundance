@@ -90,6 +90,10 @@ if(NA_HAVE_NGX_SDK)
   # patterns and an independently moving region. CPU candidate experiments cannot satisfy it.
   add_test(NAME host_j2_compute_flow_ambiguity_test COMMAND j2_compute_flow_test --ambiguity)
   set_tests_properties(host_j2_compute_flow_ambiguity_test PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  # Pixel-level replay holes, partial/nonfinite masks, flat-screen motion, known eleven-term
+  # samples, independently moving foreground and far-only depth. Hardware results, not CPU predictions.
+  add_test(NAME host_j2_screen_motion_test COMMAND j2_compute_flow_test --screen-fit --debug)
+  set_tests_properties(host_j2_screen_motion_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
   na_host_test(draw_replay_test SOURCES draw_replay_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
 endif()

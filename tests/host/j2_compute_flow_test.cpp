@@ -14,12 +14,34 @@
 #include "total_motion_gpu_audit.hpp"
 #include "flow_ambiguity_gpu_audit.hpp"
 #include "flow_fixture_pictures.hpp"
+#include "screen_motion_gpu_audit.hpp"
 int main(int argc,char** argv){
     if(!na::ffx_flow::Built())return test::kSkip;
     const bool debug_mode=(argc>1 && !std::strcmp(argv[1],"--debug")) || (argc>2 && !std::strcmp(argv[2],"--debug"));
     test::ComPtr<ID3D12Debug> debug;
     if(debug_mode){REQUIRE(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))));debug->EnableDebugLayer();}
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    if(argc>1 && !std::strcmp(argv[1],"--screen-fit")) {
+        REQUIRE(screen_audit::ArbiterFallback(d)==0);
+        REQUIRE(screen_audit::SolveControlled(d)==0);
+        REQUIRE(screen_audit::SampleFitMeasure(d)==0);
+        if(debug_mode) {
+            test::ComPtr<ID3D12InfoQueue> messages;REQUIRE(SUCCEEDED(d.device.As(&messages)));
+            unsigned errors=0;
+            for(UINT64 i=0;i<messages->GetNumStoredMessages();++i) {
+                SIZE_T size=0;messages->GetMessage(i,nullptr,&size);std::vector<char> bytes(size);
+                auto* m=reinterpret_cast<D3D12_MESSAGE*>(bytes.data());messages->GetMessage(i,m,&size);
+                if(m->Severity==D3D12_MESSAGE_SEVERITY_ERROR||m->Severity==D3D12_MESSAGE_SEVERITY_CORRUPTION){std::printf("GPU validation: %s\n",m->pDescription);++errors;}
+            }
+            std::printf("screen fit debug errors=%u\n",errors);CHECK(errors==0);
+        }
+        return test::finish("j2_screen_motion_gpu_audit");
+    }
+    if(argc>1 && !std::strcmp(argv[1],"--screen-benchmark")) {
+        REQUIRE(screen_audit::ProductionBenchmark(d,1920,1080)==0);
+        REQUIRE(screen_audit::ProductionBenchmark(d,3440,1440)==0);
+        return test::finish("j2_screen_motion_benchmark");
+    }
     if(argc>1 && !std::strcmp(argv[1],"--ambiguity")){
         if(!na::ffx_flow::DeviceSupported(d.device.Get()))return test::kSkip;
         REQUIRE(AuditFlowAmbiguity(d,512,256)==0);REQUIRE(AuditFlowAmbiguity(d,1920,1080)==0);
