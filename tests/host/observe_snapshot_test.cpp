@@ -45,8 +45,40 @@ void Matrix(float* m, float seed)
 }
 } // namespace
 
-int main()
+int budget_test()
 {
+    test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("observe_snapshot_budget_test");
+    auto* dev=d.device.Get();REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),true));
+    na_observe_config cfg{};cfg.size_bytes=sizeof cfg;REQUIRE(na_observe_start(&cfg,&Sink,nullptr)==NA_OK);
+    auto gpu=test::CreateBuffer(dev,4096,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COMMON);REQUIRE(gpu);
+    D3D12_ROOT_PARAMETER p{};p.ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    D3D12_ROOT_SIGNATURE_DESC desc{1,&p,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    test::ComPtr<ID3DBlob> blob,err;test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&desc,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&err)));
+    REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))));
+    test::List lists[3];ID3D12CommandList* submitted[3]{};na_object_id ids[3]{};
+    for(unsigned i=0;i<3;++i){
+        REQUIRE(lists[i].Create(dev));auto* l=lists[i].list.Get();REQUIRE(SUCCEEDED(l->Close()));REQUIRE(SUCCEEDED(l->Reset(lists[i].alloc.Get(),nullptr)));
+        l->SetGraphicsRootSignature(root.Get());
+        for(unsigned k=0;k<(i?4096u:30u);++k)l->SetGraphicsRootConstantBufferView(0,gpu->GetGPUVirtualAddress());
+        REQUIRE(SUCCEEDED(l->Close()));submitted[i]=l;ids[i]=na::observe::IdOf(l);
+    }
+    d.queue->ExecuteCommandLists(3,submitted);d.WaitIdle();REQUIRE(na_observe_stop()==NA_OK);
+    unsigned count[3]{},budget=0,total=0;
+    for(const auto& bytes:g_events){
+        if(reinterpret_cast<const na_event_header*>(bytes.data())->kind!=NA_EV_SNAPSHOT)continue;
+        const auto& e=*reinterpret_cast<const na_ev_snapshot*>(bytes.data());++total;
+        for(unsigned i=0;i<3;++i)if(e.list==ids[i])++count[i];
+        if(e.status==NA_SNAP_BUDGET){++budget;CHECK(e.list==ids[1]&&e.op_index==36&&e.captured_bytes==0);}
+        else CHECK(e.status==NA_SNAP_GPU_WRITTEN&&e.captured_bytes==0);
+    }
+    CHECK(total==65&&budget==1&&count[0]==30&&count[1]==35&&count[2]==0);
+    std::printf("snapshot count budget: total=%u budget=%u per_list=%u,%u,%u\n",total,budget,count[0],count[1],count[2]);
+    return test::finish("observe_snapshot_budget_test");
+}
+int main(int argc,char** argv)
+{
+    if(argc>1&&!std::strcmp(argv[1],"--budget"))return budget_test();
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("observe_snapshot_test");
     ID3D12Device* dev = d.device.Get();

@@ -24,12 +24,13 @@ struct Stats{double mean=0,p95=0,cpu=0;unsigned frames=0;};
 uint64_t cpu_time(){FILETIME c,e,k,u;GetProcessTimes(GetCurrentProcess(),&c,&e,&k,&u);ULARGE_INTEGER a{},b{};a.LowPart=k.dwLowDateTime;a.HighPart=k.dwHighDateTime;b.LowPart=u.dwLowDateTime;b.HighPart=u.dwHighDateTime;return a.QuadPart+b.QuadPart;}
 }
 int main(int argc,char** argv){
-    unsigned threads=1,span=64,copies=0,writes=0;double seconds=2.;bool bare=false,profile=false,latch=false,copy_only=false;
+    unsigned threads=1,span=64,copies=0,writes=0,uses=0;double seconds=2.;bool bare=false,profile=false,latch=false,copy_only=false;
     for(int i=1;i<argc;++i){if(!std::strcmp(argv[i],"--threads")&&i+1<argc)threads=unsigned(std::atoi(argv[++i]));
         else if(!std::strcmp(argv[i],"--seconds")&&i+1<argc)seconds=std::atof(argv[++i]);
         else if(!std::strcmp(argv[i],"--span")&&i+1<argc)span=unsigned(std::atoi(argv[++i]));
         else if(!std::strcmp(argv[i],"--copies")&&i+1<argc)copies=unsigned(std::atoi(argv[++i]));
         else if(!std::strcmp(argv[i],"--writes")&&i+1<argc)writes=unsigned(std::atoi(argv[++i]));
+        else if(!std::strcmp(argv[i],"--uses")&&i+1<argc)uses=unsigned(std::atoi(argv[++i]));
         else if(!std::strcmp(argv[i],"--copy-only"))copy_only=true;
         else if(!std::strcmp(argv[i],"--bare"))bare=true;
         else if(!std::strcmp(argv[i],"--profile"))profile=true;
@@ -41,6 +42,49 @@ int main(int argc,char** argv){
     // Native control excludes callbacks using HostWorkScope, then a real bare
     // original entry point is also measured in a separate process if required.
     if(!bare)REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),true));
+    if(uses){
+        if(uses>8192)return 2;
+        // Record only, never execute. Distinct real resources exercise the
+        // recording's bounded lifetime evidence, including its saturated path.
+        std::vector<test::ComPtr<ID3D12Resource>> resources;
+        for(unsigned i=0;i<uses;++i){
+            auto b=test::CreateBuffer(dev,256,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            REQUIRE(b);resources.push_back(std::move(b));
+        }
+        test::List list;REQUIRE(list.Create(dev));REQUIRE(SUCCEEDED(list.list->Close()));
+        const auto measure=[&](const char* name,bool bypass){
+            std::vector<double> samples;
+            const auto record=[&]{
+                REQUIRE(SUCCEEDED(list.alloc->Reset()));REQUIRE(SUCCEEDED(list.list->Reset(list.alloc.Get(),nullptr)));
+                for(unsigned repeat=0;repeat<2;++repeat)for(const auto& resource:resources){
+                    // A UAV barrier names a resource without manufacturing
+                    // thousands of transitions or submission state changes.
+                    D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;b.UAV.pResource=resource.Get();
+                    list.list->ResourceBarrier(1,&b);
+                }
+                REQUIRE(SUCCEEDED(list.list->Close()));
+                return 0;
+            };
+            const auto begin=Clock::now();
+            do{const auto start=Clock::now();
+                if(bypass){na::observe::HostWorkScope own;REQUIRE(record()==0);}else REQUIRE(record()==0);
+                samples.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+            }while(std::chrono::duration<double>(Clock::now()-begin).count()<seconds);
+            std::sort(samples.begin(),samples.end());
+            std::printf("%s uses=%u records=%zu median_ms=%.4f p95_ms=%.4f\n",name,uses,samples.size(),samples[samples.size()/2],samples[std::min(samples.size()-1,size_t(samples.size()*.95))]);
+            return 0;
+        };
+        REQUIRE(measure("uses_bypass",!bare)==0);
+        if(!bare){na_observe_config cfg{};cfg.size_bytes=sizeof(cfg);REQUIRE(na_observe_start(&cfg,sink,nullptr)==NA_OK);
+            REQUIRE(measure("uses_observed",false)==0);
+            // Every retained ID survives duplicates; Reset forgets all of it.
+            for(unsigned i=0;i<std::min(uses,4096u);++i)REQUIRE(na::observe::ListReferences(list.list.Get(),na::observe::IdOf(resources[i].Get())));
+            REQUIRE(SUCCEEDED(list.alloc->Reset()));REQUIRE(SUCCEEDED(list.list->Reset(list.alloc.Get(),nullptr)));
+            REQUIRE(!na::observe::ListReferences(list.list.Get(),na::observe::IdOf(resources.front().Get())));
+            REQUIRE(SUCCEEDED(list.list->Close()));na_observe_stop();na::observe::SetProcessExiting();
+        }
+        return 0;
+    }
     na::observe::SetRasterStateTracking(true);na::observe::SetOperationSnapshots(true);
     constexpr unsigned tables=16,draws=6000;const unsigned stride=span+1;
     // Each worker owns disjoint, stripe-aligned destinations. The immutable CPU

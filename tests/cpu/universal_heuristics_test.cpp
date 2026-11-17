@@ -11,6 +11,7 @@
 #include "test_support.hpp"
 #include "providers/discovery/universal_heuristics.hpp"
 #include <vector>
+#include <chrono>
 using namespace na::discovery;
 
 namespace {
@@ -157,8 +158,38 @@ struct Feed {
 };
 } // namespace
 
-int main() {
+int main(int argc,char** argv) {
+    const bool benchmark=argc>1&&!std::strcmp(argv[1],"--rank-benchmark");
     return test::run({
+        {"direct camera rank matches sorted ranking, including ties and missing blocks", [benchmark] {
+             Feed f;f.Swapchain(1920,1080);f.Resource(3,1920,1080,40);f.Resource(6,1920,1080,10);f.Pipeline(10,1,1,0);
+             f.Reset();f.SetPipeline(10);f.Targets({6},3);
+             for(unsigned i=0;i<256;++i){
+                 f.RootCbv(0,1000+i%16,(i/16)*256);
+                 for(unsigned j=0;j<1+i%24;++j)f.Draw(100);
+             }
+             f.Execute();f.Present();
+             CHECK(f.h.RankCameraBlocks(512).size()>100);
+             const auto reference=[&](unsigned i,size_t top){
+                 const auto ranked=f.h.RankCameraBlocks(top);
+                 for(size_t k=0;k<ranked.size();++k)
+                     if(ranked[k].resource==1000+i%16&&ranked[k].offset==(i/16)*256)return k+1;
+                 return size_t{0};
+             };
+             for(size_t top: {size_t{0},size_t{1},size_t{4},size_t{8},size_t{512}})
+                 for(unsigned i=0;i<320;++i)CHECK(f.h.CameraRank(1000+i%16,(i/16)*256,top)==reference(i,top));
+             if(benchmark){
+                 for(bool direct:{false,true,true,false}){
+                     uint64_t sum=0;const auto start=std::chrono::steady_clock::now();
+                     constexpr unsigned queries=65536;
+                     for(unsigned n=0;n<queries;++n){const unsigned i=n%320;
+                         sum+=direct?f.h.CameraRank(1000+i%16,(i/16)*256,4):reference(i,4);
+                     }
+                     const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+                     std::printf("camera_rank direct=%u queries=%u total_ms=%.4f per_64_ms=%.6f checksum=%llu\n",unsigned(direct),queries,ms,ms*64/queries,static_cast<unsigned long long>(sum));
+                 }
+             }
+         }},
         {"successful resize updates depth aspect; rejected resize leaves it unchanged", [] {
              Feed f;
              f.Swapchain(1024,768);
