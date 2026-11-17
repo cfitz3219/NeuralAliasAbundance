@@ -16,8 +16,21 @@ struct Session {
 };
 const Session& ThisProcess();
 // LocalAppData\NeuralAlias\captures\<kind>-<local time>-<exe>-p<pid> (directories created). False when
-// LocalAppData is unavailable.
+// LocalAppData is unavailable or the drive has less than the floor left (the reason is logged).
 bool MakeDir(const wchar_t* kind, wchar_t* out, size_t out_chars);
+// The captures folder's budget (core/capture_retention.hpp; Cort 2026-11-17, after 819 GB of captures
+// filled his drive). MakeDir refuses a new capture when the drive is nearly full, and starts a
+// background pass that removes the oldest capture folders until the folder fits its budget; folders
+// made by this process are never removed. Read from `ini` at every MakeDir, so a change needs no restart:
+//   [capture] keep_gb (default 60, 0 = keep everything), min_free_gb (default 20, 0 = no guard).
+// `log` receives one line per removal, per refusal and per pass, each with sizes and the reason.
+using RetentionLog = void (*)(const char* line);
+void SetRetention(const wchar_t* ini, RetentionLog log);
+struct RetentionStats {
+    uint64_t passes = 0, removed_folders = 0, removed_bytes = 0, remove_errors = 0, refused_disk_full = 0;
+    uint64_t last_total_bytes = 0, last_free_bytes = 0;
+};
+RetentionStats GetRetentionStats();
 // Writes <dir>\session.json once (kind, exe, path, pid, process start). Safe to call repeatedly.
 void TagDir(const wchar_t* dir, const char* kind);
 }

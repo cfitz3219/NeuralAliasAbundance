@@ -64,6 +64,8 @@ set_tests_properties(na.cpu.flow_candidates PROPERTIES TIMEOUT 240)
 # The screen's own motion: the lens-free whole-picture fit that pixels the pictures cannot measure follow.
 na_add_cpu_test(screen_motion)
 set_tests_properties(na.cpu.screen_motion PROPERTIES TIMEOUT 120)
+# The captures folder's budget: oldest folders first, never the run in progress.
+na_add_cpu_test(capture_retention)
 na_add_cpu_test(pass_map)
 na_add_cpu_test(live_judge)
 na_add_cpu_test(camera_tracker "${NA_CPU_ROOT}/src/core/motion_arbiter.cpp")

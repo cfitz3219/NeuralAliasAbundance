@@ -1,6 +1,8 @@
 #include "host_dx12/background/work.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/diag/dred.hpp"
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
@@ -119,6 +121,8 @@ DWORD WINAPI InitThread(LPVOID)
     }
     na::settings::SetIniPath(g_ini);
     na::settings::Load();
+    // The captures folder's budget ([capture] keep_gb, min_free_gb): old captures are removed, oldest first.
+    na::capture::SetRetention(g_ini, [](const char* line) { na::eventlog::Emit("capture_retention", "%s", line); });
     // The combined package selects the native provider at presentation.
     // Older explicit DX11 packages still install their device hook here.
     na::on12::Start(g_ini, &boot_log);
