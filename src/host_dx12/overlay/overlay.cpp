@@ -1300,14 +1300,16 @@ void write_status_line()
             if (sn > 0) WriteFile(f, sl, static_cast<DWORD>((std::min)(sn, static_cast<int>(sizeof(sl) - 1))), &written, nullptr);
         }
         {
-            char cl[320]; // camera choice and loss reasons (Sniper steep-view flicker, 2026-11-01)
+            char cl[480]; // camera choice and loss reasons (Sniper steep-view flicker, 2026-11-01)
             const int cn = snprintf(cl, sizeof(cl),
-                "j2_camera contested=%llu alternatives=%llu lost_unread=%llu lost_no_vp=%llu lost_no_inverse=%llu lost_capped=%llu other_cam=%llu jitter_slot_other=%llu inverse_computed=%llu bootstrapped=%llu\r\n",
+                "j2_camera contested=%llu alternatives=%llu lost_unread=%llu lost_no_vp=%llu lost_no_inverse=%llu lost_capped=%llu other_cam=%llu jitter_slot_other=%llu inverse_computed=%llu bootstrapped=%llu "
+                "other_lens=%llu last_other_lens{sx=%.5g sy=%.5g camera_sx=%.5g camera_sy=%.5g}\r\n",
                 static_cast<unsigned long long>(j2.camera_contested), static_cast<unsigned long long>(j2.camera_alternatives),
                 static_cast<unsigned long long>(j2.camera_lost_unread), static_cast<unsigned long long>(j2.camera_lost_no_vp),
                 static_cast<unsigned long long>(j2.camera_lost_no_inverse), static_cast<unsigned long long>(j2.camera_lost_capped),
                 static_cast<unsigned long long>(j2.other_camera_blocks), static_cast<unsigned long long>(j2.jitter_slot_other_camera),
-                static_cast<unsigned long long>(j2.camera_inverse_computed), static_cast<unsigned long long>(j2.camera_bootstrapped));
+                static_cast<unsigned long long>(j2.camera_inverse_computed), static_cast<unsigned long long>(j2.camera_bootstrapped),
+                static_cast<unsigned long long>(j2.camera_other_lens), j2.camera_other_lens_sx, j2.camera_other_lens_sy, j2.camera_lens_sx, j2.camera_lens_sy);
             if (cn > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(cn, static_cast<int>(sizeof(cl) - 1))), &written, nullptr);
             // Per present: why a frame had no DLAA / why a DLAA frame had no jitter (SE5 flicker, 2026-11-02).
             char ml[384];

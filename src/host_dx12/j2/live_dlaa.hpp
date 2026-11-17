@@ -316,6 +316,10 @@ struct Stats {
     uint64_t unjit_not_applied = 0;  // started, but no camera block was rewritten
     uint64_t unjit_not_held = 0;     // rewritten, but the camera the scene list used did not hold it
     uint64_t camera_inverse_computed = 0; // a ViewProjection without its inverse, continuing the main camera, accepted
+    // Lone matrices that continue the main camera's direction and place with another lens, refused
+    // (camera_admission.hpp SameLens), and the last one's two lens scales beside the camera's.
+    uint64_t camera_other_lens = 0;
+    float camera_other_lens_sx = 0, camera_other_lens_sy = 0, camera_lens_sx = 0, camera_lens_sy = 0;
     uint64_t camera_bootstrapped = 0;     // first main camera accepted from a persistent ViewProjection with no inverse pair anywhere
     // SE5 flashing: frames whose camera could not be read ran DLAA on a camera predicted
     // from the last two (extrapolated) or the last one (held), instead of showing the raw frame.

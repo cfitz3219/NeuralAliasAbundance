@@ -3580,6 +3580,15 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
                     have_boot = true;
                 }
             }
+            if (!recovering && c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && g_jit_cam.valid) {
+                // Why a lone matrix in the camera's direction was not taken: it has another lens (the log's other_lens).
+                na::camera::VpGeometry seen{};
+                if (na::camera::ContinuesButForLens(g_jit_cam.geo, c.matrix, &seen)) {
+                    ++g.stats.camera_other_lens;
+                    g.stats.camera_other_lens_sx = static_cast<float>(seen.sx); g.stats.camera_other_lens_sy = static_cast<float>(seen.sy);
+                    g.stats.camera_lens_sx = static_cast<float>(g_jit_cam.geo.sx); g.stats.camera_lens_sy = static_cast<float>(g_jit_cam.geo.sy);
+                }
+            }
             if (!recovering && c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix) && !is_interloper(c.matrix)) {
                 loose.vp = c.matrix;
                 loose.reversed = c.reversed;
