@@ -14,10 +14,15 @@
 //  - Exact stillness is a hypothesis too. The refined vector replaces it only when it explains the
 //    picture clearly better (still_ratio); otherwise stillness is the measurement. That is evidence
 //    from the two pictures, not a threshold on the vector's length.
-//  - Where the picture cannot measure (flat, or neither hypothesis explains it) the search's own
-//    vector is handed on as an APPROXIMATION with validity kApproximate, never as a measurement;
-//    with no search vector either, nothing is known: vector 0, validity 0, and that zero must not
-//    be read as "still".
+//  - Where the picture cannot measure (flat, or no hypothesis explains it) the pixel follows the
+//    SCREEN'S OWN MOTION (core/screen_motion.hpp: one camera movement fitted to the places that can
+//    be measured), with validity kApproximate. The search's raw vector is never handed on: on a real
+//    frame most pixels are in this case, and that vector changes with every jitter sample (Cort's
+//    Sniper Elite Resistance run, 2026-11-17: a still scene shimmered). With no screen motion to
+//    follow, nothing is known: vector 0, validity 0, and that zero must not be read as "still".
+//  - With a screen motion, IT is the hypothesis "nothing moved by itself" in place of exact
+//    stillness: a pixel is measured as moving with the screen unless its own vector explains the
+//    picture clearly better. With none, the hypothesis is exact stillness, as before.
 //  - No temporal rule: a reversal is measured on the frame it happens.
 #pragma once
 
@@ -57,11 +62,14 @@ struct Params {
 };
 
 constexpr float kMeasured = 1.0f;    // validity: the two pictures confirm the vector (moving or still)
-constexpr float kApproximate = 0.5f; // validity: the search's vector, which the pictures could not confirm
+constexpr float kApproximate = 0.5f; // validity: the screen's own motion, where the pictures could not measure
 constexpr int kSpacing = 2;          // pixels between the window's 3x3 samples (a 5x5 pixel footprint)
 
 // The measure counters' codes (compute_flow.hpp Stats::total_sum).
-enum Why : uint8_t { kMoving = 0, kNothing = 1, kOutside = 4, kUnconfirmed = 5, kStill = 7 };
+// kStill: measured, and moving with the screen (exactly still when there is no screen motion).
+// kScreen: not measurable, follows the screen's motion. kOutside and kUnconfirmed (the search's raw
+// vector handed on) are no longer produced; their slots stay so old logs keep their meaning.
+enum Why : uint8_t { kMoving = 0, kNothing = 1, kScreen = 2, kOutside = 4, kUnconfirmed = 5, kStill = 7 };
 
 struct Result {
     float x = 0, y = 0;
@@ -155,45 +163,72 @@ inline void Refine(const Image& prev, const Window& w, float px, float py, float
     }
 }
 
-// One pixel, at most 33 + 2 * 27 samples. (px, py): its position in the stabilised pictures (raster pixel centre minus the
-// frame's jitter). `raw`: the block search's vector there after the depth-aware expansion, and
-// whether that expansion vouches for it.
-inline Result MeasurePixel(const Image& cur, const Image& prev, float px, float py, bool have_raw, float raw_x,
-                           float raw_y, const Params& p = {})
+// The vector that explains the window best, among the refined hypothesis (hx, hy) and the refined
+// search vector. False: the pictures cannot measure here (flat, or neither explains them).
+// `e_with`: the error the hypothesis leaves exactly; `limit`: what counts as explaining the picture.
+inline bool BestVector(const Image& cur, const Image& prev, float px, float py, bool raw_on, float raw_x, float raw_y, float hx,
+                       float hy, const Params& p, float& bx, float& by, float& eb, float& e_with, float& limit)
 {
-    Result r;
-    const bool raw_on = have_raw && px + raw_x >= 0.0f && py + raw_y >= 0.0f && px + raw_x <= float(cur.width) &&
-                        py + raw_y <= float(cur.height);
-    const auto approximate = [&] {
-        if (!have_raw) return; // nothing known: vector 0, validity 0
-        r.x = raw_x;
-        r.y = raw_y;
-        r.valid = kApproximate;
-        r.why = raw_on ? kUnconfirmed : kOutside;
-    };
+    bx = hx;
+    by = hy;
+    eb = e_with = limit = 0;
     const Window w = WindowAt(cur, px, py);
-    if (w.contrast < p.texture_min) {
-        approximate();
-        return r;
-    }
-    float zx, zy, ez, e_still;
-    Refine(prev, w, px, py, 0.0f, 0.0f, p, zx, zy, ez, e_still);
-    float bx = zx, by = zy, eb = ez;
-    if (raw_on && (raw_x != 0.0f || raw_y != 0.0f)) {
+    if (w.contrast < p.texture_min) return false;
+    float zx, zy, ez;
+    Refine(prev, w, px, py, hx, hy, p, zx, zy, ez, e_with);
+    bx = zx;
+    by = zy;
+    eb = ez;
+    if (raw_on && (raw_x != hx || raw_y != hy)) {
         float rx, ry, er, er0;
         Refine(prev, w, px, py, raw_x, raw_y, p, rx, ry, er, er0);
         if (er <= ez) { bx = rx; by = ry; eb = er; }
     }
     // Explaining the picture: a small error in itself, and small beside the window's own contrast
     // (in a low-contrast window every position leaves a small error).
-    const float limit = (std::min)(p.image_abs, p.image_rel * w.contrast);
-    if (eb > limit) {
-        approximate();
+    limit = (std::min)(p.image_abs, p.image_rel * w.contrast);
+    return eb <= limit;
+}
+
+inline bool RawOn(const Image& cur, float px, float py, bool have_raw, float raw_x, float raw_y)
+{
+    return have_raw && px + raw_x >= 0.0f && py + raw_y >= 0.0f && px + raw_x <= float(cur.width) && py + raw_y <= float(cur.height);
+}
+
+// One sample for the screen's motion (screen_motion.hpp): the best vector itself, below a pixel,
+// with no preference for exact stillness. A single pixel prefers "still" so that jitter is not
+// reported as motion; over thousands of samples that preference would be a bias (every slow
+// parallax read as zero), and their noise averages out instead. False: not a sample.
+inline bool SamplePixel(const Image& cur, const Image& prev, float px, float py, bool have_raw, float raw_x, float raw_y,
+                        float& vx, float& vy, const Params& p = {})
+{
+    float eb, e_with, limit;
+    return BestVector(cur, prev, px, py, RawOn(cur, px, py, have_raw, raw_x, raw_y), raw_x, raw_y, 0.0f, 0.0f, p, vx, vy, eb, e_with, limit);
+}
+
+// One pixel, at most 33 + 2 * 27 samples. (px, py): its position in the stabilised pictures (raster pixel centre minus the
+// frame's jitter). `raw`: the block search's vector there after the depth-aware expansion, and
+// whether that expansion vouches for it. `screen`: the screen's own motion at this pixel
+// (screen_motion.hpp Evaluate), when there is a valid one.
+inline Result MeasurePixel(const Image& cur, const Image& prev, float px, float py, bool have_raw, float raw_x,
+                           float raw_y, const Params& p = {}, bool have_screen = false, float screen_x = 0.0f,
+                           float screen_y = 0.0f)
+{
+    Result r;
+    const float hx = have_screen ? screen_x : 0.0f, hy = have_screen ? screen_y : 0.0f;
+    float bx, by, eb, e_with, limit;
+    if (!BestVector(cur, prev, px, py, RawOn(cur, px, py, have_raw, raw_x, raw_y), raw_x, raw_y, hx, hy, p, bx, by, eb, e_with, limit)) {
+        if (have_screen) { // follows the screen; with none, nothing is known: vector 0, validity 0
+            r.x = hx;
+            r.y = hy;
+            r.valid = kApproximate;
+            r.why = kScreen;
+        }
         return r;
     }
     r.valid = kMeasured;
-    const bool still = (bx == 0.0f && by == 0.0f) || (e_still <= limit && !(eb <= p.still_ratio * e_still));
-    if (still) r.why = kStill;
+    const bool with = (bx == hx && by == hy) || (e_with <= limit && !(eb <= p.still_ratio * e_with));
+    if (with) { r.x = hx; r.y = hy; r.why = kStill; }
     else { r.x = bx; r.y = by; r.why = kMoving; }
     return r;
 }

@@ -12,7 +12,11 @@
 //  - a moving foreground over a still background gets each its own motion;
 //  - a wrong search vector does not win against what the picture shows;
 //  - motion the search did not find and the picture cannot explain is "not known", never "still";
-//  - a flat area is never a measurement.
+//  - a flat area is never a measurement, and the search's raw vector is never handed on for it
+//    (Cort's Sniper Elite Resistance run, 2026-11-17): it follows the screen's own motion when
+//    there is one (core/screen_motion.hpp), and is "not known" when there is none;
+//  - with a screen motion, a pixel moving with the screen is measured as exactly that, and a thing
+//    moving by itself keeps its own vector.
 // The numbers asserted are loose bounds around what this reference measures today; the printed
 // lines are the measurements themselves.
 #include "test_support.hpp"
@@ -118,7 +122,7 @@ Tally Measure(const Pair& pair, const std::function<void(float, float, float&, f
             else if (r.why == kStill) ++t.still;
             else if (r.valid > 0) ++t.approximate;
             else ++t.nothing;
-            CHECK(r.valid == kMeasured ? (r.why == kMoving || r.why == kStill) : r.valid == kApproximate ? (r.why == kUnconfirmed || r.why == kOutside) : r.why == kNothing);
+            CHECK(r.valid == kMeasured ? (r.why == kMoving || r.why == kStill) : r.why == kNothing); // no screen motion given: nothing is approximate
             CHECK(r.valid > 0 || (r.x == 0 && r.y == 0));
             if (r.valid == kMeasured) {
                 float tx = 0, ty = 0;
@@ -157,10 +161,12 @@ int main()
         {"a still scene measures as exactly still, with and without jitter", [] {
             for (int edges = 0; edges < 2; ++edges) {
                 const Tally plain = Measure(Pan(0, edges != 0, false), Uniform(0, 0), Search(true, 0, 0), edges ? "still, edges, no jitter" : "still, no jitter");
-                CHECK(plain.moving == 0 && plain.nothing == 0 && plain.p95 == 0);
+                // The flat pixels between the edges are not known: no screen motion is given here.
+                const double flat = edges ? 0.12 : 0.02;
+                CHECK(plain.moving == 0 && plain.Share(plain.nothing) < flat && plain.p95 == 0);
                 const Tally jittered = Measure(Pan(0, edges != 0, true), Uniform(0, 0), Search(true, 0, 0), edges ? "still, edges, jitter only" : "still, jitter only");
                 // Jitter alone is not motion: most of the picture reads exactly still, the rest within a tenth of a pixel.
-                CHECK(jittered.Share(jittered.still) > 0.80 && jittered.nothing == 0);
+                CHECK(jittered.Share(jittered.still) > 0.80 && jittered.Share(jittered.nothing) < flat);
                 CHECK(jittered.p95 < 0.12f);
                 CHECK(std::fabs(jittered.mean_x) < 0.02 && std::fabs(jittered.mean_y) < 0.02);
             }
@@ -171,13 +177,13 @@ int main()
                 std::snprintf(name, sizeof name, "pan %.3f px, search says 0", d);
                 const Tally t = Measure(Pan(d, false, true), Uniform(-d, 0), Search(true, 0, 0), name);
                 // Measured as motion on most of a textured picture, in the right direction, no cutoff:
-                CHECK(t.Share(t.moving) > 0.60 && t.nothing == 0);
+                CHECK(t.Share(t.moving) > 0.60 && t.Share(t.nothing) < 0.02);
                 CHECK(t.mean_x < -0.5 * d && t.mean_x > -1.2 * d && std::fabs(t.mean_y) < 0.03);
                 // The worst a pixel can be is "read as still": an error of the pan itself, never more.
                 CHECK(t.p95 <= d + 0.02f);
                 std::snprintf(name, sizeof name, "pan %.3f px, edges", d);
                 const Tally e = Measure(Pan(d, true, true), Uniform(-d, 0), Search(true, 0, 0), name);
-                CHECK(e.mean_x < -0.25 * d && e.mean_x > -1.3 * d && e.nothing == 0);
+                CHECK(e.mean_x < -0.25 * d && e.mean_x > -1.3 * d && e.Share(e.nothing) < 0.12);
             }
         }},
         {"a 3.4 px pan with the search's whole-pixel answer is measured below a pixel", [] {
@@ -227,17 +233,58 @@ int main()
             const Tally t = Measure(Pan(3.4f, false, true), Uniform(-3.4f, 0), Search(false, 0, 0), "pan 3.4 px, no search vector");
             CHECK(t.Share(t.nothing) > 0.93 && t.Share(t.still) < 0.02 && t.approximate == 0);
         }},
-        {"a flat area is never a measurement", [] {
+        {"a flat area is never a measurement and never gets the search's vector", [] {
             const auto flat = [](float, float) { return 0.4f; };
+            // No screen motion to follow: not known, whatever the search says.
             const Tally with = Measure(MakePair(flat, flat, true), Uniform(0, 0), Search(true, -3, 0), "flat, search says 3");
-            CHECK(with.approximate == with.pixels);
+            CHECK(with.nothing == with.pixels && with.approximate == 0);
             const Tally without = Measure(MakePair(flat, flat, true), Uniform(0, 0), Search(false, 0, 0), "flat, no search vector");
             CHECK(without.nothing == without.pixels);
-            // The search's vector for a point that came from outside the frame is handed on, marked as such.
             const Pair pair = MakePair(flat, flat, false);
             const Image cur{pair.current.data(), kW, kH}, prev{pair.previous.data(), kW, kH};
-            const Result r = MeasurePixel(cur, prev, 2.5f, 50.5f, true, -9, 0);
-            CHECK(r.why == kOutside && r.valid == kApproximate && r.x == -9 && r.y == 0);
+            // A search vector pointing outside the frame is not handed on either.
+            const Result out = MeasurePixel(cur, prev, 2.5f, 50.5f, true, -9, 0);
+            CHECK(out.why == kNothing && out.valid == 0 && out.x == 0 && out.y == 0);
+            // With a screen motion the flat pixel follows it exactly, marked as an approximation.
+            const Result follows = MeasurePixel(cur, prev, 80.5f, 50.5f, true, -9, 4, {}, true, -1.75f, 0.5f);
+            CHECK(follows.why == kScreen && follows.valid == kApproximate && follows.x == -1.75f && follows.y == 0.5f);
+        }},
+        {"with a screen motion, what moves with the screen is measured as that and the rest keeps its own vector", [] {
+            // The whole picture pans by 3.4 px; the screen's motion says so (as a fit would), the search says 3.
+            const Pair pan = Pan(3.4f, false, true);
+            const Image cur{pan.current.data(), kW, kH}, prev{pan.previous.data(), kW, kH};
+            int with = 0, own = 0, total = 0;
+            float worst = 0;
+            for (int y = 10; y < kH - 10; ++y)
+                for (int x = 10; x < kW - 10; ++x) {
+                    const Result r = MeasurePixel(cur, prev, float(x) + 0.5f - pan.jitter[0], float(y) + 0.5f - pan.jitter[1], true, -3, 0, {}, true, -3.4f, 0);
+                    ++total;
+                    if (r.why == kStill) { ++with; CHECK(r.x == -3.4f && r.y == 0 && r.valid == kMeasured); }
+                    else if (r.why == kMoving) { ++own; worst = (std::max)(worst, std::hypot(r.x + 3.4f, r.y)); }
+                }
+            std::printf("  pan 3.4 px with the screen's motion given: with the screen %5.1f%%  own vector %5.1f%%  worst own error %.3f\n",
+                        100.0 * with / total, 100.0 * own / total, worst);
+            CHECK(with > total * 9 / 10 && worst < 0.6f);
+            // A square sliding by 2.5 px over still ground, and the screen's motion is "still": the square keeps its own vector.
+            const auto square = [](float x, float y) { return 0.5f + 0.45f * std::sin(x * 0.9f) * std::sin(y * 0.8f + 0.5f); };
+            const auto world = [=](float shift) {
+                return [=](float x, float y) {
+                    const float sx = x - shift;
+                    return sx >= 50 && sx < 110 && y >= 30 && y < 90 ? square(sx, y) : Ground(x, y, false);
+                };
+            };
+            const Pair pair = MakePair(world(0), world(2.5f), true);
+            const Image c2{pair.current.data(), kW, kH}, p2{pair.previous.data(), kW, kH};
+            int moving = 0, inside = 0;
+            double mean = 0;
+            for (int y = 38; y < 84; ++y)
+                for (int x = 60; x < 104; ++x) {
+                    const Result r = MeasurePixel(c2, p2, float(x) + 0.5f - pair.jitter[0], float(y) + 0.5f - pair.jitter[1], true, -3, 0, {}, true, 0, 0);
+                    ++inside;
+                    if (r.why == kMoving) { ++moving; mean += r.x; }
+                }
+            CHECK(moving > inside * 9 / 10);
+            NEAR(mean / moving, -2.5, 0.05);
         }},
         {"through the arbiter a measured field keeps its values and is never labelled the game's own", [] {
             // Astra's correction 5: the tier-1 arithmetic is reused, the label and the counter are not.
