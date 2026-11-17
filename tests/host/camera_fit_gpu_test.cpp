@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 using M = std::array<double, 16>;
@@ -131,6 +132,70 @@ int main() {
     auto output = test::CreateTexture(d.device.Get(), W, H, DXGI_FORMAT_R32G32_FLOAT, U, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto prov = test::CreateTexture(d.device.Get(), W, H, DXGI_FORMAT_R8_UINT, U, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto rb = test::CreateBuffer(d.device.Get(), W * H * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    // The independent native-motion source must not read an absent camera.
+    // This tests real GPU arbitration, not optical-flow estimation or DLAA quality.
+    // Estimated total flow will need its own provenance when that API is added.
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> total(size_t(W)*H*2), validity(size_t(W)*H,1.f);
+        for (size_t i=0;i<size_t(W)*H;++i) {
+            switch (i%8) {
+            case 0: total[i*2]=total[i*2+1]=0; break; // valid still image
+            case 1: total[i*2]=.125f; total[i*2+1]=-.0625f; break;
+            case 2: total[i*2]=128; total[i*2+1]=-96; break;
+            case 3: total[i*2]=4; total[i*2+1]=5; validity[i]=0; break;
+            case 4: total[i*2]=4; total[i*2+1]=5; validity[i]=nan; break;
+            case 5: total[i*2]=nan; total[i*2+1]=5; break;
+            case 6: total[i*2]=2; total[i*2+1]=-3; validity[i]=.25f; break;
+            default: total[i*2]=7; total[i*2+1]=8; validity[i]=0; break;
+            }
+        }
+        auto native = upload(total.data(),8,DXGI_FORMAT_R32G32_FLOAT);
+        auto valid = upload(validity.data(),4,DXGI_FORMAT_R32_FLOAT);
+        REQUIRE(native && valid && output && prov && rb);
+        constexpr unsigned prov_pitch=(W+255u)&~255u;
+        auto prov_rb=test::CreateBuffer(d.device.Get(),prov_pitch*H,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        REQUIRE(prov_rb);
+        na::motion::gpu::Inputs in{};
+        in.tier1_valid_flag=true; in.tier1_motion=native.Get(); in.tier1_valid=valid.Get();
+        // A residual cannot fill missing total motion when there is no camera.
+        in.tier3_valid_flag=true; in.tier3_residual=native.Get();
+        in.config.residual_snap_px=.25f; in.config.residual_max_px=1.f;
+        for (float& v:in.inv_view_proj_current.m) v=nan;
+        for (float& v:in.view_proj_previous.m) v=nan;
+        in.jitter_current_px[0]=in.jitter_current_px[1]=nan;
+        na::motion::gpu::Outputs o{};
+        o.xy=output.Get(); o.provenance=prov.Get(); o.width=W; o.height=H;
+        REQUIRE(arbiter.Dispatch(l.list.Get(),in,o,0));
+        auto copy=[&](ID3D12Resource* from,ID3D12Resource* to,DXGI_FORMAT fmt,unsigned pitch) {
+            auto tr=test::Transition(from,U,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            l.list->ResourceBarrier(1,&tr);
+            D3D12_TEXTURE_COPY_LOCATION src{},dst{};
+            src.pResource=from; src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.pResource=to; dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Footprint={fmt,W,H,1,pitch};
+            l.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+            tr=test::Transition(from,D3D12_RESOURCE_STATE_COPY_SOURCE,U);
+            l.list->ResourceBarrier(1,&tr);
+        };
+        copy(output.Get(),rb.Get(),DXGI_FORMAT_R32G32_FLOAT,W*8);
+        copy(prov.Get(),prov_rb.Get(),DXGI_FORMAT_R8_UINT,prov_pitch);
+        execute(); // test-only GPU wait/readback; never used by live callbacks
+        float* xy=nullptr; uint8_t* provenance=nullptr;
+        REQUIRE(SUCCEEDED(rb->Map(0,nullptr,reinterpret_cast<void**>(&xy))));
+        REQUIRE(SUCCEEDED(prov_rb->Map(0,nullptr,reinterpret_cast<void**>(&provenance))));
+        size_t errors=0;
+        for (unsigned y=0;y<H;++y) for (unsigned x=0;x<W;++x) {
+            const size_t i=size_t(y)*W+x;
+            const bool good=i%8==0 || i%8==1 || i%8==2 || i%8==6;
+            if (provenance[size_t(y)*prov_pitch+x]!=(good?na::motion::NA_MOTION_ENGINE:na::motion::NA_MOTION_INVALID)) ++errors;
+            for (unsigned c=0;c<2;++c) if (xy[i*2+c]!=(good?total[i*2+c]:0.f)) ++errors;
+        }
+        const D3D12_RANGE none{0,0}; rb->Unmap(0,&none); prov_rb->Unmap(0,&none);
+        std::printf("camera-absent native motion: %zu mismatched components/provenance in %u pixels\n",errors,W*H);
+        CHECK(errors==0);
+    }
 
     struct Result { bool collected = false; na::motion::gpu::FitResult fit; double err_fixed = 1e9, err_plain = 0; };
     // One case: fit, then arbiter tier 2 with and without the fix; mean error vs the true motion.

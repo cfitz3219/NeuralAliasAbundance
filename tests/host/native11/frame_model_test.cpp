@@ -101,6 +101,32 @@ static std::vector<uint8_t> CameraBlock(float cx, float cz, bool column_major)
 
 int main()
 {
+    // Scene/depth/boundary selection already works without a discovered camera.
+    // Keep that property while the provider's separate camera gate is removed.
+    {
+        FrameModel with_camera, without_camera;
+        Setup(with_camera); Setup(without_camera);
+        const auto ordinary = Frame();
+        auto no_camera = ordinary;
+        for (auto& e : no_camera) {
+            std::fill(std::begin(e.cb), std::end(e.cb), Id{0});
+            std::fill(std::begin(e.cb_first), std::end(e.cb_first), uint16_t{0});
+            std::fill(std::begin(e.cb_count), std::end(e.cb_count), uint16_t{0});
+        }
+        int expected = -1, reads = 0;
+        for (size_t i=0;i<ordinary.size();++i)
+            if (ordinary[i].kind==Kind::Read && ordinary[i].resource==kColor && ++reads==2) expected=int(i);
+        for (int frame=0;frame<8;++frame) {
+            if (frame>=2) with_camera.SetCamera(kCamCb,0);
+            const int a=RunImmediate(with_camera,ordinary), b=RunImmediate(without_camera,no_camera);
+            expect(a==b,"camera absence does not change scene-boundary selection or warmup");
+            if (frame>=2) expect(b==expected,"camera-free scene model fires at the actual tonemap input");
+        }
+        const auto picked=without_camera.Current();
+        expect(picked.valid() && picked.color==kColor && picked.depth==kDepth && picked.camera_cb==0,
+               "scene colour and depth remain usable with no camera binding");
+        expect(without_camera.CameraCandidates(4).empty(),"camera-free case has no bound camera candidates");
+    }
     // ---- selection and the DLSS point, immediate context ----
     {
         FrameModel m;

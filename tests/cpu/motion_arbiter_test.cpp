@@ -151,6 +151,70 @@ int main() { return test::run({
         CHECK(Arbitrate({}, {}, t, {}, o, &s)); CHECK(provenance[0] == NA_MOTION_INVALID && s.pixels_invalid == 1);
         NEAR(out[0],0,0); NEAR(out[1],0,0);
     }},
+    {"complete native motion needs no camera and preserves zero, subpixel and fast motion", [] {
+        // Numerical contract for the already supported independent source. This is
+        // native motion, not permission to label estimated optical flow ENGINE.
+        constexpr uint32_t w = 5, h = 2, stride = 14;
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float samples[10][2] = {{0,0}, {.125f,-.0625f}, {-.25f,.375f},
+            {128,-96}, {-200,80}, {2,-3}, {-4,5}, {.03125f,0}, {0,-.03125f}, {9,11}};
+        std::array<float, stride * h> field; field.fill(nan); // poison row padding
+        std::array<float, w * h * 2> out{};
+        std::array<uint8_t, w * h> provenance{};
+        for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x)
+            for (uint32_t c = 0; c < 2; ++c) field[y * stride + x * 2 + c] = samples[y * w + x][c];
+        Tier1Input native{true, {field.data(),w,h,stride}, {}};
+        Tier2Input absent{}; // no depth, no camera, no manufactured identity matrix
+        for (float& f : absent.inv_view_proj_current.m) f = nan;
+        for (float& f : absent.view_proj_previous.m) f = nan;
+        absent.jitter_current_px[0] = absent.jitter_current_px[1] = nan;
+        Output o{out.data(),provenance.data(),w,h}; Stats s;
+        // Residual limits must never clip complete motion or erase slow pans.
+        CHECK(Arbitrate(native, absent, {}, {.25f, 1.f}, o, &s));
+        for (uint32_t i = 0; i < w * h; ++i) {
+            CHECK(provenance[i] == NA_MOTION_ENGINE);
+            NEAR(out[i * 2], samples[i][0], 0);
+            NEAR(out[i * 2 + 1], samples[i][1], 0);
+        }
+        CHECK(s.pixels_engine == w * h && s.pixels_camera == 0 && s.pixels_invalid == 0);
+        CHECK(s.pixels_residual_added == 0 && s.pixels_residual_clamped == 0 && s.pixels_residual_snapped == 0);
+    }},
+    {"absent motion is distinct from valid stationary motion without a camera", [] {
+        const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+        float native[]{0,0, .125f,-.25f, 5,5, 7,7, 9,9, inf,1, 4,4, 2,-3};
+        float valid[]{1,1,0,-1,nan,1,2,.25f};
+        float residual[16]; std::fill(std::begin(residual),std::end(residual),3.f);
+        float out[16]{}; uint8_t provenance[8]{};
+        Tier1Input t1{true,{native,8,1,16},{valid,8,1,8}};
+        Tier3Input t3{}; t3.valid=true; t3.residual={residual,8,1,16};
+        Output o{out,provenance,8,1}; Stats s;
+        CHECK(Arbitrate(t1, {}, t3, {}, o, &s));
+        for (uint32_t i = 0; i < 8; ++i) {
+            const bool accepted = i == 0 || i == 1 || i == 7;
+            CHECK(provenance[i] == (accepted ? NA_MOTION_ENGINE : NA_MOTION_INVALID));
+            NEAR(out[i * 2], accepted ? native[i * 2] : 0, 0);
+            NEAR(out[i * 2 + 1], accepted ? native[i * 2 + 1] : 0, 0);
+        }
+        // Fractional confidence admits a vector; it must not shrink its displacement.
+        CHECK(s.pixels_engine == 3 && s.pixels_invalid == 5 && s.pixels_rejected == 4);
+        CHECK(s.pixels_camera == 0 && s.pixels_residual_added == 0);
+    }},
+    {"optional camera loss cannot change already valid complete motion", [] {
+        float depth[]{.4f,.6f}, motion[]{.125f,-.25f, 0,0}, residual[]{50,50,50,50};
+        float out[4]{}; uint8_t provenance[2]{}; Stats s;
+        Tier1Input native{true,{motion,2,1,4},{}};
+        Tier3Input correction{}; correction.valid=true; correction.residual={residual,2,1,4};
+        Output o{out,provenance,2,1};
+        for (bool have_camera : {true,false,true}) {
+            auto c = camera(depth,2); c.valid=have_camera;
+            c.view_proj_previous.m[12]=20; // deliberately conflicting camera motion
+            c.jitter_current_px[0]=.375f; c.jitter_current_px[1]=-.25f;
+            CHECK(Arbitrate(native,c,correction,{},o,&s));
+            for (uint32_t i=0;i<4;++i) NEAR(out[i],motion[i],0);
+            CHECK(provenance[0]==NA_MOTION_ENGINE && provenance[1]==NA_MOTION_ENGINE);
+            CHECK(s.pixels_engine==2 && s.pixels_camera==0 && s.pixels_residual_added==0);
+        }
+    }},
     {"snap/clamp preserve provenance and bounded residual", [] {
         float depth=.5f, r[]{.1f,0}, out[2]{}; uint8_t p[1]{}; Output o{out,p,1,1}; Stats s;
         Tier3Input t{}; t.valid=true; t.residual={r,1,1,2};
