@@ -1,14 +1,14 @@
 // Shared pipeline construction adapted from j2_flow.cpp.
+    const auto compile = [](const char* entry, ComPtr<ID3DBlob>& shader) {
+        return compile_flow_shader(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", entry, shader);
+    };
     ComPtr<ID3DBlob> cs_encode, cs_accept, cs_measure, cs_cut_state, cs_cut_show, err;
-    if (FAILED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "encode", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_encode, &err)) ||
-        FAILED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "accept", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_accept, &err)))
+    if (!compile("encode",cs_encode) || !compile("accept",cs_accept))
         return false;
     // The camera-free programs. A failure here leaves the residual path above working: measured
     // motion is then unavailable and says so (Record, Frame::total).
     const bool camera_free =
-        SUCCEEDED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "measure", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_measure, &err)) &&
-        SUCCEEDED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "cut_state", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_cut_state, &err)) &&
-        SUCCEEDED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "cut_show", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_cut_show, &err));
+        compile("measure",cs_measure) && compile("cut_state",cs_cut_state) && compile("cut_show",cs_cut_show);
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 8;
@@ -62,7 +62,7 @@
         bool all = camera_free && g.pso_measure;
         for (int i = 0; i < 3 && all; ++i) {
             ComPtr<ID3DBlob> cs;
-            all = SUCCEEDED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, entries[i], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err));
+            all = compile(entries[i],cs);
             if (all) {
                 pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
                 all = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(states[i]->ReleaseAndGetAddressOf())));
@@ -78,7 +78,7 @@
         bool all = true;
         for (int i = 0; i < 4 && all; ++i) {
             ComPtr<ID3DBlob> cs;
-            all = SUCCEEDED(D3DCompile(na::j2::kCandidateShader, sizeof na::j2::kCandidateShader - 1, "j2_candidates", nullptr, nullptr, entries[i], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err));
+            all = compile_flow_shader(na::j2::kCandidateShader, sizeof na::j2::kCandidateShader - 1, "j2_candidates", entries[i], cs);
             if (all) {
                 pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
                 all = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(states[i]->ReleaseAndGetAddressOf())));

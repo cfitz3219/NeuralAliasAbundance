@@ -14,6 +14,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 namespace na::j2::compute_flow {
 std::atomic<uint32_t> g_loosen{50}; // SetLoosen; read at each Record
@@ -44,6 +45,7 @@ struct Constants {unsigned w,h,ew,eh,mode,block,cost,cost_max,offset,gw,gh;float
 static_assert(sizeof(Constants)==28*4,"root constants");
 constexpr unsigned kTable=12,kUav=8; // descriptors per table: SRVs t0..t7, then UAVs u0..u3
 constexpr unsigned kTables=8; // per recording: encode, accept or measure, the scene-cut state, the scene-cut picture, the frame candidates, the screen fit's three programs
+constexpr unsigned kCutTile=32; // pixels per group axis in flow_shaders.hpp cut_show
 constexpr unsigned kFitHead=20,kFitValues=na::motion::screen::kValues; // flow_shaders.hpp FIT_HEAD, FIT_VALUES
 constexpr unsigned kReadback=192; // counters 0..39, timestamps 48..63, the frame candidates' words 64..103, the screen fit's head 112..191
 static_assert(kFitValues==81,"flow_shaders.hpp FIT_VALUES");
@@ -63,7 +65,7 @@ struct Context {
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;unsigned w=0,h=0,stride=0;int last=-1;
     DXGI_FORMAT image_format=DXGI_FORMAT_R8G8B8A8_UNORM;
     ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> pso_encode,pso_accept;
-    ComPtr<ID3D12PipelineState> pso_measure,pso_cut_state,pso_cut_show; // the camera-free programs; null when they did not build
+    ComPtr<ID3D12PipelineState> pso_measure,pso_cut_state,pso_cut_show;
     ComPtr<ID3D12Resource> raw,expanded,residual,valid,mask,counters,zero,hist[2];
     ComPtr<ID3D12Resource> total,cut_state; // measured total motion (RG32F); the scene cut's 16-byte state, always UAV
     // VARIANT: flow/frame-candidates (flow_shaders.hpp kCandidateShader). All four programs or none.
@@ -107,15 +109,46 @@ struct Context {
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=DXGI_FORMAT_R32_TYPELESS;d.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;d.Buffer.NumElements=words;d.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
         device->CreateUnorderedAccessView(r,nullptr,&d,cpu(slot,table,i));
     }
-    // one=true: a single thread group (the scene-cut state); groups_x given: that many groups; otherwise the whole picture.
-    void dispatch(ID3D12GraphicsCommandList* l,unsigned slot,unsigned table,ID3D12PipelineState* pso,const Constants& c,bool one=false,unsigned groups_x=0,unsigned groups_y=0){
-        ID3D12DescriptorHeap* heaps[]={leases[slot]->heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetComputeRootSignature(root.Get());l->SetPipelineState(pso);
-        l->SetComputeRootDescriptorTable(0,gpu(slot,table));l->SetComputeRoot32BitConstants(1,sizeof(Constants)/4,&c,0);
+    // Consecutive internal passes may keep the same heap and root signature.
+    // Entry points that follow an external pass must bind them again.
+    void bind_compute(ID3D12GraphicsCommandList* l,unsigned slot,unsigned table){
+        ID3D12DescriptorHeap* heaps[]={leases[slot]->heap.Get()};
+        l->SetDescriptorHeaps(1,heaps);
+        l->SetComputeRootSignature(root.Get());
+        l->SetComputeRootDescriptorTable(0,gpu(slot,table));
+    }
+    // one=true: a single group. With groups_x supplied, use that explicit grid.
+    void dispatch_bound(ID3D12GraphicsCommandList* l,ID3D12PipelineState* pso,const Constants& c,bool one=false,unsigned groups_x=0,unsigned groups_y=0){
+        l->SetPipelineState(pso);
+        l->SetComputeRoot32BitConstants(1,sizeof(Constants)/4,&c,0);
         if(one)l->Dispatch(1,1,1);else if(groups_x)l->Dispatch(groups_x,groups_y,1);else l->Dispatch((w+7)/8,(h+7)/8,1);
+    }
+    void dispatch(ID3D12GraphicsCommandList* l,unsigned slot,unsigned table,ID3D12PipelineState* pso,const Constants& c,bool one=false,unsigned groups_x=0,unsigned groups_y=0){
+        bind_compute(l,slot,table);
+        dispatch_bound(l,pso,c,one,groups_x,groups_y);
     }
 };
 std::mutex mutex;std::shared_ptr<Context> current;Stats stats;uint64_t last_submit_tick=0,sample_tick=0;
 void reason(const char* r){strncpy_s(stats.reason,r,_TRUNCATE);}
+bool compile_flow_shader(const char* source,size_t bytes,const char* name,const char* entry,ComPtr<ID3DBlob>& result){
+    // Fixed source strings and entry point names. Bytecode has no dependency on
+    // the device, queue, or extent. Each context still owns its own pipelines.
+    // This is called only while holding the flow mutex.
+    struct Shader {
+        const char* source;
+        const char* entry;
+        ComPtr<ID3DBlob> bytes;
+    };
+    static std::vector<Shader> cache;
+    for(const auto& shader:cache){
+        if(shader.source!=source||std::strcmp(shader.entry,entry)!=0)continue;
+        result=shader.bytes;
+        return true;
+    }
+    if(FAILED(D3DCompile(source,bytes,name,nullptr,nullptr,entry,"cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&result,nullptr)))return false;
+    cache.push_back({source,entry,result});
+    return true;
+}
 bool programs(Context& g){
 #include "compute_flow_programs.inc"
 }
@@ -194,13 +227,19 @@ void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto&
             D3D12_RANGE none{};s.readback->Unmap(0,&none);}}
     s.pair=false;
 }}
-bool prepare_slot(Context& c,Slot& slot){
+bool prepare_slot(Context& c,unsigned index){
+    auto& slot=*c.leases[index];
     if(slot.heap)return true;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,kTables*kTable,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
     if(FAILED(c.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&slot.heap))) ||
        !c.buffer(kReadback,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST,slot.readback)){slot.heap.Reset();return false;}
     D3D12_QUERY_HEAP_DESC qd{};qd.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;qd.Count=2;
-    c.device->CreateQueryHeap(&qd,IID_PPV_ARGS(&slot.timestamps));return true;
+    c.device->CreateQueryHeap(&qd,IID_PPV_ARGS(&slot.timestamps));
+    // Null views and the default counter binding are immutable for this slot.
+    // Each pass overwrites its own live bindings before dispatch. The only
+    // optional live binding is measure's model SRV, which is set even if null.
+    for(unsigned table=0;table<kTables;++table)c.defaults(index,table);
+    return true;
 }
 }
 Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resource* color,ID3D12Resource* depth,
@@ -236,7 +275,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     const auto in_use=[](const Slot& s){return (s.lease && !s.lease.Retired()) || (s.after && !s.after.Retired());};
     unsigned work=0;while(work<c->leases.size() && in_use(*c->leases[work]))++work;
     if(work==c->leases.size())c->leases.push_back(std::make_unique<Slot>());
-    auto& slot=*c->leases[work];if(!prepare_slot(*c,slot)){++stats.unavailable;reason("AMD recording descriptor allocation failed; camera motion used");return {};}
+    auto& slot=*c->leases[work];if(!prepare_slot(*c,work)){++stats.unavailable;reason("AMD recording descriptor allocation failed; camera motion used");return {};}
     int image=-1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)!=c->last && free(*c->images[j])){image=static_cast<int>(j);break;}
     if(image<0){auto next=std::make_unique<Image>();if(!c->tex(c->image_format,next->tex) || !c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->raw_color)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
         image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));}
@@ -267,7 +306,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     cb.jitter_x=encode.x;cb.jitter_y=encode.y;
     if(slot.timestamps)l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
     move(l,im.tex.Get(),S,U);move(l,im.raw_color.Get(),S,U);
-    c->defaults(work,0);c->srv(work,0,0,color,d.Format);c->uav(work,0,kUav+0,im.tex.Get(),c->image_format);
+    c->srv(work,0,0,color,d.Format);c->uav(work,0,kUav+0,im.tex.Get(),c->image_format);
     c->uav(work,0,kUav+3,im.raw_color.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
     c->dispatch(l,work,0,c->pso_encode.Get(),cb);order(l);move(l,im.tex.Get(),U,S);move(l,im.raw_color.Get(),U,S);++stats.recorded;
     if(!pair){++stats.waiting_history;reason(f.total?"Measured motion: this is the first picture of a pair":"AMD flow capturing matching scene history; camera motion used");return t;}
@@ -288,13 +327,14 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         const unsigned groups_x=(cb.gw+7)/8,groups_y=(cb.gh+7)/8;
         move(l,c->grid.Get(),S,U);
         move(l,c->top.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->top.Get(),0,c->zero.Get(),0,48);move(l,c->top.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
-        c->defaults(work,4);c->srv(work,4,0,c->engine.Grid(),DXGI_FORMAT_R16G16_SINT);
+        c->srv(work,4,0,c->engine.Grid(),DXGI_FORMAT_R16G16_SINT);
         c->srv(work,4,5,im.tex.Get(),c->image_format);c->srv(work,4,6,prev.tex.Get(),c->image_format);
         c->uav(work,4,kUav+0,c->votes.Get(),DXGI_FORMAT_R32_UINT);c->uav(work,4,kUav+1,c->grid.Get(),DXGI_FORMAT_R16G16_SINT);c->raw_uav(work,4,kUav+2,c->top.Get(),12);
-        c->dispatch(l,work,4,c->pso_cand_clear.Get(),cc,false,32,32);order(l);
-        c->dispatch(l,work,4,c->pso_cand_count.Get(),cc,false,groups_x,groups_y);order(l);
-        for(unsigned round=0;round<8;++round){cc.mode=round;c->dispatch(l,work,4,c->pso_cand_pick.Get(),cc,false,groups_x,groups_y);order(l);}
-        c->dispatch(l,work,4,c->pso_cand_apply.Get(),cc,false,cb.gw,cb.gh);order(l); // one thread group per block, one thread per pixel
+        c->bind_compute(l,work,4);
+        c->dispatch_bound(l,c->pso_cand_clear.Get(),cc,false,32,32);order(l);
+        c->dispatch_bound(l,c->pso_cand_count.Get(),cc,false,groups_x,groups_y);order(l);
+        for(unsigned round=0;round<8;++round){cc.mode=round;c->dispatch_bound(l,c->pso_cand_pick.Get(),cc,false,groups_x,groups_y);order(l);}
+        c->dispatch_bound(l,c->pso_cand_apply.Get(),cc,false,cb.gw,cb.gh);order(l); // one thread group per block, one thread per pixel
         move(l,c->grid.Get(),U,S);
         move(l,c->top.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),64,c->top.Get(),0,40);move(l,c->top.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
         grid=c->grid.Get();slot.candidates=true;
@@ -341,27 +381,30 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
             const na::motion::screen::Params fp;
             Constants fc=cb;
             move(l,c->fit_grid.Get(),S,U);
-            c->defaults(work,5);c->srv(work,5,0,depth,DXGI_FORMAT_R32_FLOAT);c->srv(work,5,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,5,3,c->expanded.Get(),DXGI_FORMAT_R32_FLOAT);
+            c->srv(work,5,0,depth,DXGI_FORMAT_R32_FLOAT);c->srv(work,5,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,5,3,c->expanded.Get(),DXGI_FORMAT_R32_FLOAT);
             c->srv(work,5,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);c->srv(work,5,5,im.tex.Get(),c->image_format);c->srv(work,5,6,prev.tex.Get(),c->image_format);
             c->uav(work,5,kUav+0,c->fit_grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);
             c->dispatch(l,work,5,c->pso_fit_sample.Get(),fc,false,(cb.gw+7)/8,(cb.gh+7)/8);order(l);move(l,c->fit_grid.Get(),U,S);
             // The terms start at zero; the head's other words are this pair's own.
             move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->fit_state.Get(),0,c->zero.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
             move(l,c->fit_model.Get(),S,U);
-            c->defaults(work,6);c->srv(work,6,7,c->fit_grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);c->raw_uav(work,6,kUav+2,c->fit_state.Get(),c->fit_words);
-            c->defaults(work,7);c->raw_uav(work,7,kUav+2,c->fit_state.Get(),c->fit_words);c->uav(work,7,kUav+0,c->fit_model.Get(),DXGI_FORMAT_R32G32_FLOAT);
+            c->srv(work,6,7,c->fit_grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);c->raw_uav(work,6,kUav+2,c->fit_state.Get(),c->fit_words);
+            c->raw_uav(work,7,kUav+2,c->fit_state.Get(),c->fit_words);c->uav(work,7,kUav+0,c->fit_model.Get(),DXGI_FORMAT_R32G32_FLOAT);
             const unsigned groups=(cb.gw*cb.gh+63)/64;
             // screen_motion.hpp Fit: one plain step, the reweighted ones, then the fitted terms against the samples once more.
             for(int step=0;step<=fp.steps;++step){const bool last=step==fp.steps;
                 fc.history_dy=last?fp.robust_px:step>0?na::motion::screen::ScaleAt(step,fp):0.f;fc.mode=0;
-                c->dispatch(l,work,6,c->pso_fit_accum.Get(),fc,false,groups,1);order(l);
-                fc.mode=last?1u:0u;c->dispatch(l,work,7,c->pso_fit_solve.Get(),fc,true);order(l);}
+                l->SetComputeRootDescriptorTable(0,c->gpu(work,6));
+                c->dispatch_bound(l,c->pso_fit_accum.Get(),fc,false,groups,1);order(l);
+                fc.mode=last?1u:0u;
+                l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
+                c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,true);order(l);}
             move(l,c->fit_model.Get(),U,S);
             move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),112,c->fit_state.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
             model=c->fit_model.Get();slot.screen=true;
         }
-        c->defaults(work,1);c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
-        c->srv(work,1,0,depth,DXGI_FORMAT_R32_FLOAT);if(model)c->srv(work,1,2,model,DXGI_FORMAT_R32G32_FLOAT);
+        c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
+        c->srv(work,1,0,depth,DXGI_FORMAT_R32_FLOAT);c->srv(work,1,2,model,DXGI_FORMAT_R32G32_FLOAT);
         c->srv(work,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,1,3,c->expanded.Get(),DXGI_FORMAT_R32_FLOAT);
         c->srv(work,1,5,im.tex.Get(),c->image_format);c->srv(work,1,6,prev.tex.Get(),c->image_format);
         c->uav(work,1,kUav+0,c->total.Get(),DXGI_FORMAT_R32G32_FLOAT);c->uav(work,1,kUav+1,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
@@ -371,7 +414,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
             // The scene cut's state, in execution order, for RecordCutShow after DLSS (flow_shaders.hpp cut_state).
             if(!c->cut_seeded){move(l,c->cut_state.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->cut_state.Get(),0,c->zero.Get(),0,16);
                 move(l,c->cut_state.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);slot.cut_seed=true;}
-            c->defaults(work,2);c->srv(work,2,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);c->raw_uav(work,2,kUav+2,c->cut_state.Get(),4);
+            c->srv(work,2,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);c->raw_uav(work,2,kUav+2,c->cut_state.Get(),4);
             c->dispatch(l,work,2,c->pso_cut_state.Get(),cb,true);order(l);
         }
         c->engine.Finish(l);
@@ -394,7 +437,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     ok=ok && c->derive.DispatchDeriveResidual(l,c->raw.Get(),depth,fitted,camera.jitter_current_px,c->residual.Get(),c->valid.Get(),w,h,0,c->expanded.Get(),&slot.derive_heap);
     order(l);move(l,c->residual.Get(),U,S);move(l,c->valid.Get(),U,S);move(l,c->mask.Get(),S,U);
     move(l,c->counters.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->counters.Get(),0,c->zero.Get(),0,40);move(l,c->counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
-    cb.cost=2;c->defaults(work,1);c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
+    cb.cost=2;c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);
     c->srv(work,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,1,2,c->residual.Get(),DXGI_FORMAT_R32G32_FLOAT);
     c->srv(work,1,3,c->valid.Get(),DXGI_FORMAT_R32_FLOAT);c->srv(work,1,5,im.tex.Get(),c->image_format);c->srv(work,1,6,prev.tex.Get(),c->image_format);c->uav(work,1,kUav+1,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
     // Temporal agreement (j2_flow 5c5fb0d/319e2ae): the previous pair's candidates, only when that
@@ -433,9 +476,9 @@ void RecordCutShow(ID3D12GraphicsCommandList* l,const Ticket& t,ID3D12Resource* 
     auto lease=na::nr::native::RetainRecording(l,c);if(!lease)return;
     if(!slot.lease.SameRecording(lease))slot.after=lease;
     const auto od=output->GetDesc();Constants cb{};cb.w=static_cast<unsigned>(od.Width);cb.h=od.Height;
-    c->defaults(t.slot,3);c->srv(t.slot,3,0,colour,colour->GetDesc().Format);c->uav(t.slot,3,kUav+0,output,od.Format);c->raw_uav(t.slot,3,kUav+2,c->cut_state.Get(),4);
-    ID3D12DescriptorHeap* heaps[]={slot.heap.Get()};l->SetDescriptorHeaps(1,heaps);l->SetComputeRootSignature(c->root.Get());l->SetPipelineState(c->pso_cut_show.Get());
-    l->SetComputeRootDescriptorTable(0,c->gpu(t.slot,3));l->SetComputeRoot32BitConstants(1,sizeof(Constants)/4,&cb,0);l->Dispatch((cb.w+7)/8,(cb.h+7)/8,1);order(l);
+    c->srv(t.slot,3,0,colour,colour->GetDesc().Format);c->uav(t.slot,3,kUav+0,output,od.Format);c->raw_uav(t.slot,3,kUav+2,c->cut_state.Get(),4);
+    c->dispatch(l,t.slot,3,c->pso_cut_show.Get(),cb,false,(cb.w+kCutTile-1)/kCutTile,(cb.h+kCutTile-1)/kCutTile);
+    order(l);
 }
 void SetLoosen(uint32_t percent){g_loosen.store(percent>100?100u:percent,std::memory_order_relaxed);}
 void SetFrameCandidates(bool on){g_candidates.store(on,std::memory_order_relaxed);}

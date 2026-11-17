@@ -583,10 +583,19 @@ void cut_state(uint3 id : SV_DispatchThreadID) {
 }
 // After DLSS: t_color is the picture DLSS was given, u_enc its output, w x h the output's size
 // (the same size under DLAA, where this is an exact copy; a plain enlargement otherwise).
+// A group covers a 32x32 tile (compute_flow.cpp kCutTile). On ordinary frames it exits
+// before touching either image. On a cut, the 8x8 lanes write sixteen coalesced patches.
 [numthreads(8, 8, 1)]
-void cut_show(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= w || id.y >= h || u_cnt.Load(4) == 0u) return;
-    u_enc[id.xy] = t_color.SampleLevel(s_lin, (float2(id.xy) + 0.5) / float2(w, h), 0);
+void cut_show(uint3 group : SV_GroupID, uint3 lane : SV_GroupThreadID) {
+    if (u_cnt.Load(4) == 0u) return;
+    const uint2 first = group.xy * 32 + lane.xy;
+    [unroll] for (uint y = 0; y < 4; ++y) {
+        [unroll] for (uint x = 0; x < 4; ++x) {
+            const uint2 p = first + uint2(x, y) * 8;
+            if (p.x < w && p.y < h)
+                u_enc[p] = t_color.SampleLevel(s_lin, (float2(p) + 0.5) / float2(w, h), 0);
+        }
+    }
 }
 )";
 

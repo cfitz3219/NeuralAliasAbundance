@@ -37,6 +37,10 @@ int main(int argc,char** argv){
         }
         return test::finish("j2_screen_motion_gpu_audit");
     }
+    if(argc>1 && !std::strcmp(argv[1],"--overhead-benchmark")) {
+        REQUIRE(screen_audit::ProductionBenchmark(d,3440,1440,true)==0);
+        return test::finish("j2_overhead_benchmark");
+    }
     if(argc>1 && !std::strcmp(argv[1],"--screen-benchmark")) {
         REQUIRE(screen_audit::ProductionBenchmark(d,1920,1080)==0);
         REQUIRE(screen_audit::ProductionBenchmark(d,3440,1440)==0);
@@ -322,7 +326,11 @@ int main(int argc,char** argv){
             mark();cf::RecordCutShow(l.list.Get(),ticket,white.Get(),show.Get());copy(show.Get(),DXGI_FORMAT_R8G8B8A8_UNORM,w*4,shown.Get());
             execute();cf::Committed(ticket);reset();
             unsigned* data=nullptr;REQUIRE(SUCCEEDED(shown->Map(0,nullptr,reinterpret_cast<void**>(&data))));
-            const unsigned pixel=data[(h/2)*w+w/2]&255u;shown->Unmap(0,nullptr);
+            const unsigned pixel=data[(h/2)*w+w/2]&255u;
+            unsigned wrong_pixels=0;
+            for(unsigned j=0;j<w*h;++j)wrong_pixels+=(data[j]&255u)!=(i==0?250u:47u);
+            CHECK(wrong_pixels==0);
+            shown->Unmap(0,nullptr);
             const auto s=cf::GetStats();std::printf("cut show i=%u reset=%d pixel=%u cuts=%llu cut_frame=%llu\n",i,ticket.cut_reset,pixel,(unsigned long long)s.total_cuts,(unsigned long long)s.total_cut_frame);
             if(i==0){CHECK(s.total_cuts>0);CHECK(pixel==250);}
             else {CHECK(pixel==47);CHECK(ticket.cut_reset==(i==1));}
