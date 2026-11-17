@@ -180,6 +180,10 @@ if(WIN32 AND MSVC AND TARGET host_observe_producers)
   add_test(NAME na.host.diagnostic_adapter_camera_live COMMAND na_diagnostic_adapter --camera-live)
   set_tests_properties(na.host.diagnostic_adapter_camera_live PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
   set_tests_properties(na.host.diagnostic_adapter PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
+  # The three runs are one executable writing one settings file and one log beside it, and each
+  # refuses to start when that settings file is already there: never two at once.
+  set_tests_properties(na.host.diagnostic_adapter na.host.diagnostic_adapter_camera_off na.host.diagnostic_adapter_camera_live
+    PROPERTIES RESOURCE_LOCK na_diagnostic_adapter_files)
   if(Python3_Interpreter_FOUND AND NA_GAME_ADAPTER_LIB STREQUAL "na_discovery_diagnostics")
     add_test(NAME na.host.diagnostic_dll_exit COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_LIST_DIR}/test_diagnostic_dll_exit.py" "$<TARGET_FILE:NeuralAliasDXGI>")
