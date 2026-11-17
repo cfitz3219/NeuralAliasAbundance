@@ -2428,12 +2428,6 @@ void depth_frame_end_locked()
     }
     g.depth_post_scene = false;
 }
-// Draw-replay probe (SE5 smear, 2026-11-06): while DLAA/upscaling runs, count the scene draws that
-// match a draw of the previous frame, and whether their vertex buffers stayed put. One
-// replay_probe event at the first frame, then every 600 frames, with sums since the last one.
-struct ReplayProbeSums { uint64_t frames = 0, draws = 0, matched = 0, same = 0, moved = 0, untracked = 0, stages = 0, instanced = 0, unique = 0; };
-ReplayProbeSums g_rp_sum;
-uint64_t g_rp_events = 0;
 struct ReplayUse final : na::observe::ReplayUse {
     na::nr::native::RecordingLease lease;
     bool Ready(ID3D12CommandQueue* queue) const override { return lease.Ready(queue); }
@@ -2449,17 +2443,16 @@ std::shared_ptr<na::observe::ReplayUse> retain_replay(ID3D12GraphicsCommandList*
     use->lease = std::move(lease);
     return use;
 }
-void replay_probe_frame()
+void update_draw_replay()
 {
     const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
 
     // Replay is optional and only uses the scene command list used by inline DLAA.
     // Matrix-jittered clip positions are outside this pass's viewport-jitter contract.
     const bool replay = running && g.inline_mode && g.replay_ok && na::settings::Get().j2_draw_replay.load(std::memory_order_relaxed) != 0 && vpj_mode(); // matrix jitter would sit inside the clip positions (not removed yet)
-    static bool probe_on = false;
-    if (probe_on != replay) {
-        probe_on = replay;
-        na::observe::SetReplayProbe(replay);
+    static bool replay_on = false;
+    if (replay_on != replay) {
+        replay_on = replay;
         if (replay) na::observe::SetRasterStateTracking(true);
     }
     na::observe::SetDrawReplay(replay ? g.frame : 0, retain_replay);
@@ -2486,18 +2479,6 @@ void replay_probe_frame()
                 p.last_draws, p.last_pairs, g.replay_fed_frame && g.replay_fed_frame + 2 >= g.frame ? 1 : 0);
         }
     }
-    na::observe::ReplayProbeStats st{};
-    if (!na::observe::ReplayProbeFrame(&st) || !replay) return;
-    auto& m = g_rp_sum;
-    ++m.frames; m.draws += st.draws; m.matched += st.matched; m.same += st.same_buffers; m.moved += st.moved_buffers;
-    m.untracked += st.untracked; m.stages += st.extra_stages; m.instanced += st.instanced; m.unique += st.unique;
-    if (g_rp_events && m.frames < 600) return;
-    ++g_rp_events;
-    na::eventlog::Emit("replay_probe", "frames=%llu draws=%llu matched=%llu same_buffers=%llu moved_buffers=%llu untracked=%llu extra_stages=%llu instanced=%llu unique=%llu last_draws=%u last_prev=%u last_matched=%u",
-        (unsigned long long)m.frames, (unsigned long long)m.draws, (unsigned long long)m.matched, (unsigned long long)m.same,
-        (unsigned long long)m.moved, (unsigned long long)m.untracked, (unsigned long long)m.stages, (unsigned long long)m.instanced,
-        (unsigned long long)m.unique, st.draws, st.prev_draws, st.matched);
-    m = ReplayProbeSums{};
 }
 // Frame start: the sample this frame's scene draws get, only while DLAA (or upscaling) is
 // producing frames, so a stopped DLAA never leaves the game's picture moving.
@@ -8428,7 +8409,7 @@ void OnPresent(ID3D12CommandQueue* queue)
         g.wwii_submitted_camera = {};
         g.native_deferred = {};
         vpj_advance();
-        replay_probe_frame();
+        update_draw_replay();
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         g.inline_sample_locked = false;
         g.inline_camera_submitted = false;
