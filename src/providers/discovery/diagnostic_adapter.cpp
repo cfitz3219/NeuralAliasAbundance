@@ -51,7 +51,25 @@ struct Consumer {
     na::discovery::PassMap pass_map;
     FILE* map_log{};
     unsigned maps_written{}, maps_wanted{}, map_interval{};
+    bool camera_enabled=true;
+    uint64_t skipped_kinds=UINT64_MAX;
 };
+void ApplyCameraPolicy(Consumer& c) {
+    const bool enabled=na::settings::Get().j2_camera.load(std::memory_order_relaxed)!=0;
+    if(c.camera_enabled && !enabled) {
+        c.acquisition.CancelBuffers();
+        for(const auto& item:c.camera_plans) c.retry.erase(item.first);
+        c.camera_plans.clear();c.scanned.clear();
+        c.scan_count=0;
+    }
+    c.camera_enabled=enabled;
+    c.heuristics.SetCameraDiscovery(enabled);
+    const uint64_t mask=(c.map_log?0:kDescriptorKinds) | (enabled?0:(1ull<<NA_EV_SNAPSHOT));
+    if(mask!=c.skipped_kinds) {
+        na_observe_skip_kinds(mask);c.skipped_kinds=mask;
+        if(c.log) std::fprintf(c.log,"{\"type\":\"camera_discovery\",\"enabled\":%s,\"buffer_plans\":%zu}\n",enabled?"true":"false",c.camera_plans.size());
+    }
+}
 // The host owns process lifetime. No destructors race its callback at exit.
 Consumer*& consumer() { static auto* slot=new Consumer*(nullptr);return *slot; }
 wchar_t ini_path[MAX_PATH]{};
@@ -224,6 +242,7 @@ void Report(Consumer& c,const na_observe_status& status,const char* phase) {
 void __cdecl Sink(const na_event_batch* batch,void* user) {
     auto& c=*static_cast<Consumer*>(user);
     try {
+        ApplyCameraPolicy(c);
         na_observe_status status{};status.size_bytes=sizeof(status);
         if(na_observe_query_status(&status)!=NA_OK) return;
         const size_t bytes=size_t(batch->header_bytes)+batch->payload_bytes;
@@ -268,7 +287,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                         std::fprintf(c.map_log,"=== frame map %u (present %llu) ===\n%s\n",c.maps_written+1,c.presents,report.c_str());
                         std::fflush(c.map_log);
                         if(++c.maps_written<c.maps_wanted) c.pass_map.Arm(c.map_interval);
-                        else {std::fputs("stage_m: done\n",c.map_log);std::fclose(c.map_log);c.map_log=nullptr;na_observe_skip_kinds(kDescriptorKinds);}
+                        else {std::fputs("stage_m: done\n",c.map_log);std::fclose(c.map_log);c.map_log=nullptr;ApplyCameraPolicy(c);}
                     }
                 }
                 break;
@@ -319,6 +338,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                 c.truncated_snapshots+=(e.hdr.flags&NA_EVF_TRUNCATED)!=0;
                 c.unmapped_snapshots+=e.status==NA_SNAP_NOT_MAPPED;
                 c.gpu_snapshots+=e.status==NA_SNAP_GPU_WRITTEN;
+                if(!c.camera_enabled) break; // already-queued snapshots after a live policy change
                 // Bounded structural hypotheses only; APP_SYNC_UNKNOWN is never upgraded.
                 // Count captured records, not all statuses: a repeating stream
                 // of unmapped bindings must not phase-lock every scan away
@@ -359,7 +379,7 @@ void __cdecl Sink(const na_event_batch* batch,void* user) {
                 unsigned p=0;
                 for(const auto& d:c.heuristics.RankDepth(2)) if(d.score>0) priority.emplace(std::make_pair(d.resource,uint64_t{0}),++p);
                 for(const auto& k:c.heuristics.RankSceneColor(2)) priority.emplace(std::make_pair(k.resource,uint64_t{0}),++p);
-                for(const auto& b:c.heuristics.RankCameraBlocks(4)) priority.emplace(std::make_pair(b.resource,b.offset),++p);
+                if(c.camera_enabled) for(const auto& b:c.heuristics.RankCameraBlocks(4)) priority.emplace(std::make_pair(b.resource,b.offset),++p);
             }
             for(const auto& pair:c.camera_plans) plans.push_back(pair.second);
             for(const auto& pair:c.resources) {
@@ -474,7 +494,7 @@ extern "C" int na_adapter_start() {
     // Descriptor writes/copies are read only by the Stage M frame maps. Without them the
     // producers keep their slot bookkeeping but emit nothing (SE5 trace 2026-11-05: these
     // events were most of the ring traffic, the worker's memcpy and the ring drops).
-    na_observe_skip_kinds(c->map_log ? 0 : kDescriptorKinds);
+    ApplyCameraPolicy(*c);
     if(na_observe_start(&cfg,Sink,c)!=NA_OK) {na_observe_skip_kinds(0);std::fclose(c->log);delete c;return 0;}
     consumer()=c;return 1;
 }

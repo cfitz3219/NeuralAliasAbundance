@@ -6334,7 +6334,7 @@ std::atomic<void*> g_copy_probe_user{nullptr};
 // at the submission boundary. APP_SYNC_UNKNOWN always.
 void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
 {
-    if (!na::observe_internal::Started() || !lists) return;
+    if (!na::observe_internal::Started() || !lists || na::observe_internal::KindSkipped(NA_EV_SNAPSHOT)) return;
     constexpr uint32_t kMaxSnaps = 64, kMaxBytes = 4096, kBudget = 64 * 1024;
     struct Out {
         na_ev_snapshot e;

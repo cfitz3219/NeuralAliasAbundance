@@ -77,6 +77,15 @@ public:
         if (SampleId(session) && SampleId(epoch)) { session_=session; epoch_=epoch; }
     }
     size_t Pending() const { return leases_.size(); }
+    // Camera discovery can stop live while depth/colour sampling continues.
+    // Release only buffer requests; the host retains submitted GPU work until
+    // its fence completes, exactly as it does for resource retirement.
+    void CancelBuffers() noexcept {
+        for(auto it=leases_.begin();it!=leases_.end();) {
+            if(it->plan.buffer) {api_.Release(it->token);it=leases_.erase(it);}
+            else ++it;
+        }
+    }
     // Retirement invalidates every pending range of this resource. Releasing
     // an in-flight token leaves fence-owned GPU cleanup with the host.
     void Retire(uint64_t resource) noexcept {
