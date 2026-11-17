@@ -1,4 +1,5 @@
 // C8a: H1 observation producers. See producers.hpp.
+#include "core/replay_budget.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/observe/producers.hpp"
 
@@ -5422,9 +5423,16 @@ std::atomic<uint64_t> g_rp_stat[32]; // see DrawReplayStats
 enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
                   kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpOtherList,
                   kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpSegments, kRpPendingSegs,
-                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade, kRpStatCount };
+                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade,
+                  kRpNotSampled, kRpDrawTooLarge, kRpFrameFull, kRpStatCount };
 static_assert(kRpStatCount <= 32, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
+// The vertex budget (core/replay_budget.hpp): which draws of a frame are replayed. The frame state
+// is under g_replay_slots_m; g_rp_full_frame lets every later draw of a full frame leave at the door.
+std::atomic<uint64_t> g_rp_budget{0}, g_rp_full_frame{0};
+std::atomic<uint32_t> g_rp_threshold_seen{na::replay_budget::kFull};
+constexpr uint32_t kRpRotateFrames = 240;
+struct RpBudgetFrame { uint64_t frame = 0, used = 0, offered = 0; uint32_t threshold = na::replay_budget::kFull; bool full = false; } g_rpb;
 // 83b0749/8cc8cb6 runs: noted=240 built=0 twin_queued=0 no_recipe=0, so every draw
 // stopped at a gate before the recipe lookup without a count. Each gate is counted.
 enum : uint32_t { kGateNotDirect, kGateNoRetain, kGateNoDepth, kGateNoList, kGateOtherDepth, kGateRenderPass, kGateState, kGateBundle, kGatePredicate, kGateStreamOut,
@@ -5595,6 +5603,8 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
 {
     const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
     if (!frame) return;
+    // This frame has replayed its budget: nothing more to decide for the rest of its draws.
+    if (g_rp_full_frame.load(std::memory_order_relaxed) == frame) { rp_count(kRpFrameFull); return; }
     if (l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) { rp_gate(kGateNotDirect); return; }
     const auto retain = g_rp_retain.load(std::memory_order_acquire);
     if (!retain) { rp_gate(kGateNoRetain); return; }
@@ -5740,6 +5750,24 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     if (!verts) return;
     std::lock_guard<std::mutex> replay_lock(g_replay_slots_m);
     if (frame != g_rp_frame.load(std::memory_order_acquire)) return;
+    if (const uint64_t budget = g_rp_budget.load(std::memory_order_relaxed)) {
+        namespace rb = na::replay_budget;
+        if (g_rpb.frame != frame) { // a new frame: the threshold follows what the last one offered and admitted
+            if (g_rpb.frame) g_rpb.threshold = rb::NextThreshold(g_rpb.threshold, g_rpb.offered, g_rpb.used, budget, g_rpb.full);
+            g_rpb.frame = frame; g_rpb.used = 0; g_rpb.offered = 0; g_rpb.full = false;
+            g_rp_threshold_seen.store(g_rpb.threshold, std::memory_order_relaxed);
+        }
+        switch (rb::Decide(rb::DrawValue(rec.sig, rec.vb, frame, kRpRotateFrames), g_rpb.threshold, verts, g_rpb.used, budget)) {
+        case rb::Verdict::DrawTooLarge: rp_count(kRpDrawTooLarge); return;
+        case rb::Verdict::NotSampled: g_rpb.offered += verts; rp_count(kRpNotSampled); return;
+        case rb::Verdict::FrameFull:
+            g_rpb.full = true;
+            g_rp_full_frame.store(frame, std::memory_order_relaxed);
+            rp_count(kRpFrameFull);
+            return;
+        case rb::Verdict::Admit: g_rpb.offered += verts; g_rpb.used += verts; break;
+        }
+    }
     const HostWorkScope own;
     RpSlot* found = rp_find(frame);
     uint32_t slot_index = found ? static_cast<uint32_t>(found - &rp_slot(0)) : 0;
@@ -9093,6 +9121,10 @@ DepthWriteEvidence ListDepthWriteEvidence(ID3D12CommandList* list, uint64_t dept
     std::memcpy(&e.clear, &d.clear_bits, sizeof d.clear_bits);
     return e;
 }
+void SetDrawReplayBudget(uint64_t expanded_vertices)
+{
+    g_rp_budget.store(expanded_vertices, std::memory_order_relaxed);
+}
 void SetDrawReplay(uint64_t frame, ReplayRetain retain)
 {
     g_rp_retain.store(retain, std::memory_order_release);
@@ -9177,6 +9209,8 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
     out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
     out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired); out->slots = v(kRpSlotsMade);
+    out->not_sampled = v(kRpNotSampled); out->draw_too_large = v(kRpDrawTooLarge); out->frame_full = v(kRpFrameFull);
+    out->budget = g_rp_budget.load(std::memory_order_relaxed); out->budget_threshold = g_rp_threshold_seen.load(std::memory_order_relaxed);
     static const char* const names[kGateCount] = {"not_direct", "no_retain", "no_depth", "no_list", "other_depth", "render_pass", "no_pso", "bundle", "predicated", "stream_out",
         "recording", "no_pipeline", "no_depth_write", "msaa", "viewport", "root_mismatch", "root_unknown", "direct_heap", "vs_uav", "no_vb", "admitted_depth_tested"};
     int used = 0;

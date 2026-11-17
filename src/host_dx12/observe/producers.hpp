@@ -435,9 +435,15 @@ struct DrawReplayStats {
     uint64_t pending_stamped = 0, stamps = 0; // unsubmitted segments used under a GPU stamp check; stamps written at Close
     uint64_t reuse_unretired = 0; // no slot for a frame because writer lists were not reset yet (could execute again)
     uint64_t slots = 0; // position slots created (3 at start, more while SE5 keeps lists)
+    // The vertex budget (core/replay_budget.hpp): draws left out by the sample, draws over half the budget,
+    // draws after a frame reached its limit; the budget in force and the last threshold (65536 = every draw).
+    uint64_t not_sampled = 0, draw_too_large = 0, frame_full = 0, budget = 0;
+    uint32_t budget_threshold = 0;
     char gates[256] = {}; // why scene draws were not replayed: "name=count ..." (only non-zero)
 };
 void SetDrawReplay(uint64_t frame, ReplayRetain retain);
+// Expanded vertices a frame may replay (0 = no budget). Live.
+void SetDrawReplayBudget(uint64_t expanded_vertices);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);
 void GetDrawReplayStats(DrawReplayStats* out);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);

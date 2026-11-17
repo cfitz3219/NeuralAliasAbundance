@@ -2455,6 +2455,7 @@ void update_draw_replay()
         replay_on = replay;
         if (replay) na::observe::SetRasterStateTracking(true);
     }
+    na::observe::SetDrawReplayBudget(na::settings::Get().j2_replay_budget.load(std::memory_order_relaxed));
     na::observe::SetDrawReplay(replay ? g.frame : 0, retain_replay);
     {
         static uint64_t next_log = 0, logs = 0;
@@ -2477,6 +2478,10 @@ void update_draw_replay()
                 (unsigned long long)p.matched_exact, (unsigned long long)p.matched_loose, (unsigned long long)p.unmatched, (unsigned long long)p.verts, (unsigned long long)p.checked,
                 (unsigned long long)p.gpu_read, (unsigned long long)p.gpu_nonzero, (unsigned long long)p.gpu_samples, p.gpu_last,
                 p.last_draws, p.last_pairs, g.replay_fed_frame && g.replay_fed_frame + 2 >= g.frame ? 1 : 0);
+            // The vertex budget: how many draws the sample left out, and why the rest were not replayed.
+            na::eventlog::Emit("draw_replay_budget", "budget=%llu threshold=%u of 65536 not_sampled=%llu draw_too_large=%llu frame_full=%llu replayed=%llu verts=%llu",
+                (unsigned long long)d.budget, d.budget_threshold, (unsigned long long)d.not_sampled, (unsigned long long)d.draw_too_large,
+                (unsigned long long)d.frame_full, (unsigned long long)d.replayed, (unsigned long long)d.vertices);
         }
     }
 }

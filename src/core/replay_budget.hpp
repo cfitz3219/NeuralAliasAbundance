@@ -1,0 +1,85 @@
+#pragma once
+// How much of a frame draw replay may run again (Cort's Sniper Elite Resistance runs, 2026-11-17:
+// replay took the frame from 80 to about 41 fps because it expanded about 3 million vertices every
+// frame, filled its buffer with the first 50 to 80 draws in submission order, refused about 2,300
+// more, and still covered only a tenth of the screen).
+// The rule, with no game in it:
+//   - a frame may replay about `budget` expanded vertices (0 = no budget, the old behaviour);
+//   - which draws are replayed is decided by a number made from the draw's own identity (the same
+//     identity replay matches on), compared with a threshold. The same draw therefore gets the same
+//     answer in adjacent frames, which matching needs, and a lower threshold admits a subset of a
+//     higher one, so a changing threshold only loses the draws at the edge;
+//   - the threshold follows what the last frame offered and admitted, so the admitted share lands on
+//     the budget;
+//   - the identity number changes every `rotate_frames` frames, so over time every draw is tried;
+//   - one draw may take at most half the budget, and a frame stops at 5/4 of it whatever happens.
+// A pixel replay does not cover keeps the measured motion (the arbiter's slot behind tier 1).
+#include <cstdint>
+
+namespace na::replay_budget {
+
+constexpr uint32_t kFull = 65536; // threshold that admits every draw
+
+enum class Verdict : uint32_t { Admit, NotSampled, DrawTooLarge, FrameFull };
+
+// A full 64-bit finalizer per step: a small change of any input (the period counts 0, 1, 2 ...)
+// must change every output bit, or the rotation would only slide the admitted set along.
+inline uint64_t Mix(uint64_t h, uint64_t v)
+{
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ull;
+    return h ^ (h >> 33);
+}
+
+// 0..65535, the same for a draw in every frame of one rotation period.
+inline uint32_t DrawValue(uint64_t sig, uint64_t vb, uint64_t frame, uint32_t rotate_frames)
+{
+    const uint64_t epoch = rotate_frames ? frame / rotate_frames : 0;
+    return static_cast<uint32_t>(Mix(Mix(Mix(0x243f6a8885a308d3ull, sig), vb), epoch) >> 48);
+}
+
+inline uint64_t DrawLimit(uint64_t budget) { return budget / 2; }
+inline uint64_t FrameLimit(uint64_t budget) { return budget + budget / 4; }
+
+// `used`: vertices already admitted this frame.
+inline Verdict Decide(uint32_t value, uint32_t threshold, uint64_t verts, uint64_t used, uint64_t budget)
+{
+    if (!budget) return Verdict::Admit;
+    if (verts > DrawLimit(budget)) return Verdict::DrawTooLarge;
+    if (value >= threshold) return Verdict::NotSampled;
+    if (used + verts > FrameLimit(budget)) return Verdict::FrameFull;
+    return Verdict::Admit;
+}
+
+// The next frame's threshold. `offered`: vertices of every draw that asked last frame and was not
+// too large (admitted or not); `used`: the vertices admitted. Within a rotation period a draw's
+// number is fixed, so the admitted amount is a fixed rising function of the threshold: the
+// threshold is scaled by budget / used, kept within a factor of two of what the offered amount
+// alone says (so one odd frame cannot throw it), and left alone once the frame is within a tenth
+// of the budget. `hit_full`: last frame stopped at its limit, so
+// `offered` is short (draws after the stop are not counted): come down by a quarter at least.
+inline uint32_t NextThreshold(uint32_t current, uint64_t offered, uint64_t used, uint64_t budget, bool hit_full)
+{
+    if (!budget) return kFull;
+    if (!offered) return current ? current : kFull; // nothing asked: no evidence, keep it
+    if (!current) current = 1;
+    uint64_t t;
+    if (hit_full) {
+        t = uint64_t(current) * 3 / 4;
+        if (used > budget) { const uint64_t scaled = uint64_t(current) * budget / used; if (scaled < t) t = scaled; }
+    } else {
+        // Close enough: leave it, so adjacent frames admit exactly the same draws.
+        if (offered > budget && used * 10 >= budget * 9 && used * 10 <= budget * 11) return current;
+        const uint64_t estimate = offered <= budget ? kFull : (budget * kFull) / offered;
+        t = used ? uint64_t(current) * budget / used : estimate;
+        if (t > estimate * 2) t = estimate * 2;
+        if (t < estimate / 2) t = estimate / 2;
+        if (offered <= budget) t = kFull; // the whole view fits
+    }
+    if (t < 1) t = 1;
+    if (t > kFull) t = kFull;
+    return static_cast<uint32_t>(t);
+}
+
+} // namespace na::replay_budget

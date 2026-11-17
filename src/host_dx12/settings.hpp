@@ -124,6 +124,9 @@ struct Settings {
     // Draw replay ([j2] draw_replay, 1 = on): per-object motion from the game's own draws replayed with
     // stream output, fed as engine motion (Cort 2026-11-06, SE5 sweatshirt smear). Off by default (Cort).
     std::atomic<uint32_t> j2_draw_replay{0};
+    // Expanded vertices draw replay may run again per frame ([j2] replay_vertex_budget, 0 = no budget).
+    // 3 million a frame cost about 10 ms on an RTX 5070 Ti at 3440x1440 (Cort's Resistance run, 2026-11-17).
+    std::atomic<uint32_t> j2_replay_budget{1000000};
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};
