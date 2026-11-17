@@ -7,7 +7,7 @@
 #include <utility>
 #include <algorithm>
 
-inline int AuditFlowAmbiguity(test::Device& d,unsigned w,unsigned h)
+inline int AuditFlowAmbiguity(test::Device& d,unsigned w,unsigned h,bool benchmark=false)
 {
     namespace cf=na::j2::compute_flow;namespace tm=na::motion::total;
     constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -23,8 +23,9 @@ inline int AuditFlowAmbiguity(test::Device& d,unsigned w,unsigned h)
     };
     struct Case{const char* name;float pan;bool noise,mixed;};
     for(const auto c:{Case{"waves-still",0,false,false},Case{"waves-3px",3,false,false},Case{"waves-6px",6,false,false},
-                      Case{"waves-reverse6",-6,false,false},Case{"waves-12px",12,false,false},
+                      Case{"waves-reverse6",-6,false,false},Case{"waves-12px",12,false,false},Case{"waves-6.5px",6.5f,false,false},
                       Case{"noise-6px",6,true,false},Case{"mixed-independent",3,true,true}}){
+        if(benchmark && (c.pan==3 && !c.mixed || c.pan<0 || c.pan==12))continue;
         cf::Reset();std::vector<test::ComPtr<ID3D12Resource>> keep;
         std::vector<float> lum[2];test::ComPtr<ID3D12Resource> pictures[2];
         const float object_pan=-6;
@@ -53,6 +54,27 @@ inline int AuditFlowAmbiguity(test::Device& d,unsigned w,unsigned h)
         auto bar=test::Transition(depth.Get(),D3D12_RESOURCE_STATE_COPY_DEST,S);list.list->ResourceBarrier(1,&bar);keep.push_back(up);REQUIRE(execute()==0);reset();
         na::motion::gpu::Inputs independent{};independent.depth=depth.Get();independent.depth_clear=1;
         const float nan=std::numeric_limits<float>::quiet_NaN();for(unsigned j=0;j<16;++j)independent.inv_view_proj_current.m[j]=independent.view_proj_previous.m[j]=nan;
+        if(benchmark){
+            // GPU timestamps cover the existing whole flow stage, with identical input pairs and
+            // alternating directions. Submission waits, timing readbacks and warmup are test-only.
+            // ABBA order reduces clock/thermal ordering bias; this does not time DLSS or a game.
+            for(bool enabled:{false,true,true,false}){
+                cf::Reset();cf::SetFrameCandidates(enabled);std::vector<double> times;
+                for(unsigned i=0;i<26;++i){
+                    cf::Frame f;f.frame=7000+i;f.previous=i?f.frame-1:0;f.generation=102;f.source_generation=102;
+                    f.total=true;f.raster_sample=f.raster_confirmed=true;
+                    cf::Tier3 t;auto ticket=cf::Record(list.list.Get(),d.queue.Get(),pictures[i%2].Get(),depth.Get(),independent,f,t);
+                    REQUIRE(ticket.context);CHECK(ticket.pair==(i!=0));REQUIRE(execute()==0);cf::Committed(ticket);reset();
+                    const auto s=cf::GetStats();if(i>=6){CHECK(s.cand_on==enabled);CHECK(s.ms>0);times.push_back(s.ms);}
+                }
+                std::sort(times.begin(),times.end());const auto s=cf::GetStats();
+                std::printf("candidate timing %s %ux%u on=%d samples=%zu median=%.4f min=%.4f max=%.4f ms pairs=%llu offered=%u changed=%u\n",
+                    c.name,w,h,enabled,times.size(),(times[9]+times[10])*.5,times.front(),times.back(),
+                    (unsigned long long)s.cand_pairs,s.cand_last_offered,s.cand_last_changed);
+                CHECK(s.cand_pairs==(enabled?25u:0u));
+            }
+            cf::Reset();cf::SetFrameCandidates(true);continue;
+        }
         auto motion=test::CreateBuffer(d.device.Get(),size_t(w)*h*8,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
         auto valid=test::CreateBuffer(d.device.Get(),size_t(w)*h*4,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
         for(unsigned i=0;i<2;++i){cf::Frame f;f.frame=6000+i;f.previous=i?6000:0;f.generation=101;f.source_generation=101;f.total=true;f.raster_sample=f.raster_confirmed=true;
@@ -60,6 +82,14 @@ inline int AuditFlowAmbiguity(test::Device& d,unsigned w,unsigned h)
             if(i){REQUIRE(t.total && t.total_valid);copy(t.total,motion.Get(),DXGI_FORMAT_R32G32_FLOAT,w,h,w*8);copy(t.total_valid,valid.Get(),DXGI_FORMAT_R32_FLOAT,w,h,w*4);}
             REQUIRE(execute()==0);cf::Committed(ticket);reset();
         }
+        const auto candidate_stats=cf::GetStats();
+        CHECK(candidate_stats.cand_on);CHECK(candidate_stats.cand_pairs==1);CHECK(candidate_stats.cand_frame==6001);
+        CHECK(candidate_stats.cand_last_changed<=candidate_stats.cand_last_offered);
+        std::printf("candidates %s %ux%u offered=%u changed=%u GPU=%.4fms top:",c.name,w,h,
+            candidate_stats.cand_last_offered,candidate_stats.cand_last_changed,candidate_stats.ms);
+        for(const auto packed:candidate_stats.cand_top)if(packed)std::printf(" (%d,%d)=%u",int(packed&255)-128,int((packed>>8)&255)-128,packed>>16);
+        std::puts("");
+        if(c.pan==0 || !c.mixed && (c.pan==3 || c.noise))CHECK(candidate_stats.cand_last_changed==0);
         // Read the same pair's actual AMD block search separately, without changing production.
         na::ffx_flow::PairFlow search;REQUIRE(search.Init(d.device.Get(),w,h,1));REQUIRE(search.Record(list.list.Get(),pictures[1].Get(),pictures[0].Get(),0));
         const unsigned gw=(w+7)/8,gh=(h+7)/8,row=(gw*4+255u)&~255u;
