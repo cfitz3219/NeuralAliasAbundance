@@ -140,6 +140,7 @@ struct ListState {
     // every resource they reference. Bounded; overflow clears uses_complete.
     std::vector<na_object_id> uses;
     bool uses_complete = true;
+    bool uses_sorted = false; // compact once at capacity, then bounded membership/insertion
     // (render target, depth target or 0) per OMSetRenderTargets in this recording, in order (under bind_m).
     struct Target {
         na_object_id rt = 0, ds = 0;
@@ -152,6 +153,11 @@ struct ListState {
     // Explicit bounded SRV-table observations are a pass-order hint, not proof
     // of a particular AA shader or a requirement for DLAA eligibility.
     std::vector<na_object_id> sampled_textures;
+    // This is historical membership, not the live binding state. A range which
+    // was already recorded at the same descriptor revision adds no information.
+    struct SampledRange { na_object_id heap=0; uint64_t first=0,revision=0; uint32_t count=0; };
+    SampledRange sampled_ranges[16]{};
+    uint32_t sampled_range_next=0;
     std::vector<na_object_id> cleared; // render targets this recording cleared (ClearRenderTargetView)
     // Inline insertion (J2): the game's pipeline state in this recording, so host
     // work recorded INTO the game's list can hand the list back exactly as the game
@@ -3644,13 +3650,20 @@ constexpr size_t kMaxListUses = 4096;
 void add_use_locked(ListState& ls, na_object_id id)
 {
     if (!id || id == NA_UNKNOWN_U64 || (!ls.uses.empty() && ls.uses.back() == id)) return;
-    if (ls.uses.size() >= kMaxListUses) { // compact before giving up (targets are rebound often)
+    if (!ls.uses_sorted && ls.uses.size() >= kMaxListUses) {
         std::sort(ls.uses.begin(), ls.uses.end());
         ls.uses.erase(std::unique(ls.uses.begin(), ls.uses.end()), ls.uses.end());
-        if (ls.uses.size() >= kMaxListUses * 3 / 4) {
-            ls.uses_complete = false;
-            return;
-        }
+        ls.uses_sorted = true;
+    }
+    if (ls.uses_sorted) {
+        // Previously a saturated list sorted all 4096 IDs on EVERY later use,
+        // even duplicates. Keep its compacted set sorted for the rest of this
+        // recording. The small-list append path remains unchanged.
+        const auto at = std::lower_bound(ls.uses.begin(), ls.uses.end(), id);
+        if (at != ls.uses.end() && *at == id) return;
+        if (ls.uses.size() == kMaxListUses) { ls.uses_complete = false; return; }
+        ls.uses.insert(at, id);
+        return;
     }
     ls.uses.push_back(id);
 }
@@ -3882,12 +3895,15 @@ struct On<sl::list::Reset> {
                     ls->evidence_complete = true;
                     ls->uses.clear();
                     ls->uses_complete = true;
+                    ls->uses_sorted = false;
                     ls->targets.clear();
                     ls->insertion.Reset();
                     ls->last_draw_rt = 0;
                     ls->pending_entry = 0;
                     ls->entry_barrier=0;
                     ls->sampled_textures.clear();
+                    std::fill_n(ls->sampled_ranges,16,ListState::SampledRange{});
+                    ls->sampled_range_next=0;
                     ls->cleared.clear();
                     ls->pso = pso;
                     ls->heaps[0] = ls->heaps[1] = nullptr;
@@ -4429,10 +4445,16 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                         const na_root_range& range = rr[rp.first_range + q];
                         if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32 && ls->sampled_textures.size()<256) {
                             const CostScope sampled(kCostSampled);
-
+                            const uint64_t first=uint64_t(slot)+range.table_offset;
+                            const uint32_t count=std::min<uint32_t>(range.num_descriptors,64);
+                            const uint64_t revision=g_operation_revision.load();
+                            const auto seen=std::find_if(std::begin(ls->sampled_ranges),std::end(ls->sampled_ranges),[&](const auto& r){
+                                return r.heap==dh->id&&r.first==first&&r.count==count&&r.revision==revision;
+                            });
+                            if(seen!=std::end(ls->sampled_ranges))continue;
                             SlotShared stripe;
-                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64) && ls->sampled_textures.size()<256; ++k) {
-                                const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                            for (uint32_t k = 0; k < count && ls->sampled_textures.size()<256; ++k) {
+                                const uint64_t index = first + k;
                                 if (index >= dh->count) break;
                                 stripe.lock(dh, index);
                                 const auto& si = dh->info[static_cast<size_t>(index)];
@@ -4441,6 +4463,7 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                                     std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), si.resource) == ls->sampled_textures.end())
                                     ls->sampled_textures.push_back(si.resource);
                             }
+                            ls->sampled_ranges[ls->sampled_range_next++%16]={dh->id,first,revision,count};
                         }
                         if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV || range.table_offset == NA_UNKNOWN_U32) continue;
                         // Cover the complete conventional hardware CB register bank.
@@ -6321,6 +6344,7 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
     uint32_t snaps = 0, total = 0;
     bool budget_reported = false;
     for (uint32_t li = 0; li < count; ++li) {
+        if (budget_reported) return;
         std::vector<ListState::Binding> binds;
         na_object_id lid = 0;
         uint64_t gen = NA_UNKNOWN_U64;
@@ -6330,7 +6354,11 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
             if (!ls) continue;
             gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
             std::lock_guard<std::mutex> bl(ls->bind_m);
-            binds = ls->bindings;
+            // At most the remaining count budget plus its one overflow receipt
+            // can be visited. Do not allocate/copy the other thousands of
+            // historical bindings while holding the game's recording lock.
+            const size_t needed=std::min<size_t>(ls->bindings.size(),kMaxSnaps-snaps+1);
+            binds.assign(ls->bindings.begin(),ls->bindings.begin()+needed);
         }
         for (const ListState::Binding& b : binds) {
             // C9-H3-REVIEW-1 #3: no de-duplication. Every binding keeps its own
@@ -7697,7 +7725,8 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id)
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
+    return ls->uses_sorted ? std::binary_search(ls->uses.begin(),ls->uses.end(),id) :
+        std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
 }
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth)
 {

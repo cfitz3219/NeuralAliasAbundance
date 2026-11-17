@@ -276,10 +276,21 @@ public:
     }
     // Rank (1-based) of a binding among the top camera blocks, 0 if not ranked.
     size_t CameraRank(uint64_t resource, uint64_t offset, size_t top = 8) const {
-        const auto ranked = RankCameraBlocks(top);
-        for (size_t i = 0; i < ranked.size(); ++i)
-            if (ranked[i].resource == resource && ranked[i].offset == offset) return i + 1;
-        return 0;
+        if (!top) return 0;
+        const auto& blocks = Scored().cbv;
+        const auto key = std::make_pair(resource,offset);
+        const auto found = blocks.find(key);
+        if (found == blocks.end() || found->second.draws < 8) return 0;
+        // Most snapshot queries are object constants. Avoid allocating and
+        // sorting every block just to discover one binding is unranked.
+        // Equal draws retain the map key order, like the existing stable_sort.
+        size_t rank = 1;
+        for (const auto& block : blocks) {
+            if (block.second.draws > found->second.draws ||
+                (block.second.draws == found->second.draws && block.first < key))
+                if (++rank > top) return 0;
+        }
+        return rank;
     }
 
     // Render-small (P4-4): the game's whole scene is drawn at `min_scale` of the swapchain or more
