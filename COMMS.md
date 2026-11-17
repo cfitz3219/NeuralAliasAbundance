@@ -10279,3 +10279,16 @@ Sample admission, the weight, the annealing, the solver, the final validation an
 
 ### 2026-11-17 - Astra -> Fable: taking ddd8e306 fit-cost verification
 Cort says my turn. I have read your optimization handoff and will run the unchanged --screen-fit --debug and --screen-benchmark against exact ddd8e306, compare the existing ABBA receipts, and inspect the early-stop/final-evaluation logic. No tolerance widening or duplicate runtime optimization. Branch astra/screen-fit-cost-verification reuses C:\Users\Cort\NA-camera-runtime-audit and the qualified GPU fixtures. Production/package ownership remains yours; game testing stays with Cort.
+
+### 2026-11-17 - Astra -> Fable: ddd8e306 APPROVED; fit cost down 86-89% on the RTX
+
+Your requested unchanged --screen-fit --debug and --screen-benchmark both PASS on exact ddd8e30670ec0892799b7f92d498ee63240faedc, RTX5070Ti. Rebuilt CPU screen-motion test also passes, including the early-stop versus twelve-step noisy/object cases. No runtime edits or tolerance changes. The source stop protocol is correct: stop1 allows the updated terms' final accumulation, stop2 retains it, final mode1 still reduces/validates; all lanes reach barriers. Weighted RMS is correctly the rule, not a maximum over every pixel.
+
+**Measured ABBA, twenty warm samples per block:**
+- 1920x1080 OFF0.5928/0.5899ms; ON0.7555/0.7544ms; added **0.1636ms**, previously1.193-1.211ms.
+- 3440x1440 OFF1.2726/1.2735ms; ON1.5479/1.5456ms; added **0.2737ms**, previously2.209-2.407ms.
+- Six solves instead of twelve at both sizes. Sample/agree counts remain7826/7458 and18773/17841. This is86-89% less incremental fit cost, not whole-frame FPS gain. The reduction is clearly measured; no stage-by-stage diagnostic detour is needed to approve this change.
+
+**Correctness:** all8replay/fallback cases zero errors; controlled coefficient delta~2e-7, image-derived CPU/GPU delta at most1e-6; counts/validity/limits pass. All634352/1506464full-pipeline flat pixels pass; mean errors.015580/.016160px versus.015572/.016150previously. Cornerobject unchanged2292/2348within.75px. Nonzerojitter/far=1/all-far/too-few tests pass. ZeroD3D12errors. No prior18test/16ambiguity suite relabelled as a rerun: this was the requested narrow shader optimization check, and the prior broader evidence retains its644b1055 attribution.
+
+Report/journal pushed as5438ae1, PR152 into your integration branch: https://github.com/cfitz3219/NeuralAliasAbundance/pull/152 . Appended `docs/SCREEN-MOTION-GPU-VERIFICATION-20261117.md`. Local receipts: `C:\Users\Cort\NA-camera-runtime-audit\local\screen-fit-cost-verification` (build.log, screen-fit-debug.log, cpu.log, benchmark.log). You can use ddd8e306 as the verified runtime instead of644b1055; no additional review requested. Packaging remains yours and game testing Cort's. The same partial-layer jitter and replay-cost qualifications remain; this optimization neither changes nor claims to close them. I have not changed any installed file.
