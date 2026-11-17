@@ -2,6 +2,7 @@
 #include "shared_resources.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
+#include "host_dx12/native11/viewport_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
@@ -16,8 +17,10 @@
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native11/textures.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
+#include "dlaa_remote/client.hpp"
 #include <d3dcompiler.h>
 
 #include <algorithm>
@@ -25,6 +28,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace na::native_d3d11 {
 using Microsoft::WRL::ComPtr;
@@ -39,6 +43,9 @@ struct Slot {
     ComPtr<ID3D12Resource> motion, provenance;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
+    // Companion route only: the recording that follows DLSS. DLSS itself then runs in another
+    // program between the two, so one frame's work is two lists on the same allocator.
+    ComPtr<ID3D12GraphicsCommandList> after;
     ComPtr<ID3D11Texture2D> packed_depth;
     ComPtr<ID3D11ShaderResourceView> packed_view;
     ComPtr<ID3D11UnorderedAccessView> float_view;
@@ -59,6 +66,10 @@ struct Session {
     native11::CameraPick pick;
     uint64_t stream = 0, last_frame = 0;
     bool failed = false;
+    // VARIANT: dlss/in-companion
+    // DLSS runs in the 64-bit companion program instead of in this process (a 32-bit game cannot
+    // load it). Chosen by what this build is, not by which game it is in.
+    bool companion = false;
 };
 // Retain submitted work through DLL/process teardown. The game owns its
 // immediate context and can still have queued copies when shutdown starts.
@@ -66,8 +77,13 @@ Session& State() { static auto* s = new Session; return *s; }
 std::mutex mutex;
 std::atomic<const char*> reason{"Waiting for a native scene."};
 std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
+// WHY log: frames on which DLSS was told to drop its history, by cause. A reset on every frame
+// leaves nothing to accumulate, and the output is then just the jittered frame.
+std::atomic<uint64_t> resets_cut{0}, resets_changed{0}, resets_gap{0};
 std::atomic<uint64_t> delivered_size{0}, delivered_at{0};
 std::atomic<uint32_t> applied_preset{0}, applied_sharpness{0};
+// Frames whose ambient shading or bloom picture was copied into the shared colour for the companion.
+std::atomic<uint64_t> companion_shaded{0};
 std::atomic<int> raster_slot{-1};
 std::atomic<bool> evaluation_capture_pending{false};
 
@@ -95,12 +111,14 @@ bool Start(Session& s, ID3D11Device* native)
     if (!n || n >= MAX_PATH - 20) return false;
     wcscat_s(path, L"NeuralAlias-ngx");
     CreateDirectoryW(path, nullptr);
-    if (!dlss::EnsureOn(s.device.Get(), path)) return false;
+    s.companion = dlaa_remote::Wanted();
+    if (s.companion ? !dlaa_remote::Start(s.device.Get(), s.queue.Get(), path) : !dlss::EnsureOn(s.device.Get(), path)) return false;
     s.native = native;
     return true;
 }
 
-bool Texture(ID3D12Device* dev, const ImageDesc& extent, DXGI_FORMAT format, ID3D12Resource** out)
+// `shared`: the companion program opens this texture too.
+bool Texture(ID3D12Device* dev, const ImageDesc& extent, DXGI_FORMAT format, ID3D12Resource** out, bool shared = false)
 {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -113,7 +131,7 @@ bool Texture(ID3D12Device* dev, const ImageDesc& extent, DXGI_FORMAT format, ID3
     d.Format = format;
     d.SampleDesc.Count = 1;
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    return SUCCEEDED(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, kWrite,
+    return SUCCEEDED(dev->CreateCommittedResource(&heap, shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE, &d, kWrite,
                                                   nullptr, IID_PPV_ARGS(out)));
 }
 
@@ -186,12 +204,15 @@ bool Prepare(Session& s, Slot& slot, const ImageDesc& color, const ImageDesc& de
     if (FAILED(slot.color.Create(s.native.Get(), dev, color)) ||
         FAILED(slot.depth.Create(s.native.Get(), dev, depth)) ||
         FAILED(slot.output.Create(s.native.Get(), dev, out)) ||
-        !Texture(dev, color, DXGI_FORMAT_R32G32_FLOAT, &slot.motion) ||
+        !Texture(dev, color, DXGI_FORMAT_R32G32_FLOAT, &slot.motion, s.companion) ||
         !Texture(dev, color, DXGI_FORMAT_R8_UINT, &slot.provenance) ||
         FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator))) ||
         FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(),
                                        nullptr, IID_PPV_ARGS(&slot.list))) ||
         FAILED(slot.list->Close())) return false;
+    if (s.companion && (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(),
+                                                      nullptr, IID_PPV_ARGS(&slot.after))) ||
+                        FAILED(slot.after->Close()))) return false;
     slot.depth_format = packed;
     return packed == DXGI_FORMAT_R32_FLOAT || PreparePackedDepth(s, slot, depth, packed);
 }
@@ -236,21 +257,24 @@ camera::CameraFrame Pose(Session& s, const native11::SceneFrame& frame, UINT w, 
     const double jitter[2]{matrix_jitter ? c.jitter_px[0] : 0, matrix_jitter ? c.jitter_px[1] : 0};
     camera::CameraFrame result;
     wwii::SceneCamera scene;
+    const auto raster = [&](const camera::Matrix& vp) {
+        return native11::RasterViewProjection(vp, c.viewport_jitter && c.viewport_expanded, w, h);
+    };
     if (c.split_pose) {
-        result = s.camera.UpdateCameraRelative(c.split_pose->projection, c.split_pose->origin,
+        result = s.camera.UpdateCameraRelative(raster(c.split_pose->projection), c.split_pose->origin,
                                                frame.frame, w, h, jitter);
     } else if (c.no_inverse_pose) {
         // Admitted by the shared no-inverse rules in the provider: a proof over several frames.
-        result = s.camera.Update(*c.no_inverse_pose, frame.frame, w, h, jitter);
+        result = s.camera.Update(raster(*c.no_inverse_pose), frame.frame, w, h, jitter);
     } else if (wwii::DecodeSceneCamera(bytes, static_cast<uint32_t>(length), w, h, scene)) {
-        result = s.camera.UpdateCameraRelative(scene.vp, scene.origin, frame.frame, w, h, jitter);
+        result = s.camera.UpdateCameraRelative(raster(scene.vp), scene.origin, frame.frame, w, h, jitter);
     } else {
         native11::CameraPick pick;
         if (!native11::CheckLearned(bytes, s.pick, &pick))
             pick = native11::FindCamera(bytes, c.version ? c.version : frame.frame + 1);
         if (!pick.found) return {};
         s.pick = pick;
-        result = s.camera.Update(pick.vp, frame.frame, w, h, jitter);
+        result = s.camera.Update(raster(pick.vp), frame.frame, w, h, jitter);
     }
     if (c.viewport_jitter && c.jitter_applied) {
         result.jitter_px_x = c.jitter_px[0];
@@ -289,11 +313,31 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         FAILED(dr->QueryInterface(IID_PPV_ARGS(&depth)))) return Skip("Scene textures unavailable.");
     D3D11_TEXTURE2D_DESC cd{}, dd{};
     UINT csub, dsub, cw, ch, dw, dh;
-    if (!Subresource(color.Get(), c, cd, csub, cw, ch) ||
-        !Subresource(depth.Get(), d, dd, dsub, dw, dh)) return Skip("Scene texture layout unsupported.");
-    const auto cf = static_cast<DXGI_FORMAT>(c.view_format);
+    if (!Subresource(color.Get(), c, cd, csub, cw, ch) || !Subresource(depth.Get(), d, dd, dsub, dw, dh)) {
+        // Says WHY: the common case is the game's own multisample anti-aliasing.
+        if (cd.SampleDesc.Count > 1 || dd.SampleDesc.Count > 1) {
+            static char why[160];
+            std::snprintf(why, sizeof why,
+                          "The game's own anti-aliasing is on (scene picture %ux, depth %ux multisampled): DLAA needs it off in the game's settings.",
+                          cd.SampleDesc.Count, dd.SampleDesc.Count ? dd.SampleDesc.Count : 1);
+            return Skip(why);
+        }
+        return Skip("Scene texture layout unsupported (mip, array slice or active area outside the texture).");
+    }
+    auto cf = static_cast<DXGI_FORMAT>(c.view_format);
+    // VARIANT: colour/srgb-view-as-stored
+    // A picture the game writes through an sRGB view holds
+    // the same display-ready bytes as one written plainly; they are carried as stored, through
+    // the plain 8-bit sibling, so nothing is converted on the way in or out.
+    if (cf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) cf = DXGI_FORMAT_R8G8B8A8_UNORM;
     const bool hdr = cf == DXGI_FORMAT_R11G11B10_FLOAT || cf == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (!hdr && cf != DXGI_FORMAT_R8G8B8A8_UNORM) return Skip("Scene colour format unsupported.");
+    if (!hdr && cf != DXGI_FORMAT_R8G8B8A8_UNORM) {
+        if (cf == DXGI_FORMAT_B8G8R8A8_UNORM || cf == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || cf == DXGI_FORMAT_B8G8R8X8_UNORM ||
+            cf == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB)
+            return Skip("Scene colour is an 8-bit picture stored blue-first (BGRA); that order is not supported yet.");
+        if (cf == DXGI_FORMAT_R10G10B10A2_UNORM) return Skip("Scene colour is a 10-bit picture (R10G10B10A2); not supported yet.");
+        return Skip("Scene colour format unsupported.");
+    }
     ImageDesc ci{c.active_w, c.active_h, cf, true};
     const DXGI_FORMAT df = na::depth::IsDepth24(dd.Format) ? DXGI_FORMAT_R24G8_TYPELESS :
         dd.Format == DXGI_FORMAT_R32G8X24_TYPELESS || dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
@@ -307,7 +351,14 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const auto cam = Pose(s, frame, ci.width, ci.height);
     if (!cam.valid) return Skip("Waiting for the current scene camera.");
     observe::HostWorkScope own;
-    if (!s.native && !Start(s, native.Get())) return FailSession(s, "Native DX12 effects device could not start.");
+    if (!s.native && !Start(s, native.Get())) {
+        // Says WHY: on the companion route the companion's own reason is the useful one.
+        static char why[200];
+        const auto remote = dlaa_remote::GetStats();
+        if (!s.companion || !remote.reason[0]) return FailSession(s, "Native DX12 effects device could not start.");
+        std::snprintf(why, sizeof why, "DLAA companion: %s", remote.reason);
+        return FailSession(s, why);
+    }
     UINT index = 0;
     for (; index < kSlots; ++index) {
         const auto& slot = s.slots[index];
@@ -322,6 +373,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         owned->color.Description().format != ci.format || owned->depth_format != df) {
         auto slot = std::make_unique<Slot>();
         if (!Prepare(s, *slot, ci, di, df)) return FailSession(s, "Could not create shared native scene images.");
+        if (s.companion && !dlaa_remote::Bind(index, ci.width, ci.height, slot->color.Effects(), slot->depth.Effects(),
+                                              slot->motion.Get(), slot->output.Effects()))
+            return FailSession(s, "The DLAA companion could not open the shared scene images.");
         owned = std::move(slot);
     }
     auto& slot = *owned;
@@ -329,6 +383,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // Both interop fences retired this slot. End the old recording before
     // reusing its private descriptors, flow history and effect ownership.
     nr::native::Reset(list);
+    if (slot.after) nr::native::Reset(slot.after.Get());
     slot.ambient.reset();
     slot.grade.reset();
     if (FAILED(slot.allocator->Reset()) || FAILED(list->Reset(slot.allocator.Get(), nullptr)))
@@ -341,13 +396,22 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     in.depth = shared_depth;
     in.tier2_valid_flag = true;
     in.depth_clear = frame.reversed_depth ? 0.f : 1.f;
-    for (size_t i = 0; i < 16; ++i) {
-        in.inv_view_proj_current.m[i] = static_cast<float>(cam.inv_view_proj_current_row[i]);
-        in.view_proj_previous.m[i] = static_cast<float>(cam.view_proj_previous_row[i]);
+    {
+        // The same as the DX12 host (j2/live_dlaa.cpp): current clip to previous clip as ONE matrix
+        // composed in double. Chained per pixel as two float matrices through large world
+        // coordinates, a still camera gave about 0.1 px of false motion on every frame.
+        const camera::Matrix composed = camera::ComposeReprojectionRow(cam.inv_view_proj_current_row, cam.view_proj_previous_row);
+        for (size_t i = 0; i < 16; ++i) {
+            in.inv_view_proj_current.m[i] = static_cast<float>(composed[i]);
+            in.view_proj_previous.m[i] = i % 5 == 0 ? 1.f : 0.f;
+        }
     }
     in.jitter_current_px[0] = static_cast<float>(cam.jitter_px_x);
     in.jitter_current_px[1] = static_cast<float>(cam.jitter_px_y);
     const bool reset_history = cam.camera_cut || frame.selection_changed || frame.frame != s.last_frame + 1;
+    if (cam.camera_cut) resets_cut.fetch_add(1, std::memory_order_relaxed);
+    else if (frame.selection_changed) resets_changed.fetch_add(1, std::memory_order_relaxed);
+    else if (reset_history) resets_gap.fetch_add(1, std::memory_order_relaxed);
     j2::compute_flow::Ticket flow;
     if (j2::flow::Enabled()) {
         j2::compute_flow::Frame ff;
@@ -374,6 +438,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     Barrier(list, slot.motion.Get(), kWrite, kRead);
     dlss::EvalDesc eval{};
     eval.color = slot.color.Effects();
+    // The two optional passes (ambient shading, bloom) each hand DLSS a picture of their own. On the
+    // companion route that picture is copied into the shared scene colour below, because the shared
+    // colour is the one the companion reads.
     if (settings::Get().xegtao_enabled.load()) {
         xegtao::Inputs ai;
         ai.color = eval.color; ai.depth = shared_depth; ai.motion = slot.motion.Get();
@@ -411,14 +478,64 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         slot.grade = donut::ScenePass().Prepare(s.device.Get(), s.queue.Get(), gi, lighting);
         if (slot.grade && slot.grade->Record(list)) eval.color = slot.grade->Color();
     }
-    const bool evaluated = dlss::Evaluate(list, eval);
+    // Companion route: this recording ends here with every shared image handed back in the common
+    // state, DLSS runs in the companion at submission, and the rest of the frame is recorded into
+    // a second list as if DLSS had run. Whether it really did is known at submission (below).
+    ID3D12GraphicsCommandList* before_dlss = nullptr;
+    bool evaluated = false;
+    if (s.companion) {
+        if (eval.color != slot.color.Effects()) {
+            // Motion and flow above have already read the game's own picture from the shared colour,
+            // and sharpening later uses it only as its target, so nothing else needs the original.
+            constexpr auto kCopyFrom = D3D12_RESOURCE_STATE_COPY_SOURCE, kCopyTo = D3D12_RESOURCE_STATE_COPY_DEST;
+            Barrier(list, eval.color, kRead, kCopyFrom);
+            Barrier(list, slot.color.Effects(), kRead, kCopyTo);
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = slot.color.Effects();
+            to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.pResource = eval.color;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const D3D12_BOX all{0, 0, 0, ci.width, ci.height, 1};
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, &all);
+            Barrier(list, eval.color, kCopyFrom, kRead);
+            Barrier(list, slot.color.Effects(), kCopyTo, kRead);
+            eval.color = slot.color.Effects();
+            companion_shaded.fetch_add(1, std::memory_order_relaxed);
+        }
+        Barrier(list, slot.color.Effects(), kRead, kCommon);
+        Barrier(list, shared_depth, kRead, kCommon);
+        Barrier(list, slot.motion.Get(), kRead, kCommon);
+        Barrier(list, slot.output.Effects(), kWrite, kCommon);
+        if (FAILED(list->Close())) return FailSession(s, "Native effects command list could not close.");
+        before_dlss = list;
+        list = slot.after.Get();
+        if (FAILED(list->Reset(slot.allocator.Get(), nullptr))) return FailSession(s, "Could not reset the native effects list.");
+        Barrier(list, slot.color.Effects(), kCommon, kRead);
+        Barrier(list, shared_depth, kCommon, kRead);
+        Barrier(list, slot.motion.Get(), kCommon, kRead);
+        Barrier(list, slot.output.Effects(), kCommon, kWrite);
+        evaluated = true;
+    } else {
+        evaluated = dlss::Evaluate(list, eval);
+    }
     uint32_t capture_token = 0;
     if (evaluated && capture::j2::Armed()) {
+        // A saved capture also takes the scene's source textures, once per capture folder.
+        static std::wstring texture_dump_for;
+        if (const wchar_t* folder = capture::j2::Directory(); folder && *folder && texture_dump_for != folder) {
+            // Recorded only once the request is taken: while an earlier dump still runs, ask again next frame.
+            if (native11::RequestTextureDump((std::wstring(folder) + L"\\textures").c_str())) texture_dump_for = folder;
+        }
         capture::j2::Planes planes;
         planes.color = eval.color;
         planes.depth = shared_depth;
         planes.motion = slot.motion.Get();
         planes.output = slot.output.Effects();
+        // Flow saw the original scene, before optional AO/tone mapping. Keep
+        // that source available in an armed capture instead of judging flow
+        // against a differently shaded image. No extra live readback.
+        if (eval.color != slot.color.Effects())
+            planes.extra[planes.extra_count++] = {"source_color", slot.color.Effects(), kRead};
         capture::j2::Identity id;
         id.present_ordinal = id.inputs_frame = frame.frame;
         id.view_color = c.incarnation;
@@ -428,6 +545,17 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.color_format = cf;
         id.jitter_x = eval.jitter_x;
         id.jitter_y = eval.jitter_y;
+        id.raster_jitter_x = eval.jitter_x;
+        id.raster_jitter_y = eval.jitter_y;
+        id.depth_reversed = frame.reversed_depth;
+        id.camera_cut = cam.camera_cut;
+        id.cut_reason = cam.cut_reason;
+        id.flow_ran = in.tier3_valid_flag;
+        id.flow_loosen = settings::Get().j2_flow_loosen.load();
+        id.flow_jitter_x = flow.frame.jitter[0];
+        id.flow_jitter_y = flow.frame.jitter[1];
+        id.flow_jitter_convention = flow.colour_convention;
+        id.flow_jitter_epoch = flow.colour_epoch;
         id.preset = eval.preset;
         id.sharpness = settings::Get().j2_sharpness.load();
         id.dlss_hdr = eval.hdr;
@@ -478,6 +606,31 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         capture::j2::Discard(capture_token, false);
         return FailSession(s, "Native scene submission failed.");
     }
+    if (before_dlss) {
+        ID3D12CommandList* head[] = {before_dlss};
+        {
+            nr::native::Submission submitted(s.queue.Get(), 1, head);
+            s.queue->ExecuteCommandLists(1, head);
+        }
+        dlaa_remote::Frame rf{};
+        rf.slot = index;
+        rf.preset = eval.preset;
+        rf.view_id = eval.view_id;
+        rf.jitter_x = eval.jitter_x; rf.jitter_y = eval.jitter_y;
+        rf.mv_scale_x = eval.mv_scale_x; rf.mv_scale_y = eval.mv_scale_y;
+        rf.pre_exposure = eval.pre_exposure; rf.exposure_scale = eval.exposure_scale;
+        rf.quality = static_cast<uint32_t>(eval.quality);
+        rf.flags = (eval.reset ? dlaa_remote::kReset : 0u) | (eval.hdr ? dlaa_remote::kHdr : 0u) |
+                   (eval.depth_inverted ? dlaa_remote::kDepthInverted : 0u) | (eval.mv_jittered ? dlaa_remote::kMvJittered : 0u) |
+                   (eval.auto_exposure ? dlaa_remote::kAutoExposure : 0u);
+        // Orders the rest of this frame after the companion's output. The second list still runs
+        // when DLSS did not: it returns the shared images to their resting state.
+        evaluated = dlaa_remote::Evaluate(rf);
+        if (!evaluated && capture_token) {
+            capture::j2::Discard(capture_token, false);
+            capture_token = 0;
+        }
+    }
     ID3D12CommandList* lists[] = {list};
     dlss::BeforeExecute(s.queue.Get(), 1, lists);
     {
@@ -491,7 +644,13 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         evaluation_capture_pending.store(true, std::memory_order_release);
     }
     if (FAILED(s.fences.SignalEffects(&slot.effects_done))) return FailSession(s, "DX12 effects submission failed.");
-    if (!evaluated) return Skip("DLAA evaluation rejected this frame.");
+    if (!evaluated) {
+        if (!s.companion) return Skip("DLAA evaluation rejected this frame.");
+        static char why[200];
+        std::snprintf(why, sizeof why, "DLAA companion: %s", dlaa_remote::GetStats().reason);
+        if (dlaa_remote::GetStats().failed) return FailSession(s, why);
+        return Skip(why);
+    }
     if (FAILED(s.fences.WaitNative(slot.effects_done))) return FailSession(s, "Native result dependency failed.");
     ctx->CopySubresourceRegion(color.Get(), csub, c.active_x, c.active_y, 0, result, 0, nullptr);
     // This signal retires the slot. The game's subsequent submission can
@@ -508,8 +667,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     delivered_at.store(GetTickCount64(), std::memory_order_relaxed);
     if (frame.camera.raster_jitter_qualified && j2::Jitter()) {
         const auto phase = static_cast<uint32_t>(frame.frame);
-        const auto sample = settings::Get().j2_jitter_r2.load()
-            ? neural_alias::temporal_jitter_r2(phase, 8) : neural_alias::temporal_jitter(phase, 8);
+        const auto sample = native11::DlaaJitterSample(phase, settings::Get().j2_jitter_r2.load() != 0);
         native11::SetNextJitter(static_cast<float>(sample.x_pixels), static_cast<float>(sample.y_pixels));
     }
     reason.store("Native DX11 DLAA delivered before the scene consumer.", std::memory_order_relaxed);
@@ -578,11 +736,26 @@ int FormatStatus(char* out, size_t capacity)
     // `reason` at its last success, so this is what shows DLAA has stopped.
     const auto last = delivered_at.load(std::memory_order_relaxed);
     const long long last_ms = last ? static_cast<long long>(GetTickCount64() - last) : -1;
-    return std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d \"%s\"",
+    int n = std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d history_resets{camera_cut=%llu inputs_changed=%llu frame_gap=%llu} \"%s\"",
                          static_cast<unsigned long long>(delivered.load()), last_ms,
                          static_cast<unsigned long long>(busy.load()),
                          static_cast<unsigned long long>(rejected.load()), applied_preset.load(), applied_sharpness.load(),
-                         raster_slot.load(), reason.load());
+                         raster_slot.load(), static_cast<unsigned long long>(resets_cut.load()),
+                         static_cast<unsigned long long>(resets_changed.load()), static_cast<unsigned long long>(resets_gap.load()),
+                         reason.load());
+    // The handoff cost to the 64-bit companion, as numbers, on the same line the results read.
+    if (dlaa_remote::Wanted() && n > 0 && static_cast<size_t>(n) + 2 < capacity) {
+        out[n++] = ' ';
+        const int more = dlaa_remote::FormatStatus(out + n, capacity - static_cast<size_t>(n));
+        if (more > 0) n += more;
+        // Proof that ambient shading or bloom reached the picture the companion reads.
+        if (static_cast<size_t>(n) + 40 < capacity) {
+            const int tail = std::snprintf(out + n, capacity - static_cast<size_t>(n), " companion_shaded=%llu",
+                                           static_cast<unsigned long long>(companion_shaded.load(std::memory_order_relaxed)));
+            if (tail > 0) n += tail;
+        }
+    }
+    return n;
 }
 bool FormatMenuStatus(char* out, size_t capacity)
 {

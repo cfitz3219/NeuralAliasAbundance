@@ -1,7 +1,8 @@
 # Pinned MIT backend. No DLSS/NGX model or restricted SDK is fetched here.
 option(NA_BUILD_NVRHI "Build optional shared NVRHI GPU infrastructure" ON)
 set(NA_HAVE_NVRHI OFF)
-if(NA_BUILD_NVRHI)
+# NVRHI does not build for 32-bit; GPU services compile without it there.
+if(NA_BUILD_NVRHI AND CMAKE_SIZEOF_VOID_P EQUAL 8)
   include(FetchContent)
   set(NVRHI_WITH_DX11 OFF CACHE BOOL "" FORCE)
   set(NVRHI_WITH_VULKAN OFF CACHE BOOL "" FORCE)

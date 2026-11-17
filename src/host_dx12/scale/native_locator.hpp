@@ -52,14 +52,14 @@ inline uint32_t primary(const Image& im,uint32_t at){
     const auto dos=im.read<IMAGE_DOS_HEADER>(0);const auto nt=im.read<IMAGE_NT_HEADERS64>(uint32_t(dos.e_lfanew));
     const auto d=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     uint32_t unwind=0;
-    for(uint32_t p=0;p<d.Size;p+=sizeof(RUNTIME_FUNCTION)){
-        auto r=im.read<RUNTIME_FUNCTION>(d.VirtualAddress+p);if(r.BeginAddress==f.start){unwind=r.UnwindData;break;}}
+    for(uint32_t p=0;p<d.Size;p+=sizeof(_IMAGE_RUNTIME_FUNCTION_ENTRY)){
+        auto r=im.read<_IMAGE_RUNTIME_FUNCTION_ENTRY>(d.VirtualAddress+p);if(r.BeginAddress==f.start){unwind=r.UnwindData;break;}}
     for(unsigned depth=0;unwind&&depth<16;++depth){
         if(!im.contains(unwind,4,false))return 0;
-        const auto flags=im.bytes[unwind]>>3;if(!(flags&UNW_FLAG_CHAININFO))return f.start;
+        const auto flags=im.bytes[unwind]>>3;if(!(flags&0x4u /*UNW_FLAG_CHAININFO*/))return f.start;
         const auto tail=unwind+4+((im.bytes[unwind+2]+1u)&~1u)*2;
-        if(!im.contains(tail,sizeof(RUNTIME_FUNCTION),false))return 0;
-        auto r=im.read<RUNTIME_FUNCTION>(tail);f.start=r.BeginAddress;unwind=r.UnwindData;
+        if(!im.contains(tail,sizeof(_IMAGE_RUNTIME_FUNCTION_ENTRY),false))return 0;
+        auto r=im.read<_IMAGE_RUNTIME_FUNCTION_ENTRY>(tail);f.start=r.BeginAddress;unwind=r.UnwindData;
     }
     return 0;
 }

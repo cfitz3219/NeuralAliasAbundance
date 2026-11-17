@@ -54,10 +54,15 @@ inline void DumpThreadStacks() {
             STACKFRAME64 f{};
             std::string lines;
             bool idle_pool = false;
-            f.AddrPC.Offset = ctx.Rip; f.AddrPC.Mode = AddrModeFlat;
-            f.AddrFrame.Offset = ctx.Rbp; f.AddrFrame.Mode = AddrModeFlat;
-            f.AddrStack.Offset = ctx.Rsp; f.AddrStack.Mode = AddrModeFlat;
-            for (int i = 0; i < 48 && walk(IMAGE_FILE_MACHINE_AMD64, proc, th, &f, &ctx, nullptr, fta, modbase, nullptr) && f.AddrPC.Offset; ++i) {
+#if defined(_M_IX86)
+            const DWORD machine = IMAGE_FILE_MACHINE_I386;
+            f.AddrPC.Offset = ctx.Eip; f.AddrFrame.Offset = ctx.Ebp; f.AddrStack.Offset = ctx.Esp;
+#else
+            const DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+            f.AddrPC.Offset = ctx.Rip; f.AddrFrame.Offset = ctx.Rbp; f.AddrStack.Offset = ctx.Rsp;
+#endif
+            f.AddrPC.Mode = AddrModeFlat; f.AddrFrame.Mode = AddrModeFlat; f.AddrStack.Mode = AddrModeFlat;
+            for (int i = 0; i < 48 && walk(machine, proc, th, &f, &ctx, nullptr, fta, modbase, nullptr) && f.AddrPC.Offset; ++i) {
                 const DWORD64 pc = f.AddrPC.Offset, base = modbase(proc, pc);
                 char mod[MAX_PATH] = "?";
                 if (base) { GetModuleFileNameA(reinterpret_cast<HMODULE>(base), mod, MAX_PATH); }

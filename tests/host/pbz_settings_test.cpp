@@ -30,6 +30,20 @@ int main() {
     CHECK(s.follow_game_resolution==1);
     CHECK(s.fg_preset==3 && s.dlss_mode==4);
     CHECK(s.xegtao_enabled==1&&s.xegtao_radius_x1000==1250&&s.xegtao_denoise==3&&s.xegtao_falloff==450);
+    // Texture mip bias choice: automatic by default, a chosen total survives save and load, and the
+    // old mip_bias key chooses nothing.
+    CHECK(s.j2_texture_detail_x100==na::settings::kTextureDetailAuto && na::settings::DlaaMipBiasX100(s)==-100);
+    {wchar_t detail[32]{};GetPrivateProfileStringW(L"j2",L"texture_detail",L"",detail,32,na::settings::UserIniPath());CHECK(!wcscmp(detail,L"auto"));}
+    s.j2_texture_detail_x100=-200;CHECK(na::settings::Save());s.j2_texture_detail_x100=na::settings::kTextureDetailAuto;
+    WritePrivateProfileStringW(L"j2",L"mip_bias",L"0.00",na::settings::UserIniPath());
+    na::settings::Load();CHECK(s.j2_texture_detail_x100==-200 && na::settings::DlaaMipBias(s)==-2.f);
+    WritePrivateProfileStringW(L"j2",L"texture_detail",L"-1.58",na::settings::UserIniPath());
+    na::settings::Load();CHECK(s.j2_texture_detail_x100==-158);
+    WritePrivateProfileStringW(L"j2",L"texture_detail",L"-9",na::settings::UserIniPath());
+    na::settings::Load();CHECK(s.j2_texture_detail_x100==-225);
+    WritePrivateProfileStringW(L"j2",L"texture_detail",L"0",na::settings::UserIniPath());
+    na::settings::Load();CHECK(s.j2_texture_detail_x100==0 && na::settings::DlaaMipBias(s)==0.f);
+    s.j2_texture_detail_x100=na::settings::kTextureDetailAuto;CHECK(na::settings::Save());
     WritePrivateProfileStringW(L"fg",L"preset",L"99",na::settings::UserIniPath());
     na::settings::Load(); CHECK(s.fg_preset==1);
     wchar_t marker[MAX_PATH]{};swprintf_s(marker,L"%s.session",ini);

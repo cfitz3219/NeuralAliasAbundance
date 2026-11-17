@@ -169,8 +169,8 @@ DWORD WINAPI InitThread(LPVOID)
     // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
     // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1
     // = -1 at native). Configure before installing producer hooks, after the
-    // previous-session marker is read. Normal DLAA always targets total -1;
-    // old persisted comparison choices do not override it.
+    // previous-session marker is read. Normal DLAA targets the menu's Texture mip
+    // bias choice (automatic = total -1); the old [j2] mip_bias key does not override it.
     if (GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 && GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1) {
         na::observe::SetSamplerMipBias(0.f); // defer the saved effect until renderer recovery is known
         // Live switching (no restarts, Cort 2026-11-05): the game's own root signatures and
@@ -183,8 +183,8 @@ DWORD WINAPI InitThread(LPVOID)
         na::observe::SetSamplerMipPrewarm(GetPrivateProfileIntW(L"j2", L"mip_prewarm", 1, g_ini) != 0);
         if (!na::settings::SafeStart()) {
             auto& st = na::settings::Get();
-            st.j2_mip_bias_x100.store(-100);
-            const float user = -1.f;
+            st.j2_mip_bias_x100.store(na::settings::DlaaMipBiasX100(st));
+            const float user = na::settings::DlaaMipBias(st);
             float wanted[5] = {user, user, user, user, user};
             int n = 1;
             if (native_scale_asked || render_small_asked) {

@@ -306,7 +306,7 @@ extern "C" __declspec(dllexport) uint64_t __cdecl slEvaluateFeature(uintptr_t a,
     const uint32_t layout = g_sl_layout.load(std::memory_order_relaxed);
     uint32_t token_frame = 0;
     const bool v1 = layout == static_cast<uint32_t>(na::sl::Layout::V1) ||
-                    (layout == 0 && (c >> 32) == 0 && (d >> 32) == 0 && !frame_token_value(reinterpret_cast<const void*>(b), &token_frame));
+                    (layout == 0 && (static_cast<uint64_t>(c) >> 32) == 0 && (static_cast<uint64_t>(d) >> 32) == 0 && !frame_token_value(reinterpret_cast<const void*>(b), &token_frame));
     if (v1) {
         na::fg::EvaluationScope scope(static_cast<uint32_t>(c), static_cast<uint32_t>(d));
         return real(a, b, c, d, e);

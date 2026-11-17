@@ -40,9 +40,9 @@ constexpr uint32_t kCostMax = 160;     // engine cost above this rejects the blo
 // (above the engine's ~0.5 px flat-area fill, which the texture gate also removes).
 constexpr float kSnapPx = 0.5f;
 constexpr float kImageAbs = 0.08f;     // the flow must explain the image (mean luma error, 3x3 encoded texels)
-constexpr float kImageMargin = 0.02f;  // both errors within this: the image cannot tell (flat areas), accept
+constexpr float kImageMargin = 0.f; // reserved constant-buffer field; no absolute-error bypass
 // The flow must explain the image clearly better than the camera alone: e_flow <= kImageRatio *
-// e_cam (or both within kImageMargin). Still posts under jitter (bfed885, RTX 5070 Ti): the
+// e_cam. Still posts under jitter (bfed885, RTX 5070 Ti): the
 // stabilised encode leaves a different sub-pixel blur on each frame's edges, so e_cam is not 0
 // at an edge (~0.05-0.1); a coherent 2 px flow along a post axis near its end (aperture
 // ambiguity, kept alive by temporal hints) had e_flow ~ e_cam and passed the old
@@ -177,10 +177,12 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             else {
                 float e_flow = image_error(p, raw);
                 float e_cam = image_error(p, raw - r);
-                // Rejected when the image contradicts the flow, or does not clearly prefer it
-                // over the camera alone; accepted where the image cannot tell (flat interiors
-                // of moving objects: both errors within image_margin), cost permitting.
-                if (!(e_flow <= image_abs && e_flow <= max(image_margin, image_ratio * e_cam))) why = 5;
+                // Camera wins an ambiguous match. The old absolute .02 allowance
+                // admitted nonzero motion even when camera-only was exact (WWII
+                // still timber). Requiring actual improvement preserves real slow
+                // motion without imposing a larger displacement cutoff. At the
+                // loosest ratio (1), equal matches still cannot invent movement.
+                if (!(e_flow <= image_abs && e_flow < e_cam && e_flow <= image_ratio * e_cam)) why = 5;
             }
         }
         if (why == 0) {

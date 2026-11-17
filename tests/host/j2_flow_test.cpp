@@ -653,6 +653,41 @@ int case_false_flow(test::Device& d, FakeEngine& fake)
     return 0;
 }
 
+// The .02 absolute image allowance used to override the camera comparison.
+// A gently textured stationary surface then accepted a persistent one-pixel
+// flow even though camera-only matched perfectly. Reproduce through encode,
+// expansion, temporal acceptance and the final motion texture, not a counter.
+int case_ambiguous_flow(test::Device& d, FakeEngine& fake)
+{
+    for (bool moving : {false, true}) {
+        Harness h(d);
+        REQUIRE(h.Init());
+        reset_module(&fake);
+        fake.gated = false;
+        fake.SetGrid(-16, 0, 0, -1, 0, -1, 0, 0); // one full-size pixel
+        for (int f = 1; f <= 5; ++f) {
+            h.SetPicture(render([&](int x, int) {
+                return .03f + .04f * (.5f + .5f * std::sin(.2f * float(x - (moving ? f : 0))));
+            }, 0, 0));
+            auto t = fl::Prepare(d.device.Get(), d.queue.Get(), h.Source(f, f - 1, 0, 0));
+            REQUIRE(t.valid);
+            h.Frame(t, 0, 0, nullptr);
+            REQUIRE(h.WaitJ2(10000));
+        }
+        unsigned wrong = 0, corrected = 0;
+        for (unsigned y = 12; y < H - 12; y += 4) for (unsigned x = 12; x < W - 12; ++x) {
+            float v[2]; h.Motion(x, y, v);
+            if (std::hypot(v[0], v[1]) > .1f) ++wrong;
+            if (std::abs(v[0] + 1.f) < .1f && std::abs(v[1]) < .1f) ++corrected;
+        }
+        recap("low-error surface moving=%d: nonzero=%u correct-one-pixel=%u", moving, wrong, corrected);
+        if (moving) CHECK(corrected > 200); // retain real slow object motion
+        else CHECK(wrong == 0);            // no invented motion on still geometry
+        d.WaitIdle();
+    }
+    return 0;
+}
+
 int case_engine_fail(test::Device& d, FakeEngine& fake)
 {
     std::printf("-- engine-fail\n");
@@ -825,10 +860,16 @@ int main(int argc, char** argv)
     }
     FakeEngine fake;
     REQUIRE(fake.Create(d));
+    if (argc > 1 && std::strcmp(argv[1], "--ambiguous") == 0) {
+        case_ambiguous_flow(d, fake);
+        fl::Shutdown(); fl::SetEngineForTests(nullptr);
+        return test::finish("j2_flow_ambiguous_test");
+    }
     case_pair(d, &fake);
     case_still_jitter(d, &fake);
     case_flicker(d, fake);
     case_false_flow(d, fake);
+    case_ambiguous_flow(d, fake);
     case_engine_fail(d, fake);
     case_saturation(d, fake);
     case_resize(d, fake);

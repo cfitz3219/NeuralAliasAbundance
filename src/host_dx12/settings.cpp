@@ -19,7 +19,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(j2_texture_detail_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -152,6 +152,17 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         double mbv = _wtof(mb);
         mbv = mbv < -4.0 ? -4.0 : (mbv > 0.0 ? 0.0 : mbv);
         target.j2_mip_bias_x100.store(static_cast<int32_t>(mbv * 100.0 + (mbv < 0 ? -0.5 : 0.5)));
+        {
+            // [j2] texture_detail: "auto" (default) or the total the menu's Texture mip bias row
+            // chose, 0 to -2.25. Separate from the old mip_bias key on purpose: values saved by
+            // the earlier menu (Off, Light) must not come back as today's choice.
+            wchar_t detail_text[32] = {};
+            GetPrivateProfileStringW(L"j2", L"texture_detail", L"auto", detail_text, 32, ini);
+            wchar_t* detail_end = nullptr;
+            const double detail_total = wcstod(detail_text, &detail_end);
+            if (detail_end == detail_text || !(detail_total <= 0.0)) target.j2_texture_detail_x100.store(kTextureDetailAuto);
+            else target.j2_texture_detail_x100.store(static_cast<int32_t>((detail_total < -2.25 ? -2.25 : detail_total) * 100.0 - 0.5));
+        }
         // [j2] preset_v2: "auto", a letter J..M (NGX value = letter - 'A' + 1), "default", or a
         // number. Without it, the old [j2] preset key: its "L" was the old default (every save
         // wrote it), so it becomes Automatic (L for DLAA/Quality, M for Balanced/Performance,
@@ -414,6 +425,10 @@ bool SaveFromWorker()
         ok &= WritePrivateProfileStringW(L"j2", L"jitter_conv_final", v, ini) != 0;
         swprintf_s(v, L"%.2f", static_cast<int32_t>(PersistedSwitch(5,static_cast<uint32_t>(g_settings.j2_mip_bias_x100.load()))) / 100.0);
         ok &= WritePrivateProfileStringW(L"j2", L"mip_bias", v, ini) != 0;
+        const int32_t detail = g_settings.j2_texture_detail_x100.load();
+        if (detail > 0) swprintf_s(v, L"auto");
+        else swprintf_s(v, L"%.2f", detail / 100.0);
+        ok &= WritePrivateProfileStringW(L"j2", L"texture_detail", v, ini) != 0;
     }
     swprintf_s(v, L"%d", static_cast<int32_t>(PersistedSwitch(4,static_cast<uint32_t>(g_settings.reflex_mode.load()))));
     ok &= WritePrivateProfileStringW(L"latency", L"reflex", v, ini) != 0;

@@ -3420,7 +3420,7 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
             if (!recovering && c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !boot_seen && !g_jit_cam.valid && !is_interloper(c.matrix)) {
                 boot_seen = true; // the best-ranked block's first camera-shaped matrix, once per frame
                 if (boot_camera(o, c)) {
-                    boot.vp = c.matrix; boot.reversed = c.reversed; boot.injected = holds_jittered(s.bytes, c.byte_offset);
+                    boot.vp = c.matrix; boot.reversed = c.reversed; boot.injected = holds_jittered(s.bytes, static_cast<size_t>(c.byte_offset));
                     boot.block = o; boot.offset = static_cast<int64_t>(c.byte_offset); boot.inv_delta = kDerivedInverse;
                     have_boot = true;
                 }
@@ -3428,7 +3428,7 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
             if (!recovering && c.kind == na::camera::Kind::ViewProjection && !c.has_inverse_pair && !have_loose && same_camera(c.matrix) && !is_interloper(c.matrix)) {
                 loose.vp = c.matrix;
                 loose.reversed = c.reversed;
-                loose.injected = holds_jittered(s.bytes, c.byte_offset);
+                loose.injected = holds_jittered(s.bytes, static_cast<size_t>(c.byte_offset));
                 loose.block = o;
                 have_loose = true;
             }
@@ -3445,7 +3445,7 @@ bool find_camera_scan(ID3D12CommandList* const* lists, UINT scene, na_object_id 
                     k.proj_delta = static_cast<int64_t>(pc.byte_offset) - static_cast<int64_t>(c.byte_offset);
                     break;
                 }
-            k.injected = holds_jittered(s.bytes, c.byte_offset);
+            k.injected = holds_jittered(s.bytes, static_cast<size_t>(c.byte_offset));
             k.score = continuity(k.vp, k.injected);
             picks.push_back(k);
             break; // one per block

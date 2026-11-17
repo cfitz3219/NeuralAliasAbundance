@@ -1437,3 +1437,266 @@ With Antialiasing Deferred off, Cort reports rapid DLAA cycling. Run 3184 (Docum
 The large mapped-buffer path now retains several high-support and previously qualified windows, prioritizes evidence from the current scene, and resolves each draw against all windows from its own upload version. At most four windows and 32 KiB per oversized upload. The candidate stores no game-specific offset and does not widen camera acceptance. Small mapped buffers and the existing UpdateSubresource path retain the same handling. Fixed the camera diagnostic's missing captured offset argument as part of this change.
 
 Ten focused Windows tests passed. The real native DX11 DLAA fixture alternates between disjoint offsets in a 1 MiB buffer, delivers on all 12 alternating frames, skips an unfamiliar range and reacquires it, and returns to small-buffer capture. This verifies the captured-range failure mechanism. Live stability and the remaining unsupported-colour intervals are separate from the fixture result.
+
+## 2026-11-12 Pacific — Native DX11 reads the bound camera range at the draw (Claude)
+
+Independent analysis of the four Battlefield 4 runs (446a274, 0982e8d twice, 63992f6): the camera sits in one large buffer the game fills afresh each frame, so its place follows what is drawn (13,392 to 48,400 constants in run 27520) and holds still only when the view does. Kept windows cannot follow it: 303 of 376 sampled misses on 63992f6 were still outside the kept bytes. DLAA share was 56% while moving and 99% standing still.
+
+d20ef85 on `claude/project-thread-3euhfs` (branched from 63992f6):
+- camera11/exact-range: the range a scene draw binds is read at the draw through the game's own WRITE_NO_OVERWRITE mapping, once it has stayed bound for a second scene draw, and again after a discard or a new frame. Nothing the game wrote is changed. Deferred recordings carry the bytes with the draw.
+- camera/positioned-twin and the start rule: `inverse_game` misses (3,169 on 63992f6) began the moment one inverse pair was seen; the start rule now stays open for a game whose camera is usually a lone matrix. The game's block holds the camera with its position at byte 176 and without at 240; the positioned one is used.
+- camera11/held: at most three frames with the previous camera instead of a gap.
+- Status: `camera_held`, `exact_ranges{reads failed draws}`; event `native11_pick` on each change of camera kind.
+
+Tests: camera_admission 15 of 15 on Linux, including a block recorded from the run. The DX11 fixture gained a case that moves the camera place every frame through sixteen recorded places. Not yet run on a GPU, and not yet seen by Cort.
+
+## 2026-11-12 Pacific — Native DX11: the learned camera place follows the most-drawn range (Claude)
+
+Run p39980 on 496d691 (Battlefield 4): DLAA on 94.8% of scene frames, every frame for the last 5.5 minutes, but Cort saw warbling textures and shimmering edges. The log shows why the picture can be wrong while coverage is right: the camera block's start moves every frame, so the "learned range" (which compared the start) matched only by accident. On most moving frames the camera came from the continuation rule instead, which takes the first continuing matrix in any bound block, including copies inside large per-draw blocks whose position differs from the view block's by 0.1 to 0.2 units frame to frame. On four logged frames the old start held the first-person pass's block (local position 0.7, 2.2, 1.3), a 660-unit jump. Change: the learned place is buffer + slot + range size, and among those the range most scene draws read (camera/learned-place); ranges are tried most-drawn first. Expected in the next log: `pose{continued}` close to flat, `no_inverse` carrying the frames, `native11_pick` staying on slot 2 offset 176. Not yet checked: whether the jitter value told to DLSS matches the viewport shift (not logged); Cort's live "Camera jitter" switch separates that if the look stays.
+Same build, logging only (Cort: "make the log gather those values"): event `native11_jitter` (what the consumer is told beside the viewport shift the scene draws carried, shifted and unshifted draw counts, scene and depth sizes; first 48 frames, then 16 about every 10 s), and on the status line `camera_path{steps reversals jumps}` (a camera hopping between sources shows as reversals) and `jitter_told{px unshifted_colour_draws}`.
+
+## 2026-11-13 Pacific — Native DX11: DLAA follows a layered renderer to the finished picture (Claude)
+
+Run p15540 on 3272e4a (Battlefield 4), Cort: "it all looked exactly the same as before" (warbling textures, silver strings on edges). Every theory was checked against the log and the saved captures before another build:
+- camera path: steady (`continued` 35,217, 46 other; reversals 18 and jumps 25, all in the first seconds). Not the cause.
+- jitter told against jitter drawn: equal on all 240 sampled `native11_jitter` events, same convention as the DX12 path. Not the cause.
+- texture detail setting: the product's standard at DLAA on every game. Not the cause.
+- the image DLAA receives: the capture planes (`dlssdebug` and `j2` folders of this run, and of 496d691 and 63992f6) show a world-space normals map, format 28, `hdr=false`. DLAA's output is the same map anti-aliased, written back before lighting; the lit picture went to the screen with the raw jitter in it. This is the cause, and it has been so since the first Battlefield 4 build: coverage climbed from 0% to 94.8% on the wrong image. Blended normals on edges explain the silver strings, unresolved jitter the warble.
+
+Why: the frame model takes "the render target drawn most with the scene depth" as the scene colour. In a layered (deferred) renderer that target is a material layer.
+
+Change (`scene/after-layers`, one row in docs/VARIANTS.md): chosen by shape, never by name. When the most-drawn target is not floating point, is written together with other targets and is read after being drawn, and a floating-point target of the same size is then drawn with the same depth and read in turn, that later target is the picture. The scene is then its draws plus the depth-tested draws into the layers, so the camera, the jitter sample and the DLSS point cover the whole scene. The picture in use is kept on frames that draw nothing more into it. Any other shape keeps the most-drawn rule, so a game that draws its scene into one target (the WWII shape in the fixture) is untouched; the DX12 path does not use this file.
+- Hooks: draws carry how many targets are bound; a target's floating-point kind comes from the view it is written through; reads are reported for up to four watched targets (the picture, the most-drawn target, floating-point candidates first).
+- WHY log: event `native11_scene` on every change (rule, reason in words, each candidate with format, draws, multi-target draws, draw and read order), and `scene{picture= layered_frames= colour_fmt= colour_float=}` on the status line. The status buffers grew from 2 KiB to 4 KiB so the added field cannot push an older one out.
+- Also: a picture first met through a read no longer carries the previous picture's view description.
+
+Tests: frame model test on Linux passes, with the recorded shape (picture found within five frames, DLSS before the tonemap's read, scene of 212 draws, indoor frames keep the picture, ten busier targets do not hide it) and six shapes that must keep the old rule. The DX11 fixture gained a layered case. Not yet compiled on Windows, not yet run on a GPU, and not yet seen by Cort.
+
+Proof asked of the next run: the capture's DLAA input must look like the game, `color_format` a floating-point format and `hdr=true`; then Cort's eyes.
+
+## 2026-11-13 Pacific — Native DX11: the camera keeps its position when two ranges hold it (Claude)
+
+Hearts of Iron IV on 3be35e3 (p45020, 25 minutes, 22 with DLAA), Cort: "pretty close, but there is still minor tremors, that suddenly become much worse later on".
+- 00:52:43 to 01:07:30, fifteen minutes: camera_cut flat at 30 to 31, inputs_changed 0. Captures at 00:49:16 and 01:08:08: reset=0 on 30 of 30 frames, DLAA output and screen steady to 0.05 px on a still view, motion 0. The two causes of the entry below are gone.
+- 01:10:00, the sudden worsening: camera_cut 35 to 789 and camera_path jumps 6 to 760 in 55 s. Capture 01:10:42: the camera alternates on a three-frame cycle between eye (4648, 215, 1063) and eye (0, 0, 0) with a zero translation row; reset=1 on 21 of 30 frames; output jumps up to 1.2 px. The game uploads its camera twice, with its position and relative to the camera, in different ranges. The search takes the first range that gives a camera, most-drawn first, and which is most drawn changed with what was on screen.
+- Not explained yet: the "minor tremors" in the steady stretch (not visible in a still capture; a guess is that they belong to camera motion), and 2,010 frames in bursts (00:50 to 00:52, 01:08) on which the scene was not held at the boundary, near menu changes.
+
+Change (extends `camera/positioned-twin`, row updated): a position-less camera found by the general rules is kept aside while the rest of the scene's ranges are looked through for its positioned twin (same direction and lens, `IsPositionedTwin`). Status `camera_bytes{... twin_across_ranges=}`. A game with only a position-less camera pays for the wider look once in 64 frames. The packed-layout adapter path is untouched.
+
+No fixture case for this yet (the DX11 fixture's DLAA section runs on the packed layout); the proof is the next run: `history_resets{camera_cut}` flat over the whole session, `twin_across_ranges` counting when the position-less range is the most drawn. Not yet compiled on Windows.
+
+## 2026-11-13 Pacific — Native DX11: DLSS keeps its history with rotating buffers; reprojection composed as on DX12 (Claude)
+
+Hearts of Iron IV on faad053 (p40940, capture j2-20261113-002205), Cort: "Better but now the whole map is shaking, like it tremors", and it stops with jitter off. The camera is now found on 7,530 of 7,532 attempts. Checked on the capture before any change:
+- Theory 1, borders and names drawn without the jitter while the terrain has it: ruled out. Letters, coast, terrain and city lights all move by the jitter difference, together.
+- The DLAA output moves every frame by about the jitter. It should be still.
+- Cause 1 (in the capture meta): `reset=1` on 30 of 30 consecutive frames, with camera_cut=0. The provider reports a change of inputs when the camera's buffer id differs from last frame's. This game binds a different buffer object every frame, so every frame was a "change", DLSS dropped its history every frame, and its output was the current jittered frame.
+- Cause 2 (motion plane): a constant (-0.11, +0.03) px on a still camera with vp_cur == vp_prev to every digit. Reproduced offline from the captured matrix: chaining inverse and previous view-projection as two float matrices through world coordinates of about 4,500 gives -0.04 to -0.17 px in x and +0.01 to +0.04 in y; in double it is exactly 0. The DX12 host already composes the two in double (`ComposeReprojectionRow`, Astra's Anno blur finding). The DX11 consumer did not.
+
+Change:
+- provider.cpp: with `camera11/all-uploads-when-buffers-rotate` in force, the camera's buffer object is not part of the input stream. Colour and depth changes still are, and a real cut is still found from the camera's path.
+- native_d3d11/live_dlaa.cpp: the reprojection is composed in double as on DX12. Status `native11_dlaa ... history_resets{camera_cut= inputs_changed= frame_gap=}` so a log says how often and why the history was dropped.
+- Fixture: the rotating-buffer case also requires no change of inputs over 30 frames.
+
+Not yet compiled on Windows or run. Proof asked of the next run: capture `reset=0` on consecutive frames, motion plane 0 on a still view, `history_resets{inputs_changed}` flat; then Cort's eyes: no tremor with jitter on.
+
+## 2026-11-13 Pacific — Native DX11: the camera is found every frame when a game rotates its constant buffers (Claude)
+
+Hearts of Iron IV on 979d495, two runs by Cort.
+- p43648 (40 s, loading screen or main menu): 50 flat draws a frame onto the swap chain's buffer, none testing depth; `native11_point point=none`, correctly no DLAA.
+- p45540 (campaign map, 18,786 frames, about 140 fps): Cort: "it did run but without jitter". On the map the scene is NOT drawn onto the screen: it goes into a floating-point target (format 10) that is read afterwards, so the ordinary read point places DLAA (`point=before-read`). The capture's DLAA input is the lit map with no HUD, labels or counters, and the depth is a real depth picture. So the picture and the place are right, and the on-screen variants of the entry below were not what this game's map needed (they stay, tested, for the shape they describe).
+
+What is wrong on the map, from the log: `fired=14929 camera_found=7465 camera_missing=7464`, in lock-step, `pose{generic=7465 no_packet=7464}`, held 0. The camera is found on exactly every other frame. On the missed frames the top-ranked binding (PS slot 0, 2,094 of 2,201 scene draws) has `kept=0`: no upload was kept for that buffer at all. The provider keeps uploads only for the buffers last frame's scene ranked highest, except on the frame after a miss, when it keeps everything. A game that binds a different buffer object at the same place each frame is therefore found only on the keep-everything frames. Jitter follows from the same cause: the sample armed after a delivered frame is rasterised on the next frame, which is the one that finds no camera, so every delivered frame was drawn unjittered (`native11_jitter` 240 of 240 with `applied=0`, while `viewport_jitter{frames=7425}` counts the jittered, undelivered ones).
+
+Change (`camera11/all-uploads-when-buffers-rotate`, one row in docs/VARIANTS.md): when the found-then-no-bytes pair is seen twice, every upload is kept from then on. Event `native11_camera_bytes keep=all why=`, status `camera_bytes{keep_all=}`. A game whose short list holds its camera never switches, so nothing changes for it.
+
+Tests: DX11 GPU fixture case with the camera buffer alternating between two objects (delivery on every frame, jitter applied, status says keep_all). Not yet compiled on Windows or run.
+
+Proof asked of the next run: `camera_found` close to `fired`, `camera_missing` flat after the first seconds, `native11_jitter applied=1`, capture meta `jitter_px` non-zero; then Cort's eyes on a moving map.
+
+## 2026-11-13 Pacific — Native DX11: a scene drawn straight onto the screen gets a place for DLAA (Claude)
+
+Hearts of Iron IV, taken over from Astra and Sol at Cort's word. Evidence is the saved log of p41576 on 496d691: 3,704 frames, `fired=0 missed=0 unplaceable=0`, no camera event, "Waiting for a native scene." `missed` only counts frames that had a learned place, so the model never learned one. The only place the DX11 model learns by itself is "before the n-th read of the picture"; the second rule in frame_model.hpp ("before the first HUD draw", written for pictures drawn straight onto the screen) needs `EnableOverlayRule`, and nothing on DX11 ever called it. The provider already fires at that point when the model asks (`Boundary::BeforeHud`); the model never asked.
+
+Theories, each handled or made readable in this one build:
+1. The picture is the swap chain's buffer and is never read. Handled: `point/before-hud-on-screen`.
+2. The HUD keeps the scene depth bound with the depth test off, so every draw of the frame counts as a scene draw and rule 1 finds nothing. Handled: `point/before-untested-hud`.
+3. The screen picture is written through an sRGB view, which the consumer refused. Handled: `colour/srgb-view-as-stored`. A blue-first (BGRA) or 10-bit picture is still refused, now with its own reason in words.
+4. The camera is not found once DLAA is attempted. Not knowable before the first attempt; the existing `native11_cam` events list every candidate and why it was refused.
+5. The picture chosen is not the map. Readable from the auto-capture's DLAA input and `scene{}`.
+
+Change, all in shared code, chosen by what the program sees, no game name:
+- frame_model.hpp: `SetScreenTarget`; the HUD rule is on by itself when the picture is that target; the untested-HUD point with its own counters and its own "too early" test.
+- provider.cpp: tells the model the screen target each frame; a swap chain buffer is never held across a present (taken again from the bound target at the HUD point); event `native11_point` whenever the kind of place changes, with the reason in words; five more fields in `scene_boundary{}`.
+- live_dlaa.cpp (native DX11 consumer): the sRGB view case and the two worded refusals.
+- Pictures that are not the screen target: unchanged (the rule stays off; tested).
+
+Tests: frame model test on Linux passes with the new cases. DX11 GPU fixture gained two on-screen cases (HUD without depth, HUD with depth bound and test off) and a return to the read point. Not yet compiled on Windows, not yet run on a GPU, and not yet seen by Cort.
+
+Proof asked of the first run: `native11_point` names the place and why; `fired` and `delivered` move; the capture's DLAA input is the lit map (colour format 28, `hdr=false` is right for a screen picture); labels and HUD are outside the picture; then Cort's eyes.
+
+## 2026-11-12 Pacific — HOI4 with multisampling disabled, native DX11 placement evidence
+
+Cort reports DLAA still unavailable after restarting and loading a campaign. HOI4 system.log confirms DirectX 11 and no multisampling. Session p41576 on 496d691 has 3,704 presents, 643 overlay draws, 44,921 exact-range reads against selected colour draws, zero scene insertion attempts and zero deliveries. Camera admission and the DLAA backend were never reached.
+
+Follow-up continues from Claude's 56e49ef DX11 line, which distinguishes the material targets of a layered renderer from its lit picture. Reuse the existing frame model and add its selected scene draws, observed and learned read/draw boundaries, sample counts and swap-chain-buffer identity to the status line. Observe the buffer identity on swap-chain adoption and resize without keeping a reference. The counters distinguish a direct-to-backbuffer scene with a later draw from an offscreen scene missing a read or with an unusable command-list boundary. They do not arm an insertion point. The frame-model fixture checks that a draw boundary is reported even with the HUD rule disabled. No game launch or game installation performed by Astra.
+
+## 2026-11-14 UTC — native DX11: texture detail and filtering end where the scene ends
+
+Cort, Hearts of Iron IV: "when i turned on anisotropic filtering, there was red pixels everywhere, which got worse when you go higher on the filtering multiplier."
+
+Evidence, read from a saved capture of p45020 on 3be35e3 (`j2-20261113-004916-hoi4-p45020`, taken between the logged `mip_af live ... af=16` and `af=0` events): the picture given to DLAA is clean, the DLAA output is clean, the presented frame is covered in red speckle on land, sea, borders and outlined letters. So the speckle is made in the game's passes that run after the DLSS point, which sampled through our anisotropic variants. Which of those passes and which texture is not known.
+
+Change, shared code, no game name: once the frame's picture has been handed to DLSS (`Fire`), sampler binds on the immediate context keep the game's own samplers until Present, for mip bias and for filtering alike. The bindings are refreshed at the first draw after the hand-over and at the first draw of the next frame, with no new bind by the game. Frames with no DLSS point behave as before. Deferred contexts behave as before. Status: `native11_samplers{... after_scene_own=}` counts eligible binds left as the game's own for this reason. This restates the DX12 rule ("applied where the game samples its textures, before DLSS") on DX11, where it was applied to the whole frame.
+
+Not covered: a pass before the DLSS point that samples a data texture through a linear mipmapped sampler would still be made anisotropic. The capture shows no such defect in this game.
+
+Tests: one more GPU fixture case (after the hand-over the bound sampler is the game's own; the next frame gets 16x and -1 back). Not yet compiled on Windows, not run, not seen by Cort.
+
+## 2026-11-14 — Astra: native DX11 jitter coordinates and 16-phase R2
+
+Cort requested coordinate correction and 16-sample R2 with preset M unchanged, automated tests, and an updated WWII CMD; game testing remains his. Coordinated ownership in central COMMS before editing. Based on shared native-DX11 head 2ab84c6, preserving Fable's boundary/colour work; no HOI4 package change.
+
+The existing full-target viewport expansion changes the raster projection by (W+1)/W and (H+1)/H. Depth and colour used that raster footprint while camera reconstruction used the unexpanded game projection. Carry actual expansion from executed immediate/deferred scene draws and apply its X/Y transform to the unjittered camera before tracking. Current, inverse and previous matrices now share that coordinate system. Keep pixel jitter separate, preserve the border coverage, and preserve original projection when expansion is absent. Mixed expansion/sample draws use the existing mixed-jitter rejection. No game-name selector.
+
+Native DX11 R2 uses 16 positions at the same subpixel amplitude; Halton remains 8 and the DX12 route is unchanged. All camera admission paths use the same raster correction. Cached source matrices remain original. Preset/model and NGX flags are unchanged.
+
+Validation: Release build of NeuralAliasDXGI and focused targets passed with the real NGX SDK. Eight CTest cases passed (50.36 s): temporal_jitter, camera_tracker, native11_viewport_jitter, host_dlss_real_test, host_native11_frame_model_test, host_native11_provider_test, host_native11_dlaa_test, host_native11_dlaa_automatic_test. New independent math checks cover off-centre raster points at 64x36 and 3440x1440, normal/reversed depth, all 16 phases, camera reprojection through jitter toggles, plus partial/multiple viewports. Provider fixtures check immediate/deferred expansion identity; the real NVIDIA fixture delivers 34 successive frames with M and checks the executed 16-phase sample. R2 uniqueness/wrap and unchanged Halton are checked. These synthetic fixtures establish coordinate/handoff correctness, not WWII visual improvement. Logs: local workspace build-jitter.log, test-jitter.log and build/Testing/Temporary/LastTest.log. User performs the real-game comparison.
+
+### WWII packaging completion and base correction
+
+The actual fetched shared branch checked out for this work was 502f6bf (descendant of 2ab84c6), not 2ab84c6 itself as initially named in COMMS. It includes Fable's rotating-upload/history continuity, split camera position and sampler-boundary fixes. All eight tests ran against that combined source plus a11c167.
+
+Staged C:\Users\Cort\Documents\NA-wwii-on12-a11c167; repaired the existing update/install/trial/results/rollback CMD targets, which had pointed at a missing fc0e6bd package. Proxy SHA256 B07DF49792AAC80B1D421B75C8E7E8B52102F755B51EE5C7B9E525729D005D80. Same NVIDIA runtime 310.9.16; saved M/R2 configuration untouched. Reconstituted the exact installed fc0e6bd proxy/runtime as a separate recovery package and NA-wwii-restore-fc0e6bd.cmd. No installation or game launch performed.
+
+Reused the WWII additive deployment receipt and shared results collector. Bundled/hash-checked runtime and support files; native DX11 enabled, bridge disabled, same settings scope. Package script tracked as tools/deploy-wwii-native11.ps1 (staged filename deploy.ps1). Isolated fixture verifies upgrade from a copy of the current receipt, M/config preservation, separate old/new result archives, exact previous-DLL restoration, upgrade again, corrupt payload rejection without removing installed files, and uninstall leaving original assets intact. Real game DLL and settings hashes unchanged. First fixture assertion mishandled CRLF; corrected only the assertion and reran successfully. Evidence: local/wwii-jitter-package/installer-checks.log, copied into the package. PR 137 is stacked on Fable's shared branch so it contains this focused change rather than repeating the pending integration PR.
+
+## 2026-11-14 — Astra: stationary-motion investigation and flow repair
+
+Cort assigned actual tremor diagnosis/repair, coordination with Fable, automated tests and an updated WWII CMD. Kept the current game's installation and settings untouched. Began on astra/wwii-stationary-tremor from a3183eb, preserving shared native-DX11 work through 502f6bf and a11c167. Posted ownership and capture findings to central COMMS. No response from Fable yet at this milestone; no duplicate work assumed.
+
+The latest saved WWII capture contains an uninterrupted stationary segment with small camera motion, exact depth reconstruction, no history resets, and nonzero optical-flow residuals on some static geometry. Source inspection revealed an absolute .02 image-error exception accepting vectors that made the match worse than the camera-only answer. Reproduced it through the actual GPU pipeline: 340 sampled stationary points incorrectly get one-pixel motion. Removing that exception brings the count to zero, retaining all 360 sampled genuine one-pixel moving points. Both AMD and NVIDIA acceptance shaders now require an actual improvement and the existing ratio. No larger snap threshold, forced flow disable, extra GPU pass or per-game check.
+
+A real preset-M DLAA pixel fixture (jitter zero, 64 frames per case) establishes the downstream consequence: false one-pixel motion gives mean frame-to-frame change .007588648 versus .000465106 with correct motion. This is synthetic evidence, not an in-game before/after result. Added it to CTest. Native DX11 capture metadata previously left flow/raster/depth facts at zero; now filled from the actual evaluation, with the unmodified source colour retained in armed captures when AO/tone mapping changes DLAA's input. The capture fix prevents confusing post-AO image evidence with the source flow actually read.
+
+Detailed evidence, discarded explanations and remaining limits: docs/WWII-STATIONARY-TREMOR-20261114.md. Separate later missing-origin bursts and XeGTAO pine artifacts are not represented as fixed by this bounded change. Focused suite and packaging results appended after completion. User retains live testing.
+
+### Automated completion
+
+Release proxy built successfully. All 12 selected CTest cases passed in 64.34 seconds: temporal_jitter, camera_tracker, native11_viewport_jitter, j2_compute_flow, j2_flow_retention, j2_flow, dlss_real, dlss_stationary_stability, native11_frame_model, native11_provider, native11_dlaa and native11_dlaa_automatic. No selected check skipped. Real AMD fixture retained zero stationary motion with confirmed raster jitter and .0043 px moving-camera error. Native M fixtures retain the 34-frame/two-R2-cycle checks. Optional real-NGX input preservation: 0 of 262144 motion components changed, maximum error 0. Variant register: 21 rows, zero errors. Existing game process left running and untouched; all GPU work was in bounded standalone synthetic fixtures, not game control/testing.
+
+### WWII tremor package and handoff completion
+
+Source 0e2261c17a0f47031fb7176795d11010ebacbc58 is pushed on astra/wwii-stationary-tremor, PR 138 stacked on PR 137. Staged C:\Users\Cort\Documents\NA-wwii-on12-0e2261c; proxy SHA256 8D102DEF26E8FC172F1AEEE30E3A629460B00268B3A9B5D2A7B4F671526F8736. Existing Documents WWII update/install/trial/results/rollback CMDs now target this package. Added NA-wwii-restore-a11c167.cmd; both a11c167 and fc0e6bd recovery packages retain their original proxy hashes. Same NVIDIA 310.9.16, model M and saved settings scope retained. Production installer still refuses deployment while the game is running.
+
+Isolated fixture passed upgrade, results export, exact previous-DLL restore, re-upgrade, corrupt-package rejection before rollback, and removal of only owned additions. Its copied package scripts substitute a deliberately nonexistent process name for the running-game check, solely to exercise the fake installation while Cort's actual game remains open; released package guards are unmodified. The fake executable is never launched. Original fixture assets and actual live proxy/settings hashes remained unchanged. All six released payload hashes verified, CMD targets checked. Evidence copied as INSTALLER-CHECKS.txt with the automated and before/after regression logs. No real-game deployment, launch or control performed. Actual WWII visual improvement remains Cort's test, and separate AO/camera-origin findings remain qualified in the report.
+
+## 2026-11-15 UTC — material textures on native DX11: census and swap, first increment
+
+Cort approved the combined material enhancement plan (Astra's coordinated detail, Fable's delivery); order of work in COMMS 704d70f9, Astra's acceptance 39f40206 and record e8cbd44 (`src/materials/record.hpp`, `docs/MATERIAL-CACHE-V1.md`). This branch now sits on e8cbd44, which contains 502f6bf and Astra's WWII fixes.
+
+What this increment is: the delivery mechanism, proved with a marker texture. It is not an enhancement yet, and it reads no cache.
+- `native11/texture_policy.hpp` (portable, CPU-tested): judges each shader resource view once and names the reason a texture cannot take a replacement (rendered to, rewritten, data format, too small, no mips, partial view, cube, array, multisampled, not 2D). A candidate is not yet a material role.
+- `native11/textures.cpp`: hooks the device's CreateShaderResourceView and the contexts' PSGetShaderResources; the provider's PSSetShaderResources detour asks it for the views to bind. A view's destruction is seen through its private data; no reference is held on a game object. Publication is visible from the next Present, for everything published before it; already-bound views are re-bound at the next draw; the game reads back its own view; one live switch.
+- Census: pixel-shader binds counted on one frame in sixteen, before the picture is handed to DLSS; every two minutes `native11_texture_census` and up to 48 `native11_texture` rows (size, mips, formats, class, slot, binds, the set of views bound in the same call, bytes, bytes at double size). Binds rank use and are labelled as not being pixel coverage; a set is a candidate association.
+- Status: `native11_textures{...}` with the verdict tally, live, retired, replaced, bytes, swapped on immediate and deferred contexts separately, views returned as the game's own.
+
+Known limits, stated rather than hidden: a deferred command list recorded before a Present keeps what it recorded while the game replays it; a replacement with different dimensions is not checked against `Load`/`GetDimensions`/explicit LOD in the shader yet (the fixture keeps dimensions); VS/CS binds are not swapped; the bind-time lookup's cost per frame is not measured yet.
+
+Tests: CPU policy test passes on Linux. GPU fixture case added (not sampled before Present; sampled after it with no new bind; read back as the game's view; off and on live; withdrawn; memory accounted). Not yet compiled on Windows, not run on a GPU, not run in a game.
+
+### Same day — review of the first increment, three defects repaired before any run
+
+An independent review (three readers, each finding then argued against by another) confirmed three defects by tracing the code; none had run yet. All three came from one design choice, a table mapping a replacement back to the game's view.
+1. A withdrawn or superseded replacement stayed bound: the mapping was erased at Present, before the already-bound slot was repaired from it. The fixture's last check would have failed.
+2. While a replacement was bound in a game view's place, nothing kept the game's view alive (D3D's own bind reference was on the replacement), so restoring it or answering PSGetShaderResources could touch a view another thread was destroying.
+3. One replacement published for two game views corrupted the mapping.
+
+Repair: the mapping is gone. Each context keeps, per pixel-shader slot where a replacement is bound, the game's own view with one reference (`PsShadow`, in the provider's per-context state), taken on the game's own bind call: the reference D3D would have held. Restoration and read-back work from it. Cleared wherever the context's state is reset. Several game views may now share one replacement. A context with nothing replaced and nothing replaceable is no longer re-bound when the policy key changes.
+
+Also from CI: the judged-texture facts type clashed with the scene `TextureFacts` in the same namespace; renamed `MaterialTextureFacts` (e4c6ca7, Windows build and non-GPU tests green).
+
+### Same day — Astra's three delivery corrections (COMMS f55ee3e3, written against e4c6ca7)
+
+1. Reverse identity erased while an old version is still bound: already repaired in 6a8100a (no reverse table; the slot's own shadow names the game's view). Her fixture sequence is now in the test: version A, version B with no bind by the game, removal, with pixels and the game-facing view checked at each step.
+2. Context ownership of the game's bound view: already repaired in 6a8100a (`PsShadow`). Her fixture is now in the test: the game releases its last reference to a bound view; it is still read back and restored, and it lives exactly until the slot lets go of it.
+3. A replacement was protected between lookup and the real bind only by the eight-Present delay. Now every replacement chosen for a bind is referenced from the lookup until the bind has taken D3D's own reference (`SwapTextures` .. `EndTextureSwap`, and inside `RefreshTextures`), released outside the table's lock. The delay remains as tidy-up only.
+
+Also added: a deferred recording made while a replacement is visible samples it when executed and reads back the game's view. Not covered yet: the game's view kept alive for the lifetime of a recorded command list (a list replays the replacement, which D3D keeps alive itself; the game's view is only needed for read-back and restoration on a context, which the shadow covers).
+
+## 2026-11-15 Source identity `texture-subresources-v1` (Fable)
+- `src/materials/texture_subresources_v1.hpp`: portable serializer and SHA-256 for the identity agreed in COMMS 9b962d6f / fc0b110f. Python reference `tools/material_baseline/texsub.py`; shared vectors in `tests/cpu/texture_subresources_v1_test.cpp` (two mips, sRGB reading, BC1, view from mip 1, array slices, row-pitch padding, invalid orders and formats).
+- Not yet wired into the runtime: source capture and the manifest/DDS loader come next.
+
+## 2026-11-15 Source texture dump on native DX11 (Fable)
+- `native11/textures`: `RequestTextureDump(dir)`. Candidates bound to pixel shaders in the scene over 32 frames are noted inside the game's own bind call (the only place a reference is taken), the most used 48 within 512 MiB are kept, and one per Present is read through a staging copy and written as `<texture-subresources-v1 digest>.dds` (bytes as stored, DX10 header with the view's typed format) with a line in `index.jsonl` (formats, size, slot, bind counts, set). Events `native11_texture_dump` (requested / skipped with why / done); status `dump{active= written= skipped=}`.
+- Started once per saved capture folder from the native DX11 DLAA path (`<capture>\textures`). No new menu control.
+- Fixture case in `provider_test` (GPU): expected file name computed independently by `tools/material_baseline/texsub.py`. Compiles on CI; not yet run on a GPU or in a game.
+
+## 2026-11-15 Dump rework, serializer hardening, manifest reader (Fable)
+- Astra's corrections applied (6db3a8df): the source dump no longer waits on the GPU or writes files in the Present callback (one staging copy in flight, read with DO_NOT_WAIT on a later Present, hashed and written by a per-request worker; index line only after the finished file). The serializer validates its header before any arithmetic; R8_UNORM added.
+- `src/materials/manifest_reader.hpp`: portable reading of a cache entry's manifest.json into `Record`, `CheckDds` (header, size, SHA-256 of a map file), `MatchesGameTexture` (what a game texture must present to take a map). Refuses with a worded reason; does not verify entry_key against the recipe (needs the writer's canonical JSON; stated in the header). Test `material_manifest_reader` uses a manifest generated with material_lab's own DDS header/layout code.
+- Not yet: creating GPU textures from an entry and publishing them; finding a game texture's digest at run time.
+
+## 2026-11-15 Material cache loader on native DX11 (Fable)
+- `materials/cache_index.hpp`: which game textures have a prepared map, and the v1 rule for what may replace what (same size and mip count; sRGB colour for sRGB colour, BC5 for BC5, BC4 for BC4). Refusals carry their reason.
+- `native11/texture_loader.{hpp,cpp}`: reads `%LOCALAPPDATA%\NeuralAlias\materials\<entry_key>\manifest.json` at install (manifests only). A game texture of a prepared shape has its creation data copied in `CreateTexture2D` and digested on the loader's thread (no GPU read-back); a matching candidate view names a map; the map file is read, checked (header, size, SHA-256) and created on that thread; an entry is published as a unit with `PublishTextures` (by view address and creation serial). Budget 1536 MiB. Status `native11_materials{...}`, events `native11_materials` with reasons.
+- Known limits, all logged or counted: textures created empty and filled later have no identity yet (`no_creation_data`); a shown entry's maps stay loaded until the process ends; no menu control yet (the folder being absent keeps the loader idle); entry_key is not re-derived from the recipe.
+- Fixture case in provider_test (GPU only): BC1 green game texture, BC7 white prepared map. Not yet run on a GPU.
+
+## 2026-11-15: larger prepared maps, the portable half (Fable)
+- `src/materials/shader_texture_use.hpp`: reads a pixel shader's disassembly listing and says, per texture slot, whether it is only sampled plainly (`sample`, `sample_b`, `sample_d`) or read some other way (the mnemonic is kept as the reason). Unknown listing = nothing safe.
+- `src/materials/cache_index.hpp`: `LargerLog2`, `Qualified(map, allow_larger)`, `CacheIndex(allow_larger)`, `Hit::larger_log2`. A 2x/4x/8x map needs one extra level per doubling. The runtime still builds its index without `allow_larger`, so behaviour in a game is unchanged until the pixel-shader hooks and the per-draw choice exist.
+- Tests: `na.cpu.shader_texture_use` (4 cases), `na.cpu.material_cache_index` (4 cases). Not yet: the native11 hooks, a real listing from D3DDisassemble on Windows.
+
+## 2026-11-15 — DLAA for 32-bit games: companion program and handoff (Fable)
+- `src/dlaa_remote/`: `protocol.hpp` (fixed-width contract), `channel.*` (one shared block, two events), `client.*` (in-game half: starts the companion, shares fences and textures by duplicated handles, per-frame request, handoff timing), `companion*.cpp` (`NeuralAliasDlaa64.exe`: opens the shared objects, runs the unchanged `dlss::` backend, always signals `done`).
+- `native_d3d11/live_dlaa.cpp`, variant `dlss/in-companion`: on that route one frame is two command lists with the companion's DLSS between them, ordered by two shared fences (`ready`, `done`); no pixels cross as bytes. The game thread waits for the companion's answer each frame; that wait is the logged `handoff_us`.
+- Not yet on the companion route: ambient shading (XeGTAO) and tone/bloom before DLSS (they hand DLSS a different colour image). The menu says so for ambient shading.
+- If the companion ends or stops answering, the in-game half releases the fence itself, DLAA latches off with the reason, and the game's picture continues.
+- Tests: `host_dlaa_channel_test` (no graphics, both kinds of build), `host_dlaa_companion_test` / `_warp_test` (copy mode), `host_dlaa_companion_dlss_test` (RTX only). None has run on a real GPU yet.
+
+## 2026-11-15: a game that moves to a second device (Fable)
+- Rome II run on 3a186fc9: the program loaded on DX11 and the Home menu worked, but from the moment the game made its second D3D11 device the provider saw no draws and no sampler binds at all (presents still counted), so DLAA waited for a scene for the whole session.
+- Cause: `native11::Get` remembered "is this context the game's?" per context for ever. A context first met while another device was the watched one stayed "not the game's".
+- Fix (`native11/provider.cpp`): the answer carries a game-device generation; `Install` with a different device raises it and every context is asked again (its remembered state is cleared). Event `native11_device`, status `game_device{generation contexts_rechecked became_game other_device_calls}`.
+- Test: `provider_test` starts on a first device, meets the real context early, then installs on the real device; all phases run behind that.
+
+## 2026-11-16: Rome II second run; 8-bit layered renderers; frame order in the log (Fable)
+- Run p33844 on 00f3455b: one device this time (the device move was not exercised), scene and camera found on every frame, but the picture chosen was a format 87 (BGRA) material layer and DLAA refused it. Rome II is a layered renderer with no floating-point target: two sets of 8-bit layers, then draws with the scene depth on the screen target.
+- `frame_model.hpp`, variant `scene/after-layers-on-8-bit`: two or more finished sets of 8-bit layers and the scene going on in the screen target make the screen target the picture. One set alone keeps the old rule.
+- `native11_flow` event: the last frame as runs of draws per target and the watched reads, in order, with each picture-choice change (16 at most). Whether the lit picture really is finished on the screen target in Rome II is NOT known yet; this line shows it either way.
+- Not done: more than one layer set is not yet counted as scene draws (jitter covers the most-drawn set only); BGRA scene colour is still refused.
+
+## 2026-11-16: Rome II third run; the picture behind a second depth buffer (Fable)
+- Run p3624 on a3472dc8: the DLAA companion ran in the game for the first time (72,426 frames, 0 refused, handoff avg 0.28 ms). But the on-screen 8-bit rule was wrong: `native11_flow` showed the lit picture is a format 26 floating-point target drawn with a SECOND depth buffer after the layers are read, then tonemapped. DLAA ran on the finished screen image with only 7 map marks jittered; Cort saw wobble and no gain.
+- Removed `scene/after-layers-on-8-bit`. Added `scene/after-layers-second-depth` (frame_model.hpp): floating-point picture drawn with another same-size depth after the layers; both depths take the jitter; depth-tested draws into every layer set are scene draws.
+- Viewport jitter now stops for the rest of the frame once the picture is handed over (marks and HUD that test the scene depth no longer move). Status `second_depth= jitter_stopped_after_scene=`. Flow steps print the depth buffer bound.
+- Open: which of the two depths is the complete one for DLSS (the first is handed now); the 565 untested draws into the most-drawn layer set are not jittered.
+
+## 2026-11-16: Rome II with the game's AA off: DLAA runs but looks the same on and off (Fable)
+- Run p660 on 2f539a98 (game AA off): DLAA delivered 48,323 frames, 0 refused, rule after-layers, point before-read; about 930 depth-tested draws a frame took the jitter and the switch did stop it for the ~860 frames Cort had it off. Sharpness read 0 for the whole run. Cort: DLAA on and off look nearly identical, jitter on/off no visible difference. No capture was saved on that run.
+- Measured on the earlier capture (p3624, a3472dc8, game AA on): with a still camera, only about 15% of the picture moved by the told jitter. Open ground moved; forests, towns and the sea did not. DLSS in the companion was gathering frames (output steady while the input moved) and the shown picture followed the output. So the weak point there was jitter reach, not DLSS. That build jittered fewer draws than 2f539a98, so it is a hint for p660, not proof. Asked Cort for one capture on 2f539a98.
+- New tool `scripts/capture_jitter_map.py`: from a capture folder, how much of the DLAA input moves with the told jitter (shares and a green/red map), whether the output is steady, whether the shown picture follows the output, and what depth and motion hold. This is the "look at the DLAA input first" rule as a measurement, for any game.
+- Log (`native11/provider.cpp`, `frame_model.hpp`): `native11_flow` steps carry `v=` (all the run's vertices: a few per draw is a full-screen pass, many is geometry) and go out in parts when long; `native11_jitter` carries `shifted_vertices=` and `still_meshes{draws untested vertices}` (meshes drawn with the scene depth bound, while the sample is live, that kept the game's own viewport). With these the log alone says how much of the geometry gets the jitter.
+- Answered by Cort's capture on 2f539a98 (p10608, `j2-20261115-184258`, game AA off, still camera): the jitter does reach the picture. Moved fully 85.5%, partly 14.4%, not 0.1% (median 0.92 of the told shift). The 15% hint from the a3472dc8 capture did not carry over, so no change to which draws take the sample.
+- Same capture: DLSS output steady (frame-to-frame change 0.12 against 4.06 on the input), the presented picture matches the output (0.588) and not the input (0.185), depth 0.9426 to 0.9907 with nothing at clear, motion 0 px, jitter sign right, R2 16-position pattern in use, samplers applied (bias -1, AF 16). DLAA is working end to end.
+- Why Cort sees no difference: the DLAA result equals a plain supersample of the jittered inputs (smooth, no stair-steps) and is softer than the game's aliased picture (fine detail 13.5 game, 7.9 DLAA, display scale), and Sharpness has been 0 in every Rome II run, so the sharpening pass has never run there. An offline port of the program's own pass on the captured result gives 13.1 at Sharpness 50 and 40.0 at 100.
+- Code read: on the companion route the sharpening pass is recorded into the second list (`evaluated` is set true at recording), so it should run; `native11_dlaa sharpness=` in the log is the proof once the slider is above 0.
+- Asked Cort to set Sharpness to 50 on 2f539a98 (live). If nothing changes on screen, the pass is not running on this route and that is the next fix. No code change made from this capture.
+
+## 2026-11-16: Texture mip bias is a menu choice again, with stronger steps (Fable)
+- Cort 03:09Z: "you could unlock the mip bias changer as well. we removed it but in this case maybe it should be higher". The row had been read-only since 85016075 (automatic total, -1.00 for DLAA).
+- Menu row "Texture mip bias" is a selector at full resolution: Off (game's own), -0.50, Automatic (-1.00), -1.58, -2.00, -2.25. Live through the existing sampler twins (DX12) and sampler variants (native DX11); no new levels were needed, the six are the ones `kMipLevels` already builds.
+- Saved per game in a new key `[j2] texture_detail` (`auto` or the total). The old `[j2] mip_bias` key still chooses nothing, so an Off or Light saved by the pre-85016075 menu cannot switch texture detail off; it stays a mirror of the total in use. Start-up (`session.cpp`, `host_boot.cpp`), the DLAA switch and `j2::SmallMipBias` at scale 1 use `settings::DlaaMipBias`. Added upscaling modes keep their automatic totals.
+- Log: `setting j2_texture_detail_x100=` (who changed it), `mip requested bias=`, and on native DX11 `native11_samplers{want_bias= applied_bias=}`.
+- Tests: `pbz_settings_test` (default auto, save and load, clamp, old key ignored), `session_init_test` (start-up applies the choice; recovery does not). Not yet built or run on Windows here; CI builds it.
+- CI on 0669b90d: every `j2_anno_shape_test` variant failed on three checks that still held the 85016075 rule (`SmallMipBias(x, 1) == -1` for any x). They now state the new rule: full resolution returns the total it is given, the reduced modes keep their own totals.
+
+## 2026-11-16: Ambient shading and bloom when DLAA runs in the 64-bit companion (Fable)
+- Was: on the companion route (32-bit games) both passes were skipped, because each hands DLSS a picture of its own and the companion reads the shared scene colour. The menu offered them and nothing happened.
+- Now (`native_d3d11/live_dlaa.cpp`): the passes record as on the in-process route; when one made a picture, the first list copies it into the shared colour before handing the images to the companion. Motion and flow have read the game's own picture by then, and sharpening only uses the shared colour as its target afterwards. One full-screen copy per frame, only while a pass is on.
+- Log: the `native11_dlaa` status ends with `companion_shaded=<frames>` after the `dlaa_companion` numbers.
+- Test: `host_native11_dlaa_companion_test` = the existing native DX11 DLAA test with `NA_DLAA_COMPANION=1` (64-bit build, real DLSS in the companion). First run of the consumer's two-list companion path outside a game: delivery, sharpening after the companion, ambient shading and bloom reaching the companion's input. Registered only where NGX and the DLSS runtime exist, so it has not run yet; CI only compiles the change.
+- Scale check from Cort's capture (p10608 frame 7): the campaign camera sits 26 to 65 units from the ground and a pixel covers about 0.02 to 0.05 units, so the default 0.5-unit radius is roughly 10 to 20 pixels there. A sensible size; no radius change made.
+- Tone is not part of this: adaptive tone mapping was removed on 2026-11-06, so the Lighting pass is bloom only.

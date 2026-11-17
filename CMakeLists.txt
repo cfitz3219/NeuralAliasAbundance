@@ -39,7 +39,10 @@ if(NOT WIN32)
   return()
 endif()
 
-if(NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+# 32-bit games (a 32-bit copy of the in-game half beside a 64-bit DLAA companion) are being
+# brought up: NA_ALLOW_X86 lets a Win32 configure through so CI can list what does not build yet.
+option(NA_ALLOW_X86 "Allow a 32-bit (Win32) configure of the host while 32-bit support is brought up" OFF)
+if(NOT MSVC OR (NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT NA_ALLOW_X86))
   message(FATAL_ERROR "The DX12 host requires MSVC and x64.")
 endif()
 enable_language(C)
@@ -61,6 +64,16 @@ if(NOT NA_SDK_ROOT)
   endif()
 endif()
 set(NA_SDK_ROOT "${NA_SDK_ROOT}" CACHE PATH "Folder holding the local NVIDIA SDKs (see third_party/README.md)")
+# The NVIDIA SDKs ship 64-bit libraries only. A 32-bit build is the in-game half for a 32-bit
+# game: it never links them (DLAA for it runs in the 64-bit companion), whatever is on disk.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  set(NA_SDK_ROOT "" CACHE PATH "" FORCE)
+  set(NA_SDK_ROOT "") # the folder search above sets the plain variable, which would win over the cache
+  foreach(v NA_NGX_SDK_INCLUDE NA_NVOF_INCLUDE NA_PCL_INCLUDE NA_NGX_LIB NA_DLSS_DLL NA_XESS_INCLUDE)
+    unset(${v} CACHE)
+    unset(${v})
+  endforeach()
+endif()
 
 set(NA_NGX_SDK_INCLUDE "" CACHE PATH "NVIDIA NGX/DLSS SDK include dir (nvsdk_ngx.h)")
 if(NOT NA_NGX_SDK_INCLUDE AND EXISTS "${NA_SDK_ROOT}/nvidia-dlss-sdk/include/nvsdk_ngx.h")
@@ -94,7 +107,13 @@ add_library(minhook STATIC
   third_party/minhook/src/buffer.c
   third_party/minhook/src/hook.c
   third_party/minhook/src/trampoline.c
-  third_party/minhook/src/hde/hde64.c)
+  third_party/minhook/src/hde/hde64.c
+  third_party/minhook/src/hde/hde32.c) # each file is empty on the other architecture
+# The x64 code readers (scale/native_locator.hpp, adapters/tsushima/locator.hpp) parse x64
+# instruction bytes with hde64 whatever the host is built for.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  target_sources(minhook PRIVATE src/host_dx12/hooking/hde64_any_host.c)
+endif()
 target_include_directories(minhook PUBLIC third_party/minhook/include)
 target_compile_definitions(minhook PRIVATE WIN32_LEAN_AND_MEAN)
 
@@ -156,7 +175,8 @@ target_link_libraries(host_observe_producers PUBLIC abundance_options host_obser
 
 # Plan B1 (native DX11 route): D3D11 input provider. Isolated and inactive:
 # nothing installs it until Astra's B2 handoff lands; built so CI compiles it.
-add_library(host_native11 STATIC src/host_dx12/native11/provider.cpp src/host_dx12/native11/samplers.cpp)
+add_library(host_native11 STATIC src/host_dx12/native11/provider.cpp src/host_dx12/native11/samplers.cpp
+            src/host_dx12/native11/textures.cpp src/host_dx12/native11/texture_loader.cpp)
 target_link_libraries(host_native11 PUBLIC abundance_options host_hooking d3d11 dxgi)
 
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
@@ -376,6 +396,18 @@ target_link_libraries(NeuralAliasAbundance PRIVATE abundance_core d3d12 dxgi use
 
 # dxgi.dll proxy (deployed under that name by the deploy script; built as
 # NeuralAliasDXGI.dll so it is never auto-loaded by accident). Boots the host.
+# DLAA for 32-bit games (src/dlaa_remote/protocol.hpp): the in-game half talks to a 64-bit
+# companion program that runs the same DLSS backend. The client builds for both kinds, so a
+# 64-bit build can measure the handoff; the companion exists only as a 64-bit program.
+add_library(dlaa_remote_client STATIC src/dlaa_remote/channel.cpp src/dlaa_remote/client.cpp)
+target_include_directories(dlaa_remote_client PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(dlaa_remote_client PUBLIC abundance_options d3d12)
+target_link_libraries(host_dx12 PUBLIC dlaa_remote_client)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  add_executable(NeuralAliasDlaa64 WIN32 src/dlaa_remote/companion_main.cpp src/dlaa_remote/companion.cpp src/dlaa_remote/channel.cpp)
+  target_include_directories(NeuralAliasDlaa64 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(NeuralAliasDlaa64 PRIVATE abundance_options host_dlss d3d12 dxgi shell32)
+endif()
 add_library(NeuralAliasDXGI SHARED src/runtime/dxgi_proxy.cpp src/runtime/dxgi_proxy.def)
 target_link_libraries(NeuralAliasDXGI PRIVATE host_dx12)
 

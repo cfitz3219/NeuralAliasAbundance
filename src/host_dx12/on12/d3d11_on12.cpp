@@ -3,6 +3,8 @@
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/native11/texture_loader.hpp"
+#include "host_dx12/native11/textures.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/native_d3d11/shared_resources.hpp"
 #include "host_dx12/observe/producers.hpp"
@@ -309,6 +311,9 @@ void install_native(ID3D11Device* device)
     if (!na::native11::InstallSamplers(device, [] { return na::observe::SamplerMipBias(); },
                                        [] { return na::observe::SamplerAnisotropyWanted(); }))
         note("native DX11 route: the sampler hooks (texture detail / AF) could not be installed");
+    // Material textures: census of what the game draws its surfaces with, and prepared replacements.
+    if (!na::native11::InstallTextures(device))
+        note("native DX11 route: the material texture hooks could not be installed");
     // Jitter through the game's viewports: no camera layout has to be proven per game.
     na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
     if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true)) {
@@ -1551,6 +1556,10 @@ int FormatStatus(char* out, size_t capacity)
         m = na::native_d3d11::FormatStatus(out, capacity);
         if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
         m = na::native11::FormatSamplerStatus(out, static_cast<unsigned long>(capacity));
+        if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
+        m = na::native11::FormatTextureStatus(out, static_cast<unsigned long>(capacity));
+        if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
+        m = na::native11::FormatMaterialStatus(out, static_cast<unsigned long>(capacity));
         if (m > 0 && static_cast<size_t>(m) + 3 < capacity) { out += m; capacity -= static_cast<size_t>(m); extra += m; m = std::snprintf(out, capacity, " | "); out += m; capacity -= static_cast<size_t>(m); extra += m; }
     }
     return n + extra + std::snprintf(out, capacity,

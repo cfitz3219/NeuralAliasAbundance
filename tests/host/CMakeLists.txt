@@ -15,6 +15,28 @@ endfunction()
 
 na_host_test(fg_profile_test SOURCES fg_profile_test.cpp LIBS host_settings nvapi_headers)
 na_host_test(ffx_flow_test SOURCES ffx_flow_test.cpp LIBS host_ffx_flow dxgi LABELS gpu)
+na_host_test(dlaa_channel_test SOURCES dlaa_channel_test.cpp LIBS dlaa_remote_client)
+# The handoff to the 64-bit DLAA companion with real programs and no game. The copy variants need
+# no DLSS; the DLSS variant runs where an RTX card and the DLSS runtime are present. The test
+# program itself builds for both kinds: a 32-bit one beside a 64-bit NeuralAliasDlaa64.exe is the
+# real 32-bit-game arrangement.
+add_executable(dlaa_companion_test dlaa_companion_test.cpp)
+target_link_libraries(dlaa_companion_test PRIVATE abundance_options dlaa_remote_client dxgi)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  add_dependencies(dlaa_companion_test NeuralAliasDlaa64)
+  add_custom_command(TARGET dlaa_companion_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:NeuralAliasDlaa64>" "$<TARGET_FILE_DIR:dlaa_companion_test>")
+  add_test(NAME host_dlaa_companion_test COMMAND dlaa_companion_test)
+  set_tests_properties(host_dlaa_companion_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_dlaa_companion_warp_test COMMAND dlaa_companion_test --warp)
+  set_tests_properties(host_dlaa_companion_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_dlaa_companion_dlss_test COMMAND dlaa_companion_test --dlss)
+  set_tests_properties(host_dlaa_companion_dlss_test PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+  if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
+    add_custom_command(TARGET dlaa_companion_test POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlaa_companion_test>")
+  endif()
+endif()
 na_host_test(jitter_probe_test SOURCES jitter_probe_test.cpp LIBS core_gpu dxgi LABELS gpu)
 na_host_test(background_work_test SOURCES background_work_test.cpp LIBS host_background dxgi LABELS gpu)
 na_host_test(gpu_services_test SOURCES gpu_services_test.cpp LIBS host_gpu_services dxgi d3dcompiler LABELS gpu)
@@ -376,6 +398,10 @@ if(NA_HAVE_NGX_LIB)
   endif()
   na_host_test(dlss_real_test SOURCES dlss_real_test.cpp LIBS host_dlss dxgi
                ARGS "${CMAKE_CURRENT_BINARY_DIR}/dlss-real-test" LABELS "gpu;nvidia")
+  add_test(NAME host_dlss_stationary_stability_test
+           COMMAND dlss_real_test "${CMAKE_CURRENT_BINARY_DIR}/dlss-stationary-test" --stationary)
+  set_tests_properties(host_dlss_stationary_stability_test
+    PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   if(NA_DLSS_DLL)
     add_custom_command(TARGET dlss_real_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")
@@ -415,6 +441,17 @@ if(TARGET host_native11)
     set_tests_properties(host_native11_dlaa_automatic_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_custom_command(TARGET native11_dlaa_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_dlaa_test>")
+    # The same test with DLSS in the 64-bit companion program: the route every 32-bit game takes.
+    # It is the only place the consumer's two-list companion path, sharpening after the companion,
+    # and ambient shading and bloom copied into the shared colour run outside a game.
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+      add_dependencies(native11_dlaa_test NeuralAliasDlaa64)
+      add_custom_command(TARGET native11_dlaa_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:NeuralAliasDlaa64>" "$<TARGET_FILE_DIR:native11_dlaa_test>")
+      add_test(NAME host_native11_dlaa_companion_test COMMAND native11_dlaa_test)
+      set_tests_properties(host_native11_dlaa_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
+        LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
+    endif()
   endif()
 endif()
 # C8b: a frame with known passes must come back as exactly those ops (ABI 0.2).

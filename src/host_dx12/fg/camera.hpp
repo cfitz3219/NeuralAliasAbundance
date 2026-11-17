@@ -15,7 +15,9 @@ struct Camera {
     uint8_t inverted, camera_motion, motion_3d, reset, not_game, ortho, dilated, jittered;
     const void* extension;
 };
+#if defined(_WIN64) // the layout is a 64-bit game's; a 32-bit build never meets it
 static_assert(sizeof(Camera) == 432 && offsetof(Camera, jitter) == 320 && offsetof(Camera, inverted) == 412);
+#endif
 inline bool InversePair(const float* a, const float* b) {
     for (unsigned y=0; y<4; ++y) for (unsigned x=0; x<4; ++x) {
         double v=0; for(unsigned k=0;k<4;++k) {
