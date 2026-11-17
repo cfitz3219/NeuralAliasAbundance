@@ -397,11 +397,6 @@ struct DepthWriteEvidence {
 void SetDepthWriteEvidence(bool on);
 // This recording's facts about `depth` (empty when it recorded none, or recorded another depth).
 DepthWriteEvidence ListDepthWriteEvidence(ID3D12CommandList* list, uint64_t depth);
-// Draw-replay probe: per frame, the scene-depth draws and how many match a draw of the frame
-// before (same pipeline, vertex shader, counts, vertex layout); of those, how many kept the same
-// vertex/index buffers. untracked: vertex buffers unknown ([observe] raster tracking off).
-struct ReplayProbeStats { uint32_t draws, prev_draws, unique, matched, same_buffers, moved_buffers, untracked, extra_stages, instanced; };
-void SetReplayProbe(bool on);
 // Draw replay (per-object motion): every qualifying scene draw is drawn again with a stream-output
 // twin of its pipeline, writing each expanded vertex's clip position (float4) into this frame's
 // slot buffer. Capture and current-frame consumption must share one recording.
@@ -445,7 +440,6 @@ struct DrawReplayStats {
 void SetDrawReplay(uint64_t frame, ReplayRetain retain);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);
 void GetDrawReplayStats(DrawReplayStats* out);
-bool ReplayProbeFrame(ReplayProbeStats* out); // call once per frame (Present); swaps frames
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
