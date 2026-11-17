@@ -9,13 +9,20 @@
 #include <vector>
 #include <cmath>
 #include <limits>
+#include <cstring>
+#include <d3d12sdklayers.h>
 #include "total_motion_gpu_audit.hpp"
-int main(int argc,char**){
+int main(int argc,char** argv){
     if(!na::ffx_flow::Built())return test::kSkip;
+    const bool debug_mode=argc>1 && !std::strcmp(argv[1],"--debug");
+    test::ComPtr<ID3D12Debug> debug;
+    if(debug_mode){REQUIRE(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))));debug->EnableDebugLayer();}
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    test::ComPtr<ID3D12InfoQueue> info;if(debug_mode)REQUIRE(SUCCEEDED(d.device.As(&info)));
     REQUIRE(AuditTotalMotionShader(d)==0);
     if(!na::ffx_flow::DeviceSupported(d.device.Get())){std::puts("SKIP: AMD search needs 32/64-lane hardware waves");return test::kSkip;}
-    const unsigned w=argc>1?1920:512,h=argc>1?1080:256;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const bool large=argc>1 && !debug_mode;
+    const unsigned w=large?1920:512,h=large?1080:256;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     test::List l;REQUIRE(l.Create(d.device.Get()));std::vector<test::ComPtr<ID3D12Resource>> uploads;
     auto image=[&](int dx,bool depth,float jx=0.f,float jy=0.f,bool world=false){
         auto fmt=depth?DXGI_FORMAT_R32_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -230,9 +237,19 @@ int main(int argc,char**){
                 }
                 read->Unmap(0,nullptr);read_prov->Unmap(0,nullptr);
                 const auto s=cf::GetStats();
-                std::printf("total pipeline i=%u expected=%.3f mean=(%.4f,%.4f) error=%.4f estimated=%u/%u wrong_tag=%u GPU=%.3fms cuts=%llu\n",
-                    i,expected,meanx/count,meany/count,err/count,estimated,count,wrong_tag,s.ms,(unsigned long long)s.total_cuts);
+                std::printf("total pipeline i=%u expected=%.3f mean=(%.4f,%.4f) error=%.4f estimated=%u/%u wrong_tag=%u GPU=%.3fms cuts=%llu format=%u\n",
+                    i,expected,meanx/count,meany/count,err/count,estimated,count,wrong_tag,s.ms,(unsigned long long)s.total_cuts,s.stabilized_format);
                 CHECK(wrong_tag==0);CHECK(estimated>count*9/10);CHECK(err/count<.13);
+                CHECK(s.stabilized_format==DXGI_FORMAT_R10G10B10A2_UNORM || s.stabilized_format==DXGI_FORMAT_R8G8B8A8_UNORM);
+                if(s.stabilized_format==DXGI_FORMAT_R10G10B10A2_UNORM){
+                    // Whole GPU chain, including the stabilized store: the shader-only fixture
+                    // cannot catch losing the subpixel evidence to 8-bit quantisation again.
+                    if(i==2)CHECK(err/count<.07); // 1/8 px
+                    if(i==3)CHECK(err/count<.105); // 1/4 px
+                    if(i==4)CHECK(err/count<.095); // reversal
+                    if(i==1 || i==6)CHECK(err/count<.005); // stationary, alternating raster jitter
+                    if(i==5)CHECK(err/count<.04); // 3 px: precision must not worsen ordinary motion
+                }
             }
         }
         // A strong image cut must hide the old temporal picture on the cut frame and stop hiding it
@@ -259,5 +276,11 @@ int main(int argc,char**){
             else {CHECK(pixel==47);CHECK(ticket.cut_reset==(i==1));}
         }
     }
-    cf::Reset();CHECK(d.device->GetDeviceRemovedReason()==S_OK);execute();return test::finish("j2_compute_flow_test");
+    cf::Reset();CHECK(d.device->GetDeviceRemovedReason()==S_OK);execute();
+    if(info){unsigned errors=0;for(UINT64 i=0;i<info->GetNumStoredMessages();++i){
+        SIZE_T bytes=0;info->GetMessage(i,nullptr,&bytes);std::vector<uint8_t> data(bytes);auto* message=reinterpret_cast<D3D12_MESSAGE*>(data.data());
+        if(SUCCEEDED(info->GetMessage(i,message,&bytes)) && message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){
+            std::printf("D3D12: %s\n",message->pDescription);++errors;}}
+        std::printf("D3D12 debug errors=%u\n",errors);CHECK(errors==0);}
+    return test::finish("j2_compute_flow_test");
 }

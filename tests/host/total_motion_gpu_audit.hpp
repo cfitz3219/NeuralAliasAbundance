@@ -36,6 +36,9 @@ inline int AuditTotalMotionShader(test::Device& d)
     test::ComPtr<ID3D12PipelineState> pso;REQUIRE(SUCCEEDED(d.device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso))));
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,12,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
     test::ComPtr<ID3D12DescriptorHeap> heap;REQUIRE(SUCCEEDED(d.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));
+    D3D12_DESCRIPTOR_HEAP_DESC cd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+    test::ComPtr<ID3D12DescriptorHeap> clear_heap;REQUIRE(SUCCEEDED(d.device->CreateDescriptorHeap(&cd,IID_PPV_ARGS(&clear_heap))));
+    const auto clear_cpu=clear_heap->GetCPUDescriptorHandleForHeapStart();
     const unsigned stride=d.device->GetDescriptorHandleIncrementSize(hd.Type);
     const auto handle=[&](unsigned i){auto a=heap->GetCPUDescriptorHandleForHeapStart();a.ptr+=size_t(i)*stride;return a;};
     const auto srv=[&](unsigned i,ID3D12Resource* r,DXGI_FORMAT format){D3D12_SHADER_RESOURCE_VIEW_DESC v{};
@@ -94,9 +97,10 @@ inline int AuditTotalMotionShader(test::Device& d)
         uav(8,output.Get(),DXGI_FORMAT_R32G32_FLOAT);uav(9,mask.Get(),DXGI_FORMAT_R32_FLOAT);uav(11,nullptr,DXGI_FORMAT_R32G32B32A32_FLOAT);
         D3D12_UNORDERED_ACCESS_VIEW_DESC cv{};cv.Format=DXGI_FORMAT_R32_TYPELESS;cv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;cv.Buffer.NumElements=10;cv.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
         d.device->CreateUnorderedAccessView(counters.Get(),nullptr,&cv,handle(10));
+        d.device->CreateUnorderedAccessView(counters.Get(),nullptr,&cv,clear_cpu);
         ID3D12DescriptorHeap* heaps[]={heap.Get()};list.list->SetDescriptorHeaps(1,heaps);
         const unsigned zeros[4]{};auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=size_t(10)*stride;
-        list.list->ClearUnorderedAccessViewUint(gpu,handle(10),counters.Get(),zeros,0,nullptr);
+        list.list->ClearUnorderedAccessViewUint(gpu,clear_cpu,counters.Get(),zeros,0,nullptr);
         D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;list.list->ResourceBarrier(1,&order);
         std::array<unsigned,28> constants{};constants[0]=constants[2]=W;constants[1]=constants[3]=H;constants[6]=2;
         std::memcpy(&constants[22],&c.jx,4);std::memcpy(&constants[23],&c.jy,4);

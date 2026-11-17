@@ -100,6 +100,7 @@ struct Stats {
     uint64_t fit_flow_passed=0,fit_rejected_jitter=0,fit_rejected_image=0,fit_only=0;
     float fit_e_alt=0;uint32_t fit_photo_tested=0,fit_photo_better=0,fit_photo_worse=0,fit_photo_regions=0,fit_photo_good=0;float fit_photo_e_fit=0,fit_photo_e_cam=0;
     double ms=0;char reason[160]{};
+    uint32_t stabilized_format=0; // DXGI_FORMAT of the actual motion-history pictures, not the game's input
 };
 Stats GetStats();
 // The result is explicitly a last completed PIXEL sample, with its age; it
