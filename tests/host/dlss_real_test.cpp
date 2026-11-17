@@ -14,6 +14,7 @@
 #include "test_support.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
@@ -137,9 +138,10 @@ int InspectInputs(test::Device& d)
 // Real preset-M DLAA: unchanged pixels/depth/camera, with zero injected jitter.
 // Compare correct zero motion with the false one-pixel vectors admitted by the
 // flow regression. Readbacks/waits are confined to this automated fixture.
-int StationaryStability(test::Device& d)
+int StationaryStability(test::Device& d, bool timing = false)
 {
-    constexpr UINT w = 512, h = 256, frames = 64;
+    const UINT w = timing ? 3440 : 512, h = timing ? 1440 : 256;
+    constexpr UINT frames = 64;
     constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     ID3D12Device* dev = d.device.Get();
     auto color = test::CreateTexture(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST,
@@ -165,8 +167,6 @@ int StationaryStability(test::Device& d)
             REQUIRE(upload[k]);
         }
     }
-    auto rb = test::CreateBuffer(dev, bytes[3], D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    REQUIRE(rb);
     test::List l;
     REQUIRE(l.Create(dev));
     const auto copy = [&](int k)
@@ -209,6 +209,99 @@ int StationaryStability(test::Device& d)
         d.queue->ExecuteCommandLists(1, ls);
     }
     d.WaitIdle();
+    if (timing)
+    {
+        // Same fixed FP16 scene and preset for both copy shapes. The queue clock
+        // brackets NGX separately from writeback. Per-list waits and timing
+        // readbacks belong to this fixture and are outside both measurements.
+        constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        constexpr auto src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        constexpr auto dst = D3D12_RESOURCE_STATE_COPY_DEST;
+        constexpr auto format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        auto intermediate = test::CreateTexture(dev, w, h, format, dst, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto scene = test::CreateTexture(dev, w, h, format, dst, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        REQUIRE(intermediate && scene);
+        D3D12_QUERY_HEAP_DESC qdesc{};
+        qdesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qdesc.Count = 3;
+        test::ComPtr<ID3D12QueryHeap> queries;
+        REQUIRE(SUCCEEDED(dev->CreateQueryHeap(&qdesc, IID_PPV_ARGS(&queries))));
+        auto times = test::CreateBuffer(dev, 3 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, dst);
+        UINT64 freq = 0;
+        REQUIRE(times && SUCCEEDED(d.queue->GetTimestampFrequency(&freq)) && freq);
+        std::vector<double> eval_ms;
+        std::vector<double> copy_ms[2];
+        for (UINT frame = 0; frame < 4 * frames; ++frame)
+        {
+            const UINT block = frame / frames;
+            const bool round_trip = block == 1 || block == 2;
+            l.Reset();
+            na::dlss::EvalDesc e;
+            e.color = color.Get();
+            e.depth = depth.Get();
+            e.motion = motion.Get();
+            e.output = output.Get();
+            e.render_w = e.out_w = w;
+            e.render_h = e.out_h = h;
+            e.quality = na::dlss::Quality::DLAA;
+            e.preset = 13;
+            e.hdr = true;
+            e.auto_exposure = true;
+            e.depth_inverted = true;
+            e.reset = frame == 0;
+            e.view_id = 802;
+            l.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            REQUIRE(na::dlss::Evaluate(l.list.Get(), e));
+            l.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            auto b = test::Transition(output.Get(), uav, src);
+            l.list->ResourceBarrier(1, &b);
+            if (round_trip)
+            {
+                l.list->CopyResource(intermediate.Get(), output.Get());
+                auto stage = test::Transition(intermediate.Get(), dst, src);
+                l.list->ResourceBarrier(1, &stage);
+                l.list->CopyResource(scene.Get(), intermediate.Get());
+                std::swap(stage.Transition.StateBefore, stage.Transition.StateAfter);
+                l.list->ResourceBarrier(1, &stage);
+            }
+            else
+            {
+                l.list->CopyResource(scene.Get(), output.Get());
+            }
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            l.list->ResourceBarrier(1, &b);
+            l.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+            l.list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, times.Get(), 0);
+            REQUIRE(SUCCEEDED(l.list->Close()));
+            ID3D12CommandList* ls[] = {l.list.Get()};
+            na::dlss::BeforeExecute(d.queue.Get(), 1, ls);
+            d.queue->ExecuteCommandLists(1, ls);
+            na::dlss::OnExecuted(d.queue.Get(), 1, ls);
+            d.WaitIdle();
+            if (frame % frames < 16) continue;
+            const D3D12_RANGE read_range{0, 3 * sizeof(UINT64)};
+            UINT64* ticks = nullptr;
+            REQUIRE(SUCCEEDED(times->Map(0, &read_range, reinterpret_cast<void**>(&ticks))));
+            CHECK(ticks[0] < ticks[1] && ticks[1] < ticks[2]);
+            eval_ms.push_back(double(ticks[1] - ticks[0]) * 1000.0 / freq);
+            copy_ms[round_trip].push_back(double(ticks[2] - ticks[1]) * 1000.0 / freq);
+            const D3D12_RANGE written{0, 0};
+            times->Unmap(0, &written);
+        }
+        const auto report = [](const char* name, std::vector<double>& samples) {
+            std::sort(samples.begin(), samples.end());
+            std::printf("%s: n=%zu p50=%.4f ms p95=%.4f ms\n", name, samples.size(), samples[samples.size() / 2],
+                        samples[95 * samples.size() / 100]);
+        };
+        report("Preset M DLAA 3440x1440 FP16", eval_ms);
+        report("Direct writeback (one FP16 copy)", copy_ms[0]);
+        report("Staged writeback (two FP16 copies)", copy_ms[1]);
+        CHECK(dev->GetDeviceRemovedReason() == S_OK);
+        na::dlss::Shutdown();
+        return test::finish("dlss_gpu_cost");
+    }
+    auto rb = test::CreateBuffer(dev, bytes[3], D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    REQUIRE(rb);
     double changes[2]{};
     for (int faulty = 0; faulty < 2; ++faulty)
     {
@@ -330,6 +423,8 @@ int main(int argc, char** argv)
     if (argc > 2 && std::string(argv[2]) == "--inspect-inputs") return InspectInputs(d);
 
     if (argc > 2 && std::string(argv[2]) == "--stationary") return StationaryStability(d);
+
+    if (argc > 2 && std::string(argv[2]) == "--gpu-cost") return StationaryStability(d, true);
 
     const uint32_t ow = 1920, oh = 1080;
     for (na::dlss::Quality q : {na::dlss::Quality::MaxQuality, na::dlss::Quality::Balanced, na::dlss::Quality::MaxPerformance,
