@@ -670,6 +670,22 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             std::copy(cam.position.begin(), cam.position.end(), id.eye);
         }
         capture_token = capture::j2::RecordEvaluation(list, planes, id);
+    } else if (evaluated && capture::j2::RefereeWanted()) {
+        // The referee (watches only, capture/referee_gpu.hpp): DLSS's input, motion and output, in
+        // the capture's states; its token rides on capture_token, so the presented image follows.
+        capture::j2::Planes planes;
+        planes.color = eval.color;
+        planes.depth = shared_depth;
+        planes.motion = slot.motion.Get();
+        planes.output = slot.output.Effects();
+        capture::j2::Identity id;
+        id.present_ordinal = id.inputs_frame = frame.frame;
+        id.jitter_x = eval.jitter_x;
+        id.jitter_y = eval.jitter_y;
+        id.mv_scale_x = eval.mv_scale_x;
+        id.mv_scale_y = eval.mv_scale_y;
+        id.reset = eval.reset;
+        capture_token = capture::j2::RecordReferee(list, planes, id);
     }
     auto* result = slot.output.Native();
     uint32_t sharpened = 0;

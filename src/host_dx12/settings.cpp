@@ -194,6 +194,9 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         const int cam = static_cast<int>(GetPrivateProfileIntW(L"j2", L"camera", 1, ini));
         target.j2_camera.store(cam < 0 || cam > 2 ? 1 : cam);
     }
+    target.referee_enabled.store(GetPrivateProfileIntW(L"referee", L"enabled", 1, ini) ? 1u : 0u);
+    target.referee_every_ms.store(GetPrivateProfileIntW(L"referee", L"every_ms", 500, ini));
+    target.referee_log_s.store(GetPrivateProfileIntW(L"referee", L"log_seconds", 5, ini));
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
     target.nr_skin.store(pct(L"skin", 100));

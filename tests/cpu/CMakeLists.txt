@@ -69,6 +69,8 @@ na_add_cpu_test(capture_retention)
 # Draw replay's vertex budget: about the budget a frame, the same draws in adjacent frames.
 na_add_cpu_test(replay_budget)
 na_add_cpu_test(replay_movers)
+# The referee's scoring (stage 1 of the unify plan): picture, result, motion, jitter on known pictures.
+na_add_cpu_test(referee)
 na_add_cpu_test(pass_map)
 na_add_cpu_test(live_judge)
 na_add_cpu_test(camera_tracker "${NA_CPU_ROOT}/src/core/motion_arbiter.cpp")

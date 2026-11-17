@@ -13,6 +13,7 @@
 
 #include "host_dx12/j2/flow_shaders.hpp"
 #include "host_dx12/j2/replay_motion_shader.hpp"
+#include "host_dx12/capture/referee_shader.hpp"
 
 int main()
 {
@@ -60,7 +61,23 @@ int main()
         }
         if (!ok) ++failures;
     }
+    // The referee's three programs (capture/referee_gpu.cpp), compiled exactly as at run time.
+    static const char* const kReferee[] = {"thumb", "tiles", "points"};
+    for (const char* entry : kReferee) {
+        Microsoft::WRL::ComPtr<ID3DBlob> code, messages;
+        const HRESULT hr = D3DCompile(na::referee::gpu::kShader, sizeof na::referee::gpu::kShader - 1, "referee.hlsl", nullptr, nullptr,
+                                      entry, "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &messages);
+        const bool ok = SUCCEEDED(hr) && code && code->GetBufferSize() > 0;
+        std::printf("j2_flow_shaders_compile_test: referee %s %s (%zu bytes, hr=0x%08lx)\n", entry, ok ? "compiles" : "DOES NOT COMPILE",
+                    code ? static_cast<size_t>(code->GetBufferSize()) : size_t(0), static_cast<unsigned long>(hr));
+        if (messages && messages->GetBufferSize()) {
+            const char* text = static_cast<const char*>(messages->GetBufferPointer());
+            const size_t n = strnlen(text, messages->GetBufferSize());
+            std::printf("%.*s\n", static_cast<int>(n < 1800 ? n : 1800), text);
+        }
+        if (!ok) ++failures;
+    }
     std::printf("j2_flow_shaders_compile_test: %s (%d of %zu programs failed)\n", failures ? "FAIL" : "PASS", failures,
-                sizeof kEntries / sizeof kEntries[0] + sizeof kReplay / sizeof kReplay[0]);
+                sizeof kEntries / sizeof kEntries[0] + sizeof kReplay / sizeof kReplay[0] + sizeof kReferee / sizeof kReferee[0]);
     return failures ? 1 : 0;
 }

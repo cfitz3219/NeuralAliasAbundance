@@ -99,8 +99,13 @@ bool RequestTimestamped(uint32_t frames, uint32_t delay_ms = 0);
 bool Armed(); // a capture is requested, its delay has passed, frames remain
 
 // In J2's recording, right after a successful DLSS evaluate on `list`. Returns a token
-// (0 = not captured: not armed, no free slot, allocation failed).
+// (0 = not captured: not armed, no free slot, allocation failed). The token also carries the
+// referee's (capture/referee_gpu.hpp), so every Submitted/Discard below reaches both.
 uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& planes, const Identity& id);
+// The referee alone, for an evaluation the capture is not armed for: call when Armed() is false
+// and RefereeWanted() is true. Same token rules.
+bool RefereeWanted();
+uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& planes, const Identity& id);
 // The list holding the token's copies was submitted on `queue` (signals the slot fence).
 void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission);
 // The token's list will not be submitted by J2. `may_still_run`: the copies are in a

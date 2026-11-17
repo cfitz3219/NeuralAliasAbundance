@@ -131,6 +131,11 @@ struct Settings {
     // by themselves are replayed first and the rest are tried in turn (core/replay_movers.hpp).
     // 0 = the budget's hashed sample alone.
     std::atomic<uint32_t> j2_replay_movers{1};
+    // The referee (stage 1 of the unify plan, capture/referee_gpu.cpp): watches DLSS's picture,
+    // result, motion and jitter a few times a second and logs event `referee`. Changes nothing shown.
+    std::atomic<uint32_t> referee_enabled{1};   // [referee] enabled (live)
+    std::atomic<uint32_t> referee_every_ms{500}; // [referee] every_ms: one pair of frames this often
+    std::atomic<uint32_t> referee_log_s{5};      // [referee] log_seconds: one `referee` line this often
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};

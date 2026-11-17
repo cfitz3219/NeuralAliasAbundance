@@ -4918,6 +4918,22 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             }
             pending.capture = na::capture::j2::RecordEvaluation(l, cp, ci);
         }
+    } else if (evaluated && na::capture::j2::RefereeWanted()) {
+        // The referee (watches only, capture/referee_gpu.hpp): the same three images as the
+        // capture above, in the same states, before sharpening; its token rides on pending.capture.
+        na::capture::j2::Planes rp;
+        rp.color = g.color_in.Get();
+        rp.depth = g.depth32.Get();
+        rp.motion = g.motion.Get();
+        rp.output = g.output.Get();
+        na::capture::j2::Identity ri;
+        ri.present_ordinal = g.frame;
+        ri.jitter_x = e.jitter_x;
+        ri.jitter_y = e.jitter_y;
+        ri.mv_scale_x = e.mv_scale_x;
+        ri.mv_scale_y = e.mv_scale_y;
+        ri.reset = e.reset ? 1u : 0u;
+        pending.capture = na::capture::j2::RecordReferee(l, rp, ri);
     }
     if (evaluated) {
         const int dv = g_debug_view.load(std::memory_order_relaxed);

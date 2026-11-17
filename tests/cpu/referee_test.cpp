@@ -1,0 +1,255 @@
+// The referee's scoring (core/referee.hpp) on pictures made here, where the truth is known:
+//   picture: the lit scene through a tone curve and a HUD matches the screen; a different layer
+//            (other edges) and a layer without edges do not;
+//   result:  a screen made from DLSS's output says so; a screen made from the input before DLSS
+//            says that instead;
+//   motion:  the right vectors predict the frame; no vectors while the picture moves, and half
+//            vectors, are caught; a still scene is not judged;
+//   jitter:  a picture rendered with the jitter DLSS was told follows it; rendered without it, or
+//            with the opposite sign, is caught.
+#include "test_support.hpp"
+#include "core/referee.hpp"
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+using namespace na::referee;
+
+namespace {
+constexpr uint32_t W = 640, H = 360;
+
+// A scene with texture at several scales and hard edges (the edges alias without anti-aliasing).
+float Scene(float x, float y)
+{
+    float v = .06f + .35f * (.5f + .5f * std::sin(.37f * x + .11f * y)) * (.5f + .5f * std::cos(.23f * y - .05f * x));
+    v += std::sin(.09f * x + .31f * y) > 0 ? .3f : 0.f;
+    v += std::sin(.021f * x - .017f * y) > .4f ? .25f : 0.f;
+    v += .1f * std::sin(.6f * x) * std::sin(.45f * y);
+    return v;
+}
+// Another layer: edges of its own, unrelated to the scene's.
+float OtherLayer(float x, float y) { return .3f + (std::sin(.13f * x - .29f * y) > 0 ? .4f : 0.f) + .2f * std::cos(.71f * y); }
+// A layer with no edges to speak of.
+float SmoothLayer(float x, float y) { return .5f + .4f * std::sin(.004f * x) * std::cos(.006f * y); }
+
+template <class F>
+Image Render(F f, float jx, float jy, float ux = 0, float uy = 0)
+{
+    // Pixel p shows the scene point at its centre minus the jitter; the scene moved by u.
+    Image im{W, H, std::vector<float>(size_t(W) * H)};
+    for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) im.v[size_t(y) * W + x] = f(float(x) + .5f - jx - ux, float(y) + .5f - jy - uy);
+    return im;
+}
+template <class F>
+Image RenderSmooth(F f)
+{
+    Image im{W, H, std::vector<float>(size_t(W) * H)};
+    for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+            float s = 0;
+            for (int b = 0; b < 4; ++b)
+                for (int a = 0; a < 4; ++a) s += f(float(x) + (float(a) + .5f) / 4, float(y) + (float(b) + .5f) / 4);
+            im.v[size_t(y) * W + x] = s / 16;
+        }
+    return im;
+}
+// The game's tone curve, a small grain and a HUD panel over the upper left of the screen.
+Image Screen(const Image& from)
+{
+    Image s = from;
+    uint32_t seed = 12345;
+    for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+            float v = from.v[size_t(y) * W + x] * 1.4f;
+            v = std::pow(v / (1 + v), 1 / 2.2f);
+            seed = seed * 1664525u + 1013904223u;
+            v += (float(seed >> 8) / 16777216.f - .5f) * .01f;
+            if (x >= 100 && x < 180 && y >= 80 && y < 140) v = .8f;
+            s.v[size_t(y) * W + x] = v;
+        }
+    return s;
+}
+
+struct Built {
+    std::vector<float> data = std::vector<float>(kResultFloats, 0.f);
+    Sample sample;
+};
+Built Build(const Image& input, const Image& output, const Image* screen, const MotionInputs* motion)
+{
+    Built b;
+    SampleThumb(input, b.data.data() + BlockOffset(kThumbInput));
+    SampleThumb(output, b.data.data() + BlockOffset(kThumbOutput));
+    SampleTiles(input, b.data.data() + BlockOffset(kTileInput));
+    SampleTiles(output, b.data.data() + BlockOffset(kTileOutput));
+    if (screen) {
+        SampleThumb(*screen, b.data.data() + BlockOffset(kThumbScreen));
+        SampleTiles(*screen, b.data.data() + BlockOffset(kTileScreen));
+    }
+    if (motion) SamplePoints(*motion, b.data.data() + BlockOffset(kPoints));
+    b.sample.data = b.data.data();
+    b.sample.have_screen = screen != nullptr;
+    b.sample.tiles_comparable = screen && screen->w == output.w && screen->h == output.h;
+    b.sample.have_motion = motion != nullptr;
+    if (motion) b.sample.jitter_change = std::hypot(motion->jitter_now[0] - motion->jitter_before[0], motion->jitter_now[1] - motion->jitter_before[1]);
+    return b;
+}
+Verdicts JudgeOne(const Built& b, Window* keep = nullptr)
+{
+    Window w;
+    w.Add(Score(b.sample));
+    if (keep) *keep = w;
+    return Judge(w);
+}
+std::vector<float> Vectors(float vx, float vy)
+{
+    std::vector<float> m(size_t(W) * H * 2);
+    for (size_t i = 0; i < m.size(); i += 2) { m[i] = vx; m[i + 1] = vy; }
+    return m;
+}
+} // namespace
+
+int main()
+{
+    int failures = 0;
+    auto check = [&](bool ok, const char* what) {
+        std::printf("%s: %s\n", ok ? "ok" : "FAIL", what);
+        if (!ok) ++failures;
+    };
+    auto line = [](const Window& w, const Verdicts& v) {
+        static char buf[2048];
+        Format(buf, sizeof buf, w, v);
+        std::printf("  %s\n", buf);
+    };
+
+    static_assert(BlockOffset(kThumbOutput) == kThumbFloats, "layout");
+    static_assert(BlockOffset(kPoints) == 3 * kThumbFloats + 3 * kTileFloats, "layout");
+    static_assert(kResultFloats == 3 * kThumbFloats + 3 * kTileFloats + kPointFloats, "layout");
+
+    const float jx = .3f, jy = -.35f;
+    const Image input = Render(Scene, jx, jy);       // what DLSS was given: one sample a pixel, jittered
+    const Image output = RenderSmooth(Scene);         // what DLSS made: anti-aliased, unjittered
+    const Image screen_out = Screen(output);          // the screen, made from DLSS's output
+    const Image screen_in = Screen(input);            // the screen, made from the image before DLSS
+
+    { // the right picture, and its output reached the screen
+        Window w;
+        const Verdicts v = JudgeOne(Build(input, output, &screen_out, nullptr), &w);
+        line(w, v);
+        check(v.picture == Verdict::Pass, "picture: the lit scene through a tone curve and a HUD matches the screen");
+        check(v.result == Verdict::Pass, "result: a screen made from DLSS's output shows the output");
+        check(v.motion == Verdict::NotMeasured && v.jitter == Verdict::NotMeasured, "no pair: motion and jitter not measured");
+    }
+    { // the output was lost: the screen shows the image before DLSS
+        Window w;
+        const Verdicts v = JudgeOne(Build(input, output, &screen_in, nullptr), &w);
+        line(w, v);
+        check(v.picture == Verdict::Pass, "picture: still the right picture");
+        check(v.result == Verdict::Fail && w.total.tiles_input > w.total.tiles_output, "result: a screen made from the input shows the input, not the output");
+    }
+    { // DLSS ran on another layer (its own edges): the screen does not look like it
+        const Image layer = Render(OtherLayer, jx, jy);
+        Window w;
+        const Verdicts v = JudgeOne(Build(layer, RenderSmooth(OtherLayer), &screen_out, nullptr), &w);
+        line(w, v);
+        check(v.picture == Verdict::Fail, "picture: another layer does not look like the screen");
+        check(v.result == Verdict::Fail, "result: the screen shows neither that input nor that output");
+    }
+    { // DLSS ran on a layer without edges
+        const Image layer = Render(SmoothLayer, jx, jy);
+        Window w;
+        const Verdicts v = JudgeOne(Build(layer, layer, &screen_out, nullptr), &w);
+        line(w, v);
+        check(v.picture == Verdict::Fail, "picture: a layer without edges does not look like the screen");
+    }
+    { // no screen sampled
+        const Verdicts v = JudgeOne(Build(input, output, nullptr, nullptr));
+        check(v.picture == Verdict::NotMeasured && v.result == Verdict::NotMeasured, "no screen: picture and result not measured");
+    }
+
+    // Motion and jitter: the scene moved by u between the frames; the jitter changed.
+    const float ux = 3.3f, uy = -1.7f;
+    const float jb[2] = {.25f, -.3f}, jn[2] = {-.35f, .2f};
+    const Image before = Render(Scene, jb[0], jb[1]);
+    const Image now = Render(Scene, jn[0], jn[1], ux, uy);
+    auto motion_case = [&](const Image& cur, const Image& prev, float vx, float vy, const float* told_now, const float* told_before, Window* w) {
+        static std::vector<float> m;
+        m = Vectors(vx, vy);
+        MotionInputs mi;
+        mi.current = &cur; mi.previous = &prev; mi.motion = &m; mi.motion_w = W; mi.motion_h = H;
+        mi.jitter_now[0] = told_now[0]; mi.jitter_now[1] = told_now[1];
+        mi.jitter_before[0] = told_before[0]; mi.jitter_before[1] = told_before[1];
+        const Verdicts v = JudgeOne(Build(cur, cur, nullptr, &mi), w);
+        line(*w, v);
+        return v;
+    };
+    { // the right vectors (previous position minus current: -u)
+        Window w;
+        const Verdicts v = motion_case(now, before, -ux, -uy, jn, jb, &w);
+        check(v.motion == Verdict::Pass, "motion: the right vectors predict the frame");
+        check(v.jitter == Verdict::Pass, "jitter: the picture follows the jitter DLSS was told");
+    }
+    { // no vectors while the scene moved
+        Window w;
+        const Verdicts v = motion_case(now, before, 0, 0, jn, jb, &w);
+        check(v.motion == Verdict::Fail, "motion: zero vectors on a moving picture are caught");
+    }
+    { // half the vectors
+        Window w;
+        const Verdicts v = motion_case(now, before, -ux / 2, -uy / 2, jn, jb, &w);
+        check(v.motion == Verdict::Fail && w.total.twice_better * 2 >= w.total.moving, "motion: half vectors are caught as half the real motion");
+        check(v.jitter == Verdict::NotMeasured, "jitter: not judged while the vectors are wrong");
+    }
+    { // twice the vectors
+        Window w;
+        const Verdicts v = motion_case(now, before, -2 * ux, -2 * uy, jn, jb, &w);
+        check(v.motion == Verdict::Fail && w.total.half_better * 2 >= w.total.moving, "motion: doubled vectors are caught as twice the real motion");
+    }
+    { // vectors with the wrong sign
+        Window w;
+        const Verdicts v = motion_case(now, before, ux, uy, jn, jb, &w);
+        check(v.motion == Verdict::Fail, "motion: vectors with the wrong sign are caught");
+    }
+    { // the picture was rendered without jitter, DLSS was told it had one
+        const Image b0 = Render(Scene, 0, 0), n0 = Render(Scene, 0, 0, ux, uy);
+        Window w;
+        const Verdicts v = motion_case(n0, b0, -ux, -uy, jn, jb, &w);
+        check(v.motion == Verdict::Pass, "motion: still predicted without jitter in the picture");
+        check(v.jitter == Verdict::Fail && w.total.jitter_none > w.total.jitter_follows, "jitter: a picture without the jitter is caught");
+    }
+    { // the picture was rendered with the opposite jitter
+        const float rb[2] = {-jb[0], -jb[1]}, rn[2] = {-jn[0], -jn[1]};
+        const Image br = Render(Scene, rb[0], rb[1]), nr = Render(Scene, rn[0], rn[1], ux, uy);
+        Window w;
+        const Verdicts v = motion_case(nr, br, -ux, -uy, jn, jb, &w);
+        check(v.jitter == Verdict::Fail && w.total.jitter_reverse > w.total.jitter_follows, "jitter: the opposite jitter is caught");
+    }
+    { // a still scene: motion is not judged, the jitter still is
+        const Image ns = Render(Scene, jn[0], jn[1]);
+        Window w;
+        const Verdicts v = motion_case(ns, before, 0, 0, jn, jb, &w);
+        check(v.motion == Verdict::NotMeasured, "motion: a still scene is not judged");
+        check(v.jitter == Verdict::Pass, "jitter: judged on a still scene too");
+    }
+    { // DLSS's motion scale: vectors in a quarter of a pixel, scale 4
+        static std::vector<float> m;
+        m = Vectors(-ux / 4, -uy / 4);
+        MotionInputs mi;
+        mi.current = &now; mi.previous = &before; mi.motion = &m; mi.motion_w = W; mi.motion_h = H;
+        mi.scale_x = mi.scale_y = 4;
+        mi.jitter_now[0] = jn[0]; mi.jitter_now[1] = jn[1]; mi.jitter_before[0] = jb[0]; mi.jitter_before[1] = jb[1];
+        const Verdicts v = JudgeOne(Build(now, now, nullptr, &mi));
+        check(v.motion == Verdict::Pass, "motion: the motion scale is applied");
+    }
+    { // a window adds samples: one sample of each kind
+        Window w;
+        w.Add(Score(Build(input, output, &screen_out, nullptr).sample));
+        w.Add(Score(Build(input, output, &screen_out, nullptr).sample));
+        check(w.samples == 2 && w.screens == 2 && w.total.tiles == 2 * kTiles, "a window counts its samples");
+        char buf[2048];
+        check(Format(buf, sizeof buf, w, Judge(w)) > 0 && std::strstr(buf, "picture{verdict=pass") != nullptr, "the log line names the verdicts");
+    }
+    std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
+    return failures ? 1 : 0;
+}
