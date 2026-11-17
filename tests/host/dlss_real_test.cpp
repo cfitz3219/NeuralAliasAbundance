@@ -78,12 +78,228 @@ double Psnr(const std::vector<float>& a, const std::vector<double>& truth, uint3
     const double mse = se / static_cast<double>(n);
     return mse <= 0 ? 99.0 : 10.0 * std::log10(1.0 / mse);
 }
+
+// Optional real-runtime diagnostic: measure whether a post-Evaluate motion
+// capture still contains the supplied values. Wait/readback is test-only.
+int InspectInputs(test::Device& d)
+{
+    constexpr UINT w = 512, h = 256;
+    constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ID3D12Device* dev = d.device.Get();
+    auto color = test::CreateTexture(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    auto depth = test::CreateTexture(dev, w, h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    auto motion = test::CreateTexture(dev, w, h, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto output = test::CreateTexture(dev, w * 2, h * 2, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    REQUIRE(color && depth && motion && output);
+    test::List l; REQUIRE(l.Create(dev));
+    ID3D12Resource* resources[] = {color.Get(), depth.Get(), motion.Get()};
+    std::vector<test::ComPtr<ID3D12Resource>> uploads;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fm{}; UINT64 motion_bytes = 0;
+    for (UINT i = 0; i < 3; ++i) {
+        auto desc = resources[i]->GetDesc(); D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}; UINT64 bytes = 0;
+        dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &bytes);
+        auto up = test::CreateBuffer(dev, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        REQUIRE(up); uint8_t* p = nullptr; REQUIRE(SUCCEEDED(up->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+        for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) {
+            if (i == 0) reinterpret_cast<uint32_t*>(p + y * fp.Footprint.RowPitch)[x] = 0xff000000u | (((x * 13 + y * 31) & 255u) * 0x010101u);
+            else if (i == 1) reinterpret_cast<float*>(p + y * fp.Footprint.RowPitch)[x] = .005f + .01f * x / w;
+            else { float* v = reinterpret_cast<float*>(p + y * fp.Footprint.RowPitch) + 2 * x; v[0] = .375f + x * .001f; v[1] = -.125f + y * .002f; }
+        }
+        up->Unmap(0, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{}; src.pResource = up.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = fp;
+        dst.pResource = resources[i]; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; l.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        auto b = test::Transition(resources[i], D3D12_RESOURCE_STATE_COPY_DEST, read); l.list->ResourceBarrier(1, &b);
+        uploads.push_back(up); if (i == 2) { fm = fp; motion_bytes = bytes; }
+    }
+    na::dlss::EvalDesc e; e.color = color.Get(); e.depth = depth.Get(); e.motion = motion.Get(); e.output = output.Get();
+    e.render_w = w; e.render_h = h; e.out_w = w * 2; e.out_h = h * 2; e.quality = na::dlss::Quality::MaxPerformance;
+    e.preset = 13; e.hdr = false; e.reset = true; e.auto_exposure = true; e.jitter_x = .25f; e.jitter_y = -.125f;
+    REQUIRE(na::dlss::Evaluate(l.list.Get(), e));
+    auto rb = test::CreateBuffer(dev, motion_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST); REQUIRE(rb);
+    auto b = test::Transition(motion.Get(), read, D3D12_RESOURCE_STATE_COPY_SOURCE); l.list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{}; src.pResource = motion.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = rb.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fm;
+    l.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    REQUIRE(SUCCEEDED(l.list->Close())); ID3D12CommandList* lists[] = {l.list.Get()};
+    d.queue->ExecuteCommandLists(1, lists); na::dlss::OnExecuted(d.queue.Get(), 1, lists); d.WaitIdle();
+    uint8_t* p = nullptr; REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+    uint64_t changed = 0; double max_error = 0;
+    for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) {
+        const float* v = reinterpret_cast<const float*>(p + y * fm.Footprint.RowPitch) + 2 * x;
+        const float expected[] = {.375f + x * .001f, -.125f + y * .002f};
+        for (UINT c = 0; c < 2; ++c) { const double err = std::abs(double(v[c]) - expected[c]); if (err != 0) ++changed; max_error = (std::max)(max_error, err); }
+    }
+    rb->Unmap(0, nullptr); std::printf("real NGX motion-input preservation: changed=%llu/%u max_error=%.9g\n", static_cast<unsigned long long>(changed), w * h * 2, max_error);
+    na::dlss::Shutdown();
+    return 0; // Measurement only; a post-Evaluate capture must not assume preservation.
+}
+
+// Real preset-M DLAA: unchanged pixels/depth/camera, with zero injected jitter.
+// Compare correct zero motion with the false one-pixel vectors admitted by the
+// flow regression. Readbacks/waits are confined to this automated fixture.
+int StationaryStability(test::Device& d)
+{
+    constexpr UINT w = 512, h = 256, frames = 64;
+    constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ID3D12Device* dev = d.device.Get();
+    auto color = test::CreateTexture(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST,
+                                     D3D12_RESOURCE_FLAG_NONE);
+    auto depth =
+        test::CreateTexture(dev, w, h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    auto motion = test::CreateTexture(dev, w, h, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST,
+                                      D3D12_RESOURCE_FLAG_NONE);
+    auto output = test::CreateTexture(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    REQUIRE(color && depth && motion && output);
+    ID3D12Resource* textures[] = {color.Get(), depth.Get(), motion.Get(), output.Get()};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[4]{};
+    UINT64 bytes[4]{};
+    test::ComPtr<ID3D12Resource> upload[3];
+    for (int k = 0; k < 4; ++k)
+    {
+        auto desc = textures[k]->GetDesc();
+        dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp[k], nullptr, nullptr, &bytes[k]);
+        if (k < 3)
+        {
+            upload[k] = test::CreateBuffer(dev, bytes[k], D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            REQUIRE(upload[k]);
+        }
+    }
+    auto rb = test::CreateBuffer(dev, bytes[3], D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    REQUIRE(rb);
+    test::List l;
+    REQUIRE(l.Create(dev));
+    const auto copy = [&](int k)
+    {
+        D3D12_TEXTURE_COPY_LOCATION a{}, b{};
+        a.pResource = upload[k].Get();
+        a.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        a.PlacedFootprint = fp[k];
+        b.pResource = textures[k];
+        b.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        l.list->CopyTextureRegion(&b, 0, 0, 0, &a, nullptr);
+    };
+    for (int k = 0; k < 3; ++k)
+    {
+        uint8_t* p = nullptr;
+        REQUIRE(SUCCEEDED(upload[k]->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+        std::memset(p, 0, size_t(bytes[k]));
+        for (UINT y = 0; y < h; ++y)
+            for (UINT x = 0; x < w; ++x)
+            {
+                if (k == 0)
+                {
+                    auto* v = reinterpret_cast<uint16_t*>(p + y * fp[k].Footprint.RowPitch) + 4 * x;
+                    const float c = .25f + .09f * std::sin(.2f * x) + .08f * std::cos(.37f * y) +
+                                    .05f * std::sin(.4f * x + .31f * y);
+                    v[0] = v[1] = v[2] = ToHalf(c);
+                    v[3] = ToHalf(1.f);
+                }
+                else if (k == 1)
+                    reinterpret_cast<float*>(p + y * fp[k].Footprint.RowPitch)[x] = .25f;
+            }
+        upload[k]->Unmap(0, nullptr);
+        copy(k);
+        auto b = test::Transition(textures[k], D3D12_RESOURCE_STATE_COPY_DEST, read);
+        l.list->ResourceBarrier(1, &b);
+    }
+    REQUIRE(SUCCEEDED(l.list->Close()));
+    {
+        ID3D12CommandList* ls[] = {l.list.Get()};
+        d.queue->ExecuteCommandLists(1, ls);
+    }
+    d.WaitIdle();
+    double changes[2]{};
+    for (int faulty = 0; faulty < 2; ++faulty)
+    {
+        std::vector<float> previous(w * h);
+        unsigned pairs = 0;
+        for (UINT f = 0; f < frames; ++f)
+        {
+            l.Reset();
+            uint8_t* p = nullptr;
+            REQUIRE(SUCCEEDED(upload[2]->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+            const float vx = faulty ? ((f / 4) % 2 ? 1.f : -1.f) : 0.f;
+            for (UINT y = 0; y < h; ++y)
+                for (UINT x = 0; x < w; ++x)
+                {
+                    auto* v = reinterpret_cast<float*>(p + y * fp[2].Footprint.RowPitch) + 2 * x;
+                    v[0] = vx;
+                    v[1] = 0;
+                }
+            upload[2]->Unmap(0, nullptr);
+            auto b = test::Transition(motion.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
+            l.list->ResourceBarrier(1, &b);
+            copy(2);
+            b = test::Transition(motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, read);
+            l.list->ResourceBarrier(1, &b);
+            na::dlss::EvalDesc e;
+            e.color = color.Get();
+            e.depth = depth.Get();
+            e.motion = motion.Get();
+            e.output = output.Get();
+            e.render_w = e.out_w = w;
+            e.render_h = e.out_h = h;
+            e.quality = na::dlss::Quality::DLAA;
+            e.preset = 13;
+            e.hdr = true;
+            e.auto_exposure = true;
+            e.reset = f == 0;
+            e.view_id = 800 + faulty;
+            REQUIRE(na::dlss::Evaluate(l.list.Get(), e));
+            b = test::Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            l.list->ResourceBarrier(1, &b);
+            D3D12_TEXTURE_COPY_LOCATION a{}, t{};
+            a.pResource = output.Get();
+            a.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            t.pResource = rb.Get();
+            t.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            t.PlacedFootprint = fp[3];
+            l.list->CopyTextureRegion(&t, 0, 0, 0, &a, nullptr);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            l.list->ResourceBarrier(1, &b);
+            REQUIRE(SUCCEEDED(l.list->Close()));
+            ID3D12CommandList* ls[] = {l.list.Get()};
+            na::dlss::BeforeExecute(d.queue.Get(), 1, ls);
+            d.queue->ExecuteCommandLists(1, ls);
+            na::dlss::OnExecuted(d.queue.Get(), 1, ls);
+            d.WaitIdle();
+            REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+            double delta = 0;
+            unsigned n = 0;
+            for (UINT y = 16; y < h - 16; ++y)
+                for (UINT x = 16; x < w - 16; ++x)
+                {
+                    const float v = FromHalf(reinterpret_cast<uint16_t*>(p + y * fp[3].Footprint.RowPitch)[4 * x]);
+                    REQUIRE(std::isfinite(v));
+                    delta += std::abs(v - previous[y * w + x]);
+                    previous[y * w + x] = v;
+                    ++n;
+                }
+            rb->Unmap(0, nullptr);
+            if (f > 32)
+            {
+                changes[faulty] += delta / n;
+                ++pairs;
+            }
+        }
+        changes[faulty] /= pairs;
+        std::printf("stationary preset-M DLAA jitter=0 faulty-motion=%d: mean "
+                    "frame change %.9f\n",
+                    faulty, changes[faulty]);
+    }
+    CHECK(changes[0] < .001); // less than 0.1% mean linear-light variation
+    CHECK(changes[1] > changes[0] * 4 + .0005);
+    na::dlss::Shutdown();
+    return test::finish("dlss_stationary_stability");
+}
 } // namespace
 
 int main(int argc, char** argv)
 {
     test::Device d;
-    if (!test::CreateDevice(d, /*allow_warp=*/false)) {
+    if (!test::CreateDevice(d, /*allow_warp=*/false))
+    {
         std::printf("dlss_real_test: SKIP (no hardware D3D12 device)\n");
         return test::kSkip;
     }
@@ -110,6 +326,10 @@ int main(int argc, char** argv)
                 caps.optimal_settings ? 1 : 0);
     if (caps.reason[0]) std::printf("reason: %s\n", caps.reason);
     REQUIRE(init_ok && caps.available);
+
+    if (argc > 2 && std::string(argv[2]) == "--inspect-inputs") return InspectInputs(d);
+
+    if (argc > 2 && std::string(argv[2]) == "--stationary") return StationaryStability(d);
 
     const uint32_t ow = 1920, oh = 1080;
     for (na::dlss::Quality q : {na::dlss::Quality::MaxQuality, na::dlss::Quality::Balanced, na::dlss::Quality::MaxPerformance,

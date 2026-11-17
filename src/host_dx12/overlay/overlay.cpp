@@ -1,4 +1,19 @@
+#include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/effects/donut.hpp"
+#include "host_dx12/effects/xegtao.hpp"
+#include "host_dx12/gpu/services.hpp"
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
+#include "host_dx12/gpu/mem_alloc.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
+#include "host_dx12/diag/dred.hpp"
+#include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
+#include "host_dx12/native_present/size_controller.hpp"
+#include "host_dx12/native_present/input_map.hpp"
+#include <intrin.h>
+#include <algorithm>
+#include <cmath>
 #include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
@@ -10,6 +25,12 @@
 #include "host_dx12/overlay/input_handover.hpp"
 #include "host_dx12/overlay/present_queues.hpp"
 #include "host_dx12/overlay/boundary_fallback.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
+#include "host_dx12/overlay/usage_sampler.hpp"
+#include "host_dx12/overlay/dlss_debug.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
+#include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native_d3d11/live_dlaa.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -42,6 +63,15 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/j2/hud_unblend.hpp"
+#include "host_dx12/j2/projection_window.hpp"
+#include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/native_control.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/presenter.hpp"
@@ -50,6 +80,7 @@
 #include <ctime>
 #include "host_dx12/settings.hpp"
 #include "host_dx12/host_boot/session.hpp"
+#include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 #include "host_dx12/latency/pcl_stats.hpp"
 
@@ -61,8 +92,13 @@ namespace {
 constexpr uint32_t kSwapReleaseSlot = 2;          // IUnknown::Release on the swap chain (A71: same-window replacement)
 constexpr uint32_t kSwapPresentSlot = 8;
 constexpr uint32_t kSwapGetBufferSlot = 9;        // IDXGISwapChain::GetBuffer (A59 presenter)
+constexpr uint32_t kSwapGetDeviceSlot = 7;        // IDXGIDeviceSubObject::GetDevice (DX11 bridge: the game's D3D11 device)
 constexpr uint32_t kSwapResizeBuffersSlot = 13;
+constexpr uint32_t kSwapResizeTargetSlot = 14;
+constexpr uint32_t kSwapSetFullscreenStateSlot = 10; // IDXGISwapChain::SetFullscreenState
 constexpr uint32_t kSwap1Present1Slot = 22;
+constexpr uint32_t kSwapGetDescSlot = 12;   // IDXGISwapChain::GetDesc (render-small size spoof)
+constexpr uint32_t kSwap1GetDesc1Slot = 18; // IDXGISwapChain1::GetDesc1
 constexpr uint32_t kSwap2SetMaxLatencySlot = 31;  // IDXGISwapChain2::SetMaximumFrameLatency (A62)
 constexpr uint32_t kSwap2GetMaxLatencySlot = 32;  // IDXGISwapChain2::GetMaximumFrameLatency (A62)
 constexpr uint32_t kSwap2GetLatencyObjectSlot = 33;
@@ -83,6 +119,7 @@ using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT,
                                                const DXGI_PRESENT_PARAMETERS*);
 using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT,
                                              DXGI_FORMAT, UINT);
+using ResizeTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, const DXGI_MODE_DESC*);
 using Resize1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT,
                                               const UINT*, IUnknown* const*);
 using GetBufferFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, REFIID, void**);
@@ -101,6 +138,7 @@ std::atomic<uint32_t> g_chain_gone{0};       // A71: chains observed destroyed (
 PresentFn g_orig_present = nullptr;
 Present1Fn g_orig_present1 = nullptr;
 ResizeFn g_orig_resize = nullptr;
+ResizeTargetFn g_orig_resize_target = nullptr;
 Resize1Fn g_orig_resize1 = nullptr;
 GetBufferFn g_orig_get_buffer = nullptr;
 GetIndexFn g_orig_get_index = nullptr;
@@ -130,6 +168,14 @@ HRESULT real_get_buffer(IDXGISwapChain* sc, UINT i, REFIID riid, void** out)
     NativeBufferRead scope;
     return sc->GetBuffer(i, riid, out);
 }
+// The swap chain's D3D12 device; for a DX11 game on our 11on12 device, the D3D12 device behind it.
+HRESULT swapchain_d3d12_device(IDXGISwapChain* sc, ComPtr<ID3D12Device>& out)
+{
+    HRESULT hr = sc->GetDevice(IID_PPV_ARGS(&out));
+    if (SUCCEEDED(hr)) return hr;
+    out.Attach(na::on12::DeviceForSwapchain(sc));
+    return out ? S_OK : hr;
+}
 UINT real_index(IDXGISwapChain* sc)
 {
     if(!sc)return 0xFFFFFFFFu;
@@ -139,6 +185,7 @@ UINT real_index(IDXGISwapChain* sc)
     return sc3->GetCurrentBackBufferIndex();
 }
 std::atomic<int> g_color_space{DXGI_COLOR_SPACE_CUSTOM}; // last SetColorSpace1 on the game's chain
+std::atomic<uint32_t> g_presented_format{0}; // the proxied chain's buffer format at its last present (status line)
 XInputGetStateFn g_orig_xinput[3] = {};
 std::atomic<XInputGetStateFn> g_menu_xinput{nullptr};
 uint64_t g_pad_retry_after=0; // render thread, under g_state.mutex
@@ -153,31 +200,60 @@ std::atomic<ID3D12CommandQueue*> g_direct_queue{nullptr};
 // direct queue that submitted", which in a two-queue game with native Frame
 // Generation (Phantom Blade Zero) is often not the presenting queue: the menu then
 // wrote the back buffer unsynchronised with FG and the GPU faulted (Cort, 2026-10-29).
-struct SwapQueue { void* sc = nullptr; PresentQueues queues; int color_space=DXGI_COLOR_SPACE_CUSTOM; };
+struct SwapQueue { void* sc = nullptr; PresentQueues queues; int color_space=DXGI_COLOR_SPACE_CUSTOM; bool on12_owned=false; };
 std::mutex g_swap_queue_m;
 SwapQueue g_swap_queues[8];
 uint32_t g_swap_queue_next = 0;
 std::atomic<uint32_t> g_swap_queue_hits{0}, g_swap_queue_misses{0}, g_swap_queues_recorded{0}, g_swap_queue_observed{0};
+std::atomic<uint32_t> g_swap_queue_on12_recovered{0};
 std::atomic<uintptr_t> g_last_present_queue{0};
+// Where a slow Present goes (DX11 bridge menu probe, 2026-11-09: ~200 ms frames only with the menu
+// open): our own present work (on_present) vs the original Present, per 5-second status window.
+struct PresentTiming { std::atomic<uint64_t> n{0}, ours_us{0}, ours_max{0}, orig_us{0}, orig_max{0}; };
+PresentTiming g_present_timing[2]; // [0] menu closed, [1] menu open
+struct DeferredTiming { std::atomic<uint64_t> n{0}, flush{0}, lock{0}, boundary{0}; };
+DeferredTiming g_deferred_timing;
+uint64_t qpc_us()
+{
+    static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return 1e6 / double(q.QuadPart); }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return static_cast<uint64_t>(double(t.QuadPart) * f);
+}
+void note_present_timing(bool open, uint64_t ours, uint64_t orig)
+{
+    auto& t = g_present_timing[open ? 1 : 0];
+    t.n.fetch_add(1); t.ours_us.fetch_add(ours); t.orig_us.fetch_add(orig);
+    uint64_t m = t.ours_max.load(); while (ours > m && !t.ours_max.compare_exchange_weak(m, ours)) {}
+    m = t.orig_max.load(); while (orig > m && !t.orig_max.compare_exchange_weak(m, orig)) {}
+}
+
+void store_swapchain_queue(ID3D12CommandQueue* queue, void* swapchain, bool on12_owned = false)
+{
+    std::lock_guard<std::mutex> lk(g_swap_queue_m);
+    for (auto& e : g_swap_queues)
+        if (e.sc == swapchain) { e.queues.Created(queue); e.color_space=DXGI_COLOR_SPACE_CUSTOM; e.on12_owned=on12_owned; g_swap_queues_recorded.fetch_add(1); return; } // address reused
+    SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
+    slot.sc = swapchain;slot.color_space=DXGI_COLOR_SPACE_CUSTOM;slot.on12_owned=on12_owned;
+    slot.queues.Created(queue);
+    g_swap_queues_recorded.fetch_add(1);
+}
 
 void note_swapchain_queue(IUnknown* device_or_queue, void* swapchain)
 {
     if (!device_or_queue || !swapchain) return;
-    ComPtr<ID3D12CommandQueue> q;
-    if (FAILED(device_or_queue->QueryInterface(IID_PPV_ARGS(&q))) || !q) return; // D3D11 / other device: not ours
-    std::lock_guard<std::mutex> lk(g_swap_queue_m);
-    for (auto& e : g_swap_queues)
-        if (e.sc == swapchain) { e.queues.Created(q.Get()); e.color_space=DXGI_COLOR_SPACE_CUSTOM; g_swap_queues_recorded.fetch_add(1); return; } // address reused
-    SwapQueue& slot = g_swap_queues[g_swap_queue_next++ % 8];
-    slot.sc = swapchain;slot.color_space=DXGI_COLOR_SPACE_CUSTOM;
-    slot.queues.Created(q.Get());
-    g_swap_queues_recorded.fetch_add(1);
+    ComPtr<ID3D12CommandQueue> queue;
+    // D3D11On12 is resolved from the presenting chain itself on first use.
+    if (SUCCEEDED(device_or_queue->QueryInterface(IID_PPV_ARGS(&queue))) && queue)
+        store_swapchain_queue(queue.Get(), swapchain);
 }
-ComPtr<ID3D12CommandQueue> swapchain_queue(IDXGISwapChain* swapchain)
+ComPtr<ID3D12CommandQueue> swapchain_queue(IDXGISwapChain* swapchain, bool* on12_owned = nullptr)
 {
     const UINT index=real_index(swapchain);
     std::lock_guard<std::mutex> lk(g_swap_queue_m);
-    for (const auto& e : g_swap_queues) if (e.sc == swapchain) return e.queues.At(index);
+    for (const auto& e : g_swap_queues) if (e.sc == swapchain) {
+        if (on12_owned) *on12_owned = e.on12_owned;
+        return e.queues.At(index);
+    }
     return nullptr;
 }
 
@@ -193,17 +269,132 @@ CreateForHwndFn g_orig_create_for_hwnd = nullptr;
 CreateForCoreWindowFn g_orig_create_for_core_window = nullptr;
 CreateForCompositionFn g_orig_create_for_composition = nullptr;
 
+// Render-small (S1 integration, docs/NATIVE-PRESENT-SIZING.md): the REAL chain is always created at
+// the window's physical size. A game that already learned the advertised render size and passes it
+// back gets the physical size instead (else the presenter would scale an already small chain again).
+// The presenter's rounding (presenter.cpp ensure_proxies_locked): round(real * scale), full size
+// when that would not be smaller.
+na::native_present::Size small_render_for(na::native_present::Size out, double f)
+{
+    if (!(f < 1.0) || !out.w || !out.h) return out;
+    na::native_present::Size r{(std::max)(1u, static_cast<UINT>(std::lround(out.w * f))),
+                               (std::max)(1u, static_cast<UINT>(std::lround(out.h * f)))};
+    return r.w >= out.w || r.h >= out.h ? out : r;
+}
+void small_native_dims(HWND w, UINT& width, UINT& height)
+{
+    if (!na::j2::RenderSmall() || !w) return;
+    const auto st = na::native_present::GetSizeState();
+    if (st.enabled && st.hwnd == w && width == st.render.w && height == st.render.h) { width = st.output.w; height = st.output.h; }
+}
+// After creation: attach the size spoof to this window with the presenter's rounding.
+void small_attach(HWND w, IDXGISwapChain* sc)
+{
+    if (!na::j2::RenderSmall() || !w || !sc) return;
+    DXGI_SWAP_CHAIN_DESC real{};
+    { na::native_present::NativeScope native; if (FAILED(sc->GetDesc(&real))) return; }
+    const na::native_present::Size out{real.BufferDesc.Width, real.BufferDesc.Height};
+    na::native_present::Attach(w, out, small_render_for(out, static_cast<double>(na::present::RenderScale())));
+}
 HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out)
 {
-    const HRESULT hr = g_orig_create_swapchain(f, dev, d, out);
-    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    DXGI_SWAP_CHAIN_DESC copy{};
+    bool use_copy = false;
+    if (d && na::j2::RenderSmall()) { copy = *d; use_copy = true; small_native_dims(copy.OutputWindow, copy.BufferDesc.Width, copy.BufferDesc.Height); }
+    // DX11 game on our 11on12 device: its swap chain becomes a real D3D12 chain on our queue
+    // (the game keeps one virtual D3D11 back buffer; see on12::TranslateSwapChain).
+    ComPtr<ID3D12CommandQueue> on12_queue;
+    if (d && na::on12::Enabled()) {
+        DXGI_SWAP_CHAIN_DESC real{};
+        if (na::on12::TranslateSwapChain(dev, use_copy ? copy : *d, real, on12_queue.ReleaseAndGetAddressOf())) { copy = real; use_copy = true; }
+    }
+    HRESULT hr;
+    { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, use_copy ? &copy : d, out); }
+    if (on12_queue && (FAILED(hr) || !out || !*out ||
+                       !na::on12::AttachSwapChain(*out, dev, d->BufferDesc.Format, d->BufferCount, d->SwapEffect, d->SampleDesc, d->BufferUsage))) {
+        // The D3D12 chain cannot serve the game: release it and create exactly what the game asked
+        // for on its own device (the 11on12 chain the earlier bridge builds used).
+        if (SUCCEEDED(hr) && out && *out) { (*out)->Release(); *out = nullptr; }
+        on12_queue.Reset();
+        { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, dev, d, out); }
+    }
+    if (SUCCEEDED(hr) && out && *out) {
+        note_swapchain_queue(on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, *out);
+        if (d) small_attach(d->OutputWindow, *out);
+    }
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND w, const DXGI_SWAP_CHAIN_DESC1* d,
                                               const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* o, IDXGISwapChain1** out)
 {
-    const HRESULT hr = g_orig_create_for_hwnd(f, dev, w, d, fs, o, out);
-    if (SUCCEEDED(hr) && out && *out) note_swapchain_queue(dev, *out);
+    DXGI_SWAP_CHAIN_DESC1 copy{};
+    bool use_copy = false;
+    if (d && na::j2::RenderSmall()) { copy = *d; use_copy = true; small_native_dims(w, copy.Width, copy.Height); }
+    ComPtr<ID3D12CommandQueue> on12_queue; // DX11 bridge: real D3D12 chain on our queue
+    if (d && na::on12::Enabled()) {
+        DXGI_SWAP_CHAIN_DESC1 real{};
+        if (na::on12::TranslateSwapChain1(dev, use_copy ? copy : *d, real, on12_queue.ReleaseAndGetAddressOf())) { copy = real; use_copy = true; }
+    }
+    HRESULT hr;
+    { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, w, use_copy ? &copy : d, fs, o, out); }
+    if (on12_queue && (FAILED(hr) || !out || !*out ||
+                       !na::on12::AttachSwapChain(*out, dev, d->Format, d->BufferCount, d->SwapEffect, d->SampleDesc, d->BufferUsage))) {
+        if (SUCCEEDED(hr) && out && *out) { (*out)->Release(); *out = nullptr; }
+        on12_queue.Reset();
+        { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, dev, w, d, fs, o, out); }
+    }
+    if (SUCCEEDED(hr) && out && *out) {
+        note_swapchain_queue(on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, *out);
+        small_attach(w, *out);
+    }
+    return hr;
+}
+// The caller of a hooked swap-chain method is this DLL (no rewrite) or someone else (the game, or
+// a module acting for it).
+bool caller_in_our_module(const void* caller)
+{
+    static const auto range = [] {
+        HMODULE m = nullptr;
+        MEMORY_BASIC_INFORMATION mbi{};
+        std::pair<uintptr_t, uintptr_t> r{0, 0};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&caller_in_our_module), &m) && m &&
+            VirtualQuery(m, &mbi, sizeof mbi)) {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(m) + dos->e_lfanew);
+            r.first = reinterpret_cast<uintptr_t>(m);
+            r.second = r.first + nt->OptionalHeader.SizeOfImage;
+        }
+        return r;
+    }();
+    const auto p = reinterpret_cast<uintptr_t>(caller);
+    return p >= range.first && p < range.second;
+}
+// Render-small: the game's own descriptor queries see the render size; ours and other modules' stay real.
+using GetDescFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, DXGI_SWAP_CHAIN_DESC*);
+using GetDesc1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, DXGI_SWAP_CHAIN_DESC1*);
+GetDescFn g_orig_get_desc = nullptr;
+GetDesc1Fn g_orig_get_desc1 = nullptr;
+HRESULT STDMETHODCALLTYPE DetourGetDesc(IDXGISwapChain* sc, DXGI_SWAP_CHAIN_DESC* d)
+{
+    const void* caller = _ReturnAddress();
+    const HRESULT hr = g_orig_get_desc(sc, d);
+    if (SUCCEEDED(hr) && d && !caller_in_our_module(caller)) {
+        na::on12::RewriteDesc(sc, d); // DX11 bridge: the game sees the D3D11 description it asked for
+        if (na::j2::RenderSmall() && na::native_present::GameCaller(caller)) na::native_present::RewriteDesc(d);
+    }
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourGetDesc1(IDXGISwapChain1* sc, DXGI_SWAP_CHAIN_DESC1* d)
+{
+    const void* caller = _ReturnAddress();
+    const HRESULT hr = g_orig_get_desc1(sc, d);
+    if (SUCCEEDED(hr) && d && !caller_in_our_module(caller)) na::on12::RewriteDesc1(sc, d);
+    if (SUCCEEDED(hr) && d && na::j2::RenderSmall() && na::native_present::GameCaller(caller)) {
+        HWND w = nullptr;
+        { na::native_present::NativeScope native; if (FAILED(sc->GetHwnd(&w))) w = nullptr; }
+        if (w) na::native_present::RewriteDesc1(w, d);
+    }
     return hr;
 }
 HRESULT STDMETHODCALLTYPE DetourCreateForCoreWindow(IDXGIFactory2* f, IUnknown* dev, IUnknown* w, const DXGI_SWAP_CHAIN_DESC1* d,
@@ -227,6 +418,11 @@ std::atomic<ID3D12CommandQueue*> g_texture_queue{nullptr};
 std::atomic<bool> g_open{false};
 std::atomic<uint64_t> g_frames{0}, g_presents{0};
 std::atomic<uint64_t> g_menu_draw_marker{0};
+struct MenuDrawSkips {
+    std::atomic<uint64_t> not_ready{0},buffer{0},busy{0},atlas{0},empty{0},command{0};
+    std::atomic<uint64_t> present_rejected{0};
+    std::atomic<HRESULT> last_present_rejection{S_OK};
+} g_menu_skips;
 void write_menu_progress(HANDLE log);
 std::atomic<uint32_t> g_retargets{0}; // swap chain re-targets (A31)
 std::atomic<uint32_t> g_initialized{0};
@@ -312,20 +508,31 @@ void neutralise_raw(RAWINPUT* ri)
         ri->data.keyboard.Flags |= RI_KEY_BREAK; // every key reads as released
     }
 }
+// Render-small (S2): absolute raw mouse positions follow the game's virtual window; relative deltas never change.
+void small_map_raw(RAWINPUT* ri, const void* caller)
+{
+    if (ri && ri->header.dwType == RIM_TYPEMOUSE) na::native_present::MapRawMouseRead(ri->data.mouse, caller);
+}
 UINT WINAPI DetourGetRawInputData(HRAWINPUT h, UINT cmd, LPVOID data, PUINT size, UINT header)
 {
+    const void* caller = _ReturnAddress();
     UINT r = g_orig_get_raw_input_data(h, cmd, data, size, header);
-    if (r != static_cast<UINT>(-1) && data && cmd == RID_INPUT && r >= sizeof(RAWINPUTHEADER) && lock_input_for_this_thread())
-        neutralise_raw(static_cast<RAWINPUT*>(data));
+    if (r != static_cast<UINT>(-1) && data && cmd == RID_INPUT && r >= sizeof(RAWINPUTHEADER)) {
+        if (lock_input_for_this_thread()) neutralise_raw(static_cast<RAWINPUT*>(data));
+        else small_map_raw(static_cast<RAWINPUT*>(data), caller);
+    }
     return r;
 }
 UINT WINAPI DetourGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT header)
 {
+    const void* caller = _ReturnAddress();
     UINT r = g_orig_get_raw_input_buffer(data, size, header);
-    if (r != static_cast<UINT>(-1) && r != 0 && data && lock_input_for_this_thread()) {
+    const bool locked = lock_input_for_this_thread();
+    if (r != static_cast<UINT>(-1) && r != 0 && data && (locked || na::j2::RenderSmall())) {
         RAWINPUT* p = data;
         for (UINT i = 0; i < r; ++i) {
-            neutralise_raw(p);
+            if (locked) neutralise_raw(p);
+            else small_map_raw(p, caller);
             // NEXTRAWINPUTBLOCK without the QWORD type the lean headers omit: 8-byte aligned on x64.
             uintptr_t next = reinterpret_cast<uintptr_t>(reinterpret_cast<BYTE*>(p) + p->header.dwSize);
             p = reinterpret_cast<RAWINPUT*>((next + sizeof(uint64_t) - 1) & ~(sizeof(uint64_t) - 1));
@@ -335,12 +542,16 @@ UINT WINAPI DetourGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT header)
 }
 BOOL WINAPI DetourGetCursorPos(LPPOINT p)
 {
+    const void* caller = _ReturnAddress();
     if (p && lock_input_for_this_thread()) {
         p->x = g_frozen_x.load(std::memory_order_relaxed);
         p->y = g_frozen_y.load(std::memory_order_relaxed);
+        na::native_present::MapCursorRead(p, caller); // the frozen point is real; the game reads virtual
         return TRUE;
     }
-    return g_orig_get_cursor_pos(p);
+    const BOOL ok = g_orig_get_cursor_pos(p);
+    if (ok && p) na::native_present::MapCursorRead(p, caller);
+    return ok;
 }
 HCURSOR WINAPI DetourSetCursor(HCURSOR cursor)
 {
@@ -354,23 +565,51 @@ HCURSOR WINAPI DetourSetCursor(HCURSOR cursor)
 BOOL WINAPI DetourSetCursorPos(int x, int y)
 {
     if (lock_input_for_this_thread()) return TRUE; // the game may not re-centre the menu cursor
+    na::native_present::MapCursorWrite(x, y, _ReturnAddress());
     return g_orig_set_cursor_pos(x, y);
 }
+// Render-small (S2): the game's cursor clip is in its virtual screen space. Not counted in
+// input_hooks (installed only in this mode, on top of the eight).
+using PfnClipCursor = BOOL(WINAPI*)(const RECT*);
+using PfnGetClipCursor = BOOL(WINAPI*)(LPRECT);
+PfnClipCursor g_orig_clip_cursor = nullptr;
+PfnGetClipCursor g_orig_get_clip_cursor = nullptr;
+void* g_clip_hook_targets[2] = {};
+BOOL WINAPI DetourClipCursor(const RECT* r)
+{
+    RECT physical{};
+    if (r && na::native_present::MapClipRect(r, physical, _ReturnAddress())) return g_orig_clip_cursor(&physical);
+    return g_orig_clip_cursor(r);
+}
+BOOL WINAPI DetourGetClipCursor(LPRECT r)
+{
+    const void* caller = _ReturnAddress();
+    const BOOL ok = g_orig_get_clip_cursor(r);
+    if (ok && r) na::native_present::MapClipRead(r, caller);
+    return ok;
+}
+// A hotkey the menu sends on the user's behalf (dlss_debug: CTRL+ALT+Fn for NVIDIA's
+// development DLSS DLL) passes through the lock, so the DLL's own polling sees it.
 SHORT WINAPI DetourGetAsyncKeyState(int vk)
 {
-    if (lock_input_for_this_thread()) return 0;
+    if (lock_input_for_this_thread() && !na::dlss_debug::SyntheticKeyAllowed(vk)) return 0;
     return g_orig_get_async_key_state(vk);
 }
 BOOL WINAPI DetourGetKeyboardState(PBYTE state)
 {
     BOOL r = g_orig_get_keyboard_state(state);
-    if (r && state && lock_input_for_this_thread()) memset(state, 0, 256);
+    if (r && state && lock_input_for_this_thread()) {
+        BYTE keep[256];
+        memcpy(keep, state, 256);
+        memset(state, 0, 256);
+        for (int vk = 0; vk < 256; ++vk) if (na::dlss_debug::SyntheticKeyAllowed(vk)) state[vk] = keep[vk];
+    }
     return r;
 }
 SHORT WINAPI DetourGetKeyState(int vk)
 {
     // Mouse buttons and keys read through GetKeyState (VK_LBUTTON is common for "fire").
-    if (lock_input_for_this_thread()) return 0;
+    if (lock_input_for_this_thread() && !na::dlss_debug::SyntheticKeyAllowed(vk)) return 0;
     return g_orig_get_key_state(vk);
 }
 // DirectInput 8 (keyboard/mouse through IDirectInputDevice8::GetDeviceState /
@@ -471,9 +710,25 @@ void install_input_hooks()
         }
     }
     g_input_hooks.store(n, std::memory_order_release);
+    if (na::j2::RenderSmall()) {
+        const struct { const char* name; void* detour; void** original; } clip[2] = {
+            {"ClipCursor", reinterpret_cast<void*>(&DetourClipCursor), reinterpret_cast<void**>(&g_orig_clip_cursor)},
+            {"GetClipCursor", reinterpret_cast<void*>(&DetourGetClipCursor), reinterpret_cast<void**>(&g_orig_get_clip_cursor)},
+        };
+        for (int i = 0; i < 2; ++i) {
+            if (g_clip_hook_targets[i]) continue;
+            void* target = reinterpret_cast<void*>(GetProcAddress(u, clip[i].name));
+            if (target && install_input_function(target, clip[i].detour, clip[i].original)) g_clip_hook_targets[i] = target;
+            else if (!*clip[i].original) *clip[i].original = target;
+        }
+    }
 }
 void remove_input_hooks()
 {
+    for (void*& t : g_clip_hook_targets) {
+        if (t) na::hooking::Unhook(t);
+        t = nullptr;
+    }
     for (void*& t : g_di_targets) {
         if (t) na::hooking::Unhook(t);
         t = nullptr;
@@ -564,6 +819,43 @@ void menu_note(const char* text) {
     WriteFile(f, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
     CloseHandle(f);
 }
+// Render-small test builds: a fatal exception anywhere in the process leaves a line (code,
+// module+offset, thread) and a minidump next to the status log, so a crash that Windows
+// does not report still has evidence. At most two dumps per process.
+void status_note(const char* text) {
+    if (!g_status_log[0]) return;
+    HANDLE f = CreateFileW(g_status_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+    CloseHandle(f);
+}
+LONG CALLBACK crash_capture(EXCEPTION_POINTERS* e) {
+    const DWORD code = e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionCode : 0;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
+        code != 0xC0000409u /* stack buffer overrun / fail fast */ && code != 0xC0000374u /* heap corruption */ &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static std::atomic<int> count{0};
+    const int n = count.fetch_add(1);
+    if (n >= 2) return EXCEPTION_CONTINUE_SEARCH;
+    void* at = e->ExceptionRecord->ExceptionAddress;
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(at), &mod) && mod)
+        GetModuleFileNameA(mod, name, MAX_PATH);
+    const char* base = strrchr(name, '\\');
+    char row[512];
+    snprintf(row, sizeof(row), "crash code=0x%08lX at=%s+0x%llX thread=%lu info=%llu/%p mode=%u render_scale=%.3f\r\n", code,
+             base ? base + 1 : name, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(at) - reinterpret_cast<uintptr_t>(mod)),
+             GetCurrentThreadId(), e->ExceptionRecord->NumberParameters ? static_cast<unsigned long long>(e->ExceptionRecord->ExceptionInformation[0]) : 0ull,
+             e->ExceptionRecord->NumberParameters > 1 ? reinterpret_cast<void*>(e->ExceptionRecord->ExceptionInformation[1]) : nullptr,
+             na::settings::Get().j2_scale_mode.load(), na::present::RenderScale());
+    status_note(row);
+    wchar_t path[MAX_PATH]{};
+    if (swprintf_s(path, L"%s.crash%d.dmp", g_status_log, n) > 0) na::freeze::WriteMiniDump(path, e);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 int menu_fault(EXCEPTION_POINTERS* exception) {
     na::settings::MarkSessionFailed("crash");
     if (g_menu_diagnostics) {
@@ -578,12 +870,52 @@ int menu_fault(EXCEPTION_POINTERS* exception) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 ULONGLONG g_status_last_tick = 0;
+void append_status_text(const char* text, int n); // below
+void flush_events()
+{
+    std::vector<std::string> events = na::eventlog::Drain();
+    if (events.empty()) return;
+    std::string all;
+    for (const std::string& e : events) all += e;
+    append_status_text(all.data(), static_cast<int>(all.size()));
+}
 void write_status_line()
 {
     if (!g_status_log[0]) return;
     ULONGLONG now = GetTickCount64();
+    flush_events(); // timed transitions, written as soon as the discovery thread runs
     if (now - g_status_last_tick < 5000) return;
+    const bool have_interval = g_status_last_tick != 0;
+    const ULONGLONG elapsed = now - g_status_last_tick;
     g_status_last_tick = now;
+    if (na::j2::Configured() && !na::settings::AddedUpscalingAllowed()) {
+        constexpr char status[] = "added upscaling: held off\r\n";
+        append_status_text(status, sizeof status - 1);
+    }
+    if (na::on12::NativeRoute()) {
+        static uint64_t previous_frames = 0;
+        const uint64_t frames = na::native11::Stats().frames;
+        const double fps = have_interval && frames >= previous_frames
+            ? double(frames - previous_frames) * 1000.0 / double(elapsed) : 0.0;
+        previous_frames = frames;
+        static char status[8192], line[8192 + 192]; // one writer thread; the line is past 3,500 characters on a busy game
+        status[0] = line[0] = 0;
+        na::on12::FormatStatus(status, sizeof status);
+        SYSTEMTIME t{};
+        GetLocalTime(&t);
+        const int bytes = snprintf(line, sizeof line, "%02u:%02u:%02u fps=%.1f frame_ms=%.2f | %s\r\n",
+                                   t.wHour, t.wMinute, t.wSecond, fps, fps > 0 ? 1000.0 / fps : 0.0, status);
+        append_status_text(line, (std::min)(bytes, int(sizeof line) - 1));
+        return;
+    }
+    {
+        char el[160];
+        const int en = snprintf(el, sizeof el, "event_log frame=%llu total=%llu dropped=%llu\r\n",
+                                (unsigned long long)na::eventlog::Frame(),
+                                (unsigned long long)na::eventlog::g_total.load(std::memory_order_relaxed),
+                                (unsigned long long)na::eventlog::g_dropped.load(std::memory_order_relaxed));
+        if (en > 0) append_status_text(el, (std::min)(en, int(sizeof el) - 1));
+    }
     na::ngx::Stats ngx = na::ngx::GetStats();
     na::nr::Stats nr = na::nr::GetStats();
     na::motion::Stats mo = na::motion::GetStats();
@@ -616,13 +948,52 @@ void write_status_line()
     char mode_line[1536]{};
     const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
+    {char usage_line[512];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
+     if(usage_bytes>0)WriteFile(f,usage_line,DWORD((std::min)(usage_bytes,int(sizeof(usage_line)-1))),&written,nullptr);}
+    { // Effects and shared GPU services: enabled state, work done, errors and the last reason.
+        const auto& st = na::settings::Get();
+        const auto xs = na::xegtao::ScenePass().GetStats();
+        const auto bs = na::donut::ScenePass().GetStats();
+        const auto gs = na::gpu::GetStats();
+        char fx[1024];
+        const int fn = snprintf(fx, sizeof fx,
+            "effects xegtao{enabled=%u amount=%u quality=%u recorded=%llu allocations=%llu busy=%llu bindings=%llu compiling=%u reason=\"%s\"} "
+            "bloom{enabled=%u amount=%u recorded=%llu allocations=%llu busy=%llu bindings=%llu compiling=%u reason=\"%s\"} "
+            "gpu_services{built=%u textures=%llu opens=%llu submits=%llu collections=%llu errors=%llu dispatches=%llu bindings=%llu retained=%llu}\r\n",
+            st.xegtao_enabled.load(), st.xegtao_amount.load(), st.xegtao_quality.load(),
+            (unsigned long long)xs.recorded, (unsigned long long)xs.allocations, (unsigned long long)xs.busy, (unsigned long long)xs.bindings,
+            xs.compiling ? 1u : 0u, xs.reason,
+            unsigned(st.donut_bloom.load()), unsigned(st.donut_bloom_amount.load()),
+            (unsigned long long)bs.recorded, (unsigned long long)bs.allocations, (unsigned long long)bs.busy, (unsigned long long)bs.bindings,
+            bs.compiling ? 1u : 0u, bs.reason,
+            gs.built ? 1u : 0u, (unsigned long long)gs.textures, (unsigned long long)gs.opens, (unsigned long long)gs.submits,
+            (unsigned long long)gs.collections, (unsigned long long)gs.errors, (unsigned long long)gs.dispatches,
+            (unsigned long long)gs.bindings, (unsigned long long)gs.retained);
+        if (fn > 0) WriteFile(f, fx, DWORD((std::min)(fn, int(sizeof fx) - 1)), &written, nullptr);
+        static std::string last_x, last_b;
+        static uint64_t last_errors = 0;
+        if (last_x != xs.reason) { last_x = xs.reason; na::eventlog::Emit("xegtao", "reason=\"%s\"", xs.reason); }
+        if (last_b != bs.reason) { last_b = bs.reason; na::eventlog::Emit("bloom", "reason=\"%s\"", bs.reason); }
+        static ULONGLONG last_table_tick = 0;
+        static uint64_t last_table_total = ~0ull;
+        if (now - last_table_tick >= 60000) { // the game's sampler table, when it grew
+            last_table_tick = now;
+            uint64_t total = 0;
+            const std::string table = na::observe::FormatSamplerTable(&total);
+            if (total != last_table_total) {
+                last_table_total = total;
+                WriteFile(f, table.data(), DWORD(table.size()), &written, nullptr);
+            }
+        }
+        if (gs.errors != last_errors) { na::eventlog::Emit("gpu_services", "errors=%llu was=%llu", (unsigned long long)gs.errors, (unsigned long long)last_errors); last_errors = gs.errors; }
+    }
     {
         char source_line[256];
-        const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu pid=%lu queue_hits=%u buffer_queue=%u queue_misses=%u\r\n",
+        const int source_bytes=snprintf(source_line,sizeof(source_line),"overlay_source=%s native_presents=%llu presents=%llu pid=%lu queue_hits=%u buffer_queue=%u queue_misses=%u on12_queue_recovered=%u\r\n",
             g_boundary_frames.load(std::memory_order_acquire)?"streamline":"native",
             static_cast<unsigned long long>(g_native_game_presents.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_presents.load(std::memory_order_relaxed)),GetCurrentProcessId(),
-            g_swap_queue_hits.load(),g_swap_queue_observed.load(),g_swap_queue_misses.load());
+            g_swap_queue_hits.load(),g_swap_queue_observed.load(),g_swap_queue_misses.load(),g_swap_queue_on12_recovered.load());
         if(source_bytes>0)WriteFile(f,source_line,DWORD((std::min)(source_bytes,int(sizeof(source_line)-1))),&written,nullptr);
     }
     {
@@ -643,6 +1014,8 @@ void write_status_line()
     }
     char safe_line[144];const int safe_bytes=snprintf(safe_line,sizeof(safe_line),"safe_start=%u reason=%s renderer_ready=%u shared_writer=%u clean_exit_hook=%u\r\n",na::settings::SafeStart()?1u:0u,na::settings::SafeStartReason(),na::host::SessionReady()?1u:0u,na::settings::CanPersist()?1u:0u,na::host::CleanExitObserved()?1u:0u);
     if(safe_bytes>0)WriteFile(f, safe_line, static_cast<DWORD>((std::min)(safe_bytes, static_cast<int>(sizeof(safe_line)-1))), &written, nullptr);
+    {static char on12_line[8192];const int on12_bytes=na::on12::FormatStatus(on12_line,sizeof(on12_line)-2);
+     if(on12_bytes>0){WriteFile(f,on12_line,static_cast<DWORD>((std::min)(on12_bytes,static_cast<int>(sizeof(on12_line)-3))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}}
     char fg_inputs[512];
     const int fg_input_bytes = snprintf(fg_inputs, sizeof(fg_inputs),
         "native_fg_inputs evaluates=%llu available_resources=%llu hudless=%llu distortion=%llu list_type=%u color_format=%u allocation=%ux%u nr_route=%s\r\n",
@@ -686,6 +1059,21 @@ void write_status_line()
         xess.hooked_functions, xess.contexts_initialized, xess.executes, xess.replaced, xess.fallbacks, xess.reason,
         dlss.evaluates, dlss.features_created, dlss.rejected, static_cast<unsigned>(dlss.last_ngx_result), dlss.reason);
     if (un > 0) WriteFile(f, upscalers, static_cast<DWORD>((std::min)(un, static_cast<int>(sizeof(upscalers) - 1))), &written, nullptr);
+    {   // Every DLSS feature creation since the last block (flags: 1 IsHDR, 2 MVLowRes, 4 MVJittered,
+        // 8 DepthInverted, 64 AutoExposure), so a changed DLSS state can be tied to a mode change.
+        static uint64_t printed = 0;
+        const uint64_t first = dlss.create_seq > 8 && printed < dlss.create_seq - 8 ? dlss.create_seq - 8 : printed;
+        for (uint64_t s = first + 1; s <= dlss.create_seq; ++s) {
+            const auto& c = dlss.creates[(s - 1) % 8];
+            if (c.seq != s) continue;
+            char crow[256];
+            const int cn = snprintf(crow, sizeof(crow), "dlss_create seq=%llu view=0x%llX flags=0x%X hdr=%u autoexp=%u inverted=%u preset=%u quality=%u render=%ux%u out=%ux%u\r\n",
+                                   static_cast<unsigned long long>(c.seq), static_cast<unsigned long long>(c.view), c.flags, (c.flags & 1u) ? 1u : 0u,
+                                   (c.flags & 64u) ? 1u : 0u, (c.flags & 8u) ? 1u : 0u, c.preset, c.quality, c.rw, c.rh, c.ow, c.oh);
+            if (cn > 0) WriteFile(f, crow, static_cast<DWORD>((std::min)(cn, static_cast<int>(sizeof(crow) - 1))), &written, nullptr);
+        }
+        printed = dlss.create_seq;
+    }
     char pacing[256];
     int pn = snprintf(pacing, sizeof(pacing), "present_boundary returned=%llu thread=%lu hr=0x%08lX game_latency_handle=0x%llX queue=0x%llX\r\n",
                       static_cast<unsigned long long>(g_present_returns.load()), g_present_caller.load(),
@@ -708,11 +1096,304 @@ void write_status_line()
             static_cast<unsigned long long>(j2.busy), static_cast<unsigned long long>(j2.dlss_failed), static_cast<unsigned long long>(j2.cuts),
             static_cast<unsigned long long>(j2.camera_offset), j2.later_passes, static_cast<unsigned long long>(j2.duplicate_submissions), static_cast<unsigned long long>(j2.jitter_writes), static_cast<unsigned long long>(j2.camera_learned_hits), static_cast<unsigned long long>(j2.camera_scans), static_cast<long long>(j2.camera_inv_delta), static_cast<long long>(j2.camera_proj_delta), static_cast<unsigned long long>(j2.jitter_proj_writes), static_cast<unsigned long long>(j2.jitter_rebased), na::observe::SamplerMipBias(), static_cast<unsigned long long>(mb_s), static_cast<unsigned long long>(mb_st), static_cast<unsigned long long>(j2.post_camera_lists), static_cast<unsigned long long>(j2.post_depth_lists), static_cast<unsigned long long>(j2.other_camera_blocks), j2.depth_reversed ? 1u : 0u, dlss.feature_preset, na::settings::Get().j2_sharpness.load(), static_cast<unsigned long long>(j2.nis_frames), j2.scene_batches, j2.scene_batches_max, j2.scene_batches_target, static_cast<unsigned long long>(j2.waited_batches), static_cast<unsigned long long>(j2.post_scene_batches), j2.inline_mode, j2.inline_target, static_cast<unsigned long long>(j2.inline_candidates), static_cast<unsigned long long>(j2.inline_waited), static_cast<unsigned long long>(j2.inline_recorded), static_cast<unsigned long long>(j2.inline_frames), static_cast<unsigned long long>(j2.inline_refused), j2.color_sub, j2.color_mips, j2.color_slices, j2.color_samples, j2.depth_slices, j2.depth_samples, j2.width, j2.height, j2.color_format, j2.reason);
         if (jn > 0) WriteFile(f, jl, static_cast<DWORD>((std::min)(jn, static_cast<int>(sizeof(jl) - 1))), &written, nullptr);
+        if (na::j2::ProjectionWindow()) {
+            char wl[1800];
+            const int wn = snprintf(wl, sizeof wl,
+                "j2_window engaged=%u corner=%ux%u mode=%u frames=%llu missed=%llu engagements=%llu render=%ux%u out=%ux%u writes{vp=%llu inv=%llu proj=%llu prev=%llu} post_lists=%llu scissored=%llu restored=%llu derived{forward=%llu inverse=%llu kinds=\"%s\"} unpacked=%llu repeated=%llu fallbacks=%llu stale_repeats=%llu extra_cameras=%llu stale_samples=%llu blocks_capped=%llu blocks_dropped=%llu blocks_per_frame=%.0f slot_per_frame=%.1f probed_out_per_frame=%.0f derived_skipped=%llu patches=%llu refused=%llu cpu_us_per_frame=%.1f cpu_max_us_call=%llu last_unpacked=\"%s\" note=\"%s\"\r\n",
+                j2.window_engaged ? 1u : 0u, j2.window_w, j2.window_h, na::settings::Get().j2_scale_mode.load(),
+                (unsigned long long)j2.window_frames, (unsigned long long)j2.window_missed, (unsigned long long)j2.window_engagements,
+                j2.render_w, j2.render_h, j2.out_w, j2.out_h,
+                (unsigned long long)j2.window_vp_writes, (unsigned long long)j2.window_inv_writes, (unsigned long long)j2.window_proj_writes,
+                (unsigned long long)j2.window_prev_writes, (unsigned long long)j2.window_post_lists,
+                (unsigned long long)na::j2::ProjectionWindowScissored(), (unsigned long long)na::j2::ProjectionWindowScissorRestored(),
+                (unsigned long long)j2.window_derived_forward, (unsigned long long)j2.window_derived_inverse, j2.window_derived_note,
+                (unsigned long long)j2.window_unpacked, (unsigned long long)j2.window_repeated, (unsigned long long)j2.window_repeat_fallbacks,
+                (unsigned long long)j2.window_repeat_stale, (unsigned long long)j2.window_extra_cameras,
+                (unsigned long long)j2.window_stale_samples, (unsigned long long)j2.jitter_blocks_capped, (unsigned long long)j2.jitter_blocks_dropped,
+                j2.frames ? double(j2.jitter_blocks_scanned) / double(j2.frames) : 0.0, j2.frames ? double(j2.jitter_slot_blocks) / double(j2.frames) : 0.0,
+                j2.frames ? double(j2.jitter_blocks_probed_out) / double(j2.frames) : 0.0,
+                (unsigned long long)j2.window_derived_skipped, (unsigned long long)j2.jitter_patches,
+                (unsigned long long)j2.jitter_patches_refused,
+                j2.frames ? double(j2.jitter_cpu_us) / double(j2.frames) : 0.0, (unsigned long long)j2.jitter_cpu_max_us,
+                j2.window_unpacked_note, j2.window_note);
+            if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
+        }
+        if (na::j2::RenderSmall()) { // render-small S1/S2 counters (Astra's formatters)
+            char size_text[512] = {}, input_text[512] = {}, screen_text[512] = {}, size_line[1600];
+            na::native_present::FormatSizeStatus(size_text, sizeof size_text);
+            na::native_present::FormatInputStatus(input_text, sizeof input_text);
+            na::native_present::FormatScreenStatus(screen_text, sizeof screen_text);
+            const int size_n = snprintf(size_line, sizeof size_line, "%s\r\n%s\r\n%s\r\n", size_text, input_text, screen_text);
+            if (size_n > 0) WriteFile(f, size_line, DWORD((std::min)(size_n, int(sizeof size_line - 1))), &written, nullptr);
+        }
+        if (na::native_present::SizeProbeInstalled()) { // read-only size-query probe ([present] size_probe=1)
+            char probe[2400] = {};
+            na::native_present::FormatSizeProbe(probe, sizeof probe - 2);
+            const size_t probe_n = std::strlen(probe);
+            if (probe_n) { probe[probe_n] = '\r'; probe[probe_n + 1] = '\n'; WriteFile(f, probe, DWORD(probe_n + 2), &written, nullptr); }
+        }
+        { // Hook cost (2026-11-05): where the CPU time inside our hooks goes
+            char hl[2400];
+            na::observe::FormatHookCost(hl, sizeof hl - 2);
+            const size_t hn = std::strlen(hl);
+            if (hn) { hl[hn] = '\r'; hl[hn + 1] = '\n'; WriteFile(f, hl, DWORD(hn + 2), &written, nullptr); }
+            char rf[512];
+            const int rn = na::observe::FormatReadFilter(rf, sizeof rf - 2);
+            if (rn > 0 && size_t(rn) < sizeof rf - 2) { rf[rn] = '\r'; rf[rn + 1] = '\n'; WriteFile(f, rf, DWORD(rn + 2), &written, nullptr); }
+        }
+        { // Viewport jitter ([j2] viewport_jitter): real samples through the game's viewports
+            const auto vps = na::observe::GetViewportJitterStats();
+            char vl[400];
+            const int vn = snprintf(vl, sizeof vl,
+                "viewport_jitter mode=%d frames=%llu declared_list=%llu declared_submitted=%llu declared_none=%llu other_frame=%llu scene_draws=%llu sets=%llu restores=%llu unknown_viewports=%llu\r\n",
+                na::settings::Get().j2_viewport_jitter.load(), (unsigned long long)j2.vpj_frames, (unsigned long long)j2.vpj_from_list,
+                (unsigned long long)j2.vpj_from_submitted, (unsigned long long)j2.vpj_none, (unsigned long long)j2.vpj_other_frame,
+                (unsigned long long)vps.draws, (unsigned long long)vps.sets, (unsigned long long)vps.restores, (unsigned long long)vps.unknown);
+            if (vn > 0) WriteFile(f, vl, DWORD((std::min)(vn, int(sizeof vl - 1))), &written, nullptr);
+        }
+        { // anisotropic filtering ([j2] anisotropic): level = in use; static = changed in the twins in use
+            const auto as = na::observe::GetAnisoStats();
+            char al[260];
+            const int an = snprintf(al, sizeof al, "anisotropic level=%u setting=%u samplers=%llu static=%llu already=%llu native_surface=%llu native_16=%llu create_sampler=%llu create_sampler2=%llu\r\n",
+                as.level, na::settings::Get().aniso16.load(), (unsigned long long)as.samplers,
+                  (unsigned long long)as.static_samplers, (unsigned long long)as.already,
+                  (unsigned long long)as.native_surface,(unsigned long long)as.native_16,
+                  (unsigned long long)as.sampler_calls,(unsigned long long)as.sampler2_calls);
+            if (an > 0) WriteFile(f, al, DWORD((std::min)(an, int(sizeof al - 1))), &written, nullptr);
+            const auto drv = na::fg::preset::GetAnisoOverride();
+            const int dn = snprintf(al, sizeof al, "driver_af available=%u app_profile=%u selector=%u level=%u start{known=%u selector=%u level=%u} forced_this_run=%u limits16=%u written=%u write_result=%d source{selector=%u level=%u}\r\n",
+                drv.available ? 1u : 0u, drv.app_profile ? 1u : 0u, drv.selector, drv.level, drv.start_known ? 1u : 0u, drv.start_selector, drv.start_level, drv.ForcedThisRun() ? 1u : 0u, drv.Limits(16) ? 1u : 0u, drv.written ? 1u : 0u, drv.write_result,drv.selector_location,drv.level_location);
+            if (dn > 0) WriteFile(f, al, DWORD((std::min)(dn, int(sizeof al - 1))), &written, nullptr);
+            static std::string last_texture; // every driver texture setting, when it changes
+            std::string texture = na::fg::preset::DriverTextureLine();
+            if (!texture.empty() && texture != last_texture) {
+                last_texture = texture;
+                texture += "\r\n";
+                WriteFile(f, texture.data(), DWORD(texture.size()), &written, nullptr);
+            }
+        }
+        if (na::j2::RenderSmall()) { // P4-4 render-small: one line per status write
+            const auto ps = na::present::GetStats();
+            char sl[900];
+            const int sn = snprintf(sl, sizeof sl,
+                "native_present mode=%u scale=%.3f proxies=%ux%u native=%ux%u scene=%ux%u deferred=%llu dlss=%llu stretched=%llu failed=%llu dlss_refused=%llu sharpened=%llu sharpness=%u hud_nis_frames=%llu hud_nis=%u presenter_upscaled=%llu presenter_kept_old=%llu dlss_in=%ux%u dlss_out=%ux%u jitter_phases=%u mip_bias=%.2f present_source=%llu present_refused=%llu depth_clears=%u dlaa_fresh=%llu jshift=%llu present_why=\"%s\" note=\"%s\"\r\n",
+                na::settings::Get().j2_scale_mode.load(), na::present::RenderScale(), ps.scaled_w, ps.scaled_h, ps.native_w, ps.native_h,
+                j2.width, j2.height, (unsigned long long)j2.small_deferred, (unsigned long long)j2.small_dlss,
+                (unsigned long long)j2.small_stretched, (unsigned long long)j2.small_failed, (unsigned long long)j2.small_dlss_failed,
+                (unsigned long long)j2.small_sharpened, na::settings::Get().j2_sharpness.load(),
+                (unsigned long long)j2.small_hud, na::settings::Get().j2_hud_nis.load(),
+                (unsigned long long)ps.upscaled, (unsigned long long)ps.upscale_failed, j2.small_rw, j2.small_rh, j2.small_ow, j2.small_oh,
+                j2.jitter_phases, na::observe::SamplerMipBias(), (unsigned long long)j2.small_present_source,
+                (unsigned long long)j2.small_present_refused, j2.depth_clears_last, (unsigned long long)j2.dlaa_fresh_features, (unsigned long long)j2.jitter_shifted, j2.small_present_why, j2.small_note);
+            if (sn > 0) WriteFile(f, sl, DWORD((std::min)(sn, int(sizeof sl - 1))), &written, nullptr);
+            {
+                char wl[320];
+                const int wn = snprintf(wl, sizeof wl,
+                    "jitter_witness frames=%llu windows=%llu last_window{tested=%llu unshifted=%llu shifted=%llu} unseen_now=%u unseen_count=%llu retests=%llu final_colour{convention=%u epoch=%llu changes=%llu}\r\n",
+                    (unsigned long long)j2.witness_frames, (unsigned long long)j2.witness_windows, (unsigned long long)j2.witness_tested,
+                    (unsigned long long)j2.witness_unshifted, (unsigned long long)j2.witness_shifted, j2.jitter_unseen ? 1u : 0u,
+                    (unsigned long long)j2.jitter_unseen_count, (unsigned long long)j2.jitter_retests,
+                    j2.jitter_input_convention, (unsigned long long)j2.jitter_input_epoch, (unsigned long long)j2.jitter_input_changes);
+                if (wn > 0) WriteFile(f, wl, DWORD((std::min)(wn, int(sizeof wl - 1))), &written, nullptr);
+            }
+            {
+                char hl[320];
+                const int hn = snprintf(hl, sizeof hl,
+                    "hud_fallback on=%u frames=%llu applied=%llu learn_only=%llu last{mask_px=%u tested_px=%u cover_permille=%u}\r\n",
+                    na::j2::HudMaskEnabled() ? 1u : 0u, (unsigned long long)j2.hud_fb_frames, (unsigned long long)j2.hud_fb_applied,
+                    (unsigned long long)j2.hud_fb_learn_only, j2.hud_fb_mask_px, j2.hud_fb_tested_px, j2.hud_fb_cover_permille);
+                if (hn > 0) WriteFile(f, hl, DWORD((std::min)(hn, int(sizeof hl - 1))), &written, nullptr);
+            }
+            const std::string hud = na::j2::native_hud::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) +
+                " chain_fmt=" + std::to_string(g_presented_format.load(std::memory_order_relaxed)) +
+                " color_space=" + std::to_string(g_color_space.load(std::memory_order_acquire)) + "\r\n";
+            WriteFile(f, hud.data(), DWORD(hud.size()), &written, nullptr);
+            if (na::j2::hud_unblend::Configured()) {
+                const std::string ub = na::j2::hud_unblend::StatusLine() + " composited=" + std::to_string(j2.small_hud_layer) + "\r\n" +
+                                       na::diag::crumbs::StatusLine() + "\r\n" + na::gpu::mem::StatusLine() + "\r\n";
+        const auto background=na::background::GetStats();char background_line[240];
+        const int background_bytes=std::snprintf(background_line,sizeof background_line,"background workers=%u active=%u pending=%u accepted=%llu completed=%llu failed=%llu rejected=%llu\r\n",
+            background.workers,background.active,background.pending,(unsigned long long)background.accepted,(unsigned long long)background.completed,
+            (unsigned long long)background.failed,(unsigned long long)background.rejected);
+        if(background_bytes>0)WriteFile(f,background_line,DWORD((std::min)(background_bytes,int(sizeof background_line-1))),&written,nullptr);
+                WriteFile(f, ub.data(), DWORD(ub.size()), &written, nullptr);
+            }
+            {
+                const std::string trace = na::j2::native_hud::TakeTrace();
+                if (!trace.empty()) WriteFile(f, trace.data(), DWORD(trace.size()), &written, nullptr);
+            }
+        }
+        {
+            const auto automatic=na::scale::GetAutomaticSceneStats();
+            if(automatic.enabled){char automatic_line[1536];const int automatic_bytes=snprintf(automatic_line,sizeof automatic_line,
+                "layer2 mode=%u active=%u reconstructed=%u reconstructed_frames=%llu generation=%llu render=%ux%u output=%ux%u members=%u plans=%u operations=%llu redirected=%llu checkpoints=%llu misses=%llu frames=%llu presents=%llu reduced_frames=%llu reduced_pct=%.2f fast_hits=%llu snapshots=%llu snapshot_failures=%llu failed_plans=%llu poll_builds=%llu group_builds=%llu unknown_ops=%llu binding_failures=%llu native_boundaries=%llu transfer_failures=%llu control_wait_us=%llu control_hold_us=%llu control_max_us=%llu worker_us=%llu reason=\"%s\"\r\n",
+                na::settings::Get().j2_scale_mode.load(),automatic.active?1u:0u,automatic.reconstructed?1u:0u,(unsigned long long)automatic.reconstructed_frames,(unsigned long long)automatic.generation,
+                automatic.render_w,automatic.render_h,automatic.out_w,automatic.out_h,automatic.members,automatic.plans,
+                (unsigned long long)automatic.operations,(unsigned long long)automatic.redirected,(unsigned long long)automatic.checkpoints,
+                (unsigned long long)automatic.misses,(unsigned long long)automatic.frames,(unsigned long long)automatic.presents,
+                (unsigned long long)automatic.redirected_frames,automatic.presents?100.0*automatic.redirected_frames/automatic.presents:0.0,
+                (unsigned long long)automatic.fast_hits,(unsigned long long)automatic.snapshots,(unsigned long long)automatic.snapshot_failures,(unsigned long long)automatic.failed_plans,
+                (unsigned long long)automatic.poll_builds,(unsigned long long)automatic.group_builds,(unsigned long long)automatic.unknown_operations,
+                (unsigned long long)automatic.binding_failures,(unsigned long long)automatic.native_boundaries,(unsigned long long)automatic.transfer_failures,
+                (unsigned long long)automatic.control_wait_us,(unsigned long long)automatic.control_hold_us,(unsigned long long)automatic.control_max_us,
+                (unsigned long long)automatic.worker_us,automatic.reason);
+                if(automatic_bytes>0)WriteFile(f,automatic_line,DWORD((std::min)(automatic_bytes,int(sizeof automatic_line-1))),&written,nullptr);
+                const int heap_bytes=snprintf(automatic_line,sizeof automatic_line,
+                    "layer2_heaps shader_heaps=%llu shader_descriptors=%llu shared_tables=%llu rtv_heaps=%llu dsv_heaps=%llu heap_failures=%llu heap_hr=0x%08X failure_kinds=\"%s\"\r\n",
+                    (unsigned long long)automatic.shader_heaps,(unsigned long long)automatic.shader_descriptors,(unsigned long long)automatic.shared_tables,
+                    (unsigned long long)automatic.rtv_heaps,(unsigned long long)automatic.dsv_heaps,(unsigned long long)automatic.heap_failures,automatic.heap_hr,automatic.failure_kinds);
+                if(heap_bytes>0)WriteFile(f,automatic_line,DWORD((std::min)(heap_bytes,int(sizeof automatic_line-1))),&written,nullptr);
+            }
+        }
+        if(na::scale::native::Available()) {
+            const auto native=na::scale::native::GetStats();char native_line[640];
+            const int native_n=std::snprintf(native_line,sizeof native_line,"native_scale mode=%u controlled=%u confirmed=%u fraction=%.7f thread=%u ticks=%llu applies=%llu requests=%llu scene=%ux%u output=%ux%u evaluations=%llu reason=\"%s\"\r\n",
+                native.mode,native.controlled,native.confirmed,native.fraction,native.thread,(unsigned long long)native.ticks,(unsigned long long)native.applies,
+                (unsigned long long)native.requests,native.render_w,native.render_h,native.out_w,native.out_h,(unsigned long long)native.evaluation,native.reason);
+            if(native_n>0)WriteFile(f,native_line,DWORD((std::min)(native_n,int(sizeof native_line-1))),&written,nullptr);
+            const auto b=na::j2::GetNativeBridgeStats();char bridge_line[768];
+            const int bridge_n=std::snprintf(bridge_line,sizeof bridge_line,"native_bridge reduced=%d hints=%llu examined=%llu candidates=%llu recorded=%llu record_failed=%llu source_size=%llu no_destination=%llu ambiguous=%llu draw_state=%llu viewport=%llu src=%ux%u/%u full_target=%ux%u/%u game_applies=%llu refusals=%llu thread_changes=%llu reason=\"%s\"\r\n",
+                b.reduced?1:0,(unsigned long long)b.hints,(unsigned long long)b.examined,(unsigned long long)b.candidates,(unsigned long long)b.recorded,
+                (unsigned long long)b.record_failed,(unsigned long long)b.source_size,(unsigned long long)b.no_destination,(unsigned long long)b.ambiguous,
+                (unsigned long long)b.draw_state,(unsigned long long)b.viewport,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
+                (unsigned long long)native.game_applies,(unsigned long long)native.refusals,(unsigned long long)native.thread_changes,b.reason);
+            if(bridge_n>0)WriteFile(f,bridge_line,DWORD((std::min)(bridge_n,int(sizeof bridge_line-1))),&written,nullptr);
+            char delivery_line[1600];
+            const int delivery_n=std::snprintf(delivery_line,sizeof delivery_line,"native_delivery delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu stages{%s} probe{%s} refusals{%s}\r\n",
+                (unsigned long long)b.delivered,(unsigned long long)b.first_delivery_frame,(unsigned long long)b.streak,(unsigned long long)b.best_streak,
+                (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.stages,b.probe,b.refusals);
+            if(delivery_n>0)WriteFile(f,delivery_line,DWORD((std::min)(delivery_n,int(sizeof delivery_line-1))),&written,nullptr);
+            char steps_line[1024];
+            const int steps_n=std::snprintf(steps_line,sizeof steps_line,"native_steps gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu late{staged=%llu changed=%llu same=%llu resolved=%llu inline=%llu inline_held{producer=%llu state=%llu}} snap{closes=%llu depth_unknown=%llu format=%llu no_slot=%llu taken=%llu} steps{%s}\r\n",
+                (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
+                (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
+                (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,(unsigned long long)b.st_aux,
+                (unsigned long long)b.st_late_staged,(unsigned long long)b.st_late_changed,(unsigned long long)b.st_late_same,(unsigned long long)b.st_late_resolved,(unsigned long long)b.st_late_inline,
+                (unsigned long long)b.st_late_no_producer,(unsigned long long)b.st_late_no_state,
+                (unsigned long long)b.snap_closes,(unsigned long long)b.snap_depth_unknown,(unsigned long long)b.snap_format,(unsigned long long)b.snap_no_slot,(unsigned long long)b.snap_taken,b.steps);
+            if(steps_n>0)WriteFile(f,steps_line,DWORD((std::min)(steps_n,int(sizeof steps_line-1))),&written,nullptr);
+            char trace_text[4096];uint64_t traces=0;na::j2::NativeTraceResult(trace_text,sizeof trace_text,&traces);
+            char trace_line[4400];
+            const int trace_n=std::snprintf(trace_line,sizeof trace_line,"native_trace traces=%llu redirect_submitted=%llu producer_state_imported=%llu last{%s}\r\n",
+                (unsigned long long)traces,(unsigned long long)b.redirect_submitted,(unsigned long long)b.depth_state_refused,trace_text);
+            if(trace_n>0)WriteFile(f,trace_line,DWORD((std::min)(trace_n,int(sizeof trace_line-1))),&written,nullptr);
+        }
+        if (na::scale::SliderRouteActive()) {
+            // P4-4 slider route: what our mode did to the game's render scale (start-up and live).
+            const auto rh = na::scale::GetReadHookStats();
+            const auto lv = na::scale::GetLiveStats();
+            const auto dr = na::scale::GetDriverStats();
+            char sl[1400];
+            const int sn = snprintf(sl, sizeof(sl),
+                "scale mode=%d fraction=%.4f requested=%.4f baseline_w=%u scene=%ux%u judged=%u changed=%u unchanged=%u state=\"%s\" "
+                "read files=%llu patched=%llu restored=%llu unpatched=%llu async=%llu utf16=%llu mapped=%llu adopted=%llu key=%s original=%.6f file=\"%s\" note=\"%s\" "
+                "live result=%s tagged=%u tag=%.6f hits=%u/%u candidates=%u trying=%d control=%d writes=%u restores=%u scanned_kb=%llu scan_ms=%llu live_note=\"%s\"\r\n",
+                dr.mode, dr.fraction, dr.requested, dr.baseline_w, j2.width, j2.height, dr.judged, dr.changed, dr.unchanged, dr.state,
+                static_cast<unsigned long long>(rh.files_opened), static_cast<unsigned long long>(rh.reads_patched),
+                static_cast<unsigned long long>(rh.writes_restored), static_cast<unsigned long long>(rh.reads_unpatched),
+                static_cast<unsigned long long>(rh.reads_async), static_cast<unsigned long long>(rh.reads_utf16),
+                static_cast<unsigned long long>(rh.files_mapped),
+                static_cast<unsigned long long>(rh.handles_adopted), rh.key, rh.original, rh.file, rh.note,
+                na::scale::LiveResultName(lv.result), lv.tagged ? 1u : 0u, lv.tag, lv.float_hits, lv.double_hits, lv.candidates, lv.trying, lv.control,
+                lv.writes, lv.restores, static_cast<unsigned long long>(lv.scanned_kb), static_cast<unsigned long long>(lv.scan_ms), lv.note);
+            if (sn > 0) WriteFile(f, sl, static_cast<DWORD>((std::min)(sn, static_cast<int>(sizeof(sl) - 1))), &written, nullptr);
+        }
+        {
+            char cl[320]; // camera choice and loss reasons (Sniper steep-view flicker, 2026-11-01)
+            const int cn = snprintf(cl, sizeof(cl),
+                "j2_camera contested=%llu alternatives=%llu lost_unread=%llu lost_no_vp=%llu lost_no_inverse=%llu lost_capped=%llu other_cam=%llu jitter_slot_other=%llu inverse_computed=%llu bootstrapped=%llu\r\n",
+                static_cast<unsigned long long>(j2.camera_contested), static_cast<unsigned long long>(j2.camera_alternatives),
+                static_cast<unsigned long long>(j2.camera_lost_unread), static_cast<unsigned long long>(j2.camera_lost_no_vp),
+                static_cast<unsigned long long>(j2.camera_lost_no_inverse), static_cast<unsigned long long>(j2.camera_lost_capped),
+                static_cast<unsigned long long>(j2.other_camera_blocks), static_cast<unsigned long long>(j2.jitter_slot_other_camera),
+                static_cast<unsigned long long>(j2.camera_inverse_computed), static_cast<unsigned long long>(j2.camera_bootstrapped));
+            if (cn > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(cn, static_cast<int>(sizeof(cl) - 1))), &written, nullptr);
+            // Per present: why a frame had no DLAA / why a DLAA frame had no jitter (SE5 flicker, 2026-11-02).
+            char ml[384];
+            const int mn = snprintf(ml, sizeof(ml),
+                "j2_misses no_dlaa{no_camera=%llu no_state=%llu no_candidate=%llu other=%llu} unjittered{no_sample=%llu not_applied=%llu not_held=%llu} camera_held=%llu extrapolated=%llu depth_assumed=%llu camera_from_j1=%llu\r\n",
+                static_cast<unsigned long long>(j2.miss_no_camera), static_cast<unsigned long long>(j2.miss_no_state),
+                static_cast<unsigned long long>(j2.miss_no_candidate), static_cast<unsigned long long>(j2.miss_other),
+                static_cast<unsigned long long>(j2.unjit_no_sample), static_cast<unsigned long long>(j2.unjit_not_applied),
+                static_cast<unsigned long long>(j2.unjit_not_held), static_cast<unsigned long long>(j2.camera_held),
+                static_cast<unsigned long long>(j2.camera_extrapolated), static_cast<unsigned long long>(j2.depth_state_assumed),
+                static_cast<unsigned long long>(j2.camera_from_j1));
+            if (mn > 0) WriteFile(f, ml, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml) - 1))), &written, nullptr);
+            char sources[640];
+            const int sn=snprintf(sources,sizeof sources,
+                "j2_input_sources evaluated{depth_local=%llu depth_inherited=%llu depth_supplied=%llu depth_submitted=%llu camera_fresh=%llu camera_j1=%llu camera_still=%llu camera_moving=%llu camera_predicted=%llu camera_saved=%llu} last{depth=%u camera=%u age=%llu max_age=%llu}\r\n",
+                (unsigned long long)j2.depth_sources[0],(unsigned long long)j2.depth_sources[1],
+                (unsigned long long)j2.depth_sources[2],(unsigned long long)j2.depth_sources[3],
+                (unsigned long long)j2.camera_sources[0],(unsigned long long)j2.camera_sources[1],
+                (unsigned long long)j2.camera_sources[2],(unsigned long long)j2.camera_sources[3],
+                (unsigned long long)j2.camera_sources[4],(unsigned long long)j2.camera_sources[5],
+                j2.depth_source_last,j2.camera_source_last,(unsigned long long)j2.camera_age_last,(unsigned long long)j2.camera_age_max);
+            if(sn>0)WriteFile(f,sources,static_cast<DWORD>((std::min)(sn,static_cast<int>(sizeof(sources)-1))),&written,nullptr);
+            if (j2.camera_lost_evidence[0]) {
+                WriteFile(f, "j2_camera_lost ", 15, &written, nullptr);
+                WriteFile(f, j2.camera_lost_evidence, static_cast<DWORD>(std::strlen(j2.camera_lost_evidence)), &written, nullptr);
+                WriteFile(f, "\r\n", 2, &written, nullptr);
+            }
+        }
+        {
+            // P4-0b moving-object motion (Opus; one status line, read-only snapshot).
+            const auto fs = na::j2::flow::GetStats();
+            char fl[640];
+            const int fn = snprintf(fl, sizeof(fl),
+                "j2flow on=%u available=%u active=%u latched=%u cost=%u size=%ux%u engine=%ux%u grid=%u perf=%u ds=%u pairs=%llu hinted=%llu consumed=%llu encode_only=%llu abandoned=%llu skip_busy=%llu skip_split=%llu skip_msaa=%llu skip_reset=%llu skip_resize=%llu engine_failed=%llu watchdog=%llu px_acc=%llu px_inv=%llu px_small=%llu px_cost=%llu px_off=%llu px_img=%llu px_flk=%llu mean_cost=%.1f ms=%.2f ms_avg=%.2f \"%s\"\r\n",
+                fs.enabled, fs.available, fs.active, fs.latched, fs.cost, fs.width, fs.height, fs.engine_w, fs.engine_h, fs.grid, fs.perf, fs.downscale,
+                static_cast<unsigned long long>(fs.pairs), static_cast<unsigned long long>(fs.hinted), static_cast<unsigned long long>(fs.consumed), static_cast<unsigned long long>(fs.encode_only),
+                static_cast<unsigned long long>(fs.abandoned), static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
+                static_cast<unsigned long long>(fs.skipped_msaa), static_cast<unsigned long long>(fs.skipped_reset), static_cast<unsigned long long>(fs.skipped_resize),
+                static_cast<unsigned long long>(fs.engine_failed), static_cast<unsigned long long>(fs.watchdog_trips),
+                static_cast<unsigned long long>(fs.px_accepted), static_cast<unsigned long long>(fs.px_invalid), static_cast<unsigned long long>(fs.px_small),
+                static_cast<unsigned long long>(fs.px_cost), static_cast<unsigned long long>(fs.px_offscreen), static_cast<unsigned long long>(fs.px_image),
+                static_cast<unsigned long long>(fs.px_flicker),
+                fs.mean_cost, fs.ms_last, fs.ms_avg, fs.reason);
+            if (fn > 0) WriteFile(f, fl, static_cast<DWORD>((std::min)(fn, static_cast<int>(sizeof(fl) - 1))), &written, nullptr);
+        }
         char coverage[256];
         if (j2.depth_state_evidence[0]) {
             WriteFile(f, "j2_depth_evidence ", 18, &written, nullptr);
             WriteFile(f, j2.depth_state_evidence, static_cast<DWORD>(std::strlen(j2.depth_state_evidence)), &written, nullptr);
             WriteFile(f, "\r\n", 2, &written, nullptr);
+        }
+        {   // Why DLSS history restarted (Cort: a blink every ~30 s while standing still).
+            char cl2[600];
+            const int cn2 = snprintf(cl2, sizeof cl2, "j2_cuts restarts=%llu gap=%llu motion=%llu bridged=%llu interlopers{kept_main=%llu skipped=%llu} velocity_capture{candidates=%llu captured=%llu unknown_state=%llu} now=%llu recent=%s\r\n",
+                (unsigned long long)j2.cut_restarts, (unsigned long long)j2.cut_gap, (unsigned long long)j2.cut_motion, (unsigned long long)j2.gap_bridged,
+                (unsigned long long)j2.camera_interlopers, (unsigned long long)j2.camera_interloper_picks,
+                (unsigned long long)j2.velocity_candidates, (unsigned long long)j2.velocity_captured, (unsigned long long)j2.velocity_capture_unknown_state,
+                (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.recent_cuts);
+            if (cn2 > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(cn2, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
+            if (j2.game_motion[0]) {
+                WriteFile(f, "j2_", 3, &written, nullptr);
+                WriteFile(f, j2.game_motion, static_cast<DWORD>(std::strlen(j2.game_motion)), &written, nullptr);
+                WriteFile(f, "\r\n", 2, &written, nullptr);
+            }
+            {
+                const char* eff = na::settings::EffectiveSummary();
+                if (eff && eff[0]) { WriteFile(f, eff, static_cast<DWORD>(std::strlen(eff)), &written, nullptr); WriteFile(f, "\r\n", 2, &written, nullptr); }
+            }
+            // aca551b cost: standalone-projection search (cached = blocks skipped, solved = solver windows) and J1 CPU per frame.
+            const int psn = snprintf(cl2, sizeof cl2, "j2_pscan cached=%llu solved=%llu cpu_us_per_frame=%.1f cpu_max_us=%llu\r\n",
+                (unsigned long long)j2.jitter_p_scan_cached, (unsigned long long)j2.jitter_p_scan_solved,
+                j2.frames ? double(j2.jitter_cpu_us) / double(j2.frames) : 0.0, (unsigned long long)j2.jitter_cpu_max_us);
+            if (psn > 0) WriteFile(f, cl2, static_cast<DWORD>((std::min)(psn, static_cast<int>(sizeof(cl2) - 1))), &written, nullptr);
+        }
+        {   // Frames whose DLAA ran before the last scene draw (SE5 pan-only flicker): placement + late writer.
+            char ll[1000];
+            const int ln = snprintf(ll, sizeof ll, "j2_late frames=%llu now=%llu recent=%s\r\n", (unsigned long long)j2.late_frames,
+                (unsigned long long)(GetTickCount64() / 100 % 100000000), j2.late_detail);
+            if (ln > 0) WriteFile(f, ll, static_cast<DWORD>((std::min)(ln, static_cast<int>(sizeof(ll) - 1))), &written, nullptr);
+        }
+        {   // Why carried resource states are lost (SE5 depth no_state: ambiguous_queue_order).
+            const auto ps = na::observe::GetProducerStats();
+            char ol[192];
+            const int on = snprintf(ol, sizeof ol, "observe_order executes=%llu ambiguous=%llu nested_unlocked=%llu known_clears=%llu serialized=%llu\r\n",
+                (unsigned long long)ps.executes, (unsigned long long)ps.ambiguous_executes, (unsigned long long)ps.nested_unlocked,
+                (unsigned long long)ps.known_state_clears, (unsigned long long)ps.serialized_submissions);
+            if (on > 0) WriteFile(f, ol, static_cast<DWORD>((std::min)(on, static_cast<int>(sizeof(ol) - 1))), &written, nullptr);
         }
         const DWORD trace_len = static_cast<DWORD>(std::strlen(j2.insertion_frame_trace));
         WriteFile(f, "j2_frame", 8, &written, nullptr);
@@ -750,16 +1431,39 @@ void write_status_line()
                 (unsigned long long)rj[4], (unsigned long long)rj[5], (unsigned long long)rj[6], (unsigned long long)rj[7],
                 (unsigned long long)rj[8], j2.inline_frame_rejects);
             if (nrej > 0) WriteFile(f, rl, static_cast<DWORD>((std::min)(nrej, static_cast<int>(sizeof rl - 1))), &written, nullptr);
-            char al[700];
+            char icl[768];
+            const int nic = na::j2::FormatInlineCost(icl, sizeof icl);
+            if (nic > 0) WriteFile(f, icl, static_cast<DWORD>((std::min)(nic, static_cast<int>(sizeof icl - 1))), &written, nullptr);
+            char al[900];
             const int na2 = snprintf(al, sizeof al,
-                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu} note=\"%s\"\r\n",
+                "j2_profile accepted=%u rejected=%u ambiguous=%u entries=%u matched{class=%llu pair=%llu barrier=%llu legacy=%llu} rejected_skips=%llu barrier_vetoes=%llu barrier_ambiguous=%llu contradictions{class=%llu barrier=%llu} labelled=%llu unlabelled=%llu expired=%llu between{observed=%llu predicted=%llu earlier=%llu late=%llu} note=\"%s\" forgotten=%llu\r\n",
                 j2.profile_accepted, j2.profile_rejected, j2.profile_ambiguous, j2.profile_entries,
                 (unsigned long long)j2.class_matched, (unsigned long long)j2.class_pair_matched, (unsigned long long)j2.barrier_matched,
                 (unsigned long long)j2.legacy_matched, (unsigned long long)j2.class_rejected_skips, (unsigned long long)j2.barrier_vetoes,
                 (unsigned long long)j2.barrier_ambiguous_skips, (unsigned long long)j2.class_contradictions, (unsigned long long)j2.barrier_contradictions,
                 (unsigned long long)j2.labelled_frames, (unsigned long long)j2.unlabelled_frames, (unsigned long long)j2.expired_inline,
-                (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted, j2.class_note);
+                (unsigned long long)j2.between_observed, (unsigned long long)j2.between_predicted,
+                (unsigned long long)j2.between_earlier, (unsigned long long)j2.between_late, j2.class_note,
+                (unsigned long long)j2.profile_forgotten);
             if (na2 > 0) WriteFile(f, al, static_cast<DWORD>((std::min)(na2, static_cast<int>(sizeof al - 1))), &written, nullptr);
+            const int en=snprintf(al,sizeof al,"j2_entry keys=%u matched=%llu source=actual_operation rejected{new=%llu learning=%llu middle=%llu} rescued_by_boundary=%llu(writer_differs=%llu memory=%llu shapes=%u retired=%llu) context{keys=%u matched=%llu} rescue_fail{learned=%llu res=%llu writer=%llu occ=%llu tr=%llu cand=%llu dst=%llu pso=%llu pending=%llu} last{%s}\r\n",j2.entry_keys,(unsigned long long)j2.entry_matched,
+                (unsigned long long)j2.entry_unknown,(unsigned long long)j2.entry_learning,(unsigned long long)j2.entry_middle,(unsigned long long)j2.entry_rescued,(unsigned long long)j2.entry_rescued_writer,(unsigned long long)j2.entry_rescued_memory,j2.entry_shapes,(unsigned long long)j2.entry_shapes_retired,j2.entry_ctx_keys,(unsigned long long)j2.entry_ctx_matched,
+                (unsigned long long)j2.rescue_fail[0],(unsigned long long)j2.rescue_fail[1],(unsigned long long)j2.rescue_fail[2],(unsigned long long)j2.rescue_fail[3],
+                (unsigned long long)j2.rescue_fail[4],(unsigned long long)j2.rescue_fail[5],(unsigned long long)j2.rescue_fail[6],(unsigned long long)j2.rescue_fail[7],
+                (unsigned long long)j2.rescue_fail[8],j2.rescue_note);
+            if(en>0)WriteFile(f,al,static_cast<DWORD>(en),&written,nullptr);
+            {
+                // Burst diagnosis (2026-11-05): every distinct reason given, with counts, and
+                // inline placements that fired but could not record DLAA.
+                char reasons_line[1200];
+                int rn = snprintf(reasons_line, sizeof reasons_line, "j2_reasons inline_record_failed=%llu kinds=%u", (unsigned long long)j2.inline_record_failed, j2.reason_kinds);
+                for (uint32_t i = 0; i < j2.reason_kinds && rn > 0 && rn < static_cast<int>(sizeof reasons_line) - 90; ++i) {
+                    const int m = snprintf(reasons_line + rn, sizeof reasons_line - static_cast<size_t>(rn), " | %llu:%s", (unsigned long long)j2.reason_counts[i].n, j2.reason_counts[i].text);
+                    if (m < 0) break;
+                    rn += m;
+                }
+                if (rn > 0 && rn < static_cast<int>(sizeof reasons_line) - 2) { reasons_line[rn++] = '\r'; reasons_line[rn++] = '\n'; WriteFile(f, reasons_line, static_cast<DWORD>(rn), &written, nullptr); }
+            }
             const auto cs = na::capture::j2::GetStats();
             {
                 // Four separate outcomes (Astra): frames without DLAA, DLAA placed before more
@@ -776,8 +1480,9 @@ void write_status_line()
             }
             if (cs.requested) {
                 char cl[300];
-                const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u dir=\"%S\"\r\n",
+                const int nc2 = snprintf(cl, sizeof cl, "j2_capture requested=%u recorded=%u submitted=%u written=%u busy=%u discarded=%u retired=%u no_present=%u errors=%u triggers=%u extra_skipped=%u dir=\"%S\"\r\n",
                     cs.requested, cs.recorded, cs.submitted, cs.written, cs.dropped_busy, cs.discarded, cs.retired, cs.without_present, cs.errors,
+                    cs.triggers, cs.extra_skipped,
                     na::capture::j2::Directory());
                 if (nc2 > 0) WriteFile(f, cl, static_cast<DWORD>((std::min)(nc2, static_cast<int>(sizeof cl - 1))), &written, nullptr);
             }
@@ -797,11 +1502,16 @@ void write_status_line()
         if (nn > 0) WriteFile(f, nl, static_cast<DWORD>((std::min)(nn, static_cast<int>(sizeof(nl)-1))), &written, nullptr);
         // Live texture detail: were twins built, and do recordings use them or fall back?
         const auto ml = na::observe::GetMipLiveStats();
-        char ml_line[300];
-        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u now=%.2f game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu\r\n",
-                                ml.enabled ? 1u : 0u, na::observe::SamplerMipBias(), ml.game_bias, (unsigned long long)ml.twin_root_signatures,
+        char ml_line[520];
+        // chosen = menu/saved; in_use = what recordings bind (differs while preparing);
+        // changed_static = the game's static samplers changed in the twins in use (the proof).
+        const int mn = snprintf(ml_line, sizeof ml_line, "mip_live enabled=%u chosen=%.2f/af%u in_use=%.2f/af%u preparing=%u (%llu/%llu) changed_static=%llu game=%.2f twin_rs=%llu twin_pso=%llu untwinned_pso=%llu fallbacks=%llu twin_failures=%llu bound{pso_twin=%llu pso_game=%llu rs_twin=%llu rs_game=%llu} warmed=%llu parallel=%llu\r\n",
+                                ml.enabled ? 1u : 0u, ml.want_bias, ml.want_aniso, ml.live_bias, ml.live_aniso, ml.preparing ? 1u : 0u,
+                                (unsigned long long)ml.prepare_done, (unsigned long long)ml.prepare_total, (unsigned long long)ml.live_static_changed,
+                                ml.game_bias, (unsigned long long)ml.twin_root_signatures,
                                 (unsigned long long)ml.twin_pipelines, (unsigned long long)ml.untwinned_pipelines, (unsigned long long)ml.fallbacks,
-                                (unsigned long long)ml.twin_failures);
+                                (unsigned long long)ml.twin_failures, (unsigned long long)ml.bound_pso_twin, (unsigned long long)ml.bound_pso_game,
+                                (unsigned long long)ml.bound_rs_twin, (unsigned long long)ml.bound_rs_game, (unsigned long long)ml.warmed_levels, (unsigned long long)ml.parallel_passes);
         if (mn > 0) WriteFile(f, ml_line, static_cast<DWORD>((std::min)(mn, static_cast<int>(sizeof(ml_line)-1))), &written, nullptr);
     }
     const auto latency = na::latency::GetStats();
@@ -1118,7 +1828,8 @@ struct State {
     LARGE_INTEGER qpc_freq{};
     void* dummy_swapchain_identity = nullptr;
 };
-State g_state;
+// Never destroyed: FrameCtx's D3D12 objects would be released by the CRT at exit (c0000005).
+State& g_state = *new State;
 
 // A slot is not signaled again until its previous use completes. Independent
 // queues therefore cannot advance one another's completion receipts.
@@ -1136,6 +1847,27 @@ UINT64 menu_completed_prefix() {
 // Diagnostic polling must never wait on the render thread or on the GPU.
 void write_menu_progress(HANDLE log)
 {
+    const auto cf=na::j2::compute_flow::GetStats();char cfline[950];DWORD cfw=0;
+    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u} flow_loosen=%u sum{pairs=%llu accepted=%llu invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu}\r\n",
+        static_cast<unsigned long long>(cf.recorded),static_cast<unsigned long long>(cf.submitted),static_cast<unsigned long long>(cf.pairs),
+        static_cast<unsigned long long>(cf.busy),static_cast<unsigned long long>(cf.accepted),static_cast<unsigned long long>(cf.total),cf.ms,cf.reason,
+        (unsigned long long)cf.attempts,(unsigned long long)cf.submitted_pairs,(unsigned long long)cf.unavailable,(unsigned long long)cf.waiting_history,
+        (unsigned long long)cf.last_submitted_frame,(unsigned long long)cf.submit_age_ms,(unsigned long long)cf.sample_frame,(unsigned long long)cf.sample_age_ms,(unsigned long long)cf.samples,
+        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,cf.loosen,
+        (unsigned long long)cf.sum_pairs,(unsigned long long)cf.sum[0],(unsigned long long)cf.sum[1],(unsigned long long)cf.sum[2],(unsigned long long)cf.sum[3],
+        (unsigned long long)cf.sum[4],(unsigned long long)cf.sum[5],(unsigned long long)cf.sum[6]);
+    if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);
+    {char line[160];const int n=snprintf(line,sizeof line,"j2jitter source=flow convention=%u epoch=%llu changes=%llu\r\n",
+        cf.colour_jitter_convention,(unsigned long long)cf.colour_jitter_epoch,(unsigned long long)cf.colour_jitter_changes);
+        if(n>0)WriteFile(log,line,DWORD((std::min)(n,int(sizeof(line)-1))),&cfw,nullptr);}
+    {char fl[700];DWORD fw=0;const double acc=cf.fit_accepted?1.0/double(cf.fit_accepted):0.0;
+        const int fn=snprintf(fl,sizeof fl,"j2camfit recorded=%llu collected=%llu accepted=%llu flow_passed=%llu rejected_jitter=%llu rejected_image=%llu fit_only=%llu reconstruct=%d reconstruct_frames=%llu accepted_e0_mean=%.4f accepted_e_mean=%.4f last{accepted=%d e0=%.4f e0_jitter=%.4f n0=%u e=%.4f n=%u t=[%.5f %.5f %.5f] r=[%.6f %.6f %.6f] image{tested=%u better=%u worse=%u e_fit=%.4f e_cam=%.4f regions=%u good=%u}}\r\n",
+            (unsigned long long)cf.fit_recorded,(unsigned long long)cf.fit_collected,(unsigned long long)cf.fit_accepted,
+            (unsigned long long)cf.fit_flow_passed,(unsigned long long)cf.fit_rejected_jitter,(unsigned long long)cf.fit_rejected_image,(unsigned long long)cf.fit_only,
+            cf.camera_reconstruct?1:0,(unsigned long long)cf.reconstruct_frames,cf.fit_e0_sum*acc,cf.fit_e_sum*acc,
+            cf.fit_last_accepted?1:0,cf.fit_e0,cf.fit_e_alt,cf.fit_n0,cf.fit_e,cf.fit_n,cf.fit_theta[0],cf.fit_theta[1],cf.fit_theta[2],cf.fit_theta[3],cf.fit_theta[4],cf.fit_theta[5],
+            cf.fit_photo_tested,cf.fit_photo_better,cf.fit_photo_worse,cf.fit_photo_e_fit,cf.fit_photo_e_cam,cf.fit_photo_regions,cf.fit_photo_good);
+        if(fn>0)WriteFile(log,fl,(std::min)(DWORD(fn),DWORD(sizeof(fl)-1)),&fw,nullptr);}
     auto ps = na::present::GetStats();
     char p_line[256];
     int pn = snprintf(p_line, sizeof(p_line), "present_gpu submitted=%llu completed=%llu owned=%u device_hr=0x%08lX queried_latency_handle=0x%llX\r\n",
@@ -1152,6 +1884,7 @@ void write_menu_progress(HANDLE log)
     if(pn>0)WriteFile(log,p_line,static_cast<DWORD>(pn),&pw,nullptr);
     std::unique_lock<std::mutex> lock(g_state.mutex, std::try_to_lock);
     if (!lock.owns_lock() || !g_state.device) return;
+    na::diag::ReportIfRemoved(g_state.device.Get());
     char line[400];
     int n = snprintf(line, sizeof(line), "menu_gpu draws=%llu submitted=%llu completed=%llu device_hr=0x%08lX observed_queue=0x%llX present_queue=0x%llX swapchain_queues=%u hits=%u buffer_queue=%u misses=%u\r\n",
                      static_cast<unsigned long long>(g_frames.load()),
@@ -1164,6 +1897,35 @@ void write_menu_progress(HANDLE log)
     if (n >= static_cast<int>(sizeof(line))) n = static_cast<int>(sizeof(line)) - 1; // never write past a truncated line
     DWORD written = 0;
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
+    n = snprintf(line, sizeof(line),
+        "menu_skips not_ready=%llu buffer=%llu busy=%llu atlas=%llu empty=%llu command=%llu present_rejected=%llu last_present_hr=0x%08lX\r\n",
+        static_cast<unsigned long long>(g_menu_skips.not_ready.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.buffer.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.busy.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.atlas.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.empty.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.command.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_skips.present_rejected.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_menu_skips.last_present_rejection.load(std::memory_order_relaxed)));
+    if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
+    for (int open = 0; open < 2; ++open) {
+        auto& t = g_present_timing[open];
+        const uint64_t c = t.n.exchange(0), ours = t.ours_us.exchange(0), orig = t.orig_us.exchange(0);
+        const uint64_t ours_max = t.ours_max.exchange(0), orig_max = t.orig_max.exchange(0);
+        n = snprintf(line, sizeof(line), "present_timing menu=%s presents=%llu ours_us=%llu/max%llu original_present_us=%llu/max%llu\r\n",
+                     open ? "open" : "closed", static_cast<unsigned long long>(c),
+                     static_cast<unsigned long long>(c ? ours / c : 0), static_cast<unsigned long long>(ours_max),
+                     static_cast<unsigned long long>(c ? orig / c : 0), static_cast<unsigned long long>(orig_max));
+        if (n > 0) WriteFile(log, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)) - 1)), &written, nullptr);
+    }
+    {
+        const uint64_t c = g_deferred_timing.n.exchange(0), f = g_deferred_timing.flush.exchange(0),
+                       l = g_deferred_timing.lock.exchange(0), b = g_deferred_timing.boundary.exchange(0);
+        n = snprintf(line, sizeof(line), "on12_boundary presents=%llu flush_us=%llu lock_us=%llu boundary_us=%llu\r\n",
+            static_cast<unsigned long long>(c), static_cast<unsigned long long>(c ? f/c : 0),
+            static_cast<unsigned long long>(c ? l/c : 0), static_cast<unsigned long long>(c ? b/c : 0));
+        if (n > 0) WriteFile(log, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)) - 1)), &written, nullptr);
+    }
     auto nr_progress = na::nr::GetStats();
     n = snprintf(line, sizeof(line), "frame_progress nr_submitted=%llu nr_completed=%llu direct_queues=%u present_thread=%u\r\n",
         static_cast<unsigned long long>(nr_progress.gpu_submitted), static_cast<unsigned long long>(nr_progress.gpu_completed),
@@ -1245,6 +2007,8 @@ void record_raw_input(HRAWINPUT h)
 constexpr UINT kMsgCursorShow = WM_APP + 31;
 constexpr UINT kMsgCursorRestore = WM_APP + 32;
 constexpr UINT kMsgNudge = WM_APP + 33;        // A63: shrink the game window by one pixel
+constexpr UINT kMsgFill = WM_APP + 34;         // render-small: make the windowed game cover its monitor, borderless
+constexpr UINT kMsgUnfill = WM_APP + 35;       // put the window's own frame, style and place back
 constexpr UINT_PTR kNudgeTimer = 0x4E41;       // A64: restore timer id on the game's window ("NA")
 constexpr UINT kNudgeRestoreMs = 120;          // A64: restore after this, by timer, not by frames
 constexpr uint32_t kNudgeRestoreRetries = 8;   // A64: restore attempts before giving up
@@ -1344,24 +2108,141 @@ void nudge_restore(HWND hwnd)
     } // else the timer fires again
 }
 
+// Every message the GAME's window procedure receives, after our own input handling.
+// Render-small: a posted live-size request becomes the game's virtual WM_SIZE, and mouse
+// coordinates are mapped once into the game's render-size client (docs/NATIVE-PRESENT-SIZING.md).
+LRESULT call_game_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (na::j2::RenderSmall()) {
+        WINDOWPOS scratch{}; // must outlive the game's call
+        // A REAL window resize (not our posted request): the new physical size and its render size
+        // go together, with the presenter's exact scale and rounding.
+        if (msg == WM_SIZE && wp != SIZE_MINIMIZED && msg != na::native_present::ResizeMessage()) {
+            const na::native_present::Size out{LOWORD(lp), HIWORD(lp)};
+            if (out.w && out.h) na::native_present::BeginWindowResize(hwnd, out, small_render_for(out, static_cast<double>(na::present::RenderScale())));
+        }
+        if (na::native_present::PrepareSizeMessage(hwnd, msg, wp, lp, scratch) == na::native_present::MessageAction::Consume) return 0;
+        na::native_present::MapGameMouseMessage(hwnd, msg, lp);
+        return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
+    }
+    return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
+}
+// ---- Fill screen (render-small, Cort 2026-11-06) ----
+// In borderless or exclusive full screen the game sizes itself from the monitor and ignores
+// our smaller-size request (p36120: resize asked 3, ok 1, failed 2, stayed DLAA). In a window
+// it follows every request. So the game stays in its windowed mode and we make that window
+// borderless and the size of its monitor: it looks like borderless full screen, while the
+// game still believes it is a window. All window changes happen on the window's own thread
+// (posted messages), never from Present. If the game keeps putting its frame back, we stop.
+struct FillState {
+    bool saved = false, filled = false, gave_up = false;
+    LONG_PTR style = 0, ex_style = 0;
+    RECT rect{};
+    uint32_t fills = 0;
+    ULONGLONG window_start = 0;
+};
+FillState g_fill; // window thread only
+std::atomic<bool> g_fill_pending{false};
+std::atomic<bool> g_fill_active{false};
+std::atomic<bool> g_fill_gave_up{false};
+constexpr LONG_PTR kFrameStyles = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_BORDER | WS_DLGFRAME;
+constexpr LONG_PTR kFrameExStyles = WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE;
+bool window_fills_monitor(HWND hwnd, RECT* monitor_rect)
+{
+    MONITORINFO mi{sizeof mi};
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return true; // unknown: leave it alone
+    if (monitor_rect) *monitor_rect = mi.rcMonitor;
+    RECT r{};
+    if (!GetWindowRect(hwnd, &r)) return true;
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    return !(style & (WS_CAPTION | WS_THICKFRAME)) && EqualRect(&r, &mi.rcMonitor);
+}
+void handle_fill_message(HWND hwnd, bool fill)
+{
+    g_fill_pending.store(false, std::memory_order_release);
+    if (fill) {
+        if (g_fill.gave_up || IsIconic(hwnd)) return;
+        RECT mon{};
+        if (window_fills_monitor(hwnd, &mon)) { g_fill.filled = true; g_fill_active.store(true); return; }
+        const ULONGLONG now = GetTickCount64();
+        if (now - g_fill.window_start > 30000) { g_fill.window_start = now; g_fill.fills = 0; }
+        if (++g_fill.fills > 5) { // the game restores its frame every time: stop fighting it
+            g_fill.gave_up = true;
+            g_fill_gave_up.store(true);
+            na::eventlog::Emit("fill_screen", "gave_up=1 reason=\"the game keeps restoring its window frame\"");
+            return;
+        }
+        if (!g_fill.saved) {
+            g_fill.style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            g_fill.ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            GetWindowRect(hwnd, &g_fill.rect);
+            g_fill.saved = true;
+        }
+        const LONG_PTR style = (GetWindowLongPtrW(hwnd, GWL_STYLE) & ~kFrameStyles) | WS_POPUP;
+        const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & ~kFrameExStyles;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+        const BOOL ok = SetWindowPos(hwnd, nullptr, mon.left, mon.top, mon.right - mon.left, mon.bottom - mon.top,
+                                     SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        g_fill.filled = ok != FALSE;
+        g_fill_active.store(g_fill.filled);
+        na::eventlog::Emit("fill_screen", "filled=%u monitor=%ldx%ld at=%ld,%ld was{%ldx%ld style=0x%llX} attempt=%u error=%lu",
+                           ok ? 1u : 0u, long(mon.right - mon.left), long(mon.bottom - mon.top), long(mon.left), long(mon.top),
+                           long(g_fill.rect.right - g_fill.rect.left), long(g_fill.rect.bottom - g_fill.rect.top),
+                           (unsigned long long)g_fill.style, g_fill.fills, ok ? 0ul : GetLastError());
+    } else {
+        if (!g_fill.saved) return;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, g_fill.style);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_fill.ex_style);
+        const RECT& r = g_fill.rect;
+        SetWindowPos(hwnd, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                     SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        na::eventlog::Emit("fill_screen", "restored=1 size=%ldx%ld", long(r.right - r.left), long(r.bottom - r.top));
+        g_fill = FillState{};
+        g_fill_active.store(false);
+        g_fill_gave_up.store(false);
+    }
+}
+// Present thread, cheap: every 30 game frames, ask the window thread to fill or restore.
+void fill_screen_tick(IDXGISwapChain* sc)
+{
+    static uint32_t n = 0;
+    if (++n % 30 || !sc || !na::j2::RenderSmall()) return;
+    DXGI_SWAP_CHAIN_DESC d{};
+    if (FAILED(sc->GetDesc(&d)) || !d.OutputWindow || !IsWindow(d.OutputWindow)) return;
+    const bool want = na::settings::Get().fill_screen.load(std::memory_order_relaxed) != 0;
+    if (g_fill_pending.load(std::memory_order_acquire)) return;
+    if (want && d.Windowed && !g_fill_gave_up.load() && !IsIconic(d.OutputWindow) && !window_fills_monitor(d.OutputWindow, nullptr)) {
+        g_fill_pending.store(true, std::memory_order_release);
+        if (!PostMessageW(d.OutputWindow, kMsgFill, 0, 0)) g_fill_pending.store(false);
+    } else if (!want && g_fill_active.load()) {
+        g_fill_pending.store(true, std::memory_order_release);
+        if (!PostMessageW(d.OutputWindow, kMsgUnfill, 0, 0)) g_fill_pending.store(false);
+    }
+}
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     na::latency::pcl::Message(msg, wp);
     if (msg == WM_KEYDOWN && wp == VK_HOME && !(lp & (1 << 30))) {
-        g_open.store(!g_open.load(std::memory_order_relaxed), std::memory_order_release);
+        const bool open = !g_open.load(std::memory_order_relaxed);
+        g_open.store(open, std::memory_order_release);
+        na::eventlog::Emit("menu_home", "open=%u", open ? 1u : 0u);
         sync_cursor(); // close restores even if the game stops presenting
         return 0;
     }
     if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && na::j2::Enabled()) {
         const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
-        if (key && wp == key && !na::capture::j2::Armed()) // J2 evidence capture, N consecutive frames
-            na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+        if (key && wp == key && !na::capture::j2::Armed()) { // J2 evidence capture, N consecutive frames
+            if (GetKeyState(VK_SHIFT) & 0x8000) { if (!na::j2::SmearTestRunning()) na::j2::StartSmearTest(); } // Shift: the smear test
+            else na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+        }
     }
     if (msg == kMsgCursorShow || msg == kMsgCursorRestore) {
         g_cursor_message_pending.store(false);
         sync_cursor();
         return 0;
     }
+    if (msg == kMsgFill || msg == kMsgUnfill) { handle_fill_message(hwnd, msg == kMsgFill); return 0; }
     if (msg == kMsgNudge) { // A63/A64: one pixel smaller; the game sees WM_SIZE and (hopefully) rebuilds
         g_nudge_attempts.fetch_add(1, std::memory_order_relaxed);
         g_nudge_restore_tries = 0;
@@ -1389,7 +2270,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     if (!g_open.load(std::memory_order_acquire) || !g_state.imgui_ready)
-        return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
+        return call_game_wndproc(hwnd, msg, wp, lp);
 
     switch (msg) {
     case WM_INPUT:
@@ -1434,7 +2315,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         sync_cursor();
         return TRUE;
     default:
-        return CallWindowProcW(g_state.orig_wndproc, hwnd, msg, wp, lp);
+        return call_game_wndproc(hwnd, msg, wp, lp);
     }
 }
 
@@ -1609,10 +2490,14 @@ bool ensure_buffers_locked(IDXGISwapChain* sc)
 
 // The current real back buffer for THIS frame only: fetched, its RTV
 // (re)written, used, and released by the caller before the Present returns.
-bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPTOR_HANDLE target_rtv, ComPtr<ID3D12Resource>& out)
+bool acquire_back_buffer_locked(IDXGISwapChain* sc, UINT idx, D3D12_CPU_DESCRIPTOR_HANDLE target_rtv, ComPtr<ID3D12Resource>& out,
+                                ID3D12CommandQueue* queue = nullptr, na::on12::Borrowed* borrowed = nullptr)
 {
     if (idx >= g_state.backbuffer_count) return false;
-    if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) return false;
+    if (FAILED(real_get_buffer(sc, idx, IID_PPV_ARGS(&out)))) {
+        // DX11 game on our 11on12 device: borrow the D3D12 buffer underneath for this draw.
+        if (!borrowed || !na::on12::UnwrapBackBuffer(sc, idx, queue, g_state.format, out.ReleaseAndGetAddressOf(), *borrowed)) return false;
+    }
     D3D12_RENDER_TARGET_VIEW_DESC rtv{};
     rtv.Format = g_state.format;
     rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
@@ -1678,7 +2563,7 @@ bool ensure_init_locked(IDXGISwapChain* sc)
         bool committed=false;
         ~MenuAttempt(){if(!committed)discard_menu_init_locked();}
     } attempt;
-    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))) return false;
+    if (FAILED(swapchain_d3d12_device(sc, g_state.device))) return false;
     na::gputime::SetDevice(g_state.device.Get());
     g_state.rtv_stride = g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     g_state.srv_stride = g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1780,6 +2665,11 @@ void draw_page_intro(na::menu::Page p)
         Eyebrow("ADDITIONAL FEATURES");
         Heading("More possibilities.");
         Lead("Availability depends on the game and the installed version.");
+        break;
+    case na::menu::Page::Experimental:
+        Eyebrow("OPTIONAL EFFECTS");
+        Heading("Experimental.");
+        Lead("Try additional scene effects. Each starts off and can be adjusted live.");
         break;
     case na::menu::Page::Preferences:
         Eyebrow("MAKE IT YOURS");
@@ -1975,7 +2865,7 @@ void draw_panel(bool just_opened)
     auto nav = [&](float nav_w, bool horizontal) {
         float used = 0, avail = ImGui::GetContentRegionAvail().x;
         for (int i = 0; i < na::menu::kPageCount; ++i) {
-            Page p = static_cast<Page>(i + 1);
+            Page p = na::menu::kPages[i];
             float bw = horizontal ? NavButtonWidth(na::menu::PageName(p)) : nav_w;
             if (horizontal && i) {
                 if (used + S(8) + bw <= avail) {
@@ -2047,6 +2937,9 @@ void draw_panel(bool just_opened)
             ImGui::Dummy(ImVec2(0, S(8)));
             Hint("New features appear here when they are ready. Unavailable features do not change your picture.");
             break;
+        case Page::Experimental:
+            na::menu::DrawPage(Page::Experimental, true);
+            break;
         case Page::Preferences:
             draw_preferences();
             na::menu::DrawPage(Page::Preferences, true);
@@ -2093,14 +2986,24 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         ~OverlayInputScope() { t_overlay_input = prev; }
     } overlay_input_scope;
     UINT idx = frame ? 0 : real_index(sc);
-    if (!frame && idx >= g_state.backbuffer_count) return;
-    if (g_state.imgui_slot_fences.empty()) return;
+    if (!frame && idx >= g_state.backbuffer_count) {
+        g_menu_skips.buffer.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (g_state.imgui_slot_fences.empty()) {
+        g_menu_skips.not_ready.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const size_t imgui_slot = g_state.imgui_draws % g_state.imgui_slot_fences.size();
     FrameCtx& f = g_state.frames[imgui_slot];
     // Never wait for game-queue work from inside its Present callback. A
     // driver/engine may release that work only after the callback returns.
     // If this allocator is still in use, skip this overlay draw and retry.
-    if (!f.Complete()) return;
+    if (!f.Complete()) {
+        g_menu_skips.busy.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    na::on12::Borrowed borrowed; // returned to 11on12 when this function ends (after our submit)
     ComPtr<ID3D12Resource> back_buffer; // A71: this frame only
     if (frame) {
         back_buffer = frame;
@@ -2108,7 +3011,10 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
         rtv.Format = g_state.format;
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         g_state.device->CreateRenderTargetView(frame, &rtv, f.rtv);
-    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer)) return;
+    } else if (!acquire_back_buffer_locked(sc, idx, f.rtv, back_buffer, queue, &borrowed)) {
+        g_menu_skips.buffer.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
 
     apply_input(just_opened);
     if (just_opened) menu_note("menu_open: input applied\r\n");
@@ -2128,23 +3034,42 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    draw_panel(just_opened);
+    {
+        na::eventlog::ScopedSource source("panel"); // settings changed while the panel draws are the user's
+        draw_panel(just_opened);
+        na::settings::WatchChanges();
+    }
     ImGui::Render();
     if (just_opened) menu_note("menu_open: draw data built\r\n");
 
     ImDrawData* draw = ImGui::GetDrawData();
-    if (draw->DisplaySize.x <= 0 || draw->DisplaySize.y <= 0) return;
+    if (draw->DisplaySize.x <= 0 || draw->DisplaySize.y <= 0) {
+        g_menu_skips.empty.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // ImGui's Win32 coordinates follow the client, while this texture can be
+    // larger (borderless scaling, a presenter, or a resized game window).
+    // Scale BOTH the viewport and scissors through the backend's supported
+    // framebuffer transform; keep layout and mouse coordinates in client units.
+    const auto menu_target = back_buffer->GetDesc();
+    draw->FramebufferScale = ImVec2(float(menu_target.Width) / draw->DisplaySize.x,
+                                   float(menu_target.Height) / draw->DisplaySize.y);
     // New glyphs can update an EXISTING font atlas. The private upload queue
     // must not write it while an older game-queue menu draw is sampling it.
     // A completion check (not a wait) protects all atlas updates/destruction.
     // Leave the texture request pending when busy; the next frame retries.
     if (draw->Textures) {
         for (ImTextureData* texture : *draw->Textures) {
-            if (texture->Status != ImTextureStatus_OK &&
-                !menu_draws_complete()) return;
+            if (texture->Status != ImTextureStatus_OK && !menu_draws_complete()) {
+                g_menu_skips.atlas.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
         }
     }
-    if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) return;
+    if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) {
+        g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
 
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -2154,21 +3079,32 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     g_state.list->ResourceBarrier(1, &b);
     g_state.list->OMSetRenderTargets(1, &f.rtv, FALSE, nullptr);
+    if (borrowed.clear) { // 11on12 canvas: the menu goes over transparent, then D3D11 blends it on
+        const float transparent[4] = {};
+        g_state.list->ClearRenderTargetView(f.rtv, transparent, 0, nullptr);
+    }
     ID3D12DescriptorHeap* heaps[] = {g_state.srv_heap.Get()};
     g_state.list->SetDescriptorHeaps(1, heaps);
-    ImGui_ImplDX12_RenderDrawData(draw, g_state.list.Get());
+    {
+        const na::diag::crumbs::Scope crumb(g_state.list.Get(), "NeuralAlias overlay menu");
+        ImGui_ImplDX12_RenderDrawData(draw, g_state.list.Get());
+    }
     ++g_state.imgui_draws; // backend advances once per RenderDrawData, even if submission fails
     if (just_opened) menu_note("menu_open: GPU draw recorded\r\n");
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_state.list->ResourceBarrier(1, &b);
-    if (FAILED(g_state.list->Close())) return;
+    if (FAILED(g_state.list->Close())) {
+        g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     ID3D12CommandList* lists[] = {g_state.list.Get()};
     g_orig_execute(queue, 1, lists);
     f.fence_value = g_state.fence_next++;
     g_state.imgui_slot_fences[imgui_slot] = f.fence_value;
     f.signal_failed = FAILED(queue->Signal(f.completion.Get(), f.fence_value));
     g_menu_draw_marker.store(f.fence_value);
+    if (!f.signal_failed) borrowed.Submitted(f.completion.Get(), f.fence_value);
     g_frames.fetch_add(1, std::memory_order_relaxed);
     if (just_opened) menu_note("menu_open: GPU draw submitted\r\n");
 }
@@ -2178,15 +3114,39 @@ void render_with_fault_receipt(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bo
     __except (menu_fault(GetExceptionInformation())) {} // filter always continues the original exception
 }
 
+void capture_present_picture(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool open, bool drawn, bool after_menu)
+{
+    if (!frame) return;
+    if (na::capture::Pending()) {
+        // What J2 did on this present (SE5 flashing, 2026-11-02): DLAA frames since the last
+        // present, its jitter, and the misses, so a flashing present can be matched to a cause.
+        static uint64_t pf = 0, pnc = 0, pns = 0, pcut = 0, pmc = 0, pheld = 0;
+        const auto js = na::j2::GetStats();
+        char note[320];
+        snprintf(note, sizeof note, "j2_frames=%llu jitter=%.3f,%.3f no_camera=%llu no_state=%llu cuts=%llu miss_no_candidate=%llu camera_held=%llu active=%u home_open=%u home_submitted=%u home_in_capture=%u",
+                 static_cast<unsigned long long>(js.frames - pf), js.inline_jitter_x, js.inline_jitter_y,
+                 static_cast<unsigned long long>(js.no_camera - pnc), static_cast<unsigned long long>(js.no_state - pns),
+                 static_cast<unsigned long long>(js.cuts - pcut), static_cast<unsigned long long>(js.miss_no_candidate - pmc),
+                 static_cast<unsigned long long>(js.camera_held - pheld), js.active ? 1u : 0u, open ? 1u : 0u, drawn ? 1u : 0u, after_menu ? 1u : 0u);
+        pf = js.frames; pnc = js.no_camera; pns = js.no_state; pcut = js.cuts; pmc = js.miss_no_candidate; pheld = js.camera_held;
+        na::capture::NotePresent(note);
+        na::capture::OnPresent(queue, frame); // phase-1 capture
+    }
+}
+
 // The finished frame (real back buffer on the old path, the game's proxy on
 // the presenter path): Neural Rendering, motion analysis, capture.
 void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
 {
     if (!frame) return;
     DXGI_COLOR_SPACE_TYPE cs = static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire));
+    const auto frame_format = frame->GetDesc().Format;
+    const bool sdr = cs==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ||
+        (cs==DXGI_COLOR_SPACE_CUSTOM && frame_format==DXGI_FORMAT_R8G8B8A8_UNORM);
+    na::j2::NativeTracePresent(queue,frame,sdr);
+    na::j2::NativeProbePresent(queue,frame,g_orig_execute);
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
-    if (na::capture::Pending()) na::capture::OnPresent(queue, frame); // phase-1 capture
     {
         // J2 evidence capture: the presented image joins this frame's evaluation (if one
         // was captured). Executed unhooked so J2 never observes our copy as game work.
@@ -2195,6 +3155,14 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
         if (!auto_armed && after && na::j2::Enabled()) {
             auto_armed = true;
             na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load(), after * 1000u);
+        }
+        {
+            static bool auto_set = false;
+            if (!auto_set) {
+                auto_set = true;
+                const uint32_t n = na::settings::Get().j2_capture_auto.load(std::memory_order_relaxed);
+                na::capture::j2::SetAutoTrigger(n != 0, n, na::settings::Get().j2_capture_cooldown_s.load(std::memory_order_relaxed) * 1000u);
+            }
         }
         na::capture::j2::OnPresent(queue, frame, g_orig_execute);
     }
@@ -2205,14 +3173,26 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
 // failed). Takes g_state.mutex on success (caller releases via the guard it
 // passes in).
 bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D12CommandQueue>& retained_queue,
-                     ID3D12CommandQueue* queue_hint = nullptr)
+                     ID3D12CommandQueue* queue_hint = nullptr, bool* on12_owned = nullptr,
+                     na::on12::GraphicsApi api = na::on12::GraphicsApi::Dx12)
 {
     if (g_stopping.load(std::memory_order_acquire)) return false;
     if (sc == g_state.dummy_swapchain_identity) return false;
     na::host::RendererObserved();
     g_presents.fetch_add(1, std::memory_order_relaxed);
     // Use the recorded per-buffer queue or recover it from submitted writes.
-    retained_queue = queue_hint ? ComPtr<ID3D12CommandQueue>(queue_hint) : swapchain_queue(sc);
+    retained_queue = queue_hint ? ComPtr<ID3D12CommandQueue>(queue_hint) : swapchain_queue(sc, on12_owned);
+    if (!retained_queue) {
+        // The translated chain exposes a D3D11 back buffer. Recover its exact
+        // queue via the bridge's device registry, even if its creation predated us.
+        retained_queue.Attach(na::on12::QueueForSwapchain(sc));
+        if (retained_queue) {
+            const bool owned = !na::on12::IsTranslated(sc);
+            store_swapchain_queue(retained_queue.Get(), sc, owned);
+            if (on12_owned) *on12_owned = owned;
+            g_swap_queue_on12_recovered.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // Boundary frames: the game-facing proxy is not a key in g_swap_queues;
     // sl_boundary supplies the proxy's exact creation/ResizeBuffers1 queue.
     if (retained_queue) g_swap_queue_hits.fetch_add(1, std::memory_order_relaxed);
@@ -2235,6 +3215,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     }
     queue=retained_queue.Get();
     if (!queue) return false; // next submitted frame supplies evidence; never guess
+    if (!na::on12::AcceptPresentation(api)) return false;
     g_last_present_queue.store(reinterpret_cast<uintptr_t>(queue), std::memory_order_relaxed);
     if (g_state.swapchain && g_state.swapchain != sc) {
         // A31 robustness: a game that recreates its swap chain (HDR toggle,
@@ -2257,7 +3238,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
         g_retargets.fetch_add(1, std::memory_order_relaxed);
     }
     if(!g_state.device){
-        if(SUCCEEDED(sc->GetDevice(IID_PPV_ARGS(&g_state.device)))){
+        if(SUCCEEDED(swapchain_d3d12_device(sc,g_state.device))){
             na::gputime::SetDevice(g_state.device.Get());
             g_seen_device.store(g_state.device.Get(),std::memory_order_release);
             if(seen_push(SeenKind::Device,g_state.device.Get()))g_device_announced.store(true,std::memory_order_release);
@@ -2279,6 +3260,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
     }
     g_state.last_present = now;
     na::gputime::Poll(queue);
+    na::diag::crumbs::OnPresent(g_state.device.Get());
     // A63/A64 picture-rebuild nudge: started on the window thread; restored by
     // its timer. A post that cannot be delivered is a checked failure.
     na::present::RetryOrphans(); // A75: chains whose teardown timed out earlier
@@ -2323,7 +3305,11 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
 // Menu step (both paths): cursor show/restore messages, then the draw.
 void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12Resource* frame = nullptr)
 {
-    if (!g_menu_enabled.load(std::memory_order_acquire) || !g_state.imgui_ready || !g_menu_frame_ready) return;
+    na::dlss_debug::Tick(); // releases a held debug hotkey, menu open or not
+    if (!g_menu_enabled.load(std::memory_order_acquire) || !g_state.imgui_ready || !g_menu_frame_ready) {
+        if (open) g_menu_skips.not_ready.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     bool just_opened = open && !g_state.was_open;
     bool just_closed = !open && g_state.was_open;
     g_state.was_open = open;
@@ -2334,30 +3320,288 @@ void menu_step(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool open, ID3D12R
 
 // Old path (no presenter): everything on the real back buffer, then the
 // original Present by the caller.
-void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr)
+// Event log: process/engine identity once, and the swap chain every time it changes
+// (size, format, flags, buffers), so every run's log says what it ran on.
+void note_identity(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
+{
+    if (!sc) return;
+    DXGI_SWAP_CHAIN_DESC d{};
+    if (FAILED(sc->GetDesc(&d))) return;
+    static na::eventlog::Edge chain_edge;
+    const int64_t key = int64_t(d.BufferDesc.Width) << 40 ^ int64_t(d.BufferDesc.Height) << 24 ^ int64_t(d.BufferDesc.Format) << 12 ^
+                        int64_t(d.Flags) << 4 ^ int64_t(d.BufferCount) ^ int64_t(d.Windowed) << 62;
+    if (chain_edge.Changed(key)) {
+        RECT client{};
+        if (d.OutputWindow) GetClientRect(d.OutputWindow, &client);
+        na::eventlog::Emit("swapchain", "chain=%p width=%u height=%u format=%u buffers=%u swap_effect=%u flags=0x%X windowed=%u window=%p client=%ldx%ld refresh=%u/%u",
+                           static_cast<void*>(sc), d.BufferDesc.Width, d.BufferDesc.Height, unsigned(d.BufferDesc.Format), d.BufferCount,
+                           unsigned(d.SwapEffect), d.Flags, d.Windowed ? 1u : 0u, static_cast<void*>(d.OutputWindow),
+                           long(client.right - client.left), long(client.bottom - client.top),
+                           d.BufferDesc.RefreshRate.Numerator, d.BufferDesc.RefreshRate.Denominator);
+    }
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) return;
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    FILETIME created{}, ignored{};
+    unsigned long long since_start_ms = 0;
+    if (GetProcessTimes(GetCurrentProcess(), &created, &ignored, &ignored, &ignored)) {
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        const ULARGE_INTEGER a{{created.dwLowDateTime, created.dwHighDateTime}}, b{{now.dwLowDateTime, now.dwHighDateTime}};
+        since_start_ms = (b.QuadPart - a.QuadPart) / 10000ull;
+    }
+    char adapter[128] = "?";
+    unsigned vendor = 0, device_id = 0, revision = 0;
+    unsigned long long vram_mb = 0;
+    ComPtr<ID3D12Device> dev;
+    if (queue && SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev)))) {
+        const LUID luid = dev->GetAdapterLuid();
+        ComPtr<IDXGIFactory4> f;
+        ComPtr<IDXGIAdapter1> a;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f))) && SUCCEEDED(f->EnumAdapterByLuid(luid, IID_PPV_ARGS(&a)))) {
+            DXGI_ADAPTER_DESC1 ad{};
+            if (SUCCEEDED(a->GetDesc1(&ad))) {
+                WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, adapter, sizeof adapter, nullptr, nullptr);
+                vendor = ad.VendorId; device_id = ad.DeviceId; revision = ad.Revision;
+                vram_mb = ad.DedicatedVideoMemory >> 20;
+            }
+        }
+    }
+    char exe8[MAX_PATH * 2] = {};
+    WideCharToMultiByte(CP_UTF8, 0, exe, -1, exe8, sizeof exe8, nullptr, nullptr);
+    na::eventlog::Emit("identity", "api=d3d12 exe=\"%s\" pid=%lu first_frame_after_ms=%llu adapter=\"%s\" vendor=0x%04X device=0x%04X rev=%u vram_mb=%llu",
+                       exe8, GetCurrentProcessId(), since_start_ms, adapter, vendor, device_id, revision, vram_mb);
+}
+// Every real game-frame entry shares the source notification, independently
+// of whether presentation uses owned proxies or the physical backbuffer.
+// TEST/generated presents do not enter either caller.
+void game_frame_boundary(ID3D12CommandQueue* queue)
+{
+    na::j2::OnPresent(queue);
+    if(na::scale::native::Available()){
+        const auto scene=na::j2::GetStats();
+        const auto before=na::scale::native::GetStats();
+        static uint64_t previous_deliveries=0;
+        const bool delivered=scene.native_deliveries>previous_deliveries;
+        previous_deliveries=scene.native_deliveries;
+        na::scale::native::Observe(!na::j2::Paused()&&na::settings::EffectsReady(),scene.render_w?scene.render_w:scene.width,
+            scene.render_h?scene.render_h:scene.height,scene.out_w,scene.out_h,scene.frames,scene.active&&(!before.mode||delivered));
+        const auto native=na::scale::native::GetStats();
+        na::j2::SetNativeRenderExtent(native.controlled?native.render_w:0,native.controlled?native.render_h:0,native.out_w,native.out_h);
+        // Audit 2026-11-06: only on a change, and never 0 for DLAA. Setting it
+        // every frame overrode the menu's mip bias (DLAA total -1, the +4
+        // check) and re-queued the sampler-variant worker each frame.
+        const float user=static_cast<float>(na::settings::Get().j2_mip_bias_x100.load())/100.f;
+        const bool reduced=native.controlled&&!na::j2::Paused()&&native.fraction<1.f;
+        const float fraction=reduced?native.fraction:1.f;
+        static float applied_fraction=1.f;
+        if(fraction!=applied_fraction){
+            applied_fraction=fraction;
+            na::observe::SetSamplerMipBiasLive(reduced?na::j2::SmallMipBias(user,fraction):user);
+        }
+        static uint64_t bridge_frames=0;
+        if(++bridge_frames%300==0){
+            const auto b=na::j2::GetNativeBridgeStats();
+            na::eventlog::Emit("native_bridge","reduced=%d scene=%ux%u output=%ux%u hints=%llu examined=%llu not_reading=%llu snapshot=%llu source_size=%llu draw_state=%llu viewport=%llu no_destination=%llu ambiguous=%llu candidates=%llu recorded=%llu record_failed=%llu after_skipped=%llu redirected=%llu redirect_failed=%llu src=%ux%u/%u full_target=%ux%u/%u | ticks=%llu applies=%llu game_applies=%llu refusals=%llu thread_changes=%llu controlled=%d confirmed=%d reason=\"%s\" native=\"%s\"",
+                b.reduced?1:0,b.rw,b.rh,b.ow,b.oh,(unsigned long long)b.hints,(unsigned long long)b.examined,(unsigned long long)b.not_reading,
+                (unsigned long long)b.snapshot,(unsigned long long)b.source_size,(unsigned long long)b.draw_state,(unsigned long long)b.viewport,
+                (unsigned long long)b.no_destination,(unsigned long long)b.ambiguous,(unsigned long long)b.candidates,(unsigned long long)b.recorded,
+                (unsigned long long)b.record_failed,(unsigned long long)b.after_skipped,(unsigned long long)b.redirected,(unsigned long long)b.redirect_failed,b.src_w,b.src_h,b.src_fmt,b.seen_w,b.seen_h,b.seen_fmt,
+                (unsigned long long)native.ticks,(unsigned long long)native.applies,(unsigned long long)native.game_applies,(unsigned long long)native.refusals,
+                (unsigned long long)native.thread_changes,native.controlled?1:0,native.confirmed?1:0,b.reason,native.reason);
+            na::eventlog::Emit("native_steps","gated=%llu full=%llu examined=%llu no_input=%llu ambiguous=%llu partial=%llu candidates=%llu recorded=%llu failed=%llu ungated_full=%llu budget=%llu aux=%llu late{staged=%llu changed=%llu same=%llu resolved=%llu inline=%llu inline_held{producer=%llu state=%llu}} snap{closes=%llu depth_unknown=%llu format=%llu no_slot=%llu taken=%llu} steps{%s}",
+                (unsigned long long)b.st_gated,(unsigned long long)b.st_full,(unsigned long long)b.st_examined,(unsigned long long)b.st_no_input,
+                (unsigned long long)b.st_ambiguous,(unsigned long long)b.st_draw_state,(unsigned long long)b.st_candidates,(unsigned long long)b.st_recorded,
+                (unsigned long long)b.st_failed,(unsigned long long)b.st_ungated_full,(unsigned long long)b.st_budget,(unsigned long long)b.st_aux,
+                (unsigned long long)b.st_late_staged,(unsigned long long)b.st_late_changed,(unsigned long long)b.st_late_same,(unsigned long long)b.st_late_resolved,(unsigned long long)b.st_late_inline,
+                (unsigned long long)b.st_late_no_producer,(unsigned long long)b.st_late_no_state,
+                (unsigned long long)b.snap_closes,(unsigned long long)b.snap_depth_unknown,(unsigned long long)b.snap_format,(unsigned long long)b.snap_no_slot,(unsigned long long)b.snap_taken,b.steps);
+            na::eventlog::Emit("native_delivery","delivered=%llu first_frame=%llu streak=%llu best_streak=%llu order_refused=%llu later_written=%llu stages{%s} probe{%s} refusals{%s}",
+                (unsigned long long)b.delivered,(unsigned long long)b.first_delivery_frame,(unsigned long long)b.streak,(unsigned long long)b.best_streak,
+                (unsigned long long)b.order_refused,(unsigned long long)b.later_written,b.stages,b.probe,b.refusals);
+        }
+    }
+    na::settings::WatchChanges("code");
+    na::scale::AutomaticScenePresent();
+}
+void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr,
+                ComPtr<ID3D12CommandQueue>* after_present = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12CommandQueue> retained_queue;
-    if (!present_prelude(sc, queue,retained_queue,queue_hint)) return;
-    na::j2::OnPresent(queue); // one game-frame boundary, never a TEST Present
+    bool on12_owned = false;
+    if (!present_prelude(sc, queue,retained_queue,queue_hint,&on12_owned)) return;
+    // A D3D11On12-owned chain can close and execute the game's last command
+    // list inside Present. Learn from that submission in the same frame.
+    if (on12_owned && after_present) *after_present = retained_queue;
+    else game_frame_boundary(queue);
+    note_identity(sc, queue);
+    fill_screen_tick(sc);
+    if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     UINT idx = real_index(sc);
-    { // frame processing uses the actual buffer, independently of menu allocation
-        ComPtr<ID3D12Resource> bb; // A71: this frame only
-        if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get());
-    }
-    menu_step(sc, queue, g_open.load(std::memory_order_acquire));
+    ComPtr<ID3D12Resource> bb; // A71: this frame only
+    if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get());
+    const bool open = g_open.load(std::memory_order_acquire);
+    const auto draws = g_frames.load(std::memory_order_relaxed);
+    menu_step(sc, queue, open);
+    // The game-facing Present capture must include Home. Keep the separate
+    // J2 evaluation capture before Home so its image can be compared to DLSS.
+    capture_present_picture(queue, bb.Get(), open, g_frames.load(std::memory_order_relaxed) != draws, true);
+}
+
+void finish_deferred_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
+{
+    if (!queue || g_stopping.load(std::memory_order_acquire)) return;
+    // Present can return while the translation worker still has commands for
+    // the same frame. Keep the host lock out of that worker's submission path.
+    // Flush includes waiting for that worker's DLAA callback; it is not an
+    // additional independent cost to add to j2_inline_cost.
+    const uint64_t begin = qpc_us();
+    if (na::j2::Enabled() && !na::j2::Paused()) na::on12::FlushPresentedWork(sc);
+    const uint64_t flushed = qpc_us();
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    const uint64_t locked = qpc_us();
+    if (!g_stopping.load(std::memory_order_acquire) && (!g_state.swapchain || g_state.swapchain == sc))
+        game_frame_boundary(queue);
+    const uint64_t ended = qpc_us();
+    g_deferred_timing.n.fetch_add(1, std::memory_order_relaxed);
+    g_deferred_timing.flush.fetch_add(flushed - begin, std::memory_order_relaxed);
+    g_deferred_timing.lock.fetch_add(locked - flushed, std::memory_order_relaxed);
+    g_deferred_timing.boundary.fetch_add(ended - locked, std::memory_order_relaxed);
 }
 
 // A59 presenter path: the game drew into its proxy; the presenter copies,
 // generates and presents. Composite the menu on the proxy, after NR and
 // before copying to the worker's owned frame. No real-buffer access here.
-void presenter_frame_cb(ID3D12CommandQueue* queue, ID3D12Resource* frame, void*) { process_frame(queue, frame); }
+void presenter_frame_cb(ID3D12CommandQueue* queue, ID3D12Resource* frame, void* user)
+{
+    process_frame(queue, frame);
+    capture_present_picture(queue, frame, *static_cast<const bool*>(user), false, false);
+}
 void presenter_menu_cb(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Resource* frame, void* user)
 {
     menu_step(sc, queue, *static_cast<const bool*>(user), frame);
 }
 
+// Render-small mode changes (COMMS 4bd474c I1.2, Astra a066d76): one change at a time through the
+// size controller. A choice only ASKS the game (virtual WM_SIZE); the mode, mip bias and status
+// apply when the game's scene is seen at the new size (3 fresh samples after its buffers were
+// rebuilt). A game that ignores the request keeps native DLAA and the whole picture; one that
+// rebuilt but whose scene did not follow is asked back. No retry loop: a new choice re-asks.
+// Native DLAA (scale_mode 0, the "Off" of upscaling) is the same path with target = output.
+uint64_t g_small_token = 0;      // size_spoof token of the controller's current ask
+bool g_small_scene_seen = false; // the first scene sample: asking before it would race the game's start
+int g_small_mode_now = 0;         // the user's mode this present
+uint64_t g_small_ask_after = 0;   // ms: no new ask before this (an ask the size layer refused backs off)
+int g_small_refused_mode = -1;    // a mode the game did not follow (for g_small_refused_output)
+na::native_present::Size g_small_refused_output{};
+uint64_t g_small_display_generation = 0;
+bool g_small_revalidate_display = false;
+void small_note_line(const char* what, const na::native_present::ctl::Status& c)
+{
+    char row[256];
+    snprintf(row, sizeof(row), "mode_change %s applied=%ux%u (%.3f) target=%ux%u buffers=%ux%u output=%ux%u matches=%u contradictions=%u\r\n", what,
+             c.applied.w, c.applied.h, static_cast<double>(c.applied_scale), c.target.w, c.target.h, c.buffers.w, c.buffers.h,
+             c.output.w, c.output.h, c.matches, c.contradictions);
+    status_note(row);
+}
+void small_follow_mode()
+{
+    namespace np = na::native_present;
+    namespace ctl = na::native_present::ctl;
+    static bool crash_capture_on = false;
+    if (!crash_capture_on) { crash_capture_on = true; AddVectoredExceptionHandler(0, &crash_capture); }
+    const np::SizeState st = np::GetSizeState();
+    if (!st.enabled) return;
+    if (st.mode_generation != g_small_display_generation) {
+        // An ignored request in one display mode says nothing about another.
+        // A same-size mode transition may also have rebuilt the native scene.
+        g_small_revalidate_display = g_small_display_generation != 0;
+        g_small_display_generation = st.mode_generation;
+        g_small_refused_mode = -1;
+    }
+    const uint64_t now = GetTickCount64();
+    g_small_mode_now = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3);
+    {
+        const ctl::Status c = ctl::Get();
+        if (!ctl::Same(c.output, {st.output.w, st.output.h})) {
+            // First attach or a real output change (window resized by the user): start from what the game has.
+            ctl::Reset({st.output.w, st.output.h}, {st.render.w, st.render.h}, na::present::RenderScale());
+        }
+    }
+    // One scene sample per present: J2's selected scene colour for this frame (0x0 = UNKNOWN).
+    // Fresh only: written in this frame or the previous one (OnPresent may already have advanced).
+    const auto js = na::j2::GetStats();
+    const bool fresh = js.seen_scene_frame && js.frame_now >= js.seen_scene_frame && js.frame_now - js.seen_scene_frame <= 1;
+    const ctl::Extent scene = fresh ? ctl::Extent{js.seen_scene_w, js.seen_scene_h} : ctl::Extent{};
+    if (scene.w && scene.h) g_small_scene_seen = true;
+    ctl::Observe(scene);
+    auto carry_out = [&](const ctl::Action& a) {
+        const ctl::Status c = ctl::Get();
+        switch (a.kind) {
+        case ctl::ActionKind::Ask:
+        case ctl::ActionKind::Restore: {
+            if (g_small_token) np::CompleteResize(g_small_token, false, {}); // supersede the old ask's advertisement
+            g_small_token = np::RequestRenderSize({a.size.w, a.size.h}, true);
+            ctl::Asked(g_small_token, now);
+            if (!g_small_token) { // refused by the size layer: say so once, try again in a second
+                g_small_ask_after = now + 1000;
+                small_note_line("ask_refused", ctl::Get());
+                break;
+            }
+            if (a.kind == ctl::ActionKind::Restore) { g_small_refused_mode = g_small_mode_now; g_small_refused_output = st.output; }
+            small_note_line(a.kind == ctl::ActionKind::Ask ? "ask" : "restore", ctl::Get());
+            break;
+        }
+        case ctl::ActionKind::Commit: {
+            if (g_small_token) np::CompleteResize(g_small_token, true, {a.size.w, a.size.h});
+            g_small_token = 0;
+            na::present::SetRenderScale(a.scale, &na::j2::PresentUpscale, nullptr);
+            // Texture detail follows the applied mode's total, including the
+            // native sampler bias once. DLAA restores the menu's Texture mip bias
+            // choice (automatic = total -1).
+            na::observe::SetSamplerMipBiasLive(na::j2::SmallMipBias(static_cast<float>(na::settings::Get().j2_mip_bias_x100.load()) / 100.f, a.scale));
+            small_note_line(a.scale < 1.f ? "applied" : "applied_native_dlaa", c);
+            break;
+        }
+        case ctl::ActionKind::Ignored: {
+            if (g_small_token) np::CompleteResize(g_small_token, false, {});
+            g_small_token = 0;
+            g_small_refused_mode = g_small_mode_now; g_small_refused_output = st.output;
+            small_note_line("not_followed", c);
+            break;
+        }
+        default: break;
+        }
+    };
+    const int mode = (std::min)(static_cast<int>(na::settings::Get().j2_scale_mode.load()), 3); // no Ultra Performance here
+    carry_out(ctl::Tick(now));
+    if (!g_small_scene_seen) return;
+    {
+        // Another request (a real window resize) is pending: never ask over it. One that never
+        // reached an allocation expires, so it cannot hold the changeover forever.
+        const np::SizeState now_st = np::GetSizeState();
+        if (now_st.request && now_st.request != g_small_token) {
+            if (np::ExpireResize(5000, now)) status_note("mode_change window_resize_expired\r\n");
+            return;
+        }
+    }
+    if (now < g_small_ask_after) return;
+    const float f = mode > 0 ? static_cast<float>(na::scale::FractionForMode(mode)) : 1.f;
+    const np::Size want = small_render_for(st.output, static_cast<double>(f));
+    // A choice the game did not follow is not asked again for this output until the user changes it.
+    if (g_small_refused_mode >= 0 && (g_small_refused_mode != mode || g_small_refused_output.w != st.output.w ||
+                                      g_small_refused_output.h != st.output.h)) g_small_refused_mode = -1;
+    if (g_small_refused_mode == mode && !g_small_revalidate_display) return;
+    const auto change = ctl::Choose({want.w, want.h}, f, now, g_small_revalidate_display);
+    if (change.kind == ctl::ActionKind::Ask && g_small_revalidate_display) {
+        g_small_refused_mode = -1; // the old mode's timeout may have completed during Tick above
+        g_small_revalidate_display = false;
+    }
+    carry_out(change);
+}
 HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -2369,7 +3613,15 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
         return g_orig_present(sc, sync, flags);
     }
     na::present::PresentArgs a;
-    na::j2::OnPresent(queue); // game call only; the presenter's generated frames bypass this
+    DXGI_SWAP_CHAIN_DESC picture_desc{};
+    const HRESULT picture_desc_hr = sc->GetDesc(&picture_desc);
+    if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
+        na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
+    game_frame_boundary(queue); // generated frames bypass this game-facing entry
+    note_identity(sc, queue);
+    fill_screen_tick(sc);
+    if (na::j2::RenderSmall()) small_follow_mode();
+    if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     g_present_caller.store(GetCurrentThreadId());
     g_present_queue_identity.store(reinterpret_cast<uintptr_t>(queue));
     a.sc = sc;
@@ -2377,7 +3629,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.flags = flags;
     a.pp = pp;
     a.queue = queue;
-    DXGI_SWAP_CHAIN_DESC picture_desc{}; sc->GetDesc(&picture_desc);
+    g_presented_format.store(uint32_t(picture_desc.BufferDesc.Format), std::memory_order_relaxed);
     a.hdr = na::color::IsHdr(na::color::Classify(picture_desc.BufferDesc.Format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
     bool open = g_open.load(std::memory_order_acquire);
     a.menu_open = open || g_state.was_open; // closing frame still processes cursor restoration
@@ -2403,16 +3655,74 @@ bool boundary_owns_native(IDXGISwapChain* chain) {
     std::lock_guard<std::mutex> lock(g_boundary_m);
     return g_boundary_policy.Suppresses(reinterpret_cast<uintptr_t>(chain));
 }
+void note_menu_present_result(bool open, UINT flags, HRESULT result) {
+    if (open && !(flags & DXGI_PRESENT_TEST) && result != S_OK) {
+        g_menu_skips.last_present_rejection.store(result, std::memory_order_relaxed);
+        g_menu_skips.present_rejected.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+thread_local bool t_native11_present = false;
+na::on12::GraphicsApi presentation_api(IDXGISwapChain* chain)
+{
+    if (na::on12::Automatic()) return na::on12::SwapchainApi(chain);
+    return na::on12::NativeRoute() ? na::on12::GraphicsApi::Dx11 : na::on12::GraphicsApi::Unknown;
+}
+
+struct Native11Present {
+    bool outer = !t_native11_present;
+    Native11Present(IDXGISwapChain* sc, UINT flags) {
+        if (!outer) return;
+        t_native11_present = true;
+        if (flags & DXGI_PRESENT_TEST) return;
+        na::on12::AttachNativePresentation(sc);
+        if (!na::native11::ObservePresent(sc)) return;
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        ComPtr<ID3D12CommandQueue> retained;
+        ID3D12CommandQueue* queue = nullptr;
+        if (present_prelude(sc, queue, retained, nullptr, nullptr, na::on12::GraphicsApi::Dx11))
+            menu_step(sc, queue, g_open.load(std::memory_order_acquire));
+        na::native_d3d11::CapturePresent(sc, queue);
+    }
+    ~Native11Present() { if (outer) t_native11_present = false; }
+};
+
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
+    const auto api = presentation_api(sc);
+    if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present(sc, sync, flags);
+    if (api == na::on12::GraphicsApi::Dx11) {
+        Native11Present frame(sc, flags);
+        return g_orig_present(sc, sync, flags);
+    }
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
+    na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, nullptr);
+    na::on12::BeforePresent(sc, flags); // DX11 bridge: the game's picture reaches the D3D12 chain as an observed copy
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) {
+        // Discovery must see the game's Present here too: without it, its frame never ends (scores add up
+        // from boot) and the swapchain size stays unknown, so after a render-size change a shadow map won
+        // the depth pick and the scene was never found again (Anno, 2026-11-03).
+        const auto observed = na::observe::PresentBegin(sc);
+        const uint64_t tp = qpc_us();
+        const HRESULT result = presenter_present(sc, sync, flags, nullptr);
+        na::on12::AfterPresent(sc, flags, qpc_us() - tp);
+        na::observe::PresentEnd(observed, sync, flags, result);
+        return result;
+    }
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present_begin",sc);
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
+    const bool menu_open = g_open.load(std::memory_order_acquire);
+    const uint64_t t0 = qpc_us();
+    ComPtr<ID3D12CommandQueue> after_present;
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present);
+    const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present(sc, sync, flags);
+    const uint64_t t2 = qpc_us();
+    finish_deferred_present(sc, after_present.Get());
+    note_present_timing(menu_open, (t1 - t0) + (after_present ? qpc_us() - t2 : 0), t2 - t1);
+    na::on12::AfterPresent(sc, flags, t2 - t1);
+    note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
     return result;
@@ -2420,14 +3730,39 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
 HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                          const DXGI_PRESENT_PARAMETERS* pp)
 {
+    const auto api = presentation_api(sc);
+    if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present1(sc, sync, flags, pp);
+    if (api == na::on12::GraphicsApi::Dx11) {
+        Native11Present frame(sc, flags);
+        return g_orig_present1(sc, sync, flags, pp);
+    }
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
+    na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
     if (!(flags & DXGI_PRESENT_TEST)) g_native_game_presents.fetch_add(1, std::memory_order_acq_rel);
     na::dlss::ReleaseIfDeviceRemoved(); // G2-004: never pin a removed device across the game's recovery
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) return presenter_present(sc, sync, flags, pp);
+    na::on12::BeforePresent(sc, flags); // DX11 bridge: the game's picture reaches the D3D12 chain as an observed copy
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc) && na::present::Proxied(sc)) {
+        // Discovery must see the game's Present here too: without it, its frame never ends (scores add up
+        // from boot) and the swapchain size stays unknown, so after a render-size change a shadow map won
+        // the depth pick and the scene was never found again (Anno, 2026-11-03).
+        const auto observed = na::observe::PresentBegin(sc);
+        const uint64_t tp = qpc_us();
+        const HRESULT result = presenter_present(sc, sync, flags, pp);
+        na::on12::AfterPresent(sc, flags, qpc_us() - tp);
+        na::observe::PresentEnd(observed, sync, flags, result);
+        return result;
+    }
     const auto observed = na::observe::PresentBegin(sc);
     na::nr::trace::Record("present1_begin",sc);
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc);
+    const bool menu_open = g_open.load(std::memory_order_acquire);
+    ComPtr<ID3D12CommandQueue> after_present;
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present);
+    const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
+    const uint64_t t2 = qpc_us();
+    finish_deferred_present(sc, after_present.Get());
+    na::on12::AfterPresent(sc, flags, t2 - t1);
+    note_menu_present_result(menu_open, flags, result);
     na::nr::trace::Record("present1_end",sc,nullptr,0,0,result);
     na::observe::PresentEnd(observed,sync,flags,result);
     return result;
@@ -2435,8 +3770,18 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
 HRESULT STDMETHODCALLTYPE DetourGetBuffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out)
 {
     HRESULT hr = S_OK;
+    // DX11 bridge: a D3D11 interface asked of a translated chain is the game's virtual back buffer.
+    if (sc != g_state.dummy_swapchain_identity && na::on12::HandleGetBuffer(sc, index, riid, out, &hr)) return hr;
     if (!t_native_buffer_read && sc != g_state.dummy_swapchain_identity && na::present::HandleGetBuffer(sc, index, riid, out, &hr)) return hr;
     return g_orig_get_buffer(sc, index, riid, out);
+}
+using GetDeviceFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, REFIID, void**);
+GetDeviceFn g_orig_get_device = nullptr;
+HRESULT STDMETHODCALLTYPE DetourGetDevice(IDXGISwapChain* sc, REFIID riid, void** out)
+{
+    const HRESULT hr = g_orig_get_device(sc, riid, out);
+    if (FAILED(hr) && out && na::on12::HandleGetDevice(sc, riid, out)) return S_OK; // the game's D3D11 device
+    return hr;
 }
 UINT STDMETHODCALLTYPE DetourGetCurrentBackBufferIndex(IDXGISwapChain3* sc)
 {
@@ -2509,8 +3854,13 @@ ULONG STDMETHODCALLTYPE DetourRelease(IUnknown* obj)
 {
     if (t_in_our_release || na::present::InTeardownRelease() || !obj || obj == g_state.dummy_swapchain_identity) return g_orig_release(obj);
     auto* sc = static_cast<IDXGISwapChain*>(obj);
+    if (na::on12::IsTranslated(sc)) { // our copies may still run on the chain's buffers
+        obj->AddRef();
+        if (g_orig_release(obj) == 1) na::on12::BeforeFinalRelease(sc);
+    }
     ULONG n = g_orig_release(obj);
     if (n == 0) {
+        na::on12::ForgetSwapChain(sc);
         on_chain_gone(sc);
         return 0;
     }
@@ -2532,9 +3882,52 @@ void retire_nr_backbuffers(IDXGISwapChain* sc) {
     for(UINT i=0;i<desc.BufferCount;++i){ComPtr<ID3D12Resource> buffer;
         if(SUCCEEDED(real_get_buffer(sc,i,IID_PPV_ARGS(&buffer))))na::nr::native::RetireBackbuffer(buffer.Get());}
 }
+// Render-small: every fullscreen switch the game asks for is logged (one mechanism for all
+// window modes; the event shows whether exclusive fullscreen ever needs its own handling).
+using SetFullscreenStateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
+SetFullscreenStateFn g_orig_set_fullscreen = nullptr;
+HRESULT STDMETHODCALLTYPE DetourSetFullscreenState(IDXGISwapChain* sc, BOOL fullscreen, IDXGIOutput* target)
+{
+    const bool game = na::native_present::GameCaller(_ReturnAddress());
+    const HRESULT hr = g_orig_set_fullscreen(sc, fullscreen, target);
+    BOOL now = FALSE;
+    { const na::native_present::NativeScope native; ComPtr<IDXGIOutput> o; sc->GetFullscreenState(&now, &o); }
+    na::eventlog::Emit("swapchain", "set_fullscreen want=%d target=%p hr=0x%08lx now=%d caller=%s advertised=%ux%u",
+        fullscreen ? 1 : 0, static_cast<void*>(target), static_cast<unsigned long>(hr), now ? 1 : 0, game ? "game" : "other",
+        na::native_present::AdvertisedSize().w, na::native_present::AdvertisedSize().h);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE_DESC* requested)
+{
+    if (requested && na::native_present::GameCaller(_ReturnAddress())) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        HRESULT hr;
+        { const na::native_present::NativeScope native;
+          hr = sc->GetDesc(&desc); }
+        DXGI_MODE_DESC physical = *requested;
+        if (SUCCEEDED(hr) && na::native_present::RewriteResizeTarget(desc.OutputWindow, &physical)) {
+            na::eventlog::Emit("virtual_screen", "resize_target game=%ux%u physical=%ux%u", requested->Width, requested->Height,
+                               physical.Width, physical.Height);
+            return g_orig_resize_target(sc, &physical);
+        }
+    }
+    return g_orig_resize_target(sc, requested);
+}
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
+    const auto api = presentation_api(sc);
+    if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_resize(sc, count, w, h, fmt, flags);
+    if (api == na::on12::GraphicsApi::Dx11) {
+        na::native11::BeforeResize(sc);
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            if (g_state.swapchain == sc) release_buffers_locked();
+        }
+        const auto result = g_orig_resize(sc, count, w, h, fmt, flags);
+        na::native11::AfterResize(sc, result);
+        return result;
+    }
     // Reset may have retired the native FG recording without another Present.
     // Drop its completed image references before DXGI checks ResizeBuffers.
     na::nr::native::Maintain();
@@ -2544,12 +3937,31 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
         if (g_state.swapchain == sc) release_buffers_locked();
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
+    na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
+    // DX11 bridge: D3D12 chain parameters; the game's buffer waits for the verdict. Our copies
+    // still running refuse the resize with nothing changed; the presenter's transaction closes too.
+    if(!na::on12::BeforeResize(sc,&count,&fmt,&flags)){na::present::AfterResize(sc,DXGI_ERROR_INVALID_CALL);return DXGI_ERROR_INVALID_CALL;}
     const auto result=g_orig_resize(sc,count,w,h,fmt,flags);
-    na::present::AfterResize(sc,result);return result;
+    na::on12::AfterResize(sc,result);
+    na::present::AfterResize(sc,result);
+    na::observe::SwapchainResized(sc,result);return result;
 }
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
 {
+    const auto api = presentation_api(sc);
+    if (api == na::on12::GraphicsApi::Dx11On12)
+        return g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    if (api == na::on12::GraphicsApi::Dx11) {
+        na::native11::BeforeResize(sc);
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            if (g_state.swapchain == sc) release_buffers_locked();
+        }
+        const auto result = g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+        na::native11::AfterResize(sc, result);
+        return result;
+    }
     na::nr::native::Maintain();
     retire_nr_backbuffers(sc);
     {
@@ -2557,8 +3969,12 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
         if (g_state.swapchain == sc) release_buffers_locked();
     }
     if(!na::present::BeforeResize(sc))return DXGI_ERROR_INVALID_CALL; // outstanding buffer use; size unchanged
+    na::present::TranslateResize(sc,&w,&h); // render-small: the real chain follows the window
+    if(!na::on12::BeforeResize(sc,&count,&fmt,&flags)){na::present::AfterResize(sc,DXGI_ERROR_INVALID_CALL);return DXGI_ERROR_INVALID_CALL;} // DX11 bridge; same contract as ResizeBuffers
     const auto result=g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+    na::on12::AfterResize(sc,result);
     na::present::AfterResize(sc,result);
+    na::observe::SwapchainResized(sc,result);
     if(SUCCEEDED(result) && queues){
         UINT actual=count;
         if(!actual){DXGI_SWAP_CHAIN_DESC1 desc{};if(SUCCEEDED(sc->GetDesc1(&desc)))actual=desc.BufferCount;}
@@ -2649,23 +4065,25 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
     // C8: H1/H2 observation of the game's submissions ([observe] producers=1).
     const na::observe::ExecuteToken obs_token =
         na::observe::ProducersActive() ? na::observe::ExecuteBegin(q, n, lists) : na::observe::ExecuteToken{};
+    na::scale::AutomaticSceneSubmission automatic_scene(q,n,lists);
     ExecuteSubscriber* sub = g_exec_sub.load(std::memory_order_acquire);
     if (sub) {
         ExecuteContext ctx{q, n, lists, g_exec_ticket.fetch_add(1, std::memory_order_relaxed) + 1, uncovered, sub->user};
         if (sub->begin) sub->begin(&ctx);
-        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
+        na::overlay::BeforeGameSubmission(q,n,lists);
         na::j2::Execute(q, n, lists, ForwardThroughNr);
-        na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
-        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
+        na::overlay::AfterGameSubmission(q,n,lists);
         if (sub->end) sub->end(&ctx);
         g_exec_scoped.fetch_add(1, std::memory_order_relaxed);
     } else {
-        na::dlss::BeforeExecute(q, n, lists); // R-303: wait for this view's previous DLSS frame on another queue
+        na::overlay::BeforeGameSubmission(q,n,lists);
         na::j2::Execute(q, n, lists, ForwardThroughNr);
-        na::gputime::OnExecuted(q, n, lists); // R-202: completion fence on the queue that ran the lists
-        na::dlss::OnExecuted(q, n, lists);    // C6: completion evidence before retired DLSS features are released
+        na::overlay::AfterGameSubmission(q,n,lists);
     }
     na::nr::states::Submitted(q,n,lists);
+    // Same queue-serialization scope, after actual game work and before the
+    // application can signal completion/recycle its HUD buffers or tables.
+    na::j2::native_hud::AfterSubmission(q,n,lists);
     if (obs_token.queue_state) na::observe::ExecuteEnd(obs_token, q, n, lists);
     g_exec_active.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -2792,6 +4210,7 @@ na::slb::OverlayHooks make_boundary_hooks()
     h.chain_seen=&boundary_seen;
     h.present = &boundary_present;
     h.before_resize = &boundary_before_resize;
+    h.after_resize = &na::observe::SwapchainResized;
     h.released = &boundary_released;
     return h;
 }
@@ -2800,6 +4219,10 @@ const na::slb::OverlayHooks g_boundary_hooks = make_boundary_hooks();
 
 bool StartCore(const char* route_tag, PanelFn controls)
 {
+    // Drivers/other graphics layers may create a D3D11 helper while our
+    // throwaway D3D12 device is being built. Translating that helper on a
+    // worker can wait on the very D3D12 creation this caller already owns.
+    na::host::InternalFactoryScope internal_graphics;
     std::lock_guard<std::mutex> start_lock(g_start_m);
     if(g_core_started.load(std::memory_order_acquire))return true;
     QueryPerformanceFrequency(&g_state.qpc_freq);
@@ -2888,6 +4311,17 @@ bool StartCore(const char* route_tag, PanelFn controls)
                  prepare_start_hook(queue.Get(), kQueueExecuteSlot,
                                              reinterpret_cast<void*>(&DetourExecute),
                                              reinterpret_cast<void**>(&g_orig_execute));
+            // Only render-small needs to separate logical ResizeTarget from
+            // physical output. Native-DLSS routes retain their existing hooks.
+            if (ok && na::j2::RenderSmall())
+                ok = prepare_start_hook(sc.Get(), kSwapResizeTargetSlot,
+                                        reinterpret_cast<void*>(&DetourResizeTarget),
+                                        reinterpret_cast<void**>(&g_orig_resize_target));
+            // Log-only fullscreen-switch observer; optional, never blocks the core hooks.
+            if (ok && na::j2::RenderSmall())
+                prepare_start_hook(sc.Get(), kSwapSetFullscreenStateSlot,
+                                   reinterpret_cast<void*>(&DetourSetFullscreenState),
+                                   reinterpret_cast<void**>(&g_orig_set_fullscreen));
             // A59 presenter: GetBuffer / GetCurrentBackBufferIndex / ResizeBuffers1.
             // The full observer owns these slots when requested. This narrow
             // trace is for Route A freezes with that observer disabled.
@@ -2925,6 +4359,15 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 // Swap-chain creation on the shared factory vtable (after our own dummy
                 // chain exists, so it is never recorded). Late attachments recover
                 // per-buffer queues from submitted writes instead.
+                if (na::j2::RenderSmall() || na::on12::Enabled()) { // render-small size spoof / DX11 bridge description
+                    prepare_start_hook(sc.Get(), kSwapGetDescSlot, reinterpret_cast<void*>(&DetourGetDesc),
+                                       reinterpret_cast<void**>(&g_orig_get_desc));
+                    prepare_start_hook(sc.Get(), kSwap1GetDesc1Slot, reinterpret_cast<void*>(&DetourGetDesc1),
+                                       reinterpret_cast<void**>(&g_orig_get_desc1));
+                }
+                if (na::on12::Enabled()) // the game's ID3D11Device from its (D3D12) swap chain
+                    prepare_start_hook(sc.Get(), kSwapGetDeviceSlot, reinterpret_cast<void*>(&DetourGetDevice),
+                                       reinterpret_cast<void**>(&g_orig_get_device));
                 prepare_start_hook(factory.Get(), kFactoryCreateSwapChainSlot,
                                             reinterpret_cast<void*>(&DetourCreateSwapChain),
                                             reinterpret_cast<void**>(&g_orig_create_swapchain));
@@ -2951,7 +4394,14 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 na::observe::InstallProducers(dev.Get(), queue.Get(), /*hook_queue_execute=*/false);
                 na::observe::SetExecuteForwarder(g_orig_execute); // C9b: host sample copies bypass this detour
             }
-            if (ok && na::nr::states::InstallEnhancedInvalidation()) na::observe::InstallListResetTracking(dev.Get(), na::nr::OnCommandListReset,na::nr::states::Observe);
+            if (ok) {
+                const bool enhanced=na::nr::states::InstallEnhancedInvalidation();
+                // Resource/recording retirement is mandatory even if optional
+                // enhanced-barrier registration failed. Do not keep an old
+                // submission receipt when the game reuses a command list.
+                na::observe::InstallListResetTracking(dev.Get(),na::nr::OnCommandListReset,
+                    enhanced?na::nr::states::Observe:nullptr);
+            }
             if (ok) {
                 na::present::Originals o;
                 o.present = g_orig_present;
@@ -3090,6 +4540,9 @@ bool Stop()
         g_stop_incomplete.store(1, std::memory_order_release);
         return false;
     }
+    if(!na::background::Stop(5000)){
+        g_stop_incomplete.store(1,std::memory_order_release);return false;
+    }
     g_stop_incomplete.store(0, std::memory_order_release);
     // Restore before removing the subclass; queued messages cannot perform
     // cleanup once the original WndProc has been reinstated.
@@ -3144,6 +4597,7 @@ Stats GetStats()
 {
     Stats s{};
     s.frames_rendered = g_frames.load();
+    s.menu_busy_skips = g_menu_skips.busy.load(std::memory_order_relaxed);
     s.presents_seen = g_presents.load();
     s.initialized = g_initialized.load();
     s.core_ready=g_core_started.load();s.menu_enabled=g_menu_enabled.load();
@@ -3165,6 +4619,8 @@ void SetOpen(bool open) { g_open.store(open, std::memory_order_release); }
 
 bool RequestPictureRebuild(uint32_t render_w, uint32_t render_h)
 {
+    // Render-small: the game-visible window is virtual; its live resize is the posted WM_SIZE instead.
+    if (na::j2::RenderSmall()) return false;
     nudge_tick();
     // A67: refuse while a nudge is in flight (posted or window shrunk) or
     // while an earlier request has not been admitted yet; nothing about the
@@ -3198,10 +4654,16 @@ uint64_t PresentsSinceLastEvaluate() { return g_presents_since_eval.load(std::me
 
 int CurrentPageIndex() { return static_cast<int>(na::menu::CurrentPage()) - 1; }
 
-void SetStatusLogPath(const wchar_t* path)
+void SetStatusLogPath(const wchar_t* path, const wchar_t* build)
 {
     na::host::ProcessLogPath(g_status_log, MAX_PATH, path);
     g_status_last_tick = 0;
+    if (build && *build) {
+        char line[96]{};
+        const int bytes = snprintf(line, sizeof line, "NeuralAlias build %ls\r\n", build);
+        if (bytes > 0 && static_cast<size_t>(bytes) < sizeof line) append_status_text(line, bytes);
+    }
+    na::dlss_debug::SetStatusLogPath(g_status_log);
 }
 
 void SetMenuDiagnostics(bool enabled) { g_menu_diagnostics = enabled; }

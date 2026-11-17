@@ -101,7 +101,7 @@ void Flow::set_error(const char* what, int status)
     snprintf(error_, sizeof(error_), "%s: %s", what, status_name(static_cast<NV_OF_STATUS>(status)));
 }
 
-bool Flow::Init(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t grid, uint32_t perf_level)
+bool Flow::Init(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t grid, uint32_t perf_level, bool enable_cost)
 {
     if (registered_) {
         snprintf(error_, sizeof(error_), "Init refused: %u registrations outstanding", registered_);
@@ -133,7 +133,7 @@ bool Flow::Init(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t 
     ip.mode = NV_OF_MODE_OPTICALFLOW;
     ip.perfLevel = static_cast<NV_OF_PERF_LEVEL>(perf_level);
     ip.enableExternalHints = NV_OF_FALSE;
-    ip.enableOutputCost = NV_OF_FALSE;
+    ip.enableOutputCost = enable_cost ? NV_OF_TRUE : NV_OF_FALSE;
     ip.disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED;
     ip.enableRoi = NV_OF_FALSE;
     ip.predDirection = NV_OF_PRED_DIRECTION_FORWARD;
@@ -141,9 +141,10 @@ bool Flow::Init(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t 
     ip.inputBufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
     s = api->nvOFInit(h, &ip);
     if (s != NV_OF_SUCCESS) {
-        set_error("nvOFInit", s);
+        set_error(enable_cost ? "nvOFInit (with cost)" : "nvOFInit", s);
         return false;
     }
+    cost_enabled_ = enable_cost;
     return true;
 }
 
@@ -201,6 +202,33 @@ bool Flow::RegisterOutput(ID3D12Resource* rg16_sint, ID3D12Fence* fence, uint64_
     return true;
 }
 
+bool Flow::RegisterCost(ID3D12Resource* r8_uint, ID3D12Fence* fence, uint64_t wait_value, uint64_t signal_value, BufferHandle* out)
+{
+    if (!handle_ || !cost_enabled_ || !r8_uint || !fence || !out) return false;
+    D3D12_RESOURCE_DESC d = r8_uint->GetDesc();
+    if (d.Format != DXGI_FORMAT_R8_UINT || d.Width < OutWidth() || d.Height < OutHeight()) {
+        snprintf(error_, sizeof(error_), "cost must be R8_UINT of at least %ux%u", OutWidth(), OutHeight());
+        return false;
+    }
+    auto* api = static_cast<NV_OF_D3D12_API_FUNCTION_LIST*>(api_);
+    NV_OF_REGISTER_RESOURCE_PARAMS_D3D12 rp{};
+    rp.resource = r8_uint;
+    rp.inputFencePoint.fence = fence;
+    rp.inputFencePoint.value = wait_value;
+    NvOFGPUBufferHandle hb = nullptr;
+    rp.hOFGpuBuffer = &hb;
+    rp.outputFencePoint.fence = fence;
+    rp.outputFencePoint.value = signal_value;
+    NV_OF_STATUS s = api->nvOFRegisterResourceD3D12(static_cast<NvOFHandle>(handle_), &rp);
+    if (s != NV_OF_SUCCESS) {
+        set_error("nvOFRegisterResourceD3D12 (cost)", s);
+        return false;
+    }
+    *out = hb;
+    ++registered_;
+    return true;
+}
+
 bool Flow::Unregister(BufferHandle h)
 {
     if (!api_ || !h) return false;
@@ -216,9 +244,11 @@ bool Flow::Unregister(BufferHandle h)
 }
 
 bool Flow::Execute(BufferHandle input_current, BufferHandle reference_previous, BufferHandle output, ID3D12Fence* wait_fence,
-                   uint64_t wait_value, ID3D12Fence* signal_fence, uint64_t signal_value, bool disable_temporal_hints)
+                   uint64_t wait_value, ID3D12Fence* signal_fence, uint64_t signal_value, bool disable_temporal_hints,
+                   BufferHandle cost)
 {
     if (!handle_ || !input_current || !reference_previous || !output || !wait_fence || !signal_fence) return false;
+    if (cost && !cost_enabled_) return false;
     auto* api = static_cast<NV_OF_D3D12_API_FUNCTION_LIST*>(api_);
     NV_OF_FENCE_POINT in_fp{wait_fence, wait_value};
     NV_OF_FENCE_POINT out_fp{signal_fence, signal_value};
@@ -234,7 +264,7 @@ bool Flow::Execute(BufferHandle input_current, BufferHandle reference_previous, 
     ip.fencePoint = &in_fp;
     NV_OF_EXECUTE_OUTPUT_PARAMS_D3D12 op{};
     op.outputBuffer = static_cast<NvOFGPUBufferHandle>(output);
-    op.outputCostBuffer = nullptr;
+    op.outputCostBuffer = static_cast<NvOFGPUBufferHandle>(cost);
     op.hPrivData = nullptr;
     op.fencePoint = &out_fp;
     NV_OF_STATUS s = api->nvOFExecuteD3D12(static_cast<NvOFHandle>(handle_), &ip, &op);
@@ -256,6 +286,7 @@ bool Flow::Shutdown()
     }
     if (api_ && handle_) static_cast<NV_OF_D3D12_API_FUNCTION_LIST*>(api_)->nvOFDestroy(static_cast<NvOFHandle>(handle_));
     handle_ = nullptr;
+    cost_enabled_ = false;
     delete static_cast<NV_OF_D3D12_API_FUNCTION_LIST*>(api_);
     api_ = nullptr;
     module_ = nullptr; // never unloaded (see QueryCaps)

@@ -30,6 +30,7 @@ constexpr uint32_t CreateHeap = 28;
 constexpr uint32_t CreatePlacedResource = 29;
 constexpr uint32_t CreateReservedResource = 30;
 constexpr uint32_t CreateFence = 36;
+constexpr uint32_t CreateCommandSignature = 41;
 constexpr uint32_t CreatePipelineState = 47;       // ID3D12Device2
 constexpr uint32_t CreateCommandList1 = 51;        // ID3D12Device4
 constexpr uint32_t CreateCommittedResource1 = 53;  // ID3D12Device4
@@ -37,6 +38,7 @@ constexpr uint32_t CreateHeap1 = 54;               // ID3D12Device4
 constexpr uint32_t CreateReservedResource1 = 55;   // ID3D12Device4
 constexpr uint32_t CreateCommittedResource2 = 69;  // ID3D12Device8
 constexpr uint32_t CreatePlacedResource1 = 70;     // ID3D12Device8
+constexpr uint32_t CreateSampler2 = 79;            // ID3D12Device11 (Agility SDK / newer Windows SDK)
 } // namespace device
 
 namespace queue {
@@ -54,6 +56,7 @@ constexpr uint32_t Unmap = 9;
 namespace list {
 constexpr uint32_t Close = 9;
 constexpr uint32_t Reset = 10;
+constexpr uint32_t ClearState = 11;
 constexpr uint32_t DrawInstanced = 12;
 constexpr uint32_t DrawIndexedInstanced = 13;
 constexpr uint32_t Dispatch = 14;
@@ -61,8 +64,11 @@ constexpr uint32_t CopyBufferRegion = 15;
 constexpr uint32_t CopyTextureRegion = 16;
 constexpr uint32_t CopyResource = 17;
 constexpr uint32_t ResolveSubresource = 19;
+constexpr uint32_t IASetPrimitiveTopology = 20;
 constexpr uint32_t RSSetViewports = 21;
 constexpr uint32_t RSSetScissorRects = 22;
+constexpr uint32_t OMSetBlendFactor = 23;
+constexpr uint32_t OMSetStencilRef = 24;
 constexpr uint32_t SetPipelineState = 25;
 constexpr uint32_t ResourceBarrier = 26;
 constexpr uint32_t ExecuteBundle = 27;
@@ -81,9 +87,18 @@ constexpr uint32_t SetComputeRootShaderResourceView = 39;
 constexpr uint32_t SetGraphicsRootShaderResourceView = 40;
 constexpr uint32_t SetComputeRootUnorderedAccessView = 41;
 constexpr uint32_t SetGraphicsRootUnorderedAccessView = 42;
+constexpr uint32_t IASetIndexBuffer = 43;
+constexpr uint32_t IASetVertexBuffers = 44;
+constexpr uint32_t SOSetTargets = 45;
 constexpr uint32_t OMSetRenderTargets = 46;
 constexpr uint32_t ClearDepthStencilView = 47;
 constexpr uint32_t ClearRenderTargetView = 48;
+constexpr uint32_t ClearUnorderedAccessViewUint = 49;
+constexpr uint32_t ClearUnorderedAccessViewFloat = 50;
+constexpr uint32_t DiscardResource = 51;
+constexpr uint32_t BeginQuery = 52;
+constexpr uint32_t EndQuery = 53;
+constexpr uint32_t SetPredication = 55;
 constexpr uint32_t ExecuteIndirect = 59;
 // ID3D12GraphicsCommandList4 (Kind::CommandList4; verified against the SDK vtable:
 // List1 adds 60-65, List2 66, List3 67). NOT 62/63 (OMSetDepthBounds/SetSamplePositions).

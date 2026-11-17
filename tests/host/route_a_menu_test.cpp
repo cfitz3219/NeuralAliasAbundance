@@ -5,13 +5,23 @@
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
+#include "host_dx12/fg/preset_profile.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/observe/producers.hpp"
 int main() {
+    na::fg::preset::AnisoOverride af;
+    af.available=true;af.start_known=true;af.start_selector=1;af.selector=0;af.level=1;
+    CHECK(af.ForcedThisRun()&&!af.ForcedNow()&&!af.Limits(16));
+    af.selector=1;CHECK(af.ForcedNow()&&af.Limits(16));
+    af.selector=2;af.start_selector=2;CHECK(!af.ForcedNow()&&!af.ForcedThisRun());
+    af.selector=1;af.available=false;CHECK(!af.ForcedNow()&&!af.Limits(16));
     na::mode::Request saved;
     CHECK(na::mode::BuildSavedRequest(2,13,3440,1440,saved));
     CHECK(saved.render_w==2000 && saved.render_h==840 && saved.unreal_percent==58.f);
     CHECK(na::mode::BuildSavedRequest(0,13,3440,1440,saved) && saved.render_w==3440 && saved.render_h==1440);
     CHECK(!na::mode::BuildSavedRequest(99,13,3440,1440,saved));
     auto& st=na::settings::Get();
+    CHECK(!st.donut_tone && !st.donut_bloom && !st.xegtao_enabled);
     st.motion_enabled=0; st.nr_paper_white=200; st.dlss_mode=4; st.fg_preset=3;
     auto ms=na::motion::GetStats();
     std::printf("motion requested=0 observed=%u\n",ms.enabled);
@@ -23,12 +33,33 @@ int main() {
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
     na::ui::ApplyStyle();
     na::overlay::RegisterRouteAMenu();
-    for(int page=1;page<=4;++page) {
-        std::printf("drawing page %d\n",page); std::fflush(stdout);
+    CHECK(na::menu::kPageCount==5);
+    CHECK(!strcmp(na::menu::PageName(na::menu::Page::Experimental),"Experimental"));
+    int experimental=0;
+    for(int i=0;i<na::menu::Count();++i){
+        const auto* section=na::menu::At(i);
+        if(!strcmp(section->title,"XeGTAO (Ambient Occlusion)") || !strcmp(section->title,"Lighting")){
+            CHECK(na::menu::ResolvePage(*section)==(!strcmp(section->title,"XeGTAO (Ambient Occlusion)")?na::menu::Page::Enhancements:na::menu::Page::Experimental));++experimental;
+        }
+    }
+    CHECK(experimental==2);
+    // Draw the real DLAA enhancements too, including the large automatic total.
+    na::j2::SetEnabled(true);na::observe::SetSamplerMipBiasLive(-1.f);
+    for(auto page:na::menu::kPages) {
+        na::menu::SetCurrentPage(page);CHECK(na::menu::CurrentPage()==page);
+        std::printf("drawing page %s\n",na::menu::PageName(page)); std::fflush(stdout);
         ImGui::NewFrame(); ImGui::SetNextWindowSize({1400,800}); ImGui::Begin("NeuralAlias");
-        na::menu::DrawPage(static_cast<na::menu::Page>(page),true);
+        na::menu::DrawPage(page,true);
         ImGui::End(); ImGui::Render();
     }
+    // Live-DLAA-only games must expose the same pages without Route A registration.
+    na::menu::Clear();na::overlay::RegisterLiveDlaaMenu();int effects=0;
+    for(int i=0;i<na::menu::Count();++i){const auto* section=na::menu::At(i);
+        if(!strcmp(section->title,"XeGTAO (Ambient Occlusion)")){CHECK(section->page==na::menu::Page::Enhancements);++effects;}
+        if(!strcmp(section->title,"Lighting")||!strcmp(section->title,"GPU infrastructure")){CHECK(section->page==na::menu::Page::Experimental);++effects;}
+    }
+    CHECK(effects==3);
+    na::j2::SetEnabled(false);na::observe::SetProcessExiting();
     ImGui::DestroyContext();
     return test::finish("route_a_menu_test");
 }

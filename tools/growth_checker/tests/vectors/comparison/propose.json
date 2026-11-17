@@ -1,0 +1,48 @@
+{
+  "about": "A single stronger result proposes a floor.",
+  "call": "floor_action",
+  "args": [
+    {
+      "id": "sample",
+      "game": "One",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "engine": {"name": "One Engine", "source": "declared"},
+      "scene": {"id": "harbor"},
+      "settings": {"mode": "DLAA"}
+    },
+    {"case": "sample", "floor": {"delivered_share_of_presented": {"kind": "min", "value": 90}}},
+    {
+      "status": "scored",
+      "route": "B",
+      "api": "dx12",
+      "provider": "dx12",
+      "manifest": {
+        "case": "sample",
+        "evidence_type": "live_run",
+        "evidence_id": "abcdef12-bbbbbbbbbbbb",
+        "files": [{"role": "status", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+        "producer": {"build": "abcdef12", "build_source": "status_header"}
+      },
+      "sessions": [{"samples": 4}],
+      "observed": {
+        "mode": {"last": "DLAA", "distinct": ["DLAA"]},
+        "scene_id": "harbor",
+        "test_environment": "pc1",
+        "play_intervals": true
+      },
+      "measurements": {
+        "frames_delivered": {"state": "measured", "value": 900, "basis": "counter"},
+        "delivered_share_of_presented": {"state": "measured", "value": 98, "basis": "derived"}
+      }
+    },
+    {"verdict": "comparable", "limits": [], "reasons": [], "tolerance": {}},
+    null
+  ],
+  "expect": {
+    "action": "propose",
+    "floor": {"delivered_share_of_presented": {"kind": "min", "value": 98}},
+    "reason": "This run supports a higher floor. Confirm it on the next scheduled run."
+  }
+}

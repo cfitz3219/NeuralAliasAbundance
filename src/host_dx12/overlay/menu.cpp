@@ -8,7 +8,7 @@
 
 namespace na::menu {
 namespace {
-constexpr int kMax = 16;
+constexpr int kMax = 24;
 Section g_sections[kMax];
 int g_count = 0;
 Page g_current = Page::Picture;
@@ -21,6 +21,7 @@ const char* PageName(Page p)
     switch (p) {
     case Page::Picture: return "Picture";
     case Page::Enhancements: return "Enhancements";
+    case Page::Experimental: return "Experimental";
     case Page::Preferences: return "Preferences";
     case Page::Details: return "Details & support";
     default: return "";

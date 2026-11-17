@@ -7,9 +7,14 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/overlay/presenter.hpp"
+#include <cmath>
+#include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
 #include <mutex>
 
 namespace na::host {
@@ -72,9 +77,11 @@ void RunSessionWorker(RendererReadyFn activate){
         if(ready.load()){
             if(!activated){activated=true;if(activate)activate();}
             settings::FlushSessionFailure();
+            na::scale::PollAutomaticScene();
             if(save_pending.exchange(false))settings::SaveFromWorker();
         }
-        if(wake)WaitForSingleObject(wake,250);else Sleep(250);
+        const DWORD interval=na::scale::AutomaticSceneWorkPending()?10u:250u;
+        if(wake)WaitForSingleObject(wake,interval);else Sleep(interval);
     }
     std::lock_guard<std::mutex> lock(qualification);
     if(ready.load()){
@@ -89,11 +96,29 @@ void ActivateSavedRequests(const wchar_t* ini){
     if(settings::CanPersist())na::fg::preset::Initialize();
     slb::SetFgRequest(safe?slb::FgRequest{}:slb::FgRequest{static_cast<slb::FgMode>(st.native_fg_mode.load()),st.native_fg_frames.load()});
     j2::SetPaused(safe);
-    if(j2::Configured())observe::SetSamplerMipBias(static_cast<float>(st.j2_mip_bias_x100.load())/100.f);
+    if(safe)j2::flow::SetEnabled(false);
+    if(j2::Configured()){
+        // The menu's Texture mip bias choice (automatic = total -1). The old [j2] mip_bias key
+        // chooses nothing: a legacy saved Off must not switch texture detail off.
+        const float user=settings::DlaaMipBias(st);
+        if(!safe)st.j2_mip_bias_x100.store(settings::DlaaMipBiasX100(st));
+        float bias=safe?0.f:user;
+        if(!safe&&j2::RenderSmall()){
+            // Render-small: apply the mode's existing total live, including the
+            // native sampler bias exactly once (overlay small_follow_mode).
+            float wanted[4]={user,user,user,user};
+            for(int m=1;m<=3;++m)wanted[m]=j2::SmallMipBias(user,static_cast<float>(scale::FractionForMode(m)));
+            observe::SetSamplerMipLevelsWanted(wanted,4);
+            bias=j2::SmallMipBias(user,present::RenderScale());
+        }
+        observe::SetSamplerMipBias(bias);
+    }
+    // Anisotropic filtering: live like the mip bias (twins of the game's objects).
+    observe::SetSamplerAnisotropy(safe ? 0u : st.aniso16.load());
     if(GetPrivateProfileIntW(L"fsr",L"enabled",1,ini)==1)
-        ffx::SetMode(!safe && GetPrivateProfileIntW(L"fsr",L"replace",0,ini)==1?ffx::Mode::ReplaceWithDlss:ffx::Mode::Observe);
+        ffx::SetMode(settings::AddedUpscalingAllowed() && !safe && GetPrivateProfileIntW(L"fsr",L"replace",0,ini)==1?ffx::Mode::ReplaceWithDlss:ffx::Mode::Observe);
     if(GetPrivateProfileIntW(L"xess",L"enabled",1,ini)==1)
-        xess::SetMode(!safe && GetPrivateProfileIntW(L"xess",L"replace",0,ini)==1?xess::Mode::ReplaceWithDlss:xess::Mode::Observe);
+        xess::SetMode(settings::AddedUpscalingAllowed() && !safe && GetPrivateProfileIntW(L"xess",L"replace",0,ini)==1?xess::Mode::ReplaceWithDlss:xess::Mode::Observe);
     if(safe || !st.enabled.load())return;
     if(st.preset.load()>0 || st.rr_preset.load()>0)ngx::RequestReapply();
     // Engine render-size setters run only after the user's Apply button.

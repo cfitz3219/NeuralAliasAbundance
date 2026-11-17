@@ -1,0 +1,9 @@
+{
+  "about": "One improvement cannot cover an affected game with no results.",
+  "call": "build_verdict",
+  "args": [
+    {"sample": {"answer": "grew"}},
+    {"unclassified": [], "cases": {"sample": {"answer": "affected"}, "other": {"answer": "affected"}}}
+  ],
+  "expect": {"answer": "not proven", "because": ["Gameplay evidence is still incomplete for other."]}
+}

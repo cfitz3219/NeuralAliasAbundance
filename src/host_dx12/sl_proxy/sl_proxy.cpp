@@ -1,5 +1,6 @@
 #include "host_dx12/fg/camera.hpp"
 #include "host_dx12/host_boot/session.hpp"
+#include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/adapters/tlou1/timing.hpp"
@@ -97,12 +98,12 @@ DWORD WINAPI InitThread(LPVOID)
     // Gate 2: the Streamline entry point also hosts non-native upscalers.
     // Observe by default; replacement remains an explicit per-provider opt-in.
     if (GetPrivateProfileIntW(L"fsr", L"enabled", 1, ini) == 1) {
-        na::ffx::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
+        na::ffx::SetMode(na::settings::AddedUpscalingAllowed() && !na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, ini) == 1
             ? na::ffx::Mode::ReplaceWithDlss : na::ffx::Mode::Observe);
         na::ffx::StartModuleWatch();
     }
     if (GetPrivateProfileIntW(L"xess", L"enabled", 1, ini) == 1) {
-        na::xess::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
+        na::xess::SetMode(na::settings::AddedUpscalingAllowed() && !na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, ini) == 1
             ? na::xess::Mode::ReplaceWithDlss : na::xess::Mode::Observe);
         na::xess::StartModuleWatch();
     }
@@ -305,7 +306,7 @@ extern "C" __declspec(dllexport) uint64_t __cdecl slEvaluateFeature(uintptr_t a,
     const uint32_t layout = g_sl_layout.load(std::memory_order_relaxed);
     uint32_t token_frame = 0;
     const bool v1 = layout == static_cast<uint32_t>(na::sl::Layout::V1) ||
-                    (layout == 0 && (c >> 32) == 0 && (d >> 32) == 0 && !frame_token_value(reinterpret_cast<const void*>(b), &token_frame));
+                    (layout == 0 && (static_cast<uint64_t>(c) >> 32) == 0 && (static_cast<uint64_t>(d) >> 32) == 0 && !frame_token_value(reinterpret_cast<const void*>(b), &token_frame));
     if (v1) {
         na::fg::EvaluationScope scope(static_cast<uint32_t>(c), static_cast<uint32_t>(d));
         return real(a, b, c, d, e);
@@ -366,7 +367,7 @@ extern "C" __declspec(dllexport) void NeuralAliasSLProxyStats(
     if (out_hooked) *out_hooked = s.hooked_functions;
 }
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = instance;
@@ -374,5 +375,6 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
         HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
         if (t) CloseHandle(t);
     }
+    if (reason == DLL_PROCESS_DETACH && reserved) na::host::NotifyProcessExit(); // before the CRT's static teardown
     return TRUE;
 }

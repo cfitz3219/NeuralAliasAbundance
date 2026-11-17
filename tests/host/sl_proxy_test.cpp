@@ -189,7 +189,7 @@ int wmain(int argc, wchar_t** argv)
         // A 2.x-shaped Constants block, FrameToken (vptr first) and ViewportHandle.
         struct Header { void* next; uint8_t guid[16]; size_t version; };
         struct Constants2 { Header h; float body[103]; uint8_t flags[7]; uint8_t pad; float sep; } c2{};
-        static_assert(offsetof(Constants2, body) == 32 && offsetof(Constants2, flags) == 444, "2.x layout");
+        static_assert(offsetof(Constants2, body) == 16 + 2 * sizeof(void*) && offsetof(Constants2, flags) == offsetof(Constants2, body) + 412, "2.x layout");
         const uint8_t cguid[16] = {0xd7, 0x5a, 0xd3, 0xdc, 0x4a, 0x4e, 0xad, 0x4b, 0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe};
         memcpy(c2.h.guid, cguid, 16);
         c2.h.version = 2;

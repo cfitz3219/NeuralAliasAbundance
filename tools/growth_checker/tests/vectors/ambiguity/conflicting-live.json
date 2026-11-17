@@ -1,0 +1,11 @@
+{
+  "about": "Conflicting observations remain visible.",
+  "call": "job_state",
+  "args": [
+    [
+      {"state": "verified", "evidence_type": "live_run", "build": "abcdef12"},
+      {"state": "failed", "evidence_type": "live_run", "build": "abcdef12"}
+    ]
+  ],
+  "expect": {"state": "unknown", "because": "Evidence of type live_run disagrees on this job."}
+}

@@ -1,0 +1,7 @@
+{
+  "about": "Synthetic log written for the self-test. 105 s: 90 s with DLAA, one 15 s gap from camera origin rejects.",
+  "exact": {"provider": "native11", "scene_frames": 10500, "dlaa_frames": 9000, "longest_gap_seconds": 15.0, "longest_gap_window_seconds": 15,
+            "longest_gap_started": "12:00:55", "missed_because": {"origin": 1500}},
+  "min": {"dlaa_percent": 85.7, "fps_median_with_dlaa": 100.0},
+  "max": {"dlaa_percent": 85.8}
+}

@@ -23,8 +23,12 @@
 // waits; a busy ring slot skips. Jitter injection (J1) is a separate step:
 // without it DLSS gets jitter 0 (temporally stable, not super-sampled).
 #pragma once
+#include "host_dx12/j2/native_hud.hpp"
 #include <d3d12.h>
 #include <cstdint>
+#include <memory>
+#include <cmath>
+#include <string>
 
 namespace na::j2 {
 
@@ -33,8 +37,14 @@ using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList*
 void SetEnabled(bool on);   // from the INI at start-up
 bool Enabled();
 bool Configured();          // enabled at start-up (the overlay shows its section)
+void EnableWwiiSceneCamera(bool on);
 void SetPaused(bool paused); // the overlay's on/off switch (history resets on resume)
 bool Paused();
+// The native DX11 route uses the same sharpening kernel with its own slots.
+bool RecordNativeRcas(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                      ID3D12Resource* in, ID3D12Resource* out, ID3D12Resource* depth,
+                      uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT format,
+                      uint32_t slot, bool reversed);
 // Debug view (replaces the DLAA result): 0 off, 1 motion vectors, 2 fine motion
 // (sub-pixel), 3 depth.
 void SetDebugView(int mode);
@@ -42,13 +52,211 @@ void SetDebugView(int mode);
 // into `out` (UNORDERED_ACCESS). percent 0 records nothing and returns false.
 bool RecordRcasForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
                         uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt);
-// Test hook: the 101..200 % stage (NVIDIA Image Scaling sharpen-only) from `in`
-// (NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS). <= 100 % records nothing.
-bool RecordNisForTests(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* in, ID3D12Resource* out,
-                       uint32_t w, uint32_t h, uint32_t percent, DXGI_FORMAT fmt, bool hdr);
+// Test hook: compiles the render-small HUD passes (classify, dilate, composite); false + why.
+bool CompileHudShadersForTests(char* why, size_t why_size);
+// Tests: the native-HUD composite (pass "layer") from `picture` and the two layers (all in
+// NON_PIXEL_SHADER_RESOURCE) into `out` (UNORDERED_ACCESS), and one HUD-mask classify pass
+// (cur/prev/motion readable, evidence R32_FLOAT in UNORDERED_ACCESS). Set up on `queue`'s device.
+// hud_unblend's pass (tests): picture (NON_PIXEL_SHADER_RESOURCE) with l0/l1 (likewise) -> out (UNORDERED_ACCESS,
+// the un-blended scene); counts (COPY_DEST, >= 32 bytes) receives the self-check: ui, opaque, match id/dec/enc.
+bool RecordHudUnblendForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
+                              ID3D12Resource* l0, ID3D12Resource* l1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
+                              uint32_t w, uint32_t h, ID3D12Resource* counts);
+bool RecordHudLayerForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* picture, DXGI_FORMAT picture_format,
+                            ID3D12Resource* n0, ID3D12Resource* n1, DXGI_FORMAT view, float grey, bool srgb, ID3D12Resource* out,
+                            uint32_t w, uint32_t h);
+bool RecordHudClassifyForTests(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list, ID3D12Resource* cur, ID3D12Resource* prev,
+                               DXGI_FORMAT color_format, ID3D12Resource* motion, ID3D12Resource* evidence, uint32_t w, uint32_t h, uint32_t flags);
+// Test-only recorder; caller waits outside live callbacks and reads four uints:
+// tested, unjittered, raster, opposite. `counts` is a COPY_DEST readback buffer.
+bool RecordJitterWitnessForTests(ID3D12CommandQueue*, ID3D12GraphicsCommandList*, ID3D12Resource* cur,
+    ID3D12Resource* prev, ID3D12Resource* motion, uint32_t w, uint32_t h, float dx, float dy, ID3D12Resource* counts);
 int DebugView();
 void SetJitter(bool on);     // the overlay's camera-jitter switch (J1), on by default
 bool Jitter();
+
+// P4-4 projection window (no-slider route, 2026-11-02). With [j2] window=1 and a render
+// mode below DLAA, J1 also scales and shifts the camera it already rewrites, so the game
+// draws its whole scene into the top-left render-size corner of its own full-size
+// targets; DLSS reads that corner and writes the full picture back at the DLAA point.
+// Viewports, screen-size constants and every resource stay native. Engages after DLAA
+// has run on 30 frames in a row; disengages on mode 0, a size change or repeated misses.
+// P4-4 render-small (native present, COMMS 4e30a94/f0de8b4): the game renders its WHOLE frame
+// at render size into the presenter's proxies, and the presenter shows it at the window's size.
+// J2 keeps jittering the camera and builds the frame's depth and motion at its usual point,
+// but leaves the scene colour as drawn; DLSS runs at Present on the finished render-size
+// picture (PresentUpscale, the presenter's UpscaleFn). A frame without this frame's depth and
+// motion (J2 not running yet, a missed scene, another queue) is stretched bilinearly instead,
+// so a picture is always shown and the mode never switches itself off. Off by default.
+void SetRenderSmall(bool on);
+bool RenderSmall();
+// Native HUD: the CBV binding (resource, root slot) is one J2 jitters as the camera, so the
+// draw is drawn with the camera and belongs in the proxy (DLSS removes its jitter there).
+bool CameraBinding(uint64_t resource, uint64_t offset, uint32_t param, bool table);
+// Render-small HUD: tint the pixels taken as HUD (diagnostic, not saved). With the native HUD
+// (native_hud.hpp) it tints where the native HUD layers draw; with the mask, the mask.
+void SetHudMaskView(bool on);
+// The pixel-guessing HUD mask + NIS ([present] hud_mask=1; off by default: in Anno it took
+// scenery for HUD and showed the raw jittered frame there).
+void SetHudMaskEnabled(bool on);
+bool HudMaskEnabled();
+bool HudMaskView();
+// Render-small texture bias per DLSS mode (Cort, 2026-11-03; the menu is greyed out there):
+// Quality (67%) -1.585, Balanced (58%) -2, Performance (50%) -2.25 (Cort 2026-11-04: -2.5 was
+// a little too strong). DLAA (scale 1) uses `dlaa_total`: the menu's Texture mip bias choice,
+// -1 when that is automatic (settings::DlaaMipBias). The reduced modes keep their own totals.
+inline float SmallMipBias(float dlaa_total, float scale)
+{
+    if (!(scale > 0.f && scale < 1.f)) return dlaa_total;
+    return scale >= 0.62f ? -1.5849625f : (scale >= 0.54f ? -2.0f : -2.25f);
+}
+// DLSS preset setting "Automatic" (Cort 2026-11-04): L for DLAA and Quality, M for Balanced and
+// Performance. Any other setting value is an explicit NGX preset (J 10, K 11, L 12, M 13, 0 =
+// NVIDIA's default) used in every mode.
+constexpr uint32_t kPresetAuto = 255;
+inline uint32_t PresetFor(uint32_t setting, uint32_t render_w, uint32_t out_w)
+{
+    if (setting != kPresetAuto) return setting;
+    const bool below_quality = render_w && out_w && double(render_w) / double(out_w) < 0.62;
+    return below_quality ? 13u : 12u;
+}
+bool PresentUpscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, uint32_t rw, uint32_t rh,
+                    ID3D12Resource* out, uint32_t ow, uint32_t oh, bool hdr, void* user);
+// Exact original batch, before application fences: reuse the normal upscale
+// machinery on the saved pre-HUD scene, then execute the native HUD list.
+bool PreHudUpscale(ID3D12CommandQueue*,ID3D12Resource* frame,uint32_t rw,uint32_t rh,
+                   ID3D12Resource* out,uint32_t ow,uint32_t oh,const native_hud::Layer&,ID3D12CommandList* replay);
+void SetProjectionWindow(bool on);
+void SetProjectionWindowScissor(bool on); // [j2] window_scissor: clip scene draws to the corner (GPU cost), default on
+bool ProjectionWindow();
+// Recording-time view for the scissor hook: scene draws (depth target == `depth`) are
+// clipped to the top-left ew x eh corner while engaged. False = leave draws alone.
+bool ProjectionWindowScissor(uint64_t* depth, uint32_t* ew, uint32_t* eh);
+
+// P4-4 (DLSS upscaling, slider route). With no destination J2 runs DLAA as before:
+// DLSS at the scene's size, written back into the scene colour. With a destination,
+// DLSS upscales the scene's active extent (render_w x render_h at the top left of the
+// scene colour and depth; 0 = the whole texture) into J2's own target at the
+// destination's size and copies it into `dest` (single-sample 2D, copy-compatible
+// with the scene colour, at least as large as the extent); the scene colour is left
+// as the game drew it. Camera jitter, the jitter phase count and motion use the active
+// extent. A destination J2 cannot use falls back to DLAA with the reason in Stats.
+// Changing the target restarts DLSS history. Stage P sets it from the game's stretch
+// to output size; the tests set it directly.
+struct UpscaleTarget {
+    uint64_t dest = 0;       // na_object_id of the destination texture; 0 = DLAA
+    uint32_t dest_sub = 0;   // its subresource (mip + slice)
+    uint32_t render_w = 0, render_h = 0;
+    // Optional private full-size destination (native scale, audit F10: the game
+    // tone-maps while upscaling, so DLSS writes HDR here and the game's own pass
+    // then reads it). Its state between uses is `state`.
+    ID3D12Resource* resource = nullptr;
+    uint32_t state = 0;
+    bool require_delivery = false;
+};
+void SetUpscaleTarget(const UpscaleTarget& t);
+UpscaleTarget GetUpscaleTarget();
+// Native engine scaling: use the existing operation shadow to find the pass
+// reading the reduced scene into a full-output target. Reconstruct after that
+// exact operation, before subsequent post effects/HUD. Does not change window
+// geometry or run a second Present upscaler.
+void EnableNativeScaleBridge(bool enabled);
+// Explicit, one-shot F8 diagnostic of CPU-visible scene constants. No GPU readback.
+void EnableCameraInputDiagnostic(bool enabled);
+void SetNativeRenderExtent(uint32_t rw,uint32_t rh,uint32_t ow,uint32_t oh);
+// Audit 2026-11-06: what the native-scale bridge saw. One run with the game at
+// Quality must say why DLSS did or did not reconstruct (status + run log).
+struct NativeBridgeStats {
+    bool enabled=false,reduced=false;
+    uint32_t rw=0,rh=0,ow=0,oh=0;            // the game's reported scene and output size
+    uint64_t hints=0,examined=0,not_reading=0,snapshot=0,source_size=0,draw_state=0,viewport=0,
+        no_destination=0,ambiguous=0,candidates=0,recorded=0,record_failed=0,after_skipped=0,redirected=0,redirect_failed=0,
+        redirect_submitted=0,depth_state_refused=0; // redirected = DLSS recorded AND pass rebound; submitted = that list executed
+    uint32_t src_w=0,src_h=0,src_fmt=0;       // last scene colour examined
+    uint32_t seen_w=0,seen_h=0,seen_fmt=0;    // last full-size target written by a scene reader
+    char reason[200]{};
+    // Stretch finder: operations examined after this frame's scene, and the distinct
+    // full-output writers seen (pipeline, kind, output, render-size inputs, verdict).
+    uint64_t st_gated=0,st_full=0,st_examined=0,st_no_input=0,st_ambiguous=0,st_draw_state=0,st_candidates=0,st_recorded=0,st_failed=0,
+        st_ungated_full=0,st_budget=0,st_aux=0;
+    // Late-bound upscale steps: staged at the dispatch, resolved at submission (descriptors
+    // changed after recording / unchanged), and resolved to the learned images.
+    uint64_t st_late_staged=0,st_late_changed=0,st_late_same=0,st_late_resolved=0,
+        st_late_inline=0, // learned dispatches delivered inline with the input chosen by this recording's writes
+        st_late_no_producer=0,st_late_no_state=0; // inline not taken at record time: no submitted producer / input state unknown
+    // Depth snapshots at scene-list Close (the late-bound and deferred routes need one).
+    uint64_t snap_closes=0,snap_depth_unknown=0,snap_format=0,snap_no_slot=0,snap_taken=0;
+    char steps[720]{};
+    // Sol bafa40a: deliveries confirmed at submission (first frame, current and
+    // best consecutive run), producer-order refusals, deliveries whose target was
+    // written again later in the same list, and every refusal reason with its count.
+    uint64_t delivered=0,first_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
+    char refusals[1300]{};
+    char probe[320]{}; // delivery probe: sessions, pairs, per-point follow/invert/flat, verdict
+    char stages[480]{}; // Quality route stage counts, furthest stage reached and its stop reason
+};
+NativeBridgeStats GetNativeBridgeStats();
+// Presented-frame trace while the scene is reduced (diagnostic): call at every Present with
+// the presented image; the walk from it back to the scale crossing is logged (native_trace).
+void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present);
+void NativeTraceResult(char* out,size_t n,uint64_t* traces);
+// Delivery probe readback at Present (after NativeTracePresent): reads the marked
+// texels of the presented image (PRESENT state) with `exec` (unhooked; null = direct).
+void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*));
+// Starts one probe session (24 marked deliveries) now, as an armed J2 capture does.
+void RequestDeliveryProbe();
+// Tests: presents between re-verifying traces once a crossing is learned (default 900).
+void SetNativeTraceIntervalForTests(uint32_t presents);
+// Quality stability gate: consecutive deliverable frames before DLSS is written (default 30).
+void SetQualityWarmupForTests(uint32_t frames);
+// P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
+// immutable logical -> physical snapshot. Discovery, the camera and every identity stay on the
+// LOGICAL scene colour/depth ids; J2 evaluates the provider's PHYSICAL (reduced) companions and
+// writes the full-size output. The provider's resources are private host-owned textures, not
+// discovery candidates, so their exact states travel in the payload; J2 restores exactly those
+// states after its use. The output is in the same payload (same generation), never paired with
+// the separately changing UpscaleTarget.
+struct PhysicalInput {
+    uint64_t logical_color = 0, logical_depth = 0; // must equal the frame's discovered ids
+    uint64_t generation = 0;                       // the recording's snapshot generation
+    ID3D12Resource* color = nullptr; uint32_t color_sub = 0, color_state = 0;
+    ID3D12Resource* depth = nullptr; uint32_t depth_sub = 0, depth_state = 0;
+    uint32_t render_w = 0, render_h = 0;            // active extent at the top left of color/depth
+    ID3D12Resource* output = nullptr; uint32_t output_sub = 0, output_state = 0; // full size
+    std::shared_ptr<void> owner; // keeps the raw resources alive; J2 retains the payload through
+                                 // every submission of the recording that uses it
+};
+enum class PhysicalLookup {
+    None,        // no override for this frame: today's logical path
+    Provided,    // use *out
+    Unavailable, // this recording was redirected but its replacement is not available: J2 does
+                 // NOT evaluate the stale logical picture; the owner repairs the frame
+};
+enum class PhysicalOutcome {
+    Evaluated,   // DLSS evaluated the physical inputs into the payload's output
+    Unavailable, // the provider reported Unavailable: nothing evaluated
+    Failed,      // provided, but J2 could not use it (validation, retention, DLSS): nothing usable
+                 // was written to the output; the owner promotes its own current-frame output
+};
+struct PhysicalInputProvider {
+    // Called on J2's recording thread with the frame's logical ids and the game list being
+    // recorded (null on the between-lists route).
+    PhysicalLookup (*lookup)(void* ctx, uint64_t logical_color, uint64_t logical_depth,
+                             ID3D12GraphicsCommandList* game_list, std::shared_ptr<const PhysicalInput>* out) = nullptr;
+    // Every Provided / Unavailable lookup gets exactly one outcome, before J2's record returns.
+    void (*outcome)(void* ctx, uint64_t generation, PhysicalOutcome result, const char* reason) = nullptr;
+    void* ctx = nullptr;
+    // Opt-in: lookup receives the exact source recording on the between-lists
+    // route as well. Existing providers retain the historical null argument.
+    bool source_recording = false;
+};
+// Null lookup = no provider (default). Not changed while a frame records.
+void SetPhysicalInputProvider(const PhysicalInputProvider& p);
+
+// Jitter phases for a render -> output ratio (8 for DLAA, 8 x ratio^2 upscaling, max 64).
+uint32_t JitterPhasesFor(uint32_t render_w, uint32_t out_w);
+// Texture mip bias for upscaling: log2(render / output) - 1 (DLSS guidance; -1 at DLAA).
+float UpscaleMipBias(uint32_t render_w, uint32_t out_w);
 
 // Called once at the game view's non-TEST Present boundary, including while
 // paused. Presenter-generated frames must not call this. Single-view J2 uses
@@ -60,6 +268,7 @@ void OnPresent(ID3D12CommandQueue* queue);
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward);
 
 struct Stats {
+    uint64_t native_deliveries = 0; // full-output native bridge copies on submitted lists
     // Automatic route selection (route_selector.hpp). route: 0 none, 1 between,
     // 2 inline, 3 interceptor; state: 0 observing, 1 active; mode: 0 auto,
     // 1 forced between, 2 forced inline. placement_consistent = executed frames with
@@ -89,9 +298,48 @@ struct Stats {
     uint64_t camera_offset = 0;   // byte offset of the camera matrix inside its constant block
     uint32_t later_passes = 0;
     uint64_t sharpened_frames = 0; // RCAS applied to the DLAA result
-    uint64_t nis_frames = 0;       // NIS added on top (Sharpness above 100 %)
+    uint64_t nis_frames = 0;       // Legacy log field; live sharpening is RCAS-only.
     uint64_t jitter_writes = 0;   // J1: camera matrices replaced by jittered copies
+    uint64_t velocity_candidates = 0, velocity_captured = 0, velocity_capture_unknown_state = 0; // game motion-buffer candidates at scene extent (captures)
+    uint64_t camera_interlopers = 0, camera_interloper_picks = 0; // frames kept on the main camera / candidates skipped (a second camera in the slot)
     uint64_t camera_learned_hits = 0, camera_scans = 0; // camera found at the learned slot / by a full search
+    // Several valid cameras in one frame (reflection, sky, light): frames where more than one
+    // candidate was seen / where the chosen one was not the first-ranked. Lost-camera reasons:
+    // nothing readable, no ViewProjection, a ViewProjection without its inverse; capped = the
+    // block bound was reached.
+    uint64_t camera_contested = 0, camera_alternatives = 0, jitter_slot_other_camera = 0;
+    uint64_t camera_lost_unread = 0, camera_lost_no_vp = 0, camera_lost_no_inverse = 0, camera_lost_capped = 0;
+    // SE5 2026-11-02 (Cort: the camera fix changed nothing): per PRESENT, why the frame ended
+    // without DLAA, and why a DLAA frame ran without J1's jitter. Counted once per present.
+    uint64_t miss_no_camera = 0, miss_no_state = 0, miss_no_candidate = 0, miss_other = 0;
+    uint64_t unjit_no_sample = 0;    // no jitter sample was started in any earlier batch
+    uint64_t unjit_not_applied = 0;  // started, but no camera block was rewritten
+    uint64_t unjit_not_held = 0;     // rewritten, but the camera the scene list used did not hold it
+    uint64_t camera_inverse_computed = 0; // a ViewProjection without its inverse, continuing the main camera, accepted
+    uint64_t camera_bootstrapped = 0;     // first main camera accepted from a persistent ViewProjection with no inverse pair anywhere
+    // SE5 flashing: frames whose camera could not be read ran DLAA on a camera predicted
+    // from the last two (extrapolated) or the last one (held), instead of showing the raw frame.
+    uint64_t camera_held = 0, camera_extrapolated = 0;
+    // Cuts at record time by cause (restart = tracker reset by resume/gap; gap = tracker frame gap;
+    // motion = translation/rotation/fov jump), and the last few as "tick100ms:why=value[/held][/j1]".
+    uint64_t cut_restarts = 0, cut_gap = 0, cut_motion = 0;
+    uint64_t jitter_p_scan_cached = 0, jitter_p_scan_solved = 0; // standalone-P search: skipped blocks / solver calls
+    uint64_t gap_bridged = 0; // same-epoch acquisition gaps longer than 4 frames kept without a restart
+    char recent_cuts[240] = {};
+    char draw_replay[96]{};
+    char game_motion[400] = {}; // game_motion.cpp Describe(): candidate scoring and the tier 1 feed
+    uint64_t camera_from_j1 = 0;
+    uint64_t jitter_extent_rescaled = 0; // the render extent changed after J1 jittered this frame: sample rescaled // the scene list held no camera; J1's camera of this same frame (with its jitter) was used
+    // Historical field retained for Results compatibility; learned depth guesses
+    // are removed and this stays zero. Exact source counts below are evaluations.
+    uint64_t depth_state_assumed = 0;
+    // Successful submitted evaluations only. Depth: local, inherited, supplied,
+    // submitted-prefix; camera: fresh, J1, held-still, held-moving, predicted, saved.
+    uint64_t depth_sources[4] = {};
+    uint64_t camera_sources[6] = {};
+    uint32_t depth_source_last = 0, camera_source_last = 0;
+    uint64_t camera_age_last = 0, camera_age_max = 0;
+    char camera_lost_evidence[768] = {};  // bounded last-loss block/offset/read/shape evidence
     int64_t camera_inv_delta = 0; // bytes from the ViewProjection to its inverse in the camera block
     int64_t camera_proj_delta = 0; // bytes to the camera's separate projection matrix (0 = none found)
     uint64_t jitter_proj_writes = 0; // J1: projection matrices replaced by jittered copies
@@ -120,6 +368,7 @@ struct Stats {
     uint32_t inline_frame_rejects = 0; // rejections in the last closed frame
     // Placement profile (role classes; docs/PLACEMENT-DESIGN-RESPONSE.md, Opus's revision).
     uint32_t profile_accepted = 0, profile_rejected = 0, profile_ambiguous = 0, profile_entries = 0;
+    uint64_t profile_forgotten = 0; // learned patterns dropped because the table was full (0 in a healthy run)
     uint64_t class_matched = 0, class_pair_matched = 0, legacy_matched = 0; // inline recordings by trigger
     uint64_t class_rejected_skips = 0;   // consumers skipped because their class is a known temporary reader
     uint64_t barrier_matched = 0;        // inline recordings at a learned scene-completion barrier (final producer)
@@ -130,16 +379,106 @@ struct Stats {
     uint64_t class_contradictions = 0;   // class-triggered frames followed by more scene content (class demoted)
     uint64_t labelled_frames = 0, unlabelled_frames = 0; // frames that taught the profile / could not (truncated trace)
     uint64_t expired_inline = 0;         // inline recordings never submitted within two frames (released)
+    uint64_t between_earlier = 0, between_late = 0; // between fallback placed before an earlier learning entry / after a read in an earlier submission
     uint64_t between_observed = 0, between_predicted = 0; // between-list placements before an observed reader / after a predicted last scene list
     char class_note[200] = {};            // latest consumer class not accepted (explains a missed frame)
+    uint64_t entry_matched=0;
+    uint64_t entry_unknown=0,entry_learning=0,entry_middle=0;
+    // Why a refused entry was NOT rescued (2026-11-06: rescued stayed at 2 through every 40 s
+    // burst): no_learned, resource, writer, occurrence, transition, candidate, destination,
+    // pipeline, pending (an earlier insertion not yet submitted); plus the last one in full.
+    uint64_t rescue_fail[9]={};
+    uint64_t entry_ctx_matched=0; // entries accepted only by their recording context (merged-list frames)
+    uint32_t entry_ctx_keys=0;
+    char rescue_note[240]={};
+    uint64_t entry_rescued=0; // refused entries placed by the learned scene boundary instead (list-merge frames)
+    uint64_t entry_rescued_writer=0; // of those, boundaries whose final writer differed from the learned one (SE5 bursts)
+    uint64_t entry_rescued_memory=0; // of those, matched a remembered earlier delivered shape (not the previous frame's)
+    uint32_t entry_shapes=0; // delivered frame shapes remembered (max 8)
+    uint64_t entry_shapes_retired=0; // remembered endings disproved by subsequent scene writes
+    uint32_t entry_keys=0;
+    // SE5 2026-11-02 (Cort: flicker only while panning): every frame whose DLAA ran and was then
+    // followed by more scene drawing, newest first: what placed it and what drew after it.
+    uint64_t late_frames = 0;
+    char late_detail[900] = {};
     bool depth_reversed = false;  // reverse-Z as classified from the camera    // other render targets bound after the scene in the same list (insertion may be late)
     uint32_t width = 0, height = 0, color_format = 0;
+    // P4-4: the last evaluated frame's active render extent and output size (equal = DLAA),
+    // upscaled frames, and why a destination was not used (fell back to DLAA).
+    uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, jitter_phases = 0;
+    uint64_t upscaled_frames = 0, upscale_refused = 0;
+    uint64_t physical_evaluated = 0, physical_unavailable = 0, physical_failed = 0; // P4-4 Layer2 override
+    // P4-4 projection window: engaged state, the corner, frames evaluated from it,
+    // windowed frames that presented without DLSS, matrix writes by kind, post-DLAA
+    // lists that bound a windowed camera, engagements and why the last one ended.
+    bool window_engaged = false;
+    uint32_t window_w = 0, window_h = 0;
+    uint64_t window_frames = 0, window_missed = 0, window_engagements = 0;
+    uint64_t window_vp_writes = 0, window_inv_writes = 0, window_proj_writes = 0, window_prev_writes = 0, window_post_lists = 0;
+    uint64_t window_scissored = 0, window_scissor_restored = 0;
+    uint64_t window_unpacked = 0, window_repeated = 0, window_extra_cameras = 0; // full-size frames caught / repeated; extra copies of the camera windowed
+    char window_unpacked_note[160] = {};
+    uint64_t jitter_cpu_us = 0, jitter_cpu_max_us = 0; // total / worst single call, J1 + window camera work
+    uint64_t window_stale_samples = 0, jitter_blocks_capped = 0, jitter_patches = 0, jitter_patches_refused = 0;
+    uint64_t window_repeat_fallbacks = 0, window_repeat_stale = 0, window_derived_skipped = 0;
+    uint64_t jitter_blocks_dropped = 0, jitter_blocks_scanned = 0, jitter_slot_blocks = 0;
+    uint64_t jitter_blocks_probed_out = 0; // blocks skipped after the 64-byte probe
+    // Render-small: frames whose depth + motion were kept for Present; pictures DLSS upscaled at
+    // Present / stretched (no fresh depth + motion) / not produced (the presenter kept its old one).
+    uint64_t small_deferred = 0, small_dlss = 0, small_stretched = 0, small_failed = 0, small_dlss_failed = 0, small_sharpened = 0, small_hud = 0, small_hud_layer = 0;
+    uint64_t dlaa_fresh_features = 0; // DLAA features started fresh on return from render-small
+    uint64_t jitter_shifted = 0;      // DLSS colour inputs resampled by the declared jitter (no shake)
+    // Viewport jitter: frames a sample was set for, and where each DLSS frame's declaration came
+    // from (the scene list's own draws / this frame's table entry / none), plus scene lists drawn
+    // with another frame's sample (recorded ahead or late).
+    uint64_t vpj_frames = 0, vpj_from_list = 0, vpj_from_submitted = 0, vpj_none = 0, vpj_other_frame = 0;
+    // HUD protection fallback (screen-fixed map learned during movement; 2026-11-04): frames it
+    // ran, frames it was applied (zero motion + DLSS current-colour bias + NIS HUD pixels), frames
+    // learned only (coverage above 30 %: not applied), and the last completed frame's mask pixels,
+    // detailed moving pixels tested and mask coverage in permille of the picture.
+    uint64_t hud_fb_frames = 0, hud_fb_applied = 0, hud_fb_learn_only = 0;
+    uint32_t hud_fb_mask_px = 0, hud_fb_tested_px = 0, hud_fb_cover_permille = 0;
+    uint32_t small_rw = 0, small_rh = 0, small_ow = 0, small_oh = 0;
+    // I1.4: frames whose depth + motion came from the Present-time source (the in-frame detector
+    // missed); attempts it refused, and why last; selected-depth clears recorded in the last frame.
+    uint64_t small_present_source = 0, small_present_refused = 0;
+    // Jitter witness (render-small): frames tested, the last 60-frame window's pixel counts, how
+    // often jitter was found not to reach the picture (then off until a re-test), and whether off now.
+    uint64_t witness_frames = 0, witness_windows = 0, witness_tested = 0, witness_unshifted = 0, witness_shifted = 0;
+    uint32_t jitter_input_convention = 0; // jitter::Convention of final colour, not the raster write
+    uint64_t jitter_input_epoch = 0, jitter_input_changes = 0;
+    uint64_t jitter_unseen_count = 0, jitter_retests = 0;
+    bool jitter_unseen = false;
+    uint32_t depth_clears_last = 0;
+    char small_present_why[96] = {};
+    // Size observation independent of evaluation (COMMS 4bd474c I1.1): the selected scene colour's
+    // size whenever a submitted list wrote it, and the frame it was written in (frame = current).
+    uint32_t seen_scene_w = 0, seen_scene_h = 0;
+    uint64_t seen_scene_frame = 0, frame_now = 0;
+    char small_note[128] = {};
+    uint64_t window_derived_forward = 0, window_derived_inverse = 0; // camera-derived matrices rebased (see window_derived)
+    char window_derived_note[160] = {};
+    char window_note[120] = {};
+    char upscale_note[160] = {};
     // Shape of the selected resources (reported even when J2 refuses them).
     uint32_t color_sub = 0, color_mips = 0, color_slices = 0, color_samples = 0, depth_slices = 0, depth_samples = 0;
     bool active = false;          // the last batch with the scene was processed
     char reason[160] = {};
+    // Why frames went without DLAA (cumulative): each distinct reason() text and how often it
+    // was given (burst diagnosis, 2026-11-05: frames with no reason recorded were invisible).
+    struct ReasonCount { char text[64] = {}; uint64_t n = 0; };
+    ReasonCount reason_counts[12];
+    uint32_t reason_kinds = 0;
+    uint64_t inline_record_failed = 0; // an inline placement fired but recording DLAA failed (reason in the tally)
 };
+// Per-phase time of the inline DLAA scene-read callback since the last call (status line j2_inline_cost).
+int FormatInlineCost(char* out, size_t n);
 Stats GetStats();
+// Smear test (live_dlaa.cpp): a fixed sequence of DLAA variants, 8 captured frames each, into
+// captures\smear-<time>-<exe>-p<pid>\<n-variant>. Starts with the next native DLAA frame.
+void StartSmearTest();
+bool SmearTestRunning();
+void SmearTestStatus(char* text, size_t capacity);
 
 // Releases GPU objects (test hosts; the caller guarantees GPU idle).
 void Shutdown();

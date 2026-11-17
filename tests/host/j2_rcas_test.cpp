@@ -65,7 +65,7 @@ int main()
         REQUIRE(SUCCEEDED(up->Map(0, nullptr, reinterpret_cast<void**>(&p))));
         for (uint32_t y = 0; y < H; ++y)
             for (uint32_t x = 0; x < W; ++x) {
-                const uint16_t v = half(scene(x, y)), one = half(1.0f);
+                const uint16_t v = half(scene(x, y)), one = half(float(x % 8) / 8.0f);
                 const uint16_t px[4] = {v, v, v, one};
                 std::memcpy(p + fp.Offset + y * fp.Footprint.RowPitch + x * 8, px, 8);
             }
@@ -147,5 +147,49 @@ int main()
     CHECK(std::fabs(detail_a - detail_b) > std::fabs(scene(44, y) - scene(45, y)) + 0.05f); // fine detail gains contrast
     CHECK(detail_a >= 0.0f && detail_b >= 0.0f);           // ...without going negative
     CHECK(std::fabs(hdr - 4.0f) < 0.05f);                   // HDR above 1 survives
+    // Exercise the actual GPU shader across the old ceiling and the new range.
+    // Keep 100% byte-equivalent, a smooth 101% transition, stronger soft-edge
+    // contrast at 150% and more at 200%, flat/HDR/alpha preservation, and clamp out-of-range input.
+    const float baseContrast = o[y * W + 25] - o[y * W + 18];
+    float previousContrast = baseContrast;
+    std::vector<float> maximum;
+    float c150 = 0.f;
+    for (uint32_t percent : {100u, 101u, 125u, 150u, 200u, 201u, 0xFFFFFFFFu}) {
+        REQUIRE(SUCCEEDED(l.alloc->Reset()));
+        REQUIRE(SUCCEEDED(l.list->Reset(l.alloc.Get(), nullptr)));
+        b = test::Transition(out.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        l.list->ResourceBarrier(1, &b);
+        REQUIRE(na::j2::RecordRcasForTests(dev, l.list.Get(), in.Get(), out.Get(), W, H, percent, fmt));
+        b = test::Transition(out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        l.list->ResourceBarrier(1, &b);
+        l.list->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
+        REQUIRE(SUCCEEDED(l.list->Close()));
+        d.queue->ExecuteCommandLists(1, lists);
+        d.WaitIdle();
+        REQUIRE(dev->GetDeviceRemovedReason() == S_OK);
+        std::vector<float> result(W * H);
+        uint8_t* pixels = nullptr;
+        REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&pixels))));
+        for (uint32_t yy = 0; yy < H; ++yy) for (uint32_t xx = 0; xx < W; ++xx) {
+            uint16_t rgba[4];
+            std::memcpy(rgba, pixels + fp.Offset + yy * fp.Footprint.RowPitch + xx * 8, 8);
+            result[yy * W + xx] = single(rgba[0]);
+            for (int channel = 0; channel < 3; ++channel)
+                CHECK(std::isfinite(single(rgba[channel])) && single(rgba[channel]) >= 0.0f);
+            CHECK(rgba[3] == half(float(xx % 8) / 8.0f));
+        }
+        rb->Unmap(0, nullptr);
+        const float contrast = result[y * W + 25] - result[y * W + 18];
+        CHECK(contrast >= previousContrast - 0.001f);
+        previousContrast = contrast;
+        CHECK(std::fabs(result[y * W + 5] - 0.25f) < 0.002f);
+        CHECK(std::fabs(result[y * W + 60] - 4.0f) < 0.05f);
+        if (percent == 100) CHECK(result == o);
+        if (percent == 101) for (size_t i = 0; i < result.size(); ++i) CHECK(std::fabs(result[i] - o[i]) < 0.02f);
+        if (percent == 150) { CHECK(contrast > baseContrast + 0.005f); c150 = contrast; }
+        if (percent == 200) { CHECK(contrast > c150); maximum = result; }
+        if (percent > 200) CHECK(result == maximum);
+        std::printf("RCAS %u%%: soft-edge contrast %.6f (100%% %.6f)\n", percent, contrast, baseContrast);
+    }
     return test::finish("j2_rcas_test");
 }

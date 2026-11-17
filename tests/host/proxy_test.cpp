@@ -32,6 +32,7 @@ int wmain(int argc, wchar_t** argv)
     REQUIRE(create0 && create1 && create2 && query);
     CHECK(GetProcAddress(proxy, "DXGIGetDebugInterface1") != nullptr);
     CHECK(GetProcAddress(proxy, "DXGIDeclareAdapterRemovalSupport") != nullptr);
+    CHECK(GetProcAddress(proxy, "DXGIDisableVBlankVirtualization") != nullptr);
 
     abundance::ProxyStatus st{}; st.size = sizeof(st);
     REQUIRE(query(&st) == 1);

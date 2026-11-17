@@ -112,6 +112,9 @@ void InitializeTiming() {
 }
 uint64_t fiber_frame() {
     if (!attached.load(std::memory_order_acquire)) return 0;
+#if !defined(_M_X64)
+    return 0; // the fiber context read below is the x64 layout of a 64-bit game
+#else
     // Engine jobs are fibers: OS-thread TLS does not follow a suspended job.
     // The pinned 0x1e56314 getter reads slot 2 from the current fiber context.
     // Validate its key, never fall back to a process-global latest frame.
@@ -128,6 +131,7 @@ uint64_t fiber_frame() {
         const auto id = *reinterpret_cast<const uint64_t*>(params);
         return id != UINT64_MAX ? id+1 : 0;
     } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+#endif
 }
 uint64_t TimingRenderFrame() {
     const auto frame=present_id ? present_id : fiber_frame();

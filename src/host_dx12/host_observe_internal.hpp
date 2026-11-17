@@ -4,7 +4,7 @@
 //
 // Transport (A24): per-producer-thread SPSC byte rings, claimed once per
 // thread by CAS, drained by the single worker. Producers never lock, allocate
-// or wait. Up to 32 producer threads; further threads drop with loss
+// or wait. Up to 64 producer threads; further threads drop with loss
 // accounting. Semantics (framing, loss, epochs, status) are unchanged from
 // the frozen contract and covered by the same tests.
 #pragma once
@@ -24,6 +24,10 @@ bool Emit(const void* event_bytes, uint32_t group);
 
 // True while a consumer is started: producers skip building events otherwise.
 bool Started();
+// Event kinds the consumer declared it does not read (na_observe_skip_kinds): producers keep
+// their own bookkeeping but neither number nor emit such an event, so the consumer sees no
+// sequence gap and the rings carry only what is read.
+bool KindSkipped(uint32_t kind);
 // Current session and epoch (0, 0 when stopped): sample leases are scoped to them.
 void CurrentScope(na_session_id* session, na_epoch* epoch);
 

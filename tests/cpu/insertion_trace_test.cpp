@@ -61,5 +61,43 @@ int main() {
         check(final.boundary_writer == 200 && final.writer_occurrence == 2,
               "repeated producer boundaries remain distinguishable");
     }
+    // Alternate between two proven endings of the same scene. A middle-class
+    // consumer can use the remembered ending, but never an unknown writer,
+    // another target, or another occurrence of the same writer.
+    na::j2::LearnedInsertion previous{1, 2, {}};
+    previous.decision.final_candidate = previous.decision.final_transition = 2;
+    previous.decision.boundary_writer = 100;
+    previous.decision.writer_occurrence = 1;
+    previous.decision.destination = 3;
+    previous.decision.pipeline = 20;
+    auto remembered = previous;
+    remembered.decision.boundary_writer = 200;
+    auto current = remembered.decision;
+    check(na::j2::FindBoundary(previous, &remembered, 1, 1, 2, current) == &remembered,
+          "previously delivered alternate ending wins over previous frame");
+    current.boundary_writer = 300;
+    check(!na::j2::FindBoundary(previous, &remembered, 1, 1, 2, current), "unknown writer cannot use a remembered ending");
+    current = remembered.decision;
+    ++current.writer_occurrence;
+    check(!na::j2::FindBoundary(previous, &remembered, 1, 1, 2, current), "another writer occurrence remains ineligible");
+    current = remembered.decision;
+    check(!na::j2::FindBoundary(previous, &remembered, 1, 1, 9, current), "another depth cannot use the ending");
+    {
+        // A scene ending placed after its known last list (scene-end/known-ending): what the
+        // lists already present in the same submission say about it.
+        using na::j2::ColorEvent; using na::j2::Op;
+        const auto ev = [](bool write, Op op) { ColorEvent c; c.write = write; c.op = op; return c; };
+        check(na::j2::SceneTailVerdict({}) == 0, "an empty later list does not move the ending");
+        check(na::j2::SceneTailVerdict({ev(false, Op::GraphicsRead), ev(false, Op::ComputeRead)}) == 0,
+              "a reader still being learned does not move the ending");
+        check(na::j2::SceneTailVerdict({ev(false, Op::GraphicsRead), ev(true, Op::DrawWrite)}) == 1,
+              "a later scene draw in the same submission defers the ending");
+        check(na::j2::SceneTailVerdict({ev(false, Op::CopyRead), ev(true, Op::DrawWrite)}) == -1,
+              "a draw after the picture was copied onward is reuse, not continuation");
+        check(na::j2::SceneTailVerdict({ev(true, Op::ClearWrite), ev(true, Op::CopyWrite)}) == 0,
+              "clears and copies into the colour are not scene continuation");
+        // Only delivered endings count for it: an empty previous-frame slot never matches.
+        check(!na::j2::FindBoundary({}, nullptr, 0, 1, 2, current), "no delivered ending, no placement");
+    }
     return failures ? 1 : 0;
 }

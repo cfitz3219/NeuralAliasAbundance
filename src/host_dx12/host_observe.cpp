@@ -36,14 +36,23 @@ namespace {
 
 using na::observe_internal::SnapshotFn;
 
-constexpr uint32_t kDefaultBudgetMiB = 32;
+// 64 rings x 1 MiB (2026-11-05: SE5 records on ~35 threads; with 32 rings every event from
+// the remaining threads was dropped, each drop a burst of shared atomics plus a loss mark).
+constexpr uint32_t kDefaultBudgetMiB = 64;
 constexpr uint32_t kMaxBatchBytes = 64 * 1024;
-constexpr uint32_t kRings = 32;               // claimed thread ids per session
+constexpr uint32_t kRings = 64;               // claimed thread ids per session
 constexpr size_t kMinRingBytes = 2 * kMaxBatchBytes; // one max event must fit
 
+// One ring per recording thread. Each ring sits on its own cache lines (the producer
+// writes head/in_emit, the worker writes tail): neighbouring rings no longer share a line,
+// so game threads recording in parallel do not bounce each other's caches on every event.
+// (Explicit padding, not alignas: MSVC /W4 /WX rejects padding added by alignment, C4324.)
 struct Ring {
+    char lead_pad[64];                // keeps the previous ring's tail/buf off this ring's head line
     std::atomic<DWORD> owner{0};
+    std::atomic<uint32_t> in_emit{0}; // R2 quiescence, per ring (owner thread only increments)
     std::atomic<uint64_t> head{0};
+    char mid_pad[64 - sizeof(std::atomic<DWORD>) - sizeof(std::atomic<uint32_t>) - sizeof(std::atomic<uint64_t>)];
     std::atomic<uint64_t> tail{0};
     std::vector<uint8_t> buf;
 };
@@ -59,13 +68,12 @@ struct HostState {
     std::vector<uint8_t> queue;       // worker-private staging
     Ring rings[kRings];
     size_t ring_bytes = 0;
-    std::atomic<uint64_t> pending_bytes{0};
     std::mutex control_m;             // snapshot lane (lifecycle threads only)
     std::deque<ControlEntry> control;
     std::atomic<uint32_t> control_count{0};
     std::atomic<bool> started{false};
     std::atomic<bool> stopping{false};
-    std::atomic<uint32_t> active_producers{0}; // R2 quiescence counter
+    std::atomic<uint32_t> active_producers{0}; // R2 quiescence counter (emits without a ring; rings count their own)
     // T2: lifecycle generation. Bumped at every start and stop; a producer
     // records it before admission and bails after counting itself in if it
     // changed, so an admission attempt from an old session can never land in
@@ -147,7 +155,7 @@ void append_loss_mark(std::vector<uint8_t>& out, uint32_t group, uint32_t founda
     out.insert(out.end(), p, p + sizeof(ev));
 }
 
-void deliver_batch(std::vector<uint8_t>& payload, uint32_t flags, na_epoch batch_epoch)
+void deliver_batch(std::vector<uint8_t>& payload, uint32_t flags, na_epoch batch_epoch, std::vector<uint8_t>& batch)
 {
     na_event_batch hdr{};
     hdr.header_bytes = sizeof(na_event_batch);
@@ -165,7 +173,7 @@ void deliver_batch(std::vector<uint8_t>& payload, uint32_t flags, na_epoch batch
     hdr.event_count = count;
     hdr.batch_flags = flags;
 
-    std::vector<uint8_t> batch(sizeof(hdr) + payload.size());
+    batch.resize(sizeof(hdr) + payload.size());
     std::memcpy(batch.data(), &hdr, sizeof(hdr));
     if (!payload.empty()) std::memcpy(batch.data() + sizeof(hdr), payload.data(), payload.size());
     g_host.sink(reinterpret_cast<const na_event_batch*>(batch.data()), g_host.user);
@@ -224,7 +232,6 @@ void drain_rings(const uint64_t* limits)
         g_host.queue.insert(g_host.queue.end(), r.buf.data() + pos, r.buf.data() + pos + first);
         if (first < n) g_host.queue.insert(g_host.queue.end(), r.buf.data(), r.buf.data() + (n - first));
         r.tail.store(head, std::memory_order_release);
-        g_host.pending_bytes.fetch_sub(n, std::memory_order_acq_rel);
     }
 }
 
@@ -262,14 +269,36 @@ void gather()
     }
 }
 
+// Worker side: events waiting in any ring (producers no longer keep a shared byte
+// counter: one atomic every game thread wrote on every event).
+bool rings_pending()
+{
+    for (const Ring& r : g_host.rings)
+        if (r.head.load(std::memory_order_acquire) != r.tail.load(std::memory_order_relaxed)) return true;
+    return false;
+}
+bool producers_inside()
+{
+    if (g_host.active_producers.load(std::memory_order_seq_cst) != 0) return true;
+    for (const Ring& r : g_host.rings)
+        if (r.in_emit.load(std::memory_order_seq_cst) != 0) return true;
+    return false;
+}
+
 void worker_main()
 {
     g_host.worker_tid = GetCurrentThreadId();
+    // Worker-private buffers retain capacity across deliveries. Walk each
+    // gathered backlog once: erasing its first 64 KiB after every callback
+    // repeatedly moved all remaining bytes (quadratic work under load).
+    std::vector<uint8_t> payload, batch;
+    payload.reserve(kMaxBatchBytes + 16 * sizeof(na_ev_loss_mark));
+    batch.reserve(sizeof(na_event_batch) + payload.capacity());
     std::unique_lock<std::mutex> lock(g_host.mutex);
     for (;;) {
         g_host.cv.wait_for(lock, std::chrono::milliseconds(50), [] {
             return g_host.stopping.load(std::memory_order_acquire) ||
-                   g_host.pending_bytes.load(std::memory_order_acquire) != 0 ||
+                   rings_pending() ||
                    g_host.control_count.load(std::memory_order_acquire) != 0 ||
                    g_host.pending_loss_mark.load(std::memory_order_acquire) != 0;
         });
@@ -278,16 +307,17 @@ void worker_main()
             // R2: no producer may still be inside emit when we take the final
             // view of the rings. Producers are bounded (a memcpy), so this is
             // short; it is a lifecycle wait, never a hook-path wait.
-            while (g_host.active_producers.load(std::memory_order_acquire) != 0) YieldProcessor();
+            while (producers_inside()) YieldProcessor();
         }
         gather();
+        size_t consumed = 0;
         do {
-            std::vector<uint8_t> payload;
+            payload.clear();
             na_epoch batch_epoch = g_host.epoch.load(std::memory_order_acquire);
             size_t take = 0;
             bool first = true;
-            while (take < g_host.queue.size()) {
-                const auto* eh = reinterpret_cast<const na_event_header*>(g_host.queue.data() + take);
+            while (consumed + take < g_host.queue.size()) {
+                const auto* eh = reinterpret_cast<const na_event_header*>(g_host.queue.data() + consumed + take);
                 if (first) {
                     batch_epoch = eh->epoch;
                     first = false;
@@ -300,19 +330,21 @@ void worker_main()
             if (batch_epoch == g_host.epoch.load(std::memory_order_acquire)) {
                 uint32_t marks = g_host.pending_loss_mark.exchange(0, std::memory_order_acq_rel);
                 uint32_t fmarks = g_host.pending_loss_foundational.exchange(0, std::memory_order_acq_rel);
-                std::vector<uint8_t> mark_bytes;
                 for (uint32_t g = 0; g < 16; ++g)
-                    if (marks & (1u << g)) append_loss_mark(mark_bytes, g, (fmarks >> g) & 1u);
-                payload.insert(payload.end(), mark_bytes.begin(), mark_bytes.end());
+                    if (marks & (1u << g)) append_loss_mark(payload, g, (fmarks >> g) & 1u);
             }
-            payload.insert(payload.end(), g_host.queue.begin(), g_host.queue.begin() + take);
-            g_host.queue.erase(g_host.queue.begin(), g_host.queue.begin() + take);
+            payload.insert(payload.end(), g_host.queue.begin() + consumed, g_host.queue.begin() + consumed + take);
+            consumed += take;
+            if (consumed == g_host.queue.size()) {
+                g_host.queue.clear();
+                consumed = 0;
+            }
             if (final_pass) gather();
-            bool more = !g_host.queue.empty();
+            bool more = consumed < g_host.queue.size();
             uint32_t flags = (final_pass && !more) ? NA_BATCHF_FINAL : 0;
             if (!payload.empty() || flags) {
                 lock.unlock();
-                deliver_batch(payload, flags, batch_epoch);
+                deliver_batch(payload, flags, batch_epoch, batch);
                 lock.lock();
             }
             if (!more) break;
@@ -325,8 +357,13 @@ Ring* thread_ring()
 {
     thread_local Ring* ring = nullptr;
     thread_local uint64_t ring_session = 0;
+    thread_local uint64_t no_ring_session = 0; // every ring was owned when this thread asked
     uint64_t session = g_host.session.load(std::memory_order_acquire);
     if (ring && ring_session == session) return ring;
+    // Owners are released only when a session starts (new session id), so a thread that found
+    // all rings taken stays without one for the rest of the session: do not scan and CAS all
+    // of them again on every event.
+    if (!ring && session && no_ring_session == session) return nullptr;
     ring = nullptr;
     DWORD tid = GetCurrentThreadId();
     for (Ring& r : g_host.rings) {
@@ -338,6 +375,7 @@ Ring* thread_ring()
             break;
         }
     }
+    if (!ring) no_ring_session = session;
     return ring;
 }
 
@@ -370,20 +408,24 @@ bool emit_ring(const void* bytes, uint32_t group)
     bool foundational = (hdr->flags & NA_EVF_FOUNDATIONAL) != 0;
     const uint64_t gen = g_host.generation.load(std::memory_order_acquire);
     if (!g_host.started.load(std::memory_order_acquire)) return false;
-    g_host.active_producers.fetch_add(1, std::memory_order_acq_rel);
-    struct Leave { ~Leave() { g_host.active_producers.fetch_sub(1, std::memory_order_acq_rel); } } leave;
-    if (g_host.generation.load(std::memory_order_acquire) != gen ||
-        !g_host.started.load(std::memory_order_acquire) ||
-        g_host.stopping.load(std::memory_order_acquire))
-        return false; // lifecycle moved under us: not admitted
     bool malformed = hdr->size_bytes < sizeof(na_event_header) || (hdr->size_bytes % 8) != 0 ||
                      hdr->size_bytes > kMaxBatchBytes;
     Ring* ring = malformed ? nullptr : thread_ring();
+    // R2: counted in on this thread's own ring (no shared line); emits without a ring use the global count.
+    std::atomic<uint32_t>& inside = ring ? ring->in_emit : g_host.active_producers;
+    inside.fetch_add(1, std::memory_order_seq_cst);
+    struct Leave { std::atomic<uint32_t>& c; ~Leave() { c.fetch_sub(1, std::memory_order_seq_cst); } } leave{inside};
+    if (g_host.generation.load(std::memory_order_seq_cst) != gen ||
+        !g_host.started.load(std::memory_order_seq_cst) ||
+        g_host.stopping.load(std::memory_order_seq_cst))
+        return false; // lifecycle moved under us: not admitted
     bool overflow = malformed || !ring;
+    uint64_t used_before = 0;
     if (ring && !overflow) {
         uint64_t head = ring->head.load(std::memory_order_relaxed);
         uint64_t tail = ring->tail.load(std::memory_order_acquire);
-        if (ring->buf.size() - (head - tail) < hdr->size_bytes) overflow = true;
+        used_before = head - tail;
+        if (ring->buf.size() - used_before < hdr->size_bytes) overflow = true;
     }
     if (foundational && g_host.force_foundational_overflow.load(std::memory_order_acquire)) overflow = true;
     if (overflow) {
@@ -403,9 +445,16 @@ bool emit_ring(const void* bytes, uint32_t group)
     };
     put(reinterpret_cast<const uint8_t*>(&stamped), sizeof(stamped), head);
     put(static_cast<const uint8_t*>(bytes) + sizeof(stamped), size - sizeof(stamped), head + sizeof(stamped));
-    g_host.pending_bytes.fetch_add(size, std::memory_order_acq_rel); // before publish: no underflow
     ring->head.store(head + size, std::memory_order_release);
-    g_host.cv.notify_one();
+    // Wake the worker only at boundaries that complete something (a submission, a fence,
+    // a present), for foundational events, or once this ring is a quarter full (three
+    // quarters of headroom while it drains, so no more drops than before). It also wakes on
+    // its own every 50 ms. The worker receives the same events in the same order, only in
+    // larger batches. Waking it on every recorded call (about a million times a second in a
+    // heavy scene) cost every game thread a kernel wake path per draw.
+    const bool wake = foundational || hdr->kind == NA_EV_QUEUE_EXECUTE || hdr->kind == NA_EV_PRESENT ||
+                      hdr->kind == NA_EV_QUEUE_SIGNAL || (used_before + size) * 4 >= cap;
+    if (wake) g_host.cv.notify_one();
     return true;
 }
 
@@ -490,6 +539,8 @@ bool run_snapshot()
 namespace na::observe_internal {
 
 bool Emit(const void* event_bytes, uint32_t group) { return emit_ring(event_bytes, group); }
+std::atomic<uint64_t> g_skip_kinds{0};
+bool KindSkipped(uint32_t kind) { return kind < 64 && (g_skip_kinds.load(std::memory_order_relaxed) >> kind) & 1u; }
 void CurrentScope(na_session_id* session, na_epoch* epoch)
 {
     const bool on = Started();
@@ -536,7 +587,7 @@ int __cdecl na_observe_start(const na_observe_config* cfg, na_event_sink sink, v
         g_host.user = user;
         size_t budget = static_cast<size_t>(budget_mib) * 1024 * 1024;
         // Budget floor: every ring must hold one maximum event; the effective
-        // minimum total is kRings * kMinRingBytes (4 MiB), documented.
+        // minimum total is kRings * kMinRingBytes (8 MiB), documented.
         g_host.ring_bytes = std::max(kMinRingBytes, budget / kRings);
         for (Ring& r : g_host.rings) {
             r.owner.store(0);
@@ -544,7 +595,6 @@ int __cdecl na_observe_start(const na_observe_config* cfg, na_event_sink sink, v
             r.tail.store(0);
             r.buf.assign(g_host.ring_bytes, 0);
         }
-        g_host.pending_bytes.store(0);
         g_host.queue.clear();
         {
             std::lock_guard<std::mutex> cl(g_host.control_m);
@@ -572,14 +622,21 @@ int __cdecl na_observe_start(const na_observe_config* cfg, na_event_sink sink, v
     return NA_OK;
 }
 
+int __cdecl na_observe_skip_kinds(uint64_t mask)
+{
+    na::observe_internal::g_skip_kinds.store(mask, std::memory_order_relaxed);
+    return NA_OK;
+}
+
 int __cdecl na_observe_stop(void)
 {
+    na::observe_internal::g_skip_kinds.store(0, std::memory_order_relaxed);
     if (GetCurrentThreadId() == g_host.worker_tid) return NA_E_STATE;
     std::thread joiner;
     {
         std::lock_guard<std::mutex> lock(g_host.mutex);
         if (!g_host.started.load()) return NA_E_STATE;
-        g_host.stopping.store(true, std::memory_order_release); // closes admission
+        g_host.stopping.store(true, std::memory_order_seq_cst); // closes admission (pairs with the seq_cst count-in in emit_ring)
         g_host.cv.notify_one();
         joiner = std::move(g_host.worker);
     }
