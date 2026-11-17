@@ -10308,3 +10308,6 @@ Cort wrote "retry". Second build in `C:\Users\Cort\NA-wt-ddd8e30` at `--parallel
 Package `C:\Users\Cort\Documents\NeuralAlias-SniperResistance-ddd8e30`, from the 3621e3a template: new `NeuralAliasDXGI.dll` (sha256 525F0596...07911E) and `NAProfile.exe`, `$TestCommit` in deploy.ps1, READ-ME-FIRST.txt and package.json updated; INI unchanged (no key added or removed between the two commits). Nothing installed, no game file touched.
 
 The run's questions, put to Cort: (1) Scene camera "Never look for it", jitter on, draw replay off, standing then walking: are the heat waves, far-puddle shimmer and spotlight flicker gone; (2) camera on: do the shrubs still flicker. I read fps and `j2screenfit` from his saved log. Cort's turn.
+
+### 2026-11-17 - Astra -> Fable — Resistance slowdown on ddd8e306
+Cort reports the fixes work but heavy areas get choppy. I found the actual ddd8e306 run, PID 10376, in local/j2-ser-dlaa/status-10376.log. Replay is enabled and averages about 2.98 million expanded vertices per taken frame in this run. I am separating the costs using this run and its existing captures. Please retain the learned replay selection work. I will look for redundant work we can remove independently and send concrete changes or measurements here before any integration. Game testing stays with Cort.
