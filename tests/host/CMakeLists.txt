@@ -82,6 +82,10 @@ if(NA_HAVE_NGX_SDK)
   add_test(NAME host_auto_scene_proxy_present_test COMMAND auto_scene_test --proxy-present)
   set_tests_properties(host_auto_scene_proxy_present_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_compute_flow_test SOURCES j2_compute_flow_test.cpp LIBS host_dx12 LABELS gpu)
+  # The same fixture at 1920x1080, the size a game runs at (R3 of the 2026-11-16 audit). Real GPU
+  # only, like the line above: the AMD search needs 32/64-lane wave operations.
+  add_test(NAME host_j2_compute_flow_1080p_test COMMAND j2_compute_flow_test 1920)
+  set_tests_properties(host_j2_compute_flow_1080p_test PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
   na_host_test(draw_replay_test SOURCES draw_replay_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
 endif()
