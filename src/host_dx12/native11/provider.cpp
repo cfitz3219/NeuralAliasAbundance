@@ -70,7 +70,49 @@ enum CtxSlot : uint32_t {
 };
 enum SwapSlot : uint32_t { kPresent = 8, kResizeBuffers = 13, kPresent1 = 22 };
 
-constexpr size_t kMaxCbBytes = 64 * 1024;  // include a camera slice within a D3D11.1 upload ring
+constexpr size_t kMaxCbBytes = 64 * 1024; // unchanged whole-buffer path
+constexpr uint32_t kLargeCbWindowBytes = 16 * 1024;
+constexpr uint32_t kLargeCbDriftBytes = 2 * 1024; // adjacent offsets in a reused upload ring
+struct CaptureWindow { uint32_t begin = 0, size = 0; };
+constexpr size_t kLargeCbWindowCount = 4;
+constexpr uint32_t kLargeCbTotalBytes = 32 * 1024;
+struct CaptureWindows {
+    std::array<CaptureWindow, kLargeCbWindowCount> ranges{};
+    size_t count = 0;
+    uint32_t bytes = 0;
+
+    void Remember(CaptureWindow window)
+    {
+        if (!window.size) return;
+        for (size_t i = 0; i < count; ++i) {
+            const auto& saved = ranges[i];
+            const uint32_t begin = std::min(saved.begin, window.begin);
+            const uint32_t end = std::max(saved.begin + saved.size, window.begin + window.size);
+            if (std::max(saved.begin, window.begin) > std::min(saved.begin + saved.size, window.begin + window.size) ||
+                end - begin > kLargeCbWindowBytes ||
+                bytes - saved.size + (end - begin) > kLargeCbTotalBytes) continue;
+            bytes = bytes - saved.size + (end - begin);
+            ranges[i] = {begin, end - begin};
+            return;
+        }
+        if (count < ranges.size() && bytes + window.size <= kLargeCbTotalBytes) {
+            ranges[count++] = window;
+            bytes += window.size;
+        }
+    }
+};
+using CameraBytes = std::shared_ptr<const std::vector<uint8_t>>;
+struct CameraUpload {
+    uint32_t version = 0;
+    CameraBytes bytes;
+    uint32_t first_constant = 0; // position of bytes[0] in the real buffer
+    bool windowed = false;
+};
+struct CameraUploads {
+    CameraUpload primary;
+    std::vector<CameraUpload> additional;
+};
+using DeferredUpload = std::pair<size_t, CameraUploads>;
 constexpr size_t kMaxListEvents = 200000; // per deferred recording; beyond this the list's tail is not modelled
 constexpr size_t kMaxCandidates = 8;       // constant buffers searched for the camera (VS and PS)
 constexpr size_t kMaxLists = 512;          // recorded command lists kept
@@ -90,7 +132,7 @@ struct Ctx {
     uint64_t vpj_sample = 0;          // the exact sample they carry
     uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
-    std::vector<std::pair<size_t, std::vector<uint8_t>>> cb_bytes; // (event index, bytes) for CbUpdate events
+    std::vector<DeferredUpload> cb_bytes; // (event index, bytes) for CbUpdate events
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
     void reset_state()
     {
@@ -107,7 +149,7 @@ struct Ctx {
 };
 struct ListRecord {
     std::vector<Event> events;
-    std::vector<std::pair<size_t, std::vector<uint8_t>>> cb_bytes;
+    std::vector<DeferredUpload> cb_bytes;
     uint64_t order = 0;
 };
 // The view the scene used on a selected texture (typed format, subresource).
@@ -128,13 +170,14 @@ IDXGISwapChain* g_swap = nullptr; // identity only
 std::atomic<Id> g_sel_color{0};    // readable from any thread
 
 std::atomic<Id> g_cand[kMaxCandidates + 1] = {};
-using CameraBytes = std::shared_ptr<const std::vector<uint8_t>>;
-struct CameraUpload { uint32_t version = 0; CameraBytes bytes; };
+// Only populated by uploads larger than kMaxCbBytes. An empty window
+// means the scene has not yet supplied a bounded range for that buffer.
+std::unordered_map<Id, CaptureWindows> g_large_cb_windows;
 using BindingKey = std::tuple<Id, int, uint32_t, uint32_t>;
 std::map<BindingKey, CameraUpload> g_scene_uploads;
 struct SplitVote {
     FrameModel::CameraBinding projection{};
-    CameraBytes projection_bytes;
+    CameraUpload projection_upload;
     Id world_buffer = 0;
     uint32_t draws = 0;
 };
@@ -148,7 +191,7 @@ SplitDraw g_split_draw;
 Id g_split_world = 0;
 std::atomic<Id> g_split_candidate{0};
 std::atomic<bool> g_collect_camera{true};
-std::unordered_map<Id, CameraUpload> g_cb_latest;
+std::unordered_map<Id, CameraUploads> g_cb_latest;
 std::unordered_map<Id, uint64_t> g_cb_incarnation; // candidate camera buffers: lifetime id, tagged at upload (live object)
 
 ComPtr<ID3D11Resource> g_color_ref, g_depth_ref;
@@ -397,7 +440,75 @@ std::vector<uint8_t> BoundCameraBytes(const uint8_t* bytes, size_t size, uint32_
     const size_t length = count ? std::min(size_t(count) * 16, size - offset) : size - offset;
     return {bytes + offset, bytes + offset + length};
 }
-bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uint8_t>*& bytes,
+// Large-buffer snapshots must contain the entire shader-visible range.
+// Normal uploads retain their existing range semantics.
+bool UploadRange(const CameraUpload& upload, uint32_t first, uint32_t count, size_t& start, size_t& length)
+{
+    if (!upload.bytes || first < upload.first_constant) return false;
+    if (!SplitBoundRange(upload.bytes->size(), first - upload.first_constant, count, start, length)) return false;
+    return !upload.windowed || (count && length == size_t(count) * 16);
+}
+
+void LearnLargeCbWindows()
+{
+    if (g_large_cb_windows.empty()) return;
+    decltype(g_large_cb_windows) next;
+    const auto& selection = g_model.Current();
+    auto bindings = g_model.SceneCameraBindings();
+    // Prefer the binding that supplied a qualified camera. Remaining ranges
+    // must be used by a meaningful share of scene draws, not one object draw.
+    const auto camera = [&](const auto& binding) {
+        return binding.buffer == selection.camera_cb && binding.slot == selection.camera_slot &&
+               binding.first == g_camera_first && binding.count == g_camera_num;
+    };
+    std::stable_partition(bindings.begin(), bindings.end(), camera);
+    for (const auto& binding : bindings) {
+        if (next.size() >= kMaxCandidates && !next.count(binding.buffer)) continue;
+        if (!binding.count || binding.count > kLargeCbWindowBytes / 16 ||
+            binding.first > UINT32_MAX / 16 - binding.count ||
+            !g_large_cb_windows.count(binding.buffer) ||
+            (!camera(binding) && binding.draws * uint64_t{4} < g_model.SceneDrawsThisFrame())) continue;
+        const uint32_t begin = binding.first * 16;
+        const uint32_t length = binding.count * 16;
+        const uint32_t padding = std::min(kLargeCbDriftBytes, (kLargeCbWindowBytes - length) / 2);
+        const uint32_t window_begin = begin > padding ? begin - padding : 0;
+        const uint32_t trailing = std::min(padding, UINT32_MAX - begin - length);
+        next[binding.buffer].Remember({window_begin, begin + length + trailing - window_begin});
+    }
+    // The same ring can alternate between disjoint regions. Keep recent
+    // windows behind this frame's strongest evidence, within the copy budget.
+    for (auto& [id, windows] : next) {
+        const auto& previous = g_large_cb_windows.at(id);
+        for (size_t i = 0; i < previous.count; ++i) windows.Remember(previous.ranges[i]);
+    }
+    g_large_cb_windows.swap(next);
+}
+
+CaptureWindows CameraWindows(Id id)
+{
+    std::lock_guard<std::mutex> l(g_mu);
+    const auto it = g_large_cb_windows.find(id);
+    if (it != g_large_cb_windows.end()) return it->second;
+    if (g_large_cb_windows.size() < 64) g_large_cb_windows.try_emplace(id);
+    return {};
+}
+
+const CameraUpload* UploadForDraw(Id id, uint32_t first, uint32_t count)
+{
+    const auto found = g_cb_latest.find(id);
+    if (found == g_cb_latest.end()) return nullptr;
+    const auto& uploads = found->second;
+    const uint32_t version = g_model.CbVersion(id);
+    if (uploads.primary.version != version) return nullptr;
+    if (!uploads.primary.windowed) return &uploads.primary;
+    size_t start = 0, length = 0;
+    if (UploadRange(uploads.primary, first, count, start, length)) return &uploads.primary;
+    for (const auto& upload : uploads.additional)
+        if (UploadRange(upload, first, count, start, length)) return &upload;
+    return &uploads.primary; // retains provenance for diagnostics, but range admission will reject it
+}
+
+bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const CameraUpload*& upload,
                  uint64_t& version, std::optional<CameraFacts::RelativePose>& pose)
 {
     // VARIANT: camera/relative (the rule itself is providers/camera/relative_camera.hpp)
@@ -428,7 +539,7 @@ bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uin
     g_camera_first = b.first;
     g_camera_num = b.count;
     g_split_world = best->world_buffer;
-    bytes = best->projection_bytes.get();
+    upload = &best->projection_upload;
     version = b.version;
     return true;
 }
@@ -440,14 +551,14 @@ bool SplitCamera(uint32_t w, uint32_t h, CameraPick& pick, const std::vector<uin
 // one camera over consecutive scene frames. Only the list of bound ranges is DX11's own.
 // The ranges this scene's draws bound, as the shared camera rules take them (best-ranked first).
 void SceneBlocks(const std::vector<FrameModel::CameraBinding>& bindings, std::vector<camera::AdmissionBlock>& blocks,
-                 std::vector<size_t>& source, std::vector<const std::vector<uint8_t>*>& uploads)
+                 std::vector<size_t>& source, std::vector<const CameraUpload*>& uploads)
 {
     for (size_t i = 0; i < bindings.size() && blocks.size() < camera::NoInverseCamera::kMaxBlocks; ++i) {
         const auto& b = bindings[i];
         const auto it = g_scene_uploads.find({b.buffer, b.slot, b.first, b.count});
         if (it == g_scene_uploads.end() || it->second.version != b.version || !it->second.bytes) continue;
         size_t start = 0, length = 0;
-        if (!SplitBoundRange(it->second.bytes->size(), b.first, b.count, start, length)) continue;
+        if (!UploadRange(it->second, b.first, b.count, start, length)) continue;
         camera::AdmissionBlock block;
         // The place as the shaders see it: stage and slot, and the bound range. Never the buffer.
         block.slot.binding = static_cast<uint64_t>(b.slot);
@@ -457,15 +568,15 @@ void SceneBlocks(const std::vector<FrameModel::CameraBinding>& bindings, std::ve
         block.size = length;
         blocks.push_back(block);
         source.push_back(i);
-        uploads.push_back(it->second.bytes.get());
+        uploads.push_back(&it->second);
     }
 }
 bool AdmitWithoutInverse(const std::vector<FrameModel::CameraBinding>& bindings, uint32_t w, uint32_t h, CameraPick* out,
-                         const std::vector<uint8_t>** bytes_out, uint64_t* version_out, PoseCheck& result)
+                         const CameraUpload** upload_out, uint64_t* version_out, PoseCheck& result)
 {
     std::vector<camera::AdmissionBlock> blocks;
     std::vector<size_t> source;                       // blocks[i] came from bindings[source[i]]
-    std::vector<const std::vector<uint8_t>*> uploads; // ... and these kept bytes
+    std::vector<const CameraUpload*> uploads; // ... and these kept bytes
     SceneBlocks(bindings, blocks, source, uploads);
     const camera::Admission a = g_no_inverse.Admit(blocks, w, h, g_frame);
     if (a.how == camera::Admitted::None) {
@@ -491,13 +602,13 @@ bool AdmitWithoutInverse(const std::vector<FrameModel::CameraBinding>& bindings,
     g_camera_first = b.first;
     g_camera_num = b.count;
     *out = pick;
-    *bytes_out = uploads[a.block];
+    *upload_out = uploads[a.block];
     *version_out = b.version;
     return true;
 }
 
 // The camera for this frame (under g_mu): the learned block re-read, else a search of the candidates.
-bool CameraSearch(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out,
+bool CameraSearch(CameraPick* out, const CameraUpload** upload_out, uint64_t* version_out,
                   PoseCheck& result, std::optional<CameraFacts::RelativePose>& split_pose)
 {
     const Selection& s = g_model.Current();
@@ -505,7 +616,7 @@ bool CameraSearch(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint6
     const uint32_t h = g_scene_vp_h >= 1.f ? static_cast<uint32_t>(g_scene_vp_h + 0.5f) : s.color_info.height;
     // Prefer the stable split source when viewport jitter owns raster positioning.
     const auto split = [&] {
-        if (!SplitCamera(w, h, *out, *bytes_out, *version_out, split_pose)) return false;
+        if (!SplitCamera(w, h, *out, *upload_out, *version_out, split_pose)) return false;
         result = PoseCheck::Native;
         return true;
     };
@@ -521,8 +632,10 @@ bool CameraSearch(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint6
     for (const auto& b : bindings) {
         const auto it = g_scene_uploads.find({b.buffer, b.slot, b.first, b.count});
         if (it == g_scene_uploads.end() || it->second.version != b.version || !it->second.bytes) continue;
-        const auto* bytes = it->second.bytes.get();
-        const auto bound = BoundCameraBytes(bytes->data(), bytes->size(), b.first, b.count);
+        const auto& upload = it->second;
+        size_t start = 0, length = 0;
+        if (!UploadRange(upload, b.first, b.count, start, length)) continue;
+        const std::vector<uint8_t> bound(upload.bytes->data() + start, upload.bytes->data() + start + length);
         PoseCheck check = PoseCheck::NoPacket;
         const CameraPick p = PickForScene(bound, g_camera, is_learned(b), w, h, g_frame + 1, check);
         if (!p.found) {
@@ -535,12 +648,12 @@ bool CameraSearch(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint6
         g_camera_first = b.first;
         g_camera_num = b.count;
         *out = p;
-        *bytes_out = bytes;
+        *upload_out = &upload;
         *version_out = b.version;
         return true;
     }
     if (!viewport && split()) return true;
-    if (AdmitWithoutInverse(bindings, w, h, out, bytes_out, version_out, result)) return true;
+    if (AdmitWithoutInverse(bindings, w, h, out, upload_out, version_out, result)) return true;
     g_camera = {};
     g_model.SetCamera(0, -1);
     return false;
@@ -589,7 +702,7 @@ void LearnRelativeLayout(bool found, const CameraPick& cam)
     const uint32_t h = g_scene_vp_h >= 1.f ? static_cast<uint32_t>(g_scene_vp_h + 0.5f) : s.color_info.height;
     std::vector<camera::AdmissionBlock> blocks;
     std::vector<size_t> source;
-    std::vector<const std::vector<uint8_t>*> uploads;
+    std::vector<const CameraUpload*> uploads;
     SceneBlocks(g_model.SceneCameraBindings(), blocks, source, uploads);
     if (g_rel_learner.FindProjection(blocks, w, h)) return;
     g_rel_wait = 64; // not a camera-relative scene, or no block that says which matrix is this frame's
@@ -600,10 +713,10 @@ void LearnRelativeLayout(bool found, const CameraPick& cam)
     }
 }
 
-bool CameraNow(CameraPick* out, const std::vector<uint8_t>** bytes_out, uint64_t* version_out,
+bool CameraNow(CameraPick* out, const CameraUpload** upload_out, uint64_t* version_out,
                PoseCheck& result, std::optional<CameraFacts::RelativePose>& split_pose)
 {
-    const bool found = CameraSearch(out, bytes_out, version_out, result, split_pose);
+    const bool found = CameraSearch(out, upload_out, version_out, result, split_pose);
     LearnRelativeLayout(found, *out);
     if (!found) return false;
     // What the shared rules need to know about this game, whichever rule found the camera.
@@ -648,11 +761,11 @@ void DiagnoseCameraMiss()
     const auto cands = g_model.SceneCameraBindings();
     na::eventlog::Emit("native11_cam",
                        "frame=%llu colour=%ux%u fmt=%u depth=%ux%u fmt=%u scene_vp=%.0fx%.0f+%.0f+%.0f decode_wh=%ux%u scene_draws=%u "
-                       "cb_bindings=%zu ranked=%zu searched=%zu kept_buffers=%zu draw_snapshots=%zu learned_cb=%d",
+                       "cb_bindings=%zu ranked=%zu searched=%zu kept_buffers=%zu draw_snapshots=%zu learned_cb=%d large_mapped_buffers=%zu",
                        static_cast<unsigned long long>(g_frame), s.color_info.width, s.color_info.height, s.color_info.format,
                        s.depth_info.width, s.depth_info.height, s.depth_info.format, g_scene_vp_w, g_scene_vp_h, g_scene_vp_x,
                        g_scene_vp_y, w, h, g_model.SceneDrawsThisFrame(), g_model.CbSceneBindings(), g_model.RankedCandidates(),
-                       cands.size(), g_cb_latest.size(), g_scene_uploads.size(), s.camera_cb ? 1 : 0);
+                       cands.size(), g_cb_latest.size(), g_scene_uploads.size(), s.camera_cb ? 1 : 0, g_large_cb_windows.size());
     int rank = 0;
     for (const auto& c : cands) {
         if (++rank > 12) break;
@@ -660,20 +773,22 @@ void DiagnoseCameraMiss()
         const uint32_t version = c.version;
         const bool used = true;
         const auto latest = g_cb_latest.find(c.buffer);
-        const size_t kept = latest == g_cb_latest.end() ? 0 : (latest->second.bytes ? latest->second.bytes->size() : 0);
-        const uint32_t latest_version = latest == g_cb_latest.end() ? 0 : latest->second.version;
-        const std::vector<uint8_t>* bytes = nullptr;
+        const size_t kept = latest == g_cb_latest.end() ? 0 : (latest->second.primary.bytes ? latest->second.primary.bytes->size() : 0);
+        const uint32_t latest_version = latest == g_cb_latest.end() ? 0 : latest->second.primary.version;
+        const CameraUpload* upload = nullptr;
         const char* source = "no_draw_snapshot";
         const auto snap = g_scene_uploads.find({c.buffer, c.slot, c.first, c.count});
         if (snap != g_scene_uploads.end() && snap->second.version == version && snap->second.bytes) {
-            bytes = snap->second.bytes.get(); source = "scene_draw";
+            upload = &snap->second; source = "scene_draw";
         }
         const char* why = "-";
         const char* generic = "-";
         size_t bound_len = 0;
         std::vector<uint8_t> bound;
-        if (bytes) {
-            bound = BoundCameraBytes(bytes->data(), bytes->size(), first, count);
+        if (upload) {
+            size_t start = 0, length = 0;
+            if (UploadRange(*upload, first, count, start, length))
+                bound.assign(upload->bytes->data() + start, upload->bytes->data() + start + length);
             bound_len = bound.size();
             if (bound.empty()) why = "range_outside_kept_bytes";
             else {
@@ -686,10 +801,10 @@ void DiagnoseCameraMiss()
         const int stage_ps = c.slot >= kPsCbBase;
         na::eventlog::Emit("native11_cam",
                            "cand=%d cb=%llx stage=%s slot=%d draws=%u versions=%u used=%d bind_first=%u bind_count=%u kept=%zu "
-                           "version=%u latest_version=%u bytes=%s bound=%zu wwii_decode=%s generic=%s",
+                           "version=%u latest_version=%u bytes=%s bound=%zu wwii_decode=%s generic=%s captured_first=%u",
                            rank, static_cast<unsigned long long>(c.buffer), stage_ps ? "ps" : "vs",
                            stage_ps ? c.slot - kPsCbBase : c.slot, draws, versions, used ? 1 : 0, first, count, kept, version,
-                           latest_version, source, bound_len, why, generic);
+                           latest_version, source, bound_len, why, generic, upload ? upload->first_constant : 0u);
         if (dump && !bound.empty()) {
             static const char hex[] = "0123456789abcdef";
             const size_t n = (std::min)(bound.size(), size_t(1024));
@@ -716,11 +831,11 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         return SetReason("The scene colour or depth is not held from a live game view yet.");
     }
     CameraPick cam;
-    const std::vector<uint8_t>* bytes = nullptr;
+    const CameraUpload* upload = nullptr;
     uint64_t version = 0;
     PoseCheck pose_check = PoseCheck::NoPacket;
     std::optional<CameraFacts::RelativePose> split_pose;
-    const bool found = CameraNow(&cam, &bytes, &version, pose_check, split_pose);
+    const bool found = CameraNow(&cam, &upload, &version, pose_check, split_pose);
     CountPoseCheck(pose_check);
     if (!found) {
         ++g_stats.camera_missing;
@@ -758,13 +873,14 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     texture(f.color, color.Get(), sel.color_info, g_color_view);
     texture(f.depth, depth.Get(), sel.depth_info, g_depth_view);
     f.reversed_depth = cam.reversed;
-    std::vector<uint8_t> camera_bytes(*bytes); // the callback runs without g_mu
+    std::vector<uint8_t> camera_bytes(*upload->bytes); // the callback runs without g_mu
     f.camera.buffer = cam_sel.camera_cb;
     f.camera.vs_slot = cam_sel.camera_slot >= 0 && cam_sel.camera_slot < kPsCbBase ? cam_sel.camera_slot : -1;
     f.camera.ps_slot = cam_sel.camera_slot >= kPsCbBase ? cam_sel.camera_slot - kPsCbBase : -1;
     f.camera.first_constant = g_camera_first;
     f.camera.num_constants = g_camera_num;
     f.camera.version = version;
+    f.camera.bytes_first_constant = upload->first_constant;
     f.camera.split_pose = split_pose;
     if (cam.derived_inverse) f.camera.no_inverse_pose = cam.vp;
     f.camera.bytes = camera_bytes.data();
@@ -816,11 +932,17 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     if (!ok) ++g_stats.missed;
 }
 
-void SaveCameraUpload(Id resource, uint32_t version, const uint8_t* data, size_t size)
+CameraUpload CaptureUpload(const void* data, size_t size, uint32_t first_constant, bool windowed)
 {
-    auto& latest = g_cb_latest[resource];
-    latest.version = version;
-    latest.bytes = std::make_shared<const std::vector<uint8_t>>(data, data + size);
+    const auto* begin = static_cast<const uint8_t*>(data);
+    return {0, std::make_shared<const std::vector<uint8_t>>(begin, begin + size), first_constant, windowed};
+}
+
+void SaveCameraUpload(Id resource, uint32_t version, CameraUploads uploads)
+{
+    uploads.primary.version = version;
+    for (auto& upload : uploads.additional) upload.version = version;
+    g_cb_latest[resource] = std::move(uploads);
 }
 // `ws` and `ps`: the slots the relative layout names for the world range and the projection range.
 void RememberSplitDraw(const Event& e, int ws, int ps, const CameraUpload& world, const CameraUpload& projection)
@@ -831,12 +953,15 @@ void RememberSplitDraw(const Event& e, int ws, int ps, const CameraUpload& world
         world_binding != g_split_draw.world_binding || projection_binding != g_split_draw.projection_binding) {
         g_split_draw = {world.bytes, projection.bytes, world_binding, projection_binding, nullptr};
         SplitKey key{};
-        if (!MakeSplitKey(g_rel_layout, world.bytes->data(), world.bytes->size(), e.cb_first[ws], e.cb_count[ws],
-                          projection.bytes->data(), projection.bytes->size(), e.cb_first[ps], e.cb_count[ps], key)) return;
+        size_t start = 0, length = 0;
+        if (!UploadRange(world, e.cb_first[ws], e.cb_count[ws], start, length) ||
+            !UploadRange(projection, e.cb_first[ps], e.cb_count[ps], start, length)) return;
+        if (!MakeSplitKey(g_rel_layout, world.bytes->data(), world.bytes->size(), e.cb_first[ws] - world.first_constant, e.cb_count[ws],
+                          projection.bytes->data(), projection.bytes->size(), e.cb_first[ps] - projection.first_constant, e.cb_count[ps], key)) return;
         auto [it, inserted] = g_split_votes.try_emplace(key);
         if (inserted) {
             it->second.projection = {e.cb[ps], ps, e.cb_first[ps], e.cb_count[ps], projection.version, 0};
-            it->second.projection_bytes = projection.bytes;
+            it->second.projection_upload = projection;
             it->second.world_buffer = e.cb[ws];
         }
         g_split_draw.vote = &it->second;
@@ -857,15 +982,14 @@ void RememberSceneUploads(const Event& e)
     bool learn_draw = false;
     for (int slot = 0; slot < kCbBindSlots; ++slot) {
         if (!e.cb[slot]) continue;
-        const auto it = g_cb_latest.find(e.cb[slot]);
-        if (it == g_cb_latest.end() || it->second.version != g_model.CbVersion(e.cb[slot])) continue;
-        g_scene_uploads[{e.cb[slot], slot, e.cb_first[slot], e.cb_count[slot]}] = it->second;
-        if (!it->second.bytes) continue;
-        if (slot == ws) split[0] = &it->second;
-        else if (slot == ps) split[1] = &it->second;
+        const auto* upload = UploadForDraw(e.cb[slot], e.cb_first[slot], e.cb_count[slot]);
+        if (!upload || !upload->bytes) continue;
+        g_scene_uploads[{e.cb[slot], slot, e.cb_first[slot], e.cb_count[slot]}] = *upload;
+        if (slot == ws) split[0] = upload;
+        else if (slot == ps) split[1] = upload;
         if (slot == lp) {
             size_t start = 0, length = 0;
-            learn_draw = SplitBoundRange(it->second.bytes->size(), e.cb_first[slot], e.cb_count[slot], start, length) &&
+            learn_draw = UploadRange(*upload, e.cb_first[slot], e.cb_count[slot], start, length) &&
                          length == g_rel_learner.projection_size();
         }
     }
@@ -873,11 +997,10 @@ void RememberSceneUploads(const Event& e)
     if (!learn_draw) return;
     for (int slot = 0; slot < kCbSlots; ++slot) { // vertex ranges: a world transform is a vertex input
         if (slot == lp || !e.cb[slot]) continue;
-        const auto it = g_cb_latest.find(e.cb[slot]);
-        if (it == g_cb_latest.end() || it->second.version != g_model.CbVersion(e.cb[slot]) || !it->second.bytes) continue;
+        const auto* upload = UploadForDraw(e.cb[slot], e.cb_first[slot], e.cb_count[slot]);
         size_t start = 0, length = 0;
-        if (!SplitBoundRange(it->second.bytes->size(), e.cb_first[slot], e.cb_count[slot], start, length)) continue;
-        g_rel_learner.NoteDraw(static_cast<uint64_t>(slot), it->second.bytes->data() + start, length);
+        if (!upload || !UploadRange(*upload, e.cb_first[slot], e.cb_count[slot], start, length)) continue;
+        g_rel_learner.NoteDraw(static_cast<uint64_t>(slot), upload->bytes->data() + start, length);
     }
 }
 // Called in immediate draw order and while replaying executed command lists.
@@ -895,14 +1018,13 @@ void NoteViewportDraw(const Event& e)
 }
 
 // ---------------------------------------------------------------- events
-void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes = nullptr, size_t cb_size = 0)
+void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {})
 {
     if (x->deferred) {
         if (x->events.size() >= kMaxListEvents) return;
         x->events.push_back(e);
-        if (e.kind == Kind::CbUpdate && cb_bytes)
-            x->cb_bytes.emplace_back(x->events.size() - 1, std::vector<uint8_t>(static_cast<const uint8_t*>(cb_bytes),
-                                                                                static_cast<const uint8_t*>(cb_bytes) + cb_size));
+        if (e.kind == Kind::CbUpdate && uploads.primary.bytes)
+            x->cb_bytes.emplace_back(x->events.size() - 1, std::move(uploads));
         return;
     }
     std::unique_lock<std::mutex> l(g_mu);
@@ -916,8 +1038,8 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, const void* cb_bytes =
     const uint32_t v = g_model.Feed(e);
     RememberSceneUploads(e);
     NoteViewportDraw(e);
-    if (e.kind == Kind::CbUpdate && cb_bytes)
-        SaveCameraUpload(e.resource, v, static_cast<const uint8_t*>(cb_bytes), cb_size);
+    if (e.kind == Kind::CbUpdate && uploads.primary.bytes)
+        SaveCameraUpload(e.resource, v, std::move(uploads));
 }
 
 // Viewport jitter, before a game draw is forwarded: a depth-tested draw into the scene depth gets
@@ -1045,7 +1167,7 @@ void ReadResource(ID3D11DeviceContext* c, ID3D11Resource* src)
     e.resource = r;
     Emit(x, c, e);
 }
-void CbUpdate(ID3D11DeviceContext* c, ID3D11Resource* r, const void* bytes, size_t size)
+void CbUpdate(ID3D11DeviceContext* c, ID3D11Resource* r, const void* bytes, size_t size, const CaptureWindows* windows = nullptr)
 {
     Ctx* x = Get(c);
     if (!x) return;
@@ -1063,7 +1185,21 @@ void CbUpdate(ID3D11DeviceContext* c, ID3D11Resource* r, const void* bytes, size
         if (g_cb_incarnation.size() > 256) g_cb_incarnation.clear();
         g_cb_incarnation[e.resource] = inc;
     }
-    Emit(x, c, e, keep ? bytes : nullptr, keep ? std::min(size, kMaxCbBytes) : 0);
+    CameraUploads uploads;
+    if (keep && windows) {
+        const auto* data = static_cast<const uint8_t*>(bytes);
+        for (size_t i = 0; i < windows->count; ++i) {
+            const auto window = windows->ranges[i];
+            if (window.begin >= size) continue;
+            CameraUpload upload = CaptureUpload(data + window.begin, std::min<size_t>(window.size, size - window.begin),
+                                                window.begin / 16, true);
+            if (!uploads.primary.bytes) uploads.primary = std::move(upload);
+            else uploads.additional.push_back(std::move(upload));
+        }
+    } else if (keep) {
+        uploads.primary = CaptureUpload(bytes, std::min(size, kMaxCbBytes), 0, false);
+    }
+    Emit(x, c, e, std::move(uploads));
 }
 bool IsConstantBuffer(ID3D11Resource* r, UINT* size)
 {
@@ -1232,7 +1368,7 @@ HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT 
                                     type == D3D11_MAP_READ_WRITE)) {
         const Id id = IdOf(r);
         UINT size = 0;
-        if (IsCandidate(id) && IsConstantBuffer(r, &size) && size <= kMaxCbBytes) x->mapped[id] = m->pData;
+        if (IsCandidate(id) && IsConstantBuffer(r, &size)) x->mapped[id] = m->pData;
         else if (!x->mapped.empty()) x->mapped.erase(id);
     }
     return hr;
@@ -1252,8 +1388,15 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
         if (it != x->mapped.end()) {
             // The game's own write-combined mapping is read once, only for the few candidate buffers.
             if (cb && it->second) {
-                JitterUpload(it->second, size, id); // before the GPU can see the bytes
-                CbUpdate(c, r, it->second, size);
+                if (size <= kMaxCbBytes) {
+                    JitterUpload(it->second, size, id); // before the GPU can see the bytes
+                    CbUpdate(c, r, it->second, size);
+                } else {
+                    // Observe a bounded window while the map is live. Large
+                    // buffers are never rewritten by matrix jitter.
+                    const CaptureWindows windows = CameraWindows(id);
+                    CbUpdate(c, r, it->second, size, &windows);
+                }
             }
             x->mapped.erase(it);
         } else if (cb) {
@@ -1471,7 +1614,7 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
                 NoteViewportDraw(events[i]);
                 if (events[i].kind == Kind::CbUpdate && next_bytes < bytes.size() && bytes[next_bytes].first == i) {
                     const auto& upload = bytes[next_bytes++].second;
-                    SaveCameraUpload(events[i].resource, v, upload.data(), upload.size());
+                    SaveCameraUpload(events[i].resource, v, upload);
                 }
             }
         }
@@ -1505,6 +1648,7 @@ bool OnPresent(IDXGISwapChain* swap)
     }
     ++g_frame;
     ++g_stats.frames;
+    LearnLargeCbWindows();
     g_model.EndFrame();
     const auto& ms = g_model.GetStats();
     g_stats.unplaceable = ms.unplaceable;
