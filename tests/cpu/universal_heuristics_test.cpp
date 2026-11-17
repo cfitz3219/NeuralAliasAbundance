@@ -159,6 +159,31 @@ struct Feed {
 
 int main() {
     return test::run({
+        {"successful resize updates depth aspect; rejected resize leaves it unchanged", [] {
+             Feed f;
+             f.Swapchain(1024,768);
+             f.Resource(3,853,480,40);
+             f.Resource(4,2048,2048,40);
+             f.Resource(6,853,480,10);
+             f.Resource(7,1280,720,28);
+             f.Pipeline(10,1,1,0);f.Pipeline(11,0,0,1);
+             for(int i=0;i<3;++i)f.Frame();
+             auto rank=f.h.RankDepth(4);
+             CHECK(!rank.empty() && rank[0].score==0);
+             na_ev_swapchain_resized resize{};
+             resize.swapchain=99;resize.width=1280;resize.height=720;
+             resize.hresult=static_cast<int32_t>(0x80004005u);
+             f.Event(resize,NA_EV_SWAPCHAIN_RESIZED);
+             CHECK(f.h.SwapchainWidth()==1024 && f.h.SwapchainHeight()==768);
+             resize.hresult=0;f.Event(resize,NA_EV_SWAPCHAIN_RESIZED);
+             for(int i=0;i<3;++i)f.Frame();
+             rank=f.h.RankDepth(4);
+             CHECK(!rank.empty() && rank[0].resource==3 && rank[0].score>0);
+             CHECK(f.h.RecentTopDepths().Count(3)>=2);
+             resize.width=1024;resize.height=768;resize.hresult=static_cast<int32_t>(0x80004005u);
+             f.Event(resize,NA_EV_SWAPCHAIN_RESIZED);
+             CHECK(f.h.SwapchainWidth()==1280 && f.h.SwapchainHeight()==720);
+         }},
         {"generic_depth picks the swapchain-aspect main depth over shadow and half-res buffers", [] {
              Feed f;
              f.Swapchain(1920, 1080);
@@ -188,6 +213,39 @@ int main() {
              }
              CHECK(shadow_filtered && half_filtered);
              CHECK(ranked[0].last.queue == 7 && ranked[0].last.list == 5 && ranked[0].last.ticket == 3);
+         }},
+        {"render-small Performance: a half-size scene depth passes, shadow and quarter-size still fail", [] {
+             // Anno at Performance renders 1720x720 for a 3440x1440 swapchain (2026-11-03).
+             Feed f;
+             f.h.AllowRenderScale(0.5);
+             f.Swapchain(1920, 1080);
+             f.Resource(3, 960, 540, 40);   // the scene depth, exactly half
+             f.Resource(4, 2048, 2048, 40); // shadow map
+             f.Resource(5, 480, 270, 40);   // quarter-size side buffer
+             f.Resource(6, 960, 540, 10);
+             f.Resource(7, 1920, 1080, 28);
+             f.Pipeline(10, 1, 1, 0);
+             f.Pipeline(11, 0, 0, 1);
+             f.Frame();
+             f.Frame();
+             f.Frame();
+             const auto ranked = f.h.RankDepth(4);
+             CHECK(!ranked.empty());
+             CHECK(ranked[0].resource == 3 && ranked[0].score > 0 && ranked[0].aspect_match);
+             bool shadow_filtered = false, quarter_filtered = false;
+             for (const auto& c : ranked) {
+                 if (c.resource == 4) shadow_filtered = c.score == 0 && !c.aspect_match;
+                 if (c.resource == 5) quarter_filtered = c.score == 0 && !c.aspect_match;
+             }
+             CHECK(shadow_filtered && quarter_filtered);
+         }},
+        {"native Ultra Performance: one-third scene remains eligible while shadow and quarter-size are rejected", [] {
+             Feed f;f.h.AllowRenderScale(1.0/3.0);f.Swapchain(1920,1080);
+             f.Resource(3,640,360,40);f.Resource(4,2048,2048,40);f.Resource(5,480,270,40);
+             f.Resource(6,640,360,10);f.Resource(7,1920,1080,28);f.Pipeline(10,1,1,0);f.Pipeline(11,0,0,1);
+             f.Frame();f.Frame();f.Frame();const auto ranked=f.h.RankDepth(4);
+             CHECK(!ranked.empty());CHECK(ranked[0].resource==3&&ranked[0].score>0&&ranked[0].aspect_match);
+             for(const auto& candidate:ranked)if(candidate.resource==4||candidate.resource==5)CHECK(candidate.score==0&&!candidate.aspect_match);
          }},
         {"a loading-screen frame does not replace the last real frame", [] {
              Feed f;

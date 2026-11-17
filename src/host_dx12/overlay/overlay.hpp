@@ -63,6 +63,7 @@ uint64_t PresentsSinceLastEvaluate();
 
 struct Stats {
     uint64_t frames_rendered;
+    uint64_t menu_busy_skips;
     uint64_t presents_seen;
     uint32_t initialized;
     uint32_t core_ready, menu_enabled;
@@ -167,7 +168,7 @@ SeamStats GetSeamStats();
 // A55: periodic status log (one line every ~5 s, written from the discovery
 // thread, never a render thread): presentation rate, DLSS/NR/motion state
 // and timings, so measurements are recorded without anyone reading the menu.
-void SetStatusLogPath(const wchar_t* path);
+void SetStatusLogPath(const wchar_t* path, const wchar_t* build = nullptr);
 
 // Tests / hosts: the current page index (0 Picture .. 3 Details).
 int CurrentPageIndex();

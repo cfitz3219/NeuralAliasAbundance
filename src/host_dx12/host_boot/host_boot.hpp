@@ -19,6 +19,9 @@ namespace na::host {
 // Spawns the init thread when the ini enables the host. Returns true when a
 // thread was started (the ini exists and enables the host).
 bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag);
+// DLL_PROCESS_DETACH at process exit (lpReserved != nullptr), before the CRT destroys
+// statics: late D3D12 releases from exit-time destructors must not touch observe's tables.
+void NotifyProcessExit();
 
 struct Status {
     uint32_t host_enabled;    // ini said enabled=1
@@ -44,5 +47,19 @@ Status GetStatus();
 // init thread waits up to 3 s until producer installation was attempted, so
 // early swap-chain queue bindings are captured as well as producer objects.
 void WaitForObserveInstall();
+
+// The bridge's private device bootstrap can call back into our DXGI exports.
+// Like the host installer, it must not wait on the game-facing factory gate.
+class InternalFactoryScope {
+public:
+    InternalFactoryScope();
+    ~InternalFactoryScope();
+    InternalFactoryScope(const InternalFactoryScope&) = delete;
+    InternalFactoryScope& operator=(const InternalFactoryScope&) = delete;
+};
+
+// Device creation nested in our own graphics setup belongs to the runtime,
+// not the game's renderer. The 11on12 hook must forward it unchanged too.
+bool IsInternalGraphicsCall();
 
 } // namespace na::host

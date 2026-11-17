@@ -4,6 +4,7 @@
 #include <memory>
 namespace na::nr { struct FgContract; }
 namespace na::nr::native {
+struct SubmissionPosition;
 // Game-facing adapters supply exact states at this recording point. No NGX
 // parameter object is manufactured; both adapters share one NR implementation.
 struct FrameStates { uint32_t values[5]{}; bool preserve_additive_ui=false; };
@@ -16,10 +17,16 @@ class RecordingLease {
 public:
     bool Ready(ID3D12CommandQueue* consumer) const;
     bool Retired() const;
+    bool Completed() const; // GPU finished its latest submission; Reset is not required
+    bool SameRecording(const RecordingLease& other) const;
+    // Comparable only on this queue. Zero means not submitted/forwarding/failed
+    // or a different queue. Survives retirement of the resource-owning record.
+    uint64_t SubmissionOrder(ID3D12CommandQueue* consumer) const;
     explicit operator bool() const { return !!retired_; }
 private:
     std::weak_ptr<void> record_;
     std::shared_ptr<const std::atomic<bool>> retired_,completed_;
+    std::shared_ptr<const SubmissionPosition> position_;
     friend RecordingLease RetainRecording(ID3D12GraphicsCommandList*,std::shared_ptr<void>);
 };
 RecordingLease RetainRecording(ID3D12GraphicsCommandList* list,std::shared_ptr<void> payload);
@@ -81,7 +88,13 @@ private:
     std::unique_lock<std::mutex> locks_[64];
     ID3D12CommandQueue* queue_=nullptr;
     std::shared_ptr<void> records_[64];
+    uint32_t ordinals_[64]{}; // original ExecuteCommandLists order, not lock order
     uint32_t count_=0;
     bool entered_=false;
 };
+// Optional existing-forward seam. Called after recording forward locks are
+// acquired and before native Execute, without the NR registry mutex held.
+// Callback must not wait, read back, or acquire a recording forward lock.
+using SubmissionPrepareCallback=void(*)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*);
+void SetSubmissionPrepareCallback(SubmissionPrepareCallback);
 }

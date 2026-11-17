@@ -1,0 +1,9 @@
+{
+  "about": "Unclassified source cannot be treated as no impact.",
+  "call": "build_verdict",
+  "args": [
+    {"sample": {"answer": "held"}},
+    {"unclassified": ["new_path.cpp"], "cases": {"sample": {"answer": "impact_unknown"}}}
+  ],
+  "expect": {"answer": "not proven", "because": ["Some changed files have unknown impact."]}
+}

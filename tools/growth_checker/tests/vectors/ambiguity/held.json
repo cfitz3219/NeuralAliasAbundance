@@ -1,0 +1,17 @@
+{
+  "about": "A gain within tolerance holds.",
+  "call": "case_verdict",
+  "args": [
+    {
+      "verdict": "comparable",
+      "limits": [],
+      "reasons": [],
+      "tolerance": {"fps_play_median": {"absolute": 1, "relative_percent": 3}}
+    },
+    {"fps_play_median": {"baseline": 50, "change": 1.1, "against_floor": "holds"}},
+    {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+    {"dlaa_reaches_picture": {"state": "verified", "source": "owner_verdict"}},
+    []
+  ],
+  "expect": {"answer": "held", "because": ["The measured case held within its accepted limits."]}
+}

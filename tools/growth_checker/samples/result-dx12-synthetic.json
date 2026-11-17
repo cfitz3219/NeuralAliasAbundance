@@ -1,0 +1,419 @@
+{
+  "schema": "growth.result/1",
+  "manifest": {
+    "schema": "growth.manifest/1",
+    "evidence_id": "nobuild-b6e245d4362a",
+    "evidence_type": "synthetic",
+    "producer": {
+      "build": null,
+      "build_source": "unknown"
+    },
+    "session": {
+      "id": "sample",
+      "first_sample": "12:00:00",
+      "last_sample": "12:01:00",
+      "saved_folder": "sample-dx12",
+      "saved_at": null,
+      "profile_hint": null
+    },
+    "case": null,
+    "case_source": null,
+    "files": [
+      {
+        "name": "status-sample.txt",
+        "role": "status",
+        "bytes": 15505,
+        "sha256": "b6e245d4362addbd9fd831ddfed570310f07d095f1fb04bb146a1a087a1b7d9f"
+      }
+    ],
+    "scorer": {
+      "tool": "growth_checker",
+      "version": "0.2.0",
+      "schema": 1
+    },
+    "notes": [
+      "no build line in the evidence"
+    ]
+  },
+  "status": "scored",
+  "status_reason": null,
+  "provider": "dx12",
+  "api": "dx12",
+  "route": "B",
+  "sessions": [
+    {
+      "first_sample": "12:00:00",
+      "last_sample": "12:01:00",
+      "samples": 13,
+      "presented": 12000,
+      "scene": 11400,
+      "delivered": 11280,
+      "run_seconds": 60.0,
+      "unlogged_seconds": 0.0,
+      "play_seconds": 60.0,
+      "delivering_seconds": 60.0,
+      "longest_gap_seconds": 0.0,
+      "longest_gap_window_seconds": 0.0,
+      "longest_gap_started": null,
+      "first_delivery_after_seconds": 0.0
+    }
+  ],
+  "measurements": {
+    "frames_presented": {
+      "state": "measured",
+      "value": 12000,
+      "unit": "frames",
+      "basis": "counter"
+    },
+    "frames_scene": {
+      "state": "measured",
+      "value": 11400,
+      "unit": "frames",
+      "basis": "counter"
+    },
+    "frames_delivered": {
+      "state": "measured",
+      "value": 11280,
+      "unit": "frames",
+      "basis": "counter"
+    },
+    "scene_share_of_presented": {
+      "state": "measured",
+      "value": 95.0,
+      "unit": "percent",
+      "basis": "derived",
+      "limits": "Frames the program did not judge to be scene may be menus, videos, loading or missed gameplay; this number cannot tell which."
+    },
+    "delivered_share_of_scene": {
+      "state": "measured",
+      "value": 98.95,
+      "unit": "percent",
+      "basis": "derived"
+    },
+    "delivered_share_of_presented": {
+      "state": "measured",
+      "value": 94.0,
+      "unit": "percent",
+      "basis": "derived",
+      "limits": "Frames the program did not judge to be scene may be menus, videos, loading or missed gameplay; this number cannot tell which."
+    },
+    "run_seconds": {
+      "state": "measured",
+      "value": 60.0,
+      "unit": "seconds",
+      "basis": "sampled"
+    },
+    "unlogged_seconds": {
+      "state": "measured",
+      "value": 0.0,
+      "unit": "seconds",
+      "basis": "sampled",
+      "limits": "Time with no status samples (suspended or not running); not counted as play."
+    },
+    "sample_period_seconds": {
+      "state": "measured",
+      "value": 5.0,
+      "unit": "seconds",
+      "basis": "sampled"
+    },
+    "play_seconds": {
+      "state": "measured",
+      "value": 60.0,
+      "unit": "seconds",
+      "basis": "sampled",
+      "limits": "Time in which the program saw delivery opportunities (scene frames, or presented frames where scene frames are not logged)."
+    },
+    "longest_gap_seconds": {
+      "state": "measured",
+      "value": 0.0,
+      "unit": "seconds",
+      "basis": "sampled",
+      "limits": "A gap over observed opportunities, estimated from the periodic status samples. Intended Off, menu and loading time are not told apart from unexpected misses."
+    },
+    "longest_gap_window_seconds": {
+      "state": "measured",
+      "value": 0,
+      "unit": "seconds",
+      "basis": "sampled",
+      "limits": "A gap over observed opportunities, estimated from the periodic status samples. Intended Off, menu and loading time are not told apart from unexpected misses."
+    },
+    "longest_gap_started": {
+      "state": "measured",
+      "value": null,
+      "unit": "clock",
+      "basis": "sampled"
+    },
+    "not_delivering_share_of_play": {
+      "state": "measured",
+      "value": 0.0,
+      "unit": "percent",
+      "basis": "sampled",
+      "limits": "Share of play time in samples where under 98% of opportunities got DLSS."
+    },
+    "time_to_first_delivery_seconds": {
+      "state": "measured",
+      "value": 0.0,
+      "unit": "seconds",
+      "basis": "sampled",
+      "limits": "From the first sample with opportunities to the first with a delivery."
+    },
+    "fps_play_median": {
+      "state": "measured",
+      "value": 120.0,
+      "unit": "fps",
+      "basis": "sampled",
+      "limits": "Over every sample with delivery opportunities, delivering or not."
+    },
+    "fps_play_lowest": {
+      "state": "measured",
+      "value": 120.0,
+      "unit": "fps",
+      "basis": "sampled"
+    },
+    "frame_ms_play_median": {
+      "state": "measured",
+      "value": 8.33,
+      "unit": "ms",
+      "basis": "sampled"
+    },
+    "fps_median_while_delivering": {
+      "state": "measured",
+      "value": 120.0,
+      "unit": "fps",
+      "basis": "sampled",
+      "limits": "Only samples where at least 98% of opportunities got DLSS; read it beside not_delivering_share_of_play."
+    },
+    "fps_lowest_while_delivering": {
+      "state": "measured",
+      "value": 120.0,
+      "unit": "fps",
+      "basis": "sampled"
+    },
+    "frames_jittered": {
+      "state": "measured",
+      "value": 11268,
+      "unit": "frames",
+      "basis": "counter"
+    },
+    "menu_draws": {
+      "state": "measured",
+      "value": 36,
+      "unit": "draws",
+      "basis": "counter",
+      "limits": "The Home menu was drawn this many times; says nothing about its controls."
+    },
+    "camera_found_by": {
+      "state": "unknown",
+      "value": null,
+      "why": "the dx12 provider does not log which rule found the camera"
+    },
+    "missed_because": {
+      "state": "measured",
+      "value": {
+        "no_camera": 12
+      },
+      "unit": "frames per reason",
+      "basis": "counter"
+    },
+    "frames_without_camera": {
+      "state": "measured",
+      "value": 12,
+      "unit": "frames",
+      "basis": "counter",
+      "limits": "Attempts on a scene frame that had no camera."
+    },
+    "camera_scan_losses": {
+      "state": "measured",
+      "value": {
+        "lost_no_vp": 2400
+      },
+      "unit": "scans per reason",
+      "basis": "counter",
+      "limits": "Scans that found no camera. A frame can still be delivered on a held or predicted camera, so these are not missed frames."
+    },
+    "frames_on_predicted_camera": {
+      "state": "measured",
+      "value": 1800,
+      "unit": "frames",
+      "basis": "counter",
+      "limits": "Delivered on a camera held or predicted from earlier frames, because this frame's camera could not be read."
+    }
+  },
+  "observed": {
+    "preset": {
+      "last": 13,
+      "distinct": [
+        13
+      ]
+    },
+    "sharpness": {
+      "last": 50,
+      "distinct": [
+        50
+      ]
+    },
+    "scene_placement": {
+      "last": "inline",
+      "distinct": [
+        "inline"
+      ]
+    },
+    "viewport_jitter_mode": {
+      "last": "1",
+      "distinct": [
+        "1"
+      ]
+    }
+  },
+  "jobs": {
+    "home_menu_opens": {
+      "state": "verified",
+      "note": "The menu was drawn 36 times.",
+      "evidence": [
+        "menu_draws"
+      ]
+    },
+    "home_controls_take_effect": {
+      "state": "untested",
+      "note": "No setting changed during this run.",
+      "evidence": []
+    },
+    "status_truthful": {
+      "state": "unknown",
+      "note": "No cross-check of the status text against the counters exists yet.",
+      "evidence": []
+    },
+    "performance_budget": {
+      "state": "verified",
+      "note": "Median 120.0 fps over all play samples against a budget of 40.",
+      "evidence": [
+        "fps_play_median",
+        "fps_median_while_delivering",
+        "not_delivering_share_of_play"
+      ]
+    },
+    "presentation_modes": {
+      "state": "unknown",
+      "note": "This log carries no evidence of the presentation mode.",
+      "evidence": []
+    },
+    "no_crash_or_hang": {
+      "state": "unknown",
+      "note": "A log without a crash line does not prove a clean exit.",
+      "evidence": []
+    },
+    "api_chosen": {
+      "state": "verified",
+      "note": "The provider for the game's own API saw its frames.",
+      "evidence": [
+        "frames_presented"
+      ]
+    },
+    "camera_found": {
+      "state": "verified",
+      "note": "A camera was admitted on the 11280 delivered frames. Whether it is the right camera shows in the picture.",
+      "evidence": [
+        "frames_delivered",
+        "camera_found_by"
+      ]
+    },
+    "depth_found": {
+      "state": "verified",
+      "note": "Depth was supplied on the 11280 delivered frames. Its source and correctness are not in this log.",
+      "evidence": [
+        "frames_delivered"
+      ]
+    },
+    "motion_found": {
+      "state": "verified",
+      "note": "Motion was supplied on the 11280 delivered frames. Its source and correctness are not in this log.",
+      "evidence": [
+        "frames_delivered"
+      ]
+    },
+    "jitter_applied": {
+      "state": "verified",
+      "note": "11268 frames carried jitter.",
+      "evidence": [
+        "frames_jittered"
+      ]
+    },
+    "dlaa_delivered": {
+      "state": "verified",
+      "note": "11280 frames by the program's count.",
+      "evidence": [
+        "frames_delivered",
+        "delivered_share_of_scene",
+        "delivered_share_of_presented"
+      ]
+    },
+    "dlaa_reaches_picture": {
+      "state": "unknown",
+      "note": "The program's count shows DLSS ran and its output was handed back. Only the person at the screen can say it reached the picture (for example the DLSS indicator showing).",
+      "evidence": [
+        "frames_delivered"
+      ]
+    },
+    "continuity": {
+      "state": "unknown",
+      "note": "Longest gap 0.0 s (sampled). The case sets no limit; the floor comparison judges it.",
+      "evidence": [
+        "longest_gap_seconds",
+        "not_delivering_share_of_play"
+      ]
+    },
+    "cost": {
+      "state": "unknown",
+      "note": "The run has no interval with the program switched off to compare against.",
+      "evidence": []
+    }
+  },
+  "owner_verdicts": [],
+  "patterns": {
+    "api": {
+      "state": "observed",
+      "value": "dx12",
+      "source": "provider that counted the frames"
+    },
+    "provider": {
+      "state": "observed",
+      "value": "dx12",
+      "source": "provider that counted the frames"
+    },
+    "depth_convention": {
+      "state": "unknown",
+      "why": "not logged yet"
+    },
+    "jitter_route": {
+      "state": "observed",
+      "value": "viewport",
+      "source": "viewport_jitter mode="
+    },
+    "motion_source": {
+      "state": "unknown",
+      "why": "not logged yet"
+    },
+    "hud_composition": {
+      "state": "unknown",
+      "why": "not logged yet"
+    },
+    "presentation": {
+      "state": "unknown",
+      "why": "not logged yet"
+    },
+    "scene_placement": {
+      "state": "observed",
+      "value": "inline",
+      "source": "j2_route route="
+    },
+    "camera_admission": {
+      "state": "unknown",
+      "why": "this provider does not log which rule found the camera"
+    },
+    "camera_layout_from": {
+      "state": "unknown",
+      "why": "not logged"
+    }
+  },
+  "dependencies_in_use": []
+}

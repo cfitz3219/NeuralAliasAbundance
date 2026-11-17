@@ -1,4 +1,5 @@
 #pragma once
+#include "host_dx12/depth_format.hpp"
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -20,6 +21,7 @@ class MsaaResolve {
     Ptr<ID3D12Resource> depth_copy_;
     UINT stride_ = 0, rtv_stride_ = 0;
     DXGI_FORMAT color_format_ = DXGI_FORMAT_UNKNOWN, depth_view_ = DXGI_FORMAT_UNKNOWN;
+    bool depth_multisampled_ = false;
 
     static bool compile(const char* source, const char* entry, const char* target, Ptr<ID3DBlob>& code) {
         Ptr<ID3DBlob> errors;
@@ -38,13 +40,17 @@ public:
     bool Init(ID3D12Device* dev, UINT width, UINT height, DXGI_FORMAT color_format,
               const D3D12_RESOURCE_DESC& depth_desc, DXGI_SAMPLE_DESC color_samples, UINT slots) {
         device_ = dev; color_format_ = color_format;
-        const bool stencil = depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+        depth_multisampled_ = depth_desc.SampleDesc.Count > 1;
+        const bool depth24 = na::depth::IsDepth24(depth_desc.Format);
+        const bool stencil32 = depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
                              depth_desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
                              depth_desc.Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-        depth_view_ = stencil ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT;
+        depth_view_ = depth24 ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS :
+                      stencil32 ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT;
         D3D12_RESOURCE_DESC d = depth_desc;
         d.Width = width; d.Height = height; d.DepthOrArraySize = d.MipLevels = 1;
-        d.Format = stencil ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
+        d.Format = depth24 ? DXGI_FORMAT_R24G8_TYPELESS :
+                   stencil32 ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
         d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL; // no DENY_SHADER_RESOURCE, even when the game has it
         d.Alignment = 0;
         D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -85,11 +91,19 @@ cbuffer Params : register(b0) { uint width; uint height; uint reverse_z; };
     }
     target[p.xy] = nearest;
 })";
+        static const char* convert_depth_shader = R"(
+Texture2D<float> source : register(t0);
+RWTexture2D<float> target : register(u0);
+cbuffer Params : register(b0) { uint width; uint height; uint reverse_z; };
+[numthreads(8,8,1)] void main(uint3 p : SV_DispatchThreadID) {
+    if (p.x < width && p.y < height) target[p.xy] = source.Load(int3(p.xy, 0));
+})";
         Ptr<ID3DBlob> cs, vs, ps;
-        if (!compile(depth_shader, "main", "cs_5_0", cs)) return false;
+        if (!compile(depth_multisampled_ ? depth_shader : convert_depth_shader, "main", "cs_5_0", cs)) return false;
         D3D12_COMPUTE_PIPELINE_STATE_DESC cp{};
         cp.pRootSignature = root_.Get(); cp.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
         if (FAILED(dev->CreateComputePipelineState(&cp, IID_PPV_ARGS(&depth_pso_)))) return false;
+        if (color_samples.Count == 1) return true; // only multisampled color needs a draw-based writeback
         static const char* write_shader = R"(
 Texture2D<float4> source : register(t0);
 float4 vertex(uint id : SV_VertexID) : SV_Position {
@@ -126,7 +140,9 @@ float4 pixel(float4 pos : SV_Position) : SV_Target { return source.Load(int3(int
                       UINT width, UINT height, bool reverse, UINT slot) {
         const UINT base = slot * 3;
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = depth_view_; srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        srv.Format = depth_view_;
+        srv.ViewDimension = depth_multisampled_ ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+        if (!depth_multisampled_) srv.Texture2D.MipLevels = 1;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         device_->CreateShaderResourceView(depth_copy_.Get(), &srv, cpu(base));
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};

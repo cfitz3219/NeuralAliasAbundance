@@ -1,0 +1,5 @@
+{
+  "about": "Call of Duty WWII, native DX11 provider, build fc0e6bd, Cort's run of 2026-11-09 19:10 (results folder NA-wwii-results-20261110-231230, process 8020). This is the floor a later build must not fall below on the same kind of run. It is not a pass mark for the game: Cort has not accepted a long session yet.",
+  "min": {"dlaa_percent": 96.0, "fps_median_with_dlaa": 90.0, "scene_frames": 5000},
+  "max": {"longest_gap_seconds": 8.0, "longest_gap_window_seconds": 20}
+}

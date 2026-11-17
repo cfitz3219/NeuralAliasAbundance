@@ -109,7 +109,11 @@ int main()
         CHECK(e.hdr && e.depth_inverted && e.auto_exposure && !e.mv_jittered && !e.mv_display_res);
         CHECK(e.jitter_x == 0.3f && e.jitter_y == -0.2f);
         auto f = GoodFrame(); f.color_space = abundance::ColorSpace::srgb_sdr;
-        CHECK(!na::dlss::FromFrame(f, r, Quality::MaxQuality, &e, &why) && why && std::strstr(why, "linear"));
+        CHECK(na::dlss::FromFrame(f, r, Quality::MaxQuality, &e, &why)&&!why&&!e.hdr);
+        f.color_space=abundance::ColorSpace::linear_sdr;
+        CHECK(na::dlss::FromFrame(f, r, Quality::MaxQuality, &e, &why)&&!why&&e.hdr);
+        f.color_space=abundance::ColorSpace::unknown;
+        CHECK(!na::dlss::FromFrame(f, r, Quality::MaxQuality, &e, &why)&&why);
         f = GoodFrame(); f.jitter_known = false;
         CHECK(!na::dlss::FromFrame(f, r, Quality::MaxQuality, &e, &why) && why);
         f = GoodFrame(); f.motion_space = abundance::MotionSpace::pixels_current_to_previous; f.motion.extent = f.output;

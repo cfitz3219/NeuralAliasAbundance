@@ -1,0 +1,129 @@
+{
+  "schema": "growth.dependencies/1",
+  "about": "Which cases a source change can reach. The most specific path wins (longest match). A changed file that matches no area is 'impact unknown', never 'no impact'. An area reaches a case through the case's provider: eligibility counts, not which rule won last time.",
+  "areas": [
+    {
+      "id": "no-game-effect",
+      "reaches": [],
+      "paths": [
+        "docs/",
+        "growth/",
+        "tools/",
+        "tests/",
+        "scripts/tests/",
+        "scripts/score_run.py",
+        "scripts/check_variants.py",
+        ".github/",
+        ".gitignore",
+        "*.md"
+      ],
+      "why": "Documents, the growth checker, tests and CI. Nothing here is in the program a game loads."
+    },
+    {
+      "id": "camera-rules",
+      "capability": "camera",
+      "reaches": [
+        "native11",
+        "dx12"
+      ],
+      "paths": [
+        "src/providers/camera/"
+      ],
+      "variants": [
+        "camera/no-inverse",
+        "camera/relative"
+      ],
+      "why": "The shared camera rules. Both Route B providers can select them, whichever rule won in a game's last run."
+    },
+    {
+      "id": "discovery",
+      "capability": "discovery",
+      "reaches": [
+        "native11",
+        "dx12"
+      ],
+      "paths": [
+        "src/providers/discovery/",
+        "src/providers/classifier/"
+      ],
+      "why": "Shared input discovery for Route B."
+    },
+    {
+      "id": "native-dx11",
+      "reaches": [
+        "native11"
+      ],
+      "paths": [
+        "src/host_dx12/native11/",
+        "src/host_dx12/native_d3d11/",
+        "src/host_dx12/on12/",
+        "src/host_dx12/adapters/wwii/"
+      ],
+      "variants": [
+        "camera11/packed"
+      ],
+      "why": "The native DX11 provider, its consumer, the disabled DX11 bridge and the layouts the DX11 provider starts from. Any DX11 game reaches them."
+    },
+    {
+      "id": "dx12-scene",
+      "reaches": [
+        "dx12",
+        "native11"
+      ],
+      "paths": [
+        "src/host_dx12/j2/",
+        "src/host_dx12/native_present/",
+        "src/host_dx12/scale/",
+        "src/host_dx12/observe/",
+        "src/host_dx12/host_observe"
+      ],
+      "why": "DX12 scene observation and live DLAA. The native DX11 consumer includes parts of j2, so a change here can reach DX11 games too."
+    },
+    {
+      "id": "route-a",
+      "reaches": [
+        "route_a"
+      ],
+      "paths": [
+        "src/host_dx12/sl_boundary/",
+        "src/host_dx12/sl_proxy/",
+        "src/host_dx12/adapters/tsushima/",
+        "src/host_dx12/adapters/unreal/",
+        "src/host_dx12/adapters/tlou1/",
+        "src/host_dx12/adapters/mode_control"
+      ],
+      "why": "The native-DLSS route: the Streamline boundary and the engine adapters."
+    },
+    {
+      "id": "shared-program",
+      "reaches": [
+        "native11",
+        "dx12",
+        "route_a"
+      ],
+      "paths": [
+        "src/"
+      ],
+      "why": "Everything else in the program is treated as shared by both routes and both APIs: the DLSS backend, the menu and overlay, settings, hooks, start-up, effects, motion, the runtime proxy."
+    },
+    {
+      "id": "build-and-package",
+      "reaches": [
+        "native11",
+        "dx12",
+        "route_a"
+      ],
+      "paths": [
+        "CMakeLists.txt",
+        "cmake/",
+        "build.ps1",
+        "third_party/",
+        "shaders/",
+        "assets/",
+        "profiles/",
+        "scripts/"
+      ],
+      "why": "What is built and what the installer puts in each game's folder."
+    }
+  ]
+}

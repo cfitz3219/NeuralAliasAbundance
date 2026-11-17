@@ -1,14 +1,25 @@
 // C8a: H1 observation producers. See producers.hpp.
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/observe/producers.hpp"
 
+#include <utility>
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <wrl/client.h>
 
 #include "queue_occurrences.hpp"
 #include "host_dx12/j2/insertion_trace.hpp"
+#include "host_dx12/observe/texture_operation.hpp"
+#include "host_dx12/observe/operation_snapshot.hpp"
+#include "host_dx12/observe/shader_dimensions.hpp"
+#include "host_dx12/observe/reader_slots_lock.hpp"
 #include <tuple>
+#include <deque>
+#include <functional>
+#include <string>
 #include <algorithm>
+#include <array>
 #include <system_error>
 #include <chrono>
 #include <condition_variable>
@@ -39,7 +50,7 @@ namespace sl = na::observe::slots;
 // {6E2B39A4-1C0D-4C55-9A3F-2F6B8E1D7A10}: our retirement sentinel's private-data key.
 constexpr GUID kSentinelGuid = {0x6e2b39a4, 0x1c0d, 0x4c55, {0x9a, 0x3f, 0x2f, 0x6b, 0x8e, 0x1d, 0x7a, 0x10}};
 
-// Pipelines and root signatures have no na_object_kind in ABI 0.1; their
+// Pipelines, root and command signatures have no na_object_kind in ABI 0.1; their
 // retirement reports this value (documented in the C8 proposal).
 constexpr uint32_t NA_OBJ_PIPELINE_HOST = 10;
 
@@ -51,10 +62,16 @@ struct QueueState {
     std::mutex submit_m;
 };
 
+struct DescHeap;
+// Recordings with a pinned viewport sample may still need it after the global
+// request goes away. Only an entirely idle jitter path can skip the list locks.
+std::atomic<uint64_t> g_vpj_recordings{0};
 struct ListState {
+    uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
     std::atomic<uint64_t> generation{0};
     std::atomic<bool> generation_known{false};
     std::atomic<uint64_t> op_index{0};
+    std::atomic<uint8_t> work_tail{0}; // 0 unarmed, 1 watched, 2 followed by more work
     std::atomic<bool> recording_observed{false}; // this recording began under observation
     std::atomic<bool> coverage_complete{false};  // the list's current table is fully hooked
     // C9: constant-data bindings of the current recording, snapshotted at submission.
@@ -67,6 +84,16 @@ struct ListState {
     std::mutex bind_m;
     std::vector<Binding> bindings;
     const void* root_sig[2] = {nullptr, nullptr}; // graphics, compute (recording thread)
+    // root_table: the bound root signature's registry entry, reused while the same signature stays
+    // bound and no object retired (g_retire_gen); std::unordered_map nodes never move otherwise.
+    const void* rs_key[2] = {nullptr, nullptr};
+    const void* rs_obj[2] = {nullptr, nullptr};
+    uint64_t rs_gen[2] = {0, 0};
+    // The bound pipeline's registry entry, reused the same way (pso_obj_locked; under g_m + bind_m).
+    const void* pso_key = nullptr;
+    const void* pso_obj = nullptr;
+    uint64_t pso_gen = 0;
+    uint64_t root_serial[2]{},host_restore_serial=0;
     // C9b: explicit transitions recorded in this recording, in order (under bind_m).
     struct StateNote {
         na_object_id resource;
@@ -102,21 +129,68 @@ struct ListState {
     struct RootArg {
         uint8_t type = 0; // 0 unset, 1 table, 2 CBV, 3 SRV, 4 UAV, 5 constants
         uint64_t value = 0;
+        uint64_t serial = 0;
         std::vector<uint32_t> consts;
     };
     ID3D12PipelineState* pso = nullptr;
     ID3D12DescriptorHeap* heaps[2] = {nullptr, nullptr};
+    DescHeap* heap_metadata[2]{}; // borrowed only under g_m, invalidated by heap_registry_revision
+    uint64_t heap_metadata_revision=0;
     uint32_t nheaps = 0;
+    struct KeyCache {
+        OperationKey prefix;
+        uint64_t state_revision=0,registry_revision=0,dimension_cbvs=0;
+        std::vector<uint64_t> members;
+        bool valid=false,rebase=false;
+    } operation_key[2];
+    uint64_t key_revision[2]{},read_revision[2]{};
+    struct ShaderReads {
+        uint64_t state_revision=0,registry_revision=0,color=0;
+        na_object_id srvs[16]{},uav=0;
+        uint32_t count=0;uint8_t color_srvs=0;bool valid=false;
+    } shader_reads[2];
     std::vector<RootArg> args[2]; // [graphics, compute], by root parameter
     na_object_id cur_rt = 0, cur_ds = 0; // currently bound first render target / depth
+    na_object_id last_draw_rt = 0; // actual draw evidence survives OM unbinding
     na_object_id cur_rts[8] = {};
     uint32_t cur_nrt = 0;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32;
+    na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
+    uint32_t entry_barrier=0;
     bool restorable = true;              // false after work whose state effects we cannot replay
+    bool game_stream_output = false;     // a stream-output target of the game is bound now (any slot)
+    D3D12_GPU_VIRTUAL_ADDRESS game_so[D3D12_SO_BUFFER_SLOT_COUNT]{};
     bool in_render_pass = false;         // between BeginRenderPass and EndRenderPass (no host copy/dispatch allowed)
-    int8_t mip_level = -1;               // live mip bias: twin level latched at Reset (-1 = the game's own objects)
+    D3D12_VIEWPORT raster_viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    D3D12_RECT raster_scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT raster_viewport_count = 0, raster_scissor_count = 0, raster_rt_count = 0;
+    D3D12_PRIMITIVE_TOPOLOGY raster_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    bool raster_viewports_known = false, raster_scissors_known = false, raster_topology_known = false;
+    bool raster_targets_known = false, raster_has_depth = false;
+    bool raster_tracking = false; // latched at Reset; an Off request cannot undo restoration mid-recording
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffers[32]{};
+    uint32_t vertex_mask=0;
+    D3D12_INDEX_BUFFER_VIEW index_buffer{};
+    bool index_known=false;
+    float blend_factor[4]{};UINT stencil_ref=0;
+    ID3D12Resource* predicate=nullptr;UINT64 predicate_offset=0;D3D12_PREDICATION_OP predicate_op=D3D12_PREDICATION_OP_EQUAL_ZERO;
+    uint32_t active_queries=0;
+    std::vector<std::shared_ptr<const DescriptorDetails>> native_colors;
+    uint64_t target_serial=0,viewport_serial=0,scissor_serial=0;
+    std::shared_ptr<const DescriptorDetails> native_depth;
+    int8_t mip_level = -1;               // live sampler variant latched at Reset: mip level (-1 = the game's own objects)
+    int8_t af_latched = 0;               // ...and its anisotropic index (0 off, 1 4x, 2 8x, 3 16x)
+    // Binds of this recording (under bind_m; added to the totals at the next Reset): twin
+    // passed to the driver / the game's own object kept (sampler-independent or identical twin).
+    uint32_t mip_pso_twin = 0, mip_pso_game = 0, mip_rs_twin = 0, mip_rs_game = 0;
+    // Viewport jitter: our offset copies of the game's viewports are bound now (vpj_value),
+    // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
+    bool vpj_applied = false;
+    uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
+    ~ListState() { if (vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release); }
 };
 
+struct VariantRecipe; // live sampler variants: see the definition
 struct Obj {
     na_object_id id = 0;
     uint32_t kind = 0;
@@ -126,13 +200,36 @@ struct Obj {
     std::vector<na_root_param> root_params; // root signatures (C9 table resolution)
     std::vector<na_root_range> root_ranges;
     uint64_t root_hash = 0;                 // structural layout hash (role classes; stable across sessions)
+    std::vector<ShaderDimension> dimensions;
+    std::vector<ShaderResource> shader_resources;
+    bool reflection_complete=false;
+    bool native_hud_affine=false;
+    uint8_t blend_class=0; // BlendClass (producers.hpp)
+    bool shader_readonly=false;
+    uint32_t shader_rejection=ShaderUnknown;
+    bool pixel_position=false;
+    uint8_t indirect_draw_kind=0; // 1 DRAW, 2 DRAW_INDEXED; no root/IA state arguments
     // Live mip bias: per-level twins of a root signature / pipeline state (index = level).
     // same[i]: the game's own object is already correct for level i (nothing to swap).
     // Immutable once published; owns a reference on every twin. A twin is never one of
     // the game's own objects (see D_CreateRootSignature), so twins cannot form cycles.
     // Never destroyed inside another D3D12 object's destruction: see ReleaseTwinsLater.
-    struct Twins { IUnknown* obj[3] = {}; bool same[3] = {}; ~Twins() { for (auto* o : obj) if (o) o->Release(); } };
-    std::shared_ptr<Twins> twins;
+    // built[i]: level i was prepared (same or obj, or it failed: then neither and lookups fall back).
+    struct Twins {
+        IUnknown* obj[7] = {}; bool same[7] = {}; bool built[7] = {}; // = kMipCount
+        Twins() = default;
+        Twins(const Twins& o) { for (int i = 0; i < 7; ++i) { obj[i] = o.obj[i]; same[i] = o.same[i]; built[i] = o.built[i]; if (obj[i]) obj[i]->AddRef(); } }
+        Twins& operator=(const Twins&) = delete;
+        ~Twins() { for (auto* o : obj) if (o) o->Release(); }
+    };
+    std::shared_ptr<Twins> twins;          // raster storage on command lists (not sampler variants)
+    // Live sampler variants (mip bias x anisotropic filtering): af_sets[a] holds the twins at
+    // anisotropic index a, per mip level. variant_kind: 0 = sampler-independent (the game's
+    // object is right for every variant), 1 = has variants, 2 = cannot be twinned (a pipeline
+    // with an embedded root signature): recordings fall back to the game's objects.
+    std::shared_ptr<Twins> af_sets[4];
+    std::shared_ptr<const VariantRecipe> recipe; // creation copy for background builds
+    uint8_t variant_kind = 0;
     bool retirement_unobservable = false;   // the sentinel could not be attached
     uint64_t present_ordinal = 0;
 };
@@ -150,8 +247,41 @@ struct DescHeap {
         uint32_t first_sub = NA_UNKNOWN_U32;
         uint64_t cbv_offset = 0; // CBV: byte offset in `resource`
         uint32_t cbv_size = 0;   // CBV: SizeInBytes
+        std::shared_ptr<const DescriptorDetails> details;
     };
     std::vector<SlotInfo> info; // last observed write per slot (record-time CPU view)
+    // Slot stripes (64 slots each): descriptor copies, the game's most frequent call (10-20k
+    // per frame in SE5), update versions/info under the SHARED g_m plus these, exclusive for
+    // the destination slots and shared for the source slots. Every other reader of
+    // versions/info under the shared g_m takes the covering stripe shared, one stripe at a
+    // time. Writers under the exclusive g_m need none (no copy can be running then).
+    std::unique_ptr<std::shared_mutex[]> stripes;
+    uint32_t nstripes = 0;
+    // Read filter (one bit per slot, one word per stripe): the slot holds an SRV of a resource in
+    // g_hot_ids (the live scene colour or any resource ever seen as a copy of it). Written with
+    // info, under the same locks; read under the shared g_m.
+    std::unique_ptr<std::atomic<uint64_t>[]> hot;
+};
+constexpr uint32_t kStripeShift = 6;
+// Shared lock of the stripe holding a slot. Holds at most one stripe: lock() moves to
+// another stripe by releasing the current one first (never two at once, so readers cannot
+// form a cycle with a copy, which takes its stripes in one global order).
+struct SlotShared {
+    std::shared_mutex* m = nullptr;
+    SlotShared() = default;
+    SlotShared(const DescHeap* h, uint64_t slot) { lock(h, slot); }
+    SlotShared(const SlotShared&) = delete;
+    SlotShared& operator=(const SlotShared&) = delete;
+    void lock(const DescHeap* h, uint64_t slot)
+    {
+        std::shared_mutex* n = h && h->stripes && (slot >> kStripeShift) < h->nstripes ? &h->stripes[static_cast<size_t>(slot >> kStripeShift)] : nullptr;
+        if (n == m) return;
+        unlock();
+        m = n;
+        if (m) m->lock_shared();
+    }
+    void unlock() { if (m) { m->unlock_shared(); m = nullptr; } }
+    ~SlotShared() { unlock(); }
 };
 
 struct VaRange {
@@ -160,10 +290,22 @@ struct VaRange {
     const void* key = nullptr;
 };
 
-std::shared_mutex g_m; // registry, heaps, VA table. Never held across a D3D12 call.
+// registry, heaps, VA table. Never held across a D3D12 call. Readers take per-thread slots
+// instead of one shared lock word (reader_slots_lock.hpp: SE5 spun ~3.7 s/s on that word).
+// Deferred descriptor view writes (see note_descriptor_write) of every thread are applied before
+// any thread takes the registry lock for anything else, so no reader can see a slot older than
+// its last write. The flush itself locks the base class.
+void flush_deferred_writes();
+struct RegistryLock : na::observe::ReaderSlotsLock {
+    void lock_shared() { flush_deferred_writes(); ReaderSlotsLock::lock_shared(); }
+    void lock() { flush_deferred_writes(); ReaderSlotsLock::lock(); }
+};
+RegistryLock g_m;
 // Never destroyed: at process exit an entry's twins must not be Released (a twin's last
 // Release can retire an object through its sentinel, which takes g_m and walks this map).
 std::unordered_map<const void*, Obj>& g_objs = *new std::unordered_map<const void*, Obj>();
+std::atomic<bool> g_raster_tracking{false};
+std::atomic<bool> g_operation_snapshots{false};
 void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t); // live mip bias: see the definition
 void ReleaseParkedTwins();
 std::atomic<uint64_t> g_mip_shared_skips{0}; // twin levels dropped: D3D12 returned one of the game's own root signatures
@@ -177,16 +319,33 @@ std::atomic<uint64_t> g_mip_shared_skips{0}; // twin levels dropped: D3D12 retur
 // creation hook or ExecuteCommandLists, which run in the game's call, not inside the
 // runtime's teardown of an object). Twins still parked at process exit are leaked.
 std::mutex g_twin_grave_m;
-std::vector<std::shared_ptr<Obj::Twins>>& g_twin_grave = *new std::vector<std::shared_ptr<Obj::Twins>>();
+std::vector<std::shared_ptr<void>>& g_twin_grave = *new std::vector<std::shared_ptr<void>>();
 void ReleaseTwinsLater(std::shared_ptr<Obj::Twins>&& t)
 {
     if (!t) return;
     std::lock_guard<std::mutex> lk(g_twin_grave_m);
     g_twin_grave.push_back(std::move(t));
 }
+// An entry's twins, variant sets and creation copy (which holds a device reference).
+struct ObjParcel { std::shared_ptr<Obj::Twins> twins, sets[4]; std::shared_ptr<const VariantRecipe> recipe; };
+ObjParcel take_parcel(Obj& o)
+{
+    ObjParcel p;
+    p.twins = std::move(o.twins);
+    for (int a = 0; a < 4; ++a) p.sets[a] = std::move(o.af_sets[a]);
+    p.recipe = std::move(o.recipe);
+    return p;
+}
+void ReleaseLater(ObjParcel&& p)
+{
+    std::lock_guard<std::mutex> lk(g_twin_grave_m);
+    if (p.twins) g_twin_grave.push_back(std::move(p.twins));
+    for (auto& t : p.sets) if (t) g_twin_grave.push_back(std::move(t));
+    if (p.recipe) g_twin_grave.push_back(std::const_pointer_cast<VariantRecipe>(std::move(p.recipe)));
+}
 void ReleaseParkedTwins()
 {
-    std::vector<std::shared_ptr<Obj::Twins>> dead;
+    std::vector<std::shared_ptr<void>> dead;
     {
         std::lock_guard<std::mutex> lk(g_twin_grave_m);
         if (g_twin_grave.empty()) return;
@@ -195,7 +354,100 @@ void ReleaseParkedTwins()
     dead.clear(); // plain Release calls from the game's own call stack
 }
 std::vector<std::unique_ptr<DescHeap>> g_heaps;
+// ---- Read filter (WWII p31660, 2026-11-09: DLAA on, 10 fps, the bridge's single thread at 98%:
+// before_shader_use walked every descriptor of every bound table on ~9,000 draws per frame,
+// 2.6 us per draw, touching one 48-byte SlotInfo per descriptor of a ring heap that is new each
+// draw, so its cache never hits). The walk only produces something when a table holds an SRV
+// of the scene colour or of a copy of it. g_hot_ids is a superset of both (the selected colour
+// plus every copy ever seen); each heap keeps one bit per slot for "SRV of a hot id". When no
+// bound SRV range has a hot bit, the walk's result is known (no colour read, no derived read)
+// and it is skipped; otherwise the original walk runs unchanged. The set grows only through RefreshReadFilter
+// (called at Present with no lock held), which publishes the ids and then adds the bits heap by
+// heap in chunks; until that scan is complete g_hot_ready is false and every draw takes the original walk.
+constexpr uint32_t kHotMax = 64;
+na_object_id g_hot_ids[kHotMax] = {}; // read under the shared g_m, written under the exclusive g_m
+uint32_t g_hot_n = 0;
+na_object_id g_hot_color = 0;         // the selected colour the bits were built for
+std::atomic<bool> g_hot_ready{false};
+std::mutex g_hot_pending_m;           // the known set mirrored here, plus additions not yet applied
+na_object_id g_hot_known[kHotMax] = {};
+uint32_t g_hot_known_n = 0;
+na_object_id g_hot_pending[kHotMax] = {};
+uint32_t g_hot_pending_n = 0;
+bool g_hot_overflow = false;          // more than kHotMax ids: the filter stays off (original walk)
+std::atomic<uint64_t> g_hot_rebuilds{0}, g_hot_skipped{0}, g_hot_walked{0};
+inline bool hot_id_locked(na_object_id id)
+{
+    if (!id || id == NA_UNKNOWN_U64) return false;
+    for (uint32_t i = 0; i < g_hot_n; ++i) if (g_hot_ids[i] == id) return true;
+    return false;
+}
+inline void set_hot_bit(DescHeap* h, uint64_t slot, bool on)
+{
+    if (!h->hot || (slot >> kStripeShift) >= h->nstripes) return;
+    const uint64_t bit = 1ull << (slot & 63);
+    auto& w = h->hot[static_cast<size_t>(slot >> kStripeShift)];
+    if (on) w.fetch_or(bit, std::memory_order_relaxed);
+    else if (w.load(std::memory_order_relaxed) & bit) w.fetch_and(~bit, std::memory_order_relaxed);
+}
+// Any hot slot in [first, first + n) (clipped to the heap); the shared g_m is held.
+inline bool any_hot(const DescHeap* h, uint64_t first, uint64_t n)
+{
+    if (!h->hot) return true; // no bitmap: let the walk decide
+    if (first >= h->count) return false;
+    const uint64_t end = std::min<uint64_t>(first + n, h->count);
+    for (uint64_t a = first; a < end;) {
+        const uint64_t w = a >> kStripeShift, lo = a & 63, hi = std::min<uint64_t>(64, lo + (end - a));
+        const uint64_t mask = (hi == 64 ? ~0ull : ((1ull << hi) - 1)) & ~((1ull << lo) - 1);
+        if (h->hot[static_cast<size_t>(w)].load(std::memory_order_relaxed) & mask) return true;
+        a += hi - lo;
+    }
+    return false;
+}
+void mark_hot_candidate(na_object_id id) // a copy of the scene colour (any thread, any lock)
+{
+    if (!id || id == NA_UNKNOWN_U64) return;
+    std::lock_guard<std::mutex> lk(g_hot_pending_m);
+    for (uint32_t i = 0; i < g_hot_known_n; ++i) if (g_hot_known[i] == id) return;
+    for (uint32_t i = 0; i < g_hot_pending_n; ++i) if (g_hot_pending[i] == id) return;
+    g_hot_ready.store(false, std::memory_order_release);
+    if (g_hot_pending_n < kHotMax) g_hot_pending[g_hot_pending_n++] = id; else g_hot_overflow = true;
+}
+// CPU-handle index of g_heaps, sorted by cpu_start (rebuilt under the exclusive g_m whenever
+// g_heaps changes): every descriptor write/copy and many binds looked their heap up by
+// walking all heaps under the lock.
+std::vector<std::pair<uint64_t, DescHeap*>> g_heap_cpu_index;
+void heap_index_rebuild()
+{
+    g_heap_cpu_index.clear();
+    g_heap_cpu_index.reserve(g_heaps.size());
+    for (auto& h : g_heaps) g_heap_cpu_index.emplace_back(h->cpu_start, h.get());
+    // Stable: for an equal start the later (newer) heap stays last and is found first.
+    std::stable_sort(g_heap_cpu_index.begin(), g_heap_cpu_index.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+}
 std::vector<VaRange> g_va; // sorted by begin
+// g_va_maxend[i] = the largest end among g_va[0..i]: a backwards walk stops as soon as no
+// earlier range can reach va. Exact (overlapping placed buffers are still all found), where
+// the old 64 GB window crossed nearly every buffer on each root CBV/SRV bind.
+std::vector<uint64_t> g_va_maxend;
+void va_reindex(size_t from)
+{
+    g_va_maxend.resize(g_va.size());
+    for (size_t i = from; i < g_va.size(); ++i)
+        g_va_maxend[i] = i ? (std::max)(g_va_maxend[i - 1], g_va[i].end) : g_va[i].end;
+}
+void va_insert(const VaRange& r)
+{
+    const auto it = std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; });
+    const size_t at = static_cast<size_t>(it - g_va.begin());
+    g_va.insert(it, r);
+    va_reindex(at);
+}
+// Protected by the existing g_m. No additional hot-path setter lock. Identity
+// reuse, descriptor writes/copies and heap retirement invalidate borrowed data.
+std::atomic<uint64_t> g_operation_revision{1}; // atomic: descriptor copies advance it under the shared g_m
+uint64_t g_heap_registry_revision=1;
 struct BufferInfo {
     uint32_t heap_type = NA_UNKNOWN_U32;
     uint64_t width = 0;
@@ -215,10 +467,42 @@ bool cpu_visible_heap(const D3D12_HEAP_PROPERTIES& p)
 }
 std::unordered_map<na_object_id, BufferInfo> g_buffers; // under g_m
 std::unordered_map<na_object_id, const void*> g_res_keys; // resource id -> canonical object (C9b), under g_m
+// 2D textures by (width, height), kept beside g_res_keys under g_m so FindTextures is a
+// bucket lookup. Before this (p49040, WWII 11on12) the lookup walked every resource and ran
+// three to four times per DLAA evaluation on the translator thread: ~18 ms of each frame.
+std::unordered_map<uint64_t, std::vector<na_object_id>> g_tex2d_by_dims;
+std::unordered_map<na_object_id, uint64_t> g_tex2d_dims; // id -> its key, for retirement
+inline uint64_t tex2d_key(uint64_t w, uint32_t h) { return (w << 32) | h; }
+void tex2d_index_add_locked(na_object_id id, const D3D12_RESOURCE_DESC& d)
+{
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    const uint64_t key = tex2d_key(d.Width, d.Height);
+    const auto prev = g_tex2d_dims.find(id);
+    if (prev != g_tex2d_dims.end()) {
+        if (prev->second == key) return; // re-registered with the same description
+        auto& v = g_tex2d_by_dims[prev->second];
+        v.erase(std::remove(v.begin(), v.end(), id), v.end());
+        if (v.empty()) g_tex2d_by_dims.erase(prev->second);
+    }
+    g_tex2d_dims[id] = key;
+    g_tex2d_by_dims[key].push_back(id);
+}
+void tex2d_index_erase_locked(na_object_id id)
+{
+    const auto it = g_tex2d_dims.find(id);
+    if (it == g_tex2d_dims.end()) return;
+    const auto b = g_tex2d_by_dims.find(it->second);
+    if (b != g_tex2d_by_dims.end()) {
+        auto& v = b->second;
+        v.erase(std::remove(v.begin(), v.end(), id), v.end());
+        if (v.empty()) g_tex2d_by_dims.erase(b);
+    }
+    g_tex2d_dims.erase(it);
+}
 std::atomic<uint64_t> g_next_id{1};
 
 struct Counters {
-    std::atomic<uint64_t> nested_unlocked{0};
+    std::atomic<uint64_t> nested_unlocked{0}, serialized{0};
     std::atomic<uint64_t> snap_reread{0}, preexisting_resources{0}, preexisting_heaps{0}, sample_known_state{0}, known_clears{0};
     std::atomic<uint64_t> sample_missing_recording{0}, sample_partial_coverage{0}, sample_partial_states{0}, sample_no_transition{0};
     std::atomic<uint64_t> live{0}, created{0}, retired{0}, writes{0}, copies{0}, unresolved{0}, sentinel_fail{0},
@@ -266,7 +550,13 @@ struct ResKnown {
     bool has_all = false;
     uint32_t all = kStatePending;
     std::unordered_map<uint32_t, uint32_t> subs;
+    uint8_t reset_why = 0;  // diagnostics: why its states last became unknown (KnownReset)
 };
+// Why a carried state became unknown (diagnostics only; DescribeStateEvidence names it).
+enum KnownReset : uint8_t { kResetNone, kResetStoreClear, kResetOverlap, kResetUnordered, kResetOtherQueue, kResetSubs, kResetPendingNote,
+                            kResetAmbiguous, kResetTainted, kResetEpoch, kResetCopyQueue };
+const char* const kResetNames[] = {"none", "store_clear", "overlapped_submissions", "unordered_submission", "other_queue", "too_many_subresources", "split_or_aliasing_barrier",
+                                   "ambiguous_queue_order", "unknown_submission_in_flight", "store_cleared_meanwhile", "copy_queue_decay"};
 constexpr size_t kMaxKnown = 65536, kMaxKnownSubs = 64;
 std::mutex g_known_m;
 std::unordered_map<na_object_id, ResKnown> g_known; // under g_known_m (never taken before g_m or g_samples_m)
@@ -287,8 +577,9 @@ void known_forget(na_object_id id)
     std::lock_guard<std::mutex> lock(g_known_m);
     g_known.erase(id);
 }
-void known_reset_locked(ResKnown& k)
+void known_reset_locked(ResKnown& k, KnownReset why)
 {
+    k.reset_why = why;
     k.queue = 0;
     k.has_all = false;
     k.all = kStatePending;
@@ -297,7 +588,7 @@ void known_reset_locked(ResKnown& k)
 // Entries stay (eligibility and in-flight marks are kept); states become unknown.
 void known_clear_locked()
 {
-    for (auto& kv : g_known) known_reset_locked(kv.second);
+    for (auto& kv : g_known) known_reset_locked(kv.second, kResetStoreClear);
     ++g_known_epoch;
     g_c.known_clears.fetch_add(1);
 }
@@ -362,6 +653,20 @@ void init_header(E& e, uint32_t kind, uint32_t flags)
     e.hdr.flags = flags;
 }
 
+// Like init_header, but for a kind the session's consumer does not read
+// (na_observe_skip_kinds): the event is zeroed and NOT numbered, so skipping it leaves
+// no thread_seq gap (a gap would read as lost events). Returns whether to emit it.
+template <typename E>
+bool init_header_wanted(E& e, uint32_t kind, uint32_t flags)
+{
+    if (!na::observe_internal::KindSkipped(kind)) {
+        init_header(e, kind, flags);
+        return true;
+    }
+    std::memset(&e, 0, sizeof(e));
+    return false;
+}
+
 template <typename E>
 void emit(const E& e, uint32_t group)
 {
@@ -369,19 +674,114 @@ void emit(const E& e, uint32_t group)
     na::observe_internal::Emit(&e, group);
 }
 
+// ---- Hook cost (2026-11-05: with us loaded SE5 ran 35 fps CPU-bound vs 165 without) ----------
+// Wall time spent inside each outermost command-list hook (ours + the driver's call), per
+// slot, plus ExecuteCommandLists and pipeline creation. Thread-local sums are folded into the
+// shared totals every 512 calls, so the measurement itself adds no shared write per call.
+constexpr uint32_t kCostSlots = 128, kCostExec = 125, kCostPso = 126;
+// Pseudo slots (inside the hooks, inclusive, nested in the slot above): 100.. (printed by name).
+constexpr uint32_t kCostPseudo = 100, kCostVpj = 100, kCostShaderUse = 101, kCostLaneBefore = 102, kCostLaneAfter = 103,
+                   kCostDriver = 104, kCostRun = 105, kCostRootTable = 106, kCostSampled = 107, kCostEmit = 108,
+                   kCostNoteDraw = 109, kCostCanonMiss = 110,
+                   kCostDescCopy = 111, kCostDescCopyWait = 112, kCostDescWrite = 113, kCostDescWriteWait = 114, // descriptor copies/writes and their wait for the exclusive g_m
+                   // WWII p28412 (2026-11-09): pso 37-81 ms per creation and shader_use 10 us per draw were the two
+                   // costs; these split each into the driver's / the walk's share and ours.
+                   kCostPsoDriver = 115, kCostPsoReflect = 116, kCostUseLookup = 117, kCostUseWalk = 118, kCostUseCallback = 119,
+                   // WWII p7632: ResourceBarrier cost 15 ms per DLAA frame; the scene-read callback (inline DLAA) is timed alone.
+                   kCostSceneReadCb = 120, kCostLast = 120;
+std::atomic<bool> g_cost_enabled{false};
+std::atomic<uint64_t> g_cost_ticks[kCostSlots]{}, g_cost_calls[kCostSlots]{}, g_cost_timed[kCostSlots]{};
+thread_local uint64_t t_cost_ticks[kCostSlots]{}, t_cost_calls[kCostSlots]{}, t_cost_timed[kCostSlots]{};
+thread_local uint32_t t_cost_n = 0, t_cost_seq[kCostSlots]{};
+// WWII p7632: ~7 million timed scopes per second (one per descriptor copy/write, its lock wait, every
+// driver forward, root table and event emit) made the profiler a large share of what it measured: two
+// clock reads per scope, nested inside the slot envelopes. These uniform, very frequent scopes are
+// timed on one call in 16 (per thread) and every call is counted; the report scales the timed sum
+// by calls/timed. All other slots (rare or heavy-tailed, such as ResourceBarrier) time every call.
+constexpr uint32_t kCostSampleMask = 15;
+constexpr bool cost_sampled(uint32_t s)
+{
+    return s == kCostDescCopy || s == kCostDescCopyWait || s == kCostDescWrite || s == kCostDescWriteWait ||
+           s == kCostDriver || s == kCostRootTable || s == kCostEmit ||
+           // WWII p31660: ~9,000 draws per frame, each opening up to five of these nested per-draw scopes.
+           s == kCostVpj || s == kCostShaderUse || s == kCostUseLookup || s == kCostUseWalk || s == kCostUseCallback;
+}
+inline uint64_t cost_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return static_cast<uint64_t>(c.QuadPart); }
+void cost_flush()
+{
+    for (uint32_t i = 0; i < kCostSlots; ++i)
+        if (t_cost_calls[i]) {
+            g_cost_ticks[i].fetch_add(t_cost_ticks[i], std::memory_order_relaxed);
+            g_cost_calls[i].fetch_add(t_cost_calls[i], std::memory_order_relaxed);
+            g_cost_timed[i].fetch_add(t_cost_timed[i], std::memory_order_relaxed);
+            t_cost_ticks[i] = t_cost_calls[i] = t_cost_timed[i] = 0;
+        }
+    t_cost_n = 0;
+}
+struct CostScope {
+    uint32_t slot = kCostSlots; uint64_t t0 = 0; bool counted = false; // counted: the call was counted at entry (sampled slot)
+    explicit CostScope(uint32_t s, bool on = true)
+    {
+        if (!on || s >= kCostSlots || !g_cost_enabled.load(std::memory_order_relaxed)) return;
+        if (cost_sampled(s)) {
+            ++t_cost_calls[s];
+            if (t_cost_seq[s]++ & kCostSampleMask) return; // counted, not timed
+            counted = true;
+        }
+        slot = s; t0 = cost_now();
+    }
+    void Close()
+    {
+        if (slot >= kCostSlots) return;
+        t_cost_ticks[slot] += cost_now() - t0; ++t_cost_timed[slot];
+        if (!counted) ++t_cost_calls[slot];
+        counted = false;
+        if (++t_cost_n >= 512 || slot >= kCostExec) cost_flush();
+        slot = kCostSlots;
+    }
+    // Account what ran so far to this scope's slot and continue under another one.
+    // A sampled target is counted on every call and timed only when this scope was timed, so a
+    // sampled chain (lookup -> walk) times whole calls and the report's calls/timed scaling holds.
+    void Switch(uint32_t s)
+    {
+        const bool on = slot < kCostSlots;
+        Close();
+        if (s >= kCostSlots || !g_cost_enabled.load(std::memory_order_relaxed)) return;
+        if (cost_sampled(s)) {
+            ++t_cost_calls[s];
+            if (!on) return;
+            counted = true;
+        } else if (!on) {
+            return;
+        }
+        slot = s; t0 = cost_now();
+    }
+    ~CostScope() { Close(); }
+    CostScope(const CostScope&) = delete;
+    CostScope& operator=(const CostScope&) = delete;
+};
+
+
 // Canonical COM identity (review: interface pointers of one object may differ
 // under wrapping layers): the registry is keyed by the object's IUnknown.
-// A one-entry per-thread cache keeps the hot recording path cheap; any
-// retirement invalidates every cache (an address may be reused afterwards).
+// A small per-thread cache keeps the hot recording path cheap; any retirement invalidates
+// every cache (an address may be reused afterwards). 2026-11-05: one entry thrashed, since a
+// draw canonicalises its list AND its pipeline (note_draw, viewport jitter), so every call fell
+// through to QueryInterface + Release: two COM calls, and interlocked refcount traffic on the
+// game's shared PSOs from every recording thread. Eight entries, round-robin replacement.
 std::atomic<uint64_t> g_retire_gen{1};
 const void* canon(const void* p)
 {
     if (!p) return nullptr;
-    thread_local const void* c_in = nullptr;
-    thread_local const void* c_out = nullptr;
+    constexpr unsigned kWays = 8;
+    thread_local const void* c_in[kWays] = {};
+    thread_local const void* c_out[kWays] = {};
     thread_local uint64_t c_gen = 0;
+    thread_local unsigned c_next = 0;
     const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
-    if (p == c_in && gen == c_gen) return c_out;
+    if (gen != c_gen) { for (unsigned i = 0; i < kWays; ++i) c_in[i] = nullptr; c_gen = gen; }
+    for (unsigned i = 0; i < kWays; ++i) if (c_in[i] == p) return c_out[i];
+    const CostScope miss(kCostCanonMiss);
     IUnknown* u = nullptr;
     auto* obj = static_cast<IUnknown*>(const_cast<void*>(p));
     const void* out = p;
@@ -389,9 +789,9 @@ const void* canon(const void* p)
         out = u;
         u->Release(); // the caller still holds the object
     }
-    c_in = p;
-    c_out = out;
-    c_gen = gen;
+    const unsigned w = c_next++ % kWays;
+    c_in[w] = p;
+    c_out[w] = out;
     return out;
 }
 
@@ -429,21 +829,38 @@ private:
     uint32_t kind_;
 };
 
+std::atomic<bool> g_process_exiting{false};
 void RetireSentinel::retire(const void* key, na_object_id id, uint32_t kind)
 {
+    // SE5 exit crashes (c0000005 at retire, symbolicated 2026-11-02): exit-time destructors of
+    // other statics released D3D12 objects after the CRT had destroyed g_m / g_heaps / g_va.
+    if (g_process_exiting.load(std::memory_order_acquire)) return;
     g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
-    std::shared_ptr<Obj::Twins> drop; // parked, never released here (we are inside the owner's destruction)
+    ObjParcel drop; // parked, never released here (we are inside the owner's destruction)
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
+        ++g_operation_revision;++g_heap_registry_revision;
         auto it = g_objs.find(key);
-        if (it != g_objs.end() && it->second.id == id) { drop = std::move(it->second.twins); g_objs.erase(it); }
+        if (it != g_objs.end() && it->second.id == id) { drop = take_parcel(it->second); g_objs.erase(it); }
+        // Again under the exclusive lock: an entry cached between the bump above and this erase
+        // (root_table's per-recording root signature entry) must not survive it.
+        g_retire_gen.fetch_add(1, std::memory_order_acq_rel);
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& h) { return h->id == id; }),
                       g_heaps.end());
-        g_va.erase(std::remove_if(g_va.begin(), g_va.end(), [&](const VaRange& r) { return r.resource == id; }), g_va.end());
+        heap_index_rebuild();
+        {
+            const auto first = std::find_if(g_va.begin(), g_va.end(), [&](const VaRange& r) { return r.resource == id; });
+            if (first != g_va.end()) {
+                const size_t at = static_cast<size_t>(first - g_va.begin());
+                g_va.erase(std::remove_if(first, g_va.end(), [&](const VaRange& r) { return r.resource == id; }), g_va.end());
+                va_reindex(at);
+            }
+        }
         g_buffers.erase(id);
         g_res_keys.erase(id);
+        tex2d_index_erase_locked(id);
     }
-    ReleaseTwinsLater(std::move(drop));
+    ReleaseLater(std::move(drop));
     if (kind == NA_OBJ_RESOURCE) known_forget(id);
     g_c.live.fetch_sub(1);
     g_c.retired.fetch_add(1);
@@ -478,7 +895,7 @@ void attach_sentinel(IUnknown* object, const void* key, na_object_id id, uint32_
     // Review: no retirement will ever be observed for this identity. Its
     // creation event carries METHOD_UNOBSERVED (see remember_creation).
     g_c.sentinel_fail.fetch_add(1);
-    std::unique_lock<std::shared_mutex> lock(g_m);
+    std::unique_lock<RegistryLock> lock(g_m);
     auto it = g_objs.find(key);
     if (it != g_objs.end() && it->second.id == id) it->second.retirement_unobservable = true;
 }
@@ -499,15 +916,19 @@ na_object_id register_object(IUnknown* object, uint32_t kind)
     if (!object) return 0;
     const void* key = canon(object);
     const na_object_id id = g_next_id.fetch_add(1);
-    std::shared_ptr<Obj::Twins> drop; // stale entry's twins, released after g_m
+    ObjParcel drop; // stale entry's twins, released after g_m
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         Obj& o = g_objs[key];
-        if (o.id) g_c.live.fetch_sub(1); // address reused without a retirement we saw
-        drop = std::move(o.twins);
+        ++g_operation_revision;
+        if (o.id) {
+            g_c.live.fetch_sub(1); // address reused without a retirement we saw
+            g_retire_gen.fetch_add(1, std::memory_order_acq_rel); // cached entries (lists, pipelines, signatures) of the old object
+        }
+        drop = take_parcel(o);
         o = fresh_obj(id, kind);
     }
-    ReleaseTwinsLater(std::move(drop));
+    ReleaseLater(std::move(drop));
     g_c.live.fetch_add(1);
     g_c.created.fetch_add(1);
     attach_sentinel(object, key, id, kind);
@@ -523,16 +944,17 @@ na_object_id ensure_registered(IUnknown* object, uint32_t kind, bool* created)
     if (!object) return 0;
     const void* key = canon(object);
     na_object_id id = 0;
-    std::shared_ptr<Obj::Twins> drop; // stale entry's twins, released after g_m
+    ObjParcel drop; // stale entry's twins, released after g_m
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         auto it = g_objs.find(key);
         if (it != g_objs.end() && it->second.kind == kind) return it->second.id;
         id = g_next_id.fetch_add(1);
-        if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = std::move(it->second.twins); }
+        ++g_operation_revision;
+        if (it != g_objs.end()) { g_c.live.fetch_sub(1); drop = take_parcel(it->second); g_retire_gen.fetch_add(1, std::memory_order_acq_rel); }
         g_objs[key] = fresh_obj(id, kind);
     }
-    ReleaseTwinsLater(std::move(drop));
+    ReleaseLater(std::move(drop));
     *created = true;
     g_c.live.fetch_add(1);
     g_c.created.fetch_add(1);
@@ -544,12 +966,13 @@ template <typename E>
 void remember_creation(const void* object, E& e)
 {
     const void* key = canon(object);
-    std::unique_lock<std::shared_mutex> lock(g_m);
+    std::unique_lock<RegistryLock> lock(g_m);
     auto it = g_objs.find(key);
     if (it == g_objs.end()) return;
     if (it->second.retirement_unobservable) e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
     const auto* b = reinterpret_cast<const uint8_t*>(&e);
     it->second.created.assign(b, b + sizeof(E));
+    if constexpr(std::is_same_v<E,na_ev_list_created>)if(it->second.list)it->second.list->list_type=e.list_type;
 }
 
 na_object_id id_locked(const void* object)
@@ -561,7 +984,7 @@ na_object_id id_locked(const void* object)
 na_object_id lookup(const void* key)
 {
     if (!key) return 0;
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     return id_locked(key);
 }
 
@@ -632,11 +1055,12 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
     e.heap_type = heap_type;
     remember_creation(obj, e);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         g_res_keys[id] = canon(obj);
+        tex2d_index_add_locked(id, d);
     }
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         BufferInfo& bi = g_buffers[id];
         bi.heap_type = heap_type;
         bi.width = d.Width;
@@ -650,9 +1074,9 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
         known_created(id, static_cast<uint32_t>(initial));
     if (va) {
-        std::unique_lock<std::shared_mutex> lock(g_m);
-        VaRange r{va, va + d.Width, id, obj};
-        g_va.insert(std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; }), r);
+        std::unique_lock<RegistryLock> lock(g_m);
+        va_insert(VaRange{va, va + d.Width, id, obj});
+        ++g_operation_revision;
     }
     emit(e, NA_GROUP_RESOURCE);
 }
@@ -700,8 +1124,9 @@ na_object_id ensure_resource_registered(ID3D12Resource* res)
     e.heap_type = has_heap ? static_cast<uint32_t>(hp.Type) : NA_UNKNOWN_U32;
     remember_creation(res, e);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         g_res_keys[id] = canon(res);
+        tex2d_index_add_locked(id, d);
         if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             BufferInfo& bi = g_buffers[id];
             bi.heap_type = e.heap_type;
@@ -710,8 +1135,8 @@ na_object_id ensure_resource_registered(ID3D12Resource* res)
             bi.ever_mapped = bi.cpu_visible; // it may have been mapped before we could see it
         }
         if (va) {
-            VaRange r{va, va + d.Width, id, res};
-            g_va.insert(std::upper_bound(g_va.begin(), g_va.end(), r, [](const VaRange& a, const VaRange& b) { return a.begin < b.begin; }), r);
+            va_insert(VaRange{va, va + d.Width, id, res});
+            ++g_operation_revision;
         }
     }
     emit(e, NA_GROUP_RESOURCE);
@@ -740,7 +1165,9 @@ bool resolve_va_locked(uint64_t va, na_object_id* resource, uint64_t* offset)
             found = it->resource;
             base = it->begin;
         }
-        if (it->end + (1ull << 36) < va) break; // ranges far below cannot contain it
+        // No range at or before the previous one ends above va: none can contain it.
+        const size_t i = static_cast<size_t>(it - g_va.begin());
+        if (i == 0 || g_va_maxend[i - 1] <= va) break;
     }
     if (hits != 1) return false;
     *resource = found;
@@ -751,6 +1178,20 @@ bool resolve_va_locked(uint64_t va, na_object_id* resource, uint64_t* offset)
 // ------------------------------------------------------------ descriptors
 DescHeap* heap_for_cpu_locked(uint64_t ptr, uint32_t* slot)
 {
+    // Fast path: the heap with the greatest start at or below ptr.
+    auto it = std::upper_bound(g_heap_cpu_index.begin(), g_heap_cpu_index.end(), ptr,
+                               [](uint64_t v, const std::pair<uint64_t, DescHeap*>& e) { return v < e.first; });
+    if (it != g_heap_cpu_index.begin()) {
+        DescHeap* h = std::prev(it)->second;
+        if (h->increment && ptr >= h->cpu_start) {
+            const uint64_t off = ptr - h->cpu_start;
+            if (off % h->increment == 0 && off / h->increment < h->count) {
+                *slot = static_cast<uint32_t>(off / h->increment);
+                return h;
+            }
+        }
+    }
+    // Overlapping or unindexed heaps (not expected): the original full walk.
     for (auto& h : g_heaps) {
         if (!h->increment || ptr < h->cpu_start) continue;
         const uint64_t off = ptr - h->cpu_start;
@@ -764,35 +1205,273 @@ DescHeap* heap_for_cpu_locked(uint64_t ptr, uint32_t* slot)
     return nullptr;
 }
 
+// Publish a view's creation arguments into a slot (caller holds the slot's stripe exclusively).
+// WWII p31660: ~1 M view writes per second on the bridge's single translator thread, each one a
+// make_shared of a ~250-byte DescriptorDetails plus the free of the slot's previous one. The slot's
+// previous details object is reused in place when the slot is its only owner: every other owner
+// (a descriptor copy's destination slot, a reader's snapshot) can only obtain it by copying from a
+// holder, and the only holder is this slot, whose stripe we hold exclusively. Otherwise (shared)
+// a new object is made, as before. Readers never see a published object change: a shared one is
+// never touched.
+// Only eligible game sampler slots carry this payload. Descriptor-copy shadowing
+// already preserves the slot recipe and drops it when the owning heap is retired.
+struct SamplerRecipe final : DescriptorDetails {
+    D3D12_SAMPLER_DESC desc{};
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+    D3D12_SAMPLER_DESC2 desc2{};
+    bool modern = false;
+#endif
+    float native_bias = 0.0f, stored_bias = 0.0f;
+};
+
+void publish_details(DescHeap::SlotInfo& info, std::shared_ptr<const DescriptorDetails> old, const DescriptorDetails* view,
+                     uint32_t kind, na_object_id resource)
+{
+    if (!view) return;
+    if (kind == NA_DESC_SAMPLER) {
+        auto sampler = std::make_shared<SamplerRecipe>(*static_cast<const SamplerRecipe*>(view));
+        sampler->kind = kind;
+        info.details = std::move(sampler);
+        return;
+    }
+    if (old && old.use_count() == 1) {
+        auto* d = const_cast<DescriptorDetails*>(old.get()); // made non-const by make_shared below
+        *d = *view;
+        d->kind = kind; d->resource = resource;
+        info.details = std::move(old);
+        return;
+    }
+    auto d = std::make_shared<DescriptorDetails>(*view);
+    d->kind = kind; d->resource = resource;
+    info.details = std::move(d);
+}
+
+// ---- Deferred view writes (WWII p49040: ~1.1 M CreateXView per second on the D3D11On12 translator
+// thread, ~0.14 us each = ~12 ms of every frame; the bridge writes ~10 staging descriptors per draw
+// and copies them into its online heap). When nothing needs the write at once (its event is not
+// wanted, no operation snapshot, not host work) and the resource's registry id is already known to
+// this thread, the write is queued on the thread's queue and applied in one batch: one registry
+// lock, one stripe lock per run of neighbouring slots, one revision bump. Every queue is drained by
+// ANY thread before it takes the registry lock for anything else (RegistryLock above), so no reader
+// of a slot (the draw's walk, a copy of the slot, a render-target bind, ExecuteCommandLists, the
+// read-filter scan) can see a slot older than its last write, whichever thread wrote it: a view the
+// game thread created is applied at the latest when the translator thread next touches the registry.
+// Per-thread resource id cache: pointer -> registry id, valid until any object retires
+// (g_retire_gen, as canon()'s cache), so a cached id never names a reused pointer.
+constexpr uint32_t kIdCache = 256;
+struct ThreadIdCache { uint64_t gen = 0; const void* ptr[kIdCache]{}; na_object_id id[kIdCache]{}; };
+thread_local ThreadIdCache t_idc;
+inline uint32_t idc_slot(const void* p) { return static_cast<uint32_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B1u) >> 24; }
+inline void idc_refresh()
+{
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (gen == t_idc.gen) return;
+    for (auto& q : t_idc.ptr) q = nullptr;
+    t_idc.gen = gen;
+}
+inline bool idc_get(const void* p, na_object_id* id)
+{
+    idc_refresh();
+    const uint32_t i = idc_slot(p);
+    if (t_idc.ptr[i] != p) return false;
+    *id = t_idc.id[i];
+    return true;
+}
+inline void idc_put(const void* p, na_object_id id)
+{
+    idc_refresh();
+    const uint32_t i = idc_slot(p);
+    t_idc.ptr[i] = p;
+    t_idc.id[i] = id;
+}
+constexpr uint32_t kDeferredWrites = 64, kDeferredQueues = 256;
+// CBV entries carry the buffer address and size instead of a resource id: the address is resolved
+// when the batch is applied (under the shared g_m, which no retirement can hold at the same time,
+// and every retirement drains the queues first, so it resolves exactly as it would have at the write).
+struct DeferredWrite { uint64_t ptr; na_object_id resource; uint32_t kind, format, first_sub; uint32_t cbv_size; uint64_t cbv_va; };
+struct DeferredQueue {
+    std::atomic<bool> busy{false}; // spin lock: the owner appends, any thread drains
+    std::atomic<uint32_t> n{0};
+    DeferredWrite w[kDeferredWrites];
+};
+std::atomic<DeferredQueue*> g_dw_queues[kDeferredQueues]{};
+std::atomic<uint32_t> g_dw_queue_n{0};
+std::atomic<uint32_t> g_dw_pending{0}; // queues holding at least one write (the drain's fast "nothing to do")
+std::atomic<uint64_t> g_deferred_writes{0}, g_deferred_flushes{0}, g_deferred_cbvs{0};
+std::atomic<void (*)()> g_deferred_apply_probe{nullptr};
+std::mutex& deferred_drain_mutex()
+{
+    static auto* m = new std::mutex(); // registry also remains usable during process exit
+    return *m;
+}
+thread_local DeferredQueue* t_dwq = nullptr;
+inline void dwq_lock(DeferredQueue& q) { while (q.busy.exchange(true, std::memory_order_acquire)) YieldProcessor(); }
+inline void dwq_unlock(DeferredQueue& q) { q.busy.store(false, std::memory_order_release); }
+DeferredQueue* my_deferred_queue()
+{
+    if (t_dwq) return t_dwq;
+    const uint32_t i = g_dw_queue_n.fetch_add(1, std::memory_order_acq_rel);
+    if (i >= kDeferredQueues) return nullptr; // the 257th writing thread keeps the immediate path
+    auto* q = new DeferredQueue(); // kept for the process: the thread's writes may be drained after it is gone
+    g_dw_queues[i].store(q, std::memory_order_release);
+    t_dwq = q;
+    return q;
+}
+void apply_deferred_writes(const DeferredWrite* w, uint32_t n)
+{
+    const CostScope cost(kCostDescWrite);
+    std::shared_lock<na::observe::ReaderSlotsLock> lock(static_cast<na::observe::ReaderSlotsLock&>(g_m), std::defer_lock);
+    { const CostScope wait(kCostDescWriteWait); lock.lock(); }
+    DescHeap* cur_h = nullptr;
+    uint32_t cur_stripe = ~0u, unresolved = 0, cbvs = 0;
+    std::shared_mutex* held = nullptr;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t slot = 0;
+        DescHeap* h = heap_for_cpu_locked(w[i].ptr, &slot);
+        if (!h) { ++unresolved; continue; }
+        const uint32_t st = slot >> kStripeShift;
+        if (h != cur_h || st != cur_stripe) {
+            if (held) held->unlock();
+            held = h->stripes && st < h->nstripes ? &h->stripes[st] : nullptr;
+            if (held) held->lock(); // one stripe at a time, as the immediate path
+            cur_h = h; cur_stripe = st;
+        }
+        ++h->versions[slot];
+        std::shared_ptr<const DescriptorDetails> prev = std::move(h->info[slot].details); // no snapshot: dropped, as the immediate path
+        if (w[i].kind == NA_DESC_CBV) {
+            na_object_id res = 0;
+            uint64_t off = 0;
+            const bool known = w[i].cbv_va && resolve_va_locked(w[i].cbv_va, &res, &off);
+            h->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, w[i].cbv_va ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
+                                               known ? off : 0, w[i].cbv_size};
+            set_hot_bit(h, slot, false);
+            ++cbvs;
+        } else {
+            h->info[slot] = DescHeap::SlotInfo{w[i].kind, w[i].resource, w[i].format, w[i].first_sub, 0, 0};
+            set_hot_bit(h, slot, w[i].kind == NA_DESC_SRV && hot_id_locked(w[i].resource));
+        }
+    }
+    if (held) held->unlock();
+    // After the writes: a reader that took the revision before this and walked a slot before its
+    // write caches the old revision and is invalidated; one that takes it now sees every write.
+    ++g_operation_revision;
+    g_c.writes.fetch_add(n);
+    if (unresolved) g_c.unresolved.fetch_add(unresolved);
+    g_deferred_writes.fetch_add(n, std::memory_order_relaxed);
+    if (cbvs) g_deferred_cbvs.fetch_add(cbvs, std::memory_order_relaxed);
+    g_deferred_flushes.fetch_add(1, std::memory_order_relaxed);
+}
+// Drains every thread's queue. Called before any registry lock (RegistryLock); takes the base lock itself.
+void flush_deferred_writes()
+{
+    if (!g_dw_pending.load(std::memory_order_acquire)) return;
+    // Keep detached batches visible to every reader, and preserve application order
+    // when another thread drains a newer batch from the same queue.
+    std::lock_guard<std::mutex> drain(deferred_drain_mutex());
+    const uint32_t nq = std::min<uint32_t>(g_dw_queue_n.load(std::memory_order_acquire), kDeferredQueues);
+    for (uint32_t qi = 0; qi < nq; ++qi) {
+        DeferredQueue* q = g_dw_queues[qi].load(std::memory_order_acquire);
+        if (!q || !q->n.load(std::memory_order_relaxed)) continue;
+        DeferredWrite w[kDeferredWrites];
+        dwq_lock(*q);
+        const uint32_t n = q->n.load(std::memory_order_relaxed);
+        std::copy_n(q->w, n, w);
+        q->n.store(0, std::memory_order_relaxed);
+        dwq_unlock(*q);
+        if (!n) continue;
+        if (auto probe = g_deferred_apply_probe.load(std::memory_order_acquire)) probe();
+        apply_deferred_writes(w, n);
+        g_dw_pending.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+bool defer_descriptor_write(uint64_t ptr, na_object_id resource, uint32_t kind, uint32_t format, uint32_t first_sub,
+                            uint64_t cbv_va = 0, uint32_t cbv_size = 0)
+{
+    DeferredQueue* q = my_deferred_queue();
+    if (!q) return false;
+    dwq_lock(*q);
+    if (q->n.load(std::memory_order_relaxed) == kDeferredWrites) {
+        dwq_unlock(*q);
+        flush_deferred_writes(); // drains this queue among the others
+        dwq_lock(*q);
+    }
+    const uint32_t n = q->n.load(std::memory_order_relaxed);
+    q->w[n] = DeferredWrite{ptr, resource, kind, format, first_sub, cbv_size, cbv_va};
+    q->n.store(n + 1, std::memory_order_relaxed);
+    if (n == 0) g_dw_pending.fetch_add(1, std::memory_order_release);
+    dwq_unlock(*q);
+    return true;
+}
+
 void note_descriptor_write(D3D12_CPU_DESCRIPTOR_HANDLE dst, uint32_t kind, IUnknown* resource, uint32_t format,
-                           uint32_t first_sub, uint32_t sub_count)
+                           uint32_t first_sub, uint32_t sub_count, const DescriptorDetails* view = nullptr)
 {
     na_ev_descriptor_write e;
-    init_header(e, NA_EV_DESCRIPTOR_WRITE, 0);
-    {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+    const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    if (!want && !view && !t_host_work) {
+        // The common case under the bridge: the resource's id is known to this thread (every view
+        // after the first of a resource) or there is none (sampler, null view): queue it.
+        na_object_id rid = 0;
+        if ((!resource || idc_get(resource, &rid)) && defer_descriptor_write(dst.ptr, rid, kind, format, first_sub)) return;
+    }
+    // Sol 7fec1c4: a resource first met through a view (DXGI swap-chain buffers are
+    // created by DXGI, never through our creation hooks) is registered BEFORE the
+    // descriptor metadata is published, outside the registry lock. Otherwise the view
+    // keeps NA_UNKNOWN_U64 forever and the presenting draw's target is invisible.
+    // Host-owned work stays unregistered (ensure_resource_registered checks t_host_work).
+    // The id returned here is the resource's registry id; the game holds the resource across this
+    // call, so it cannot retire before the publish below (WWII: ~1 M view writes/s on the bridge's
+    // single thread; the second canonical lookup under the lock was pure repetition).
+    // 2026-11-09: the known-resource case (every view after the first) resolves the id under the same
+    // shared registry lock that publishes the slot: one lock acquisition per write instead of two.
+    // Only a resource not yet registered leaves the lock, registers (outside it, as before) and retries,
+    // so the registration still precedes the publish.
+    const bool registrable = resource && kind != NA_DESC_SAMPLER;
+    na_object_id pre = 0;
+    bool registered = false;
+    for (;;) {
+        const CostScope cost(kCostDescWrite);
+        std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
+        { const CostScope wait(kCostDescWriteWait); lock.lock(); }
+        const na_object_id rid = pre ? pre : resource ? id_locked(resource) : 0;
+        if (registrable && !rid && !registered && !t_host_work) {
+            lock.unlock();
+            pre = ensure_resource_registered(static_cast<ID3D12Resource*>(resource));
+            registered = true; // at most one retry; a failed registration publishes as unknown, as before
+            continue;
+        }
+        if (rid && registrable && !t_host_work) idc_put(resource, rid); // later views of it on this thread are queued
         uint32_t slot = 0;
         DescHeap* h = heap_for_cpu_locked(dst.ptr, &slot);
         if (!h) {
             g_c.unresolved.fetch_add(1);
             return;
         }
+        // The registry lock retains the heap/resource identity; only this slot's
+        // stripe is exclusive. Publish compact metadata and replay details together.
+        std::unique_lock<std::shared_mutex> stripe(h->stripes[slot >> kStripeShift], std::defer_lock);
+        { const CostScope wait(kCostDescWriteWait); stripe.lock(); }
         e.heap = h->id;
         e.slot = slot;
         e.slot_version = ++h->versions[slot];
-        e.resource = resource ? id_locked(resource) : 0;
+        ++g_operation_revision;
+        e.resource = rid;
         if (resource && !e.resource) {
             e.resource = NA_UNKNOWN_U64; // resource-backed, but created before observation
             e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
         }
+        std::shared_ptr<const DescriptorDetails> prev = std::move(h->info[slot].details);
         h->info[slot] = DescHeap::SlotInfo{kind, e.resource, format, first_sub, 0, 0};
+        set_hot_bit(h, slot, kind == NA_DESC_SRV && hot_id_locked(e.resource));
+        publish_details(h->info[slot], std::move(prev), view, kind, e.resource);
+        break;
     }
     e.descriptor_kind = kind;
     e.format = format;
     e.first_subresource = first_sub;
     e.subresource_count = sub_count;
     g_c.writes.fetch_add(1);
-    emit(e, NA_GROUP_DESCRIPTOR);
+    if (want) emit(e, NA_GROUP_DESCRIPTOR);
 }
 
 // Copies of `count` descriptors from src to dst, split wherever either side
@@ -801,10 +1480,69 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
 {
     while (count) {
         na_ev_descriptor_copy e;
-        init_header(e, NA_EV_DESCRIPTOR_COPY, 0);
+        const bool emit_it = init_header_wanted(e, NA_EV_DESCRIPTOR_COPY, 0);
         uint32_t run = 0;
+        bool resolved = false, striped = false;
         {
-            std::unique_lock<std::shared_mutex> lock(g_m);
+            // Shared g_m + the slots' stripes (exact same result as the exclusive section,
+            // which remains the path for a copy spanning more than kMaxStripes stripes).
+            const CostScope cost(kCostDescCopy);
+            std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
+            { const CostScope wait(kCostDescCopyWait); lock.lock(); }
+            uint32_t ds = 0, ss = 0;
+            DescHeap* dh = heap_for_cpu_locked(dst, &ds);
+            DescHeap* sh = heap_for_cpu_locked(src, &ss);
+            if (dh && sh) {
+                resolved = true;
+                run = std::min({count, dh->count - ds, sh->count - ss});
+                constexpr uint32_t kMaxStripes = 32;
+                struct Want { std::shared_mutex* m; bool ex; };
+                Want want[kMaxStripes];
+                uint32_t nw = 0;
+                const auto add = [&](DescHeap* h, uint32_t first, bool ex) {
+                    if (!run || !h->stripes) return false;
+                    for (uint32_t st = first >> kStripeShift; st <= (first + run - 1) >> kStripeShift; ++st) {
+                        if (st >= h->nstripes) return false;
+                        std::shared_mutex* m = &h->stripes[st];
+                        bool merged = false;
+                        for (uint32_t i = 0; i < nw; ++i) if (want[i].m == m) { want[i].ex |= ex; merged = true; }
+                        if (merged) continue;
+                        if (nw == kMaxStripes) return false;
+                        want[nw++] = {m, ex};
+                    }
+                    return true;
+                };
+                if (run && add(dh, ds, true) && add(sh, ss, false)) {
+                    std::sort(want, want + nw, [](const Want& a, const Want& b) { return std::less<std::shared_mutex*>()(a.m, b.m); });
+                    {
+                        const CostScope wait(kCostDescCopyWait);
+                        for (uint32_t i = 0; i < nw; ++i) { if (want[i].ex) want[i].m->lock(); else want[i].m->lock_shared(); }
+                    }
+                    ++g_operation_revision;
+                    for (uint32_t i = 0; i < run; ++i) {
+                        ++dh->versions[ds + i];
+                        dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
+                        set_hot_bit(dh, ds + i, dh->info[ds + i].kind == NA_DESC_SRV && hot_id_locked(dh->info[ds + i].resource));
+                    }
+                    for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
+                    striped = true;
+                } else if (!run) striped = true; // nothing to copy
+                e.src_heap = sh->id;
+                e.dst_heap = dh->id;
+                e.src_slot = ss;
+                e.dst_slot = ds;
+                e.slot_count = run;
+            }
+        }
+        if (!resolved) {
+            g_c.unresolved.fetch_add(1);
+            return;
+        }
+        if (!striped) {
+            // Rare (a copy over more than 32 stripes, 2048+ slots): the exclusive section.
+            const CostScope cost(kCostDescCopy);
+            std::unique_lock<RegistryLock> lock(g_m, std::defer_lock);
+            { const CostScope wait(kCostDescCopyWait); lock.lock(); }
             uint32_t ds = 0, ss = 0;
             DescHeap* dh = heap_for_cpu_locked(dst, &ds);
             DescHeap* sh = heap_for_cpu_locked(src, &ss);
@@ -813,9 +1551,11 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
                 return;
             }
             run = std::min({count, dh->count - ds, sh->count - ss});
+            ++g_operation_revision;
             for (uint32_t i = 0; i < run; ++i) {
                 ++dh->versions[ds + i];
-                dh->info[ds + i] = sh->info[ss + i]; // contents follow the source's record-time view
+                dh->info[ds + i] = sh->info[ss + i];
+                set_hot_bit(dh, ds + i, dh->info[ds + i].kind == NA_DESC_SRV && hot_id_locked(dh->info[ds + i].resource));
             }
             e.src_heap = sh->id;
             e.dst_heap = dh->id;
@@ -824,11 +1564,109 @@ void note_descriptor_copy(uint64_t dst, uint64_t src, uint32_t count, uint32_t i
             e.slot_count = run;
         }
         g_c.copies.fetch_add(1);
-        emit(e, NA_GROUP_DESCRIPTOR);
+        if (emit_it) emit(e, NA_GROUP_DESCRIPTOR);
         count -= run;
         dst += static_cast<uint64_t>(run) * increment;
         src += static_cast<uint64_t>(run) * increment;
     }
+}
+
+// CopyDescriptors with several ranges, as one unit (2026-11-09, WWII p31660: ~580k copy runs/s on the
+// D3D11On12 translator thread, the fps bottleneck). The translation layer gathers a shader table with ONE
+// CopyDescriptors call: one destination range, one single-descriptor source range per view. Run by run,
+// each of those paid the registry lock, two heap searches, its stripe locks, a revision bump and the
+// counters. Here the registry lock, the destination heap search and every stripe lock are taken once
+// per call; each run still updates exactly the slots, versions, hot bits and events it did run by run
+// (in the same order; D3D12 leaves overlapping source/destination undefined). Anything unusual (an
+// unresolved heap, a run crossing a heap end, too many runs or stripes) returns false BEFORE any
+// change and the caller uses the per-run path unchanged.
+std::atomic<uint64_t> g_copy_simple{0}, g_copy_calls{0}, g_copy_batched{0}, g_copy_batched_runs{0}; // per-API-call shape (status line)
+bool note_descriptor_copies_batch(const uint64_t* dst, const uint64_t* src, const uint32_t* cnt, uint32_t n, uint32_t increment)
+{
+    // A gather of 64 single-descriptor sources can touch 64 source stripes plus the destination's.
+    constexpr uint32_t kMaxRuns = 64, kMaxStripes = 96;
+    if (n < 2 || n > kMaxRuns || !increment) return false;
+    struct Run { DescHeap* dh; DescHeap* sh; uint32_t ds, ss; };
+    Run runs[kMaxRuns];
+    na_ev_descriptor_copy ev[kMaxRuns];
+    bool want_ev[kMaxRuns];
+    {
+        const CostScope cost(kCostDescCopy);
+        std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
+        { const CostScope wait(kCostDescCopyWait); lock.lock(); }
+        struct Want { std::shared_mutex* m; bool ex; };
+        Want want[kMaxStripes];
+        uint32_t nw = 0;
+        const auto add = [&](DescHeap* h, uint32_t first, uint32_t count, bool ex) {
+            if (!h->stripes) return false;
+            for (uint32_t st = first >> kStripeShift; st <= (first + count - 1) >> kStripeShift; ++st) {
+                if (st >= h->nstripes) return false;
+                std::shared_mutex* m = &h->stripes[st];
+                bool merged = false;
+                for (uint32_t i = 0; i < nw; ++i) if (want[i].m == m) { want[i].ex |= ex; merged = true; }
+                if (merged) continue;
+                if (nw == kMaxStripes) return false;
+                want[nw++] = {m, ex};
+            }
+            return true;
+        };
+        DescHeap* last_d = nullptr; DescHeap* last_s = nullptr;
+        const auto find = [&](DescHeap*& last, uint64_t ptr, uint32_t* slot) -> DescHeap* {
+            if (last && ptr >= last->cpu_start) { // same heap as the previous run: no search
+                const uint64_t off = ptr - last->cpu_start;
+                if (off % last->increment == 0 && off / last->increment < last->count) { *slot = static_cast<uint32_t>(off / last->increment); return last; }
+            }
+            DescHeap* h = heap_for_cpu_locked(ptr, slot);
+            if (h) last = h;
+            return h;
+        };
+        // Pass 1: resolve every run and collect its stripes; nothing changes yet.
+        for (uint32_t r = 0; r < n; ++r) {
+            if (!cnt[r]) return false;
+            Run& x = runs[r];
+            x.dh = find(last_d, dst[r], &x.ds);
+            x.sh = find(last_s, src[r], &x.ss);
+            if (!x.dh || !x.sh) return false;
+            if (cnt[r] > x.dh->count - x.ds || cnt[r] > x.sh->count - x.ss) return false;
+            if (!add(x.dh, x.ds, cnt[r], true) || !add(x.sh, x.ss, cnt[r], false)) return false;
+        }
+        // Pass 2: same per-slot effect as the per-run path, under every stripe at once (global address order).
+        std::sort(want, want + nw, [](const Want& a, const Want& b) { return std::less<std::shared_mutex*>()(a.m, b.m); });
+        {
+            const CostScope wait(kCostDescCopyWait);
+            for (uint32_t i = 0; i < nw; ++i) { if (want[i].ex) want[i].m->lock(); else want[i].m->lock_shared(); }
+        }
+        // Events: the kind is skipped in ordinary play, so the per-run header work is checked once.
+        const bool events = !na::observe_internal::KindSkipped(NA_EV_DESCRIPTOR_COPY);
+        const bool any_hot_ids = g_hot_n != 0; // under g_m: no SRV can be hot without an id
+        for (uint32_t r = 0; r < n; ++r) {
+            const Run& x = runs[r];
+            DescHeap::SlotInfo* d = &x.dh->info[x.ds];
+            const DescHeap::SlotInfo* sinfo = &x.sh->info[x.ss];
+            uint64_t* ver = &x.dh->versions[x.ds];
+            for (uint32_t i = 0; i < cnt[r]; ++i) {
+                ++ver[i];
+                d[i] = sinfo[i];
+                set_hot_bit(x.dh, x.ds + i, any_hot_ids && d[i].kind == NA_DESC_SRV && hot_id_locked(d[i].resource));
+            }
+            want_ev[r] = events && init_header_wanted(ev[r], NA_EV_DESCRIPTOR_COPY, 0);
+            if (!want_ev[r]) continue;
+            ev[r].src_heap = x.sh->id;
+            ev[r].dst_heap = x.dh->id;
+            ev[r].src_slot = x.ss;
+            ev[r].dst_slot = x.ds;
+            ev[r].slot_count = cnt[r];
+        }
+        // One revision step for the whole call, after its writes and before any stripe is released:
+        // a reader that read the revision earlier is invalidated, one that reads it now waits on a
+        // stripe and then sees every write (the per-run steps gave readers nothing more).
+        ++g_operation_revision;
+        for (uint32_t i = nw; i-- > 0;) { if (want[i].ex) want[i].m->unlock(); else want[i].m->unlock_shared(); }
+    }
+    g_c.copies.fetch_add(n);
+    g_copy_batched.fetch_add(1, std::memory_order_relaxed); g_copy_batched_runs.fetch_add(n, std::memory_order_relaxed);
+    for (uint32_t r = 0; r < n; ++r) if (want_ev[r]) emit(ev[r], NA_GROUP_DESCRIPTOR);
+    return true;
 }
 
 std::atomic<uint32_t> g_increment[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES] = {};
@@ -861,6 +1699,9 @@ NA_ORIG(CreateUnorderedAccessView, void, ID3D12Device*, ID3D12Resource*, ID3D12R
 NA_ORIG(CreateRenderTargetView, void, ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 NA_ORIG(CreateDepthStencilView, void, ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 NA_ORIG(CreateSampler, void, ID3D12Device*, const D3D12_SAMPLER_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+NA_ORIG(CreateSampler2, void, ID3D12Device11*, const D3D12_SAMPLER_DESC2*, D3D12_CPU_DESCRIPTOR_HANDLE);
+#endif
 NA_ORIG(CopyDescriptors, void, ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
 NA_ORIG(CopyDescriptorsSimple, void, ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
 NA_ORIG(CreateCommittedResource, HRESULT, ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
@@ -936,7 +1777,7 @@ void list_created(ID3D12Device* dev, IUnknown* obj, D3D12_COMMAND_LIST_TYPE type
     e.is_bundle = type == D3D12_COMMAND_LIST_TYPE_BUNDLE ? 1u : 0u;
     e.initially_open = open ? 1u : 0u;
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         auto it = g_objs.find(canon(obj));
         if (it != g_objs.end() && it->second.list) {
             it->second.list->generation.store(open ? 1 : 0);
@@ -994,6 +1835,10 @@ void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, co
     dh->type = desc->Type;
     dh->versions.assign(desc->NumDescriptors, 0);
     dh->info.assign(desc->NumDescriptors, DescHeap::SlotInfo{});
+    dh->nstripes = (desc->NumDescriptors + (1u << kStripeShift) - 1) >> kStripeShift;
+    dh->stripes.reset(new std::shared_mutex[dh->nstripes ? dh->nstripes : 1]);
+    dh->hot.reset(new std::atomic<uint64_t>[dh->nstripes ? dh->nstripes : 1]);
+    for (uint32_t i = 0; i < (dh->nstripes ? dh->nstripes : 1); ++i) dh->hot[i].store(0, std::memory_order_relaxed);
     const na_object_id dev_id = device_id(dev);
     na_ev_descriptor_heap_created e;
     init_header(e, NA_EV_DESCRIPTOR_HEAP_CREATED, flags);
@@ -1004,11 +1849,13 @@ void register_heap(ID3D12Device* dev, IUnknown* obj, ID3D12DescriptorHeap* h, co
     e.shader_visible = visible ? 1u : 0u;
     dh->id = e.heap;
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         // A heap at the same CPU address replaces a destroyed one we never saw retire.
         g_heaps.erase(std::remove_if(g_heaps.begin(), g_heaps.end(), [&](const std::unique_ptr<DescHeap>& x) { return x->key == obj; }),
                       g_heaps.end());
         g_heaps.push_back(std::move(dh));
+        heap_index_rebuild();
+        ++g_operation_revision;++g_heap_registry_revision;
     }
     remember_creation(obj, e);
     emit(e, NA_GROUP_DESCRIPTOR);
@@ -1022,7 +1869,7 @@ void ensure_heap_registered(ID3D12DescriptorHeap* h)
 {
     if (!h || t_host_work) return;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         for (auto& dh : g_heaps)
             if (dh->key == h) return;
     }
@@ -1039,30 +1886,45 @@ void ensure_heap_registered(ID3D12DescriptorHeap* h)
 void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     o_CreateConstantBufferView(dev, desc, h);
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
+    if(g_operation_snapshots.load()&&!t_host_work&&desc){view_args.explicit_view=true;view_args.cbv=*desc;view=&view_args;}
     na_object_id res = 0;
     uint64_t off = 0;
     bool known = false;
-    if (desc && desc->BufferLocation) {
-        std::shared_lock<std::shared_mutex> lock(g_m);
-        known = resolve_va_locked(desc->BufferLocation, &res, &off);
-    }
     // ABI 0.1 DESCRIPTOR_WRITE carries no byte offset; the resource identity is
     // what H1 promises. Unresolved / ambiguous ranges are UNKNOWN, never guessed.
     na_ev_descriptor_write e;
-    init_header(e, NA_EV_DESCRIPTOR_WRITE, known ? 0u : NA_EVF_METHOD_UNOBSERVED);
+    const bool want = init_header_wanted(e, NA_EV_DESCRIPTOR_WRITE, 0);
+    // p22748 (2026-11-09): CBV writes are nearly all of the bridge's view writes (one per constant
+    // buffer bind per draw) and none took the deferred path. Queue them like other views: same slot
+    // record, the address resolved when the batch is applied.
+    if (!want && !view && !t_host_work &&
+        defer_descriptor_write(h.ptr, 0, NA_DESC_CBV, NA_UNKNOWN_U32, 0, desc ? desc->BufferLocation : 0, desc ? desc->SizeInBytes : 0))
+        return;
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        const CostScope cost(kCostDescWrite);
+        std::shared_lock<RegistryLock> lock(g_m, std::defer_lock);
+        { const CostScope wait(kCostDescWriteWait); lock.lock(); }
+        if(desc&&desc->BufferLocation)known=resolve_va_locked(desc->BufferLocation,&res,&off);
+        if(!known)e.hdr.flags|=NA_EVF_METHOD_UNOBSERVED;
         uint32_t slot = 0;
         DescHeap* dh = heap_for_cpu_locked(h.ptr, &slot);
         if (!dh) {
             g_c.unresolved.fetch_add(1);
             return;
         }
+        std::unique_lock<std::shared_mutex> stripe(dh->stripes[slot >> kStripeShift], std::defer_lock);
+        { const CostScope wait(kCostDescWriteWait); stripe.lock(); }
         e.heap = dh->id;
         e.slot = slot;
         e.slot_version = ++dh->versions[slot];
+        ++g_operation_revision;
+        std::shared_ptr<const DescriptorDetails> prev = std::move(dh->info[slot].details);
         dh->info[slot] = DescHeap::SlotInfo{NA_DESC_CBV, desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0, NA_UNKNOWN_U32, 0,
                                             known ? off : 0, desc ? desc->SizeInBytes : 0};
+        publish_details(dh->info[slot], std::move(prev), view, NA_DESC_CBV, dh->info[slot].resource);
+        set_hot_bit(dh, slot, false);
     }
     e.descriptor_kind = NA_DESC_CBV;
     e.resource = desc && desc->BufferLocation ? (known ? res : NA_UNKNOWN_U64) : 0;
@@ -1070,7 +1932,7 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     e.first_subresource = 0;
     e.subresource_count = 1;
     g_c.writes.fetch_add(1);
-    emit(e, NA_GROUP_DESCRIPTOR);
+    if (want) emit(e, NA_GROUP_DESCRIPTOR);
 }
 
 void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1078,7 +1940,12 @@ void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resou
     o_CreateShaderResourceView(dev, r, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MostDetailedMip; count = d->Texture2D.MipLevels; }
-    note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
+    if (g_operation_snapshots.load() && !t_host_work) {
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.srv = *d;
+    }
+    note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Resource* r, ID3D12Resource* counter,
@@ -1087,7 +1954,13 @@ void STDMETHODCALLTYPE D_CreateUnorderedAccessView(ID3D12Device* dev, ID3D12Reso
     o_CreateUnorderedAccessView(dev, r, counter, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MipSlice; count = 1; }
-    note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
+    if (g_operation_snapshots.load() && !t_host_work) {
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.uav = *d;
+        bool created = false; view_args.counter = counter ? ensure_registered(counter, NA_OBJ_RESOURCE, &created) : 0;
+    }
+    note_descriptor_write(h, NA_DESC_UAV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1105,7 +1978,12 @@ void STDMETHODCALLTYPE D_CreateRenderTargetView(ID3D12Device* dev, ID3D12Resourc
     else if (d->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
         first = d->Texture2DMSArray.FirstArraySlice; count = 1; // MSAA textures have exactly one mip
     }
-    note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
+    if (g_operation_snapshots.load() && !t_host_work) {
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.rtv = *d;
+    }
+    note_descriptor_write(h, NA_DESC_RTV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -1122,7 +2000,12 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
     else if (d->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY && d->Texture2DMSArray.ArraySize == 1) {
         first = d->Texture2DMSArray.FirstArraySlice; count = 1;
     }
-    note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count);
+    DescriptorDetails view_args;
+    const DescriptorDetails* view = nullptr;
+    if (g_operation_snapshots.load() && !t_host_work) {
+        view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.dsv = *d;
+    }
+    note_descriptor_write(h, NA_DESC_DSV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
 }
 
 // Texture LOD (mip) bias for temporal reconstruction (J2 DLAA): with jitter and
@@ -1132,20 +2015,60 @@ void STDMETHODCALLTYPE D_CreateDepthStencilView(ID3D12Device* dev, ID3D12Resourc
 // use mips (linear / anisotropic mip filtering, MaxLOD > 0); never to
 // comparison (shadow) samplers or point-mip lookups. 0 = off.
 std::atomic<float> g_mip_bias{0.0f};
-// Live mip bias (Cort: compare without restarting). The game's static samplers are baked
-// into its root signatures and pipelines at load, so every root signature and pipeline
-// gets twins built at creation for the other menu levels; command lists are switched to
-// the twins of the level latched at their Reset. Levels = the menu's choices.
-constexpr float kMipLevels[3] = {0.0f, -0.5f, -1.0f};
-std::atomic<int> g_mip_game_level{0};      // level the game's own objects are built with (0 = no bias unless J2 sets it)
-std::atomic<int> g_mip_live_level{0};      // level selected in the menu
-std::atomic<bool> g_mip_switched{false};   // a level other than the game's has been selected (enables lookups)
+// Live sampler variants (Cort 2026-11-03: compare without restarting; 2026-11-05: no
+// restarts at all, and the saved choice must work from the first frame). The game's static
+// samplers are baked into its root signatures and pipelines at load. Saved effects are only
+// activated once renderer recovery is known (971a7b3), which is AFTER the game builds them,
+// so the game's own objects are left exactly as the game made them and every choice is a
+// twin: variant (mip level, anisotropic index). Command lists bind the twins of the variant
+// latched at their Reset. The saved choice (and the DLSS modes' automatic levels) get twins
+// at creation; any other choice is built by a background worker from copies of the creation
+// descriptions and goes live, for all lists at once, when complete.
+// Render-small's DLSS modes (Cort, 2026-11-03): Quality -1.585 (NVIDIA's -1 + log2(1/1.5)),
+// Balanced -2, Performance -2.25 (Cort 2026-11-04; was -2.5).
+// Level 6 (+4) is the menu's visible check (Cort 2026-11-06: "0 and -1 look the same"): if the
+// surfaces do not turn obviously blurry at +4, the samplers we change are not the ones the
+// game's materials use, whatever the counters say. Never saved.
+constexpr int kMipCount = 7;
+constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.25f, 4.0f};
+static_assert(kMipCount <= 7, "Obj::Twins holds 7 levels");
+constexpr uint32_t kAfLevels[4] = {0, 4, 8, 16};
+std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels built at creation (bit i = kMipLevels[i])
+// Background warm-up (Cort 2026-11-06: "mip does nothing"; a choice not built at load took
+// 25-30 s, so a quick A/B never switched). After the chosen level is live, the worker builds the
+// menu's levels (0, -0.5, -1) and the DLSS modes' automatic levels at the in-use filtering, one
+// at a time at below-normal priority, so a later switch is immediate. [j2] mip_prewarm=0 = off.
+std::atomic<bool> g_mip_prewarm{true};
+std::atomic<uint64_t> g_mip_warmed{0}; // levels completed by warm-up (statistics)
+std::atomic<uint64_t> g_mip_parallel_passes{0}; // passes whose pipelines were shared with the background pool
+std::atomic<int> g_pre_af{0};              // anisotropic index built at creation (the saved one)
+// Variants packed as level | af << 4; 0 = the game's own objects.
+std::atomic<uint32_t> g_var_want{0};       // chosen (menu / saved activation)
+std::atomic<uint32_t> g_var_live{0};       // in use: what recordings latch at Reset
+std::atomic<uint64_t> g_var_request_tick{0}; // event log: when the current choice was asked for
+std::atomic<bool> g_var_missing{false};    // a lookup met an object without the live variant: refill
+std::atomic<uint64_t> g_var_done{0}, g_var_total{0};
+// Never destroyed (the worker is detached and may still wait at process exit).
+std::mutex& g_var_m = *new std::mutex();   // the worker's wake-up and the want/live hand-over
+std::condition_variable& g_var_cv = *new std::condition_variable();
+bool g_var_started = false;
+std::atomic<uint64_t> g_var_static_changed[kMipCount * 4]; // static samplers changed, per variant
+std::atomic<uint64_t> g_var_aniso_changed[kMipCount * 4]; // AF changes only, not mip-bias changes
+std::atomic<bool> g_mip_switched{false};   // a variant other than the game's has been in use (enables lookups)
 std::atomic<bool> g_mip_live_enabled{false}; // twins are built only when J2 enables live switching
 std::atomic<uint64_t> g_mip_twin_rs{0}, g_mip_twin_pso{0}, g_mip_untwinned{0}, g_mip_fallbacks{0}, g_mip_twin_fail{0};
+// Draw-time proof (Cort 2026-11-05: "x16 shows no difference"): binds that really went to the
+// driver as twins vs kept the game's object, summed once per recording at its next Reset.
+std::atomic<uint64_t> g_mip_bound_pso_twin{0}, g_mip_bound_pso_game{0}, g_mip_bound_rs_twin{0}, g_mip_bound_rs_game{0};
+int var_level(uint32_t v) { return static_cast<int>(v & 15u) < kMipCount ? static_cast<int>(v & 15u) : 0; }
+int var_af(uint32_t v) { return static_cast<int>(v >> 4 & 3u); }
+uint32_t var_pack(int level, int af) { return static_cast<uint32_t>(level) | static_cast<uint32_t>(af) << 4; }
+int af_index(uint32_t level) { return level >= 16 ? 3 : level >= 8 ? 2 : level ? 1 : 0; }
 int nearest_mip_level(float b)
 {
     int best = 0;
-    for (int i = 1; i < 3; ++i) if (std::fabs(b - kMipLevels[i]) < std::fabs(b - kMipLevels[best])) best = i;
+    for (int i = 1; i < kMipCount; ++i)
+        if (std::fabs(b - kMipLevels[i]) < std::fabs(b - kMipLevels[best])) best = i;
     return best;
 }
 std::atomic<uint64_t> g_biased_samplers{0}, g_biased_static{0};
@@ -1171,44 +2094,247 @@ bool sampler_wants_bias(const SD& d)
     const bool surface = aniso || (linear_min && (tiles(d.AddressU) || tiles(d.AddressV)));
     return surface && d.MaxLOD > 0.0f;
 }
+template <typename SD>
+bool sampler_wants_aniso(const SD& d)
+{
+    // Addressing does not determine the texture footprint. Atlased/unique-UV
+    // materials commonly clamp; exclude data/comparison/point lookups, but do
+    // not apply mip-bias's WRAP-only material heuristic to filtering.
+    return D3D12_DECODE_FILTER_REDUCTION(d.Filter)==D3D12_FILTER_REDUCTION_TYPE_STANDARD&&d.MaxLOD>0&&
+        (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter)||D3D12_DECODE_MIN_FILTER(d.Filter)==D3D12_FILTER_TYPE_LINEAR);
+}
 float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
-// Target-based bias (Cort, aiming for a total of `target`, e.g. -1): a sampler
-// with a neutral or positive native bias gets NVIDIA's NativeBias + target; one
-// the game already biases negative is brought to `target` at most and never
-// past it (no stacking -1 on top of the game's own sharpening).
+// Anisotropic filtering 4x/8x/16x: eligible standard linear samplers, including
+// clamp-addressed materials, are made anisotropic at that level.
+// It is applied where the game samples its textures, before DLSS, so DLSS gets the sharper
+// oblique detail. Comparison / min-max / point samplers are untouched. Unlike mip bias,
+// an isotropic screen-space footprint needs no addressing-based exclusion.
+std::atomic<uint32_t> g_aniso_level{0}; // 0 off, else 4 / 8 / 16 (menu)
+std::atomic<uint64_t> g_aniso_samplers{0}, g_aniso_static{0}, g_aniso_already{0};
+std::atomic<uint64_t> g_sampler_calls{0}, g_sampler2_calls{0}; // the game's CreateSampler / CreateSampler2 calls
+template <typename SD>
+bool apply_aniso(SD& d)
+{
+    const uint32_t level = g_aniso_level.load(std::memory_order_relaxed);
+    if (!level || !sampler_wants_aniso(d)) return false;
+    // Never lowers the game's own: an anisotropic sampler at or above the chosen level stays.
+    if (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level) {
+        g_aniso_already.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    d.Filter = D3D12_FILTER_ANISOTROPIC;
+    d.MaxAnisotropy = level;
+    return true;
+}
+// Cort's total-bias rule: DLAA automatically targets exactly -1, including the
+// native value. Native -1 needs no change; native 0 -> -1, native -0.5 -> -1,
+// native -1.5 -> -1. Zero is the temporary comparison with the original sampler.
 float biased(float native, float target)
 {
     if (target == 0.0f) return native;
-    if (native >= 0.0f) return clamp_lod(native + target);
-    return native < target ? native : target;
+    return clamp_lod(target);
+}
+// The anisotropic part of a variant (no counters): as apply_aniso, at an explicit level.
+template <typename SD>
+bool aniso_to(SD& d, uint32_t level)
+{
+    if (!level || (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level)) return false;
+    d.Filter = D3D12_FILTER_ANISOTROPIC;
+    d.MaxAnisotropy = level;
+    return true;
+}
+// The game's static samplers as variant (level, af) wants them; returns how many changed.
+uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level, int af,uint32_t* aniso_changed=nullptr)
+{
+    uint32_t changed = 0;
+    for (auto& x : ss) {
+        const bool bias=sampler_wants_bias(x),aniso=sampler_wants_aniso(x);
+        if(!bias&&!aniso)continue;
+        bool c = false;
+        const float nb = bias?biased(x.MipLODBias, kMipLevels[level]):x.MipLODBias;
+        if (nb != x.MipLODBias) { x.MipLODBias = nb; c = true; }
+        if (aniso&&aniso_to(x, kAfLevels[af])) { c = true;if(aniso_changed)++*aniso_changed; }
+        if (c) ++changed;
+    }
+    return changed;
 }
 // The game's own biases on surface samplers, observed whether or not we bias.
 std::mutex g_native_m;
 uint64_t g_native_neg = 0, g_native_zero = 0, g_native_pos = 0;
+uint64_t g_native_surface = 0,g_native_af16 = 0;
 float g_native_min = 0.0f, g_native_max = 0.0f;
-void note_native(float b)
+void note_native(float b,uint32_t anisotropy,bool bias_eligible)
 {
     std::lock_guard<std::mutex> lock(g_native_m);
-    const bool first = !(g_native_neg || g_native_zero || g_native_pos);
-    if (b < 0.0f) ++g_native_neg; else if (b > 0.0f) ++g_native_pos; else ++g_native_zero;
-    if (first || b < g_native_min) g_native_min = b;
-    if (first || b > g_native_max) g_native_max = b;
+    if(bias_eligible){
+        const bool first = !(g_native_neg || g_native_zero || g_native_pos);
+        if (b < 0.0f) ++g_native_neg; else if (b > 0.0f) ++g_native_pos; else ++g_native_zero;
+        if (first || b < g_native_min) g_native_min = b;
+        if (first || b > g_native_max) g_native_max = b;
+    }
+    ++g_native_surface;if(anisotropy>=16)++g_native_af16;
+}
+
+// The game's own sampler table (event log, Cort 2026-11-06): every distinct sampler the game
+// creates (heap, heap v2, static in a root signature) with how many times, so a log answers
+// "are the materials already 16x / already biased?" without a capture.
+struct SamplerRow { uint32_t kind, filter, aniso, u, v, w, cmp; float bias, min_lod, max_lod; uint64_t count; };
+std::mutex g_sampler_table_m;
+std::vector<SamplerRow> g_sampler_table;
+std::atomic<uint64_t> g_sampler_table_total{0}, g_sampler_table_overflow{0};
+template <typename D>
+void note_sampler_desc(uint32_t kind, const D& d)
+{
+    g_sampler_table_total.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_sampler_table_m);
+    for (SamplerRow& r : g_sampler_table)
+        if (r.kind == kind && r.filter == uint32_t(d.Filter) && r.aniso == d.MaxAnisotropy && r.u == uint32_t(d.AddressU) &&
+            r.v == uint32_t(d.AddressV) && r.w == uint32_t(d.AddressW) && r.cmp == uint32_t(d.ComparisonFunc) &&
+            r.bias == d.MipLODBias && r.min_lod == d.MinLOD && r.max_lod == d.MaxLOD) { ++r.count; return; }
+    if (g_sampler_table.size() >= 256) { g_sampler_table_overflow.fetch_add(1, std::memory_order_relaxed); return; }
+    g_sampler_table.push_back({kind, uint32_t(d.Filter), d.MaxAnisotropy, uint32_t(d.AddressU), uint32_t(d.AddressV), uint32_t(d.AddressW),
+                               uint32_t(d.ComparisonFunc), d.MipLODBias, d.MinLOD, d.MaxLOD, 1});
+}
+
+std::atomic<uint64_t> g_visible_sampler_uploads{0};
+std::atomic<float> g_visible_sampler_bias{0.0f};
+
+void visible_sampler_bias(float bias)
+{
+    g_visible_sampler_bias.store(bias, std::memory_order_relaxed);
+    g_visible_sampler_uploads.fetch_add(1, std::memory_order_release);
+}
+
+bool shader_visible_sampler(D3D12_CPU_DESCRIPTOR_HANDLE handle)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    uint32_t slot = 0;
+    const auto* heap = heap_for_cpu_locked(handle.ptr, &slot);
+    return heap && heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap->gpu_start;
 }
 
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
+    if (!t_host_work) g_sampler_calls.fetch_add(1, std::memory_order_relaxed);
+    if (d && !t_host_work) note_sampler_desc(0, *d);
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
-    if (surface) note_native(d->MipLODBias);
-    if (surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias) {
-        D3D12_SAMPLER_DESC m = *d;
-        m.MipLODBias = biased(m.MipLODBias, bias);
+    const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
+    if (aniso_surface) note_native(d->MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(d->Filter)?d->MaxAnisotropy:0,surface);
+    D3D12_SAMPLER_DESC m = d ? *d : D3D12_SAMPLER_DESC{};
+    const bool bias_it = surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias;
+    if (bias_it) m.MipLODBias = biased(m.MipLODBias, bias);
+    const bool aniso_it = aniso_surface && apply_aniso(m);
+    if (bias_it || aniso_it) {
         o_CreateSampler(dev, &m, h);
-        g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
+        if (bias_it) g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
+        if (aniso_it) g_aniso_samplers.fetch_add(1, std::memory_order_relaxed);
     } else {
         o_CreateSampler(dev, d, h);
     }
-    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32);
+    SamplerRecipe recipe;
+    const bool retain = surface && g_mip_live_enabled.load(std::memory_order_relaxed);
+    if (retain) {
+        recipe.desc = m;
+        recipe.native_bias = d->MipLODBias;
+        recipe.stored_bias = m.MipLODBias;
+        if (shader_visible_sampler(h)) visible_sampler_bias(recipe.stored_bias);
+    }
+    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, retain ? &recipe : nullptr);
+}
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+// ID3D12Device11::CreateSampler2 (Agility SDK games): the same sampler as CreateSampler with
+// integer border colours / flags. It was never hooked, so a game that creates its material
+// samplers this way got neither the mip bias nor anisotropic filtering (Cort 2026-11-05:
+// "x16 shows no difference", raised=0). Same rules as D_CreateSampler.
+void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER_DESC2* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
+{
+    if (!t_host_work) g_sampler2_calls.fetch_add(1, std::memory_order_relaxed);
+    if (d && !t_host_work) note_sampler_desc(1, *d);
+    const float bias = g_mip_bias.load(std::memory_order_relaxed);
+    const bool surface = d && !t_host_work && sampler_wants_bias(*d);
+    const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
+    if (aniso_surface) note_native(d->MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(d->Filter)?d->MaxAnisotropy:0,surface);
+    D3D12_SAMPLER_DESC2 m = d ? *d : D3D12_SAMPLER_DESC2{};
+    const bool bias_it = surface && bias != 0.0f && biased(d->MipLODBias, bias) != d->MipLODBias;
+    if (bias_it) m.MipLODBias = biased(m.MipLODBias, bias);
+    const bool aniso_it = aniso_surface && apply_aniso(m);
+    if (bias_it || aniso_it) {
+        o_CreateSampler2(dev, &m, h);
+        if (bias_it) g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
+        if (aniso_it) g_aniso_samplers.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        o_CreateSampler2(dev, d, h);
+    }
+    SamplerRecipe recipe;
+    const bool retain = surface && g_mip_live_enabled.load(std::memory_order_relaxed);
+    if (retain) {
+        recipe.desc2 = m;
+        recipe.modern = true;
+        recipe.native_bias = d->MipLODBias;
+        recipe.stored_bias = m.MipLODBias;
+        if (shader_visible_sampler(h)) visible_sampler_bias(recipe.stored_bias);
+    }
+    note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, retain ? &recipe : nullptr);
+}
+#endif
+
+// D3D11On12 stages samplers in CPU heaps and refreshes shader-visible tables
+// with CopyDescriptors. Change only that fresh destination, within the game's
+// original write. CPU recipes stay intact, including through CPU-to-CPU copies.
+void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_t n, uint32_t inc)
+{
+    if (!n || t_host_work || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
+    const float target = g_mip_bias.load(std::memory_order_relaxed);
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+    Microsoft::WRL::ComPtr<ID3D12Device11> device11;
+#endif
+    uint32_t copied = 0;
+    while (copied < n) {
+        std::array<std::shared_ptr<const SamplerRecipe>, 16> recipes{};
+        uint32_t run = 0;
+        {
+            std::shared_lock<RegistryLock> lock(g_m);
+            uint32_t ds = 0, ss = 0;
+            const auto* dest = heap_for_cpu_locked(dst + uint64_t(copied) * inc, &ds);
+            const auto* source = heap_for_cpu_locked(src + uint64_t(copied) * inc, &ss);
+            if (!dest || !source || !dest->gpu_start || source->gpu_start ||
+                dest->type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER || source->type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) return;
+            run = std::min({n - copied, dest->count - ds, source->count - ss, uint32_t(recipes.size())});
+            SlotShared stripe;
+            for (uint32_t i = 0; i < run; ++i) {
+                stripe.lock(source, ss + i);
+                const auto& info = source->info[ss + i];
+                if (info.kind == NA_DESC_SAMPLER) recipes[i] = std::static_pointer_cast<const SamplerRecipe>(info.details);
+            }
+        }
+        if (!run) return;
+        for (uint32_t i = 0; i < run; ++i) {
+            const auto& recipe = recipes[i];
+            if (!recipe) continue;
+            float total = biased(recipe->native_bias, target);
+            if (total != recipe->stored_bias) {
+                const D3D12_CPU_DESCRIPTOR_HANDLE handle{static_cast<SIZE_T>(dst + uint64_t(copied + i) * inc)};
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+                if (recipe->modern) {
+                    if (!device11) dev->QueryInterface(IID_PPV_ARGS(&device11));
+                    if (device11) {
+                        auto desc = recipe->desc2;
+                        desc.MipLODBias = total;
+                        o_CreateSampler2(device11.Get(), &desc, handle);
+                    } else total = recipe->stored_bias;
+                } else
+#endif
+                {
+                    auto desc = recipe->desc;
+                    desc.MipLODBias = total;
+                    o_CreateSampler(dev, &desc, handle);
+                }
+            }
+            visible_sampler_bias(total);
+        }
+        copied += run;
+    }
 }
 
 void STDMETHODCALLTYPE D_CopyDescriptors(ID3D12Device* dev, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* ds, const UINT* dsz, UINT ns,
@@ -1217,14 +2343,42 @@ void STDMETHODCALLTYPE D_CopyDescriptors(ID3D12Device* dev, UINT nd, const D3D12
     o_CopyDescriptors(dev, nd, ds, dsz, ns, ss, ssz, type);
     if (!ds || !ss) return;
     const uint32_t inc = descriptor_increment(dev, type);
-    // Walk both range lists in step; null size arrays mean ranges of 1.
+    // Walk both range lists in step; null size arrays mean ranges of 1. The runs are gathered first
+    // and applied as one unit when they fit (note_descriptor_copies_batch); otherwise run by run.
+    constexpr uint32_t kBatch = 64;
+    uint64_t bd[kBatch], bs[kBatch];
+    uint32_t bc[kBatch], nb = 0;
+    bool fits = true;
+    {
+        uint32_t di = 0, si = 0, doff = 0, soff = 0;
+        while (di < nd && si < ns) {
+            const uint32_t dlen = dsz ? dsz[di] : 1, slen = ssz ? ssz[si] : 1;
+            if (doff >= dlen) { ++di; doff = 0; continue; }
+            if (soff >= slen) { ++si; soff = 0; continue; }
+            const uint32_t run = std::min(dlen - doff, slen - soff);
+            if (nb == kBatch) { fits = false; break; }
+            bd[nb] = ds[di].ptr + static_cast<uint64_t>(doff) * inc;
+            bs[nb] = ss[si].ptr + static_cast<uint64_t>(soff) * inc;
+            bc[nb++] = run;
+            doff += run;
+            soff += run;
+        }
+    }
+    g_copy_calls.fetch_add(1, std::memory_order_relaxed);
+    if (fits && note_descriptor_copies_batch(bd, bs, bc, nb, inc)) {
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            for (uint32_t i = 0; i < nb; ++i) apply_sampler_upload(dev, bd[i], bs[i], bc[i], inc);
+        return;
+    }
     uint32_t di = 0, si = 0, doff = 0, soff = 0;
     while (di < nd && si < ns) {
         const uint32_t dlen = dsz ? dsz[di] : 1, slen = ssz ? ssz[si] : 1;
         if (doff >= dlen) { ++di; doff = 0; continue; }
         if (soff >= slen) { ++si; soff = 0; continue; }
         const uint32_t run = std::min(dlen - doff, slen - soff);
-        note_descriptor_copy(ds[di].ptr + static_cast<uint64_t>(doff) * inc, ss[si].ptr + static_cast<uint64_t>(soff) * inc, run, inc);
+        const uint64_t dst = ds[di].ptr + uint64_t(doff) * inc, src = ss[si].ptr + uint64_t(soff) * inc;
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) apply_sampler_upload(dev, dst, src, run, inc);
+        note_descriptor_copy(dst, src, run, inc);
         doff += run;
         soff += run;
     }
@@ -1234,7 +2388,10 @@ void STDMETHODCALLTYPE D_CopyDescriptorsSimple(ID3D12Device* dev, UINT n, D3D12_
                                                D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
     o_CopyDescriptorsSimple(dev, n, dst, src, type);
-    note_descriptor_copy(dst.ptr, src.ptr, n, descriptor_increment(dev, type));
+    g_copy_simple.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t inc = descriptor_increment(dev, type);
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) apply_sampler_upload(dev, dst.ptr, src.ptr, n, inc);
+    note_descriptor_copy(dst.ptr, src.ptr, n, inc);
 }
 
 HRESULT STDMETHODCALLTYPE D_CreateCommittedResource(ID3D12Device* dev, const D3D12_HEAP_PROPERTIES* p, D3D12_HEAP_FLAGS f, const D3D12_RESOURCE_DESC* d,
@@ -1349,7 +2506,7 @@ std::shared_ptr<QueueState> queue_state(ID3D12CommandQueue* q, na_object_id* id)
     static std::mutex registration;
     std::lock_guard<std::mutex> first_use(registration);
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto it = g_objs.find(canon(q));
         if (it != g_objs.end() && it->second.queue) {
             *id = it->second.id;
@@ -1375,7 +2532,7 @@ std::shared_ptr<QueueState> queue_state(ID3D12CommandQueue* q, na_object_id* id)
     e.queue_flags = d.Flags;
     remember_creation(q, e);
     emit(e, NA_GROUP_QUEUE);
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     auto it = g_objs.find(canon(q));
     *id = qid;
     return (it != g_objs.end() && it->second.queue) ? it->second.queue : nullptr;
@@ -1422,6 +2579,7 @@ HRESULT STDMETHODCALLTYPE D_Signal(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64
 }
 HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
 {
+    if (t_host_work) return o_Wait(q, f, v); // private completion, as for D_Signal
     const auto token = ExecuteBegin(q);
     const HRESULT hr = o_Wait(q, f, v);
     sync_event(NA_EV_QUEUE_WAIT, token, f, v, hr);
@@ -1430,6 +2588,7 @@ HRESULT STDMETHODCALLTYPE D_Wait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v
 
 void STDMETHODCALLTYPE D_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
+    const CostScope cost(kCostExec, !t_host_work);
     ReleaseParkedTwins();
     const ExecuteToken t = ExecuteBegin(q, n, lists);
     o_ExecuteCommandLists(q, n, lists);
@@ -1481,7 +2640,7 @@ bool snapshot()
     // Live inventory: creation events in id (= creation) order.
     std::vector<std::pair<na_object_id, std::vector<uint8_t>>> events;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         events.reserve(g_objs.size());
         for (const auto& kv : g_objs)
             if (!kv.second.created.empty()) events.emplace_back(kv.second.id, kv.second.created);
@@ -1517,11 +2676,28 @@ uint64_t fnv1a(const void* data, size_t n)
     return h;
 }
 
+thread_local std::vector<ShaderDimension> g_next_dimensions;
+thread_local std::vector<ShaderResource> g_next_shader_resources;
+thread_local bool g_next_reflection_complete=true;
+thread_local bool g_next_shader_readonly=true;
+thread_local uint32_t g_next_shader_rejection=0;
+thread_local bool g_next_pixel_position=false;
 void bytecode(na_ev_pipeline_created& e, uint32_t stage, const D3D12_SHADER_BYTECODE& b)
 {
     if (!b.pShaderBytecode || !b.BytecodeLength) return;
     e.stage_hash[stage] = fnv1a(b.pShaderBytecode, b.BytecodeLength);
     e.stage_bytes[stage] = static_cast<uint32_t>(b.BytecodeLength);
+    if(g_operation_snapshots.load()&&!t_host_work){
+        const uint32_t visibility[]={D3D12_SHADER_VISIBILITY_VERTEX,D3D12_SHADER_VISIBILITY_PIXEL,D3D12_SHADER_VISIBILITY_DOMAIN,D3D12_SHADER_VISIBILITY_HULL,D3D12_SHADER_VISIBILITY_GEOMETRY};
+        bool pixel_position=false;
+        const bool reflected=ReflectDimensions(b,g_next_dimensions,stage<5?visibility[stage]:D3D12_SHADER_VISIBILITY_ALL,&g_next_shader_resources,
+            stage==NA_STAGE_PS?&pixel_position:nullptr);
+        g_next_reflection_complete &= reflected;
+        uint32_t rejection=0;
+        g_next_shader_readonly &= ExecutableReadOnly(b,stage==NA_STAGE_PS?&pixel_position:nullptr,&rejection);
+        g_next_shader_rejection|=rejection;
+        if(stage==NA_STAGE_PS)g_next_pixel_position=pixel_position;
+    }
 }
 
 void depth_blend(na_ev_pipeline_created& e, BOOL depth_enable, D3D12_DEPTH_WRITE_MASK mask, D3D12_COMPARISON_FUNC func)
@@ -1540,8 +2716,46 @@ void blend_mask(na_ev_pipeline_created& e, const D3D12_BLEND_DESC& b)
     }
 }
 
+// RGB replay uses out=a+dst*b. Opaque, straight/premultiplied alpha-over,
+// and pure colour multiplication fit it without saturating the grey witness.
+// MIN/MAX/logic/additive-clipping and destination-alpha coupling instead keep
+// the original full picture and use the draw-derived protection method.
+thread_local bool g_next_hud_affine=false;
+thread_local uint8_t g_next_blend_class=0;
+// RT0 colour blend as the HUD un-blend replay sees it (BlendClass in producers.hpp): the result
+// must be A + M * destination per channel with A, M independent of the destination, which
+// rules out MIN/MAX, logic ops and any factor reading the destination's ALPHA (the replay
+// targets carry alpha 1, the game's do not). A destination COLOUR factor on the source side is
+// still linear in the destination. DestBlend ZERO with no destination factor: the draw replaces
+// what is there, exactly like an opaque draw, although blending is switched on.
+uint8_t blend_class(const D3D12_BLEND_DESC& blend)
+{
+    const auto& b=blend.RenderTarget[0];
+    if(b.LogicOpEnable)return 4;
+    if(!b.BlendEnable)return 1;
+    if(b.BlendOp==D3D12_BLEND_OP_MIN||b.BlendOp==D3D12_BLEND_OP_MAX)return 4;
+    const auto dest_alpha=[](D3D12_BLEND f){return f==D3D12_BLEND_DEST_ALPHA||f==D3D12_BLEND_INV_DEST_ALPHA||f==D3D12_BLEND_SRC_ALPHA_SAT;};
+    const auto dest_colour=[](D3D12_BLEND f){return f==D3D12_BLEND_DEST_COLOR||f==D3D12_BLEND_INV_DEST_COLOR;};
+    if(dest_alpha(b.SrcBlend)||dest_alpha(b.DestBlend)||dest_colour(b.DestBlend))return 4;
+    if(b.DestBlend==D3D12_BLEND_ZERO&&!dest_colour(b.SrcBlend))return 3;
+    return 2;
+}
+thread_local bool g_next_stream_output=false;
+bool hud_affine(const D3D12_BLEND_DESC& blend)
+{
+    const auto& b=blend.RenderTarget[0];
+    if(b.LogicOpEnable)return false;
+    if(!b.BlendEnable)return true;
+    if(b.BlendOp!=D3D12_BLEND_OP_ADD)return false;
+    return ((b.SrcBlend==D3D12_BLEND_SRC_ALPHA||b.SrcBlend==D3D12_BLEND_ONE)&&b.DestBlend==D3D12_BLEND_INV_SRC_ALPHA)||
+           (b.SrcBlend==D3D12_BLEND_ZERO&&(b.DestBlend==D3D12_BLEND_SRC_COLOR||b.DestBlend==D3D12_BLEND_INV_SRC_COLOR));
+}
+
 void pipeline_unknowns(na_ev_pipeline_created& e)
 {
+    g_next_hud_affine=false;
+    g_next_blend_class=0;
+    g_next_stream_output=false;
     for (auto& f : e.rtv_formats) f = 0;
     e.dsv_format = 0;
     e.sample_count = NA_UNKNOWN_U32;
@@ -1555,25 +2769,388 @@ void emit_pipeline(ID3D12Device* dev, IUnknown* obj, na_ev_pipeline_created& e, 
     e.pipeline = register_object(obj, NA_OBJ_PIPELINE_HOST);
     e.root_signature = rs ? lookup(rs) : 0;
     remember_creation(obj, e);
+    if(g_operation_snapshots.load()&&!t_host_work){
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
+            found->second.dimensions=g_next_dimensions;found->second.shader_resources=g_next_shader_resources;
+            found->second.reflection_complete=g_next_reflection_complete;
+            found->second.shader_rejection=g_next_shader_rejection|(g_next_stream_output?ShaderStreamOutput:0u);}
+        if(found!=g_objs.end())found->second.shader_readonly=g_next_shader_readonly&&!g_next_stream_output&&
+            std::none_of(g_next_shader_resources.begin(),g_next_shader_resources.end(),[](const auto& r){return r.type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;});
+    }
+    {std::unique_lock<RegistryLock> lock(g_m);const auto found=g_objs.find(canon(obj));if(found!=g_objs.end()){
+        found->second.native_hud_affine=g_next_hud_affine;found->second.blend_class=g_next_blend_class;found->second.pixel_position=g_next_pixel_position;}}
     emit(e, NA_GROUP_PIPELINE);
 }
 
 NA_ORIG(CreateRootSignature, HRESULT, ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
+NA_ORIG(CreateCommandSignature, HRESULT, ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE D_CreateCommandSignature(ID3D12Device* dev, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+    ID3D12RootSignature* root, REFIID iid, void** out)
+{
+    Depth depth("CreateCommandSignature");
+    const HRESULT hr=o_CreateCommandSignature(dev,desc,root,iid,out);
+    if(SUCCEEDED(hr)&&out&&*out&&desc&&depth.outermost()&&!t_host_work) {
+        auto* object=static_cast<IUnknown*>(*out);
+        register_object(object,NA_OBJ_PIPELINE_HOST);
+        uint8_t kind=0;
+        if(desc->NumArgumentDescs==1&&desc->pArgumentDescs&&!root) {
+            const auto type=desc->pArgumentDescs[0].Type;
+            if(type==D3D12_INDIRECT_ARGUMENT_TYPE_DRAW&&desc->ByteStride>=sizeof(D3D12_DRAW_ARGUMENTS))kind=1;
+            if(type==D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED&&desc->ByteStride>=sizeof(D3D12_DRAW_INDEXED_ARGUMENTS))kind=2;
+        }
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto found=g_objs.find(canon(object));if(found!=g_objs.end())found->second.indirect_draw_kind=kind;
+    }
+    return hr;
+}
+uint8_t indirect_draw_kind(ID3D12CommandSignature* signature)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    const auto found=g_objs.find(canon(signature));return found==g_objs.end()?0:found->second.indirect_draw_kind;
+}
 NA_ORIG(CreateGraphicsPipelineState, HRESULT, ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
 NA_ORIG(CreateComputePipelineState, HRESULT, ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 NA_ORIG(CreatePipelineState, HRESULT, ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
 
+// Pipeline state stream: subobjects are pointer-aligned {type; payload}.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324) // padding to pointer alignment IS the stream layout
+#endif
+template <typename T>
+struct alignas(void*) Sub {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    T inner;
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+template <typename T>
+const T& inner_of(const uint8_t* p) { return reinterpret_cast<const Sub<T>*>(p)->inner; }
+
+size_t sub_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t)
+{
+    switch (t) {
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: return sizeof(Sub<ID3D12RootSignature*>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: return sizeof(Sub<D3D12_SHADER_BYTECODE>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: return sizeof(Sub<D3D12_STREAM_OUTPUT_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: return sizeof(Sub<D3D12_BLEND_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: return sizeof(Sub<UINT>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: return sizeof(Sub<D3D12_RASTERIZER_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: return sizeof(Sub<D3D12_DEPTH_STENCIL_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: return sizeof(Sub<D3D12_INPUT_LAYOUT_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: return sizeof(Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: return sizeof(Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: return sizeof(Sub<D3D12_RT_FORMAT_ARRAY>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: return sizeof(Sub<DXGI_FORMAT>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: return sizeof(Sub<DXGI_SAMPLE_DESC>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: return sizeof(Sub<UINT>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: return sizeof(Sub<D3D12_CACHED_PIPELINE_STATE>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: return sizeof(Sub<D3D12_PIPELINE_STATE_FLAGS>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: return sizeof(Sub<D3D12_DEPTH_STENCIL_DESC1>);
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: return sizeof(Sub<D3D12_VIEW_INSTANCING_DESC>);
+    default: return 0; // newer subobject: stop here, the rest is reported unobserved
+    }
+}
+
+// ---- Live sampler variants: creation copies and twin building.
+// A creation copy owns everything its description pointed at (shader bytecode, shared
+// between pipelines that use the same shader; input layouts; stream-output declarations;
+// view-instancing locations), so the background worker can build more twins long after
+// the game's call returned. The cached-PSO blob is never copied: it belongs to the game's
+// variant. A device reference is held for as long as the entry exists.
+constexpr GUID kReplayRootBlob = {0x12adf671, 0xa84c, 0x43e0, {0xa7, 0x39, 0x11, 0x80, 0x43, 0xbc, 0xf8, 0x3e}};
+
+void remember_replay_root(ID3D12RootSignature* root, const void* blob, SIZE_T size)
+{
+    if (root && blob && size && size <= UINT_MAX)
+        root->SetPrivateData(kReplayRootBlob, static_cast<UINT>(size), blob);
+}
+
+struct VariantRecipe {
+    enum Kind : uint8_t { RootSignature, Graphics, Compute, Stream } kind = RootSignature;
+    Microsoft::WRL::ComPtr<ID3D12Device> dev;
+    UINT node_mask = 0;               // root signatures
+    std::vector<uint8_t> blob;
+    const void* rs_key = nullptr;     // pipelines: the root signature they were built with
+    na_object_id rs_id = 0;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC g{};
+    D3D12_COMPUTE_PIPELINE_STATE_DESC c{};
+    std::vector<uint8_t> stream;
+    size_t rs_offset = SIZE_MAX;
+    std::vector<std::shared_ptr<const std::vector<uint8_t>>> code;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elems;
+    std::vector<D3D12_SO_DECLARATION_ENTRY> so;
+    std::vector<UINT> strides;
+    std::vector<D3D12_VIEW_INSTANCE_LOCATION> vil;
+    std::deque<std::string> names;    // stable addresses for semantic names
+    VariantRecipe() = default;
+    VariantRecipe(const VariantRecipe&) = delete;
+    VariantRecipe& operator=(const VariantRecipe&) = delete;
+    IUnknown* make(ID3D12RootSignature* rs) const;
+};
+std::mutex g_code_m;
+std::unordered_map<uint64_t, std::vector<std::weak_ptr<const std::vector<uint8_t>>>>& g_code =
+    *new std::unordered_map<uint64_t, std::vector<std::weak_ptr<const std::vector<uint8_t>>>>();
+D3D12_SHADER_BYTECODE own_code(VariantRecipe& r, const D3D12_SHADER_BYTECODE& b)
+{
+    if (!b.pShaderBytecode || !b.BytecodeLength) return {};
+    const auto* bytes = static_cast<const uint8_t*>(b.pShaderBytecode);
+    // DXBC/DXIL containers carry their content digest right after the magic; the size and
+    // the first bytes key the cache, and a hit is compared in full before it is shared.
+    const uint64_t k = fnv1a(bytes, b.BytecodeLength < 64 ? b.BytecodeLength : 64) ^ (static_cast<uint64_t>(b.BytecodeLength) * 0x9E3779B97F4A7C15ull);
+    std::shared_ptr<const std::vector<uint8_t>> sp;
+    {
+        std::lock_guard<std::mutex> lk(g_code_m);
+        auto& bucket = g_code[k];
+        bucket.erase(std::remove_if(bucket.begin(), bucket.end(), [](const auto& w) { return w.expired(); }), bucket.end());
+        for (const auto& w : bucket)
+            if (auto hit = w.lock())
+                if (hit->size() == b.BytecodeLength && std::memcmp(hit->data(), bytes, b.BytecodeLength) == 0) { sp = hit; break; }
+        if (!sp) {
+            sp = std::make_shared<const std::vector<uint8_t>>(bytes, bytes + b.BytecodeLength);
+            bucket.push_back(sp);
+        }
+    }
+    r.code.push_back(sp);
+    return {sp->data(), sp->size()};
+}
+D3D12_INPUT_LAYOUT_DESC own_layout(VariantRecipe& r, const D3D12_INPUT_LAYOUT_DESC& d)
+{
+    if (!d.NumElements || !d.pInputElementDescs) return {nullptr, 0};
+    r.elems.assign(d.pInputElementDescs, d.pInputElementDescs + d.NumElements);
+    for (auto& e : r.elems)
+        if (e.SemanticName) { r.names.emplace_back(e.SemanticName); e.SemanticName = r.names.back().c_str(); }
+    return {r.elems.data(), d.NumElements};
+}
+D3D12_STREAM_OUTPUT_DESC own_so(VariantRecipe& r, const D3D12_STREAM_OUTPUT_DESC& d)
+{
+    D3D12_STREAM_OUTPUT_DESC o = d;
+    if (d.NumEntries && d.pSODeclaration) {
+        r.so.assign(d.pSODeclaration, d.pSODeclaration + d.NumEntries);
+        for (auto& e : r.so)
+            if (e.SemanticName) { r.names.emplace_back(e.SemanticName); e.SemanticName = r.names.back().c_str(); }
+        o.pSODeclaration = r.so.data();
+    } else { o.pSODeclaration = nullptr; o.NumEntries = 0; }
+    if (d.NumStrides && d.pBufferStrides) { r.strides.assign(d.pBufferStrides, d.pBufferStrides + d.NumStrides); o.pBufferStrides = r.strides.data(); }
+    else { o.pBufferStrides = nullptr; o.NumStrides = 0; }
+    return o;
+}
+std::shared_ptr<const VariantRecipe> recipe_of(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d)
+{
+    auto r = std::make_shared<VariantRecipe>();
+    r->kind = VariantRecipe::Graphics;
+    r->dev = dev;
+    r->g = d;
+    r->g.VS = own_code(*r, d.VS); r->g.PS = own_code(*r, d.PS); r->g.DS = own_code(*r, d.DS);
+    r->g.HS = own_code(*r, d.HS); r->g.GS = own_code(*r, d.GS);
+    r->g.StreamOutput = own_so(*r, d.StreamOutput);
+    r->g.InputLayout = own_layout(*r, d.InputLayout);
+    r->g.CachedPSO = {};
+    r->g.pRootSignature = nullptr;
+    return r;
+}
+std::shared_ptr<const VariantRecipe> recipe_of(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC& d)
+{
+    auto r = std::make_shared<VariantRecipe>();
+    r->kind = VariantRecipe::Compute;
+    r->dev = dev;
+    r->c = d;
+    r->c.CS = own_code(*r, d.CS);
+    r->c.CachedPSO = {};
+    r->c.pRootSignature = nullptr;
+    return r;
+}
+// A stream with a subobject this build does not know cannot be copied safely: no recipe
+// (its twins at creation still work; a background build falls back for it).
+std::shared_ptr<const VariantRecipe> recipe_of(ID3D12Device* dev, const D3D12_PIPELINE_STATE_STREAM_DESC& d)
+{
+    if (!d.pPipelineStateSubobjectStream || !d.SizeInBytes) return nullptr;
+    auto r = std::make_shared<VariantRecipe>();
+    r->kind = VariantRecipe::Stream;
+    r->dev = dev;
+    const auto* p = static_cast<const uint8_t*>(d.pPipelineStateSubobjectStream);
+    r->stream.assign(p, p + d.SizeInBytes);
+    uint8_t* q = r->stream.data();
+    size_t at = 0;
+    while (at + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= d.SizeInBytes) {
+        const auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(q + at);
+        const size_t n = sub_size(type);
+        if (!n || at + n > d.SizeInBytes) return nullptr;
+        uint8_t* s = q + at;
+        switch (type) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: r->rs_offset = at; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
+            auto& b = reinterpret_cast<Sub<D3D12_SHADER_BYTECODE>*>(s)->inner;
+            b = own_code(*r, b);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: {
+            auto& so = reinterpret_cast<Sub<D3D12_STREAM_OUTPUT_DESC>*>(s)->inner;
+            so = own_so(*r, so);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+            auto& il = reinterpret_cast<Sub<D3D12_INPUT_LAYOUT_DESC>*>(s)->inner;
+            il = own_layout(*r, il);
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+            reinterpret_cast<Sub<D3D12_CACHED_PIPELINE_STATE>*>(s)->inner = {};
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+            auto& vi = reinterpret_cast<Sub<D3D12_VIEW_INSTANCING_DESC>*>(s)->inner;
+            if (vi.ViewInstanceCount && vi.pViewInstanceLocations) {
+                r->vil.assign(vi.pViewInstanceLocations, vi.pViewInstanceLocations + vi.ViewInstanceCount);
+                vi.pViewInstanceLocations = r->vil.data();
+            } else vi.pViewInstanceLocations = nullptr;
+            break;
+        }
+        default: break;
+        }
+        at += n;
+    }
+    if (r->rs_offset == SIZE_MAX) return nullptr; // no root-signature subobject: nothing to swap
+    return r;
+}
+IUnknown* VariantRecipe::make(ID3D12RootSignature* trs) const
+{
+    const HostWorkScope host;
+    ID3D12PipelineState* t = nullptr;
+    switch (kind) {
+    case Graphics: {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d = g;
+        d.pRootSignature = trs;
+        return SUCCEEDED(o_CreateGraphicsPipelineState(dev.Get(), &d, IID_PPV_ARGS(&t))) ? t : nullptr;
+    }
+    case Compute: {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC d = c;
+        d.pRootSignature = trs;
+        return SUCCEEDED(o_CreateComputePipelineState(dev.Get(), &d, IID_PPV_ARGS(&t))) ? t : nullptr;
+    }
+    case Stream: {
+        Microsoft::WRL::ComPtr<ID3D12Device2> d2;
+        if (FAILED(dev.As(&d2))) return nullptr;
+        std::vector<uint8_t> copy(stream);
+        std::memcpy(copy.data() + rs_offset + offsetof(Sub<ID3D12RootSignature*>, inner), &trs, sizeof(trs));
+        D3D12_PIPELINE_STATE_STREAM_DESC sd{copy.size(), copy.data()};
+        return SUCCEEDED(o_CreatePipelineState(d2.Get(), &sd, IID_PPV_ARGS(&t))) ? t : nullptr;
+    }
+    default: return nullptr;
+    }
+}
+// Root-signature twins for anisotropic index `af` at the mip levels in `levels` that `base`
+// (the current set, may be null) has not prepared yet. Level 0 at index 0 is the game's own.
+// Returns null when nothing new was prepared.
+std::shared_ptr<Obj::Twins> build_rs_set(const VariantRecipe& r, int af, uint32_t levels, const Obj::Twins* base)
+{
+    ID3D12VersionedRootSignatureDeserializer* rd = nullptr;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* u = nullptr;
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(r.blob.data(), r.blob.size(), IID_PPV_ARGS(&rd))) || !rd ||
+        !(u = rd->GetUnconvertedRootSignatureDesc()) ||
+        (u->Version != D3D_ROOT_SIGNATURE_VERSION_1_0 && u->Version != D3D_ROOT_SIGNATURE_VERSION_1_1)) {
+        if (rd) rd->Release();
+        return nullptr;
+    }
+    const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
+    const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
+    auto set = base ? std::make_shared<Obj::Twins>(*base) : std::make_shared<Obj::Twins>();
+    bool added = false;
+    for (int level = 0; level < kMipCount; ++level) {
+        if (!(levels >> level & 1u) || set->built[level]) continue;
+        set->built[level] = true;
+        added = true;
+        std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
+        uint32_t aniso_changed=0;
+        const uint32_t changed = (level == 0 && af == 0) ? 0u : variant_samplers(ss, level, af,&aniso_changed);
+        if (!changed) { set->same[level] = true; continue; }
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
+        if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
+        else copy.Desc_1_1.pStaticSamplers = ss.data();
+        ID3DBlob* b = nullptr;
+        ID3DBlob* err = nullptr;
+        ID3D12RootSignature* twin = nullptr;
+        if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&copy, &b, &err)) && b) {
+            const HostWorkScope host;
+            if (FAILED(o_CreateRootSignature(r.dev.Get(), r.node_mask, b->GetBufferPointer(), b->GetBufferSize(), IID_PPV_ARGS(&twin)))) twin = nullptr;
+        }
+        if (twin && b) remember_replay_root(twin, b->GetBufferPointer(), b->GetBufferSize());
+        if (b) b->Release();
+        if (err) err->Release();
+        if (!twin) { g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed); continue; }
+        // D3D12 returns the same object for identical bytes: a twin that is one of the game's
+        // own root signatures is not kept (holding it could make two game root signatures own
+        // each other). That level has no twin: recordings at it fall back to the game's objects.
+        bool game_obj = false;
+        {
+            std::shared_lock<RegistryLock> lock(g_m);
+            game_obj = g_objs.find(canon(twin)) != g_objs.end();
+        }
+        if (game_obj) {
+            twin->Release();
+            g_mip_shared_skips.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        set->obj[level] = twin;
+        g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
+        g_var_static_changed[level * 4 + af].fetch_add(changed, std::memory_order_relaxed);
+        g_var_aniso_changed[level * 4 + af].fetch_add(aniso_changed, std::memory_order_relaxed);
+    }
+    rd->Release();
+    return added ? set : nullptr;
+}
+// Pipeline twins matching a root-signature set: one per level that set prepared and `base`
+// has not. Same root signature -> the game's pipeline is right; no root twin -> none.
+template <typename Make>
+std::shared_ptr<Obj::Twins> build_pso_set(Make&& make, const Obj::Twins& rs_set, const Obj::Twins* base,uint32_t levels)
+{
+    auto set = base ? std::make_shared<Obj::Twins>(*base) : std::make_shared<Obj::Twins>();
+    bool added = false;
+    for (int level = 0; level < kMipCount; ++level) {
+        if (!(levels>>level&1u) || !rs_set.built[level] || set->built[level]) continue;
+        set->built[level] = true;
+        added = true;
+        if (rs_set.same[level]) { set->same[level] = true; continue; }
+        if (!rs_set.obj[level]) continue; // the root twin failed: recordings at this level fall back
+        IUnknown* t = make(static_cast<ID3D12RootSignature*>(rs_set.obj[level]));
+        if (t) { set->obj[level] = t; g_mip_twin_pso.fetch_add(1, std::memory_order_relaxed); }
+        else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
+    }
+    return added ? set : nullptr;
+}
+// Levels to prepare at creation for anisotropic index `af`: the saved choice's levels
+// (g_mip_level_mask at g_pre_af) plus the chosen and the in-use variants.
+uint32_t creation_levels(int af)
+{
+    uint32_t m = 0;
+    if (af == g_pre_af.load(std::memory_order_relaxed)) m |= g_mip_level_mask.load(std::memory_order_relaxed);
+    for (const uint32_t v : {g_var_want.load(std::memory_order_relaxed), g_var_live.load(std::memory_order_relaxed)})
+        if (var_af(v) == af) m |= 1u << var_level(v);
+    if (af == 0) m &= ~1u; // the game's own
+    return m;
+}
+
 HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T size, REFIID riid, void** out)
 {
     Depth depth("CreateRootSignature");
-    // Mip bias for static samplers: re-serialise the root signature with biased
-    // samplers (versions 1.0 / 1.1; anything else is passed through unchanged). The game
-    // gets the startup level; twins for the other menu levels are built right after.
+    // Static samplers. Live variants on (the default): the game's root signature is created
+    // exactly as the game asked, and twins carry the mip bias / anisotropic filtering (see
+    // the live sampler variants above). Off ([j2] mip_bias_live=0): it is re-serialised with
+    // the chosen variant (versions 1.0 / 1.1; objects created from then on only).
     ID3DBlob* rebuilt = nullptr;
-    const int game_level = g_mip_game_level.load(std::memory_order_relaxed);
-    ID3DBlob* level_blob[3] = {};
-    bool level_same[3] = {true, true, true};
-    bool decodable = false;
+    bool decodable = false, has_surface = false;
+    const bool live = g_mip_live_enabled.load(std::memory_order_relaxed);
     if (blob && size && !t_host_work && depth.outermost()) { // also when off: native biases are recorded
         ID3D12VersionedRootSignatureDeserializer* rd = nullptr;
         const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* u = nullptr;
@@ -1583,73 +3160,60 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             decodable = true;
             const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
             const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
-            for (UINT i = 0; i < ns; ++i) if (sampler_wants_bias(src[i])) note_native(src[i].MipLODBias);
-            const bool live = g_mip_live_enabled.load(std::memory_order_relaxed);
-            for (int level = 0; level < 3; ++level) {
-                if (level != game_level && !live) continue;
-                D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
-                std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
-                uint32_t changed = 0;
-                for (auto& x : ss)
-                    if (sampler_wants_bias(x)) {
-                        const float nb = biased(x.MipLODBias, kMipLevels[level]);
-                        if (nb != x.MipLODBias) { x.MipLODBias = nb; ++changed; }
-                    }
-                if (!changed) continue; // the original blob is right for this level
-                if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
-                else copy.Desc_1_1.pStaticSamplers = ss.data();
-                ID3DBlob* b = nullptr;
-                ID3DBlob* err = nullptr;
-                if (SUCCEEDED(D3D12SerializeVersionedRootSignature(&copy, &b, &err)) && b) {
-                    level_blob[level] = b;
-                    level_same[level] = false;
-                    if (level == game_level) g_biased_static.fetch_add(changed, std::memory_order_relaxed);
-                } else if (b) b->Release();
-                if (err) err->Release();
+            for (UINT i = 0; i < ns; ++i) note_sampler_desc(2, src[i]);
+            for (UINT i = 0; i < ns; ++i) if (sampler_wants_aniso(src[i])) {
+                has_surface=true;note_native(src[i].MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(src[i].Filter)?src[i].MaxAnisotropy:0,sampler_wants_bias(src[i]));
             }
-            if (level_blob[game_level]) { rebuilt = level_blob[game_level]; rebuilt->AddRef(); }
+            const uint32_t want = g_var_want.load(std::memory_order_relaxed);
+            if (!live && has_surface && want) {
+                std::vector<D3D12_STATIC_SAMPLER_DESC> ss(src, src + ns);
+                uint32_t biased_n = 0, aniso_n = 0;
+                for (auto& x : ss) {
+                    const bool bias=sampler_wants_bias(x),aniso=sampler_wants_aniso(x);
+                    if(!bias&&!aniso)continue;
+                    const float nb = bias?biased(x.MipLODBias, kMipLevels[var_level(want)]):x.MipLODBias;
+                    if (nb != x.MipLODBias) { x.MipLODBias = nb; ++biased_n; }
+                    if (aniso&&aniso_to(x, kAfLevels[var_af(want)])) ++aniso_n;
+                }
+                if (biased_n || aniso_n) {
+                    D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
+                    if (u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) copy.Desc_1_0.pStaticSamplers = ss.data();
+                    else copy.Desc_1_1.pStaticSamplers = ss.data();
+                    ID3DBlob* err = nullptr;
+                    if (FAILED(D3D12SerializeVersionedRootSignature(&copy, &rebuilt, &err))) rebuilt = nullptr;
+                    if (err) err->Release();
+                    if (rebuilt) {
+                        g_biased_static.fetch_add(biased_n, std::memory_order_relaxed);
+                        g_aniso_static.fetch_add(aniso_n, std::memory_order_relaxed);
+                    }
+                }
+            }
         }
         if (rd) rd->Release();
     }
     const HRESULT hr = rebuilt ? o_CreateRootSignature(dev, mask, rebuilt->GetBufferPointer(), rebuilt->GetBufferSize(), riid, out)
                                : o_CreateRootSignature(dev, mask, blob, size, riid, out);
-    if (rebuilt) rebuilt->Release();
-    std::shared_ptr<Obj::Twins> rs_twins;
-    if (decodable && SUCCEEDED(hr) && out && *out) {
-        // Twins for the other levels: same as the game's blob -> nothing to swap.
-        for (int level = 0; level < 3; ++level) {
-            if (level == game_level) continue;
-            const bool same_as_game = level_same[level] && level_same[game_level];
-            if (same_as_game) continue; // marked below if any other level needs twins
-            if (!rs_twins) rs_twins = std::make_shared<Obj::Twins>();
-            const void* bytes = level_blob[level] ? level_blob[level]->GetBufferPointer() : blob;
-            const SIZE_T n = level_blob[level] ? level_blob[level]->GetBufferSize() : size;
-            ID3D12RootSignature* twin = nullptr;
-            if (SUCCEEDED(o_CreateRootSignature(dev, mask, bytes, n, IID_PPV_ARGS(&twin))) && twin) {
-                // D3D12 returns the same object for identical bytes: a twin that is one of
-                // the game's own root signatures is not kept (holding it could make two game
-                // root signatures own each other). That level has no twin: recordings at it
-                // fall back to the game's objects.
-                const void* tkey = canon(twin);
-                bool game_obj = false;
-                {
-                    std::shared_lock<std::shared_mutex> lock(g_m);
-                    game_obj = g_objs.find(tkey) != g_objs.end();
-                }
-                if (game_obj) {
-                    twin->Release();
-                    g_mip_shared_skips.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-                rs_twins->obj[level] = twin;
-                g_mip_twin_rs.fetch_add(1, std::memory_order_relaxed);
-            } else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
+    if (depth.outermost() && !t_host_work && SUCCEEDED(hr) && out && *out) {
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&root)))) {
+            if (rebuilt) remember_replay_root(root.Get(), rebuilt->GetBufferPointer(), rebuilt->GetBufferSize());
+            else remember_replay_root(root.Get(), blob, size);
         }
-        if (rs_twins)
-            for (int level = 0; level < 3; ++level)
-                rs_twins->same[level] = level == game_level || (level_same[level] && level_same[game_level]);
     }
-    for (auto* b : level_blob) if (b) b->Release();
+    if (rebuilt) rebuilt->Release();
+    std::shared_ptr<const VariantRecipe> recipe;
+    std::shared_ptr<Obj::Twins> sets[4];
+    if (live && decodable && has_surface && SUCCEEDED(hr) && out && *out) {
+        ReleaseParkedTwins();
+        auto r = std::make_shared<VariantRecipe>();
+        r->kind = VariantRecipe::RootSignature;
+        r->dev = dev;
+        r->node_mask = mask;
+        r->blob.assign(static_cast<const uint8_t*>(blob), static_cast<const uint8_t*>(blob) + size);
+        for (int af = 0; af < 4; ++af)
+            if (const uint32_t lv = creation_levels(af)) sets[af] = build_rs_set(*r, af, lv, nullptr);
+        recipe = std::move(r);
+    }
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj) return hr;
     constexpr uint32_t kMaxParams = 64, kMaxRanges = 256;
@@ -1741,14 +3305,16 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     ev.e.device = device_id(dev);
     ev.e.root_signature = register_object(obj, NA_OBJ_PIPELINE_HOST);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         auto it = g_objs.find(canon(obj));
         if (it != g_objs.end()) {
             if (it->second.retirement_unobservable) ev.e.hdr.flags |= NA_EVF_METHOD_UNOBSERVED;
             it->second.created.assign(raw, raw + ev.e.hdr.size_bytes);
             it->second.root_params.assign(params, params + ev.e.param_count);
             it->second.root_ranges.assign(ranges, ranges + nranges);
-            rs_twins.swap(it->second.twins); // any previous set is released after g_m (end of scope)
+            for (int af = 0; af < 4; ++af) sets[af].swap(it->second.af_sets[af]); // previous sets released after g_m
+            recipe.swap(it->second.recipe);
+            it->second.variant_kind = it->second.recipe ? 1 : 0;
             // Structural hash of the layout (parameter and range records), not the object:
             // identical layouts created in another session hash the same.
             uint64_t layout_hash = 1469598103934665603ull;
@@ -1764,53 +3330,75 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
     return hr;
 }
 
-// Live mip bias: the root signature's twins (null when it needs none).
-std::shared_ptr<Obj::Twins> rs_twins_of(const void* rs)
-{
-    if (!rs) return nullptr;
-    std::shared_lock<std::shared_mutex> lock(g_m);
-    const auto it = g_objs.find(canon(rs));
-    return it == g_objs.end() ? nullptr : it->second.twins;
-}
-// Builds pipeline twins with `make(level, twin_rs)` for every level whose root-signature
-// twin differs; levels whose root signature is unchanged need no twin (same[]).
-// A pipeline without a known root signature gets an empty twin set (never swapped:
-// a list using it falls back to the game's objects).
-template <typename Make>
-void make_pso_twins(IUnknown* pso, const void* rs, Make make)
+// Live sampler variants: a pipeline's twins follow its root signature's. A pipeline on a
+// sampler-dependent root signature keeps a creation copy (`recipe`, null when its stream
+// cannot be copied) and gets twins for every set its root signature has now; later sets
+// are built by the background worker. A pipeline with an embedded root signature cannot
+// be twinned: recordings that bind it fall back to the game's objects.
+template <typename Make, typename RecipeFn>
+void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_fn)
 {
     if (!pso || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
     ReleaseParkedTwins();
-    const auto rt = rs_twins_of(rs);
-    std::shared_ptr<Obj::Twins> pt;
+    uint8_t kind = 0;
+    na_object_id rs_id = 0;
+    std::shared_ptr<Obj::Twins> rs_sets[4], sets[4];
     if (!rs) {
-        pt = std::make_shared<Obj::Twins>(); // embedded root signature: not swappable
-        pt->same[g_mip_game_level.load()] = true;
+        kind = 2;
         g_mip_untwinned.fetch_add(1, std::memory_order_relaxed);
-    } else if (rt) {
-        pt = std::make_shared<Obj::Twins>();
-        for (int level = 0; level < 3; ++level) {
-            if (rt->same[level]) { pt->same[level] = true; continue; }
-            if (!rt->obj[level]) continue; // twin root signature failed: no swap for this level
-            IUnknown* twin = make(level, static_cast<ID3D12RootSignature*>(rt->obj[level]));
-            if (twin) { pt->obj[level] = twin; g_mip_twin_pso.fetch_add(1, std::memory_order_relaxed); }
-            else g_mip_twin_fail.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        std::shared_lock<RegistryLock> lock(g_m);
+        const auto it = g_objs.find(canon(rs));
+        if (it != g_objs.end() && it->second.variant_kind == 1) {
+            kind = 1;
+            rs_id = it->second.id;
+            for (int af = 0; af < 4; ++af) rs_sets[af] = it->second.af_sets[af];
         }
-    } else return; // root signature needs no twins: the pipeline needs none either
-    {
-        std::unique_lock<std::shared_mutex> lock(g_m);
-        const auto it = g_objs.find(canon(pso));
-        if (it != g_objs.end()) pt.swap(it->second.twins);
     }
-    pt.reset(); // a replaced set (if any) is released outside g_m
+    if (!kind) return; // root signature needs no twins: the pipeline needs none either
+    std::shared_ptr<const VariantRecipe> recipe;
+    if (kind == 1) {
+        recipe = recipe_fn();
+        // No pipeline twin is compiled here: this is the game's own creation call, often on the
+        // thread that pumps its window, and compiling a twin per level doubled or tripled the
+        // load (c3853df hung SE5's start-up for 40 s+ with AF 16x saved). The background worker
+        // builds the chosen variant; until then lookups use the game's pipeline and wake it.
+        (void)make;
+        for (int af = 0; af < 4; ++af) (void)rs_sets[af];
+        if (recipe) {
+            auto r = std::const_pointer_cast<VariantRecipe>(recipe);
+            r->rs_key = canon(rs);
+            r->rs_id = rs_id;
+        }
+    }
+    bool published_recipe = false;
+    {
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto it = g_objs.find(canon(pso));
+        if (it != g_objs.end()) {
+            it->second.variant_kind = kind;
+            for (int af = 0; af < 4; ++af) sets[af].swap(it->second.af_sets[af]);
+            recipe.swap(it->second.recipe);
+            published_recipe = it->second.recipe != nullptr;
+        }
+    }
+    // Wake only after publication: a worker woken before the swap could miss this recipe.
+    if (published_recipe && (g_var_want.load(std::memory_order_relaxed) || g_mip_prewarm.load(std::memory_order_relaxed)) &&
+        !g_var_missing.exchange(true, std::memory_order_relaxed)) g_var_cv.notify_one();
+    // replaced sets (if any) are released outside g_m
 }
 
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d); // Draw replay (below)
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateGraphicsPipelineState");
-    const HRESULT hr = o_CreateGraphicsPipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreateGraphicsPipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_GRAPHICS;
@@ -1825,23 +3413,31 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     e.sample_count = d->SampleDesc.Count;
     depth_blend(e, d->DepthStencilState.DepthEnable, d->DepthStencilState.DepthWriteMask, d->DepthStencilState.DepthFunc);
     blend_mask(e, d->BlendState);
+    g_next_hud_affine=hud_affine(d->BlendState);
+    g_next_blend_class=blend_class(d->BlendState);
+    g_next_stream_output=d->StreamOutput.NumEntries!=0;
     emit_pipeline(dev, obj, e, d->pRootSignature);
+    replay_note_pipeline(dev, obj, *d);
     make_pso_twins(obj, d->pRootSignature, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC c = *d;
         c.pRootSignature = trs;
         c.CachedPSO = {}; // the cache belongs to the game's variant
         ID3D12PipelineState* t = nullptr;
         return SUCCEEDED(o_CreateGraphicsPipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
-    });
+    }, [&] { return recipe_of(dev, *d); });
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreateComputePipelineState");
-    const HRESULT hr = o_CreateComputePipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreateComputePipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d) return hr;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_COMPUTE;
@@ -1857,64 +3453,21 @@ HRESULT STDMETHODCALLTYPE D_CreateComputePipelineState(ID3D12Device* dev, const 
         c.CachedPSO = {};
         ID3D12PipelineState* t = nullptr;
         return SUCCEEDED(o_CreateComputePipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
-    });
+    }, [&] { return recipe_of(dev, *d); });
     return hr;
 }
 
-// Pipeline state stream: subobjects are pointer-aligned {type; payload}.
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4324) // padding to pointer alignment IS the stream layout
-#endif
-template <typename T>
-struct alignas(void*) Sub {
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
-    T inner;
-};
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-template <typename T>
-const T& inner_of(const uint8_t* p) { return reinterpret_cast<const Sub<T>*>(p)->inner; }
-
-size_t sub_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t)
-{
-    switch (t) {
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: return sizeof(Sub<ID3D12RootSignature*>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: return sizeof(Sub<D3D12_SHADER_BYTECODE>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: return sizeof(Sub<D3D12_STREAM_OUTPUT_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: return sizeof(Sub<D3D12_BLEND_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: return sizeof(Sub<UINT>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: return sizeof(Sub<D3D12_RASTERIZER_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: return sizeof(Sub<D3D12_DEPTH_STENCIL_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: return sizeof(Sub<D3D12_INPUT_LAYOUT_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: return sizeof(Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: return sizeof(Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: return sizeof(Sub<D3D12_RT_FORMAT_ARRAY>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: return sizeof(Sub<DXGI_FORMAT>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: return sizeof(Sub<DXGI_SAMPLE_DESC>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: return sizeof(Sub<UINT>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: return sizeof(Sub<D3D12_CACHED_PIPELINE_STATE>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: return sizeof(Sub<D3D12_PIPELINE_STATE_FLAGS>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: return sizeof(Sub<D3D12_DEPTH_STENCIL_DESC1>);
-    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: return sizeof(Sub<D3D12_VIEW_INSTANCING_DESC>);
-    default: return 0; // newer subobject: stop here, the rest is reported unobserved
-    }
-}
 
 HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID riid, void** out)
 {
+    const CostScope cost(kCostPso, !t_host_work);
     Depth depth("CreatePipelineState");
-    const HRESULT hr = o_CreatePipelineState(dev, d, riid, out);
+    HRESULT hr = S_OK;
+    { const CostScope driver(kCostPsoDriver, !t_host_work); hr = o_CreatePipelineState(dev, d, riid, out); }
+    const CostScope reflect(kCostPsoReflect, !t_host_work); // everything of ours after the driver returned
     IUnknown* obj = depth.outermost() ? out_object(hr, out) : nullptr;
     if (!obj || !d || !d->pPipelineStateSubobjectStream) return hr;
+    g_next_dimensions.clear();g_next_shader_resources.clear();g_next_reflection_complete=true;g_next_shader_readonly=true;g_next_shader_rejection=0;g_next_pixel_position=false;
     na_ev_pipeline_created e;
     init_header(e, NA_EV_PIPELINE_CREATED, NA_EVF_FOUNDATIONAL);
     e.pipeline_kind = NA_PIPELINE_STREAM;
@@ -1944,7 +3497,8 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: bytecode(e, NA_STAGE_CS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: bytecode(e, NA_STAGE_AS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: bytecode(e, NA_STAGE_MS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: blend_mask(e, inner_of<D3D12_BLEND_DESC>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: blend_mask(e, inner_of<D3D12_BLEND_DESC>(s)); g_next_hud_affine=hud_affine(inner_of<D3D12_BLEND_DESC>(s)); g_next_blend_class=blend_class(inner_of<D3D12_BLEND_DESC>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: g_next_stream_output=inner_of<D3D12_STREAM_OUTPUT_DESC>(s).NumEntries!=0;break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
             const auto& ds = inner_of<D3D12_DEPTH_STENCIL_DESC>(s);
             depth_blend(e, ds.DepthEnable, ds.DepthWriteMask, ds.DepthFunc);
@@ -1982,8 +3536,9 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
             D3D12_PIPELINE_STATE_STREAM_DESC c{d->SizeInBytes, copy.data()};
             ID3D12PipelineState* t = nullptr;
             return SUCCEEDED(o_CreatePipelineState(dev, &c, IID_PPV_ARGS(&t))) ? t : nullptr;
-        });
-    else make_pso_twins(obj, nullptr, [](int, ID3D12RootSignature*) -> IUnknown* { return nullptr; });
+        }, [&] { return recipe_of(dev, *d); });
+    else make_pso_twins(obj, nullptr, [](int, ID3D12RootSignature*) -> IUnknown* { return nullptr; },
+                        [] { return std::shared_ptr<const VariantRecipe>(); });
     return hr;
 }
 
@@ -1995,18 +3550,49 @@ struct Rec {
     uint32_t flags = 0;
 };
 
+// Per-thread cache of the last few lists (WWII: every hook of every translated draw looked its list
+// up in g_objs, ~1 M entries under D3D11On12, three to four times per draw). Keyed by the caller's
+// pointer; valid while no object retired or was replaced (g_retire_gen, bumped under the exclusive
+// g_m whenever an entry is erased or replaced), and the caller holds the shared g_m, so the entry
+// cannot go away while it is used.
+struct ListCacheEntry { const void* key = nullptr; ListState* ls = nullptr; na_object_id id = 0; };
+constexpr uint32_t kListCache = 4;
+thread_local ListCacheEntry t_list_cache[kListCache];
+thread_local uint64_t t_list_cache_gen = 0;
+thread_local uint32_t t_list_cache_next = 0;
 ListState* list_state_locked(const void* l, na_object_id* id)
 {
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (gen != t_list_cache_gen) { for (auto& e : t_list_cache) e = {}; t_list_cache_gen = gen; }
+    if (l) for (const auto& e : t_list_cache) if (e.key == l) { *id = e.id; return e.ls; }
     auto it = g_objs.find(canon(l));
     if (it == g_objs.end() || !it->second.list) return nullptr;
     *id = it->second.id;
+    if (l) t_list_cache[t_list_cache_next++ % kListCache] = {l, it->second.list.get(), it->second.id};
     return it->second.list.get();
+}
+// The bound pipeline's entry (nullptr if unknown), cached per recording like root_sig_obj_locked.
+const Obj* pso_obj_locked(ListState& ls)
+{
+    if (!ls.pso) return nullptr;
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (ls.pso_key == ls.pso && ls.pso_gen == gen) return static_cast<const Obj*>(ls.pso_obj);
+    const auto it = g_objs.find(canon(ls.pso));
+    const Obj* o = it != g_objs.end() ? &it->second : nullptr;
+    if (o) { ls.pso_key = ls.pso; ls.pso_obj = o; ls.pso_gen = gen; }
+    return o;
+}
+const na_ev_pipeline_created* pso_created_locked(ListState& ls)
+{
+    const Obj* o = pso_obj_locked(ls);
+    if (!o || o->created.size() < sizeof(na_ev_pipeline_created)) return nullptr;
+    return reinterpret_cast<const na_ev_pipeline_created*>(o->created.data());
 }
 
 template <typename F>
 void with_list_state(const void* l, F&& f)
 {
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id id = 0;
     if (ListState* ls = list_state_locked(l, &id)) f(*ls);
 }
@@ -2059,17 +3645,19 @@ void preexisting_list(ID3D12GraphicsCommandList* l)
     emit(e, NA_GROUP_LIST);
 }
 
-bool begin_op(ID3D12GraphicsCommandList* l, Rec* r)
+bool begin_op(ID3D12GraphicsCommandList* l, Rec* r, bool work = true)
 {
     if (t_host_work || !na::observe_internal::Started() || !l) return false;
     for (int attempt = 0; attempt < 2; ++attempt) {
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             na_object_id id = 0;
             if (ListState* ls = list_state_locked(l, &id)) {
                 r->list = id;
                 r->gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
                 r->op_index = ls->op_index.fetch_add(1) + 1;
+                if (work && ls->work_tail.load(std::memory_order_relaxed)==1)
+                    ls->work_tail.store(2,std::memory_order_relaxed);
                 if (!ls->recording_observed.load() || !ls->coverage_complete.load() || r->gen == NA_UNKNOWN_U64)
                     r->flags |= NA_EVF_METHOD_UNOBSERVED;
                 return true;
@@ -2080,9 +3668,28 @@ bool begin_op(ID3D12GraphicsCommandList* l, Rec* r)
     return false;
 }
 
+template<class Fn>
+bool recorded_locked(ID3D12GraphicsCommandList* l,Rec& r,Fn&& fn){
+    if(t_host_work||!na::observe_internal::Started()||!l)return false;
+    for(int attempt=0;attempt<2;++attempt){
+        {std::shared_lock<RegistryLock> lock(g_m);na_object_id id=0;
+            if(auto* ls=list_state_locked(l,&id)){
+                r.list=id;r.gen=ls->generation_known.load()?ls->generation.load():NA_UNKNOWN_U64;r.op_index=ls->op_index.fetch_add(1)+1;
+                if (ls->work_tail.load(std::memory_order_relaxed)==1)
+                    ls->work_tail.store(2,std::memory_order_relaxed);
+                if(!ls->recording_observed.load()||!ls->coverage_complete.load()||r.gen==NA_UNKNOWN_U64)r.flags|=NA_EVF_METHOD_UNOBSERVED;
+                std::lock_guard<std::mutex> bind(ls->bind_m);fn(*ls);return true;
+            }
+        }
+        preexisting_list(l);
+    }
+    return false;
+}
+
 void emit_op(const Rec& r, uint32_t op, std::initializer_list<uint64_t> a, const void* payload = nullptr, uint32_t bytes = 0,
              uint32_t stride = 0, uint32_t extra_flags = 0, uint32_t group = NA_GROUP_PASS)
 {
+    const CostScope cost(kCostEmit);
     constexpr uint32_t kMaxPayload = 64 * sizeof(na_barrier);
     struct Ev {
         na_ev_list_op e;
@@ -2138,6 +3745,24 @@ DescHeap* heap_for_gpu_locked(uint64_t ptr, uint32_t* slot)
     return nullptr;
 }
 
+// g_m and the list's bind_m are held. Registry changes invalidate the raw
+// pointers BEFORE they may be inspected; game-owned heaps retain their native
+// lifetime rules. A table lookup examines at most the two currently bound heaps.
+void bound_heaps_locked(ListState& ls){
+    if(ls.heap_metadata_revision==g_heap_registry_revision)return;
+    ls.heap_metadata[0]=ls.heap_metadata[1]=nullptr;
+    for(uint32_t i=0;i<ls.nheaps;++i){const auto* key=canon(ls.heaps[i]);
+        for(const auto& h:g_heaps)if(h->key==ls.heaps[i]||h->key==key){ls.heap_metadata[i]=h.get();break;}}
+    ls.heap_metadata_revision=g_heap_registry_revision;
+}
+DescHeap* bound_heap_for_gpu_locked(ListState& ls,uint64_t ptr,uint32_t* slot){
+    bound_heaps_locked(ls);
+    for(uint32_t i=0;i<ls.nheaps;++i){auto* h=ls.heap_metadata[i];if(!h||!h->gpu_start||!h->increment||ptr<h->gpu_start)continue;
+        const auto offset=ptr-h->gpu_start;if(offset%h->increment||offset/h->increment>=h->count)continue;
+        *slot=static_cast<uint32_t>(offset/h->increment);return h;}
+    return nullptr;
+}
+
 na_view_ref view_ref_locked(DescHeap* h, uint32_t slot)
 {
     na_view_ref v{};
@@ -2147,6 +3772,7 @@ na_view_ref view_ref_locked(DescHeap* h, uint32_t slot)
         v.format = v.first_subresource = NA_UNKNOWN_U32;
         return v;
     }
+    const SlotShared stripe(h, slot);
     const DescHeap::SlotInfo& si = h->info[slot];
     v.heap = h->id;
     v.slot = slot;
@@ -2160,7 +3786,7 @@ na_view_ref view_ref_locked(DescHeap* h, uint32_t slot)
 
 na_view_ref cpu_ref(D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     uint32_t slot = 0;
     DescHeap* dh = heap_for_cpu_locked(h.ptr, &slot);
     return view_ref_locked(dh, slot);
@@ -2190,13 +3816,13 @@ struct On<sl::list::Reset> {
         uint64_t gen = 0;
         bool bundle = false;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             known = list_state_locked(l, &id) != nullptr;
         }
         if (!known) preexisting_list(l);
         const auto cov = na::hooking::variants::CoverageOf(na::hooking::variants::Kind::CommandList, l);
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             ListState* ls = list_state_locked(l, &id);
             if (!ls) return;
             if (SUCCEEDED(hr)) {
@@ -2204,6 +3830,7 @@ struct On<sl::list::Reset> {
                 // unknown generation stays unknown (we never invent a count).
                 if (ls->generation_known.load()) ls->generation.fetch_add(1);
                 ls->op_index.store(0);
+                ls->work_tail.store(0);
                 ls->recording_observed.store(true);
                 {
                     std::lock_guard<std::mutex> bl(ls->bind_m);
@@ -2214,17 +3841,33 @@ struct On<sl::list::Reset> {
                     ls->uses_complete = true;
                     ls->targets.clear();
                     ls->insertion.Reset();
+                    ls->last_draw_rt = 0;
+                    ls->pending_entry = 0;
+                    ls->entry_barrier=0;
                     ls->sampled_textures.clear();
                     ls->cleared.clear();
                     ls->pso = pso;
                     ls->heaps[0] = ls->heaps[1] = nullptr;
                     ls->nheaps = 0;
+                    ls->heap_metadata_revision=0;
+                    ls->operation_key[0].valid=ls->operation_key[1].valid=false;
+                    ++ls->key_revision[0];++ls->key_revision[1];++ls->read_revision[0];++ls->read_revision[1];
                     ls->args[0].clear();
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
                     ls->cur_nrt = 0;
+                    ls->native_colors.clear();
+                    ls->native_depth.reset();
                     ls->restorable = true;
+                    ls->active_queries=0;
                     ls->in_render_pass = false;
+                    ls->raster_viewports_known = ls->raster_scissors_known = ls->raster_topology_known = false;
+                    ls->vertex_mask=0;ls->index_known=false;ls->index_buffer={};ls->stencil_ref=0;
+                    std::fill_n(ls->blend_factor,4,0.f);ls->predicate=nullptr;ls->predicate_offset=0;
+                    ls->game_stream_output = false;
+                    std::fill_n(ls->game_so, D3D12_SO_BUFFER_SLOT_COUNT, D3D12_GPU_VIRTUAL_ADDRESS{0});
+                    ls->raster_targets_known = false;
+                    ls->raster_tracking = g_raster_tracking.load(std::memory_order_acquire);
                 }
                 ls->root_sig[0] = ls->root_sig[1] = nullptr;
                 ls->coverage_complete.store(cov == na::hooking::variants::Coverage::Complete);
@@ -2255,7 +3898,7 @@ struct On<sl::list::Close> {
     static void run(GL* l, HRESULT hr)
     {
         Rec r;
-        if (!begin_op(l, &r)) return;
+        if (!begin_op(l, &r, false)) return;
         na_ev_list_reset_close e;
         init_header(e, NA_EV_LIST_CLOSE, 0);
         e.list = r.list;
@@ -2264,12 +3907,9 @@ struct On<sl::list::Close> {
         emit(e, NA_GROUP_LIST);
     }
 };
-void note_draw(GL* l) {
-    std::shared_lock<std::shared_mutex> lock(g_m);
-    na_object_id id = 0;
-    auto* ls = list_state_locked(l, &id);
-    if (!ls) return;
-    std::lock_guard<std::mutex> bl(ls->bind_m);
+void note_draw_locked(ListState* ls){
+    const CostScope cost(kCostNoteDraw);
+    ls->last_draw_rt = ls->cur_nrt == 1 ? ls->cur_rts[0] : 0;
     uint64_t sel_depth = 0, sel_color = 0;
     GetLiveSelection(&sel_depth, &sel_color);
     for (uint32_t i = 0; i < ls->cur_nrt; ++i)
@@ -2278,30 +3918,37 @@ void note_draw(GL* l) {
             ev.with_depth = sel_depth && ls->cur_ds == sel_depth; // scene content, not a reuse of the texture
             ls->insertion.Add(ev);
         }
-    auto pipeline = g_objs.find(canon(ls->pso));
-    if (ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 && pipeline != g_objs.end() &&
-        pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
-        const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
-        if (p->depth_enable == 1 && p->depth_write == 1 && ls->states.size() < 4096)
-            ls->states.push_back({ls->cur_ds, ls->cur_ds_sub, D3D12_RESOURCE_STATE_DEPTH_WRITE});
+    const na_ev_pipeline_created* p = ls->cur_ds && ls->cur_ds_sub != NA_UNKNOWN_U32 ? pso_created_locked(*ls) : nullptr;
+    if (p) {
+        if(p->depth_enable==1&&p->depth_write==1&&ls->states.size()<4096){
+            const bool same=!ls->states.empty()&&ls->states.back().resource==ls->cur_ds&&ls->states.back().subresource==ls->cur_ds_sub&&ls->states.back().state_after==D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            if(!same)ls->states.push_back({ls->cur_ds,ls->cur_ds_sub,D3D12_RESOURCE_STATE_DEPTH_WRITE});
+        }
     }
 }
+void note_draw(GL* l){with_list_state(l,[&](ListState& ls){std::lock_guard<std::mutex> lock(ls.bind_m);note_draw_locked(&ls);});}
+void draw_operation(GL* l,uint32_t op,uint64_t count,uint64_t instances){
+    Rec r;if(recorded_locked(l,r,[&](ListState& ls){note_draw_locked(&ls);}))emit_op(r,op,{count,instances});
+}
+
 template <>
 struct On<sl::list::DrawInstanced> {
     static void run(GL* l, UINT v, UINT i, UINT, UINT)
     {
-        Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_DRAW, {v, i});
-        if (r.list) note_draw(l);
+        draw_operation(l,NA_OP_DRAW,v,i);
     }
 };
+template<> struct On<sl::list::BeginQuery>{static void run(GL* l,ID3D12QueryHeap*,D3D12_QUERY_TYPE type,UINT){
+    if(type!=D3D12_QUERY_TYPE_TIMESTAMP)with_list_state(l,[](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);++s.active_queries;});
+}};
+template<> struct On<sl::list::EndQuery>{static void run(GL* l,ID3D12QueryHeap*,D3D12_QUERY_TYPE type,UINT){
+    if(type!=D3D12_QUERY_TYPE_TIMESTAMP)with_list_state(l,[](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);if(s.active_queries)--s.active_queries;});
+}};
 template <>
 struct On<sl::list::DrawIndexedInstanced> {
     static void run(GL* l, UINT n, UINT i, UINT, INT, UINT)
     {
-        Rec r;
-        if (begin_op(l, &r)) emit_op(r, NA_OP_DRAW_INDEXED, {n, i});
-        if (r.list) note_draw(l);
+        draw_operation(l,NA_OP_DRAW_INDEXED,n,i);
     }
 };
 template <>
@@ -2381,12 +4028,31 @@ struct On<sl::list::ResolveSubresource> {
         note_uses(l, {d, s});
     }
 };
+std::atomic<RasterStateListener> g_raster_listener{nullptr};
+void notify_raster_state(GL* l)
+{
+    const auto listener = g_raster_listener.load(std::memory_order_acquire);
+    if (!listener) return;
+    RasterScissors s;
+    if (!ListRasterScissors(l, s)) return;
+    HostWorkScope own;
+    listener(l, s);
+}
 template <>
 struct On<sl::list::RSSetViewports> {
     static void run(GL* l, UINT n, const D3D12_VIEWPORT* v)
     {
         Rec r;
-        if (!begin_op(l, &r) || !n || !v) return;
+        if (!begin_op(l, &r)) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ++ls.viewport_serial;ls.raster_viewports_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || v);
+            if (ls.raster_viewports_known) {
+                ls.raster_viewport_count = n;
+                if (n) std::copy_n(v, n, ls.raster_viewports);
+            }
+        });
+        if (!n || !v) return;
         // Every viewport (review): 6 floats each, first one also in a[].
         constexpr UINT kMax = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
         float all[kMax * 6];
@@ -2404,7 +4070,17 @@ struct On<sl::list::RSSetScissorRects> {
     static void run(GL* l, UINT n, const D3D12_RECT* rc)
     {
         Rec r;
-        if (!begin_op(l, &r) || !n || !rc) return;
+        if (!begin_op(l, &r)) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ++ls.scissor_serial;ls.raster_scissors_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || rc);
+            if (ls.raster_scissors_known) {
+                ls.raster_scissor_count = n;
+                if (n) std::copy_n(rc, n, ls.raster_scissors);
+            }
+        });
+        notify_raster_state(l);
+        if (!n || !rc) return;
         const auto pack = [](LONG a, LONG b) { return static_cast<uint64_t>(static_cast<uint32_t>(a)) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32); };
         constexpr UINT kMax = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
         int32_t all[kMax * 4];
@@ -2419,13 +4095,79 @@ struct On<sl::list::RSSetScissorRects> {
     }
 };
 template <>
+struct On<sl::list::IASetPrimitiveTopology> {
+    static void run(GL* l, D3D12_PRIMITIVE_TOPOLOGY topology) {
+        if (t_host_work) return;
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.raster_topology = topology; ls.raster_topology_known = true;
+        });
+    }
+};
+template <>
+struct On<sl::list::ClearState> {
+    static void run(GL* l,ID3D12PipelineState* pso){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+        s.pso=pso;s.root_sig[0]=s.root_sig[1]=nullptr;s.args[0].clear();s.args[1].clear();s.nheaps=0;
+        s.cur_rt=s.cur_ds=0;s.cur_nrt=0;s.native_colors.clear();s.native_depth.reset();
+        s.raster_rt_count=s.raster_viewport_count=s.raster_scissor_count=0;s.raster_has_depth=false;
+        s.raster_targets_known=s.raster_viewports_known=s.raster_scissors_known=s.raster_topology_known=true;
+        s.raster_topology=D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;s.restorable=true;
+        s.vertex_mask=0;s.index_known=false;s.index_buffer={};s.stencil_ref=0;std::fill_n(s.blend_factor,4,0.f);
+        s.game_stream_output=false;std::fill_n(s.game_so,D3D12_SO_BUFFER_SLOT_COUNT,D3D12_GPU_VIRTUAL_ADDRESS{0});s.predicate=nullptr;s.predicate_offset=0;++s.key_revision[0];++s.key_revision[1];++s.read_revision[0];++s.read_revision[1];
+    });}
+};
+template <>
+struct On<sl::list::SOSetTargets> {
+    static void run(GL* list, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views)
+    {
+        // Track each slot, so unbinding (null views or zero locations) clears the state again.
+        // Previously the first binding made every later draw of the recording ineligible.
+        with_list_state(list, [&](ListState& state) {
+            std::lock_guard<std::mutex> lock(state.bind_m);
+            for (UINT i = 0; i < count && start + i < D3D12_SO_BUFFER_SLOT_COUNT; ++i)
+                state.game_so[start + i] = views ? views[i].BufferLocation : 0;
+            state.game_stream_output = false;
+            for (const auto location : state.game_so) state.game_stream_output |= location != 0;
+        });
+    }
+};
+template <>
+struct On<sl::list::SetPredication> {
+    static void run(GL* l,ID3D12Resource* buffer,UINT64 offset,D3D12_PREDICATION_OP op){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+        s.predicate=buffer;s.predicate_offset=offset;s.predicate_op=op;});}
+};
+template <>
+struct On<sl::list::IASetVertexBuffers> {
+    static void run(GL* l,UINT first,UINT count,const D3D12_VERTEX_BUFFER_VIEW* views){
+        if(first>32||count>32-first)return;
+        with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+            if(!s.raster_tracking)return;
+            for(UINT i=0;i<count;++i){s.vertex_buffers[first+i]=views?views[i]:D3D12_VERTEX_BUFFER_VIEW{};s.vertex_mask|=1u<<(first+i);}});
+    }
+};
+template <>
+struct On<sl::list::IASetIndexBuffer> {
+    static void run(GL* l,const D3D12_INDEX_BUFFER_VIEW* view){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+        if(s.raster_tracking){s.index_buffer=view?*view:D3D12_INDEX_BUFFER_VIEW{};s.index_known=true;}});}
+};
+template <>
+struct On<sl::list::OMSetBlendFactor> {
+    static void run(GL* l,const FLOAT factor[4]){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);
+        if(s.raster_tracking)for(UINT i=0;i<4;++i)s.blend_factor[i]=factor?factor[i]:1.f;});}
+};
+template <>
+struct On<sl::list::OMSetStencilRef> {
+    static void run(GL* l,UINT value){with_list_state(l,[&](ListState& s){std::lock_guard<std::mutex> lock(s.bind_m);if(s.raster_tracking)s.stencil_ref=value;});}
+};
+template <>
 struct On<sl::list::SetPipelineState> {
     static void run(GL* l, ID3D12PipelineState* p)
     {
         Rec r;
         if (!begin_op(l, &r)) return;
         emit_op(r, NA_OP_SET_PIPELINE, {id_or_unknown(p)});
-        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m); ls.pso = p; });
+        with_list_state(l, [&](ListState& ls) { std::lock_guard<std::mutex> bl(ls.bind_m);
+            if(ls.pso!=p){++ls.key_revision[0];++ls.key_revision[1];ls.operation_key[0].valid=ls.operation_key[1].valid=false;}ls.pso = p; });
     }
 };
 template <>
@@ -2433,7 +4175,7 @@ struct On<sl::list::ResourceBarrier> {
     static void run(GL* l, UINT n, const D3D12_RESOURCE_BARRIER* b)
     {
         Rec r;
-        if (!begin_op(l, &r) || !n || !b) return;
+        if (!begin_op(l, &r, false) || !n || !b) return;
         constexpr uint32_t kMax = 64;
         na_barrier out[kMax];
         const uint32_t m = std::min<uint32_t>(n, kMax);
@@ -2529,7 +4271,7 @@ struct On<sl::list::SetDescriptorHeaps> {
         na_object_id res = 0, smp = 0;
         for (UINT i = 0; h && i < n; ++i) {
             if (!h[i]) continue;
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             for (auto& dh : g_heaps)
                 if (dh->key == h[i]) (dh->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? smp : res) = dh->id;
         }
@@ -2537,6 +4279,7 @@ struct On<sl::list::SetDescriptorHeaps> {
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             ls.nheaps = 0;
+            ls.heap_metadata_revision=0;++ls.key_revision[0];++ls.key_revision[1];++ls.read_revision[0];++ls.read_revision[1];
             for (UINT i = 0; h && i < n && i < 2; ++i) ls.heaps[ls.nheaps++] = h[i];
         });
     }
@@ -2548,9 +4291,9 @@ void root_sig(GL* l, ID3D12RootSignature* rs)
     if (!begin_op(l, &r)) return;
     emit_op(r, NA_OP_SET_ROOT_SIGNATURE, {id_or_unknown(rs), Compute});
     with_list_state(l, [&](ListState& ls) {
-        const bool changed = ls.root_sig[Compute] != rs;
-        ls.root_sig[Compute] = rs;
         std::lock_guard<std::mutex> bl(ls.bind_m);
+        const bool changed = ls.root_sig[Compute] != rs;ls.root_sig[Compute] = rs;++ls.root_serial[Compute];
+        if(changed){++ls.key_revision[Compute];++ls.read_revision[Compute];ls.operation_key[Compute].valid=false;}
         if (changed) ls.args[Compute].clear(); // a different root signature invalidates every root argument
     });
 }
@@ -2558,14 +4301,42 @@ template <>
 struct On<sl::list::SetComputeRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<1>(l, rs); } };
 template <>
 struct On<sl::list::SetGraphicsRootSignature> { static void run(GL* l, ID3D12RootSignature* rs) { root_sig<0>(l, rs); } };
-void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t value, const void* consts = nullptr, UINT count = 0, UINT dest = 0)
+// The bound root signature's registry entry, reused while the same signature stays bound and no
+// object retired (g_retire_gen; std::unordered_map nodes never move otherwise). Under g_m + bind_m.
+// WWII: every table bind (~280k/s) looked it up twice (shadow_arg_locked and root_table).
+const Obj* root_sig_obj_locked(ListState& ls, uint32_t compute)
 {
-    if (param >= 64) return;
-    with_list_state(l, [&](ListState& ls) {
-        std::lock_guard<std::mutex> bl(ls.bind_m);
+    if (!ls.root_sig[compute]) return nullptr;
+    const uint64_t gen = g_retire_gen.load(std::memory_order_acquire);
+    if (ls.rs_key[compute] == ls.root_sig[compute] && ls.rs_gen[compute] == gen) return static_cast<const Obj*>(ls.rs_obj[compute]);
+    const auto it = g_objs.find(canon(ls.root_sig[compute]));
+    const Obj* rso = it != g_objs.end() ? &it->second : nullptr;
+    if (rso) { ls.rs_key[compute] = ls.root_sig[compute]; ls.rs_obj[compute] = rso; ls.rs_gen[compute] = gen; }
+    return rso;
+}
+void shadow_arg_locked(ListState& ls,uint32_t compute,UINT param,uint8_t type,uint64_t value,const void* consts=nullptr,UINT count=0,UINT dest=0){
+    if(param>=64)return;
         auto& v = ls.args[compute];
         if (v.size() <= param) v.resize(param + 1);
         ListState::RootArg& a = v[param];
+        if(a.type!=type||a.value!=value||type==5){
+            if(type==1||a.type==1){
+                bool texture_table=true;
+                const Obj* root = type==1&&a.type==1 ? root_sig_obj_locked(ls, compute) : nullptr;
+                if(root&&param<root->root_params.size()){
+                    const auto& p=root->root_params[param];
+                    if(p.param_type==NA_ROOT_TABLE&&p.first_range<=root->root_ranges.size()&&p.count<=root->root_ranges.size()-p.first_range){
+                        texture_table=false;
+                        for(UINT i=0;i<p.count;++i){const auto& range=root->root_ranges[p.first_range+i];
+                            texture_table|=range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SRV||range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV;}
+                    }
+                }
+                if(texture_table)++ls.read_revision[compute];
+            }
+            const auto& cached=ls.operation_key[compute];
+            if(type!=2||(a.type!=2&&a.type!=0)||!cached.valid||(cached.dimension_cbvs&(uint64_t(1)<<param)))++ls.key_revision[compute];
+        }
+        ++a.serial;
         if (type == 5) {
             if (a.type != 5) a.consts.clear();
             if (dest + count > 64) return;
@@ -2576,41 +4347,50 @@ void shadow_arg(GL* l, uint32_t compute, UINT param, uint8_t type, uint64_t valu
         }
         a.type = type;
         a.value = value;
-    });
+}
+void shadow_arg(GL* l,uint32_t compute,UINT param,uint8_t type,uint64_t value,const void* consts=nullptr,UINT count=0,UINT dest=0){
+    if(param>=64)return;
+    with_list_state(l,[&](ListState& ls){std::lock_guard<std::mutex> lock(ls.bind_m);shadow_arg_locked(ls,compute,param,type,value,consts,count,dest);});
 }
 std::atomic<TableBindCallback> g_table_cb{nullptr};
+std::atomic<EntryCallback> g_entry_cb{nullptr};
 template <uint32_t Compute>
-void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
-{
-    Rec r;
-    if (!begin_op(l, &r)) return;
-    na_object_id heap = 0;
-    uint32_t slot = 0;
-    uint64_t version = 0;
-    shadow_arg(l, Compute, param, 1, h.ptr);
-    {
-        std::shared_lock<std::shared_mutex> lock(g_m);
-        DescHeap* dh = heap_for_gpu_locked(h.ptr, &slot);
+void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
+    const CostScope cost(kCostRootTable);
+    Rec r;na_object_id heap=0;uint32_t slot=0;uint64_t version=0;
+    if(!recorded_locked(l,r,[&](ListState& state){auto* ls=&state;
+        shadow_arg_locked(state,Compute,param,1,h.ptr);
+        // Legal shader tables live in one of the recording's two bound heaps.
+        // Reuse their generation-checked metadata before searching every heap
+        // in a large game. Keep the original fallback for out-of-order evidence.
+        DescHeap* dh = bound_heap_for_gpu_locked(state,h.ptr,&slot);
+        if (!dh) dh = heap_for_gpu_locked(h.ptr, &slot);
         if (dh) {
             heap = dh->id;
+            const SlotShared stripe(dh, slot);
             version = dh->versions[slot];
         }
-        // C9: CBV ranges of this table (first range, per the bound root signature).
-        na_object_id lid = 0;
-        ListState* ls = list_state_locked(l, &lid);
-        if (dh && ls && ls->root_sig[Compute]) {
-            auto it = g_objs.find(canon(ls->root_sig[Compute]));
-            if (it != g_objs.end() && param < it->second.root_params.size()) {
-                const na_root_param& rp = it->second.root_params[param];
+        // C9: CBV ranges of this table, per the bound root signature.
+
+        // WWII p31660: ~250k table binds/s on the translator thread. Both per-recording budgets full
+        // (256 sampled textures, 4096 CBV bindings) means the range loops below add nothing: skip them,
+        // and reuse the root signature's entry instead of two hash lookups per bind.
+        if (dh && ls->root_sig[Compute] && (ls->sampled_textures.size() < 256 || ls->bindings.size() < 4096)) {
+            const Obj* rso = root_sig_obj_locked(*ls, Compute);
+            if (rso && param < rso->root_params.size()) {
+                const na_root_param& rp = rso->root_params[param];
                 if (rp.param_type == NA_ROOT_TABLE) {
-                    const auto& rr = it->second.root_ranges;
+                    const auto& rr = rso->root_ranges;
                     for (uint32_t q = 0; q < rp.count && rp.first_range + q < rr.size(); ++q) {
                         const na_root_range& range = rr[rp.first_range + q];
-                        if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32) {
-                            std::lock_guard<std::mutex> bl(ls->bind_m);
-                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
+                        if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32 && ls->sampled_textures.size()<256) {
+                            const CostScope sampled(kCostSampled);
+
+                            SlotShared stripe;
+                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64) && ls->sampled_textures.size()<256; ++k) {
                                 const uint64_t index = uint64_t(slot) + range.table_offset + k;
                                 if (index >= dh->count) break;
+                                stripe.lock(dh, index);
                                 const auto& si = dh->info[static_cast<size_t>(index)];
                                 if (si.kind == NA_DESC_SRV && si.resource && si.resource != NA_UNKNOWN_U64 &&
                                     ls->sampled_textures.size() < 256 &&
@@ -2619,10 +4399,18 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                             }
                         }
                         if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV || range.table_offset == NA_UNKNOWN_U32) continue;
-                        const uint32_t n = std::min<uint32_t>(range.num_descriptors, 8);
-                        const bool cut = range.num_descriptors > 8; // incl. unbounded: coverage flagged
-                        for (uint32_t k = 0; k < n && slot + range.table_offset + k < dh->count; ++k) {
-                            const DescHeap::SlotInfo& si = dh->info[slot + range.table_offset + k];
+                        // Cover the complete conventional hardware CB register bank.
+                        // Microsoft D3D11On12 uses 4/8/14/15-entry tables; the old
+                        // eight-entry budget silently hid its later camera buffers.
+                        constexpr uint32_t max_cbvs = D3D12_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT;
+                        const uint64_t first = uint64_t(slot) + range.table_offset;
+                        const uint32_t available = first < dh->count ? static_cast<uint32_t>(dh->count - first) : 0;
+                        const uint32_t n = std::min({range.num_descriptors, max_cbvs, available});
+                        const bool cut = range.num_descriptors > n; // incl. unbounded: coverage flagged
+                        SlotShared stripe;
+                        for (uint32_t k = 0; k < n && ls->bindings.size() < 4096; ++k) {
+                            stripe.lock(dh, first + k);
+                            const DescHeap::SlotInfo& si = dh->info[static_cast<size_t>(first + k)];
                             if (si.kind != NA_DESC_CBV) continue;
                             ListState::Binding b;
                             b.kind = NA_SNAP_TABLE_CBV;
@@ -2633,16 +4421,16 @@ void root_table(GL* l, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE h)
                             b.offset = si.cbv_offset;
                             b.resource = si.resource == NA_UNKNOWN_U64 ? 0 : si.resource;
                             b.range_truncated = cut;
-                            add_binding(*ls, b);
+                            if(ls->bindings.size()<4096)ls->bindings.push_back(b);
                         }
                     }
                 }
             }
         }
-    }
-    emit_op(r, NA_OP_SET_ROOT_TABLE, {heap, heap ? slot : uint64_t{NA_UNKNOWN_U32}, heap ? version : NA_UNKNOWN_U64, param, Compute}, nullptr, 0, 0,
-            heap ? 0u : NA_EVF_METHOD_UNOBSERVED);
+    }))return;
+    emit_op(r,NA_OP_SET_ROOT_TABLE,{heap,heap?slot:uint64_t{NA_UNKNOWN_U32},heap?version:NA_UNKNOWN_U64,param,Compute},nullptr,0,0,heap?0u:NA_EVF_METHOD_UNOBSERVED);
 }
+
 template <>
 struct On<sl::list::SetComputeRootDescriptorTable> { static void run(GL* l, UINT p, D3D12_GPU_DESCRIPTOR_HANDLE h) { root_table<1>(l, p, h); } };
 template <>
@@ -2673,7 +4461,7 @@ void root_view(GL* l, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
     uint64_t off = 0;
     bool known = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         known = resolve_va_locked(va, &res, &off);
     }
     if (Kind == NA_DESC_CBV) {
@@ -2732,7 +4520,7 @@ struct On<sl::list::OMSetRenderTargets> {
         na_view_ref refs[9];
         uint32_t m = 0;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             for (UINT i = 0; rts && i < n && i < 8; ++i) {
                 // Single range: consecutive descriptors from rts[0].
                 const D3D12_CPU_DESCRIPTOR_HANDLE h = single ? D3D12_CPU_DESCRIPTOR_HANDLE{rts[0].ptr + static_cast<SIZE_T>(i) * descriptor_increment_cached(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)} : rts[i];
@@ -2752,6 +4540,7 @@ struct On<sl::list::OMSetRenderTargets> {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             set_targets_locked(ls, refs, m, dsv != nullptr);
         });
+        notify_raster_state(l);
     }
 };
 template <>
@@ -2784,19 +4573,46 @@ struct On<sl::list::ClearRenderTargetView> {
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, na::j2::Op::ClearWrite});
+            if (v.resource == ls.pending_entry) ls.pending_entry = 0;
             if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
                 ls.cleared.push_back(v.resource);
         });
     }
 };
+struct TailWork {
+    template<typename... Args> static void run(GL* list, Args...) {
+        Rec r;
+        begin_op(list, &r);
+    }
+};
+template<> struct On<sl::list::ClearUnorderedAccessViewUint> : TailWork {};
+template<> struct On<sl::list::ClearUnorderedAccessViewFloat> : TailWork {};
+template<> struct On<sl::list::DiscardResource> : TailWork {};
+
 template <>
 struct On<sl::list::ExecuteIndirect> {
     static void run(GL* l, ID3D12CommandSignature*, UINT max, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64)
     {
         Rec r;
         if (begin_op(l, &r)) emit_op(r, NA_OP_EXECUTE_INDIRECT, {max}, nullptr, 0, 0, NA_EVF_METHOD_UNOBSERVED);
+        bool graphics=false;
+        {
+            std::shared_lock<RegistryLock> lock(g_m);
+            na_object_id id=0;auto* ls=list_state_locked(l,&id);
+            if(ls) {
+                std::lock_guard<std::mutex> bl(ls->bind_m);
+                const auto p=g_objs.find(canon(ls->pso));
+                if(p!=g_objs.end() && p->second.created.size()>=sizeof(na_ev_pipeline_created)) {
+                    const auto* d=reinterpret_cast<const na_ev_pipeline_created*>(p->second.created.data());
+                    graphics=d->pipeline_kind==NA_PIPELINE_GRAPHICS || (d->pipeline_kind==NA_PIPELINE_STREAM && !d->stage_bytes[NA_STAGE_CS]);
+                }
+            }
+        }
+        if(r.list && graphics)note_draw(l);
     }
 };
+
+std::atomic<TextureTraceListener> g_texture_trace_listener{nullptr};
 
 // ID3D12GraphicsCommandList4 render passes (Kind::CommandList4). BeginRenderPass binds
 // the attachments (and may clear them); EndRenderPass leaves bindings UNDEFINED
@@ -2810,16 +4626,23 @@ struct On<sl::list::BeginRenderPass> {
         Rec r;
         if (!begin_op(l, &r)) return;
         na_view_ref refs[9];
+        std::shared_ptr<const DescriptorDetails> color_views[8];
+        std::shared_ptr<const DescriptorDetails> depth_view;
+        const bool snapshot=g_operation_snapshots.load(std::memory_order_relaxed);
         uint32_t m = 0;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             for (UINT i = 0; rts && i < n && i < 8; ++i) {
                 uint32_t slot = 0;
-                refs[m++] = view_ref_locked(heap_for_cpu_locked(rts[i].cpuDescriptor.ptr, &slot), slot);
+                auto* heap=heap_for_cpu_locked(rts[i].cpuDescriptor.ptr,&slot);
+                refs[m++]=view_ref_locked(heap,slot);
+                if(snapshot&&heap){const SlotShared stripe(heap,slot);color_views[i]=heap->info[slot].details;}
             }
             if (ds) {
                 uint32_t slot = 0;
-                refs[m++] = view_ref_locked(heap_for_cpu_locked(ds->cpuDescriptor.ptr, &slot), slot);
+                auto* heap=heap_for_cpu_locked(ds->cpuDescriptor.ptr,&slot);
+                refs[m++]=view_ref_locked(heap,slot);
+                if(snapshot&&heap){const SlotShared stripe(heap,slot);depth_view=heap->info[slot].details;}
             }
         }
         const uint32_t nrt = ds ? (m ? m - 1 : 0) : m;
@@ -2832,6 +4655,18 @@ struct On<sl::list::BeginRenderPass> {
             if (!begin_op(l, &rc)) break;
             const FLOAT* c = rts[i].BeginningAccess.Clear.ClearValue.Color;
             emit_op(rc, NA_OP_CLEAR_RTV, {float_bits(c[0], c[1]), float_bits(c[2], c[3])}, &refs[i], sizeof(refs[i]), sizeof(refs[i]), 0, NA_GROUP_RESOURCE_USE);
+        }
+        if (const auto trace=g_texture_trace_listener.load(std::memory_order_relaxed)) {
+            const HostWorkScope own;
+            for (uint32_t i=0;i<nrt;++i) {
+                if (rts[i].BeginningAccess.Type!=D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR &&
+                    rts[i].BeginningAccess.Type!=D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD) continue;
+                TextureCall call;
+                call.kind=TextureKind::ClearColor;
+                call.target=rts[i].cpuDescriptor;
+                call.target_id=refs[i].resource;
+                trace(l,call); // both modes discard the previous contents
+            }
         }
         const bool depth_clear = ds && ds->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
         if (depth_clear) {
@@ -2846,6 +4681,9 @@ struct On<sl::list::BeginRenderPass> {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             set_targets_locked(ls, refs, m, ds != nullptr);
             ls.in_render_pass = true;
+            ls.raster_targets_known = false; // in-pass snapshots are observation only
+            ls.native_colors.assign(color_views,color_views+nrt);
+            ls.native_depth=std::move(depth_view);
             for (uint32_t i = 0; i < nrt; ++i) {
                 if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
                 ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::ClearWrite});
@@ -2868,6 +4706,9 @@ struct On<sl::list::EndRenderPass> {
             ls.in_render_pass = false;
             ls.cur_rt = ls.cur_ds = 0; // attachments are not bound after the pass
             ls.cur_nrt = 0;
+            ls.native_colors.clear();
+            ls.native_depth.reset();
+            ls.raster_targets_known = false;
             for (auto& t : ls.cur_rts) t = 0;
             ls.cur_ds_sub = NA_UNKNOWN_U32;
         });
@@ -2907,6 +4748,7 @@ bool is_derived(na_object_id id) { return is_derived_any(&id, 1); }
 void add_derived(na_object_id id)
 {
     if (!id) return;
+    mark_hot_candidate(id);
     std::lock_guard<std::mutex> lk(g_derived_m);
     const uint32_t m = g_derived_n.load(std::memory_order_relaxed);
     for (uint32_t i = 0; i < m; ++i) if (g_derived[i] == id) return;
@@ -2928,14 +4770,18 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
             !(b.Transition.StateBefore & D3D12_RESOURCE_STATE_RENDER_TARGET) || !(b.Transition.StateAfter & reads) ||
             resource_id(b.Transition.pResource) != color) continue;
         uint32_t cs = 0, ds = 0;
-        if (!ListSceneSubresource(l, color, depth, &cs, &ds) ||
-            (b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != cs)) continue;
+        const bool scene_here = ListSceneSubresource(l, color, depth, &cs, &ds);
+        // Whole-resource handoff is exact evidence even in a pure post list.
+        // Keep that entry for submitted-scene placement; it cannot insert inline
+        // without this recording's scene metadata. No subresource is guessed.
+        if ((!scene_here && b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) ||
+            (scene_here && b.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && b.Transition.Subresource != cs)) continue;
         std::vector<ListState::StateNote> entry_states;
         // The callback runs BEFORE this entire barrier batch. Its first
         // transition for each selected subresource supplies the exact entry
         // state, even when depth was only read and prior GPU work is in flight.
         // Never use StateAfter here, nor the before-state of an END_ONLY half.
-        for (const auto selected : {std::pair<na_object_id, uint32_t>{color, cs}, {depth, ds}}) {
+        if(scene_here)for (const auto selected : {std::pair<na_object_id, uint32_t>{color, cs}, {depth, ds}}) {
             for (UINT j = 0; j < count; ++j) {
                 const auto& entry = barriers[j];
                 if (entry.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) break;
@@ -2949,7 +4795,7 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
             }
         }
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             na_object_id lid = 0;
             auto* ls = list_state_locked(l, &lid);
             if (!ls) return;
@@ -2958,8 +4804,10 @@ void before_read_transition(GL* l, UINT count, const D3D12_RESOURCE_BARRIER* bar
                 ls->states.insert(ls->states.end(), entry_states.begin(), entry_states.end());
             else ls->evidence_complete = false;
             ls->insertion.Add({color, 0, UINT64_MAX, false, na::j2::Op::Barrier});
+            ls->pending_entry = color;
+            ++ls->entry_barrier;
         }
-        if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+        if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, true); }
         break; // our pass runs before the whole original barrier batch
     }
 }
@@ -2971,11 +4819,19 @@ void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
     GetLiveSelection(&depth, &color);
     const auto source = resource_id(src), destination = resource_id(dst);
     if (!color) return;
+    // A real copy consumes or replaces the handoff before any shader operation.
+    // Do not later label an unrelated draw as its first entry.
+    if (source == color || destination == color) {
+        with_list_state(l, [&](ListState& ls) {
+            std::lock_guard<std::mutex> bl(ls.bind_m);
+            ls.pending_entry = 0;
+        });
+    }
     const bool from_color = source == color;
     if (!from_color && !is_derived(source)) return;
     add_derived(destination); // lineage: the copy carries the scene on
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         auto* ls = list_state_locked(l, &lid);
         if (!ls) return;
@@ -2985,14 +4841,14 @@ void before_texture_copy(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
         ev.color_srvs = from_color ? 1 : 0;
         ls->insertion.Add(ev);
     }
-    if (from_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, true);
+    if (from_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, true); }
 }
 
 void after_texture_copy(GL* l, ID3D12Resource* dst)
 {
     if (t_host_work || !na::observe_internal::Started() || !dst) return;
     const auto destination = resource_id(dst);
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id lid = 0;
     auto* ls = list_state_locked(l, &lid);
     if (!ls) return;
@@ -3000,33 +4856,87 @@ void after_texture_copy(GL* l, ID3D12Resource* dst)
     ls->insertion.Add({destination, 0, 0, true, na::j2::Op::CopyWrite});
 }
 
-void before_shader_use(GL* l, bool compute)
+// The same tables, ranges and bound-heap test as the walk below, reading only the hot bits.
+// False = the walk would find no SRV of the colour and no SRV of a copy of it.
+template <typename Sig>
+bool read_filter_needs_walk_locked(ListState& ls, const Sig& sig, bool compute, na_object_id color)
+{
+    if (!g_hot_ready.load(std::memory_order_acquire) || g_hot_color != color) return true;
+    const auto& params = sig.root_params;
+    const auto& ranges = sig.root_ranges;
+    for (size_t p = 0; p < ls.args[compute].size() && p < params.size(); ++p) {
+        const auto& arg = ls.args[compute][p];
+        if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
+        uint32_t slot = 0;
+        auto* heap = bound_heap_for_gpu_locked(ls, arg.value, &slot);
+        if (!heap) continue;
+        bool bound = false;
+        for (uint32_t h = 0; h < ls.nheaps; ++h) bound |= heap->key == ls.heaps[h];
+        if (!bound) continue;
+        for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
+            const auto& range = ranges[params[p].first_range + r];
+            if (range.table_offset == NA_UNKNOWN_U32 || range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) continue;
+            if (any_hot(heap, uint64_t(slot) + range.table_offset, std::min<uint32_t>(range.num_descriptors, 64))) return true;
+        }
+    }
+    return false;
+}
+void before_shader_use(GL* l, bool compute, bool indirect=false)
 {
     if (t_host_work || !na::observe_internal::Started()) return;
     uint64_t depth = 0, color = 0;
     GetLiveSelection(&depth, &color);
     if (!color) return;
     bool reads_color = false;
+    na::j2::InsertionEvent entry;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        CostScope lookup(kCostUseLookup);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         auto* ls = list_state_locked(l, &lid);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
-        const auto signature = g_objs.find(canon(ls->root_sig[compute]));
-        if (signature == g_objs.end()) return;
+        const Obj* current_pso = pso_obj_locked(*ls);
+        if(indirect) {
+            if(!current_pso || current_pso->created.size()<sizeof(na_ev_pipeline_created))return;
+            const auto* pd=reinterpret_cast<const na_ev_pipeline_created*>(current_pso->created.data());
+            compute=pd->pipeline_kind==NA_PIPELINE_COMPUTE || pd->stage_bytes[NA_STAGE_CS]!=0;
+        }
+        const Obj* sig_obj = root_sig_obj_locked(*ls, compute);
+        if (!sig_obj) return;
+        const Obj& sig = *sig_obj;
+        if(ls->pending_entry==color) {
+            ls->pending_entry=0;
+            entry={color,compute?0:ls->cur_rt,current_pso?current_pso->id:0,false,
+                indirect?(compute?na::j2::Op::IndirectComputeEntry:na::j2::Op::IndirectGraphicsEntry):
+                         (compute?na::j2::Op::ComputeEntry:na::j2::Op::GraphicsEntry),sig.root_hash};
+            resource_dims_locked(entry.destination,&entry.dst_w,&entry.dst_h,&entry.dst_fmt);
+            entry.recording=ls->generation.load();entry.operation=ls->op_index.load()+1;entry.barrier=ls->entry_barrier;
+            ls->insertion.SetEntryContext(entry);
+            ls->insertion.Add(entry);
+        }
         na_object_id destination = compute ? 0 : ls->cur_rt;
         uint8_t color_srvs = 0;
         na_object_id srv_ids[16] = {};
         uint32_t nsrv = 0;
         bool reads_derived = false;
-        const auto& params = signature->second.root_params;
-        const auto& ranges = signature->second.root_ranges;
+        auto& cached=ls->shader_reads[compute];
+        const uint64_t revision_now=g_operation_revision.load(); // before reading: a concurrent copy then invalidates
+        lookup.Switch(kCostUseWalk);
+        if(cached.valid&&cached.state_revision==ls->read_revision[compute]&&cached.registry_revision==revision_now&&cached.color==color){
+            color_srvs=cached.color_srvs;reads_color=color_srvs!=0;nsrv=cached.count;
+            std::copy_n(cached.srvs,nsrv,srv_ids);if(compute)destination=cached.uav;
+        }else if(!read_filter_needs_walk_locked(*ls, sig, compute, color)){
+            g_hot_skipped.fetch_add(1, std::memory_order_relaxed); // no bound SRV of the colour or a copy: nothing to record
+        }else{
+        g_hot_walked.fetch_add(1, std::memory_order_relaxed);
+        const auto& params = sig.root_params;
+        const auto& ranges = sig.root_ranges;
         for (size_t p = 0; p < ls->args[compute].size() && p < params.size(); ++p) {
             const auto& arg = ls->args[compute][p];
             if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
             uint32_t slot = 0;
-            auto* heap = heap_for_gpu_locked(arg.value, &slot);
+            auto* heap = bound_heap_for_gpu_locked(*ls,arg.value, &slot);
             if (!heap) continue;
             bool bound = false;
             for (uint32_t h = 0; h < ls->nheaps; ++h) bound |= heap->key == ls->heaps[h];
@@ -3034,9 +4944,11 @@ void before_shader_use(GL* l, bool compute)
             for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
                 const auto& range = ranges[params[p].first_range + r];
                 if (range.table_offset == NA_UNKNOWN_U32) continue;
+                SlotShared stripe;
                 for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
                     const uint64_t index = uint64_t(slot) + range.table_offset + k;
                     if (index >= heap->count) break;
+                    stripe.lock(heap, index);
                     const auto& info = heap->info[static_cast<size_t>(index)];
                     if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && info.kind == NA_DESC_SRV) {
                         if (info.resource == color) {
@@ -3051,11 +4963,15 @@ void before_shader_use(GL* l, bool compute)
                 }
             }
         }
+        cached.state_revision=ls->read_revision[compute];cached.registry_revision=revision_now;cached.color=color;
+        cached.color_srvs=color_srvs;cached.count=nsrv;cached.uav=compute?destination:0;
+        std::copy_n(srv_ids,nsrv,cached.srvs);cached.valid=true;
+        }
         if (reads_color) {
             // Role-class inputs (only for the few draws that read the scene colour).
             na::j2::InsertionEvent ev{color, destination, reinterpret_cast<uint64_t>(ls->pso), false,
                                       compute ? na::j2::Op::ComputeRead : na::j2::Op::GraphicsRead,
-                                      signature->second.root_hash};
+                                      sig.root_hash};
             ev.color_srvs = color_srvs;
             resource_dims_locked(destination, &ev.dst_w, &ev.dst_h, &ev.dst_fmt);
             uint32_t cw = 0, ch = 0, cf = 0;
@@ -3071,7 +4987,9 @@ void before_shader_use(GL* l, bool compute)
                 ls->insertion.Add({color, destination, reinterpret_cast<uint64_t>(ls->pso), false, na::j2::Op::DerivedRead});
         }
     }
-    if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) cb(l, &color, 1, compute);
+    const CostScope callbacks(kCostUseCallback);
+    if(entry.resource)if(auto cb=g_entry_cb.load(std::memory_order_acquire))cb(l,entry);
+    if (reads_color) if (auto cb = g_table_cb.load(std::memory_order_acquire)) { const CostScope c(kCostSceneReadCb); cb(l, &color, 1, compute); }
 }
 
 // ---- Live mip bias: bind the twins of the level latched at this recording's Reset.
@@ -3080,7 +4998,7 @@ void before_shader_use(GL* l, bool compute)
 // re-binds the game's root signatures and arguments first, so pipeline and root
 // signature always match.
 template <typename T>
-T* mip_swap_locked(int level, T* obj, bool pso, bool* untwinned)
+T* mip_swap_locked(int level, int af, T* obj, bool pso, bool* untwinned)
 {
     if (level < 0 || !obj) return obj;
     const auto it = g_objs.find(canon(obj));
@@ -3090,10 +5008,19 @@ T* mip_swap_locked(int level, T* obj, bool pso, bool* untwinned)
         if (pso && !t_host_work) *untwinned = true;
         return obj;
     }
-    if (!it->second.twins) return obj; // its root signature needs no twins
-    const auto& t = *it->second.twins;
-    if (t.same[level]) return obj;
-    if (t.obj[level]) return static_cast<T*>(t.obj[level]);
+    const Obj& o = it->second;
+    if (o.variant_kind == 0) return obj; // sampler-independent: the game's object is right
+    if (o.variant_kind == 2) { *untwinned = true; return obj; }
+    const auto& t = o.af_sets[af & 3];
+    if (!t || !t->built[level]) {
+        // Created while the variant was being prepared: the worker fills it in (it also
+        // re-checks every second, so a wake-up lost here only delays it).
+        *untwinned = true;
+        if (o.recipe && !g_var_missing.exchange(true, std::memory_order_relaxed)) g_var_cv.notify_one();
+        return obj;
+    }
+    if (t->same[level]) return obj;
+    if (t->obj[level]) return static_cast<T*>(t->obj[level]);
     *untwinned = true;
     return obj;
 }
@@ -3102,16 +5029,16 @@ void mip_on_pso(GL* l, ID3D12PipelineState*& p)
     if (!g_mip_switched.load(std::memory_order_relaxed) || !p) return;
     bool fallback = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         ListState* ls = list_state_locked(l, &lid);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (ls->mip_level < 0) return;
         bool untwinned = false;
-        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, p, true, &untwinned);
+        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, ls->af_latched, p, true, &untwinned);
         if (untwinned) { ls->mip_level = -1; fallback = true; }
-        else p = t;
+        else { if (t != p) ++ls->mip_pso_twin; else ++ls->mip_pso_game; p = t; }
     }
     if (fallback) {
         g_mip_fallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -3124,16 +5051,16 @@ void mip_on_rs(GL* l, ID3D12RootSignature*& r)
     if (!g_mip_switched.load(std::memory_order_relaxed) || !r) return;
     bool fallback = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         na_object_id lid = 0;
         ListState* ls = list_state_locked(l, &lid);
         if (!ls) return;
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (ls->mip_level < 0) return;
         bool untwinned = false;
-        ID3D12RootSignature* t = mip_swap_locked(ls->mip_level, r, false, &untwinned);
+        ID3D12RootSignature* t = mip_swap_locked(ls->mip_level, ls->af_latched, r, false, &untwinned);
         if (untwinned) { ls->mip_level = -1; fallback = true; } // r (the game's) is bound as is
-        else r = t;
+        else { if (t != r) ++ls->mip_rs_twin; else ++ls->mip_rs_game; r = t; }
     }
     if (fallback) {
         // A pipeline twin may be bound: switch the whole recording to the game's objects
@@ -3146,18 +5073,24 @@ void mip_on_rs(GL* l, ID3D12RootSignature*& r)
 void mip_on_reset(GL* l, ID3D12PipelineState*& p)
 {
     if (!g_mip_switched.load(std::memory_order_relaxed)) return;
-    const int live = g_mip_live_level.load(std::memory_order_relaxed), game = g_mip_game_level.load(std::memory_order_relaxed);
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    const uint32_t v = g_var_live.load(std::memory_order_acquire);
+    std::shared_lock<RegistryLock> lock(g_m);
     na_object_id lid = 0;
     ListState* ls = list_state_locked(l, &lid);
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    ls->mip_level = static_cast<int8_t>(live != game ? live : -1);
+    // The previous recording's binds into the totals (one add per counter per recording).
+    if (ls->mip_pso_twin) g_mip_bound_pso_twin.fetch_add(std::exchange(ls->mip_pso_twin, 0u), std::memory_order_relaxed);
+    if (ls->mip_pso_game) g_mip_bound_pso_game.fetch_add(std::exchange(ls->mip_pso_game, 0u), std::memory_order_relaxed);
+    if (ls->mip_rs_twin) g_mip_bound_rs_twin.fetch_add(std::exchange(ls->mip_rs_twin, 0u), std::memory_order_relaxed);
+    if (ls->mip_rs_game) g_mip_bound_rs_game.fetch_add(std::exchange(ls->mip_rs_game, 0u), std::memory_order_relaxed);
+    ls->mip_level = static_cast<int8_t>(v ? var_level(v) : -1); // 0 = the game's own objects
+    ls->af_latched = static_cast<int8_t>(var_af(v));
     if (ls->mip_level >= 0 && p) {
         bool untwinned = false;
-        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, p, true, &untwinned);
+        ID3D12PipelineState* t = mip_swap_locked(ls->mip_level, ls->af_latched, p, true, &untwinned);
         if (untwinned) ls->mip_level = -1; // nothing bound yet: simply record with the game's objects
-        else p = t;
+        else { if (t != p) ++ls->mip_pso_twin; else ++ls->mip_pso_game; p = t; }
     }
 }
 
@@ -3168,6 +5101,742 @@ bool g_reset_registered = false; // installation thread only
 bool g_barriers_registered=false;
 std::atomic<void (*)(ID3D12GraphicsCommandList*,UINT,const D3D12_RESOURCE_BARRIER*)> g_barrier_listener{nullptr};
 std::atomic<bool> g_full_list_tracking{false};
+struct ShaderHooks { std::shared_ptr<ShaderOperationHook> lane[2]; };
+// Like the existing live registry, do not run D3D12-owning destructors during
+// static teardown. Registration changes happen on the control/setup worker.
+auto& g_shader_hooks = *new std::shared_ptr<const ShaderHooks>();
+std::mutex g_shader_hooks_m;
+std::atomic<bool> g_shader_hooks_enabled{false};
+struct TextureHooks { std::shared_ptr<TextureOperationHook> lane[2]; };
+auto& g_texture_hooks = *new std::shared_ptr<const TextureHooks>();
+std::mutex g_texture_hooks_m;
+std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
+
+
+void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
+    BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
+{
+    if (t_host_work) return;
+    bool enabled = false;
+    with_list_state(list, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m); enabled = ls.raster_tracking; ls.raster_targets_known = false;
+    });
+    if (!enabled) return;
+    if (count > 8 || (count && !targets)) return;
+    if (g_operation_snapshots.load()) {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0; auto* ls = list_state_locked(list, &id);
+        if (ls) {
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            ++ls->target_serial;ls->native_colors.clear(); ls->native_depth.reset();
+            UINT stride = 0;
+            if (count) { uint32_t slot = 0; if (auto* heap = heap_for_cpu_locked(targets[0].ptr, &slot)) stride = heap->increment; }
+            for (UINT i = 0; i < count; ++i) {
+                uint32_t slot = 0;
+                const auto handle = contiguous ? targets[0].ptr + SIZE_T(i) * stride : targets[i].ptr;
+                const auto* heap = heap_for_cpu_locked(handle, &slot);
+                std::shared_ptr<const DescriptorDetails> det;
+                if (heap) { const SlotShared stripe(heap, slot); det = heap->info[slot].details; }
+                ls->native_colors.push_back(std::move(det));
+            }
+            if (depth) { uint32_t slot = 0; if (const auto* heap = heap_for_cpu_locked(depth->ptr, &slot)) { const SlotShared stripe(heap, slot); ls->native_depth = heap->info[slot].details; } }
+        }
+    }
+    std::shared_ptr<Obj::Twins> storage;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        const auto found = g_objs.find(canon(list));
+        if (found == g_objs.end() || !found->second.list) return;
+        storage = found->second.twins;
+    }
+    // CPU-only descriptor storage, once per observed list. Use the existing
+    // deferred child-object release path: releasing these from a list's private
+    // retirement sentinel would re-enter D3D12 under its destruction lock.
+    HostWorkScope own;
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return;
+    if (!storage) {
+        auto candidate = std::make_shared<Obj::Twins>();
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rt, ds;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt)))) return;
+        hd = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ds)))) return;
+        candidate->obj[0] = rt.Detach(); candidate->obj[1] = ds.Detach();
+        {
+            std::unique_lock<RegistryLock> lock(g_m);
+            const auto found = g_objs.find(canon(list));
+            if (found == g_objs.end() || !found->second.list) return;
+            if (!found->second.twins) found->second.twins = candidate;
+            storage = found->second.twins;
+        }
+    }
+    auto* rt = static_cast<ID3D12DescriptorHeap*>(storage->obj[0]);
+    auto* ds = static_cast<ID3D12DescriptorHeap*>(storage->obj[1]);
+    if (!rt || !ds) return;
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    auto dst = rt->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < count; ++i) {
+        const auto src = contiguous ? D3D12_CPU_DESCRIPTOR_HANDLE{targets[0].ptr + SIZE_T(i) * stride} : targets[i];
+        device->CopyDescriptorsSimple(1, dst, src, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        dst.ptr += stride;
+    }
+    if (depth) device->CopyDescriptorsSimple(1, ds->GetCPUDescriptorHandleForHeapStart(), *depth, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    with_list_state(list, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        ls.raster_rt_count = count; ls.raster_has_depth = depth != nullptr; ls.raster_targets_known = true;
+    });
+}
+// ---- Viewport jitter (real sub-pixel samples) ------------------------------------------
+// The game's camera block is only half the story in some games (SE5: our matrix write never
+// moved the rasterised picture). Every D3D12 game sets its viewports, so the sample offset is
+// applied there instead: a draw whose bound depth is the live scene depth and whose pipeline
+// tests depth gets the game's viewports moved by (x, y) render pixels (+x right, +y down), the
+// content moves with them, and DLSS is told exactly that value. Post passes (no scene depth,
+// or depth test off: full-screen passes) keep the game's own viewports, so nothing is shifted
+// twice. Packed: frame (low 32 bits, never 0) << 32 | x << 16 | y, x/y int16 in 1/65536 px.
+std::atomic<uint64_t> g_vpj{0};
+std::atomic<bool> g_vpj_ever{false};
+std::atomic<uint64_t> g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_draws{0}, g_vpj_unknown{0};
+thread_local bool t_vpj_self = false; // our own RSSetViewports: not a change of the game's
+float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
+// The game (or host work restoring the game's state) set viewports, or the list restarted:
+// our offset copies are no longer bound.
+void vpj_viewports_replaced(GL* l, bool reset)
+{
+    if (!g_vpj_ever.load(std::memory_order_relaxed) || t_vpj_self) return;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list_state_locked(l, &id);
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    ls->vpj_applied = false;
+    if (reset) {
+        if (ls->vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release);
+        ls->vpj_scene = 0; ls->vpj_depth = 0;
+    }
+}
+void vpj_before_draw(GL* l)
+{
+    if (!g_vpj_ever.load(std::memory_order_relaxed)) return;
+    const uint64_t cur = g_vpj.load(std::memory_order_acquire);
+    if (!cur && !g_vpj_recordings.load(std::memory_order_acquire)) return;
+    D3D12_VIEWPORT v[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT n = 0;
+    {
+        uint64_t sel_depth = 0, sel_color = 0;
+        GetLiveSelection(&sel_depth, &sel_color);
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        // A Present on another thread must not change half a scene recording's
+        // sample. The first eligible draw owns it until this list is Reset.
+        const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
+        bool want = sample && sel_depth && ls->cur_ds == sel_depth;
+        if (want) {
+            const na_ev_pipeline_created* pc = pso_created_locked(*ls);
+            want = pc && pc->depth_enable == 1;
+        }
+        if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
+        if (want) {
+            if (!ls->vpj_scene) g_vpj_recordings.fetch_add(1, std::memory_order_release);
+            ls->vpj_scene = sample;
+            ls->vpj_depth=sel_depth;
+            g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
+            if (ls->vpj_applied && ls->vpj_value == sample) return;
+            const float dx = vpj_axis(sample, 16), dy = vpj_axis(sample, 0);
+            n = ls->raster_viewport_count;
+            std::copy_n(ls->raster_viewports, n, v);
+            // Fractional translation can truncate the hardware viewport's
+            // right/bottom coverage, leaving a row or column of clear pixels.
+            // Give a full-depth scene viewport half a pixel on each side.
+            // The depth attachment and original scissor still clip writes,
+            // and the centred expansion keeps the declared jitter unchanged.
+            uint32_t width = 0, height = 0, format = 0;
+            if (n == 1 && v[0].TopLeftX == 0.f && v[0].TopLeftY == 0.f &&
+                ls->cur_ds_sub == 0 && resource_dims_locked(sel_depth, &width, &height, &format) &&
+                v[0].Width == static_cast<float>(width) && v[0].Height == static_cast<float>(height)) {
+                v[0].TopLeftX -= .5f;
+                v[0].TopLeftY -= .5f;
+                v[0].Width += 1.f;
+                v[0].Height += 1.f;
+            }
+            for (UINT i = 0; i < n; ++i) {
+                v[i].TopLeftX += dx;
+                v[i].TopLeftY += dy;
+            }
+            ls->vpj_applied = true; ls->vpj_value = sample;
+            ++ls->viewport_serial; // actual driver viewport changed outside the game shadow
+            g_vpj_sets.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (!ls->vpj_applied) return;
+            ls->vpj_applied = false;
+            if (!ls->raster_viewports_known) return; // nothing known to hand back (the game sets its own before relying on them)
+            ++ls->viewport_serial;
+            n = ls->raster_viewport_count;
+            std::copy_n(ls->raster_viewports, n, v);
+            g_vpj_restores.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    HostWorkScope own;
+    t_vpj_self = true;
+    l->RSSetViewports(n, n ? v : nullptr);
+    t_vpj_self = false;
+}
+// Draw-replay probe (2026-11-06, SE5 smear): can the scene's draws be matched to the same draws
+// last frame, and are they posed in the vertex shader (no tessellation/geometry stages)? Every
+// draw on the live scene depth with a depth-testing pipeline adds a signature: pipeline, vertex
+// shader, counts, vertex buffer layout. The vertex buffer addresses are kept apart, so a match
+// whose buffers moved (double-buffered or compute-posed meshes) is counted separately.
+struct ReplayDraw { uint64_t sig = 0, vb = 0; bool tracked = false, stages = false; uint32_t instances = 0; };
+std::atomic<bool> g_rp_on{false};
+std::mutex g_rp_m;
+std::vector<ReplayDraw> g_rp_cur, g_rp_prev;
+uint64_t rp_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); return h; }
+void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
+{
+    if (!g_rp_on.load(std::memory_order_relaxed) || t_vpj_self) return;
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!sel_depth) return;
+    ReplayDraw d;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->cur_ds != sel_depth) return;
+        const na_ev_pipeline_created* pc = pso_created_locked(*ls);
+        if (!pc || pc->depth_enable != 1) return;
+        uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
+        h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
+        d.stages = pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS];
+        d.tracked = ls->raster_tracking;
+        if (d.tracked) {
+            h = rp_mix(h, ls->vertex_mask);
+            uint64_t vb = 0;
+            for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) {
+                h = rp_mix(h, ls->vertex_buffers[i].StrideInBytes); h = rp_mix(h, ls->vertex_buffers[i].SizeInBytes);
+                vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
+            }
+            if (ls->index_known) { h = rp_mix(h, ls->index_buffer.Format); vb = rp_mix(vb, ls->index_buffer.BufferLocation); }
+            d.vb = vb;
+        }
+        d.sig = h; d.instances = instances;
+    }
+    std::lock_guard<std::mutex> g(g_rp_m);
+    if (g_rp_cur.size() < 65536) g_rp_cur.push_back(d);
+}
+// ---- Draw replay (2026-11-06, SE5 sweatshirt smear; the TOX2-recomp idea in DX12): right after a
+// scene draw (live scene depth, depth test and write, triangle list, vertex shader only), the same
+// draw runs again with a stream-output twin of its pipeline (no pixel shader, nothing rasterised)
+// that writes every expanded vertex's clip position (SV_Position) into this frame's slot. J2 matches
+// each draw to its twin of the frame before and rasterises the difference: exact per-object motion
+// (skinned characters too), the data a game with DLSS built in hands NVIDIA. Generic: no game data.
+// Slot layout: kRpCounters filled-size counters (16 bytes each), then float4 positions.
+constexpr uint32_t kRpSlots = 3, kRpCounters = 8192, kRpBlock = 256; // counters zeroed per list, a block at a time
+// Sol (COMMS 0860a3b): a writer list that is closed but not reset can execute
+// again and rewrite a reused slot's positions (any range, not only its own
+// stamp). A slot is reused only once every writer list is reset (Retired) AND
+// done on the GPU. SE5 keeps lists for several frames, so slots are added on
+// demand up to kRpMaxSlots (48 MB each) instead of waiting (3 fixed slots
+// waiting on retirement gave not_ready 39.6M on 4c5b2d9).
+constexpr uint32_t kRpMaxSlots = 8;
+constexpr uint64_t kRpCounterBytes = uint64_t(kRpCounters) * 16, kRpBytes = 48ull << 20;
+// 2026-11-07 (98d13f1 run: segments 6724, pending 6723, fed 0): J2 records its
+// list before SE5 submits the geometry lists, so "already submitted" is never
+// true at record time. What matters is GPU order. Each writer segment stamps a
+// unique token into g_rp_stamps at the end of its list (WriteBufferImmediate,
+// MARKER_OUT: after all its stream-output writes). J2 may then use a segment
+// that is not submitted yet: the replay shader checks the stamp per draw and
+// draws nothing for a segment whose list has not run before it on the GPU.
+constexpr uint32_t kRpMaxSegs = 64;
+struct SoTwin {
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> rs, replay_root;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+    uint8_t state = 0; // 0 queued, 1 built, 2 failed
+};
+struct SoEntry {
+    std::shared_ptr<const VariantRecipe> recipe;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> rs; // the game's root signature of the pipeline
+    uint64_t vs_hash = 0;
+    std::vector<SoTwin> twins; // by the root signature bound with it (the game's or a sampler twin)
+};
+std::mutex g_so_m;
+std::condition_variable g_so_cv;
+std::unordered_map<const void*, std::shared_ptr<SoEntry>>& g_so = *new std::unordered_map<const void*, std::shared_ptr<SoEntry>>();
+std::deque<std::pair<std::shared_ptr<SoEntry>, ID3D12RootSignature*>>& g_so_queue = *new std::deque<std::pair<std::shared_ptr<SoEntry>, ID3D12RootSignature*>>();
+bool g_so_worker = false;
+Microsoft::WRL::ComPtr<ID3D12Device>& g_rp_device = *new Microsoft::WRL::ComPtr<ID3D12Device>();
+Microsoft::WRL::ComPtr<ID3D12Resource>& g_rp_zeros = *new Microsoft::WRL::ComPtr<ID3D12Resource>();
+Microsoft::WRL::ComPtr<ID3D12Resource>& g_rp_stamps = *new Microsoft::WRL::ComPtr<ID3D12Resource>(); // uint per (slot, segment), COMMON between uses
+std::atomic<uint32_t> g_rp_token{0};
+std::atomic<bool> g_rp_bufs_ok{false};
+std::atomic<uint64_t> g_rp_frame{0};
+std::atomic<ReplayRetain> g_rp_retain{nullptr};
+std::mutex g_replay_slots_m;
+struct RpSlot {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buf;
+    // 2026-11-07 (f905099 run: take_other_list=12792): SE5 draws its geometry on
+    // other command lists than the one J2 records on. A frame's slot therefore
+    // holds one segment per writing list recording, each with its own counter
+    // blocks (zeroed inside that list) and its own lease.
+    struct Seg {
+        std::shared_ptr<ReplayUse> writer;
+        uint64_t list_id = 0, recording = 0;
+        uint32_t block_end = 0, next_counter = 0;
+        bool stream_out = false; // the buffer is in STREAM_OUT in this list (leaves to COMMON at Close)
+        uint32_t stamp_index = 0, token = 0; // token written to g_rp_stamps[stamp_index] at this list's Close
+        bool stampable = false, stamped = false;
+        std::vector<ReplayRecord> draws;
+    };
+    std::shared_ptr<ReplayUse> reader;
+    uint64_t frame = 0, verts = 0;
+    uint32_t counters = 0;
+    bool sealed = false;
+    std::vector<Seg> segs;
+    bool Free() const {
+        if (reader && !reader->Completed()) return false;
+        for (const auto& x : segs) if (x.writer && !x.writer->Completed()) return false;
+        return true;
+    }
+    bool Unretired() const {
+        for (const auto& x : segs) if (x.writer && !x.writer->Retired()) return true;
+        return false;
+    }
+};
+RpSlot& rp_slot(uint32_t i) { static RpSlot* s = new RpSlot[kRpMaxSlots]; return s[i]; }
+uint32_t g_rp_slots = 0; // slots with a buffer (under g_replay_slots_m)
+RpSlot* rp_find(uint64_t frame)
+{
+    for (uint32_t i = 0; i < g_rp_slots; ++i) if (rp_slot(i).frame == frame && rp_slot(i).buf) return &rp_slot(i);
+    return nullptr;
+}
+std::atomic<uint64_t> g_rp_stat[32]; // see DrawReplayStats
+enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
+                  kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpOtherList,
+                  kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpSegments, kRpPendingSegs,
+                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade, kRpStatCount };
+static_assert(kRpStatCount <= 32, "g_rp_stat size");
+void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
+// 83b0749/8cc8cb6 runs: noted=240 built=0 twin_queued=0 no_recipe=0, so every draw
+// stopped at a gate before the recipe lookup without a count. Each gate is counted.
+enum : uint32_t { kGateNotDirect, kGateNoRetain, kGateNoDepth, kGateNoList, kGateOtherDepth, kGateRenderPass, kGateState, kGateBundle, kGatePredicate, kGateStreamOut,
+                  kGateRecording, kGateNoPipeline, kGateNoDepthWrite, kGateMsaa, kGateViewport, kGateRootMismatch,
+                  kGateRootUnknown, kGateDirectHeap, kGateVsUav, kGateNoVertexBuffer, kGateDepthMatched, kGateCount };
+std::atomic<uint64_t> g_rp_gate[kGateCount];
+void rp_gate(uint32_t k) { g_rp_gate[k].fetch_add(1, std::memory_order_relaxed); }
+
+HRESULT make_replay_root(ID3D12Device* dev, UINT node, ID3D12RootSignature* game,
+                         ID3D12RootSignature** result)
+{
+    UINT size = 0;
+    if (FAILED(game->GetPrivateData(kReplayRootBlob, &size, nullptr)) || !size) return E_INVALIDARG;
+    std::vector<uint8_t> blob(size);
+    HRESULT hr = game->GetPrivateData(kReplayRootBlob, &size, blob.data());
+    if (FAILED(hr)) return hr;
+    Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> decoder;
+    hr = D3D12CreateVersionedRootSignatureDeserializer(blob.data(), size, IID_PPV_ARGS(&decoder));
+    if (FAILED(hr)) return hr;
+    auto desc = *decoder->GetUnconvertedRootSignatureDesc();
+    const auto allow = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT;
+    switch (desc.Version) {
+    case D3D_ROOT_SIGNATURE_VERSION_1_0: desc.Desc_1_0.Flags |= allow; break;
+    case D3D_ROOT_SIGNATURE_VERSION_1_1: desc.Desc_1_1.Flags |= allow; break;
+    case D3D_ROOT_SIGNATURE_VERSION_1_2: desc.Desc_1_2.Flags |= allow; break;
+    default: return E_INVALIDARG;
+    }
+    Microsoft::WRL::ComPtr<ID3DBlob> bytes;
+    hr = D3D12SerializeVersionedRootSignature(&desc, &bytes, nullptr);
+    if (FAILED(hr)) return hr;
+    return o_CreateRootSignature(dev, node, bytes->GetBufferPointer(), bytes->GetBufferSize(), IID_PPV_ARGS(result));
+}
+
+void so_worker()
+{
+    for (;;) {
+        std::pair<std::shared_ptr<SoEntry>, ID3D12RootSignature*> job;
+        {
+            std::unique_lock<std::mutex> lk(g_so_m);
+            g_so_cv.wait(lk, [] { return !g_so_queue.empty(); });
+            job = std::move(g_so_queue.front());
+            g_so_queue.pop_front();
+        }
+        const HostWorkScope host;
+        const VariantRecipe& r = *job.first->recipe;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d = r.g;
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+        HRESULT hr = make_replay_root(r.dev.Get(), d.NodeMask, job.second, &root);
+        d.pRootSignature = root.Get();
+        d.PS = {};
+        d.DepthStencilState.DepthEnable = FALSE;
+        d.DepthStencilState.StencilEnable = FALSE;
+        d.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        d.NumRenderTargets = 0;
+        for (auto& format : d.RTVFormats) format = DXGI_FORMAT_UNKNOWN;
+        d.BlendState = {};
+        d.SampleDesc = {1, 0};
+        d.SampleMask = UINT_MAX;
+        d.RasterizerState.ForcedSampleCount = 0;
+        static const D3D12_SO_DECLARATION_ENTRY decl{0, "SV_Position", 0, 0, 4, 0};
+        static const UINT stride = 16;
+        d.StreamOutput = {&decl, 1, &stride, 1, D3D12_SO_NO_RASTERIZED_STREAM};
+        d.CachedPSO = {};
+        ID3D12PipelineState* t = nullptr;
+        if (SUCCEEDED(hr)) hr = o_CreateGraphicsPipelineState(r.dev.Get(), &d, IID_PPV_ARGS(&t));
+        const bool ok = SUCCEEDED(hr);
+        rp_count(ok ? kRpBuilt : kRpBuildFailed);
+        if (!ok) na::eventlog::Emit("draw_replay_pipeline_failed", "hr=0x%08x vs=0x%llx",
+            static_cast<unsigned>(hr), static_cast<unsigned long long>(job.first->vs_hash));
+        std::lock_guard<std::mutex> lk(g_so_m);
+        for (auto& tw : job.first->twins) {
+            if (tw.rs.Get() != job.second) continue;
+            tw.state = ok ? 1 : 2;
+            if (ok) {
+                tw.replay_root = std::move(root);
+                tw.pso.Attach(t);
+            }
+            break;
+        }
+    }
+}
+// Called from the pipeline-creation hook for every graphics pipeline: keeps a creation copy of the
+// ones a scene draw could replay (no hull/domain/geometry stage, no stream output of its own).
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d)
+{
+    if (t_host_work || !pso || !d.pRootSignature || !d.VS.pShaderBytecode || d.HS.pShaderBytecode || d.DS.pShaderBytecode ||
+        d.GS.pShaderBytecode || d.StreamOutput.NumEntries || !d.DepthStencilState.DepthEnable ||
+        d.DepthStencilState.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ALL ||
+        d.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return;
+    auto e = std::make_shared<SoEntry>();
+    e->recipe = recipe_of(dev, d);
+    e->rs = d.pRootSignature;
+    e->vs_hash = fnv1a(static_cast<const uint8_t*>(d.VS.pShaderBytecode), d.VS.BytecodeLength);
+    rp_count(kRpNoted);
+    std::lock_guard<std::mutex> lk(g_so_m);
+    g_so[canon(pso)] = std::move(e); // a new pipeline at a reused address replaces the old copy
+    if (!g_rp_device) g_rp_device = dev;
+}
+bool rp_ensure_buffers()
+{
+    if (g_rp_bufs_ok.load(std::memory_order_acquire)) return true;
+    static std::atomic<bool> tried{false};
+    if (tried.exchange(true)) return false;
+    Microsoft::WRL::ComPtr<ID3D12Device> dev;
+    { std::lock_guard<std::mutex> lk(g_so_m); dev = g_rp_device; if (!g_so_worker) { g_so_worker = true; std::thread(so_worker).detach(); } }
+    if (!dev) { tried = false; return false; }
+    const HostWorkScope host;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kRpBytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (uint32_t i = 0; i < kRpSlots; ++i)
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&rp_slot(i).buf)))) return false;
+    { std::lock_guard<std::mutex> lk(g_replay_slots_m); g_rp_slots = kRpSlots; }
+    rp_count(kRpSlotsMade, kRpSlots);
+    rd.Width = kRpCounterBytes;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rp_zeros)))) return false;
+    rd.Width = uint64_t(kRpMaxSlots) * kRpMaxSegs * 4;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rp_stamps)))) return false;
+    g_rp_bufs_ok.store(true, std::memory_order_release);
+    return true;
+}
+// Close of any list that wrote replay positions: leave the slot buffer in COMMON
+// so the next list (in this or a later ExecuteCommandLists) starts from a known state.
+void replay_on_close(GL* l)
+{
+    if (!g_rp_bufs_ok.load(std::memory_order_acquire)) return;
+    const uint64_t recording = ListRecording(l);
+    if (!recording) return;
+    const uint64_t list_id = IdOf(l);
+    std::lock_guard<std::mutex> lock(g_replay_slots_m);
+    for (uint32_t i = 0; i < g_rp_slots; ++i) {
+        auto& slot = rp_slot(i);
+        for (auto& x : slot.segs) {
+            if (x.list_id != list_id || x.recording != recording) continue;
+            const HostWorkScope own;
+            if (x.stream_out) {
+                D3D12_RESOURCE_BARRIER barrier{};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition = {slot.buf.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                      D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COMMON};
+                l->ResourceBarrier(1, &barrier);
+                x.stream_out = false;
+            }
+            if (x.stampable && !x.stamped) {
+                Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList2> l2;
+                if (FAILED(l->QueryInterface(IID_PPV_ARGS(&l2)))) continue;
+                D3D12_RESOURCE_BARRIER barrier{};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition = {g_rp_stamps.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                      D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+                l->ResourceBarrier(1, &barrier);
+                const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER stamp{g_rp_stamps->GetGPUVirtualAddress() + uint64_t(x.stamp_index) * 4, x.token};
+                const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+                l2->WriteBufferImmediate(1, &stamp, &mode);
+                std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+                l->ResourceBarrier(1, &barrier);
+                x.stamped = true;
+                rp_count(kRpStamps);
+            }
+        }
+    }
+}
+// After a game draw (outermost, not host work): replay it into this frame's slot when it qualifies.
+void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2, INT a3, UINT a4)
+{
+    const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
+    if (!frame) return;
+    if (l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) { rp_gate(kGateNotDirect); return; }
+    const auto retain = g_rp_retain.load(std::memory_order_acquire);
+    if (!retain) { rp_gate(kGateNoRetain); return; }
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!sel_depth) { rp_gate(kGateNoDepth); return; }
+    ID3D12PipelineState* game_pso = nullptr;
+    ID3D12RootSignature* bound_rs = nullptr;
+    std::shared_ptr<SoEntry> entry;
+    std::vector<ListState::RootArg> arguments;
+    uint64_t recording = 0;
+    na_object_id list_id = 0;
+    ReplayRecord rec{};
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        auto* ls = list_state_locked(l, &list_id);
+        if (!ls) { rp_gate(kGateNoList); return; }
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (ls->cur_ds != sel_depth) { rp_gate(kGateOtherDepth); return; }
+        if (ls->in_render_pass) { rp_gate(kGateRenderPass); return; }
+        if (!ls->pso) { rp_gate(kGateState); return; }
+        if (!ls->restorable) { rp_gate(kGateBundle); return; }
+        if (ls->predicate) { rp_gate(kGatePredicate); return; }
+        if (ls->game_stream_output) { rp_gate(kGateStreamOut); return; }
+        if (!ls->recording_observed.load() || !ls->generation_known.load() || !ls->coverage_complete.load()) { rp_gate(kGateRecording); return; }
+        recording = ls->generation.load() + 1;
+        const auto pipeline = g_objs.find(canon(ls->pso));
+        if (pipeline == g_objs.end() || pipeline->second.created.size() < sizeof(na_ev_pipeline_created)) { rp_gate(kGateNoPipeline); return; }
+        const auto* pc = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+        // Opaque geometry whose depth is already in the scene depth also qualifies: engines with a
+        // depth pre-pass draw their G-buffer pass with depth writes off and an EQUAL / LESS_EQUAL
+        // (GREATER_EQUAL when reversed) test. Blended or other-test draws stay out.
+        const bool depth_written = pc->depth_enable == 1 && pc->depth_write == 1;
+        const bool depth_matched = pc->depth_enable == 1 && pc->depth_write == 0 && pc->blend_enable_mask == 0 &&
+                                   (pc->depth_func == D3D12_COMPARISON_FUNC_EQUAL || pc->depth_func == D3D12_COMPARISON_FUNC_LESS_EQUAL ||
+                                    pc->depth_func == D3D12_COMPARISON_FUNC_GREATER_EQUAL);
+        if (!depth_written && !depth_matched) { rp_gate(kGateNoDepthWrite); return; }
+        if (depth_matched) rp_gate(kGateDepthMatched);
+        if (pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS]) { rp_count(kRpStages); return; }
+        if (!ls->raster_topology_known || ls->raster_topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) { rp_count(kRpTopology); return; }
+        if (pc->sample_count != 1) { rp_gate(kGateMsaa); return; }
+        if (!ls->raster_viewports_known || ls->raster_viewport_count != 1 ||
+            !ls->raster_scissors_known || ls->raster_scissor_count != 1) { rp_gate(kGateViewport); return; }
+        const auto& viewport = ls->raster_viewports[0];
+        if (viewport.TopLeftX != 0.f || viewport.TopLeftY != 0.f || viewport.MinDepth != 0.f ||
+            viewport.MaxDepth != 1.f || !(viewport.Width > 0.f && viewport.Width <= 16384.f &&
+                                         viewport.Height > 0.f && viewport.Height <= 16384.f)) { rp_gate(kGateViewport); return; }
+        rec.width = static_cast<uint32_t>(viewport.Width);
+        rec.height = static_cast<uint32_t>(viewport.Height);
+        if (static_cast<float>(rec.width) != viewport.Width || static_cast<float>(rec.height) != viewport.Height) { rp_gate(kGateViewport); return; }
+        const auto& scissor = ls->raster_scissors[0];
+        rec.scissor[0] = scissor.left; rec.scissor[1] = scissor.top;
+        rec.scissor[2] = scissor.right; rec.scissor[3] = scissor.bottom;
+        {
+            std::lock_guard<std::mutex> lk(g_so_m);
+            const auto it = g_so.find(canon(ls->pso));
+            if (it == g_so.end()) { rp_count(kRpNoRecipe); return; }
+            entry = it->second;
+        }
+        if (entry->vs_hash != pc->stage_hash[NA_STAGE_VS]) { rp_count(kRpHashMismatch); return; } // a pipeline we never saw created
+        const void* root_key = canon(entry->rs.Get());
+        if (canon(ls->root_sig[0]) != root_key) { rp_gate(kGateRootMismatch); return; }
+        const auto root = g_objs.find(root_key);
+        if (root == g_objs.end() || root->second.created.size() < sizeof(na_ev_root_signature_created)) { rp_gate(kGateRootUnknown); return; }
+        const auto* metadata = reinterpret_cast<const na_ev_root_signature_created*>(root->second.created.data());
+        // Executing a shader twice must not duplicate writes through a vertex-visible
+        // UAV or through a directly indexed descriptor heap.
+        if (metadata->hdr.flags & (NA_EVF_TRUNCATED | NA_EVF_METHOD_UNOBSERVED)) { rp_gate(kGateRootUnknown); return; }
+        if (metadata->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) { rp_gate(kGateDirectHeap); return; }
+        for (const auto& param : root->second.root_params) {
+            if (param.visibility != D3D12_SHADER_VISIBILITY_ALL && param.visibility != D3D12_SHADER_VISIBILITY_VERTEX) continue;
+            if (param.param_type == NA_ROOT_UAV) { rp_gate(kGateVsUav); return; }
+            if (param.param_type != NA_ROOT_TABLE) continue;
+            const auto& ranges = root->second.root_ranges;
+            if (param.first_range > ranges.size() || param.count > ranges.size() - param.first_range) { rp_gate(kGateRootUnknown); return; }
+            for (uint32_t i = 0; i < param.count; ++i)
+                if (ranges[param.first_range + i].range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) { rp_gate(kGateVsUav); return; }
+        }
+        bound_rs = entry->rs.Get();
+        game_pso = ls->pso;
+        if (g_mip_switched.load(std::memory_order_relaxed) && ls->mip_level >= 0) {
+            bool untwinned = false;
+            bound_rs = mip_swap_locked(ls->mip_level, ls->af_latched, bound_rs, false, &untwinned);
+            game_pso = mip_swap_locked(ls->mip_level, ls->af_latched, game_pso, true, &untwinned);
+            if (untwinned) { rp_count(kRpUntwinned); return; }
+        }
+        uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
+        h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
+        h = rp_mix(h, a2); h = rp_mix(h, static_cast<uint32_t>(a3)); h = rp_mix(h, a4);
+        uint64_t vb = 0;
+        if (ls->raster_tracking) {
+            for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
+            if (ls->index_known) vb = rp_mix(vb, ls->index_buffer.BufferLocation);
+        }
+        if (!vb && (indexed || ls->vertex_mask)) { rp_gate(kGateNoVertexBuffer); return; }
+        rec.sig = h; rec.vb = vb;
+    }
+    if (!rp_ensure_buffers() || g_rp_device.Get() != entry->recipe->dev.Get()) return;
+    ID3D12PipelineState* so = nullptr;
+    ID3D12RootSignature* replay_root = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_so_m);
+        SoTwin* tw = nullptr;
+        for (auto& t : entry->twins) if (t.rs.Get() == bound_rs) { tw = &t; break; }
+        if (!tw) {
+            entry->twins.push_back(SoTwin{bound_rs, nullptr, nullptr, 0});
+            g_so_queue.emplace_back(entry, bound_rs);
+            g_so_cv.notify_one();
+            rp_count(kRpNoTwin);
+            return;
+        }
+        if (tw->state == 0) { rp_count(kRpBuilding); return; }
+        if (tw->state == 2) { rp_count(kRpFailedTwin); return; }
+        so = tw->pso.Get();
+        replay_root = tw->replay_root.Get();
+    }
+    if (replay_root != bound_rs) {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list_state_locked(l, &id);
+        if (!ls) return;
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        arguments = ls->args[0];
+    }
+    const auto bind = [&](ID3D12RootSignature* root) {
+        l->SetGraphicsRootSignature(root);
+        for (UINT i = 0; i < arguments.size(); ++i) {
+            const auto& arg = arguments[i];
+            switch (arg.type) {
+            case 1: l->SetGraphicsRootDescriptorTable(i, {arg.value}); break;
+            case 2: l->SetGraphicsRootConstantBufferView(i, arg.value); break;
+            case 3: l->SetGraphicsRootShaderResourceView(i, arg.value); break;
+            case 4: l->SetGraphicsRootUnorderedAccessView(i, arg.value); break;
+            case 5:
+                if (!arg.consts.empty())
+                    l->SetGraphicsRoot32BitConstants(i, static_cast<UINT>(arg.consts.size()), arg.consts.data(), 0);
+                break;
+            default: break;
+            }
+        }
+    };
+    const uint64_t verts = uint64_t(count / 3) * 3 * instances;
+    if (!verts) return;
+    std::lock_guard<std::mutex> replay_lock(g_replay_slots_m);
+    if (frame != g_rp_frame.load(std::memory_order_acquire)) return;
+    const HostWorkScope own;
+    RpSlot* found = rp_find(frame);
+    uint32_t slot_index = found ? static_cast<uint32_t>(found - &rp_slot(0)) : 0;
+    if (!found) {
+        // A free slot that is not the previous frame's (J2 reads it as history).
+        bool waited = false;
+        for (uint32_t i = 0; i < g_rp_slots && !found; ++i) {
+            RpSlot& c = rp_slot(i);
+            if (c.frame + 1 == frame || !c.Free()) continue;
+            if (c.Unretired()) { waited = true; continue; }
+            found = &c; slot_index = i;
+        }
+        if (!found && g_rp_slots < kRpMaxSlots) {
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kRpBytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            RpSlot& c = rp_slot(g_rp_slots);
+            if (SUCCEEDED(g_rp_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&c.buf)))) {
+                found = &c; slot_index = g_rp_slots++;
+                rp_count(kRpSlotsMade);
+            }
+        }
+        if (!found) {
+            if (waited) rp_count(kRpReuseUnretired);
+            rp_count(kRpNotReady);
+            return;
+        }
+        RpSlot& slot = *found;
+        slot.reader.reset();
+        slot.segs.clear();
+        slot.frame = frame;
+        slot.sealed = false;
+        slot.verts = 0;
+        slot.counters = 0;
+    }
+    RpSlot& slot = *found;
+    if (slot.sealed) { rp_count(kRpOtherList); return; }
+    RpSlot::Seg* seg = nullptr;
+    for (auto& x : slot.segs) if (x.list_id == list_id && x.recording == recording) { seg = &x; break; }
+    if (!seg) {
+        if (slot.segs.size() >= kRpMaxSegs) { rp_count(kRpOverflow); return; }
+        auto use = retain(l);
+        if (!use) return;
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList2> l2;
+        const bool stampable = SUCCEEDED(l->QueryInterface(IID_PPV_ARGS(&l2)));
+        const uint32_t index = slot_index * kRpMaxSegs + static_cast<uint32_t>(slot.segs.size());
+        uint32_t token = 0;
+        while (!token) token = g_rp_token.fetch_add(1, std::memory_order_relaxed) + 1;
+        slot.segs.push_back({});
+        seg = &slot.segs.back();
+        seg->writer = std::move(use);
+        seg->list_id = list_id;
+        seg->recording = recording;
+        seg->stamp_index = index;
+        seg->token = token;
+        seg->stampable = stampable;
+        rp_count(kRpSegments);
+    }
+    if (seg->next_counter == seg->block_end) { // a fresh block of filled-size counters, zeroed in THIS list
+        if (slot.counters + kRpBlock > kRpCounters) { rp_count(kRpOverflow); return; }
+        const uint32_t block = slot.counters;
+        slot.counters += kRpBlock;
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {slot.buf.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_DEST};
+        if (seg->stream_out) l->ResourceBarrier(1, &barrier); // else COMMON, promoted by the copy
+        l->CopyBufferRegion(slot.buf.Get(), uint64_t(block) * 16, g_rp_zeros.Get(), 0, uint64_t(kRpBlock) * 16);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        l->ResourceBarrier(1, &barrier);
+        seg->stream_out = true;
+        seg->next_counter = block;
+        seg->block_end = block + kRpBlock;
+    }
+    const uint64_t first = slot.verts;
+    const uint32_t ci = seg->next_counter;
+    if (verts > (kRpBytes - kRpCounterBytes) / 16 - first) {
+        rp_count(kRpOverflow);
+        return;
+    }
+    const D3D12_GPU_VIRTUAL_ADDRESS base = slot.buf->GetGPUVirtualAddress();
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW view{base + kRpCounterBytes + first * 16, verts * 16, base + uint64_t(ci) * 16};
+    if (replay_root != bound_rs) bind(replay_root);
+    l->SetPipelineState(so);
+    l->SOSetTargets(0, 1, &view);
+    if (indexed) l->DrawIndexedInstanced(count, instances, a2, a3, a4);
+    else l->DrawInstanced(count, instances, a2, a4);
+    const D3D12_STREAM_OUTPUT_BUFFER_VIEW unbound{};
+    l->SOSetTargets(0, 1, &unbound);
+    if (replay_root != bound_rs) bind(bound_rs);
+    l->SetPipelineState(game_pso);
+    rec.first = static_cast<uint32_t>(first);
+    rec.verts = static_cast<uint32_t>(verts);
+    rp_count(kRpReplayed);
+    rp_count(kRpVerts, verts);
+    slot.verts += verts;
+    ++seg->next_counter;
+    seg->draws.push_back(rec);
+}
 template <uint32_t Slot, typename Sig>
 struct ListHook;
 template <uint32_t Slot, typename R, typename... A>
@@ -3178,7 +5847,29 @@ struct ListHook<Slot, R(A...)> {
     static R STDMETHODCALLTYPE thunk(GL* l, A... a)
     {
         na::hooking::variants::CallScope scope(l, Slot);
-        auto fn = reinterpret_cast<Pfn>(orig[I]);
+        const CostScope cost(Slot, scope.outermost && !t_host_work);
+        const auto native_fn = reinterpret_cast<Pfn>(orig[I]);
+        const auto fn = [native_fn](GL* forwarded_list,auto... arguments)->R {
+            if constexpr(Slot==sl::list::DrawInstanced||Slot==sl::list::DrawIndexedInstanced||
+                         Slot==sl::list::Dispatch||Slot==sl::list::ExecuteIndirect||Slot==sl::list::ExecuteBundle) {
+                // Runtime/debug/wrapping layers can forward this call through
+                // another command-list identity. It is still ONE game command.
+                // Do not jitter/rebind/reconstruct that internal forwarding a
+                // second time; observe the outer call after it returns.
+                const HostWorkScope runtime;
+                return native_fn(forwarded_list,arguments...);
+            }else return native_fn(forwarded_list,arguments...);
+        };
+        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
+                      Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
+            if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
+        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced)
+            if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                const auto args = std::forward_as_tuple(a...);
+                replay_probe_draw(l, std::get<0>(args), std::get<1>(args), Slot == sl::list::DrawIndexedInstanced);
+            }
+        if constexpr (Slot == sl::list::RSSetViewports || Slot == sl::list::Reset)
+            if (scope.outermost && !scope.ambiguous) vpj_viewports_replaced(l, Slot == sl::list::Reset);
         if constexpr (Slot == sl::list::ResourceBarrier) {
             if(scope.outermost && !scope.ambiguous)if(auto listener=g_barrier_listener.load())listener(l,a...);
             if(!g_full_list_tracking.load()){fn(l,a...);return;}
@@ -3197,6 +5888,35 @@ struct ListHook<Slot, R(A...)> {
         // pipelines and the learned profile at every level except the game's own.
         constexpr bool kMipSlot = Slot == sl::list::SetPipelineState || Slot == sl::list::SetGraphicsRootSignature ||
                                   Slot == sl::list::SetComputeRootSignature || Slot == sl::list::Reset;
+        uint8_t pure_indirect=0;
+        if constexpr (Slot == sl::list::ExecuteIndirect) {
+            if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
+                const auto hooks=std::atomic_load_explicit(&g_shader_hooks,std::memory_order_acquire);
+                if(hooks&&hooks->lane[1])pure_indirect=indirect_draw_kind(std::get<0>(std::forward_as_tuple(a...)));
+            }
+        }
+        if constexpr (Slot == sl::list::ExecuteBundle || Slot == sl::list::ExecuteIndirect || Slot == sl::list::BeginRenderPass) {
+            if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
+                const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
+                if (hooks) for (unsigned i=0;i<2;++i) if (hooks->lane[i]) {
+                    // A draw-only signature inherits all resource/root/IA
+                    // bindings. Other indirect signatures retain the existing
+                    // native boundary, as do reconstruction/replay owners.
+                    if constexpr (Slot == sl::list::ExecuteIndirect) if(i==1&&pure_indirect)continue;
+                    HostWorkScope own; hooks->lane[i]->NativeBoundary(l);
+                }
+            }
+        }
+        if constexpr (Slot == sl::list::Close) {
+            if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
+                const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
+                if (hooks) for (const auto& hook : hooks->lane) if (hook) {
+                    HostWorkScope own; hook->Closing(l);
+                }
+            }
+            // After every Closing hook (one may still read this list's positions).
+            if (!t_host_work && scope.outermost && !scope.ambiguous) replay_on_close(l);
+        }
         if constexpr (kMipSlot) {
             const std::tuple<std::decay_t<A>...> game{a...}; // what the game passed
             {
@@ -3219,6 +5939,8 @@ struct ListHook<Slot, R(A...)> {
             }
         } else
         if constexpr (std::is_void_v<R>) {
+            if constexpr (Slot == sl::list::OMSetRenderTargets)
+                if (scope.outermost && !scope.ambiguous) capture_raster_targets(l, a...);
             if constexpr (Slot == sl::list::ResourceBarrier)
                 if (scope.outermost && !scope.ambiguous) before_read_transition(l, a...);
             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
@@ -3230,8 +5952,135 @@ struct ListHook<Slot, R(A...)> {
                 }
             }
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch)
-                if (scope.outermost && !scope.ambiguous) before_shader_use(l, Slot == sl::list::Dispatch);
-            fn(l, a...);
+                if (scope.outermost && !scope.ambiguous) { const CostScope c(kCostShaderUse); before_shader_use(l, Slot == sl::list::Dispatch); }
+            if constexpr(Slot==sl::list::ExecuteIndirect)
+                if(scope.outermost && !scope.ambiguous){ const CostScope c(kCostShaderUse); before_shader_use(l,false,true); }
+            if constexpr(Slot==sl::list::ExecuteIndirect) {
+                if(pure_indirect) {
+                    const auto hooks=std::atomic_load_explicit(&g_shader_hooks,std::memory_order_acquire);
+                    if(hooks&&hooks->lane[1]) {
+                        ShaderCall call;call.kind=pure_indirect==1?ShaderKind::Draw:ShaderKind::DrawIndexed;call.indirect=true;
+                        ShaderScope saved;
+                        {HostWorkScope own;saved=hooks->lane[1]->Before(l,call);}
+                        if(saved.action!=ShaderAction::Replaced){fn(l,a...);On<Slot>::run(l,a...);}
+                        {HostWorkScope own;hooks->lane[1]->After(l,call,saved);}
+                        return;
+                    }
+                }
+            }
+            if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch) {
+                if (!t_host_work && scope.outermost && !scope.ambiguous && g_shader_hooks_enabled.load(std::memory_order_acquire)) {
+                    const auto hooks = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
+                    if (hooks) {
+                        ShaderCall call;
+                        if constexpr (Slot == sl::list::Dispatch) call.kind = ShaderKind::Dispatch;
+                        else if constexpr (Slot == sl::list::DrawInstanced) call.kind = ShaderKind::Draw;
+                        else call.kind = ShaderKind::DrawIndexed;
+                        size_t arg_index = 0;
+                        ((call.args[arg_index++] = static_cast<int64_t>(a)), ...);
+                        ShaderScope saved[2];
+                        unsigned entered = 0;
+                        bool replaced = false;
+                        for (unsigned i = 0; i < 2; ++i) {
+                            entered = i + 1;
+                            if (!hooks->lane[i]) continue;
+                            { const CostScope c(kCostLaneBefore); HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
+                            if (saved[i].action == ShaderAction::Replaced) { replaced = true; break; }
+                        }
+                        if (!replaced) {
+                            if constexpr (Slot == sl::list::Dispatch) {
+                                { const CostScope c(kCostDriver); fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2])); }
+                                { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2])); }
+                            } else if constexpr (Slot == sl::list::DrawInstanced) {
+                                { const CostScope c(kCostDriver); fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), UINT(call.args[3])); }
+                                { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), UINT(call.args[3])); }
+                            } else {
+                                { const CostScope c(kCostDriver); fn(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4])); }
+                                { const CostScope c(kCostRun); On<Slot>::run(l, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4])); }
+                            }
+                        } // A skipped native command is NOT emitted as an executed game draw/write.
+                        bool native_bindings = !replaced;
+                        for (unsigned i = entered; i > 0; --i) if (hooks->lane[i - 1]) {
+                            native_bindings = native_bindings && !saved[i - 1].state;
+                            const CostScope c(kCostLaneAfter); HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
+                        }
+                        if constexpr (Slot == sl::list::DrawInstanced)
+                            if (native_bindings) replay_after_draw(l, false, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), 0, UINT(call.args[3]));
+                        if constexpr (Slot == sl::list::DrawIndexedInstanced)
+                            if (native_bindings) replay_after_draw(l, true, UINT(call.args[0]), UINT(call.args[1]), UINT(call.args[2]), INT(call.args[3]), UINT(call.args[4]));
+                        return;
+                    }
+                }
+            }
+            if constexpr (Slot == sl::list::ClearRenderTargetView || Slot == sl::list::ClearDepthStencilView ||
+                          Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource) {
+                if constexpr (Slot == sl::list::ClearDepthStencilView) {
+                    if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                        const auto listen = g_depth_clear_listener.load(std::memory_order_acquire);
+                        const auto args = std::forward_as_tuple(a...);
+                        if (listen && (std::get<1>(args) & D3D12_CLEAR_FLAG_DEPTH)) listen(l, cpu_ref(std::get<0>(args)).resource);
+                    }
+                }
+                if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                    const auto hooks = std::atomic_load_explicit(&g_texture_hooks, std::memory_order_acquire);
+                    const auto trace = g_texture_trace_listener.load(std::memory_order_relaxed);
+                    if (trace || (hooks && (hooks->lane[0] || hooks->lane[1]))) {
+                        TextureCall call;
+                        const auto args = std::forward_as_tuple(a...);
+                        if constexpr (Slot == sl::list::ClearRenderTargetView) {
+                            call.kind = TextureKind::ClearColor; call.target = std::get<0>(args);
+                            call.target_id = cpu_ref(call.target).resource;
+                            if (std::get<1>(args)) std::memcpy(call.color, std::get<1>(args), sizeof call.color);
+                            call.rect_count = std::get<2>(args); call.rects = std::get<3>(args);
+                        } else if constexpr (Slot == sl::list::ClearDepthStencilView) {
+                            call.kind = TextureKind::ClearDepth; call.target = std::get<0>(args);
+                            call.target_id = cpu_ref(call.target).resource; call.flags = std::get<1>(args);
+                            call.depth = std::get<2>(args); call.stencil = std::get<3>(args);
+                            call.rect_count = std::get<4>(args); call.rects = std::get<5>(args);
+                        } else if constexpr (Slot == sl::list::CopyResource) {
+                            call.kind = TextureKind::Copy; call.destination = std::get<0>(args); call.source = std::get<1>(args);
+                        } else if constexpr (Slot == sl::list::CopyTextureRegion) {
+                            call.kind = TextureKind::CopyRegion;
+                            if (std::get<0>(args)) call.destination_location = *std::get<0>(args);
+                            if (std::get<4>(args)) call.source_location = *std::get<4>(args);
+                            call.destination = call.destination_location.pResource; call.source = call.source_location.pResource;
+                            call.x = std::get<1>(args); call.y = std::get<2>(args); call.z = std::get<3>(args); call.box = std::get<5>(args);
+                        } else {
+                            call.kind = TextureKind::Resolve; call.destination = std::get<0>(args); call.destination_sub = std::get<1>(args);
+                            call.source = std::get<2>(args); call.source_sub = std::get<3>(args); call.format = std::get<4>(args);
+                        }
+                        ShaderScope saved[2];
+                        unsigned entered = 0;
+                        bool replaced = false;
+                        for (unsigned i = 0; i < 2; ++i) {
+                            entered = i + 1;
+                            if (!hooks || !hooks->lane[i]) continue;
+                            { HostWorkScope own; saved[i] = hooks->lane[i]->Before(l, call); }
+                            if (saved[i].action == ShaderAction::Replaced) { replaced = true; break; }
+                        }
+                        if (!replaced) {
+                            fn(l, a...);
+                            if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::CopyTextureRegion || Slot == sl::list::ResolveSubresource)
+                                after_texture_copy(l, call.destination);
+                            On<Slot>::run(l, a...);
+                            if (trace) { const HostWorkScope own; trace(l, call); }
+                        }
+                        for (unsigned i = entered; i > 0; --i) if (hooks && hooks->lane[i - 1]) {
+                            HostWorkScope own; hooks->lane[i - 1]->After(l, call, saved[i - 1]);
+                        }
+                        return;
+                    }
+                }
+            }
+            { const CostScope c(kCostDriver); fn(l, a...); }
+            if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced)
+                if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                    const auto args = std::forward_as_tuple(a...);
+                    if constexpr (Slot == sl::list::DrawIndexedInstanced)
+                        replay_after_draw(l, true, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args));
+                    else
+                        replay_after_draw(l, false, std::get<0>(args), std::get<1>(args), std::get<2>(args), 0, std::get<3>(args));
+                }
             if constexpr (Slot == sl::list::CopyResource || Slot == sl::list::ResolveSubresource || Slot == sl::list::CopyTextureRegion) {
                 if (scope.outermost && !scope.ambiguous) {
                     auto args = std::forward_as_tuple(a...);
@@ -3258,12 +6107,22 @@ bool register_list_slots()
         ListHook<L::Close, HRESULT()>::spec(),
         ListHook<L::Reset, HRESULT(ID3D12CommandAllocator*, ID3D12PipelineState*)>::spec(),
         ListHook<L::DrawInstanced, void(UINT, UINT, UINT, UINT)>::spec(),
+        ListHook<L::BeginQuery,void(ID3D12QueryHeap*,D3D12_QUERY_TYPE,UINT)>::spec(),
+        ListHook<L::EndQuery,void(ID3D12QueryHeap*,D3D12_QUERY_TYPE,UINT)>::spec(),
         ListHook<L::DrawIndexedInstanced, void(UINT, UINT, UINT, INT, UINT)>::spec(),
         ListHook<L::Dispatch, void(UINT, UINT, UINT)>::spec(),
         ListHook<L::CopyBufferRegion, void(ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64)>::spec(),
         ListHook<L::CopyTextureRegion, void(const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*)>::spec(),
         ListHook<L::CopyResource, void(ID3D12Resource*, ID3D12Resource*)>::spec(),
         ListHook<L::ResolveSubresource, void(ID3D12Resource*, UINT, ID3D12Resource*, UINT, DXGI_FORMAT)>::spec(),
+        ListHook<L::IASetPrimitiveTopology, void(D3D12_PRIMITIVE_TOPOLOGY)>::spec(),
+        ListHook<L::ClearState,void(ID3D12PipelineState*)>::spec(),
+        ListHook<L::SOSetTargets, void(UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*)>::spec(),
+        ListHook<L::SetPredication,void(ID3D12Resource*,UINT64,D3D12_PREDICATION_OP)>::spec(),
+        ListHook<L::IASetVertexBuffers,void(UINT,UINT,const D3D12_VERTEX_BUFFER_VIEW*)>::spec(),
+        ListHook<L::IASetIndexBuffer,void(const D3D12_INDEX_BUFFER_VIEW*)>::spec(),
+        ListHook<L::OMSetBlendFactor,void(const FLOAT*)>::spec(),
+        ListHook<L::OMSetStencilRef,void(UINT)>::spec(),
         ListHook<L::RSSetViewports, void(UINT, const D3D12_VIEWPORT*)>::spec(),
         ListHook<L::RSSetScissorRects, void(UINT, const D3D12_RECT*)>::spec(),
         ListHook<L::SetPipelineState, void(ID3D12PipelineState*)>::spec(),
@@ -3287,6 +6146,9 @@ bool register_list_slots()
         ListHook<L::OMSetRenderTargets, void(UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*)>::spec(),
         ListHook<L::ClearDepthStencilView, void(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*)>::spec(),
         ListHook<L::ClearRenderTargetView, void(D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT*, UINT, const D3D12_RECT*)>::spec(),
+        ListHook<L::ClearUnorderedAccessViewUint, void(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT*, UINT, const D3D12_RECT*)>::spec(),
+        ListHook<L::ClearUnorderedAccessViewFloat, void(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const FLOAT*, UINT, const D3D12_RECT*)>::spec(),
+        ListHook<L::DiscardResource, void(ID3D12Resource*, const D3D12_DISCARD_REGION*)>::spec(),
         ListHook<L::ExecuteIndirect, void(ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64)>::spec(),
     };
     std::vector<na::hooking::variants::SlotSpec> remaining;
@@ -3330,7 +6192,7 @@ void note_map(ID3D12Resource* r, void* cpu)
 {
     const na_object_id id = lookup(r);
     if (!id) return;
-    std::unique_lock<std::shared_mutex> lock(g_m);
+    std::unique_lock<RegistryLock> lock(g_m);
     auto it = g_buffers.find(id);
     if (it == g_buffers.end()) return;
     it->second.cpu = static_cast<uint8_t*>(cpu);
@@ -3344,7 +6206,7 @@ void note_unmap(ID3D12Resource* r)
     const na_object_id id = lookup(r);
     if (!id) return;
     if (auto probe = g_unmap_probe.load(std::memory_order_acquire)) probe(g_unmap_probe_user.load());
-    std::unique_lock<std::shared_mutex> lock(g_m);
+    std::unique_lock<RegistryLock> lock(g_m);
     auto it = g_buffers.find(id);
     if (it == g_buffers.end() || !it->second.maps) return;
     if (--it->second.maps == 0) it->second.cpu = nullptr;
@@ -3406,7 +6268,7 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
         na_object_id lid = 0;
         uint64_t gen = NA_UNKNOWN_U64;
         {
-            std::shared_lock<std::shared_mutex> lock(g_m);
+            std::shared_lock<RegistryLock> lock(g_m);
             ListState* ls = lists[li] ? list_state_locked(lists[li], &lid) : nullptr;
             if (!ls) continue;
             gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
@@ -3445,7 +6307,7 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
             } else {
                 ID3D12Resource* reread = nullptr; // G3-02: host read of an app-unmapped buffer
                 {
-                    std::shared_lock<std::shared_mutex> lock(g_m); // Unmap waits for the copy
+                    std::shared_lock<RegistryLock> lock(g_m); // Unmap waits for the copy
                     auto it = g_buffers.find(b.resource);
                     if (it == g_buffers.end()) o.e.status = NA_SNAP_UNRESOLVED;
                     else if (!it->second.cpu_visible) o.e.status = NA_SNAP_GPU_WRITTEN;
@@ -4055,7 +6917,7 @@ void capture_submission(uint32_t count, ID3D12CommandList* const* lists, Submiss
         if (notes_ok) c.reject = why;
         notes_ok = uses_ok = false;
     };
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     for (uint32_t i = 0; i < count; ++i) {
         na_object_id lid = 0;
         ListState* ls = lists[i] ? list_state_locked(lists[i], &lid) : nullptr;
@@ -4128,7 +6990,8 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
         auto it = g_known.find(m.id);
         if (it == g_known.end()) continue; // retired meanwhile
         if (valid && m.alone && it->second.mark_seq == m.seq) good.push_back(m.id);
-        else known_reset_locked(it->second); // overlapped / ambiguous / cleared / copy-queue decay
+        else known_reset_locked(it->second, valid ? kResetOverlap : ambiguous ? kResetAmbiguous : c.tainted ? kResetTainted :
+                                             c.epoch != g_known_epoch ? kResetEpoch : kResetCopyQueue); // the exact cause, for the log
     }
     std::sort(good.begin(), good.end());
     std::vector<na_object_id> claimed; // ids whose queue ownership was settled in this publication
@@ -4137,7 +7000,7 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
         ResKnown& k = g_known[n.resource];
         if (std::find(claimed.begin(), claimed.end(), n.resource) == claimed.end()) {
             claimed.push_back(n.resource);
-            if (k.queue && k.queue != qid) known_reset_locked(k); // another queue's timeline: start over
+            if (k.queue && k.queue != qid) known_reset_locked(k, kResetOtherQueue); // another queue's timeline: start over
             k.queue = qid;
         }
         if (n.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
@@ -4145,11 +7008,12 @@ void known_publish(SubmissionCapture& c, na_object_id qid, bool ambiguous)
             k.all = n.state_after;
             k.subs.clear();
         } else if (k.subs.size() >= kMaxKnownSubs && !k.subs.count(n.subresource)) {
-            known_reset_locked(k);
+            known_reset_locked(k, kResetSubs);
             k.queue = qid;
         } else {
             k.subs[n.subresource] = n.state_after;
         }
+        if (n.state_after == kStatePending) k.reset_why = kResetPendingNote;
     }
     for (const auto& m : c.marks) {
         auto it = g_known.find(m.id);
@@ -4241,7 +7105,7 @@ void acquire_sample_sources(ID3D12CommandQueue* q, na_object_id qid, D3D12_COMMA
         recount_armed_locked();
     }
     if (want.empty()) return;
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     for (const auto& w : want) {
         auto it = g_res_keys.find(w.second);
         ID3D12Resource* res = nullptr;
@@ -4416,6 +7280,10 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
         ID3D12Device8* d8 = nullptr;
         device->QueryInterface(__uuidof(ID3D12Device4), reinterpret_cast<void**>(&d4));
         device->QueryInterface(__uuidof(ID3D12Device8), reinterpret_cast<void**>(&d8));
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+        ID3D12Device11* d11 = nullptr;
+        device->QueryInterface(__uuidof(ID3D12Device11), reinterpret_cast<void**>(&d11));
+#endif
 #define NA_HOOK(obj, ns, name, req) hook(obj, sl::ns::name, fn(&D_##name), reinterpret_cast<void**>(&o_##name), req)
         bool ok = NA_HOOK(device, device, CreateCommandQueue, true) &&
                   NA_HOOK(device, device, CreateCommandList, true) && NA_HOOK(device, device, CreateDescriptorHeap, true) &&
@@ -4425,13 +7293,17 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
                   NA_HOOK(device, device, CopyDescriptors, true) && NA_HOOK(device, device, CopyDescriptorsSimple, true) &&
                   NA_HOOK(device, device, CreateCommittedResource, true) && NA_HOOK(device, device, CreateHeap, true) &&
                   NA_HOOK(device, device, CreatePlacedResource, true) && NA_HOOK(device, device, CreateReservedResource, true) &&
-                  NA_HOOK(device, device, CreateFence, true) &&
+                  NA_HOOK(device, device, CreateFence, true) && NA_HOOK(device, device, CreateCommandSignature, false) &&
                   NA_HOOK(device, device, CreateRootSignature, true) && NA_HOOK(device, device, CreateGraphicsPipelineState, true) &&
                   NA_HOOK(device, device, CreateComputePipelineState, true) && NA_HOOK(d2, device, CreatePipelineState, false) &&
                   NA_HOOK(d4, device, CreateCommandList1, false) && NA_HOOK(d4, device, CreateCommittedResource1, false) &&
                   NA_HOOK(d4, device, CreateHeap1, false) && NA_HOOK(d4, device, CreateReservedResource1, false) &&
                   NA_HOOK(d8, device, CreateCommittedResource2, false) && NA_HOOK(d8, device, CreatePlacedResource1, false) &&
                   NA_HOOK(queue, queue, Signal, true) && NA_HOOK(queue, queue, Wait, true);
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+        if (ok) ok = NA_HOOK(d11, device, CreateSampler2, false);
+        if (d11) d11->Release();
+#endif
         if (ok && hook_queue_execute) ok = NA_HOOK(queue, queue, ExecuteCommandLists, true);
 #undef NA_HOOK
         if (!ok) rollback_patches();
@@ -4488,6 +7360,19 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
         g_c.nested_unlocked.fetch_add(1);
         t.nested_unlocked = true;
     }
+    // Serialize game work per queue FIRST (C9B-R3 for samples; SE5 2026-11-02 for the
+    // known-state store): two threads submitting to one queue at once leave the GPU order
+    // unknown, which resets every carried state they touch. The store's marks must be taken
+    // under the same lock, or a second thread marks inside the first one's submission
+    // (Astra reproduced that race on db60492: kResetOverlap). The runtime serializes a queue's
+    // submissions anyway, so the lock only fixes the observed order to the queue's.
+    const bool armed = g_armed.load(std::memory_order_acquire);
+    if (!t_host_work && t_submit_depth == 0) { // Signal/Wait too: they share the queue's order
+        qs->submit_m.lock();
+        ++t_submit_depth;
+        t.submit_locked = true;
+        if (!armed) g_c.serialized.fetch_add(1);
+    }
     // Evidence for sampling and the known-state store, captured before the
     // original runs (review PR40 #2); the store marks what it may change.
     std::shared_ptr<SubmissionCapture> cap; // none for queue sync operations and host work
@@ -4505,10 +7390,7 @@ ExecuteToken ExecuteBegin(ID3D12CommandQueue* queue, uint32_t count, ID3D12Comma
     t_cur_qid = qid;
     t.cur_set = true;
     t.list_type = static_cast<uint32_t>(type);
-    if (!t_host_work && t_submit_depth == 0 && g_armed.load(std::memory_order_acquire)) { // C9B-R3
-        qs->submit_m.lock();
-        ++t_submit_depth;
-        t.submit_locked = true;
+    if (t.submit_locked && armed) {
         static const SubmissionCapture kNoLists;
         acquire_sample_sources(queue, qid, type, cap ? *cap : kNoLists); // before the original runs (C9B-REVIEW-2 #2)
     }
@@ -4557,7 +7439,7 @@ void ExecuteEnd(const ExecuteToken& t, ID3D12CommandQueue* queue, uint32_t count
     ex.e.refs_offset = offsetof(Exec, refs);
     ex.e.ref_stride = sizeof(na_list_ref);
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         for (uint32_t i = 0; i < n; ++i) {
             auto it = g_objs.find(canon(lists[i]));
             if (it == g_objs.end()) {
@@ -4613,7 +7495,7 @@ PresentToken PresentBegin(IDXGISwapChain* chain)
     }
     const void* key=canon(chain);
     {
-        std::unique_lock<std::shared_mutex> lock(g_m);
+        std::unique_lock<RegistryLock> lock(g_m);
         auto it=g_objs.find(key);
         if(it!=g_objs.end() && it->second.id==token.swapchain) token.ordinal=++it->second.present_ordinal;
     }
@@ -4627,6 +7509,36 @@ void PresentEnd(const PresentToken& token,uint32_t sync,uint32_t flags,int32_t r
     e.sync_interval=sync;e.present_flags=flags;e.backbuffer_index=token.index;
     emit(e,NA_GROUP_SWAPCHAIN);
 }
+void SwapchainResized(IDXGISwapChain* chain,int32_t result)
+{
+    if(!chain || !ProducersActive())return;
+    const auto id=lookup(chain);
+    if(!id)return; // First Present will discover the current size if not yet observed.
+    na_ev_swapchain_resized e;
+    init_header(e,NA_EV_SWAPCHAIN_RESIZED,NA_EVF_FOUNDATIONAL);
+    e.swapchain=id;e.hresult=result;
+    e.width=e.height=e.format=e.buffer_count=e.buffer_generation=NA_UNKNOWN_U32;
+    DXGI_SWAP_CHAIN_DESC desc{};
+    const bool known=SUCCEEDED(result) && SUCCEEDED(chain->GetDesc(&desc));
+    if(known){
+        e.width=desc.BufferDesc.Width;e.height=desc.BufferDesc.Height;
+        e.format=desc.BufferDesc.Format;e.buffer_count=desc.BufferCount;
+        // Snapshot/restart consumers also need the latest description. Preserve
+        // original creation provenance; an unobserved generation stays unknown.
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto it=g_objs.find(canon(chain));
+        if(it!=g_objs.end() && it->second.id==id && it->second.created.size()==sizeof(na_ev_swapchain_created)){
+            na_ev_swapchain_created creation{};
+            std::memcpy(&creation,it->second.created.data(),sizeof creation);
+            creation.width=e.width;creation.height=e.height;creation.format=e.format;creation.buffer_count=e.buffer_count;
+            if(creation.buffer_generation!=NA_UNKNOWN_U32)++creation.buffer_generation;
+            e.buffer_generation=creation.buffer_generation;
+            std::memcpy(it->second.created.data(),&creation,sizeof creation);
+        }
+    }
+    if(SUCCEEDED(result) && !known)e.hdr.flags|=NA_EVF_METHOD_UNOBSERVED;
+    emit(e,NA_GROUP_SWAPCHAIN);
+}
 bool InstallRequested() { return g_requested.load(); }
 bool ProducersActive() { return g_active.load(std::memory_order_acquire); }
 
@@ -4638,7 +7550,7 @@ na_object_id IdOf(const void* object) { return lookup(object); }
 std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list)
 {
     std::vector<LiveBinding> out;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return out;
@@ -4649,10 +7561,81 @@ std::vector<LiveBinding> ListRootConstantBuffers(ID3D12CommandList* list)
             out.push_back({b.resource, b.offset, b.size, b.op_index, b.param, b.kind == NA_SNAP_TABLE_CBV});
     return out;
 }
+uint32_t ListCurrentGraphicsCbvs(ID3D12CommandList* list, LiveBinding* out, uint32_t max)
+{
+    if (!out || !max) return 0;
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    uint32_t n = 0;
+    size_t scanned = 0;
+    for (auto it = ls->bindings.rbegin(); it != ls->bindings.rend() && n < max && scanned < 512; ++it, ++scanned) {
+        const auto& b = *it;
+        if (!b.resource || b.compute || (b.kind != NA_SNAP_ROOT_CBV && b.kind != NA_SNAP_TABLE_CBV)) continue;
+        const bool table = b.kind == NA_SNAP_TABLE_CBV;
+        bool seen = false; // a later binding of the same root parameter replaced this one
+        for (uint32_t i = 0; i < n && !seen; ++i) seen = out[i].param == b.param && out[i].table == table && !table;
+        if (seen) continue;
+        out[n++] = {b.resource, b.offset, b.size, b.op_index, b.param, table};
+    }
+    return n;
+}
+uint32_t ListCurrentGraphicsSrvs(ID3D12CommandList* list, na_object_id* out, uint32_t max, bool* incomplete)
+{
+    bool cut = false;
+    struct Report { bool* to; bool* cut; ~Report() { if (to) *to = *cut; } } report{incomplete, &cut};
+    if (!out || !max) { cut = true; return 0; }
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) { cut = true; return 0; }
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    const auto signature = g_objs.find(canon(ls->root_sig[0]));
+    if (signature == g_objs.end()) { cut = true; return 0; }
+    const auto& params = signature->second.root_params;
+    const auto& ranges = signature->second.root_ranges;
+    uint32_t n = 0;
+    for (size_t p = 0; p < ls->args[0].size() && p < params.size(); ++p) {
+        const auto& arg = ls->args[0][p];
+        if (params[p].param_type != NA_ROOT_TABLE) continue;
+        if (arg.type != 1) continue;
+        uint32_t slot = 0;
+        auto* heap = bound_heap_for_gpu_locked(*ls, arg.value, &slot);
+        if (!heap) { cut = true; continue; }
+        bool bound = false;
+        for (uint32_t h = 0; h < ls->nheaps; ++h) bound |= heap->key == ls->heaps[h];
+        if (!bound) { cut = true; continue; }
+        for (uint32_t r = 0; r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
+            const auto& range = ranges[params[p].first_range + r];
+            if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) continue;
+            // Wide ranges are walked up to kWide descriptors (a bindless table beyond that is
+            // reported incomplete rather than read as its first entries).
+            constexpr uint32_t kWide = 1024;
+            if (range.table_offset == NA_UNKNOWN_U32 || range.num_descriptors > kWide) cut = true;
+            if (range.table_offset == NA_UNKNOWN_U32) continue;
+            SlotShared stripe;
+            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, kWide); ++k) {
+                const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                if (index >= heap->count) break;
+                stripe.lock(heap, index);
+                const auto& info = heap->info[static_cast<size_t>(index)];
+                if (info.kind != NA_DESC_SRV || !info.resource) continue;
+                bool seen = false;
+                for (uint32_t i = 0; i < n && !seen; ++i) seen = out[i] == info.resource;
+                if (seen) continue;
+                if (n == max) { cut = true; continue; }
+                out[n++] = info.resource;
+            }
+        }
+    }
+    return n;
+}
 bool ListReferences(ID3D12CommandList* list, na_object_id id)
 {
     if (!id) return false;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -4662,7 +7645,7 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id)
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth)
 {
     if (!color || !depth) return false;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -4671,7 +7654,7 @@ bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id dep
 }
 na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_object_id color)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return {};
@@ -4680,7 +7663,7 @@ na::j2::InsertionDecision ListInsertionDecision(ID3D12CommandList* list, na_obje
 }
 na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_object_id color)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return {};
@@ -4689,12 +7672,129 @@ na::j2::ConsumerSignature ListConsumerSignature(ID3D12CommandList* list, na_obje
 }
 bool ListColorEvents(ID3D12CommandList* list, na_object_id color, std::vector<na::j2::ColorEvent>& out)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->insertion.ColorEvents(color, out);
+}
+// Incremental rebuild (2026-11-09, run 48522d0: the first version rescanned EVERY slot of every heap
+// under the exclusive g_m on the present thread whenever the set changed, and also took that lock on
+// every Present while no scene was selected or after an overflow; D3D11On12's online view heap holds
+// about a million descriptors, so each pass stalled the translator thread for milliseconds).
+// Now: the ids are published first (exclusive g_m held only for that copy, no scan), then the slots
+// are scanned in chunks of kHotScanChunk per Present under the SHARED g_m and each word's stripe,
+// on the present thread. The scan only ADDS bits (the id set only grows), and every write or copy
+// that lands during the scan computes its own bit from the already-published set, so when the
+// last chunk is done the bits are exact. Until then g_hot_ready stays false (the original walk).
+constexpr uint32_t kHotScanChunk = 32768; // slots per Present (~1.5 MB of SlotInfo, well under a millisecond)
+// Scan state, under g_hot_scan_m: Present can run on several threads (one per chain), and two
+// concurrent refreshes would share these; the second one simply leaves (try-lock, no waiting).
+std::mutex g_hot_scan_m;
+bool g_hot_scan_active = false;
+size_t g_hot_scan_heap = 0;               // index into g_hot_scan_ids
+uint32_t g_hot_scan_word = 0;
+std::vector<na_object_id> g_hot_scan_ids; // heap ids snapshot when the scan began (heaps may come and go)
+void RefreshReadFilter()
+{
+    if (g_hot_ready.load(std::memory_order_acquire) || t_host_work) return;
+    std::unique_lock<std::mutex> scan(g_hot_scan_m, std::try_to_lock);
+    if (!scan.owns_lock()) return; // another Present thread is refreshing
+    uint64_t depth = 0, color = 0;
+    GetLiveSelection(&depth, &color);
+    if (!color) { g_hot_scan_active = false; return; } // nothing to filter for; no lock taken
+    { std::lock_guard<std::mutex> lk(g_hot_pending_m); if (g_hot_overflow) return; }
+    if (!g_hot_scan_active) {
+        // Publish the grown id set, then start the scan from the first heap.
+        na_object_id ids[kHotMax];
+        uint32_t n = 0;
+        {
+            std::unique_lock<RegistryLock> lock(g_m); // brief: the id copy and the heap snapshot only
+            std::lock_guard<std::mutex> lk(g_hot_pending_m);
+            const auto add = [&](na_object_id id) {
+                if (!id || id == NA_UNKNOWN_U64) return true;
+                for (uint32_t i = 0; i < n; ++i) if (ids[i] == id) return true;
+                if (n == kHotMax) return false;
+                ids[n++] = id;
+                return true;
+            };
+            bool fits = add(color);
+            for (uint32_t i = 0; fits && i < g_hot_known_n; ++i) fits = add(g_hot_known[i]);
+            for (uint32_t i = 0; fits && i < g_hot_pending_n; ++i) fits = add(g_hot_pending[i]);
+            if (!fits) { g_hot_overflow = true; return; }
+            std::copy_n(ids, n, g_hot_ids);
+            g_hot_n = n;
+            g_hot_color = color;
+            std::copy_n(ids, n, g_hot_known);
+            g_hot_known_n = n;
+            g_hot_pending_n = 0;
+            g_hot_scan_ids.clear();
+            for (auto& h : g_heaps) if (h->hot) g_hot_scan_ids.push_back(h->id);
+        }
+        g_hot_scan_active = true;
+        g_hot_scan_heap = 0;
+        g_hot_scan_word = 0;
+    }
+    uint32_t budget = kHotScanChunk;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        while (budget && g_hot_scan_heap < g_hot_scan_ids.size()) {
+            DescHeap* h = nullptr;
+            for (auto& x : g_heaps) if (x->id == g_hot_scan_ids[g_hot_scan_heap]) { h = x.get(); break; }
+            if (!h || !h->hot) { ++g_hot_scan_heap; g_hot_scan_word = 0; continue; } // retired meanwhile
+            for (; g_hot_scan_word < h->nstripes && budget; ++g_hot_scan_word) {
+                const uint64_t base = uint64_t(g_hot_scan_word) << kStripeShift;
+                if (base >= h->count) break;
+                uint64_t bits = 0;
+                {
+                    std::shared_lock<std::shared_mutex> stripe(h->stripes[g_hot_scan_word]);
+                    for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
+                        const auto& si = h->info[static_cast<size_t>(base + b)];
+                        if (si.kind == NA_DESC_SRV && hot_id_locked(si.resource)) bits |= 1ull << b;
+                    }
+                }
+                if (bits) h->hot[g_hot_scan_word].fetch_or(bits, std::memory_order_relaxed); // adds only; writes keep their own bits exact
+                budget -= static_cast<uint32_t>(std::min<uint64_t>(64, h->count - base));
+            }
+            if (g_hot_scan_word >= h->nstripes || (uint64_t(g_hot_scan_word) << kStripeShift) >= h->count) { ++g_hot_scan_heap; g_hot_scan_word = 0; }
+        }
+    }
+    if (g_hot_scan_heap < g_hot_scan_ids.size()) return; // more next Present
+    g_hot_scan_active = false;
+    uint64_t d2 = 0, c2 = 0;
+    GetLiveSelection(&d2, &c2);
+    if (c2 != g_hot_color) return; // the colour moved during the scan: the next Present starts over
+    {
+        // Astra (2026-11-09): the pending check and the ready publication must be one step under
+        // g_hot_pending_m. mark_hot_candidate adds its id and stores ready=false under that mutex, so
+        // a copy seen between an unlocked check and the store would have its false overwritten by our
+        // true while its id and bits are absent (a false "no read" skip).
+        std::lock_guard<std::mutex> lk(g_hot_pending_m);
+        if (g_hot_pending_n != 0 || g_hot_overflow) return; // the set grew during the scan
+        ++g_operation_revision; // per-list read caches were built without the filter; let them refill through it
+        g_hot_rebuilds.fetch_add(1, std::memory_order_relaxed);
+        g_hot_ready.store(true, std::memory_order_release);
+    }
+    // A colour change publishes ready=false without that mutex; re-check after our store so a change
+    // in between cannot be left overwritten (either it lands after our store, or we undo ours here).
+    uint64_t d3 = 0, c3 = 0;
+    GetLiveSelection(&d3, &c3);
+    if (c3 != g_hot_color) g_hot_ready.store(false, std::memory_order_release);
+}
+int FormatReadFilter(char* out, size_t n)
+{
+    bool overflow;
+    uint32_t ids;
+    { std::lock_guard<std::mutex> lk(g_hot_pending_m); overflow = g_hot_overflow; ids = g_hot_known_n; }
+    return std::snprintf(out, n, "read_filter ready=%u ids=%u overflow=%u rebuilds=%llu skipped=%llu walked=%llu"
+        " | desc_copy_calls simple=%llu multi=%llu batched=%llu batched_runs=%llu | view_writes=%llu deferred=%llu deferred_cbv=%llu flushes=%llu",
+        g_hot_ready.load() ? 1u : 0u, ids, overflow ? 1u : 0u, (unsigned long long)g_hot_rebuilds.load(),
+        (unsigned long long)g_hot_skipped.load(), (unsigned long long)g_hot_walked.load(),
+        (unsigned long long)g_copy_simple.load(), (unsigned long long)g_copy_calls.load(),
+        (unsigned long long)g_copy_batched.load(), (unsigned long long)g_copy_batched_runs.load(),
+        (unsigned long long)g_c.writes.load(), (unsigned long long)g_deferred_writes.load(), (unsigned long long)g_deferred_cbvs.load(),
+        (unsigned long long)g_deferred_flushes.load());
 }
 void ResetDerived()
 {
@@ -4703,7 +7803,7 @@ void ResetDerived()
 }
 na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id color)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return {};
@@ -4711,9 +7811,10 @@ na::j2::LiveConsumer ListLiveConsumer(ID3D12CommandList* list, na_object_id colo
     return ls->insertion.Live(color);
 }
 void SetTableBindCallback(TableBindCallback cb) { g_table_cb.store(cb, std::memory_order_release); }
+void SetEntryCallback(EntryCallback cb) { g_entry_cb.store(cb, std::memory_order_release); }
 bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id* ds)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -4722,24 +7823,212 @@ bool ListCurrentTargets(ID3D12CommandList* list, na_object_id* rt, na_object_id*
     if (ds) *ds = ls->cur_ds;
     return true;
 }
+na_object_id ListLastDrawTarget(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load()) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->last_draw_rt;
+}
+void SetRasterStateListener(RasterStateListener listener) { g_raster_listener.store(listener, std::memory_order_release); }
+bool ListRasterScissors(ID3D12CommandList* list, RasterScissors& out)
+{
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->raster_scissors_known || ls->in_render_pass) return false;
+    out.recording = ls->generation.load() + 1;
+    out.scissor_serial = ls->scissor_serial;
+    out.ds = ls->cur_ds;
+    out.count = ls->raster_scissor_count < 16 ? ls->raster_scissor_count : 16;
+    static_assert(sizeof(RasterScissors::Rect) == sizeof(D3D12_RECT), "D3D12_RECT layout");
+    std::memcpy(out.rects, ls->raster_scissors, out.count * sizeof(D3D12_RECT));
+    return true;
+}
+na_object_id ListPipelineId(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* state = list ? list_state_locked(list, &id) : nullptr;
+    if (!state) return 0;
+    std::lock_guard<std::mutex> bindings(state->bind_m);
+    const auto pipeline = g_objs.find(canon(state->pso));
+    return pipeline == g_objs.end() ? 0 : pipeline->second.id;
+}
+
+bool ListDrawState(ID3D12CommandList* list, DrawInfo& out)
+{
+    DrawInfo r;
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return false;
+    r.list = lid;
+    r.recording = ls->generation.load() + 1;
+    const bool complete = ls->coverage_complete.load();
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    r.rt = ls->cur_rt; r.ds = ls->cur_ds; r.rt_count = ls->cur_nrt;
+    r.query_active=ls->active_queries!=0;
+    r.restorable = complete && ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
+                   ls->raster_viewports_known && ls->raster_scissors_known;
+    if (ls->raster_viewports_known) {
+        r.viewport_count = ls->raster_viewport_count < 16 ? ls->raster_viewport_count : 16;
+        for (uint32_t i = 0; i < r.viewport_count; ++i) {
+            const D3D12_VIEWPORT& v = ls->raster_viewports[i];
+            const float f[6] = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+            std::memcpy(r.viewports[i], f, sizeof f);
+        }
+    }
+    if (ls->raster_scissors_known) {
+        r.scissor_count = ls->raster_scissor_count < 16 ? ls->raster_scissor_count : 16;
+        for (uint32_t i = 0; i < r.scissor_count; ++i) {
+            const D3D12_RECT& c = ls->raster_scissors[i];
+            r.scissors[i][0] = c.left; r.scissors[i][1] = c.top; r.scissors[i][2] = c.right; r.scissors[i][3] = c.bottom;
+        }
+    }
+    const auto pipeline = ls->pso ? g_objs.find(canon(ls->pso)) : g_objs.end();
+    if (pipeline != g_objs.end() && pipeline->second.created.size() >= sizeof(na_ev_pipeline_created)) {
+        const auto* p = reinterpret_cast<const na_ev_pipeline_created*>(pipeline->second.created.data());
+        if (p->pipeline_kind == NA_PIPELINE_GRAPHICS || (p->pipeline_kind == NA_PIPELINE_STREAM && p->stage_hash[NA_STAGE_CS] == 0)) {
+            r.pipeline_known = true;
+            r.pso_rt_count = p->rt_count; r.rtv_format = p->rtv_formats[0]; r.dsv_format = p->dsv_format;
+            r.samples = p->sample_count; r.blend_mask = p->blend_enable_mask;
+            r.native_hud_affine=pipeline->second.native_hud_affine;
+            r.blend_class=pipeline->second.blend_class;
+            r.shader_readonly=pipeline->second.shader_readonly;
+            r.shader_rejection=pipeline->second.shader_rejection;
+            r.pixel_position=pipeline->second.pixel_position;
+            r.depth_enable = p->depth_enable; r.depth_func = p->depth_func;
+        }
+    }
+    out = r;
+    return true;
+}
 uint64_t ListRecording(ID3D12CommandList* list)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->generation_known.load()) return 0;
     return ls->generation.load() + 1; // never 0
 }
+bool ListWorkTailUnchanged(ID3D12CommandList* list, bool arm)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* state = list ? list_state_locked(list, &id) : nullptr;
+    if (!state || !state->recording_observed.load() || !state->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bindings(state->bind_m);
+    if (!state->restorable || !state->evidence_complete || state->in_render_pass) return false;
+    if (arm) state->work_tail.store(1,std::memory_order_relaxed);
+    return state->work_tail.load(std::memory_order_relaxed)==1;
+}
 bool ListStateRestorable(ID3D12CommandList* l)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->restorable && !ls->in_render_pass;
 }
-bool RestoreListState(ID3D12GraphicsCommandList* l)
+bool ListShaderState(ID3D12CommandList* l, bool compute, ShaderState& out)
+{
+    ShaderState result;
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->restorable || ls->in_render_pass) return false;
+    result.root = static_cast<ID3D12RootSignature*>(const_cast<void*>(ls->root_sig[compute ? 1 : 0]));
+    result.list_type=ls->list_type;
+    result.raster_restorable=ls->raster_tracking&&ls->raster_targets_known&&ls->raster_viewports_known&&ls->raster_scissors_known;
+    result.target_serial=ls->target_serial;result.viewport_serial=ls->viewport_serial;result.scissor_serial=ls->scissor_serial;
+    result.viewport_jitter=ls->vpj_applied?ls->vpj_value:0;
+    result.root_serial=ls->root_serial[compute];result.restore_serial=ls->host_restore_serial;
+    bound_heaps_locked(*ls);
+    for (uint32_t i = 0; i < ls->nheaps; ++i) {
+        const DescHeap* heap = ls->heap_metadata[i];
+        if (!heap) return false;
+        if (heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) result.resources = ls->heaps[i];
+        else if (heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) result.samplers = ls->heaps[i];
+        else return false;
+    }
+    const auto& args = ls->args[compute ? 1 : 0];
+    if (args.size() > 64) return false;
+    for (uint32_t p = 0; p < args.size(); ++p) {
+        const auto& a = args[p];
+        if (a.type == 2){result.cbv_params |= uint64_t(1) << p;result.cbv_serial[p]=a.serial;}
+        if (a.type != 1) continue;
+        uint32_t slot=0;const DescHeap* heap=bound_heap_for_gpu_locked(*ls,a.value,&slot);
+        if (!heap) return false;
+        result.tables[result.count++] = {p, a.value, heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER};
+    }
+    out = result;
+    return result.root != nullptr;
+}
+void PreserveAppliedViewportJitter(ID3D12CommandList* list,uint64_t sample)
+{
+    if(!sample)return;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id=0;auto* ls=list?list_state_locked(list,&id):nullptr;
+    if(!ls)return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if(ls->vpj_scene==sample&&ls->vpj_value==sample)ls->vpj_applied=true;
+}
+void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook> hook)
+{
+    const auto index = static_cast<unsigned>(lane);
+    if (index >= 2) return;
+    std::shared_ptr<const ShaderHooks> prior;
+    {
+        std::lock_guard<std::mutex> lock(g_shader_hooks_m);
+        prior = std::atomic_load_explicit(&g_shader_hooks, std::memory_order_acquire);
+        auto next = std::make_shared<ShaderHooks>();
+        if (prior) *next = *prior;
+        next->lane[index] = std::move(hook);
+        const bool enabled = !!next->lane[0] || !!next->lane[1];
+        std::atomic_store_explicit(&g_shader_hooks, std::shared_ptr<const ShaderHooks>(next), std::memory_order_release);
+        g_shader_hooks_enabled.store(enabled, std::memory_order_release);
+    } // old callbacks/resources can be destroyed outside the registration lock
+}
+void SetTextureTraceListener(TextureTraceListener listener) { g_texture_trace_listener.store(listener, std::memory_order_release); }
+void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
+void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
+{
+    SetTextureOperationHook(TextureLane::Effects, std::move(hook));
+}
+void SetTextureOperationHook(TextureLane lane, std::shared_ptr<TextureOperationHook> hook)
+{
+    const auto index = static_cast<unsigned>(lane);
+    if (index >= 2) return;
+    std::shared_ptr<const TextureHooks> prior;
+    {
+        std::lock_guard<std::mutex> lock(g_texture_hooks_m);
+        prior = std::atomic_load_explicit(&g_texture_hooks, std::memory_order_acquire);
+        auto next = std::make_shared<TextureHooks>();
+        if (prior) *next = *prior;
+        next->lane[index] = std::move(hook);
+        std::atomic_store_explicit(&g_texture_hooks, std::shared_ptr<const TextureHooks>(next), std::memory_order_release);
+    } // callbacks and GPU-owning objects are released outside the registry lock
+}
+void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
+bool ListRasterStateRestorable(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
+        ls->raster_viewports_known && ls->raster_scissors_known && ls->raster_topology_known;
+}
+bool RestoreListState(ID3D12GraphicsCommandList* l,ID3D12GraphicsCommandList* destination,bool graphics_only,std::vector<uint64_t>* graphics_reads)
 {
     // Snapshot under the locks, issue the calls without them (these calls run
     // under the caller's HostWorkScope, so they are not observed as the game's).
@@ -4747,46 +8036,158 @@ bool RestoreListState(ID3D12GraphicsCommandList* l)
     ID3D12DescriptorHeap* heaps[2] = {};
     uint32_t nheaps = 0;
     const void* rs[2] = {};
-    std::vector<ListState::RootArg> args[2];
+    struct RootReplay {uint8_t type=0;uint64_t value=0;UINT count=0;uint32_t consts[64]{};};
+    RootReplay args[2][64];UINT nargs[2]{};
+    std::shared_ptr<Obj::Twins> raster_storage;
+    D3D12_VIEWPORT viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    D3D12_RECT scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT viewport_count = 0, scissor_count = 0, rt_count = 0;
+    D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    bool vp_known = false, sc_known = false, topology_known = false, has_depth = false;
+    D3D12_VERTEX_BUFFER_VIEW vertices[32]{};UINT vertex_mask=0;D3D12_INDEX_BUFFER_VIEW index{};bool index_known=false;
+    FLOAT blend[4]={1,1,1,1};UINT stencil=0;
+    ID3D12Resource* predicate=nullptr;UINT64 predicate_offset=0;D3D12_PREDICATION_OP predicate_op=D3D12_PREDICATION_OP_EQUAL_ZERO;
     {
-        std::shared_lock<std::shared_mutex> rl(g_m);
+        std::shared_lock<RegistryLock> rl(g_m);
         na_object_id lid = 0;
         ListState* ls = l ? list_state_locked(l, &lid) : nullptr;
         if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
         std::lock_guard<std::mutex> bl(ls->bind_m);
         if (!ls->restorable || ls->in_render_pass) return false;
         pso = ls->pso;
+        vertex_mask=ls->vertex_mask;std::copy_n(ls->vertex_buffers,32,vertices);index=ls->index_buffer;index_known=ls->index_known;
+        std::copy_n(ls->blend_factor,4,blend);stencil=ls->stencil_ref;
+        predicate=ls->predicate;predicate_offset=ls->predicate_offset;predicate_op=ls->predicate_op;
+        if(graphics_reads){
+            graphics_reads->clear();
+            const auto keep=[&](uint64_t id){if(id&&std::find(graphics_reads->begin(),graphics_reads->end(),id)==graphics_reads->end())graphics_reads->push_back(id);};
+            const auto address=[&](uint64_t va){uint64_t id=0,offset=0;if(!va)return true;if(!resolve_va_locked(va,&id,&offset))return false;keep(id);return true;};
+            for(UINT i=0;i<32;++i)if((vertex_mask&(1u<<i))&&!address(vertices[i].BufferLocation))return false;
+            if(index_known&&!address(index.BufferLocation))return false;
+            if(predicate){const auto p=g_objs.find(canon(predicate));if(p==g_objs.end())return false;keep(p->second.id);}
+            const auto root=g_objs.find(canon(ls->root_sig[0]));if(root==g_objs.end())return false;
+            for(UINT p=0;p<ls->args[0].size();++p){const auto& a=ls->args[0][p];
+                if(a.type==2||a.type==3){if(!address(a.value))return false;}
+                else if(a.type==4)return false;
+                else if(a.type==1){
+                    if(p>=root->second.root_params.size())return false;const auto& param=root->second.root_params[p];
+                    if(param.first_range>root->second.root_ranges.size()||param.count>root->second.root_ranges.size()-param.first_range)return false;
+                    UINT slot=0;const auto* heap=heap_for_gpu_locked(a.value,&slot);if(!heap)return false;
+                    for(UINT j=0;j<param.count;++j){const auto& range=root->second.root_ranges[param.first_range+j];
+                        if(range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)continue;
+                        if(range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_UAV||range.num_descriptors==UINT_MAX||range.table_offset==UINT_MAX||
+                            range.table_offset>4096||range.num_descriptors>4096-range.table_offset||slot+range.table_offset>heap->count||range.num_descriptors>heap->count-slot-range.table_offset)return false;
+                        for(UINT j2=0;j2<range.num_descriptors;++j2){
+                            std::shared_ptr<const DescriptorDetails> det;
+                            {const SlotShared stripe(heap,uint64_t(slot)+range.table_offset+j2);det=heap->info[slot+range.table_offset+j2].details;}
+                            if(!det)return false;
+                            if(det->kind==NA_DESC_CBV){if(!address(det->cbv.BufferLocation))return false;}
+                            else keep(det->resource);
+                        }
+                    }
+                }
+            }
+        }
+        ++ls->host_restore_serial;
         nheaps = ls->nheaps;
         heaps[0] = ls->heaps[0];
         heaps[1] = ls->heaps[1];
         rs[0] = ls->root_sig[0];
         rs[1] = ls->root_sig[1];
-        args[0] = ls->args[0];
-        args[1] = ls->args[1];
+        for(UINT c=0;c<(graphics_only?1u:2u);++c){if(ls->args[c].size()>64)return false;nargs[c]=UINT(ls->args[c].size());
+            for(UINT p=0;p<nargs[c];++p){const auto& from=ls->args[c][p];auto& to=args[c][p];
+                if(from.consts.size()>64)return false;to.type=from.type;to.value=from.value;to.count=UINT(from.consts.size());
+                if(to.count)std::copy_n(from.consts.data(),to.count,to.consts);
+                // A table bound from a heap the list has since replaced (the game set other
+                // heaps after that bind) is stale: replaying it is invalid (D3D12 708) and the
+                // game cannot draw with it either, so it is left unbound.
+                if(to.type==1){UINT s=0;if(!bound_heap_for_gpu_locked(*ls,to.value,&s))to.type=0;}}}
+        if (ls->raster_tracking) {
+            vp_known = ls->raster_viewports_known; viewport_count = ls->raster_viewport_count;
+            sc_known = ls->raster_scissors_known; scissor_count = ls->raster_scissor_count;
+            topology_known = ls->raster_topology_known; topology = ls->raster_topology;
+            if (vp_known) std::copy_n(ls->raster_viewports, viewport_count, viewports);
+            if (sc_known) std::copy_n(ls->raster_scissors, scissor_count, scissors);
+            if (ls->raster_targets_known) {
+                const auto owner = g_objs.find(canon(l));
+                if (owner != g_objs.end()) raster_storage = owner->second.twins;
+                rt_count = ls->raster_rt_count; has_depth = ls->raster_has_depth;
+            }
+        }
     }
+    if(destination)l=destination;
     if (nheaps) l->SetDescriptorHeaps(nheaps, heaps);
-    for (uint32_t c = 0; c < 2; ++c) {
+    for (uint32_t c = 0; c < (graphics_only?1u:2u); ++c) {
         if (!rs[c]) continue;
         auto* sig = static_cast<ID3D12RootSignature*>(const_cast<void*>(rs[c]));
         if (c) l->SetComputeRootSignature(sig); else l->SetGraphicsRootSignature(sig);
-        for (UINT p = 0; p < args[c].size(); ++p) {
-            const ListState::RootArg& a = args[c][p];
+        for (UINT p = 0; p < nargs[c]; ++p) {
+            const auto& a = args[c][p];
             switch (a.type) {
             case 1: { D3D12_GPU_DESCRIPTOR_HANDLE h{a.value}; if (c) l->SetComputeRootDescriptorTable(p, h); else l->SetGraphicsRootDescriptorTable(p, h); break; }
             case 2: if (c) l->SetComputeRootConstantBufferView(p, a.value); else l->SetGraphicsRootConstantBufferView(p, a.value); break;
             case 3: if (c) l->SetComputeRootShaderResourceView(p, a.value); else l->SetGraphicsRootShaderResourceView(p, a.value); break;
             case 4: if (c) l->SetComputeRootUnorderedAccessView(p, a.value); else l->SetGraphicsRootUnorderedAccessView(p, a.value); break;
-            case 5: if (!a.consts.empty()) { if (c) l->SetComputeRoot32BitConstants(p, static_cast<UINT>(a.consts.size()), a.consts.data(), 0); else l->SetGraphicsRoot32BitConstants(p, static_cast<UINT>(a.consts.size()), a.consts.data(), 0); } break;
+            case 5: if (a.count) { if (c) l->SetComputeRoot32BitConstants(p, a.count, a.consts, 0); else l->SetGraphicsRoot32BitConstants(p, a.count, a.consts, 0); } break;
             default: break;
             }
         }
     }
     if (pso) l->SetPipelineState(pso);
+    if(destination){
+        for(UINT i=0;i<32;++i)if(vertex_mask&(1u<<i))l->IASetVertexBuffers(i,1,&vertices[i]);
+        if(index_known)l->IASetIndexBuffer(index.BufferLocation?&index:nullptr);
+        l->OMSetBlendFactor(blend);l->OMSetStencilRef(stencil);
+        l->SetPredication(predicate,predicate_offset,predicate_op);
+    }
+    if (raster_storage && raster_storage->obj[0] && raster_storage->obj[1]) {
+        const auto rt = static_cast<ID3D12DescriptorHeap*>(raster_storage->obj[0])->GetCPUDescriptorHandleForHeapStart();
+        const auto ds = static_cast<ID3D12DescriptorHeap*>(raster_storage->obj[1])->GetCPUDescriptorHandleForHeapStart();
+        l->OMSetRenderTargets(rt_count, rt_count ? &rt : nullptr, TRUE, has_depth ? &ds : nullptr);
+    }
+    if (vp_known) l->RSSetViewports(viewport_count, viewport_count ? viewports : nullptr);
+    if (sc_known) l->RSSetScissorRects(scissor_count, scissor_count ? scissors : nullptr);
+    if (topology_known) l->IASetPrimitiveTopology(topology);
+    return true;
+}
+bool RestoreBindingState(ID3D12GraphicsCommandList* l,bool compute,bool restore_heaps,uint64_t cbvs,bool targets,bool vp,bool sc,ID3D12RootSignature* expected_root){
+    ID3D12DescriptorHeap* heaps[2]{};UINT heap_count=0;
+    struct Table{UINT param;uint64_t address;};Table tables[2][64]{};UINT table_count[2]{};
+    uint64_t addresses[64]{};D3D12_VIEWPORT viewports[16]{};D3D12_RECT scissors[16]{};
+    UINT viewport_count=0,scissor_count=0,rt_count=0;bool depth=false;
+    std::shared_ptr<Obj::Twins> storage;
+    {std::shared_lock<RegistryLock> lock(g_m);na_object_id id=0;auto* ls=l?list_state_locked(l,&id):nullptr;
+        if(!ls||!ls->recording_observed.load()||!ls->coverage_complete.load())return false;
+        std::lock_guard<std::mutex> bind(ls->bind_m);if(!ls->restorable||ls->in_render_pass)return false;
+        if(expected_root&&ls->root_sig[compute]!=expected_root)cbvs=0;
+        if(restore_heaps){heap_count=ls->nheaps;std::copy_n(ls->heaps,heap_count,heaps);
+            for(UINT c=0;c<2;++c){if(ls->args[c].size()>64)return false;
+                for(UINT p=0;p<ls->args[c].size();++p)if(ls->args[c][p].type==1)tables[c][table_count[c]++]={p,ls->args[c][p].value};}}
+        for(UINT p=0;p<64;++p)if(cbvs&(uint64_t(1)<<p)){
+            if(p>=ls->args[compute].size()||ls->args[compute][p].type!=2)return false;addresses[p]=ls->args[compute][p].value;}
+        if(targets||vp||sc){if(!ls->raster_tracking)return false;
+            if(targets){if(!ls->raster_targets_known)return false;const auto owner=g_objs.find(canon(l));
+                if(owner==g_objs.end()||!owner->second.twins||!owner->second.twins->obj[0]||!owner->second.twins->obj[1])return false;
+                storage=owner->second.twins;rt_count=ls->raster_rt_count;depth=ls->raster_has_depth;}
+            if(vp){if(!ls->raster_viewports_known)return false;viewport_count=ls->raster_viewport_count;std::copy_n(ls->raster_viewports,viewport_count,viewports);}
+            if(sc){if(!ls->raster_scissors_known)return false;scissor_count=ls->raster_scissor_count;std::copy_n(ls->raster_scissors,scissor_count,scissors);}}
+    }
+    if(restore_heaps){l->SetDescriptorHeaps(heap_count,heap_count?heaps:nullptr);
+        for(UINT c=0;c<2;++c)for(UINT i=0;i<table_count[c];++i){const auto& table=tables[c][i];
+            if(c)l->SetComputeRootDescriptorTable(table.param,{table.address});else l->SetGraphicsRootDescriptorTable(table.param,{table.address});}}
+    for(UINT p=0;p<64;++p)if(cbvs&(uint64_t(1)<<p)){
+        if(compute)l->SetComputeRootConstantBufferView(p,addresses[p]);else l->SetGraphicsRootConstantBufferView(p,addresses[p]);}
+    if(targets){if(!storage->obj[0]||!storage->obj[1])return false;
+        const auto rt=static_cast<ID3D12DescriptorHeap*>(storage->obj[0])->GetCPUDescriptorHandleForHeapStart();
+        const auto ds=static_cast<ID3D12DescriptorHeap*>(storage->obj[1])->GetCPUDescriptorHandleForHeapStart();
+        l->OMSetRenderTargets(rt_count,rt_count?&rt:nullptr,TRUE,depth?&ds:nullptr);}
+    if(vp)l->RSSetViewports(viewport_count,viewport_count?viewports:nullptr);
+    if(sc)l->RSSetScissorRects(scissor_count,scissor_count?scissors:nullptr);
     return true;
 }
 bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -4795,7 +8196,7 @@ bool ListClearsTarget(ID3D12CommandList* list, na_object_id target)
 }
 bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -4805,7 +8206,7 @@ bool ListSamplesTexture(ID3D12CommandList* list, na_object_id texture)
 bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object_id depth, uint32_t* sub, uint32_t* depth_sub)
 {
     if (!sub || !depth_sub) return false;
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
@@ -4818,7 +8219,7 @@ bool ListSceneSubresource(ID3D12CommandList* list, na_object_id color, na_object
 }
 uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object_id depth)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return 0;
@@ -4835,7 +8236,7 @@ uint32_t ListTargetsAfter(ID3D12CommandList* list, na_object_id color, na_object
 // array slices) separately; the whole-resource query refuses those.
 StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return StateLookup::Unavailable;
@@ -4856,7 +8257,7 @@ bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, ui
 }
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
 {
-    std::shared_lock<std::shared_mutex> rl(g_m);
+    std::shared_lock<RegistryLock> rl(g_m);
     na_object_id lid = 0;
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
@@ -4871,16 +8272,16 @@ bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
     }
     return false;
 }
-uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n)
+uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_t n, BufferMapPolicy policy)
 {
     if (!res || !src || !n) return 0;
     ID3D12Resource* rewrite = nullptr;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto it = g_buffers.find(res);
         if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width || it->second.width - offset < n) return 0;
         if (it->second.cpu) return guarded_copy(it->second.cpu + offset, src, n) ? n : 0;
-        if (!it->second.ever_mapped) return 0;
+        if (!it->second.ever_mapped && policy == BufferMapPolicy::Observed) return 0;
         auto key = g_res_keys.find(res);
         if (key != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&rewrite));
     }
@@ -4890,26 +8291,26 @@ uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_
     t_host_work = true;
     const D3D12_RANGE none{0, 0};
     void* p = nullptr;
-    if (SUCCEEDED(rewrite->Map(0, &none, &p)) && p) {
-        ok = guarded_copy(static_cast<uint8_t*>(p) + offset, src, n);
-        const D3D12_RANGE written{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)};
+    if (SUCCEEDED(rewrite->Map(0, &none, &p))) {
+        ok = p && guarded_copy(static_cast<uint8_t*>(p) + offset, src, n);
+        const D3D12_RANGE written = p ? D3D12_RANGE{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)} : none;
         rewrite->Unmap(0, &written);
     }
     t_host_work = was_host;
     rewrite->Release();
     return ok ? n : 0;
 }
-uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
+uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n, BufferMapPolicy policy)
 {
     if (!res || !dst || !n) return 0;
     ID3D12Resource* reread = nullptr;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto it = g_buffers.find(res);
         if (it == g_buffers.end() || !it->second.cpu_visible || offset >= it->second.width) return 0;
         n = static_cast<uint32_t>(std::min<uint64_t>(n, it->second.width - offset));
         if (it->second.cpu) return guarded_copy(dst, it->second.cpu + offset, n) ? n : 0;
-        if (!it->second.ever_mapped) return 0;
+        if (!it->second.ever_mapped && policy == BufferMapPolicy::Observed) return 0;
         auto key = g_res_keys.find(res);
         if (key != g_res_keys.end()) static_cast<IUnknown*>(const_cast<void*>(key->second))->QueryInterface(IID_PPV_ARGS(&reread));
     }
@@ -4919,14 +8320,19 @@ uint32_t ReadBuffer(na_object_id res, uint64_t offset, void* dst, uint32_t n)
     t_host_work = true;
     const D3D12_RANGE rr{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + n)};
     void* p = nullptr;
-    if (SUCCEEDED(reread->Map(0, &rr, &p)) && p) {
-        ok = guarded_copy(dst, static_cast<const uint8_t*>(p) + offset, n);
+    if (SUCCEEDED(reread->Map(0, &rr, &p))) {
+        ok = p && guarded_copy(dst, static_cast<const uint8_t*>(p) + offset, n);
         const D3D12_RANGE none{0, 0};
         reread->Unmap(0, &none);
     }
     t_host_work = was_host;
     reread->Release();
     return ok ? n : 0;
+}
+bool KnownSubStateOnQueueNow(ID3D12CommandQueue* queue, na_object_id id, uint32_t sub, uint32_t* state)
+{
+    const auto qid=queue?lookup(queue):0;
+    return qid && state && id && known_state(id,sub,qid,0,state);
 }
 bool KnownSubStateNow(na_object_id id, uint32_t sub, uint32_t* state)
 {
@@ -4946,7 +8352,7 @@ void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t su
     uint32_t kind = NA_UNKNOWN_U32;
     bool covered = false, complete = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         const auto key = g_res_keys.find(id);
         if (key != g_res_keys.end()) {
             const auto obj = g_objs.find(key->second);
@@ -4964,12 +8370,14 @@ void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t su
     std::lock_guard<std::mutex> lock(g_known_m);
     const auto k = g_known.find(id);
     uint32_t value = kStatePending;
+    const char* why = kResetNames[kResetNone];
     if (k != g_known.end()) {
         const auto s = k->second.subs.find(sub);
         value = s != k->second.subs.end() ? s->second : k->second.has_all ? k->second.all : kStatePending;
+        if (k->second.reset_why < sizeof kResetNames / sizeof kResetNames[0]) why = kResetNames[k->second.reset_why];
     }
-    std::snprintf(text, capacity, "kind=%u list_covered=%u list_complete=%u registered=%u state=0x%x marks=%u unknown_submissions=%u disabled=%u unhooked_queues=%llu",
-                  kind, covered ? 1u : 0u, complete ? 1u : 0u, k != g_known.end() ? 1u : 0u, value,
+    std::snprintf(text, capacity, "kind=%u list_covered=%u list_complete=%u registered=%u state=0x%x last_unknown=%s marks=%u unknown_submissions=%u disabled=%u unhooked_queues=%llu",
+                  kind, covered ? 1u : 0u, complete ? 1u : 0u, k != g_known.end() ? 1u : 0u, value, why,
                   k != g_known.end() ? k->second.in_flight : 0u, g_unknown_inflight,
                   g_known_disabled.load() ? 1u : 0u, static_cast<unsigned long long>(g_unhooked_queues.load()));
 }
@@ -5004,33 +8412,273 @@ bool KnownStateInCurrentSubmission(na_object_id id, uint32_t* state)
     *state = v;
     return true;
 }
+namespace {
+// ---- Live sampler variants: the background worker. A chosen variant that some objects
+// lack is built here (root signatures first, then the pipelines on them), outside g_m,
+// and published per object; recordings switch to it (g_var_live, latched at Reset) only
+// once every object that can have it has it, so a frame never mixes old and new.
+struct FillItem {
+    const void* key = nullptr;
+    na_object_id id = 0;
+    std::shared_ptr<const VariantRecipe> recipe;
+    std::shared_ptr<Obj::Twins> base;
+};
+// One pass for variant (level, af). Returns how many objects lacked it, or SIZE_MAX when
+// the choice changed meanwhile (the caller starts over with the new one).
+// Background pool for pipeline compiles (Cort 2026-11-06: use the Taskflow workers). Set by the
+// host after it starts na::background; unset (tests, early boot) = everything on this thread.
+std::atomic<BackgroundSubmit> g_bg_submit{nullptr};
+void publish_variant(const FillItem& it, int af, std::shared_ptr<Obj::Twins> built)
+{
+    if (built) {
+        std::unique_lock<RegistryLock> lock(g_m);
+        const auto f = g_objs.find(it.key);
+        if (f != g_objs.end() && f->second.id == it.id && f->second.af_sets[af] == it.base) f->second.af_sets[af].swap(built);
+    }
+    // `built` now holds the replaced set (or an unused new one): released here, outside g_m
+    built.reset();
+    g_var_done.fetch_add(1, std::memory_order_relaxed);
+}
+void fill_pso_item(const FillItem& it, int level, int af)
+{
+    std::shared_ptr<Obj::Twins> rs_set;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        const auto f = g_objs.find(it.recipe->rs_key);
+        if (f != g_objs.end() && f->second.id == it.recipe->rs_id) rs_set = f->second.af_sets[af];
+    }
+    if (!rs_set || !rs_set->built[level]) { g_var_done.fetch_add(1, std::memory_order_relaxed); return; } // next pass
+    const VariantRecipe& r = *it.recipe;
+    // Static root variants are cheap and may already cover several levels.
+    // Compile only the requested PSO level before making this choice live.
+    publish_variant(it, af, build_pso_set([&r](ID3D12RootSignature* trs) { return r.make(trs); }, *rs_set, it.base.get(), 1u << level));
+}
+// Pipelines of one pass, shared out item by item between this thread and up to two pool jobs
+// (D3D12 pipeline creation is free-threaded). Owned by a shared_ptr so a job that starts late,
+// or one still running when this thread gives up at process exit, never touches a dead frame.
+struct PsoBatch {
+    std::vector<FillItem> items;
+    std::atomic<size_t> next{0};
+    std::atomic<bool> stopped{false};
+    std::mutex m;
+    std::condition_variable cv;
+    int running = 0;
+    int level = 0, af = 0;
+    uint32_t v = 0;
+    void run()
+    {
+        for (;;) {
+            if (g_var_want.load(std::memory_order_relaxed) != v || g_process_exiting.load(std::memory_order_acquire)) { stopped = true; return; }
+            const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= items.size()) return;
+            fill_pso_item(items[i], level, af);
+        }
+    }
+};
+size_t fill_pass(int level, int af, uint32_t v)
+{
+    std::vector<FillItem> rs_items, pso_items;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        for (const auto& kv : g_objs) {
+            const Obj& o = kv.second;
+            if (o.variant_kind != 1 || !o.recipe) continue;
+            const auto& set = o.af_sets[af];
+            if (set && set->built[level]) continue;
+            auto& to = o.recipe->kind == VariantRecipe::RootSignature ? rs_items : pso_items;
+            to.push_back({kv.first, o.id, o.recipe, set});
+        }
+    }
+    const size_t found = rs_items.size() + pso_items.size();
+    g_var_total.store(found, std::memory_order_relaxed);
+    g_var_done.store(0, std::memory_order_relaxed);
+    for (const auto& it : rs_items) { // root signatures: cheap, kept in order on this thread
+        if (g_var_want.load(std::memory_order_relaxed) != v) return SIZE_MAX;
+        publish_variant(it, af, build_rs_set(*it.recipe, af, 1u << level, it.base.get()));
+    }
+    if (pso_items.empty()) return found;
+    auto batch = std::make_shared<PsoBatch>();
+    batch->items = std::move(pso_items);
+    batch->level = level; batch->af = af; batch->v = v;
+    if (const BackgroundSubmit submit = g_bg_submit.load(std::memory_order_acquire); submit && batch->items.size() >= 16) {
+        for (int k = 0; k < 2; ++k) {
+            { std::lock_guard<std::mutex> l(batch->m); ++batch->running; }
+            const bool queued = submit([batch] {
+                batch->run();
+                { std::lock_guard<std::mutex> l(batch->m); --batch->running; }
+                batch->cv.notify_all();
+            });
+            if (!queued) { std::lock_guard<std::mutex> l(batch->m); --batch->running; }
+        }
+    }
+    batch->run(); // this thread takes items too
+    {
+        std::unique_lock<std::mutex> l(batch->m);
+        while (batch->running > 0) {
+            batch->cv.wait_for(l, std::chrono::seconds(1));
+            if (g_process_exiting.load(std::memory_order_acquire)) return SIZE_MAX;
+        }
+    }
+    g_mip_parallel_passes.fetch_add(batch->items.size() >= 16 && g_bg_submit.load(std::memory_order_relaxed) ? 1 : 0, std::memory_order_relaxed);
+    return batch->stopped.load() ? SIZE_MAX : found;
+}
+void variant_worker()
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); // compiles yield to the game's threads
+    for (;;) {
+        uint32_t v = 0;
+        bool refill = false;
+        {
+            std::unique_lock<std::mutex> lk(g_var_m);
+            while (!g_var_cv.wait_for(lk, std::chrono::seconds(1), [] {
+                return g_var_want.load(std::memory_order_relaxed) != g_var_live.load(std::memory_order_relaxed) ||
+                       g_var_missing.load(std::memory_order_relaxed);
+            })) {
+                if (g_process_exiting.load(std::memory_order_acquire)) return;
+            }
+            if (g_process_exiting.load(std::memory_order_acquire)) return;
+            v = g_var_want.load(std::memory_order_relaxed);
+            refill = v == g_var_live.load(std::memory_order_relaxed);
+            g_var_missing.store(false, std::memory_order_relaxed);
+        }
+        bool aborted = false;
+        if (v && g_mip_live_enabled.load(std::memory_order_relaxed)) {
+            for (int pass = 0; pass < 6; ++pass) { // objects created during a pass are caught by the next
+                const size_t found = fill_pass(var_level(v), var_af(v), v);
+                if (found == SIZE_MAX) { aborted = true; break; }
+                if (!found) break;
+            }
+        }
+        if (aborted) continue;
+        if (refill) {
+            // Idle: warm the other selectable levels (see g_mip_prewarm) so a switch is immediate.
+            // fill_pass gives up as soon as a new choice arrives; the loop above then serves it.
+            if (g_mip_live_enabled.load(std::memory_order_relaxed) && g_mip_prewarm.load(std::memory_order_relaxed)) {
+                const int af = var_af(v);
+                const uint32_t levels = (0x7u | g_mip_level_mask.load(std::memory_order_relaxed)) & ~(af == 0 ? 1u : 0u);
+                for (int level = 0; level < kMipCount; ++level) {
+                    if (!(levels >> level & 1u) || level == var_level(v)) continue;
+                    bool built_any = false, stop = false;
+                    for (int pass = 0; pass < 6; ++pass) {
+                        const size_t found = fill_pass(level, af, v);
+                        if (found == SIZE_MAX || g_process_exiting.load(std::memory_order_acquire)) { stop = true; break; }
+                        if (!found) break;
+                        built_any = true;
+                    }
+                    if (stop) break;
+                    if (built_any) g_mip_warmed.fetch_add(1, std::memory_order_relaxed);
+                }
+                // the in-use level's own counters for the menu/status line
+                g_var_total.store(0, std::memory_order_relaxed);
+                g_var_done.store(0, std::memory_order_relaxed);
+            }
+            // Rate-limit refill notifications, but let a user's new choice preempt immediately.
+            std::unique_lock<std::mutex> lk(g_var_m);
+            g_var_cv.wait_for(lk, std::chrono::seconds(1), [v] {
+                return g_var_want.load(std::memory_order_relaxed) != v || g_process_exiting.load(std::memory_order_acquire);
+            });
+            continue;
+        } // never spin on stragglers
+        {
+            std::lock_guard<std::mutex> lk(g_var_m);
+            if (g_var_want.load(std::memory_order_relaxed) == v) {
+                if (v && g_mip_live_enabled.load(std::memory_order_relaxed)) g_mip_switched.store(true, std::memory_order_release);
+                const uint32_t was_live = g_var_live.load(std::memory_order_relaxed);
+                g_var_live.store(v, std::memory_order_release);
+                if (was_live != v)
+                    na::eventlog::Emit("mip_af", "live bias=%.3f af=%u was{bias=%.3f af=%u} took_ms=%llu objects=%llu/%llu static_changed=%llu",
+                                       kMipLevels[var_level(v)], kAfLevels[var_af(v)], kMipLevels[var_level(was_live)], kAfLevels[var_af(was_live)],
+                                       (unsigned long long)(GetTickCount64() - g_var_request_tick.load(std::memory_order_relaxed)),
+                                       (unsigned long long)g_var_done.load(std::memory_order_relaxed), (unsigned long long)g_var_total.load(std::memory_order_relaxed),
+                                       (unsigned long long)g_var_static_changed[var_level(v) * 4 + var_af(v)].load(std::memory_order_relaxed));
+                // Activation is itself an idle-work request. No subsequent game draw or
+                // missing-object lookup is required to start warming the other choices.
+                if (g_mip_prewarm.load(std::memory_order_relaxed)) g_var_missing.store(true, std::memory_order_relaxed);
+            }
+        }
+        g_var_cv.notify_all();
+    }
+}
+template <typename F>
+void request_variant(F&& change)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_var_m);
+        const uint32_t w = g_var_want.load(std::memory_order_relaxed);
+        g_var_want.store(change(w), std::memory_order_relaxed);
+        g_var_request_tick.store(GetTickCount64(), std::memory_order_relaxed);
+        if (!g_var_started) {
+            g_var_started = true;
+            g_var_missing.store(true, std::memory_order_relaxed); // original/Off can warm alternatives too
+            std::thread(variant_worker).detach();
+        }
+    }
+    g_var_cv.notify_all();
+}
+} // namespace
 void SetSamplerMipBias(float bias)
 {
-    // Startup value: the game's own objects are built at the nearest menu level.
     const int level = nearest_mip_level(bias);
-    g_mip_bias.store(kMipLevels[level], std::memory_order_relaxed);
-    g_mip_game_level.store(level, std::memory_order_relaxed);
-    g_mip_live_level.store(level, std::memory_order_relaxed);
+    {
+        static na::eventlog::Edge e;
+        int64_t was = 0;
+        if (e.Changed(level, &was))
+            na::eventlog::Emit("mip", "requested bias=%.3f level=%d asked=%.3f was_level=%lld", kMipLevels[level], level, bias, (long long)was);
+    }
+    g_mip_bias.store(kMipLevels[level], std::memory_order_relaxed); // sampler descriptors created from now on
+    request_variant([level](uint32_t w) { return var_pack(level, var_af(w)); });
 }
-float SamplerMipBias() { return kMipLevels[g_mip_live_level.load(std::memory_order_relaxed)]; }
-void SetSamplerMipBiasLive(float bias)
-{
-    const int level = nearest_mip_level(bias);
-    g_mip_live_level.store(level, std::memory_order_relaxed);
-    if (level != g_mip_game_level.load(std::memory_order_relaxed)) g_mip_switched.store(true, std::memory_order_release);
-}
+float SamplerMipBias() { return kMipLevels[var_level(g_var_want.load(std::memory_order_relaxed))]; }
+uint32_t SamplerAnisotropyWanted() { return kAfLevels[var_af(g_var_want.load(std::memory_order_relaxed))]; }
+void SetSamplerMipBiasLive(float bias) { SetSamplerMipBias(bias); }
 void SetSamplerMipBiasLiveEnabled(bool on) { g_mip_live_enabled.store(on, std::memory_order_relaxed); }
+void SetSamplerMipPrewarm(bool on) {
+    if (g_mip_prewarm.exchange(on, std::memory_order_relaxed) || !on) return;
+    g_var_missing.store(true, std::memory_order_relaxed);
+    g_var_cv.notify_one();
+}
+void SetBackgroundSubmitter(BackgroundSubmit submit) { g_bg_submit.store(submit, std::memory_order_release); }
+void SetSamplerMipLevelsWanted(const float* biases, int n)
+{
+    uint32_t mask = 0;
+    for (int i = 0; i < n; ++i) mask |= 1u << nearest_mip_level(biases[i]);
+    g_mip_level_mask.store(mask, std::memory_order_relaxed);
+}
+bool WaitSamplerVariant(uint32_t timeout_ms)
+{
+    std::unique_lock<std::mutex> lk(g_var_m);
+    return g_var_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [] {
+        return g_var_want.load(std::memory_order_relaxed) == g_var_live.load(std::memory_order_relaxed);
+    });
+}
 MipLiveStats GetMipLiveStats()
 {
     MipLiveStats m;
+    const uint32_t want = g_var_want.load(std::memory_order_relaxed), live = g_var_live.load(std::memory_order_relaxed);
     m.enabled = g_mip_live_enabled.load(std::memory_order_relaxed);
-    m.game_bias = kMipLevels[g_mip_game_level.load(std::memory_order_relaxed)];
-    m.live_bias = kMipLevels[g_mip_live_level.load(std::memory_order_relaxed)];
+    m.game_bias = 0.0f;
+    m.live_bias = kMipLevels[var_level(live)];
+    m.visible_sampler_uploads = g_visible_sampler_uploads.load(std::memory_order_acquire);
+    m.visible_sampler_bias = g_visible_sampler_bias.load(std::memory_order_relaxed);
+    m.want_bias = kMipLevels[var_level(want)];
+    m.want_aniso = kAfLevels[var_af(want)];
+    m.live_aniso = kAfLevels[var_af(live)];
+    m.preparing = want != live;
+    m.prepare_done = g_var_done.load(std::memory_order_relaxed);
+    m.prepare_total = g_var_total.load(std::memory_order_relaxed);
+    m.live_static_changed = g_var_static_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed);
     m.twin_root_signatures = g_mip_twin_rs.load(std::memory_order_relaxed);
     m.twin_pipelines = g_mip_twin_pso.load(std::memory_order_relaxed);
     m.untwinned_pipelines = g_mip_untwinned.load(std::memory_order_relaxed);
     m.fallbacks = g_mip_fallbacks.load(std::memory_order_relaxed);
+    m.bound_pso_twin = g_mip_bound_pso_twin.load(std::memory_order_relaxed);
+    m.bound_pso_game = g_mip_bound_pso_game.load(std::memory_order_relaxed);
+    m.bound_rs_twin = g_mip_bound_rs_twin.load(std::memory_order_relaxed);
+    m.bound_rs_game = g_mip_bound_rs_game.load(std::memory_order_relaxed);
     m.twin_failures = g_mip_twin_fail.load(std::memory_order_relaxed);
+    m.shared_skips = g_mip_shared_skips.load(std::memory_order_relaxed);
+    m.warmed_levels = g_mip_warmed.load(std::memory_order_relaxed);
+    m.parallel_passes = g_mip_parallel_passes.load(std::memory_order_relaxed);
     return m;
 }
 void NativeMipBiases(NativeBiasStats* s)
@@ -5040,16 +8688,345 @@ void NativeMipBiases(NativeBiasStats* s)
     s->negative = g_native_neg; s->zero = g_native_zero; s->positive = g_native_pos;
     s->min = g_native_min; s->max = g_native_max;
 }
+std::string FormatSamplerTable(uint64_t* total)
+{
+    if (total) *total = g_sampler_table_total.load(std::memory_order_relaxed);
+    std::vector<SamplerRow> rows;
+    {
+        std::lock_guard<std::mutex> lk(g_sampler_table_m);
+        rows = g_sampler_table;
+    }
+    std::sort(rows.begin(), rows.end(), [](const SamplerRow& a, const SamplerRow& b) { return a.count > b.count; });
+    static const char* kinds[] = {"heap", "heap2", "static"};
+    std::string out;
+    char line[320];
+    snprintf(line, sizeof line, "sampler_table distinct=%zu created=%llu overflow=%llu (kind filter aniso address bias lod cmp count)\r\n", rows.size(),
+             (unsigned long long)g_sampler_table_total.load(std::memory_order_relaxed),
+             (unsigned long long)g_sampler_table_overflow.load(std::memory_order_relaxed));
+    out += line;
+    for (const SamplerRow& r : rows) {
+        snprintf(line, sizeof line, "sampler_row kind=%s filter=0x%X anisotropic=%u max_aniso=%u address=%u/%u/%u bias=%.3f lod=%.2f..%.2f cmp=%u count=%llu\r\n",
+                 kinds[r.kind < 3 ? r.kind : 0], r.filter, D3D12_DECODE_IS_ANISOTROPIC_FILTER(D3D12_FILTER(r.filter)) ? 1u : 0u, r.aniso,
+                 r.u, r.v, r.w, r.bias, r.min_lod, r.max_lod, r.cmp, (unsigned long long)r.count);
+        out += line;
+    }
+    return out;
+}
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
 {
     if (samplers) *samplers = g_biased_samplers.load(std::memory_order_relaxed);
-    if (static_samplers) *static_samplers = g_biased_static.load(std::memory_order_relaxed);
+    // Static samplers: changed in the game's objects (live switching off), or in the twins
+    // of the variant in use (live switching on: the game's own objects are never changed).
+    const uint32_t live = g_var_live.load(std::memory_order_relaxed);
+    if (static_samplers)
+        *static_samplers = g_biased_static.load(std::memory_order_relaxed) +
+                           (var_level(live) ? g_var_static_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
+}
+void SetSamplerAnisotropy(uint32_t level)
+{
+    const int af = af_index(level);
+    {
+        static na::eventlog::Edge e;
+        int64_t was = 0;
+        if (e.Changed(af, &was))
+            na::eventlog::Emit("af", "requested level=%u asked=%u was_index=%lld", kAfLevels[af], level, (long long)was);
+    }
+    g_aniso_level.store(kAfLevels[af], std::memory_order_relaxed); // sampler descriptors created from now on
+    request_variant([af](uint32_t w) { return var_pack(var_level(w), af); });
+}
+void SetSamplerAnisotropyPrebuild(uint32_t level)
+{
+    g_pre_af.store(af_index(level), std::memory_order_relaxed);
+    // Descriptor-heap samplers are created once, at load, long before the saved settings are
+    // activated: give them the saved level from the start (as the static twins get it), or
+    // a game whose materials use heap samplers never gets the filtering at all.
+    g_aniso_level.store(kAfLevels[af_index(level)], std::memory_order_relaxed);
+}
+AnisoStats GetAnisoStats()
+{
+    AnisoStats a;
+    const uint32_t live = g_var_live.load(std::memory_order_relaxed);
+    a.level = g_mip_live_enabled.load(std::memory_order_relaxed) ? kAfLevels[var_af(live)] : g_aniso_level.load(std::memory_order_relaxed);
+    a.samplers = g_aniso_samplers.load(std::memory_order_relaxed);
+    a.static_samplers = g_aniso_static.load(std::memory_order_relaxed) +
+                        (var_af(live) ? g_var_aniso_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
+    a.already = g_aniso_already.load(std::memory_order_relaxed);
+    {std::lock_guard<std::mutex> lock(g_native_m);a.native_surface=g_native_surface;a.native_16=g_native_af16;}
+    a.sampler_calls = g_sampler_calls.load(std::memory_order_relaxed);
+    a.sampler2_calls = g_sampler2_calls.load(std::memory_order_relaxed);
+    return a;
 }
 HostWorkScope::HostWorkScope() : prev_(t_host_work) { t_host_work = true; }
 HostWorkScope::~HostWorkScope() { t_host_work = prev_; }
+void SetOperationSnapshots(bool enabled) { g_operation_snapshots.store(enabled); }
+namespace {
+bool shader_uses(const Obj& pipeline,const na_root_param& param,const na_root_range& range,uint32_t index){
+    if(!pipeline.reflection_complete)return true;
+    for(const auto& used:pipeline.shader_resources){
+        if(param.visibility!=D3D12_SHADER_VISIBILITY_ALL&&used.visibility!=D3D12_SHADER_VISIBILITY_ALL&&param.visibility!=used.visibility)continue;
+        if(used.type==range.range_type&&used.space==range.register_space&&index>=used.first&&
+            (used.count==UINT_MAX||index-used.first<used.count))return true;}
+    return false;
+}
+}
+bool NativeDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,OperationDescriptor& out) {
+    out={};DescriptorDetails details;uint64_t version=0;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);uint32_t slot=0;
+        const auto* heap=heap_for_cpu_locked(handle.ptr,&slot);if(!heap)return false;
+        const SlotShared stripe(heap,slot);
+        if(!heap->info[slot].details)return false;
+        details=*heap->info[slot].details;version=heap->versions[slot];
+    }
+    OperationDescriptor next;next.view=details;next.version=version;
+    if(details.resource){next.resource.Attach(AcquireResource(details.resource));if(!next.resource)return false;}
+    if(details.counter){next.counter.Attach(AcquireResource(details.counter));if(!next.counter)return false;}
+    out=std::move(next);return true;
+}
+uint32_t RefreshNativeOperation(NativeOperation& op)
+{
+    struct Fresh { size_t at; DescriptorDetails view; uint64_t version; bool has_view; };
+    std::vector<Fresh> fresh;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        for (const auto& t : op.tables) {
+            if (!t.heap) continue;
+            const DescHeap* heap = nullptr;
+            for (const auto& h : g_heaps) if (h->id == t.heap) { heap = h.get(); break; }
+            if (!heap || uint64_t(t.slot) + t.count > heap->count || size_t(t.first) + t.count > op.descriptors.size()) continue;
+            SlotShared stripe;
+            for (uint32_t i = 0; i < t.count; ++i) {
+                stripe.lock(heap, uint64_t(t.slot) + i);
+                const uint64_t version = heap->versions[t.slot + i];
+                auto& d = op.descriptors[t.first + i];
+                if (version == d.version) continue;
+                const auto& info = heap->info[t.slot + i];
+                fresh.push_back({size_t(t.first) + i, info.details ? *info.details : DescriptorDetails{}, version, info.details != nullptr});
+            }
+        }
+    }
+    uint32_t changed = 0;
+    for (auto& f : fresh) {
+        auto& d = op.descriptors[f.at];
+        OperationDescriptor next; next.used = d.used; next.version = f.version;
+        if (f.has_view) next.view = f.view;
+        if (next.view.resource) next.resource.Attach(AcquireResource(next.view.resource));
+        if (next.view.counter) next.counter.Attach(AcquireResource(next.view.counter));
+        d = std::move(next);
+        ++changed;
+    }
+    return changed;
+}
+bool ListNativeOperationKey(ID3D12GraphicsCommandList* list,bool compute,const uint64_t* members,size_t count,NativeOperationKey& out){
+    out={};OperationKey key;
+    std::shared_lock<RegistryLock> lock(g_m);
+    auto* ls=list?list_state_locked(list,&out.list):nullptr;
+    if(!ls||!ls->recording_observed.load()||!ls->coverage_complete.load()||!ls->generation_known.load())return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if(!ls->restorable||ls->in_render_pass)return false;
+    out.recording=ls->generation.load()+1;
+    auto& cached=ls->operation_key[compute];bool rebase=false;
+    const uint64_t revision_now=g_operation_revision.load(); // before reading: a concurrent copy then invalidates
+    if(cached.valid&&cached.state_revision==ls->key_revision[compute]&&cached.registry_revision==revision_now&&
+       count==cached.members.size()&&std::equal(cached.members.begin(),cached.members.end(),members)){
+        key=cached.prefix;rebase=cached.rebase;
+    }else{
+    cached.valid=false;cached.dimension_cbvs=0;
+    const auto rs=g_objs.find(canon(ls->root_sig[compute])),pipeline=g_objs.find(canon(ls->pso));
+    if(rs==g_objs.end()||pipeline==g_objs.end()||rs->second.root_params.size()>64)return false;
+    OperationKey::add(key.state,pipeline->second.id);OperationKey::add(key.state,compute);
+    const auto root=reinterpret_cast<uintptr_t>(ls->root_sig[compute]);OperationKey::add(key.state,root);
+    const auto& args=ls->args[compute];uint32_t descriptor_count=0,table_first[64]{};
+    const auto member=[&](uint64_t id){return count&&std::binary_search(members,members+count,id);};
+    for(uint32_t param=0;param<rs->second.root_params.size();++param){const auto& p=rs->second.root_params[param];
+        if(p.param_type!=NA_ROOT_TABLE||param>=args.size()||args[param].type!=1)continue;
+        if(p.first_range>rs->second.root_ranges.size()||p.count>rs->second.root_ranges.size()-p.first_range)return false;
+        uint32_t span=0;bool sampler=false;
+        for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+            if(range.num_descriptors==UINT_MAX||range.table_offset==UINT_MAX||range.num_descriptors>4096||range.table_offset>4096-range.num_descriptors)return false;
+            sampler|=range.range_type==D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;span=std::max(span,range.table_offset+range.num_descriptors);}
+        if(sampler)continue;
+        uint32_t slot=0;const auto* heap=bound_heap_for_gpu_locked(*ls,args[param].value,&slot);
+        if(!heap||span>heap->count-slot||span>4096-descriptor_count)return false;
+        table_first[param]=descriptor_count;
+        for(uint32_t i=0;i<span;++i){bool used=!pipeline->second.reflection_complete;
+            if(!used)for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+                if(i>=range.table_offset&&i-range.table_offset<range.num_descriptors)used|=shader_uses(pipeline->second,p,range,range.base_register+i-range.table_offset);}
+            std::shared_ptr<const DescriptorDetails> details;
+            {const SlotShared stripe(heap,uint64_t(slot)+i);details=heap->info[slot+i].details;}
+            if(used&&!details)return false;
+            if(details){key.descriptor(*details,used);rebase|=used&&(member(details->resource)||member(details->counter));}
+            else key.descriptor({},false);
+        }
+        descriptor_count+=span;
+    }
+    // Hash only named, used dimension bindings. Per-object/material CBVs and
+    // native table addresses are not copied or retained by passthrough plans.
+    for(const auto& field:pipeline->second.dimensions)for(uint32_t param=0;param<rs->second.root_params.size();++param){
+        const auto& p=rs->second.root_params[param];uint32_t descriptor=UINT_MAX;uint64_t address=0;
+        if(p.visibility!=D3D12_SHADER_VISIBILITY_ALL&&field.visibility!=D3D12_SHADER_VISIBILITY_ALL&&p.visibility!=field.visibility)continue;
+        if(p.param_type==NA_ROOT_CBV&&p.shader_register==field.shader_register&&p.register_space==field.space)cached.dimension_cbvs|=uint64_t(1)<<param;
+        if(param>=args.size())continue;
+        if(p.param_type==NA_ROOT_CBV&&p.shader_register==field.shader_register&&p.register_space==field.space){
+            if(args[param].type==2)address=args[param].value;}
+        else if(p.param_type==NA_ROOT_TABLE&&args[param].type==1){
+            uint32_t slot=0;const auto* heap=bound_heap_for_gpu_locked(*ls,args[param].value,&slot);if(!heap)return false;
+            for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+                if(range.range_type!=D3D12_DESCRIPTOR_RANGE_TYPE_CBV||range.register_space!=field.space||field.shader_register<range.base_register||field.shader_register-range.base_register>=range.num_descriptors)continue;
+                const auto offset=range.table_offset+field.shader_register-range.base_register;
+                std::shared_ptr<const DescriptorDetails> details;
+                {const SlotShared stripe(heap,uint64_t(slot)+offset);details=heap->info[slot+offset].details;}
+                if(!details)return false;address=details->cbv.BufferLocation;descriptor=table_first[param]+offset;}
+        }
+        uint64_t resource=0,offset=0;if(address&&resolve_va_locked(address,&resource,&offset)){key.constant(param,descriptor,resource,offset,field);rebase|=descriptor!=UINT_MAX;}
+    }
+    cached.prefix=key;cached.rebase=rebase;cached.state_revision=ls->key_revision[compute];cached.registry_revision=revision_now;
+    cached.members.clear();if(count)cached.members.assign(members,members+count);cached.valid=true;
+    }
+    if(!compute){if(!ls->raster_tracking||!ls->raster_targets_known||!ls->raster_viewports_known||!ls->raster_scissors_known)return false;
+        for(const auto& rt:ls->native_colors){if(!rt)return false;OperationKey::add(key.state,rt->resource);OperationKey::add(key.state,rt->rtv);}
+        const DescriptorDetails empty{};const auto& depth=ls->native_depth?*ls->native_depth:empty;
+        if(!ls->native_depth&&ls->raster_has_depth)return false;
+        OperationKey::add(key.state,depth.resource);OperationKey::add(key.state,depth.dsv);
+        for(UINT i=0;i<ls->raster_viewport_count;++i)OperationKey::add(key.state,ls->raster_viewports[i]);
+        for(UINT i=0;i<ls->raster_scissor_count;++i)OperationKey::add(key.state,ls->raster_scissors[i]);}
+    out.key=key.finish(rebase);return true;
+}
+bool ListNativeOperation(ID3D12GraphicsCommandList* list, bool compute, NativeOperation& out,const char** reason,bool read_only)
+{
+    out = {};
+    if(reason)*reason=nullptr;
+    const auto fail=[&](const char* why){if(reason)*reason=why;return false;};
+    NativeOperation next; next.compute = compute;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        auto* ls = list ? list_state_locked(list, &next.list) : nullptr;
+        if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load() || !ls->generation_known.load()) return fail("Scene recording metadata is incomplete.");
+        std::lock_guard<std::mutex> bl(ls->bind_m);
+        if (!ls->restorable || (ls->in_render_pass && !read_only)) return fail("Scene state cannot be restored here (including an active render pass).");
+        next.recording = ls->generation.load() + 1; // same public identity as ListRecording
+        auto rs = g_objs.find(canon(ls->root_sig[compute]));
+        if (rs == g_objs.end() || !ls->pso || rs->second.root_params.size() > 64) return fail("Scene root signature or pipeline bindings are unavailable.");
+        next.root = static_cast<ID3D12RootSignature*>(const_cast<void*>(ls->root_sig[compute]));
+        next.pipeline = ls->pso;
+        const auto pipeline = g_objs.find(canon(ls->pso));
+        if (pipeline != g_objs.end()) next.pipeline_id = pipeline->second.id;
+        next.reflection_complete=pipeline!=g_objs.end()&&pipeline->second.reflection_complete;
+        next.heap_indexing=pipeline!=g_objs.end()&&(pipeline->second.shader_rejection&ShaderDirectHeap)!=0;
+        const auto& args = ls->args[compute];
+        for (uint32_t param = 0; param < rs->second.root_params.size(); ++param) {
+            const auto& p = rs->second.root_params[param];
+            if (p.param_type != NA_ROOT_TABLE || param >= args.size() || args[param].type != 1) continue;
+            if (p.first_range > rs->second.root_ranges.size() || p.count > rs->second.root_ranges.size() - p.first_range) return fail("Scene descriptor table layout is incomplete.");
+            uint32_t span = 0; bool sampler = false;
+            for (uint32_t r = 0; r < p.count; ++r) {
+                const auto& range = rs->second.root_ranges[p.first_range + r];
+                uint32_t count = range.num_descriptors;
+                // Read-only (trace): an unbounded range is bounded by the registers
+                // the reflected shader declares in it. A runtime-indexed array
+                // (unbounded or zero BindCount) stays unresolvable.
+                if (count == UINT_MAX && read_only && next.reflection_complete && pipeline != g_objs.end()) {
+                    count = 0;
+                    for (const auto& used : pipeline->second.shader_resources) {
+                        if (p.visibility!=D3D12_SHADER_VISIBILITY_ALL&&used.visibility!=D3D12_SHADER_VISIBILITY_ALL&&p.visibility!=used.visibility) continue;
+                        if (used.type != range.range_type || used.space != range.register_space || used.first < range.base_register) continue;
+                        if (used.count == 0 || used.count == UINT_MAX) return fail("Scene samples a runtime-indexed unbounded descriptor array.");
+                        if (uint64_t(used.first - range.base_register) + used.count > 4096) return fail("Scene uses an unbounded or oversized descriptor table.");
+                        count = std::max(count, used.first - range.base_register + used.count);
+                    }
+                }
+                if (count == UINT_MAX || range.table_offset == UINT_MAX ||
+                    count > 4096 || range.table_offset > 4096 - count) return fail("Scene uses an unbounded or oversized descriptor table.");
+                sampler |= range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+                span = std::max(span, range.table_offset + count);
+            }
+            if (sampler) continue;
+            uint32_t slot = 0; const auto* heap = heap_for_gpu_locked(args[param].value, &slot);
+            if (!heap || span > heap->count - slot || span > 4096 - next.descriptors.size()) return fail("Scene resource table is outside the tracked descriptor heap.");
+            next.tables.push_back({param, static_cast<uint32_t>(next.descriptors.size()), span, heap->id, slot});
+            SlotShared stripe;
+            for (uint32_t i = 0; i < span; ++i) {
+                stripe.lock(heap, uint64_t(slot) + i);
+                const auto& info = heap->info[slot + i];
+                OperationDescriptor d;d.used=!next.reflection_complete;
+                if(next.reflection_complete)for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+                    if(i>=range.table_offset&&i-range.table_offset<range.num_descriptors)
+                        d.used|=shader_uses(pipeline->second,p,range,range.base_register+i-range.table_offset);}
+                if (!info.details&&d.used) return fail("A used scene descriptor lacks its typed creation data.");
+                if(info.details)d.view = *info.details; d.version = heap->versions[slot + i];
+                next.descriptors.push_back(std::move(d));
+            }
+        }
+        if (!compute) {
+            if (!ls->raster_tracking || (!ls->raster_targets_known && !(read_only&&ls->in_render_pass)) ||
+                !ls->raster_viewports_known || !ls->raster_scissors_known) return fail("Scene targets, viewport or clipping metadata is incomplete.");
+            for (const auto& c : ls->native_colors) {
+                if (!c) return fail("A scene render target lacks its typed creation data.");
+                OperationDescriptor d; d.view = *c; next.colors.push_back(std::move(d));
+            }
+            if (ls->native_depth) next.depth.view = *ls->native_depth;
+            else if (ls->raster_has_depth) return fail("The scene depth view lacks its typed creation data.");
+            next.viewports.assign(ls->raster_viewports, ls->raster_viewports + ls->raster_viewport_count);
+            next.scissors.assign(ls->raster_scissors, ls->raster_scissors + ls->raster_scissor_count);
+        }
+        if(pipeline!=g_objs.end())for(const auto& field:pipeline->second.dimensions) {
+            for(uint32_t param=0;param<rs->second.root_params.size()&&param<args.size();++param) {
+                const auto& p=rs->second.root_params[param];uint32_t descriptor=UINT_MAX;uint64_t address=0;
+                if(p.visibility!=D3D12_SHADER_VISIBILITY_ALL&&field.visibility!=D3D12_SHADER_VISIBILITY_ALL&&p.visibility!=field.visibility)continue;
+                if(p.param_type==NA_ROOT_CBV&&args[param].type==2&&p.shader_register==field.shader_register&&p.register_space==field.space)address=args[param].value;
+                else if(p.param_type==NA_ROOT_TABLE&&args[param].type==1) {
+                    const auto table=std::find_if(next.tables.begin(),next.tables.end(),[&](const auto& t){return t.param==param;});
+                    if(table==next.tables.end())continue;
+                    for(uint32_t r=0;r<p.count;++r){const auto& range=rs->second.root_ranges[p.first_range+r];
+                        if(range.range_type!=D3D12_DESCRIPTOR_RANGE_TYPE_CBV||range.register_space!=field.space||
+                           field.shader_register<range.base_register||field.shader_register-range.base_register>=range.num_descriptors)continue;
+                        descriptor=table->first+range.table_offset+field.shader_register-range.base_register;
+                        if(descriptor<next.descriptors.size())address=next.descriptors[descriptor].view.cbv.BufferLocation;
+                    }
+                }
+                uint64_t resource=0,offset=0;if(!address||!resolve_va_locked(address,&resource,&offset))continue;
+                auto c=std::find_if(next.constants.begin(),next.constants.end(),[&](const auto& x){return x.param==param&&x.descriptor==descriptor;});
+                if(c==next.constants.end()){NativeOperation::Constant value;value.param=param;value.descriptor=descriptor;value.resource_id=resource;value.offset=offset;
+                    next.constants.push_back(std::move(value));c=std::prev(next.constants.end());}
+                c->bytes=std::max(c->bytes,field.bytes);c->dimensions.push_back(field);
+            }
+        }
+    }
+    const auto acquire = [](OperationDescriptor& d) {
+        if (d.view.resource) { d.resource.Attach(AcquireResource(d.view.resource)); if (!d.resource) return false; }
+        if (d.view.counter) { d.counter.Attach(AcquireResource(d.view.counter)); if (!d.counter) return false; }
+        return true;
+    };
+    for (auto& d : next.descriptors) if (d.used&&!acquire(d)) return fail("A scene descriptor's resource has retired.");
+    for (auto& d : next.colors) if (!acquire(d)) return fail("A scene colour target has retired.");
+    if (next.depth.view.resource && !acquire(next.depth)) return fail("The scene depth target has retired.");
+    for(auto& c:next.constants){c.resource.Attach(AcquireResource(c.resource_id));if(!c.resource)return fail("A scene dimension buffer has retired.");}
+    out = std::move(next); return true;
+}
+// Read-only: 2D textures whose recorded creation has one of `formats` and exactly w x h
+// (Claude 2026-11-06, Cort's OK: J2 captures a game velocity candidate). One bucket of the
+// (w, h) index under the shared lock, so it is cheap enough for every DLAA evaluation.
+uint32_t FindTextures(const uint32_t* formats, uint32_t format_count, uint32_t w, uint32_t h, na_object_id* out, uint32_t max)
+{
+    if (!formats || !format_count || !out || !max) return 0;
+    std::shared_lock<RegistryLock> lock(g_m);
+    const auto b = g_tex2d_by_dims.find(tex2d_key(w, h));
+    if (b == g_tex2d_by_dims.end()) return 0;
+    uint32_t n = 0;
+    for (const na_object_id id : b->second) {
+        uint32_t rw = 0, rh = 0, rf = 0;
+        if (!resource_dims_locked(id, &rw, &rh, &rf) || rw != w || rh != h) continue;
+        bool match = false;
+        for (uint32_t i = 0; i < format_count && !match; ++i) match = formats[i] == rf;
+        if (!match) continue;
+        out[n++] = id;
+        if (n == max) break;
+    }
+    return n;
+}
 ID3D12Resource* AcquireResource(na_object_id id)
 {
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     auto key = g_res_keys.find(id);
     if (key == g_res_keys.end()) return nullptr;
     ID3D12Resource* r = nullptr;
@@ -5057,12 +9034,243 @@ ID3D12Resource* AcquireResource(na_object_id id)
     return r;
 }
 namespace {
-std::atomic<uint64_t> g_live_depth{0}, g_live_color{0};
+// Depth and colour are one role: published and read together (two separate atomics let a
+// reader see a new depth with the old colour, Astra 20cddb8).
+// Readers are per draw on every recording thread, so they never take a lock: a sequence
+// counter (odd while a writer is mid-update) lets them retry instead (seqlock). Writers stay
+// serialised by g_live_m.
+std::mutex g_live_m;
+std::atomic<uint64_t> g_live_depth{0}, g_live_color{0}, g_live_seq{0};
+uint64_t g_live_version = 0;
 }
-void SetLiveSelection(uint64_t depth, uint64_t color) { g_live_depth.store(depth); g_live_color.store(color); }
-void GetLiveSelection(uint64_t* depth, uint64_t* color) { *depth = g_live_depth.load(); *color = g_live_color.load(); }
+void SetLiveSelection(uint64_t depth, uint64_t color)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    const uint64_t d0 = g_live_depth.load(std::memory_order_relaxed), c0 = g_live_color.load(std::memory_order_relaxed);
+    if (depth == d0 && color == c0) return;
+    if (color != c0) g_hot_ready.store(false, std::memory_order_release); // bits were built for the old colour
+    ++g_live_version;
+    g_live_seq.fetch_add(1, std::memory_order_acq_rel); // odd: update in progress
+    g_live_depth.store(depth, std::memory_order_relaxed);
+    g_live_color.store(color, std::memory_order_relaxed);
+    g_live_seq.fetch_add(1, std::memory_order_release); // even: consistent
+    // Again after the publish: RefreshReadFilter stores ready=true and then re-reads the selection,
+    // so a change is either seen by that re-read or its own false here lands after the true.
+    if (color != c0) g_hot_ready.store(false, std::memory_order_release);
+}
+void GetLiveSelection(uint64_t* depth, uint64_t* color)
+{
+    for (;;) {
+        const uint64_t s0 = g_live_seq.load(std::memory_order_acquire);
+        if (s0 & 1) continue;
+        const uint64_t d = g_live_depth.load(std::memory_order_acquire), c = g_live_color.load(std::memory_order_acquire);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_live_seq.load(std::memory_order_relaxed) == s0) { *depth = d; *color = c; return; }
+    }
+}
+void SetSceneViewportJitter(uint64_t frame, float x, float y)
+{
+    if (!frame) { g_vpj.store(0, std::memory_order_release); return; }
+    const auto q = [](float f) { return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(std::lround(double(f) * 65536.0), -32767L, 32767L))); };
+    uint32_t f32 = static_cast<uint32_t>(frame);
+    if (!f32) f32 = 1;
+    g_vpj_ever.store(true, std::memory_order_relaxed);
+    g_vpj.store(uint64_t(f32) << 32 | uint64_t(q(x)) << 16 | q(y), std::memory_order_release);
+}
+void SetReplayProbe(bool on) { g_rp_on.store(on, std::memory_order_relaxed); }
+bool ReplayProbeFrame(ReplayProbeStats* out)
+{
+    std::vector<ReplayDraw> cur;
+    { std::lock_guard<std::mutex> g(g_rp_m); cur.swap(g_rp_cur); }
+    ReplayProbeStats st{};
+    st.draws = static_cast<uint32_t>(cur.size());
+    std::unordered_map<uint64_t, std::vector<uint64_t>> prev; // signature -> buffer hashes, in order
+    for (const auto& d : g_rp_prev) prev[d.sig].push_back(d.vb);
+    std::unordered_map<uint64_t, uint32_t> used, seen;
+    for (const auto& d : cur) {
+        if (!d.tracked) ++st.untracked;
+        if (d.stages) ++st.extra_stages;
+        if (d.instances > 1) ++st.instanced;
+        if (++seen[d.sig] == 1) ++st.unique;
+        auto it = prev.find(d.sig);
+        uint32_t& u = used[d.sig];
+        if (it == prev.end() || u >= it->second.size()) continue;
+        ++st.matched;
+        if (it->second[u] == d.vb) ++st.same_buffers; else ++st.moved_buffers;
+        ++u;
+    }
+    st.prev_draws = static_cast<uint32_t>(g_rp_prev.size());
+    g_rp_prev.swap(cur);
+    *out = st;
+    return st.draws || st.prev_draws;
+}
+void SetDrawReplay(uint64_t frame, ReplayRetain retain)
+{
+    g_rp_retain.store(retain, std::memory_order_release);
+    g_rp_frame.store(retain ? frame : 0, std::memory_order_release);
+}
+bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
+{
+    *f = ReplayFrame{};
+    if (!list || !queue || !g_rp_bufs_ok.load(std::memory_order_acquire)) return false;
+    const uint64_t recording = ListRecording(list);
+    const uint64_t list_id = IdOf(list);
+    const auto retain = g_rp_retain.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lock(g_replay_slots_m);
+    const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
+    if (frame < 2 || !recording || !retain) return false;
+    RpSlot* cur_slot = rp_find(frame);
+    if (!cur_slot || cur_slot->segs.empty()) { rp_count(kRpTakeUnclaimed); return false; }
+    auto& cur = *cur_slot;
+    if (cur.sealed) { rp_count(kRpTakeSealed); return false; }
+    // Positions this list may read now: its own (recorded earlier in this same
+    // list) and those of other lists already submitted to this queue (same-queue
+    // order). A list still unsubmitted could execute after us: left out.
+    // A list not yet submitted is used too when its segment is stamped at its
+    // Close: the replay shader then checks the stamp on the GPU (see kRpMaxSegs).
+    // Every other list's draws are checked too (a stale re-execution of an
+    // older writer rewrites its own token, which then no longer matches).
+    bool own = false, other = false;
+    for (auto& x : cur.segs) {
+        const bool mine = x.list_id == list_id && x.recording == recording;
+        const bool ready = mine || (x.writer && x.writer->Ready(queue));
+        if (!ready && !(x.writer && x.stampable)) { rp_count(kRpPendingSegs); continue; }
+        if (!ready) rp_count(kRpPendingStamped);
+        own |= mine; other |= !mine;
+        const size_t at = f->cur_draws.size();
+        f->cur_draws.insert(f->cur_draws.end(), x.draws.begin(), x.draws.end());
+        if (!mine && (!ready || x.stamped)) for (size_t i = at; i < f->cur_draws.size(); ++i) {
+            f->cur_draws[i].check = x.stamp_index + 1;
+            f->cur_draws[i].token = x.token;
+        }
+    }
+    if (f->cur_draws.empty()) { rp_count(kRpTakeOtherList); return false; }
+    auto reader = retain(list);
+    if (!reader) return false;
+    cur.sealed = true;
+    cur.reader = reader;
+    rp_count(kRpTaken);
+    f->cur = cur.buf.Get();
+    f->cur_in_list = own;
+    f->stamps = g_rp_stamps.Get();
+    f->data_offset = kRpCounterBytes;
+    RpSlot* prev_slot = rp_find(frame - 1);
+    if (prev_slot && prev_slot->sealed && !prev_slot->segs.empty()) {
+        auto& prev = *prev_slot;
+        bool ready = true;
+        for (const auto& x : prev.segs) ready &= x.writer && x.writer->Ready(queue);
+        if (ready) {
+            prev.reader = reader;
+            f->prev = prev.buf.Get();
+            for (auto& x : prev.segs) {
+                const size_t at = f->prev_draws.size();
+                f->prev_draws.insert(f->prev_draws.end(), x.draws.begin(), x.draws.end());
+                x.draws.clear();
+                if (x.stamped) for (size_t i = at; i < f->prev_draws.size(); ++i) {
+                    f->prev_draws[i].check = x.stamp_index + 1;
+                    f->prev_draws[i].token = x.token;
+                }
+            }
+        }
+    }
+    (void)other;
+    return true;
+}
+
+void GetDrawReplayStats(DrawReplayStats* out)
+{
+    const auto v = [](uint32_t k) { return g_rp_stat[k].load(std::memory_order_relaxed); };
+    out->replayed = v(kRpReplayed); out->vertices = v(kRpVerts); out->twin_queued = v(kRpNoTwin); out->twin_building = v(kRpBuilding);
+    out->twin_failed = v(kRpFailedTwin); out->overflow = v(kRpOverflow); out->topology = v(kRpTopology); out->stages = v(kRpStages);
+    out->untwinned = v(kRpUntwinned); out->no_recipe = v(kRpNoRecipe); out->not_ready = v(kRpNotReady); out->built = v(kRpBuilt);
+    out->build_failed = v(kRpBuildFailed); out->noted = v(kRpNoted); out->hash_mismatch = v(kRpHashMismatch);
+    out->other_list = v(kRpOtherList); out->take_unclaimed = v(kRpTakeUnclaimed); out->take_other_list = v(kRpTakeOtherList);
+    out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
+    out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
+    out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired); out->slots = v(kRpSlotsMade);
+    static const char* const names[kGateCount] = {"not_direct", "no_retain", "no_depth", "no_list", "other_depth", "render_pass", "no_pso", "bundle", "predicated", "stream_out",
+        "recording", "no_pipeline", "no_depth_write", "msaa", "viewport", "root_mismatch", "root_unknown", "direct_heap", "vs_uav", "no_vb", "admitted_depth_tested"};
+    int used = 0;
+    out->gates[0] = 0;
+    for (uint32_t k = 0; k < kGateCount; ++k) {
+        const uint64_t n = g_rp_gate[k].load(std::memory_order_relaxed);
+        if (!n || used >= int(sizeof out->gates) - 1) continue;
+        const int w = std::snprintf(out->gates + used, sizeof out->gates - used, "%s%s=%llu", used ? " " : "", names[k], (unsigned long long)n);
+        if (w > 0) used = (std::min)(int(sizeof out->gates) - 1, used + w);
+    }
+}
+bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y)
+{
+    if (!packed) return false;
+    if (frame) *frame = static_cast<uint32_t>(packed >> 32);
+    if (x) *x = vpj_axis(packed, 16);
+    if (y) *y = vpj_axis(packed, 0);
+    return true;
+}
+uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return 0;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return !scene_depth||scene_depth==ls->vpj_depth?ls->vpj_scene:0;
+}
+void SetHookProfiling(bool enabled){g_cost_enabled.store(enabled,std::memory_order_relaxed);}
+void FormatHookCost(char* out, size_t n)
+{
+    if (!out || !n) return;
+    out[0] = 0;
+    if(!g_cost_enabled.load(std::memory_order_relaxed)){std::snprintf(out,n,"hook_cost disabled");return;}
+    cost_flush(); // this thread's share
+    static uint64_t prev_ticks[kCostSlots]{}, prev_calls[kCostSlots]{}, prev_timed[kCostSlots]{}, prev_at = 0;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t now = cost_now();
+    const double secs = prev_at ? double(now - prev_at) / double(f.QuadPart) : 0.0;
+    struct Row { uint32_t slot; double ms_per_s, calls_per_s, us_per_call; };
+    Row rows[kCostSlots]; uint32_t nr = 0; double list_total = 0;
+    for (uint32_t i = 0; i < kCostSlots; ++i) {
+        const uint64_t t = g_cost_ticks[i].load(std::memory_order_relaxed), c = g_cost_calls[i].load(std::memory_order_relaxed),
+                       tc = g_cost_timed[i].load(std::memory_order_relaxed);
+        const uint64_t dt = t - prev_ticks[i], dc = c - prev_calls[i], dtc = tc - prev_timed[i];
+        prev_ticks[i] = t; prev_calls[i] = c; prev_timed[i] = tc;
+        if (!dc || !dtc || secs <= 0) continue;
+        // Sampled slots: the timed calls' sum scaled to every call (exact for the others, dtc == dc).
+        const double ms = double(dt) * 1000.0 / double(f.QuadPart) * (double(dc) / double(dtc));
+        rows[nr++] = {i, ms / secs, double(dc) / secs, ms * 1000.0 / double(dc)};
+        if (i < kCostPseudo) list_total += ms / secs;
+    }
+    prev_at = now;
+    std::sort(rows, rows + nr, [](const Row& a, const Row& b) { return a.ms_per_s > b.ms_per_s; });
+    int w = std::snprintf(out, n, "hook_cost window_s=%.1f list_ms_per_s=%.1f", secs, list_total);
+    static const char* const kPseudo[] = {"vpj", "shader_use", "lane_before", "lane_after", "driver", "run", "root_table",
+                                           "sampled", "emit", "note_draw", "canon_miss", "desc_copy", "desc_copy_wait",
+                                           "desc_write", "desc_write_wait", "pso_driver", "pso_reflect", "use_lookup", "use_walk", "use_callback",
+                                           "scene_read_cb"};
+    static_assert(sizeof(kPseudo) / sizeof(kPseudo[0]) == kCostLast - kCostPseudo + 1, "one name per pseudo slot");
+    for (uint32_t i = 0; i < nr && i < 24 && w > 0 && size_t(w) < n; ++i) {
+        const uint32_t sl = rows[i].slot;
+        const char* tag = sl == kCostExec ? "exec" : sl == kCostPso ? "pso" :
+                          (sl >= kCostPseudo && sl <= kCostLast) ? kPseudo[sl - kCostPseudo] : nullptr;
+        if (tag) w += std::snprintf(out + w, n - w, " %s{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", tag, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
+        else w += std::snprintf(out + w, n - w, " s%u{ms_per_s=%.1f calls_per_s=%.0f us=%.2f}", rows[i].slot, rows[i].ms_per_s, rows[i].calls_per_s, rows[i].us_per_call);
+    }
+}
+ViewportJitterStats GetViewportJitterStats()
+{
+    return {g_vpj_draws.load(std::memory_order_relaxed), g_vpj_sets.load(std::memory_order_relaxed),
+            g_vpj_restores.load(std::memory_order_relaxed), g_vpj_unknown.load(std::memory_order_relaxed)};
+}
+uint64_t LiveSelectionVersion()
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    return g_live_version;
+}
 
 void SetSampleAcquireProbeForTests(void (*probe)()) { g_acquire_probe = probe; }
+void SetDeferredApplyProbeForTests(void (*probe)()) { g_deferred_apply_probe.store(probe, std::memory_order_release); }
 void SetSampleWorkerPausedForTests(bool paused) { g_worker_paused.store(paused, std::memory_order_release); }
 void SetSampleWorkerStartFailsForTests(bool fail) { g_fail_worker_start.store(fail); }
 void SetSampleSignalFailsForTests(bool fail) { g_fail_sample_signal.store(fail); }
@@ -5082,7 +9290,7 @@ void SetSnapshotCopyProbeForTests(void (*probe)(void* user), void* user)
 bool ResolveGpuVa(uint64_t va, na_object_id* resource, uint64_t* offset)
 {
     if (!resource || !offset) return false;
-    std::shared_lock<std::shared_mutex> lock(g_m);
+    std::shared_lock<RegistryLock> lock(g_m);
     return resolve_va_locked(va, resource, offset);
 }
 
@@ -5090,9 +9298,17 @@ void SetExecuteForwarder(void(STDMETHODCALLTYPE* fwd)(ID3D12CommandQueue*, UINT,
 {
     g_exec_forward.store(fwd, std::memory_order_release);
 }
+bool HostExecuteAvailable(){return g_exec_forward.load(std::memory_order_acquire)||o_ExecuteCommandLists;}
+bool ExecuteHostCommands(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
+    auto forward=g_exec_forward.load(std::memory_order_acquire);if(!forward)forward=o_ExecuteCommandLists;
+    if(!queue||!forward||!count||!lists)return false;const HostWorkScope host;forward(queue,count,lists);return true;
+}
+
+void SetProcessExiting() { g_process_exiting.store(true, std::memory_order_release); }
 
 ProducerStats GetProducerStats()
 {
+    flush_deferred_writes(); // queued view writes count once applied
     ProducerStats s{};
     s.objects_live = g_c.live.load();
     s.objects_created = g_c.created.load();
@@ -5116,6 +9332,7 @@ ProducerStats GetProducerStats()
     s.sample_partial_states = g_c.sample_partial_states.load();
     s.sample_no_transition = g_c.sample_no_transition.load();
     s.nested_unlocked = g_c.nested_unlocked.load();
+    s.serialized_submissions = g_c.serialized.load();
     s.snapshots_reread = g_c.snap_reread.load();
     s.preexisting_resources = g_c.preexisting_resources.load();
     s.preexisting_heaps = g_c.preexisting_heaps.load();
@@ -5145,7 +9362,7 @@ extern "C" int __cdecl na_observe_sample_request(const na_sample_request* r, uin
     if (!session) return NA_E_STATE; // leases are scoped to a running session
     bool buffer = false;
     {
-        std::shared_lock<std::shared_mutex> lock(g_m);
+        std::shared_lock<RegistryLock> lock(g_m);
         auto key = g_res_keys.find(r->resource);
         if (key == g_res_keys.end()) return NA_E_ARG; // not an observed resource
         // The creation record (no object dereference) says whether it is a buffer.

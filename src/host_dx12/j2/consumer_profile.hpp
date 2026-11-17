@@ -21,6 +21,7 @@
 //    never handed to the boundary matcher.
 // Pure CPU, bounded, no D3D12.
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "host_dx12/j2/insertion_trace.hpp"
@@ -88,7 +89,7 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
     bool post_barrier_found = false;
     // A barrier (RT -> read transition) is not a consumer: it never counts as "the colour
     // consumed again", and never as copying the image onward.
-    const auto consumes = [](const ColorEvent& e) { return !e.write && e.op != Op::Barrier; };
+    const auto consumes = [](const ColorEvent& e) { return !e.write && e.op != Op::Barrier && !IsEntry(e.op); };
     // Scene construction continues after `from`: a draw into the colour (depth attachment
     // or not) before the image is copied onward. Clears/copies into the colour are reuse.
     const auto continued = [&](size_t from) {
@@ -102,6 +103,7 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
     uint64_t last_producer = 0; // submission order also spans a writer/consumer list split
     for (size_t i = 0; i < seq.size(); ++i) {
         const ColorEvent& c = seq[i];
+        if (IsEntry(c.op)) continue;
         if (c.list_start) list_context = 0;
         if (c.write) { last_producer = c.producer; continue; }
         if (c.op == Op::Barrier) {
@@ -145,7 +147,13 @@ inline void LabelFrame(const std::vector<ColorEvent>& seq, uint32_t scene_w, uin
 class ConsumerProfile {
 public:
     static constexpr uint32_t kAcceptHits = 3;
-    static constexpr size_t kMaxEntries = 256; // SER needed more than 64 (classes + barrier/producer pairs)
+    // A full table forgets what the game still uses. Sniper Elite 5's menu sat at the old cap of
+    // 256 in every saved run (2026-11-07 to 11-11) with the accepted count rising and falling
+    // between samples: patterns seen only every 40 s (the merged-list burst) were dropped and
+    // re-learned, three undelivered frames each time. The cap is now a memory bound that a real
+    // game does not reach, and lookups go through a hash index so the size costs no frame time.
+    // (History: 64 was too small for Sniper Elite Resistance, 256 for Sniper Elite 5.)
+    static constexpr size_t kMaxEntries = 4096;
     struct Entry {
         ClassKey cls;
         uint64_t producer = 0; // 0: the class itself; else the (class, producer) qualification
@@ -154,7 +162,9 @@ public:
     };
     enum class Verdict : uint8_t { Unknown = 0, Accepted, AcceptedWithProducer, AcceptedQualified, Rejected, Ambiguous };
 
-    void Clear() { e_.clear(); }
+    void Clear() { e_.clear(); index_.clear(); evictions_ = 0; }
+    // Entries dropped because the table was full (0 in a healthy run).
+    uint64_t Evictions() const { return evictions_; }
     void Observe(const Labelled& l, uint64_t frame)
     {
         if (l.role == Role::Later) return; // downstream passes teach nothing about the boundary
@@ -221,29 +231,72 @@ public:
         return n;
     }
     size_t Size() const { return e_.size(); }
+    // Diagnostic: the tallies behind a verdict, {class post, class temp, pair post, pair temp}.
+    // False when the class itself has no entry (never seen, or dropped at the bound).
+    bool Tallies(const ClassKey& cls, uint64_t producer, uint32_t out[4]) const
+    {
+        out[0] = out[1] = out[2] = out[3] = 0;
+        const Entry* plain = find(cls, 0);
+        if (plain) { out[0] = plain->post; out[1] = plain->temp; }
+        const Entry* pair = producer ? find(cls, producer) : nullptr;
+        if (pair) { out[2] = pair->post; out[3] = pair->temp; }
+        return plain != nullptr;
+    }
 
 private:
+    static uint64_t slot(const ClassKey& cls, uint64_t producer)
+    {
+        return ClassHash(cls) ^ (producer * 0x9E3779B97F4A7C15ull);
+    }
+    // Position of the entry in e_, or e_.size() when absent.
+    size_t position(const ClassKey& cls, uint64_t producer) const
+    {
+        const auto range = index_.equal_range(slot(cls, producer));
+        for (auto it = range.first; it != range.second; ++it) {
+            const Entry& x = e_[it->second];
+            if (x.producer == producer && x.cls == cls) return it->second;
+        }
+        return e_.size();
+    }
     const Entry* find(const ClassKey& cls, uint64_t producer) const
     {
-        for (const auto& x : e_) if (x.producer == producer && x.cls == cls) return &x;
-        return nullptr;
+        const size_t at = position(cls, producer);
+        return at < e_.size() ? &e_[at] : nullptr;
+    }
+    // Point the index entry of e_[from] at position `to` (to == e_.size(): remove it).
+    void reindex(size_t from, size_t to)
+    {
+        const auto range = index_.equal_range(slot(e_[from].cls, e_[from].producer));
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second != from) continue;
+            if (to < e_.size()) it->second = to; else index_.erase(it);
+            return;
+        }
     }
     Entry& find_or_add(const ClassKey& cls, uint64_t producer, uint64_t frame)
     {
-        for (auto& x : e_) if (x.producer == producer && x.cls == cls) return x;
+        const size_t at = position(cls, producer);
+        if (at < e_.size()) return e_[at];
         if (e_.size() >= kMaxEntries) {
             size_t lru = 0;
             for (size_t i = 1; i < e_.size(); ++i) if (e_[i].last_frame < e_[lru].last_frame) lru = i;
-            e_.erase(e_.begin() + static_cast<std::ptrdiff_t>(lru));
+            const size_t last = e_.size() - 1;
+            reindex(lru, e_.size());
+            if (lru != last) { reindex(last, lru); e_[lru] = e_[last]; }
+            e_.pop_back();
+            ++evictions_;
         }
         Entry n;
         n.cls = cls;
         n.producer = producer;
         n.last_frame = frame;
         e_.push_back(n);
+        index_.emplace(slot(cls, producer), e_.size() - 1);
         return e_.back();
     }
     std::vector<Entry> e_;
+    std::unordered_multimap<uint64_t, size_t> index_; // slot(class, producer) -> position in e_
+    uint64_t evictions_ = 0;
 };
 
 } // namespace na::j2

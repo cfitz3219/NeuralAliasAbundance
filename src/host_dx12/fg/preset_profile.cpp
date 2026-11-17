@@ -1,3 +1,4 @@
+#include <string>
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/settings.hpp"
 #include <windows.h>
@@ -234,6 +235,7 @@ DWORD WINAPI refresh_worker(void*) {
         HANDLE e = refresh_event.load();
         if (!e || WaitForSingleObject(e, INFINITE) != WAIT_OBJECT_0) return 0;
         ReadUpscalerOverrides();
+        ReadAnisoOverride();
     }
 }
 }
@@ -252,11 +254,213 @@ void RequestUpscalerOverridesRefresh() {
 }
 }
 
+namespace na::fg::preset {
+namespace {
+std::mutex aniso_mutex;
+AnisoOverride aniso_state;
+std::atomic<int> aniso_job{0}; // 1 write APP, 2 restore
+std::once_flag aniso_once;
+HANDLE aniso_event = nullptr;
+bool exe_name(NvAPI_UnicodeString& exe) {
+    wchar_t path[MAX_PATH]{}; GetModuleFileNameW(nullptr, path, MAX_PATH);
+    auto name = wcsrchr(path, L'\\'); name = name ? name + 1 : path;
+    wcscpy_s(reinterpret_cast<wchar_t*>(exe), NVAPI_UNICODE_STRING_MAX, name);
+    return name[0] != 0;
+}
+bool aniso_backup_path(wchar_t (&out)[MAX_PATH]) {
+    wcsncpy_s(out, settings::UserIniPath(), _TRUNCATE);
+    auto slash = wcsrchr(out, L'\\');
+    if (!slash) return false;
+    wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - out), L"AF-profile-before.ini");
+    return true;
+}
+// One DRS session: read the effective selector/level for this executable and optionally
+// write (job 1: selector APP, saving the previous values first; job 2: put them back).
+int32_t aniso_session(int job, AnisoOverride& out, const wchar_t* exe_override = nullptr, const wchar_t* backup_override = nullptr) {
+    out.available = false;
+    if (!load_api()) return NVAPI_ERROR;
+    using GetGlobal = NvAPI_Status(__cdecl*)(NvDRSSessionHandle, NvDRSProfileHandle*);
+    auto module = GetModuleHandleW(L"nvapi64.dll");
+    auto query = module ? reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(module, "nvapi_QueryInterface"))) : nullptr;
+    auto get_global = query ? reinterpret_cast<GetGlobal>(query(0x617bff9f)) : nullptr; // NvAPI_DRS_GetCurrentGlobalProfile
+    NvDRSSessionHandle session = nullptr;
+    NvAPI_Status r = create(&session);
+    if (r != NVAPI_OK) return r;
+    r = load(session);
+    if (r == NVAPI_OK) {
+        NvAPI_UnicodeString exe{};
+        if (exe_override) wcscpy_s(reinterpret_cast<wchar_t*>(exe), NVAPI_UNICODE_STRING_MAX, exe_override); else exe_name(exe);
+        NvDRSProfileHandle app_profile = nullptr, global = nullptr;
+        NVDRS_APPLICATION app{}; app.version = NVDRS_APPLICATION_VER;
+        if (find(session, exe, &app_profile, &app) != NVAPI_OK) app_profile = nullptr;
+        if (get_global && get_global(session, &global) != NVAPI_OK) global = nullptr;
+        NvDRSProfileHandle profile = app_profile ? app_profile : global;
+        out.app_profile = app_profile != nullptr;
+        if (profile) {
+            NVDRS_SETTING sel{}; sel.version = NVDRS_SETTING_VER;
+            NVDRS_SETTING lvl{}; lvl.version = NVDRS_SETTING_VER;
+            const bool has_sel = get(session, profile, ANISO_MODE_SELECTOR_ID, &sel) == NVAPI_OK;
+            const bool has_lvl = get(session, profile, ANISO_MODE_LEVEL_ID, &lvl) == NVAPI_OK;
+            out.available=has_sel&&has_lvl;
+            if(has_sel)out.selector_location=uint32_t(sel.settingLocation);
+            if(has_lvl)out.level_location=uint32_t(lvl.settingLocation);
+            out.selector = has_sel ? sel.u32CurrentValue : ANISO_MODE_SELECTOR_DEFAULT;
+            out.level = has_lvl ? lvl.u32CurrentValue : ANISO_MODE_LEVEL_DEFAULT;
+            wchar_t backup[MAX_PATH]{};
+            if (backup_override) wcsncpy_s(backup, backup_override, _TRUNCATE);
+            if (job && app_profile && (backup_override || aniso_backup_path(backup))) {
+                if (job == 1) {
+                    // Save once what the profile held itself (user value), so restore is exact.
+                    if (GetFileAttributesW(backup) == INVALID_FILE_ATTRIBUTES) {
+                        const bool own = has_sel && sel.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION && !sel.isCurrentPredefined;
+                        wchar_t v[32];
+                        swprintf_s(v, L"%u", own ? 1u : 0u); WritePrivateProfileStringW(L"selector", L"user_value", v, backup);
+                        swprintf_s(v, L"%u", out.selector); WritePrivateProfileStringW(L"selector", L"value", v, backup);
+                        WritePrivateProfileStringW(L"backup", L"exe", reinterpret_cast<const wchar_t*>(exe), backup);
+                        WritePrivateProfileStringW(L"backup", L"complete", L"1", backup);
+                    }
+                    if (GetPrivateProfileIntW(L"backup", L"complete", 0, backup) != 1) r = NVAPI_ERROR;
+                    if (r == NVAPI_OK) {
+                        NVDRS_SETTING w{}; w.version = NVDRS_SETTING_VER; w.settingId = ANISO_MODE_SELECTOR_ID;
+                        w.settingType = NVDRS_DWORD_TYPE; w.u32CurrentValue = ANISO_MODE_SELECTOR_APP;
+                        r = set(session, app_profile, &w);
+                        if (r == NVAPI_OK) r = save(session);
+                    }
+                } else if (GetPrivateProfileIntW(L"backup", L"complete", 0, backup) == 1) {
+                    if (GetPrivateProfileIntW(L"selector", L"user_value", 0, backup)) {
+                        NVDRS_SETTING w{}; w.version = NVDRS_SETTING_VER; w.settingId = ANISO_MODE_SELECTOR_ID;
+                        w.settingType = NVDRS_DWORD_TYPE; w.u32CurrentValue = GetPrivateProfileIntW(L"selector", L"value", 0, backup);
+                        r = set(session, app_profile, &w);
+                    } else {
+                        r = erase(session, app_profile, ANISO_MODE_SELECTOR_ID);
+                        if (r == NVAPI_SETTING_NOT_FOUND) r = NVAPI_OK;
+                    }
+                    if (r == NVAPI_OK) r = save(session);
+                    if (r == NVAPI_OK) DeleteFileW(backup);
+                } else r = NVAPI_ERROR;
+                if (r == NVAPI_OK) { // read back what the profile now says
+                    NVDRS_SETTING again{}; again.version = NVDRS_SETTING_VER;
+                    if (get(session, app_profile, ANISO_MODE_SELECTOR_ID, &again) == NVAPI_OK){out.selector = again.u32CurrentValue;out.selector_location=uint32_t(again.settingLocation);}
+                    else {out.available=false;out.selector = ANISO_MODE_SELECTOR_DEFAULT;out.selector_location=~0u;}
+                }
+            } else if (job) r = NVAPI_EXECUTABLE_NOT_FOUND; // no own profile: we never write the global one
+        }
+    }
+    destroy(session);
+    return r;
+}
+// Read-only: every driver texture-filtering setting for this executable's profile and the
+// global profile, with value, where it comes from (location) and whether it is predefined.
+// For the run log only (Cort 2026-11-06: gather all data); never writes.
+std::string g_driver_texture_line;
+std::string read_texture_driver_settings() {
+    if (!load_api()) return "driver_texture available=0";
+    using GetGlobal = NvAPI_Status(__cdecl*)(NvDRSSessionHandle, NvDRSProfileHandle*);
+    auto module = GetModuleHandleW(L"nvapi64.dll");
+    auto query = module ? reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(module, "nvapi_QueryInterface"))) : nullptr;
+    auto get_global = query ? reinterpret_cast<GetGlobal>(query(0x617bff9f)) : nullptr;
+    NvDRSSessionHandle session = nullptr;
+    if (create(&session) != NVAPI_OK) return "driver_texture available=0 session=0";
+    std::string out = "driver_texture available=1";
+    if (load(session) == NVAPI_OK) {
+        NvAPI_UnicodeString exe{};
+        exe_name(exe);
+        NvDRSProfileHandle app_profile = nullptr, global = nullptr;
+        NVDRS_APPLICATION app{}; app.version = NVDRS_APPLICATION_VER;
+        if (find(session, exe, &app_profile, &app) != NVAPI_OK) app_profile = nullptr;
+        if (get_global && get_global(session, &global) != NVAPI_OK) global = nullptr;
+        struct Id { const char* name; NvU32 id; };
+        static const Id texture_ids[] = {
+            {"aniso_selector", ANISO_MODE_SELECTOR_ID}, {"aniso_level", ANISO_MODE_LEVEL_ID},
+            {"lod_bias_auto", AUTO_LODBIASADJUST_ID}, {"lod_bias", LODBIASADJUST_ID},
+            {"no_negative_lod", PS_TEXFILTER_NO_NEG_LODBIAS_ID}, {"aniso_sample_opt", PS_TEXFILTER_ANISO_OPTS2_ID},
+            {"bilinear_in_aniso", PS_TEXFILTER_BILINEAR_IN_ANISO_ID}, {"trilinear_opt", PS_TEXFILTER_DISABLE_TRILIN_SLOPE_ID},
+            {"quality", QUALITY_ENHANCEMENTS_ID}};
+        const struct { const char* name; NvDRSProfileHandle h; } profiles[] = {{"app", app_profile}, {"global", global}};
+        char b[160];
+        for (const auto& p : profiles) {
+            snprintf(b, sizeof b, " %s{present=%u", p.name, p.h ? 1u : 0u);
+            out += b;
+            if (p.h)
+                for (const Id& i : texture_ids) {
+                    NVDRS_SETTING st{}; st.version = NVDRS_SETTING_VER;
+                    if (get(session, p.h, i.id, &st) == NVAPI_OK)
+                        snprintf(b, sizeof b, " %s=%u@loc%u%s", i.name, unsigned(st.u32CurrentValue), unsigned(st.settingLocation),
+                                 st.isCurrentPredefined ? "(predefined)" : "");
+                    else snprintf(b, sizeof b, " %s=unset", i.name);
+                    out += b;
+                }
+            out += "}";
+        }
+    } else out += " load=0";
+    destroy(session);
+    return out;
+}
+DWORD WINAPI aniso_worker(void*) {
+    for (;;) {
+        if (WaitForSingleObject(aniso_event, INFINITE) != WAIT_OBJECT_0) return 0;
+        const int job = aniso_job.exchange(0);
+        AnisoOverride now{};
+        const int32_t r = aniso_session(job, now);
+        std::string texture_line = read_texture_driver_settings();
+        std::lock_guard<std::mutex> lock(aniso_mutex);
+        const bool written = aniso_state.written;
+        const AnisoOverride old = aniso_state;
+        aniso_state = now;
+        g_driver_texture_line = std::move(texture_line);
+        aniso_state.start_known = old.start_known; aniso_state.start_selector = old.start_selector; aniso_state.start_level = old.start_level;
+        aniso_state.write_pending = false;
+        aniso_state.written = written || (job == 1 && r == NVAPI_OK);
+        if (job == 2 && r == NVAPI_OK) aniso_state.written = false;
+        if (job) aniso_state.write_result = r;
+    }
+}
+void aniso_start() {
+    std::call_once(aniso_once, [] {
+        aniso_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!aniso_event) return;
+        HANDLE t = CreateThread(nullptr, 0, aniso_worker, nullptr, 0, nullptr);
+        if (t) CloseHandle(t); else { CloseHandle(aniso_event); aniso_event = nullptr; }
+    });
+}
+void aniso_queue(int job) {
+    aniso_start();
+    if (!aniso_event) return;
+    { std::lock_guard<std::mutex> lock(aniso_mutex); aniso_state.write_pending = true; }
+    aniso_job.store(job);
+    SetEvent(aniso_event);
+}
+}
+void ReadAnisoOverride() {
+    AnisoOverride now{};
+    aniso_session(0, now);
+    std::lock_guard<std::mutex> lock(aniso_mutex);
+    const AnisoOverride old = aniso_state;
+    aniso_state = now; aniso_state.written = old.written; aniso_state.write_result = old.write_result;
+    if (old.start_known) { aniso_state.start_known = true; aniso_state.start_selector = old.start_selector; aniso_state.start_level = old.start_level; }
+    else if (now.available) { aniso_state.start_known = true; aniso_state.start_selector = now.selector; aniso_state.start_level = now.level; }
+}
+AnisoOverride GetAnisoOverride() { std::lock_guard<std::mutex> lock(aniso_mutex); return aniso_state; }
+std::string DriverTextureLine() { std::lock_guard<std::mutex> lock(aniso_mutex); return g_driver_texture_line; }
+void RequestAppControlledAniso() { aniso_queue(1); }
+void RequestRestoreAniso() { aniso_queue(2); }
+}
+
 #ifdef NA_PROFILE_CLI
 int wmain(int argc, wchar_t** argv) {
     // Read-only status; installer apply/rollback share the runtime's exact DRS path.
-    if (argc < 3 || argc > 5) { fwprintf(stderr, L"Usage: NAProfile status|apply|restore exe [backup.ini] [1|2|3]\n"); return 2; }
+    if (argc < 3 || argc > 5) { fwprintf(stderr, L"Usage: NAProfile status|apply|restore exe [backup.ini] [1|2|3]\n       NAProfile af-status|af-app|af-restore exe [backup.ini]\n"); return 2; }
     using namespace na::fg::preset;
+    // Anisotropic-filtering override (driver AF forced over the game): installer path, so the
+    // profile is application-controlled before the game starts (no restart needed).
+    if (!_wcsnicmp(argv[1], L"af-", 3)) {
+        const int job = !_wcsicmp(argv[1], L"af-app") ? 1 : !_wcsicmp(argv[1], L"af-restore") ? 2 : !_wcsicmp(argv[1], L"af-status") ? 0 : -1;
+        if (job < 0 || (job && argc < 4) || wcslen(argv[2]) >= MAX_PATH || wcschr(argv[2], L'\\') || wcschr(argv[2], L'/')) return 2;
+        AnisoOverride a{};
+        const int32_t r = aniso_session(job, a, argv[2], job ? argv[3] : nullptr);
+        wprintf(L"exe=%s result=%d available=%u app_profile=%u selector=%u level=%u selector_location=%u level_location=%u\n", argv[2], r, a.available ? 1u : 0u, a.app_profile ? 1u : 0u, a.selector, a.level,a.selector_location,a.level_location);
+        return r == NVAPI_OK ? 0 : 1;
+    }
     const bool read = !_wcsicmp(argv[1], L"status");
     const bool restore = !_wcsicmp(argv[1], L"restore");
     if (!read && !restore && _wcsicmp(argv[1], L"apply")) return 2;

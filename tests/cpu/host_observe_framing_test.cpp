@@ -29,6 +29,7 @@ struct Capture {
     std::string error;
     unsigned calls=0, final=0;
     std::vector<na_event_header> events;
+    std::vector<std::pair<na_epoch, na_object_id>> retired;
     static void __cdecl sink(const na_event_batch* b, void* user) {
         auto& c=*static_cast<Capture*>(user);
         std::unique_lock<std::mutex> lock(c.mutex);
@@ -47,6 +48,11 @@ struct Capture {
                 na_event_header e{}; std::memcpy(&e,payload+offset,sizeof(e));
                 CHECK(e.size_bytes >= sizeof(e) && e.size_bytes % 8 == 0);
                 CHECK(e.size_bytes <= b->payload_bytes-offset); CHECK(e.epoch == b->epoch);
+                if (e.kind == NA_EV_OBJECT_RETIRED) {
+                    CHECK(e.size_bytes >= sizeof(na_ev_object_retired));
+                    na_ev_object_retired value{}; std::memcpy(&value,payload+offset,sizeof(value));
+                    c.retired.emplace_back(e.epoch,value.object);
+                }
                 if (e.kind == NA_EV_INVENTORY_COMPLETE) {
                     CHECK(e.size_bytes >= sizeof(na_ev_inventory_complete));
                     na_ev_inventory_complete value{}; std::memcpy(&value,payload+offset,sizeof(value));
@@ -92,6 +98,39 @@ na_ev_object_retired event(bool foundational=true) {
 }
 }
 int main() { return test::run({
+    {"multi-megabyte backlog preserves epochs, producer order and final delivery", [] {
+        Session s; s.capture.park_complete=true; s.start();
+        {
+            std::unique_lock<std::mutex> lock(s.capture.mutex);
+            CHECK(s.capture.cv.wait_for(lock,std::chrono::seconds(5),[&] { return s.capture.entered; }));
+        }
+        // The sink is parked while 16 producers fill separate rings. This is
+        // deliberately many 64 KiB batches, with a control boundary in between.
+        auto burst=[](unsigned phase) {
+            std::atomic<bool> ok{true};std::vector<std::thread> threads;
+            for(unsigned t=0;t<16;++t)threads.emplace_back([&,t] {
+                alignas(8) unsigned char bytes[32768]{};
+                auto e=event();e.hdr.size_bytes=sizeof bytes;
+                for(unsigned i=0;i<3;++i) {
+                    e.object=1+phase*48+t*3+i;std::memcpy(bytes,&e,sizeof e);
+                    if(!Emit(bytes,NA_GROUP_RESOURCE))ok=false;
+                }
+            });
+            for(auto& t:threads)t.join();CHECK(ok.load());
+        };
+        burst(0);CHECK(na_observe_resync()==NA_OK);burst(1);
+        s.stop();CHECK(s.capture.final==1);CHECK(s.capture.retired.size()==96);
+        unsigned next[32]{};bool epoch2=false;
+        for(const auto& v:s.capture.retired) {
+            CHECK(v.second>=1&&v.second<=96);
+            const auto n=static_cast<unsigned>(v.second-1),producer=n/3;
+            CHECK(n%3==next[producer]++);
+            CHECK(v.first==(n<48?1u:2u));
+            if(v.first==2)epoch2=true;else CHECK(!epoch2);
+        }
+        for(unsigned n:next)CHECK(n==3);
+        const auto stat=status();CHECK(stat.foundational_dropped==0&&stat.detail_dropped==0);
+    }},
     {"lifecycle, exact batch framing, final delivery and no post-stop callbacks", [] {
         Session s; CHECK(na_observe_stop() == NA_E_STATE); CHECK(na_observe_resync() == NA_E_STATE);
         CHECK(na_observe_start(nullptr,nullptr,nullptr) == NA_E_ARG);

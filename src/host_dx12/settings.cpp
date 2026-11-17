@@ -1,4 +1,6 @@
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
+#include "core/jitter_domain.hpp"
 
 #include <shlobj.h>
 #include <windows.h>
@@ -17,7 +19,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_preset) F(j2_mip_bias_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(j2_texture_detail_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -86,6 +88,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     target.rr_preset.store(rr_preset >= 4 && rr_preset <= 6 ? rr_preset : 0);
     target.text_bold.store(
         GetPrivateProfileIntW(L"overlay", L"text_bold", 0, ini) ? 1u : 0u);
+    target.fill_screen.store(GetPrivateProfileIntW(L"present", L"fill_screen", 0, ini) ? 1u : 0u);
     target.win_x.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_x", 0, ini)));
     target.win_y.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_y", 0, ini)));
     target.win_w.store(static_cast<int32_t>(GetPrivateProfileIntW(L"overlay", L"win_w", 0, ini)));
@@ -97,23 +100,95 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     const bool nr=GetPrivateProfileIntW(L"nr",L"enabled",0,ini)!=0;
     if(&target==&g_settings)SetNrEnabled(nr,only_if_present?NrWriteSource::UserIni:NrWriteSource::DefaultIni);
     else target.nr_enabled.store(nr?1u:0u);
+    target.donut_tone.store(0); /* adaptive tone mapping removed 2026-11-06 (Cort); an old tone=1 is ignored */
+    target.donut_bloom.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"bloom",0,ini),0u,1u));
+    target.donut_amount.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"amount",100,ini),0u,100u));
+    target.donut_bias.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"exposure",800,ini),0u,1600u));
+    target.donut_white.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"white",3000,ini),100u,20000u));
+    target.donut_speed_up.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"speed_up",1000,ini),0u,20000u));
+    target.donut_speed_down.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"speed_down",500,ini),0u,20000u));
+    target.donut_curve.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"curve",0,ini),0u,1u));
+    target.donut_bloom_amount.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"bloom_amount",100,ini),0u,1000u));
+    target.donut_bloom_sigma.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"bloom_sigma",16000,ini),4000u,64000u));
+    target.donut_bloom_threshold.store((std::clamp)(GetPrivateProfileIntW(L"donut",L"bloom_threshold",1000,ini),0u,20000u));
+    target.xegtao_enabled.store(GetPrivateProfileIntW(L"xegtao",L"enabled",0,ini)?1u:0u);
+    target.xegtao_amount.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"amount",100,ini),100u));
+    target.xegtao_quality.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"quality",2,ini),3u));
+    target.xegtao_radius_x1000.store((std::clamp)(GetPrivateProfileIntW(L"xegtao",L"radius_x1000",500,ini),1u,100000u));
+    target.xegtao_denoise.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"denoise",1,ini),3u));
+    target.xegtao_radius_multiplier.store((std::clamp)(GetPrivateProfileIntW(L"xegtao",L"radius_multiplier",1457,ini),300u,3000u));
+    target.xegtao_falloff.store((std::clamp)(GetPrivateProfileIntW(L"xegtao",L"falloff",615,ini),1u,1000u));
+    target.xegtao_sample_distribution.store((std::clamp)(GetPrivateProfileIntW(L"xegtao",L"sample_distribution",2000,ini),100u,3000u));
+    target.xegtao_thin_occluder.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"thin_occluder",0,ini),1000u));
+    target.xegtao_final_power.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"final_power",2200,ini),5000u));
+    target.xegtao_depth_mip_offset.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"depth_mip_offset",3300,ini),30000u));
+    target.xegtao_temporal.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"temporal",850,ini),950u));
     target.nr_intensity.store(pct(L"intensity", 100));
     {
-        const int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
-        target.j2_sharpness.store(static_cast<uint32_t>(v < 0 ? 0 : (v > 200 ? 200 : v))); // 101..200 adds NIS
+        // [j2] sharpen: the menu's 0..100 (= RCAS 0..200). Older files only have [j2] sharpness
+        // on the RCAS scale (0..150): halved, rounded up, so 150 -> 75 and 100 -> 50.
+        int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen", -1, ini));
+        if (v < 0) {
+            const int old = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
+            v = old <= 0 ? 0 : (old + 1) / 2;
+        }
+        target.j2_sharpness.store(static_cast<uint32_t>(v > 100 ? 100 : v));
+        const int hud = static_cast<int>(GetPrivateProfileIntW(L"j2", L"hud_nis", 50, ini));
+        target.j2_hud_nis.store(static_cast<uint32_t>(hud < 0 ? 0 : (hud > 100 ? 100 : hud)));
+        const int fl = static_cast<int>(GetPrivateProfileIntW(L"j2", L"flow_loosen", 50, ini));
+        target.j2_flow_loosen.store(static_cast<uint32_t>(fl < 0 ? 0 : (fl > 100 ? 100 : fl)));
+        {
+            const int af = static_cast<int>(GetPrivateProfileIntW(L"j2", L"anisotropic", 0, ini));
+            // 1 = the first build's on switch (16x).
+            target.aniso16.store(af == 1 || af >= 16 ? 16u : af >= 8 ? 8u : af >= 4 ? 4u : 0u);
+        }
+        {
+            wchar_t js[16] = {};
+            GetPrivateProfileStringW(L"j2", L"jitter_sequence", L"halton", js, 16, ini);
+            target.j2_jitter_r2.store(_wcsicmp(js, L"r2") == 0 ? 1u : 0u);
+        }
         wchar_t mb[32] = {};
         GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, ini);
         double mbv = _wtof(mb);
         mbv = mbv < -4.0 ? -4.0 : (mbv > 0.0 ? 0.0 : mbv);
         target.j2_mip_bias_x100.store(static_cast<int32_t>(mbv * 100.0 + (mbv < 0 ? -0.5 : 0.5)));
-        // [j2] preset: a letter J..M (NGX value = letter - 'A' + 1), "default", or a number.
+        {
+            // [j2] texture_detail: "auto" (default) or the total the menu's Texture mip bias row
+            // chose, 0 to -2.25. Separate from the old mip_bias key on purpose: values saved by
+            // the earlier menu (Off, Light) must not come back as today's choice.
+            wchar_t detail_text[32] = {};
+            GetPrivateProfileStringW(L"j2", L"texture_detail", L"auto", detail_text, 32, ini);
+            wchar_t* detail_end = nullptr;
+            const double detail_total = wcstod(detail_text, &detail_end);
+            if (detail_end == detail_text || !(detail_total <= 0.0)) target.j2_texture_detail_x100.store(kTextureDetailAuto);
+            else target.j2_texture_detail_x100.store(static_cast<int32_t>((detail_total < -2.25 ? -2.25 : detail_total) * 100.0 - 0.5));
+        }
+        // [j2] preset_v2: "auto", a letter J..M (NGX value = letter - 'A' + 1), "default", or a
+        // number. Without it, the old [j2] preset key: its "L" was the old default (every save
+        // wrote it), so it becomes Automatic (L for DLAA/Quality, M for Balanced/Performance,
+        // Cort 2026-11-04); any other old choice is kept.
         wchar_t pz[16] = {};
-        GetPrivateProfileStringW(L"j2", L"preset", L"L", pz, 16, ini);
-        uint32_t pv = 12;
-        if (pz[0] >= L'0' && pz[0] <= L'9') pv = static_cast<uint32_t>(_wtoi(pz));
+        GetPrivateProfileStringW(L"j2", L"preset_v2", L"", pz, 16, ini);
+        const bool v2 = pz[0] != 0;
+        if (!v2) GetPrivateProfileStringW(L"j2", L"preset", L"auto", pz, 16, ini);
+        uint32_t pv = 255;
+        if (!_wcsicmp(pz, L"auto")) pv = 255;
+        else if (pz[0] >= L'0' && pz[0] <= L'9') pv = static_cast<uint32_t>(_wtoi(pz));
         else if (!_wcsicmp(pz, L"default")) pv = 0;
-        else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 12; }
-        target.j2_preset.store(pv > 26 ? 12 : pv);
+        else if (pz[0] && !pz[1]) { const wchar_t c = towupper(pz[0]); pv = (c >= L'A' && c <= L'Z') ? static_cast<uint32_t>(c - L'A' + 1) : 255; }
+        if (!v2 && pv == 12) pv = 255;
+        target.j2_preset.store(pv > 26 && pv != 255 ? 255 : pv);
+        const uint32_t sm = GetPrivateProfileIntW(L"j2", L"scale_mode", 0, ini);
+        target.j2_scale_mode.store(sm > 4 ? 0 : sm);
+        const uint32_t jf = GetPrivateProfileIntW(L"j2", L"jitter_conv_flow", 0, ini);
+        const uint32_t jn = GetPrivateProfileIntW(L"j2", L"jitter_conv_final", 0, ini);
+        target.j2_jitter_conv_flow.store(jf > 3 ? 0 : jf);
+        target.j2_jitter_conv_final.store(jn > 3 ? 0 : jn);
+        const int js = static_cast<int>(GetPrivateProfileIntW(L"j2", L"jitter_shift", 1, ini));
+        target.j2_jitter_shift.store(js < 0 ? -1 : (js > 0 ? 1 : 0));
+        const int vj = static_cast<int>(GetPrivateProfileIntW(L"j2", L"viewport_jitter", 1, ini));
+        target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
+        target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);
     }
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
@@ -170,6 +245,37 @@ void SetIniPath(const wchar_t* path)
     if (path) wcsncpy_s(g_ini_defaults, path, _TRUNCATE);
 }
 
+namespace {
+char g_effective[1024] = {};
+// Where a key's effective value came from: the user ini wins when it holds the key
+// (load order above), else the game's deployed ini, else the built-in default.
+const char* source_of(const wchar_t* section, const wchar_t* key)
+{
+    wchar_t v[8] = {};
+    if (g_ini_user[0] && GetPrivateProfileStringW(section, key, L"\x01", v, 8, g_ini_user) && v[0] != 1) return "user";
+    if (g_ini_defaults[0] && GetPrivateProfileStringW(section, key, L"\x01", v, 8, g_ini_defaults) && v[0] != 1) return "game";
+    return "builtin";
+}
+void describe_effective()
+{
+    // Astra 20cddb8 point 5: the 05dc62b deploy log printed flow_loosen=50/preset L while the
+    // game ran 0/M from the saved user choices. Log every effective value with its source.
+    std::snprintf(g_effective, sizeof g_effective,
+        "settings_effective game_ini=\"%ls\" user_ini=\"%ls\" j2.flow_loosen=%u(%s) j2.preset=%u(%s) j2.sharpen=%u(%s) "
+        "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s)",
+        g_ini_defaults, g_ini_user,
+        g_settings.j2_flow_loosen.load(), source_of(L"j2", L"flow_loosen"),
+        g_settings.j2_preset.load(), [] { const char* s = source_of(L"j2", L"preset_v2"); return strcmp(s, "builtin") ? s : source_of(L"j2", L"preset"); }(),
+        g_settings.j2_sharpness.load(), source_of(L"j2", L"sharpen"),
+        g_settings.j2_hud_nis.load(), source_of(L"j2", L"hud_nis"),
+        g_settings.j2_scale_mode.load(), source_of(L"j2", L"scale_mode"),
+        g_settings.j2_mip_bias_x100.load(), source_of(L"j2", L"mip_bias"),
+        g_settings.dlss_mode.load(), source_of(L"dlss", L"mode"),
+        g_settings.preset.load(), source_of(L"dlss", L"preset"));
+}
+} // namespace
+const char* EffectiveSummary() { return g_effective; }
+
 const wchar_t* UserIniPath()
 {
     resolve_user_ini();
@@ -196,10 +302,24 @@ void Load()
         g_settings.j2_capture_frames.store(f < 1 ? 1u : (f > 240 ? 240u : f));
         g_settings.j2_capture_key.store(GetPrivateProfileIntW(L"j2", L"capture_key", 0x77, g_ini_defaults) & 0xFFu);
         g_settings.j2_capture_after_s.store(GetPrivateProfileIntW(L"j2", L"capture_after_seconds", 0, g_ini_defaults));
+        // Automatic evidence captures (test packages): sessions per run, cooldown between them.
+        g_settings.j2_capture_auto.store(GetPrivateProfileIntW(L"j2", L"capture_auto", 0, g_ini_defaults));
+        g_settings.j2_capture_cooldown_s.store(GetPrivateProfileIntW(L"j2", L"capture_cooldown_seconds", 20, g_ini_defaults));
     }
 #define REMEMBER(member) g_loaded_values.member.store(g_settings.member.load());
     NA_PERSISTED_FIELDS(REMEMBER)
 #undef REMEMBER
+    // Jitter calibration starts from this game's saved verdicts (Cort 2026-11-04: no re-learning
+    // window after scene changes or at launch); a new verdict is saved again.
+    na::jitter::Remembered().enabled.store(true);
+    if (const uint32_t c = g_settings.j2_jitter_conv_flow.load()) na::jitter::Remembered().Put(na::jitter::kStageFlow, 0, c);
+    if (const uint32_t c = g_settings.j2_jitter_conv_final.load()) na::jitter::Remembered().Put(na::jitter::kStageFinal, 0, c);
+    na::jitter::OnRemember() = [](uint32_t stage, uint32_t c) {
+        auto& slot = stage == na::jitter::kStageFlow ? g_settings.j2_jitter_conv_flow : g_settings.j2_jitter_conv_final;
+        if (stage != na::jitter::kStageFlow && stage != na::jitter::kStageFinal) return;
+        if (slot.exchange(c) != c) Save();
+    };
+    describe_effective();
 
 }
 
@@ -226,6 +346,8 @@ bool SaveFromWorker()
     ok &= WritePrivateProfileStringW(L"dlss", L"rr_preset", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.text_bold.load());
     ok &= WritePrivateProfileStringW(L"overlay", L"text_bold", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.fill_screen.load());
+    ok &= WritePrivateProfileStringW(L"present", L"fill_screen", v, ini) != 0;
     struct { const wchar_t* key; int32_t value; } win[] = {
         {L"win_x", g_settings.win_x.load()}, {L"win_y", g_settings.win_y.load()},
         {L"win_w", g_settings.win_w.load()}, {L"win_h", g_settings.win_h.load()}};
@@ -242,6 +364,31 @@ bool SaveFromWorker()
         swprintf_s(v, L"%u", kv.value);
         ok &= WritePrivateProfileStringW(L"nr", kv.key, v, ini) != 0;
     }
+    // Backend selection is automatic; remove the obsolete user preference.
+    ok &= WritePrivateProfileStringW(L"experimental",L"nvrhi",nullptr,ini)!=0;
+    const struct { const wchar_t* key; uint32_t value; } donut[] = {
+        {L"bloom",g_settings.donut_bloom.load()},
+        {L"amount",g_settings.donut_amount.load()},
+        {L"exposure",g_settings.donut_bias.load()}, /* was "bias" (absolute exposure, default -0.5 stops) until 2026-11-05 */
+        {L"white",g_settings.donut_white.load()},
+        {L"speed_up",g_settings.donut_speed_up.load()},
+        {L"speed_down",g_settings.donut_speed_down.load()},
+        {L"curve",g_settings.donut_curve.load()},
+        {L"bloom_amount",g_settings.donut_bloom_amount.load()},
+        {L"bloom_sigma",g_settings.donut_bloom_sigma.load()},
+        {L"bloom_threshold",g_settings.donut_bloom_threshold.load()}};
+    for (const auto& kv : donut) { swprintf_s(v,L"%u",kv.value);ok &= WritePrivateProfileStringW(L"donut",kv.key,v,ini)!=0; }
+    const struct { const wchar_t* key; uint32_t value; } ao[] = {
+        {L"enabled",g_settings.xegtao_enabled.load()}, {L"amount",g_settings.xegtao_amount.load()},
+        {L"quality",g_settings.xegtao_quality.load()}, {L"radius_x1000",g_settings.xegtao_radius_x1000.load()},
+        {L"denoise",g_settings.xegtao_denoise.load()}, {L"radius_multiplier",g_settings.xegtao_radius_multiplier.load()},
+        {L"falloff",g_settings.xegtao_falloff.load()}, {L"sample_distribution",g_settings.xegtao_sample_distribution.load()},
+        {L"thin_occluder",g_settings.xegtao_thin_occluder.load()}, {L"final_power",g_settings.xegtao_final_power.load()},
+        {L"depth_mip_offset",g_settings.xegtao_depth_mip_offset.load()}, {L"temporal",g_settings.xegtao_temporal.load()}};
+    for (const auto& kv : ao) {
+        swprintf_s(v,L"%u",kv.value);
+        ok &= WritePrivateProfileStringW(L"xegtao",kv.key,v,ini)!=0;
+    }
     struct { const wchar_t* key; uint32_t value; } motion[] = {
         {L"enabled", PersistedSwitch(2,g_settings.motion_enabled.load())}, {L"grid", g_settings.motion_grid.load()}, {L"perf", g_settings.motion_perf.load()},
         {L"downscale", g_settings.motion_downscale.load()}};
@@ -249,15 +396,39 @@ bool SaveFromWorker()
         swprintf_s(v, L"%u", kv.value);
         ok &= WritePrivateProfileStringW(L"motion", kv.key, v, ini) != 0;
     }
-    swprintf_s(v, L"%u", g_settings.j2_sharpness.load());
-    ok &= WritePrivateProfileStringW(L"j2", L"sharpness", v, ini) != 0;
+    const auto sharpness = g_settings.j2_sharpness.load();
+    swprintf_s(v, L"%u", sharpness > 100 ? 100 : sharpness);
+    ok &= WritePrivateProfileStringW(L"j2", L"sharpen", v, ini) != 0;
+    WritePrivateProfileStringW(L"j2", L"sharpness", nullptr, ini); // the old RCAS-scale key
+    swprintf_s(v, L"%u", (std::min)(g_settings.j2_hud_nis.load(), 100u));
+    ok &= WritePrivateProfileStringW(L"j2", L"hud_nis", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.j2_flow_loosen.load() > 100 ? 100u : g_settings.j2_flow_loosen.load());
+    ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.aniso16.load());
+    ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", v, ini) != 0;
+    ok &= WritePrivateProfileStringW(L"j2", L"jitter_sequence", g_settings.j2_jitter_r2.load() ? L"r2" : L"halton", ini) != 0;
+    ok &= WritePrivateProfileStringW(L"j2", L"draw_replay", g_settings.j2_draw_replay.load() ? L"1" : L"0", ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
-        if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
+        if (pv == 255) swprintf_s(v, L"auto");
+        else if (pv >= 1 && pv <= 26) swprintf_s(v, L"%c", static_cast<wchar_t>(L'A' + pv - 1));
         else swprintf_s(v, L"default");
+        ok &= WritePrivateProfileStringW(L"j2", L"preset_v2", v, ini) != 0;
+        // Older builds read [j2] preset: they get L for Automatic.
+        if (pv == 255) swprintf_s(v, L"L");
         ok &= WritePrivateProfileStringW(L"j2", L"preset", v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.j2_scale_mode.load());
+        ok &= WritePrivateProfileStringW(L"j2", L"scale_mode", v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.j2_jitter_conv_flow.load());
+        ok &= WritePrivateProfileStringW(L"j2", L"jitter_conv_flow", v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.j2_jitter_conv_final.load());
+        ok &= WritePrivateProfileStringW(L"j2", L"jitter_conv_final", v, ini) != 0;
         swprintf_s(v, L"%.2f", static_cast<int32_t>(PersistedSwitch(5,static_cast<uint32_t>(g_settings.j2_mip_bias_x100.load()))) / 100.0);
         ok &= WritePrivateProfileStringW(L"j2", L"mip_bias", v, ini) != 0;
+        const int32_t detail = g_settings.j2_texture_detail_x100.load();
+        if (detail > 0) swprintf_s(v, L"auto");
+        else swprintf_s(v, L"%.2f", detail / 100.0);
+        ok &= WritePrivateProfileStringW(L"j2", L"texture_detail", v, ini) != 0;
     }
     swprintf_s(v, L"%d", static_cast<int32_t>(PersistedSwitch(4,static_cast<uint32_t>(g_settings.reflex_mode.load()))));
     ok &= WritePrivateProfileStringW(L"latency", L"reflex", v, ini) != 0;
@@ -290,6 +461,31 @@ void DeferForRenderer(SaveDispatcher dispatcher){
 }
 void PublishRendererReady(){g_renderer_ready.store(true,std::memory_order_release);}
 uint32_t LastSaveResult() { return g_last_save.load(); }
+
+// Event log: every persisted setting change, with old and new value and who made it
+// (the caller's source tag; the panel, ini reload and mode commit set one).
+void WatchChanges(const char* source)
+{
+    static std::mutex m;
+    static bool primed = false;
+    static int64_t last[256];
+    std::lock_guard<std::mutex> lk(m);
+    na::eventlog::ScopedSource tag(source ? source : na::eventlog::Source());
+    int i = 0;
+#define WATCH(member) { const int64_t v = static_cast<int64_t>(g_settings.member.load()); \
+        if (i < 256) { if (primed && last[i] != v) na::eventlog::Emit("setting", "%s=%lld was=%lld", #member, (long long)v, (long long)last[i]); last[i] = v; } ++i; }
+    NA_PERSISTED_FIELDS(WATCH)
+#undef WATCH
+    if (!primed) { // the whole persisted table once, in chunks, so every run starts with all values
+        std::string chunk;
+#define DUMP(member) { char kv[64]; snprintf(kv, sizeof kv, " %s=%lld", #member, static_cast<long long>(g_settings.member.load())); \
+        if (chunk.size() + strlen(kv) > 400) { na::eventlog::Emit("settings_all", "%s", chunk.c_str()); chunk.clear(); } chunk += kv; }
+        NA_PERSISTED_FIELDS(DUMP)
+#undef DUMP
+        if (!chunk.empty()) na::eventlog::Emit("settings_all", "%s", chunk.c_str());
+    }
+    primed = true;
+}
 
 namespace {
 void apply_recovery(bool unclean,uint32_t reason){

@@ -6,8 +6,8 @@
 //   - resource / heap / descriptor-heap / list / fence / queue creations with
 //     their parameters, placed-resource heap linkage;
 //   - descriptor writes resolved to (heap, slot) with versions, a CBV resolved
-//     through the GPU VA table, a view of an unobserved resource marked
-//     UNKNOWN (never invented), CopyDescriptorsSimple versions;
+//     through the GPU VA table, a view discovers a preexisting resource while
+//     retaining UNKNOWN creation provenance, CopyDescriptorsSimple versions;
 //   - queue execute with list refs and tickets, signal/wait provenance;
 //   - OBJECT_RETIRED on final release (private-data sentinel).
 #include "test_support.hpp"
@@ -18,12 +18,19 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
 std::mutex g_m;
 std::vector<std::vector<uint8_t>> g_events;
 std::atomic<unsigned> g_invalid_reports{0};
+HANDLE g_drain_entered = nullptr, g_drain_resume = nullptr;
+void PauseDeferredApply()
+{
+    SetEvent(g_drain_entered);
+    WaitForSingleObject(g_drain_resume, 5000);
+}
 struct ObserveSession {
     bool running = false;
     ~ObserveSession() { if (running) na_observe_stop(); }
@@ -80,7 +87,7 @@ int main()
     if (!test::CreateDevice(d)) return test::SkipNoDevice("observe_producers_test");
     ID3D12Device* dev = d.device.Get();
 
-    // Created BEFORE installation: unknown to the producers.
+    // Created BEFORE installation: first discovered through its later view.
     auto early = test::CreateBuffer(dev, 4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
     REQUIRE(early);
 
@@ -132,6 +139,17 @@ int main()
         CHECK(!na::observe::ResolveGpuVa(cbuf->GetGPUVirtualAddress() + 65536 + 4096 * 64, &r, &off) || r != cbuf_id);
     }
 
+    {
+        // FindTextures answers from the (w, h) index: exact size and format, nothing else.
+        const uint32_t rgba8[] = {DXGI_FORMAT_R8G8B8A8_UNORM};
+        const uint32_t f16[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_FLOAT};
+        na_object_id found[4] = {};
+        CHECK(na::observe::FindTextures(rgba8, 1, 64, 32, found, 4) == 1 && found[0] == placed_id);
+        CHECK(na::observe::FindTextures(f16, 2, 128, 64, found, 4) == 1 && found[0] == rt_id);
+        CHECK(na::observe::FindTextures(f16, 2, 64, 32, found, 4) == 0);   // right size, other format
+        CHECK(na::observe::FindTextures(rgba8, 1, 64, 64, found, 4) == 0); // no texture of that size
+    }
+
     std::printf("checkpoint 3\n"); std::fflush(stdout);
     // Descriptor heaps and writes.
     D3D12_DESCRIPTOR_HEAP_DESC dhd{};
@@ -153,16 +171,27 @@ int main()
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{cbuf->GetGPUVirtualAddress() + 256, 256};
     dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 4 * inc});
     // Buffers have UNKNOWN resource format, so no typed default SRV exists.
-    // Keep the resource unobserved while supplying a valid buffer view.
+    // Supplying its valid view discovers the live object, without inventing
+    // its creation method or initial state.
     D3D12_SHADER_RESOURCE_VIEW_DESC early_srv{};
     early_srv.Format = DXGI_FORMAT_R32_UINT;
     early_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     early_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     early_srv.Buffer.NumElements = 4096 / sizeof(uint32_t);
     dev->CreateShaderResourceView(early.Get(), &early_srv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 5 * inc});
+    const auto early_id = na::observe::IdOf(early.Get());
+    REQUIRE(early_id && early_id != NA_UNKNOWN_U64);
     REQUIRE(SUCCEEDED(dev->GetDeviceRemovedReason()));
     dev->CopyDescriptorsSimple(3, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + inc},
                                s3, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    {
+        // A translation layer's table gather: one destination range, one single-descriptor source per view
+        // (applied as one unit by the batched copy path; same events as run by run).
+        const D3D12_CPU_DESCRIPTOR_HANDLE gather_dst{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc};
+        const UINT gather_n = 2;
+        const D3D12_CPU_DESCRIPTOR_HANDLE gather_src[2] = {D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 5 * inc}, s3};
+        dev->CopyDescriptors(1, &gather_dst, &gather_n, 2, gather_src, nullptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
     dev->CreateRenderTargetView(rt.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
 
     std::printf("checkpoint 4\n"); std::fflush(stdout);
@@ -192,12 +221,40 @@ int main()
     std::printf("checkpoint 4.8\n"); std::fflush(stdout);
 
     std::printf("checkpoint 5\n"); std::fflush(stdout);
+    // The creation inventory must not keep its old aspect after a real resize.
+    // Zero width/height are resolved by DXGI, not published as zero/requested size.
+    HWND resize_window=test::CreateTestWindow(L"Observer resize",480,300);
+    REQUIRE(resize_window);
+    DXGI_SWAP_CHAIN_DESC1 sd{};sd.Width=1024;sd.Height=768;
+    sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;sd.SampleDesc.Count=1;
+    sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;sd.BufferCount=2;sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    test::ComPtr<IDXGISwapChain1> chain;
+    REQUIRE(SUCCEEDED(d.factory->CreateSwapChainForHwnd(d.queue.Get(),resize_window,&sd,nullptr,nullptr,&chain)));
+    const auto present=na::observe::PresentBegin(chain.Get());
+    REQUIRE(present.swapchain);
+    const auto resized=chain->ResizeBuffers(0,0,0,DXGI_FORMAT_UNKNOWN,0);
+    REQUIRE(SUCCEEDED(resized));na::observe::SwapchainResized(chain.Get(),resized);
+    DXGI_SWAP_CHAIN_DESC actual{};REQUIRE(SUCCEEDED(chain->GetDesc(&actual)));
+    test::ComPtr<ID3D12Resource> retained;
+    REQUIRE(SUCCEEDED(chain->GetBuffer(0,IID_PPV_ARGS(&retained))));
+    const auto failed=chain->ResizeBuffers(0,1280,720,DXGI_FORMAT_UNKNOWN,0);
+    REQUIRE(FAILED(failed));na::observe::SwapchainResized(chain.Get(),failed);retained.Reset();
     // Retirement: the last reference goes away.
     placed.Reset();
     REQUIRE(na_observe_resync() == NA_OK);
     REQUIRE(na_observe_stop() == NA_OK);
     session.running = false;
     CHECK(g_invalid_reports.load() == 0);
+    const auto resized_events=All<na_ev_swapchain_resized>(NA_EV_SWAPCHAIN_RESIZED);
+    REQUIRE(resized_events.size()==2);
+    CHECK(resized_events[0].swapchain==present.swapchain && resized_events[0].hresult>=0);
+    CHECK(resized_events[0].width==actual.BufferDesc.Width && resized_events[0].height==actual.BufferDesc.Height);
+    CHECK(resized_events[0].format==static_cast<uint32_t>(sd.Format) && resized_events[0].buffer_count==2);
+    CHECK(resized_events[1].hresult==failed && resized_events[1].width==NA_UNKNOWN_U32);
+    const auto replayed=All<na_ev_swapchain_created>(NA_EV_SWAPCHAIN_CREATED);
+    REQUIRE(!replayed.empty());
+    CHECK(replayed.back().swapchain==present.swapchain && replayed.back().width==actual.BufferDesc.Width && replayed.back().height==actual.BufferDesc.Height);
+    chain.Reset();DestroyWindow(resize_window);
 
     std::printf("checkpoint 6\n"); std::fflush(stdout);
     // ---- decode ----
@@ -220,7 +277,7 @@ int main()
     }
     {
         auto res = All<na_ev_resource_created>(NA_EV_RESOURCE_CREATED);
-        bool placed_ok = false, rt_ok = false, buf_ok = false;
+        bool placed_ok = false, rt_ok = false, buf_ok = false, preexisting_ok = false;
         for (const auto& r : res) {
             if (r.resource == placed_id)
                 placed_ok = r.creation_kind == NA_CREATE_PLACED && r.heap == heap_id && r.heap_offset == 0 && r.width == 64 &&
@@ -229,10 +286,14 @@ int main()
                 rt_ok = r.creation_kind == NA_CREATE_COMMITTED && r.format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
                         (r.resource_flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && r.initial_state == D3D12_RESOURCE_STATE_RENDER_TARGET;
             if (r.resource == cbuf_id) buf_ok = r.dimension == D3D12_RESOURCE_DIMENSION_BUFFER && r.heap_type == D3D12_HEAP_TYPE_UPLOAD;
+            if (r.resource == early_id) preexisting_ok = r.dimension == D3D12_RESOURCE_DIMENSION_BUFFER && r.width == 4096 &&
+                r.creation_kind == NA_CREATE_UNKNOWN && r.initial_state == NA_UNKNOWN_U32 && r.heap_offset == NA_UNKNOWN_U64 &&
+                (r.hdr.flags & NA_EVF_PREEXISTING) && (r.hdr.flags & NA_EVF_METHOD_UNOBSERVED);
         }
         CHECK(placed_ok);
         CHECK(rt_ok);
         CHECK(buf_ok);
+        CHECK(preexisting_ok);
         CHECK(!All<na_ev_resource_heap_created>(NA_EV_RESOURCE_HEAP_CREATED).empty());
     }
     const na_object_id staging_id = na::observe::IdOf(staging.Get()), srv_heap_id = na::observe::IdOf(srv_heap.Get());
@@ -246,23 +307,30 @@ int main()
         CHECK(vis && nonvis);
         auto writes = All<na_ev_descriptor_write>(NA_EV_DESCRIPTOR_WRITE);
         int srv_v = 0;
-        bool cbv_ok = false, unknown_ok = false, rtv_ok = false;
+        bool cbv_ok = false, discovered_ok = false, rtv_ok = false;
         for (const auto& w : writes) {
             if (w.heap == staging_id && w.slot == 3 && w.descriptor_kind == NA_DESC_SRV && w.resource == placed_id) srv_v = static_cast<int>(w.slot_version);
             if (w.heap == staging_id && w.slot == 4) cbv_ok = w.descriptor_kind == NA_DESC_CBV && w.resource == cbuf_id;
             if (w.heap == staging_id && w.slot == 5)
-                unknown_ok = w.resource == NA_UNKNOWN_U64 && (w.hdr.flags & NA_EVF_METHOD_UNOBSERVED);
+                discovered_ok = w.resource == early_id && w.descriptor_kind == NA_DESC_SRV;
             if (w.descriptor_kind == NA_DESC_RTV) rtv_ok = w.resource == rt_id && w.slot == 0;
         }
         CHECK(srv_v == 2);
         CHECK(cbv_ok);
-        CHECK(unknown_ok);
+        CHECK(discovered_ok);
         CHECK(rtv_ok);
         auto copies = All<na_ev_descriptor_copy>(NA_EV_DESCRIPTOR_COPY);
         bool copy_ok = false;
         for (const auto& c : copies)
             if (c.src_heap == staging_id && c.dst_heap == srv_heap_id && c.src_slot == 3 && c.dst_slot == 1 && c.slot_count == 3) copy_ok = true;
         CHECK(copy_ok);
+        bool gather_a = false, gather_b = false;
+        for (const auto& c : copies) {
+            if (c.src_heap == staging_id && c.dst_heap == srv_heap_id && c.src_slot == 5 && c.dst_slot == 6 && c.slot_count == 1) gather_a = true;
+            if (c.src_heap == staging_id && c.dst_heap == srv_heap_id && c.src_slot == 3 && c.dst_slot == 7 && c.slot_count == 1) gather_b = true;
+        }
+        CHECK(gather_a);
+        CHECK(gather_b);
     }
     {
         const na_object_id list_id = na::observe::IdOf(list.Get());
@@ -308,7 +376,76 @@ int main()
         for (const auto& r : All<na_ev_object_retired>(NA_EV_OBJECT_RETIRED))
             if (r.object == placed_id) retired = r.object_kind == NA_OBJ_RESOURCE;
         CHECK(retired);
+        const uint32_t rgba8[] = {DXGI_FORMAT_R8G8B8A8_UNORM};
+        na_object_id found[2] = {};
+        CHECK(na::observe::FindTextures(rgba8, 1, 64, 32, found, 2) == 0); // left the (w, h) index with its retirement
         CHECK(na::observe::IdOf(placed.Get()) == 0);
+    }
+    {
+        // A consumer that does not read descriptor events (na_observe_skip_kinds): the
+        // producers keep their bookkeeping but emit nothing, and skipped events are not
+        // numbered, so the thread's sequence stays gap-free (a gap would read as lost events).
+        { std::lock_guard<std::mutex> lock(g_m); g_events.clear(); }
+        const auto before = na::observe::GetProducerStats();
+        REQUIRE(na_observe_skip_kinds((1ull << NA_EV_DESCRIPTOR_WRITE) | (1ull << NA_EV_DESCRIPTOR_COPY)) == NA_OK);
+        REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
+        session.running = true;
+        test::ComPtr<ID3D12Fence> fa, fb;
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fa))));
+        dev->CreateShaderResourceView(rt.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc}); // placed was released above
+        // A second view of a resource this thread already resolved is queued on the thread
+        // (deferred view writes) and applied before the copy below reads the slot.
+        dev->CreateShaderResourceView(rt.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc});
+        dev->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 7 * inc});
+        dev->CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE{srv_heap->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc},
+                                   D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc}, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        REQUIRE(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fb))));
+        // A detached batch is still pending until it is applied. A second registry
+        // reader must not pass the drain and observe the old descriptor metadata.
+        g_drain_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_drain_resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE reader_started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE reader_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        REQUIRE(g_drain_entered && g_drain_resume && reader_started && reader_done);
+        na::observe::SetDeferredApplyProbeForTests(&PauseDeferredApply);
+        dev->CreateShaderResourceView(rt.Get(), nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{s0.ptr + 6 * inc});
+        std::thread drainer([&] { na::observe::IdOf(rt.Get()); });
+        const DWORD entered = WaitForSingleObject(g_drain_entered, 5000);
+        CHECK(entered == WAIT_OBJECT_0);
+        std::thread reader([&] {
+            SetEvent(reader_started);
+            na::observe::IdOf(rt.Get());
+            SetEvent(reader_done);
+        });
+        CHECK(WaitForSingleObject(reader_started, 5000) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(reader_done, 100) == WAIT_TIMEOUT);
+        SetEvent(g_drain_resume);
+        drainer.join(); reader.join();
+        na::observe::SetDeferredApplyProbeForTests(nullptr);
+        CHECK(WaitForSingleObject(reader_done, 0) == WAIT_OBJECT_0);
+        CloseHandle(g_drain_entered); CloseHandle(g_drain_resume);
+        CloseHandle(reader_started); CloseHandle(reader_done);
+        na_observe_status status{};
+        status.size_bytes = sizeof(status);
+        REQUIRE(na_observe_query_status(&status) == NA_OK);
+        REQUIRE(na_observe_stop() == NA_OK);
+        session.running = false;
+        const auto after = na::observe::GetProducerStats();
+        CHECK(CountKind(NA_EV_DESCRIPTOR_WRITE) == 0);
+        CHECK(CountKind(NA_EV_DESCRIPTOR_COPY) == 0);
+        CHECK(after.descriptor_writes == before.descriptor_writes + 4); // both queued writes were applied
+        CHECK(after.descriptor_copies == before.descriptor_copies + 1);
+        uint32_t seq_a = 0, seq_b = 0;
+        const na_object_id fa_id = na::observe::IdOf(fa.Get()), fb_id = na::observe::IdOf(fb.Get());
+        for (const auto& f : All<na_ev_fence_created>(NA_EV_FENCE_CREATED)) {
+            if (f.fence == fa_id) seq_a = static_cast<uint32_t>(f.hdr.thread_seq);
+            if (f.fence == fb_id) seq_b = static_cast<uint32_t>(f.hdr.thread_seq);
+        }
+        CHECK(seq_a != 0 && seq_b == seq_a + 1);
+        CHECK(status.foundational_dropped == 0 && status.detail_dropped == 0);
+        std::printf("skip kinds: fence seq %u -> %u, writes +%llu copies +%llu\n", seq_a, seq_b,
+                    static_cast<unsigned long long>(after.descriptor_writes - before.descriptor_writes),
+                    static_cast<unsigned long long>(after.descriptor_copies - before.descriptor_copies));
     }
     const auto st = na::observe::GetProducerStats();
     std::printf("producers: live %llu created %llu retired %llu writes %llu copies %llu unresolved %llu sentinel-fail %llu executes %llu\n",

@@ -13,6 +13,60 @@ permissions:
   pull-requests: write # failing-test output is posted on the branch's PR (annotations cap at 10 lines)
 
 jobs:
+  windows-x86-scope:
+    # Bring-up of 32-bit game support: lists what in the host does not build for Win32 yet.
+    # Informational until the 32-bit in-game half builds; it never fails the run.
+    name: Windows x86 (MSVC) scope listing, informational
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Win32
+        run: cmake -S . -B build32 -A Win32 -DNA_ALLOW_X86=ON
+      - name: Build Release, keep going, summarise errors
+        shell: pwsh
+        run: |
+          cmake --build build32 --config Release --parallel -- /p:StopOnFirstFailure=false 2>&1 | Out-File -FilePath build32-log.txt -Encoding utf8
+          $errs = Select-String -Path build32-log.txt -Pattern ': (fatal )?error [A-Z]+[0-9]+|LINK : fatal|error MSB|: warning C[0-9]+'
+          Write-Output "X86-SCOPE total error lines: $($errs.Count)"
+          Write-Output "X86-SCOPE errors by project:"
+          $errs | ForEach-Object { if ($_.Line -match '\[([^\]]*\\)?([^\\\]]+)\.vcxproj\]') { $Matches[2] } else { '(none)' } } | Group-Object | Sort-Object Count -Descending | ForEach-Object { Write-Output ("  {0,5}  {1}" -f $_.Count, $_.Name) }
+          Write-Output "X86-SCOPE errors by code:"
+          $errs | ForEach-Object { if ($_.Line -match 'error ([A-Z]+[0-9]+)') { $Matches[1] } } | Group-Object | Sort-Object Count -Descending | ForEach-Object { Write-Output ("  {0,5}  {1}" -f $_.Count, $_.Name) }
+          Write-Output "X86-SCOPE first 300 distinct error lines:"
+          $errs | ForEach-Object { ($_.Line -replace '^\s+','') -replace ',\d+\)',')' } | Sort-Object -Unique | Select-Object -First 300 | ForEach-Object { Write-Output "  $_" }
+          Write-Output "X86-SCOPE targets built:"
+          $built = Select-String -Path build32-log.txt -Pattern '\.vcxproj -> ' | ForEach-Object { ($_.Line.Trim() -replace '^.*-> ','') -replace '^.*\\','' }
+          Write-Output ("  count: " + @($built).Count)
+          Write-Output ("  libraries and programs: " + ((@($built) | Where-Object { $_ -notmatch '^na_cpu_|_test\.exe$|_corpus\.exe$' }) -join ' '))
+          exit 0
+      - name: 32-bit tests (informational)
+        shell: pwsh
+        run: |
+          ctest --test-dir build32 -C Release --output-on-failure -LE gpu --timeout 120 2>&1 | Select-Object -Last 60
+          Write-Output "X86-SCOPE ctest exit code: $LASTEXITCODE"
+          exit 0
+      - name: Install script selftest with the 32-bit program
+        shell: powershell
+        run: |
+          $dll = Get-ChildItem -Path build32 -Recurse -Filter NeuralAliasDXGI.dll | Select-Object -First 1
+          if (-not $dll) { Write-Output 'X86-SCOPE no 32-bit NeuralAliasDXGI.dll was built'; exit 0 }
+          & .\tools\deploy-native11.selftest.ps1 -Dll $dll.FullName
+          Write-Output "X86-SCOPE install selftest exit code: $LASTEXITCODE"
+          exit 0
+      - name: 32-bit in-game half with the 64-bit DLAA companion, software device
+        shell: pwsh
+        run: |
+          cmake -S . -B build64c -A x64 | Select-Object -Last 3
+          cmake --build build64c --config Release --parallel --target NeuralAliasDlaa64 2>&1 | Select-Object -Last 5
+          $companion = Get-ChildItem -Path build64c -Recurse -Filter NeuralAliasDlaa64.exe | Select-Object -First 1
+          $test = Get-ChildItem -Path build32 -Recurse -Filter dlaa_companion_test.exe | Select-Object -First 1
+          if (-not $companion -or -not $test) { Write-Output "X86-SCOPE handoff: missing companion=$($companion.FullName) test=$($test.FullName)"; exit 0 }
+          Copy-Item $companion.FullName (Split-Path $test.FullName)
+          & $test.FullName --warp
+          Write-Output "X86-SCOPE 32-bit to 64-bit handoff exit code: $LASTEXITCODE"
+          exit 0
+
   windows:
     name: Windows x64 (MSVC) build + non-GPU tests
     runs-on: windows-latest
@@ -47,6 +101,12 @@ jobs:
               if ($l -match 'Failed|Timeout|\*\*\*|Not Run|tests failed') { Write-Output "::error::$l" }
             }
           exit $code
+      - name: DLAA companion handoff on the software device (informational)
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure -R host_dlaa_companion_warp_test --timeout 120 2>&1 | Select-Object -Last 30
+          Write-Output "DLAA-COMPANION warp ctest exit code: $LASTEXITCODE"
+          exit 0
       - name: Deployment script tests (C5)
         shell: pwsh
         run: |
@@ -212,3 +272,9 @@ jobs:
         run: cmake --build build --parallel
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Variants register
+        run: python3 scripts/check_variants.py
+      - name: Replay check self-test
+        run: python3 scripts/score_run.py --self-test
+      - name: Growth checker self-test
+        run: python3 tools/growth_checker selftest

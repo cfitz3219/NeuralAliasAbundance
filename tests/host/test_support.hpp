@@ -54,10 +54,15 @@ inline void DumpThreadStacks() {
             STACKFRAME64 f{};
             std::string lines;
             bool idle_pool = false;
-            f.AddrPC.Offset = ctx.Rip; f.AddrPC.Mode = AddrModeFlat;
-            f.AddrFrame.Offset = ctx.Rbp; f.AddrFrame.Mode = AddrModeFlat;
-            f.AddrStack.Offset = ctx.Rsp; f.AddrStack.Mode = AddrModeFlat;
-            for (int i = 0; i < 48 && walk(IMAGE_FILE_MACHINE_AMD64, proc, th, &f, &ctx, nullptr, fta, modbase, nullptr) && f.AddrPC.Offset; ++i) {
+#if defined(_M_IX86)
+            const DWORD machine = IMAGE_FILE_MACHINE_I386;
+            f.AddrPC.Offset = ctx.Eip; f.AddrFrame.Offset = ctx.Ebp; f.AddrStack.Offset = ctx.Esp;
+#else
+            const DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+            f.AddrPC.Offset = ctx.Rip; f.AddrFrame.Offset = ctx.Rbp; f.AddrStack.Offset = ctx.Rsp;
+#endif
+            f.AddrPC.Mode = AddrModeFlat; f.AddrFrame.Mode = AddrModeFlat; f.AddrStack.Mode = AddrModeFlat;
+            for (int i = 0; i < 48 && walk(machine, proc, th, &f, &ctx, nullptr, fta, modbase, nullptr) && f.AddrPC.Offset; ++i) {
                 const DWORD64 pc = f.AddrPC.Offset, base = modbase(proc, pc);
                 char mod[MAX_PATH] = "?";
                 if (base) { GetModuleFileNameA(reinterpret_cast<HMODULE>(base), mod, MAX_PATH); }
@@ -145,9 +150,10 @@ struct Device {
     void WaitIdle() { SignalAndWait(queue.Get(), fence.Get(), fence_value, event, device.Get(), "WaitIdle"); }
 };
 // Returns false when no D3D12 device (hardware or WARP) can be created.
+// NA_TEST_FORCE_WARP=1 reproduces software-runner failures on a hardware PC.
 inline bool CreateDevice(Device& d, bool allow_warp = true) {
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&d.factory)))) return false;
-    for (UINT i = 0;; ++i) {
+    for (UINT i = 0; !GetEnvironmentVariableW(L"NA_TEST_FORCE_WARP",nullptr,0); ++i) {
         ComPtr<IDXGIAdapter1> a;
         if (d.factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&a)) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc{}; a->GetDesc1(&desc);

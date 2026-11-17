@@ -3,6 +3,10 @@
 #include <windows.h>
 
 #include <MinHook.h>
+#if defined(NA_HAVE_DETOURS)
+#include <detours.h>
+#include <tlhelp32.h>
+#endif
 
 #include <map>
 #include <mutex>
@@ -20,6 +24,7 @@ struct HookRecord {
     void* trampoline = nullptr;
     bool enabled = false;
     bool dead = false; // A46: was enabled once, could not be cleanly removed; unpatched, trampoline kept
+    std::vector<void**> outs; // Detours engine: every published original (re-pointed on attach/detach)
 };
 // Keyed by the concrete target function. Guarded by g_mutex.
 std::map<void*, HookRecord> g_hooks;
@@ -44,6 +49,116 @@ uint32_t g_dead_count = 0;
 
 thread_local int t_detour_depth = 0;
 
+// ---- Hooking engine (Cort 2026-11-05: Microsoft Detours as an opt-in alternative).
+// MinHook (default): create disabled with a trampoline at once, then enable / disable / remove.
+// Detours: a hook exists only while attached, so "create" records the target and publishes
+// the TARGET itself as the original (calling it directly is correct while nothing is
+// patched); "enable" attaches in one transaction with every other thread of the process
+// enlisted (Detours, unlike MinHook, only fixes up threads it is told about), and every
+// published original gets the trampoline BEFORE the commit writes the jump; "disable"
+// detaches the same way and points every published original back at the target; "remove"
+// has nothing left to do.
+Engine g_engine = Engine::MinHook;
+
+#if defined(NA_HAVE_DETOURS)
+// Every other thread of this process, opened for Detours' instruction-pointer fix-up.
+struct Threads {
+    std::vector<HANDLE> h;
+    ~Threads() { for (HANDLE t : h) CloseHandle(t); }
+};
+bool enlist_threads(Threads& t)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof te;
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        if (HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID)) t.h.push_back(th);
+    }
+    CloseHandle(snap);
+    return true;
+}
+bool detours_attach(void* target, HookRecord& r)
+{
+    Threads threads;
+    if (!enlist_threads(threads)) return false;
+    if (DetourTransactionBegin() != NO_ERROR) return false;
+    for (HANDLE th : threads.h) DetourUpdateThread(th);
+    PVOID pointer = target;
+    PDETOUR_TRAMPOLINE trampoline = nullptr;
+    if (DetourAttachEx(&pointer, r.detour, &trampoline, nullptr, nullptr) != NO_ERROR || !trampoline) {
+        DetourTransactionAbort();
+        return false;
+    }
+    // Publish before the jump lands (A45): the trampoline is complete once attached.
+    for (void** o : r.outs) if (o) *o = trampoline;
+    if (DetourTransactionCommit() != NO_ERROR) {
+        for (void** o : r.outs) if (o) *o = target;
+        return false;
+    }
+    r.trampoline = trampoline;
+    return true;
+}
+bool detours_detach(void* target, HookRecord& r)
+{
+    Threads threads;
+    if (!enlist_threads(threads)) return false;
+    if (DetourTransactionBegin() != NO_ERROR) return false;
+    for (HANDLE th : threads.h) DetourUpdateThread(th);
+    PVOID pointer = r.trampoline;
+    if (DetourDetach(&pointer, r.detour) != NO_ERROR) {
+        DetourTransactionAbort();
+        return false;
+    }
+    if (DetourTransactionCommit() != NO_ERROR) return false;
+    for (void** o : r.outs) if (o) *o = target;
+    r.trampoline = target;
+    return true;
+}
+#endif
+
+bool engine_init()
+{
+    if (g_engine == Engine::Detours) return true;
+    return MH_Initialize() == MH_OK;
+}
+bool engine_uninit()
+{
+    if (g_engine == Engine::Detours) return true;
+    return MH_Uninitialize() == MH_OK;
+}
+// Creates the hook disabled; *trampoline is what callers may call meanwhile.
+bool engine_create(void* target, void* detour, void** trampoline)
+{
+    if (g_engine == Engine::Detours) { *trampoline = target; return true; }
+    return MH_CreateHook(target, detour, trampoline) == MH_OK;
+}
+bool engine_enable(void* target, HookRecord& r)
+{
+#if defined(NA_HAVE_DETOURS)
+    if (g_engine == Engine::Detours) return detours_attach(target, r);
+#endif
+    (void)r;
+    return MH_EnableHook(target) == MH_OK;
+}
+bool engine_disable(void* target, HookRecord& r)
+{
+#if defined(NA_HAVE_DETOURS)
+    if (g_engine == Engine::Detours) return detours_detach(target, r);
+#endif
+    (void)r;
+    return MH_DisableHook(target) == MH_OK;
+}
+bool engine_remove(void* target, bool* not_created)
+{
+    if (g_engine == Engine::Detours) { if (not_created) *not_created = false; return true; }
+    const MH_STATUS st = MH_RemoveHook(target);
+    if (not_created) *not_created = st == MH_ERROR_NOT_CREATED;
+    return st == MH_OK || st == MH_ERROR_NOT_CREATED;
+}
+
 void set_error(const char* text)
 {
     lstrcpynA(g_last_error, text, sizeof(g_last_error));
@@ -55,13 +170,14 @@ void set_error(const char* text)
 bool disable_checked(void* target)
 {
     if (g_fail_next_disable_for_test) { g_fail_next_disable_for_test = false; return false; }
-    return MH_DisableHook(target) == MH_OK;
+    auto it = g_hooks.find(target);
+    if (it == g_hooks.end()) return false;
+    return engine_disable(target, it->second);
 }
 bool remove_checked(void* target)
 {
     if (g_fail_next_remove_for_test) { g_fail_next_remove_for_test = false; return false; }
-    MH_STATUS st = MH_RemoveHook(target);
-    return st == MH_OK || st == MH_ERROR_NOT_CREATED;
+    return engine_remove(target, nullptr);
 }
 // Marks a record dead after a failed cleanup: kept, never reused, counted.
 void retain_dead_locked(void* target, const char* why)
@@ -92,6 +208,7 @@ bool hook_target_locked(void* target, void* detour, void** out_original, bool en
         // programming error we refuse rather than silently chain.
         if (it->second.detour != detour || it->second.dead) { set_error("target already owned by another detour or retired hook"); return false; }
         *out_original = it->second.trampoline;
+        it->second.outs.push_back(out_original);
         if (!enable) {
             // A46 (A45 review finding 1): a pending target published to a
             // second variable is tracked too, so Abandon nulls both.
@@ -100,17 +217,17 @@ bool hook_target_locked(void* target, void* detour, void** out_original, bool en
         return true;
     }
     void* trampoline = nullptr;
-    if (MH_CreateHook(target, detour, &trampoline) != MH_OK) {
-        set_error("MH_CreateHook failed");
+    if (!engine_create(target, detour, &trampoline)) {
+        set_error(g_engine == Engine::Detours ? "Detours: create failed" : "MH_CreateHook failed");
         return false;
     }
     // Publish BEFORE enabling (A45): a caller that reaches the detour the
     // instant the patch lands must find its original pointer already set.
     *out_original = trampoline;
-    g_hooks[target] = HookRecord{detour, trampoline, false, false};
+    g_hooks[target] = HookRecord{detour, trampoline, false, false, {out_original}};
     if (enable) {
-        if (MH_EnableHook(target) != MH_OK) {
-            set_error("MH_EnableHook failed");
+        if (!engine_enable(target, g_hooks[target])) {
+            set_error(g_engine == Engine::Detours ? "Detours: attach failed" : "MH_EnableHook failed");
             // A47: the failed hook is removed only if MinHook confirms it;
             // otherwise the record is retained dead and the original stays valid.
             if (remove_checked(target)) {
@@ -155,7 +272,7 @@ bool Initialize()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_init_refs == 0) {
-        if (MH_Initialize() != MH_OK) return false;
+        if (!engine_init()) return false;
     }
     ++g_init_refs;
     return true;
@@ -201,7 +318,7 @@ void Shutdown()
             return;
         }
         g_dead_count = 0;
-        if (MH_Uninitialize() != MH_OK) {
+        if (!engine_uninit()) {
             set_error("MH_Uninitialize failed");
             g_init_refs = 1;
         }
@@ -302,7 +419,7 @@ bool CommitInstall()
     for (Pending& p : g_pending) {
         auto it = g_hooks.find(p.target);
         if (it == g_hooks.end()) { ++index; continue; }
-        bool enabled = index != g_fail_enable_at_for_test && MH_EnableHook(p.target) == MH_OK;
+        bool enabled = index != g_fail_enable_at_for_test && engine_enable(p.target, it->second);
         ++index;
         if (enabled) {
             it->second.enabled = true;
@@ -341,6 +458,23 @@ void AbandonInstall()
     g_pending.clear();
     g_in_transaction = false;
 }
+
+bool SetEngine(Engine e)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_init_refs != 0) return e == g_engine; // fixed once a session started
+#if !defined(NA_HAVE_DETOURS)
+    if (e == Engine::Detours) return false;
+#endif
+    g_engine = e;
+    return true;
+}
+Engine CurrentEngine()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_engine;
+}
+const char* EngineName() { return CurrentEngine() == Engine::Detours ? "Microsoft Detours" : "MinHook"; }
 
 void FailNextCommitEnableForTest(int index)
 {

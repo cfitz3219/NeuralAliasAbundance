@@ -10,6 +10,10 @@ Re-vendored 2026-10-23 after the crash, at the same pins the original project re
 | NVAPI | 2026-10 main | 70d337db9186e968eab622f7e786de7e437faf3d | MIT | headers only (`nvapi.h`, `NvApiDriverSettings.h`, …); the runtime is the driver's `nvapi64.dll`, loaded dynamically |
 | FidelityFX SDK (ffx-api) | main 2026-06-24 | 60f4ea81909200d8542eca14dccb2628b763a9a3 | MIT | 3 headers only (`ffx_api.h`, `ffx_api_types.h`, `ffx_upscale.h`), SDK layout kept so relative includes work; the runtime is the game's own `amd_fidelityfx_*_dx12.dll` (C7) |
 | NVIDIA Image Scaling (NIS) | v1.0.3 | 35e13ba316c98eeecf16f37eae70ce88019911f6 | MIT | `NIS_Scaler.h`, `NIS_Config.h`, `NIS_Main.hlsl` (reference), `licence.txt`; `nis_scaler_embed.hpp` is generated from `NIS_Scaler.h` by `make_embed.py` (J2 Sharpness 101–200 %: sharpen-only, compiled at run time) |
+| AMD FidelityFX optical flow (FSR3 SDK) | release-FSR3-3.0.3 | a0632abf1350bb64c098573d84c42f053f053a6e | MIT | `ffx-opticalflow/`: optical-flow + SPD + core GPU headers and the 7 DX12 pass `.hlsl` files, unmodified; compiled by DXC at build time (P4-0c), no AMD runtime |
+| AMD FidelityFX Breadcrumbs (FidelityFX SDK) | v1.1.4 | c6efa6bf7f2027b3ec94f28578bb5965eabb9e55 | MIT | `ffx-breadcrumbs/`: Breadcrumbs component + the host headers and shared files it needs, unmodified; our own DX12 callbacks in `diag/gpu_breadcrumbs.cpp` (no AMD runtime) |
+| AMD D3D12 Memory Allocator | v3.0.1 | 9ef66bc14edd10dee0de3a545b98578363552f66 | MIT | `d3d12ma/`: `D3D12MemAlloc.h` + `.cpp`, unmodified; used via `gpu/mem_alloc.hpp` for our own resources |
+| Microsoft Detours | v4.0.1 | e4bfd6b03e50de46b47abfbd1e46b384f0c5f833 | MIT | `detours/src/` library sources, unmodified; opt-in hooking engine (`[hooking] engine=detours`), MinHook stays the default |
 
 Streamline rule (unchanged): TLOU ships interposer 1.4.7; no public 1.4.7 tag exists. Wrappers may forward
 without interpreting SL structs; interpreting any field requires runtime validation evidence first.
@@ -27,3 +31,7 @@ SDK compiles that feature out and the build stays green:
 | NVIDIA Optical Flow SDK 5 | `<root>/optical-flow/nvOpticalFlowD3D12.h` | `NA_HAVE_NVOF` | `nvof_flow_stub.cpp`: QueryCaps reports unavailable |
 | Reflex PCL stats | `<root>/pclstats/pclstats.h` | `NA_HAVE_PCL_STATS` | PCL stats inert |
 | DLSS runtime `nvngx_dlss.dll` | `<root>/nvidia-dlss-sdk/lib/Windows_x86_64/rel/` | (tests only) | DLSS GPU tests skipped |
+
+### Optional NVRHI backend
+
+Pinned MIT NVRHI and Microsoft DirectX-Headers are fetched at configure time by cmake/nvrhi.cmake. Pins and redistribution licences are preserved in third_party/nvrhi. Runtime off by default; no restricted NVIDIA SDK/model content is vendored.

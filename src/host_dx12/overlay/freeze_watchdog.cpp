@@ -11,6 +11,31 @@ namespace na::freeze {
 
 namespace {
 
+#if defined(_M_IX86)
+// 32-bit: there are no unwind tables, so follow the saved frame pointers. Every read is checked
+// first (a frame-pointer-omitted function can leave anything in EBP); the walk only ever moves up
+// the stack, so it ends. Safe to run while the target thread is suspended.
+uint32_t walk_context(CONTEXT& ctx, uint64_t* frames, uint32_t capacity)
+{
+    uint32_t n = 0;
+    if (capacity && ctx.Eip) frames[n++] = ctx.Eip;
+    DWORD frame = ctx.Ebp;
+    while (n < capacity && frame && !(frame & 3)) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(frame)), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            static_cast<uintptr_t>(frame) + 8 > reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize)
+            break;
+        const DWORD* at = reinterpret_cast<const DWORD*>(static_cast<uintptr_t>(frame));
+        const DWORD next = at[0], ret = at[1];
+        if (!ret) break;
+        frames[n++] = ret;
+        if (next <= frame) break;
+        frame = next;
+    }
+    return n;
+}
+#else
 // x64 unwinding with the kernel's own tables: no dbghelp, no symbol
 // handler, no loader lock. Safe to run while the target thread is suspended.
 uint32_t walk_context(CONTEXT& ctx, uint64_t* frames, uint32_t capacity)
@@ -32,6 +57,7 @@ uint32_t walk_context(CONTEXT& ctx, uint64_t* frames, uint32_t capacity)
     }
     return n;
 }
+#endif
 
 } // namespace
 

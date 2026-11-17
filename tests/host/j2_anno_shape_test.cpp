@@ -1,4 +1,6 @@
 #include "host_dx12/settings.hpp"
+#include "host_dx12/effects/xegtao.hpp"
+#include "host_dx12/effects/donut.hpp"
 // J2 on Anno's shape (the run that crashed, 2026-10-26): the path the game takes,
 // not the convenient one.
 //   - submissions go through ExecuteBegin/End around J2, as the overlay does;
@@ -18,10 +20,17 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_observe.h"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
+#include "host_dx12/nr/nr_pass.hpp"
+#include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "host_dx12/overlay/submission_tracking.hpp"
 
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -58,16 +67,17 @@ std::string ReadText(const std::wstring& path)
 void __stdcall Forward(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
     g_forwarded.assign(lists, lists + n);
+    na::nr::native::Submission recording(q,n,lists); // same lifetime wrapper as production ForwardThroughNr
     q->ExecuteCommandLists(n, lists); // queue not hooked in this test: the plain runtime call
 }
 // The overlay's sequence around a game submission.
 void Submit(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, bool j2)
 {
     const na::observe::ExecuteToken t = na::observe::ExecuteBegin(q, n, lists);
-    na::dlss::BeforeExecute(q, n, lists); // as the overlay: DLSS completion tracking of inline recordings
+    na::overlay::BeforeGameSubmission(q,n,lists);
     if (j2) na::j2::Execute(q, n, lists, &Forward);
     else q->ExecuteCommandLists(n, lists);
-    na::dlss::OnExecuted(q, n, lists);
+    na::overlay::AfterGameSubmission(q,n,lists);
     na::observe::ExecuteEnd(t, q, n, lists);
 }
 using M = std::array<double, 16>;
@@ -113,21 +123,231 @@ void Store(uint8_t* dst, const M& m)
 {
     for (int i = 0; i < 16; ++i) { const float f = static_cast<float>(m[i]); std::memcpy(dst + i * 4, &f, 4); }
 }
+// Test-only GPU consumer/readback. It observes the lens at this submission,
+// before a later camera upload could repair it and conceal the mismatch.
+int ProjectionShift(test::Device& d, ID3D12Resource* lens, UINT w, UINT h, bool column, float shift[2])
+{
+    const na::observe::HostWorkScope host;
+    auto* dev = d.device.Get();
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    test::ComPtr<ID3DBlob> blob, err, cs;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)));
+    test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root))));
+    const std::string source = std::string("cbuffer Lens:register(b0){float4 pad;") +
+        (column ? "column_major" : "row_major") + " float4x4 P;}"
+        "RWByteAddressBuffer result:register(u0);[numthreads(1,1,1)]void CS(){"
+        "float4 p=mul(P,float4(0,0,1,1));result.Store2(0,asuint(p.xy/p.w*float2(" +
+        std::to_string(float(w) / 2.f) + "," + std::to_string(-float(h) / 2.f) + ")));}";
+    REQUIRE(SUCCEEDED(D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr, "CS", "cs_5_0", 0, 0, &cs, &err)));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature = root.Get();
+    pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()}; test::ComPtr<ID3D12PipelineState> pipeline;
+    REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pipeline))));
+    auto result = test::CreateBuffer(dev, 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto rb = test::CreateBuffer(dev, 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    REQUIRE(result && rb); test::List check; REQUIRE(check.Create(dev));
+    check.list->SetComputeRootSignature(root.Get()); check.list->SetPipelineState(pipeline.Get());
+    check.list->SetComputeRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+    check.list->SetComputeRootUnorderedAccessView(1, result->GetGPUVirtualAddress()); check.list->Dispatch(1, 1, 1);
+    auto barrier = test::Transition(result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    check.list->ResourceBarrier(1, &barrier); check.list->CopyBufferRegion(rb.Get(), 0, result.Get(), 0, 8);
+    REQUIRE(SUCCEEDED(check.list->Close())); ID3D12CommandList* lists[] = {check.list.Get()};
+    d.queue->ExecuteCommandLists(1, lists); d.WaitIdle();
+    void* p = nullptr; REQUIRE(SUCCEEDED(rb->Map(0, nullptr, &p)));
+    std::memcpy(shift, p, 8); rb->Unmap(0, nullptr);
+    return 0;
+}
 } // namespace
+
+// Actual sampler pixels, not a no-op Dispatch or a count of created twins.
+// All waits/readbacks in this standalone diagnostic are test-only.
+int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float native_bias=0.f,bool dynamic=false)
+{
+    test::Device d;if(!test::CreateDevice(d))return test::SkipNoDevice("AF pixels");auto* dev=d.device.Get();
+    REQUIRE(na::observe::InstallProducers(dev,d.queue.Get(),false));
+    na_observe_config cfg{};cfg.size_bytes=sizeof(cfg);REQUIRE(na_observe_start(&cfg,Sink,nullptr)==NA_OK);
+    na::observe::SetSamplerMipBiasLiveEnabled(true);na::observe::SetSamplerMipBiasLive(0);na::observe::SetSamplerAnisotropy(0);
+    na::observe::SetSamplerMipPrewarm(false); // pixel comparisons do not measure unrelated compilation
+    const float levels[]={0,-1,-2};na::observe::SetSamplerMipLevelsWanted(levels,3);na::observe::SetSamplerAnisotropyPrebuild(16);
+    REQUIRE(na::observe::WaitSamplerVariant(10000));
+    constexpr UINT TW=1024,TH=64,MIPS=11,W=64,H=64;
+    D3D12_RESOURCE_DESC td{};td.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;td.Width=TW;td.Height=TH;td.DepthOrArraySize=1;
+    td.MipLevels=MIPS;td.SampleDesc.Count=1;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;test::ComPtr<ID3D12Resource> tex;
+    REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&td,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&tex))));
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[MIPS]{};UINT64 bytes=0;dev->GetCopyableFootprints(&td,0,MIPS,0,fp,nullptr,nullptr,&bytes);
+    auto up=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);REQUIRE(up);void* mapped=nullptr;REQUIRE(SUCCEEDED(up->Map(0,nullptr,&mapped)));
+    for(UINT m=0;m<MIPS;++m)for(UINT y=0;y<fp[m].Footprint.Height;++y)for(UINT x=0;x<fp[m].Footprint.Width;++x){
+        auto* p=static_cast<uint8_t*>(mapped)+fp[m].Offset+SIZE_T(y)*fp[m].Footprint.RowPitch+x*4;
+        p[0]=p[1]=p[2]=mip_pixels?uint8_t(16+20*m):(m>=2?128:uint8_t(((y<<m)/2)%2?255:0));p[3]=255;}
+    up->Unmap(0,nullptr);test::List init;REQUIRE(init.Create(dev));
+    for(UINT m=0;m<MIPS;++m){D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=tex.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;to.SubresourceIndex=m;
+        D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=up.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=fp[m];init.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);}
+    auto b=test::Transition(tex.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);init.list->ResourceBarrier(1,&b);
+    REQUIRE(SUCCEEDED(init.list->Close()));ID3D12CommandList* initialize[]={init.list.Get()};d.queue->ExecuteCommandLists(1,initialize);d.WaitIdle();
+    auto out=test::CreateTexture(dev,W,H,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);REQUIRE(out);
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,2,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};test::ComPtr<ID3D12DescriptorHeap> heap;
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));auto cpu=heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};sv.Format=td.Format;sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;sv.Texture2D.MipLevels=MIPS;sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;dev->CreateShaderResourceView(tex.Get(),&sv,cpu);
+    cpu.ptr+=dev->GetDescriptorHandleIncrementSize(hd.Type);D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};uv.Format=DXGI_FORMAT_R32_FLOAT;uv.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;dev->CreateUnorderedAccessView(out.Get(),nullptr,&uv,cpu);
+    D3D12_DESCRIPTOR_RANGE ranges[]={{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,1,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,1,0,0,1}};
+    D3D12_ROOT_PARAMETER param{};param.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;param.DescriptorTable={2,ranges};
+    D3D12_STATIC_SAMPLER_DESC ss{};ss.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;ss.AddressU=ss.AddressV=ss.AddressW=clamp?D3D12_TEXTURE_ADDRESS_MODE_CLAMP:D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    ss.MaxAnisotropy=1;ss.MaxLOD=D3D12_FLOAT32_MAX;ss.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
+    ss.MipLODBias=native_bias;
+    D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,1,0,0,0};
+    D3D12_ROOT_PARAMETER params[2]{param,{}};
+    params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable={1,&sampler_range};
+    test::ComPtr<ID3D12DescriptorHeap> sampler_cpu, sampler_gpu;
+    if(dynamic){
+        D3D12_DESCRIPTOR_HEAP_DESC sd{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&sd,IID_PPV_ARGS(&sampler_cpu))));
+        sd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&sd,IID_PPV_ARGS(&sampler_gpu))));
+        D3D12_SAMPLER_DESC desc{};
+        desc.Filter=ss.Filter;desc.AddressU=ss.AddressU;desc.AddressV=ss.AddressV;desc.AddressW=ss.AddressW;
+        desc.MipLODBias=ss.MipLODBias;desc.MaxAnisotropy=ss.MaxAnisotropy;
+        desc.ComparisonFunc=ss.ComparisonFunc;desc.MaxLOD=ss.MaxLOD;
+        auto base=sampler_cpu->GetCPUDescriptorHandleForHeapStart();
+        dev->CreateSampler(&desc,base);
+        auto staging=base;staging.ptr+=dev->GetDescriptorHandleIncrementSize(sd.Type);
+        dev->CopyDescriptorsSimple(1,staging,base,sd.Type);
+    }
+    D3D12_ROOT_SIGNATURE_DESC rd{dynamic?2u:1u,params,dynamic?0u:1u,dynamic?nullptr:&ss,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    test::ComPtr<ID3DBlob> blob,error,cs;test::ComPtr<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error)));REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))));
+    // Left: oblique 16:1 footprint. Right: isotropic 1:1 postprocess control;
+    // changing AF must not alter those control pixels even with CLAMP addressing.
+    const char* code=mip_pixels?
+        "Texture2D<float4> image:register(t0);SamplerState samp:register(s0);RWTexture2D<float> target:register(u0);[numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){float2 uv=(float2(p.xy)+.5)/64;target[p.xy]=p.x<32?image.SampleGrad(samp,uv,float2(4.0/1024,0),float2(0,4.0/64)).r:image.Load(int3(0,0,2)).r;}":
+        "Texture2D<float4> image:register(t0);SamplerState samp:register(s0);RWTexture2D<float> target:register(u0);[numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){float du=(p.x<32?16.0:1.0)/1024;target[p.xy]=image.SampleGrad(samp,(float2(p.xy)+.5)/64,float2(du,0),float2(0,1.0/64)).r;}";
+    REQUIRE(SUCCEEDED(D3DCompile(code,std::strlen(code),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&cs,&error)));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={cs->GetBufferPointer(),cs->GetBufferSize()};test::ComPtr<ID3D12PipelineState> pso;
+    REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso))));
+    if(prewarm_only){
+        const auto before=na::observe::GetMipLiveStats().warmed_levels;
+        na::observe::SetSamplerMipPrewarm(true);
+        na::observe::SetSamplerMipBiasLive(-.5f);REQUIRE(na::observe::WaitSamplerVariant(10000));
+        // No recording, PSO bind, or deliberate miss wakes the worker here.
+        // A completed choice must itself schedule the remaining menu levels.
+        for(unsigned i=0;i<300&&na::observe::GetMipLiveStats().warmed_levels==before;++i)Sleep(10);
+        const auto after=na::observe::GetMipLiveStats();
+        std::printf("idle mip warm-up: before=%llu after=%llu, want=%.2f live=%.2f, no draw/miss trigger\n",(unsigned long long)before,(unsigned long long)after.warmed_levels,after.want_bias,after.live_bias);
+        CHECK(after.warmed_levels>before&&after.want_bias==after.live_bias);
+        REQUIRE(na_observe_stop()==NA_OK);na::observe::SetProcessExiting();return test::finish("idle mip prewarm");
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT of{};const auto od=out->GetDesc();dev->GetCopyableFootprints(&od,0,1,0,&of,nullptr,nullptr,&bytes);
+    auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);test::List list;REQUIRE(list.Create(dev));REQUIRE(SUCCEEDED(list.list->Close()));
+    std::vector<float> original;unsigned pass=0;
+    const std::vector<float> choices=mip_pixels?std::vector<float>{0,-1,-.5f,-1.5849625f,-2,-2.25f,4,0}:std::vector<float>{0,16,0,4,8,16,0};
+    for(float choice:choices){
+        const UINT af=mip_pixels?0u:UINT(choice);
+        const auto before=na::observe::GetMipLiveStats();
+        if(mip_pixels)na::observe::SetSamplerMipBiasLive(choice);else na::observe::SetSamplerAnisotropy(af);
+        REQUIRE(na::observe::WaitSamplerVariant(10000));
+        const auto after=na::observe::GetMipLiveStats();
+        // Three root levels exist, but switching AF must compile only the one
+        // requested PSO level before becoming active.
+        if(pass==1&&!clamp&&!mip_pixels)CHECK(after.twin_pipelines-before.twin_pipelines==1);
+        REQUIRE(SUCCEEDED(list.alloc->Reset()));REQUIRE(SUCCEEDED(list.list->Reset(list.alloc.Get(),pso.Get())));
+        list.list->SetComputeRootSignature(root.Get());
+        ID3D12DescriptorHeap* heaps[]={heap.Get(),sampler_gpu.Get()};
+        list.list->SetDescriptorHeaps(dynamic?2:1,heaps);
+        list.list->SetComputeRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+        if(dynamic){
+            constexpr auto type=D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            auto src=sampler_cpu->GetCPUDescriptorHandleForHeapStart();
+            src.ptr+=dev->GetDescriptorHandleIncrementSize(type);
+            const auto dest=sampler_gpu->GetCPUDescriptorHandleForHeapStart();
+            if(pass%2)dev->CopyDescriptors(1,&dest,nullptr,1,&src,nullptr,type);
+            else dev->CopyDescriptorsSimple(1,dest,src,type);
+            list.list->SetComputeRootDescriptorTable(1,sampler_gpu->GetGPUDescriptorHandleForHeapStart());
+            const auto applied=na::observe::GetMipLiveStats();
+            CHECK(applied.visible_sampler_uploads==pass+1);
+            CHECK(applied.visible_sampler_bias==(choice==0?native_bias:choice));
+        }
+        list.list->Dispatch(W/8,H/8,1);
+        b=test::Transition(out.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);list.list->ResourceBarrier(1,&b);
+        D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=out.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=of;list.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list.list->ResourceBarrier(1,&b);REQUIRE(SUCCEEDED(list.list->Close()));ID3D12CommandList* lists[]={list.list.Get()};d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+        REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&mapped)));std::vector<float> values;for(UINT y=0;y<H;++y){const auto* row=reinterpret_cast<const float*>(static_cast<const uint8_t*>(mapped)+y*of.Footprint.RowPitch);values.insert(values.end(),row,row+W);}rb->Unmap(0,nullptr);
+        // Optional standalone regression evidence only: actual GPU pixels,
+        // never an extra readback or capture in the game's live hooks.
+        char directory[MAX_PATH]{};
+        if(GetEnvironmentVariableA("NA_TEST_AF_CAPTURE",directory,MAX_PATH)>0){
+            char name[MAX_PATH]{};sprintf_s(name,"%s/%s-%02u-%ux.pgm",directory,clamp?"clamp":"wrap",pass,af);
+            FILE* image=nullptr;REQUIRE(fopen_s(&image,name,"wb")==0&&image);
+            std::fprintf(image,"P5\n%u %u\n255\n",W,H);
+            for(float value:values)std::fputc(int(std::lround(std::clamp(value,0.f,1.f)*255)),image);
+            CHECK(std::fclose(image)==0);
+        }
+        if(!pass++)original=values;
+        double change=0,contrast=0,control=0;
+        for(size_t i=0;i<values.size();++i){
+            if(i%W<W/2){change+=std::abs(values[i]-original[i]);contrast+=std::abs(values[i]-.5f);}
+            else control+=std::abs(values[i]-original[i]);
+        }
+        change/=W*H/2;contrast/=W*H/2;control/=W*H/2;
+        if(!mip_pixels)std::printf("AF pixels %s %ux: oblique change %.6f contrast %.6f isotropic change %.6f effective%u\n",clamp?"clamp":"wrap",af,change,contrast,control,na::observe::GetMipLiveStats().live_aniso);
+        if(mip_pixels){
+            double mean=0;for(size_t i=0;i<values.size();++i)if(i%W<W/2)mean+=values[i];mean/=W*H/2;
+            // The same pre-existing root/PSO/texture are rebound after each live request.
+            // LOD2 at bias0, LOD1 at -1, LOD1.5 at -0.5, LOD6 at +4.
+            const double expected=(16+20*(std::max)(0.f,2+(choice==0?native_bias:choice)))/255.0;
+            std::printf("mip live pixels requested %.2f active %.2f: mean %.6f expected %.6f, change %.6f direct-load control %.6f\n",choice,after.live_bias,mean,expected,change,control);
+            CHECK(std::abs(mean-expected)<.006);CHECK(after.live_bias==choice);
+            if(choice==0||choice==native_bias)CHECK(change<.00001);else CHECK(change>.001);
+        }else {if(af==0)CHECK(change<.01);if(af==16)CHECK(change>.15);}
+        CHECK(control<.01);CHECK(dev->GetDeviceRemovedReason()==S_OK);
+    }
+    REQUIRE(na_observe_stop()==NA_OK);na::observe::SetProcessExiting();return test::finish(mip_pixels?"live mip pixels":"AF pixels");
+}
 
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    // Counter-delta tests below measure demand compilation only. The separate
+    // --mip-prewarm case enables and verifies background compilation explicitly.
+    na::observe::SetSamplerMipPrewarm(false);
+    if(argc>1&&std::strcmp(argv[1],"--af-pixels")==0)return AnisoPixels(argc>2&&std::strcmp(argv[2],"clamp")==0);
+    if(argc>1&&std::strcmp(argv[1],"--mip-prewarm")==0)return AnisoPixels(false,true);
+    if(argc>1&&std::strcmp(argv[1],"--mip-pixels")==0)return AnisoPixels(false,false,true);
+    if(argc>1&&std::strcmp(argv[1],"--mip-pixels-native-negative")==0)return AnisoPixels(false,false,true,-1.5f);
+    if(argc>1&&std::strcmp(argv[1],"--mip-pixels-native-already")==0)return AnisoPixels(false,false,true,-1.f);
+    if (argc > 1 && std::strcmp(argv[1], "--mip-dynamic-pixels") == 0) return AnisoPixels(false,false,true,0.f,true);
+    if (argc > 1 && std::strcmp(argv[1], "--mip-dynamic-native-already") == 0) return AnisoPixels(false,false,true,-1.f,true);
     const UINT samples = argc > 1 ? UINT(std::atoi(argv[1])) : 1;
     const UINT depth_samples = argc > 2 ? UINT(std::atoi(argv[2])) : samples;
+    bool depth24 = false;
+    for (int i = 3; i < argc; ++i) depth24 |= std::strcmp(argv[i], "--depth24") == 0;
+    const auto depth_texture_format = depth24 ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R32G8X24_TYPELESS;
+    const auto depth_view_format = depth24 ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     const bool msaa = samples > 1;
-    const bool real_ngx = argc > 3 && std::strcmp(argv[3], "--real") == 0;
+    const bool entry_real=argc>3 && std::strcmp(argv[3],"--entry-real")==0;
+    const bool entry_split_indirect=argc>3 && std::strcmp(argv[3],"--entry-split-indirect")==0;
+    const bool entry_indirect=entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-indirect")==0);
+    const bool entry_camera_gap=argc>3 && std::strcmp(argv[3],"--entry-split-camera-gap")==0;
+    const bool entry_split=entry_camera_gap || entry_split_indirect || (argc>3 && std::strcmp(argv[3],"--entry-split")==0);
+    const bool entry_decoy=argc>3 && std::strcmp(argv[3],"--entry-decoy")==0;
+    const bool entry_retire=argc>3 && std::strcmp(argv[3],"--entry-boundary-retire")==0;
+    const bool entry_boundary=entry_retire || (argc>3 && std::strcmp(argv[3],"--entry-boundary")==0);
+    const bool entry_test=entry_boundary || entry_decoy || entry_real || entry_indirect || entry_split || (argc>3 && std::strcmp(argv[3],"--entry")==0);
+    const bool real_ngx = entry_real || argc > 3 && std::strcmp(argv[3], "--real") == 0;
     // --planes: depth's two planes (depth, stencil) are transitioned by separate
     // per-subresource barriers, as Sniper Elite Resistance does.
     const bool planes = argc > 3 && std::strcmp(argv[3], "--planes") == 0;
     // --split: the scene is drawn across two submissions per frame (Sniper Elite
     // Resistance); DLAA must follow the second one, before the post pass.
     const bool split = argc > 3 && std::strcmp(argv[3], "--split") == 0;
+    const bool early_component = argc > 3 && std::strcmp(argv[3], "--jitter-early-component") == 0;
+    const bool column_component = argc > 3 && std::strcmp(argv[3], "--jitter-column-component") == 0;
+    const bool component_test = early_component || column_component || (argc > 3 && std::strcmp(argv[3], "--jitter-component") == 0);
+    const bool alias_test = argc > 3 && std::strcmp(argv[3], "--camera-alias") == 0;
     // --inline: the scene and its post-processing are recorded in ONE command list
     // (Sniper Elite Resistance); DLAA must be recorded inside it, before the post
     // pass binds the colour for reading, and the game's state handed back.
@@ -137,8 +357,11 @@ int main(int argc, char** argv)
     // route from the frame structure (inline for scene+post in one list, between for
     // the Anno shape) after its learning frames.
     const bool auto_inline = argc > 3 && std::strcmp(argv[3], "--auto-inline") == 0;
-    const bool auto_between = argc > 3 && std::strcmp(argv[3], "--auto-between") == 0;
-    const bool inline_list = auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
+    const bool missed_camera_map = argc > 3 && std::strcmp(argv[3], "--auto-between-missed-map") == 0;
+    const bool auto_between = missed_camera_map || (argc > 3 && std::strcmp(argv[3], "--auto-between") == 0);
+    const bool inline_flow=argc>3 && std::strcmp(argv[3],"--inline-flow")==0;
+    if(inline_flow && !na::ffx_flow::Built())return test::kSkip;
+    const bool inline_list = entry_test || inline_flow || auto_inline || inline_record_first || inline_copy || (argc > 3 && std::strcmp(argv[3], "--inline") == 0);
     // auto-between needs an OBSERVABLE consumer (a copy of the colour): a barrier-only
     // hand-back is not evidence of a list boundary (Astra R3).
     const bool post_reader = argc > 3 && !real_ngx && !planes && !split && !inline_list;
@@ -152,15 +375,47 @@ int main(int argc, char** argv)
         if (desc.VendorId != 0x10DE) { printf("SKIP: real DLAA needs NVIDIA hardware\n"); return test::kSkip; }
     }
     ID3D12Device* dev = d.device.Get();
+    bool test_donut=false;for(int i=3;i<argc;++i)test_donut|=std::strcmp(argv[i],"--donut")==0;
+    if(test_donut){
+        auto warm=test::CreateTexture(dev,64,32,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+        na::donut::Inputs in;in.color=warm.Get();in.format=DXGI_FORMAT_R16G16B16A16_FLOAT;in.width=64;in.height=32;
+        na::donut::Options o;o.tone=true;o.bloom=true;na::donut::ScenePass().Prepare(dev,d.queue.Get(),in,o);
+        REQUIRE(na::donut::ScenePass().WaitPrepared(30000));na::settings::Get().donut_tone=1;na::settings::Get().donut_bloom=1;
+    }
+    bool test_ao=false;for(int i=3;i<argc;++i)test_ao|=std::strcmp(argv[i],"--xegtao")==0;
+    if(test_ao){
+#if !defined(NA_HAVE_XEGTAO)
+        return test::kSkip;
+#else
+        auto warm_color=test::CreateTexture(dev,64,32,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+        auto warm_depth=test::CreateTexture(dev,64,32,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_FLAG_NONE);
+        na::xegtao::Inputs in;in.color=warm_color.Get();in.depth=warm_depth.Get();in.width=64;in.height=32;
+        in.color_format=DXGI_FORMAT_R16G16B16A16_FLOAT;in.projection={1,2,0,0,0,.1f};
+        na::xegtao::Options options;options.enabled=true;
+        na::xegtao::ScenePass().Prepare(dev,d.queue.Get(),in,options);
+        REQUIRE(na::xegtao::ScenePass().WaitPrepared(30000));na::settings::Get().xegtao_enabled=1;
+#endif
+    }
     ID3D12CommandQueue* q = d.queue.Get();
     REQUIRE(na::observe::InstallProducers(dev, q, /*hook_queue_execute=*/false));
+    // Reproduce the extra observation used by the older Sniper package while
+    // keeping the scene at native size. Use the same delivery assertions.
+    for (int i = 4; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--native-scale-observer") == 0)
+            na::j2::EnableNativeScaleBridge(true);
+    }
+    if(inline_flow)REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
     na_observe_config cfg{};
     cfg.size_bytes = sizeof(cfg);
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
     if (!real_ngx) na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) { return na::dlss::Attach(device, fake::MakeApi()); });
 
+#if defined(NA_J2_TEST_COMPUTE)
+    constexpr uint32_t W=512,H=256;
+#else
     constexpr uint32_t W = 64, H = 32;
-    for (auto pair : {std::make_pair(DXGI_FORMAT_R16G16B16A16_FLOAT,samples), std::make_pair(DXGI_FORMAT_D32_FLOAT_S8X24_UINT,depth_samples)}) {
+#endif
+    for (auto pair : {std::make_pair(DXGI_FORMAT_R16G16B16A16_FLOAT,samples), std::make_pair(depth_view_format,depth_samples)}) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{pair.first,pair.second,D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE,0};
         REQUIRE(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&levels,sizeof levels)));
         if (!levels.NumQualityLevels) { printf("SKIP: hardware does not support sample count %u\n",pair.second); return test::kSkip; }
@@ -180,12 +435,14 @@ int main(int argc, char** argv)
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&color))));
     }
-    auto depth = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    const auto depth_flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                             (depth24 ? D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE : D3D12_RESOURCE_FLAG_NONE);
+    auto depth = test::CreateTexture(dev, W, H, depth_texture_format, D3D12_RESOURCE_STATE_COMMON, depth_flags);
     if (depth_samples > 1) {
         depth.Reset();
         D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         auto dd = color->GetDesc();
-        dd.DepthOrArraySize = 1; dd.MipLevels = 1; dd.SampleDesc.Count = depth_samples; dd.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+        dd.DepthOrArraySize = 1; dd.MipLevels = 1; dd.SampleDesc.Count = depth_samples; dd.Format = depth_texture_format;
         dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
         REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&depth))));
@@ -197,7 +454,7 @@ int main(int argc, char** argv)
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvh))));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvh))));
-    D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC chd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&cbvh))));
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvh->GetCPUDescriptorHandleForHeapStart(), dsv = dsvh->GetCPUDescriptorHandleForHeapStart();
     D3D12_RENDER_TARGET_VIEW_DESC rvd{};
@@ -222,12 +479,20 @@ int main(int argc, char** argv)
         dev->CreateRenderTargetView(color.Get(), &v0, rtv0);
     }
     D3D12_DEPTH_STENCIL_VIEW_DESC dvd{};
-    dvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    dvd.Format = depth_view_format;
     dvd.ViewDimension = depth_samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
     dev->CreateDepthStencilView(depth.Get(), &dvd, dsv);
     constexpr uint32_t kBlock = 1024, kVp = 336;
     D3D12_CONSTANT_BUFFER_VIEW_DESC cv{cb->GetGPUVirtualAddress() + kBlock, 768};
     dev->CreateConstantBufferView(&cv, cbvh->GetCPUDescriptorHandleForHeapStart());
+    auto short_cpu = cbvh->GetCPUDescriptorHandleForHeapStart();
+    auto short_gpu = cbvh->GetGPUDescriptorHandleForHeapStart();
+    const UINT cbv_step = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    short_cpu.ptr += cbv_step; short_gpu.ptr += cbv_step;
+    auto short_cv = cv; short_cv.SizeInBytes = 256; dev->CreateConstantBufferView(&short_cv, short_cpu);
+    auto lens = test::CreateBuffer(dev, 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    REQUIRE(lens); uint8_t* lens_cpu = nullptr;
+    REQUIRE(SUCCEEDED(lens->Map(0, nullptr, reinterpret_cast<void**>(&lens_cpu))));
     test::ComPtr<ID3D12RootSignature> rs;
     {
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0};
@@ -286,8 +551,8 @@ int main(int argc, char** argv)
         uint64_t after4 = 0;
         na::observe::MipBiasCounts(&after4, nullptr);
         CHECK(after4 == after3 + 1);
-        // Aim for a total: a game's own -1.5 is already past -1 (left alone); its -0.5
-        // is brought to -1 (biased); the native values are recorded either way.
+        // Exact total -1: both native -1.5 and -0.5 are brought to -1,
+        // rather than accumulating our offset or retaining a different total.
         na::observe::NativeBiasStats n0;
         na::observe::NativeMipBiases(&n0);
         sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -297,7 +562,7 @@ int main(int argc, char** argv)
         dev->CreateSampler(&sd, h2);
         uint64_t after5 = 0;
         na::observe::MipBiasCounts(&after5, nullptr);
-        CHECK(after5 == after4);
+        CHECK(after5 == after4 + 1);
         sd.MipLODBias = -0.5f;
         dev->CreateSampler(&sd, h2);
         uint64_t after6 = 0;
@@ -328,11 +593,23 @@ int main(int argc, char** argv)
             const auto m1 = na::observe::GetMipLiveStats();
             std::printf("mip live: root twins %llu pipeline twins %llu failures %llu\n", (unsigned long long)(m1.twin_root_signatures - m0.twin_root_signatures),
                         (unsigned long long)(m1.twin_pipelines - m0.twin_pipelines), (unsigned long long)m1.twin_failures);
-            CHECK(m1.twin_root_signatures == m0.twin_root_signatures + 2); // levels 0 and -0.5 (the game's is -1)
-            CHECK(m1.twin_pipelines == m0.twin_pipelines + 2);
+            // Levels -0.5 and -1 (the game's own objects are never changed now). The -1 twin has the
+            // same bytes as `rs` above (created with live switching off, so biased to -1 in place):
+            // D3D12 returns that object, which is the game's, so it is not kept (a shared skip) and
+            // its pipeline twin is not built either.
+            const uint64_t skips = m1.shared_skips - m0.shared_skips;
+            CHECK(m1.twin_root_signatures + skips == m0.twin_root_signatures + 2);
+            // Pipeline twins are never compiled inside the game's creation call (c3853df start-up
+            // hang): the background worker builds the chosen level afterwards.
+            CHECK(m1.twin_pipelines == m0.twin_pipelines);
+            CHECK(skips == 1);
             CHECK(m1.twin_failures == 0);
             na::observe::SetSamplerMipBiasLive(-0.5f);
             CHECK(na::observe::SamplerMipBias() == -0.5f);
+            REQUIRE(na::observe::WaitSamplerVariant(5000));
+            for (int i = 0; i < 500 && na::observe::GetMipLiveStats().twin_pipelines == m0.twin_pipelines; ++i) Sleep(10);
+            CHECK(na::observe::GetMipLiveStats().twin_pipelines == m0.twin_pipelines + 1); // -0.5 only
+            CHECK(na::observe::GetMipLiveStats().live_bias == -0.5f);
             test::ComPtr<ID3D12CommandAllocator> la;
             test::ComPtr<ID3D12GraphicsCommandList> ll;
             REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&la))));
@@ -349,10 +626,149 @@ int main(int argc, char** argv)
             d.WaitIdle();
             CHECK(dev->GetDeviceRemovedReason() == S_OK); // twin root signature + twin pipeline matched
             CHECK(na::observe::GetMipLiveStats().fallbacks == 0);
-            na::observe::SetSamplerMipBiasLive(-1.0f); // back to the game's own objects
+            na::observe::SetSamplerMipBiasLive(-1.0f);
+            REQUIRE(na::observe::WaitSamplerVariant(5000));
             na::observe::SetSamplerMipBiasLiveEnabled(false);
         }
+        {
+            // Render-small levels per DLSS mode (Q -1.585, B -2, P -2.25 since Cort 2026-11-04). Every level can
+            // be chosen since live variants are built on demand (Cort 2026-11-05), so -0.6 picks Light (-0.5).
+            const float wanted[4] = {-1.0f, na::j2::SmallMipBias(-1.0f, 1.0f / 1.5f), na::j2::SmallMipBias(-1.0f, 1.0f / 1.72f),
+                                     na::j2::SmallMipBias(-1.0f, 0.5f)};
+            // Full resolution uses the DLAA total it is given (the menu's Texture mip bias choice, -1 when
+            // automatic; Cort 2026-11-16). The reduced modes keep their own totals whatever that choice is.
+            CHECK(na::j2::SmallMipBias(-1.f,1.f)==-1.f);
+            CHECK(na::j2::SmallMipBias(-2.f,1.f)==-2.f);
+            CHECK(na::j2::SmallMipBias(0.f,1.f)==0.f);
+            CHECK(na::j2::SmallMipBias(-2.f,.5f)==wanted[3]&&na::j2::SmallMipBias(0.f,1.0f/1.5f)==wanted[1]);
+            na::observe::SetSamplerMipLevelsWanted(wanted, 4);
+            na::observe::SetSamplerMipBiasLive(wanted[1]);
+            CHECK(std::fabs(na::observe::SamplerMipBias() + 1.585f) < 0.001f);
+            na::observe::SetSamplerMipBiasLive(wanted[2]);
+            CHECK(na::observe::SamplerMipBias() == -2.0f);
+            na::observe::SetSamplerMipBiasLive(wanted[3]);
+            CHECK(na::observe::SamplerMipBias() == -2.25f);
+            // Automatic preset (Cort 2026-11-04): L for DLAA/Quality, M for Balanced/Performance;
+            // explicit presets apply in every mode.
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 3440, 3440) == 12u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 2293, 3440) == 12u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 2000, 3440) == 13u);
+            CHECK(na::j2::PresetFor(na::j2::kPresetAuto, 1720, 3440) == 13u);
+            CHECK(na::j2::PresetFor(12u, 1720, 3440) == 12u);
+            CHECK(na::j2::PresetFor(11u, 3440, 3440) == 11u);
+            CHECK(na::j2::PresetFor(0u, 1720, 3440) == 0u);
+            na::observe::SetSamplerMipBiasLive(-0.6f);
+            CHECK(na::observe::SamplerMipBias() == -0.5f);
+            const float classic[3] = {0.0f, -0.5f, -1.0f};
+            na::observe::SetSamplerMipLevelsWanted(classic, 3);
+            na::observe::SetSamplerMipBiasLive(-1.0f);
+        }
         na::observe::SetSamplerMipBias(0.0f);
+        // 16x anisotropic filtering (menu switch, no mip bias): a tiling linear sampler and an
+        // 8x static sampler become 16x (the root signature is rebuilt even with no bias change);
+        // clamped linear materials are included; shadow comparisons stay unchanged;
+        // a native 16x sampler is left at the game's own setting.
+        {
+            na::observe::SetSamplerAnisotropy(16);
+            const auto a0 = na::observe::GetAnisoStats();
+            CHECK(a0.level == 16);
+            test::ComPtr<ID3D12RootSignature> rs_af;
+            D3D12_ROOT_SIGNATURE_DESC rd2{1, &p, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+            test::ComPtr<ID3DBlob> blob2, err2;
+            REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd2, D3D_ROOT_SIGNATURE_VERSION_1, &blob2, &err2)));
+            REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob2->GetBufferPointer(), blob2->GetBufferSize(), IID_PPV_ARGS(&rs_af))));
+            const auto a1 = na::observe::GetAnisoStats();
+            CHECK(a1.static_samplers == a0.static_samplers + 1);
+            sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.MaxAnisotropy = 1;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            dev->CreateSampler(&sd, h2);
+            const auto a2 = na::observe::GetAnisoStats();
+            CHECK(a2.samplers == a1.samplers + 1);
+            sd.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+            sd.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS;
+            dev->CreateSampler(&sd, h2);
+            CHECK(na::observe::GetAnisoStats().samplers == a2.samplers);
+            sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            dev->CreateSampler(&sd, h2);
+            const auto a3 = na::observe::GetAnisoStats();
+            CHECK(a3.samplers == a2.samplers + 1);
+            sd.Filter = D3D12_FILTER_ANISOTROPIC;
+            sd.MaxAnisotropy = 16;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            dev->CreateSampler(&sd, h2);
+            const auto a4 = na::observe::GetAnisoStats();
+            CHECK(a4.samplers == a3.samplers);
+            CHECK(a4.already == a3.already + 1);
+            na::observe::SetSamplerAnisotropy(0);
+            sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.MaxAnisotropy = 1;
+            dev->CreateSampler(&sd, h2);
+            CHECK(na::observe::GetAnisoStats().samplers == a4.samplers); // off: untouched
+        }
+        // Live anisotropic filtering (Cort 2026-11-05: no restarts). Nothing is prepared at
+        // creation (saved choice: no bias, off); choosing 16x builds the twins in the background
+        // from the creation copies, and a recording reset afterwards binds and runs them.
+        {
+            na::observe::SetSamplerMipBias(0.0f);
+            na::observe::SetSamplerAnisotropy(0);
+            REQUIRE(na::observe::WaitSamplerVariant(5000));
+            const float none[1] = {0.0f};
+            na::observe::SetSamplerMipLevelsWanted(none, 1);
+            na::observe::SetSamplerAnisotropyPrebuild(0);
+            na::observe::SetSamplerMipBiasLiveEnabled(true);
+            const auto m0 = na::observe::GetMipLiveStats();
+            test::ComPtr<ID3D12RootSignature> ars;
+            REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&ars))));
+            const char* cs = "[numthreads(1,1,1)] void CS() {}";
+            test::ComPtr<ID3DBlob> csb, cse;
+            REQUIRE(SUCCEEDED(D3DCompile(cs, std::strlen(cs), nullptr, nullptr, nullptr, "CS", "cs_5_0", 0, 0, &csb, &cse)));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+            cd.pRootSignature = ars.Get();
+            cd.CS = {csb->GetBufferPointer(), csb->GetBufferSize()};
+            test::ComPtr<ID3D12PipelineState> apso;
+            REQUIRE(SUCCEEDED(dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&apso))));
+            csb.Reset(); // the creation copy owns its bytecode
+            const auto m1 = na::observe::GetMipLiveStats();
+            CHECK(m1.twin_root_signatures == m0.twin_root_signatures); // nothing chosen yet
+            CHECK(m1.twin_pipelines == m0.twin_pipelines);
+            na::observe::SetSamplerAnisotropy(16);
+            REQUIRE(na::observe::WaitSamplerVariant(10000));
+            const auto m2 = na::observe::GetMipLiveStats();
+            std::printf("live AF: root twins %llu pipeline twins %llu changed static %llu failures %llu\n",
+                        (unsigned long long)(m2.twin_root_signatures - m1.twin_root_signatures), (unsigned long long)(m2.twin_pipelines - m1.twin_pipelines),
+                        (unsigned long long)m2.live_static_changed, (unsigned long long)m2.twin_failures);
+            CHECK(m2.live_aniso == 16);
+            CHECK(m2.twin_root_signatures >= m1.twin_root_signatures + 1);
+            CHECK(m2.twin_pipelines >= m1.twin_pipelines + 1);
+            CHECK(m2.live_static_changed >= 1);
+            CHECK(m2.twin_failures == m1.twin_failures);
+            CHECK(na::observe::GetAnisoStats().level == 16);
+            test::ComPtr<ID3D12CommandAllocator> la;
+            test::ComPtr<ID3D12GraphicsCommandList> ll;
+            REQUIRE(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&la))));
+            REQUIRE(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, la.Get(), nullptr, IID_PPV_ARGS(&ll))));
+            REQUIRE(SUCCEEDED(ll->Close()));
+            REQUIRE(SUCCEEDED(la->Reset()));
+            REQUIRE(SUCCEEDED(ll->Reset(la.Get(), nullptr))); // latches 16x
+            ll->SetComputeRootSignature(ars.Get());
+            ll->SetPipelineState(apso.Get());
+            ll->Dispatch(1, 1, 1);
+            REQUIRE(SUCCEEDED(ll->Close()));
+            ID3D12CommandList* one[] = {ll.Get()};
+            q->ExecuteCommandLists(1, one);
+            d.WaitIdle();
+            CHECK(dev->GetDeviceRemovedReason() == S_OK); // background-built root signature + pipeline matched
+            CHECK(na::observe::GetMipLiveStats().fallbacks == m2.fallbacks);
+            na::observe::SetSamplerAnisotropy(0);
+            REQUIRE(na::observe::WaitSamplerVariant(5000));
+            CHECK(na::observe::GetMipLiveStats().live_aniso == 0);
+            na::observe::SetSamplerMipBiasLiveEnabled(false);
+            const float classic[3] = {0.0f, -0.5f, -1.0f};
+            na::observe::SetSamplerMipLevelsWanted(classic, 3);
+        }
     }
     test::ComPtr<ID3D12RootSignature> rs_pre; // the pre-pass's own root signature: one root CBV
     {
@@ -375,14 +791,30 @@ int main(int argc, char** argv)
     test::ComPtr<ID3D12RootSignature> post_root;
     if (post_reader || inline_list) {
         REQUIRE(!msaa);
-        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&post_heap))));
+        auto post_desc=chd;if(entry_test)post_desc.NumDescriptors=entry_decoy?192:96;
+        REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&post_desc, IID_PPV_ARGS(&post_heap))));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2DArray.MipLevels = 1; srv.Texture2DArray.FirstArraySlice = 1; srv.Texture2DArray.ArraySize = 1;
-        dev->CreateShaderResourceView(color.Get(), &srv, post_heap->GetCPUDescriptorHandleForHeapStart());
-        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        auto handle=post_heap->GetCPUDescriptorHandleForHeapStart();
+        if(entry_test) {
+            const auto stride=dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            for(UINT i=0;i<post_desc.NumDescriptors;++i){dev->CreateShaderResourceView(nullptr,&srv,handle);handle.ptr+=stride;}
+            handle=post_heap->GetCPUDescriptorHandleForHeapStart();handle.ptr+=72u*stride;
+        }
+        dev->CreateShaderResourceView(color.Get(), &srv, handle);
+        if (entry_decoy) {
+            dev->CreateShaderResourceView(color.Get(), &srv, post_heap->GetCPUDescriptorHandleForHeapStart());
+            // The intermediate shader reads slot 72 of its own table. Keep that
+            // hidden from the bounded SRV scan, while the terminal shader reads
+            // the visible slot zero of the other table.
+            handle=post_heap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr+=168u*dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            dev->CreateShaderResourceView(color.Get(), &srv, handle);
+        }
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, entry_test?96u:1u, 0, 0, 0};
         D3D12_ROOT_PARAMETER p{}; p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p.DescriptorTable = {1, &range};
         D3D12_ROOT_SIGNATURE_DESC rd{1, &p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -391,7 +823,8 @@ int main(int argc, char** argv)
         REQUIRE(SUCCEEDED(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&post_root))));
     }
     // Inline mode: the post pass draws into its own target (another resource).
-    test::ComPtr<ID3D12PipelineState> post_pso;
+    test::ComPtr<ID3D12PipelineState> post_pso,final_post_pso;
+    std::vector<test::ComPtr<ID3D12PipelineState>> entry_writers;
     test::ComPtr<ID3D12Resource> post_rt;
     test::ComPtr<ID3D12DescriptorHeap> post_rtvh;
     D3D12_CPU_DESCRIPTOR_HANDLE post_rtv{};
@@ -402,14 +835,18 @@ int main(int argc, char** argv)
         REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&phd, IID_PPV_ARGS(&post_rtvh))));
         post_rtv = post_rtvh->GetCPUDescriptorHandleForHeapStart();
         dev->CreateRenderTargetView(post_rt.Get(), nullptr, post_rtv);
-        const char* shader = R"(
+        const char* shader = entry_test ? R"(
+Texture2DArray<float4> images[96] : register(t0);
+float4 VS(uint id:SV_VertexID):SV_Position {float2 p=float2((id<<1)&2,id&2);return float4(p*2-1,0,1);}
+float4 PS(float4 p:SV_Position):SV_Target {return images[72].Load(int4(int2(p.xy),0,0));}
+)" : R"(
 Texture2DArray<float4> image : register(t0);
 float4 VS(uint id : SV_VertexID) : SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,0,1); }
 float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(pos.xy),0,0)); }
 )";
         test::ComPtr<ID3DBlob> vs, ps, err;
         REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vs, &err)));
-        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &ps, &err)));
+        REQUIRE(SUCCEEDED(D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "PS", entry_test?"ps_5_1":"ps_5_0", 0, 0, &ps, &err)));
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = post_root.Get();
         pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
@@ -421,13 +858,36 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&post_pso))));
+        if(entry_test){
+            if (entry_decoy) {
+                const char* visible = "Texture2DArray<float4> images[96]:register(t0); float4 PS(float4 p:SV_Position):SV_Target{return images[0].Load(int4(int2(p.xy),0,0));}";
+                REQUIRE(SUCCEEDED(D3DCompile(visible,std::strlen(visible),nullptr,nullptr,nullptr,"PS","ps_5_1",0,0,&ps,&err)));
+                pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+            }
+            pd.RasterizerState.FrontCounterClockwise=TRUE;
+            REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&final_post_pso))));
+            const char* geometry="float4 VS(uint i:SV_VertexID):SV_Position{float2 p=float2((i<<1)&2,i&2);return float4(p*2-1,.5,1);} float4 PS():SV_Target{return float4(.2,.3,.4,1);}";
+            REQUIRE(SUCCEEDED(D3DCompile(geometry,std::strlen(geometry),nullptr,nullptr,nullptr,"VS","vs_5_0",0,0,&vs,&err)));
+            REQUIRE(SUCCEEDED(D3DCompile(geometry,std::strlen(geometry),nullptr,nullptr,nullptr,"PS","ps_5_0",0,0,&ps,&err)));
+            pd.pRootSignature=rs.Get();pd.VS={vs->GetBufferPointer(),vs->GetBufferSize()};pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+            pd.DSVFormat=depth_view_format;
+            for(int i=0;i<24;++i){pd.RasterizerState.DepthBias=i;test::ComPtr<ID3D12PipelineState> pso;
+                REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&pso))));entry_writers.push_back(pso);}
+        }
     }
     uint8_t* cpu = nullptr;
-    REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
+    if (missed_camera_map) {
+        // Anno's persistent mapping existed before it could be observed.
+        na::observe::HostWorkScope unobserved;
+        REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
+    } else {
+        REQUIRE(SUCCEEDED(cb->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) && cpu);
+    }
 
     // An earlier submission leaves colour in RENDER_TARGET and depth in DEPTH_WRITE.
-    test::List setup, scene, consumer, prepass, scene2;
-    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev) && scene2.Create(dev));
+    test::List setup, scene, consumer, prepass, scene2, lens_prepass;
+    REQUIRE(setup.Create(dev) && scene.Create(dev) && consumer.Create(dev) && prepass.Create(dev) && scene2.Create(dev) && lens_prepass.Create(dev));
+    REQUIRE(SUCCEEDED(lens_prepass.list->Close()));
     REQUIRE(SUCCEEDED(scene2.list->Close()));
     REQUIRE(SUCCEEDED(setup.list->Close()));
     {
@@ -450,16 +910,17 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         d.WaitIdle();
     }
     REQUIRE(SUCCEEDED(scene.list->Close()) && SUCCEEDED(consumer.list->Close()) && SUCCEEDED(prepass.list->Close()));
-    na::settings::Get().j2_inline.store(inline_list && !auto_inline);
+    na::settings::Get().j2_inline.store(inline_list && !auto_inline && !entry_split && !entry_retire);
     // Fixed-route tests force between-list insertion so their frame-1 expectations hold;
     // the auto modes exercise the selector.
     na::settings::Get().j2_route.store((auto_inline || auto_between || inline_list) ? 0u : 1u);
     na::j2::SetEnabled(true);
+    na::j2::flow::SetEnabled(inline_flow);
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     // Auto modes also exercise the J2 evidence capture: 3 consecutive evaluations, each
     // with its own slot, joined by the presented image (a stand-in in PRESENT state).
-    const bool capture = auto_inline || auto_between;
+    const bool capture = auto_inline || auto_between || entry_test;
     test::ComPtr<ID3D12Resource> presented;
     std::wstring cap_dir;
     if (capture) {
@@ -473,16 +934,30 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         REQUIRE(SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &pd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&presented))));
         wchar_t tmp[MAX_PATH];
         REQUIRE(GetTempPathW(MAX_PATH, tmp) > 0);
-        cap_dir = std::wstring(tmp) + L"na_j2_capture_" + std::to_wstring(GetCurrentProcessId()) + (auto_inline ? L"_inline" : L"_between");
+        cap_dir = std::wstring(tmp) + L"na_j2_capture_" + std::to_wstring(GetCurrentProcessId()) + (entry_test ? L"_entry" : auto_inline ? L"_inline" : L"_between");
         na::capture::j2::Request(3, cap_dir.c_str(), 0);
     }
+    test::ComPtr<ID3D12CommandSignature> indirect_signature;
+    test::ComPtr<ID3D12Resource> indirect_args;
+    if(entry_indirect){
+        D3D12_INDIRECT_ARGUMENT_DESC arg{};arg.Type=D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(D3D12_DRAW_ARGUMENTS),1,&arg,0};
+        REQUIRE(SUCCEEDED(dev->CreateCommandSignature(&desc,nullptr,IID_PPV_ARGS(&indirect_signature))));
+        indirect_args=test::CreateBuffer(dev,sizeof(D3D12_DRAW_ARGUMENTS),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* ptr=nullptr;REQUIRE(indirect_args && SUCCEEDED(indirect_args->Map(0,nullptr,&ptr)));
+        D3D12_DRAW_ARGUMENTS draw{3,1,0,0};std::memcpy(ptr,&draw,sizeof draw);indirect_args->Unmap(0,nullptr);
+    }
+    if(entry_test)na::j2::SetDebugView(3); // Native NGX is real; known post-NGX depth picture witnesses state handoff.
     int frame_no = 0;
+    float early_shift[2]{};
+    unsigned entry_delivered=0,entry_checks=0;
     const auto frame = [&](double cam_x, bool unpatched_prepass = false) {
         // Copy case: every 4th frame the LAST scene write comes from a different pipeline
         // (another object drawn last). The boundary matcher keys on the final writer, so it
         // rejects that frame and the next (safely: no early insertion); the learned consumer
         // class (the copy) must cover both.
         const bool other_writer = inline_copy && (frame_no++ % 4 == 3);
+        const int entry_frame=entry_test?++frame_no:0;
         d.WaitIdle();
         const int frame_evals = fake::evals;
         if (inline_list) {
@@ -507,6 +982,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         Store(cpu + kBlock + kVp + 192, Proj()); // the camera's own projection, in the same block
         Store(cpu + kPre + kVp, vp); // the pre-pass's own copy of the camera
         Store(cpu + kPre + kVp + 128, inv);
+        if(entry_camera_gap && (entry_frame==12 || entry_frame==18))std::memset(cpu,0,4096);
+        std::memset(lens_cpu, 0, 256);
+        M lens_p = Proj();
+        if (column_component) for (int r = 0; r < 4; ++r) for (int c = r + 1; c < 4; ++c) std::swap(lens_p[r * 4 + c], lens_p[c * 4 + r]);
+        Store(lens_cpu + 16, lens_p);
         prepass.Reset(); // earlier batch: depth only, its own root signature
         prepass.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
         prepass.list->SetGraphicsRootSignature(rs_pre.Get());
@@ -521,15 +1001,42 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 Store(cpu + kPre + kVp, vp);
             }
         }
+        if (early_component) {
+            lens_prepass.Reset();
+            lens_prepass.list->SetGraphicsRootSignature(rs_pre.Get());
+            lens_prepass.list->SetGraphicsRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+            REQUIRE(SUCCEEDED(lens_prepass.list->Close()));
+            ID3D12CommandList* work[] = {lens_prepass.list.Get()};
+            Submit(q, 1, work, true);
+            REQUIRE(ProjectionShift(d, lens.Get(), W, H, false, early_shift) == 0);
+        }
         scene.Reset(); // no colour/depth transitions in the scene list: carried state
         scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         const float clear[4] = {0.2f, 0.3f, 0.4f, 1};
         scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+        if(!entry_test)scene.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
         ID3D12DescriptorHeap* heaps[] = {cbvh.Get()};
         scene.list->SetDescriptorHeaps(1, heaps);
+        if (component_test) {
+            // A separate root/layout consumes the exact same lens, without a VP beside it.
+            scene.list->SetGraphicsRootSignature(rs_pre.Get());
+            scene.list->SetGraphicsRootConstantBufferView(0, lens->GetGPUVirtualAddress());
+        }
         scene.list->SetGraphicsRootSignature(rs.Get());
+        if (alias_test) scene.list->SetGraphicsRootDescriptorTable(0, short_gpu);
         for (int i = 0; i < 3; ++i) scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+        if (entry_retire && entry_frame >= 12) {
+            // The NEW final writer is also used earlier in this same recording.
+            // Its post-entry context is therefore genuinely ambiguous: only the
+            // last writer occurrence can deliver the finished picture. This keeps
+            // the pixel test from passing just through a newly accepted context.
+            D3D12_VIEWPORT v{0, 0, float(W), float(H), 0, 1};
+            D3D12_RECT s{0, 0, LONG(W), LONG(H)};
+            scene.list->RSSetViewports(1, &v); scene.list->RSSetScissorRects(1, &s);
+            scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            scene.list->SetPipelineState(entry_writers.at(2).Get());
+            scene.list->DrawInstanced(3, 1, 0, 0);
+        }
         if (inline_list) { // ...then, in the SAME list, post-processing reads the colour
             D3D12_RESOURCE_BARRIER rd2 = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             scene.list->ResourceBarrier(1, &rd2);
@@ -545,6 +1052,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             const int evals_before_read = fake::evals;
             scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // binding alone is not a read
             REQUIRE(fake::evals == evals_before_read);
+            if(entry_decoy) {
+                auto mid=post_heap->GetGPUDescriptorHandleForHeapStart();
+                mid.ptr+=96u*dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                scene.list->SetGraphicsRootDescriptorTable(0,mid);
+            }
             scene.list->SetPipelineState(post_pso.Get()); // shader chosen AFTER the table
             scene.list->DrawInstanced(3, 1, 0, 0); // intermediate actual read
             REQUIRE(fake::evals == evals_before_read); // must NEVER process the incomplete scene
@@ -552,15 +1064,71 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
             scene.list->ClearRenderTargetView(rtv, clear, 0, nullptr); // actual later scene write
+            if(entry_test){
+                scene.list->SetGraphicsRootSignature(rs.Get());scene.list->SetDescriptorHeaps(1,heaps);
+                scene.list->SetGraphicsRootDescriptorTable(0,cbvh->GetGPUDescriptorHandleForHeapStart());
+                const int writer = entry_retire && entry_frame <= 8 ? (entry_frame <= 4 ? 0 : 1) :
+                    entry_split ? 0 : entry_boundary ? entry_frame % 2 : entry_frame - 1;
+                scene.list->SetPipelineState(entry_writers.at(writer).Get());scene.list->DrawInstanced(3,1,0,0);
+                scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
+                if (entry_retire && entry_frame >= 12) {
+                    // A previously successful ending is now MID-scene. The next
+                    // real scene draw overwrites an early DLAA result. Alternating
+                    // old endings must both be retired, not rescued forever from
+                    // memory and made to cycle the automatic route off/on.
+                    auto read = test::Transition(color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    scene.list->ResourceBarrier(1, &read);
+                    scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
+                    scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+                    scene.list->SetPipelineState(post_pso.Get());
+                    scene.list->DrawInstanced(3, 1, 0, 0);
+                    std::swap(read.Transition.StateBefore, read.Transition.StateAfter);
+                    scene.list->ResourceBarrier(1, &read);
+                    scene.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+                    scene.list->SetDescriptorHeaps(1, heaps);
+                    scene.list->SetGraphicsRootSignature(rs.Get());
+                    scene.list->SetGraphicsRootDescriptorTable(0, cbvh->GetGPUDescriptorHandleForHeapStart());
+                    scene.list->SetPipelineState(entry_writers.at(2).Get());
+                    scene.list->DrawInstanced(3, 1, 0, 0);
+                    scene.list->SetDescriptorHeaps(1, ph);
+                    scene.list->SetGraphicsRootSignature(post_root.Get());
+                }
+            }
             if (other_writer) { // the final scene write is a draw with another pipeline
                 scene.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
                 scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
                 scene.list->DrawInstanced(3, 1, 0, 0);
             }
+            if(entry_split && entry_frame>3 && entry_frame%2==0){
+                // The same terminal pass is now recorded in a separate list with no
+                // scene/depth draw of its own. Descriptor96 is GPU-indexed, not resolved.
+                REQUIRE(SUCCEEDED(scene.list->Close()));ID3D12CommandList* complete[]={scene.list.Get()};
+                Submit(q,1,complete,true);d.WaitIdle();
+                std::swap(scene,scene2);scene.Reset();
+                scene.list->SetDescriptorHeaps(1,ph);scene.list->SetGraphicsRootSignature(post_root.Get());
+                scene.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                scene.list->RSSetViewports(1,&viewport);scene.list->RSSetScissorRects(1,&scissor);
+            }
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
             scene.list->OMSetRenderTargets(1, &post_rtv, FALSE, nullptr);
             scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart()); // final scene binding
+            if(entry_test){
+                const float sentinel[4]={.7f,.2f,.1f,1};scene.list->ClearRenderTargetView(post_rtv,sentinel,0,nullptr);
+                if (entry_decoy && entry_frame >= 8) {
+                    auto decoy = post_heap->GetGPUDescriptorHandleForHeapStart();
+                    decoy.ptr += 96u * dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    scene.list->SetGraphicsRootDescriptorTable(0, decoy);
+                    scene.list->SetPipelineState(post_pso.Get()); // same PSO seen mid-scene, with its scene SRV outside the bounded scan
+                    scene.list->DrawInstanced(3, 1, 0, 0);
+                    REQUIRE(fake::evals == evals_before_read); // no insertion at a decoy
+                    scene.list->SetGraphicsRootDescriptorTable(0, post_heap->GetGPUDescriptorHandleForHeapStart());
+                }
+                // Boundary variant alternates two established final writers.
+                // Its final reader now shares the known-middle PSO, so only
+                // the exact remembered producer boundary can admit it.
+                scene.list->SetPipelineState(entry_boundary && entry_frame>=8 ? post_pso.Get() : final_post_pso.Get());
+            }
             // Legacy boundary matcher: injected at the final read transition. Consumer anchor
             // (P4-0D): injected just before the final actual consumer (below). Never twice.
             REQUIRE(fake::evals <= evals_before_read + 1);
@@ -576,8 +1144,9 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 scene.list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
                 for (auto& b : cbars) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                 scene.list->ResourceBarrier(2, cbars);
-            } else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
-            if (fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
+            } else if(entry_indirect)scene.list->ExecuteIndirect(indirect_signature.Get(),1,indirect_args.Get(),0,nullptr,0);
+            else scene.list->DrawInstanced(3, 1, 0, 0); // final actual read
+            if (!entry_test && fake::evals != evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)) {
                 const auto ds = na::j2::GetStats();
                 std::printf("MISS evals=%d before=%d accepted=%u rejected_skips=%llu cands=%llu waited=%llu refused=%llu rec=%llu no_camera=%llu no_state=%llu busy=%llu pending=%llu reason=\"%s\"\n",
                             fake::evals, evals_before_read, ds.profile_accepted, (unsigned long long)ds.class_rejected_skips,
@@ -585,7 +1154,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                             (unsigned long long)ds.inline_recorded, (unsigned long long)ds.no_camera, (unsigned long long)ds.no_state,
                             (unsigned long long)ds.busy, (unsigned long long)ds.inline_rejects[8], ds.reason);
             }
-            REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // exactly one, before the final consumer ran
+            if(!entry_test) REQUIRE(fake::evals == evals_before_read + (na::j2::GetStats().inline_mode ? 1 : 0)); // exactly one, before the final consumer ran
             std::swap(rd2.Transition.StateBefore, rd2.Transition.StateAfter);
             scene.list->ResourceBarrier(1, &rd2);
         }
@@ -627,6 +1196,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
                 uint8_t original[64]; Store(original, vp);
                 const auto f = [](const uint8_t* p, size_t i) { float v; std::memcpy(&v, p + i * 4, 4); return double(v); };
                 for (size_t block : {size_t(kBlock), size_t(kPre)}) {
+                    if(entry_camera_gap && (entry_frame==12 || entry_frame==18)){
+                        REQUIRE(jx==0 && jy==0); // unreadable camera was not jittered
+                        continue;
+                    }
                     const auto* raster = cpu + block + kVp;
                     const double dx = (f(raster, 3) / f(raster, 15) - f(original, 3) / f(original, 15)) * W / 2;
                     const double dy = -(f(raster, 7) / f(raster, 15) - f(original, 7) / f(original, 15)) * H / 2;
@@ -656,6 +1229,21 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         na::j2::OnPresent(q);
         if (capture) na::capture::j2::OnPresent(q, presented.Get(), &PlainExecute);
         d.WaitIdle();
+        if(entry_test && entry_frame >= (entry_retire ? 16 : 8)){
+            if(entry_split || entry_decoy || entry_boundary)CHECK(fake::evals==frame_evals+1); // exactly one evaluation in each warmed frame
+            const auto desc=post_rt->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes=0;
+            dev->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+            auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);
+            test::List copy;REQUIRE(copy.Create(dev));auto b=test::Transition(post_rt.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy.list->ResourceBarrier(1,&b);D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=post_rt.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=fp;
+            copy.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);copy.list->ResourceBarrier(1,&b);
+            REQUIRE(SUCCEEDED(copy.list->Close()));ID3D12CommandList* work[]={copy.list.Get()};PlainExecute(q,1,work);d.WaitIdle();
+            void* ptr=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,&ptr)));uint16_t rgb[3]{};
+            std::memcpy(rgb,static_cast<uint8_t*>(ptr)+fp.Offset+fp.Footprint.RowPitch*(H/2)+8*(W/2),sizeof rgb);rb->Unmap(0,nullptr);
+            ++entry_checks;const bool delivered=rgb[0]==0 && rgb[1]==0 && rgb[2]==0;if(delivered)++entry_delivered;
+            CHECK(delivered);printf("entry frame %d: downstream %04x/%04x/%04x\n",entry_frame,rgb[0],rgb[1],rgb[2]);
+        }
         const auto ps = na::observe::GetProducerStats();
         std::printf("producers: known disabled %u unknown_inflight %u entries %llu unhooked_queues %llu clears %llu sample_known %llu\n",
                     ps.known_store_disabled, ps.known_unknown_inflight, (unsigned long long)ps.known_entries, (unsigned long long)ps.unhooked_queues,
@@ -679,6 +1267,10 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(as.route.route == (auto_inline ? 2u : 1u));        // chosen from the structure
         CHECK(as.route.state == 1 && as.route.generation == 1);  // learned once, no oscillation
         CHECK(as.frames >= 2 && as.frames <= 4);                 // not before the learning frames
+        if (missed_camera_map) {
+            CHECK(as.camera_offset == kVp && as.no_camera == 0);
+            CHECK(evaluations() > evals0 && as.jitter_writes > 0);
+        }
         if (auto_inline) CHECK(as.inline_frames == as.frames && g_forwarded.size() == 1);
         else CHECK(as.inline_frames == 0 && g_forwarded.size() == 3);
         CHECK(as.route.contribution_established == 0);           // lineage not observed: unknown
@@ -710,11 +1302,50 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(FileSize(cap_dir + L"\\00003-meta.json") < 0); // bounded: exactly the requested frames
         return test::finish(auto_inline ? "j2_anno_shape_test (auto-inline)" : "j2_anno_shape_test (auto-between)");
     }
+    if(entry_test){
+        for(int f=0;f<(entry_retire ? 40 : 24);++f)REQUIRE(frame(.25*(f%4))==0);
+        const auto st=na::j2::GetStats();
+        printf("POST ENTRY %u/%u downstream; matches %llu frames %llu late %llu real %u\n",entry_delivered,entry_checks,(unsigned long long)st.entry_matched,(unsigned long long)st.frames,(unsigned long long)st.inline_late_writes,real_ngx);
+        const unsigned expected = entry_retire ? 25u : 17u;
+        CHECK(entry_checks==expected && entry_delivered==expected && (entry_boundary ? st.entry_rescued_memory>=2 : entry_decoy ? st.class_matched+st.class_pair_matched>=17 : st.entry_matched>=17));
+        CHECK(st.no_camera==0 && st.no_state==0);
+        if (entry_retire) {
+            CHECK(st.inline_late_writes <= 2); // one disproval per formerly valid ending
+            CHECK(st.entry_shapes_retired >= 2);
+            CHECK(st.legacy_matched >= expected); // true last occurrence, not context acceptance
+            CHECK(st.route.changes == 1 && st.route.contradictions <= 2);
+        } else CHECK(st.inline_late_writes==0);
+        CHECK(st.depth_sources[1]+(entry_split?st.depth_sources[3]:0)>=17 && st.depth_state_assumed==0); // inherited or exact submitted-prefix state, never guessed
+        if(entry_split)CHECK(st.between_observed>=9 && st.depth_sources[2]==0); // saved handoff exercised; no supplied substitute
+        if(entry_camera_gap)CHECK(st.camera_held>=2);
+        uint64_t depth_total=0,camera_total=0;
+        for(const auto value:st.depth_sources)depth_total+=value;
+        for(const auto value:st.camera_sources)camera_total+=value;
+        CHECK(depth_total==st.frames && camera_total==st.frames); // count submissions, not attempts
+        CHECK(evaluations()-evals0>=17 && evaluations()-evals0<=(entry_retire ? 40 : 24));
+        CHECK(dev->GetDeviceRemovedReason()==S_OK);
+        na::capture::j2::Shutdown();
+        const auto cs=na::capture::j2::GetStats();
+        CHECK(cs.written==3 && cs.errors==0 && cs.without_present==0);
+        for(int i=0;i<3;++i){
+            wchar_t file[32];swprintf_s(file,L"\\%05d-meta.json",i);
+            const auto meta=ReadText(cap_dir+file);
+            const std::string pipeline="\"pipeline\": "+std::to_string(na::observe::IdOf(final_post_pso.Get()));
+            CHECK(meta.find(pipeline)!=std::string::npos);
+            CHECK(meta.find("\"operation\": 0")==std::string::npos);
+            CHECK(meta.find("\"barrier\": 0")==std::string::npos);
+        }
+        return test::finish("j2 post entry delivery");
+    }
     if (inline_list) {
         // The copy case runs long enough for the consumer anchor's stability gate (16
         // identical signatures) to hand over from the boundary matcher.
         const int frames = inline_copy ? 22 : 4;
         for (int f = 0; f < frames; ++f) REQUIRE(frame(0.25 * (f % 4)) == 0);
+        if(inline_flow){const auto flow=na::j2::compute_flow::GetStats();
+            printf("inline AMD: recorded=%llu submitted=%llu pairs=%llu %s\n",(unsigned long long)flow.recorded,(unsigned long long)flow.submitted,(unsigned long long)flow.pairs,flow.reason);
+            CHECK(flow.submitted>=2 && flow.pairs>=1);
+        }
         if (inline_record_first) REQUIRE(frame(1.0, true) == 0);
         const auto is = na::j2::GetStats();
         std::printf("inline: mode %u, candidates %llu, recorded %llu, frames %llu (inline %llu), refused %llu, evals %llu, forwarded %zu, \"%s\"\n",
@@ -784,6 +1415,16 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     const double jx = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X), jy = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
     CHECK((jx != 0.0 || jy != 0.0) && std::fabs(jx) < 0.5 && std::fabs(jy) < 0.5);
+    if (component_test) {
+        float shift[2]{};
+        REQUIRE(ProjectionShift(d, lens.Get(), W, H, column_component, shift) == 0);
+        std::printf("standalone GPU projection shift=(%.6f,%.6f), NGX jitter=(%.6f,%.6f)\n", shift[0], shift[1], jx, jy);
+        CHECK(std::fabs(shift[0] - jx) < 1e-5 && std::fabs(shift[1] - jy) < 1e-5);
+        if (early_component) {
+            std::printf("earlier GPU projection shift=(%.6f,%.6f)\n", early_shift[0], early_shift[1]);
+            CHECK(std::fabs(early_shift[0] - jx) < 1e-5 && std::fabs(early_shift[1] - jy) < 1e-5);
+        }
+    }
     }
     {
         uint8_t orig[64];
@@ -854,6 +1495,8 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         } else CHECK(s1[0] == 0 && s1[1] == 0 && s1[2] == 0);      // the scene's clear (0.2,0.3,0.4) was replaced by the DLAA result
     }
     CHECK(dev->GetDeviceRemovedReason() == S_OK);
+    if(test_donut)CHECK(na::donut::ScenePass().GetStats().recorded>0);
+    if(test_ao)CHECK(na::xegtao::ScenePass().GetStats().recorded>0);
     na::j2::SetEnabled(false);
     d.WaitIdle();
     na::j2::Shutdown();

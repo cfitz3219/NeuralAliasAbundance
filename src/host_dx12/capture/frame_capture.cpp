@@ -1,10 +1,12 @@
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -26,6 +28,7 @@ struct Plane {
 struct Frame {
     uint32_t index = 0;
     EvalInputs in{};
+    char note[256] = {};
     std::vector<Plane> planes; // color, depth, motion, dlss_output, backbuffer
     UINT64 fence_value = 0;
 };
@@ -35,6 +38,8 @@ struct State {
     std::atomic<bool> pending{false};
     std::atomic<ULONGLONG> start_at{0}; // A44: tick count at which the capture starts
     uint32_t requested = 0, evaluated = 0, written = 0, errors = 0;
+    bool presents_only = false;
+    char note[256] = {};
     wchar_t dir[MAX_PATH] = {};
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -47,7 +52,10 @@ struct State {
     std::atomic<bool> stop{false};
     HANDLE wake = nullptr;
 };
-State g;
+// Never destroyed: at process exit the CRT would run ~State with `writer` still joinable
+// (std::terminate -> abort, 0xC0000409 at exit after any capture: SE5 2026-11-02, symbolicated
+// by the PC session) and release D3D objects after the device is gone. The OS reclaims it.
+State& g = *new State;
 
 bool ensure_device(ID3D12Device* dev)
 {
@@ -110,6 +118,43 @@ bool record_plane(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
     return true;
 }
 
+// A viewable copy of an 8-bit or 10-bit colour plane: 24-bit BMP, bottom-up. Other formats
+// (float, depth, motion) have only their .raw.
+void write_bmp(const wchar_t* path, const void* data, const Plane& p)
+{
+    const DXGI_FORMAT f = p.desc.Format;
+    const bool rgba8 = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    const bool bgra8 = f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    const bool rgb10 = f == DXGI_FORMAT_R10G10B10A2_UNORM || f == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    if (!rgba8 && !bgra8 && !rgb10) return;
+    const uint32_t w = static_cast<uint32_t>(p.desc.Width), h = p.desc.Height, pitch = p.footprint.Footprint.RowPitch;
+    if (!w || !h || uint64_t(pitch) * h > p.bytes) return;
+    const uint32_t out_pitch = (w * 3 + 3) & ~3u;
+    std::vector<uint8_t> row(out_pitch);
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path, L"wb") != 0 || !fp) return;
+    const uint32_t size = 54 + out_pitch * h;
+    uint8_t hdr[54] = {'B', 'M'};
+    auto put32 = [&](int at, uint32_t v) { memcpy(hdr + at, &v, 4); };
+    auto put16 = [&](int at, uint16_t v) { memcpy(hdr + at, &v, 2); };
+    put32(2, size); put32(10, 54); put32(14, 40); put32(18, w); put32(22, h); put16(26, 1); put16(28, 24); put32(34, out_pitch * h);
+    fwrite(hdr, 1, 54, fp);
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    for (uint32_t y = h; y-- > 0;) {
+        const uint8_t* s = src + size_t(y) * pitch;
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t r, gch, b;
+            if (rgb10) {
+                uint32_t v; memcpy(&v, s + x * 4, 4);
+                r = uint8_t((v & 0x3FF) >> 2); gch = uint8_t(((v >> 10) & 0x3FF) >> 2); b = uint8_t(((v >> 20) & 0x3FF) >> 2);
+            } else if (rgba8) { r = s[x * 4]; gch = s[x * 4 + 1]; b = s[x * 4 + 2]; }
+            else { b = s[x * 4]; gch = s[x * 4 + 1]; r = s[x * 4 + 2]; }
+            row[x * 3] = b; row[x * 3 + 1] = gch; row[x * 3 + 2] = r;
+        }
+        fwrite(row.data(), 1, out_pitch, fp);
+    }
+    fclose(fp);
+}
 void write_frame(const Frame& f)
 {
     wchar_t path[MAX_PATH];
@@ -124,17 +169,22 @@ void write_frame(const Frame& f)
             fwrite(mapped, 1, static_cast<size_t>(p.bytes), fp);
             fclose(fp);
         }
+        if (strcmp(p.name, "backbuffer") == 0) { // the picture as seen: viewable copy
+            swprintf_s(path, L"%s\\frame%u-%S.bmp", g.dir, f.index, p.name);
+            write_bmp(path, mapped, p);
+        }
         D3D12_RANGE none{0, 0};
         p.readback->Unmap(0, &none);
     }
     swprintf_s(path, L"%s\\frame%u-meta.json", g.dir, f.index);
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path, L"wb") == 0 && fp) {
-        fprintf(fp, "{\n  \"frame\": %u,\n  \"render\": [%u, %u],\n  \"output\": [%u, %u],\n"
+        fprintf(fp, "{\n  \"exe\": \"%ls\",\n  \"pid\": %u,\n  \"frame\": %u,\n  \"render\": [%u, %u],\n  \"output\": [%u, %u],\n"
                     "  \"jitter\": [%.6f, %.6f],\n  \"mv_scale\": [%.4f, %.4f],\n  \"reset\": %u,\n"
+                    "  \"note\": \"%s\",\n"
                     "  \"planes\": [\n",
-                f.index, f.in.render_w, f.in.render_h, f.in.out_w, f.in.out_h, f.in.jitter_x,
-                f.in.jitter_y, f.in.mv_scale_x, f.in.mv_scale_y, f.in.reset);
+                ThisProcess().exe, ThisProcess().pid, f.index, f.in.render_w, f.in.render_h, f.in.out_w, f.in.out_h, f.in.jitter_x,
+                f.in.jitter_y, f.in.mv_scale_x, f.in.mv_scale_y, f.in.reset, f.note);
         bool first = true;
         for (const Plane& p : f.planes) {
             if (!p.readback) continue;
@@ -179,9 +229,11 @@ void Request(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms)
 {
     std::lock_guard<std::mutex> lock(g.m);
     if (!out_dir || frames == 0) return;
+    g.presents_only = false;
     g.start_at = GetTickCount64() + delay_ms;
     wcsncpy_s(g.dir, out_dir, _TRUNCATE);
     CreateDirectoryW(g.dir, nullptr);
+    TagDir(g.dir, "frames");
     g.requested = frames;
     g.evaluated = 0;
     g.written = 0;
@@ -193,6 +245,19 @@ void Request(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms)
         g.writer = std::thread(&writer_main);
     }
     g.pending.store(true, std::memory_order_release);
+}
+
+void RequestPresents(uint32_t frames, const wchar_t* out_dir, uint32_t delay_ms)
+{
+    Request(frames, out_dir, delay_ms);
+    std::lock_guard<std::mutex> lock(g.m);
+    g.presents_only = g.pending.load();
+}
+
+void NotePresent(const char* text)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    snprintf(g.note, sizeof g.note, "%s", text ? text : "");
 }
 
 bool Pending()
@@ -239,10 +304,21 @@ bool OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     return ok;
 }
 
-void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer)
+void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* backbuffer, bool wait_for_slot)
 {
     if (!Pending() || !queue) return;
     std::lock_guard<std::mutex> lock(g.m);
+    if (!wait_for_slot && g.fence_next > 1 && g.fence->GetCompletedValue() < g.fence_next - 1) return;
+    if (!g.current && g.presents_only && g.evaluated < g.requested) {
+        ComPtr<ID3D12Device> dev;
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_device(dev.Get())) { ++g.errors; return; }
+        auto f = std::make_unique<Frame>();
+        f->index = g.evaluated;
+        f->planes.resize(5);
+        snprintf(f->note, sizeof f->note, "%s", g.note);
+        g.current = std::move(f);
+        ++g.evaluated;
+    }
     if (!g.current || !g.device) return;
     // One allocator: it may only be reset once the GPU has finished the previous
     // capture copy recorded with it. Resetting it while that copy still runs is

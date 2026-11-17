@@ -1,0 +1,11 @@
+{
+  "about": "A replay cannot renew a different build's live verification.",
+  "call": "job_state",
+  "args": [
+    [
+      {"state": "verified", "evidence_type": "live_run", "build": "12345678"},
+      {"state": "verified", "evidence_type": "replay", "build": "abcdef12"}
+    ]
+  ],
+  "expect": {"state": "unknown", "because": "These pieces refer to different builds. Select the build to judge."}
+}

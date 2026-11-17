@@ -29,3 +29,6 @@ nvngx*.dll
 .vs/
 .vscode/
 *.user
+
+# Python
+__pycache__/

@@ -28,7 +28,7 @@ void Flow::set_error(const char* what, int status)
     snprintf(error_, sizeof(error_), "%s: %s (status %d)", what, kReason, status);
 }
 
-bool Flow::Init(ID3D12Device*, uint32_t width, uint32_t height, uint32_t grid, uint32_t)
+bool Flow::Init(ID3D12Device*, uint32_t width, uint32_t height, uint32_t grid, uint32_t, bool)
 {
     width_ = width; height_ = height; grid_ = grid ? grid : 1;
     set_error("Init", 0);
@@ -46,8 +46,14 @@ bool Flow::RegisterOutput(ID3D12Resource*, ID3D12Fence*, uint64_t, uint64_t, Buf
     set_error("RegisterOutput", 0);
     return false;
 }
+bool Flow::RegisterCost(ID3D12Resource*, ID3D12Fence*, uint64_t, uint64_t, BufferHandle* out)
+{
+    if (out) *out = nullptr;
+    set_error("RegisterCost", 0);
+    return false;
+}
 bool Flow::Unregister(BufferHandle) { set_error("Unregister", 0); return false; }
-bool Flow::Execute(BufferHandle, BufferHandle, BufferHandle, ID3D12Fence*, uint64_t, ID3D12Fence*, uint64_t, bool)
+bool Flow::Execute(BufferHandle, BufferHandle, BufferHandle, ID3D12Fence*, uint64_t, ID3D12Fence*, uint64_t, bool, BufferHandle)
 {
     set_error("Execute", 0);
     return false;

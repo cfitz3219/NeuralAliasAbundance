@@ -12,6 +12,7 @@
     static_assert(offsetof(vtbl, method) / sizeof(void*) == (value), #vtbl "::" #method " slot")
 
 namespace s = na::observe::slots;
+NA_SLOT(ID3D12GraphicsCommandListVtbl, IASetPrimitiveTopology, s::list::IASetPrimitiveTopology);
 NA_SLOT(ID3D12DeviceVtbl, CreateCommandQueue, s::device::CreateCommandQueue);
 NA_SLOT(ID3D12DeviceVtbl, CreateCommandAllocator, s::device::CreateCommandAllocator);
 NA_SLOT(ID3D12DeviceVtbl, CreateGraphicsPipelineState, s::device::CreateGraphicsPipelineState);
@@ -32,6 +33,7 @@ NA_SLOT(ID3D12DeviceVtbl, CreateHeap, s::device::CreateHeap);
 NA_SLOT(ID3D12DeviceVtbl, CreatePlacedResource, s::device::CreatePlacedResource);
 NA_SLOT(ID3D12DeviceVtbl, CreateReservedResource, s::device::CreateReservedResource);
 NA_SLOT(ID3D12DeviceVtbl, CreateFence, s::device::CreateFence);
+NA_SLOT(ID3D12DeviceVtbl, CreateCommandSignature, s::device::CreateCommandSignature);
 NA_SLOT(ID3D12Device2Vtbl, CreatePipelineState, s::device::CreatePipelineState);
 NA_SLOT(ID3D12Device4Vtbl, CreateCommandList1, s::device::CreateCommandList1);
 NA_SLOT(ID3D12Device4Vtbl, CreateCommittedResource1, s::device::CreateCommittedResource1);
@@ -39,6 +41,9 @@ NA_SLOT(ID3D12Device4Vtbl, CreateHeap1, s::device::CreateHeap1);
 NA_SLOT(ID3D12Device4Vtbl, CreateReservedResource1, s::device::CreateReservedResource1);
 NA_SLOT(ID3D12Device8Vtbl, CreateCommittedResource2, s::device::CreateCommittedResource2);
 NA_SLOT(ID3D12Device8Vtbl, CreatePlacedResource1, s::device::CreatePlacedResource1);
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+NA_SLOT(ID3D12Device11Vtbl, CreateSampler2, s::device::CreateSampler2);
+#endif
 
 NA_SLOT(ID3D12ResourceVtbl, Map, s::resource::Map);
 NA_SLOT(ID3D12ResourceVtbl, Unmap, s::resource::Unmap);
@@ -78,6 +83,9 @@ NA_SLOT(ID3D12GraphicsCommandListVtbl, SetGraphicsRootUnorderedAccessView, s::li
 NA_SLOT(ID3D12GraphicsCommandListVtbl, OMSetRenderTargets, s::list::OMSetRenderTargets);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearDepthStencilView, s::list::ClearDepthStencilView);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearRenderTargetView, s::list::ClearRenderTargetView);
+NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearUnorderedAccessViewUint, s::list::ClearUnorderedAccessViewUint);
+NA_SLOT(ID3D12GraphicsCommandListVtbl, ClearUnorderedAccessViewFloat, s::list::ClearUnorderedAccessViewFloat);
+NA_SLOT(ID3D12GraphicsCommandListVtbl, DiscardResource, s::list::DiscardResource);
 NA_SLOT(ID3D12GraphicsCommandListVtbl, ExecuteIndirect, s::list::ExecuteIndirect);
 NA_SLOT(ID3D12GraphicsCommandList4Vtbl, BeginRenderPass, s::list::BeginRenderPass);
 NA_SLOT(ID3D12GraphicsCommandList4Vtbl, EndRenderPass, s::list::EndRenderPass);

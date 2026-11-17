@@ -42,6 +42,15 @@ namespace na::hooking {
 bool Initialize();
 void Shutdown();
 
+// Hooking engine, chosen before the first Initialize ([hooking] engine=detours in the ini;
+// default MinHook). Microsoft Detours (MIT, third_party/detours) is opt-in: same contract
+// (publish before enable, transactions, removal needs quiescence). Returns false when the
+// engine is not built in, or a session already started with the other one.
+enum class Engine { MinHook, Detours };
+bool SetEngine(Engine e);
+Engine CurrentEngine();
+const char* EngineName();
+
 // Hooks `slot_index` of `object`'s vtable (0-based). On success writes the
 // trampoline (original function) to *out_original BEFORE enabling the hook.
 // If that concrete function is already hooked, returns the existing

@@ -13,7 +13,8 @@ enum class Op : uint8_t {
     Unknown = 0, DrawWrite, ClearWrite, CopyWrite,  // writes
     Barrier,                                        // RT -> read transition (not a consumer)
     GraphicsRead, ComputeRead, CopyRead,            // actual consumers
-    DerivedRead                                     // read of a texture copied from the colour this frame (lineage only)
+    DerivedRead,                                    // read of a texture copied from the colour this frame (lineage only)
+    GraphicsEntry, ComputeEntry, IndirectGraphicsEntry, IndirectComputeEntry
 };
 struct InsertionEvent {
     uint64_t resource = 0, destination = 0, pipeline = 0;
@@ -25,7 +26,20 @@ struct InsertionEvent {
     uint8_t color_srvs = 0;  // descriptors of the scene colour in the bound tables
     uint8_t view_srvs = 0;   // other view-sized textures read alongside (history etc.)
     bool with_depth = false; // write: the selected scene depth was bound (scene content, not reuse)
+    uint64_t recording=0,operation=0;
+    uint32_t barrier=0;
+    // Entry context (2026-11-06, SE5 40 s bursts): where this entry sits in its own recording.
+    // Bit 4 = the colour was written earlier in this recording; bits 0-3 = which entry of the
+    // colour since that write (or since the recording began), this one included, capped at 15.
+    // The same consumer PSO can be an intermediate entry in one shape and the terminal one in
+    // another (lists merged vs split); the context keeps the two occurrences apart.
+    uint32_t context=0;
+    uint64_t producer=0;   // entry: pipeline of the colour's last write in this recording (0 = none)
 };
+inline uint32_t EntryContext(bool written_in_recording, uint32_t ordinal)
+{
+    return (written_in_recording ? 16u : 0u) | (ordinal > 15u ? 15u : ordinal);
+}
 inline Op ClassifyOp(const InsertionEvent& e)
 {
     if (e.op != Op::Unknown) return e.op;
@@ -34,6 +48,7 @@ inline Op ClassifyOp(const InsertionEvent& e)
     return e.pipeline ? Op::GraphicsRead : Op::CopyRead;
 }
 inline bool IsConsumer(Op op) { return op == Op::GraphicsRead || op == Op::ComputeRead || op == Op::CopyRead; }
+inline bool IsEntry(Op op) { return op == Op::GraphicsEntry || op == Op::ComputeEntry || op == Op::IndirectGraphicsEntry || op == Op::IndirectComputeEntry; }
 
 // P4-0D (Argon's PostEntryPSO, with Astra's corrections): the first ACTUAL consumer of
 // the selected colour after its final write in a recording, learned from completed,
@@ -96,6 +111,30 @@ struct InsertionDecision {
     uint32_t writer_occurrence = 0;
     uint32_t derived_reads = 0; // reads of textures copied from the colour this frame
 };
+struct LearnedInsertion {
+    uint64_t color = 0, depth = 0;
+    InsertionDecision decision;
+};
+
+inline bool MatchesBoundary(const LearnedInsertion& learned, uint64_t color, uint64_t depth,
+                            const InsertionDecision& current) {
+    const auto& d = learned.decision;
+    if (!d.final_candidate || learned.color != color || learned.depth != depth ||
+        current.destination != d.destination || current.pipeline != d.pipeline) return false;
+    if (d.final_transition && d.boundary_writer)
+        return current.boundary_writer == d.boundary_writer && current.writer_occurrence == d.writer_occurrence;
+    if (d.final_transition) return current.final_transition == d.final_transition;
+    return current.candidates == d.final_candidate;
+}
+
+inline const LearnedInsertion* FindBoundary(const LearnedInsertion& previous, const LearnedInsertion* delivered,
+                                             int count, uint64_t color, uint64_t depth, const InsertionDecision& current) {
+    if (MatchesBoundary(previous, color, depth, current)) return &previous;
+    for (int i = 0; i < count; ++i)
+        if (MatchesBoundary(delivered[i], color, depth, current)) return &delivered[i];
+    return nullptr;
+}
+
 // A write or an actual consumer of the selected colour, in recording order (frame labelling).
 struct ColorEvent {
     bool write = false;
@@ -105,9 +144,34 @@ struct ColorEvent {
     uint64_t producer = 0;     // consumer/barrier: pipeline of the preceding write in this recording
     bool list_start = false;   // first event of a recording (frame sequences span several lists)
 };
+// What one later list of a submission says about a scene ending placed before it:
+//  +1 the scene continues (a draw into the colour before the picture is copied onward),
+//  -1 the picture is copied onward here (anything later reuses the texture; stop looking),
+//   0 neither (empty, readers only, clears): keep looking in the next list.
+// The same meaning of "continues" as LabelFrame.
+inline int SceneTailVerdict(const std::vector<ColorEvent>& events) {
+    for (const auto& e : events) {
+        if (!e.write && e.op == Op::CopyRead) return -1;
+        if (e.write && e.op == Op::DrawWrite) return 1;
+    }
+    return 0;
+}
 class InsertionTrace {
 public:
     void Reset() { events_.clear(); complete_ = true; }
+    // Context of an entry about to be added (see InsertionEvent::context / producer).
+    void SetEntryContext(InsertionEvent& entry) const {
+        uint32_t ordinal = 1;
+        bool written = false;
+        entry.producer = 0;
+        for (size_t i = events_.size(); i-- > 0;) {
+            const auto& p = events_[i];
+            if (p.resource != entry.resource) continue;
+            if (p.write) { written = true; entry.producer = p.pipeline; break; }
+            if (IsEntry(p.op)) ++ordinal;
+        }
+        entry.context = EntryContext(written, ordinal);
+    }
     void Add(InsertionEvent event) {
         if (events_.size() == 8192) { complete_ = false; return; }
         events_.push_back(event);
@@ -119,6 +183,7 @@ public:
         std::map<uint64_t, uint32_t> writer_reads;
         for (const auto& event : events_) {
             if (event.resource != color) continue;
+            if (IsEntry(event.op)) continue; // operation evidence is not proof of a resource read
             if (event.op == Op::DerivedRead) { ++result.derived_reads; continue; } // lineage only
             if (!event.write) ++result.all_reads;
             if (!event.write && event.pipeline == UINT64_MAX) ++result.transitions;
@@ -245,7 +310,7 @@ public:
                 c.producer = producer;
                 c.list_start = first; first = false;
                 out.push_back(c);
-            } else if ((IsConsumer(op) && e.destination != color) || op == Op::Barrier) {
+            } else if ((IsConsumer(op) && e.destination != color) || op == Op::Barrier || IsEntry(op)) {
                 ColorEvent c;
                 c.op = op; c.raw = e; c.producer = producer;
                 c.list_start = first; first = false;

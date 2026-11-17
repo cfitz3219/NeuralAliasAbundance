@@ -1,7 +1,14 @@
+#include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/background/work.hpp"
+#include "host_dx12/gpu/mem_alloc.hpp"
+#include "host_dx12/gpu/services.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
+#include "host_dx12/effects/donut.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
 #include "host_dx12/adapters/tsushima/apply.hpp"
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
 #include "host_dx12/adapters/mode_control.hpp"
+#include "host_dx12/scale/native_control.hpp"
 #include "host_dx12/sl_boundary/sl_boundary.hpp"
 // Route A menu content (A30 redesign): the Picture page (status, master
 // switch, mode cards, preset), the Enhancements rows (Ray Reconstruction;
@@ -18,13 +25,22 @@
 #include <atomic>
 #include <cstdio>
 #include <ctime>
+#include <string>
 
 #include <imgui.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/native_d3d11/live_dlaa.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/effects/xegtao.hpp"
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/motion/live_flow.hpp"
@@ -32,9 +48,12 @@
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/nr/nr_pass.hpp"
 #include "host_dx12/overlay/menu.hpp"
+#include "host_dx12/overlay/dlss_debug.hpp"
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
 
 namespace na::overlay {
@@ -921,84 +940,132 @@ void DrawLiveDlaa()
     BeginGroupBox("Live DLAA");
     bool on = !na::j2::Paused();
     BeginRow("NeuralAlias DLAA (test)", "NVIDIA DLSS at full resolution on this game's 3D picture. Switch off to compare.", SwitchWidth());
-    if (Switch("j2", &on)) na::j2::SetPaused(!on);
+    if (Switch("j2", &on)) {
+        na::j2::SetPaused(!on);
+        const auto mip = na::observe::GetMipLiveStats();
+        if (mip.enabled && !na::j2::RenderSmall() &&
+            (!na::settings::AddedUpscalingAllowed() || na::settings::Get().j2_scale_mode.load() == 0))
+            na::observe::SetSamplerMipBiasLive(on ? na::settings::DlaaMipBias(na::settings::Get()) : 0.0f);
+    }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
+    if (na::settings::AddedUpscalingAllowed() &&
+        (na::scale::native::Available() || na::scale::SliderRouteActive() ||
+         na::scale::GetAutomaticSceneStats().enabled || na::j2::ProjectionWindow() || na::j2::RenderSmall())) {
+        // P4-4 slider route: the mode sets the game's own render scale (read at start-up; live
+        // when the game allows it). The game's own Render Scale slider is left to the user.
+        na::settings::Settings& ss = na::settings::Get();
+        int mode = static_cast<int>(ss.j2_scale_mode.load());
+        // Render-small draws the HUD small too: Ultra Performance (33%) is not offered there.
+        const int modes = na::j2::RenderSmall() ? 4 : 5;
+        if (mode < 0 || mode >= modes) mode = mode >= modes ? modes - 1 : 0;
+        BeginRow("Render mode", na::scale::native::Available()
+            ? "Changes the game's scene resolution through its own settings system while you play. DLSS reconstructs at full display size; your window mode stays the same. DLAA uses full resolution."
+            : na::j2::RenderSmall()
+            ? "DLAA uses full resolution. Quality, Balanced and Performance draw the whole game smaller for more FPS (67%, 58%, 50%) and DLSS brings it back to full size. The game's own HUD is drawn smaller too, so text is a little softer. Changes apply while you play."
+            : na::scale::GetAutomaticSceneStats().enabled
+            ? "DLAA uses full resolution. The other modes draw the prepared scene into smaller textures and reconstruct it at full display size, independently of window mode. Changes apply while you play; the status reports the actual DLSS input and output."
+            : na::j2::ProjectionWindow()
+            ? "DLAA uses full resolution. Quality, Balanced, Performance and Ultra Performance render the scene smaller for more FPS. Menus and the HUD keep their normal size. Changes apply while you play."
+            : "DLAA draws the game at full resolution. Quality, Balanced, Performance and Ultra Performance draw it smaller for more FPS (67%, 58%, 50%, 33%). NeuralAlias sets the game's Render Scale for you; leave the game's own slider at 100%.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2scale", &mode, kModes, modes)) {
+            ss.j2_scale_mode.store(static_cast<uint32_t>(mode));
+            na::settings::Save();
+            if(na::scale::SliderRouteActive())na::scale::RequestMode(mode);
+            if(na::scale::native::Available())na::scale::native::Request(mode);
+        }
+        EndRow();
+          if(na::scale::native::Available()){const auto native=na::scale::native::GetStats();
+              // Audit 2026-11-06: when the game is smaller but DLSS is not
+              // reconstructing, say why (the bridge's reason), not only "checking".
+              const auto bridge=na::j2::GetNativeBridgeStats();char note[260];
+              if(!native.confirmed&&bridge.reduced&&!bridge.recorded&&bridge.reason[0])
+                  std::snprintf(note,sizeof note,"Scene %u x %u, DLSS not reconstructing yet: %s",bridge.rw,bridge.rh,bridge.reason);
+              else std::snprintf(note,sizeof note,"%s",native.reason);
+              StatusLine(native.confirmed?1:0,note);}
+          else if(na::j2::RenderSmall()){const auto j2=na::j2::GetStats();const auto ps=na::present::GetStats();
+              char note[200];
+              if(ps.scaled_w)std::snprintf(note,sizeof note,"Rendering the game at %ux%u, DLSS to %ux%u.",ps.scaled_w,ps.scaled_h,ps.native_w,ps.native_h);
+              else std::snprintf(note,sizeof note,"%s",mode?"Waiting for the game to rebuild at the smaller size.":"Rendering at full resolution.");
+              StatusLine(ps.scaled_w&&j2.small_dlss?1:0,note);}
+          else if(na::j2::ProjectionWindow()){const auto j2=na::j2::GetStats();
+              char note[200];
+              if(j2.window_engaged)std::snprintf(note,sizeof note,"Rendering the scene at %ux%u, DLSS to full size.",j2.window_w,j2.window_h);
+              else std::snprintf(note,sizeof note,"%s",j2.window_note[0]?j2.window_note:(mode?"Starting once DLAA is running steadily.":"Rendering at full resolution."));
+              StatusLine(j2.window_engaged?1:0,note);}
+          else if(na::scale::GetAutomaticSceneStats().enabled){const auto automatic=na::scale::GetAutomaticSceneStats();
+              char note[240];
+              const bool actual=automatic.reconstructed&&st.active&&st.render_w==automatic.render_w&&st.render_h==automatic.render_h&&
+                  st.out_w==automatic.out_w&&st.out_h==automatic.out_h;
+              if(mode==0&&st.active&&st.render_w==st.out_w&&st.render_h==st.out_h)
+                  std::snprintf(note,sizeof note,"DLAA at %u x %u.",st.render_w,st.render_h);
+              else if(actual)std::snprintf(note,sizeof note,"Scene renders at %u x %u; DLSS output %u x %u.",st.render_w,st.render_h,st.out_w,st.out_h);
+              else std::snprintf(note,sizeof note,"%s",automatic.reason);
+              StatusLine((actual||(mode==0&&st.active&&st.render_w==st.out_w))?1:0,note);}
+          else StatusLine(0, na::scale::GetDriverStats().state);
+        if (na::j2::RenderSmall()) {
+            // Borderless/full screen make the game ignore the smaller size; a window that covers
+            // the screen keeps Quality/Balanced/Performance working and looks the same.
+            bool fill = ss.fill_screen.load() != 0;
+            BeginRow("Fill the screen", "Keeps the game in its Windowed mode and removes the window's frame so it covers the whole screen, like borderless. Set the game's own display mode to Windowed: in borderless or full screen the game ignores the smaller size, so Quality, Balanced and Performance cannot work there. Applies at once.", S(220));
+            if (ImGui::Checkbox("##fillscreen", &fill)) { ss.fill_screen.store(fill ? 1u : 0u); na::settings::Save(); }
+            EndRow();
+        }
+    }
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLAA; the HUD is never sharpened. 0-100%: AMD RCAS (halo-free, up to its designed maximum). 101-200%: NVIDIA Image Scaling sharpening added on top for extra bite; edge outlines can appear near 200%. 0 = off.", S(220));
+        BeginRow("Sharpness", "Sharpening after DLSS: RCAS with soft halo control, easing off at depth edges so silhouettes keep clean outlines. 0 = off. The strength doubles every 25 points: 50% is standard RCAS at full strength, 75% is twice it and 100% four times. Native HUD is composed afterward. If separation is unavailable, HUD in the game image can also be sharpened.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 200, sharp ? (sharp > 100 ? "%d%% (RCAS + NIS)" : "%d%%") : "Off")) {
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
         EndRow();
     }
+    if (na::j2::RenderSmall() && na::j2::native_hud::Automatic()) {
+        const auto method=na::j2::native_hud::AutomaticMethod();
+        if(method==na::j2::hud_routes::Method::Off)
+            Hint("HUD separation unavailable after four methods; DLSS keeps running with the HUD in the image.");
+        else if(na::j2::native_hud::AutomaticVerified())
+            Hint("HUD separation verified; compatible HUD pixels are drawn at native resolution.");
+        else
+            Hint("Checking automatic HUD separation; DLSS keeps running during the checks.");
+    }
     {
-        // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default.
-        static const char* kLivePresets[] = {"L (default)", "M", "K", "J", "NVIDIA default"};
-        static const uint32_t kLiveValues[] = {12, 13, 11, 10, 0};
+        // DLSS render preset. NGX values: J 10, K 11, L 12, M 13; 0 = NVIDIA's default;
+        // Automatic (Cort 2026-11-04): L for DLAA/Quality, M for Balanced/Performance.
+        static const char* kLivePresets[] = {"Automatic (L / M)", "L (all modes)", "M (all modes)", "K", "J", "NVIDIA default"};
+        static const uint32_t kLiveValues[] = {na::j2::kPresetAuto, 12, 13, 11, 10, 0};
         na::settings::Settings& ss = na::settings::Get();
         const uint32_t cur = ss.j2_preset.load();
         int idx = 0;
-        for (int i = 0; i < 5; ++i) if (kLiveValues[i] == cur) idx = i;
-        BeginRow("DLSS preset", "Which DLSS model runs. L and M are the newest (DLSS 4.5) transformer models; K and J are the earlier transformer models. Changing it restarts DLAA's history for one frame.", S(220));
+        for (int i = 0; i < 6; ++i) if (kLiveValues[i] == cur) idx = i;
+        BeginRow("DLSS preset", "Which DLSS model runs. Automatic uses L for DLAA and Quality and M for Balanced and Performance. L and M are the newest (DLSS 4.5) transformer models; K and J are the earlier transformer models. Changing it restarts DLAA's history for one frame.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2preset", &idx, kLivePresets, 5)) {
+        if (ImGui::Combo("##j2preset", &idx, kLivePresets, 6)) {
             ss.j2_preset.store(kLiveValues[idx]);
             na::settings::Save();
         }
         EndRow();
     }
-    bool jit = na::j2::Jitter();
-    BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
-    if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
-    EndRow();
-    {
+    const bool native = na::on12::NativeRoute();
+    if (native) {
+        // Camera jitter has one switch for every route: Enhancements > DLAA enhancements.
+        char status[200]{};
+        const bool running = na::native_d3d11::FormatMenuStatus(status, sizeof status);
+        StatusLine(running ? 1 : 0, status);
+    }
+    if (!native) {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
         int dv = na::j2::DebugView();
-        BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible. Magenta = broken values.", S(220));
+        BeginRow("Debug view", "Shows what DLAA is given instead of its result. Motion: colour = direction, brightness = speed, black = still. Fine motion makes tiny false motion visible (0.2 px = full colour). Colour wheel: red = right, green = down-left, blue = up-left, magenta = right-and-up. White = broken values.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2dbg", &dv, kViews, 4)) na::j2::SetDebugView(dv);
         EndRow();
     }
-    {
-        // Texture detail (negative mip bias, NVIDIA DLSS guide 3.5: -1 at native).
-        // Games build their samplers at load, so a change applies at the next start;
-        // the setting lives in this game's own NeuralAliasHost.ini (per game).
-        static const char* kDetail[] = {"Off (game's own)", "Light (-0.5)", "Standard (-1, NVIDIA)"};
-        static const int kDetailX100[] = {0, -50, -100};
-        na::settings::Settings& ss = na::settings::Get();
-        const int cur = ss.j2_mip_bias_x100.load();
-        int idx = 2;
-        for (int i = 0; i < 3; ++i) if (kDetailX100[i] == cur) idx = i;
-        const auto ml = na::observe::GetMipLiveStats();
-        const bool live = ml.enabled && (ml.twin_pipelines > 0 || ml.twin_root_signatures > 0);
-        BeginRow("Texture detail", "Samples surface textures sharper so DLAA can rebuild their full detail (NVIDIA's DLSS guide recommends -1 at native resolution). Very fine patterns such as fabric weaves can shimmer at -1; Light is gentler. Screen effects are never changed. Switches live (from the next frame); remembered for this game.", S(220));
-        ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2detail", &idx, kDetail, 3)) {
-            ss.j2_mip_bias_x100.store(kDetailX100[idx]);
-            na::observe::SetSamplerMipBiasLive(kDetailX100[idx] / 100.0f);
-            na::settings::Save();
-        }
-        EndRow();
-        uint64_t ns = 0, nst = 0;
-        na::observe::MipBiasCounts(&ns, &nst);
-        na::observe::NativeBiasStats nb;
-        na::observe::NativeMipBiases(&nb);
-        char tb[400];
-        const float active = na::observe::SamplerMipBias();
-        std::snprintf(tb, sizeof tb, "Now: %.1f (game loaded at %.1f; %llu root signatures and %llu pipelines prepared for switching, %llu fixed, %llu fall-backs). Game's own bias on its surface textures: %llu below 0, %llu at 0, %llu above.",
-                      active, ml.game_bias, static_cast<unsigned long long>(ml.twin_root_signatures), static_cast<unsigned long long>(ml.twin_pipelines),
-                      static_cast<unsigned long long>(ml.untwinned_pipelines), static_cast<unsigned long long>(ml.fallbacks),
-                      static_cast<unsigned long long>(nb.negative), static_cast<unsigned long long>(nb.zero), static_cast<unsigned long long>(nb.positive));
-        StatusLine(0, tb);
-        (void)ns; (void)nst;
-        if (!live && static_cast<int>(ml.game_bias * -100.0f + 0.5f) != -cur)
-            StatusLine(2, "Live switching is not available in this session (no prepared pipelines): restart the game to see this change.");
-    }
-    {
+    if (!native) {
         // Where DLAA is placed in this game's frame, chosen automatically (or forced in the ini).
         const auto& rt = st.route;
         static const char* kWhere[] = {"not placed yet", "between the game's command lists", "inside the game's scene list", "handled by the game's own upscaler call"};
@@ -1020,13 +1087,55 @@ void DrawLiveDlaa()
         if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
         ImGui::EndDisabled();
         EndRow();
+        if (!native) {   // Draw-replay motion on/off (Cort 2026-11-06): live, remembered.
+            na::settings::Settings& rs = na::settings::Get();
+            bool replay = rs.j2_draw_replay.load() != 0;
+            BeginRow("Object motion (draw replay)", "Tests whether replaying matching scene draws reduces smearing on moving objects. Uses extra GPU time and applies live.", S(220));
+            if (ImGui::Checkbox("##drawreplay", &replay)) { rs.j2_draw_replay.store(replay ? 1u : 0u); na::settings::Save(); }
+            EndRow();
+            if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
+        }
+        if (!native) {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
+            const bool running = na::j2::SmearTestRunning();
+            BeginRow("Smear test", "About 20 seconds: DLAA runs in 7 variants one after another (normal, no motion, current frame only, no sharpening, DLSS preset L, the game's own motion, normal) and saves 8 frames of each. The picture changes while it runs; keep the view still. Shift + the capture key starts it too.", ButtonWidth("Start smear test"));
+            ImGui::BeginDisabled(!on || running || na::capture::j2::Armed());
+            if (Button("Start smear test")) na::j2::StartSmearTest();
+            ImGui::EndDisabled();
+            EndRow();
+            char smear_text[200] = {};
+            na::j2::SmearTestStatus(smear_text, sizeof smear_text);
+            if (smear_text[0]) StatusLine(0, smear_text);
+        }
         if (cs.requested) {
             char cl[200];
             std::snprintf(cl, sizeof cl, "Capture: %u of %u recorded, %u saved, %u skipped (busy), %u without the presented picture, %u errors.",
                           cs.recorded, cs.requested, cs.written, cs.dropped_busy + cs.discarded + cs.retired, cs.without_present, cs.errors);
             StatusLine(0, cl);
         }
+        // Every presented frame for a short burst, DLAA or not, with what J2 did on each: the
+        // only way to see WHICH presents flash (Cort, SE5 2026-11-02). Starts 3 s after the click.
+        const na::capture::Stats pc = na::capture::GetStats();
+        constexpr uint32_t kPresentFrames = 40;
+        BeginRow(native ? "Capture presented frames" : "Capture every presented frame", native ? "Saves up to 40 presented pictures without blocking the game for GPU readback." : "Saves the picture you saw for the next 40 frames in a row, whether DLAA ran on them or not, with a note of what DLAA did on each. For finding flashing. About 1.6 GB; to LocalAppData\\NeuralAlias\\captures.", ButtonWidth("Capture 40 presents"));
+        ImGui::BeginDisabled(pc.frames_requested != 0 && pc.frames_written < pc.frames_requested);
+        if (Button("Capture 40 presents")) {
+            wchar_t dir[MAX_PATH];
+            if (na::capture::MakeDir(L"presents", dir, MAX_PATH)) { // ...-<exe>-p<pid>, with session.json
+                na::capture::RequestPresents(kPresentFrames, dir, 3000);
+                na::overlay::SetOpen(false);
+            }
+        }
+        ImGui::EndDisabled();
+        EndRow();
+        if (pc.frames_requested) {
+            char pl[160];
+            const uint32_t wait_ms = na::capture::DelayRemainingMs();
+            if (wait_ms) std::snprintf(pl, sizeof pl, "Capturing in %u s: close the menu and play.", (wait_ms + 999) / 1000);
+            else std::snprintf(pl, sizeof pl, "Presented frames: %u of %u saved, %u errors.", pc.frames_written, pc.frames_requested, pc.errors);
+            StatusLine(0, pl);
+        }
     }
+    if (native) { EndGroupBox(); return; }
     char buf[320];
     if (!on) {
         StatusLine(0, "Off: you are seeing the game's own picture.");
@@ -1042,11 +1151,385 @@ void DrawLiveDlaa()
     EndGroupBox();
 }
 
+
+// Cort 2026-11-03: the DLAA enhancements (camera jitter, moving-object motion, texture detail)
+// live on the Enhancements page, the same for every game.
+void DrawLiveDlaaEnhancements()
+{
+    using namespace na::ui;
+    if (!na::j2::Configured()) return;
+    const bool native = na::on12::NativeRoute();
+    BeginGroupBox("DLAA enhancements");
+    bool jit = na::j2::Jitter();
+    BeginRow("Camera jitter", "Shifts the camera by a fraction of a pixel each frame so DLAA can sharpen as well as smooth. Switch off if the picture shimmers or flickers.", SwitchWidth());
+    if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
+    EndRow();
+    {
+        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
+        bool fl = na::j2::flow::Enabled();
+        BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
+        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
+        EndRow();
+        if (na::j2::compute_flow::GetStats().camera_reconstruct)
+            ImGui::TextWrapped("This game's camera data has no camera movement, so camera motion is rebuilt from the picture. AMD flow keeps running (extra GPU time) even with the switch off; the switch only controls moving-object motion.");
+        {
+            na::settings::Settings& ss = na::settings::Get();
+            int loose = static_cast<int>(ss.j2_flow_loosen.load());
+            BeginRow("Moving-object rules", "How much of what the optical flow finds is accepted. 0% = the original strict rules. Higher accepts more moving objects (including ones against the sky) but can add smearing or shimmer. Compare with the Motion vectors debug view.", S(220));
+            ImGui::SetNextItemWidth(S(220));
+            if (ImGui::SliderInt("##j2flowloose", &loose, 0, 100, loose ? "%d%% looser" : "Strict (original)", ImGuiSliderFlags_AlwaysClamp))
+                ss.j2_flow_loosen.store(static_cast<uint32_t>(loose));
+            if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+            EndRow();
+        }
+        if (fl) {
+            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
+            const auto cs=na::j2::compute_flow::GetStats();
+            if(na::on12::NativeRoute() || na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
+                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
+                StatusLine(0,line);
+                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
+                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
+                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
+                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
+                    Hint(detail);}
+            }else{
+            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
+            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
+            char tb[360];
+            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
+            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
+                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
+                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
+                          static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
+            StatusLine(fs.latched ? 2 : 0, tb);
+            }
+        }
+    }
+    {
+        const auto ml = na::observe::GetMipLiveStats();
+        na::settings::Settings& ss = na::settings::Get();
+        // Cort 2026-11-16: the changer is back, with stronger steps than the automatic -1.00. At full
+        // resolution the menu chooses the total; added upscaling modes keep their own automatic
+        // totals, so there the row only shows the value in use.
+        const bool chooses = !na::j2::RenderSmall() && (!na::settings::AddedUpscalingAllowed() || ss.j2_scale_mode.load() == 0);
+        BeginRow("Texture mip bias", "How much sharper the game's surface textures are sampled, as a total that includes the game's own bias. DLAA rebuilds the extra detail over several frames. Automatic is -1.00, the standard at full resolution. Stronger steps show more texture detail; very fine patterns can start to shimmer. A sampler already at the target keeps its value. Live, and remembered for this game.", S(220));
+        if (chooses) {
+            static const char* kDetail[] = {"Off (game's own)", "-0.50", "Automatic (-1.00)", "-1.58", "-2.00", "-2.25 (strongest)"};
+            static const int32_t kDetailX100[] = {0, -50, na::settings::kTextureDetailAuto, -158, -200, -225};
+            const int32_t cur = ss.j2_texture_detail_x100.load();
+            int idx = 2;
+            if (cur <= 0) { // a hand-written value in between shows as the nearest step
+                int best = 1 << 30;
+                for (int i = 0; i < 6; ++i) {
+                    if (i == 2) continue;
+                    const int d = kDetailX100[i] > cur ? kDetailX100[i] - cur : cur - kDetailX100[i];
+                    if (d < best) { best = d; idx = i; }
+                }
+            }
+            ImGui::SetNextItemWidth(S(220));
+            if (ImGui::Combo("##j2detail", &idx, kDetail, 6)) {
+                ss.j2_texture_detail_x100.store(kDetailX100[idx]);
+                ss.j2_mip_bias_x100.store(na::settings::DlaaMipBiasX100(ss));
+                na::settings::Save();
+                // With DLAA switched off the game's own sampling stays; the choice applies when it is switched on.
+                if (!na::j2::Paused()) na::observe::SetSamplerMipBiasLive(na::settings::DlaaMipBias(ss));
+            }
+        } else {
+            PushTitle();
+            if (ml.want_bias == 0.0f) ImGui::TextColored(kText, "Game's own");
+            else ImGui::TextColored(kText, "Target %.2f", ml.want_bias);
+            PopFont();
+        }
+        EndRow();
+        if (chooses && ml.want_bias != ml.live_bias) {
+            char text[128];
+            std::snprintf(text, sizeof text, "Applying %.2f; the current total is %.2f until preparation finishes.", ml.want_bias, ml.live_bias);
+            Hint(text);
+        }
+        if (native) {
+            const auto applied = na::native11::GetSamplerStats();
+            char detail[180]{};
+            if (applied.material_binds)
+                std::snprintf(detail, sizeof detail, "Last bound material sampler: game %.2f, applied %.2f (change %+.2f).",
+                              applied.original_bias, applied.bias, applied.bias - applied.original_bias);
+            else std::snprintf(detail, sizeof detail, "Waiting for a material sampler on the native DX11 route.");
+            Hint(detail);
+        } else if (ml.visible_sampler_uploads) {
+            char text[96];
+            std::snprintf(text, sizeof text, "Last material sampler uploaded to the GPU: %.2f", ml.visible_sampler_bias);
+            Hint(text);
+        } else if (ml.live_static_changed && ml.bound_pso_twin) {
+            char text[96];
+            std::snprintf(text, sizeof text, "Prepared static sampler target: %.2f", ml.live_bias);
+            Hint(text);
+        } else Hint("Waiting for an observed material sampler.");
+        if (!native && ml.preparing) Hint("Preparing static sampler variants.");
+        if (!native && !ml.enabled) StatusLine(2, "Live texture adjustments are disabled for this session.");
+    }
+    {
+        // Anisotropic filtering on the game's surface textures (before DLSS, where the game
+        // samples them). Live, through the same twins as Texture detail (no restarts).
+        static const char* kAniso[] = {"Off (game's own)", "4x", "8x", "16x"};
+        static const uint32_t kAnisoLevel[] = {0, 4, 8, 16};
+        na::settings::Settings& ss = na::settings::Get();
+        const uint32_t cur = ss.aniso16.load();
+        int idx = 0;
+        for (int i = 0; i < 4; ++i) if (kAnisoLevel[i] == cur) idx = i;
+        BeginRow("Anisotropic filtering", "Raises eligible linear texture filtering to 4x, 8x or 16x, improving detail at steep angles before DLSS, including textures that use clamp addressing. Off restores the game's own filtering, which may already be 16x. Point, comparison and min/max samplers keep their filtering. A new level prepares in the background; the status below shows which level is active. Remembered for this game.", S(220));
+        // A profile read is diagnostic evidence, not a GPU sampling result.
+        // In particular a cached startup value must not disable the live
+        // selector after the profile changes or a read becomes unavailable.
+        const auto drv = na::fg::preset::GetAnisoOverride();
+        ImGui::SetNextItemWidth(S(220));
+        ImGui::BeginDisabled(drv.ForcedNow());
+        if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
+            ss.aniso16.store(kAnisoLevel[idx]);
+            na::observe::SetSamplerAnisotropy(kAnisoLevel[idx]);
+            na::settings::Save();
+        }
+        ImGui::EndDisabled();
+        EndRow();
+        const auto warn = [](const char* text) {
+            ImGui::PushTextWrapPos(0.f);
+            StatusLine(2, text);
+            ImGui::PopTextWrapPos();
+        };
+        if (drv.ForcedNow()) {
+            warn("Set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls");
+        } else if(drv.ForcedThisRun())
+            Hint("The current driver profile leaves filtering to the application. If its old override is still active, it clears on the next game launch.");
+        else if (!drv.available)
+            Hint("If this choice makes no difference, set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls.");
+        const auto as = na::observe::GetAnisoStats();
+        char tb[240];
+        const auto ml2 = na::observe::GetMipLiveStats();
+        if (native) {
+            const auto applied = na::native11::GetSamplerStats();
+            std::snprintf(tb, sizeof tb, "Native material filtering last bound: %ux. Changed bindings: %llu; variant errors: %llu.",
+                          applied.af, static_cast<unsigned long long>(applied.swapped),
+                          static_cast<unsigned long long>(applied.variant_failures));
+        } else if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
+            std::snprintf(tb, sizeof tb, "Preparing %ux in the background (%llu of %llu objects); the current filtering stays until it is complete.", ml2.want_aniso,
+                          static_cast<unsigned long long>(ml2.prepare_done), static_cast<unsigned long long>(ml2.prepare_total));
+        else if (as.level)
+            std::snprintf(tb, sizeof tb, "Application samplers: %ux. Built %llu static sampler overrides; raised %llu sampler descriptors.", as.level,
+                          static_cast<unsigned long long>(as.static_samplers), static_cast<unsigned long long>(as.samplers));
+        else
+            std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
+        StatusLine(0, tb);
+        if (!native && as.level) {
+            // Draw-time proof: how often the game's draws really went to the GPU with our
+            // changed pipelines, against with its own (which never carry the change).
+            std::snprintf(tb, sizeof tb, "Changed pipeline bindings recorded: %llu; original pipeline bindings: %llu.",
+                          static_cast<unsigned long long>(ml2.bound_pso_twin), static_cast<unsigned long long>(ml2.bound_pso_game));
+            Hint(tb);
+        }
+        if(as.native_surface&&as.native_16==as.native_surface)
+            Hint("The game already requested 16x for all observed surface samplers.");
+    }
+    {
+        // Jitter sequence (Cort 2026-11-05): where inside each pixel DLAA/DLSS samples, frame
+        // by frame. Same number of positions either way (16 for DLAA); switches live.
+        static const char* kSeq[] = {"Halton (NVIDIA's recommendation)", "R2 (Roberts)"};
+        na::settings::Settings& ss = na::settings::Get();
+        int idx = ss.j2_jitter_r2.load() ? 1 : 0;
+        BeginRow("Jitter pattern", "The order of tiny sub-pixel shifts DLAA/DLSS uses to rebuild detail over frames. Halton is NVIDIA's recommendation; R2 (Martin Roberts) spaces the positions a little more evenly. Compare them standing still on fine detail (wires, fences, grass). Switches live; remembered for this game.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##jitterseq", &idx, kSeq, 2)) {
+            ss.j2_jitter_r2.store(idx ? 1u : 0u);
+            na::settings::Save();
+        }
+        EndRow();
+    }
+    EndGroupBox();
+}
+
+// NVIDIA's development DLSS DLL: its debug views and hotkeys, and one button that records
+// what they show (Cort 2026-11-05: "a section of the overlay where I can use it, and a button
+// to record images, data, logs from the debugged view").
+void DrawDlssDebug()
+{
+    using namespace na::ui;
+    const auto i = na::dlss_debug::Query();
+    char line[400];
+    if (!i.loaded) StatusLine(2, "DLSS DLL: not loaded yet (DLSS has not been created in this session).");
+    else {
+        std::snprintf(line, sizeof line, "DLSS DLL: %s%s%s (%llu bytes, SHA-256 %s...)",
+                      i.build == 2 ? "NVIDIA development build" : i.build == 1 ? "release build" : i.sha256_16[0] ? "unknown build" : "checking...",
+                      i.version[0] ? " " : "", i.version[0] ? i.version : "", static_cast<unsigned long long>(i.bytes), i.sha256_16[0] ? i.sha256_16 : "-");
+        StatusLine(i.build == 2 ? 1 : 0, line);
+        char narrow[260];
+        std::snprintf(narrow, sizeof narrow, "%ls", i.path);
+        Hint(narrow);
+    }
+    std::snprintf(line, sizeof line, "NVIDIA on-screen indicator (registry ShowDlssIndicator): %s%s",
+                  !i.indicator_known ? "unknown" : i.indicator ? "on, value " : "off", (i.indicator_known && i.indicator) ? std::to_string(i.indicator).c_str() : "");
+    StatusLine(i.indicator_known && i.indicator ? 1 : 0, line);
+    {
+        // GPU breadcrumbs (AMD FidelityFX Breadcrumbs): markers around our passes so a freeze or
+        // crash report shows which one the GPU was in. Live; not remembered (diagnostics only).
+        bool crumbs = na::diag::crumbs::Enabled();
+        BeginRow("GPU breadcrumbs", "Records which NeuralAlias pass the GPU was running, for the crash report written if the game's device is lost. Costs two tiny GPU writes per pass. Turn on while chasing a freeze or crash.", S(220));
+        if (ImGui::Checkbox("##crumbs", &crumbs)) na::diag::crumbs::SetEnabled(crumbs);
+        EndRow();
+        Hint(na::diag::crumbs::StatusLine().c_str());
+    }
+    BeginRow("Indicator", "NVIDIA's own DLSS indicator and, with the development DLL, its debug text. Changing it asks for administrator rights (a Windows prompt appears; the game may minimise). Takes effect when DLSS is next created, usually after a restart of the game.",
+             ButtonWidth("Turn off"));
+    if (i.indicator_known && i.indicator) { if (Button("Turn off")) na::dlss_debug::SetIndicator(false); }
+    else if (Button("Turn on")) na::dlss_debug::SetIndicator(true);
+    EndRow();
+    SectionTitle("Development DLL hotkeys (sent to the game, menu open)");
+    Hint("Only NVIDIA's development DLL reacts. The combination is held for a few frames; its on-screen text names the current view or jitter configuration.");
+    struct Key { const char* label; const char* help; int vk; const char* btn; };
+    const Key keys[] = {
+        {"Debug view", "CTRL+ALT+F12: cycles the development DLL's overlays (jitter, motion vectors, depth, exposure, ...).", VK_F12, "Next view"},
+        {"Jitter configuration", "CTRL+ALT+F9: the DLL halves, doubles or flips the jitter it was told about. If the picture reacts, DLSS receives our jitter; if nothing changes, it does not.", VK_F9, "Next config"},
+        {"Jitter negate / swap", "CTRL+ALT+F10: negates and swaps the declared jitter axes.", VK_F10, "Press"},
+        {"Accumulation", "CTRL+ALT+F6: toggles temporal accumulation (a single-frame picture shows what one frame alone contains).", VK_F6, "Toggle"},
+    };
+    for (const Key& k : keys) {
+        BeginRow(k.label, k.help, ButtonWidth(k.btn));
+        if (Button(k.btn)) na::dlss_debug::PressHotkey(k.vk);
+        EndRow();
+    }
+    SectionTitle("Record");
+    const na::capture::Stats pc = na::capture::GetStats();
+    const auto cs = na::capture::j2::GetStats();
+    const bool busy = (pc.frames_requested != 0 && pc.frames_written < pc.frames_requested) || na::capture::j2::Armed();
+    BeginRow("Record the debugged view", "Saves the next 3 presented pictures exactly as shown (NVIDIA's overlay included; .bmp and .raw), what DLSS was given and produced on the next 3 evaluations, a copy of the status log and a note with the DLSS/HUD status lines, into one folder under LocalAppData\\NeuralAlias\\captures. The results CMD collects it.",
+             ButtonWidth("Record now"));
+    ImGui::BeginDisabled(busy);
+    if (Button("Record now")) {
+        wchar_t dir[MAX_PATH];
+        na::dlss_debug::Record(3, dir, MAX_PATH);
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    if (na::dlss_debug::LastRecordDir()[0]) {
+        std::snprintf(line, sizeof line, "%s: %ls (pictures %u/%u, DLSS planes %u/%u)", busy ? "Recording" : "Last recording", na::dlss_debug::LastRecordDir(),
+                      pc.frames_written, pc.frames_requested, cs.written, cs.requested);
+        StatusLine(busy ? 2 : 1, line);
+    }
+}
+
 } // namespace
+
+static void DrawExperimentalGpu();
+static void DrawDonutLighting();
+static void DrawAmbientOcclusion();
 
 void RegisterLiveDlaaMenu()
 {
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
+    na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
+    na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
+    // XeGTAO and Lighting run inside live DLAA too, but their rows were only registered with
+    // the Route A menu, so a live-DLAA-only game (Sniper Elite 5, Cort 2026-11-05) never showed
+    // them. Register them here unless the Route A menu already did.
+    const auto registered = [](void (*draw)()) {
+        for (int i = 0; i < na::menu::Count(); ++i)
+            if (const na::menu::Section* s = na::menu::At(i); s && s->draw == draw) return true;
+        return false;
+    };
+    if (!registered(&DrawAmbientOcclusion))
+        na::menu::Register({"XeGTAO (Ambient Occlusion)", na::menu::Availability::Available, nullptr, &DrawAmbientOcclusion, na::menu::Page::Enhancements});
+    if (!registered(&DrawDonutLighting))
+        na::menu::Register({"Lighting", na::menu::Availability::Available, nullptr, &DrawDonutLighting, na::menu::Page::Experimental});
+    if (!registered(&DrawExperimentalGpu))
+        na::menu::Register({"GPU infrastructure", na::menu::Availability::Available, nullptr, &DrawExperimentalGpu, na::menu::Page::Experimental});
+}
+
+static void DrawExperimentalGpu()
+{
+    using namespace na::ui;
+    const auto memory=na::gpu::mem::GetStats();const auto preparation=na::background::GetStats();char details[192];
+    std::snprintf(details,sizeof details,"GPU scratch memory: %.1f MB used in %.1f MB of reusable heaps.",memory.allocation_bytes/1048576.0,memory.block_bytes/1048576.0);Hint(details);
+    std::snprintf(details,sizeof details,"Background preparation: %u working, %u waiting; %llu jobs completed.",preparation.active,
+        preparation.pending>=preparation.active?preparation.pending-preparation.active:0,static_cast<unsigned long long>(preparation.completed));Hint(details);
+}
+
+static void DrawDonutLighting()
+{
+    using namespace na::ui;
+    // Adaptive tone mapping was removed on Cort's order (2026-11-06: "not helpful or useful to
+    // our core purpose"). Only Bloom remains here; the tone setting is no longer shown, read or saved.
+    auto& s=na::settings::Get();bool bloom=s.donut_bloom.load()!=0;
+    // BeginRow pushes the row label as an ID, so the popup ID is taken outside the row: an
+    // OpenPopup("...") inside it named a different popup than BeginPopupModal below, and the
+    // button did nothing (Cort 2026-11-05).
+    const ImGuiID bloom_popup=ImGui::GetID("Bloom settings");
+    BeginRow("Bloom","Adds an adjustable soft glow around bright scene details.",S(220));
+    if(ImGui::Checkbox("##donutbloom",&bloom)){s.donut_bloom=bloom;na::settings::Save();}
+    ImGui::SameLine();if(Button("Bloom settings..."))ImGui::OpenPopup(bloom_popup);EndRow();
+    if(bloom){const auto status=na::donut::ScenePass().GetStats();char activity[224];
+        std::snprintf(activity,sizeof activity,"%s Processed %llu scenes.",status.reason,static_cast<unsigned long long>(status.recorded));Hint(activity);}
+    bool open=true;ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
+    if(!ImGui::BeginPopupModal("Bloom settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
+    bool changed=false;
+    const auto title=[&](const char* name,const char* tip){ImGui::TextUnformatted(name);if(ImGui::IsItemHovered())ImGui::SetTooltip("%s",tip);ImGui::SameLine(S(220));ImGui::SetNextItemWidth(S(310));};
+    const auto scalar=[&](const char* name,const char* tip,const char* id,std::atomic<uint32_t>& field,float lo,float hi){
+        title(name,tip);float v=field.load()*.001f;if(ImGui::SliderFloat(id,&v,lo,hi,"%.2f")){field=uint32_t(v*1000+.5f);changed=true;}};
+    if(ImGui::Checkbox("Bloom",&bloom)){s.donut_bloom=bloom;changed=true;}
+    scalar("Glow amount","Sets the added glow; zero leaves scene colour unchanged.","##bloomamount",s.donut_bloom_amount,0,1);
+    scalar("Glow radius","Spreads light over a wider or narrower area, in scene pixels.","##bloomsigma",s.donut_bloom_sigma,4,64);
+    scalar("Glow threshold","How much brighter than the scene's average a spot must be to glow (1 = about 5x the average).","##bloomthreshold",s.donut_bloom_threshold,0,20);
+    if(Button("Reset bloom defaults")){s.donut_bloom_amount=100;s.donut_bloom_sigma=16000;s.donut_bloom_threshold=1000;changed=true;}
+    if(changed)na::settings::Save();
+    const auto stats=na::donut::ScenePass().GetStats();
+    if(bloom)Hint(stats.reason);else Hint("Bloom is off. No effect work is submitted.");
+    Hint("Settings apply live. The game's own final colour processing remains active.");
+    ImGui::EndPopup();
+}
+
+static void DrawAmbientOcclusion()
+{
+    using namespace na::ui;
+    auto& s=na::settings::Get();bool enabled=s.xegtao_enabled.load()!=0;
+    const ImGuiID xegtao_popup=ImGui::GetID("XeGTAO settings"); // outside the row: see DrawDonutLighting
+    BeginRow("XeGTAO (Ambient Occlusion)", "Adds soft shading around corners and where objects meet. Turn the game's ambient occlusion off where possible to avoid doubling its shading.", S(220));
+    if(ImGui::Checkbox("##xegtao",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);na::settings::Save();}
+    ImGui::SameLine();if(Button("Settings..."))ImGui::OpenPopup(xegtao_popup);EndRow();
+    ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
+    // The modal stays open on outside clicks; its own X dismisses it.
+    bool open=true;
+    if(!ImGui::BeginPopupModal("XeGTAO settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
+    bool changed=false;
+    if(ImGui::Checkbox("Enable XeGTAO",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);changed=true;}
+    const auto title=[&](const char* label,const char* tip){
+        ImGui::TextUnformatted(label);if(ImGui::IsItemHovered())ImGui::SetTooltip("%s",tip);
+        ImGui::SameLine(S(220));ImGui::SetNextItemWidth(S(310));
+    };
+    const auto scalar=[&](const char* name,const char* tip,const char* id,std::atomic<uint32_t>& field,float lo,float hi,bool logarithmic=false){
+        title(name,tip);float value=field.load()*.001f;
+        if(ImGui::SliderFloat(id,&value,lo,hi,"%.3f",logarithmic?ImGuiSliderFlags_Logarithmic:0)){
+            field.store(uint32_t(value*1000+.5f));changed=true;
+        }
+    };
+    title("Quality","More samples improve contact detail at a higher GPU cost.");
+    int quality=int(s.xegtao_quality.load());const char* quality_names[]={"Low","Medium","High","Ultra"};
+    if(ImGui::SliderInt("##aoquality",&quality,0,3,quality_names[quality])){s.xegtao_quality.store(quality);changed=true;}
+    title("Denoising","Smooths sampling noise; higher settings soften more detail.");
+    int denoise=int(s.xegtao_denoise.load());const char* denoise_names[]={"Off","Sharp","Medium","Soft"};
+    if(ImGui::SliderInt("##aodenoise",&denoise,0,3,denoise_names[denoise])){s.xegtao_denoise.store(denoise);changed=true;}
+    scalar("Radius","How far nearby surfaces cast contact shading.","##aoradius",s.xegtao_radius_x1000,.01f,100.f,true);
+    scalar("Radius multiplier","Fine-tunes the reach of the contact shading.","##aomult",s.xegtao_radius_multiplier,.3f,3.f);
+    scalar("Falloff","How gradually shading fades with distance.","##aofalloff",s.xegtao_falloff,.001f,1.f);
+    scalar("Sample distribution","Concentrates samples near small details or spreads them farther out.","##aodist",s.xegtao_sample_distribution,.1f,3.f);
+    scalar("Thin-object compensation","Reduces excessive shading from thin foreground objects.","##aothin",s.xegtao_thin_occluder,0.f,1.f);
+    scalar("Shadow strength","Adjusts the contrast of the computed contact shading.","##aopower",s.xegtao_final_power,0.f,5.f);
+    scalar("Depth mip offset","Trades distant depth detail against speed and stability.","##aomip",s.xegtao_depth_mip_offset,0.f,30.f);
+    scalar("Temporal stability","Carries the shading over from earlier frames along the motion, so it does not shimmer along edges while the camera moves. 0 turns it off; higher is steadier but follows moving shadows more slowly.","##aotemporal",s.xegtao_temporal,0.f,.95f);
+    if(Button("Reset to Intel defaults")){
+        s.xegtao_amount.store(100);s.xegtao_quality.store(2);s.xegtao_denoise.store(1);s.xegtao_radius_x1000.store(500);
+        s.xegtao_radius_multiplier.store(1457);s.xegtao_falloff.store(615);s.xegtao_sample_distribution.store(2000);
+        s.xegtao_thin_occluder.store(0);s.xegtao_final_power.store(2200);s.xegtao_depth_mip_offset.store(3300);s.xegtao_temporal.store(850);changed=true;
+    }
+    if(changed)na::settings::Save();
+    if(enabled){const auto status=na::xegtao::ScenePass().GetStats();StatusLine(0,status.reason);}
+    else Hint("Off. Settings are remembered; enable XeGTAO to see changes while playing.");
+    ImGui::EndPopup();
 }
 
 void RegisterRouteAMenu()
@@ -1064,6 +1547,9 @@ void RegisterRouteAMenu()
     na::menu::Register({"Latency and display", Availability::Available, nullptr, &DrawLatencyDetails, Page::Details});
     na::menu::Register({"DLSS in use", Availability::Available, nullptr, &DrawDlssInUseRow, Page::Enhancements});
     na::menu::Register({"Motion analysis", Availability::Available, nullptr, &DrawMotionRow, Page::Enhancements});
+    na::menu::Register({"XeGTAO (Ambient Occlusion)", Availability::Available, nullptr, &DrawAmbientOcclusion, Page::Enhancements});
+    na::menu::Register({"GPU infrastructure", Availability::Available, nullptr, &DrawExperimentalGpu, Page::Experimental});
+    na::menu::Register({"Lighting", Availability::Available, nullptr, &DrawDonutLighting, Page::Experimental});
     na::menu::Register({"Connection", Availability::Available, nullptr, &DrawConnectionRow, Page::Details});
     na::menu::Register({"Save pictures for analysis", Availability::Available, nullptr, &DrawCaptureRow,
                         Page::Details});

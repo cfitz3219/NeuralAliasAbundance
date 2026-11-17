@@ -1,5 +1,7 @@
 // C6: generic DLSS Super Resolution / DLAA backend. See dlss_backend.hpp.
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
+#include "host_dx12/diag/dred.hpp"
 #include "host_dx12/dlss/call_origin.hpp"
 
 #include "core/frame_contract.hpp"
@@ -80,8 +82,6 @@ bool FromFrame(const abundance::Frame& f, const FrameResources& r, Quality q, Ev
         std::snprintf(buf, sizeof(buf), "%s", v.reason.c_str());
         return fail(buf);
     }
-    if (f.color_space == abundance::ColorSpace::srgb_sdr)
-        return fail("DLSS needs linear colour; this frame's colour is display-encoded (sRGB).");
     EvalDesc d;
     d.color = r.color;
     d.depth = r.depth;
@@ -102,7 +102,10 @@ bool FromFrame(const abundance::Frame& f, const FrameResources& r, Quality q, Ev
         d.mv_scale_y = static_cast<float>(f.motion.extent.height);
     }
     d.mv_jittered = !f.motion_excludes_jitter; // validate_inputs requires excludes_jitter today
-    d.hdr = f.color_space == abundance::ColorSpace::linear_hdr;
+    // NGX's HDR flag selects linear-light processing, not whether the monitor
+    // is HDR. The NVIDIA guide accepts sRGB/gamma LDR with IsHDR clear, and
+    // requires IsHDR for linear input (including linear SDR values <= 1).
+    d.hdr = f.color_space != abundance::ColorSpace::srgb_sdr;
     d.auto_exposure = r.exposure == nullptr;
     d.depth_inverted = r.depth_inverted;
     d.reset = v.reset;
@@ -523,6 +526,7 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
 
 bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
 {
+    const na::diag::crumbs::Scope crumb(list, "NeuralAlias DLSS evaluate");
     const InjectorCallScope origin;
     std::lock_guard<std::mutex> lock(g.m);
     if (!list) return false;
@@ -656,6 +660,10 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         g.stats.feature_out_h = d.out_h;
         g.stats.feature_flags = flags;
         g.stats.feature_preset = d.preset;
+        {
+            auto& c = g.stats.creates[g.stats.create_seq % 8];
+            c = {++g.stats.create_seq, d.view_id, flags, d.preset, static_cast<uint32_t>(d.quality), create_w, create_h, d.out_w, d.out_h};
+        }
         collect_locked(); // the retired feature may already be free of uses
     }
     Feature& ft = g.features[view.feature];
@@ -667,7 +675,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     p->Set(NVSDK_NGX_Parameter_Output, d.output);
     p->Set(NVSDK_NGX_Parameter_ExposureTexture, d.exposure);
     p->Set(NVSDK_NGX_Parameter_TransparencyMask, static_cast<ID3D12Resource*>(nullptr));
-    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, static_cast<ID3D12Resource*>(nullptr));
+    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, d.bias_current_color);
     p->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, d.jitter_x);
     p->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, d.jitter_y);
     p->Set(NVSDK_NGX_Parameter_MV_Scale_X, d.mv_scale_x);
@@ -685,6 +693,10 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     p->Set(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, 0u);
     p->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, 0u);
     p->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, 0u);
+#ifdef NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X
+    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, 0u);
+    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y, 0u);
+#endif
     const NVSDK_NGX_Result r = reinterpret_cast<PfnEvaluate>(g.api.evaluate_feature)(list, static_cast<NVSDK_NGX_Handle*>(ft.handle), p, nullptr);
     g.stats.last_ngx_result = static_cast<int32_t>(r);
     if (NVSDK_NGX_FAILED(r)) {
@@ -740,6 +752,7 @@ bool ReleaseIfDeviceRemoved()
     {
         std::lock_guard<std::mutex> lock(g.m);
         if (!g.attached || !g.device || g.device->GetDeviceRemovedReason() == S_OK) return false;
+        na::diag::ReportIfRemoved(g.device.Get());
     }
     Shutdown(); // see OnExecuted: a removed device must not stay pinned
     return true;
@@ -755,6 +768,7 @@ void OnExecuted(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList* co
             on_executed_locked(queue, count, lists);
             return;
         }
+        na::diag::ReportIfRemoved(g.device.Get());
     }
     // Hardware session (G2-004): the bound device was removed. D3D12 devices
     // are per-adapter singletons, so while we (or NGX) hold it the game's

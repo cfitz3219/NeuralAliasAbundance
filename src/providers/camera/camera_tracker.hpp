@@ -33,6 +33,11 @@ namespace na::camera {
 struct CameraFrame {
     bool valid{};                 // matrix is a perspective ViewProjection and the unjittered matrix inverts
     bool camera_cut{};            // reset temporal history this frame
+    // Why (diagnostics): 0 none, 1 no history, 2 frame order/gap, 3 translation, 4 rotation, 5 fov, 6 origin mode;
+    // cut_value: frames (2), world units (3), radians (4, 5).
+    uint8_t cut_reason{};
+    double cut_value{};
+    bool cut_deferred{};          // confirm_cuts: a jump held for one frame (cut_reason/value say which), no reset
     bool jitter_known{};          // jitter came from the injected sample, not estimated
     double jitter_px_x{}, jitter_px_y{}; // render pixels, +X right, +Y down
     double fov_y{}, aspect{};     // radians; width/height of the projection scales
@@ -87,6 +92,32 @@ inline Matrix ComposeReprojectionRow(const Matrix& inv_view_proj_current_row, co
             m[r * 4 + c] = v;
         }
     return m;
+}
+
+// A frame whose camera block could not be read (SE5: the scene list's camera slot held
+// no ViewProjection on ~10 % of frames): predict this frame's unjittered VP from the two
+// before it at constant camera velocity, column-vector algebra. With VP = P * V,
+// cur * inv(prev) * cur = P * (V1 * inv(V0)) * V1: the last view step applied once more.
+// Falls back to `cur` (hold) when `prev` does not invert or the prediction is not a
+// perspective ViewProjection.
+inline Matrix ExtrapolateViewProjection(const Matrix& prev, const Matrix& cur) {
+    Matrix inv{};
+    if (!Invert(prev, inv)) return cur;
+    Matrix step{}, out{};
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t c = 0; c < 4; ++c) {
+            double v = 0;
+            for (size_t k = 0; k < 4; ++k) v += cur[r * 4 + k] * inv[k * 4 + c];
+            step[r * 4 + c] = v;
+        }
+    for (size_t r = 0; r < 4; ++r)
+        for (size_t c = 0; c < 4; ++c) {
+            double v = 0;
+            for (size_t k = 0; k < 4; ++k) v += step[r * 4 + k] * cur[k * 4 + c];
+            out[r * 4 + c] = v;
+        }
+    Candidate check{};
+    return ViewProjection(out, check) ? out : cur;
 }
 
 // Exact inverse of core/temporal_jitter.hpp for a KNOWN pixel offset.
@@ -167,8 +198,18 @@ public:
     struct Limits {
         double max_translation = 25.0;   // world units per frame
         double max_rotation = 0.65;      // radians per frame
-        double max_fov_change = 0.15;    // radians per frame
+        // Radians per frame. Zooming (scope, binoculars, aim) is continuous camera motion that the
+        // depth + projection reprojection describes exactly; SE5's scope changed the FOV by
+        // 0.17-0.54 rad in one frame and each reset DLSS history: Cort's periodic "blink"
+        // (2026-11-02). Only an extreme change (a different camera) counts as a cut.
+        double max_fov_change = 1.0;
         uint64_t max_frame_gap = 4;      // frames without a camera before history is stale
+        // 2026-11-07 (Cort's f905099 run: 418 motion cuts in ~3 minutes of play,
+        // each one a DLSS history reset = a flash): a translation/rotation/FOV
+        // jump resets history only once the NEXT camera confirms it. A one-frame
+        // blip (another camera read for a frame) keeps the accepted camera and
+        // does not reset; a real cut resets one frame later.
+        bool confirm_cuts = false;
     };
 
     // `m`: the chosen camera ViewProjection (column-vector convention).
@@ -193,16 +234,43 @@ public:
         // Cut detection against the previous accepted frame.
         bool cut = !have_ || bool(world_origin) != previous_relative_ ||
                    frame <= last_frame_ || frame - last_frame_ > lim.max_frame_gap;
-        if (!cut) {
+        if (!have_) f.cut_reason = 1;
+        else if (bool(world_origin) != previous_relative_) f.cut_reason = 6;
+        else if (cut) { f.cut_reason = 2; f.cut_value = double(frame) - double(last_frame_); }
+        const auto jump = [&](const VpGeometry& a, double a_fov, uint8_t& reason, double& value) {
             double d2 = 0, dot = 0;
             for (size_t j = 0; j < 3; ++j) {
-                const double d = g.position[j] - prev_.position[j];
+                const double d = g.position[j] - a.position[j];
                 d2 += d * d;
-                dot += g.forward[j] * prev_.forward[j];
+                dot += g.forward[j] * a.forward[j];
             }
             const double angle = std::acos(std::clamp(dot, -1.0, 1.0));
-            if (d2 > lim.max_translation * lim.max_translation || angle > lim.max_rotation ||
-                std::abs(f.fov_y - prev_fov_) > lim.max_fov_change) cut = true;
+            if (d2 > lim.max_translation * lim.max_translation) { reason = 3; value = std::sqrt(d2); return true; }
+            if (angle > lim.max_rotation) { reason = 4; value = angle; return true; }
+            if (std::abs(f.fov_y - a_fov) > lim.max_fov_change) { reason = 5; value = f.fov_y - a_fov; return true; }
+            return false;
+        };
+        if (!cut) cut = jump(prev_, prev_fov_, f.cut_reason, f.cut_value);
+        if (!cut) suspect_ = false;
+        else if (lim.confirm_cuts && f.cut_reason >= 3 && f.cut_reason <= 5) {
+            uint8_t r = 0; double v = 0;
+            // Confirmed: this camera continues the one suspected last frame.
+            const bool confirmed = suspect_ && suspect_frame_ + 1 == frame && !jump(suspect_g_, suspect_fov_, r, v);
+            if (!confirmed) {
+                // Hold the accepted camera for this frame: no reset, no camera motion.
+                suspect_ = true; suspect_g_ = g; suspect_fov_ = f.fov_y; suspect_frame_ = frame;
+                f.cut_deferred = true;
+                f.fov_y = prev_fov_; f.aspect = prev_aspect_; f.position = prev_.position; f.forward = prev_.forward;
+                f.view_proj_current_row = prev_vp_row_;
+                f.view_proj_previous_row = prev_vp_row_;
+                f.unjittered = TransposeMatrix(prev_vp_row_);
+                if (injected_px) { f.jitter_known = true; f.jitter_px_x = injected_px[0]; f.jitter_px_y = injected_px[1]; }
+                if (!Invert(f.view_proj_current_row, f.inv_view_proj_current_row)) return CameraFrame{};
+                f.valid = true;
+                last_frame_ = frame;
+                return f;
+            }
+            suspect_ = false;
         }
         // Jitter: known injected sample, else offset from the running mean.
         double jx = 0, jy = 0; // clip-space translate-by-W amounts to remove
@@ -234,6 +302,7 @@ public:
         f.valid = true;
         prev_ = g;
         prev_fov_ = f.fov_y;
+        prev_aspect_ = f.aspect;
         prev_vp_row_ = f.view_proj_current_row;
         last_frame_ = frame;
         have_ = true;
@@ -246,7 +315,7 @@ public:
                                     const double* injected_px = nullptr) {
         return Update(m, frame, width, height, injected_px, Limits{}, &world_origin);
     }
-    void Reset() { have_ = false; }
+    void Reset() { have_ = false; suspect_ = false; }
 
 private:
     bool have_ = false;
@@ -254,8 +323,12 @@ private:
     std::array<double, 3> previous_origin_{};
     uint64_t last_frame_ = 0;
     VpGeometry prev_{};
-    double prev_fov_ = 0, mean_dx_ = 0, mean_dy_ = 0;
+    double prev_fov_ = 0, prev_aspect_ = 1, mean_dx_ = 0, mean_dy_ = 0;
     Matrix prev_vp_row_{};
+    bool suspect_ = false;
+    VpGeometry suspect_g_{};
+    double suspect_fov_ = 0;
+    uint64_t suspect_frame_ = 0;
 };
 
 } // namespace na::camera

@@ -1,3 +1,8 @@
+#include "host_dx12/background/work.hpp"
+#include "host_dx12/j2/hud_unblend.hpp"
+#include "host_dx12/diag/dred.hpp"
+#include "host_dx12/diag/gpu_breadcrumbs.hpp"
+#include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/nr/sl_consumer.hpp"
 #include "host_dx12/adapters/tlou1/apply.hpp"
@@ -7,8 +12,18 @@
 #include "host_dx12/adapters/unreal/screen_percentage.hpp"
 #include "host_dx12/adapters/mode_control.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/native_hud.hpp"
+#include "host_dx12/native_present/size_spoof.hpp"
+#include "host_dx12/j2/projection_window.hpp"
+#include "host_dx12/j2/j2_flow.hpp"
+#include "host_dx12/scale/live_driver.hpp"
+#include "host_dx12/scale/native_control.hpp"
+#include "host_dx12/scale/auto_scene.hpp"
+#include "host_dx12/scale/settings_read_hook.hpp"
+#include "host_dx12/native_present/size_probe.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -45,6 +60,7 @@ wchar_t g_ini[MAX_PATH] = {};
 HANDLE g_install_event = nullptr;              // manual reset; set once install was attempted
 std::atomic<DWORD> g_init_thread{0};
 std::atomic<uint32_t> g_gate_expired{0};
+thread_local unsigned t_internal_factory_depth = 0;
 void signal_install_attempted()
 {
     if (g_install_event) SetEvent(g_install_event);
@@ -75,27 +91,109 @@ void set_error(const char* text)
 DWORD WINAPI InitThread(LPVOID)
 {
     g_init_thread.store(GetCurrentThreadId());
+    InternalFactoryScope internal_graphics;
     struct Release { ~Release() { signal_install_attempted(); } } release; // every exit path
+    wchar_t build[41]{};
+    GetPrivateProfileStringW(L"host", L"build_commit", L"", build, ARRAYSIZE(build), g_ini);
+    if (build[0]) {
+        char line[64]{};
+        std::snprintf(line, sizeof line, "NeuralAlias build %ls", build);
+        boot_log(line);
+    }
     boot_log("host init thread entered");
     // Once hooks go in, this module must never unload.
     HMODULE pinned = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                        reinterpret_cast<LPCWSTR>(&InitThread), &pinned);
+    {   // Hooking engine: MinHook unless the ini asks for Microsoft Detours (opt-in).
+        wchar_t engine[32] = {};
+        GetPrivateProfileStringW(L"hooking", L"engine", L"minhook", engine, 32, g_ini);
+        if (lstrcmpiW(engine, L"detours") == 0 && !na::hooking::SetEngine(na::hooking::Engine::Detours))
+            boot_log("hooking: Detours requested but not available; using MinHook");
+    }
     if (!na::hooking::Initialize()) { set_error("hooking core failed to initialise"); return 0; }
+    {
+        char line[96];
+        std::snprintf(line, sizeof line, "hooking: engine %s", na::hooking::EngineName());
+        boot_log(line);
+    }
     na::settings::SetIniPath(g_ini);
     na::settings::Load();
+    // The combined package selects the native provider at presentation.
+    // Older explicit DX11 packages still install their device hook here.
+    na::on12::Start(g_ini, &boot_log);
     na::host::StartSession();
+    // DRED (Windows' own device-removed diagnostics): must be on before the game creates its
+    // D3D12 device, which waits for this thread. Report beside the status log.
+    {
+        wchar_t dir[MAX_PATH];
+        lstrcpynW(dir, g_ini, MAX_PATH);
+        wchar_t custom[MAX_PATH] = {};
+        if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(dir, custom, MAX_PATH);
+        for (int i = lstrlenW(dir) - 1; i >= 0; --i)
+            if (dir[i] == L'\\' || dir[i] == L'/') { dir[i] = 0; break; }
+        const bool page_faults = GetPrivateProfileIntW(L"diagnostics", L"dred", 1, g_ini) != 0;
+        const bool breadcrumbs = GetPrivateProfileIntW(L"diagnostics", L"dred_breadcrumbs", 0, g_ini) == 1;
+        boot_log(na::diag::EnableDred(page_faults, breadcrumbs, dir).c_str());
+        na::diag::crumbs::SetEnabled(GetPrivateProfileIntW(L"diagnostics", L"gpu_breadcrumbs", 0, g_ini) == 1);
+    }
+    // P4-4 slider route (step 1): our menu's mode sets the game's render scale. The read hook
+    // must be in before the game reads its settings file, so it goes in first. Opt-in per game
+    // ([j2] read_hook=1, with J2 on); never in safe start. Its log beside the status log.
+    const bool added_upscaling = na::settings::AddedUpscalingAllowed();
+    const bool native_scale_asked = added_upscaling && GetPrivateProfileIntW(L"j2", L"native_scale", 0, g_ini) == 1;
+    const bool read_hook_asked = added_upscaling && GetPrivateProfileIntW(L"j2", L"read_hook", 0, g_ini) == 1;
+    const bool render_small_asked = added_upscaling && GetPrivateProfileIntW(L"present", L"render_small", 0, g_ini) == 1;
+    if ((native_scale_asked || read_hook_asked) && GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
+        !na::settings::SafeStart()) {
+        wchar_t scale_log[MAX_PATH];
+        lstrcpynW(scale_log, g_ini, MAX_PATH);
+        for (int i = lstrlenW(scale_log) - 1; i >= 0; --i)
+            if (scale_log[i] == L'\\' || scale_log[i] == L'/') { scale_log[i] = 0; break; }
+        wchar_t custom[MAX_PATH] = {};
+        if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) {
+            lstrcpynW(scale_log, custom, MAX_PATH);
+            for (int i = lstrlenW(scale_log) - 1; i >= 0; --i)
+                if (scale_log[i] == L'\\' || scale_log[i] == L'/') { scale_log[i] = 0; break; }
+        }
+        wchar_t name[64];
+        swprintf_s(name, L"\\NeuralAlias-scale-%lu.log", GetCurrentProcessId());
+        lstrcatW(scale_log, name);
+        const int mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        if(native_scale_asked){
+            const bool ready=na::scale::native::Start(mode,scale_log);
+            if(ready)na::j2::EnableNativeScaleBridge(true);
+            boot_log(ready?"native scale: engine-owned settings control installed":"native scale: settings relationship unavailable; native DLAA retained");
+        }else boot_log(na::scale::StartSliderRoute(mode, scale_log) ? "slider route: settings read hook installed" : "slider route: read hook failed");
+    }
     // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
     // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1
     // = -1 at native). Configure before installing producer hooks, after the
-    // previous-session marker is read. [j2] mip_bias overrides; 0 turns it off.
+    // previous-session marker is read. Normal DLAA targets the menu's Texture mip
+    // bias choice (automatic = total -1); the old [j2] mip_bias key does not override it.
     if (GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 && GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1) {
-        wchar_t mb[32] = {};
-        GetPrivateProfileStringW(L"j2", L"mip_bias", L"-1.0", mb, 32, g_ini);
         na::observe::SetSamplerMipBias(0.f); // defer the saved effect until renderer recovery is known
-        // Live switching from the menu (no restart): twin root signatures/pipelines are
-        // built at creation for the other levels. [j2] mip_bias_live=0 turns it off.
+        // Live switching (no restarts, Cort 2026-11-05): the game's own root signatures and
+        // pipelines are left as the game made them; twins carry the mip bias and anisotropic
+        // filtering. [j2] mip_bias_live=0 turns it off. The saved choice's twins (and, for
+        // render-small, the DLSS modes' automatic levels) are built as the game creates its
+        // objects, before activation, so the saved choice works from the first frame it is
+        // activated; any other choice is prepared in the background when picked.
         na::observe::SetSamplerMipBiasLiveEnabled(GetPrivateProfileIntW(L"j2", L"mip_bias_live", 1, g_ini) != 0);
+        na::observe::SetSamplerMipPrewarm(GetPrivateProfileIntW(L"j2", L"mip_prewarm", 1, g_ini) != 0);
+        if (!na::settings::SafeStart()) {
+            auto& st = na::settings::Get();
+            st.j2_mip_bias_x100.store(na::settings::DlaaMipBiasX100(st));
+            const float user = na::settings::DlaaMipBias(st);
+            float wanted[5] = {user, user, user, user, user};
+            int n = 1;
+            if (native_scale_asked || render_small_asked) {
+                n=native_scale_asked?5:4;
+                for (int m = 1; m < n; ++m) wanted[m] = na::j2::SmallMipBias(user, static_cast<float>(na::scale::FractionForMode(m)));
+            }
+            na::observe::SetSamplerMipLevelsWanted(wanted, n);
+            na::observe::SetSamplerAnisotropyPrebuild(st.aniso16.load());
+        }
     }
 
     if (GetPrivateProfileIntW(L"overlay", L"enabled", 1, g_ini) == 1) {
@@ -114,6 +212,8 @@ DWORD WINAPI InitThread(LPVOID)
     // NGX core before the game reaches it, watch for the core module, wire
     // the runtimes for Neural Rendering and Frame Generation, register the
     // Route A pages, enable the presenter. Off unless [route_a] enabled=1.
+    // Read-only: does the NVIDIA driver force texture filtering over the game (and our 16x)?
+    na::fg::preset::ReadAnisoOverride();
     bool route_a = GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1;
     bool route_a_started = false;
     if (route_a) {
@@ -168,13 +268,13 @@ DWORD WINAPI InitThread(LPVOID)
     // (read-only: records what the game gives FSR); replacing FSR's output with
     // DLSS is opt-in via [fsr] replace=1. Off entirely with [fsr] enabled=0.
     if (GetPrivateProfileIntW(L"fsr", L"enabled", 1, g_ini) == 1) {
-        na::ffx::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, g_ini) == 1 ? na::ffx::Mode::ReplaceWithDlss
+        na::ffx::SetMode(added_upscaling && !na::settings::SafeStart() && GetPrivateProfileIntW(L"fsr", L"replace", 0, g_ini) == 1 ? na::ffx::Mode::ReplaceWithDlss
                                                                                   : na::ffx::Mode::Observe);
         na::ffx::StartModuleWatch();
     }
     // C7b: XeSS interception, same policy ([xess] enabled / replace).
     if (GetPrivateProfileIntW(L"xess", L"enabled", 1, g_ini) == 1) {
-        na::xess::SetMode(!na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, g_ini) == 1 ? na::xess::Mode::ReplaceWithDlss
+        na::xess::SetMode(added_upscaling && !na::settings::SafeStart() && GetPrivateProfileIntW(L"xess", L"replace", 0, g_ini) == 1 ? na::xess::Mode::ReplaceWithDlss
                                                                                     : na::xess::Mode::Observe);
         na::xess::StartModuleWatch();
     }
@@ -201,17 +301,100 @@ DWORD WINAPI InitThread(LPVOID)
         // The game folder may not be writable (Program Files): [host] status_log overrides.
         wchar_t custom[MAX_PATH] = {};
         if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(status_path, custom, MAX_PATH);
-        na::overlay::SetStatusLogPath(status_path); // A55
+        na::overlay::SetStatusLogPath(status_path, build); // A55
         na::overlay::SetMenuDiagnostics(GetPrivateProfileIntW(L"host", L"menu_diagnostics", 0, g_ini) == 1);
     }
     // C8: discovery observation producers (H1/H2). Off by default until a
     // consumer (A5 classifier) runs; [observe] producers=1 turns them on.
-    na::observe::RequestInstall(GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
-    // J2 live DLAA (needs the producers and the discovery adapter): off unless [j2] enabled=1.
+    const bool native11 = na::on12::NativeRoute();
+    const bool dx12_producers = !native11 && GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1;
+    na::observe::RequestInstall(dx12_producers);
+    // Each route supplies scene inputs through its own observer.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
-                       GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1);
-    if (na::j2::Configured()) na::overlay::RegisterLiveDlaaMenu();
+                       (native11 || dx12_producers || na::on12::Automatic()));
+    wchar_t scene_camera_exe[MAX_PATH]{};
+    GetPrivateProfileStringW(L"host", L"executable", L"", scene_camera_exe, MAX_PATH, g_ini);
+    na::j2::EnableWwiiSceneCamera(na::j2::Configured() &&
+        GetPrivateProfileIntW(L"dx11on12", L"enabled", 0, g_ini) == 1 &&
+        lstrcmpiW(scene_camera_exe, L"s2_sp64_ship.exe") == 0);
+    // P4-4 projection window ([j2] window=1): the no-slider route that windows J1's camera;
+    // Layer2 stays off with it (both would change the scene's render size).
+    // P4-4 render-small ([present] render_small=1, plan COMMS 4e30a94): the game renders its whole
+    // frame at render size into the presenter's proxies; J2 upscales it at Present. Needs the
+    // presenter and J2; the projection window and Layer2 stay off with it.
+    // Scene-resource provision does not virtualize window/display geometry.
+    // Retain full-size presentation proxies; J2 receives reduced companions
+    // from its physical-input provider and writes back a native-size scene.
+    const bool scene_asked = added_upscaling && !native_scale_asked && GetPrivateProfileIntW(L"present", L"scene_resources", 0, g_ini) == 1;
+    const bool small_asked = !native_scale_asked && !scene_asked && render_small_asked;
+    // Render-small needs the presenter, which Route A normally switches on. A game with
+    // [route_a] enabled=0 (Anno) still gets it here; [present] proxy=0 keeps it off.
+    if ((small_asked || scene_asked) && !route_a && na::j2::Configured() &&
+        GetPrivateProfileIntW(L"present", L"proxy", 1, g_ini) == 1)
+        na::present::SetEnabled(true);
+    const bool render_small = small_asked && na::j2::Configured() && na::present::Enabled();
+    if (small_asked && !render_small)
+        boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
+                                       : "render-small: requested but OFF ([present] proxy=0)");
+    na::j2::SetRenderSmall(render_small);
+    na::j2::EnableCameraInputDiagnostic(GetPrivateProfileIntW(L"diagnostics", L"camera_inputs", 0, g_ini) == 1);
+    {const bool profile=GetPrivateProfileIntW(L"observe",L"profile_hooks",0,g_ini)==1;
+     na::observe::SetHookProfiling(profile);
+     if(profile||GetPrivateProfileIntW(L"observe",L"usage_log",0,g_ini)==1)na::usage::Start();} // CPU/GPU usage + busiest threads in the status log; cheap (5 s background sample), so test packages keep it on with profile_hooks=0
+    // Read-only size-query probe (COMMS 4bd474c I1.5): which window/monitor/display-mode/DXGI
+    // output calls the game uses to learn a size. Changes no answer. [present] size_probe=1.
+    if (GetPrivateProfileIntW(L"present", L"size_probe", 0, g_ini) == 1)
+        boot_log(na::native_present::InstallSizeProbe() ? "size probe: installed" : "size probe: FAILED to install");
+    if (render_small) {
+        boot_log(na::native_present::InstallSizeHooks() ? "render-small: size hooks installed" : "render-small: size hooks FAILED");
+        // One virtual screen in every window mode: the monitor/display/DXGI-output answers
+        // the game uses in borderless and fullscreen are scaled with its client size.
+        if (!na::native_present::SizeProbeInstalled())
+            boot_log(na::native_present::InstallSizeProbe() ? "render-small: virtual screen hooks installed" : "render-small: virtual screen hooks FAILED");
+        // Four finite, GPU-checked methods. Old manual HUD preferences do not
+        // choose the renderer or disable DLSS. Exhaustion leaves ordinary DLSS.
+        if(GetPrivateProfileIntW(L"present",L"hud_separation",1,g_ini)!=0){
+            na::j2::native_hud::Install();
+            na::j2::native_hud::SetAutomatic(true);
+        }
+        na::j2::SetHudMaskEnabled(false); // temporal protection is not verified separation
+        boot_log(na::j2::native_hud::Automatic()?"render-small: automatic HUD methods; ordinary DLSS on exhaustion":"render-small: HUD separation disabled by ini; ordinary DLSS unchanged");
+        // Ultra Performance is not offered with render-small (the HUD would be drawn at 33%).
+        if (na::settings::Get().j2_scale_mode.load() > 3) na::settings::Get().j2_scale_mode.store(3);
+        const int small_mode = static_cast<int>(na::settings::Get().j2_scale_mode.load());
+        const float small_f = small_mode > 0 && small_mode <= 4 ? static_cast<float>(na::scale::FractionForMode(small_mode)) : 1.f;
+        // Comparison mode: DLAA also runs at Present (full-size proxies), not inside the frame.
+        const bool present_dlaa = GetPrivateProfileIntW(L"present", L"present_dlaa", 0, g_ini) == 1;
+        na::present::SetPresentDlaa(present_dlaa);
+        if (present_dlaa) boot_log("render-small: DLAA runs at Present too ([present] present_dlaa=1)");
+        // Native start (COMMS 4bd474c I1.3): the game is first told its real size and runs native
+        // DLAA; the controller asks for the mode's size once a scene has been seen, and applies the
+        // mode only when the game's scene follows. A game that ignores the request never shows a crop.
+        na::present::SetRenderScale(1.f, &na::j2::PresentUpscale, nullptr);
+        char small_line[128];
+        std::snprintf(small_line, sizeof small_line, "render-small: enabled (mode %d, scale %.3f requested after start; native DLAA until the game follows)", small_mode, small_f);
+        boot_log(small_line);
+    }
+    const bool projection_window = added_upscaling && !native_scale_asked && !render_small && !scene_asked && na::j2::Configured() && GetPrivateProfileIntW(L"j2", L"window", 0, g_ini) == 1;
+    na::j2::SetProjectionWindow(projection_window);
+    na::j2::SetProjectionWindowScissor(GetPrivateProfileIntW(L"j2", L"window_scissor", 1, g_ini) != 0);
+    if (projection_window) { na::j2::InstallProjectionWindowScissor(); boot_log("projection window: enabled"); }
+    const bool scene_resources=added_upscaling&&!native_scale_asked&&!render_small&&!projection_window&&na::j2::Configured()&&
+        (scene_asked||GetPrivateProfileIntW(L"layer2",L"enabled",0,g_ini)==1);
+    na::scale::ConfigureAutomaticScene(scene_resources);
+    if(scene_resources){
+        na::present::SetPresentDlaa(false);
+        na::present::SetRenderScale(1.f,nullptr,nullptr);
+        boot_log("scene-resources: reduced scene companions; native presentation; no virtual window resize or second Present DLAA");
+    }
+    if (na::j2::Configured()) {
+        if (!added_upscaling) boot_log("added upscaling: held off");
+        na::overlay::RegisterLiveDlaaMenu();
+    }
+    na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
     if(na::settings::SafeStart())na::j2::SetPaused(true);
+    na::background::Start(); // two below-normal workers, never hardware_concurrency
+    na::observe::SetBackgroundSubmitter(&na::background::Submit); // mip/AF variant compiles share the pool
     bool started = na::overlay::StartCore(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "core attached" : "core attachment failed");
@@ -267,6 +450,8 @@ DWORD WINAPI InitThread(LPVOID)
 
 } // namespace
 
+void NotifyProcessExit() { na::background::RequestStop();na::observe::SetProcessExiting(); }
+
 bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag)
 {
     g_self = self;
@@ -277,6 +462,16 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
     wsprintfW(g_ini, L"%s\\%s", dir, ini_name);
     if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES) return false;
     if (GetPrivateProfileIntW(L"host", L"enabled", 0, g_ini) != 1) return false;
+    wchar_t expected_exe[MAX_PATH]{};
+    if (GetPrivateProfileStringW(L"host", L"executable", L"", expected_exe, MAX_PATH, g_ini)) {
+        wchar_t process_path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, process_path, MAX_PATH);
+        if (!length || length >= MAX_PATH) return false;
+        const wchar_t* basename = process_path;
+        for (const wchar_t* p = process_path; *p; ++p)
+            if (*p == L'\\' || *p == L'/') basename = p + 1;
+        if (lstrcmpiW(basename, expected_exe) != 0) return false;
+    }
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_status.host_enabled = 1;
@@ -286,9 +481,10 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
         if (tag_w[0]) WideCharToMultiByte(CP_ACP, 0, tag_w, -1, tag_a, 32, nullptr, nullptr);
         strncpy_s(g_status.tag, tag_a[0] ? tag_a : (default_tag ? default_tag : "HOST"), _TRUNCATE);
     }
-    if ((GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 ||
-         (GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1)) &&
-        GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1)
+    if (na::on12::AutomaticRequested(g_ini) || GetPrivateProfileIntW(L"native11", L"enabled", 0, g_ini) == 1 ||
+        ((GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 ||
+          GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1) &&
+         GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1))
         g_install_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
     if (!t) {
@@ -301,7 +497,7 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
 
 void WaitForObserveInstall()
 {
-    if (!g_install_event) return;
+    if (!g_install_event || t_internal_factory_depth) return;
     // The init thread's own setup creates factories through this proxy.
     const DWORD init = g_init_thread.load();
     if (init && init == GetCurrentThreadId()) return;
@@ -309,6 +505,10 @@ void WaitForObserveInstall()
     // loader lock), the game continues and early objects stay PREEXISTING.
     if(WaitForSingleObject(g_install_event,3000)==WAIT_TIMEOUT)g_gate_expired.fetch_add(1);
 }
+
+InternalFactoryScope::InternalFactoryScope() { ++t_internal_factory_depth; }
+InternalFactoryScope::~InternalFactoryScope() { --t_internal_factory_depth; }
+bool IsInternalGraphicsCall() { return t_internal_factory_depth != 0; }
 
 Status GetStatus()
 {

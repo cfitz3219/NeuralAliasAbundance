@@ -1,0 +1,3 @@
+https://github.com/GameTechDev/XeGTAO
+commit a5b1686c7ea37788eeb3576b5be47f7c03db532c
+XeGTAO.h / XeGTAO.hlsli and LICENSE copied unmodified.

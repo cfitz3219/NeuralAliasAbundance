@@ -55,11 +55,17 @@ public:
     // perf_level: 5 slow/best, 10 medium, 20 fast. grid: 1, 2 or 4 (must be
     // in Caps::grid_sizes). Returns false with LastError() filled on failure.
     // Refuses to re-initialise while registrations are outstanding.
-    bool Init(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t grid, uint32_t perf_level);
+    // enable_cost (P4-0b): the engine also writes a per-block matching cost
+    // (one R8_UINT value per output-grid block; lower = better match). A
+    // driver that refuses it fails Init; callers retry without cost.
+    bool Init(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t grid, uint32_t perf_level, bool enable_cost = false);
+    bool CostEnabled() const { return cost_enabled_; }
     // Registers caller-owned resources. `fence` is used for the registration
     // handshake (the API waits for `wait_value` and signals `signal_value`).
     bool RegisterInput(ID3D12Resource* bgra8, ID3D12Fence* fence, uint64_t wait_value, uint64_t signal_value, BufferHandle* out);
     bool RegisterOutput(ID3D12Resource* rg16_sint, ID3D12Fence* fence, uint64_t wait_value, uint64_t signal_value, BufferHandle* out);
+    // Cost output (P4-0b): R8_UINT texture of OutWidth() x OutHeight(); requires Init(enable_cost).
+    bool RegisterCost(ID3D12Resource* r8_uint, ID3D12Fence* fence, uint64_t wait_value, uint64_t signal_value, BufferHandle* out);
     // Returns false (LastError() filled) when the driver refuses; the
     // registration then still counts as outstanding.
     bool Unregister(BufferHandle h);
@@ -67,9 +73,10 @@ public:
     uint32_t OutstandingRegistrations() const { return registered_; }
     // Asynchronous flow computation input -> reference. The engine waits until
     // `wait_fence` >= wait_value and sets `signal_fence` = signal_value when done.
+    // `cost` (optional) is a RegisterCost handle; only with CostEnabled().
     bool Execute(BufferHandle input_current, BufferHandle reference_previous, BufferHandle output,
                  ID3D12Fence* wait_fence, uint64_t wait_value, ID3D12Fence* signal_fence, uint64_t signal_value,
-                 bool disable_temporal_hints);
+                 bool disable_temporal_hints, BufferHandle cost = nullptr);
     // Destroys the engine. Returns false and does NOTHING while registrations
     // are outstanding (destroying then would break the teardown rule). The
     // destructor calls Shutdown() and, if refused, leaks the engine rather
@@ -89,6 +96,7 @@ private:
     void* module_ = nullptr;   // HMODULE
     uint32_t width_ = 0, height_ = 0, grid_ = 1;
     uint32_t registered_ = 0;
+    bool cost_enabled_ = false;
     char error_[192] = {};
 };
 
