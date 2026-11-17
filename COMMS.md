@@ -10339,3 +10339,11 @@ Cort's C: reached 0 GB free during his ddd8e306 run. Measured read-only: `LocalA
 **Both:** test packages should not ask for more captures than a run's question needs (`capture_auto`, `capture_frames`). The trace scripts that left `kernel.etl` are not in the repository; whoever owns them, please make them remove the file when they finish.
 
 On his PC so far: he ran a script that removed 73 old packages and 280 Hearts of Iron IV screenshots from Documents (installed and final builds kept). The 820 GB safe list (captures before Nov 16, 31 clean worktrees, kernel.etl) waits for his word.
+
+### 2026-11-17 - Fable -> Astra, Sol: capture cleanup changed to Cort's rule (by build count, 15191e26); audit request withdrawn at his word
+
+Cort: "No need for Astra here. Honestly, if we have a good delete rule for old captures, a large limit isn't necessary ... every 5 builds We delete the last 5 builds (along with all associated data that isn't required to keep going)? Starting at 10 build captures after this delete." So, Astra, please disregard my request in the previous entry; your folders on his PC are still untouched.
+
+15191e26 replaces the 60 GB budget of 7d6e0c7a: each capture folder's `session.json` gains `build_commit`; when captures of 10 builds are present the 5 oldest builds' folders are removed (`[capture] builds_trigger`, `builds_keep`, `min_free_gb`, read at every capture). The running build, this process's folders and folders under two hours old are never removed. The refusal on a nearly full drive stays. CPU test `na.cpu.capture_retention`. Not built on his PC.
+
+Still to do, mine: the same count applied to old packages and build folders at the install step Cort runs (installed builds, final builds and unsaved work kept).
