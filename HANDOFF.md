@@ -1148,3 +1148,6 @@ Astra PR153 / 3e893e7 removes the old per-draw replay probe, which recorded 559M
 ### 2026-11-17 — Non-replay performance cuts ready for integration
 
 Astra PR154 / 725f57e. GPU benchmarks show warm context block 2.58 to .78 s, FP16 rejected-candidate mean .0912 to .0141 ms, motion stage 1.545 to 1.518 ms, ordinary cut guard .0123 to .0047 ms. Ten tests pass, production debug zero errors. CPU setup calls are reduced; direct CPU recording median remains within run variance. No in-game FPS or latency verification yet. Fable owns combined integration. Details in COMMS and PR154 WORKLOG.
+
+### 2026-11-17 — Wider observer costs fixed
+Astra3e75462 / PR156 into claude/project-thread-axt148 fixes repeated full-resource-set sorting, unchanged SRV membership scans, oversized submission binding copies, and per-snapshot camera sorting. Conditional DX12recordingstress49.37->3.02ms; camera rank154/162->3.50/3.43ms per65536queries. Ordinary initialrecording1.34->1.14ms, repeatvariance disclosed.21focusedCTests pass, runtime+adapter builds pass. Detailed report docs/OBSERVER-COST-AUDIT-20261117.md in PR156; COMMS contains integrationhandoff. No gameFPSclaim, deployment, source-specific workaround or replay overlap. Stopped benchmarks when Cort's Sniperprocess appeared. Fable owns combinedpackage.
