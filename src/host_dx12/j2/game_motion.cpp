@@ -115,6 +115,8 @@ struct Constants { uint32_t w, h, sw, sh, gw, gh, step, count, unorm0, unorm1, u
 constexpr uint32_t kTable = 7; // t0..t3, u0..u2
 constexpr uint32_t kCounterBytes = kCandidates * kSlots * 4;
 constexpr uint32_t kStep = 4;
+constexpr uint32_t kRejectBeforePause = 64;
+constexpr uint32_t kRetryPause = 31; // then seed an adjacent pair and score again
 static_assert(kSlots == 18 && kErrZero == 12 && kMaxY == 17, "shader SLOTS and S_* defines");
 
 std::mutex g_stats_m;
@@ -246,29 +248,34 @@ bool Feed::ensure_textures(ID3D12Resource* color, uint32_t rw, uint32_t rh)
     return true;
 }
 
-void Feed::collect(uint32_t slot)
+Feed::Sample Feed::collect(uint32_t slot)
 {
     SlotState& s = slot_[slot];
-    if (!s.recorded) return;
+    if (!s.recorded) return Sample::None;
     s.recorded = false;
     uint32_t* p = nullptr;
     const D3D12_RANGE whole{0, kCounterBytes};
-    if (FAILED(s.readback->Map(0, &whole, reinterpret_cast<void**>(&p))) || !p) return;
+    if (FAILED(s.readback->Map(0, &whole, reinterpret_cast<void**>(&p))) || !p) return Sample::None;
     uint32_t v[kCandidates * kSlots];
     std::memcpy(v, p, sizeof(v));
     std::memset(p, 0, sizeof(v)); // a recording that never ran reads back as nothing measured
     s.readback->Unmap(0, &whole);
     std::lock_guard<std::mutex> lock(g_stats_m);
     ++stats_.collected;
+    const auto before = decider_.GoodFrames();
+    bool measured = false;
     for (uint32_t c = 0; c < kCandidates; ++c) {
         if (!s.candidate_id[c] || s.candidate_id[c] != current_id_[c]) continue; // measured on a texture no longer in that seat
         const uint32_t* q = v + c * kSlots;
         Measure m;
         for (uint32_t k = 0; k < kHypotheses; ++k) m.err[k] = q[kErr0 + k];
         m.err_zero = q[kErrZero]; m.scored = q[kScored]; m.moving = q[kMoving]; m.non_finite = q[kNonFinite];
+        measured = measured || m.moving != 0 || m.non_finite != 0;
         std::memcpy(&m.max_x, &q[kMaxX], 4); std::memcpy(&m.max_y, &q[kMaxY], 4);
         decider_.Add(c, m);
     }
+    if (decider_.GoodFrames() != before) return Sample::Promising;
+    return measured ? Sample::Rejected : Sample::None;
 }
 
 Output Feed::Record(ID3D12GraphicsCommandList* list, uint32_t slot, const Candidate* cands, uint32_t count,
@@ -276,13 +283,14 @@ Output Feed::Record(ID3D12GraphicsCommandList* list, uint32_t slot, const Candid
 {
     Output out{};
     if (!list || !pso_score_ || slot >= slots_ || !color || rw < 4 || rh < 4) return out;
-    collect(slot);
+    const auto sample = collect(slot);
     if (count == 0) {
         // No colour copy is recorded on this path. A candidate returning later
         // must warm a new adjacent-frame pair, not score against an old picture.
         // Discard pending CPU scores from that old epoch as well; GPU resources
         // remain retained and each slot is still recycled only after completion.
         prev_valid_ = false;
+        rejected_ = quiet_frames_ = 0;
         for (auto& pending : slot_) pending.recorded = false;
         // Nothing to score: free the seats (so a texture found later starts fresh) and stop
         // before any texture or descriptor work (WWII p49040: every evaluation came here).
@@ -304,13 +312,29 @@ Output Feed::Record(ID3D12GraphicsCommandList* list, uint32_t slot, const Candid
         for (uint32_t c = 0; !placed && c < kCandidates; ++c)
             if (!seat[c] && !next[c] && cands[i].resource) { next[c] = cands[i].id; seat[c] = &cands[i]; placed = true; }
     }
+    const auto cd = color->GetDesc();
+    const auto previous = prev_ ? prev_->GetDesc() : D3D12_RESOURCE_DESC{};
+    const bool extent_changed = rw != tw_ || rh != th_ || cd.Format != prev_format_ ||
+        cd.Width != previous.Width || cd.Height != previous.Height;
     {
         std::lock_guard<std::mutex> lock(g_stats_m);
+        bool changed = false;
         for (uint32_t c = 0; c < kCandidates; ++c)
-            if (next[c] != current_id_[c]) { decider_.ResetCandidate(c); current_id_[c] = next[c]; ++stats_.candidate_changes; }
+            if (next[c] != current_id_[c]) { decider_.ResetCandidate(c); current_id_[c] = next[c]; ++stats_.candidate_changes; changed = true; }
+        if (changed || extent_changed || reset || force_ || decider_.UsedCandidate() >= 0 || sample == Sample::Promising) {
+            rejected_ = quiet_frames_ = 0;
+        } else if (sample == Sample::Rejected && !quiet_frames_) {
+            if (rejected_ < kRejectBeforePause) ++rejected_;
+            if (rejected_ == kRejectBeforePause) quiet_frames_ = kRetryPause;
+        }
+        if (quiet_frames_) {
+            --quiet_frames_;
+            ++stats_.deferred;
+            prev_valid_ = false; // A later probe must use adjacent pictures.
+            return out;
+        }
     }
     if (!ensure_textures(color, rw, rh)) return out;
-    const D3D12_RESOURCE_DESC cd = color->GetDesc();
     if (rw > cd.Width || rh > cd.Height) return out;
     const auto NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const auto UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -458,12 +482,13 @@ void Feed::Describe(char* text, size_t capacity) const
     if (!text || !capacity) return;
     const Stats s = GetStats();
     std::snprintf(text, capacity,
-                  "game_motion{cands=%u scored=%llu measured=%llu good=%llu used=%d/%s%s%s locked=%llu dropped=%llu fed=%llu "
+                  "game_motion{cands=%u scored=%llu measured=%llu good=%llu used=%d/%s%s%s locked=%llu dropped=%llu fed=%llu deferred=%llu "
                   "last{c=%u best=%d ratio=%.3f second=%.3f px=%llu moving=%llu nonfinite=%llu max=%.4g,%.4g}}",
                   s.candidates, (unsigned long long)s.scored, (unsigned long long)s.measured, (unsigned long long)s.good,
                   s.used_candidate, s.used_encoding >= 0 ? KindName(static_cast<uint32_t>(s.used_encoding)) : "-",
                   s.used_encoding >= 0 && (s.used_encoding & 1) ? "-x" : "", s.used_encoding >= 0 && (s.used_encoding & 2) ? "-y" : "",
-                  (unsigned long long)s.locked, (unsigned long long)s.dropped, (unsigned long long)s.fed, s.last_candidate, s.last_best,
+                  (unsigned long long)s.locked, (unsigned long long)s.dropped, (unsigned long long)s.fed,
+                  (unsigned long long)s.deferred, s.last_candidate, s.last_best,
                   s.last_ratio, s.last_second, (unsigned long long)s.last_scored, (unsigned long long)s.last_moving,
                   (unsigned long long)s.last_non_finite, s.last_max_x, s.last_max_y);
 }

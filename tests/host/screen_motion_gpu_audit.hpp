@@ -2,6 +2,7 @@
 // Independent, test-only GPU verification. All waits, uploads and readbacks stay in this fixture.
 #include "core/screen_motion.hpp"
 #include <array>
+#include <chrono>
 
 namespace screen_audit {
 constexpr auto S = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -256,7 +257,7 @@ inline int SampleFitMeasure(test::Device& d) {
     return 0;
 }
 
-inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h) {
+inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhead=false) {
     namespace cf=na::j2::compute_flow;Gpu g(d);std::vector<float> rgba(size_t(w)*h*4),depth(size_t(w)*h,.03f);ComPtr<ID3D12Resource> image[2];
     for(unsigned f=0;f<2;++f) {
         for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){float px=float(x)-3.f*f;
@@ -264,12 +265,39 @@ inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h) {
         image[f]=g.Upload(w,h,DXGI_FORMAT_R32G32B32A32_FLOAT,16,rgba.data());
     }
     auto dep=g.Upload(w,h,DXGI_FORMAT_R32_FLOAT,4,depth.data());REQUIRE(g.Execute()==0);g.Reset();na::motion::gpu::Inputs in;in.depth=dep.Get();in.depth_clear=0;
+    auto cut_output=overhead?test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R32G32B32A32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS):ComPtr<ID3D12Resource>{};
+    auto timing=overhead?test::CreateBuffer(d.device.Get(),16,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST):ComPtr<ID3D12Resource>{};
+    ComPtr<ID3D12QueryHeap> queries;
+    UINT64 frequency=0;
+    if(overhead){
+        const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_TIMESTAMP,2,0};
+        REQUIRE(cut_output&&timing&&SUCCEEDED(d.device->CreateQueryHeap(&query_desc,IID_PPV_ARGS(&queries))));
+        REQUIRE(SUCCEEDED(d.queue->GetTimestampFrequency(&frequency))&&frequency);
+    }
     for(bool enabled:{false,true,true,false}) {
-        cf::Reset();cf::SetScreenFit(enabled);std::vector<double> ms;
+        if(overhead&&!enabled)continue;
+        cf::Reset();cf::SetScreenFit(enabled);std::vector<double> ms,record_us,cut_ms;
+        const auto start=std::chrono::steady_clock::now();
         for(unsigned i=0;i<26;++i){cf::Frame f;f.frame=9000+i;f.previous=i?f.frame-1:0;f.generation=303;f.source_generation=303;f.total=true;f.raster_sample=f.raster_confirmed=true;
+            const auto record_start=std::chrono::steady_clock::now();
             cf::Tier3 t;auto ticket=cf::Record(g.l.list.Get(),d.queue.Get(),image[i%2].Get(),dep.Get(),in,f,t);REQUIRE(ticket.context);CHECK(ticket.pair==(i!=0));
+            if(overhead&&i>=6){
+                record_us.push_back(std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-record_start).count());
+                auto* list=g.l.list.Get();
+                list->EndQuery(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
+                cf::RecordCutShow(list,ticket,image[i%2].Get(),cut_output.Get());
+                list->EndQuery(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
+                list->ResolveQueryData(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,timing.Get(),0);
+            }
             ComPtr<ID3D12Resource> rx,rv;if(i==25){REQUIRE(t.total&&t.total_valid);rx=g.Read(t.total,w,h,DXGI_FORMAT_R32G32_FLOAT,8);rv=g.Read(t.total_valid,w,h,DXGI_FORMAT_R32_FLOAT,4);}
             REQUIRE(g.Execute()==0);cf::Committed(ticket);g.Reset();const auto s=cf::GetStats();
+            if(overhead&&i>=6){
+                UINT64* times=nullptr;const D3D12_RANGE range{0,16},none{};
+                REQUIRE(SUCCEEDED(timing->Map(0,&range,reinterpret_cast<void**>(&times))));
+                cut_ms.push_back(double(times[1]-times[0])*1000.0/double(frequency));
+                timing->Unmap(0,&none);
+                CHECK(!ticket.cut_reset&&s.total_cuts==0);
+            }
             if(i==25){auto x=g.Floats(rx.Get(),w,h,2),v=g.Floats(rv.Get(),w,h,1);unsigned n=0,bad=0;double error=0;
                 for(unsigned y=16;y<h-16;++y)for(unsigned xx=16;xx<w-16;++xx){if((xx/96+y/64)%3==0||xx%96<12||xx%96>83||y%64<12||y%64>51)continue;size_t j=size_t(y)*w+xx;++n;
                     if(enabled){const double e=std::hypot(x[2*j]+3.f,x[2*j+1]);error+=e;bad+=v[j]!=.5f||!std::isfinite(e)||e>.25;}
@@ -279,6 +307,12 @@ inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h) {
         std::sort(ms.begin(),ms.end());auto s=cf::GetStats();
         std::printf("screen fit timing %ux%u on=%d samples=%zu median=%.4f min=%.4f max=%.4f ms model=%d samples=%.0f agree=%.0f steps=%u\n",w,h,enabled,ms.size(),(ms[9]+ms[10])*.5,ms.front(),ms.back(),s.screen_last_valid,s.screen_samples,s.screen_agree,s.screen_steps);
         CHECK(s.screen_pairs==(enabled?25u:0u));
+        if(overhead){
+            std::sort(record_us.begin(),record_us.end());std::sort(cut_ms.begin(),cut_ms.end());
+            std::printf("steady %ux%u: record median %.2f us p95 %.2f us; ordinary cut-show median %.4f ms p95 %.4f ms; block wall %.2f s\n",
+                        w,h,(record_us[9]+record_us[10])*.5,record_us[18],(cut_ms[9]+cut_ms[10])*.5,cut_ms[18],
+                        std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
+        }
     }
     cf::Reset();cf::SetScreenFit(true);return 0;
 }
