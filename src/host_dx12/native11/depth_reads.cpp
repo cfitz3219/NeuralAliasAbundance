@@ -22,7 +22,7 @@ Formats FormatsFor(DXGI_FORMAT format)
 
 bool Compile(const char* entry, const char* profile, ComPtr<ID3DBlob>& code)
 {
-    const D3D_SHADER_MACRO definitions[]{{"NA_RASTER_EXPANSION", "1"}, {nullptr, nullptr}};
+    const D3D_SHADER_MACRO definitions[]{{"NA_RASTER_EXPANSION", "1"}, {"NA_ACTIVE_DEPTH_RECT", "1"}, {nullptr, nullptr}};
     const auto& shader = na::depth::unjitter::kSource;
     return SUCCEEDED(D3DCompile(shader, sizeof shader - 1, "depth_unjitter", definitions, nullptr,
         entry, profile, D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, nullptr));
@@ -35,103 +35,13 @@ struct Constants {
 };
 static_assert(sizeof(Constants) == 32);
 
-template<class Shader>
-struct ShaderState {
-    ComPtr<Shader> shader;
-    ID3D11ClassInstance* instances[256]{};
-    UINT count = ARRAYSIZE(instances);
-    ~ShaderState()
-    {
-        for (UINT index = 0; index < count; ++index)
-            if (instances[index]) instances[index]->Release();
-    }
-};
-
-struct DrawState {
-    ID3D11RenderTargetView* targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-    UINT target_count = 0;
-    ComPtr<ID3D11DepthStencilView> depth;
-    ComPtr<ID3D11DepthStencilState> depth_state;
-    ComPtr<ID3D11BlendState> blend;
-    ComPtr<ID3D11RasterizerState> raster;
-    ComPtr<ID3D11InputLayout> layout;
-    ComPtr<ID3D11Buffer> constants;
-    ComPtr<ID3D11ShaderResourceView> input;
-    ShaderState<ID3D11VertexShader> vs;
-    ShaderState<ID3D11PixelShader> ps;
-    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-    UINT viewport_count = ARRAYSIZE(viewports);
-    D3D11_PRIMITIVE_TOPOLOGY topology{};
-    UINT stencil = 0, mask = 0, first_constant = 0, constant_count = 0;
-    float blend_factor[4]{};
-    ComPtr<ID3D11DeviceContext1> context1;
-
-    ~DrawState()
-    {
-        for (auto* view : targets) if (view) view->Release();
-    }
-    bool Save(ID3D11DeviceContext* context, D3D_FEATURE_LEVEL level)
-    {
-        ComPtr<ID3D11GeometryShader> geometry;
-        ComPtr<ID3D11HullShader> hull;
-        ComPtr<ID3D11DomainShader> domain;
-        ComPtr<ID3D11Predicate> predicate;
-        BOOL predicated = FALSE;
-        context->GSGetShader(&geometry, nullptr, nullptr);
-        context->HSGetShader(&hull, nullptr, nullptr);
-        context->DSGetShader(&domain, nullptr, nullptr);
-        context->GetPredication(&predicate, &predicated);
-        if (geometry || hull || domain || predicate) return false;
-        ID3D11UnorderedAccessView* uavs[D3D11_1_UAV_SLOT_COUNT]{};
-        const UINT count = level >= D3D_FEATURE_LEVEL_11_1 ? ARRAYSIZE(uavs) : D3D11_PS_CS_UAV_REGISTER_COUNT;
-        context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, count, uavs);
-        bool output_busy = false;
-        for (auto* view : uavs) if (view) { output_busy = true; view->Release(); }
-        ID3D11Buffer* stream_out[D3D11_SO_BUFFER_SLOT_COUNT]{};
-        context->SOGetTargets(ARRAYSIZE(stream_out), stream_out);
-        for (auto* buffer : stream_out) if (buffer) { output_busy = true; buffer->Release(); }
-        if (output_busy) return false;
-        context->OMGetRenderTargets(ARRAYSIZE(targets), targets, &depth);
-        for (UINT slot = 0; slot < ARRAYSIZE(targets); ++slot) if (targets[slot]) target_count = slot + 1;
-        context->OMGetDepthStencilState(&depth_state, &stencil);
-        context->OMGetBlendState(&blend, blend_factor, &mask);
-        context->RSGetState(&raster);
-        context->RSGetViewports(&viewport_count, viewports);
-        context->IAGetInputLayout(&layout);
-        context->IAGetPrimitiveTopology(&topology);
-        context->VSGetShader(&vs.shader, vs.instances, &vs.count);
-        context->PSGetShader(&ps.shader, ps.instances, &ps.count);
-        context->PSGetShaderResources(0, 1, &input);
-        if (SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context1))))
-            context1->PSGetConstantBuffers1(0, 1, &constants, &first_constant, &constant_count);
-        else context->PSGetConstantBuffers(0, 1, &constants);
-        return true;
-    }
-    void Restore(ID3D11DeviceContext* context)
-    {
-        ID3D11ShaderResourceView* none = nullptr;
-        context->PSSetShaderResources(0, 1, &none);
-        context->OMSetRenderTargets(target_count, targets, depth.Get());
-        context->OMSetDepthStencilState(depth_state.Get(), stencil);
-        context->OMSetBlendState(blend.Get(), blend_factor, mask);
-        context->RSSetViewports(viewport_count, viewports);
-        context->RSSetState(raster.Get());
-        context->IASetInputLayout(layout.Get());
-        context->IASetPrimitiveTopology(topology);
-        context->VSSetShader(vs.shader.Get(), vs.instances, vs.shader ? vs.count : 0);
-        context->PSSetShader(ps.shader.Get(), ps.instances, ps.shader ? ps.count : 0);
-        if (context1 && constants) context1->PSSetConstantBuffers1(0, 1, constants.GetAddressOf(), &first_constant, &constant_count);
-        else context->PSSetConstantBuffers(0, 1, constants.GetAddressOf());
-        context->PSSetShaderResources(0, 1, input.GetAddressOf());
-    }
-};
 }
 
 bool DepthReadTwin::Prepare(ID3D11Resource* depth)
 {
-    if (source_.Get() == depth) return twin_ != nullptr;
+    if (source_.Get() == depth) return draw_ != nullptr;
     source_ = depth;
-    twin_.Reset(); input_.Reset(); output_.Reset(); target_.Reset();
+    twin_.Reset(); input_.Reset(); output_.Reset(); target_.Reset(); draw_.Reset();
     ComPtr<ID3D11Texture2D> original;
     if (FAILED(depth->QueryInterface(IID_PPV_ARGS(&original)))) {
         reason_ = "scene depth is not a 2D texture";
@@ -192,12 +102,36 @@ bool DepthReadTwin::Prepare(ID3D11Resource* depth)
         reason_ = "could not create the corrected depth texture and views";
         return false;
     }
+    // Record the isolated pass once per depth allocation. Execute with state
+    // restoration so neither a compute consumer's UAVs nor a lighting draw's
+    // render targets, predication and shader stages are disturbed.
+    ComPtr<ID3D11DeviceContext> record;
+    if (FAILED(device_->CreateDeferredContext(0, &record))) {
+        reason_ = "could not create the private depth correction context";
+        return false;
+    }
+    const D3D11_VIEWPORT viewport{0, 0, float(desc_.Width), float(desc_.Height), 0, 1};
+    record->RSSetViewports(1, &viewport);
+    record->RSSetState(raster_.Get());
+    record->OMSetRenderTargets(0, nullptr, target_.Get());
+    record->OMSetDepthStencilState(depth_state_.Get(), 0);
+    record->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    record->VSSetShader(vs_.Get(), nullptr, 0);
+    record->PSSetShader(ps_.Get(), nullptr, 0);
+    record->PSSetConstantBuffers(0, 1, constants_.GetAddressOf());
+    record->PSSetShaderResources(0, 1, input_.GetAddressOf());
+    record->Draw(3, 0);
+    if (FAILED(record->FinishCommandList(FALSE, &draw_))) {
+        reason_ = "could not record the private depth correction";
+        return false;
+    }
     twin_ = std::move(twin);
     view_format_ = formats.srv;
     return true;
 }
 
-bool DepthReadTwin::Refresh(ID3D11DeviceContext* context, ID3D11Resource* depth, float jitter_x, float jitter_y, bool expanded)
+bool DepthReadTwin::Refresh(ID3D11DeviceContext* context, ID3D11Resource* depth, float jitter_x, float jitter_y,
+                            bool expanded, UINT active_width, UINT active_height)
 {
     if (!context || !depth || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE ||
         !std::isfinite(jitter_x) || !std::isfinite(jitter_y) || std::fabs(jitter_x) > .5f || std::fabs(jitter_y) > .5f) {
@@ -209,7 +143,7 @@ bool DepthReadTwin::Refresh(ID3D11DeviceContext* context, ID3D11Resource* depth,
     if (device_.Get() != owner.Get()) {
         device_ = owner;
         vs_.Reset(); ps_.Reset(); constants_.Reset(); depth_state_.Reset(); raster_.Reset();
-        source_.Reset();
+        source_.Reset(); draw_.Reset();
     }
     // A debug or proxy device may return wrapped resources to the underlying
     // context's detours. Only use private resources on the device's own context.
@@ -220,29 +154,15 @@ bool DepthReadTwin::Refresh(ID3D11DeviceContext* context, ID3D11Resource* depth,
         return false;
     }
     if (!Prepare(depth)) return false;
-    DrawState saved;
-    if (!saved.Save(context, device_->GetFeatureLevel())) {
-        reason_ = "the game's draw state cannot be borrowed for depth correction";
+    if (!active_width || active_width > desc_.Width || !active_height || active_height > desc_.Height) {
+        reason_ = "depth raster footprint outside the texture";
         return false;
     }
     const na::depth::unjitter::Params defaults;
-    const Constants args{jitter_x, jitter_y, static_cast<int>(desc_.Width) - 1, static_cast<int>(desc_.Height) - 1,
-        defaults.curve, defaults.noise, expanded ? 1.f / float(desc_.Width) : 0.f, expanded ? 1.f / float(desc_.Height) : 0.f};
+    const Constants args{jitter_x, jitter_y, static_cast<int>(active_width) - 1, static_cast<int>(active_height) - 1,
+        defaults.curve, defaults.noise, expanded ? 1.f / float(active_width) : 0.f, expanded ? 1.f / float(active_height) : 0.f};
     context->UpdateSubresource(constants_.Get(), 0, nullptr, &args, 0, 0);
-    const D3D11_VIEWPORT viewport{0, 0, float(desc_.Width), float(desc_.Height), 0, 1};
-    context->RSSetViewports(1, &viewport);
-    context->RSSetState(raster_.Get());
-    context->OMSetRenderTargets(0, nullptr, target_.Get());
-    context->OMSetDepthStencilState(depth_state_.Get(), 0);
-    context->OMSetBlendState(nullptr, nullptr, UINT_MAX);
-    context->IASetInputLayout(nullptr);
-    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context->VSSetShader(vs_.Get(), nullptr, 0);
-    context->PSSetShader(ps_.Get(), nullptr, 0);
-    context->PSSetConstantBuffers(0, 1, constants_.GetAddressOf());
-    context->PSSetShaderResources(0, 1, input_.GetAddressOf());
-    context->Draw(3, 0);
-    saved.Restore(context);
+    context->ExecuteCommandList(draw_.Get(), TRUE);
     reason_ = "current scene depth corrected";
     return true;
 }

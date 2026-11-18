@@ -476,7 +476,8 @@ if(TARGET host_native11)
   set_tests_properties(host_native11_screen_check_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_native11_adaptive_screen_test COMMAND native11_provider_test --adaptive-screen)
   add_test(NAME host_native11_adaptive_screen_warp_test COMMAND native11_provider_test --adaptive-screen-warp)
-  set_tests_properties(host_native11_adaptive_screen_test host_native11_adaptive_screen_warp_test
+  add_test(NAME host_native11_adaptive_screen_miss_test COMMAND native11_provider_test --adaptive-screen-miss)
+  set_tests_properties(host_native11_adaptive_screen_test host_native11_adaptive_screen_warp_test host_native11_adaptive_screen_miss_test
     PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host")
   add_test(NAME host_native11_depth_reads_test COMMAND native11_provider_test --depth-reads)
   add_test(NAME host_native11_depth_reads_warp_test COMMAND native11_provider_test --depth-reads-warp)

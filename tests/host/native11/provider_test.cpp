@@ -17,10 +17,12 @@
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
+#include "host_dx12/diag/event_log.hpp"
 #if defined(NA_TEST_NATIVE_DLAA)
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/capture/referee_gpu.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -86,6 +88,11 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
 }
 float4 vs_post(uint id : SV_VertexID) : SV_Position {
     return float4((id & 1) ? 1.0 : -1.0, (id & 2) ? 1.0 : -1.0, 0.5, 1.0);
+}
+struct GsVertex { float4 pos : SV_Position; };
+[maxvertexcount(3)]
+void gs_passthrough(triangle GsVertex input[3], inout TriangleStream<GsVertex> output) {
+    [unroll] for (uint i = 0; i < 3; ++i) output.Append(input[i]);
 }
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
 float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
@@ -637,6 +644,10 @@ int DepthReadFixture(Game& g, bool debug_layer)
     ComPtr<ID3D11PixelShader> ps;
     ComPtr<ID3D11ComputeShader> cs;
     ComPtr<ID3D11RasterizerState> raster;
+    ComPtr<ID3D11GeometryShader> gs;
+    const auto geom = Compile("gs_passthrough", "gs_5_0");
+    if (!geom || FAILED(g.device->CreateGeometryShader(geom->GetBufferPointer(), geom->GetBufferSize(), nullptr, &gs)))
+        return 1;
     D3D11_RASTERIZER_DESC raster_desc{};
     raster_desc.FillMode = D3D11_FILL_SOLID;
     raster_desc.CullMode = D3D11_CULL_NONE;
@@ -700,7 +711,8 @@ int DepthReadFixture(Game& g, bool debug_layer)
     ComPtr<ID3D11Query> raster_query;
     const D3D11_QUERY_DESC query_desc{D3D11_QUERY_OCCLUSION, 0};
     if (FAILED(g.device->CreateQuery(&query_desc, &raster_query))) return 1;
-    const auto render = [&](float jitter, bool enable, bool use_compute, bool use_copy, bool defer, bool query = false) {
+    const auto render = [&](float jitter, bool enable, bool use_compute, bool use_copy, bool defer,
+                            bool query = false, bool mixed = false, bool geometry_shader = false) {
         na::native11::SetDepthReads(enable);
         na::native11::SetNextJitter(-jitter, jitter);
         g.swap->Present(0, 0);
@@ -711,6 +723,12 @@ int DepthReadFixture(Game& g, bool debug_layer)
         g.ctx->VSSetShader(vs.Get(), nullptr, 0);
         g.ctx->PSSetShader(g.ps_scene.Get(), nullptr, 0);
         g.ctx->Draw(3, 0);
+        if (mixed) {
+            // A write through a small viewport into the same depth texture.
+            // Its footprint is incompatible with the full-size correction.
+            Viewport(g.ctx.Get(), 12, 10);
+            g.ctx->Draw(3, 0);
+        }
         if (defer) {
             ComPtr<ID3D11DeviceContext> deferred;
             ComPtr<ID3D11CommandList> list;
@@ -721,6 +739,8 @@ int DepthReadFixture(Game& g, bool debug_layer)
         if (use_copy) g.ctx->CopyResource(copy.Get(), g.depth.Get());
         auto* view = use_copy ? copy_view.Get() : original.Get();
         auto* target = mask_rtv.Get();
+        const float sentinel[]{-1.f, -1.f, -1.f, -1.f};
+        g.ctx->ClearRenderTargetView(target, sentinel);
         g.ctx->OMSetDepthStencilState(g.depth_off.Get(), 0);
         Viewport(g.ctx.Get(), g.w, g.h);
         if (use_compute) {
@@ -741,9 +761,16 @@ int DepthReadFixture(Game& g, bool debug_layer)
             g.ctx->OMSetRenderTargets(1, &target, read_only.Get());
             g.ctx->PSSetShaderResources(1, 1, &view);
             g.ctx->PSSetShader(ps.Get(), nullptr, 0);
+            if (geometry_shader) g.ctx->GSSetShader(gs.Get(), nullptr, 0);
             if (query) g.ctx->Begin(raster_query.Get());
             g.ctx->Draw(3, 0);
             if (query) g.ctx->End(raster_query.Get());
+            if (geometry_shader) {
+                ComPtr<ID3D11GeometryShader> saved;
+                g.ctx->GSGetShader(&saved, nullptr, nullptr);
+                expect(saved.Get() == gs.Get(), "depth correction preserves the consumer's geometry shader");
+                g.ctx->GSSetShader(nullptr, nullptr, 0);
+            }
             ComPtr<ID3D11ShaderResourceView> bound;
             ComPtr<ID3D11DepthStencilView> bound_depth;
             g.ctx->PSGetShaderResources(1, 1, &bound);
@@ -754,6 +781,8 @@ int DepthReadFixture(Game& g, bool debug_layer)
             g.ctx->OMSetRenderTargets(0, nullptr, nullptr);
         }
         const float result = read_mask();
+        if (result < 0) std::printf("lighting draw left its destination unwritten: compute=%d copy=%d geometry=%d\n",
+                                    use_compute, use_copy, geometry_shader);
         g.ctx->OMSetDepthStencilState(nullptr, 0);
         Post(g.ctx.Get(), g, true);
         return result;
@@ -765,6 +794,25 @@ int DepthReadFixture(Game& g, bool debug_layer)
     const float corrected_negative = render(-.375f, true, false, false, false);
     const float corrected_compute = render(.375f, true, true, false, false);
     const float corrected_copy = render(.375f, true, false, true, false);
+    if (!debug_layer) {
+        expect(render(.375f, true, false, false, false, false, false, true) == 1.f,
+               "the isolated depth correction works with a game geometry shader bound");
+        bool held = true;
+        for (int i = 0; i < 4; ++i) {
+            held &= render(.375f, true, false, false, false, false, true) == raw_positive;
+            held &= render(.375f, true, false, false, false) == raw_positive;
+        }
+        expect(held, "alternating usable and mixed writes leave the same lighting reader on original depth");
+        expect(render(.375f, true, true, false, false) == 1.f,
+               "an independent compute reader still receives corrected current depth");
+        expect(render(.375f, true, false, false, false, false, true) == raw_positive,
+               "an unqualified lighting read restarts only its own recovery");
+        const float first = render(.375f, true, false, false, false);
+        const float second = render(.375f, true, false, false, false);
+        const float third = render(.375f, true, false, false, false);
+        expect(first == raw_positive && second == raw_positive && third == 1.f,
+               "the lighting reader resumes correction after three usable frames");
+    }
     const float deferred = render(.375f, true, false, false, true);
     const float queried = render(.375f, true, false, false, false, true);
     std::printf("depth slab: vanilla=%g jittered=%g,%g corrected=%g,%g compute=%g copy=%g deferred=%g\n",
@@ -792,13 +840,17 @@ int DepthReadFixture(Game& g, bool debug_layer)
                 expect(false, message->pDescription);
         }
     }
+    if (g_failed) {
+        for (const auto& event : na::eventlog::Drain())
+            if (event.find(" depth_reads ") != std::string::npos) std::printf("%s", event.c_str());
+    }
     na::native11::SetDepthReads(false);
     na::native11::Uninstall();
     return g_failed ? 1 : 0;
 }
 #endif
 
-int ScreenCheckFixture(Game& game, bool adaptive)
+int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
 {
     struct Surface {
         ComPtr<ID3D11Texture2D> picture;
@@ -909,13 +961,13 @@ int ScreenCheckFixture(Game& game, bool adaptive)
     if (adaptive) {
         // Learn a numbered read on order A, then put a plausible draw at
         // that number before more scene work. B and C both share A's inputs.
-        const auto render = [&](int order, bool check_pixels = false) {
+        const auto render = [&](int order, bool check_pixels = false, bool extra_read = false) {
             Pump();
             evaluator.proof = 0;
             Scene(game.ctx.Get(), game, 0);
             game.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             game.ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
-            if (order != 0) {
+            if (order != 0 || extra_read) {
                 // Same reader as A, but in this order it receives unfinished colour.
                 reader(canvas.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
             }
@@ -991,15 +1043,20 @@ int ScreenCheckFixture(Game& game, bool adaptive)
             return reached;
         };
 
-        for (int i = 0; i < 12; ++i) render(0);
+        for (int i = 0; i < 12; ++i) render(0, false, missed_order);
 #if defined(NA_TEST_NATIVE_DLAA)
+        na::settings::Get().referee_every_ms.store(100);
         na::settings::Get().referee_enabled.store(1);
 #endif
         na::native11::SetScreenCheck(true);
-        render(0); // advance the production Present path with the referee enabled
-        render(1);
+        render(0, false, missed_order); // advance the production Present path with the referee enabled
+        const auto before_change = na::native11::Stats();
+        render(missed_order ? 0 : 1);
         const auto baseline = na::native11::Stats();
-        expect(baseline.contradictions > 0, "changing the order exposes the old numbered-read contradiction");
+        if (missed_order)
+            expect(baseline.fired == before_change.fired && baseline.contradictions == 0,
+                   "the changed order has fewer reads than the old route expects and misses its insertion");
+        else expect(baseline.contradictions > 0, "changing the order exposes the old numbered-read contradiction");
         for (int i = 0; i < 64 && na::native11::Stats().screen_confirmed < 2; ++i) render(i & 1);
         const auto learned = na::native11::Stats();
         expect(learned.screen_confirmed == 2, "both recurring readers earn independent screen proofs");
@@ -1023,6 +1080,15 @@ int ScreenCheckFixture(Game& game, bool adaptive)
                "switching back to previous orders uses known proofs on the first returning frames");
         expect(na::native11::Stats().contradictions == baseline.contradictions,
                "confirmed placements produce no late-scene contradictions");
+#if defined(NA_TEST_NATIVE_DLAA)
+        for (int i = 0; i < 48 && na::referee::gpu::GetStats().screens < 2; ++i) render(i & 1);
+        const auto witness = na::referee::gpu::GetStats();
+        expect(witness.screens >= 2 && witness.pairs > 0,
+               "the real native Present hook captures diagnostic screen and motion samples");
+        std::printf("native Present witness: screens=%llu pairs=%llu failed=%llu\n",
+                    static_cast<unsigned long long>(witness.screens), static_cast<unsigned long long>(witness.pairs),
+                    static_cast<unsigned long long>(witness.failed));
+#endif
         na::native11::RejectScreenProof(proof[0]);
         expect(render(1, true) && evaluator.proof == proof[1] && !render(0, true) && !evaluator.proof,
                "a lost screen proof retires only its own draw order");
@@ -1164,8 +1230,9 @@ int ScreenCheckFixture(Game& game, bool adaptive)
 
 int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 {
-    const bool adaptive = argc > 1 && (std::strcmp(argv[1], "--adaptive-screen") == 0 ||
-                                      std::strcmp(argv[1], "--adaptive-screen-warp") == 0);
+    const bool missed_order = argc > 1 && std::strcmp(argv[1], "--adaptive-screen-miss") == 0;
+    const bool adaptive = missed_order || (argc > 1 && (std::strcmp(argv[1], "--adaptive-screen") == 0 ||
+                                                       std::strcmp(argv[1], "--adaptive-screen-warp") == 0));
 #if defined(NA_TEST_NATIVE_DLAA)
     const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
@@ -1224,7 +1291,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->GetDesc(&adapter_desc);
     std::printf("device: %ls (%s)\n", adapter_desc.Description, warp ? "WARP" : "hardware");
 #if !defined(NA_TEST_NATIVE_DLAA)
-    if (adaptive || screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g, adaptive);
+    if (adaptive || screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g, adaptive, missed_order);
 #endif
 #if defined(NA_TEST_NATIVE_DLAA)
     if (warp) return 77;
@@ -1250,7 +1317,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (g_failed) return 1;
     if (adaptive) {
         na::j2::SetJitter(true);
-        const int result = ScreenCheckFixture(g, true);
+        const int result = ScreenCheckFixture(g, true, missed_order);
         DeleteFileW(ini.c_str());
         std::fflush(stdout);
         ExitProcess(result);

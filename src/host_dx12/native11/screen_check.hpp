@@ -76,6 +76,7 @@ public:
     bool Active() const { return color_ || depth_ || !adaptive_scenes_.empty(); }
 
     void NoteOrdinalPixel(uint32_t draws) { ordinal_draws_ = draws; }
+    void NoteActualPixel(uint32_t draws) { reader_after_draws_ = draws; }
 
     void Write(uint64_t writer)
     {
@@ -243,7 +244,7 @@ public:
     }
 
     const char* Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
-                        uint32_t scene_draws)
+                        uint32_t scene_draws, bool attempted)
     {
         const auto finish = [&](const char* outcome) {
             ResetFrame();
@@ -251,14 +252,16 @@ public:
         };
         const bool ordinary_completed = ordinary_this_frame_ && ordinary_draws_ == scene_draws;
         ordinary_this_frame_ = false;
-        if (!adaptive_ && ordinal_draws_ && scene_draws > ordinal_draws_) {
+        const bool early = ordinal_draws_ && scene_draws > ordinal_draws_;
+        const bool missed_reader = !attempted && scene_draws && reader_after_draws_ == scene_draws;
+        if (!adaptive_ && (early || missed_reader)) {
             adaptive_ = true;
             if (adaptive_scenes_.size() >= 16) adaptive_scenes_.erase(adaptive_scenes_.begin());
             adaptive_scenes_.emplace_back(color_, depth_);
             verified_ = {};
             legacy_rejected_.clear();
             ResetAttempt();
-            return finish("draw_order_changed");
+            return finish(early ? "draw_order_changed" : "draw_order_missed");
         }
         if (adaptive_) {
             if (!truncated_) entries_.Observe(sequence_, true, frame);
@@ -370,7 +373,7 @@ private:
     void ResetFrame()
     {
         sequence_.clear();
-        entries_since_write_ = ordinal_draws_ = 0;
+        entries_since_write_ = ordinal_draws_ = reader_after_draws_ = 0;
         writer_ = frame_proof_ = epoch_ = 0;
         delivered_this_frame_ = truncated_ = false;
     }
@@ -504,7 +507,7 @@ private:
     std::vector<Route> routes_;
     std::vector<std::pair<Id, Id>> adaptive_scenes_;
     bool adaptive_ = false, truncated_ = false;
-    uint32_t ordinal_draws_ = 0, entries_since_write_ = 0;
+    uint32_t ordinal_draws_ = 0, reader_after_draws_ = 0, entries_since_write_ = 0;
     uint64_t writer_ = 0, epoch_ = 0, marked_epoch_ = 0, delivery_epoch_ = 0, frame_proof_ = 0;
 
     Id color_ = 0, depth_ = 0;

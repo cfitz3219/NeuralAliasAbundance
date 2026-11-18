@@ -12,6 +12,7 @@
 #include "referee_points.h"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -32,6 +33,14 @@ constexpr ULONGLONG kStuckMs = 3000; // a half-taken sample is given up after th
 struct Copy {
     ComPtr<ID3D12Resource> tex;   // the referee's own texture, NON_PIXEL_SHADER_RESOURCE between lists
     D3D12_RESOURCE_DESC desc{};
+};
+
+struct VisualEvidence {
+    const void* chain = nullptr;
+    uint64_t proof = 0, ordinal = 0;
+    ULONGLONG at = 0;
+    uint8_t losses = 0;
+    bool skipped_parity = false, pending = false;
 };
 
 struct State {
@@ -76,10 +85,7 @@ struct State {
     uint64_t preview_last = 0;
     ULONGLONG preview_at = 0;
     bool preview_exact = false;
-    const void* visual_source = nullptr;
-    uint64_t visual_proof = 0, visual_ordinal = 0;
-    ULONGLONG visual_at = 0;
-    uint8_t visual_losses = 0;
+    std::vector<VisualEvidence> visual;
     std::atomic<bool> visual_rollback{false};
     std::vector<float> data;
     Stats stats;
@@ -87,6 +93,19 @@ struct State {
     LastSample last;
 };
 State& g = *new State; // never destroyed: its D3D12 objects must not be released by the CRT at exit
+
+auto visual_proof(uint64_t proof)
+{
+    return std::find_if(g.visual.begin(), g.visual.end(), [proof](const VisualEvidence& v) {
+        return v.proof == proof;
+    });
+}
+
+void update_visual_pending()
+{
+    g.visual_rollback = std::any_of(g.visual.begin(), g.visual.end(),
+        [](const VisualEvidence& v) { return v.pending; });
+}
 
 void set_phase(Phase p) { g.phase = p; g.phase_at = GetTickCount64(); }
 bool enabled() { return na::settings::Get().referee_enabled.load(std::memory_order_relaxed) != 0; }
@@ -367,21 +386,29 @@ void collect_sample()
             g.done_screen && g.preview_exact && !g.invalidated) {
             const auto vote = shadow::VoteScreen(score);
             const ULONGLONG now = GetTickCount64();
-            if (g.visual_source != g.swapchain || g.visual_proof != proof ||
-                now - g.visual_at > every_ms() * 4 + kStuckMs) {
-                g.visual_source = g.swapchain;
-                g.visual_proof = proof;
-                g.visual_losses = 0;
-                g.visual_rollback = false;
+            auto it = visual_proof(proof);
+            if (it == g.visual.end()) {
+                if (g.visual.size() >= 24) {
+                    const auto oldest = std::min_element(g.visual.begin(), g.visual.end(),
+                        [](const VisualEvidence& a, const VisualEvidence& b) { return a.at < b.at; });
+                    g.visual.erase(oldest);
+                }
+                g.visual.push_back({g.swapchain, proof});
+                it = g.visual.end() - 1;
             }
-            g.visual_ordinal = g.main_ordinal;
+            auto& evidence = *it;
+            if (evidence.chain != g.swapchain || now - evidence.at > every_ms() * 4 + kStuckMs)
+                evidence = {g.swapchain, proof};
+            evidence.ordinal = g.main_ordinal;
+            evidence.skipped_parity = false;
             if (vote != shadow::ScreenVote::Unknown) {
-                g.visual_at = now;
-                g.visual_losses = uint8_t(((g.visual_losses << 1) | (vote == shadow::ScreenVote::Input)) & 15u);
-                // Two independent images in the last four decisive samples
-                // showed the input. An intervening good image does not erase loss.
-                if (g.visual_losses & (g.visual_losses - 1)) g.visual_rollback = true;
+                evidence.at = now;
+                evidence.losses = uint8_t(((evidence.losses << 1) | (vote == shadow::ScreenVote::Input)) & 15u);
+                // Two input votes from the same reader, even when another
+                // independently verified order appears between these samples.
+                evidence.pending = (evidence.losses & (evidence.losses - 1)) != 0;
             }
+            update_visual_pending();
         }
         ++g.stats.samples;
         if (!g.data.empty()) {
@@ -642,9 +669,16 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     // A fixed sampling cadence can lock to one parity at a steady frame
     // rate. On a proven native reader, alternate which parity gets scored.
     const uint64_t screen_ordinal = due && !screen_only ? e.present_ordinal + 1 : e.present_ordinal;
-    if (e.context.native_screen_proof && e.context.native_screen_proof == g.visual_proof &&
-        ((screen_ordinal ^ g.visual_ordinal) & 1u) == 0 &&
-        (due || e.present_ordinal - g.pre_ordinal == 1)) return 0;
+    if (e.context.native_screen_proof) {
+        const auto v = visual_proof(e.context.native_screen_proof);
+        if (v != g.visual.end() && ((screen_ordinal ^ v->ordinal) & 1u) == 0 &&
+            !v->skipped_parity && (due || e.present_ordinal - g.pre_ordinal == 1)) {
+            // Prefer the other parity, but an order that only runs every
+            // other frame must still be sampled.
+            v->skipped_parity = true;
+            return 0;
+        }
+    }
     if (due && !screen_only) {
         if (!ensure(kPrev, e.color, rw, rh)) { ++g.stats.failed; return 0; }
         copy(l, kPrev, e.color, e.color_state);
@@ -781,19 +815,22 @@ uint64_t TakeNativeScreenLoss(const void* swapchain)
 {
     if (!enabled() || !g.visual_rollback.load(std::memory_order_relaxed)) return 0;
     std::lock_guard<std::mutex> lock(g.m);
-    if (g.visual_source != swapchain || !g.visual_rollback.load(std::memory_order_relaxed)) return 0;
-    g.visual_rollback = false;
-    return g.visual_proof;
+    const auto next = std::find_if(g.visual.begin(), g.visual.end(), [swapchain](const VisualEvidence& v) {
+        return v.chain == swapchain && v.pending;
+    });
+    if (next == g.visual.end()) return 0;
+    const uint64_t proof = next->proof;
+    g.visual.erase(next);
+    update_visual_pending();
+    return proof;
 }
 
 void InvalidatePresentation(const void* swapchain)
 {
     std::lock_guard<std::mutex> lock(g.m);
-    if (g.visual_source == swapchain) {
-        g.visual_source = nullptr;
-        g.visual_losses = 0;
-        g.visual_rollback = false;
-    }
+    g.visual.erase(std::remove_if(g.visual.begin(), g.visual.end(),
+        [swapchain](const VisualEvidence& v) { return v.chain == swapchain; }), g.visual.end());
+    update_visual_pending();
     if (g.screen_only_source == swapchain) g.screen_only_source = nullptr;
     if (g.tile_source == swapchain) g.tile_source = nullptr;
     if (g.preview_source == swapchain) {

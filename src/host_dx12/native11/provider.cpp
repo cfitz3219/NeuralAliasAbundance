@@ -148,52 +148,89 @@ struct DepthReads {
     Id resource = 0;
     uint32_t frame = 0;
     uint64_t sample = 0;
+    UINT width = 0, height = 0;
     bool cleared = false, seen = false, mixed = false, dirty = true, deferred = false, expanded = false;
-    const char* logged = nullptr;
+    // Qualify recovery for each clearing/lighting role independently. A late
+    // unsafe read must not make a stable earlier reader change texture.
+    struct Reader {
+        uint64_t key = 0;
+        uint32_t frame = 0;
+        uint8_t good = 0;
+        bool blocked = false;
+        const char* reason = nullptr;
+    };
+    std::array<Reader, 24> readers{};
 
     void Start(uint32_t ordinal, Id depth)
     {
         if (frame == ordinal && resource == depth) return;
-        if (resource != depth) twin.reset();
+        if (resource != depth) {
+            twin.reset();
+            readers = {};
+        }
         frame = ordinal;
         resource = depth;
         sample = 0;
+        width = height = 0;
         cleared = seen = mixed = deferred = expanded = false;
         dirty = true;
     }
-    void Report(const char* state, const char* reason)
+    void Write(uint64_t raster_sample, bool expanded_viewport, UINT w, UINT h)
     {
-        if (logged && std::strcmp(logged, reason) == 0) return;
-        logged = reason;
-        na::eventlog::Emit("depth_reads", "variant=depth-reads/twin api=dx11 state=%s why=\"%s\"", state, reason);
-    }
-    void Write(uint64_t raster_sample, bool full_viewport)
-    {
-        if (!raster_sample || !full_viewport || (seen && sample != raster_sample)) mixed = true;
+        if (!raster_sample || !w || !h ||
+            (seen && (sample != raster_sample || expanded != expanded_viewport || width != w || height != h))) mixed = true;
         sample = raster_sample;
-        expanded = full_viewport;
+        width = w;
+        height = h;
+        expanded = expanded_viewport;
         seen = dirty = true;
     }
-    bool Refresh(ID3D11DeviceContext* context, ID3D11Resource* depth)
+    void Report(Reader& reader, const char* state, const char* reason)
     {
-        if (deferred || mixed) {
-            Report("refused", deferred ? "deferred game work in this frame" : "mixed or unqualified depth writes");
-            return false;
+        if (reader.reason && std::strcmp(reader.reason, reason) == 0) return;
+        reader.reason = reason;
+        static std::atomic<unsigned> budget{0};
+        if (budget.fetch_add(1, std::memory_order_relaxed) >= 256) return;
+        na::eventlog::Emit("depth_reads", "variant=depth-reads/twin api=dx11 frame=%u reader=%llx state=%s why=\"%s\"",
+                           frame - 1, static_cast<unsigned long long>(reader.key), state, reason);
+    }
+    bool Refresh(ID3D11DeviceContext* context, ID3D11Resource* depth, uint64_t key, bool query)
+    {
+        auto it = std::find_if(readers.begin(), readers.end(), [key](const Reader& r) { return r.key == key; });
+        if (it == readers.end()) {
+            it = std::min_element(readers.begin(), readers.end(), [](const Reader& a, const Reader& b) {
+                return a.frame < b.frame;
+            });
+            *it = {key};
         }
-        if (!cleared || !seen) {
-            Report("filling", "waiting for a clear and viewport-jittered scene depth writes");
+        auto& reader = *it;
+        const bool new_frame = reader.frame != frame;
+        reader.frame = frame;
+        const auto refuse = [&](const char* reason) {
+            reader.blocked = true;
+            reader.good = 0;
+            Report(reader, "refused", reason);
             return false;
+        };
+        if (deferred || mixed) return refuse(deferred ? "deferred game work in this frame" : "mixed or unqualified depth writes");
+        if (!cleared || !seen) return refuse("waiting for a clear and viewport-jittered scene depth writes");
+        if (dirty && query) return refuse("a game raster query is active");
+        if (reader.blocked) {
+            if (new_frame && reader.good < 3) ++reader.good;
+            if (reader.good < 3) {
+                Report(reader, "recovering", "waiting for three usable frames from this reader");
+                return false;
+            }
+            reader.blocked = false;
         }
-        if (!dirty) return true;
-        if (!twin) twin = std::make_unique<DepthReadTwin>();
-        float offset[2];
-        std::memcpy(offset, &sample, sizeof offset);
-        if (!twin->Refresh(context, depth, offset[0], offset[1], expanded)) {
-            Report("refused", twin->Reason());
-            return false;
+        if (dirty) {
+            if (!twin) twin = std::make_unique<DepthReadTwin>();
+            float offset[2];
+            std::memcpy(offset, &sample, sizeof offset);
+            if (!twin->Refresh(context, depth, offset[0], offset[1], expanded, width, height)) return refuse(twin->Reason());
+            dirty = false;
         }
-        dirty = false;
-        Report("on", twin->Reason());
+        Report(reader, "on", "current scene depth corrected");
         return true;
     }
 };
@@ -1813,7 +1850,7 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.rt_count = x->rt_count;
     e.depth = x->depth;
     e.depth_test = x->depth_test;
-    e.depth_func = x->depth_func;
+    e.depth_func = x->depth_read_only ? 0 : x->depth_func;
     e.vertices = vertices;
     e.indirect = indirect;
     e.viewport_sample = x->vpj_applied ? x->vpj_sample : 0;
@@ -2163,11 +2200,6 @@ public:
         if (!depth || (state->depth == depth && !state->depth_read_only)) return;
         auto& reads = state->depth_reads;
         reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
-        if (!reads.seen) return;
-        if (reads.dirty && state->raster_queries) {
-            reads.Report("refused", "a game raster query is active");
-            return;
-        }
         Inside own;
         if (compute) Bind(DepthStage::Compute);
         else {
@@ -2201,6 +2233,7 @@ private:
         auto& reads = state_->depth_reads;
         const auto& mask = reads.slots[static_cast<size_t>(stage)];
         if (mask.none()) return;
+        uint64_t shader = 0;
         for (UINT slot = 0; slot < kDepthSlots; ++slot) {
             if (!mask.test(slot)) continue;
             ComPtr<ID3D11ShaderResourceView> original;
@@ -2218,7 +2251,25 @@ private:
             ComPtr<ID3D11Resource> resource;
             original->GetResource(&resource);
             if (IdOf(resource.Get()) != reads.resource) continue;
-            if (!reads.Refresh(context_, resource.Get())) return;
+            if (!shader) {
+                if (stage == DepthStage::Pixel) {
+                    ComPtr<ID3D11PixelShader> current;
+                    context_->PSGetShader(&current, nullptr, nullptr);
+                    shader = IncarnationOf(current.Get());
+                } else if (stage == DepthStage::Vertex) {
+                    ComPtr<ID3D11VertexShader> current;
+                    context_->VSGetShader(&current, nullptr, nullptr);
+                    shader = IncarnationOf(current.Get());
+                } else {
+                    ComPtr<ID3D11ComputeShader> current;
+                    context_->CSGetShader(&current, nullptr, nullptr);
+                    shader = IncarnationOf(current.Get());
+                }
+                if (!shader) return;
+            }
+            const uint64_t key = (shader << 11) | (uint64_t(stage) << 9) |
+                (uint64_t(state_->depth == reads.resource) << 8) | slot;
+            if (!reads.Refresh(context_, resource.Get(), key, state_->raster_queries != 0)) continue;
             if (auto* twin = reads.twin->ViewFor(original.Get())) {
                 Set(stage, slot, twin);
                 slots_[count_++] = {stage, slot, original.Detach()};
@@ -2246,7 +2297,16 @@ void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, F
     } else forward();
     if (!dispatch && state->depth == depth && !state->depth_read_only && state->depth_func) {
         reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
-        reads.Write(state->vpj_applied ? state->vpj_sample : 0, state->vpj_applied && state->vpj_expanded);
+        const auto width = g_sel_depth_w.load(std::memory_order_relaxed);
+        const auto height = g_sel_depth_h.load(std::memory_order_relaxed);
+        const auto valid = [](float dimension, UINT target) {
+            return target && dimension >= float(target) * .98f && dimension <= float(target) &&
+                dimension == float(static_cast<UINT>(dimension));
+        };
+        const bool picture = state->vp_n == 1 && state->vp_x == 0.f && state->vp_y == 0.f &&
+            valid(state->vp_w, width) && valid(state->vp_h, height);
+        reads.Write(state->vpj_applied ? state->vpj_sample : 0, state->vpj_applied && state->vpj_expanded,
+                    picture ? static_cast<UINT>(state->vp_w) : 0, picture ? static_cast<UINT>(state->vp_h) : 0);
     }
 }
 
@@ -2259,13 +2319,21 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     std::unique_lock<std::mutex> lock(g_mu);
     const auto& scene = g_model.Current();
     const auto draws = g_model.SceneDrawsThisFrame();
-    if (!g_screen.MayInspect() || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
+    const bool inspect = g_screen.MayInspect();
+    const bool missed_ordinal = !g_model.FiredThisFrame() && g_model.LearnedPointKind() == 1 &&
+        !g_screen.Adaptive() && !g_screen.Verified(scene.color, scene.depth);
+    if ((!inspect && !missed_ordinal) || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
         scene.color == g_backbuffer || !g_swap || x->raster_queries ||
         IdOf(g_color_ref.Get()) != scene.color || g_color_view.mip || g_color_view.slice) return {};
     ResourceInfo output{};
     if (!g_model.InfoOf(x->rt0, output) || output.width != scene.color_info.width ||
-        output.height != scene.color_info.height || x->vp_w != float(output.width) || x->vp_h != float(output.height))
-        return {};
+        output.height != scene.color_info.height || output.samples != 1 || scene.color_info.samples != 1) return {};
+    const auto covers_picture = [](float viewport, uint32_t extent) {
+        // Alignment padding can leave a few unused rows in a full-size texture.
+        // The exact presented pixels still qualify the reader.
+        return viewport <= float(extent) && viewport >= .98f * float(extent);
+    };
+    if (!covers_picture(x->vp_w, output.width) || !covers_picture(x->vp_h, output.height)) return {};
 
     Inside own;
     ComPtr<ID3D11Predicate> predicate;
@@ -2292,8 +2360,10 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
         D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
         view->GetDesc(&desc);
         if (desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || desc.Texture2D.MostDetailedMip) continue;
-        ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format)};
         g_screen.SetScene(scene.color, scene.depth);
+        if (missed_ordinal) g_screen.NoteActualPixel(draws);
+        if (!inspect) return {};
+        ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format)};
         if (g_screen.Adaptive()) {
             reader.color = IncarnationOf(g_color_ref.Get());
             if (IdOf(g_depth_ref.Get()) != scene.depth) return {};
@@ -2603,9 +2673,9 @@ ID3D11Resource* DepthCopySource(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* 
     if (!depth || IdOf(src) != depth || dst == src) return src;
     auto& reads = x->depth_reads;
     reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
-    if (reads.dirty && x->raster_queries) return src;
     Inside own;
-    if (!reads.Refresh(c, src)) return src;
+    constexpr uint64_t copy_reader = ~uint64_t{0};
+    if (!reads.Refresh(c, src, copy_reader, x->raster_queries != 0)) return src;
     auto* twin = reads.twin->SourceForCopy(dst);
     return twin ? twin : src;
 }
@@ -2771,7 +2841,7 @@ void ObserveBackbuffer(IDXGISwapChain* swap)
     g_backbuffer = SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&buffer))) ? IdOf(buffer.Get()) : 0;
 }
 
-bool OnPresent(IDXGISwapChain* swap)
+bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
 {
     if (t_inside) return false;
     ID3D11Device* game = g_device_raw.load(std::memory_order_acquire);
@@ -2798,11 +2868,12 @@ bool OnPresent(IDXGISwapChain* swap)
             game->GetImmediateContext(&context);
             swap->GetBuffer(0, IID_PPV_ARGS(&screen));
         }
-        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame()))
+        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame()))
             na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
                                outcome, (unsigned long long)g_screen.Paired(),
                                (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
     } else if (g_screen.Active()) g_screen.ResetPlacement();
+    if (receipt) *receipt = {g_frame, g_frame_delivered || g_model.SceneDrawsThisFrame() != 0, g_frame_delivered};
     ++g_frame;
     g_exact_frame.fetch_add(1, std::memory_order_relaxed);
     ++g_stats.frames;
@@ -3197,7 +3268,10 @@ void RejectScreenProof(uint64_t proof)
         na::eventlog::Emit("native11_screen", "candidate=replaced_after_delivery proof=%llu",
                            static_cast<unsigned long long>(proof));
 }
-bool ObservePresent(void* swapchain) { return OnPresent(static_cast<IDXGISwapChain*>(swapchain)); }
+bool ObservePresent(void* swapchain, PresentReceipt* receipt)
+{
+    return OnPresent(static_cast<IDXGISwapChain*>(swapchain), receipt);
+}
 void BeforeResize(void* swapchain) { ReleaseResizeInputs(static_cast<IDXGISwapChain*>(swapchain)); }
 void AfterResize(void* swapchain, long result) { UpdateResizeExtent(static_cast<IDXGISwapChain*>(swapchain), result); }
 OwnWorkScope::OwnWorkScope() : was_(t_inside) { t_inside = true; }
