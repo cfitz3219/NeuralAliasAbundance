@@ -856,6 +856,14 @@ int ScreenCheckFixture(Game& game)
     if (!na::native11::Install(game.device.Get(), consume, &game)) return 1;
     na::native11::SetScreenCheck(true);
     na::native11::SetCameraUse(na::native11::CameraUse::Optional);
+    // The synthetic quads use the opposite winding to the default cull state.
+    D3D11_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D11_FILL_SOLID;
+    raster.CullMode = D3D11_CULL_NONE;
+    raster.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> visible;
+    if (FAILED(game.device->CreateRasterizerState(&raster, &visible))) return 1;
+    game.ctx->RSSetState(visible.Get());
     uint64_t deliveries = 0;
     for (int frame = 0; frame < 72; ++frame) {
         Pump();
@@ -868,14 +876,14 @@ int ScreenCheckFixture(Game& game)
         reader(game.back_rtv.Get(), canvas.srv.Get(), composite.Get());
         const auto stats = na::native11::Stats();
         if (stats.screen_delivered > deliveries) {
-            expect(stats.screen_delivered == deliveries + 1, "verified reader delivers once");
+            if (stats.screen_delivered != deliveries + 1) expect(false, "verified reader delivers once");
             ComPtr<ID3D11Texture2D> screen;
             if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) return 1;
             const auto shown = read(screen.Get());
-            expect(std::abs(int(shown[0]) - 143) <= 2 && std::abs(int(shown[1]) - 48) <= 2 &&
-                   std::abs(int(shown[2]) - 24) <= 2, "presented pixels contain the evaluator's output after the game's composite");
-            expect(read(decoy.picture.Get()) == unprocessed && std::abs(int(unprocessed[0]) - 191) > 5,
-                   "the decoy remains unprocessed");
+            if (std::abs(int(shown[0]) - 143) > 2 || std::abs(int(shown[1]) - 48) > 2 || std::abs(int(shown[2]) - 24) > 2)
+                expect(false, "presented pixels contain the evaluator's output after the game's composite");
+            if (read(decoy.picture.Get()) != unprocessed || std::abs(int(unprocessed[0]) - 191) <= 5)
+                expect(false, "the decoy remains unprocessed");
             ++deliveries;
         }
         if (FAILED(game.swap->Present(0, 0))) return 1;
@@ -1831,6 +1839,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     g.ctx->PSSetSamplers(0, 1, &material_raw);
     g.ctx->ClearState();
     g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    // The synthetic quads use the opposite winding to the default cull state.
     D3D11_RASTERIZER_DESC raster{};
     raster.FillMode = D3D11_FILL_SOLID; raster.CullMode = D3D11_CULL_NONE; raster.DepthClipEnable = TRUE;
     ComPtr<ID3D11RasterizerState> no_cull;
