@@ -49,6 +49,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -89,6 +90,7 @@ float4 vs_post(uint id : SV_VertexID) : SV_Position {
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
+float4 ps_screen_check(float4 p : SV_Position) : SV_Target { return float4(scene.Load(int3(int2(p.xy), 0)).rgb * 0.75, 1); }
 Texture2D<float> test_depth : register(t1);
 RWTexture2D<float> mask_out : register(u0);
 float4 vs_depth_ramp(uint id : SV_VertexID) : SV_Position {
@@ -795,6 +797,109 @@ int DepthReadFixture(Game& g, bool debug_layer)
 }
 #endif
 
+#if !defined(NA_TEST_NATIVE_DLAA)
+int ScreenCheckFixture(Game& game)
+{
+    struct Surface {
+        ComPtr<ID3D11Texture2D> picture;
+        ComPtr<ID3D11RenderTargetView> rtv;
+        ComPtr<ID3D11ShaderResourceView> srv;
+    } decoy, canvas;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = game.w;
+    desc.Height = game.h;
+    desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    for (auto* surface : {&decoy, &canvas}) {
+        if (FAILED(game.device->CreateTexture2D(&desc, nullptr, &surface->picture)) ||
+            FAILED(game.device->CreateRenderTargetView(surface->picture.Get(), nullptr, &surface->rtv)) ||
+            FAILED(game.device->CreateShaderResourceView(surface->picture.Get(), nullptr, &surface->srv))) return 1;
+    }
+    desc.Width = desc.Height = 1;
+    desc.BindFlags = 0;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> pixel;
+    if (FAILED(game.device->CreateTexture2D(&desc, nullptr, &pixel))) return 1;
+    auto code = Compile("ps_screen_check", "ps_5_0");
+    ComPtr<ID3D11PixelShader> composite;
+    if (!code || FAILED(game.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &composite))) return 1;
+    auto reader = [&](ID3D11RenderTargetView* target, ID3D11ShaderResourceView* input, ID3D11PixelShader* shader) {
+        game.ctx->OMSetRenderTargets(1, &target, nullptr);
+        game.ctx->PSSetShaderResources(0, 1, &input);
+        game.ctx->PSSetShader(shader, nullptr, 0);
+        game.ctx->Draw(4, 0);
+        input = nullptr;
+        game.ctx->PSSetShaderResources(0, 1, &input);
+    };
+    auto read = [&](ID3D11Texture2D* source) -> std::array<BYTE, 4> {
+        na::native11::OwnWorkScope own;
+        const D3D11_BOX box{2, 2, 0, 3, 3, 1};
+        game.ctx->CopySubresourceRegion(pixel.Get(), 0, 0, 0, 0, source, 0, &box);
+        D3D11_MAPPED_SUBRESOURCE map{};
+        if (FAILED(game.ctx->Map(pixel.Get(), 0, D3D11_MAP_READ, 0, &map))) return {};
+        std::array<BYTE, 4> rgba{};
+        std::memcpy(rgba.data(), map.pData, rgba.size());
+        game.ctx->Unmap(pixel.Get(), 0);
+        return rgba;
+    };
+
+    auto consume = [](void* user, void* context, const na::native11::SceneFrame& frame) {
+        auto& g = *static_cast<Game*>(user);
+        if (!na::native11::Stats().screen_confirmed) return false;
+        if (frame.color.d3d11_resource != g.color.Get() || frame.depth.d3d11_resource != g.depth.Get()) return false;
+        const float replacement[]{.75f, .25f, .125f, 1.f};
+        static_cast<ID3D11DeviceContext*>(context)->ClearRenderTargetView(g.color_rtv.Get(), replacement);
+        return true;
+    };
+    if (!na::native11::Install(game.device.Get(), consume, &game)) return 1;
+    na::native11::SetScreenCheck(true);
+    na::native11::SetCameraUse(na::native11::CameraUse::Optional);
+    // The synthetic quads use the opposite winding to the default cull state.
+    D3D11_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D11_FILL_SOLID;
+    raster.CullMode = D3D11_CULL_NONE;
+    raster.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> visible;
+    if (FAILED(game.device->CreateRasterizerState(&raster, &visible))) return 1;
+    game.ctx->RSSetState(visible.Get());
+    uint64_t deliveries = 0;
+    for (int frame = 0; frame < 72; ++frame) {
+        Pump();
+        Scene(game.ctx.Get(), game, 0);
+        game.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        game.ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
+        reader(decoy.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
+        const auto unprocessed = read(decoy.picture.Get());
+        reader(canvas.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
+        reader(game.back_rtv.Get(), canvas.srv.Get(), composite.Get());
+        const auto stats = na::native11::Stats();
+        if (stats.screen_delivered > deliveries) {
+            if (stats.screen_delivered != deliveries + 1) expect(false, "verified reader delivers once");
+            ComPtr<ID3D11Texture2D> screen;
+            if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) return 1;
+            const auto shown = read(screen.Get());
+            if (std::abs(int(shown[0]) - 143) > 2 || std::abs(int(shown[1]) - 48) > 2 || std::abs(int(shown[2]) - 24) > 2)
+                expect(false, "presented pixels contain the evaluator's output after the game's composite");
+            if (read(decoy.picture.Get()) != unprocessed || std::abs(int(unprocessed[0]) - 191) <= 5)
+                expect(false, "the decoy remains unprocessed");
+            ++deliveries;
+        }
+        if (FAILED(game.swap->Present(0, 0))) return 1;
+    }
+    const auto stats = na::native11::Stats();
+    std::printf("native DX11 screen check: confirmed=%llu refuted=%llu paired=%llu pixel_verified_frames=%llu\n",
+                (unsigned long long)stats.screen_confirmed, (unsigned long long)stats.screen_refuted,
+                (unsigned long long)stats.screen_pairs, (unsigned long long)deliveries);
+    expect(stats.screen_confirmed == 1 && stats.screen_refuted == 1 && stats.screen_pairs == 16,
+           "screen proof rejects the decoy and confirms the real reader");
+    expect(deliveries >= 20, "native DLAA handoff delivers continuously after confirmation");
+    na::native11::Uninstall();
+    return g_failed ? 1 : 0;
+}
+#endif
+
 int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 {
 #if defined(NA_TEST_NATIVE_DLAA)
@@ -834,11 +939,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #endif
     Game g;
     bool warp = false;
+    const bool screen_warp = argc > 1 && std::strcmp(argv[1], "--screen-check-warp") == 0;
     const bool depth_warp = argc > 1 && std::strcmp(argv[1], "--depth-reads-warp") == 0;
     const bool depth_debug = argc > 1 && std::strcmp(argv[1], "--depth-reads-debug") == 0;
     const bool depth_reads = depth_warp || depth_debug || (argc > 1 && std::strcmp(argv[1], "--depth-reads") == 0);
     g.shader_depth = depth_reads;
-    if (depth_warp || depth_debug || !MakeGame(g, false)) {
+    if (screen_warp || depth_warp || depth_debug || !MakeGame(g, false)) {
         g = Game{};
         g.shader_depth = depth_reads;
         if (!MakeGame(g, true, depth_debug)) {
@@ -847,7 +953,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         }
         warp = true;
     }
-    std::printf("device: %s\n", warp ? "WARP" : "hardware");
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC adapter_desc{};
+    if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->GetDesc(&adapter_desc);
+    std::printf("device: %ls (%s)\n", adapter_desc.Description, warp ? "WARP" : "hardware");
+#if !defined(NA_TEST_NATIVE_DLAA)
+    if (screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g);
+#endif
 #if defined(NA_TEST_NATIVE_DLAA)
     if (warp) return 77;
     ComPtr<ID3D11On12Device> translated;
@@ -1726,6 +1839,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     g.ctx->PSSetSamplers(0, 1, &material_raw);
     g.ctx->ClearState();
     g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    // The synthetic quads use the opposite winding to the default cull state.
     D3D11_RASTERIZER_DESC raster{};
     raster.FillMode = D3D11_FILL_SOLID; raster.CullMode = D3D11_CULL_NONE; raster.DepthClipEnable = TRUE;
     ComPtr<ID3D11RasterizerState> no_cull;

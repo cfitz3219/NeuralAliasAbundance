@@ -138,12 +138,14 @@ struct ProviderStats {
     // Depth direction with no camera (depth_direction.hpp): frames not handed over because it is not
     // proven yet, and frames on which a proven direction and the camera's own answer disagreed.
     uint64_t depth_unproven = 0, depth_camera_disagrees = 0;
+    uint64_t screen_confirmed = 0, screen_refuted = 0, screen_pairs = 0, screen_delivered = 0;
     const char* last_miss = "";
 };
 
 // Installs the D3D11 hooks on `device` (ID3D11Device*) and its immediate context. Idempotent.
 bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present = false);
 // The hosted path receives DXGI events through the overlay's existing hooks.
+void SetScreenCheck(bool on);
 bool ObservePresent(void* swapchain);
 void BeforeResize(void* swapchain);
 void AfterResize(void* swapchain, long result);

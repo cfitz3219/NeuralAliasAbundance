@@ -3739,6 +3739,8 @@ struct Native11Present {
         if (flags & DXGI_PRESENT_TEST) return;
         na::on12::AttachNativePresentation(sc);
         na::native_d3d11::SyncCameraUse(); // [j2] camera, live: before this present closes the frame
+        na::native11::SetScreenCheck(na::j2::Enabled() && !na::j2::Paused() &&
+            na::settings::Get().referee_enabled.load(std::memory_order_relaxed));
         if (!na::native11::ObservePresent(sc)) return;
         std::lock_guard<std::mutex> lock(g_state.mutex);
         ComPtr<ID3D12CommandQueue> retained;
