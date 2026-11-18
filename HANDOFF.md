@@ -1159,3 +1159,7 @@ Astra5b7a68a / PR157 into claude/project-thread-axt148 stops diagnostic constant
 ### 2026-11-17 — GitHub backlog and main consolidation complete
 
 Reviewed all 39 original open PRs. Merged #133, #132, #134, #135 and #144 into Route B, then merged #158 to main as 82fe548 after all four GitHub jobs passed. That brings the consolidated DX11/DX12 source and the latest GameCheck rules into main. GameCheck passed 38 tests locally. Closed 24 obsolete, duplicate, or carried-forward PRs after verifying their disposition. The remaining ten are #83, #88–#94, #142 and #145. Earlier branches are retained. Fable's active Resistance build and follow-up are still tracked by #145. See docs/PR-BACKLOG-20261117.md for the evidence and decision on each original PR.
+
+### 2026-11-17 — Referee stage 1 patched
+
+PR #159 at a867810 targets Fable's active branch. Exact-frame and swap-chain matching, independent fences, bounded recording lifetime, actual NGX snapshots, separate submission coverage, lower DX11 copy load, and off-thread scoring are implemented. Release host and five focused checks passed, plus WARP. COMMS has the integration notes. The referee is opt-in pending real-game calibration. No package or installed game changed.
