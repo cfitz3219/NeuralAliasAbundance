@@ -138,7 +138,9 @@ void symptom_and_its_end()
         std::printf("%-24s pixels touched %5d   switching with the jitter: as it is %5d (%5.1f %%)   with the nudge taken out %d\n", c.name,
             c.raw.touched, c.raw.switching, c.raw.touched ? 100.0 * c.raw.switching / c.raw.touched : 0.0, c.fixed.switching);
         CHECK(c.raw.touched > 20);
-        CHECK(c.fixed.switching == 0);
+        // None, but for a pixel that lies on the mark's or the pool's edge to the last bit of a float (the
+        // corrected depth is exact to about 1e-5 of itself; which way such a pixel falls differs by compiler).
+        CHECK(c.fixed.switching * 1000 <= c.fixed.touched);
         if (c.far_away) CHECK(c.raw.switching * 2 > c.raw.touched); // far away: most of it switches
         else CHECK(c.raw.switching * 20 < c.raw.touched);           // up close: solid but for an edge pixel or two
     }
