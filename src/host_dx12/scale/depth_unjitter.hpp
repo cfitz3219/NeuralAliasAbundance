@@ -22,15 +22,21 @@ public:
     static constexpr D3D12_RESOURCE_STATES kTwinRest =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     ID3D12Resource* Twin() const { return twin_.Get(); }
-    // Record() between the twin's two transitions (rest -> DEPTH_WRITE -> rest). Every recording that
-    // refreshes the twin does it this way, so the twin's state is the same at the start and end of each.
-    bool RecordRefresh(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y) const;
-    // Caller: game depth's depth plane readable by a pixel shader (PIXEL_SHADER_RESOURCE, with or
-    // without DEPTH_READ), twin in DEPTH_WRITE (RecordRefresh does that), outside render passes; restores the game's
-    // command-list state afterwards and keeps this pass alive through every execution of the
-    // recording. jitter = how far the picture was moved, in pixels (+x right, +y down).
-    // No waits, descriptor writes, allocation, compilation or readback here.
-    bool Record(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y) const;
+    // Every recording that brings the twin up to date does it one of these two ways, so the twin rests
+    // in kTwinRest at the start and end of each. Both: a DIRECT recording outside render passes;
+    // game_state = the state the game's depth plane is in here (all_planes: the game's barrier named
+    // every subresource); this pass must outlive every execution of the recording. No waits,
+    // descriptor writes, allocation, compilation or readback.
+    //
+    // The corrected depth. jitter = how far the picture was moved, in pixels (+x right, +y down);
+    // expanded = the scene's one full-size viewport was also widened by half a pixel on each side.
+    // Changes the list's graphics pipeline state: the caller hands the game's back afterwards.
+    bool RecordRefresh(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y, bool expanded,
+        D3D12_RESOURCE_STATES game_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, bool all_planes = true) const;
+    // The game's depth plane as it is (what the game reads today). Touches no pipeline state.
+    bool RecordCopy(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES game_state, bool all_planes) const;
+    // The draw alone: game depth's depth plane readable by a pixel shader, twin in DEPTH_WRITE.
+    bool Record(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y, bool expanded = false) const;
 private:
     Microsoft::WRL::ComPtr<ID3D12Resource> depth_, twin_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;

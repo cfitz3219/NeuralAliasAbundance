@@ -24,7 +24,10 @@ Formats formats(DXGI_FORMAT f) {
 }
 bool compile(const char* entry, const char* target, Microsoft::WRL::ComPtr<ID3DBlob>& code) {
     Microsoft::WRL::ComPtr<ID3DBlob> errors;
-    return SUCCEEDED(D3DCompile(kSource, std::strlen(kSource), "depth with the jitter taken out", nullptr, nullptr,
+    // The widening of a full-size scene viewport is part of where the picture landed (Astra, PR 162);
+    // the term is compiled in and its factor is zero for a scene that was not widened.
+    const D3D_SHADER_MACRO definitions[]{{"NA_RASTER_EXPANSION", "1"}, {nullptr, nullptr}};
+    return SUCCEEDED(D3DCompile(kSource, std::strlen(kSource), "depth with the jitter taken out", definitions, nullptr,
         entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors));
 }
 }
@@ -76,7 +79,7 @@ std::shared_ptr<const DepthUnjitter> DepthUnjitter::Create(ID3D12Device* device,
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable = {1, &range}; params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants = {0, 0, 6}; params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].Constants = {0, 0, 8}; params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters = 2; rd.pParameters = params;
     Microsoft::WRL::ComPtr<ID3DBlob> blob, errors, vs, ps;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
@@ -98,19 +101,19 @@ std::shared_ptr<const DepthUnjitter> DepthUnjitter::Create(ID3D12Device* device,
     if (FAILED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pass->pso_)))) return fail("pipeline preparation failed");
     return pass;
 }
-bool DepthUnjitter::Record(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y) const
+bool DepthUnjitter::Record(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y, bool expanded) const
 {
     if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
     const na::depth::unjitter::Params defaults;
-    struct Args { float jx, jy; int32_t last_x, last_y; float curve, noise; };
+    struct Args { float jx, jy; int32_t last_x, last_y; float curve, noise, inverse_width, inverse_height; };
     const Args args{jitter_x, jitter_y, static_cast<int32_t>(size_.width) - 1, static_cast<int32_t>(size_.height) - 1, defaults.curve,
-        defaults.noise};
-    static_assert(sizeof(Args) == 24, "six 32-bit root constants");
+        defaults.noise, expanded ? 1.f / static_cast<float>(size_.width) : 0.f, expanded ? 1.f / static_cast<float>(size_.height) : 0.f};
+    static_assert(sizeof(Args) == 32, "eight 32-bit root constants");
     ID3D12DescriptorHeap* heaps[]{srv_.Get()};
     list->SetDescriptorHeaps(1, heaps);
     list->SetGraphicsRootSignature(root_.Get()); list->SetPipelineState(pso_.Get());
     list->SetGraphicsRootDescriptorTable(0, srv_->GetGPUDescriptorHandleForHeapStart());
-    list->SetGraphicsRoot32BitConstants(1, 6, &args, 0);
+    list->SetGraphicsRoot32BitConstants(1, 8, &args, 0);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(size_.width), static_cast<float>(size_.height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(size_.width), static_cast<LONG>(size_.height)};
     list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
@@ -119,17 +122,45 @@ bool DepthUnjitter::Record(ID3D12GraphicsCommandList* list, float jitter_x, floa
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); list->DrawInstanced(3, 1, 0, 0);
     return true;
 }
-bool DepthUnjitter::RecordRefresh(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y) const
+namespace {
+D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, UINT subresource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = resource;
+    b.Transition.Subresource = subresource; b.Transition.StateBefore = before; b.Transition.StateAfter = after;
+    return b;
+}
+}
+bool DepthUnjitter::RecordRefresh(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y, bool expanded,
+    D3D12_RESOURCE_STATES game_state, bool all_planes) const
 {
     if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = twin_.Get();
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = kTwinRest; b.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    list->ResourceBarrier(1, &b);
-    const bool ok = Record(list, jitter_x, jitter_y);
-    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    list->ResourceBarrier(1, &b);
+    const UINT planes = all_planes ? D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES : 0;
+    // A depth the game made readable for other stages only is lent to the pixel stage for this one draw.
+    const bool lend = !(game_state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_RESOURCE_BARRIER b[2]{
+        transition(twin_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, kTwinRest, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        transition(depth_.Get(), planes, game_state, game_state | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
+    list->ResourceBarrier(lend ? 2 : 1, b);
+    const bool ok = Record(list, jitter_x, jitter_y, expanded);
+    for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    list->ResourceBarrier(lend ? 2 : 1, b);
     return ok;
+}
+bool DepthUnjitter::RecordCopy(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES game_state, bool) const
+{
+    if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    // The depth plane alone (subresource 0): the stencil plane may be in another state, and nothing reads the twin's.
+    D3D12_RESOURCE_BARRIER b[2]{
+        transition(twin_.Get(), 0, kTwinRest, D3D12_RESOURCE_STATE_COPY_DEST),
+        transition(depth_.Get(), 0, game_state, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+    list->ResourceBarrier(2, b);
+    D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+    to.pResource = twin_.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; to.SubresourceIndex = 0;
+    from.pResource = depth_.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; from.SubresourceIndex = 0;
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    list->ResourceBarrier(2, b);
+    return true;
 }
 } // namespace na::scale

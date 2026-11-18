@@ -468,9 +468,6 @@ void GetDrawReplayStats(DrawReplayStats* out);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
-// The sample the most recent recording pinned for its scene draws (0 = none yet): what the depth
-// those draws wrote was nudged by, for a recording that reads it without drawing the scene itself.
-uint64_t LastSceneViewportJitter();
 struct ViewportJitterStats { uint64_t draws, sets, restores, unknown; };
 ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists

@@ -8999,6 +8999,7 @@ void Shutdown()
     g.msaa = MsaaResolve{};
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; s.native_scale_resources={}; s.late_input_buffer={}; }
     na::j2::flow::Shutdown(); // before the device and J2's fence go
+    na::j2::depth_reads::Shutdown(); // the game's views go back to its own depth; the twin's users keep it alive
     na::j2::compute_flow::Reset();
     g.fence.Reset(); g.queue.Reset(); g.device.Reset();
     g.arbiter = na::motion::gpu::Arbiter{};

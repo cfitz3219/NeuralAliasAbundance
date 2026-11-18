@@ -13,7 +13,8 @@
 namespace na::j2::depth_reads {
 // Once per presented frame, on the presenting thread, as host work. `want` = viewport jitter is
 // supplying samples and the setting is on; `scene_depth` = the selected scene depth (registry id,
-// 0 = none); `queue` = the game's queue (to let it drain once before existing views are rewritten).
+// 0 = none); `queue` = the game's queue (views go to the twin only after that queue has finished a
+// recording that brought the twin up to date).
 void Tick(ID3D12CommandQueue* queue, uint64_t scene_depth, bool want);
 // One line for the status log: what is on, what was done, and why not where it was not.
 int Format(char* out, size_t n);

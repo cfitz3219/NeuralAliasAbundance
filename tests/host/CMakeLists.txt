@@ -108,7 +108,10 @@ na_host_test(depth_restore_test SOURCES depth_restore_test.cpp LIBS host_scene_s
 # Scene depth with the raster jitter taken back out: the card's program against its processor reference (runs on WARP in CI).
 na_host_test(depth_unjitter_test SOURCES depth_unjitter_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 # Depth reads end to end through the real hooks, no game (not labelled gpu: it runs on WARP in CI).
-na_host_test(depth_reads_test SOURCES depth_reads_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+# Needs the recording tracker (which recordings were submitted and finished), built only with the NGX headers.
+if(NA_HAVE_NGX_SDK)
+  na_host_test(depth_reads_test SOURCES depth_reads_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+endif()
 na_host_test(color_restore_test SOURCES color_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 add_test(NAME host_color_restore_warp_test COMMAND color_restore_test --warp)
 set_tests_properties(host_color_restore_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)

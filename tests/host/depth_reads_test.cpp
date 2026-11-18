@@ -1,9 +1,11 @@
 // Depth reads end to end, with no game: a sloping depth drawn through jittered viewports, then read
 // by a "lighting" draw the way a game reads its scene depth. Before the hand-over the read sees the
-// jitter; after it (a view that existed before, and one made after) it sees the depth with the
-// jitter taken out, whichever sample the frame used; turned off, the game's own depth is back.
-// The read draw's state is set BEFORE the game's barrier, so a wrong restore shows in the pixels.
-// Wait/readback belong only to this test.
+// jitter (and the widened viewport); after it (a view that existed before, and one made after) it
+// sees the depth the game's own pixel-centre rays expect, whichever sample the frame used; turned
+// off, the game's own depth is back. Also (Astra's audit of 2db2250e): a recording that is never
+// submitted hands nothing over; a view with its own component mapping keeps it; a barrier inside a
+// game query adds nothing to the query; a barrier before the game has bound its state still gets
+// the corrected depth before the read. Wait/readback belong only to this test.
 #include "test_support.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/observe/operation_snapshot.hpp"
@@ -13,14 +15,17 @@
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 namespace {
 void __cdecl sink(const na_event_batch*,void*){}
 constexpr UINT W=64,H=32;
-// The scene's depth where a pixel centre is, for a viewport moved by (jx,jy). The host gives a
+// What the depth buffer holds at a pixel for a viewport moved by (jx,jy). The host gives a
 // full-size scene viewport half a pixel on each side, hence the +1s.
 float scene_depth(UINT x,UINT y,float jx,float jy){return .1f+.2f*(float(x)+1.f-jx)/float(W+1)+.2f*(float(y)+1.f-jy)/float(H+1);}
+// What the game's own pixel-centre rays expect there: the scene through its own viewport, not moved, not widened.
+float true_depth(UINT x,UINT y){return .1f+.2f*(float(x)+.5f)/float(W)+.2f*(float(y)+.5f)/float(H);}
 }
 int main(){
     test::ComPtr<ID3D12Debug> debug;if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
@@ -38,8 +43,10 @@ int main(){
     test::ComPtr<ID3D12DescriptorHeap> rt,ds,views;D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rt))));hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&ds))));
-    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=2;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=3;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&views))));
+    test::ComPtr<ID3D12DescriptorHeap> staging;hd.NumDescriptors=1;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    REQUIRE(SUCCEEDED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&staging))));
     const auto rtv=rt->GetCPUDescriptorHandleForHeapStart(),dsv=ds->GetCPUDescriptorHandleForHeapStart();
     dev->CreateRenderTargetView(color.Get(),nullptr,rtv);
     D3D12_DEPTH_STENCIL_VIEW_DESC dd{};dd.Format=DXGI_FORMAT_D32_FLOAT;dd.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;dev->CreateDepthStencilView(depth.Get(),&dd,dsv);
@@ -50,6 +57,16 @@ int main(){
     auto cpu0=views->GetCPUDescriptorHandleForHeapStart(),cpu1=cpu0;cpu1.ptr+=step;
     auto gpu0=views->GetGPUDescriptorHandleForHeapStart(),gpu1=gpu0;gpu1.ptr+=step;
     dev->CreateShaderResourceView(depth.Get(),&sd,cpu0);
+    // Slot 2: a view whose red channel is the constant 0, made in a staging heap and copied over (it must stay 0).
+    auto cpu2=cpu1;cpu2.ptr+=step;auto gpu2=gpu1;gpu2.ptr+=step;
+    {auto zero=sd;zero.Shader4ComponentMapping=D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
+        dev->CreateShaderResourceView(depth.Get(),&zero,staging->GetCPUDescriptorHandleForHeapStart());
+        dev->CopyDescriptorsSimple(1,cpu2,staging->GetCPUDescriptorHandleForHeapStart(),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);}
+    // A pipeline-statistics query the "game" holds open across its barrier.
+    test::ComPtr<ID3D12QueryHeap> queries;D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,1,0};
+    REQUIRE(SUCCEEDED(dev->CreateQueryHeap(&qd,IID_PPV_ARGS(&queries))));
+    auto counted=test::CreateBuffer(dev,sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS),D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(counted);
     test::ComPtr<ID3DBlob> vs,ps,rps,blob,error;test::ComPtr<ID3D12RootSignature> scene_root,read_root;
     D3D12_ROOT_SIGNATURE_DESC rd{};REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error)));
     REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&scene_root))));
@@ -78,18 +95,33 @@ float4 Read(V v):SV_Target{return float4(scene_depth.Load(int3(v.p.xy,0)),v.uv,1
     test::List list;REQUIRE(list.Create(dev));REQUIRE(SUCCEEDED(list.list->Close()));
     uint64_t frame_number=0;
     // One frame the way a deferred game records it; returns what its lighting read at every pixel.
-    auto frame=[&](float jx,float jy,D3D12_GPU_DESCRIPTOR_HANDLE view,std::vector<float>& out)->bool{
+    // Usual: everything the lighting draw needs is bound BEFORE the barrier, so the host's work there must hand it all back.
+    // Late: the barrier comes first, with the scene's state still bound and no heaps; the lighting state follows.
+    // Query: as Usual, with a pipeline-statistics query open across the barrier alone.
+    // Unsubmitted: recorded up to the barrier, closed, never given to the queue.
+    enum class Mode{Usual,Late,Query,Unsubmitted};
+    uint64_t counted_primitives=0;
+    auto frame=[&](float jx,float jy,D3D12_GPU_DESCRIPTOR_HANDLE view,std::vector<float>& out,Mode mode=Mode::Usual)->bool{
         list.Reset();auto* l=list.list.Get();na::observe::SetSceneViewportJitter(++frame_number,jx,jy);
         const D3D12_VIEWPORT vp{0,0,float(W),float(H),0,1};const D3D12_RECT sc{0,0,LONG(W),LONG(H)};
         l->SetGraphicsRootSignature(scene_root.Get());l->SetPipelineState(scene.Get());l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         l->OMSetRenderTargets(1,&rtv,FALSE,&dsv);l->RSSetViewports(1,&vp);l->RSSetScissorRects(1,&sc);
         l->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,1.f,0,0,nullptr);
         l->DrawInstanced(3,1,0,0);
-        // Everything the lighting draw needs is bound first; the host's work at the barrier must hand it all back.
-        ID3D12DescriptorHeap* heaps[]={views.Get()};l->SetDescriptorHeaps(1,heaps);
-        l->SetGraphicsRootSignature(read_root.Get());l->SetGraphicsRootDescriptorTable(0,view);l->SetPipelineState(read.Get());
-        l->OMSetRenderTargets(1,&rtv,FALSE,nullptr);l->RSSetViewports(1,&vp);l->RSSetScissorRects(1,&sc);
-        auto b=test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);l->ResourceBarrier(1,&b);
+        auto b=test::Transition(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        const auto lighting_state=[&]{
+            ID3D12DescriptorHeap* heaps[]={views.Get()};l->SetDescriptorHeaps(1,heaps);
+            l->SetGraphicsRootSignature(read_root.Get());l->SetGraphicsRootDescriptorTable(0,view);l->SetPipelineState(read.Get());
+            l->OMSetRenderTargets(1,&rtv,FALSE,nullptr);l->RSSetViewports(1,&vp);l->RSSetScissorRects(1,&sc);};
+        if(mode==Mode::Usual){lighting_state();l->ResourceBarrier(1,&b);}
+        else{
+            if(mode==Mode::Query){lighting_state();l->BeginQuery(queries.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);}
+            l->ResourceBarrier(1,&b);
+            if(mode==Mode::Query){l->EndQuery(queries.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+                l->ResolveQueryData(queries.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0,1,counted.Get(),0);}
+            if(mode==Mode::Unsubmitted)return SUCCEEDED(l->Close());
+            if(mode==Mode::Late)lighting_state();
+        }
         l->DrawInstanced(3,1,0,0);
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);l->ResourceBarrier(1,&b);
         {const na::observe::HostWorkScope own;
@@ -99,6 +131,8 @@ float4 Read(V v):SV_Target{return float4(scene_depth.Load(int3(v.p.xy,0)),v.uv,1
             std::swap(c.Transition.StateBefore,c.Transition.StateAfter);l->ResourceBarrier(1,&c);}
         if(FAILED(l->Close()))return false;ID3D12CommandList* lists[]={l};
         {na::nr::native::Submission keep(d.queue.Get(),1,lists);d.queue->ExecuteCommandLists(1,lists);}d.WaitIdle();
+        if(mode==Mode::Query){const void* q=nullptr;if(FAILED(counted->Map(0,nullptr,const_cast<void**>(&q))))return false;
+            counted_primitives=static_cast<const D3D12_QUERY_DATA_PIPELINE_STATISTICS*>(q)->IAPrimitives;counted->Unmap(0,nullptr);}
         const void* data=nullptr;if(FAILED(readback->Map(0,nullptr,const_cast<void**>(&data))))return false;
         out.resize(size_t(W)*H);
         for(UINT y=0;y<H;++y)for(UINT x=0;x<W;++x){
@@ -109,35 +143,55 @@ float4 Read(V v):SV_Target{return float4(scene_depth.Load(int3(v.p.xy,0)),v.uv,1
         }
         readback->Unmap(0,nullptr);return true;
     };
-    // Largest difference from the scene's depth for a viewport moved by (jx,jy), away from the picture's rim.
+    // Largest difference from what the buffer holds for a viewport moved by (jx,jy), away from the picture's rim.
     auto worst=[&](const std::vector<float>& got,float jx,float jy){float m=0;UINT wx=0,wy=0;
         for(UINT y=2;y+2<H;++y)for(UINT x=2;x+2<W;++x){const float e=std::abs(got[size_t(y)*W+x]-scene_depth(x,y,jx,jy));if(e>m){m=e;wx=x;wy=y;}}
-        std::printf("  jitter %+.3f/%+.3f: worst %.3g at %u,%u (read %.7f, scene %.7f)\n",jx,jy,m,wx,wy,got[size_t(wy)*W+wx],scene_depth(wx,wy,jx,jy));return m;};
+        std::printf("  against the buffer at jitter %+.3f/%+.3f: worst %.3g at %u,%u (read %.7f, buffer %.7f)\n",jx,jy,m,wx,wy,got[size_t(wy)*W+wx],scene_depth(wx,wy,jx,jy));return m;};
+    // Largest difference from what the game's pixel-centre rays expect, over the WHOLE picture (the rim is where the widening shows most).
+    auto wrong=[&](const std::vector<float>& got){float m=0;UINT wx=0,wy=0;
+        for(UINT y=0;y<H;++y)for(UINT x=0;x<W;++x){const float e=std::abs(got[size_t(y)*W+x]-true_depth(x,y));if(e>m){m=e;wx=x;wy=y;}}
+        std::printf("  against the game's rays: worst %.3g at %u,%u (read %.7f, expected %.7f)\n",m,wx,wy,got[size_t(wy)*W+wx],true_depth(wx,wy));return m;};
+    auto all_zero=[&](const std::vector<float>& got){for(float v:got)if(v!=0.f)return false;return true;};
     auto tick=[&](bool want){const na::observe::HostWorkScope own;na::j2::depth_reads::Tick(d.queue.Get(),depth_id,want);};
-    auto status=[&](const char* expect){char line[448];na::j2::depth_reads::Format(line,sizeof line);std::printf("%s\n",line);
+    char line[512]{};
+    auto status=[&](const char* expect){na::j2::depth_reads::Format(line,sizeof line);std::printf("%s\n",line);
         char want[32];std::snprintf(want,sizeof want,"state=%s ",expect);return std::strstr(line,want)!=nullptr;};
+    auto count=[&](const char* name){const char* at=std::strstr(line,name);return at?std::strtoull(at+std::strlen(name),nullptr,10):0ull;};
     constexpr float tol=2e-5f;const float s1[2]={.25f,-.375f},s2[2]={-.375f,-.25f};
     std::vector<float> got;
-    // 0. Nothing handed over: the read sees the jitter (this is the flicker's source).
-    std::printf("off:\n");REQUIRE(frame(s1[0],s1[1],gpu0,got));CHECK(worst(got,s1[0],s1[1])<tol);CHECK(worst(got,0,0)>1e-3f);
-    // 1. Asked for: the twin fills at the barrier, the game's views still name its own depth.
+    // 0. Nothing handed over: the read sees the buffer as it is, which is not what the game's rays expect.
+    std::printf("off:\n");REQUIRE(frame(s1[0],s1[1],gpu0,got));CHECK(worst(got,s1[0],s1[1])<tol);CHECK(wrong(got)>1e-3f);
+    REQUIRE(frame(s1[0],s1[1],gpu2,got));CHECK(all_zero(got));
+    // 1. Asked for. A recording that reaches the barrier and is never submitted hands nothing over.
     tick(true);CHECK(status("filling"));
+    REQUIRE(frame(s1[0],s1[1],gpu0,got,Mode::Unsubmitted));tick(true);tick(true);CHECK(status("filling"));
+    // 2. A submitted, finished frame: the twin was brought up to date, the game's views still name its own depth.
     std::printf("filling:\n");REQUIRE(frame(s1[0],s1[1],gpu0,got));CHECK(worst(got,s1[0],s1[1])<tol);
-    // 2. Handed over: the view that existed (slot 0) is rewritten; a view made now (slot 1) goes to the twin.
+    // 3. Handed over: the view that existed (slot 0) is rewritten; a view made now (slot 1) goes to the twin.
     tick(true);CHECK(status("on"));
     dev->CreateShaderResourceView(depth.Get(),&sd,cpu1);
-    std::printf("on, the view that existed, second sample:\n");REQUIRE(frame(s2[0],s2[1],gpu0,got));CHECK(worst(got,0,0)<tol);
-    std::printf("on, a view made after, first sample:\n");REQUIRE(frame(s1[0],s1[1],gpu1,got));CHECK(worst(got,0,0)<tol);
+    std::printf("on, the view that existed, second sample:\n");REQUIRE(frame(s2[0],s2[1],gpu0,got));CHECK(wrong(got)<tol);
+    std::printf("on, a view made after, first sample:\n");REQUIRE(frame(s1[0],s1[1],gpu1,got));CHECK(wrong(got)<tol);
     tick(true);
-    std::printf("on, a view made after, second sample:\n");REQUIRE(frame(s2[0],s2[1],gpu1,got));CHECK(worst(got,0,0)<tol);
-    {const auto stats=na::observe::GetDepthReadStats();CHECK(stats.created>=1&&stats.swept>=1&&stats.readable>=4);CHECK(status("on"));}
-    // 3. Turned off live: both views are back on the game's depth.
+    std::printf("on, a view made after, second sample:\n");REQUIRE(frame(s2[0],s2[1],gpu1,got));CHECK(wrong(got)<tol);
+    // The view with its own component mapping still reads its constant.
+    REQUIRE(frame(s1[0],s1[1],gpu2,got));CHECK(all_zero(got));
+    CHECK(status("on"));const auto corrected=count("corrected=");CHECK(corrected>=4&&count("views_rewritten=")>=2&&count("views_created=")>=1&&count("upgraded=")==0);
+    // 4. The barrier before the game has bound anything for its lighting: a plain copy there, the corrected depth before the read.
+    std::printf("on, barrier first:\n");REQUIRE(frame(s2[0],s2[1],gpu0,got,Mode::Late));CHECK(wrong(got)<tol);
+    CHECK(status("on"));CHECK(count("upgraded=")==1&&count("copied=")>=1&&count("corrected=")==corrected);
+    // 5. A game query open across the barrier counts nothing of the host's; the read is still corrected.
+    std::printf("on, barrier inside a game query:\n");REQUIRE(frame(s1[0],s1[1],gpu1,got,Mode::Query));CHECK(wrong(got)<tol);
+    std::printf("  primitives the game's query counted across its barrier: %llu\n",static_cast<unsigned long long>(counted_primitives));CHECK(counted_primitives==0);
+    CHECK(status("on"));CHECK(count("upgraded=")==2);
+    // 6. Turned off live: every view is back on the game's depth.
     tick(false);CHECK(status("off"));
     std::printf("off again:\n");REQUIRE(frame(s2[0],s2[1],gpu0,got));CHECK(worst(got,s2[0],s2[1])<tol);
     REQUIRE(frame(s1[0],s1[1],gpu1,got));CHECK(worst(got,s1[0],s1[1])<tol);
-    // 4. And on again (a second twin; the first is parked).
+    REQUIRE(frame(s1[0],s1[1],gpu2,got));CHECK(all_zero(got));
+    // 7. And on again (a second twin; the first is parked).
     tick(true);REQUIRE(frame(s1[0],s1[1],gpu0,got));tick(true);CHECK(status("on"));
-    std::printf("on again:\n");REQUIRE(frame(s2[0],s2[1],gpu1,got));CHECK(worst(got,0,0)<tol);
+    std::printf("on again:\n");REQUIRE(frame(s2[0],s2[1],gpu1,got));CHECK(wrong(got)<tol);
     tick(false);na::j2::depth_reads::Shutdown();
     na::observe::SetSceneViewportJitter(0,0,0);
     if(info)for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T size=0;info->GetMessage(i,nullptr,&size);std::vector<uint8_t> data(size);auto* message=reinterpret_cast<D3D12_MESSAGE*>(data.data());
