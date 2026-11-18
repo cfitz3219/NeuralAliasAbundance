@@ -44,3 +44,7 @@ PR #165 (89ae5f5 on 8e2eb95b) applies the shared screen check to the native DX11
 ## 2026-11-18 Pacific — Shadow of War DX11 Referee continuity
 
 PR 166 (07acf67) targets the active 78b539df integration line. The native DX11 Referee now preserves ordinary DLAA delivery and requires a candidate to stay present throughout screen proof. A reader that later alternates between delivery and misses loses control. Ten focused tests passed. RTX and WARP pixel checks passed for ordinary delivery, interrupted proof, discovery of the visible reader and restoration after alternating misses. No live game run or installer. The separate overhead from camera discovery while DLAA is paused is documented in the branch's WORKLOG.
+
+## 2026-11-18 Pacific — Shadow of War final-image monitoring and camera cost
+
+PR 166 ends at c46e5b9 on the active native DX11 base. Referee checks the exact presented frame after approval, aligns the scene and display grids, and retires only the matching reader after repeated clear input votes. Pausing DLAA stops camera acquisition and DLAA-only sampler bias. Optional camera search backs off during successful measured-motion delivery and resumes automatically. Release and 13 focused automated tests passed including native DX12 screen coverage and three real NVIDIA DX11 cases. The classifier passed separately on WARP. COMMS and the branch WORKLOG preserve receipts. No new installer or matched in-game timing on this build.
