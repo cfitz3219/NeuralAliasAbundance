@@ -1171,3 +1171,7 @@ PR #161 merged at 3536dbba. It connects the referee to a read-only route preview
 ## 2026-11-17 Pacific — Native DX11 jitter-locked lighting handoff
 
 Astra's native DX11 implementation is a561d9e (PR #162 into Fable's claude/project-thread-axt148). Fable retains the DX12 implementation and combined integration. The Release host built, hardware and WARP passed the depth-slab fixture, and the debug-wrapper fallback was verified. Original depth tests and DLAA inputs are intact. COMMS records the rendering condition, state-handling decision and game limits. Source handoff only. No installation, package or live game run.
+
+## 2026-11-17 Pacific — Cross-review of depth correction
+
+Cort requested a reciprocal review. Astra asked Fable in COMMS to review DX11 PR #162 at a561d9e (12/12 Release tests). Astra reviewed Fable's DX12 2db2250. The original fixture and shader checks passed on the RTX, but narrow hardware/WARP probes reproduced premature twin activation, descriptor semantics changes, residual viewport-expansion error, and injected query/work duplication. COMMS carries the measurements, DX12 corrections and local reproduction path. Fable owns DX12 fixes. No deployment or gameplay test.
