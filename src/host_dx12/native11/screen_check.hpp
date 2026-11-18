@@ -57,6 +57,14 @@ public:
 
     bool Verified(Id color, Id depth) const { return color_ == color && depth_ == depth && !!verified_; }
     bool Matches(Reader reader) const { return reader == verified_; }
+    uint64_t Proof() const { return verified_ ? proof_ : 0; }
+
+    bool RejectProof(uint64_t proof)
+    {
+        if (!proof || proof != Proof()) return false;
+        RetireVerified();
+        return true;
+    }
     bool MayInspect() const
     {
         return verified_ || (!ordinary_this_frame_ && ordinary_gaps_ >= kOrdinaryGrace);
@@ -167,10 +175,7 @@ public:
             const bool overwritten = delivered_this_frame_ && scene_draws != delivered_draws_;
             delivered_this_frame_ = false;
             if (overwritten || (missed && recent_miss_)) {
-                Reject(verified_);
-                verified_ = {};
-                ordinary_gaps_ = 0;
-                ResetAttempt();
+                RetireVerified();
                 return "lost_coverage";
             }
             if (missed) recent_miss_ = screen_marker::kSession;
@@ -214,6 +219,7 @@ public:
         const bool intermittent = sampled_all && (follow_ || invert_) && !confirmed;
         if (confirmed) {
             verified_ = candidate_;
+            proof_ = ++next_proof_;
             ++confirmed_;
         } else {
             Reject(candidate_);
@@ -330,6 +336,14 @@ private:
         rejected_.push_back(reader);
     }
 
+    void RetireVerified()
+    {
+        Reject(verified_);
+        verified_ = {};
+        ordinary_gaps_ = 0;
+        ResetAttempt();
+    }
+
     void ResetAttempt()
     {
         candidate_ = {};
@@ -350,6 +364,8 @@ private:
     UINT samples_ = 0, follow_ = 0, invert_ = 0, flat_ = 0;
     static constexpr uint32_t kOrdinaryGrace = 4;
     uint64_t opened_ = 0;
+    static inline uint64_t next_proof_ = 0; // all provider screen state is under the frame lock
+    uint64_t proof_ = 0;
     uint32_t issued_ = 0, reader_draws_ = 0, recent_miss_ = 0, delivered_draws_ = 0;
     uint32_t ordinary_gaps_ = 0, ordinary_draws_ = 0;
     bool marked_ = false, seen_ = false;

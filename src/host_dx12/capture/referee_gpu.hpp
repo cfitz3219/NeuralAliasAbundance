@@ -58,6 +58,8 @@ void Discard(uint32_t token, bool may_still_run);
 bool NeedsScreen(Presentation frame);
 void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec);
 void InvalidatePresentation(const void* swapchain);
+// Consume a visual rollback decision scoped to a native DX11 screen proof.
+uint64_t TakeNativeScreenLoss(const void* swapchain);
 
 struct Stats {
     uint64_t samples = 0, pairs = 0, screens = 0, logged = 0;

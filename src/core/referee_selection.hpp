@@ -27,6 +27,7 @@ struct Context {
     Placement placement;
     uint64_t color = 0, depth = 0, generation = 0;
     uint32_t subresource = 0, width = 0, height = 0;
+    uint64_t native_screen_proof = 0;
 
     bool SameScene(const Context& other) const
     {
@@ -36,7 +37,8 @@ struct Context {
     bool operator==(const Context& other) const
     {
         return placement == other.placement && color == other.color && depth == other.depth &&
-               generation == other.generation && subresource == other.subresource && width == other.width && height == other.height;
+               generation == other.generation && subresource == other.subresource && width == other.width && height == other.height &&
+               native_screen_proof == other.native_screen_proof;
     }
 };
 
@@ -59,6 +61,17 @@ struct DeliveryContinuity {
     }
 };
 
+enum class ScreenVote { Unknown, Input, Output };
+
+inline ScreenVote VoteScreen(const SampleScore& score)
+{
+    const uint32_t decided = score.tiles_input + score.tiles_output;
+    if (score.tiles_textured < 4 || decided < 4 || decided * 2 < score.tiles_textured) return ScreenVote::Unknown;
+    if (score.tiles_input * 4 >= decided * 3) return ScreenVote::Input;
+    if (score.tiles_output * 4 >= decided * 3) return ScreenVote::Output;
+    return ScreenVote::Unknown;
+}
+
 struct Evidence {
     Context context;
     Window measured;
@@ -69,10 +82,8 @@ struct Evidence {
     void Add(const SampleScore& score, Placement observed = {})
     {
         measured.Add(score);
-        const uint32_t decided = score.tiles_output + score.tiles_input;
-        if (score.tiles_textured < 4 || decided < 4 || decided * 2 < score.tiles_textured ||
-            score.tiles_input * 4 < decided * 3 ||
-            observed.path == Path::None || observed == context.placement) return;
+        if (VoteScreen(score) != ScreenVote::Input || observed.path == Path::None ||
+            observed == context.placement) return;
         if (alternative_votes && !(alternative == observed)) alternatives_disagree = true;
         alternative = observed;
         ++alternative_votes;

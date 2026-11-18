@@ -316,6 +316,7 @@ bool FailSession(Session& s, const char* why)
 void SyncCameraUse()
 {
     native11::SetDepthReads(settings::Get().j2_depth_reads.load(std::memory_order_relaxed) != 0);
+    native11::SetEvaluationPaused(!j2::Enabled() || j2::Paused());
     const int setting = settings::Get().j2_camera.load(std::memory_order_relaxed);
     native11::SetCameraUse(setting == 0 ? native11::CameraUse::Off : setting == 2 ? native11::CameraUse::Required
                                                                                 : native11::CameraUse::Optional);
@@ -631,7 +632,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.dlss_mv_lowres = !eval.mv_display_res;
         const referee::shadow::Context identity{
             {referee::shadow::Path::Native11, static_cast<uint64_t>(frame.boundary)},
-            frame.color.incarnation, frame.depth.incarnation, frame.scene_stream, csub};
+            frame.color.incarnation, frame.depth.incarnation, frame.scene_stream, csub, 0, 0, frame.screen_proof};
         capture_token = capture::j2::RecordReferee(list, planes, id, eval.render_w, eval.render_h, eval.out_w, eval.out_h, identity);
     } else if (evaluated && eval.reset) {
         referee::gpu::NotifyEvaluationReset();
@@ -817,6 +818,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
 
 void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
 {
+    if (const auto lost_proof = referee::gpu::TakeNativeScreenLoss(swap))
+        native11::RejectScreenProof(lost_proof);
     const bool eval = evaluation_capture_pending.exchange(false, std::memory_order_acq_rel);
     const bool burst = capture::Pending();
     if (!eval && !burst && !settings::Get().referee_enabled.load(std::memory_order_relaxed)) return;

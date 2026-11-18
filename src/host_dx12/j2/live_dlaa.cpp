@@ -3,6 +3,7 @@
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/j2/camera_interloper.hpp"
 #include "host_dx12/j2/game_motion.hpp"
 #include "host_dx12/j2/late_input.hpp"
@@ -8252,6 +8253,8 @@ void SetPaused(bool paused)
 {
     if (!paused && g.paused.load()) { std::lock_guard<std::mutex> lock(g.m); g.resume_reset = true; }
     g.paused.store(paused);
+    // The next DX11 draws can precede Present. Resume watching uploads now.
+    na::native11::SetEvaluationPaused(paused || !g.enabled.load());
 }
 bool Paused() { return g.paused.load(); }
 bool RecordNativeRcas(ID3D12Device* device, ID3D12GraphicsCommandList* list,

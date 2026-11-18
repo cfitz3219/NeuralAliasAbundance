@@ -102,6 +102,7 @@ struct SceneFrame {
     // The scene's own identity: stays while the colour and depth objects stay. A camera buffer that
     // changes, appears or goes does not move it (it moves `stream`, which the camera's consumer reads).
     uint64_t scene_stream = 0;
+    uint64_t screen_proof = 0;     // current verified reader, or zero for ordinary placement
     bool scene_changed = false;    // scene_stream differs from the previous fired frame
     Boundary boundary = Boundary::BeforeRead;
     uint32_t scene_draws = 0;      // scene draws this frame before the boundary
@@ -146,6 +147,7 @@ struct ProviderStats {
 bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present = false);
 // The hosted path receives DXGI events through the overlay's existing hooks.
 void SetScreenCheck(bool on);
+void RejectScreenProof(uint64_t proof);
 bool ObservePresent(void* swapchain);
 void BeforeResize(void* swapchain);
 void AfterResize(void* swapchain, long result);
@@ -186,6 +188,7 @@ void SetDepthReads(bool enabled);
 // Live: takes effect on the next frame, either way round.
 enum class CameraUse : uint8_t { Required = 0, Optional = 1, Off = 2 };
 void SetCameraUse(CameraUse use);
+void SetEvaluationPaused(bool paused);
 ProviderStats Stats();
 int FormatStatus(char* out, unsigned long n); // one status line: "native11 frames= fired= ..."
 

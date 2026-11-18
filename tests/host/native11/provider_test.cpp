@@ -358,7 +358,7 @@ void Viewport(ID3D11DeviceContext* c, UINT w, UINT h)
 }
 
 
-void Scene(ID3D11DeviceContext* c, Game& g, int frame)
+void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
 {
     g_tonemap_bound = false;
     if (g.rotate_camera) g.cam_cb = g.cam_pool[frame & 1];
@@ -390,7 +390,7 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     c->PSSetShader(g.ps_scene.Get(), nullptr, 0);
     for (int i = 0; i < 20; ++i) { SetObject(c, g, i); c->Draw(4, 0); }
     // Main scene.
-    UploadCamera(c, g, MainVp(frame), true);
+    UploadCamera(c, g, no_pose ? na::camera::Matrix{} : MainVp(frame), true);
     ID3D11RenderTargetView* rt = g.on_screen ? g.back_rtv.Get() : g.color_rtv.Get();
     ID3D11RenderTargetView* layers[2] = {g.layer_rtv.Get(), g.layer2_rtv.Get()};
     if (g.layered) c->OMSetRenderTargets(2, layers, g.dsv.Get());
@@ -849,15 +849,17 @@ int ScreenCheckFixture(Game& game)
         Game& game;
         bool ordinary = true;
         uint64_t writes = 0;
+        uint64_t proof = 0;
     } evaluator{game};
     auto consume = [](void* user, void* context, const na::native11::SceneFrame& frame) {
         auto& state = *static_cast<Evaluator*>(user);
         auto& g = state.game;
-        if (!state.ordinary && !na::native11::Stats().screen_confirmed) return false;
+        if (!state.ordinary && !frame.screen_proof) return false;
         if (frame.color.d3d11_resource != g.color.Get() || frame.depth.d3d11_resource != g.depth.Get()) return false;
         const float replacement[]{.75f, .25f, .125f, 1.f};
         static_cast<ID3D11DeviceContext*>(context)->ClearRenderTargetView(g.color_rtv.Get(), replacement);
         ++state.writes;
+        state.proof = frame.screen_proof;
         return true;
     };
     if (!na::native11::Install(game.device.Get(), consume, &evaluator)) return 1;
@@ -873,9 +875,9 @@ int ScreenCheckFixture(Game& game)
     struct Presented {
         bool processed = false, clean_decoy = false;
     };
-    auto frame = [&](bool other, bool bypass = false) {
+    auto frame = [&](bool other, bool bypass = false, bool no_pose = false) {
         Pump();
-        Scene(game.ctx.Get(), game, 0);
+        Scene(game.ctx.Get(), game, 0, no_pose);
         game.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         game.ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
         reader(decoy.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
@@ -896,7 +898,7 @@ int ScreenCheckFixture(Game& game)
         const bool processed = std::abs(int(shown[0]) - 143) <= 2 &&
                                std::abs(int(shown[1]) - 48) <= 2 &&
                                std::abs(int(shown[2]) - 24) <= 2;
-        expect(SUCCEEDED(game.swap->Present(0, 0)), "present the fixture frame");
+        if (FAILED(game.swap->Present(0, 0))) expect(false, "present the fixture frame");
         return Presented{processed, std::abs(int(decoy_pixel[0]) - 191) > 5};
     };
 
@@ -959,6 +961,40 @@ int ScreenCheckFixture(Game& game)
     expect(restored_shown == 48 && evaluator.writes == writes_before + 48 &&
            final.screen_delivered == fallback.screen_delivered && final.screen_confirmed == confirmed.screen_confirmed,
            "fallback preserves every presented frame and does not take over again");
+    na::native11::SetScreenCheck(false);
+    frame(false);
+    na::native11::SetScreenCheck(true);
+    evaluator.ordinary = false;
+    for (int i = 0; i < 40; ++i) frame(false);
+    const auto proof = evaluator.proof;
+    expect(proof != 0, "the accepted reader tags its actual evaluations");
+    const auto before_reject = na::native11::Stats();
+    na::native11::RejectScreenProof(proof + 1);
+    expect(frame(false).processed && na::native11::Stats().screen_delivered == before_reject.screen_delivered + 1,
+           "another reader's result cannot retire the current proof");
+    na::native11::RejectScreenProof(proof);
+    evaluator.ordinary = true;
+    expect(frame(false).processed && evaluator.proof == 0,
+           "a visible-delivery rejection returns placement to the ordinary route");
+
+    na::native11::SetScreenCheck(false);
+    const auto before_pause = na::native11::Stats();
+    na::native11::SetEvaluationPaused(true);
+    for (int i = 0; i < 16; ++i) frame(false);
+    const auto paused = na::native11::Stats();
+    expect(paused.camera_found == before_pause.camera_found && paused.camera_missing == before_pause.camera_missing,
+           "the camera search stays completely idle while paused");
+    na::native11::SetEvaluationPaused(false);
+    int measured_shown = 0;
+    for (int i = 0; i < 32; ++i) measured_shown += frame(false, false, true).processed;
+    const auto measured = na::native11::Stats();
+    const auto searches = measured.camera_missing - paused.camera_missing;
+    expect(searches == 8 && measured_shown == 32, "failed optional searches back off while the consumer still delivers");
+    for (int i = 0; i < 124; ++i) frame(false);
+    expect(na::native11::Stats().camera_found > measured.camera_found,
+           "optional search recovers automatically when the camera returns");
+    std::printf("native DX11 camera budget: paused searches=0, optional searches=%llu/32, displayed=%d/32\n",
+                (unsigned long long)searches, measured_shown);
     std::printf("native DX11 screen check: ordinary=%d/48 alternating=%d/48 bypass=%d/48 cold_start=%llu restored=%d/48\n",
                 ordinary_shown, alternating_shown, bypass_shown, (unsigned long long)deliveries, restored_shown);
     na::native11::Uninstall();
@@ -1488,8 +1524,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     expect(g_seen.jitter_reported == jitter_off, "jitter switch stops changing future WWII camera uploads");
     na::j2::SetPaused(true);
     const auto paused = evaluations;
+    const auto before_pause = na::native11::Stats();
     for (int i = 0; i < 3; ++i) present_campaign();
+    const auto in_pause = na::native11::Stats();
     expect(evaluations == paused, "DLAA switch stops native evaluations");
+    expect(in_pause.camera_found == before_pause.camera_found && in_pause.camera_missing == before_pause.camera_missing,
+           "DLAA switch stops camera search before the next campaign draw");
     na::j2::SetPaused(false);
     present_campaign();
     expect(evaluations > paused, "DLAA switch resumes native evaluations");
