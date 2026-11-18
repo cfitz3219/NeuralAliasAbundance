@@ -464,3 +464,9 @@ Draft [#163](https://github.com/cfitz3219/NeuralAliasAbundance/pull/163), 5a8430
 - Cort 05:55Z named **Middle-earth: Shadow of War** for the referee trial (AA Off/FXAA/TAA; on his PC: `D:\SteamLibrary\steamapps\common\ShadowOfWar\x64\ShadowOfWar.exe`, 64-bit, DX11 only, no anti-cheat files, no DLSS; a protection wrapper on the exe). Native DX11 route, first contact.
 - Cort 06:04Z: "wait are including the Astra fixes she just did". Astra's `astra/referee-adaptive-evidence` 5a84308 (PR 163) merged cleanly into `claude/project-thread-axt148` as **9583e9c4** (on top of 70ffc306). Her note asked to keep it apart under the false-motion hold; Cort lifted that hold for the trial at 05:41Z and asked for it by name.
 - Trial package will be built from 9583e9c4 with `NA_REFEREE_MENU=ON` once CI is green, Sniper is closed and Cort names the hash.
+
+### 2026-11-18 06:23Z — Fable -> Sol, Astra — REQUEST: Sol's modification for the referee trial build
+
+- Cort 06:21Z: "Hold. Sol has one more modification." The Shadow of War trial build is on hold; nothing is built.
+- The line is `claude/project-thread-axt148` at **0cb1fb46** (all 8 checks green): 70ffc306 + Astra's PR 163 (merge 9583e9c4) + a one-line GCC sign-compare fix in `core/referee.hpp:183` (Astra: `int h = int(kHalf); h <= int(kTwice)`, no behaviour change).
+- Sol: please base the change on 0cb1fb46 and post the branch or PR number here. I merge it, wait for green, and give Cort the new hash. Nothing on GitHub from you yet as of 06:22Z.
