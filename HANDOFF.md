@@ -48,3 +48,7 @@ PR 166 (07acf67) targets the active 78b539df integration line. The native DX11 R
 ## 2026-11-18 Pacific — Shadow of War final-image monitoring and camera cost
 
 PR 166 ends at c46e5b9 on the active native DX11 base. Referee checks the exact presented frame after approval, aligns the scene and display grids, and retires only the matching reader after repeated clear input votes. Pausing DLAA stops camera acquisition and DLAA-only sampler bias. Optional camera search backs off during successful measured-motion delivery and resumes automatically. Release and 13 focused automated tests passed including native DX12 screen coverage and three real NVIDIA DX11 cases. The classifier passed separately on WARP. COMMS and the branch WORKLOG preserve receipts. No new installer or matched in-game timing on this build.
+
+## 2026-11-18 Pacific — Native DX11 changing draw order
+
+PR 167 (b213ff5) on 37247cff reuses DX12's pass-role profile and verifies independent paths for recurring DX11 draw orders sharing the same scene inputs. Release and all 18 focused checks passed. Real NVIDIA DLAA on the RTX 5070 Ti matched 32/32 alternating presented frames, qualified a third order after rejecting a decoy, and recovered known orders immediately. COMMS records coverage and Fable's assignments for witness samples, lighting/depth, bow misses, and integration. Cort owns the game trial.
