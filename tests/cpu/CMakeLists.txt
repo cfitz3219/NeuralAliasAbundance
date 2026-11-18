@@ -66,6 +66,8 @@ na_add_cpu_test(screen_motion)
 set_tests_properties(na.cpu.screen_motion PROPERTIES TIMEOUT 120)
 # The captures folder's budget: oldest folders first, never the run in progress.
 na_add_cpu_test(capture_retention)
+# Scene depth with the raster jitter taken back out, for the game's own shader reads (far marks and lamp pools that switch with the jitter).
+na_add_cpu_test(depth_unjitter)
 # Draw replay's vertex budget: about the budget a frame, the same draws in adjacent frames.
 na_add_cpu_test(replay_budget)
 na_add_cpu_test(replay_movers)
