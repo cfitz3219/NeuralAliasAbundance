@@ -1099,7 +1099,7 @@ void DiagnoseCameraMiss()
 // before the list / HUD draw that holds it). Under g_mu (`lk`), on the immediate context's thread,
 // before the read is forwarded. g_mu is let go during the callback so the game's other threads never
 // wait behind it; the facts handed over are copies or references we hold.
-void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary)
+void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary, bool verified_reader = false)
 {
     ++g_stats.fired;
     SetSceneHanded(true); // whatever the outcome below, the game's scene draws for this frame are over
@@ -1423,6 +1423,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     lk.lock();
     if (!ok) ++g_stats.missed;
+    else if (g_frame == f.frame && g_screen_enabled.load(std::memory_order_relaxed))
+        g_screen.NoteDelivery(verified_reader, f.scene_draws);
 }
 
 CameraUpload CaptureUpload(const void* data, size_t size, uint32_t first_constant, bool windowed)
@@ -2174,7 +2176,7 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     std::unique_lock<std::mutex> lock(g_mu);
     const auto& scene = g_model.Current();
     const auto draws = g_model.SceneDrawsThisFrame();
-    if (!draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
+    if (!g_screen.MayInspect() || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
         scene.color == g_backbuffer || !g_swap || x->raster_queries ||
         IdOf(g_color_ref.Get()) != scene.color || g_color_view.mip || g_color_view.slice) return {};
     ResourceInfo output{};
@@ -2212,9 +2214,7 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
         if (g_screen.Verified(scene.color, scene.depth)) {
             if (!g_screen.Matches(reader) || g_model.FiredThisFrame()) return {};
             g_model.MarkFired();
-            const auto missed = g_stats.missed;
-            Fire(c, lock, Boundary::BeforeRead);
-            g_screen.NoteDelivery(g_stats.missed == missed && g_frame_fired, draws);
+            Fire(c, lock, Boundary::BeforeRead, true);
             StopViewportJitterAfterScene();
             return {};
         }
@@ -2669,11 +2669,9 @@ bool OnPresent(IDXGISwapChain* swap)
             game->GetImmediateContext(&context);
             swap->GetBuffer(0, IID_PPV_ARGS(&screen));
         }
-        bool confirmed, refuted;
-        g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), confirmed, refuted);
-        if (confirmed || refuted)
+        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame()))
             na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
-                               confirmed ? "confirmed" : "refuted", (unsigned long long)g_screen.Paired(),
+                               outcome, (unsigned long long)g_screen.Paired(),
                                (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
     } else g_screen.SetScene(0, 0);
     ++g_frame;

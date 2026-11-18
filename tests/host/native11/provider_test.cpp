@@ -804,14 +804,14 @@ int ScreenCheckFixture(Game& game)
         ComPtr<ID3D11Texture2D> picture;
         ComPtr<ID3D11RenderTargetView> rtv;
         ComPtr<ID3D11ShaderResourceView> srv;
-    } decoy, canvas;
+    } decoy, canvas, other_canvas;
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = game.w;
     desc.Height = game.h;
     desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    for (auto* surface : {&decoy, &canvas}) {
+    for (auto* surface : {&decoy, &canvas, &other_canvas}) {
         if (FAILED(game.device->CreateTexture2D(&desc, nullptr, &surface->picture)) ||
             FAILED(game.device->CreateRenderTargetView(surface->picture.Get(), nullptr, &surface->rtv)) ||
             FAILED(game.device->CreateShaderResourceView(surface->picture.Get(), nullptr, &surface->srv))) return 1;
@@ -845,16 +845,22 @@ int ScreenCheckFixture(Game& game)
         return rgba;
     };
 
+    struct Evaluator {
+        Game& game;
+        bool ordinary = true;
+        uint64_t writes = 0;
+    } evaluator{game};
     auto consume = [](void* user, void* context, const na::native11::SceneFrame& frame) {
-        auto& g = *static_cast<Game*>(user);
-        if (!na::native11::Stats().screen_confirmed) return false;
+        auto& state = *static_cast<Evaluator*>(user);
+        auto& g = state.game;
+        if (!state.ordinary && !na::native11::Stats().screen_confirmed) return false;
         if (frame.color.d3d11_resource != g.color.Get() || frame.depth.d3d11_resource != g.depth.Get()) return false;
         const float replacement[]{.75f, .25f, .125f, 1.f};
         static_cast<ID3D11DeviceContext*>(context)->ClearRenderTargetView(g.color_rtv.Get(), replacement);
+        ++state.writes;
         return true;
     };
-    if (!na::native11::Install(game.device.Get(), consume, &game)) return 1;
-    na::native11::SetScreenCheck(true);
+    if (!na::native11::Install(game.device.Get(), consume, &evaluator)) return 1;
     na::native11::SetCameraUse(na::native11::CameraUse::Optional);
     // The synthetic quads use the opposite winding to the default cull state.
     D3D11_RASTERIZER_DESC raster{};
@@ -864,37 +870,83 @@ int ScreenCheckFixture(Game& game)
     ComPtr<ID3D11RasterizerState> visible;
     if (FAILED(game.device->CreateRasterizerState(&raster, &visible))) return 1;
     game.ctx->RSSetState(visible.Get());
-    uint64_t deliveries = 0;
-    for (int frame = 0; frame < 72; ++frame) {
+    struct Presented {
+        bool processed = false, clean_decoy = false;
+    };
+    auto frame = [&](bool other) {
         Pump();
         Scene(game.ctx.Get(), game, 0);
         game.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         game.ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
         reader(decoy.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
-        const auto unprocessed = read(decoy.picture.Get());
-        reader(canvas.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
-        reader(game.back_rtv.Get(), canvas.srv.Get(), composite.Get());
+        const auto decoy_pixel = read(decoy.picture.Get());
+        auto& target = other ? other_canvas : canvas;
+        reader(target.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
+        reader(game.back_rtv.Get(), target.srv.Get(), composite.Get());
+        ComPtr<ID3D11Texture2D> screen;
+        if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) {
+            expect(false, "read the fixture backbuffer");
+            return Presented{};
+        }
+        const auto shown = read(screen.Get());
+        const bool processed = std::abs(int(shown[0]) - 143) <= 2 &&
+                               std::abs(int(shown[1]) - 48) <= 2 &&
+                               std::abs(int(shown[2]) - 24) <= 2;
+        expect(SUCCEEDED(game.swap->Present(0, 0)), "present the fixture frame");
+        return Presented{processed, std::abs(int(decoy_pixel[0]) - 191) > 5};
+    };
+
+    for (int i = 0; i < 16; ++i) frame(false);
+    na::native11::SetScreenCheck(true);
+    int ordinary_shown = 0;
+    for (int i = 0; i < 48; ++i) ordinary_shown += frame((i & 1) != 0).processed;
+    expect(ordinary_shown == 48 && na::native11::Stats().screen_confirmed == 0,
+           "the ordinary route reaches the screen on every frame with Referee and alternating readers");
+
+    evaluator.ordinary = false;
+    int alternating_shown = 0;
+    for (int i = 0; i < 48; ++i) alternating_shown += frame((i & 1) != 0).processed;
+    const auto alternating = na::native11::Stats();
+    expect(alternating_shown == 0 && alternating.screen_confirmed == 0 && alternating.screen_refuted == 1,
+           "an alternating reader cannot take over during fallback discovery");
+
+    na::native11::SetScreenCheck(false);
+    frame(false);
+    na::native11::SetScreenCheck(true);
+    uint64_t deliveries = 0;
+    for (int i = 0; i < 72; ++i) {
+        const auto result = frame(false);
         const auto stats = na::native11::Stats();
         if (stats.screen_delivered > deliveries) {
-            if (stats.screen_delivered != deliveries + 1) expect(false, "verified reader delivers once");
-            ComPtr<ID3D11Texture2D> screen;
-            if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) return 1;
-            const auto shown = read(screen.Get());
-            if (std::abs(int(shown[0]) - 143) > 2 || std::abs(int(shown[1]) - 48) > 2 || std::abs(int(shown[2]) - 24) > 2)
-                expect(false, "presented pixels contain the evaluator's output after the game's composite");
-            if (read(decoy.picture.Get()) != unprocessed || std::abs(int(unprocessed[0]) - 191) <= 5)
-                expect(false, "the decoy remains unprocessed");
+            expect(stats.screen_delivered == deliveries + 1, "verified reader delivers once");
+            expect(result.processed, "presented pixels contain the evaluator output after the game's composite");
+            expect(result.clean_decoy, "the decoy stays unprocessed");
             ++deliveries;
+        } else {
+            expect(!deliveries, "the verified reader stays active when the scene is stable");
         }
-        if (FAILED(game.swap->Present(0, 0))) return 1;
     }
-    const auto stats = na::native11::Stats();
-    std::printf("native DX11 screen check: confirmed=%llu refuted=%llu paired=%llu pixel_verified_frames=%llu\n",
-                (unsigned long long)stats.screen_confirmed, (unsigned long long)stats.screen_refuted,
-                (unsigned long long)stats.screen_pairs, (unsigned long long)deliveries);
-    expect(stats.screen_confirmed == 1 && stats.screen_refuted == 1 && stats.screen_pairs == 16,
-           "screen proof rejects the decoy and confirms the real reader");
-    expect(deliveries >= 20, "native DLAA handoff delivers continuously after confirmation");
+    const auto confirmed = na::native11::Stats();
+    expect(confirmed.screen_confirmed == 1 && confirmed.screen_refuted == alternating.screen_refuted + 1 &&
+           confirmed.screen_pairs == alternating.screen_pairs + 16,
+           "screen proof rejects the decoy and confirms the visible reader");
+    expect(deliveries >= 20, "the verified reader can deliver continuously when the ordinary route cannot");
+
+    evaluator.ordinary = true;
+    // The learned reader now disappears on every other frame. After two spaced
+    // misses the ordinary route must take over and keep all later frames.
+    for (int i = 0; i < 4; ++i) frame((i & 1) != 0);
+    const auto fallback = na::native11::Stats();
+    expect(fallback.screen_delivered == deliveries + 2, "verified reader is retired on its second spaced miss");
+    const auto writes_before = evaluator.writes;
+    int restored_shown = 0;
+    for (int i = 0; i < 48; ++i) restored_shown += frame((i & 1) != 0).processed;
+    const auto final = na::native11::Stats();
+    expect(restored_shown == 48 && evaluator.writes == writes_before + 48 &&
+           final.screen_delivered == fallback.screen_delivered && final.screen_confirmed == confirmed.screen_confirmed,
+           "fallback preserves every presented frame and does not take over again");
+    std::printf("native DX11 screen check: ordinary=%d/48 alternating=%d/48 cold_start=%llu restored=%d/48\n",
+                ordinary_shown, alternating_shown, (unsigned long long)deliveries, restored_shown);
     na::native11::Uninstall();
     return g_failed ? 1 : 0;
 }

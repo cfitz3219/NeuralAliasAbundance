@@ -40,11 +40,17 @@ public:
         depth_ = depth;
         verified_ = {};
         rejected_.clear();
+        ordinary_gaps_ = 0;
+        ordinary_this_frame_ = false;
         ResetAttempt();
     }
 
     bool Verified(Id color, Id depth) const { return color_ == color && depth_ == depth && !!verified_; }
     bool Matches(Reader reader) const { return reader == verified_; }
+    bool MayInspect() const
+    {
+        return verified_ || (!ordinary_this_frame_ && ordinary_gaps_ >= kOrdinaryGrace);
+    }
     bool AwaitingSamples() const { return !!candidate_; }
     uint64_t Confirmed() const { return confirmed_; }
     uint64_t Refuted() const { return refuted_; }
@@ -54,9 +60,14 @@ public:
     Mark Begin(ID3D11DeviceContext* context, Reader reader, ID3D11Texture2D* source,
                DXGI_FORMAT view_format, uint64_t frame, uint32_t scene_draws)
     {
-        if (verified_ || marked_ || issued_ == screen_marker::kSession ||
+        if (verified_ || marked_ ||
             std::find(rejected_.begin(), rejected_.end(), reader) != rejected_.end()) return {};
         if (candidate_ && !(reader == candidate_)) return {};
+        if (candidate_ && !seen_) {
+            seen_ = true;
+            reader_draws_ = scene_draws;
+        }
+        if (issued_ == screen_marker::kSession) return {};
 
         D3D11_TEXTURE2D_DESC desc{};
         source->GetDesc(&desc);
@@ -88,9 +99,8 @@ public:
         // The marker goes in the source before the draw, so a merely bound but
         // unused SRV cannot earn a vote. Restore the original texels after the draw.
         immediate->ClearView(marker_view_.Get(), rgba, mark.rects.data(), UINT(mark.rects.size()));
-        marked_ = true;
-        marked_frame_ = frame;
-        marked_draws_ = scene_draws;
+        marked_ = seen_ = true;
+        reader_draws_ = scene_draws;
         ++issued_;
         return mark;
     }
@@ -104,31 +114,61 @@ public:
         }
     }
 
-    void NoteDelivery(bool delivered, uint32_t scene_draws)
+    void NoteDelivery(bool by_verified_reader, uint32_t scene_draws)
     {
-        if (delivered) {
+        if (by_verified_reader) {
             delivered_this_frame_ = true;
             delivered_draws_ = scene_draws;
             ++delivered_;
+        } else {
+            ordinary_this_frame_ = true;
+            ordinary_draws_ = scene_draws;
         }
     }
 
-    void Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
-                 uint32_t scene_draws, bool& confirmed, bool& refuted)
+    const char* Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
+                        uint32_t scene_draws)
     {
-        confirmed = refuted = false;
-        if (verified_) {
-            if (delivered_this_frame_) {
-                misses_ = 0;
-                if (scene_draws != delivered_draws_) verified_ = {};
-            } else if (++misses_ >= 16) verified_ = {};
-            delivered_this_frame_ = false;
-            if (!verified_) { rejected_.clear(); ResetAttempt(); }
-            return;
+        const bool ordinary_completed = ordinary_this_frame_ && ordinary_draws_ == scene_draws;
+        ordinary_this_frame_ = false;
+        if (ordinary_completed) {
+            ordinary_gaps_ = 0;
+            if (candidate_ || verified_) {
+                verified_ = {};
+                ResetAttempt();
+                return "ordinary_restored";
+            }
+            return nullptr;
         }
-        if (!candidate_ || !context || !screen) { marked_ = false; return; }
-        Collect(context);
-        if (marked_ && frame == marked_frame_ && scene_draws == marked_draws_) {
+        if (scene_draws && ordinary_gaps_ < kOrdinaryGrace) ++ordinary_gaps_;
+
+        if (verified_) {
+            // An eligible success ages a previous miss instead of erasing it. A
+            // reader delivering every other frame must lose control promptly.
+            const bool missed = !delivered_this_frame_ && scene_draws;
+            const bool overwritten = delivered_this_frame_ && scene_draws != delivered_draws_;
+            delivered_this_frame_ = false;
+            if (overwritten || (missed && recent_miss_)) {
+                Reject(verified_);
+                verified_ = {};
+                ordinary_gaps_ = 0;
+                ResetAttempt();
+                return "lost_coverage";
+            }
+            if (missed) recent_miss_ = screen_marker::kSession;
+            else if (scene_draws && recent_miss_) --recent_miss_;
+            return nullptr;
+        }
+        if (!candidate_) return nullptr;
+        // Only a reader seen at the right point on every scene frame can earn
+        // control. The staging samples may finish later than those draws.
+        if (scene_draws && (!seen_ || reader_draws_ != scene_draws)) {
+            Reject(candidate_);
+            ResetAttempt();
+            return "intermittent";
+        }
+        if (context) Collect(context);
+        if (marked_ && scene_draws && context && screen) {
             D3D11_TEXTURE2D_DESC desc{};
             screen->GetDesc(&desc);
             auto slot = std::find_if(slots_.begin(), slots_.end(), [](const auto& s) { return !s.pending; });
@@ -146,24 +186,21 @@ public:
                 }
             }
         }
-        marked_ = false;
-        if (issued_ < screen_marker::kSession && frame - opened_ < 32) return;
-        if (std::any_of(slots_.begin(), slots_.end(), [](const auto& slot) { return slot.pending; }) &&
-            frame - opened_ < 32) return;
+        marked_ = seen_ = false;
+        if (frame - opened_ < 32 && (issued_ < screen_marker::kSession ||
+            std::any_of(slots_.begin(), slots_.end(), [](const auto& slot) { return slot.pending; }))) return nullptr;
         const auto outcome = votes_.ResultOf();
-        if (outcome == Vote::Result::Reached) {
+        const bool confirmed = issued_ == screen_marker::kSession && outcome == Vote::Result::Reached;
+        const bool refuted = outcome == Vote::Result::Discarded;
+        if (confirmed) {
             verified_ = candidate_;
-            confirmed = true;
             ++confirmed_;
         } else {
-            // Mixed/unavailable samples cannot establish a route. Try the
-            // next consumer of this scene rather than weighing a guess.
-            if (rejected_.size() >= 16) rejected_.erase(rejected_.begin());
-            rejected_.push_back(candidate_);
-            refuted = outcome == Vote::Result::Discarded;
+            Reject(candidate_);
             if (refuted) ++refuted_;
         }
         ResetAttempt();
+        return confirmed ? "confirmed" : refuted ? "refuted" : "inconclusive";
     }
 
 private:
@@ -258,15 +295,21 @@ private:
         }
     }
 
+    void Reject(Reader reader)
+    {
+        if (rejected_.size() >= 16) rejected_.erase(rejected_.begin());
+        rejected_.push_back(reader);
+    }
+
     void ResetAttempt()
     {
         candidate_ = {};
         slots_ = {};
         original_.Reset();
         marker_view_.Reset();
-        issued_ = misses_ = 0;
+        issued_ = recent_miss_ = 0;
         votes_ = {};
-        marked_ = have_previous_ = delivered_this_frame_ = false;
+        marked_ = seen_ = have_previous_ = delivered_this_frame_ = false;
     }
 
     Id color_ = 0, depth_ = 0;
@@ -277,9 +320,12 @@ private:
     std::array<Slot, 6> slots_{};
     Vote votes_;
     Sample previous_{};
-    uint64_t opened_ = 0, marked_frame_ = 0;
-    uint32_t issued_ = 0, marked_draws_ = 0, misses_ = 0, delivered_draws_ = 0;
-    bool marked_ = false, have_previous_ = false, delivered_this_frame_ = false;
+    static constexpr uint32_t kOrdinaryGrace = 4;
+    uint64_t opened_ = 0;
+    uint32_t issued_ = 0, reader_draws_ = 0, recent_miss_ = 0, delivered_draws_ = 0;
+    uint32_t ordinary_gaps_ = 0, ordinary_draws_ = 0;
+    bool marked_ = false, seen_ = false, have_previous_ = false;
+    bool delivered_this_frame_ = false, ordinary_this_frame_ = false;
     uint64_t confirmed_ = 0, refuted_ = 0, paired_ = 0, delivered_ = 0;
 };
 
