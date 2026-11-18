@@ -44,6 +44,7 @@
 #endif
 
 #include <d3d11_4.h>
+#include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
@@ -88,6 +89,22 @@ float4 vs_post(uint id : SV_VertexID) : SV_Position {
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
+Texture2D<float> test_depth : register(t1);
+RWTexture2D<float> mask_out : register(u0);
+float4 vs_depth_ramp(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2((id << 1) & 2, id & 2) * 2 - 1;
+    return float4(p, 0.45 + 0.05 * p.x + 0.13 * p.y, 1);
+}
+float slab(uint2 pixel) {
+    float2 p = float2(pixel) + 0.5;
+    float expected = 0.45 + 0.05 * (p.x / 160.0 - 1) + 0.13 * (1 - p.y / 90.0);
+    return abs(test_depth.Load(int3(pixel, 0)) - expected) < 0.00010 ? 1 : 0;
+}
+float ps_depth_slab(float4 p : SV_Position) : SV_Target { return slab(uint2(p.xy)); }
+[numthreads(8, 8, 1)]
+void cs_depth_slab(uint3 id : SV_DispatchThreadID) {
+    if (id.x < 320 && id.y < 180) mask_out[id.xy] = slab(id.xy);
+}
 SamplerState material : register(s0);
 float4 ps_mips(float4 p : SV_Position) : SV_Target {
     return scene.SampleGrad(material, float2(0.5, 0.5), float2(2.0/64.0,0), float2(0,2.0/64.0));
@@ -127,6 +144,7 @@ struct Game {
     ComPtr<IDXGISwapChain> swap;
     HWND wnd = nullptr;
     UINT w = 320, h = 180;
+    bool shader_depth = false;
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
     uint32_t camera_ring_offset = 24576;
@@ -178,7 +196,15 @@ bool MakeTargets(Game& g)
     d.SampleDesc.Count = 1;
     d.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     d.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.depth)) || FAILED(g.device->CreateDepthStencilView(g.depth.Get(), nullptr, &g.dsv))) return false;
+    D3D11_DEPTH_STENCIL_VIEW_DESC depth_view{};
+    depth_view.Format = DXGI_FORMAT_D32_FLOAT;
+    depth_view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (g.shader_depth) {
+        d.Format = DXGI_FORMAT_R32_TYPELESS;
+        d.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    }
+    if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.depth)) ||
+        FAILED(g.device->CreateDepthStencilView(g.depth.Get(), g.shader_depth ? &depth_view : nullptr, &g.dsv))) return false;
     d.Format = kSceneFormat;
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.color)) || FAILED(g.device->CreateRenderTargetView(g.color.Get(), nullptr, &g.color_rtv)) ||
@@ -187,7 +213,7 @@ bool MakeTargets(Game& g)
     return true;
 }
 
-bool MakeGame(Game& g, bool warp)
+bool MakeGame(Game& g, bool warp, bool debug = false)
 {
     WNDCLASSW wc{};
     wc.lpfnWndProc = DefWindowProcW;
@@ -206,9 +232,9 @@ bool MakeGame(Game& g, bool warp)
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     const D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &sd,
-                                             &g.swap, &g.device, nullptr, &g.ctx)))
-        return false;
+    const UINT flags = debug ? D3D11_CREATE_DEVICE_DEBUG : 0;
+    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+            &fl, 1, D3D11_SDK_VERSION, &sd, &g.swap, &g.device, nullptr, &g.ctx))) return false;
     D3D11_TEXTURE2D_DESC d{};
     d.Width = d.Height = 512;
     d.MipLevels = d.ArraySize = 1;
@@ -369,7 +395,7 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame)
     else c->OMSetRenderTargets(1, &rt, g.dsv.Get());
     const float clear[4] = {0.1f, 0.2f, 0.3f, 1.f};
     c->ClearRenderTargetView(rt, clear);
-    c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
+    c->ClearDepthStencilView(g.dsv.Get(), g.shader_depth ? D3D11_CLEAR_DEPTH : D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
     Viewport(c, g.w, g.h);
     if (g.campaign_split_camera) BindSplitCamera(c, g);
     for (int i = 0; i < 40; ++i) {
@@ -598,6 +624,177 @@ bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
 
 } // namespace
 
+#if !defined(NA_TEST_NATIVE_DLAA)
+int DepthReadFixture(Game& g, bool debug_layer)
+{
+    const auto ramp = Compile("vs_depth_ramp", "vs_5_0");
+    const auto slab = Compile("ps_depth_slab", "ps_5_0");
+    const auto compute = Compile("cs_depth_slab", "cs_5_0");
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11ComputeShader> cs;
+    ComPtr<ID3D11RasterizerState> raster;
+    D3D11_RASTERIZER_DESC raster_desc{};
+    raster_desc.FillMode = D3D11_FILL_SOLID;
+    raster_desc.CullMode = D3D11_CULL_NONE;
+    raster_desc.DepthClipEnable = TRUE;
+    D3D11_DEPTH_STENCIL_DESC no_test{};
+    no_test.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    no_test.FrontFace = no_test.BackFace = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP,
+                                           D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_ALWAYS};
+    if (!ramp || !slab || !compute ||
+        FAILED(g.device->CreateVertexShader(ramp->GetBufferPointer(), ramp->GetBufferSize(), nullptr, &vs)) ||
+        FAILED(g.device->CreatePixelShader(slab->GetBufferPointer(), slab->GetBufferSize(), nullptr, &ps)) ||
+        FAILED(g.device->CreateComputeShader(compute->GetBufferPointer(), compute->GetBufferSize(), nullptr, &cs)) ||
+        FAILED(g.device->CreateDepthStencilState(&no_test, &g.depth_off)) ||
+        FAILED(g.device->CreateRasterizerState(&raster_desc, &raster))) return 1;
+    D3D11_SHADER_RESOURCE_VIEW_DESC read{};
+    read.Format = DXGI_FORMAT_R32_FLOAT;
+    read.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    read.Texture2D.MipLevels = 1;
+    ComPtr<ID3D11ShaderResourceView> original, copy_view;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    dsv.Flags = D3D11_DSV_READ_ONLY_DEPTH;
+    ComPtr<ID3D11DepthStencilView> read_only;
+    if (FAILED(g.device->CreateShaderResourceView(g.depth.Get(), &read, &original)) ||
+        FAILED(g.device->CreateDepthStencilView(g.depth.Get(), &dsv, &read_only))) return 1;
+    D3D11_TEXTURE2D_DESC desc{};
+    g.depth->GetDesc(&desc);
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> copy, mask, staging;
+    if (FAILED(g.device->CreateTexture2D(&desc, nullptr, &copy)) ||
+        FAILED(g.device->CreateShaderResourceView(copy.Get(), &read, &copy_view))) return 1;
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+    ComPtr<ID3D11RenderTargetView> mask_rtv;
+    ComPtr<ID3D11UnorderedAccessView> mask_uav;
+    if (FAILED(g.device->CreateTexture2D(&desc, nullptr, &mask)) ||
+        FAILED(g.device->CreateRenderTargetView(mask.Get(), nullptr, &mask_rtv)) ||
+        FAILED(g.device->CreateUnorderedAccessView(mask.Get(), nullptr, &mask_uav))) return 1;
+    desc.BindFlags = 0;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(g.device->CreateTexture2D(&desc, nullptr, &staging))) return 1;
+    const auto read_mask = [&] {
+        g.ctx->CopyResource(staging.Get(), mask.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(g.ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return -1.f;
+        const auto* row = static_cast<const uint8_t*>(mapped.pData) + 67 * mapped.RowPitch;
+        const float result = reinterpret_cast<const float*>(row)[173];
+        g.ctx->Unmap(staging.Get(), 0);
+        return result;
+    };
+    int frame = 0;
+    for (; frame < 40; ++frame) {
+        Scene(g.ctx.Get(), g, frame);
+        Post(g.ctx.Get(), g, true);
+        g.swap->Present(0, 0);
+    }
+    expect(g_seen.calls != 0, "the provider learned the scene with shader-readable depth");
+    na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+    ComPtr<ID3D11Query> raster_query;
+    const D3D11_QUERY_DESC query_desc{D3D11_QUERY_OCCLUSION, 0};
+    if (FAILED(g.device->CreateQuery(&query_desc, &raster_query))) return 1;
+    const auto render = [&](float jitter, bool enable, bool use_compute, bool use_copy, bool defer, bool query = false) {
+        na::native11::SetDepthReads(enable);
+        na::native11::SetNextJitter(-jitter, jitter);
+        g.swap->Present(0, 0);
+        Scene(g.ctx.Get(), g, frame++);
+        g.ctx->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH, 1.f, 0);
+        g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.ctx->RSSetState(raster.Get());
+        g.ctx->VSSetShader(vs.Get(), nullptr, 0);
+        g.ctx->PSSetShader(g.ps_scene.Get(), nullptr, 0);
+        g.ctx->Draw(3, 0);
+        if (defer) {
+            ComPtr<ID3D11DeviceContext> deferred;
+            ComPtr<ID3D11CommandList> list;
+            if (FAILED(g.device->CreateDeferredContext(0, &deferred)) ||
+                FAILED(deferred->FinishCommandList(FALSE, &list))) return -1.f;
+            g.ctx->ExecuteCommandList(list.Get(), TRUE);
+        }
+        if (use_copy) g.ctx->CopyResource(copy.Get(), g.depth.Get());
+        auto* view = use_copy ? copy_view.Get() : original.Get();
+        auto* target = mask_rtv.Get();
+        g.ctx->OMSetDepthStencilState(g.depth_off.Get(), 0);
+        Viewport(g.ctx.Get(), g.w, g.h);
+        if (use_compute) {
+            g.ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            auto* uav = mask_uav.Get();
+            g.ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            g.ctx->CSSetShaderResources(1, 1, &view);
+            g.ctx->CSSetShader(cs.Get(), nullptr, 0);
+            g.ctx->Dispatch(40, 23, 1);
+            ComPtr<ID3D11ShaderResourceView> bound;
+            g.ctx->CSGetShaderResources(1, 1, &bound);
+            expect(bound.Get() == view, "compute still sees its original SRV after dispatch");
+            uav = nullptr;
+            g.ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            view = nullptr;
+            g.ctx->CSSetShaderResources(1, 1, &view);
+        } else {
+            g.ctx->OMSetRenderTargets(1, &target, read_only.Get());
+            g.ctx->PSSetShaderResources(1, 1, &view);
+            g.ctx->PSSetShader(ps.Get(), nullptr, 0);
+            if (query) g.ctx->Begin(raster_query.Get());
+            g.ctx->Draw(3, 0);
+            if (query) g.ctx->End(raster_query.Get());
+            ComPtr<ID3D11ShaderResourceView> bound;
+            ComPtr<ID3D11DepthStencilView> bound_depth;
+            g.ctx->PSGetShaderResources(1, 1, &bound);
+            g.ctx->OMGetRenderTargets(0, nullptr, &bound_depth);
+            expect(bound.Get() == view && bound_depth.Get() == read_only.Get(), "the draw restores the game's SRV and read-only DSV");
+            view = nullptr;
+            g.ctx->PSSetShaderResources(1, 1, &view);
+            g.ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        }
+        const float result = read_mask();
+        g.ctx->OMSetDepthStencilState(nullptr, 0);
+        Post(g.ctx.Get(), g, true);
+        return result;
+    };
+    const float raw_zero = render(0.f, false, false, false, false);
+    const float raw_positive = render(.375f, false, false, false, false);
+    const float raw_negative = render(-.375f, false, false, false, false);
+    const float corrected_positive = render(.375f, true, false, false, false);
+    const float corrected_negative = render(-.375f, true, false, false, false);
+    const float corrected_compute = render(.375f, true, true, false, false);
+    const float corrected_copy = render(.375f, true, false, true, false);
+    const float deferred = render(.375f, true, false, false, true);
+    const float queried = render(.375f, true, false, false, false, true);
+    std::printf("depth slab: vanilla=%g jittered=%g,%g corrected=%g,%g compute=%g copy=%g deferred=%g\n",
+                double(raw_zero), double(raw_positive), double(raw_negative), double(corrected_positive),
+                double(corrected_negative), double(corrected_compute), double(corrected_copy), double(deferred));
+    expect(raw_zero == 1.f && raw_positive == 0.f && raw_negative == 0.f, "actual viewport jitter causes the slab to disappear");
+    if (debug_layer) {
+        expect(corrected_positive == raw_positive && corrected_negative == raw_negative &&
+               corrected_compute == raw_positive && corrected_copy == raw_positive,
+               "the debug wrapper preserves the original depth for all consumers");
+    } else {
+        expect(corrected_positive == 1.f && corrected_negative == 1.f, "depth shader reads preserve the unjittered slab at both offsets");
+        expect(corrected_compute == 1.f && corrected_copy == 1.f, "dispatch and compatible depth copies get the corrected values");
+    }
+    expect(deferred == raw_positive, "an external deferred list leaves the game's depth reads alone");
+    expect(queried == raw_positive, "the correction does not add work to an active game occlusion query");
+    ComPtr<ID3D11InfoQueue> debug;
+    if (SUCCEEDED(g.device.As(&debug))) {
+        for (UINT64 index = 0; index < debug->GetNumStoredMessages(); ++index) {
+            SIZE_T size = 0;
+            if (FAILED(debug->GetMessage(index, nullptr, &size))) continue;
+            std::vector<uint8_t> data(size);
+            auto* message = reinterpret_cast<D3D11_MESSAGE*>(data.data());
+            if (SUCCEEDED(debug->GetMessage(index, message, &size)) && message->Severity <= D3D11_MESSAGE_SEVERITY_ERROR)
+                expect(false, message->pDescription);
+        }
+    }
+    na::native11::SetDepthReads(false);
+    na::native11::Uninstall();
+    return g_failed ? 1 : 0;
+}
+#endif
+
 int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 {
 #if defined(NA_TEST_NATIVE_DLAA)
@@ -637,9 +834,17 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #endif
     Game g;
     bool warp = false;
-    if (!MakeGame(g, false)) {
+    const bool depth_warp = argc > 1 && std::strcmp(argv[1], "--depth-reads-warp") == 0;
+    const bool depth_debug = argc > 1 && std::strcmp(argv[1], "--depth-reads-debug") == 0;
+    const bool depth_reads = depth_warp || depth_debug || (argc > 1 && std::strcmp(argv[1], "--depth-reads") == 0);
+    g.shader_depth = depth_reads;
+    if (depth_warp || depth_debug || !MakeGame(g, false)) {
         g = Game{};
-        if (!MakeGame(g, true)) { std::printf("SKIP: no DX11 device\n"); return 77; }
+        g.shader_depth = depth_reads;
+        if (!MakeGame(g, true, depth_debug)) {
+            std::printf("SKIP: no %s DX11 device\n", depth_debug ? "debug-layer" : "WARP");
+            return 77;
+        }
         warp = true;
     }
     std::printf("device: %s\n", warp ? "WARP" : "hardware");
@@ -697,6 +902,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #endif
     expect(installed, "the provider's hooks install on the game's device");
     if (!installed) return 1;
+#if !defined(NA_TEST_NATIVE_DLAA)
+    if (depth_reads) return DepthReadFixture(g, depth_debug);
+#endif
 #if defined(NA_TEST_NATIVE_DLAA)
     if (camera_off_start) {
         // Cold start: no earlier camera-backed frame, no hand-written next jitter, no warm flow pair.

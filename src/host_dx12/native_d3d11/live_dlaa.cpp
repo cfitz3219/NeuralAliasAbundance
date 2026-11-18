@@ -315,6 +315,7 @@ bool FailSession(Session& s, const char* why)
 
 void SyncCameraUse()
 {
+    native11::SetDepthReads(settings::Get().j2_depth_reads.load(std::memory_order_relaxed) != 0);
     const int setting = settings::Get().j2_camera.load(std::memory_order_relaxed);
     native11::SetCameraUse(setting == 0 ? native11::CameraUse::Off : setting == 2 ? native11::CameraUse::Required
                                                                                 : native11::CameraUse::Optional);

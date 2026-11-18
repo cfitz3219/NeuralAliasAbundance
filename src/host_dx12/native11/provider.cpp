@@ -32,6 +32,7 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/depth_direction.hpp"
+#include "host_dx12/native11/depth_reads.hpp"
 #include "host_dx12/native11/frame_model.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
@@ -45,6 +46,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -65,7 +67,8 @@ enum CtxSlot : uint32_t {
     kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kPSSetConstantBuffers = 16, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
     kDrawIndexedInstanced = 20, kDrawInstanced = 21, kVSSetShaderResources = 25, kOMSetRenderTargets = 33,
     kOMSetRenderTargetsAndUAVs = 34, kOMSetDepthStencilState = 36, kDrawIndexedInstancedIndirect = 39,
-    kDrawInstancedIndirect = 40, kRSSetViewports = 44, kCopySubresourceRegion = 46, kCopyResource = 47, kUpdateSubresource = 48,
+    kBegin = 27, kEnd = 28, kDrawInstancedIndirect = 40, kDrawAuto = 38, kDispatch = 41, kDispatchIndirect = 42,
+    kRSSetViewports = 44, kCopySubresourceRegion = 46, kCopyResource = 47, kUpdateSubresource = 48,
     kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
     kClearState = 110, kFinishCommandList = 114,
     // ID3D11DeviceContext1
@@ -135,6 +138,65 @@ constexpr size_t kMaxListEvents = 200000; // per deferred recording; beyond this
 constexpr size_t kMaxCandidates = 8;       // constant buffers searched for the camera (VS and PS)
 constexpr size_t kMaxLists = 512;          // recorded command lists kept
 
+enum class DepthStage : size_t { Pixel, Vertex, Compute };
+constexpr UINT kDepthSlots = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+std::atomic<bool> g_depth_reads_enabled{false};
+struct DepthReads {
+    std::bitset<kDepthSlots> slots[3];
+    std::unique_ptr<DepthReadTwin> twin;
+    Id resource = 0;
+    uint32_t frame = 0;
+    uint64_t sample = 0;
+    bool cleared = false, seen = false, mixed = false, dirty = true, deferred = false, expanded = false;
+    const char* logged = nullptr;
+
+    void Start(uint32_t ordinal, Id depth)
+    {
+        if (frame == ordinal && resource == depth) return;
+        if (resource != depth) twin.reset();
+        frame = ordinal;
+        resource = depth;
+        sample = 0;
+        cleared = seen = mixed = deferred = expanded = false;
+        dirty = true;
+    }
+    void Report(const char* state, const char* reason)
+    {
+        if (logged && std::strcmp(logged, reason) == 0) return;
+        logged = reason;
+        na::eventlog::Emit("depth_reads", "variant=depth-reads/twin api=dx11 state=%s why=\"%s\"", state, reason);
+    }
+    void Write(uint64_t raster_sample, bool full_viewport)
+    {
+        if (!raster_sample || !full_viewport || (seen && sample != raster_sample)) mixed = true;
+        sample = raster_sample;
+        expanded = full_viewport;
+        seen = dirty = true;
+    }
+    bool Refresh(ID3D11DeviceContext* context, ID3D11Resource* depth)
+    {
+        if (deferred || mixed) {
+            Report("refused", deferred ? "deferred game work in this frame" : "mixed or unqualified depth writes");
+            return false;
+        }
+        if (!cleared || !seen) {
+            Report("filling", "waiting for a clear and viewport-jittered scene depth writes");
+            return false;
+        }
+        if (!dirty) return true;
+        if (!twin) twin = std::make_unique<DepthReadTwin>();
+        float offset[2];
+        std::memcpy(offset, &sample, sizeof offset);
+        if (!twin->Refresh(context, depth, offset[0], offset[1], expanded)) {
+            Report("refused", twin->Reason());
+            return false;
+        }
+        dirty = false;
+        Report("on", twin->Reason());
+        return true;
+    }
+};
+
 struct Ctx {
     bool game = false; // a context of the game's device
     uint32_t gen = 0;  // the game-device generation that answer was given in
@@ -145,6 +207,9 @@ struct Ctx {
     Id rt0 = 0, depth = 0;
     uint8_t rt_count = 0;              // render targets bound together
     bool depth_test = true;
+    bool depth_read_only = false;
+    uint32_t raster_queries = 0;
+    DepthReads depth_reads;
     uint8_t depth_func = kCompareLess; // the bound state's comparison when it tests AND writes depth, else 0 (default state: LESS, writing)
     Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
     uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
@@ -176,6 +241,8 @@ struct Ctx {
         rt0 = depth = 0;
         rt_count = 0;
         depth_test = true;
+        depth_read_only = false;
+        for (auto& mask : depth_reads.slots) mask.reset();
         depth_func = kCompareLess;
         std::memset(cb, 0, sizeof(cb));
         std::memset(cb_first, 0, sizeof(cb_first));
@@ -432,6 +499,8 @@ Ctx* Get(ID3D11DeviceContext* c)
             if (is && !was) g_ctx_became_game.fetch_add(1, std::memory_order_relaxed);
             // What was remembered belongs to the other device's objects.
             slot->reset_state();
+            slot->depth_reads = {};
+            slot->raster_queries = 0;
             slot->events.clear();
             slot->cb_bytes.clear();
             slot->mapped.clear();
@@ -459,6 +528,9 @@ using PFN_Draw = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using PFN_DrawIndexedInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
 using PFN_DrawInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
 using PFN_DrawIndirect = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+using PFN_DrawAuto = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*);
+using PFN_Dispatch = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT);
+using PFN_Query = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Asynchronous*);
 using PFN_Map = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
 using PFN_Unmap = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
 using PFN_OMSetRT = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
@@ -489,6 +561,10 @@ struct Originals {
     PFN_DrawIndexedInstanced draw_indexed_instanced = nullptr;
     PFN_DrawInstanced draw_instanced = nullptr;
     PFN_DrawIndirect draw_indexed_indirect = nullptr, draw_indirect = nullptr;
+    PFN_DrawAuto draw_auto = nullptr;
+    PFN_Dispatch dispatch = nullptr;
+    PFN_DrawIndirect dispatch_indirect = nullptr;
+    PFN_Query begin = nullptr, end = nullptr;
     PFN_Map map = nullptr;
     PFN_Unmap unmap = nullptr;
     PFN_OMSetRT om_rt = nullptr;
@@ -1645,10 +1721,10 @@ ExactSet ExactForDraw(ID3D11DeviceContext* c, Ctx* x)
     return x->exact_set;
 }
 
-void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
+Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
 {
     Ctx* x = Get(c);
-    if (!x) return;
+    if (!x) return nullptr;
     VpjBeforeDraw(c, x);
     const auto refresh_samplers = [&] {
         const uint64_t policy = SamplerPolicyKey();
@@ -1698,6 +1774,7 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     if ((picture_draw || layer_draw) && !CameraOff()) exact = ExactForDraw(c, x); // camera bytes: not read when no camera is looked for
     Emit(x, c, e, {}, exact);
     if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
+    return x;
 }
 // The scene colour first met through a read, before any bind as a render target: its view as read.
 ViewUse SrvUse(ID3D11ShaderResourceView* v)
@@ -1721,21 +1798,27 @@ bool Watched(Id r, Id color)
         if (w.load(std::memory_order_relaxed) == r) return true;
     return false;
 }
-void ReadEvents(ID3D11DeviceContext* c, UINT n, ID3D11ShaderResourceView* const* views)
+void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID3D11ShaderResourceView* const* views)
 {
     Ctx* x = Get(c);
-    if (!x || !views) return;
+    if (!x) return;
+    auto& depth_slots = x->depth_reads.slots[static_cast<size_t>(stage)];
+    const bool track_depth = !x->deferred && g_depth_reads_enabled.load(std::memory_order_relaxed);
+    if (!track_depth && !views) return;
+    const Id depth = track_depth ? g_sel_depth.load(std::memory_order_relaxed) : 0;
     const Id color = g_sel_color.load(std::memory_order_relaxed);
-    if (!color && !g_watch[0].load(std::memory_order_relaxed)) return;
+    if (!depth && !color && !g_watch[0].load(std::memory_order_relaxed)) return;
     Id sent[kWatch + 1] = {};
     size_t sent_n = 0;
     for (UINT i = 0; i < n; ++i) {
-        if (!views[i]) continue;
         Id r = 0;
-        {
+        if (views && views[i]) {
             Inside in;
             r = ResourceOfView(views[i]);
         }
+        if (track_depth && start < kDepthSlots && i < kDepthSlots - start)
+            depth_slots.set(start + i, r && r == depth);
+        if (!r || sent_n == kWatch + 1) continue;
         if (!Watched(r, color)) continue;
         bool again = false;
         for (size_t k = 0; k < sent_n; ++k) again = again || sent[k] == r;
@@ -1756,7 +1839,7 @@ void ReadEvents(ID3D11DeviceContext* c, UINT n, ID3D11ShaderResourceView* const*
         e.resource = r;
         Emit(x, c, e);
         if (sent_n < kWatch + 1) sent[sent_n++] = r;
-        if (sent_n == kWatch + 1) return;
+        if (sent_n == kWatch + 1 && !track_depth) return;
     }
 }
 void ReadResource(ID3D11DeviceContext* c, ID3D11Resource* src)
@@ -1921,7 +2004,7 @@ void STDMETHODCALLTYPE PSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT sta
 }
 void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
-    ReadEvents(c, n, v);
+    ReadEvents(c, DepthStage::Pixel, start, n, v);
     // Material textures: a published replacement is bound in place of the game's view (textures.hpp).
     ID3D11ShaderResourceView* swapped[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
     Ctx* x = Get(c); // null inside our own work and on other devices' contexts: bound as given
@@ -1931,43 +2014,183 @@ void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start
 }
 void STDMETHODCALLTYPE CSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
-    ReadEvents(c, n, v);
+    ReadEvents(c, DepthStage::Compute, start, n, v);
     O(c, t_inside ? nullptr : Get(c)).cs_srv(c, start, n, v);
 }
 void STDMETHODCALLTYPE VSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
-    ReadEvents(c, n, v);
+    ReadEvents(c, DepthStage::Vertex, start, n, v);
     O(c, t_inside ? nullptr : Get(c)).vs_srv(c, start, n, v);
 }
+Id DepthReadsSource(Ctx* state)
+{
+    return state && !state->deferred && g_depth_reads_enabled.load(std::memory_order_relaxed) &&
+        g_vpj_route.load(std::memory_order_relaxed) ? g_sel_depth.load(std::memory_order_relaxed) : 0;
+}
+
+bool CountsRasterWork(ID3D11Asynchronous* object)
+{
+    ComPtr<ID3D11Query> query;
+    if (!object || FAILED(object->QueryInterface(IID_PPV_ARGS(&query)))) return false;
+    D3D11_QUERY_DESC desc{};
+    query->GetDesc(&desc);
+    return desc.Query == D3D11_QUERY_OCCLUSION || desc.Query == D3D11_QUERY_OCCLUSION_PREDICATE ||
+           desc.Query == D3D11_QUERY_PIPELINE_STATISTICS;
+}
+
+void STDMETHODCALLTYPE Begin_d(ID3D11DeviceContext* c, ID3D11Asynchronous* object)
+{
+    Ctx* x = Get(c);
+    if (x && !x->deferred && CountsRasterWork(object)) ++x->raster_queries;
+    O(c, x).begin(c, object);
+}
+
+void STDMETHODCALLTYPE End_d(ID3D11DeviceContext* c, ID3D11Asynchronous* object)
+{
+    Ctx* x = Get(c);
+    O(c, x).end(c, object);
+    if (x && x->raster_queries && CountsRasterWork(object)) --x->raster_queries;
+}
+
+class DepthBindings {
+public:
+    DepthBindings(ID3D11DeviceContext* context, Ctx* state, Id depth, bool compute)
+        : context_(context), state_(state)
+    {
+        if (!depth || (state->depth == depth && !state->depth_read_only)) return;
+        auto& reads = state->depth_reads;
+        reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+        if (!reads.seen) return;
+        if (reads.dirty && state->raster_queries) {
+            reads.Report("refused", "a game raster query is active");
+            return;
+        }
+        Inside own;
+        if (compute) Bind(DepthStage::Compute);
+        else {
+            Bind(DepthStage::Pixel);
+            Bind(DepthStage::Vertex);
+        }
+    }
+    ~DepthBindings()
+    {
+        if (!count_) return;
+        Inside own;
+        while (count_) {
+            const auto& saved = slots_[--count_];
+            Set(saved.stage, saved.slot, saved.view);
+            saved.view->Release();
+        }
+    }
+    DepthBindings(const DepthBindings&) = delete;
+    DepthBindings& operator=(const DepthBindings&) = delete;
+
+private:
+    void Set(DepthStage stage, UINT slot, ID3D11ShaderResourceView* view)
+    {
+        const auto& original = O(context_, state_);
+        const auto set = stage == DepthStage::Pixel ? original.ps_srv :
+                         stage == DepthStage::Vertex ? original.vs_srv : original.cs_srv;
+        set(context_, slot, 1, &view);
+    }
+    void Bind(DepthStage stage)
+    {
+        auto& reads = state_->depth_reads;
+        const auto& mask = reads.slots[static_cast<size_t>(stage)];
+        if (mask.none()) return;
+        for (UINT slot = 0; slot < kDepthSlots; ++slot) {
+            if (!mask.test(slot)) continue;
+            ComPtr<ID3D11ShaderResourceView> original;
+            if (stage == DepthStage::Pixel) context_->PSGetShaderResources(slot, 1, &original);
+            else if (stage == DepthStage::Vertex) context_->VSGetShaderResources(slot, 1, &original);
+            else context_->CSGetShaderResources(slot, 1, &original);
+            if (!original) continue;
+            D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+            original->GetDesc(&view);
+            if (view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || view.Texture2D.MostDetailedMip != 0 ||
+                (view.Texture2D.MipLevels != 1 && view.Texture2D.MipLevels != UINT(-1)) ||
+                (view.Format != DXGI_FORMAT_R32_FLOAT && view.Format != DXGI_FORMAT_R16_UNORM &&
+                 view.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS && view.Format != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS))
+                continue;
+            ComPtr<ID3D11Resource> resource;
+            original->GetResource(&resource);
+            if (IdOf(resource.Get()) != reads.resource) continue;
+            if (!reads.Refresh(context_, resource.Get())) return;
+            if (auto* twin = reads.twin->ViewFor(original.Get())) {
+                Set(stage, slot, twin);
+                slots_[count_++] = {stage, slot, original.Detach()};
+            }
+        }
+    }
+    struct Slot { DepthStage stage; UINT slot; ID3D11ShaderResourceView* view; };
+    ID3D11DeviceContext* context_;
+    Ctx* state_;
+    Slot slots_[kDepthSlots * 2];
+    size_t count_ = 0;
+};
+
+template<class Forward>
+void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, Forward forward)
+{
+    const Id depth = DepthReadsSource(state);
+    if (!depth) { forward(); return; }
+    auto& reads = state->depth_reads;
+    const bool has_binding = dispatch ? reads.slots[static_cast<size_t>(DepthStage::Compute)].any() :
+        (reads.slots[static_cast<size_t>(DepthStage::Pixel)] | reads.slots[static_cast<size_t>(DepthStage::Vertex)]).any();
+    if (has_binding && (state->depth != depth || state->depth_read_only)) {
+        DepthBindings bindings(context, state, depth, dispatch);
+        forward();
+    } else forward();
+    if (!dispatch && state->depth == depth && !state->depth_read_only && state->depth_func) {
+        reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+        reads.Write(state->vpj_applied ? state->vpj_sample : 0, state->vpj_applied && state->vpj_expanded);
+    }
+}
+
 void STDMETHODCALLTYPE DrawIndexed_d(ID3D11DeviceContext* c, UINT count, UINT start, INT base)
 {
-    DrawEvent(c, count, false);
-    O(c, t_inside ? nullptr : Get(c)).draw_indexed(c, count, start, base);
+    Ctx* x = DrawEvent(c, count, false);
+    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_indexed(c, count, start, base); });
 }
 void STDMETHODCALLTYPE Draw_d(ID3D11DeviceContext* c, UINT count, UINT start)
 {
-    DrawEvent(c, count, false);
-    O(c, t_inside ? nullptr : Get(c)).draw(c, count, start);
+    Ctx* x = DrawEvent(c, count, false);
+    ForwardDepthRead(c, x, false, [&] { O(c, x).draw(c, count, start); });
 }
 void STDMETHODCALLTYPE DrawIndexedInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
 {
-    DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
-    O(c, t_inside ? nullptr : Get(c)).draw_indexed_instanced(c, count, inst, start, base, start_inst);
+    Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
+    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
 }
 void STDMETHODCALLTYPE DrawInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, UINT start_inst)
 {
-    DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
-    O(c, t_inside ? nullptr : Get(c)).draw_instanced(c, count, inst, start, start_inst);
+    Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
+    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_instanced(c, count, inst, start, start_inst); });
 }
 void STDMETHODCALLTYPE DrawIndexedInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
-    DrawEvent(c, 0, true);
-    O(c, t_inside ? nullptr : Get(c)).draw_indexed_indirect(c, b, off);
+    Ctx* x = DrawEvent(c, 0, true);
+    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_indexed_indirect(c, b, off); });
 }
 void STDMETHODCALLTYPE DrawInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
-    DrawEvent(c, 0, true);
-    O(c, t_inside ? nullptr : Get(c)).draw_indirect(c, b, off);
+    Ctx* x = DrawEvent(c, 0, true);
+    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_indirect(c, b, off); });
+}
+void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
+{
+    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? DrawEvent(c, 0, true) : nullptr;
+    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_auto(c); });
+}
+void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
+{
+    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? Get(c) : nullptr;
+    ForwardDepthRead(c, x, true, [&] { O(c, x).dispatch(c, x_groups, y_groups, z_groups); });
+}
+void STDMETHODCALLTYPE DispatchIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT offset)
+{
+    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? Get(c) : nullptr;
+    ForwardDepthRead(c, x, true, [&] { O(c, x).dispatch_indirect(c, args, offset); });
 }
 HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m)
 {
@@ -2039,6 +2262,8 @@ void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11
     if (JitterUpload(tmp.data(), tmp.size(), IdOf(r))) src = tmp.data(); // the game's upload, jittered
     CbUpdate(c, r, tmp.data(), tmp.size());
 }
+void InvalidateDepthWrite(Ctx* context, ID3D11Resource* resource);
+
 void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub, const D3D11_BOX* box, const void* src, UINT rp,
                                            UINT dp)
 {
@@ -2046,6 +2271,7 @@ void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resourc
     std::vector<uint8_t> tmp;
     UpdateCommon(c, x, r, box, src, tmp);
     O(c, x).update(c, r, sub, box, src, rp, dp);
+    InvalidateDepthWrite(x, r);
 }
 void STDMETHODCALLTYPE UpdateSubresource1_d(ID3D11DeviceContext1* c, ID3D11Resource* r, UINT sub, const D3D11_BOX* box, const void* src,
                                             UINT rp, UINT dp, UINT flags)
@@ -2054,6 +2280,7 @@ void STDMETHODCALLTYPE UpdateSubresource1_d(ID3D11DeviceContext1* c, ID3D11Resou
     std::vector<uint8_t> tmp;
     UpdateCommon(c, x, r, box, src, tmp);
     O(c, x).update1(c, r, sub, box, src, rp, dp, flags);
+    InvalidateDepthWrite(x, r);
 }
 ViewUse RtvUse(ID3D11RenderTargetView* v)
 {
@@ -2066,10 +2293,11 @@ ViewUse RtvUse(ID3D11RenderTargetView* v)
     else if (d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY) u.slice = d.Texture2DMSArray.FirstArraySlice;
     return u;
 }
-ViewUse DsvUse(ID3D11DepthStencilView* v)
+ViewUse DsvUse(ID3D11DepthStencilView* v, bool* read_only = nullptr)
 {
     D3D11_DEPTH_STENCIL_VIEW_DESC d{};
     v->GetDesc(&d);
+    if (read_only) *read_only = (d.Flags & D3D11_DSV_READ_ONLY_DEPTH) != 0;
     ViewUse u;
     u.format = d.Format;
     if (d.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D) u.mip = d.Texture2D.MipSlice;
@@ -2082,10 +2310,11 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
     ID3D11Resource* rt = nullptr;
     ID3D11Resource* ds = nullptr;
     ViewUse rt_use, ds_use;
+    x->depth_read_only = false;
     {
         Inside in;
         if (n && rtvs && rtvs[0]) { rtvs[0]->GetResource(&rt); rt_use = RtvUse(rtvs[0]); }
-        if (dsv) { dsv->GetResource(&ds); ds_use = DsvUse(dsv); }
+        if (dsv) { dsv->GetResource(&ds); ds_use = DsvUse(dsv, &x->depth_read_only); }
     }
     x->rt0 = IdOf(rt);
     x->depth = IdOf(ds);
@@ -2163,21 +2392,50 @@ void STDMETHODCALLTYPE RSSetViewports_d(ID3D11DeviceContext* c, UINT n, const D3
     }
     O(c, x).rs_vp(c, n, v);
 }
+void InvalidateDepthWrite(Ctx* context, ID3D11Resource* resource)
+{
+    const Id depth = DepthReadsSource(context);
+    if (!depth || IdOf(resource) != depth) return;
+    auto& reads = context->depth_reads;
+    reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+    reads.mixed = true;
+}
+
+ID3D11Resource* DepthCopySource(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* dst, ID3D11Resource* src)
+{
+    const Id depth = DepthReadsSource(x);
+    if (!depth || IdOf(src) != depth || dst == src) return src;
+    auto& reads = x->depth_reads;
+    reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+    if (reads.dirty && x->raster_queries) return src;
+    Inside own;
+    if (!reads.Refresh(c, src)) return src;
+    auto* twin = reads.twin->SourceForCopy(dst);
+    return twin ? twin : src;
+}
+
 void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y0, UINT z0, ID3D11Resource* src,
                                                UINT ss, const D3D11_BOX* box)
 {
     ReadResource(c, src);
-    O(c, t_inside ? nullptr : Get(c)).copy_region(c, dst, ds, x0, y0, z0, src, ss, box);
+    Ctx* x = Get(c);
+    auto* source = !ds && !ss && !x0 && !y0 && !z0 && !box ? DepthCopySource(c, x, dst, src) : src;
+    O(c, x).copy_region(c, dst, ds, x0, y0, z0, source, ss, box);
+    InvalidateDepthWrite(x, dst);
 }
 void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src)
 {
     ReadResource(c, src);
-    O(c, t_inside ? nullptr : Get(c)).copy_resource(c, dst, src);
+    Ctx* x = Get(c);
+    O(c, x).copy_resource(c, dst, DepthCopySource(c, x, dst, src));
+    InvalidateDepthWrite(x, dst);
 }
 void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT f)
 {
     ReadResource(c, src);
-    O(c, t_inside ? nullptr : Get(c)).resolve(c, dst, ds, src, ss, f);
+    Ctx* x = Get(c);
+    O(c, x).resolve(c, dst, ds, src, ss, f);
+    InvalidateDepthWrite(x, dst);
 }
 void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT flags, FLOAT d, UINT8 s)
 {
@@ -2193,6 +2451,13 @@ void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11Dep
         e.resource = id;
         e.clear_depth = d;
         Emit(x, c, e);
+        if (id && id == DepthReadsSource(x)) {
+            auto& reads = x->depth_reads;
+            reads.Start(g_exact_frame.load(std::memory_order_relaxed), id);
+            reads.cleared = true;
+            reads.seen = reads.mixed = false;
+            reads.dirty = true;
+        }
     }
     O(c, x).clear_dsv(c, v, flags, d, s);
 }
@@ -2237,6 +2502,11 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
 void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11CommandList* list, BOOL restore)
 {
     Ctx* x = Get(c);
+    if (const Id depth = list ? DepthReadsSource(x) : 0) {
+        auto& reads = x->depth_reads;
+        reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+        reads.deferred = true;
+    }
     if (x && !x->deferred && list) {
         std::unique_lock<std::mutex> l(g_mu);
         auto it = g_lists.find(list);
@@ -2564,6 +2834,11 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
         {kDrawInstanced, reinterpret_cast<void*>(&DrawInstanced_d), reinterpret_cast<void**>(&o.draw_instanced)},
         {kDrawIndexedInstancedIndirect, reinterpret_cast<void*>(&DrawIndexedInstancedIndirect_d), reinterpret_cast<void**>(&o.draw_indexed_indirect)},
         {kDrawInstancedIndirect, reinterpret_cast<void*>(&DrawInstancedIndirect_d), reinterpret_cast<void**>(&o.draw_indirect)},
+        {kDrawAuto, reinterpret_cast<void*>(&DrawAuto_d), reinterpret_cast<void**>(&o.draw_auto)},
+        {kDispatch, reinterpret_cast<void*>(&Dispatch_d), reinterpret_cast<void**>(&o.dispatch)},
+        {kDispatchIndirect, reinterpret_cast<void*>(&DispatchIndirect_d), reinterpret_cast<void**>(&o.dispatch_indirect)},
+        {kBegin, reinterpret_cast<void*>(&Begin_d), reinterpret_cast<void**>(&o.begin)},
+        {kEnd, reinterpret_cast<void*>(&End_d), reinterpret_cast<void**>(&o.end)},
         {kMap, reinterpret_cast<void*>(&Map_d), reinterpret_cast<void**>(&o.map)},
         {kUnmap, reinterpret_cast<void*>(&Unmap_d), reinterpret_cast<void**>(&o.unmap)},
         {kOMSetRenderTargets, reinterpret_cast<void*>(&OMSetRenderTargets_d), reinterpret_cast<void**>(&o.om_rt)},
@@ -2718,6 +2993,13 @@ void SetJitterRoute(JitterRoute route)
 {
     g_vpj_route.store(route == JitterRoute::Viewport, std::memory_order_relaxed);
     if (route != JitterRoute::Viewport) g_vpj_sample.store(0, std::memory_order_release); // bound copies restore at the next draw
+}
+
+void SetDepthReads(bool enabled)
+{
+    if (g_depth_reads_enabled.exchange(enabled) != enabled)
+        na::eventlog::Emit("depth_reads", "variant=depth-reads/twin api=dx11 state=%s why=\"%s\"",
+                           enabled ? "filling" : "off", enabled ? "waiting for qualified raster depth" : "disabled");
 }
 
 void SetCameraUse(CameraUse use)

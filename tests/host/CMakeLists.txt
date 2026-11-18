@@ -463,6 +463,11 @@ na_host_test(native11_frame_model_test SOURCES native11/frame_model_test.cpp)
 if(TARGET host_native11)
   # The B1 provider on a synthetic DX11 game (hardware, else WARP): runs on the hosted runner.
   na_host_test(native11_provider_test SOURCES native11/provider_test.cpp LIBS host_native11 d3dcompiler)
+  add_test(NAME host_native11_depth_reads_test COMMAND native11_provider_test --depth-reads)
+  add_test(NAME host_native11_depth_reads_warp_test COMMAND native11_provider_test --depth-reads-warp)
+  add_test(NAME host_native11_depth_reads_debug_test COMMAND native11_provider_test --depth-reads-debug)
+  set_tests_properties(host_native11_depth_reads_test host_native11_depth_reads_warp_test host_native11_depth_reads_debug_test
+    PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   if(NA_HAVE_NGX_LIB AND NA_DLSS_DLL)
     na_host_test(native11_dlaa_test SOURCES native11/provider_test.cpp LIBS host_dx12 LABELS "gpu;nvidia")
     target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
