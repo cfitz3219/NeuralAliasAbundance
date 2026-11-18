@@ -76,6 +76,11 @@ struct State {
     uint64_t preview_last = 0;
     ULONGLONG preview_at = 0;
     bool preview_exact = false;
+    const void* visual_source = nullptr;
+    uint64_t visual_proof = 0, visual_ordinal = 0;
+    ULONGLONG visual_at = 0;
+    uint8_t visual_losses = 0;
+    std::atomic<bool> visual_rollback{false};
     std::vector<float> data;
     Stats stats;
     bool keep_receipt = false;
@@ -357,6 +362,27 @@ void collect_sample()
             g.preview_pending = true;
             g.preview_last = g.main_ordinal;
         }
+        const uint64_t proof = g.captured_context.native_screen_proof;
+        if (proof && g.captured_context.placement.path == shadow::Path::Native11 &&
+            g.done_screen && g.preview_exact && !g.invalidated) {
+            const auto vote = shadow::VoteScreen(score);
+            const ULONGLONG now = GetTickCount64();
+            if (g.visual_source != g.swapchain || g.visual_proof != proof ||
+                now - g.visual_at > every_ms() * 4 + kStuckMs) {
+                g.visual_source = g.swapchain;
+                g.visual_proof = proof;
+                g.visual_losses = 0;
+                g.visual_rollback = false;
+            }
+            g.visual_ordinal = g.main_ordinal;
+            if (vote != shadow::ScreenVote::Unknown) {
+                g.visual_at = now;
+                g.visual_losses = uint8_t(((g.visual_losses << 1) | (vote == shadow::ScreenVote::Input)) & 15u);
+                // Two independent images in the last four decisive samples
+                // showed the input. An intervening good image does not erase loss.
+                if (g.visual_losses & (g.visual_losses - 1)) g.visual_rollback = true;
+            }
+        }
         ++g.stats.samples;
         if (!g.data.empty()) {
             g.last.data.swap(g.data);
@@ -487,7 +513,15 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     if (screen) size(kScreen, sw, shh);
     uint32_t iw = 0, ih = 0;
     size(kInput, iw, ih);
-    const bool tiles = screen && ow == sw && oh == shh && iw == sw && ih == shh;
+    const bool aligned = screen && ow == sw && oh == shh && iw == sw && ih == shh;
+    // Native DLAA may feed a game's own display resample (e.g. supersampling).
+    // Compare like-aspect pictures on the smaller pixel grid. Different aspects
+    // can be letterboxing or cropping, so they remain diagnostic thumbnails only.
+    const double scene_aspect = double(iw) / ih;
+    const bool resampled = screen && g.captured_context.placement.path == shadow::Path::Native11 &&
+                           iw == ow && ih == oh && sw >= kTile && shh >= kTile &&
+                           std::abs(double(sw) / shh - scene_aspect) < scene_aspect * .01;
+    const bool tiles = aligned || resampled;
     for (int i = 0; screen && i < 3; ++i) {
         k = {};
         k.src = thumbs[i];
@@ -497,6 +531,8 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
         if (tiles) {
             if (g.swapchain == g.tile_source && g.captured_context == g.tile_context) k.locations = g.tile_locations;
             k.base = BlockOffset(tile_blocks[i]);
+            k.mw = (std::min)(iw, sw);
+            k.mh = (std::min)(ih, shh);
             run(g.tiles.Get(), k, kTiles, 1);
         }
     }
@@ -603,6 +639,12 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !init(dev.Get())) return 0;
     // VARIANT: referee/isolated-evaluation
     const bool screen_only = due && g.screen_only_source;
+    // A fixed sampling cadence can lock to one parity at a steady frame
+    // rate. On a proven native reader, alternate which parity gets scored.
+    const uint64_t screen_ordinal = due && !screen_only ? e.present_ordinal + 1 : e.present_ordinal;
+    if (e.context.native_screen_proof && e.context.native_screen_proof == g.visual_proof &&
+        ((screen_ordinal ^ g.visual_ordinal) & 1u) == 0 &&
+        (due || e.present_ordinal - g.pre_ordinal == 1)) return 0;
     if (due && !screen_only) {
         if (!ensure(kPrev, e.color, rw, rh)) { ++g.stats.failed; return 0; }
         copy(l, kPrev, e.color, e.color_state);
@@ -735,9 +777,23 @@ void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* pr
     compute(queue, screen ? presented : nullptr, exec);
 }
 
+uint64_t TakeNativeScreenLoss(const void* swapchain)
+{
+    if (!enabled() || !g.visual_rollback.load(std::memory_order_relaxed)) return 0;
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.visual_source != swapchain || !g.visual_rollback.load(std::memory_order_relaxed)) return 0;
+    g.visual_rollback = false;
+    return g.visual_proof;
+}
+
 void InvalidatePresentation(const void* swapchain)
 {
     std::lock_guard<std::mutex> lock(g.m);
+    if (g.visual_source == swapchain) {
+        g.visual_source = nullptr;
+        g.visual_losses = 0;
+        g.visual_rollback = false;
+    }
     if (g.screen_only_source == swapchain) g.screen_only_source = nullptr;
     if (g.tile_source == swapchain) g.tile_source = nullptr;
     if (g.preview_source == swapchain) {

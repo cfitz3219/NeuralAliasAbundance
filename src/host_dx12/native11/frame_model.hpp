@@ -327,10 +327,24 @@ public:
                 }
             }
             break;
-        case Kind::CbUpdate: return ++cb_version_[e.resource];
+        case Kind::CbUpdate: return track_camera_ ? ++cb_version_[e.resource] : 0;
         }
         return 0;
     }
+    // The scene and placement model stays warm without hashing or ranking camera bindings.
+    void SetCameraTracking(bool enabled)
+    {
+        if (track_camera_ == enabled) return;
+        track_camera_ = enabled;
+        if (!enabled) {
+            cb_version_.clear();
+            cb_scene_.clear();
+            cb_ranges_.clear();
+            camera_versions_.clear();
+            last_cb_order_.clear();
+        }
+    }
+
     uint32_t CbVersion(Id cb) const
     {
         const auto it = cb_version_.find(cb);
@@ -563,13 +577,15 @@ private:
                     if (tested_draws_ && !first_flat_after_tested_pending_) first_flat_after_tested_pending_ = flat_draws_;
                 }
             }
-            CountCbs(e);
-            if (sel_.camera_cb && sel_.camera_slot >= 0 && e.cb[sel_.camera_slot] == sel_.camera_cb)
-                ++camera_versions_[CbVersion(sel_.camera_cb)];
+            if (track_camera_) {
+                CountCbs(e);
+                if (sel_.camera_cb && sel_.camera_slot >= 0 && e.cb[sel_.camera_slot] == sel_.camera_cb)
+                    ++camera_versions_[CbVersion(sel_.camera_cb)];
+            }
         } else if (sel_.valid() && e.rt0 == sel_.color) {
             ++overlay_draws_;
             if (last_scene_draw_event_ && !first_overlay_after_scene_pending_) first_overlay_after_scene_pending_ = overlay_draws_;
-        } else if (!sel_.valid() && e.depth && e.rt0) {
+        } else if (track_camera_ && !sel_.valid() && e.depth && e.rt0) {
             // Before a selection exists, rank camera candidates by draws with any depth.
             CountCbs(e);
         }
@@ -834,6 +850,7 @@ private:
     std::unordered_map<std::pair<Id, int>, CbUse, CbHash> cb_scene_;
     std::map<std::tuple<Id, int, uint32_t, uint32_t>, CbUse> cb_ranges_;
     std::unordered_map<Id, uint32_t> cb_version_;
+    bool track_camera_ = true;
     std::map<uint32_t, uint32_t> camera_versions_;
     std::vector<std::pair<Id, int>> last_cb_order_;
     Selection sel_;

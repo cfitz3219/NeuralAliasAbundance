@@ -252,7 +252,7 @@ struct Params {
 struct Sample {
     const float* data = nullptr;       // kResultFloats, laid out as above
     bool have_screen = false;          // the presented image was sampled
-    bool tiles_comparable = false;     // output and screen have the same size
+    bool tiles_comparable = false;     // sampled on the same pixel grid (native or normalized)
     bool have_motion = false;          // the previous evaluation was the frame before, same size
     float jitter_change = 0;           // |j_now - j_before| in pixels
 };

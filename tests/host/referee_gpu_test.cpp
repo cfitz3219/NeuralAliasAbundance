@@ -88,12 +88,13 @@ ComPtr<ID3D12Resource> MotionTexture(test::Device& d, test::List& l, const std::
     return t;
 }
 // The presented image: 8 bits a channel, in PRESENT (= COMMON) as a swap chain's buffer is.
-ComPtr<ID3D12Resource> ScreenTexture(test::Device& d, test::List& l, const std::vector<uint8_t>& v, std::vector<ComPtr<ID3D12Resource>>& keep)
+ComPtr<ID3D12Resource> ScreenTexture(test::Device& d, test::List& l, const std::vector<uint8_t>& v,
+                                     std::vector<ComPtr<ID3D12Resource>>& keep, uint32_t w = rs::kW, uint32_t h = rs::kH)
 {
     std::vector<uint8_t> px(v.size() * 4);
     for (size_t i = 0; i < v.size(); ++i) { px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = v[i]; px[i * 4 + 3] = 255; }
-    ComPtr<ID3D12Resource> t = test::CreateTexture(d.device.Get(), rs::kW, rs::kH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
-    if (!t || !Upload(d, l, t.Get(), px.data(), size_t(rs::kW) * 4, keep)) return nullptr;
+    ComPtr<ID3D12Resource> t = test::CreateTexture(d.device.Get(), w, h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    if (!t || !Upload(d, l, t.Get(), px.data(), size_t(w) * 4, keep)) return nullptr;
     const D3D12_RESOURCE_BARRIER b = test::Transition(t.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
     l.list->ResourceBarrier(1, &b);
     return t;
@@ -105,7 +106,8 @@ struct Images { ID3D12Resource *prev, *input, *output, *motion, *screen; };
 // Returns false (with a FAIL line) when the referee did not take it.
 bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images& im, rg::LastSample& got,
                 bool late = false, ID3D12CommandQueue* blocked = nullptr, ID3D12Fence* release = nullptr,
-                bool changed_scene = false, bool reset = false, bool display_vectors = false, bool unsampled_reset = false)
+                bool changed_scene = false, bool reset = false, bool display_vectors = false, bool unsampled_reset = false,
+                uint64_t native_proof = 0)
 {
     const uint64_t before = rg::GetStats().samples;
     CHECK(rg::Wanted());
@@ -115,7 +117,9 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     e.output_w = display_vectors ? 2 * rs::kW : rs::kW;
     e.output_h = display_vectors ? 2 * rs::kH : rs::kH;
     e.mv_display_res = display_vectors;
-    e.context = {{na::referee::shadow::Path::Inline, 22}, 1, 2, 3, 0, rs::kW, rs::kH};
+    e.context = {{native_proof ? na::referee::shadow::Path::Native11 : na::referee::shadow::Path::Inline, 22},
+                 1, 2, 3, 0, rs::kW, rs::kH, native_proof};
+    const bool native11 = native_proof != 0;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterBefore[0]; e.jitter_y = rs::kJitterBefore[1];
     const uint32_t pre = rg::Record(l.list.Get(), e);
@@ -131,7 +135,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         rg::Submitted(pre, d.queue.Get());
     }
     CHECK(!rg::NeedsScreen({ordinal, &d}));
-    rg::OnPresent({ordinal, &d, true, true}, d.queue.Get(), nullptr, Execute);
+    rg::OnPresent({ordinal, &d, true, true, native11}, d.queue.Get(), nullptr, Execute);
 
     CHECK(rg::Wanted()); // half taken: the next evaluation is wanted
     e.color = im.input;
@@ -147,13 +151,13 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     rg::Discard(pre, false);
     Run(d, main);
     rg::Submitted(second, d.queue.Get());
-    CHECK(rg::NeedsScreen({ordinal, &d, true, true}));
-    CHECK(!rg::NeedsScreen({ordinal, &d, true, false}));
-    rg::OnPresent({ordinal, &l, true, true}, d.queue.Get(), im.screen, Execute);
+    CHECK(rg::NeedsScreen({ordinal, &d, true, true, native11}));
+    CHECK(!rg::NeedsScreen({ordinal, &d, true, false, native11}));
+    rg::OnPresent({ordinal, &l, true, true, native11}, d.queue.Get(), im.screen, Execute);
     CHECK(!rg::NeedsScreen({ordinal + 7, &d}));
     CHECK(!rg::NeedsScreen({ordinal, &l}));
     if (late && !blocked) ordinal += 7;
-    rg::OnPresent({ordinal, &d, true, true}, d.queue.Get(), im.screen, Execute);
+    rg::OnPresent({ordinal, &d, true, true, native11}, d.queue.Get(), im.screen, Execute);
     if (blocked) {
         ComPtr<ID3D12Fence> presenting_done, producer_done;
         const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -181,7 +185,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         return false;
     }
     got = rg::GetLastSample();
-    CHECK(got.screen == !late && got.tiles == (!late && !display_vectors) && got.pair == (!changed_scene && !reset && !unsampled_reset));
+    CHECK(got.screen == !late && got.tiles == (!late && !display_vectors) && got.pair == (im.motion && !changed_scene && !reset && !unsampled_reset));
     CHECK(std::fabs(got.jitter_change - (got.pair ? rs::JitterChange() : 0.f)) < 1e-4f);
     CHECK(got.data.size() == na::referee::kResultFloats);
     return got.data.size() == na::referee::kResultFloats;
@@ -404,6 +408,51 @@ int main()
         if (attempt == 0) CHECK(score.tiles_textured == 0);
         else CHECK(score.tiles_output >= 4 && score.tiles_input == 0);
     }
+    // Match the roughly 1.34x scene-to-display ratio seen in the field.
+    const uint32_t w = 304, h = 168;
+    auto screen_bytes = [&](const na::referee::Image& picture) {
+        std::vector<uint8_t> pixels(size_t(w) * h);
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                const float sx = (float(x) + .5f) * picture.w / w - .5f;
+                const float sy = (float(y) + .5f) * picture.h / h - .5f;
+                const int ix = int(std::floor(sx)), iy = int(std::floor(sy));
+                const float fx = sx - ix, fy = sy - iy;
+                const float a = picture.At(ix, iy) * (1 - fx) + picture.At(ix + 1, iy) * fx;
+                const float b = picture.At(ix, iy + 1) * (1 - fx) + picture.At(ix + 1, iy + 1) * fx;
+                const float v = (a * (1 - fy) + b * fy) * 1.4f;
+                const float tone = std::pow(v / (1.f + v), 1.f / 2.2f);
+                pixels[size_t(y) * w + x] = uint8_t(std::lround(tone * 255.f));
+            }
+        }
+        return pixels;
+    };
+    auto tiny_input = ScreenTexture(d, l, screen_bytes(input), keep, w, h);
+    auto tiny_output = ScreenTexture(d, l, screen_bytes(output), keep, w, h);
+    REQUIRE(tiny_input && tiny_output);
+    Run(d, l);
+    keep.clear();
+    // The pass still submits every time, but only the middle sample makes it
+    // through the game's compositor. That success must not erase the others.
+    using na::referee::shadow::ScreenVote;
+    for (unsigned i = 0; i < 3; ++i) {
+        const bool good = i == 1;
+        if (i) ++ordinal; // the monitor samples the other Present parity
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), nullptr,
+                                          good ? tiny_output.Get() : tiny_input.Get()}, got,
+                           false, nullptr, nullptr, false, false, false, false, 17));
+        auto vote = na::referee::shadow::VoteScreen(
+            na::referee::Score({got.data.data(), got.screen, got.tiles, false, 0}));
+        CHECK(got.screen && got.tiles && vote == (good ? ScreenVote::Output : ScreenVote::Input));
+        CHECK(rg::TakeNativeScreenLoss(&l) == 0);
+        CHECK(rg::TakeNativeScreenLoss(&d) == (i == 2 ? 17u : 0u));
+    }
+    CHECK(!rg::TakeNativeScreenLoss(&d)); // consumed
+    Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), nullptr, tiny_input.Get()}, got,
+                       false, nullptr, nullptr, false, false, false, false, 18));
+    CHECK(!rg::TakeNativeScreenLoss(&d)); // a new proof does not inherit the old failures
     Sleep(150);
     REQUIRE(rg::Wanted());
     rg::Evaluation discarded;

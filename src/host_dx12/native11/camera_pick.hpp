@@ -1,8 +1,8 @@
 // DX11 camera pick: finds the camera ViewProjection in a constant buffer's
 // bytes, with the same rule as the DX12 host (live_dlaa.cpp, find_camera): a
 // ViewProjection whose inverse sits in the same block (engines that rebuild
-// positions from depth upload both; object constants rarely do). Uses the
-// shared na::camera::FindMatrices, so there is one definition of "a camera".
+// positions from depth upload both; object constants rarely do). Uses the paired
+// VP subset of the shared matrix scanner and the same camera tests as DX12.
 // Once found, the offset is learned and checked first next frame.
 //
 // Portable C++17 (Linux-tested).
@@ -62,26 +62,14 @@ inline bool CheckLearned(const std::vector<uint8_t>& bytes, const CameraPick& le
 inline CameraPick FindCamera(const std::vector<uint8_t>& bytes, uint64_t identity)
 {
     CameraPick r;
-    if (bytes.size() < 128) return r;
-    na::camera::Snapshot s{};
-    s.session = s.epoch = 1;
-    s.submission = s.content_version = identity;
-    s.resource = identity;
-    s.base_offset = 0;
-    s.complete = s.lifetime_valid = true;
-    s.sync = na::camera::Sync::AppSyncUnknown; // read on the CPU at the game's own upload: scope known
-    s.bytes = bytes;
-    const auto scan = na::camera::FindMatrices(s);
-    for (const auto& c : scan.candidates) {
-        if (c.kind != na::camera::Kind::ViewProjection || !c.has_inverse_pair) continue;
-        r.found = true;
-        r.offset = c.byte_offset;
-        r.inverse_delta = static_cast<int64_t>(c.inverse_byte_offset) - static_cast<int64_t>(c.byte_offset);
-        r.layout = c.layout;
-        r.vp = c.matrix;
-        r.reversed = c.reversed;
-        return r;
-    }
+    na::camera::Candidate c{};
+    if (!na::camera::Known(identity) || !na::camera::FindPairedViewProjection(bytes, c)) return r;
+    r.found = true;
+    r.offset = c.byte_offset;
+    r.inverse_delta = static_cast<int64_t>(c.inverse_byte_offset) - static_cast<int64_t>(c.byte_offset);
+    r.layout = c.layout;
+    r.vp = c.matrix;
+    r.reversed = c.reversed;
     return r;
 }
 

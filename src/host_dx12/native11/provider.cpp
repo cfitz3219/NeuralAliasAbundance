@@ -335,7 +335,20 @@ uint64_t g_scene_key[2] = {};             // colour and depth lifetime ids
 // Whether a frame needs a camera to be handed over (input_provider.hpp CameraUse). Off: nothing
 // camera-related runs at all, on any thread, so it is read without g_mu.
 std::atomic<uint8_t> g_camera_use{static_cast<uint8_t>(CameraUse::Required)};
-bool CameraOff() { return g_camera_use.load(std::memory_order_relaxed) == static_cast<uint8_t>(CameraUse::Off); }
+std::atomic<bool> g_eval_paused{false}, g_camera_suspended{false};
+uint32_t g_camera_failures = 0, g_camera_retry_frames = 0;
+bool g_frame_delivered = false;
+constexpr uint32_t kCameraSearchBurst = 8, kCameraRetryFrames = 120;
+
+CameraUse CameraSetting()
+{
+    return static_cast<CameraUse>(g_camera_use.load(std::memory_order_relaxed));
+}
+bool CameraTracking()
+{
+    return !g_eval_paused.load(std::memory_order_relaxed) && !g_camera_suspended.load(std::memory_order_relaxed) &&
+           CameraSetting() != CameraUse::Off;
+}
 // VARIANT: depth/direction-from-depth-writes
 // Which end of the selected depth is near, from that depth's own scene writes (depth_direction.hpp).
 // Gathered on every frame, under g_mu; used when the frame has no camera to say it.
@@ -469,7 +482,7 @@ ResourceInfo InfoOf(ID3D11Resource* r, bool depth)
 }
 bool IsCandidate(Id id)
 {
-    if (!id || CameraOff()) return false; // no camera is looked for: no constant buffer bytes are kept
+    if (!id || !CameraTracking()) return false;
     if (g_collect_camera.load(std::memory_order_relaxed) ||
         g_split_candidate.load(std::memory_order_relaxed) == id) return true;
     for (auto& c : g_cand)
@@ -1099,7 +1112,7 @@ void DiagnoseCameraMiss()
 // before the list / HUD draw that holds it). Under g_mu (`lk`), on the immediate context's thread,
 // before the read is forwarded. g_mu is let go during the callback so the game's other threads never
 // wait behind it; the facts handed over are copies or references we hold.
-void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary)
+void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary, bool verified_reader = false)
 {
     ++g_stats.fired;
     SetSceneHanded(true); // whatever the outcome below, the game's scene draws for this frame are over
@@ -1129,7 +1142,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     // A camera is looked for exactly as before unless the host said never to (Off). What changes is
     // what a frame without one means: Required, a miss (as before); Optional and Off, the frame is
     // handed over all the same with camera_known = false, and nothing below reads a camera.
-    const auto use = static_cast<CameraUse>(g_camera_use.load(std::memory_order_relaxed));
+    const auto use = CameraTracking() ? CameraSetting() : CameraUse::Off;
     bool found = false;
     if (use != CameraUse::Off) {
         found = CameraNow(&cam, &upload, &version, pose_check, split_pose);
@@ -1377,6 +1390,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         }
     }
     f.boundary = boundary;
+    f.screen_proof = verified_reader ? g_screen.Proof() : 0;
     f.scene_draws = g_model.SceneDrawsThisFrame();
     // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
     // tagged when the game last uploaded to it.
@@ -1423,6 +1437,11 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     lk.lock();
     if (!ok) ++g_stats.missed;
+    else if (g_frame == f.frame) {
+        g_frame_delivered = true;
+        if (g_screen_enabled.load(std::memory_order_relaxed))
+            g_screen.NoteDelivery(verified_reader, f.scene_draws);
+    }
 }
 
 CameraUpload CaptureUpload(const void* data, size_t size, uint32_t first_constant, bool windowed)
@@ -1466,7 +1485,7 @@ void RememberSplitDraw(const Event& e, int ws, int ps, const CameraUpload& world
 // or a different binding in the same ring cannot erase this draw's evidence.
 void RememberSceneUploads(const Event& e, const std::vector<ExactRange>* exact = nullptr)
 {
-    if (e.kind != Kind::Draw || !g_model.IsSceneDraw(e)) return;
+    if (e.kind != Kind::Draw || !CameraTracking() || !g_model.IsSceneDraw(e)) return;
     // Ranges read at this very draw stand for the draw's own upload version.
     std::array<CameraUpload, kCbBindSlots> exact_upload;
     if (exact) {
@@ -1762,10 +1781,13 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.indirect = indirect;
     e.viewport_sample = x->vpj_applied ? x->vpj_sample : 0;
     e.viewport_expanded = x->vpj_applied && x->vpj_expanded;
-    std::memcpy(e.cb, x->cb, sizeof(e.cb));
-    for (int i = 0; i < kCbBindSlots; ++i) {
-        e.cb_first[i] = static_cast<uint16_t>(x->cb_first[i]);
-        e.cb_count[i] = static_cast<uint16_t>(x->cb_num[i]);
+    const bool camera_tracking = CameraTracking();
+    if (camera_tracking) {
+        std::memcpy(e.cb, x->cb, sizeof(e.cb));
+        for (int i = 0; i < kCbBindSlots; ++i) {
+            e.cb_first[i] = static_cast<uint16_t>(x->cb_first[i]);
+            e.cb_count[i] = static_cast<uint16_t>(x->cb_num[i]);
+        }
     }
     const bool picture_draw = e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed);
     const bool layer_draw = e.depth_test && e.rt0 && e.rt0 == g_sel_layer.load(std::memory_order_relaxed) &&
@@ -1782,7 +1804,7 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         }
     }
     ExactSet exact;
-    if ((picture_draw || layer_draw) && !CameraOff()) exact = ExactForDraw(c, x); // camera bytes: not read when no camera is looked for
+    if ((picture_draw || layer_draw) && camera_tracking) exact = ExactForDraw(c, x); // camera bytes: not read when no camera is looked for
     Emit(x, c, e, {}, exact);
     if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
     return x;
@@ -1929,7 +1951,7 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
     {
         std::lock_guard<std::mutex> l(g_mu);
         if (g_vpj_route.load(std::memory_order_relaxed)) return false; // jitter goes through the viewports; never both
-        if (CameraOff()) return false; // no camera is looked for: none is written to, from the frame the switch is made
+        if (!CameraTracking()) return false;
         const auto& selection = g_model.Current();
         // A PS-only pose can reconstruct camera motion. Rewriting it cannot
         // move the scene's raster samples and must not be reported as jitter.
@@ -2174,7 +2196,7 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     std::unique_lock<std::mutex> lock(g_mu);
     const auto& scene = g_model.Current();
     const auto draws = g_model.SceneDrawsThisFrame();
-    if (!draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
+    if (!g_screen.MayInspect() || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
         scene.color == g_backbuffer || !g_swap || x->raster_queries ||
         IdOf(g_color_ref.Get()) != scene.color || g_color_view.mip || g_color_view.slice) return {};
     ResourceInfo output{};
@@ -2212,9 +2234,7 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
         if (g_screen.Verified(scene.color, scene.depth)) {
             if (!g_screen.Matches(reader) || g_model.FiredThisFrame()) return {};
             g_model.MarkFired();
-            const auto missed = g_stats.missed;
-            Fire(c, lock, Boundary::BeforeRead);
-            g_screen.NoteDelivery(g_stats.missed == missed && g_frame_fired, draws);
+            Fire(c, lock, Boundary::BeforeRead, true);
             StopViewportJitterAfterScene();
             return {};
         }
@@ -2285,7 +2305,7 @@ HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT 
 {
     Ctx* x = Get(c);
     const HRESULT hr = O(c, x).map(c, r, sub, type, flags, m);
-    if (x && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
+    if (x && CameraTracking() && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
                                     type == D3D11_MAP_READ_WRITE)) {
         const Id id = IdOf(r);
         UINT size = 0;
@@ -2309,6 +2329,11 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
     Ctx* x = Get(c);
     if (x) {
         const Id id = IdOf(r);
+        if (!CameraTracking()) {
+            if (!x->mapped.empty()) x->mapped.erase(id);
+            O(c, x).unmap(c, r, sub);
+            return;
+        }
         UINT size = 0;
         bool cb = false;
         {
@@ -2338,7 +2363,7 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
 }
 void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11_BOX* box, const void*& src, std::vector<uint8_t>& tmp)
 {
-    if (!x || !r || !src) return;
+    if (!x || !r || !src || !CameraTracking()) return;
     UINT size = 0;
     bool cb = false;
     {
@@ -2347,6 +2372,10 @@ void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11
     }
     if (!cb) return;
     if (box || !IsCandidate(IdOf(r))) { CbUpdate(c, r, nullptr, 0); return; } // constant buffers are updated whole
+    if (g_vpj_route.load(std::memory_order_relaxed)) {
+        CbUpdate(c, r, src, size);
+        return;
+    }
     tmp.assign(static_cast<const uint8_t*>(src), static_cast<const uint8_t*>(src) + size);
     if (JitterUpload(tmp.data(), tmp.size(), IdOf(r))) src = tmp.data(); // the game's upload, jittered
     CbUpdate(c, r, tmp.data(), tmp.size());
@@ -2669,17 +2698,15 @@ bool OnPresent(IDXGISwapChain* swap)
             game->GetImmediateContext(&context);
             swap->GetBuffer(0, IID_PPV_ARGS(&screen));
         }
-        bool confirmed, refuted;
-        g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), confirmed, refuted);
-        if (confirmed || refuted)
+        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame()))
             na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
-                               confirmed ? "confirmed" : "refuted", (unsigned long long)g_screen.Paired(),
+                               outcome, (unsigned long long)g_screen.Paired(),
                                (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
     } else g_screen.SetScene(0, 0);
     ++g_frame;
     g_exact_frame.fetch_add(1, std::memory_order_relaxed);
     ++g_stats.frames;
-    LearnLargeCbWindows();
+    if (CameraTracking()) LearnLargeCbWindows();
     // A swap chain's buffer is never held across a present: a game may let go of its swap chain at
     // any time, and a reference of ours would keep the old one alive. Fire takes it again.
     if (g_backbuffer && g_color_ref && IdOf(g_color_ref.Get()) == g_backbuffer) g_color_ref.Reset();
@@ -2721,6 +2748,7 @@ bool OnPresent(IDXGISwapChain* swap)
     }
     g_stats.unplaceable = ms.unplaceable;
     g_stats.contradictions = ms.contradictions;
+    const bool scene_changed = g_stats.selection_changes != ms.selection_changes;
     g_stats.selection_changes = ms.selection_changes;
     size_t k = 0;
     const Selection& s = g_model.Current();
@@ -2733,8 +2761,31 @@ bool OnPresent(IDXGISwapChain* swap)
     g_split_votes.clear();
     g_split_candidate.store(g_split_world, std::memory_order_relaxed);
     g_split_world = 0;
+    // If measured motion already delivered the frame, failed Optional searches may sleep.
+    // Keep Required mode searching and retry automatically after scene changes or at low cadence.
+    if (CameraSetting() == CameraUse::Optional && !g_eval_paused.load(std::memory_order_relaxed)) {
+        if (g_camera_suspended.load(std::memory_order_relaxed)) {
+            if (ms.last_scene_draws && g_camera_retry_frames) --g_camera_retry_frames;
+            if (!g_camera_retry_frames || scene_changed || (g_frame_fired && !g_frame_delivered)) {
+                g_camera_failures = kCameraSearchBurst - 1; // one retry frame unless the camera returns
+                g_camera_suspended.store(false, std::memory_order_relaxed);
+                g_collect_camera.store(true, std::memory_order_relaxed);
+                g_model.SetCameraTracking(true);
+            }
+        } else if (g_frame_found) g_camera_failures = 0;
+        else if (g_frame_fired && g_frame_delivered && ++g_camera_failures >= kCameraSearchBurst) {
+            g_camera_retry_frames = kCameraRetryFrames;
+            g_camera_suspended.store(true, std::memory_order_relaxed);
+            g_held.valid = false;
+            g_cb_latest.clear();
+            g_large_cb_windows.clear();
+            g_model.SetCameraTracking(false);
+            na::eventlog::Emit("native11_camera_budget", "frame=%llu retry_scene_frames=%u",
+                               static_cast<unsigned long long>(g_frame), g_camera_retry_frames);
+        }
+    }
     // Learning the relative layout needs every scene range's upload for one frame.
-    if (g_frame_fired && !g_collect_all) {
+    if (CameraTracking() && g_frame_fired && !g_collect_all) {
         const bool collecting = g_collect_camera.load(std::memory_order_relaxed); // how this frame's uploads were kept
         if (!collecting && g_frame_no_bytes && g_prev_found_collecting) {
             if (++g_rotation_misses >= 2) {
@@ -2750,11 +2801,12 @@ bool OnPresent(IDXGISwapChain* swap)
         }
         g_prev_found_collecting = collecting && g_frame_found;
     }
-    g_frame_fired = g_frame_found = g_frame_no_bytes = false;
+    g_frame_fired = g_frame_found = g_frame_no_bytes = g_frame_delivered = false;
     g_depth_dir.EndFrame(); // the next frame's evidence starts empty; what is proven stays
     SetSceneHanded(false);
     TexturesOnPresent();
-    g_collect_camera.store(!CameraOff() && (!g_camera.found || g_rel_learner.armed() || g_collect_all), std::memory_order_relaxed);
+    g_collect_camera.store(CameraTracking() && (!g_camera.found || g_rel_learner.armed() || g_collect_all || g_camera_failures),
+                           std::memory_order_relaxed);
     // Retire upload shadows not in the next scene's acquisition set. Draw-time
     // snapshots keep their own ownership until this frame is closed.
     if (g_cb_latest.size() > 512) {
@@ -2838,7 +2890,7 @@ bool OnPresent(IDXGISwapChain* swap)
     g_jitter_written = false;
     // A request covers exactly the frame that starts here: without a new one (a missed or failed
     // evaluation), the next frame's camera is the game's own, unjittered.
-    g_jitter_active = g_jitter_requested && g_camera.found && !CameraOff(); // the matrix write needs a camera that is being looked for
+    g_jitter_active = g_jitter_requested && g_camera.found && CameraTracking(); // the matrix write needs a camera that is being looked for
     g_jitter = neural_alias::JitterSample{g_next_jitter[0], g_next_jitter[1]};
     // Viewport route: the same one-frame request, applied on the scene draws of the frame starting here.
     const uint32_t jittered_draws = g_vpj_frame_draws;
@@ -3032,6 +3084,15 @@ bool InstallHooks(bool host_owns_present)
 } // namespace
 
 void SetScreenCheck(bool on) { g_screen_enabled.store(on, std::memory_order_relaxed); }
+
+void RejectScreenProof(uint64_t proof)
+{
+    if (!proof || !g_screen_enabled.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_screen.RejectProof(proof))
+        na::eventlog::Emit("native11_screen", "candidate=replaced_after_delivery proof=%llu",
+                           static_cast<unsigned long long>(proof));
+}
 bool ObservePresent(void* swapchain) { return OnPresent(static_cast<IDXGISwapChain*>(swapchain)); }
 void BeforeResize(void* swapchain) { ReleaseResizeInputs(static_cast<IDXGISwapChain*>(swapchain)); }
 void AfterResize(void* swapchain, long result) { UpdateResizeExtent(static_cast<IDXGISwapChain*>(swapchain), result); }
@@ -3083,6 +3144,15 @@ void Uninstall()
     g_swap = nullptr;
     g_backbuffer = 0;
     g_collect_all = false;
+    g_camera_suspended.store(false, std::memory_order_relaxed);
+    g_eval_paused.store(false, std::memory_order_relaxed);
+    g_camera_failures = g_camera_retry_frames = 0;
+    g_frame_delivered = false;
+    g_cb_latest.clear();
+    g_scene_uploads.clear();
+    g_large_cb_windows.clear();
+    g_model.SetCameraTracking(CameraTracking());
+    g_collect_camera.store(CameraTracking(), std::memory_order_relaxed);
     g_twin_wait_until = 0;
     g_rotation_misses = 0;
     g_frame_fired = g_frame_found = g_frame_no_bytes = g_prev_found_collecting = false;
@@ -3113,12 +3183,36 @@ void SetDepthReads(bool enabled)
                            enabled ? "filling" : "off", enabled ? "waiting for qualified raster depth" : "disabled");
 }
 
+static void ResetCameraAcquisition()
+{
+    g_camera_failures = g_camera_retry_frames = 0;
+    g_camera_suspended.store(false, std::memory_order_relaxed);
+    g_held.valid = false;
+    g_cb_latest.clear();
+    g_scene_uploads.clear();
+    g_large_cb_windows.clear();
+    const bool tracking = CameraTracking();
+    g_collect_camera.store(tracking, std::memory_order_relaxed);
+    g_model.SetCameraTracking(tracking);
+}
+
+void SetEvaluationPaused(bool paused)
+{
+    if (g_eval_paused.exchange(paused, std::memory_order_relaxed) == paused) return;
+    std::lock_guard<std::mutex> l(g_mu);
+    ResetCameraAcquisition();
+    if (paused) {
+        g_vpj_sample.store(0, std::memory_order_release);
+        g_jitter_active = g_jitter_requested = false;
+    }
+}
+
 void SetCameraUse(CameraUse use)
 {
     const auto next = static_cast<uint8_t>(use);
     if (g_camera_use.exchange(next, std::memory_order_relaxed) == next) return;
     std::lock_guard<std::mutex> l(g_mu);
-    g_held.valid = false; // a camera held from before the change is not carried across it
+    ResetCameraAcquisition();
     na::eventlog::Emit("native11_camera_use", "frame=%llu use=%s", static_cast<unsigned long long>(g_frame),
                        use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required");
 }
@@ -3254,11 +3348,13 @@ int FormatStatus(char* out, unsigned long n)
                                    static_cast<unsigned long long>(g_vpj_stopped_after_scene.load(std::memory_order_relaxed)));
     if (tail < 0 || static_cast<size_t>(head + tail) >= n) return tail < 0 ? head : head + tail;
     // The camera's part in handing frames over, and the depth direction learned without one.
-    const auto use = static_cast<CameraUse>(g_camera_use.load(std::memory_order_relaxed));
+    const auto use = CameraSetting();
+    const char* camera_work = g_eval_paused.load(std::memory_order_relaxed) ? "paused" :
+        g_camera_suspended.load(std::memory_order_relaxed) ? "backoff" : use == CameraUse::Off ? "off" : "active";
     const int more = std::snprintf(out + head + tail, n - head - tail,
-                                   " camera_use{mode=%s handed_without_looking=%llu handed_none_found=%llu} "
+                                   " camera_use{mode=%s work=%s handed_without_looking=%llu handed_none_found=%llu} "
                                    "depth_direction{%s writes_less=%u writes_greater=%u equal=%u clears=%u clear=%.6g unproven_frames=%llu flips=%llu camera_disagrees=%llu}",
-                                   use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required",
+                                   use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required", camera_work,
                                    static_cast<unsigned long long>(s.camera_off), static_cast<unsigned long long>(s.camera_absent),
                                    depth_proven == DepthCompare::NearIsLess ? "near_is_less" : depth_proven == DepthCompare::NearIsGreater ? "near_is_greater" : "unproven",
                                    depth_seen.less, depth_seen.greater, depth_seen.equal, depth_seen.clears, depth_seen.clear,

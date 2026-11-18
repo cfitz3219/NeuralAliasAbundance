@@ -15,8 +15,18 @@ namespace na::native11 {
 // Called on the game's immediate context, under the provider's frame lock.
 // The marker is mapped only from a staging copy with DO_NOT_WAIT at Present.
 class ScreenCheck {
-    using Vote = screen_marker::Vote;
     using Texture = Microsoft::WRL::ComPtr<ID3D11Texture2D>;
+    static constexpr UINT kPairs = 3, kPoints = kPairs * 2;
+    using ProbeRects = std::array<D3D11_RECT, kPoints>;
+
+    // Every location changes polarity on both frame parities. A fixed edge or
+    // an alternating post-process cannot substitute for the challenge pattern.
+    static constexpr std::array<UINT, screen_marker::kSession> kPatterns{0, 7, 5, 2, 3, 4, 6, 1};
+
+    static bool FirstIsHigh(UINT sample, UINT pair)
+    {
+        return (kPatterns[sample] & (1u << pair)) != 0;
+    }
 
 public:
     struct Reader {
@@ -30,7 +40,7 @@ public:
     };
     struct Mark {
         Texture source, original;
-        std::array<D3D11_RECT, 3> rects{};
+        ProbeRects rects{};
     };
 
     void SetScene(Id color, Id depth)
@@ -40,11 +50,25 @@ public:
         depth_ = depth;
         verified_ = {};
         rejected_.clear();
+        ordinary_gaps_ = 0;
+        ordinary_this_frame_ = false;
         ResetAttempt();
     }
 
     bool Verified(Id color, Id depth) const { return color_ == color && depth_ == depth && !!verified_; }
     bool Matches(Reader reader) const { return reader == verified_; }
+    uint64_t Proof() const { return verified_ ? proof_ : 0; }
+
+    bool RejectProof(uint64_t proof)
+    {
+        if (!proof || proof != Proof()) return false;
+        RetireVerified();
+        return true;
+    }
+    bool MayInspect() const
+    {
+        return verified_ || (!ordinary_this_frame_ && ordinary_gaps_ >= kOrdinaryGrace);
+    }
     bool AwaitingSamples() const { return !!candidate_; }
     uint64_t Confirmed() const { return confirmed_; }
     uint64_t Refuted() const { return refuted_; }
@@ -54,9 +78,14 @@ public:
     Mark Begin(ID3D11DeviceContext* context, Reader reader, ID3D11Texture2D* source,
                DXGI_FORMAT view_format, uint64_t frame, uint32_t scene_draws)
     {
-        if (verified_ || marked_ || issued_ == screen_marker::kSession ||
+        if (verified_ || marked_ ||
             std::find(rejected_.begin(), rejected_.end(), reader) != rejected_.end()) return {};
         if (candidate_ && !(reader == candidate_)) return {};
+        if (candidate_ && !seen_) {
+            seen_ = true;
+            reader_draws_ = scene_draws;
+        }
+        if (issued_ == screen_marker::kSession) return {};
 
         D3D11_TEXTURE2D_DESC desc{};
         source->GetDesc(&desc);
@@ -83,14 +112,21 @@ public:
         if (!issued_) opened_ = frame;
         Mark mark{source, original_, Points(desc.Width, desc.Height)};
         CopyPoints(context, source, original_.Get(), mark.rects);
-        const auto value = (issued_ & 1u) ? screen_marker::kHigh : screen_marker::kLow;
-        const float rgba[]{value, value, value, 1.f};
-        // The marker goes in the source before the draw, so a merely bound but
-        // unused SRV cannot earn a vote. Restore the original texels after the draw.
-        immediate->ClearView(marker_view_.Get(), rgba, mark.rects.data(), UINT(mark.rects.size()));
-        marked_ = true;
-        marked_frame_ = frame;
-        marked_draws_ = scene_draws;
+        std::array<D3D11_RECT, kPairs> high{}, low{};
+        for (UINT pair = 0; pair < kPairs; ++pair) {
+            const UINT first = 2 * pair;
+            const bool high_first = FirstIsHigh(issued_, pair);
+            high[pair] = mark.rects[first + !high_first];
+            low[pair] = mark.rects[first + high_first];
+        }
+        constexpr float high_rgba[]{screen_marker::kHigh, screen_marker::kHigh, screen_marker::kHigh, 1.f};
+        constexpr float low_rgba[]{screen_marker::kLow, screen_marker::kLow, screen_marker::kLow, 1.f};
+        // Write the pair into the source only around this reader. Both sides
+        // must be recognizable in the same presented image.
+        immediate->ClearView(marker_view_.Get(), high_rgba, high.data(), kPairs);
+        immediate->ClearView(marker_view_.Get(), low_rgba, low.data(), kPairs);
+        marked_ = seen_ = true;
+        reader_draws_ = scene_draws;
         ++issued_;
         return mark;
     }
@@ -104,35 +140,63 @@ public:
         }
     }
 
-    void NoteDelivery(bool delivered, uint32_t scene_draws)
+    void NoteDelivery(bool by_verified_reader, uint32_t scene_draws)
     {
-        if (delivered) {
+        if (by_verified_reader) {
             delivered_this_frame_ = true;
             delivered_draws_ = scene_draws;
             ++delivered_;
+        } else {
+            ordinary_this_frame_ = true;
+            ordinary_draws_ = scene_draws;
         }
     }
 
-    void Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
-                 uint32_t scene_draws, bool& confirmed, bool& refuted)
+    const char* Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
+                        uint32_t scene_draws)
     {
-        confirmed = refuted = false;
-        if (verified_) {
-            if (delivered_this_frame_) {
-                misses_ = 0;
-                if (scene_draws != delivered_draws_) verified_ = {};
-            } else if (++misses_ >= 16) verified_ = {};
-            delivered_this_frame_ = false;
-            if (!verified_) { rejected_.clear(); ResetAttempt(); }
-            return;
+        const bool ordinary_completed = ordinary_this_frame_ && ordinary_draws_ == scene_draws;
+        ordinary_this_frame_ = false;
+        if (ordinary_completed) {
+            ordinary_gaps_ = 0;
+            if (candidate_ || verified_) {
+                verified_ = {};
+                ResetAttempt();
+                return "ordinary_restored";
+            }
+            return nullptr;
         }
-        if (!candidate_ || !context || !screen) { marked_ = false; return; }
-        Collect(context);
-        if (marked_ && frame == marked_frame_ && scene_draws == marked_draws_) {
+        if (scene_draws && ordinary_gaps_ < kOrdinaryGrace) ++ordinary_gaps_;
+
+        if (verified_) {
+            // An eligible success ages a previous miss instead of erasing it. A
+            // reader delivering every other frame must lose control promptly.
+            const bool missed = !delivered_this_frame_ && scene_draws;
+            const bool overwritten = delivered_this_frame_ && scene_draws != delivered_draws_;
+            delivered_this_frame_ = false;
+            if (overwritten || (missed && recent_miss_)) {
+                RetireVerified();
+                return "lost_coverage";
+            }
+            if (missed) recent_miss_ = screen_marker::kSession;
+            else if (scene_draws && recent_miss_) --recent_miss_;
+            return nullptr;
+        }
+        if (!candidate_) return nullptr;
+        // Only a reader seen at the right point on every scene frame can earn
+        // control. The staging samples may finish later than those draws.
+        if (scene_draws && (!seen_ || reader_draws_ != scene_draws)) {
+            Reject(candidate_);
+            ResetAttempt();
+            return "intermittent";
+        }
+        if (context) Collect(context);
+        if (marked_ && scene_draws && context && screen) {
             D3D11_TEXTURE2D_DESC desc{};
             screen->GetDesc(&desc);
             auto slot = std::find_if(slots_.begin(), slots_.end(), [](const auto& s) { return !s.pending; });
-            if (slot != slots_.end() && desc.SampleDesc.Count == 1 && Bytes(desc.Format)) {
+            if (slot != slots_.end() && desc.Width >= 8 && desc.Height >= 8 &&
+                desc.SampleDesc.Count == 1 && Bytes(desc.Format)) {
                 if (!SameFormat(slot->image.Get(), desc.Format)) {
                     slot->image.Reset();
                     MakeStrip(context, desc.Format, true, slot->image);
@@ -140,42 +204,39 @@ public:
                 if (slot->image) {
                     CopyPoints(context, screen, slot->image.Get(), Points(desc.Width, desc.Height));
                     slot->frame = frame;
-                    slot->value = (issued_ - 1) & 1u;
+                    slot->sample = issued_ - 1;
                     slot->format = desc.Format;
                     slot->pending = true;
                 }
             }
         }
-        marked_ = false;
-        if (issued_ < screen_marker::kSession && frame - opened_ < 32) return;
-        if (std::any_of(slots_.begin(), slots_.end(), [](const auto& slot) { return slot.pending; }) &&
-            frame - opened_ < 32) return;
-        const auto outcome = votes_.ResultOf();
-        if (outcome == Vote::Result::Reached) {
+        marked_ = seen_ = false;
+        if (frame - opened_ < 32 && (issued_ < screen_marker::kSession ||
+            std::any_of(slots_.begin(), slots_.end(), [](const auto& slot) { return slot.pending; }))) return nullptr;
+        const bool sampled_all = samples_ == screen_marker::kSession;
+        const bool confirmed = sampled_all && (follow_ == samples_ || invert_ == samples_);
+        const bool refuted = sampled_all && flat_ == samples_;
+        const bool intermittent = sampled_all && (follow_ || invert_) && !confirmed;
+        if (confirmed) {
             verified_ = candidate_;
-            confirmed = true;
+            proof_ = ++next_proof_;
             ++confirmed_;
         } else {
-            // Mixed/unavailable samples cannot establish a route. Try the
-            // next consumer of this scene rather than weighing a guess.
-            if (rejected_.size() >= 16) rejected_.erase(rejected_.begin());
-            rejected_.push_back(candidate_);
-            refuted = outcome == Vote::Result::Discarded;
+            Reject(candidate_);
             if (refuted) ++refuted_;
         }
         ResetAttempt();
+        if (confirmed) return "confirmed";
+        if (refuted) return "refuted";
+        return intermittent ? "intermittent_screen" : "inconclusive";
     }
 
 private:
-    struct Sample {
-        float luma[3]{};
-        UINT value = 0;
-    };
     struct Slot {
         Texture image;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         uint64_t frame = 0;
-        UINT value = 0;
+        UINT sample = 0;
         bool pending = false;
     };
 
@@ -201,7 +262,7 @@ private:
     static bool MakeStrip(ID3D11DeviceContext* context, DXGI_FORMAT format, bool readback, Texture& out)
     {
         D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = 3;
+        desc.Width = kPoints;
         desc.Height = desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
         desc.Format = format;
         if (readback) {
@@ -213,19 +274,21 @@ private:
         return SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &out));
     }
 
-    static std::array<D3D11_RECT, 3> Points(UINT width, UINT height)
+    static ProbeRects Points(UINT width, UINT height)
     {
-        std::array<D3D11_RECT, 3> points{};
-        for (UINT i = 0; i < points.size(); ++i) {
+        ProbeRects points{};
+        const LONG spacing = LONG(std::max(1u, width / 512u));
+        for (UINT i = 0; i < kPairs; ++i) {
             const LONG x = LONG(width * screen_marker::kAt[i][0]);
             const LONG y = LONG(height * screen_marker::kAt[i][1]);
-            points[i] = {x, y, x + 1, y + 1};
+            points[2 * i] = {x, y, x + 1, y + 1};
+            points[2 * i + 1] = {x + spacing, y, x + spacing + 1, y + 1};
         }
         return points;
     }
 
     static void CopyPoints(ID3D11DeviceContext* context, ID3D11Texture2D* source,
-                           ID3D11Texture2D* destination, const std::array<D3D11_RECT, 3>& points)
+                           ID3D11Texture2D* destination, const ProbeRects& points)
     {
         for (UINT i = 0; i < points.size(); ++i) {
             const auto& r = points[i];
@@ -246,16 +309,39 @@ private:
             if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return;
             next->pending = false;
             if (FAILED(hr)) continue;
-            Sample sample{};
-            sample.value = next->value;
             const auto* data = static_cast<const uint8_t*>(map.pData);
-            for (UINT i = 0; i < 3; ++i) sample.luma[i] = screen_marker::Luma(data + i * Bytes(next->format), next->format);
+            const UINT stride = Bytes(next->format);
+            UINT follows = 0, inverts = 0, flat = 0;
+            for (UINT pair = 0; pair < kPairs; ++pair) {
+                const float first = screen_marker::Luma(data + 2 * pair * stride, next->format);
+                const float second = screen_marker::Luma(data + (2 * pair + 1) * stride, next->format);
+                const float contrast = FirstIsHigh(next->sample, pair) ? first - second : second - first;
+                if (!std::isfinite(contrast)) continue;
+                follows += contrast > .02f;
+                inverts += contrast < -.02f;
+                flat += std::abs(contrast) <= .02f;
+            }
             context->Unmap(next->image.Get(), 0);
-            if (have_previous_) votes_.Add(previous_.value, previous_.luma, sample.value, sample.luma);
-            previous_ = sample;
-            have_previous_ = true;
+            follow_ += follows >= 2;
+            invert_ += inverts >= 2;
+            flat_ += flat >= 2;
+            ++samples_;
             ++paired_;
         }
+    }
+
+    void Reject(Reader reader)
+    {
+        if (rejected_.size() >= 16) rejected_.erase(rejected_.begin());
+        rejected_.push_back(reader);
+    }
+
+    void RetireVerified()
+    {
+        Reject(verified_);
+        verified_ = {};
+        ordinary_gaps_ = 0;
+        ResetAttempt();
     }
 
     void ResetAttempt()
@@ -264,9 +350,9 @@ private:
         slots_ = {};
         original_.Reset();
         marker_view_.Reset();
-        issued_ = misses_ = 0;
-        votes_ = {};
-        marked_ = have_previous_ = delivered_this_frame_ = false;
+        issued_ = recent_miss_ = 0;
+        samples_ = follow_ = invert_ = flat_ = 0;
+        marked_ = seen_ = delivered_this_frame_ = false;
     }
 
     Id color_ = 0, depth_ = 0;
@@ -274,12 +360,16 @@ private:
     std::vector<Reader> rejected_;
     Texture original_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> marker_view_;
-    std::array<Slot, 6> slots_{};
-    Vote votes_;
-    Sample previous_{};
-    uint64_t opened_ = 0, marked_frame_ = 0;
-    uint32_t issued_ = 0, marked_draws_ = 0, misses_ = 0, delivered_draws_ = 0;
-    bool marked_ = false, have_previous_ = false, delivered_this_frame_ = false;
+    std::array<Slot, screen_marker::kSession> slots_{};
+    UINT samples_ = 0, follow_ = 0, invert_ = 0, flat_ = 0;
+    static constexpr uint32_t kOrdinaryGrace = 4;
+    uint64_t opened_ = 0;
+    static inline uint64_t next_proof_ = 0; // all provider screen state is under the frame lock
+    uint64_t proof_ = 0;
+    uint32_t issued_ = 0, reader_draws_ = 0, recent_miss_ = 0, delivered_draws_ = 0;
+    uint32_t ordinary_gaps_ = 0, ordinary_draws_ = 0;
+    bool marked_ = false, seen_ = false;
+    bool delivered_this_frame_ = false, ordinary_this_frame_ = false;
     uint64_t confirmed_ = 0, refuted_ = 0, paired_ = 0, delivered_ = 0;
 };
 

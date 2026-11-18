@@ -11,15 +11,14 @@ Texture2D<float4> t_motion : register(t4);
 RWByteAddressBuffer u_out  : register(u0);
 cbuffer C : register(b0) {
     uint src, base, w, h;          // which image (0..3), first float, its size
-    uint mw, mh, pad0, pad1;       // motion size
+    uint mw, mh, pad0, pad1;       // motion size for points, comparison grid size for tiles
     float sx, sy, djx, djy;        // DLSS's motion scale; jitter now minus jitter before (pixels)
     uint4 tileCells[2];
 };
 static const uint kThumbW = 128, kThumbH = 72, kTaps = 4, kTile = 32, kGridW = 96, kGridH = 54, kValues = 8;
 static const float2 kTileAt[8] = { float2(.22,.30), float2(.42,.26), float2(.62,.30), float2(.80,.34),
                                    float2(.20,.66), float2(.38,.72), float2(.60,.70), float2(.78,.64) };
-float luma(float4 c) { return log2(max(dot(c.rgb, float3(.2126, .7152, .0722)), 0) + 1e-4); }
-float load_log(uint which, int2 p, uint ww, uint hh) {
+float load_luma(uint which, int2 p, uint ww, uint hh) {
     p = clamp(p, int2(0, 0), int2(int(ww) - 1, int(hh) - 1));
     float4 c;
     [branch] switch (which) {
@@ -28,8 +27,9 @@ float load_log(uint which, int2 p, uint ww, uint hh) {
         case 2: c = t_output.Load(int3(p, 0)); break;
         default: c = t_screen.Load(int3(p, 0)); break;
     }
-    return luma(c);
+    return max(dot(c.rgb, float3(.2126, .7152, .0722)), 0) + 1e-4;
 }
+float load_log(uint which, int2 p, uint ww, uint hh) { return log2(load_luma(which, p, ww, hh)); }
 void store(uint i, float v) { u_out.Store((base + i) * 4, asuint(v)); }
 
 [numthreads(8, 8, 1)]
@@ -49,13 +49,26 @@ void thumb(uint3 id : SV_DispatchThreadID) {
 void tiles(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const uint k = gid.x;
     const uint cell = tileCells[k / 4][k % 4];
-    int2 centre = int2(kTileAt[k] * float2(w, h));
+    int2 centre = int2(kTileAt[k] * float2(mw, mh));
     if (cell != 0) {
         uint2 xy = uint2((cell - 1) % kThumbW, (cell - 1) / kThumbW);
-        centre = int2((2 * xy + 1) * uint2(w, h) / (2 * uint2(kThumbW, kThumbH)));
+        centre = int2((2 * xy + 1) * uint2(mw, mh) / (2 * uint2(kThumbW, kThumbH)));
     }
     const int left = centre.x - int(kTile / 2), top = centre.y - int(kTile / 2);
-    store((k * kTile + tid.y) * kTile + tid.x, load_log(src, int2(left + int(tid.x), top + int(tid.y)), w, h));
+    const int2 grid_pixel = int2(left + int(tid.x), top + int(tid.y));
+    float value;
+    if (mw == w && mh == h) value = load_log(src, grid_pixel, w, h);
+    else {
+        // One comparison footprint in screen pixels; map each pixel centre to
+        // the equivalent point in the source and filter linear luminance.
+        const float2 mapped = (float2(grid_pixel) + .5) * float2(w, h) / float2(mw, mh) - .5;
+        const int2 p = int2(floor(mapped));
+        const float2 f = frac(mapped);
+        const float a = lerp(load_luma(src, p, w, h), load_luma(src, p + int2(1, 0), w, h), f.x);
+        const float b = lerp(load_luma(src, p + int2(0, 1), w, h), load_luma(src, p + int2(1, 1), w, h), f.x);
+        value = log2(lerp(a, b, f.y));
+    }
+    store((k * kTile + tid.y) * kTile + tid.x, value);
 }
 
 // Bilinear in log luminance, pixel-centre coordinates (0.5 = the middle of column 0).
