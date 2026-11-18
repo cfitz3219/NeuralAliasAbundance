@@ -949,6 +949,16 @@ void DrawLiveDlaa()
     }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
+#ifdef NA_HAVE_REFEREE_SHADERS
+    auto& referee_enabled = na::settings::Get().referee_enabled;
+    bool referee_on = referee_enabled.load() != 0;
+    BeginRow("Referee", "Checks DLAA while you play and records its findings in the results log.", SwitchWidth());
+    if (Switch("referee", &referee_on)) {
+        referee_enabled.store(referee_on ? 1u : 0u);
+        na::settings::Save();
+    }
+    EndRow();
+#endif
     if (na::settings::AddedUpscalingAllowed() &&
         (na::scale::native::Available() || na::scale::SliderRouteActive() ||
          na::scale::GetAutomaticSceneStats().enabled || na::j2::ProjectionWindow() || na::j2::RenderSmall())) {
