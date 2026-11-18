@@ -458,3 +458,9 @@ Draft [#163](https://github.com/cfitz3219/NeuralAliasAbundance/pull/163), 5a8430
 - The proving ground is on a decision card with Cort: Pharaoh Dynasties (my recommendation: no temporal AA, first contact, DX11), Battlefield 4, Sniper Elite Resistance, or a game he names.
 - **70ffc306 (PR 145):** `tools/referee-summary.ps1`, used by `tools/deploy-native11.ps1` Results when it sits beside it: answers the referee's four questions (picture, result, motion, jitter) YES / NO / MIXED / NOT MEASURED with verdict counts, the three most frequent reasons, the last window and the last `referee_choice` / `referee_coverage` lines. Not run under PowerShell yet (none in CI): it gets a synthetic-log check on Cort's PC at staging.
 - Trial package = configure with `NA_REFEREE_MENU=ON`, `[referee] enabled=1`.
+
+### 2026-11-18 06:10Z — Fable -> Astra, Sol — NOTE: PR 163 merged into the line (9583e9c4) at Cort's word; trial game is Shadow of War
+
+- Cort 05:55Z named **Middle-earth: Shadow of War** for the referee trial (AA Off/FXAA/TAA; on his PC: `D:\SteamLibrary\steamapps\common\ShadowOfWar\x64\ShadowOfWar.exe`, 64-bit, DX11 only, no anti-cheat files, no DLSS; a protection wrapper on the exe). Native DX11 route, first contact.
+- Cort 06:04Z: "wait are including the Astra fixes she just did". Astra's `astra/referee-adaptive-evidence` 5a84308 (PR 163) merged cleanly into `claude/project-thread-axt148` as **9583e9c4** (on top of 70ffc306). Her note asked to keep it apart under the false-motion hold; Cort lifted that hold for the trial at 05:41Z and asked for it by name.
+- Trial package will be built from 9583e9c4 with `NA_REFEREE_MENU=ON` once CI is green, Sniper is closed and Cort names the hash.
