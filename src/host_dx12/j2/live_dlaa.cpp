@@ -120,6 +120,7 @@ struct PendingHistory {
     bool has_interlopers = false;
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
+    uint64_t referee_boundary = 0; // verified at the current recording, zero when unavailable
     na::j2::compute_flow::Ticket compute_flow;
     uint32_t depth_source=0, camera_source=0;
     uint64_t camera_age=0;
@@ -308,6 +309,7 @@ struct State {
     std::vector<na::j2::ColorEvent> frame_seq; // this frame's writes/consumers of the colour, submission order
     bool frame_seq_complete = true;
     uint64_t scene_color_id = 0;
+    bool scene_single_subresource = false;
     uint32_t scene_w = 0, scene_h = 0;         // selected colour, mip 0 (class size reference)
     bool class_fired = false;                   // this frame's DLAA was triggered by a class
     na::j2::ClassKey fired_class;
@@ -4813,11 +4815,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         id.mv_scale_y = e.mv_scale_y;
         id.reset = e.reset ? 1u : 0u;
         id.dlss_mv_jittered = e.mv_jittered;
+        id.dlss_mv_lowres = !e.mv_display_res;
         using na::referee::shadow::Path;
         const auto& route = g.router.Current();
         const na::referee::shadow::Context context{
-            {inl ? Path::Inline : Path::Between, route.signature}, color_id, depth_id, route.history_generation, csub};
+            {inl ? Path::Inline : Path::Between, pending.referee_boundary}, color_id, depth_id, route.history_generation, csub};
         pending.capture = na::capture::j2::RecordReferee(l, planes, id, e.render_w, e.render_h, e.out_w, e.out_h, context);
+    } else if (evaluated && e.reset) {
+        na::referee::gpu::NotifyEvaluationReset();
     }
     // A measured scene cut that DLSS has not been reset for yet: the temporal output still holds the
     // old scene, so those frames show the picture DLSS was given instead. Decided on the GPU, in
@@ -4859,6 +4864,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // Inline: the root-layout hash of the consumer class that triggered DLAA, when a class did,
         // else the route's boundary signature.
         ci.insertion_signature = inl ? (g.class_fired ? g.fired_class.root : rd.signature) : 0;
+        ci.referee_boundary = pending.referee_boundary;
         ci.color_sub = csub;
         ci.width = w;
         ci.height = h;
@@ -5306,6 +5312,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     bool touched = false;
     const uint32_t slot = g.slot;
     g.capture_entry=entry?*entry:na::j2::InsertionEvent{};
+    pending.referee_boundary = na::j2::BoundarySignature(current);
     bool ok = record(one, 0, depth_id, color_id, &out, pending, l, &touched);
     if (!ok && window_frame_now()) { // projection window: never leave the clipped corner on screen
         na::capture::j2::Discard(pending.capture, true);
@@ -8578,6 +8585,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     if (selected_color && selected_color != g.scene_color_id) {
         // A different scene image: its size is the class reference; the old profile does not apply.
         g.scene_color_id = selected_color;
+        g.scene_single_subresource = false;
         g.scene_w = g.scene_h = 0;
         g.profile.Clear();
         g.entries.Clear();
@@ -8585,6 +8593,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         c.Attach(na::observe::AcquireResource(selected_color));
         if (c) {
             const D3D12_RESOURCE_DESC cd = c->GetDesc();
+            g.scene_single_subresource = cd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && cd.MipLevels == 1 && cd.DepthOrArraySize == 1;
             g.scene_w = static_cast<uint32_t>(cd.Width);
             g.scene_h = cd.Height;
         }
@@ -8616,11 +8625,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             sum.color_writes = decision.writes;
             sum.reads = decision.all_reads + decision.derived_reads; // a read of a copy of the scene continues its chain
             sum.reads_after_last_write = decision.final_candidate ? 1u : 0u;
-            sum.clears_color = sum.renders_scene && na::observe::ListClearsTarget(lists[i], selected_color);
-            uint64_t sig = 1469598103934665603ull; // FNV-1a over the boundary's identity
-            for (uint64_t v : {decision.boundary_writer, static_cast<uint64_t>(decision.writer_occurrence), decision.destination, decision.pipeline})
-                sig = (sig ^ v) * 1099511628211ull;
-            sum.boundary_signature = decision.final_candidate ? sig : 0;
+            sum.consumed_after_last_write = decision.consumed_after_last_write;
+            sum.clears_color = g.scene_single_subresource && decision.cleared_full_view;
+            sum.boundary_signature = na::j2::BoundarySignature(decision);
             g.frame_agg.AddList(sum);
             if (sum.renders_scene) {
                 if (g.inline_mode && g.queue.Get() == queue && g.wwii_scene_camera.load(std::memory_order_relaxed) && vpj_mode()) {

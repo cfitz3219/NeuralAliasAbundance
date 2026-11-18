@@ -49,6 +49,7 @@ struct ListSummary {
     uint32_t reads = 0;          // all observed uses of the colour (reads) in this recording
     bool clears_color = false;   // the recording starts the image over
     uint64_t boundary_signature = 0; // stable identity of the in-recording boundary (writer PSO, occurrence, consumer)
+    bool consumed_after_last_write = false; // an observed graphics/compute/copy read, beyond a readable-state transition
 };
 
 // Per-frame structural observation, built from the frame's list summaries.
@@ -59,6 +60,7 @@ struct FrameObservation {
     bool boundary_inside_list = false; // the last scene-writing recording uses the colour after its last write
     bool consumer_in_later_list = false; // a later recording reads the colour after the last scene write
     uint64_t inline_signature = 0; // boundary_signature of that last scene-writing recording
+    bool inline_consumer = false;
     // Inputs (missing-evidence reporting; they do not choose the route).
     bool camera_missed = false, depth_state_missed = false;
     bool native_jitter = false;    // evidence only
@@ -73,19 +75,21 @@ struct FrameObservation {
 // the scene's consumer); a recording that clears the colour restarts the image.
 class FrameAggregator {
 public:
-    void Reset() { obs_ = {}; consumer_after_last_write_ = false; }
+    void Reset() { obs_ = {}; consumer_after_last_write_ = false; scene_version_alive_ = false; }
     void AddList(const ListSummary& s)
     {
         if (s.renders_scene && s.color_writes) {
-            if (s.clears_color) obs_.scene_lists = 0; // the image starts over
+            if (s.clears_color || !scene_version_alive_) obs_.scene_lists = 0;
+            scene_version_alive_ = true;
             obs_.scene = true;
             ++obs_.scene_lists;
             obs_.boundary_inside_list = s.reads_after_last_write > 0;
             obs_.inline_signature = s.boundary_signature;
+            obs_.inline_consumer = s.consumed_after_last_write;
             consumer_after_last_write_ = false;
             return;
         }
-        if (obs_.scene && s.reads && !s.color_writes) consumer_after_last_write_ = true;
+        if (scene_version_alive_ && s.reads && !s.color_writes) consumer_after_last_write_ = true;
         if (obs_.scene && s.color_writes && !s.renders_scene) {
             // Written outside the scene pass (e.g. a full-screen composite into it):
             // any consumer seen before this point read an earlier version.
@@ -96,6 +100,8 @@ public:
                 // (Astra R2). Ordinary composites into it keep the association.
                 obs_.boundary_inside_list = false;
                 obs_.inline_signature = 0;
+                obs_.inline_consumer = false;
+                scene_version_alive_ = false;
             }
         }
     }
@@ -108,6 +114,7 @@ public:
 private:
     FrameObservation obs_;
     bool consumer_after_last_write_ = false;
+    bool scene_version_alive_ = false;
 };
 
 struct RouteDecision {
@@ -115,7 +122,7 @@ struct RouteDecision {
     RouteState state = RouteState::Observe;
     uint64_t signature = 0;          // structural identity of the active route
     uint32_t history_generation = 0; // bumps whenever the route (or its signature class) changes
-    uint32_t matches = 0;            // consecutive frames proposing the same route + signature
+    uint32_t matches = 0;            // consecutive frames with the same dependency relationship
     uint32_t observed = 0;           // scene frames observed in the current window
     bool override_active = false;
     bool contribution_established = false; // lineage to Present observed in the last executed frame
@@ -144,6 +151,7 @@ public:
     {
         if (m == mode_) return;
         mode_ = m;
+        inline_consumers_ = exact_matches_ = 0;
         if (m == RouteMode::Auto) {
             d_.override_active = false;
             d_.state = RouteState::Observe;
@@ -178,7 +186,7 @@ public:
             d_.state = RouteState::Active;
             d_.matches = d_.observed = 0;
             last_proposal_ = Route::Interceptor;
-            last_sig_ = kInterceptorSignature;
+            inline_consumers_ = exact_matches_ = 0;
             d_.reason = "A supported upscaler call serves this view.";
             d_.missing = "";
             return d_;
@@ -219,8 +227,15 @@ public:
             why = "The scene completes at a command-list boundary; a later list reads it.";
         }
 
-        if (proposal == last_proposal_ && sig == last_sig_) ++d_.matches;
-        else { d_.matches = 1; last_proposal_ = proposal; last_sig_ = sig; }
+        if (proposal == last_proposal_ && sig == last_sig_) ++exact_matches_;
+        else { exact_matches_ = 1; last_proposal_ = proposal; last_sig_ = sig; }
+        // VARIANT: placement/observed-inline-consumers
+        // When signatures vary, count only actual consumers after the final scene write.
+        // Three changing state transitions alone must not open the new path.
+        inline_consumers_ = proposal == Route::Inline && o.inline_consumer ? inline_consumers_ + 1 : 0;
+        d_.matches = exact_matches_ > inline_consumers_ ? exact_matches_ : inline_consumers_;
+        if (inline_consumers_ >= kMatchesToAccept && exact_matches_ < kMatchesToAccept)
+            why = "Repeated reads after the final scene write establish inline placement across changing passes.";
         ++d_.observed;
 
         // Contradictions within the recent window (older ones age out).
@@ -243,7 +258,8 @@ public:
             set_route(Route::None, 0, "contradiction: the scene was written again after our insertion");
             d_.state = RouteState::Observe;
             d_.observed = 1;
-            d_.matches = 1;
+            exact_matches_ = d_.matches = 1;
+            inline_consumers_ = o.inline_consumer ? 1u : 0u;
             d_.reason = "Relearning after a contradiction.";
             return d_;
         }
@@ -316,6 +332,7 @@ private:
     uint64_t first_contradiction_frame_ = 0;
     Route last_proposal_ = Route::None;
     uint64_t last_sig_ = 0;
+    uint32_t exact_matches_ = 0, inline_consumers_ = 0;
 };
 
 } // namespace na::j2

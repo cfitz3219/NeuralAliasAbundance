@@ -1,5 +1,6 @@
 #pragma once
 #include "core/referee.hpp"
+#include <array>
 
 namespace na::referee::shadow {
 
@@ -36,6 +37,25 @@ struct Context {
     {
         return placement == other.placement && color == other.color && depth == other.depth &&
                generation == other.generation && subresource == other.subresource && width == other.width && height == other.height;
+    }
+};
+
+// Observe every eligible Present, including the ones that never produced a DLSS sample.
+// A gap, menu or another swap chain ends the sequence; it cannot establish a transition.
+struct DeliveryContinuity {
+    uint64_t changes = 0, longest_miss = 0;
+    uint64_t miss_run = 0, last_ordinal = 0;
+    const void* source = nullptr;
+    bool last_submitted = false;
+    void Observe(const void* swapchain, uint64_t ordinal, bool eligible, bool submitted)
+    {
+        const bool next = source && source == swapchain && ordinal > last_ordinal && ordinal - last_ordinal == 1;
+        if (eligible && next && submitted != last_submitted) ++changes;
+        miss_run = eligible && !submitted ? (next ? miss_run : 0) + 1 : 0;
+        longest_miss = (std::max)(longest_miss, miss_run);
+        source = eligible ? swapchain : nullptr;
+        last_ordinal = ordinal;
+        last_submitted = submitted;
     }
 };
 
@@ -77,6 +97,8 @@ inline Choice Preview(const Evidence& current, const Evidence* alternative = nul
         return {"hold", "the sample has no identified scene and placement"};
 
     const auto verdict = Judge(votes);
+    if (verdict.picture == Verdict::Pass && votes.output_frames && votes.input_frames)
+        return {"check_continuity", "some sampled screens favor the output and others the input", current.context.placement};
     if (verdict.picture == Verdict::Pass && verdict.result == Verdict::Pass &&
         StrongCount(votes.output_frames, votes.samples)) {
         if (verdict.motion == Verdict::Fail || verdict.jitter == Verdict::Fail)
@@ -102,5 +124,54 @@ inline Choice Preview(const Evidence& current, const Evidence* alternative = nul
     }
     return {"hold", "too little consistent evidence to change placement"};
 }
+
+// A rotating scene target or optional pass must not erase its other recent observations.
+// Keep only scores, never GPU resources. Unrelated presentations and resets start a new history.
+class RecentSamples {
+public:
+    static constexpr size_t capacity = 12;
+    void Clear() { count_ = next_ = 0; }
+    void Add(const Context& context, uint64_t ordinal, const SampleScore& score, Placement observed = {})
+    {
+        if (count_) {
+            const auto& last = entries_[(next_ + capacity - 1) % capacity];
+            if (ordinal <= last.ordinal || context.generation != last.context.generation) Clear();
+        }
+        entries_[next_] = {context, ordinal, score, observed};
+        next_ = (next_ + 1) % capacity;
+        if (count_ < capacity) ++count_;
+    }
+
+    Evidence For(const Context& context, uint64_t& first) const
+    {
+        first = 0;
+        Evidence e;
+        e.context = context;
+        for (size_t i = 0; i < count_; ++i) {
+            const auto& entry = entries_[(next_ + capacity - count_ + i) % capacity];
+            if (!(entry.context == context)) continue;
+            if (!e.measured.samples) first = entry.ordinal;
+            e.Add(entry.score, entry.observed);
+        }
+        return e;
+    }
+
+    Choice Choose(const Evidence& current) const
+    {
+        const auto decision = Preview(current);
+        if (decision.candidate.path == Path::None || decision.candidate == current.context.placement) return decision;
+        // Only compare the boundary independently observed on this scene's bypassed frames.
+        Context other = current.context;
+        other.placement = decision.candidate;
+        uint64_t first = 0;
+        const auto alternative = For(other, first);
+        return Preview(current, &alternative);
+    }
+
+private:
+    struct Entry { Context context; uint64_t ordinal = 0; SampleScore score; Placement observed; };
+    std::array<Entry, capacity> entries_{};
+    size_t next_ = 0, count_ = 0;
+};
 
 } // namespace na::referee::shadow

@@ -13,6 +13,7 @@ cbuffer C : register(b0) {
     uint src, base, w, h;          // which image (0..3), first float, its size
     uint mw, mh, pad0, pad1;       // motion size
     float sx, sy, djx, djy;        // DLSS's motion scale; jitter now minus jitter before (pixels)
+    uint4 tileCells[2];
 };
 static const uint kThumbW = 128, kThumbH = 72, kTaps = 4, kTile = 32, kGridW = 96, kGridH = 54, kValues = 8;
 static const float2 kTileAt[8] = { float2(.22,.30), float2(.42,.26), float2(.62,.30), float2(.80,.34),
@@ -47,7 +48,13 @@ void thumb(uint3 id : SV_DispatchThreadID) {
 [numthreads(32, 32, 1)]
 void tiles(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const uint k = gid.x;
-    const int left = int(kTileAt[k].x * float(w)) - int(kTile / 2), top = int(kTileAt[k].y * float(h)) - int(kTile / 2);
+    const uint cell = tileCells[k / 4][k % 4];
+    int2 centre = int2(kTileAt[k] * float2(w, h));
+    if (cell != 0) {
+        uint2 xy = uint2((cell - 1) % kThumbW, (cell - 1) / kThumbW);
+        centre = int2((2 * xy + 1) * uint2(w, h) / (2 * uint2(kThumbW, kThumbH)));
+    }
+    const int left = centre.x - int(kTile / 2), top = centre.y - int(kTile / 2);
     store((k * kTile + tid.y) * kTile + tid.x, load_log(src, int2(left + int(tid.x), top + int(tid.y)), w, h));
 }
 
@@ -61,6 +68,10 @@ float log_at(uint which, float2 q) {
     return lerp(lerp(v00, v10, a.x), lerp(v01, v11, a.x), a.y);
 }
 
+bool patch_visible(float2 q) {
+    return all(q >= 1.5) && all(q <= float2(w, h) - 1.5);
+}
+
 [numthreads(8, 6, 1)]
 void points(uint3 id : SV_DispatchThreadID) {
     if (id.x >= kGridW || id.y >= kGridH) return;
@@ -70,7 +81,12 @@ void points(uint3 id : SV_DispatchThreadID) {
     const uint mx = min(uint(x / float(w) * float(mw)), mw - 1), my = min(uint(y / float(h) * float(mh)), mh - 1);
     const float2 m = t_motion.Load(int3(mx, my, 0)).xy;
     const float2 v = m * float2(sx, sy), dj = float2(djx, djy);
-    if (any(!isfinite(v))) { [unroll] for (uint k = 0; k < kValues; ++k) store(at + k, -1); return; }
+    const float2 centre = float2(x, y);
+    if (any(!isfinite(v)) || any(!isfinite(dj)) || !patch_visible(centre) || !patch_visible(centre + v) ||
+        !patch_visible(centre + v - dj) || !patch_visible(centre + v + dj)) {
+        [unroll] for (uint k = 0; k < kValues; ++k) store(at + k, -1);
+        return;
+    }
     const float2 shift[6] = { float2(0, 0), v, v - dj, v + dj, .5 * v - dj, 2 * v - dj };
     float e[6] = { 0, 0, 0, 0, 0, 0 };
     float contrast = 0;
@@ -82,7 +98,7 @@ void points(uint3 id : SV_DispatchThreadID) {
             const float pv = log_at(0, q);
             contrast += .5 * (abs(log_at(0, q + float2(1, 0)) - pv) + abs(log_at(0, q + float2(0, 1)) - pv));
         }
-    [unroll] for (uint k = 0; k < 6; ++k) store(at + k, e[k] / 9);
+    [unroll] for (uint k = 0; k < 6; ++k) store(at + k, k >= 4 && !patch_visible(centre + shift[k]) ? -1 : e[k] / 9);
     store(at + 6, contrast / 9);
     store(at + 7, length(v));
 }

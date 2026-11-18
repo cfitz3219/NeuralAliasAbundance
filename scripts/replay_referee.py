@@ -51,9 +51,9 @@ def write_frame(stream, folder, meta, control):
             and meta.get("present_pairing") == "overlay_present"):
         screen = luma(*image(folder, meta, "present", width, height), width, height)
     if screen is not None:
-        if control == "bypass":
+        if control == "bypass" or (control == "alternating" and meta["index"] % 2):
             screen = color
-        elif control == "output":
+        elif control in ("output", "alternating"):
             screen = output
     have_screen = output is not None and screen is not None
 
@@ -66,7 +66,7 @@ def write_frame(stream, folder, meta, control):
     flags = int(have_screen) | (int(motion is not None) << 1) | (int(bool(meta.get("reset"))) << 2)
     stream.write(struct.pack(
         "<5Q5I4f", ordinal, view.get("color", 0), view.get("depth", 0),
-        meta.get("insertion_signature", 0), meta.get("history_generation", 0),
+        meta.get("referee_boundary", meta.get("insertion_signature", 0)), meta.get("history_generation", 0),
         route if route in (1, 2) else 0, view.get("color_sub", 0), width, height, flags,
         *meta.get("jitter_px", (0, 0)), *meta.get("mv_scale", (1, 1)),
     ))
@@ -84,8 +84,8 @@ def main():
     parser.add_argument("folder", type=Path)
     parser.add_argument("--runner", type=Path, required=True, help="built na_referee_replay executable")
     parser.add_argument("--frames", type=int, default=12)
-    parser.add_argument("--control", choices=("actual", "bypass", "output"), default="actual",
-                        help="bypass/output substitute captured input/output pixels for the exact screen image")
+    parser.add_argument("--control", choices=("actual", "bypass", "output", "alternating"), default="actual",
+                        help="controls substitute captured input, output or alternating saved images for the matched screen")
     args = parser.parse_args()
     if args.frames < 1:
         parser.error("--frames must be positive")

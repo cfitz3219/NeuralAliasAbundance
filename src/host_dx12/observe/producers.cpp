@@ -4668,7 +4668,7 @@ struct On<sl::list::ClearDepthStencilView> {
 };
 template <>
 struct On<sl::list::ClearRenderTargetView> {
-    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT* c, UINT, const D3D12_RECT*)
+    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT* c, UINT rect_count, const D3D12_RECT*)
     {
         Rec r;
         if (!begin_op(l, &r)) return;
@@ -4679,7 +4679,7 @@ struct On<sl::list::ClearRenderTargetView> {
         note_uses(l, {v.resource});
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, na::j2::Op::ClearWrite});
+            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, rect_count ? na::j2::Op::ClearWrite : na::j2::Op::FullViewClear});
             if (v.resource == ls.pending_entry) ls.pending_entry = 0;
             if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
                 ls.cleared.push_back(v.resource);
@@ -4794,7 +4794,7 @@ struct On<sl::list::BeginRenderPass> {
             ls.native_depth=std::move(depth_view);
             for (uint32_t i = 0; i < nrt; ++i) {
                 if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
-                ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::ClearWrite});
+                ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::FullViewClear});
                 if (ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), refs[i].resource) == ls.cleared.end())
                     ls.cleared.push_back(refs[i].resource);
             }

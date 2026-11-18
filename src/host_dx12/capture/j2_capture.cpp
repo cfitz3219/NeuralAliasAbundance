@@ -230,8 +230,8 @@ void write_slot(const Slot& s)
         mat("vp_current_row", id.vp_cur, ",");
         mat("vp_previous_row", id.vp_prev, ",");
         mat("inv_vp_current_row", id.inv_vp_cur, "");
-        std::fprintf(fp, "  },\n  \"selection_version\": %llu,\n  \"tracker_restart\": %u,\n  \"cut_reason\": %u,\n  \"depth_reversed\": %u,\n  \"flow\": {\"ran\": %u, \"loosen\": %u, \"colour_jitter\": [%.6f, %.6f], \"convention\": %u, \"epoch\": %llu},\n",
-            (unsigned long long)id.selection_version, id.tracker_restart, id.cut_reason, id.depth_reversed, id.flow_ran, id.flow_loosen,
+        std::fprintf(fp, "  },\n  \"referee_boundary\": %llu,\n  \"selection_version\": %llu,\n  \"tracker_restart\": %u,\n  \"cut_reason\": %u,\n  \"depth_reversed\": %u,\n  \"flow\": {\"ran\": %u, \"loosen\": %u, \"colour_jitter\": [%.6f, %.6f], \"convention\": %u, \"epoch\": %llu},\n",
+            (unsigned long long)id.referee_boundary, (unsigned long long)id.selection_version, id.tracker_restart, id.cut_reason, id.depth_reversed, id.flow_ran, id.flow_loosen,
             id.flow_jitter_x,id.flow_jitter_y,id.flow_jitter_convention,(unsigned long long)id.flow_jitter_epoch);
         std::fprintf(fp, "  \"dlss\": {\"hdr\": %s, \"depth_inverted\": %s, \"auto_exposure\": %s, \"mv_lowres\": %s, \"mv_jittered\": %s, "
             "\"pre_exposure\": %.6g, \"exposure_scale\": %.6g, \"quality\": %u, \"bias_current_color\": %s, \"jitter_shifted\": %s},\n"
@@ -387,6 +387,7 @@ uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& p, const I
     e.render_w = render_w; e.render_h = render_h;
     e.output_w = output_w; e.output_h = output_h;
     e.mv_jittered = id.dlss_mv_jittered;
+    e.mv_display_res = !id.dlss_mv_lowres;
     e.jitter_x = id.jitter_x; e.jitter_y = id.jitter_y;
     e.mv_scale_x = id.mv_scale_x; e.mv_scale_y = id.mv_scale_y;
     e.reset = id.reset != 0;

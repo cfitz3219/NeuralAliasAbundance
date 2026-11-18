@@ -31,6 +31,7 @@ struct Evaluation {
     bool reset = false;               // DLSS history reset: no pair across it
     bool owns_present = false;        // render-small: the output is the presented image (not judged)
     bool mv_jittered = false;
+    bool mv_display_res = false;
     shadow::Context context;
 };
 
@@ -47,6 +48,8 @@ struct Presentation {
 
 // Cheap: whether the next evaluation should be offered (a sample is due or half taken).
 bool Wanted();
+// A provider can reset DLSS history between scheduled samples.
+void NotifyEvaluationReset();
 // In the evaluation's list, after DLSS ran. Returns a token (0: nothing recorded).
 uint32_t Record(ID3D12GraphicsCommandList* list, const Evaluation& e);
 void Submitted(uint32_t token, ID3D12CommandQueue* queue);

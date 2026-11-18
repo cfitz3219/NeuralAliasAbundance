@@ -195,12 +195,52 @@ int main()
         for (int frame = 0; frame < 2; ++frame) current.Add(good);
         for (int frame = 0; frame < 3; ++frame) alternative.Add(good);
         check(!std::strcmp(Preview(current, &alternative).action, "keep"), "shadow: keep a verified current route");
+        current.Add(bypass);
+        check(!std::strcmp(Preview(current).action, "check_continuity") && Judge(current.measured).result == Verdict::Partial,
+              "shadow: three visible outputs and a confirmed bypass report intermittent delivery");
         current.measured = {};
         for (int frame = 0; frame < 3; ++frame) current.Add(bypass);
         check(!std::strcmp(Preview(current).action, "check_placement"), "shadow: bypass alone does not establish another boundary");
         check(!std::strcmp(Preview(current, &alternative).action, "prefer"), "shadow: a verified same-scene alternative beats a bypassed route");
         alternative.context.color++;
         check(!std::strcmp(Preview(current, &alternative).action, "check_placement"), "shadow: an alternative for another scene cannot replace the current one");
+        RecentSamples recent;
+        Context producer = current.context, different = producer;
+        different.color++;
+        Context other = producer;
+        other.placement = between;
+        uint64_t ordinal = 0, first;
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            recent.Add(producer, ++ordinal, bypass, between);
+            recent.Add(different, ++ordinal, bypass);
+            recent.Add(other, ++ordinal, good);
+        }
+        const auto candidates = recent.For(producer, first);
+        check(first == 1 && candidates.measured.samples == 3 &&
+              !std::strcmp(recent.Choose(candidates).action, "prefer"),
+              "shadow: rotating exact contexts retain independent screen evidence for the observed alternative");
+        for (size_t i = 0; i < RecentSamples::capacity; ++i) recent.Add(different, ++ordinal, bypass);
+        check(!recent.For(producer, first).measured.samples, "shadow: stale context ages out");
+        different.generation++;
+        recent.Add(different, ++ordinal, good);
+        check(recent.For(different, first).measured.samples == 1, "shadow: new generation starts clean");
+        recent.Add(different, ordinal, bypass);
+        check(recent.For(different, first).measured.samples == 1, "shadow: repeated ordinal cannot vote twice");
+
+        DeliveryContinuity alternating, grouped;
+        for (uint64_t i = 0; i < 12; ++i) {
+            alternating.Observe(&producer, i, true, i % 2 == 0);
+            grouped.Observe(&producer, i, true, i < 6);
+        }
+        check(alternating.changes == 11 && alternating.longest_miss == 1 &&
+              grouped.changes == 1 && grouped.longest_miss == 6,
+              "coverage: distinguish rapid cycling and one long gap at identical submission rates");
+        grouped.Observe(&producer, 12, false, false);
+        grouped.Observe(&producer, 13, true, true);
+        grouped.Observe(&different, 14, true, false);
+        grouped.Observe(&different, 18, true, true);
+        check(grouped.changes == 1 && grouped.longest_miss == 6,
+              "coverage: menus, another chain and an ordinal gap cannot manufacture transitions");
         current.measured = {};
         for (int frame = 0; frame < 3; ++frame) current.Add(bypass, between);
         check(!std::strcmp(Preview(current).action, "probe"), "shadow: a repeated observed boundary is a probe candidate");
@@ -234,6 +274,12 @@ int main()
         Window w;
         const Verdicts v = motion_case(now, before, 0, 0, jn, jb, &w);
         check(v.motion == Verdict::Fail, "motion: zero vectors on a moving picture are caught");
+    }
+    { // A prior-frame position far outside the image supplies no evidence.
+        Window w;
+        const Verdicts v = motion_case(now, before, 1e30f, 0, jn, jb, &w);
+        check(w.total.points == 0 && v.motion == Verdict::NotMeasured && v.jitter == Verdict::NotMeasured,
+              "motion: off-screen projections cannot vote against a working motion source");
     }
     { // half the vectors
         Window w;
