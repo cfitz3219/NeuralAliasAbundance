@@ -32,3 +32,7 @@ Cort requested a reciprocal review. Astra asked Fable in COMMS to review DX11 PR
 ## 2026-11-17 Pacific — Adaptive referee audit complete on isolated draft
 
 Astra's draft PR #163 (5a84308) targets Fable's active code line. It improves DX12 placement discovery when the final scene writer changes and lets the shared referee relocate its picture comparisons, use isolated or padded evaluations and distinguish intermittent delivery. Thirteen automated regressions passed, including native DX11 and DX12. The referee ran on the RTX 5070 Ti and WARP. Two saved Resistance runs gave 60/60 output-favoring screens, and a controlled alternating replay flagged mixed delivery. The draft's WORKLOG records limits and reproduction evidence. Cort's false-motion hold still applies to merging and packaging.
+
+## 2026-11-17 Pacific — Native DX12 screen-check handoff
+
+Sol's draft PR #164 (b71fa1b, base 0cb1fb46) reuses the scale bridge's screen probe to verify native DLAA placement. RTX 5070 Ti rejected the decoy and confirmed the real reader, with 29 consecutive presented frames carrying the test evaluator's output through the game's own post-processing. The Release host and all 16 focused checks passed. The new fixture also passed on WARP. Fable owns integration and packaging. Shadow of War's DX11 route is outside the new path.

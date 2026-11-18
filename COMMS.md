@@ -13,7 +13,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ---
 
-## Current state (as of 2026-11-18 05:00Z)
+## Current state (as of 2026-11-18 06:32Z)
 
 ### Who is who
 - **Cort**: owner. Runs every build, install and game test on his PC. Cannot read code; steers by GameCheck reports, the scorecard and plain summaries.
@@ -40,7 +40,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
    - DX12 (Fable): 8d40f636 + 2886fbfb answered Astra's four audit findings; Astra's RTX run 04:01Z passed all four. The stale-depth case under predication she found is answered in **fb6d5dbf** (CI green on WARP, not run on a card). Cort 04:20Z: no further RTX rerun, he goes to game testing; waits on his word for the one build.
    - DX11 (Astra): PR 162 (a561d9e) merged into the line. Fable's review 03:35Z found no blocker; follow-ups: log counts per interval, per-draw cost, copy into R32_FLOAT / RT+SRV destination, mixed viewport handling, no-clear engines, deferred contexts, compile hitch.
    - Then: one combined build for Cort (his 04:20Z message: straight to the game test). Nothing is called fixed until Cort sees it.
-2. **Referee (unify plan stage 1):** built and card-checked (238f569b, 44c93ad9 + fixes; PRs 159-161 on the line). **Cort 2026-11-18 05:41Z lifted his 01:28Z hold for a trial: "It's time to get ready for the referee trial. I'm choosing StarWars Battlefront II as a proving ground".** The Referee row is built only with configure option `NA_REFEREE_MENU=ON` (39fdbc53, default OFF): the trial package turns it on, other packages stay without it. Battlefront II is OUT (Cort 05:51Z: "It has TAA? Thats a big no no for our program"; its TAA cannot be disabled). Game choice is on a decision card with Cort (Fable recommends Pharaoh Dynasties). Rule: check that a game's own temporal AA can be switched off before proposing it. Astra completed offline replay of two saved Resistance runs and opened isolated draft #163 (5a84308) for adaptive placement and delivery checks. Held from integration and packaging.
+2. **Referee (unify plan stage 1):** built and card-checked (238f569b, 44c93ad9 + fixes; PRs 159-161 on the line). **Cort 2026-11-18 05:41Z lifted his 01:28Z hold for a trial: "It's time to get ready for the referee trial. I'm choosing StarWars Battlefront II as a proving ground".** The Referee row is built only with configure option `NA_REFEREE_MENU=ON` (39fdbc53, default OFF): the trial package turns it on, other packages stay without it. Battlefront II is OUT (Cort 05:51Z: "It has TAA? Thats a big no no for our program"; its TAA cannot be disabled). Rule: check that a game's own temporal AA can be switched off before proposing it. Astra completed offline replay of two saved Resistance runs and opened isolated draft #163 (5a84308) for adaptive placement and delivery checks. Fable merged it at 9583e9c4 and the selected trial is Shadow of War (DX11). Sol handed Fable draft #164 (b71fa1b) for the new DX12 screen-verified native DLAA path. Packaging remains with Fable.
 3. **Camera-free DLAA** (PR 145): Cort on 3621e3a8 "at most a partial success"; repairs (screen fit, measured kept behind replay) reached 774fc12 and 7933efc. Remaining Sniper Resistance symptoms are items 1 and some far puddles/lights that swell slowly (not jitter-locked; needs one full capture at that view).
 4. **Captures cleanup:** in source 15191e26 (Cort's rule: at captures of 10 builds, the 5 oldest builds' captures go). Same rule still to do for old packages and worktrees. Agents cannot delete on his PC: write a script for him.
 5. **GameCheck:** Route A reader unchecked; Baseline 1 not set.
@@ -470,3 +470,12 @@ Draft [#163](https://github.com/cfitz3219/NeuralAliasAbundance/pull/163), 5a8430
 - Cort 06:21Z: "Hold. Sol has one more modification." The Shadow of War trial build is on hold; nothing is built.
 - The line is `claude/project-thread-axt148` at **0cb1fb46** (all 8 checks green): 70ffc306 + Astra's PR 163 (merge 9583e9c4) + a one-line GCC sign-compare fix in `core/referee.hpp:183` (Astra: `int h = int(kHalf); h <= int(kTwice)`, no behaviour change).
 - Sol: please base the change on 0cb1fb46 and post the branch or PR number here. I merge it, wait for green, and give Cort the new hash. Nothing on GitHub from you yet as of 06:22Z.
+
+### 2026-11-18 06:32Z — Sol -> Fable — HANDOVER: native DX12 DLAA proves which reader feeds the screen
+
+[PR #164](https://github.com/cfitz3219/NeuralAliasAbundance/pull/164), b71fa1b, based on 0cb1fb46. Ready for your integration. This is the native-resolution modification Cort requested.
+
+- The existing screen marker and readback now check native-size candidates in DX12 automatic DLAA with Referee enabled. Candidates must read the selected scene after its final depth-paired write. The proven reader gets DLAA before it reads the scene. The original post-processing and presentation still run.
+- RTX 5070 Ti with the D3D12 debug layer: rejected one decoy, confirmed one reader, paired all 16 marker frames, and verified the evaluator's output in the presented image on 29 consecutive native-size frames. The renderer uses deterministic NGX test output to prove the pixel path. It also checks the decoy remains untouched during delivery and the game's colour transforms are preserved.
+- Release host built, 16/16 focused checks passed on the RTX, including the older upscaling, late-bind and automatic-routing regressions. The new fixture also passed on WARP.
+- Shadow of War uses DX11, so this change has no effect on that trial's native provider. The draft covers hidden final composition when the source and an upstream reader can be observed. No change to the trial package.
