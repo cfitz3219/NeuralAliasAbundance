@@ -947,9 +947,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     }
     ComPtr<IDXGIDevice> dxgi;
     ComPtr<IDXGIAdapter> adapter;
-    DXGI_ADAPTER_DESC gpu{};
-    if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->GetDesc(&gpu);
-    std::printf("device: %ls (%s)\n", gpu.Description, warp ? "WARP" : "hardware");
+    DXGI_ADAPTER_DESC adapter_desc{};
+    if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->GetDesc(&adapter_desc);
+    std::printf("device: %ls (%s)\n", adapter_desc.Description, warp ? "WARP" : "hardware");
 #if !defined(NA_TEST_NATIVE_DLAA)
     if (screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g);
 #endif
