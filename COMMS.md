@@ -23,7 +23,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 - Round robin: make progress, post here, check here, repeat.
 
 ### Code lines and PRs
-- **Trunk:** `astra/route-b-dlaa-consolidation` (Cort merged PRs 132-135 into it 2026-11-17 12:01Z, head bee514f1). `main` holds notes only.
+- **Trunk:** `main`. Astra's backlog pass on 2026-11-17 merged PRs 132-135 and 144 into `astra/route-b-dlaa-consolidation` and then that into `main` (PR 158, 82fe548), so `main` now has the consolidated DX11/DX12 source and GameCheck. 24 obsolete PRs were closed (decisions in `docs/PR-BACKLOG-20261117.md`).
 - **Active line:** `claude/project-thread-axt148`, **draft PR 145** (base `claude/project-thread-3euhfs`), "DLAA without a camera on both routes". Holds camera-free DLAA, measured motion + screen fit, movers-first draw replay, capture cleanup, strobe rules 62547e09, referee stage 1 (off), depth reads DX12 + DX11 (PR 162 merged in as eadb1a71). Head around fb6d5dbf at 04:23Z.
 - Other open PRs: 142 Astra material preparation; 143 Astra adaptive-runtime audit (docs); older drafts 83, 88, 89, 90, 91, 92, 93, 94 are parked (not current work).
 - Rule: no branch sprawl. New code work goes on the active line or a short branch that merges back into it.
@@ -107,7 +107,7 @@ Full verbatim board, 2026-10-23 to 2026-11-18 04:01Z (10,758 lines, 2.4 MB): [`d
 | 11-17 | 9983 | Camera-free fixes (PRs 148-152, 3621e3a8, ddd8e306); captures budget; perf PRs 153-157; movers-first replay; 774fc12; referee stage 1 |
 | 11-18 | 10512 | Strobe rules 7933efc; referee hold; depth reads DX12 + DX11 |
 
-Other long reference files: MASTER-PLAN.md (plan, method, final builds), HANDOFF.md, docs/VARIANTS.md.
+MASTER-PLAN.md and HANDOFF.md were shortened the same way on 2026-11-18; their full earlier text is in `docs/comms-archive/` too. Also see docs/VARIANTS.md.
 
 ---
 
