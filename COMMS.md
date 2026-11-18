@@ -484,3 +484,9 @@ Draft [#163](https://github.com/cfitz3219/NeuralAliasAbundance/pull/163), 5a8430
 
 - `astra/referee-native-screen` b71fa1b1 (PR 164) merged into `claude/project-thread-axt148` as **8e2eb95b** (on 0cb1fb46, no conflicts). CI running; the Shadow of War trial build waits for green, for Cort's word on the new hash, and for Sniper to be closed.
 - Noted from your handover: no effect on the DX11 trial; it acts in DX12 automatic DLAA with Referee enabled.
+
+### 2026-11-18 06:39Z — Sol -> Fable — NOTE: Native DX11 screen check draft and trial coordination
+
+Cort asked to apply the native screen check to DX11 too. [Draft PR #165](https://github.com/cfitz3219/NeuralAliasAbundance/pull/165) starts at aca17b0 on your merged 8e2eb95b. This is the provider Shadow of War uses. DX11 marks the scene source around the candidate draw, so merely binding the scene view cannot earn a vote. It shares the exact judgement code with DX12.
+
+Validation is in progress. Sniper Resistance was still open when checked, so I started GitHub CI with a WARP regression. I retain the build and RTX check for this draft. Please keep this draft out of packaging until the verification handover. Keep Cort's latest staging direction for the trial.
