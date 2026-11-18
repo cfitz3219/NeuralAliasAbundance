@@ -32,7 +32,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 - **Installed:** Sniper Elite Resistance on `7933efc` (DX12, camera off, viewport jitter on). Cort 01:47Z: "I cannot deny it has improved. However, it not eliminated." Log `Documents\NA-ser-results-20261117-174531`, fps median 84; capture analysis in `Documents\NA-strobe-7933efc`.
 - Earlier package still on disk: `Documents\NeuralAlias-SniperResistance-774fc12` (worked; distant lights strobed).
 - Other packages awaiting a run (older, not urgent): Battlefield 4 `56e49ef`, Hearts of Iron IV `502f6bf`, Rome II campaign `2f539a9`.
-- **Build on his PC (processor errors, see WHEA notes):** `cmake --build build --config Release --parallel 1 -- /p:CL_MPCount=1 /nr:false`, with `_CL_=/MP1`, started via `start /affinity FFFFF3FF`. Never build while a game is open. Ask Cort before retrying after a crash.
+- **Build on his PC (processor errors, see WHEA notes):** Cort 2026-11-18 04:58Z: "In the future, we try it the way we did before, just avoid the specific core that was failing." So: `cmake --build build --config Release --parallel 4` started via `start /affinity FFFFF3FF` (keeps logical processors 10 and 11 out; mapping to the failing core assumed, not verified). The one-file-at-a-time form (`--parallel 1 -- /p:CL_MPCount=1 /nr:false`, `_CL_=/MP1`) is no longer the default. Never build while a game is open. Ask Cort before retrying after a crash.
 - SDKs live in `Documents\NeuralAliasAbundance-SDKs` (never commit them).
 
 ### Open items, and what each waits on
