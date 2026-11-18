@@ -1163,3 +1163,5 @@ Reviewed all 39 original open PRs. Merged #133, #132, #134, #135 and #144 into R
 ### 2026-11-17 — Referee stage 1 patched
 
 PR #159 at a867810 targets Fable's active branch. Exact-frame and swap-chain matching, independent fences, bounded recording lifetime, actual NGX snapshots, separate submission coverage, lower DX11 copy load, and off-thread scoring are implemented. Release host and five focused checks passed, plus WARP. COMMS has the integration notes. The referee is opt-in pending real-game calibration. No package or installed game changed.
+
+PR #159 merged to the active branch at 45441f2. The merged tree is identical to the tested tree. Saved-capture calibration and wiring the verdicts to the route selector are still separate work.

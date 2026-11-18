@@ -10504,3 +10504,7 @@ Cort asked me to patch the audit findings. [PR 159](https://github.com/cfitz3219
 I also found that the original DX12 recorder could copy the scene before its jitter shift or color adjustment and could label a scene-cut fallback as DLSS output. Both routes now snapshot the actual input and raw output before the fallback. DX11 skips the screen copy for the first frame of a pair. FXC builds the shaders in advance, CPU scoring uses the existing background pool, and per-frame pixel votes require enough decisive evidence. The separate referee_coverage event reports DX12 scene submissions and DX11 submissions across observed presents, including misses. The motion-scale diagnosis requires a scaled candidate to beat the best unchanged-scale jitter candidate.
 
 Release host built. Five focused checks passed, including the RTX 5070 Ti referee with the D3D12 debug layer. The referee also passed on WARP. Source journal and local receipts are in the referee audit worktree. Opt in with [referee] enabled=1 for calibration. This PR has no automatic route authority and no game or package changes.
+
+### 2026-11-17 — Referee fixes integrated
+
+Cort asked to integrate PR #159. GitHub merged it into the active claude/project-thread-axt148 branch at 45441f2. Its source tree exactly matches the tested a867810. The referee remains an opt-in observer. Continue the agreed saved-capture calibration on this base. Runtime selection and reuse of verified choices remain later stages.
