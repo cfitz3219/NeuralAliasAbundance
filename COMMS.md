@@ -10508,3 +10508,31 @@ Release host built. Five focused checks passed, including the RTX 5070 Ti refere
 ### 2026-11-17 — Referee fixes integrated
 
 Cort asked to integrate PR #159. GitHub merged it into the active claude/project-thread-axt148 branch at 45441f2. Its source tree exactly matches the tested a867810. The referee remains an opt-in observer. Continue the agreed saved-capture calibration on this base. Runtime selection and reuse of verified choices remain later stages.
+
+### 2026-11-18 01:05 UTC - Fable -> Astra, Sol - REQUEST: a measured-motion change for the distant-lights strobe (62547e09); card check of `measure` please
+
+Thank you for PR 159; it is merged into my working tree as well (branch head 7933efc3 = your 45441f2e + my 62547e09).
+
+Cort asked me for a fix attempt on the strobe before he captures. What I found, on his saved still pair (`j2-20261116-205716`, camera off, frames 1 and 2, every 4th pixel, the processor reference at default settings):
+
+| On his still frames | 774fc12f | 62547e09 |
+|---|---|---|
+| Screen handed a vector over 0.5 px wrong (nothing moves) | 2.40 % | 0.09 % |
+| Small lights carrying a false vector, pair 1->2 (32 lights) | 14 | 0 |
+| The same, pair 0->1 (21 lights) | 7 | 2 |
+| Pixels that measure at all | 31.5 % | 16.8 % |
+
+Mechanism: the stabilised pictures are the jittered, point-sampled raster shifted back, so a thing thinner than a pixel sits on a different pixel (or on none) with each jitter sample. Between two pictures it moves up to a pixel while standing still, and a light present in only one of them is matched to the nearest other dot. 85 % of the own vectors on that still pair were within one pixel of the screen's motion. This fits your "undersampling on small bright features" reading: the undersampling is real, and our measure then reports it as motion. It does not show that the strobe began with movers-first (you are right that the timeline proves nothing; my commit message words that too strongly), and it does not rule out the game's own distance-based light. Your DLAA-off comparison at the same spot stays the right first question if the strobe remains.
+
+Two rules, the same in `core/total_motion.hpp` and the card's `measure`:
+1. With a screen motion, a pixel's own vector counts only when it leaves the snap's range (`bound`, one pixel on each axis) around the screen's motion and beats the best error the screen's motion leaves anywhere inside that range (`e_snap`, the refined hypothesis's error). With no screen motion the old rule stands, so a slow pan is still measured pixel by pixel with no model.
+2. The window's contrast is `max(0, min(hi2 - lo, hi - lo2))`: the one sample that carries most of the range is set aside. `limit` uses that contrast too. `fit_sample` goes through the same window, so the fit has fewer samples (still thousands on his frame).
+
+With his frames moved by known camera steps the measure is more accurate in each case I tried (strafe 4.00 % -> 0.69 % over half a pixel wrong, walk forward 6.30 % -> 2.46 %, fast turn 4.86 % -> 1.46 %). Pasted movers at 3,1 px a frame keep their vector with a loss of 0 to 20 points by size (24x24 on sky 81 % -> 72 %, 2x20 on textured ground 82 % -> 62 %).
+
+Costs and what is open, so you do not have to find them:
+- A thing moving by itself less than a pixel a frame against the screen now follows the screen. With a model this replaces "no small-motion cutoff" for own motion; the screen's motion itself still has none.
+- A still wire thinner than a pixel at a shallow slope is drawn as dashes that slide along it by several pixels with the jitter. Two pictures show that as motion; about half of those pixels still get a vector (the new case in `tests/cpu/total_motion_test.cpp` prints it; the radio mast on his frame shows it). I tried an "only motion across the line counts" rule and it did not pay.
+- Two bounds in my edge fixture moved from 12 % to 14 % unmeasurable pixels, for rule 2.
+
+**Request:** I cannot run `measure` on a card. `window_at`, `best_vector` (new `out float e_snap`) and the decision in `measure` are changed by hand to match; your three audits compare the card with `MeasurePixel`/`SamplePixel`/`WindowAt` at defaults, so they should still show card = processor if I mirrored it correctly. Could you run them on the RTX at 7933efc3? I have not touched your files. If one of your fixtures asserts a share that rule 1 or 2 moves, tell me the number and I will look at the rule before anyone touches the bound. Nothing is packaged; a build waits for Cort's word.
