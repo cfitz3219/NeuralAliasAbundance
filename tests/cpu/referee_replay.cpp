@@ -16,10 +16,12 @@ bool Read(T* data, size_t count)
     return std::fread(data, sizeof(T), count, stdin) == count;
 }
 
-void Report(const Evidence& evidence, uint64_t first, uint64_t last)
+void Report(const RecentSamples& recent, const Context& context, uint64_t last)
 {
+    uint64_t first;
+    const auto evidence = recent.For(context, first);
     if (!evidence.measured.samples) return;
-    const auto choice = Preview(evidence);
+    const auto choice = recent.Choose(evidence);
     char details[2048];
     Format(details, sizeof details, evidence.measured, Judge(evidence.measured));
     std::printf("frames=%llu..%llu current=%s action=%s candidate=%s why=\"%s\"\n%s\n",
@@ -34,10 +36,15 @@ int main()
     if (_setmode(_fileno(stdin), _O_BINARY) == -1) return 2;
 #endif
     static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
-    Evidence evidence;
+    RecentSamples recent;
+    Window all_frames;
+    Context previous_context;
+    bool have_previous = false;
     Image previous;
+    TileLocations locations;
+    Context tile_context;
     std::array<float, 2> prior_jitter{};
-    uint64_t previous_ordinal = 0, first = 0, last = 0;
+    uint64_t previous_ordinal = 0;
     std::vector<float> values(kResultFloats);
     for (;;) {
         uint64_t ids[5]; // ordinal, colour, depth, boundary and history generation
@@ -49,16 +56,14 @@ int main()
         const uint32_t width = info[2], height = info[3], flags = info[4];
         if (!width || !height || width > 8192 || height > 8192 || info[0] > uint32_t(Path::Native11)) return 2;
         const uint64_t ordinal = ids[0];
-        if (evidence.measured.samples && ordinal <= last) return 2;
+        if (have_previous && ordinal <= previous_ordinal) return 2;
         const Context context{{Path(info[0]), ids[3]}, ids[1], ids[2], ids[4], info[1], width, height};
-        if (!evidence.measured.samples || !(evidence.context == context) || (flags & 4)) {
-            Report(evidence, first, last);
-            evidence = {};
-            evidence.context = context;
-            first = ordinal;
+        if (have_previous && (!(previous_context == context) || (flags & 4))) {
+            Report(recent, previous_context, previous_ordinal);
             previous = {};
         }
-        last = ordinal;
+        if (flags & 4) { recent.Clear(); locations = {}; }
+        const TileLocations active_tiles = context == tile_context ? locations : TileLocations{};
 
         const size_t count = size_t(width) * height;
         Image current{width, height, std::vector<float>(count)};
@@ -67,13 +72,13 @@ int main()
         if (screen) {
             Image comparison{width, height, std::vector<float>(count)};
             SampleThumb(current, values.data() + BlockOffset(kThumbInput));
-            SampleTiles(current, values.data() + BlockOffset(kTileInput));
+            SampleTiles(current, values.data() + BlockOffset(kTileInput), active_tiles);
             if (!Read(comparison.v.data(), count)) return 2;
             SampleThumb(comparison, values.data() + BlockOffset(kThumbOutput));
-            SampleTiles(comparison, values.data() + BlockOffset(kTileOutput));
+            SampleTiles(comparison, values.data() + BlockOffset(kTileOutput), active_tiles);
             if (!Read(comparison.v.data(), count)) return 2;
             SampleThumb(comparison, values.data() + BlockOffset(kThumbScreen));
-            SampleTiles(comparison, values.data() + BlockOffset(kTileScreen));
+            SampleTiles(comparison, values.data() + BlockOffset(kTileScreen), active_tiles);
         }
         bool pair = false;
         const float dx = temporal[0] - prior_jitter[0], dy = temporal[1] - prior_jitter[1];
@@ -87,12 +92,22 @@ int main()
                 SamplePoints(input, values.data() + BlockOffset(kPoints));
             }
         }
-        evidence.Add(Score({values.data(), screen, screen, pair, std::hypot(dx, dy)}));
+        const auto score = Score({values.data(), screen, screen, pair, std::hypot(dx, dy)});
+        recent.Add(context, ordinal, score);
+        all_frames.Add(score);
+        if (screen && score.tiles_textured < kTiles / 2) {
+            locations = FindTexturedTiles(values.data());
+            tile_context = context;
+        }
+        previous_context = context;
+        have_previous = true;
         previous = std::move(current);
         previous_ordinal = ordinal;
         prior_jitter = {temporal[0], temporal[1]};
     }
-    if (!evidence.measured.samples) return 2;
-    Report(evidence, first, last);
+    if (!have_previous) return 2;
+    Report(recent, previous_context, previous_ordinal);
+    std::printf("entire_recording samples=%u output_frames=%u input_frames=%u neither_frames=%u motion_pairs=%u\n",
+                all_frames.samples, all_frames.output_frames, all_frames.input_frames, all_frames.neither_frames, all_frames.motions);
     return 0;
 }

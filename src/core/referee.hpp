@@ -108,18 +108,37 @@ inline void SampleThumb(const Image& im, float* out)
             out[j * kThumbW + i] = s / float(kThumbTaps * kThumbTaps);
         }
 }
-inline int TileLeft(uint32_t k, uint32_t w) { return int(kTileAt[k][0] * float(w)) - int(kTile / 2); }
-inline int TileTop(uint32_t k, uint32_t h) { return int(kTileAt[k][1] * float(h)) - int(kTile / 2); }
-inline void SampleTiles(const Image& im, float* out)
+// Zero keeps the original position. Other values encode a cell in the existing thumbnail.
+struct TileLocations { uint32_t cell[kTiles]{}; };
+inline int TileLeft(uint32_t k, uint32_t w, const TileLocations& loc = {})
+{
+    const uint32_t cell = loc.cell[k];
+    const int centre = cell ? int((2 * ((cell - 1) % kThumbW) + 1) * w / (2 * kThumbW)) : int(kTileAt[k][0] * float(w));
+    return centre - int(kTile / 2);
+}
+inline int TileTop(uint32_t k, uint32_t h, const TileLocations& loc = {})
+{
+    const uint32_t cell = loc.cell[k];
+    const int centre = cell ? int((2 * ((cell - 1) / kThumbW) + 1) * h / (2 * kThumbH)) : int(kTileAt[k][1] * float(h));
+    return centre - int(kTile / 2);
+}
+inline void SampleTiles(const Image& im, float* out, const TileLocations& loc = {})
 {
     for (uint32_t k = 0; k < kTiles; ++k)
         for (uint32_t y = 0; y < kTile; ++y)
             for (uint32_t x = 0; x < kTile; ++x)
-                out[(k * kTile + y) * kTile + x] = LogLuma(im.At(TileLeft(k, im.w) + int(x), TileTop(k, im.h) + int(y)));
+                out[(k * kTile + y) * kTile + x] = LogLuma(im.At(TileLeft(k, im.w, loc) + int(x), TileTop(k, im.h, loc) + int(y)));
 }
 // Grid point (i, j) of a w x h image: a pixel centre.
 inline float PointX(uint32_t i, uint32_t w) { return std::floor((float(i) + .5f) / kGridW * float(w)) + .5f; }
 inline float PointY(uint32_t j, uint32_t h) { return std::floor((float(j) + .5f) / kGridH * float(h)) + .5f; }
+
+// Keep the 3x3 comparison patch inside the observed image. A disoccluded point
+// has no prior-frame measurement; clamping it to the last texel fabricates one.
+inline bool PatchVisible(float x, float y, uint32_t width, uint32_t height)
+{
+    return x >= 1.5f && y >= 1.5f && x <= float(width) - 1.5f && y <= float(height) - 1.5f;
+}
 
 struct MotionInputs {
     const Image* current = nullptr;   // this frame's DLSS input (luminance)
@@ -143,7 +162,10 @@ inline void SamplePoints(const MotionInputs& in, float* out)
             const uint32_t my = std::min(uint32_t(y / float(c.h) * float(in.motion_h)), in.motion_h - 1);
             const size_t mi = (size_t(my) * in.motion_w + mx) * 2;
             const float vx = (*in.motion)[mi] * in.scale_x, vy = (*in.motion)[mi + 1] * in.scale_y;
-            if (!std::isfinite(vx) || !std::isfinite(vy) || p.w != c.w || p.h != c.h) {
+            if (p.w != c.w || p.h != c.h || !PatchVisible(x, y, c.w, c.h) ||
+                !PatchVisible(x + vx, y + vy, p.w, p.h) ||
+                !PatchVisible(x + vx - dj[0], y + vy - dj[1], p.w, p.h) ||
+                !PatchVisible(x + vx + dj[0], y + vy + dj[1], p.w, p.h)) {
                 for (uint32_t k = 0; k < kPointValues; ++k) o[k] = -1;
                 continue;
             }
@@ -158,6 +180,8 @@ inline void SamplePoints(const MotionInputs& in, float* out)
                     contrast += .5f * (std::fabs(LogAt(p, x + float(a) + 1, y + float(b)) - pv) + std::fabs(LogAt(p, x + float(a), y + float(b) + 1) - pv));
                 }
             for (int h = 0; h < 6; ++h) o[h] = e[h] / 9.f;
+            for (int h = kHalf; h <= kTwice; ++h)
+                if (!PatchVisible(x + shift[h][0], y + shift[h][1], p.w, p.h)) o[h] = -1;
             o[kContrast] = contrast / 9.f;
             o[kLength] = std::sqrt(vx * vx + vy * vy);
         }
@@ -310,8 +334,8 @@ inline SampleScore Score(const Sample& s, const Params& p = Params())
                 r.err_still += o[kStill]; r.err_vector += e;
                 if (e < .8f * o[kStill]) ++r.explained;
                 const float best_unscaled = (std::min)({o[kFollows], o[kReverse], o[kVector]});
-                if (o[kHalf] < .7f * best_unscaled) ++r.half_better;
-                if (o[kTwice] < .7f * best_unscaled) ++r.twice_better;
+                if (o[kHalf] >= 0 && o[kHalf] < .7f * best_unscaled) ++r.half_better;
+                if (o[kTwice] >= 0 && o[kTwice] < .7f * best_unscaled) ++r.twice_better;
             } else {
                 ++r.still_points;
                 // Changed, and the jitter does not account for it.
@@ -323,6 +347,34 @@ inline SampleScore Score(const Sample& s, const Params& p = Params())
 }
 
 // ---------------------------------------------------------------------------------------------
+// Relocate empty probes using the thumbnails already read back. Choose shared scene and
+// screen detail in each of eight regions. Never use which candidate won to choose a location.
+inline TileLocations FindTexturedTiles(const float* data)
+{
+    TileLocations loc;
+    const float* input = data + BlockOffset(kThumbInput);
+    const float* screen = data + BlockOffset(kThumbScreen);
+    auto texture = [](const float* q) {
+        return std::fabs(q[1] - q[-1]) + std::fabs(q[kThumbW] - q[-int(kThumbW)]);
+    };
+    for (uint32_t k = 0; k < kTiles; ++k) {
+        const uint32_t x0 = k % 4 * (kThumbW / 4), y0 = k / 4 * (kThumbH / 2);
+        float best = 0;
+        for (uint32_t y = y0 + 3; y + 3 < y0 + kThumbH / 2; y += 2)
+            for (uint32_t x = x0 + 3; x + 3 < x0 + kThumbW / 4; x += 2) {
+                const uint32_t centre = y * kThumbW + x;
+                float strength = 0;
+                for (int dy : {-1, 1}) for (int dx : {-1, 1}) {
+                    const int i = int(centre) + dy * int(kThumbW) + dx;
+                    const float a = texture(input + i), b = texture(screen + i);
+                    if (std::isfinite(a) && std::isfinite(b)) strength += (std::min)(a, b);
+                }
+                if (strength > best) { best = strength; loc.cell[k] = centre + 1; }
+            }
+    }
+    return loc;
+}
+
 // A window of samples (a few seconds) and its verdicts, as the log prints them.
 struct Window {
     uint32_t samples = 0, screens = 0, motions = 0;
@@ -387,6 +439,7 @@ inline Verdicts Judge(const Window& w, const Params& p = Params())
         const uint32_t decided = w.output_frames + w.input_frames;
         if (!w.textured_frames) v.result_why = "too few textured tiles per frame";
         else if (w.neither_frames * 2 > w.textured_frames) { v.result = Verdict::Fail; v.result_why = "the screen shows neither DLSS's input nor its output at the tiles"; }
+        else if (w.output_frames && w.input_frames) { v.result = Verdict::Partial; v.result_why = "some sampled screens favor the output and others the input"; }
         else if (!decided || decided * 2 < w.textured_frames) { v.result = Verdict::Partial; v.result_why = "too few sampled frames distinguish DLSS input and output"; }
         else if (w.output_frames * 4 >= decided * 3) { v.result = Verdict::Pass; v.result_why = "the screen shows DLSS's output"; }
         else if (w.input_frames * 4 >= decided * 3) { v.result = Verdict::Fail; v.result_why = "the screen shows the image before DLSS, not its output"; }
@@ -397,7 +450,7 @@ inline Verdicts Judge(const Window& w, const Params& p = Params())
         if (t.textured < 64) v.motion_why = "too few textured points";
         else if (t.moving * 50 < t.textured) {
             if (judged_still && t.changed_still * 2 > judged_still) { v.motion = Verdict::Fail; v.motion_why = "the picture moved where the vectors say still"; }
-            else { v.motion_why = "nothing moved: camera and scene still"; }
+            else { v.motion_why = "too few moving vectors to judge motion across the scene"; }
         } else {
             const double ratio = t.err_still > 0 ? t.err_vector / t.err_still : 1.0;
             const double share = double(t.explained) / t.moving;

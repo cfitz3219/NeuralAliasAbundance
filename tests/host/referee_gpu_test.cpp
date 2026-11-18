@@ -78,10 +78,11 @@ ComPtr<ID3D12Resource> Picture(test::Device& d, test::List& l, const na::referee
     l.list->ResourceBarrier(1, &b);
     return t;
 }
-ComPtr<ID3D12Resource> MotionTexture(test::Device& d, test::List& l, const std::vector<float>& m, std::vector<ComPtr<ID3D12Resource>>& keep)
+ComPtr<ID3D12Resource> MotionTexture(test::Device& d, test::List& l, const std::vector<float>& m, std::vector<ComPtr<ID3D12Resource>>& keep,
+                                        UINT width = rs::kW, UINT height = rs::kH)
 {
-    ComPtr<ID3D12Resource> t = test::CreateTexture(d.device.Get(), rs::kW, rs::kH, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
-    if (!t || !Upload(d, l, t.Get(), m.data(), size_t(rs::kW) * 8, keep)) return nullptr;
+    ComPtr<ID3D12Resource> t = test::CreateTexture(d.device.Get(), width, height, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    if (!t || !Upload(d, l, t.Get(), m.data(), size_t(width) * 8, keep)) return nullptr;
     const D3D12_RESOURCE_BARRIER b = test::Transition(t.Get(), D3D12_RESOURCE_STATE_COPY_DEST, NPSR);
     l.list->ResourceBarrier(1, &b);
     return t;
@@ -103,12 +104,17 @@ struct Images { ID3D12Resource *prev, *input, *output, *motion, *screen; };
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
 // Returns false (with a FAIL line) when the referee did not take it.
 bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images& im, rg::LastSample& got,
-                bool late = false, ID3D12CommandQueue* blocked = nullptr, ID3D12Fence* release = nullptr)
+                bool late = false, ID3D12CommandQueue* blocked = nullptr, ID3D12Fence* release = nullptr,
+                bool changed_scene = false, bool reset = false, bool display_vectors = false, bool unsampled_reset = false)
 {
     const uint64_t before = rg::GetStats().samples;
     CHECK(rg::Wanted());
     rg::Evaluation e;
     e.color = im.prev; e.output = im.output; e.motion = im.motion;
+    e.render_w = rs::kW; e.render_h = rs::kH;
+    e.output_w = display_vectors ? 2 * rs::kW : rs::kW;
+    e.output_h = display_vectors ? 2 * rs::kH : rs::kH;
+    e.mv_display_res = display_vectors;
     e.context = {{na::referee::shadow::Path::Inline, 22}, 1, 2, 3, 0, rs::kW, rs::kH};
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterBefore[0]; e.jitter_y = rs::kJitterBefore[1];
@@ -125,19 +131,25 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         rg::Submitted(pre, d.queue.Get());
     }
     CHECK(!rg::NeedsScreen({ordinal, &d}));
-    rg::OnPresent({ordinal, &d}, d.queue.Get(), nullptr, Execute);
+    rg::OnPresent({ordinal, &d, true, true}, d.queue.Get(), nullptr, Execute);
 
     CHECK(rg::Wanted()); // half taken: the next evaluation is wanted
     e.color = im.input;
+    if (changed_scene) ++e.context.color;
+    if (unsampled_reset) rg::NotifyEvaluationReset();
+    e.reset = reset;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterNow[0]; e.jitter_y = rs::kJitterNow[1];
     auto& main = blocked ? next_list : l;
     const uint32_t second = rg::Record(main.list.Get(), e);
     CHECK(second > pre);
+    if (!second) return false;
     rg::Discard(pre, false);
     Run(d, main);
     rg::Submitted(second, d.queue.Get());
-    CHECK(rg::NeedsScreen({ordinal, &d}));
+    CHECK(rg::NeedsScreen({ordinal, &d, true, true}));
+    CHECK(!rg::NeedsScreen({ordinal, &d, true, false}));
+    rg::OnPresent({ordinal, &l, true, true}, d.queue.Get(), im.screen, Execute);
     CHECK(!rg::NeedsScreen({ordinal + 7, &d}));
     CHECK(!rg::NeedsScreen({ordinal, &l}));
     if (late && !blocked) ordinal += 7;
@@ -169,8 +181,8 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         return false;
     }
     got = rg::GetLastSample();
-    CHECK(got.screen == !late && got.tiles == !late && got.pair);
-    CHECK(std::fabs(got.jitter_change - rs::JitterChange()) < 1e-4f);
+    CHECK(got.screen == !late && got.tiles == (!late && !display_vectors) && got.pair == (!changed_scene && !reset && !unsampled_reset));
+    CHECK(std::fabs(got.jitter_change - (got.pair ? rs::JitterChange() : 0.f)) < 1e-4f);
     CHECK(got.data.size() == na::referee::kResultFloats);
     return got.data.size() == na::referee::kResultFloats;
 }
@@ -268,7 +280,7 @@ int main()
     CHECK(std::any_of(events.begin(), events.end(), [](const auto& line) {
         return line.find("referee_choice mode=preview") != std::string::npos &&
                line.find("last=4 current=inline generation=3") != std::string::npos &&
-               line.find("input=1 action=hold") != std::string::npos;
+               line.find("input=1 action=check_continuity") != std::string::npos;
     }));
 
     // 3. Vectors half the real motion.
@@ -302,9 +314,98 @@ int main()
                 static_cast<unsigned long long>(s.main), static_cast<unsigned long long>(s.failed),
                 static_cast<unsigned long long>(s.unpaired));
     CHECK(s.samples == 5 && s.pairs == 5 && s.screens == 3 && s.failed == 0 && s.unpaired == 0 && !s.stopped);
+    l.Reset(); // the blocked-queue case submitted its second half on a different list
+    const Images complete{t_prev.Get(), t_input.Get(), t_output.Get(), t_motion.Get(), t_screen.Get()};
+    for (int change = 0; change < 3; ++change) {
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, complete, got, false, nullptr, nullptr, change == 0, change == 1, false, change == 2));
+        na::referee::Window window;
+        window.Add(na::referee::Score({got.data.data(), got.screen, got.tiles, got.pair, got.jitter_change}));
+        CHECK(Judge(window).result == Verdict::Pass && Judge(window).motion == Verdict::NotMeasured);
+    }
+    // The declared evaluation occupies the top left of a larger allocation.
+    // Bright padding must never enter any of the sampled blocks.
+    auto pad = [](const na::referee::Image& src, UINT width, UINT height) {
+        na::referee::Image dst{width, height, std::vector<float>(size_t(width) * height, 80.f)};
+        for (UINT y = 0; y < src.h; ++y)
+            std::copy_n(src.v.data() + size_t(y) * src.w, src.w, dst.v.data() + size_t(y) * width);
+        return dst;
+    };
+    auto large_prev = Picture(d, l, pad(prev, rs::kW + 63, rs::kH + 27), NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+    auto large_input = Picture(d, l, pad(input, rs::kW + 63, rs::kH + 27), NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+    auto large_output = Picture(d, l, pad(output, 2 * rs::kW, 2 * rs::kH), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, keep);
+    std::vector<float> large_motion(size_t(rs::kW) * rs::kH * 8);
+    for (size_t i = 0; i < large_motion.size(); ++i) large_motion[i] = -2.f * rs::kU[i % 2];
+    auto display_mv = MotionTexture(d, l, large_motion, keep, 2 * rs::kW, 2 * rs::kH);
+    REQUIRE(large_prev && large_input && large_output && display_mv);
+    Run(d, l);
+    keep.clear();
+    Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {large_prev.Get(), large_input.Get(), large_output.Get(), t_motion.Get(), t_screen.Get()}, got));
+    Compare("padded scene and output", got.data, rs::Expected(prev, input, output, rs::ScreenImage(shows_output), motion));
+    const auto cropped = got;
+    Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {large_prev.Get(), large_input.Get(), large_output.Get(), display_mv.Get(), t_screen.Get()},
+                       got, false, nullptr, nullptr, false, false, true));
+    const auto points = na::referee::BlockOffset(na::referee::kPoints);
+    CHECK(std::equal(got.data.begin() + points, got.data.end(), cropped.data.begin() + points));
+    // Every other game frame misses DLAA. No temporal pair exists; the next
+    // isolated evaluation must still be compared to its own submitted screen.
     Sleep(150);
     REQUIRE(rg::Wanted());
-    l.Reset();
+    rg::Evaluation isolated;
+    isolated.color = t_input.Get(); isolated.output = t_output.Get();
+    isolated.context = {{na::referee::shadow::Path::Inline, 22}, 1, 2, 3, 0, rs::kW, rs::kH};
+    auto submit_isolated = [&] {
+        isolated.present_ordinal = ++ordinal;
+        const auto token = rg::Record(l.list.Get(), isolated);
+        CHECK(token != 0);
+        Run(d, l);
+        rg::Submitted(token, d.queue.Get());
+    };
+    submit_isolated();
+    rg::OnPresent({ordinal, &d, true, true}, d.queue.Get(), nullptr, Execute);
+    rg::OnPresent({++ordinal, &d, true, false}, d.queue.Get(), nullptr, Execute);
+    REQUIRE(rg::Wanted());
+    submit_isolated();
+    CHECK(rg::NeedsScreen({ordinal, &d, true, true}));
+    rg::OnPresent({ordinal, &d, true, true}, d.queue.Get(), t_screen.Get(), Execute);
+    d.WaitIdle();
+    rg::Wanted();
+    REQUIRE(na::background::WaitIdle(3000));
+    const auto solo = rg::GetLastSample();
+    CHECK(solo.number == got.number + 1 && solo.screen && solo.tiles && !solo.pair);
+    na::referee::Window single;
+    single.Add(na::referee::Score({solo.data.data(), solo.screen, solo.tiles, solo.pair, solo.jitter_change}));
+    CHECK(Judge(single).result == Verdict::Pass && Judge(single).motion == Verdict::NotMeasured);
+    // The original tiles see only a featureless centre. The next sample should
+    // find the textured edges from the existing thumbnails at the same budget.
+    auto bands = [](na::referee::Image img) {
+        for (UINT y = 0; y < img.h; ++y) {
+            if ((y >= 7 && y < 34) || (y >= img.h - 34 && y < img.h - 7)) continue;
+            std::fill_n(img.v.begin() + size_t(y) * img.w, img.w, .34f);
+        }
+        return img;
+    };
+    auto band_input = Picture(d, l, bands(input), NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+    auto band_output = Picture(d, l, bands(output), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, keep);
+    auto band_screen = ScreenTexture(d, l, rs::ScreenBytes(bands(output)), keep);
+    REQUIRE(band_input && band_output && band_screen);
+    Run(d, l);
+    keep.clear();
+    const Images edge_detail{t_prev.Get(), band_input.Get(), band_output.Get(), t_motion.Get(), band_screen.Get()};
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, edge_detail, got, false, nullptr, nullptr, false, attempt == 0));
+        const auto score = na::referee::Score({got.data.data(), got.screen, got.tiles, false, 0});
+        std::printf("edge-only detail, sample %d: %u textured, %u output, %u input\n",
+                    attempt + 1, score.tiles_textured, score.tiles_output, score.tiles_input);
+        if (attempt == 0) CHECK(score.tiles_textured == 0);
+        else CHECK(score.tiles_output >= 4 && score.tiles_input == 0);
+    }
+    Sleep(150);
+    REQUIRE(rg::Wanted());
     rg::Evaluation discarded;
     discarded.color = t_input.Get();
     discarded.output = t_output.Get();
@@ -315,7 +416,7 @@ int main()
     CHECK(rg::GetStats().stopped && !rg::Wanted());
     Run(d, l);
     rg::Submitted(outstanding, d.queue.Get());
-    CHECK(rg::GetStats().samples == s.samples);
+    CHECK(rg::GetStats().samples == got.number);
     ComPtr<ID3D12InfoQueue> info;
     if (debug && SUCCEEDED(d.device.As(&info))) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {

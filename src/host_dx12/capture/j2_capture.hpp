@@ -38,6 +38,7 @@ struct Identity {
     uint32_t route_mode = 0;       // 0 auto, 1 forced between, 2 forced inline
     uint32_t history_generation = 0;
     uint64_t insertion_signature = 0; // the boundary the inline trigger matched (writer pso, occurrence)
+    uint64_t referee_boundary = 0; // actual sampled boundary, same identity used by the route preview
     uint32_t color_sub = 0;        // scene colour subresource copied
     uint32_t width = 0, height = 0, color_format = 0;
     float jitter_x = 0, jitter_y = 0; // pixels, as passed to DLSS

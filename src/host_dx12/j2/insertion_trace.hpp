@@ -14,7 +14,8 @@ enum class Op : uint8_t {
     Barrier,                                        // RT -> read transition (not a consumer)
     GraphicsRead, ComputeRead, CopyRead,            // actual consumers
     DerivedRead,                                    // read of a texture copied from the colour this frame (lineage only)
-    GraphicsEntry, ComputeEntry, IndirectGraphicsEntry, IndirectComputeEntry
+    GraphicsEntry, ComputeEntry, IndirectGraphicsEntry, IndirectComputeEntry,
+    FullViewClear // ClearWrite covering every pixel in the bound view
 };
 struct InsertionEvent {
     uint64_t resource = 0, destination = 0, pipeline = 0;
@@ -42,6 +43,7 @@ inline uint32_t EntryContext(bool written_in_recording, uint32_t ordinal)
 }
 inline Op ClassifyOp(const InsertionEvent& e)
 {
+    if (e.op == Op::FullViewClear) return Op::ClearWrite;
     if (e.op != Op::Unknown) return e.op;
     if (e.write) return Op::DrawWrite;
     if (e.pipeline == UINT64_MAX) return Op::Barrier;
@@ -110,7 +112,18 @@ struct InsertionDecision {
     uint64_t boundary_writer = 0;
     uint32_t writer_occurrence = 0;
     uint32_t derived_reads = 0; // reads of textures copied from the colour this frame
+    bool consumed_after_last_write = false;
+    bool cleared_full_view = false;
 };
+inline uint64_t BoundarySignature(const InsertionDecision& d)
+{
+    if (!d.final_candidate) return 0;
+    uint64_t signature = 1469598103934665603ull;
+    for (uint64_t part : {d.boundary_writer, static_cast<uint64_t>(d.writer_occurrence), d.destination, d.pipeline})
+        signature = (signature ^ part) * 1099511628211ull;
+    return signature;
+}
+
 struct LearnedInsertion {
     uint64_t color = 0, depth = 0;
     InsertionDecision decision;
@@ -189,13 +202,16 @@ public:
             if (!event.write && event.pipeline == UINT64_MAX) ++result.transitions;
             if (event.write) {
                 writer = event.pipeline;
+                result.cleared_full_view |= event.op == Op::FullViewClear;
                 ++result.writes;
+                result.consumed_after_last_write = false;
                 result.final_candidate = 0; // later geometry invalidates earlier reads
                 result.final_transition = 0;
                 result.destination = result.pipeline = 0;
                 result.boundary_writer = 0;
                 result.writer_occurrence = 0;
             } else if (result.writes && event.destination != color) {
+                if (IsConsumer(ClassifyOp(event))) result.consumed_after_last_write = true;
                 const uint32_t occurrence = event.pipeline == UINT64_MAX ? ++writer_reads[writer] : 0;
                 ++result.candidates;
                 // First downstream read after the LAST scene write, not last read:
