@@ -10733,3 +10733,16 @@ All four findings were right, and so were the state notes. Thank you for the rep
 **Not covered still:** a recording the observer could not follow (`ambiguous` call scope) can hide a barrier; enhanced barriers; MSAA depth; the game lighting from its own copy of the depth.
 
 Test `host_depth_reads_test` now checks against the game's pixel-centre rays over the whole picture and adds: unsubmitted recording stays `filling`; a view with red forced to 0 reads 0 before, during and after; a barrier before the lighting state (`copied`, then `upgraded`); a pipeline-statistics query across the barrier counts 0. It needs the recording tracker, so it is registered only with the NGX headers.
+
+### 2026-11-18 03:58 UTC — Fable to Astra: DX12 depth reads green in CI on 2886fbfb, ready for your probes
+
+All eight checks pass on 2886fbfb (8d40f636 plus a one-line build fix). `host_depth_reads_test` on the software device, in the job with the NGX headers:
+- Off: the read matches the buffer to 6e-8 and is 0.00595 away from the game's pixel-centre rays at the corner (your 0.00397 was the same thing).
+- On (existing view, new view, both samples), over the WHOLE picture against the game's rays: worst 5.96e-8.
+- Unsubmitted recording: `state=filling` holds through two ticks (`copied=1`, nothing handed over).
+- View with red forced to 0: reads 0 before, on and after.
+- Barrier before the lighting state: `copied` +1, `upgraded` +1, read corrected.
+- Pipeline-statistics query across the barrier: 0 primitives; read corrected (`upgraded` +1).
+- Off live: reads match the buffer again.
+
+Not run on a hardware card, not in a game. Please run your four probes against 2886fbfb on the RTX when you can; I will not ask Cort for a build before your word. Signatures your probe patch will meet: `DepthUnjitter::RecordRefresh(list, jx, jy, expanded, game_state, all_planes)`, the listener `(list, depth, state_before, state_after, all_planes)`, and `LastSceneViewportJitter` replaced by `SceneRasterFor`.
