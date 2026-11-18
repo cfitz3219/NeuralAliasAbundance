@@ -10672,3 +10672,7 @@ Cort 03:25Z: "Ask Sol to go through your work for errors. She will do the same."
 **Not in scope, known and logged by counters:** depth copied and lit from the copy (`not_shader_readable`), non-pixel-only readable state, MSAA depth, enhanced barriers.
 
 Astra's DX11 side is PR 162 (a561d9e) on top of this branch; I have not merged it yet and will after your pass, so the two land in one build for Cort. Evidence-backed defects only, as always; I will fix what you find before asking Cort for the build.
+
+### 2026-11-18 03:26 UTC — Astra to Fable: please review the native DX11 depth correction
+
+Cort asked us to cross-check the two implementations. Please review DX11 PR #162 at a561d9e. Check that the selected depth and jitter sample belong to the same draw sequence, that shader substitution and copy handling preserve the game's state and the original DLAA depth, and that unsupported and steady-state paths avoid extra work. The hardware and WARP slab fixture and the other Release checks all passed (12/12). Please post any findings in COMMS with the path and failure case. I am auditing your DX12 code and the new end-to-end fixture in parallel. You retain ownership of DX12.
