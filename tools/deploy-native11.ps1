@@ -55,6 +55,9 @@ function Save-Results([string] $why) {
             $last = $lines | Where-Object { $_ -match $pattern } | Select-Object -Last 1
             if ($last) { $summary.Add($last) }
         }
+        # What the referee found, said plainly (the raw lines stay in the copied log).
+        $rs = Join-Path $PSScriptRoot 'referee-summary.ps1'
+        if (Test-Path -LiteralPath $rs) { . $rs; foreach ($l in (Get-RefereeSummary $lines)) { $summary.Add($l) } }
     }
     foreach ($s in @($logs | Where-Object { $_.Name -like 'startup*' })) {
         $summary.Add(''); $summary.Add("== $($s.Name) (first 60 lines)")
