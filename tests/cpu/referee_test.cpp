@@ -168,6 +168,19 @@ int main()
         check(v.picture == Verdict::NotMeasured && v.result == Verdict::NotMeasured, "no screen: picture and result not measured");
     }
 
+    {
+        Window window;
+        SampleScore ambiguous;
+        ambiguous.tiles = ambiguous.tiles_textured = 8;
+        SampleScore output_vote = ambiguous;
+        output_vote.tiles_output = 8;
+        window.Add(output_vote);
+        for (int frame = 0; frame < 4; ++frame) window.Add(ambiguous);
+        check(Judge(window).result == Verdict::Partial, "result: one decisive frame cannot speak for five");
+        for (int frame = 0; frame < 3; ++frame) window.Add(output_vote);
+        check(Judge(window).result == Verdict::Pass, "result: enough agreeing frames support a sampled pass");
+    }
+
     // Motion and jitter: the scene moved by u between the frames; the jitter changed.
     const float ux = 3.3f, uy = -1.7f;
     const float jb[2] = {.25f, -.3f}, jn[2] = {-.35f, .2f};
@@ -224,6 +237,8 @@ int main()
         Window w;
         const Verdicts v = motion_case(nr, br, -ux, -uy, jn, jb, &w);
         check(v.jitter == Verdict::Fail && w.total.jitter_reverse > w.total.jitter_follows, "jitter: the opposite jitter is caught");
+        check(w.total.half_better * 2 < w.total.moving && w.total.twice_better * 2 < w.total.moving,
+              "motion: changing scale does not explain the opposite jitter");
     }
     { // a still scene: motion is not judged, the jitter still is
         const Image ns = Render(Scene, jn[0], jn[1]);

@@ -1,12 +1,16 @@
 #include "host_dx12/capture/referee_gpu.hpp"
-#include "host_dx12/capture/referee_shader.hpp"
 #include "core/referee.hpp"
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
 
 #include <windows.h>
-#include <d3dcompiler.h>
 #include <wrl/client.h>
+#ifdef NA_HAVE_REFEREE_SHADERS
+#include "referee_thumb.h"
+#include "referee_tiles.h"
+#include "referee_points.h"
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -21,8 +25,8 @@ namespace {
 
 constexpr auto NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 enum Img : uint32_t { kPrev, kInput, kOutput, kScreen, kMotion, kImages };
-enum class Phase { Idle, PreRecorded, PreSubmitted, MainRecorded, MainSubmitted, Computing, Stopped };
-constexpr uint32_t kTokenPre = 1, kTokenMain = 2;
+enum class Phase { Idle, PreRecorded, PreSubmitted, MainRecorded, MainSubmitted, Computing, Scoring, Retiring, Stopped };
+constexpr uint32_t kMaxToken = 0x00ffffff; // high 24 bits of the capture token
 constexpr ULONGLONG kStuckMs = 3000; // a half-taken sample is given up after this
 
 struct Copy {
@@ -40,27 +44,25 @@ struct State {
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
     D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    ComPtr<ID3D12Fence> fence;
-    UINT64 fence_next = 1;
+    ComPtr<ID3D12Fence> pre_fence, main_fence, compute_fence;
+    UINT64 sample_serial = 0, pre_value = 0, main_value = 0, compute_value = 0;
     bool init_tried = false, init_ok = false;
     Copy img[kImages];
-    // Textures a list we did not submit may still write (inline route): never released.
-    std::vector<ComPtr<ID3D12Resource>> kept;
-    bool tainted = false;
-    // Replaced textures, released once the next sample's reduction has completed.
-    std::vector<ComPtr<ID3D12Resource>> retire;
     Phase phase = Phase::Idle;
-    ULONGLONG phase_at = 0, next_at = 0, window_at = 0;
+    ULONGLONG phase_at = 0, next_at = 0, window_at = 0, coverage_at = 0;
+    uint64_t observed_dx12 = 0, submitted_dx12 = 0, observed_dx11 = 0, submitted_dx11 = 0;
     uint64_t pre_ordinal = 0, main_ordinal = 0;
     float pre_jitter[2]{}, main_jitter[2]{}, mv_scale[2]{1, 1};
-    bool main_closed = false;
-    UINT64 pre_fence = 0, main_fence = 0, compute_fence = 0;
+    const void* swapchain = nullptr;
+    bool screen_elapsed = false, have_motion = false, invalidated = false;
+    uint32_t token = 0, next_token = 0;
     ComPtr<ID3D12CommandQueue> pre_queue, main_queue;
     bool done_screen = false, done_tiles = false, done_pair = false;
     float done_jitter_change = 0;
     na::referee::Window window;
-    std::vector<float> data = std::vector<float>(na::referee::kResultFloats, 0.f);
+    std::vector<float> data;
     Stats stats;
+    bool keep_receipt = false;
     LastSample last;
 };
 State& g = *new State; // never destroyed: its D3D12 objects must not be released by the CRT at exit
@@ -99,18 +101,25 @@ DXGI_FORMAT view_format(DXGI_FORMAT f)
 }
 bool readable(DXGI_FORMAT f)
 {
-    switch (f) {
-    case DXGI_FORMAT_UNKNOWN:
-    case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_D16_UNORM:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_R32G8X24_TYPELESS:
-        return false;
-    default: return true;
+    switch (view_format(f)) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R32_FLOAT:
+        return true;
+    default: return false;
     }
 }
 
 bool init(ID3D12Device* dev)
 {
-    if (g.init_tried) return g.init_ok && g.device.Get() == dev;
+    if (g.init_tried) {
+        if (g.device.Get() != dev) stop("the evaluation device changed");
+        return g.init_ok && g.phase != Phase::Stopped;
+    }
     g.init_tried = true;
     g.device = dev;
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kImages, 0, 0, 0};
@@ -128,24 +137,26 @@ bool init(ID3D12Device* dev)
         stop("the referee's root signature could not be made");
         return false;
     }
-    const char* entries[3] = {"thumb", "tiles", "points"};
+#ifdef NA_HAVE_REFEREE_SHADERS
+    const D3D12_SHADER_BYTECODE shaders[] = {
+        {referee_thumb, sizeof referee_thumb},
+        {referee_tiles, sizeof referee_tiles},
+        {referee_points, sizeof referee_points}
+    };
     ComPtr<ID3D12PipelineState>* psos[3] = {&g.thumb, &g.tiles, &g.points};
     for (int i = 0; i < 3; ++i) {
-        ComPtr<ID3DBlob> cs;
-        err.Reset();
-        if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "referee.hlsl", nullptr, nullptr, entries[i], "cs_5_0",
-                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err))) {
-            stop("the referee's card programs did not compile");
-            return false;
-        }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = g.root.Get();
-        pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+        pd.CS = shaders[i];
         if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(psos[i]->ReleaseAndGetAddressOf())))) {
             stop("the referee's card programs could not be made");
             return false;
         }
     }
+#else
+    stop("the referee shaders were unavailable at build time");
+    return false;
+#endif
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kImages, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     const UINT64 bytes = UINT64(na::referee::kResultFloats) * 4;
     auto buffer = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags, ComPtr<ID3D12Resource>& r) {
@@ -163,7 +174,9 @@ bool init(ID3D12Device* dev)
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap))) ||
         !buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, g.results) ||
         !buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, g.readback) ||
-        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)))) {
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.pre_fence))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.main_fence))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.compute_fence)))) {
         stop("the referee's buffers could not be made");
         return false;
     }
@@ -190,10 +203,15 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3
 bool ensure(Img which, ID3D12Resource* src)
 {
     const D3D12_RESOURCE_DESC s = src->GetDesc();
-    if (s.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || s.SampleDesc.Count != 1 || !readable(s.Format)) return false;
+    if (s.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || s.SampleDesc.Count != 1 ||
+        s.DepthOrArraySize != 1 || s.MipLevels != 1 || !readable(s.Format)) return false;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{view_format(s.Format), {}, {}};
+    D3D12_FEATURE_DATA_FORMAT_INFO info{s.Format, 0};
+    if (FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &info, sizeof info)) || info.PlaneCount != 1 ||
+        FAILED(g.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD)) return false;
     Copy& c = g.img[which];
     if (c.tex && c.desc.Width == s.Width && c.desc.Height == s.Height && c.desc.Format == s.Format) return true;
-    if (c.tex) (g.tainted ? g.kept : g.retire).push_back(c.tex);
     c.tex.Reset();
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -248,36 +266,91 @@ void emit_window(bool force)
     g.window_at = now;
 }
 
-// A finished reduction: read, score, add to the window. Never waits.
-void collect()
+bool completed(ID3D12Fence* fence, UINT64 value)
 {
-    if (g.phase != Phase::Computing || g.fence->GetCompletedValue() < g.compute_fence) return;
+    if (!value) return true;
+    const UINT64 done = fence->GetCompletedValue();
+    if (done == UINT64_MAX) { stop("the device was removed"); return false; }
+    return done >= value;
+}
+
+void retire()
+{
+    g.token = 0;
+    set_phase(Phase::Retiring);
+}
+
+void collect_sample()
+{
     void* p = nullptr;
     D3D12_RANGE r{0, SIZE_T(na::referee::kResultFloats) * 4};
-    if (SUCCEEDED(g.readback->Map(0, &r, &p)) && p) {
-        std::memcpy(g.data.data(), p, SIZE_T(na::referee::kResultFloats) * 4);
-        D3D12_RANGE none{0, 0};
+    const bool mapped = SUCCEEDED(g.readback->Map(0, &r, &p)) && p;
+    na::referee::SampleScore score;
+    if (mapped) {
+        const auto* samples = static_cast<const float*>(p);
+        score = na::referee::Score({samples, g.done_screen, g.done_tiles, g.done_pair, g.done_jitter_change});
+        bool keep_receipt;
+        {
+            std::lock_guard<std::mutex> lock(g.m);
+            keep_receipt = g.keep_receipt;
+        }
+        if (keep_receipt) g.data.assign(samples, samples + na::referee::kResultFloats);
+        const D3D12_RANGE none{0, 0};
         g.readback->Unmap(0, &none);
-        na::referee::Sample s;
-        s.data = g.data.data();
-        s.have_screen = g.done_screen;
-        s.tiles_comparable = g.done_tiles;
-        s.have_motion = g.done_pair;
-        s.jitter_change = g.done_jitter_change;
-        g.window.Add(na::referee::Score(s));
+    }
+    std::lock_guard<std::mutex> lock(g.m);
+    if (mapped) {
+        g.window.Add(score);
         ++g.stats.samples;
-        g.last.data = g.data;
-        g.last.screen = g.done_screen; g.last.tiles = g.done_tiles; g.last.pair = g.done_pair;
-        g.last.jitter_change = g.done_jitter_change;
-        g.last.number = g.stats.samples;
+        if (!g.data.empty()) {
+            g.last.data.swap(g.data);
+            g.data.clear();
+            g.last.screen = g.done_screen; g.last.tiles = g.done_tiles; g.last.pair = g.done_pair;
+            g.last.jitter_change = g.done_jitter_change;
+            g.last.number = g.stats.samples;
+        }
         if (g.done_pair) ++g.stats.pairs;
         if (g.done_screen) ++g.stats.screens;
     } else {
         ++g.stats.failed;
     }
-    g.retire.clear();
-    set_phase(Phase::Idle);
+    emit_window(!enabled());
+    retire();
     g.next_at = GetTickCount64() + every_ms();
+}
+
+void maintain()
+{
+    if (g.phase == Phase::Computing && completed(g.compute_fence.Get(), g.compute_value)) {
+        if (na::background::Submit(collect_sample)) set_phase(Phase::Scoring);
+    }
+    if (g.phase == Phase::Retiring && completed(g.pre_fence.Get(), g.pre_value) &&
+        completed(g.main_fence.Get(), g.main_value)) {
+        g.pre_value = g.main_value = g.compute_value = 0;
+        g.pre_queue.Reset();
+        g.main_queue.Reset();
+        g.swapchain = nullptr;
+        g.invalidated = false;
+        set_phase(Phase::Idle);
+    }
+}
+
+void log_coverage_if_due()
+{
+    const auto now = GetTickCount64();
+    if (now < g.coverage_at) return;
+    const auto scene12 = g.observed_dx12, submitted12 = g.submitted_dx12;
+    const auto presents11 = g.observed_dx11, submitted11 = g.submitted_dx11;
+    if (na::background::Submit([scene12, submitted12, presents11, submitted11] {
+        na::eventlog::Emit("referee_coverage", "dx12_scene=%llu dx12_submitted=%llu dx11_presents=%llu dx11_submitted=%llu",
+                           static_cast<unsigned long long>(scene12), static_cast<unsigned long long>(submitted12),
+                           static_cast<unsigned long long>(presents11), static_cast<unsigned long long>(submitted11));
+    })) {
+        const uint32_t seconds = na::settings::Get().referee_log_s.load(std::memory_order_relaxed);
+        g.coverage_at = now + 1000ull * (std::max)(seconds, 1u);
+    } else {
+        g.coverage_at = now + 1000;
+    }
 }
 
 // The reduction, on our own list, on the presenting queue.
@@ -295,7 +368,7 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
         g.list->Close();
         g.list_type = type;
     }
-    if (FAILED(g.alloc->Reset()) || FAILED(g.list->Reset(g.alloc.Get(), nullptr))) { ++g.stats.failed; set_phase(Phase::Idle); return; }
+    if (FAILED(g.alloc->Reset()) || FAILED(g.list->Reset(g.alloc.Get(), nullptr))) { stop("the referee's command list could not reset"); return; }
     ID3D12GraphicsCommandList* l = g.list.Get();
     const bool screen = presented && ensure(kScreen, presented);
     if (screen) {
@@ -316,7 +389,7 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     const UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE h = g.heap->GetCPUDescriptorHandleForHeapStart();
     for (uint32_t i = 0; i < kImages; ++i) {
-        const Copy& c = (g.img[i].tex && (i != kScreen || screen)) ? g.img[i] : g.img[kInput];
+        const Copy& c = (g.img[i].tex && (i != kScreen || screen) && (i != kMotion || g.have_motion)) ? g.img[i] : g.img[kInput];
         D3D12_SHADER_RESOURCE_VIEW_DESC v{};
         v.Format = view_format(c.desc.Format);
         v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -346,9 +419,10 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     uint32_t ow = 0, oh = 0, sw = 0, shh = 0;
     size(kOutput, ow, oh);
     if (screen) size(kScreen, sw, shh);
-    const bool tiles = screen && ow == sw && oh == shh;
-    for (int i = 0; i < 3; ++i) {
-        if (thumbs[i] == kScreen && !screen) continue;
+    uint32_t iw = 0, ih = 0;
+    size(kInput, iw, ih);
+    const bool tiles = screen && ow == sw && oh == shh && iw == sw && ih == shh;
+    for (int i = 0; screen && i < 3; ++i) {
         k = {};
         k.src = thumbs[i];
         size(thumbs[i], k.w, k.h);
@@ -359,10 +433,9 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
             run(g.tiles.Get(), k, kTiles, 1);
         }
     }
-    uint32_t pw = 0, ph = 0, iw = 0, ih = 0;
+    uint32_t pw = 0, ph = 0;
     size(kPrev, pw, ph);
-    size(kInput, iw, ih);
-    const bool pair = g.img[kPrev].tex && g.img[kMotion].tex && pw == iw && ph == ih && g.main_ordinal == g.pre_ordinal + 1;
+    const bool pair = g.have_motion && pw == iw && ph == ih;
     if (pair) {
         k = {};
         k.src = kInput;
@@ -382,14 +455,14 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     l->CopyBufferRegion(g.readback.Get(), 0, g.results.Get(), 0, UINT64(kResultFloats) * 4);
     rb = transition(g.results.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     l->ResourceBarrier(1, &rb);
-    if (FAILED(l->Close())) { ++g.stats.failed; set_phase(Phase::Idle); return; }
-    // The evaluation's copies may have run on another queue: this queue waits for them on the card.
-    if (g.pre_queue && g.pre_queue.Get() != queue && g.pre_fence) queue->Wait(g.fence.Get(), g.pre_fence);
-    if (g.main_queue && g.main_queue.Get() != queue && g.main_fence) queue->Wait(g.fence.Get(), g.main_fence);
+    if (FAILED(l->Close())) { stop("the referee's command list could not close"); return; }
     ID3D12CommandList* one[] = {l};
     exec(queue, 1, one);
-    g.compute_fence = g.fence_next++;
-    queue->Signal(g.fence.Get(), g.compute_fence);
+    g.compute_value = g.sample_serial;
+    if (FAILED(queue->Signal(g.compute_fence.Get(), g.compute_value))) {
+        stop("the referee reduction could not be fenced");
+        return;
+    }
     g.done_screen = screen;
     g.done_tiles = tiles;
     g.done_pair = pair;
@@ -398,19 +471,17 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     set_phase(Phase::Computing);
 }
 
-// A half-taken sample that went nowhere is given up (its lists were submitted, discarded, or are
-// kept by `tainted`, so the textures stay valid).
 void watchdog()
 {
     const ULONGLONG now = GetTickCount64();
     if (now - g.phase_at < kStuckMs) return;
     switch (g.phase) {
     case Phase::PreRecorded: case Phase::MainRecorded:
-        g.tainted = true; // neither submitted nor discarded: it may still run
-        [[fallthrough]];
+        stop("a recorded diagnostic copy has unknown submission status");
+        break;
     case Phase::PreSubmitted: case Phase::MainSubmitted:
         ++g.stats.unpaired;
-        set_phase(Phase::Idle);
+        retire();
         g.next_at = now + every_ms();
         break;
     default: break;
@@ -423,100 +494,154 @@ bool Wanted()
 {
     if (!enabled()) return false;
     std::lock_guard<std::mutex> lock(g.m);
-    // Collected here too: a route that hands over the presented image only after an evaluation it
-    // recorded (DX11) would otherwise never read a finished reduction.
-    if (g.init_ok && g.phase == Phase::Computing) { collect(); emit_window(false); }
+    watchdog();
+    maintain();
     if (g.phase == Phase::Idle) return GetTickCount64() >= g.next_at;
-    return g.phase == Phase::PreSubmitted;
+    return g.phase == Phase::PreSubmitted && g.swapchain;
 }
 
 uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
 {
     if (!l || !e.color || !e.output || e.owns_present || !enabled()) return 0;
+    const auto color_desc = e.color->GetDesc();
+    const auto output_desc = e.output->GetDesc();
+    if ((e.render_w && color_desc.Width != e.render_w) || (e.render_h && color_desc.Height != e.render_h) ||
+        (e.output_w && output_desc.Width != e.output_w) || (e.output_h && output_desc.Height != e.output_h)) return 0;
     std::lock_guard<std::mutex> lock(g.m);
     if (g.phase == Phase::Stopped) return 0;
     watchdog();
+    if (g.next_token == kMaxToken) { stop("the referee's recording identities are exhausted"); return 0; }
     const bool due = g.phase == Phase::Idle && GetTickCount64() >= g.next_at;
-    const bool restart = g.phase == Phase::PreSubmitted && (e.present_ordinal != g.pre_ordinal + 1 || e.reset) &&
-                         e.present_ordinal != g.pre_ordinal;
-    if (due || restart) {
-        ComPtr<ID3D12Device> dev;
-        if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !init(dev.Get())) return 0;
+    if (!due && g.phase != Phase::PreSubmitted) return 0;
+    ComPtr<ID3D12Device> dev;
+    if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !init(dev.Get())) return 0;
+    if (due) {
         if (!ensure(kPrev, e.color)) { ++g.stats.failed; return 0; }
         copy(l, kPrev, e.color, e.color_state);
         g.pre_ordinal = e.present_ordinal;
         g.pre_jitter[0] = e.jitter_x;
         g.pre_jitter[1] = e.jitter_y;
-        g.pre_fence = 0;
-        g.pre_queue.Reset();
-        if (restart) ++g.stats.restarted;
+        ++g.sample_serial;
         ++g.stats.pre;
         set_phase(Phase::PreRecorded);
-        return kTokenPre;
+        return g.token = ++g.next_token;
     }
-    if (g.phase != Phase::PreSubmitted || e.present_ordinal != g.pre_ordinal + 1) return 0;
-    if (!ensure(kInput, e.color) || !ensure(kOutput, e.output) || (e.motion && !ensure(kMotion, e.motion))) { ++g.stats.failed; return 0; }
+    if (e.present_ordinal <= g.pre_ordinal) return 0;
+    if (!g.swapchain || e.present_ordinal != g.pre_ordinal + 1 || e.reset ||
+        color_desc.Format != g.img[kPrev].desc.Format ||
+        color_desc.Width != g.img[kPrev].desc.Width || color_desc.Height != g.img[kPrev].desc.Height) {
+        ++g.stats.restarted;
+        retire();
+        return 0;
+    }
+    const auto motion_desc = e.motion ? e.motion->GetDesc() : D3D12_RESOURCE_DESC{};
+    g.have_motion = !e.mv_jittered && motion_desc.Width == color_desc.Width && motion_desc.Height == color_desc.Height &&
+                    ensure(kMotion, e.motion);
+    if (!ensure(kInput, e.color) || !ensure(kOutput, e.output)) { ++g.stats.failed; return 0; }
     copy(l, kInput, e.color, e.color_state);
     copy(l, kOutput, e.output, e.output_state);
-    if (e.motion) copy(l, kMotion, e.motion, e.motion_state);
-    else g.img[kMotion].tex.Reset();
+    if (g.have_motion) copy(l, kMotion, e.motion, e.motion_state);
     g.main_ordinal = e.present_ordinal;
     g.main_jitter[0] = e.jitter_x;
     g.main_jitter[1] = e.jitter_y;
     g.mv_scale[0] = e.mv_scale_x;
     g.mv_scale[1] = e.mv_scale_y;
-    g.main_closed = false;
-    g.main_fence = 0;
-    g.main_queue.Reset();
+    g.screen_elapsed = false;
     ++g.stats.main;
     set_phase(Phase::MainRecorded);
-    return kTokenMain;
+    return g.token = ++g.next_token;
 }
 
 void Submitted(uint32_t token, ID3D12CommandQueue* queue)
 {
     if (!token || !queue) return;
     std::lock_guard<std::mutex> lock(g.m);
-    if (token == kTokenPre && g.phase == Phase::PreRecorded) {
-        g.pre_fence = g.fence_next++;
-        queue->Signal(g.fence.Get(), g.pre_fence);
+    if (token != g.token) return;
+    ComPtr<ID3D12Device> dev;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || dev.Get() != g.device.Get()) {
+        stop("the referee copies were submitted on another device");
+        return;
+    }
+    if (g.phase == Phase::PreRecorded) {
+        g.pre_value = g.sample_serial;
+        if (FAILED(queue->Signal(g.pre_fence.Get(), g.pre_value))) { stop("the previous input could not be fenced"); return; }
         g.pre_queue = queue;
         set_phase(Phase::PreSubmitted);
-    } else if (token == kTokenMain && g.phase == Phase::MainRecorded) {
-        g.main_fence = g.fence_next++;
-        queue->Signal(g.fence.Get(), g.main_fence);
+    } else if (g.phase == Phase::MainRecorded) {
+        g.main_value = g.sample_serial;
+        if (FAILED(queue->Signal(g.main_fence.Get(), g.main_value))) { stop("the current inputs could not be fenced"); return; }
         g.main_queue = queue;
         set_phase(Phase::MainSubmitted);
     }
+    g.token = 0;
+    if (g.invalidated) retire();
 }
 
 void Discard(uint32_t token, bool may_still_run)
 {
     if (!token) return;
     std::lock_guard<std::mutex> lock(g.m);
-    const bool ours = (token == kTokenPre && g.phase == Phase::PreRecorded) || (token == kTokenMain && g.phase == Phase::MainRecorded);
-    if (!ours) return;
-    if (may_still_run) g.tainted = true; // its copies may still land: these textures are never released
+    if (token != g.token || (g.phase != Phase::PreRecorded && g.phase != Phase::MainRecorded)) return;
     ++g.stats.discarded;
-    set_phase(Phase::Idle);
+    if (may_still_run) { stop("a discarded diagnostic recording may still execute"); return; }
+    retire();
     g.next_at = GetTickCount64() + 50;
 }
 
-void OnFrameClosed(uint64_t present_ordinal)
+bool NeedsScreen(Presentation frame)
 {
+    if (!enabled() || !frame.swapchain) return false;
     std::lock_guard<std::mutex> lock(g.m);
-    if (g.phase == Phase::MainSubmitted && present_ordinal >= g.main_ordinal) g.main_closed = true;
+    return g.phase == Phase::MainSubmitted && !g.screen_elapsed &&
+           frame.ordinal == g.main_ordinal && frame.swapchain == g.swapchain;
 }
 
-void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec)
+void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec)
+{
+    if (!enabled() || !frame.swapchain) return;
+    std::lock_guard<std::mutex> lock(g.m);
+    if (frame.eligible) {
+        if (frame.native11) { ++g.observed_dx11; if (frame.submitted) ++g.submitted_dx11; }
+        else { ++g.observed_dx12; if (frame.submitted) ++g.submitted_dx12; }
+    }
+    log_coverage_if_due();
+    watchdog();
+    maintain();
+    if (g.phase == Phase::PreSubmitted) {
+        if (frame.ordinal == g.pre_ordinal && !g.swapchain) g.swapchain = frame.swapchain;
+        else if (frame.ordinal > g.pre_ordinal || frame.swapchain != g.swapchain) {
+            ++g.stats.unpaired;
+            retire();
+        }
+    }
+    if (g.phase != Phase::MainSubmitted || frame.ordinal < g.main_ordinal) return;
+    if (frame.swapchain != g.swapchain) { ++g.stats.unpaired; retire(); return; }
+    const bool screen = !g.screen_elapsed && frame.ordinal == g.main_ordinal;
+    g.screen_elapsed = true;
+    if (!queue || !exec) return;
+    ComPtr<ID3D12Device> dev;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || dev.Get() != g.device.Get() ||
+        queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    if ((queue != g.pre_queue.Get() && !completed(g.pre_fence.Get(), g.pre_value)) ||
+        (queue != g.main_queue.Get() && !completed(g.main_fence.Get(), g.main_value))) return;
+    if ((!screen || !presented) && !g.have_motion) { retire(); return; }
+    compute(queue, screen ? presented : nullptr, exec);
+}
+
+void InvalidatePresentation(const void* swapchain)
 {
     std::lock_guard<std::mutex> lock(g.m);
-    if (!g.init_ok || g.phase == Phase::Stopped) return;
-    collect();
-    if (g.phase == Phase::MainSubmitted && g.main_closed && queue && exec) compute(queue, presented, exec);
-    else watchdog();
-    emit_window(false);
-    if (!enabled() && g.window.samples) emit_window(true);
+    if (g.swapchain && swapchain != g.swapchain) return;
+    switch (g.phase) {
+    case Phase::PreRecorded: case Phase::MainRecorded:
+        g.invalidated = true;
+        break;
+    case Phase::PreSubmitted: case Phase::MainSubmitted:
+        ++g.stats.unpaired;
+        retire();
+        break;
+    default: break;
+    }
 }
 
 Stats GetStats()
@@ -529,6 +654,12 @@ LastSample GetLastSample()
 {
     std::lock_guard<std::mutex> lock(g.m);
     return g.last;
+}
+
+void EnableSampleReceiptForTests()
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    g.keep_receipt = true;
 }
 
 } // namespace na::referee::gpu
