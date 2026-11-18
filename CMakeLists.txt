@@ -249,6 +249,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/j2/compute_flow.cpp
   src/host_dx12/j2/game_motion.cpp
   src/host_dx12/j2/replay_motion.cpp
+  src/host_dx12/j2/depth_reads.cpp
   src/host_dx12/j2/nis_scaler.cpp
   src/host_dx12/j2/native_hud.cpp
   src/host_dx12/j2/hud_unblend.cpp

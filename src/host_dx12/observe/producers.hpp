@@ -177,6 +177,10 @@ bool RestoreBindingState(ID3D12GraphicsCommandList*,bool compute,bool heaps,uint
 // restoration. Existing executable recordings keep their captured state.
 void SetRasterStateTracking(bool enabled);
 bool ListRasterStateRestorable(ID3D12CommandList* list);
+// Weaker: raster tracking was latched for this recording, so RestoreListState hands back whichever of the
+// targets, viewports, scissors and topology the game has set on it so far. One it has not set yet (a
+// recording starts with none, and a render pass ends with no targets) the game must set before it draws.
+bool ListRasterStateTracked(ID3D12CommandList* list);
 bool ListStateRestorable(ID3D12CommandList* list); // RestoreListState would succeed
 // Bounded snapshot of the current native shader bindings, for scoped private
 // descriptor heaps. Rebind ALL resource tables when changing their heap, and
@@ -464,6 +468,9 @@ void GetDrawReplayStats(DrawReplayStats* out);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
+// The sample the most recent recording pinned for its scene draws (0 = none yet): what the depth
+// those draws wrote was nudged by, for a recording that reads it without drawing the scene itself.
+uint64_t LastSceneViewportJitter();
 struct ViewportJitterStats { uint64_t draws, sets, restores, unknown; };
 ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists

@@ -2,6 +2,7 @@
 #include "core/depth_unjitter.hpp"
 #include <d3dcompiler.h>
 #include <climits>
+#include <utility>
 #include <cstring>
 
 namespace na::scale {
@@ -88,7 +89,7 @@ std::shared_ptr<const DepthUnjitter> DepthUnjitter::Create(ID3D12Device* device,
     D3D12_HEAP_PROPERTIES heap_properties{}; heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC twin = desc; twin.Alignment = 0;
     D3D12_CLEAR_VALUE clear{}; clear.Format = f.dsv;
-    if (FAILED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &twin, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+    if (FAILED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &twin, kTwinRest, &clear,
             IID_PPV_ARGS(&pass->twin_))))
         return fail("the twin could not be allocated");
     pass->twin_->SetName(L"NeuralAlias depth, jitter taken out");
@@ -152,5 +153,18 @@ bool DepthUnjitter::Record(ID3D12GraphicsCommandList* list, float jitter_x, floa
     list->OMSetRenderTargets(0, nullptr, FALSE, &target);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); list->DrawInstanced(3, 1, 0, 0);
     return true;
+}
+bool DepthUnjitter::RecordRefresh(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y) const
+{
+    if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = twin_.Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = kTwinRest; b.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    list->ResourceBarrier(1, &b);
+    const bool ok = Record(list, jitter_x, jitter_y);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    list->ResourceBarrier(1, &b);
+    return ok;
 }
 } // namespace na::scale

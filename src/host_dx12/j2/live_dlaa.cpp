@@ -7,6 +7,7 @@
 #include "host_dx12/j2/game_motion.hpp"
 #include "host_dx12/j2/late_input.hpp"
 #include "host_dx12/j2/replay_motion.hpp"
+#include "host_dx12/j2/depth_reads.hpp"
 #include <unordered_map>
 #include <map>
 #include <utility>
@@ -2442,6 +2443,29 @@ std::shared_ptr<na::observe::ReplayUse> retain_replay(ID3D12GraphicsCommandList*
     auto use = std::make_shared<ReplayUse>();
     use->lease = std::move(lease);
     return use;
+}
+// Depth reads ([j2] depth_reads): only while viewport jitter is supplying the samples (with the game's own
+// jitter, or none, the game's depth is what its lighting expects). Raster tracking lets the game's targets,
+// viewports and scissors be handed back after the twin's one draw.
+void update_depth_reads()
+{
+    const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
+    const bool want = running && vpj_mode() && g.jitter_on && na::settings::Get().j2_depth_reads.load(std::memory_order_relaxed) != 0;
+    static bool on = false;
+    if (want && !on) na::observe::SetRasterStateTracking(true);
+    on = want;
+    uint64_t depth = 0, color = 0;
+    na::observe::GetLiveSelection(&depth, &color);
+    na::observe::HostWorkScope own;
+    na::j2::depth_reads::Tick(g.queue.Get(), depth, want);
+    static uint64_t next_log = 0, logs = 0;
+    if (want && g.frame >= next_log) {
+        next_log = g.frame + (logs ? 600 : 120);
+        ++logs;
+        char line[448];
+        na::j2::depth_reads::Format(line, sizeof line);
+        na::eventlog::Emit("depth_reads", "%s", line);
+    }
 }
 void update_draw_replay()
 {
@@ -8487,6 +8511,7 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
         g.native_deferred = {};
         vpj_advance();
         update_draw_replay();
+        update_depth_reads();
         g.jit.valid = false; // J1: the next camera block starts a new jitter sample
         g.inline_sample_locked = false;
         g.inline_camera_submitted = false;
@@ -8951,6 +8976,7 @@ Stats GetStats()
     std::lock_guard<std::mutex> lock(g.m);
     g.stats.frame_now = g.frame;
     if (g.game_motion_ok) g.game_motion.Describe(g.stats.game_motion, sizeof g.stats.game_motion);
+    na::j2::depth_reads::Format(g.stats.depth_reads, sizeof g.stats.depth_reads);
     if (na::settings::Get().j2_draw_replay.load(std::memory_order_relaxed)) {
         na::observe::DrawReplayStats d{};
         na::observe::GetDrawReplayStats(&d);

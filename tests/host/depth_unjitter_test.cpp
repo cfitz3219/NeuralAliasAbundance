@@ -137,8 +137,8 @@ int run(test::Device& d, DXGI_FORMAT resource_format, DXGI_FORMAT dsv_format)
     const float jitters[][2] = {{0.3125f, -0.4375f}, {-0.46875f, 0.28125f}, {0.0f, 0.40625f}, {-0.21875f, 0.0f}, {0.0f, 0.0f}};
     for (const auto& j : jitters) {
         recording.Reset();
-        REQUIRE(pass->Record(list, j[0], j[1]));
-        result.Record(list, pass->Twin(), D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        REQUIRE(pass->RecordRefresh(list, j[0], j[1]));
+        result.Record(list, pass->Twin(), na::scale::DepthUnjitter::kTwinRest);
         REQUIRE(SUCCEEDED(list->Close()));
         d.queue->ExecuteCommandLists(1, lists); d.WaitIdle();
         REQUIRE(result.Read(dsv_format, out));

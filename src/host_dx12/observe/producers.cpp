@@ -68,6 +68,7 @@ struct DescHeap;
 // Recordings with a pinned viewport sample may still need it after the global
 // request goes away. Only an entirely idle jitter path can skip the list locks.
 std::atomic<uint64_t> g_vpj_recordings{0};
+std::atomic<uint64_t> g_vpj_last_pinned{0}; // the sample the most recent recording pinned for its scene draws
 // Depth direction evidence (SetDepthWriteEvidence). The facts belong to the RECORDING they were
 // recorded in (ListState::de, cleared when the list is Reset) and say nothing until that recording
 // is submitted: a list recorded ahead, discarded or reset proves nothing about the picture on
@@ -1973,9 +1974,34 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     if (want) emit(e, NA_GROUP_DESCRIPTOR);
 }
 
+// ---- Depth reads (j2/depth_reads.cpp; core/depth_unjitter.hpp says why). The game's shader
+// reads of one depth texture are made on a TWIN the host fills with the raster jitter taken back
+// out. The game's depth itself is untouched: depth tests, the host's own readers and the registry
+// all keep the game's texture, and the registry keeps recording the game's view as the game made
+// it. Only the descriptor the DRIVER gets names the twin, and only for a view of the depth plane
+// (a stencil view stays on the game's texture). One pointer comparison on the view-creation path.
+// A read that is missed (a view in a heap the registry never saw, a copy of the depth texture
+// itself) simply stays on the game's depth, as without this.
+std::atomic<ID3D12Resource*> g_dr_depth{nullptr}, g_dr_twin{nullptr};
+std::atomic<uint64_t> g_dr_created{0}, g_dr_swept{0}, g_dr_readable{0}, g_dr_other{0};
+std::atomic<DepthReadableListener> g_dr_listener{nullptr};
+inline bool depth_plane_view(uint32_t format)
+{
+    return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
+           format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || format == DXGI_FORMAT_R16_UNORM;
+}
+
 void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
-    o_CreateShaderResourceView(dev, r, d, h);
+    ID3D12Resource* driver = r;
+    if (r && d && r == g_dr_depth.load(std::memory_order_acquire) && !t_host_work &&
+        d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && depth_plane_view(static_cast<uint32_t>(d->Format))) {
+        if (ID3D12Resource* twin = g_dr_twin.load(std::memory_order_acquire)) {
+            driver = twin;
+            g_dr_created.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    o_CreateShaderResourceView(dev, driver, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MostDetailedMip; count = d->Texture2D.MipLevels; }
     DescriptorDetails view_args;
@@ -5180,6 +5206,29 @@ struct TextureHooks { std::shared_ptr<TextureOperationHook> lane[2]; };
 auto& g_texture_hooks = *new std::shared_ptr<const TextureHooks>();
 std::mutex g_texture_hooks_m;
 std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
+// Depth reads: the game has just moved the twinned depth from "being written" to "readable by a
+// shader" on this recording. The listener refreshes the twin here, AFTER the game's barrier, so
+// every read the game records from now on sees the depth as it is at this point of the list.
+void after_depth_readable(GL* l, UINT n, const D3D12_RESOURCE_BARRIER* b)
+{
+    ID3D12Resource* depth = g_dr_depth.load(std::memory_order_relaxed);
+    if (!depth || t_host_work || !b) return;
+    constexpr UINT shader = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    for (UINT i = 0; i < n; ++i) {
+        const auto& x = b[i];
+        if (x.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || x.Transition.pResource != depth ||
+            (x.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) continue;
+        if (x.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && x.Transition.Subresource != 0) continue; // depth plane only
+        if (!(x.Transition.StateBefore & D3D12_RESOURCE_STATE_DEPTH_WRITE) || (x.Transition.StateAfter & D3D12_RESOURCE_STATE_DEPTH_WRITE)) continue;
+        if (!(x.Transition.StateAfter & shader)) { g_dr_other.fetch_add(1, std::memory_order_relaxed); continue; } // e.g. the game copies its depth
+        g_dr_readable.fetch_add(1, std::memory_order_relaxed);
+        if (const auto listen = g_dr_listener.load(std::memory_order_acquire)) {
+            HostWorkScope own;
+            listen(l, depth, static_cast<uint32_t>(x.Transition.StateAfter), x.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+        }
+        return;
+    }
+}
 
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
@@ -5313,7 +5362,7 @@ void vpj_before_draw(GL* l)
         if (want) want = pc && pc->depth_enable == 1;
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
-            if (!ls->vpj_scene) g_vpj_recordings.fetch_add(1, std::memory_order_release);
+            if (!ls->vpj_scene) { g_vpj_recordings.fetch_add(1, std::memory_order_release); g_vpj_last_pinned.store(sample, std::memory_order_release); }
             ls->vpj_scene = sample;
             ls->vpj_depth=sel_depth;
             g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
@@ -6169,6 +6218,8 @@ struct ListHook<Slot, R(A...)> {
                 }
             }
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, a...);
+            if constexpr (Slot == sl::list::ResourceBarrier)
+                if (scope.outermost && !scope.ambiguous) after_depth_readable(l, a...);
         } else {
             const R r = fn(l, a...);
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, r, a...);
@@ -8085,6 +8136,63 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
 }
 void SetTextureTraceListener(TextureTraceListener listener) { g_texture_trace_listener.store(listener, std::memory_order_release); }
 void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
+void SetDepthReadableListener(DepthReadableListener listener) { g_dr_listener.store(listener, std::memory_order_release); }
+void SetDepthReadTwin(ID3D12Resource* game_depth, ID3D12Resource* twin)
+{
+    // Twin first when setting, depth first when clearing: a view creation that sees the depth sees a twin.
+    if (game_depth) { g_dr_twin.store(twin, std::memory_order_release); g_dr_depth.store(game_depth, std::memory_order_release); }
+    else { g_dr_depth.store(nullptr, std::memory_order_release); g_dr_twin.store(nullptr, std::memory_order_release); }
+}
+uint32_t RedirectExistingDepthReads(ID3D12Resource* game_depth, ID3D12Resource* target)
+{
+    // Views of the depth plane the game made BEFORE the twin existed, and every copy of them the
+    // registry has seen. Found under the registry lock (which first applies every queued view
+    // write), written after it: the registry lock is never held across a D3D12 call. A game thread
+    // that replaces one of these slots in that gap could lose its write; the caller therefore runs
+    // this once per twin, at the game's Present, with the game's queue idle.
+    if (!game_depth || !target) return 0;
+    struct Hit { D3D12_CPU_DESCRIPTOR_HANDLE handle; uint32_t format, first; };
+    std::vector<Hit> hits;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        const na_object_id id = id_locked(game_depth);
+        if (!id) return 0;
+        for (const auto& h : g_heaps) {
+            if (h->type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !h->stripes) continue;
+            for (uint32_t st = 0; st < h->nstripes; ++st) {
+                const uint64_t base = uint64_t(st) << kStripeShift;
+                if (base >= h->count) break;
+                std::shared_lock<std::shared_mutex> stripe(h->stripes[st]);
+                for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
+                    const auto& si = h->info[static_cast<size_t>(base + b)];
+                    if (si.kind != NA_DESC_SRV || si.resource != id || !depth_plane_view(si.format)) continue;
+                    hits.push_back({{static_cast<SIZE_T>(h->cpu_start + (base + b) * h->increment)}, si.format,
+                                    si.first_sub == NA_UNKNOWN_U32 ? 0u : si.first_sub});
+                }
+            }
+        }
+    }
+    if (hits.empty()) return 0;
+    ID3D12Device* device = nullptr;
+    if (FAILED(target->GetDevice(IID_PPV_ARGS(&device))) || !device) return 0;
+    HostWorkScope own;
+    for (const Hit& hit : hits) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+        d.Format = static_cast<DXGI_FORMAT>(hit.format); d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Texture2D.MostDetailedMip = hit.first; d.Texture2D.MipLevels = 1;
+        o_CreateShaderResourceView(device, target, &d, hit.handle);
+    }
+    device->Release();
+    g_dr_swept.fetch_add(hits.size(), std::memory_order_relaxed);
+    return static_cast<uint32_t>(hits.size());
+}
+DepthReadStats GetDepthReadStats()
+{
+    return {g_dr_created.load(std::memory_order_relaxed), g_dr_swept.load(std::memory_order_relaxed),
+            g_dr_readable.load(std::memory_order_relaxed), g_dr_other.load(std::memory_order_relaxed)};
+}
+
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {
     SetTextureOperationHook(TextureLane::Effects, std::move(hook));
@@ -8104,6 +8212,15 @@ void SetTextureOperationHook(TextureLane lane, std::shared_ptr<TextureOperationH
     } // callbacks and GPU-owning objects are released outside the registry lock
 }
 void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
+bool ListRasterStateTracked(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->raster_tracking && ls->restorable && !ls->in_render_pass;
+}
 bool ListRasterStateRestorable(ID3D12CommandList* list)
 {
     std::shared_lock<RegistryLock> lock(g_m);
@@ -9315,6 +9432,7 @@ bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float
     if (y) *y = vpj_axis(packed, 0);
     return true;
 }
+uint64_t LastSceneViewportJitter() { return g_vpj_last_pinned.load(std::memory_order_acquire); }
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
 {
     std::shared_lock<RegistryLock> lock(g_m);

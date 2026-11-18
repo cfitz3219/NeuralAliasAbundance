@@ -347,6 +347,7 @@ struct Stats {
     uint64_t gap_bridged = 0; // same-epoch acquisition gaps longer than 4 frames kept without a restart
     char recent_cuts[240] = {};
     char draw_replay[96]{};
+    char depth_reads[448]{}; // depth_reads.cpp Format(): state, counts and why
     char game_motion[400] = {}; // game_motion.cpp Describe(): candidate scoring and the tier 1 feed
     uint64_t camera_from_j1 = 0;
     uint64_t jitter_extent_rescaled = 0; // the render extent changed after J1 jittered this frame: sample rescaled // the scene list held no camera; J1's camera of this same frame (with its jitter) was used

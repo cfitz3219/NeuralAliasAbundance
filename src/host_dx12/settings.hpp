@@ -124,6 +124,12 @@ struct Settings {
     // Draw replay ([j2] draw_replay, 1 = on): per-object motion from the game's own draws replayed with
     // stream output, fed as engine motion (Cort 2026-11-06, SE5 sweatshirt smear). Off by default (Cort).
     std::atomic<uint32_t> j2_draw_replay{0};
+    // Depth reads ([j2] depth_reads, 1 = on): while viewport jitter supplies the samples, the game's own
+    // shader reads of the scene depth get the depth with the jitter taken back out (Cort's Sniper Elite
+    // Resistance run on 7933efc, 2026-11-18: a far ground mark and a lamp's pool of light switched with
+    // the jitter sample). Depth tests and DLSS keep the game's depth. Live, saved per game.
+    // Off by default until it has run in a game on Cort's screen; then on for every game.
+    std::atomic<uint32_t> j2_depth_reads{0};
     // Expanded vertices draw replay may run again per frame ([j2] replay_vertex_budget, 0 = no budget).
     // 3 million a frame cost about 10 ms on an RTX 5070 Ti at 3440x1440 (Cort's Resistance run, 2026-11-17).
     std::atomic<uint32_t> j2_replay_budget{1000000};

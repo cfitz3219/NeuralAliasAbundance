@@ -18,10 +18,15 @@ namespace na::scale {
 class DepthUnjitter {
 public:
     static std::shared_ptr<const DepthUnjitter> Create(ID3D12Device* device, ID3D12Resource* game_depth, std::string& error);
-    // The twin; in D3D12_RESOURCE_STATE_DEPTH_WRITE when created.
+    // The state the twin rests in, from its creation on: readable by any shader stage.
+    static constexpr D3D12_RESOURCE_STATES kTwinRest =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     ID3D12Resource* Twin() const { return twin_.Get(); }
+    // Record() between the twin's two transitions (rest -> DEPTH_WRITE -> rest). Every recording that
+    // refreshes the twin does it this way, so the twin's state is the same at the start and end of each.
+    bool RecordRefresh(ID3D12GraphicsCommandList* list, float jitter_x, float jitter_y) const;
     // Caller: game depth's depth plane readable by a pixel shader (PIXEL_SHADER_RESOURCE, with or
-    // without DEPTH_READ), twin in DEPTH_WRITE, outside render passes; restores the game's
+    // without DEPTH_READ), twin in DEPTH_WRITE (RecordRefresh does that), outside render passes; restores the game's
     // command-list state afterwards and keeps this pass alive through every execution of the
     // recording. jitter = how far the picture was moved, in pixels (+x right, +y down).
     // No waits, descriptor writes, allocation, compilation or readback here.

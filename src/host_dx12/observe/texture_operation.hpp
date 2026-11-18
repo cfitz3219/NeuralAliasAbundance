@@ -40,6 +40,24 @@ void SetTextureOperationHook(TextureLane, std::shared_ptr<TextureOperationHook>)
 // clears depth, before it is forwarded, with the view's resource id. Records nothing.
 using DepthClearListener = void (*)(ID3D12GraphicsCommandList*, uint64_t target_id);
 void SetDepthClearListener(DepthClearListener);
+// Depth reads (j2/depth_reads.cpp). The game's shader reads of `game_depth`'s depth plane are made
+// on `twin` (same description): every view of it the game creates from now on, and, through
+// RedirectExistingDepthReads, the views it made before. Null, null = none. The twin must outlive
+// every descriptor that may name it, so the owner keeps it at least as long as the game's depth.
+void SetDepthReadTwin(ID3D12Resource* game_depth, ID3D12Resource* twin);
+// Rewrites the existing views (and recorded copies of them) of `game_depth`'s depth plane to
+// `target`: the twin, or the game's depth itself to undo. Returns how many. Call at the game's
+// Present with the game's queue idle, once per change.
+uint32_t RedirectExistingDepthReads(ID3D12Resource* game_depth, ID3D12Resource* target);
+// Called (as host work) right after the game moves the twinned depth from DEPTH_WRITE to a state
+// a shader can read, on the recording that holds the barrier. state_after = the game's new state;
+// all_planes = the barrier named every subresource.
+using DepthReadableListener = void (*)(ID3D12GraphicsCommandList* list, ID3D12Resource* game_depth, uint32_t state_after, bool all_planes);
+void SetDepthReadableListener(DepthReadableListener);
+// created: views made on the twin at creation; swept: existing views rewritten; readable: write-to-read
+// barriers seen; other: write-to-something-else barriers (a copy source, for example) the twin does not cover.
+struct DepthReadStats { uint64_t created, swept, readable, other; };
+DepthReadStats GetDepthReadStats();
 // Called only for a forwarded game texture operation, with the actual call arguments.
 using TextureTraceListener = void (*)(ID3D12GraphicsCommandList*, const TextureCall&) noexcept;
 void SetTextureTraceListener(TextureTraceListener);
