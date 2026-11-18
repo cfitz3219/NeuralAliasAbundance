@@ -949,7 +949,9 @@ void DrawLiveDlaa()
     }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
-#ifdef NA_HAVE_REFEREE_SHADERS
+    // Cort 2026-11-18: no package shows the Referee switch until he says the false motion is dealt
+    // with. The row is built only when NA_REFEREE_MENU is asked for at configure time (default OFF).
+#if defined(NA_HAVE_REFEREE_SHADERS) && defined(NA_REFEREE_MENU)
     auto& referee_enabled = na::settings::Get().referee_enabled;
     bool referee_on = referee_enabled.load() != 0;
     BeginRow("Referee", "Checks DLAA while you play and records its findings in the results log.", SwitchWidth());
