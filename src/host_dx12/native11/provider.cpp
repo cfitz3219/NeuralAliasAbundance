@@ -34,6 +34,7 @@
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/native11/depth_reads.hpp"
 #include "host_dx12/native11/frame_model.hpp"
+#include "host_dx12/native11/screen_check.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
 #include "providers/camera/camera_admission.hpp"
@@ -202,6 +203,8 @@ struct Ctx {
     uint32_t gen = 0;  // the game-device generation that answer was given in
     uint64_t sampler_policy = ~uint64_t{0};
     uint64_t texture_policy = ~uint64_t{0};
+    Id screen_color = 0;
+    std::bitset<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> screen_slots;
     PsShadow ps_shadow;                // the game's views behind bound material replacements (textures.hpp)
     bool deferred = false;
     Id rt0 = 0, depth = 0;
@@ -238,6 +241,8 @@ struct Ctx {
         sampler_policy = ~uint64_t{0};
         texture_policy = ~uint64_t{0};
         ps_shadow.Clear();
+        screen_color = 0;
+        screen_slots.reset();
         rt0 = depth = 0;
         rt_count = 0;
         depth_test = true;
@@ -268,6 +273,8 @@ void* g_cb_user = nullptr;
 
 std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
+ScreenCheck g_screen;
+std::atomic<bool> g_screen_enabled{false};
 std::unordered_map<ID3D11DeviceContext*, std::unique_ptr<Ctx>> g_ctx;
 std::map<ID3D11CommandList*, ListRecord> g_lists;
 uint64_t g_list_order = 0;
@@ -1564,7 +1571,11 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
         return;
     }
     std::unique_lock<std::mutex> l(g_mu);
-    if (e.kind == Kind::Read && g_model.ShouldFireBeforeRead(e.resource)) {
+    const auto& scene = g_model.Current();
+    // VARIANT: point/native11-screen-verified
+    const bool screen_verified = e.kind == Kind::Read && g_screen_enabled.load(std::memory_order_relaxed) &&
+                                 g_screen.Verified(scene.color, scene.depth);
+    if (e.kind == Kind::Read && !screen_verified && g_model.ShouldFireBeforeRead(e.resource)) {
         g_model.MarkFired();
         Fire(c, l, Boundary::BeforeRead);
         StopViewportJitterAfterScene();
@@ -1804,9 +1815,14 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
     if (!x) return;
     auto& depth_slots = x->depth_reads.slots[static_cast<size_t>(stage)];
     const bool track_depth = !x->deferred && g_depth_reads_enabled.load(std::memory_order_relaxed);
-    if (!track_depth && !views) return;
+    const bool screen = !x->deferred && stage == DepthStage::Pixel && g_screen_enabled.load(std::memory_order_relaxed);
+    if (!track_depth && !views && !screen) return;
     const Id depth = track_depth ? g_sel_depth.load(std::memory_order_relaxed) : 0;
     const Id color = g_sel_color.load(std::memory_order_relaxed);
+    if (screen && x->screen_color != color) {
+        x->screen_color = color;
+        x->screen_slots.reset();
+    }
     if (!depth && !color && !g_watch[0].load(std::memory_order_relaxed)) return;
     Id sent[kWatch + 1] = {};
     size_t sent_n = 0;
@@ -1816,6 +1832,8 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
             Inside in;
             r = ResourceOfView(views[i]);
         }
+        if (screen && start < x->screen_slots.size() && i < x->screen_slots.size() - start)
+            x->screen_slots.set(start + i, r && r == color);
         if (track_depth && start < kDepthSlots && i < kDepthSlots - start)
             depth_slots.set(start + i, r && r == depth);
         if (!r || sent_n == kWatch + 1) continue;
@@ -1839,7 +1857,7 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
         e.resource = r;
         Emit(x, c, e);
         if (sent_n < kWatch + 1) sent[sent_n++] = r;
-        if (sent_n == kWatch + 1 && !track_depth) return;
+        if (sent_n == kWatch + 1 && !track_depth && !screen) return;
     }
 }
 void ReadResource(ID3D11DeviceContext* c, ID3D11Resource* src)
@@ -2147,40 +2165,111 @@ void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, F
     }
 }
 
+ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
+{
+    if (!x || x->deferred || x->rt_count != 1 || !x->rt0 || (x->depth && x->depth_test) ||
+        x->screen_slots.none() || x->vp_n != 1 || x->vp_x != 0.f || x->vp_y != 0.f ||
+        !g_screen_enabled.load(std::memory_order_relaxed)) return {};
+
+    std::unique_lock<std::mutex> lock(g_mu);
+    const auto& scene = g_model.Current();
+    const auto draws = g_model.SceneDrawsThisFrame();
+    if (!draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
+        scene.color == g_backbuffer || !g_swap || x->raster_queries ||
+        IdOf(g_color_ref.Get()) != scene.color || g_color_view.mip || g_color_view.slice) return {};
+    ResourceInfo output{};
+    if (!g_model.InfoOf(x->rt0, output) || output.width != scene.color_info.width ||
+        output.height != scene.color_info.height || x->vp_w != float(output.width) || x->vp_h != float(output.height))
+        return {};
+
+    Inside own;
+    ComPtr<ID3D11Predicate> predicate;
+    BOOL predicate_value = FALSE;
+    c->GetPredication(&predicate, &predicate_value);
+    if (predicate) return {};
+    ComPtr<ID3D11PixelShader> shader;
+    c->PSGetShader(&shader, nullptr, nullptr);
+    if (!shader) return {};
+    ComPtr<ID3D11RenderTargetView> target;
+    c->OMGetRenderTargets(1, &target, nullptr);
+    if (!target) return {};
+    D3D11_RENDER_TARGET_VIEW_DESC target_view{};
+    target->GetDesc(&target_view);
+    if (target_view.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || target_view.Texture2D.MipSlice) return {};
+    ComPtr<ID3D11Resource> destination;
+    target->GetResource(&destination);
+    if (IdOf(destination.Get()) != x->rt0) return {};
+    for (UINT slot = 0; slot < x->screen_slots.size(); ++slot) {
+        if (!x->screen_slots.test(slot)) continue;
+        ComPtr<ID3D11ShaderResourceView> view;
+        c->PSGetShaderResources(slot, 1, &view); // the runtime may have automatically unbound it
+        if (!view || ResourceOfView(view.Get()) != scene.color) continue;
+        D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+        view->GetDesc(&desc);
+        if (desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || desc.Texture2D.MostDetailedMip) continue;
+        const ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format)};
+        g_screen.SetScene(scene.color, scene.depth);
+        if (g_screen.Verified(scene.color, scene.depth)) {
+            if (!g_screen.Matches(reader) || g_model.FiredThisFrame()) return {};
+            g_model.MarkFired();
+            const auto missed = g_stats.missed;
+            Fire(c, lock, Boundary::BeforeRead);
+            g_screen.NoteDelivery(g_stats.missed == missed && g_frame_fired, draws);
+            StopViewportJitterAfterScene();
+            return {};
+        }
+        ComPtr<ID3D11Texture2D> source;
+        if (FAILED(g_color_ref.As(&source))) return {};
+        return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+    }
+    return {};
+}
+
+template<class Forward>
+void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
+{
+    const auto mark = CheckScreenReader(c, state);
+    ForwardDepthRead(c, state, false, forward);
+    if (mark.source) {
+        Inside own;
+        ScreenCheck::Restore(c, mark);
+    }
+}
+
 void STDMETHODCALLTYPE DrawIndexed_d(ID3D11DeviceContext* c, UINT count, UINT start, INT base)
 {
     Ctx* x = DrawEvent(c, count, false);
-    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_indexed(c, count, start, base); });
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed(c, count, start, base); });
 }
 void STDMETHODCALLTYPE Draw_d(ID3D11DeviceContext* c, UINT count, UINT start)
 {
     Ctx* x = DrawEvent(c, count, false);
-    ForwardDepthRead(c, x, false, [&] { O(c, x).draw(c, count, start); });
+    ForwardGameDraw(c, x, [&] { O(c, x).draw(c, count, start); });
 }
 void STDMETHODCALLTYPE DrawIndexedInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
 {
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
-    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
 }
 void STDMETHODCALLTYPE DrawInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, UINT start_inst)
 {
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
-    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_instanced(c, count, inst, start, start_inst); });
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_instanced(c, count, inst, start, start_inst); });
 }
 void STDMETHODCALLTYPE DrawIndexedInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
     Ctx* x = DrawEvent(c, 0, true);
-    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_indexed_indirect(c, b, off); });
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_indirect(c, b, off); });
 }
 void STDMETHODCALLTYPE DrawInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
     Ctx* x = DrawEvent(c, 0, true);
-    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_indirect(c, b, off); });
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_indirect(c, b, off); });
 }
 void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
 {
     Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? DrawEvent(c, 0, true) : nullptr;
-    ForwardDepthRead(c, x, false, [&] { O(c, x).draw_auto(c); });
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_auto(c); });
 }
 void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
 {
@@ -2566,11 +2655,27 @@ bool OnPresent(IDXGISwapChain* swap)
         ComPtr<ID3D11Device> d;
         if (FAILED(swap->GetDevice(IID_PPV_ARGS(&d))) || d.Get() != game) return false;
         g_swap = swap;
+        g_screen.SetScene(0, 0);
         DXGI_SWAP_CHAIN_DESC sd{};
         swap->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
     }
+    if (g_screen_enabled.load(std::memory_order_relaxed)) {
+        Inside own;
+        ComPtr<ID3D11DeviceContext> context;
+        ComPtr<ID3D11Texture2D> screen;
+        if (g_screen.AwaitingSamples()) {
+            game->GetImmediateContext(&context);
+            swap->GetBuffer(0, IID_PPV_ARGS(&screen));
+        }
+        bool confirmed, refuted;
+        g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), confirmed, refuted);
+        if (confirmed || refuted)
+            na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
+                               confirmed ? "confirmed" : "refuted", (unsigned long long)g_screen.Paired(),
+                               (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
+    } else g_screen.SetScene(0, 0);
     ++g_frame;
     g_exact_frame.fetch_add(1, std::memory_order_relaxed);
     ++g_stats.frames;
@@ -2584,6 +2689,8 @@ bool OnPresent(IDXGISwapChain* swap)
     // is told which target is the screen; a picture drawn straight onto it has no read to wait for.
     g_model.SetScreenTarget(g_backbuffer);
     g_model.EndFrame();
+    const auto& picked = g_model.Current();
+    if (g_screen_enabled.load(std::memory_order_relaxed)) g_screen.SetScene(picked.color, picked.depth);
     const auto& ms = g_model.GetStats();
     {
         // WHY log: one line whenever the place DLSS runs at changes kind, with what the frame showed.
@@ -2788,6 +2895,7 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
 {
     std::lock_guard<std::mutex> l(g_mu);
     if (s == g_swap) {
+        g_screen.SetScene(0, 0);
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
         g_color_ref.Reset();
         g_depth_ref.Reset();
@@ -2923,6 +3031,7 @@ bool InstallHooks(bool host_owns_present)
 
 } // namespace
 
+void SetScreenCheck(bool on) { g_screen_enabled.store(on, std::memory_order_relaxed); }
 bool ObservePresent(void* swapchain) { return OnPresent(static_cast<IDXGISwapChain*>(swapchain)); }
 void BeforeResize(void* swapchain) { ReleaseResizeInputs(static_cast<IDXGISwapChain*>(swapchain)); }
 void AfterResize(void* swapchain, long result) { UpdateResizeExtent(static_cast<IDXGISwapChain*>(swapchain), result); }
@@ -2969,6 +3078,8 @@ void Uninstall()
     std::lock_guard<std::mutex> l(g_mu);
     g_cb = nullptr;
     g_cb_user = nullptr;
+    g_screen = {};
+    g_screen_enabled.store(false, std::memory_order_relaxed);
     g_swap = nullptr;
     g_backbuffer = 0;
     g_collect_all = false;
@@ -3023,7 +3134,12 @@ void SetNextJitter(float x_px, float y_px)
 ProviderStats Stats()
 {
     std::lock_guard<std::mutex> l(g_mu);
-    return g_stats;
+    ProviderStats stats = g_stats;
+    stats.screen_confirmed = g_screen.Confirmed();
+    stats.screen_refuted = g_screen.Refuted();
+    stats.screen_pairs = g_screen.Paired();
+    stats.screen_delivered = g_screen.Delivered();
+    return stats;
 }
 
 int FormatStatus(char* out, unsigned long n)

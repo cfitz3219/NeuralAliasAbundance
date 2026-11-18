@@ -26,6 +26,7 @@
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/capture/screen_marker.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
@@ -1429,11 +1430,8 @@ void native_delivery_submitted(bool producer_order,const char* refusal,uint32_t 
 //    example SE5's bindless final dispatch) is marked on the game's own image,
 //    BEFORE any DLSS goes there; it is learned only when the screen follows;
 //  * delivery: the first sustained delivery (30 frames) or an armed J2 capture.
-struct DeliveryProbe {
+struct DeliveryProbe : na::screen_marker::Vote {
     std::mutex m;
-    static constexpr float kAt[3][2]{{.30f,.62f},{.70f,.62f},{.50f,.38f}};
-    static constexpr uint32_t kSession=8;
-    static constexpr float kLow=.2f,kHigh=.8f;
     uint32_t remaining=0;uint64_t sessions=0;bool auto_done=false;
     bool verify=false;NativeCrossing target;uint32_t verify_attempts=0;
     int outcome=0;NativeCrossing outcome_target; // for the trace, applied outside this lock
@@ -1448,27 +1446,14 @@ struct DeliveryProbe {
     struct Sample{uint32_t value=0;float luma[3]{};uint64_t frame=0;};
     std::vector<Sample> seq;
     uint64_t marked=0,paired=0,unpaired=0,size_mismatch=0,verified=0,refuted=0;
-    uint32_t follow[3]{},invert[3]{},flat[3]{},steps=0;
     char verdict[48]="none";
     void start(bool verifying){
-        remaining=kSession;++sessions;seq.clear();marks.clear();verify=verifying;
-        for(auto& x:follow)x=0;for(auto& x:invert)x=0;for(auto& x:flat)x=0;steps=0;
+        remaining=na::screen_marker::kSession;++sessions;seq.clear();marks.clear();verify=verifying;
+        static_cast<na::screen_marker::Vote&>(*this) = {};
         std::snprintf(verdict,sizeof verdict,"%s","running");
     }
 };
 DeliveryProbe& g_probe=*new DeliveryProbe;
-float probe_luma(const uint8_t* p,DXGI_FORMAT f){
-    const auto half=[](uint16_t h){const uint32_t e=(h>>10)&31,m=h&1023;const float v=e==0?std::ldexp(float(m),-24):std::ldexp(float(m|1024),int(e)-25);return (h&0x8000)?-v:v;};
-    float r=0,g2=0,b=0;
-    switch(f){
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:case DXGI_FORMAT_R16G16B16A16_TYPELESS:{uint16_t t[4];std::memcpy(t,p,8);r=half(t[0]);g2=half(t[1]);b=half(t[2]);break;}
-    case DXGI_FORMAT_R8G8B8A8_UNORM:case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:case DXGI_FORMAT_R8G8B8A8_TYPELESS:r=p[0]/255.f;g2=p[1]/255.f;b=p[2]/255.f;break;
-    case DXGI_FORMAT_B8G8R8A8_UNORM:case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:case DXGI_FORMAT_B8G8R8A8_TYPELESS:b=p[0]/255.f;g2=p[1]/255.f;r=p[2]/255.f;break;
-    case DXGI_FORMAT_R10G10B10A2_UNORM:case DXGI_FORMAT_R10G10B10A2_TYPELESS:{uint32_t v;std::memcpy(&v,p,4);r=(v&1023)/1023.f;g2=((v>>10)&1023)/1023.f;b=((v>>20)&1023)/1023.f;break;}
-    default:return -1.f;
-    }
-    return .2126f*r+.7152f*g2+.0722f*b;
-}
 // Writes this frame's marker texels into `dest` (UNORDERED_ACCESS) in `l`.
 // verifying: the mark pairs once its recording was submitted (lease); a delivery
 // mark pairs only when J2 confirmed that delivery at submission (probe_submitted).
@@ -1507,10 +1492,10 @@ bool probe_write_locked(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32
     D3D12_UNORDERED_ACCESS_VIEW_DESC u{};u.Format=DXGI_FORMAT(view_format);u.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
     g.device->CreateUnorderedAccessView(dest,nullptr,&u,gc);g.device->CreateUnorderedAccessView(dest,nullptr,&u,cc);
     const uint32_t value=uint32_t(p.marked&1);
-    const float v=value?DeliveryProbe::kHigh:DeliveryProbe::kLow;
+    const float v=value?na::screen_marker::kHigh:na::screen_marker::kLow;
     const float c[4]{v,v,v,1.f};
     D3D12_RECT rects[3];
-    for(int i=0;i<3;++i){const LONG x=LONG(DeliveryProbe::kAt[i][0]*float(desc.Width)),y=LONG(DeliveryProbe::kAt[i][1]*float(desc.Height));rects[i]={x,y,x+1,y+1};}
+    for(int i=0;i<3;++i){const LONG x=LONG(na::screen_marker::kAt[i][0]*float(desc.Width)),y=LONG(na::screen_marker::kAt[i][1]*float(desc.Height));rects[i]={x,y,x+1,y+1};}
     const na::observe::HostWorkScope own;
     if(render_target){
         D3D12_CPU_DESCRIPTOR_HANDLE rh=p.rtv->GetCPUDescriptorHandleForHeapStart();
@@ -1567,19 +1552,14 @@ void probe_judge_locked(){
     // Steps between consecutive paired presents: luma moves with the marker?
     for(size_t i=1;i<p.seq.size();++i){
         const auto& a=p.seq[i-1];const auto& b=p.seq[i];
-        if(a.value==b.value)continue;
-        ++p.steps;const float dm=b.value?1.f:-1.f;
-        for(int k=0;k<3;++k){const float d=b.luma[k]-a.luma[k];
-            if(std::fabs(d)<.02f)++p.flat[k];else if(d*dm>0)++p.follow[k];else ++p.invert[k];}
+        p.Add(a.value, a.luma, b.value, b.luma);
     }
     p.seq.erase(p.seq.begin(),p.seq.end()-(p.seq.empty()?0:1));
     if(p.steps<5){std::snprintf(p.verdict,sizeof p.verdict,"%s",p.paired?"unresolved_few_pairs":"unresolved_unpaired");return;}
-    uint32_t reach=0,still=0;
-    for(int k=0;k<3;++k){
-        if(p.follow[k]*4>=p.steps*3||p.invert[k]*4>=p.steps*3)++reach;
-        if(p.flat[k]*4>=p.steps*3)++still;
-    }
-    std::snprintf(p.verdict,sizeof p.verdict,"%s",reach>=2?"confirmed_in_presented":still==3?"replaced_before_present":"unresolved_mixed");
+    using Result = na::screen_marker::Vote::Result;
+    const auto result = p.ResultOf();
+    std::snprintf(p.verdict, sizeof p.verdict, "%s", result == Result::Reached ? "confirmed_in_presented" :
+                  result == Result::Discarded ? "replaced_before_present" : "unresolved_mixed");
 }
 // Collect finished readbacks (never waits on the GPU).
 void probe_collect_locked(){
@@ -1594,7 +1574,7 @@ void probe_collect_locked(){
         if(FAILED(s.rb->Map(0,&r,reinterpret_cast<void**>(&data)))||!data)continue;
         DeliveryProbe::Sample x;x.value=s.value;x.frame=s.frame;
         bool ok=true;
-        for(int k=0;k<3;++k){x.luma[k]=probe_luma(data+k*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,s.format);ok&=x.luma[k]>=0;}
+        for(int k=0;k<3;++k){x.luma[k]=na::screen_marker::Luma(data+k*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,s.format);ok&=x.luma[k]>=0;}
         D3D12_RANGE none{0,0};s.rb->Unmap(0,&none);
         if(ok){p.seq.push_back(x);++p.paired;}
     }
@@ -1666,7 +1646,7 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
                         D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=frame;src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                         dst.pResource=slot->rb.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                         dst.PlacedFootprint.Offset=UINT64(k)*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;dst.PlacedFootprint.Footprint={desc.Format,1,1,1,D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
-                        const UINT x=UINT(DeliveryProbe::kAt[k][0]*float(desc.Width)),y=UINT(DeliveryProbe::kAt[k][1]*float(desc.Height));
+                        const UINT x=UINT(na::screen_marker::kAt[k][0]*float(desc.Width)),y=UINT(na::screen_marker::kAt[k][1]*float(desc.Height));
                         const D3D12_BOX box{x,y,0,x+1,y+1,1};
                         l->CopyTextureRegion(&dst,0,0,0,&src,&box);
                     }
