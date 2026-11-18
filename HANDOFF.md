@@ -1167,3 +1167,7 @@ PR #159 at a867810 targets Fable's active branch. Exact-frame and swap-chain mat
 PR #159 merged to the active branch at 45441f2. The merged tree is identical to the tested tree. Saved-capture calibration and wiring the verdicts to the route selector are still separate work.
 
 PR #161 merged at 3536dbba. It connects the referee to a read-only route preview and replays saved Resistance captures through the same policy. It does not give the referee control of the live route. COMMS and the active WORKLOG record the samples, controlled bypass and limits of the evidence.
+
+## 2026-11-17 Pacific — Native DX11 jitter-locked lighting handoff
+
+Astra's native DX11 implementation is a561d9e (PR #162 into Fable's claude/project-thread-axt148). Fable retains the DX12 implementation and combined integration. The Release host built, hardware and WARP passed the depth-slab fixture, and the debug-wrapper fallback was verified. Original depth tests and DLAA inputs are intact. COMMS records the rendering condition, state-handling decision and game limits. Source handoff only. No installation, package or live game run.
