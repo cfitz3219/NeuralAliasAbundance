@@ -873,7 +873,7 @@ int ScreenCheckFixture(Game& game)
     struct Presented {
         bool processed = false, clean_decoy = false;
     };
-    auto frame = [&](bool other) {
+    auto frame = [&](bool other, bool bypass = false) {
         Pump();
         Scene(game.ctx.Get(), game, 0);
         game.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -882,7 +882,11 @@ int ScreenCheckFixture(Game& game)
         const auto decoy_pixel = read(decoy.picture.Get());
         auto& target = other ? other_canvas : canvas;
         reader(target.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
-        reader(game.back_rtv.Get(), target.srv.Get(), composite.Get());
+        if (bypass) {
+            const float game_picture[]{.25f, .5f, .75f, 1.f};
+            game.ctx->ClearRenderTargetView(other_canvas.rtv.Get(), game_picture);
+        }
+        reader(game.back_rtv.Get(), bypass ? other_canvas.srv.Get() : target.srv.Get(), composite.Get());
         ComPtr<ID3D11Texture2D> screen;
         if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) {
             expect(false, "read the fixture backbuffer");
@@ -913,6 +917,16 @@ int ScreenCheckFixture(Game& game)
     na::native11::SetScreenCheck(false);
     frame(false);
     na::native11::SetScreenCheck(true);
+    int bypass_shown = 0;
+    for (int i = 0; i < 48; ++i) bypass_shown += frame(false, (i & 1) != 0).processed;
+    const auto bypassed = na::native11::Stats();
+    expect(bypass_shown == 0 && bypassed.screen_confirmed == 0 &&
+           bypassed.screen_refuted == alternating.screen_refuted + 1,
+           "a stable reader whose output is discarded every other frame cannot take over");
+
+    na::native11::SetScreenCheck(false);
+    frame(false);
+    na::native11::SetScreenCheck(true);
     uint64_t deliveries = 0;
     for (int i = 0; i < 72; ++i) {
         const auto result = frame(false);
@@ -927,8 +941,8 @@ int ScreenCheckFixture(Game& game)
         }
     }
     const auto confirmed = na::native11::Stats();
-    expect(confirmed.screen_confirmed == 1 && confirmed.screen_refuted == alternating.screen_refuted + 1 &&
-           confirmed.screen_pairs == alternating.screen_pairs + 16,
+    expect(confirmed.screen_confirmed == 1 && confirmed.screen_refuted == bypassed.screen_refuted + 1 &&
+           confirmed.screen_pairs == bypassed.screen_pairs + 16,
            "screen proof rejects the decoy and confirms the visible reader");
     expect(deliveries >= 20, "the verified reader can deliver continuously when the ordinary route cannot");
 
@@ -945,8 +959,8 @@ int ScreenCheckFixture(Game& game)
     expect(restored_shown == 48 && evaluator.writes == writes_before + 48 &&
            final.screen_delivered == fallback.screen_delivered && final.screen_confirmed == confirmed.screen_confirmed,
            "fallback preserves every presented frame and does not take over again");
-    std::printf("native DX11 screen check: ordinary=%d/48 alternating=%d/48 cold_start=%llu restored=%d/48\n",
-                ordinary_shown, alternating_shown, (unsigned long long)deliveries, restored_shown);
+    std::printf("native DX11 screen check: ordinary=%d/48 alternating=%d/48 bypass=%d/48 cold_start=%llu restored=%d/48\n",
+                ordinary_shown, alternating_shown, bypass_shown, (unsigned long long)deliveries, restored_shown);
     na::native11::Uninstall();
     return g_failed ? 1 : 0;
 }
