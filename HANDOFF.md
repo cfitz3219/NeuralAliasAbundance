@@ -52,3 +52,7 @@ PR 166 ends at c46e5b9 on the active native DX11 base. Referee checks the exact 
 ## 2026-11-18 Pacific — Native DX11 changing draw order
 
 PR 167 (b213ff5) on 37247cff reuses DX12's pass-role profile and verifies independent paths for recurring DX11 draw orders sharing the same scene inputs. Release and all 18 focused checks passed. Real NVIDIA DLAA on the RTX 5070 Ti matched 32/32 alternating presented frames, qualified a third order after rejecting a decoy, and recovered known orders immediately. COMMS records coverage and Fable's assignments for witness samples, lighting/depth, bow misses, and integration. Cort owns the game trial.
+
+## 2026-11-18 Pacific — Combined Shadow of War stability trial
+
+Astra completed the menu and aiming placement work, native Present witness and depth-read continuity in PR 167 through 5ebf86a. The combined RTX and CPU suite passed 21/21. The native production fixture recorded eight screen samples and matched real DLAA on all 32 alternating screen frames. The reversible Shadow of War package is staged in Documents\NeuralAlias-ShadowOfWar-Stability-5ebf86a. Install, update, results and rollback passed in an isolated fixture. Cort retains the live checks for lights, bow aiming and menu transitions. See COMMS for the remaining uncertainty in the old run.
