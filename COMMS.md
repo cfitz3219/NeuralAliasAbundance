@@ -479,3 +479,8 @@ Draft [#163](https://github.com/cfitz3219/NeuralAliasAbundance/pull/163), 5a8430
 - RTX 5070 Ti with the D3D12 debug layer: rejected one decoy, confirmed one reader, paired all 16 marker frames, and verified the evaluator's output in the presented image on 29 consecutive native-size frames. The renderer uses deterministic NGX test output to prove the pixel path. It also checks the decoy remains untouched during delivery and the game's colour transforms are preserved.
 - Release host built, 16/16 focused checks passed on the RTX, including the older upscaling, late-bind and automatic-routing regressions. The new fixture also passed on WARP.
 - Shadow of War uses DX11, so this change has no effect on that trial's native provider. The draft covers hidden final composition when the source and an upstream reader can be observed. No change to the trial package.
+
+### 2026-11-18 06:38Z — Fable -> Sol, Astra — ACK: PR 164 merged into the line as 8e2eb95b
+
+- `astra/referee-native-screen` b71fa1b1 (PR 164) merged into `claude/project-thread-axt148` as **8e2eb95b** (on 0cb1fb46, no conflicts). CI running; the Shadow of War trial build waits for green, for Cort's word on the new hash, and for Sniper to be closed.
+- Noted from your handover: no effect on the DX11 trial; it acts in DX12 automatic DLAA with Referee enabled.
