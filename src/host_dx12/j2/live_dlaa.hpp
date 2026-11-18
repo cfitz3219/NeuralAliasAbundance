@@ -30,6 +30,7 @@
 #include <cmath>
 #include <string>
 
+namespace na::referee::gpu { struct Presentation; }
 namespace na::j2 {
 
 using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
@@ -261,7 +262,7 @@ float UpscaleMipBias(uint32_t render_w, uint32_t out_w);
 // Called once at the game view's non-TEST Present boundary, including while
 // paused. Presenter-generated frames must not call this. Single-view J2 uses
 // its execution queue; other queues do not advance its camera history.
-void OnPresent(ID3D12CommandQueue* queue);
+void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receipt = nullptr);
 
 // Wraps the forward of a game ExecuteCommandLists (after observation began
 // for it). Forwards the original batch unchanged unless a frame is processed.

@@ -3189,7 +3189,7 @@ void capture_present_picture(ID3D12CommandQueue* queue, ID3D12Resource* frame, b
 
 // The finished frame (real back buffer on the old path, the game's proxy on
 // the presenter path): Neural Rendering, motion analysis, capture.
-void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
+void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame, na::referee::gpu::Presentation receipt)
 {
     if (!frame) return;
     DXGI_COLOR_SPACE_TYPE cs = static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire));
@@ -3217,7 +3217,7 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame)
                 na::capture::j2::SetAutoTrigger(n != 0, n, na::settings::Get().j2_capture_cooldown_s.load(std::memory_order_relaxed) * 1000u);
             }
         }
-        na::capture::j2::OnPresent(queue, frame, g_orig_execute);
+        na::capture::j2::OnPresent(queue, frame, g_orig_execute, receipt);
     }
 }
 
@@ -3429,9 +3429,10 @@ void note_identity(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
 // Every real game-frame entry shares the source notification, independently
 // of whether presentation uses owned proxies or the physical backbuffer.
 // TEST/generated presents do not enter either caller.
-void game_frame_boundary(ID3D12CommandQueue* queue)
+na::referee::gpu::Presentation game_frame_boundary(ID3D12CommandQueue* queue, IDXGISwapChain* swapchain = nullptr)
 {
-    na::j2::OnPresent(queue);
+    na::referee::gpu::Presentation receipt{0, swapchain};
+    na::j2::OnPresent(queue, swapchain ? &receipt : nullptr);
     if(na::scale::native::Available()){
         const auto scene=na::j2::GetStats();
         const auto before=na::scale::native::GetStats();
@@ -3477,6 +3478,7 @@ void game_frame_boundary(ID3D12CommandQueue* queue)
     }
     na::settings::WatchChanges("code");
     na::scale::AutomaticScenePresent();
+    return receipt;
 }
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr,
                 ComPtr<ID3D12CommandQueue>* after_present = nullptr)
@@ -3488,14 +3490,16 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr,
     if (!present_prelude(sc, queue,retained_queue,queue_hint,&on12_owned)) return;
     // A D3D11On12-owned chain can close and execute the game's last command
     // list inside Present. Learn from that submission in the same frame.
+    na::referee::gpu::Presentation receipt;
     if (on12_owned && after_present) *after_present = retained_queue;
-    else game_frame_boundary(queue);
+    else receipt = game_frame_boundary(queue, sc);
     note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
     UINT idx = real_index(sc);
     ComPtr<ID3D12Resource> bb; // A71: this frame only
-    if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get());
+    if (SUCCEEDED(real_get_buffer(sc, idx, IID_PPV_ARGS(&bb)))) process_frame(queue, bb.Get(), receipt);
+    else na::referee::gpu::OnPresent(receipt, queue, nullptr, g_orig_execute);
     const bool open = g_open.load(std::memory_order_acquire);
     const auto draws = g_frames.load(std::memory_order_relaxed);
     menu_step(sc, queue, open);
@@ -3528,14 +3532,19 @@ void finish_deferred_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue)
 // A59 presenter path: the game drew into its proxy; the presenter copies,
 // generates and presents. Composite the menu on the proxy, after NR and
 // before copying to the worker's owned frame. No real-buffer access here.
+struct PresenterFrameContext {
+    bool menu_open;
+    na::referee::gpu::Presentation receipt;
+};
 void presenter_frame_cb(ID3D12CommandQueue* queue, ID3D12Resource* frame, void* user)
 {
-    process_frame(queue, frame);
-    capture_present_picture(queue, frame, *static_cast<const bool*>(user), false, false);
+    const auto& context = *static_cast<const PresenterFrameContext*>(user);
+    process_frame(queue, frame, context.receipt);
+    capture_present_picture(queue, frame, context.menu_open, false, false);
 }
 void presenter_menu_cb(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Resource* frame, void* user)
 {
-    menu_step(sc, queue, *static_cast<const bool*>(user), frame);
+    menu_step(sc, queue, static_cast<const PresenterFrameContext*>(user)->menu_open, frame);
 }
 
 // Render-small mode changes (COMMS 4bd474c I1.2, Astra a066d76): one change at a time through the
@@ -3670,7 +3679,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     const HRESULT picture_desc_hr = sc->GetDesc(&picture_desc);
     if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
         na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
-    game_frame_boundary(queue); // generated frames bypass this game-facing entry
+    const auto receipt = game_frame_boundary(queue, sc); // generated frames bypass this game-facing entry
     note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::j2::RenderSmall()) small_follow_mode();
@@ -3690,7 +3699,8 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.menu = &presenter_menu_cb;
     // MenuFn runs on this recording thread before the owned frame copy. A
     // Home message after this snapshot is handled next frame.
-    a.user = &open;
+    PresenterFrameContext context{open, receipt};
+    a.user = &context;
     HRESULT hr = na::present::Present(a);
     g_present_result.store(hr);
     g_present_returns.fetch_add(1);
@@ -3970,6 +3980,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeTarget(IDXGISwapChain* sc, const DXGI_MODE
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                               UINT h, DXGI_FORMAT fmt, UINT flags)
 {
+    na::referee::gpu::InvalidatePresentation(sc);
     const auto api = presentation_api(sc);
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_resize(sc, count, w, h, fmt, flags);
     if (api == na::on12::GraphicsApi::Dx11) {
@@ -4003,6 +4014,7 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
 HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                const UINT* node_masks, IUnknown* const* queues)
 {
+    na::referee::gpu::InvalidatePresentation(sc);
     const auto api = presentation_api(sc);
     if (api == na::on12::GraphicsApi::Dx11On12)
         return g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);

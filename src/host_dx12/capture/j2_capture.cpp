@@ -371,40 +371,30 @@ bool Armed()
     return g.armed.load(std::memory_order_acquire) && GetTickCount64() >= g.start_at.load(std::memory_order_relaxed);
 }
 
-// The capture's token is 1..kSlots in the low byte; the referee's rides in the next byte.
+// The capture's token is 1..kSlots in the low byte; the referee uses the high 24 bits.
 constexpr uint32_t kOwnMask = 0xff, kRefereeShift = 8;
 
-static uint32_t record_referee(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id)
+uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id,
+                       uint32_t render_w, uint32_t render_h, uint32_t output_w, uint32_t output_h)
 {
-    if (id.presentation_only || id.owns_present || !na::referee::gpu::Wanted()) return 0;
+    if (id.presentation_only || id.owns_present) return 0;
     na::referee::gpu::Evaluation e;
     e.color = p.color; e.color_state = p.color_state;
     e.motion = p.motion; e.motion_state = p.motion_state;
     e.output = p.output; e.output_state = p.output_state;
     e.present_ordinal = id.present_ordinal;
+    e.render_w = render_w; e.render_h = render_h;
+    e.output_w = output_w; e.output_h = output_h;
+    e.mv_jittered = id.dlss_mv_jittered;
     e.jitter_x = id.jitter_x; e.jitter_y = id.jitter_y;
     e.mv_scale_x = id.mv_scale_x; e.mv_scale_y = id.mv_scale_y;
     e.reset = id.reset != 0;
     return na::referee::gpu::Record(list, e) << kRefereeShift;
 }
 
-static uint32_t record_capture(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id);
-
-uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id)
-{
-    if (!list) return 0;
-    const uint32_t referee = id.evaluation_succeeded ? record_referee(list, p, id) : 0;
-    return record_capture(list, p, id) | referee;
-}
-
 bool RefereeWanted() { return na::referee::gpu::Wanted(); }
 
-uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id)
-{
-    return list ? record_referee(list, p, id) : 0;
-}
-
-static uint32_t record_capture(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id)
+uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id)
 {
     if (!Armed() || !list) return 0;
     if(!p.color||!p.output||(!id.presentation_only&&(!p.depth||!p.motion)))return 0;
@@ -487,7 +477,6 @@ void Discard(uint32_t token, bool may_still_run)
 
 void OnFrameClosed(uint64_t present_ordinal, uint64_t late_writes)
 {
-    na::referee::gpu::OnFrameClosed(present_ordinal);
     std::lock_guard<std::mutex> lock(g.m);
     g.last_closed = present_ordinal;
     release_unpresented(present_ordinal);
@@ -499,9 +488,11 @@ void OnFrameClosed(uint64_t present_ordinal, uint64_t late_writes)
     if (g.wake) SetEvent(g.wake);
 }
 
-void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec)
+bool NeedsPresentCapture(uint32_t token) { return (token & kOwnMask) != 0; }
+
+void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec, na::referee::gpu::Presentation frame)
 {
-    na::referee::gpu::OnPresent(queue, presented, exec);
+    na::referee::gpu::OnPresent(frame, queue, presented, exec);
     std::lock_guard<std::mutex> lock(g.m);
     Slot* s = nullptr;
     for (auto& c : g.slots)

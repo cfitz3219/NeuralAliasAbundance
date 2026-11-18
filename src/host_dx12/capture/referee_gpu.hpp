@@ -24,13 +24,23 @@ struct Evaluation {
     ID3D12Resource* motion = nullptr; D3D12_RESOURCE_STATES motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     ID3D12Resource* output = nullptr; D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     uint64_t present_ordinal = 0;     // the frame this evaluation belongs to
+    uint32_t render_w = 0, render_h = 0, output_w = 0, output_h = 0;
     float jitter_x = 0, jitter_y = 0; // pixels, as DLSS was told
     float mv_scale_x = 1, mv_scale_y = 1;
     bool reset = false;               // DLSS history reset: no pair across it
     bool owns_present = false;        // render-small: the output is the presented image (not judged)
+    bool mv_jittered = false;
 };
 
 using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+
+struct Presentation {
+    uint64_t ordinal = 0;
+    const void* swapchain = nullptr;
+    bool eligible = false;
+    bool submitted = false;
+    bool native11 = false;
+};
 
 // Cheap: whether the next evaluation should be offered (a sample is due or half taken).
 bool Wanted();
@@ -39,8 +49,9 @@ uint32_t Record(ID3D12GraphicsCommandList* list, const Evaluation& e);
 void Submitted(uint32_t token, ID3D12CommandQueue* queue);
 // The list will not be submitted by us. may_still_run: someone else may still run it.
 void Discard(uint32_t token, bool may_still_run);
-void OnFrameClosed(uint64_t present_ordinal);
-void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec);
+bool NeedsScreen(Presentation frame);
+void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec);
+void InvalidatePresentation(const void* swapchain);
 
 struct Stats {
     uint64_t samples = 0, pairs = 0, screens = 0, logged = 0;
@@ -57,6 +68,7 @@ struct LastSample {
     float jitter_change = 0;
     uint64_t number = 0; // GetStats().samples when it was read
 };
+void EnableSampleReceiptForTests();
 LastSample GetLastSample();
 
 } // namespace na::referee::gpu
