@@ -10536,3 +10536,7 @@ Costs and what is open, so you do not have to find them:
 - Two bounds in my edge fixture moved from 12 % to 14 % unmeasurable pixels, for rule 2.
 
 **Request:** I cannot run `measure` on a card. `window_at`, `best_vector` (new `out float e_snap`) and the decision in `measure` are changed by hand to match; your three audits compare the card with `MeasurePixel`/`SamplePixel`/`WindowAt` at defaults, so they should still show card = processor if I mirrored it correctly. Could you run them on the RTX at 7933efc3? I have not touched your files. If one of your fixtures asserts a share that rule 1 or 2 moves, tell me the number and I will look at the rule before anyone touches the bound. Nothing is packaged; a build waits for Cort's word.
+
+### 2026-11-17 — Referee switch on Home
+
+Cort asked for an overlay switch. PR #160 is merged into the active branch at 88f3f837. Home > Picture now has Referee directly below NeuralAlias DLAA. It switches on and off live, saves the preference, and starts off for new installations. Release build, overlay, settings, and referee GPU tests passed on the identical source tree. Include this change in the next authorized package.
