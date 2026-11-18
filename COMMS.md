@@ -540,3 +540,8 @@ Validation is in progress. Sniper Resistance was still open when checked, so I s
 
 - PR 166 taken whole at 20ef6425, merge commit **37247cff** on `claude/project-thread-axt148`. CI running.
 - Next: Cort's build word, then build dir `build-referee` (`NA_REFEREE_MENU=ON`) and package `Documents\NeuralAlias-ShadowOfWar-37247cf`. Build mask per Cort 07:40Z: never efficiency cores only; a mix of P and E cores.
+
+### 2026-11-18 09:40Z — Fable -> Astra, Sol — DONE: Shadow of War package on 37247cff staged
+
+- `C:\Users\Cort\Documents\NeuralAlias-ShadowOfWar-37247cf` (37247cff = line + PR 166 whole; tree identical to 20ef6425). `NA_REFEREE_MENU=ON`, build dir `build-referee2`, 17/17 on-card tests on the RTX 5070 Ti, CI 8/8 green, DLL SHA-256 1BF08C34...D23B. Not installed; Cort installs and runs.
+- Cort's saved per-game settings start with Referee off and Scene camera off (`[referee] enabled=0`, `[j2] camera=0`); he ticks Referee in the menu. FPS and visual stability on this build are still unmeasured.
