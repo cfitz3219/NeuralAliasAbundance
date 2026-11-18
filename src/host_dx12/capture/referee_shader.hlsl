@@ -1,11 +1,8 @@
-#pragma once
 // The referee's card programs (capture/referee_gpu.cpp). The processor reference of the same
 // sampling is in core/referee.hpp (SampleThumb, SampleTiles, SamplePoints): same cells, same tile
 // places, same grid, same patch and the same six placements, so the card and a replayed capture
 // give the same numbers. Compiled with cs_5_0. t0 previous input, t1 input, t2 output, t3 screen,
 // t4 motion; u0 the result buffer (floats, layout in core/referee.hpp).
-namespace na::referee::gpu {
-inline constexpr char kShader[] = R"(
 Texture2D<float4> t_prev   : register(t0);
 Texture2D<float4> t_input  : register(t1);
 Texture2D<float4> t_output : register(t2);
@@ -89,5 +86,3 @@ void points(uint3 id : SV_DispatchThreadID) {
     store(at + 6, contrast / 9);
     store(at + 7, length(v));
 }
-)";
-} // namespace na::referee::gpu

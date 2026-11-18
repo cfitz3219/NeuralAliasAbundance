@@ -9,6 +9,7 @@
 #include "test_support.hpp"
 #include "referee_gpu_scene.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/settings.hpp"
 
 #include <cmath>
@@ -100,7 +101,8 @@ struct Images { ID3D12Resource *prev, *input, *output, *motion, *screen; };
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
 // Returns false (with a FAIL line) when the referee did not take it.
-bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images& im, rg::LastSample& got)
+bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images& im, rg::LastSample& got,
+                bool late = false, ID3D12CommandQueue* blocked = nullptr, ID3D12Fence* release = nullptr)
 {
     const uint64_t before = rg::GetStats().samples;
     CHECK(rg::Wanted());
@@ -109,24 +111,54 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterBefore[0]; e.jitter_y = rs::kJitterBefore[1];
     const uint32_t pre = rg::Record(l.list.Get(), e);
-    CHECK(pre == 1);
-    Run(d, l);
-    rg::Submitted(pre, d.queue.Get());
-    rg::OnFrameClosed(ordinal);
-    rg::OnPresent(d.queue.Get(), im.screen, Execute);
+    CHECK(pre != 0);
+    test::List next_list;
+    if (blocked) {
+        if (FAILED(l.list->Close()) || !next_list.Create(d.device.Get())) return false;
+        ID3D12CommandList* first[] = {l.list.Get()};
+        blocked->ExecuteCommandLists(1, first);
+        rg::Submitted(pre, blocked);
+    } else {
+        Run(d, l);
+        rg::Submitted(pre, d.queue.Get());
+    }
+    CHECK(!rg::NeedsScreen({ordinal, &d}));
+    rg::OnPresent({ordinal, &d}, d.queue.Get(), nullptr, Execute);
 
     CHECK(rg::Wanted()); // half taken: the next evaluation is wanted
     e.color = im.input;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterNow[0]; e.jitter_y = rs::kJitterNow[1];
-    const uint32_t second = rg::Record(l.list.Get(), e);
-    CHECK(second == 2);
-    Run(d, l);
+    auto& main = blocked ? next_list : l;
+    const uint32_t second = rg::Record(main.list.Get(), e);
+    CHECK(second > pre);
+    rg::Discard(pre, false);
+    Run(d, main);
     rg::Submitted(second, d.queue.Get());
-    rg::OnFrameClosed(ordinal);
-    rg::OnPresent(d.queue.Get(), im.screen, Execute); // the reduction is queued here, no wait
+    CHECK(rg::NeedsScreen({ordinal, &d}));
+    CHECK(!rg::NeedsScreen({ordinal + 7, &d}));
+    CHECK(!rg::NeedsScreen({ordinal, &l}));
+    if (late && !blocked) ordinal += 7;
+    rg::OnPresent({ordinal, &d}, d.queue.Get(), im.screen, Execute);
+    if (blocked) {
+        ComPtr<ID3D12Fence> presenting_done, producer_done;
+        const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const bool fenced = event && SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&presenting_done))) &&
+                            SUCCEEDED(d.queue->Signal(presenting_done.Get(), 1)) &&
+                            SUCCEEDED(presenting_done->SetEventOnCompletion(1, event));
+        const bool presented = fenced && WaitForSingleObject(event, 2000) == WAIT_OBJECT_0;
+        CHECK(presented);
+        CHECK(SUCCEEDED(release->Signal(1)));
+        d.WaitIdle();
+        if (event) CloseHandle(event);
+        if (FAILED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&producer_done))) ||
+            FAILED(blocked->Signal(producer_done.Get(), 1)) ||
+            FAILED(producer_done->SetEventOnCompletion(1, nullptr))) return false;
+        rg::OnPresent({++ordinal, &d}, d.queue.Get(), im.screen, Execute);
+    }
     d.WaitIdle();
-    rg::Wanted(); // reads the finished reduction
+    rg::Wanted();
+    if (!na::background::WaitIdle(3000)) return false;
     const rg::Stats s = rg::GetStats();
     if (s.samples != before + 1) {
         std::printf("FAIL: no sample taken (samples %llu, stopped=%d why=\"%s\")\n",
@@ -135,7 +167,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         return false;
     }
     got = rg::GetLastSample();
-    CHECK(got.screen && got.tiles && got.pair);
+    CHECK(got.screen == !late && got.tiles == !late && got.pair);
     CHECK(std::fabs(got.jitter_change - rs::JitterChange()) < 1e-4f);
     CHECK(got.data.size() == na::referee::kResultFloats);
     return got.data.size() == na::referee::kResultFloats;
@@ -172,8 +204,19 @@ void Report(const char* what, const na::referee::Verdicts& v)
 
 int main()
 {
+#ifndef NA_HAVE_REFEREE_SHADERS
+    std::puts("SKIP: Windows SDK FXC was unavailable");
+    return test::kSkip;
+#endif
+    ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+        debug->EnableDebugLayer();
+        std::puts("D3D12 debug layer enabled");
+    }
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("referee_gpu_test");
+    REQUIRE(na::background::Start());
+    rg::EnableSampleReceiptForTests();
     na::settings::Get().referee_enabled.store(1);
     na::settings::Get().referee_every_ms.store(100);
     test::List l;
@@ -229,12 +272,55 @@ int main()
         CHECK(v.result == Verdict::Pass);
     }
 
+    Sleep(150);
+    CHECK(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), t_motion.Get(), t_screen.Get()}, got, true));
+    CHECK(na::referee::Score({got.data.data(), got.screen, got.tiles, got.pair, got.jitter_change}).points > 0);
+
+    Sleep(150);
+    ComPtr<ID3D12CommandQueue> blocked;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    REQUIRE(SUCCEEDED(d.device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&blocked))));
+    ComPtr<ID3D12Fence> release;
+    REQUIRE(SUCCEEDED(d.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&release))));
+    REQUIRE(SUCCEEDED(blocked->Wait(release.Get(), 1)));
+    CHECK(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), t_motion.Get(), t_screen.Get()},
+                     got, true, blocked.Get(), release.Get()));
+
     const rg::Stats s = rg::GetStats();
     std::printf("stats: samples=%llu pairs=%llu screens=%llu pre=%llu main=%llu failed=%llu unpaired=%llu\n",
                 static_cast<unsigned long long>(s.samples), static_cast<unsigned long long>(s.pairs),
                 static_cast<unsigned long long>(s.screens), static_cast<unsigned long long>(s.pre),
                 static_cast<unsigned long long>(s.main), static_cast<unsigned long long>(s.failed),
                 static_cast<unsigned long long>(s.unpaired));
-    CHECK(s.samples == 3 && s.pairs == 3 && s.failed == 0 && s.unpaired == 0 && !s.stopped);
+    CHECK(s.samples == 5 && s.pairs == 5 && s.screens == 3 && s.failed == 0 && s.unpaired == 0 && !s.stopped);
+    Sleep(150);
+    REQUIRE(rg::Wanted());
+    l.Reset();
+    rg::Evaluation discarded;
+    discarded.color = t_input.Get();
+    discarded.output = t_output.Get();
+    discarded.present_ordinal = ++ordinal;
+    const uint32_t outstanding = rg::Record(l.list.Get(), discarded);
+    REQUIRE(outstanding != 0);
+    rg::Discard(outstanding, true);
+    CHECK(rg::GetStats().stopped && !rg::Wanted());
+    Run(d, l);
+    rg::Submitted(outstanding, d.queue.Get());
+    CHECK(rg::GetStats().samples == s.samples);
+    ComPtr<ID3D12InfoQueue> info;
+    if (debug && SUCCEEDED(d.device.As(&info))) {
+        for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
+            SIZE_T bytes = 0;
+            REQUIRE(SUCCEEDED(info->GetMessage(i, nullptr, &bytes)));
+            std::vector<uint8_t> message(bytes);
+            auto* entry = reinterpret_cast<D3D12_MESSAGE*>(message.data());
+            REQUIRE(SUCCEEDED(info->GetMessage(i, entry, &bytes)));
+            if (entry->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+                std::printf("debug layer: %s\n", entry->pDescription);
+                ++test::g_failures;
+            }
+        }
+    }
+    CHECK(na::background::Stop(3000));
     return test::finish("referee_gpu_test");
 }

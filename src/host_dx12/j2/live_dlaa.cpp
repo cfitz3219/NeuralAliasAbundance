@@ -4774,6 +4774,23 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (t_ic) t_ic->mark(kIcEvaluate);
     pending.reset = e.reset;
     const bool evaluated = na::dlss::Evaluate(l, e);
+    const bool capture_armed = evaluated && na::capture::j2::Armed();
+    if (evaluated && !capture_armed && g_debug_view.load(std::memory_order_relaxed) == 0 &&
+        na::capture::j2::RefereeWanted()) {
+        na::capture::j2::Planes planes;
+        planes.color = e.color;
+        planes.motion = e.motion;
+        planes.output = e.output;
+        na::capture::j2::Identity id;
+        id.present_ordinal = g.frame;
+        id.jitter_x = e.jitter_x;
+        id.jitter_y = e.jitter_y;
+        id.mv_scale_x = e.mv_scale_x;
+        id.mv_scale_y = e.mv_scale_y;
+        id.reset = e.reset ? 1u : 0u;
+        id.dlss_mv_jittered = e.mv_jittered;
+        pending.capture = na::capture::j2::RecordReferee(l, planes, id, e.render_w, e.render_h, e.out_w, e.out_h);
+    }
     // A measured scene cut that DLSS has not been reset for yet: the temporal output still holds the
     // old scene, so those frames show the picture DLSS was given instead. Decided on the GPU, in
     // execution order, with no wait (compute_flow.hpp RecordCutShow). Nothing happens on other frames.
@@ -4785,7 +4802,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (t_ic) t_ic->mark(kIcFinish);
     if (!evaluated) ++g.stats.dlss_failed;
     if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
-    if (evaluated && na::capture::j2::Armed()) {
+    if (capture_armed) {
         // Evidence capture: copied in this same list right after the evaluate, so the GPU
         // order makes them exactly this evaluation's inputs and raw DLSS output.
         na::capture::j2::Planes cp;
@@ -4918,22 +4935,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             }
             pending.capture = na::capture::j2::RecordEvaluation(l, cp, ci);
         }
-    } else if (evaluated && na::capture::j2::RefereeWanted()) {
-        // The referee (watches only, capture/referee_gpu.hpp): the same three images as the
-        // capture above, in the same states, before sharpening; its token rides on pending.capture.
-        na::capture::j2::Planes rp;
-        rp.color = g.color_in.Get();
-        rp.depth = g.depth32.Get();
-        rp.motion = g.motion.Get();
-        rp.output = g.output.Get();
-        na::capture::j2::Identity ri;
-        ri.present_ordinal = g.frame;
-        ri.jitter_x = e.jitter_x;
-        ri.jitter_y = e.jitter_y;
-        ri.mv_scale_x = e.mv_scale_x;
-        ri.mv_scale_y = e.mv_scale_y;
-        ri.reset = e.reset ? 1u : 0u;
-        pending.capture = na::capture::j2::RecordReferee(l, rp, ri);
     }
     if (evaluated) {
         const int dv = g_debug_view.load(std::memory_order_relaxed);
@@ -8244,7 +8245,7 @@ void update_window(bool executed)
     g.stats.window_h = w.engaged ? w.eh : 0;
 }
 
-void OnPresent(ID3D12CommandQueue* queue)
+void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receipt)
 {
     na::eventlog::TickFrame(); // every game Present: the event log's frame number
     std::lock_guard<std::mutex> lock(g.m);
@@ -8253,6 +8254,11 @@ void OnPresent(ID3D12CommandQueue* queue)
             // Route selector: close this frame's structure + outcome.
             na::j2::FrameObservation& o = g.frame_agg.Observation();
             o.executed = g.submitted_frame == g.frame;
+            if (receipt) {
+                receipt->ordinal = g.frame;
+                receipt->eligible = o.scene;
+                receipt->submitted = o.scene && o.executed;
+            }
             const uint64_t late = g.stats.inline_late_writes + g.stats.post_scene_batches;
             o.later_scene_write = o.executed && late > g.route_prev_late;
             na::capture::j2::OnFrameClosed(g.frame, late - g.route_prev_late); // evidence capture identity
@@ -8487,6 +8493,8 @@ void OnPresent(ID3D12CommandQueue* queue)
             if (g.scene_batches_cur > g.stats.scene_batches_max) g.stats.scene_batches_max = g.scene_batches_cur;
         }
         g.scene_batches_cur = 0;
+    } else if (receipt) {
+        *receipt = {};
     }
 }
 

@@ -103,6 +103,7 @@ std::atomic<uint32_t> applied_preset{0}, applied_sharpness{0};
 std::atomic<uint64_t> companion_shaded{0};
 std::atomic<int> raster_slot{-1};
 std::atomic<bool> evaluation_capture_pending{false};
+std::atomic<uint64_t> delivered_frame{UINT64_MAX};
 
 bool Skip(const char* why)
 {
@@ -611,13 +612,29 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     } else {
         evaluated = dlss::Evaluate(list, eval);
     }
+    uint32_t capture_token = 0;
+    const bool capture_armed = evaluated && capture::j2::Armed();
+    if (evaluated && !capture_armed && capture::j2::RefereeWanted()) {
+        capture::j2::Planes planes;
+        planes.color = eval.color;
+        planes.motion = eval.motion;
+        planes.output = eval.output;
+        capture::j2::Identity id;
+        id.present_ordinal = frame.frame;
+        id.jitter_x = eval.jitter_x;
+        id.jitter_y = eval.jitter_y;
+        id.mv_scale_x = eval.mv_scale_x;
+        id.mv_scale_y = eval.mv_scale_y;
+        id.reset = eval.reset;
+        id.dlss_mv_jittered = eval.mv_jittered;
+        capture_token = capture::j2::RecordReferee(list, planes, id, eval.render_w, eval.render_h, eval.out_w, eval.out_h);
+    }
     // A measured scene cut that DLSS has not been reset for yet: the temporal output still holds the
     // old scene, so those frames show the picture DLSS was given instead. Decided on the GPU, in
     // execution order, with no wait (compute_flow.hpp RecordCutShow). Nothing happens on other frames.
     if (measured && evaluated && flow.pair)
         j2::compute_flow::RecordCutShow(list, flow, eval.color, slot.output.Effects());
-    uint32_t capture_token = 0;
-    if (evaluated && capture::j2::Armed()) {
+    if (capture_armed) {
         // A saved capture also takes the scene's source textures, once per capture folder.
         static std::wstring texture_dump_for;
         if (const wchar_t* folder = capture::j2::Directory(); folder && *folder && texture_dump_for != folder) {
@@ -670,22 +687,6 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             std::copy(cam.position.begin(), cam.position.end(), id.eye);
         }
         capture_token = capture::j2::RecordEvaluation(list, planes, id);
-    } else if (evaluated && capture::j2::RefereeWanted()) {
-        // The referee (watches only, capture/referee_gpu.hpp): DLSS's input, motion and output, in
-        // the capture's states; its token rides on capture_token, so the presented image follows.
-        capture::j2::Planes planes;
-        planes.color = eval.color;
-        planes.depth = shared_depth;
-        planes.motion = slot.motion.Get();
-        planes.output = slot.output.Effects();
-        capture::j2::Identity id;
-        id.present_ordinal = id.inputs_frame = frame.frame;
-        id.jitter_x = eval.jitter_x;
-        id.jitter_y = eval.jitter_y;
-        id.mv_scale_x = eval.mv_scale_x;
-        id.mv_scale_y = eval.mv_scale_y;
-        id.reset = eval.reset;
-        capture_token = capture::j2::RecordReferee(list, planes, id);
     }
     auto* result = slot.output.Native();
     uint32_t sharpened = 0;
@@ -772,7 +773,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     dlss::OnExecuted(s.queue.Get(), 1, lists);
     if (capture_token) {
         capture::j2::Submitted(capture_token, s.queue.Get(), frame.frame);
-        evaluation_capture_pending.store(true, std::memory_order_release);
+        if (capture::j2::NeedsPresentCapture(capture_token))
+            evaluation_capture_pending.store(true, std::memory_order_release);
     }
     if (FAILED(s.fences.SignalEffects(&slot.effects_done))) return FailSession(s, "DX12 effects submission failed.");
     if (!evaluated) {
@@ -793,6 +795,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     if (eval.reset) s.last_reset_frame = frame.frame; // submitted and delivered: this is the reset a measured cut waits for
     (measured ? supplied_measured : supplied_camera).fetch_add(1, std::memory_order_relaxed);
     delivered.fetch_add(1, std::memory_order_relaxed);
+    delivered_frame.store(frame.frame, std::memory_order_release);
     delivered_size.store((uint64_t(ci.width) << 32) | ci.height, std::memory_order_relaxed);
     applied_preset.store(eval.preset, std::memory_order_relaxed);
     applied_sharpness.store(sharpened, std::memory_order_relaxed);
@@ -809,7 +812,7 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
 {
     const bool eval = evaluation_capture_pending.exchange(false, std::memory_order_acq_rel);
     const bool burst = capture::Pending();
-    if (!eval && !burst) return;
+    if (!eval && !burst && !settings::Get().referee_enabled.load(std::memory_order_relaxed)) return;
     struct PresentCopy {
         SharedTexture image;
         SharedFences fences;
@@ -819,10 +822,13 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
     };
     static auto* state = new std::unique_ptr<PresentCopy>;
     const auto stats = native11::Stats();
+    const referee::gpu::Presentation frame{stats.frames - 1, swap, true,
+        delivered_frame.load(std::memory_order_acquire) == stats.frames - 1, true};
+    const auto execute = [](ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) { q->ExecuteCommandLists(n, lists); };
     if (eval) capture::j2::OnFrameClosed(stats.frames - 1, 0);
-    const auto complete = [queue, eval, burst](ID3D12Resource* image) {
-        if (eval) capture::j2::OnPresent(queue, image,
-            [](ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) { q->ExecuteCommandLists(n, lists); });
+    const auto complete = [queue, eval, burst, frame, execute](ID3D12Resource* image) {
+        if (eval) capture::j2::OnPresent(queue, image, execute, frame);
+        else referee::gpu::OnPresent(frame, queue, image, execute);
         if (burst && image) {
             char note[256]{};
             FormatStatus(note, sizeof note);
@@ -830,6 +836,7 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
             capture::OnPresent(queue, image, false);
         }
     };
+    if (!eval && !burst && !referee::gpu::NeedsScreen(frame)) return complete(nullptr);
     ComPtr<ID3D11Texture2D> backbuffer;
     if (!queue || FAILED(swap->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) return complete(nullptr);
     native11::OwnWorkScope own;

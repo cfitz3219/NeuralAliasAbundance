@@ -309,8 +309,9 @@ inline SampleScore Score(const Sample& s, const Params& p = Params())
                 ++r.moving;
                 r.err_still += o[kStill]; r.err_vector += e;
                 if (e < .8f * o[kStill]) ++r.explained;
-                if (o[kHalf] < .7f * o[kFollows]) ++r.half_better;
-                if (o[kTwice] < .7f * o[kFollows]) ++r.twice_better;
+                const float best_unscaled = (std::min)({o[kFollows], o[kReverse], o[kVector]});
+                if (o[kHalf] < .7f * best_unscaled) ++r.half_better;
+                if (o[kTwice] < .7f * best_unscaled) ++r.twice_better;
             } else {
                 ++r.still_points;
                 // Changed, and the jitter does not account for it.
@@ -325,6 +326,7 @@ inline SampleScore Score(const Sample& s, const Params& p = Params())
 // A window of samples (a few seconds) and its verdicts, as the log prints them.
 struct Window {
     uint32_t samples = 0, screens = 0, motions = 0;
+    uint32_t textured_frames = 0, output_frames = 0, input_frames = 0, neither_frames = 0;
     double picture_sum = 0, picture_output_sum = 0; uint32_t picture_n = 0;
     float picture_min = 2, picture_max = -2;
     SampleScore total;
@@ -340,6 +342,15 @@ struct Window {
         if (s.points) ++motions;
         total.tiles += s.tiles; total.tiles_textured += s.tiles_textured; total.tiles_output += s.tiles_output;
         total.tiles_input += s.tiles_input; total.tiles_neither += s.tiles_neither;
+        if (s.tiles_textured >= 4) {
+            ++textured_frames;
+            const uint32_t decided = s.tiles_output + s.tiles_input;
+            if (s.tiles_neither * 2 > s.tiles_textured) ++neither_frames;
+            else if (decided >= 4 && decided * 2 >= s.tiles_textured) {
+                if (s.tiles_output * 4 >= decided * 3) ++output_frames;
+                else if (s.tiles_input * 4 >= decided * 3) ++input_frames;
+            }
+        }
         total.points += s.points; total.textured += s.textured; total.moving += s.moving; total.explained += s.explained;
         total.changed_still += s.changed_still; total.still_points += s.still_points;
         total.half_better += s.half_better; total.twice_better += s.twice_better;
@@ -373,14 +384,14 @@ inline Verdicts Judge(const Window& w, const Params& p = Params())
     }
     const auto& t = w.total;
     if (t.tiles) {
-        const uint32_t decided = t.tiles_output + t.tiles_input;
-        if (t.tiles_textured < 4) v.result_why = "too few textured tiles";
-        else if (t.tiles_neither * 2 > t.tiles_textured) { v.result = Verdict::Fail; v.result_why = "the screen shows neither DLSS's input nor its output at the tiles"; }
-        else if (decided < 4) { v.result = Verdict::Partial; v.result_why = "output and input look the same on the screen (still scene or tiles without edges)"; }
-        else if (t.tiles_output * 4 >= decided * 3) { v.result = Verdict::Pass; v.result_why = "the screen shows DLSS's output"; }
-        else if (t.tiles_input * 4 >= decided * 3) { v.result = Verdict::Fail; v.result_why = "the screen shows the image before DLSS, not its output"; }
+        const uint32_t decided = w.output_frames + w.input_frames;
+        if (!w.textured_frames) v.result_why = "too few textured tiles per frame";
+        else if (w.neither_frames * 2 > w.textured_frames) { v.result = Verdict::Fail; v.result_why = "the screen shows neither DLSS's input nor its output at the tiles"; }
+        else if (!decided || decided * 2 < w.textured_frames) { v.result = Verdict::Partial; v.result_why = "too few sampled frames distinguish DLSS input and output"; }
+        else if (w.output_frames * 4 >= decided * 3) { v.result = Verdict::Pass; v.result_why = "the screen shows DLSS's output"; }
+        else if (w.input_frames * 4 >= decided * 3) { v.result = Verdict::Fail; v.result_why = "the screen shows the image before DLSS, not its output"; }
         else { v.result = Verdict::Partial; v.result_why = "the tiles disagree on which image reached the screen"; }
-    } else if (w.screens) v.result_why = "output and screen differ in size";
+    } else if (w.screens) v.result_why = "input, output and screen do not share the same extent";
     if (t.points) {
         const uint32_t judged_still = t.still_points;
         if (t.textured < 64) v.motion_why = "too few textured points";
@@ -418,13 +429,15 @@ inline int Format(char* out, size_t n, const Window& w, const Verdicts& v)
     return std::snprintf(out, n,
         "samples=%u screens=%u pairs=%u "
         "picture{verdict=%s edges=%.3f min=%.3f max=%.3f output_edges=%.3f why=\"%s\"} "
-        "result{verdict=%s tiles=%u textured=%u output=%u input=%u neither=%u why=\"%s\"} "
+        "result{verdict=%s tiles=%u textured=%u output=%u input=%u neither=%u frame_votes=%u/%u output_frames=%u input_frames=%u neither_frames=%u why=\"%s\"} "
         "motion{verdict=%s points=%u textured=%u moving=%u explained=%u error_ratio=%.3f half_better=%u twice_better=%u changed_where_still=%u of=%u why=\"%s\"} "
         "jitter{verdict=%s points=%u follows=%u reverse=%u none=%u why=\"%s\"}",
         w.samples, w.screens, w.motions,
         VerdictName(v.picture), double(w.Picture()), w.picture_n ? double(w.picture_min) : 0.0, w.picture_n ? double(w.picture_max) : 0.0,
         w.picture_n ? w.picture_output_sum / w.picture_n : 0.0, v.picture_why,
-        VerdictName(v.result), t.tiles, t.tiles_textured, t.tiles_output, t.tiles_input, t.tiles_neither, v.result_why,
+        VerdictName(v.result), t.tiles, t.tiles_textured, t.tiles_output, t.tiles_input, t.tiles_neither,
+        w.output_frames + w.input_frames + w.neither_frames, w.textured_frames,
+        w.output_frames, w.input_frames, w.neither_frames, v.result_why,
         VerdictName(v.motion), t.points, t.textured, t.moving, t.explained, ratio, t.half_better, t.twice_better, t.changed_still, t.still_points, v.motion_why,
         VerdictName(v.jitter), t.jitter_points, t.jitter_follows, t.jitter_reverse, t.jitter_none, v.jitter_why);
 }

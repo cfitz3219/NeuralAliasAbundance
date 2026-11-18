@@ -19,6 +19,7 @@
 // one-line-per-frame index.csv. Raw = the readback footprint (row_pitch in meta).
 // Separate from capture/frame_capture (native-NGX path), which is left unchanged.
 #pragma once
+#include "host_dx12/capture/referee_gpu.hpp"
 
 #include <d3d12.h>
 
@@ -105,7 +106,8 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& planes,
 // The referee alone, for an evaluation the capture is not armed for: call when Armed() is false
 // and RefereeWanted() is true. Same token rules.
 bool RefereeWanted();
-uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& planes, const Identity& id);
+uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& planes, const Identity& id,
+                       uint32_t render_w, uint32_t render_h, uint32_t output_w, uint32_t output_h);
 // The list holding the token's copies was submitted on `queue` (signals the slot fence).
 void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission);
 // The token's list will not be submitted by J2. `may_still_run`: the copies are in a
@@ -116,7 +118,9 @@ void OnFrameClosed(uint64_t present_ordinal, uint64_t late_writes);
 // The image handed to Present (PRESENT state). Attached to this frame's submitted
 // evaluation; copied on the slot's own list, executed with `exec` (the unhooked queue
 // entry point, so J2 never observes it).
-void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec);
+void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec,
+               na::referee::gpu::Presentation frame = {});
+bool NeedsPresentCapture(uint32_t token);
 
 // Compact per-frame record kept in a ring for every frame (also frames without DLSS), so a
 // capture shows the frames BEFORE and AROUND a stretch/reset, not only the evaluations.
