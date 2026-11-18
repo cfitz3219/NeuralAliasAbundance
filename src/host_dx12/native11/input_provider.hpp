@@ -172,6 +172,7 @@ void SetNextJitter(float x_px, float y_px);
 //                     CameraFacts::jitter_applied then means this frame's scene draws carried it.
 enum class JitterRoute { Matrix, Viewport };
 void SetJitterRoute(JitterRoute route);
+void SetDepthReads(bool enabled);
 // Whether a frame needs a camera to be handed over.
 //  Required (default here): as before 2026-11-16, a frame with no camera is a miss. Kept as the
 //             provider's default so its own tests and any consumer that cannot work without a

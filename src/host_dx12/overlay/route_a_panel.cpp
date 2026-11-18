@@ -1105,10 +1105,10 @@ void DrawLiveDlaa()
             EndRow();
             if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
         }
-        if (!native) {   // Depth reads (Cort 2026-11-18: far lights and ground marks switching with the jitter): live, remembered.
+        {
             na::settings::Settings& rs = na::settings::Get();
             bool reads = rs.j2_depth_reads.load() != 0;
-            BeginRow("Steady distant lighting", "Gives the game's own lighting the scene depth without NeuralAlias's jitter, so distant lights and ground marks stop switching on and off. Applies live.", S(220));
+            BeginRow("Steady distant lighting", "Reduces jitter-related flicker in lights and ground marks by correcting the depth the game's lighting reads. Applies live.", S(220));
             if (ImGui::Checkbox("##depthreads", &reads)) { rs.j2_depth_reads.store(reads ? 1u : 0u); na::settings::Save(); }
             EndRow();
         }
