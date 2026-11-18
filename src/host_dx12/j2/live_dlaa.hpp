@@ -199,11 +199,14 @@ struct NativeBridgeStats {
 NativeBridgeStats GetNativeBridgeStats();
 // Presented-frame trace while the scene is reduced (diagnostic): call at every Present with
 // the presented image; the walk from it back to the scale crossing is logged (native_trace).
-void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present);
+void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present,
+                        uint64_t ordinal = 0, const void* source = nullptr);
 void NativeTraceResult(char* out,size_t n,uint64_t* traces);
 // Delivery probe readback at Present (after NativeTracePresent): reads the marked
 // texels of the presented image (PRESENT state) with `exec` (unhooked; null = direct).
-void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*));
+void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame,
+                        void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*),
+                        uint64_t ordinal = 0, const void* source = nullptr);
 // Starts one probe session (24 marked deliveries) now, as an armed J2 capture does.
 void RequestDeliveryProbe();
 // Tests: presents between re-verifying traces once a crossing is learned (default 900).

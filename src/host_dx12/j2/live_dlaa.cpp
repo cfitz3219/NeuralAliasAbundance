@@ -492,7 +492,15 @@ std::atomic<uint32_t> g_window_ew{0}, g_window_eh{0};
 // P4-4 upscale target: set by Stage P / tests from any thread, read at recording.
 std::mutex g_up_m;
 UpscaleTarget g_up;
-std::atomic<bool> g_native_bridge{false},g_native_reduced{false};
+std::atomic<bool> g_native_bridge{false},g_native_reduced{false},g_native_discovery{false};
+std::atomic<bool> g_screen_discovery_installed{false};
+bool native_discovery_enabled() {
+    const auto& s = na::settings::Get();
+    return na::settings::EffectsReady() && g.enabled.load(std::memory_order_relaxed) &&
+        !g.paused.load(std::memory_order_relaxed) && s.referee_enabled.load(std::memory_order_relaxed) &&
+        !s.j2_scale_mode.load(std::memory_order_relaxed) && !s.j2_route.load(std::memory_order_relaxed) &&
+        !s.j2_inline.load(std::memory_order_relaxed);
+}
 struct NativeExtent{uint32_t rw=0,rh=0,ow=0,oh=0;} g_native_extent; // under g_up_m
 thread_local ID3D12GraphicsCommandList* t_native_hint=nullptr;
 thread_local uint64_t t_native_color=0,t_native_depth=0;
@@ -558,11 +566,12 @@ struct NativeCrossing {
     // Unlike a current binding, this survives the game's OM unbind before CS.
     bool input_is_last_draw = false;
     uint32_t input_param=UINT_MAX, input_offset=0;
+    uint64_t native_depth = 0; // a native DLAA candidate must still pair with this depth
     bool operator==(const NativeCrossing& b) const {
         return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
             gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader&&
-            input_param==b.input_param&&input_offset==b.input_offset;
+            input_param==b.input_param&&input_offset==b.input_offset&&native_depth==b.native_depth;
     }
     // The same step reading another render-size image (p27252: SE5's pso 556 alternates its
     // input between #13433 and #13435 while the output #13437 stays).
@@ -578,6 +587,7 @@ struct TraceOp {
     // The bindings could not be snapshotted (unbounded table, missing typed view...):
     // only the bound render target and the full-size images the list samples are known.
     bool inferred = false;
+    uint64_t paired_depth = 0;
     const char* why = nullptr; // inferred: the snapshot's failure (a static string)
     bool heap_indexing = false; // reads ResourceDescriptorHeap[] directly (inputs no table shows)
     uint64_t list = 0, recording = 0; // the recording this op belongs to
@@ -626,6 +636,12 @@ struct NativeTrace{
     uint32_t learned_interval=900; // presents between re-verifying traces once learned (tests shorten it)
     char result[4096]{};
     NativeCrossing previous, learned;
+    bool native_resolution = false;
+    uint64_t discovery_color = 0, discovery_depth = 0;
+    ID3D12CommandQueue* discovery_queue = nullptr;
+    const void* discovery_source = nullptr;
+    NativeExtent discovery_extent;
+    uint32_t discovery_misses = 0;
     std::vector<uint64_t> learned_inputs; // every render-size input the learned step was seen reading (cap 4)
     std::atomic<uint64_t> learned_pso{0};
     void note_input(uint64_t id){
@@ -637,6 +653,10 @@ struct NativeTrace{
     }
 };
 NativeTrace& g_trace=*new NativeTrace;
+bool verified_native_reader() {
+    return g_native_discovery.load(std::memory_order_relaxed) && native_discovery_enabled() &&
+           g_trace.learned_pso.load(std::memory_order_acquire);
+}
 constexpr uint64_t kTraceOps=60000;
 TraceIo trace_view(ID3D12Resource* resource, uint64_t id, uint32_t view, bool whole, char binding=0)
 {
@@ -734,6 +754,11 @@ void trace_texture(ID3D12GraphicsCommandList* l, const na::observe::TextureCall&
             if (op.transfer) op.in.push_back(source);
             op.out.push_back(dest);
         }
+        if (op.out.size() == 1 && call.kind == TextureKind::ClearColor) {
+            na_object_id color = 0, depth = 0;
+            na::observe::ListCurrentTargets(l, &color, &depth);
+            if (op.out[0].id == color) op.paired_depth = depth;
+        }
         trace_append(l, std::move(op));
     } catch (...) {}
 }
@@ -822,6 +847,7 @@ void trace_op(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,b
             op.scissors[0].right<LONG(t.vw) || op.scissors[0].bottom<LONG(t.vh);
     }
     trace_fill_io(op,t);
+    if (t.depth) t.paired_depth = op.depth.view.resource;
     // Kept only inside the trace window (released at submission): a cached presenting op
     // lives for the whole run and must not retain the game's images (swap-chain resizes).
     if(!cache&&!op.tables.empty())t.snap=std::make_shared<na::observe::NativeOperation>(std::move(op));
@@ -990,6 +1016,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
 {
     NativeExtent e;
     { std::lock_guard<std::mutex> lock(g_up_m); e=g_native_extent; }
+    if (g_trace.native_resolution) e = g_trace.discovery_extent;
     {   // Frame dump: the first trace of the session, and once per armed J2 capture (F8).
         const bool armed=na::capture::j2::Armed();
         if(!g_frame_dumps||(armed&&!g_dump_armed_seen))trace_dump_frame(queue,presented,e,g_trace.presents);
@@ -1041,6 +1068,45 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         const auto at=std::lower_bound(history.begin(),history.end(),before);
         return at==history.begin() ? ops.size() : *std::prev(at);
     };
+    if (g_trace.native_resolution) {
+        // VARIANT: placement/native-screen-verified
+        NativeCrossing next;
+        // A full-size texture alone could be the HUD, reflection, or a spare branch.
+        // Offer only actual readers of the selected, depth-paired scene after its
+        // final write. Ask the existing screen probe which consumer survives.
+        const auto scene_writer = writer(scene, ops.size());
+        if (scene_writer < ops.size() && depth && ops[scene_writer].paired_depth == depth && !g_trace.learned.pso) {
+            for (size_t i = scene_writer + 1; i < ops.size(); ++i) {
+                const auto& op = ops[i];
+                if (op.queue != queue || !op.direct || !op.pso || !op.reflected || op.inferred ||
+                    op.heap_indexing || op.late || op.depth || op.blend || op.out.size() != 1)
+                    continue;
+                const auto& out = op.out.front();
+                if (!out.whole || out.id == scene || out.w != e.ow || out.h != e.oh ||
+                    writer(out.id, ops.size()) != i ||
+                    (op.compute ? (op.uavs != 1 || !op.gx || !op.gy || op.gz != 1) : out.binding != 'r'))
+                    continue;
+                const auto pick = pick_scene_input(op.in, e.rw, e.rh, e.ow, e.oh);
+                if (!pick.ok) continue;
+                const auto& in = op.in[pick.at];
+                if (in.id != scene || !trace_same_color(in.vfmt, out.vfmt)) continue;
+                NativeCrossing c{op.pso, in.id, out.id, scene, e.rw, e.rh, e.ow, e.oh,
+                                 in.vfmt, out.vfmt, op.gx, op.gy, op.gz};
+                c.native_depth = depth;
+                if (std::find(g_trace.refuted.begin(), g_trace.refuted.end(), c) != g_trace.refuted.end()) continue;
+                if (!(g_trace.provisional == c)) ++g_trace.provisionals;
+                next = c;
+                add(" dlaa_screen_candidate=%llu input=%llu output=%llu",
+                    (unsigned long long)c.pso, (unsigned long long)c.input, (unsigned long long)c.output);
+                break;
+            }
+        }
+        g_trace.provisional = next;
+        g_trace.provisional_pso.store(next.pso, std::memory_order_release);
+        add(" dlaa_screen_learned=%llu refuted=%llu", (unsigned long long)g_trace.learned.pso,
+            (unsigned long long)g_trace.refutations);
+        return;
+    }
     const auto traces_scene=[&](uint64_t id,size_t before) {
         std::vector<std::pair<uint64_t,size_t>> pending{{id,before}};
         std::vector<size_t> visited;
@@ -1373,10 +1439,11 @@ struct DeliveryProbe {
     int outcome=0;NativeCrossing outcome_target; // for the trace, applied outside this lock
     uint32_t expect_w=0,expect_h=0;
     ComPtr<ID3D12DescriptorHeap> gpu,cpu,rtv;uint32_t next_desc=0;
+    std::array<na::nr::native::RecordingLease, 16> descriptor_uses;
     struct Mark{uint64_t frame=0;uint32_t value=0;bool submitted=false;na::nr::native::RecordingLease lease;};
     std::deque<Mark> marks;
     struct Slot{ComPtr<ID3D12CommandAllocator> alloc;ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> rb;
-        uint64_t fence=0;uint32_t value=0;uint64_t frame=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;bool busy=false;};
+        uint64_t fence=0, session=0;uint32_t value=0;uint64_t frame=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;bool busy=false;};
     Slot slots[6];ComPtr<ID3D12Fence> fence;uint64_t fence_next=1;
     struct Sample{uint32_t value=0;float luma[3]{};uint64_t frame=0;};
     std::vector<Sample> seq;
@@ -1408,6 +1475,8 @@ float probe_luma(const uint8_t* p,DXGI_FORMAT f){
 bool probe_write_locked(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_t view_format,uint64_t frame,bool verifying=false,bool render_target=false){
     auto& p=g_probe;
     if(!p.remaining||!dest||!g.device)return false;
+    if (verifying && p.target.native_depth && std::any_of(p.marks.begin(), p.marks.end(),
+        [frame](const auto& mark) { return mark.frame == frame; })) return false;
     const auto desc=dest->GetDesc();
     // A render-target output (a draw writing the full-size image as RT) is marked
     // with a rect clear of an RTV while it is in RENDER_TARGET state.
@@ -1427,7 +1496,11 @@ bool probe_write_locked(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32
     if(verifying){auto owner=std::make_shared<std::vector<ComPtr<ID3D12Resource>>>();owner->push_back(dest);lease=na::nr::native::RetainRecording(l,owner);}
     // A ring of 16 descriptors: a slot is rewritten only 16 marks later.
     const UINT inc=g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const UINT at=p.next_desc++%16;
+    const UINT at = p.next_desc % 16;
+    if (p.descriptor_uses[at] && !p.descriptor_uses[at].Retired()) return false;
+    if (p.target.native_depth && verifying && !lease) return false;
+    p.descriptor_uses[at] = lease;
+    ++p.next_desc;
     D3D12_CPU_DESCRIPTOR_HANDLE gc=p.gpu->GetCPUDescriptorHandleForHeapStart();gc.ptr+=SIZE_T(at)*inc;
     D3D12_GPU_DESCRIPTOR_HANDLE gg=p.gpu->GetGPUDescriptorHandleForHeapStart();gg.ptr+=UINT64(at)*inc;
     D3D12_CPU_DESCRIPTOR_HANDLE cc=p.cpu->GetCPUDescriptorHandleForHeapStart();cc.ptr+=SIZE_T(at)*inc;
@@ -1516,6 +1589,7 @@ void probe_collect_locked(){
     for(auto& s:p.slots){
         if(!s.busy||s.fence>done)continue;
         s.busy=false;
+        if (s.session != p.sessions) continue;
         uint8_t* data=nullptr;D3D12_RANGE r{0,3*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT};
         if(FAILED(s.rb->Map(0,&r,reinterpret_cast<void**>(&data)))||!data)continue;
         DeliveryProbe::Sample x;x.value=s.value;x.frame=s.frame;
@@ -1543,21 +1617,31 @@ void probe_finish_verify_locked(){
 }
 }
 void apply_probe_outcome(int outcome,const NativeCrossing& c);
-void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*))
+void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*), uint64_t ordinal, const void* source)
 {
     int outcome=0;NativeCrossing target;
+    bool native_present = false;
+    if (g_native_discovery.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> trace_lock(g_trace.m);
+        native_present = ordinal && source && g_trace.discovery_source == source && g_trace.discovery_queue == queue;
+    }
     try{
         std::lock_guard<std::mutex> lock(g_probe.m);
         auto& p=g_probe;
+        const bool native = p.target.native_depth != 0 && p.verify;
+        if (native && !native_present) return;
+        const auto matches = [&](const auto& mark) {
+            return mark.submitted && (native ? mark.frame == ordinal : mark.frame == g.frame || mark.frame + 1 == g.frame);
+        };
         probe_collect_locked();
         if(queue&&frame&&g.device&&!p.marks.empty()){
             for(auto& x:p.marks)if(!x.submitted&&x.lease&&x.lease.Ready(queue))x.submitted=true;
             // The submitted mark of this frame or the frame before it (Present ordinal vs record ordinal).
-            auto mark=std::find_if(p.marks.rbegin(),p.marks.rend(),[&](const auto& x){return x.submitted&&(x.frame==g.frame||x.frame+1==g.frame);});
+            auto mark=p.marks.rend();
             // Marks too old to pair are dropped (counted), so a session can end.
             for(auto it=p.marks.begin();it!=p.marks.end();)
-                if(it->frame+2<g.frame){++p.unpaired;it=p.marks.erase(it);}else ++it;
-            mark=std::find_if(p.marks.rbegin(),p.marks.rend(),[&](const auto& x){return x.submitted&&(x.frame==g.frame||x.frame+1==g.frame);});
+                if(it->frame < (native ? ordinal : (g.frame > 2 ? g.frame-2 : 0))){++p.unpaired;it=p.marks.erase(it);}else ++it;
+            mark=std::find_if(p.marks.rbegin(),p.marks.rend(),matches);
             const auto desc=frame->GetDesc();
             if(mark!=p.marks.rend()&&(desc.Width!=p.expect_w||desc.Height!=p.expect_h)){++p.size_mismatch;p.marks.clear();mark=p.marks.rend();}
             if(mark!=p.marks.rend()&&(p.fence||SUCCEEDED(g.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&p.fence))))){
@@ -1591,7 +1675,7 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
                         ID3D12CommandList* one[]{l};
                         if(exec)exec(queue,1,one);else queue->ExecuteCommandLists(1,one);
                         slot->fence=p.fence_next++;queue->Signal(p.fence.Get(),slot->fence);
-                        slot->busy=true;slot->value=mark->value;slot->frame=mark->frame;slot->format=desc.Format;
+                        slot->busy=true;slot->session=p.sessions;slot->value=mark->value;slot->frame=mark->frame;slot->format=desc.Format;
                         p.marks.erase(std::next(mark).base());
                     }
                 }
@@ -2258,13 +2342,15 @@ void apply_route_locked(ID3D12CommandQueue* queue)
     // Inline is armed only after at least one scene frame was observed under this
     // decision: the trigger matches the boundary learned from a completed frame, and
     // a list recorded before any frame closed has nothing to match (legacy timing).
-    g.inline_mode = g_native_reduced.load(std::memory_order_relaxed) || (d.route == na::j2::Route::Inline && d.scene_frames > 0);
+    const bool native_recording = g.inl.valid && g.inl.history.native_delivery;
+    g.inline_mode = native_recording || verified_native_reader() || g_native_reduced.load(std::memory_order_relaxed) ||
+                    (d.route == na::j2::Route::Inline && d.scene_frames > 0);
     g.stats.inline_mode = g.inline_mode ? 1u : 0u;
     if (d.history_generation != g.route_gen_applied) {
         g.route_gen_applied = d.history_generation;
         if (d.history_generation > 1) ++g.stats.history_resets; // the first route is not a reset
         g.resume_reset = true;   // output of the old route must not feed the new one
-        if (!g_native_reduced.load(std::memory_order_relaxed)) {
+        if (!native_recording && !g_native_reduced.load(std::memory_order_relaxed)) {
             if (g.inl.valid) na::capture::j2::Discard(g.inl.history.capture, true);
             g.inl.valid = false; g.inl_redirected = false; // an inline recording from the old route is not committed
         }
@@ -2275,7 +2361,7 @@ void apply_route_locked(ID3D12CommandQueue* queue)
     // Only from Execute (queue given): it runs inside a host-work scope, so NGX's own
     // submissions are not routed back into J2. From Present they would re-enter
     // Execute while g.m is held.
-    if (queue && d.route == na::j2::Route::Inline && !g.dlss_ready) {
+    if (queue && (d.route == na::j2::Route::Inline || g_native_discovery.load(std::memory_order_relaxed)) && !g.dlss_ready) {
         if (!g.device) ensure_device(queue);
         if (g.device) dlss_on();
     }
@@ -5097,7 +5183,7 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     ic.mark(kIcLock);
     std::lock_guard<std::mutex> lock(g.m);
     ic.mark(kIcQuery);
-    if (!g.inline_mode || g.latched || !g.device) return;
+    if (!g.inline_mode || g.latched || !g.device || verified_native_reader()) return;
     // The existing MSAA-depth path changes raster state which this restore does
     // not replay. Keep it at its original boundary, as for resolved consumers.
     if(entry && g.depth_samples>1)return;
@@ -5477,6 +5563,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         uint64_t other=0;ComPtr<ID3D12Resource> other_target;
         bool rebound=false;
         uint64_t input=0; // stretch finder: DLSS reads this render-size image (0 = the scene colour)
+        bool native_dlaa=false;
         bool verify=false, verify_rt=false; NativeCrossing crossing; // provisional: mark the game's own image, no DLSS
         bool separate_reader=false;
         std::shared_ptr<LateInputBinding> late_input;
@@ -5822,8 +5909,26 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
     }
 public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l,na::observe::ShaderCall& call) noexcept override {
-        if(!g_native_reduced.load(std::memory_order_relaxed)){t_native_hint=nullptr;return {};}
+        const bool reduced = g_native_reduced.load(std::memory_order_relaxed);
+        const bool discover = g_native_discovery.load(std::memory_order_relaxed) && native_discovery_enabled();
+        if(!reduced && !discover){t_native_hint=nullptr;return {};}
         try{
+            if (discover && !reduced) {
+                if (g_trace.armed.load(std::memory_order_relaxed)) trace_op(l, call);
+                if (g_trace.learned_pso.load(std::memory_order_acquire)) {
+                    auto match = verify_step(l, call, true);
+                    auto c = std::static_pointer_cast<Candidate>(match.state);
+                    if (c) {
+                        c->native_dlaa = true;
+                        c->source.Attach(na::observe::AcquireResource(c->color));
+                        c->guide.Attach(na::observe::AcquireResource(c->depth));
+                        if (c->source && c->guide) reconstruct(l, c, nullptr, nullptr);
+                    }
+                    return {};
+                }
+                if (g_trace.provisional_pso.load(std::memory_order_acquire)) return verify_step(l, call);
+                return {};
+            }
             if(g_trace.armed.load(std::memory_order_relaxed))trace_op(l,call);
             else if(!g_trace.learned_pso.load(std::memory_order_relaxed))trace_present_writer(l,call);
             if (g_trace.learned_pso.load(std::memory_order_acquire)) return stretch(l,call);
@@ -5905,12 +6010,19 @@ public:
     }
     // The provisional crossing's dispatch (exact pipeline, groups, input and output):
     // after it runs, the screen probe marks the game's own image (no DLSS).
-    na::observe::ShaderScope verify_step(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call){
+    na::observe::ShaderScope verify_step(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,bool learned=false){
         const bool dispatch=call.kind==na::observe::ShaderKind::Dispatch;
         if (call.indirect || l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return {};
-        const uint64_t pso=g_trace.provisional_pso.load(std::memory_order_acquire);
+        const uint64_t pso = (learned ? g_trace.learned_pso : g_trace.provisional_pso).load(std::memory_order_acquire);
         if (!pso || na::observe::ListPipelineId(l)!=pso) return {};
-        NativeCrossing p;{std::lock_guard<std::mutex> lock(g_trace.m);p=g_trace.provisional;}
+        NativeCrossing p;
+        { std::lock_guard<std::mutex> lock(g_trace.m); p = learned ? g_trace.learned : g_trace.provisional; }
+        if (p.native_depth) {
+            uint64_t color = 0, depth = 0;
+            na::observe::GetLiveSelection(&depth, &color);
+            if (p.scene != color || p.native_depth != depth || !na::observe::ListStateRestorable(l) ||
+                na::observe::ListPredication(l, nullptr, nullptr, nullptr)) return {};
+        }
         const auto refuse=[&](const char* why){native_reject(g_nb.st_gated,why);return na::observe::ShaderScope{};};
         if (p.pso!=pso || dispatch!=(p.gx!=0) || (dispatch && (call.args[0]!=p.gx || call.args[1]!=p.gy || call.args[2]!=p.gz))) return refuse("Screen check: the provisional step ran with other groups than traced.");
         na::observe::NativeOperation op;const char* why=nullptr;
@@ -5930,7 +6042,23 @@ public:
         if (!output && !dispatch && op.colors.size()==1 && op.colors[0].resource && op.colors[0].view.resource==p.output) { output=&op.colors[0]; rt=true; }
         if (srvs[pick.at].id!=p.input || !output || output->view.resource!=p.output) return refuse("Screen check: the provisional step reads or writes other images than traced.");
         auto c=std::make_shared<Candidate>();
-        c->verify=true;c->verify_rt=rt;c->crossing=p;c->target=output->resource;c->dest=p.output;
+        if (p.native_depth) {
+            TraceOp actual;
+            trace_fill_io(op, actual);
+            const auto input = pick_scene_input(actual.in, p.rw, p.rh, p.ow, p.oh);
+            if (!input.ok || actual.in[input.at].vfmt != p.in_view || op.heap_indexing ||
+                actual.out.size() != 1 || !actual.out.front().whole ||
+                actual.out.front().vfmt != p.out_view ||
+                (rt && (op.depth.resource || op.viewports.size() != 1 || op.scissors.size() != 1))) return {};
+            const auto expected = rt ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            uint32_t state = 0;
+            if (na::observe::ListStateSub(l, p.output, 0, &state) != na::observe::StateLookup::Known ||
+                !(state & expected)) return {};
+            c->color = p.scene;
+            c->depth = p.native_depth;
+            c->recording = op.recording;
+        }
+        c->verify=!learned;c->verify_rt=rt;c->crossing=p;c->target=output->resource;c->dest=p.output;
         return {na::observe::ShaderAction::Forward,c};
     }    void After(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall&,na::observe::ShaderScope& scope) noexcept override {
         auto c=std::static_pointer_cast<Candidate>(scope.state);if(!c)return;
@@ -5948,8 +6076,11 @@ public:
             return;
         }
         if(c->verify){
+            if (c->crossing.native_depth && (!g_native_discovery.load(std::memory_order_relaxed) || !native_discovery_enabled())) return;
             try{
-                if(probe_verify_mark(l,c->target.Get(),c->crossing.out_view,g.frame,c->crossing,c->verify_rt)&&!na::observe::RestoreListState(l)){
+                uint64_t frame;
+                { std::lock_guard<std::mutex> lock(g.m); frame = g.frame; }
+                if(probe_verify_mark(l,c->target.Get(),c->crossing.out_view,frame,c->crossing,c->verify_rt)&&!na::observe::RestoreListState(l)){
                     std::lock_guard<std::mutex> lock(g.m);g.latched=true;reason("Stopped: the screen probe could not restore game state.");
                 }
             }catch(...){}
@@ -5988,7 +6119,8 @@ public:
                 // accepted here (recorded commands cannot be cancelled by a later order check);
                 // such a frame goes to the list-boundary route from stretch() instead.
                 const auto* p=c->input ? &c->producer :
-                    pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/true);
+                    pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/!c->native_dlaa);
+                if (c->native_dlaa && p && (p->frame != g.frame || !p->native_origin.SubmissionOrder(g.queue.Get()))) p = nullptr;
                 if(c->input) {
                     const auto order=p->native_origin.SubmissionOrder(g.queue.Get());
                     if(!p->native_origin || p->color!=color || p->depth!=depth || !p->native_origin.Ready(g.queue.Get()) ||
@@ -6022,6 +6154,7 @@ public:
             if(local&&(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied)))jitter_batch(one,1);
             g.inline_sample_locked=true;
             const uint32_t slot=g.slot;PendingHistory pending;ID3D12GraphicsCommandList* out=nullptr;bool touched=false;
+            if (c->native_dlaa) pending.referee_boundary = c->crossing.pso;
             auto owned=std::make_shared<std::vector<ComPtr<ID3D12Resource>>>();owned->reserve(16);
             *owned={c->source,c->guide,c->target};
             auto lease=na::nr::native::RetainRecording(l,owned);if(!lease)return false;
@@ -6033,6 +6166,7 @@ public:
             UpscaleTarget previous;
             UpscaleTarget target{c->dest,c->sub,0,0};
             target.require_delivery=true;
+            if (c->native_dlaa) target = {}; // write native-size DLAA back before the game's real reader
             if(op){
                 const auto sd=c->source->GetDesc();const auto od=c->other_target->GetDesc();
                 const DXGI_FORMAT f=typed(sd.Format);
@@ -6100,7 +6234,9 @@ public:
         return false;
     }
     void Closing(ID3D12GraphicsCommandList* l) noexcept override {
-        if(!g_native_reduced.load(std::memory_order_relaxed)||g.paused.load())return;
+        if ((!g_native_reduced.load(std::memory_order_relaxed) &&
+             !(g_native_discovery.load(std::memory_order_relaxed) && g_trace.learned_pso.load(std::memory_order_relaxed))) ||
+            g.paused.load()) return;
         try{
             uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
             if(!color||!depth||!na::observe::ListRendersTo(l,color,depth))return;
@@ -7916,11 +8052,16 @@ bool PreHudUpscale(ID3D12CommandQueue* queue,ID3D12Resource* frame,uint32_t rw,u
                    ID3D12Resource* out,uint32_t ow,uint32_t oh,const native_hud::Layer& layer,ID3D12CommandList* replay)
 {return present_upscale(queue,frame,rw,rh,out,ow,oh,is_float_color(frame->GetDesc().Format),&layer,replay);}
 
+void InstallScreenDiscovery();
+
 void SetEnabled(bool on)
 {
     g.enabled.store(on);
     g.configured.store(on);
-    if (on) na::observe::SetTableBindCallback(&on_table_bind);
+    if (on) {
+        na::observe::SetTableBindCallback(&on_table_bind);
+        if (native_discovery_enabled() && !g_screen_discovery_installed.load()) InstallScreenDiscovery();
+    }
     na::observe::SetEntryCallback(on?&on_entry:nullptr);
 }
 void EnableWwiiSceneCamera(bool on) { g.wwii_scene_camera.store(on, std::memory_order_relaxed); }
@@ -7936,11 +8077,16 @@ PhysicalReport::~PhysicalReport()
 void SetPhysicalInputProvider(const PhysicalInputProvider& p) { std::lock_guard<std::mutex> lk(g_up_m); g_phys = p; }
 void SetUpscaleTarget(const UpscaleTarget& t) { std::lock_guard<std::mutex> lk(g_up_m); g_up = t; }
 UpscaleTarget GetUpscaleTarget() { std::lock_guard<std::mutex> lk(g_up_m); return g_up; }
+void InstallScreenDiscovery() {
+    na::observe::SetOperationSnapshots(true);
+    na::observe::SetRasterStateTracking(true);
+    na::observe::SetTextureTraceListener(trace_texture);
+    na::observe::SetShaderOperationHook(na::observe::ShaderLane::Reconstruction, std::make_shared<NativeScaleHook>());
+    g_screen_discovery_installed.store(true, std::memory_order_release);
+}
 void EnableNativeScaleBridge(bool enabled) {
     g_native_bridge.store(enabled);g_native_reduced.store(false);
-    na::observe::SetTextureTraceListener(enabled?trace_texture:nullptr);
-    if(enabled){na::observe::SetOperationSnapshots(true);na::observe::SetRasterStateTracking(true);
-        na::observe::SetShaderOperationHook(na::observe::ShaderLane::Reconstruction,std::make_shared<NativeScaleHook>());}
+    if (enabled) InstallScreenDiscovery();
 }
 void EnableCameraInputDiagnostic(bool enabled) { g_camera_input_diagnostic.store(enabled); }
 NativeBridgeStats GetNativeBridgeStats() {
@@ -7991,10 +8137,67 @@ NativeBridgeStats GetNativeBridgeStats() {
     }
     return r;
 }
-void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present) {
+void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present, uint64_t ordinal, const void* source) {
     try{
+        const bool reduced = g_native_reduced.load(std::memory_order_relaxed);
+        bool native = false, submitted = false;
+        uint64_t depth = 0, color = 0;
+        NativeExtent picture{};
+        if (!reduced && frame && ordinal && source && native_discovery_enabled()) {
+            {
+                std::lock_guard<std::mutex> state_lock(g.m);
+                if (queue != g.queue.Get() || ordinal + 1 != g.frame) return;
+                native = !g.latched && g.router.Current().route != na::j2::Route::Interceptor;
+                submitted = g.submitted_frame == ordinal;
+            }
+            if (native) {
+                na::observe::GetLiveSelection(&depth, &color);
+                const auto d = frame->GetDesc();
+                picture = {uint32_t(d.Width), d.Height, uint32_t(d.Width), d.Height};
+                native = color && depth && picture.ow && picture.oh;
+            }
+        }
+        // Install before the first discovery window. A persisted setting also
+        // starts observation at boot, before the game's early descriptors exist.
+        if (native && !g_screen_discovery_installed.load(std::memory_order_acquire)) InstallScreenDiscovery();
         std::lock_guard<std::mutex> lock(g_trace.m);
-        if(!g_native_reduced.load(std::memory_order_relaxed)){
+        if (g_trace.native_resolution != native || (native &&
+            (g_trace.discovery_color != color || g_trace.discovery_depth != depth ||
+             g_trace.discovery_extent.ow != picture.ow || g_trace.discovery_extent.oh != picture.oh ||
+             g_trace.discovery_queue != queue || g_trace.discovery_source != source))) {
+            g_trace.native_resolution = native;
+            g_trace.discovery_color = color;
+            g_trace.discovery_depth = depth;
+            g_trace.discovery_extent = picture;
+            g_trace.discovery_queue = native ? queue : nullptr;
+            g_trace.discovery_source = native ? source : nullptr;
+            g_trace.previous = {}; g_trace.learned = {}; g_trace.learned_inputs.clear(); g_trace.learned_pso.store(0);
+            g_trace.provisional = {}; g_trace.provisional_pso.store(0); g_trace.refuted.clear();
+            g_trace.armed.store(false);
+            g_trace.presents = g_trace.armed_at = 0;
+            g_trace.discovery_misses = 0;
+            std::lock_guard<std::mutex> probe_lock(g_probe.m);
+            if (g_probe.target.native_depth) {
+                ++g_probe.sessions; // prior readbacks may still retire, but cannot vote here
+                g_probe.verify = false;
+                g_probe.remaining = 0;
+                g_probe.outcome = 0;
+                g_probe.target = {};
+                g_probe.marks.clear();
+                g_probe.seq.clear();
+            }
+        }
+        if (native && g_trace.learned.pso) {
+            g_trace.discovery_misses = submitted ? 0 : g_trace.discovery_misses + 1;
+            if (g_trace.discovery_misses >= 16) {
+                g_trace.learned = {};
+                g_trace.learned_pso.store(0, std::memory_order_release);
+                g_trace.refuted.clear();
+                g_trace.discovery_misses = 0;
+            }
+        }
+        g_native_discovery.store(native, std::memory_order_relaxed);
+        if(!reduced && !native){
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
             g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
             g_trace.presents=g_trace.armed_at=0;
@@ -8004,6 +8207,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         ++g_trace.presents;
         NativeExtent extent;
         { std::lock_guard<std::mutex> size_lock(g_up_m); extent=g_native_extent; }
+        if (native) extent = picture;
         if (g_trace.learned.pso && (g_trace.learned.rw!=extent.rw || g_trace.learned.rh!=extent.rh ||
                                    g_trace.learned.ow!=extent.ow || g_trace.learned.oh!=extent.oh)) {
             // A live mode change invalidates image identities immediately. Do
@@ -8018,6 +8222,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             g_trace.presented_ids[0].store(id);
         }
         if(!g_trace.armed.load()){
+            if (native && g_trace.learned.pso) return;
             // First trace ~2 s after the scene is reduced, then every ~15 s.
             // Actual layout failures request one immediate observation. A
             // persistent unsupported layout gets at most one retry per120
@@ -8729,7 +8934,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         PendingHistory pending;
         int before=record_deferred_native(queue,lists,count,&ours,pending);
         ft(" |");
-        if (before<0 && !g_native_reduced.load(std::memory_order_relaxed) && !g.inl.valid &&
+        if (before<0 && !g_native_reduced.load(std::memory_order_relaxed) && !verified_native_reader() && !g.inl.valid &&
             g.submitted_frame != g.frame && g.queue.Get() == queue && g.dlss_ready &&
             selected_color && selected_depth && g.router.Mode() == na::j2::RouteMode::Auto)
             before=record_between_consumer(lists,count,selected_color,selected_depth,&ours,pending);
@@ -9050,7 +9255,7 @@ void Shutdown()
     g.native_scene = {};
     g.native_producers.clear();
     g.native_deferred = {};
-    g_native_reduced.store(false);g_native_bridge.store(false);
+    g_native_reduced.store(false);g_native_bridge.store(false);g_native_discovery.store(false);
     g.jitter_writes.Clear();
     g.frame_seq.clear();
     g.frame_seq_complete = true;
