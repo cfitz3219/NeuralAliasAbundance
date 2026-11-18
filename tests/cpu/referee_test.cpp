@@ -8,7 +8,7 @@
 //   jitter:  a picture rendered with the jitter DLSS was told follows it; rendered without it, or
 //            with the opposite sign, is caught.
 #include "test_support.hpp"
-#include "core/referee.hpp"
+#include "core/referee_selection.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -179,6 +179,33 @@ int main()
         check(Judge(window).result == Verdict::Partial, "result: one decisive frame cannot speak for five");
         for (int frame = 0; frame < 3; ++frame) window.Add(output_vote);
         check(Judge(window).result == Verdict::Pass, "result: enough agreeing frames support a sampled pass");
+    }
+
+    {
+        using namespace na::referee::shadow;
+        const auto output_sample = Build(input, output, &screen_out, nullptr);
+        const auto input_sample = Build(input, output, &screen_in, nullptr);
+        const auto good = Score(output_sample.sample), bypass = Score(input_sample.sample);
+        const Placement between{Path::Between, 0}, inline_route{Path::Inline, 31};
+        Evidence current, alternative;
+        current.context = {inline_route, 20, 21, 3, 0, W, H};
+        alternative.context = {between, 20, 21, 4, 0, W, H};
+        current.Add(good);
+        check(!std::strcmp(Preview(current).action, "hold"), "shadow: one good sample cannot certify a route");
+        for (int frame = 0; frame < 2; ++frame) current.Add(good);
+        for (int frame = 0; frame < 3; ++frame) alternative.Add(good);
+        check(!std::strcmp(Preview(current, &alternative).action, "keep"), "shadow: keep a verified current route");
+        current.measured = {};
+        for (int frame = 0; frame < 3; ++frame) current.Add(bypass);
+        check(!std::strcmp(Preview(current).action, "check_placement"), "shadow: bypass alone does not establish another boundary");
+        check(!std::strcmp(Preview(current, &alternative).action, "prefer"), "shadow: a verified same-scene alternative beats a bypassed route");
+        alternative.context.color++;
+        check(!std::strcmp(Preview(current, &alternative).action, "check_placement"), "shadow: an alternative for another scene cannot replace the current one");
+        current.measured = {};
+        for (int frame = 0; frame < 3; ++frame) current.Add(bypass, between);
+        check(!std::strcmp(Preview(current).action, "probe"), "shadow: a repeated observed boundary is a probe candidate");
+        current.Add(bypass, {Path::Inline, 45});
+        check(!std::strcmp(Preview(current).action, "check_placement"), "shadow: conflicting boundary observations do not select a probe");
     }
 
     // Motion and jitter: the scene moved by u between the frames; the jitter changed.

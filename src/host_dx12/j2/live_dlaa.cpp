@@ -4789,7 +4789,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         id.mv_scale_y = e.mv_scale_y;
         id.reset = e.reset ? 1u : 0u;
         id.dlss_mv_jittered = e.mv_jittered;
-        pending.capture = na::capture::j2::RecordReferee(l, planes, id, e.render_w, e.render_h, e.out_w, e.out_h);
+        using na::referee::shadow::Path;
+        const auto& route = g.router.Current();
+        const na::referee::shadow::Context context{
+            {inl ? Path::Inline : Path::Between, route.signature}, color_id, depth_id, route.history_generation, csub};
+        pending.capture = na::capture::j2::RecordReferee(l, planes, id, e.render_w, e.render_h, e.out_w, e.out_h, context);
     }
     // A measured scene cut that DLSS has not been reset for yet: the temporal output still holds the
     // old scene, so those frames show the picture DLSS was given instead. Decided on the GPU, in
@@ -8301,6 +8305,21 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
                                           na::xess::GetStats().executes;
                 o.interceptor = external > g.route_prev_external;
                 g.route_prev_external = external;
+            }
+            if (receipt && o.scene && o.executed && !o.camera_missed && !o.depth_state_missed && !o.interceptor &&
+                na::settings::Get().referee_enabled.load(std::memory_order_relaxed) &&
+                g.router.Mode() == na::j2::RouteMode::Auto) {
+                using na::referee::shadow::Path;
+                const auto& route = g.router.Current();
+                auto& alternate = receipt->alternate;
+                if (route.route == na::j2::Route::Inline && o.consumer_in_later_list && !o.boundary_inside_list)
+                    alternate.placement = {Path::Between, 0};
+                else if (route.route == na::j2::Route::Between && o.boundary_inside_list && o.inline_signature)
+                    alternate.placement = {Path::Inline, o.inline_signature};
+                if (alternate.placement.path != Path::None) {
+                    na::observe::GetLiveSelection(&alternate.depth, &alternate.color);
+                    alternate.generation = route.history_generation;
+                }
             }
             g.route_prev_late = late;
             g.route_prev_no_camera = g.stats.no_camera;
