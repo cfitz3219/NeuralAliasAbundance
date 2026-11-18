@@ -40,3 +40,7 @@ Sol's draft PR #164 (b71fa1b, base 0cb1fb46) reuses the scale bridge's screen pr
 ## 2026-11-17 Pacific — Native DX11 screen-check handoff
 
 PR #165 (89ae5f5 on 8e2eb95b) applies the shared screen check to the native DX11 provider. RTX 5070 Ti and WARP each rejected the decoy, confirmed the visible reader and matched presented pixels on 53 consecutive native-size frames. Eleven selected local cases passed, including two separate native DX11 tests using real NGX. Fable owns integration and packaging. Shadow of War still needs its trial.
+
+## 2026-11-18 Pacific — Shadow of War DX11 Referee continuity
+
+PR 166 (07acf67) targets the active 78b539df integration line. The native DX11 Referee now preserves ordinary DLAA delivery and requires a candidate to stay present throughout screen proof. A reader that later alternates between delivery and misses loses control. Ten focused tests passed. RTX and WARP pixel checks passed for ordinary delivery, interrupted proof, discovery of the visible reader and restoration after alternating misses. No live game run or installer. The separate overhead from camera discovery while DLAA is paused is documented in the branch's WORKLOG.
