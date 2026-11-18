@@ -36,3 +36,7 @@ Astra's draft PR #163 (5a84308) targets Fable's active code line. It improves DX
 ## 2026-11-17 Pacific — Native DX12 screen-check handoff
 
 Sol's draft PR #164 (b71fa1b, base 0cb1fb46) reuses the scale bridge's screen probe to verify native DLAA placement. RTX 5070 Ti rejected the decoy and confirmed the real reader, with 29 consecutive presented frames carrying the test evaluator's output through the game's own post-processing. The Release host and all 16 focused checks passed. The new fixture also passed on WARP. Fable owns integration and packaging. Shadow of War's DX11 route is outside the new path.
+
+## 2026-11-17 Pacific — Native DX11 screen-check handoff
+
+PR #165 (89ae5f5 on 8e2eb95b) applies the shared screen check to the native DX11 provider. RTX 5070 Ti and WARP each rejected the decoy, confirmed the visible reader and matched presented pixels on 53 consecutive native-size frames. Eleven selected local cases passed, including two separate native DX11 tests using real NGX. Fable owns integration and packaging. Shadow of War still needs its trial.
