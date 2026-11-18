@@ -180,7 +180,7 @@ inline void SamplePoints(const MotionInputs& in, float* out)
                     contrast += .5f * (std::fabs(LogAt(p, x + float(a) + 1, y + float(b)) - pv) + std::fabs(LogAt(p, x + float(a), y + float(b) + 1) - pv));
                 }
             for (int h = 0; h < 6; ++h) o[h] = e[h] / 9.f;
-            for (int h = kHalf; h <= kTwice; ++h)
+            for (int h = int(kHalf); h <= int(kTwice); ++h)
                 if (!PatchVisible(x + shift[h][0], y + shift[h][1], p.w, p.h)) o[h] = -1;
             o[kContrast] = contrast / 9.f;
             o[kLength] = std::sqrt(vx * vx + vy * vy);
