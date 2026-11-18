@@ -8209,13 +8209,6 @@ void ViewportJitterDropped(ID3D12CommandList* list)
     std::lock_guard<std::mutex> bl(ls->bind_m);
     if (ls->vpj_applied) { ls->vpj_applied = false; ++ls->viewport_serial; }
 }
-uint64_t ListRecording(ID3D12CommandList* list)
-{
-    std::shared_lock<RegistryLock> lock(g_m);
-    na_object_id id = 0;
-    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
-    return ls && ls->generation_known.load() ? ls->generation.load() + 1 : 0;
-}
 void SetDepthReadTwin(ID3D12Resource* game_depth, ID3D12Resource* twin)
 {
     // Twin first when setting, depth first when clearing: a view creation that sees the depth sees a twin.

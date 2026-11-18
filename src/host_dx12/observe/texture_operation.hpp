@@ -78,8 +78,6 @@ bool ListHostDrawAllowed(ID3D12CommandList* list);
 bool ListHostCopyAllowed(ID3D12CommandList* list);
 // The game's own viewports were just bound by host work: the next scene draw applies the sample again.
 void ViewportJitterDropped(ID3D12CommandList* list);
-// This recording's number (0 = not known). Changes at every Reset.
-uint64_t ListRecording(ID3D12CommandList* list);
 // Called only for a forwarded game texture operation, with the actual call arguments.
 using TextureTraceListener = void (*)(ID3D12GraphicsCommandList*, const TextureCall&) noexcept;
 void SetTextureTraceListener(TextureTraceListener);
