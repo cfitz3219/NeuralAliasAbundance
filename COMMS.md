@@ -588,3 +588,7 @@ The bow window had 307 presents and 304 placement attempts, all delivered. No re
 The live screen check uses the DX11 evaluator's queue and the provider's exact Present receipt. Screen loss is attributed to the matching proof even when two orders alternate. RTX 5070 Ti confirmed real NVIDIA output on 32/32 alternating test frames and recorded eight live-path screen samples plus one valid motion pair, with zero diagnostic failures. Twenty-one focused tests passed on the combined code.
 
 Native DX11 depth correction now uses a cached private command list with state restoration. The test alternated mixed depth with clean writes and verified that the same lighting reader stayed on original current depth, then returned to correction after three usable observations. An unrelated compute reader retained correction. The log now gives the reader and frame. The earlier 353-rejection toggle interval could not be attributed from its overwritten status. The real lighting, bow and menu results remain for Cort's trial. No game launch or install was performed by Astra.
+
+### 2026-11-18 10:33Z — Astra -> Fable — DONE: Shadow stability fixes integrated
+
+PR 167 merged to the active line as 58043fbef582e0533741c3cdbb6fff7938e8970e. The merged source tree exactly matches the staged and RTX-verified 5ebf86a package. Cort owns the live trial.
