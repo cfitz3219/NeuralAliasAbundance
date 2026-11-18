@@ -44,7 +44,7 @@ void set_current(std::shared_ptr<Entry> e) { std::lock_guard<std::mutex> lock(g_
 // corrected: the twin was drawn with the jitter taken out; copied: it got the game's depth as it is
 // (the scene was not nudged, the nudge is not known here, or a draw could not be handed back here);
 // upgraded: a copy was followed by the corrected draw before the recording's next draw.
-std::atomic<uint64_t> g_corrected{0}, g_copied{0}, g_upgraded{0}, g_no_sample{0}, g_not_restorable{0};
+std::atomic<uint64_t> g_corrected{0}, g_copied{0}, g_upgraded{0}, g_no_sample{0}, g_not_restorable{0}, g_unpredicated{0};
 std::atomic<bool> g_stop{false};
 std::atomic<const char*> g_stop_why{""};
 void stop(const char* why) { g_stop_why.store(why, std::memory_order_release); g_stop.store(true, std::memory_order_release); }
@@ -57,6 +57,22 @@ thread_local Pending t_pending;
 void drop_pending() { t_pending = {}; na::observe::SetDepthReadPending(nullptr); }
 
 void keep(Entry& e, RecordingLease lease) { std::lock_guard<std::mutex> lock(e.m); e.filled[e.next++ % 8] = std::move(lease); }
+// The game's predication would skip the host's copy or draw as it skips the game's own, and the
+// game's reads would then see the twin of an earlier frame. Taken off for the host's work at this
+// point of the recording, put back exactly as the game last set it.
+struct Unpredicated {
+    ID3D12GraphicsCommandList* list;
+    ID3D12Resource* buffer = nullptr; UINT64 offset = 0; D3D12_PREDICATION_OP op = D3D12_PREDICATION_OP_EQUAL_ZERO;
+    bool bound;
+    explicit Unpredicated(ID3D12GraphicsCommandList* l) : list(l), bound(na::observe::ListPredication(l, &buffer, &offset, &op))
+    {
+        if (!bound) return;
+        list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        g_unpredicated.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~Unpredicated() { if (bound) list->SetPredication(buffer, offset, op); }
+    Unpredicated(const Unpredicated&) = delete; Unpredicated& operator=(const Unpredicated&) = delete;
+};
 // The corrected draw, then the game's state back. False: the recording now holds host state (stopped for good).
 bool draw(const std::shared_ptr<Entry>& e, ID3D12GraphicsCommandList* list, const na::observe::SceneRaster& raster, uint32_t state, bool all_planes)
 {
@@ -82,6 +98,7 @@ void on_barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, uint32_t
     na::observe::SceneRaster raster;
     const bool nudged = na::observe::SceneRasterFor(list, e->id, raster);
     if (!nudged) g_no_sample.fetch_add(1, std::memory_order_relaxed);
+    const Unpredicated unpredicated(list);
     if (nudged && na::observe::ListHostDrawAllowed(list)) {
         if (!draw(e, list, raster, after, all_planes)) return;
         g_corrected.fetch_add(1, std::memory_order_relaxed);
@@ -112,6 +129,7 @@ void on_before_draw(ID3D12GraphicsCommandList* list)
     drop_pending();
     auto lease = na::nr::native::RetainRecording(list, e);
     if (!lease) return; // the copy stands
+    const Unpredicated unpredicated(list);
     if (!draw(e, list, raster, p.state, p.all_planes)) return;
     g_upgraded.fetch_add(1, std::memory_order_relaxed);
     keep(*e, std::move(lease));
@@ -209,11 +227,12 @@ int Format(char* out, size_t n)
     if (s.live) { const auto d = s.live->depth->GetDesc(); w = d.Width; h = d.Height; format = d.Format; }
     const char* state = s.latched ? "stopped" : !s.live ? (s.refused.empty() ? "off" : "refused") : s.live->redirected ? "on" : "filling";
     return std::snprintf(out, n,
-        "depth_reads variant=depth-reads/twin api=dx12 state=%s depth=%llux%u format=%u corrected=%llu copied=%llu upgraded=%llu "
+        "depth_reads variant=depth-reads/twin api=dx12 state=%s depth=%llux%u format=%u corrected=%llu copied=%llu upgraded=%llu predication_lifted=%llu "
         "views_created=%llu views_rewritten=%llu views_left=%llu views_raced=%llu readable_barriers=%llu no_sample=%llu "
         "not_restorable=%llu why=\"%s\"",
         state, static_cast<unsigned long long>(w), h, format, static_cast<unsigned long long>(g_corrected.load()),
         static_cast<unsigned long long>(g_copied.load()), static_cast<unsigned long long>(g_upgraded.load()),
+        static_cast<unsigned long long>(g_unpredicated.load()),
         static_cast<unsigned long long>(o.created), static_cast<unsigned long long>(o.swept), static_cast<unsigned long long>(o.unknown_view),
         static_cast<unsigned long long>(o.raced), static_cast<unsigned long long>(o.readable),
         static_cast<unsigned long long>(g_no_sample.load()), static_cast<unsigned long long>(g_not_restorable.load()),

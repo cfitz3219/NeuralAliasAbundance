@@ -8187,7 +8187,7 @@ bool ListHostDrawAllowed(ID3D12CommandList* list)
     std::lock_guard<std::mutex> bl(ls->bind_m);
     return ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
            ls->raster_viewports_known && ls->raster_scissors_known && ls->raster_topology_known &&
-           ls->pso && ls->root_sig[0] && ls->nheaps && !ls->active_queries && !ls->predicate &&
+           ls->pso && ls->root_sig[0] && ls->nheaps && !ls->active_queries &&
            ls->args[0].size() <= 64 && ls->args[1].size() <= 64;
 }
 bool ListHostCopyAllowed(ID3D12CommandList* list)
@@ -8198,7 +8198,20 @@ bool ListHostCopyAllowed(ID3D12CommandList* list)
     ListState* ls = list ? list_state_locked(list, &id) : nullptr;
     if (!ls) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return !ls->in_render_pass && !ls->predicate; // predication would skip a copy as it skips a draw
+    return !ls->in_render_pass;
+}
+bool ListPredication(ID3D12CommandList* list, ID3D12Resource** buffer, UINT64* offset, D3D12_PREDICATION_OP* op)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->predicate) return false;
+    if (buffer) *buffer = ls->predicate;
+    if (offset) *offset = ls->predicate_offset;
+    if (op) *op = ls->predicate_op;
+    return true;
 }
 void ViewportJitterDropped(ID3D12CommandList* list)
 {

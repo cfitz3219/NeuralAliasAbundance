@@ -72,10 +72,13 @@ struct SceneRaster { uint64_t sample = 0; bool expanded = false; bool own = fals
 bool SceneRasterFor(ID3D12CommandList* list, uint64_t depth, SceneRaster& out);
 // A host draw can be recorded here and everything handed back: a DIRECT recording outside passes,
 // with targets, viewports, scissors, topology, pipeline, root and heaps all known, no game query
-// counting and no predication.
+// counting. Predication is the caller's to take off and put back (ListPredication).
 bool ListHostDrawAllowed(ID3D12CommandList* list);
-// A host copy can be recorded here: a DIRECT recording outside passes with no predication.
+// A host copy can be recorded here: a DIRECT recording outside passes (predication: as above).
 bool ListHostCopyAllowed(ID3D12CommandList* list);
+// The predication the game has bound on this recording now (what its last SetPredication said).
+// False: none. Predication skips copies and draws alike, the host's with the game's.
+bool ListPredication(ID3D12CommandList* list, ID3D12Resource** buffer, UINT64* offset, D3D12_PREDICATION_OP* op);
 // The game's own viewports were just bound by host work: the next scene draw applies the sample again.
 void ViewportJitterDropped(ID3D12CommandList* list);
 // Called only for a forwarded game texture operation, with the actual call arguments.
