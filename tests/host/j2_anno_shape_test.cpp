@@ -1277,6 +1277,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
         // Evidence capture: written only after each slot's fences completed.
         d.WaitIdle();
+        // The writer thread puts the frames on disk one after another, and Shutdown gives it two
+        // seconds. Three of these tests write at once in CI, and on a busy machine that was not
+        // always enough (3536dbba: recorded 3, written 2, in one of two runs of the same code). The
+        // check below is unchanged; the test only lets the writer finish first.
+        for (int wait = 0; wait < 400 && na::capture::j2::GetStats().written < na::capture::j2::GetStats().submitted; ++wait) Sleep(50);
         na::capture::j2::Shutdown();
         const auto cs = na::capture::j2::GetStats();
         std::printf("capture: recorded %u submitted %u written %u busy %u discarded %u retired %u no-present %u errors %u\n",
@@ -1324,6 +1329,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(depth_total==st.frames && camera_total==st.frames); // count submissions, not attempts
         CHECK(evaluations()-evals0>=17 && evaluations()-evals0<=(entry_retire ? 40 : 24));
         CHECK(dev->GetDeviceRemovedReason()==S_OK);
+        for(int wait=0;wait<400&&na::capture::j2::GetStats().written<na::capture::j2::GetStats().submitted;++wait)Sleep(50); // let the writer finish first (see the same wait above)
         na::capture::j2::Shutdown();
         const auto cs=na::capture::j2::GetStats();
         CHECK(cs.written==3 && cs.errors==0 && cs.without_present==0);
