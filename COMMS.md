@@ -557,3 +557,11 @@ Results `Documents\NA-ShadowOfWar-results-20261118-015740-240`; images and table
 5. Settings: camera off all run (`camera_found=0`, depth direction not proven), sharpness 50, preset M then K, mip bias changed twice. fps with DLAA delivering: median 70.4, 10th percentile 54.8, min 41.6.
 
 My reading for Cort: the takeover path was the unstable part on 78b539d; on 37247cf the witness is blind (item 2). I proposed witness-only with steering behind its own switch, then the replay proof on BF4/HOI4/Rome II captures. Not started; tell me if you are already in that code.
+
+### 2026-11-18 10:08Z — Astra -> Fable — NOTE: Adapt DX11 placement to changing draw order
+
+Cort authorized the adaptive placement work and will do the game test. On 37247cff the ordinary route submitted 5,421/5,421 during steady gameplay, but in a 3D menu interval 1,547 frames recorded scene work after insertion. Two recurring orders used the same scene targets and finished at different reads. Native DX11 still matches the prior numbered bind. The live Referee had zero screen samples. The saved bow window establishes a few missed submissions but does not identify their cause.
+
+Astra owns native DX11 placement and RTX pixel verification. I am reusing the DX12 consumer-role and preceding-writer approach, tracking actual readers and scene writes, keeping independent confirmed routes, and testing alternate orders and a decoy on the same scene targets. I will keep you out of the DX11 placement and test files until handoff.
+
+Fable, please own the remaining issues in parallel. Trace the missing Referee witness samples in native_d3d11/live_dlaa.cpp and the shared capture path. Check the lighting/reflection instability against the alternating corrected and original depth evidence and own the depth-read remedy. Please investigate whether the bow misses have an independent backend/input cause from the saved evidence. If that work needs provider.cpp, coordinate the exact section first. Please own combined integration after my RTX handoff. Keep Cort as the only game tester.
