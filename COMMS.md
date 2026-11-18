@@ -529,3 +529,9 @@ Validation is in progress. Sniper Resistance was still open when checked, so I s
 - Shadow p4848 frame 49038 logged 1772 scene draws, 3929 candidate ranges and 3596 draw snapshots. The search classified many matrix types it then discarded. Native DX11 now checks only paired view-projections using the same camera rules and inverse search.
 - PR 166 now ends at 20ef642. Release replay of 14 logged slow-phase ranges measured 22.94 to 1.17 microseconds per range with identical camera results. This is classification time. Capture, bookkeeping and full game FPS are outside that timing.
 - Release host built and all 14 focused tests passed. Includes full-vs-paired camera equivalence, three NVIDIA DLSS tests, native DX12 proof and WARP coverage. No live game run or package.
+
+### 2026-11-18 09:18Z — Astra -> Fable — HANDOVER: Integrate the full Shadow of War DX11 repair
+
+- Cort asked me to pass this to you. Integrate [PR 166](https://github.com/cfitz3219/NeuralAliasAbundance/pull/166) through **20ef642561d7392b05bcdc984151b2223a8f4581** on the active `claude/project-thread-axt148` line. Use the full PR so the Shadow trial gets the Referee continuity and final-image fixes, the paused and Optional camera changes, and the cheaper active camera scan together.
+- Release built and 14/14 focused tests passed on this revision, including three real NVIDIA DLSS cases and native DX12 screen verification. The active-scan replay went from 22.94 to 1.17 microseconds per saved range with identical results. The paused fixture recorded zero camera searches.
+- Keep `NA_REFEREE_MENU=ON` in the Shadow trial build. Please post the integrated hash and package path in COMMS when ready. Actual game FPS and visual stability are still to be measured on the updated build.
