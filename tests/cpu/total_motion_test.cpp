@@ -16,7 +16,13 @@
 //    (Cort's Sniper Elite Resistance run, 2026-11-17): it follows the screen's own motion when
 //    there is one (core/screen_motion.hpp), and is "not known" when there is none;
 //  - with a screen motion, a pixel moving with the screen is measured as exactly that, and a thing
-//    moving by itself keeps its own vector.
+//    moving by itself keeps its own vector;
+//  - a still light smaller than a pixel, which the jittered raster puts on a different pixel (or on
+//    none) every frame, gets NO motion of its own, while a thing that really moves over the same sky
+//    keeps its vector (Cort's Sniper Elite Resistance run on 774fc12f, 2026-11-17: distant lights
+//    strobed and went solid up close). OPEN, measured and printed here: a still wire thinner than a
+//    pixel at a shallow slope is drawn as dashes that slide along it by several pixels with the
+//    jitter; two pictures alone show that as motion, and about half of those pixels still get a vector.
 // The numbers asserted are loose bounds around what this reference measures today; the printed
 // lines are the measurements themselves.
 #include "test_support.hpp"
@@ -161,8 +167,10 @@ int main()
         {"a still scene measures as exactly still, with and without jitter", [] {
             for (int edges = 0; edges < 2; ++edges) {
                 const Tally plain = Measure(Pan(0, edges != 0, false), Uniform(0, 0), Search(true, 0, 0), edges ? "still, edges, no jitter" : "still, no jitter");
-                // The flat pixels between the edges are not known: no screen motion is given here.
-                const double flat = edges ? 0.12 : 0.02;
+                // The flat pixels between the edges are not known: no screen motion is given here. (0.14, not
+                // the 0.12 of before the one-sample rule: where the bars lower the texture's contrast, more
+                // windows fall under what the picture needs to measure. 8.3 % before the rule, 12.5 % with it.)
+                const double flat = edges ? 0.14 : 0.02;
                 CHECK(plain.moving == 0 && plain.Share(plain.nothing) < flat && plain.p95 == 0);
                 const Tally jittered = Measure(Pan(0, edges != 0, true), Uniform(0, 0), Search(true, 0, 0), edges ? "still, edges, jitter only" : "still, jitter only");
                 // Jitter alone is not motion: most of the picture reads exactly still, the rest within a tenth of a pixel.
@@ -183,7 +191,7 @@ int main()
                 CHECK(t.p95 <= d + 0.02f);
                 std::snprintf(name, sizeof name, "pan %.3f px, edges", d);
                 const Tally e = Measure(Pan(d, true, true), Uniform(-d, 0), Search(true, 0, 0), name);
-                CHECK(e.mean_x < -0.25 * d && e.mean_x > -1.3 * d && e.Share(e.nothing) < 0.12);
+                CHECK(e.mean_x < -0.25 * d && e.mean_x > -1.3 * d && e.Share(e.nothing) < 0.14);
             }
         }},
         {"a 3.4 px pan with the search's whole-pixel answer is measured below a pixel", [] {
@@ -285,6 +293,117 @@ int main()
                 }
             CHECK(moving > inside * 9 / 10);
             NEAR(mean / moving, -2.5, 0.05);
+        }},
+        {"a still light smaller than a pixel gets no motion of its own, and a real mover keeps its", [] {
+            // A dark sky with lights smaller than a pixel; with `wire` >= 0, a thin wire of that slope;
+            // with `movers`, a textured square and a narrow textured bar that slide over it.
+            const auto night = [](float x, float y, float sx, float sy, bool movers, float wire) {
+                float v = 0.06f + 0.012f * (Noise(x / 9.f, y / 9.f) - 0.5f);
+                const int cx = int(std::floor(x / 16.f)), cy = int(std::floor(y / 12.f));
+                const float lx = float(cx) * 16.f + 3.f + 10.f * Hash(cx, cy), ly = float(cy) * 12.f + 3.f + 6.f * Hash(cx + 31, cy + 17);
+                if (std::fabs(x - lx) < 0.35f && std::fabs(y - ly) < 0.35f) v = 0.9f;        // a light 0.7 px across
+                if (wire >= 0 && x < 100 && std::fabs(y - (22.3f + wire * x)) < 0.3f) v = 0.7f; // a wire 0.6 px thick
+                if (movers) {
+                    const float mx = x - sx, my = y - sy;
+                    const float tex = 0.5f + 0.45f * std::sin(mx * 0.9f) * std::sin(my * 0.8f + 0.5f);
+                    if (mx >= 40 && mx < 64 && my >= 50 && my < 74) v = tex;   // 24 x 24
+                    if (mx >= 110 && mx < 113 && my >= 60 && my < 84) v = tex; // 3 x 24
+                }
+                return v;
+            };
+            // The search, stood in for by the least 7x7 difference within 3 px (zero wins a tie); none where its block is flat.
+            const auto search = [](const Image& cur, const Image& prev, int x, int y, float& rx, float& ry) {
+                float lo = 1e9f, hi = -1e9f;
+                for (int j = -3; j <= 3; ++j)
+                    for (int i = -3; i <= 3; ++i) {
+                        const float c = cur.luma[size_t(y + j) * kW + (x + i)];
+                        lo = (std::min)(lo, c);
+                        hi = (std::max)(hi, c);
+                    }
+                rx = ry = 0;
+                if (hi - lo < 0.03f) return false;
+                float best = 1e9f;
+                for (int dy = -3; dy <= 3; ++dy)
+                    for (int dx = -3; dx <= 3; ++dx) {
+                        float sad = 0;
+                        for (int j = -3; j <= 3; ++j)
+                            for (int i = -3; i <= 3; ++i)
+                                sad += std::fabs(cur.luma[size_t(y + j) * kW + (x + i)] - prev.luma[size_t(y + j + dy) * kW + (x + i + dx)]);
+                        if (sad < best - 1e-6f || (dx == 0 && dy == 0 && sad <= best + 1e-6f)) { best = sad; rx = float(dx); ry = float(dy); }
+                    }
+                return true;
+            };
+            // The eight jitter samples the program uses by default (Halton 2, 3), in order.
+            float jitter[8][2];
+            for (int k = 0; k < 8; ++k) {
+                const auto halton = [](int i, int b) { float f = 1, r = 0; for (; i > 0; i /= b) { f /= float(b); r += f * float(i % b); } return r; };
+                jitter[k][0] = halton(k + 1, 2) - 0.5f;
+                jitter[k][1] = halton(k + 1, 3) - 0.5f;
+            }
+            struct Count { int own = 0, wrong = 0, right = 0, inside = 0; };
+            // One frame pair of the cycle, everything still but the movers (u pixels a frame); the screen's motion says "still".
+            const auto run = [&](const Params& p, float ux, float uy, bool movers, float wire, Count& sky, Count& square, Count& bar) {
+                for (int k = 0; k < 8; ++k) {
+                    const float* jp = jitter[k];
+                    const float* jc = jitter[(k + 1) % 8];
+                    const float t = float(k);
+                    const std::vector<float> previous = Encode(Draw([&](float x, float y) { return night(x, y, ux * t, uy * t, movers, wire); }, jp[0], jp[1]), jp[0], jp[1]);
+                    const std::vector<float> current = Encode(Draw([&](float x, float y) { return night(x, y, ux * (t + 1), uy * (t + 1), movers, wire); }, jc[0], jc[1]), jc[0], jc[1]);
+                    const Image cur{current.data(), kW, kH}, prev{previous.data(), kW, kH};
+                    for (int y = 10; y < kH - 10; ++y)
+                        for (int x = 10; x < kW - 10; ++x) {
+                            float rx, ry;
+                            const bool have = search(cur, prev, x, y, rx, ry);
+                            const Result r = MeasurePixel(cur, prev, float(x) + 0.5f - jc[0], float(y) + 0.5f - jc[1], have, rx, ry, p, true, 0, 0);
+                            const float mx = float(x) + 0.5f - ux * (t + 1), my = float(y) + 0.5f - uy * (t + 1);
+                            // Well inside a mover (its edges and what it uncovers are judged by other fixtures); well away from both for the sky.
+                            const bool in_square = movers && mx >= 44 && mx < 60 && my >= 54 && my < 70;
+                            const bool in_bar = movers && mx >= 110.5f && mx < 112.5f && my >= 64 && my < 80;
+                            const bool near_mover = movers && ((mx >= 28 && mx < 76 && my >= 38 && my < 86) || (mx >= 98 && mx < 125 && my >= 48 && my < 96));
+                            Count* c = in_square ? &square : in_bar ? &bar : near_mover ? nullptr : &sky;
+                            if (!c) continue;
+                            ++c->inside;
+                            if (r.why != kMoving) continue;
+                            ++c->own;
+                            if (c == &sky) c->wrong += std::hypot(r.x, r.y) > 0.5f;
+                            else c->right += std::hypot(r.x + ux, r.y + uy) <= 0.5f;
+                        }
+                }
+            };
+            Params before;
+            before.snap = before.lone = false;
+            Count sky_before, sky_now, unused1, unused2;
+            run(before, 0, 0, false, -1, sky_before, unused1, unused2);
+            run({}, 0, 0, false, -1, sky_now, unused1, unused2);
+            std::printf("  still lights, 8 jittered pairs: an own vector on %d pixels before (%d over half a pixel), %d now (%d)\n",
+                        sky_before.own, sky_before.wrong, sky_now.own, sky_now.wrong);
+            // The strobe is reproduced without the two rules. With them a few pixels are left, where two lights share a window.
+            CHECK(sky_before.wrong > 300);
+            CHECK(sky_now.wrong * 30 <= sky_before.wrong && sky_now.own * 50 <= sky_before.own);
+            // OPEN: a still wire thinner than a pixel. Steep, it behaves like the lights; at a shallow slope its dashes slide along it.
+            for (float slope : {0.5f, 0.13f}) {
+                Count wire_before, wire_now;
+                run(before, 0, 0, false, slope, wire_before, unused1, unused2);
+                run({}, 0, 0, false, slope, wire_now, unused1, unused2);
+                std::printf("  the same with a still wire, slope %.2f: over half a pixel on %d pixels before, %d now\n", slope, wire_before.wrong, wire_now.wrong);
+                CHECK(slope < 0.3f ? wire_now.wrong * 3 <= wire_before.wrong * 2 : wire_now.wrong * 10 <= wire_before.wrong);
+            }
+            // The square and the bar slide 3 px right and 1 px down a frame over the lights: they keep their own vector.
+            Count sky_b, square_b, bar_b, sky_n, square_n, bar_n;
+            run(before, 3, 1, true, -1, sky_b, square_b, bar_b);
+            run({}, 3, 1, true, -1, sky_n, square_n, bar_n);
+            std::printf("  a real mover over that sky, right vector: square %5.1f%% before, %5.1f%% now; 3 px bar %5.1f%% before, %5.1f%% now; sky wrong %d before, %d now\n",
+                        100.0 * square_b.right / square_b.inside, 100.0 * square_n.right / square_n.inside, 100.0 * bar_b.right / bar_b.inside,
+                        100.0 * bar_n.right / bar_n.inside, sky_b.wrong, sky_n.wrong);
+            // (The bar is hard for this fixture under either rule: three pixels of a jittered raster. What is asked is that the
+            // rules take little of what was measured before.)
+            CHECK(square_n.right > square_n.inside * 9 / 10 && bar_n.right * 5 >= bar_b.right * 4);
+            CHECK(sky_n.wrong * 30 <= sky_b.wrong);
+            // What the rule costs, written down: a thing moving by itself less than a pixel a frame against the screen follows the screen.
+            Count sky_s, square_s, bar_s;
+            run({}, 0.4f, 0.2f, true, -1, sky_s, square_s, bar_s);
+            std::printf("  the same movers at 0.4 px a frame: own vectors on %d of %d pixels (they follow the screen)\n", square_s.own + bar_s.own, square_s.inside + bar_s.inside);
+            CHECK(square_s.own == 0 && bar_s.own == 0);
         }},
         {"through the arbiter a measured field keeps its values and is never labelled the game's own", [] {
             // Astra's correction 5: the tier-1 arithmetic is reused, the label and the counter are not.

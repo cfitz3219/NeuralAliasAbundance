@@ -158,6 +158,13 @@ void accept(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 //  - Where the pictures cannot measure (flat, or no hypothesis explains them) the pixel follows the
 //    screen's own motion (the model fit_solve wrote), and the search's raw vector is never handed
 //    on. With a model, IT is the hypothesis "nothing moved by itself" in place of exact stillness.
+//  - With a model, a pixel's own vector counts only when it leaves the sampling snap's range around
+//    the model's motion (kTotalBound either way on each axis) and explains the pictures clearly
+//    better than the model does anywhere inside that range: the stabilised pictures are a jittered,
+//    point-sampled raster shifted back, so a thing thinner than a pixel moves by up to a pixel
+//    between them while standing still (total_motion.hpp says what was seen and what this costs).
+//  - One sample is not a texture: the window's contrast is taken with the one sample that carries
+//    most of its range set aside.
 //  - Validity written: 1 measured (with the screen, or moving by itself), 0.5 the screen's own
 //    motion where the pictures could not measure, 0 nothing known (no model to follow).
 static const float kTotalImageAbs = 0.08, kTotalImageRel = 0.15, kTotalTextureMin = 0.03;
@@ -166,7 +173,8 @@ static const float kTotalApproximate = 0.5;
 float cur_luma(float2 q) { return luma(t_cur.SampleLevel(s_lin, q / float2(w, h), 0).rgb); }
 float prev_luma(float2 q) { return luma(t_prev.SampleLevel(s_lin, q / float2(w, h), 0).rgb); }
 // The current picture around p: nine places two pixels apart, each one's gradient (central
-// differences one pixel either side), the structure sums and the local contrast. 33 reads.
+// differences one pixel either side), the structure sums and the local contrast (with the one
+// sample that carries most of the range set aside). 33 reads.
 struct Window { float lc[9]; float2 g[9]; float3 a; float contrast; };
 Window window_at(float2 p) {
     Window win;
@@ -178,7 +186,7 @@ Window window_at(float2 p) {
     [unroll] for (int um = 0; um < 4; ++um) {
         [unroll] for (int ui = -1; ui <= 1; ++ui) updown[um * 3 + (ui + 1)] = cur_luma(p + float2(2 * ui, 2 * um - 3));
     }
-    float lo = 1e9, hi = -1e9;
+    float lo = 1e9, lo2 = 1e9, hi = -1e9, hi2 = -1e9; // the darkest and the brightest sample, and the next of each
     [unroll] for (int wj = -1; wj <= 1; ++wj) {
         [unroll] for (int wi = -1; wi <= 1; ++wi) {
             int k = (wj + 1) * 3 + (wi + 1);
@@ -188,10 +196,13 @@ Window window_at(float2 p) {
             win.lc[k] = c;
             win.g[k] = g;
             win.a += float3(g.x * g.x, g.x * g.y, g.y * g.y);
-            lo = min(lo, c); hi = max(hi, c);
+            if (c > hi) { hi2 = hi; hi = c; }
+            else if (c > hi2) hi2 = c;
+            if (c < lo) { lo2 = lo; lo = c; }
+            else if (c < lo2) lo2 = c;
         }
     }
-    win.contrast = hi - lo;
+    win.contrast = max(0.0, min(hi2 - lo, hi - lo2));
     return win;
 }
 // Bounded refinement of one hypothesis v0: two damped Gauss-Newton steps on the window with the
@@ -234,14 +245,15 @@ float4 refine(float2 p, float2 v0, Window win) {
 }
 // The vector that explains the window best, among the refined hypothesis `hyp` and the refined
 // search vector (total_motion.hpp BestVector). False: the pictures cannot measure here (flat, or
-// neither explains them). e_with: the error `hyp` leaves exactly; limit: what counts as explaining.
-bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, out float2 best, out float e_best, out float e_with, out float limit) {
-    best = hyp; e_best = 0; e_with = 0; limit = 0;
+// neither explains them). e_with: the error `hyp` leaves exactly; limit: what counts as explaining;
+// e_snap: the least error `hyp` leaves within its refinement's bound (the sampling snap's range).
+bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, out float2 best, out float e_best, out float e_with, out float limit, out float e_snap) {
+    best = hyp; e_best = 0; e_with = 0; limit = 0; e_snap = 0;
     Window win = window_at(p);
     bool textured = win.contrast >= kTotalTextureMin;
     if (textured) {
         float4 z = refine(p, hyp, win);
-        best = z.xy; e_best = z.z; e_with = z.w;
+        best = z.xy; e_best = z.z; e_snap = z.z; e_with = z.w;
         if (raw_on && any(raw != hyp)) {
             float4 r = refine(p, raw, win);
             if (r.z <= z.z) { best = r.xy; e_best = r.z; }
@@ -305,8 +317,8 @@ void fit_sample(uint3 id : SV_DispatchThreadID) {
         float2 p = float2(c) + 0.5 - float2(jitter_x, jitter_y);
         float2 q = p + raw;
         bool raw_on = have_raw && q.x >= 0.0 && q.y >= 0.0 && q.x <= float(w) && q.y <= float(h);
-        float2 best; float e_best, e_with, limit;
-        bool confirmed = best_vector(p, float2(0, 0), raw_on, raw, best, e_best, e_with, limit);
+        float2 best; float e_best, e_with, limit, e_snap;
+        bool confirmed = best_vector(p, float2(0, 0), raw_on, raw, best, e_best, e_with, limit, e_snap);
         o = float4(best, nearness_of(t_color[c].x), confirmed ? 1.0 : 0.0);
     }
     u_enc[id.xy] = o;
@@ -547,11 +559,20 @@ void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             bool have_screen = t_res[int2(6, 0)].x > 0.5;
             float2 hyp = 0;
             if (have_screen) hyp = screen_at(p, min(nearness_of(t_color[id.xy].x), t_res[int2(5, 0)].y));
-            float2 best; float e_best, e_with, limit;
-            if (best_vector(p, hyp, raw_on, raw, best, e_best, e_with, limit)) {
+            float2 best; float e_best, e_with, limit, e_snap;
+            if (best_vector(p, hyp, raw_on, raw, best, e_best, e_with, limit, e_snap)) {
                 valid = 1.0;
-                // The hypothesis stands unless the pixel's own vector explains the picture clearly better.
-                bool with_screen = all(best == hyp) || (e_with <= limit && !(e_best <= kTotalStillRatio * e_with));
+                // The hypothesis stands unless the pixel's own vector explains the picture clearly
+                // better. With a model: inside the sampling snap's range the pictures cannot tell
+                // motion from sampling, and outside it the own vector must beat the best the model
+                // does anywhere inside.
+                bool with_screen;
+                if (have_screen) {
+                    bool outside = any(abs(best - hyp) > kTotalBound);
+                    with_screen = !outside || (e_snap <= limit && !(e_best <= kTotalStillRatio * e_snap));
+                } else {
+                    with_screen = all(best == hyp) || (e_with <= limit && !(e_best <= kTotalStillRatio * e_with));
+                }
                 if (with_screen) { why = 7; v = hyp; }
                 else { why = 0; v = best; }
             } else if (have_screen) { v = hyp; valid = kTotalApproximate; why = 2; }
