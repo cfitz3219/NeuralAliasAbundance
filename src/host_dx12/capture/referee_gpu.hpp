@@ -16,6 +16,7 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <vector>
+#include "core/referee_selection.hpp"
 
 namespace na::referee::gpu {
 
@@ -30,6 +31,7 @@ struct Evaluation {
     bool reset = false;               // DLSS history reset: no pair across it
     bool owns_present = false;        // render-small: the output is the presented image (not judged)
     bool mv_jittered = false;
+    shadow::Context context;
 };
 
 using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
@@ -40,6 +42,7 @@ struct Presentation {
     bool eligible = false;
     bool submitted = false;
     bool native11 = false;
+    shadow::Context alternate;
 };
 
 // Cheap: whether the next evaluation should be offered (a sample is due or half taken).

@@ -10,6 +10,7 @@
 #include "referee_gpu_scene.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
 #include "host_dx12/background/work.hpp"
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
 
 #include <cmath>
@@ -108,6 +109,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     CHECK(rg::Wanted());
     rg::Evaluation e;
     e.color = im.prev; e.output = im.output; e.motion = im.motion;
+    e.context = {{na::referee::shadow::Path::Inline, 22}, 1, 2, 3, 0, rs::kW, rs::kH};
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterBefore[0]; e.jitter_y = rs::kJitterBefore[1];
     const uint32_t pre = rg::Record(l.list.Get(), e);
@@ -139,7 +141,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     CHECK(!rg::NeedsScreen({ordinal + 7, &d}));
     CHECK(!rg::NeedsScreen({ordinal, &l}));
     if (late && !blocked) ordinal += 7;
-    rg::OnPresent({ordinal, &d}, d.queue.Get(), im.screen, Execute);
+    rg::OnPresent({ordinal, &d, true, true}, d.queue.Get(), im.screen, Execute);
     if (blocked) {
         ComPtr<ID3D12Fence> presenting_done, producer_done;
         const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -219,6 +221,7 @@ int main()
     rg::EnableSampleReceiptForTests();
     na::settings::Get().referee_enabled.store(1);
     na::settings::Get().referee_every_ms.store(100);
+    na::settings::Get().referee_log_s.store(1);
     test::List l;
     REQUIRE(l.Create(d.device.Get()));
 
@@ -253,7 +256,7 @@ int main()
     }
 
     // 2. The screen shows DLSS's input.
-    Sleep(150);
+    Sleep(1050);
     if (TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), t_motion.Get(), t_screen_input.Get()}, got)) {
         Compare("screen shows the input", got.data, rs::Expected(prev, input, output, rs::ScreenImage(shows_input), motion));
         const na::referee::Verdicts v = rs::JudgeAlone(got.data);
@@ -261,6 +264,12 @@ int main()
         CHECK(v.result == Verdict::Fail);
         CHECK(v.motion == Verdict::Pass);
     }
+    const auto events = na::eventlog::Drain();
+    CHECK(std::any_of(events.begin(), events.end(), [](const auto& line) {
+        return line.find("referee_choice mode=preview") != std::string::npos &&
+               line.find("last=4 current=inline generation=3") != std::string::npos &&
+               line.find("input=1 action=hold") != std::string::npos;
+    }));
 
     // 3. Vectors half the real motion.
     Sleep(150);

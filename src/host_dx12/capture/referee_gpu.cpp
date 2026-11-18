@@ -60,6 +60,12 @@ struct State {
     bool done_screen = false, done_tiles = false, done_pair = false;
     float done_jitter_change = 0;
     na::referee::Window window;
+    shadow::Context captured_context;
+    shadow::Placement observed_alternate;
+    shadow::Evidence preview;
+    const void* preview_source = nullptr;
+    uint64_t preview_first = 0, preview_last = 0;
+    bool preview_exact = false;
     std::vector<float> data;
     Stats stats;
     bool keep_receipt = false;
@@ -261,6 +267,17 @@ void emit_window(bool force)
     char line[2048];
     na::referee::Format(line, sizeof line, g.window, na::referee::Judge(g.window));
     na::eventlog::Emit("referee", "%s", line);
+    if (g.preview.measured.samples) {
+        const auto choice = shadow::Preview(g.preview);
+        na::eventlog::Emit("referee_choice",
+                           "mode=preview first=%llu last=%llu current=%s generation=%llu samples=%u output=%u input=%u action=%s candidate=%s boundary=%llu why=\"%s\"",
+                           static_cast<unsigned long long>(g.preview_first), static_cast<unsigned long long>(g.preview_last),
+                           shadow::Name(g.preview.context.placement.path),
+                           static_cast<unsigned long long>(g.preview.context.generation), g.preview.measured.samples,
+                           g.preview.measured.output_frames, g.preview.measured.input_frames, choice.action,
+                           shadow::Name(choice.candidate.path), static_cast<unsigned long long>(choice.candidate.boundary), choice.reason);
+        g.preview = {};
+    }
     ++g.stats.logged;
     g.window = na::referee::Window();
     g.window_at = now;
@@ -301,6 +318,18 @@ void collect_sample()
     std::lock_guard<std::mutex> lock(g.m);
     if (mapped) {
         g.window.Add(score);
+        if (g.captured_context.placement.path != shadow::Path::None) {
+            if (!g.preview.measured.samples || g.preview_source != g.swapchain ||
+                !(g.preview.context == g.captured_context) || g.main_ordinal <= g.preview_last) {
+                g.preview = {};
+                g.preview.context = g.captured_context;
+                g.preview_source = g.swapchain;
+                g.preview_first = g.main_ordinal;
+            }
+            if (g.done_screen && g.preview_exact) g.preview.Add(score, g.observed_alternate);
+            else g.preview.Add({});
+            g.preview_last = g.main_ordinal;
+        }
         ++g.stats.samples;
         if (!g.data.empty()) {
             g.last.data.swap(g.data);
@@ -509,6 +538,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
         (e.output_w && output_desc.Width != e.output_w) || (e.output_h && output_desc.Height != e.output_h)) return 0;
     std::lock_guard<std::mutex> lock(g.m);
     if (g.phase == Phase::Stopped) return 0;
+    if (e.reset && g.preview.context == e.context) g.preview = {};
     watchdog();
     if (g.next_token == kMaxToken) { stop("the referee's recording identities are exhausted"); return 0; }
     const bool due = g.phase == Phase::Idle && GetTickCount64() >= g.next_at;
@@ -518,6 +548,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     if (due) {
         if (!ensure(kPrev, e.color)) { ++g.stats.failed; return 0; }
         copy(l, kPrev, e.color, e.color_state);
+        g.captured_context = e.context;
         g.pre_ordinal = e.present_ordinal;
         g.pre_jitter[0] = e.jitter_x;
         g.pre_jitter[1] = e.jitter_y;
@@ -528,6 +559,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     }
     if (e.present_ordinal <= g.pre_ordinal) return 0;
     if (!g.swapchain || e.present_ordinal != g.pre_ordinal + 1 || e.reset ||
+        !(g.captured_context == e.context) ||
         color_desc.Format != g.img[kPrev].desc.Format ||
         color_desc.Width != g.img[kPrev].desc.Width || color_desc.Height != g.img[kPrev].desc.Height) {
         ++g.stats.restarted;
@@ -547,6 +579,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     g.mv_scale[0] = e.mv_scale_x;
     g.mv_scale[1] = e.mv_scale_y;
     g.screen_elapsed = false;
+    g.preview_exact = false;
     ++g.stats.main;
     set_phase(Phase::MainRecorded);
     return g.token = ++g.next_token;
@@ -625,6 +658,12 @@ void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* pr
     if ((queue != g.pre_queue.Get() && !completed(g.pre_fence.Get(), g.pre_value)) ||
         (queue != g.main_queue.Get() && !completed(g.main_fence.Get(), g.main_value))) return;
     if ((!screen || !presented) && !g.have_motion) { retire(); return; }
+    g.preview_exact = screen && frame.submitted;
+    const auto& current = g.captured_context;
+    frame.alternate.width = current.width;
+    frame.alternate.height = current.height;
+    g.observed_alternate = g.preview_exact && current.SameScene(frame.alternate) &&
+        current.generation == frame.alternate.generation ? frame.alternate.placement : shadow::Placement{};
     compute(queue, screen ? presented : nullptr, exec);
 }
 
@@ -632,6 +671,8 @@ void InvalidatePresentation(const void* swapchain)
 {
     std::lock_guard<std::mutex> lock(g.m);
     if (g.swapchain && swapchain != g.swapchain) return;
+    if (g.preview_source == swapchain) g.preview = {};
+    g.preview_exact = false;
     switch (g.phase) {
     case Phase::PreRecorded: case Phase::MainRecorded:
         g.invalidated = true;

@@ -375,7 +375,8 @@ bool Armed()
 constexpr uint32_t kOwnMask = 0xff, kRefereeShift = 8;
 
 uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id,
-                       uint32_t render_w, uint32_t render_h, uint32_t output_w, uint32_t output_h)
+                       uint32_t render_w, uint32_t render_h, uint32_t output_w, uint32_t output_h,
+                       na::referee::shadow::Context context)
 {
     if (id.presentation_only || id.owns_present) return 0;
     na::referee::gpu::Evaluation e;
@@ -389,6 +390,9 @@ uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& p, const I
     e.jitter_x = id.jitter_x; e.jitter_y = id.jitter_y;
     e.mv_scale_x = id.mv_scale_x; e.mv_scale_y = id.mv_scale_y;
     e.reset = id.reset != 0;
+    context.width = render_w;
+    context.height = render_h;
+    e.context = context;
     return na::referee::gpu::Record(list, e) << kRefereeShift;
 }
 

@@ -627,7 +627,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.mv_scale_y = eval.mv_scale_y;
         id.reset = eval.reset;
         id.dlss_mv_jittered = eval.mv_jittered;
-        capture_token = capture::j2::RecordReferee(list, planes, id, eval.render_w, eval.render_h, eval.out_w, eval.out_h);
+        const referee::shadow::Context identity{
+            {referee::shadow::Path::Native11, static_cast<uint64_t>(frame.boundary)},
+            frame.color.incarnation, frame.depth.incarnation, frame.scene_stream, csub};
+        capture_token = capture::j2::RecordReferee(list, planes, id, eval.render_w, eval.render_h, eval.out_w, eval.out_h, identity);
     }
     // A measured scene cut that DLSS has not been reset for yet: the temporal output still holds the
     // old scene, so those frames show the picture DLSS was given instead. Decided on the GPU, in
