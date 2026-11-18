@@ -21,6 +21,7 @@
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_picture.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/capture/referee_gpu.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 
 #include <array>
@@ -210,6 +211,7 @@ void WritePattern(ID3D12GraphicsCommandList* l, const std::map<std::string, test
 
 int main(int argc,char** argv)
 {
+    const bool native_dlaa = argc > 1 && std::strstr(argv[1], "native-dlaa") != nullptr;
     const bool native_scale=argc>1&&std::strstr(argv[1],"--native-scale")!=nullptr;
     const bool native_merged=argc>1&&std::strstr(argv[1],"merged")!=nullptr;
     const bool native_late=argc>1&&std::strstr(argv[1],"late")!=nullptr;
@@ -257,7 +259,10 @@ int main(int argc,char** argv)
     g_queue = d.queue.Get();
     std::printf("step: install producers\n");
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
-    if(native_scale)na::j2::EnableNativeScaleBridge(true);
+    if (native_dlaa) {
+        na::settings::Get().referee_enabled.store(1);
+        na::j2::SetEnabled(true); // before descriptor creation
+    } else if (native_scale) na::j2::EnableNativeScaleBridge(true);
     // Every native-scale variant uses recording leases, as does production.
     // A Reset must create a new receipt, including the short direct-pass tests.
     if(native_scale) REQUIRE(na::observe::InstallListResetTracking(dev,na::nr::OnCommandListReset));
@@ -266,7 +271,7 @@ int main(int argc,char** argv)
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
     na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) { return na::dlss::Attach(device, fake::MakeApi()); });
 
-    constexpr uint32_t W = 64, H = 32;
+    const uint32_t W = native_dlaa ? 96 : 64, H = native_dlaa ? 48 : 32;
     auto color = test::CreateTexture(dev, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto depth = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
     auto cb = test::CreateBuffer(dev, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -382,16 +387,20 @@ int main(int argc,char** argv)
     };
 
     na::j2::SetEnabled(true);
-    na::settings::Get().j2_route.store(1); // fixed between-list route: frame-1 expectations (selector tested separately)
+    na::settings::Get().j2_route.store(native_dlaa ? 0 : 1); // fixed between-list route for the older cases
     na::j2::SetJitter(true); // J1 is off by default in the game; the tests exercise it
     // No discovery picks yet: untouched.
     na::observe::SetLiveSelection(0, 0);
-    frame(0);
-    CHECK(g_forwarded.size() == 2);
+    if (!native_dlaa) {
+        frame(0);
+        CHECK(g_forwarded.size() == 2);
+    }
     na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
     const int evals0 = fake::evals;
-    frame(0);
     auto st = na::j2::GetStats();
+    if (!native_dlaa) {
+    frame(0);
+    st = na::j2::GetStats();
     std::printf("frame 1: forwarded %zu, frames %llu, camera offset %llu, reason \"%s\"\n", g_forwarded.size(),
                 static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.camera_offset), st.reason);
     CHECK(g_forwarded.size() == 3 && g_forwarded[0] == scene.list.Get() && g_forwarded[2] == consumer.list.Get());
@@ -407,6 +416,7 @@ int main(int argc,char** argv)
     CHECK((fake::I(fake::last_create, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags) & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0);
     CHECK((fake::I(fake::last_create, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags) & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0);
     CHECK(st.frames == 1 && st.camera_offset == 80 && st.later_passes == 0);
+    }
 
     if(native_scale){
         // Actual native upscale operation; no SetUpscaleTarget, manual inline
@@ -414,8 +424,8 @@ int main(int argc,char** argv)
         // existing operation shadow must find the source/destination itself.
         constexpr uint32_t OW=96,OH=48;
         const bool late_fp16=native_earlier_input && std::strstr(argv[1],"fp16")!=nullptr;
-        const auto format=native_late&&!late_fp16?DXGI_FORMAT_R8G8B8A8_TYPELESS:DXGI_FORMAT_R16G16B16A16_FLOAT;
-        const auto view_format=native_late&&!late_fp16?DXGI_FORMAT_R8G8B8A8_UNORM:format;
+        const auto format=native_late&&!late_fp16&&!native_dlaa?DXGI_FORMAT_R8G8B8A8_TYPELESS:DXGI_FORMAT_R16G16B16A16_FLOAT;
+        const auto view_format=native_late&&!late_fp16&&!native_dlaa?DXGI_FORMAT_R8G8B8A8_UNORM:format;
         const auto flags=D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         auto native=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
         REQUIRE(native);
@@ -471,9 +481,15 @@ int main(int argc,char** argv)
         D3D12_ROOT_SIGNATURE_DESC root_desc{1,&root_param,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
         test::ComPtr<ID3DBlob> serialized,error,shader;
         REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&root_desc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error)));
-        REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&native_root))));
+        const HRESULT native_root_hr = dev->CreateRootSignature(0, serialized->GetBufferPointer(),
+            serialized->GetBufferSize(), IID_PPV_ARGS(&native_root));
+        if (FAILED(native_root_hr)) {
+            std::printf("native root failure HRESULT=0x%08lx device=0x%08lx\n",
+                        static_cast<unsigned long>(native_root_hr), static_cast<unsigned long>(dev->GetDeviceRemovedReason()));
+        }
+        REQUIRE(SUCCEEDED(native_root_hr));
         const char hlsl[]=R"(Texture2D<float4> image:register(t0);RWTexture2D<float4> output:register(u0);
-            [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){if(p.x<96&&p.y<48)output[p.xy]=image.Load(int3(p.xy*uint2(64,32)/uint2(96,48),0));})";
+            [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){uint w,h;image.GetDimensions(w,h);if(p.x<96&&p.y<48)output[p.xy]=image.Load(int3(p.xy*uint2(w,h)/uint2(96,48),0));})";
         REQUIRE(SUCCEEDED(D3DCompile(hlsl,sizeof hlsl,"native_stretch",nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&shader,&error)));
         test::ComPtr<ID3D12DescriptorHeap> native_rtvs;
         if(native_graphics){
@@ -499,7 +515,7 @@ int main(int argc,char** argv)
             auto hdr=sv;hdr.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
             dev->CreateShaderResourceView(color.Get(),&hdr,{base+2*increment});
             dev->CreateUnorderedAccessView(late.Get(),nullptr,&uv,{base+3*increment});
-            dev->CreateShaderResourceView(late.Get(),&sv,{base+4*increment});
+            dev->CreateShaderResourceView(native_dlaa ? color.Get() : late.Get(),&sv,{base+4*increment});
             dev->CreateUnorderedAccessView(decoy.Get(),nullptr,&uv,{base+5*increment});
             const char convert[]=R"(Texture2D<float4> src:register(t0);RWTexture2D<float4> dst:register(u0);
                 [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){dst[p.xy]=sqrt(src.Load(int3(p.xy,0)));})";
@@ -586,10 +602,10 @@ int main(int argc,char** argv)
             const auto base=heap->GetCPUDescriptorHandleForHeapStart().ptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC fp=sv;fp.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
             dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{base+7*increment});
-            dev->CreateShaderResourceView(late.Get(),&sv,{base+8*increment});
+            dev->CreateShaderResourceView(native_dlaa ? color.Get() : late.Get(),&sv,{base+8*increment});
             dev->CreateShaderResourceView(aux.Get(),&fp,{base+9*increment});
             dev->CreateUnorderedAccessView(native.Get(),nullptr,&uv,{base+10*increment});
-            dev->CreateShaderResourceView(late.Get(),&sv,{base+11*increment});
+            dev->CreateShaderResourceView(native_dlaa ? color.Get() : late.Get(),&sv,{base+11*increment});
             dev->CreateShaderResourceView(nullptr,&fp,{base+12*increment});
             dev->CreateShaderResourceView(decoy.Get(),&sv,{base+13*increment});
             if(native_latebind){
@@ -617,7 +633,10 @@ int main(int argc,char** argv)
             REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&d2,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error)));
             REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&se5_root))));
             const char up[]=R"(Texture2D<float4> image:register(t0);Texture2D<float4> aux:register(t1);RWTexture2D<float4> output:register(u0);
-                [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){if(p.x<96&&p.y<48)output[p.xy]=image.Load(int3(p.xy*uint2(64,32)/uint2(96,48),0))+min(aux.Load(int3(0,0,0)),0);})";
+                [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){uint w,h;image.GetDimensions(w,h);if(p.x<96&&p.y<48){
+                    float4 c=image.Load(int3(p.xy*uint2(w,h)/uint2(96,48),0))+min(aux.Load(int3(0,0,0)),0);
+                    output[p.xy]=w==96 ? float4(c.rgb*0.75,c.a) : c;
+                }})";
             test::ComPtr<ID3DBlob> cs;
             REQUIRE(SUCCEEDED(D3DCompile(up,sizeof up,"se5_upscale",nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&cs,&error)));
             D3D12_COMPUTE_PIPELINE_STATE_DESC c{};c.pRootSignature=se5_root.Get();c.CS={cs->GetBufferPointer(),cs->GetBufferSize()};
@@ -742,7 +761,8 @@ int main(int argc,char** argv)
             if(native_inherited)na::observe::ExecuteEnd(token,d.queue.Get(),count,ls);
         };
         for(unsigned iteration=0;iteration<iterations;++iteration){
-            d.WaitIdle();na::j2::OnPresent(d.queue.Get());
+            d.WaitIdle();
+            if (!native_dlaa) na::j2::OnPresent(d.queue.Get());
             const bool merged_reader=native_layout_change&&iteration>=90&&iteration<120;
             if((native_rotate && iteration==80) || (native_layout_change && (iteration==50 || iteration>=80))){
                 if(iteration==80)CHECK(late_deliveries>0);
@@ -781,7 +801,10 @@ int main(int argc,char** argv)
             ID3D12GraphicsCommandList* target_list=scene.list.Get();
             if(!native_merged){
                 REQUIRE(SUCCEEDED(scene.list->Close()));
-                if(native_close_race){
+                if (native_dlaa) {
+                    ID3D12CommandList* producer[]{scene.list.Get()};
+                    native_execute(1, producer);
+                } else if(native_close_race){
                     ID3D12CommandList* producer[]{scene.list.Get()};native_execute(1,producer);
                     // A future recording of the SAME scene closes while the
                     // current dispatch is forwarded, but is never submitted.
@@ -865,15 +888,18 @@ int main(int argc,char** argv)
                             std::swap(other.Transition.StateBefore,other.Transition.StateAfter);target_list->ResourceBarrier(1,&other);
                         }
                     }
-                    if(!native_layout_change){
+                    if (!native_layout_change && !native_dlaa) {
                         auto write=test::Transition(late.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                         target_list->ResourceBarrier(1,&write);
                         target_list->SetPipelineState(tonemap.Get());
                         target_list->SetComputeRootDescriptorTable(0,{base+2*increment});
                         target_list->Dispatch(W/8,H/8,1);
                     }
-                    auto read=test::Transition(late.Get(),native_layout_change?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    target_list->ResourceBarrier(1,&read);
+                    if (!native_dlaa) {
+                        auto read = test::Transition(late.Get(), native_layout_change ? D3D12_RESOURCE_STATE_RENDER_TARGET :
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        target_list->ResourceBarrier(1, &read);
+                    }
                     auto decoy_write=test::Transition(decoy.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     target_list->ResourceBarrier(1,&decoy_write);
                     target_list->SetPipelineState(native_pipeline.Get());
@@ -930,7 +956,7 @@ int main(int argc,char** argv)
             if(native_se5){
                 // The presenting list is separate (final_list, below).
                 auto end_late=test::Transition(late.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
-                target_list->ResourceBarrier(1,&end_late);
+                if (!native_dlaa) target_list->ResourceBarrier(1,&end_late);
                 target_list->ResourceBarrier(2,end_native);
                 if(merged_reader){
                     // The SAME screen conversion moves into this recording,
@@ -989,7 +1015,7 @@ int main(int argc,char** argv)
             }
             ID3D12CommandList* native_lists[]{scene.list.Get(),post.list.Get()};
             if(native_se5){
-                if(native_close_race){
+                if(native_close_race || native_dlaa){
                     native_execute(1,native_lists+1);
                 }else if(native_reverse && iteration>=2){
                     native_execute(1,native_lists+1);
@@ -1074,8 +1100,13 @@ int main(int argc,char** argv)
             }
             st=na::j2::GetStats();
             if(native_se5){
-                na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false);
-                na::j2::NativeProbePresent(d.queue.Get(),presented.Get(),nullptr);
+                na::referee::gpu::Presentation receipt;
+                if (native_dlaa) {
+                    receipt.swapchain = presented.Get(); // fixture's sole presenting surface
+                    na::j2::OnPresent(d.queue.Get(), &receipt);
+                }
+                na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false,receipt.ordinal,receipt.swapchain);
+                na::j2::NativeProbePresent(d.queue.Get(),presented.Get(),nullptr,receipt.ordinal,receipt.swapchain);
                 if(native_bindless){
 static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,sizeof tr,&n);if(n!=seen){seen=n;const char* pv=std::strstr(tr,"provisional");std::printf("bindless iteration %u trace %llu: %.160s | probe %.200s\n",iteration,(unsigned long long)n,pv?pv:"(none)",na::j2::GetNativeBridgeStats().probe);}}
                 d.WaitIdle();
@@ -1108,13 +1139,21 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     std::printf("se5 iteration %u: pattern %.3f %.3f %.3f native %.3f %.3f %.3f presented %.4f %.4f %.4f hud %.2f %.2f %.2f aux %s\n",iteration,
                         g_pattern[0],g_pattern[1],g_pattern[2],game[0],game[1],game[2],world[0],world[1],world[2],hud[0],hud[1],hud[2],iteration%2?"no":"yes");
                     (void)q;
+                    if (native_dlaa) {
+                        CHECK(st.render_w == W && st.render_h == H && st.out_w == W && st.out_h == H);
+                        const auto untouched = ReadTexel(d, decoy.Get(), OW-1, OH-1);
+                        for (int c = 0; c < 3; ++c) {
+                            CHECK(std::fabs(untouched[c] - .3f) < .002f);
+                            CHECK(std::fabs(game[c] - g_pattern[c] * .75f) < .002f);
+                        }
+                    }
                     for(int c=0;c<3;++c){
-                        CHECK(std::fabs(game[c]-g_pattern[c])<1.f/255.f+.001f);          // 8-bit store of the pattern
+                        if (!native_dlaa) CHECK(std::fabs(game[c]-g_pattern[c])<1.f/255.f+.001f);          // 8-bit store of the pattern
                         CHECK(std::fabs(world[c]-std::pow(game[c],2.2f))<.003f);           // the game's conversion of it
                     }
                 }else{
                     if(late_deliveries)std::printf("se5 iteration %u: no delivery: j2 \"%s\" bridge \"%s\"\n",iteration,st.reason,na::j2::GetNativeBridgeStats().reason);
-                    CHECK(fake::evals==before_native+int(late_deliveries));
+                    if (!native_dlaa) CHECK(fake::evals==before_native+int(late_deliveries));
                     if((native_reverse || native_tail) && final_recorded){
                         const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1);
                         const auto game=ReadTexel(d,native.Get(),OW-1,OH-1);
@@ -1161,6 +1200,12 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                 std::printf("se5 unseen: deliveries %u probe{%s} trace{%.400s}\n",late_deliveries,nbs.probe,trace);
                 CHECK(std::strstr(nbs.probe,"verified=1")!=nullptr && std::strstr(nbs.probe,"refuted=1")!=nullptr);
                 CHECK(late_deliveries>=2);
+            } else if (native_dlaa) {
+                std::printf("native DLAA: %u pixel-verified deliveries, probe{%s}, trace{%s}\n",
+                            late_deliveries, nbs.probe, trace);
+                CHECK(std::strstr(trace, "dlaa_screen_candidate=") && std::strstr(trace, "refuted=1"));
+                CHECK(std::strstr(nbs.probe, "verified=1") && std::strstr(nbs.probe, "refuted=1"));
+                CHECK(late_deliveries >= 2);
             }else if(native_bindless){
                 // Unreadable presenting dispatch: the decoy crossing was refuted by the
                 // screen probe, the game's upscale step confirmed, then delivered.
@@ -1177,7 +1222,7 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                 CHECK(late_deliveries>=2);
 
             }else if(false){ // the delivery probe is a fallback only now (no automatic delivery session)
-            }else if(native_se5){
+            }else if(native_se5 && !native_dlaa){
                 // The fixture arms the delivery probe (RequestDeliveryProbe); a confirmed verdict is a
                 // valid outcome, an unresolved one too (the probe is not a delivery condition).
                 CHECK(std::strstr(nbs.probe,"verdict=")!=nullptr);
@@ -1189,7 +1234,7 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                 CHECK(late_deliveries==0 && fake::evals==before_native && std::strstr(trace,"handoff=[")!=nullptr);
                 const auto nb=na::j2::GetNativeBridgeStats();
                 CHECK(nb.after_skipped>0);
-                CHECK(std::strstr(nb.reason,native_reverse?"not submitted before":"no list boundary")!=nullptr);            }else{
+                CHECK(std::strstr(nb.reason,native_reverse?"not submitted before":"no list boundary")!=nullptr);            }else if (!native_dlaa) {
                 if(native_se5&&!native_tail)CHECK(nbs.delivered==late_deliveries && nbs.order_refused==0 && (late_deliveries<2||nbs.best_streak>=2));
                 if(native_se5){
                     // Learned through the once-recorded presenting list (cached, last write),
@@ -1239,11 +1284,13 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
             na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false);
             CHECK(std::strstr(na::j2::GetNativeBridgeStats().stages,"learned=0")!=nullptr);
         }
+        if (!native_dlaa) {
         // Restore DLAA while the last post list remains closed/replayable. GPU
         // completion, rather than requiring its future Reset, permits resizing.
         na::j2::SetNativeRenderExtent(W,H,W,H);na::j2::OnPresent(d.queue.Get());frame(.5);
         st=na::j2::GetStats();CHECK(st.active&&st.render_w==W&&st.render_h==H&&st.out_w==W&&st.out_h==H);
         if(!native_reverse)CHECK(fake::evals==before_native+(native_late?int(late_deliveries):3)+1);
+        }
         test::ComPtr<ID3D12InfoQueue> info;
         if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&info)))) {
             for (UINT64 i=0;i<info->GetNumStoredMessages();++i) {

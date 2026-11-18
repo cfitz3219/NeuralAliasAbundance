@@ -3196,8 +3196,8 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame, na::referee
     const auto frame_format = frame->GetDesc().Format;
     const bool sdr = cs==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ||
         (cs==DXGI_COLOR_SPACE_CUSTOM && frame_format==DXGI_FORMAT_R8G8B8A8_UNORM);
-    na::j2::NativeTracePresent(queue,frame,sdr);
-    na::j2::NativeProbePresent(queue,frame,g_orig_execute);
+    na::j2::NativeTracePresent(queue, frame, sdr, receipt.ordinal, receipt.swapchain);
+    na::j2::NativeProbePresent(queue, frame, g_orig_execute, receipt.ordinal, receipt.swapchain);
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
     {
