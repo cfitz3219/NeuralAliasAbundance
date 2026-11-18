@@ -35,6 +35,9 @@ float slope(float m2, float m1, float c, float p1, float p2, float j, bool minus
 float at(int2 p) { return depth.Load(int3(clamp(p, int2(0, 0), last), 0)); }
 float ps(float4 position : SV_Position) : SV_Depth {
     int2 p = int2(position.xy);
+#ifdef NA_ACTIVE_DEPTH_RECT
+    if (any(p > last)) return depth.Load(int3(p, 0));
+#endif
     float2 offset = jitter;
 #ifdef NA_RASTER_EXPANSION
     offset += (position.xy - 0.5 * float2(last + 1)) * inverse_size;

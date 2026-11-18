@@ -148,7 +148,13 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present 
 // The hosted path receives DXGI events through the overlay's existing hooks.
 void SetScreenCheck(bool on);
 void RejectScreenProof(uint64_t proof);
-bool ObservePresent(void* swapchain);
+// The native provider closes the frame on the same hook that samples it.
+struct PresentReceipt {
+    uint64_t ordinal = 0;
+    bool scene = false;
+    bool submitted = false;
+};
+bool ObservePresent(void* swapchain, PresentReceipt* receipt = nullptr);
 void BeforeResize(void* swapchain);
 void AfterResize(void* swapchain, long result);
 class OwnWorkScope {

@@ -9,6 +9,7 @@
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_boot/session.hpp"
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
@@ -103,7 +104,6 @@ std::atomic<uint32_t> applied_preset{0}, applied_sharpness{0};
 std::atomic<uint64_t> companion_shaded{0};
 std::atomic<int> raster_slot{-1};
 std::atomic<bool> evaluation_capture_pending{false};
-std::atomic<uint64_t> delivered_frame{UINT64_MAX};
 
 bool Skip(const char* why)
 {
@@ -803,7 +803,6 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     if (eval.reset) s.last_reset_frame = frame.frame; // submitted and delivered: this is the reset a measured cut waits for
     (measured ? supplied_measured : supplied_camera).fetch_add(1, std::memory_order_relaxed);
     delivered.fetch_add(1, std::memory_order_relaxed);
-    delivered_frame.store(frame.frame, std::memory_order_release);
     delivered_size.store((uint64_t(ci.width) << 32) | ci.height, std::memory_order_relaxed);
     applied_preset.store(eval.preset, std::memory_order_relaxed);
     applied_sharpness.store(sharpened, std::memory_order_relaxed);
@@ -816,7 +815,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     return true;
 }
 
-void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
+void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue, const native11::PresentReceipt& receipt)
 {
     if (const auto lost_proof = referee::gpu::TakeNativeScreenLoss(swap))
         native11::RejectScreenProof(lost_proof);
@@ -831,11 +830,19 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
         uint64_t native_done = 0, effects_done = 0;
     };
     static auto* state = new std::unique_ptr<PresentCopy>;
-    const auto stats = native11::Stats();
-    const referee::gpu::Presentation frame{stats.frames - 1, swap, true,
-        delivered_frame.load(std::memory_order_acquire) == stats.frames - 1, true};
+    const referee::gpu::Presentation frame{receipt.ordinal, swap, receipt.scene, receipt.submitted, true};
+    const bool witness = referee::gpu::NeedsScreen(frame);
+    ComPtr<ID3D12CommandQueue> evaluation_queue;
+    if (witness || eval || burst) {
+        // The inputs, copies and witness reduction must use the same queue.
+        // The overlay's separate queue can reach Present before our sample
+        // fence completes, even when both queues belong to the same device.
+        std::lock_guard<std::mutex> lock(mutex);
+        evaluation_queue = State().queue;
+    }
+    auto* queue = evaluation_queue ? evaluation_queue.Get() : fallback_queue;
     const auto execute = [](ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) { q->ExecuteCommandLists(n, lists); };
-    if (eval) capture::j2::OnFrameClosed(stats.frames - 1, 0);
+    if (eval) capture::j2::OnFrameClosed(receipt.ordinal, 0);
     const auto complete = [queue, eval, burst, frame, execute](ID3D12Resource* image) {
         if (eval) capture::j2::OnPresent(queue, image, execute, frame);
         else referee::gpu::OnPresent(frame, queue, image, execute);
@@ -846,9 +853,21 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
             capture::OnPresent(queue, image, false);
         }
     };
-    if (!eval && !burst && !referee::gpu::NeedsScreen(frame)) return complete(nullptr);
+    if (!eval && !burst && !witness) return complete(nullptr);
+    const auto unavailable = [&](const char* stage, HRESULT hr = S_OK) {
+        static uint64_t next_log = 0;
+        const auto now = GetTickCount64();
+        if (witness && now >= next_log) {
+            next_log = now + 5000;
+            na::eventlog::Emit("native11_witness", "frame=%llu missed=%s hr=0x%08lx",
+                               static_cast<unsigned long long>(receipt.ordinal), stage, static_cast<unsigned long>(hr));
+        }
+        complete(nullptr);
+    };
+    if (!queue || (witness && !evaluation_queue)) return unavailable("evaluation_queue");
     ComPtr<ID3D11Texture2D> backbuffer;
-    if (!queue || FAILED(swap->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) return complete(nullptr);
+    HRESULT hr = swap->GetBuffer(0, IID_PPV_ARGS(&backbuffer));
+    if (FAILED(hr)) return unavailable("backbuffer", hr);
     native11::OwnWorkScope own;
     observe::HostWorkScope host_work;
     D3D11_TEXTURE2D_DESC desc{};
@@ -856,25 +875,25 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* queue)
     ComPtr<ID3D11Device> native;
     backbuffer->GetDevice(&native);
     const ImageDesc image{desc.Width, desc.Height, desc.Format};
-    if (!CompatibleImageCopy(desc, 0, image)) return complete(nullptr);
+    if (!CompatibleImageCopy(desc, 0, image)) return unavailable("incompatible_backbuffer");
     auto& copy = *state;
     if (!copy || copy->queue.Get() != queue || copy->native.Get() != native.Get() ||
         copy->image.Description().width != image.width || copy->image.Description().height != image.height ||
         copy->image.Description().format != image.format) {
-        if (copy && !copy->fences.Retired(copy->native_done, copy->effects_done)) return complete(nullptr);
+        if (copy && !copy->fences.Retired(copy->native_done, copy->effects_done)) return unavailable("old_copy_in_flight");
         auto next = std::make_unique<PresentCopy>();
         ComPtr<ID3D12Device> effects;
-        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&effects))) ||
-            FAILED(next->image.Create(native.Get(), effects.Get(), image)) ||
-            FAILED(next->fences.Create(native.Get(), effects.Get(), queue))) return complete(nullptr);
+        if (FAILED(hr = queue->GetDevice(IID_PPV_ARGS(&effects))) ||
+            FAILED(hr = next->image.Create(native.Get(), effects.Get(), image)) ||
+            FAILED(hr = next->fences.Create(native.Get(), effects.Get(), queue))) return unavailable("create_copy", hr);
         next->native = native;
         next->queue = queue;
         copy = std::move(next);
     }
-    if (copy->effects_done && FAILED(copy->fences.WaitNative(copy->effects_done))) return complete(nullptr);
+    if (copy->effects_done && FAILED(hr = copy->fences.WaitNative(copy->effects_done))) return unavailable("native_wait", hr);
     copy->fences.NativeContext()->CopySubresourceRegion(copy->image.Native(), 0, 0, 0, 0, backbuffer.Get(), 0, nullptr);
-    if (FAILED(copy->fences.SignalNative(&copy->native_done)) ||
-        FAILED(copy->fences.WaitEffects(copy->native_done))) return complete(nullptr);
+    if (FAILED(hr = copy->fences.SignalNative(&copy->native_done)) ||
+        FAILED(hr = copy->fences.WaitEffects(copy->native_done))) return unavailable("submit_copy", hr);
     complete(copy->image.Effects());
     copy->fences.SignalEffects(&copy->effects_done);
 }

@@ -454,6 +454,16 @@ int main()
                        false, nullptr, nullptr, false, false, false, false, 18));
     CHECK(!rg::TakeNativeScreenLoss(&d)); // a new proof does not inherit the old failures
     Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), nullptr, tiny_output.Get()}, got,
+                       false, nullptr, nullptr, false, false, false, false, 19));
+    CHECK(!rg::TakeNativeScreenLoss(&d));
+    ++ordinal; // prefer the other parity for this second witness of proof 18
+    Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), nullptr, tiny_input.Get()}, got,
+                       false, nullptr, nullptr, false, false, false, false, 18));
+    CHECK(rg::TakeNativeScreenLoss(&d) == 18);
+    CHECK(!rg::TakeNativeScreenLoss(&d)); // proof 19 stays qualified
+    Sleep(150);
     REQUIRE(rg::Wanted());
     rg::Evaluation discarded;
     discarded.color = t_input.Get();
