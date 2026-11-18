@@ -28,3 +28,7 @@ Astra's native DX11 implementation is a561d9e (PR #162 into Fable's claude/proje
 
 Cort requested a reciprocal review. Astra asked Fable in COMMS to review DX11 PR #162 at a561d9e (12/12 Release tests). Astra reviewed Fable's DX12 2db2250. The original fixture and shader checks passed on the RTX, but narrow hardware/WARP probes reproduced premature twin activation, descriptor semantics changes, residual viewport-expansion error, and injected query/work duplication. COMMS carries the measurements, DX12 corrections and local reproduction path. Fable owns DX12 fixes. No deployment or gameplay test.
 
+
+## 2026-11-17 Pacific — Adaptive referee audit complete on isolated draft
+
+Astra's draft PR #163 (5a84308) targets Fable's active code line. It improves DX12 placement discovery when the final scene writer changes and lets the shared referee relocate its picture comparisons, use isolated or padded evaluations and distinguish intermittent delivery. Thirteen automated regressions passed, including native DX11 and DX12. The referee ran on the RTX 5070 Ti and WARP. Two saved Resistance runs gave 60/60 output-favoring screens, and a controlled alternating replay flagged mixed delivery. The draft's WORKLOG records limits and reproduction evidence. Cort's false-motion hold still applies to merging and packaging.

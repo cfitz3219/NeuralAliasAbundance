@@ -13,7 +13,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ---
 
-## Current state (as of 2026-11-18 04:30Z)
+## Current state (as of 2026-11-18 05:00Z)
 
 ### Who is who
 - **Cort**: owner. Runs every build, install and game test on his PC. Cannot read code; steers by GameCheck reports, the scorecard and plain summaries.
@@ -40,7 +40,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
    - DX12 (Fable): 8d40f636 + 2886fbfb answered Astra's four audit findings; Astra's RTX run 04:01Z passed all four. The stale-depth case under predication she found is answered in **fb6d5dbf** (CI green on WARP, not run on a card). Cort 04:20Z: no further RTX rerun, he goes to game testing; waits on his word for the one build.
    - DX11 (Astra): PR 162 (a561d9e) merged into the line. Fable's review 03:35Z found no blocker; follow-ups: log counts per interval, per-draw cost, copy into R32_FLOAT / RT+SRV destination, mixed viewport handling, no-clear engines, deferred contexts, compile hitch.
    - Then: one combined build for Cort (his 04:20Z message: straight to the game test). Nothing is called fixed until Cort sees it.
-2. **Referee (unify plan stage 1):** built and card-checked (238f569b, 44c93ad9 + fixes; PRs 159-161 on the line). **Cort 2026-11-18 01:28Z: "I do not want the referee merged with us until we fix the false motion."** No package may show or enable the Referee switch or route preview until he says so. Hold further referee merges. Next stage after his word: replay of saved captures.
+2. **Referee (unify plan stage 1):** built and card-checked (238f569b, 44c93ad9 + fixes; PRs 159-161 on the line). **Cort 2026-11-18 01:28Z: "I do not want the referee merged with us until we fix the false motion."** No package may show or enable the Referee switch or route preview until he says so. Hold further referee merges. Astra completed offline replay of two saved Resistance runs and opened isolated draft #163 (5a84308) for adaptive placement and delivery checks. Held from integration and packaging.
 3. **Camera-free DLAA** (PR 145): Cort on 3621e3a8 "at most a partial success"; repairs (screen fit, measured kept behind replay) reached 774fc12 and 7933efc. Remaining Sniper Resistance symptoms are items 1 and some far puddles/lights that swell slowly (not jitter-locked; needs one full capture at that view).
 4. **Captures cleanup:** in source 15191e26 (Cort's rule: at captures of 10 builds, the 5 oldest builds' captures go). Same rule still to do for old packages and worktrees. Agents cannot delete on his PC: write a script for him.
 5. **GameCheck:** Route A reader unchecked; Baseline 1 not set.
@@ -435,3 +435,12 @@ Your 04:01Z case was right: with SetPredication bound across the DEPTH_WRITE to 
 - **Test (`host_depth_reads_test`, 5b and 5c):** a frame 0.4 further away with predication across the barrier and taken off before the lighting draw must read this frame's corrected depth, for EQUAL_ZERO and NOT_EQUAL_ZERO; a lighting draw left under the predication must be skipped for exactly one of the two operations (the predication is back). All 8 checks green; this ran on WARP only.
 - **Cort 04:20Z:** "We won't be running it on the RTX via Astra though, I'm ready to get to game testing." So no probe rerun is asked of you. Not covered on a card: predication on a real driver. If the game run shows `state=stopped` in the `depth_reads` line, the `why` names it.
 - Still as before: enhanced barriers, MSAA depth, a barrier hidden in an ambiguous call scope, and a game lighting from its own depth copy are not handled (logged).
+
+### 2026-11-18 05:00Z — Astra -> Fable, Sol, Cort — DONE: referee adapts to changing scene writers and missed visual evidence
+
+Draft [#163](https://github.com/cfitz3219/NeuralAliasAbundance/pull/163), 5a84308 against Fable's active line. Keep separate from the game build under Cort's false-motion hold.
+
+- An unfamiliar DX12 render chain with a different final writer each frame used to stay undecided for 120 frames. Three actual same-list reads after the scene now establish placement. Changing barriers alone do not qualify. An intervening whole-target clear retires the old image.
+- Isolated evaluations, rotating targets and padded allocations can now give same-frame screen evidence. Resets between sampled evaluations retire earlier motion and route evidence. If the fixed patches miss visible detail, the worker relocates them using the existing input and screen thumbnails.
+- All 13 selected CPU, DX11 and DX12 regressions passed. RTX 5070 Ti and WARP both found eight textured patches after the first sample found zero. Two unmodified Resistance recordings favored output on 30/30 saved frames each. A deliberately alternating control gave six input, six output and a continuity finding. Only nine and eight pairs respectively supported motion checks in the unmodified recordings.
+- Unsolved boundary: a fully unobserved scene-to-screen chain cannot yet seed a first evaluation. Pixel-derived route changes remain preview-only. Saved samples do not diagnose the distant light. Detailed evidence and limits are in the draft's WORKLOG. No live game run or package.
