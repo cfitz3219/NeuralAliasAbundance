@@ -2,6 +2,7 @@
 
 #include "host_dx12/capture/screen_marker.hpp"
 #include "host_dx12/native11/frame_model.hpp"
+#include "host_dx12/j2/post_entry.hpp"
 
 #include <d3d11_1.h>
 #include <wrl/client.h>
@@ -32,9 +33,12 @@ public:
     struct Reader {
         uint64_t output = 0, shader = 0;
         UINT slot = 0, format = 0;
+        uint64_t color = 0, depth = 0, writer = 0;
+        uint32_t context = 0;
         bool operator==(const Reader& other) const
         {
-            return output == other.output && shader == other.shader && slot == other.slot && format == other.format;
+            return output == other.output && shader == other.shader && slot == other.slot && format == other.format &&
+                   color == other.color && depth == other.depth && writer == other.writer && context == other.context;
         }
         explicit operator bool() const { return output && shader; }
     };
@@ -49,25 +53,104 @@ public:
         color_ = color;
         depth_ = depth;
         verified_ = {};
-        rejected_.clear();
+        adaptive_ = std::find(adaptive_scenes_.begin(), adaptive_scenes_.end(), std::pair{color, depth}) != adaptive_scenes_.end();
+        legacy_rejected_.clear();
         ordinary_gaps_ = 0;
         ordinary_this_frame_ = false;
         ResetAttempt();
+        ResetFrame();
+    }
+
+    void ResetPlacement()
+    {
+        SetScene(0, 0);
+        adaptive_ = false;
+        adaptive_scenes_.clear();
+        routes_.clear();
+        rejected_.clear();
+        entries_.Clear();
+        ResetFrame();
+    }
+
+    bool Adaptive() const { return adaptive_; }
+    bool Active() const { return color_ || depth_ || !adaptive_scenes_.empty(); }
+
+    void NoteOrdinalPixel(uint32_t draws) { ordinal_draws_ = draws; }
+
+    void Write(uint64_t writer)
+    {
+        ++epoch_;
+        writer_ = writer;
+        entries_since_write_ = 0;
+        if (!adaptive_) return;
+        na::j2::ColorEvent entry{};
+        entry.write = true;
+        entry.producer = writer;
+        if (!sequence_.empty() && sequence_.back().write) sequence_.back() = entry;
+        else Append(entry);
+    }
+
+    // Use the DX12 role profile on executed reads. The input binding slot is
+    // the DX11 equivalent of the consumer's resource layout. Consecutive
+    // writes are collapsed: only the producer of the newest content matters.
+    bool Learn(Reader& reader, UINT width, UINT height)
+    {
+        if (!writer_ || !reader.color || !reader.depth || truncated_) return false;
+        na::j2::InsertionEvent event;
+        event.op = na::j2::Op::GraphicsEntry;
+        event.pipeline = reader.shader;
+        event.root = (reader.color << 8) | (uint64_t(reader.slot) + 1);
+        event.destination = reader.output;
+        event.dst_w = width;
+        event.dst_h = height;
+        event.dst_fmt = reader.format;
+        event.producer = writer_;
+        event.context = na::j2::EntryContext(true, ++entries_since_write_);
+        na::j2::ColorEvent entry{};
+        entry.op = event.op;
+        entry.raw = event;
+        Append(entry);
+        reader.writer = writer_;
+        // The same shader/target/producer can be terminal and intermediate.
+        // Only qualify by order since this write when the broader role is ambiguous.
+        if (entries_.AcceptedByContext(event)) reader.context = event.context;
+        return !truncated_ && entries_.Accepts(event);
     }
 
     bool Verified(Id color, Id depth) const { return color_ == color && depth_ == depth && !!verified_; }
     bool Matches(Reader reader) const { return reader == verified_; }
-    uint64_t Proof() const { return verified_ ? proof_ : 0; }
+    uint64_t Proof() const { return adaptive_ ? frame_proof_ : verified_ ? proof_ : 0; }
+
+    bool Select(Reader reader)
+    {
+        if (!adaptive_) return Matches(reader);
+        for (const auto& route : routes_) {
+            if (reader == route.reader) {
+                frame_proof_ = route.proof;
+                delivery_epoch_ = epoch_;
+                return true;
+            }
+        }
+        return false;
+    }
 
     bool RejectProof(uint64_t proof)
     {
-        if (!proof || proof != Proof()) return false;
+        if (!proof) return false;
+        const auto match = std::find_if(routes_.begin(), routes_.end(),
+            [proof](const Route& route) { return route.proof == proof; });
+        if (match != routes_.end()) {
+            Reject(match->reader);
+            routes_.erase(match);
+            return true;
+        }
+        if (!verified_ || proof != proof_) return false;
         RetireVerified();
         return true;
     }
     bool MayInspect() const
     {
-        return verified_ || (!ordinary_this_frame_ && ordinary_gaps_ >= kOrdinaryGrace);
+        return adaptive_ || verified_ || (!ordinary_this_frame_ && ordinary_gaps_ >= kOrdinaryGrace);
     }
     bool AwaitingSamples() const { return !!candidate_; }
     uint64_t Confirmed() const { return confirmed_; }
@@ -78,8 +161,13 @@ public:
     Mark Begin(ID3D11DeviceContext* context, Reader reader, ID3D11Texture2D* source,
                DXGI_FORMAT view_format, uint64_t frame, uint32_t scene_draws)
     {
-        if (verified_ || marked_ ||
-            std::find(rejected_.begin(), rejected_.end(), reader) != rejected_.end()) return {};
+        // A rare branch may disappear while another needs qualification.
+        // Keep known routes and only abandon the incomplete sampling attempt.
+        if (adaptive_ && candidate_ && !marked_ && issued_ < screen_marker::kSession &&
+            frame - last_marked_ >= 2 * screen_marker::kSession) ResetAttempt();
+        const auto& rejected = adaptive_ ? rejected_ : legacy_rejected_;
+        if (verified_ || marked_ || (adaptive_ && frame_proof_) ||
+            std::find(rejected.begin(), rejected.end(), reader) != rejected.end()) return {};
         if (candidate_ && !(reader == candidate_)) return {};
         if (candidate_ && !seen_) {
             seen_ = true;
@@ -127,6 +215,8 @@ public:
         immediate->ClearView(marker_view_.Get(), low_rgba, low.data(), kPairs);
         marked_ = seen_ = true;
         reader_draws_ = scene_draws;
+        marked_epoch_ = epoch_;
+        last_marked_ = frame;
         ++issued_;
         return mark;
     }
@@ -155,18 +245,47 @@ public:
     const char* Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
                         uint32_t scene_draws)
     {
+        const auto finish = [&](const char* outcome) {
+            ResetFrame();
+            return outcome;
+        };
         const bool ordinary_completed = ordinary_this_frame_ && ordinary_draws_ == scene_draws;
         ordinary_this_frame_ = false;
-        if (ordinary_completed) {
+        if (!adaptive_ && ordinal_draws_ && scene_draws > ordinal_draws_) {
+            adaptive_ = true;
+            if (adaptive_scenes_.size() >= 16) adaptive_scenes_.erase(adaptive_scenes_.begin());
+            adaptive_scenes_.emplace_back(color_, depth_);
+            verified_ = {};
+            legacy_rejected_.clear();
+            ResetAttempt();
+            return finish("draw_order_changed");
+        }
+        if (adaptive_) {
+            if (!truncated_) entries_.Observe(sequence_, true, frame);
+            if (frame_proof_ && delivery_epoch_ != epoch_) {
+                RejectProof(frame_proof_);
+                if (marked_ && (marked_epoch_ != epoch_ || truncated_)) ResetAttempt();
+                else marked_ = false;
+                return finish("adaptive_later_scene_write");
+            }
+            // The candidate may be absent on a different draw order. Only
+            // its own sampled frames can qualify or disprove it.
+            if (marked_ && (marked_epoch_ != epoch_ || truncated_)) {
+                Reject(candidate_);
+                ResetAttempt();
+                return finish("adaptive_candidate_mid_scene");
+            }
+        }
+        if (!adaptive_ && ordinary_completed) {
             ordinary_gaps_ = 0;
             if (candidate_ || verified_) {
                 verified_ = {};
                 ResetAttempt();
-                return "ordinary_restored";
+                return finish("ordinary_restored");
             }
-            return nullptr;
+            return finish(nullptr);
         }
-        if (scene_draws && ordinary_gaps_ < kOrdinaryGrace) ++ordinary_gaps_;
+        if (!adaptive_ && scene_draws && ordinary_gaps_ < kOrdinaryGrace) ++ordinary_gaps_;
 
         if (verified_) {
             // An eligible success ages a previous miss instead of erasing it. A
@@ -176,19 +295,19 @@ public:
             delivered_this_frame_ = false;
             if (overwritten || (missed && recent_miss_)) {
                 RetireVerified();
-                return "lost_coverage";
+                return finish("lost_coverage");
             }
             if (missed) recent_miss_ = screen_marker::kSession;
             else if (scene_draws && recent_miss_) --recent_miss_;
-            return nullptr;
+            return finish(nullptr);
         }
-        if (!candidate_) return nullptr;
+        if (!candidate_) return finish(nullptr);
         // Only a reader seen at the right point on every scene frame can earn
         // control. The staging samples may finish later than those draws.
-        if (scene_draws && (!seen_ || reader_draws_ != scene_draws)) {
+        if (!adaptive_ && scene_draws && (!seen_ || reader_draws_ != scene_draws)) {
             Reject(candidate_);
             ResetAttempt();
-            return "intermittent";
+            return finish("intermittent");
         }
         if (context) Collect(context);
         if (marked_ && scene_draws && context && screen) {
@@ -211,27 +330,51 @@ public:
             }
         }
         marked_ = seen_ = false;
-        if (frame - opened_ < 32 && (issued_ < screen_marker::kSession ||
-            std::any_of(slots_.begin(), slots_.end(), [](const auto& slot) { return slot.pending; }))) return nullptr;
+        const uint64_t deadline = adaptive_ ? 96 : 32;
+        if (frame - opened_ < deadline && (issued_ < screen_marker::kSession ||
+            std::any_of(slots_.begin(), slots_.end(), [](const auto& slot) { return slot.pending; }))) return finish(nullptr);
         const bool sampled_all = samples_ == screen_marker::kSession;
         const bool confirmed = sampled_all && (follow_ == samples_ || invert_ == samples_);
         const bool refuted = sampled_all && flat_ == samples_;
         const bool intermittent = sampled_all && (follow_ || invert_) && !confirmed;
         if (confirmed) {
-            verified_ = candidate_;
-            proof_ = ++next_proof_;
+            if (adaptive_) {
+                if (routes_.size() >= 24) routes_.erase(routes_.begin());
+                routes_.push_back({candidate_, ++next_proof_});
+            } else {
+                verified_ = candidate_;
+                proof_ = ++next_proof_;
+            }
             ++confirmed_;
         } else {
-            Reject(candidate_);
+            // A recurring order that did not appear often enough can retry.
+            // Measured bypasses and contradictory placements are retained.
+            if (!adaptive_ || sampled_all) Reject(candidate_);
             if (refuted) ++refuted_;
         }
         ResetAttempt();
-        if (confirmed) return "confirmed";
-        if (refuted) return "refuted";
-        return intermittent ? "intermittent_screen" : "inconclusive";
+        if (confirmed) return finish(adaptive_ ? "adaptive_confirmed" : "confirmed");
+        if (refuted) return finish("refuted");
+        return finish(intermittent ? "intermittent_screen" : "inconclusive");
     }
 
 private:
+    struct Route { Reader reader; uint64_t proof; };
+
+    void Append(const na::j2::ColorEvent& event)
+    {
+        if (sequence_.size() >= 64) truncated_ = true;
+        else sequence_.push_back(event);
+    }
+
+    void ResetFrame()
+    {
+        sequence_.clear();
+        entries_since_write_ = ordinal_draws_ = 0;
+        writer_ = frame_proof_ = epoch_ = 0;
+        delivered_this_frame_ = truncated_ = false;
+    }
+
     struct Slot {
         Texture image;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -332,8 +475,9 @@ private:
 
     void Reject(Reader reader)
     {
-        if (rejected_.size() >= 16) rejected_.erase(rejected_.begin());
-        rejected_.push_back(reader);
+        auto& rejected = reader.color ? rejected_ : legacy_rejected_;
+        if (rejected.size() >= 24) rejected.erase(rejected.begin());
+        rejected.push_back(reader);
     }
 
     void RetireVerified()
@@ -355,15 +499,23 @@ private:
         marked_ = seen_ = delivered_this_frame_ = false;
     }
 
+    na::j2::PostEntryProfile entries_;
+    std::vector<na::j2::ColorEvent> sequence_;
+    std::vector<Route> routes_;
+    std::vector<std::pair<Id, Id>> adaptive_scenes_;
+    bool adaptive_ = false, truncated_ = false;
+    uint32_t ordinal_draws_ = 0, entries_since_write_ = 0;
+    uint64_t writer_ = 0, epoch_ = 0, marked_epoch_ = 0, delivery_epoch_ = 0, frame_proof_ = 0;
+
     Id color_ = 0, depth_ = 0;
     Reader candidate_{}, verified_{};
-    std::vector<Reader> rejected_;
+    std::vector<Reader> rejected_, legacy_rejected_;
     Texture original_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> marker_view_;
     std::array<Slot, screen_marker::kSession> slots_{};
     UINT samples_ = 0, follow_ = 0, invert_ = 0, flat_ = 0;
     static constexpr uint32_t kOrdinaryGrace = 4;
-    uint64_t opened_ = 0;
+    uint64_t opened_ = 0, last_marked_ = 0;
     static inline uint64_t next_proof_ = 0; // all provider screen state is under the frame lock
     uint64_t proof_ = 0;
     uint32_t issued_ = 0, reader_draws_ = 0, recent_miss_ = 0, delivered_draws_ = 0;

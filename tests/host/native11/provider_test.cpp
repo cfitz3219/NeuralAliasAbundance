@@ -88,6 +88,7 @@ float4 vs_post(uint id : SV_VertexID) : SV_Position {
     return float4((id & 1) ? 1.0 : -1.0, (id & 2) ? 1.0 : -1.0, 0.5, 1.0);
 }
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
+float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
 float4 ps_screen_check(float4 p : SV_Position) : SV_Target { return float4(scene.Load(int3(int2(p.xy), 0)).rgb * 0.75, 1); }
@@ -797,25 +798,39 @@ int DepthReadFixture(Game& g, bool debug_layer)
 }
 #endif
 
-#if !defined(NA_TEST_NATIVE_DLAA)
-int ScreenCheckFixture(Game& game)
+int ScreenCheckFixture(Game& game, bool adaptive)
 {
     struct Surface {
         ComPtr<ID3D11Texture2D> picture;
         ComPtr<ID3D11RenderTargetView> rtv;
         ComPtr<ID3D11ShaderResourceView> srv;
-    } decoy, canvas, other_canvas;
+    } decoy, canvas, other_canvas, third_canvas;
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = game.w;
     desc.Height = game.h;
     desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    for (auto* surface : {&decoy, &canvas, &other_canvas}) {
+    for (auto* surface : {&decoy, &canvas, &other_canvas, &third_canvas}) {
         if (FAILED(game.device->CreateTexture2D(&desc, nullptr, &surface->picture)) ||
             FAILED(game.device->CreateRenderTargetView(surface->picture.Get(), nullptr, &surface->rtv)) ||
             FAILED(game.device->CreateShaderResourceView(surface->picture.Get(), nullptr, &surface->srv))) return 1;
     }
+#if defined(NA_TEST_NATIVE_DLAA)
+    const auto color_copy = [&](DXGI_FORMAT format) -> ComPtr<ID3D11Texture2D> {
+        auto staging = desc;
+        staging.Format = format;
+        staging.BindFlags = 0;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ComPtr<ID3D11Texture2D> result;
+        game.device->CreateTexture2D(&staging, nullptr, &result);
+        return result;
+    };
+    const auto before = color_copy(kSceneFormat), after = color_copy(kSceneFormat);
+    const auto shown = color_copy(DXGI_FORMAT_R8G8B8A8_UNORM);
+    if (!before || !after || !shown) return 1;
+#endif
     desc.Width = desc.Height = 1;
     desc.BindFlags = 0;
     desc.Usage = D3D11_USAGE_STAGING;
@@ -823,6 +838,10 @@ int ScreenCheckFixture(Game& game)
     ComPtr<ID3D11Texture2D> pixel;
     if (FAILED(game.device->CreateTexture2D(&desc, nullptr, &pixel))) return 1;
     auto code = Compile("ps_screen_check", "ps_5_0");
+    auto variant_code = Compile("ps_scene_variant", "ps_5_0");
+    ComPtr<ID3D11PixelShader> variant;
+    if (!variant_code || FAILED(game.device->CreatePixelShader(variant_code->GetBufferPointer(),
+        variant_code->GetBufferSize(), nullptr, &variant))) return 1;
     ComPtr<ID3D11PixelShader> composite;
     if (!code || FAILED(game.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &composite))) return 1;
     auto reader = [&](ID3D11RenderTargetView* target, ID3D11ShaderResourceView* input, ID3D11PixelShader* shader) {
@@ -850,20 +869,35 @@ int ScreenCheckFixture(Game& game)
         bool ordinary = true;
         uint64_t writes = 0;
         uint64_t proof = 0;
-    } evaluator{game};
+#if defined(NA_TEST_NATIVE_DLAA)
+        ID3D11Texture2D* before;
+        ID3D11Texture2D* after;
+#endif
+    } evaluator{game
+#if defined(NA_TEST_NATIVE_DLAA)
+        , true, 0, 0, before.Get(), after.Get()
+#endif
+    };
     auto consume = [](void* user, void* context, const na::native11::SceneFrame& frame) {
         auto& state = *static_cast<Evaluator*>(user);
         auto& g = state.game;
         if (!state.ordinary && !frame.screen_proof) return false;
         if (frame.color.d3d11_resource != g.color.Get() || frame.depth.d3d11_resource != g.depth.Get()) return false;
+        auto* ctx = static_cast<ID3D11DeviceContext*>(context);
+#if defined(NA_TEST_NATIVE_DLAA)
+        ctx->CopyResource(state.before, g.color.Get());
+        if (!na::native_d3d11::EvaluateFrame(nullptr, context, frame)) return false;
+        ctx->CopyResource(state.after, g.color.Get());
+#else
         const float replacement[]{.75f, .25f, .125f, 1.f};
-        static_cast<ID3D11DeviceContext*>(context)->ClearRenderTargetView(g.color_rtv.Get(), replacement);
+        ctx->ClearRenderTargetView(g.color_rtv.Get(), replacement);
+#endif
         ++state.writes;
         state.proof = frame.screen_proof;
         return true;
     };
     if (!na::native11::Install(game.device.Get(), consume, &evaluator)) return 1;
-    na::native11::SetCameraUse(na::native11::CameraUse::Optional);
+    na::native11::SetCameraUse(adaptive ? na::native11::CameraUse::Off : na::native11::CameraUse::Optional);
     // The synthetic quads use the opposite winding to the default cull state.
     D3D11_RASTERIZER_DESC raster{};
     raster.FillMode = D3D11_FILL_SOLID;
@@ -872,6 +906,133 @@ int ScreenCheckFixture(Game& game)
     ComPtr<ID3D11RasterizerState> visible;
     if (FAILED(game.device->CreateRasterizerState(&raster, &visible))) return 1;
     game.ctx->RSSetState(visible.Get());
+    if (adaptive) {
+        // Learn a numbered read on order A, then put a plausible draw at
+        // that number before more scene work. B and C both share A's inputs.
+        const auto render = [&](int order, bool check_pixels = false) {
+            Pump();
+            evaluator.proof = 0;
+            Scene(game.ctx.Get(), game, 0);
+            game.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            game.ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
+            if (order != 0) {
+                // Same reader as A, but in this order it receives unfinished colour.
+                reader(canvas.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
+            }
+            auto* rt = game.color_rtv.Get();
+            game.ctx->OMSetRenderTargets(1, &rt, game.dsv.Get());
+            game.ctx->VSSetShader(game.vs.Get(), nullptr, 0);
+            game.ctx->PSSetShader(variant.Get(), nullptr, 0);
+            SetObject(game.ctx.Get(), game, 2);
+            game.ctx->Draw(4, 0);
+            game.ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
+            if (order == 2) reader(decoy.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
+            auto& target = order == 2 ? third_canvas : order == 1 ? other_canvas : canvas;
+            reader(target.rtv.Get(), game.color_srv.Get(), game.ps_tonemap.Get());
+            reader(game.back_rtv.Get(), target.srv.Get(), composite.Get());
+            ComPtr<ID3D11Texture2D> screen;
+            if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) return false;
+            bool reached = false;
+            if (check_pixels && evaluator.proof) {
+#if defined(NA_TEST_NATIVE_DLAA)
+                na::native11::OwnWorkScope own;
+                game.ctx->CopyResource(shown.Get(), screen.Get());
+                struct Sample {
+                    ID3D11DeviceContext* ctx;
+                    ID3D11Texture2D* texture;
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    bool valid;
+                    Sample(ID3D11DeviceContext* context, ID3D11Texture2D* source)
+                        : ctx(context), texture(source), valid(SUCCEEDED(ctx->Map(texture, 0, D3D11_MAP_READ, 0, &map))) {}
+                    ~Sample() { if (valid) ctx->Unmap(texture, 0); }
+                    const uint8_t* At(UINT x, UINT y) const {
+                        return static_cast<const uint8_t*>(map.pData) + y * map.RowPitch + x * 4;
+                    }
+                } original{game.ctx.Get(), before.Get()}, evaluated{game.ctx.Get(), after.Get()},
+                  presented{game.ctx.Get(), shown.Get()};
+                unsigned different = 0, matches_output = 0;
+                if (original.valid && evaluated.valid && presented.valid) {
+                    const auto pixel = [](const uint8_t* bytes) {
+                        DirectX::PackedVector::XMFLOAT3PK packed;
+                        std::memcpy(&packed, bytes, sizeof(packed));
+                        DirectX::XMFLOAT3 rgb;
+                        DirectX::XMStoreFloat3(&rgb, DirectX::PackedVector::XMLoadFloat3PK(&packed));
+                        const auto channel = [](float linear) {
+                            return int(std::lround(std::lround(std::clamp(linear, 0.f, 1.f) * 255.f) * .75f));
+                        };
+                        return std::array<int, 3>{channel(rgb.x), channel(rgb.y), channel(rgb.z)};
+                    };
+                    for (UINT y = 0; y < game.h; y += 2) {
+                        for (UINT x = 0; x < game.w; x += 2) {
+                            const auto input = pixel(original.At(x, y));
+                            const auto output = pixel(evaluated.At(x, y));
+                            const auto* display = presented.At(x, y);
+                            for (int rgb = 0; rgb < 3; ++rgb) {
+                                if (std::abs(output[rgb] - input[rgb]) < 5) continue;
+                                ++different;
+                                matches_output += std::abs(output[rgb] - int(display[rgb])) <= 2;
+                            }
+                        }
+                    }
+                }
+                reached = different >= 16 && matches_output * 100 >= different * 98;
+                if (!reached)
+                    std::printf("NGX screen provenance: order=%d, differentiated samples=%u, output matches=%u\n",
+                                order, different, matches_output);
+#else
+                const auto rgba = read(screen.Get());
+                reached = std::abs(int(rgba[0]) - 143) <= 2 && std::abs(int(rgba[1]) - 48) <= 2 &&
+                          std::abs(int(rgba[2]) - 24) <= 2;
+                if (order == 2)
+                    reached = reached && std::abs(int(read(decoy.picture.Get())[0]) - 191) > 5;
+#endif
+            }
+            if (FAILED(game.swap->Present(0, 0))) expect(false, "present the adaptive DX11 frame");
+            return reached;
+        };
+
+        for (int i = 0; i < 12; ++i) render(0);
+#if defined(NA_TEST_NATIVE_DLAA)
+        na::settings::Get().referee_enabled.store(1);
+#endif
+        na::native11::SetScreenCheck(true);
+        render(0); // advance the production Present path with the referee enabled
+        render(1);
+        const auto baseline = na::native11::Stats();
+        expect(baseline.contradictions > 0, "changing the order exposes the old numbered-read contradiction");
+        for (int i = 0; i < 64 && na::native11::Stats().screen_confirmed < 2; ++i) render(i & 1);
+        const auto learned = na::native11::Stats();
+        expect(learned.screen_confirmed == 2, "both recurring readers earn independent screen proofs");
+        int alternating = 0;
+        bool consistent = true;
+        uint64_t proof[2]{};
+        for (int i = 0; i < 32; ++i) {
+            alternating += render(i & 1, true);
+            if (i < 2) proof[i] = evaluator.proof;
+            else consistent = consistent && proof[i & 1] == evaluator.proof;
+        }
+        expect(alternating == 32 && consistent && proof[0] && proof[1] && proof[0] != proof[1],
+               "all 32 alternating frames carry the evaluated scene through to the displayed pixels");
+
+        for (int i = 0; i < 48 && na::native11::Stats().screen_confirmed < 3; ++i) render(2);
+        const auto discovered = na::native11::Stats();
+        expect(discovered.screen_confirmed == 3 && discovered.screen_refuted > learned.screen_refuted,
+               "an unseen third order rejects its finished-colour decoy and proves the visible reader");
+        expect(render(2, true), "the new order presents evaluated pixels");
+        expect(render(0, true) && evaluator.proof == proof[0] && render(1, true) && evaluator.proof == proof[1],
+               "switching back to previous orders uses known proofs on the first returning frames");
+        expect(na::native11::Stats().contradictions == baseline.contradictions,
+               "confirmed placements produce no late-scene contradictions");
+        na::native11::RejectScreenProof(proof[0]);
+        expect(render(1, true) && evaluator.proof == proof[1] && !render(0, true) && !evaluator.proof,
+               "a lost screen proof retires only its own draw order");
+        std::printf("adaptive DX11 screen: %d/32 alternating, %llu confirmed, %llu rejected, %llu paired\n",
+                    alternating, (unsigned long long)discovered.screen_confirmed,
+                    (unsigned long long)discovered.screen_refuted, (unsigned long long)discovered.screen_pairs);
+        na::native11::Uninstall();
+        return g_failed ? 1 : 0;
+    }
+
     struct Presented {
         bool processed = false, clean_decoy = false;
     };
@@ -1000,10 +1161,11 @@ int ScreenCheckFixture(Game& game)
     na::native11::Uninstall();
     return g_failed ? 1 : 0;
 }
-#endif
 
 int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 {
+    const bool adaptive = argc > 1 && (std::strcmp(argv[1], "--adaptive-screen") == 0 ||
+                                      std::strcmp(argv[1], "--adaptive-screen-warp") == 0);
 #if defined(NA_TEST_NATIVE_DLAA)
     const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
@@ -1029,7 +1191,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
-        !set(L"j2", L"camera", camera_off_start ? L"0" : L"2") ||
+        !set(L"j2", L"camera", (camera_off_start || adaptive) ? L"0" : L"2") ||
 
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
     na::host::WaitForObserveInstall();
@@ -1041,7 +1203,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #endif
     Game g;
     bool warp = false;
-    const bool screen_warp = argc > 1 && std::strcmp(argv[1], "--screen-check-warp") == 0;
+    const bool screen_warp = argc > 1 && (std::strcmp(argv[1], "--screen-check-warp") == 0 ||
+                                         std::strcmp(argv[1], "--adaptive-screen-warp") == 0);
     const bool depth_warp = argc > 1 && std::strcmp(argv[1], "--depth-reads-warp") == 0;
     const bool depth_debug = argc > 1 && std::strcmp(argv[1], "--depth-reads-debug") == 0;
     const bool depth_reads = depth_warp || depth_debug || (argc > 1 && std::strcmp(argv[1], "--depth-reads") == 0);
@@ -1061,7 +1224,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->GetDesc(&adapter_desc);
     std::printf("device: %ls (%s)\n", adapter_desc.Description, warp ? "WARP" : "hardware");
 #if !defined(NA_TEST_NATIVE_DLAA)
-    if (screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g);
+    if (adaptive || screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g, adaptive);
 #endif
 #if defined(NA_TEST_NATIVE_DLAA)
     if (warp) return 77;
@@ -1085,6 +1248,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
            std::strstr(activation, "dx11on12 enabled=0") != nullptr && std::strstr(activation, "wrapped=0") != nullptr,
            "production host installed the native provider exactly once");
     if (g_failed) return 1;
+    if (adaptive) {
+        na::j2::SetJitter(true);
+        const int result = ScreenCheckFixture(g, true);
+        DeleteFileW(ini.c_str());
+        std::fflush(stdout);
+        ExitProcess(result);
+    }
     na::j2::SetJitter(true);
 #endif
     g_seen.game = &g;

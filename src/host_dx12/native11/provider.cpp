@@ -65,12 +65,12 @@ using Microsoft::WRL::ComPtr;
 
 // ID3D11DeviceContext vtable (d3d11.h order).
 enum CtxSlot : uint32_t {
-    kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kPSSetConstantBuffers = 16, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
+    kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kPSSetShader = 9, kPSSetConstantBuffers = 16, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
     kDrawIndexedInstanced = 20, kDrawInstanced = 21, kVSSetShaderResources = 25, kOMSetRenderTargets = 33,
     kOMSetRenderTargetsAndUAVs = 34, kOMSetDepthStencilState = 36, kDrawIndexedInstancedIndirect = 39,
     kBegin = 27, kEnd = 28, kDrawInstancedIndirect = 40, kDrawAuto = 38, kDispatch = 41, kDispatchIndirect = 42,
     kRSSetViewports = 44, kCopySubresourceRegion = 46, kCopyResource = 47, kUpdateSubresource = 48,
-    kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
+    kClearRenderTargetView = 50, kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
     kClearState = 110, kFinishCommandList = 114,
     // ID3D11DeviceContext1
     kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
@@ -204,6 +204,9 @@ struct Ctx {
     uint64_t sampler_policy = ~uint64_t{0};
     uint64_t texture_policy = ~uint64_t{0};
     Id screen_color = 0;
+    ID3D11PixelShader* pixel_shader = nullptr; // context owns the binding
+    uint64_t writer_shader = 0;
+    bool pixel_shader_known = false;
     std::bitset<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> screen_slots;
     PsShadow ps_shadow;                // the game's views behind bound material replacements (textures.hpp)
     bool deferred = false;
@@ -242,6 +245,9 @@ struct Ctx {
         texture_policy = ~uint64_t{0};
         ps_shadow.Clear();
         screen_color = 0;
+        pixel_shader = nullptr;
+        writer_shader = 0;
+        pixel_shader_known = false;
         screen_slots.reset();
         rt0 = depth = 0;
         rt_count = 0;
@@ -275,6 +281,7 @@ std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
 ScreenCheck g_screen;
 std::atomic<bool> g_screen_enabled{false};
+std::atomic<bool> g_adaptive_scene{false}; // skip writer tagging on stable frames
 std::unordered_map<ID3D11DeviceContext*, std::unique_ptr<Ctx>> g_ctx;
 std::map<ID3D11CommandList*, ListRecord> g_lists;
 uint64_t g_list_order = 0;
@@ -575,6 +582,8 @@ using PFN_Resize = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT
 struct Originals {
     PFN_VSSetCB vs_cb = nullptr, ps_cb = nullptr;
     PFN_VSSetCB1 vs_cb1 = nullptr, ps_cb1 = nullptr;
+    void (STDMETHODCALLTYPE *ps_shader)(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT) = nullptr;
+    void (STDMETHODCALLTYPE *clear_rtv)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT*) = nullptr;
     PFN_SetSRV ps_srv = nullptr, cs_srv = nullptr, vs_srv = nullptr;
     PFN_DrawIndexed draw_indexed = nullptr;
     PFN_Draw draw = nullptr;
@@ -1574,7 +1583,24 @@ void NoteDepthDirection(const Event& e)
 
 // ---------------------------------------------------------------- events
 void StopViewportJitterAfterScene();
-void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {}, const ExactSet& exact = {})
+void TrackPlacementWrite(const Event& e)
+{
+    if (!g_screen.Adaptive() || !g_screen_enabled.load(std::memory_order_relaxed)) return;
+    const auto& scene = g_model.Current();
+    if (!scene.valid()) return;
+    if (e.kind == Kind::Draw && (e.rt0 == scene.color || g_model.IsSceneDraw(e))) {
+        // A depth/blend variant of the same shader can occupy another pass.
+        const uint64_t writer = e.placement_writer ? (e.placement_writer << 8) |
+            (uint64_t(e.depth_test) << 7) | (uint64_t(e.depth_func) << 3) | std::min<uint8_t>(7, e.rt_count) : 0;
+        g_screen.Write(writer);
+    } else if ((e.kind == Kind::ColorWrite && e.resource == scene.color) ||
+               (e.kind == Kind::ClearDepth && e.resource == scene.depth)) {
+        g_screen.Write(0);
+    }
+}
+
+void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {}, const ExactSet& exact = {},
+          bool pixel_read = false)
 {
     if (x->deferred) {
         if (x->events.size() >= kMaxListEvents) return;
@@ -1594,7 +1620,17 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
     // VARIANT: point/native11-screen-verified
     const bool screen_verified = e.kind == Kind::Read && g_screen_enabled.load(std::memory_order_relaxed) &&
                                  g_screen.Verified(scene.color, scene.depth);
-    if (e.kind == Kind::Read && !screen_verified && g_model.ShouldFireBeforeRead(e.resource)) {
+    const bool screen_enabled = g_screen_enabled.load(std::memory_order_relaxed);
+    // The existing ordinal stays available to the legacy providers. Once
+    // contradicted for a pixel consumer, only an observed draw can retake it.
+    // VARIANT: point/native11-adaptive-reader
+    const bool adaptive_read = pixel_read && screen_enabled && g_screen.Adaptive() &&
+        scene.color != g_backbuffer && scene.color_info.samples == 1;
+    if (e.kind == Kind::Read && !screen_verified && !adaptive_read && g_model.ShouldFireBeforeRead(e.resource)) {
+        if (pixel_read && screen_enabled) {
+            g_screen.SetScene(scene.color, scene.depth);
+            g_screen.NoteOrdinalPixel(g_model.SceneDrawsThisFrame());
+        }
         g_model.MarkFired();
         Fire(c, l, Boundary::BeforeRead);
         StopViewportJitterAfterScene();
@@ -1603,6 +1639,7 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
         Fire(c, l, Boundary::BeforeHud);
         StopViewportJitterAfterScene();
     }
+    TrackPlacementWrite(e);
     const uint32_t v = g_model.Feed(e);
     RememberSceneUploads(e, exact.get());
     NoteViewportDraw(e);
@@ -1792,6 +1829,20 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     const bool picture_draw = e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed);
     const bool layer_draw = e.depth_test && e.rt0 && e.rt0 == g_sel_layer.load(std::memory_order_relaxed) &&
                             e.depth == g_sel_depth.load(std::memory_order_relaxed);
+    if ((picture_draw || layer_draw) && g_adaptive_scene.load(std::memory_order_relaxed)) {
+        if (!x->pixel_shader_known) {
+            Inside in;
+            ComPtr<ID3D11PixelShader> shader;
+            c->PSGetShader(&shader, nullptr, nullptr);
+            x->pixel_shader = shader.Get();
+            x->pixel_shader_known = true;
+        }
+        if (!x->writer_shader && x->pixel_shader) {
+            Inside in;
+            x->writer_shader = IncarnationOf(x->pixel_shader);
+        }
+        e.placement_writer = x->writer_shader;
+    }
     if (!x->deferred && (picture_draw || layer_draw)) {
         // Scene-draw facts the frame model does not keep: viewport extent and the camera's offset binding.
         std::lock_guard<std::mutex> l(g_mu);
@@ -1877,7 +1928,7 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
         Event e;
         e.kind = Kind::Read;
         e.resource = r;
-        Emit(x, c, e);
+        Emit(x, c, e, {}, {}, stage == DepthStage::Pixel);
         if (sent_n < kWatch + 1) sent[sent_n++] = r;
         if (sent_n == kWatch + 1 && !track_depth && !screen) return;
     }
@@ -2042,6 +2093,18 @@ void STDMETHODCALLTYPE PSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT sta
     NoteCbs(x, kPsCbBase, start, n, b, first, num);
     O(c, x).ps_cb1(c, start, n, b, first, num);
 }
+void STDMETHODCALLTYPE PSSetShader_d(ID3D11DeviceContext* c, ID3D11PixelShader* shader,
+                                     ID3D11ClassInstance* const* instances, UINT count)
+{
+    Ctx* x = Get(c);
+    if (x && (!x->pixel_shader_known || x->pixel_shader != shader)) {
+        x->pixel_shader = shader;
+        x->pixel_shader_known = true;
+        x->writer_shader = 0;
+    }
+    O(c, x).ps_shader(c, shader, instances, count);
+}
+
 void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
     ReadEvents(c, DepthStage::Pixel, start, n, v);
@@ -2229,8 +2292,23 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
         D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
         view->GetDesc(&desc);
         if (desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || desc.Texture2D.MostDetailedMip) continue;
-        const ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format)};
+        ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format)};
         g_screen.SetScene(scene.color, scene.depth);
+        if (g_screen.Adaptive()) {
+            reader.color = IncarnationOf(g_color_ref.Get());
+            if (IdOf(g_depth_ref.Get()) != scene.depth) return {};
+            reader.depth = IncarnationOf(g_depth_ref.Get());
+            if (!g_screen.Learn(reader, output.width, output.height) || g_model.FiredThisFrame()) return {};
+            if (!g_screen.Select(reader)) {
+                ComPtr<ID3D11Texture2D> source;
+                if (FAILED(g_color_ref.As(&source))) return {};
+                return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+            }
+            g_model.MarkFired();
+            Fire(c, lock, Boundary::BeforeRead, true);
+            StopViewportJitterAfterScene();
+            return {};
+        }
         if (g_screen.Verified(scene.color, scene.depth)) {
             if (!g_screen.Matches(reader) || g_model.FiredThisFrame()) return {};
             g_model.MarkFired();
@@ -2532,6 +2610,24 @@ ID3D11Resource* DepthCopySource(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* 
     return twin ? twin : src;
 }
 
+void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
+{
+    if (!x || !resource || resource != g_sel_color.load(std::memory_order_relaxed) ||
+        !g_adaptive_scene.load(std::memory_order_relaxed)) return;
+    Event e;
+    e.kind = Kind::ColorWrite;
+    e.resource = resource;
+    Emit(x, c, e);
+}
+
+void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11RenderTargetView* view, const FLOAT color[4])
+{
+    Ctx* x = Get(c);
+    if (x && g_adaptive_scene.load(std::memory_order_relaxed))
+        TrackPlacementColorWrite(c, x, ResourceOfView(view));
+    O(c, x).clear_rtv(c, view, color);
+}
+
 void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y0, UINT z0, ID3D11Resource* src,
                                                UINT ss, const D3D11_BOX* box)
 {
@@ -2540,6 +2636,7 @@ void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Res
     auto* source = !ds && !ss && !x0 && !y0 && !z0 && !box ? DepthCopySource(c, x, dst, src) : src;
     O(c, x).copy_region(c, dst, ds, x0, y0, z0, source, ss, box);
     InvalidateDepthWrite(x, dst);
+    TrackPlacementColorWrite(c, x, IdOf(dst));
 }
 void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src)
 {
@@ -2547,6 +2644,7 @@ void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* ds
     Ctx* x = Get(c);
     O(c, x).copy_resource(c, dst, DepthCopySource(c, x, dst, src));
     InvalidateDepthWrite(x, dst);
+    TrackPlacementColorWrite(c, x, IdOf(dst));
 }
 void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT f)
 {
@@ -2554,6 +2652,7 @@ void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resour
     Ctx* x = Get(c);
     O(c, x).resolve(c, dst, ds, src, ss, f);
     InvalidateDepthWrite(x, dst);
+    TrackPlacementColorWrite(c, x, IdOf(dst));
 }
 void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT flags, FLOAT d, UINT8 s)
 {
@@ -2642,6 +2741,7 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
             size_t next_exact = 0;
             const std::vector<ExactRange>* current_exact = nullptr;
             for (size_t i = 0; i < events.size(); ++i) {
+                TrackPlacementWrite(events[i]);
                 const uint32_t v = g_model.Feed(events[i]);
                 if (next_exact < exact.size() && exact[next_exact].first == i) current_exact = exact[next_exact++].second.get();
                 RememberSceneUploads(events[i], current_exact);
@@ -2684,7 +2784,7 @@ bool OnPresent(IDXGISwapChain* swap)
         ComPtr<ID3D11Device> d;
         if (FAILED(swap->GetDevice(IID_PPV_ARGS(&d))) || d.Get() != game) return false;
         g_swap = swap;
-        g_screen.SetScene(0, 0);
+        g_screen.ResetPlacement();
         DXGI_SWAP_CHAIN_DESC sd{};
         swap->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
@@ -2702,7 +2802,7 @@ bool OnPresent(IDXGISwapChain* swap)
             na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
                                outcome, (unsigned long long)g_screen.Paired(),
                                (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
-    } else g_screen.SetScene(0, 0);
+    } else if (g_screen.Active()) g_screen.ResetPlacement();
     ++g_frame;
     g_exact_frame.fetch_add(1, std::memory_order_relaxed);
     ++g_stats.frames;
@@ -2718,6 +2818,7 @@ bool OnPresent(IDXGISwapChain* swap)
     g_model.EndFrame();
     const auto& picked = g_model.Current();
     if (g_screen_enabled.load(std::memory_order_relaxed)) g_screen.SetScene(picked.color, picked.depth);
+    g_adaptive_scene.store(g_screen.Adaptive(), std::memory_order_relaxed);
     const auto& ms = g_model.GetStats();
     {
         // WHY log: one line whenever the place DLSS runs at changes kind, with what the frame showed.
@@ -2947,7 +3048,8 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
 {
     std::lock_guard<std::mutex> l(g_mu);
     if (s == g_swap) {
-        g_screen.SetScene(0, 0);
+        g_screen.ResetPlacement();
+        g_adaptive_scene.store(false, std::memory_order_relaxed);
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
         g_color_ref.Reset();
         g_depth_ref.Reset();
@@ -2985,6 +3087,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     std::vector<H> hooks = {
         {kVSSetConstantBuffers, reinterpret_cast<void*>(&VSSetConstantBuffers_d), reinterpret_cast<void**>(&o.vs_cb)},
         {kPSSetConstantBuffers, reinterpret_cast<void*>(&PSSetConstantBuffers_d), reinterpret_cast<void**>(&o.ps_cb)},
+        {kPSSetShader, reinterpret_cast<void*>(&PSSetShader_d), reinterpret_cast<void**>(&o.ps_shader)},
         {kPSSetShaderResources, reinterpret_cast<void*>(&PSSetShaderResources_d), reinterpret_cast<void**>(&o.ps_srv)},
         {kCSSetShaderResources, reinterpret_cast<void*>(&CSSetShaderResources_d), reinterpret_cast<void**>(&o.cs_srv)},
         {kVSSetShaderResources, reinterpret_cast<void*>(&VSSetShaderResources_d), reinterpret_cast<void**>(&o.vs_srv)},
@@ -3008,6 +3111,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
         {kCopySubresourceRegion, reinterpret_cast<void*>(&CopySubresourceRegion_d), reinterpret_cast<void**>(&o.copy_region)},
         {kCopyResource, reinterpret_cast<void*>(&CopyResource_d), reinterpret_cast<void**>(&o.copy_resource)},
         {kUpdateSubresource, reinterpret_cast<void*>(&UpdateSubresource_d), reinterpret_cast<void**>(&o.update)},
+        {kClearRenderTargetView, reinterpret_cast<void*>(&ClearRenderTargetView_d), reinterpret_cast<void**>(&o.clear_rtv)},
         {kClearDepthStencilView, reinterpret_cast<void*>(&ClearDepthStencilView_d), reinterpret_cast<void**>(&o.clear_dsv)},
         {kResolveSubresource, reinterpret_cast<void*>(&ResolveSubresource_d), reinterpret_cast<void**>(&o.resolve)},
         {kClearState, reinterpret_cast<void*>(&ClearState_d), reinterpret_cast<void**>(&o.clear_state)},
@@ -3140,6 +3244,7 @@ void Uninstall()
     g_cb = nullptr;
     g_cb_user = nullptr;
     g_screen = {};
+    g_adaptive_scene.store(false, std::memory_order_relaxed);
     g_screen_enabled.store(false, std::memory_order_relaxed);
     g_swap = nullptr;
     g_backbuffer = 0;

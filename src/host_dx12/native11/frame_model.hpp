@@ -114,6 +114,7 @@ enum class Kind : uint8_t {
     Draw,       // a draw with the context's current targets
     ClearDepth, // ClearDepthStencilView(resource)
     Read,       // the resource is bound for reading (SRV) or is a copy/resolve source
+    ColorWrite, // colour clear/copy/resolve recorded for adaptive placement
     CbUpdate,   // a constant buffer's contents changed (Map/Unmap, UpdateSubresource)
 };
 
@@ -132,6 +133,7 @@ struct Event {
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
     // Depth direction evidence (depth_direction.hpp). Last on purpose: hosts that do not say leave them 0.
     uint8_t depth_func = 0;       // Draw: the depth comparison (D3D11 numbering, 1..8) when this draw tests AND WRITES the depth; 0 otherwise
+    uint64_t placement_writer = 0; // pixel shader incarnation of this DX11 write
     float clear_depth = 0;        // ClearDepth: the value the depth was cleared to
 };
 
@@ -327,6 +329,7 @@ public:
                 }
             }
             break;
+        case Kind::ColorWrite: break; // the placement profile tracks these separately
         case Kind::CbUpdate: return track_camera_ ? ++cb_version_[e.resource] : 0;
         }
         return 0;
