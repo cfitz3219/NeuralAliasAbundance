@@ -856,18 +856,19 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
         ComPtr<ID3D11Texture2D> picture;
         ComPtr<ID3D11RenderTargetView> rtv;
         ComPtr<ID3D11ShaderResourceView> srv;
-    } decoy, canvas, other_canvas, third_canvas;
+    } decoy, canvas, other_canvas, third_canvas, second_output;
     D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = game.w;
+    desc.Width = game.w + (adaptive ? 1 : 0); // one padding column after the active viewport
     desc.Height = game.h;
     desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    for (auto* surface : {&decoy, &canvas, &other_canvas, &third_canvas}) {
+    for (auto* surface : {&decoy, &canvas, &other_canvas, &third_canvas, &second_output}) {
         if (FAILED(game.device->CreateTexture2D(&desc, nullptr, &surface->picture)) ||
             FAILED(game.device->CreateRenderTargetView(surface->picture.Get(), nullptr, &surface->rtv)) ||
             FAILED(game.device->CreateShaderResourceView(surface->picture.Get(), nullptr, &surface->srv))) return 1;
     }
+    desc.Width = game.w;
 #if defined(NA_TEST_NATIVE_DLAA)
     const auto color_copy = [&](DXGI_FORMAT format) -> ComPtr<ID3D11Texture2D> {
         auto staging = desc;
@@ -896,8 +897,10 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
         variant_code->GetBufferSize(), nullptr, &variant))) return 1;
     ComPtr<ID3D11PixelShader> composite;
     if (!code || FAILED(game.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &composite))) return 1;
+    bool multiple_outputs = false;
     auto reader = [&](ID3D11RenderTargetView* target, ID3D11ShaderResourceView* input, ID3D11PixelShader* shader) {
-        game.ctx->OMSetRenderTargets(1, &target, nullptr);
+        ID3D11RenderTargetView* outputs[]{target, second_output.rtv.Get()};
+        game.ctx->OMSetRenderTargets(multiple_outputs && target != game.back_rtv.Get() ? 2 : 1, outputs, nullptr);
         game.ctx->PSSetShaderResources(0, 1, &input);
         game.ctx->PSSetShader(shader, nullptr, 0);
         game.ctx->Draw(4, 0);
@@ -961,9 +964,10 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
     if (adaptive) {
         // Learn a numbered read on order A, then put a plausible draw at
         // that number before more scene work. B and C both share A's inputs.
-        const auto render = [&](int order, bool check_pixels = false, bool extra_read = false) {
+        const auto render = [&](int order, bool check_pixels = false, bool extra_read = false, bool different_writer = false) {
             Pump();
             evaluator.proof = 0;
+            const auto writes_before = evaluator.writes;
             Scene(game.ctx.Get(), game, 0);
             game.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             game.ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
@@ -974,7 +978,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
             auto* rt = game.color_rtv.Get();
             game.ctx->OMSetRenderTargets(1, &rt, game.dsv.Get());
             game.ctx->VSSetShader(game.vs.Get(), nullptr, 0);
-            game.ctx->PSSetShader(variant.Get(), nullptr, 0);
+            game.ctx->PSSetShader(different_writer ? game.ps_scene.Get() : variant.Get(), nullptr, 0);
             SetObject(game.ctx.Get(), game, 2);
             game.ctx->Draw(4, 0);
             game.ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
@@ -985,7 +989,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
             ComPtr<ID3D11Texture2D> screen;
             if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) return false;
             bool reached = false;
-            if (check_pixels && evaluator.proof) {
+            if (check_pixels && evaluator.writes == writes_before + 1) {
 #if defined(NA_TEST_NATIVE_DLAA)
                 na::native11::OwnWorkScope own;
                 game.ctx->CopyResource(shown.Get(), screen.Get());
@@ -1057,9 +1061,18 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
             expect(baseline.fired == before_change.fired && baseline.contradictions == 0,
                    "the changed order has fewer reads than the old route expects and misses its insertion");
         else expect(baseline.contradictions > 0, "changing the order exposes the old numbered-read contradiction");
+        multiple_outputs = true; // the ordinary reader works, but the screen probe cannot qualify MRT
+        render(0); // let the original ordinal settle on the new order
+        const auto writes_before_search = evaluator.writes;
+        int visible_while_searching = 0;
+        for (int i = 0; i < 24; ++i) visible_while_searching += render(0, true);
+        expect(visible_while_searching == 24 && evaluator.writes == writes_before_search + 24 && na::native11::Stats().screen_confirmed == 0,
+               "searching without a replacement preserves every ordinary submission");
+        multiple_outputs = false;
         for (int i = 0; i < 64 && na::native11::Stats().screen_confirmed < 2; ++i) render(i & 1);
         const auto learned = na::native11::Stats();
         expect(learned.screen_confirmed == 2, "both recurring readers earn independent screen proofs");
+        const auto late_before_alternating = learned.contradictions;
         int alternating = 0;
         bool consistent = true;
         uint64_t proof[2]{};
@@ -1071,6 +1084,10 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
         expect(alternating == 32 && consistent && proof[0] && proof[1] && proof[0] != proof[1],
                "all 32 alternating frames carry the evaluated scene through to the displayed pixels");
 
+        expect(na::native11::Stats().contradictions == late_before_alternating,
+               "confirmed placements produce no late-scene contradictions across alternating orders");
+        expect(render(1, true, false, true) && evaluator.proof == proof[1],
+               "the same unambiguous final reader retains proof when the last object's shader changes");
         for (int i = 0; i < 48 && na::native11::Stats().screen_confirmed < 3; ++i) render(2);
         const auto discovered = na::native11::Stats();
         expect(discovered.screen_confirmed == 3 && discovered.screen_refuted > learned.screen_refuted,
@@ -1078,8 +1095,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
         expect(render(2, true), "the new order presents evaluated pixels");
         expect(render(0, true) && evaluator.proof == proof[0] && render(1, true) && evaluator.proof == proof[1],
                "switching back to previous orders uses known proofs on the first returning frames");
-        expect(na::native11::Stats().contradictions == baseline.contradictions,
-               "confirmed placements produce no late-scene contradictions");
+
 #if defined(NA_TEST_NATIVE_DLAA)
         for (int i = 0; i < 48 && na::referee::gpu::GetStats().screens < 2; ++i) render(i & 1);
         const auto witness = na::referee::gpu::GetStats();
@@ -1089,6 +1105,16 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
                     static_cast<unsigned long long>(witness.screens), static_cast<unsigned long long>(witness.pairs),
                     static_cast<unsigned long long>(witness.failed));
 #endif
+        multiple_outputs = true;
+        render(0);
+        render(0); // the first absence releases the ordinary reader
+        const auto writes_after_loss = evaluator.writes;
+        int visible_after_loss = 0;
+        for (int i = 0; i < 24; ++i) visible_after_loss += render(0, true);
+        expect(visible_after_loss == 24 && evaluator.writes == writes_after_loss + 24,
+               "an absent proven order cannot keep a valid ordinary reader offline");
+        multiple_outputs = false;
+        for (int i = 0; i < 6; ++i) render(1);
         na::native11::RejectScreenProof(proof[0]);
         expect(render(1, true) && evaluator.proof == proof[1] && !render(0, true) && !evaluator.proof,
                "a lost screen proof retires only its own draw order");

@@ -53,6 +53,8 @@ public:
         color_ = color;
         depth_ = depth;
         verified_ = {};
+        steering_ = false;
+        consecutive_proven_ = 0;
         adaptive_ = std::find(adaptive_scenes_.begin(), adaptive_scenes_.end(), std::pair{color, depth}) != adaptive_scenes_.end();
         legacy_rejected_.clear();
         ordinary_gaps_ = 0;
@@ -96,7 +98,7 @@ public:
     // writes are collapsed: only the producer of the newest content matters.
     bool Learn(Reader& reader, UINT width, UINT height)
     {
-        if (!writer_ || !reader.color || !reader.depth || truncated_) return false;
+        if (!epoch_ || !reader.color || !reader.depth || truncated_) return false;
         na::j2::InsertionEvent event;
         event.op = na::j2::Op::GraphicsEntry;
         event.pipeline = reader.shader;
@@ -111,10 +113,14 @@ public:
         entry.op = event.op;
         entry.raw = event;
         Append(entry);
-        reader.writer = writer_;
-        // The same shader/target/producer can be terminal and intermediate.
-        // Only qualify by order since this write when the broader role is ambiguous.
-        if (entries_.AcceptedByContext(event)) reader.context = event.context;
+        // A proven base role can follow different final objects. Binding its
+        // proof to the last object's shader would discard that proof every time
+        // the last object changes. Only contextual acceptance requires both.
+        if (entries_.AcceptedByContext(event)) {
+            if (!writer_) return false;
+            reader.writer = writer_;
+            reader.context = event.context;
+        }
         return !truncated_ && entries_.Accepts(event);
     }
 
@@ -122,13 +128,18 @@ public:
     bool Matches(Reader reader) const { return reader == verified_; }
     uint64_t Proof() const { return adaptive_ ? frame_proof_ : verified_ ? proof_ : 0; }
 
-    bool Select(Reader reader)
+    bool ReservesPixelRead() const { return adaptive_ && steering_; }
+
+    bool Select(Reader reader, bool available)
     {
         if (!adaptive_) return Matches(reader);
         for (const auto& route : routes_) {
             if (reader == route.reader) {
-                frame_proof_ = route.proof;
-                delivery_epoch_ = epoch_;
+                seen_proven_epoch_ = epoch_;
+                if (available) {
+                    frame_proof_ = route.proof;
+                    delivery_epoch_ = epoch_;
+                }
                 return true;
             }
         }
@@ -143,6 +154,10 @@ public:
         if (match != routes_.end()) {
             Reject(match->reader);
             routes_.erase(match);
+            if (routes_.empty()) {
+                steering_ = false;
+                consecutive_proven_ = 0;
+            }
             return true;
         }
         if (!verified_ || proof != proof_) return false;
@@ -264,6 +279,18 @@ public:
             return finish(early ? "draw_order_changed" : "draw_order_missed");
         }
         if (adaptive_) {
+            // Qualifying a replacement must never silence the ordinary evaluator.
+            // A missing or overwritten reader releases the next frame immediately.
+            // Re-arm only after consecutive sightings on complete scene frames, so
+            // an intermittent proof cannot repeatedly take the other order offline.
+            if (scene_draws && !truncated_ && seen_proven_epoch_ && seen_proven_epoch_ == epoch_ &&
+                (!frame_proof_ || delivered_this_frame_)) {
+                if (consecutive_proven_ < 3) ++consecutive_proven_;
+                steering_ = consecutive_proven_ >= 3;
+            } else {
+                steering_ = false;
+                consecutive_proven_ = 0;
+            }
             if (!truncated_) entries_.Observe(sequence_, true, frame);
             if (frame_proof_ && delivery_epoch_ != epoch_) {
                 RejectProof(frame_proof_);
@@ -344,6 +371,8 @@ public:
             if (adaptive_) {
                 if (routes_.size() >= 24) routes_.erase(routes_.begin());
                 routes_.push_back({candidate_, ++next_proof_});
+                consecutive_proven_ = 3;
+                steering_ = true; // the completed screen challenge is direct positive evidence
             } else {
                 verified_ = candidate_;
                 proof_ = ++next_proof_;
@@ -374,7 +403,7 @@ private:
     {
         sequence_.clear();
         entries_since_write_ = ordinal_draws_ = reader_after_draws_ = 0;
-        writer_ = frame_proof_ = epoch_ = 0;
+        writer_ = frame_proof_ = seen_proven_epoch_ = epoch_ = 0;
         delivered_this_frame_ = truncated_ = false;
     }
 
@@ -506,7 +535,9 @@ private:
     std::vector<na::j2::ColorEvent> sequence_;
     std::vector<Route> routes_;
     std::vector<std::pair<Id, Id>> adaptive_scenes_;
-    bool adaptive_ = false, truncated_ = false;
+    bool adaptive_ = false, truncated_ = false, steering_ = false;
+    unsigned consecutive_proven_ = 0;
+    uint64_t seen_proven_epoch_ = 0;
     uint32_t ordinal_draws_ = 0, reader_after_draws_ = 0, entries_since_write_ = 0;
     uint64_t writer_ = 0, epoch_ = 0, marked_epoch_ = 0, delivery_epoch_ = 0, frame_proof_ = 0;
 

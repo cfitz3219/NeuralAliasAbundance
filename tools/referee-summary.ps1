@@ -10,7 +10,12 @@ function Get-RefereeSummary([string[]] $Lines) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         return $out
     }
-    $out.Add('Referee (it only watches; it changes nothing shown):')
+    $out.Add('Referee screen and delivery checks')
+    $placements = @($Lines | Where-Object { $_ -match '(^|\s)native11_placement\s' })
+    if ($placements) {
+        $out.Add('  DX11 adaptive placement changes: ' + $placements.Count +
+                 '. Last change: ' + ($placements[-1] -replace '^.*?native11_placement\s+', ''))
+    }
     foreach ($s in $states) { $out.Add('  state: ' + ($s -replace '^.*?referee_state\s+', '')) }
     if (-not $windows) {
         $out.Add('  No window was judged. Candidates: DLAA never ran on a frame; the run was shorter than one log interval; the referee stopped (see the state lines above).')

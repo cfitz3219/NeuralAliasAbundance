@@ -223,7 +223,7 @@ bool init(ID3D12Device* dev)
     g.init_ok = true;
     g.stats.running = true;
     g.window_at = GetTickCount64();
-    na::eventlog::Emit("referee_state", "started every_ms=%llu (watches only: picture, result, motion, jitter)",
+    na::eventlog::Emit("referee_state", "started every_ms=%llu (sampling picture, result, motion, jitter)",
                        static_cast<unsigned long long>(every_ms()));
     return true;
 }

@@ -1655,13 +1655,12 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
     std::unique_lock<std::mutex> l(g_mu);
     const auto& scene = g_model.Current();
     // VARIANT: point/native11-screen-verified
-    const bool screen_verified = e.kind == Kind::Read && g_screen_enabled.load(std::memory_order_relaxed) &&
-                                 g_screen.Verified(scene.color, scene.depth);
     const bool screen_enabled = g_screen_enabled.load(std::memory_order_relaxed);
-    // The existing ordinal stays available to the legacy providers. Once
-    // contradicted for a pixel consumer, only an observed draw can retake it.
+    const bool screen_verified = pixel_read && screen_enabled && g_screen.Verified(scene.color, scene.depth);
+    // Let discovery run alongside normal delivery until a proven reader can
+    // take its place. A search with no suitable reader must not claim the frame.
     // VARIANT: point/native11-adaptive-reader
-    const bool adaptive_read = pixel_read && screen_enabled && g_screen.Adaptive() &&
+    const bool adaptive_read = pixel_read && screen_enabled && g_screen.ReservesPixelRead() &&
         scene.color != g_backbuffer && scene.color_info.samples == 1;
     if (e.kind == Kind::Read && !screen_verified && !adaptive_read && g_model.ShouldFireBeforeRead(e.resource)) {
         if (pixel_read && screen_enabled) {
@@ -2326,8 +2325,13 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
         scene.color == g_backbuffer || !g_swap || x->raster_queries ||
         IdOf(g_color_ref.Get()) != scene.color || g_color_view.mip || g_color_view.slice) return {};
     ResourceInfo output{};
-    if (!g_model.InfoOf(x->rt0, output) || output.width != scene.color_info.width ||
-        output.height != scene.color_info.height || output.samples != 1 || scene.color_info.samples != 1) return {};
+    // A compositor may draw the active picture into an alignment-padded target.
+    // Qualify that reader by its on-screen pixels, with a bounded extent check.
+    const auto close_extent = [](uint32_t a, uint32_t b) {
+        return a && b && uint64_t((std::min)(a, b)) * 100 >= uint64_t((std::max)(a, b)) * 98;
+    };
+    if (!g_model.InfoOf(x->rt0, output) || !close_extent(output.width, scene.color_info.width) ||
+        !close_extent(output.height, scene.color_info.height) || output.samples != 1 || scene.color_info.samples != 1) return {};
     const auto covers_picture = [](float viewport, uint32_t extent) {
         // Alignment padding can leave a few unused rows in a full-size texture.
         // The exact presented pixels still qualify the reader.
@@ -2368,12 +2372,13 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
             reader.color = IncarnationOf(g_color_ref.Get());
             if (IdOf(g_depth_ref.Get()) != scene.depth) return {};
             reader.depth = IncarnationOf(g_depth_ref.Get());
-            if (!g_screen.Learn(reader, output.width, output.height) || g_model.FiredThisFrame()) return {};
-            if (!g_screen.Select(reader)) {
+            if (!g_screen.Learn(reader, output.width, output.height)) return {};
+            if (!g_screen.Select(reader, !g_model.FiredThisFrame())) {
                 ComPtr<ID3D11Texture2D> source;
                 if (FAILED(g_color_ref.As(&source))) return {};
                 return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
             }
+            if (g_model.FiredThisFrame()) return {}; // witness the route without evaluating twice
             g_model.MarkFired();
             Fire(c, lock, Boundary::BeforeRead, true);
             StopViewportJitterAfterScene();
@@ -2860,6 +2865,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
     }
+    const bool reserved_before = g_screen.ReservesPixelRead();
     if (g_screen_enabled.load(std::memory_order_relaxed)) {
         Inside own;
         ComPtr<ID3D11DeviceContext> context;
@@ -2890,6 +2896,11 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     const auto& picked = g_model.Current();
     if (g_screen_enabled.load(std::memory_order_relaxed)) g_screen.SetScene(picked.color, picked.depth);
     g_adaptive_scene.store(g_screen.Adaptive(), std::memory_order_relaxed);
+    if (reserved_before != g_screen.ReservesPixelRead()) {
+        na::eventlog::Emit("native11_placement", "next_frame=%llu reader=%s",
+                           static_cast<unsigned long long>(g_frame),
+                           g_screen.ReservesPixelRead() ? "screen_proven" : "ordinary");
+    }
     const auto& ms = g_model.GetStats();
     {
         // WHY log: one line whenever the place DLSS runs at changes kind, with what the frame showed.
