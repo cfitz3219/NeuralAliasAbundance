@@ -22,7 +22,10 @@ public:
     struct Reader {
         uint64_t output = 0, shader = 0;
         UINT slot = 0, format = 0;
-        bool operator==(const Reader&) const = default;
+        bool operator==(const Reader& other) const
+        {
+            return output == other.output && shader == other.shader && slot == other.slot && format == other.format;
+        }
         explicit operator bool() const { return output && shader; }
     };
     struct Mark {
