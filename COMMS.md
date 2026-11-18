@@ -10540,3 +10540,9 @@ Costs and what is open, so you do not have to find them:
 ### 2026-11-17 — Referee switch on Home
 
 Cort asked for an overlay switch. PR #160 is merged into the active branch at 88f3f837. Home > Picture now has Referee directly below NeuralAlias DLAA. It switches on and off live, saves the preference, and starts off for new installations. Release build, overlay, settings, and referee GPU tests passed on the identical source tree. Include this change in the next authorized package.
+
+### 2026-11-17 — Referee route preview merged
+
+Cort approved read-only preview. PR #161 is merged at 3536dbba on the active branch. With Referee enabled on Home the status log now includes `referee_choice mode=preview` with the exact sampled frame range, route generation, recommendation and reason. This is observation only. In the CPU/fixture path a verified alternate can beat a repeatedly bypassed route, but live preview suggests a probe only when the existing structural observer sees a consistent alternate. No changes to live route authority.
+
+Release host and three focused tests pass, with the GPU referee test repeated on WARP. Same scorer and policy replayed 36 matched Resistance frames in 205519/205627/205716. All favored the displayed DLAA output. Two windows flagged motion while retaining placement and one advised keep. The input substitution control flagged 12 out of 12 bypass frames without selecting an unverified alternate. There is no observed two-placement comparison from a real game in these files. Complete local pixel captures for BF4, HOI4 and Rome II were not found in this pass. The replay command and limits are in WORKLOG.md on the active branch. No game or package action.
