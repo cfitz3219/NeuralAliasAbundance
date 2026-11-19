@@ -132,6 +132,13 @@ struct Stats {
     uint64_t screen_pairs=0,screen_valid=0,screen_few=0,screen_unsolved=0,screen_disagree=0,screen_frame=0;
     float screen_theta[11]{},screen_nearness_limit=0,screen_samples=0,screen_agree=0,screen_energy=0;
     bool screen_last_valid=false,screen_last_unsolved=false;uint32_t screen_steps=0;
+    // VARIANT motion/screen-fit/depth-layers: pairs whose samples' depths fell into two groups (each
+    // then has its own fit; the numbers above are the far group's), and those whose near group has a
+    // model. The newest pair: the depth distance that parts the groups (0: one group, because the
+    // depths run on without an empty stretch or a side holds too few samples) and the near group's fit.
+    uint64_t screen_split=0,screen_near_valid=0;
+    float screen_split_nearness=0,screen_near_theta[11]{},screen_near_samples=0,screen_near_agree=0,screen_near_energy=0;
+    bool screen_near_last_valid=false;uint32_t screen_near_steps=0;
     uint64_t cand_pairs=0,cand_pairs_changed=0,cand_offered=0,cand_changed=0,cand_frame=0;
     uint32_t cand_top[8]{},cand_last_offered=0,cand_last_changed=0;
     double ms=0;char reason[160]{};

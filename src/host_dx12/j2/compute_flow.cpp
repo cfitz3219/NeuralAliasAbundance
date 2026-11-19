@@ -47,7 +47,8 @@ constexpr unsigned kTable=12,kUav=8; // descriptors per table: SRVs t0..t7, then
 constexpr unsigned kTables=8; // per recording: encode, accept or measure, the scene-cut state, the scene-cut picture, the frame candidates, the screen fit's three programs
 constexpr unsigned kCutTile=32; // pixels per group axis in flow_shaders.hpp cut_show
 constexpr unsigned kFitHead=20,kFitValues=na::motion::screen::kValues; // flow_shaders.hpp FIT_HEAD, FIT_VALUES
-constexpr unsigned kReadback=192; // counters 0..39, timestamps 48..63, the frame candidates' words 64..103, the screen fit's head 112..191
+constexpr unsigned kReadback=272; // counters 0..39, timestamps 48..63, the frame candidates' words 64..103, the screen fit's head 112..191 (the far group, or the one fit of every depth), the near group's 192..271
+constexpr unsigned kFitTile=5; // flow_shaders.hpp FIT_TILE
 static_assert(kFitValues==81,"flow_shaders.hpp FIT_VALUES");
 struct Image {ComPtr<ID3D12Resource> tex,raw_color;std::vector<Lease> uses;Lease producer;uint64_t frame=0,colour_epoch=0;unsigned generation=0;float jitter[2]{},raster_jitter[2]{};bool raster_confirmed=false;};
 struct Slot {
@@ -73,7 +74,7 @@ struct Context {
     ComPtr<ID3D12Resource> votes,grid,top; // 256x256 R32_UINT, always UAV; the grid handed on (R16G16_SINT, one vector per 8x8 block); 48 bytes, always UAV
     // VARIANT: motion/screen-fit (flow_shaders.hpp fit_sample / fit_accum / fit_solve). All three programs or none.
     ComPtr<ID3D12PipelineState> pso_fit_sample,pso_fit_accum,pso_fit_solve;
-    ComPtr<ID3D12Resource> fit_grid,fit_model,fit_state; // RGBA32F, one sample per 8x8 block; RG32F 8x1, the model `measure` reads; the terms and the groups' sums, always UAV
+    ComPtr<ID3D12Resource> fit_grid,fit_model,fit_state; // RGBA32F, one sample per 8x8 block; RG32F 9x2, the model `measure` reads (a row per group of depths); the terms, the tiles' sums and the tiles' own words, always UAV
     unsigned fit_words=0; // fit_state's size in words
     bool cut_seeded=false; // cut_state has been zeroed by a submitted recording
     unsigned hist_read=0;uint64_t hist_frame=0;unsigned hist_generation=0; // last committed pair's candidates
@@ -167,8 +168,8 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     void* p=nullptr;if(FAILED(c.zero->Map(0,nullptr,&p)))return false;memset(p,0,96);c.zero->Unmap(0,nullptr);
     // The screen fit is optional: without its programs or working memory `measure` has no model to
     // follow, pixels the pictures cannot measure are not known, and the j2screenfit line says on=0.
-    c.fit_words=kFitHead+(((w+7)/8)*((h+7)/8)+63)/64*kFitValues;
-    if(c.pso_fit_solve && !(c.tex(DXGI_FORMAT_R32G32B32A32_FLOAT,c.fit_grid,(w+7)/8,(h+7)/8,S) && c.tex(DXGI_FORMAT_R32G32_FLOAT,c.fit_model,8,1,S) &&
+    {const unsigned gw=(w+7)/8,gh=(h+7)/8;c.fit_words=kFitHead+((gw+7)/8)*((gh+7)/8)*(kFitValues+kFitTile);} // a thread group is one tile of 8 x 8 samples (flow_shaders.hpp fit_tiles)
+    if(c.pso_fit_solve && !(c.tex(DXGI_FORMAT_R32G32B32A32_FLOAT,c.fit_grid,(w+7)/8,(h+7)/8,S) && c.tex(DXGI_FORMAT_R32G32_FLOAT,c.fit_model,9,2,S) &&
         c.buffer(c.fit_words*4,D3D12_HEAP_TYPE_DEFAULT,U,c.fit_state))){
         c.pso_fit_sample.Reset();c.pso_fit_accum.Reset();c.pso_fit_solve.Reset();}
     // The frame candidates are optional: without their programs or working memory the search's grid is used as it is.
@@ -197,14 +198,18 @@ void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto&
         else if(r.samples>=256 && r.samples0>=256 && r.energy0>.05f && r.energy<.7f*r.energy0)++stats.fit_rejected_jitter; // plain test passed, quantised/jitter test refused
         stats.fit_e_alt=r.energy_alt;stats.fit_photo_tested=r.photo_tested;stats.fit_photo_better=r.photo_better;stats.fit_photo_worse=r.photo_worse;
         stats.fit_photo_regions=r.photo_regions;stats.fit_photo_good=r.photo_regions_good;stats.fit_photo_e_fit=r.photo_e_fit;stats.fit_photo_e_cam=r.photo_e_cam;}}
-    if(s.screen){void* p=nullptr;D3D12_RANGE range{112,192}; // the screen fit of this pair (flow_shaders.hpp FIT_HEAD: the fit buffer's first words)
-        if(SUCCEEDED(s.readback->Map(0,&range,&p))){unsigned v[kFitHead];float f[kFitHead];memcpy(v,static_cast<const unsigned char*>(p)+112,sizeof v);memcpy(f,v,sizeof f);
+    if(s.screen){void* p=nullptr;D3D12_RANGE range{112,272}; // the screen fit of this pair (flow_shaders.hpp FIT_HEAD: the fit buffer's first words), far group then near group
+        if(SUCCEEDED(s.readback->Map(0,&range,&p))){unsigned v[kFitHead],nv[kFitHead];float f[kFitHead],nf[kFitHead];memcpy(v,static_cast<const unsigned char*>(p)+112,sizeof v);memcpy(f,v,sizeof f);
+            memcpy(nv,static_cast<const unsigned char*>(p)+112+kFitHead*4,sizeof nv);memcpy(nf,nv,sizeof nf);const bool split=nf[19]>0;
             const na::motion::screen::Params fp;
             ++stats.screen_pairs;
             // Why a pair has no model, in the order the fit decides it.
-            if(v[12])++stats.screen_valid;else if(f[13]<fp.min_samples)++stats.screen_few;else if(v[16])++stats.screen_unsolved;else ++stats.screen_disagree;
+            if(split)++stats.screen_split;if(split && nv[12])++stats.screen_near_valid;
+            if(v[12] || (split && nv[12]))++stats.screen_valid;else if(f[13]<fp.min_samples)++stats.screen_few;else if(v[16])++stats.screen_unsolved;else ++stats.screen_disagree;
             if(s.frame>=stats.screen_frame){stats.screen_frame=s.frame;memcpy(stats.screen_theta,f,sizeof stats.screen_theta);stats.screen_nearness_limit=f[11];
-                stats.screen_last_valid=v[12]!=0;stats.screen_samples=f[13];stats.screen_agree=f[14];stats.screen_energy=f[15];stats.screen_last_unsolved=v[16]!=0;stats.screen_steps=v[17];}
+                stats.screen_last_valid=v[12]!=0;stats.screen_samples=f[13];stats.screen_agree=f[14];stats.screen_energy=f[15];stats.screen_last_unsolved=v[16]!=0;stats.screen_steps=v[17];
+                stats.screen_split_nearness=nf[19];memcpy(stats.screen_near_theta,nf,sizeof stats.screen_near_theta);stats.screen_near_last_valid=split && nv[12]!=0;
+                stats.screen_near_samples=nf[13];stats.screen_near_agree=nf[14];stats.screen_near_energy=nf[15];stats.screen_near_steps=nv[17];}
             D3D12_RANGE none{};s.readback->Unmap(0,&none);}}
     if(s.candidates){void* p=nullptr;D3D12_RANGE range{64,104}; // the frame candidates of this pair (flow_shaders.hpp kCandidateShader, u2)
         if(SUCCEEDED(s.readback->Map(0,&range,&p))){unsigned v[10];memcpy(v,static_cast<const unsigned char*>(p)+64,sizeof v);
@@ -389,18 +394,35 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
             move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->fit_state.Get(),0,c->zero.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
             move(l,c->fit_model.Get(),S,U);
             c->srv(work,6,7,c->fit_grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);c->raw_uav(work,6,kUav+2,c->fit_state.Get(),c->fit_words);
+            c->srv(work,7,7,c->fit_grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT); // fit_solve's mode 2 counts the samples' depths
             c->raw_uav(work,7,kUav+2,c->fit_state.Get(),c->fit_words);c->uav(work,7,kUav+0,c->fit_model.Get(),DXGI_FORMAT_R32G32_FLOAT);
-            const unsigned groups=(cb.gw*cb.gh+63)/64;
-            // screen_motion.hpp Fit: one plain step, the reweighted ones, then the fitted terms against the samples once more.
-            for(int step=0;step<=fp.steps;++step){const bool last=step==fp.steps;
-                fc.history_dy=last?fp.robust_px:step>0?na::motion::screen::ScaleAt(step,fp):0.f;fc.mode=0;
-                l->SetComputeRootDescriptorTable(0,c->gpu(work,6));
-                c->dispatch_bound(l,c->pso_fit_accum.Get(),fc,false,groups,1);order(l);
-                fc.mode=last?1u:0u;
-                l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
-                c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,true);order(l);}
+            const unsigned tiles=((cb.gw+7)/8)*((cb.gh+7)/8);
+            // VARIANT: motion/screen-fit/depth-layers
+            // Where the samples' depths fall into two groups with an empty stretch between them, each
+            // group gets its own fit and a pixel its own group's (screen_motion.hpp FitLayers says why:
+            // a large near figure moving by itself otherwise decides what the still far scene is handed).
+            fc.mode=2;fc.offset=0;
+            l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
+            c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,true);order(l);
+            // Row 0: the far group, or the one fit of every depth. Row 1: the near group; with no split
+            // it holds no samples and its row says "not valid".
+            for(unsigned row=0;row<2;++row){
+                if(row){ // the terms and the stop state start again; the split (word 19) stays
+                    move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyBufferRegion(c->fit_state.Get(),0,c->zero.Get(),0,(kFitHead-1)*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);}
+                fc.offset=row;
+                // screen_motion.hpp Fit: one plain step, the reweighted ones, then the fitted terms against the samples once more.
+                // A pass uses the tile weights the pass before it left (TileScaleFor).
+                for(int step=0;step<=fp.steps;++step){const bool last=step==fp.steps;
+                    fc.history_dy=last?fp.robust_px:step>0?na::motion::screen::ScaleAt(step,fp):0.f;fc.mode=0;
+                    const float tile_now=na::motion::screen::TileScaleFor(step,fp);
+                    fc.agree_px=fp.tile_px>0?(tile_now>0?tile_now:-1.f):0.f;fc.agree_cos=na::motion::screen::TileScaleFor(step+1,fp);
+                    l->SetComputeRootDescriptorTable(0,c->gpu(work,6));
+                    c->dispatch_bound(l,c->pso_fit_accum.Get(),fc,false,tiles,1);order(l);
+                    fc.mode=last?1u:0u;
+                    l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
+                    c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,true);order(l);}
+                move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),112+row*kFitHead*4,c->fit_state.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);}
             move(l,c->fit_model.Get(),U,S);
-            move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),112,c->fit_state.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
             model=c->fit_model.Get();slot.screen=true;
         }
         c->srv(work,1,4,c->engine.SceneChange(),DXGI_FORMAT_R32_UINT);

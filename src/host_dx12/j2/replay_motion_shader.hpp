@@ -65,10 +65,16 @@ bool camera_at(float2 c, float depth, out float2 r) {
 // texels are flow_shaders.hpp fit_solve's: 0..5 the eleven terms and the nearness limit, 6.x valid).
 bool screen_at(float2 c, float depth, out float2 r) {
     r = 0;
-    if (!(t_model[int2(6, 0)].x > 0.5)) return false;
-    const float2 a = t_model[int2(0, 0)], b = t_model[int2(1, 0)], e = t_model[int2(2, 0)];
-    const float2 f = t_model[int2(3, 0)], g = t_model[int2(4, 0)], k = t_model[int2(5, 0)];
-    const float nearness = min(fin(depth) && depth >= 0.0 && depth <= 1.0 ? abs(depth - depth_far) : 0.0, k.y);
+    // Two groups of depths each have their own fit (rows 0 and 1; texel 8 the nearness that parts
+    // them, 0 with one group): a pixel is given its own group's when that is valid, else the other's.
+    const float own = fin(depth) && depth >= 0.0 && depth <= 1.0 ? abs(depth - depth_far) : 0.0;
+    const float split = t_model[int2(8, 0)].x;
+    int row = split > 0.0 && own >= split ? 1 : 0;
+    if (!(t_model[int2(6, row)].x > 0.5)) row = 1 - row;
+    if (!(t_model[int2(6, row)].x > 0.5)) return false;
+    const float2 a = t_model[int2(0, row)], b = t_model[int2(1, row)], e = t_model[int2(2, row)];
+    const float2 f = t_model[int2(3, row)], g = t_model[int2(4, row)], k = t_model[int2(5, row)];
+    const float nearness = min(own, k.y);
     const float sc = 2.0 / float(h);
     const float X = (c.x - 0.5 * float(w)) * sc, Y = (c.y - 0.5 * float(h)) * sc;
     // theta 0..10 = a.x a.y b.x b.y e.x e.y f.x f.y g.x g.y k.x

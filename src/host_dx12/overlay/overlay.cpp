@@ -1894,13 +1894,18 @@ void write_menu_progress(HANDLE log)
     // cannot measure follow. Why pairs had no model, and the newest completed pair's fit: its samples,
     // how many agree, their mean robust error (px^2), the nearest depth distance it answers for, and
     // the eleven terms (a0..a7 the picture's own flow in pixels, c1..c3 the parallax per unit of depth distance).
-    {char line[620];int n=snprintf(line,sizeof line,"j2screenfit on=%d pairs=%llu with_model=%llu no_model{too_few_samples=%llu not_solved=%llu samples_disagree=%llu} "
+    {char line[1100];int n=snprintf(line,sizeof line,"j2screenfit on=%d pairs=%llu with_model=%llu no_model{too_few_samples=%llu not_solved=%llu samples_disagree=%llu} "
         "last{frame=%llu model=%d samples=%.0f agree=%.0f error=%.4f nearness_limit=%.6f steps=%u terms=",
         cf.screen_on?1:0,(unsigned long long)cf.screen_pairs,(unsigned long long)cf.screen_valid,(unsigned long long)cf.screen_few,(unsigned long long)cf.screen_unsolved,
         (unsigned long long)cf.screen_disagree,(unsigned long long)cf.screen_frame,cf.screen_last_valid?1:0,cf.screen_samples,cf.screen_agree,cf.screen_energy,
         cf.screen_nearness_limit,cf.screen_steps);
         for(unsigned k=0;k<11 && n>0 && n<int(sizeof line)-24;++k)n+=snprintf(line+n,sizeof line-size_t(n),"%s%.5g",k?",":"",cf.screen_theta[k]);
-        if(n>0 && n<int(sizeof line)-4){n+=snprintf(line+n,sizeof line-size_t(n),"}\r\n");WriteFile(log,line,DWORD(n),&cfw,nullptr);}}
+        // VARIANT motion/screen-fit/depth-layers: split 0 = one group of depths (they run on without an
+        // empty stretch, or a side holds too few samples) and the terms above are the one fit.
+        if(n>0 && n<int(sizeof line)-4)n+=snprintf(line+n,sizeof line-size_t(n),"} depth_groups{pairs_split=%llu near_with_model=%llu last{split_nearness=%.6g near_model=%d near_samples=%.0f near_agree=%.0f near_error=%.4f near_steps=%u near_terms=",
+            (unsigned long long)cf.screen_split,(unsigned long long)cf.screen_near_valid,cf.screen_split_nearness,cf.screen_near_last_valid?1:0,cf.screen_near_samples,cf.screen_near_agree,cf.screen_near_energy,cf.screen_near_steps);
+        for(unsigned k=0;k<11 && n>0 && n<int(sizeof line)-24;++k)n+=snprintf(line+n,sizeof line-size_t(n),"%s%.5g",k?",":"",cf.screen_near_theta[k]);
+        if(n>0 && n<int(sizeof line)-6){n+=snprintf(line+n,sizeof line-size_t(n),"}}\r\n");WriteFile(log,line,DWORD(n),&cfw,nullptr);}}
     // VARIANT flow/frame-candidates (core/flow_candidates.hpp): why blocks changed. The newest completed
     // pair's candidates, strongest first, as (x,y)xblocks; a block takes one only when it explains
     // the two pictures clearly better than the block's own vector.

@@ -272,8 +272,16 @@ bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, out float2 best,
 // (their own meaning is not used by them, and the block stays the 28 words every user binds):
 #define depth_far history_dx  // the depth value at the far end: 0 for reversed depth, 1 otherwise
 #define fit_scale history_dy  // fit_accum: this step's weight scale in pixels; 0 = the plain first step
-//      mode                     fit_solve: 0 a solving step, 1 the final evaluation
+//      mode                     fit_solve: 0 a solving step, 1 the final evaluation, 2 the depth groups' split
+#define fit_row offset        // which group of depths this fit is: 0 the far group (every depth when there is no split), 1 the near group
+#define fit_tile_now agree_px  // the tile scale of the weights this pass uses; 0 no tile weights at all; under 0 none yet at this step
+#define fit_tile_next agree_cos // the tile scale of the weights this pass leaves for the next; 0 or less: every weight 1
 static const float kFitRobust = 1.5, kFitMinSamples = 256.0, kFitMinAgree = 0.5, kFitMaxVector = 512.0, kFitDamping = 1e-4;
+static const float kFitTileFinal = 0.1, kFitTileNoise = 9.0; // screen_motion.hpp Params::tile_final_px, tile_noise
+// screen_motion.hpp LayerParams and kDepthBins.
+#define FIT_BINS 50
+static const uint kFitGapBins = 3u, kFitNearSpan = 6u;
+static const float kFitGapStray = 0.002;
 #define FIT_TERMS 11
 #define FIT_PAIRS 66   // the normal matrix's upper triangle, row by row
 #define FIT_COUNT 77   // confirmed samples
@@ -286,9 +294,22 @@ static const float kFitRobust = 1.5, kFitMinSamples = 256.0, kFitMinAgree = 0.5,
 // (too few samples, or a step could not be solved), 17 steps solved, 18 the stop state (FIT_STOP: 0
 // solving; 1 the last step no longer moved its samples, so the next pass over them is the final
 // evaluation; 2 that pass is in the buffer and the remaining passes do nothing); from FIT_HEAD each
-// thread group's FIT_VALUES partial sums.
+// thread group's FIT_VALUES partial sums, and after the last group's each group's FIT_TILE words. A
+// thread group is one TILE of 8 x 8 samples (screen_motion.hpp TileGrid). Its tile words: the sums
+// over its samples of w rx, w ry, w, w r^2 with the sample weight alone, as this pass found them,
+// and the tile's weight for the next pass (fit_solve writes it; screen_motion.hpp WeighTiles).
+// Word 19: the nearness that parts the far group from the near group; 0 with one group
+// (screen_motion.hpp FindSplit). fit_solve's mode 2 writes it and the fits of both groups read it.
 #define FIT_HEAD 20
 #define FIT_STOP 18
+#define FIT_SPLIT 19
+#define FIT_TILE 5
+#define FIT_GATHER (FIT_VALUES + 4) // what a lane gathers per sample: the 81 values and the four tile sums
+uint fit_tiles_across() { return (gw + 7u) / 8u; }
+uint fit_tiles() { return fit_tiles_across() * ((gh + 7u) / 8u); }
+uint fit_tile_word(uint tile, uint k) { return (FIT_HEAD + fit_tiles() * FIT_VALUES + tile * FIT_TILE + k) * 4; }
+// Whether a sample of this nearness belongs to the group this fit is for (screen_motion.hpp Window).
+bool fit_holds(float nearness, float split) { return fit_row == 0u ? (split <= 0.0 || nearness < split) : (split > 0.0 && nearness >= split); }
 static const float kFitConverged = 0.001; // screen_motion.hpp Params::converged_px
 bool fin(float a) { return (asuint(a) & 0x7fffffffu) < 0x7f800000u; }
 // A depth value's distance from the far end; 0 for a value that is not a depth.
@@ -327,21 +348,22 @@ void fit_sample(uint3 id : SV_DispatchThreadID) {
 // thread group, their sums stored per group. t_hist is bound as the fit's grid. Each lane writes
 // its own sample's values, then lane t sums value t (and t + 64) over the group's samples in lane
 // order: one barrier, and the 81 sums are made and stored side by side.
-groupshared float gf[64 * FIT_VALUES];
+groupshared float gf[64 * FIT_GATHER];
 groupshared uint gc[64];
 [numthreads(64, 1, 1)]
 void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     // The fit has stopped and its final pass is already in the buffer: nothing to do. (No lane
     // leaves before the barrier.)
     const bool idle = u_cnt.Load(FIT_STOP * 4) >= 2u;
-    const uint s = gid.x * 64 + gi;
+    const uint across = fit_tiles_across();
+    const uint2 cell = uint2((gid.x % across) * 8u + (gi & 7u), (gid.x / across) * 8u + (gi >> 3));
     uint used = 0u;
-    if (!idle && s < gw * gh) {
-        const uint2 cell = uint2(s % gw, s / gw);
+    if (!idle && cell.x < gw && cell.y < gh) {
         const float4 a = t_hist[cell];
-        if (a.w > 0.5 && fin(a.x) && fin(a.y) && fin(a.z) && abs(a.x) < kFitMaxVector && abs(a.y) < kFitMaxVector) {
+        if (a.w > 0.5 && fin(a.x) && fin(a.y) && fin(a.z) && abs(a.x) < kFitMaxVector && abs(a.y) < kFitMaxVector &&
+            fit_holds(a.z, asfloat(u_cnt.Load(FIT_SPLIT * 4)))) {
             used = 1u;
-            const uint base = gi * FIT_VALUES;
+            const uint base = gi * FIT_GATHER;
             const float2 p = float2(cell * block + block / 2) + 0.5 - float2(jitter_x, jitter_y);
             float bu[FIT_TERMS], bv[FIT_TERMS];
             fit_terms(p, a.z, bu, bv);
@@ -351,7 +373,9 @@ void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
             const float rr = dot(r, r), c2 = kFitRobust * kFitRobust;
             // 1 / (1 + r^2 / s^2)^2: its pull on the fit falls as 1 / r^3 (screen_motion.hpp).
             const float qw = fit_scale > 0.0 ? 1.0 / (1.0 + rr / (fit_scale * fit_scale)) : 1.0;
-            const float wgt = qw * qw;
+            // The tile's weight, made from the pass before this one (screen_motion.hpp WeighTiles).
+            const float tile = fit_tile_now > 0.0 ? asfloat(u_cnt.Load(fit_tile_word(gid.x, 4))) : 1.0;
+            const float ws = qw * qw, wgt = ws * tile;
             uint idx = 0;
             [unroll] for (uint ia = 0; ia < FIT_TERMS; ++ia) {
                 [unroll] for (uint ib = ia; ib < FIT_TERMS; ++ib) { gf[base + idx] = wgt * (bu[ia] * bu[ib] + bv[ia] * bv[ib]); ++idx; }
@@ -362,7 +386,13 @@ void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
             gf[base + FIT_COUNT] = 1.0;
             gf[base + FIT_ENERGY] = 0.5 * rr / (1.0 + rr / c2);
             gf[base + FIT_INLIERS] = agrees ? 1.0 : 0.0;
-            gf[base + FIT_NEAREST] = agrees ? a.z : 0.0;
+            // The model is asked no nearer than the nearest agreeing sample of a tile that still holds the fit.
+            gf[base + FIT_NEAREST] = agrees && tile > 0.5 ? a.z : 0.0;
+            // This pass's own disagreement for the tile, with the sample weight alone.
+            gf[base + FIT_VALUES + 0] = ws * r.x;
+            gf[base + FIT_VALUES + 1] = ws * r.y;
+            gf[base + FIT_VALUES + 2] = ws;
+            gf[base + FIT_VALUES + 3] = ws * rr;
         }
     }
     gc[gi] = used;
@@ -370,15 +400,16 @@ void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     if (!idle) {
         [unroll] for (uint part = 0; part < 2; ++part) {
             const uint t = gi + part * 64;
-            if (t < FIT_VALUES) {
+            if (t < FIT_GATHER) {
                 float sum = 0;
                 [loop] for (uint lane = 0; lane < 64; ++lane) {
                     if (gc[lane] != 0u) {
-                        const float x = gf[lane * FIT_VALUES + t];
+                        const float x = gf[lane * FIT_GATHER + t];
                         sum = t == FIT_NEAREST ? max(sum, x) : sum + x;
                     }
                 }
-                u_cnt.Store((FIT_HEAD + gid.x * FIT_VALUES + t) * 4, asuint(sum));
+                if (t < FIT_VALUES) u_cnt.Store((FIT_HEAD + gid.x * FIT_VALUES + t) * 4, asuint(sum));
+                else u_cnt.Store(fit_tile_word(gid.x, t - FIT_VALUES), asuint(sum));
             }
         }
     }
@@ -387,15 +418,78 @@ void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
 // One thread group: the groups' sums reduced, then one step of the fit (screen_motion.hpp Solve:
 // the scaled, damped normal equations by Cholesky, as a correction to the terms) or, with mode 1,
 // the final evaluation (screen_motion.hpp Fit's last pass). u_enc is bound as the model `measure`
-// reads (RG32F, 8 x 1): texels 0..4 the terms in pairs, 5 the last term and nearness_limit, 6 valid and
-// the confirmed samples, 7 those agreeing and their mean robust error.
+// reads (RG32F, 9 x 2; row fit_row: 0 the far group or the one fit of every depth, 1 the near
+// group): texels 0..4 the terms in pairs, 5 the last term and nearness_limit, 6 valid and the
+// confirmed samples, 7 those agreeing and their mean robust error, 8 the split's nearness.
+// A solving step also leaves every tile's weight for the next pass (screen_motion.hpp WeighTiles).
+// Mode 2, before the fits: the samples' depths are counted in half-octave bins (t_hist is bound as
+// the fit's grid) and the split is found (screen_motion.hpp DepthCounts, FindSplit).
 // The 81 values are reduced side by side: lane v + 81 k (k = 0, 1, 2) sums value v over every third
 // group, then lane v joins its three parts. Two barriers in all.
 groupshared float gr[256];
 groupshared float gt[FIT_VALUES];
+groupshared float gq[512];             // each lane's share of the tiles' spread and weight
+groupshared float gvar;                // the samples' spread about their tiles' means
+groupshared uint gbin[64 * FIT_BINS];  // mode 2: 64 lanes' own counts per bin
+uint fit_bin(float nearness) { // screen_motion.hpp DepthBin
+    if (!(nearness > 5.9604645e-8)) return 0u;
+    return uint(clamp(49 + int(floor(2.0 * log2(nearness))), 1, FIT_BINS - 1));
+}
+void fit_split(uint gi) {
+    if (gi < 64u) {
+        uint own[FIT_BINS];
+        [loop] for (uint b0 = 0; b0 < FIT_BINS; ++b0) own[b0] = 0u;
+        const uint cells = gw * gh;
+        [loop] for (uint at = gi; at < cells; at += 64u) {
+            const float4 a = t_hist[uint2(at % gw, at / gw)];
+            if (a.w > 0.5 && fin(a.x) && fin(a.y) && fin(a.z) && abs(a.x) < kFitMaxVector && abs(a.y) < kFitMaxVector) own[fit_bin(a.z)] += 1u;
+        }
+        [loop] for (uint b1 = 0; b1 < FIT_BINS; ++b1) gbin[gi * FIT_BINS + b1] = own[b1];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi != 0u) return;
+    float bins[FIT_BINS];
+    float total = 0;
+    [loop] for (uint b = 0; b < FIT_BINS; ++b) {
+        uint n = 0u;
+        [loop] for (uint lane = 0; lane < 64u; ++lane) n += gbin[lane * FIT_BINS + b];
+        bins[b] = float(n);
+        total += float(n);
+    }
+    const float stray_max = kFitGapStray * total;
+    // The nearest bin that holds more than strays.
+    uint top = FIT_BINS - 1;
+    float nearer = 0;
+    [loop] for (uint q = 0; q < FIT_BINS; ++q) {
+        if (top > 0u && nearer + bins[top] <= stray_max) { nearer += bins[top]; --top; }
+    }
+    float split = 0, below = 0;
+    uint best = 0u;
+    [loop] for (uint first = 1; first < FIT_BINS; ++first) {
+        below += bins[first - 1];
+        // The longest run starting here that holds no more than the stray allowance.
+        float held = 0;
+        uint run = 0u;
+        bool open = true;
+        [loop] for (uint c = 0; c < FIT_BINS; ++c) {
+            if (c >= first && open) {
+                if (held + bins[c] <= stray_max) { held += bins[c]; ++run; }
+                else open = false;
+            }
+        }
+        const float above = total - below - held;
+        const bool near_is_one_group = top < first + run + kFitNearSpan;
+        if (below >= kFitMinSamples && run >= kFitGapBins && above >= kFitMinSamples && run > best && near_is_one_group) {
+            best = run;
+            split = exp2(0.5 * (float(first + run / 2u) - 49.0)); // the lower edge of the run's middle bin
+        }
+    }
+    u_cnt.Store(FIT_SPLIT * 4, asuint(split));
+}
 [numthreads(256, 1, 1)]
 void fit_solve(uint gi : SV_GroupIndex) {
-    const uint groups = (gw * gh + 63) / 64;
+    if (mode == 2u) { fit_split(gi); return; }
+    const uint groups = fit_tiles();
     const uint stop = u_cnt.Load(FIT_STOP * 4);
     // A solving step after the fit has stopped: 1 keeps this pass's sums as the final evaluation,
     // 2 has nothing left to do. Either way nothing is reduced or solved.
@@ -409,12 +503,44 @@ void fit_solve(uint gi : SV_GroupIndex) {
         }
     }
     gr[gi] = part;
+    // The tiles' weights for the next pass: first the samples' own spread about their tiles' means.
+    const bool weigh = !idle && mode == 0u;
+    float spread = 0, weight = 0;
+    if (weigh) {
+        [loop] for (uint g1 = gi; g1 < groups; g1 += 256u) {
+            const float sw = asfloat(u_cnt.Load(fit_tile_word(g1, 2)));
+            if (sw > 0.0) {
+                const float2 mean = float2(asfloat(u_cnt.Load(fit_tile_word(g1, 0))), asfloat(u_cnt.Load(fit_tile_word(g1, 1)))) / sw;
+                spread += asfloat(u_cnt.Load(fit_tile_word(g1, 3))) - sw * dot(mean, mean);
+                weight += sw;
+            }
+        }
+    }
+    gq[gi] = spread;
+    gq[256 + gi] = weight;
     GroupMemoryBarrierWithGroupSync();
     if (gi < FIT_VALUES) {
         const float x0 = gr[gi], x1 = gr[gi + FIT_VALUES], x2 = gr[gi + 2 * FIT_VALUES];
         gt[gi] = gi == FIT_NEAREST ? max(x0, max(x1, x2)) : x0 + x1 + x2;
     }
+    if (gi == 255u) { // a lane with nothing else to do here
+        float sp = 0, wt = 0;
+        [loop] for (uint lane = 0; lane < 256u; ++lane) { sp += gq[lane]; wt += gq[256 + lane]; }
+        gvar = wt > 0.0 ? max(sp / wt, 0.0) : 0.0;
+    }
     GroupMemoryBarrierWithGroupSync();
+    if (weigh) {
+        [loop] for (uint g2 = gi; g2 < groups; g2 += 256u) {
+            float tw = 1.0;
+            const float sw = asfloat(u_cnt.Load(fit_tile_word(g2, 2)));
+            if (fit_tile_next > 0.0 && sw > 0.0) {
+                const float2 mean = float2(asfloat(u_cnt.Load(fit_tile_word(g2, 0))), asfloat(u_cnt.Load(fit_tile_word(g2, 1)))) / sw;
+                const float qt = 1.0 / (1.0 + dot(mean, mean) / (fit_tile_next * fit_tile_next + kFitTileNoise * gvar / sw));
+                tw = qt * qt;
+            }
+            u_cnt.Store(fit_tile_word(g2, 4), asuint(tw));
+        }
+    }
     if (gi != 0) return;
     if (idle) {
         if (stop == 1u) u_cnt.Store(FIT_STOP * 4, 2u);
@@ -494,7 +620,9 @@ void fit_solve(uint gi : SV_GroupIndex) {
                 }
             }
             const float moved = gt[0] > 1e-20 ? sqrt(max(q, 0.0) / gt[0]) : 0.0;
-            if (fit_scale > 0.0 && fit_scale <= kFitRobust && moved < kFitConverged) u_cnt.Store(FIT_STOP * 4, 1u);
+            // (and, with tile weights, once those have their final scale too)
+            const bool tiles_final = fit_tile_now == 0.0 || (fit_tile_now > 0.0 && fit_tile_now <= kFitTileFinal);
+            if (fit_scale > 0.0 && fit_scale <= kFitRobust && tiles_final && moved < kFitConverged) u_cnt.Store(FIT_STOP * 4, 1u);
         } else {
             u_cnt.Store(16 * 4, 1u);
         }
@@ -512,21 +640,31 @@ void fit_solve(uint gi : SV_GroupIndex) {
     float th2[FIT_TERMS + 1];
     [unroll] for (uint k3 = 0; k3 < FIT_TERMS; ++k3) th2[k3] = valid ? asfloat(u_cnt.Load(k3 * 4)) : 0.0;
     th2[FIT_TERMS] = valid ? nearness_limit : 0.0;
-    [unroll] for (uint k4 = 0; k4 < 6; ++k4) u_enc[uint2(k4, 0)] = float4(th2[2 * k4], th2[2 * k4 + 1], 0, 0);
-    u_enc[uint2(6, 0)] = float4(valid ? 1.0 : 0.0, n, 0, 0);
-    u_enc[uint2(7, 0)] = float4(agree, energy, 0, 0);
+    [unroll] for (uint k4 = 0; k4 < 6; ++k4) u_enc[uint2(k4, fit_row)] = float4(th2[2 * k4], th2[2 * k4 + 1], 0, 0);
+    u_enc[uint2(6, fit_row)] = float4(valid ? 1.0 : 0.0, n, 0, 0);
+    u_enc[uint2(7, fit_row)] = float4(agree, energy, 0, 0);
+    u_enc[uint2(8, fit_row)] = float4(asfloat(u_cnt.Load(FIT_SPLIT * 4)), 0, 0, 0);
 }
 // The model at a position (screen_motion.hpp Evaluate). t_res is bound as fit_solve's model; with
 // nothing bound there every read is 0 and there is no model.
-float2 screen_at(float2 p, float nearness) {
+// `row`: which group's fit (screen_row).
+float2 screen_at(float2 p, float nearness, int row) {
     float bu[FIT_TERMS], bv[FIT_TERMS];
     fit_terms(p, nearness, bu, bv);
     float2 v = 0;
     [unroll] for (uint k = 0; k < FIT_TERMS; ++k) {
-        const float2 pr = t_res[int2(k / 2, 0)];
+        const float2 pr = t_res[int2(k / 2, row)];
         v += ((k & 1u) != 0u ? pr.y : pr.x) * float2(bu[k], bv[k]);
     }
     return v;
+}
+// The fit a pixel of this depth is given (screen_motion.hpp ModelFor): its own group's when that is
+// valid, else the other group's; -1: no model at all. A model texture of one row has one fit.
+int screen_row(float nearness) {
+    const float split = t_res[int2(8, 0)].x;
+    const int own = split > 0.0 && nearness >= split ? 1 : 0;
+    if (t_res[int2(6, own)].x > 0.5) return own;
+    return t_res[int2(6, 1 - own)].x > 0.5 ? 1 - own : -1;
 }
 )" R"(
 // t_raw: the search's vector after the depth-aware expansion; t_valid: that expansion's validity;
@@ -556,9 +694,11 @@ void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             bool raw_on = have_raw && q.x >= 0.0 && q.y >= 0.0 && q.x <= float(w) && q.y <= float(h);
             // The hypothesis "nothing moved by itself": the screen's own motion here, never asked
             // about a depth nearer than its nearest agreeing sample; exact stillness with no model.
-            bool have_screen = t_res[int2(6, 0)].x > 0.5;
+            const float own_nearness = nearness_of(t_color[id.xy].x);
+            const int row = screen_row(own_nearness);
+            bool have_screen = row >= 0;
             float2 hyp = 0;
-            if (have_screen) hyp = screen_at(p, min(nearness_of(t_color[id.xy].x), t_res[int2(5, 0)].y));
+            if (have_screen) hyp = screen_at(p, min(own_nearness, t_res[int2(5, row)].y), row);
             float2 best; float e_best, e_with, limit, e_snap;
             if (best_vector(p, hyp, raw_on, raw, best, e_best, e_with, limit, e_snap)) {
                 valid = 1.0;
