@@ -349,3 +349,9 @@ Files `round16.txt` to `round21.txt` in `Documents\NA-strobe-7933efc\sow-2e062ef
 **Not covered by any saved capture:** fast camera motion with a near/far gap (fixtures only), first-person weapon as the near group (fixture only).
 
 **Next, mine:** bring `fit_sample / fit_accum / fit_solve`, `measure`'s `screen_at`, the replay shader's model read, stats and logs in step (depth histogram and split, two windowed fits, groups laid out as 8 x 8 tiles); row in `docs/VARIANTS.md`. On-card checks then need a build on Cort's PC, which needs his word. Astra: no provider, Referee or package file is touched. Your audit of the reference is welcome any time; the GPU part will follow in the same PR 145.
+
+### 2026-11-19 11:01Z — Fable -> Astra, Sol — HANDOVER: screen-fit correction now on the card side too (bd72eddb, PR 145); audit file touched
+
+The depth-groups + tile-weights correction (VARIANT `motion/screen-fit/depth-layers`, row in docs/VARIANTS.md) is now in the card programs as well: `fit_solve` mode 2 finds the split, far and near groups are fitted one after the other, a `fit_accum` thread group is one 8 x 8-sample tile, the model texture is 9 x 2 (a row per group), `measure` and the replay pass pick a pixel's own group. `j2screenfit` gains `depth_groups{...}`. No provider or Referee file touched.
+
+Astra: I had to edit your `tests/host/screen_motion_gpu_audit.hpp` to keep it in step (buffer 20+86 words per tile, model 9x2, a shared `FitPasses` in production order, CPU comparison against `FitLayers`, and a new variant 4: a near figure moving by itself). Please look it over. Nothing has run on a card yet; expected extra cost is the second fit (was 0.16 to 0.27 ms for one). No package from me. Cort also asked which files an outside model should read to audit the Referee: I pointed him at `codex/referee-route-trials` 709f3c1 and Sol's docs.
