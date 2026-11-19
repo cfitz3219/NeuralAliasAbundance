@@ -12,6 +12,11 @@
 //  - noise, things moving by themselves and plain wrong samples do not pull the fit away;
 //  - too few samples, or samples that do not agree, give no model at all;
 //  - the model is never asked about a depth nearer than its nearest agreeing sample;
+//  - a large near figure moving by itself in front of a still far scene (Cort's Shadow of War
+//    character screen of 2026-11-18) bends the one fit and with it the still scene; with the depths
+//    fitted as two groups the still scene is handed nothing that depends on the figure at all, a
+//    rigid scene with the same two groups keeps its exact camera motion, and depths that run on
+//    without a gap are one group and one fit, exactly as before;
 //  - on a mostly flat picture, still or moving, a pixel that cannot be measured follows the fit and
 //    never the search's vector, however wrong the search is there. Nearer than the nearest patch
 //    that can be measured it carries that patch's depth's motion: less than the truth, and stated.
@@ -106,6 +111,90 @@ Errors Against(const screen::Model& m, const Camera& c, bool measured_depths_onl
         }
     e.mean /= float((std::max)(n, 1));
     return e;
+}
+
+// The Shadow of War character screen as the fit sees it: a figure over 28% of the picture, every
+// block of it measurable, bending as it moves (`speed` px a frame, not a camera's motion and not a
+// rigid body's); behind it a still scene a dozen times further off of which three blocks in ten can
+// be measured, with the measurement's own noise. The camera does not move.
+bool OnFigure(float px, float py)
+{
+    const float u = (px - 0.42f * kW) / (0.19f * kW), v = (py - 0.55f * kH) / (0.5f * kH);
+    return u * u + v * v < 1.0f;
+}
+float FigureSceneNearness(float px, float py)
+{
+    if (OnFigure(px, py)) {
+        const float u = (px - 0.42f * kW) / (0.19f * kW), v = (py - 0.55f * kH) / (0.5f * kH);
+        return 0.009f + 0.005f * (0.5f + 0.5f * std::sin(7.0f * u) * std::cos(5.0f * v));
+    }
+    const float horizon = 0.45f * kH;
+    return py < horizon ? 0.0002f * (py / horizon) : 0.0004f + 0.00035f * (py - horizon) / (float(kH) - horizon);
+}
+std::vector<screen::Sample> FigureSamples(float speed, uint32_t seed)
+{
+    std::vector<screen::Sample> s;
+    Rng rng{seed};
+    for (uint32_t y = 4; y < kH; y += 8)
+        for (uint32_t x = 4; x < kW; x += 8) {
+            screen::Sample a;
+            a.px = float(x) + 0.5f;
+            a.py = float(y) + 0.5f;
+            a.nearness = FigureSceneNearness(a.px, a.py);
+            // The same random draws whatever the speed, so two speeds differ in the figure's motion only.
+            const float draw = rng.Next(), nx = rng.Gauss(), ny = rng.Gauss();
+            if (OnFigure(a.px, a.py)) {
+                const float u = (a.px - 0.42f * kW) / (0.19f * kW), v = (a.py - 0.55f * kH) / (0.5f * kH);
+                a.confirmed = true;
+                a.vx = speed * (0.8f * std::sin(3.1f * v + 0.4f) + 0.5f * u * v + 0.3f) + 0.1f * nx;
+                a.vy = speed * (0.6f * std::cos(2.3f * u) - 0.4f * v * v + 0.5f * u) + 0.1f * ny;
+            } else {
+                a.confirmed = draw < 0.3f;
+                a.vx = 0.1f * nx;
+                a.vy = 0.1f * ny;
+            }
+            s.push_back(a);
+        }
+    return s;
+}
+// What the still far scene is handed: all of it, and the part that differs from place to place
+// (the part DLSS turns into waves; a uniform shift moves the picture as one).
+struct Handed { float rms = 0, uneven = 0, worst = 0; };
+template <typename ModelAt>
+Handed HandedToFarScene(ModelAt&& model_at)
+{
+    double sum = 0, sx = 0, sy = 0;
+    int n = 0;
+    Handed h;
+    for (uint32_t y = 1; y < kH; y += 3)
+        for (uint32_t x = 1; x < kW; x += 3) {
+            const float px = float(x) + 0.5f, py = float(y) + 0.5f;
+            if (OnFigure(px, py)) continue;
+            const float nearness = FigureSceneNearness(px, py);
+            const screen::Model* m = model_at(nearness);
+            if (!m) continue;
+            float vx, vy;
+            screen::Evaluate(*m, px, py, nearness, kW, kH, vx, vy);
+            sum += double(vx) * vx + double(vy) * vy;
+            sx += vx;
+            sy += vy;
+            h.worst = (std::max)(h.worst, std::hypot(vx, vy));
+            ++n;
+        }
+    if (!n) return h;
+    const double mx = sx / n, my = sy / n;
+    h.rms = float(std::sqrt(sum / n));
+    h.uneven = float(std::sqrt((std::max)(0.0, sum / n - mx * mx - my * my)));
+    return h;
+}
+
+// A rigid scene with the same two groups of depths: a far landscape and something near and large
+// that is part of the scene (a wall, a cockpit frame), all of it seen by one moving camera.
+float TwoGroupNearness(float px, float py)
+{
+    if (px > 0.62f * kW) return 0.03f + 0.02f * (px - 0.62f * kW) / (0.38f * kW);
+    const float horizon = 0.42f * kH;
+    return py <= horizon ? 0.0f : 0.004f * (py - horizon) / (float(kH) - horizon);
 }
 
 const Camera kMoves[] = {
@@ -279,6 +368,113 @@ int main()
             screen::Evaluate(m, 100.5f, 300.5f, m.nearness_limit, kW, kH, a0, a1);
             screen::Evaluate(m, 100.5f, 300.5f, 0.04f, kW, kH, b0, b1);
             CHECK(a0 == b0 && a1 == b1);
+        }},
+        {"a large near figure moving by itself cannot decide what the still far scene is handed", [] {
+            Handed slowest;
+            int i = 0;
+            for (const float speed : {0.3f, 0.6f, 1.2f}) {
+                const auto samples = FigureSamples(speed, 77);
+                // The one fit: the figure agrees with it (within robust_px), holds most of the samples, and bends it.
+                const screen::Model one = screen::Fit(samples.data(), samples.size(), kW, kH);
+                CHECK(one.valid && one.agree > 0.98f * one.samples);
+                const Handed before = HandedToFarScene([&](float) { return &one; });
+                const screen::Layers l = screen::FitLayers(samples.data(), samples.size(), kW, kH);
+                CHECK(l.split.found && l.far_fit.valid && l.near_fit.valid);
+                CHECK(l.split.nearness > 0.00075f && l.split.nearness < 0.009f);
+                const Handed after = HandedToFarScene([&](float nearness) { return screen::ModelFor(l, nearness); });
+                std::printf("  figure moving %.1f px: split at nearness %.5f (%.0f far samples, %.0f near, %.0f between)\n"
+                            "      one fit:    still scene handed %.4f px, uneven %.4f, worst %.4f\n"
+                            "      two groups: still scene handed %.4f px, uneven %.4f, worst %.4f\n",
+                            speed, l.split.nearness, l.split.far_samples, l.split.near_samples, l.split.stray, before.rms, before.uneven, before.worst,
+                            after.rms, after.uneven, after.worst);
+                // The fault: uneven false motion that grows with the figure's speed (the captures: 0.04 to 0.22 px).
+                CHECK(before.uneven > 0.25f * speed);
+                // The correction: what is left is the far samples' own noise, and it is the SAME numbers whatever the figure does.
+                CHECK(after.uneven < 0.02f && after.worst < 0.05f);
+                if (i == 0) slowest = after;
+                else CHECK(after.rms == slowest.rms && after.uneven == slowest.uneven && after.worst == slowest.worst);
+                // The figure is given its own group's fit, which follows it better than the one fit did.
+                double own_one = 0, own_two = 0;
+                int n = 0;
+                for (const auto& a : samples) {
+                    if (!OnFigure(a.px, a.py)) continue;
+                    float ox, oy, tx, ty;
+                    screen::Evaluate(one, a.px, a.py, a.nearness, kW, kH, ox, oy);
+                    screen::Evaluate(*screen::ModelFor(l, a.nearness), a.px, a.py, a.nearness, kW, kH, tx, ty);
+                    own_one += std::hypot(ox - a.vx, oy - a.vy);
+                    own_two += std::hypot(tx - a.vx, ty - a.vy);
+                    ++n;
+                }
+                std::printf("      the figure's own samples against the fit they follow: %.4f px with one fit, %.4f px with their own\n", own_one / n, own_two / n);
+                CHECK(own_two <= own_one);
+                ++i;
+            }
+        }},
+        {"a rigid scene with two groups of depths keeps its exact camera motion", [] {
+            int i = 0;
+            for (const Camera& c : kMoves) {
+                std::vector<screen::Sample> samples;
+                for (uint32_t y = 4; y < kH; y += 8)
+                    for (uint32_t x = 4; x < kW; x += 8) {
+                        screen::Sample a;
+                        a.px = float(x) + 0.5f;
+                        a.py = float(y) + 0.5f;
+                        a.nearness = TwoGroupNearness(a.px, a.py);
+                        TrueFlow(c, a.px, a.py, a.nearness, a.vx, a.vy);
+                        a.confirmed = true;
+                        samples.push_back(a);
+                    }
+                const screen::Layers l = screen::FitLayers(samples.data(), samples.size(), kW, kH);
+                CHECK(l.split.found && l.far_fit.valid && l.near_fit.valid);
+                float mean = 0, worst = 0, biggest = 0;
+                int n = 0;
+                for (uint32_t y = 0; y < kH; y += 3)
+                    for (uint32_t x = 0; x < kW; x += 3) {
+                        const float px = float(x) + 0.5f, py = float(y) + 0.5f, nearness = TwoGroupNearness(px, py);
+                        float tx, ty, mx, my;
+                        TrueFlow(c, px, py, nearness, tx, ty);
+                        screen::Evaluate(*screen::ModelFor(l, nearness), px, py, nearness, kW, kH, mx, my);
+                        const float d = std::hypot(mx - tx, my - ty);
+                        mean += d;
+                        worst = (std::max)(worst, d);
+                        biggest = (std::max)(biggest, std::hypot(tx, ty));
+                        ++n;
+                    }
+                mean /= float(n);
+                std::printf("  %-24s largest motion %6.2f px  two-group fit error mean %.4f worst %.4f  (split at %.5f)\n", kMoveNames[i], biggest, mean, worst,
+                            l.split.nearness);
+                CHECK(mean < 0.05f && worst < 0.35f);
+                ++i;
+            }
+        }},
+        {"depths that run on without a gap are one group and the one fit, as before", [] {
+            for (const Camera& c : kMoves) {
+                // Sky at nearness 0 over ground that comes steadily nearer, and a wall: no two groups here.
+                const auto samples = BlockSamples(c);
+                const screen::Layers l = screen::FitLayers(samples.data(), samples.size(), kW, kH);
+                const screen::Model one = screen::Fit(samples.data(), samples.size(), kW, kH);
+                CHECK(!l.split.found && !l.near_fit.valid && l.far_fit.valid == one.valid);
+                for (int k = 0; k < screen::kTerms; ++k) CHECK(l.far_fit.theta[k] == one.theta[k]);
+                CHECK(screen::ModelFor(l, 0.0f) == &l.far_fit && screen::ModelFor(l, 0.04f) == &l.far_fit);
+            }
+            // A gap needs enough samples on both sides, and a few strays inside it do not close it.
+            auto samples = FigureSamples(0.6f, 5);
+            CHECK(screen::FitLayers(samples.data(), samples.size(), kW, kH).split.found);
+            int strays = 0;
+            for (auto& a : samples)
+                if (!OnFigure(a.px, a.py) && a.confirmed && strays < 3) { a.nearness = 0.003f; ++strays; }
+            CHECK(screen::FitLayers(samples.data(), samples.size(), kW, kH).split.found);
+            int kept = 0;
+            for (auto& a : samples)
+                if (OnFigure(a.px, a.py)) a.confirmed = kept++ < 200; // a small near thing: too few samples to be a group
+            const screen::Layers small = screen::FitLayers(samples.data(), samples.size(), kW, kH);
+            CHECK(!small.split.found && !small.near_fit.valid);
+            // With neither group's fit valid there is no model at all; with one, the other's pixels are given it.
+            screen::Layers none;
+            CHECK(screen::ModelFor(none, 0.5f) == nullptr);
+            screen::Layers only_far = screen::FitLayers(FigureSamples(0.6f, 5).data(), FigureSamples(0.6f, 5).size(), kW, kH);
+            only_far.near_fit.valid = false;
+            CHECK(screen::ModelFor(only_far, 0.012f) == &only_far.far_fit);
         }},
         {"on a mostly flat picture a pixel that cannot be measured follows the fit, never the search", [] {
             int i = 0;

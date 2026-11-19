@@ -101,6 +101,12 @@ inline void Evaluate(const Model& m, float px, float py, float nearness, uint32_
     for (int k = 0; k < kTerms; ++k) { vx += m.theta[k] * bu[k]; vy += m.theta[k] * bv[k]; }
 }
 
+// The depths one fit takes its samples from: from <= nearness < below. The default is every depth.
+struct Window {
+    float from = 0.0f, below = 3.0e38f;
+    bool Holds(float nearness) const { return nearness >= from && nearness < below; }
+};
+
 inline bool Usable(const Sample& s, const Params& p)
 {
     return s.confirmed && std::isfinite(s.vx) && std::isfinite(s.vy) && std::isfinite(s.nearness) && std::fabs(s.vx) < p.max_vector &&
@@ -119,14 +125,14 @@ inline float ScaleAt(int step, const Params& p)
 // One pass over the samples at the given terms. `scale_px` 0: the first, plain step. Agreement and
 // the robust error are always counted at robust_px.
 inline void Accumulate(const Sample* samples, size_t count, uint32_t width, uint32_t height, const float theta[kTerms], float scale_px,
-                       const Params& p, double sums[kValues])
+                       const Params& p, double sums[kValues], const Window& window = {})
 {
     for (int i = 0; i < kValues; ++i) sums[i] = 0;
     const float c2 = p.robust_px * p.robust_px, s2 = scale_px * scale_px;
     const bool weighted = scale_px > 0;
     for (size_t s = 0; s < count; ++s) {
         const Sample& a = samples[s];
-        if (!Usable(a, p)) continue;
+        if (!Usable(a, p) || !window.Holds(a.nearness)) continue;
         float bu[kTerms], bv[kTerms];
         Terms(a.px, a.py, a.nearness, width, height, bu, bv);
         float mx = 0, my = 0;
@@ -209,7 +215,7 @@ inline float StepSize(const double sums[kValues], const float delta[kTerms])
     return sums[0] > 1e-20 ? float(std::sqrt((std::max)(q, 0.0) / sums[0])) : 0.0f;
 }
 
-inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t height, const Params& p = {})
+inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t height, const Params& p = {}, const Window& window = {})
 {
     Model m;
     if (!samples || !width || !height) return m;
@@ -218,7 +224,7 @@ inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t h
     bool ok = true;
     for (int step = 0; step < p.steps && ok; ++step) {
         const float scale = step > 0 ? ScaleAt(step, p) : 0.0f;
-        Accumulate(samples, count, width, height, theta, scale, p, sums);
+        Accumulate(samples, count, width, height, theta, scale, p, sums, window);
         if (sums[kCount] < double(p.min_samples)) { ok = false; break; }
         float delta[kTerms];
         ok = Solve(sums, p, delta);
@@ -230,7 +236,7 @@ inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t h
         if (scale > 0 && scale <= p.robust_px && StepSize(sums, delta) < p.converged_px) break;
     }
     // The fitted terms against the samples once more: how many agree, and how near the nearest of those is.
-    if (ok) Accumulate(samples, count, width, height, theta, p.robust_px, p, sums);
+    if (ok) Accumulate(samples, count, width, height, theta, p.robust_px, p, sums, window);
     m.samples = float(sums[kCount]);
     if (!ok) return m;
     m.agree = float(sums[kInliers]);
@@ -239,6 +245,132 @@ inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t h
     for (int k = 0; k < kTerms; ++k) m.theta[k] = theta[k];
     m.valid = m.agree >= p.min_agree * m.samples;
     return m;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Depth layers (VARIANT motion/screen-fit/depth-layers).
+//
+// Why (Cort's Shadow of War run of 2026-11-18, build 2e062ef, measured 2026-11-19). On a character
+// screen an animated figure covered 28% of the picture and held more than half of the fit's samples;
+// the still scene far behind it held the rest. The figure moved by itself, not rigidly, by 0.3 to
+// 1.6 px a frame: inside robust_px, so its samples agreed with the fit and kept their full weight.
+// The three parallax terms cannot describe a bending figure, so the eight position terms took the
+// rest, and those are the ONLY terms the far scene has. The still scene was handed 0.04 to 0.22 px of
+// motion a frame that differed from place to place (r 0.9 with the figure's speed over nine
+// captures). DLSS preset K adds such motion up over its whole history: slow waves over a building
+// that does not move. A reweighting scale cannot part the two: both are within a pixel of any model.
+//
+// What parts them is depth. A camera's turn is what the far scene shows; a near thing cannot tell a
+// turn from its own motion. Where the samples' depths fall into two groups with an empty stretch
+// between them (a figure in front of a landscape, a weapon in front of a world, a cockpit), each
+// group is fitted by itself with the same eleven terms and the same rules, and a pixel is given its
+// own group's fit. In a rigid scene the two fits agree to their noise, so nothing is lost; when one
+// group moves by itself it can no longer decide what the other is handed. Where the depths run on
+// without such a stretch (open ground to the horizon) there is one group and one fit, as before.
+//
+// The stretch is looked for on the depth value's own scale with no unit and no lens: usable samples
+// are counted in half-octave bins of nearness; a run of at least gap_bins bins that together hold
+// almost nothing (gap_stray of the samples), with at least min_samples on each side, is a gap, and
+// the widest one is used. The split is the middle bin edge of the run. The near group must be a
+// group: everything nearer than the gap within near_span_bins half octaves of the nearest samples.
+// Sky at nearness 0 under ground that comes steadily nearer is NOT two groups: on this scale the sky
+// is endlessly far from everything, but the ground above the "gap" runs on through every depth, and
+// its far end is as far as the sky for any motion a camera can make.
+constexpr int kDepthBins = 50; // 0: nearness <= 2^-24 (sky); b: (2^((b-49)/2), 2^((b-48)/2)]; 49: above 1/sqrt(2)
+
+struct LayerParams {
+    int gap_bins = 3;          // an empty stretch this many half octaves wide (a factor 2.8 in nearness at least)
+    float gap_stray = 0.002f;  // the share of all samples the stretch may still hold
+    int near_span_bins = 6;    // the near group's own depths: within a factor 8 of the nearest samples
+};
+
+inline int DepthBin(float nearness)
+{
+    if (!(nearness > 5.9604645e-8f)) return 0; // 2^-24
+    const int b = 49 + int(std::floor(2.0f * std::log2(nearness)));
+    return (std::min)((std::max)(b, 1), kDepthBins - 1);
+}
+// The lower edge of bin b (b >= 1).
+inline float DepthBinEdge(int b) { return std::exp2(0.5f * float(b - 49)); }
+
+struct Split {
+    bool found = false;
+    float nearness = 0;        // far group: nearness < this; near group: the rest
+    float far_samples = 0, near_samples = 0, stray = 0;
+    int first_bin = 0, bins = 0; // the empty run
+};
+
+inline void DepthCounts(const Sample* samples, size_t count, const Params& p, double bins[kDepthBins])
+{
+    for (int i = 0; i < kDepthBins; ++i) bins[i] = 0;
+    for (size_t s = 0; s < count; ++s)
+        if (Usable(samples[s], p)) bins[DepthBin(samples[s].nearness)] += 1.0;
+}
+
+inline Split FindSplit(const double bins[kDepthBins], const Params& p, const LayerParams& lp = {})
+{
+    Split best;
+    double total = 0;
+    for (int i = 0; i < kDepthBins; ++i) total += bins[i];
+    const double stray_max = double(lp.gap_stray) * total;
+    // The nearest bin that holds more than strays.
+    int top = kDepthBins - 1;
+    for (double nearer = 0; top > 0 && nearer + bins[top] <= stray_max; --top) nearer += bins[top];
+    double below = 0;
+    for (int first = 1; first < kDepthBins; ++first) {
+        below += bins[first - 1];
+        if (below < double(p.min_samples)) continue;
+        // The longest run starting here that holds no more than the stray allowance.
+        double held = 0;
+        int last = first - 1;
+        for (int b = first; b < kDepthBins && held + bins[b] <= stray_max; ++b) { held += bins[b]; last = b; }
+        const int run = last - first + 1;
+        const double above = total - below - held;
+        if (run < lp.gap_bins || above < double(p.min_samples) || run <= best.bins) continue;
+        if (top - (first + run) >= lp.near_span_bins) continue; // what lies above the stretch is not one near group
+        best.found = true;
+        best.first_bin = first;
+        best.bins = run;
+        best.nearness = DepthBinEdge(first + run / 2);
+        best.far_samples = float(below);
+        best.near_samples = float(above);
+        best.stray = float(held);
+    }
+    return best;
+}
+
+struct Layers {
+    Split split;
+    Model far_fit, near_fit; // with no split: far_fit is the one fit of every depth and near_fit is not valid
+};
+
+inline Layers FitLayers(const Sample* samples, size_t count, uint32_t width, uint32_t height, const Params& p = {}, const LayerParams& lp = {})
+{
+    Layers l;
+    if (!samples || !width || !height) return l;
+    double bins[kDepthBins];
+    DepthCounts(samples, count, p, bins);
+    l.split = FindSplit(bins, p, lp);
+    if (!l.split.found) {
+        l.far_fit = Fit(samples, count, width, height, p);
+        return l;
+    }
+    Window far_w, near_w;
+    far_w.below = l.split.nearness;
+    near_w.from = l.split.nearness;
+    l.far_fit = Fit(samples, count, width, height, p, far_w);
+    l.near_fit = Fit(samples, count, width, height, p, near_w);
+    return l;
+}
+
+// The fit a pixel of this depth is given: its own group's when that is valid, else the other group's
+// (which is then asked only up to its own nearest agreeing sample, as always). Null: no model at all.
+inline const Model* ModelFor(const Layers& l, float nearness)
+{
+    const bool near_group = l.split.found && nearness >= l.split.nearness;
+    const Model* own = near_group ? &l.near_fit : &l.far_fit;
+    const Model* other = near_group ? &l.far_fit : &l.near_fit;
+    return own->valid ? own : other->valid ? other : nullptr;
 }
 
 } // namespace na::motion::screen
