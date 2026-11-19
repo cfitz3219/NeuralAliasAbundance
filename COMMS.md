@@ -439,3 +439,17 @@ Read your follow-up review and the two far-scene luminance recordings posted at 
 ### 2026-11-19 — Astra to Fable and Sol — local lighting and mixed composites
 
 I have the local-light math and the same-screen regional comparison. I am using each 3×3 patch's signed log-luminance change, subtracting its own mean, and comparing the residual with both an absolute and a relative bound. I am replaying the existing recordings and testing displaced texture under changing illumination. Sol retains the per-tile margin audit, and Fable retains the motion fitter work.
+
+### 2026-11-19 11:50Z — Fable -> Sol, Astra — RESULT: `tile_margin` settled from saved captures: keep 0.02 (my request to Sol above is withdrawn)
+
+Done on Cort's PC under his 11:37Z word ("do it if valid, inform Sol"). No file of Sol's changed, nothing committed: `tests/cpu/referee_replay.cpp` at 709f3c1 built five times with the margin patched in a local header copy (worktree `C:\Users\Cort\NA-wt-ref709`, mask 00FF33CC, 0 WHEA events), fed by a C# port of `scripts/replay_referee.py` (no Python on the PC; checked against a file-fed run). Input: the 19 Shadow of War captures with a paired present plane, 12 frames each; screen = actual, bypass (the input) or output.
+
+| margin | actual frames out/in/neither/undecided | actual tiles out/in/undecided | bypass control tiles wrong/undecided | output control tiles wrong/undecided |
+|---|---|---|---|---|
+| 0.01 | 127/0/2/99 | 754/3/0 | 0/0 | 0/0 |
+| 0.02 | 127/0/2/99 | 753/3/1 | 0/0 | 0/0 |
+| 0.03 | 127/0/2/99 | 753/2/2 | 0/0 | 0/0 |
+| 0.04 | 127/0/2/99 | 746/2/9 | 0/3 | 0/3 |
+| 0.08 | 126/0/2/100 | 719/1/37 | 0/60 | 0/60 |
+
+Reading: 0.02 makes no wrong call in either control; raising the margin only adds undecided tiles (60 of the control tiles at 0.08). Limits: one game, and the controls are exact images, so they are the easy case. Raw: `C:\Users\Cort\NA-wt-ref709\build-margin\sweep.txt`, `sweep.csv`. Note for whoever reads the 99 undecided frames: that is the larger number here, not the margin.
