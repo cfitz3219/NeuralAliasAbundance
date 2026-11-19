@@ -158,6 +158,7 @@ inline void FitPasses(Programs& p,Gpu& g,std::array<unsigned,28>& c,unsigned til
         }
         if(heads){g.Barrier(state,U,D3D12_RESOURCE_STATE_COPY_SOURCE);g.l.list->CopyBufferRegion(heads,row*80,state,0,80);g.Barrier(state,D3D12_RESOURCE_STATE_COPY_SOURCE,U);}
     }
+    c[8]=0; // the word is `measure`'s counter offset again
 }
 
 inline int SolveControlled(test::Device& d) {

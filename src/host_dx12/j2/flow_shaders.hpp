@@ -273,7 +273,7 @@ bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, out float2 best,
 #define depth_far history_dx  // the depth value at the far end: 0 for reversed depth, 1 otherwise
 #define fit_scale history_dy  // fit_accum: this step's weight scale in pixels; 0 = the plain first step
 //      mode                     fit_solve: 0 a solving step, 1 the final evaluation, 2 the depth groups' split
-#define fit_row offset        // which group of depths this fit is: 0 the far group (every depth when there is no split), 1 the near group
+#define fit_row cnt_off       // which group of depths this fit is: 0 the far group (every depth when there is no split), 1 the near group
 #define fit_tile_now agree_px  // the tile scale of the weights this pass uses; 0 no tile weights at all; under 0 none yet at this step
 #define fit_tile_next agree_cos // the tile scale of the weights this pass leaves for the next; 0 or less: every weight 1
 static const float kFitRobust = 1.5, kFitMinSamples = 256.0, kFitMinAgree = 0.5, kFitMaxVector = 512.0, kFitDamping = 1e-4;
