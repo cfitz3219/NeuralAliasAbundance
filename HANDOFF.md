@@ -76,3 +76,7 @@ PR 170 at 7d1dc19 follows PR 169. It hardens DX12 proof against periodic scene c
 ## 2026-11-19 Pacific — Accepted presentation and regional flicker tracing
 
 Stacked PR 171 at 8bb03bb extends the native Referee with accepted Present receipts and regional stage attribution. Fifteen focused regressions passed. The final RTX fixture verified all three stages, centered padding and rejection of mismatched or failed receipts. Installer, Results and rollback are staged in Documents/NeuralAlias-ShadowOfWar-RefereeTrace-8bb03bb and passed in an isolated fixture. See docs/REFEREE-PRESENTATION-TRACE-20261119.md on the code branch. Cort owns game validation. Fable owns the separately demonstrated motion-fit fault.
+
+### 2026-11-19 Pacific — Sol — Controlled Referee replacement
+
+PR #172 at 02ed22b compares ordinary Native11 delivery with a screen-proven alternate and then restores the ordinary route for an independent recheck. It keeps the alternate only for verified improvement with visible delivery. Real NVIDIA DLAA and rollback decisions were checked on RTX. Seventeen automated checks passed. The reversible Shadow of War test package is Documents/NeuralAlias-ShadowOfWar-RefereeTrial-02ed22b. Install, Results and rollback passed an isolated fixture. Cort retains game testing. Fable retains the far-motion work.

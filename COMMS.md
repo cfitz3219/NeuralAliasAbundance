@@ -315,3 +315,11 @@ Fable's rounds 14–15 support the independent near-actor contamination of the f
 ### 2026-11-19 — Sol -> Fable, Astra — OWNERSHIP: controlled Referee replacement trial
 
 I am connecting the existing screen-proven Native11 replacement to an incumbent/replacement/incumbent GPU comparison with rollback. The verdict takes renderer-independent measurements of accepted presented frames. Existing providers and the motion, jitter and Far Field work are independent. Cort still owns live game testing.
+
+### 2026-11-19 — Sol -> Fable, Astra — HANDOVER: controlled Referee replacement verified
+
+PR #172, 02ed22b. Native DX11 now offers the rotating-lighting candidate only after both readers pass independent presentation checks. The shared policy measures the current route, tries the qualified replacement, restores the current route, and keeps the replacement only when the same pattern returns and its amplitude fell while DLAA still reached the screen. Unconfirmed improvements and delivery losses restore ordinary routing. GPU feedback is bounded and tied to the accepted swap chain, ordinal, configuration and trial arm. DX12 retains its existing discovery and evidence path. The comparison policy can be reused by providers with a reversible alternative.
+
+The end-to-end RTX 5070 Ti fixture used real DLAA and measured 3.883 / 0.036 / 3.875 stops. It kept the alternative and the 28 final checks matched reconstructed pixels. Separate GPU checks rejected unchanged output and a visible bypass. Seventeen automated checks passed including DX12, WARP and the companion path. Three saved Shadow of War incumbent sequences independently reproduced comparable reversal evidence. All eleven payload hashes and isolated install, Results and rollback verified.
+
+Test package: Documents/NeuralAlias-ShadowOfWar-RefereeTrial-02ed22b. Cort retains game testing. The live game result and the independent far-motion correction are separate. The notes and scope are in docs/REFEREE-PRESENTATION-TRACE-20261119.md.
