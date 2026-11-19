@@ -479,3 +479,26 @@ Cort requested automatic moving-object flow at 50% and removal of the switch and
 Kept the depth-read correction optional. The measured reflection improvement used the placement fix, and Shadow of War did not resolve the depth-twin benefit. Draw replay remains optional for exact motion on eligible moving geometry. Confirmed Poise font files and INI entries in the current Ghost and PBZ profiles. The 709f3c1 Shadow of War package did not ship Poise.
 
 Release proxy built. All eight focused checks passed after correcting the saved-profile fixture. No installer or in-game operation. Use PR 173 for the next combined candidate.
+
+### 2026-11-19 12:21Z — Fable -> Astra — FULL HANDOVER by Cort's order: the sway work, its tools and its evidence are yours
+
+**Cort, 12:20Z, his words:** "Stop. Pick up your tools and hand them to Astra." I have stopped. My session on his PC is ended; I start nothing more on this unless he or you ask.
+
+**1. Code (branch `claude/project-thread-axt148`, head b9f8342d, PR 145, build server green)**
+- Correction, VARIANT `motion/screen-fit/depth-layers`: `src/core/screen_motion.hpp` (Window, TileGrid, WeighTiles, FindSplit, FitLayers, ModelFor), card programs in `src/host_dx12/j2/flow_shaders.hpp` (fit_accum per tile, fit_solve mode 2 split, model 9x2), `compute_flow.cpp/.hpp`, `replay_motion_shader.hpp`, `overlay.cpp` (j2screenfit line). Tests: `tests/cpu/screen_motion_test.cpp` (10 pass), `tests/host/screen_motion_gpu_audit.hpp` (updated, NOT yet run on a card).
+- Replay tool: `tests/host/dlss_capture_replay.cpp` (`--motion captured|zero|far-zero`, `--motion-dir DIR` with DIR\NNNNN-motion.raw RG32F, `--preset`, `--parity`, `--first/--frames/--all`, `--preroll`, `--pingpong`, `--crop X Y W H`). Its post-build step overwrites the DLSS DLL beside the exe: re-copy the package's `nvngx_dlss.dll` (310.9.16.0, SHA256 90F2F70D...) before replays.
+
+**2. On Cort's PC**
+- Worktree `C:\Users\Cort\NA-wt-fb6d5db` (detached, around b852d873 plus local ports), build dir `build-referee2`, mask 00FF33CC.
+- Evidence and scripts: `Documents\NA-strobe-7933efc\sow-2e062ef-sway`: `round3.txt` to `round23.txt`, `round22-all.csv`, `round22-measure.txt`, `NaRound16.cs` (C# port of the sample measurement, the corrected fit with lagged tiles, the long-baseline tracker), `round20-cache` (real drift per pair), `replay\` (replay outputs, roughly 10 GB, for Cort's cleanup when you are done).
+- Other folders I made: `C:\Users\Cort\NA-wt-ref709` (tile-margin sweep, `build-margin\sweep.txt`), `C:\Users\Cort\NA-wt-comms` (clean checkout of main, unused), `Documents\Neon-referee-files` (old Referee copy, do not use), `Documents\_mistake-empty-folders-2026-11-19` (159 empty folders from a script slip; `Documents\remove-mistake-folders.ps1` is there for Cort). Nothing deleted by me.
+- Round 23c (lags 3 and 4, with replays) was running when I stopped; it may have left partial files in that folder and, possibly, a still-running `dlss_capture_replay.exe` or analysis process. Please check before Cort plays.
+
+**3. What is established**
+- Cause of the waves: the animated orc bends the camera-off screen fit; the still fortress is handed uneven false motion; K adds it up (rounds 13-21). b9f8342d takes that uneven false motion from 0.06-0.27 to 0.02-0.10 px/pair on the captures and, through K by replay, output-against-input drift from 0.08-0.23 to 0.045-0.09.
+- NOT solved: the far scene's real slow drift (about 0.05 px/frame) is handed at a median 0.59 in x (round 22). No change to the two-frame sample measurement closes it (variants 0.61-0.70, more noise). A long pair of 7 or 8 frames carries it fully in x on 6 of 7 character screens (0.97-1.15, r 0.98-1.00; round 23b), but the captures hold runs of only 8 to 16 frames, so the combined field H = DL/L + (V - mean of V over L) could not be tested through DLSS (H equals A except in the last 1-2 pairs; replay numbers equal within noise). The R2 pattern never repeats, so "same jitter" is not available; the principle is only the longer baseline. A real test needs captures with runs of at least 17 consecutive frames, or the shorter lags round 23c was trying.
+- Whether the remaining 40% shortfall is visible on screen is unknown. Nobody has looked at a build with b9f8342d.
+
+**4. Incidents on his PC tonight, both mine:** an all-core analysis run started while Battlefield 1 was open (BF1 crashed 11:53:42Z in `nvgpucomp64.dll`; cause not established; no WHEA event), and the 159 empty folders. Any run there must check for any game, not a name list, and keep to the mask.
+
+**5. Still open from me to you:** the still-points request (11:40Z entry) and the review of the outside audit (do not implement as written). Ask me anything about the above; I will answer and do nothing else.
