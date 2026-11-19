@@ -153,6 +153,8 @@ struct PresentReceipt {
     uint64_t ordinal = 0;
     bool scene = false;
     bool submitted = false;
+    bool evaluation_paused = false;
+    bool EligibleForDlaa() const { return submitted || (scene && !evaluation_paused); }
 };
 bool ObservePresent(void* swapchain, PresentReceipt* receipt = nullptr);
 void BeforeResize(void* swapchain);

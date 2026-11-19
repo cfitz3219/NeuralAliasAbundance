@@ -235,6 +235,56 @@ inline float EdgeEnergy(const float* a, uint32_t w, uint32_t h)
     return n ? float(s / n) : 0.f;
 }
 
+// A display can scale the scene to fit or centre it at one source pixel per display pixel.
+// Only sample the latter layouts for small padding. Odd padding has two possible origins
+// on each odd axis. The normalized screen occupies the original block even when testing these.
+inline uint32_t PaddedLayouts(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh)
+{
+    if (w < kTile || h < kTile || sw < w || sh < h || (w == sw && h == sh)) return 0;
+    const uint32_t dx = sw - w, dy = sh - h;
+    if (dx > (std::min)(16u, w / 16) || dy > (std::min)(16u, h / 16)) return 0;
+    return (1u + (dx & 1u)) * (1u + (dy & 1u));
+}
+
+// Pick one geometry for the whole frame using the structure common to both candidates.
+// A HUD/overlay patch or an isolated reflection cannot choose a different shift for itself.
+inline uint32_t RegisterScreenTiles(const float* data, const float* padded, uint32_t layouts, bool& scaled_matches)
+{
+    scaled_matches = false;
+    if (!layouts || layouts > 4 || !padded) return 0;
+    float gains[4]{};
+    int supporters[4]{};
+    uint32_t scaled_support = 0;
+    for (uint32_t tile = 0; tile < kTiles; ++tile) {
+        const auto at = tile * kTile * kTile;
+        const auto* input = data + BlockOffset(kTileInput) + at;
+        const auto* output = data + BlockOffset(kTileOutput) + at;
+        float reference[kTile * kTile];
+        for (uint32_t i = 0; i < kTile * kTile; ++i) reference[i] = .5f * (input[i] + output[i]);
+        const float scaled = EdgeCorrelation(reference, data + BlockOffset(kTileScreen) + at, kTile, kTile);
+        if (!std::isfinite(scaled)) continue;
+        if (scaled >= .45f) ++scaled_support;
+        for (uint32_t i = 0; i < layouts; ++i) {
+            const float centered = EdgeCorrelation(reference, padded + i * kTileFloats + at, kTile, kTile);
+            if (!std::isfinite(centered)) continue;
+            const float gain = centered - scaled;
+            gains[i] += std::clamp(gain, -.5f, .5f);
+            if (gain > .09f && centered >= .45f) ++supporters[i];
+            if (gain < -.09f) --supporters[i];
+        }
+    }
+    float best = .6f;
+    uint32_t selected = 0;
+    for (uint32_t i = 0; i < layouts; ++i) {
+        if (supporters[i] >= 3 && gains[i] > best) {
+            best = gains[i];
+            selected = i + 1;
+        }
+    }
+    scaled_matches = scaled_support >= 3;
+    return selected;
+}
+
 struct Params {
     float picture_match = .45f, picture_partial = .2f;      // edge correlation, input vs screen
     float screen_edges = .01f;         // a screen thumbnail with this much edge can be compared
@@ -255,6 +305,7 @@ struct Sample {
     bool tiles_comparable = false;     // sampled on the same pixel grid (native or normalized)
     bool have_motion = false;          // the previous evaluation was the frame before, same size
     float jitter_change = 0;           // |j_now - j_before| in pixels
+    const float* registered_screen_tiles = nullptr;
 };
 
 struct SampleScore {
@@ -286,7 +337,7 @@ inline SampleScore Score(const Sample& s, const Params& p = Params())
             const uint32_t at = k * kTile * kTile;
             const float* ti = d + BlockOffset(kTileInput) + at;
             const float* to = d + BlockOffset(kTileOutput) + at;
-            const float* ts = d + BlockOffset(kTileScreen) + at;
+            const float* ts = (s.registered_screen_tiles ? s.registered_screen_tiles : d + BlockOffset(kTileScreen)) + at;
             ++r.tiles;
             if (EdgeEnergy(to, kTile, kTile) < p.tile_energy) continue;
             ++r.tiles_textured;

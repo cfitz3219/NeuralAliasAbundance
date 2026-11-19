@@ -71,6 +71,9 @@ struct State {
     uint32_t token = 0, next_token = 0;
     ComPtr<ID3D12CommandQueue> pre_queue, main_queue;
     bool done_screen = false, done_tiles = false, done_pair = false;
+    bool scaled_tiles = false;
+    uint32_t padded_layouts = 0;
+    uint32_t centered_in_window = 0;
     float done_jitter_change = 0;
     na::referee::Window window;
     shadow::Context captured_context;
@@ -198,7 +201,7 @@ bool init(ID3D12Device* dev)
     return false;
 #endif
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kImages, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    const UINT64 bytes = UINT64(na::referee::kResultFloats) * 4;
+    const UINT64 bytes = UINT64(na::referee::kResultFloats + 4 * kTileFloats) * sizeof(float);
     auto buffer = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags, ComPtr<ID3D12Resource>& r) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = type;
@@ -305,7 +308,7 @@ void emit_window(bool force)
     if (!g.window.samples || (!force && now - g.window_at < ULONGLONG(log_s < 1 ? 1 : log_s) * 1000)) return;
     char line[2048];
     na::referee::Format(line, sizeof line, g.window, na::referee::Judge(g.window));
-    na::eventlog::Emit("referee", "%s", line);
+    na::eventlog::Emit("referee", "%s centered_screen_samples=%u", line, g.centered_in_window);
     if (g.preview_pending) {
         uint64_t first;
         const auto evidence = g.recent.For(g.preview_context, first);
@@ -321,6 +324,7 @@ void emit_window(bool force)
     }
     ++g.stats.logged;
     g.window = na::referee::Window();
+    g.centered_in_window = 0;
     g.window_at = now;
 }
 
@@ -341,14 +345,20 @@ void retire()
 void collect_sample()
 {
     void* p = nullptr;
-    D3D12_RANGE r{0, SIZE_T(na::referee::kResultFloats) * 4};
+    D3D12_RANGE r{0, SIZE_T(kResultFloats + g.padded_layouts * kTileFloats) * sizeof(float)};
     const bool mapped = SUCCEEDED(g.readback->Map(0, &r, &p)) && p;
     na::referee::SampleScore score;
+    uint32_t layout = 0;
+    bool scaled_matches = false;
     TileLocations suggested_tiles;
     bool relocate = false;
     if (mapped) {
         const auto* samples = static_cast<const float*>(p);
-        score = na::referee::Score({samples, g.done_screen, g.done_tiles, g.done_pair, g.done_jitter_change});
+        const auto* padded = samples + kResultFloats;
+        layout = RegisterScreenTiles(samples, padded, g.padded_layouts, scaled_matches);
+        const float* screen_tiles = layout ? padded + (layout - 1) * kTileFloats : nullptr;
+        const bool comparable = g.scaled_tiles || scaled_matches || layout != 0;
+        score = na::referee::Score({samples, g.done_screen, comparable, g.done_pair, g.done_jitter_change, screen_tiles});
         // VARIANT: referee/shared-texture-probes
         relocate = g.done_tiles && score.tiles_textured < kTiles / 2;
         if (relocate) suggested_tiles = FindTexturedTiles(samples);
@@ -357,12 +367,16 @@ void collect_sample()
             std::lock_guard<std::mutex> lock(g.m);
             keep_receipt = g.keep_receipt;
         }
-        if (keep_receipt) g.data.assign(samples, samples + na::referee::kResultFloats);
+        if (keep_receipt) {
+            g.data.assign(samples, samples + kResultFloats);
+            if (screen_tiles) std::copy_n(screen_tiles, kTileFloats, g.data.data() + BlockOffset(kTileScreen));
+        }
         const D3D12_RANGE none{0, 0};
         g.readback->Unmap(0, &none);
     }
     std::lock_guard<std::mutex> lock(g.m);
     if (mapped) {
+        if (layout) ++g.centered_in_window;
         g.window.Add(score);
         if (relocate && g.preview_exact && g.main_epoch == g.epoch) {
             g.tile_locations = suggested_tiles;
@@ -414,9 +428,10 @@ void collect_sample()
         if (!g.data.empty()) {
             g.last.data.swap(g.data);
             g.data.clear();
-            g.last.screen = g.done_screen; g.last.tiles = g.done_tiles; g.last.pair = g.done_pair;
+            g.last.screen = g.done_screen; g.last.tiles = g.scaled_tiles || scaled_matches || layout != 0; g.last.pair = g.done_pair;
             g.last.jitter_change = g.done_jitter_change;
             g.last.number = g.stats.samples;
+            g.last.centered_layout = layout;
         }
         if (g.done_pair) ++g.stats.pairs;
         if (g.done_screen) {
@@ -542,13 +557,14 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     size(kInput, iw, ih);
     const bool aligned = screen && ow == sw && oh == shh && iw == sw && ih == shh;
     // Native DLAA may feed a game's own display resample (e.g. supersampling).
-    // Compare like-aspect pictures on the smaller pixel grid. Different aspects
-    // can be letterboxing or cropping, so they remain diagnostic thumbnails only.
+    // Compare like-aspect pictures on the smaller pixel grid. A small border can
+    // instead preserve native pixels; the shared tile vote checks both origins.
     const double scene_aspect = double(iw) / ih;
     const bool resampled = screen && g.captured_context.placement.path == shadow::Path::Native11 &&
                            iw == ow && ih == oh && sw >= kTile && shh >= kTile &&
                            std::abs(double(sw) / shh - scene_aspect) < scene_aspect * .01;
-    const bool tiles = aligned || resampled;
+    g.padded_layouts = screen && iw == ow && ih == oh ? PaddedLayouts(iw, ih, sw, shh) : 0;
+    const bool tiles = aligned || resampled || g.padded_layouts;
     for (int i = 0; screen && i < 3; ++i) {
         k = {};
         k.src = thumbs[i];
@@ -561,6 +577,11 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
             k.mw = (std::min)(iw, sw);
             k.mh = (std::min)(ih, shh);
             run(g.tiles.Get(), k, kTiles, 1);
+            if (i == 2 && g.padded_layouts) {
+                k.base = kResultFloats;
+                k.pad0 = 1;
+                run(g.tiles.Get(), k, kTiles, g.padded_layouts);
+            }
         }
     }
     uint32_t pw = 0, ph = 0;
@@ -582,7 +603,8 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     after[0].UAV.pResource = g.results.Get();
     after[1] = transition(g.results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     l->ResourceBarrier(2, after);
-    l->CopyBufferRegion(g.readback.Get(), 0, g.results.Get(), 0, UINT64(kResultFloats) * 4);
+    l->CopyBufferRegion(g.readback.Get(), 0, g.results.Get(), 0,
+                        UINT64(kResultFloats + g.padded_layouts * kTileFloats) * sizeof(float));
     rb = transition(g.results.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     l->ResourceBarrier(1, &rb);
     if (FAILED(l->Close())) { stop("the referee's command list could not close"); return; }
@@ -595,6 +617,7 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     }
     g.done_screen = screen;
     g.done_tiles = tiles;
+    g.scaled_tiles = aligned || resampled;
     g.done_pair = pair;
     g.done_jitter_change = pair ? std::hypot(g.main_jitter[0] - g.pre_jitter[0], g.main_jitter[1] - g.pre_jitter[1]) : 0.f;
     if (!pair) ++g.stats.unpaired;

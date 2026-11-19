@@ -56,6 +56,15 @@ void tiles(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     }
     const int left = centre.x - int(kTile / 2), top = centre.y - int(kTile / 2);
     const int2 grid_pixel = int2(left + int(tid.x), top + int(tid.y));
+    if (pad0 != 0) {
+        // Only the alternate screen dispatch sets pad0. The grid is the unscaled scene.
+        const uint2 margin = uint2(w - mw, h - mh);
+        const uint nx = 1 + (margin.x & 1);
+        const uint2 origin = margin / 2 + uint2(gid.y % nx, gid.y / nx);
+        store((gid.y * 8 + k) * kTile * kTile + tid.y * kTile + tid.x,
+              load_log(src, grid_pixel + int2(origin), w, h));
+        return;
+    }
     float value;
     if (mw == w && mh == h) value = load_log(src, grid_pixel, w, h);
     else {

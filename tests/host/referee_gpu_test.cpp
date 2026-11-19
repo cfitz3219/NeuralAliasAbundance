@@ -100,7 +100,10 @@ ComPtr<ID3D12Resource> ScreenTexture(test::Device& d, test::List& l, const std::
     return t;
 }
 
-struct Images { ID3D12Resource *prev, *input, *output, *motion, *screen; };
+struct Images {
+    ID3D12Resource *prev, *input, *output, *motion, *screen;
+    bool unknown_geometry = false;
+};
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
 // Returns false (with a FAIL line) when the referee did not take it.
@@ -185,7 +188,8 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         return false;
     }
     got = rg::GetLastSample();
-    CHECK(got.screen == !late && got.tiles == (!late && !display_vectors) && got.pair == (im.motion && !changed_scene && !reset && !unsampled_reset));
+    CHECK(got.screen == !late && got.tiles == (!late && !display_vectors && !im.unknown_geometry) &&
+          got.pair == (im.motion && !changed_scene && !reset && !unsampled_reset));
     CHECK(std::fabs(got.jitter_change - (got.pair ? rs::JitterChange() : 0.f)) < 1e-4f);
     CHECK(got.data.size() == na::referee::kResultFloats);
     return got.data.size() == na::referee::kResultFloats;
@@ -463,6 +467,39 @@ int main()
                        false, nullptr, nullptr, false, false, false, false, 18));
     CHECK(rg::TakeNativeScreenLoss(&d) == 18);
     CHECK(!rg::TakeNativeScreenLoss(&d)); // proof 19 stays qualified
+    // Identical scene and output size, seven additional rows on the display. The same
+    // registration must identify a shown input, shown output, and unrelated overlay.
+    // Exercise both roundings of the odd margin and the existing scaled layout.
+    for (int which = 0; which < 4; ++which) {
+        const uint32_t pw = rs::kW, ph = rs::kH + 7;
+        const auto& source = which == 0 ? shows_input : shows_output;
+        std::vector<uint8_t> pixels(size_t(pw) * ph, 0);
+        for (uint32_t y = 0; y < ph; ++y) {
+            for (uint32_t x = 0; x < pw; ++x) {
+                if (which == 2) {
+                    pixels[size_t(y) * pw + x] = uint8_t((rs::Grain(x, y, 37) + .5f) * 255.f);
+                } else if (which == 3) {
+                    float sy = std::clamp((float(y) + .5f) * rs::kH / ph - .5f, 0.f, float(rs::kH - 1));
+                    uint32_t lo = uint32_t(sy), hi = (std::min)(lo + 1, rs::kH - 1);
+                    pixels[size_t(y) * pw + x] = uint8_t(std::lround(source[size_t(lo) * pw + x] * (1 - (sy - lo)) +
+                                                                      source[size_t(hi) * pw + x] * (sy - lo)));
+                } else {
+                    const uint32_t top = which == 0 ? 3 : 4;
+                    if (y >= top && y - top < rs::kH) pixels[size_t(y) * pw + x] = source[size_t(y - top) * pw + x];
+                }
+            }
+        }
+        auto composition = ScreenTexture(d, l, pixels, keep, pw, ph);
+        REQUIRE(composition);
+        Run(d, l);
+        keep.clear();
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), nullptr, composition.Get(), which == 2}, got));
+        const auto vote = na::referee::shadow::VoteScreen(na::referee::Score({got.data.data(), got.screen, got.tiles, false, 0}));
+        std::printf("padded screen case %d: layout %u, vote %d\n", which, got.centered_layout, int(vote));
+        CHECK(vote == (which == 0 ? ScreenVote::Input : which == 2 ? ScreenVote::Unknown : ScreenVote::Output));
+        CHECK(got.centered_layout == (which < 2 ? uint32_t(which + 1) : 0u));
+    }
     Sleep(150);
     REQUIRE(rg::Wanted());
     rg::Evaluation discarded;

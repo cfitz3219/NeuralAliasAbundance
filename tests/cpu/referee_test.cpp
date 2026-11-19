@@ -9,6 +9,7 @@
 //            with the opposite sign, is caught.
 #include "test_support.hpp"
 #include "core/referee_selection.hpp"
+#include "host_dx12/native11/input_provider.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -228,6 +229,15 @@ int main()
         check(recent.For(different, first).measured.samples == 1, "shadow: repeated ordinal cannot vote twice");
 
         DeliveryContinuity alternating, grouped;
+        DeliveryContinuity paused;
+        for (uint64_t i = 0; i < 2250; ++i) {
+            const bool suspended = i > 0 && i < 2245;
+            const na::native11::PresentReceipt frame{i, true, i == 0 || i == 2245, suspended || i == 0};
+            paused.Observe(&producer, frame.ordinal, frame.EligibleForDlaa(), frame.submitted);
+            if (i == 0) check(frame.EligibleForDlaa(), "a delivered frame counts even if paused before Present");
+        }
+        check(paused.changes == 1 && paused.longest_miss == 4,
+              "a long deliberate pause breaks the sequence; four genuine misses after resuming still count");
         for (uint64_t i = 0; i < 12; ++i) {
             alternating.Observe(&producer, i, true, i % 2 == 0);
             grouped.Observe(&producer, i, true, i < 6);

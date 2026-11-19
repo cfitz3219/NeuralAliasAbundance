@@ -75,6 +75,7 @@ struct LastSample {
     bool screen = false, tiles = false, pair = false;
     float jitter_change = 0;
     uint64_t number = 0; // GetStats().samples when it was read
+    uint32_t centered_layout = 0; // nonzero only if multiple regions favored the same padded mapping
 };
 void EnableSampleReceiptForTests();
 LastSample GetLastSample();
