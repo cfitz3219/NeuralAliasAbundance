@@ -14,6 +14,14 @@ This guide supersedes the narrower wording below as the standing rule set. Credi
 
 Sniper illustrates the guide: Fable identified the real native-upscale boundary and late descriptor updates; placing processing there preserved the later native HUD. Astra then checked saved text/icon pixels rather than inferring success from a full-size viewport. The technical rules and evidence below remain a case study, not a requirement that every game use the same arrangement.
 
+## 2026-11-19 — Evaluate the Referee from a game's first frame
+
+Cort asks every contributor to start a Referee review by describing what the running program can see when an unfamiliar game opens. Follow the same build through loading, the first playable scene, and a change such as opening a menu, aiming, swapping scene buffers or drawing post-processing in another order. Name the observations actually available at each point, including what can be observed before the first DLAA evaluation.
+
+For each observed problem, trace which existing tool the runtime can call, what would make it choose that tool, and which on-screen evidence would keep or reject the result. Follow a rejected attempt one step further. Identify the next distinct action that can address the still-visible symptom, or say exactly where automatic recovery ends. Distinguish a measured failure from an inconclusive trial that can earn a retry. Preserve the working route and its history wherever the evidence allows.
+
+Use the games already studied as examples of rendering behavior. Credit a behavior as transferable when the same build recognizes and handles it from observations. Use the existing GameCheck first-contact record for success on a fresh game without a patch. Include the observation cost during discovery and after a route settles.
+
 ## 2026-11-07 — Five standing rules from Fable 5.1's Sniper discovery
 
 Historical, narrower wording; generalized by the guide above at Cort's request.
