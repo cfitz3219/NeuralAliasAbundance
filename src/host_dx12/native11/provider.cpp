@@ -35,6 +35,7 @@
 #include "host_dx12/native11/depth_reads.hpp"
 #include "host_dx12/native11/frame_model.hpp"
 #include "host_dx12/native11/screen_check.hpp"
+#include "host_dx12/native11/lit_scene.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
 #include "providers/camera/camera_admission.hpp"
@@ -240,7 +241,7 @@ struct Ctx {
     uint32_t gen = 0;  // the game-device generation that answer was given in
     uint64_t sampler_policy = ~uint64_t{0};
     uint64_t texture_policy = ~uint64_t{0};
-    Id screen_color = 0;
+    Id screen_color = 0, screen_peer = 0;
     ID3D11PixelShader* pixel_shader = nullptr; // context owns the binding
     uint64_t writer_shader = 0;
     bool pixel_shader_known = false;
@@ -281,7 +282,7 @@ struct Ctx {
         sampler_policy = ~uint64_t{0};
         texture_policy = ~uint64_t{0};
         ps_shadow.Clear();
-        screen_color = 0;
+        screen_color = screen_peer = 0;
         pixel_shader = nullptr;
         writer_shader = 0;
         pixel_shader_known = false;
@@ -317,6 +318,9 @@ void* g_cb_user = nullptr;
 std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
 ScreenCheck g_screen;
+LitScene g_lit;
+std::atomic<Id> g_lit_peer{0};
+uint64_t g_last_lit_generation = 0;
 std::atomic<bool> g_screen_enabled{false};
 std::atomic<bool> g_adaptive_scene{false}; // skip writer tagging on stable frames
 std::unordered_map<ID3D11DeviceContext*, std::unique_ptr<Ctx>> g_ctx;
@@ -1158,7 +1162,8 @@ void DiagnoseCameraMiss()
 // before the list / HUD draw that holds it). Under g_mu (`lk`), on the immediate context's thread,
 // before the read is forwarded. g_mu is let go during the callback so the game's other threads never
 // wait behind it; the facts handed over are copies or references we hold.
-void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary, bool verified_reader = false)
+void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary, bool verified_reader = false,
+          ID3D11Resource* lit_color = nullptr, ViewUse lit_view = {}, uint64_t lit_proof = 0)
 {
     ++g_stats.fired;
     SetSceneHanded(true); // whatever the outcome below, the game's scene draws for this frame are over
@@ -1175,7 +1180,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         if (bound) bound->GetResource(&picture);
         if (picture && IdOf(picture.Get()) == sel.color) g_color_ref = picture;
     }
-    if (!g_color_ref || IdOf(g_color_ref.Get()) != sel.color || !g_depth_ref || IdOf(g_depth_ref.Get()) != sel.depth) {
+    if ((!lit_color && (!g_color_ref || IdOf(g_color_ref.Get()) != sel.color)) || !g_depth_ref || IdOf(g_depth_ref.Get()) != sel.depth) {
         ++g_stats.missed;
         return SetReason("The scene colour or depth is not held from a live game view yet.");
     }
@@ -1291,8 +1296,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         t.active_h = vh >= 1.f ? std::min(mh - t.active_y, static_cast<uint32_t>(vh + 0.5f)) : mh - t.active_y;
     };
     // Our own references for the callback's duration (nothing another thread does can free them).
-    const ComPtr<ID3D11Resource> color = g_color_ref, depth = g_depth_ref;
-    texture(f.color, color.Get(), sel.color_info, g_color_view);
+    const ComPtr<ID3D11Resource> color(lit_color ? lit_color : g_color_ref.Get()), depth = g_depth_ref;
+    texture(f.color, color.Get(), sel.color_info, lit_color ? lit_view : g_color_view);
     texture(f.depth, depth.Get(), sel.depth_info, g_depth_view);
     {
         // VARIANT: depth/direction-from-depth-writes
@@ -1436,7 +1441,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         }
     }
     f.boundary = boundary;
-    f.screen_proof = verified_reader ? g_screen.Proof() : 0;
+    f.screen_proof = lit_color ? lit_proof : verified_reader ? g_screen.Proof() : 0;
     f.scene_draws = g_model.SceneDrawsThisFrame();
     // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
     // tagged when the game last uploaded to it.
@@ -1448,9 +1453,13 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     // The scene's own identity (colour and depth objects). A camera buffer that changes, appears or
     // goes is not a change of scene: it moves `stream` below, which only the camera's consumer reads.
-    f.scene_changed = !g_scene_stream || f.color.incarnation != g_scene_key[0] || f.depth.incarnation != g_scene_key[1];
+    const uint64_t lit_generation = lit_color ? g_lit.generation : 0;
+    const uint64_t history_color = lit_color ? 0 : f.color.incarnation;
+    f.scene_changed = !g_scene_stream || g_last_lit_generation != lit_generation ||
+                      history_color != g_scene_key[0] || f.depth.incarnation != g_scene_key[1];
+    g_last_lit_generation = lit_generation;
     if (f.scene_changed) ++g_scene_stream;
-    g_scene_key[0] = f.color.incarnation;
+    g_scene_key[0] = history_color;
     g_scene_key[1] = f.depth.incarnation;
     f.scene_stream = g_scene_stream;
     // VARIANT: camera11/all-uploads-when-buffers-rotate
@@ -1462,10 +1471,10 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     // camera buffer met again afterwards is not a change of inputs.
     const bool camera_changed = have_camera && !g_collect_all &&
         (cam_sel.camera_cb != g_stream_key[2] || (cam_inc && g_stream_key[3] && cam_inc != g_stream_key[3]));
-    f.selection_changed = !g_stream || f.color.incarnation != g_stream_key[0] || f.depth.incarnation != g_stream_key[1] ||
+    f.selection_changed = !g_stream || f.scene_changed || history_color != g_stream_key[0] || f.depth.incarnation != g_stream_key[1] ||
                           camera_changed;
     if (f.selection_changed) ++g_stream;
-    g_stream_key[0] = f.color.incarnation;
+    g_stream_key[0] = history_color;
     g_stream_key[1] = f.depth.incarnation;
     if (have_camera) {
         g_stream_key[2] = cam_sel.camera_cb;
@@ -1485,8 +1494,15 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     if (!ok) ++g_stats.missed;
     else if (g_frame == f.frame) {
         g_frame_delivered = true;
-        if (g_screen_enabled.load(std::memory_order_relaxed))
-            g_screen.NoteDelivery(verified_reader, f.scene_draws);
+        if (g_screen_enabled.load(std::memory_order_relaxed)) {
+            if (lit_proof) {
+                g_lit.screen.NoteDelivery(true, f.scene_draws);
+                const auto deliveries = g_lit.screen.Delivered();
+                if (deliveries <= 2 || (deliveries & (deliveries - 1)) == 0)
+                    na::eventlog::Emit("native11_lit_role", "frame=%llu role_deliveries=%llu scene_stream=%llu",
+                        (unsigned long long)f.frame, (unsigned long long)deliveries, (unsigned long long)f.scene_stream);
+            } else g_screen.NoteDelivery(verified_reader, f.scene_draws);
+        }
     }
 }
 
@@ -1622,6 +1638,14 @@ void NoteDepthDirection(const Event& e)
 void StopViewportJitterAfterScene();
 void TrackPlacementWrite(const Event& e)
 {
+    if (g_lit.observed_member &&
+        ((e.kind == Kind::Draw && g_lit.Peer(e.rt0)) || (e.kind == Kind::ColorWrite && g_lit.Peer(e.resource)) ||
+         (e.kind == Kind::ClearDepth && e.resource == g_lit.depth))) {
+        g_lit.screen.Write(0);
+        const auto index = g_lit.observed_member == g_lit.members[1];
+        if (g_lit.observed_proven) g_lit.Revoke(g_lit.proofs[index]);
+        g_lit.observed_member = g_lit.observed_write = 0;
+    }
     if (!g_screen.Adaptive() || !g_screen_enabled.load(std::memory_order_relaxed)) return;
     const auto& scene = g_model.Current();
     if (!scene.valid()) return;
@@ -1662,7 +1686,8 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
     // VARIANT: point/native11-adaptive-reader
     const bool adaptive_read = pixel_read && screen_enabled && g_screen.ReservesPixelRead() &&
         scene.color != g_backbuffer && scene.color_info.samples == 1;
-    if (e.kind == Kind::Read && !screen_verified && !adaptive_read && g_model.ShouldFireBeforeRead(e.resource)) {
+    const auto reserve_lit = [&] { return screen_enabled && g_lit.steer && g_lit.Predicted(g_model); };
+    if (e.kind == Kind::Read && !screen_verified && !adaptive_read && g_model.ShouldFireBeforeRead(e.resource) && !reserve_lit()) {
         if (pixel_read && screen_enabled) {
             g_screen.SetScene(scene.color, scene.depth);
             g_screen.NoteOrdinalPixel(g_model.SceneDrawsThisFrame());
@@ -1670,7 +1695,7 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
         g_model.MarkFired();
         Fire(c, l, Boundary::BeforeRead);
         StopViewportJitterAfterScene();
-    } else if (e.kind == Kind::Draw && g_model.ShouldFireBeforeDraw(e)) {
+    } else if (e.kind == Kind::Draw && g_model.ShouldFireBeforeDraw(e) && !reserve_lit()) {
         g_model.MarkFired();
         Fire(c, l, Boundary::BeforeHud);
         StopViewportJitterAfterScene();
@@ -1928,8 +1953,10 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
     if (!track_depth && !views && !screen) return;
     const Id depth = track_depth ? g_sel_depth.load(std::memory_order_relaxed) : 0;
     const Id color = g_sel_color.load(std::memory_order_relaxed);
-    if (screen && x->screen_color != color) {
+    const Id peer = screen ? g_lit_peer.load(std::memory_order_relaxed) : 0;
+    if (screen && (x->screen_color != color || x->screen_peer != peer)) {
         x->screen_color = color;
+        x->screen_peer = peer;
         x->screen_slots.reset();
     }
     if (!depth && !color && !g_watch[0].load(std::memory_order_relaxed)) return;
@@ -1942,7 +1969,7 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
             r = ResourceOfView(views[i]);
         }
         if (screen && start < x->screen_slots.size() && i < x->screen_slots.size() - start)
-            x->screen_slots.set(start + i, r && r == color);
+            x->screen_slots.set(start + i, r && (r == color || r == peer));
         if (track_depth && start < kDepthSlots && i < kDepthSlots - start)
             depth_slots.set(start + i, r && r == depth);
         if (!r || sent_n == kWatch + 1) continue;
@@ -2319,9 +2346,11 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     const auto& scene = g_model.Current();
     const auto draws = g_model.SceneDrawsThisFrame();
     const bool inspect = g_screen.MayInspect();
+    const Id lit = g_lit.Predicted(g_model);
+    const uint64_t lit_write = lit ? g_model.LitWrite(g_lit.Peer(lit), lit) : 0;
     const bool missed_ordinal = !g_model.FiredThisFrame() && g_model.LearnedPointKind() == 1 &&
         !g_screen.Adaptive() && !g_screen.Verified(scene.color, scene.depth);
-    if ((!inspect && !missed_ordinal) || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
+    if ((!inspect && !missed_ordinal && !lit_write) || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
         scene.color == g_backbuffer || !g_swap || x->raster_queries ||
         IdOf(g_color_ref.Get()) != scene.color || g_color_view.mip || g_color_view.slice) return {};
     ResourceInfo output{};
@@ -2360,10 +2389,51 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
         if (!x->screen_slots.test(slot)) continue;
         ComPtr<ID3D11ShaderResourceView> view;
         c->PSGetShaderResources(slot, 1, &view); // the runtime may have automatically unbound it
-        if (!view || ResourceOfView(view.Get()) != scene.color) continue;
+        if (!view) continue;
+        const Id bound = ResourceOfView(view.Get());
+        if (bound != scene.color && bound != lit) continue;
         D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
         view->GetDesc(&desc);
         if (desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || desc.Texture2D.MostDetailedMip) continue;
+        if (lit_write && bound == lit && !g_lit.Peer(x->rt0) && IdOf(g_depth_ref.Get()) == g_lit.depth &&
+            g_color_view.format == static_cast<uint32_t>(desc.Format) &&
+            x->vp_w == g_scene_vp_w && x->vp_h == g_scene_vp_h && !g_scene_vp_x && !g_scene_vp_y) {
+            ComPtr<ID3D11Resource> source;
+            view->GetResource(&source);
+            ComPtr<ID3D11Texture2D> texture;
+            if (FAILED(source.As(&texture))) continue;
+            D3D11_TEXTURE2D_DESC td{};
+            texture->GetDesc(&td);
+            if (td.MipLevels != 1 || td.ArraySize != 1 || td.SampleDesc.Count != 1) continue;
+            ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format),
+                                       IncarnationOf(source.Get()), IncarnationOf(g_depth_ref.Get())};
+            if (!g_lit.ObserveView(lit == g_lit.members[1], reader.color, reader.depth,
+                    {UINT(x->vp_w), UINT(x->vp_h), UINT(desc.Format), g_depth_view.format, g_depth_view.mip, g_depth_view.slice}))
+                continue;
+            auto& probe = g_lit.screen;
+            if (probe.Select(reader, true)) {
+                g_lit.proofs[lit == g_lit.members[1]] = probe.Proof();
+                g_lit.observed_member = lit;
+                g_lit.observed_write = lit_write;
+                g_lit.observed_proven = true;
+                if (g_lit.steer && !g_model.FiredThisFrame()) {
+                    g_model.MarkFired();
+                    Fire(c, lock, Boundary::BeforeRead, false, source.Get(), SrvUse(view.Get()), probe.Proof());
+                    StopViewportJitterAfterScene();
+                    g_lit.observed_proven = g_frame_delivered;
+                }
+                if (g_lit.steer) return {};
+            } else if (!g_screen.AwaitingSamples()) {
+                auto mark = probe.Begin(c, reader, texture.Get(), desc.Format, g_frame, draws);
+                if (mark.source) {
+                    g_lit.observed_member = lit;
+                    g_lit.observed_write = lit_write;
+                    g_lit.observed_proven = false;
+                    return mark;
+                }
+            }
+        }
+        if (bound != scene.color || (!inspect && !missed_ordinal) || (lit && g_lit.steer)) continue;
         g_screen.SetScene(scene.color, scene.depth);
         if (missed_ordinal) g_screen.NoteActualPixel(draws);
         if (!inspect) return {};
@@ -2376,7 +2446,8 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
             if (!g_screen.Select(reader, !g_model.FiredThisFrame())) {
                 ComPtr<ID3D11Texture2D> source;
                 if (FAILED(g_color_ref.As(&source))) return {};
-                return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+                if (!g_lit.screen.AwaitingSamples()) return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+                continue;
             }
             if (g_model.FiredThisFrame()) return {}; // witness the route without evaluating twice
             g_model.MarkFired();
@@ -2393,7 +2464,7 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
         }
         ComPtr<ID3D11Texture2D> source;
         if (FAILED(g_color_ref.As(&source))) return {};
-        return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+        if (!g_lit.screen.AwaitingSamples()) return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
     }
     return {};
 }
@@ -2687,8 +2758,10 @@ ID3D11Resource* DepthCopySource(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* 
 
 void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
 {
-    if (!x || !resource || resource != g_sel_color.load(std::memory_order_relaxed) ||
-        !g_adaptive_scene.load(std::memory_order_relaxed)) return;
+    if (!x || !resource) return;
+    const Id peer = g_lit_peer.load(std::memory_order_relaxed);
+    if ((!peer && !g_adaptive_scene.load(std::memory_order_relaxed)) ||
+        (resource != peer && resource != g_sel_color.load(std::memory_order_relaxed))) return;
     Event e;
     e.kind = Kind::ColorWrite;
     e.resource = resource;
@@ -2698,7 +2771,7 @@ void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
 void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11RenderTargetView* view, const FLOAT color[4])
 {
     Ctx* x = Get(c);
-    if (x && g_adaptive_scene.load(std::memory_order_relaxed))
+    if (x && (g_adaptive_scene.load(std::memory_order_relaxed) || g_lit_peer.load(std::memory_order_relaxed)))
         TrackPlacementColorWrite(c, x, ResourceOfView(view));
     O(c, x).clear_rtv(c, view, color);
 }
@@ -2860,6 +2933,8 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         if (FAILED(swap->GetDevice(IID_PPV_ARGS(&d))) || d.Get() != game) return false;
         g_swap = swap;
         g_screen.ResetPlacement();
+        g_lit.Clear();
+        g_lit_peer.store(0, std::memory_order_relaxed);
         DXGI_SWAP_CHAIN_DESC sd{};
         swap->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
@@ -2870,7 +2945,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         Inside own;
         ComPtr<ID3D11DeviceContext> context;
         ComPtr<ID3D11Texture2D> screen;
-        if (g_screen.AwaitingSamples()) {
+        if (g_screen.AwaitingSamples() || g_lit.screen.AwaitingSamples()) {
             game->GetImmediateContext(&context);
             swap->GetBuffer(0, IID_PPV_ARGS(&screen));
         }
@@ -2878,6 +2953,10 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
                                outcome, (unsigned long long)g_screen.Paired(),
                                (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
+        if (g_lit.Learned()) {
+            if (const char* outcome = g_lit.screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame()))
+                na::eventlog::Emit("native11_lit_role", "frame=%llu reader=%s", (unsigned long long)g_frame, outcome);
+        }
     } else if (g_screen.Active()) g_screen.ResetPlacement();
     if (receipt) *receipt = {g_frame, g_frame_delivered || g_model.SceneDrawsThisFrame() != 0, g_frame_delivered,
                              g_eval_paused.load(std::memory_order_relaxed)};
@@ -2893,8 +2972,16 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     // (frame_model.hpp) the model
     // is told which target is the screen; a picture drawn straight onto it has no read to wait for.
     g_model.SetScreenTarget(g_backbuffer);
-    g_model.EndFrame();
+    const bool check_lit = g_screen_enabled.load(std::memory_order_relaxed);
+    const bool was_steering = g_lit.steer;
+    g_model.EndFrame(check_lit, check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0);
     const auto& picked = g_model.Current();
+    const auto order = g_model.CompletedLitOrder();
+    g_lit.Finish(check_lit && (picked.color == order.late || picked.color == order.early) && picked.depth == order.depth
+                 ? order : FrameModel::LitOrder{});
+    if (was_steering != g_lit.steer)
+        na::eventlog::Emit("native11_lit_role", "next_frame=%llu both_screen_proven=%d", (unsigned long long)g_frame, int(g_lit.steer));
+    g_lit_peer.store(g_lit.Learned() ? g_lit.Peer(picked.color) : 0, std::memory_order_relaxed);
     if (g_screen_enabled.load(std::memory_order_relaxed)) g_screen.SetScene(picked.color, picked.depth);
     g_adaptive_scene.store(g_screen.Adaptive(), std::memory_order_relaxed);
     if (reserved_before != g_screen.ReservesPixelRead()) {
@@ -3132,6 +3219,8 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
     std::lock_guard<std::mutex> l(g_mu);
     if (s == g_swap) {
         g_screen.ResetPlacement();
+        g_lit.Clear();
+        g_lit_peer.store(0, std::memory_order_relaxed);
         g_adaptive_scene.store(false, std::memory_order_relaxed);
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
         g_color_ref.Reset();
@@ -3276,7 +3365,7 @@ void RejectScreenProof(uint64_t proof)
 {
     if (!proof || !g_screen_enabled.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lock(g_mu);
-    if (g_screen.RejectProof(proof))
+    if (g_lit.Revoke(proof) || g_screen.RejectProof(proof))
         na::eventlog::Emit("native11_screen", "candidate=replaced_after_delivery proof=%llu",
                            static_cast<unsigned long long>(proof));
 }
@@ -3330,6 +3419,8 @@ void Uninstall()
     g_cb = nullptr;
     g_cb_user = nullptr;
     g_screen = {};
+    g_lit.Clear();
+    g_lit_peer.store(0, std::memory_order_relaxed);
     g_adaptive_scene.store(false, std::memory_order_relaxed);
     g_screen_enabled.store(false, std::memory_order_relaxed);
     g_swap = nullptr;

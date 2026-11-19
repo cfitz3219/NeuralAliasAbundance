@@ -52,12 +52,17 @@ function Get-RefereeSummary([string[]] $Lines) {
     $layerOrder = Get-Native11LayerOrderFinding $Lines
     $windows = @($Lines | Where-Object { $_ -match '(^|\s)referee\s+samples=\d+' })
     $states = @($Lines | Where-Object { $_ -match '(^|\s)referee_state\s' })
-    if (-not $windows -and -not $states) {
+    $roles = @($Lines | Where-Object { $_ -match '\bnative11_lit_role frame=\d+ role_deliveries=(\d+) scene_stream=\d+' })
+    if (-not $windows -and -not $states -and -not $roles) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
     }
     $out.Add('Referee screen and delivery checks')
+    if ($roles) {
+        $null = $roles[-1] -match 'role_deliveries=(\d+) scene_stream=(\d+)'
+        $out.Add("  Rotating lighting buffers: DLAA used the screen-verified lighting route. Last checkpoint for scene $($Matches[2]): at least $($Matches[1]) submissions.")
+    }
     if ($layerOrder) { $out.Add($layerOrder) }
     $placements = @($Lines | Where-Object { $_ -match '(^|\s)native11_placement\s' })
     if ($placements) {

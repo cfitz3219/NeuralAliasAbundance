@@ -25,3 +25,7 @@ Check 'additional plausible target' ($alternating | ForEach-Object { $_ + ' [oth
 Check 'other extent' ($alternating -replace 'last_read=2399 float=1 same_size=1','last_read=2399 float=1 same_size=0') $false
 Check 'scene rule changes' ($alternating[0..3] + ($alternating[4..7] -replace 'rule=after-layers ', 'rule=after-layers-second-depth ')) $false
 Write-Output 'Referee layer-order summary passed all eight cases.'
+$active = @(Get-RefereeSummary @('event native11_lit_role frame=200 role_deliveries=64 scene_stream=4'))
+if (-not ($active -like '*at least 64 submissions*') -or ($active -like '*not running*')) { throw 'Missing observed lighting-route delivery' }
+$unproven = @(Get-RefereeSummary @('event native11_lit_role frame=201 reader=adaptive_candidate_mid_scene'))
+if ($unproven -like '*used the screen-verified lighting route*') { throw 'Reported an unverified lighting route as active' }

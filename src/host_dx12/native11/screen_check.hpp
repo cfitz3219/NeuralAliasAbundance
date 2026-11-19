@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host_dx12/capture/screen_marker.hpp"
+#include "core/referee.hpp"
 #include "host_dx12/native11/frame_model.hpp"
 #include "host_dx12/j2/post_entry.hpp"
 
@@ -169,6 +170,9 @@ public:
         return adaptive_ || verified_ || (!ordinary_this_frame_ && ordinary_gaps_ >= kOrdinaryGrace);
     }
     bool AwaitingSamples() const { return !!candidate_; }
+    // A rotating scene owner supplies its own completed-frame qualification.
+    // Reuse the same asynchronous reader challenge and independent proof IDs.
+    void IndependentReaders() { adaptive_ = true; }
     uint64_t Confirmed() const { return confirmed_; }
     uint64_t Refuted() const { return refuted_; }
     uint64_t Paired() const { return paired_; }
@@ -213,6 +217,8 @@ public:
         }
 
         candidate_ = reader;
+        marker_width_ = desc.Width;
+        marker_height_ = desc.Height;
         if (!issued_) opened_ = frame;
         Mark mark{source, original_, Points(desc.Width, desc.Height)};
         CopyPoints(context, source, original_.Get(), mark.rects);
@@ -352,6 +358,15 @@ public:
                 }
                 if (slot->image) {
                     CopyPoints(context, screen, slot->image.Get(), Points(desc.Width, desc.Height));
+                    slot->layouts = na::referee::PaddedLayouts(marker_width_, marker_height_, desc.Width, desc.Height);
+                    for (UINT layout = 0; layout < slot->layouts; ++layout) {
+                        const UINT dx = desc.Width - marker_width_, dy = desc.Height - marker_height_;
+                        const LONG x = LONG(dx / 2 + layout % (1 + (dx & 1)));
+                        const LONG y = LONG(dy / 2 + layout / (1 + (dx & 1)));
+                        auto points = Points(marker_width_, marker_height_);
+                        for (auto& r : points) { r.left += x; r.right += x; r.top += y; r.bottom += y; }
+                        CopyPoints(context, screen, slot->image.Get(), points, (layout + 1) * kPoints);
+                    }
                     slot->frame = frame;
                     slot->sample = issued_ - 1;
                     slot->format = desc.Format;
@@ -364,9 +379,14 @@ public:
         if (frame - opened_ < deadline && (issued_ < screen_marker::kSession ||
             std::any_of(slots_.begin(), slots_.end(), [](const auto& slot) { return slot.pending; }))) return finish(nullptr);
         const bool sampled_all = samples_ == screen_marker::kSession;
-        const bool confirmed = sampled_all && (follow_ == samples_ || invert_ == samples_);
-        const bool refuted = sampled_all && flat_ == samples_;
-        const bool intermittent = sampled_all && (follow_ || invert_) && !confirmed;
+        bool confirmed = false, any_response = false;
+        bool refuted = sampled_all;
+        for (const auto& layout : votes_) {
+            confirmed |= sampled_all && (layout.follow == samples_ || layout.invert == samples_);
+            any_response |= layout.follow || layout.invert;
+            if (layout.seen && layout.flat != samples_) refuted = false;
+        }
+        const bool intermittent = sampled_all && any_response && !confirmed;
         if (confirmed) {
             if (adaptive_) {
                 if (routes_.size() >= 24) routes_.erase(routes_.begin());
@@ -410,6 +430,7 @@ private:
     struct Slot {
         Texture image;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        UINT layouts = 0;
         uint64_t frame = 0;
         UINT sample = 0;
         bool pending = false;
@@ -437,7 +458,7 @@ private:
     static bool MakeStrip(ID3D11DeviceContext* context, DXGI_FORMAT format, bool readback, Texture& out)
     {
         D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = kPoints;
+        desc.Width = readback ? kPoints * 5 : kPoints;
         desc.Height = desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
         desc.Format = format;
         if (readback) {
@@ -463,12 +484,12 @@ private:
     }
 
     static void CopyPoints(ID3D11DeviceContext* context, ID3D11Texture2D* source,
-                           ID3D11Texture2D* destination, const ProbeRects& points)
+                           ID3D11Texture2D* destination, const ProbeRects& points, UINT offset = 0)
     {
         for (UINT i = 0; i < points.size(); ++i) {
             const auto& r = points[i];
             const D3D11_BOX box{UINT(r.left), UINT(r.top), 0, UINT(r.right), UINT(r.bottom), 1};
-            context->CopySubresourceRegion(destination, 0, i, 0, 0, source, 0, &box);
+            context->CopySubresourceRegion(destination, 0, offset + i, 0, 0, source, 0, &box);
         }
     }
 
@@ -486,20 +507,25 @@ private:
             if (FAILED(hr)) continue;
             const auto* data = static_cast<const uint8_t*>(map.pData);
             const UINT stride = Bytes(next->format);
-            UINT follows = 0, inverts = 0, flat = 0;
-            for (UINT pair = 0; pair < kPairs; ++pair) {
-                const float first = screen_marker::Luma(data + 2 * pair * stride, next->format);
-                const float second = screen_marker::Luma(data + (2 * pair + 1) * stride, next->format);
-                const float contrast = FirstIsHigh(next->sample, pair) ? first - second : second - first;
-                if (!std::isfinite(contrast)) continue;
-                follows += contrast > .02f;
-                inverts += contrast < -.02f;
-                flat += std::abs(contrast) <= .02f;
+            for (UINT i = 0; i <= next->layouts; ++i) {
+                UINT follows = 0, inverts = 0, flat = 0;
+                for (UINT pair = 0; pair < kPairs; ++pair) {
+                    const auto* point = data + (i * kPoints + 2 * pair) * stride;
+                    const float first = screen_marker::Luma(point, next->format);
+                    const float second = screen_marker::Luma(point + stride, next->format);
+                    const float contrast = FirstIsHigh(next->sample, pair) ? first - second : second - first;
+                    if (!std::isfinite(contrast)) continue;
+                    follows += contrast > .02f;
+                    inverts += contrast < -.02f;
+                    flat += std::abs(contrast) <= .02f;
+                }
+                auto& v = votes_[i];
+                ++v.seen;
+                v.follow += follows >= 2;
+                v.invert += inverts >= 2;
+                v.flat += flat >= 2;
             }
             context->Unmap(next->image.Get(), 0);
-            follow_ += follows >= 2;
-            invert_ += inverts >= 2;
-            flat_ += flat >= 2;
             ++samples_;
             ++paired_;
         }
@@ -527,7 +553,8 @@ private:
         original_.Reset();
         marker_view_.Reset();
         issued_ = recent_miss_ = 0;
-        samples_ = follow_ = invert_ = flat_ = 0;
+        samples_ = 0;
+        votes_ = {};
         marked_ = seen_ = delivered_this_frame_ = false;
     }
 
@@ -547,7 +574,9 @@ private:
     Texture original_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> marker_view_;
     std::array<Slot, screen_marker::kSession> slots_{};
-    UINT samples_ = 0, follow_ = 0, invert_ = 0, flat_ = 0;
+    UINT samples_ = 0, marker_width_ = 0, marker_height_ = 0;
+    struct LayoutVote { UINT seen = 0, follow = 0, invert = 0, flat = 0; };
+    std::array<LayoutVote, 5> votes_{};
     static constexpr uint32_t kOrdinaryGrace = 4;
     uint64_t opened_ = 0, last_marked_ = 0;
     static inline uint64_t next_proof_ = 0; // all provider screen state is under the frame lock
