@@ -94,6 +94,11 @@ struct State {
     bool scaled_tiles = false;
     uint32_t padded_layouts = 0;
     uint32_t centered_in_window = 0;
+    RegionalTiles regional_anchor;
+    shadow::Context regional_context;
+    const void* regional_source = nullptr;
+    uint64_t regional_ordinal = 0, regional_at = 0;
+    unsigned regional_streak = 0;
     float done_jitter_change = 0;
     na::referee::Window window;
     shadow::Context captured_context;
@@ -376,6 +381,7 @@ void collect_sample()
     FlickerTransition transition;
     TrialSample trial;
     bool trial_valid = false;
+    RegionalTiles regions;
     if (mapped) {
         const auto* samples = static_cast<const float*>(p);
         const auto* padded = samples + kResultFloats;
@@ -384,6 +390,18 @@ void collect_sample()
         const bool comparable = g.scaled_tiles || scaled_matches || layout != 0;
         const Sample observations{samples, g.done_screen, comparable, g.done_pair, g.done_jitter_change, screen_tiles};
         score = na::referee::Score(observations);
+        shadow::ScreenVote vote = shadow::ScreenVote::Unknown;
+        if (g.done_screen && comparable && (!g.padded_layouts || layout || scaled_matches) &&
+            (g.trial_adjacent || (score.local.input && score.local.output))) {
+            TileVotes local;
+            const auto width = uint32_t((std::min)(g.img[kInput].desc.Width, g.img[kScreen].desc.Width));
+            const auto height = (std::min)(g.img[kInput].desc.Height, g.img[kScreen].desc.Height);
+            vote = shadow::DistinguishTrialOutput(score, observations, width, height, g.sampled_locations, &local);
+            regions.Set(local, width, height, g.sampled_locations);
+            const float* presented = screen_tiles ? screen_tiles : samples + BlockOffset(kTileScreen);
+            for (unsigned i = 0; i < kTiles; ++i) if (regions.output & (1u << i))
+                regions.detail[i] = EdgeEnergy(presented + i * kTile * kTile, kTile, kTile);
+        }
         if (g.trace_pair && (!g.padded_layouts || layout)) {
             if (g.adjacent)
                 transition = LocateTransition(samples + kTraceOffset, samples + BlockOffset(kThumbInput),
@@ -412,8 +430,7 @@ void collect_sample()
                     }
                     if (count) trial.motion_error = total / count;
                 }
-                const auto vote = shadow::DistinguishTrialOutput(score, observations,
-                    uint32_t(g.img[kInput].desc.Width), g.img[kInput].desc.Height, g.sampled_locations);
+                trial.tiles = regions;
                 trial.bypassed = vote == shadow::ScreenVote::Input;
                 trial.delivered = vote == shadow::ScreenVote::Output;
             }
@@ -478,6 +495,30 @@ void collect_sample()
             g.previous_transition = transition;
             g.trace_ordinal = g.main_ordinal;
         }
+        if (enabled() && g.preview_exact && !g.invalidated && g.main_epoch == g.epoch && regions.Mixed()) {
+            const auto now = GetTickCount64();
+            const bool same = g.regional_streak && g.regional_source == g.swapchain &&
+                g.captured_context.SameTemporalSequence(g.regional_context) && g.main_ordinal > g.regional_ordinal &&
+                g.main_ordinal - g.regional_ordinal <= 240 && now - g.regional_at <= 4000 &&
+                g.regional_anchor.Compare(regions) == RegionalTiles::Match::Original;
+            g.regional_streak = same ? (std::min)(g.regional_streak + 1, 4u) : 1;
+            if (!same) g.regional_anchor = regions;
+            if (g.regional_streak == 3) {
+                unsigned i = 0, c = 0;
+                while (!(regions.input & (1u << i))) ++i;
+                while (!(regions.output & (1u << c))) ++c;
+                na::eventlog::Emit("referee_composite",
+                    "frame=%llu path=%s input_xy=%d,%d control_xy=%d,%d tile_size=%u input_mask=%u output_mask=%u",
+                    (unsigned long long)g.main_ordinal, shadow::Name(g.captured_context.placement.path),
+                    regions.at[i].x, regions.at[i].y, regions.at[c].x, regions.at[c].y, kTile,
+                    unsigned(regions.input), unsigned(regions.output));
+            }
+            g.regional_context = g.captured_context;
+            g.regional_source = g.swapchain;
+            g.regional_at = now;
+            g.regional_ordinal = g.main_ordinal;
+        } else g.regional_streak = 0;
+        score.verified_mixed = g.regional_streak >= 3;
         if (layout) ++g.centered_in_window;
         g.window.Add(score);
         if (relocate && g.preview_exact && g.main_epoch == g.epoch) {

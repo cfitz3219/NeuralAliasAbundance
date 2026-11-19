@@ -648,6 +648,62 @@ int main()
                            got, false, nullptr, nullptr, false, false, false, false, 9993, false, &resized));
         rg::InvalidatePresentation(&d);
         CHECK(!rg::TakeTrialSample(resized.ticket, measured));
+        // A stable left-side bypass has no flicker amplitude. Sample the real GPU mailbox
+        // against the same input/output textures and a tone-mapped, split final screen.
+        auto split_bytes = shows_output;
+        for (unsigned y = 0; y < rs::kH; ++y)
+            for (unsigned x = 0; x < rs::kW / 2; ++x)
+                split_bytes[y * rs::kW + x] = shows_input[y * rs::kW + x];
+        const auto small_overlay = [&](unsigned mode) {
+            auto bytes = shows_output;
+            for (int y = TileTop(0, rs::kH); y < TileTop(0, rs::kH) + int(kTile); ++y)
+                for (int x = TileLeft(0, rs::kW); x < TileLeft(0, rs::kW) + int(kTile); ++x) {
+                    const auto i = size_t(y) * rs::kW + x;
+                    bytes[i] = mode == 0 ? shows_input[i] : mode == 1 ? uint8_t((3 * shows_output[i] + 80) / 4) : 113;
+                }
+            return ScreenTexture(d, l, bytes, keep);
+        };
+        auto raw_patch = small_overlay(0), translucent = small_overlay(1), covered = small_overlay(2);
+        auto split = ScreenTexture(d, l, split_bytes, keep);
+        REQUIRE(split);
+        Run(d, l);
+        keep.clear();
+        for (unsigned mode = 0; mode < 5; ++mode) {
+            ID3D12Resource* displayed[] = {raw_patch.Get(), translucent.Get(), covered.Get(), t_screen_input.Get(), t_screen.Get()};
+            TracePair trace{t_output.Get(), displayed[mode], true, 6995, 72};
+            Sleep(150);
+            REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, displayed[mode]}, got,
+                               false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+            REQUIRE(rg::TakeTrialSample(trace.ticket, measured));
+            std::printf("regional control %u: input=%02x output=%02x confirmed=%02x\n", mode,
+                        unsigned(measured.tiles.input), unsigned(measured.tiles.output), unsigned(measured.tiles.confirmed_input));
+            CHECK(measured.tiles.Mixed() == (mode == 0));
+            if (mode == 0) CHECK(measured.tiles.confirmed_input == 1);
+            if (mode == 1) CHECK(measured.delivered && (measured.tiles.output & 1));
+            if (mode == 2) CHECK(measured.delivered && !((measured.tiles.input | measured.tiles.output) & 1));
+            if (mode >= 3) CHECK(mode == 3 ? measured.bypassed : measured.delivered);
+        }
+        RouteTrial regional;
+        regional.Start(170, ordinal + 1, GetTickCount64());
+        for (unsigned arm = 0; arm < 3; ++arm) {
+            ordinal += RouteTrial::warmup_frames + 1;
+            const auto ticket = regional.Ticket(ordinal);
+            REQUIRE(ticket);
+            for (unsigned i = 0; i < RouteTrial::samples; ++i) {
+                auto* displayed = arm == 1 ? t_screen.Get() : split.Get();
+                TracePair trace{t_output.Get(), displayed, true, ticket, 711};
+                Sleep(150);
+                REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, displayed}, got,
+                                   false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+                REQUIRE(rg::TakeTrialSample(ticket, measured));
+                if (!i) std::printf("regional arm %u: input=%02x output=%02x comparable=%u\n",
+                                    arm, unsigned(measured.tiles.input), unsigned(measured.tiles.output), unsigned(measured.comparable));
+                CHECK(arm == 1 ? measured.delivered : measured.tiles.Mixed());
+                regional.Tick(GetTickCount64(), true);
+                regional.Add(ticket, measured, ordinal + 1);
+            }
+        }
+        CHECK(regional.Regional() && regional.Current() == RouteTrial::Phase::Kept);
         // The test reflector alternates about one stop. The alternative either
         // removes it, delivers the same artifact, or puts the input on screen.
         for (unsigned mode = 0; mode < 3; ++mode) {
@@ -748,6 +804,56 @@ int main()
                     saw_bloom, recovery.Excluded(), saw_ambient, result.Name(), result.Baseline(), result.Candidate(), result.Confirmation());
         CHECK(saw_bloom && saw_ambient && recovery.Excluded() == Bit(Tool::Bloom));
         CHECK(result.Current() == RouteTrial::Phase::Kept && recovery.ToolInUse() == Tool::AmbientHistory);
+    }
+    Sleep(150);
+    REQUIRE(rg::Wanted());
+    {
+        auto relit = input;
+        for (unsigned y = 0; y < relit.h; ++y)
+            for (unsigned x = 0; x < relit.w; ++x)
+                relit.v[size_t(y) * relit.w + x] *= ((x / 37 + y / 29) % 2) ? 2.f : .5f;
+        std::vector<float> still(motion.size(), 0.f);
+        auto t_lit = Picture(d, l, relit, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+        auto t_still = MotionTexture(d, l, still, keep);
+        REQUIRE(t_lit && t_still);
+        Run(d, l);
+        keep.clear();
+        REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_lit.Get(), t_output.Get(), t_still.Get(), t_screen.Get()}, got));
+        auto measured = na::referee::Score({got.data.data(), got.screen, got.tiles, got.pair, got.jitter_change});
+        const auto ref = rs::Expected(input, relit, output, rs::ScreenImage(shows_output), still);
+        const auto expected = na::referee::Score({ref.data(), true, true, true, got.jitter_change});
+        std::printf("patchy light: compatible=%u unresolved=%u pattern=%u of %u still points\n",
+                    measured.light_compatible, measured.ambiguous_still, measured.changed_still, measured.still_points);
+        CHECK(measured.light_compatible == expected.light_compatible && measured.changed_still == expected.changed_still);
+        // A patch crossing two differently lit materials genuinely changes shape. Compare
+        // against the known light field on the interiors, after the normal jitter gate.
+        unsigned interiors = 0;
+        const auto* light_samples = got.data.data() + na::referee::BlockOffset(na::referee::kPoints);
+        for (unsigned j = 0; j < na::referee::kGridH; ++j) for (unsigned i = 0; i < na::referee::kGridW; ++i) {
+            const int x = int(na::referee::PointX(i, relit.w)), y = int(na::referee::PointY(j, relit.h));
+            if ((x - 1) / 37 != (x + 1) / 37 || (y - 1) / 29 != (y + 1) / 29) continue;
+            const float* p = light_samples + (j * na::referee::kGridW + i) * na::referee::kPointValues;
+            if (p[na::referee::kContrast] < .03f || p[na::referee::kStill] <= .08f ||
+                p[measured.placement] <= .8f * p[na::referee::kStill]) continue;
+            const double gain = ((x / 37 + y / 29) % 2) ? 2. : .5;
+            double deltas[9]{}, mean = 0;
+            unsigned n = 0;
+            for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
+                const double v = (std::max)(0., double(input.At(x + dx, y + dy)));
+                const double floor = na::referee::kLumaFloor;
+                if ((std::max)(v, v * gain) + floor <= 1. / 1024) continue;
+                deltas[n] = std::log2((v * gain + floor) / (v + floor));
+                mean += deltas[n++];
+            }
+            if (n < 5) { CHECK(p[na::referee::kStillStructure] < 0); continue; }
+            mean /= n;
+            double residual = 0;
+            for (unsigned k = 0; k < n; ++k) residual += std::fabs(deltas[k] - mean);
+            residual /= n;
+            CHECK(std::fabs(p[na::referee::kStillStructure] - residual) < .002);
+            if (residual <= (std::min)(.04, .25 * p[na::referee::kStill])) ++interiors;
+        }
+        CHECK(interiors > 3000 && measured.light_compatible >= interiors);
     }
     Sleep(150);
     REQUIRE(rg::Wanted());

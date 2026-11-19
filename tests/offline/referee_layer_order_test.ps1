@@ -52,3 +52,10 @@ $sequence = @(Get-RefereeSummary @(
 ))
 if (-not ($sequence -like '*after trying reduced bloom*') -or -not ($sequence -like '*Kept current-frame ambient shading*') -or
     -not ($sequence -like '*no submitted control matches*')) { throw 'Missing stage-specific recovery sequence' }
+
+$regional = @(Get-RefereeSummary @(
+    'event referee_composite frame=98 path=native11 input_xy=81,32 control_xy=240,46 tile_size=32 input_mask=1 output_mask=28'
+    'event native11_route_trial next_frame=201 phase=kept region=11 stops=0.000/0.000/0.000 regional=1 why=the original bypass returned on recheck'
+))
+if (-not ($regional -like '*81,32*240,46*') -or -not ($regional -like '*Replacement kept*original bypass*') -or
+    ($regional -like '*brightness change in stops*')) { throw 'Regional replacement evidence was lost in the results' }

@@ -17,7 +17,7 @@ cbuffer C : register(b0) {
     float sx, sy, djx, djy;        // DLSS's motion scale; jitter now minus jitter before (pixels)
     uint4 tileCells[2];
 };
-static const uint kThumbW = 128, kThumbH = 72, kTaps = 4, kTile = 32, kGridW = 96, kGridH = 54, kValues = 8;
+static const uint kThumbW = 128, kThumbH = 72, kTaps = 4, kTile = 32, kGridW = 96, kGridH = 54, kValues = 9;
 static const float2 kTileAt[8] = { float2(.22,.30), float2(.42,.26), float2(.62,.30), float2(.80,.34),
                                    float2(.20,.66), float2(.38,.72), float2(.60,.70), float2(.78,.64) };
 float load_luma(uint which, int2 p, uint ww, uint hh) {
@@ -117,16 +117,27 @@ void points(uint3 id : SV_DispatchThreadID) {
     }
     const float2 shift[6] = { float2(0, 0), v, v - dj, v + dj, .5 * v - dj, 2 * v - dj };
     float e[6] = { 0, 0, 0, 0, 0, 0 };
-    float contrast = 0;
-    for (int b = -1; b <= 1; ++b)
+    float contrast = 0, delta[9], sum = 0;
+    uint support = 0, mask = 0;
+    [unroll] for (int b = -1; b <= 1; ++b)
         for (int a = -1; a <= 1; ++a) {
             const float2 q = float2(x + a, y + b);
             const float cv = log_at(1, q);
-            [unroll] for (uint k = 0; k < 6; ++k) e[k] += abs(cv - log_at(0, q + shift[k]));
             const float pv = log_at(0, q);
+            const float d = cv - pv;
+            const uint tap = (b + 1) * 3 + a + 1;
+            delta[tap] = d;
+            if (max(cv, pv) > -10) { sum += d; ++support; mask |= 1u << tap; }
+            e[0] += abs(d);
+            [unroll] for (uint k = 1; k < 6; ++k) e[k] += abs(cv - log_at(0, q + shift[k]));
             contrast += .5 * (abs(log_at(0, q + float2(1, 0)) - pv) + abs(log_at(0, q + float2(0, 1)) - pv));
         }
     [unroll] for (uint k = 0; k < 6; ++k) store(at + k, k >= 4 && !patch_visible(centre + shift[k]) ? -1 : e[k] / 9);
     store(at + 6, contrast / 9);
     store(at + 7, length(v));
+    float structure = 0;
+    const float inv_support = rcp(float(max(support, 1u)));
+    [unroll] for (uint i = 0; i < 9; ++i)
+        if (mask & (1u << i)) structure += abs(delta[i] - sum * inv_support);
+    store(at + 8, support >= 5 ? structure * inv_support : -1);
 }

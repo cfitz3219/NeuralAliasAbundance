@@ -3047,9 +3047,9 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             if (placement_owned_frame && g_lit.steer && ticket && g_trial_reader(ticket, sample)) trial.Add(ticket, sample, g_frame);
             if (before != trial.Current())
                 na::eventlog::Emit("native11_route_trial",
-                    "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f why=%s",
+                    "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u why=%s",
                     (unsigned long long)g_frame, trial.Name(), trial.Region(),
-                    trial.Baseline(), trial.Candidate(), trial.Confirmation(), trial.Reason());
+                    trial.Baseline(), trial.Candidate(), trial.Confirmation(), unsigned(trial.Regional()), trial.Reason());
         }
         g_lit.steer = g_lit.steer && trial.UsesCandidate();
     } else g_recovery.Clear();

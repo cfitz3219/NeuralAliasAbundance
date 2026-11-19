@@ -37,3 +37,30 @@ Fable measured two archived Shadow of War sequences, 233659 and 015408. Approxim
 - `src/host_dx12/observe/producers.cpp` collects read transitions and submission evidence. `src/host_dx12/native11/frame_model.hpp` learns boundaries. `docs/VARIANTS.md` records the game counterexamples.
 - `src/host_dx12/dlss/dlss_backend.cpp` owns per-view NGX features. [Fable's replay tool on PR 145](https://github.com/cfitz3219/NeuralAliasAbundance/blob/b9f8342d76d03baeb6e245b1f9944382b83707ea/tests/host/dlss_capture_replay.cpp) evaluates saved inputs.
 - [Microsoft D3D12 resource states and barriers](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12), [enhanced barriers](https://microsoft.github.io/DirectX-Specs/d3d/D3D12EnhancedBarriers.html), [NVIDIA Streamline DLSS integration](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS.md).
+
+## 2026-11-19 implementation and capture measurements
+
+### Local illumination and missing motion
+
+The CPU reference and the sampling shader use the same nine already-read log-luminance values. At each textured 3×3 patch with a vector shorter than half a pixel, let d be its current-minus-previous log luminance differences. The raw change is mean(abs(d)) over all nine texels. For the structure measurement, exclude texels below −10 stops at both times, where the logarithmic floor obscures gain. Require at least five remaining texels. On those texels measure mean(abs(d − mean(d))). A uniform multiplicative light change within the patch leaves a near-zero residual even when the next patch changes by a different amount. A texel that becomes visible on only one frame remains in the comparison.
+
+The original jitter check still runs first. Among its unexplained changes above 0.08 stop, a residual no greater than both 0.04 stop and a quarter of the raw change is compatible with local illumination. A residual above 0.08 counts as changed structure. Intermediate results remain inconclusive. A changing shadow boundary can change local structure too. A uniform ramp moving across the patch can resemble a gain. Neither observation alone identifies the physical cause.
+
+The existing replay ran over all 30 saved evaluations in each recording. Only the continuous prefixes had adjacent pairs eligible for motion scoring. Replaying the first 8 and 9 saved frames, respectively, with scripts/replay_referee.py and the current na_referee_replay executable reproduces the following full-frame totals. Each count is a grid-point observation across pairs, not a unique pixel or a frame verdict.
+
+| Saved Shadow of War run | Adjacent pairs | Textured points reporting stillness | Previously counted as changed | Local light compatible | Changed structure | Inconclusive |
+|---|---:|---:|---:|---:|---:|---:|
+| 233659, process 33800 | 7 | 19,386 | 4,708 | 290 | 3,653 | 765 |
+| 015408, process 41728 | 8 | 9,684 | 1,937 | 140 | 1,514 | 283 |
+
+Both recordings include enough moving points that the predominantly-still rule does not decide their whole-frame motion verdict. The production scorer reports partial prediction for 233659 and passes motion for 015408. The still-point correction alone cannot establish the cause of the visible reflection.
+
+An additional fixed-pixel check restricted the same grid to textured points in the farthest quartile of valid depth with sub-half-pixel vectors at both endpoints. In 233659, 121 of 197 observations exceeded 0.08 stop one frame apart, compared with 21 of 179 two frames apart. Of the 121, 51 preserved the local pattern, 36 changed it, and 34 were inconclusive. This check deliberately uses fixed pixels without jitter compensation. In 015408 this particular depth-and-vector filter yielded zero adjacent observations, so it supports no distant-still comparison for that recording.
+
+### Regional composition
+
+The shared screen reader carries the locations and owners of registered 32×32 tiles. A small patch of input can qualify when its two non-overlapping halves independently identify the input and at least two separate control tiles identify the reconstruction. Larger mixed areas can qualify with separate non-overlapping tiles for each source. A positive whole-screen vote can coexist with a local bypass. Reading back another image or synchronously waiting in the game callback is unnecessary.
+
+After three accepted, matching observations, Results reports pixel coordinates for a disputed tile and a clear control. When the native DX11 adapter has independently qualified another lighting placement, its existing reversible comparison can now act on a steady bypass. Four comparable observations per arm must reproduce the original mixed picture, show reconstruction at the disputed locations under the replacement, and restore the bypass on the ordinary route. Controls must retain their source and visible detail. Missing or relocated witnesses cannot earn approval. A suspected local bypass alone does not nominate a different draw pass in DX12 or alter the chosen preset.
+
+The RTX fixture passed a local input patch, a translucent overlay over reconstructed detail, an opaque patch with no identifiable source, and whole-screen alternation through the actual shader and accepted-presentation mailbox. In the steady split-screen control, masks for the original, candidate and original recheck were respectively 0x31/0x8c, 0x00/0xbd and 0x31/0x8c (input/output). This fixture uses known input and output images. The separate native DX11 tests execute real NGX. Neither substitutes for seeing the fault in Shadow of War with this build.

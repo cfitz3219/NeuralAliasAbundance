@@ -4,6 +4,61 @@
 
 namespace na::referee {
 
+// Coordinates identify the sampled footprint even after a probe relocates.
+struct RegionalTiles {
+    struct Position { int x = 0, y = 0; };
+    std::array<Position, kTiles> at{};
+    std::array<float, kTiles> detail{}; // presented high-frequency energy at the fixed witnesses
+    uint8_t input = 0, output = 0, confirmed_input = 0;
+
+    void Set(TileVotes votes, uint32_t w, uint32_t h, const TileLocations& locations)
+    {
+        input = votes.input;
+        output = votes.output;
+        confirmed_input = votes.confirmed_input;
+        for (unsigned i = 0; i < kTiles; ++i) {
+            at[i] = {TileLeft(i, w, locations), TileTop(i, h, locations)};
+            if (at[i].x < 0 || at[i].y < 0 || at[i].x + int(kTile) > int(w) || at[i].y + int(kTile) > int(h)) {
+                input &= uint8_t(~(1u << i));
+                output &= uint8_t(~(1u << i));
+            }
+        }
+    }
+    bool Mixed() const
+    {
+        if (!(input & (input - 1)) && !(input & confirmed_input)) return false;
+        if (!(output & (output - 1)) || (input & output)) return false;
+        for (unsigned i = 0; i < kTiles; ++i) if (((input | output) >> i) & 1u)
+            for (unsigned j = 0; j < i; ++j) if (((input | output) >> j) & 1u)
+                if (std::abs(at[i].x - at[j].x) < int(kTile) && std::abs(at[i].y - at[j].y) < int(kTile)) return false;
+        return true;
+    }
+    enum class Match { Unknown, Original, Improved, Worse };
+    Match Compare(const RegionalTiles& current) const
+    {
+        unsigned raw = 0, enhanced = 0, required = 0;
+        bool missing = false;
+        for (unsigned i = 0; i < kTiles; ++i) {
+            const unsigned bit = 1u << i;
+            if (!((input | output) & bit)) continue;
+            if (at[i].x != current.at[i].x || at[i].y != current.at[i].y) { missing = true; continue; }
+            if (output & bit) {
+                if (current.input & bit) return Match::Worse;
+                if (!(current.output & bit)) { missing = true; continue; }
+                if (detail[i] > .02f && current.detail[i] < .75f * detail[i]) return Match::Worse;
+            } else {
+                ++required;
+                raw += (current.input & bit) != 0;
+                enhanced += (current.output & bit) != 0;
+            }
+        }
+        if (missing) return Match::Unknown;
+        if (required && raw == required && (required > 1 || (current.confirmed_input & input))) return Match::Original;
+        if (required && enhanced == required && !current.input) return Match::Improved;
+        return Match::Unknown;
+    }
+};
+
 struct TrialSample {
     static constexpr unsigned subdivisions = 4;
     using Change = std::array<float, subdivisions * subdivisions>;
@@ -15,6 +70,7 @@ struct TrialSample {
     std::array<float, FlickerTransition::count> image{};
     std::array<float, FlickerTransition::count> contrast{};
     bool delivered = false, bypassed = false;
+    RegionalTiles tiles;
     bool comparable = true;
     FlickerTransition origin{};
     uint8_t tools = 0, applied = 0; // intersection of the two submitted recordings
@@ -104,9 +160,10 @@ public:
         targeted_ = true;
     }
     bool RuledOut() const { return phase_ == Phase::Rejected && ruled_out_; }
+    bool Regional() const { return regional_; }
     void ObserveRejectedSetup(const TrialSample& sample)
     {
-        if (phase_ == Phase::Rejected && !retry_at_ && baseline_ && !SameSetup(anchor_, sample))
+        if (phase_ == Phase::Rejected && !retry_at_ && (baseline_ || regional_) && !SameSetup(anchor_, sample))
             Retry("the display layout or evaluation settings changed");
     }
     Phase Current() const { return phase_; }
@@ -128,20 +185,21 @@ public:
     }
     uint64_t Ticket(uint64_t frame) const
     {
-        const bool watch = phase_ == Phase::Kept || (phase_ == Phase::Rejected && !retry_at_ && baseline_);
+        const bool watch = phase_ == Phase::Kept || (phase_ == Phase::Rejected && !retry_at_ && (baseline_ || regional_));
         return (Active() || watch) && frame >= measured_from_ ? (id_ << 3) | static_cast<uint8_t>(phase_) : 0;
     }
     void Tick(uint64_t now, bool available)
     {
         now_ = now;
         if (UsesCandidate() && !available) Retry("replacement lost its screen route");
+        if (phase_ == Phase::Kept && regional_ && now - regional_seen_ >= maximum_ms) Retry("regional screen evidence expired");
         if (Active() && now >= expires_) Retry("timed out without comparable presented evidence");
     }
     void Add(uint64_t ticket, const TrialSample& sample, uint64_t next_frame)
     {
         if (!ticket || ticket != Ticket(sample.ordinal) || sample.ordinal <= last_ordinal_) return;
         last_ordinal_ = sample.ordinal;
-        if (baseline_ && !SameSetup(anchor_, sample)) {
+        if ((baseline_ || regional_) && !SameSetup(anchor_, sample)) {
             Retry("the display layout or evaluation settings changed");
             return;
         }
@@ -151,7 +209,8 @@ public:
             Reject("replacement lost visible delivery");
             return;
         }
-        if (!sample.comparable || (UsesCandidate() && !sample.delivered)) {
+        if (!sample.comparable || (UsesCandidate() && !sample.delivered && !regional_)) {
+            if (regional_ && Active()) count_ = lost_region_ = 0;
             watch_same_ = watch_opposite_ = 0;
             return;
         }
@@ -161,14 +220,51 @@ public:
             }) ||
             !std::all_of(sample.image.begin(), sample.image.end(), finite)) return;
         if ((targeted_ || phase_ != Phase::Baseline) && !SameView(anchor_, sample)) {
+            if (regional_ && Active()) count_ = 0;
             watch_same_ = watch_opposite_ = 0;
             return;
+        }
+        if (regional_ && UsesCandidate()) {
+            const auto match = anchor_.tiles.Compare(sample.tiles);
+            if (match == RegionalTiles::Match::Worse) {
+                Retry("the replacement degraded a verified output area");
+                return;
+            }
+            if (match == RegionalTiles::Match::Original && phase_ == Phase::Candidate) {
+                count_ = 0;
+                if (++lost_region_ >= 2) {
+                    ruled_out_ = true;
+                    Reject("the original regional bypass persisted on the replacement");
+                }
+                return;
+            }
+            if (match != RegionalTiles::Match::Improved) {
+                count_ = 0;
+                if (phase_ == Phase::Kept) {
+                    if (++lost_region_ >= 2) Retry("regional delivery could no longer be verified");
+                } else lost_region_ = 0;
+                return;
+            }
+            lost_region_ = 0;
+            regional_seen_ = now_;
         }
         if (phase_ == Phase::Kept) {
             // Keep ordinary sampling cadence after a win. Two reversals in each
             // direction at the original severity reopen discovery. A single
             // highlight or a different view cannot displace a working route.
-            if (now_ - watch_at_ > maximum_ms) watch_same_ = watch_opposite_ = 0;
+            if (now_ - watch_at_ > maximum_ms) { watch_same_ = watch_opposite_ = 0; count_ = 0; }
+            if (spatial_only_) {
+                watch_at_ = now_;
+                window_[count_++] = sample;
+                const TrialSample* pattern = nullptr;
+                if (count_ >= samples && Repeated(region_, nullptr, pattern) >= .12f) {
+                    Retry("flicker appeared in the region recovered by the replacement");
+                } else if (count_ == window_.size()) {
+                    std::move(window_.begin() + 1, window_.end(), window_.begin());
+                    --count_;
+                }
+                return;
+            }
             watch_at_ = now_;
             const auto& change = sample.change[region_];
             const bool strong = !ImprovesWith(TrialMagnitude(change), (std::min)(baseline_, confirmation_));
@@ -201,7 +297,33 @@ public:
             } else {
                 strongest = Repeated(region_, &anchor_, pattern);
             }
-            bool comparable = strongest >= .12f;
+            if (phase_ == Phase::Baseline && !targeted_) {
+                const auto& first = window_[0];
+                bool mixed = first.width && first.height && first.tiles.Mixed();
+                unsigned mixed_frames = 0;
+                for (unsigned i = 0; i < count_; ++i) {
+                    mixed_frames += window_[i].tiles.Mixed();
+                    mixed = mixed && first.tiles.Compare(window_[i].tiles) == RegionalTiles::Match::Original &&
+                            SameSetup(first, window_[i]);
+                }
+                if (mixed) {
+                    if (strongest < .12f) {
+                        anchor_ = first;
+                        for (unsigned i = 0; i < kTiles; ++i) if (first.tiles.input & (1u << i)) {
+                            const auto at = first.tiles.at[i];
+                            region_ = (at.x + kTile / 2) * FlickerTransition::columns / first.width +
+                                (at.y + kTile / 2) * FlickerTransition::rows / first.height * FlickerTransition::columns;
+                            break;
+                        }
+                    }
+                    anchor_.tiles = first.tiles;
+                } else if (mixed_frames >= 2) strongest = 0;
+                regional_ = mixed;
+                spatial_only_ = mixed && strongest < .12f;
+            }
+            bool comparable = strongest >= .12f || spatial_only_;
+            for (unsigned i = 0; regional_ && comparable && i < count_; ++i)
+                comparable = anchor_.tiles.Compare(window_[i].tiles) == RegionalTiles::Match::Original;
             for (unsigned i = 0; comparable && i < count_; ++i) comparable = SameView(anchor_, window_[i]);
             if (!comparable) {
                 if (count_ == window_.size()) {
@@ -215,13 +337,15 @@ public:
                 Next(Phase::Candidate, next_frame);
             } else {
                 confirmation_ = strongest;
-                if (!Improves(confirmation_) || confirmation_ < baseline_ * .67f || confirmation_ > baseline_ * 1.5f) {
+                if (!spatial_only_ && (!Improves(confirmation_) || confirmation_ < baseline_ * .67f || confirmation_ > baseline_ * 1.5f)) {
                     Reject("the original flicker did not return consistently");
                     return;
                 }
                 Next(Phase::Kept, next_frame);
                 retry_delay_ = 8000;
-                reason_ = "the replacement reduced flicker against both ordinary-route measurements";
+                regional_seen_ = now_;
+                reason_ = regional_ ? "disputed tiles switched to reconstructed detail, clear controls held, and the original bypass returned on recheck" :
+                    "the replacement reduced flicker against both ordinary-route measurements";
             }
         } else if (phase_ == Phase::Candidate) {
             replacement_ = 0.f;
@@ -236,7 +360,11 @@ public:
                 Reject("the replacement lost visible detail in the affected area");
                 return;
             }
-            if (!Improves(baseline_)) {
+            if (spatial_only_ && replacement_ >= .12f) {
+                Reject("new visible variation during the regional replacement");
+                return;
+            }
+            if (!spatial_only_ && !Improves(baseline_)) {
                 // A single unrelated flash is grounds to restore ordinary
                 // rendering. It is insufficient to blacklist this tool.
                 ruled_out_ = !targeted_;
@@ -263,7 +391,7 @@ private:
     void Next(Phase phase, uint64_t frame)
     {
         phase_ = phase;
-        count_ = 0;
+        count_ = lost_region_ = 0;
         // A slow but conclusive baseline must leave the candidate its own
         // observation window. Only phase progress renews this deadline.
         expires_ = now_ + maximum_ms;
@@ -325,7 +453,9 @@ private:
     uint64_t id_ = 0, expires_ = 0, measured_from_ = 0;
     uint64_t now_ = 0, retry_at_ = 0, retry_delay_ = 8000, last_ordinal_ = 0, watch_at_ = 0;
     uint8_t watch_same_ = 0, watch_opposite_ = 0;
-    bool targeted_ = false, ruled_out_ = false;
+    bool targeted_ = false, ruled_out_ = false, regional_ = false, spatial_only_ = false;
+    uint8_t lost_region_ = 0;
+    uint64_t regional_seen_ = 0;
     uint32_t region_ = 0;
     unsigned count_ = 0;
     float baseline_ = 0, replacement_ = 0, confirmation_ = 0;

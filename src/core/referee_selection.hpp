@@ -93,30 +93,63 @@ inline ScreenVote VoteScreen(const SampleScore& score)
 // registered pixels where the two actually differ. A close match to both,
 // mixed ownership or a later tone curve outside tolerance is inconclusive.
 inline ScreenVote DistinguishTrialOutput(const SampleScore& score, const Sample& s,
-                                         uint32_t width, uint32_t height, const TileLocations& locations)
+                                         uint32_t width, uint32_t height, const TileLocations& locations, TileVotes* local = nullptr)
 {
     const auto vote = VoteScreen(score);
-    if (vote != ScreenVote::Unknown || !s.data || !s.have_screen || !s.tiles_comparable ||
-        (score.tiles_input && score.tiles_output)) return vote;
+    if (local) *local = score.local;
+    if (!s.data || !s.have_screen || !s.tiles_comparable) return vote;
+    const bool whole = vote == ScreenVote::Unknown && !(score.tiles_input && score.tiles_output);
+    if (!whole && !local) return vote;
     const float* input = s.data + BlockOffset(kTileInput);
     const float* output = s.data + BlockOffset(kTileOutput);
     const float* screen = s.registered_screen_tiles ? s.registered_screen_tiles : s.data + BlockOffset(kTileScreen);
     unsigned input_tiles = 0, output_tiles = 0;
     for (unsigned tile = 0; tile < kTiles; ++tile) {
-        unsigned different = 0, at_input = 0, at_output = 0;
+        if (!whole && ((local->input | local->output) & (1u << tile))) continue;
+        unsigned different = 0, at_input = 0, at_output = 0, first_different = 0, first_input = 0;
         for (unsigned j = 0; j < kTile*kTile; ++j) {
             const unsigned i = tile*kTile*kTile + j;
             const float gap = std::fabs(input[i] - output[i]);
             if (!std::isfinite(gap) || gap < .05f) continue;
             ++different;
             const float tolerance = (std::min)(.04f, .25f * gap);
-            at_input += std::fabs(screen[i] - input[i]) <= tolerance;
+            const bool near_input = std::fabs(screen[i] - input[i]) <= tolerance;
+            at_input += near_input;
+            if (j < kTile * kTile / 2) { ++first_different; first_input += near_input; }
             at_output += std::fabs(screen[i] - output[i]) <= tolerance;
         }
         if (different < 16) continue;
-        if (at_input * 4 >= different * 3) input_tiles |= 1u << tile;
+        if (at_input * 4 >= different * 3) {
+            input_tiles |= 1u << tile;
+            if (local && first_different >= 8 && different - first_different >= 8 &&
+                first_input * 4 >= first_different * 3 && (at_input - first_input) * 4 >= (different - first_different) * 3)
+                local->confirmed_input |= uint8_t(1u << tile);
+        }
         if (at_output * 4 >= different * 3) output_tiles |= 1u << tile;
     }
+    if (local) {
+        const uint8_t conflict = uint8_t((input_tiles & local->output) | (output_tiles & local->input));
+        local->input = uint8_t((local->input | input_tiles) & ~conflict & score.textured_tiles);
+        local->output = uint8_t((local->output | output_tiles) & ~conflict & score.textured_tiles);
+        local->confirmed_input &= local->input;
+    }
+    if (local && local->input && !(local->input & (local->input - 1)) && !(local->input & local->confirmed_input) &&
+        (local->output & (local->output - 1))) {
+        // One small disputed area can be real. Require two non-overlapping textured
+        // halves to independently prefer input, in addition to the clear control tiles.
+        unsigned tile = 0;
+        while (!(local->input & (1u << tile))) ++tile;
+        bool confirmed = true;
+        for (unsigned half = 0; confirmed && half < 2; ++half) {
+            const unsigned i = (2 * tile + half) * kTile * kTile / 2;
+            const float ci = EdgeCorrelation(input + i, screen + i, kTile, kTile / 2);
+            const float co = EdgeCorrelation(output + i, screen + i, kTile, kTile / 2);
+            confirmed = ci >= .85f && ci - co >= Params{}.tile_margin &&
+                        EdgeEnergy(output + i, kTile, kTile / 2) >= Params{}.tile_energy;
+        }
+        if (confirmed) local->confirmed_input = local->input;
+    }
+    if (!whole) return vote;
     const auto independent = [&](unsigned votes) {
         for (unsigned i = 0; i < kTiles; ++i) if (votes & (1u << i))
             for (unsigned j = 0; j < i; ++j) if (votes & (1u << j)) {

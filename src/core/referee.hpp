@@ -36,7 +36,7 @@ constexpr uint32_t kThumbW = 128, kThumbH = 72;  // picture cells (whole image, 
 constexpr uint32_t kThumbTaps = 4;               // taps per cell side
 constexpr uint32_t kTiles = 8, kTile = 32;       // result tiles, full resolution
 constexpr uint32_t kGridW = 96, kGridH = 54;     // motion points
-constexpr uint32_t kPointValues = 8;             // per motion point, see Point
+constexpr uint32_t kPointValues = 9;             // per motion point, see Point
 constexpr float kLumaFloor = 1e-4f;              // log2(luma + floor): black is not minus infinity
 
 // Tile centres as a share of the image: off the middle (crosshair, reticle) and the outer band
@@ -68,7 +68,8 @@ constexpr uint32_t kResultFloats = BlockOffset(kPoints) + kPointFloats;
 //   twice:   p + 2v - (j_now - j_before)    (a vector half too short would be right here)
 // plus the patch's own contrast (mean absolute step to the right and below, previous image) and
 // the vector's length in pixels. A value below zero marks a point that could not be measured.
-enum PointValue : uint32_t { kStill, kVector, kFollows, kReverse, kHalf, kTwice, kContrast, kLength };
+enum PointValue : uint32_t { kStill, kVector, kFollows, kReverse, kHalf, kTwice, kContrast, kLength, kStillStructure };
+static_assert(kStillStructure + 1 == kPointValues);
 
 // ---------------------------------------------------------------------------------------------
 // The processor reference of the card's sampling (tests, captures). An image is linear luminance,
@@ -169,19 +170,33 @@ inline void SamplePoints(const MotionInputs& in, float* out)
                 for (uint32_t k = 0; k < kPointValues; ++k) o[k] = -1;
                 continue;
             }
-            float e[6]{}, contrast = 0;
+            float e[6]{}, contrast = 0, delta[9], sum = 0;
+            unsigned support = 0, mask = 0;
             const float shift[6][2] = {{0, 0}, {vx, vy}, {vx - dj[0], vy - dj[1]}, {vx + dj[0], vy + dj[1]},
                                        {.5f * vx - dj[0], .5f * vy - dj[1]}, {2 * vx - dj[0], 2 * vy - dj[1]}};
             for (int b = -1; b <= 1; ++b)
                 for (int a = -1; a <= 1; ++a) {
                     const float cv = LogAt(c, x + float(a), y + float(b));
-                    for (int h = 0; h < 6; ++h) e[h] += std::fabs(cv - LogAt(p, x + float(a) + shift[h][0], y + float(b) + shift[h][1]));
                     const float pv = LogAt(p, x + float(a), y + float(b));
+                    const float d = cv - pv;
+                    const unsigned tap = (b + 1) * 3 + a + 1;
+                    delta[tap] = d;
+                    // Both samples near the log floor have no reliable gain. An edge that
+                    // becomes visible on just one frame is still evidence of a shape change.
+                    if ((std::max)(cv, pv) > -10.f) { sum += d; ++support; mask |= 1u << tap; }
+                    e[kStill] += std::fabs(d);
+                    for (int h = 1; h < 6; ++h) e[h] += std::fabs(cv - LogAt(p, x + float(a) + shift[h][0], y + float(b) + shift[h][1]));
                     contrast += .5f * (std::fabs(LogAt(p, x + float(a) + 1, y + float(b)) - pv) + std::fabs(LogAt(p, x + float(a), y + float(b) + 1) - pv));
                 }
             for (int h = 0; h < 6; ++h) o[h] = e[h] / 9.f;
             for (int h = int(kHalf); h <= int(kTwice); ++h)
                 if (!PatchVisible(x + shift[h][0], y + shift[h][1], p.w, p.h)) o[h] = -1;
+            // A multiplicative light change becomes one additive offset in log luminance.
+            float structure = 0;
+            const float inv_support = 1.f / (std::max)(support, 1u);
+            for (unsigned k = 0; k < 9; ++k)
+                if (mask & (1u << k)) structure += std::fabs(delta[k] - sum * inv_support);
+            o[kStillStructure] = support >= 5 ? structure * inv_support : -1.f;
             o[kContrast] = contrast / 9.f;
             o[kLength] = std::sqrt(vx * vx + vy * vy);
         }
@@ -308,11 +323,17 @@ struct Sample {
     const float* registered_screen_tiles = nullptr;
 };
 
+struct TileVotes { uint8_t input = 0, output = 0, confirmed_input = 0; };
+
 struct SampleScore {
     float picture = std::numeric_limits<float>::quiet_NaN();       // input vs screen
     float picture_output = std::numeric_limits<float>::quiet_NaN(); // output vs screen
     uint32_t tiles = 0, tiles_textured = 0, tiles_output = 0, tiles_input = 0, tiles_neither = 0;
     uint32_t points = 0, textured = 0, moving = 0, explained = 0, changed_still = 0, still_points = 0;
+    TileVotes local; // confidently matched registered tiles in this sample only
+    uint8_t textured_tiles = 0;
+    bool verified_mixed = false; // independently supported input and output in the same registered screen
+    uint32_t light_compatible = 0, ambiguous_still = 0; // brightness-only fits and inconclusive residuals
     uint32_t half_better = 0, twice_better = 0; // moving points a scaled vector predicts clearly better
     double err_still = 0, err_vector = 0;   // sums over moving textured points
     uint32_t jitter_points = 0, jitter_follows = 0, jitter_reverse = 0, jitter_none = 0;
@@ -341,10 +362,13 @@ inline SampleScore Score(const Sample& s, const Params& p = Params())
             ++r.tiles;
             if (EdgeEnergy(to, kTile, kTile) < p.tile_energy) continue;
             ++r.tiles_textured;
+            r.textured_tiles |= uint8_t(1u << k);
             const float co = EdgeCorrelation(to, ts, kTile, kTile), ci = EdgeCorrelation(ti, ts, kTile, kTile);
             if (!std::isfinite(co) || !std::isfinite(ci) || (std::max)(co, ci) < p.tile_seen) { ++r.tiles_neither; continue; }
             if (co - ci >= p.tile_margin) ++r.tiles_output;
             else if (ci - co >= p.tile_margin) ++r.tiles_input;
+            if (co >= .85f && co - ci >= p.tile_margin) r.local.output |= uint8_t(1u << k);
+            if (ci >= .85f && ci - co >= p.tile_margin) r.local.input |= uint8_t(1u << k);
         }
     }
     if (s.have_motion) {
@@ -390,7 +414,13 @@ inline SampleScore Score(const Sample& s, const Params& p = Params())
             } else {
                 ++r.still_points;
                 // Changed, and the jitter does not account for it.
-                if (o[kStill] > p.point_changed && e > .8f * o[kStill]) ++r.changed_still;
+                if (o[kStill] > p.point_changed && e > .8f * o[kStill]) {
+                    const float residual = o[kStillStructure];
+                    if (residual >= 0 && residual <= (std::min)(p.point_changed * .5f, .25f * o[kStill]))
+                        ++r.light_compatible;
+                    else if (residual > p.point_changed) ++r.changed_still;
+                    else ++r.ambiguous_still;
+                }
             }
         }
     }
@@ -452,18 +482,20 @@ struct Window {
         if (s.points) ++motions;
         total.tiles += s.tiles; total.tiles_textured += s.tiles_textured; total.tiles_output += s.tiles_output;
         total.tiles_input += s.tiles_input; total.tiles_neither += s.tiles_neither;
+        if (s.verified_mixed) ++mixed_frames;
         if (s.tiles_textured >= 4) {
             ++textured_frames;
             const uint32_t decided = s.tiles_output + s.tiles_input;
             if (s.tiles_neither * 2 > s.tiles_textured) ++neither_frames;
             else if (decided >= 4 && decided * 2 >= s.tiles_textured) {
-                if (s.tiles_output >= 2 && s.tiles_input >= 2) ++mixed_frames;
+                if (!s.verified_mixed && s.tiles_output >= 2 && s.tiles_input >= 2) ++mixed_frames;
                 if (s.tiles_output * 4 >= decided * 3) ++output_frames;
                 else if (s.tiles_output < 2 && s.tiles_input * 4 >= decided * 3) ++input_frames;
             }
         }
         total.points += s.points; total.textured += s.textured; total.moving += s.moving; total.explained += s.explained;
         total.changed_still += s.changed_still; total.still_points += s.still_points;
+        total.light_compatible += s.light_compatible; total.ambiguous_still += s.ambiguous_still;
         total.half_better += s.half_better; total.twice_better += s.twice_better;
         total.err_still += s.err_still; total.err_vector += s.err_vector;
         total.jitter_points += s.jitter_points; total.jitter_follows += s.jitter_follows;
@@ -508,7 +540,8 @@ inline Verdicts Judge(const Window& w, const Params& p = Params())
         const uint32_t judged_still = t.still_points;
         if (t.textured < 64) v.motion_why = "too few textured points";
         else if (t.moving * 50 < t.textured) {
-            if (judged_still && t.changed_still * 2 > judged_still) { v.motion = Verdict::Fail; v.motion_why = "the picture moved where the vectors say still"; }
+            if (judged_still && t.changed_still * 2 > judged_still) { v.motion = Verdict::Fail; v.motion_why = "local patterns changed where the vectors say still"; }
+            else if (t.light_compatible > judged_still / 2) v.motion_why = "brightness changed while local patterns held";
             else { v.motion_why = "too few moving vectors to judge motion across the scene"; }
         } else {
             const double ratio = t.err_still > 0 ? t.err_vector / t.err_still : 1.0;
@@ -542,7 +575,7 @@ inline int Format(char* out, size_t n, const Window& w, const Verdicts& v)
         "samples=%u screens=%u pairs=%u "
         "picture{verdict=%s edges=%.3f min=%.3f max=%.3f output_edges=%.3f why=\"%s\"} "
         "result{verdict=%s tiles=%u textured=%u output=%u input=%u neither=%u frame_votes=%u/%u output_frames=%u input_frames=%u neither_frames=%u why=\"%s\"} "
-        "motion{verdict=%s points=%u textured=%u moving=%u explained=%u error_ratio=%.3f half_better=%u twice_better=%u changed_where_still=%u of=%u why=\"%s\"} "
+        "motion{verdict=%s points=%u textured=%u moving=%u explained=%u error_ratio=%.3f half_better=%u twice_better=%u changed_where_still=%u of=%u light_compatible=%u ambiguous_still=%u why=\"%s\"} "
         "jitter{verdict=%s points=%u follows=%u reverse=%u none=%u why=\"%s\"}",
         w.samples, w.screens, w.motions,
         VerdictName(v.picture), double(w.Picture()), w.picture_n ? double(w.picture_min) : 0.0, w.picture_n ? double(w.picture_max) : 0.0,
@@ -550,7 +583,7 @@ inline int Format(char* out, size_t n, const Window& w, const Verdicts& v)
         VerdictName(v.result), t.tiles, t.tiles_textured, t.tiles_output, t.tiles_input, t.tiles_neither,
         w.output_frames + w.input_frames + w.neither_frames, w.textured_frames,
         w.output_frames, w.input_frames, w.neither_frames, v.result_why,
-        VerdictName(v.motion), t.points, t.textured, t.moving, t.explained, ratio, t.half_better, t.twice_better, t.changed_still, t.still_points, v.motion_why,
+        VerdictName(v.motion), t.points, t.textured, t.moving, t.explained, ratio, t.half_better, t.twice_better, t.changed_still, t.still_points, t.light_compatible, t.ambiguous_still, v.motion_why,
         VerdictName(v.jitter), t.jitter_points, t.jitter_follows, t.jitter_reverse, t.jitter_none, v.jitter_why);
 }
 

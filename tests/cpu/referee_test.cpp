@@ -302,6 +302,26 @@ int main()
         const Verdicts v = motion_case(now, before, 0, 0, jn, jb, &w);
         check(v.motion == Verdict::Fail, "motion: zero vectors on a moving picture are caught");
     }
+    { // Adjacent materials independently brighten or dim, while a displaced texture still fails.
+        Image relit = before, pan = now;
+        for (unsigned y = 0; y < H; ++y) for (unsigned x = 0; x < W; ++x) {
+            const float gain = ((x / 37 + y / 29) % 2) ? 2.f : .5f;
+            relit.v[y * W + x] *= gain;
+            pan.v[y * W + x] *= gain;
+        }
+        Window w;
+        auto v = motion_case(relit, before, 0, 0, jb, jb, &w);
+        check(v.motion == Verdict::NotMeasured && w.total.light_compatible > w.total.still_points * .8f,
+              "local lighting on static detail does not convict the motion source");
+        v = motion_case(pan, before, 0, 0, jn, jb, &w);
+        check(v.motion == Verdict::Fail, "a pan with missing vectors remains visible under patchy relighting");
+        auto foliage = before;
+        for (unsigned y = H / 4; y < H / 2; ++y)
+            for (unsigned x = W / 4; x < W * 3 / 4; ++x) foliage.v[y * W + x] = now.v[y * W + x];
+        v = motion_case(foliage, before, 0, 0, jb, jb, &w);
+        check(v.motion == Verdict::NotMeasured && w.total.changed_still > 0 && w.total.changed_still < w.total.still_points / 3,
+              "a moving patch surrounded by stationary detail is recorded without blaming the entire motion source");
+    }
     { // A prior-frame position far outside the image supplies no evidence.
         Window w;
         const Verdicts v = motion_case(now, before, 1e30f, 0, jn, jb, &w);
@@ -453,6 +473,42 @@ int main()
         exercise(.07f, .24f, true, false, 0.f, Phase::Rejected);
         exercise(.07f, .24f, false, true, 0.f, Phase::Rejected);
         exercise(.04f, .24f, false, false, .32f, Phase::Rejected);
+        // A stationary two-region bypass has no flash. Exercise the actual trial transitions.
+        const auto regional_case = [&](unsigned candidate, bool restore_original) {
+            RouteTrial t;
+            t.Start(57, 0, 100);
+            uint64_t ordinal = 0;
+            for (unsigned arm = 0; arm < 3 && t.Active(); ++arm) {
+                ordinal += RouteTrial::warmup_frames + 1;
+                for (unsigned i = 0; i < 4; ++i) {
+                    TrialSample f;
+                    f.ordinal = ++ordinal; f.width = 960; f.height = 540;
+                    f.delivered = true; // even a positive global verdict must not rescue a bad candidate
+                    TileVotes votes{0x03, 0xfc};
+                    if ((arm == 1 && candidate != 1) || (arm == 2 && !restore_original)) votes = {0, 0xff};
+                    if (arm == 1 && candidate == 2) votes = {0x04, 0xfb};
+                    f.tiles.Set(votes, f.width, f.height, {});
+                    f.tiles.detail[2] = (arm == 1 && candidate == 5) ? .04f : .10f;
+                    if (arm == 1 && candidate == 3) f.tiles.at[0].x++;
+                    if (arm == 1 && candidate == 4) f.change[20].fill(.3f);
+                    t.Tick(100 + ordinal, true);
+                    t.Add(t.Ticket(f.ordinal), f, f.ordinal + 1);
+                }
+            }
+            if (t.Active()) t.Tick(100 + ordinal + RouteTrial::maximum_ms, true);
+            return t;
+        };
+        auto won = regional_case(0, true);
+        check(won.Regional() && won.Current() == Phase::Kept, "mixed tiles: disputed areas recover, controls hold, original bypass returns");
+        won.Tick(100000, true);
+        check(!won.UsesCandidate(), "a regional winner expires without accepted screen receipts");
+        for (unsigned c = 1; c <= 5; ++c)
+            check(regional_case(c, true).Current() == Phase::Rejected, "reject unchanged, damaged, relocated or newly flickering regional trial");
+        check(regional_case(0, false).Current() == Phase::Rejected, "an original bypass that does not recur cannot certify a replacement");
+        RegionalTiles overlap;
+        overlap.Set({3, 12}, 960, 540, {});
+        overlap.at[0] = overlap.at[1];
+        check(!overlap.Mixed(), "overlapping tiles cannot act as independent witnesses");
         RouteTrial quiet;
         quiet.Start(52, 0, 0);
         for (uint64_t i = 40; i < 44; ++i) {

@@ -57,7 +57,8 @@ function Get-RefereeSummary([string[]] $Lines) {
     $traces = @($Lines | Where-Object { $_ -match '\breferee_trace\s+frames=\d+,\d+ first_stage=(input|reconstruction|composition) ' })
     $trials = @($Lines | Where-Object { $_ -match '\bnative11_route_trial next_frame=\d+ phase=' })
     $recovery = @($Lines | Where-Object { $_ -match '\breferee_recovery frame=\d+ first_stage=' })
-    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery) {
+    $composite = $Lines | Where-Object { $_ -match '\breferee_composite frame=\d+ path=' } | Select-Object -Last 1
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
@@ -81,15 +82,21 @@ function Get-RefereeSummary([string[]] $Lines) {
         $null = $roles[-1] -match 'role_deliveries=(\d+) scene_stream=(\d+)'
         $out.Add("  Rotating lighting buffers: DLAA used the screen-verified lighting route. Last checkpoint for scene $($Matches[2]): at least $($Matches[1]) submissions.")
     }
-    if ($trials) {
-        $null = $trials[-1] -match '\bphase=(\w+) region=(\d+) stops=([^ ]+) why=(.*)$'
+    if ($composite -match 'input_xy=(\d+,\d+) control_xy=(\d+,\d+) tile_size=(\d+)') {
+        $out.Add("  Repeated regional difference. A $($Matches[3])-pixel tile at ($($Matches[1])) matched the input. A control at ($($Matches[2])) matched the reconstructed picture.")
+    }
+    if ($trials -and $trials[-1] -match '\bphase=(\w+) region=(\d+) stops=([^ ]+)(?: regional=(\d+))? why=(.*)$') {
+        $regional = $Matches[4] -eq '1'
+        $why = $Matches[5]
+        $stops = $Matches[3]
         $trialState = switch ($Matches[1]) {
             'kept' { 'Replacement kept' }
             'rejected' { 'Ordinary route restored' }
             default { 'Comparison in progress at the last recorded frame' }
         }
-        $out.Add("  $trialState. $($Matches[4])")
-        $out.Add("  Compared brightness change in stops (ordinary / replacement / ordinary retest): $($Matches[3]).")
+        $out.Add("  $trialState. $why")
+        if ($regional) { $out.Add('  The comparison follows the same disputed tiles and clear controls through the ordinary route, replacement, and ordinary retest.') }
+        else { $out.Add("  Compared brightness change in stops (ordinary / replacement / ordinary retest): $stops.") }
     }
     if ($layerOrder) { $out.Add($layerOrder) }
     if ($recovery) {
