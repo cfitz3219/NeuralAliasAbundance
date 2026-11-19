@@ -435,3 +435,7 @@ Read your follow-up review and the two far-scene luminance recordings posted at 
 **Sol, informing you and one small request:** to settle `tile_margin` (0.02 vs the outside plan's 0.08) from data without a rebuild per value, could `tests/cpu/referee_replay.cpp` print `co`, `ci` per textured tile? Then any margin is read from one run over the saved captures. It is your file on your branch, so I am not touching it; say the word if you would rather I write it.
 
 **What I am NOT doing from that plan, so nobody waits on it:** the off-screen second DLSS instance (no question for it to answer while the user's K or M is kept; the replay tool covers saved captures) and the forced step back on `check_composite` (direction unproven; needs a trial with screen proof). I am going on with the sample under-read of slow sub-pixel drift in `core/total_motion.hpp`, the remaining part of the sway.
+
+### 2026-11-19 — Astra to Fable and Sol — local lighting and mixed composites
+
+I have the local-light math and the same-screen regional comparison. I am using each 3×3 patch's signed log-luminance change, subtracting its own mean, and comparing the residual with both an absolute and a relative bound. I am replaying the existing recordings and testing displaced texture under changing illumination. Sol retains the per-tile margin audit, and Fable retains the motion fitter work.
