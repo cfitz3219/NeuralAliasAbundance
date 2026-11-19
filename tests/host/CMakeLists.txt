@@ -495,7 +495,8 @@ if(TARGET host_native11)
     add_test(NAME host_native11_dlaa_rotating_lighting_test COMMAND native11_dlaa_test --lit-role)
     add_test(NAME host_native11_dlaa_rotating_padded_lighting_test COMMAND native11_dlaa_test --lit-role-padded)
     add_test(NAME host_native11_dlaa_route_trial_test COMMAND native11_dlaa_test --lit-role-trial)
-    set_tests_properties(host_native11_dlaa_rotating_lighting_test host_native11_dlaa_rotating_padded_lighting_test
+    add_test(NAME host_native11_dlaa_composition_recovery_test COMMAND native11_dlaa_test --composition-recovery)
+    set_tests_properties(host_native11_dlaa_composition_recovery_test host_native11_dlaa_rotating_lighting_test host_native11_dlaa_rotating_padded_lighting_test
       host_native11_dlaa_route_trial_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     set_tests_properties(host_native11_dlaa_adaptive_screen_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_custom_command(TARGET native11_dlaa_test POST_BUILD

@@ -363,7 +363,8 @@ void Arbiter::fix_srv(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* fix)
     device_->CreateShaderResourceView(fix ? fix : dummy_fix_.Get(), &d, h);
 }
 
-bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const Outputs& out, uint32_t frame_slot)
+bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const Outputs& out, uint32_t frame_slot,
+                       RecordedSuppliers* suppliers)
 {
     if (!list || !pso_ || !out.xy || !out.provenance || out.width == 0 || out.height == 0 || frame_slot >= slots_)
         return false;
@@ -385,9 +386,10 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     if (use1) flags |= 1u;
     if (use1 && in.tier1_valid) flags |= 2u;
     if (use2) flags |= 4u;
-    if (use3) flags |= 8u;
-    if (use3 && in.tier3_mask) flags |= 16u;
-    if (use3 && in.tier3_valid) flags |= 32u;
+    const bool residual = use3 && !(use2 && in.prefer_camera_without_residual);
+    if (residual) flags |= 8u;
+    if (residual && in.tier3_mask) flags |= 16u;
+    if (residual && in.tier3_valid) flags |= 32u;
     if (out.stats) flags |= 64u;
     if (use2 && in.fix) flags |= 128u;
     if (use1 && in.tier1_source == Tier1Source::Estimated) flags |= 256u; // label and counter only
@@ -466,6 +468,7 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     // added by DecodeStats, exactly like motion_arbiter.cpp:138-140.
     whole_rejects_last_ = whole_rejects * static_cast<uint64_t>(out.width) * out.height;
     tier1_source_last_ = in.tier1_source;
+    if (suppliers) *suppliers = {use_est, use2 && use3};
     return true;
 }
 

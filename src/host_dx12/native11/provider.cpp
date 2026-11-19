@@ -27,6 +27,7 @@
 #include "host_dx12/native11/textures.hpp"
 
 #include "core/temporal_jitter.hpp"
+#include "host_dx12/diag/referee_recovery.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
@@ -326,6 +327,7 @@ std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
 ScreenCheck g_screen;
 LitScene g_lit;
+referee::StageRecovery g_recovery;
 std::atomic<Id> g_lit_peer{0};
 uint64_t g_last_lit_generation = 0;
 std::atomic<bool> g_screen_enabled{false};
@@ -1450,8 +1452,18 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     f.boundary = boundary;
     f.screen_proof = lit_color ? lit_proof : verified_reader ? g_screen.Proof() : 0;
-    if (g_trial_reader && g_lit.trial.UsesCandidate() == bool(lit_color))
-        f.trial_ticket = g_lit.trial.Ticket(g_frame);
+    if (g_trial_reader && g_screen_enabled.load(std::memory_order_relaxed)) {
+        auto& placement = g_lit.trial;
+        if (placement.Active() || placement.UsesCandidate()) {
+            if (placement.UsesCandidate() == bool(lit_color)) f.trial_ticket = placement.Ticket(g_frame);
+        } else if (!lit_color) {
+            g_recovery.SetScene({f.color.incarnation, f.depth.incarnation, f.color.active_w, f.color.active_h,
+                f.color.mip, f.depth.mip, f.color.array_slice, f.depth.array_slice, f.color.active_x, f.color.active_y});
+            f.trial_ticket = g_recovery.Ticket(g_frame);
+            f.recovery_tool = g_recovery.ToolInUse();
+            f.recovery_configuration = g_recovery.Configuration();
+        }
+    }
     f.scene_draws = g_model.SceneDrawsThisFrame();
     // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
     // tagged when the game last uploaded to it.
@@ -2969,6 +2981,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         g_swap = swap;
         g_screen.ResetPlacement();
         g_lit.Clear();
+        g_recovery.Clear();
         g_lit_peer.store(0, std::memory_order_relaxed);
         DXGI_SWAP_CHAIN_DESC sd{};
         swap->GetDesc(&sd);
@@ -3018,14 +3031,20 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         using Phase = referee::RouteTrial::Phase;
         auto& trial = g_lit.trial;
         const auto before = trial.Current();
+        const auto now = GetTickCount64();
+        const bool placement_owned_frame = trial.Active() || trial.UsesCandidate();
+        static referee::TrialSample sample; // provider lock, initialized once; reader overwrites on success
+        if (!placement_owned_frame && referee::AdvanceRecovery(g_recovery, g_frame - 1, now, g_trial_reader, sample))
+            trial.ObserveRejectedSetup(sample);
         if (before != Phase::Idle || g_lit.steer) {
-            const auto now = GetTickCount64();
-            if (g_lit.steer && trial.CanStart(now)) trial.Start(++g_trial_serial, g_frame, now);
+            if (g_lit.steer && trial.CanStart(now) && !g_recovery.Busy()) {
+                g_recovery.Suspend();
+                trial.Start(++g_trial_serial, g_frame, now);
+            }
             const bool available = g_lit.steer && (!trial.UsesCandidate() || g_frame_delivered_lit);
             trial.Tick(now, available);
-            referee::TrialSample sample;
             const auto ticket = trial.Ticket(g_frame - 1);
-            if (g_lit.steer && ticket && g_trial_reader(ticket, sample)) trial.Add(ticket, sample, g_frame);
+            if (placement_owned_frame && g_lit.steer && ticket && g_trial_reader(ticket, sample)) trial.Add(ticket, sample, g_frame);
             if (before != trial.Current())
                 na::eventlog::Emit("native11_route_trial",
                     "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f why=%s",
@@ -3033,7 +3052,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                     trial.Baseline(), trial.Candidate(), trial.Confirmation(), trial.Reason());
         }
         g_lit.steer = g_lit.steer && trial.UsesCandidate();
-    }
+    } else g_recovery.Clear();
     if (was_steering != g_lit.steer)
         na::eventlog::Emit("native11_lit_role", "next_frame=%llu steering=%d", (unsigned long long)g_frame, int(g_lit.steer));
     g_lit_peer.store(g_lit.Learned() ? g_lit.Peer(picked.color) : 0, std::memory_order_relaxed);
@@ -3281,6 +3300,7 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
     if (s == g_swap) {
         g_screen.ResetPlacement();
         g_lit.Clear();
+        g_recovery.Clear();
         g_lit_peer.store(0, std::memory_order_relaxed);
         g_adaptive_scene.store(false, std::memory_order_relaxed);
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
@@ -3491,6 +3511,7 @@ void Uninstall()
     g_trial_reader = nullptr;
     g_screen = {};
     g_lit.Clear();
+    g_recovery.Clear();
     g_lit_peer.store(0, std::memory_order_relaxed);
     g_adaptive_scene.store(false, std::memory_order_relaxed);
     g_screen_enabled.store(false, std::memory_order_relaxed);

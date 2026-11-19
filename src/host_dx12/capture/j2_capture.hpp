@@ -111,7 +111,7 @@ uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& planes, co
                        uint32_t render_w, uint32_t render_h, uint32_t output_w, uint32_t output_h,
                        na::referee::shadow::Context context);
 // The list holding the token's copies was submitted on `queue` (signals the slot fence).
-void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission);
+void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission, uint8_t tools = 0, uint8_t applied = 0);
 // The token's list will not be submitted by J2. `may_still_run`: the copies are in a
 // list someone else may still submit (inline) -> the slot is retired, never reused.
 void Discard(uint32_t token, bool may_still_run);

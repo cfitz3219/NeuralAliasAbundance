@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace na::referee { struct TrialSample; }
+namespace na::referee { struct TrialSample; enum class RecoveryTool : uint8_t; }
 
 namespace na::native11 {
 
@@ -106,6 +106,8 @@ struct SceneFrame {
     uint64_t scene_stream = 0;
     uint64_t screen_proof = 0;     // current verified reader, or zero for ordinary placement
     uint64_t trial_ticket = 0;     // valid only in a measured, post-warmup trial window
+    referee::RecoveryTool recovery_tool{};
+    uint64_t recovery_configuration = 0;
     bool scene_changed = false;    // scene_stream differs from the previous fired frame
     Boundary boundary = Boundary::BeforeRead;
     uint32_t scene_draws = 0;      // scene draws this frame before the boundary

@@ -67,6 +67,12 @@ struct Inputs {
     ID3D12Resource* fix = nullptr;
     // CPU basis for CameraFit (compute_flow runs the fit when this and a flow pair exist).
     const FitBasis* fit_basis = nullptr;
+    bool prefer_camera_without_residual = false;
+};
+
+struct RecordedSuppliers {
+    bool estimated = false;
+    bool camera_with_residual_available = false;
 };
 
 struct Outputs {
@@ -93,7 +99,8 @@ public:
     // Records one dispatch on `list`. `frame_slot` selects a descriptor
     // block so up to max_frames_in_flight dispatches can be in flight.
     // Returns false for a null/invalid input (nothing recorded).
-    bool Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const Outputs& out, uint32_t frame_slot);
+    bool Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const Outputs& out, uint32_t frame_slot,
+                  RecordedSuppliers* suppliers = nullptr);
     // DeriveResidual on the GPU (mirrors na::motion::DeriveResidual): for
     // suppliers with RAW image flow measured on jittered frames,
     //   residual = raw_flow - V_cam - (jitter_prev - jitter_cur),

@@ -334,6 +334,20 @@ inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhe
         std::sort(ms.begin(),ms.end());auto s=cf::GetStats();
         std::printf("screen fit timing %ux%u on=%d samples=%zu median=%.4f min=%.4f max=%.4f ms model=%d samples=%.0f agree=%.0f steps=%u\n",w,h,enabled,ms.size(),(ms[9]+ms[10])*.5,ms.front(),ms.back(),s.screen_last_valid,s.screen_samples,s.screen_agree,s.screen_steps);
         CHECK(s.screen_pairs==(enabled?25u:0u));
+        if (enabled && !overhead) {
+            // Change just one recording and restore on the next one, in the
+            // same stream. Direct motion and its validity must survive both.
+            for (unsigned i = 26; i < 28; ++i) {
+                cf::Frame f;
+                f.frame=9000+i;f.previous=f.frame-1;f.generation=303;f.source_generation=303;
+                f.total=f.raster_sample=f.raster_confirmed=true;f.use_screen_fit=i==27;
+                cf::Tier3 t;
+                const auto ticket=cf::Record(g.l.list.Get(),d.queue.Get(),image[i%2].Get(),dep.Get(),in,f,t);
+                REQUIRE(ticket.context && ticket.pair && t.total && t.total_valid);
+                CHECK(bool(t.screen_model)==f.use_screen_fit);
+                REQUIRE(g.Execute()==0);cf::Committed(ticket);g.Reset();
+            }
+        }
         if(overhead){
             std::sort(record_us.begin(),record_us.end());std::sort(cut_ms.begin(),cut_ms.end());
             std::printf("steady %ux%u: record median %.2f us p95 %.2f us; ordinary cut-show median %.4f ms p95 %.4f ms; block wall %.2f s\n",

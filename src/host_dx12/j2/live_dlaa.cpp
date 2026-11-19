@@ -1,4 +1,5 @@
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/referee_recovery.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
@@ -122,6 +123,8 @@ struct PendingHistory {
     bool has_interlopers = false;
     bool cut = false;
     uint32_t capture = 0; // J2 evidence capture token for this evaluation (0 = none)
+    referee::StageRecovery::Scene recovery_scene{};
+    uint8_t recovery_tools = 0, recovery_applied = 0;
     uint64_t referee_boundary = 0; // verified at the current recording, zero when unavailable
     na::j2::compute_flow::Ticket compute_flow;
     uint32_t depth_source=0, camera_source=0;
@@ -190,6 +193,8 @@ struct DeferredNativeScale {
 
 struct State {
     std::mutex m;
+    referee::StageRecovery recovery{true};
+    const void* recovery_swapchain = nullptr;
     std::atomic<bool> enabled{false};
     std::atomic<bool> configured{false};
     std::atomic<bool> paused{false}; // the user's on/off switch in the overlay
@@ -1785,6 +1790,8 @@ void reason(const char* r)
 }
 void depth_feed_locked(UINT upto); // below, with the rest of the depth direction evidence
 void committed_sources(const PendingHistory& p) {
+    if (p.recovery_scene.color) g.recovery.SetScene(p.recovery_scene);
+    else g.recovery.Suspend();
     if(p.native_source) {
         const auto order=p.native_source.SubmissionOrder(g.queue.Get());
         if(order)g.consumed_native_order=(std::max)(g.consumed_native_order,order);
@@ -4417,6 +4424,31 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     pending.measured = measured;
     pending.no_camera = no_camera;
     pending.frame = g.frame;
+    using Tool = referee::RecoveryTool;
+    const int smear = smear_mode();
+    const bool recover = settings::Get().referee_enabled.load(std::memory_order_relaxed) && g.recovery_swapchain &&
+        !upscaling && !deferred && !windowed && !phys && !repeat && !skip_color && !smear &&
+        !g_debug_view.load(std::memory_order_relaxed) && rw == ow && rh == oh &&
+        g.router.Mode() == RouteMode::Auto;
+    if (recover) {
+        pending.recovery_scene = {color_id, depth_id, rw, rh, csub, dsub};
+        pending.recovery_scene.inline_route = inl != nullptr;
+        pending.recovery_scene.reader = pending.referee_boundary;
+        pending.recovery_scene.generation = g.router.Current().history_generation;
+        pending.recovery_scene.selection = pending.selection_version;
+    }
+    const auto current_configuration = [&] {
+        return referee::EvaluationConfiguration(PresetFor(settings::Get().j2_preset.load(), rw, ow), cf, dd.Format,
+            is_float_color(cf), reversed, camera_use, measured, g.jitter_on, flow::Enabled());
+    };
+    const bool same_recovery = recover && g.recovery.Matches(pending.recovery_scene);
+    Tool tool = same_recovery && !hist_reset ? g.recovery.ToolInUse() : Tool::None;
+    if (tool != Tool::None && g.recovery.Configuration() != current_configuration()) tool = Tool::None;
+    const auto recorded = [&](Tool option) {
+        pending.recovery_tools |= referee::Bit(option);
+        if (option == tool) pending.recovery_applied |= referee::Bit(option);
+    };
+
     bool viewport_sample_known=false;
     if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
         float vx = 0.f, vy = 0.f;
@@ -4620,6 +4652,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             frame.raster_confirmed=measured ? (vpj_mode() || (frame.jitter[0]==0.f && frame.jitter[1]==0.f)) : viewport_sample_known;
             frame.source_generation=pending.selection_version;
             frame.residual=object_flow;frame.camera_reconstruct=reconstruct && !measured;
+            // Draw replay can also consume the fit. Keep it out of a single-variable comparison.
+            const bool compare_fit = !settings::Get().j2_draw_replay.load(std::memory_order_relaxed);
+            frame.use_screen_fit = tool != Tool::ScreenFit || !compare_fit;
             frame.total=measured;frame.last_reset_frame=g.last_reset_frame;
             na::j2::compute_flow::Tier3 tier;
             na::j2::compute_flow::SetLoosen(na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed));
@@ -4636,6 +4671,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                     // outside their mask was handed no motion at all (Astra, 2026-11-17; Cort's Sniper Elite
                     // Resistance run of 3621e3a8: draw replay on stilled the shimmer while standing and
                     // lost the picture's motion while walking).
+                    if (compare_fit && (tier.screen_model || (!frame.use_screen_fit && tier.total_valid))) recorded(Tool::ScreenFit);
                     in.estimated_valid_flag=true;in.estimated_motion=tier.total;in.estimated_valid=tier.total_valid;
                     measured_cut=pending.compute_flow.cut_reset;
                 }else measured_no_pair=true; // the first picture of a pair
@@ -4655,6 +4691,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             in.tier3_valid = t3.valid;
             in.tier3_valid_flag = true;
         }
+        in.prefer_camera_without_residual = tool == Tool::CameraResidual;
         // Tier 1: the game's own motion texture, used only once it predicts the picture (moving
         // characters in a still menu get ~0 from the camera and smear; Cort 2026-11-06).
         if (g.game_motion_ok && !(saved && saved->at_present)) {
@@ -4748,7 +4785,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         o.provenance = g.provenance.Get();
         o.width = rw; // the active extent (top left); render pixels
         o.height = rh;
-        have_motion = !measured_failed && g.arbiter.Dispatch(l, in, o, g.slot);
+        na::motion::gpu::RecordedSuppliers suppliers;
+        have_motion = !measured_failed && g.arbiter.Dispatch(l, in, o, g.slot, &suppliers);
+        if (suppliers.camera_with_residual_available) recorded(Tool::CameraResidual);
+        if (!suppliers.estimated) {
+            pending.recovery_tools &= uint8_t(~referee::Bit(Tool::ScreenFit));
+            pending.recovery_applied &= uint8_t(~referee::Bit(Tool::ScreenFit));
+        }
         if (have_motion && use_replay_motion && in.tier1_valid_flag) g.replay_fed_frame = g.frame;
     }
     if(t_ic) t_ic->mark(kIcAO);
@@ -4787,13 +4830,18 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ai.scene_epoch=pending.selection_version;
         ai.reset=tracker_restart||cam.camera_cut||resize||!same_epoch;
         const auto column=na::camera::TransposeMatrix(cam.view_proj_current_row);
+        auto options = na::xegtao::CurrentOptions();
+        const bool history_requested = options.temporal > 0;
+        if (tool == Tool::AmbientHistory) options.temporal = 0;
         if(na::xegtao::FromViewProjection(column.data(),ai.projection))
-            ambient=na::xegtao::ScenePass().Prepare(g.device.Get(),g.queue.Get(),ai,na::xegtao::CurrentOptions());
+            ambient=na::xegtao::ScenePass().Prepare(g.device.Get(),g.queue.Get(),ai,options);
         if(ambient){
             // Register ownership BEFORE recording work, using existing machinery.
             if(inl){if(!na::nr::native::RetainRecording(l,ambient))ambient.reset();}
             else s.ambient=ambient;
             if(ambient&&!ambient->Record(l))ambient.reset();
+            if (ambient && history_requested && (tool == Tool::AmbientHistory ||
+                ambient->CompositedVisibility() != ambient->Occlusion())) recorded(Tool::AmbientHistory);
         }
     }
     if (deferred) { // render-small: depth/motion retained for Present, optional AO goes into the pre-HUD scene
@@ -4843,7 +4891,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if(t_ic) t_ic->mark(kIcSetup);
     // 4. DLSS at native resolution
     na::dlss::EvalDesc e{};
-    const int smear = smear_mode();
     e.color = ambient?ambient->Color():g.color_in.Get();
     // Jitter shift: the declared offset moved into the colour, so the picture does not shake.
     bool shifted = false;
@@ -4899,13 +4946,18 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         static uint64_t small_seen = 0;
         if (g.stats.small_dlss != small_seen) { small_seen = g.stats.small_dlss; na::dlss::ReleaseView(kViewId); ++g.stats.dlaa_fresh_features; }
     }
-    const auto grade_options=na::donut::CurrentOptions();
+    auto grade_options=na::donut::CurrentOptions();
+    if (tool == Tool::Bloom) grade_options.bloom_amount *= .5f;
     if(grade_options.tone||grade_options.bloom){
         na::donut::Inputs di;di.color=e.color;di.format=typed(e.color->GetDesc().Format);di.width=rw;di.height=rh;
         di.srgb=di.format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB||di.format==DXGI_FORMAT_R8G8B8A8_UNORM;di.reset=e.reset;di.stream=kViewId;
         auto grade=na::donut::ScenePass().Prepare(g.device.Get(),g.queue.Get(),di,grade_options);
         if(grade){if(inl){if(!na::nr::native::RetainRecording(l,grade))grade.reset();}else s.grade=grade;
-            if(grade&&grade->Record(l))e.color=grade->Color();}
+            if(grade&&grade->Record(l)) {
+                e.color=grade->Color();
+                if (grade_options.bloom && grade_options.bloom_amount > 0) recorded(Tool::Bloom);
+            }
+        }
     }
     if (smear == 2 && smear_ones(l, rw, rh)) e.bias_current_color = g_smear.ones.Get();
     {   // smear test 4: preset L on a fresh feature, and a fresh one again afterwards (presets apply at creation)
@@ -4934,8 +4986,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         id.dlss_mv_lowres = !e.mv_display_res;
         using na::referee::shadow::Path;
         const auto& route = g.router.Current();
-        const na::referee::shadow::Context context{
+        na::referee::shadow::Context context{
             {inl ? Path::Inline : Path::Between, pending.referee_boundary}, color_id, depth_id, route.history_generation, csub};
+        if (same_recovery) {
+            context.trial_ticket = g.recovery.Ticket(g.frame);
+            if (context.trial_ticket) context.trial_configuration = current_configuration();
+        }
         pending.capture = na::capture::j2::RecordReferee(l, planes, id, e.render_w, e.render_h, e.out_w, e.out_h, context);
     } else if (evaluated && e.reset) {
         na::referee::gpu::NotifyEvaluationReset();
@@ -5092,12 +5148,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             b.push_back(uav_barrier(g.output.Get()));
             flush(l, b);
             debug_record(l, dv, g.output.Get(), cf, g.ow, g.oh, g.rw, g.rh, g.slot); // replaces the DLAA result with the debug picture
-        } else if (const uint32_t pct = smear == 3 ? 0u : 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
+        } else if (const uint32_t pct = smear == 3 ? 0u : (tool == Tool::Sharpen ? 1u : 2u) * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
             // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
             b.push_back(uav_barrier(g.output.Get()));
             add(b, g.output.Get(), UAV, NPSR);
             flush(l, b);
             if (rcas_record(l, pct, cf)) {
+                recorded(Tool::Sharpen);
                 b.push_back(uav_barrier(g.sharp.Get()));
                 add(b, g.sharp.Get(), UAV, SRC);
                 add(b, g.output.Get(), NPSR, DST);
@@ -8522,6 +8579,16 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
     na::eventlog::TickFrame(); // every game Present: the event log's frame number
     std::lock_guard<std::mutex> lock(g.m);
     if (queue && g.queue.Get() == queue) {
+        const void* source = receipt ? receipt->swapchain : nullptr;
+        if (!settings::Get().referee_enabled.load(std::memory_order_relaxed)) source = nullptr;
+        if (g.recovery_swapchain != source) {
+            g.recovery.Clear();
+            g.recovery_swapchain = source;
+        }
+        if (source) {
+            static referee::TrialSample sample;
+            referee::AdvanceRecovery(g.recovery, g.frame, GetTickCount64(), referee::gpu::TakeTrialSample, sample);
+        }
         {
             // Route selector: close this frame's structure + outcome.
             na::j2::FrameObservation& o = g.frame_agg.Observation();
@@ -8999,7 +9066,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                     if (lists[i]) g.stats.inline_late_writes += na::observe::ListInsertionDecision(lists[i], selected_color).writes;
                 slot.fence_value = g.fence_next++;
                 queue->Signal(g.fence.Get(), slot.fence_value);
-                na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
+                na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions, pending.recovery_tools, pending.recovery_applied);
                 na::j2::compute_flow::Committed(pending.compute_flow);
                 reason(pending.native_delivery ? "Native scene DLSS reconstructed between the upscale and the game's next list." :
                     "Live DLAA is running before a learned post-processing consumer in a separate list.");
@@ -9036,7 +9103,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         g.slots[g.inl.slot].fence_value = g.fence_next++;
         queue->Signal(g.fence.Get(), g.slots[g.inl.slot].fence_value);
         if (g.inl_redirected) { g_nb.redirect_submitted.fetch_add(1, std::memory_order_relaxed); g.inl_redirected = false; }
-        na::capture::j2::Submitted(g.inl.history.capture, queue, g.stats.submissions);
+        na::capture::j2::Submitted(g.inl.history.capture, queue, g.stats.submissions, g.inl.history.recovery_tools, g.inl.history.recovery_applied);
         na::j2::compute_flow::Committed(g.inl.history.compute_flow);
         g.inl.history.capture = 0;
         g.inl.valid = false;
@@ -9188,7 +9255,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     queue->Signal(g.fence.Get(), s.fence_value);
     na::j2::flow::Committed(flow_ticket, g.fence.Get(), s.fence_value);
     na::j2::compute_flow::Committed(pending.compute_flow);
-    na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions);
+    na::capture::j2::Submitted(pending.capture, queue, g.stats.submissions, pending.recovery_tools, pending.recovery_applied);
 }
 
 void StartSmearTest() { g_smear.requested.store(true); }
@@ -9239,6 +9306,8 @@ Stats GetStats()
 void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g.m);
+    g.recovery.Clear();
+    g.recovery_swapchain = nullptr;
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset(); g.jshift.Reset();
     g.msaa = MsaaResolve{};
     for (auto& s : g.slots) { s.list.Reset(); s.alloc.Reset(); s.fence_value = 0; s.native_scale_resources={}; s.late_input_buffer={}; }

@@ -63,3 +63,17 @@ Epic's render graph describes transient resource aliasing, pass culling and asyn
 - [DXGI Present flags and nonblocking failure](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-present)
 - [D3D12 synchronization and queue fences](https://learn.microsoft.com/en-us/windows/win32/direct3d12/user-mode-heap-synchronization)
 - [NVIDIA DLSS input and frame guidance](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS.md)
+
+## Following up an unsuccessful placement
+
+The native DX11 and DX12 renderers now pass the earliest measured change and the controls actually recorded on both accepted frames to a common recovery controller. It keeps up to eight combinations of scene, settings, view, region and local flash pattern in memory. Returning to a matching view retains its exclusions during that session. A resize, device change or Referee opt-out clears the relevant history. No setting is written to the user's configuration by a trial.
+
+| First observed change | Controls eligible for a temporary comparison |
+|---|---|
+| DLAA input | Halve the existing Bloom contribution. If eligible, compare current-frame XeGTAO against its accumulated result. |
+| DLAA output | Keep camera motion and omit its optional object-flow correction, or use measured motion without the fitted fill on camera-free frames. Each requires a matching submitted motion supplier and measurable correspondence. |
+| After DLAA, on the accepted presentation | Compare half-strength RCAS when the sharpening pass actually ran. An opaque game compositor can leave this stage with no remaining eligible control. |
+
+The DX11 lighting-placement comparison gets the first opportunity when its reader is verified. On a failure, ordinary rendering resumes and the observer locates the fault again across input, reconstruction and presentation. A confirmed failure is specific to the measured view and control. Loss of evidence defers that control, giving another eligible control priority. Each arm has a bounded observation window, renewed only on a phase transition. Quiet frames and slow collection do not renew it.
+
+The GPU worker compares the same visible area across original, candidate and original settings. Gains must survive restoration, loss of detail in the region disqualifies a candidate, and moving the flash elsewhere fails the comparison. A single exceptional frame cannot rule a tool out. Screen motion trials also check the declared motion against image correspondences. A retained control is sampled periodically and withdrawn if delivery is lost or the artifact recurs. The Results report distinguishes a measured rejection from a view change, an incomplete comparison and exhaustion of the available tools. Game-owned lighting passes that the runtime cannot separately observe or change remain a coverage limit.

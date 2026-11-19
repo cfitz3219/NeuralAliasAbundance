@@ -86,6 +86,7 @@ struct State {
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
     const void* trial_source = nullptr;
     TrialSample trial_sample;
+    uint8_t trial_tools = 0, trial_applied = 0;
     uint64_t solo_screens = 0;
     uint32_t token = 0, next_token = 0;
     ComPtr<ID3D12CommandQueue> pre_queue, main_queue;
@@ -396,6 +397,21 @@ void collect_sample()
                 trial.width = uint32_t(g.img[kScreen].desc.Width);
                 trial.height = g.img[kScreen].desc.Height;
                 trial.layout = layout;
+                trial.origin = transition;
+                trial.tools = g.trial_tools;
+                trial.applied = g.trial_applied;
+                if (g.have_motion && score.textured >= 64) {
+                    const float* points = samples + BlockOffset(kPoints);
+                    float total = 0;
+                    unsigned count = 0;
+                    for (unsigned i = 0; i < kGridW * kGridH; ++i) {
+                        const float* point = points + i * kPointValues;
+                        if (point[kStill] < 0 || point[kContrast] < Params{}.point_contrast) continue;
+                        total += point[kFollows];
+                        ++count;
+                    }
+                    if (count) trial.motion_error = total / count;
+                }
                 const auto vote = shadow::DistinguishTrialOutput(score, observations,
                     uint32_t(g.img[kInput].desc.Width), g.img[kInput].desc.Height, g.sampled_locations);
                 trial.bypassed = vote == shadow::ScreenVote::Input;
@@ -428,10 +444,18 @@ void collect_sample()
         }
         if (trial.ordinal && enabled() && g.preview_exact && !g.invalidated) {
             g.trial_sample = trial;
+            g.trial_sample.observed_at = GetTickCount64();
             g.trial_source = g.swapchain;
             g.trial_last_ticket = g.captured_context.trial_ticket;
             g.trial_sample_ticket.store(g.trial_last_ticket, std::memory_order_release);
             g.trial_last_ordinal = trial.ordinal;
+            // After a non-witness, move the next probe slightly later. A
+            // seven-frame render cycle sampled every 21 frames otherwise
+            // repeats the same pair even when its parity alternates.
+            if (!g.keep_receipt && (!trial.comparable || !trial.delivered)) {
+                const uint64_t phase = trial.ordinal * 11400714819323198485ull;
+                g.trace_next_at += 20u * ((phase >> 60) + 1);
+            }
         }
         if (g.trace_pair && (!g.padded_layouts || layout) && g.main_epoch == g.epoch && g.preview_exact)
             ++g.stats.trace_pairs;
@@ -894,7 +918,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     return g.token = ++g.next_token;
 }
 
-void Submitted(uint32_t token, ID3D12CommandQueue* queue)
+void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint8_t tools, uint8_t applied)
 {
     if (!token || !queue) return;
     std::lock_guard<std::mutex> lock(g.m);
@@ -905,11 +929,15 @@ void Submitted(uint32_t token, ID3D12CommandQueue* queue)
         return;
     }
     if (g.phase == Phase::PreRecorded) {
+        g.trial_tools = tools;
+        g.trial_applied = applied;
         g.pre_value = 2 * g.sample_serial;
         if (FAILED(queue->Signal(g.pre_fence.Get(), g.pre_value))) { stop("the previous input could not be fenced"); return; }
         g.pre_queue = queue;
         set_phase(Phase::PreSubmitted);
     } else if (g.phase == Phase::MainRecorded) {
+        g.trial_tools &= tools;
+        g.trial_applied &= applied;
         g.main_value = g.sample_serial;
         if (FAILED(queue->Signal(g.main_fence.Get(), g.main_value))) { stop("the current inputs could not be fenced"); return; }
         g.main_queue = queue;

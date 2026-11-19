@@ -56,7 +56,8 @@ function Get-RefereeSummary([string[]] $Lines) {
     $roles = @($Lines | Where-Object { $_ -match '\bnative11_lit_role frame=\d+ role_deliveries=(\d+) scene_stream=\d+' })
     $traces = @($Lines | Where-Object { $_ -match '\breferee_trace\s+frames=\d+,\d+ first_stage=(input|reconstruction|composition) ' })
     $trials = @($Lines | Where-Object { $_ -match '\bnative11_route_trial next_frame=\d+ phase=' })
-    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage) {
+    $recovery = @($Lines | Where-Object { $_ -match '\breferee_recovery frame=\d+ first_stage=' })
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
@@ -91,6 +92,23 @@ function Get-RefereeSummary([string[]] $Lines) {
         $out.Add("  Compared brightness change in stops (ordinary / replacement / ordinary retest): $($Matches[3]).")
     }
     if ($layerOrder) { $out.Add($layerOrder) }
+    if ($recovery) {
+        $names = @{
+            reduce_bloom = 'reduced bloom'; current_frame_ambient_shading = 'current-frame ambient shading'
+            camera_without_residual = 'camera motion without residual flow'
+            directly_measured_motion = 'directly measured motion'; reduce_sharpening = 'reduced sharpening'
+        }
+        foreach ($line in $recovery) {
+            if ($line -notmatch 'first_stage=(\w+) region=(\d+) tool=(\w+) phase=(kept|restored|no_matching_tool) ruled_out=\d+ stops=([\d./-]+) why=(.*)$') { continue }
+            $stage, $region, $tool, $phase, $measurements, $why = $Matches[1], $Matches[2], $Matches[3], $Matches[4], $Matches[5], $Matches[6]
+            if ($phase -eq 'no_matching_tool') { $out.Add("  Region $region, $stage. $why."); continue }
+            $result = if ($phase -eq 'kept') { 'Kept' } else { 'Restored the previous settings after trying' }
+            $out.Add("  Region $region, $stage. $result $($names[$tool]). $why. Brightness change (ordinary / trial / recheck) $measurements.")
+        }
+        if ($recovery[-1] -match 'tool=(\w+) phase=(baseline|replacement|baseline_recheck) ') {
+            $out.Add("  Comparison still in progress at the last observation for '$($names[$Matches[1]])'.")
+        }
+    }
     $placements = @($Lines | Where-Object { $_ -match '(^|\s)native11_placement\s' })
     if ($placements) {
         $out.Add('  DX11 adaptive placement changes: ' + $placements.Count +

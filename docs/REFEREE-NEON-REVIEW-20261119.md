@@ -15,10 +15,17 @@ Astra reviewed Neon's eight proposals against the native renderer, Fable's revie
 
 The first implementation priority supported by both reviews is a regional check of mixed composites. The second is distinguishing unchanged geometry under changing illumination from genuinely missing motion. Off-screen preset or motion trials are a later, budgeted option. None of the eight snippets earns immediate adoption as written.
 
+## What earns an implementation change
+
+1. Reuse the existing registered screen probes for a short comparison of the disputed region and an unaffected scene region. Keep ordinary delivery throughout. The check must separate a known clear output with a translucent overlay, a small known patch of raw input over an otherwise reconstructed frame, and alternation of the entire frame. An unreadable region stays unresolved.
+2. On the same static textured geometry, vary illumination and compare that against a genuine camera pan with deliberately zero motion. The former should leave motion unjudged while the latter still flags missing motion. A scene with moving foliage around stable geometry checks that local uncertainty stays local.
+3. Calibrate threshold proposals against saved positives and labeled negative controls, using the same registered pixels for both values. Count wrong approvals and losses of real delivery independently.
+4. Reuse Fable's saved-frame NGX replay for competing motion fields or presets. Only budget a live shadow comparison when replay demonstrates a decision the existing tests cannot make. Use the same view, corresponding pixels, equivalent warm-up, and separate histories.
+
 ## Source locations
 
 - `src/core/referee.hpp` contains EdgeCorrelation, Score, Window and Judge.
 - `src/core/referee_selection.hpp` contains VoteScreen, DistinguishTrialOutput and Preview. `src/host_dx12/capture/referee_gpu.cpp` emits the preview as a diagnostic.
 - `src/host_dx12/observe/producers.cpp` collects read transitions and submission evidence. `src/host_dx12/native11/frame_model.hpp` learns boundaries. `docs/VARIANTS.md` records the game counterexamples.
-- `src/host_dx12/dlss/dlss_backend.cpp` owns per-view NGX features. `tests/host/dlss_capture_replay.cpp` evaluates saved inputs.
+- `src/host_dx12/dlss/dlss_backend.cpp` owns per-view NGX features. [Fable's replay tool on PR 145](https://github.com/cfitz3219/NeuralAliasAbundance/blob/b9f8342d76d03baeb6e245b1f9944382b83707ea/tests/host/dlss_capture_replay.cpp) evaluates saved inputs.
 - [Microsoft D3D12 resource states and barriers](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12), [enhanced barriers](https://microsoft.github.io/DirectX-Specs/d3d/D3D12EnhancedBarriers.html), [NVIDIA Streamline DLSS integration](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS.md).

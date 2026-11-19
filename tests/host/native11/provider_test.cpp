@@ -23,6 +23,7 @@
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
+#include "core/referee_recovery.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -888,7 +889,7 @@ int DepthReadFixture(Game& g, bool debug_layer)
 #endif
 
 int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[maybe_unused]] bool rotating_lights = false,
-                       [[maybe_unused]] bool compare_routes = false)
+                       [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false)
 {
     struct Surface {
         ComPtr<ID3D11Texture2D> picture;
@@ -972,6 +973,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         ID3D11RenderTargetView* expected_reader = nullptr;
         uint64_t scene_stream = 0, camera_stream = 0;
         bool reset = false, displayed_reader = false;
+        unsigned sharpening_trial_frames = 0;
 #endif
     } evaluator{game
 #if defined(NA_TEST_NATIVE_DLAA)
@@ -998,6 +1000,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             state.displayed_reader = actual.Get() == state.expected_reader;
         }
         if (!na::native_d3d11::EvaluateFrame(nullptr, context, frame)) return false;
+        if (frame.recovery_tool == na::referee::RecoveryTool::Sharpen) ++state.sharpening_trial_frames;
         ctx->CopyResource(state.after, source);
         state.received = source;
         state.scene_stream = frame.scene_stream;
@@ -1012,8 +1015,16 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         return true;
     };
 #if defined(NA_TEST_NATIVE_DLAA)
+    const auto recovery_evidence = +[](uint64_t ticket, na::referee::TrialSample& sample) {
+        if (!na::referee::gpu::TakeTrialSample(ticket, sample)) return false;
+        std::printf("accepted frame=%llu ticket=%llx delivered=%d comparable=%d first=%s region=%u tools=%u applied=%u\n",
+            static_cast<unsigned long long>(sample.ordinal), static_cast<unsigned long long>(ticket),
+            sample.delivered, sample.comparable, na::referee::StageName(sample.origin.stage), sample.origin.region,
+            unsigned(sample.tools), unsigned(sample.applied));
+        return true;
+    };
     if (!na::native11::Install(game.device.Get(), consume, &evaluator, compare_routes,
-            compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
+            composition_fault ? recovery_evidence : compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
 #else
     if (!na::native11::Install(game.device.Get(), consume, &evaluator)) return 1;
 #endif
@@ -1070,6 +1081,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             uint64_t scene = 0, camera = 0;
             std::vector<int> previous;
         };
+        bool start_fault = !composition_fault;
         auto record = [&](int i, bool light_on, Sample* sample, bool pinned = false, bool overwrite = false) {
             Pump();
             const auto start = evaluator.writes;
@@ -1104,7 +1116,10 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             c->OMSetRenderTargets(1, &late_rt, game.dsv.Get());
             c->PSSetShaderResources(0, 1, &early);
             c->VSSetShader(lit_vs.Get(), nullptr, 0);
-            c->PSSetShader(light_on ? reflection.Get() : composite.Get(), nullptr, 0);
+            // Keep the exposure identical across the rotating owners in the
+            // isolated composition case. The other fixture's .75 gain would
+            // introduce a second, whole-picture change at the earlier route.
+            c->PSSetShader(light_on ? reflection.Get() : composition_fault ? game.ps_tonemap.Get() : composite.Get(), nullptr, 0);
             for (int n = 0; n < 6; ++n) c->Draw(4, 0);
             if (overwrite) {
                 const float new_picture[]{.2f, .3f, .4f, 1};
@@ -1122,7 +1137,8 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                 // This fixture deliberately flashes one region when DLAA has
                 // already evaluated the early surface. The controlled path
                 // uses the same final shader and resources for every frame.
-                const float flash[4]{evaluator.received && evaluator.received != expected ? .80f : 0.f};
+                const bool flash_on = composition_fault ? (start_fault && (i & 1) != 0) : evaluator.received && evaluator.received != expected;
+                const float flash[4]{flash_on ? .80f : 0.f};
                 c->UpdateSubresource(trial_flash.Get(), 0, nullptr, flash, 0, 0);
                 auto* control = trial_flash.Get();
                 c->PSSetConstantBuffers(1, 1, &control);
@@ -1183,6 +1199,44 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         for (int i = 0; i < 70; ++i) if (!record(i, true, i < 42 ? nullptr : &baseline)) return 1;
         na::settings::Get().referee_enabled.store(1);
         na::native11::SetScreenCheck(true);
+        if (composition_fault) {
+            // The final game shader flashes independently of the amount of
+            // sharpening. The real provider must try the real RCAS control,
+            // then restore it while continuing to deliver NGX.
+            auto& options = na::settings::Get();
+            options.referee_every_ms.store(100);
+            options.j2_sharpness.store(50);
+            const auto end = GetTickCount64() + 90000;
+            int i = 0;
+            bool excluded = false, placement_rejected = false;
+            while (!excluded && GetTickCount64() < end) {
+                if (!record(i++, false, nullptr)) return 1;
+                Sleep(6);
+                for (const auto& line : na::eventlog::Drain()) {
+                    if (line.find("native11_route_trial") != std::string::npos) {
+                        std::printf("%s", line.c_str());
+                        if (line.find("phase=baseline ") != std::string::npos) start_fault = true;
+                        if (line.find("phase=rejected ") != std::string::npos &&
+                            line.find("did not improve") != std::string::npos) placement_rejected = true;
+                    }
+                    if (line.find("referee_recovery") != std::string::npos) {
+                        std::printf("%s\n", line.c_str());
+                        excluded |= line.find("tool=reduce_sharpening phase=restored ruled_out=16") != std::string::npos;
+                    }
+                }
+            }
+            const auto tried = evaluator.sharpening_trial_frames;
+            Sample restored;
+            for (unsigned j = 0; j < 28; ++j) if (!record(i++, false, &restored)) return 1;
+            std::printf("composition recovery: tried=%u restored=%d/28 changes=%zu visible=%zu exclusions=%d\n",
+                tried, restored.evaluated, restored.changed, restored.reached, int(excluded));
+            expect(placement_rejected, "failed lighting placement hands the same fault to the stage-specific selector");
+            expect(tried && excluded && evaluator.sharpening_trial_frames == tried && options.j2_sharpness.load() == 50,
+                   "actual DX11 trial rejects a compositing flash independent of sharpening and restores user settings");
+            expect(restored.evaluated == 28, "real DLAA stays engaged after the unsuccessful correction");
+            na::native11::Uninstall();
+            return g_failed ? 1 : 0;
+        }
         if (compare_routes) {
             na::settings::Get().referee_every_ms.store(100);
             const auto until = GetTickCount64() + 18000;
@@ -1568,7 +1622,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
     const bool padded_hdr = argc > 1 && std::strcmp(argv[1], "--lit-role-padded") == 0;
-    const bool compare_routes = argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0;
+    const bool composition_fault = argc > 1 && std::strcmp(argv[1], "--composition-recovery") == 0;
+    const bool compare_routes = composition_fault || (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
     wchar_t exe[MAX_PATH]{};
@@ -1660,7 +1715,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (g_failed) return 1;
     if (adaptive || rotating_lights) {
         na::j2::SetJitter(true);
-        const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes);
+        const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes, composition_fault);
         DeleteFileW(ini.c_str());
         std::fflush(stdout);
         ExitProcess(result);

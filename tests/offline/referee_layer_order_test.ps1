@@ -45,3 +45,10 @@ $rollback = @(Get-RefereeSummary ($trial + 'event native11_route_trial next_fram
 if (-not ($rollback -like '*Ordinary route restored. lost reader*') -or ($rollback -like '*Replacement kept*')) {
     throw 'Missing latest fallback verdict'
 }
+$sequence = @(Get-RefereeSummary @(
+    'event referee_recovery frame=100 first_stage=input region=36 tool=reduce_bloom phase=restored ruled_out=1 stops=0.24/0.25/0.00 why=the replacement did not improve the presented picture'
+    'event referee_recovery frame=200 first_stage=input region=36 tool=current_frame_ambient_shading phase=kept ruled_out=1 stops=0.24/0.01/0.24 why=the replacement reduced flicker'
+    'event referee_recovery frame=300 first_stage=composition region=20 tool=observe phase=no_matching_tool ruled_out=0 stops=0/0/0 why=no submitted control matches the measured stage'
+))
+if (-not ($sequence -like '*after trying reduced bloom*') -or -not ($sequence -like '*Kept current-frame ambient shading*') -or
+    -not ($sequence -like '*no submitted control matches*')) { throw 'Missing stage-specific recovery sequence' }

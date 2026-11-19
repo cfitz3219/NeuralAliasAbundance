@@ -8,12 +8,17 @@ struct TrialSample {
     static constexpr unsigned subdivisions = 4;
     using Change = std::array<float, subdivisions * subdivisions>;
     uint64_t ordinal = 0;
+    uint64_t observed_at = 0; // monotonic time of the receipt, supplied by the live observer
     uint64_t configuration = 0;
     uint32_t layout = 0, width = 0, height = 0;
     std::array<Change, FlickerTransition::count> change{};
     std::array<float, FlickerTransition::count> image{};
+    std::array<float, FlickerTransition::count> contrast{};
     bool delivered = false, bypassed = false;
     bool comparable = true;
+    FlickerTransition origin{};
+    uint8_t tools = 0, applied = 0; // intersection of the two submitted recordings
+    float motion_error = -1; // mean declared-motion patch error over textured screen points
 };
 
 inline float TrialMagnitude(const TrialSample::Change& region)
@@ -44,6 +49,7 @@ inline bool MeasureTrialScreen(const float* before, const float* after, TrialSam
     static_assert(kThumbW % cols == 0 && kThumbH >= rows);
     sample.change = {};
     sample.image = {};
+    sample.contrast = {};
     for (uint32_t y = 0; y < kThumbH; ++y)
         for (uint32_t x = 0; x < kThumbW; ++x) {
             const uint32_t i = y * kThumbW + x;
@@ -52,6 +58,10 @@ inline bool MeasureTrialScreen(const float* before, const float* after, TrialSam
             const unsigned region = (cy / n) * Region::columns + cx / n;
             sample.change[region][(cy % n) * n + cx % n] += after[i] - before[i];
             sample.image[region] += (after[i] + before[i]) * .5f;
+            if (x && (x - 1) * Region::columns / kThumbW == x * Region::columns / kThumbW)
+                sample.contrast[region] += .5f * (std::fabs(after[i] - after[i - 1]) + std::fabs(before[i] - before[i - 1]));
+            if (y && (y - 1) * Region::rows / kThumbH == y * Region::rows / kThumbH)
+                sample.contrast[region] += .5f * (std::fabs(after[i] - after[i - kThumbW]) + std::fabs(before[i] - before[i - kThumbW]));
         }
     for (unsigned cy = 0; cy < rows; ++cy) {
         const unsigned y0 = (cy * kThumbH + rows - 1) / rows;
@@ -63,6 +73,7 @@ inline bool MeasureTrialScreen(const float* before, const float* after, TrialSam
         }
     }
     for (auto& value : sample.image) value *= float(Region::count) / kThumbFloats;
+    for (auto& value : sample.contrast) value *= float(Region::count) / kThumbFloats;
     return std::count_if(sample.change.begin(), sample.change.end(), [](const auto& region) { return TrialMagnitude(region) < .055f; }) >=
         Region::count * 3 / 4;
 }
@@ -83,8 +94,20 @@ public:
         retry_delay_ = delay;
         now_ = now;
         id_ = id;
-        expires_ = now + maximum_ms;
         Next(Phase::Baseline, frame);
+    }
+    void StartAt(uint64_t id, uint64_t frame, uint64_t now, const TrialSample& witness)
+    {
+        Start(id, frame, now);
+        anchor_ = witness;
+        region_ = witness.origin.region;
+        targeted_ = true;
+    }
+    bool RuledOut() const { return phase_ == Phase::Rejected && ruled_out_; }
+    void ObserveRejectedSetup(const TrialSample& sample)
+    {
+        if (phase_ == Phase::Rejected && !retry_at_ && baseline_ && !SameSetup(anchor_, sample))
+            Retry("the display layout or evaluation settings changed");
     }
     Phase Current() const { return phase_; }
     const char* Name() const
@@ -101,7 +124,7 @@ public:
     static bool WatchTicket(uint64_t ticket)
     {
         const auto phase = static_cast<Phase>(ticket & 7u);
-        return phase == Phase::Kept || phase == Phase::Rejected;
+        return phase == Phase::Idle || phase == Phase::Kept || phase == Phase::Rejected;
     }
     uint64_t Ticket(uint64_t frame) const
     {
@@ -124,6 +147,7 @@ public:
         }
         if (phase_ == Phase::Rejected) return;
         if (UsesCandidate() && sample.bypassed) {
+            ruled_out_ = true;
             Reject("replacement lost visible delivery");
             return;
         }
@@ -136,7 +160,7 @@ public:
                 return std::all_of(region.begin(), region.end(), finite);
             }) ||
             !std::all_of(sample.image.begin(), sample.image.end(), finite)) return;
-        if (phase_ != Phase::Baseline && !SameView(anchor_, sample)) {
+        if ((targeted_ || phase_ != Phase::Baseline) && !SameView(anchor_, sample)) {
             watch_same_ = watch_opposite_ = 0;
             return;
         }
@@ -151,8 +175,10 @@ public:
             const int direction = strong ? TrialDirection(anchor_.change[region_], change) : 0;
             watch_same_ = uint8_t((watch_same_ << 1) | (direction > 0));
             watch_opposite_ = uint8_t((watch_opposite_ << 1) | (direction < 0));
-            if ((watch_same_ & (watch_same_ - 1)) && (watch_opposite_ & (watch_opposite_ - 1)))
+            if ((watch_same_ & (watch_same_ - 1)) && (watch_opposite_ & (watch_opposite_ - 1))) {
+                ruled_out_ = targeted_;
                 Retry("the measured flicker returned on the replacement");
+            }
             return;
         }
         window_[count_++] = sample;
@@ -162,6 +188,7 @@ public:
             const TrialSample* pattern = nullptr;
             if (phase_ == Phase::Baseline) {
                 for (uint32_t i = 0; i < FlickerTransition::count; ++i) {
+                    if (targeted_ && i != region_) continue;
                     const TrialSample* reference = nullptr;
                     const float amplitude = Repeated(i, nullptr, reference);
                     if (amplitude > strongest) {
@@ -198,9 +225,31 @@ public:
             }
         } else if (phase_ == Phase::Candidate) {
             replacement_ = 0.f;
-            for (unsigned i = 0; i < count_; ++i)
+            unsigned detail_losses = 0;
+            for (unsigned i = 0; i < count_; ++i) {
+                if (targeted_ && anchor_.contrast[region_] > .04f &&
+                    window_[i].contrast[region_] < .75f * anchor_.contrast[region_]) ++detail_losses;
                 for (const auto& change : window_[i].change) replacement_ = (std::max)(replacement_, TrialMagnitude(change));
-            if (!Improves(baseline_)) { Reject("the replacement did not improve the presented picture"); return; }
+            }
+            if (detail_losses >= 2) {
+                ruled_out_ = true;
+                Reject("the replacement lost visible detail in the affected area");
+                return;
+            }
+            if (!Improves(baseline_)) {
+                // A single unrelated flash is grounds to restore ordinary
+                // rendering. It is insufficient to blacklist this tool.
+                ruled_out_ = !targeted_;
+                for (unsigned region = 0; targeted_ && !ruled_out_ && region < FlickerTransition::count; ++region) {
+                    const TrialSample* pattern = nullptr;
+                    const auto severity = Repeated(region, region == region_ ? &anchor_ : nullptr, pattern);
+                    ruled_out_ = !ImprovesWith(severity, baseline_);
+                }
+                if (!ruled_out_ && count_ < window_.size()) return;
+                Reject(ruled_out_ ? "the replacement did not improve the presented picture" :
+                                    "an isolated change prevented a reliable verdict");
+                return;
+            }
             Next(Phase::ConfirmBaseline, next_frame);
         }
     }
@@ -215,6 +264,9 @@ private:
     {
         phase_ = phase;
         count_ = 0;
+        // A slow but conclusive baseline must leave the candidate its own
+        // observation window. Only phase progress renews this deadline.
+        expires_ = now_ + maximum_ms;
         measured_from_ = frame + warmup_frames;
     }
     void Reject(const char* reason) { phase_ = Phase::Rejected; reason_ = reason; }
@@ -273,6 +325,7 @@ private:
     uint64_t id_ = 0, expires_ = 0, measured_from_ = 0;
     uint64_t now_ = 0, retry_at_ = 0, retry_delay_ = 8000, last_ordinal_ = 0, watch_at_ = 0;
     uint8_t watch_same_ = 0, watch_opposite_ = 0;
+    bool targeted_ = false, ruled_out_ = false;
     uint32_t region_ = 0;
     unsigned count_ = 0;
     float baseline_ = 0, replacement_ = 0, confirmation_ = 0;

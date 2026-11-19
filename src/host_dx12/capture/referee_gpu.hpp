@@ -54,7 +54,7 @@ bool Wanted();
 void NotifyEvaluationReset();
 // In the evaluation's list, after DLSS ran. Returns a token (0: nothing recorded).
 uint32_t Record(ID3D12GraphicsCommandList* list, const Evaluation& e);
-void Submitted(uint32_t token, ID3D12CommandQueue* queue);
+void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint8_t tools = 0, uint8_t applied = 0);
 // The list will not be submitted by us. may_still_run: someone else may still run it.
 void Discard(uint32_t token, bool may_still_run);
 bool NeedsScreen(Presentation frame);

@@ -9,7 +9,7 @@
 //            with the opposite sign, is caught.
 #include "test_support.hpp"
 #include "core/referee_selection.hpp"
-#include "core/referee_trial.hpp"
+#include "core/referee_recovery.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include <cmath>
 #include <cstdio>
@@ -467,6 +467,73 @@ int main()
         check(quiet.Current() == Phase::Rejected && !quiet.CanStart(RouteTrial::maximum_ms),
               "trial: close a quiet measurement window with a cooldown");
         check(quiet.CanStart(RouteTrial::maximum_ms + 8000), "trial: a later change can still trigger a comparison");
+    }
+    {
+        using namespace na::referee;
+        using T = RecoveryTool;
+        using S = FlickerStage;
+        check(NextTool(S::Unknown, 255) == T::None && NextTool(S::Reconstruction, Bit(T::Bloom)) == T::None &&
+              NextTool(S::Input, Bit(T::Sharpen)) == T::None, "unknown and wrong-stage controls are never tried");
+        check(NextTool(S::Input, Bit(T::AmbientHistory)) == T::AmbientHistory &&
+              NextTool(S::Reconstruction, Bit(T::CameraResidual)) == T::CameraResidual &&
+              NextTool(S::Reconstruction, Bit(T::ScreenFit)) == T::ScreenFit &&
+              NextTool(S::Composition, Bit(T::Sharpen)) == T::Sharpen, "controls belong to their stage");
+        StageRecovery r;
+        const StageRecovery::Scene scene{1, 2, 1920, 1080};
+        r.SetScene(scene);
+        TrialSample s;
+        s.width = 1920; s.height = 1080; s.configuration = 8;
+        s.comparable = s.delivered = true; s.tools = Bit(T::Sharpen);
+        s.origin = {S::Composition, 33, {0, 0, .3f}};
+        uint64_t test_time = 101;
+        auto send = [&](float amplitude, float contrast, uint8_t applied = 0) {
+            s.ordinal += RouteTrial::warmup_frames + 1;
+            test_time += 100;
+            s.origin.stops[2] *= -1;
+            s.change[33].fill(s.origin.stops[2] > 0 ? amplitude : -amplitude);
+            s.contrast[33] = contrast;
+            s.applied = applied;
+            r.Tick(test_time);
+            r.Add(r.Ticket(s.ordinal), s, s.ordinal + 1, test_time);
+        };
+        s.delivered = false;
+        send(.3f, .2f); send(.3f, .2f);
+        check(!r.Busy(), "delivery must be distinguished before an experiment");
+        s.delivered = true;
+        s.origin.stops[0] = -.2f;
+        send(.3f, .2f); send(.3f, .2f);
+        check(!r.Busy(), "strong ambiguous upstream motion cannot authorize a downstream fix");
+        s.origin.stops[0] = 0;
+        send(.3f, .2f); send(.3f, .2f);
+        check(r.Selected() == T::Sharpen && r.ToolInUse() == T::None, "ordinary route measures the target before a change");
+        for (int i = 0; i < 4; ++i) send(.3f, .2f);
+        check(r.ToolInUse() == T::Sharpen, "matched target unlocks the change");
+        for (int i = 0; i < 4; ++i) send(.01f, .01f, Bit(T::Sharpen));
+        check(!r.Busy() && r.Excluded() == Bit(T::Sharpen), "removing detail cannot earn a win");
+        r.SetScene({9, 2, 1920, 1080});
+        r.SetScene(scene);
+        send(.3f, .2f); send(.3f, .2f);
+        check(!r.Busy() && r.Exhausted(), "returning to the same view remembers what failed");
+        ++s.configuration;
+        send(.3f, .2f); send(.3f, .2f);
+        check(r.Busy() && !r.Excluded(), "new user settings get an independent result");
+        auto stale = r.Ticket(s.ordinal + 80);
+        r.Clear(); r.SetScene(scene);
+        check(!r.Busy() && r.Ticket(s.ordinal) != stale, "device change invalidates even a late worker receipt");
+        test_time += 5000;
+        s.observed_at = 1;
+        send(.3f, .2f); send(.3f, .2f);
+        check(!r.Busy(), "stale accepted presents cannot start a live change");
+        s.observed_at = 0;
+        send(.3f, .2f); send(.3f, .2f);
+        for (int i = 0; i < 4; ++i) send(.3f, .2f);
+        check(r.ToolInUse() == T::Sharpen, "fresh receipts recover after a stale pair");
+        send(.45f, .2f, Bit(T::Sharpen));
+        for (int i = 0; i < 7; ++i) send(.01f, .2f, Bit(T::Sharpen));
+        check(!r.Busy() && !r.Excluded(), "one unrelated flash is inconclusive, not a lasting rejection");
+        StageRecovery dx12(true);
+        dx12.SetScene(scene);
+        check(dx12.Ticket(s.ordinal) != r.Ticket(s.ordinal), "DX11 and DX12 mailboxes are independent");
     }
     std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
     return failures ? 1 : 0;

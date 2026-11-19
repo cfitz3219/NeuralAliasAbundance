@@ -10,7 +10,7 @@
 #include "referee_gpu_scene.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
 #include "host_dx12/capture/screen_marker.hpp"
-#include "core/referee_trace.hpp"
+#include "core/referee_recovery.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
@@ -112,6 +112,7 @@ struct TracePair {
     bool accept = true;
     uint64_t ticket = 0, configuration = 0;
     bool returned_present = true;
+    uint8_t tools = 0, applied = 0, main_tools = 255;
 };
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
@@ -148,7 +149,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         rg::Submitted(pre, blocked);
     } else {
         Run(d, l);
-        rg::Submitted(pre, d.queue.Get());
+        rg::Submitted(pre, d.queue.Get(), trace ? trace->tools : 0, trace ? trace->applied : 0);
     }
     CHECK(!rg::NeedsScreen({ordinal, &d}));
     rg::Presentation earlier{ordinal, &d, true, true, native11};
@@ -174,7 +175,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     if (!second) return false;
     rg::Discard(pre, false);
     Run(d, main);
-    rg::Submitted(second, d.queue.Get());
+    rg::Submitted(second, d.queue.Get(), trace ? trace->tools & trace->main_tools : 0, trace ? trace->applied : 0);
     CHECK(rg::NeedsScreen({ordinal, &d, true, true, native11}));
     CHECK(!rg::NeedsScreen({ordinal, &d, true, false, native11}));
     rg::OnPresent({ordinal, &l, true, true, native11}, d.queue.Get(), im.screen, Execute);
@@ -698,6 +699,55 @@ int main()
                 CHECK(trial.Current() == Phase::Rejected && !trial.UsesCandidate());
             }
         }
+    }
+    {
+        // The fixture controls a pre-DLAA lighting fault. Reducing bloom leaves
+        // it visible, and taking AO from the current frame removes it. The
+        // selector receives only the GPU's three image stages and receipts.
+        using namespace na::referee;
+        using Tool = RecoveryTool;
+        auto bright_input = input;
+        for (unsigned y = input.h / 2; y < input.h * 5 / 8; ++y)
+            for (unsigned x = input.w / 2; x < input.w * 5 / 8; ++x)
+                bright_input.v[size_t(y) * input.w + x] *= 1.8f;
+        auto input_up = Picture(d, l, bright_input, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+        REQUIRE(input_up);
+        Run(d, l);
+        keep.clear();
+        StageRecovery recovery;
+        recovery.SetScene({1, 2, rs::kW, rs::kH});
+        bool saw_bloom = false, saw_ambient = false;
+        unsigned direction = 0;
+        constexpr uint8_t available = Bit(Tool::Bloom) | Bit(Tool::AmbientHistory) | Bit(Tool::Sharpen);
+        for (unsigned i = 0; i < 42 && recovery.Comparison().Current() != RouteTrial::Phase::Kept; ++i) {
+            ordinal += RouteTrial::warmup_frames + 1;
+            const auto ticket = recovery.Ticket(ordinal);
+            REQUIRE(ticket);
+            const auto active = recovery.ToolInUse();
+            saw_bloom |= active == Tool::Bloom;
+            saw_ambient |= active == Tool::AmbientHistory;
+            const bool quiet = active == Tool::AmbientHistory;
+            const bool reverse = direction++ % 2 != 0;
+            const bool from_lit = !quiet && reverse, to_lit = !quiet && !reverse;
+            TracePair trace{from_lit ? lit_out.Get() : t_output.Get(), from_lit ? lit_display.Get() : t_screen.Get(),
+                            true, ticket, 981, true, available, Bit(active)};
+            if (i == 0) trace.main_tools = Bit(Tool::Sharpen); // one submission lacked both input controls
+            Sleep(150);
+            REQUIRE(TakeSample(d, l, ordinal, {from_lit ? input_up.Get() : t_input.Get(), to_lit ? input_up.Get() : t_input.Get(),
+                              to_lit ? lit_out.Get() : t_output.Get(), nullptr, to_lit ? lit_display.Get() : t_screen.Get()},
+                              got, false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+            TrialSample sample;
+            REQUIRE(rg::TakeTrialSample(ticket, sample));
+            CHECK(sample.delivered && sample.comparable && sample.tools == (available & trace.main_tools));
+            if (!quiet) CHECK(sample.origin.stage == FlickerStage::Input && sample.origin.region == 36);
+            recovery.Tick(GetTickCount64());
+            recovery.Add(ticket, sample, ordinal + 1, GetTickCount64());
+        }
+        const auto& result = recovery.Comparison();
+        std::printf("staged recovery: failed bloom=%d excluded=%u tried ambient=%d phase=%s stops %.3f/%.3f/%.3f\n",
+                    saw_bloom, recovery.Excluded(), saw_ambient, result.Name(), result.Baseline(), result.Candidate(), result.Confirmation());
+        CHECK(saw_bloom && saw_ambient && recovery.Excluded() == Bit(Tool::Bloom));
+        CHECK(result.Current() == RouteTrial::Phase::Kept && recovery.ToolInUse() == Tool::AmbientHistory);
     }
     Sleep(150);
     REQUIRE(rg::Wanted());
