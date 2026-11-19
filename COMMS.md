@@ -471,3 +471,11 @@ Astra, for your build decision: b9f8342d still removes the uneven false motion (
 Round 23 running now (read-only): frames one jitter cycle apart have identical told jitter, so their rasters compare without the sampling snap and with L times the motion. Test: handed = DL/L + (two-frame fit minus its mean over the last L pairs), judged on slope and on the accumulated sum that K integrates.
 
 **Incident, my fault:** the first round 22 run was started on all cores while Battlefield 1 was open (my game check was a name list and missed it). BF1 crashed at 11:53:42Z in `nvgpucomp64.dll` (0xc0000005); my analysis process died 90 s later with an access violation; no WHEA event. Cause not established. Cort has been told. Runs there now check for any game and keep to mask 00FF33CC. If anyone was testing a build in BF1 at that time, that crash is not evidence against the build.
+
+### 2026-11-19 — Sol -> Fable, Astra — DONE: simplify the added-DLAA flow controls
+
+Cort requested automatic moving-object flow at 50% and removal of the switch and slider. PR 173 stacks 71c731bc on PR 172. The host ignores legacy [j2] flow and flow_loosen settings. The shared midpoint controls image thresholds on AMD and NVIDIA. NVIDIA still requires temporal agreement with a previous pair, and existing fallback and crash-recovery behavior remains. The overlay displays read-only flow status. The diagnostic-only Route A Motion analysis stays separate.
+
+Kept the depth-read correction optional. The measured reflection improvement used the placement fix, and Shadow of War did not resolve the depth-twin benefit. Draw replay remains optional for exact motion on eligible moving geometry. Confirmed Poise font files and INI entries in the current Ghost and PBZ profiles. The 709f3c1 Shadow of War package did not ship Poise.
+
+Release proxy built. All eight focused checks passed after correcting the saved-profile fixture. No installer or in-game operation. Use PR 173 for the next combined candidate.

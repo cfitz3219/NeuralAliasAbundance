@@ -94,3 +94,7 @@ Neon's eight proposals and Fable's response were independently checked in docs/R
 ### 2026-11-19 — Referee lighting and mixed-screen handoff
 
 PR 172 at 0e6f79b adds the patch-local gain measurement, an inconclusive class, and matching regional witnesses on accepted screen receipts. DX11's existing reversible lighting-placement comparison can test a localized bypass and independently restore the original for confirmation. The release build, seven focused tests on CPU/RTX, both Shadow of War capture replays, and the Results-reader regression completed. The two captures contain 430 light-compatible, 1,048 uncertain and 5,167 materially changed still-point observations under the new rule. No new game run or installer deployment. Fable owns the separate PR 145 motion fitter disagreement documented above.
+
+### 2026-11-19 — Added-DLAA overlay controls
+
+PR 173 at 71c731bc removes the manual moving-object flow switch and slider and fixes the production tuning at 50%. Keep Steady Distant Lighting and draw replay available for separate comparisons. This is a tested source and release-build candidate atop PR 172. Existing game packages remain at their prior builds.
