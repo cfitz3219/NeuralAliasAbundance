@@ -133,7 +133,8 @@ inline bool Usable(const Sample& s, const Params& p)
 // the whole tile. So each tile (tile_px square) gets a second weight from its MEAN residual, of the
 // same form as the sample weight, with a scale that starts wide and halves down to tile_final_px,
 // widened by the tile's own standard error (the fit's pooled residual variance over the tile's
-// weight, times tile_noise) so that a tile with few samples is not judged on its noise. A rigid
+// weight, times tile_noise) so that a tile with few samples is not judged on its noise. A pass uses
+// the weights made from the pass before it (WeighTiles). A rigid
 // scene can bring every tile's mean to nothing; a bending figure cannot, whatever the terms, so it
 // is the figure's tiles that let go.
 struct TileGrid {
@@ -179,9 +180,11 @@ inline float ScaleAt(int step, const Params& p)
 // One pass over the samples at the given terms. `scale_px` 0: the first, plain step. Agreement and
 // the robust error are always counted at robust_px.
 inline void Accumulate(const Sample* samples, size_t count, uint32_t width, uint32_t height, const float theta[kTerms], float scale_px,
-                       const Params& p, double sums[kValues], const Window& window = {}, const TileGrid* tiles = nullptr)
+                       const Params& p, double sums[kValues], const Window& window = {}, TileGrid* tiles = nullptr)
 {
     for (int i = 0; i < kValues; ++i) sums[i] = 0;
+    if (tiles)
+        for (size_t t = 0; t < tiles->weight.size(); ++t) tiles->sx[t] = tiles->sy[t] = tiles->sw[t] = tiles->s2[t] = 0.0;
     const float c2 = p.robust_px * p.robust_px, s2 = scale_px * scale_px;
     const bool weighted = scale_px > 0;
     for (size_t s = 0; s < count; ++s) {
@@ -194,8 +197,16 @@ inline void Accumulate(const Sample* samples, size_t count, uint32_t width, uint
         const float rx = a.vx - mx, ry = a.vy - my;
         const float rr = rx * rx + ry * ry;
         const float q = weighted ? 1.0f / (1.0f + rr / s2) : 1.0f;
-        const float tile = tiles ? tiles->weight[tiles->At(a.px, a.py)] : 1.0f;
+        const size_t at = tiles ? tiles->At(a.px, a.py) : 0;
+        const float tile = tiles ? tiles->weight[at] : 1.0f;
         const float w = q * q * tile;
+        if (tiles) { // this pass's own disagreement per tile, with the sample weight alone: the next pass's tile weights
+            const float ws = q * q;
+            tiles->sx[at] += double(ws * rx);
+            tiles->sy[at] += double(ws * ry);
+            tiles->sw[at] += double(ws);
+            tiles->s2[at] += double(ws * rr);
+        }
         int idx = 0;
         for (int i = 0; i < kTerms; ++i)
             for (int j = i; j < kTerms; ++j) sums[idx++] += double(w * (bu[i] * bu[j] + bv[i] * bv[j]));
@@ -210,31 +221,13 @@ inline void Accumulate(const Sample* samples, size_t count, uint32_t width, uint
     }
 }
 
-// Every tile's weight at the given terms: one pass for the tiles' sums with the sample weight of
-// `scale_px`, then the weights at the tile scale `tile_scale_px`.
-inline void WeighTiles(const Sample* samples, size_t count, uint32_t width, uint32_t height, const float theta[kTerms], float scale_px,
-                       float tile_scale_px, const Params& p, const Window& window, TileGrid& tiles)
+// Every tile's weight for the NEXT pass, from the sums the pass just made gathered (Accumulate), at
+// the tile scale `tile_scale_px`; 0: every weight 1. One pass behind on purpose: the card's programs
+// then need no second pass over the samples per step, and at the end the terms no longer move.
+inline void WeighTiles(float tile_scale_px, const Params& p, TileGrid& tiles)
 {
     const size_t n = tiles.weight.size();
-    for (size_t t = 0; t < n; ++t) tiles.sx[t] = tiles.sy[t] = tiles.sw[t] = tiles.s2[t] = 0.0;
-    const float s2 = scale_px * scale_px;
-    for (size_t s = 0; s < count; ++s) {
-        const Sample& a = samples[s];
-        if (!Usable(a, p) || !window.Holds(a.nearness)) continue;
-        float bu[kTerms], bv[kTerms];
-        Terms(a.px, a.py, a.nearness, width, height, bu, bv);
-        float mx = 0, my = 0;
-        for (int k = 0; k < kTerms; ++k) { mx += theta[k] * bu[k]; my += theta[k] * bv[k]; }
-        const float rx = a.vx - mx, ry = a.vy - my;
-        const float rr = rx * rx + ry * ry;
-        const float q = scale_px > 0 ? 1.0f / (1.0f + rr / s2) : 1.0f;
-        const float w = q * q;
-        const size_t t = tiles.At(a.px, a.py);
-        tiles.sx[t] += double(w * rx);
-        tiles.sy[t] += double(w * ry);
-        tiles.sw[t] += double(w);
-        tiles.s2[t] += double(w * rr);
-    }
+    if (!(tile_scale_px > 0)) { for (size_t t = 0; t < n; ++t) tiles.weight[t] = 1.0f; return; }
     // The samples' own spread about their tiles' means, over all tiles.
     double spread = 0, total = 0;
     for (size_t t = 0; t < n; ++t) {
@@ -314,6 +307,9 @@ inline float StepSize(const double sums[kValues], const float delta[kTerms])
     return sums[0] > 1e-20 ? float(std::sqrt((std::max)(q, 0.0) / sums[0])) : 0.0f;
 }
 
+// The tile scale of the weights pass `step` uses (they were made after pass step - 1); 0: none yet.
+inline float TileScaleFor(int step, const Params& p) { return p.tile_px > 0 && step >= p.tile_first_step ? TileScaleAt(step, p) : 0.0f; }
+
 inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t height, const Params& p = {}, const Window& window = {})
 {
     Model m;
@@ -322,14 +318,14 @@ inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t h
     float theta[kTerms] = {};
     TileGrid tiles;
     if (p.tile_px > 0) tiles.Shape(width, height, p.tile_px);
-    const TileGrid* use = nullptr;
+    TileGrid* use = tiles.On() ? &tiles : nullptr;
     bool ok = true;
-    for (int step = 0; step < p.steps && ok; ++step) {
+    int step = 0;
+    for (; step < p.steps && ok; ++step) {
         const float scale = step > 0 ? ScaleAt(step, p) : 0.0f;
-        const bool tiled = tiles.On() && step >= p.tile_first_step;
-        const float tile_scale = tiled ? TileScaleAt(step, p) : 0.0f;
-        if (tiled) { WeighTiles(samples, count, width, height, theta, scale, tile_scale, p, window, tiles); use = &tiles; }
+        const float tile_scale = TileScaleFor(step, p); // of the weights this pass uses
         Accumulate(samples, count, width, height, theta, scale, p, sums, window, use);
+        if (use) WeighTiles(TileScaleFor(step + 1, p), p, tiles);
         if (sums[kCount] < double(p.min_samples)) { ok = false; break; }
         float delta[kTerms];
         ok = Solve(sums, p, delta);
@@ -338,14 +334,11 @@ inline Model Fit(const Sample* samples, size_t count, uint32_t width, uint32_t h
         ++m.steps;
         // Once the weights have their final scales, a step that no longer moves its samples is the last:
         // further steps would repeat it. (Measured on Cort's captured frames: 6 to 9 solves of 12.)
-        const bool final_scales = scale > 0 && scale <= p.robust_px && (!tiles.On() || (tiled && tile_scale <= p.tile_final_px));
+        const bool final_scales = scale > 0 && scale <= p.robust_px && (!use || (tile_scale > 0 && tile_scale <= p.tile_final_px));
         if (final_scales && StepSize(sums, delta) < p.converged_px) break;
     }
     // The fitted terms against the samples once more: how many agree, and how near the nearest of those is.
-    if (ok) {
-        if (use) WeighTiles(samples, count, width, height, theta, p.robust_px, p.tile_final_px, p, window, tiles);
-        Accumulate(samples, count, width, height, theta, p.robust_px, p, sums, window, use);
-    }
+    if (ok) Accumulate(samples, count, width, height, theta, p.robust_px, p, sums, window, use);
     m.samples = float(sums[kCount]);
     if (!ok) return m;
     m.agree = float(sums[kInliers]);
