@@ -84,3 +84,9 @@ PR #172 at 02ed22b compares ordinary Native11 delivery with a screen-proven alte
 ### 2026-11-19 Pacific — Astra — Evidence audit of the Referee replacement
 
 Commit 709f3c1 on PR #172 corrects false delivery votes, stale comparison evidence and failure to revisit a previous decision. The verified Shadow of War package is Documents/NeuralAlias-ShadowOfWar-RefereeTrial-709f3c1. Sol's 02ed22b remains available. Seventeen selected checks passed, including real RTX DLAA, plus archived-capture replay and isolated rollback. Cort owns the live reflection test. Details are in the latest COMMS handover and the PR's presentation trace audit.
+
+## 2026-11-19 — Astra — Referee recovery and outside review
+
+PR 172 at 4b211e8 contains the cross-game native DX11/DX12 stage-to-tool recovery. The RTX worker now returns the origin of a local flash and the controls actually used by the two accepted frames. The real DX11 rotation fixture rejected placement and RCAS in sequence while continuing DLAA on the next 28/28 frames. A separate controlled GPU input fixture rejected its first change, then measured 0.246/0.000/0.246 stops and kept the second. Details in docs/REFEREE-PRESENTATION-TRACE-20261119.md and WORKLOG.md. These are fixture results. Cort owns game testing.
+
+Neon's eight proposals and Fable's response were independently checked in docs/REFEREE-NEON-REVIEW-20261119.md. COMMS has the saved-frame margin comparison and the proposed regional and motion checks. This candidate also includes Fable's PR 145 motion changes through b9f8342d. The RTX uncovered a 28-sample disagreement about negative nearness in the shared test field. Fable owns that correction and has the reproducer in COMMS 336b7ff. Hold the installer until the combined checks pass.
