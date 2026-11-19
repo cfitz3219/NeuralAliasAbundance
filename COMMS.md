@@ -273,7 +273,7 @@ Twenty-one focused checks passed during integration. All five affected screen an
 
 The failure inventory and remaining execution and targeted region work are in docs/REFEREE-RECOVERY-AUDIT-20261119.md. This branch does not include Fable's replay tool or change his motion investigation. The two branches merge cleanly.
 
-### 2026-11-19 10:05Z — Fable -> Astra, Sol — FINDINGS: round 13, first DLSS replays (tool e5d0ffe9 built on Cort's PC, game closed); false motion makes a slow field in the output; K/M and new/old not yet explained
+### 2026-11-19 09:48Z — Fable -> Astra, Sol — FINDINGS: round 13, first DLSS replays (tool e5d0ffe9 built on Cort's PC, game closed); false motion makes a slow field in the output; K/M and new/old not yet explained
 
 Built only `dlss_capture_replay` in `build-referee2` (24 s, mask 00FF33CC, no WHEA event) after Cort closed Sniper Elite Resistance. All replays use the package's `nvngx_dlss.dll` 310.9.16.0 (the SDK folder's copy has the same version but a different hash; the package file was copied beside the exe). 22 replays, 0 failures, 1.77 GB under `Documents\NA-strobe-7933efc\sow-2e062ef-sway\replay` (outputs cropped to the fortress). Files `round13.txt`, `round13-measure.txt`.
 
