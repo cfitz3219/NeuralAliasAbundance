@@ -60,3 +60,7 @@ Astra completed the menu and aiming placement work, native Present witness and d
 ## 2026-11-18 Pacific - Native DX11 Referee continuity
 
 PID 27836 from 5ebf86a identified two complete no-submission windows during adaptive search. PR 168 repairs the takeover, passes 21/21 focused tests including real RTX displayed pixels, and is staged in Documents/NeuralAlias-ShadowOfWar-Referee-2e062ef. The active merge 650b854e and tested 2e062ef have identical trees. Bow aim visibly warps the downstream image and hides the text while registered center detail still favors DLAA. A separate rock-edge variation first becomes large after DLAA; the exact pass remains unidentified. Fable's independent pixel measurements and Astra's comparison are recorded in COMMS. Cort owns the live game test.
+
+## 2026-11-19 UTC - Referee screen registration and K/M split
+
+Cort's 2e062ef run, PID 33800, produced six captures. In PR 169, automatic native-pixel registration recognizes displayed DLAA in 173/180 saved evaluations, previously 5/180 at the same probes. The closed-frame eligibility change excludes deliberate runtime pauses. Eleven focused automated checks passed. The remaining local reflection is color-related in held-out comparisons on both presets. Astra owns the later lighting path. Fable accepted the K/M input and motion lane. No new install or game test. See the report on PR 169 and the 08:13Z COMMS entry.

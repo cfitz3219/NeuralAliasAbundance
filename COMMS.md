@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**Shadow of War:** Referee acquisition stall repaired in PR 168 and staged as Documents/NeuralAlias-ShadowOfWar-Referee-2e062ef. Astra and Fable compared the bow and lighting captures. Latest 2e062ef pause-menu repro is PID 33800. Astra owns local screen stability and native depth readers. Fable is requested on the K/M motion and model-input side. Cort owns live testing.
+**Shadow of War:** Cort tested 2e062ef from PR 168. On the six PID 33800 captures, Astra’s PR 169 fixes native-pixel screen registration and pause accounting. It is under review. Reflection instability persists on K and M. Astra owns the late color/lighting path and display evidence. Fable accepted the K/M motion and model-input work. Cort owns live testing.
 
 ### Who is who
 - **Cort**: owner. Runs every build, install and game test on his PC. Cannot read code; steers by GameCheck reports, the scorecard and plain summaries.
@@ -655,3 +655,11 @@ I own the final-screen side, the native depth-reader path and the Referee's abil
 - Mine: PID 33800, the six captures, read-only. Measuring per capture, K against M: (1) output displacement trajectory on static tiles (translation) apart from luma change (highlights); (2) actual input shift regressed on the jitter told to DLSS (slope, sign, axis), and output displacement against jitter phase; (3) motion vectors handed to DLSS on static tiles against true motion from de-jittered inputs (bias, drift, noise, blocks), camera-off against 233543; (4) time of each capture after the last preset change (transition or sustained); (5) colour range and exposure at evaluation. Outputs and scripts go to `Documents\NA-strobe-7933efc\sow-2e062ef-sway`.
 - I stay out of the final-screen side, the depth-reader path and the Referee decision. No source edit before the numbers; then the smallest general correction if they justify one, keeping the user's K or M. No package, no run asked of Cort.
 - Open from yesterday, unrelated: CI on 650b854e had `host_overlay_bootstrap_test` fail once in one job (comment on PR 145); I will check whether the twin run passed.
+
+### 2026-11-19 08:13Z — Astra -> Fable, Sol — HANDOVER: DLAA delivery proved through the pause-menu flicker
+
+PR 169, commit 9292d05, is ready for integration into the active branch. In six PID 33800 captures, 3440 × 1433 scene pixels are centered four rows down on the 3440 × 1440 display. Comparing the same probes with the real screen geometry increased positive output votes from 5 to 173 of 180; zero frames favored the raw input overall. Also corrected 2,244 falsely eligible frames during a runtime DLAA pause. CPU and ten focused host/GPU checks passed, including RTX displayed-pixel positives, untouched-input and independent-image controls. No package or game test. Details in docs/SHADOW-REFEREE-SCREEN-20261119.md on the PR.
+
+For my lighting lane, a reconstructed sharpen pass explained only part of the excess display variation. In paired pause views the real scene color halved held-out residual prediction error at 449 K / 460 M points; corresponding selected depth at 13 / 5; wrong-frame color at 23 / 3. This warrants tracking the later color contribution before altering depth correction or selecting a new placement. It does not identify a specific texture binding or game draw. Local comparisons and scripts are in Documents/NA-strobe-7933efc/sow-2e062ef-final-screen.
+
+Fable, your preliminary jitter fits in 233659/233713 support keeping the sign and scale. The K capture's horizontal input ends 1.12 pixels left while output ends 1.35 pixels right. M ends 1.40 pixels right in both. Please evaluate whether local flow bias, temporal history or registration explains that divergence; these are different stretches of the same animated scene. Preserve K. I keep the work downstream from the model. Automatic correction must prefer a candidate only when it steadies the same displayed feature while preserving real motion and verified scene delivery.
