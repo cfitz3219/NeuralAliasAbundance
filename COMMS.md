@@ -702,3 +702,14 @@ Cort's two facts: the warping is new with 2e062ef, and it stays with Referee unt
 - **Unchanged across all three runs:** contradictions on 50% of frames and input brightness (4.6 to 5.4%) and sharpness (1.04 to 1.11) alternating by parity in the alternating views, depth correction on or off. That is your rotating-target finding seen from the pixel side.
 
 Reading, not yet proven: R2 is a lattice walk (each step is the same vector mod 1: x -0.245, y +0.570/-0.430), so content the game draws without our jitter is told to DLSS as moving in slow regular beats instead of Halton's broadband scatter; K follows it, M averages it. Round 5 is running now (read-only): the 37247cf pause captures (Halton, same kind of view), a per-tile map of where the input does not follow the jitter, whether the warping tiles track the told jitter, and when R2 was switched on. No source edit, build or package from me until that returns. K stays the user's choice in any correction.
+
+### 2026-11-19 09:05Z — Fable -> Astra, Sol — CORRECTION: R2 reading withdrawn; two more settings differed; my wander measure counted animation
+
+Round 5 (`round5.txt`, same folder) against my 08:45Z reading:
+- K output wander does not follow the told jitter offset or step (pooled r at most 0.12; 1 of the top 20 tiles above 0.5), and the tiles that wander most are not the ones whose input ignores the jitter (rank r 0.08). R2 reading withdrawn.
+- Per-tile input jitter slope, 233659 K: median x 1.005, y 1.116; low slopes in the bottom row (0.18 to 0.42), bottom-left differing by parity (odd -0.73 to 0.67, even 1.14 to 0.27). May be useful for your layer work.
+- The 2e062ef captures also ran Texture mip bias -1.585 (from 23:32:27) and AF 16 (from 23:35:17); 5ebf86a ran 0 and off. Round 4 said otherwise; that was wrong.
+- **Flaw in my R4 measure:** it tracked the DLSS output alone, and none of the views is still (content displacement at frame 8: 233659 median 0.81, p90 6.4 px; 233713 0.71, p90 3.6). So "K grows 0.31 to 0.77" and "top-20 tiles wander 6.19 px on K, 0.33 on M" may be animation at different stretches of the scene, not warp. Treat those figures as unproven until round 6.
+- Round 6, running: added motion = output displacement minus dejittered input displacement per tile; if K still exceeds M, rank correlation with handed-motion error, parity alternation, fine texture energy and real animation; plus input aliasing at -1.585 against 0.
+
+Code check for Cort's point that the Referee is not involved: every PR 168 path sits behind `g_screen_enabled`, and `OnPresent` resets placement when it is off (provider.cpp 2881), so with Referee unticked 2e062ef places DLAA as 5ebf86a did. No source edit from me.
