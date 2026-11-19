@@ -9,6 +9,7 @@
 //            with the opposite sign, is caught.
 #include "test_support.hpp"
 #include "core/referee_selection.hpp"
+#include "core/referee_trial.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include <cmath>
 #include <cstdio>
@@ -363,6 +364,74 @@ int main()
         check(w.samples == 2 && w.screens == 2 && w.total.tiles == 2 * kTiles, "a window counts its samples");
         char buf[2048];
         check(Format(buf, sizeof buf, w, Judge(w)) > 0 && std::strstr(buf, "picture{verdict=pass") != nullptr, "the log line names the verdicts");
+    }
+    {
+        using Phase = RouteTrial::Phase;
+        constexpr unsigned region = 18;
+        const auto exercise = [&](float candidate, float repeat, bool lost, bool changed,
+                                  float new_flicker, Phase expected) {
+            RouteTrial trial;
+            uint64_t ordinal = 0;
+            trial.Start(51, ordinal, 100);
+            check(!trial.Ticket(ordinal) && !trial.UsesCandidate(), "trial: start from ordinary route with warmup");
+            const auto window = [&](float amplitude, bool delivered = true, uint64_t layout = 1, float side_effect = 0.f) {
+                ordinal += RouteTrial::warmup_frames + 1;
+                const auto ticket = trial.Ticket(ordinal);
+                for (unsigned i = 0; i < RouteTrial::samples; ++i) {
+                    TrialSample frame;
+                    frame.ordinal = ordinal++;
+                    frame.configuration = layout;
+                    frame.delivered = delivered;
+                    frame.bypassed = !delivered;
+                    frame.width = 3440;
+                    frame.height = 1440;
+                    for (unsigned j = 0; j < frame.change[region].size(); ++j)
+                        frame.change[region][j] = (i + j) % 2 ? -amplitude : amplitude;
+                    frame.change[63].fill(side_effect);
+                    trial.Add(ticket ^ 8, frame, ordinal); // different experiment
+                    trial.Add(ticket, frame, ordinal);
+                    trial.Add(ticket, frame, ordinal); // same pair cannot vote twice
+                }
+            };
+            window(.25f);
+            check(trial.Current() == Phase::Candidate && trial.UsesCandidate(), "trial: repeated incumbent reversal unlocks replacement");
+            window(candidate, !lost, changed ? 2u : 1u, new_flicker);
+            if (trial.Current() == Phase::ConfirmBaseline) {
+                check(!trial.UsesCandidate(), "trial: restore ordinary route for the independent recheck");
+                window(repeat);
+                trial.Tick(100 + RouteTrial::maximum_ms, true);
+            }
+            if (changed) {
+                check(trial.Current() == Phase::Candidate, "trial: a different configuration is excluded");
+                trial.Tick(100 + RouteTrial::maximum_ms, true);
+            }
+            check(trial.Current() == expected, trial.Reason());
+            check(trial.UsesCandidate() == (expected == Phase::Kept), "trial: failed comparison falls back");
+            if (expected == Phase::Kept) {
+                trial.Tick(110, false);
+                check(trial.Current() == Phase::Rejected && !trial.UsesCandidate(), "trial: withdraw when a proved reader is lost");
+            }
+        };
+        exercise(.07f, .24f, false, false, .05f, Phase::Kept);
+        exercise(.20f, .24f, false, false, 0.f, Phase::Rejected);
+        exercise(.07f, .01f, false, false, 0.f, Phase::Rejected);
+        exercise(.07f, .24f, true, false, 0.f, Phase::Rejected);
+        exercise(.07f, .24f, false, true, 0.f, Phase::Rejected);
+        exercise(.04f, .24f, false, false, .32f, Phase::Rejected);
+        RouteTrial quiet;
+        quiet.Start(52, 0, 0);
+        for (uint64_t i = 40; i < 44; ++i) {
+            TrialSample frame;
+            frame.ordinal = i;
+            frame.delivered = true;
+            frame.change[region].fill(i == 40 ? .4f : 0.f);
+            quiet.Add(quiet.Ticket(i), frame, i + 1);
+        }
+        check(quiet.Current() == Phase::Baseline && !quiet.UsesCandidate(), "trial: a single brightness jump does not trigger a replacement");
+        quiet.Tick(RouteTrial::maximum_ms, true);
+        check(quiet.Current() == Phase::Rejected && !quiet.CanStart(RouteTrial::maximum_ms),
+              "trial: close a quiet measurement window with a cooldown");
+        check(quiet.CanStart(RouteTrial::maximum_ms + 8000), "trial: a later change can still trigger a comparison");
     }
     std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
     return failures ? 1 : 0;

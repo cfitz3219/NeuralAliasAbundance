@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <vector>
 #include "core/referee_selection.hpp"
+#include "core/referee_trial.hpp"
 
 namespace na::referee::gpu {
 
@@ -59,6 +60,7 @@ void Discard(uint32_t token, bool may_still_run);
 bool NeedsScreen(Presentation frame);
 void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec);
 void PresentResult(const void* swapchain, uint64_t ordinal, bool accepted);
+bool TakeTrialSample(uint64_t ticket, TrialSample& sample);
 void InvalidatePresentation(const void* swapchain);
 // Consume a visual rollback decision scoped to a native DX11 screen proof.
 uint64_t TakeNativeScreenLoss(const void* swapchain);
@@ -67,6 +69,7 @@ struct Stats {
     uint64_t samples = 0, pairs = 0, screens = 0, logged = 0;
     uint64_t pre = 0, main = 0, restarted = 0, discarded = 0, unpaired = 0, failed = 0;
     uint64_t trace_pairs = 0, trace_reversals = 0, rejected_presents = 0;
+    uint64_t trial_pairs = 0, trial_comparable = 0;
     bool running = false, stopped = false;
     char why[160] = "";
 };

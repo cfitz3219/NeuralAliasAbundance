@@ -1,5 +1,6 @@
 #pragma once
 #include "host_dx12/native11/screen_check.hpp"
+#include "core/referee_trial.hpp"
 
 namespace na::native11 {
 
@@ -8,6 +9,7 @@ namespace na::native11 {
 // actual reads must independently reproduce the marker in the display.
 struct LitScene {
     ScreenCheck screen;
+    referee::RouteTrial trial;
     Id members[2]{}, depth = 0;
     unsigned observations[2]{}, consecutive_proven = 0;
     uint64_t proofs[2]{}, generation = 0, observed_write = 0;

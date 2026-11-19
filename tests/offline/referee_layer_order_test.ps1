@@ -29,3 +29,16 @@ $active = @(Get-RefereeSummary @('event native11_lit_role frame=200 role_deliver
 if (-not ($active -like '*at least 64 submissions*') -or ($active -like '*not running*')) { throw 'Missing observed lighting-route delivery' }
 $unproven = @(Get-RefereeSummary @('event native11_lit_role frame=201 reader=adaptive_candidate_mid_scene'))
 if ($unproven -like '*used the screen-verified lighting route*') { throw 'Reported an unverified lighting route as active' }
+
+$trial = @(
+    'event native11_route_trial next_frame=301 phase=baseline region=0 stops=0.000/0.000/0.000 why='
+    'event native11_route_trial next_frame=603 phase=kept region=36 stops=0.246/0.000/0.246 why=measured improvement'
+)
+$outcome = @(Get-RefereeSummary $trial)
+if (-not ($outcome -like '*Replacement kept. measured improvement*') -or -not ($outcome -like '*0.246/0.000/0.246*')) {
+    throw 'Missing pixel comparison verdict'
+}
+$rollback = @(Get-RefereeSummary ($trial + 'event native11_route_trial next_frame=647 phase=rejected region=36 stops=0.246/0.000/0.246 why=lost reader'))
+if (-not ($rollback -like '*Ordinary route restored. lost reader*') -or ($rollback -like '*Replacement kept*')) {
+    throw 'Missing latest fallback verdict'
+}

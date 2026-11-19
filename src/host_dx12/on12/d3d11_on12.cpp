@@ -1,6 +1,7 @@
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
+#include "host_dx12/capture/referee_gpu.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -320,7 +321,8 @@ void install_native(ID3D11Device* device)
     na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
     // [j2] camera: whether a frame needs a camera at all (kept in step at every present too).
     na::native_d3d11::SyncCameraUse();
-    if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true)) {
+    if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true,
+                             &na::referee::gpu::TakeTrialSample)) {
         g_native_installs.fetch_add(1);
         note("native DX11 route: the input provider is on the game's own D3D11 device");
     } else {

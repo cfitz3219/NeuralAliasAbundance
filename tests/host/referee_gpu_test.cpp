@@ -106,7 +106,12 @@ struct Images {
     ID3D12Resource *prev, *input, *output, *motion, *screen;
     bool unknown_geometry = false;
 };
-struct TracePair { ID3D12Resource* before_output; ID3D12Resource* before_screen; bool accept = true; };
+struct TracePair {
+    ID3D12Resource* before_output;
+    ID3D12Resource* before_screen;
+    bool accept = true;
+    uint64_t ticket = 0, configuration = 0;
+};
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
 // Returns false (with a FAIL line) when the referee did not take it.
@@ -125,6 +130,10 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     e.mv_display_res = display_vectors;
     e.context = {{native_proof ? na::referee::shadow::Path::Native11 : na::referee::shadow::Path::Inline, 22},
                  1, 2, 3, 0, rs::kW, rs::kH, native_proof};
+    if (trace) {
+        e.context.trial_ticket = trace->ticket;
+        e.context.trial_configuration = trace->configuration;
+    }
     const bool native11 = native_proof != 0;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterBefore[0]; e.jitter_y = rs::kJitterBefore[1];
@@ -609,11 +618,50 @@ int main()
             CHECK(got.flicker_stage == (reverse ? first + 1 : 0));
         }
     }
-    TracePair rejected{t_output.Get(), t_screen.Get(), false};
+    TracePair rejected{t_output.Get(), t_screen.Get(), false, 62};
     Sleep(150);
     REQUIRE(TakeSample(d, l, ordinal, {unlit_in.Get(), unlit_in.Get(), t_output.Get(), nullptr, lit_display.Get()},
                        got, false, nullptr, nullptr, false, false, false, false, 0, false, &rejected));
     CHECK(rg::GetStats().trace_pairs == 8 && rg::GetStats().trace_reversals == 4 && rg::GetStats().rejected_presents == 1);
+    {
+        using namespace na::referee;
+        TrialSample measured;
+        CHECK(!rg::TakeTrialSample(rejected.ticket, measured));
+        // The test reflector alternates about one stop. The alternative either
+        // removes it, delivers the same artifact, or puts the input on screen.
+        for (unsigned mode = 0; mode < 3; ++mode) {
+            RouteTrial trial;
+            using Phase = RouteTrial::Phase;
+            trial.Start(40 + mode, ordinal + 1, GetTickCount64());
+            for (unsigned arm = 0; arm < 3 && trial.Active(); ++arm) {
+                ordinal += RouteTrial::warmup_frames + 1;
+                const auto ticket = trial.Ticket(ordinal);
+                REQUIRE(ticket);
+                const bool quiet = arm == 1 && mode == 0;
+                const bool bypass = arm == 1 && mode == 2;
+                for (unsigned i = 0; i < RouteTrial::samples && trial.Ticket(ordinal) == ticket; ++i) {
+                    const bool reverse = i % 2 != 0;
+                    TracePair trace{!quiet && reverse ? lit_out.Get() : t_output.Get(),
+                                    !quiet && reverse ? lit_display.Get() : t_screen.Get(), true, ticket, 70};
+                    Sleep(150);
+                    REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(),
+                                      !quiet && !reverse ? lit_out.Get() : t_output.Get(),
+                                      nullptr, bypass ? t_screen_input.Get() :
+                                      !quiet && !reverse ? lit_display.Get() : t_screen.Get()}, got,
+                                      false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+                    CHECK(!rg::TakeTrialSample(ticket ^ 8u, measured));
+                    REQUIRE(rg::TakeTrialSample(ticket, measured));
+                    CHECK(measured.ordinal == ordinal && measured.configuration == 70);
+                    CHECK(measured.delivered != bypass && measured.bypassed == bypass);
+                    CHECK(!rg::TakeTrialSample(ticket, measured));
+                    trial.Add(ticket, measured, ordinal + 1);
+                }
+            }
+            std::printf("screen trial case %u: %s stops %.3f/%.3f/%.3f (%s)\n", mode, trial.Name(),
+                        trial.Baseline(), trial.Candidate(), trial.Confirmation(), trial.Reason());
+            CHECK(trial.Current() == (mode == 0 ? Phase::Kept : Phase::Rejected));
+        }
+    }
     Sleep(150);
     REQUIRE(rg::Wanted());
     rg::Evaluation discarded;

@@ -630,9 +630,30 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.reset = eval.reset;
         id.dlss_mv_jittered = eval.mv_jittered;
         id.dlss_mv_lowres = !eval.mv_display_res;
-        const referee::shadow::Context identity{
+        referee::shadow::Context identity{
             {referee::shadow::Path::Native11, static_cast<uint64_t>(frame.boundary)},
             frame.color.incarnation, frame.depth.incarnation, frame.scene_stream, csub, 0, 0, frame.screen_proof};
+        identity.trial_ticket = frame.trial_ticket;
+        if (identity.trial_ticket) {
+            const auto& set = settings::Get();
+            const uint32_t configuration[] = {
+                eval.preset, uint32_t(cf), uint32_t(df), uint32_t(hdr), uint32_t(frame.reversed_depth),
+                uint32_t(camera_setting), uint32_t(measured), uint32_t(j2::Jitter()),
+                set.j2_jitter_r2.load(), set.j2_depth_reads.load(), set.j2_sharpness.load(),
+                uint32_t(settings::DlaaMipBiasX100(set)), set.aniso16.load(),
+                set.motion_enabled.load(), set.j2_flow_loosen.load(), uint32_t(j2::flow::Enabled()),
+                set.xegtao_enabled.load(), set.xegtao_amount.load(), set.xegtao_quality.load(),
+                set.xegtao_radius_x1000.load(), set.xegtao_denoise.load(), set.xegtao_radius_multiplier.load(),
+                set.xegtao_falloff.load(), set.xegtao_sample_distribution.load(), set.xegtao_thin_occluder.load(),
+                set.xegtao_final_power.load(), set.xegtao_depth_mip_offset.load(), set.xegtao_temporal.load(),
+                uint32_t(lighting.tone), uint32_t(lighting.bloom), lighting.curve, set.donut_amount.load(),
+                set.donut_bias.load(), set.donut_white.load(), set.donut_speed_up.load(), set.donut_speed_down.load(),
+                set.donut_bloom_amount.load(), set.donut_bloom_sigma.load(), set.donut_bloom_threshold.load()
+            };
+            uint64_t hash = 14695981039346656037ull;
+            for (const auto value : configuration) hash = (hash ^ value) * 1099511628211ull;
+            identity.trial_configuration = hash;
+        }
         capture_token = capture::j2::RecordReferee(list, planes, id, eval.render_w, eval.render_h, eval.out_w, eval.out_h, identity);
     } else if (evaluated && eval.reset) {
         referee::gpu::NotifyEvaluationReset();

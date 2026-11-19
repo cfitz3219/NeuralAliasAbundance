@@ -54,7 +54,8 @@ function Get-RefereeSummary([string[]] $Lines) {
     $states = @($Lines | Where-Object { $_ -match '(^|\s)referee_state\s' })
     $roles = @($Lines | Where-Object { $_ -match '\bnative11_lit_role frame=\d+ role_deliveries=(\d+) scene_stream=\d+' })
     $traces = @($Lines | Where-Object { $_ -match '\breferee_trace\s+frames=\d+,\d+ first_stage=(input|reconstruction|composition) ' })
-    if (-not $windows -and -not $states -and -not $roles -and -not $traces) {
+    $trials = @($Lines | Where-Object { $_ -match '\bnative11_route_trial next_frame=\d+ phase=' })
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
@@ -68,6 +69,16 @@ function Get-RefereeSummary([string[]] $Lines) {
     if ($roles) {
         $null = $roles[-1] -match 'role_deliveries=(\d+) scene_stream=(\d+)'
         $out.Add("  Rotating lighting buffers: DLAA used the screen-verified lighting route. Last checkpoint for scene $($Matches[2]): at least $($Matches[1]) submissions.")
+    }
+    if ($trials) {
+        $null = $trials[-1] -match '\bphase=(\w+) region=(\d+) stops=([^ ]+) why=(.*)$'
+        $trialState = switch ($Matches[1]) {
+            'kept' { 'Replacement kept' }
+            'rejected' { 'Ordinary route restored' }
+            default { 'Comparison in progress at the last recorded frame' }
+        }
+        $out.Add("  $trialState. $($Matches[4])")
+        $out.Add("  Compared brightness change in stops (ordinary / replacement / ordinary retest): $($Matches[3]).")
     }
     if ($layerOrder) { $out.Add($layerOrder) }
     $placements = @($Lines | Where-Object { $_ -match '(^|\s)native11_placement\s' })

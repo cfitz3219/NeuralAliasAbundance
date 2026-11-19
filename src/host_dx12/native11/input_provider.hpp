@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <optional>
 
+namespace na::referee { struct TrialSample; }
+
 namespace na::native11 {
 
 using Id = uint64_t; // identity of a game resource (its ID3D11Resource pointer); 0 = none
@@ -103,6 +105,7 @@ struct SceneFrame {
     // changes, appears or goes does not move it (it moves `stream`, which the camera's consumer reads).
     uint64_t scene_stream = 0;
     uint64_t screen_proof = 0;     // current verified reader, or zero for ordinary placement
+    uint64_t trial_ticket = 0;     // valid only in a measured, post-warmup trial window
     bool scene_changed = false;    // scene_stream differs from the previous fired frame
     Boundary boundary = Boundary::BeforeRead;
     uint32_t scene_draws = 0;      // scene draws this frame before the boundary
@@ -144,7 +147,9 @@ struct ProviderStats {
 };
 
 // Installs the D3D11 hooks on `device` (ID3D11Device*) and its immediate context. Idempotent.
-bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present = false);
+using TrialReader = bool (*)(uint64_t ticket, referee::TrialSample& sample);
+bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present = false,
+             TrialReader trial_reader = nullptr);
 // The hosted path receives DXGI events through the overlay's existing hooks.
 void SetScreenCheck(bool on);
 void RejectScreenProof(uint64_t proof);

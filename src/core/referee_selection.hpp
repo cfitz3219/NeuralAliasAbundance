@@ -28,6 +28,7 @@ struct Context {
     uint64_t color = 0, depth = 0, generation = 0;
     uint32_t subresource = 0, width = 0, height = 0;
     uint64_t native_screen_proof = 0;
+    uint64_t trial_ticket = 0, trial_configuration = 0;
 
     bool SameScene(const Context& other) const
     {
@@ -38,7 +39,8 @@ struct Context {
     {
         return placement == other.placement && color == other.color && depth == other.depth &&
                generation == other.generation && subresource == other.subresource && width == other.width && height == other.height &&
-               native_screen_proof == other.native_screen_proof;
+               native_screen_proof == other.native_screen_proof && trial_ticket == other.trial_ticket &&
+               trial_configuration == other.trial_configuration;
     }
     bool SameTemporalSequence(const Context& other) const
     {
@@ -48,6 +50,7 @@ struct Context {
         // identity for screen votes and use the logical scene for motion.
         return placement.path == Path::Native11 && placement == other.placement &&
                generation && generation == other.generation &&
+               trial_ticket == other.trial_ticket && trial_configuration == other.trial_configuration &&
                native_screen_proof && other.native_screen_proof &&
                color && other.color && depth && depth == other.depth && subresource == other.subresource &&
                width == other.width && height == other.height;

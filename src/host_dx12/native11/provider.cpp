@@ -319,6 +319,8 @@ std::mutex g_install_mu;
 std::atomic<bool> g_installed{false};
 SceneCallback g_cb = nullptr;
 void* g_cb_user = nullptr;
+TrialReader g_trial_reader = nullptr;
+uint64_t g_trial_serial = 0;
 
 std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
@@ -391,6 +393,7 @@ std::atomic<uint8_t> g_camera_use{static_cast<uint8_t>(CameraUse::Required)};
 std::atomic<bool> g_eval_paused{false}, g_camera_suspended{false};
 uint32_t g_camera_failures = 0, g_camera_retry_frames = 0;
 bool g_frame_delivered = false;
+bool g_frame_delivered_lit = false;
 constexpr uint32_t kCameraSearchBurst = 8, kCameraRetryFrames = 120;
 
 CameraUse CameraSetting()
@@ -1447,6 +1450,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     f.boundary = boundary;
     f.screen_proof = lit_color ? lit_proof : verified_reader ? g_screen.Proof() : 0;
+    if (g_trial_reader && g_lit.trial.UsesCandidate() == bool(lit_color))
+        f.trial_ticket = g_lit.trial.Ticket(g_frame);
     f.scene_draws = g_model.SceneDrawsThisFrame();
     // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
     // tagged when the game last uploaded to it.
@@ -1499,6 +1504,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     if (!ok) ++g_stats.missed;
     else if (g_frame == f.frame) {
         g_frame_delivered = true;
+        g_frame_delivered_lit = lit_proof != 0;
         if (g_screen_enabled.load(std::memory_order_relaxed)) {
             if (lit_proof) {
                 g_lit.screen.NoteDelivery(true, f.scene_draws);
@@ -3008,8 +3014,28 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     const auto order = g_model.CompletedLitOrder();
     g_lit.Finish(check_lit && (picked.color == order.late || picked.color == order.early) && picked.depth == order.depth
                  ? order : FrameModel::LitOrder{});
+    if (g_trial_reader && check_lit) {
+        using Phase = referee::RouteTrial::Phase;
+        auto& trial = g_lit.trial;
+        const auto before = trial.Current();
+        if (before != Phase::Idle || g_lit.steer) {
+            const auto now = GetTickCount64();
+            if (g_lit.steer && trial.CanStart(now)) trial.Start(++g_trial_serial, g_frame, now);
+            const bool available = g_lit.steer && (!trial.UsesCandidate() || g_frame_delivered_lit);
+            trial.Tick(now, available);
+            referee::TrialSample sample;
+            const auto ticket = trial.Ticket(g_frame - 1);
+            if (g_lit.steer && ticket && g_trial_reader(ticket, sample)) trial.Add(ticket, sample, g_frame);
+            if (before != trial.Current())
+                na::eventlog::Emit("native11_route_trial",
+                    "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f why=%s",
+                    (unsigned long long)g_frame, trial.Name(), trial.Region(),
+                    trial.Baseline(), trial.Candidate(), trial.Confirmation(), trial.Reason());
+        }
+        g_lit.steer = g_lit.steer && trial.UsesCandidate();
+    }
     if (was_steering != g_lit.steer)
-        na::eventlog::Emit("native11_lit_role", "next_frame=%llu both_screen_proven=%d", (unsigned long long)g_frame, int(g_lit.steer));
+        na::eventlog::Emit("native11_lit_role", "next_frame=%llu steering=%d", (unsigned long long)g_frame, int(g_lit.steer));
     g_lit_peer.store(g_lit.Learned() ? g_lit.Peer(picked.color) : 0, std::memory_order_relaxed);
     if (g_screen_enabled.load(std::memory_order_relaxed)) g_screen.SetScene(picked.color, picked.depth);
     g_adaptive_scene.store(g_screen.Adaptive(), std::memory_order_relaxed);
@@ -3102,6 +3128,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         g_prev_found_collecting = collecting && g_frame_found;
     }
     g_frame_fired = g_frame_found = g_frame_no_bytes = g_frame_delivered = false;
+    g_frame_delivered_lit = false;
     g_depth_dir.EndFrame(); // the next frame's evidence starts empty; what is proven stays
     SetSceneHanded(false);
     TexturesOnPresent();
@@ -3420,13 +3447,14 @@ void AfterResize(void* swapchain, long result) { UpdateResizeExtent(static_cast<
 OwnWorkScope::OwnWorkScope() : was_(t_inside) { t_inside = true; }
 OwnWorkScope::~OwnWorkScope() { t_inside = was_; }
 
-bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present)
+bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present, TrialReader trial_reader)
 {
     std::lock_guard<std::mutex> g(g_install_mu);
     {
         std::lock_guard<std::mutex> l(g_mu);
         g_cb = cb;
         g_cb_user = user;
+        g_trial_reader = trial_reader;
     }
     if (device) {
         ID3D11Device* was = g_device_raw.exchange(static_cast<ID3D11Device*>(device), std::memory_order_acq_rel);
@@ -3460,6 +3488,7 @@ void Uninstall()
     std::lock_guard<std::mutex> l(g_mu);
     g_cb = nullptr;
     g_cb_user = nullptr;
+    g_trial_reader = nullptr;
     g_screen = {};
     g_lit.Clear();
     g_lit_peer.store(0, std::memory_order_relaxed);
@@ -3472,6 +3501,7 @@ void Uninstall()
     g_eval_paused.store(false, std::memory_order_relaxed);
     g_camera_failures = g_camera_retry_frames = 0;
     g_frame_delivered = false;
+    g_frame_delivered_lit = false;
     g_cb_latest.clear();
     g_scene_uploads.clear();
     g_large_cb_windows.clear();
