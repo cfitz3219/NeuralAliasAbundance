@@ -141,47 +141,74 @@ struct Programs {
     }
 };
 inline void Word(std::array<unsigned,28>& c,unsigned i,float v){std::memcpy(&c[i],&v,4);}
+// The production order of the fit's passes (compute_flow.cpp): the depth groups' split, then the far
+// group's fit and the near group's, each a plain step, the reweighted ones and the final evaluation.
+// Table 1 is fit_accum, table 2 fit_solve (its t7 must be the grid). `heads`: a readback buffer of
+// 160 bytes that receives the far fit's head and then the near fit's.
+inline void FitPasses(Programs& p,Gpu& g,std::array<unsigned,28>& c,unsigned tiles,ID3D12Resource* state,ID3D12Resource* zero,ID3D12Resource* heads) {
+    namespace sm=na::motion::screen;const sm::Params params;
+    c[4]=2;c[8]=0;p.Dispatch(2,c);g.Order();
+    for(unsigned row=0;row<2;++row) {
+        if(row){g.Barrier(state,U,D3D12_RESOURCE_STATE_COPY_DEST);g.l.list->CopyBufferRegion(state,0,zero,0,76);g.Barrier(state,D3D12_RESOURCE_STATE_COPY_DEST,U);}
+        c[8]=row;
+        for(int step=0;step<=params.steps;++step) {
+            Word(c,25,step==params.steps?params.robust_px:step?sm::ScaleAt(step,params):0.f);
+            const float now=sm::TileScaleFor(step,params);Word(c,20,params.tile_px>0?(now>0?now:-1.f):0.f);Word(c,21,sm::TileScaleFor(step+1,params));
+            c[4]=0;p.Dispatch(1,c,tiles);g.Order();c[4]=step==params.steps?1u:0u;p.Dispatch(2,c);g.Order();
+        }
+        if(heads){g.Barrier(state,U,D3D12_RESOURCE_STATE_COPY_SOURCE);g.l.list->CopyBufferRegion(heads,row*80,state,0,80);g.Barrier(state,D3D12_RESOURCE_STATE_COPY_SOURCE,U);}
+    }
+    c[8]=0; // the word is `measure`'s counter offset again
+}
 
 inline int SolveControlled(test::Device& d) {
     namespace sm=na::motion::screen;
-    constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=(gw*gh+63)/64,words=20+81*groups;
+    constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=((gw+7)/8)*((gh+7)/8),words=20+86*groups; // a thread group is one tile of 8 x 8 samples; 81 sums and 5 tile words each
     Gpu g(d); Programs p(g); REQUIRE(p.Init()==0);
-    for(unsigned variant=0;variant<4;++variant) {
+    for(unsigned variant=0;variant<5;++variant) {
         p.Defaults(); std::vector<sm::Sample> samples;std::vector<float> grid(gw*gh*4);
         sm::Model truth;truth.valid=true;truth.nearness_limit=1;
         const float theta[]={-3.f,.21f,-.13f,1.f,.16f,-.09f,.07f,-.03f,13.f,-8.f,4.f};std::copy(theta,theta+11,truth.theta);
         for(unsigned y=0;y<gh;++y)for(unsigned x=0;x<gw;++x) {
             sm::Sample a;a.px=float(x*8)+4.5f;a.py=float(y*8)+4.5f;
             a.nearness=variant==2?0.f:.01f+.06f*float(y)/gh+.02f*std::sin(float(x)*.23f)*std::sin(float(y)*.31f);
+            const bool figure=variant==4&&x<gw/2&&y>gh/4; // a near figure in front of the far scene: two groups of depths
+            if(figure)a.nearness=.4f+.05f*float(x)/gw;
             a.confirmed=variant==3?(y==0):(x+y)%3!=0;sm::Evaluate(truth,a.px,a.py,a.nearness,w,h,a.vx,a.vy);
             if(variant==1&&x>gw*3/4&&y>gh*2/3){a.vx+=18;a.vy-=9;}
+            if(figure){a.vx+=.9f*std::sin(float(y)*.4f);a.vy+=.6f*std::cos(float(x)*.3f);} // it moves by itself and bends
             samples.push_back(a);size_t k=(size_t(y)*gw+x)*4;grid[k]=a.vx;grid[k+1]=a.vy;grid[k+2]=a.nearness;grid[k+3]=a.confirmed?1.f:0.f;
         }
-        const auto ref=sm::Fit(samples.data(),samples.size(),w,h);
+        const auto layers=sm::FitLayers(samples.data(),samples.size(),w,h);const auto& ref=layers.far_fit;
         auto input=g.Upload(gw,gh,DXGI_FORMAT_R32G32B32A32_FLOAT,16,grid.data());
         auto state=test::CreateBuffer(d.device.Get(),words*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         auto zero=test::CreateBuffer(d.device.Get(),80,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);void* z=nullptr;REQUIRE(SUCCEEDED(zero->Map(0,nullptr,&z)));std::memset(z,0,80);zero->Unmap(0,nullptr);
         g.l.list->CopyBufferRegion(state.Get(),0,zero.Get(),0,80);g.Barrier(state.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
-        auto model=test::CreateTexture(d.device.Get(),8,1,DXGI_FORMAT_R32G32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        p.Srv(1,7,input.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Raw(1,state.Get(),words);p.Raw(2,state.Get(),words);p.Uav(2,8,model.Get(),DXGI_FORMAT_R32G32_FLOAT);
+        auto model=test::CreateTexture(d.device.Get(),9,2,DXGI_FORMAT_R32G32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        p.Srv(1,7,input.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Srv(2,7,input.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Raw(1,state.Get(),words);p.Raw(2,state.Get(),words);p.Uav(2,8,model.Get(),DXGI_FORMAT_R32G32_FLOAT);
         std::array<unsigned,28> c{};c[0]=c[2]=w;c[1]=c[3]=h;c[9]=gw;c[10]=gh;c[5]=8;
-        sm::Params params;
-        for(int step=0;step<=params.steps;++step) {Word(c,25,step==params.steps?params.robust_px:step?sm::ScaleAt(step,params):0.f);c[4]=0;p.Dispatch(1,c,groups);g.Order();c[4]=step==params.steps?1u:0u;p.Dispatch(2,c);g.Order();}
-        auto rm=g.Read(model.Get(),8,1,DXGI_FORMAT_R32G32_FLOAT,8,U);
-        auto rb=test::CreateBuffer(d.device.Get(),80,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);g.Barrier(state.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);g.l.list->CopyBufferRegion(rb.Get(),0,state.Get(),0,80);
-        REQUIRE(g.Execute()==0);auto m=g.Floats(rm.Get(),8,1,2);float* head=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,reinterpret_cast<void**>(&head))));
+        auto rb=test::CreateBuffer(d.device.Get(),160,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        FitPasses(p,g,c,groups,state.Get(),zero.Get(),rb.Get());
+        auto rm=g.Read(model.Get(),9,2,DXGI_FORMAT_R32G32_FLOAT,8,U);
+        REQUIRE(g.Execute()==0);auto m=g.Floats(rm.Get(),9,2,2);float* head=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,reinterpret_cast<void**>(&head))));
         for(unsigned k=0;k<16;++k){CHECK(std::isfinite(m[k]));CHECK(std::isfinite(head[k]));}
         float maximum=0;for(unsigned k=0;k<11;++k)maximum=(std::max)(maximum,std::abs(head[k]-ref.theta[k]));
         CHECK((m[12]>0)==ref.valid);CHECK(head[13]==ref.samples);CHECK(head[14]==ref.agree);CHECK(std::abs(head[11]-ref.nearness_limit)<1e-5f);
         if(ref.valid)CHECK(maximum<.002f);
         std::printf("controlled screen fit variant=%u valid=%d/%d samples=%.0f/%.0f agree=%.0f/%.0f nearness=%.6f/%.6f max_term_delta=%.7f\n",variant,m[12]>0,ref.valid,head[13],ref.samples,head[14],ref.agree,head[11],ref.nearness_limit,maximum);
+        // The depth groups: the same split, and the near group's own fit in the model's second row.
+        const float* near_head=head+20;float near_maximum=0;for(unsigned k=0;k<11;++k)near_maximum=(std::max)(near_maximum,std::abs(near_head[k]-layers.near_fit.theta[k]));
+        CHECK((variant==4)==layers.split.found);CHECK(std::abs(near_head[19]-layers.split.nearness)<=1e-5f*layers.split.nearness);CHECK(m[16]==near_head[19]);
+        CHECK((m[18+12]>0)==layers.near_fit.valid);CHECK(near_head[13]==layers.near_fit.samples);
+        if(layers.split.found){CHECK(layers.near_fit.valid);CHECK(std::abs(near_head[14]-layers.near_fit.agree)<=2);CHECK(near_maximum<.02f);for(unsigned k=0;k<11;++k)CHECK(std::abs(m[18+k]-near_head[k])<1e-6f);}
+        std::printf("controlled depth groups variant=%u split=%.6f/%.6f near valid=%d/%d samples=%.0f/%.0f agree=%.0f/%.0f max_term_delta=%.7f\n",variant,near_head[19],layers.split.nearness,m[18+12]>0,layers.near_fit.valid,near_head[13],layers.near_fit.samples,near_head[14],layers.near_fit.agree,near_maximum);
         rb->Unmap(0,nullptr);g.Reset();
     }
     return 0;
 }
 inline int SampleFitMeasure(test::Device& d) {
     namespace sm=na::motion::screen;namespace tm=na::motion::total;
-    constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=(gw*gh+63)/64,words=20+81*groups;
+    constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=((gw+7)/8)*((gh+7)/8),words=20+86*groups; // a thread group is one tile of 8 x 8 samples; 81 sums and 5 tile words each
     Gpu g(d);Programs p(g);REQUIRE(p.Init()==0);
     for(unsigned variant=0;variant<5;++variant) {
         p.Defaults(); sm::Model truth;truth.valid=true;truth.nearness_limit=1;
@@ -207,7 +234,7 @@ inline int SampleFitMeasure(test::Device& d) {
         auto prev=g.Upload(w,h,DXGI_FORMAT_R32G32B32A32_FLOAT,16,rgba.data());
         auto rr=g.Upload(w,h,DXGI_FORMAT_R32G32_FLOAT,8,raw.data()),rv=g.Upload(w,h,DXGI_FORMAT_R32_FLOAT,4,valid.data()),rd=g.Upload(w,h,DXGI_FORMAT_R32_FLOAT,4,depth.data());
         auto grid=test::CreateTexture(d.device.Get(),gw,gh,DXGI_FORMAT_R32G32B32A32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        auto model=test::CreateTexture(d.device.Get(),8,1,DXGI_FORMAT_R32G32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto model=test::CreateTexture(d.device.Get(),9,2,DXGI_FORMAT_R32G32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         auto output=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R32G32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         auto mask=test::CreateTexture(d.device.Get(),w,h,DXGI_FORMAT_R32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         auto state=test::CreateBuffer(d.device.Get(),words*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -216,23 +243,23 @@ inline int SampleFitMeasure(test::Device& d) {
         g.l.list->CopyBufferRegion(state.Get(),0,zero.Get(),0,80);g.Barrier(state.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
         g.l.list->CopyBufferRegion(counters.Get(),0,zero.Get(),0,40);g.Barrier(counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,U);
         for(unsigned t:{0u,3u}) {p.Srv(t,0,rd.Get(),DXGI_FORMAT_R32_FLOAT);p.Srv(t,1,rr.Get(),DXGI_FORMAT_R32G32_FLOAT);p.Srv(t,3,rv.Get(),DXGI_FORMAT_R32_FLOAT);p.Srv(t,5,cur.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Srv(t,6,prev.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);}
-        p.Uav(0,8,grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Srv(1,7,grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Raw(1,state.Get(),words);p.Raw(2,state.Get(),words);p.Uav(2,8,model.Get(),DXGI_FORMAT_R32G32_FLOAT);
+        p.Uav(0,8,grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Srv(1,7,grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Srv(2,7,grid.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT);p.Raw(1,state.Get(),words);p.Raw(2,state.Get(),words);p.Uav(2,8,model.Get(),DXGI_FORMAT_R32G32_FLOAT);
         p.Srv(3,2,model.Get(),DXGI_FORMAT_R32G32_FLOAT);p.Uav(3,8,output.Get(),DXGI_FORMAT_R32G32_FLOAT);p.Uav(3,9,mask.Get(),DXGI_FORMAT_R32_FLOAT);p.Raw(3,counters.Get(),10);
         std::array<unsigned,28> c{};c[0]=c[2]=w;c[1]=c[3]=h;c[9]=gw;c[10]=gh;c[5]=8;
         Word(c,22,jx);Word(c,23,jy);Word(c,24,far_depth);
         p.Dispatch(0,c,(gw+7)/8,(gh+7)/8);g.Order();g.Barrier(grid.Get(),U,S);
-        sm::Params params;for(int step=0;step<=params.steps;++step){Word(c,25,step==params.steps?params.robust_px:step?sm::ScaleAt(step,params):0.f);c[4]=0;p.Dispatch(1,c,groups);g.Order();c[4]=step==params.steps?1u:0u;p.Dispatch(2,c);g.Order();}
+        FitPasses(p,g,c,groups,state.Get(),zero.Get(),nullptr);
         g.Barrier(model.Get(),U,S);p.Dispatch(3,c,(w+7)/8,(h+7)/8);g.Order();
-        auto rg=g.Read(grid.Get(),gw,gh,DXGI_FORMAT_R32G32B32A32_FLOAT,16),rm=g.Read(model.Get(),8,1,DXGI_FORMAT_R32G32_FLOAT,8);
+        auto rg=g.Read(grid.Get(),gw,gh,DXGI_FORMAT_R32G32B32A32_FLOAT,16),rm=g.Read(model.Get(),9,2,DXGI_FORMAT_R32G32_FLOAT,8);
         auto ro=g.Read(output.Get(),w,h,DXGI_FORMAT_R32G32_FLOAT,8,U),rvv=g.Read(mask.Get(),w,h,DXGI_FORMAT_R32_FLOAT,4,U);
-        REQUIRE(g.Execute()==0);auto gs=g.Floats(rg.Get(),gw,gh,4),gm=g.Floats(rm.Get(),8,1,2),vectors=g.Floats(ro.Get(),w,h,2),masks=g.Floats(rvv.Get(),w,h,1);
+        REQUIRE(g.Execute()==0);auto gs=g.Floats(rg.Get(),gw,gh,4),gm=g.Floats(rm.Get(),9,2,2),vectors=g.Floats(ro.Get(),w,h,2),masks=g.Floats(rvv.Get(),w,h,1);
         std::vector<sm::Sample> samples;tm::Image ci{current.data(),w,h},pi{previous.data(),w,h};unsigned sample_decisions=0,sample_errors=0;
         for(unsigned y=0;y<gh;++y)for(unsigned x=0;x<gw;++x){size_t i=size_t(y)*gw+x,j=size_t(y*8+4)*w+x*8+4;sm::Sample a;
             a.px=float(x*8)+4.5f-jx;a.py=float(y*8)+4.5f-jy;a.vx=gs[4*i];a.vy=gs[4*i+1];a.nearness=gs[4*i+2];a.confirmed=gs[4*i+3]>.5f;samples.push_back(a);
             float vx,vy;bool confirmed=tm::SamplePixel(ci,pi,a.px,a.py,true,raw[2*j],raw[2*j+1],vx,vy);sample_decisions+=confirmed!=a.confirmed;
             sample_errors+=confirmed&&a.confirmed&&std::hypot(vx-a.vx,vy-a.vy)>.03f;
         }
-        auto ref=sm::Fit(samples.data(),samples.size(),w,h);sm::Model fitted;std::copy(gm.begin(),gm.begin()+11,fitted.theta);fitted.nearness_limit=gm[11];fitted.valid=gm[12]>0;
+        const auto layers=sm::FitLayers(samples.data(),samples.size(),w,h);const auto& ref=layers.far_fit;CHECK(!layers.split.found&&gm[16]==0&&gm[18+12]==0);sm::Model fitted;std::copy(gm.begin(),gm.begin()+11,fitted.theta);fitted.nearness_limit=gm[11];fitted.valid=gm[12]>0;
         for(float value:gm)CHECK(std::isfinite(value));
         float maxterm=0;for(unsigned k=0;k<11;++k)maxterm=(std::max)(maxterm,std::abs(gm[k]-ref.theta[k]));
         CHECK(fitted.valid&&ref.valid);CHECK(gm[13]==ref.samples);CHECK(std::abs(gm[14]-ref.agree)<=1);CHECK(maxterm<.01f);CHECK(std::abs(gm[11]-ref.nearness_limit)<1e-5f);

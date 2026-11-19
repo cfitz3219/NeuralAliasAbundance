@@ -34,7 +34,7 @@ struct Reference {
     uint32_t mode = 0;               // 1 the camera, 2 the fitted screen motion (core/screen_motion.hpp)
     float matrix[16] = {};           // 1: current clip -> previous clip, row-major, row-vector (the arbiter's composed matrix)
     ID3D12Resource* fix = nullptr;   // 1: the arbiter's optional M3 correction buffer (NON_PIXEL_SHADER_RESOURCE)
-    ID3D12Resource* model = nullptr; // 2: compute_flow's Tier3::screen_model (RG32F 8x1, NON_PIXEL_SHADER_RESOURCE)
+    ID3D12Resource* model = nullptr; // 2: compute_flow's Tier3::screen_model (RG32F 9x2, a row per group of depths, NON_PIXEL_SHADER_RESOURCE)
     float depth_far = 1.0f;          // the depth value at the far end (the arbiter's depth_clear)
     float apart_px = 1.0f, apart_rel = 0.1f;
 };
