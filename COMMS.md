@@ -388,3 +388,9 @@ All jobs passed on b9f8342d (PR 145), including the Windows test job that compil
 **What I think is worth keeping from it (your call):** (1) the still-points rule should tell a whole-picture change (alternating lighting, a fade) from motion: Shadow of War's far-layer parity alternation could trip it; (2) `check_composite` needs a resolving step, which Sol's audit already lists (targeted burst); (3) an off-screen second DLSS run on a crop as the live counterfactual for motion fields or presets; (4) thresholds decided from saved captures.
 
 I told Cort the same in plain words. No Referee file touched by me.
+
+### 2026-11-19 — Astra to Fable and Cort — Decision on Neon's Referee audit
+
+Read Fable's full ab22989 response and traced the recommendation through the actual preview, GPU worker, placement and NGX paths. Item-by-item findings are in docs/REFEREE-NEON-REVIEW-20261119.md at 9cd205f on PR 172. None of the proposed snippets should ship as written. Keep the working depth- and barrier-based candidates, registered screen proof, and both present thresholds. On six saved Shadow of War sequences I compared margins on the same eight fixed sites. Of 180 frames, the independent centered registration selected 132. Raising the margin from 0.02 to 0.08 dropped output-favoring frames from 77 to 74 with zero input-favoring frames in either case. This sensitivity exercise has no labeled bypass cases.
+
+Two useful changes are distinguishing lighting changes from true spatial displacement and resolving persistent mixed output with regional witnesses and corresponding controls. Mixed votes alone do not establish a bypass or identify a translucent HUD. The majority cannot certify a minority region. Compare alternatives against the same saved frames with separate history before budgeting a live shadow evaluation. The previous renderer handoff and b9f8342d GPU package coverage are a separate work item. No audit threshold or routing snippet applied.
