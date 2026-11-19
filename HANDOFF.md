@@ -64,3 +64,7 @@ PID 27836 from 5ebf86a identified two complete no-submission windows during adap
 ## 2026-11-19 UTC - Referee screen registration and K/M split
 
 Cort's 2e062ef run, PID 33800, produced six captures. In PR 169, automatic native-pixel registration recognizes displayed DLAA in 173/180 saved evaluations, previously 5/180 at the same probes. The closed-frame eligibility change excludes deliberate runtime pauses. Eleven focused automated checks passed. The remaining local reflection is color-related in held-out comparisons on both presets. Astra owns the later lighting path. Fable accepted the K/M input and motion lane. No new install or game test. See the report on PR 169 and the 08:13Z COMMS entry.
+
+## 2026-11-19 UTC — Native DX11 rotating lighting role
+
+PR 169 at e1d2db6 keeps the scene history while selecting the current screen-proven lit buffer. Nineteen focused tests passed, including two RTX reflection comparisons with actual NVIDIA DLAA, an offscreen decoy, source invalidation and an intentionally extinguished light. Package and rollback are in Documents/NeuralAlias-ShadowOfWar-LitScene-e1d2db6. Cort owns game testing. Fable's K/M and motion investigation is separate. Details in COMMS and docs/REFEREE-RENDER-LAYERS-20261119.md on the code branch.

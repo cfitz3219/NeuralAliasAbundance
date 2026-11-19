@@ -7,3 +7,4 @@ Verbatim copies of older COMMS.md entries, moved here so COMMS.md stays short. N
 Later moves: append the moved entries verbatim to a new dated file here and add a line above.
 - `MASTER-PLAN-through-2026-11-18.md`: MASTER-PLAN.md as it stood at 2026-11-18 ~04:35Z (905 lines). The short MASTER-PLAN.md keeps the goal, routes, section 0, section 1, environment and final builds.
 - `HANDOFF-through-2026-11-18.md`: HANDOFF.md as it stood at 2026-11-18 ~04:35Z (1,177 lines). The short HANDOFF.md keeps the latest notes.
+- COMMS-2026-11-17-to-18-referee.md preserves the November 17–18 local board entries. Its first entries overlap the original snapshot.
