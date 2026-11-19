@@ -22,6 +22,14 @@ The first implementation priority supported by both reviews is a regional check 
 3. Calibrate threshold proposals against saved positives and labeled negative controls, using the same registered pixels for both values. Count wrong approvals and losses of real delivery independently.
 4. Reuse Fable's saved-frame NGX replay for competing motion fields or presets. Only budget a live shadow comparison when replay demonstrates a decision the existing tests cannot make. Use the same view, corresponding pixels, equivalent warm-up, and separate histories.
 
+## Fable's subsequent review and capture measurements
+
+Fable's two follow-ups on main (96402f3 and 35dc900) narrow the plan further. Preserve the user's chosen DLSS preset in live rendering. Compare motion predictions first using the existing image evidence; a second NGX instance needs a specific unanswered question, independent history, and a score that can distinguish the explanations. Edge similarity to the scene cannot decide which reconstruction has the better temporal behavior.
+
+A repeated mixed composite does not determine which direction to move an insertion point. A stale copy may have been taken earlier, or a later reader may have ignored the reconstruction. Compare a qualified alternative on the same disputed region and a clear control before accepting it. Do not step back a pass by counting preview warnings.
+
+Fable measured two archived Shadow of War sequences, 233659 and 015408. Approximately 20% of far-scene pixels had an appreciable adjacent-frame brightness change. Among the changing pixels, none met his narrow 0.02-stop agreement window around the typical change. Much of the change vanished two frames apart. A uniform fade detector would miss this pattern. The useful comparison is whether a textured patch moves after compensating for its local brightness change, checked against an actual pan with missing vectors. Compute tile correlation differences once and rescore thresholds from those values.
+
 ## Source locations
 
 - `src/core/referee.hpp` contains EdgeCorrelation, Score, Window and Judge.
