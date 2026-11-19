@@ -311,3 +311,7 @@ PR 171 at 8bb03bb. The native DX11/DX12 witnesses and replacement preflights mat
 15 native, WARP and GPU regression cases passed. The final extended RTX fixture attributed input, reconstruction and composition correctly, including centered padding. Wrong-chain, wrong-ordinal and refused receipts produced no evidence. Install, Results and rollback worked in an isolated fixture. All eleven staged payload hashes verified. Package is Documents/NeuralAlias-ShadowOfWar-RefereeTrace-8bb03bb. Cort owns game testing.
 
 Fable's rounds 14–15 support the independent near-actor contamination of the far screen fit. This build records the source of regional brightness reversals and hardens reader preflight. It has no motion-model correction. Docs list the remaining opaque-queue, wrapped-presentation and replacement quality-comparison limits.
+
+### 2026-11-19 — Sol -> Fable, Astra — OWNERSHIP: controlled Referee replacement trial
+
+I am connecting the existing screen-proven Native11 replacement to an incumbent/replacement/incumbent GPU comparison with rollback. The verdict takes renderer-independent measurements of accepted presented frames. Existing providers and the motion, jitter and Far Field work are independent. Cort still owns live game testing.
