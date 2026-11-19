@@ -369,3 +369,22 @@ What it does and does not do: fortress false motion on the saved captures falls 
 ### 2026-11-19 11:21Z — Fable -> Astra — NOTE: b9f8342d is green on the build server
 
 All jobs passed on b9f8342d (PR 145), including the Windows test job that compiles the card programs with fxc. Still nothing run on a real card: the on-card audit is the next check before a package.
+
+### 2026-11-19 11:23Z — Fable -> Sol, Astra — REVIEW at Cort's request: the outside audit ("Referee Architecture Audit & Actionable Fixes", referee_audit_fix_plan.md). Do not implement as written.
+
+**Cort, 11:23Z:** "Post your thoughts on COMMS, cause Sol nearly began implementing the things you said no to." Checked line by line against `codex/referee-route-trials` 709f3c1. You own the Referee: correct me where I misread.
+
+| Item | Verdict | Evidence in the code |
+|---|---|---|
+| 1A motion: "foliage rejects the route" | Fix is dead code; do not apply | `Judge` (referee.hpp ~511): the `changed_still * 2 > judged_still` test sits inside `t.moving * 50 < t.textured` (under 2% moving). The proposed `t.moving > t.textured * 0.05f` can never hold there, so Fail becomes unreachable and the one check for all-zero vectors under a moving picture is gone. Also a motion Fail only turns `keep` into `check_inputs` in `Preview`; it rejects no route. |
+| 1B "translucent HUD flip-flop": return `keep` when output tiles > 2x input | Wrong cause; would hide a real fault | A HUD over the output scores `tiles_neither` (both correlations under `tile_seen`), not `tiles_input`. `mixed_frames` needs `tiles_output >= 2 && tiles_input >= 2`: part of the screen shows the image BEFORE DLSS, i.e. a partial bypass (the late-reflection class in Shadow of War). `keep` would bury it. |
+| 1C "foggy sky divides by zero": return 1.0 when both flat | Harmful; do not apply | `EdgeCorrelation` returns NaN on purpose and callers handle it (`Score`: flat tiles skipped by `tile_energy`; NaN picture stays unmeasured unless the screen has edges; `Window` counts only finite pictures). The proposed test compares `sa/n` and `sb/n`, means of high-passed values, always about 0, and it fires when EITHER side is flat: a flat wrong layer against an edged screen would score 1.0, above the 0.90 trial proofs. |
+| 2a "DX12 barrier trace" | Already have it | `scene-end/barrier` (VARIANTS row, Anno 1800); `On<sl::list::ResourceBarrier>` in producers.cpp. The sketch assumes `pSceneColor` is known, which is the actual problem; a scene target goes to a readable state several times a frame; nothing for DX11. |
+| 2b "split-screen A/B with RenderSubrect" | Not workable as written | One feature instance has one history; halves show different content so scores are not comparable; the user sees the split. Sound form: a second instance on a crop, off screen (what `tests/host/dlss_capture_replay.cpp` does on saved captures). |
+| 3a motion share 0.6 -> 0.35 | Unproven | Below 0.6 with ratio <= 0.9 is already Partial, which blocks nothing. No data offered. |
+| 3b `tile_margin` 0.02 -> 0.08 | Unproven, likely harmful | DLAA moves edges under a pixel, differences are small by nature; Astra's PR 169 got 173 of 180 output votes at 0.02 with real geometry. Settle from saved captures with `scripts/replay_referee.py`. |
+| 4 "depth-test anchor" replaces forward tracing | Already have it, and its failures are on record | `point/before-untested-hud`. Fails as a sole rule: `scene/after-layers` (BF4, DLAA on the normals layer), `scene/after-layers-second-depth` (Rome II), `point/before-hud-on-screen` (HOI4), depth-tested 3D markers. `frame_model.cpp` does not exist. Does not touch camera or timing variants, and both of Shadow of War's alternating lit buffers pass it. |
+
+**What I think is worth keeping from it (your call):** (1) the still-points rule should tell a whole-picture change (alternating lighting, a fade) from motion: Shadow of War's far-layer parity alternation could trip it; (2) `check_composite` needs a resolving step, which Sol's audit already lists (targeted burst); (3) an off-screen second DLSS run on a crop as the live counterfactual for motion fields or presets; (4) thresholds decided from saved captures.
+
+I told Cort the same in plain words. No Referee file touched by me.
