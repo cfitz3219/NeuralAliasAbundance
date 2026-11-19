@@ -501,7 +501,6 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         ff.use_screen_fit = tool != Tool::ScreenFit;
         ff.total = measured; ff.last_reset_frame = s.last_reset_frame;
         j2::compute_flow::Tier3 tier;
-        j2::compute_flow::SetLoosen(settings::Get().j2_flow_loosen.load());
         flow = j2::compute_flow::Record(list, s.queue.Get(), slot.color.Effects(), shared_depth, in, ff, tier);
         if (measured) {
             if (!flow.context || (flow.pair && !tier.total)) {
@@ -711,7 +710,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.camera_cut = !measured && cam.camera_cut;
         id.cut_reason = measured ? 0u : static_cast<uint32_t>(cam.cut_reason);
         id.flow_ran = in.tier3_valid_flag || in.tier1_valid_flag || in.estimated_valid_flag;
-        id.flow_loosen = settings::Get().j2_flow_loosen.load();
+        id.flow_loosen = settings::kObjectFlowLoosen;
         id.flow_jitter_x = flow.frame.jitter[0];
         id.flow_jitter_y = flow.frame.jitter[1];
         id.flow_jitter_convention = flow.colour_convention;

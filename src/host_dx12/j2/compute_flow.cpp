@@ -1,5 +1,6 @@
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/j2/flow_shaders.hpp"
+#include "host_dx12/settings.hpp"
 #include "host_dx12/ffx_flow/ffx_flow.hpp"
 #include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
 #include "host_dx12/nvof/flow_expand.hpp"
@@ -17,7 +18,7 @@
 #include <cstring>
 
 namespace na::j2::compute_flow {
-std::atomic<uint32_t> g_loosen{50}; // SetLoosen; read at each Record
+std::atomic<uint32_t> g_loosen{settings::kObjectFlowLoosen}; // tests can exercise other thresholds
 std::atomic<bool> g_candidates{true}; // SetFrameCandidates; read at each Record
 std::atomic<bool> g_screen_fit{true}; // SetScreenFit; read at each Record
 using Microsoft::WRL::ComPtr;using Lease=na::nr::native::RecordingLease;

@@ -4628,9 +4628,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // colour/depth copies. It needs no batch split or external queue wait.
         // Camera reconstruction (Cort 2026-11-04: flow on removed the oily smear because the M3 fit
         // lived inside the flow toggle). When the selected matrix carries no view for 30 frames in a
-        // row, the camera term is zero whatever the player does: AMD flow + the M3 fit then run even
-        // with optical flow off (the toggle keeps only the object-motion residual); 30 frames with a
-        // view end it. Games with a real camera matrix are unaffected.
+        // row, the camera term is zero whatever the player does. Use measured screen motion
+        // until 30 frames with a usable view restore the normal camera route.
         static int no_view_streak = 0, view_streak = 0;
         static bool reconstruct = false;
         if (no_camera) {} // no matrix this frame: it says nothing about the camera's own matrices
@@ -4657,7 +4656,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             frame.use_screen_fit = tool != Tool::ScreenFit || !compare_fit;
             frame.total=measured;frame.last_reset_frame=g.last_reset_frame;
             na::j2::compute_flow::Tier3 tier;
-            na::j2::compute_flow::SetLoosen(na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed));
             pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),g.color_in.Get(),g.depth32.Get(),in,frame,tier);
             if(measured){
                 // Nothing can be measured at all (the programs or working memory are missing, or the
@@ -5063,7 +5061,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ci.tracker_restart = tracker_restart ? 1u : 0u; ci.cut_reason = static_cast<uint32_t>(cam.cut_reason);
         ci.depth_reversed = reversed ? 1u : 0u;
         ci.flow_ran = (flow_tier.residual != nullptr || flow_tier.fix != nullptr) ? 1u : 0u;
-        ci.flow_loosen = na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed);
+        ci.flow_loosen = na::settings::kObjectFlowLoosen;
         ci.raster_jitter_x = static_cast<float>(cam.jitter_px_x); ci.raster_jitter_y = static_cast<float>(cam.jitter_px_y);
         ci.flow_jitter_x=pending.compute_flow.frame.jitter[0];ci.flow_jitter_y=pending.compute_flow.frame.jitter[1];
         ci.flow_jitter_convention=pending.compute_flow.colour_convention;ci.flow_jitter_epoch=pending.compute_flow.colour_epoch;
@@ -8048,7 +8046,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         ci.flow_ran = d.flow_ran ? 1u : 0u;
         ci.flow_jitter_x=d.flow_jitter_x;ci.flow_jitter_y=d.flow_jitter_y;
         ci.flow_jitter_convention=d.flow_jitter_convention;ci.flow_jitter_epoch=d.flow_jitter_epoch;
-        ci.flow_loosen = na::settings::Get().j2_flow_loosen.load(std::memory_order_relaxed);
+        ci.flow_loosen = na::settings::kObjectFlowLoosen;
         uint64_t sel_d = 0, sel_c = 0;
         na::observe::GetLiveSelection(&sel_d, &sel_c);
         ci.view_depth = sel_d; ci.view_color = sel_c;

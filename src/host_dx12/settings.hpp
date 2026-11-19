@@ -20,6 +20,9 @@
 
 namespace na::settings {
 
+// Live DLAA keeps the former slider at its 50% setting for all game profiles.
+inline constexpr uint32_t kObjectFlowLoosen = 50;
+
 enum class DlssMode : uint32_t {
     DLAA = 0,         // 100% â€” render at output resolution
     Quality = 1,      // 66.7%
@@ -82,7 +85,6 @@ struct Settings {
     // Render-small HUD: 0 = the HUD goes through DLSS with the scene; 1..100 = HUD pixels are
     // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
     std::atomic<uint32_t> j2_hud_nis{50};
-    std::atomic<uint32_t> j2_flow_loosen{50}; // J2 moving-object flow: 0 = the original acceptance rules, 100 = loosest (Cort 2026-11-03)
     std::atomic<uint32_t> j2_jitter_r2{0}; // jitter sequence: 0 Halton 2,3 (default), 1 R2; [j2] jitter_sequence; live
     std::atomic<uint32_t> aniso16{0}; // anisotropic filtering level on the game's surface textures: 0 off, 4, 8, 16; [j2] anisotropic; read at game start
     // J2 texture detail in effect at full resolution, x 100: a mirror of the choice below, written at

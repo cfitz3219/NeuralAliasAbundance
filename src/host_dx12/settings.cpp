@@ -135,8 +135,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_sharpness.store(static_cast<uint32_t>(v > 100 ? 100 : v));
         const int hud = static_cast<int>(GetPrivateProfileIntW(L"j2", L"hud_nis", 50, ini));
         target.j2_hud_nis.store(static_cast<uint32_t>(hud < 0 ? 0 : (hud > 100 ? 100 : hud)));
-        const int fl = static_cast<int>(GetPrivateProfileIntW(L"j2", L"flow_loosen", 50, ini));
-        target.j2_flow_loosen.store(static_cast<uint32_t>(fl < 0 ? 0 : (fl > 100 ? 100 : fl)));
+        // Legacy flow and flow_loosen keys are ignored by this build.
         {
             const int af = static_cast<int>(GetPrivateProfileIntW(L"j2", L"anisotropic", 0, ini));
             // 1 = the first build's on switch (16x).
@@ -266,13 +265,12 @@ const char* source_of(const wchar_t* section, const wchar_t* key)
 }
 void describe_effective()
 {
-    // Astra 20cddb8 point 5: the 05dc62b deploy log printed flow_loosen=50/preset L while the
-    // game ran 0/M from the saved user choices. Log every effective value with its source.
+    // Log what the runtime actually uses, with the origin of each setting.
     std::snprintf(g_effective, sizeof g_effective,
         "settings_effective game_ini=\"%ls\" user_ini=\"%ls\" j2.flow_loosen=%u(%s) j2.preset=%u(%s) j2.sharpen=%u(%s) "
         "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s) j2.camera=%d(%s)",
         g_ini_defaults, g_ini_user,
-        g_settings.j2_flow_loosen.load(), source_of(L"j2", L"flow_loosen"),
+        kObjectFlowLoosen, "builtin",
         g_settings.j2_preset.load(), [] { const char* s = source_of(L"j2", L"preset_v2"); return strcmp(s, "builtin") ? s : source_of(L"j2", L"preset"); }(),
         g_settings.j2_sharpness.load(), source_of(L"j2", L"sharpen"),
         g_settings.j2_hud_nis.load(), source_of(L"j2", L"hud_nis"),
@@ -413,8 +411,6 @@ bool SaveFromWorker()
     WritePrivateProfileStringW(L"j2", L"sharpness", nullptr, ini); // the old RCAS-scale key
     swprintf_s(v, L"%u", (std::min)(g_settings.j2_hud_nis.load(), 100u));
     ok &= WritePrivateProfileStringW(L"j2", L"hud_nis", v, ini) != 0;
-    swprintf_s(v, L"%u", g_settings.j2_flow_loosen.load() > 100 ? 100u : g_settings.j2_flow_loosen.load());
-    ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.aniso16.load());
     ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", v, ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"jitter_sequence", g_settings.j2_jitter_r2.load() ? L"r2" : L"halton", ini) != 0;

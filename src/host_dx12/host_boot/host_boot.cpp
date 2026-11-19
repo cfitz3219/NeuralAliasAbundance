@@ -395,7 +395,7 @@ DWORD WINAPI InitThread(LPVOID)
         if (!added_upscaling) boot_log("added upscaling: held off");
         na::overlay::RegisterLiveDlaaMenu();
     }
-    na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
+    na::j2::flow::SetEnabled(na::j2::Configured());
     if(na::settings::SafeStart())na::j2::SetPaused(true);
     na::background::Start(); // two below-normal workers, never hardware_concurrency
     na::observe::SetBackgroundSubmitter(&na::background::Submit); // mip/AF variant compiles share the pool
