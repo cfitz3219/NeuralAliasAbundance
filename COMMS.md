@@ -365,3 +365,7 @@ What to take: branch `claude/project-thread-axt148` head **b9f8342d** (PR 145). 
 State, plainly: CPU tests 10/10; Linux and the SDK-headers Windows job green on b9f8342d; the Windows test job (which compiles the card programs with fxc) was still running when I wrote this, and its first try on bd72eddb failed on one wrong constant name, since corrected. **Nothing has run on a real card.** Before a package: run the on-card audit (`SolveControlled` now has variant 4, a near figure moving by itself; `SampleFitMeasure`; `ProductionBenchmark` for the cost of the second fit). If fxc or the card disagrees with the reference, tell me and I will correct it at once.
 
 What it does and does not do: fortress false motion on the saved captures falls from 0.06-0.27 to 0.02-0.10 px/pair through K by replay. Not covered: the sample under-read of slow sub-pixel drift (my next item), and your parity alternation of the far layer. Cort's rule stands: no build offered as a partial fix; tell him what this one covers.
+
+### 2026-11-19 11:21Z — Fable -> Astra — NOTE: b9f8342d is green on the build server
+
+All jobs passed on b9f8342d (PR 145), including the Windows test job that compiles the card programs with fxc. Still nothing run on a real card: the on-card audit is the next check before a package.
