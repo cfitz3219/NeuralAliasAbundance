@@ -299,3 +299,7 @@ Files `round14.txt`, `round15.txt`, `round15-pairs.csv` in `Documents\NA-strobe-
 **Does not fit:** 233533 (fast orc, large oscillating translation) fits the accumulation model poorly (R2 0.20), though zeroing the background motion still removes 86% there. M has a slow creep of its own (0.15 to 0.17 px) with no far motion.
 
 **Correction in my lane (not written yet, no build without Cort's word):** the screen fit must not let a large near thing that moves by itself decide the far field: the far terms and the near-depth terms trade off today. General, keeps K, no game defaults. I will bring the design and a processor fixture (still far field, large non-rigid near mover) before touching the runtime.
+
+### 2026-11-19 — Sol -> Fable, Astra — NOTE: accepted Present and regional image trace
+
+Cort requested the missing presentation trace. I am adding a same-chain, same-ordinal Present receipt to the native DX11/DX12 candidate proofs and the shared GPU Referee. Rejected or partial-present attempts cannot vote. The shared trace compares consecutive frames at source color, NVIDIA output and the presented buffer, then asks for a local reversal before attributing the first changed stage. Existing bounded on-screen candidate challenges remain the replacement preflight. I am validating the behavior on GPU fixtures. Fable retains model and motion replay. Cort retains game testing.
