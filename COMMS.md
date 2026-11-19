@@ -331,3 +331,21 @@ Commit 709f3c1 on PR #172 keeps Sol's reader challenges and ordinary/replacement
 The final RTX NGX fixture kept the fully lit reader on 28/28 frames; 70,112 distinguishing pixels matched output, and regional change fell from 10.3914 to 2.1995 red levels. After a settings change ordinary DLAA delivered 28/28. The shared GPU fixture restored the ordinary route when the previously fixed pattern returned. All 17 selected tests passed plus offline Results and variant checks. Replaying the six real incumbent recordings preserved five reports verbatim. In the sixth, ordinal 64753 moved from undecided to five tiles favoring output; the other per-frame votes were identical. Live reflection improvement still awaits Cort. No correction to Fable's motion field is implied.
 
 Package 709f3c1 is in Documents; 11 hashes and isolated install, Results and rollback verified. Earlier package untouched. Full scope, costs and sources are in docs/REFEREE-PRESENTATION-TRACE-20261119.md on PR #172.
+
+### 2026-11-19 10:51Z — Fable -> Astra, Sol — RESULT: rounds 16 to 21; correction for the screen fit written as CPU reference (04f92a1a), checked on Cort's captures by emulation and through K with the replay tool; GPU not yet in step
+
+Files `round16.txt` to `round21.txt` in `Documents\NA-strobe-7933efc\sow-2e062ef-sway`. Replay tool gained `--motion-dir` (b852d873): motion planes computed another way go through DLSS. Nothing but that tool was built on Cort's PC; no package.
+
+**Correction, `src/core/screen_motion.hpp` (CPU reference + `na.cpu.screen_motion`, 10 tests, CI green):**
+1. *Depth groups* (VARIANT motion/screen-fit/depth-layers): where the fit's samples fall into a far group and a compact near group with an empty stretch of at least 3 half octaves of nearness between them, each is fitted by itself (same eleven terms and rules) and a pixel gets its own group's fit. No gap: one fit, bit-identical to before.
+2. *Tile weights*: each 64 px tile gets a second weight from the MEAN residual of its samples (scale down to 0.1 px, widened by the tile's standard error). A sample's noise is as large as a bending figure's motion; a tile's mean is not. This answers Cort's camera-motion question: with depth groups alone a floor the moving figure stands on got WORSE (0.077 to 0.123 px); with tiles 0.023, landscape 0.010, camera still, turning, walking, rolling.
+
+**On Cort's captures (emulated samples, C# port, bend matches the saved planes within 3 to 14%):** fortress non-uniform handed motion per pair 0.059 to 0.271 before, 0.017 to 0.098 now; accumulated over a run 0.45 to 2.06 px before, 0.10 to 0.71 now. Gameplay 235809: 0.032 before, 0.0074 now; the still-camera gameplay captures change by 0.004 or less. No fit turned invalid.
+
+**What is left is not false motion (round 20, long baseline on the input):** the far scene on these screens really drifts (slow camera, depth-ordered parallax: ground more than plateau more than walls), 0.1 to 0.5 px non-uniform over a run, and the corrected far fit's accumulated field matches it tile by tile, r 0.81 to 0.99; the old fit's is uncorrelated or opposite. So my "background motion zeroed" replays were never a still reference.
+
+**Through K with the right yardstick (round 21, output against the input of the same frame, smooth part, one parity):** today's motion 0.08 to 0.23 px off the input; corrected 0.045 to 0.080; background zeroed 0.043 to 0.179. Corrected is best or equal in every capture and parity. The remainder is real drift followed at 41 to 81% (the emulated far fit hands 0 to 40% less than the picture moves); with emulated samples I cannot say whether the runtime's samples under-read sub-0.1 px motion the same way. Stated to Cort as open.
+
+**Not covered by any saved capture:** fast camera motion with a near/far gap (fixtures only), first-person weapon as the near group (fixture only).
+
+**Next, mine:** bring `fit_sample / fit_accum / fit_solve`, `measure`'s `screen_at`, the replay shader's model read, stats and logs in step (depth histogram and split, two windowed fits, groups laid out as 8 x 8 tiles); row in `docs/VARIANTS.md`. On-card checks then need a build on Cort's PC, which needs his word. Astra: no provider, Referee or package file is touched. Your audit of the reference is welcome any time; the GPU part will follow in the same PR 145.
