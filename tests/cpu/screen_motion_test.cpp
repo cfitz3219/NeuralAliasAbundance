@@ -256,6 +256,11 @@ int main()
                 const screen::Model m = screen::Fit(samples.data(), samples.size(), kW, kH);
                 CHECK(m.valid);
                 const Errors e = Against(m, c);
+                screen::Params samples_only;
+                samples_only.tile_px = 0;
+                const Errors plain = Against(screen::Fit(samples.data(), samples.size(), kW, kH, samples_only), c);
+                // Tile weights must not cost a rigid scene anything that matters.
+                CHECK(e.mean < plain.mean + 0.01f && e.worst < plain.worst + 0.05f);
                 float biggest = 0;
                 for (const auto& a : samples) biggest = (std::max)(biggest, std::hypot(a.vx, a.vy));
                 std::printf("  %-24s largest motion %6.2f px  fit error mean %.4f worst %.4f  agree %.0f of %.0f\n", kMoveNames[i], biggest, e.mean,
@@ -374,8 +379,11 @@ int main()
             int i = 0;
             for (const float speed : {0.3f, 0.6f, 1.2f}) {
                 const auto samples = FigureSamples(speed, 77);
-                // The one fit: the figure agrees with it (within robust_px), holds most of the samples, and bends it.
-                const screen::Model one = screen::Fit(samples.data(), samples.size(), kW, kH);
+                // The one fit with sample weights only (the fit as it was): the figure agrees with it (within
+                // robust_px), holds most of the samples, and bends it.
+                screen::Params samples_only;
+                samples_only.tile_px = 0;
+                const screen::Model one = screen::Fit(samples.data(), samples.size(), kW, kH, samples_only);
                 CHECK(one.valid && one.agree > 0.98f * one.samples);
                 const Handed before = HandedToFarScene([&](float) { return &one; });
                 const screen::Layers l = screen::FitLayers(samples.data(), samples.size(), kW, kH);
@@ -383,8 +391,8 @@ int main()
                 CHECK(l.split.nearness > 0.00075f && l.split.nearness < 0.009f);
                 const Handed after = HandedToFarScene([&](float nearness) { return screen::ModelFor(l, nearness); });
                 std::printf("  figure moving %.1f px: split at nearness %.5f (%.0f far samples, %.0f near, %.0f between)\n"
-                            "      one fit:    still scene handed %.4f px, uneven %.4f, worst %.4f\n"
-                            "      two groups: still scene handed %.4f px, uneven %.4f, worst %.4f\n",
+                            "      as it was:  still scene handed %.4f px, uneven %.4f, worst %.4f\n"
+                            "      now:        still scene handed %.4f px, uneven %.4f, worst %.4f\n",
                             speed, l.split.nearness, l.split.far_samples, l.split.near_samples, l.split.stray, before.rms, before.uneven, before.worst,
                             after.rms, after.uneven, after.worst);
                 // The fault: uneven false motion that grows with the figure's speed (the captures: 0.04 to 0.22 px).
@@ -407,6 +415,84 @@ int main()
                 }
                 std::printf("      the figure's own samples against the fit they follow: %.4f px with one fit, %.4f px with their own\n", own_one / n, own_two / n);
                 CHECK(own_two <= own_one);
+                ++i;
+            }
+        }},
+        {"a figure moving by itself cannot bend still things at its own depth either, camera still or moving", [] {
+            // The player on a rampart: the figure and the floor it stands on are one group of depths, a far
+            // landscape is the other, and three blocks in ten of the landscape can be measured. Depth cannot
+            // part the figure from the floor; the tiles' mean disagreement can.
+            const auto kind = [](float px, float py) { // 0 far landscape, 1 the floor, 2 the figure
+                const float u = (px - 0.5f * kW) / (0.13f * kW), v = (py - 0.6f * kH) / (0.4f * kH);
+                return u * u + v * v < 1.0f ? 2 : py > 0.72f * kH ? 1 : 0;
+            };
+            const auto nearness_at = [&](float px, float py) {
+                const int k = kind(px, py);
+                if (k == 2) return 0.012f + 0.004f * std::sin(px * 0.03f);
+                if (k == 1) return 0.008f + 0.012f * (py - 0.72f * kH) / (0.28f * kH);
+                const float horizon = 0.45f * kH;
+                return py < horizon ? 0.0f : 0.0003f + 0.0006f * (py - horizon) / (float(kH) - horizon);
+            };
+            int i = 0;
+            for (const Camera& c : {kMoves[0], kMoves[3], kMoves[4], kMoves[5]}) {
+                Rng rng{31};
+                std::vector<screen::Sample> samples;
+                for (uint32_t y = 4; y < kH; y += 8)
+                    for (uint32_t x = 4; x < kW; x += 8) {
+                        screen::Sample a;
+                        a.px = float(x) + 0.5f;
+                        a.py = float(y) + 0.5f;
+                        a.nearness = nearness_at(a.px, a.py);
+                        TrueFlow(c, a.px, a.py, a.nearness, a.vx, a.vy);
+                        const int k = kind(a.px, a.py);
+                        a.confirmed = k != 0 || rng.Next() < 0.3f;
+                        a.vx += 0.15f * rng.Gauss();
+                        a.vy += 0.15f * rng.Gauss();
+                        if (k == 2) {
+                            const float u = (a.px - 0.5f * kW) / (0.13f * kW), v = (a.py - 0.6f * kH) / (0.4f * kH);
+                            a.vx += 0.6f * (0.8f * std::sin(3.1f * v + 0.4f) + 0.5f * u * v + 0.3f);
+                            a.vy += 0.6f * (0.6f * std::cos(2.3f * u) - 0.4f * v * v + 0.5f * u);
+                        }
+                        samples.push_back(a);
+                    }
+                screen::Params samples_only;
+                samples_only.tile_px = 0;
+                const screen::Model was = screen::Fit(samples.data(), samples.size(), kW, kH, samples_only);
+                const screen::Layers groups_only = screen::FitLayers(samples.data(), samples.size(), kW, kH, samples_only);
+                const screen::Layers now = screen::FitLayers(samples.data(), samples.size(), kW, kH);
+                CHECK(was.valid && now.split.found && now.far_fit.valid && now.near_fit.valid);
+                // Mean error against the camera's true motion on the still things: [0] landscape, [1] floor.
+                double e_was[2] = {}, e_groups[2] = {}, e_now[2] = {};
+                float worst_now[2] = {};
+                int n[2] = {};
+                for (uint32_t y = 1; y < kH; y += 3)
+                    for (uint32_t x = 1; x < kW; x += 3) {
+                        const float px = float(x) + 0.5f, py = float(y) + 0.5f;
+                        const int k = kind(px, py);
+                        if (k == 2) continue;
+                        const float e = nearness_at(px, py);
+                        float tx, ty, ax, ay, gx, gy, bx, by;
+                        TrueFlow(c, px, py, e, tx, ty);
+                        screen::Evaluate(was, px, py, e, kW, kH, ax, ay);
+                        screen::Evaluate(*screen::ModelFor(groups_only, e), px, py, e, kW, kH, gx, gy);
+                        screen::Evaluate(*screen::ModelFor(now, e), px, py, e, kW, kH, bx, by);
+                        e_was[k] += std::hypot(ax - tx, ay - ty);
+                        e_groups[k] += std::hypot(gx - tx, gy - ty);
+                        const float d = std::hypot(bx - tx, by - ty);
+                        e_now[k] += d;
+                        worst_now[k] = (std::max)(worst_now[k], d);
+                        ++n[k];
+                    }
+                for (int k = 0; k < 2; ++k) { e_was[k] /= n[k]; e_groups[k] /= n[k]; e_now[k] /= n[k]; }
+                std::printf("  %-22s landscape: as it was %.4f, depth groups alone %.4f, now %.4f (worst %.4f)\n"
+                            "                         floor:     as it was %.4f, depth groups alone %.4f, now %.4f (worst %.4f)\n",
+                            i == 0 ? "still" : i == 1 ? "turn" : i == 2 ? "walk + turn + look up" : "roll + strafe", e_was[0], e_groups[0], e_now[0],
+                            double(worst_now[0]), e_was[1], e_groups[1], e_now[1], double(worst_now[1]));
+                // As it was, both still things are bent; depth groups alone free the landscape and bend the floor more.
+                CHECK(e_was[0] > 0.04 && e_was[1] > 0.04 && e_groups[1] > e_was[1]);
+                // Now neither is.
+                CHECK(e_now[0] < 0.04 && e_now[1] < 0.03);
+                CHECK(e_now[0] < 0.5 * e_was[0] && e_now[1] < 0.5 * e_was[1]);
                 ++i;
             }
         }},
