@@ -84,6 +84,7 @@ struct State {
     bool trace_parity_skipped = false;
     std::atomic<uint64_t> trial_sample_ticket{0};
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
+    const void* trial_source = nullptr;
     TrialSample trial_sample;
     uint64_t solo_screens = 0;
     uint32_t token = 0, next_token = 0;
@@ -98,6 +99,7 @@ struct State {
     shadow::Placement observed_alternate;
     shadow::RecentSamples recent;
     TileLocations tile_locations;
+    TileLocations sampled_locations;
     shadow::Context tile_context;
     const void* tile_source = nullptr;
     shadow::Context preview_context;
@@ -379,7 +381,8 @@ void collect_sample()
         layout = RegisterScreenTiles(samples, padded, g.padded_layouts, scaled_matches);
         const float* screen_tiles = layout ? padded + (layout - 1) * kTileFloats : nullptr;
         const bool comparable = g.scaled_tiles || scaled_matches || layout != 0;
-        score = na::referee::Score({samples, g.done_screen, comparable, g.done_pair, g.done_jitter_change, screen_tiles});
+        const Sample observations{samples, g.done_screen, comparable, g.done_pair, g.done_jitter_change, screen_tiles};
+        score = na::referee::Score(observations);
         if (g.trace_pair && (!g.padded_layouts || layout)) {
             if (g.adjacent)
                 transition = LocateTransition(samples + kTraceOffset, samples + BlockOffset(kThumbInput),
@@ -387,20 +390,23 @@ void collect_sample()
             if (g.trial_adjacent) {
                 const float* screen = g.padded_layouts ? samples + kTraceOffset + 3 * kThumbFloats : samples + BlockOffset(kThumbScreen);
                 trial_valid = MeasureTrialScreen(samples + kTraceOffset + 2 * kThumbFloats, screen, trial);
+                trial.comparable = trial_valid;
                 trial.ordinal = g.main_ordinal;
                 trial.configuration = g.captured_context.trial_configuration;
                 trial.width = uint32_t(g.img[kScreen].desc.Width);
                 trial.height = g.img[kScreen].desc.Height;
                 trial.layout = layout;
-                const auto vote = shadow::VoteScreen(score);
+                const auto vote = shadow::DistinguishTrialOutput(score, observations,
+                    uint32_t(g.img[kInput].desc.Width), g.img[kInput].desc.Height, g.sampled_locations);
                 trial.bypassed = vote == shadow::ScreenVote::Input;
-                trial.delivered = vote == shadow::ScreenVote::Output || (!trial.bypassed &&
-                    g.captured_context.native_screen_proof && score.picture_output >= Params{}.picture_match);
+                trial.delivered = vote == shadow::ScreenVote::Output;
             }
         }
         // VARIANT: referee/shared-texture-probes
-        relocate = g.done_tiles && score.tiles_textured < kTiles / 2;
-        if (relocate) suggested_tiles = FindTexturedTiles(samples);
+        const bool ambiguous = g.done_tiles && score.tiles_textured >= kTiles / 2 &&
+            score.tiles_input + score.tiles_output < 2 && !trial.delivered && !trial.bypassed;
+        relocate = g.done_tiles && (score.tiles_textured < kTiles / 2 || ambiguous);
+        if (relocate) suggested_tiles = FindTexturedTiles(samples, ambiguous, g.sampled_locations);
         bool keep_receipt;
         {
             std::lock_guard<std::mutex> lock(g.m);
@@ -420,8 +426,9 @@ void collect_sample()
             ++g.stats.trial_pairs;
             if (trial_valid) ++g.stats.trial_comparable;
         }
-        if ((trial_valid || trial.bypassed) && enabled() && g.preview_exact && !g.invalidated) {
+        if (trial.ordinal && enabled() && g.preview_exact && !g.invalidated) {
             g.trial_sample = trial;
+            g.trial_source = g.swapchain;
             g.trial_last_ticket = g.captured_context.trial_ticket;
             g.trial_sample_ticket.store(g.trial_last_ticket, std::memory_order_release);
             g.trial_last_ordinal = trial.ordinal;
@@ -652,6 +659,8 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
         g.img[kPrevOutput].desc.Format == g.img[kOutput].desc.Format &&
         g.img[kPrevScreen].desc.Width == sw && g.img[kPrevScreen].desc.Height == shh &&
         g.img[kPrevScreen].desc.Format == g.img[kScreen].desc.Format;
+    g.sampled_locations = g.swapchain == g.tile_source && g.captured_context.SameTemporalSequence(g.tile_context)
+        ? g.tile_locations : TileLocations{};
     for (int i = 0; screen && i < 3; ++i) {
         k = {};
         k.src = thumbs[i];
@@ -659,7 +668,7 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
         k.base = BlockOffset(thumb_blocks[i]);
         run(g.thumb.Get(), k, (kThumbW + 7) / 8, (kThumbH + 7) / 8);
         if (tiles) {
-            if (g.swapchain == g.tile_source && g.captured_context == g.tile_context) k.locations = g.tile_locations;
+            k.locations = g.sampled_locations;
             k.base = BlockOffset(tile_blocks[i]);
             k.mw = (std::min)(iw, sw);
             k.mh = (std::min)(ih, shh);
@@ -832,7 +841,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
         g.pre_accepted = g.pre_trace_screen = false;
         // Limit the additional texture copies to native-resolution pairs.
         g.pre_trace_output = trace_due && ensure(kPrevOutput, e.output, ow, oh);
-        if (trace_due) g.trace_next_at = now + (e.context.trial_ticket ? 400 : 750);
+        if (trace_due) g.trace_next_at = now + (e.context.trial_ticket && !RouteTrial::WatchTicket(e.context.trial_ticket) ? 400 : 750);
         if (g.pre_trace_output) copy(l, kPrevOutput, e.output, e.output_state);
         g.captured_context = e.context;
         g.pre_ordinal = e.present_ordinal;
@@ -1017,6 +1026,7 @@ void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* pr
     if ((queue != g.pre_queue.Get() && !completed(g.pre_fence.Get(), g.pre_value)) ||
         (queue != g.main_queue.Get() && !completed(g.main_fence.Get(), g.main_value))) return;
     if ((!screen || !presented) && !g.have_motion) { retire(); return; }
+    if (!frame.await_result) g.trial_adjacent = false;
     g.preview_exact = screen;
     g.awaiting_result = screen && frame.await_result;
     const auto& current = g.captured_context;
@@ -1081,6 +1091,11 @@ bool TakeTrialSample(uint64_t ticket, TrialSample& sample)
 void InvalidatePresentation(const void* swapchain)
 {
     std::lock_guard<std::mutex> lock(g.m);
+    if (g.trial_source == swapchain) {
+        g.trial_source = nullptr;
+        g.trial_last_ticket = g.trial_last_ordinal = 0;
+        g.trial_sample_ticket.store(0, std::memory_order_release);
+    }
     for (auto& p : g.pending_presents) if (p.swapchain == swapchain) p = {};
     g.pending_receipt.store(std::any_of(g.pending_presents.begin(), g.pending_presents.end(),
         [](const Presentation& p) { return p.swapchain != nullptr; }), std::memory_order_release);

@@ -52,15 +52,25 @@ function Get-RefereeSummary([string[]] $Lines) {
     $layerOrder = Get-Native11LayerOrderFinding $Lines
     $windows = @($Lines | Where-Object { $_ -match '(^|\s)referee\s+samples=\d+' })
     $states = @($Lines | Where-Object { $_ -match '(^|\s)referee_state\s' })
+    $coverage = $Lines | Where-Object { $_ -match '(^|\s)referee_coverage\s' } | Select-Object -Last 1
     $roles = @($Lines | Where-Object { $_ -match '\bnative11_lit_role frame=\d+ role_deliveries=(\d+) scene_stream=\d+' })
     $traces = @($Lines | Where-Object { $_ -match '\breferee_trace\s+frames=\d+,\d+ first_stage=(input|reconstruction|composition) ' })
     $trials = @($Lines | Where-Object { $_ -match '\bnative11_route_trial next_frame=\d+ phase=' })
-    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials) {
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
     }
     $out.Add('Referee screen and delivery checks')
+    if ($coverage) {
+        foreach ($api in 'dx11','dx12') {
+            $seen = if ($api -eq 'dx11') { 'dx11_presents' } else { 'dx12_scene' }
+            if ($coverage -match "\b$seen=(\d+)" -and ($eligible = [long]$Matches[1]) -gt 0 -and
+                $coverage -match "\b${api}_submitted=(\d+)") {
+                $out.Add("  $($api.ToUpperInvariant()) submitted DLAA on $($Matches[1]) of $eligible eligible frames at the last checkpoint.")
+            }
+        }
+    }
     if ($traces) {
         $stages = $traces | ForEach-Object { if ($_ -match '\bfirst_stage=(\w+)') { $Matches[1] } } | Group-Object
         $out.Add('  Local flicker first measured at ' + (($stages | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join ', '))

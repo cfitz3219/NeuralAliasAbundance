@@ -25,6 +25,9 @@ Check 'additional plausible target' ($alternating | ForEach-Object { $_ + ' [oth
 Check 'other extent' ($alternating -replace 'last_read=2399 float=1 same_size=1','last_read=2399 float=1 same_size=0') $false
 Check 'scene rule changes' ($alternating[0..3] + ($alternating[4..7] -replace 'rule=after-layers ', 'rule=after-layers-second-depth ')) $false
 Write-Output 'Referee layer-order summary passed all eight cases.'
+$coverage = @(Get-RefereeSummary @('event referee_coverage dx12_scene=90 dx12_submitted=0 dx11_presents=25 dx11_submitted=22'))
+if (($coverage -like '*not running*') -or -not ($coverage -like '*DX12 submitted DLAA on 0 of 90*') -or
+    -not ($coverage -like '*DX11 submitted DLAA on 22 of 25*')) { throw 'Lost coverage before first qualified image' }
 $active = @(Get-RefereeSummary @('event native11_lit_role frame=200 role_deliveries=64 scene_stream=4'))
 if (-not ($active -like '*at least 64 submissions*') -or ($active -like '*not running*')) { throw 'Missing observed lighting-route delivery' }
 $unproven = @(Get-RefereeSummary @('event native11_lit_role frame=201 reader=adaptive_candidate_mid_scene'))

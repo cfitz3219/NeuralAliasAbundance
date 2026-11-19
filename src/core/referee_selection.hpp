@@ -89,6 +89,47 @@ inline ScreenVote VoteScreen(const SampleScore& score)
     return ScreenVote::Unknown;
 }
 
+// A mild reconstruction can preserve the same edges as its input. Look at
+// registered pixels where the two actually differ. A close match to both,
+// mixed ownership or a later tone curve outside tolerance is inconclusive.
+inline ScreenVote DistinguishTrialOutput(const SampleScore& score, const Sample& s,
+                                         uint32_t width, uint32_t height, const TileLocations& locations)
+{
+    const auto vote = VoteScreen(score);
+    if (vote != ScreenVote::Unknown || !s.data || !s.have_screen || !s.tiles_comparable ||
+        (score.tiles_input && score.tiles_output)) return vote;
+    const float* input = s.data + BlockOffset(kTileInput);
+    const float* output = s.data + BlockOffset(kTileOutput);
+    const float* screen = s.registered_screen_tiles ? s.registered_screen_tiles : s.data + BlockOffset(kTileScreen);
+    unsigned input_tiles = 0, output_tiles = 0;
+    for (unsigned tile = 0; tile < kTiles; ++tile) {
+        unsigned different = 0, at_input = 0, at_output = 0;
+        for (unsigned j = 0; j < kTile*kTile; ++j) {
+            const unsigned i = tile*kTile*kTile + j;
+            const float gap = std::fabs(input[i] - output[i]);
+            if (!std::isfinite(gap) || gap < .05f) continue;
+            ++different;
+            const float tolerance = (std::min)(.04f, .25f * gap);
+            at_input += std::fabs(screen[i] - input[i]) <= tolerance;
+            at_output += std::fabs(screen[i] - output[i]) <= tolerance;
+        }
+        if (different < 16) continue;
+        if (at_input * 4 >= different * 3) input_tiles |= 1u << tile;
+        if (at_output * 4 >= different * 3) output_tiles |= 1u << tile;
+    }
+    const auto independent = [&](unsigned votes) {
+        for (unsigned i = 0; i < kTiles; ++i) if (votes & (1u << i))
+            for (unsigned j = 0; j < i; ++j) if (votes & (1u << j)) {
+                if (std::abs(TileLeft(i, width, locations) - TileLeft(j, width, locations)) >= int(kTile) ||
+                    std::abs(TileTop(i, height, locations) - TileTop(j, height, locations)) >= int(kTile)) return true;
+            }
+        return false;
+    };
+    if (!input_tiles && !score.tiles_input && independent(output_tiles)) return ScreenVote::Output;
+    if (!output_tiles && !score.tiles_output && independent(input_tiles)) return ScreenVote::Input;
+    return ScreenVote::Unknown;
+}
+
 struct Evidence {
     Context context;
     Window measured;

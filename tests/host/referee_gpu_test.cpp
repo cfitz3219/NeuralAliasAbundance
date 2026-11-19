@@ -111,6 +111,7 @@ struct TracePair {
     ID3D12Resource* before_screen;
     bool accept = true;
     uint64_t ticket = 0, configuration = 0;
+    bool returned_present = true;
 };
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
@@ -181,9 +182,9 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     CHECK(!rg::NeedsScreen({ordinal, &l}));
     if (late && !blocked) ordinal += 7;
     rg::Presentation current{ordinal, &d, true, true, native11};
-    if (trace) current.await_result = true;
+    if (trace) current.await_result = trace->returned_present;
     rg::OnPresent(current, d.queue.Get(), im.screen, Execute);
-    if (trace) {
+    if (trace && trace->returned_present) {
         d.WaitIdle();
         rg::PresentResult(&l, ordinal, true); // a different chain cannot sign for this scene
         rg::PresentResult(&d, ordinal + 1, true); // nor a different frame
@@ -627,6 +628,25 @@ int main()
         using namespace na::referee;
         TrialSample measured;
         CHECK(!rg::TakeTrialSample(rejected.ticket, measured));
+        // Even with an independently proved reader, identical input and
+        // output pixels give no evidence about which reached the screen.
+        TracePair identical{t_output.Get(), t_screen.Get(), true, 2051, 70};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {unlit_in.Get(), unlit_in.Get(), t_output.Get(), nullptr, t_screen.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 9991, false, &identical));
+        REQUIRE(rg::TakeTrialSample(identical.ticket, measured));
+        CHECK(!measured.delivered && !measured.bypassed);
+        TracePair unacknowledged{t_output.Get(), t_screen.Get(), true, 2059, 70, false};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, t_screen.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 9992, false, &unacknowledged));
+        CHECK(!rg::TakeTrialSample(unacknowledged.ticket, measured));
+        TracePair resized{t_output.Get(), t_screen.Get(), true, 2067, 70};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, t_screen.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 9993, false, &resized));
+        rg::InvalidatePresentation(&d);
+        CHECK(!rg::TakeTrialSample(resized.ticket, measured));
         // The test reflector alternates about one stop. The alternative either
         // removes it, delivers the same artifact, or puts the input on screen.
         for (unsigned mode = 0; mode < 3; ++mode) {
@@ -660,6 +680,23 @@ int main()
             std::printf("screen trial case %u: %s stops %.3f/%.3f/%.3f (%s)\n", mode, trial.Name(),
                         trial.Baseline(), trial.Candidate(), trial.Confirmation(), trial.Reason());
             CHECK(trial.Current() == (mode == 0 ? Phase::Kept : Phase::Rejected));
+            if (mode == 0) {
+                ordinal += RouteTrial::warmup_frames + 1;
+                const auto watch = trial.Ticket(ordinal);
+                REQUIRE(watch);
+                for (unsigned i = 0; i < 4; ++i) {
+                    const bool reverse = i % 2 != 0;
+                    TracePair trace{reverse ? lit_out.Get() : t_output.Get(),
+                                    reverse ? lit_display.Get() : t_screen.Get(), true, watch, 70};
+                    Sleep(150);
+                    REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), reverse ? t_output.Get() : lit_out.Get(),
+                                       nullptr, reverse ? t_screen.Get() : lit_display.Get()}, got,
+                                       false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+                    REQUIRE(rg::TakeTrialSample(watch, measured));
+                    trial.Add(watch, measured, ordinal + 1);
+                }
+                CHECK(trial.Current() == Phase::Rejected && !trial.UsesCandidate());
+            }
         }
     }
     Sleep(150);

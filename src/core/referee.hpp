@@ -400,15 +400,16 @@ inline SampleScore Score(const Sample& s, const Params& p = Params())
 // ---------------------------------------------------------------------------------------------
 // Relocate empty probes using the thumbnails already read back. Choose shared scene and
 // screen detail in each of eight regions. Never use which candidate won to choose a location.
-inline TileLocations FindTexturedTiles(const float* data)
+inline TileLocations FindTexturedTiles(const float* data, bool distinguish = false, TileLocations loc = {})
 {
-    TileLocations loc;
     const float* input = data + BlockOffset(kThumbInput);
+    const float* output = data + BlockOffset(kThumbOutput);
     const float* screen = data + BlockOffset(kThumbScreen);
     auto texture = [](const float* q) {
         return std::fabs(q[1] - q[-1]) + std::fabs(q[kThumbW] - q[-int(kThumbW)]);
     };
     for (uint32_t k = 0; k < kTiles; ++k) {
+        if (distinguish && !((k + k / 4) & 1u)) continue;
         const uint32_t x0 = k % 4 * (kThumbW / 4), y0 = k / 4 * (kThumbH / 2);
         float best = 0;
         for (uint32_t y = y0 + 3; y + 3 < y0 + kThumbH / 2; y += 2)
@@ -418,7 +419,13 @@ inline TileLocations FindTexturedTiles(const float* data)
                 for (int dy : {-1, 1}) for (int dx : {-1, 1}) {
                     const int i = int(centre) + dy * int(kThumbW) + dx;
                     const float a = texture(input + i), b = texture(screen + i);
-                    if (std::isfinite(a) && std::isfinite(b)) strength += (std::min)(a, b);
+                    if (!std::isfinite(a) || !std::isfinite(b)) continue;
+                    // Where equally textured inputs make attribution ambiguous,
+                    // spend half the probes on regions which can tell them apart.
+                    // Select symmetrically from the two source images, without
+                    // consulting which one won the comparison at the screen.
+                    const float weight = distinguish ? std::fabs(a - texture(output + i)) : 1.f;
+                    strength += (std::min)(a, b) * weight;
                 }
                 if (strength > best) { best = strength; loc.cell[k] = centre + 1; }
             }

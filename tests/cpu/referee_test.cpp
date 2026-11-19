@@ -365,6 +365,29 @@ int main()
         char buf[2048];
         check(Format(buf, sizeof buf, w, Judge(w)) > 0 && std::strstr(buf, "picture{verdict=pass") != nullptr, "the log line names the verdicts");
     }
+    { // Highly textured but identical patches cannot distinguish a route.
+        std::vector<float> data(kResultFloats);
+        float* in = data.data() + BlockOffset(kThumbInput);
+        float* out = data.data() + BlockOffset(kThumbOutput);
+        float* shown = data.data() + BlockOffset(kThumbScreen);
+        for (unsigned y = 0; y < kThumbH; ++y) for (unsigned x = 0; x < kThumbW; ++x) {
+            const unsigned i = y * kThumbW + x;
+            const auto u = x % 32, v = y % 36;
+            const float stripe = (x & 2) ? 1.f : -1.f;
+            in[i] = (u < 13 ? 1.f : .2f) * stripe;
+            out[i] = (u >= 20 && u <= 27 && v >= 18 && v <= 27) ? in[i] * .3f : in[i];
+            shown[i] = in[i];
+        }
+        const auto ordinary = FindTexturedTiles(data.data());
+        const auto adaptive = FindTexturedTiles(data.data(), true, ordinary);
+        unsigned witnesses = 0, controls = 0;
+        for (unsigned k = 0; k < kTiles; ++k) {
+            const unsigned p = adaptive.cell[k] - 1;
+            if (adaptive.cell[k] == ordinary.cell[k]) ++controls;
+            if (p < kThumbFloats && std::fabs(in[p] - out[p]) > .05f) ++witnesses;
+        }
+        check(witnesses == 4 && controls == 4, "ambiguous textured views: four probes find distinguishing detail and four retain independent coverage");
+    }
     {
         using Phase = RouteTrial::Phase;
         constexpr unsigned region = 18;
@@ -402,14 +425,26 @@ int main()
                 trial.Tick(100 + RouteTrial::maximum_ms, true);
             }
             if (changed) {
-                check(trial.Current() == Phase::Candidate, "trial: a different configuration is excluded");
+                check(trial.Current() == Phase::Rejected, "trial: changing settings immediately returns the ordinary route");
                 trial.Tick(100 + RouteTrial::maximum_ms, true);
             }
             check(trial.Current() == expected, trial.Reason());
             check(trial.UsesCandidate() == (expected == Phase::Kept), "trial: failed comparison falls back");
             if (expected == Phase::Kept) {
+                auto monitored = trial;
+                window(.24f);
+                check(trial.Current() == Phase::Rejected && !trial.UsesCandidate(),
+                      "trial: the same flicker returning after approval restores the ordinary route");
+                trial = monitored;
+                window(0.f, true, 2);
+                check(trial.Current() == Phase::Rejected && !trial.UsesCandidate(),
+                      "trial: approval cannot leak into new settings");
+                trial = monitored;
+                window(0.f);
+                check(trial.Current() == Phase::Kept, "trial: a quiet verified winner stays in use");
                 trial.Tick(110, false);
                 check(trial.Current() == Phase::Rejected && !trial.UsesCandidate(), "trial: withdraw when a proved reader is lost");
+                check(trial.CanStart(8100 + 11), "trial: temporary loss can qualify again in the same scene");
             }
         };
         exercise(.07f, .24f, false, false, .05f, Phase::Kept);

@@ -13,6 +13,7 @@ struct TrialSample {
     std::array<Change, FlickerTransition::count> change{};
     std::array<float, FlickerTransition::count> image{};
     bool delivered = false, bypassed = false;
+    bool comparable = true;
 };
 
 inline float TrialMagnitude(const TrialSample::Change& region)
@@ -77,7 +78,10 @@ public:
 
     void Start(uint64_t id, uint64_t frame, uint64_t now)
     {
+        const auto delay = retry_delay_;
         *this = {};
+        retry_delay_ = delay;
+        now_ = now;
         id_ = id;
         expires_ = now + maximum_ms;
         Next(Phase::Baseline, frame);
@@ -92,28 +96,65 @@ public:
     bool UsesCandidate() const { return phase_ == Phase::Candidate || phase_ == Phase::Kept; }
     bool CanStart(uint64_t now) const
     {
-        return phase_ == Phase::Idle || (phase_ == Phase::Rejected && !baseline_ && now >= expires_ + 8000);
+        return phase_ == Phase::Idle || (phase_ == Phase::Rejected && retry_at_ && now >= retry_at_);
+    }
+    static bool WatchTicket(uint64_t ticket)
+    {
+        const auto phase = static_cast<Phase>(ticket & 7u);
+        return phase == Phase::Kept || phase == Phase::Rejected;
     }
     uint64_t Ticket(uint64_t frame) const
     {
-        return Active() && frame >= measured_from_ ? (id_ << 3) | static_cast<uint8_t>(phase_) : 0;
+        const bool watch = phase_ == Phase::Kept || (phase_ == Phase::Rejected && !retry_at_ && baseline_);
+        return (Active() || watch) && frame >= measured_from_ ? (id_ << 3) | static_cast<uint8_t>(phase_) : 0;
     }
     void Tick(uint64_t now, bool available)
     {
-        if ((phase_ == Phase::Candidate || phase_ == Phase::Kept) && !available) Reject("replacement lost its screen route");
-        if (Active() && now >= expires_) Reject("timed out without comparable presented evidence");
+        now_ = now;
+        if (UsesCandidate() && !available) Retry("replacement lost its screen route");
+        if (Active() && now >= expires_) Retry("timed out without comparable presented evidence");
     }
     void Add(uint64_t ticket, const TrialSample& sample, uint64_t next_frame)
     {
-        if (!ticket || ticket != Ticket(sample.ordinal) || (count_ && sample.ordinal <= window_[count_ - 1].ordinal)) return;
-        if (sample.bypassed && phase_ == Phase::Candidate) Reject("replacement lost visible delivery");
-        if (!Active() || (phase_ == Phase::Candidate && !sample.delivered)) return;
+        if (!ticket || ticket != Ticket(sample.ordinal) || sample.ordinal <= last_ordinal_) return;
+        last_ordinal_ = sample.ordinal;
+        if (baseline_ && !SameSetup(anchor_, sample)) {
+            Retry("the display layout or evaluation settings changed");
+            return;
+        }
+        if (phase_ == Phase::Rejected) return;
+        if (UsesCandidate() && sample.bypassed) {
+            Reject("replacement lost visible delivery");
+            return;
+        }
+        if (!sample.comparable || (UsesCandidate() && !sample.delivered)) {
+            watch_same_ = watch_opposite_ = 0;
+            return;
+        }
         const auto finite = [](float v) { return std::isfinite(v); };
         if (!std::all_of(sample.change.begin(), sample.change.end(), [&](const auto& region) {
                 return std::all_of(region.begin(), region.end(), finite);
             }) ||
             !std::all_of(sample.image.begin(), sample.image.end(), finite)) return;
-        if (phase_ != Phase::Baseline && !SameView(anchor_, sample)) return;
+        if (phase_ != Phase::Baseline && !SameView(anchor_, sample)) {
+            watch_same_ = watch_opposite_ = 0;
+            return;
+        }
+        if (phase_ == Phase::Kept) {
+            // Keep ordinary sampling cadence after a win. Two reversals in each
+            // direction at the original severity reopen discovery. A single
+            // highlight or a different view cannot displace a working route.
+            if (now_ - watch_at_ > maximum_ms) watch_same_ = watch_opposite_ = 0;
+            watch_at_ = now_;
+            const auto& change = sample.change[region_];
+            const bool strong = !ImprovesWith(TrialMagnitude(change), (std::min)(baseline_, confirmation_));
+            const int direction = strong ? TrialDirection(anchor_.change[region_], change) : 0;
+            watch_same_ = uint8_t((watch_same_ << 1) | (direction > 0));
+            watch_opposite_ = uint8_t((watch_opposite_ << 1) | (direction < 0));
+            if ((watch_same_ & (watch_same_ - 1)) && (watch_opposite_ & (watch_opposite_ - 1)))
+                Retry("the measured flicker returned on the replacement");
+            return;
+        }
         window_[count_++] = sample;
         if (count_ < samples) return;
         if (phase_ == Phase::Baseline || phase_ == Phase::ConfirmBaseline) {
@@ -151,7 +192,8 @@ public:
                     Reject("the original flicker did not return consistently");
                     return;
                 }
-                phase_ = Phase::Kept;
+                Next(Phase::Kept, next_frame);
+                retry_delay_ = 8000;
                 reason_ = "the replacement reduced flicker against both ordinary-route measurements";
             }
         } else if (phase_ == Phase::Candidate) {
@@ -176,7 +218,17 @@ private:
         measured_from_ = frame + warmup_frames;
     }
     void Reject(const char* reason) { phase_ = Phase::Rejected; reason_ = reason; }
-    bool Improves(float value) const { return replacement_ <= value * .70f && value - replacement_ >= .04f; }
+    void Retry(const char* reason)
+    {
+        Reject(reason);
+        retry_at_ = now_ + retry_delay_;
+        retry_delay_ = (std::min)(retry_delay_ * 2, uint64_t{60000});
+    }
+    static bool ImprovesWith(float replacement, float ordinary)
+    {
+        return replacement <= ordinary * .70f && ordinary - replacement >= .04f;
+    }
+    bool Improves(float value) const { return ImprovesWith(replacement_, value); }
     float Repeated(uint32_t region, const TrialSample* prior_pattern, const TrialSample*& pattern) const
     {
         // Two samples must move the same pixels one way, and two the
@@ -197,11 +249,14 @@ private:
         }
         return (std::min)(same[1], opposite[1]);
     }
+    static bool SameSetup(const TrialSample& a, const TrialSample& b)
+    {
+        return a.width == b.width && a.height == b.height && a.layout == b.layout && a.configuration == b.configuration;
+    }
     bool SameView(const TrialSample& a, const TrialSample& b) const
     {
-        if (a.width != b.width || a.height != b.height || a.layout != b.layout ||
-            a.configuration != b.configuration) return false;
-        if (phase_ == Phase::Candidate && std::fabs(a.image[region_] - b.image[region_]) > .08f + .6f * baseline_)
+        if (!SameSetup(a, b)) return false;
+        if (UsesCandidate() && std::fabs(a.image[region_] - b.image[region_]) > .08f + .6f * baseline_)
             return false;
         float change = 0;
         unsigned count = 0;
@@ -216,6 +271,8 @@ private:
     }
     Phase phase_ = Phase::Idle;
     uint64_t id_ = 0, expires_ = 0, measured_from_ = 0;
+    uint64_t now_ = 0, retry_at_ = 0, retry_delay_ = 8000, last_ordinal_ = 0, watch_at_ = 0;
+    uint8_t watch_same_ = 0, watch_opposite_ = 0;
     uint32_t region_ = 0;
     unsigned count_ = 0;
     float baseline_ = 0, replacement_ = 0, confirmation_ = 0;

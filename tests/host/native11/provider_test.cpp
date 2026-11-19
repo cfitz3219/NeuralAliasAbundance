@@ -1202,6 +1202,20 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                    "the actual provider keeps the improved screen-proved route");
             expect(fixed.changed > 100 && fixed.reached * 100 >= fixed.changed * 98 && new_delta < old_delta * .25,
                    "real NGX reaches the screen and the reflected light stops flickering");
+            auto& sharpness = na::settings::Get().j2_sharpness;
+            const auto previous_sharpness = sharpness.load();
+            sharpness.store(previous_sharpness ? 0 : 1);
+            const auto changed_until = GetTickCount64() + 4000;
+            while (GetTickCount64() < changed_until) {
+                if (!record(i++, true, nullptr)) return 1;
+                Sleep(7);
+            }
+            Sample after_change;
+            for (int j = 0; j < 28; ++j) if (!record(i++, true, &after_change)) return 1;
+            sharpness.store(previous_sharpness);
+            std::printf("after settings change: ordinary delivered=%d/28 later reader=%d/28\n", after_change.evaluated, after_change.correct);
+            expect(after_change.evaluated == 28 && after_change.correct == baseline.correct,
+                   "settings change restores the ordinary route and preserves DLAA on every test frame");
             na::native11::Uninstall();
             return g_failed ? 1 : 0;
         }

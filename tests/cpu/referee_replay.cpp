@@ -146,8 +146,9 @@ int main()
         if (layouts && VoteScreen(score) == ScreenVote::Output) ++selected_output_votes;
         recent.Add(context, ordinal, score);
         all_frames.Add(score);
-        if ((tiles || layouts) && score.tiles_textured < kTiles / 2) {
-            locations = FindTexturedTiles(values.data());
+        const bool ambiguous = score.tiles_textured >= kTiles / 2 && score.tiles_input + score.tiles_output < 2;
+        if ((tiles || layouts) && (score.tiles_textured < kTiles / 2 || ambiguous)) {
+            locations = FindTexturedTiles(values.data(), ambiguous, active_tiles);
             tile_context = context;
         }
         previous_context = context;
