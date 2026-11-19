@@ -284,3 +284,18 @@ Built only `dlss_capture_replay` in `build-referee2` (24 s, mask 00FF33CC, no WH
 - **Qualifies my reading:** (1) M moves too: M-captured against M-farzero 0.108 (233659) and 0.150 (233713); K moves only 1.1 to 1.4 times more than M under the same motion, which is not Cort's "subsides on M". (2) The motion-driven field is about twice as large on the 2e062ef captures as on 024339 although round 11 found similar per-pair false translation.
 
 Not claimed to Cort as the whole cause. Round 14 (running, no build): same-parity subsequences of the zero-motion both-parity replays, to see whether the alternating far layer alone gives K a slow field and M none; M one-parity replays; regression of the output field on accumulated non-uniform handed motion per capture; fine-detail level and jitter phases of each run.
+
+### 2026-11-19 09:55Z — Fable -> Astra, Sol — RESULT: rounds 14 and 15; the K waves over the fortress are accounted for end to end (replays, no game run)
+
+Files `round14.txt`, `round15.txt`, `round15-pairs.csv` in `Documents\NA-strobe-7933efc\sow-2e062ef-sway`; 34 replays, 2.52 GB under `replay\` (Cort may remove the folder). No build beyond the replay tool, nothing packaged.
+
+**Chain, each link measured:**
+1. On the character screen the orc (26 to 30% of the picture, over half the fit's samples) moves by itself and non-rigidly. How fast it moves predicts the NON-UNIFORM false motion our camera-off screen fit hands the still fortress: r 0.89 per pair (n 70), 0.93 on capture means (n 9, three builds). Far-field measurability and noise predict nothing (r -0.25, -0.02).
+2. **K adds that false motion up over its whole history:** output field (replay with handed motion against replay with background motion zeroed, one parity) regressed on accumulated non-uniform handed motion: slope 0.83, r 0.93 on 233659; 0.75, r 0.84 on 024339 (5ebf86a). Coherent at 24 px (0.87): a broad slow wave. **M follows at slope 0.5 with a 2-step memory** and coherence 0.47. That is "waves on K, subsides on M".
+3. Remove the background's handed motion and K's one-parity output is still to the tracker floor (0.035 to 0.060 px; 77 to 86% removed).
+4. **Newer against older:** same slope and memory on 2e062ef and 5ebf86a; the 2e062ef captures were handed 1.8 to 2.6 times more non-uniform false motion and the output ratio is 1.8. The reason is the orc's motion in those frames (p95 0.63 to 2.58 px/frame against 0.56). 37247cf's fast-orc capture 015408 bends the fit as much as 233533. Build term after orc p95: +0.011 px, se 0.018, not distinguishable from zero; a settings effect (R2, mip bias -1.585, AF 16) of up to about 0.03 px per step cannot be excluded from nine captures. So the mechanism is in all three builds; PR 168 did not add it.
+5. **The alternating far layer alone (fault 2)** with no motion and both parities gives same-parity wander 0.10 to 0.14 on K and 0.14 to 0.23 on M, low coherence (0.15 to 0.26), plus a frame-to-frame output difference of 0.12 to 0.23 (K) and 0.10 to 0.17 (M). Not a broad wave, and no worse on K than on M. Astra: it is real and yours, but it is not what Cort described.
+
+**Does not fit:** 233533 (fast orc, large oscillating translation) fits the accumulation model poorly (R2 0.20), though zeroing the background motion still removes 86% there. M has a slow creep of its own (0.15 to 0.17 px) with no far motion.
+
+**Correction in my lane (not written yet, no build without Cort's word):** the screen fit must not let a large near thing that moves by itself decide the far field: the far terms and the near-depth terms trade off today. General, keeps K, no game defaults. I will bring the design and a processor fixture (still far field, large non-rigid near mover) before touching the runtime.
