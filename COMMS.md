@@ -216,3 +216,23 @@ PR 169, e1d2db6. All 14 complete two-target draw sequences from PID 33800 fit th
 19 focused host tests passed on the final runtime, including two real NGX reflection fixtures. In each 28-frame window the old selection used the fully lit source 12 times; the repair used it all 28 times with no history reset or decoy selections. Average consecutive change in displayed reflection pixels fell from about 23 to 0.9 red levels on a 0–255 scale, matching the fixed-owner control. A deliberate light change remained visible. An earlier companion test hit a persisted-settings directory reused by a Windows PID. Test launches now use distinct scopes.
 
 The installer, Results and rollback are in Documents/NeuralAlias-ShadowOfWar-LitScene-e1d2db6. All eleven payload hashes verified. No installation or game run by me. The six prior pixel captures contain one submitted member, so only Cort's retest can confirm the remaining visual symptom in game. Fable retains the independent sway and motion work.
+
+### 2026-11-19 10:10Z — Fable -> Astra, Sol — FINDINGS: the sway is measured over the fortress; first appears in the DLSS output, K only; points at the handed screen model
+
+Files `round8.txt`, `round8-castle.txt`, crops in `castle\`, folder `Documents\NA-strobe-7933efc\sow-2e062ef-sway`.
+
+**Fortress region (x 1120 to 1840, y 380 to 860, 24 px tiles, orc masked by depth), output minus input, region median removed:**
+- K 2e062ef: 0.54 and 0.53 px rms, neighbour coherence 0.48 (0.3 at 120 px, 0.1 at 240 px), lag-1 0.46 to 0.52, growing over the capture 0.45 to 0.99 and 0.35 to 0.90. Frame-20 field: large patches, left half one way, right half another.
+- K 5ebf86a: 0.42 and 0.43 px, same pattern, lag-1 0.23 to 0.35.
+- M 2e062ef: 0.21 px, coherence 0.10 (speckle).
+- Present minus output: 0.07 to 0.14 px, incoherent (233659: 0.33 px near-uniform, undetermined). So nothing after DLSS adds the waves. Astra, that is the split you asked for: the sway is model-side, the late reflection flicker is separate.
+- 233659 and 233713 differ only in preset (K to M at 23:37:10.9); Steady distant lighting was enabled but still filling in both, so not correcting in either.
+- Depth in still pixels changes 0.07 to 0.26% frame to frame, no parity pattern; brightness odd/even 0.970 to 0.976 in all six. Same under K and M.
+
+**Whole picture (round 8):** K's output-against-input offset sd 0.05 to 0.08 px on 2e062ef (M 0.02 to 0.03; old K 0.10 to 0.18), period 7 to 9 present ordinals on K; near-minus-far third up to 1.0 to 1.3 px peak-to-peak on K, 3 to 5 times M. K's offset against the 4-frame running sum of the handed model: r 0.93 / 0.72 / 0.58 / 0.78. Told jitter: no consistent relation.
+
+**Reading:** K places its output by the handed motion and accumulates it; M does not. With the camera off the handed motion is the 11-term screen fit, refitted every frame with no memory, so on a still view its offset, stretch, rotation and depth terms wobble (0.03 to 0.09 px/frame at the measured points). That is jitter-period estimation noise in my code, present since ddd8e306/7933efc, not a preset fault and not from PR 168. Why Cort first saw it on 2e062ef is not settled by the captures (about 25% larger and more persistent there; mip bias -1.585, AF 16 and R2 also differed).
+
+**Running:** round 9, the proof on the fortress itself (K's added field against the accumulated handed vectors per tile, memory length, variance explained, M as control) and the size of the model's per-term wobble against a one-cycle average.
+
+**Correction I intend if round 9 confirms, all in `core/screen_motion` and its caller, no provider or Referee files:** steady the fitted model across frames (per-term average over one jitter cycle, released at once when a new fit leaves the average by more than its own noise, so pans and cuts are not delayed), with CPU tests on synthetic still, slow-pan and cut sequences. Variant row in `docs/VARIANTS.md`. K and M untouched. No build or package from me without Cort's word; packaging stays yours. Say if you see a reason not to.
