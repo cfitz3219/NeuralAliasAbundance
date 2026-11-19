@@ -2,15 +2,63 @@
 # `referee_state`, `referee_choice` and `referee_coverage` event lines. Dot-source it and call
 # Get-RefereeSummary with the log's lines. No game is named here; any package's results script
 # can use it (deploy-native11.ps1 does, when this file sits beside it).
+# These are completed-frame layer reports, already written by the native provider.
+# A frame may compare two eligible targets without either having screen proof.
+function Get-Native11LayerOrderFinding([string[]] $Lines) {
+    $header = [regex]'\bnative11_scene frame=(\d+) rule=(after-layers(?:-second-depth)?) '
+    $candidate = [regex]'\[(?<role>(?:SELECTED )?(?:picture|other)) fmt=(?<fmt>\d+) draws=\d+ multi=\d+ first=\d+ last=(?<write>\d+) first_read=\d+ read_after=(?<read>\d+) last_read=\d+ float=1 same_size=1\]'
+    $previousFrame = -2L
+    $previousRole = ''
+    $previousGroup = ''
+    $length = 0
+    $longest = 0
+    $last = 0L
+    foreach ($line in $Lines) {
+        if ($line.IndexOf('native11_scene frame=', [StringComparison]::Ordinal) -lt 0) { continue }
+        $record = $header.Match($line)
+        if (!$record.Success) { $length = 0; continue }
+        $frame = [long]$record.Groups[1].Value
+        $pair = $candidate.Matches($line)
+        if ($pair.Count -ne 2) { $length = 0; continue }
+        $picture, $other = $pair[0], $pair[1]
+        if ($picture.Groups['role'].Value.EndsWith('other')) { $picture, $other = $other, $picture }
+        if (!$picture.Groups['role'].Value.EndsWith('picture') -or !$other.Groups['role'].Value.EndsWith('other') -or
+            $other.Groups['fmt'].Value -ne $picture.Groups['fmt'].Value) { $length = 0; continue }
+
+        $earlierWrite = [long]$other.Groups['write'].Value
+        $earlierRead = [long]$other.Groups['read'].Value
+        $laterWrite = [long]$picture.Groups['write'].Value
+        $laterRead = [long]$picture.Groups['read'].Value
+        if (!$earlierWrite -or $earlierWrite -ge $earlierRead -or $earlierRead -ge $laterWrite -or
+            $laterWrite -ge $laterRead) { $length = 0; continue }
+        if ($picture.Groups['role'].Value -eq 'SELECTED picture') { $role = 'later' }
+        elseif ($other.Groups['role'].Value -eq 'SELECTED other') { $role = 'earlier' }
+        else { $length = 0; continue }
+
+        $group = $record.Groups[2].Value + '/' + $picture.Groups['fmt'].Value
+        if ($frame -eq $previousFrame + 1 -and $group -eq $previousGroup -and $role -ne $previousRole) { ++$length }
+        else { $length = 1 }
+        $previousFrame, $previousGroup, $previousRole = $frame, $group, $role
+        if ($length -gt $longest) { $longest, $last = $length, $frame }
+    }
+    if ($longest -ge 8) {
+        $first = $last - $longest + 1
+        return "  DX11 layer order: selection alternated between earlier and later scene-color candidates for $longest consecutive recorded frames ($first-$last). Compare both paths at the screen before attributing flicker to either."
+    }
+}
+
 function Get-RefereeSummary([string[]] $Lines) {
     $out = New-Object System.Collections.Generic.List[string]
+    $layerOrder = Get-Native11LayerOrderFinding $Lines
     $windows = @($Lines | Where-Object { $_ -match '(^|\s)referee\s+samples=\d+' })
     $states = @($Lines | Where-Object { $_ -match '(^|\s)referee_state\s' })
     if (-not $windows -and -not $states) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
+        if ($layerOrder) { $out.Add($layerOrder) }
         return $out
     }
     $out.Add('Referee screen and delivery checks')
+    if ($layerOrder) { $out.Add($layerOrder) }
     $placements = @($Lines | Where-Object { $_ -match '(^|\s)native11_placement\s' })
     if ($placements) {
         $out.Add('  DX11 adaptive placement changes: ' + $placements.Count +
