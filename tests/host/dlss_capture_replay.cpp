@@ -10,6 +10,9 @@
 //
 // What can be changed, one at a time:
 //   --motion captured | zero | far-zero   the motion vectors as saved; none; none beyond --far-depth
+//   --motion-dir DIR                      a saved frame's motion comes from DIR\NNNNN-motion.raw when that
+//                                         file exists (two 32-bit floats a pixel, tight rows, the motion
+//                                         plane's size): motion computed another way for the same frames
 //   --preset 0 | 10..13                   the DLSS model (0 = as captured; 11 K, 13 M)
 //   --parity all | even | odd             every frame, or only those with an even / odd present
 //                                         ordinal (the motion of a skipped frame is added to the next)
@@ -361,7 +364,7 @@ struct Step {
 
 int Usage()
 {
-    std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D]\n"
+    std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D] [--motion-dir DIR]\n"
                 "    [--preset 0|10..13] [--parity all|even|odd] [--first INDEX] [--frames N] [--all] [--preroll N] [--pingpong N]\n"
                 "    [--crop X Y W H]\n");
     return 2;
@@ -372,7 +375,7 @@ int main(int argc, char** argv)
 {
     if (argc < 3) return Usage();
     const std::string capture = argv[1], out_root = argv[2];
-    std::string name = "replay";
+    std::string name = "replay", motion_dir;
     MotionMode mode = MotionMode::Captured;
     const char* mode_name = "captured";
     float far_depth = 0.005f;
@@ -394,6 +397,7 @@ int main(int argc, char** argv)
             else return Usage();
             mode_name = argv[i];
         }
+        else if (a == "--motion-dir" && value) { motion_dir = value; ++i; }
         else if (a == "--far-depth" && value) { far_depth = static_cast<float>(std::strtod(value, nullptr)); ++i; }
         else if (a == "--preset") { if (!number(&preset)) return Usage(); }
         else if (a == "--first") { if (!number(&first)) return Usage(); }
@@ -420,6 +424,7 @@ int main(int argc, char** argv)
     const std::string out_dir = out_root + "\\" + name;
     CreateDirectoryA(out_dir.c_str(), nullptr);
     fopen_s(&g_log, (out_dir + "\\replay.log").c_str(), "wb");
+    if (!motion_dir.empty()) Log("motion planes from %s where present", motion_dir.c_str());
     Log("dlss_capture_replay: capture=%s name=%s motion=%s far_depth=%g preset=%u parity=%s first=%u frames=%u all=%d preroll=%u pingpong=%u",
         capture.c_str(), name.c_str(), mode_name, far_depth, preset, parity < 0 ? "all" : parity ? "odd" : "even", first, max_frames,
         all ? 1 : 0, preroll, pingpong);
@@ -537,7 +542,7 @@ int main(int argc, char** argv)
     std::vector<uint8_t> rows, depth_rows, motion_rows, saved_rows;
     std::vector<float> vectors, sum;
     const size_t pixels = static_cast<size_t>(head.motion.width) * head.motion.height;
-    uint32_t written = 0;
+    uint32_t written = 0, replaced_planes = 0;
     for (size_t si = 0; si < steps.size(); ++si) {
         const Step& s = steps[si];
         const Meta& m = frames[selected[s.frame]];
@@ -549,7 +554,16 @@ int main(int argc, char** argv)
         sum.assign(pixels * 2, 0.0f);
         if (s.direction != 0 && mode != MotionMode::Zero) {
             for (const size_t f : s.motions) {
-                REQUIRE(ReadPlane(capture, frames[f].index, "motion", frames[f].motion, &motion_rows) && MotionToFloat(motion_rows, frames[f].motion.format, &vectors));
+                // A replacement plane when one was given for this frame, else the saved one.
+                bool replaced = false;
+                if (!motion_dir.empty()) {
+                    PlaneInfo given = frames[f].motion;
+                    given.format = 16;
+                    given.row_pitch = given.width * 8;
+                    replaced = ReadPlane(motion_dir, frames[f].index, "motion", given, &motion_rows) && MotionToFloat(motion_rows, 16, &vectors);
+                    if (replaced) ++replaced_planes;
+                }
+                REQUIRE(replaced || (ReadPlane(capture, frames[f].index, "motion", frames[f].motion, &motion_rows) && MotionToFloat(motion_rows, frames[f].motion.format, &vectors)));
                 REQUIRE(vectors.size() == sum.size());
                 const float sign = s.direction < 0 ? -1.0f : 1.0f;
                 for (size_t i = 0; i < sum.size(); ++i) sum[i] += sign * vectors[i];
@@ -665,6 +679,7 @@ int main(int argc, char** argv)
     }
     if (csv) std::fclose(csv);
     const auto st = na::dlss::GetStats();
+    if (!motion_dir.empty()) Log("motion planes taken from the given folder: %u", replaced_planes);
     Log("done: %u outputs written to %s; evaluates=%llu features created=%llu (preset requested %u)", written, out_dir.c_str(),
         static_cast<unsigned long long>(st.evaluates), static_cast<unsigned long long>(st.features_created), st.feature_preset);
     d.WaitIdle();
