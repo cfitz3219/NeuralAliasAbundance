@@ -1338,6 +1338,15 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         na::native11::RejectScreenProof(proof[0]);
         expect(render(1, true) && evaluator.proof == proof[1] && !render(0, true) && !evaluator.proof,
                "a lost screen proof retires only its own draw order");
+#if !defined(NA_TEST_NATIVE_DLAA)
+        bool recovered = false;
+        for (int i = 0; i < 176 && !recovered; ++i) {
+            const bool reached = render(0, true);
+            if (i < 112) expect(!evaluator.proof, "rejected reader stays off during cooldown");
+            recovered = reached && evaluator.proof && evaluator.proof != proof[0];
+        }
+        expect(recovered, "a returning reader can earn a fresh screen proof after cooldown");
+#endif
         std::printf("adaptive DX11 screen: %d/32 alternating, %llu confirmed, %llu rejected, %llu paired\n",
                     alternating, (unsigned long long)discovered.screen_confirmed,
                     (unsigned long long)discovered.screen_refuted, (unsigned long long)discovered.screen_pairs);

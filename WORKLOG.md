@@ -1976,3 +1976,13 @@ Cort asked for the Referee to follow the finished lighting across buffer swaps a
 Reused the frame model, native reader challenge, padded screen registration and scene generation. Each member earns its own screen proof. The consumer still receives the real texture and depth. Once both members qualify, they share a history and ordinary camera selection remains steady. Unqualified orders fall back. Results now distinguishes actual use of this route from candidate observations.
 
 On the RTX 5070 Ti, first experiments using an unjittered screen-space stripe stopped the buffer swaps but left high-frequency variation. A reflection sampled in surface coordinates allowed a like-for-like comparison with a fixed physical owner. Across 28 frames, the old selection used the final lighting 12 times, the qualified route 28 times with one submission each and no history reset. Tests compare consecutive displayed pixels in the highlight, reject an offscreen decoy, and preserve a real light change. A second fixture uses typeless FP16, a compositor and centered padding. The user owns game testing. The new route is independent of Fable's withdrawn R2 hypothesis and makes no change to preset or sampler settings.
+
+## 2026-11-19 Pacific — Sol — Referee proof and recovery follow-up
+
+Reviewed the current integration against both graphics APIs, the November Referee archives and the Shadow of War and Resistance evidence. The latest captured Shadow of War run is still 2e062ef. Fable's separate replay and K/M investigation remain on his code line.
+
+The DX12 marker now challenges three regions with independent codes. A naturally alternating picture fails the pattern test. Provisional candidates finish or yield rather than restart on each competing candidate. Unknown and refuted candidates cool down with different delays. The native DX11 path now retries previously rejected readers, checks the actual latest writer's view and conservatively suspends rotating proof when an incomplete command list leaves a gap in execution evidence.
+
+The shared referee pairs adjacent frames across a verified lighting rotation for motion analysis. Screen votes remain scoped to the specific reader. History resets invalidate queued rollback evidence. Strong input and output evidence on different regions of the same frames now yields a composition diagnosis and cannot retire the full route.
+
+The detailed failure inventory, references, verification and remaining adaptive work are in docs/REFEREE-RECOVERY-AUDIT-20261119.md.

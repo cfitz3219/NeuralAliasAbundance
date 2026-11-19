@@ -429,7 +429,7 @@ inline TileLocations FindTexturedTiles(const float* data)
 // A window of samples (a few seconds) and its verdicts, as the log prints them.
 struct Window {
     uint32_t samples = 0, screens = 0, motions = 0;
-    uint32_t textured_frames = 0, output_frames = 0, input_frames = 0, neither_frames = 0;
+    uint32_t textured_frames = 0, output_frames = 0, input_frames = 0, neither_frames = 0, mixed_frames = 0;
     double picture_sum = 0, picture_output_sum = 0; uint32_t picture_n = 0;
     float picture_min = 2, picture_max = -2;
     SampleScore total;
@@ -450,7 +450,8 @@ struct Window {
             const uint32_t decided = s.tiles_output + s.tiles_input;
             if (s.tiles_neither * 2 > s.tiles_textured) ++neither_frames;
             else if (decided >= 4 && decided * 2 >= s.tiles_textured) {
-                if (s.tiles_output * 4 >= decided * 3) ++output_frames;
+                if (s.tiles_output >= 2 && s.tiles_input >= 2) ++mixed_frames;
+                else if (s.tiles_output * 4 >= decided * 3) ++output_frames;
                 else if (s.tiles_input * 4 >= decided * 3) ++input_frames;
             }
         }

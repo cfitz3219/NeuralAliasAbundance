@@ -396,7 +396,7 @@ void collect_sample()
             g.preview_last = g.main_ordinal;
         }
         const uint64_t proof = g.captured_context.native_screen_proof;
-        if (proof && g.captured_context.placement.path == shadow::Path::Native11 &&
+        if (enabled() && g.main_epoch == g.epoch && proof && g.captured_context.placement.path == shadow::Path::Native11 &&
             g.done_screen && g.preview_exact && !g.invalidated) {
             const auto vote = shadow::VoteScreen(score);
             const ULONGLONG now = GetTickCount64();
@@ -647,6 +647,8 @@ void reset_evidence_locked()
     g.tile_source = nullptr;
     g.recent.Clear();
     g.preview_pending = false;
+    g.visual.clear();
+    g.visual_rollback.store(false, std::memory_order_relaxed);
 }
 
 } // namespace
@@ -718,7 +720,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     if (!screen_only && (!g.swapchain || e.present_ordinal <= g.pre_ordinal)) return 0;
     // Only temporal measurements depend on the previous picture.
     const bool adjacent = !screen_only && g.pre_epoch == g.epoch && e.present_ordinal - g.pre_ordinal == 1 && !e.reset &&
-        g.captured_context == e.context && color_desc.Format == g.img[kPrev].desc.Format &&
+        g.captured_context.SameTemporalSequence(e.context) && color_desc.Format == g.img[kPrev].desc.Format &&
         rw == g.img[kPrev].desc.Width && rh == g.img[kPrev].desc.Height;
     const uint32_t mw = e.mv_display_res ? ow : rw, mh = e.mv_display_res ? oh : rh;
     g.have_motion = adjacent && !e.mv_jittered && e.motion && ensure(kMotion, e.motion, mw, mh);

@@ -236,6 +236,8 @@ struct DepthReads {
     }
 };
 
+// The view the scene used on a selected texture (typed format, subresource).
+struct ViewUse { uint32_t format = 0, mip = 0, slice = 0; };
 struct Ctx {
     bool game = false; // a context of the game's device
     uint32_t gen = 0;  // the game-device generation that answer was given in
@@ -265,6 +267,8 @@ struct Ctx {
     uint64_t vpj_sample = 0;          // the exact sample they carry
     uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
+    bool events_truncated = false;
+    ViewUse rt_view, ds_view;
     std::vector<DeferredUpload> cb_bytes; // (event index, bytes) for CbUpdate events
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
     // Large constant buffers this context has itself mapped for writing since its state began.
@@ -288,6 +292,7 @@ struct Ctx {
         pixel_shader_known = false;
         screen_slots.reset();
         rt0 = depth = 0;
+        rt_view = ds_view = {};
         rt_count = 0;
         depth_test = true;
         depth_read_only = false;
@@ -306,9 +311,9 @@ struct ListRecord {
     std::vector<DeferredUpload> cb_bytes;
     std::vector<DeferredExact> draw_bytes;
     uint64_t order = 0;
+    uint64_t incarnation = 0;
+    bool complete = false;
 };
-// The view the scene used on a selected texture (typed format, subresource).
-struct ViewUse { uint32_t format = 0, mip = 0, slice = 0; };
 
 std::mutex g_install_mu;
 std::atomic<bool> g_installed{false};
@@ -1636,14 +1641,24 @@ void NoteDepthDirection(const Event& e)
 
 // ---------------------------------------------------------------- events
 void StopViewportJitterAfterScene();
-void TrackPlacementWrite(const Event& e)
+void TrackPlacementWrite(const Event& e, const Ctx* live = nullptr)
 {
+    if (e.kind == Kind::Draw && g_lit.Learned() && g_lit.Peer(e.rt0)) {
+        auto& view = g_lit.written[e.rt0 == g_lit.members[1]];
+        view = {};
+        if (live && e.depth == g_lit.depth && !live->rt_view.mip && !live->rt_view.slice &&
+            live->vp_n == 1 && live->vp_x == 0.f && live->vp_y == 0.f &&
+            live->vp_w > 0.f && live->vp_h > 0.f) {
+            view = {UINT(live->vp_w), UINT(live->vp_h), live->rt_view.format,
+                    live->ds_view.format, live->ds_view.mip, live->ds_view.slice};
+        }
+    }
     if (g_lit.observed_member &&
         ((e.kind == Kind::Draw && g_lit.Peer(e.rt0)) || (e.kind == Kind::ColorWrite && g_lit.Peer(e.resource)) ||
          (e.kind == Kind::ClearDepth && e.resource == g_lit.depth))) {
         g_lit.screen.Write(0);
         const auto index = g_lit.observed_member == g_lit.members[1];
-        if (g_lit.observed_proven) g_lit.Revoke(g_lit.proofs[index]);
+        if (g_lit.observed_proven) g_lit.Revoke(g_lit.proofs[index], g_frame);
         g_lit.observed_member = g_lit.observed_write = 0;
     }
     if (!g_screen.Adaptive() || !g_screen_enabled.load(std::memory_order_relaxed)) return;
@@ -1664,7 +1679,10 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
           bool pixel_read = false)
 {
     if (x->deferred) {
-        if (x->events.size() >= kMaxListEvents) return;
+        if (x->events.size() >= kMaxListEvents) {
+            x->events_truncated = true;
+            return;
+        }
         x->events.push_back(e);
         if (e.kind == Kind::Draw && (exact.get() != x->exact_recorded || !x->exact_recorded_any) &&
             (exact || x->exact_recorded)) {
@@ -1700,7 +1718,7 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
         Fire(c, l, Boundary::BeforeHud);
         StopViewportJitterAfterScene();
     }
-    TrackPlacementWrite(e);
+    TrackPlacementWrite(e, x);
     const uint32_t v = g_model.Feed(e);
     RememberSceneUploads(e, exact.get());
     NoteViewportDraw(e);
@@ -2512,7 +2530,7 @@ void STDMETHODCALLTYPE DrawInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buf
 }
 void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
 {
-    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? DrawEvent(c, 0, true) : nullptr;
+    Ctx* x = DrawEvent(c, 0, true);
     ForwardGameDraw(c, x, [&] { O(c, x).draw_auto(c); });
 }
 void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
@@ -2605,6 +2623,7 @@ void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11
     CbUpdate(c, r, tmp.data(), tmp.size());
 }
 void InvalidateDepthWrite(Ctx* context, ID3D11Resource* resource);
+void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource);
 
 void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub, const D3D11_BOX* box, const void* src, UINT rp,
                                            UINT dp)
@@ -2612,6 +2631,7 @@ void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resourc
     Ctx* x = Get(c);
     std::vector<uint8_t> tmp;
     UpdateCommon(c, x, r, box, src, tmp);
+    TrackPlacementColorWrite(c, x, IdOf(r));
     O(c, x).update(c, r, sub, box, src, rp, dp);
     InvalidateDepthWrite(x, r);
 }
@@ -2621,6 +2641,7 @@ void STDMETHODCALLTYPE UpdateSubresource1_d(ID3D11DeviceContext1* c, ID3D11Resou
     Ctx* x = Get(c);
     std::vector<uint8_t> tmp;
     UpdateCommon(c, x, r, box, src, tmp);
+    TrackPlacementColorWrite(c, x, IdOf(r));
     O(c, x).update1(c, r, sub, box, src, rp, dp, flags);
     InvalidateDepthWrite(x, r);
 }
@@ -2660,6 +2681,8 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
     }
     x->rt0 = IdOf(rt);
     x->depth = IdOf(ds);
+    x->rt_view = rt_use;
+    x->ds_view = ds_use;
     UINT bound = 0;
     for (UINT i = 0; rtvs && i < n; ++i)
         if (rtvs[i]) ++bound;
@@ -2844,6 +2867,8 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
             rec.cb_bytes = std::move(x->cb_bytes);
             rec.draw_bytes = std::move(x->draw_bytes);
             rec.order = ++g_list_order;
+            rec.incarnation = IncarnationOf(*out);
+            rec.complete = !x->events_truncated;
             if (g_lists.size() > kMaxLists) {
                 auto oldest = g_lists.begin();
                 for (auto it = g_lists.begin(); it != g_lists.end(); ++it)
@@ -2852,6 +2877,7 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
             }
         }
         x->events.clear();
+        x->events_truncated = false;
         x->cb_bytes.clear();
         x->draw_bytes.clear();
         // A new recording must map with discard before it may map without overwrite again.
@@ -2875,6 +2901,9 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
     if (x && !x->deferred && list) {
         std::unique_lock<std::mutex> l(g_mu);
         auto it = g_lists.find(list);
+        if (it != g_lists.end() && it->second.incarnation != IncarnationOf(list)) it = g_lists.end();
+        if (g_screen_enabled.load(std::memory_order_relaxed) && (it == g_lists.end() || !it->second.complete))
+            g_lit.LostObservation();
         if (it != g_lists.end() && g_model.ShouldFireBeforeList(g_model.Summarize(it->second.events))) {
             g_model.MarkFired();
             Fire(c, l, Boundary::BeforeList);
@@ -3365,7 +3394,7 @@ void RejectScreenProof(uint64_t proof)
 {
     if (!proof || !g_screen_enabled.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lock(g_mu);
-    if (g_lit.Revoke(proof) || g_screen.RejectProof(proof))
+    if (g_lit.Revoke(proof, g_frame) || g_screen.RejectProof(proof, g_frame))
         na::eventlog::Emit("native11_screen", "candidate=replaced_after_delivery proof=%llu",
                            static_cast<unsigned long long>(proof));
 }

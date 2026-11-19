@@ -23,11 +23,9 @@ class ScreenCheck {
 
     // Every location changes polarity on both frame parities. A fixed edge or
     // an alternating post-process cannot substitute for the challenge pattern.
-    static constexpr std::array<UINT, screen_marker::kSession> kPatterns{0, 7, 5, 2, 3, 4, 6, 1};
-
     static bool FirstIsHigh(UINT sample, UINT pair)
     {
-        return (kPatterns[sample] & (1u << pair)) != 0;
+        return (screen_marker::kPatterns[sample] & (1u << pair)) != 0;
     }
 
 public:
@@ -147,13 +145,13 @@ public:
         return false;
     }
 
-    bool RejectProof(uint64_t proof)
+    bool RejectProof(uint64_t proof, uint64_t frame)
     {
         if (!proof) return false;
         const auto match = std::find_if(routes_.begin(), routes_.end(),
             [proof](const Route& route) { return route.proof == proof; });
         if (match != routes_.end()) {
-            Reject(match->reader);
+            Defer(match->reader, frame);
             routes_.erase(match);
             if (routes_.empty()) {
                 steering_ = false;
@@ -162,7 +160,7 @@ public:
             return true;
         }
         if (!verified_ || proof != proof_) return false;
-        RetireVerified();
+        RetireVerified(frame);
         return true;
     }
     bool MayInspect() const
@@ -170,6 +168,7 @@ public:
         return adaptive_ || verified_ || (!ordinary_this_frame_ && ordinary_gaps_ >= kOrdinaryGrace);
     }
     bool AwaitingSamples() const { return !!candidate_; }
+    void CancelChallenge() { if (candidate_) ResetAttempt(); }
     // A rotating scene owner supplies its own completed-frame qualification.
     // Reuse the same asynchronous reader challenge and independent proof IDs.
     void IndependentReaders() { adaptive_ = true; }
@@ -187,7 +186,9 @@ public:
             frame - last_marked_ >= 2 * screen_marker::kSession) ResetAttempt();
         const auto& rejected = adaptive_ ? rejected_ : legacy_rejected_;
         if (verified_ || marked_ || (adaptive_ && frame_proof_) ||
-            std::find(rejected.begin(), rejected.end(), reader) != rejected.end()) return {};
+            std::any_of(rejected.begin(), rejected.end(), [&](const Retry& retry) {
+                return retry.reader == reader && frame < retry.after;
+            })) return {};
         if (candidate_ && !(reader == candidate_)) return {};
         if (candidate_ && !seen_) {
             seen_ = true;
@@ -299,7 +300,7 @@ public:
             }
             if (!truncated_) entries_.Observe(sequence_, true, frame);
             if (frame_proof_ && delivery_epoch_ != epoch_) {
-                RejectProof(frame_proof_);
+                RejectProof(frame_proof_, frame);
                 if (marked_ && (marked_epoch_ != epoch_ || truncated_)) ResetAttempt();
                 else marked_ = false;
                 return finish("adaptive_later_scene_write");
@@ -307,7 +308,7 @@ public:
             // The candidate may be absent on a different draw order. Only
             // its own sampled frames can qualify or disprove it.
             if (marked_ && (marked_epoch_ != epoch_ || truncated_)) {
-                Reject(candidate_);
+                Defer(candidate_, frame);
                 ResetAttempt();
                 return finish("adaptive_candidate_mid_scene");
             }
@@ -330,7 +331,7 @@ public:
             const bool overwritten = delivered_this_frame_ && scene_draws != delivered_draws_;
             delivered_this_frame_ = false;
             if (overwritten || (missed && recent_miss_)) {
-                RetireVerified();
+                RetireVerified(frame);
                 return finish("lost_coverage");
             }
             if (missed) recent_miss_ = screen_marker::kSession;
@@ -341,7 +342,7 @@ public:
         // Only a reader seen at the right point on every scene frame can earn
         // control. The staging samples may finish later than those draws.
         if (!adaptive_ && scene_draws && (!seen_ || reader_draws_ != scene_draws)) {
-            Reject(candidate_);
+            Defer(candidate_, frame);
             ResetAttempt();
             return finish("intermittent");
         }
@@ -399,9 +400,9 @@ public:
             }
             ++confirmed_;
         } else {
-            // A recurring order that did not appear often enough can retry.
-            // Measured bypasses and contradictory placements are retained.
-            if (!adaptive_ || sampled_all) Reject(candidate_);
+            // A timeout or a display change is not a permanent property of a
+            // shader and target. Prove the reader again after a quiet interval.
+            Defer(candidate_, frame, refuted ? 1024 : 128);
             if (refuted) ++refuted_;
         }
         ResetAttempt();
@@ -412,6 +413,7 @@ public:
 
 private:
     struct Route { Reader reader; uint64_t proof; };
+    struct Retry { Reader reader; uint64_t after = 0, delay = 0; };
 
     void Append(const na::j2::ColorEvent& event)
     {
@@ -531,16 +533,21 @@ private:
         }
     }
 
-    void Reject(Reader reader)
+    void Defer(Reader reader, uint64_t frame, uint64_t initial_delay = 128)
     {
-        auto& rejected = reader.color ? rejected_ : legacy_rejected_;
-        if (rejected.size() >= 24) rejected.erase(rejected.begin());
-        rejected.push_back(reader);
+        auto& rejected = adaptive_ ? rejected_ : legacy_rejected_;
+        const auto existing = std::find_if(rejected.begin(), rejected.end(),
+            [&](const Retry& retry) { return retry.reader == reader; });
+        const uint64_t delay = existing == rejected.end() ? initial_delay :
+            (std::clamp)(existing->delay * 2, initial_delay, uint64_t(4096));
+        if (existing != rejected.end()) rejected.erase(existing);
+        else if (rejected.size() >= 24) rejected.erase(rejected.begin());
+        rejected.push_back({reader, frame + delay, delay});
     }
 
-    void RetireVerified()
+    void RetireVerified(uint64_t frame)
     {
-        Reject(verified_);
+        Defer(verified_, frame);
         verified_ = {};
         ordinary_gaps_ = 0;
         ResetAttempt();
@@ -570,7 +577,7 @@ private:
 
     Id color_ = 0, depth_ = 0;
     Reader candidate_{}, verified_{};
-    std::vector<Reader> rejected_, legacy_rejected_;
+    std::vector<Retry> rejected_, legacy_rejected_;
     Texture original_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> marker_view_;
     std::array<Slot, screen_marker::kSession> slots_{};

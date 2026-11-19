@@ -9,6 +9,7 @@
 #include "test_support.hpp"
 #include "referee_gpu_scene.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
+#include "host_dx12/capture/screen_marker.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
@@ -110,7 +111,7 @@ struct Images {
 bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images& im, rg::LastSample& got,
                 bool late = false, ID3D12CommandQueue* blocked = nullptr, ID3D12Fence* release = nullptr,
                 bool changed_scene = false, bool reset = false, bool display_vectors = false, bool unsampled_reset = false,
-                uint64_t native_proof = 0)
+                uint64_t native_proof = 0, bool rotate = false)
 {
     const uint64_t before = rg::GetStats().samples;
     CHECK(rg::Wanted());
@@ -143,6 +144,10 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     CHECK(rg::Wanted()); // half taken: the next evaluation is wanted
     e.color = im.input;
     if (changed_scene) ++e.context.color;
+    if (rotate) {
+        ++e.context.color;
+        ++e.context.native_screen_proof;
+    }
     if (unsampled_reset) rg::NotifyEvaluationReset();
     e.reset = reset;
     e.present_ordinal = ++ordinal;
@@ -226,6 +231,30 @@ void Report(const char* what, const na::referee::Verdicts& v)
 
 int main()
 {
+    {
+        using namespace na::screen_marker;
+        Vote real, inverted, parity, discarded;
+        for (uint32_t i = 1; i < kSession; ++i) {
+            float prev[3], next[3], inv_prev[3], inv_next[3], natural_prev[3], natural_next[3], flat[3]{};
+            for (uint32_t k = 0; k < 3; ++k) {
+                prev[k] = ((kPatterns[i - 1] >> k) & 1u) ? .7f : .2f;
+                next[k] = ((kPatterns[i] >> k) & 1u) ? .7f : .2f;
+                inv_prev[k] = 1.f - prev[k];
+                inv_next[k] = 1.f - next[k];
+                natural_prev[k] = (i & 1u) ? .2f : .7f;
+                natural_next[k] = 1.f - natural_prev[k];
+            }
+            const uint32_t before = kPatterns[i - 1], after = kPatterns[i];
+            real.Add(before, prev, after, next);
+            inverted.Add(before, inv_prev, after, inv_next);
+            parity.Add(before, natural_prev, after, natural_next);
+            discarded.Add(before, flat, after, flat);
+        }
+        CHECK(real.ResultOf() == Vote::Result::Reached);
+        CHECK(inverted.ResultOf() == Vote::Result::Reached);
+        CHECK(parity.ResultOf() != Vote::Result::Reached);
+        CHECK(discarded.ResultOf() == Vote::Result::Discarded);
+    }
 #ifndef NA_HAVE_REFEREE_SHADERS
     std::puts("SKIP: Windows SDK FXC was unavailable");
     return test::kSkip;
@@ -467,6 +496,18 @@ int main()
                        false, nullptr, nullptr, false, false, false, false, 18));
     CHECK(rg::TakeNativeScreenLoss(&d) == 18);
     CHECK(!rg::TakeNativeScreenLoss(&d)); // proof 19 stays qualified
+    Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), t_motion.Get(), tiny_output.Get()},
+                       got, false, nullptr, nullptr, false, false, false, false, 31, true));
+    CHECK(got.pair); // different physical sources and proofs, one verified scene history
+    for (unsigned i = 0; i < 2; ++i) {
+        if (i) ++ordinal;
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), nullptr, tiny_input.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 41));
+    }
+    rg::NotifyEvaluationReset();
+    CHECK(!rg::TakeNativeScreenLoss(&d)); // pending pre-reset decisions cannot retire the live reader
     // Identical scene and output size, seven additional rows on the display. The same
     // registration must identify a shown input, shown output, and unrelated overlay.
     // Exercise both roundings of the odd margin and the existing scaled layout.

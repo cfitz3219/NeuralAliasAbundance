@@ -40,6 +40,18 @@ struct Context {
                generation == other.generation && subresource == other.subresource && width == other.width && height == other.height &&
                native_screen_proof == other.native_screen_proof;
     }
+    bool SameTemporalSequence(const Context& other) const
+    {
+        if (*this == other) return true;
+        // Native11 allocates a common scene generation only after the
+        // rotating owners have both been verified. Preserve physical proof
+        // identity for screen votes and use the logical scene for motion.
+        return placement.path == Path::Native11 && placement == other.placement &&
+               generation && generation == other.generation &&
+               native_screen_proof && other.native_screen_proof &&
+               color && other.color && depth && depth == other.depth && subresource == other.subresource &&
+               width == other.width && height == other.height;
+    }
 };
 
 // Observe every eligible Present, including the ones that never produced a DLSS sample.
@@ -67,6 +79,7 @@ inline ScreenVote VoteScreen(const SampleScore& score)
 {
     const uint32_t decided = score.tiles_input + score.tiles_output;
     if (score.tiles_textured < 4 || decided < 4 || decided * 2 < score.tiles_textured) return ScreenVote::Unknown;
+    if (score.tiles_input >= 2 && score.tiles_output >= 2) return ScreenVote::Unknown;
     if (score.tiles_input * 4 >= decided * 3) return ScreenVote::Input;
     if (score.tiles_output * 4 >= decided * 3) return ScreenVote::Output;
     return ScreenVote::Unknown;
@@ -110,6 +123,9 @@ inline Choice Preview(const Evidence& current, const Evidence* alternative = nul
     const auto verdict = Judge(votes);
     if (verdict.picture == Verdict::Pass && votes.output_frames && votes.input_frames)
         return {"check_continuity", "some sampled screens favor the output and others the input", current.context.placement};
+    // VARIANT: referee/composite-evidence
+    if (verdict.picture == Verdict::Pass && votes.mixed_frames >= 2)
+        return {"check_composite", "separate regions of each sampled screen favor different stages", current.context.placement};
     if (verdict.picture == Verdict::Pass && verdict.result == Verdict::Pass &&
         StrongCount(votes.output_frames, votes.samples)) {
         if (verdict.motion == Verdict::Fail || verdict.jitter == Verdict::Fail)
@@ -121,6 +137,7 @@ inline Choice Preview(const Evidence& current, const Evidence* alternative = nul
     if (verdict.picture == Verdict::Pass && verdict.result == Verdict::Fail &&
         StrongCount(votes.input_frames, votes.samples)) {
         if (alternative && current.context.SameScene(alternative->context) &&
+            current.context.generation == alternative->context.generation &&
             alternative->context.placement.path != Path::None &&
             !(alternative->context.placement == current.context.placement)) {
             const auto proof = Judge(alternative->measured);

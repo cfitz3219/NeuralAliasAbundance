@@ -190,7 +190,7 @@ int main()
         const Placement between{Path::Between, 0}, inline_route{Path::Inline, 31};
         Evidence current, alternative;
         current.context = {inline_route, 20, 21, 3, 0, W, H};
-        alternative.context = {between, 20, 21, 4, 0, W, H};
+        alternative.context = {between, 20, 21, 3, 0, W, H};
         current.Add(good);
         check(!std::strcmp(Preview(current).action, "hold"), "shadow: one good sample cannot certify a route");
         for (int frame = 0; frame < 2; ++frame) current.Add(good);
@@ -203,6 +203,9 @@ int main()
         for (int frame = 0; frame < 3; ++frame) current.Add(bypass);
         check(!std::strcmp(Preview(current).action, "check_placement"), "shadow: bypass alone does not establish another boundary");
         check(!std::strcmp(Preview(current, &alternative).action, "prefer"), "shadow: a verified same-scene alternative beats a bypassed route");
+        ++alternative.context.generation;
+        check(!std::strcmp(Preview(current, &alternative).action, "check_placement"), "shadow: a reset makes an older alternative ineligible");
+        --alternative.context.generation;
         alternative.context.color++;
         check(!std::strcmp(Preview(current, &alternative).action, "check_placement"), "shadow: an alternative for another scene cannot replace the current one");
         RecentSamples recent;
@@ -256,6 +259,16 @@ int main()
         check(!std::strcmp(Preview(current).action, "probe"), "shadow: a repeated observed boundary is a probe candidate");
         current.Add(bypass, {Path::Inline, 45});
         check(!std::strcmp(Preview(current).action, "check_placement"), "shadow: conflicting boundary observations do not select a probe");
+        current.measured = {};
+        auto composite = good;
+        composite.tiles_textured = 8;
+        composite.tiles_input = 6;
+        composite.tiles_output = 2;
+        current.Add(composite);
+        current.Add(composite);
+        check(VoteScreen(composite) == ScreenVote::Unknown &&
+              !std::strcmp(Preview(current).action, "check_composite"),
+              "shadow: partial composition is evidence to inspect local stages, never a whole-route rollback");
     }
 
     // Motion and jitter: the scene moved by u between the frames; the jitter changed.

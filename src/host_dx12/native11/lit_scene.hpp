@@ -3,6 +3,7 @@
 
 namespace na::native11 {
 
+// VARIANT: point/native11-rotating-lighting
 // Lives under the provider lock. The ordered pair is a resource role; both
 // actual reads must independently reproduce the marker in the display.
 struct LitScene {
@@ -14,8 +15,10 @@ struct LitScene {
     // Active extent, typed colour/depth views, depth mip and array slice.
     using View = std::array<uint32_t, 6>;
     View view{};
+    View written[2]{};
     Id observed_member = 0;
     bool later_writes_first = false, steer = false, observed_proven = false;
+    bool incomplete = false;
 
     Id Peer(Id member) const {
         if (member && member == members[0]) return members[1];
@@ -24,7 +27,7 @@ struct LitScene {
     }
     bool Learned() const { return observations[0] >= 3 && observations[1] >= 3; }
     Id Predicted(const FrameModel& model) const {
-        if (!Learned()) return 0;
+        if (!Learned() || incomplete) return 0;
         const Id first = model.FirstLitWriter(members[0], members[1]);
         return later_writes_first ? first : Peer(first);
     }
@@ -34,7 +37,7 @@ struct LitScene {
         generation = next;
     }
     bool ObserveView(unsigned member, uint64_t color_id, uint64_t depth_id, View current) {
-        if (!color_id || !depth_id) return false;
+        if (!color_id || !depth_id || written[member] != current) return false;
         if ((incarnations[member] && incarnations[member] != color_id) ||
             (depth_incarnation && (depth_incarnation != depth_id || !(view == current)))) {
             Clear();
@@ -45,7 +48,20 @@ struct LitScene {
         view = current;
         return true;
     }
+    void LostObservation() {
+        incomplete = true;
+        consecutive_proven = 0;
+        steer = false;
+        screen.CancelChallenge();
+    }
     void Finish(const FrameModel::LitOrder& order) {
+        written[0] = written[1] = {};
+        if (incomplete) {
+            incomplete = false;
+            observed_member = observed_write = 0;
+            observed_proven = false;
+            return;
+        }
         if (!order.late || !order.first) {
             if (depth) Clear();
             return;
@@ -71,8 +87,8 @@ struct LitScene {
         observed_member = observed_write = 0;
         observed_proven = false;
     }
-    bool Revoke(uint64_t proof) {
-        if (!proof || !screen.RejectProof(proof)) return false;
+    bool Revoke(uint64_t proof, uint64_t frame) {
+        if (!proof || !screen.RejectProof(proof, frame)) return false;
         for (auto& p : proofs) if (p == proof) p = 0;
         consecutive_proven = 0;
         steer = false;

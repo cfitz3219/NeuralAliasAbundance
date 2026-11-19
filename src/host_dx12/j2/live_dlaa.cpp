@@ -633,7 +633,13 @@ struct NativeTrace{
     // indexed bindless arrays): the frame's render->full crossings are offered one at
     // a time as PROVISIONAL and learned only after the screen probe confirms them.
     NativeCrossing provisional;std::atomic<uint64_t> provisional_pso{0};
-    std::vector<NativeCrossing> refuted;
+    struct RetryCrossing { NativeCrossing crossing; uint64_t after; };
+    std::vector<RetryCrossing> refuted;
+    bool CoolingDown(const NativeCrossing& crossing, uint64_t now) const {
+        return std::any_of(refuted.begin(), refuted.end(), [&](const RetryCrossing& entry) {
+            return entry.crossing == crossing && now < entry.after;
+        });
+    }
     uint64_t provisionals=0,verified=0,refutations=0;
     uint32_t learned_interval=900; // presents between re-verifying traces once learned (tests shorten it)
     char result[4096]{};
@@ -1095,7 +1101,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 NativeCrossing c{op.pso, in.id, out.id, scene, e.rw, e.rh, e.ow, e.oh,
                                  in.vfmt, out.vfmt, op.gx, op.gy, op.gz};
                 c.native_depth = depth;
-                if (std::find(g_trace.refuted.begin(), g_trace.refuted.end(), c) != g_trace.refuted.end()) continue;
+                if (g_trace.CoolingDown(c, GetTickCount64())) continue;
                 if (!(g_trace.provisional == c)) ++g_trace.provisionals;
                 next = c;
                 add(" dlaa_screen_candidate=%llu input=%llu output=%llu",
@@ -1308,7 +1314,7 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 }
                 if (w!=i || !traces_scene(in.id,i)) continue;
                 const NativeCrossing c{op.pso,in.id,o.id,scene,e.rw,e.rh,e.ow,e.oh,in.vfmt,o.vfmt,op.gx,op.gy,op.gz,true}; // reader unreadable: treated as a separate list (Sol's splice checks the tail)
-                if (std::find(g_trace.refuted.begin(),g_trace.refuted.end(),c)!=g_trace.refuted.end()) continue;
+                if (g_trace.CoolingDown(c, GetTickCount64())) continue;
                 if (std::find(cands.begin(),cands.end(),c)!=cands.end()) continue;
                 cands.push_back(c);
             }
@@ -1435,6 +1441,7 @@ struct DeliveryProbe : na::screen_marker::Vote {
     std::mutex m;
     uint32_t remaining=0;uint64_t sessions=0;bool auto_done=false;
     bool verify=false;NativeCrossing target;uint32_t verify_attempts=0;
+    uint64_t last_verify_visit=0;
     int outcome=0;NativeCrossing outcome_target; // for the trace, applied outside this lock
     uint32_t expect_w=0,expect_h=0;
     ComPtr<ID3D12DescriptorHeap> gpu,cpu,rtv;uint32_t next_desc=0;
@@ -1472,7 +1479,7 @@ bool probe_write_locked(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32
         D3D12_DESCRIPTOR_HEAP_DESC hr{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,16,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
         if(FAILED(g.device->CreateDescriptorHeap(&hr,IID_PPV_ARGS(&p.rtv))))return false;
     }
-    if(!p.gpu){
+    if(!render_target && !p.gpu){
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,16,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
         if(FAILED(g.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&p.gpu))))return false;
         hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -1481,33 +1488,44 @@ bool probe_write_locked(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32
     na::nr::native::RecordingLease lease;
     if(verifying){auto owner=std::make_shared<std::vector<ComPtr<ID3D12Resource>>>();owner->push_back(dest);lease=na::nr::native::RetainRecording(l,owner);}
     // A ring of 16 descriptors: a slot is rewritten only 16 marks later.
-    const UINT inc=g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT at = p.next_desc % 16;
     if (p.descriptor_uses[at] && !p.descriptor_uses[at].Retired()) return false;
     if (p.target.native_depth && verifying && !lease) return false;
     p.descriptor_uses[at] = lease;
     ++p.next_desc;
-    D3D12_CPU_DESCRIPTOR_HANDLE gc=p.gpu->GetCPUDescriptorHandleForHeapStart();gc.ptr+=SIZE_T(at)*inc;
-    D3D12_GPU_DESCRIPTOR_HANDLE gg=p.gpu->GetGPUDescriptorHandleForHeapStart();gg.ptr+=UINT64(at)*inc;
-    D3D12_CPU_DESCRIPTOR_HANDLE cc=p.cpu->GetCPUDescriptorHandleForHeapStart();cc.ptr+=SIZE_T(at)*inc;
-    D3D12_UNORDERED_ACCESS_VIEW_DESC u{};u.Format=DXGI_FORMAT(view_format);u.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
-    g.device->CreateUnorderedAccessView(dest,nullptr,&u,gc);g.device->CreateUnorderedAccessView(dest,nullptr,&u,cc);
-    const uint32_t value=uint32_t(p.marked&1);
-    const float v=value?na::screen_marker::kHigh:na::screen_marker::kLow;
-    const float c[4]{v,v,v,1.f};
-    D3D12_RECT rects[3];
-    for(int i=0;i<3;++i){const LONG x=LONG(na::screen_marker::kAt[i][0]*float(desc.Width)),y=LONG(na::screen_marker::kAt[i][1]*float(desc.Height));rects[i]={x,y,x+1,y+1};}
+    const uint32_t value=na::screen_marker::kPatterns[na::screen_marker::kSession - p.remaining];
+    D3D12_RECT rects[2][3]{};
+    UINT counts[2]{};
+    for (UINT i = 0; i < 3; ++i) {
+        const UINT level = (value >> i) & 1u;
+        const LONG x = LONG(na::screen_marker::kAt[i][0] * float(desc.Width));
+        const LONG y = LONG(na::screen_marker::kAt[i][1] * float(desc.Height));
+        rects[level][counts[level]++] = {x,y,x+1,y+1};
+    }
+    constexpr float low = na::screen_marker::kLow, high = na::screen_marker::kHigh;
+    constexpr float colors[2][4]{{low, low, low, 1.f}, {high, high, high, 1.f}};
     const na::observe::HostWorkScope own;
     if(render_target){
         D3D12_CPU_DESCRIPTOR_HANDLE rh=p.rtv->GetCPUDescriptorHandleForHeapStart();
         rh.ptr+=SIZE_T(at)*g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         D3D12_RENDER_TARGET_VIEW_DESC rd{};rd.Format=DXGI_FORMAT(view_format);rd.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
         g.device->CreateRenderTargetView(dest,&rd,rh);
-        l->ClearRenderTargetView(rh,c,3,rects);
+        for (UINT level = 0; level < 2; ++level)
+            if (counts[level]) l->ClearRenderTargetView(rh, colors[level], counts[level], rects[level]);
     }else{
+        const UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        auto gc = p.gpu->GetCPUDescriptorHandleForHeapStart(); gc.ptr += SIZE_T(at) * inc;
+        auto gg = p.gpu->GetGPUDescriptorHandleForHeapStart(); gg.ptr += UINT64(at) * inc;
+        auto cc = p.cpu->GetCPUDescriptorHandleForHeapStart(); cc.ptr += SIZE_T(at) * inc;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT(view_format);
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g.device->CreateUnorderedAccessView(dest, nullptr, &view, gc);
+        g.device->CreateUnorderedAccessView(dest, nullptr, &view, cc);
         ID3D12DescriptorHeap* heaps[]{p.gpu.Get()};l->SetDescriptorHeaps(1,heaps);
         D3D12_RESOURCE_BARRIER uav{};uav.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;uav.UAV.pResource=dest;l->ResourceBarrier(1,&uav);
-        l->ClearUnorderedAccessViewFloat(gg,cc,dest,c,3,rects);
+        for (UINT level = 0; level < 2; ++level)
+            if (counts[level]) l->ClearUnorderedAccessViewFloat(gg, cc, dest, colors[level], counts[level], rects[level]);
         l->ResourceBarrier(1,&uav);
     }
     if(p.marks.size()>=16)p.marks.pop_front();
@@ -1538,11 +1556,20 @@ bool probe_verify_mark(ID3D12GraphicsCommandList* l,ID3D12Resource* dest,uint32_
     auto& p=g_probe;
     if(p.outcome)return false; // last session's result not applied yet
     if(p.verify&&p.target==c&&!p.remaining)return false; // all marks written: waiting for its readbacks and verdict
+    if (!(p.target == c)) {
+        // Different branches may appear on alternating frames. Let the
+        // current candidate finish before lending the probe to another.
+        if (p.verify && (!p.remaining || (frame >= p.last_verify_visit && frame - p.last_verify_visit < 32))) return false;
+        p.verify_attempts = 0;
+        p.last_verify_visit = 0;
+    }
     if(!p.remaining||!p.verify||!(p.target==c)){
         if(p.remaining&&!p.verify)return false; // a delivery session is running
         p.start(true);p.target=c;
     }
-    return probe_write_locked(l,dest,view_format,frame,true,render_target);
+    const bool marked = probe_write_locked(l,dest,view_format,frame,true,render_target);
+    if (marked || p.last_verify_visit == 0) p.last_verify_visit = frame;
+    return marked;
 }
 void probe_submitted(uint64_t frame,bool ok){
     std::lock_guard<std::mutex> lock(g_probe.m);
@@ -1556,7 +1583,6 @@ void probe_judge_locked(){
         p.Add(a.value, a.luma, b.value, b.luma);
     }
     p.seq.erase(p.seq.begin(),p.seq.end()-(p.seq.empty()?0:1));
-    if(p.steps<5){std::snprintf(p.verdict,sizeof p.verdict,"%s",p.paired?"unresolved_few_pairs":"unresolved_unpaired");return;}
     using Result = na::screen_marker::Vote::Result;
     const auto result = p.ResultOf();
     std::snprintf(p.verdict, sizeof p.verdict, "%s", result == Result::Reached ? "confirmed_in_presented" :
@@ -1593,7 +1619,7 @@ void probe_finish_verify_locked(){
     const bool unresolved=std::strncmp(p.verdict,"unresolved",10)==0||std::strcmp(p.verdict,"running")==0;
     if(confirmed){p.outcome=1;++p.verified;p.verify_attempts=0;}
     else if(unresolved&&++p.verify_attempts<3){p.outcome=2;} // try the same candidate again
-    else{p.outcome=-1;++p.refuted;p.verify_attempts=0;}
+    else{p.outcome=unresolved?-2:-1;if(!unresolved)++p.refuted;p.verify_attempts=0;}
     p.outcome_target=p.target;p.verify=false;
 }
 }
@@ -1677,11 +1703,16 @@ void apply_probe_outcome(int outcome,const NativeCrossing& c)
         g_trace.provisional={};
         na::eventlog::Emit("native_trace","provisional crossing confirmed on screen: learned pso=%llu in#%llu out#%llu",
             (unsigned long long)c.pso,(unsigned long long)c.input,(unsigned long long)c.output);
-    }else if(outcome==-1){
+    }else if(outcome<0){
+        const auto existing = std::find_if(g_trace.refuted.begin(), g_trace.refuted.end(),
+            [&](const auto& entry) { return entry.crossing == c; });
+        if (existing != g_trace.refuted.end()) g_trace.refuted.erase(existing);
         if(g_trace.refuted.size()>=16)g_trace.refuted.erase(g_trace.refuted.begin());
-        g_trace.refuted.push_back(c);++g_trace.refutations;
+        g_trace.refuted.push_back({c, GetTickCount64() + (outcome == -1 ? 15000 : 3000)});
+        if (outcome == -1) ++g_trace.refutations;
         g_trace.provisional={};
-        na::eventlog::Emit("native_trace","provisional crossing refuted (the screen did not follow its marker): pso=%llu in#%llu out#%llu",
+        na::eventlog::Emit("native_trace","provisional crossing %s; cooling down: pso=%llu in#%llu out#%llu",
+            outcome == -1 ? "refuted (screen did not follow marker)" : "unresolved (no repeatable screen evidence)",
             (unsigned long long)c.pso,(unsigned long long)c.input,(unsigned long long)c.output);
     }
     g_trace.provisional_pso.store(g_trace.provisional.pso,std::memory_order_release);
@@ -1703,10 +1734,10 @@ void probe_stats(char* out,size_t n){
     std::lock_guard<std::mutex> lock(g_probe.m);auto& p=g_probe;
     // Said explicitly when there is nothing to judge (Sol 6a48746: no verdict from absence).
     if(!p.paired)std::snprintf(p.verdict,sizeof p.verdict,"%s",p.marked?"unresolved_no_paired_present":"unresolved_no_marked_delivery");
-    std::snprintf(out,n,"sessions=%llu marked=%llu paired=%llu unpaired=%llu size_mismatch=%llu verified=%llu refuted=%llu steps=%u follow=%u/%u/%u invert=%u/%u/%u flat=%u/%u/%u verdict=%s",
+    std::snprintf(out,n,"sessions=%llu marked=%llu paired=%llu unpaired=%llu size_mismatch=%llu verified=%llu refuted=%llu steps=%u/%u/%u follow=%u/%u/%u invert=%u/%u/%u flat=%u/%u/%u verdict=%s",
         (unsigned long long)p.sessions,(unsigned long long)p.marked,(unsigned long long)p.paired,(unsigned long long)p.unpaired,(unsigned long long)p.size_mismatch,
         (unsigned long long)p.verified,(unsigned long long)p.refuted,
-        p.steps,p.follow[0],p.follow[1],p.follow[2],p.invert[0],p.invert[1],p.invert[2],p.flat[0],p.flat[1],p.flat[2],p.verdict);
+        p.steps[0],p.steps[1],p.steps[2],p.follow[0],p.follow[1],p.follow[2],p.invert[0],p.invert[1],p.invert[2],p.flat[0],p.flat[1],p.flat[2],p.verdict);
 }
 PhysicalInputProvider g_phys; // under g_up_m
 
