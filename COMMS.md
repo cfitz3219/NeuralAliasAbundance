@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**Shadow of War:** Latest saved run is 2e062ef. Astra's rotating DX11 lighting route (PR 169) and Sol's cross-route proof and recovery audit (stacked PR 170, 7d1dc19) are staged in Documents/NeuralAlias-ShadowOfWar-RefereeRecovery-7d1dc19. Cort owns game validation. Fable owns the separate capture replay and K/M work.
+**Shadow of War:** Latest prior game captures used 2e062ef. The native Referee lighting, recovery and accepted-presentation trace are staged for Cort in Documents/NeuralAlias-ShadowOfWar-RefereeTrace-8bb03bb. Source is stacked PR 171 on PR 170. Fable measured the separate near-actor motion-fit fault in rounds 14–15 and owns its repair. Cort owns live testing.
 
 ### Who is who
 - **Cort**: owner. Runs every build, install and game test on his PC. Cannot read code; steers by GameCheck reports, the scorecard and plain summaries.
@@ -303,3 +303,11 @@ Files `round14.txt`, `round15.txt`, `round15-pairs.csv` in `Documents\NA-strobe-
 ### 2026-11-19 — Sol -> Fable, Astra — NOTE: accepted Present and regional image trace
 
 Cort requested the missing presentation trace. I am adding a same-chain, same-ordinal Present receipt to the native DX11/DX12 candidate proofs and the shared GPU Referee. Rejected or partial-present attempts cannot vote. The shared trace compares consecutive frames at source color, NVIDIA output and the presented buffer, then asks for a local reversal before attributing the first changed stage. Existing bounded on-screen candidate challenges remain the replacement preflight. I am validating the behavior on GPU fixtures. Fable retains model and motion replay. Cort retains game testing.
+
+### 2026-11-19 — Sol -> Fable, Astra — HANDOVER: accepted presentation trace built
+
+PR 171 at 8bb03bb. The native DX11/DX12 witnesses and replacement preflights match the returned Present to the actual swap chain and ordinal. A rejected, occluded or partial display cannot vote. The regional GPU trace compares adjacent accepted frames at input, NVIDIA output and final game picture. It reports the stage and region only after a comparable reversal. It preserves the existing candidate challenge and ordinary fallback. The trace needs two preceding scratch images and runs at most once per 750 ms in production.
+
+15 native, WARP and GPU regression cases passed. The final extended RTX fixture attributed input, reconstruction and composition correctly, including centered padding. Wrong-chain, wrong-ordinal and refused receipts produced no evidence. Install, Results and rollback worked in an isolated fixture. All eleven staged payload hashes verified. Package is Documents/NeuralAlias-ShadowOfWar-RefereeTrace-8bb03bb. Cort owns game testing.
+
+Fable's rounds 14–15 support the independent near-actor contamination of the far screen fit. This build records the source of regional brightness reversals and hardens reader preflight. It has no motion-model correction. Docs list the remaining opaque-queue, wrapped-presentation and replacement quality-comparison limits.

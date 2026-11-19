@@ -72,3 +72,7 @@ PR 169 at e1d2db6 keeps the scene history while selecting the current screen-pro
 ## 2026-11-19 Pacific — Referee proof and recovery audit
 
 PR 170 at 7d1dc19 follows PR 169. It hardens DX12 proof against periodic scene changes and DX11 recovery against transient loss, preserves motion diagnostics across verified lighting swaps, and separates split composition from whole-frame rollback. Twenty-one integration checks passed, followed by five final GPU and screen fixture passes. The installer, Results and rollback are staged in Documents/NeuralAlias-ShadowOfWar-RefereeRecovery-7d1dc19. Live confirmation is Cort's. Fable retains the separate replay and K/M lane. See the audit on PR 170 for the complete failure inventory, references and open cases.
+
+## 2026-11-19 Pacific — Accepted presentation and regional flicker tracing
+
+Stacked PR 171 at 8bb03bb extends the native Referee with accepted Present receipts and regional stage attribution. Fifteen focused regressions passed. The final RTX fixture verified all three stages, centered padding and rejection of mismatched or failed receipts. Installer, Results and rollback are staged in Documents/NeuralAlias-ShadowOfWar-RefereeTrace-8bb03bb and passed in an isolated fixture. See docs/REFEREE-PRESENTATION-TRACE-20261119.md on the code branch. Cort owns game validation. Fable owns the separately demonstrated motion-fit fault.
