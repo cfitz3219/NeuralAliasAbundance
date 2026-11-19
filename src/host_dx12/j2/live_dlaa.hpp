@@ -206,7 +206,8 @@ void NativeTraceResult(char* out,size_t n,uint64_t* traces);
 // texels of the presented image (PRESENT state) with `exec` (unhooked; null = direct).
 void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame,
                         void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*),
-                        uint64_t ordinal = 0, const void* source = nullptr);
+                        uint64_t ordinal = 0, const void* source = nullptr, bool await_result = false);
+void NativeProbeResult(const void* source, uint64_t ordinal, bool accepted);
 // Starts one probe session (24 marked deliveries) now, as an armed J2 capture does.
 void RequestDeliveryProbe();
 // Tests: presents between re-verifying traces once a crossing is learned (default 900).

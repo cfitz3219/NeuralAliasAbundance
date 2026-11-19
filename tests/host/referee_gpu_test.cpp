@@ -10,6 +10,7 @@
 #include "referee_gpu_scene.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
 #include "host_dx12/capture/screen_marker.hpp"
+#include "core/referee_trace.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
@@ -105,18 +106,19 @@ struct Images {
     ID3D12Resource *prev, *input, *output, *motion, *screen;
     bool unknown_geometry = false;
 };
+struct TracePair { ID3D12Resource* before_output; ID3D12Resource* before_screen; bool accept = true; };
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
 // Returns false (with a FAIL line) when the referee did not take it.
 bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images& im, rg::LastSample& got,
                 bool late = false, ID3D12CommandQueue* blocked = nullptr, ID3D12Fence* release = nullptr,
                 bool changed_scene = false, bool reset = false, bool display_vectors = false, bool unsampled_reset = false,
-                uint64_t native_proof = 0, bool rotate = false)
+                uint64_t native_proof = 0, bool rotate = false, const TracePair* trace = nullptr)
 {
     const uint64_t before = rg::GetStats().samples;
     CHECK(rg::Wanted());
     rg::Evaluation e;
-    e.color = im.prev; e.output = im.output; e.motion = im.motion;
+    e.color = im.prev; e.output = trace ? trace->before_output : im.output; e.motion = im.motion;
     e.render_w = rs::kW; e.render_h = rs::kH;
     e.output_w = display_vectors ? 2 * rs::kW : rs::kW;
     e.output_h = display_vectors ? 2 * rs::kH : rs::kH;
@@ -139,10 +141,14 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         rg::Submitted(pre, d.queue.Get());
     }
     CHECK(!rg::NeedsScreen({ordinal, &d}));
-    rg::OnPresent({ordinal, &d, true, true, native11}, d.queue.Get(), nullptr, Execute);
+    rg::Presentation earlier{ordinal, &d, true, true, native11};
+    if (trace) earlier.await_result = true;
+    rg::OnPresent(earlier, d.queue.Get(), trace ? trace->before_screen : nullptr, Execute);
+    if (trace) rg::PresentResult(&d, ordinal, true);
 
     CHECK(rg::Wanted()); // half taken: the next evaluation is wanted
     e.color = im.input;
+    e.output = im.output;
     if (changed_scene) ++e.context.color;
     if (rotate) {
         ++e.context.color;
@@ -165,7 +171,23 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     CHECK(!rg::NeedsScreen({ordinal + 7, &d}));
     CHECK(!rg::NeedsScreen({ordinal, &l}));
     if (late && !blocked) ordinal += 7;
-    rg::OnPresent({ordinal, &d, true, true, native11}, d.queue.Get(), im.screen, Execute);
+    rg::Presentation current{ordinal, &d, true, true, native11};
+    if (trace) current.await_result = true;
+    rg::OnPresent(current, d.queue.Get(), im.screen, Execute);
+    if (trace) {
+        d.WaitIdle();
+        rg::PresentResult(&l, ordinal, true); // a different chain cannot sign for this scene
+        rg::PresentResult(&d, ordinal + 1, true); // nor a different frame
+        rg::Wanted();
+        CHECK(na::background::WaitIdle(3000));
+        CHECK(rg::GetStats().samples == before);
+        rg::PresentResult(&d, ordinal, trace->accept);
+        if (!trace->accept) {
+            rg::Wanted();
+            CHECK(na::background::WaitIdle(3000));
+            return rg::GetStats().samples == before;
+        }
+    }
     if (blocked) {
         ComPtr<ID3D12Fence> presenting_done, producer_done;
         const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -541,6 +563,57 @@ int main()
         CHECK(vote == (which == 0 ? ScreenVote::Input : which == 2 ? ScreenVote::Unknown : ScreenVote::Output));
         CHECK(got.centered_layout == (which < 2 ? uint32_t(which + 1) : 0u));
     }
+    // Isolate the first changed stage with the same two luma levels, then
+    // deny a Present receipt to make sure a copied picture cannot vote.
+    auto bright = output;
+    for (uint32_t y = bright.h / 2; y < bright.h * 5 / 8; ++y)
+        for (uint32_t x = bright.w / 2; x < bright.w * 5 / 8; ++x)
+            bright.v[size_t(y) * bright.w + x] *= 1.8f;
+    auto lit_in = Picture(d, l, bright, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+    auto lit_out = Picture(d, l, bright, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, keep);
+    auto lit_display = ScreenTexture(d, l, rs::ScreenBytes(bright), keep);
+    Run(d, l);
+    keep.clear();
+    REQUIRE(lit_in && lit_out && lit_display);
+    const auto unlit_in = Picture(d, l, output, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+    const auto padded = [&](const na::referee::Image& image) {
+        const auto pixels = rs::ScreenBytes(image);
+        std::vector<uint8_t> aligned(size_t(image.w) * (image.h + 7));
+        std::copy(pixels.begin(), pixels.end(), aligned.begin() + 3 * image.w);
+        return ScreenTexture(d, l, aligned, keep, image.w, image.h + 7);
+    };
+    const auto unlit_padded = padded(output), lit_padded = padded(bright);
+    Run(d, l);
+    keep.clear();
+    REQUIRE(unlit_in && unlit_padded && lit_padded);
+    using na::referee::FlickerStage;
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+        const unsigned first = (std::min)(scenario, 2u);
+        const bool has_padding = scenario == 3;
+        rg::NotifyEvaluationReset();
+        for (unsigned reverse = 0; reverse < 2; ++reverse) {
+            const bool up = reverse == 0;
+            auto* old_in = first == 0 && !up ? lit_in.Get() : unlit_in.Get();
+            auto* new_in = first == 0 && up ? lit_in.Get() : unlit_in.Get();
+            auto* old_output = first <= 1 && !up ? lit_out.Get() : t_output.Get();
+            auto* new_output = first <= 1 && up ? lit_out.Get() : t_output.Get();
+            auto* lit_screen = has_padding ? lit_padded.Get() : lit_display.Get();
+            auto* unlit_screen = has_padding ? unlit_padded.Get() : t_screen.Get();
+            TracePair trace{old_output, up ? unlit_screen : lit_screen};
+            Sleep(150);
+            REQUIRE(TakeSample(d, l, ordinal, {old_in, new_in, new_output, nullptr,
+                                              up ? lit_screen : unlit_screen}, got,
+                              false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+            const auto stage = static_cast<FlickerStage>(got.flicker_stage);
+            std::printf("trace expected=%u reversal=%u layout=%u actual=%s\n", first + 1, reverse, got.centered_layout, na::referee::StageName(stage));
+            CHECK(got.flicker_stage == (reverse ? first + 1 : 0));
+        }
+    }
+    TracePair rejected{t_output.Get(), t_screen.Get(), false};
+    Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {unlit_in.Get(), unlit_in.Get(), t_output.Get(), nullptr, lit_display.Get()},
+                       got, false, nullptr, nullptr, false, false, false, false, 0, false, &rejected));
+    CHECK(rg::GetStats().trace_pairs == 8 && rg::GetStats().trace_reversals == 4 && rg::GetStats().rejected_presents == 1);
     Sleep(150);
     REQUIRE(rg::Wanted());
     rg::Evaluation discarded;

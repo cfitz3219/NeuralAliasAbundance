@@ -1106,7 +1106,8 @@ int main(int argc,char** argv)
                     na::j2::OnPresent(d.queue.Get(), &receipt);
                 }
                 na::j2::NativeTracePresent(d.queue.Get(),presented.Get(),false,receipt.ordinal,receipt.swapchain);
-                na::j2::NativeProbePresent(d.queue.Get(),presented.Get(),nullptr,receipt.ordinal,receipt.swapchain);
+                na::j2::NativeProbePresent(d.queue.Get(),presented.Get(),nullptr,receipt.ordinal,receipt.swapchain,true);
+                na::j2::NativeProbeResult(receipt.swapchain,receipt.ordinal,true);
                 if(native_bindless){
 static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,sizeof tr,&n);if(n!=seen){seen=n;const char* pv=std::strstr(tr,"provisional");std::printf("bindless iteration %u trace %llu: %.160s | probe %.200s\n",iteration,(unsigned long long)n,pv?pv:"(none)",na::j2::GetNativeBridgeStats().probe);}}
                 d.WaitIdle();

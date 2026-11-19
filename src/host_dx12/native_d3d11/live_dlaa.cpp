@@ -830,7 +830,8 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue, co
         uint64_t native_done = 0, effects_done = 0;
     };
     static auto* state = new std::unique_ptr<PresentCopy>;
-    const referee::gpu::Presentation frame{receipt.ordinal, swap, receipt.EligibleForDlaa(), receipt.submitted, true};
+    referee::gpu::Presentation frame{receipt.ordinal, swap, receipt.EligibleForDlaa(), receipt.submitted, true};
+    frame.await_result = true;
     const bool witness = referee::gpu::NeedsScreen(frame);
     ComPtr<ID3D12CommandQueue> evaluation_queue;
     if (witness || eval || burst) {

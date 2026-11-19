@@ -8,6 +8,8 @@ Texture2D<float4> t_input  : register(t1);
 Texture2D<float4> t_output : register(t2);
 Texture2D<float4> t_screen : register(t3);
 Texture2D<float4> t_motion : register(t4);
+Texture2D<float4> t_prev_output : register(t5);
+Texture2D<float4> t_prev_screen : register(t6);
 RWByteAddressBuffer u_out  : register(u0);
 cbuffer C : register(b0) {
     uint src, base, w, h;          // which image (0..3), first float, its size
@@ -25,6 +27,8 @@ float load_luma(uint which, int2 p, uint ww, uint hh) {
         case 0: c = t_prev.Load(int3(p, 0)); break;
         case 1: c = t_input.Load(int3(p, 0)); break;
         case 2: c = t_output.Load(int3(p, 0)); break;
+        case 5: c = t_prev_output.Load(int3(p, 0)); break;
+        case 6: c = t_prev_screen.Load(int3(p, 0)); break;
         default: c = t_screen.Load(int3(p, 0)); break;
     }
     return max(dot(c.rgb, float3(.2126, .7152, .0722)), 0) + 1e-4;
@@ -36,11 +40,13 @@ void store(uint i, float v) { u_out.Store((base + i) * 4, asuint(v)); }
 void thumb(uint3 id : SV_DispatchThreadID) {
     if (id.x >= kThumbW || id.y >= kThumbH) return;
     float s = 0;
+    const uint tw = pad0 != 0 ? mw : w, th = pad0 != 0 ? mh : h;
+    const int2 origin = pad0 != 0 ? int2((w - mw) / 2, (h - mh) / 2) : int2(0,0);
     for (uint b = 0; b < kTaps; ++b)
         for (uint a = 0; a < kTaps; ++a) {
-            const int x = int((float(id.x) + (float(a) + .5) / kTaps) / kThumbW * float(w));
-            const int y = int((float(id.y) + (float(b) + .5) / kTaps) / kThumbH * float(h));
-            s += load_log(src, int2(x, y), w, h);
+            const int x = int((float(id.x) + (float(a) + .5) / kTaps) / kThumbW * float(tw));
+            const int y = int((float(id.y) + (float(b) + .5) / kTaps) / kThumbH * float(th));
+            s += load_log(src, int2(x, y) + origin, w, h);
         }
     store(id.y * kThumbW + id.x, s / float(kTaps * kTaps));
 }

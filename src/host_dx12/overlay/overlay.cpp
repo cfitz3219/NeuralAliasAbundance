@@ -3197,7 +3197,7 @@ void process_frame(ID3D12CommandQueue* queue, ID3D12Resource* frame, na::referee
     const bool sdr = cs==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ||
         (cs==DXGI_COLOR_SPACE_CUSTOM && frame_format==DXGI_FORMAT_R8G8B8A8_UNORM);
     na::j2::NativeTracePresent(queue, frame, sdr, receipt.ordinal, receipt.swapchain);
-    na::j2::NativeProbePresent(queue, frame, g_orig_execute, receipt.ordinal, receipt.swapchain);
+    na::j2::NativeProbePresent(queue, frame, g_orig_execute, receipt.ordinal, receipt.swapchain, receipt.await_result);
     na::nr::OnPresent(queue, frame, cs);      // live Neural Rendering (before capture and the menu)
     na::motion::OnPresent(queue, frame, cs);  // A52: live optical flow (after NR, before capture)
     {
@@ -3481,7 +3481,8 @@ na::referee::gpu::Presentation game_frame_boundary(ID3D12CommandQueue* queue, ID
     return receipt;
 }
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr,
-                ComPtr<ID3D12CommandQueue>* after_present = nullptr)
+                ComPtr<ID3D12CommandQueue>* after_present = nullptr,
+                na::referee::gpu::Presentation* observed = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
@@ -3493,6 +3494,10 @@ void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr,
     na::referee::gpu::Presentation receipt;
     if (on12_owned && after_present) *after_present = retained_queue;
     else receipt = game_frame_boundary(queue, sc);
+    if (observed && receipt.swapchain) {
+        receipt.await_result = true;
+        *observed = receipt;
+    }
     note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
@@ -3725,6 +3730,21 @@ void note_menu_present_result(bool open, UINT flags, HRESULT result) {
     }
 }
 thread_local bool t_native11_present = false;
+bool accepted_picture(UINT flags, HRESULT result, const DXGI_PRESENT_PARAMETERS* parameters = nullptr)
+{
+    return result == S_OK && !(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE)) &&
+        (!parameters || (!parameters->DirtyRectsCount && !parameters->pScrollRect));
+}
+
+void acknowledge_picture(na::referee::gpu::Presentation receipt, UINT flags, HRESULT result,
+                         const DXGI_PRESENT_PARAMETERS* parameters = nullptr)
+{
+    if (!receipt.swapchain || !receipt.await_result) return;
+    const bool accepted = accepted_picture(flags, result, parameters);
+    na::j2::NativeProbeResult(receipt.swapchain, receipt.ordinal, accepted);
+    na::referee::gpu::PresentResult(receipt.swapchain, receipt.ordinal, accepted);
+}
+
 na::on12::GraphicsApi presentation_api(IDXGISwapChain* chain)
 {
     if (na::on12::Automatic()) return na::on12::SwapchainApi(chain);
@@ -3733,6 +3753,8 @@ na::on12::GraphicsApi presentation_api(IDXGISwapChain* chain)
 
 struct Native11Present {
     bool outer = !t_native11_present;
+    bool observed = false;
+    na::native11::PresentReceipt receipt{};
     Native11Present(IDXGISwapChain* sc, UINT flags) {
         if (!outer) return;
         t_native11_present = true;
@@ -3741,14 +3763,21 @@ struct Native11Present {
         na::native_d3d11::SyncCameraUse(); // [j2] camera, live: before this present closes the frame
         na::native11::SetScreenCheck(na::j2::Enabled() && !na::j2::Paused() &&
             na::settings::Get().referee_enabled.load(std::memory_order_relaxed));
-        na::native11::PresentReceipt receipt{};
-        if (!na::native11::ObservePresent(sc, &receipt)) return;
+        observed = na::native11::ObservePresent(sc, &receipt);
+        if (!observed) return;
         std::lock_guard<std::mutex> lock(g_state.mutex);
         ComPtr<ID3D12CommandQueue> retained;
         ID3D12CommandQueue* queue = nullptr;
         if (present_prelude(sc, queue, retained, nullptr, nullptr, na::on12::GraphicsApi::Dx11))
             menu_step(sc, queue, g_open.load(std::memory_order_acquire));
         na::native_d3d11::CapturePresent(sc, queue, receipt);
+    }
+    void Complete(IDXGISwapChain* chain, UINT flags, HRESULT result, const DXGI_PRESENT_PARAMETERS* parameters = nullptr)
+    {
+        if (!observed) return;
+        const bool accepted = accepted_picture(flags, result, parameters);
+        na::native11::ObservePresentResult(chain, receipt.ordinal, accepted);
+        na::referee::gpu::PresentResult(chain, receipt.ordinal, accepted);
     }
     ~Native11Present() { if (outer) t_native11_present = false; }
 };
@@ -3759,7 +3788,9 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present(sc, sync, flags);
     if (api == na::on12::GraphicsApi::Dx11) {
         Native11Present frame(sc, flags);
-        return g_orig_present(sc, sync, flags);
+        const HRESULT hr = g_orig_present(sc, sync, flags);
+        frame.Complete(sc, flags, hr);
+        return hr;
     }
     if (na::present::IsPresentThread()) return g_orig_present(sc, sync, flags); // never re-entered by design; safety
     na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
@@ -3782,10 +3813,12 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     const bool menu_open = g_open.load(std::memory_order_acquire);
     const uint64_t t0 = qpc_us();
     ComPtr<ID3D12CommandQueue> after_present;
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present);
+    na::referee::gpu::Presentation witness;
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present, &witness);
     const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present(sc, sync, flags);
     const uint64_t t2 = qpc_us();
+    acknowledge_picture(witness, flags, result);
     finish_deferred_present(sc, after_present.Get());
     note_present_timing(menu_open, (t1 - t0) + (after_present ? qpc_us() - t2 : 0), t2 - t1);
     na::on12::AfterPresent(sc, flags, t2 - t1);
@@ -3801,7 +3834,9 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present1(sc, sync, flags, pp);
     if (api == na::on12::GraphicsApi::Dx11) {
         Native11Present frame(sc, flags);
-        return g_orig_present1(sc, sync, flags, pp);
+        const HRESULT hr = g_orig_present1(sc, sync, flags, pp);
+        frame.Complete(sc, flags, hr, pp);
+        return hr;
     }
     if (na::present::IsPresentThread()) return g_orig_present1(sc, sync, flags, pp);
     na::observe::RefreshReadFilter(); // no observer lock is held here; cheap unless the scene colour or its copies changed
@@ -3823,10 +3858,12 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     na::nr::trace::Record("present1_begin",sc);
     const bool menu_open = g_open.load(std::memory_order_acquire);
     ComPtr<ID3D12CommandQueue> after_present;
-    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present);
+    na::referee::gpu::Presentation witness;
+    if (!(flags & DXGI_PRESENT_TEST) && !boundary_owns_native(sc)) on_present(sc, nullptr, &after_present, &witness);
     const uint64_t t1 = qpc_us();
     const HRESULT result = g_orig_present1(sc, sync, flags, pp);
     const uint64_t t2 = qpc_us();
+    acknowledge_picture(witness, flags, result, pp);
     finish_deferred_present(sc, after_present.Get());
     na::on12::AfterPresent(sc, flags, t2 - t1);
     note_menu_present_result(menu_open, flags, result);

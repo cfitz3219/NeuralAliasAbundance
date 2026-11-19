@@ -157,6 +157,7 @@ struct PresentReceipt {
     bool EligibleForDlaa() const { return submitted || (scene && !evaluation_paused); }
 };
 bool ObservePresent(void* swapchain, PresentReceipt* receipt = nullptr);
+void ObservePresentResult(void* swapchain, uint64_t ordinal, bool accepted);
 void BeforeResize(void* swapchain);
 void AfterResize(void* swapchain, long result);
 class OwnWorkScope {

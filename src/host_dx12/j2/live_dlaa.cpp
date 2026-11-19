@@ -1449,8 +1449,10 @@ struct DeliveryProbe : na::screen_marker::Vote {
     struct Mark{uint64_t frame=0;uint32_t value=0;bool submitted=false;na::nr::native::RecordingLease lease;};
     std::deque<Mark> marks;
     struct Slot{ComPtr<ID3D12CommandAllocator> alloc;ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> rb;
-        uint64_t fence=0, session=0;uint32_t value=0;uint64_t frame=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;bool busy=false;};
+        uint64_t fence=0, session=0;uint32_t value=0;uint64_t frame=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;bool busy=false;
+        const void* await_source=nullptr;uint64_t await_ordinal=0;bool rejected=false;};
     Slot slots[6];ComPtr<ID3D12Fence> fence;uint64_t fence_next=1;
+    std::atomic<bool> pending_result{false};
     struct Sample{uint32_t value=0;float luma[3]{};uint64_t frame=0;};
     std::vector<Sample> seq;
     uint64_t marked=0,paired=0,unpaired=0,size_mismatch=0,verified=0,refuted=0;
@@ -1593,10 +1595,11 @@ void probe_collect_locked(){
     auto& p=g_probe;
     if(!p.fence)return;
     const uint64_t done=p.fence->GetCompletedValue();
+    if (done == UINT64_MAX) return;
     for(auto& s:p.slots){
-        if(!s.busy||s.fence>done)continue;
+        if(!s.busy||s.fence>done||s.await_source)continue;
         s.busy=false;
-        if (s.session != p.sessions) continue;
+        if (s.session != p.sessions || s.rejected) continue;
         uint8_t* data=nullptr;D3D12_RANGE r{0,3*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT};
         if(FAILED(s.rb->Map(0,&r,reinterpret_cast<void**>(&data)))||!data)continue;
         DeliveryProbe::Sample x;x.value=s.value;x.frame=s.frame;
@@ -1624,7 +1627,7 @@ void probe_finish_verify_locked(){
 }
 }
 void apply_probe_outcome(int outcome,const NativeCrossing& c);
-void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*), uint64_t ordinal, const void* source)
+void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*), uint64_t ordinal, const void* source, bool await_result)
 {
     int outcome=0;NativeCrossing target;
     bool native_present = false;
@@ -1683,6 +1686,8 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
                         if(exec)exec(queue,1,one);else queue->ExecuteCommandLists(1,one);
                         slot->fence=p.fence_next++;queue->Signal(p.fence.Get(),slot->fence);
                         slot->busy=true;slot->session=p.sessions;slot->value=mark->value;slot->frame=mark->frame;slot->format=desc.Format;
+                        slot->await_source=await_result?source:nullptr;slot->await_ordinal=ordinal;slot->rejected=false;
+                        if (slot->await_source) p.pending_result.store(true, std::memory_order_release);
                         p.marks.erase(std::next(mark).base());
                     }
                 }
@@ -1692,6 +1697,19 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
         if(p.outcome){outcome=p.outcome;target=p.outcome_target;p.outcome=0;}
     }catch(...){}
     if(outcome)apply_probe_outcome(outcome,target);
+}
+void NativeProbeResult(const void* source, uint64_t ordinal, bool accepted)
+{
+    if (!source || !g_probe.pending_result.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_probe.m);
+    for (auto& slot : g_probe.slots) {
+        if (!slot.busy || slot.await_source != source || slot.await_ordinal != ordinal) continue;
+        slot.await_source = nullptr;
+        slot.rejected = !accepted;
+        if (!accepted) ++g_probe.unpaired;
+    }
+    g_probe.pending_result.store(std::any_of(std::begin(g_probe.slots), std::end(g_probe.slots),
+        [](const auto& slot) { return slot.await_source != nullptr; }), std::memory_order_release);
 }
 // The screen probe's result for a provisional crossing (called without g_probe.m).
 void apply_probe_outcome(int outcome,const NativeCrossing& c)

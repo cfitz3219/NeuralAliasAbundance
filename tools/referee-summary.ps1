@@ -53,12 +53,18 @@ function Get-RefereeSummary([string[]] $Lines) {
     $windows = @($Lines | Where-Object { $_ -match '(^|\s)referee\s+samples=\d+' })
     $states = @($Lines | Where-Object { $_ -match '(^|\s)referee_state\s' })
     $roles = @($Lines | Where-Object { $_ -match '\bnative11_lit_role frame=\d+ role_deliveries=(\d+) scene_stream=\d+' })
-    if (-not $windows -and -not $states -and -not $roles) {
+    $traces = @($Lines | Where-Object { $_ -match '\breferee_trace\s+frames=\d+,\d+ first_stage=(input|reconstruction|composition) ' })
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
     }
     $out.Add('Referee screen and delivery checks')
+    if ($traces) {
+        $stages = $traces | ForEach-Object { if ($_ -match '\bfirst_stage=(\w+)') { $Matches[1] } } | Group-Object
+        $out.Add('  Local flicker first measured at ' + (($stages | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join ', '))
+        $out.Add('  Last matched pair: ' + ($traces[-1] -replace '^.*?referee_trace\s+', ''))
+    }
     if ($roles) {
         $null = $roles[-1] -match 'role_deliveries=(\d+) scene_stream=(\d+)'
         $out.Add("  Rotating lighting buffers: DLAA used the screen-verified lighting route. Last checkpoint for scene $($Matches[2]): at least $($Matches[1]) submissions.")
@@ -71,7 +77,8 @@ function Get-RefereeSummary([string[]] $Lines) {
     }
     foreach ($s in $states) { $out.Add('  state: ' + ($s -replace '^.*?referee_state\s+', '')) }
     if (-not $windows) {
-        $out.Add('  No window was judged. Candidates: DLAA never ran on a frame; the run was shorter than one log interval; the referee stopped (see the state lines above).')
+        if ($traces) { $out.Add('  A regional trace was recorded before an aggregate verdict was written.') }
+        else { $out.Add('  No aggregate verdict was written. See the state lines for any recorded reason.') }
         return $out
     }
     $out.Add("  $($windows.Count) windows judged (one every few seconds).")

@@ -1988,3 +1988,9 @@ The shared referee pairs adjacent frames across a verified lighting rotation for
 The detailed failure inventory, references, verification and remaining adaptive work are in docs/REFEREE-RECOVERY-AUDIT-20261119.md.
 
 The combined 21-case suite passed while the final reporting improvement was under test. Rechecking the final build caught a transformed fixture that genuinely displayed the output while two of its eight regions favored input. The delivery vote now preserves a strong positive majority. It still refuses a whole-screen rollback when two regions show the output. The CPU test exercises both directions, and the scaled-screen GPU fixture checks the case that exposed the error.
+
+## 2026-11-19 Pacific — Sol — Accepted presentation and regional trace
+
+Read current COMMS, HANDOFF, MASTER-PLAN, the November Referee archive and the Microsoft/NVIDIA API references. Fable's round 13 separated a false-motion effect at reconstruction from the alternating scene input. The accepted-presentation checks join the swap chain, ordinal, submission and result before native candidate evidence counts. Referee snapshot comparisons reuse the existing reducer and stage images, adding two preceding scratch images at a limited cadence. The comparison holds a local transition until a comparable reversal independently appears.
+
+The RTX fixture identified input, reconstruction, native composition and centered padded composition. An unreturned, unrelated or rejected receipt did not vote. The protected candidate search uses the existing coded-pixel proof and fallback. It now has the acceptance receipt in native paths. Both provider routes retain their existing discovery and do not use this brightness diagnostic to alter motion or presets. The engineering notes identify the domain and remaining limitations in docs/REFEREE-PRESENTATION-TRACE-20261119.md.

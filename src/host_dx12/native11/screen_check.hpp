@@ -265,8 +265,17 @@ public:
         }
     }
 
+    void PresentResult(uint64_t frame, bool accepted)
+    {
+        for (auto& slot : slots_) {
+            if (!slot.pending || slot.frame != frame) continue;
+            if (accepted) slot.awaiting_result = false;
+            else slot.pending = false;
+        }
+    }
+
     const char* Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
-                        uint32_t scene_draws, bool attempted)
+                        uint32_t scene_draws, bool attempted, bool await_result = false)
     {
         const auto finish = [&](const char* outcome) {
             ResetFrame();
@@ -372,6 +381,7 @@ public:
                     slot->sample = issued_ - 1;
                     slot->format = desc.Format;
                     slot->pending = true;
+                    slot->awaiting_result = await_result;
                 }
             }
         }
@@ -435,7 +445,7 @@ private:
         UINT layouts = 0;
         uint64_t frame = 0;
         UINT sample = 0;
-        bool pending = false;
+        bool pending = false, awaiting_result = false;
     };
 
     static UINT Bytes(DXGI_FORMAT format)
@@ -501,7 +511,7 @@ private:
             Slot* next = nullptr;
             for (auto& slot : slots_)
                 if (slot.pending && (!next || slot.frame < next->frame)) next = &slot;
-            if (!next) return;
+            if (!next || next->awaiting_result) return;
             D3D11_MAPPED_SUBRESOURCE map{};
             const HRESULT hr = context->Map(next->image.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
             if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return;

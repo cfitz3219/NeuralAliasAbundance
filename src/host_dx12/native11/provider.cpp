@@ -2978,12 +2978,12 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             game->GetImmediateContext(&context);
             swap->GetBuffer(0, IID_PPV_ARGS(&screen));
         }
-        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame()))
+        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
             na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
                                outcome, (unsigned long long)g_screen.Paired(),
                                (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
         if (g_lit.Learned()) {
-            if (const char* outcome = g_lit.screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame()))
+            if (const char* outcome = g_lit.screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
                 na::eventlog::Emit("native11_lit_role", "frame=%llu reader=%s", (unsigned long long)g_frame, outcome);
         }
     } else if (g_screen.Active()) g_screen.ResetPlacement();
@@ -3220,18 +3220,23 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
 HRESULT STDMETHODCALLTYPE Present_d(IDXGISwapChain* s, UINT sync, UINT flags)
 {
     const bool outer = !t_in_present;
-    if (outer && !(flags & DXGI_PRESENT_TEST)) OnPresent(s);
+    PresentReceipt receipt{};
+    const bool observed = outer && !(flags & DXGI_PRESENT_TEST) && OnPresent(s, &receipt);
     t_in_present = true;
     const HRESULT hr = g_present(s, sync, flags);
+    if (observed) ObservePresentResult(s, receipt.ordinal, hr == S_OK && !(flags & DXGI_PRESENT_DO_NOT_SEQUENCE));
     if (outer) t_in_present = false;
     return hr;
 }
 HRESULT STDMETHODCALLTYPE Present1_d(IDXGISwapChain1* s, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p)
 {
     const bool outer = !t_in_present;
-    if (outer && !(flags & DXGI_PRESENT_TEST)) OnPresent(s);
+    PresentReceipt receipt{};
+    const bool observed = outer && !(flags & DXGI_PRESENT_TEST) && OnPresent(s, &receipt);
     t_in_present = true;
     const HRESULT hr = g_present1(s, sync, flags, p);
+    if (observed) ObservePresentResult(s, receipt.ordinal, hr == S_OK && !(flags & DXGI_PRESENT_DO_NOT_SEQUENCE) &&
+        (!p || (!p->DirtyRectsCount && !p->pScrollRect)));
     if (outer) t_in_present = false;
     return hr;
 }
@@ -3401,6 +3406,14 @@ void RejectScreenProof(uint64_t proof)
 bool ObservePresent(void* swapchain, PresentReceipt* receipt)
 {
     return OnPresent(static_cast<IDXGISwapChain*>(swapchain), receipt);
+}
+void ObservePresentResult(void* swapchain, uint64_t ordinal, bool accepted)
+{
+    if (!g_screen_enabled.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (swapchain != g_swap) return;
+    g_screen.PresentResult(ordinal, accepted);
+    g_lit.screen.PresentResult(ordinal, accepted);
 }
 void BeforeResize(void* swapchain) { ReleaseResizeInputs(static_cast<IDXGISwapChain*>(swapchain)); }
 void AfterResize(void* swapchain, long result) { UpdateResizeExtent(static_cast<IDXGISwapChain*>(swapchain), result); }
