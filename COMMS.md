@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**Shadow of War:** Latest prior game captures used 2e062ef. The native Referee lighting, recovery and accepted-presentation trace are staged for Cort in Documents/NeuralAlias-ShadowOfWar-RefereeTrace-8bb03bb. Source is stacked PR 171 on PR 170. Fable measured the separate near-actor motion-fit fault in rounds 14–15 and owns its repair. Cort owns live testing.
+**Shadow of War:** The latest test package is Documents/NeuralAlias-ShadowOfWar-RefereeTrial-709f3c1 (PR #172). Sol's 02ed22b package is preserved. The latest saved live captures use 2e062ef. Fable owns near-actor motion contamination. Cort owns the game test of the pause-menu reflection.
 
 ### Who is who
 - **Cort**: owner. Runs every build, install and game test on his PC. Cannot read code; steers by GameCheck reports, the scorecard and plain summaries.
@@ -323,3 +323,11 @@ PR #172, 02ed22b. Native DX11 now offers the rotating-lighting candidate only af
 The end-to-end RTX 5070 Ti fixture used real DLAA and measured 3.883 / 0.036 / 3.875 stops. It kept the alternative and the 28 final checks matched reconstructed pixels. Separate GPU checks rejected unchanged output and a visible bypass. Seventeen automated checks passed including DX12, WARP and the companion path. Three saved Shadow of War incumbent sequences independently reproduced comparable reversal evidence. All eleven payload hashes and isolated install, Results and rollback verified.
 
 Test package: Documents/NeuralAlias-ShadowOfWar-RefereeTrial-02ed22b. Cort retains game testing. The live game result and the independent far-motion correction are separate. The notes and scope are in docs/REFEREE-PRESENTATION-TRACE-20261119.md.
+
+### 2026-11-19 10:38Z — Astra -> Fable, Sol — HANDOVER: audited replacement verdict and scoped recovery
+
+Commit 709f3c1 on PR #172 keeps Sol's reader challenges and ordinary/replacement/ordinary control. The old worker credited identical input/output pixels and accepted a trial pair lacking its second Present receipt on the RTX. The old policy dropped monitoring after a win and could permanently reject a temporarily lost reader. Fixed with distinguishing pixels, invalidation and scoped monitoring, with cooldown for inconclusive trials. Existing strong edge votes and ordinary DLAA delivery remain available. A rejected arm that measured no improvement stays suppressed for that setup.
+
+The final RTX NGX fixture kept the fully lit reader on 28/28 frames; 70,112 distinguishing pixels matched output, and regional change fell from 10.3914 to 2.1995 red levels. After a settings change ordinary DLAA delivered 28/28. The shared GPU fixture restored the ordinary route when the previously fixed pattern returned. All 17 selected tests passed plus offline Results and variant checks. Replaying the six real incumbent recordings preserved five reports verbatim. In the sixth, ordinal 64753 moved from undecided to five tiles favoring output; the other per-frame votes were identical. Live reflection improvement still awaits Cort. No correction to Fable's motion field is implied.
+
+Package 709f3c1 is in Documents; 11 hashes and isolated install, Results and rollback verified. Earlier package untouched. Full scope, costs and sources are in docs/REFEREE-PRESENTATION-TRACE-20261119.md on PR #172.

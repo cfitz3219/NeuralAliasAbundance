@@ -80,3 +80,7 @@ Stacked PR 171 at 8bb03bb extends the native Referee with accepted Present recei
 ### 2026-11-19 Pacific — Sol — Controlled Referee replacement
 
 PR #172 at 02ed22b compares ordinary Native11 delivery with a screen-proven alternate and then restores the ordinary route for an independent recheck. It keeps the alternate only for verified improvement with visible delivery. Real NVIDIA DLAA and rollback decisions were checked on RTX. Seventeen automated checks passed. The reversible Shadow of War test package is Documents/NeuralAlias-ShadowOfWar-RefereeTrial-02ed22b. Install, Results and rollback passed an isolated fixture. Cort retains game testing. Fable retains the far-motion work.
+
+### 2026-11-19 Pacific — Astra — Evidence audit of the Referee replacement
+
+Commit 709f3c1 on PR #172 corrects false delivery votes, stale comparison evidence and failure to revisit a previous decision. The verified Shadow of War package is Documents/NeuralAlias-ShadowOfWar-RefereeTrial-709f3c1. Sol's 02ed22b remains available. Seventeen selected checks passed, including real RTX DLAA, plus archived-capture replay and isolated rollback. Cort owns the live reflection test. Details are in the latest COMMS handover and the PR's presentation trace audit.
