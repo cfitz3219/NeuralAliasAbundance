@@ -22,10 +22,13 @@
 //                                         formed when the run starts (default 16)
 //   --pingpong N                          walk the run back and forth N more times (backwards the
 //                                         saved motion is negated): a longer sequence from few frames
+//   --crop X Y W H                        save only this rectangle of each output (a whole 3440x1433
+//                                         output is 20 to 40 MB a frame; the region studied is far less)
 //
 // Output, in <out folder>\<name>: one NNNNN-dlssout.raw per replayed frame (tight rows, the capture's
-// own pixel format), replay.csv (which saved frame each step is) and replay.log (every setting, and
-// for the forward pass how far the replayed output is from the output the game run saved).
+// own pixel format), replay.csv (which saved frame each step is, and the rectangle saved) and
+// replay.log (every setting, and per frame how far the whole replayed output is from the output the
+// game run saved).
 //
 // A measuring tool for saved captures: it reads files and runs DLSS on this machine's card. It does
 // not touch a game, an install or a setting. Needs an RTX card and the DLSS runtime beside it.
@@ -359,7 +362,8 @@ struct Step {
 int Usage()
 {
     std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D]\n"
-                "    [--preset 0|10..13] [--parity all|even|odd] [--first INDEX] [--frames N] [--all] [--preroll N] [--pingpong N]\n");
+                "    [--preset 0|10..13] [--parity all|even|odd] [--first INDEX] [--frames N] [--all] [--preroll N] [--pingpong N]\n"
+                "    [--crop X Y W H]\n");
     return 2;
 }
 } // namespace
@@ -373,6 +377,7 @@ int main(int argc, char** argv)
     const char* mode_name = "captured";
     float far_depth = 0.005f;
     uint32_t preset = 0, first = 0, max_frames = 0, preroll = 16, pingpong = 0;
+    uint32_t crop_x = 0, crop_y = 0, crop_w = 0, crop_h = 0; // 0 size = the whole output
     int parity = -1;
     bool all = false;
     for (int i = 3; i < argc; ++i) {
@@ -402,6 +407,13 @@ int main(int argc, char** argv)
             if (parity < 0 && v != "all") return Usage();
         }
         else if (a == "--all") all = true;
+        else if (a == "--crop" && i + 4 < argc) {
+            crop_x = static_cast<uint32_t>(std::strtoul(argv[i + 1], nullptr, 10));
+            crop_y = static_cast<uint32_t>(std::strtoul(argv[i + 2], nullptr, 10));
+            crop_w = static_cast<uint32_t>(std::strtoul(argv[i + 3], nullptr, 10));
+            crop_h = static_cast<uint32_t>(std::strtoul(argv[i + 4], nullptr, 10));
+            i += 4;
+        }
         else return Usage();
     }
     CreateDirectoryA(out_root.c_str(), nullptr);
@@ -439,6 +451,10 @@ int main(int argc, char** argv)
     if (head.bias_mask) Log("note: the game run gave DLSS a bias mask (not saved); the replay gives none");
     if (head.jitter_shifted) Log("note: the capture marks its jitter as shifted");
     const PlaneInfo out_plane = head.dlssout.valid && Bpp(head.dlssout.format) ? head.dlssout : head.color;
+    if (!crop_w || !crop_h || crop_x >= out_plane.width || crop_y >= out_plane.height) { crop_x = 0; crop_y = 0; crop_w = out_plane.width; crop_h = out_plane.height; }
+    crop_w = std::min(crop_w, out_plane.width - crop_x);
+    crop_h = std::min(crop_h, out_plane.height - crop_y);
+    Log("saved rectangle: x %u y %u, %u x %u of the %u x %u output", crop_x, crop_y, crop_w, crop_h, out_plane.width, out_plane.height);
     if (!Bpp(head.color.format) || !Bpp(head.depth.format) || Bpp(head.depth.format) != 4 || (head.motion.format != 16 && head.motion.format != 34)) {
         Log("FATAL: plane formats not read by this tool: color %u depth %u motion %u", head.color.format, head.depth.format, head.motion.format);
         return 1;
@@ -516,7 +532,7 @@ int main(int argc, char** argv)
 
     FILE* csv = nullptr;
     fopen_s(&csv, (out_dir + "\\replay.csv").c_str(), "wb");
-    if (csv) std::fprintf(csv, "step,file,source_index,present_ordinal,direction,jitter_x,jitter_y,motion_planes,width,height,dxgi_format,bytes_per_pixel\n");
+    if (csv) std::fprintf(csv, "step,file,source_index,present_ordinal,direction,jitter_x,jitter_y,motion_planes,width,height,dxgi_format,bytes_per_pixel,crop_x,crop_y\n");
 
     std::vector<uint8_t> rows, depth_rows, motion_rows, saved_rows;
     std::vector<float> vectors, sum;
@@ -614,9 +630,12 @@ int main(int argc, char** argv)
         snprintf(file, sizeof file, "%05u-dlssout.raw", written);
         FILE* fp = nullptr;
         if (fopen_s(&fp, (out_dir + "\\" + file).c_str(), "wb") != 0 || !fp) { Log("FATAL: cannot write %s", file); return 1; }
-        const size_t put = std::fwrite(rows.data(), 1, rows.size(), fp);
+        const size_t crop_row = static_cast<size_t>(crop_w) * out_bpp;
+        size_t put = 0;
+        for (uint32_t y = 0; y < crop_h; ++y)
+            put += std::fwrite(rows.data() + tight * (crop_y + y) + static_cast<size_t>(crop_x) * out_bpp, 1, crop_row, fp);
         std::fclose(fp);
-        if (put != rows.size()) { Log("FATAL: short write of %s (disk full?)", file); return 1; }
+        if (put != crop_row * crop_h) { Log("FATAL: short write of %s (disk full?)", file); return 1; }
         double apart = -1.0, level = 0.0;
         if (m.dlssout.valid && m.dlssout.format == out_plane.format && m.dlssout.width == out_plane.width && m.dlssout.height == out_plane.height &&
             ReadPlane(capture, m.index, "dlssout", m.dlssout, &saved_rows)) {
@@ -637,9 +656,9 @@ int main(int argc, char** argv)
             si, file, m.index, static_cast<unsigned long long>(m.present_ordinal), s.direction > 0 ? "forwards" : s.direction < 0 ? "backwards" : "start",
             static_cast<double>(m.jitter_x), static_cast<double>(m.jitter_y), s.direction != 0 && mode != MotionMode::Zero ? s.motions.size() : size_t(0), apart, level);
         if (csv) {
-            std::fprintf(csv, "%u,%s,%u,%llu,%d,%.6f,%.6f,%zu,%u,%u,%u,%u\n", written, file, m.index, static_cast<unsigned long long>(m.present_ordinal), s.direction,
+            std::fprintf(csv, "%u,%s,%u,%llu,%d,%.6f,%.6f,%zu,%u,%u,%u,%u,%u,%u\n", written, file, m.index, static_cast<unsigned long long>(m.present_ordinal), s.direction,
                          static_cast<double>(m.jitter_x), static_cast<double>(m.jitter_y), s.direction != 0 && mode != MotionMode::Zero ? s.motions.size() : size_t(0),
-                         out_plane.width, out_plane.height, out_plane.format, out_bpp);
+                         crop_w, crop_h, out_plane.format, out_bpp, crop_x, crop_y);
             std::fflush(csv);
         }
         ++written;
