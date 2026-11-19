@@ -451,8 +451,8 @@ struct Window {
             if (s.tiles_neither * 2 > s.tiles_textured) ++neither_frames;
             else if (decided >= 4 && decided * 2 >= s.tiles_textured) {
                 if (s.tiles_output >= 2 && s.tiles_input >= 2) ++mixed_frames;
-                else if (s.tiles_output * 4 >= decided * 3) ++output_frames;
-                else if (s.tiles_input * 4 >= decided * 3) ++input_frames;
+                if (s.tiles_output * 4 >= decided * 3) ++output_frames;
+                else if (s.tiles_output < 2 && s.tiles_input * 4 >= decided * 3) ++input_frames;
             }
         }
         total.points += s.points; total.textured += s.textured; total.moving += s.moving; total.explained += s.explained;

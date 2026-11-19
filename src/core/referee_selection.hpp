@@ -79,9 +79,10 @@ inline ScreenVote VoteScreen(const SampleScore& score)
 {
     const uint32_t decided = score.tiles_input + score.tiles_output;
     if (score.tiles_textured < 4 || decided < 4 || decided * 2 < score.tiles_textured) return ScreenVote::Unknown;
-    if (score.tiles_input >= 2 && score.tiles_output >= 2) return ScreenVote::Unknown;
-    if (score.tiles_input * 4 >= decided * 3) return ScreenVote::Input;
     if (score.tiles_output * 4 >= decided * 3) return ScreenVote::Output;
+    // A strong output majority shows delivery. A strong input majority with
+    // independent output regions cannot establish a whole-screen bypass.
+    if (score.tiles_output < 2 && score.tiles_input * 4 >= decided * 3) return ScreenVote::Input;
     return ScreenVote::Unknown;
 }
 

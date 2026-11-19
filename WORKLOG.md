@@ -1986,3 +1986,5 @@ The DX12 marker now challenges three regions with independent codes. A naturally
 The shared referee pairs adjacent frames across a verified lighting rotation for motion analysis. Screen votes remain scoped to the specific reader. History resets invalidate queued rollback evidence. Strong input and output evidence on different regions of the same frames now yields a composition diagnosis and cannot retire the full route.
 
 The detailed failure inventory, references, verification and remaining adaptive work are in docs/REFEREE-RECOVERY-AUDIT-20261119.md.
+
+The combined 21-case suite passed while the final reporting improvement was under test. Rechecking the final build caught a transformed fixture that genuinely displayed the output while two of its eight regions favored input. The delivery vote now preserves a strong positive majority. It still refuses a whole-screen rollback when two regions show the output. The CPU test exercises both directions, and the scaled-screen GPU fixture checks the case that exposed the error.

@@ -269,6 +269,9 @@ int main()
         check(VoteScreen(composite) == ScreenVote::Unknown &&
               !std::strcmp(Preview(current).action, "check_composite"),
               "shadow: partial composition is evidence to inspect local stages, never a whole-route rollback");
+        std::swap(composite.tiles_input, composite.tiles_output);
+        check(VoteScreen(composite) == ScreenVote::Output,
+              "shadow: strong positive delivery survives two disagreeing regions");
     }
 
     // Motion and jitter: the scene moved by u between the frames; the jitter changed.
