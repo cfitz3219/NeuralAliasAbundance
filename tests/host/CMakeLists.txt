@@ -439,6 +439,17 @@ if(NA_HAVE_NGX_LIB)
   endif()
 endif()
 
+# A measuring tool, not a test: replays a saved DLAA capture through DLSS on this machine's card with
+# one input changed at a time (see the head of the source). Built everywhere so the hosted build
+# compiles it; it only runs where an RTX card, the NGX library and the DLSS runtime are present.
+add_executable(dlss_capture_replay dlss_capture_replay.cpp)
+target_link_libraries(dlss_capture_replay PRIVATE abundance_options host_dlss dxgi d3d12)
+target_include_directories(dlss_capture_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
+  add_custom_command(TARGET dlss_capture_replay POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_capture_replay>")
+endif()
+
 if(NA_HAVE_NGX_LIB)
   # Gate 2 hardware session: ARGON-G2-004 device loss with the real NGX runtime.
   na_host_test(dlss_device_loss_test SOURCES dlss_device_loss_test.cpp LIBS host_dlss d3d12 dxgi
