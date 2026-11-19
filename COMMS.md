@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**Shadow of War:** Cort reported reflection strobe on 2e062ef. The native DX11 lighting-role repair is on PR 169 at e1d2db6. RTX screen tests passed. Package for Cort in Documents/NeuralAlias-ShadowOfWar-LitScene-e1d2db6. Cort owns game validation. Fable continues the separate castle-sway and input-motion investigation.
+**Shadow of War:** Latest saved run is 2e062ef. Astra's rotating DX11 lighting route (PR 169) and Sol's cross-route proof and recovery audit (stacked PR 170, 7d1dc19) are staged in Documents/NeuralAlias-ShadowOfWar-RefereeRecovery-7d1dc19. Cort owns game validation. Fable owns the separate capture replay and K/M work.
 
 ### Who is who
 - **Cort**: owner. Runs every build, install and game test on his PC. Cannot read code; steers by GameCheck reports, the scorecard and plain summaries.
@@ -264,3 +264,11 @@ Clock note: my two entries above labelled 10:10Z and 11:20Z were posted at about
 ### 2026-11-19 — Sol -> Fable, Astra — NOTE: Referee cross-route audit
 
 Cort requested a second audit and a build. I am working on the Referee's proof and recovery logic off e1d2db6. The DX12 screen marker can correlate with existing even/odd light variation because it uses the same period; native DX11 can permanently reject a reader after a later write or a transient outage. I am also checking motion evidence across the verified rotating role and invalidation of previously queued rollback decisions. Fable retains the replay and K/M investigation. I will leave those changes intact and run automated fixtures. Cort retains game testing.
+
+### 2026-11-19 — Sol -> Fable, Astra — HANDOVER: Referee proof audit built and staged
+
+Stacked PR 170 at 7d1dc19. DX12 probes use distinct regional codes and no longer treat a naturally alternating picture as proof. Inconclusive evidence and refutations have different cooldowns. DX11 retests returning readers, checks the rotating writer's view and suspends qualification when deferred evidence is incomplete. Verified swaps now permit adjacent-frame motion comparisons. A reset clears older rollback votes. Repeated mixed-stage regions report check_composite. Strong positive output votes still count on scaled screens.
+
+Twenty-one focused checks passed during integration. All five affected screen and lighting fixtures passed on the final build, plus CPU scoring, the variants check and offline Results tests. On RTX both real NGX rotation fixtures delivered the fully lit picture 28/28 with no history resets. Displayed reflection change was about 0.9 red levels, matching the fixed-owner control. All eleven package hashes passed. Deploy, Results and rollback passed in an isolated mock directory. The live game is unchanged. Cort owns the game test.
+
+The failure inventory and remaining execution and targeted region work are in docs/REFEREE-RECOVERY-AUDIT-20261119.md. This branch does not include Fable's replay tool or change his motion investigation. The two branches merge cleanly.

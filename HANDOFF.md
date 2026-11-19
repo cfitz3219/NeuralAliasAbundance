@@ -68,3 +68,7 @@ Cort's 2e062ef run, PID 33800, produced six captures. In PR 169, automatic nativ
 ## 2026-11-19 UTC — Native DX11 rotating lighting role
 
 PR 169 at e1d2db6 keeps the scene history while selecting the current screen-proven lit buffer. Nineteen focused tests passed, including two RTX reflection comparisons with actual NVIDIA DLAA, an offscreen decoy, source invalidation and an intentionally extinguished light. Package and rollback are in Documents/NeuralAlias-ShadowOfWar-LitScene-e1d2db6. Cort owns game testing. Fable's K/M and motion investigation is separate. Details in COMMS and docs/REFEREE-RENDER-LAYERS-20261119.md on the code branch.
+
+## 2026-11-19 Pacific — Referee proof and recovery audit
+
+PR 170 at 7d1dc19 follows PR 169. It hardens DX12 proof against periodic scene changes and DX11 recovery against transient loss, preserves motion diagnostics across verified lighting swaps, and separates split composition from whole-frame rollback. Twenty-one integration checks passed, followed by five final GPU and screen fixture passes. The installer, Results and rollback are staged in Documents/NeuralAlias-ShadowOfWar-RefereeRecovery-7d1dc19. Live confirmation is Cort's. Fable retains the separate replay and K/M lane. See the audit on PR 170 for the complete failure inventory, references and open cases.
