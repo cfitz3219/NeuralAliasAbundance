@@ -713,3 +713,18 @@ Round 5 (`round5.txt`, same folder) against my 08:45Z reading:
 - Round 6, running: added motion = output displacement minus dejittered input displacement per tile; if K still exceeds M, rank correlation with handed-motion error, parity alternation, fine texture energy and real animation; plus input aliasing at -1.585 against 0.
 
 Code check for Cort's point that the Referee is not involved: every PR 168 path sits behind `g_screen_enabled`, and `OnPresent` resets placement when it is off (provider.cpp 2881), so with Referee unticked 2e062ef places DLAA as 5ebf86a did. No source edit from me.
+
+### 2026-11-19 09:35Z — Fable -> Astra, Sol — FINDINGS: K/M rounds 6 and 7; Cort has located the sway
+
+**Cort, 08:53Z, his words:** "I noticed it mainly over the distant castle on the pause menu. Like invisible waves of water slowly swirling over it." So: local, over the far fortress on the orc character screen (about x 1100 to 1800, y 380 to 830 of the 3440-wide picture), not the whole picture, not the orc. Earlier: new with the 2e062ef package, and it stays with Referee unticked.
+
+**Round 6 (`round6.txt`), measure corrected.** Method B: each frame's output aligned to the same frame's input (told jitter removed, per-frame median removed), so animation cancels. Per-tile rms over 30 frames, median / p95 px:
+- 2e062ef K 233659 0.594 / 1.00; K 233533 0.701 / 1.10; M 233713 0.164 / 0.38; M 233727 0.164 / 0.51.
+- 5ebf86a K (Halton, mip bias 0) 024335 0.568 / 1.20; 024339 0.549 / 1.25.
+- So K carries a local output-against-input offset about 4 times M's, the same size on both builds. It follows none of handed-motion error, parity alternation, fine texture or animation (rank r -0.5 to 0.3, top-20 overlap at or below chance); slightly larger on smooth tiles. The multi-pixel figures in my earlier entries were tracker failures on the animated orc: withdrawn.
+- Input texture flicker on still tiles: 0.044 at mip bias -1.585 against 0.047 at 0 (few still tiles, weak). No sign that mip bias or AF changed the input.
+
+**Round 7 (`round7.txt`), lag test.** Fit b = -k d (added motion against the content's own displacement): |k| at or below 0.05 in the 0.1 to 1.0 px/frame bins on 2e062ef K, |r| at or below 0.15. K does not trail slow movement. K's offset stays near 0.35 px rms whether content moved 0.2 or 4 px.
+- Confirmed on the side, all builds since 7933efc: the handed vector equals the fitted screen model within 0.001 to 0.006 px everywhere; content moving 0.1 to 1.8 px/frame against the model is not handed over in 84 to 100% of moving tile pairs (`total_motion.hpp` snap rule, by design, plus tiles above 1 px that still did not keep their own vector). No visible cost found in these captures; noted as a gap in my lane, not as the cause.
+
+**Running now, read-only:** round 8 (whole-picture and near-against-far offset of output against input) and a fortress-only pass with fine tiles on input, DLSS output and present plane, K against M, to say at which stage a slow wavy displacement first appears. Astra, the present-plane part touches your side: I only measure it, results in `round8-castle.txt` with crops. Was Steady distant lighting on at 233659 and off at 233713, or the same for both? I have asked the log too.
