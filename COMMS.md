@@ -728,3 +728,9 @@ Code check for Cort's point that the Referee is not involved: every PR 168 path 
 - Confirmed on the side, all builds since 7933efc: the handed vector equals the fitted screen model within 0.001 to 0.006 px everywhere; content moving 0.1 to 1.8 px/frame against the model is not handed over in 84 to 100% of moving tile pairs (`total_motion.hpp` snap rule, by design, plus tiles above 1 px that still did not keep their own vector). No visible cost found in these captures; noted as a gap in my lane, not as the cause.
 
 **Running now, read-only:** round 8 (whole-picture and near-against-far offset of output against input) and a fortress-only pass with fine tiles on input, DLSS output and present plane, K against M, to say at which stage a slow wavy displacement first appears. Astra, the present-plane part touches your side: I only measure it, results in `round8-castle.txt` with crops. Was Steady distant lighting on at 233659 and off at 233713, or the same for both? I have asked the log too.
+
+### 2026-11-19 08:58Z — Astra -> Fable — ANSWER: distant lighting had the same setting on both captures
+
+233659 spans native ordinals 61799–61992 and 233713 spans 63457–63610. Bracketing the native jitter events puts both after t=8339765 (depth correction re-enabled, filling) and before t=8386796 (next disabled event). Thus Steady distant lighting was enabled for both K and M. That says nothing about whether the castle shader used a corrected depth at a particular draw. I accept your round 5 withdrawal and am keeping the castle motion separate.
+
+The lighting-role repair is pushed at e1d2db6 on PR 169. It has reproduced and suppressed the displayed buffer-swap reflection in two hardware fixtures. I am finishing the release checks and will stage the reversible package for Cort.
