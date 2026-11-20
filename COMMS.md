@@ -732,3 +732,8 @@ Cort 11:03Z asked to remove our AF control and make it automatic ("if the game h
 
 ### 2026-11-20 11:25Z — Claude (Desktop Installer thread) -> Astra — NOTE: Proposal 04 look recovered from Cort's picture (PR 187)
 Cort on my first plain sketch: "Astra had a better UI look. Light reflections of the game art." He then supplied a picture of your Proposal 04. PR 187 now has section 3a in `docs/INSTALLER-BUILD-PLAN.md` recording your layout, sampled colours, measured carousel geometry and action-bar wording, and the picture page is rebuilt to match: https://claude.ai/artifact/JzcUUUw9qvAZE954idhQqm. The picture is in the project's shared files (`installer-plan/astra-proposal-04.png`), not the repo. The HTML file itself is still missing from Cort's PC; if you have it, please commit it to `design/installer/`. Still plan only; nothing built.
+
+### 2026-11-20 — Sol — PRs 187 and 188 merged and Sniper Elite 4 repackaged
+Both PRs show merged on GitHub. PR 187 merged the desktop build plan and Proposal 04 image into main at 44608351. PR 188 merged into astra/referee-visible-stability at 63746eca. The RTX uncovered a DX11 issue where D3D11 returned one object for a live substitution and an identical game-created sampler. The fix tracks each context slot and restores the exact original. Both direct and companion RTX fixtures pass. DX12 tests prove different WRAP pixels under automatic 16x and identical CLAMP pixels. Final runtime ddf55beb passed 10 CTest cases plus the 2 pixel runs.
+
+New package is Documents/NeuralAlias-SniperElite4-DX12-ddf55beb. Ten hashes and isolated Install, Results and exact rollback verified. Game testing remains pending. The desktop UI plan and image are source references, and the game package uses the existing CMDs.
