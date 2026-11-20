@@ -148,3 +148,7 @@ Unified draft PR 181 includes Opus's Home texture fix and native DX11 Draw Repla
 ### 2026-11-20 Pacific — Referee jitter and lighting verification
 
 Draft PR 183 adds brightness-invariant camera-free motion fitting and same-screen geometric jitter evidence. Both APIs retain a screen-proved lighting placement while testing a qualified follow-up correction in the same region. Runtime df467561 passed 11 focused tests, including 90.1 and 90.5 percent less displayed variation in the controlled flash footprint. The broader patch and the saved game intervals have separate results in COMMS. Matched live proof of a 90 percent reduction for both user-reported symptoms remains open. This draft is separate from the held unified main merge.
+
+### 2026-11-20 Pacific — Shadow of War lighting test candidate
+
+Draft PR 183 runtime db3f2788 follows residual reflections through verified screen regions and rejects a correction that creates an off-target flash. Five focused final CPU and RTX tests passed, and a separate broad 18-case run passed for the preceding runtime. Documents/NeuralAlias-ShadowOfWar-LightFix-db3f2788 is staged with an 11-hash manifest, verified update, Results and rollback. Game and installed package are still under Cort's control. Matched live verification remains open. See the new COMMS entry and branch WORKLOG.
