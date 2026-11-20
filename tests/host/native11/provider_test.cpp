@@ -1090,6 +1090,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             uint64_t scene = 0, camera = 0;
             std::vector<int> previous;
         };
+        bool alternate_every_frame = false;
         bool start_fault = !composition_fault;
         auto record = [&](int i, bool light_on, Sample* sample, bool pinned = false, bool overwrite = false,
                           bool clear_before_reader = false) {
@@ -1098,7 +1099,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             evaluator.received = nullptr;
             evaluator.proof = 0;
             // Only the parity fixture swaps roles on every frame.
-            const bool swap_roles = !pinned && (parity_roles ? i % 2 != 0 : (i % 7 == 2 || i % 7 == 4 || i % 7 == 5));
+            const bool swap_roles = !pinned && (alternate_every_frame ? i % 2 != 0 : (i % 7 == 2 || i % 7 == 4 || i % 7 == 5));
             auto* early_rt = swap_roles ? peer.rtv.Get() : game.color_rtv.Get();
             auto* late_rt = swap_roles ? game.color_rtv.Get() : peer.rtv.Get();
             auto* early = swap_roles ? peer.srv.Get() : game.color_srv.Get();
@@ -1215,6 +1216,12 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             return SUCCEEDED(game.swap->Present(0, 0));
         };
         Sample baseline, fixed, dim, pinned, pinned_dim;
+        if (parity_roles) {
+            // Establish an ordinary physical owner before the scene begins
+            // swapping roles every frame. This is the incumbent under test.
+            for (int i = 0; i < 70; ++i) if (!record(i, true, nullptr)) return 1;
+            alternate_every_frame = true;
+        }
         for (int i = 0; i < 70; ++i) if (!record(i, true, i < 42 ? nullptr : &baseline)) return 1;
         na::settings::Get().referee_enabled.store(1);
         na::native11::SetScreenCheck(true);
