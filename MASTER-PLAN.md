@@ -32,6 +32,8 @@ Preserve proven engine and game adapters while assessing what transfers. The exa
 
 **Referee parity (2026-11-19, Cort):** Route B runs the same decision policy for DX11 and DX12. Both can nominate a verified placement for localized flicker or incomplete delivery, compare the displayed result, keep an improvement, and move on to other available corrections. API adapters supply actual resource, reader, submission and presentation evidence and execute the selected action. New recovery behavior belongs in the shared Referee and should receive equivalent-evidence tests for both paths.
 
+**Unified main branch (2026-11-20, Cort):** After Fable's final handoff, integrate the remaining work and the shared Referee into GitHub's `main`. Maintain one source baseline and build path for both routes and graphics APIs. Preserve the tested adapters and publish integration work to GitHub as it progresses. Draft PR 181 is the current integration candidate.
+
 ## 0. The method: how the program grows, and how we prove it (2026-11-11, v3)
 
 **Cort, 2026-11-11:** "We need a planned method after we confirm it works in all games tested. After that we need an actual way to solidly confirm we are growing and not receding. Something professional... a method to the madness that's consistent. That a program becomes intelligent and adaptive to any game type it comes in contact with. We do not want a simple hodge podge of code scripts lazily bound together." Later: the checker "would be separate from the main program."
