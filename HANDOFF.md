@@ -152,3 +152,7 @@ Draft PR 183 adds brightness-invariant camera-free motion fitting and same-scree
 ### 2026-11-20 Pacific — Shadow of War lighting test candidate
 
 Draft PR 183 runtime db3f2788 follows residual reflections through verified screen regions and rejects a correction that creates an off-target flash. Five focused final CPU and RTX tests passed, and a separate broad 18-case run passed for the preceding runtime. Documents/NeuralAlias-ShadowOfWar-LightFix-db3f2788 is staged with an 11-hash manifest, verified update, Results and rollback. Game and installed package are still under Cort's control. Matched live verification remains open. See the new COMMS entry and branch WORKLOG.
+
+### 2026-11-20 Pacific — Cort placed the lighting and jitter package on hold
+
+Cort requires at least 90 percent verified reduction for the reported lighting and vibration before any further build or installer. The earlier db3f2788 candidate is withheld from use. There are no game or installer changes in this handoff. Astra is prioritizing the jitter signal on existing captures while Opus and Fable have the lighting evidence and remaining gap in COMMS.
