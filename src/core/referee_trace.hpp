@@ -81,32 +81,47 @@ struct TileShift {
 
 inline TileShift MeasureTileShift(const float* before, const float* after)
 {
+    // Remove pixel-grid aliasing before estimating a subpixel displacement.
+    // Apply the same one-pixel binomial filter to both registered patches.
+    constexpr unsigned filtered = kTile - 2;
+    const auto smooth = [](const float* src) {
+        std::array<float, filtered * filtered> patch{};
+        for (unsigned y = 0; y < filtered; ++y) {
+            for (unsigned x = 0; x < filtered; ++x) {
+                const auto* p = src + y*kTile + x;
+                const auto row = [](const float* r) { return r[0] + 2.f*r[1] + r[2]; };
+                patch[y*filtered + x] = (row(p) + 2.f*row(p + kTile) + row(p + 2*kTile)) / 16.f;
+            }
+        }
+        return patch;
+    };
+    const auto a = smooth(before), b = smooth(after);
     double sx = 0, sy = 0, sd = 0, xx = 0, xy = 0, yy = 0, xd = 0, yd = 0, dd = 0;
     unsigned n = 0;
-    for (unsigned y = 2; y + 2 < kTile; ++y) {
-        for (unsigned x = 2; x + 2 < kTile; ++x) {
-            const unsigned i = y * kTile + x;
-            const double gx = .25 * ((before[i + 1] - before[i - 1]) + (after[i + 1] - after[i - 1]));
-            const double gy = .25 * ((before[i + kTile] - before[i - kTile]) + (after[i + kTile] - after[i - kTile]));
-            const double d = before[i] - after[i];
+    for (unsigned y = 2; y + 2 < filtered; ++y) {
+        for (unsigned x = 2; x + 2 < filtered; ++x) {
+            const unsigned i = y * filtered + x;
+            const double gx = .25 * ((a[i + 1] - a[i - 1]) + (b[i + 1] - b[i - 1]));
+            const double gy = .25 * ((a[i + filtered] - a[i - filtered]) + (b[i + filtered] - b[i - filtered]));
+            const double d = a[i] - b[i];
             if (!std::isfinite(gx) || !std::isfinite(gy) || !std::isfinite(d) ||
-                (std::max)(before[i], after[i]) <= -10.f) continue;
+                (std::max)(a[i], b[i]) <= -10.f) continue;
             sx += gx; sy += gy; sd += d;
             xx += gx * gx; xy += gx * gy; yy += gy * gy;
             xd += gx * d; yd += gy * d; dd += d * d;
             ++n;
         }
     }
-    constexpr auto inner = (kTile - 4) * (kTile - 4);
+    constexpr auto inner = (filtered - 4) * (filtered - 4);
     if (n < inner * 3 / 4) return {};
     const double inv_n = 1.0 / n;
     xx -= sx * sx * inv_n; xy -= sx * sy * inv_n; yy -= sy * sy * inv_n;
     xd -= sx * sd * inv_n; yd -= sy * sd * inv_n; dd -= sd * sd * inv_n;
     const double power = xx + yy, det = xx * yy - xy * xy;
-    if (!(power >= .0002 * n && det > .015 * power * power)) return {};
+    if (!(power >= .0001 * n && det > .015 * power * power)) return {};
     const double dx = (yy * xd - xy * yd) / det, dy = (xx * yd - xy * xd) / det;
     const double unexplained = dd - dx * xd - dy * yd;
-    if (!(std::hypot(dx, dy) < 1.5 && unexplained < power * .04)) return {};
+    if (!(std::hypot(dx, dy) < 1.5 && unexplained < power * .16)) return {};
     return {float(dx), float(dy), true};
 }
 
@@ -114,23 +129,10 @@ struct JitterDisplacement {
     TileShift raster, reconstructed, presented;
     float phase_x = 0, phase_y = 0;
     bool Valid() const { return raster.valid && reconstructed.valid && presented.valid; }
-    float ScreenError() const
+    float PhaseProjection(const TileShift& shift) const
     {
-        return std::hypot(presented.x - raster.x + phase_x, presented.y - raster.y + phase_y);
-    }
-    float ModelError() const
-    {
-        return std::hypot(reconstructed.x - raster.x + phase_x, reconstructed.y - raster.y + phase_y);
-    }
-    float PhaseProjection() const
-    {
-        return ((presented.x - raster.x + phase_x) * phase_x +
-                (presented.y - raster.y + phase_y) * phase_y) / std::hypot(phase_x, phase_y);
-    }
-    float ReconstructedProjection() const
-    {
-        return ((reconstructed.x - raster.x + phase_x) * phase_x +
-                (reconstructed.y - raster.y + phase_y) * phase_y) / std::hypot(phase_x, phase_y);
+        return ((shift.x - raster.x + phase_x) * phase_x +
+                (shift.y - raster.y + phase_y) * phase_y) / std::hypot(phase_x, phase_y);
     }
 };
 
@@ -143,12 +145,16 @@ struct JitterVibration {
         float presented = 0, reconstructed = 0;
     };
     std::array<Sample, 8> pairs{};
-    unsigned count = 0, cursor = 0;
+    unsigned count = 0, cursor = 0, misses = 0;
 
     void Add(const JitterDisplacement& d)
     {
-        if (!d.Valid() || std::hypot(d.phase_x, d.phase_y) < .25f) return;
-        pairs[cursor] = {d.phase_x, d.phase_y, d.PhaseProjection(), d.ReconstructedProjection()};
+        if (!d.Valid() || std::hypot(d.phase_x, d.phase_y) < .25f) {
+            if (count && ++misses >= 2) count = cursor = 0;
+            return;
+        }
+        misses = 0;
+        pairs[cursor] = {d.phase_x, d.phase_y, d.PhaseProjection(d.presented), d.PhaseProjection(d.reconstructed)};
         cursor = (cursor + 1) % pairs.size();
         count = (std::min)(count + 1, static_cast<unsigned>(pairs.size()));
     }

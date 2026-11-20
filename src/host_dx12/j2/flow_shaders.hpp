@@ -175,10 +175,11 @@ float prev_luma(float2 q) { return luma(t_prev.SampleLevel(s_lin, q / float2(w, 
 // The current picture around p: nine places two pixels apart, each one's gradient (central
 // differences one pixel either side), the structure sums and the local contrast (with the one
 // sample that carries most of the range set aside). 33 reads.
-struct Window { float lc[9]; float2 g[9]; float3 a; float contrast; };
-Window window_at(float2 p) {
+struct Window { float lc[9]; float2 g[9]; float3 a; float2 mean_g; float contrast; };
+Window window_at(float2 p, bool match_light) {
     Window win;
     win.a = 0;
+    win.mean_g = 0;
     float side[12], updown[12];
     [unroll] for (int sj = -1; sj <= 1; ++sj) {
         [unroll] for (int sm = 0; sm < 4; ++sm) side[(sj + 1) * 4 + sm] = cur_luma(p + float2(2 * sm - 3, 2 * sj));
@@ -196,11 +197,17 @@ Window window_at(float2 p) {
             win.lc[k] = c;
             win.g[k] = g;
             win.a += float3(g.x * g.x, g.x * g.y, g.y * g.y);
+            if (match_light) win.mean_g += g;
             if (c > hi) { hi2 = hi; hi = c; }
             else if (c > hi2) hi2 = c;
             if (c < lo) { lo2 = lo; lo = c; }
             else if (c < lo2) lo2 = c;
         }
+    }
+    if (match_light) {
+        win.mean_g /= 9.0;
+        win.a -= 9.0 * float3(win.mean_g.x * win.mean_g.x, win.mean_g.x * win.mean_g.y, win.mean_g.y * win.mean_g.y);
+        win.a.xz = max(0.0, win.a.xz);
     }
     win.contrast = max(0.0, min(hi2 - lo, hi - lo2));
     return win;
@@ -208,7 +215,7 @@ Window window_at(float2 p) {
 // Bounded refinement of one hypothesis v0: two damped Gauss-Newton steps on the window with the
 // current picture's gradients; on an edge the vector moves across the edge only. Returns the best
 // vector met (v0 included) in xy, its mean |luma| error in z, and the error of v0 exactly in w.
-float4 refine(float2 p, float2 v0, Window win) {
+float4 refine(float2 p, float2 v0, Window win, bool match_light) {
     float a11 = win.a.x + kTotalDamp, a22 = win.a.z + kTotalDamp, a12 = win.a.y;
     float det = a11 * a22 - a12 * a12;
     float mid = 0.5 * (a11 + a22);
@@ -222,14 +229,21 @@ float4 refine(float2 p, float2 v0, Window win) {
     float e = 0, e0 = 0;
     [unroll] for (int it = 0; it <= 2; ++it) {
         float2 b = 0;
-        float err = 0;
+        float mean = 0, err = 0;
+        float difference[9];
         [unroll] for (int rj = -1; rj <= 1; ++rj) {
             [unroll] for (int ri = -1; ri <= 1; ++ri) {
                 int k = (rj + 1) * 3 + (ri + 1);
                 float d = prev_luma(p + float2(2 * ri, 2 * rj) + c) - win.lc[k];
                 b += win.g[k] * d;
-                err += abs(d);
+                if (match_light) { mean += d; difference[k] = d; }
+                else err += abs(d);
             }
+        }
+        if (match_light) {
+            b -= win.mean_g * mean;
+            mean /= 9.0;
+            [unroll] for (int k = 0; k < 9; ++k) err += abs(difference[k] - mean);
         }
         err /= 9.0;
         if (it == 0) { e0 = err; e = err; }
@@ -247,15 +261,16 @@ float4 refine(float2 p, float2 v0, Window win) {
 // search vector (total_motion.hpp BestVector). False: the pictures cannot measure here (flat, or
 // neither explains them). e_with: the error `hyp` leaves exactly; limit: what counts as explaining;
 // e_snap: the least error `hyp` leaves within its refinement's bound (the sampling snap's range).
-bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, out float2 best, out float e_best, out float e_with, out float limit, out float e_snap) {
+bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, bool match_light,
+                 out float2 best, out float e_best, out float e_with, out float limit, out float e_snap) {
     best = hyp; e_best = 0; e_with = 0; limit = 0; e_snap = 0;
-    Window win = window_at(p);
-    bool textured = win.contrast >= kTotalTextureMin;
+    Window win = window_at(p, match_light);
+    bool textured = win.contrast >= kTotalTextureMin && (!match_light || win.a.x + win.a.z >= kTotalDamp);
     if (textured) {
-        float4 z = refine(p, hyp, win);
+        float4 z = refine(p, hyp, win, match_light);
         best = z.xy; e_best = z.z; e_snap = z.z; e_with = z.w;
         if (raw_on && any(raw != hyp)) {
-            float4 r = refine(p, raw, win);
+            float4 r = refine(p, raw, win, match_light);
             if (r.z <= z.z) { best = r.xy; e_best = r.z; }
         }
         // Explaining the picture: a small error in itself and small beside the window's own contrast.
@@ -345,7 +360,9 @@ void fit_sample(uint3 id : SV_DispatchThreadID) {
         float2 q = p + raw;
         bool raw_on = have_raw && q.x >= 0.0 && q.y >= 0.0 && q.x <= float(w) && q.y <= float(h);
         float2 best; float e_best, e_with, limit, e_snap;
-        bool confirmed = best_vector(p, float2(0, 0), raw_on, raw, best, e_best, e_with, limit, e_snap);
+        // A coherent brightness change is not a shift. Without this, a
+        // changing light on a strong slope biases the fitted camera motion.
+        bool confirmed = best_vector(p, float2(0, 0), raw_on, raw, true, best, e_best, e_with, limit, e_snap);
         o = float4(best, nearness_of(t_color[c].x), confirmed ? 1.0 : 0.0);
     }
     u_enc[id.xy] = o;
@@ -705,7 +722,7 @@ void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             float2 hyp = 0;
             if (have_screen) hyp = screen_at(p, min(own_nearness, t_res[int2(5, row)].y), row);
             float2 best; float e_best, e_with, limit, e_snap;
-            if (best_vector(p, hyp, raw_on, raw, best, e_best, e_with, limit, e_snap)) {
+            if (best_vector(p, hyp, raw_on, raw, false, best, e_best, e_with, limit, e_snap)) {
                 valid = 1.0;
                 // The hypothesis stands unless the pixel's own vector explains the picture clearly
                 // better. With a model: inside the sampling snap's range the pictures cannot tell

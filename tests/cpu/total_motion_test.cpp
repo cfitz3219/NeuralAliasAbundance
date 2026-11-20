@@ -237,6 +237,41 @@ int main()
             CHECK(t.Share(t.moving) + t.Share(t.still) > 0.95 && t.p95 <= 0.22f);
             CHECK(t.mean_x > 0.1 && t.mean_x < 0.25);
         }},
+        {"screen fit does not turn alternate lighting into geometry", [] {
+            constexpr unsigned w = 64, h = 48;
+            const auto render = [](float dx, float light) {
+                std::vector<float> pixels(w * h);
+                for (unsigned y = 0; y < h; ++y) for (unsigned x = 0; x < w; ++x) {
+                    const float u = x - dx;
+                    pixels[y * w + x] = .43f + .12f * std::sin(.30f*u + .13f*y) +
+                        .11f * std::cos(.24f*y - .08f*u) + light;
+                }
+                return pixels;
+            };
+            const auto previous = render(0.f, 0.f);
+            const auto flash = render(0.f, .025f);
+            const auto pan = render(.23f, .025f);
+            const Image before{previous.data(), w, h};
+            const Image still{flash.data(), w, h};
+            const Image moved{pan.data(), w, h};
+            double original = 0, corrected = 0, motion = 0;
+            unsigned count = 0;
+            for (unsigned y = 6; y < h-6; y += 4) for (unsigned x = 6; x < w-6; x += 4) {
+                const float px = x + .5f, py = y + .5f;
+                float ox, oy, nx, ny, mx, my, error, base, limit, snap;
+                if (!BestVector(still, before, px, py, false, 0, 0, 0, 0, {}, ox, oy, error, base, limit, snap) ||
+                    !SamplePixel(still, before, px, py, false, 0, 0, nx, ny) ||
+                    !SamplePixel(moved, before, px, py, false, 0, 0, mx, my)) continue;
+                original += std::hypot(ox, oy);
+                corrected += std::hypot(nx, ny);
+                motion += mx;
+                ++count;
+            }
+            std::printf("    light-only false motion %.5f -> %.5f px; pan %.5f px (expected -0.23), %u patches\n",
+                original / count, corrected / count, motion / count, count);
+            CHECK(count > 30 && original / count > .16 && corrected <= original * .10);
+            NEAR(motion / count, -.23, .05);
+        }},
         {"motion nobody found is not known, and never still", [] {
             const Tally t = Measure(Pan(3.4f, false, true), Uniform(-3.4f, 0), Search(false, 0, 0), "pan 3.4 px, no search vector");
             CHECK(t.Share(t.nothing) > 0.93 && t.Share(t.still) < 0.02 && t.approximate == 0);

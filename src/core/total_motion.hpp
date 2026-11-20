@@ -108,10 +108,11 @@ struct Window {
     float lc[9];
     float gx[9], gy[9];
     float a11 = 0, a12 = 0, a22 = 0;
+    float mean_gx = 0, mean_gy = 0;
     float contrast = 0;
 };
 
-inline Window WindowAt(const Image& cur, float px, float py, bool lone = true)
+inline Window WindowAt(const Image& cur, float px, float py, bool lone = true, bool match_light = false)
 {
     float side[3][4], updown[4][3]; // one pixel left/right of each sample; one pixel above/below
     for (int j = -1; j <= 1; ++j)
@@ -126,6 +127,10 @@ inline Window WindowAt(const Image& cur, float px, float py, bool lone = true)
             w.lc[k] = Sample(cur, px + float(kSpacing * i), py + float(kSpacing * j));
             w.gx[k] = 0.5f * (side[j + 1][i + 2] - side[j + 1][i + 1]);
             w.gy[k] = 0.5f * (updown[j + 2][i + 1] - updown[j + 1][i + 1]);
+            if (match_light) {
+                w.mean_gx += w.gx[k];
+                w.mean_gy += w.gy[k];
+            }
             w.a11 += w.gx[k] * w.gx[k];
             w.a12 += w.gx[k] * w.gy[k];
             w.a22 += w.gy[k] * w.gy[k];
@@ -136,6 +141,13 @@ inline Window WindowAt(const Image& cur, float px, float py, bool lone = true)
             else if (c < lo2) lo2 = c;
         }
     }
+    if (match_light) {
+        w.mean_gx /= 9.f;
+        w.mean_gy /= 9.f;
+        w.a11 = (std::max)(0.f, w.a11 - 9.f * w.mean_gx * w.mean_gx);
+        w.a12 -= 9.f * w.mean_gx * w.mean_gy;
+        w.a22 = (std::max)(0.f, w.a22 - 9.f * w.mean_gy * w.mean_gy);
+    }
     w.contrast = lone ? (std::max)(0.0f, (std::min)(hi2 - lo, hi - lo2)) : hi - lo;
     return w;
 }
@@ -144,7 +156,7 @@ inline Window WindowAt(const Image& cur, float px, float py, bool lone = true)
 // picture's gradients. Returns the best vector met (the hypothesis itself included), its mean
 // |luma| error `e`, and the error `e0` of the hypothesis exactly. 9 samples per evaluation.
 inline void Refine(const Image& prev, const Window& w, float px, float py, float v0x, float v0y, const Params& p,
-                   float& vx, float& vy, float& e, float& e0)
+                   float& vx, float& vy, float& e, float& e0, bool match_light = false)
 {
     const float a11 = w.a11 + p.damp, a22 = w.a22 + p.damp, a12 = w.a12;
     const float det = a11 * a22 - a12 * a12;
@@ -162,15 +174,24 @@ inline void Refine(const Image& prev, const Window& w, float px, float py, float
     vy = v0y;
     e = e0 = 0;
     for (int step = 0; step <= p.steps; ++step) {
-        float bx = 0, by = 0, err = 0;
+        float bx = 0, by = 0, mean = 0, err = 0;
+        float difference[9];
         for (int j = -1; j <= 1; ++j) {
             for (int i = -1; i <= 1; ++i) {
                 const int k = (j + 1) * 3 + (i + 1);
                 const float d = Sample(prev, px + float(kSpacing * i) + cx, py + float(kSpacing * j) + cy) - w.lc[k];
                 bx += w.gx[k] * d;
                 by += w.gy[k] * d;
-                err += std::fabs(d);
+                if (match_light) { mean += d; difference[k] = d; }
+                else err += std::fabs(d);
             }
+        }
+        if (match_light) {
+            bx -= w.mean_gx * mean;
+            by -= w.mean_gy * mean;
+            mean /= 9.f;
+            // A uniform light change explains the patch without moving it.
+            for (const float d : difference) err += std::fabs(d - mean);
         }
         err /= 9.0f;
         if (step == 0) e0 = e = err;
@@ -196,21 +217,22 @@ inline void Refine(const Image& prev, const Window& w, float px, float py, float
 // `e_with`: the error the hypothesis leaves exactly; `limit`: what counts as explaining the picture;
 // `e_snap`: the least error the hypothesis leaves within its refinement's bound (the sampling snap's range).
 inline bool BestVector(const Image& cur, const Image& prev, float px, float py, bool raw_on, float raw_x, float raw_y, float hx,
-                       float hy, const Params& p, float& bx, float& by, float& eb, float& e_with, float& limit, float& e_snap)
+                       float hy, const Params& p, float& bx, float& by, float& eb, float& e_with, float& limit, float& e_snap,
+                       bool match_light = false)
 {
     bx = hx;
     by = hy;
     eb = e_with = limit = e_snap = 0;
-    const Window w = WindowAt(cur, px, py, p.lone);
-    if (w.contrast < p.texture_min) return false;
+    const Window w = WindowAt(cur, px, py, p.lone, match_light);
+    if (w.contrast < p.texture_min || (match_light && w.a11 + w.a22 < p.damp)) return false;
     float zx, zy, ez;
-    Refine(prev, w, px, py, hx, hy, p, zx, zy, ez, e_with);
+    Refine(prev, w, px, py, hx, hy, p, zx, zy, ez, e_with, match_light);
     bx = zx;
     by = zy;
     eb = e_snap = ez;
     if (raw_on && (raw_x != hx || raw_y != hy)) {
         float rx, ry, er, er0;
-        Refine(prev, w, px, py, raw_x, raw_y, p, rx, ry, er, er0);
+        Refine(prev, w, px, py, raw_x, raw_y, p, rx, ry, er, er0, match_light);
         if (er <= ez) { bx = rx; by = ry; eb = er; }
     }
     // Explaining the picture: a small error in itself, and small beside the window's own contrast
@@ -232,7 +254,8 @@ inline bool SamplePixel(const Image& cur, const Image& prev, float px, float py,
                         float& vx, float& vy, const Params& p = {})
 {
     float eb, e_with, limit, e_snap;
-    return BestVector(cur, prev, px, py, RawOn(cur, px, py, have_raw, raw_x, raw_y), raw_x, raw_y, 0.0f, 0.0f, p, vx, vy, eb, e_with, limit, e_snap);
+    return BestVector(cur, prev, px, py, RawOn(cur, px, py, have_raw, raw_x, raw_y), raw_x, raw_y, 0.0f, 0.0f, p,
+                      vx, vy, eb, e_with, limit, e_snap, true);
 }
 
 // One pixel, at most 33 + 2 * 27 samples. (px, py): its position in the stabilised pictures (raster pixel centre minus the
