@@ -157,6 +157,23 @@ struct ColorEvent {
     uint64_t producer = 0;     // consumer/barrier: pipeline of the preceding write in this recording
     bool list_start = false;   // first event of a recording (frame sequences span several lists)
 };
+
+// Work backwards from the first actual read of the final scene version.
+// A barrier can end the producer list, but it cannot consume a picture.
+inline bool HasSeparateSceneReader(const std::vector<ColorEvent>& events)
+{
+    bool crossed_list = false;
+    bool reads = false;
+    for (auto i = events.rbegin(); i != events.rend(); ++i) {
+        if (i->write) return reads && crossed_list && i->with_depth;
+        if (IsConsumer(i->op)) {
+            reads = true;
+            crossed_list = false;
+        }
+        crossed_list |= i->list_start;
+    }
+    return false;
+}
 // What one later list of a submission says about a scene ending placed before it:
 //  +1 the scene continues (a draw into the colour before the picture is copied onward),
 //  -1 the picture is copied onward here (anything later reuses the texture; stop looking),

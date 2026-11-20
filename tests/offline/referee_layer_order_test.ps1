@@ -59,3 +59,8 @@ $regional = @(Get-RefereeSummary @(
 ))
 if (-not ($regional -like '*81,32*240,46*') -or -not ($regional -like '*Replacement kept*original bypass*') -or
     ($regional -like '*brightness change in stops*')) { throw 'Regional replacement evidence was lost in the results' }
+
+$dx12 = @(Get-RefereeSummary @(
+    'event dx12_route_trial next_frame=202 phase=kept region=11 stops=0.000/0.000/0.000 regional=1 why=the original bypass returned on recheck'
+))
+if (-not ($dx12 -like '*Replacement kept*original bypass*')) { throw 'DX12 placement trial was lost in the results' }

@@ -13,6 +13,7 @@
 #include "core/referee_recovery.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/j2/referee_placement.hpp"
 #include "host_dx12/settings.hpp"
 
 #include <cmath>
@@ -106,6 +107,7 @@ struct Images {
     ID3D12Resource *prev, *input, *output, *motion, *screen;
     bool unknown_geometry = false;
 };
+using PlacementPath = na::referee::shadow::Path;
 struct TracePair {
     ID3D12Resource* before_output;
     ID3D12Resource* before_screen;
@@ -113,6 +115,7 @@ struct TracePair {
     uint64_t ticket = 0, configuration = 0;
     bool returned_present = true;
     uint8_t tools = 0, applied = 0, main_tools = 255;
+    PlacementPath path = PlacementPath::Inline, alternate = PlacementPath::None;
 };
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
@@ -135,6 +138,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     if (trace) {
         e.context.trial_ticket = trace->ticket;
         e.context.trial_configuration = trace->configuration;
+        if (!native_proof) e.context.placement.path = trace->path;
     }
     const bool native11 = native_proof != 0;
     e.present_ordinal = ++ordinal;
@@ -183,7 +187,11 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     CHECK(!rg::NeedsScreen({ordinal, &l}));
     if (late && !blocked) ordinal += 7;
     rg::Presentation current{ordinal, &d, true, true, native11};
-    if (trace) current.await_result = trace->returned_present;
+    if (trace) {
+        current.await_result = trace->returned_present;
+        current.alternate = e.context;
+        current.alternate.placement = {trace->alternate, 0};
+    }
     rg::OnPresent(current, d.queue.Get(), im.screen, Execute);
     if (trace && trace->returned_present) {
         d.WaitIdle();
@@ -683,8 +691,14 @@ int main()
             if (mode == 2) CHECK(measured.delivered && !((measured.tiles.input | measured.tiles.output) & 1));
             if (mode >= 3) CHECK(mode == 3 ? measured.bypassed : measured.delivered);
         }
-        RouteTrial regional;
-        regional.Start(170, ordinal + 1, GetTickCount64());
+        na::j2::PlacementTrial regional;
+        TracePair nomination{t_output.Get(), split.Get(), true, 714, 711};
+        nomination.alternate = PlacementPath::Between;
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, split.Get()}, got,
+                           false, nullptr, nullptr, false, false, false, false, 0, false, &nomination));
+        REQUIRE(rg::TakeTrialSample(nomination.ticket, measured));
+        REQUIRE(regional.Begin(measured, ordinal, GetTickCount64(), 1));
         for (unsigned arm = 0; arm < 3; ++arm) {
             ordinal += RouteTrial::warmup_frames + 1;
             const auto ticket = regional.Ticket(ordinal);
@@ -692,6 +706,8 @@ int main()
             for (unsigned i = 0; i < RouteTrial::samples; ++i) {
                 auto* displayed = arm == 1 ? t_screen.Get() : split.Get();
                 TracePair trace{t_output.Get(), displayed, true, ticket, 711};
+                trace.path = arm == 1 ? PlacementPath::Between : PlacementPath::Inline;
+                trace.alternate = arm == 1 ? PlacementPath::None : PlacementPath::Between;
                 Sleep(150);
                 REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, displayed}, got,
                                    false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
@@ -700,10 +716,10 @@ int main()
                                     arm, unsigned(measured.tiles.input), unsigned(measured.tiles.output), unsigned(measured.comparable));
                 CHECK(arm == 1 ? measured.delivered : measured.tiles.Mixed());
                 regional.Tick(GetTickCount64(), true);
-                regional.Add(ticket, measured, ordinal + 1);
+                regional.Add(ticket, measured, ordinal, GetTickCount64());
             }
         }
-        CHECK(regional.Regional() && regional.Current() == RouteTrial::Phase::Kept);
+        CHECK(regional.Comparison().Regional() && regional.Comparison().Current() == RouteTrial::Phase::Kept);
         // The test reflector alternates about one stop. The alternative either
         // removes it, delivers the same artifact, or puts the input on screen.
         for (unsigned mode = 0; mode < 3; ++mode) {

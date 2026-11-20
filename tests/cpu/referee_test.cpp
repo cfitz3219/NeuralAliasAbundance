@@ -10,6 +10,7 @@
 #include "test_support.hpp"
 #include "core/referee_selection.hpp"
 #include "core/referee_recovery.hpp"
+#include "host_dx12/j2/referee_placement.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include <cmath>
 #include <cstdio>
@@ -505,6 +506,70 @@ int main()
         for (unsigned c = 1; c <= 5; ++c)
             check(regional_case(c, true).Current() == Phase::Rejected, "reject unchanged, damaged, relocated or newly flickering regional trial");
         check(regional_case(0, false).Current() == Phase::Rejected, "an original bypass that does not recur cannot certify a replacement");
+        using Dx12 = na::j2::PlacementTrial;
+        using Path = Dx12::Path;
+        const auto placement_sample = [](uint64_t ordinal, uint64_t now, bool alternate, bool repaired) {
+            TrialSample sample;
+            sample.ordinal = ordinal;
+            sample.observed_at = now;
+            sample.width = 960;
+            sample.height = 540;
+            sample.layout = 1;
+            sample.configuration = 1;
+            sample.delivered = true;
+            sample.context = {{alternate ? Path::Between : Path::Inline, alternate ? 0ull : 17ull},
+                31, 41, 3, 0, sample.width, sample.height, 0, 0, sample.configuration};
+            sample.alternate = {alternate ? Path::None : Path::Between, 0};
+            sample.tiles.Set(repaired ? TileVotes{0, 0xff} : TileVotes{3, 0xfc}, sample.width, sample.height, {});
+            sample.tiles.detail.fill(.10f);
+            return sample;
+        };
+        for (bool repaired : {true, false}) {
+            Dx12 trial;
+            auto witness = placement_sample(1, 100, false, false);
+            auto no_reader = witness;
+            no_reader.alternate = {};
+            check(!trial.Begin(no_reader, 3, 102, 12), "DX12: mixed output alone cannot nominate a handoff");
+            check(!trial.Begin(witness, 300, 103, 12), "DX12: old proof cannot start a trial");
+            check(trial.Begin(witness, 3, 103, 12), "DX12: accepted mixed output with separate reader starts baseline");
+            check(!trial.Matches(31, 41, 4, 12) && !trial.Matches(31, 41, 3, 13), "DX12: scene epoch and selection own the trial");
+            uint64_t ordinal = 3;
+            const auto arm = [&](bool candidate, bool improves) {
+                ordinal += 2 + RouteTrial::warmup_frames;
+                for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
+                    const auto tick = 100 + ordinal;
+                    auto sample = placement_sample(ordinal, tick, candidate, improves);
+                    trial.Tick(tick, true);
+                    const auto ticket = trial.Ticket(ordinal);
+                    auto wrong_scope = sample;
+                    wrong_scope.context.depth++;
+                    trial.Add(ticket, wrong_scope, ordinal, tick);
+                    trial.Add(ticket ^ 8u, sample, ordinal, tick);
+                    trial.Add(ticket, sample, ordinal, tick);
+                }
+            };
+            arm(false, false);
+            check(trial.UsesCandidate() && trial.Comparison().Regional(), "DX12: comparable baseline unlocks independent candidate");
+            arm(true, repaired);
+            if (repaired) {
+                check(trial.Comparison().Current() == Phase::ConfirmBaseline && !trial.UsesCandidate(),
+                    "DX12: restore incumbent for a confirmation on the same area");
+                arm(false, false);
+                check(trial.Comparison().Current() == Phase::Kept && trial.UsesCandidate(),
+                    "DX12: improved areas, preserved controls and repeatable bypass keep the handoff");
+                trial.Tick(100 + ordinal, false);
+                check(trial.Comparison().Current() == Phase::Rejected && !trial.UsesCandidate(),
+                    "DX12: lost qualified submission returns the original route");
+            } else {
+                check(trial.Comparison().RuledOut() && !trial.UsesCandidate(),
+                    "DX12: unchanged regional bypass rules out this handoff");
+                witness = placement_sample(ordinal, 10000, false, false);
+                check(!trial.Begin(witness, ordinal, 10000, 12), "DX12: remember failed handoff for the same view and settings");
+                witness.context.trial_configuration++;
+                witness.configuration++;
+                check(trial.Begin(witness, ordinal, 10000, 12), "DX12: a changed configuration can qualify for a new comparison");
+            }
+        }
         RegionalTiles overlap;
         overlap.Set({3, 12}, 960, 540, {});
         overlap.at[0] = overlap.at[1];

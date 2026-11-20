@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/referee_trace.hpp"
+#include "core/referee_selection.hpp"
 
 namespace na::referee {
 
@@ -71,6 +72,8 @@ struct TrialSample {
     std::array<float, FlickerTransition::count> contrast{};
     bool delivered = false, bypassed = false;
     RegionalTiles tiles;
+    shadow::Context context;
+    shadow::Placement alternate;
     bool comparable = true;
     FlickerTransition origin{};
     uint8_t tools = 0, applied = 0; // intersection of the two submitted recordings

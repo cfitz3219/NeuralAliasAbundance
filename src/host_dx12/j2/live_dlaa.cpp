@@ -29,6 +29,7 @@
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/screen_marker.hpp"
+#include "host_dx12/j2/referee_placement.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
@@ -131,6 +132,7 @@ struct PendingHistory {
     uint64_t camera_age=0;
     bool keep_reset = false; // a repeated frame: DLSS did not run, a pending history reset still applies
     uint64_t selection_version = 0; // live scene selection this evaluation used (same epoch = same version)
+    bool referee_handoff = false; // this recording used a validated separate-list reader
     // Camera-free DLAA: this frame's motion was measured on the pictures (no camera gave it), and
     // whether the frame carried a DLSS reset (the reset a measured scene cut waits for).
     bool measured = false, reset = false;
@@ -194,6 +196,8 @@ struct DeferredNativeScale {
 struct State {
     std::mutex m;
     referee::StageRecovery recovery{true};
+    PlacementTrial placement_trial;
+    uint64_t placement_submitted = 0;
     const void* recovery_swapchain = nullptr;
     std::atomic<bool> enabled{false};
     std::atomic<bool> configured{false};
@@ -4442,7 +4446,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             is_float_color(cf), reversed, camera_use, measured, g.jitter_on, flow::Enabled());
     };
     const bool same_recovery = recover && g.recovery.Matches(pending.recovery_scene);
-    Tool tool = same_recovery && !hist_reset ? g.recovery.ToolInUse() : Tool::None;
+    Tool tool = same_recovery && !hist_reset && !g.placement_trial.OwnsComparison() ? g.recovery.ToolInUse() : Tool::None;
     if (tool != Tool::None && g.recovery.Configuration() != current_configuration()) tool = Tool::None;
     const auto recorded = [&](Tool option) {
         pending.recovery_tools |= referee::Bit(option);
@@ -4986,7 +4990,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         const auto& route = g.router.Current();
         na::referee::shadow::Context context{
             {inl ? Path::Inline : Path::Between, pending.referee_boundary}, color_id, depth_id, route.history_generation, csub};
-        if (same_recovery) {
+        if (recover && g.placement_trial.Matches(color_id, depth_id, route.history_generation, pending.selection_version)) {
+            if (g.placement_trial.UsesCandidate() == pending.referee_handoff)
+                context.trial_ticket = g.placement_trial.Ticket(g.frame);
+            if (context.trial_ticket) context.trial_configuration = current_configuration();
+        } else if (same_recovery) {
             context.trial_ticket = g.recovery.Ticket(g.frame);
             if (context.trial_ticket) context.trial_configuration = current_configuration();
         }
@@ -5269,6 +5277,11 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     std::lock_guard<std::mutex> lock(g.m);
     ic.mark(kIcQuery);
     if (!g.inline_mode || g.latched || !g.device || verified_native_reader()) return;
+    if (g.placement_trial.UsesCandidate() && g.router.Mode() == RouteMode::Auto &&
+        !window_now() && !window_frame_now() &&
+        settings::Get().referee_enabled.load(std::memory_order_relaxed) &&
+        g.placement_trial.Matches(color_id, depth_id, g.router.Current().history_generation, na::observe::LiveSelectionVersion()))
+        return; // the candidate records only an independent host command list
     // The existing MSAA-depth path changes raster state which this restore does
     // not replay. Keep it at its original boundary, as for resolved consumers.
     if(entry && g.depth_samples>1)return;
@@ -6564,7 +6577,7 @@ void note_handoff_reader(const na::j2::InsertionEvent& e, UINT list, bool after_
 
 int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                             uint64_t color, uint64_t depth,
-                            ID3D12GraphicsCommandList** ours, PendingHistory& pending)
+                            ID3D12GraphicsCommandList** ours, PendingHistory& pending, bool trial = false)
 {
     auto& saved = g.waiting_scene;
     if (saved.frame != g.frame || saved.color != color || saved.depth != depth) {
@@ -6604,22 +6617,28 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
             // Inline needs a scene draw in its own recording. A learned entry
             // in a pure post list instead uses this submitted-scene handoff.
             // Unqualified entries are not evidence of the final handoff by themselves.
-            if (entry ? !g.entries.Accepts(e.raw) : !na::j2::IsConsumer(e.op)) continue;
+            if (entry ? trial || !g.entries.Accepts(e.raw) : !na::j2::IsConsumer(e.op)) continue;
             if (!writes && !consumed && saved.frame == g.frame) {
                 const auto cls = na::j2::MakeClass(e.raw, g.scene_w, g.scene_h);
                 const auto verdict = g.profile.Judge(cls, saved.producer);
                 using V = na::j2::ConsumerProfile::Verdict;
                 bool recorded = false;
-                const UINT at = first_read >= 0 && static_cast<UINT>(first_read) < i ? static_cast<UINT>(first_read) : i;
-                if(entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer){
+                const bool earlier = first_read >= 0 && static_cast<UINT>(first_read) < i;
+                const UINT at = earlier ? static_cast<UINT>(first_read) : i;
+                const bool qualified = entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer;
+                // A trial takes only an actual, qualified read. Don't place before an
+                // earlier unresolved entry, or after a reader in a previous submission.
+                if (qualified && (!trial || (!earlier && !saved.read_before && g.frame_seq_complete &&
+                    na::j2::HasSeparateSceneReader(g.frame_seq)))) {
                     g.capture_entry=entry?e.raw:na::j2::InsertionEvent{};
+                    pending.referee_handoff = trial;
                     recorded=record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, at);
+                    if (!recorded) pending.referee_handoff = false;
                     g.capture_entry={};
                 }
-                g.frame_handoff |= recorded ? kHoRecorded : (entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer)
-                                                              ? kHoRecordFailed : kHoReaderUnjudged;
+                g.frame_handoff |= recorded ? kHoRecorded : qualified ? kHoRecordFailed : kHoReaderUnjudged;
                 if (!entry) ft("c%u", unsigned(verdict));
-                ft("%s", recorded ? "R" : (entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer) ? "F" : "");
+                ft("%s", recorded ? "R" : qualified ? "F" : "");
                 if (!recorded && !entry && verdict != V::Accepted && verdict != V::AcceptedWithProducer) {
                     // The reader that had the finished scene and was turned down: its class verdict and the tallies behind it.
                     uint32_t t[4];
@@ -6674,6 +6693,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 saved.injected = g_injected;
                 g.frame_handoff |= kHoSaved;
                 ft("S");
+                if (trial) continue; // the experiment waits for a qualified read in this frame
                 // The list that ended the scene in delivered frames (same boundary writer and
                 // occurrence) has just ended with the picture handed off and unread. Its reader may
                 // sit in a later list without a traceable read of the colour: Sniper Elite 5's menu
@@ -8579,13 +8599,10 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
     if (queue && g.queue.Get() == queue) {
         const void* source = receipt ? receipt->swapchain : nullptr;
         if (!settings::Get().referee_enabled.load(std::memory_order_relaxed)) source = nullptr;
-        if (g.recovery_swapchain != source) {
+        const bool source_changed = g.recovery_swapchain != source;
+        if (source_changed) {
             g.recovery.Clear();
             g.recovery_swapchain = source;
-        }
-        if (source) {
-            static referee::TrialSample sample;
-            referee::AdvanceRecovery(g.recovery, g.frame, GetTickCount64(), referee::gpu::TakeTrialSample, sample);
         }
         {
             // Route selector: close this frame's structure + outcome.
@@ -8645,7 +8662,8 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
                 using na::referee::shadow::Path;
                 const auto& route = g.router.Current();
                 auto& alternate = receipt->alternate;
-                if (route.route == na::j2::Route::Inline && o.consumer_in_later_list && !o.boundary_inside_list)
+                if (route.route == na::j2::Route::Inline && o.consumer_in_later_list && g.frame_seq_complete &&
+                    na::j2::HasSeparateSceneReader(g.frame_seq))
                     alternate.placement = {Path::Between, 0};
                 else if (route.route == na::j2::Route::Between && o.boundary_inside_list && o.inline_signature)
                     alternate.placement = {Path::Inline, o.inline_signature};
@@ -8657,7 +8675,47 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
             g.route_prev_late = late;
             g.route_prev_no_camera = g.stats.no_camera;
             g.route_prev_no_state = g.stats.no_state;
-            const auto& d = g.router.OnFrame(o);
+            auto& placement = g.placement_trial;
+            const bool was_candidate = placement.UsesCandidate();
+            const auto previous_phase = placement.Comparison().Current();
+            const auto now = GetTickCount64();
+            uint64_t depth = 0, color = 0;
+            const auto& incumbent = g.router.Current();
+            const bool placement_available = source && o.scene && !o.interceptor && g.frame_seq_complete &&
+                incumbent.route == Route::Inline && g.router.Mode() == RouteMode::Auto &&
+                !g_native_reduced.load(std::memory_order_relaxed) && !verified_native_reader() &&
+                !window_now() && !window_frame_now();
+            if (placement_available) na::observe::GetLiveSelection(&depth, &color);
+            const uint64_t selection = placement_available ? na::observe::LiveSelectionVersion() : 0;
+            const bool placement_invalidated = placement.OwnsComparison() &&
+                (source_changed || !placement_available || !placement.Matches(color, depth, incumbent.history_generation, selection));
+            if (placement_invalidated)
+                placement.Invalidate(now);
+            if (placement.OwnsComparison()) {
+                placement.Tick(now, o.executed && !o.later_scene_write && g.placement_submitted == g.frame);
+                const auto ticket = placement.Ticket(g.frame);
+                static referee::TrialSample proof;
+                if (ticket && referee::gpu::TakeTrialSample(ticket, proof)) placement.Add(ticket, proof, g.frame, now);
+            } else if (source) {
+                static referee::TrialSample sample;
+                const bool observed = referee::AdvanceRecovery(g.recovery, g.frame, now, referee::gpu::TakeTrialSample, sample);
+                if (placement_available && o.executed && !o.camera_missed && !o.depth_state_missed &&
+                    observed && !g.recovery.Busy() && sample.context.color == color && sample.context.depth == depth &&
+                    sample.context.generation == incumbent.history_generation &&
+                    placement.Begin(sample, g.frame, now, selection))
+                    g.recovery.Suspend();
+            }
+            if (was_candidate != placement.UsesCandidate()) {
+                g.resume_reset = true;
+                g.waiting_scene = {};
+            }
+            const auto& comparison = placement.Comparison();
+            if (comparison.Current() != previous_phase)
+                na::eventlog::Emit("dx12_route_trial", "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u why=%s",
+                    (unsigned long long)(g.frame + 1), placement_invalidated ? "rejected" : comparison.Name(), comparison.Region(),
+                    comparison.Baseline(), comparison.Candidate(), comparison.Confirmation(),
+                    unsigned(comparison.Regional()), placement_invalidated ? "the scene or comparison scope changed" : comparison.Reason());
+            const auto& d = g.router.OnFrame(o, placement.OwnsComparison());
             g.frame_agg.Reset();
             auto& r = g.stats.route;
             r.route = static_cast<uint32_t>(d.route);
@@ -9031,10 +9089,14 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         PendingHistory pending;
         int before=record_deferred_native(queue,lists,count,&ours,pending);
         ft(" |");
+        const bool placement_candidate = g.placement_trial.UsesCandidate() && !window_now() && !window_frame_now() &&
+            settings::Get().referee_enabled.load(std::memory_order_relaxed) &&
+            g.placement_trial.Matches(selected_color, selected_depth, g.router.Current().history_generation,
+                                      na::observe::LiveSelectionVersion());
         if (before<0 && !g_native_reduced.load(std::memory_order_relaxed) && !verified_native_reader() && !g.inl.valid &&
             g.submitted_frame != g.frame && g.queue.Get() == queue && g.dlss_ready &&
             selected_color && selected_depth && g.router.Mode() == na::j2::RouteMode::Auto)
-            before=record_between_consumer(lists,count,selected_color,selected_depth,&ours,pending);
+            before=record_between_consumer(lists,count,selected_color,selected_depth,&ours,pending,placement_candidate);
         else if (before<0 && !g_native_reduced.load(std::memory_order_relaxed))
         {
             g.frame_handoff |= g.inl.valid ? kHoBlockedInline : g.submitted_frame == g.frame ? kHoBlockedOwned : kHoBlockedOther;
@@ -9054,6 +9116,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 g.eval_selection_version = pending.selection_version;
                 committed_sources(pending);
                 g.submitted_frame = g.frame;
+                if (pending.referee_handoff) g.placement_submitted = g.frame;
                 if (!pending.keep_reset) g.resume_reset = false;
                 g.stats.active = true;
                 ++g.stats.frames;
@@ -9305,6 +9368,8 @@ void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g.m);
     g.recovery.Clear();
+    g.placement_trial = {};
+    g.placement_submitted = 0;
     g.recovery_swapchain = nullptr;
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset(); g.jshift.Reset();
     g.msaa = MsaaResolve{};
