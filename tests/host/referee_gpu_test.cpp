@@ -646,20 +646,23 @@ int main()
         constexpr uint32_t neighbor = 37;
         auto shifting_reflection = output;
         auto two_reflections = bright;
+        auto stronger_neighbor = output;
         for (unsigned y = output.h / 2; y < output.h * 5 / 8; ++y)
             for (unsigned x = output.w * 5 / 8; x < output.w * 6 / 8; ++x) {
                 const bool left = x < output.w * 11 / 16;
                 const size_t at = size_t(y) * output.w + x;
                 shifting_reflection.v[at] *= left ? 1.12f : 1.f / 1.12f;
-                two_reflections.v[at] *= left ? 1.32f : 1.f / 1.32f;
+                two_reflections.v[at] *= left ? 1.39f : 1.f / 1.39f;
+                stronger_neighbor.v[at] = two_reflections.v[at];
             }
         auto shifting_screen = ScreenTexture(d, l, rs::ScreenBytes(shifting_reflection), keep);
         auto two_output = Picture(d, l, two_reflections, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, keep);
         auto two_screen = ScreenTexture(d, l, rs::ScreenBytes(two_reflections), keep);
+        auto introduced_screen = ScreenTexture(d, l, rs::ScreenBytes(stronger_neighbor), keep);
         Run(d, l);
         keep.clear();
-        REQUIRE(shifting_screen && two_output && two_screen);
+        REQUIRE(shifting_screen && two_output && two_screen && introduced_screen);
         TracePair subregion{t_output.Get(), t_screen.Get(), true, 9539, 70};
         subregion.recovery_region = neighbor;
         subregion.recovery_floor = .025f;
@@ -773,12 +776,13 @@ int main()
         CHECK(regional.Comparison().Regional() && regional.Comparison().Current() == RouteTrial::Phase::Kept);
         // The test reflector alternates about one stop. The alternative either
         // removes it, delivers the same artifact, puts the input on screen, or
-        // removes the strongest flash while leaving a second reflection.
-        for (unsigned mode = 0; mode < 4; ++mode) {
+        // removes the strongest flash while leaving an existing or new reflection.
+        for (unsigned mode = 0; mode < 5; ++mode) {
             PlacementTrial placement;
             using Phase = RouteTrial::Phase;
             const auto& trial = placement.Comparison();
             const bool wide = mode == 3;
+            const bool introduces_neighbor = mode == 4;
             auto* ordinary_output = wide ? two_output.Get() : lit_out.Get();
             auto* ordinary_screen = wide ? two_screen.Get() : lit_display.Get();
             TracePair reflection{t_output.Get(), t_screen.Get(), true, 952 + mode * 8u, 70};
@@ -796,8 +800,11 @@ int main()
                 const bool bypass = arm == 1 && mode == 2;
                 for (unsigned i = 0; i < RouteTrial::samples && placement.Ticket(ordinal) == ticket; ++i) {
                     const bool reverse = i % 2 != 0;
-                    const auto larger = !quiet && !(wide && arm == 1);
-                    auto* active_screen = wide && arm == 1 ? shifting_screen.Get() : larger ? ordinary_screen : t_screen.Get();
+                    auto* residual_screen = wide ? shifting_screen.Get() :
+                        introduces_neighbor ? introduced_screen.Get() : nullptr;
+                    const bool residual = arm == 1 && residual_screen;
+                    const bool larger = !quiet && !residual;
+                    auto* active_screen = residual ? residual_screen : larger ? ordinary_screen : t_screen.Get();
                     TracePair trace{larger && reverse ? ordinary_output : t_output.Get(),
                                     reverse ? active_screen : t_screen.Get(), true, ticket, 70};
                     Sleep(150);
@@ -822,7 +829,13 @@ int main()
                             100.f * trial.VerifiedReduction(), unsigned(placement.AllowsStageRecovery()),
                             placement.RecoveryRegion(), placement.RecoveryBaseline());
                 CHECK(trial.VerifiedReduction() >= .90f && placement.AllowsStageRecovery() &&
-                      placement.RecoveryRegion() == neighbor && placement.RecoveryBaseline() > .20f);
+                      placement.RecoveryRegion() == neighbor &&
+                      placement.RecoveryBaseline() >= RouteTrial::minimum_flicker &&
+                      placement.RecoveryBaseline() < trial.Baseline());
+            }
+            if (introduces_neighbor) {
+                CHECK(trial.Candidate() < trial.Baseline() * .70f && trial.RuledOut() &&
+                      std::strstr(trial.Reason(), "worsened recurring flicker"));
             }
             if (mode == 0) {
                 ordinal += RouteTrial::warmup_frames + 1;
