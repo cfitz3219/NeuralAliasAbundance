@@ -6630,7 +6630,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 // A trial takes only an actual, qualified read. Don't place before an
                 // earlier unresolved entry, or after a reader in a previous submission.
                 if (qualified && (!trial || (i >= after_last_write && !earlier && !saved.read_before && g.frame_seq_complete &&
-                    na::j2::HasSeparateSceneReader(g.frame_seq)))) {
+                    na::j2::SeparateSceneReader(g.frame_seq)))) {
                     g.capture_entry=entry?e.raw:na::j2::InsertionEvent{};
                     pending.referee_handoff = trial;
                     recorded=record(lists, 0, depth, color, ours, pending, nullptr, nullptr, &saved, at);
@@ -8663,10 +8663,15 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
                 using na::referee::shadow::Path;
                 const auto& route = g.router.Current();
                 auto& alternate = receipt->alternate;
-                if (route.route == na::j2::Route::Inline && o.consumer_in_later_list && g.frame_seq_complete &&
-                    na::j2::HasSeparateSceneReader(g.frame_seq))
-                    alternate.placement = {Path::Between, 0};
-                else if (route.route == na::j2::Route::Between && o.boundary_inside_list && o.inline_signature)
+                if (route.route == na::j2::Route::Inline && o.consumer_in_later_list && g.frame_seq_complete) {
+                    uint64_t producer = 0;
+                    if (const auto* reader = na::j2::SeparateSceneReader(g.frame_seq, &producer)) {
+                        using V = na::j2::ConsumerProfile::Verdict;
+                        const auto verdict = g.profile.Judge(na::j2::MakeClass(reader->raw, g.scene_w, g.scene_h), producer);
+                        if (verdict == V::Accepted || verdict == V::AcceptedWithProducer)
+                            alternate.placement = {Path::Between, 0};
+                    }
+                } else if (route.route == na::j2::Route::Between && o.boundary_inside_list && o.inline_signature)
                     alternate.placement = {Path::Inline, o.inline_signature};
                 if (alternate.placement.path != Path::None) {
                     na::observe::GetLiveSelection(&alternate.depth, &alternate.color);

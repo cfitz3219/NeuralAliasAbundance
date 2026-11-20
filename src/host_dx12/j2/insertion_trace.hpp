@@ -160,19 +160,27 @@ struct ColorEvent {
 
 // Work backwards from the first actual read of the final scene version.
 // A barrier can end the producer list, but it cannot consume a picture.
-inline bool HasSeparateSceneReader(const std::vector<ColorEvent>& events)
+inline const ColorEvent* SeparateSceneReader(const std::vector<ColorEvent>& events, uint64_t* producer = nullptr)
 {
     bool crossed_list = false;
-    bool reads = false;
+    const ColorEvent* reader = nullptr;
     for (auto i = events.rbegin(); i != events.rend(); ++i) {
-        if (i->write) return reads && crossed_list && i->with_depth;
+        if (i->write) {
+            if (!crossed_list || !i->with_depth) return nullptr;
+            if (producer) *producer = i->producer;
+            return reader;
+        }
         if (IsConsumer(i->op)) {
-            reads = true;
+            reader = &*i;
             crossed_list = false;
+        } else if (reader && crossed_list && IsEntry(i->op)) {
+            // This recording could already have forwarded the output by
+            // a binding we could not trace. Do not nominate a later read.
+            reader = nullptr;
         }
         crossed_list |= i->list_start;
     }
-    return false;
+    return nullptr;
 }
 // What one later list of a submission says about a scene ending placed before it:
 //  +1 the scene continues (a draw into the colour before the picture is copied onward),

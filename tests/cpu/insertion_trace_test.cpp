@@ -90,16 +90,23 @@ int main() {
         auto writer = ev(true, Op::DrawWrite);
         writer.with_depth = true;
         writer.list_start = true;
+        writer.producer = 17;
         auto barrier = ev(false, Op::Barrier);
         auto reader = ev(false, Op::GraphicsRead);
-        check(!na::j2::HasSeparateSceneReader({writer, barrier}), "a transition cannot nominate a separate reader");
-        check(!na::j2::HasSeparateSceneReader({writer, reader}), "an in-list reader cannot nominate a separate reader");
+        check(!na::j2::SeparateSceneReader({writer, barrier}), "a transition cannot nominate a separate reader");
+        check(!na::j2::SeparateSceneReader({writer, reader}), "an in-list reader cannot nominate a separate reader");
         reader.list_start = true;
-        check(na::j2::HasSeparateSceneReader({writer, barrier, reader}), "a real reader in a later list can qualify");
-        check(!na::j2::HasSeparateSceneReader({writer, ev(false, Op::ComputeRead), reader}),
+        const std::vector<ColorEvent> separated = {writer, barrier, reader};
+        uint64_t producer = 0;
+        check(na::j2::SeparateSceneReader(separated, &producer) == &separated.back() && producer == 17,
+              "a real reader in a later list can qualify with its scene producer");
+        auto entry = ev(false, Op::GraphicsEntry);
+        entry.list_start = true;
+        check(!na::j2::SeparateSceneReader({writer, entry, reader}), "an earlier unresolved reader makes placement ambiguous");
+        check(!na::j2::SeparateSceneReader({writer, ev(false, Op::ComputeRead), reader}),
               "a later list cannot replace a first reader already in the scene recording");
-        check(!na::j2::HasSeparateSceneReader({writer, reader, writer}), "a later scene version invalidates the earlier reader");
-        check(!na::j2::HasSeparateSceneReader({writer, ev(true, Op::CopyWrite), reader}),
+        check(!na::j2::SeparateSceneReader({writer, reader, writer}), "a later scene version invalidates the earlier reader");
+        check(!na::j2::SeparateSceneReader({writer, ev(true, Op::CopyWrite), reader}),
               "an unpaired final write cannot nominate a separate reader");
         check(na::j2::SceneTailVerdict({}) == 0, "an empty later list does not move the ending");
         check(na::j2::SceneTailVerdict({ev(false, Op::GraphicsRead), ev(false, Op::ComputeRead)}) == 0,
