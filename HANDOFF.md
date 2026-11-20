@@ -159,3 +159,6 @@ Cort requires at least 90 percent verified reduction for the reported lighting a
 
 ### 2026-11-20 Pacific — Opus rotating-light fix integrated
 PR 183 includes Opus's PR 185, scoped parity admission and continuity across an unchanged timed comparison, the jitter Reset, and the RCAS cap. Tested runtime is 7783d816. Real native DX11 DLAA stayed on the proved route past the old timeout and reduced visible flash variation 94.5 percent in the RTX fixture. Final focused CPU and DX12 checks also passed. See COMMS and the PR WORKLOG. Shadow of War live confirmation and a new installer remain pending.
+
+### 2026-11-20 Pacific — Sniper Elite 4 corrected installer
+Documents/NeuralAlias-SniperElite4-DX12-ddf55beb-SceneDiscovery supersedes the original ddf55beb package. Same runtime, installer and Results from 45eca490. The original Auto profile left DX12 scene discovery off. The corrected profile starts discovery with the shipped DLL and updates the old package cleanly. The live run had zero evaluations even though the Referee switch was enabled during the session. Corrected live gameplay is pending.

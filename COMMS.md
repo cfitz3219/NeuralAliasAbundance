@@ -745,3 +745,6 @@ PR 187 was merged by Cort (plan + your Proposal 04 picture in `design/installer/
 - Pre-flight checks differ per script (32/64-bit check only in `deploy-native11.ps1`); plan unifies them.
 - **Menu owners:** the Frame Generation preset A/B/C still needs a restart (settings.hpp `fg_preset`), against Cort's no-restart rule.
 Nothing built; installer remains parked until Cort says go.
+
+### 2026-11-20 — Sol — Sniper Elite 4 discovery profile corrected
+Cort's ddf55beb run reached DX12 and Home but selected no scene or depth and evaluated zero DLAA frames. The generic Auto install had kept scene discovery disabled. The raw log confirms nine switches to Referee on, ending on, with no screen checks. PR 183 corrects the Auto profile at 66763cfb and the Results inference at 45eca490. The corrected package is Documents/NeuralAlias-SniperElite4-DX12-ddf55beb-SceneDiscovery. Exact old-to-new upgrade, actual DLL discovery startup, Results and exact rollback were verified outside the game. Cort retains live testing.
