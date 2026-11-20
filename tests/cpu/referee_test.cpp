@@ -494,7 +494,9 @@ int main()
             check(trial.UsesCandidate() == (expected == Phase::Kept), "trial: failed comparison falls back");
             if (expected == Phase::Kept) {
                 check(std::fabs(trial.VerifiedReduction() - (1.f - candidate / (std::min)(.25f, repeat))) < .001f &&
-                      trial.HasResidualFlicker() == (candidate > .1f * (std::min)(.25f, repeat)),
+                      (trial.ResidualBaseline() > 0.f) ==
+                          (candidate > RouteTrial::residual_fraction * (std::min)(.25f, repeat) &&
+                           candidate >= FlickerTransition::scoped_minimum),
                       "trial: measure the 90 percent target against both baselines in the affected area");
                 auto monitored = trial;
                 window(.24f);
@@ -681,6 +683,33 @@ int main()
             check(!partial.UsesCandidate() && !partial.AllowsStageRecovery(),
                   "loss of the actual display proof removes secondary recovery authority");
         }
+        for (auto path : {Path::Native11, Path::Inline}) {
+            PlacementTrial wide;
+            const PlacementTrial::Scope scope{31, 41, 3, 12};
+            check(wide.BeginVerified(scope, 1, 100), "start a comparison across the affected display");
+            uint64_t ordinal = 1;
+            for (unsigned arm = 0; arm < 3; ++arm) {
+                ordinal += RouteTrial::warmup_frames + 2;
+                for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
+                    auto sample = placement_sample(ordinal, ordinal + 100, arm == 1, true);
+                    sample.context.placement.path = arm == 1 && path == Path::Inline ? Path::Between : path;
+                    const float sign = i % 2 ? 1.f : -1.f;
+                    sample.change[13].fill(sign * (arm == 1 ? .01f : .25f));
+                    sample.change[14].fill(sign * (arm == 0 ? .18f : arm == 1 ? .06f : .16f));
+                    // Stronger changes that vanished from the ordinary-route recheck or
+                    // appeared only once on the replacement cannot direct a new correction.
+                    sample.change[21].fill(arm == 2 ? 0.f : sign * (arm == 0 ? .20f : .09f));
+                    sample.change[22].fill(arm != 1 ? sign * .20f : i == 0 ? .10f : 0.f);
+                    wide.Tick(sample.observed_at, true);
+                    wide.Add(scope, wide.Ticket(ordinal), sample, ordinal, sample.observed_at);
+                }
+            }
+            check(wide.UsesCandidate() && wide.Comparison().VerifiedReduction() >= .90f,
+                  "the primary result is still verified");
+            check(wide.AllowsStageRecovery() && wide.RecoveryRegion() == 14 &&
+                  std::fabs(wide.RecoveryFloor() - .016f) < .0001f,
+                  "the remaining recurring reflection selects its own region and baseline on both APIs");
+        }
         RegionalTiles overlap;
         overlap.Set({3, 12}, 960, 540, {});
         overlap.at[0] = overlap.at[1];
@@ -781,6 +810,24 @@ int main()
         check(LocateTransition(earlier.data(), later.data()).stage == S::Unknown &&
               residual.stage == S::Composition && residual.region == location && residual.recovery_floor == .025f,
               "existing lighting proof can target a smaller repeated residual without lowering the ordinary detector");
+        later = earlier;
+        for (unsigned y = 0; y < kThumbH; ++y) for (unsigned x = 0; x < kThumbW; ++x) {
+            if (y * FlickerTransition::rows / kThumbH * FlickerTransition::columns +
+                x * FlickerTransition::columns / kThumbW != location) continue;
+            const unsigned pixel = y * kThumbW + x;
+            const float local = x % (kThumbW / FlickerTransition::columns) < kThumbW / FlickerTransition::columns / 2 ?
+                .06f : -.06f;
+            later[pixel] += .16f;
+            later[2 * kThumbFloats + pixel] += local;
+        }
+        const auto split = LocateTransition(earlier.data(), later.data(), nullptr, location, .025f);
+        check(split.region == location && split.stage == S::Composition &&
+              std::fabs(std::fabs(split.stops[2]) - .06f) < .001f && std::fabs(split.stops[0]) < .001f,
+              "opposite changes inside a proved footprint stay visible and unrelated upstream brightness is excluded");
+        for (unsigned pixel = 0; pixel < kThumbFloats; ++pixel)
+            later[kThumbFloats + pixel] += .8f * (later[2 * kThumbFloats + pixel] - earlier[2 * kThumbFloats + pixel]);
+        check(LocateTransition(earlier.data(), later.data(), nullptr, location, .025f).stage == S::Reconstruction,
+              "matching subregion evidence attributes the change to reconstruction when it exists there");
         s = {};
         s.comparable = s.delivered = true;
         s.width = 1920; s.height = 1080; s.tools = Bit(T::Sharpen);

@@ -22,6 +22,8 @@ inline const char* StageName(FlickerStage stage)
 struct FlickerTransition {
     static constexpr uint32_t columns = 8, rows = 8;
     static constexpr uint32_t count = columns * rows;
+    static constexpr unsigned subdivisions = 4;
+    static constexpr float scoped_minimum = .018f;
     FlickerStage stage = FlickerStage::Unknown;
     uint32_t region = 0;
     std::array<float, 3> stops{};
@@ -50,17 +52,58 @@ inline FlickerTransition LocateTransition(const float* before, const float* afte
     }
     const auto& presented = delta[2];
     const bool scoped = recovery_floor > 0.f && recovery_region < Result::count;
-    const float floor = scoped ? std::clamp(recovery_floor, .018f, .12f) : .12f;
+    const float floor = scoped ? std::clamp(recovery_floor, Result::scoped_minimum, .12f) : .12f;
     const auto peak = scoped ? presented.begin() + recovery_region :
         std::max_element(presented.begin(), presented.end(), [](float a, float b) { return std::fabs(a) < std::fabs(b); });
     const uint32_t region = static_cast<uint32_t>(peak - presented.begin());
-    if (std::fabs(*peak) < floor) return {};
     const auto quiet = std::count_if(presented.begin(), presented.end(), [](float s) { return std::fabs(s) < .055f; });
     if (quiet < Result::count * 3 / 4) return {};
-    const auto begins = [peak, floor](float s) { return std::fabs(s) >= floor * (.085f / .12f) && s * *peak > 0; };
-    const auto stage = begins(delta[0][region]) ? FlickerStage::Input :
-                       begins(delta[1][region]) ? FlickerStage::Reconstruction : FlickerStage::Composition;
-    return {stage, region, {delta[0][region], delta[1][region], *peak}, scoped ? floor : 0.f};
+    std::array<float, 3> stops{delta[0][region], delta[1][region], *peak};
+    if (scoped) {
+        // The accepted comparison identified this footprint by a spatial
+        // pattern. Opposite changes at its edges can cancel in the tile mean.
+        // Use the same subdivisions and match the upstream change to the
+        // presented pattern before assigning a stage.
+        constexpr unsigned n = Result::subdivisions;
+        constexpr unsigned columns = Result::columns * n, rows = Result::rows * n;
+        const unsigned col = region % Result::columns * n, row = region / Result::columns * n;
+        std::array<std::array<float, n * n>, 3> changes{};
+        for (unsigned sy = 0; sy < n; ++sy) for (unsigned sx = 0; sx < n; ++sx) {
+            const unsigned x0 = (col + sx) * kThumbW / columns;
+            const unsigned x1 = x0 + kThumbW / columns;
+            const unsigned y0 = ((row + sy) * kThumbH + rows - 1) / rows;
+            const unsigned y1 = ((row + sy + 1) * kThumbH + rows - 1) / rows;
+            for (unsigned stage = 0; stage < changes.size(); ++stage) {
+                const float* a = before + stage * kThumbFloats;
+                const float* b = screen && stage == 2 ? screen : after + stage * kThumbFloats;
+                float sum = 0.f;
+                for (unsigned y = y0; y < y1; ++y)
+                    for (unsigned x = x0; x < x1; ++x) sum += b[y * kThumbW + x] - a[y * kThumbW + x];
+                changes[stage][sy * n + sx] = sum / ((y1 - y0) * (x1 - x0));
+            }
+        }
+        const auto& visible = changes[2];
+        const auto strongest = std::max_element(visible.begin(), visible.end(),
+            [](float a, float b) { return std::fabs(a) < std::fabs(b); });
+        float magnitude = 0.f, power = 0.f;
+        for (float v : visible) { magnitude += std::fabs(v); power += v * v; }
+        magnitude /= visible.size();
+        if (magnitude < floor) return {};
+        stops[2] = std::copysign(magnitude, *strongest);
+        for (unsigned stage = 0; stage < 2; ++stage) {
+            float dot = 0.f, upstream_power = 0.f;
+            for (unsigned i = 0; i < visible.size(); ++i) {
+                const float v = changes[stage][i];
+                dot += v * visible[i];
+                upstream_power += v * v;
+            }
+            stops[stage] = dot * dot >= .64f * power * upstream_power ? stops[2] * dot / power : 0.f;
+        }
+    } else if (std::fabs(stops[2]) < floor) return {};
+    const auto begins = [&stops, floor](float s) { return std::fabs(s) >= floor * (.085f / .12f) && s * stops[2] > 0; };
+    const auto stage = begins(stops[0]) ? FlickerStage::Input :
+                       begins(stops[1]) ? FlickerStage::Reconstruction : FlickerStage::Composition;
+    return {stage, region, stops, scoped ? floor : 0.f};
 }
 
 // One real highlight change can look exactly like a flicker edge. Require a

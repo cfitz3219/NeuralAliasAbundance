@@ -130,10 +130,11 @@ public:
         // ambiguous (e.g. a nonlinear composite). It cannot authorize a tool.
         const unsigned first = unsigned(s.origin.stage) - 1;
         if (first >= s.origin.stops.size()) return;
-        for (unsigned i = 0; i < first; ++i) if (std::fabs(s.origin.stops[i]) >= .085f) return;
+        const float upstream_floor = s.origin.recovery_floor > 0.f ? s.origin.recovery_floor * (.085f / .12f) : .085f;
+        for (unsigned i = 0; i < first; ++i) if (std::fabs(s.origin.stops[i]) >= upstream_floor) return;
         const bool reversed = previous_.ordinal && s.ordinal - previous_.ordinal <= 240 &&
             now - previous_at_ < RouteTrial::maximum_ms && SameSetup(previous_, s) && SameView(previous_, s) &&
-            s.origin.region == previous_.origin.region && Reverses(previous_.origin, s.origin);
+            s.origin.region == previous_.origin.region && ReversesAtSameRegion(previous_, s);
         uint8_t available = s.tools & previous_.tools;
         if (!(s.motion_error >= 0 && previous_.motion_error >= 0))
             available &= uint8_t(~(Bit(Tool::CameraResidual) | Bit(Tool::ScreenFit)));
@@ -173,6 +174,14 @@ public:
     const char* Reason() const { return Busy() ? trial_.Reason() : why_; }
 
 private:
+    static bool ReversesAtSameRegion(const TrialSample& a, const TrialSample& b)
+    {
+        if (!(a.origin.recovery_floor > 0.f && b.origin.recovery_floor > 0.f)) return Reverses(a.origin, b.origin);
+        const auto region = b.origin.region;
+        const float earlier = std::fabs(a.origin.stops[2]), later = std::fabs(b.origin.stops[2]);
+        return a.origin.stage == b.origin.stage && (std::min)(earlier, later) * 3 >= (std::max)(earlier, later) &&
+               TrialDirection(a.change[region], b.change[region]) < 0;
+    }
     struct EntryData {
         Scene scene{};
         TrialSample example;

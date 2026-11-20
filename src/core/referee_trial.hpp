@@ -61,7 +61,7 @@ struct RegionalTiles {
 };
 
 struct TrialSample {
-    static constexpr unsigned subdivisions = 4;
+    static constexpr unsigned subdivisions = FlickerTransition::subdivisions;
     using Change = std::array<float, subdivisions * subdivisions>;
     uint64_t ordinal = 0;
     uint64_t observed_at = 0; // monotonic time of the receipt, supplied by the live observer
@@ -175,6 +175,7 @@ public:
     enum class Phase : uint8_t { Idle, Baseline, Candidate, ConfirmBaseline, Kept, Rejected };
     static constexpr unsigned samples = 4;
     static constexpr float minimum_flicker = .12f;
+    static constexpr float residual_fraction = .10f;
     static constexpr uint64_t warmup_frames = 16, maximum_ms = 18000;
 
     void Start(uint64_t id, uint64_t frame, uint64_t now)
@@ -193,7 +194,7 @@ public:
         region_ = witness.origin.region;
         targeted_ = true;
         if (witness.origin.recovery_floor > 0)
-            flicker_floor_ = std::clamp(witness.origin.recovery_floor, .018f, minimum_flicker);
+            flicker_floor_ = std::clamp(witness.origin.recovery_floor, FlickerTransition::scoped_minimum, minimum_flicker);
     }
     bool RuledOut() const { return phase_ == Phase::Rejected && ruled_out_; }
     bool Regional() const { return regional_; }
@@ -318,6 +319,11 @@ public:
                     if (targeted_ && i != region_) continue;
                     const TrialSample* reference = nullptr;
                     const float amplitude = Repeated(i, nullptr, reference);
+                    if (!targeted_) {
+                        auto& evidence = regions_[i];
+                        evidence.baseline = amplitude;
+                        if (amplitude >= minimum_flicker) evidence.pattern = reference->change[i];
+                    }
                     if (amplitude > strongest) {
                         strongest = amplitude;
                         region_ = i;
@@ -326,7 +332,7 @@ public:
                 }
                 if (pattern) anchor_ = *pattern;
             } else {
-                strongest = Repeated(region_, &anchor_, pattern);
+                strongest = Repeated(region_, &anchor_.change[region_], pattern);
             }
             if (phase_ == Phase::Baseline && !targeted_) {
                 const auto& first = window_[0];
@@ -372,6 +378,7 @@ public:
                     Reject("the original flicker did not return consistently");
                     return;
                 }
+                if (!targeted_ && !regional_) SelectResidualRegion();
                 Next(Phase::Kept, next_frame);
                 retry_delay_ = 8000;
                 regional_seen_ = now_;
@@ -403,13 +410,21 @@ public:
                 ruled_out_ = !targeted_;
                 for (unsigned region = 0; targeted_ && !ruled_out_ && region < FlickerTransition::count; ++region) {
                     const TrialSample* pattern = nullptr;
-                    const auto severity = Repeated(region, region == region_ ? &anchor_ : nullptr, pattern);
+                    const auto severity = Repeated(region, region == region_ ? &anchor_.change[region_] : nullptr, pattern);
                     ruled_out_ = !ImprovesWith(severity, baseline_);
                 }
                 if (!ruled_out_ && count_ < window_.size()) return;
                 Reject(ruled_out_ ? "the replacement did not improve the presented picture" :
                                     "an isolated change prevented a reliable verdict");
                 return;
+            }
+            if (!targeted_ && !regional_) {
+                for (uint32_t i = 0; i < regions_.size(); ++i) {
+                    auto& evidence = regions_[i];
+                    if (evidence.baseline < minimum_flicker) continue;
+                    const TrialSample* pattern = nullptr;
+                    evidence.replacement = Repeated(i, &evidence.pattern, pattern);
+                }
             }
             Next(Phase::ConfirmBaseline, next_frame);
         }
@@ -427,13 +442,29 @@ public:
         if (phase_ != Phase::Kept || spatial_only_) return -1.f;
         return 1.f - affected_replacement_ / (std::min)(baseline_, confirmation_);
     }
-    bool HasResidualFlicker() const
-    {
-        const float reduction = VerifiedReduction();
-        return reduction >= 0.f && reduction < .90f;
-    }
+    uint32_t ResidualRegion() const { return residual_region_; }
+    float ResidualBaseline() const { return phase_ == Phase::Kept ? residual_baseline_ : 0.f; }
 
 private:
+    void SelectResidualRegion()
+    {
+        float greatest = 0.f;
+        for (uint32_t i = 0; i < regions_.size(); ++i) {
+            const auto& evidence = regions_[i];
+            if (evidence.baseline < minimum_flicker || evidence.replacement < FlickerTransition::scoped_minimum)
+                continue;
+            const TrialSample* pattern = nullptr;
+            const float confirmation = Repeated(i, &evidence.pattern, pattern);
+            if (confirmation < evidence.baseline * .67f || confirmation > evidence.baseline * 1.5f)
+                continue;
+            const float original = (std::min)(evidence.baseline, confirmation);
+            if (evidence.replacement > original * residual_fraction && evidence.replacement > greatest) {
+                greatest = evidence.replacement;
+                residual_region_ = i;
+                residual_baseline_ = original;
+            }
+        }
+    }
     void Next(Phase phase, uint64_t frame)
     {
         phase_ = phase;
@@ -455,7 +486,7 @@ private:
         return replacement <= ordinary * .70f && ordinary - replacement >= flicker_floor_ / 3.f;
     }
     bool Improves(float value) const { return ImprovesWith(replacement_, value); }
-    float Repeated(uint32_t region, const TrialSample* prior_pattern, const TrialSample*& pattern) const
+    float Repeated(uint32_t region, const TrialSample::Change* prior_pattern, const TrialSample*& pattern) const
     {
         // Two samples must move the same pixels one way, and two the
         // opposite way. Quiet intervening pairs need not be transitions.
@@ -463,7 +494,7 @@ private:
         const auto end = magnitude.begin() + count_;
         for (unsigned i = 0; i < count_; ++i) magnitude[i] = TrialMagnitude(window_[i].change[region]);
         pattern = &window_[std::max_element(magnitude.begin(), end) - magnitude.begin()];
-        const auto& reference = (prior_pattern ? *prior_pattern : *pattern).change[region];
+        const auto& reference = prior_pattern ? *prior_pattern : pattern->change[region];
         std::array<float, 2> same{}, opposite{};
         for (unsigned i = 0; i < count_; ++i) {
             const auto& change = window_[i].change[region];
@@ -503,13 +534,20 @@ private:
     uint8_t lost_region_ = 0;
     uint64_t regional_seen_ = 0;
     uint32_t region_ = 0;
+    uint32_t residual_region_ = 0;
     unsigned count_ = 0;
     float baseline_ = 0, replacement_ = 0, confirmation_ = 0, affected_replacement_ = 0;
     float flicker_floor_ = minimum_flicker;
+    float residual_baseline_ = 0.f;
     const char* reason_ = "";
     TrialSample anchor_;
     static constexpr unsigned incumbent_window = 8;
     std::array<TrialSample, incumbent_window> window_{};
+    struct RegionEvidence {
+        TrialSample::Change pattern{};
+        float baseline = 0.f, replacement = 0.f;
+    };
+    std::array<RegionEvidence, FlickerTransition::count> regions_{};
 };
 
 } // namespace na::referee

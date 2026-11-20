@@ -5097,7 +5097,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             context.trial_ticket = g.recovery.Ticket(g.frame);
             if (context.trial_ticket) context.trial_configuration = current_configuration();
             if (recovering_kept) {
-                context.recovery_region = g.placement_trial.Comparison().Region();
+                context.recovery_region = g.placement_trial.RecoveryRegion();
                 context.recovery_floor = g.placement_trial.RecoveryFloor();
             }
         }
