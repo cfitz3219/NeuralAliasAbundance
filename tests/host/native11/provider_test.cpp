@@ -2837,8 +2837,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         g.ctx->Draw(4, 0);
         bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
         if (bound) bound->GetDesc(&applied);
-        expect(bound && applied.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && applied.MaxAnisotropy == 1,
-               "after the switch the draw samples with the game's own sampler");
+        D3D11_SAMPLER_DESC original{};
+        if (material) material->GetDesc(&original);
+        std::printf("native AF restored: same object=%d filter=%u/%u max_aniso=%u/%u\n",
+                    int(bound.Get() == material.Get()), unsigned(applied.Filter), unsigned(original.Filter),
+                    applied.MaxAnisotropy, original.MaxAnisotropy);
+        expect(bound && bound.Get() == material.Get(), "after the switch the draw binds the exact original game sampler");
         auto* game_owned16 = shared16.Get();
         g.ctx->PSSetSamplers(0, 1, &game_owned16);
         g.ctx->Draw(4, 0);
