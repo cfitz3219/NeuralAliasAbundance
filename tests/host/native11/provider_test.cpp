@@ -891,7 +891,7 @@ int DepthReadFixture(Game& g, bool debug_layer)
 
 int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[maybe_unused]] bool rotating_lights = false,
                        [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false,
-                       [[maybe_unused]] bool reuse_depth = false, [[maybe_unused]] bool physical_lighting = false)
+                       [[maybe_unused]] bool reuse_depth = false, [[maybe_unused]] bool disagreeing_scene = false)
 {
     struct Surface {
         ComPtr<ID3D11Texture2D> picture;
@@ -1029,7 +1029,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         return true;
     };
     if (!na::native11::Install(game.device.Get(), consume, &evaluator, compare_routes,
-            composition_fault || physical_lighting ? recovery_evidence : compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
+            composition_fault || disagreeing_scene ? recovery_evidence : compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
 #else
     if (!na::native11::Install(game.device.Get(), consume, &evaluator)) return 1;
 #endif
@@ -1059,7 +1059,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         if (!box_code || FAILED(game.device->CreatePixelShader(box_code->GetBufferPointer(), box_code->GetBufferSize(), nullptr, &letterbox))) return 1;
         evaluator.peer = peer.picture.Get();
         evaluator.expected_reader = game.padded_hdr ? other_canvas.rtv.Get() : game.back_rtv.Get();
-        const bool staged_flash = compare_routes && !physical_lighting;
+        const bool staged_flash = compare_routes && !disagreeing_scene;
         auto blob = Compile(staged_flash ? "ps_trial_light" : "ps_reflection", "ps_5_0");
         auto vertex = Compile("vs_reflection", "vs_5_0");
         ComPtr<ID3D11VertexShader> lit_vs;
@@ -1068,12 +1068,10 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             !vertex || FAILED(game.device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &lit_vs))) return 1;
         ComPtr<ID3D11PixelShader> trial_surface, trial_screen;
         ComPtr<ID3D11Buffer> trial_flash;
-        if (compare_routes) {
+        if (staged_flash) {
             auto surface = Compile("ps_trial_surface", "ps_5_0");
             if (!surface || FAILED(game.device->CreatePixelShader(surface->GetBufferPointer(),
                 surface->GetBufferSize(), nullptr, &trial_surface))) return 1;
-        }
-        if (staged_flash) {
             auto screen_shader = Compile("ps_trial_screen", "ps_5_0");
             const D3D11_BUFFER_DESC flags{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
             if (!screen_shader ||
@@ -1085,8 +1083,8 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&back)))) return 1;
         struct Sample {
             int correct = 0, evaluated = 0, proven = 0, fixed_history = 0, displayed_readers = 0;
-            size_t changed = 0, reached = 0, comparisons = 0;
-            double movement = 0, brightness = 0;
+            size_t changed = 0, reached = 0, comparisons = 0, flash_pairs = 0;
+            double movement = 0, brightness = 0, flash_delta = 0;
             uint64_t scene = 0, camera = 0;
             std::vector<int> previous;
         };
@@ -1113,9 +1111,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             c->OMSetDepthStencilState(nullptr, 0);
             ID3D11RenderTargetView* layers[]{canvas.rtv.Get(), second_output.rtv.Get()};
             c->OMSetRenderTargets(2, layers, game.dsv.Get());
-            // An automatic comparison needs stable texture outside the
-            // reflection to establish that these are the same scene.
-            c->PSSetShader(compare_routes ? trial_surface.Get() : game.ps_scene.Get(), nullptr, 0);
+            c->PSSetShader(staged_flash ? trial_surface.Get() : game.ps_scene.Get(), nullptr, 0);
             for (int n = 0; n < 34; ++n) c->Draw(4, 0);
             // Keep the depth test active against the layer depth and draw coplanar fullscreen lighting.
             c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
@@ -1198,8 +1194,13 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                         s.reached += std::abs(out-visible_pixel) <= 2;
                     }
                     if (!s.previous.empty()) {
-                        s.movement += std::abs(visible_pixel-s.previous[current.size()]);
+                        const auto change = std::abs(visible_pixel-s.previous[current.size()]);
+                        s.movement += change;
                         ++s.comparisons;
+                        if (x >= 120 && x < 160 && y >= 68 && y < 90) {
+                            s.flash_delta += change;
+                            ++s.flash_pairs;
+                        }
                     }
                     s.brightness += visible_pixel;
                     current.push_back(visible_pixel);
@@ -1275,11 +1276,25 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             std::printf("controlled native scene: before=%.4f after=%.4f late=%d/28, visible result=%zu/%zu, GPU pairs=%llu comparable=%llu\n",
                         old_delta, new_delta, fixed.correct, fixed.reached, fixed.changed,
                         static_cast<unsigned long long>(stats.trial_pairs), static_cast<unsigned long long>(stats.trial_comparable));
+            if (disagreeing_scene) {
+                // Both readers may qualify while successive pictures from
+                // the ordinary route have no comparable structure. Keep
+                // delivering DLAA on the incumbent in that case.
+                expect(fixed.evaluated == 28 && fixed.correct == baseline.correct && new_delta >= old_delta * .80 &&
+                    stats.trial_pairs > stats.trial_comparable,
+                    "alternating pictures without shared structure cannot authorize a replacement");
+                na::native11::Uninstall();
+                return g_failed ? 1 : 0;
+            }
             expect(fixed.correct == 28 && fixed.proven == 28 && fixed.displayed_readers == 28,
                    "the actual provider keeps the improved screen-proved route");
-            expect(fixed.changed > 100 && fixed.reached * 100 >= fixed.changed * 98 &&
-                new_delta < old_delta * (physical_lighting ? .10 : .25),
+            expect(fixed.changed > 100 && fixed.reached * 100 >= fixed.changed * 98 && new_delta < old_delta * .25,
                    "real NGX reaches the screen and the reflected light stops flickering");
+            const double flash_before = baseline.flash_delta / baseline.flash_pairs;
+            const double flash_after = fixed.flash_delta / fixed.flash_pairs;
+            std::printf("known reflection footprint: before=%.4f after=%.4f\n", flash_before, flash_after);
+            expect(flash_before > 10 && flash_after <= flash_before * .10,
+                   "the automatic replacement cuts displayed variation by at least ninety percent where the light flashes");
             auto& sharpness = na::settings::Get().j2_sharpness;
             const auto previous_sharpness = sharpness.load();
             sharpness.store(previous_sharpness ? 0 : 1);
@@ -1659,11 +1674,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
     const bool padded_hdr = argc > 1 && std::strcmp(argv[1], "--lit-role-padded") == 0;
-    const bool physical_lighting = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-physical") == 0;
+    const bool disagreeing_scene = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-disagreeing-scene") == 0;
     const bool trial_reused_depth = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-reused-depth") == 0;
-    const bool reuse_depth = trial_reused_depth || physical_lighting || (argc > 1 && std::strcmp(argv[1], "--lit-role-reused-depth") == 0);
+    const bool reuse_depth = trial_reused_depth || disagreeing_scene || (argc > 1 && std::strcmp(argv[1], "--lit-role-reused-depth") == 0);
     const bool composition_fault = argc > 1 && std::strcmp(argv[1], "--composition-recovery") == 0;
-    const bool compare_routes = composition_fault || trial_reused_depth || physical_lighting ||
+    const bool compare_routes = composition_fault || trial_reused_depth || disagreeing_scene ||
         (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
@@ -1757,7 +1772,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (adaptive || rotating_lights) {
         na::j2::SetJitter(true);
         const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes,
-                                               composition_fault, reuse_depth, physical_lighting);
+                                               composition_fault, reuse_depth, disagreeing_scene);
         DeleteFileW(ini.c_str());
         std::fflush(stdout);
         ExitProcess(result);
