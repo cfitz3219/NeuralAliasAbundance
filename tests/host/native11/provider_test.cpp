@@ -2493,6 +2493,23 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
            na::xegtao::ScenePass().GetStats().recorded == ao_live.recorded &&
            na::donut::ScenePass().GetStats().recorded == lighting_live.recorded,
            "native enhancement switches stop their GPU work live");
+    auto& effect_options = na::settings::Get();
+    const auto prior_camera = effect_options.j2_camera.exchange(0);
+    effect_options.xegtao_enabled.store(1);
+    effect_options.donut_bloom.store(1);
+    for (int i = 0; i < 3; ++i) present_campaign();
+    const auto bloom_with_no_camera = na::donut::ScenePass().GetStats().recorded;
+    const auto ao_with_no_camera = na::xegtao::ScenePass().GetStats().recorded;
+    const auto delivered_with_no_camera = evaluations;
+    for (int i = 0; i < 4; ++i) present_campaign();
+    const auto ambient_status = na::xegtao::ScenePass().GetStats();
+    expect(na::donut::ScenePass().GetStats().recorded == bloom_with_no_camera + 4 &&
+           evaluations == delivered_with_no_camera + 4 && ambient_status.recorded == ao_with_no_camera &&
+           std::strstr(ambient_status.reason, "Use it when found"),
+           "on native DX11, bloom and DLAA keep running without a camera while XeGTAO explains what it needs");
+    effect_options.xegtao_enabled.store(0);
+    effect_options.donut_bloom.store(0);
+    effect_options.j2_camera.store(prior_camera);
     auto& draw_replay = na::settings::Get().j2_draw_replay;
     draw_replay.store(1);
     present_campaign();

@@ -751,10 +751,12 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         ai.srgb = !hdr; ai.clear_depth = frame.reversed_depth ? 0.f : 1.f;
         ai.jitter_x = in.jitter_current_px[0]; ai.jitter_y = in.jitter_current_px[1];
         ai.frame = frame.frame; ai.motion_reference_frame = s.last_frame;
-        ai.scene_epoch = frame.stream; ai.reset = reset_history;
+        ai.scene_epoch = frame.scene_stream; ai.reset = reset_history || cam.camera_cut;
         const auto column = camera::TransposeMatrix(cam.view_proj_current_row);
-        // Ambient shading rebuilds positions from the depth: that needs the camera's projection.
-        if (measured) xegtao::ScenePass().Unavailable("Ambient shading needs the scene camera; this frame has none.");
+        // The projection is independent of whether DLAA uses measured motion during camera acquisition.
+        if (!cam.valid) xegtao::ScenePass().Unavailable(camera_setting == 0
+            ? "To use XeGTAO, set Scene camera to Use it when found."
+            : "Waiting for the scene camera to run XeGTAO.");
         else if (xegtao::FromViewProjection(column.data(), ai.projection)) {
             auto options = xegtao::CurrentOptions();
             const bool history_requested = options.temporal > 0;

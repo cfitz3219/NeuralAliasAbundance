@@ -1522,10 +1522,12 @@ static void DrawDonutLighting()
 static void DrawAmbientOcclusion()
 {
     using namespace na::ui;
+    constexpr char ao_tip[] = "For natural-looking shadows, turn off the game's ambient occlusion (HBAO+, SSAO, or similar) when using XeGTAO.";
     auto& s=na::settings::Get();bool enabled=s.xegtao_enabled.load()!=0;
     const ImGuiID xegtao_popup=ImGui::GetID("XeGTAO settings"); // outside the row: see DrawDonutLighting
-    BeginRow("XeGTAO (Ambient Occlusion)", "Adds soft shading around corners and where objects meet. Turn the game's ambient occlusion off where possible to avoid doubling its shading.", S(220));
+    BeginRow("XeGTAO (Ambient Occlusion)", "Adds soft shading around corners and where objects meet.", S(220), ao_tip);
     if(ImGui::Checkbox("##xegtao",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);na::settings::Save();}
+    ImGui::SetItemTooltip("%s", ao_tip);
     ImGui::SameLine();if(Button("Settings..."))ImGui::OpenPopup(xegtao_popup);EndRow();
     ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
     // The modal stays open on outside clicks; its own X dismisses it.
@@ -1533,6 +1535,7 @@ static void DrawAmbientOcclusion()
     if(!ImGui::BeginPopupModal("XeGTAO settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
     bool changed=false;
     if(ImGui::Checkbox("Enable XeGTAO",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);changed=true;}
+    ImGui::SetItemTooltip("%s", ao_tip);
     const auto title=[&](const char* label,const char* tip){
         ImGui::TextUnformatted(label);if(ImGui::IsItemHovered())ImGui::SetTooltip("%s",tip);
         ImGui::SameLine(S(220));ImGui::SetNextItemWidth(S(310));
