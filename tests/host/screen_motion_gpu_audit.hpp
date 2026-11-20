@@ -180,6 +180,10 @@ inline int SolveControlled(test::Device& d) {
             samples.push_back(a);size_t k=(size_t(y)*gw+x)*4;grid[k]=a.vx;grid[k+1]=a.vy;grid[k+2]=a.nearness;grid[k+3]=a.confirmed?1.f:0.f;
         }
         const auto layers=sm::FitLayers(samples.data(),samples.size(),w,h);const auto& ref=layers.far_fit;
+        // Variant 0 supplies 2,048 confirmed samples including 28 negative
+        // distances. Variant 2 supplies valid zero distances for sky.
+        if(variant==0)CHECK(ref.samples==2020);
+        if(variant==2)CHECK(ref.samples==2048);
         auto input=g.Upload(gw,gh,DXGI_FORMAT_R32G32B32A32_FLOAT,16,grid.data());
         auto state=test::CreateBuffer(d.device.Get(),words*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         auto zero=test::CreateBuffer(d.device.Get(),80,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);void* z=nullptr;REQUIRE(SUCCEEDED(zero->Map(0,nullptr,&z)));std::memset(z,0,80);zero->Unmap(0,nullptr);

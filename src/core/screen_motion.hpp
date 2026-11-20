@@ -116,8 +116,8 @@ struct Window {
 
 inline bool Usable(const Sample& s, const Params& p)
 {
-    return s.confirmed && std::isfinite(s.vx) && std::isfinite(s.vy) && std::isfinite(s.nearness) && std::fabs(s.vx) < p.max_vector &&
-           std::fabs(s.vy) < p.max_vector;
+    return s.confirmed && std::isfinite(s.vx) && std::isfinite(s.vy) && std::isfinite(s.nearness) &&
+           Window{}.Holds(s.nearness) && std::fabs(s.vx) < p.max_vector && std::fabs(s.vy) < p.max_vector;
 }
 
 // Things that move by themselves by less than a pixel.
