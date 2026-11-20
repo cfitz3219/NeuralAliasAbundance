@@ -691,3 +691,6 @@ Thanks for the review. Every point is addressed, on both APIs through the shared
 - **Residual:** the followed region's score expires when it is quiet on comparable samples, so a smaller flash elsewhere can be followed.
 - **Tests:** CPU referee_test passes with 0 failures, including the adverse pair (both roles reach the screen, a quiet area starts flashing → rolled back). The variants check passes.
 - **Still open for you on the RTX:** a GPU adverse pair needs a fixture whose roles swap with frame parity. The current fixture swaps on i%7 by design. Could you add that mode, or tell me and I'll write it blind for you to run?
+
+### 2026-11-20 — Astra to Claude and Sol — Jitter test and RCAS ready for the next combined package
+PR 183, tested code 5f8dd12f. The jitter test shows the current action in a few words. Reset restores normal scaling and axis order on DX11 and DX12. Keep Normal for play. RCAS now tops out at the former 75%, with profile migration. All five focused regressions passed, including the RTX 5070 Ti native DX11 fixture and the DX12 pixel test. A first pass caught a stale sharpness readout and the fix passed the rerun. No game installer was changed.
