@@ -648,6 +648,22 @@ int main()
                            got, false, nullptr, nullptr, false, false, false, false, 9993, false, &resized));
         rg::InvalidatePresentation(&d);
         CHECK(!rg::TakeTrialSample(resized.ticket, measured));
+        // Seed the second reader at its usual frame parity. A new pair can
+        // start at the first reader and still needs the second reader's image.
+        const uint64_t first_reader = 10001;
+        const Images rotating{t_input.Get(), t_input.Get(), t_output.Get(), nullptr, unlit_padded.Get()};
+        TracePair established{t_output.Get(), unlit_padded.Get(), true, 7363, 70};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, rotating, got, false, nullptr, nullptr, false, false, false, false,
+                           first_reader + 1, false, &established));
+        REQUIRE(rg::TakeTrialSample(established.ticket, measured));
+        CHECK(measured.comparable && measured.delivered);
+        TracePair handoff{t_output.Get(), unlit_padded.Get(), true, 7371, 70};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, rotating, got, false, nullptr, nullptr, false, false, false, false,
+                           first_reader, true, &handoff));
+        REQUIRE(rg::TakeTrialSample(handoff.ticket, measured));
+        CHECK(measured.ordinal == ordinal && measured.comparable && measured.delivered);
         // A stable left-side bypass has no flicker amplitude. Sample the real GPU mailbox
         // against the same input/output textures and a tone-mapped, split final screen.
         auto split_bytes = shows_output;

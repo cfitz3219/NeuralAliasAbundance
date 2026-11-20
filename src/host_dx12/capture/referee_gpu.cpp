@@ -875,13 +875,13 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev))) || !init(dev.Get())) return 0;
     // VARIANT: referee/isolated-evaluation
     const bool screen_only = due && g.screen_only_source;
-    // A fixed sampling cadence can lock to one parity at a steady frame
-    // rate. On a proven native reader, alternate which parity gets scored.
-    const uint64_t screen_ordinal = due && !screen_only ? e.present_ordinal + 1 : e.present_ordinal;
-    if (e.context.native_screen_proof) {
+    // Vary parity only when opening a probe. Once it has a preceding Present,
+    // skipping its partner can starve a trial whose two readers alternate.
+    if (due && e.context.native_screen_proof) {
+        const uint64_t screen_ordinal = screen_only ? e.present_ordinal : e.present_ordinal + 1;
         const auto v = visual_proof(e.context.native_screen_proof);
         if (v != g.visual.end() && ((screen_ordinal ^ v->ordinal) & 1u) == 0 &&
-            !v->skipped_parity && (due || e.present_ordinal - g.pre_ordinal == 1)) {
+            !v->skipped_parity) {
             // Prefer the other parity, but an order that only runs every
             // other frame must still be sampled.
             v->skipped_parity = true;
