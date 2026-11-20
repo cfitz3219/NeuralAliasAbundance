@@ -5546,7 +5546,7 @@ std::atomic<bool> g_rp_movers_on{false};
 na::replay_movers::Table g_rp_table;
 std::atomic<uint64_t> g_rp_movers{0}, g_rp_suspects{0}, g_rp_promoted{0}, g_rp_let_go{0}, g_rp_reports{0};
 uint64_t g_rp_learn_clock = 0; // reports are dated by their order (under g_replay_slots_m)
-struct RpBudgetFrame { uint64_t frame = 0, used = 0, offered = 0, mover_used = 0; uint32_t threshold = na::replay_budget::kFull, phase = 0; bool full = false, movers = false; } g_rpb;
+na::replay_budget::FrameBudget g_rpb; // core/replay_budget.hpp Choose (the native DX11 producer keeps its own)
 // 83b0749/8cc8cb6 runs: noted=240 built=0 twin_queued=0 no_recipe=0, so every draw
 // stopped at a gate before the recipe lookup without a count. Each gate is counted.
 enum : uint32_t { kGateNotDirect, kGateNoRetain, kGateNoDepth, kGateNoList, kGateOtherDepth, kGateRenderPass, kGateState, kGateBundle, kGatePredicate, kGateStreamOut,
@@ -5867,40 +5867,23 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     if (const uint64_t budget = g_rp_budget.load(std::memory_order_relaxed)) {
         namespace rb = na::replay_budget;
         const bool movers = g_rp_movers_on.load(std::memory_order_relaxed);
-        const uint64_t share = movers ? budget / kRpProbeShare : budget; // what the sampled draws may take
-        if (g_rpb.frame != frame) { // a new frame: the threshold follows what the last one offered and admitted
-            if (g_rpb.movers != movers) { g_rpb.threshold = rb::kFull; g_rpb.movers = movers; } // another rule: start it afresh
-            else if (g_rpb.frame) g_rpb.threshold = rb::NextThreshold(g_rpb.threshold, g_rpb.offered, g_rpb.used, share, g_rpb.full);
-            if (frame / kRpProbeFrames != g_rpb.frame / kRpProbeFrames) g_rpb.phase = rb::NextPhase(g_rpb.phase, g_rpb.threshold);
-            g_rpb.frame = frame; g_rpb.used = 0; g_rpb.offered = 0; g_rpb.mover_used = 0; g_rpb.full = false;
-            g_rp_threshold_seen.store(g_rpb.threshold, std::memory_order_relaxed);
-        }
-        if (movers && g_rp_table.IsMover(rec.sig, rec.vb)) {
-            // A draw known to move by itself: replayed while the movers together fit the budget.
-            if (g_rpb.mover_used + verts > budget) { rp_count(kRpMoverLeftOut); return; }
-            g_rpb.mover_used += verts;
-            rp_count(kRpMoverDraws);
-            rp_count(kRpMoverVerts, verts);
-        } else {
-            const rb::Verdict verdict = movers
-                ? rb::DecideWithin(rb::SweepValue(rec.sig, rec.vb, g_rpb.phase), g_rpb.threshold, verts, g_rpb.used, rb::DrawLimit(budget),
-                                   rb::ProbeFrameLimit(budget, share))
-                : rb::Decide(rb::DrawValue(rec.sig, rec.vb, frame, kRpRotateFrames), g_rpb.threshold, verts, g_rpb.used, budget);
-            switch (verdict) {
-            case rb::Verdict::DrawTooLarge: rp_count(kRpDrawTooLarge); return;
-            case rb::Verdict::NotSampled: g_rpb.offered += verts; rp_count(kRpNotSampled); return;
-            case rb::Verdict::FrameFull:
-                g_rpb.full = true;
-                // Without movers nothing later in the frame can be admitted: leave at the door from here on.
-                if (movers) g_rpb.offered += verts;
-                else g_rp_full_frame.store(frame, std::memory_order_relaxed);
-                rp_count(kRpFrameFull);
-                return;
-            case rb::Verdict::Admit:
-                g_rpb.offered += verts; g_rpb.used += verts;
-                if (movers) rp_count(kRpProbeVerts, verts);
-                break;
-            }
+        bool closed = false;
+        const rb::Choice choice = rb::Choose(g_rpb, frame, budget, movers, movers && g_rp_table.IsMover(rec.sig, rec.vb), rec.sig, rec.vb, verts,
+                                             {kRpRotateFrames, kRpProbeShare, kRpProbeFrames}, &closed);
+        g_rp_threshold_seen.store(g_rpb.threshold, std::memory_order_relaxed);
+        switch (choice) {
+        case rb::Choice::MoverLeftOut: rp_count(kRpMoverLeftOut); return;
+        case rb::Choice::MoverAdmit: rp_count(kRpMoverDraws); rp_count(kRpMoverVerts, verts); break;
+        case rb::Choice::DrawTooLarge: rp_count(kRpDrawTooLarge); return;
+        case rb::Choice::NotSampled: rp_count(kRpNotSampled); return;
+        case rb::Choice::FrameFull:
+            // Without movers nothing later in the frame can be admitted: leave at the door from here on.
+            if (closed) g_rp_full_frame.store(frame, std::memory_order_relaxed);
+            rp_count(kRpFrameFull);
+            return;
+        case rb::Choice::Admit:
+            if (movers) rp_count(kRpProbeVerts, verts);
+            break;
         }
     }
     const HostWorkScope own;

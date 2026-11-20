@@ -2,6 +2,7 @@
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
+#include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -314,6 +315,10 @@ void install_native(ID3D11Device* device)
             return na::j2::Enabled() && !na::j2::Paused() ? na::observe::SamplerMipBias() : 0.f;
         }, [] { return na::observe::SamplerAnisotropyWanted(); }))
         note("native DX11 route: the sampler hooks (texture detail / AF) could not be installed");
+    // Draw replay: the game's vertex shaders are kept from creation, so a scene draw can be replayed
+    // with stream output when [j2] draw_replay is on (native11/draw_replay.hpp).
+    if (!na::native11::draw_replay::Install(device))
+        note("native DX11 route: the draw replay hook (vertex shader creation) could not be installed");
     // Material textures: census of what the game draws its surfaces with, and prepared replacements.
     if (!na::native11::InstallTextures(device))
         note("native DX11 route: the material texture hooks could not be installed");

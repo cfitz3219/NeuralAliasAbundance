@@ -59,9 +59,23 @@ public:
     // current raster offset in render pixels, absent from both sets of clip positions.
     Output Record(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
                   const float viewport_jitter[2], const Reference* reference = nullptr);
+    // The same pass on positions another producer captured (the native DX11 route: draws replayed
+    // with D3D11 stream output, copied into DX12 buffers by the caller). `frame->cur` and `->prev` are
+    // in COMMON and stay alive until this recording retires (the caller keeps them). `expanded`: the
+    // scene was rasterised through a viewport widened by half a pixel on each side (native11
+    // JitterViewports), so the pass rasterises on that same grid: motion in its pixels, and the same
+    // pixels as the game's depth.
+    Output Record(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
+                  const float viewport_jitter[2], const Reference* reference, const na::observe::ReplayFrame& frame, bool expanded);
+    // Where what the pass learns about each draw goes (default: the DX12 observe layer's table).
+    using LearnSink = void (*)(const na::observe::ReplayObservation*, size_t);
+    void SetLearnSink(LearnSink sink) { learn_ = sink ? sink : &na::observe::ReplayLearn; }
     Stats GetStats() const { return stats_; }
 private:
     bool ensure(uint32_t rw, uint32_t rh);
+    Output record(ID3D12GraphicsCommandList* list, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
+                  const float viewport_jitter[2], const Reference* reference, const na::observe::ReplayFrame& f, bool expanded);
+    LearnSink learn_ = &na::observe::ReplayLearn;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_[2]; // [reversed]

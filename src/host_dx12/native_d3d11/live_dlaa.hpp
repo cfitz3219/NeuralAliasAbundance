@@ -16,4 +16,6 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue,
 void SyncCameraUse();
 int FormatStatus(char* out, size_t capacity);
 bool FormatMenuStatus(char* out, size_t capacity);
+// Draw replay on this route (native11/draw_replay.hpp): one line for the menu, empty when the switch is off.
+bool FormatReplayStatus(char* out, size_t capacity);
 }

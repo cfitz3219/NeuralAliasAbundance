@@ -1101,16 +1101,17 @@ void DrawLiveDlaa()
         EndRow();
         {
             na::settings::Settings& rs = na::settings::Get();
-            bool replay = !native && rs.j2_draw_replay.load() != 0;
+            bool replay = rs.j2_draw_replay.load() != 0;
             BeginRow("Object motion (draw replay)",
-                     native ? "Draw replay is unavailable on native DirectX 11."
-                            : "Replays matching scene draws to reduce smearing on moving objects. Uses extra GPU time and applies live.",
+                     "Replays matching scene draws to reduce smearing on moving objects. Uses extra GPU time and applies live.",
                      S(220));
-            ImGui::BeginDisabled(native);
             if (ImGui::Checkbox("##drawreplay", &replay)) { rs.j2_draw_replay.store(replay ? 1u : 0u); na::settings::Save(); }
-            ImGui::EndDisabled();
             EndRow();
-            if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
+            // Native DirectX 11 has its own replay producer (native11/draw_replay.hpp) on the same switch.
+            char native_replay[96] = {};
+            if (native) na::native_d3d11::FormatReplayStatus(native_replay, sizeof native_replay);
+            const char* replay_status = native ? native_replay : st.draw_replay;
+            if (replay && replay_status[0]) StatusLine(0, replay_status);
         }
         if (!native) {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
             const bool running = na::j2::SmearTestRunning();
