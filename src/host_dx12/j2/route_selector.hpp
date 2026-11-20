@@ -176,7 +176,7 @@ public:
     }
 
     // Close one frame. The returned decision applies to the NEXT frame.
-    const RouteDecision& OnFrame(const FrameObservation& o)
+    const RouteDecision& OnFrame(const FrameObservation& o, bool comparing_placement = false)
     {
         if (o.interceptor && mode_ == RouteMode::Auto) {
             // A supported upscaler handler owns the view: explicit ownership, honoured at
@@ -209,7 +209,9 @@ public:
             if (o.later_scene_write) { ++d_.contradictions; contradiction = true; }
             else ++d_.placement_consistent;
         }
-        if (mode_ != RouteMode::Auto) return d_; // overrides never relearn
+        // A bounded screen comparison retains the incumbent. Interceptor
+        // ownership above still takes precedence and cancels the comparison.
+        if (mode_ != RouteMode::Auto || comparing_placement) return d_;
 
         // Positive boundary evidence only (Astra R3): a usable in-list boundary, or a
         // later list that reads the final scene version. No observed consumer is NOT a

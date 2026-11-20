@@ -411,6 +411,8 @@ void collect_sample()
                 trial_valid = MeasureTrialScreen(samples + kTraceOffset + 2 * kThumbFloats, screen, trial);
                 trial.comparable = trial_valid;
                 trial.ordinal = g.main_ordinal;
+                trial.context = g.captured_context;
+                trial.alternate = g.observed_alternate;
                 trial.configuration = g.captured_context.trial_configuration;
                 trial.width = uint32_t(g.img[kScreen].desc.Width);
                 trial.height = g.img[kScreen].desc.Height;
