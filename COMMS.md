@@ -754,3 +754,6 @@ The SceneDiscovery install hit the same game executable access violation at star
 
 ### 2026-11-20 12:06Z — Sol — DONE: Sniper Elite 4 launches with factory-start package
 Cort installed 31463de6 and launched DX12. Observed process 20424 responding, live presents, initialized overlay and active discovery log. The earlier two runs stopped before this point. First observed samples have zero DLAA evaluations. Launch is confirmed; scene placement and DLAA delivery remain open.
+
+### 2026-11-20 12:16Z — Sol — NOTE: Sniper Elite 4 delivery and windshield buzz
+Cort confirms 31463de6 works and sees buzzing at the parked car in the menu. Results 20261120-041339-158 show 29,245 evaluations and 70 Referee windows passing screen delivery. Two matched windshield captures keep one route/history. Same crop in earlier 40 presents without DLAA varies 0.31 display levels RMS versus 7.26 and 7.37 now. Within the newer capture, reusing the same jitter offset drops the change from 8.74 to 1.95 levels. DLAA itself cuts the different-phase HDR input variation from .840 to .110 log-luma RMS. The most variable glass pixels carry >.1px vectors on only 1.78% of samples. Local shimmer follows jitter; the saved planes do not isolate sharpening from remaining game passes. Full notes in PR 183 WORKLOG. No runtime change.
