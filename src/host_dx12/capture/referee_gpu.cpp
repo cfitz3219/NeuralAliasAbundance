@@ -159,8 +159,15 @@ ULONGLONG every_ms()
     const uint32_t v = na::settings::Get().referee_every_ms.load(std::memory_order_relaxed);
     return v < 100 ? 100 : v;
 }
+void clear_parity_locked()
+{
+    g.parity.Reset();
+    g.parity_at = 0;
+    g_parity_seen.store(false, std::memory_order_relaxed);
+}
 void stop(const char* why)
 {
+    clear_parity_locked();
     set_phase(Phase::Stopped);
     g.stats.stopped = true;
     g.stats.running = false;
@@ -571,11 +578,8 @@ void collect_sample()
                 g.trace_context.generation != g.captured_context.generation ||
                 !(g.trace_context.placement == g.captured_context.placement) ||
                 g.trace_context.trial_configuration != g.captured_context.trial_configuration ||
-                g.main_ordinal <= g.trace_ordinal || g.main_ordinal - g.trace_ordinal > 240) {
-                g.parity.Reset();
-                g.parity_at = 0;
-                g_parity_seen.store(false, std::memory_order_relaxed);
-            }
+                g.main_ordinal <= g.trace_ordinal || g.main_ordinal - g.trace_ordinal > 240)
+                clear_parity_locked();
             const auto matched = g.parity.Matched();
             if (g.parity.Observe(g.pre_ordinal, g.main_ordinal, transition.stops)) {
                 ++g.stats.parity_recognitions;
@@ -951,9 +955,7 @@ void reset_evidence_locked()
     g.visual.clear();
     g.visual_rollback.store(false, std::memory_order_relaxed);
     g.trace_source = nullptr;
-    g.parity.Reset();
-    g.parity_at = 0;
-    g_parity_seen.store(false, std::memory_order_relaxed);
+    clear_parity_locked();
     g.geometry = {};
 }
 
@@ -1292,9 +1294,7 @@ void InvalidatePresentation(const void* swapchain)
         [](const Presentation& p) { return p.swapchain != nullptr; }), std::memory_order_release);
     if (g.trace_source == swapchain) {
         g.trace_source = nullptr;
-        g.parity.Reset();
-        g.parity_at = 0;
-        g_parity_seen.store(false, std::memory_order_relaxed);
+        clear_parity_locked();
     }
     g.visual.erase(std::remove_if(g.visual.begin(), g.visual.end(),
         [swapchain](const VisualEvidence& v) { return v.chain == swapchain; }), g.visual.end());
@@ -1322,7 +1322,7 @@ void InvalidatePresentation(const void* swapchain)
 
 bool ParityRoleSwapSeen(const void* swapchain, uint64_t depth)
 {
-    if (!swapchain || !depth || !g_parity_seen.load(std::memory_order_relaxed)) return false;
+    if (!swapchain || !depth || !enabled() || !g_parity_seen.load(std::memory_order_relaxed)) return false;
     std::lock_guard<std::mutex> lock(g.m);
     return g.trace_source == swapchain && g.trace_context.depth == depth &&
         g.parity.Recognized() && GetTickCount64() - g.parity_at <= 20000;
