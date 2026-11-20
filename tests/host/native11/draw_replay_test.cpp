@@ -43,6 +43,10 @@ int main()
         }
     }
     std::printf("device: %s\n", warp ? "WARP" : "hardware");
+    ComPtr<ID3D11Device> single_threaded;
+    REQUIRE(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED,
+        &fl, 1, D3D11_SDK_VERSION, &single_threaded, nullptr, nullptr)));
+    CHECK(!dr::Install(single_threaded.Get()));
     REQUIRE(dr::Install(dev.Get()));
 
     constexpr UINT w = 32, h = 24;
@@ -185,10 +189,14 @@ float4 ps() : SV_Target { return 1; }
 
     // Frame 4: the game streams out itself: left alone.
     {
-        ID3D11Buffer* targets[] = {game_so.Get()};
-        const UINT offsets[] = {0};
-        ctx->SOSetTargets(1, targets, offsets);
+        ID3D11Buffer* targets[] = {nullptr, game_so.Get()};
+        const UINT offsets[] = {0, 0};
+        ctx->SOSetTargets(2, targets, offsets);
         draw(4, 0, true);
+        ID3D11Buffer* actual[2]{};
+        ctx->SOGetTargets(2, actual);
+        CHECK(!actual[0] && actual[1] == game_so.Get());
+        for (auto* b : actual) if (b) b->Release();
         ctx->SOSetTargets(0, nullptr, nullptr);
         CHECK(dr::Seal(4).draws.empty());
         CHECK(std::strstr(dr::GetStats().gates, "stream_out=1") != nullptr);

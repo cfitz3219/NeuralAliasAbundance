@@ -2543,7 +2543,9 @@ void ReplayAfterDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs
     f.scene_depth = scene_depth && x->depth == scene_depth && x->depth_test;
     f.depth_read_only = x->depth_read_only;
     f.query_active = x->raster_queries != 0;
-    f.viewport = &x->vps[0].TopLeftX; // D3D11_VIEWPORT: TopLeftX, TopLeftY, Width, Height, MinDepth, MaxDepth
+    const auto& vp = x->vps[0];
+    const float viewport[]{vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, vp.MinDepth, vp.MaxDepth};
+    f.viewport = viewport;
     f.viewports = x->vp_n;
     draw_replay::AfterDraw(c, f, a);
 }

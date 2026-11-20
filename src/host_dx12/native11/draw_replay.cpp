@@ -50,8 +50,9 @@ struct Entry {
     ComPtr<ID3D11GeometryShader> twin;
     uint8_t state = 0; // 0 not asked, 1 queued, 2 built, 3 failed
 };
-std::mutex g_shaders_m;
-std::condition_variable g_shaders_cv;
+// Like the DX12 replay worker, the idle waiter can outlive CRT teardown.
+std::mutex& g_shaders_m = *new std::mutex();
+std::condition_variable& g_shaders_cv = *new std::condition_variable();
 std::unordered_map<const void*, std::shared_ptr<Entry>>& g_shaders = *new std::unordered_map<const void*, std::shared_ptr<Entry>>();
 std::deque<std::shared_ptr<Entry>>& g_queue = *new std::deque<std::shared_ptr<Entry>>();
 bool g_worker = false;
@@ -182,13 +183,27 @@ bool Install(void* device)
 {
     std::lock_guard<std::mutex> g(g_install_mu);
     auto* dev = static_cast<ID3D11Device*>(device);
-    if (!dev) return false;
-    g_hooked.store(dev, std::memory_order_release);
+    // The twin builder calls device methods from a worker.
+    if (!dev || (dev->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED)) return false;
     {
+        std::lock_guard<std::mutex> frame_lock(g_m);
         std::lock_guard<std::mutex> lk(g_shaders_m);
-        if (g_device.Get() != dev) { g_device = dev; g_shaders.clear(); } // another device: its shaders are not this one's
+        if (g_device.Get() != dev) {
+            g_device = dev;
+            g_shaders.clear();
+            g_queue.clear();
+            g_acc = {};
+            g_table.Clear();
+            g_so.Reset();
+            g_so_view.Reset();
+            g_pack.Reset();
+            g_buffers_tried = false;
+        }
     }
-    if (g_installed) return true;
+    if (g_installed) {
+        g_hooked.store(dev, std::memory_order_release);
+        return true;
+    }
     if (!na::hooking::Initialize()) return false;
     bool ok = na::hooking::BeginInstallWait("native11_draw_replay");
     ok = ok && na::hooking::PrepareVTableSlot(dev, kCreateVertexShader, reinterpret_cast<void*>(&CreateVertexShader_d),
@@ -196,6 +211,7 @@ bool Install(void* device)
     if (ok) ok = na::hooking::CommitInstall();
     else na::hooking::AbandonInstall();
     g_installed = ok;
+    if (ok) g_hooked.store(dev, std::memory_order_release);
     na::eventlog::Emit("draw_replay11", "install ok=%d", ok ? 1 : 0);
     return ok;
 }
@@ -260,9 +276,14 @@ void AfterDraw(ID3D11DeviceContext* c, const DrawFacts& facts, const DrawArgs& a
         if (gs.p || hs.p || ds.p) { gate(kGateStages); return; }
     }
     {
-        Held<ID3D11Buffer> so;
-        c->SOGetTargets(1, &so.p);
-        if (so.p) { gate(kGateStreamOut); return; }
+        ID3D11Buffer* targets[D3D11_SO_BUFFER_SLOT_COUNT]{};
+        c->SOGetTargets(D3D11_SO_BUFFER_SLOT_COUNT, targets);
+        bool bound = false;
+        for (auto* target : targets) if (target) {
+            bound = true;
+            target->Release();
+        }
+        if (bound) { gate(kGateStreamOut); return; }
     }
     {
         Held<ID3D11Predicate> predicate;
@@ -273,8 +294,10 @@ void AfterDraw(ID3D11DeviceContext* c, const DrawFacts& facts, const DrawArgs& a
     {
         // D3D11.1 lets every stage see the output UAVs: running the vertex shader twice must not
         // write through one twice (DX12: kGateVsUav).
-        ID3D11UnorderedAccessView* uavs[D3D11_PS_CS_UAV_REGISTER_COUNT]{};
-        c->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, D3D11_PS_CS_UAV_REGISTER_COUNT, uavs);
+        ID3D11UnorderedAccessView* uavs[D3D11_1_UAV_SLOT_COUNT]{};
+        const UINT slots = dev->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1 ?
+            D3D11_1_UAV_SLOT_COUNT : D3D11_PS_CS_UAV_REGISTER_COUNT;
+        c->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, slots, uavs);
         bool any = false;
         for (auto* u : uavs) if (u) { any = true; u->Release(); }
         if (any) { gate(kGateVsUav); return; }
@@ -429,7 +452,11 @@ Sealed Seal(uint64_t frame)
 
 bool Pack(ID3D11DeviceContext* ctx, ID3D11UnorderedAccessView* target, uint64_t verts)
 {
+    std::lock_guard<std::mutex> lock(g_m);
     if (!ctx || !target || !verts || verts > kCapacity || !g_pack || !g_so_view) { count(kPackFailed); return false; }
+    ComPtr<ID3D11Device> device;
+    ctx->GetDevice(&device);
+    if (device.Get() != g_device.Get()) { count(kPackFailed); return false; }
     OwnWorkScope own;
     ComPtr<ID3D11ComputeShader> previous;
     ComPtr<ID3D11ShaderResourceView> previous_srv;
