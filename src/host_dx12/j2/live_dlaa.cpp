@@ -5086,14 +5086,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         const auto logical_color = pending.referee_logical_color ? pending.referee_logical_color : color_id;
         na::referee::shadow::Context context{
             {inl ? Path::Inline : Path::Between, pending.referee_boundary}, logical_color, depth_id, route.history_generation, csub};
+        context.trial_configuration = current_configuration();
         if (recover && !recovering_kept && g.placement_trial.Matches({logical_color, depth_id, route.history_generation,
                                                                     pending.selection_version, g.placement_lighting})) {
             if (g.placement_trial.UsesCandidate() == pending.referee_handoff)
                 context.trial_ticket = g.placement_trial.Ticket(g.frame);
-            if (context.trial_ticket) context.trial_configuration = current_configuration();
         } else if (same_recovery) {
             context.trial_ticket = g.recovery.Ticket(g.frame);
-            if (context.trial_ticket) context.trial_configuration = current_configuration();
             if (recovering_kept) {
                 context.recovery_region = g.placement_trial.RecoveryRegion();
                 context.recovery_floor = g.placement_trial.RecoveryFloor();

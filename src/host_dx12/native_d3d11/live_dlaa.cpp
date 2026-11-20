@@ -854,7 +854,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             {referee::shadow::Path::Native11, static_cast<uint64_t>(frame.boundary)},
             frame.color.incarnation, frame.depth.incarnation, frame.scene_stream, csub, 0, 0, frame.screen_proof};
         identity.trial_ticket = frame.trial_ticket;
-        if (identity.trial_ticket) identity.trial_configuration = configuration();
+        identity.trial_configuration = configuration();
         identity.recovery_region = frame.recovery_region;
         identity.recovery_floor = frame.recovery_floor;
         capture_token = capture::j2::RecordReferee(list, planes, id, eval.render_w, eval.render_h, eval.out_w, eval.out_h, identity);

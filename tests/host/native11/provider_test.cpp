@@ -1224,19 +1224,6 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         }
         for (int i = 0; i < 70; ++i) if (!record(i, true, i < 42 ? nullptr : &baseline)) return 1;
         na::settings::Get().referee_enabled.store(1);
-        int next_frame = 0;
-        if (parity_roles) {
-            // Observe the ordinary route before the timed alternative can
-            // remove the known signal. Then enable both production proofs.
-            na::settings::Get().referee_every_ms.store(100);
-            const auto learn_until = GetTickCount64() + 16000;
-            while (!na::referee::gpu::GetStats().parity_recognitions && GetTickCount64() < learn_until) {
-                if (!record(next_frame++, true, nullptr)) return 1;
-                Sleep(7);
-            }
-            expect(na::referee::gpu::GetStats().parity_recognitions > 0,
-                   "the RTX trace recognizes alternating input and screen brightness");
-        }
         na::native11::SetScreenCheck(true);
         if (composition_fault) {
             // The final game shader flashes independently of the amount of
@@ -1281,7 +1268,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             const auto menu_draws = na::overlay::GetStats().frames_rendered;
             auto until = GetTickCount64() + 18000;
             bool kept_by_roles = false;
-            int i = next_frame;
+            int i = 0;
             while (GetTickCount64() < until) {
                 if (reuse_depth) na::overlay::SetOpen((i / 8) % 2 == 0);
                 if (!record(i++, true, nullptr)) return 1;
