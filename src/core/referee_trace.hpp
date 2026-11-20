@@ -163,23 +163,23 @@ struct JitterVibration {
         cursor = (cursor + 1) % pairs.size();
         count = (std::min)(count + 1, static_cast<unsigned>(pairs.size()));
     }
-    float Leakage(bool output) const
+    struct Estimate { float shift = 0; bool valid = false, locked = false; };
+    Estimate Measure(bool output) const
     {
-        if (count < 6) return 0;
+        if (count < 6) return {};
         float xmin = 0, xmax = 0, ymin = 0, ymax = 0, sum = 0;
-        unsigned agrees = 0;
+        unsigned same = 0, opposite = 0;
         for (unsigned i = 0; i < count; ++i) {
-            const auto& pair = pairs[i];
-            const float error = output ? pair.reconstructed : pair.presented;
-            if (error >= .03f) {
-                xmin = (std::min)(xmin, pair.phase_x); xmax = (std::max)(xmax, pair.phase_x);
-                ymin = (std::min)(ymin, pair.phase_y); ymax = (std::max)(ymax, pair.phase_y);
-                ++agrees;
-            }
-            sum += error;
+            const auto& sample = pairs[i];
+            xmin = (std::min)(xmin, sample.phase_x); xmax = (std::max)(xmax, sample.phase_x);
+            ymin = (std::min)(ymin, sample.phase_y); ymax = (std::max)(ymax, sample.phase_y);
+            const float shift = output ? sample.reconstructed : sample.presented;
+            same += shift >= .03f;
+            opposite += shift <= -.03f;
+            sum += shift;
         }
-        if (agrees < count - 1 || xmin > -.15f || xmax < .15f || ymin > -.15f || ymax < .15f) return 0;
-        return sum / count;
+        if (xmin > -.15f || xmax < .15f || ymin > -.15f || ymax < .15f) return {};
+        return {sum / count, true, same >= count - 1 || opposite >= count - 1};
     }
 };
 

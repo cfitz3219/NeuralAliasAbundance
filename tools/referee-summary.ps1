@@ -125,8 +125,9 @@ function Get-RefereeSummary([string[]] $Lines) {
             $out.Add("  Comparison still in progress at the last observation for '$($names[$Matches[1]])'.")
         }
     }
-    if ($jitterGeometry -match 'tile_xy=(\d+,\d+) samples=(\d+) phase_residual_screen_px=([\d.]+) phase_residual_dlaa_px=([\d.]+)' -and [double]$Matches[3] -gt 0) {
-        $out.Add("  Jitter-aligned edge movement measured at ($($Matches[1])) on $($Matches[2]) pairs. Screen $($Matches[3]) px, DLAA output $($Matches[4]) px.")
+    if ($jitterGeometry -match 'tile_xy=(\d+,\d+) samples=(\d+) phase_residual_screen_px=([-\d.]+) phase_residual_dlaa_px=([-\d.]+)(?: locked=(\d+))?') {
+        $qualifier = if ($Matches[5] -eq '0') { 'No consistent jitter phase in these pairs.' } else { 'Movement follows the jitter phase.' }
+        $out.Add("  Jitter-aligned edge movement measured at ($($Matches[1])) on $($Matches[2]) pairs. Screen $($Matches[3]) px, DLAA output $($Matches[4]) px. $qualifier")
     }
     $placements = @($Lines | Where-Object { $_ -match '(^|\s)native11_placement\s' })
     if ($placements) {

@@ -91,7 +91,7 @@ struct State {
         uint32_t layout = 0, width = 0, height = 0;
         TileLocations locations;
         std::array<JitterVibration, kTiles> window;
-        float reported = 0;
+        JitterVibration::Estimate reported;
     } geometry;
     std::atomic<uint64_t> trial_sample_ticket{0};
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
@@ -507,17 +507,23 @@ void collect_sample()
             }
             w.ordinal = g.main_ordinal;
             unsigned tile = 0;
-            float maximum = 0;
+            JitterVibration::Estimate best;
             for (unsigned i = 0; i < kTiles; ++i) {
                 w.window[i].Add(geometry[i]);
-                if (const float leak = w.window[i].Leakage(false); leak > maximum) { tile = i; maximum = leak; }
+                const auto current = w.window[i].Measure(false);
+                if (current.valid && (!best.valid || (current.locked && !best.locked) ||
+                    (current.locked == best.locked && std::fabs(current.shift) > std::fabs(best.shift)))) {
+                    tile = i;
+                    best = current;
+                }
             }
-            if (std::fabs(maximum - w.reported) >= .03f) {
-                w.reported = maximum;
+            if (best.valid && (!w.reported.valid || best.locked != w.reported.locked ||
+                std::fabs(best.shift - w.reported.shift) >= .03f)) {
+                w.reported = best;
                 na::eventlog::Emit("referee_jitter_geometry",
-                    "frame=%llu tile_xy=%d,%d samples=%u phase_residual_screen_px=%.4f phase_residual_dlaa_px=%.4f",
+                    "frame=%llu tile_xy=%d,%d samples=%u phase_residual_screen_px=%.4f phase_residual_dlaa_px=%.4f locked=%u",
                     (unsigned long long)g.main_ordinal, regions.at[tile].x, regions.at[tile].y,
-                    w.window[tile].count, maximum, w.window[tile].Leakage(true));
+                    w.window[tile].count, best.shift, w.window[tile].Measure(true).shift, unsigned(best.locked));
             }
         }
         if (g.trace_pair && g.trial_adjacent && g.preview_exact && !g.invalidated) {

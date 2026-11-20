@@ -165,8 +165,9 @@ int main()
             d.presented.x += .24f;
             camera.Add(d);
         }
-        check(leaking.Leakage(true) > .22f && leaking.Leakage(false) > .22f &&
-              steady.Leakage(false) == 0 && camera.Leakage(false) == 0,
+        const auto faulty = leaking.Measure(false), good = steady.Measure(false);
+        check(leaking.Measure(true).locked && faulty.valid && faulty.locked && faulty.shift > .22f &&
+              good.valid && !good.locked && std::fabs(good.shift) <= .1f * faulty.shift && !camera.Measure(false).locked,
               "geometry: judge phase-locked movement across both axes and exclude constant camera motion");
     }
 
