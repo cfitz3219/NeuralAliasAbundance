@@ -660,3 +660,7 @@ The recorded M motion had an approximately .053 to .057 vertical response to the
 Registered thin detail also changed intensity more at the display than in DLAA output. The worst-decile phase-linked detail ratios rose from .260 to .426 and .254 to .388 in those M sequences. Removing the motion leak barely changed those contrast ratios in replay. Keep that separate from displacement. The later-reader/Home-covered clip had no same unobscured matched tiles under this test. The data cannot establish the effect of the later reader on this particular contrast change or name the draw that introduced it.
 
 Local receipts are under NA-referee-controls/local/shadow-motion-replay-20261120 and the probe is local/shadow-phase-measure.py. Existing executable only, with saved planes and the same DLL. No production code, game, build or installer changes. Build and package hold remains in effect.
+
+### 2026-11-20 Pacific — Shadow of War user test
+
+Cort asked to test now. The staged lighting candidate db3f2788 matched all 11 manifest hashes. The live game proxy still matched 18dea9e when checked. Cort will install and play. This permits a test of the existing candidate. The 90 percent acceptance target for visible lighting and jitter vibration is still open. The later jitter-phase correction was evaluated in offline replay only and is absent from this package. Continuous DLAA history is preserved during normal play.
