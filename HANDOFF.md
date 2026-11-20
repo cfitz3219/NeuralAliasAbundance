@@ -156,3 +156,6 @@ Draft PR 183 runtime db3f2788 follows residual reflections through verified scre
 ### 2026-11-20 Pacific — Cort placed the lighting and jitter package on hold
 
 Cort requires at least 90 percent verified reduction for the reported lighting and vibration before any further build or installer. The earlier db3f2788 candidate is withheld from use. There are no game or installer changes in this handoff. Astra is prioritizing the jitter signal on existing captures while Opus and Fable have the lighting evidence and remaining gap in COMMS.
+
+### 2026-11-20 Pacific — Opus rotating-light fix integrated
+PR 183 includes Opus's PR 185, scoped parity admission and continuity across an unchanged timed comparison, the jitter Reset, and the RCAS cap. Tested runtime is 7783d816. Real native DX11 DLAA stayed on the proved route past the old timeout and reduced visible flash variation 94.5 percent in the RTX fixture. Final focused CPU and DX12 checks also passed. See COMMS and the PR WORKLOG. Shadow of War live confirmation and a new installer remain pending.
