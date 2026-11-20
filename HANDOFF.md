@@ -136,3 +136,7 @@ PR 178 (01f707b4) resets DLAA once on a confirmed change of sampling mode. Three
 ### 2026-11-20 Pacific — Lighting evidence and jitter switch parity
 
 PR 179 (0d8e38fe) takes native DX11 lighting proof before Home, as DX12 already does, and leaves Home in the separate full-screen capture. Two real-NGX RTX tests passed. PR 180 (a72c26d0) implements one jitter-switch history rule across DX11 and DX12, with a Release build and seven further regression passes. Live verification of the castle and a combined package remain open. Technical evidence is in COMMS and the branch WORKLOG.
+
+### 2026-11-20 Pacific — Unified release line
+
+Draft PR 181 into main is backed up on GitHub at astra/unified-main a30f16fe. It preserves the tested production sources through a72c26d0 and the main and integration journals. It is the convergence point for both routes, both graphics APIs and the shared Referee. Fable's final handoff and the combined automated verification precede the final merge. See COMMS for the overlap already identified.
