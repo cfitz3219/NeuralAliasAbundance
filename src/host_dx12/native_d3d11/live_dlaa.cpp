@@ -452,9 +452,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const auto lighting = donut::CurrentOptions();
     const uint32_t preset = settings::Get().j2_preset.load();
     const bool jitter_requested = j2::Jitter();
+    const neural_alias::JitterDiagnostic debug_jitter{settings::Get().j2_debug_jitter.load(std::memory_order_relaxed)};
     const auto configuration = [&] {
         return referee::EvaluationConfiguration(preset == 255 ? 12u : preset, cf, df, hdr, frame.reversed_depth,
-            camera_setting, measured, jitter_requested, j2::flow::Enabled());
+            camera_setting, measured, jitter_requested, j2::flow::Enabled(), debug_jitter.value);
     };
     // Settings changes take precedence even between GPU observations.
     const Tool tool = frame.recovery_tool != Tool::None && settings::Get().referee_enabled.load() &&
@@ -537,7 +538,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // A draw can still carry the previous setting for one frame. Reset on the first picture that
     // matches the new setting. Occasional missing samples while the setting is unchanged retain history.
     const auto jitter_history = neural_alias::JitterHistoryForFrame(s.jitter_history, jitter_requested,
-                                                                   frame.raster.applied);
+                                                                   frame.raster.applied, debug_jitter);
     const bool jitter_switched = neural_alias::JitterHistoryChanged(s.jitter_history, jitter_history);
     reset_history |= jitter_switched;
     j2::compute_flow::Ticket flow;
@@ -774,8 +775,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     eval.quality = dlss::Quality::DLAA;
     eval.hdr = eval.auto_exposure = hdr;
     eval.depth_inverted = frame.reversed_depth;
-    eval.jitter_x = in.jitter_current_px[0];
-    eval.jitter_y = in.jitter_current_px[1];
+    const auto declared = debug_jitter.Declared(in.jitter_current_px[0], in.jitter_current_px[1]);
+    eval.jitter_x = declared.x;
+    eval.jitter_y = declared.y;
     eval.reset = reset_history;
     eval.preset = preset == 255 ? 12 : preset;
     constexpr uint64_t kNativeView = 0x4e41544956453131ull;
@@ -890,8 +892,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.color_format = cf;
         id.jitter_x = eval.jitter_x;
         id.jitter_y = eval.jitter_y;
-        id.raster_jitter_x = eval.jitter_x;
-        id.raster_jitter_y = eval.jitter_y;
+        id.raster_jitter_x = in.jitter_current_px[0];
+        id.raster_jitter_y = in.jitter_current_px[1];
         id.depth_reversed = frame.reversed_depth;
         id.camera_cut = !measured && cam.camera_cut;
         id.cut_reason = measured ? 0u : static_cast<uint32_t>(cam.cut_reason);
@@ -920,10 +922,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     auto* result = slot.output.Native();
     uint32_t sharpened = 0;
-    // The menu value is 0..100; the RCAS pass takes 0..200 (100 = standard RCAS). The DX12 host
-    // doubles it at every call site; without that the slider's top was plain RCAS and its upper,
-    // stronger half was unreachable (p37752: 0 and 100 looked alike).
-    const uint32_t sharpness = (tool == Tool::Sharpen ? 1u : 2u) * settings::Get().j2_sharpness.load();
+    const uint32_t sharpness = settings::RcasStrength(settings::Get().j2_sharpness.load(), tool == Tool::Sharpen);
     if (evaluated && sharpness) {
         Barrier(list, slot.output.Effects(), kWrite, kRead);
         Barrier(list, slot.color.Effects(), kRead, kWrite);

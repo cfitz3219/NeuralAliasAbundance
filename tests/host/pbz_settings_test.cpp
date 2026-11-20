@@ -13,6 +13,21 @@ int main() {
     WritePrivateProfileStringW(L"j2",L"flow_loosen",L"0",ini);
     na::settings::SetIniPath(ini); na::settings::Load();
     auto& s=na::settings::Get();
+    for (unsigned old = 0; old <= 100; ++old)
+        CHECK(na::settings::RcasStrength(na::settings::RcasSliderFromLegacy(old)) == 2 * (old > 75 ? 75 : old));
+    CHECK(na::settings::RcasStrength(s.j2_sharpness) == 100);
+    WritePrivateProfileStringW(L"j2", L"sharpen", L"90", ini);
+    na::settings::Load();
+    CHECK(s.j2_sharpness == 100);
+    s.j2_sharpness = 53;
+    CHECK(na::settings::Save());
+    s.j2_sharpness = 0;
+    na::settings::Load();
+    CHECK(s.j2_sharpness == 53);
+    // A rollback can edit the legacy key while the newer key remains on disk.
+    WritePrivateProfileStringW(L"j2", L"sharpen", L"50", na::settings::UserIniPath());
+    na::settings::Load();
+    CHECK(na::settings::RcasStrength(s.j2_sharpness) == 100);
     CHECK(strstr(na::settings::EffectiveSummary(), "j2.flow_loosen=50(builtin)") != nullptr);
     CHECK(s.donut_tone==0&&s.donut_bloom==0&&s.donut_bias==800&&s.donut_white==3000);
     WritePrivateProfileStringW(L"experimental",L"nvrhi",L"1",na::settings::UserIniPath());

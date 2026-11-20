@@ -6,12 +6,12 @@
 
 namespace na::referee {
 inline uint64_t EvaluationConfiguration(uint32_t preset, uint32_t cf, uint32_t df, bool hdr, bool reversed,
-                                        int camera, bool measured, bool jitter, bool flow)
+                                        int camera, bool measured, bool jitter, bool flow, uint32_t debug_jitter)
 {
     const auto& set = settings::Get();
     const uint32_t configuration[] = {
         preset, uint32_t(cf), uint32_t(df), uint32_t(hdr), uint32_t(reversed),
-        uint32_t(camera), uint32_t(measured), uint32_t(jitter),
+        uint32_t(camera), uint32_t(measured), uint32_t(jitter), debug_jitter,
         set.j2_draw_replay.load(), set.j2_replay_movers.load(), set.j2_replay_budget.load(),
         uint32_t(set.j2_viewport_jitter.load()), uint32_t(set.j2_jitter_shift.load()), set.j2_jitter_r2.load(), set.j2_sharpness.load(),
         uint32_t(settings::DlaaMipBiasX100(set)), set.aniso16.load(),

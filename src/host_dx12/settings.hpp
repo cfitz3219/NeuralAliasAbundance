@@ -20,6 +20,19 @@
 
 namespace na::settings {
 
+inline constexpr uint32_t kMaxRcasStrength = 150;
+inline constexpr uint32_t RcasSliderFromLegacy(uint32_t old_percent) {
+    return old_percent >= 75 ? 100 : (old_percent * 4 + 1) / 3;
+}
+inline constexpr uint32_t RcasStrength(uint32_t percent, bool reduced = false) {
+    if (percent > 100) percent = 100;
+    // Round half steps to even. Every surviving old slider setting maps
+    // back to its exact (even) shader strength after profile migration.
+    uint32_t strength = percent * 3 / 2;
+    if ((percent % 2) && (strength % 2)) ++strength;
+    return reduced ? strength / 2 : strength;
+}
+
 // Live DLAA keeps the former slider at its 50% setting for all game profiles.
 inline constexpr uint32_t kObjectFlowLoosen = 50;
 
@@ -81,7 +94,8 @@ struct Settings {
     std::atomic<uint32_t> xegtao_thin_occluder{0}, xegtao_final_power{2200}, xegtao_depth_mip_offset{3300};
     std::atomic<uint32_t> xegtao_temporal{850}; // x1000: share of earlier frames kept (0 = off); stops edge shimmer while panning
     std::atomic<uint32_t> nr_intensity{100};
-    std::atomic<uint32_t> j2_sharpness{50}; // J2 sharpening, menu scale 0..100 = RCAS 0..200 (0 = off; 50 = standard RCAS full strength)
+    std::atomic<uint32_t> j2_sharpness{RcasSliderFromLegacy(50)}; // menu 0..100 = shader strength 0..150
+    std::atomic<uint32_t> j2_debug_jitter{0}; // session only, normal declaration at launch
     // Render-small HUD: 0 = the HUD goes through DLSS with the scene; 1..100 = HUD pixels are
     // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
     std::atomic<uint32_t> j2_hud_nis{50};

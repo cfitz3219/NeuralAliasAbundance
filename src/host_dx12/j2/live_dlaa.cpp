@@ -2099,10 +2099,7 @@ bool debug_record(ID3D12GraphicsCommandList* l, int mode, ID3D12Resource* out, D
 // (FSR_RCAS_DENOISE) so flat noisy areas are not amplified. Runs on the DLAA
 // result before the game's tonemap and HUD, in a Reinhard-compressed copy of the
 // HDR values (RCAS expects 0..1), expanded back afterwards. 100 is RCAS at full strength
-// (0 stops); 0 skips the pass. The sharpening gain doubles every 50 over 1..200 (x1/4 near 0,
-// x1 at 100, x4 at 200): one rate across the whole slider (Cort 2026-11-04: the top half barely
-// changed when only the lobe ceiling rose). The menu's 0..100 slider is half this scale (menu 50
-// = 100, menu 100 = 200). Contrast limiters and noise attenuation remain. No second filter.
+// (0 stops); 0 skips the pass. Gain doubles every 50 shader units up to 150 (2x standard).
 struct RcasPass {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso;
@@ -2263,8 +2260,7 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->SetComputeRootSignature(pass.root.Get());
     l->SetPipelineState(pass.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
-    // One rate over the whole range: the gain doubles every 50 % (menu: every 25 points).
-    const uint32_t pc = (std::min)(percent, 200u);
+    const uint32_t pc = (std::min)(percent, na::settings::kMaxRcasStrength);
     const float gain = pc == 100 ? 1.0f : std::exp2((static_cast<float>(pc) - 100.0f) / 50.0f);
     const float open = pc > 100 ? (std::min)(1.0f, std::log2(gain) / 2.0f) : 0.0f;
     const float con = gain, limit = open;
@@ -4521,8 +4517,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         } else viewport_sample_known=vpj_declared(lists, scene, &vx, &vy);
         cam.jitter_px_x = vx; cam.jitter_px_y = vy; cam.jitter_known = true;
     }
+    const neural_alias::JitterDiagnostic debug_jitter{na::settings::Get().j2_debug_jitter.load(std::memory_order_relaxed)};
     const auto jitter_history = neural_alias::JitterHistoryForFrame(g.jitter_history, g.jitter_on,
-        cam.jitter_px_x != 0.0 || cam.jitter_px_y != 0.0);
+        cam.jitter_px_x != 0.0 || cam.jitter_px_y != 0.0, debug_jitter);
     const bool jitter_switched = !deferred && neural_alias::JitterHistoryChanged(g.jitter_history, jitter_history);
     // Measured motion adds its own resets below for a missing pair or a measured scene cut.
     const bool hist_reset = jitter_switched || (measured ? (gap_restart || resize) : (cam.camera_cut || resize || g.resume_reset));
@@ -4545,7 +4542,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     const auto current_configuration = [&] {
         return referee::EvaluationConfiguration(PresetFor(settings::Get().j2_preset.load(), rw, ow), cf, dd.Format,
-            is_float_color(cf), reversed, camera_use, measured, g.jitter_on, flow::Enabled());
+            is_float_color(cf), reversed, camera_use, measured, g.jitter_on, flow::Enabled(), debug_jitter.value);
     };
     const bool same_recovery = recover && g.recovery.Matches(pending.recovery_scene);
     const bool recovering_kept = g.placement_trial.AllowsStageRecovery() && pending.referee_handoff &&
@@ -5013,8 +5010,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     e.quality = na::dlss::QualityForScale(rw, rh, ow, oh); // DLAA when equal
     e.preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), rw, ow); // Automatic: L for DLAA/Quality, M for Balanced/Performance
     e.view_id = kViewId;
-    e.jitter_x = static_cast<float>(cam.jitter_px_x); // DLSS: colour sampled at pixel centre - jitter
-    e.jitter_y = static_cast<float>(cam.jitter_px_y);
+    const auto declared = debug_jitter.Declared(static_cast<float>(cam.jitter_px_x), static_cast<float>(cam.jitter_px_y));
+    e.jitter_x = declared.x;
+    e.jitter_y = declared.y;
     if (inl) {
         g.stats.inline_jitter_x = e.jitter_x;
         g.stats.inline_jitter_y = e.jitter_y;
@@ -5257,7 +5255,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             b.push_back(uav_barrier(g.output.Get()));
             flush(l, b);
             debug_record(l, dv, g.output.Get(), cf, g.ow, g.oh, g.rw, g.rh, g.slot); // replaces the DLAA result with the debug picture
-        } else if (const uint32_t pct = smear == 3 ? 0u : (tool == Tool::Sharpen ? 1u : 2u) * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed)) {
+        } else if (const uint32_t pct = smear == 3 ? 0u : na::settings::RcasStrength(na::settings::Get().j2_sharpness.load(std::memory_order_relaxed), tool == Tool::Sharpen)) {
             // RCAS: output -> sharp, then back into output so the write-back path is unchanged.
             b.push_back(uav_barrier(g.output.Get()));
             add(b, g.output.Get(), UAV, NPSR);
@@ -7870,8 +7868,10 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     // declaring the offset is the behaviour that looked far better). The calibration keeps
     // measuring and logging (j2jitter / jitter_witness) but no longer changes the declaration.
     const na::jitter::Sample colour_jitter{d.jx, d.jy};
+    const neural_alias::JitterDiagnostic debug_jitter{na::settings::Get().j2_debug_jitter.load(std::memory_order_relaxed)};
+    const auto declared = debug_jitter.Declared(colour_jitter.x, colour_jitter.y);
     const auto jitter_history = neural_alias::JitterHistoryForFrame(g.small_jitter_history, g.jitter_on,
-        colour_jitter.x != 0.f || colour_jitter.y != 0.f);
+        colour_jitter.x != 0.f || colour_jitter.y != 0.f, debug_jitter);
     bool dlss = false;
     bool evaluation_reset = false;
     bool small_shifted = false; // DLSS got the jitter-shifted colour (g_small.jshift, back to UAV after)
@@ -8015,8 +8015,8 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         e.quality = na::dlss::QualityForScale(rw, rh, ow, oh);
         e.preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), rw, ow);
         e.view_id = kSmallViewId;
-        e.jitter_x = colour_jitter.x;
-        e.jitter_y = colour_jitter.y;
+        e.jitter_x = declared.x;
+        e.jitter_y = declared.y;
         g_small.last_jx = d.jx; g_small.last_jy = d.jy;
         // History continues only from the previous frame's evaluation at the same sizes.
         e.reset = d.reset || neural_alias::JitterHistoryChanged(g.small_jitter_history, jitter_history) ||
@@ -8058,10 +8058,10 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         } else if (dlss) {
             g.small_last = d.frame;
             g.small_ow = ow; g.small_oh = oh; g.small_rw = rw; g.small_rh = rh;
-            // After DLSS: RCAS on the picture (menu 0..100 = RCAS 0..200), then the HUD from
+            // After DLSS: RCAS on the picture, then the HUD from
             // NIS over it where the mask says HUD. The picture moves between `out` and `sharp`
             // (`cur`); it ends in `out`, UNORDERED_ACCESS, as DLSS left it.
-            const uint32_t pct = 2u * na::settings::Get().j2_sharpness.load(std::memory_order_relaxed);
+            const uint32_t pct = na::settings::RcasStrength(na::settings::Get().j2_sharpness.load(std::memory_order_relaxed));
             const bool have_sharp = (pct || hud_mask || hud_layer) && small_sharp_target(ow, oh, of);
             ID3D12Resource* sharp = g_small.sharp.Get();
             ID3D12Resource* cur = out;
@@ -8201,8 +8201,8 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         ci.width = rw;
         ci.height = rh;
         ci.color_format = static_cast<uint32_t>(cp.color->GetDesc().Format);
-        ci.jitter_x = colour_jitter.x;
-        ci.jitter_y = colour_jitter.y;
+        ci.jitter_x = declared.x;
+        ci.jitter_y = declared.y;
         ci.raster_jitter_x = d.jx; ci.raster_jitter_y = d.jy;
         ci.jitter_convention = static_cast<uint32_t>(g_small.final_jitter.Get());
         ci.jitter_epoch = g_small.final_jitter.Epoch();
@@ -8286,7 +8286,7 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         fnote.frame = g.frame;
         fnote.dlss = dlss ? 1u : 0u;
         fnote.reset = dlss && evaluation_reset ? 1u : 0u;
-        fnote.jitter_x = colour_jitter.x; fnote.jitter_y = colour_jitter.y;
+        fnote.jitter_x = declared.x; fnote.jitter_y = declared.y;
         na::observe::GetLiveSelection(&fnote.selection_depth, &fnote.selection_color);
         fnote.selection_version = na::observe::LiveSelectionVersion();
         fnote.camera_source = d.camera_source; fnote.camera_age = d.camera_age;

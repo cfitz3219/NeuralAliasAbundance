@@ -4,6 +4,22 @@
 #include <cmath>
 using namespace neural_alias;
 int main() { return test::run({
+    {"overlay jitter configurations wrap and reset both axes", [] {
+        for (uint32_t i = 0; i < JitterDiagnostic::count; ++i) {
+            JitterDiagnostic config{i};
+            auto xy = config.Declared(.25f, -.125f);
+            const auto& scale = JitterDiagnostic::scales[i];
+            CHECK(xy.x == .25f * scale.x && xy.y == -.125f * scale.y);
+            JitterDiagnostic swapped{config.ToggleAxes()};
+            auto yx = swapped.Declared(.25f, -.125f);
+            CHECK(yx.x == xy.y && yx.y == xy.x);
+            CHECK(swapped.ToggleAxes() == i);
+        }
+        JitterDiagnostic last{JitterDiagnostic::count - 1};
+        CHECK(last.WithConfig(last.Config() + 1) == 0);
+        JitterDiagnostic normal{};
+        CHECK(normal.Declared(.25f, -.125f).x == .25f && normal.Declared(.25f, -.125f).y == -.125f);
+    }},
     {"known Halton samples and wrapping", [] {
         const double xs[] = {0, -.25, .25, -.375};
         const double ys[] = {-1./6, 1./6, -7./18, -1./18};

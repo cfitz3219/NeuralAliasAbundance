@@ -1,4 +1,6 @@
 #include "host_dx12/native11/samplers.hpp"
+#include "core/temporal_jitter.hpp"
+#include <cmath>
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
@@ -1028,7 +1030,7 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLSS: RCAS with soft halo control, easing off at depth edges so silhouettes keep clean outlines. 0 = off. The strength doubles every 25 points: 50% is standard RCAS at full strength, 75% is twice it and 100% four times. Native HUD is composed afterward. If separation is unavailable, HUD in the game image can also be sharpened.", S(220));
+        BeginRow("Sharpness", "RCAS sharpens the reconstructed picture. 0% turns it off, 67% gives standard sharpening, and 100% gives twice standard strength. HUD elements drawn into the scene can also be sharpened.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
@@ -1384,13 +1386,44 @@ void DrawDlssDebug()
     if (i.indicator_known && i.indicator) { if (Button("Turn off")) na::dlss_debug::SetIndicator(false); }
     else if (Button("Turn on")) na::dlss_debug::SetIndicator(true);
     EndRow();
-    SectionTitle("Development DLL hotkeys (sent to the game, menu open)");
-    Hint("Only NVIDIA's development DLL reacts. The combination is held for a few frames; its on-screen text names the current view or jitter configuration.");
+    SectionTitle("Jitter diagnostic");
+    auto& selection = na::settings::Get().j2_debug_jitter;
+    neural_alias::JitterDiagnostic mode{selection.load(std::memory_order_relaxed)};
+    BeginRow("Try a jitter setting", "The game shifts each picture a fraction of a pixel so DLAA can pick up fine detail. These tests change how DLAA reads that shift. If edges start shaking, press Reset.", ButtonWidth("Next setting") + ImGui::GetStyle().ItemSpacing.x + ButtonWidth("Reset"));
+    if (Button("Next setting")) mode.value = mode.WithConfig(mode.Config() + 1);
+    ImGui::SameLine();
+    if (Button("Reset")) mode.value = 0;
+    EndRow();
+    bool swapped = mode.Swapped();
+    BeginRow("Swap sideways with up and down", nullptr, SwitchWidth());
+    if (ImGui::Checkbox("##swapaxes", &swapped)) mode.value = mode.ToggleAxes();
+    EndRow();
+    selection.store(mode.value, std::memory_order_relaxed);
+    BeginGroupBox("##selected-jitter");
+    Eyebrow("CURRENT JITTER SETTING");
+    const auto& config = mode.scales[mode.Config()];
+    PushLabelStrong();
+    ImGui::PushTextWrapPos(0.f);
+    ImGui::TextColored(mode.value ? kWarn : kOk, "%s", swapped && !mode.Config() ? "Directions swapped" : config.name);
+    ImGui::PopTextWrapPos();
+    PopFont();
+    if (!swapped) Hint(config.description);
+    else {
+        // Describe the final mapping directly, even for a flipped and swapped test.
+        const auto movement = [](float gain) {
+            return std::fabs(gain) == .5f ? "half as far" : std::fabs(gain) == 2.f ? "twice as far" : "the same distance";
+        };
+        std::snprintf(line, sizeof line, "A step right is read as a step %s, %s. A step down is read as a step %s, %s.",
+                      config.x < 0 ? "up" : "down", movement(config.x),
+                      config.y < 0 ? "left" : "right", movement(config.y));
+        Hint(line);
+    }
+    EndGroupBox();
+    SectionTitle("Development DLL hotkeys");
+    Hint("These buttons operate NVIDIA's development DLL. Its keyboard jitter overrides are independent of the NeuralAlias diagnostic above.");
     struct Key { const char* label; const char* help; int vk; const char* btn; };
     const Key keys[] = {
         {"Debug view", "CTRL+ALT+F12: cycles the development DLL's overlays (jitter, motion vectors, depth, exposure, ...).", VK_F12, "Next view"},
-        {"Jitter configuration", "CTRL+ALT+F9: the DLL halves, doubles or flips the jitter it was told about. If the picture reacts, DLSS receives our jitter; if nothing changes, it does not.", VK_F9, "Next config"},
-        {"Jitter negate / swap", "CTRL+ALT+F10: negates and swaps the declared jitter axes.", VK_F10, "Press"},
         {"Accumulation", "CTRL+ALT+F6: toggles temporal accumulation (a single-frame picture shows what one frame alone contains).", VK_F6, "Toggle"},
     };
     for (const Key& k : keys) {

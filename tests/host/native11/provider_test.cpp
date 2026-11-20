@@ -2576,6 +2576,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             expect(jitter_resets() == wanted, "switch-on resets DLAA with the first jittered picture");
         }
         expect(jitter_resets() == before_switch + 2, "jitter-on pictures keep their new history");
+        na::settings::Get().j2_debug_jitter.store(5); // double, both axes
+        for (int i = 0; i < 3; ++i) present_campaign();
+        expect(jitter_resets() == before_switch + 3, "double-offset diagnostic changes delivered history once");
+        na::settings::Get().j2_debug_jitter.store(0);
+        for (int i = 0; i < 3; ++i) present_campaign();
+        expect(jitter_resets() == before_switch + 4 && g_seen.last.raster.applied,
+               "normal jitter restores delivered history once and keeps raster jitter on");
         na::j2::SetJitter(false);
         na::settings::Get().j2_jitter_r2.store(prior_r2);
         na::settings::Get().j2_preset.store(prior_preset);

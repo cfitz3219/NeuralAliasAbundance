@@ -125,14 +125,17 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     target.xegtao_temporal.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"temporal",850,ini),950u));
     target.nr_intensity.store(pct(L"intensity", 100));
     {
-        // [j2] sharpen: the menu's 0..100 (= RCAS 0..200). Older files only have [j2] sharpness
-        // on the RCAS scale (0..150): halved, rounded up, so 150 -> 75 and 100 -> 50.
-        int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen", -1, ini));
-        if (v < 0) {
-            const int old = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
-            v = old <= 0 ? 0 : (old + 1) / 2;
+        const int current = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen_v2", -1, ini));
+        const int legacy = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen", -1, ini));
+        if (current >= 0 && (legacy < 0 || legacy == static_cast<int>((RcasStrength(current) + 1) / 2)))
+            target.j2_sharpness.store((std::min)(static_cast<uint32_t>(current), 100u));
+        else if (legacy >= 0)
+            target.j2_sharpness.store(RcasSliderFromLegacy(legacy));
+        else {
+            const int old = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", -1, ini));
+            if (old >= 0) target.j2_sharpness.store(RcasSliderFromLegacy(((std::min)(old, 150) + 1) / 2));
+            else if (!only_if_present) target.j2_sharpness.store(RcasSliderFromLegacy(50));
         }
-        target.j2_sharpness.store(static_cast<uint32_t>(v > 100 ? 100 : v));
         const int hud = static_cast<int>(GetPrivateProfileIntW(L"j2", L"hud_nis", 50, ini));
         target.j2_hud_nis.store(static_cast<uint32_t>(hud < 0 ? 0 : (hud > 100 ? 100 : hud)));
         // Legacy flow and flow_loosen keys are ignored by this build.
@@ -271,7 +274,15 @@ void describe_effective()
         g_ini_defaults, g_ini_user,
         kObjectFlowLoosen, "builtin",
         g_settings.j2_preset.load(), [] { const char* s = source_of(L"j2", L"preset_v2"); return strcmp(s, "builtin") ? s : source_of(L"j2", L"preset"); }(),
-        g_settings.j2_sharpness.load(), source_of(L"j2", L"sharpen"),
+        g_settings.j2_sharpness.load(), [] {
+            const char* source = "builtin";
+            for (const auto* key : {L"sharpen_v2", L"sharpen", L"sharpness"}) {
+                const auto* at = source_of(L"j2", key);
+                if (!strcmp(at, "user")) return at;
+                if (!strcmp(at, "game")) source = at;
+            }
+            return source;
+        }(),
         g_settings.j2_hud_nis.load(), source_of(L"j2", L"hud_nis"),
         g_settings.j2_scale_mode.load(), source_of(L"j2", L"scale_mode"),
         g_settings.j2_mip_bias_x100.load(), source_of(L"j2", L"mip_bias"),
@@ -405,7 +416,10 @@ bool SaveFromWorker()
         ok &= WritePrivateProfileStringW(L"motion", kv.key, v, ini) != 0;
     }
     const auto sharpness = g_settings.j2_sharpness.load();
-    swprintf_s(v, L"%u", sharpness > 100 ? 100 : sharpness);
+    swprintf_s(v, L"%u", (std::min)(sharpness, 100u));
+    ok &= WritePrivateProfileStringW(L"j2", L"sharpen_v2", v, ini) != 0;
+    // Older binaries retain the same approximate strength if the user rolls back.
+    swprintf_s(v, L"%u", (RcasStrength(sharpness) + 1) / 2);
     ok &= WritePrivateProfileStringW(L"j2", L"sharpen", v, ini) != 0;
     WritePrivateProfileStringW(L"j2", L"sharpness", nullptr, ini); // the old RCAS-scale key
     swprintf_s(v, L"%u", (std::min)(g_settings.j2_hud_nis.load(), 100u));

@@ -478,6 +478,12 @@ float4 PS(float4 p : SV_Position) : SV_Target
         REQUIRE(check_jitter("on: recorded unshifted picture", change, false, 0) == 0);
         REQUIRE(check_jitter("on: first shifted picture", {}, true, 1) == 0);
         REQUIRE(check_jitter("on: preserve new history", {}, true, 0) == 0);
+        na::settings::Get().j2_debug_jitter.store(1); // half, both axes
+        REQUIRE(check_jitter("half offsets: change history once", {}, true, 1) == 0);
+        REQUIRE(check_jitter("half offsets: stable history", {}, true, 0) == 0);
+        na::settings::Get().j2_debug_jitter.store(0);
+        REQUIRE(check_jitter("reset diagnostic: normal jitter", {}, true, 1) == 0);
+        REQUIRE(check_jitter("reset diagnostic: stable history", {}, true, 0) == 0);
         st = na::j2::GetStats();
     } else {
         CHECK(st.supplied_measured == 0 && st.measured_unavailable == 7);
