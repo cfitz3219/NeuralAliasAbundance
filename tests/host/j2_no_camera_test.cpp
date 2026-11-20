@@ -217,6 +217,7 @@ float4 PS(float4 p : SV_Position) : SV_Target
         ID3D12PipelineState* with = nullptr; // the scene draw's pipeline (none = the depth-writing one)
         bool clear_depth = true;
         ID3D12CommandList* ahead = nullptr;  // a closed recording of the game's, submitted before the scene list
+        int jitter_after_record = -1;
     };
     size_t lists_given = 0;
     // One game frame: Present, the scene list (clear, the draw), the list that reads the scene.
@@ -255,6 +256,7 @@ float4 PS(float4 p : SV_Position) : SV_Target
                                           test::Transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON)};
         consumer.list->ResourceBarrier(2, back);
         REQUIRE(SUCCEEDED(consumer.list->Close()));
+        if (o.jitter_after_record >= 0) na::j2::SetJitter(o.jitter_after_record != 0);
         ID3D12CommandList* lists[3] = {};
         UINT count = 0;
         if (o.ahead) lists[count++] = o.ahead;
@@ -456,6 +458,27 @@ float4 PS(float4 p : SV_Position) : SV_Target
         std::printf("camera off: %d of 6 later frames carried the DLSS history on, %d had a viewport sample\n", kept, sampled);
         CHECK(kept >= 1);    // measured pairs keep the history: not a reset every frame
         CHECK(sampled >= 1); // the raster sample reaches the picture and DLSS without a camera
+        const auto check_jitter = [&](const char* label, const FrameOptions& options,
+                                      bool shifted, int reset) {
+            const auto previous = fake::evals;
+            REQUIRE(frame(label, options) == 0);
+            CHECK(delivered() && fake::evals == previous + 1);
+            const double x = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_X);
+            const double y = fake::F(fake::last_eval, NVSDK_NGX_Parameter_Jitter_Offset_Y);
+            CHECK((x != 0.0 || y != 0.0) == shifted);
+            CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == reset);
+            return 0;
+        };
+        FrameOptions change;
+        change.jitter_after_record = 0;
+        REQUIRE(check_jitter("off: recorded jitter still delivered", change, true, 0) == 0);
+        REQUIRE(check_jitter("off: first unshifted picture", {}, false, 1) == 0);
+        REQUIRE(check_jitter("off: preserve new history", {}, false, 0) == 0);
+        change.jitter_after_record = 1;
+        REQUIRE(check_jitter("on: recorded unshifted picture", change, false, 0) == 0);
+        REQUIRE(check_jitter("on: first shifted picture", {}, true, 1) == 0);
+        REQUIRE(check_jitter("on: preserve new history", {}, true, 0) == 0);
+        st = na::j2::GetStats();
     } else {
         CHECK(st.supplied_measured == 0 && st.measured_unavailable == 7);
     }

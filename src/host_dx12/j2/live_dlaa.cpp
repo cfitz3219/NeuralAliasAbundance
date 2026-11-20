@@ -130,6 +130,7 @@ struct PendingHistory {
     uint32_t depth_source=0, camera_source=0;
     uint64_t camera_age=0;
     bool keep_reset = false; // a repeated frame: DLSS did not run, a pending history reset still applies
+    neural_alias::JitterMode jitter_history{};
     uint64_t selection_version = 0; // live scene selection this evaluation used (same epoch = same version)
     bool referee_handoff = false; // this recording used a validated separate-list reader
     uint64_t referee_logical_color = 0; // physical lighting input differs from the selected scene id
@@ -206,6 +207,7 @@ struct State {
     std::atomic<bool> configured{false};
     std::atomic<bool> paused{false}; // the user's on/off switch in the overlay
     bool resume_reset = false;       // history is stale after a pause
+    neural_alias::JitterMode jitter_history{}, small_jitter_history{};
     bool inl_redirected = false;     // the pending inline DLSS also rebound the game's pass (counted when submitted)
     bool latched = false;            // stopped for this session after a failure (reason kept)
     ComPtr<ID3D12Device> device;
@@ -1880,6 +1882,7 @@ void reason(const char* r)
 }
 void depth_feed_locked(UINT upto); // below, with the rest of the depth direction evidence
 void committed_sources(const PendingHistory& p) {
+    if (p.jitter_history != neural_alias::JitterMode::Unset) g.jitter_history = p.jitter_history;
     if (p.recovery_scene.color) g.recovery.SetScene(p.recovery_scene);
     else g.recovery.Suspend();
     if(p.native_source) {
@@ -4508,9 +4511,21 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // before it, and the camera takes over on the next.
     const bool measured = no_camera || (tracker_stale && cam.camera_cut && camera_use != 2 && !cannot_measure && !gap_restart && !resize &&
                                         !g.measured_refused);
-    // Reasons to start a new DLSS history. Camera: as before. Measured: a camera cut is not one (the
-    // measured supplier adds its own two below: no pair yet, and a scene cut seen in the pictures).
-    const bool hist_reset = measured ? (gap_restart || resize) : (cam.camera_cut || resize || g.resume_reset);
+    bool viewport_sample_known=false;
+    if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
+        float vx = 0.f, vy = 0.f;
+        uint32_t sample_frame=0;
+        if (saved && saved->require_current_states && saved->native_viewport_sample) {
+            viewport_sample_known=na::observe::DecodeSceneViewportJitter(saved->native_viewport_sample,&sample_frame,&vx,&vy);
+            if (na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed)<0) { vx=-vx; vy=-vy; }
+        } else viewport_sample_known=vpj_declared(lists, scene, &vx, &vy);
+        cam.jitter_px_x = vx; cam.jitter_px_y = vy; cam.jitter_known = true;
+    }
+    const auto jitter_history = neural_alias::JitterHistoryForFrame(g.jitter_history, g.jitter_on,
+        cam.jitter_px_x != 0.0 || cam.jitter_px_y != 0.0);
+    const bool jitter_switched = !deferred && neural_alias::JitterHistoryChanged(g.jitter_history, jitter_history);
+    // Measured motion adds its own resets below for a missing pair or a measured scene cut.
+    const bool hist_reset = jitter_switched || (measured ? (gap_restart || resize) : (cam.camera_cut || resize || g.resume_reset));
     pending.measured = measured;
     pending.no_camera = no_camera;
     pending.frame = g.frame;
@@ -4539,16 +4554,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (option == tool) pending.recovery_applied |= referee::Bit(option);
     };
 
-    bool viewport_sample_known=false;
-    if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
-        float vx = 0.f, vy = 0.f;
-        uint32_t sample_frame=0;
-        if (saved && saved->require_current_states && saved->native_viewport_sample) {
-            viewport_sample_known=na::observe::DecodeSceneViewportJitter(saved->native_viewport_sample,&sample_frame,&vx,&vy);
-            if (na::settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed)<0) { vx=-vx; vy=-vy; }
-        } else viewport_sample_known=vpj_declared(lists, scene, &vx, &vy);
-        cam.jitter_px_x = vx; cam.jitter_px_y = vy; cam.jitter_known = true;
-    }
     if (!held && !no_camera) { // the newest read camera (one per frame: a later attempt in the same frame replaces it)
         if (g.cam_f1 != g.frame) { g.cam_u0 = g.cam_u1; g.cam_f0 = g.cam_f1; }
         g.cam_u1 = cam.unjittered; g.cam_f1 = g.frame; g.cam_rev = reversed;
@@ -5056,6 +5061,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (t_ic) t_ic->mark(kIcEvaluate);
     pending.reset = e.reset;
     const bool evaluated = na::dlss::Evaluate(l, e);
+    if (evaluated) pending.jitter_history = jitter_history;
     const bool capture_armed = evaluated && na::capture::j2::Armed();
     if (evaluated && !capture_armed && g_debug_view.load(std::memory_order_relaxed) == 0 &&
         na::capture::j2::RefereeWanted()) {
@@ -7855,6 +7861,8 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     // declaring the offset is the behaviour that looked far better). The calibration keeps
     // measuring and logging (j2jitter / jitter_witness) but no longer changes the declaration.
     const na::jitter::Sample colour_jitter{d.jx, d.jy};
+    const auto jitter_history = neural_alias::JitterHistoryForFrame(g.small_jitter_history, g.jitter_on,
+        colour_jitter.x != 0.f || colour_jitter.y != 0.f);
     bool dlss = false;
     bool evaluation_reset = false;
     bool small_shifted = false; // DLSS got the jitter-shifted colour (g_small.jshift, back to UAV after)
@@ -8002,7 +8010,8 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
         e.jitter_y = colour_jitter.y;
         g_small.last_jx = d.jx; g_small.last_jy = d.jy;
         // History continues only from the previous frame's evaluation at the same sizes.
-        e.reset = d.reset || g.small_last == 0 || d.frame != g.small_last + 1 ||
+        e.reset = d.reset || neural_alias::JitterHistoryChanged(g.small_jitter_history, jitter_history) ||
+                  g.small_last == 0 || d.frame != g.small_last + 1 ||
                   g.small_ow != ow || g.small_oh != oh || g.small_rw != rw || g.small_rh != rh ||
                   g_small.applied_jitter_epoch != g_small.final_jitter.Epoch();
         e.hdr = separate_scene?is_float_color(e.color->GetDesc().Format):hdr;
@@ -8254,7 +8263,10 @@ static bool present_upscale(ID3D12CommandQueue* queue, ID3D12Resource* frame, ui
     if(!na::gpu::SubmitMixed(queue,count,lists,g_small.owned_recording?g_small.owned.get():nullptr,forward)){
         na::capture::j2::Discard(capture,false);++g.stats.small_failed;return false;
     } // native HUD stays before this frame's completion fence
-    if (dlss) na::dlss::OnExecuted(queue, count, lists);
+    if (dlss) {
+        na::dlss::OnExecuted(queue, count, lists);
+        g.small_jitter_history = jitter_history;
+    }
     if (capture) na::capture::j2::Submitted(capture, queue, g.stats.submissions);
     g_small.value[si] = g_small.next++;
     queue->Signal(g_small.fence.Get(), g_small.value[si]);
@@ -8668,9 +8680,8 @@ bool ProjectionWindowScissor(uint64_t* depth, uint32_t* ew, uint32_t* eh)
 void SetJitter(bool on)
 {
     std::lock_guard<std::mutex> lock(g.m);
-    if (g.jitter_on != on) g.resume_reset = true; // the input sequence changes character
     g.jitter_on = on;
-    if (!on) g.jit.valid = false;
+    if (!on && !g.jit.applied) g.jit.valid = false;
 }
 bool Jitter()
 {
@@ -9657,6 +9668,7 @@ void Shutdown()
     g.inline_sample_locked = false;
     g.inline_camera_submitted = false;
     g.resume_reset = false;
+    g.jitter_history = g.small_jitter_history = neural_alias::JitterMode::Unset;
     g.no_camera_last = g.measured_refused = false;
     g.last_reset_frame = 0;
     g.camera_streak = 0;

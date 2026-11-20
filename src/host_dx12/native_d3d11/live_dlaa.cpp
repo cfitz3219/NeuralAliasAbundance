@@ -74,7 +74,7 @@ struct Session {
     uint64_t flow_frame = 0;       // the last frame whose picture (flow recording) was really submitted
     uint64_t last_reset_frame = 0; // the newest frame delivered with a DLSS reset
     bool measured_last = false;    // the last delivered frame's motion was measured, not from a camera
-    bool jitter_history = false;   // the sampling mode established in delivered DLAA history
+    neural_alias::JitterMode jitter_history{}; // established by delivered DLAA history
     bool failed = false;
     // VARIANT: dlss/in-companion
     // DLSS runs in the 64-bit companion program instead of in this process (a 32-bit game cannot
@@ -486,8 +486,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     else if (reset_history) resets_gap.fetch_add(1, std::memory_order_relaxed);
     // A draw can still carry the previous setting for one frame. Reset on the first picture that
     // matches the new setting. Occasional missing samples while the setting is unchanged retain history.
-    const bool jitter_switched = s.last_frame && s.jitter_history != jitter_requested &&
-                                 frame.raster.applied == jitter_requested;
+    const auto jitter_history = neural_alias::JitterHistoryForFrame(s.jitter_history, jitter_requested,
+                                                                   frame.raster.applied);
+    const bool jitter_switched = neural_alias::JitterHistoryChanged(s.jitter_history, jitter_history);
     reset_history |= jitter_switched;
     j2::compute_flow::Ticket flow;
     if (measured || j2::flow::Enabled()) {
@@ -842,7 +843,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // This signal retires the slot. The game's subsequent submission can
     // flush it naturally because no effects queue waits on the value.
     if (FAILED(s.fences.SignalNative(&slot.native_done, false))) return FailSession(s, "Native result submission failed.");
-    if (!s.last_frame || jitter_switched) s.jitter_history = frame.raster.applied;
+    s.jitter_history = jitter_history;
     if (jitter_switched) resets_jitter_switch.fetch_add(1, std::memory_order_relaxed);
     s.stream = frame.stream;
     s.last_frame = frame.frame;
