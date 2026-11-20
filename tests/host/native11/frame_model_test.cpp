@@ -702,6 +702,46 @@ int main()
                    "a later target with a second depth that is never read gives no place to run: the old rule stands");
         }
     }
+    {
+        // Recorded order: material targets, two rotating HDR owners, a
+        // reduction, the full-size reader, then downstream depth reuse.
+        FrameModel m;
+        Setup(m);
+        constexpr Id early = 40, late = 41, compositor = 42;
+        m.SetInfo(kColor, {1920, 1080, 23, 1, false, false});
+        for (Id hdr : {early, late, compositor})
+            m.SetInfo(hdr, {1920, 1080, 10, 1, false, true});
+        Event clear;
+        clear.kind = Kind::ClearDepth;
+        clear.resource = kDepth;
+        const auto write_hdr = [&](Id a, Id b) {
+            auto layers = Draw(kColor, kDepth, 300);
+            layers.rt_count = 2;
+            for (int draw = 0; draw < 32; ++draw) m.Feed(layers);
+            m.Feed(Read(kColor));
+            for (int draw = 0; draw < 5; ++draw) m.Feed(Draw(a, kDepth, 24));
+            m.Feed(Read(a));
+            for (int draw = 0; draw < 8; ++draw) m.Feed(Draw(b, kDepth, 24));
+            m.Feed(Read(b));
+            m.Feed(Draw(kBloom, 0, 3));
+            m.Feed(Read(b));
+        };
+        for (int frame = 0; frame < 6; ++frame) {
+            write_hdr(early, late);
+            m.Feed(Draw(compositor, 0, 3));
+            m.Feed(clear);
+            m.EndFrame(true);
+        }
+        write_hdr(late, early);
+        expect(m.LitWrite(late, early) != 0, "eligible lighting reader sees intact depth before the post draw");
+        m.Feed(Draw(compositor, 0, 3));
+        m.Feed(clear);
+        expect(m.LitWrite(late, early) == 0, "another live reader cannot evaluate with cleared depth");
+        m.EndFrame(true);
+        const auto order = m.CompletedLitOrder();
+        expect(order.early == late && order.late == early && order.depth == kDepth,
+               "downstream depth reuse preserves the completed HDR role reversal");
+    }
     // The first shape in this file (one colour target, drawn alone) never becomes layered.
     {
         FrameModel m;
