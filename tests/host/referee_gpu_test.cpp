@@ -116,6 +116,8 @@ struct TracePair {
     bool returned_present = true;
     uint8_t tools = 0, applied = 0, main_tools = 255;
     PlacementPath path = PlacementPath::Inline, alternate = PlacementPath::None;
+    uint32_t recovery_region = 0;
+    float recovery_floor = 0.f;
 };
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
@@ -138,6 +140,8 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     if (trace) {
         e.context.trial_ticket = trace->ticket;
         e.context.trial_configuration = trace->configuration;
+        e.context.recovery_region = trace->recovery_region;
+        e.context.recovery_floor = trace->recovery_floor;
         if (!native_proof) e.context.placement.path = trace->path;
     }
     const bool native11 = native_proof != 0;
@@ -637,6 +641,27 @@ int main()
         using namespace na::referee;
         TrialSample measured;
         CHECK(!rg::TakeTrialSample(rejected.ticket, measured));
+        // The left and right halves of this reflection change in opposite
+        // directions. A single luma mean would miss it entirely.
+        auto shifting_reflection = output;
+        for (unsigned y = output.h / 2; y < output.h * 5 / 8; ++y)
+            for (unsigned x = output.w / 2; x < output.w * 5 / 8; ++x)
+                shifting_reflection.v[size_t(y) * output.w + x] *= x < output.w * 9 / 16 ? 1.12f : 1.f / 1.12f;
+        auto shifting_screen = ScreenTexture(d, l, rs::ScreenBytes(shifting_reflection), keep);
+        Run(d, l);
+        keep.clear();
+        REQUIRE(shifting_screen);
+        TracePair subregion{t_output.Get(), t_screen.Get(), true, 9539, 70};
+        subregion.recovery_region = 36;
+        subregion.recovery_floor = .025f;
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {unlit_in.Get(), unlit_in.Get(), t_output.Get(), nullptr, shifting_screen.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 0, false, &subregion));
+        REQUIRE(rg::TakeTrialSample(subregion.ticket, measured));
+        std::printf("residual split reflection: region=%u stage=%s stops=%.4f\n", measured.origin.region,
+                    StageName(measured.origin.stage), measured.origin.stops[2]);
+        CHECK(measured.comparable && measured.origin.stage == FlickerStage::Composition &&
+              measured.origin.region == 36 && std::fabs(measured.origin.stops[2]) > .045f);
         // Even with an independently proved reader, identical input and
         // output pixels give no evidence about which reached the screen.
         TracePair identical{t_output.Get(), t_screen.Get(), true, 2051, 70};
