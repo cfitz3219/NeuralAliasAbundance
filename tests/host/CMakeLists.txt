@@ -200,6 +200,8 @@ set_tests_properties(host_on12_present_order_test PROPERTIES TIMEOUT 30 LABELS "
 set_tests_properties(host_on12_bootstrap_ownership_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(overlay_input_handover_test SOURCES overlay_input_handover_test.cpp LIBS host_dx12)
 na_host_test(overlay_boundary_fallback_test SOURCES overlay_boundary_fallback_test.cpp)
+# Home menu flicker (2026-11-20): new menu text never costs a menu frame; old font images are released by fence.
+na_host_test(menu_texture_test SOURCES menu_texture_test.cpp LIBS imgui d3d12 dxgi LABELS gpu)
 add_test(NAME host_overlay_hardware_test COMMAND overlay_test --hardware)
 set_tests_properties(host_overlay_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 
