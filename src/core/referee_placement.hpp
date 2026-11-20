@@ -44,13 +44,14 @@ public:
         if (!(offer == scope_)) trial_ = {};
         configuration_ = 0;
         incumbent_ = {};
+        independently_verified_ = true;
         Start(offer, frame, now);
         return true;
     }
 
     bool Begin(Scope offer, const TrialSample& witness, uint64_t frame, uint64_t now)
     {
-        if (!offer || OwnsComparison() || now < next_attempt_ || !Fresh(witness, frame, now) ||
+        if (!offer || OwnsComparison() || now < next_attempt_ || !Fresh(witness, frame, now) || witness.broad_light ||
             !witness.comparable || !HasSymptom(witness)) return false;
         const bool same = offer == scope_ && witness.configuration == configuration_ &&
             witness.layout == layout_ && witness.width == width_ && witness.height == height_;
@@ -58,6 +59,7 @@ public:
         if (!same) trial_ = {};
         Remember(witness);
         incumbent_ = witness.context.placement;
+        independently_verified_ = false;
         Start(offer, frame, now);
         return true;
     }
@@ -71,7 +73,7 @@ public:
 
     void Add(Scope scope, uint64_t ticket, const TrialSample& sample, uint64_t frame, uint64_t now)
     {
-        if (!Matches(scope) || !Fresh(sample, frame, now)) return;
+        if (!Matches(scope) || !Fresh(sample, frame, now) || (sample.broad_light && !independently_verified_)) return;
         if (!UsesCandidate() && sample.comparable && ticket == trial_.Ticket(sample.ordinal)) {
             if (incumbent_.path == shadow::Path::None) incumbent_ = sample.context.placement;
             else if (!(incumbent_ == sample.context.placement)) return;
@@ -115,6 +117,7 @@ private:
     shadow::Placement incumbent_;
     uint64_t domain_, next_attempt_ = 0, serial_ = 0, configuration_ = 0;
     uint32_t layout_ = 0, width_ = 0, height_ = 0;
+    bool independently_verified_ = false;
 };
 
 } // namespace na::referee

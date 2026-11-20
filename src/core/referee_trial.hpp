@@ -75,6 +75,7 @@ struct TrialSample {
     shadow::Context context;
     shadow::Placement alternate;
     bool comparable = true;
+    bool broad_light = false; // same rendered structure with a shared lighting shift
     float screen_structure = 0.f;
     unsigned quiet_regions = 0;
     FlickerTransition origin{};
@@ -104,6 +105,8 @@ inline int TrialDirection(const TrialSample::Change& a, const TrialSample::Chang
 inline bool MeasureTrialScreen(const float* before, const float* after, TrialSample& sample)
 {
     using Region = FlickerTransition;
+    sample.broad_light = false;
+    sample.quiet_regions = 0;
     sample.screen_structure = EdgeCorrelation(before, after, kThumbW, kThumbH);
     if (!(sample.screen_structure >= .90f)) return false;
     constexpr unsigned n = TrialSample::subdivisions;
@@ -138,7 +141,30 @@ inline bool MeasureTrialScreen(const float* before, const float* after, TrialSam
     for (auto& value : sample.contrast) value *= float(Region::count) / kThumbFloats;
     sample.quiet_regions = static_cast<unsigned>(std::count_if(sample.change.begin(), sample.change.end(),
         [](const auto& region) { return TrialMagnitude(region) < .055f; }));
-    return sample.quiet_regions >= Region::count * 3 / 4;
+    if (sample.quiet_regions >= Region::count * 3 / 4) return true;
+    // A verified lighting reader may be worth comparing when a reflection
+    // changes several regions at once. Require much stronger geometry and
+    // two thirds of the view to agree after a common brightness shift. A
+    // purely global flash has no local excess and does not qualify.
+    if (sample.screen_structure < .98f) return false;
+    std::array<float, Region::count> midpoints{};
+    for (unsigned i = 0; i < Region::count; ++i) {
+        for (const auto value : sample.change[i]) midpoints[i] += value;
+        midpoints[i] /= sample.change[i].size();
+    }
+    auto middle = midpoints.begin() + midpoints.size() / 2;
+    std::nth_element(midpoints.begin(), middle, midpoints.end());
+    const float offset = *middle;
+    unsigned matched = 0;
+    float strongest = 0;
+    for (auto region : sample.change) {
+        for (auto& value : region) value -= offset;
+        const float residual = TrialMagnitude(region);
+        matched += residual < .055f;
+        strongest = (std::max)(strongest, residual);
+    }
+    sample.broad_light = matched * 3 >= Region::count * 2 && strongest >= .12f;
+    return sample.broad_light;
 }
 
 // VARIANT: referee/controlled-route-trial

@@ -519,6 +519,22 @@ int main()
         exercise(.07f, .24f, true, false, 0.f, Phase::Rejected);
         exercise(.07f, .24f, false, true, 0.f, Phase::Rejected);
         exercise(.04f, .24f, false, false, .32f, Phase::Rejected);
+        {
+            std::array<float, kThumbFloats> before{}, after{};
+            for (unsigned y = 0; y < kThumbH; ++y) for (unsigned x = 0; x < kThumbW; ++x) {
+                const unsigned i = y * kThumbW + x;
+                before[i] = std::sin(.73f*x + .41f*y);
+                after[i] = before[i] + .08f + (x >= 64 && x < 80 && y >= 18 && y < 27 ? .22f : 0.f);
+            }
+            TrialSample s;
+            check(MeasureTrialScreen(before.data(), after.data(), s) && s.broad_light &&
+                  s.quiet_regions < FlickerTransition::count * 3 / 4 &&
+                  std::fabs(TrialMagnitude(s.change[20]) - .30f) < .001f,
+                  "bright regions with the same structure preserve the raw magnitude for a proved lighting reader");
+            for (unsigned i = 0; i < kThumbFloats; ++i) after[i] = before[i] + .08f;
+            check(!MeasureTrialScreen(before.data(), after.data(), s) && !s.broad_light,
+                  "uniform exposure change alone cannot start a local lighting correction");
+        }
         // A stationary two-region bypass has no flash. Exercise the actual trial transitions.
         const auto regional_case = [&](unsigned candidate, bool restore_original) {
             RouteTrial t;
@@ -651,6 +667,7 @@ int main()
                 ordinal += RouteTrial::warmup_frames + 2;
                 for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
                     auto sample = placement_sample(ordinal, ordinal + 100, arm == 1, true);
+                    sample.broad_light = arm != 1;
                     sample.change[13].fill((i % 2 ? 1.f : -1.f) * (arm == 1 ? .06f : .25f));
                     partial.Tick(sample.observed_at, true);
                     partial.Add(scope, partial.Ticket(ordinal), sample, ordinal, sample.observed_at);

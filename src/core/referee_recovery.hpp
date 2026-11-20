@@ -92,7 +92,7 @@ public:
     }
     void Add(uint64_t ticket, const TrialSample& s, uint64_t next_frame, uint64_t now)
     {
-        if (!ticket || ticket != Ticket(s.ordinal) || !s.ordinal || s.ordinal <= last_ ||
+        if (!ticket || ticket != Ticket(s.ordinal) || !s.ordinal || s.ordinal <= last_ || s.broad_light ||
             s.ordinal >= next_frame || next_frame - s.ordinal > 240 ||
             (s.observed_at && now > s.observed_at && now - s.observed_at > 4000)) return;
         last_ = s.ordinal;

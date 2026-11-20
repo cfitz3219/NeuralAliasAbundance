@@ -1068,12 +1068,15 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             !vertex || FAILED(game.device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &lit_vs))) return 1;
         ComPtr<ID3D11PixelShader> trial_surface, trial_screen;
         ComPtr<ID3D11Buffer> trial_flash;
-        if (staged_flash) {
+        if (compare_routes) {
             auto surface = Compile("ps_trial_surface", "ps_5_0");
+            if (!surface || FAILED(game.device->CreatePixelShader(surface->GetBufferPointer(),
+                surface->GetBufferSize(), nullptr, &trial_surface))) return 1;
+        }
+        if (staged_flash) {
             auto screen_shader = Compile("ps_trial_screen", "ps_5_0");
             const D3D11_BUFFER_DESC flags{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
-            if (!surface || !screen_shader ||
-                FAILED(game.device->CreatePixelShader(surface->GetBufferPointer(), surface->GetBufferSize(), nullptr, &trial_surface)) ||
+            if (!screen_shader ||
                 FAILED(game.device->CreatePixelShader(screen_shader->GetBufferPointer(), screen_shader->GetBufferSize(), nullptr, &trial_screen)) ||
                 FAILED(game.device->CreateBuffer(&flags, nullptr, &trial_flash))) return 1;
         }
@@ -1110,7 +1113,9 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             c->OMSetDepthStencilState(nullptr, 0);
             ID3D11RenderTargetView* layers[]{canvas.rtv.Get(), second_output.rtv.Get()};
             c->OMSetRenderTargets(2, layers, game.dsv.Get());
-            c->PSSetShader(staged_flash ? trial_surface.Get() : game.ps_scene.Get(), nullptr, 0);
+            // An automatic comparison needs stable texture outside the
+            // reflection to establish that these are the same scene.
+            c->PSSetShader(compare_routes ? trial_surface.Get() : game.ps_scene.Get(), nullptr, 0);
             for (int n = 0; n < 34; ++n) c->Draw(4, 0);
             // Keep the depth test active against the layer depth and draw coplanar fullscreen lighting.
             c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
