@@ -83,12 +83,17 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
     if (exhausted_now || previous != recovery.Selected() ||
         (recovery.Busy() && phase != recovery.Comparison().Current())) {
         const auto& trial = recovery.Comparison();
+        const auto& original = placement.Comparison();
+        const float total = on_kept_route && recovery.Busy() && trial.VerifiedReduction() >= 0.f &&
+            recovery.Region() == original.Region()
+            ? 1.f - trial.CandidateAffectedRegion() / (std::min)(original.Baseline(), original.Confirmation()) : -1.f;
         eventlog::Emit("referee_recovery",
-            "frame=%llu first_stage=%s region=%u tool=%s phase=%s ruled_out=%u stops=%.3f/%.3f/%.3f why=%s",
+            "frame=%llu first_stage=%s region=%u tool=%s phase=%s ruled_out=%u stops=%.3f/%.3f/%.3f reduction=%.4f total=%.4f why=%s",
             (unsigned long long)frame, StageName(recovery.Origin()), recovery.Region(),
             ToolName(recovery.Busy() ? recovery.Selected() : previous),
             exhausted_now ? "no_matching_tool" : recovery.Busy() ? trial.Name() : "restored",
-            unsigned(recovery.Excluded()), trial.Baseline(), trial.Candidate(), trial.Confirmation(), recovery.Reason());
+            unsigned(recovery.Excluded()), trial.Baseline(), trial.Candidate(), trial.Confirmation(),
+            recovery.Busy() ? trial.VerifiedReduction() : -1.f, total, recovery.Reason());
     }
 }
 } // namespace na::referee

@@ -29,6 +29,8 @@ struct Context {
     uint32_t subresource = 0, width = 0, height = 0;
     uint64_t native_screen_proof = 0;
     uint64_t trial_ticket = 0, trial_configuration = 0;
+    uint32_t recovery_region = 0;
+    float recovery_floor = 0; // same affected region of an already verified placement
 
     bool SameScene(const Context& other) const
     {
@@ -40,7 +42,8 @@ struct Context {
         return placement == other.placement && color == other.color && depth == other.depth &&
                generation == other.generation && subresource == other.subresource && width == other.width && height == other.height &&
                native_screen_proof == other.native_screen_proof && trial_ticket == other.trial_ticket &&
-               trial_configuration == other.trial_configuration;
+               trial_configuration == other.trial_configuration && recovery_region == other.recovery_region &&
+               recovery_floor == other.recovery_floor;
     }
     bool SameTemporalSequence(const Context& other) const
     {
@@ -51,6 +54,7 @@ struct Context {
         return placement.path == Path::Native11 && placement == other.placement &&
                generation && generation == other.generation &&
                trial_ticket == other.trial_ticket && trial_configuration == other.trial_configuration &&
+               recovery_region == other.recovery_region && recovery_floor == other.recovery_floor &&
                native_screen_proof && other.native_screen_proof &&
                color && other.color && depth && depth == other.depth && subresource == other.subresource &&
                width == other.width && height == other.height;

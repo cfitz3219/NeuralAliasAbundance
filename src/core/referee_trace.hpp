@@ -25,10 +25,12 @@ struct FlickerTransition {
     FlickerStage stage = FlickerStage::Unknown;
     uint32_t region = 0;
     std::array<float, 3> stops{};
+    float recovery_floor = 0.f;
 };
 
 // VARIANT: referee/accepted-regional-trace
-inline FlickerTransition LocateTransition(const float* before, const float* after, const float* screen = nullptr)
+inline FlickerTransition LocateTransition(const float* before, const float* after, const float* screen = nullptr,
+                                          uint32_t recovery_region = 0, float recovery_floor = 0.f)
 {
     using Result = FlickerTransition;
     std::array<std::array<float, Result::count>, 3> delta{};
@@ -47,15 +49,18 @@ inline FlickerTransition LocateTransition(const float* before, const float* afte
         for (auto& v : delta[stage]) v *= float(Result::count) / kThumbFloats;
     }
     const auto& presented = delta[2];
-    const auto peak = std::max_element(presented.begin(), presented.end(), [](float a, float b) { return std::fabs(a) < std::fabs(b); });
+    const bool scoped = recovery_floor > 0.f && recovery_region < Result::count;
+    const float floor = scoped ? std::clamp(recovery_floor, .018f, .12f) : .12f;
+    const auto peak = scoped ? presented.begin() + recovery_region :
+        std::max_element(presented.begin(), presented.end(), [](float a, float b) { return std::fabs(a) < std::fabs(b); });
     const uint32_t region = static_cast<uint32_t>(peak - presented.begin());
-    if (std::fabs(*peak) < .12f) return {};
+    if (std::fabs(*peak) < floor) return {};
     const auto quiet = std::count_if(presented.begin(), presented.end(), [](float s) { return std::fabs(s) < .055f; });
     if (quiet < Result::count * 3 / 4) return {};
-    const auto begins = [peak](float s) { return std::fabs(s) >= .085f && s * *peak > 0; };
+    const auto begins = [peak, floor](float s) { return std::fabs(s) >= floor * (.085f / .12f) && s * *peak > 0; };
     const auto stage = begins(delta[0][region]) ? FlickerStage::Input :
                        begins(delta[1][region]) ? FlickerStage::Reconstruction : FlickerStage::Composition;
-    return {stage, region, {delta[0][region], delta[1][region], *peak}};
+    return {stage, region, {delta[0][region], delta[1][region], *peak}, scoped ? floor : 0.f};
 }
 
 // One real highlight change can look exactly like a flicker edge. Require a

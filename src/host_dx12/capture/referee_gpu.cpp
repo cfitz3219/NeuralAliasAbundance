@@ -424,7 +424,8 @@ void collect_sample()
         if (g.trace_pair && (!g.padded_layouts || layout)) {
             if (g.adjacent)
                 transition = LocateTransition(samples + kTraceOffset, samples + BlockOffset(kThumbInput),
-                    g.padded_layouts ? samples + kTraceOffset + 3 * kThumbFloats : nullptr);
+                    g.padded_layouts ? samples + kTraceOffset + 3 * kThumbFloats : nullptr,
+                    g.captured_context.recovery_region, g.captured_context.recovery_floor);
             if (g.trial_adjacent) {
                 const float* screen = g.padded_layouts ? samples + kTraceOffset + 3 * kThumbFloats : samples + BlockOffset(kThumbScreen);
                 trial_valid = MeasureTrialScreen(samples + kTraceOffset + 2 * kThumbFloats, screen, trial);

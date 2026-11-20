@@ -162,6 +162,8 @@ public:
         anchor_ = witness;
         region_ = witness.origin.region;
         targeted_ = true;
+        if (witness.origin.recovery_floor > 0)
+            flicker_floor_ = std::clamp(witness.origin.recovery_floor, .018f, minimum_flicker);
     }
     bool RuledOut() const { return phase_ == Phase::Rejected && ruled_out_; }
     bool Regional() const { return regional_; }
@@ -320,7 +322,7 @@ public:
                 regional_ = mixed;
                 spatial_only_ = mixed && strongest < minimum_flicker;
             }
-            bool comparable = strongest >= minimum_flicker || spatial_only_;
+            bool comparable = strongest >= flicker_floor_ || spatial_only_;
             for (unsigned i = 0; regional_ && comparable && i < count_; ++i)
                 comparable = anchor_.tiles.Compare(window_[i].tiles) == RegionalTiles::Match::Original;
             for (unsigned i = 0; comparable && i < count_; ++i) comparable = SameView(anchor_, window_[i]);
@@ -386,6 +388,7 @@ public:
     float Baseline() const { return baseline_; }
     float Candidate() const { return replacement_; }
     float Confirmation() const { return confirmation_; }
+    float CandidateAffectedRegion() const { return affected_replacement_; }
     uint32_t Region() const { return region_; }
     // Same pixels at the displayed output in all three phases. Use the
     // quieter of the two incumbent measurements as the denominator.
@@ -417,9 +420,9 @@ private:
         retry_at_ = now_ + retry_delay_;
         retry_delay_ = (std::min)(retry_delay_ * 2, uint64_t{60000});
     }
-    static bool ImprovesWith(float replacement, float ordinary)
+    bool ImprovesWith(float replacement, float ordinary) const
     {
-        return replacement <= ordinary * .70f && ordinary - replacement >= .04f;
+        return replacement <= ordinary * .70f && ordinary - replacement >= flicker_floor_ / 3.f;
     }
     bool Improves(float value) const { return ImprovesWith(replacement_, value); }
     float Repeated(uint32_t region, const TrialSample* prior_pattern, const TrialSample*& pattern) const
@@ -472,6 +475,7 @@ private:
     uint32_t region_ = 0;
     unsigned count_ = 0;
     float baseline_ = 0, replacement_ = 0, confirmation_ = 0, affected_replacement_ = 0;
+    float flicker_floor_ = minimum_flicker;
     const char* reason_ = "";
     TrialSample anchor_;
     static constexpr unsigned incumbent_window = 8;

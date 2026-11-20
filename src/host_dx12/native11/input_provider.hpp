@@ -108,6 +108,8 @@ struct SceneFrame {
     uint64_t trial_ticket = 0;     // valid only in a measured, post-warmup trial window
     referee::RecoveryTool recovery_tool{};
     uint64_t recovery_configuration = 0;
+    uint32_t recovery_region = 0;
+    float recovery_floor = 0;
     bool scene_changed = false;    // scene_stream differs from the previous fired frame
     Boundary boundary = Boundary::BeforeRead;
     uint32_t scene_draws = 0;      // scene draws this frame before the boundary

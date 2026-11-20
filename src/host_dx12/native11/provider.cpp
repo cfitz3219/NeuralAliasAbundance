@@ -1471,6 +1471,10 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
             f.trial_ticket = g_recovery.Ticket(g_frame);
             f.recovery_tool = g_recovery.ToolInUse();
             f.recovery_configuration = g_recovery.Configuration();
+            if (lit_color) {
+                f.recovery_region = g_placement.Comparison().Region();
+                f.recovery_floor = g_placement.RecoveryFloor();
+            }
         }
     }
     f.scene_draws = g_model.SceneDrawsThisFrame();

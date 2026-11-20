@@ -214,10 +214,16 @@ inline int SampleFitMeasure(test::Device& d) {
     namespace sm=na::motion::screen;namespace tm=na::motion::total;
     constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=((gw+7)/8)*((gh+7)/8),words=20+86*groups; // a thread group is one tile of 8 x 8 samples; 81 sums and 5 tile words each
     Gpu g(d);Programs p(g);REQUIRE(p.Init()==0);
-    for(unsigned variant=0;variant<5;++variant) {
+    for(unsigned variant=0;variant<7;++variant) {
         p.Defaults(); sm::Model truth;truth.valid=true;truth.nearness_limit=1;
         const float jx=variant==3?.375f:0.f,jy=variant==3?-.25f:0.f,far_depth=variant==4?1.f:0.f;
         const float theta[]={-2.5f,.08f,.03f,.5f,.02f,-.02f,.01f,-.02f,15.f,-7.f,4.f};std::copy(theta,theta+11,truth.theta);
+        const bool changing_light = variant >= 5;
+        const float real_motion = variant == 6 ? -.23f : 0.f;
+        if (changing_light) {
+            std::fill(std::begin(truth.theta), std::end(truth.theta), 0.f);
+            truth.theta[0] = real_motion;
+        }
         const auto nearness=[&](float x,float y){return variant==2?0.f:.01f+.06f*y/h+.02f*std::sin(x*.017f)*std::sin(y*.023f);};
         const auto object=[&](float x,float y){return variant==1&&x>float(w)*.75f&&y>float(h)*.67f;};
         const auto motion=[&](float x,float y,float& vx,float& vy){sm::Evaluate(truth,x,y,nearness(x,y),w,h,vx,vy);if(object(x,y)){vx+=10;vy-=4;}};
@@ -229,7 +235,9 @@ inline int SampleFitMeasure(test::Device& d) {
         for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x) {
             const size_t i=size_t(y)*w+x;const float px=float(x)+.5f,py=float(y)+.5f;current[i]=texture(px,py);
             float gx=px,gy=py;for(unsigned k=0;k<8;++k){float vx,vy;motion(gx,gy,vx,vy);gx=px-vx;gy=py-vy;}previous[i]=texture(gx,gy);
+            if (changing_light) previous[i] += .025f;
             motion(px-jx,py-jy,raw[2*i],raw[2*i+1]);depth[i]=far_depth==0?nearness(px-jx,py-jy):1.f-nearness(px-jx,py-jy);
+            if (changing_light) raw[2*i] = raw[2*i+1] = 0;
             if(current[i]==.012f){raw[2*i]=17;raw[2*i+1]=-13;} // explicit bad search in untextured regions
             rgba[4*i]=rgba[4*i+1]=rgba[4*i+2]=current[i];rgba[4*i+3]=1;
         }
@@ -268,6 +276,20 @@ inline int SampleFitMeasure(test::Device& d) {
         float maxterm=0;for(unsigned k=0;k<11;++k)maxterm=(std::max)(maxterm,std::abs(gm[k]-ref.theta[k]));
         CHECK(fitted.valid&&ref.valid);CHECK(gm[13]==ref.samples);CHECK(std::abs(gm[14]-ref.agree)<=1);CHECK(maxterm<.01f);CHECK(std::abs(gm[11]-ref.nearness_limit)<1e-5f);
         CHECK(sample_decisions<samples.size()/100);CHECK(sample_errors<samples.size()/100);
+        if (changing_light) {
+            double error = 0;
+            unsigned n = 0;
+            for (const auto& sample : samples) {
+                if (!sample.confirmed) continue;
+                float vx, vy;
+                sm::Evaluate(fitted, sample.px, sample.py, sample.nearness, w, h, vx, vy);
+                error += std::hypot(vx - real_motion, vy);
+                ++n;
+            }
+            std::printf("changing light: true motion %.3f px, fitted error %.5f px (%u samples)\n",
+                        real_motion, error / (std::max)(n, 1u), n);
+            CHECK(n > 100 && error / n < (variant == 5 ? .01 : .06));
+        }
         unsigned flat=0,flat_bad=0,decisions=0,vector_bad=0,compared=0,obj=0,obj_good=0;double flat_error=0;
         for(unsigned y=16;y<h-16;++y)for(unsigned x=16;x<w-16;++x){size_t i=size_t(y)*w+x;const float px=float(x)+.5f-jx,py=float(y)+.5f-jy;float vx,vy;sm::Evaluate(fitted,px,py,std::abs(depth[i]-far_depth),w,h,vx,vy);
             auto expected=tm::MeasurePixel(ci,pi,px,py,true,raw[2*i],raw[2*i+1],{},fitted.valid,vx,vy);

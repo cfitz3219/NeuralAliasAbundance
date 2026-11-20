@@ -5096,6 +5096,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         } else if (same_recovery) {
             context.trial_ticket = g.recovery.Ticket(g.frame);
             if (context.trial_ticket) context.trial_configuration = current_configuration();
+            if (recovering_kept) {
+                context.recovery_region = g.placement_trial.Comparison().Region();
+                context.recovery_floor = g.placement_trial.RecoveryFloor();
+            }
         }
         pending.capture = na::capture::j2::RecordReferee(l, planes, id, e.render_w, e.render_h, e.out_w, e.out_h, context);
     } else if (evaluated && e.reset) {

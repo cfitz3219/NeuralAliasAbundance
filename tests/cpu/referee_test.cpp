@@ -657,6 +657,8 @@ int main()
             }
             check(partial.UsesCandidate() && partial.AllowsStageRecovery(),
                   "keep a verified partial improvement while allowing the next relevant correction");
+            check(std::fabs(partial.RecoveryFloor() - .025f) < .0001f,
+                  "follow the remaining flicker at the original region's ten percent limit");
             partial.Tick(100 + ordinal, false);
             check(!partial.UsesCandidate() && !partial.AllowsStageRecovery(),
                   "loss of the actual display proof removes secondary recovery authority");
@@ -746,6 +748,42 @@ int main()
         StageRecovery dx12(true);
         dx12.SetScene(scene);
         check(dx12.Ticket(s.ordinal) != r.Ticket(s.ordinal), "DX11 and DX12 mailboxes are independent");
+
+        std::vector<float> earlier(3 * kThumbFloats), later;
+        for (unsigned q = 0; q < earlier.size(); ++q)
+            earlier[q] = std::sin(float(q % kThumbW) * .31f) + std::cos(float(q / kThumbW) * .37f);
+        later = earlier;
+        constexpr unsigned location = 33;
+        for (unsigned y = 0; y < kThumbH; ++y) for (unsigned x = 0; x < kThumbW; ++x) {
+            if (y * FlickerTransition::rows / kThumbH * FlickerTransition::columns +
+                x * FlickerTransition::columns / kThumbW == location)
+                later[2 * kThumbFloats + y * kThumbW + x] += .06f;
+        }
+        const auto residual = LocateTransition(earlier.data(), later.data(), nullptr, location, .025f);
+        check(LocateTransition(earlier.data(), later.data()).stage == S::Unknown &&
+              residual.stage == S::Composition && residual.region == location && residual.recovery_floor == .025f,
+              "existing lighting proof can target a smaller repeated residual without lowering the ordinary detector");
+        s = {};
+        s.comparable = s.delivered = true;
+        s.width = 1920; s.height = 1080; s.tools = Bit(T::Sharpen);
+        s.origin = residual;
+        const auto residual_pair = [&](float change, uint8_t applied = 0) {
+            s.ordinal += RouteTrial::warmup_frames + 1;
+            test_time += 100;
+            s.origin.stops[2] *= -1;
+            s.change[location].fill(std::copysign(change, s.origin.stops[2]));
+            s.applied = applied;
+            dx12.Tick(test_time);
+            dx12.Add(dx12.Ticket(s.ordinal), s, s.ordinal + 1, test_time);
+        };
+        residual_pair(.06f); residual_pair(.06f);
+        for (unsigned i = 0; i < RouteTrial::samples; ++i) residual_pair(.06f);
+        check(dx12.ToolInUse() == T::Sharpen, "the next tool runs against the residual on the kept route");
+        for (unsigned i = 0; i < RouteTrial::samples; ++i) residual_pair(.01f, Bit(T::Sharpen));
+        for (unsigned i = 0; i < RouteTrial::samples; ++i) residual_pair(.06f);
+        check(dx12.Comparison().Current() == RouteTrial::Phase::Kept &&
+              .25f * .10f > dx12.Comparison().CandidateAffectedRegion(),
+              "residual trial preserves delivery and improves more than ninety percent of the original fault");
     }
     std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
     return failures ? 1 : 0;

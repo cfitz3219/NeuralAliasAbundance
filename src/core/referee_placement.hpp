@@ -22,6 +22,7 @@ public:
     bool OwnsComparison() const { return trial_.Active() || trial_.UsesCandidate(); }
     bool UsesCandidate() const { return trial_.UsesCandidate(); }
     bool AllowsStageRecovery() const { return !trial_.Regional() && trial_.HasResidualFlicker(); }
+    float RecoveryFloor() const { return (std::min)(trial_.Baseline(), trial_.Confirmation()) * .10f; }
     const RouteTrial& Comparison() const { return trial_; }
     uint64_t Ticket(uint64_t frame) const { return OwnsComparison() ? trial_.Ticket(frame) : 0; }
     bool Matches(Scope scope) const { return OwnsComparison() && scope == scope_; }
