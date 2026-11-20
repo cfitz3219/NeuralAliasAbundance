@@ -138,6 +138,7 @@ struct PendingHistory {
     // Camera-free DLAA: this frame's motion was measured on the pictures (no camera gave it), and
     // whether the frame carried a DLSS reset (the reset a measured scene cut waits for).
     bool measured = false, reset = false;
+    na::observe::ResolvedRaster resolved_raster{};
     bool no_camera = false; // the tracker was not given a camera on this frame
     uint64_t frame = 0;
     // Depth direction evidence this hand-over closes when it is submitted (see State::depth_batch):
@@ -5333,6 +5334,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false; // nothing useful to submit; retried next frame
     }
+    if (inl && vpj_mode() && !upscaling && !windowed && !phys && !deferred && !skip_color &&
+        rw == ow && rh == oh && viewport_sample_known) {
+        // Snapshot the game's actual consumer binding. Host commands do not alter its shadow.
+        const auto& entry = g.capture_entry;
+        const bool full_reader = entry.op == na::j2::Op::GraphicsEntry &&
+            entry.resource == color_id && entry.dst_w == ow && entry.dst_h == oh;
+        pending.resolved_raster = na::observe::FinishSceneRaster(inl, color_id, csub, depth_id, dsub,
+            full_reader ? entry.destination : 0);
+    }
     g.stats.width = w;
     g.stats.height = h;
     g.stats.color_format = static_cast<uint32_t>(cd.Format);
@@ -9370,8 +9380,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 return;
         }
         na::capture::j2::Discard(pending.capture, false);
+        const auto resolved = has && queue == g.queue.Get() && producer_order && !lighting_binding_changed && g.inl.frame == g.frame
+            ? g.inl.history.resolved_raster : na::observe::ResolvedRaster{};
         lock.unlock();
         forward(queue, count, lists);
+        if (resolved.sample) na::observe::SubmitResolvedRaster(resolved);
         if (!has && !scene_camera_to_submit.writes) return;
         lock.lock();
         // A recording only contributes its pose after forwarding the work on

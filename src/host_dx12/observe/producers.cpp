@@ -69,11 +69,13 @@ struct DescHeap;
 // Recordings with a pinned viewport sample may still need it after the global
 // request goes away. Only an entirely idle jitter path can skip the list locks.
 std::atomic<uint64_t> g_vpj_recordings{0};
+std::atomic<bool> g_vpj_ever{false};
 // What the most recent recording pinned for its scene draws: the sample, the depth it drew into and
 // whether its one full-size viewport was widened (that is part of where the picture landed).
 struct VpjPinned { uint64_t sample = 0, depth = 0; bool expanded = false; };
 std::mutex g_vpj_pinned_m;
 VpjPinned g_vpj_pinned;
+ResolvedRaster g_vpj_submitted; // protected by the observation registry lock
 // Depth direction evidence (SetDepthWriteEvidence). The facts belong to the RECORDING they were
 // recorded in (ListState::de, cleared when the list is Reset) and say nothing until that recording
 // is submitted: a list recorded ahead, discarded or reset proves nothing about the picture on
@@ -197,7 +199,7 @@ struct ListState {
     na_object_id last_draw_rt = 0; // actual draw evidence survives OM unbinding
     na_object_id cur_rts[8] = {};
     uint32_t cur_nrt = 0;
-    uint32_t cur_ds_sub = NA_UNKNOWN_U32;
+    uint32_t cur_ds_sub = NA_UNKNOWN_U32, cur_rt_sub = NA_UNKNOWN_U32;
     na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
     uint32_t entry_barrier=0;
     bool restorable = true;              // false after work whose state effects we cannot replay
@@ -228,6 +230,18 @@ struct ListState {
     uint32_t mip_pso_twin = 0, mip_pso_game = 0, mip_rs_twin = 0, mip_rs_game = 0;
     // Viewport jitter: our offset copies of the game's viewports are bound now (vpj_value),
     // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
+    ResolvedRaster vpj_resolved;
+    // A new depth image in this recording cannot inherit a previous resolve.
+    uint64_t vpj_cleared_depth = 0;
+    bool vpj_counted_local = false, vpj_counted_submitted = false;
+    bool vpj_discarded = false;
+    void NewDepthImage(uint64_t depth) {
+        if (!g_vpj_ever.load(std::memory_order_relaxed)) return;
+        uint64_t selected = 0, color = 0;
+        GetLiveSelection(&selected, &color);
+        if (selected == depth) vpj_cleared_depth = depth;
+        if (depth && vpj_resolved.depth == depth) vpj_resolved = {};
+    }
     bool vpj_applied = false;
     uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
     bool vpj_scene_expanded = false, vpj_scene_mixed = false; // the pinned scene draws' raster shape; mixed = not one shape
@@ -3973,6 +3987,9 @@ struct On<sl::list::Reset> {
                 {
                     std::lock_guard<std::mutex> bl(ls->bind_m);
                     ls->bindings.clear();
+                    ls->vpj_resolved = {};
+                    ls->vpj_cleared_depth = 0;
+                    ls->vpj_counted_local = ls->vpj_counted_submitted = ls->vpj_discarded = false;
                     ls->states.clear();
                     ls->evidence_complete = true;
                     ls->uses.clear();
@@ -4646,6 +4663,7 @@ void set_targets_locked(ListState& ls, const na_view_ref* refs, uint32_t m, bool
 {
     const uint32_t nrt = has_dsv ? (m ? m - 1 : 0) : m;
     ls.cur_rt = nrt ? refs[0].resource : 0;
+    ls.cur_rt_sub = nrt ? refs[0].first_subresource : NA_UNKNOWN_U32;
     ls.cur_nrt = nrt;
     for (uint32_t i = 0; i < nrt; ++i) ls.cur_rts[i] = refs[i].resource;
     ls.cur_ds = has_dsv && m ? refs[m - 1].resource : 0;
@@ -4694,7 +4712,7 @@ struct On<sl::list::OMSetRenderTargets> {
 };
 template <>
 struct On<sl::list::ClearDepthStencilView> {
-    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT depth, UINT8 stencil, UINT, const D3D12_RECT*)
+    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT*)
     {
         Rec r;
         if (!begin_op(l, &r)) return;
@@ -4705,6 +4723,7 @@ struct On<sl::list::ClearDepthStencilView> {
         if ((f & D3D12_CLEAR_FLAG_DEPTH) && v.resource && v.first_subresource != NA_UNKNOWN_U32)
             with_list_state(l, [&](ListState& ls) {
                 std::lock_guard<std::mutex> bl(ls.bind_m);
+                if (!rect_count) ls.NewDepthImage(v.resource);
                 if (ls.states.size() < 4096) ls.states.push_back({v.resource, v.first_subresource, D3D12_RESOURCE_STATE_DEPTH_WRITE});
             });
     }
@@ -4722,6 +4741,8 @@ struct On<sl::list::ClearRenderTargetView> {
         note_uses(l, {v.resource});
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
+            if (v.resource && !rect_count && (ls.vpj_resolved.color == v.resource || ls.vpj_resolved.destination == v.resource))
+                ls.vpj_resolved = {};
             if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, rect_count ? na::j2::Op::ClearWrite : na::j2::Op::FullViewClear});
             if (v.resource == ls.pending_entry) ls.pending_entry = 0;
             if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
@@ -4737,7 +4758,19 @@ struct TailWork {
 };
 template<> struct On<sl::list::ClearUnorderedAccessViewUint> : TailWork {};
 template<> struct On<sl::list::ClearUnorderedAccessViewFloat> : TailWork {};
-template<> struct On<sl::list::DiscardResource> : TailWork {};
+template<> struct On<sl::list::DiscardResource> {
+    static void run(GL* list, ID3D12Resource* resource, const D3D12_DISCARD_REGION*) {
+        Rec r;
+        if (!begin_op(list, &r) || !resource || !g_vpj_ever.load(std::memory_order_relaxed)) return;
+        const auto id = IdOf(resource);
+        with_list_state(list, [&](ListState& ls) {
+            std::lock_guard<std::mutex> lock(ls.bind_m);
+            ls.vpj_discarded = true;
+            if (id == ls.vpj_resolved.color || id == ls.vpj_resolved.depth || id == ls.vpj_resolved.destination)
+                ls.vpj_resolved = {};
+        });
+    }
+};
 
 template <>
 struct On<sl::list::ExecuteIndirect> {
@@ -4832,11 +4865,18 @@ struct On<sl::list::BeginRenderPass> {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             set_targets_locked(ls, refs, m, ds != nullptr);
             ls.in_render_pass = true;
+            if (ds && (depth_clear || ds->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD))
+                ls.NewDepthImage(refs[m - 1].resource);
             ls.raster_targets_known = false; // in-pass snapshots are observation only
             ls.native_colors.assign(color_views,color_views+nrt);
             ls.native_depth=std::move(depth_view);
             for (uint32_t i = 0; i < nrt; ++i) {
-                if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
+                const auto access = rts[i].BeginningAccess.Type;
+                if ((access == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || access == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD) &&
+                    refs[i].resource && (ls.vpj_resolved.color == refs[i].resource || ls.vpj_resolved.destination == refs[i].resource))
+                    ls.vpj_resolved = {};
+                if (access == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD) ls.vpj_discarded = true;
+                if (access != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
                 ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::FullViewClear});
                 if (ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), refs[i].resource) == ls.cleared.end())
                     ls.cleared.push_back(refs[i].resource);
@@ -5383,7 +5423,7 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
 // or depth test off: full-screen passes) keep the game's own viewports, so nothing is shifted
 // twice. Packed: frame (low 32 bits, never 0) << 32 | x << 16 | y, x/y int16 in 1/65536 px.
 std::atomic<uint64_t> g_vpj{0};
-std::atomic<bool> g_vpj_ever{false};
+std::atomic<uint64_t> g_vpj_local_layers{0}, g_vpj_submitted_layers{0};
 std::atomic<uint64_t> g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_draws{0}, g_vpj_unknown{0};
 thread_local bool t_vpj_self = false; // our own RSSetViewports: not a change of the game's
 // The game (or host work restoring the game's state) set viewports, or the list restarted:
@@ -5429,6 +5469,36 @@ void vpj_before_draw(GL* l)
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
         bool want = sample && sel_depth && ls->cur_ds == sel_depth;
         if (want) want = pc && pc->depth_enable == 1;
+        if (want && ls->cur_nrt == 1 && pc->depth_write == 0) {
+            // A depth test also belongs to glass, particles and other compositing draws.
+            // Once the scene is reconstructed, their colour is on the display pixel grid.
+            const auto matches = [&](const ResolvedRaster& r) {
+                return r.sample == sample && r.color == sel_color && r.depth == sel_depth &&
+                       r.depth_sub == ls->cur_ds_sub;
+            };
+            const auto destination = [&](const ResolvedRaster& r) {
+                return r.destination && ls->cur_rt == r.destination && ls->cur_rt_sub == r.destination_sub;
+            };
+            const auto& local = ls->vpj_resolved;
+            if (matches(local) && ((ls->cur_rt == local.color && ls->cur_rt_sub == local.color_sub) || destination(local))) {
+                want = false;
+                if (!ls->vpj_counted_local) {
+                    ls->vpj_counted_local = true;
+                    g_vpj_local_layers.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (sample == cur && matches(g_vpj_submitted) && destination(g_vpj_submitted) &&
+                       !ls->vpj_discarded && ls->vpj_cleared_depth != sel_depth && ls->cleared.size() < 64 &&
+                       pso_obj_locked(*ls)->blend_class == 2 &&
+                       std::find(ls->cleared.begin(), ls->cleared.end(), ls->cur_rt) == ls->cleared.end()) {
+                // A separate list loading/blending into the submitted consumer's exact view.
+                // A different phase, a replacement blend or a cleared target has no such proof.
+                want = false;
+                if (!ls->vpj_counted_submitted) {
+                    ls->vpj_counted_submitted = true;
+                    g_vpj_submitted_layers.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
             const bool first_pin = !ls->vpj_scene;
@@ -9449,9 +9519,39 @@ void GetLiveSelection(uint64_t* depth, uint64_t* color)
         if (g_live_seq.load(std::memory_order_relaxed) == s0) { *depth = d; *color = c; return; }
     }
 }
+ResolvedRaster FinishSceneRaster(ID3D12CommandList* list, uint64_t color, uint32_t color_sub,
+                                 uint64_t depth, uint32_t depth_sub, uint64_t destination)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !color || !depth) return {};
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->vpj_scene || ls->vpj_depth != depth) return {};
+    auto& raster = ls->vpj_resolved;
+    raster = {ls->vpj_scene, color, depth, 0, color_sub, depth_sub, 0};
+    if (destination && destination != color && ls->cur_nrt == 1 && ls->cur_rt == destination &&
+        ls->cur_rt_sub != NA_UNKNOWN_U32) {
+        raster.destination = destination;
+        raster.destination_sub = ls->cur_rt_sub;
+    }
+    return raster;
+}
+void SubmitResolvedRaster(const ResolvedRaster& raster)
+{
+    if (!raster.sample || !raster.destination) return;
+    std::unique_lock<RegistryLock> lock(g_m);
+    if (g_vpj.load(std::memory_order_acquire) == raster.sample) g_vpj_submitted = raster;
+}
 void SetSceneViewportJitter(uint64_t frame, float x, float y)
 {
-    if (!frame) { g_vpj.store(0, std::memory_order_release); return; }
+    if (!frame) {
+        if (g_vpj.exchange(0, std::memory_order_acq_rel)) {
+            std::unique_lock<RegistryLock> lock(g_m);
+            g_vpj_submitted = {};
+        }
+        return;
+    }
     const auto q = [](float f) { return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(std::lround(double(f) * 65536.0), -32767L, 32767L))); };
     uint32_t f32 = static_cast<uint32_t>(frame);
     if (!f32) f32 = 1;
@@ -9689,7 +9789,8 @@ void FormatHookCost(char* out, size_t n)
 ViewportJitterStats GetViewportJitterStats()
 {
     return {g_vpj_draws.load(std::memory_order_relaxed), g_vpj_sets.load(std::memory_order_relaxed),
-            g_vpj_restores.load(std::memory_order_relaxed), g_vpj_unknown.load(std::memory_order_relaxed)};
+            g_vpj_restores.load(std::memory_order_relaxed), g_vpj_unknown.load(std::memory_order_relaxed),
+            g_vpj_local_layers.load(std::memory_order_relaxed), g_vpj_submitted_layers.load(std::memory_order_relaxed)};
 }
 uint64_t LiveSelectionVersion()
 {

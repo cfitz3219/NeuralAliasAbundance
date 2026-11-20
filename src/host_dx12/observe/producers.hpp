@@ -390,6 +390,15 @@ uint64_t LiveSelectionVersion();
 // is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
 // by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
+// A successful native-size resolve ends the scene sample for layers drawn over its image.
+// The second target is the observed full-size consumer, when it is known.
+struct ResolvedRaster {
+    uint64_t sample = 0, color = 0, depth = 0, destination = 0;
+    uint32_t color_sub = 0, depth_sub = 0, destination_sub = 0;
+};
+ResolvedRaster FinishSceneRaster(ID3D12CommandList* list, uint64_t color, uint32_t color_sub,
+                                 uint64_t depth, uint32_t depth_sub, uint64_t destination);
+void SubmitResolvedRaster(const ResolvedRaster& raster);
 // Depth direction evidence (camera-free DLAA; the DX12 half of VARIANT
 // depth/direction-from-depth-writes, decided by native11/depth_direction.hpp). While on, every
 // game draw whose bound depth is the live scene depth and whose pipeline tests AND writes depth is
@@ -477,7 +486,7 @@ void GetDrawReplayStats(DrawReplayStats* out);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
-struct ViewportJitterStats { uint64_t draws, sets, restores, unknown; };
+struct ViewportJitterStats { uint64_t draws, sets, restores, unknown, local_layers, submitted_layers; };
 ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,
