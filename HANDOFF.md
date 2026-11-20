@@ -144,3 +144,7 @@ Draft PR 181 into main is backed up on GitHub at astra/unified-main a30f16fe. It
 ### 2026-11-20 Pacific — Opus integration verified
 
 Unified draft PR 181 includes Opus's Home texture fix and native DX11 Draw Replay with the recorded ownership guards. Runtime e4d0ab7d built in Release and passed all eight focused tests. Test details and remaining live verification are in COMMS and the integration WORKLOG at ed5c1115. The final runtime merge is held for Fable's handoff.
+
+### 2026-11-20 Pacific — Referee jitter and lighting verification
+
+Draft PR 183 adds brightness-invariant camera-free motion fitting and same-screen geometric jitter evidence. Both APIs retain a screen-proved lighting placement while testing a qualified follow-up correction in the same region. Runtime df467561 passed 11 focused tests, including 90.1 and 90.5 percent less displayed variation in the controlled flash footprint. The broader patch and the saved game intervals have separate results in COMMS. Matched live proof of a 90 percent reduction for both user-reported symptoms remains open. This draft is separate from the held unified main merge.
