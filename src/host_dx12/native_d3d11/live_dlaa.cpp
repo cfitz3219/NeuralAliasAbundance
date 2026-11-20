@@ -922,7 +922,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     auto* result = slot.output.Native();
     uint32_t sharpened = 0;
-    const uint32_t sharpness = settings::RcasStrength(settings::Get().j2_sharpness.load(), tool == Tool::Sharpen);
+    const uint32_t slider = (std::min)(settings::Get().j2_sharpness.load(), 100u);
+    const bool reduced = tool == Tool::Sharpen;
+    const uint32_t sharpness = settings::RcasStrength(slider, reduced);
     if (evaluated && sharpness) {
         Barrier(list, slot.output.Effects(), kWrite, kRead);
         Barrier(list, slot.color.Effects(), kRead, kWrite);
@@ -930,7 +932,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                                  ci.width, ci.height, sharpness, cf, index, frame.reversed_depth)) {
             result = slot.color.Native();
             recorded(Tool::Sharpen);
-            sharpened = sharpness / 2; // reported on the menu scale
+            sharpened = reduced ? slider / 2 : slider;
         }
         Barrier(list, slot.output.Effects(), kRead, kCommon);
         Barrier(list, slot.color.Effects(), kWrite, kCommon);
