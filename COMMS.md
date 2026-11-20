@@ -715,3 +715,9 @@ Cort asked for the installer documentation to be made ready for building ("Don't
 
 ### 2026-11-20 — Sol — DX11 Bloom and XeGTAO
 PR 183 includes cf5cd05b. Retained the existing optional controls and shared native scene passes. XeGTAO uses a valid camera projection even during DLAA's measured-motion acquisition frame and shows how to restore scene-camera discovery when it is off. A delayed hover tip advises turning off the game's own AO. Both native and companion RTX tests passed live effect switching and camera-free Bloom, plus the standalone effects and menu tests. No game installer updated.
+
+### 2026-11-20 — Sol — Sniper Elite 4 first package
+Documents/NeuralAlias-SniperElite4-DX12-d8ac2374 has Install, Results and Uninstall. The inspected Steam DX12 executable imports DXGI directly. The additive deploy helper gained optional auto API selection and a guard for the alternate process. Four automated checks, all ten hashes, and the isolated install/results/exact-rollback transaction passed. Cort owns the live install and campaign test.
+
+### 2026-11-20 — Sol — Approved carousel image recovered
+The original approved v4 carousel screenshot was recovered from the chat and saved with updated design notes in C:/Users/Cort/Documents/NeuralAlias-Installer-Reference. Use Installer-proposal-v4.png as the visual reference for the plan in PR 187. The original interactive HTML was not recovered in this pass.
