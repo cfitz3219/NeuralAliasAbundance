@@ -51,6 +51,54 @@ public:
         return true;
     }
 
+    // VARIANT: referee/proved-roles-kept (referee_trial.hpp). Admission
+    // needs both rotating roles proved on the screen (`offer`) and the
+    // parity signature recognized on the ordinary route (`parity_seen`,
+    // referee_parity.hpp). Without the signature the timed trial
+    // (BeginVerified) decides as before. A timed trial already running on
+    // the same scope is upgraded. The incumbent's last comparable samples go
+    // with the keep as its damage reference. The 8-second wait after an
+    // invalidation is for timed trials. A keep that ended on lost delivery
+    // waits for its retry; one that ended on proved damage is not retried
+    // for the same scope.
+    bool KeepProvedRoles(Scope offer, bool parity_seen, uint64_t frame, uint64_t now)
+    {
+        if (!offer || !parity_seen) return false;
+        if (OwnsComparison()) {
+            if (!(offer == scope_)) return false;
+            if (trial_.Structural()) return true;
+        } else if (offer == scope_ && trial_.WasStructural() &&
+                   (trial_.RuledOut() || !trial_.CanStart(now))) return false;
+        trial_ = {};
+        configuration_ = 0;
+        incumbent_ = {};
+        independently_verified_ = true;
+        scope_ = offer;
+        const auto fresh = [&](const TrialSample& s) { return s.observed_at && now >= s.observed_at && now - s.observed_at <= 20000; };
+        std::array<TrialSample, RouteTrial::incumbent_samples> evidence{};
+        unsigned count = 0;
+        for (unsigned i = 0; i < observed_count_; ++i)
+            if (fresh(observed_[i])) evidence[count++] = observed_[i];
+        trial_.KeepProvedRoles(domain_ | ++serial_, frame + 1, now, evidence.data(), count);
+        return true;
+    }
+    bool KeptByStructure() const { return trial_.Structural(); }
+    unsigned IncumbentSamples() const { return trial_.IncumbentSamples(); }
+    // Comparable, delivered pictures of the ordinary route, retained as the
+    // damage reference for a later structural keep.
+    void ObserveIncumbent(const TrialSample& sample)
+    {
+        if (UsesCandidate() || !sample.comparable || !sample.delivered || sample.bypassed) return;
+        if (observed_count_ && (observed_[0].width != sample.width || observed_[0].height != sample.height ||
+                                observed_[0].layout != sample.layout || observed_[0].configuration != sample.configuration))
+            observed_count_ = 0;
+        if (observed_count_ == observed_.size()) {
+            std::move(observed_.begin() + 1, observed_.end(), observed_.begin());
+            --observed_count_;
+        }
+        observed_[observed_count_++] = sample;
+    }
+
     bool Begin(Scope offer, const TrialSample& witness, uint64_t frame, uint64_t now)
     {
         if (!offer || OwnsComparison() || now < next_attempt_ || !Fresh(witness, frame, now) || witness.broad_light ||
@@ -120,6 +168,8 @@ private:
     uint64_t domain_, next_attempt_ = 0, serial_ = 0, configuration_ = 0;
     uint32_t layout_ = 0, width_ = 0, height_ = 0;
     bool independently_verified_ = false;
+    std::array<TrialSample, RouteTrial::incumbent_samples> observed_{};
+    unsigned observed_count_ = 0;
 };
 
 } // namespace na::referee

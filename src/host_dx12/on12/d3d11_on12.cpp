@@ -326,6 +326,7 @@ void install_native(ID3D11Device* device)
     na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
     // [j2] camera: whether a frame needs a camera at all (kept in step at every present too).
     na::native_d3d11::SyncCameraUse();
+    na::native11::SetParitySignal(&na::referee::gpu::ParityRoleSwapSeen);
     if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true,
                              &na::referee::gpu::TakeTrialSample)) {
         g_native_installs.fetch_add(1);

@@ -70,10 +70,16 @@ struct Stats {
     uint64_t pre = 0, main = 0, restarted = 0, discarded = 0, unpaired = 0, failed = 0;
     uint64_t trace_pairs = 0, trace_reversals = 0, rejected_presents = 0;
     uint64_t trial_pairs = 0, trial_comparable = 0;
+    uint64_t parity_matched = 0, parity_recognitions = 0; // referee/parity-role-swap
     bool running = false, stopped = false;
     char why[160] = "";
 };
 Stats GetStats();
+// VARIANT: referee/parity-role-swap
+// True once the trace recognized the
+// parity signature on the current presentation; consulted for admission of
+// referee/proved-roles-kept by both adapters.
+bool ParityRoleSwapSeen();
 
 // The last sample as read back (core/referee.hpp layout) and what it holds; for tests and tools.
 struct LastSample {

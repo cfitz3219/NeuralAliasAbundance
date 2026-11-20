@@ -59,7 +59,9 @@ function Get-RefereeSummary([string[]] $Lines) {
     $recovery = @($Lines | Where-Object { $_ -match '\breferee_recovery frame=\d+ first_stage=' })
     $jitterGeometry = $Lines | Where-Object { $_ -match '\breferee_jitter_geometry frame=' } | Select-Object -Last 1
     $composite = $Lines | Where-Object { $_ -match '\breferee_composite frame=\d+ path=' } | Select-Object -Last 1
-    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry) {
+    $parity = @($Lines | Where-Object { $_ -match '\breferee_parity_swap frames=\d+,\d+ ' })
+    $kept = @($Lines | Where-Object { $_ -match '\breferee_roles frame=\d+ kept=1' })
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry -and -not $parity -and -not $kept) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
@@ -78,6 +80,16 @@ function Get-RefereeSummary([string[]] $Lines) {
         $stages = $traces | ForEach-Object { if ($_ -match '\bfirst_stage=(\w+)') { $Matches[1] } } | Group-Object
         $out.Add('  Local flicker first measured at ' + (($stages | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join ', '))
         $out.Add('  Last matched pair: ' + ($traces[-1] -replace '^.*?referee_trace\s+', ''))
+    }
+    if ($parity) {
+        $null = $parity[-1] -match 'brighter=(\w+)'
+        $out.Add("  Parity flicker recognized $($parity.Count) time(s): the screen flipped brightness every other frame ($($Matches[1]) frames brighter), opposite to the DLAA input. Cause: two scene buffers swap jobs each frame.")
+    }
+    if ($kept) {
+        $null = $kept[-1] -match 'referee_roles frame=(\d+)'
+        $keptFrame = [long]$Matches[1]
+        $after = @($traces | Where-Object { $_ -match 'referee_trace\s+frames=\d+,(\d+) ' -and [long]$Matches[1] -gt $keptFrame })
+        $out.Add("  Role-following route kept from frame $keptFrame ($($kept.Count) keep(s)); no timeout can restore the flickering route. Traced flashes after the last keep: $($after.Count).")
     }
     if ($roles) {
         $null = $roles[-1] -match 'role_deliveries=(\d+) scene_stream=(\d+)'

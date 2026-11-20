@@ -34,9 +34,23 @@ inline uint64_t EvaluationConfiguration(uint32_t preset, uint32_t cf, uint32_t d
 template<class Reader, class Accept>
 void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bool can_nominate, bool screen_proved,
                       bool candidate_submitted, StageRecovery& recovery, uint64_t frame, uint64_t now,
-                      Reader read, Accept accept, TrialSample& sample)
+                      Reader read, Accept accept, TrialSample& sample, bool parity_seen = false)
 {
     bool on_kept_route = false;
+    // VARIANT: referee/proved-roles-kept
+    // Both adapters offer `screen_proved` only for a rotating scene pair whose
+    // two roles each reached the screen. With the parity signature also
+    // recognized (referee_parity.hpp) the role-following route is kept at
+    // once (core/referee_trial.hpp), upgrading a timed trial on the same
+    // scope. Without the signature the timed trial below decides as before.
+    if (can_nominate && screen_proved && parity_seen && !placement.KeptByStructure() &&
+        (!placement.OwnsComparison() || placement.Matches(scope)) &&
+        placement.KeepProvedRoles(scope, parity_seen, frame, now)) {
+        recovery.Suspend();
+        eventlog::Emit("referee_roles", "frame=%llu kept=1 incumbent_samples=%u why=%s", (unsigned long long)frame,
+                       placement.IncumbentSamples(), placement.Comparison().Reason());
+        return;
+    }
     if (placement.OwnsComparison()) {
         if (!placement.Matches(scope)) {
             placement.Invalidate(now);
@@ -48,8 +62,10 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
         if (!on_kept_route || !placement.AllowsStageRecovery()) {
             recovery.Suspend();
             const auto ticket = placement.Ticket(frame);
-            if (ticket && read(ticket, sample) && accept(sample, true, placement.UsesCandidate()))
+            if (ticket && read(ticket, sample) && accept(sample, true, placement.UsesCandidate())) {
+                if (!placement.UsesCandidate()) placement.ObserveIncumbent(sample);
                 placement.Add(scope, ticket, sample, frame, now);
+            }
             return;
         }
     }
@@ -78,6 +94,7 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
         recovery.Suspend();
         return;
     }
+    if (got && !on_kept_route) placement.ObserveIncumbent(sample);
     if (got) recovery.Add(ticket, sample, frame + 1, now);
     const bool exhausted_now = exhausted != recovery.Exhausted();
     if (exhausted_now || previous != recovery.Selected() ||

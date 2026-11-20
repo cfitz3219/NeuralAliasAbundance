@@ -11,6 +11,7 @@
 #include "core/referee_selection.hpp"
 #include "core/referee_recovery.hpp"
 #include "core/referee_placement.hpp"
+#include "core/referee_parity.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include <cmath>
 #include <cstdio>
@@ -867,6 +868,149 @@ int main()
         check(dx12.Comparison().Current() == RouteTrial::Phase::Kept &&
               .25f * .10f > dx12.Comparison().CandidateAffectedRegion(),
               "residual trial preserves delivery and improves more than ninety percent of the original fault");
+    }
+    {
+        // referee/parity-role-swap: stops as traced in Shadow of War 18dea9e
+        // (results 231420-994): odd frames brighter on screen, DLAA input
+        // the other way. Recognized after six agreeing adjacent pairs.
+        ParityRoleSwap swap;
+        bool recognized = false;
+        unsigned recognized_at = 0;
+        for (unsigned i = 0; i < 10; ++i) {
+            const uint64_t first = 115400 + i;
+            const float sign = ((first + 1) & 1u) ? 1.f : -1.f;
+            if (swap.Observe(first, first + 1, {-.30f * sign, -.14f * sign, .62f * sign}) && !recognized) {
+                recognized = true;
+                recognized_at = i;
+            }
+        }
+        check(recognized && recognized_at == ParityRoleSwap::needed - 1 && swap.Phase() > 0,
+              "parity flicker opposite to the DLAA input is recognized after six agreeing pairs");
+        ParityRoleSwap same_way;
+        bool wrongly = false;
+        for (unsigned i = 0; i < 10; ++i) {
+            const uint64_t first = 2000 + i;
+            const float sign = ((first + 1) & 1u) ? 1.f : -1.f;
+            wrongly |= same_way.Observe(first, first + 1, {.30f * sign, .15f * sign, .40f * sign});
+        }
+        check(!wrongly, "a flicker already in the game's input (same direction on screen) is not a role swap");
+        ParityRoleSwap unlocked;
+        for (unsigned i = 0; i < 12; ++i) {
+            const uint64_t first = 3000 + 2 * i; // same parity every time, sign changes
+            const float sign = i % 2 ? 1.f : -1.f;
+            wrongly |= unlocked.Observe(first, first + 1, {-.30f * sign, 0.f, .62f * sign});
+        }
+        check(!wrongly, "a flicker not locked to frame parity is not a role swap");
+        ParityRoleSwap gaps;
+        for (unsigned i = 0; i < 12; ++i) wrongly |= gaps.Observe(4000 + 3 * i, 4002 + 3 * i, {-.3f, 0.f, .6f});
+        check(!wrongly, "only adjacent frame pairs can show the parity signature");
+
+        // referee/proved-roles-kept, after Astra's review of c5197c8d.
+        const PlacementTrial::Scope scope{31, 41, 3, 12};
+        const auto picture = [](uint64_t ordinal, uint64_t now) {
+            TrialSample t;
+            t.ordinal = ordinal;
+            t.observed_at = now;
+            t.width = 960; t.height = 540; t.layout = 1; t.configuration = 1;
+            t.delivered = t.comparable = true;
+            for (unsigned r = 0; r < FlickerTransition::count; ++r) { t.image[r] = .3f; t.contrast[r] = .10f; }
+            return t;
+        };
+        // Incumbent: region 13 flickers with frame parity, every other area quiet.
+        const auto incumbent_seen = [&](PlacementTrial& trial) {
+            for (unsigned i = 0; i < RouteTrial::incumbent_samples; ++i) {
+                auto t = picture(1 + i, 1000 + i);
+                t.change[13].fill(i % 2 ? .30f : -.30f);
+                trial.ObserveIncumbent(t);
+            }
+        };
+        uint64_t ordinal = 0;
+        const auto kept_window = [&](PlacementTrial& trial, uint64_t now, auto&& shape) {
+            for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
+                auto t = picture(ordinal, now + i);
+                shape(t, i);
+                trial.Tick(now + i, true);
+                trial.Add(scope, trial.Ticket(ordinal), t, ordinal, now + i);
+            }
+        };
+        {
+            PlacementTrial roles;
+            incumbent_seen(roles);
+            check(!roles.KeepProvedRoles({}, true, 1, 1100), "no proved pair, no keep");
+            check(!roles.KeepProvedRoles(scope, false, 1, 1100) && !roles.OwnsComparison(),
+                  "without the recognized parity signature the timed trial decides, not the structural keep");
+            check(roles.KeepProvedRoles(scope, true, 1, 1100) && roles.UsesCandidate() && roles.KeptByStructure() &&
+                  roles.IncumbentSamples() == RouteTrial::incumbent_samples,
+                  "proved roles plus the parity signature: kept at once, with the incumbent's regional evidence");
+            roles.Tick(1100 + 10 * RouteTrial::maximum_ms, true);
+            check(roles.UsesCandidate(), "no timeout restores the flickering ordinary route");
+            roles.Tick(200000, false);
+            roles.Tick(200001, true);
+            check(roles.UsesCandidate(), "one missed submission does not end the keep");
+            for (unsigned i = 0; i + 1 < RouteTrial::missed_limit; ++i) roles.Tick(200002 + i, false);
+            roles.Tick(200100, true);
+            check(roles.UsesCandidate(), "missed then resumed delivery keeps the role route");
+            ordinal = 2 + RouteTrial::warmup_frames;
+            kept_window(roles, 210000, [](TrialSample& t, unsigned i) { t.change[13].fill(i % 2 ? .14f : -.14f); });
+            check(roles.UsesCandidate() && roles.AllowsStageRecovery() && roles.RecoveryRegion() == 13,
+                  "a recurring residual where the incumbent flickered goes to stage recovery");
+            kept_window(roles, 220000, [](TrialSample&, unsigned) {});
+            kept_window(roles, 230000, [](TrialSample&, unsigned) {});
+            check(roles.UsesCandidate() && !roles.AllowsStageRecovery(),
+                  "the residual target expires once that area is quiet on comparable samples");
+            for (unsigned i = 0; i < RouteTrial::missed_limit; ++i) roles.Tick(240000 + i, false);
+            check(!roles.UsesCandidate() && !roles.KeepProvedRoles(scope, true, ordinal, 240100),
+                  "sustained loss of delivery ends the keep until its retry");
+            check(roles.KeepProvedRoles(scope, true, ordinal, 240100 + 8000),
+                  "after the retry delay the re-proved pair is kept again");
+        }
+        {
+            // Adverse pair: both roles reach the screen, but the role route
+            // makes a previously quiet area flicker in the same view.
+            PlacementTrial adverse;
+            incumbent_seen(adverse);
+            check(adverse.KeepProvedRoles(scope, true, 1, 1100), "adverse pair admitted");
+            ordinal = 2 + RouteTrial::warmup_frames;
+            kept_window(adverse, 2000, [](TrialSample& t, unsigned i) { t.change[40].fill(i % 2 ? .25f : -.25f); });
+            check(!adverse.UsesCandidate() && adverse.Comparison().RuledOut() &&
+                  !adverse.KeepProvedRoles(scope, true, ordinal, 2000 + 600000),
+                  "a new flash in an area the ordinary route showed quiet rolls the keep back for this scope");
+            check(adverse.KeepProvedRoles({31, 41, 4, 12}, true, ordinal, 2000 + 600000),
+                  "a new scene generation can be judged again");
+        }
+        {
+            PlacementTrial blurred;
+            incumbent_seen(blurred);
+            check(blurred.KeepProvedRoles(scope, true, 1, 1100), "blurring pair admitted");
+            ordinal = 2 + RouteTrial::warmup_frames;
+            kept_window(blurred, 2000, [](TrialSample& t, unsigned) { for (unsigned r = 20; r < 30; ++r) t.contrast[r] = .03f; });
+            check(!blurred.UsesCandidate() && blurred.Comparison().RuledOut(),
+                  "lost detail against the incumbent's picture rolls the keep back");
+        }
+        {
+            PlacementTrial moved;
+            incumbent_seen(moved);
+            check(moved.KeepProvedRoles(scope, true, 1, 1100), "view-change pair admitted");
+            ordinal = 2 + RouteTrial::warmup_frames;
+            kept_window(moved, 2000, [](TrialSample& t, unsigned i) {
+                for (auto& v : t.image) v = .8f;
+                for (unsigned r = 20; r < 30; ++r) t.contrast[r] = .03f;
+                t.change[40].fill(i % 2 ? .25f : -.25f);
+            });
+            check(moved.UsesCandidate(), "a different view is not evidence of damage");
+        }
+        {
+            // A timed trial already measuring the same scope is upgraded
+            // once the signature is recognized.
+            PlacementTrial timed;
+            check(timed.BeginVerified(scope, 1, 100) && timed.OwnsComparison() && !timed.UsesCandidate(),
+                  "timed trial on the ordinary route");
+            check(timed.KeepProvedRoles(scope, true, 5, 200) && timed.KeptByStructure(),
+                  "the recognized signature upgrades it to the structural keep");
+            PlacementTrial other;
+            check(other.BeginVerified(scope, 1, 100) && !other.KeepProvedRoles({32, 41, 3, 12}, true, 5, 200),
+                  "a different scope cannot take over a running comparison");
+        }
     }
     std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
     return failures ? 1 : 0;
