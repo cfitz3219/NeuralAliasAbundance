@@ -165,3 +165,6 @@ Documents/NeuralAlias-SniperElite4-DX12-ddf55beb-SceneDiscovery supersedes the o
 
 ### 2026-11-20 Pacific — Sniper Elite 4 launch recovery
 The ddf55beb-SceneDiscovery package crashed twice before core attachment. Use Documents/NeuralAlias-SniperElite4-DX12-31463de6-FactoryStart. The new profile waits for the game's first successful DXGI factory call to start the host, then enables scene discovery. The generated profile and shipped DLL pass the factory startup check, and upgrade and rollback were verified in a fixture. Game launch and delivery remain to be confirmed by Cort.
+
+### 2026-11-20 Pacific — Sniper Elite 4 resolved-layer jitter
+Cort confirmed that 31463de6 starts and delivers DLAA. The remaining menu windshield buzz returned between the steady reconstructed image and the final display. PR 183 b75bf44f corrects native DX12 subpixel jitter on qualifying depth-tested layers after reconstruction. Six focused regressions passed, including a stationary/moving RTX glint check. The reversible factory-start upgrade from 31463de6 passed with the shipped profile. Current test package is Documents/NeuralAlias-SniperElite4-DX12-b75bf44f-FactoryStart. The in-game windshield result awaits Cort. COMMS and the PR's WORKLOG record the evidence and limits.
