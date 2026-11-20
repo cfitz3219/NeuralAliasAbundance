@@ -643,16 +643,25 @@ int main()
         CHECK(!rg::TakeTrialSample(rejected.ticket, measured));
         // The left and right halves of this reflection change in opposite
         // directions. A single luma mean would miss it entirely.
+        constexpr uint32_t neighbor = 37;
         auto shifting_reflection = output;
+        auto two_reflections = bright;
         for (unsigned y = output.h / 2; y < output.h * 5 / 8; ++y)
-            for (unsigned x = output.w / 2; x < output.w * 5 / 8; ++x)
-                shifting_reflection.v[size_t(y) * output.w + x] *= x < output.w * 9 / 16 ? 1.12f : 1.f / 1.12f;
+            for (unsigned x = output.w * 5 / 8; x < output.w * 6 / 8; ++x) {
+                const bool left = x < output.w * 11 / 16;
+                const size_t at = size_t(y) * output.w + x;
+                shifting_reflection.v[at] *= left ? 1.12f : 1.f / 1.12f;
+                two_reflections.v[at] *= left ? 1.32f : 1.f / 1.32f;
+            }
         auto shifting_screen = ScreenTexture(d, l, rs::ScreenBytes(shifting_reflection), keep);
+        auto two_output = Picture(d, l, two_reflections, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, keep);
+        auto two_screen = ScreenTexture(d, l, rs::ScreenBytes(two_reflections), keep);
         Run(d, l);
         keep.clear();
-        REQUIRE(shifting_screen);
+        REQUIRE(shifting_screen && two_output && two_screen);
         TracePair subregion{t_output.Get(), t_screen.Get(), true, 9539, 70};
-        subregion.recovery_region = 36;
+        subregion.recovery_region = neighbor;
         subregion.recovery_floor = .025f;
         Sleep(150);
         REQUIRE(TakeSample(d, l, ordinal, {unlit_in.Get(), unlit_in.Get(), t_output.Get(), nullptr, shifting_screen.Get()},
@@ -661,7 +670,7 @@ int main()
         std::printf("residual split reflection: region=%u stage=%s stops=%.4f\n", measured.origin.region,
                     StageName(measured.origin.stage), measured.origin.stops[2]);
         CHECK(measured.comparable && measured.origin.stage == FlickerStage::Composition &&
-              measured.origin.region == 36 && std::fabs(measured.origin.stops[2]) > .045f);
+              measured.origin.region == neighbor && std::fabs(measured.origin.stops[2]) > .045f);
         // Even with an independently proved reader, identical input and
         // output pixels give no evidence about which reached the screen.
         TracePair identical{t_output.Get(), t_screen.Get(), true, 2051, 70};
@@ -763,14 +772,18 @@ int main()
         }
         CHECK(regional.Comparison().Regional() && regional.Comparison().Current() == RouteTrial::Phase::Kept);
         // The test reflector alternates about one stop. The alternative either
-        // removes it, delivers the same artifact, or puts the input on screen.
-        for (unsigned mode = 0; mode < 3; ++mode) {
+        // removes it, delivers the same artifact, puts the input on screen, or
+        // removes the strongest flash while leaving a second reflection.
+        for (unsigned mode = 0; mode < 4; ++mode) {
             PlacementTrial placement;
             using Phase = RouteTrial::Phase;
             const auto& trial = placement.Comparison();
+            const bool wide = mode == 3;
+            auto* ordinary_output = wide ? two_output.Get() : lit_out.Get();
+            auto* ordinary_screen = wide ? two_screen.Get() : lit_display.Get();
             TracePair reflection{t_output.Get(), t_screen.Get(), true, 952 + mode * 8u, 70};
             Sleep(150);
-            REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), lit_out.Get(), nullptr, lit_display.Get()},
+            REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), ordinary_output, nullptr, ordinary_screen},
                                got, false, nullptr, nullptr, false, false, false, false, 0, false, &reflection));
             REQUIRE(rg::TakeTrialSample(reflection.ticket, measured));
             CHECK(measured.delivered && !measured.tiles.Mixed());
@@ -783,13 +796,15 @@ int main()
                 const bool bypass = arm == 1 && mode == 2;
                 for (unsigned i = 0; i < RouteTrial::samples && placement.Ticket(ordinal) == ticket; ++i) {
                     const bool reverse = i % 2 != 0;
-                    TracePair trace{!quiet && reverse ? lit_out.Get() : t_output.Get(),
-                                    !quiet && reverse ? lit_display.Get() : t_screen.Get(), true, ticket, 70};
+                    const auto larger = !quiet && !(wide && arm == 1);
+                    auto* active_screen = wide && arm == 1 ? shifting_screen.Get() : larger ? ordinary_screen : t_screen.Get();
+                    TracePair trace{larger && reverse ? ordinary_output : t_output.Get(),
+                                    reverse ? active_screen : t_screen.Get(), true, ticket, 70};
                     Sleep(150);
                     REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(),
-                                      !quiet && !reverse ? lit_out.Get() : t_output.Get(),
+                                      larger && !reverse ? ordinary_output : t_output.Get(),
                                       nullptr, bypass ? t_screen_input.Get() :
-                                      !quiet && !reverse ? lit_display.Get() : t_screen.Get()}, got,
+                                      !reverse ? active_screen : t_screen.Get()}, got,
                                       false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
                     CHECK(!rg::TakeTrialSample(ticket ^ 8u, measured));
                     REQUIRE(rg::TakeTrialSample(ticket, measured));
@@ -801,7 +816,14 @@ int main()
             }
             std::printf("screen trial case %u: %s stops %.3f/%.3f/%.3f (%s)\n", mode, trial.Name(),
                         trial.Baseline(), trial.Candidate(), trial.Confirmation(), trial.Reason());
-            CHECK(trial.Current() == (mode == 0 ? Phase::Kept : Phase::Rejected));
+            CHECK(trial.Current() == (mode == 0 || wide ? Phase::Kept : Phase::Rejected));
+            if (wide) {
+                std::printf("neighbor trial after primary %.1f%%: recovery=%u region=%u original=%.4f\n",
+                            100.f * trial.VerifiedReduction(), unsigned(placement.AllowsStageRecovery()),
+                            placement.RecoveryRegion(), placement.RecoveryBaseline());
+                CHECK(trial.VerifiedReduction() >= .90f && placement.AllowsStageRecovery() &&
+                      placement.RecoveryRegion() == neighbor && placement.RecoveryBaseline() > .20f);
+            }
             if (mode == 0) {
                 ordinal += RouteTrial::warmup_frames + 1;
                 const auto watch = placement.Ticket(ordinal);
