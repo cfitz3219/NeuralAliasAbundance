@@ -128,3 +128,7 @@ PR 176 at 270d7b6b uses one decision policy and adds DX12 rotating-lighting plac
 ### 2026-11-19 Pacific — Shadow of War overlay preferences
 
 PR 177 (323a805e) on top of the shared Referee branch removes the Steady Distant Lighting switch and enables qualified correction automatically. The Replay checkbox is visible but disabled in native DX11 and remains off by default in DX12. Seven focused Release checks passed. The reported distant vibration remains open. See COMMS for the current evidence. Existing live package is 18dea9e.
+
+### 2026-11-20 Pacific — Native DX11 jitter history and Shadow of War pixel audit
+
+PR 178 (01f707b4) resets DLAA once on a confirmed change of sampling mode. Three focused RTX tests passed, preserving the late-reader regression. Saved menu evidence shows DLAA output on the orc's skin, armor, cloth and fur plus a sign reversal in castle brightness after DLAA. COMMS lists the affected captures and distinguishes this from live verification. No updated CMD.
