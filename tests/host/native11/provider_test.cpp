@@ -1201,7 +1201,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             }
             return SUCCEEDED(game.swap->Present(0, 0));
         };
-        Sample baseline, fixed, dim, pinned;
+        Sample baseline, fixed, dim, pinned, pinned_dim;
         for (int i = 0; i < 70; ++i) if (!record(i, true, i < 42 ? nullptr : &baseline)) return 1;
         na::settings::Get().referee_enabled.store(1);
         na::native11::SetScreenCheck(true);
@@ -1298,6 +1298,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         expect(resets() == before_swaps, "actual DLAA and measured-motion histories survive every qualified swap");
         for (int i = 0; i < 56; ++i) if (!record(i, true, i < 28 ? nullptr : &pinned, true)) return 1;
         for (int i = 0; i < 21; ++i) if (!record(i, false, i >= 14 ? &dim : nullptr)) return 1;
+        for (int i = 0; i < 21; ++i) if (!record(i, false, i >= 14 ? &pinned_dim : nullptr, true)) return 1;
         double old_delta = baseline.movement / baseline.comparisons, new_delta = fixed.movement / fixed.comparisons;
         std::printf("fixed-owner control reflection delta=%.4f\n", pinned.movement/pinned.comparisons);
         std::printf("reflection swaps: baseline late=%d/28, delta=%.4f; qualified late=%d/28, submissions=%d, proofs=%d, stable histories=%d, delta=%.4f, display matches=%zu/%zu, light on/off=%.2f/%.2f\n",
@@ -1310,7 +1311,15 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         expect(fixed.changed > 100 && fixed.reached*100 >= fixed.changed*98, "displayed reflection matches real NGX output on differentiated pixels");
         expect(new_delta < 1 && new_delta < old_delta*.25, "stationary reflection stops alternating when the physical buffers swap");
         expect(std::abs(new_delta - pinned.movement/pinned.comparisons) < .25, "swapping and pinned surfaces have the same residual flicker within a quarter of a display level");
-        expect(fixed.brightness/28 > dim.brightness/7 + 20*5376, "an intentionally extinguished reflection still disappears");
+        // Measure the response using this model/runtime on a single physical
+        // owner. Different NVIDIA runtimes can render the same change with
+        // different contrast, even when both deliver the correct result.
+        constexpr double pixels = 5376;
+        const double pinned_drop = (pinned.brightness / 28 - pinned_dim.brightness / 7) / pixels;
+        const double rotating_drop = (fixed.brightness / 28 - dim.brightness / 7) / pixels;
+        std::printf("intentional light change: pinned=%.3f rotating=%.3f display levels\n", pinned_drop, rotating_drop);
+        expect(pinned_drop >= 8 && std::abs(rotating_drop - pinned_drop) <= .10 * pinned_drop,
+               "rotating placement preserves the fixed owner's response when a real light goes out");
         if (reuse_depth) {
             if (!record(0, true, nullptr, false, false, true)) return 1;
             expect(!evaluator.proof, "the lighting reader refuses a depth clear before it consumes the scene");
