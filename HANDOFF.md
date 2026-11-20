@@ -132,3 +132,7 @@ PR 177 (323a805e) on top of the shared Referee branch removes the Steady Distant
 ### 2026-11-20 Pacific — Native DX11 jitter history and Shadow of War pixel audit
 
 PR 178 (01f707b4) resets DLAA once on a confirmed change of sampling mode. Three focused RTX tests passed, preserving the late-reader regression. Saved menu evidence shows DLAA output on the orc's skin, armor, cloth and fur plus a sign reversal in castle brightness after DLAA. COMMS lists the affected captures and distinguishes this from live verification. No updated CMD.
+
+### 2026-11-20 Pacific — Lighting evidence and jitter switch parity
+
+PR 179 (0d8e38fe) takes native DX11 lighting proof before Home, as DX12 already does, and leaves Home in the separate full-screen capture. Two real-NGX RTX tests passed. PR 180 (a72c26d0) implements one jitter-switch history rule across DX11 and DX12, with a Release build and seven further regression passes. Live verification of the castle and a combined package remain open. Technical evidence is in COMMS and the branch WORKLOG.
