@@ -188,7 +188,6 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         const int vj = static_cast<int>(GetPrivateProfileIntW(L"j2", L"viewport_jitter", 1, ini));
         target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
         target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);
-        target.j2_depth_reads.store(GetPrivateProfileIntW(L"j2", L"depth_reads", 0, ini) ? 1u : 0u);
         target.j2_replay_budget.store(GetPrivateProfileIntW(L"j2", L"replay_vertex_budget", 1000000, ini));
         target.j2_replay_movers.store(GetPrivateProfileIntW(L"j2", L"replay_movers", 1, ini) ? 1u : 0u);
         const int cam = static_cast<int>(GetPrivateProfileIntW(L"j2", L"camera", 1, ini));
@@ -415,7 +414,6 @@ bool SaveFromWorker()
     ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", v, ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"jitter_sequence", g_settings.j2_jitter_r2.load() ? L"r2" : L"halton", ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"draw_replay", g_settings.j2_draw_replay.load() ? L"1" : L"0", ini) != 0;
-    ok &= WritePrivateProfileStringW(L"j2", L"depth_reads", g_settings.j2_depth_reads.load() ? L"1" : L"0", ini) != 0;
     swprintf_s(v, L"%d", g_settings.j2_camera.load());
     ok &= WritePrivateProfileStringW(L"j2", L"camera", v, ini) != 0;
     {

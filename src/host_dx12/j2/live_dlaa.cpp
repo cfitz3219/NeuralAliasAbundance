@@ -2665,7 +2665,7 @@ std::shared_ptr<na::observe::ReplayUse> retain_replay(ID3D12GraphicsCommandList*
 void update_depth_reads()
 {
     const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
-    const bool want = running && vpj_mode() && g.jitter_on && na::settings::Get().j2_depth_reads.load(std::memory_order_relaxed) != 0;
+    const bool want = running && vpj_mode() && g.jitter_on;
     static bool on = false;
     if (want && !on) na::observe::SetRasterStateTracking(true);
     on = want;

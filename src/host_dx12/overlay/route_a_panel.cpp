@@ -1099,20 +1099,18 @@ void DrawLiveDlaa()
         if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
         ImGui::EndDisabled();
         EndRow();
-        if (!native) {   // Draw-replay motion on/off (Cort 2026-11-06): live, remembered.
-            na::settings::Settings& rs = na::settings::Get();
-            bool replay = rs.j2_draw_replay.load() != 0;
-            BeginRow("Object motion (draw replay)", "Tests whether replaying matching scene draws reduces smearing on moving objects. Uses extra GPU time and applies live.", S(220));
-            if (ImGui::Checkbox("##drawreplay", &replay)) { rs.j2_draw_replay.store(replay ? 1u : 0u); na::settings::Save(); }
-            EndRow();
-            if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
-        }
         {
             na::settings::Settings& rs = na::settings::Get();
-            bool reads = rs.j2_depth_reads.load() != 0;
-            BeginRow("Steady distant lighting", "Reduces jitter-related flicker in lights and ground marks by correcting the depth the game's lighting reads. Applies live.", S(220));
-            if (ImGui::Checkbox("##depthreads", &reads)) { rs.j2_depth_reads.store(reads ? 1u : 0u); na::settings::Save(); }
+            bool replay = !native && rs.j2_draw_replay.load() != 0;
+            BeginRow("Object motion (draw replay)",
+                     native ? "Draw replay is unavailable on native DirectX 11."
+                            : "Replays matching scene draws to reduce smearing on moving objects. Uses extra GPU time and applies live.",
+                     S(220));
+            ImGui::BeginDisabled(native);
+            if (ImGui::Checkbox("##drawreplay", &replay)) { rs.j2_draw_replay.store(replay ? 1u : 0u); na::settings::Save(); }
+            ImGui::EndDisabled();
             EndRow();
+            if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
         }
         if (!native) {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
             const bool running = na::j2::SmearTestRunning();
