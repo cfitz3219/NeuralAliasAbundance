@@ -751,3 +751,6 @@ Cort's ddf55beb run reached DX12 and Home but selected no scene or depth and eva
 
 ### 2026-11-20 12:05Z — Sol — DONE: Sniper Elite 4 launch recovery package
 The SceneDiscovery install hit the same game executable access violation at startup twice with the same runtime. Both dumps precede core attachment and the start of the discovery adapter. The game imports DXGI before its own entry code. PR 183 at 31463de6 adds an opt-in startup mode that keeps the proxy idle until a successful DirectX factory call. Discovery remains enabled. The generated profile and actual DLL passed both idle and active checks. The replacement and exact rollback passed in an isolated game folder. Documents/NeuralAlias-SniperElite4-DX12-31463de6-FactoryStart supersedes the crashing SceneDiscovery package. Cort owns the game run.
+
+### 2026-11-20 12:06Z — Sol — DONE: Sniper Elite 4 launches with factory-start package
+Cort installed 31463de6 and launched DX12. Observed process 20424 responding, live presents, initialized overlay and active discovery log. The earlier two runs stopped before this point. First observed samples have zero DLAA evaluations. Launch is confirmed; scene placement and DLAA delivery remain open.
