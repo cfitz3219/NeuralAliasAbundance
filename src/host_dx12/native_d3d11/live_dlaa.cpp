@@ -74,6 +74,7 @@ struct Session {
     uint64_t flow_frame = 0;       // the last frame whose picture (flow recording) was really submitted
     uint64_t last_reset_frame = 0; // the newest frame delivered with a DLSS reset
     bool measured_last = false;    // the last delivered frame's motion was measured, not from a camera
+    bool jitter_history = false;   // the sampling mode established in delivered DLAA history
     bool failed = false;
     // VARIANT: dlss/in-companion
     // DLSS runs in the 64-bit companion program instead of in this process (a 32-bit game cannot
@@ -88,7 +89,7 @@ std::atomic<const char*> reason{"Waiting for a native scene."};
 std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
 // WHY log: frames on which DLSS was told to drop its history, by cause. A reset on every frame
 // leaves nothing to accumulate, and the output is then just the jittered frame.
-std::atomic<uint64_t> resets_cut{0}, resets_changed{0}, resets_gap{0};
+std::atomic<uint64_t> resets_cut{0}, resets_changed{0}, resets_gap{0}, resets_jitter_switch{0};
 // VARIANT: motion/measured-total
 // Which supplier gave each delivered frame its motion, and the measured supplier's own resets:
 // no pair yet (the first picture, by compute_flow's Ticket::no_pair code) and a measured scene cut.
@@ -400,9 +401,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     using Tool = referee::RecoveryTool;
     const auto lighting = donut::CurrentOptions();
     const uint32_t preset = settings::Get().j2_preset.load();
+    const bool jitter_requested = j2::Jitter();
     const auto configuration = [&] {
         return referee::EvaluationConfiguration(preset == 255 ? 12u : preset, cf, df, hdr, frame.reversed_depth,
-            camera_setting, measured, j2::Jitter(), j2::flow::Enabled());
+            camera_setting, measured, jitter_requested, j2::flow::Enabled());
     };
     // Settings changes take precedence even between GPU observations.
     const Tool tool = frame.recovery_tool != Tool::None && settings::Get().referee_enabled.load() &&
@@ -482,6 +484,11 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     if (!measured && cam.camera_cut) resets_cut.fetch_add(1, std::memory_order_relaxed);
     else if (measured ? frame.scene_changed : frame.selection_changed) resets_changed.fetch_add(1, std::memory_order_relaxed);
     else if (reset_history) resets_gap.fetch_add(1, std::memory_order_relaxed);
+    // A draw can still carry the previous setting for one frame. Reset on the first picture that
+    // matches the new setting. Occasional missing samples while the setting is unchanged retain history.
+    const bool jitter_switched = s.last_frame && s.jitter_history != jitter_requested &&
+                                 frame.raster.applied == jitter_requested;
+    reset_history |= jitter_switched;
     j2::compute_flow::Ticket flow;
     if (measured || j2::flow::Enabled()) {
         j2::compute_flow::Frame ff;
@@ -835,6 +842,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // This signal retires the slot. The game's subsequent submission can
     // flush it naturally because no effects queue waits on the value.
     if (FAILED(s.fences.SignalNative(&slot.native_done, false))) return FailSession(s, "Native result submission failed.");
+    if (!s.last_frame || jitter_switched) s.jitter_history = frame.raster.applied;
+    if (jitter_switched) resets_jitter_switch.fetch_add(1, std::memory_order_relaxed);
     s.stream = frame.stream;
     s.last_frame = frame.frame;
     s.measured_last = measured;
@@ -946,13 +955,14 @@ int FormatStatus(char* out, size_t capacity)
     // resets (the first picture of a pair, with the last reason code of compute_flow's Ticket::no_pair;
     // a measured scene cut), frames left alone because nothing could be measured, and jitter samples
     // kept in sequence after a frame that was not delivered.
-    int n = std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d history_resets{camera_cut=%llu inputs_changed=%llu frame_gap=%llu} "
+    int n = std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d history_resets{camera_cut=%llu inputs_changed=%llu frame_gap=%llu jitter_switch=%llu} "
                          "camera_setting=%d motion_supplier{camera=%llu measured=%llu} measured{reset_first_picture=%llu last_no_pair=%u reset_scene_cut=%llu unavailable=%llu jitter_kept_after_miss=%llu} \"%s\"",
                          static_cast<unsigned long long>(delivered.load()), last_ms,
                          static_cast<unsigned long long>(busy.load()),
                          static_cast<unsigned long long>(rejected.load()), applied_preset.load(), applied_sharpness.load(),
                          raster_slot.load(), static_cast<unsigned long long>(resets_cut.load()),
                          static_cast<unsigned long long>(resets_changed.load()), static_cast<unsigned long long>(resets_gap.load()),
+                         static_cast<unsigned long long>(resets_jitter_switch.load()),
                          settings::Get().j2_camera.load(std::memory_order_relaxed),
                          static_cast<unsigned long long>(supplied_camera.load()), static_cast<unsigned long long>(supplied_measured.load()),
                          static_cast<unsigned long long>(resets_no_pair.load()), last_no_pair.load(),

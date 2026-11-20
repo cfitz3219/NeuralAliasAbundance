@@ -2504,12 +2504,34 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(std::strstr(status, "preset=13") != nullptr, "NVIDIA DLAA keeps preset M during sixteen-sample R2");
         expect(g_seen.last.camera.jitter_applied && g_seen.jitter_reported >= jitter_before_viewport + 8,
                "the native campaign pose gets real jitter through the viewports");
+        const auto jitter_resets = [&] {
+            na::native_d3d11::FormatStatus(status, sizeof status);
+            const char* count = std::strstr(status, "jitter_switch=");
+            unsigned long long resets = 0;
+            expect(count && sscanf_s(count, "jitter_switch=%llu", &resets) == 1,
+                   "read the native jitter history reset counter");
+            return resets;
+        };
+        const auto before_switch = jitter_resets();
         na::j2::SetJitter(false);
-        present_campaign(); // an already armed sample may still apply to this frame
+        for (int i = 0; i < 2; ++i) {
+            present_campaign(); // an already armed sample may still apply to the first frame
+            const auto wanted = before_switch + (g_seen.last.raster.applied ? 0 : 1);
+            expect(jitter_resets() == wanted, "switch-off resets DLAA with the first unjittered picture");
+        }
         const auto viewport_off = g_seen.jitter_reported;
         for (int i = 0; i < 4; ++i) present_campaign();
         expect(g_seen.jitter_reported == viewport_off, "the jitter switch stops the viewport offsets");
         expect(!g_seen.last.camera.viewport_expanded, "native DLAA returns to the original footprint with jitter off");
+        expect(jitter_resets() == before_switch + 1, "jitter-off pictures keep their new history");
+        na::j2::SetJitter(true);
+        for (int i = 0; i < 5; ++i) {
+            present_campaign();
+            const auto wanted = before_switch + (g_seen.last.raster.applied ? 2 : 1);
+            expect(jitter_resets() == wanted, "switch-on resets DLAA with the first jittered picture");
+        }
+        expect(jitter_resets() == before_switch + 2, "jitter-on pictures keep their new history");
+        na::j2::SetJitter(false);
         na::settings::Get().j2_jitter_r2.store(prior_r2);
         na::settings::Get().j2_preset.store(prior_preset);
 
