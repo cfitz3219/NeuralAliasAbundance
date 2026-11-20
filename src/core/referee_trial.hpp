@@ -421,9 +421,18 @@ public:
             if (!targeted_ && !regional_) {
                 for (uint32_t i = 0; i < regions_.size(); ++i) {
                     auto& evidence = regions_[i];
-                    if (evidence.baseline < minimum_flicker) continue;
                     const TrialSample* pattern = nullptr;
-                    evidence.replacement = Repeated(i, &evidence.pattern, pattern);
+                    const float recurring = Repeated(i, nullptr, pattern);
+                    // Whole-screen peak alone can hide a smaller new flash
+                    // elsewhere once the original strongest one is removed.
+                    if (recurring >= minimum_flicker &&
+                        recurring > evidence.baseline * 1.3f + minimum_flicker / 3.f) {
+                        ruled_out_ = true;
+                        Reject("the replacement introduced or worsened recurring flicker in another area");
+                        return;
+                    }
+                    if (recurring >= FlickerTransition::scoped_minimum && evidence.baseline >= minimum_flicker)
+                        evidence.replacement = Repeated(i, &evidence.pattern, pattern);
                 }
             }
             Next(Phase::ConfirmBaseline, next_frame);

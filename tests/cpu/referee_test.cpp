@@ -710,6 +710,24 @@ int main()
                   std::fabs(wide.RecoveryFloor() - .016f) < .0001f,
                   "the remaining recurring reflection selects its own region and baseline on both APIs");
         }
+        {
+            RouteTrial introduced;
+            introduced.Start(551, 0, 1);
+            uint64_t ordinal = RouteTrial::warmup_frames + 1;
+            for (unsigned arm = 0; arm < 2; ++arm) {
+                ordinal += RouteTrial::warmup_frames + 1;
+                for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
+                    auto sample = placement_sample(ordinal, ordinal + 100, arm == 1, true);
+                    const float sign = i % 2 ? 1.f : -1.f;
+                    sample.change[13].fill(sign * (arm == 0 ? .25f : .01f));
+                    sample.change[40].fill(sign * (arm == 0 ? 0.f : .14f));
+                    introduced.Add(introduced.Ticket(ordinal), sample, ordinal + 1);
+                }
+            }
+            check(introduced.Current() == Phase::Rejected && !introduced.UsesCandidate() &&
+                  std::strstr(introduced.Reason(), "worsened recurring flicker"),
+                  "a smaller newly flashing area vetoes an otherwise impressive replacement");
+        }
         RegionalTiles overlap;
         overlap.Set({3, 12}, 960, 540, {});
         overlap.at[0] = overlap.at[1];
