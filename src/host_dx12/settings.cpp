@@ -144,8 +144,8 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
             // Hidden [j2] anisotropic_filter (no menu control): -1 / auto, 0 / off, 16 / force.
             // The old menu key [j2] anisotropic is not read: a level saved by the removed control
             // must not override automatic filtering.
-            int32_t mode = 0;
-            if (ReadAnisotropicFilter(ini, &mode)) target.af_mode.store(mode);
+            int32_t af_setting = 0;
+            if (ReadAnisotropicFilter(ini, &af_setting)) target.af_mode.store(af_setting);
             else if (!only_if_present) target.af_mode.store(-1);
         }
         {
