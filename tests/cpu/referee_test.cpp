@@ -520,19 +520,19 @@ int main()
         exercise(.07f, .24f, false, true, 0.f, Phase::Rejected);
         exercise(.04f, .24f, false, false, .32f, Phase::Rejected);
         {
-            std::array<float, kThumbFloats> before{}, after{};
+            std::array<float, kThumbFloats> original_view{}, lit_view{};
             for (unsigned y = 0; y < kThumbH; ++y) for (unsigned x = 0; x < kThumbW; ++x) {
                 const unsigned i = y * kThumbW + x;
-                before[i] = std::sin(.73f*x + .41f*y);
-                after[i] = before[i] + .08f + (x >= 64 && x < 80 && y >= 18 && y < 27 ? .22f : 0.f);
+                original_view[i] = std::sin(.73f*x + .41f*y);
+                lit_view[i] = original_view[i] + .08f + (x >= 64 && x < 80 && y >= 18 && y < 27 ? .22f : 0.f);
             }
             TrialSample s;
-            check(MeasureTrialScreen(before.data(), after.data(), s) && s.broad_light &&
+            check(MeasureTrialScreen(original_view.data(), lit_view.data(), s) && s.broad_light &&
                   s.quiet_regions < FlickerTransition::count * 3 / 4 &&
                   std::fabs(TrialMagnitude(s.change[20]) - .30f) < .001f,
                   "bright regions with the same structure preserve the raw magnitude for a proved lighting reader");
-            for (unsigned i = 0; i < kThumbFloats; ++i) after[i] = before[i] + .08f;
-            check(!MeasureTrialScreen(before.data(), after.data(), s) && !s.broad_light,
+            for (unsigned i = 0; i < kThumbFloats; ++i) lit_view[i] = original_view[i] + .08f;
+            check(!MeasureTrialScreen(original_view.data(), lit_view.data(), s) && !s.broad_light,
                   "uniform exposure change alone cannot start a local lighting correction");
         }
         // A stationary two-region bypass has no flash. Exercise the actual trial transitions.
