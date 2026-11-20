@@ -456,10 +456,7 @@ void collect_sample()
                 trial.bypassed = vote == shadow::ScreenVote::Input;
                 trial.delivered = vote == shadow::ScreenVote::Output;
             }
-            if (g.trace_geometry && vote == shadow::ScreenVote::Output &&
-                EdgeCorrelation(samples + kTraceOffset + 2 * kThumbFloats,
-                    g.padded_layouts ? samples + kTraceOffset + 3 * kThumbFloats : samples + BlockOffset(kThumbScreen),
-                    kThumbW, kThumbH) >= .90f) {
+            if (g.trace_geometry && trial.delivered && trial.comparable) {
                 const float* earlier = samples + kGeometryOffset;
                 const float* earlier_screen = earlier + (2 + (layout ? layout - 1 : 0)) * kTileFloats;
                 const float* present = screen_tiles ? screen_tiles : samples + BlockOffset(kTileScreen);
@@ -792,7 +789,7 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
         g.img[kPrevOutput].desc.Format == g.img[kOutput].desc.Format &&
         g.img[kPrevScreen].desc.Width == sw && g.img[kPrevScreen].desc.Height == shh &&
         g.img[kPrevScreen].desc.Format == g.img[kScreen].desc.Format;
-    g.trace_geometry = g.trace_pair && g.pre_ordinal + 1 == g.main_ordinal &&
+    g.trace_geometry = g.trace_pair && g.adjacent && g.trial_adjacent &&
         g.img[kPrev].desc.Width == iw && g.img[kPrev].desc.Height == ih &&
         g.img[kPrev].desc.Format == g.img[kInput].desc.Format &&
         std::hypot(g.main_jitter[0] - g.pre_jitter[0], g.main_jitter[1] - g.pre_jitter[1]) >= .25f;

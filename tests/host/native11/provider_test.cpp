@@ -891,7 +891,7 @@ int DepthReadFixture(Game& g, bool debug_layer)
 
 int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[maybe_unused]] bool rotating_lights = false,
                        [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false,
-                       [[maybe_unused]] bool reuse_depth = false)
+                       [[maybe_unused]] bool reuse_depth = false, [[maybe_unused]] bool physical_lighting = false)
 {
     struct Surface {
         ComPtr<ID3D11Texture2D> picture;
@@ -1056,7 +1056,8 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         if (!box_code || FAILED(game.device->CreatePixelShader(box_code->GetBufferPointer(), box_code->GetBufferSize(), nullptr, &letterbox))) return 1;
         evaluator.peer = peer.picture.Get();
         evaluator.expected_reader = game.padded_hdr ? other_canvas.rtv.Get() : game.back_rtv.Get();
-        auto blob = Compile(compare_routes ? "ps_trial_light" : "ps_reflection", "ps_5_0");
+        const bool staged_flash = compare_routes && !physical_lighting;
+        auto blob = Compile(staged_flash ? "ps_trial_light" : "ps_reflection", "ps_5_0");
         auto vertex = Compile("vs_reflection", "vs_5_0");
         ComPtr<ID3D11VertexShader> lit_vs;
         ComPtr<ID3D11PixelShader> reflection;
@@ -1064,7 +1065,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             !vertex || FAILED(game.device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &lit_vs))) return 1;
         ComPtr<ID3D11PixelShader> trial_surface, trial_screen;
         ComPtr<ID3D11Buffer> trial_flash;
-        if (compare_routes) {
+        if (staged_flash) {
             auto surface = Compile("ps_trial_surface", "ps_5_0");
             auto screen_shader = Compile("ps_trial_screen", "ps_5_0");
             const D3D11_BUFFER_DESC flags{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
@@ -1106,7 +1107,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             c->OMSetDepthStencilState(nullptr, 0);
             ID3D11RenderTargetView* layers[]{canvas.rtv.Get(), second_output.rtv.Get()};
             c->OMSetRenderTargets(2, layers, game.dsv.Get());
-            c->PSSetShader(compare_routes ? trial_surface.Get() : game.ps_scene.Get(), nullptr, 0);
+            c->PSSetShader(staged_flash ? trial_surface.Get() : game.ps_scene.Get(), nullptr, 0);
             for (int n = 0; n < 34; ++n) c->Draw(4, 0);
             // Keep the depth test active against the layer depth and draw coplanar fullscreen lighting.
             c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
@@ -1137,7 +1138,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                 screen_vp.Height += 3;
                 c->RSSetViewports(1, &screen_vp);
                 reader(game.back_rtv.Get(), other_canvas.srv.Get(), letterbox.Get());
-            } else if (compare_routes) {
+            } else if (staged_flash) {
                 // This fixture deliberately flashes one region when DLAA has
                 // already evaluated the early surface. The controlled path
                 // uses the same final shader and resources for every frame.
@@ -1268,7 +1269,8 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                         static_cast<unsigned long long>(stats.trial_pairs), static_cast<unsigned long long>(stats.trial_comparable));
             expect(fixed.correct == 28 && fixed.proven == 28 && fixed.displayed_readers == 28,
                    "the actual provider keeps the improved screen-proved route");
-            expect(fixed.changed > 100 && fixed.reached * 100 >= fixed.changed * 98 && new_delta < old_delta * .25,
+            expect(fixed.changed > 100 && fixed.reached * 100 >= fixed.changed * 98 &&
+                new_delta < old_delta * (physical_lighting ? .10 : .25),
                    "real NGX reaches the screen and the reflected light stops flickering");
             auto& sharpness = na::settings::Get().j2_sharpness;
             const auto previous_sharpness = sharpness.load();
@@ -1649,10 +1651,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
     const bool padded_hdr = argc > 1 && std::strcmp(argv[1], "--lit-role-padded") == 0;
+    const bool physical_lighting = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-physical") == 0;
     const bool trial_reused_depth = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-reused-depth") == 0;
-    const bool reuse_depth = trial_reused_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role-reused-depth") == 0);
+    const bool reuse_depth = trial_reused_depth || physical_lighting || (argc > 1 && std::strcmp(argv[1], "--lit-role-reused-depth") == 0);
     const bool composition_fault = argc > 1 && std::strcmp(argv[1], "--composition-recovery") == 0;
-    const bool compare_routes = composition_fault || trial_reused_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
+    const bool compare_routes = composition_fault || trial_reused_depth || physical_lighting ||
+        (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
     wchar_t exe[MAX_PATH]{};
@@ -1744,7 +1748,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (g_failed) return 1;
     if (adaptive || rotating_lights) {
         na::j2::SetJitter(true);
-        const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes, composition_fault, reuse_depth);
+        const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes,
+                                               composition_fault, reuse_depth, physical_lighting);
         DeleteFileW(ini.c_str());
         std::fflush(stdout);
         ExitProcess(result);

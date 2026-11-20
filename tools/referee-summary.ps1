@@ -57,8 +57,9 @@ function Get-RefereeSummary([string[]] $Lines) {
     $traces = @($Lines | Where-Object { $_ -match '\breferee_trace\s+frames=\d+,\d+ first_stage=(input|reconstruction|composition) ' })
     $trials = @($Lines | Where-Object { $_ -match '\b(?:native11|dx12)_route_trial next_frame=\d+ phase=' })
     $recovery = @($Lines | Where-Object { $_ -match '\breferee_recovery frame=\d+ first_stage=' })
+    $jitterGeometry = $Lines | Where-Object { $_ -match '\breferee_jitter_geometry frame=' } | Select-Object -Last 1
     $composite = $Lines | Where-Object { $_ -match '\breferee_composite frame=\d+ path=' } | Select-Object -Last 1
-    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite) {
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry) {
         $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
@@ -85,9 +86,9 @@ function Get-RefereeSummary([string[]] $Lines) {
     if ($composite -match 'input_xy=(\d+,\d+) control_xy=(\d+,\d+) tile_size=(\d+)') {
         $out.Add("  Repeated regional difference. A $($Matches[3])-pixel tile at ($($Matches[1])) matched the input. A control at ($($Matches[2])) matched the reconstructed picture.")
     }
-    if ($trials -and $trials[-1] -match '\bphase=(\w+) region=(\d+) stops=([^ ]+)(?: regional=(\d+))? why=(.*)$') {
+    if ($trials -and $trials[-1] -match '\bphase=(\w+) region=(\d+) stops=([^ ]+)(?: regional=(\d+))?(?: verified_reduction=([-\d.]+))? why=(.*)$') {
         $regional = $Matches[4] -eq '1'
-        $why = $Matches[5]
+        $why = $Matches[6]
         $stops = $Matches[3]
         $trialState = switch ($Matches[1]) {
             'kept' { 'Replacement kept' }
@@ -97,6 +98,11 @@ function Get-RefereeSummary([string[]] $Lines) {
         $out.Add("  $trialState. $why")
         if ($regional) { $out.Add('  The comparison follows the same disputed tiles and clear controls through the ordinary route, replacement, and ordinary retest.') }
         else { $out.Add("  Compared brightness change in stops (ordinary / replacement / ordinary retest): $stops.") }
+        if ($Matches[1] -eq 'kept' -and $Matches[5] -and [double]$Matches[5] -ge 0) {
+            $reduction = [double]$Matches[5]
+            $goal = if ($reduction -ge .90) { 'met the 90% target' } else { 'below the 90% target' }
+            $out.Add(('  Measured {0:P1} less brightness variation in the affected region, {1}.' -f $reduction, $goal))
+        }
     }
     if ($layerOrder) { $out.Add($layerOrder) }
     if ($recovery) {
@@ -106,15 +112,21 @@ function Get-RefereeSummary([string[]] $Lines) {
             directly_measured_motion = 'directly measured motion'; reduce_sharpening = 'reduced sharpening'
         }
         foreach ($line in $recovery) {
-            if ($line -notmatch 'first_stage=(\w+) region=(\d+) tool=(\w+) phase=(kept|restored|no_matching_tool) ruled_out=\d+ stops=([\d./-]+) why=(.*)$') { continue }
-            $stage, $region, $tool, $phase, $measurements, $why = $Matches[1], $Matches[2], $Matches[3], $Matches[4], $Matches[5], $Matches[6]
+            if ($line -notmatch 'first_stage=(\w+) region=(\d+) tool=(\w+) phase=(kept|restored|no_matching_tool) ruled_out=\d+ stops=([\d./-]+)(?: reduction=([-\d.]+) total=([-\d.]+))? why=(.*)$') { continue }
+            $stage, $region, $tool, $phase, $measurements, $why = $Matches[1], $Matches[2], $Matches[3], $Matches[4], $Matches[5], $Matches[8]
             if ($phase -eq 'no_matching_tool') { $out.Add("  Region $region, $stage. $why."); continue }
             $result = if ($phase -eq 'kept') { 'Kept' } else { 'Restored the previous settings after trying' }
             $out.Add("  Region $region, $stage. $result $($names[$tool]). $why. Brightness change (ordinary / trial / recheck) $measurements.")
+            if ($phase -eq 'kept' -and $Matches[7] -and [double]$Matches[7] -ge 0) {
+                $out.Add(('  Both corrections reduced the original flicker by {0:P1} in the same region.' -f [double]$Matches[7]))
+            }
         }
         if ($recovery[-1] -match 'tool=(\w+) phase=(baseline|replacement|baseline_recheck) ') {
             $out.Add("  Comparison still in progress at the last observation for '$($names[$Matches[1]])'.")
         }
+    }
+    if ($jitterGeometry -match 'tile_xy=(\d+,\d+) samples=(\d+) phase_residual_screen_px=([\d.]+) phase_residual_dlaa_px=([\d.]+)' -and [double]$Matches[3] -gt 0) {
+        $out.Add("  Jitter-aligned edge movement measured at ($($Matches[1])) on $($Matches[2]) pairs. Screen $($Matches[3]) px, DLAA output $($Matches[4]) px.")
     }
     $placements = @($Lines | Where-Object { $_ -match '(^|\s)native11_placement\s' })
     if ($placements) {
