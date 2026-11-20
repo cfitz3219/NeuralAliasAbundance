@@ -9,6 +9,7 @@ param([ValidateSet('Deploy','Rollback','Results')] [string] $Action = 'Deploy',
     [string] $DocumentsDirectory = (Join-Path $env:USERPROFILE 'Documents'),
     [string] $EvidenceRoot = (Join-Path $env:LOCALAPPDATA 'NeuralAlias\runs'),
     [ValidateSet('Native11','Auto')] [string] $GraphicsApi = 'Native11',
+    [switch] $StartAfterFactory,
     [string[]] $AlsoClose = @())
 $ErrorActionPreference = 'Stop'
 if ($Label -notmatch '^[A-Za-z0-9-]{1,40}$') { throw 'Label must be letters, digits and dashes.' }
@@ -171,6 +172,7 @@ try {
 build_commit=$commit
 executable=$Exe
 graphics_api=$(if ($autoApi) { 'auto' })
+start_after_factory=$(if ($StartAfterFactory) { 1 } else { 0 })
 startup_log=$Evid\startup.log
 status_log=$Evid\status.log
 enabled=1

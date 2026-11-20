@@ -23,13 +23,17 @@ template<class Function> Function resolve(const char* name) {
     return module?reinterpret_cast<Function>(GetProcAddress(module,name)):nullptr;
 }
 HRESULT factory(const char* name,REFIID iid,void** result) {
-    na::host::WaitForObserveInstall(); // G3-03: game objects created under observation
+    const bool deferred = na::host::FactoryStartupDeferred();
+    if (!deferred) na::host::WaitForObserveInstall();
     if(!result) return E_POINTER;
     *result=nullptr;
     using Function=HRESULT(WINAPI*)(REFIID,void**);
     const auto function=resolve<Function>(name);
     if(!function) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
-    factories.fetch_add(1,std::memory_order_relaxed);return function(iid,result);
+    factories.fetch_add(1,std::memory_order_relaxed);
+    const HRESULT status = function(iid,result);
+    if (deferred && SUCCEEDED(status)) na::host::StartAfterFactory();
+    return status;
 }
 }
 extern "C" HRESULT WINAPI AbundanceCreateDXGIFactory(REFIID iid,void** result) {
@@ -39,13 +43,17 @@ extern "C" HRESULT WINAPI AbundanceCreateDXGIFactory1(REFIID iid,void** result) 
     return factory("CreateDXGIFactory1",iid,result);
 }
 extern "C" HRESULT WINAPI AbundanceCreateDXGIFactory2(UINT flags,REFIID iid,void** result) {
-    na::host::WaitForObserveInstall(); // G3-03
+    const bool deferred = na::host::FactoryStartupDeferred();
+    if (!deferred) na::host::WaitForObserveInstall();
     if(!result) return E_POINTER;
     *result=nullptr;
     using Function=HRESULT(WINAPI*)(UINT,REFIID,void**);
     const auto function=resolve<Function>("CreateDXGIFactory2");
     if(!function) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
-    factories.fetch_add(1,std::memory_order_relaxed);return function(flags,iid,result);
+    factories.fetch_add(1,std::memory_order_relaxed);
+    const HRESULT status = function(flags,iid,result);
+    if (deferred && SUCCEEDED(status)) na::host::StartAfterFactory();
+    return status;
 }
 extern "C" HRESULT WINAPI AbundanceDXGIGetDebugInterface1(UINT flags,REFIID iid,void** result) {
     if(!result) return E_POINTER;
@@ -85,7 +93,7 @@ extern "C" int __cdecl AbundanceQueryProxyStatus(abundance::ProxyStatus* status)
 BOOL WINAPI DllMain(HINSTANCE instance,DWORD reason,LPVOID reserved) {
     if(reason==DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
-        na::host::StartFromIni(instance,L"NeuralAliasHost.ini","ROUTE B");
+        na::host::StartFromIni(instance,L"NeuralAliasHost.ini","ROUTE B",true);
     }
     if(reason==DLL_PROCESS_DETACH && reserved) na::host::NotifyProcessExit(); // before the CRT's static teardown
     return TRUE;

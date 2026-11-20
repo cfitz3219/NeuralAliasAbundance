@@ -4,8 +4,8 @@
 //
 // Activation is ini-gated exactly like the SL proxy: `<ini_name>` next to
 // the DLL with `[host] enabled=1`. Without it the proxy stays a pure
-// forwarder with zero hooks. Everything runs on an init thread spawned from
-// DllMain (no work under the loader lock): pin the module, hooking core,
+// forwarder with zero hooks. The init thread can be spawned at DLL attachment
+// or when the application creates its first DXGI factory: pin the module, hooking core,
 // settings, overlay scale/fonts, adapter prepare, overlay Start (which owns
 // the swap-chain/queue hooks and the discovery thread), adapter start.
 #pragma once
@@ -16,9 +16,12 @@
 
 namespace na::host {
 
-// Spawns the init thread when the ini enables the host. Returns true when a
-// thread was started (the ini exists and enables the host).
-bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag);
+// Arms or starts host initialization according to the application's profile.
+// Only the proxy supplies a DXGI factory callback for deferred startup.
+bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag,
+                  bool has_factory_callback = false);
+bool FactoryStartupDeferred();
+void StartAfterFactory();
 // DLL_PROCESS_DETACH at process exit (lpReserved != nullptr), before the CRT destroys
 // statics: late D3D12 releases from exit-time destructors must not touch observe's tables.
 void NotifyProcessExit();
