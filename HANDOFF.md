@@ -110,3 +110,5 @@ Use Documents/NeuralAlias-ShadowOfWar-Combined-55527b0/02-INSTALL-ShadowOfWar.cm
 ### 2026-11-19 — DX12 Referee placement comparison
 
 PR 174 at 7bb6b815 adds the qualified separate-list alternative and screen comparison to DX12, on top of PR 173. It checks the actual qualified first reader and scopes the trial to the scene and evaluation settings. A failed comparison restores normal selection. The first missing candidate can cost one DLAA frame if the incumbent inline list has already closed. Results parser regression passed. The Windows CI check and eventual game validation are separate. Shadow of War was open, so local compilation, GPU tests and installation were deferred.
+
+Final branch head 9912d332 adds reader-role qualification before nomination and rules out earlier reads when a later list writes the selected scene again. GitHub Actions run 44659158634 passed all four jobs, including the controlled DX12 screen comparison on both Windows x64 configurations. Linux 63, Windows without the SDK 155, Windows with the public SDK 204 passed and one skipped NR runtime probe. See PR 174 for the code and COMMS for the exact pixel witnesses.
