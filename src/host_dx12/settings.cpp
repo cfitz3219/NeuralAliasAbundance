@@ -522,7 +522,8 @@ bool PollHiddenSettings()
 {
     // Live without a menu or restart (Cort: no restarts for any setting): the hidden key is
     // re-read when either ini file changes, checked at most once a second.
-    static std::mutex m;
+    // Never destroyed: the discovery thread may still poll while the process exits.
+    static std::mutex& m = *new std::mutex();
     static ULONGLONG last_check = 0;
     static FILETIME seen[2] = {};
     std::lock_guard<std::mutex> lk(m);
