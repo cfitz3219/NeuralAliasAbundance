@@ -1023,10 +1023,13 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             static_cast<unsigned long long>(sample.ordinal), static_cast<unsigned long long>(ticket),
             sample.delivered, sample.comparable, na::referee::StageName(sample.origin.stage), sample.origin.region,
             unsigned(sample.tools), unsigned(sample.applied));
+        if (!sample.comparable)
+            std::printf("noncomparable picture: edge agreement %.3f, quiet regions %u\n",
+                        sample.screen_structure, sample.quiet_regions);
         return true;
     };
     if (!na::native11::Install(game.device.Get(), consume, &evaluator, compare_routes,
-            composition_fault ? recovery_evidence : compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
+            composition_fault || physical_lighting ? recovery_evidence : compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
 #else
     if (!na::native11::Install(game.device.Get(), consume, &evaluator)) return 1;
 #endif

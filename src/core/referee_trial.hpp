@@ -75,6 +75,8 @@ struct TrialSample {
     shadow::Context context;
     shadow::Placement alternate;
     bool comparable = true;
+    float screen_structure = 0.f;
+    unsigned quiet_regions = 0;
     FlickerTransition origin{};
     uint8_t tools = 0, applied = 0; // intersection of the two submitted recordings
     float motion_error = -1; // mean declared-motion patch error over textured screen points
@@ -102,7 +104,8 @@ inline int TrialDirection(const TrialSample::Change& a, const TrialSample::Chang
 inline bool MeasureTrialScreen(const float* before, const float* after, TrialSample& sample)
 {
     using Region = FlickerTransition;
-    if (!(EdgeCorrelation(before, after, kThumbW, kThumbH) >= .90f)) return false;
+    sample.screen_structure = EdgeCorrelation(before, after, kThumbW, kThumbH);
+    if (!(sample.screen_structure >= .90f)) return false;
     constexpr unsigned n = TrialSample::subdivisions;
     constexpr unsigned cols = Region::columns * n, rows = Region::rows * n;
     static_assert(kThumbW % cols == 0 && kThumbH >= rows);
@@ -133,8 +136,9 @@ inline bool MeasureTrialScreen(const float* before, const float* after, TrialSam
     }
     for (auto& value : sample.image) value *= float(Region::count) / kThumbFloats;
     for (auto& value : sample.contrast) value *= float(Region::count) / kThumbFloats;
-    return std::count_if(sample.change.begin(), sample.change.end(), [](const auto& region) { return TrialMagnitude(region) < .055f; }) >=
-        Region::count * 3 / 4;
+    sample.quiet_regions = static_cast<unsigned>(std::count_if(sample.change.begin(), sample.change.end(),
+        [](const auto& region) { return TrialMagnitude(region) < .055f; }));
+    return sample.quiet_regions >= Region::count * 3 / 4;
 }
 
 // VARIANT: referee/controlled-route-trial
