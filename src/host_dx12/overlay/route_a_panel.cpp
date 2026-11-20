@@ -1522,7 +1522,7 @@ static void DrawDonutLighting()
 static void DrawAmbientOcclusion()
 {
     using namespace na::ui;
-    constexpr char ao_tip[] = "For natural-looking shadows, turn off the game's ambient occlusion (HBAO+, SSAO, or similar) when using XeGTAO.";
+    constexpr char ao_tip[] = "Disable in-game Ambient Occlusion before enabling XeGTAO";
     auto& s=na::settings::Get();bool enabled=s.xegtao_enabled.load()!=0;
     const ImGuiID xegtao_popup=ImGui::GetID("XeGTAO settings"); // outside the row: see DrawDonutLighting
     BeginRow("XeGTAO (Ambient Occlusion)", "Adds soft shading around corners and where objects meet.", S(220), ao_tip);
