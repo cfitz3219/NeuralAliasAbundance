@@ -268,7 +268,17 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         REQUIRE(geo.Create(dev) && post.Create(dev));
         REQUIRE(SUCCEEDED(geo.list->Close()) && SUCCEEDED(post.list->Close()));
         uint32_t fed_frames = 0, pending_ok = 0, late_masked = 0;
+        // Learning which draws move by themselves (core/replay_movers.hpp). Up to frame 207 the
+        // camera given to the pass is still, so the triangle's one-pixel step is its own: it becomes
+        // a mover. From 209 the camera makes that same step, so the triangle is seen and not apart.
+        na::observe::SetDrawReplayMovers(true);
+        uint64_t apart_mid = 0, visible_mid = 0, movers_mid = 0, apart_end = 0, visible_end = 0;
         for (uint32_t frame = 200; frame < 216; ++frame) {
+            na::j2::replay_motion::Reference learn;
+            learn.mode = 1;
+            learn.apart_px = 0.5f;
+            learn.matrix[0] = learn.matrix[5] = learn.matrix[10] = learn.matrix[15] = 1.f;
+            if (frame >= 209) learn.matrix[12] = (frame % 2 ? -1.f : 1.f) * 2.f / float(w);
             na::nr::native::Reset(geo.list.Get());geo.Reset();
             na::nr::native::Reset(post.list.Get());post.Reset();
             const float jitter[2] = { frame % 2 ? .375f : -.25f, frame % 2 ? -.375f : .25f };
@@ -301,8 +311,16 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
             if (submit_first) { na::nr::native::Submission s1(d.queue.Get(), 1, gl); d.queue->ExecuteCommandLists(1, gl); }
             const na::j2::replay_motion::Output output = [&] {
                 const na::observe::HostWorkScope host;
-                return pass.Record(post.list.Get(), d.queue.Get(), depth.Get(), w, h, false, false, jitter);
+                return pass.Record(post.list.Get(), d.queue.Get(), depth.Get(), w, h, false, false, jitter, &learn);
             }();
+            if (frame == 209 || frame == 215) { // Record has just read back every earlier frame's counts
+                const auto learned = pass.GetStats();
+                if (frame == 209) {
+                    na::observe::DrawReplayStats m{};
+                    na::observe::GetDrawReplayStats(&m);
+                    apart_mid = learned.learn_apart; visible_mid = learned.learn_visible; movers_mid = m.movers;
+                } else { apart_end = learned.learn_apart; visible_end = learned.learn_visible; }
+            }
             if (output.motion) {
                 ++fed_frames;
                 ID3D12Resource* textures[] = {output.motion, output.valid};
@@ -361,6 +379,12 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         CHECK(fed_frames >= 15); // 200 has no previous
         CHECK(pending_ok == 2);
         CHECK(late_masked == 2);
+        std::printf("learning: still camera seen %llu apart %llu movers %llu; camera making the same step seen %llu apart %llu\n",
+                    (unsigned long long)visible_mid, (unsigned long long)apart_mid, (unsigned long long)movers_mid,
+                    (unsigned long long)(visible_end - visible_mid), (unsigned long long)(apart_end - apart_mid));
+        CHECK(apart_mid >= 6 && movers_mid == 1);                     // its own step, seen on several frames: a mover
+        CHECK(visible_end > visible_mid && apart_end == apart_mid);   // the camera's step: seen, never apart
+        na::observe::SetDrawReplayMovers(false);
     }
     test::ComPtr<ID3D12InfoQueue> messages;
     if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&messages)))) {

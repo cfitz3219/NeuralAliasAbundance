@@ -44,6 +44,18 @@ inline bool operator==(const StartSlot& a, const StartSlot& b)
 }
 inline bool operator!=(const StartSlot& a, const StartSlot& b) { return !(a == b); }
 
+// The same lens: both of its scales, the horizontal one as much as the vertical one.
+// Until 2026-11-17 only the vertical scale was compared. Cort's Sniper Elite Resistance captures of
+// that day (build 3621e3a8) hold a matrix that is no camera of the scene picture at all: vertical
+// scale 2.096 beside the camera's 2.145, the same forward direction, a position 0.23 away, and a
+// horizontal scale of 0.0027 where the camera's is 0.898 (its x axis lies along the view direction).
+// ContinuesCamera admitted it on 3 of 30 captured frames and it was held for 5 more; reprojecting
+// with it moved every pixel by thousands of pixels in one frame.
+inline bool SameLens(const VpGeometry& last, const VpGeometry& v)
+{
+    return std::abs(v.sy - last.sy) <= 0.05 * std::abs(last.sy) && std::abs(v.sx - last.sx) <= 0.05 * std::abs(last.sx);
+}
+
 // Two consecutive frames of one camera: nearly the same direction, a bounded
 // step, the same lens.
 inline bool StartContinues(const Matrix& a, const Matrix& b)
@@ -55,7 +67,7 @@ inline bool StartContinues(const Matrix& a, const Matrix& b)
         dot += u.forward[j] * v.forward[j];
         d2 += (u.position[j] - v.position[j]) * (u.position[j] - v.position[j]);
     }
-    return dot > 0.9 && d2 <= 2500.0 && std::abs(u.sy - v.sy) <= 0.05 * std::abs(v.sy);
+    return dot > 0.9 && d2 <= 2500.0 && SameLens(v, u);
 }
 
 // The first main camera, proven by persistence instead of an inverse pair.
@@ -105,7 +117,23 @@ inline bool ContinuesCamera(const VpGeometry& last, const Matrix& m)
         d2 += (v.position[j] - last.position[j]) * (v.position[j] - last.position[j]);
         len2 += last.position[j] * last.position[j];
     }
-    return dot > 0.98 && std::abs(v.sy - last.sy) <= 0.05 * std::abs(last.sy) && d2 <= 0.01 * len2 + 100.0;
+    return dot > 0.98 && SameLens(last, v) && d2 <= 0.01 * len2 + 100.0;
+}
+
+// For the logs: `m` continues `last` in direction and place and is refused for its lens alone.
+inline bool ContinuesButForLens(const VpGeometry& last, const Matrix& m, VpGeometry* seen = nullptr)
+{
+    VpGeometry v{};
+    if (!DecomposeViewProjection(m, v)) return false;
+    double dot = 0, d2 = 0, len2 = 0;
+    for (int j = 0; j < 3; ++j) {
+        dot += v.forward[j] * last.forward[j];
+        d2 += (v.position[j] - last.position[j]) * (v.position[j] - last.position[j]);
+        len2 += last.position[j] * last.position[j];
+    }
+    if (!(dot > 0.98 && d2 <= 0.01 * len2 + 100.0) || SameLens(last, v)) return false;
+    if (seen) *seen = v;
+    return true;
 }
 
 // Direction and lens only: for comparing a matrix that carries the camera position with one that has
@@ -116,7 +144,7 @@ inline bool ContinuesView(const VpGeometry& last, const Matrix& m)
     if (!DecomposeViewProjection(m, v)) return false;
     double dot = 0;
     for (int j = 0; j < 3; ++j) dot += v.forward[j] * last.forward[j];
-    return dot > 0.98 && std::abs(v.sy - last.sy) <= 0.05 * std::abs(last.sy);
+    return dot > 0.98 && SameLens(last, v);
 }
 
 // The matrix has the camera position removed (the game renders relative to the

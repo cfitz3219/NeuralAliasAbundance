@@ -14,6 +14,7 @@
 //   - overrides; route changes bump the history generation exactly once
 // Self-contained (no D3D12): also compiles with a host compiler for quick checks.
 #include "host_dx12/j2/route_selector.hpp"
+#include "host_dx12/j2/insertion_trace.hpp"
 
 #include <cstdio>
 #include <vector>
@@ -95,6 +96,28 @@ int main()
         CHECK(rs.Current().route == Route::Inline && rs.Current().history_generation == gen);
         CHECK(rs.Current().placement_consistent == 8 && rs.Current().contradictions == 0);
         CHECK(!rs.Current().contribution_established); // no lineage observed: unknown, not assumed
+    }
+    // The consumer can be inline every frame while its exact writer never repeats.
+    {
+        RouteSelector rs;
+        RouteSelector barriers;
+        for (uint64_t sig = 1; sig <= 120; ++sig) {
+            InsertionTrace trace;
+            trace.Add({1, 0, sig, true, Op::DrawWrite});
+            trace.Add({1, 0, UINT64_MAX, false, Op::Barrier});
+            ListSummary structure = scene_and_post(sig);
+            structure.consumed_after_last_write = trace.Analyze(1).consumed_after_last_write;
+            barriers.OnFrame(frame({structure}));
+            trace.Add({1, 2, sig, false, Op::ComputeRead});
+            structure.consumed_after_last_write = trace.Analyze(1).consumed_after_last_write;
+            rs.OnFrame(frame({structure}));
+            trace.Add({1, 0, sig, true, Op::DrawWrite});
+            CHECK(!trace.Analyze(1).consumed_after_last_write);
+            if (sig == 3) CHECK(rs.Current().route == Route::Inline);
+        }
+        CHECK(rs.Current().route == Route::Inline && rs.Current().signature == 120);
+        CHECK(rs.Current().route_changes == 1 && rs.Current().unstable_windows == 0);
+        CHECK(barriers.Current().route == Route::None && barriers.Current().route_changes == 0);
     }
     // 6. Contradiction: the scene was written again after our insertion.
     {
@@ -189,9 +212,16 @@ int main()
     {
         ListSummary clear;
         clear.color_writes = 1;
-        clear.clears_color = true;
+        InsertionTrace trace;
+        trace.Add({70, 0, 0, true, Op::ClearWrite});
+        CHECK(!trace.Analyze(70).cleared_full_view);
+        trace.Add({70, 0, 0, true, Op::FullViewClear});
+        clear.clears_color = trace.Analyze(70).cleared_full_view;
+        CHECK(clear.clears_color);
         const auto o = frame({scene_and_post(17), clear});
         CHECK(!o.boundary_inside_list && o.inline_signature == 0);
+        CHECK(!frame({scene_and_post(17), clear, reader()}).consumer_in_later_list);
+        CHECK(frame({scene_and_post(17), clear, scene_list(), reader()}).consumer_in_later_list);
         ListSummary composite;
         composite.color_writes = 1;
         const auto o2 = frame({scene_and_post(17), composite});

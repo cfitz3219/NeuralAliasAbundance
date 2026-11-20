@@ -30,6 +30,7 @@
 #include <cmath>
 #include <string>
 
+namespace na::referee::gpu { struct Presentation; }
 namespace na::j2 {
 
 using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
@@ -191,6 +192,7 @@ struct NativeBridgeStats {
     // best consecutive run), producer-order refusals, deliveries whose target was
     // written again later in the same list, and every refusal reason with its count.
     uint64_t delivered=0,first_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
+    uint64_t lighting_reader = 0;
     char refusals[1300]{};
     char probe[320]{}; // delivery probe: sessions, pairs, per-point follow/invert/flat, verdict
     char stages[480]{}; // Quality route stage counts, furthest stage reached and its stop reason
@@ -198,15 +200,20 @@ struct NativeBridgeStats {
 NativeBridgeStats GetNativeBridgeStats();
 // Presented-frame trace while the scene is reduced (diagnostic): call at every Present with
 // the presented image; the walk from it back to the scale crossing is logged (native_trace).
-void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present);
+void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool sdr_present,
+                        uint64_t ordinal = 0, const void* source = nullptr);
 void NativeTraceResult(char* out,size_t n,uint64_t* traces);
 // Delivery probe readback at Present (after NativeTracePresent): reads the marked
 // texels of the presented image (PRESENT state) with `exec` (unhooked; null = direct).
-void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*));
+void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame,
+                        void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*),
+                        uint64_t ordinal = 0, const void* source = nullptr, bool await_result = false);
+void NativeProbeResult(const void* source, uint64_t ordinal, bool accepted);
 // Starts one probe session (24 marked deliveries) now, as an armed J2 capture does.
 void RequestDeliveryProbe();
 // Tests: presents between re-verifying traces once a crossing is learned (default 900).
-void SetNativeTraceIntervalForTests(uint32_t presents);
+void SetNativeTraceIntervalForTests(uint32_t presents, bool inspect_lighting = false);
+bool StartVerifiedLightingArmForTests();
 // Quality stability gate: consecutive deliverable frames before DLSS is written (default 30).
 void SetQualityWarmupForTests(uint32_t frames);
 // P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional
@@ -261,7 +268,7 @@ float UpscaleMipBias(uint32_t render_w, uint32_t out_w);
 // Called once at the game view's non-TEST Present boundary, including while
 // paused. Presenter-generated frames must not call this. Single-view J2 uses
 // its execution queue; other queues do not advance its camera history.
-void OnPresent(ID3D12CommandQueue* queue);
+void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receipt = nullptr);
 
 // Wraps the forward of a game ExecuteCommandLists (after observation began
 // for it). Forwards the original batch unchanged unless a frame is processed.
@@ -316,10 +323,29 @@ struct Stats {
     uint64_t unjit_not_applied = 0;  // started, but no camera block was rewritten
     uint64_t unjit_not_held = 0;     // rewritten, but the camera the scene list used did not hold it
     uint64_t camera_inverse_computed = 0; // a ViewProjection without its inverse, continuing the main camera, accepted
+    // Lone matrices that continue the main camera's direction and place with another lens, refused
+    // (camera_admission.hpp SameLens), and the last one's two lens scales beside the camera's.
+    uint64_t camera_other_lens = 0;
+    float camera_other_lens_sx = 0, camera_other_lens_sy = 0, camera_lens_sx = 0, camera_lens_sy = 0;
     uint64_t camera_bootstrapped = 0;     // first main camera accepted from a persistent ViewProjection with no inverse pair anywhere
     // SE5 flashing: frames whose camera could not be read ran DLAA on a camera predicted
     // from the last two (extrapolated) or the last one (held), instead of showing the raw frame.
     uint64_t camera_held = 0, camera_extrapolated = 0;
+    // Camera-free DLAA (VARIANTS camera/optional, motion/measured-total, depth/direction-from-depth-writes).
+    // Delivered frames by whose motion they got; the measured supplier's own resets (no pair yet, by
+    // compute_flow's Ticket::no_pair code, and a scene cut seen in the pictures); frames left alone
+    // because nothing could be measured; cameras that came back after measured frames.
+    uint64_t supplied_camera = 0, supplied_measured = 0;
+    uint64_t measured_no_pair = 0, measured_cut_resets = 0, measured_unavailable = 0, cut_after_measured = 0;
+    uint32_t measured_last_no_pair = 0;
+    // Which end of the depth is near, with no camera to say: the last decision (0 not proven,
+    // 1 smaller is nearer, 2 larger is nearer; native11/depth_direction.hpp DepthVerdict for why),
+    // the evidence it saw, frames that waited for a proof, and proofs that disagreed with a camera.
+    bool depth_evidence = false;
+    uint32_t depth_near = 0, depth_verdict = 0;
+    uint32_t depth_writes_less = 0, depth_writes_greater = 0, depth_writes_equal = 0, depth_clears = 0;
+    float depth_clear = 0;
+    uint64_t depth_unproven = 0, depth_camera_disagrees = 0, depth_flips = 0;
     // Cuts at record time by cause (restart = tracker reset by resume/gap; gap = tracker frame gap;
     // motion = translation/rotation/fov jump), and the last few as "tick100ms:why=value[/held][/j1]".
     uint64_t cut_restarts = 0, cut_gap = 0, cut_motion = 0;
@@ -327,6 +353,7 @@ struct Stats {
     uint64_t gap_bridged = 0; // same-epoch acquisition gaps longer than 4 frames kept without a restart
     char recent_cuts[240] = {};
     char draw_replay[96]{};
+    char depth_reads[448]{}; // depth_reads.cpp Format(): state, counts and why
     char game_motion[400] = {}; // game_motion.cpp Describe(): candidate scoring and the tier 1 feed
     uint64_t camera_from_j1 = 0;
     uint64_t jitter_extent_rescaled = 0; // the render extent changed after J1 jittered this frame: sample rescaled // the scene list held no camera; J1's camera of this same frame (with its jitter) was used

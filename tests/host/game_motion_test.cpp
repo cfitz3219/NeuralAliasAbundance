@@ -8,6 +8,7 @@
 #include "test_support.hpp"
 #include "host_dx12/j2/game_motion.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -39,15 +40,20 @@ float picture(uint32_t x, uint32_t y, float t)
     return 0.6f * pattern(fx, fy);
 }
 
+template<uint32_t Width=W,uint32_t Height=H>
 struct Rig {
+    static constexpr uint32_t W=Width,H=Height;
     test::Device& d;
     ComPtr<ID3D12Resource> color, cand, up_color, up_cand, rb;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fc{}, fv{};
+    bool half_colour=false;
     explicit Rig(test::Device& dev) : d(dev) {}
-    bool init()
+    bool init(bool use_half_colour=false)
     {
         ID3D12Device* dev = d.device.Get();
-        color = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+        half_colour=use_half_colour;
+        const auto colour_format=half_colour?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R32G32B32A32_FLOAT;
+        color = test::CreateTexture(dev, W, H, colour_format, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
         cand = test::CreateTexture(dev, W, H, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
         if (!color || !cand) return false;
         UINT64 tc = 0, tv = 0;
@@ -60,21 +66,29 @@ struct Rig {
         return up_color && up_cand && rb;
     }
     // Frame t: the picture at t, the candidate holding motion t-1 -> t (when `motion`).
-    void fill(float t, bool motion)
+    void fill(float t, bool motion, bool rejected=false)
     {
         uint8_t* p = nullptr;
         up_color->Map(0, nullptr, reinterpret_cast<void**>(&p));
         for (uint32_t y = 0; y < H; ++y)
             for (uint32_t x = 0; x < W; ++x) {
-                const float v = picture(x, y, t), px[4] = {v, v, v, 1.0f};
-                std::memcpy(p + fc.Offset + y * fc.Footprint.RowPitch + x * 16, px, 16);
+                const float v = rejected ? ((x/96+y/64)%6==0?pattern(float(x),float(y)):.012f) : picture(x, y, t);
+                auto* row=p+fc.Offset+y*fc.Footprint.RowPitch;
+                if(half_colour){
+                    const auto h=half(v);
+                    const uint16_t px[4]={h,h,h,half(1.0f)};
+                    std::memcpy(row+x*sizeof px,px,sizeof px);
+                }else{
+                    const float px[4]={v,v,v,1.0f};
+                    std::memcpy(row+x*sizeof px,px,sizeof px);
+                }
             }
         up_color->Unmap(0, nullptr);
         up_cand->Map(0, nullptr, reinterpret_cast<void**>(&p));
         for (uint32_t y = 0; y < H; ++y)
             for (uint32_t x = 0; x < W; ++x) {
                 const bool m = motion && on_block(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, t);
-                const uint16_t v[2] = {half(m ? DX / W : 0.f), half(m ? DY / H : 0.f)};
+                const uint16_t v[2] = {half(rejected?.25f:m ? DX / W : 0.f), half(rejected?.5f:m ? DY / H : 0.f)};
                 std::memcpy(p + fv.Offset + y * fv.Footprint.RowPitch + x * 4, v, 4);
             }
         up_cand->Unmap(0, nullptr);
@@ -95,17 +109,17 @@ struct Rig {
         l->ResourceBarrier(2, b);
     }
     // Runs `frames` frames; returns the last Output and leaves the motion readback in rb (when fed).
-    Output run(Feed& f, int frames, bool motion, int first = 0, bool candidate_present = true)
+    Output run(Feed& f, int frames, bool motion, int first = 0, bool candidate_present = true, bool rejected = false, bool scripted_cuts = true)
     {
         Output o{};
         for (int i = first; i < first + frames; ++i) {
-            fill(static_cast<float>(i % 7), motion);
+            fill(static_cast<float>(i % 7), motion, rejected);
             test::List l;
             if (!l.Create(d.device.Get())) return Output{};
             upload(l.list.Get());
             Candidate c{cand.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 77};
             // frame i % 7 == 0 jumps back to t = 0: not a continuation, so not scored
-            o = f.Record(l.list.Get(), static_cast<uint32_t>(i) % kSlotsInFlight, &c, candidate_present ? 1u : 0u, color.Get(), W, H, i % 7 == 0);
+            o = f.Record(l.list.Get(), static_cast<uint32_t>(i) % kSlotsInFlight, &c, candidate_present ? 1u : 0u, color.Get(), W, H, scripted_cuts && i % 7 == 0);
             if (o.motion) {
                 D3D12_RESOURCE_BARRIER b = test::Transition(o.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 l.list->ResourceBarrier(1, &b);
@@ -131,12 +145,67 @@ struct Rig {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT mfp{};
     float last_t = 0;
 };
+
+int rejected_benchmark(test::Device& d)
+{
+    constexpr UINT width=3440,height=1440;
+    Rig<width,height> rig(d);
+    REQUIRE(rig.init(true));
+    Feed feed;
+    REQUIRE(feed.Init(d.device.Get(),kSlotsInFlight));
+    test::List list;
+    REQUIRE(list.Create(d.device.Get()));
+    rig.fill(0,false,true);
+    rig.upload(list.list.Get());
+    ComPtr<ID3D12QueryHeap> query;
+    const D3D12_QUERY_HEAP_DESC desc{D3D12_QUERY_HEAP_TYPE_TIMESTAMP,2,0};
+    REQUIRE(SUCCEEDED(d.device->CreateQueryHeap(&desc,IID_PPV_ARGS(&query))));
+    UINT64 frequency=0;
+    REQUIRE(SUCCEEDED(d.queue->GetTimestampFrequency(&frequency))&&frequency);
+    auto result=test::CreateBuffer(d.device.Get(),16,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+    REQUIRE(result);
+    const Candidate candidate{rig.cand.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,77};
+    std::vector<double> samples;
+    double full_rate_sum=0;
+    for(unsigned i=0;i<176;++i){
+        auto* commands=list.list.Get();
+        commands->EndQuery(query.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
+        const auto output=feed.Record(commands,i%kSlotsInFlight,&candidate,1,rig.color.Get(),width,height,false);
+        CHECK(!output.motion);
+        commands->EndQuery(query.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
+        commands->ResolveQueryData(query.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,result.Get(),0);
+        REQUIRE(SUCCEEDED(commands->Close()));
+        ID3D12CommandList* batch[]={commands};
+        d.queue->ExecuteCommandLists(1,batch);
+        d.WaitIdle();
+        list.Reset();
+        void* mapped=nullptr;
+        const D3D12_RANGE read{0,16},none{};
+        REQUIRE(SUCCEEDED(result->Map(0,&read,&mapped)));
+        const auto* ticks=static_cast<const UINT64*>(mapped);
+        const double ms=double(ticks[1]-ticks[0])*1000.0/double(frequency);
+        if(i>=16&&i<48)full_rate_sum+=ms;
+        if(i>=144)samples.push_back(ms);
+        result->Unmap(0,&none);
+    }
+    std::sort(samples.begin(),samples.end());
+    const auto stats=feed.GetStats();
+    CHECK(stats.scored<100&&stats.deferred>90&&stats.fed==0&&stats.good==0);
+    double sum=0;
+    for(double sample:samples)sum+=sample;
+    std::printf("Rejected candidate, %ux%u: scored %llu, deferred %llu, fed %llu, pixels scored %llu, median %.4f ms mean %.4f ms p95 %.4f ms, full-rate mean %.4f ms\n",
+                width,height,static_cast<unsigned long long>(stats.scored),static_cast<unsigned long long>(stats.deferred),
+                static_cast<unsigned long long>(stats.fed),static_cast<unsigned long long>(stats.last_scored),
+                (samples[15]+samples[16])*.5,sum/samples.size(),samples[30],full_rate_sum/32);
+    return test::finish("game_motion_rejected_benchmark");
+}
 } // namespace
 
-int main()
+int main(int argc,char** argv)
 {
     test::Device d;
     if (!test::CreateDevice(d)) return test::SkipNoDevice("game_motion_test");
+    if(argc>1&&std::strcmp(argv[1],"--rejected-benchmark")==0)return rejected_benchmark(d);
     {
         Rig rig(d);
         REQUIRE(rig.init());
@@ -180,6 +249,22 @@ int main()
         const auto resumed = rig.run(f, 72, true, 84);
         CHECK(resumed.motion && f.GetStats().used_candidate == 0);
         REQUIRE(d.device->GetDeviceRemovedReason() == S_OK);
+    }
+    {
+        Rig rig(d);
+        REQUIRE(rig.init());
+        Feed f;
+        REQUIRE(f.Init(d.device.Get(), kSlotsInFlight));
+        CHECK(!rig.run(f,85,false,0,true,true,false).motion);
+        const auto rejected=f.GetStats();
+        CHECK(rejected.deferred>0 && rejected.fed==0);
+        // The same texture starts holding valid motion. There is no cut or
+        // identity change to bail out the retry path.
+        const auto recovered=rig.run(f,96,true,85,true,false,false);
+        CHECK(recovered.motion&&f.GetStats().used_candidate==0&&f.GetStats().used_encoding==7);
+        const auto stable=f.GetStats();
+        CHECK(rig.run(f,14,true,181,true,false,false).motion);
+        CHECK(f.GetStats().deferred==stable.deferred);
     }
     {
         Rig rig(d);

@@ -20,6 +20,9 @@
 
 namespace na::settings {
 
+// Live DLAA keeps the former slider at its 50% setting for all game profiles.
+inline constexpr uint32_t kObjectFlowLoosen = 50;
+
 enum class DlssMode : uint32_t {
     DLAA = 0,         // 100% â€” render at output resolution
     Quality = 1,      // 66.7%
@@ -82,7 +85,6 @@ struct Settings {
     // Render-small HUD: 0 = the HUD goes through DLSS with the scene; 1..100 = HUD pixels are
     // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
     std::atomic<uint32_t> j2_hud_nis{50};
-    std::atomic<uint32_t> j2_flow_loosen{50}; // J2 moving-object flow: 0 = the original acceptance rules, 100 = loosest (Cort 2026-11-03)
     std::atomic<uint32_t> j2_jitter_r2{0}; // jitter sequence: 0 Halton 2,3 (default), 1 R2; [j2] jitter_sequence; live
     std::atomic<uint32_t> aniso16{0}; // anisotropic filtering level on the game's surface textures: 0 off, 4, 8, 16; [j2] anisotropic; read at game start
     // J2 texture detail in effect at full resolution, x 100: a mirror of the choice below, written at
@@ -114,9 +116,28 @@ struct Settings {
     // the opposite sign, 0 = off: the camera-matrix route). Cort 2026-11-04. Loading the ini
     // turns it on unless the ini says otherwise; without a Load (tests) the camera-matrix route stays.
     std::atomic<int32_t> j2_viewport_jitter{0};
+    // VARIANT: camera/optional
+    // [j2] camera: what the scene camera is to DLAA on the native DX11 route (2026-11-16, Cort:
+    // "eliminate the dependency"). 1 = used when found (default): a frame without one still gets DLAA,
+    // with motion measured from the picture. 0 = never looked for: nothing camera-related runs.
+    // 2 = required: a frame without a camera is left alone (the behaviour before this setting).
+    // Live, saved per game.
+    std::atomic<int32_t> j2_camera{1};
     // Draw replay ([j2] draw_replay, 1 = on): per-object motion from the game's own draws replayed with
     // stream output, fed as engine motion (Cort 2026-11-06, SE5 sweatshirt smear). Off by default (Cort).
     std::atomic<uint32_t> j2_draw_replay{0};
+    // Expanded vertices draw replay may run again per frame ([j2] replay_vertex_budget, 0 = no budget).
+    // 3 million a frame cost about 10 ms on an RTX 5070 Ti at 3440x1440 (Cort's Resistance run, 2026-11-17).
+    std::atomic<uint32_t> j2_replay_budget{1000000};
+    // VARIANT: replay/movers-first ([j2] replay_movers, 1 = on): within the budget, draws known to move
+    // by themselves are replayed first and the rest are tried in turn (core/replay_movers.hpp).
+    // 0 = the budget's hashed sample alone.
+    std::atomic<uint32_t> j2_replay_movers{1};
+    // The referee (stage 1 of the unify plan, capture/referee_gpu.cpp): watches DLSS's picture,
+    // result, motion and jitter a few times a second and logs event `referee`. Changes nothing shown.
+    std::atomic<uint32_t> referee_enabled{0};   // [referee] enabled (live)
+    std::atomic<uint32_t> referee_every_ms{500}; // [referee] every_ms: one pair of frames this often
+    std::atomic<uint32_t> referee_log_s{5};      // [referee] log_seconds: one `referee` line this often
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};

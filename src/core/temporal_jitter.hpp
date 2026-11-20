@@ -7,6 +7,17 @@ namespace neural_alias {
 // Independent sampling math, applied by the verified Alien camera adapter.
 // The adapter owns sequence advancement/reset and must select the main scene camera.
 struct JitterSample { double x_pixels, y_pixels; };
+enum class JitterMode : uint8_t { Unset, Unshifted, Shifted };
+
+// A recorded frame can still carry the previous setting. The history changes
+// mode only on an evaluated frame whose raster agrees with the new request.
+constexpr JitterMode JitterHistoryForFrame(JitterMode previous, bool requested, bool raster_shifted) {
+    if (requested != raster_shifted) return previous;
+    return raster_shifted ? JitterMode::Shifted : JitterMode::Unshifted;
+}
+constexpr bool JitterHistoryChanged(JitterMode previous, JitterMode next) {
+    return previous != JitterMode::Unset && next != JitterMode::Unset && previous != next;
+}
 inline double radical_inverse(uint32_t index, uint32_t base) {
     double result=0, weight=1;
     while(index) { weight/=base; result+=double(index%base)*weight; index/=base; }

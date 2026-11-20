@@ -1,9 +1,33 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 #include <map>
 
 namespace na::j2 {
+// A reader can follow a later lighting image only if its final writer
+// used a same-view image from the same scene and depth, with an observed
+// write-to-read interval. Mirrored occurrences are proved separately.
+template<class Operations, class View, class Writer, class HasGap>
+uint64_t LightingPeer(const Operations& ops, size_t reader, uint64_t scene, uint64_t depth,
+                      const View& input, Writer writer, HasGap has_gap)
+{
+    const size_t light = writer(input.id, reader);
+    if (light >= reader || light != writer(input.id, ops.size()) || has_gap(light, reader)) return 0;
+    const auto& op = ops[light];
+    if (op.paired_depth != depth || !op.direct || !op.reflected || op.inferred || op.heap_indexing || op.late) return 0;
+    uint64_t peer = 0;
+    for (const auto& base : op.in) {
+        if (!base.whole || !input.whole || base.id == input.id || base.w != input.w || base.h != input.h ||
+            base.vfmt != input.vfmt || (input.id != scene && base.id != scene)) continue;
+        const auto base_writer = writer(base.id, light);
+        if (base_writer >= light || ops[base_writer].paired_depth != depth || has_gap(base_writer, light)) continue;
+        if (peer && peer != base.id) return 0;
+        peer = base.id;
+    }
+    return peer;
+}
+
 // CPU-only recording evidence; never retains game objects or waits for the GPU.
 // A read binding is an insertion candidate, not proof of an AA/tonemap shader.
 // Operation kinds (P4-0D consumer anchor). Op::Unknown events are classified from
@@ -14,7 +38,8 @@ enum class Op : uint8_t {
     Barrier,                                        // RT -> read transition (not a consumer)
     GraphicsRead, ComputeRead, CopyRead,            // actual consumers
     DerivedRead,                                    // read of a texture copied from the colour this frame (lineage only)
-    GraphicsEntry, ComputeEntry, IndirectGraphicsEntry, IndirectComputeEntry
+    GraphicsEntry, ComputeEntry, IndirectGraphicsEntry, IndirectComputeEntry,
+    FullViewClear // ClearWrite covering every pixel in the bound view
 };
 struct InsertionEvent {
     uint64_t resource = 0, destination = 0, pipeline = 0;
@@ -42,6 +67,7 @@ inline uint32_t EntryContext(bool written_in_recording, uint32_t ordinal)
 }
 inline Op ClassifyOp(const InsertionEvent& e)
 {
+    if (e.op == Op::FullViewClear) return Op::ClearWrite;
     if (e.op != Op::Unknown) return e.op;
     if (e.write) return Op::DrawWrite;
     if (e.pipeline == UINT64_MAX) return Op::Barrier;
@@ -110,7 +136,18 @@ struct InsertionDecision {
     uint64_t boundary_writer = 0;
     uint32_t writer_occurrence = 0;
     uint32_t derived_reads = 0; // reads of textures copied from the colour this frame
+    bool consumed_after_last_write = false;
+    bool cleared_full_view = false;
 };
+inline uint64_t BoundarySignature(const InsertionDecision& d)
+{
+    if (!d.final_candidate) return 0;
+    uint64_t signature = 1469598103934665603ull;
+    for (uint64_t part : {d.boundary_writer, static_cast<uint64_t>(d.writer_occurrence), d.destination, d.pipeline})
+        signature = (signature ^ part) * 1099511628211ull;
+    return signature;
+}
+
 struct LearnedInsertion {
     uint64_t color = 0, depth = 0;
     InsertionDecision decision;
@@ -144,6 +181,31 @@ struct ColorEvent {
     uint64_t producer = 0;     // consumer/barrier: pipeline of the preceding write in this recording
     bool list_start = false;   // first event of a recording (frame sequences span several lists)
 };
+
+// Work backwards from the first actual read of the final scene version.
+// A barrier can end the producer list, but it cannot consume a picture.
+inline const ColorEvent* SeparateSceneReader(const std::vector<ColorEvent>& events, uint64_t* producer = nullptr)
+{
+    bool crossed_list = false;
+    const ColorEvent* reader = nullptr;
+    for (auto i = events.rbegin(); i != events.rend(); ++i) {
+        if (i->write) {
+            if (!crossed_list || !i->with_depth) return nullptr;
+            if (producer) *producer = i->producer;
+            return reader;
+        }
+        if (IsConsumer(i->op)) {
+            reader = &*i;
+            crossed_list = false;
+        } else if (reader && crossed_list && IsEntry(i->op)) {
+            // This recording could already have forwarded the output by
+            // a binding we could not trace. Do not nominate a later read.
+            reader = nullptr;
+        }
+        crossed_list |= i->list_start;
+    }
+    return nullptr;
+}
 // What one later list of a submission says about a scene ending placed before it:
 //  +1 the scene continues (a draw into the colour before the picture is copied onward),
 //  -1 the picture is copied onward here (anything later reuses the texture; stop looking),
@@ -189,13 +251,16 @@ public:
             if (!event.write && event.pipeline == UINT64_MAX) ++result.transitions;
             if (event.write) {
                 writer = event.pipeline;
+                result.cleared_full_view |= event.op == Op::FullViewClear;
                 ++result.writes;
+                result.consumed_after_last_write = false;
                 result.final_candidate = 0; // later geometry invalidates earlier reads
                 result.final_transition = 0;
                 result.destination = result.pipeline = 0;
                 result.boundary_writer = 0;
                 result.writer_occurrence = 0;
             } else if (result.writes && event.destination != color) {
+                if (IsConsumer(ClassifyOp(event))) result.consumed_after_last_write = true;
                 const uint32_t occurrence = event.pipeline == UINT64_MAX ? ++writer_reads[writer] : 0;
                 ++result.candidates;
                 // First downstream read after the LAST scene write, not last read:

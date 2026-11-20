@@ -259,8 +259,8 @@ uint64_t SamplerPolicyKey()
     if (!g_installed.load(std::memory_order_relaxed)) return 0;
     // A value no (bias, af) pair has, so the first draw after the scene is handed over, and the first
     // draw of the next frame, each refresh what is bound.
-    if (g_scene_handed.load(std::memory_order_relaxed)) return ~uint64_t{1};
-    return Key(g_bias_fn ? g_bias_fn() : 0.f, g_af_fn ? g_af_fn() : 0u);
+    const uint64_t key = Key(g_bias_fn ? g_bias_fn() : 0.f, g_af_fn ? g_af_fn() : 0u);
+    return key && g_scene_handed.load(std::memory_order_relaxed) ? ~uint64_t{1} : key;
 }
 void SetSceneHanded(bool handed) { g_scene_handed.store(handed, std::memory_order_relaxed); }
 bool SceneHanded() { return g_scene_handed.load(std::memory_order_relaxed); }

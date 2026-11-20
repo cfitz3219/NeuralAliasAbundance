@@ -11,6 +11,7 @@
 #include "test_support.hpp"
 #include "providers/discovery/universal_heuristics.hpp"
 #include <vector>
+#include <chrono>
 using namespace na::discovery;
 
 namespace {
@@ -157,8 +158,38 @@ struct Feed {
 };
 } // namespace
 
-int main() {
+int main(int argc,char** argv) {
+    const bool benchmark=argc>1&&!std::strcmp(argv[1],"--rank-benchmark");
     return test::run({
+        {"direct camera rank matches sorted ranking, including ties and missing blocks", [benchmark] {
+             Feed f;f.Swapchain(1920,1080);f.Resource(3,1920,1080,40);f.Resource(6,1920,1080,10);f.Pipeline(10,1,1,0);
+             f.Reset();f.SetPipeline(10);f.Targets({6},3);
+             for(unsigned i=0;i<256;++i){
+                 f.RootCbv(0,1000+i%16,(i/16)*256);
+                 for(unsigned j=0;j<1+i%24;++j)f.Draw(100);
+             }
+             f.Execute();f.Present();
+             CHECK(f.h.RankCameraBlocks(512).size()>100);
+             const auto reference=[&](unsigned i,size_t top){
+                 const auto ranked=f.h.RankCameraBlocks(top);
+                 for(size_t k=0;k<ranked.size();++k)
+                     if(ranked[k].resource==1000+i%16&&ranked[k].offset==(i/16)*256)return k+1;
+                 return size_t{0};
+             };
+             for(size_t top: {size_t{0},size_t{1},size_t{4},size_t{8},size_t{512}})
+                 for(unsigned i=0;i<320;++i)CHECK(f.h.CameraRank(1000+i%16,(i/16)*256,top)==reference(i,top));
+             if(benchmark){
+                 for(bool direct:{false,true,true,false}){
+                     uint64_t sum=0;const auto start=std::chrono::steady_clock::now();
+                     constexpr unsigned queries=65536;
+                     for(unsigned n=0;n<queries;++n){const unsigned i=n%320;
+                         sum+=direct?f.h.CameraRank(1000+i%16,(i/16)*256,4):reference(i,4);
+                     }
+                     const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+                     std::printf("camera_rank direct=%u queries=%u total_ms=%.4f per_64_ms=%.6f checksum=%llu\n",unsigned(direct),queries,ms,ms*64/queries,static_cast<unsigned long long>(sum));
+                 }
+             }
+         }},
         {"successful resize updates depth aspect; rejected resize leaves it unchanged", [] {
              Feed f;
              f.Swapchain(1024,768);
@@ -300,6 +331,27 @@ int main() {
              CHECK(!blocks.empty() && blocks[0].resource == 20 && blocks[0].offset == 256 && blocks[0].draws == 161 && blocks[0].share > 0.99);
              for (size_t i = 1; i < blocks.size(); ++i) CHECK(blocks[i].resource == 21 && blocks[i].draws * 4 < blocks[0].draws);
              CHECK(f.h.CameraRank(20, 256) == 1 && f.h.CameraRank(21, 0) == 0);
+         }},
+        {"camera discovery can stop and resume without changing depth and colour selection", [] {
+             Feed on,off;off.h.SetCameraDiscovery(false); // also survives the first session/epoch reset
+             for(auto* f:{&on,&off}){
+                 f->Swapchain(1920,1080);f->Resource(3,1920,1080,40);f->Resource(6,1920,1080,10);
+                 f->Pipeline(10,1,1,0);f->Pipeline(11,0,0,1);
+             }
+             for(unsigned frame=0;frame<5;++frame){
+                 on.Frame();off.Frame();
+                 CHECK(off.h.RankCameraBlocks(512).empty() && off.h.CameraRank(20,256)==0);
+                 const auto a=on.h.RankDepth(8),b=off.h.RankDepth(8);
+                 CHECK(a.size()==b.size());
+                 for(size_t i=0;i<std::min(a.size(),b.size());++i){CHECK(a[i].resource==b[i].resource && a[i].score==b[i].score && a[i].draws==b[i].draws);}
+                 const auto x=on.h.RankSceneColor(8,3),y=off.h.RankSceneColor(8,3);
+                 CHECK(x.size()==y.size());
+                 for(size_t i=0;i<std::min(x.size(),y.size());++i){CHECK(x[i].resource==y[i].resource && x[i].score==y[i].score && x[i].draws==y[i].draws);}
+             }
+             CHECK(on.h.CameraRank(20,256)==1);
+             off.h.SetCameraDiscovery(true);off.Frame();CHECK(off.h.CameraRank(20,256)==1);
+             off.h.SetCameraDiscovery(false);CHECK(off.h.RankCameraBlocks(512).empty());
+             off.Execute();off.Present();CHECK(off.h.RankCameraBlocks(512).empty()); // cached recording cannot revive camera data
          }},
         {"R41-1: a truncated target array with a wide stride reads only the carried prefix", [] {
              Feed f;

@@ -1,4 +1,6 @@
 // C8a: H1 observation producers. See producers.hpp.
+#include "core/replay_budget.hpp"
+#include "core/replay_movers.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/observe/producers.hpp"
 
@@ -66,6 +68,40 @@ struct DescHeap;
 // Recordings with a pinned viewport sample may still need it after the global
 // request goes away. Only an entirely idle jitter path can skip the list locks.
 std::atomic<uint64_t> g_vpj_recordings{0};
+// What the most recent recording pinned for its scene draws: the sample, the depth it drew into and
+// whether its one full-size viewport was widened (that is part of where the picture landed).
+struct VpjPinned { uint64_t sample = 0, depth = 0; bool expanded = false; };
+std::mutex g_vpj_pinned_m;
+VpjPinned g_vpj_pinned;
+// Depth direction evidence (SetDepthWriteEvidence). The facts belong to the RECORDING they were
+// recorded in (ListState::de, cleared when the list is Reset) and say nothing until that recording
+// is submitted: a list recorded ahead, discarded or reset proves nothing about the picture on
+// screen (Astra's R5, 2026-11-16). The host adds up the recordings it actually submits, in
+// execution order (ListDepthWriteEvidence). This switch only says whether recordings keep them.
+std::atomic<bool> g_de_on{false};
+struct DepthWrites {
+    uint64_t depth = 0;             // the scene depth these facts are about (0 = none yet)
+    uint32_t less = 0, greater = 0, equal = 0, other = 0, clears = 0, clear_bits = 0;
+    bool clear_mixed = false;
+    void select(uint64_t d) { if (depth != d) { *this = DepthWrites{}; depth = d; } }
+    void write(uint64_t d, uint32_t func)
+    {
+        select(d);
+        ++(func == D3D12_COMPARISON_FUNC_LESS || func == D3D12_COMPARISON_FUNC_LESS_EQUAL ? less
+         : func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL ? greater
+         : func == D3D12_COMPARISON_FUNC_EQUAL ? equal : other);
+    }
+    void clear(uint64_t d, float value)
+    {
+        select(d);
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof bits);
+        if (clears && clear_bits != bits) clear_mixed = true;
+        clear_bits = bits;
+        ++clears;
+    }
+};
+float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
 struct ListState {
     uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
     std::atomic<uint64_t> generation{0};
@@ -109,6 +145,7 @@ struct ListState {
     // every resource they reference. Bounded; overflow clears uses_complete.
     std::vector<na_object_id> uses;
     bool uses_complete = true;
+    bool uses_sorted = false; // compact once at capacity, then bounded membership/insertion
     // (render target, depth target or 0) per OMSetRenderTargets in this recording, in order (under bind_m).
     struct Target {
         na_object_id rt = 0, ds = 0;
@@ -121,6 +158,11 @@ struct ListState {
     // Explicit bounded SRV-table observations are a pass-order hint, not proof
     // of a particular AA shader or a requirement for DLAA eligibility.
     std::vector<na_object_id> sampled_textures;
+    // This is historical membership, not the live binding state. A range which
+    // was already recorded at the same descriptor revision adds no information.
+    struct SampledRange { na_object_id heap=0; uint64_t first=0,revision=0; uint32_t count=0; };
+    SampledRange sampled_ranges[16]{};
+    uint32_t sampled_range_next=0;
     std::vector<na_object_id> cleared; // render targets this recording cleared (ClearRenderTargetView)
     // Inline insertion (J2): the game's pipeline state in this recording, so host
     // work recorded INTO the game's list can hand the list back exactly as the game
@@ -187,6 +229,8 @@ struct ListState {
     // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
     bool vpj_applied = false;
     uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
+    bool vpj_scene_expanded = false, vpj_scene_mixed = false; // the pinned scene draws' raster shape; mixed = not one shape
+    DepthWrites de; // this recording's depth-writing draws and clears of the scene depth (bind_m)
     ~ListState() { if (vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release); }
 };
 
@@ -1935,14 +1979,47 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     if (want) emit(e, NA_GROUP_DESCRIPTOR);
 }
 
+// ---- Depth reads (j2/depth_reads.cpp; core/depth_unjitter.hpp says why). The game's shader
+// reads of one depth texture are made on a TWIN the host fills with the raster jitter taken back
+// out. The game's depth itself is untouched: depth tests, the host's own readers and the registry
+// all keep the game's texture, and the registry keeps recording the game's view as the game made
+// it. Only the descriptor the DRIVER gets names the twin, and only for a view of the depth plane
+// (a stencil view stays on the game's texture). One pointer comparison on the view-creation path.
+// A read that is missed (a view in a heap the registry never saw, a copy of the depth texture
+// itself) simply stays on the game's depth, as without this.
+std::atomic<ID3D12Resource*> g_dr_depth{nullptr}, g_dr_twin{nullptr};
+std::atomic<uint64_t> g_dr_created{0}, g_dr_swept{0}, g_dr_readable{0}, g_dr_other{0};
+std::atomic<DepthReadableListener> g_dr_listener{nullptr};
+std::atomic<DepthPendingListener> g_dr_pending_listener{nullptr};
+std::atomic<uint64_t> g_dr_unknown_view{0}, g_dr_raced{0};
+thread_local ID3D12GraphicsCommandList* t_dr_pending = nullptr; // this thread's recording waiting for its next draw
+thread_local int t_barrier_nest = 0; // a runtime or debug layer forwarding ONE game barrier through another list
+inline bool depth_plane_view(uint32_t format)
+{
+    return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
+           format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || format == DXGI_FORMAT_R16_UNORM;
+}
+
 void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
-    o_CreateShaderResourceView(dev, r, d, h);
+    ID3D12Resource* driver = r;
+    if (r && d && r == g_dr_depth.load(std::memory_order_acquire) && !t_host_work &&
+        d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && depth_plane_view(static_cast<uint32_t>(d->Format))) {
+        if (ID3D12Resource* twin = g_dr_twin.load(std::memory_order_acquire)) {
+            driver = twin;
+            g_dr_created.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    o_CreateShaderResourceView(dev, driver, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MostDetailedMip; count = d->Texture2D.MipLevels; }
     DescriptorDetails view_args;
     const DescriptorDetails* view = nullptr;
-    if (g_operation_snapshots.load() && !t_host_work) {
+    // A view of a depth plane always keeps its exact description: should the depth get a twin later,
+    // the view (and every copy of it) can then be recreated on the twin exactly as the game made it.
+    const bool depth_plane = r && d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && depth_plane_view(static_cast<uint32_t>(d->Format)) &&
+                             (r->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    if ((g_operation_snapshots.load() || depth_plane) && !t_host_work) {
         view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.srv = *d;
     }
     note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
@@ -3596,18 +3673,36 @@ void with_list_state(const void* l, F&& f)
     na_object_id id = 0;
     if (ListState* ls = list_state_locked(l, &id)) f(*ls);
 }
+// A clear of the live scene depth, kept with the recording it was recorded in.
+void de_clear(const void* l, uint64_t resource, float value)
+{
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!resource || resource != sel_depth) return;
+    with_list_state(l, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        ls.de.clear(sel_depth, value);
+    });
+}
 
 constexpr size_t kMaxListUses = 4096;
 void add_use_locked(ListState& ls, na_object_id id)
 {
     if (!id || id == NA_UNKNOWN_U64 || (!ls.uses.empty() && ls.uses.back() == id)) return;
-    if (ls.uses.size() >= kMaxListUses) { // compact before giving up (targets are rebound often)
+    if (!ls.uses_sorted && ls.uses.size() >= kMaxListUses) {
         std::sort(ls.uses.begin(), ls.uses.end());
         ls.uses.erase(std::unique(ls.uses.begin(), ls.uses.end()), ls.uses.end());
-        if (ls.uses.size() >= kMaxListUses * 3 / 4) {
-            ls.uses_complete = false;
-            return;
-        }
+        ls.uses_sorted = true;
+    }
+    if (ls.uses_sorted) {
+        // Previously a saturated list sorted all 4096 IDs on EVERY later use,
+        // even duplicates. Keep its compacted set sorted for the rest of this
+        // recording. The small-list append path remains unchanged.
+        const auto at = std::lower_bound(ls.uses.begin(), ls.uses.end(), id);
+        if (at != ls.uses.end() && *at == id) return;
+        if (ls.uses.size() == kMaxListUses) { ls.uses_complete = false; return; }
+        ls.uses.insert(at, id);
+        return;
     }
     ls.uses.push_back(id);
 }
@@ -3839,12 +3934,15 @@ struct On<sl::list::Reset> {
                     ls->evidence_complete = true;
                     ls->uses.clear();
                     ls->uses_complete = true;
+                    ls->uses_sorted = false;
                     ls->targets.clear();
                     ls->insertion.Reset();
                     ls->last_draw_rt = 0;
                     ls->pending_entry = 0;
                     ls->entry_barrier=0;
                     ls->sampled_textures.clear();
+                    std::fill_n(ls->sampled_ranges,16,ListState::SampledRange{});
+                    ls->sampled_range_next=0;
                     ls->cleared.clear();
                     ls->pso = pso;
                     ls->heaps[0] = ls->heaps[1] = nullptr;
@@ -3856,6 +3954,7 @@ struct On<sl::list::Reset> {
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
                     ls->cur_nrt = 0;
+                    ls->de = DepthWrites{}; // a new recording: the old one's depth facts go with it
                     ls->native_colors.clear();
                     ls->native_depth.reset();
                     ls->restorable = true;
@@ -4385,10 +4484,16 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                         const na_root_range& range = rr[rp.first_range + q];
                         if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32 && ls->sampled_textures.size()<256) {
                             const CostScope sampled(kCostSampled);
-
+                            const uint64_t first=uint64_t(slot)+range.table_offset;
+                            const uint32_t count=std::min<uint32_t>(range.num_descriptors,64);
+                            const uint64_t revision=g_operation_revision.load();
+                            const auto seen=std::find_if(std::begin(ls->sampled_ranges),std::end(ls->sampled_ranges),[&](const auto& r){
+                                return r.heap==dh->id&&r.first==first&&r.count==count&&r.revision==revision;
+                            });
+                            if(seen!=std::end(ls->sampled_ranges))continue;
                             SlotShared stripe;
-                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64) && ls->sampled_textures.size()<256; ++k) {
-                                const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                            for (uint32_t k = 0; k < count && ls->sampled_textures.size()<256; ++k) {
+                                const uint64_t index = first + k;
                                 if (index >= dh->count) break;
                                 stripe.lock(dh, index);
                                 const auto& si = dh->info[static_cast<size_t>(index)];
@@ -4397,6 +4502,7 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                                     std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), si.resource) == ls->sampled_textures.end())
                                     ls->sampled_textures.push_back(si.resource);
                             }
+                            ls->sampled_ranges[ls->sampled_range_next++%16]={dh->id,first,revision,count};
                         }
                         if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV || range.table_offset == NA_UNKNOWN_U32) continue;
                         // Cover the complete conventional hardware CB register bank.
@@ -4551,6 +4657,7 @@ struct On<sl::list::ClearDepthStencilView> {
         if (!begin_op(l, &r)) return;
         const na_view_ref v = cpu_ref(h);
         emit_op(r, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(f), float_bits(depth, 0.f), stencil}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
+        if ((f & D3D12_CLEAR_FLAG_DEPTH) && g_de_on.load(std::memory_order_relaxed)) de_clear(l, v.resource, depth);
         note_uses(l, {v.resource});
         if ((f & D3D12_CLEAR_FLAG_DEPTH) && v.resource && v.first_subresource != NA_UNKNOWN_U32)
             with_list_state(l, [&](ListState& ls) {
@@ -4561,7 +4668,7 @@ struct On<sl::list::ClearDepthStencilView> {
 };
 template <>
 struct On<sl::list::ClearRenderTargetView> {
-    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT* c, UINT, const D3D12_RECT*)
+    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT* c, UINT rect_count, const D3D12_RECT*)
     {
         Rec r;
         if (!begin_op(l, &r)) return;
@@ -4572,7 +4679,7 @@ struct On<sl::list::ClearRenderTargetView> {
         note_uses(l, {v.resource});
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, na::j2::Op::ClearWrite});
+            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, rect_count ? na::j2::Op::ClearWrite : na::j2::Op::FullViewClear});
             if (v.resource == ls.pending_entry) ls.pending_entry = 0;
             if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
                 ls.cleared.push_back(v.resource);
@@ -4675,6 +4782,7 @@ struct On<sl::list::BeginRenderPass> {
                 const auto& v = ds->DepthBeginningAccess.Clear.ClearValue.DepthStencil;
                 emit_op(rc, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(D3D12_CLEAR_FLAG_DEPTH), float_bits(v.Depth, 0.f), v.Stencil}, &refs[m - 1],
                         sizeof(refs[m - 1]), sizeof(refs[m - 1]), 0, NA_GROUP_RESOURCE_USE);
+                if (g_de_on.load(std::memory_order_relaxed)) de_clear(l, refs[m - 1].resource, v.Depth);
             }
         }
         with_list_state(l, [&](ListState& ls) {
@@ -4686,7 +4794,7 @@ struct On<sl::list::BeginRenderPass> {
             ls.native_depth=std::move(depth_view);
             for (uint32_t i = 0; i < nrt; ++i) {
                 if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
-                ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::ClearWrite});
+                ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::FullViewClear});
                 if (ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), refs[i].resource) == ls.cleared.end())
                     ls.cleared.push_back(refs[i].resource);
             }
@@ -5111,6 +5219,42 @@ struct TextureHooks { std::shared_ptr<TextureOperationHook> lane[2]; };
 auto& g_texture_hooks = *new std::shared_ptr<const TextureHooks>();
 std::mutex g_texture_hooks_m;
 std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
+// Depth reads: the game has just moved the twinned depth from "being written" to "readable by a
+// shader" on this recording. The listener refreshes the twin here, AFTER the game's barrier, so
+// every read the game records from now on sees the depth as it is at this point of the list.
+void after_depth_readable(GL* l, UINT n, const D3D12_RESOURCE_BARRIER* b)
+{
+    ID3D12Resource* depth = g_dr_depth.load(std::memory_order_relaxed);
+    if (!depth || t_host_work || !b) return;
+    constexpr UINT shader = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    // The depth plane's LAST transition of the batch decides (plane 0 or all planes; a split
+    // barrier counts where it completes).
+    const D3D12_RESOURCE_BARRIER* last = nullptr;
+    for (UINT i = 0; i < n; ++i) {
+        const auto& x = b[i];
+        if (x.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || x.Transition.pResource != depth ||
+            (x.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) continue;
+        if (x.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && x.Transition.Subresource != 0) continue;
+        last = &x;
+    }
+    if (!last) return;
+    const UINT before = last->Transition.StateBefore, after = last->Transition.StateAfter;
+    if ((after & shader) && !(before & shader)) g_dr_readable.fetch_add(1, std::memory_order_relaxed);
+    else if (!(after & shader)) g_dr_other.fetch_add(1, std::memory_order_relaxed);
+    if (const auto listen = g_dr_listener.load(std::memory_order_acquire)) {
+        HostWorkScope own;
+        listen(l, depth, before, after, last->Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    }
+}
+// A recording that could only take a plain copy at its barrier asks to be called before its next
+// draw or dispatch, when the game has bound everything a host draw must hand back.
+void depth_pending_before(GL* l)
+{
+    if (const auto listen = g_dr_pending_listener.load(std::memory_order_acquire)) {
+        HostWorkScope own;
+        listen(l);
+    } else t_dr_pending = nullptr;
+}
 
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
@@ -5199,7 +5343,6 @@ std::atomic<uint64_t> g_vpj{0};
 std::atomic<bool> g_vpj_ever{false};
 std::atomic<uint64_t> g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_draws{0}, g_vpj_unknown{0};
 thread_local bool t_vpj_self = false; // our own RSSetViewports: not a change of the game's
-float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
 // The game (or host work restoring the game's state) set viewports, or the list restarted:
 // our offset copies are no longer bound.
 void vpj_viewports_replaced(GL* l, bool reset)
@@ -5213,14 +5356,18 @@ void vpj_viewports_replaced(GL* l, bool reset)
     ls->vpj_applied = false;
     if (reset) {
         if (ls->vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release);
-        ls->vpj_scene = 0; ls->vpj_depth = 0;
+        ls->vpj_scene = 0; ls->vpj_depth = 0; ls->vpj_scene_expanded = ls->vpj_scene_mixed = false;
     }
 }
 void vpj_before_draw(GL* l)
 {
-    if (!g_vpj_ever.load(std::memory_order_relaxed)) return;
-    const uint64_t cur = g_vpj.load(std::memory_order_acquire);
-    if (!cur && !g_vpj_recordings.load(std::memory_order_acquire)) return;
+    // Two readers of the same per-draw facts: viewport jitter, and (only while asked for) the depth
+    // direction evidence. With the evidence off this is the viewport jitter's own early return.
+    const bool evidence = g_de_on.load(std::memory_order_relaxed);
+    const bool vpj = g_vpj_ever.load(std::memory_order_relaxed);
+    const uint64_t cur = vpj ? g_vpj.load(std::memory_order_acquire) : 0;
+    const bool moving = vpj && (cur || g_vpj_recordings.load(std::memory_order_acquire));
+    if (!moving && !evidence) return;
     D3D12_VIEWPORT v[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     UINT n = 0;
     {
@@ -5233,15 +5380,16 @@ void vpj_before_draw(GL* l)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         // A Present on another thread must not change half a scene recording's
         // sample. The first eligible draw owns it until this list is Reset.
+        const na_ev_pipeline_created* pc = sel_depth && ls->cur_ds == sel_depth ? pso_created_locked(*ls) : nullptr;
+        if (evidence && pc && pc->depth_enable == 1 && pc->depth_write == 1) ls->de.write(sel_depth, pc->depth_func);
+        if (!moving) return; // counted only: no viewport of the game's is touched
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
         bool want = sample && sel_depth && ls->cur_ds == sel_depth;
-        if (want) {
-            const na_ev_pipeline_created* pc = pso_created_locked(*ls);
-            want = pc && pc->depth_enable == 1;
-        }
+        if (want) want = pc && pc->depth_enable == 1;
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
-            if (!ls->vpj_scene) g_vpj_recordings.fetch_add(1, std::memory_order_release);
+            const bool first_pin = !ls->vpj_scene;
+            if (first_pin) g_vpj_recordings.fetch_add(1, std::memory_order_release);
             ls->vpj_scene = sample;
             ls->vpj_depth=sel_depth;
             g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
@@ -5255,6 +5403,7 @@ void vpj_before_draw(GL* l)
             // The depth attachment and original scissor still clip writes,
             // and the centred expansion keeps the declared jitter unchanged.
             uint32_t width = 0, height = 0, format = 0;
+            bool expanded = false;
             if (n == 1 && v[0].TopLeftX == 0.f && v[0].TopLeftY == 0.f &&
                 ls->cur_ds_sub == 0 && resource_dims_locked(sel_depth, &width, &height, &format) &&
                 v[0].Width == static_cast<float>(width) && v[0].Height == static_cast<float>(height)) {
@@ -5262,7 +5411,11 @@ void vpj_before_draw(GL* l)
                 v[0].TopLeftY -= .5f;
                 v[0].Width += 1.f;
                 v[0].Height += 1.f;
+                expanded = true;
             }
+            if (!first_pin && ls->vpj_scene_expanded != expanded) ls->vpj_scene_mixed = true;
+            ls->vpj_scene_expanded = expanded;
+            { std::lock_guard<std::mutex> pin(g_vpj_pinned_m); g_vpj_pinned = {sample, sel_depth, expanded}; }
             for (UINT i = 0; i < n; ++i) {
                 v[i].TopLeftX += dx;
                 v[i].TopLeftY += dy;
@@ -5285,51 +5438,7 @@ void vpj_before_draw(GL* l)
     l->RSSetViewports(n, n ? v : nullptr);
     t_vpj_self = false;
 }
-// Draw-replay probe (2026-11-06, SE5 smear): can the scene's draws be matched to the same draws
-// last frame, and are they posed in the vertex shader (no tessellation/geometry stages)? Every
-// draw on the live scene depth with a depth-testing pipeline adds a signature: pipeline, vertex
-// shader, counts, vertex buffer layout. The vertex buffer addresses are kept apart, so a match
-// whose buffers moved (double-buffered or compute-posed meshes) is counted separately.
-struct ReplayDraw { uint64_t sig = 0, vb = 0; bool tracked = false, stages = false; uint32_t instances = 0; };
-std::atomic<bool> g_rp_on{false};
-std::mutex g_rp_m;
-std::vector<ReplayDraw> g_rp_cur, g_rp_prev;
 uint64_t rp_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); return h; }
-void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
-{
-    if (!g_rp_on.load(std::memory_order_relaxed) || t_vpj_self) return;
-    uint64_t sel_depth = 0, sel_color = 0;
-    GetLiveSelection(&sel_depth, &sel_color);
-    if (!sel_depth) return;
-    ReplayDraw d;
-    {
-        std::shared_lock<RegistryLock> lock(g_m);
-        na_object_id id = 0;
-        auto* ls = list_state_locked(l, &id);
-        if (!ls) return;
-        std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (ls->cur_ds != sel_depth) return;
-        const na_ev_pipeline_created* pc = pso_created_locked(*ls);
-        if (!pc || pc->depth_enable != 1) return;
-        uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
-        h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
-        d.stages = pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS];
-        d.tracked = ls->raster_tracking;
-        if (d.tracked) {
-            h = rp_mix(h, ls->vertex_mask);
-            uint64_t vb = 0;
-            for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) {
-                h = rp_mix(h, ls->vertex_buffers[i].StrideInBytes); h = rp_mix(h, ls->vertex_buffers[i].SizeInBytes);
-                vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
-            }
-            if (ls->index_known) { h = rp_mix(h, ls->index_buffer.Format); vb = rp_mix(vb, ls->index_buffer.BufferLocation); }
-            d.vb = vb;
-        }
-        d.sig = h; d.instances = instances;
-    }
-    std::lock_guard<std::mutex> g(g_rp_m);
-    if (g_rp_cur.size() < 65536) g_rp_cur.push_back(d);
-}
 // ---- Draw replay (2026-11-06, SE5 sweatshirt smear; the TOX2-recomp idea in DX12): right after a
 // scene draw (live scene depth, depth test and write, triangle list, vertex shader only), the same
 // draw runs again with a stream-output twin of its pipeline (no pixel shader, nothing rasterised)
@@ -5415,13 +5524,29 @@ RpSlot* rp_find(uint64_t frame)
     for (uint32_t i = 0; i < g_rp_slots; ++i) if (rp_slot(i).frame == frame && rp_slot(i).buf) return &rp_slot(i);
     return nullptr;
 }
-std::atomic<uint64_t> g_rp_stat[32]; // see DrawReplayStats
+std::atomic<uint64_t> g_rp_stat[40]; // see DrawReplayStats
 enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
                   kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpOtherList,
                   kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpSegments, kRpPendingSegs,
-                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade, kRpStatCount };
-static_assert(kRpStatCount <= 32, "g_rp_stat size");
+                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade,
+                  kRpNotSampled, kRpDrawTooLarge, kRpFrameFull, kRpMoverDraws, kRpMoverVerts, kRpMoverLeftOut, kRpProbeVerts, kRpStatCount };
+static_assert(kRpStatCount <= 40, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
+// The vertex budget (core/replay_budget.hpp): which draws of a frame are replayed. The frame state
+// is under g_replay_slots_m; g_rp_full_frame lets every later draw of a full frame leave at the door.
+std::atomic<uint64_t> g_rp_budget{0}, g_rp_full_frame{0};
+std::atomic<uint32_t> g_rp_threshold_seen{na::replay_budget::kFull};
+constexpr uint32_t kRpRotateFrames = 240;
+// VARIANT: replay/movers-first (core/replay_movers.hpp). Known movers are replayed first, up to the
+// whole budget; every other draw is tried in turn on budget / kRpProbeShare vertices a frame, the
+// same draws for kRpProbeFrames frames (a draw needs three moving frames in a row of pairs to be
+// learned), then the next slice. The table and the frame state are under g_replay_slots_m.
+constexpr uint32_t kRpProbeShare = 4, kRpProbeFrames = 24;
+std::atomic<bool> g_rp_movers_on{false};
+na::replay_movers::Table g_rp_table;
+std::atomic<uint64_t> g_rp_movers{0}, g_rp_suspects{0}, g_rp_promoted{0}, g_rp_let_go{0}, g_rp_reports{0};
+uint64_t g_rp_learn_clock = 0; // reports are dated by their order (under g_replay_slots_m)
+struct RpBudgetFrame { uint64_t frame = 0, used = 0, offered = 0, mover_used = 0; uint32_t threshold = na::replay_budget::kFull, phase = 0; bool full = false, movers = false; } g_rpb;
 // 83b0749/8cc8cb6 runs: noted=240 built=0 twin_queued=0 no_recipe=0, so every draw
 // stopped at a gate before the recipe lookup without a count. Each gate is counted.
 enum : uint32_t { kGateNotDirect, kGateNoRetain, kGateNoDepth, kGateNoList, kGateOtherDepth, kGateRenderPass, kGateState, kGateBundle, kGatePredicate, kGateStreamOut,
@@ -5592,6 +5717,8 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
 {
     const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
     if (!frame) return;
+    // This frame has replayed its budget: nothing more to decide for the rest of its draws.
+    if (g_rp_full_frame.load(std::memory_order_relaxed) == frame) { rp_count(kRpFrameFull); return; }
     if (l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) { rp_gate(kGateNotDirect); return; }
     const auto retain = g_rp_retain.load(std::memory_order_acquire);
     if (!retain) { rp_gate(kGateNoRetain); return; }
@@ -5737,6 +5864,45 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     if (!verts) return;
     std::lock_guard<std::mutex> replay_lock(g_replay_slots_m);
     if (frame != g_rp_frame.load(std::memory_order_acquire)) return;
+    if (const uint64_t budget = g_rp_budget.load(std::memory_order_relaxed)) {
+        namespace rb = na::replay_budget;
+        const bool movers = g_rp_movers_on.load(std::memory_order_relaxed);
+        const uint64_t share = movers ? budget / kRpProbeShare : budget; // what the sampled draws may take
+        if (g_rpb.frame != frame) { // a new frame: the threshold follows what the last one offered and admitted
+            if (g_rpb.movers != movers) { g_rpb.threshold = rb::kFull; g_rpb.movers = movers; } // another rule: start it afresh
+            else if (g_rpb.frame) g_rpb.threshold = rb::NextThreshold(g_rpb.threshold, g_rpb.offered, g_rpb.used, share, g_rpb.full);
+            if (frame / kRpProbeFrames != g_rpb.frame / kRpProbeFrames) g_rpb.phase = rb::NextPhase(g_rpb.phase, g_rpb.threshold);
+            g_rpb.frame = frame; g_rpb.used = 0; g_rpb.offered = 0; g_rpb.mover_used = 0; g_rpb.full = false;
+            g_rp_threshold_seen.store(g_rpb.threshold, std::memory_order_relaxed);
+        }
+        if (movers && g_rp_table.IsMover(rec.sig, rec.vb)) {
+            // A draw known to move by itself: replayed while the movers together fit the budget.
+            if (g_rpb.mover_used + verts > budget) { rp_count(kRpMoverLeftOut); return; }
+            g_rpb.mover_used += verts;
+            rp_count(kRpMoverDraws);
+            rp_count(kRpMoverVerts, verts);
+        } else {
+            const rb::Verdict verdict = movers
+                ? rb::DecideWithin(rb::SweepValue(rec.sig, rec.vb, g_rpb.phase), g_rpb.threshold, verts, g_rpb.used, rb::DrawLimit(budget),
+                                   rb::ProbeFrameLimit(budget, share))
+                : rb::Decide(rb::DrawValue(rec.sig, rec.vb, frame, kRpRotateFrames), g_rpb.threshold, verts, g_rpb.used, budget);
+            switch (verdict) {
+            case rb::Verdict::DrawTooLarge: rp_count(kRpDrawTooLarge); return;
+            case rb::Verdict::NotSampled: g_rpb.offered += verts; rp_count(kRpNotSampled); return;
+            case rb::Verdict::FrameFull:
+                g_rpb.full = true;
+                // Without movers nothing later in the frame can be admitted: leave at the door from here on.
+                if (movers) g_rpb.offered += verts;
+                else g_rp_full_frame.store(frame, std::memory_order_relaxed);
+                rp_count(kRpFrameFull);
+                return;
+            case rb::Verdict::Admit:
+                g_rpb.offered += verts; g_rpb.used += verts;
+                if (movers) rp_count(kRpProbeVerts, verts);
+                break;
+            }
+        }
+    }
     const HostWorkScope own;
     RpSlot* found = rp_find(frame);
     uint32_t slot_index = found ? static_cast<uint32_t>(found - &rp_slot(0)) : 0;
@@ -5858,16 +6024,17 @@ struct ListHook<Slot, R(A...)> {
                 // second time; observe the outer call after it returns.
                 const HostWorkScope runtime;
                 return native_fn(forwarded_list,arguments...);
+            }else if constexpr(Slot==sl::list::ResourceBarrier){
+                struct Nest{Nest(){++t_barrier_nest;}~Nest(){--t_barrier_nest;}}nest;
+                return native_fn(forwarded_list,arguments...);
             }else return native_fn(forwarded_list,arguments...);
         };
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
             if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
-        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced)
-            if (!t_host_work && scope.outermost && !scope.ambiguous) {
-                const auto args = std::forward_as_tuple(a...);
-                replay_probe_draw(l, std::get<0>(args), std::get<1>(args), Slot == sl::list::DrawIndexedInstanced);
-            }
+        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch ||
+                      Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
+            if (t_dr_pending == l && !t_host_work && scope.outermost && !scope.ambiguous) depth_pending_before(l);
         if constexpr (Slot == sl::list::RSSetViewports || Slot == sl::list::Reset)
             if (scope.outermost && !scope.ambiguous) vpj_viewports_replaced(l, Slot == sl::list::Reset);
         if constexpr (Slot == sl::list::ResourceBarrier) {
@@ -6089,6 +6256,8 @@ struct ListHook<Slot, R(A...)> {
                 }
             }
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, a...);
+            if constexpr (Slot == sl::list::ResourceBarrier)
+                if (scope.outermost && !scope.ambiguous && !t_barrier_nest) after_depth_readable(l, a...);
         } else {
             const R r = fn(l, a...);
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, r, a...);
@@ -6254,7 +6423,7 @@ std::atomic<void*> g_copy_probe_user{nullptr};
 // at the submission boundary. APP_SYNC_UNKNOWN always.
 void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
 {
-    if (!na::observe_internal::Started() || !lists) return;
+    if (!na::observe_internal::Started() || !lists || na::observe_internal::KindSkipped(NA_EV_SNAPSHOT)) return;
     constexpr uint32_t kMaxSnaps = 64, kMaxBytes = 4096, kBudget = 64 * 1024;
     struct Out {
         na_ev_snapshot e;
@@ -6264,6 +6433,7 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
     uint32_t snaps = 0, total = 0;
     bool budget_reported = false;
     for (uint32_t li = 0; li < count; ++li) {
+        if (budget_reported) return;
         std::vector<ListState::Binding> binds;
         na_object_id lid = 0;
         uint64_t gen = NA_UNKNOWN_U64;
@@ -6273,7 +6443,11 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
             if (!ls) continue;
             gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
             std::lock_guard<std::mutex> bl(ls->bind_m);
-            binds = ls->bindings;
+            // At most the remaining count budget plus its one overflow receipt
+            // can be visited. Do not allocate/copy the other thousands of
+            // historical bindings while holding the game's recording lock.
+            const size_t needed=std::min<size_t>(ls->bindings.size(),kMaxSnaps-snaps+1);
+            binds.assign(ls->bindings.begin(),ls->bindings.begin()+needed);
         }
         for (const ListState::Binding& b : binds) {
             // C9-H3-REVIEW-1 #3: no de-duplication. Every binding keeps its own
@@ -7640,7 +7814,8 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id)
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
+    return ls->uses_sorted ? std::binary_search(ls->uses.begin(),ls->uses.end(),id) :
+        std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
 }
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth)
 {
@@ -7999,6 +8174,137 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
 }
 void SetTextureTraceListener(TextureTraceListener listener) { g_texture_trace_listener.store(listener, std::memory_order_release); }
 void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
+void SetDepthReadableListener(DepthReadableListener listener) { g_dr_listener.store(listener, std::memory_order_release); }
+void SetDepthPendingListener(DepthPendingListener listener) { g_dr_pending_listener.store(listener, std::memory_order_release); }
+void SetDepthReadPending(ID3D12GraphicsCommandList* list) { t_dr_pending = list; }
+bool ListHostDrawAllowed(ID3D12CommandList* list)
+{
+    if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
+           ls->raster_viewports_known && ls->raster_scissors_known && ls->raster_topology_known &&
+           ls->pso && ls->root_sig[0] && ls->nheaps && !ls->active_queries &&
+           ls->args[0].size() <= 64 && ls->args[1].size() <= 64;
+}
+bool ListHostCopyAllowed(ID3D12CommandList* list)
+{
+    if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return !ls->in_render_pass;
+}
+bool ListPredication(ID3D12CommandList* list, ID3D12Resource** buffer, UINT64* offset, D3D12_PREDICATION_OP* op)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->predicate) return false;
+    if (buffer) *buffer = ls->predicate;
+    if (offset) *offset = ls->predicate_offset;
+    if (op) *op = ls->predicate_op;
+    return true;
+}
+void ViewportJitterDropped(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (ls->vpj_applied) { ls->vpj_applied = false; ++ls->viewport_serial; }
+}
+void SetDepthReadTwin(ID3D12Resource* game_depth, ID3D12Resource* twin)
+{
+    // Twin first when setting, depth first when clearing: a view creation that sees the depth sees a twin.
+    if (game_depth) { g_dr_twin.store(twin, std::memory_order_release); g_dr_depth.store(game_depth, std::memory_order_release); }
+    else { g_dr_depth.store(nullptr, std::memory_order_release); g_dr_twin.store(nullptr, std::memory_order_release); }
+}
+uint32_t RedirectExistingDepthReads(ID3D12Resource* game_depth, ID3D12Resource* target)
+{
+    // Views of the depth plane the game made BEFORE the twin existed, and every copy of them the
+    // registry has seen, each recreated with the game's EXACT view description (component mapping,
+    // LOD clamp and all). A view whose description was not recorded is left alone.
+    // Found under the registry lock (which first applies every queued view write), written after
+    // it: the registry lock is never held across a D3D12 call. Each slot is then looked at again:
+    // one the game wrote in that gap gets the game's own view back.
+    if (!game_depth || !target) return 0;
+    struct Hit { DescHeap* heap; uint64_t slot; D3D12_CPU_DESCRIPTOR_HANDLE handle; std::shared_ptr<const DescriptorDetails> details; };
+    std::vector<Hit> hits;
+    na_object_id id = 0;
+    const auto depth_view = [&](const DescHeap::SlotInfo& si) {
+        return si.kind == NA_DESC_SRV && si.resource == id && si.details && si.details->explicit_view &&
+               si.details->srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && depth_plane_view(static_cast<uint32_t>(si.details->srv.Format));
+    };
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        id = id_locked(game_depth);
+        if (!id) return 0;
+        for (const auto& h : g_heaps) {
+            if (h->type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !h->stripes) continue;
+            for (uint32_t st = 0; st < h->nstripes; ++st) {
+                const uint64_t base = uint64_t(st) << kStripeShift;
+                if (base >= h->count) break;
+                std::shared_lock<std::shared_mutex> stripe(h->stripes[st]);
+                for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
+                    const auto& si = h->info[static_cast<size_t>(base + b)];
+                    if (si.kind != NA_DESC_SRV || si.resource != id || !depth_plane_view(si.format)) continue;
+                    if (!depth_view(si)) { g_dr_unknown_view.fetch_add(1, std::memory_order_relaxed); continue; }
+                    hits.push_back({h.get(), base + b, {static_cast<SIZE_T>(h->cpu_start + (base + b) * h->increment)}, si.details});
+                }
+            }
+        }
+    }
+    if (hits.empty()) return 0;
+    ID3D12Device* device = nullptr;
+    if (FAILED(target->GetDevice(IID_PPV_ARGS(&device))) || !device) return 0;
+    HostWorkScope own;
+    for (const Hit& hit : hits) o_CreateShaderResourceView(device, target, &hit.details->srv, hit.handle);
+    // Second look. `again`: the game wrote the slot meanwhile; what it wrote is put back as it was written.
+    struct Again { D3D12_CPU_DESCRIPTOR_HANDLE handle; std::shared_ptr<const DescriptorDetails> details; na_object_id resource; uint32_t kind; };
+    std::vector<Again> again;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        for (const Hit& hit : hits) {
+            bool live = false;
+            for (const auto& h : g_heaps) if (h.get() == hit.heap) { live = true; break; }
+            if (!live) continue; // the heap is gone; so is the slot
+            const SlotShared stripe(hit.heap, hit.slot);
+            const auto& si = hit.heap->info[static_cast<size_t>(hit.slot)];
+            if (si.details == hit.details) continue;
+            again.push_back({hit.handle, si.details, si.resource, si.kind});
+        }
+    }
+    for (const Again& a : again) {
+        g_dr_raced.fetch_add(1, std::memory_order_relaxed);
+        if (a.kind != NA_DESC_SRV || !a.details) continue; // not a view this can rebuild: counted, left as the sweep wrote it
+        ID3D12Resource* resource = a.resource == id ? target : AcquireResource(a.resource);
+        if (a.resource != id && !resource) continue;
+        const bool to_target = a.resource == id && a.details->explicit_view && a.details->srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+                               depth_plane_view(static_cast<uint32_t>(a.details->srv.Format));
+        ID3D12Resource* use = a.resource == id ? (to_target ? target : game_depth) : resource;
+        o_CreateShaderResourceView(device, use, a.details->explicit_view ? &a.details->srv : nullptr, a.handle);
+        if (a.resource != id) resource->Release();
+    }
+    device->Release();
+    g_dr_swept.fetch_add(hits.size(), std::memory_order_relaxed);
+    return static_cast<uint32_t>(hits.size());
+}
+DepthReadStats GetDepthReadStats()
+{
+    return {g_dr_created.load(std::memory_order_relaxed), g_dr_swept.load(std::memory_order_relaxed),
+            g_dr_readable.load(std::memory_order_relaxed), g_dr_other.load(std::memory_order_relaxed),
+            g_dr_unknown_view.load(std::memory_order_relaxed), g_dr_raced.load(std::memory_order_relaxed)};
+}
+
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {
     SetTextureOperationHook(TextureLane::Effects, std::move(hook));
@@ -8018,6 +8324,15 @@ void SetTextureOperationHook(TextureLane lane, std::shared_ptr<TextureOperationH
     } // callbacks and GPU-owning objects are released outside the registry lock
 }
 void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
+bool ListRasterStateTracked(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->raster_tracking && ls->restorable && !ls->in_render_pass;
+}
 bool ListRasterStateRestorable(ID3D12CommandList* list)
 {
     std::shared_lock<RegistryLock> lock(g_m);
@@ -9077,32 +9392,47 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y)
     g_vpj_ever.store(true, std::memory_order_relaxed);
     g_vpj.store(uint64_t(f32) << 32 | uint64_t(q(x)) << 16 | q(y), std::memory_order_release);
 }
-void SetReplayProbe(bool on) { g_rp_on.store(on, std::memory_order_relaxed); }
-bool ReplayProbeFrame(ReplayProbeStats* out)
+void SetDepthWriteEvidence(bool on) { g_de_on.store(on, std::memory_order_relaxed); }
+DepthWriteEvidence ListDepthWriteEvidence(ID3D12CommandList* list, uint64_t depth)
 {
-    std::vector<ReplayDraw> cur;
-    { std::lock_guard<std::mutex> g(g_rp_m); cur.swap(g_rp_cur); }
-    ReplayProbeStats st{};
-    st.draws = static_cast<uint32_t>(cur.size());
-    std::unordered_map<uint64_t, std::vector<uint64_t>> prev; // signature -> buffer hashes, in order
-    for (const auto& d : g_rp_prev) prev[d.sig].push_back(d.vb);
-    std::unordered_map<uint64_t, uint32_t> used, seen;
-    for (const auto& d : cur) {
-        if (!d.tracked) ++st.untracked;
-        if (d.stages) ++st.extra_stages;
-        if (d.instances > 1) ++st.instanced;
-        if (++seen[d.sig] == 1) ++st.unique;
-        auto it = prev.find(d.sig);
-        uint32_t& u = used[d.sig];
-        if (it == prev.end() || u >= it->second.size()) continue;
-        ++st.matched;
-        if (it->second[u] == d.vb) ++st.same_buffers; else ++st.moved_buffers;
-        ++u;
-    }
-    st.prev_draws = static_cast<uint32_t>(g_rp_prev.size());
-    g_rp_prev.swap(cur);
-    *out = st;
-    return st.draws || st.prev_draws;
+    DepthWriteEvidence e;
+    if (!list || !depth) return e;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list_state_locked(list, &id);
+    if (!ls) return e;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    const DepthWrites& d = ls->de;
+    if (d.depth != depth) return e; // nothing recorded about this depth
+    e.depth = d.depth;
+    e.less = d.less; e.greater = d.greater; e.equal = d.equal; e.other = d.other;
+    e.clears = d.clears; e.clear_mixed = d.clear_mixed;
+    std::memcpy(&e.clear, &d.clear_bits, sizeof d.clear_bits);
+    return e;
+}
+void SetDrawReplayBudget(uint64_t expanded_vertices)
+{
+    g_rp_budget.store(expanded_vertices, std::memory_order_relaxed);
+}
+void SetDrawReplayMovers(bool on)
+{
+    if (g_rp_movers_on.exchange(on, std::memory_order_relaxed) == on || on) return;
+    std::lock_guard<std::mutex> lock(g_replay_slots_m); // turned off: what was learned goes with it
+    g_rp_table.Clear();
+    g_rp_movers.store(0, std::memory_order_relaxed);
+    g_rp_suspects.store(0, std::memory_order_relaxed);
+}
+void ReplayLearn(const ReplayObservation* seen, size_t count)
+{
+    if (!seen || !count || !g_rp_movers_on.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_replay_slots_m);
+    ++g_rp_learn_clock;
+    for (size_t i = 0; i < count; ++i) g_rp_table.Report(seen[i].sig, seen[i].vb, seen[i].visible, seen[i].apart, g_rp_learn_clock);
+    g_rp_reports.fetch_add(count, std::memory_order_relaxed);
+    g_rp_movers.store(g_rp_table.Movers(), std::memory_order_relaxed);
+    g_rp_suspects.store(g_rp_table.Suspects(), std::memory_order_relaxed);
+    g_rp_promoted.store(g_rp_table.Promoted(), std::memory_order_relaxed);
+    g_rp_let_go.store(g_rp_table.LetGo(), std::memory_order_relaxed);
 }
 void SetDrawReplay(uint64_t frame, ReplayRetain retain)
 {
@@ -9188,6 +9518,13 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
     out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
     out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired); out->slots = v(kRpSlotsMade);
+    out->not_sampled = v(kRpNotSampled); out->draw_too_large = v(kRpDrawTooLarge); out->frame_full = v(kRpFrameFull);
+    out->budget = g_rp_budget.load(std::memory_order_relaxed); out->budget_threshold = g_rp_threshold_seen.load(std::memory_order_relaxed);
+    out->movers_on = g_rp_movers_on.load(std::memory_order_relaxed);
+    out->movers = g_rp_movers.load(std::memory_order_relaxed); out->suspects = g_rp_suspects.load(std::memory_order_relaxed);
+    out->promoted = g_rp_promoted.load(std::memory_order_relaxed); out->let_go = g_rp_let_go.load(std::memory_order_relaxed);
+    out->mover_draws = v(kRpMoverDraws); out->mover_verts = v(kRpMoverVerts); out->movers_left_out = v(kRpMoverLeftOut);
+    out->probe_verts = v(kRpProbeVerts); out->reports = g_rp_reports.load(std::memory_order_relaxed);
     static const char* const names[kGateCount] = {"not_direct", "no_retain", "no_depth", "no_list", "other_depth", "render_pass", "no_pso", "bundle", "predicated", "stream_out",
         "recording", "no_pipeline", "no_depth_write", "msaa", "viewport", "root_mismatch", "root_unknown", "direct_heap", "vs_uav", "no_vb", "admitted_depth_tested"};
     int used = 0;
@@ -9205,6 +9542,31 @@ bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float
     if (frame) *frame = static_cast<uint32_t>(packed >> 32);
     if (x) *x = vpj_axis(packed, 16);
     if (y) *y = vpj_axis(packed, 0);
+    return true;
+}
+bool SceneRasterFor(ID3D12CommandList* list, uint64_t depth, SceneRaster& out)
+{
+    out = {};
+    if (!depth) return false;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list ? list_state_locked(list, &id) : nullptr;
+        if (ls) {
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            if (ls->vpj_scene && ls->vpj_depth == depth) {
+                if (ls->vpj_scene_mixed) return false;
+                out = {ls->vpj_scene, ls->vpj_scene_expanded, true};
+                return true;
+            }
+        }
+    }
+    // Another recording drew the scene. Its pin counts only for this depth and for the sample the
+    // frame being recorded now carries (a pin left from an earlier frame says nothing about this one).
+    const uint64_t current = g_vpj.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> pin(g_vpj_pinned_m);
+    if (!current || g_vpj_pinned.sample != current || g_vpj_pinned.depth != depth) return false;
+    out = {g_vpj_pinned.sample, g_vpj_pinned.expanded, false};
     return true;
 }
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
