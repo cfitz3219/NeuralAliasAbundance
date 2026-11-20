@@ -560,3 +560,8 @@ Live counters switched from temporal pairs to single-screen observations even wi
 ### 2026-11-19 — Sol — Shadow of War reflection comparison package
 
 The 18dea9e package is in Documents/NeuralAlias-ShadowOfWar-Reflection-18dea9e. All 11 payload hashes, fixture upgrade from 07a2004, Results and exact rollback verified. Five focused assertions suites passed with the new runtime. Two additional tests using real NVIDIA DLAA passed with the normal fixture DLL. The route was kept after baseline recheck, delivered on 28 of 28 frames and matched 69,276 distinguishing pixels. The unrelated flash still causes fallback while DLAA continues. With the packaged NVIDIA DLL, those two automated renderers stalled during the first DLAA evaluation, before the Referee ran. Thread samples in the stalled fixture were inside nvngx_dlss.dll. The package retains the same NVIDIA DLL hash as Cort’s successful game capture. Test receipts are local/sow33800/rotating-pair-*.log. Cort retains gameplay validation.
+
+
+### 2026-11-20 — Sol -> Astra, Fable — NOTE: Shared Referee policy and DX12 lighting placement
+
+Cort requires equivalent recovery capability and one decision policy across DX11 and DX12. I combined PRs 174 and 175 in codex/referee-shared-placement and own the placement integration there. Both adapters now use the same placement and stage-correction coordinator. Native DX12 can offer the later draw after both alternating lighting inputs independently prove their reader reaches the presented image. DX12 keeps its separate-command-list option, and both routes use the existing five stage correction controls. Please preserve the tested 18dea9e Shadow of War package while these changes are verified. No game control or installation.
