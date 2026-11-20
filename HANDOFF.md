@@ -162,3 +162,6 @@ PR 183 includes Opus's PR 185, scoped parity admission and continuity across an 
 
 ### 2026-11-20 Pacific — Sniper Elite 4 corrected installer
 Documents/NeuralAlias-SniperElite4-DX12-ddf55beb-SceneDiscovery supersedes the original ddf55beb package. Same runtime, installer and Results from 45eca490. The original Auto profile left DX12 scene discovery off. The corrected profile starts discovery with the shipped DLL and updates the old package cleanly. The live run had zero evaluations even though the Referee switch was enabled during the session. Corrected live gameplay is pending.
+
+### 2026-11-20 Pacific — Sniper Elite 4 launch recovery
+The ddf55beb-SceneDiscovery package crashed twice before core attachment. Use Documents/NeuralAlias-SniperElite4-DX12-31463de6-FactoryStart. The new profile waits for the game's first successful DXGI factory call to start the host, then enables scene discovery. The generated profile and shipped DLL pass the factory startup check, and upgrade and rollback were verified in a fixture. Game launch and delivery remain to be confirmed by Cort.
