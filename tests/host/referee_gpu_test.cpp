@@ -13,7 +13,7 @@
 #include "core/referee_recovery.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/diag/event_log.hpp"
-#include "host_dx12/j2/referee_placement.hpp"
+#include "core/referee_placement.hpp"
 #include "host_dx12/settings.hpp"
 
 #include <cmath>
@@ -707,14 +707,15 @@ int main()
             if (mode == 2) CHECK(measured.delivered && !((measured.tiles.input | measured.tiles.output) & 1));
             if (mode >= 3) CHECK(mode == 3 ? measured.bypassed : measured.delivered);
         }
-        na::j2::PlacementTrial regional;
+        PlacementTrial regional;
+        const PlacementTrial::Scope scope{1, 2, 3, 1};
         TracePair nomination{t_output.Get(), split.Get(), true, 714, 711};
         nomination.alternate = PlacementPath::Between;
         Sleep(150);
         REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, split.Get()}, got,
                            false, nullptr, nullptr, false, false, false, false, 0, false, &nomination));
         REQUIRE(rg::TakeTrialSample(nomination.ticket, measured));
-        REQUIRE(regional.Begin(measured, ordinal, GetTickCount64(), 1));
+        REQUIRE(regional.Begin(scope, measured, ordinal, GetTickCount64()));
         for (unsigned arm = 0; arm < 3; ++arm) {
             ordinal += RouteTrial::warmup_frames + 1;
             const auto ticket = regional.Ticket(ordinal);
@@ -732,23 +733,30 @@ int main()
                                     arm, unsigned(measured.tiles.input), unsigned(measured.tiles.output), unsigned(measured.comparable));
                 CHECK(arm == 1 ? measured.delivered : measured.tiles.Mixed());
                 regional.Tick(GetTickCount64(), true);
-                regional.Add(ticket, measured, ordinal, GetTickCount64());
+                regional.Add(scope, ticket, measured, ordinal, GetTickCount64());
             }
         }
         CHECK(regional.Comparison().Regional() && regional.Comparison().Current() == RouteTrial::Phase::Kept);
         // The test reflector alternates about one stop. The alternative either
         // removes it, delivers the same artifact, or puts the input on screen.
         for (unsigned mode = 0; mode < 3; ++mode) {
-            RouteTrial trial;
+            PlacementTrial placement;
             using Phase = RouteTrial::Phase;
-            trial.Start(40 + mode, ordinal + 1, GetTickCount64());
+            const auto& trial = placement.Comparison();
+            TracePair reflection{t_output.Get(), t_screen.Get(), true, 952 + mode * 8u, 70};
+            Sleep(150);
+            REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), lit_out.Get(), nullptr, lit_display.Get()},
+                               got, false, nullptr, nullptr, false, false, false, false, 0, false, &reflection));
+            REQUIRE(rg::TakeTrialSample(reflection.ticket, measured));
+            CHECK(measured.delivered && !measured.tiles.Mixed());
+            REQUIRE(placement.Begin(scope, measured, ordinal, GetTickCount64()));
             for (unsigned arm = 0; arm < 3 && trial.Active(); ++arm) {
                 ordinal += RouteTrial::warmup_frames + 1;
-                const auto ticket = trial.Ticket(ordinal);
+                const auto ticket = placement.Ticket(ordinal);
                 REQUIRE(ticket);
                 const bool quiet = arm == 1 && mode == 0;
                 const bool bypass = arm == 1 && mode == 2;
-                for (unsigned i = 0; i < RouteTrial::samples && trial.Ticket(ordinal) == ticket; ++i) {
+                for (unsigned i = 0; i < RouteTrial::samples && placement.Ticket(ordinal) == ticket; ++i) {
                     const bool reverse = i % 2 != 0;
                     TracePair trace{!quiet && reverse ? lit_out.Get() : t_output.Get(),
                                     !quiet && reverse ? lit_display.Get() : t_screen.Get(), true, ticket, 70};
@@ -763,7 +771,7 @@ int main()
                     CHECK(measured.ordinal == ordinal && measured.configuration == 70);
                     CHECK(measured.delivered != bypass && measured.bypassed == bypass);
                     CHECK(!rg::TakeTrialSample(ticket, measured));
-                    trial.Add(ticket, measured, ordinal + 1);
+                    placement.Add(scope, ticket, measured, ordinal, GetTickCount64());
                 }
             }
             std::printf("screen trial case %u: %s stops %.3f/%.3f/%.3f (%s)\n", mode, trial.Name(),
@@ -771,7 +779,7 @@ int main()
             CHECK(trial.Current() == (mode == 0 ? Phase::Kept : Phase::Rejected));
             if (mode == 0) {
                 ordinal += RouteTrial::warmup_frames + 1;
-                const auto watch = trial.Ticket(ordinal);
+                const auto watch = placement.Ticket(ordinal);
                 REQUIRE(watch);
                 for (unsigned i = 0; i < 4; ++i) {
                     const bool reverse = i % 2 != 0;
@@ -782,7 +790,7 @@ int main()
                                        nullptr, reverse ? t_screen.Get() : lit_display.Get()}, got,
                                        false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
                     REQUIRE(rg::TakeTrialSample(watch, measured));
-                    trial.Add(watch, measured, ordinal + 1);
+                    placement.Add(scope, watch, measured, ordinal, GetTickCount64());
                 }
                 CHECK(trial.Current() == Phase::Rejected && !trial.UsesCandidate());
             }

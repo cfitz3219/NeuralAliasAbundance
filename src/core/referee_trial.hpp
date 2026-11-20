@@ -144,6 +144,7 @@ class RouteTrial {
 public:
     enum class Phase : uint8_t { Idle, Baseline, Candidate, ConfirmBaseline, Kept, Rejected };
     static constexpr unsigned samples = 4;
+    static constexpr float minimum_flicker = .12f;
     static constexpr uint64_t warmup_frames = 16, maximum_ms = 18000;
 
     void Start(uint64_t id, uint64_t frame, uint64_t now)
@@ -164,11 +165,6 @@ public:
     }
     bool RuledOut() const { return phase_ == Phase::Rejected && ruled_out_; }
     bool Regional() const { return regional_; }
-    void ObserveRejectedSetup(const TrialSample& sample)
-    {
-        if (phase_ == Phase::Rejected && !retry_at_ && (baseline_ || regional_) && !SameSetup(anchor_, sample))
-            Retry("the display layout or evaluation settings changed");
-    }
     Phase Current() const { return phase_; }
     const char* Name() const
     {
@@ -260,7 +256,7 @@ public:
                 watch_at_ = now_;
                 window_[count_++] = sample;
                 const TrialSample* pattern = nullptr;
-                if (count_ >= samples && Repeated(region_, nullptr, pattern) >= .12f) {
+                if (count_ >= samples && Repeated(region_, nullptr, pattern) >= minimum_flicker) {
                     Retry("flicker appeared in the region recovered by the replacement");
                 } else if (count_ == window_.size()) {
                     std::move(window_.begin() + 1, window_.end(), window_.begin());
@@ -310,7 +306,7 @@ public:
                             SameSetup(first, window_[i]);
                 }
                 if (mixed) {
-                    if (strongest < .12f) {
+                    if (strongest < minimum_flicker) {
                         anchor_ = first;
                         for (unsigned i = 0; i < kTiles; ++i) if (first.tiles.input & (1u << i)) {
                             const auto at = first.tiles.at[i];
@@ -322,9 +318,9 @@ public:
                     anchor_.tiles = first.tiles;
                 } else if (mixed_frames >= 2) strongest = 0;
                 regional_ = mixed;
-                spatial_only_ = mixed && strongest < .12f;
+                spatial_only_ = mixed && strongest < minimum_flicker;
             }
-            bool comparable = strongest >= .12f || spatial_only_;
+            bool comparable = strongest >= minimum_flicker || spatial_only_;
             for (unsigned i = 0; regional_ && comparable && i < count_; ++i)
                 comparable = anchor_.tiles.Compare(window_[i].tiles) == RegionalTiles::Match::Original;
             for (unsigned i = 0; comparable && i < count_; ++i) comparable = SameView(anchor_, window_[i]);
@@ -363,7 +359,7 @@ public:
                 Reject("the replacement lost visible detail in the affected area");
                 return;
             }
-            if (spatial_only_ && replacement_ >= .12f) {
+            if (spatial_only_ && replacement_ >= minimum_flicker) {
                 Reject("new visible variation during the regional replacement");
                 return;
             }

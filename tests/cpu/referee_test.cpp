@@ -10,7 +10,7 @@
 #include "test_support.hpp"
 #include "core/referee_selection.hpp"
 #include "core/referee_recovery.hpp"
-#include "host_dx12/j2/referee_placement.hpp"
+#include "core/referee_placement.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include <cmath>
 #include <cstdio>
@@ -506,8 +506,7 @@ int main()
         for (unsigned c = 1; c <= 5; ++c)
             check(regional_case(c, true).Current() == Phase::Rejected, "reject unchanged, damaged, relocated or newly flickering regional trial");
         check(regional_case(0, false).Current() == Phase::Rejected, "an original bypass that does not recur cannot certify a replacement");
-        using Dx12 = na::j2::PlacementTrial;
-        using Path = Dx12::Path;
+        using Path = shadow::Path;
         const auto placement_sample = [](uint64_t ordinal, uint64_t now, bool alternate, bool repaired) {
             TrialSample sample;
             sample.ordinal = ordinal;
@@ -525,14 +524,13 @@ int main()
             return sample;
         };
         for (bool repaired : {true, false}) {
-            Dx12 trial;
+            PlacementTrial trial;
+            const PlacementTrial::Scope scope{31, 41, 3, 12};
             auto witness = placement_sample(1, 100, false, false);
-            auto no_reader = witness;
-            no_reader.alternate = {};
-            check(!trial.Begin(no_reader, 3, 102, 12), "DX12: mixed output alone cannot nominate a handoff");
-            check(!trial.Begin(witness, 300, 103, 12), "DX12: old proof cannot start a trial");
-            check(trial.Begin(witness, 3, 103, 12), "DX12: accepted mixed output with separate reader starts baseline");
-            check(!trial.Matches(31, 41, 4, 12) && !trial.Matches(31, 41, 3, 13), "DX12: scene epoch and selection own the trial");
+            check(!trial.Begin({}, witness, 3, 102), "mixed output alone cannot nominate a reader");
+            check(!trial.Begin(scope, witness, 300, 103), "old proof cannot start a trial");
+            check(trial.Begin(scope, witness, 3, 103), "mixed output with a proved reader starts baseline");
+            check(!trial.Matches({31, 41, 4, 12}) && !trial.Matches({31, 41, 3, 13}), "scene epoch and selection own the trial");
             uint64_t ordinal = 3;
             const auto arm = [&](bool candidate, bool improves) {
                 ordinal += 2 + RouteTrial::warmup_frames;
@@ -541,11 +539,9 @@ int main()
                     auto sample = placement_sample(ordinal, tick, candidate, improves);
                     trial.Tick(tick, true);
                     const auto ticket = trial.Ticket(ordinal);
-                    auto wrong_scope = sample;
-                    wrong_scope.context.depth++;
-                    trial.Add(ticket, wrong_scope, ordinal, tick);
-                    trial.Add(ticket ^ 8u, sample, ordinal, tick);
-                    trial.Add(ticket, sample, ordinal, tick);
+                    trial.Add({31, 42, 3, 12}, ticket, sample, ordinal, tick);
+                    trial.Add(scope, ticket ^ 8u, sample, ordinal, tick);
+                    trial.Add(scope, ticket, sample, ordinal, tick);
                 }
             };
             arm(false, false);
@@ -564,11 +560,41 @@ int main()
                 check(trial.Comparison().RuledOut() && !trial.UsesCandidate(),
                     "DX12: unchanged regional bypass rules out this handoff");
                 witness = placement_sample(ordinal, 10000, false, false);
-                check(!trial.Begin(witness, ordinal, 10000, 12), "DX12: remember failed handoff for the same view and settings");
+                check(!trial.Begin(scope, witness, ordinal, 10000), "remember failed handoff for the same view and settings");
+                auto next_reader = trial;
+                check(next_reader.BeginVerified({31, 41, 3, 12, 19}, ordinal, 10000),
+                    "a failed handoff cannot rule out a different proved reader");
                 witness.context.trial_configuration++;
                 witness.configuration++;
-                check(trial.Begin(witness, ordinal, 10000, 12), "DX12: a changed configuration can qualify for a new comparison");
+                check(trial.Begin(scope, witness, ordinal, 10000), "a changed configuration can qualify for a new comparison");
             }
+        }
+        // Same localized strobe, same proved logical scene. Exercise both
+        // adapters' receipt shapes, including two independently proved owners.
+        for (auto path : {Path::Native11, Path::Inline}) {
+            PlacementTrial trial;
+            const PlacementTrial::Scope scope{31, 41, 3, 12};
+            auto sample = placement_sample(1, 100, false, true);
+            sample.context.placement = {path, 17};
+            check(!trial.Begin(scope, sample, 1, 100), "quiet fully delivered output stays on its current route");
+            sample.change[13].fill(.24f);
+            check(trial.Begin(scope, sample, 1, 100), "localized flicker can start a placement trial with full delivery");
+            uint64_t ordinal = 1;
+            for (unsigned arm = 0; arm < 3; ++arm) {
+                ordinal += RouteTrial::warmup_frames + 2;
+                for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
+                    sample.ordinal = ordinal;
+                    sample.observed_at = ordinal + 100;
+                    sample.context.color = arm == 1 ? 31 + (i % 2) : 31;
+                    sample.context.placement.path = arm == 1 && path == Path::Inline ? Path::Between : path;
+                    sample.change[13].fill(arm == 1 ? .01f : (i % 2 ? .24f : -.24f));
+                    const auto ticket = trial.Ticket(ordinal);
+                    trial.Tick(sample.observed_at, true);
+                    trial.Add(scope, ticket, sample, ordinal, sample.observed_at);
+                }
+            }
+            check(trial.Comparison().Current() == Phase::Kept && trial.UsesCandidate(),
+                "both receipt shapes keep the later placement only after the same flicker decreases");
         }
         RegionalTiles overlap;
         overlap.Set({3, 12}, 960, 540, {});

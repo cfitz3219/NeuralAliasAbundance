@@ -321,13 +321,17 @@ std::atomic<bool> g_installed{false};
 SceneCallback g_cb = nullptr;
 void* g_cb_user = nullptr;
 TrialReader g_trial_reader = nullptr;
-uint64_t g_trial_serial = 0;
 
 std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
 ScreenCheck g_screen;
 LitScene g_lit;
+referee::PlacementTrial g_placement{uint64_t{1} << 57};
 referee::StageRecovery g_recovery;
+referee::PlacementTrial::Scope LightingScope()
+{
+    return {g_lit.incarnations[0], g_lit.depth_incarnation, g_lit.generation};
+}
 std::atomic<Id> g_lit_peer{0};
 uint64_t g_last_lit_generation = 0;
 std::atomic<bool> g_screen_enabled{false};
@@ -1453,9 +1457,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.boundary = boundary;
     f.screen_proof = lit_color ? lit_proof : verified_reader ? g_screen.Proof() : 0;
     if (g_trial_reader && g_screen_enabled.load(std::memory_order_relaxed)) {
-        auto& placement = g_lit.trial;
-        if (placement.Active() || placement.UsesCandidate()) {
-            if (placement.UsesCandidate() == bool(lit_color)) f.trial_ticket = placement.Ticket(g_frame);
+        if (g_placement.Matches(LightingScope())) {
+            if (g_placement.UsesCandidate() == bool(lit_color)) f.trial_ticket = g_placement.Ticket(g_frame);
         } else if (!lit_color) {
             g_recovery.SetScene({f.color.incarnation, f.depth.incarnation, f.color.active_w, f.color.active_h,
                 f.color.mip, f.depth.mip, f.color.array_slice, f.depth.array_slice, f.color.active_x, f.color.active_y});
@@ -3039,31 +3042,26 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_lit.Finish(check_lit && (picked.color == order.late || picked.color == order.early) && picked.depth == order.depth
                  ? order : FrameModel::LitOrder{});
     if (g_trial_reader && check_lit) {
-        using Phase = referee::RouteTrial::Phase;
-        auto& trial = g_lit.trial;
-        const auto before = trial.Current();
-        const auto now = GetTickCount64();
-        const bool placement_owned_frame = trial.Active() || trial.UsesCandidate();
-        static referee::TrialSample sample; // provider lock, initialized once; reader overwrites on success
-        if (!placement_owned_frame && referee::AdvanceRecovery(g_recovery, g_frame - 1, now, g_trial_reader, sample))
-            trial.ObserveRejectedSetup(sample);
-        if (before != Phase::Idle || g_lit.steer) {
-            if (g_lit.steer && trial.CanStart(now) && !g_recovery.Busy()) {
-                g_recovery.Suspend();
-                trial.Start(++g_trial_serial, g_frame, now);
-            }
-            const bool available = g_lit.steer && (!trial.UsesCandidate() || g_frame_delivered_lit);
-            trial.Tick(now, available);
-            const auto ticket = trial.Ticket(g_frame - 1);
-            if (placement_owned_frame && g_lit.steer && ticket && g_trial_reader(ticket, sample)) trial.Add(ticket, sample, g_frame);
-            if (before != trial.Current())
-                na::eventlog::Emit("native11_route_trial",
-                    "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u why=%s",
-                    (unsigned long long)g_frame, trial.Name(), trial.Region(),
-                    trial.Baseline(), trial.Candidate(), trial.Confirmation(), unsigned(trial.Regional()), trial.Reason());
-        }
-        g_lit.steer = g_lit.steer && trial.UsesCandidate();
-    } else g_recovery.Clear();
+        const auto before = g_placement.Comparison().Current();
+        const auto scope = g_lit.steer ? LightingScope() : referee::PlacementTrial::Scope{};
+        static referee::TrialSample sample;
+        referee::AdvancePlacement(g_placement, scope, bool(scope), bool(scope), g_frame_delivered_lit,
+            g_recovery, g_frame - 1, GetTickCount64(), g_trial_reader,
+            [&](const referee::TrialSample& seen, bool, bool) {
+                return seen.context.placement.path == referee::shadow::Path::Native11 &&
+                    seen.context.depth == scope.depth;
+            }, sample);
+        const auto& trial = g_placement.Comparison();
+        if (before != trial.Current())
+            na::eventlog::Emit("native11_route_trial",
+                "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u why=%s",
+                (unsigned long long)g_frame, trial.Name(), trial.Region(),
+                trial.Baseline(), trial.Candidate(), trial.Confirmation(), unsigned(trial.Regional()), trial.Reason());
+        g_lit.steer = g_lit.steer && g_placement.UsesCandidate();
+    } else {
+        if (g_placement.OwnsComparison()) g_placement.Invalidate(GetTickCount64());
+        g_recovery.Clear();
+    }
     if (was_steering != g_lit.steer)
         na::eventlog::Emit("native11_lit_role", "next_frame=%llu steering=%d", (unsigned long long)g_frame, int(g_lit.steer));
     g_lit_peer.store(g_lit.Learned() ? g_lit.Peer(picked.color) : 0, std::memory_order_relaxed);

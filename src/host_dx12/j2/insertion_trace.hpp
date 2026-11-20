@@ -1,9 +1,33 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 #include <map>
 
 namespace na::j2 {
+// A reader can follow a later lighting image only if its final writer
+// used a same-view image from the same scene and depth, with an observed
+// write-to-read interval. Mirrored occurrences are proved separately.
+template<class Operations, class View, class Writer, class HasGap>
+uint64_t LightingPeer(const Operations& ops, size_t reader, uint64_t scene, uint64_t depth,
+                      const View& input, Writer writer, HasGap has_gap)
+{
+    const size_t light = writer(input.id, reader);
+    if (light >= reader || light != writer(input.id, ops.size()) || has_gap(light, reader)) return 0;
+    const auto& op = ops[light];
+    if (op.paired_depth != depth || !op.direct || !op.reflected || op.inferred || op.heap_indexing || op.late) return 0;
+    uint64_t peer = 0;
+    for (const auto& base : op.in) {
+        if (!base.whole || !input.whole || base.id == input.id || base.w != input.w || base.h != input.h ||
+            base.vfmt != input.vfmt || (input.id != scene && base.id != scene)) continue;
+        const auto base_writer = writer(base.id, light);
+        if (base_writer >= light || ops[base_writer].paired_depth != depth || has_gap(base_writer, light)) continue;
+        if (peer && peer != base.id) return 0;
+        peer = base.id;
+    }
+    return peer;
+}
+
 // CPU-only recording evidence; never retains game objects or waits for the GPU.
 // A read binding is an insertion candidate, not proof of an AA/tonemap shader.
 // Operation kinds (P4-0D consumer anchor). Op::Unknown events are classified from

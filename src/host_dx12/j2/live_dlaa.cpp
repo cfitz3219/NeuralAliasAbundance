@@ -29,7 +29,6 @@
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/screen_marker.hpp"
-#include "host_dx12/j2/referee_placement.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
@@ -133,6 +132,8 @@ struct PendingHistory {
     bool keep_reset = false; // a repeated frame: DLSS did not run, a pending history reset still applies
     uint64_t selection_version = 0; // live scene selection this evaluation used (same epoch = same version)
     bool referee_handoff = false; // this recording used a validated separate-list reader
+    uint64_t referee_logical_color = 0; // physical lighting input differs from the selected scene id
+    std::shared_ptr<na::observe::NativeOperation> referee_lighting_reader;
     // Camera-free DLAA: this frame's motion was measured on the pictures (no camera gave it), and
     // whether the frame carried a DLSS reset (the reset a measured scene cut waits for).
     bool measured = false, reset = false;
@@ -196,8 +197,10 @@ struct DeferredNativeScale {
 struct State {
     std::mutex m;
     referee::StageRecovery recovery{true};
-    PlacementTrial placement_trial;
+    referee::PlacementTrial placement_trial;
     uint64_t placement_submitted = 0;
+    uint64_t placement_unproved = 0;
+    uint64_t placement_lighting = 0; // shader of the proved rotating reader, zero for a separate-list handoff
     const void* recovery_swapchain = nullptr;
     std::atomic<bool> enabled{false};
     std::atomic<bool> configured{false};
@@ -578,11 +581,12 @@ struct NativeCrossing {
     bool input_is_last_draw = false;
     uint32_t input_param=UINT_MAX, input_offset=0;
     uint64_t native_depth = 0; // a native DLAA candidate must still pair with this depth
+    uint64_t light_peer = 0; // independently proved peer of a rotating lighting input
     bool operator==(const NativeCrossing& b) const {
         return pso==b.pso&&input==b.input&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
             gx==b.gx&&gy==b.gy&&gz==b.gz&&separate_reader==b.separate_reader&&
-            input_param==b.input_param&&input_offset==b.input_offset&&native_depth==b.native_depth;
+            input_param==b.input_param&&input_offset==b.input_offset&&native_depth==b.native_depth&&light_peer==b.light_peer;
     }
     // The same step reading another render-size image (p27252: SE5's pso 556 alternates its
     // input between #13433 and #13435 while the output #13437 stays).
@@ -590,6 +594,10 @@ struct NativeCrossing {
         return pso==b.pso&&output==b.output&&scene==b.scene&&
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
             gx==b.gx&&gy==b.gy&&gz==b.gz&&input_param==b.input_param&&input_offset==b.input_offset;
+    }
+    bool lighting_pair(const NativeCrossing& other) const {
+        return light_peer && light_peer == other.input && other.light_peer == input &&
+            native_depth == other.native_depth && same_step(other);
     }
 };
 struct TraceOp {
@@ -619,6 +627,7 @@ struct NativeTrace{
     std::mutex m;std::atomic<bool> armed{false};
     std::atomic<bool> refresh_requested{false};
     uint64_t refresh_at=0;
+    uint64_t lighting_probe_at = 0, lighting_search_at = 0;
     uint32_t frames=0,untraced=0,traced_lists=0;uint64_t ops=0,traces=0,presents=0,armed_at=0;
     // 83b0749 run: presented=1963 never connected, untraced=1 every trace.
     // Which list that is: id/recording, list type, queue type, position among the frame's ops.
@@ -653,6 +662,20 @@ struct NativeTrace{
     uint32_t learned_interval=900; // presents between re-verifying traces once learned (tests shorten it)
     char result[4096]{};
     NativeCrossing previous, learned;
+    NativeCrossing lighting[2];
+    std::atomic<uint64_t> lighting_pso{0}, active_lighting{0};
+    bool find_lighting = false;
+    void ClearLighting() {
+        lighting[0] = lighting[1] = {};
+        lighting_probe_at = 0;
+        lighting_search_at = 0;
+        lighting_pso.store(0, std::memory_order_release);
+        active_lighting.store(0, std::memory_order_release);
+        find_lighting = false;
+    }
+    bool ProvedLighting(const NativeCrossing& reader) const {
+        return lighting[0] == reader || lighting[1] == reader;
+    }
     bool native_resolution = false;
     uint64_t discovery_color = 0, discovery_depth = 0;
     ID3D12CommandQueue* discovery_queue = nullptr;
@@ -1092,7 +1115,11 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         // Offer only actual readers of the selected, depth-paired scene after its
         // final write. Ask the existing screen probe which consumer survives.
         const auto scene_writer = writer(scene, ops.size());
-        if (scene_writer < ops.size() && depth && ops[scene_writer].paired_depth == depth && !g_trace.learned.pso) {
+        const bool inspect_lighting = g_trace.find_lighting && !g_trace.lighting_pso.load(std::memory_order_relaxed);
+        if (g_trace.provisional.light_peer && inspect_lighting &&
+            g_trace.presents - g_trace.lighting_probe_at <= 240) return; // finish the current screen challenge first
+        if (scene_writer < ops.size() && depth && ops[scene_writer].paired_depth == depth &&
+            (!g_trace.learned.pso || inspect_lighting)) {
             for (size_t i = scene_writer + 1; i < ops.size(); ++i) {
                 const auto& op = ops[i];
                 if (op.queue != queue || !op.direct || !op.pso || !op.reflected || op.inferred ||
@@ -1106,11 +1133,23 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                 const auto pick = pick_scene_input(op.in, e.rw, e.rh, e.ow, e.oh);
                 if (!pick.ok) continue;
                 const auto& in = op.in[pick.at];
-                if (in.id != scene || !trace_same_color(in.vfmt, out.vfmt)) continue;
+                if (!trace_same_color(in.vfmt, out.vfmt)) continue;
+                const auto has_gap = [&](size_t first, size_t last) {
+                    return std::any_of(g_trace.untraced_lists.begin(), g_trace.untraced_lists.end(),
+                        [&](const NativeTrace::Untraced& list) { return list.at > first && list.at <= last; });
+                };
+                const uint64_t peer = inspect_lighting ? na::j2::LightingPeer(ops, i, scene, depth, in, writer, has_gap) : 0;
+                if (!peer && (in.id != scene || g_trace.learned.pso)) continue;
+                if (peer && std::any_of(ops.begin(), ops.begin() + i, [&](const TraceOp& earlier) {
+                    return earlier.pso == op.pso && earlier.queue == queue &&
+                        std::any_of(earlier.out.begin(), earlier.out.end(), [&](const TraceIo& view) { return view.id == out.id; }) &&
+                        std::any_of(earlier.in.begin(), earlier.in.end(), [&](const TraceIo& view) { return view.id == in.id; });
+                })) continue;
                 NativeCrossing c{op.pso, in.id, out.id, scene, e.rw, e.rh, e.ow, e.oh,
                                  in.vfmt, out.vfmt, op.gx, op.gy, op.gz};
                 c.native_depth = depth;
-                if (g_trace.CoolingDown(c, GetTickCount64())) continue;
+                c.light_peer = peer;
+                if (g_trace.CoolingDown(c, GetTickCount64()) || (peer && g_trace.ProvedLighting(c))) continue;
                 if (!(g_trace.provisional == c)) ++g_trace.provisionals;
                 next = c;
                 add(" dlaa_screen_candidate=%llu input=%llu output=%llu",
@@ -1119,9 +1158,11 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
             }
         }
         g_trace.provisional = next;
+        g_trace.lighting_probe_at = next.light_peer ? g_trace.presents : 0;
         g_trace.provisional_pso.store(next.pso, std::memory_order_release);
         add(" dlaa_screen_learned=%llu refuted=%llu", (unsigned long long)g_trace.learned.pso,
             (unsigned long long)g_trace.refutations);
+        add(" lighting_reader=%llu", (unsigned long long)g_trace.lighting_pso.load(std::memory_order_relaxed));
         return;
     }
     const auto traces_scene=[&](uint64_t id,size_t before) {
@@ -1726,7 +1767,15 @@ void apply_probe_outcome(int outcome,const NativeCrossing& c)
     std::lock_guard<std::mutex> lock(g_trace.m);
     if(!(g_trace.provisional==c))return; // the trace moved on meanwhile
     if(outcome==1){
-        g_trace.learned=c;g_trace.previous=c;g_trace.note_input(c.input);++g_trace.verified;
+        if (c.light_peer) {
+            if (g_trace.lighting[0].lighting_pair(c)) {
+                g_trace.lighting[1] = c;
+                g_trace.lighting_pso.store(c.pso, std::memory_order_release);
+            } else g_trace.lighting[0] = c;
+        } else {
+            g_trace.learned=c;g_trace.previous=c;g_trace.note_input(c.input);
+        }
+        ++g_trace.verified;
         g_trace.provisional={};
         na::eventlog::Emit("native_trace","provisional crossing confirmed on screen: learned pso=%llu in#%llu out#%llu",
             (unsigned long long)c.pso,(unsigned long long)c.input,(unsigned long long)c.output);
@@ -1745,10 +1794,47 @@ void apply_probe_outcome(int outcome,const NativeCrossing& c)
     g_trace.provisional_pso.store(g_trace.provisional.pso,std::memory_order_release);
     g_trace.learned_pso.store(g_trace.learned.pso,std::memory_order_release);
 }
-void SetNativeTraceIntervalForTests(uint32_t presents)
+void SetNativeTraceIntervalForTests(uint32_t presents, bool inspect_lighting)
 {
     std::lock_guard<std::mutex> lock(g_trace.m);
     g_trace.learned_interval=presents?presents:900u;
+    if (inspect_lighting && g_trace.native_resolution) {
+        g_trace.find_lighting = true;
+        g_trace.lighting_search_at = g_trace.presents;
+        g_trace.refresh_requested.store(true, std::memory_order_relaxed);
+    }
+}
+bool StartVerifiedLightingArmForTests()
+{
+    // The GPU fixture tests the placement adapter independently of the
+    // decision tests. Give it an already measured baseline on its own scene.
+    std::lock_guard<std::mutex> lock(g.m);
+    std::lock_guard<std::mutex> trace_lock(g_trace.m);
+    const auto& first = g_trace.lighting[0];
+    if (!first.lighting_pair(g_trace.lighting[1]) || g.frame <= 64) return false;
+    const auto now = GetTickCount64();
+    const referee::PlacementTrial::Scope scope{first.scene, first.native_depth,
+        g.router.Current().history_generation, na::observe::LiveSelectionVersion(), first.pso};
+    referee::PlacementTrial trial;
+    const uint64_t start = g.frame - 64;
+    if (!trial.BeginVerified(scope, start, now)) return false;
+    referee::TrialSample sample;
+    sample.delivered = true;
+    sample.observed_at = now;
+    sample.width = first.ow;
+    sample.height = first.oh;
+    sample.configuration = 1;
+    for (unsigned i = 0; i < referee::RouteTrial::samples; ++i) {
+        sample.ordinal = start + referee::RouteTrial::warmup_frames + 2 + i;
+        sample.change[13].fill(i % 2 ? -.25f : .25f);
+        trial.Add(scope, trial.Ticket(sample.ordinal), sample, sample.ordinal, now);
+    }
+    if (!trial.UsesCandidate()) return false;
+    g.placement_trial = std::move(trial);
+    g.placement_lighting = first.pso;
+    g_trace.active_lighting.store(first.pso, std::memory_order_release);
+    g.resume_reset = true;
+    return true;
 }
 void RequestDeliveryProbe()
 {
@@ -4988,9 +5074,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         id.dlss_mv_lowres = !e.mv_display_res;
         using na::referee::shadow::Path;
         const auto& route = g.router.Current();
+        const auto logical_color = pending.referee_logical_color ? pending.referee_logical_color : color_id;
         na::referee::shadow::Context context{
-            {inl ? Path::Inline : Path::Between, pending.referee_boundary}, color_id, depth_id, route.history_generation, csub};
-        if (recover && g.placement_trial.Matches(color_id, depth_id, route.history_generation, pending.selection_version)) {
+            {inl ? Path::Inline : Path::Between, pending.referee_boundary}, logical_color, depth_id, route.history_generation, csub};
+        if (recover && g.placement_trial.Matches({logical_color, depth_id, route.history_generation,
+                                                  pending.selection_version, g.placement_lighting})) {
             if (g.placement_trial.UsesCandidate() == pending.referee_handoff)
                 context.trial_ticket = g.placement_trial.Ticket(g.frame);
             if (context.trial_ticket) context.trial_configuration = current_configuration();
@@ -5280,7 +5368,8 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     if (g.placement_trial.UsesCandidate() && g.router.Mode() == RouteMode::Auto &&
         !window_now() && !window_frame_now() &&
         settings::Get().referee_enabled.load(std::memory_order_relaxed) &&
-        g.placement_trial.Matches(color_id, depth_id, g.router.Current().history_generation, na::observe::LiveSelectionVersion()))
+        g.placement_trial.Matches({color_id, depth_id, g.router.Current().history_generation,
+                                   na::observe::LiveSelectionVersion(), g.placement_lighting}))
         return; // the candidate records only an independent host command list
     // The existing MSAA-depth path changes raster state which this restore does
     // not replay. Keep it at its original boundary, as for resolved consumers.
@@ -5663,6 +5752,7 @@ class NativeScaleHook final:public na::observe::ShaderOperationHook {
         uint64_t input=0; // stretch finder: DLSS reads this render-size image (0 = the scene colour)
         bool native_dlaa=false;
         bool verify=false, verify_rt=false; NativeCrossing crossing; // provisional: mark the game's own image, no DLSS
+        std::shared_ptr<na::observe::NativeOperation> lighting_reader;
         bool separate_reader=false;
         std::shared_ptr<LateInputBinding> late_input;
         bool late=false; // staged for submission-time resolution (stage_late); After() arms the boundary watch
@@ -6013,6 +6103,21 @@ public:
         try{
             if (discover && !reduced) {
                 if (g_trace.armed.load(std::memory_order_relaxed)) trace_op(l, call);
+                if (g_trace.active_lighting.load(std::memory_order_acquire)) {
+                    auto match = verify_step(l, call, true, true);
+                    auto c = std::static_pointer_cast<Candidate>(match.state);
+                    if (c) {
+                        c->native_dlaa = true;
+                        c->source.Attach(na::observe::AcquireResource(c->crossing.input));
+                        c->guide.Attach(na::observe::AcquireResource(c->depth));
+                        if (c->source && c->guide) reconstruct(l, c, nullptr, nullptr);
+                    }
+                    return {};
+                }
+                if (g_trace.provisional_pso.load(std::memory_order_acquire)) {
+                    auto match = verify_step(l, call);
+                    if (match.state) return match;
+                }
                 if (g_trace.learned_pso.load(std::memory_order_acquire)) {
                     auto match = verify_step(l, call, true);
                     auto c = std::static_pointer_cast<Candidate>(match.state);
@@ -6024,7 +6129,6 @@ public:
                     }
                     return {};
                 }
-                if (g_trace.provisional_pso.load(std::memory_order_acquire)) return verify_step(l, call);
                 return {};
             }
             if(g_trace.armed.load(std::memory_order_relaxed))trace_op(l,call);
@@ -6108,13 +6212,20 @@ public:
     }
     // The provisional crossing's dispatch (exact pipeline, groups, input and output):
     // after it runs, the screen probe marks the game's own image (no DLSS).
-    na::observe::ShaderScope verify_step(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,bool learned=false){
+    na::observe::ShaderScope verify_step(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall& call,
+                                        bool learned=false, bool rotating=false){
         const bool dispatch=call.kind==na::observe::ShaderKind::Dispatch;
         if (call.indirect || l->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT) return {};
-        const uint64_t pso = (learned ? g_trace.learned_pso : g_trace.provisional_pso).load(std::memory_order_acquire);
+        const uint64_t pso = (rotating ? g_trace.active_lighting :
+            learned ? g_trace.learned_pso : g_trace.provisional_pso).load(std::memory_order_acquire);
         if (!pso || na::observe::ListPipelineId(l)!=pso) return {};
-        NativeCrossing p;
-        { std::lock_guard<std::mutex> lock(g_trace.m); p = learned ? g_trace.learned : g_trace.provisional; }
+        NativeCrossing p, peer;
+        {
+            std::lock_guard<std::mutex> lock(g_trace.m);
+            p = rotating ? g_trace.lighting[0] : learned ? g_trace.learned : g_trace.provisional;
+            if (rotating) peer = g_trace.lighting[1];
+        }
+        if (rotating && !p.lighting_pair(peer)) return {};
         if (p.native_depth) {
             uint64_t color = 0, depth = 0;
             na::observe::GetLiveSelection(&depth, &color);
@@ -6135,6 +6246,7 @@ public:
         }
         const auto pick=pick_scene_input(srvs,p.rw,p.rh,p.ow,p.oh);
         if (!pick.ok) return refuse(pick.why);
+        if (rotating && srvs[pick.at].id == peer.input) p = peer;
         // A draw may write the full-size image as its render target instead of a UAV.
         bool rt=false;
         if (!output && !dispatch && op.colors.size()==1 && op.colors[0].resource && op.colors[0].view.resource==p.output) { output=&op.colors[0]; rt=true; }
@@ -6157,6 +6269,7 @@ public:
             c->recording = op.recording;
         }
         c->verify=!learned;c->verify_rt=rt;c->crossing=p;c->target=output->resource;c->dest=p.output;
+        if (rotating) c->lighting_reader = std::make_shared<na::observe::NativeOperation>(std::move(op));
         return {na::observe::ShaderAction::Forward,c};
     }    void After(ID3D12GraphicsCommandList* l,const na::observe::ShaderCall&,na::observe::ShaderScope& scope) noexcept override {
         auto c=std::static_pointer_cast<Candidate>(scope.state);if(!c)return;
@@ -6209,15 +6322,21 @@ public:
             if(na::observe::ListRecording(l)!=c->recording||!na::observe::ListStateRestorable(l)){skip("The game's state at the upscale pass cannot be restored.");return false;}
             uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
             if(color!=c->color||depth!=c->depth){skip("The scene selection changed during the frame.");return false;}
+            const bool rotating = c->native_dlaa && c->crossing.light_peer;
+            if (rotating && (!g.placement_trial.UsesCandidate() || g.placement_lighting != c->crossing.pso ||
+                !g.placement_trial.Matches({color, depth, g.router.Current().history_generation,
+                                            na::observe::LiveSelectionVersion(), g.placement_lighting})))
+                return false;
+            const uint64_t render_color = rotating ? c->crossing.input : color;
             ID3D12CommandList* one[]{l};SceneInput saved;
-            const bool local=na::observe::ListRendersTo(l,color,depth);
+            const bool local=na::observe::ListRendersTo(l,render_color,depth);
             if(!local){
                 // Inline work depends on the producer's GPU work, so the producer must already
                 // be ordered before this list: submitted. A closed, unsubmitted one is not
                 // accepted here (recorded commands cannot be cancelled by a later order check);
                 // such a frame goes to the list-boundary route from stretch() instead.
                 const auto* p=c->input ? &c->producer :
-                    pick_producer_locked(color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/!c->native_dlaa);
+                    pick_producer_locked(render_color,depth,g.queue.Get(),nullptr,0,0,/*allow_unsubmitted=*/!c->native_dlaa);
                 if (c->native_dlaa && p && (p->frame != g.frame || !p->native_origin.SubmissionOrder(g.queue.Get()))) p = nullptr;
                 if(c->input) {
                     const auto order=p->native_origin.SubmissionOrder(g.queue.Get());
@@ -6230,7 +6349,7 @@ public:
             // Stretch finder: DLSS reads the step's own render-size input (already
             // post-processed); camera, depth and producer stay the scene's.
             SceneInput staged;
-            const uint64_t in_id=c->input?c->input:color;
+            const uint64_t in_id=c->input?c->input:render_color;
             if(c->input){
                 if(local){
                     staged.frame=g.frame;staged.depth=depth;
@@ -6253,6 +6372,11 @@ public:
             g.inline_sample_locked=true;
             const uint32_t slot=g.slot;PendingHistory pending;ID3D12GraphicsCommandList* out=nullptr;bool touched=false;
             if (c->native_dlaa) pending.referee_boundary = c->crossing.pso;
+            if (rotating) {
+                pending.referee_handoff = true;
+                pending.referee_logical_color = color;
+                pending.referee_lighting_reader = c->lighting_reader;
+            }
             auto owned=std::make_shared<std::vector<ComPtr<ID3D12Resource>>>();owned->reserve(16);
             *owned={c->source,c->guide,c->target};
             auto lease=na::nr::native::RetainRecording(l,owned);if(!lease)return false;
@@ -6322,7 +6446,7 @@ public:
 
             {std::lock_guard<std::mutex> nb(g_nb.m);std::snprintf(g_nb.reason,sizeof g_nb.reason,"%s",c->input?"DLSS reconstructs at the game's own upscale step (its render-size input).":"DLSS reconstructs at the game's own upscale pass.");}
             g.slot=(slot+1)%kRing;g.inl.list=l;g.inl.rec=c->recording;g.inl.frame=g.frame;g.inl.slot=slot;
-            g.inl.writes=na::observe::ListInsertionDecision(l,color).writes;g.inl.color=color;g.inl.history=pending;g.inl.boundary={};g.inl.valid=true;g.inl_frame=g.frame;
+            g.inl.writes=na::observe::ListInsertionDecision(l,render_color).writes;g.inl.color=render_color;g.inl.history=pending;g.inl.boundary={};g.inl.valid=true;g.inl_frame=g.frame;
             g.inl.producer={};g.inl.producer_list=0;g.inl.producer_rec=0;
             if(!local){g.inl.producer=saved.native_origin;g.inl.producer_list=saved.native_list;g.inl.producer_rec=saved.native_recording;}
             g.inl.dest=c->dest;g.inl.dest_writes=c->dest?na::observe::ListInsertionDecision(l,c->dest).writes:0;
@@ -6333,11 +6457,22 @@ public:
     }
     void Closing(ID3D12GraphicsCommandList* l) noexcept override {
         if ((!g_native_reduced.load(std::memory_order_relaxed) &&
-             !(g_native_discovery.load(std::memory_order_relaxed) && g_trace.learned_pso.load(std::memory_order_relaxed))) ||
+             !(g_native_discovery.load(std::memory_order_relaxed) &&
+               (g_trace.learned_pso.load(std::memory_order_relaxed) || g_trace.active_lighting.load(std::memory_order_relaxed)))) ||
             g.paused.load()) return;
         try{
             uint64_t depth=0,color=0;na::observe::GetLiveSelection(&depth,&color);
-            if(!color||!depth||!na::observe::ListRendersTo(l,color,depth))return;
+            if(!color||!depth)return;
+            uint64_t peer = 0;
+            if (g_trace.active_lighting.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> trace_lock(g_trace.m);
+                const auto& first = g_trace.lighting[0];
+                if (first.scene == color && first.native_depth == depth && first.lighting_pair(g_trace.lighting[1]))
+                    peer = first.input == color ? first.light_peer : first.input;
+            }
+            const bool selected_written = na::observe::ListRendersTo(l,color,depth);
+            const bool peer_written = peer && na::observe::ListRendersTo(l,peer,depth);
+            if (!selected_written && !peer_written) return;
             std::lock_guard<std::mutex> lock(g.m);ID3D12CommandList* one[]{l};
             if(g.latched||!g.device)return;
             // A merged recording already owns its reconstruction/history and
@@ -6347,6 +6482,12 @@ public:
             // No rendering or GPU readback at Close. Preserve the actual scene
             // camera/sample for a separate post-processing recording, using J1.
             if(!g.inline_camera_submitted||(g.jit.valid&&g.jit.applied))jitter_batch(one,1);
+            if (peer_written) save_producer(l, peer, depth, false);
+            if (selected_written) save_producer(l, color, depth, true);
+        }catch(...){}
+    }
+    void save_producer(ID3D12GraphicsCommandList* l, uint64_t color, uint64_t depth, bool incumbent) {
+            ID3D12CommandList* one[]{l};
             SceneInput saved;saved.frame=g.frame;saved.color=color;saved.depth=depth;
             saved.native_recording=na::observe::ListRecording(l);
             saved.native_list=na::observe::IdOf(l);
@@ -6368,10 +6509,9 @@ public:
             else g_nb.snap_depth_unknown.fetch_add(1,std::memory_order_relaxed);
             saved.native_serial=++g.next_native_source;
 
-            g.native_scene=saved;
+            if (incumbent) g.native_scene=saved;
             g.native_producers.push_back(std::move(saved));
             while(g.native_producers.size()>8)g.native_producers.pop_front();
-        }catch(...){}
     }
 };
 
@@ -8198,6 +8338,7 @@ void EnableCameraInputDiagnostic(bool enabled) { g_camera_input_diagnostic.store
 NativeBridgeStats GetNativeBridgeStats() {
     NativeBridgeStats r;auto& n=g_nb;
     r.enabled=g_native_bridge.load();r.reduced=g_native_reduced.load();
+    r.lighting_reader = g_trace.lighting_pso.load(std::memory_order_acquire);
     r.hints=n.hints.load();r.examined=n.examined.load();r.not_reading=n.not_reading.load();r.snapshot=n.snapshot.load();
     r.source_size=n.source_size.load();r.draw_state=n.draw_state.load();r.viewport=n.viewport.load();r.no_destination=n.no_destination.load();
     r.ambiguous=n.ambiguous.load();r.candidates=n.candidates.load();r.recorded=n.recorded.load();r.record_failed=n.record_failed.load();
@@ -8278,6 +8419,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             g_trace.discovery_queue = native ? queue : nullptr;
             g_trace.discovery_source = native ? source : nullptr;
             g_trace.previous = {}; g_trace.learned = {}; g_trace.learned_inputs.clear(); g_trace.learned_pso.store(0);
+            g_trace.ClearLighting();
             g_trace.provisional = {}; g_trace.provisional_pso.store(0); g_trace.refuted.clear();
             g_trace.armed.store(false);
             g_trace.presents = g_trace.armed_at = 0;
@@ -8306,11 +8448,19 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         if(!reduced && !native){
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
             g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
+            if (g_trace.find_lighting || g_trace.lighting_pso.load(std::memory_order_relaxed)) g_trace.ClearLighting();
             g_trace.presents=g_trace.armed_at=0;
             g_trace.refresh_at=0;g_trace.refresh_requested.store(false,std::memory_order_relaxed);
             return;
         }
         ++g_trace.presents;
+        if (g_trace.find_lighting && g_trace.presents - g_trace.lighting_search_at > 480) {
+            g_trace.find_lighting = false;
+            if (g_trace.provisional.light_peer) {
+                g_trace.provisional = {};
+                g_trace.provisional_pso.store(0, std::memory_order_release);
+            }
+        }
         NativeExtent extent;
         { std::lock_guard<std::mutex> size_lock(g_up_m); extent=g_native_extent; }
         if (native) extent = picture;
@@ -8319,6 +8469,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             // A live mode change invalidates image identities immediately. Do
             // not wait the 900-present maintenance interval with the old size.
             g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
+            g_trace.ClearLighting();
             g_trace.provisional={};g_trace.provisional_pso.store(0);g_trace.refuted.clear();
             g_trace.armed.store(false);g_trace.armed_at=g_trace.presents>30?g_trace.presents-30:0;
         }
@@ -8328,15 +8479,18 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             g_trace.presented_ids[0].store(id);
         }
         if(!g_trace.armed.load()){
-            if (native && g_trace.learned.pso) return;
+            const bool lighting_needed = g_trace.find_lighting && !g_trace.lighting_pso.load(std::memory_order_relaxed);
+            if (native && g_trace.learned.pso && !lighting_needed) return;
             // First trace ~2 s after the scene is reduced, then every ~15 s.
             // Actual layout failures request one immediate observation. A
             // persistent unsupported layout gets at most one retry per120
             // presents, rather than tracing every failed frame.
             const bool refresh=g_trace.refresh_requested.load(std::memory_order_relaxed) &&
                 (!g_trace.refresh_at || g_trace.presents-g_trace.refresh_at>=120u);
-            if(refresh || g_trace.presents-g_trace.armed_at>=(g_trace.learned_pso.load()?g_trace.learned_interval:30u)){
-                if(refresh)g_trace.refresh_at=g_trace.presents;
+            const auto interval = lighting_needed ? 30u + (g_trace.traces & 1u) :
+                g_trace.learned_pso.load() ? g_trace.learned_interval : 30u;
+            if(refresh || g_trace.presents-g_trace.armed_at>=interval){
+            if(refresh)g_trace.refresh_at=g_trace.presents;
                 g_trace.refresh_requested.store(false,std::memory_order_relaxed);
                 g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;g_trace.untraced_lists.clear();
                 g_trace.late_ops=g_trace.late_tabled=0;
@@ -8612,7 +8766,7 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
             if (receipt) {
                 receipt->ordinal = g.frame;
                 receipt->eligible = o.scene;
-                receipt->submitted = o.scene && o.executed;
+                receipt->submitted = o.scene && o.executed && g.placement_unproved != g.frame;
             }
             const uint64_t late = g.stats.inline_late_writes + g.stats.post_scene_batches;
             o.later_scene_write = o.executed && late > g.route_prev_late;
@@ -8657,13 +8811,28 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
                 o.interceptor = external > g.route_prev_external;
                 g.route_prev_external = external;
             }
-            if (receipt && o.scene && o.executed && !o.camera_missed && !o.depth_state_missed && !o.interceptor &&
-                na::settings::Get().referee_enabled.load(std::memory_order_relaxed) &&
-                g.router.Mode() == na::j2::RouteMode::Auto) {
+            const auto& incumbent = g.router.Current();
+            const bool can_place = source && o.scene && !o.interceptor &&
+                g.router.Mode() == na::j2::RouteMode::Auto && !g_native_reduced.load(std::memory_order_relaxed) &&
+                !window_now() && !window_frame_now();
+            uint64_t depth = 0, color = 0, lighting = 0;
+            if (can_place) {
+                na::observe::GetLiveSelection(&depth, &color);
+                if (g_trace.lighting_pso.load(std::memory_order_acquire) &&
+                    (!g.placement_trial.OwnsComparison() || g.placement_lighting)) {
+                    std::lock_guard<std::mutex> trace_lock(g_trace.m);
+                    const auto& first = g_trace.lighting[0];
+                    if (g_trace.discovery_source == source && first.scene == color && first.native_depth == depth &&
+                        first.lighting_pair(g_trace.lighting[1])) lighting = first.pso;
+                }
+            }
+            if (receipt && can_place && o.executed && !o.camera_missed && !o.depth_state_missed) {
                 using na::referee::shadow::Path;
                 const auto& route = g.router.Current();
                 auto& alternate = receipt->alternate;
-                if (route.route == na::j2::Route::Inline && o.consumer_in_later_list && g.frame_seq_complete) {
+                if (lighting)
+                    alternate.placement = {Path::Inline, lighting};
+                else if (route.route == na::j2::Route::Inline && o.consumer_in_later_list && g.frame_seq_complete) {
                     uint64_t producer = 0;
                     if (const auto* reader = na::j2::SeparateSceneReader(g.frame_seq, &producer)) {
                         using V = na::j2::ConsumerProfile::Verdict;
@@ -8685,36 +8854,59 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
             const bool was_candidate = placement.UsesCandidate();
             const auto previous_phase = placement.Comparison().Current();
             const auto now = GetTickCount64();
-            uint64_t depth = 0, color = 0;
-            const auto& incumbent = g.router.Current();
-            const bool placement_available = source && o.scene && !o.interceptor && g.frame_seq_complete &&
-                incumbent.route == Route::Inline && g.router.Mode() == RouteMode::Auto &&
-                !g_native_reduced.load(std::memory_order_relaxed) && !verified_native_reader() &&
-                !window_now() && !window_frame_now();
-            if (placement_available) na::observe::GetLiveSelection(&depth, &color);
+            const bool placement_available = can_place &&
+                ((incumbent.route == Route::Inline && (lighting || g.frame_seq_complete)) ||
+                 (lighting && incumbent.route == Route::Between));
             const uint64_t selection = placement_available ? na::observe::LiveSelectionVersion() : 0;
+            const auto scope = placement_available ? referee::PlacementTrial::Scope{color, depth, incumbent.history_generation,
+                                                                                     selection, lighting}
+                                                   : referee::PlacementTrial::Scope{};
+            const bool lost_lighting = g.placement_lighting && g.placement_lighting != lighting;
             const bool placement_invalidated = placement.OwnsComparison() &&
-                (source_changed || !placement_available || !placement.Matches(color, depth, incumbent.history_generation, selection));
-            if (placement_invalidated)
-                placement.Invalidate(now);
-            if (placement.OwnsComparison()) {
-                // Recording can run ahead of Present. An intact inline recording
-                // may finish during warmup, but never counts as a candidate sample.
-                const bool warmup_fallback = g.inl_frame == g.frame && !placement.Ticket(g.frame);
-                placement.Tick(now, o.executed && !o.later_scene_write &&
-                    (g.placement_submitted == g.frame || warmup_fallback));
-                const auto ticket = placement.Ticket(g.frame);
-                static referee::TrialSample proof;
-                if (ticket && referee::gpu::TakeTrialSample(ticket, proof)) placement.Add(ticket, proof, g.frame, now);
-            } else if (source) {
+                (source_changed || !placement.Matches(scope) || lost_lighting);
+            if (placement_invalidated) placement.Invalidate(now);
+            if (source) {
+                using na::referee::shadow::Path;
                 static referee::TrialSample sample;
-                const bool observed = referee::AdvanceRecovery(g.recovery, g.frame, now, referee::gpu::TakeTrialSample, sample);
-                if (placement_available && o.executed && !o.camera_missed && !o.depth_state_missed &&
-                    observed && !g.recovery.Busy() && sample.context.color == color && sample.context.depth == depth &&
-                    sample.context.generation == incumbent.history_generation &&
-                    placement.Begin(sample, g.frame, now, selection))
-                    g.recovery.Suspend();
+                const bool can_nominate = can_place && o.executed && !o.camera_missed && !o.depth_state_missed;
+                // An intact inline recording can run ahead during warmup,
+                // but receives no candidate ticket.
+                const bool warmup_fallback = g.inl_frame == g.frame && !placement.Ticket(g.frame);
+                const bool candidate_submitted = o.executed && !o.later_scene_write &&
+                    (g.placement_submitted == g.frame || warmup_fallback);
+                referee::AdvancePlacement(placement, scope, can_nominate, lighting != 0, candidate_submitted, g.recovery,
+                    g.frame, now, referee::gpu::TakeTrialSample,
+                    [&](const referee::TrialSample& seen, bool active, bool candidate) {
+                        const auto& context = seen.context;
+                        if (context.color != color || context.depth != depth || context.generation != incumbent.history_generation)
+                            return false;
+                        if (!active && !lighting && referee::PlacementTrial::ShowsFlicker(seen) &&
+                            seen.origin.stage != referee::FlickerStage::Unknown && native_discovery_enabled()) {
+                            std::lock_guard<std::mutex> trace_lock(g_trace.m);
+                            if (g_trace.native_resolution && !g_trace.find_lighting &&
+                                (!g_trace.lighting_search_at ||
+                                 g_trace.presents - g_trace.lighting_search_at >= g_trace.learned_interval)) {
+                                g_trace.find_lighting = true;
+                                g_trace.lighting_search_at = g_trace.presents;
+                                g_trace.refresh_requested.store(true, std::memory_order_relaxed);
+                            }
+                        }
+                        if (candidate)
+                            return g.placement_lighting ? context.placement == referee::shadow::Placement{Path::Inline, g.placement_lighting}
+                                                       : context.placement.path == Path::Between;
+                        const auto incumbent_path = incumbent.route == Route::Between ? Path::Between : Path::Inline;
+                        if (context.placement.path != incumbent_path) return false;
+                        if (!active || placement.Comparison().Current() == referee::RouteTrial::Phase::Baseline)
+                            return (lighting && seen.alternate == referee::shadow::Placement{Path::Inline, lighting}) ||
+                                (!verified_native_reader() && seen.alternate.path == Path::Between);
+                        return true;
+                    }, sample);
+                if (previous_phase != referee::RouteTrial::Phase::Baseline &&
+                    placement.Comparison().Current() == referee::RouteTrial::Phase::Baseline)
+                    g.placement_lighting = lighting;
             }
+            if (!placement.OwnsComparison()) g.placement_lighting = 0;
+            g_trace.active_lighting.store(placement.UsesCandidate() ? g.placement_lighting : 0, std::memory_order_release);
             if (was_candidate != placement.UsesCandidate()) {
                 g.resume_reset = true;
                 g.waiting_scene = {};
@@ -9049,17 +9241,24 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             g.stats.insertion_pipeline = decision.pipeline;
         }
     }
-    if (g.inline_mode) {
+    const bool lighting_owns = g.placement_lighting && g.placement_trial.UsesCandidate() &&
+        g_trace.active_lighting.load(std::memory_order_acquire) == g.placement_lighting &&
+        g.placement_trial.Matches({selected_color, selected_depth, g.router.Current().history_generation,
+                                   na::observe::LiveSelectionVersion(), g.placement_lighting});
+    if (g.inline_mode || lighting_owns) {
         // Count actual observed writes after our insertion, including later
         // lists without the scene depth bound. This is not a full-overwrite claim.
         bool after = g.submitted_frame == g.frame;
         for (UINT i = 0; i < count; ++i) {
             if (!lists[i]) continue;
-            const auto d = na::observe::ListInsertionDecision(lists[i], selected_color);
+            const bool lighting = g.inl.history.referee_lighting_reader &&
+                (g.inl.valid || g.placement_submitted == g.frame);
+            const auto color = lighting ? g.inl.color : selected_color;
+            const auto d = na::observe::ListInsertionDecision(lists[i], color);
             if (g.inl.valid && lists[i] == g.inl.list && na::observe::ListRecording(lists[i]) == g.inl.rec) {
-                if (d.writes > g.inl.writes) { g.stats.inline_late_writes += d.writes - g.inl.writes; note_late_writer(lists[i], selected_color, g.inl.writes, 1, d.writes - g.inl.writes); }
+                if (d.writes > g.inl.writes) { g.stats.inline_late_writes += d.writes - g.inl.writes; note_late_writer(lists[i], color, g.inl.writes, 1, d.writes - g.inl.writes); }
                 after = true;
-            } else if (after) { g.stats.inline_late_writes += d.writes; if (d.writes) note_late_writer(lists[i], selected_color, 0, 2, d.writes); }
+            } else if (after) { g.stats.inline_late_writes += d.writes; if (d.writes) note_late_writer(lists[i], color, 0, 2, d.writes); }
         }
         // Inline mode: no J2 list is inserted; DLAA is already inside the game's list.
         // Its history is committed when that list is actually submitted.
@@ -9085,6 +9284,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
             const auto w = na::observe::ListInsertionDecision(lists[consumer_at], g.inl.dest).writes;
             if (w > g.inl.dest_writes) later_dest_writes = w - g.inl.dest_writes;
         }
+        const bool lighting_binding_changed = has && g.inl.history.referee_lighting_reader &&
+            na::observe::RefreshNativeOperation(*g.inl.history.referee_lighting_reader) != 0;
+        if (lighting_binding_changed) g.placement_unproved = g.frame;
         jitter_batch(lists, count);
         for (UINT i = 0; i < count; ++i) { // diagnostic only: was a reader in this batch refused under an earlier frame number?
             if (!lists[i]) continue;
@@ -9099,13 +9301,13 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 g.inline_camera_submitted = true;
         ID3D12GraphicsCommandList* ours = nullptr;
         PendingHistory pending;
-        int before=record_deferred_native(queue,lists,count,&ours,pending);
+        int before=lighting_owns ? -1 : record_deferred_native(queue,lists,count,&ours,pending);
         ft(" |");
-        const bool placement_candidate = g.placement_trial.UsesCandidate() && !window_now() && !window_frame_now() &&
+        const bool placement_candidate = g.placement_trial.UsesCandidate() && !g.placement_lighting && !window_now() && !window_frame_now() &&
             settings::Get().referee_enabled.load(std::memory_order_relaxed) &&
-            g.placement_trial.Matches(selected_color, selected_depth, g.router.Current().history_generation,
-                                      na::observe::LiveSelectionVersion());
-        if (before<0 && !g_native_reduced.load(std::memory_order_relaxed) && !verified_native_reader() && !g.inl.valid &&
+            g.placement_trial.Matches({selected_color, selected_depth, g.router.Current().history_generation,
+                                       na::observe::LiveSelectionVersion()});
+        if (before<0 && !lighting_owns && !g_native_reduced.load(std::memory_order_relaxed) && !verified_native_reader() && !g.inl.valid &&
             g.submitted_frame != g.frame && g.queue.Get() == queue && g.dlss_ready &&
             selected_color && selected_depth && g.router.Mode() == na::j2::RouteMode::Auto)
             before=record_between_consumer(lists,count,selected_color,selected_depth,&ours,pending,placement_candidate,after_last_selected_write);
@@ -9165,9 +9367,11 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.inl.history.native_delivery) { native_delivery_submitted(producer_order, producer_refusal, later_dest_writes, g.frame); probe_submitted(g.inl.frame, producer_order); }
         if (g.inl.history.native_delivery && producer_order) ++g.stats.native_deliveries;
         g.submitted_frame = g.frame;
+        if (g.inl.history.referee_handoff && producer_order && !later_dest_writes && !lighting_binding_changed)
+            g.placement_submitted = g.frame;
         if (!g.inl.history.keep_reset) g.resume_reset = false;
         // A delivery that read an unwritten depth snapshot: its history is not trusted.
-        if (!producer_order) g.resume_reset = true;
+        if (!producer_order || lighting_binding_changed) g.resume_reset = true;
         if (g.inl.history.cut) ++g.stats.cuts;
         ++g.stats.frames;
         ++g.stats.inline_frames;
@@ -9380,8 +9584,10 @@ void Shutdown()
 {
     std::lock_guard<std::mutex> lock(g.m);
     g.recovery.Clear();
-    g.placement_trial = {};
+    g.placement_trial = referee::PlacementTrial{};
     g.placement_submitted = 0;
+    g.placement_unproved = 0;
+    g.placement_lighting = 0;
     g.recovery_swapchain = nullptr;
     g.depth32.Reset(); g.motion.Reset(); g.provenance.Reset(); g.output.Reset(); g.color_in.Reset(); g.sharp.Reset(); g.jshift.Reset();
     g.msaa = MsaaResolve{};
@@ -9432,6 +9638,10 @@ void Shutdown()
     g.native_producers.clear();
     g.native_deferred = {};
     g_native_reduced.store(false);g_native_bridge.store(false);g_native_discovery.store(false);
+    {
+        std::lock_guard<std::mutex> trace_lock(g_trace.m);
+        g_trace.ClearLighting();
+    }
     g.jitter_writes.Clear();
     g.frame_seq.clear();
     g.frame_seq_complete = true;

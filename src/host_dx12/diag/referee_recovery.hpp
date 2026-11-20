@@ -1,5 +1,6 @@
 #pragma once
 #include "core/referee_recovery.hpp"
+#include "core/referee_placement.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
 
@@ -30,15 +31,37 @@ inline uint64_t EvaluationConfiguration(uint32_t preset, uint32_t cf, uint32_t d
 
 // Both API adapters poll the same bounded GPU mailbox after closing a frame.
 // Each adapter supplies its own scratch sample under its existing render lock.
-template<class Reader>
-bool AdvanceRecovery(StageRecovery& recovery, uint64_t frame, uint64_t now, Reader read, TrialSample& sample)
+template<class Reader, class Accept>
+void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bool can_nominate, bool screen_proved,
+                      bool candidate_submitted, StageRecovery& recovery, uint64_t frame, uint64_t now,
+                      Reader read, Accept accept, TrialSample& sample)
 {
+    if (placement.OwnsComparison()) {
+        if (!placement.Matches(scope)) {
+            placement.Invalidate(now);
+            return;
+        }
+        placement.Tick(now, candidate_submitted);
+        const auto ticket = placement.Ticket(frame);
+        if (ticket && read(ticket, sample) && accept(sample, true, placement.UsesCandidate()))
+            placement.Add(scope, ticket, sample, frame, now);
+        return;
+    }
     const auto previous = recovery.Selected();
     const auto phase = recovery.Comparison().Current();
     const auto exhausted = recovery.Exhausted();
     const auto ticket = recovery.Ticket(frame);
     recovery.Tick(now);
+    if (!recovery.Busy() && can_nominate && screen_proved && placement.BeginVerified(scope, frame, now)) {
+        recovery.Suspend();
+        return;
+    }
     const bool got = ticket && read(ticket, sample) && ticket == recovery.Ticket(sample.ordinal);
+    if (got && !recovery.Busy() && can_nominate && accept(sample, false, false) &&
+        placement.Begin(scope, sample, frame, now)) {
+        recovery.Suspend();
+        return;
+    }
     if (got) recovery.Add(ticket, sample, frame + 1, now);
     const bool exhausted_now = exhausted != recovery.Exhausted();
     if (exhausted_now || previous != recovery.Selected() ||
@@ -51,6 +74,5 @@ bool AdvanceRecovery(StageRecovery& recovery, uint64_t frame, uint64_t now, Read
             exhausted_now ? "no_matching_tool" : recovery.Busy() ? trial.Name() : "restored",
             unsigned(recovery.Excluded()), trial.Baseline(), trial.Candidate(), trial.Confirmation(), recovery.Reason());
     }
-    return got;
 }
 } // namespace na::referee
