@@ -1458,11 +1458,16 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     f.boundary = boundary;
     f.screen_proof = lit_color ? lit_proof : verified_reader ? g_screen.Proof() : 0;
     if (g_trial_reader && g_screen_enabled.load(std::memory_order_relaxed)) {
-        if (g_placement.Matches(LightingScope())) {
+        const auto lighting = LightingScope();
+        const bool trial = g_placement.Matches(lighting);
+        if (trial && !g_placement.AllowsStageRecovery()) {
             if (g_placement.UsesCandidate() == bool(lit_color)) f.trial_ticket = g_placement.Ticket(g_frame);
-        } else if (!lit_color) {
-            g_recovery.SetScene({f.color.incarnation, f.depth.incarnation, f.color.active_w, f.color.active_h,
-                f.color.mip, f.depth.mip, f.color.array_slice, f.depth.array_slice, f.color.active_x, f.color.active_y});
+        } else if (bool(lit_color) == trial) {
+            referee::StageRecovery::Scene scene{lit_color ? lighting.color : f.color.incarnation,
+                f.depth.incarnation, f.color.active_w, f.color.active_h,
+                f.color.mip, f.depth.mip, f.color.array_slice, f.depth.array_slice, f.color.active_x, f.color.active_y};
+            if (lit_color) scene.generation = lighting.generation;
+            g_recovery.SetScene(scene);
             f.trial_ticket = g_recovery.Ticket(g_frame);
             f.recovery_tool = g_recovery.ToolInUse();
             f.recovery_configuration = g_recovery.Configuration();
@@ -3080,9 +3085,10 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         const auto& trial = g_placement.Comparison();
         if (before != trial.Current())
             na::eventlog::Emit("native11_route_trial",
-                "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u why=%s",
+                "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u verified_reduction=%.4f why=%s",
                 (unsigned long long)g_frame, trial.Name(), trial.Region(),
-                trial.Baseline(), trial.Candidate(), trial.Confirmation(), unsigned(trial.Regional()), trial.Reason());
+                trial.Baseline(), trial.Candidate(), trial.Confirmation(), unsigned(trial.Regional()),
+                trial.VerifiedReduction(), trial.Reason());
         g_lit.steer = g_lit.steer && g_placement.UsesCandidate();
     } else {
         if (g_placement.OwnsComparison()) g_placement.Invalidate(GetTickCount64());

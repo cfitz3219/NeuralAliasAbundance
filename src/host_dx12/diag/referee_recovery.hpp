@@ -36,28 +36,44 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
                       bool candidate_submitted, StageRecovery& recovery, uint64_t frame, uint64_t now,
                       Reader read, Accept accept, TrialSample& sample)
 {
+    bool on_kept_route = false;
     if (placement.OwnsComparison()) {
         if (!placement.Matches(scope)) {
             placement.Invalidate(now);
+            recovery.Suspend();
             return;
         }
+        on_kept_route = placement.AllowsStageRecovery();
         placement.Tick(now, candidate_submitted);
-        const auto ticket = placement.Ticket(frame);
-        if (ticket && read(ticket, sample) && accept(sample, true, placement.UsesCandidate()))
-            placement.Add(scope, ticket, sample, frame, now);
-        return;
+        if (!on_kept_route || !placement.AllowsStageRecovery()) {
+            recovery.Suspend();
+            const auto ticket = placement.Ticket(frame);
+            if (ticket && read(ticket, sample) && accept(sample, true, placement.UsesCandidate()))
+                placement.Add(scope, ticket, sample, frame, now);
+            return;
+        }
     }
     const auto previous = recovery.Selected();
     const auto phase = recovery.Comparison().Current();
     const auto exhausted = recovery.Exhausted();
     const auto ticket = recovery.Ticket(frame);
     recovery.Tick(now);
-    if (!recovery.Busy() && can_nominate && screen_proved && placement.BeginVerified(scope, frame, now)) {
+    if (!on_kept_route && !recovery.Busy() && can_nominate && screen_proved && placement.BeginVerified(scope, frame, now)) {
         recovery.Suspend();
         return;
     }
     const bool got = ticket && read(ticket, sample) && ticket == recovery.Ticket(sample.ordinal);
-    if (got && !recovery.Busy() && can_nominate && accept(sample, false, false) &&
+    if (got && on_kept_route) {
+        if (!accept(sample, true, true)) return;
+        // Maintain the original placement verdict against untouched frames.
+        // If a second tool degrades the picture, its own trial restores this
+        // route without taking the earlier improvement away.
+        if (recovery.ToolInUse() == RecoveryTool::None) {
+            placement.Add(scope, placement.Ticket(sample.ordinal), sample, frame, now);
+            if (!placement.UsesCandidate()) { recovery.Suspend(); return; }
+        }
+    }
+    if (got && !on_kept_route && !recovery.Busy() && can_nominate && accept(sample, false, false) &&
         placement.Begin(scope, sample, frame, now)) {
         recovery.Suspend();
         return;

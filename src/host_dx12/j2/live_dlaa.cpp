@@ -4536,7 +4536,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         !g_debug_view.load(std::memory_order_relaxed) && rw == ow && rh == oh &&
         g.router.Mode() == RouteMode::Auto;
     if (recover) {
-        pending.recovery_scene = {color_id, depth_id, rw, rh, csub, dsub};
+        const auto logical_color = pending.referee_logical_color ? pending.referee_logical_color : color_id;
+        pending.recovery_scene = {logical_color, depth_id, rw, rh, csub, dsub};
         pending.recovery_scene.inline_route = inl != nullptr;
         pending.recovery_scene.reader = pending.referee_boundary;
         pending.recovery_scene.generation = g.router.Current().history_generation;
@@ -4547,7 +4548,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             is_float_color(cf), reversed, camera_use, measured, g.jitter_on, flow::Enabled());
     };
     const bool same_recovery = recover && g.recovery.Matches(pending.recovery_scene);
-    Tool tool = same_recovery && !hist_reset && !g.placement_trial.OwnsComparison() ? g.recovery.ToolInUse() : Tool::None;
+    const bool recovering_kept = g.placement_trial.AllowsStageRecovery() && pending.referee_handoff &&
+        g.placement_trial.Matches({pending.recovery_scene.color, depth_id, pending.recovery_scene.generation,
+                                   pending.selection_version, g.placement_lighting});
+    Tool tool = same_recovery && !hist_reset && (!g.placement_trial.OwnsComparison() || recovering_kept)
+        ? g.recovery.ToolInUse() : Tool::None;
     if (tool != Tool::None && g.recovery.Configuration() != current_configuration()) tool = Tool::None;
     const auto recorded = [&](Tool option) {
         pending.recovery_tools |= referee::Bit(option);
@@ -5083,8 +5088,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         const auto logical_color = pending.referee_logical_color ? pending.referee_logical_color : color_id;
         na::referee::shadow::Context context{
             {inl ? Path::Inline : Path::Between, pending.referee_boundary}, logical_color, depth_id, route.history_generation, csub};
-        if (recover && g.placement_trial.Matches({logical_color, depth_id, route.history_generation,
-                                                  pending.selection_version, g.placement_lighting})) {
+        if (recover && !recovering_kept && g.placement_trial.Matches({logical_color, depth_id, route.history_generation,
+                                                                    pending.selection_version, g.placement_lighting})) {
             if (g.placement_trial.UsesCandidate() == pending.referee_handoff)
                 context.trial_ticket = g.placement_trial.Ticket(g.frame);
             if (context.trial_ticket) context.trial_configuration = current_configuration();
@@ -8924,10 +8929,11 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
             }
             const auto& comparison = placement.Comparison();
             if (comparison.Current() != previous_phase)
-                na::eventlog::Emit("dx12_route_trial", "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u why=%s",
+                na::eventlog::Emit("dx12_route_trial", "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u verified_reduction=%.4f why=%s",
                     (unsigned long long)(g.frame + 1), placement_invalidated ? "rejected" : comparison.Name(), comparison.Region(),
                     comparison.Baseline(), comparison.Candidate(), comparison.Confirmation(),
-                    unsigned(comparison.Regional()), placement_invalidated ? "the scene or comparison scope changed" : comparison.Reason());
+                    unsigned(comparison.Regional()), comparison.VerifiedReduction(),
+                    placement_invalidated ? "the scene or comparison scope changed" : comparison.Reason());
             const auto& d = g.router.OnFrame(o, placement.OwnsComparison());
             g.frame_agg.Reset();
             auto& r = g.stats.route;

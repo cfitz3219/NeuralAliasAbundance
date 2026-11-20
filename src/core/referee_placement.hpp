@@ -21,6 +21,7 @@ public:
     explicit PlacementTrial(uint64_t domain = uint64_t{1} << 58) : domain_(domain) {}
     bool OwnsComparison() const { return trial_.Active() || trial_.UsesCandidate(); }
     bool UsesCandidate() const { return trial_.UsesCandidate(); }
+    bool AllowsStageRecovery() const { return !trial_.Regional() && trial_.HasResidualFlicker(); }
     const RouteTrial& Comparison() const { return trial_; }
     uint64_t Ticket(uint64_t frame) const { return OwnsComparison() ? trial_.Ticket(frame) : 0; }
     bool Matches(Scope scope) const { return OwnsComparison() && scope == scope_; }

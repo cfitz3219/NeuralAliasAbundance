@@ -348,11 +348,13 @@ public:
             }
         } else if (phase_ == Phase::Candidate) {
             replacement_ = 0.f;
+            affected_replacement_ = 0.f;
             unsigned detail_losses = 0;
             for (unsigned i = 0; i < count_; ++i) {
                 if (targeted_ && anchor_.contrast[region_] > .04f &&
                     window_[i].contrast[region_] < .75f * anchor_.contrast[region_]) ++detail_losses;
                 for (const auto& change : window_[i].change) replacement_ = (std::max)(replacement_, TrialMagnitude(change));
+                affected_replacement_ = (std::max)(affected_replacement_, TrialMagnitude(window_[i].change[region_]));
             }
             if (detail_losses >= 2) {
                 ruled_out_ = true;
@@ -385,6 +387,18 @@ public:
     float Candidate() const { return replacement_; }
     float Confirmation() const { return confirmation_; }
     uint32_t Region() const { return region_; }
+    // Same pixels at the displayed output in all three phases. Use the
+    // quieter of the two incumbent measurements as the denominator.
+    float VerifiedReduction() const
+    {
+        if (phase_ != Phase::Kept || spatial_only_) return -1.f;
+        return 1.f - affected_replacement_ / (std::min)(baseline_, confirmation_);
+    }
+    bool HasResidualFlicker() const
+    {
+        const float reduction = VerifiedReduction();
+        return reduction >= 0.f && reduction < .90f;
+    }
 
 private:
     void Next(Phase phase, uint64_t frame)
@@ -457,7 +471,7 @@ private:
     uint64_t regional_seen_ = 0;
     uint32_t region_ = 0;
     unsigned count_ = 0;
-    float baseline_ = 0, replacement_ = 0, confirmation_ = 0;
+    float baseline_ = 0, replacement_ = 0, confirmation_ = 0, affected_replacement_ = 0;
     const char* reason_ = "";
     TrialSample anchor_;
     static constexpr unsigned incumbent_window = 8;

@@ -492,6 +492,9 @@ int main()
             check(trial.Current() == expected, trial.Reason());
             check(trial.UsesCandidate() == (expected == Phase::Kept), "trial: failed comparison falls back");
             if (expected == Phase::Kept) {
+                check(std::fabs(trial.VerifiedReduction() - (1.f - candidate / (std::min)(.25f, repeat))) < .001f &&
+                      trial.HasResidualFlicker() == (candidate > .1f * (std::min)(.25f, repeat)),
+                      "trial: measure the 90 percent target against both baselines in the affected area");
                 auto monitored = trial;
                 window(.24f);
                 check(trial.Current() == Phase::Rejected && !trial.UsesCandidate(),
@@ -509,6 +512,7 @@ int main()
             }
         };
         exercise(.07f, .24f, false, false, .05f, Phase::Kept);
+        exercise(.02f, .24f, false, false, .06f, Phase::Kept);
         exercise(.20f, .24f, false, false, 0.f, Phase::Rejected);
         exercise(.07f, .01f, false, false, 0.f, Phase::Rejected);
         exercise(.07f, .24f, true, false, 0.f, Phase::Rejected);
@@ -635,6 +639,27 @@ int main()
             }
             check(trial.Comparison().Current() == Phase::Kept && trial.UsesCandidate(),
                 "both receipt shapes keep the later placement only after the same flicker decreases");
+            check(!trial.AllowsStageRecovery(), "a verified ninety percent result needs no second correction");
+        }
+        {
+            PlacementTrial partial;
+            const PlacementTrial::Scope scope{31, 41, 3, 12};
+            check(partial.BeginVerified(scope, 1, 100), "start a bounded partial-lighting test");
+            uint64_t ordinal = 1;
+            for (unsigned arm = 0; arm < 3; ++arm) {
+                ordinal += RouteTrial::warmup_frames + 2;
+                for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
+                    auto sample = placement_sample(ordinal, ordinal + 100, arm == 1, true);
+                    sample.change[13].fill((i % 2 ? 1.f : -1.f) * (arm == 1 ? .06f : .25f));
+                    partial.Tick(sample.observed_at, true);
+                    partial.Add(scope, partial.Ticket(ordinal), sample, ordinal, sample.observed_at);
+                }
+            }
+            check(partial.UsesCandidate() && partial.AllowsStageRecovery(),
+                  "keep a verified partial improvement while allowing the next relevant correction");
+            partial.Tick(100 + ordinal, false);
+            check(!partial.UsesCandidate() && !partial.AllowsStageRecovery(),
+                  "loss of the actual display proof removes secondary recovery authority");
         }
         RegionalTiles overlap;
         overlap.Set({3, 12}, 960, 540, {});
