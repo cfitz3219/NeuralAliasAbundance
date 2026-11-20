@@ -10,6 +10,8 @@
 // sampler_policy.hpp (the DX12 host's rules on D3D11's fields).
 #pragma once
 
+#include <d3d11.h>
+#include <wrl/client.h>
 #include <cstdint>
 
 namespace na::native11 {
@@ -21,6 +23,18 @@ using SamplerAfFn = uint32_t (*)();
 // Hooks the game's device (ID3D11Device*) CreateSamplerState and its contexts' PS/CS sampler binds.
 // Idempotent. Install it when the device is created, before the game makes its samplers.
 bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af);
+
+// A sampler state may be shared by our replacement and a game-created state.
+// Remember the original per bound slot, with the reference the context would hold.
+struct SamplerShadow {
+    struct Slot {
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> original;
+        ID3D11SamplerState* applied = nullptr;
+    };
+    Slot pixel[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+    Slot compute[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+};
+SamplerShadow* SamplerShadowOf(ID3D11DeviceContext* context);
 
 uint64_t SamplerPolicyKey();
 void RefreshSamplers(void* context);

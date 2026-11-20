@@ -244,6 +244,7 @@ struct Ctx {
     bool game = false; // a context of the game's device
     uint32_t gen = 0;  // the game-device generation that answer was given in
     uint64_t sampler_policy = ~uint64_t{0};
+    SamplerShadow sampler_shadow;
     uint64_t texture_policy = ~uint64_t{0};
     Id screen_color = 0, screen_peer = 0;
     ID3D11PixelShader* pixel_shader = nullptr; // context owns the binding
@@ -286,6 +287,7 @@ struct Ctx {
     void reset_state()
     {
         sampler_policy = ~uint64_t{0};
+        sampler_shadow = {};
         texture_policy = ~uint64_t{0};
         ps_shadow.Clear();
         screen_color = screen_peer = 0;
@@ -3545,6 +3547,11 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present,
 }
 
 bool IsGameWork(void* context) { return Get(static_cast<ID3D11DeviceContext*>(context)) != nullptr; }
+SamplerShadow* SamplerShadowOf(ID3D11DeviceContext* context)
+{
+    Ctx* x = Get(context);
+    return x ? &x->sampler_shadow : nullptr;
+}
 PsShadow* TextureShadowOf(ID3D11DeviceContext* c)
 {
     Ctx* x = Get(c);

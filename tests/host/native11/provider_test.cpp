@@ -2819,10 +2819,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         if (bound) bound->GetDesc(&applied);
         expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16,
                "automatic AF binds 16x on the tiling material sampler");
-        D3D11_SAMPLER_DESC own16 = sampler;
-        own16.Filter = D3D11_FILTER_ANISOTROPIC; own16.MaxAnisotropy = 16;
+        // D3D11 interns identical samplers. The game now requests exactly the
+        // descriptor targeted by our existing substitution, while it is bound.
+        D3D11_SAMPLER_DESC own16 = applied;
+        ComPtr<ID3D11SamplerState> shared16;
+        expect(SUCCEEDED(g.device->CreateSamplerState(&own16, &shared16)) && shared16.Get() == bound.Get(),
+               "an explicit game sampler can share the bound automatic AF replacement");
         std::vector<ComPtr<ID3D11SamplerState>> game16;
-        for (int i = 0; i < 64 && na::observe::SamplerAfActionWanted() != na::af::kKeep; ++i) {
+        for (int i = 1; i < 64 && na::observe::SamplerAfActionWanted() != na::af::kKeep; ++i) {
             own16.MipLODBias = -0.125f * float(i); // distinct descriptions: each counts once
             game16.emplace_back();
             g.device->CreateSamplerState(&own16, &game16.back());
@@ -2835,6 +2839,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         if (bound) bound->GetDesc(&applied);
         expect(bound && applied.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && applied.MaxAnisotropy == 1,
                "after the switch the draw samples with the game's own sampler");
+        auto* game_owned16 = shared16.Get();
+        g.ctx->PSSetSamplers(0, 1, &game_owned16);
+        g.ctx->Draw(4, 0);
+        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound);
+        expect(bound.Get() == shared16.Get(),
+               "a new explicit game bind keeps the same 16x sampler");
+        g.ctx->PSSetSamplers(0, 1, &material_raw);
         na::observe::SetSamplerAfFollow(0);
     }
     // Material textures: a published replacement is sampled in place of the game's view from the
