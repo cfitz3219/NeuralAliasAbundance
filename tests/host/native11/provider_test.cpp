@@ -1232,13 +1232,9 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                 for (const auto& line : na::eventlog::Drain()) {
                     if (line.find("native11_route_trial") != std::string::npos) {
                         std::printf("%s", line.c_str());
-                        // referee/proved-roles-kept: proved roles go straight to
-                        // the kept route; a timed trial starts with its baseline.
-                        if (line.find("phase=baseline ") != std::string::npos ||
-                            line.find("phase=kept ") != std::string::npos) start_fault = true;
-                        if ((line.find("phase=rejected ") != std::string::npos &&
-                             line.find("did not improve") != std::string::npos) ||
-                            line.find("phase=kept ") != std::string::npos) placement_rejected = true;
+                        if (line.find("phase=baseline ") != std::string::npos) start_fault = true;
+                        if (line.find("phase=rejected ") != std::string::npos &&
+                            line.find("did not improve") != std::string::npos) placement_rejected = true;
                     }
                     if (line.find("referee_recovery") != std::string::npos) {
                         std::printf("%s\n", line.c_str());
@@ -1251,7 +1247,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             for (unsigned j = 0; j < 28; ++j) if (!record(i++, false, &restored)) return 1;
             std::printf("composition recovery: tried=%u restored=%d/28 changes=%zu visible=%zu exclusions=%d\n",
                 tried, restored.evaluated, restored.changed, restored.reached, int(excluded));
-            expect(placement_rejected, "the lighting placement settles (kept by proved roles, or rejected) and the same fault goes to the stage-specific selector");
+            expect(placement_rejected, "failed lighting placement hands the same fault to the stage-specific selector");
             expect(tried && excluded && evaluator.sharpening_trial_frames == tried && options.j2_sharpness.load() == 50,
                    "actual DX11 trial rejects a compositing flash independent of sharpening and restores user settings");
             expect(restored.evaluated == 28, "real DLAA stays engaged after the unsuccessful correction");
@@ -1281,14 +1277,12 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                         old_delta, new_delta, fixed.correct, fixed.reached, fixed.changed,
                         static_cast<unsigned long long>(stats.trial_pairs), static_cast<unsigned long long>(stats.trial_comparable));
             if (disagreeing_scene) {
-                // Both readers qualify while successive pictures from the
-                // ordinary route have no comparable structure. Before
-                // referee/proved-roles-kept the incumbent stayed for want of
-                // comparable pictures. Proved roles are now followed by
-                // structure: the ordinary route evaluates a different stage
-                // on alternate frames, so it is not a fair incumbent.
-                expect(fixed.evaluated == 28 && fixed.correct == 28,
-                    "proved rotating roles are followed even when the ordinary route gives no comparable pictures");
+                // Both readers may qualify while successive pictures from
+                // the ordinary route have no comparable structure. Keep
+                // delivering DLAA on the incumbent in that case.
+                expect(fixed.evaluated == 28 && fixed.correct == baseline.correct && new_delta >= old_delta * .80 &&
+                    stats.trial_pairs > stats.trial_comparable,
+                    "alternating pictures without shared structure cannot authorize a replacement");
                 na::native11::Uninstall();
                 return g_failed ? 1 : 0;
             }

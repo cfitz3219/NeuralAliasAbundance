@@ -322,6 +322,7 @@ std::atomic<bool> g_installed{false};
 SceneCallback g_cb = nullptr;
 void* g_cb_user = nullptr;
 TrialReader g_trial_reader = nullptr;
+std::atomic<ParitySignal> g_parity_signal{nullptr}; // referee/parity-role-swap
 
 std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
@@ -329,6 +330,11 @@ ScreenCheck g_screen;
 LitScene g_lit;
 referee::PlacementTrial g_placement{uint64_t{1} << 57};
 referee::StageRecovery g_recovery;
+bool ParitySeen()
+{
+    const auto seen = g_parity_signal.load(std::memory_order_relaxed);
+    return seen && seen();
+}
 referee::PlacementTrial::Scope LightingScope()
 {
     return {g_lit.incarnations[0], g_lit.depth_incarnation, g_lit.generation};
@@ -3085,7 +3091,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             [&](const referee::TrialSample& seen, bool, bool) {
                 return seen.context.placement.path == referee::shadow::Path::Native11 &&
                     seen.context.depth == scope.depth;
-            }, sample);
+            }, sample, ParitySeen());
         const auto& trial = g_placement.Comparison();
         if (before != trial.Current())
             na::eventlog::Emit("native11_route_trial",
@@ -3512,6 +3518,7 @@ void AfterResize(void* swapchain, long result) { UpdateResizeExtent(static_cast<
 OwnWorkScope::OwnWorkScope() : was_(t_inside) { t_inside = true; }
 OwnWorkScope::~OwnWorkScope() { t_inside = was_; }
 
+void SetParitySignal(ParitySignal seen) { g_parity_signal.store(seen, std::memory_order_relaxed); }
 bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present, TrialReader trial_reader)
 {
     std::lock_guard<std::mutex> g(g_install_mu);

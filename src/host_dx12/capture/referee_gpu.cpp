@@ -13,6 +13,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -25,6 +26,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace na::referee::gpu {
 namespace {
+std::atomic<bool> g_parity_seen{false}; // referee/parity-role-swap, current presentation
 
 constexpr auto NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 enum Img : uint32_t { kPrev, kInput, kOutput, kScreen, kMotion, kPrevOutput, kPrevScreen, kImages };
@@ -563,9 +565,13 @@ void collect_sample()
                     (unsigned long long)g.captured_context.color, (unsigned long long)g.captured_context.depth,
                     (unsigned long long)g.captured_context.native_screen_proof, (unsigned long long)g.captured_context.generation);
             }
-            if (g.trace_source != g.swapchain) g.parity.Reset();
+            if (g.trace_source != g.swapchain) {
+                g.parity.Reset();
+                g_parity_seen.store(false, std::memory_order_relaxed);
+            }
             if (g.parity.Observe(g.pre_ordinal, g.main_ordinal, transition.stops)) {
                 ++g.stats.parity_recognitions;
+                g_parity_seen.store(true, std::memory_order_relaxed);
                 na::eventlog::Emit("referee_parity_swap", "frames=%llu,%llu region=%u,%u change_stops=%.3f/%.3f/%.3f "
                     "matched=%llu brighter=%s color=%llu generation=%llu why=\"the screen flips brightness with frame parity, "
                     "opposite to the DLAA input: the scene targets exchange roles every frame, follow the role\"",
@@ -1297,6 +1303,7 @@ void InvalidatePresentation(const void* swapchain)
     }
 }
 
+bool ParityRoleSwapSeen() { return g_parity_seen.load(std::memory_order_relaxed); }
 Stats GetStats()
 {
     std::lock_guard<std::mutex> lock(g.m);

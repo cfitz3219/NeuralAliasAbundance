@@ -154,6 +154,11 @@ struct ProviderStats {
 using TrialReader = bool (*)(uint64_t ticket, referee::TrialSample& sample);
 bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present = false,
              TrialReader trial_reader = nullptr);
+// VARIANT: referee/parity-role-swap
+// The host's Referee says whether it has
+// recognized the parity signature (admission for referee/proved-roles-kept).
+using ParitySignal = bool (*)();
+void SetParitySignal(ParitySignal seen);
 // The hosted path receives DXGI events through the overlay's existing hooks.
 void SetScreenCheck(bool on);
 void RejectScreenProof(uint64_t proof);

@@ -75,6 +75,11 @@ struct Stats {
     char why[160] = "";
 };
 Stats GetStats();
+// VARIANT: referee/parity-role-swap
+// True once the trace recognized the
+// parity signature on the current presentation; consulted for admission of
+// referee/proved-roles-kept by both adapters.
+bool ParityRoleSwapSeen();
 
 // The last sample as read back (core/referee.hpp layout) and what it holds; for tests and tools.
 struct LastSample {
