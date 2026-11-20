@@ -106,3 +106,7 @@ PR 173 source 71c731bc rebuilt in build-cpu-verified-71c731bc. Runtime DLL and s
 ### 2026-11-19 — Combined Shadow of War candidate
 
 Use Documents/NeuralAlias-ShadowOfWar-Combined-55527b0/02-INSTALL-ShadowOfWar.cmd. This combines the two Referee changes from PR 172 with the depth-bound correction and 50% optical-flow setting on PR 173. The 28-sample disagreement is fixed and verified twice on the RTX. Fourteen other automated regressions and the actual packaged DLSS runtime placement trial passed. Package and reversible upgrade tested without touching the real installation. Cort retains the live reflection check and can run 03-RESULTS-ShadowOfWar.cmd afterward.
+
+### 2026-11-19 — DX12 Referee placement comparison
+
+PR 174 at 7bb6b815 adds the qualified separate-list alternative and screen comparison to DX12, on top of PR 173. It checks the actual qualified first reader and scopes the trial to the scene and evaluation settings. A failed comparison restores normal selection. The first missing candidate can cost one DLAA frame if the incumbent inline list has already closed. Results parser regression passed. The Windows CI check and eventual game validation are separate. Shadow of War was open, so local compilation, GPU tests and installation were deferred.
