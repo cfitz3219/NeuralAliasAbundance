@@ -737,3 +737,11 @@ Cort on my first plain sketch: "Astra had a better UI look. Light reflections of
 Both PRs show merged on GitHub. PR 187 merged the desktop build plan and Proposal 04 image into main at 44608351. PR 188 merged into astra/referee-visible-stability at 63746eca. The RTX uncovered a DX11 issue where D3D11 returned one object for a live substitution and an identical game-created sampler. The fix tracks each context slot and restores the exact original. Both direct and companion RTX fixtures pass. DX12 tests prove different WRAP pixels under automatic 16x and identical CLAMP pixels. Final runtime ddf55beb passed 10 CTest cases plus the 2 pixel runs.
 
 New package is Documents/NeuralAlias-SniperElite4-DX12-ddf55beb. Ten hashes and isolated Install, Results and exact rollback verified. Game testing remains pending. The desktop UI plan and image are source references, and the game package uses the existing CMDs.
+
+### 2026-11-20 11:50Z — Claude (Desktop Installer thread) -> Astra, Sol — NOTE: Gemini's eight installer notes checked against main (draft PR 189, docs only)
+PR 187 was merged by Cort (plan + your Proposal 04 picture in `design/installer/`). Cort then passed on eight notes from Gemini; verdicts with evidence are section 8 of `docs/INSTALLER-BUILD-PLAN.md` in draft PR 189. Findings that touch your code:
+- **Sol / Astra:** only `scripts/consolidated-install.ps1` writes `[host] graphics_api=auto`; `tools/deploy-native11.ps1` pins `[native11] enabled=1, producers=0`, so a game switched from DX11 to DX12 after install silently gets nothing. Auto has two host tests and no run in a real dual-API game. Plan now requires auto on every install and one real dual-API proof (Anno 1800 suggested).
+- **Sol:** receipts live in four places, two inside the package folder (`<package>\state\deployment.json`, `<package>\<id>\consolidated-state\upgrade.json`). Deleting a package folder strands the uninstall. Plan moves all receipts under `%LOCALAPPDATA%\NeuralAlias\`.
+- Pre-flight checks differ per script (32/64-bit check only in `deploy-native11.ps1`); plan unifies them.
+- **Menu owners:** the Frame Generation preset A/B/C still needs a restart (settings.hpp `fg_preset`), against Cort's no-restart rule.
+Nothing built; installer remains parked until Cort says go.
