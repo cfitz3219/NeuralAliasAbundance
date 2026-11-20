@@ -28,6 +28,7 @@
 #include "host_dx12/overlay/submission_tracking.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/overlay/dlss_debug.hpp"
+#include "host_dx12/overlay/menu_textures.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
@@ -1853,6 +1854,9 @@ struct State {
 };
 // Never destroyed: FrameCtx's D3D12 objects would be released by the CRT at exit (c0000005).
 State& g_state = *new State;
+// Font images detached while earlier menu draws were on the GPU (g_state.mutex).
+// Never destroyed, like g_state: it holds D3D12 fences.
+na::overlay::MenuTextureKeeper& g_menu_textures = *new na::overlay::MenuTextureKeeper;
 
 // A slot is not signaled again until its previous use completes. Independent
 // queues therefore cannot advance one another's completion receipts.
@@ -1956,7 +1960,8 @@ void write_menu_progress(HANDLE log)
     DWORD written = 0;
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
     n = snprintf(line, sizeof(line),
-        "menu_skips not_ready=%llu buffer=%llu busy=%llu atlas=%llu empty=%llu command=%llu present_rejected=%llu last_present_hr=0x%08lX\r\n",
+        "menu_skips not_ready=%llu buffer=%llu busy=%llu atlas=%llu empty=%llu command=%llu present_rejected=%llu last_present_hr=0x%08lX"
+        " menu_textures{fresh_copies=%llu detached=%llu released=%llu waiting=%llu refused=%llu}\r\n",
         static_cast<unsigned long long>(g_menu_skips.not_ready.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(g_menu_skips.buffer.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(g_menu_skips.busy.load(std::memory_order_relaxed)),
@@ -1964,7 +1969,13 @@ void write_menu_progress(HANDLE log)
         static_cast<unsigned long long>(g_menu_skips.empty.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(g_menu_skips.command.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(g_menu_skips.present_rejected.load(std::memory_order_relaxed)),
-        static_cast<unsigned long>(g_menu_skips.last_present_rejection.load(std::memory_order_relaxed)));
+        static_cast<unsigned long>(g_menu_skips.last_present_rejection.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_textures.GetStats().fresh_copies.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_textures.GetStats().detached.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_textures.GetStats().released.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_textures.GetStats().pending.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_menu_textures.GetStats().refused.load(std::memory_order_relaxed)));
+    if (n >= static_cast<int>(sizeof(line))) n = static_cast<int>(sizeof(line)) - 1;
     if (n > 0) WriteFile(log, line, static_cast<DWORD>(n), &written, nullptr);
     for (int open = 0; open < 2; ++open) {
         auto& t = g_present_timing[open];
@@ -2569,7 +2580,7 @@ void discard_menu_init_locked()
 {
     if(g_state.imgui_context_created){
         auto& io=ImGui::GetIO();
-        if(io.BackendRendererUserData)ImGui_ImplDX12_Shutdown();
+        if(io.BackendRendererUserData){g_menu_textures.Collect(true);ImGui_ImplDX12_Shutdown();}
         if(io.BackendPlatformUserData)ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();g_state.imgui_context_created=false;
     }
@@ -2601,6 +2612,7 @@ bool ensure_init_locked(IDXGISwapChain* sc)
             // ImGui context, fonts and the Win32 backend stay; device objects
             // are rebuilt right away (eager, as at first init).
             if(!menu_draws_complete())return false; // retry next frame; never wait in Present
+            g_menu_textures.Collect(true);
             ImGui_ImplDX12_Shutdown();
             ImGui_ImplDX12_InitInfo info{};
             info.Device = g_state.device.Get();
@@ -3112,17 +3124,37 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     const auto menu_target = back_buffer->GetDesc();
     draw->FramebufferScale = ImVec2(float(menu_target.Width) / draw->DisplaySize.x,
                                    float(menu_target.Height) / draw->DisplaySize.y);
-    // New glyphs can update an EXISTING font atlas. The private upload queue
-    // must not write it while an older game-queue menu draw is sampling it.
-    // A completion check (not a wait) protects all atlas updates/destruction.
-    // Leave the texture request pending when busy; the next frame retries.
+    // New glyphs, a new text size or a regrown font image must never cost the
+    // menu a frame (Cort 2026-11-20: the whole menu flickered on page switches,
+    // slider drags and switches). The private upload queue still never writes
+    // an image an unfinished menu draw may sample: while such draws exist the
+    // keeper moves the request to a fresh image and releases the old one by
+    // fence (menu_textures.hpp). Completion is checked, never waited for.
     if (draw->Textures) {
-        for (ImTextureData* texture : *draw->Textures) {
-            if (texture->Status != ImTextureStatus_OK && !menu_draws_complete()) {
-                g_menu_skips.atlas.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
+        std::vector<na::overlay::MenuDrawInFlight> in_flight;
+        bool unreadable = false;
+        for (const FrameCtx& slot : g_state.frames) {
+            if (slot.Complete()) continue;
+            if (slot.signal_failed || !slot.completion) unreadable = true;
+            else in_flight.push_back({slot.completion, slot.fence_value});
         }
+        g_menu_textures.Collect(in_flight.empty() && !unreadable);
+        const uint64_t copies_before = g_menu_textures.GetStats().fresh_copies.load(std::memory_order_relaxed);
+        const uint64_t detached_before = g_menu_textures.GetStats().detached.load(std::memory_order_relaxed);
+        if (!g_menu_textures.Prepare(draw->Textures, in_flight, unreadable)) {
+            const uint64_t skips = g_menu_skips.atlas.fetch_add(1, std::memory_order_relaxed);
+            if (skips % 64 == 0) // the first, then every 64th: the reason without flooding the log
+                na::eventlog::Emit("menu_texture", "action=skip_draw why=\"%s\" in_flight=%zu detached=%zu skips=%llu",
+                               unreadable ? "an earlier menu draw's completion cannot be read" : "too many font images still in use by earlier draws",
+                               in_flight.size(), g_menu_textures.Pending(), static_cast<unsigned long long>(skips + 1));
+            return;
+        }
+        const uint64_t copies = g_menu_textures.GetStats().fresh_copies.load(std::memory_order_relaxed) - copies_before;
+        const uint64_t detached = g_menu_textures.GetStats().detached.load(std::memory_order_relaxed) - detached_before;
+        if (detached)
+            na::eventlog::Emit("menu_texture", "action=fresh_image fresh_copies=%llu retired=%llu in_flight=%zu waiting=%zu why=\"new menu text while earlier menu draws were on the GPU; the menu is drawn this frame\"",
+                               static_cast<unsigned long long>(copies), static_cast<unsigned long long>(detached - copies),
+                               in_flight.size(), g_menu_textures.Pending());
     }
     if (FAILED(f.allocator->Reset()) || FAILED(g_state.list->Reset(f.allocator.Get(), nullptr))) {
         g_menu_skips.command.fetch_add(1, std::memory_order_relaxed);
@@ -3290,7 +3322,7 @@ bool present_prelude(IDXGISwapChain* sc, ID3D12CommandQueue*& queue,ComPtr<ID3D1
         release_buffers_locked();
         g_state.frames.clear();
         g_state.rtv_heap.Reset();
-        if (g_state.imgui_ready) ImGui_ImplDX12_InvalidateDeviceObjects();
+        if (g_state.imgui_ready) { g_menu_textures.Collect(true); ImGui_ImplDX12_InvalidateDeviceObjects(); }
         g_state.swapchain = sc;
         g_state.last_present.QuadPart = 0;
         g_retargets.fetch_add(1, std::memory_order_relaxed);
@@ -4678,6 +4710,7 @@ bool Stop()
                 return false; // keep GPU-owned resources alive; shutdown may retry
             }
         }
+        g_menu_textures.Collect(true);
         ImGui_ImplDX12_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
