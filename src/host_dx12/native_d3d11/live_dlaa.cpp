@@ -862,13 +862,17 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     return true;
 }
 
-void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue, const native11::PresentReceipt& receipt)
+void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue,
+                    const native11::PresentReceipt& receipt, PresentPicture picture)
 {
-    if (const auto lost_proof = referee::gpu::TakeNativeScreenLoss(swap))
-        native11::RejectScreenProof(lost_proof);
-    const bool eval = evaluation_capture_pending.exchange(false, std::memory_order_acq_rel);
-    const bool burst = capture::Pending();
-    if (!eval && !burst && !settings::Get().referee_enabled.load(std::memory_order_relaxed)) return;
+    const bool game_picture = picture == PresentPicture::Game;
+    if (game_picture) {
+        if (const auto lost_proof = referee::gpu::TakeNativeScreenLoss(swap))
+            native11::RejectScreenProof(lost_proof);
+    }
+    const bool eval = game_picture && evaluation_capture_pending.exchange(false, std::memory_order_acq_rel);
+    const bool burst = !game_picture && capture::Pending();
+    if (!eval && !burst && !(game_picture && settings::Get().referee_enabled.load(std::memory_order_relaxed))) return;
     struct PresentCopy {
         SharedTexture image;
         SharedFences fences;
@@ -879,7 +883,7 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue, co
     static auto* state = new std::unique_ptr<PresentCopy>;
     referee::gpu::Presentation frame{receipt.ordinal, swap, receipt.EligibleForDlaa(), receipt.submitted, true};
     frame.await_result = true;
-    const bool witness = referee::gpu::NeedsScreen(frame);
+    const bool witness = game_picture && referee::gpu::NeedsScreen(frame);
     ComPtr<ID3D12CommandQueue> evaluation_queue;
     if (witness || eval || burst) {
         // The inputs, copies and witness reduction must use the same queue.
@@ -891,9 +895,9 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue, co
     auto* queue = evaluation_queue ? evaluation_queue.Get() : fallback_queue;
     const auto execute = [](ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) { q->ExecuteCommandLists(n, lists); };
     if (eval) capture::j2::OnFrameClosed(receipt.ordinal, 0);
-    const auto complete = [queue, eval, burst, frame, execute](ID3D12Resource* image) {
+    const auto complete = [queue, eval, game_picture, burst, frame, execute](ID3D12Resource* image) {
         if (eval) capture::j2::OnPresent(queue, image, execute, frame);
-        else referee::gpu::OnPresent(frame, queue, image, execute);
+        else if (game_picture) referee::gpu::OnPresent(frame, queue, image, execute);
         if (burst && image) {
             char note[256]{};
             FormatStatus(note, sizeof note);

@@ -3773,9 +3773,14 @@ struct Native11Present {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         ComPtr<ID3D12CommandQueue> retained;
         ID3D12CommandQueue* queue = nullptr;
-        if (present_prelude(sc, queue, retained, nullptr, nullptr, na::on12::GraphicsApi::Dx11))
+        const bool ready = present_prelude(sc, queue, retained, nullptr, nullptr, na::on12::GraphicsApi::Dx11);
+        using na::native_d3d11::PresentPicture;
+        // The Referee and evaluator need the game picture. The diagnostic
+        // burst separately saves the composed frame, including our own menu.
+        na::native_d3d11::CapturePresent(sc, queue, receipt, PresentPicture::Game);
+        if (ready)
             menu_step(sc, queue, g_open.load(std::memory_order_acquire));
-        na::native_d3d11::CapturePresent(sc, queue, receipt);
+        na::native_d3d11::CapturePresent(sc, queue, receipt, PresentPicture::WithHome);
     }
     void Complete(IDXGISwapChain* chain, UINT flags, HRESULT result, const DXGI_PRESENT_PARAMETERS* parameters = nullptr)
     {

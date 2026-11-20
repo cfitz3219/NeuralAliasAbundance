@@ -1245,11 +1245,18 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         }
         if (compare_routes) {
             na::settings::Get().referee_every_ms.store(100);
+            const auto menu_draws = na::overlay::GetStats().frames_rendered;
             const auto until = GetTickCount64() + 18000;
             int i = 0;
             while (GetTickCount64() < until) {
+                if (reuse_depth) na::overlay::SetOpen((i / 8) % 2 == 0);
                 if (!record(i++, true, nullptr)) return 1;
                 Sleep(7);
+            }
+            if (reuse_depth) {
+                na::overlay::SetOpen(false);
+                expect(na::overlay::GetStats().frames_rendered > menu_draws,
+                       "Home was drawn during the lighting comparison");
             }
             for (int j = 0; j < 28; ++j) if (!record(i++, true, &fixed)) return 1;
             const double old_delta = baseline.movement / baseline.comparisons;
