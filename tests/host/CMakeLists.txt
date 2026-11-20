@@ -494,10 +494,13 @@ if(TARGET host_native11)
     add_test(NAME host_native11_dlaa_adaptive_screen_test COMMAND native11_dlaa_test --adaptive-screen)
     add_test(NAME host_native11_dlaa_rotating_lighting_test COMMAND native11_dlaa_test --lit-role)
     add_test(NAME host_native11_dlaa_rotating_padded_lighting_test COMMAND native11_dlaa_test --lit-role-padded)
+    add_test(NAME host_native11_dlaa_rotating_reused_depth_test COMMAND native11_dlaa_test --lit-role-reused-depth)
     add_test(NAME host_native11_dlaa_route_trial_test COMMAND native11_dlaa_test --lit-role-trial)
+    add_test(NAME host_native11_dlaa_route_trial_reused_depth_test COMMAND native11_dlaa_test --lit-role-trial-reused-depth)
     add_test(NAME host_native11_dlaa_composition_recovery_test COMMAND native11_dlaa_test --composition-recovery)
     set_tests_properties(host_native11_dlaa_composition_recovery_test host_native11_dlaa_rotating_lighting_test host_native11_dlaa_rotating_padded_lighting_test
-      host_native11_dlaa_route_trial_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+      host_native11_dlaa_rotating_reused_depth_test host_native11_dlaa_route_trial_test
+      host_native11_dlaa_route_trial_reused_depth_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     set_tests_properties(host_native11_dlaa_adaptive_screen_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_custom_command(TARGET native11_dlaa_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_dlaa_test>")

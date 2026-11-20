@@ -889,7 +889,8 @@ int DepthReadFixture(Game& g, bool debug_layer)
 #endif
 
 int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[maybe_unused]] bool rotating_lights = false,
-                       [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false)
+                       [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false,
+                       [[maybe_unused]] bool reuse_depth = false)
 {
     struct Surface {
         ComPtr<ID3D11Texture2D> picture;
@@ -1082,7 +1083,8 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             std::vector<int> previous;
         };
         bool start_fault = !composition_fault;
-        auto record = [&](int i, bool light_on, Sample* sample, bool pinned = false, bool overwrite = false) {
+        auto record = [&](int i, bool light_on, Sample* sample, bool pinned = false, bool overwrite = false,
+                          bool clear_before_reader = false) {
             Pump();
             const auto start = evaluator.writes;
             evaluator.received = nullptr;
@@ -1125,6 +1127,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                 const float new_picture[]{.2f, .3f, .4f, 1};
                 c->ClearRenderTargetView(late_rt, new_picture);
             }
+            if (clear_before_reader) c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
             c->VSSetShader(game.vs_post.Get(), nullptr, 0);
             reader(decoy.rtv.Get(), late, game.ps_tonemap.Get());
             if (game.padded_hdr) {
@@ -1144,6 +1147,9 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                 c->PSSetConstantBuffers(1, 1, &control);
                 reader(game.back_rtv.Get(), late, trial_screen.Get());
             } else reader(game.back_rtv.Get(), late, game.ps_tonemap.Get());
+            // A post layer can clear/reuse the depth attachment after the
+            // lighting reader has consumed the scene color.
+            if (reuse_depth) c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
             if (sample) {
                 auto& s = *sample;
                 s.correct += evaluator.received == expected;
@@ -1305,6 +1311,10 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         expect(new_delta < 1 && new_delta < old_delta*.25, "stationary reflection stops alternating when the physical buffers swap");
         expect(std::abs(new_delta - pinned.movement/pinned.comparisons) < .25, "swapping and pinned surfaces have the same residual flicker within a quarter of a display level");
         expect(fixed.brightness/28 > dim.brightness/7 + 20*5376, "an intentionally extinguished reflection still disappears");
+        if (reuse_depth) {
+            if (!record(0, true, nullptr, false, false, true)) return 1;
+            expect(!evaluator.proof, "the lighting reader refuses a depth clear before it consumes the scene");
+        }
         if (!record(0, true, nullptr, false, true)) return 1;
         expect(!evaluator.proof, "a clear between the final lighting draw and its reader invalidates the source");
         if (g_failed)
@@ -1622,9 +1632,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
     const bool padded_hdr = argc > 1 && std::strcmp(argv[1], "--lit-role-padded") == 0;
+    const bool trial_reused_depth = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-reused-depth") == 0;
+    const bool reuse_depth = trial_reused_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role-reused-depth") == 0);
     const bool composition_fault = argc > 1 && std::strcmp(argv[1], "--composition-recovery") == 0;
-    const bool compare_routes = composition_fault || (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
-    const bool rotating_lights = compare_routes || padded_hdr || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
+    const bool compare_routes = composition_fault || trial_reused_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
+    const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -1715,7 +1727,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (g_failed) return 1;
     if (adaptive || rotating_lights) {
         na::j2::SetJitter(true);
-        const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes, composition_fault);
+        const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes, composition_fault, reuse_depth);
         DeleteFileW(ini.c_str());
         std::fflush(stdout);
         ExitProcess(result);

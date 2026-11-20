@@ -189,6 +189,7 @@ public:
     const Selection& Current() const { return sel_; }
     const Stats& GetStats() const { return stats_; }
     uint32_t SceneDrawsThisFrame() const { return scene_draws_; }
+    uint64_t FrameEventCount() const { return events_; }
     // The scene was seen to be drawn through material layers (kept until the scene depth changes).
     bool Layered() const { return wide_; }
     // The layers' first render target (the most-drawn one); 0 when the scene has no layers.
@@ -228,14 +229,14 @@ public:
         if (y == color_.end()) return a;
         return x->second.first_draw < y->second.first_draw ? a : b;
     }
-    uint64_t LitWrite(Id early, Id late) const
+    uint64_t LitWrite(Id early, Id late, bool require_current_depth = true) const
     {
         const auto x = target_.find(early), y = target_.find(late);
         const auto scene = color_.find({sel_.depth, late});
         const auto depth = depth_.find(sel_.depth);
         if (x == target_.end() || y == target_.end() || scene == color_.end() || depth == depth_.end() ||
             x->second.last_other_write > x->second.last_draw || y->second.last_other_write > y->second.last_draw ||
-            depth->second.last_clear > scene->second.last_draw ||
+            (require_current_depth && depth->second.last_clear > scene->second.last_draw) ||
             !x->second.read_after || x->second.read_after >= y->second.last_draw ||
             y->second.last_draw != scene->second.last_draw) return 0;
         return y->second.last_draw;
@@ -859,7 +860,10 @@ private:
             }
             if (a && b && a->format == b->format && (sel_.color == a->id || sel_.color == b->id)) {
                 if (a->last_draw > b->last_draw) std::swap(a, b);
-                if (a->read_after > a->last_draw && b->read_after > b->last_draw && LitWrite(a->id, b->id))
+                // This labels completed color order. Depth can be reused
+                // downstream after the reader has consumed the scene. The live
+                // reader checks for intact depth again before evaluating DLAA.
+                if (a->read_after > a->last_draw && b->read_after > b->last_draw && LitWrite(a->id, b->id, false))
                     completed_lit_ = {a->id, b->id, FirstLitWriter(a->id, b->id), depth};
             }
         }

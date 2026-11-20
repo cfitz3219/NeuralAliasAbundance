@@ -1671,9 +1671,10 @@ void TrackPlacementWrite(const Event& e, const Ctx* live = nullptr)
                     live->ds_view.format, live->ds_view.mip, live->ds_view.slice};
         }
     }
+    // The lighting read has already been admitted with live, intact depth.
+    // Clearing depth in a later pass cannot change the color it read.
     if (g_lit.observed_member &&
-        ((e.kind == Kind::Draw && g_lit.Peer(e.rt0)) || (e.kind == Kind::ColorWrite && g_lit.Peer(e.resource)) ||
-         (e.kind == Kind::ClearDepth && e.resource == g_lit.depth))) {
+        ((e.kind == Kind::Draw && g_lit.Peer(e.rt0)) || (e.kind == Kind::ColorWrite && g_lit.Peer(e.resource)))) {
         g_lit.screen.Write(0);
         const auto index = g_lit.observed_member == g_lit.members[1];
         if (g_lit.observed_proven) g_lit.Revoke(g_lit.proofs[index], g_frame);
@@ -2448,7 +2449,17 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
                 continue;
             auto& probe = g_lit.screen;
             if (probe.Select(reader, true)) {
-                g_lit.proofs[lit == g_lit.members[1]] = probe.Proof();
+                const auto member = lit == g_lit.members[1];
+                static unsigned logged_readers = 0;
+                if (g_lit.proofs[member] != probe.Proof() && logged_readers < 32) {
+                    ++logged_readers;
+                    na::eventlog::Emit("native11_lit_role",
+                        "frame=%llu draw_event=%llu proof=%llu source=%03x destination=%03x shader=%llu slot=%u",
+                        (unsigned long long)g_frame, (unsigned long long)g_model.FrameEventCount(),
+                        (unsigned long long)probe.Proof(), unsigned((lit >> 4) & 0xfff),
+                        unsigned((x->rt0 >> 4) & 0xfff), (unsigned long long)reader.shader, reader.slot);
+                }
+                g_lit.proofs[member] = probe.Proof();
                 g_lit.observed_member = lit;
                 g_lit.observed_write = lit_write;
                 g_lit.observed_proven = true;
