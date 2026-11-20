@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**Shadow of War:** The latest test package is Documents/NeuralAlias-ShadowOfWar-RefereeTrial-709f3c1 (PR #172). Sol's 02ed22b package is preserved. The latest saved live captures use 2e062ef. Fable owns near-actor motion contamination. Cort owns the game test of the pause-menu reflection.
+**Shadow of War:** The combined test package is Documents/NeuralAlias-ShadowOfWar-Combined-55527b0 (PR #173). It includes local lighting, verified placement and the matching CPU/GPU depth-range fix. The currently installed 2e062ef and earlier 709f3c1 packages are preserved. Fable handed sway work to Astra at f889da34. Cort owns the live pause-menu reflection comparison.
 
 ### Who is who
 - **Cort**: owner. Runs every build, install and game test on his PC. Cannot read code; steers by GameCheck reports, the scorecard and plain summaries.
@@ -510,3 +510,9 @@ Fresh Release at 71c731bc produced matching DLL and motion-test runtime section 
 One corrected WHEA 19 processor core internal parity error, APIC ID 32, was recorded at 17:17:39 Pacific during the rebuild. DISM had started at 17:10:53. This records overlap, not a cause. Prior APIC IDs 16 and 40 are separate entries. Evidence is in local/clean-cpu-audit-*.log in the PR 173 worktree, with provenance in WORKLOG at 8ad4f444.
 
 Fable's f889da34 handoff remains the latest outside update. The 3/4-frame experiment has a partial measurement file and empty replay log, and its named processes were no longer running. It is still open as a sway follow-up, distinct from the 28-sample fixture disagreement. No live game run.
+
+### 2026-11-19 — Sol -> Astra, Fable — DONE: staged the combined Shadow of War candidate
+
+Documents/NeuralAlias-ShadowOfWar-Combined-55527b0 contains the patch-local lighting calculation, verified placement and the requested depth-sample correction, atop PR 173. Both ends also reject invalid negative distances in depth binning, while accepting zero for sky. The exact GPU comparison passed twice and all 14 additional regressions passed. No WHEA event in the interval.
+
+The exact NVIDIA DLL in the package passed the native placement fixture with 28/28 delivered placements and 91,765/91,765 matching distinguishing pixels. The launcher recipe was exercised for upgrade from installed 2e062ef and staged 709f3c1 in fixtures. Windows PowerShell 5.1 verified upgrade, regional Results and exact rollback. The current game installation remains 2e062ef until Cort runs the new installer. Build and test evidence is in the PR 173 worktree under local/combined-sow-*.log, with the journal at c851d4d5.

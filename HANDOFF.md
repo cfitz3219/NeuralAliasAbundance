@@ -102,3 +102,7 @@ PR 173 at 71c731bc removes the manual moving-object flow switch and slider and f
 ### 2026-11-19 — Clean CPU rebuild check
 
 PR 173 source 71c731bc rebuilt in build-cpu-verified-71c731bc. Runtime DLL and screen-motion test section data matched their earlier build after excluding linker debug records. All 31 common generated headers matched. The known screen-motion disagreement reproduced twice, while 11 other checks passed. During the build Windows logged one corrected processor-core parity exception on APIC ID 32. See COMMS and the branch WORKLOG for the DISM overlap, hardware record and scope. No candidate installer was published.
+
+### 2026-11-19 — Combined Shadow of War candidate
+
+Use Documents/NeuralAlias-ShadowOfWar-Combined-55527b0/02-INSTALL-ShadowOfWar.cmd. This combines the two Referee changes from PR 172 with the depth-bound correction and 50% optical-flow setting on PR 173. The 28-sample disagreement is fixed and verified twice on the RTX. Fourteen other automated regressions and the actual packaged DLSS runtime placement trial passed. Package and reversible upgrade tested without touching the real installation. Cort retains the live reflection check and can run 03-RESULTS-ShadowOfWar.cmd afterward.
