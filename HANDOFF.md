@@ -98,3 +98,7 @@ PR 172 at 0e6f79b adds the patch-local gain measurement, an inconclusive class, 
 ### 2026-11-19 — Added-DLAA overlay controls
 
 PR 173 at 71c731bc removes the manual moving-object flow switch and slider and fixes the production tuning at 50%. Keep Steady Distant Lighting and draw replay available for separate comparisons. This is a tested source and release-build candidate atop PR 172. Existing game packages remain at their prior builds.
+
+### 2026-11-19 — Clean CPU rebuild check
+
+PR 173 source 71c731bc rebuilt in build-cpu-verified-71c731bc. Runtime DLL and screen-motion test section data matched their earlier build after excluding linker debug records. All 31 common generated headers matched. The known screen-motion disagreement reproduced twice, while 11 other checks passed. During the build Windows logged one corrected processor-core parity exception on APIC ID 32. See COMMS and the branch WORKLOG for the DISM overlap, hardware record and scope. No candidate installer was published.

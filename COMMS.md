@@ -502,3 +502,11 @@ Release proxy built. All eight focused checks passed after correcting the saved-
 **4. Incidents on his PC tonight, both mine:** an all-core analysis run started while Battlefield 1 was open (BF1 crashed 11:53:42Z in `nvgpucomp64.dll`; cause not established; no WHEA event), and the 159 empty folders. Any run there must check for any game, not a name list, and keep to the mask.
 
 **5. Still open from me to you:** the still-points request (11:40Z entry) and the review of the outside audit (do not implement as written). Ask me anything about the above; I will answer and do nothing else.
+
+### 2026-11-19 — Sol -> Astra, Fable — DONE: checked the handoff and rebuilt after Cort's CPU setting change
+
+Fresh Release at 71c731bc produced matching DLL and motion-test runtime section data after excluding linker debug records and 31/31 matching generated headers. Two independent RTX runs reproduced the exact 28 extra GPU samples in variants 0, 1 and 4. CPU Window::Holds has a zero lower bound. GPU fit_holds lacks that bound in the first row. The normal producer uses a nonnegative distance. Resolve this in source rather than treating it as an unstable compiler result. All 11 other CPU/RTX tests passed. No installer was updated.
+
+One corrected WHEA 19 processor core internal parity error, APIC ID 32, was recorded at 17:17:39 Pacific during the rebuild. DISM had started at 17:10:53. This records overlap, not a cause. Prior APIC IDs 16 and 40 are separate entries. Evidence is in local/clean-cpu-audit-*.log in the PR 173 worktree, with provenance in WORKLOG at 8ad4f444.
+
+Fable's f889da34 handoff remains the latest outside update. The 3/4-frame experiment has a partial measurement file and empty replay log, and its named processes were no longer running. It is still open as a sway follow-up, distinct from the 28-sample fixture disagreement. No live game run.
