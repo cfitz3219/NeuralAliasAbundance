@@ -141,7 +141,9 @@ The window has a built-in **smoothness log**. A test command spins the carousel 
 
 ## 3a. The approved look, written down (Astra's Proposal 04)
 
-The original mockup file was lost from Cort's PC. On 2026-11-20 Cort supplied a picture of it ("The top part is the UI. The bottom is an explanation") and said of an earlier plain sketch: "it doesn't look how i want it. Astra had a better UI look. Light reflections of the game art." This section records that look in words and numbers so it survives. The picture is kept in the project's shared files as `installer-plan/astra-proposal-04.png` (not in the repo, because it shows game cover art). A working rebuild is on the picture page linked from the pull request.
+The original mockup file was lost from Cort's PC. On 2026-11-20 Cort supplied a picture of it ("The top part is the UI. The bottom is an explanation") and said of an earlier plain sketch: "it doesn't look how i want it. Astra had a better UI look. Light reflections of the game art." This section records that look in words and numbers so it survives. The picture is in the repo at [`design/installer/astra-proposal-04.png`](../design/installer/astra-proposal-04.png) (added at Cort's word, 2026-11-20), with copies in the project's shared files and on Cort's PC in `Documents\NeuralAlias-Installer-Design-SAVED`.
+
+![Astra's Proposal 04](../design/installer/astra-proposal-04.png) A working rebuild is on the picture page linked from the pull request.
 
 **Top to bottom**
 
