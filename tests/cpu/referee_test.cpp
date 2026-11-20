@@ -130,6 +130,46 @@ int main()
     static_assert(BlockOffset(kPoints) == 3 * kThumbFloats + 3 * kTileFloats, "layout");
     static_assert(kResultFloats == 3 * kThumbFloats + 3 * kTileFloats + kPointFloats, "layout");
 
+    { // A changing light can have the same frequency as the raster sample.
+        const auto patch = [](float tx, float ty, float log_light, bool other = false) {
+            std::array<float, kTile * kTile> pixels;
+            for (unsigned y = 0; y < kTile; ++y) for (unsigned x = 0; x < kTile; ++x) {
+                const float px = x - tx, py = y - ty;
+                pixels[y * kTile + x] = log_light + (other ? std::sin(.9f * px + .5f * py) :
+                    .3f * std::sin(.19f * px + .1f * py) + .4f * std::cos(.3f * py - .09f * px));
+            }
+            return pixels;
+        };
+        const auto original = patch(0, 0, 0);
+        const auto flash = patch(0, 0, .5f);
+        const auto shifted = patch(.36f, -.52f, .5f);
+        const auto unrelated = patch(0, 0, 0, true);
+        const auto flash_shift = MeasureTileShift(original.data(), flash.data());
+        const auto translation = MeasureTileShift(original.data(), shifted.data());
+        check(flash_shift.valid && std::hypot(flash_shift.x, flash_shift.y) < .001f,
+              "geometry: a half-stop light shift does not move edges");
+        check(translation.valid && std::fabs(translation.x - .36f) < .01f &&
+              std::fabs(translation.y + .52f) < .01f && !MeasureTileShift(original.data(), unrelated.data()).valid,
+              "geometry: recover subpixel translation under a flash, reject an unrelated picture");
+        JitterVibration leaking, steady, camera;
+        for (unsigned i = 0; i < 8; ++i) {
+            const float x = i & 1 ? -.48f : .48f, y = i & 2 ? -.37f : .37f;
+            const auto in = patch(x + .07f, y - .05f, .1f);
+            const auto bad = patch(x * .4f + .07f, y * .4f - .05f, .5f);
+            const auto correct = patch(.07f, -.05f, .5f);
+            JitterDisplacement d{MeasureTileShift(original.data(), in.data()),
+                MeasureTileShift(original.data(), bad.data()), MeasureTileShift(original.data(), bad.data()), x, y};
+            leaking.Add(d);
+            d.reconstructed = d.presented = MeasureTileShift(original.data(), correct.data());
+            steady.Add(d);
+            d.presented.x += .24f;
+            camera.Add(d);
+        }
+        check(leaking.Leakage(true) > .22f && leaking.Leakage(false) > .22f &&
+              steady.Leakage(false) == 0 && camera.Leakage(false) == 0,
+              "geometry: judge phase-locked movement across both axes and exclude constant camera motion");
+    }
+
     const float jx = .3f, jy = -.35f;
     const Image input = Render(Scene, jx, jy);       // what DLSS was given: one sample a pixel, jittered
     const Image output = RenderSmooth(Scene);         // what DLSS made: anti-aliased, unjittered

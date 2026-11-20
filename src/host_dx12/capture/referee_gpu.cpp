@@ -28,7 +28,8 @@ namespace {
 constexpr auto NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 enum Img : uint32_t { kPrev, kInput, kOutput, kScreen, kMotion, kPrevOutput, kPrevScreen, kImages };
 constexpr uint32_t kTraceOffset = kResultFloats + 4 * kTileFloats;
-constexpr uint32_t kTraceFloats = 4 * kThumbFloats;
+constexpr uint32_t kGeometryOffset = kTraceOffset + 4 * kThumbFloats;
+constexpr uint32_t kGeometryFloats = 6 * kTileFloats; // prior input, output and up to four screen origins
 enum class Phase { Idle, PreRecorded, PreSubmitted, MainRecorded, MainSubmitted, Computing, Scoring, Retiring, Stopped };
 constexpr uint32_t kMaxToken = 0x00ffffff; // high 24 bits of the capture token
 constexpr ULONGLONG kStuckMs = 3000; // a half-taken sample is given up after this
@@ -74,6 +75,7 @@ struct State {
     bool screen_elapsed = false, have_motion = false, invalidated = false, single_main = false;
     bool pre_trace_output = false, pre_trace_screen = false, pre_accepted = false, adjacent = false;
     bool awaiting_result = false, trace_pair = false, trial_adjacent = false;
+    bool trace_geometry = false;
     std::array<Presentation, 4> pending_presents{};
     std::atomic<bool> pending_receipt{false};
     FlickerTransition previous_transition;
@@ -82,6 +84,15 @@ struct State {
     uint64_t trace_ordinal = 0;
     ULONGLONG trace_next_at = 0;
     bool trace_parity_skipped = false;
+    struct MotionWitness {
+        const void* source = nullptr;
+        shadow::Context view;
+        uint64_t ordinal = 0;
+        uint32_t layout = 0, width = 0, height = 0;
+        TileLocations locations;
+        std::array<JitterVibration, kTiles> window;
+        float reported = 0;
+    } geometry;
     std::atomic<uint64_t> trial_sample_ticket{0};
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
     const void* trial_source = nullptr;
@@ -227,7 +238,7 @@ bool init(ID3D12Device* dev)
     return false;
 #endif
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kImages, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    const UINT64 bytes = UINT64(kTraceOffset + kTraceFloats) * sizeof(float);
+    const UINT64 bytes = UINT64(kGeometryOffset + kGeometryFloats) * sizeof(float);
     auto buffer = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags, ComPtr<ID3D12Resource>& r) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = type;
@@ -368,10 +379,17 @@ void retire()
     set_phase(Phase::Retiring);
 }
 
+uint32_t sample_floats()
+{
+    if (g.trace_geometry) return kGeometryOffset + (2 + (std::max)(1u, g.padded_layouts)) * kTileFloats;
+    if (g.trace_pair) return kGeometryOffset;
+    return kResultFloats + g.padded_layouts * kTileFloats;
+}
+
 void collect_sample()
 {
     void* p = nullptr;
-    D3D12_RANGE r{0, SIZE_T(g.trace_pair ? kTraceOffset + kTraceFloats : kResultFloats + g.padded_layouts * kTileFloats) * sizeof(float)};
+    D3D12_RANGE r{0, SIZE_T(sample_floats()) * sizeof(float)};
     const bool mapped = SUCCEEDED(g.readback->Map(0, &r, &p)) && p;
     na::referee::SampleScore score;
     uint32_t layout = 0;
@@ -382,6 +400,7 @@ void collect_sample()
     TrialSample trial;
     bool trial_valid = false;
     RegionalTiles regions;
+    std::array<JitterDisplacement, kTiles> geometry{};
     if (mapped) {
         const auto* samples = static_cast<const float*>(p);
         const auto* padded = samples + kResultFloats;
@@ -436,6 +455,23 @@ void collect_sample()
                 trial.bypassed = vote == shadow::ScreenVote::Input;
                 trial.delivered = vote == shadow::ScreenVote::Output;
             }
+            if (g.trace_geometry && vote == shadow::ScreenVote::Output &&
+                EdgeCorrelation(samples + kTraceOffset + 2 * kThumbFloats,
+                    g.padded_layouts ? samples + kTraceOffset + 3 * kThumbFloats : samples + BlockOffset(kThumbScreen),
+                    kThumbW, kThumbH) >= .90f) {
+                const float* earlier = samples + kGeometryOffset;
+                const float* earlier_screen = earlier + (2 + (layout ? layout - 1 : 0)) * kTileFloats;
+                const float* present = screen_tiles ? screen_tiles : samples + BlockOffset(kTileScreen);
+                for (unsigned i = 0; i < kTiles; ++i) {
+                    if (!(regions.output & (1u << i))) continue;
+                    const unsigned at = i * kTile * kTile;
+                    geometry[i] = {
+                        MeasureTileShift(earlier + at, samples + BlockOffset(kTileInput) + at),
+                        MeasureTileShift(earlier + kTileFloats + at, samples + BlockOffset(kTileOutput) + at),
+                        MeasureTileShift(earlier_screen + at, present + at),
+                        g.main_jitter[0] - g.pre_jitter[0], g.main_jitter[1] - g.pre_jitter[1]};
+                }
+            }
         }
         // VARIANT: referee/shared-texture-probes
         const bool ambiguous = g.done_tiles && score.tiles_textured >= kTiles / 2 &&
@@ -457,6 +493,35 @@ void collect_sample()
     std::lock_guard<std::mutex> lock(g.m);
     if (mapped) {
         FlickerStage trace = FlickerStage::Unknown;
+        if (g.trace_geometry && enabled() && g.preview_exact && !g.invalidated && g.main_epoch == g.epoch) {
+            auto& w = g.geometry;
+            if (w.source != g.swapchain || !w.view.SameTemporalSequence(g.captured_context) ||
+                w.layout != layout || w.width != g.img[kScreen].desc.Width || w.height != g.img[kScreen].desc.Height ||
+                g.main_ordinal <= w.ordinal || g.main_ordinal - w.ordinal > 240 ||
+                !std::equal(std::begin(w.locations.cell), std::end(w.locations.cell), std::begin(g.sampled_locations.cell))) {
+                w = {};
+                w.source = g.swapchain;
+                w.view = g.captured_context;
+                w.layout = layout;
+                w.width = uint32_t(g.img[kScreen].desc.Width);
+                w.height = g.img[kScreen].desc.Height;
+                w.locations = g.sampled_locations;
+            }
+            w.ordinal = g.main_ordinal;
+            unsigned tile = 0;
+            float maximum = 0;
+            for (unsigned i = 0; i < kTiles; ++i) {
+                w.window[i].Add(geometry[i]);
+                if (const float leak = w.window[i].Leakage(false); leak > maximum) { tile = i; maximum = leak; }
+            }
+            if (std::fabs(maximum - w.reported) >= .03f) {
+                w.reported = maximum;
+                na::eventlog::Emit("referee_jitter_geometry",
+                    "frame=%llu tile_xy=%d,%d samples=%u phase_residual_screen_px=%.4f phase_residual_dlaa_px=%.4f",
+                    (unsigned long long)g.main_ordinal, regions.at[tile].x, regions.at[tile].y,
+                    w.window[tile].count, maximum, w.window[tile].Leakage(true));
+            }
+        }
         if (g.trace_pair && g.trial_adjacent && g.preview_exact && !g.invalidated) {
             ++g.stats.trial_pairs;
             if (trial_valid) ++g.stats.trial_comparable;
@@ -726,6 +791,10 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
         g.img[kPrevOutput].desc.Format == g.img[kOutput].desc.Format &&
         g.img[kPrevScreen].desc.Width == sw && g.img[kPrevScreen].desc.Height == shh &&
         g.img[kPrevScreen].desc.Format == g.img[kScreen].desc.Format;
+    g.trace_geometry = g.trace_pair && g.pre_ordinal + 1 == g.main_ordinal &&
+        g.img[kPrev].desc.Width == iw && g.img[kPrev].desc.Height == ih &&
+        g.img[kPrev].desc.Format == g.img[kInput].desc.Format &&
+        std::hypot(g.main_jitter[0] - g.pre_jitter[0], g.main_jitter[1] - g.pre_jitter[1]) >= .25f;
     g.sampled_locations = g.swapchain == g.tile_source && g.captured_context.SameTemporalSequence(g.tile_context)
         ? g.tile_locations : TileLocations{};
     for (int i = 0; screen && i < 3; ++i) {
@@ -762,6 +831,19 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
             k.base = kTraceOffset + 3 * kThumbFloats;
             run(g.thumb.Get(), k, (kThumbW + 7) / 8, (kThumbH + 7) / 8);
         }
+        if (g.trace_geometry) {
+            for (unsigned i = 0; i < 3; ++i) {
+                k = {};
+                k.src = earlier[i];
+                size(earlier[i], k.w, k.h);
+                k.base = kGeometryOffset + i * kTileFloats;
+                k.mw = iw;
+                k.mh = ih;
+                k.locations = g.sampled_locations;
+                k.pad0 = i == 2 && g.padded_layouts;
+                run(g.tiles.Get(), k, kTiles, k.pad0 ? g.padded_layouts : 1);
+            }
+        }
     }
     uint32_t pw = 0, ph = 0;
     size(kPrev, pw, ph);
@@ -783,7 +865,7 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
     after[1] = transition(g.results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     l->ResourceBarrier(2, after);
     l->CopyBufferRegion(g.readback.Get(), 0, g.results.Get(), 0,
-                        UINT64(g.trace_pair ? kTraceOffset + kTraceFloats : kResultFloats + g.padded_layouts * kTileFloats) * sizeof(float));
+                        UINT64(sample_floats()) * sizeof(float));
     rb = transition(g.results.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     l->ResourceBarrier(1, &rb);
     if (FAILED(l->Close())) { stop("the referee's command list could not close"); return; }
@@ -835,6 +917,7 @@ void reset_evidence_locked()
     g.visual.clear();
     g.visual_rollback.store(false, std::memory_order_relaxed);
     g.trace_source = nullptr;
+    g.geometry = {};
 }
 
 } // namespace
