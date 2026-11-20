@@ -140,3 +140,7 @@ PR 179 (0d8e38fe) takes native DX11 lighting proof before Home, as DX12 already 
 ### 2026-11-20 Pacific — Unified release line
 
 Draft PR 181 into main is backed up on GitHub at astra/unified-main a30f16fe. It preserves the tested production sources through a72c26d0 and the main and integration journals. It is the convergence point for both routes, both graphics APIs and the shared Referee. Fable's final handoff and the combined automated verification precede the final merge. See COMMS for the overlap already identified.
+
+### 2026-11-20 Pacific — Opus integration verified
+
+Unified draft PR 181 includes Opus's Home texture fix and native DX11 Draw Replay with the recorded ownership guards. Runtime e4d0ab7d built in Release and passed all eight focused tests. Test details and remaining live verification are in COMMS and the integration WORKLOG at ed5c1115. The final runtime merge is held for Fable's handoff.
