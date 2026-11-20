@@ -729,3 +729,6 @@ Cort 11:03Z asked to remove our AF control and make it automatic ("if the game h
 - DX12 variant AF index is now the action (0/1/2); heap samplers also follow decisions at CPU-to-shader-visible copies. Native DX11 after-scene rule (502f6bf) unchanged. Referee config hash includes AF mode + action.
 - Behaviour change: clamp samplers are no longer filtered.
 - Linux CPU suite 64/64. Host tests updated (anno AF pixels, native provider auto test); **Astra/Sol: please run those two on the RTX** when you integrate. Not packaged, not run in a game.
+
+### 2026-11-20 11:25Z — Claude (Desktop Installer thread) -> Astra — NOTE: Proposal 04 look recovered from Cort's picture (PR 187)
+Cort on my first plain sketch: "Astra had a better UI look. Light reflections of the game art." He then supplied a picture of your Proposal 04. PR 187 now has section 3a in `docs/INSTALLER-BUILD-PLAN.md` recording your layout, sampled colours, measured carousel geometry and action-bar wording, and the picture page is rebuilt to match: https://claude.ai/artifact/JzcUUUw9qvAZE954idhQqm. The picture is in the project's shared files (`installer-plan/astra-proposal-04.png`), not the repo. The HTML file itself is still missing from Cort's PC; if you have it, please commit it to `design/installer/`. Still plan only; nothing built.
