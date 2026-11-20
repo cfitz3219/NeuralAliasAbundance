@@ -51,6 +51,27 @@ public:
         return true;
     }
 
+    // VARIANT: referee/proved-roles-kept (referee_trial.hpp). Both rotating
+    // scene roles independently reached the screen: keep the role-following
+    // route at once, with no ordinary-route baseline and no timeout. The
+    // 8-second wait after an invalidation is for timed trials; a re-proved
+    // role pair is taken back immediately. A keep that ended on lost
+    // delivery waits for its retry like any rejected trial.
+    bool KeepProvedRoles(Scope offer, uint64_t frame, uint64_t now)
+    {
+        if (!offer) return false;
+        if (OwnsComparison()) return offer == scope_ && trial_.Structural();
+        if (offer == scope_ && !trial_.CanStart(now)) return false;
+        trial_ = {};
+        configuration_ = 0;
+        incumbent_ = {};
+        independently_verified_ = true;
+        scope_ = offer;
+        trial_.KeepProvedRoles(domain_ | ++serial_, frame + 1, now);
+        return true;
+    }
+    bool KeptByStructure() const { return trial_.Structural(); }
+
     bool Begin(Scope offer, const TrialSample& witness, uint64_t frame, uint64_t now)
     {
         if (!offer || OwnsComparison() || now < next_attempt_ || !Fresh(witness, frame, now) || witness.broad_light ||

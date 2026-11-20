@@ -8924,6 +8924,8 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
                 if (previous_phase != referee::RouteTrial::Phase::Baseline &&
                     placement.Comparison().Current() == referee::RouteTrial::Phase::Baseline)
                     g.placement_lighting = lighting;
+                // VARIANT: referee/proved-roles-kept: a proved role pair skips the baseline.
+                if (placement.KeptByStructure() && !g.placement_lighting) g.placement_lighting = lighting;
             }
             if (!placement.OwnsComparison()) g.placement_lighting = 0;
             g_trace.active_lighting.store(placement.UsesCandidate() ? g.placement_lighting : 0, std::memory_order_release);

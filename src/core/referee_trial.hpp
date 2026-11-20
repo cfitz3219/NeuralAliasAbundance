@@ -196,6 +196,27 @@ public:
         if (witness.origin.recovery_floor > 0)
             flicker_floor_ = std::clamp(witness.origin.recovery_floor, FlickerTransition::scoped_minimum, minimum_flicker);
     }
+    // VARIANT: referee/proved-roles-kept
+    // Two same-size scene targets that exchange roles every frame make the
+    // physical-target route evaluate a different stage on alternate frames:
+    // DLAA gets the lit picture on one frame and the unlit one on the next,
+    // and the game's later pass adds the missing light on top. The screen
+    // then flips brightness with frame parity, opposite to the DLAA input
+    // (Shadow of War 18dea9e: 61 of 61 traced flashes). Once an adapter has
+    // proved both roles reach the screen, following the role is the only
+    // consistent route, so it is kept by structure. The ordinary route is
+    // the cause, not a fair incumbent: it is never shown again to measure a
+    // baseline, and no timeout can restore it. Only a lost screen route or
+    // proof of bypass ends the keep. A recurring residual on the kept route
+    // becomes the target of the stage-recovery tools.
+    void KeepProvedRoles(uint64_t id, uint64_t frame, uint64_t now)
+    {
+        Start(id, frame, now);
+        structural_ = true;
+        Next(Phase::Kept, frame);
+        reason_ = "both rotating scene roles reach the screen; the role-following route is kept";
+    }
+    bool Structural() const { return structural_ && phase_ == Phase::Kept; }
     bool RuledOut() const { return phase_ == Phase::Rejected && ruled_out_; }
     bool Regional() const { return regional_; }
     Phase Current() const { return phase_; }
@@ -224,6 +245,7 @@ public:
     {
         now_ = now;
         if (UsesCandidate() && !available) Retry("replacement lost its screen route");
+        if (structural_) return;
         if (phase_ == Phase::Kept && regional_ && now - regional_seen_ >= maximum_ms) Retry("regional screen evidence expired");
         if (Active() && now >= expires_) Retry("timed out without comparable presented evidence");
     }
@@ -237,6 +259,11 @@ public:
         }
         if (phase_ == Phase::Rejected) return;
         if (UsesCandidate() && sample.bypassed) {
+            if (structural_) {
+                // The roles are proved again before the next keep.
+                Retry("the role-following route lost visible delivery");
+                return;
+            }
             ruled_out_ = true;
             Reject("replacement lost visible delivery");
             return;
@@ -251,6 +278,10 @@ public:
                 return std::all_of(region.begin(), region.end(), finite);
             }) ||
             !std::all_of(sample.image.begin(), sample.image.end(), finite)) return;
+        if (structural_) {
+            KeepStructural(sample);
+            return;
+        }
         if ((targeted_ || phase_ != Phase::Baseline) && !SameView(anchor_, sample)) {
             if (regional_ && Active()) count_ = 0;
             watch_same_ = watch_opposite_ = 0;
@@ -455,6 +486,33 @@ public:
     float ResidualBaseline() const { return phase_ == Phase::Kept ? residual_baseline_ : 0.f; }
 
 private:
+    // Kept by structure: watch the delivered picture and hand a recurring
+    // residual to stage recovery. Never restores the ordinary route.
+    void KeepStructural(const TrialSample& sample)
+    {
+        if (count_ && !SameSetup(window_[0], sample)) count_ = 0;
+        window_[count_++] = sample;
+        if (count_ >= samples) {
+            float strongest = 0.f;
+            uint32_t at = 0;
+            const TrialSample* pattern = nullptr;
+            for (uint32_t i = 0; i < FlickerTransition::count; ++i) {
+                const TrialSample* reference = nullptr;
+                const float amplitude = Repeated(i, nullptr, reference);
+                if (amplitude > strongest) { strongest = amplitude; at = i; pattern = reference; }
+            }
+            if (strongest >= minimum_flicker && strongest > residual_baseline_ * 1.3f && pattern) {
+                residual_region_ = region_ = at;
+                residual_baseline_ = strongest;
+                anchor_ = *pattern;
+                reason_ = "role-following route kept; a recurring residual was handed to stage recovery";
+            }
+        }
+        if (count_ == window_.size()) {
+            std::move(window_.begin() + 1, window_.end(), window_.begin());
+            --count_;
+        }
+    }
     void SelectResidualRegion()
     {
         float greatest = 0.f;
@@ -539,7 +597,7 @@ private:
     uint64_t id_ = 0, expires_ = 0, measured_from_ = 0;
     uint64_t now_ = 0, retry_at_ = 0, retry_delay_ = 8000, last_ordinal_ = 0, watch_at_ = 0;
     uint8_t watch_same_ = 0, watch_opposite_ = 0;
-    bool targeted_ = false, ruled_out_ = false, regional_ = false, spatial_only_ = false;
+    bool targeted_ = false, ruled_out_ = false, regional_ = false, spatial_only_ = false, structural_ = false;
     uint8_t lost_region_ = 0;
     uint64_t regional_seen_ = 0;
     uint32_t region_ = 0;

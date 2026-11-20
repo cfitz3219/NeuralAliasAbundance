@@ -11,6 +11,7 @@
 #include "core/referee_selection.hpp"
 #include "core/referee_recovery.hpp"
 #include "core/referee_placement.hpp"
+#include "core/referee_parity.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include <cmath>
 #include <cstdio>
@@ -867,6 +868,78 @@ int main()
         check(dx12.Comparison().Current() == RouteTrial::Phase::Kept &&
               .25f * .10f > dx12.Comparison().CandidateAffectedRegion(),
               "residual trial preserves delivery and improves more than ninety percent of the original fault");
+    }
+    {
+        // referee/parity-role-swap: stops as traced in Shadow of War 18dea9e
+        // (results 231420-994): odd frames brighter on screen, DLAA input
+        // the other way. Recognized after six agreeing adjacent pairs.
+        ParityRoleSwap swap;
+        bool recognized = false;
+        unsigned recognized_at = 0;
+        for (unsigned i = 0; i < 10; ++i) {
+            const uint64_t first = 115400 + i;
+            const float sign = ((first + 1) & 1u) ? 1.f : -1.f;
+            if (swap.Observe(first, first + 1, {-.30f * sign, -.14f * sign, .62f * sign}) && !recognized) {
+                recognized = true;
+                recognized_at = i;
+            }
+        }
+        check(recognized && recognized_at == ParityRoleSwap::needed - 1 && swap.Phase() > 0,
+              "parity flicker opposite to the DLAA input is recognized after six agreeing pairs");
+        ParityRoleSwap same_way;
+        bool wrongly = false;
+        for (unsigned i = 0; i < 10; ++i) {
+            const uint64_t first = 2000 + i;
+            const float sign = ((first + 1) & 1u) ? 1.f : -1.f;
+            wrongly |= same_way.Observe(first, first + 1, {.30f * sign, .15f * sign, .40f * sign});
+        }
+        check(!wrongly, "a flicker already in the game's input (same direction on screen) is not a role swap");
+        ParityRoleSwap unlocked;
+        for (unsigned i = 0; i < 12; ++i) {
+            const uint64_t first = 3000 + 2 * i; // same parity every time, sign changes
+            const float sign = i % 2 ? 1.f : -1.f;
+            wrongly |= unlocked.Observe(first, first + 1, {-.30f * sign, 0.f, .62f * sign});
+        }
+        check(!wrongly, "a flicker not locked to frame parity is not a role swap");
+        ParityRoleSwap gaps;
+        for (unsigned i = 0; i < 12; ++i) wrongly |= gaps.Observe(4000 + 3 * i, 4002 + 3 * i, {-.3f, 0.f, .6f});
+        check(!wrongly, "only adjacent frame pairs can show the parity signature");
+
+        // referee/proved-roles-kept: a proved role pair is kept at once,
+        // never times out, and hands a residual to stage recovery.
+        PlacementTrial roles;
+        const PlacementTrial::Scope scope{31, 41, 3, 12};
+        check(!roles.KeepProvedRoles({}, 1, 100), "no proved pair, no keep");
+        check(roles.KeepProvedRoles(scope, 1, 100) && roles.UsesCandidate() && roles.KeptByStructure() &&
+              roles.Comparison().Current() == RouteTrial::Phase::Kept,
+              "proved rotating roles: the role-following route is kept with no ordinary-route baseline");
+        roles.Tick(100 + 10 * RouteTrial::maximum_ms, true);
+        check(roles.UsesCandidate(), "no timeout restores the flickering ordinary route");
+        uint64_t ordinal = 2 + RouteTrial::warmup_frames;
+        TrialSample kept;
+        kept.width = 960; kept.height = 540; kept.layout = 1; kept.configuration = 1;
+        kept.delivered = kept.comparable = true;
+        for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
+            kept.ordinal = ordinal;
+            kept.observed_at = 200000 + ordinal;
+            kept.change[13].fill(i % 2 ? .25f : -.25f);
+            roles.Add(scope, roles.Ticket(ordinal), kept, ordinal, kept.observed_at);
+        }
+        check(roles.UsesCandidate() && roles.AllowsStageRecovery() && roles.RecoveryRegion() == 13,
+              "a recurring residual on the kept route goes to stage recovery, not back to the ordinary route");
+        check(roles.KeepProvedRoles(scope, ordinal, 300000), "the same proved pair stays kept");
+        kept.ordinal = ++ordinal;
+        kept.observed_at = 300001;
+        kept.bypassed = true;
+        roles.Tick(kept.observed_at, true);
+        roles.Add(scope, roles.Ticket(ordinal), kept, ordinal, kept.observed_at);
+        check(!roles.UsesCandidate() && !roles.KeepProvedRoles(scope, ordinal, 300002),
+              "proof that DLAA no longer reaches the screen ends the keep until its retry");
+        check(roles.KeepProvedRoles(scope, ordinal, 300001 + 8000 + 1),
+              "after the retry delay the re-proved pair is kept again");
+        roles.Invalidate(400000);
+        check(roles.KeepProvedRoles(scope, ordinal, 400001),
+              "a pair re-proved after a scene change is taken back without the timed-trial wait");
     }
     std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
     return failures ? 1 : 0;

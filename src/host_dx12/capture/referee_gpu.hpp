@@ -70,6 +70,7 @@ struct Stats {
     uint64_t pre = 0, main = 0, restarted = 0, discarded = 0, unpaired = 0, failed = 0;
     uint64_t trace_pairs = 0, trace_reversals = 0, rejected_presents = 0;
     uint64_t trial_pairs = 0, trial_comparable = 0;
+    uint64_t parity_matched = 0, parity_recognitions = 0; // referee/parity-role-swap
     bool running = false, stopped = false;
     char why[160] = "";
 };

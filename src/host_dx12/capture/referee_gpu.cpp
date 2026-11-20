@@ -19,6 +19,7 @@
 #include <mutex>
 #include <vector>
 #include "core/referee_trace.hpp"
+#include "core/referee_parity.hpp"
 
 using Microsoft::WRL::ComPtr;
 
@@ -79,6 +80,7 @@ struct State {
     std::array<Presentation, 4> pending_presents{};
     std::atomic<bool> pending_receipt{false};
     FlickerTransition previous_transition;
+    ParityRoleSwap parity; // VARIANT: referee/parity-role-swap
     shadow::Context trace_context;
     const void* trace_source = nullptr;
     uint64_t trace_ordinal = 0;
@@ -561,6 +563,19 @@ void collect_sample()
                     (unsigned long long)g.captured_context.color, (unsigned long long)g.captured_context.depth,
                     (unsigned long long)g.captured_context.native_screen_proof, (unsigned long long)g.captured_context.generation);
             }
+            if (g.trace_source != g.swapchain) g.parity.Reset();
+            if (g.parity.Observe(g.pre_ordinal, g.main_ordinal, transition.stops)) {
+                ++g.stats.parity_recognitions;
+                na::eventlog::Emit("referee_parity_swap", "frames=%llu,%llu region=%u,%u change_stops=%.3f/%.3f/%.3f "
+                    "matched=%llu brighter=%s color=%llu generation=%llu why=\"the screen flips brightness with frame parity, "
+                    "opposite to the DLAA input: the scene targets exchange roles every frame, follow the role\"",
+                    (unsigned long long)g.pre_ordinal, (unsigned long long)g.main_ordinal,
+                    transition.region % FlickerTransition::columns, transition.region / FlickerTransition::columns,
+                    transition.stops[0], transition.stops[1], transition.stops[2],
+                    (unsigned long long)g.parity.Matched(), g.parity.Phase() > 0 ? "odd" : "even",
+                    (unsigned long long)g.captured_context.color, (unsigned long long)g.captured_context.generation);
+            }
+            g.stats.parity_matched = g.parity.Matched();
             g.trace_source = g.swapchain;
             g.trace_context = g.captured_context;
             g.previous_transition = transition;
