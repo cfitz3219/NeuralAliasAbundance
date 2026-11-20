@@ -100,7 +100,7 @@ Order matters. The first source that has the answer wins, and the PC's own files
 
 | What | First choice | Then | Last resort |
 |---|---|---|---|
-| **Cover art** | The picture the launcher already saved on the PC (Steam keeps upright 600x900 covers in its own cache folder; Epic and GOG keep theirs too) | The launcher's public picture address for that game id | [SteamGridDB](https://www.steamgriddb.com) (free, needs a free personal key, community-made art), then a plain Poise title card |
+| **Cover art** | The picture the launcher already saved on the PC. Checked on Cort's PC 2026-11-20: Steam keeps one folder per game id under `Steam\appcache\librarycache\`, each with an upright cover `library_600x900.jpg` (300 by 450 pixels as stored), a wide banner, a logo and a ready-blurred backdrop. Epic and GOG keep theirs too (not yet checked) | The launcher's public picture address for that game id | [SteamGridDB](https://www.steamgriddb.com) (free, needs a free personal key, community-made art), then a plain Poise title card |
 | **Name, launcher id, install folder** | The launcher's own record on disk | | |
 | **DirectX kind, 32/64-bit, DLSS and Frame Gen files, anti-cheat** | The game's own files (section 4) | Our run logs | |
 | **Hints for games we have never run** | [PCGamingWiki](https://www.pcgamingwiki.com) (free to read; its text is CC BY-NC-SA, so we link and summarise, we do not copy) | | |
@@ -136,6 +136,53 @@ Smooth means one thing: every time the monitor refreshes, a new picture is ready
 ### How we will know it is smooth (no eyeballing numbers)
 
 The window has a built-in **smoothness log**. A test command spins the carousel through 100 games by itself and writes every frame's time to a file, with a plain summary line: monitor rate, slowest frame, how many frames were late, and what the program was doing during any late one. Cort never reads numbers off the screen; the log goes with the other results. The pass mark is in section 6.
+
+---
+
+## 3a. The approved look, written down (Astra's Proposal 04)
+
+The original mockup file was lost from Cort's PC. On 2026-11-20 Cort supplied a picture of it ("The top part is the UI. The bottom is an explanation") and said of an earlier plain sketch: "it doesn't look how i want it. Astra had a better UI look. Light reflections of the game art." This section records that look in words and numbers so it survives. The picture is kept in the project's shared files as `installer-plan/astra-proposal-04.png` (not in the repo, because it shows game cover art). A working rebuild is on the picture page linked from the pull request.
+
+**Top to bottom**
+
+1. Header: "NeuralAlias" in Poise Light at the left; "Library" (underlined, current), "Components", "Settings" at the right; a hairline beneath.
+2. Headline, centred: "Your games. Sharper and smoother." in Poise Light. Beneath it: "Bring DLSS, Neural Rendering and Frame Generation to your games."
+3. At the right, above the carousel: the game count ("9 games") and a round Sync button with two circling arrows.
+4. The carousel (below).
+5. The selected game's name in Poise Light, and a small line: "Saved library information · DX12".
+6. Two small square arrow buttons with a counter between them: "05 / 09".
+7. The Go bar: 300 px wide, centred.
+8. One box titled "Installation Options" holding three checkboxes in a row: DLSS, DLSS 5 Neural Rendering, Frame Gen. A feature the game already has is shown ticked and gray with "Already in game" beneath it. Below the box: "1 feature selected".
+9. Footer hairline with small notes.
+
+**Colours** (sampled from the picture)
+
+| Use | Colour |
+|---|---|
+| Window background | `#111716` |
+| Text | `#f2f2ea`, muted `#9ea8a1` |
+| Go, ready | `#b7cf97` with dark text `#243022` |
+| Go*, with caveats | `#e2c685` with dark text |
+| Unable to Install* | `#b8645e` with white text |
+| Nothing selected, on hover | `#7d877f` with white text |
+| Explanation strip | paper `#edf0e8`, dark text |
+| Selected cover's frame | cream `#f1efe4`, 3 px |
+| DirectX ribbon | pale sage, dark text, across the top-left corner |
+
+**The carousel, measured from the picture** (selected cover 220 by 328)
+
+| Places from the middle | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| Distance from centre | 0 | 228 | 324 | 406 | 472 |
+| Size | 100% | 90% | 76% | 63% | 52% |
+| Turned toward the middle | 0° | 33° | 36° | 38° | 40° |
+| Dimmed and softened | none | slight | more | more | most, fading out |
+
+So there is breathing room beside the selected cover and the side stacks tighten and fade, as Astra's handoff note said. Covers are centred on one line (no floor), each with a soft shadow, rounded corners and a fine light edge. Side covers and the arrows both move one game.
+
+**The light on the art.** Covers look glossy: a soft band of light lies across each one and moves as the cover turns. To keep this free of cost while moving, the band is one ready-made strip per card that the graphics card only slides (rule 4 in section 3). The same goes for the dim, soft side covers.
+
+**The action bar explanation** (the lower part of Astra's picture) is kept word for word: Ready: "The selected features can be installed." With caveats: "Hover or select * to read the specific caveats." Unavailable: "Explain which selection cannot work, and why." Nothing selected, hover: "'Please make a selection' appears above the bar." Also: "Compatibility follows selected features. While detection runs: 'Checking compatibility…' · Uninstalled overlay options remain visible, grayed out and labelled 'Not installed'." Sync: the first scan reports what it found; later scans stop silently.
 
 ---
 
@@ -247,7 +294,7 @@ Stages 1 and 2 need no window and help today's test packages by themselves, so t
 
 ## 7. Open items
 
-1. **The approved v4 mockup is no longer at `Documents\NeuralAlias-Installer-Proposal-v4\preview.html` on Cort's PC** (checked 2026-11-20; the folder is gone, likely in one of the cleanups). It was never in the repo. Its description survives in `docs/comms-archive/HANDOFF-through-2026-11-18.md` ("approved installer UI remembered"): Poise font; headline "Your games. Sharper and smoother."; DLSS explanation beneath; centered 300 px Go above one compact Installation Options box with three unboxed checkboxes; nine cover positions with breathing room beside the selected one and tighter, fading, blurred side stacks; only the nearest side covers act as arrows; Sync with spinning circle-arrows that reports only additions; DirectX corner ribbons; native features gray. **Ask: Astra, if you still have the file, please commit it to `design/installer/`.** If it is lost, it is rebuilt from that description at Stage 0 and shown to Cort for a fresh yes.
+1. **The original Proposal 04 file is still missing** from `Documents\NeuralAlias-Installer-Proposal-v4\` on Cort's PC (checked 2026-11-20) and was never in the repo. Cort supplied a picture of it the same day; section 3a records the look from that picture. **Astra, if you still have the HTML file, please commit it to `design/installer/`** so Stage 3 can start from your file instead of a rebuild.
 2. **Stack choice** is Cort's: Tauri plus web page (recommended) or the C++ fallback.
 3. **Wraparound at the ends**, checkbox defaults and exact timing stay Cort's calls on seeing Stage 3, as Astra's design left them.
 4. **Sharing beyond Cort's PC** raises two questions that do not block building: where the NVIDIA DLSS file comes from on someone else's PC, and signing the program so Windows does not warn. Both wait until a public release is on the table.
