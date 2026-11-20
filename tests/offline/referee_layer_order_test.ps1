@@ -25,6 +25,14 @@ Check 'additional plausible target' ($alternating | ForEach-Object { $_ + ' [oth
 Check 'other extent' ($alternating -replace 'last_read=2399 float=1 same_size=1','last_read=2399 float=1 same_size=0') $false
 Check 'scene rule changes' ($alternating[0..3] + ($alternating[4..7] -replace 'rule=after-layers ', 'rule=after-layers-second-depth ')) $false
 Write-Output 'Referee layer-order summary passed all eight cases.'
+$enabledWithoutEvidence = @(Get-RefereeSummary @(
+    'event src=code settings_all j2_scale_mode=0 referee_enabled=0'
+    'event src=panel setting referee_enabled=1 was=0'
+    'event src=panel setting referee_enabled=0 was=1'
+))
+if ($enabledWithoutEvidence -notlike '*enabled during this run*no screen or delivery checks*') {
+    throw 'Lost the Referee setting change when no screen checks ran'
+}
 $coverage = @(Get-RefereeSummary @('event referee_coverage dx12_scene=90 dx12_submitted=0 dx11_presents=25 dx11_submitted=22'))
 if (($coverage -like '*not running*') -or -not ($coverage -like '*DX12 submitted DLAA on 0 of 90*') -or
     -not ($coverage -like '*DX11 submitted DLAA on 22 of 25*')) { throw 'Lost coverage before first qualified image' }

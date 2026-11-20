@@ -62,7 +62,9 @@ function Get-RefereeSummary([string[]] $Lines) {
     $parity = @($Lines | Where-Object { $_ -match '\breferee_parity_swap frames=\d+,\d+ ' })
     $kept = @($Lines | Where-Object { $_ -match '\breferee_roles frame=\d+ kept=1' })
     if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry -and -not $parity -and -not $kept) {
-        $out.Add('Referee: not running in this log (the Referee switch was off, or this build has no referee).')
+        $enabled = $Lines | Where-Object { $_ -match '\b(?:setting |settings_all\s+.*\b)referee_enabled=1\b' } | Select-Object -First 1
+        if ($enabled) { $out.Add('Referee was enabled during this run. The log has no screen or delivery checks.') }
+        else { $out.Add('The log has no Referee screen or delivery checks.') }
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
     }
