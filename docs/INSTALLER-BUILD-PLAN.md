@@ -328,7 +328,7 @@ Cort passed on eight notes from Gemini and asked: evaluate, and fix where he is 
 
 ### 8b. Added to the window
 
-Proposals for Astra and Cort, since the look is theirs. None changes Proposal 04's layout.
+Proposals for Astra and Cort, since the look is theirs. None changes Proposal 04's layout. Cort said "Implement what you approve of" (2026-11-20 11:50Z), so all four are now shown working in the sketch page (type a name, folder line with Locate manually, Installed / Play / Uninstall, remembered ticks). The real window is still not built.
 
 - **Installed state.** A game with our program installed shows a small "Installed · build" line under its name. The bar reads **Play**, and a quiet **Uninstall** sits beside the arrows. Ticking a different set of features turns the bar back into **Go** to apply the change. Play starts the game the way the package's `00-PLAY` file does today.
 - **Where the game is.** The small line under the name ("Saved library information · DX12") also carries the folder. Clicking it opens the folder. **Locate manually** is offered there, and automatically when the folder no longer exists or the same game is found in two places.
