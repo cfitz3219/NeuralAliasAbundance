@@ -88,6 +88,7 @@ function Get-RefereeSummary([string[]] $Lines) {
     }
     if ($trials -and $trials[-1] -match '\bphase=(\w+) region=(\d+) stops=([^ ]+)(?: regional=(\d+))?(?: verified_reduction=([-\d.]+))? why=(.*)$') {
         $regional = $Matches[4] -eq '1'
+        $primaryRegion = $Matches[2]
         $why = $Matches[6]
         $stops = $Matches[3]
         $trialState = switch ($Matches[1]) {
@@ -97,11 +98,11 @@ function Get-RefereeSummary([string[]] $Lines) {
         }
         $out.Add("  $trialState. $why")
         if ($regional) { $out.Add('  The comparison follows the same disputed tiles and clear controls through the ordinary route, replacement, and ordinary retest.') }
-        else { $out.Add("  Compared brightness change in stops (ordinary / replacement / ordinary retest): $stops.") }
+        else { $out.Add("  Brightness change in stops (ordinary region $primaryRegion / largest during replacement / ordinary region retest): $stops.") }
         if ($Matches[1] -eq 'kept' -and $Matches[5] -and [double]$Matches[5] -ge 0) {
             $reduction = [double]$Matches[5]
             $goal = if ($reduction -ge .90) { 'met the 90% target' } else { 'below the 90% target' }
-            $out.Add(('  Measured {0:P1} less brightness variation in the affected region, {1}.' -f $reduction, $goal))
+            $out.Add(('  Measured {0:P1} less brightness variation in region {1}, {2} for that region.' -f $reduction, $primaryRegion, $goal))
         }
     }
     if ($layerOrder) { $out.Add($layerOrder) }
@@ -118,7 +119,7 @@ function Get-RefereeSummary([string[]] $Lines) {
             $result = if ($phase -eq 'kept') { 'Kept' } else { 'Restored the previous settings after trying' }
             $out.Add("  Region $region, $stage. $result $($names[$tool]). $why. Brightness change (ordinary / trial / recheck) $measurements.")
             if ($phase -eq 'kept' -and $Matches[7] -and [double]$Matches[7] -ge 0) {
-                $out.Add(('  Both corrections reduced the original flicker by {0:P1} in the same region.' -f [double]$Matches[7]))
+                $out.Add(('  Both corrections reduced the original flicker by {0:P1} in region {1}.' -f [double]$Matches[7], $region))
             }
         }
         if ($recovery[-1] -match 'tool=(\w+) phase=(baseline|replacement|baseline_recheck) ') {

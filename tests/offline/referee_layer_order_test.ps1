@@ -67,8 +67,8 @@ if (-not ($dx12 -like '*Replacement kept*original bypass*')) { throw 'DX12 place
 
 $residual = @(Get-RefereeSummary @(
     'event dx12_route_trial next_frame=202 phase=kept region=11 stops=0.25/0.06/0.25 regional=0 verified_reduction=0.76 why=measured improvement'
-    'event referee_recovery frame=200 first_stage=composition region=11 tool=reduce_sharpening phase=kept ruled_out=0 stops=0.06/0.01/0.06 reduction=0.8333 total=0.9600 why=the replacement reduced flicker'
+    'event referee_recovery frame=200 first_stage=composition region=12 tool=reduce_sharpening phase=kept ruled_out=0 stops=0.06/0.01/0.06 reduction=0.8333 total=0.9600 why=the replacement reduced flicker'
     'event referee_jitter_geometry frame=201 tile_xy=1120,380 samples=8 phase_residual_screen_px=0.2200 phase_residual_dlaa_px=0.2000'
 ))
-if (-not ($residual -like '*below the 90% target*') -or -not ($residual -like '*Both corrections reduced the original flicker*') -or
+if (-not ($residual -like '*region 11, below the 90% target*') -or -not ($residual -like '*Both corrections reduced the original flicker*in region 12*') -or
     -not ($residual -like '*Jitter-aligned edge movement measured at (1120,380)*')) { throw 'Lost verified reduction or geometry in the results' }
