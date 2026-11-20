@@ -124,3 +124,7 @@ Use Documents/NeuralAlias-ShadowOfWar-Reflection-18dea9e/02-INSTALL-ShadowOfWar.
 ### 2026-11-19 — Shared Referee recovery for DX11 and DX12
 
 PR 176 at 270d7b6b uses one decision policy and adds DX12 rotating-lighting placement with independent screen proofs for both inputs. The focused Release set passed 7/7, including actual NVIDIA DX11 tests and the RTX DX12 screen fixture. The preceding Shadow of War package remains the game test artifact. See COMMS and the branch WORKLOG for exact evidence and scope.
+
+### 2026-11-19 Pacific — Shadow of War overlay preferences
+
+PR 177 (323a805e) on top of the shared Referee branch removes the Steady Distant Lighting switch and enables qualified correction automatically. The Replay checkbox is visible but disabled in native DX11 and remains off by default in DX12. Seven focused Release checks passed. The reported distant vibration remains open. See COMMS for the current evidence. Existing live package is 18dea9e.
