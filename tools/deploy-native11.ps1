@@ -206,14 +206,14 @@ enabled=0
 [fg]
 enabled=0
 [adapter]
-enabled=0
+enabled=$(if ($autoApi) { 1 } else { 0 })
 [observe]
 profile_hooks=0
 usage_log=1
 producers=$(if ($autoApi) { 1 } else { 0 })
-early_install=0
+early_install=$(if ($autoApi) { 1 } else { 0 })
 [discovery]
-enabled=0
+enabled=$(if ($autoApi) { 1 } else { 0 })
 read_only=1
 log=$Evid\discovery.jsonl
 [j2]
