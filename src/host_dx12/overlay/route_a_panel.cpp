@@ -1388,39 +1388,38 @@ void DrawDlssDebug()
     EndRow();
     SectionTitle("Jitter diagnostic");
     auto& selection = na::settings::Get().j2_debug_jitter;
-    neural_alias::JitterDiagnostic mode{selection.load(std::memory_order_relaxed)};
-    BeginRow("Try a jitter setting", "The game shifts each picture a fraction of a pixel so DLAA can pick up fine detail. These tests change how DLAA reads that shift. If edges start shaking, press Reset.", ButtonWidth("Next setting") + ImGui::GetStyle().ItemSpacing.x + ButtonWidth("Reset"));
+    const auto before = selection.load(std::memory_order_relaxed);
+    neural_alias::JitterDiagnostic mode{before};
+    BeginRow("Test jitter", "If edges shake, press Reset.", ButtonWidth("Next setting") + ImGui::GetStyle().ItemSpacing.x + ButtonWidth("Reset"));
     if (Button("Next setting")) mode.value = mode.WithConfig(mode.Config() + 1);
     ImGui::SameLine();
     if (Button("Reset")) mode.value = 0;
     EndRow();
     bool swapped = mode.Swapped();
-    BeginRow("Swap sideways with up and down", nullptr, SwitchWidth());
+    BeginRow("Swap sideways and up/down", nullptr, SwitchWidth());
     if (ImGui::Checkbox("##swapaxes", &swapped)) mode.value = mode.ToggleAxes();
     EndRow();
-    selection.store(mode.value, std::memory_order_relaxed);
+    if (before != mode.value) selection.store(mode.value, std::memory_order_relaxed);
     BeginGroupBox("##selected-jitter");
-    Eyebrow("CURRENT JITTER SETTING");
+    Eyebrow("CURRENT SETTING");
     const auto& config = mode.scales[mode.Config()];
     PushLabelStrong();
     ImGui::PushTextWrapPos(0.f);
     ImGui::TextColored(mode.value ? kWarn : kOk, "%s", swapped && !mode.Config() ? "Directions swapped" : config.name);
     ImGui::PopTextWrapPos();
     PopFont();
-    if (!swapped) Hint(config.description);
-    else {
-        // Describe the final mapping directly, even for a flipped and swapped test.
+    if (swapped) {
         const auto movement = [](float gain) {
-            return std::fabs(gain) == .5f ? "half as far" : std::fabs(gain) == 2.f ? "twice as far" : "the same distance";
+            return std::fabs(gain) == .5f ? " (half)" : std::fabs(gain) == 2.f ? " (double)" : "";
         };
-        std::snprintf(line, sizeof line, "A step right is read as a step %s, %s. A step down is read as a step %s, %s.",
+        std::snprintf(line, sizeof line, "Right becomes %s%s. Down becomes %s%s.",
                       config.x < 0 ? "up" : "down", movement(config.x),
                       config.y < 0 ? "left" : "right", movement(config.y));
         Hint(line);
     }
     EndGroupBox();
     SectionTitle("Development DLL hotkeys");
-    Hint("These buttons operate NVIDIA's development DLL. Its keyboard jitter overrides are independent of the NeuralAlias diagnostic above.");
+    Hint("NVIDIA keyboard shortcuts are separate.");
     struct Key { const char* label; const char* help; int vk; const char* btn; };
     const Key keys[] = {
         {"Debug view", "CTRL+ALT+F12: cycles the development DLL's overlays (jitter, motion vectors, depth, exposure, ...).", VK_F12, "Next view"},

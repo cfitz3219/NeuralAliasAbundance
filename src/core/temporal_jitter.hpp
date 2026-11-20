@@ -11,28 +11,24 @@ struct JitterSample { double x_pixels, y_pixels; };
 // have no reported state we can reliably return to zero.
 struct JitterDiagnostic {
     struct Scale { float x, y; };
-    struct Configuration { float x, y; const char* name; const char* description; };
+    struct Configuration { float x, y; const char* name; };
     inline static constexpr Configuration scales[] = {
-        {1, 1, "Normal jitter", "DLAA gets the same tiny shift the game drew. Use this for playing."},
-        {.5f, .5f, "Half the distance", "DLAA is told the picture moved only half as far as it did."},
-        {.5f, -.5f, "Half the distance, up and down reversed", "DLAA gets half the real movement. Up counts as down and down counts as up."},
-        {-.5f, .5f, "Half the distance, left and right reversed", "DLAA gets half the real movement. Left counts as right and right counts as left."},
-        {-.5f, -.5f, "Half the distance, opposite direction", "If the picture moved up and right, DLAA is told it moved down and left, half as far."},
-        {2, 2, "Twice the distance", "DLAA is told the picture moved twice as far as it did. This can make distant edges shake."},
-        {2, -2, "Twice the distance, up and down reversed", "DLAA gets twice the real movement. Up counts as down and down counts as up."},
-        {-2, 2, "Twice the distance, left and right reversed", "DLAA gets twice the real movement. Left counts as right and right counts as left."},
-        {-2, -2, "Twice the distance, opposite direction", "If the picture moved up and right, DLAA is told it moved down and left, twice as far."},
-        {1, -1, "Reverse up and down", "DLAA reads an upward shift as downward and a downward shift as upward. Left and right stay normal."},
-        {-1, 1, "Reverse left and right", "DLAA reads a leftward shift as rightward and a rightward shift as leftward. Up and down stay normal."},
-        {-1, -1, "Reverse every direction", "DLAA gets the right distance in the opposite direction. A shift up and right becomes down and left."},
-        {.5f, 1, "Smaller sideways steps", "DLAA gets half the real left or right movement. Up and down stay normal."},
-        {1, .5f, "Smaller up and down steps", "DLAA gets half the real up or down movement. Left and right stay normal."},
-        {-.5f, 1, "Smaller sideways steps in reverse", "DLAA reads a shift to the right as a half-sized shift to the left, and vice versa. Up and down stay normal."},
-        {1, -.5f, "Smaller up and down steps in reverse", "DLAA reads a shift up as a half-sized shift down, and vice versa. Left and right stay normal."},
-        {2, 1, "Larger sideways steps", "DLAA gets twice the real left or right movement. Up and down stay normal."},
-        {1, 2, "Larger up and down steps", "DLAA gets twice the real up or down movement. Left and right stay normal."},
-        {-2, 1, "Larger sideways steps in reverse", "DLAA reads a shift to the right as a shift twice as far to the left, and vice versa. Up and down stay normal."},
-        {1, -2, "Larger up and down steps in reverse", "DLAA reads a shift up as a shift twice as far down, and vice versa. Left and right stay normal."}
+        {1, 1, "Normal jitter"},
+        {.5f, .5f, "Half both ways"},
+        {.5f, -.5f, "Half both ways. Flip up/down."},
+        {-.5f, .5f, "Half both ways. Flip left/right."},
+        {-.5f, -.5f, "Half both ways. Flip both."},
+        {2, 2, "Double both ways"},
+        {2, -2, "Double both ways. Flip up/down."},
+        {-2, 2, "Double both ways. Flip left/right."},
+        {-2, -2, "Double both ways. Flip both."},
+        {1, -1, "Flip up/down only"},
+        {-1, 1, "Flip left/right only"},
+        {-1, -1, "Flip both directions"},
+        {.5f, 1, "Half sideways only"}, {1, .5f, "Half up/down only"},
+        {-.5f, 1, "Half and flip sideways only"}, {1, -.5f, "Half and flip up/down only"},
+        {2, 1, "Double sideways only"}, {1, 2, "Double up/down only"},
+        {-2, 1, "Double and flip sideways only"}, {1, -2, "Double and flip up/down only"}
     };
     static constexpr uint32_t count = sizeof(scales) / sizeof(scales[0]);
     uint32_t value = 0; // first count = normal axes, next count = swapped
