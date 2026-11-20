@@ -100,7 +100,10 @@ struct Settings {
     // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
     std::atomic<uint32_t> j2_hud_nis{50};
     std::atomic<uint32_t> j2_jitter_r2{0}; // jitter sequence: 0 Halton 2,3 (default), 1 R2; [j2] jitter_sequence; live
-    std::atomic<uint32_t> aniso16{0}; // anisotropic filtering level on the game's surface textures: 0 off, 4, 8, 16; [j2] anisotropic; read at game start
+    // Anisotropic filtering on the game's world textures, no menu control (Cort 2026-11-20):
+    // hidden [j2] anisotropic_filter = -1 automatic (default), 0 off (the game's own), 16 forced.
+    // Re-read live when either ini changes (PollHiddenSettings). Rule: core/anisotropic_auto.hpp.
+    std::atomic<int32_t> af_mode{-1};
     // J2 texture detail in effect at full resolution, x 100: a mirror of the choice below, written at
     // game start and when the menu changes it. The old [j2] mip_bias key no longer chooses anything.
     std::atomic<int32_t> j2_mip_bias_x100{-100};
@@ -220,6 +223,12 @@ const wchar_t* UserIniPath();
 void Load();  // defaults ini, then user ini overrides when present
 // Event log: emits one "setting" event per changed persisted field since the last call.
 void WatchChanges(const char* source = nullptr);
+// Hidden [j2] anisotropic_filter from one ini: false when the key is absent.
+bool ReadAnisotropicFilter(const wchar_t* ini, int32_t* mode);
+// af_mode -> the shared AF detector (core/anisotropic_auto.hpp).
+void ApplyAnisotropicMode();
+// Re-reads hidden ini settings when an ini file changed (at most once a second); true on a change.
+bool PollHiddenSettings();
 // One line with every effective J2/DLSS value and where it came from (user / game / builtin).
 const char* EffectiveSummary();
 // Settings -> user ini (only our keys). Returns false when any write failed;

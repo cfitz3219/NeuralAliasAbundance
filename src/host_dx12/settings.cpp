@@ -1,6 +1,7 @@
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
 #include "core/jitter_domain.hpp"
+#include "core/anisotropic_auto.hpp"
 
 #include <shlobj.h>
 #include <windows.h>
@@ -140,9 +141,12 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_hud_nis.store(static_cast<uint32_t>(hud < 0 ? 0 : (hud > 100 ? 100 : hud)));
         // Legacy flow and flow_loosen keys are ignored by this build.
         {
-            const int af = static_cast<int>(GetPrivateProfileIntW(L"j2", L"anisotropic", 0, ini));
-            // 1 = the first build's on switch (16x).
-            target.aniso16.store(af == 1 || af >= 16 ? 16u : af >= 8 ? 8u : af >= 4 ? 4u : 0u);
+            // Hidden [j2] anisotropic_filter (no menu control): -1 / auto, 0 / off, 16 / force.
+            // The old menu key [j2] anisotropic is not read: a level saved by the removed control
+            // must not override automatic filtering.
+            int32_t af_setting = 0;
+            if (ReadAnisotropicFilter(ini, &af_setting)) target.af_mode.store(af_setting);
+            else if (!only_if_present) target.af_mode.store(-1);
         }
         {
             wchar_t js[16] = {};
@@ -305,6 +309,8 @@ void Load()
     g_settings.fg_profile_override.store(g_ini_defaults[0] && GetPrivateProfileIntW(L"fg", L"profile_override", 0, g_ini_defaults) == 1);
     resolve_user_ini();
     load_from(g_ini_user, true); // user choices win when present
+    ApplyAnisotropicMode();
+    PollHiddenSettings(); // records the ini times, so only a later edit counts as a change
     // Insertion mode is an explicit per-game deployment choice, never inherited
     // from another game's global menu preferences.
     g_settings.j2_inline.store(g_ini_defaults[0] && GetPrivateProfileIntW(L"j2", L"inline", 0, g_ini_defaults) != 0);
@@ -424,8 +430,8 @@ bool SaveFromWorker()
     WritePrivateProfileStringW(L"j2", L"sharpness", nullptr, ini); // the old RCAS-scale key
     swprintf_s(v, L"%u", (std::min)(g_settings.j2_hud_nis.load(), 100u));
     ok &= WritePrivateProfileStringW(L"j2", L"hud_nis", v, ini) != 0;
-    swprintf_s(v, L"%u", g_settings.aniso16.load());
-    ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", v, ini) != 0;
+    // The removed menu control's key; [j2] anisotropic_filter is hidden and never written here.
+    WritePrivateProfileStringW(L"j2", L"anisotropic", nullptr, ini);
     ok &= WritePrivateProfileStringW(L"j2", L"jitter_sequence", g_settings.j2_jitter_r2.load() ? L"r2" : L"halton", ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"draw_replay", g_settings.j2_draw_replay.load() ? L"1" : L"0", ini) != 0;
     swprintf_s(v, L"%d", g_settings.j2_camera.load());
@@ -486,6 +492,63 @@ uint32_t LastSaveResult() { return g_last_save.load(); }
 
 // Event log: every persisted setting change, with old and new value and who made it
 // (the caller's source tag; the panel, ini reload and mode commit set one).
+bool ReadAnisotropicFilter(const wchar_t* ini, int32_t* mode)
+{
+    if (!ini || !ini[0]) return false;
+    wchar_t v[32] = {};
+    GetPrivateProfileStringW(L"j2", L"anisotropic_filter", L"", v, 32, ini);
+    const wchar_t* p = v;
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (!*p) return false;
+    int32_t m = -1;
+    if (!_wcsnicmp(p, L"auto", 4)) m = -1;
+    else if (!_wcsnicmp(p, L"off", 3)) m = 0;
+    else if (!_wcsnicmp(p, L"force", 5)) m = 16;
+    else {
+        const int n = _wtoi(p);
+        m = n < 0 ? -1 : n == 0 ? 0 : 16;
+    }
+    *mode = m;
+    return true;
+}
+
+void ApplyAnisotropicMode()
+{
+    const int32_t m = g_settings.af_mode.load();
+    na::af::Global().SetMode(na::af::ModeFromSetting(m));
+}
+
+bool PollHiddenSettings()
+{
+    // Live without a menu or restart (Cort: no restarts for any setting): the hidden key is
+    // re-read when either ini file changes, checked at most once a second.
+    // Never destroyed: the discovery thread may still poll while the process exits.
+    static std::mutex& m = *new std::mutex();
+    static ULONGLONG last_check = 0;
+    static FILETIME seen[2] = {};
+    std::lock_guard<std::mutex> lk(m);
+    const ULONGLONG now = GetTickCount64();
+    if (last_check && now - last_check < 1000) return false;
+    last_check = now;
+    const wchar_t* files[2] = {g_ini_defaults, g_ini_user};
+    bool changed = false;
+    for (int i = 0; i < 2; ++i) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        FILETIME t{};
+        if (files[i][0] && GetFileAttributesExW(files[i], GetFileExInfoStandard, &a)) t = a.ftLastWriteTime;
+        if (CompareFileTime(&t, &seen[i]) != 0) { seen[i] = t; changed = true; }
+    }
+    if (!changed) return false;
+    int32_t mode = -1, from = 0;
+    if (ReadAnisotropicFilter(g_ini_defaults, &from)) mode = from;
+    if (g_ini_user[0] && ReadAnisotropicFilter(g_ini_user, &from)) mode = from;
+    const int32_t was = g_settings.af_mode.exchange(mode);
+    if (was == mode) return false;
+    na::eventlog::Emit("setting", "af_mode=%d was=%d source=ini_change", mode, was);
+    ApplyAnisotropicMode();
+    return true;
+}
+
 void WatchChanges(const char* source)
 {
     static std::mutex m;

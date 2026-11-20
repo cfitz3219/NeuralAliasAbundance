@@ -1,6 +1,7 @@
 // C8a: H1 observation producers. See producers.hpp.
 #include "core/replay_budget.hpp"
 #include "core/replay_movers.hpp"
+#include "core/anisotropic_auto.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/observe/producers.hpp"
 
@@ -1266,6 +1267,25 @@ struct SamplerRecipe final : DescriptorDetails {
     bool modern = false;
 #endif
     float native_bias = 0.0f, stored_bias = 0.0f;
+    // Anisotropic filtering of a world sampler follows the action in force at each upload too
+    // (automatic AF may decide after the game created its heap samplers): the game's own filter
+    // and anisotropy, and what the stored descriptor holds.
+    bool world = false;
+    uint32_t native_filter = 0, native_aniso = 0, stored_filter = 0, stored_aniso = 0;
+    // The game's own sampler as the AF rule sees it (addressing and LOD range are never changed).
+    na::af::Facts native_af() const
+    {
+        na::af::Facts f;
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+        if (modern) { f.address_u = uint32_t(desc2.AddressU); f.address_v = uint32_t(desc2.AddressV); f.max_lod = desc2.MaxLOD; }
+        else
+#endif
+        { f.address_u = uint32_t(desc.AddressU); f.address_v = uint32_t(desc.AddressV); f.max_lod = desc.MaxLOD; }
+        f.filter = native_filter;
+        f.max_anisotropy = native_aniso;
+        f.mip_lod_bias = native_bias;
+        return f;
+    }
 };
 
 void publish_details(DescHeap::SlotInfo& info, std::shared_ptr<const DescriptorDetails> old, const DescriptorDetails* view,
@@ -2109,7 +2129,9 @@ std::atomic<float> g_mip_bias{0.0f};
 constexpr int kMipCount = 7;
 constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.25f, 4.0f};
 static_assert(kMipCount <= 7, "Obj::Twins holds 7 levels");
-constexpr uint32_t kAfLevels[4] = {0, 4, 8, 16};
+// Anisotropic index of a variant = af::Action (core/anisotropic_auto.hpp): 0 the game's own,
+// 1 automatic (world samplers below 8x -> 16x), 2 forced 16x; 3 is unused. Levels for readouts.
+constexpr uint32_t kAfLevels[4] = {0, 16, 16, 0};
 std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels built at creation (bit i = kMipLevels[i])
 // Background warm-up (Cort 2026-11-06: "mip does nothing"; a choice not built at load took
 // 25-30 s, so a quick A/B never switched). After the chosen level is live, the worker builds the
@@ -2140,7 +2162,7 @@ std::atomic<uint64_t> g_mip_bound_pso_twin{0}, g_mip_bound_pso_game{0}, g_mip_bo
 int var_level(uint32_t v) { return static_cast<int>(v & 15u) < kMipCount ? static_cast<int>(v & 15u) : 0; }
 int var_af(uint32_t v) { return static_cast<int>(v >> 4 & 3u); }
 uint32_t var_pack(int level, int af) { return static_cast<uint32_t>(level) | static_cast<uint32_t>(af) << 4; }
-int af_index(uint32_t level) { return level >= 16 ? 3 : level >= 8 ? 2 : level ? 1 : 0; }
+int af_index(uint32_t action) { return action == na::af::kAuto16 ? 1 : action == na::af::kForce16 ? 2 : 0; }
 int nearest_mip_level(float b)
 {
     int best = 0;
@@ -2171,36 +2193,49 @@ bool sampler_wants_bias(const SD& d)
     const bool surface = aniso || (linear_min && (tiles(d.AddressU) || tiles(d.AddressV)));
     return surface && d.MaxLOD > 0.0f;
 }
+// Anisotropic filtering: one rule for DX11 and DX12, core/anisotropic_auto.hpp (Cort 2026-11-20).
+// World samplers only: not comparison / min-max, not point, mips, WRAP/MIRROR on U or V.
 template <typename SD>
-bool sampler_wants_aniso(const SD& d)
+na::af::Facts af_facts(const SD& d)
 {
-    // Addressing does not determine the texture footprint. Atlased/unique-UV
-    // materials commonly clamp; exclude data/comparison/point lookups, but do
-    // not apply mip-bias's WRAP-only material heuristic to filtering.
-    return D3D12_DECODE_FILTER_REDUCTION(d.Filter)==D3D12_FILTER_REDUCTION_TYPE_STANDARD&&d.MaxLOD>0&&
-        (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter)||D3D12_DECODE_MIN_FILTER(d.Filter)==D3D12_FILTER_TYPE_LINEAR);
+    na::af::Facts f;
+    f.filter = uint32_t(d.Filter);
+    f.address_u = uint32_t(d.AddressU);
+    f.address_v = uint32_t(d.AddressV);
+    f.max_anisotropy = d.MaxAnisotropy;
+    f.max_lod = d.MaxLOD;
+    f.mip_lod_bias = d.MipLODBias;
+    return f;
+}
+template <typename SD>
+bool sampler_wants_aniso(const SD& d) { return na::af::IsWorld(af_facts(d)); }
+// The anisotropic part of a variant (no counters): `action` (af::Action) on one sampler.
+template <typename SD>
+bool aniso_to(SD& d, uint32_t action)
+{
+    na::af::Facts f = af_facts(d);
+    if (!na::af::Apply(f, action)) return false;
+    d.Filter = D3D12_FILTER(f.filter);
+    d.MaxAnisotropy = f.max_anisotropy;
+    return true;
 }
 float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
-// Anisotropic filtering 4x/8x/16x: eligible standard linear samplers, including
-// clamp-addressed materials, are made anisotropic at that level.
-// It is applied where the game samples its textures, before DLSS, so DLSS gets the sharper
-// oblique detail. Comparison / min-max / point samplers are untouched. Unlike mip bias,
-// an isotropic screen-space footprint needs no addressing-based exclusion.
-std::atomic<uint32_t> g_aniso_level{0}; // 0 off, else 4 / 8 / 16 (menu)
+// Anisotropic filtering on world samplers (af::Apply), where the game samples its textures,
+// before DLSS, so DLSS gets the sharper oblique detail. Heap samplers get the action in force
+// when the game creates them, and again whenever the game copies them into a shader-visible
+// heap (apply_sampler_upload); static samplers through the live twins.
+std::atomic<uint32_t> g_aniso_level{0}; // af::Action for sampler descriptors created from now on
 std::atomic<uint64_t> g_aniso_samplers{0}, g_aniso_static{0}, g_aniso_already{0};
 std::atomic<uint64_t> g_sampler_calls{0}, g_sampler2_calls{0}; // the game's CreateSampler / CreateSampler2 calls
 template <typename SD>
 bool apply_aniso(SD& d)
 {
-    const uint32_t level = g_aniso_level.load(std::memory_order_relaxed);
-    if (!level || !sampler_wants_aniso(d)) return false;
-    // Never lowers the game's own: an anisotropic sampler at or above the chosen level stays.
-    if (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level) {
-        g_aniso_already.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t action = g_aniso_level.load(std::memory_order_relaxed);
+    if (action == na::af::kKeep || !sampler_wants_aniso(d)) return false;
+    if (!aniso_to(d, action)) {
+        g_aniso_already.fetch_add(1, std::memory_order_relaxed); // the game's own filtering already meets it
         return false;
     }
-    d.Filter = D3D12_FILTER_ANISOTROPIC;
-    d.MaxAnisotropy = level;
     return true;
 }
 // Cort's total-bias rule: DLAA automatically targets exactly -1, including the
@@ -2210,15 +2245,6 @@ float biased(float native, float target)
 {
     if (target == 0.0f) return native;
     return clamp_lod(target);
-}
-// The anisotropic part of a variant (no counters): as apply_aniso, at an explicit level.
-template <typename SD>
-bool aniso_to(SD& d, uint32_t level)
-{
-    if (!level || (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level)) return false;
-    d.Filter = D3D12_FILTER_ANISOTROPIC;
-    d.MaxAnisotropy = level;
-    return true;
 }
 // The game's static samplers as variant (level, af) wants them; returns how many changed.
 uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level, int af,uint32_t* aniso_changed=nullptr)
@@ -2230,7 +2256,7 @@ uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level,
         bool c = false;
         const float nb = bias?biased(x.MipLODBias, kMipLevels[level]):x.MipLODBias;
         if (nb != x.MipLODBias) { x.MipLODBias = nb; c = true; }
-        if (aniso&&aniso_to(x, kAfLevels[af])) { c = true;if(aniso_changed)++*aniso_changed; }
+        if (aniso&&aniso_to(x, uint32_t(af))) { c = true;if(aniso_changed)++*aniso_changed; }
         if (c) ++changed;
     }
     return changed;
@@ -2293,7 +2319,7 @@ bool shader_visible_sampler(D3D12_CPU_DESCRIPTOR_HANDLE handle)
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     if (!t_host_work) g_sampler_calls.fetch_add(1, std::memory_order_relaxed);
-    if (d && !t_host_work) note_sampler_desc(0, *d);
+    if (d && !t_host_work) { note_sampler_desc(0, *d); na::af::Global().Observe(af_facts(*d)); }
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
     const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
@@ -2315,6 +2341,9 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
         recipe.desc = m;
         recipe.native_bias = d->MipLODBias;
         recipe.stored_bias = m.MipLODBias;
+        recipe.world = aniso_surface;
+        recipe.native_filter = uint32_t(d->Filter); recipe.native_aniso = d->MaxAnisotropy;
+        recipe.stored_filter = uint32_t(m.Filter); recipe.stored_aniso = m.MaxAnisotropy;
         if (shader_visible_sampler(h)) visible_sampler_bias(recipe.stored_bias);
     }
     note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, retain ? &recipe : nullptr);
@@ -2327,7 +2356,7 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
 void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER_DESC2* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     if (!t_host_work) g_sampler2_calls.fetch_add(1, std::memory_order_relaxed);
-    if (d && !t_host_work) note_sampler_desc(1, *d);
+    if (d && !t_host_work) { note_sampler_desc(1, *d); na::af::Global().Observe(af_facts(*d)); }
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
     const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
@@ -2350,6 +2379,9 @@ void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER
         recipe.modern = true;
         recipe.native_bias = d->MipLODBias;
         recipe.stored_bias = m.MipLODBias;
+        recipe.world = aniso_surface;
+        recipe.native_filter = uint32_t(d->Filter); recipe.native_aniso = d->MaxAnisotropy;
+        recipe.stored_filter = uint32_t(m.Filter); recipe.stored_aniso = m.MaxAnisotropy;
         if (shader_visible_sampler(h)) visible_sampler_bias(recipe.stored_bias);
     }
     note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, retain ? &recipe : nullptr);
@@ -2363,6 +2395,7 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
 {
     if (!n || t_host_work || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
     const float target = g_mip_bias.load(std::memory_order_relaxed);
+    const uint32_t af_action = g_aniso_level.load(std::memory_order_relaxed);
 #if defined(__ID3D12Device11_INTERFACE_DEFINED__)
     Microsoft::WRL::ComPtr<ID3D12Device11> device11;
 #endif
@@ -2390,7 +2423,13 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
             const auto& recipe = recipes[i];
             if (!recipe) continue;
             float total = biased(recipe->native_bias, target);
-            if (total != recipe->stored_bias) {
+            uint32_t filter = recipe->stored_filter, aniso = recipe->stored_aniso;
+            if (recipe->world) {
+                na::af::Facts f = recipe->native_af();
+                na::af::Apply(f, af_action);
+                filter = f.filter; aniso = f.max_anisotropy;
+            }
+            if (total != recipe->stored_bias || filter != recipe->stored_filter || aniso != recipe->stored_aniso) {
                 const D3D12_CPU_DESCRIPTOR_HANDLE handle{static_cast<SIZE_T>(dst + uint64_t(copied + i) * inc)};
 #if defined(__ID3D12Device11_INTERFACE_DEFINED__)
                 if (recipe->modern) {
@@ -2398,6 +2437,8 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
                     if (device11) {
                         auto desc = recipe->desc2;
                         desc.MipLODBias = total;
+                        desc.Filter = D3D12_FILTER(filter);
+                        desc.MaxAnisotropy = aniso;
                         o_CreateSampler2(device11.Get(), &desc, handle);
                     } else total = recipe->stored_bias;
                 } else
@@ -2405,6 +2446,8 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
                 {
                     auto desc = recipe->desc;
                     desc.MipLODBias = total;
+                    desc.Filter = D3D12_FILTER(filter);
+                    desc.MaxAnisotropy = aniso;
                     o_CreateSampler(dev, &desc, handle);
                 }
             }
@@ -3237,7 +3280,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             decodable = true;
             const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
             const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
-            for (UINT i = 0; i < ns; ++i) note_sampler_desc(2, src[i]);
+            for (UINT i = 0; i < ns; ++i) { note_sampler_desc(2, src[i]); na::af::Global().Observe(af_facts(src[i])); }
             for (UINT i = 0; i < ns; ++i) if (sampler_wants_aniso(src[i])) {
                 has_surface=true;note_native(src[i].MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(src[i].Filter)?src[i].MaxAnisotropy:0,sampler_wants_bias(src[i]));
             }
@@ -3250,7 +3293,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
                     if(!bias&&!aniso)continue;
                     const float nb = bias?biased(x.MipLODBias, kMipLevels[var_level(want)]):x.MipLODBias;
                     if (nb != x.MipLODBias) { x.MipLODBias = nb; ++biased_n; }
-                    if (aniso&&aniso_to(x, kAfLevels[var_af(want)])) ++aniso_n;
+                    if (aniso&&aniso_to(x, uint32_t(var_af(want)))) ++aniso_n;
                 }
                 if (biased_n || aniso_n) {
                     D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
@@ -9020,31 +9063,71 @@ void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
         *static_samplers = g_biased_static.load(std::memory_order_relaxed) +
                            (var_level(live) ? g_var_static_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
 }
-void SetSamplerAnisotropy(uint32_t level)
+void SetSamplerAfAction(uint32_t action)
 {
-    const int af = af_index(level);
+    const int af = af_index(action);
     {
         static na::eventlog::Edge e;
         int64_t was = 0;
         if (e.Changed(af, &was))
-            na::eventlog::Emit("af", "requested level=%u asked=%u was_index=%lld", kAfLevels[af], level, (long long)was);
+            na::eventlog::Emit("af", "requested action=%s was_index=%lld", na::af::ActionName(uint32_t(af)), (long long)was);
     }
-    g_aniso_level.store(kAfLevels[af], std::memory_order_relaxed); // sampler descriptors created from now on
+    g_aniso_level.store(uint32_t(af), std::memory_order_relaxed); // sampler descriptors created from now on
     request_variant([af](uint32_t w) { return var_pack(var_level(w), af); });
 }
-void SetSamplerAnisotropyPrebuild(uint32_t level)
+void SetSamplerAfActionPrebuild(uint32_t action)
 {
-    g_pre_af.store(af_index(level), std::memory_order_relaxed);
+    g_pre_af.store(af_index(action), std::memory_order_relaxed);
     // Descriptor-heap samplers are created once, at load, long before the saved settings are
-    // activated: give them the saved level from the start (as the static twins get it), or
-    // a game whose materials use heap samplers never gets the filtering at all.
-    g_aniso_level.store(kAfLevels[af_index(level)], std::memory_order_relaxed);
+    // activated: give them the action from the start (as the static twins get it), or a game
+    // whose materials use heap samplers never gets the filtering at all.
+    g_aniso_level.store(uint32_t(af_index(action)), std::memory_order_relaxed);
 }
+void SetSamplerAnisotropy(uint32_t level) { SetSamplerAfAction(level ? na::af::kForce16 : na::af::kKeep); }
+void SetSamplerAnisotropyPrebuild(uint32_t level) { SetSamplerAfActionPrebuild(level ? na::af::kForce16 : na::af::kKeep); }
+namespace {
+// 0 = not following (explicit calls only), 1 = load: creation follows the detector, 2 = live.
+std::atomic<int> g_af_follow{0};
+void af_detector_changed(uint32_t action)
+{
+    const int stage = g_af_follow.load(std::memory_order_acquire);
+    if (stage >= 1) SetSamplerAfActionPrebuild(action);
+    if (stage >= 2) SetSamplerAfAction(action);
+}
+void af_detector_report(const char* line) { na::eventlog::Emit("af", "%s", line); }
+} // namespace
+void SetSamplerAfFollow(int stage)
+{
+    auto& detector = na::af::Global();
+    static std::once_flag connected;
+    std::call_once(connected, [&detector] {
+        detector.SetOnChange(&af_detector_changed);
+        detector.SetOnReport(&af_detector_report);
+        // A decision made before this point (samplers created at load) still reaches the log.
+        if (detector.ReportCount()) {
+            char line[700];
+            detector.LastReport(line, sizeof line);
+            na::eventlog::Emit("af", "%s (made before activation)", line);
+        }
+    });
+    stage = stage < 0 ? 0 : (stage > 2 ? 2 : stage);
+    g_af_follow.store(stage, std::memory_order_release);
+    // Re-read after applying: a decision made on another thread meanwhile must not be overwritten.
+    for (uint32_t applied = ~0u;;) {
+        const uint32_t action = stage ? detector.Current() : uint32_t(na::af::kKeep);
+        if (action == applied) break;
+        if (stage == 1) SetSamplerAfActionPrebuild(action);
+        else SetSamplerAfAction(action); // 0: the game's own (safe start); 2: live
+        applied = action;
+    }
+}
+uint32_t SamplerAfActionWanted() { return uint32_t(var_af(g_var_want.load(std::memory_order_relaxed))); }
 AnisoStats GetAnisoStats()
 {
     AnisoStats a;
     const uint32_t live = g_var_live.load(std::memory_order_relaxed);
-    a.level = g_mip_live_enabled.load(std::memory_order_relaxed) ? kAfLevels[var_af(live)] : g_aniso_level.load(std::memory_order_relaxed);
+    a.level = g_mip_live_enabled.load(std::memory_order_relaxed) ? kAfLevels[var_af(live)] : na::af::ActionLevel(g_aniso_level.load(std::memory_order_relaxed));
+    a.action = g_mip_live_enabled.load(std::memory_order_relaxed) ? uint32_t(var_af(live)) : g_aniso_level.load(std::memory_order_relaxed);
     a.samplers = g_aniso_samplers.load(std::memory_order_relaxed);
     a.static_samplers = g_aniso_static.load(std::memory_order_relaxed) +
                         (var_af(live) ? g_var_aniso_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);

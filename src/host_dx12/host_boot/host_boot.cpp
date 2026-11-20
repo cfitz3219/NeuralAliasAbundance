@@ -196,7 +196,9 @@ DWORD WINAPI InitThread(LPVOID)
                 for (int m = 1; m < n; ++m) wanted[m] = na::j2::SmallMipBias(user, static_cast<float>(na::scale::FractionForMode(m)));
             }
             na::observe::SetSamplerMipLevelsWanted(wanted, n);
-            na::observe::SetSamplerAnisotropyPrebuild(st.aniso16.load());
+            // Anisotropic filtering is automatic (core/anisotropic_auto.hpp): twins built at
+            // creation and new heap samplers follow the shared detector from the first sampler.
+            na::observe::SetSamplerAfFollow(1);
         }
     }
 
