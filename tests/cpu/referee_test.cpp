@@ -886,6 +886,11 @@ int main()
         }
         check(recognized && recognized_at == ParityRoleSwap::needed - 1 && swap.Phase() > 0,
               "parity flicker opposite to the DLAA input is recognized after six agreeing pairs");
+        for (unsigned i = 0; i < ParityRoleSwap::needed; ++i) {
+            const uint64_t first = 115410 + i;
+            swap.Observe(first, first + 1, {.30f, .15f, .40f});
+        }
+        check(!swap.Recognized(), "contradictory evidence expires a previously recognized signature");
         ParityRoleSwap same_way;
         bool wrongly = false;
         for (unsigned i = 0; i < 10; ++i) {

@@ -891,7 +891,8 @@ int DepthReadFixture(Game& g, bool debug_layer)
 
 int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[maybe_unused]] bool rotating_lights = false,
                        [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false,
-                       [[maybe_unused]] bool reuse_depth = false, [[maybe_unused]] bool disagreeing_scene = false)
+                       [[maybe_unused]] bool reuse_depth = false, [[maybe_unused]] bool disagreeing_scene = false,
+                       [[maybe_unused]] bool parity_roles = false)
 {
     struct Surface {
         ComPtr<ID3D11Texture2D> picture;
@@ -1028,6 +1029,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                         sample.screen_structure, sample.quiet_regions);
         return true;
     };
+    na::native11::SetParitySignal(&na::referee::gpu::ParityRoleSwapSeen);
     if (!na::native11::Install(game.device.Get(), consume, &evaluator, compare_routes,
             composition_fault || disagreeing_scene ? recovery_evidence : compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
 #else
@@ -1095,8 +1097,8 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             const auto start = evaluator.writes;
             evaluator.received = nullptr;
             evaluator.proof = 0;
-            // Include consecutive frames with the same owner: parity cannot solve this route.
-            const bool swap_roles = !pinned && (i % 7 == 2 || i % 7 == 4 || i % 7 == 5);
+            // Only the parity fixture swaps roles on every frame.
+            const bool swap_roles = !pinned && (parity_roles ? i % 2 != 0 : (i % 7 == 2 || i % 7 == 4 || i % 7 == 5));
             auto* early_rt = swap_roles ? peer.rtv.Get() : game.color_rtv.Get();
             auto* late_rt = swap_roles ? game.color_rtv.Get() : peer.rtv.Get();
             auto* early = swap_roles ? peer.srv.Get() : game.color_srv.Get();
@@ -1257,11 +1259,20 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
         if (compare_routes) {
             na::settings::Get().referee_every_ms.store(100);
             const auto menu_draws = na::overlay::GetStats().frames_rendered;
-            const auto until = GetTickCount64() + 18000;
+            auto until = GetTickCount64() + 18000;
+            bool kept_by_roles = false;
             int i = 0;
             while (GetTickCount64() < until) {
                 if (reuse_depth) na::overlay::SetOpen((i / 8) % 2 == 0);
                 if (!record(i++, true, nullptr)) return 1;
+                if (parity_roles && !kept_by_roles) {
+                    for (const auto& line : na::eventlog::Drain()) {
+                        if (line.find("referee_roles") == std::string::npos || line.find(" kept=1") == std::string::npos) continue;
+                        std::printf("%s\n", line.c_str());
+                        kept_by_roles = true;
+                        until = GetTickCount64() + na::referee::RouteTrial::maximum_ms + 1000;
+                    }
+                }
                 Sleep(7);
             }
             if (reuse_depth) {
@@ -1286,6 +1297,9 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                 na::native11::Uninstall();
                 return g_failed ? 1 : 0;
             }
+            if (parity_roles)
+                expect(kept_by_roles && stats.parity_recognitions > 0,
+                       "measured parity flicker keeps the proved readers past the former timeout");
             expect(fixed.correct == 28 && fixed.proven == 28 && fixed.displayed_readers == 28,
                    "the actual provider keeps the improved screen-proved route");
             expect(fixed.changed > 100 && fixed.reached * 100 >= fixed.changed * 98 && new_delta < old_delta * .25,
@@ -1295,6 +1309,10 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
             std::printf("known reflection footprint: before=%.4f after=%.4f\n", flash_before, flash_after);
             expect(flash_before > 10 && flash_after <= flash_before * .10,
                    "the automatic replacement cuts displayed variation by at least ninety percent where the light flashes");
+            if (parity_roles) {
+                na::native11::Uninstall();
+                return g_failed ? 1 : 0;
+            }
             auto& sharpness = na::settings::Get().j2_sharpness;
             const auto previous_sharpness = sharpness.load();
             sharpness.store(previous_sharpness ? 0 : 1);
@@ -1678,7 +1696,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool trial_reused_depth = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-reused-depth") == 0;
     const bool reuse_depth = trial_reused_depth || disagreeing_scene || (argc > 1 && std::strcmp(argv[1], "--lit-role-reused-depth") == 0);
     const bool composition_fault = argc > 1 && std::strcmp(argv[1], "--composition-recovery") == 0;
-    const bool compare_routes = composition_fault || trial_reused_depth || disagreeing_scene ||
+    const bool parity_roles = argc > 1 && std::strcmp(argv[1], "--lit-role-parity") == 0;
+    const bool compare_routes = composition_fault || trial_reused_depth || disagreeing_scene || parity_roles ||
         (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
@@ -1772,7 +1791,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (adaptive || rotating_lights) {
         na::j2::SetJitter(true);
         const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes,
-                                               composition_fault, reuse_depth, disagreeing_scene);
+                                               composition_fault, reuse_depth, disagreeing_scene, parity_roles);
         DeleteFileW(ini.c_str());
         std::fflush(stdout);
         ExitProcess(result);

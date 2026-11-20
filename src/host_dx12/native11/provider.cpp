@@ -330,10 +330,10 @@ ScreenCheck g_screen;
 LitScene g_lit;
 referee::PlacementTrial g_placement{uint64_t{1} << 57};
 referee::StageRecovery g_recovery;
-bool ParitySeen()
+bool ParitySeen(const void* swapchain, uint64_t depth)
 {
     const auto seen = g_parity_signal.load(std::memory_order_relaxed);
-    return seen && seen();
+    return seen && seen(swapchain, depth);
 }
 referee::PlacementTrial::Scope LightingScope()
 {
@@ -3091,7 +3091,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             [&](const referee::TrialSample& seen, bool, bool) {
                 return seen.context.placement.path == referee::shadow::Path::Native11 &&
                     seen.context.depth == scope.depth;
-            }, sample, ParitySeen());
+            }, sample, scope && ParitySeen(swap, scope.depth));
         const auto& trial = g_placement.Comparison();
         if (before != trial.Current())
             na::eventlog::Emit("native11_route_trial",

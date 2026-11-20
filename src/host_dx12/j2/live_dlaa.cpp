@@ -8920,7 +8920,7 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
                             return (lighting && seen.alternate == referee::shadow::Placement{Path::Inline, lighting}) ||
                                 (!verified_native_reader() && seen.alternate.path == Path::Between);
                         return true;
-                    }, sample, referee::gpu::ParityRoleSwapSeen());
+                    }, sample, lighting && referee::gpu::ParityRoleSwapSeen(source, depth));
                 if (previous_phase != referee::RouteTrial::Phase::Baseline &&
                     placement.Comparison().Current() == referee::RouteTrial::Phase::Baseline)
                     g.placement_lighting = lighting;

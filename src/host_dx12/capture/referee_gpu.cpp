@@ -83,6 +83,7 @@ struct State {
     std::atomic<bool> pending_receipt{false};
     FlickerTransition previous_transition;
     ParityRoleSwap parity; // VARIANT: referee/parity-role-swap
+    uint64_t parity_at = 0;
     shadow::Context trace_context;
     const void* trace_source = nullptr;
     uint64_t trace_ordinal = 0;
@@ -551,7 +552,7 @@ void collect_sample()
         }
         if (g.trace_pair && (!g.padded_layouts || layout) && g.main_epoch == g.epoch && g.preview_exact)
             ++g.stats.trace_pairs;
-        if (enabled() && g.preview_exact && g.main_epoch == g.epoch && transition.stage != FlickerStage::Unknown) {
+        if (enabled() && g.preview_exact && !g.invalidated && g.main_epoch == g.epoch && transition.stage != FlickerStage::Unknown) {
             if (g.trace_source == g.swapchain && g.trace_context.SameTemporalSequence(g.captured_context) &&
                 g.main_ordinal > g.trace_ordinal && g.main_ordinal - g.trace_ordinal <= 240 &&
                 Reverses(g.previous_transition, transition)) {
@@ -565,13 +566,19 @@ void collect_sample()
                     (unsigned long long)g.captured_context.color, (unsigned long long)g.captured_context.depth,
                     (unsigned long long)g.captured_context.native_screen_proof, (unsigned long long)g.captured_context.generation);
             }
-            if (g.trace_source != g.swapchain) {
+            const auto now = GetTickCount64();
+            if (g.trace_source != g.swapchain || !g.trace_context.SameScene(g.captured_context) ||
+                g.trace_context.generation != g.captured_context.generation ||
+                !(g.trace_context.placement == g.captured_context.placement) ||
+                g.trace_context.trial_configuration != g.captured_context.trial_configuration ||
+                g.main_ordinal <= g.trace_ordinal || g.main_ordinal - g.trace_ordinal > 240) {
                 g.parity.Reset();
+                g.parity_at = 0;
                 g_parity_seen.store(false, std::memory_order_relaxed);
             }
+            const auto matched = g.parity.Matched();
             if (g.parity.Observe(g.pre_ordinal, g.main_ordinal, transition.stops)) {
                 ++g.stats.parity_recognitions;
-                g_parity_seen.store(true, std::memory_order_relaxed);
                 na::eventlog::Emit("referee_parity_swap", "frames=%llu,%llu region=%u,%u change_stops=%.3f/%.3f/%.3f "
                     "matched=%llu brighter=%s color=%llu generation=%llu why=\"the screen flips brightness with frame parity, "
                     "opposite to the DLAA input: the scene targets exchange roles every frame, follow the role\"",
@@ -581,11 +588,13 @@ void collect_sample()
                     (unsigned long long)g.parity.Matched(), g.parity.Phase() > 0 ? "odd" : "even",
                     (unsigned long long)g.captured_context.color, (unsigned long long)g.captured_context.generation);
             }
+            if (g.parity.Matched() != matched) g.parity_at = now;
             g.stats.parity_matched = g.parity.Matched();
             g.trace_source = g.swapchain;
             g.trace_context = g.captured_context;
             g.previous_transition = transition;
             g.trace_ordinal = g.main_ordinal;
+            g_parity_seen.store(g.parity.Recognized(), std::memory_order_relaxed);
         }
         if (enabled() && g.preview_exact && !g.invalidated && g.main_epoch == g.epoch && regions.Mixed()) {
             const auto now = GetTickCount64();
@@ -942,6 +951,9 @@ void reset_evidence_locked()
     g.visual.clear();
     g.visual_rollback.store(false, std::memory_order_relaxed);
     g.trace_source = nullptr;
+    g.parity.Reset();
+    g.parity_at = 0;
+    g_parity_seen.store(false, std::memory_order_relaxed);
     g.geometry = {};
 }
 
@@ -1278,7 +1290,12 @@ void InvalidatePresentation(const void* swapchain)
     for (auto& p : g.pending_presents) if (p.swapchain == swapchain) p = {};
     g.pending_receipt.store(std::any_of(g.pending_presents.begin(), g.pending_presents.end(),
         [](const Presentation& p) { return p.swapchain != nullptr; }), std::memory_order_release);
-    if (g.trace_source == swapchain) g.trace_source = nullptr;
+    if (g.trace_source == swapchain) {
+        g.trace_source = nullptr;
+        g.parity.Reset();
+        g.parity_at = 0;
+        g_parity_seen.store(false, std::memory_order_relaxed);
+    }
     g.visual.erase(std::remove_if(g.visual.begin(), g.visual.end(),
         [swapchain](const VisualEvidence& v) { return v.chain == swapchain; }), g.visual.end());
     update_visual_pending();
@@ -1303,7 +1320,13 @@ void InvalidatePresentation(const void* swapchain)
     }
 }
 
-bool ParityRoleSwapSeen() { return g_parity_seen.load(std::memory_order_relaxed); }
+bool ParityRoleSwapSeen(const void* swapchain, uint64_t depth)
+{
+    if (!swapchain || !depth || !g_parity_seen.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.trace_source == swapchain && g.trace_context.depth == depth &&
+        g.parity.Recognized() && GetTickCount64() - g.parity_at <= 20000;
+}
 Stats GetStats()
 {
     std::lock_guard<std::mutex> lock(g.m);
