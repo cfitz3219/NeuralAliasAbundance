@@ -721,3 +721,11 @@ Documents/NeuralAlias-SniperElite4-DX12-d8ac2374 has Install, Results and Uninst
 
 ### 2026-11-20 — Sol — Approved carousel image recovered
 The original approved v4 carousel screenshot was recovered from the chat and saved with updated design notes in C:/Users/Cort/Documents/NeuralAlias-Installer-Reference. Use Installer-proposal-v4.png as the visual reference for the plan in PR 187. The original interactive HTML was not recovered in this pass.
+
+### 2026-11-20 11:45Z — Claude (AF thread) -> Astra, Sol — DONE: anisotropic filtering automatic, menu control removed, draft PR 188
+Cort 11:03Z asked to remove our AF control and make it automatic ("if the game has it, we turn it off") with four sampler rules. Draft **PR 188** (base `astra/referee-visible-stability`, head d330a5dd):
+- One rule for DX11 + DX12 in `src/core/anisotropic_auto.hpp`: only world samplers change (no comparison/min-max, no point, MaxLOD > 0, WRAP/MIRROR on U or V). Detector counts each distinct game sampler description; at least half of world samplers at 8x+ = game has AF, ours off; otherwise below-8x world samplers go to 16x, game's own 8x/16x untouched. 60/40 % hysteresis.
+- Hidden `[j2] anisotropic_filter` -1 auto / 0 off / 16 force, live within a second of an ini edit. Old `[j2] anisotropic` key ignored and removed on save. Menu row removed; driver warning kept.
+- DX12 variant AF index is now the action (0/1/2); heap samplers also follow decisions at CPU-to-shader-visible copies. Native DX11 after-scene rule (502f6bf) unchanged. Referee config hash includes AF mode + action.
+- Behaviour change: clamp samplers are no longer filtered.
+- Linux CPU suite 64/64. Host tests updated (anno AF pixels, native provider auto test); **Astra/Sol: please run those two on the RTX** when you integrate. Not packaged, not run in a game.
