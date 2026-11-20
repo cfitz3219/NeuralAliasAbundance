@@ -78,3 +78,7 @@ Retain Cort's visual concept. The following are reuse candidates, not approved d
 No decision has been made about checkbox defaults, carousel wraparound at the first/last game, exact artwork dimensions, animation timing, or whether to use Rust/egui. The precise evidence used to determine feature compatibility also remains an implementation decision. These are not reasons to expand this design into another rendering project.
 
 No code, mockup, installer, or game change is part of this documentation task.
+
+## Build readiness (added 2026-11-20)
+
+At Cort's request the build-ready plan now sits beside this design in [INSTALLER-BUILD-PLAN.md](INSTALLER-BUILD-PLAN.md): what to build it with, how the carousel is kept smooth, what the program knows about each game, how it uses the existing install scripts, and the build order with a definition of done per stage. It adds to this design and changes none of it. Still plan only; implementation waits for Cort's go.
