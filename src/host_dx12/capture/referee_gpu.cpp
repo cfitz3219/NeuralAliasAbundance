@@ -158,8 +158,16 @@ ULONGLONG every_ms()
     const uint32_t v = na::settings::Get().referee_every_ms.load(std::memory_order_relaxed);
     return v < 100 ? 100 : v;
 }
+// VARIANT: referee/parity-role-swap -- the published signal lives exactly as
+// long as the scene evidence it was recognized on.
+void clear_parity_locked()
+{
+    g.parity.Reset();
+    g_parity_seen.store(false, std::memory_order_relaxed);
+}
 void stop(const char* why)
 {
+    clear_parity_locked();
     set_phase(Phase::Stopped);
     g.stats.stopped = true;
     g.stats.running = false;
@@ -565,10 +573,10 @@ void collect_sample()
                     (unsigned long long)g.captured_context.color, (unsigned long long)g.captured_context.depth,
                     (unsigned long long)g.captured_context.native_screen_proof, (unsigned long long)g.captured_context.generation);
             }
-            if (g.trace_source != g.swapchain) {
-                g.parity.Reset();
-                g_parity_seen.store(false, std::memory_order_relaxed);
-            }
+            // The signature belongs to one presentation. A scene cut or history
+            // reset clears it in reset_evidence_locked(); the rotating targets
+            // need not share one temporal context, so that is not compared here.
+            if (g.trace_source != g.swapchain) clear_parity_locked();
             if (g.parity.Observe(g.pre_ordinal, g.main_ordinal, transition.stops)) {
                 ++g.stats.parity_recognitions;
                 g_parity_seen.store(true, std::memory_order_relaxed);
@@ -935,6 +943,7 @@ void watchdog()
 
 void reset_evidence_locked()
 {
+    clear_parity_locked(); // the signature is scene evidence too
     ++g.epoch;
     g.tile_source = nullptr;
     g.recent.Clear();
@@ -1278,7 +1287,10 @@ void InvalidatePresentation(const void* swapchain)
     for (auto& p : g.pending_presents) if (p.swapchain == swapchain) p = {};
     g.pending_receipt.store(std::any_of(g.pending_presents.begin(), g.pending_presents.end(),
         [](const Presentation& p) { return p.swapchain != nullptr; }), std::memory_order_release);
-    if (g.trace_source == swapchain) g.trace_source = nullptr;
+    if (g.trace_source == swapchain) {
+        g.trace_source = nullptr;
+        clear_parity_locked(); // recognized on that presentation; it no longer vouches for anything
+    }
     g.visual.erase(std::remove_if(g.visual.begin(), g.visual.end(),
         [swapchain](const VisualEvidence& v) { return v.chain == swapchain; }), g.visual.end());
     update_visual_pending();
@@ -1303,7 +1315,7 @@ void InvalidatePresentation(const void* swapchain)
     }
 }
 
-bool ParityRoleSwapSeen() { return g_parity_seen.load(std::memory_order_relaxed); }
+bool ParityRoleSwapSeen() { return enabled() && g_parity_seen.load(std::memory_order_relaxed); }
 Stats GetStats()
 {
     std::lock_guard<std::mutex> lock(g.m);
