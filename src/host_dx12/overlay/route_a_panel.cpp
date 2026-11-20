@@ -1274,65 +1274,15 @@ void DrawLiveDlaaEnhancements()
         if (!native && !ml.enabled) StatusLine(2, "Live texture adjustments are disabled for this session.");
     }
     {
-        // Anisotropic filtering on the game's surface textures (before DLSS, where the game
-        // samples them). Live, through the same twins as Texture detail (no restarts).
-        static const char* kAniso[] = {"Off (game's own)", "4x", "8x", "16x"};
-        static const uint32_t kAnisoLevel[] = {0, 4, 8, 16};
-        na::settings::Settings& ss = na::settings::Get();
-        const uint32_t cur = ss.aniso16.load();
-        int idx = 0;
-        for (int i = 0; i < 4; ++i) if (kAnisoLevel[i] == cur) idx = i;
-        BeginRow("Anisotropic filtering", "Raises eligible linear texture filtering to 4x, 8x or 16x, improving detail at steep angles before DLSS, including textures that use clamp addressing. Off restores the game's own filtering, which may already be 16x. Point, comparison and min/max samplers keep their filtering. A new level prepares in the background; the status below shows which level is active. Remembered for this game.", S(220));
-        // A profile read is diagnostic evidence, not a GPU sampling result.
-        // In particular a cached startup value must not disable the live
-        // selector after the profile changes or a read becomes unavailable.
+        // Anisotropic filtering has no control (Cort 2026-11-20): it is automatic for DX11 and
+        // DX12 (core/anisotropic_auto.hpp), hidden [j2] anisotropic_filter, decisions in the log.
+        // Only a driver override that forces filtering over every game is worth a line here.
         const auto drv = na::fg::preset::GetAnisoOverride();
-        ImGui::SetNextItemWidth(S(220));
-        ImGui::BeginDisabled(drv.ForcedNow());
-        if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
-            ss.aniso16.store(kAnisoLevel[idx]);
-            na::observe::SetSamplerAnisotropy(kAnisoLevel[idx]);
-            na::settings::Save();
-        }
-        ImGui::EndDisabled();
-        EndRow();
-        const auto warn = [](const char* text) {
-            ImGui::PushTextWrapPos(0.f);
-            StatusLine(2, text);
-            ImGui::PopTextWrapPos();
-        };
         if (drv.ForcedNow()) {
-            warn("Set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls");
-        } else if(drv.ForcedThisRun())
-            Hint("The current driver profile leaves filtering to the application. If its old override is still active, it clears on the next game launch.");
-        else if (!drv.available)
-            Hint("If this choice makes no difference, set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls.");
-        const auto as = na::observe::GetAnisoStats();
-        char tb[240];
-        const auto ml2 = na::observe::GetMipLiveStats();
-        if (native) {
-            const auto applied = na::native11::GetSamplerStats();
-            std::snprintf(tb, sizeof tb, "Native material filtering last bound: %ux. Changed bindings: %llu; variant errors: %llu.",
-                          applied.af, static_cast<unsigned long long>(applied.swapped),
-                          static_cast<unsigned long long>(applied.variant_failures));
-        } else if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
-            std::snprintf(tb, sizeof tb, "Preparing %ux in the background (%llu of %llu objects); the current filtering stays until it is complete.", ml2.want_aniso,
-                          static_cast<unsigned long long>(ml2.prepare_done), static_cast<unsigned long long>(ml2.prepare_total));
-        else if (as.level)
-            std::snprintf(tb, sizeof tb, "Application samplers: %ux. Built %llu static sampler overrides; raised %llu sampler descriptors.", as.level,
-                          static_cast<unsigned long long>(as.static_samplers), static_cast<unsigned long long>(as.samplers));
-        else
-            std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
-        StatusLine(0, tb);
-        if (!native && as.level) {
-            // Draw-time proof: how often the game's draws really went to the GPU with our
-            // changed pipelines, against with its own (which never carry the change).
-            std::snprintf(tb, sizeof tb, "Changed pipeline bindings recorded: %llu; original pipeline bindings: %llu.",
-                          static_cast<unsigned long long>(ml2.bound_pso_twin), static_cast<unsigned long long>(ml2.bound_pso_game));
-            Hint(tb);
+            ImGui::PushTextWrapPos(0.f);
+            StatusLine(2, "Set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls");
+            ImGui::PopTextWrapPos();
         }
-        if(as.native_surface&&as.native_16==as.native_surface)
-            Hint("The game already requested 16x for all observed surface samplers.");
     }
     {
         // Jitter sequence (Cort 2026-11-05): where inside each pixel DLAA/DLSS samples, frame

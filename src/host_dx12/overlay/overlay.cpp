@@ -81,6 +81,7 @@
 #include "host_dx12/nr/queue_trace.hpp"
 #include <ctime>
 #include "host_dx12/settings.hpp"
+#include "core/anisotropic_auto.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
@@ -883,6 +884,7 @@ void flush_events()
 }
 void write_status_line()
 {
+    na::settings::PollHiddenSettings(); // hidden ini keys stay live (at most one check a second)
     if (!g_status_log[0]) return;
     ULONGLONG now = GetTickCount64();
     flush_events(); // timed transitions, written as soon as the discovery thread runs
@@ -1153,11 +1155,15 @@ void write_status_line()
                 (unsigned long long)vps.draws, (unsigned long long)vps.sets, (unsigned long long)vps.restores, (unsigned long long)vps.unknown);
             if (vn > 0) WriteFile(f, vl, DWORD((std::min)(vn, int(sizeof vl - 1))), &written, nullptr);
         }
-        { // anisotropic filtering ([j2] anisotropic): level = in use; static = changed in the twins in use
+        { // anisotropic filtering (automatic, hidden [j2] anisotropic_filter): level/action = in use;
+          // static = changed in the twins in use; af_auto = what the detector saw and decided, and why
             const auto as = na::observe::GetAnisoStats();
-            char al[260];
-            const int an = snprintf(al, sizeof al, "anisotropic level=%u setting=%u samplers=%llu static=%llu already=%llu native_surface=%llu native_16=%llu create_sampler=%llu create_sampler2=%llu\r\n",
-                as.level, na::settings::Get().aniso16.load(), (unsigned long long)as.samplers,
+            char al[520];
+            const auto det = na::af::Global().Get();
+            int an = na::af::Detector::Format(det, al, sizeof al - 2);
+            if (an > 0 && an < int(sizeof al - 2)) { al[an++] = '\r'; al[an++] = '\n'; WriteFile(f, al, DWORD(an), &written, nullptr); }
+            an = snprintf(al, sizeof al, "anisotropic level=%u action=%s setting=%d samplers=%llu static=%llu already=%llu native_surface=%llu native_16=%llu create_sampler=%llu create_sampler2=%llu\r\n",
+                as.level, na::af::ActionName(as.action), na::settings::Get().af_mode.load(), (unsigned long long)as.samplers,
                   (unsigned long long)as.static_samplers, (unsigned long long)as.already,
                   (unsigned long long)as.native_surface,(unsigned long long)as.native_16,
                   (unsigned long long)as.sampler_calls,(unsigned long long)as.sampler2_calls);

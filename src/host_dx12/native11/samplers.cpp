@@ -103,6 +103,9 @@ HRESULT STDMETHODCALLTYPE CreateSamplerState_d(ID3D11Device* dev, const D3D11_SA
             if (e->wants_af) g_elig_af.fetch_add(1, std::memory_order_relaxed);
             slot = std::move(e);
         }
+        l.unlock();
+        // Automatic AF: the game's own description, before any variant of ours (one detector, both APIs).
+        if (fresh) af::Global().Observe(AfFacts(f));
     }
     return hr;
 }
@@ -304,10 +307,10 @@ int FormatSamplerStatus(char* out, unsigned long n)
     const float want_bias = g_bias_fn ? g_bias_fn() : 0.0f;
     const uint32_t want_af = g_af_fn ? g_af_fn() : 0u;
     return std::snprintf(out, n,
-                         "native11_samplers{installed=%d want_bias=%.3f want_af=%u applied_bias=%.3f applied_af=%u created=%llu "
+                         "native11_samplers{installed=%d want_bias=%.3f want_af=%s applied_bias=%.3f applied_af=%u created=%llu "
                          "material=%llu af_eligible=%llu variants=%llu variant_failures=%llu binds=%llu swapped=%llu unknown=%llu "
                          "after_scene_own=%llu}",
-                         s.installed ? 1 : 0, want_bias, want_af, s.bias, s.af, static_cast<unsigned long long>(s.created),
+                         s.installed ? 1 : 0, want_bias, af::ActionName(want_af), s.bias, s.af, static_cast<unsigned long long>(s.created),
                          static_cast<unsigned long long>(s.eligible_bias), static_cast<unsigned long long>(s.eligible_af),
                          static_cast<unsigned long long>(s.variants), static_cast<unsigned long long>(s.variant_failures),
                          static_cast<unsigned long long>(s.binds), static_cast<unsigned long long>(s.swapped),

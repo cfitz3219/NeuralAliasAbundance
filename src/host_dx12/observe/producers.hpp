@@ -334,17 +334,26 @@ struct MipLiveStats {
 };
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
-uint32_t SamplerAnisotropyWanted(); // the menu's AF level (0 / 4 / 8 / 16), as SamplerMipBias is the bias
+uint32_t SamplerAnisotropyWanted(); // the AF level wanted for world samplers (0 = the game's own, 16)
+uint32_t SamplerAfActionWanted();   // the af::Action wanted (core/anisotropic_auto.hpp), read by the native DX11 binds
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
 // Every distinct sampler the game created (heap, heap v2, root-signature static), most used first.
 std::string FormatSamplerTable(uint64_t* total = nullptr);
-// Anisotropic filtering (0 off, 4 / 8 / 16) on eligible standard linear samplers,
-// including clamp-addressed materials. Live static variants; newly created sampler descriptors.
+// Anisotropic filtering on world samplers (core/anisotropic_auto.hpp: not comparison, not point,
+// mips, WRAP/MIRROR). Automatic, no menu control: the host follows the shared detector.
+// stage 0 = stop following and keep the game's own (safe start), 1 = at load (twins built at
+// creation and new heap samplers follow the detector; nothing activated yet), 2 = live (every
+// decision change switches the twins in the background, no restart). [j2] anisotropic_filter.
+void SetSamplerAfFollow(int stage);
+// Explicit actions (af::Action), without the detector: live variants and newly created descriptors.
+void SetSamplerAfAction(uint32_t action);
+void SetSamplerAfActionPrebuild(uint32_t action);
+// Explicit level (tests): 0 = the game's own, any other = forced 16x on world samplers.
 void SetSamplerAnisotropy(uint32_t level);
-// The saved anisotropic level: twins for it are built at creation (before activation).
 void SetSamplerAnisotropyPrebuild(uint32_t level);
 struct AnisoStats {
-    uint32_t level = 0;
+    uint32_t level = 0;  // 0 = the game's own, 16
+    uint32_t action = 0; // af::Action in use
     uint64_t samplers = 0, static_samplers = 0, already = 0;
     uint64_t native_surface=0,native_16=0; // original observed surface samplers, before our override
     uint64_t sampler_calls = 0, sampler2_calls = 0; // the game's CreateSampler / CreateSampler2 calls (all, eligible or not)

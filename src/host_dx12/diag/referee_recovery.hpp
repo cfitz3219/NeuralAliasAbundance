@@ -1,6 +1,7 @@
 #pragma once
 #include "core/referee_recovery.hpp"
 #include "core/referee_placement.hpp"
+#include "core/anisotropic_auto.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
 
@@ -14,7 +15,7 @@ inline uint64_t EvaluationConfiguration(uint32_t preset, uint32_t cf, uint32_t d
         uint32_t(camera), uint32_t(measured), uint32_t(jitter), debug_jitter,
         set.j2_draw_replay.load(), set.j2_replay_movers.load(), set.j2_replay_budget.load(),
         uint32_t(set.j2_viewport_jitter.load()), uint32_t(set.j2_jitter_shift.load()), set.j2_jitter_r2.load(), set.j2_sharpness.load(),
-        uint32_t(settings::DlaaMipBiasX100(set)), set.aniso16.load(),
+        uint32_t(settings::DlaaMipBiasX100(set)), uint32_t(set.af_mode.load()), af::Global().Current(),
         set.motion_enabled.load(), settings::kObjectFlowLoosen, uint32_t(flow),
         set.xegtao_enabled.load(), set.xegtao_amount.load(), set.xegtao_quality.load(),
         set.xegtao_radius_x1000.load(), set.xegtao_denoise.load(), set.xegtao_radius_multiplier.load(),

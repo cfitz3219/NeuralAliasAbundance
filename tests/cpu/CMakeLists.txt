@@ -247,6 +247,7 @@ if(WIN32 AND MSVC AND TARGET host_observe_producers AND EXISTS "${NA_CPU_ROOT}/s
   set_tests_properties(na.host.sample_worker_wakeup PROPERTIES LABELS "host;capture" TIMEOUT 15 SKIP_RETURN_CODE 77)
 endif()
 na_add_cpu_test(native11_sampler_policy)
+na_add_cpu_test(anisotropic_auto)
 na_add_cpu_test(native11_texture_policy)
 na_add_cpu_test(texture_subresources_v1)
 na_add_cpu_test(material_manifest_reader)

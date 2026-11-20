@@ -313,7 +313,7 @@ void install_native(ID3D11Device* device)
     // DLAA texture detail (mip bias) and AF on the game's own samplers, live from the menu's state.
     if (!na::native11::InstallSamplers(device, [] {
             return na::j2::Enabled() && !na::j2::Paused() ? na::observe::SamplerMipBias() : 0.f;
-        }, [] { return na::observe::SamplerAnisotropyWanted(); }))
+        }, [] { return na::observe::SamplerAfActionWanted(); }))
         note("native DX11 route: the sampler hooks (texture detail / AF) could not be installed");
     // Draw replay: the game's vertex shaders are kept from creation, so a scene draw can be replayed
     // with stream output when [j2] draw_replay is on (native11/draw_replay.hpp).

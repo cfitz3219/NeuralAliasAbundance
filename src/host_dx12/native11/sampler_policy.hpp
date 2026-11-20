@@ -7,11 +7,13 @@
 //    (WRAP / MIRROR / MIRROR_ONCE) on U or V, and mips (MaxLOD > 0). Screen-space
 //    passes clamp and stay untouched. Cort's total rule: a non-zero target
 //    replaces the game's own bias (native -0.5 or 0 -> -1); 0 = the original.
-//  - AF: standard reduction, anisotropic or linear minification, mips; clamp
-//    allowed. Never lowers the game's own anisotropy.
+//  - AF: core/anisotropic_auto.hpp, the one rule both APIs share (world samplers
+//    only: not comparison, not point, mips, WRAP/MIRROR; automatic by default).
 //
 // Portable C++17 (Linux-tested); the D3D11 layer copies the fields in and out.
 #pragma once
+
+#include "core/anisotropic_auto.hpp"
 
 #include <cstdint>
 
@@ -44,26 +46,34 @@ inline bool WantsBias(const SamplerFacts& s)
     return surface && s.max_lod > 0.0f;
 }
 
-inline bool WantsAniso(const SamplerFacts& s)
+inline af::Facts AfFacts(const SamplerFacts& s)
 {
-    using namespace sampler_bits;
-    return Reduction(s.filter) == 0 && s.max_lod > 0.0f && (Anisotropic(s.filter) || MinFilter(s.filter) == 1);
+    af::Facts f;
+    f.filter = s.filter;
+    f.address_u = s.address_u;
+    f.address_v = s.address_v;
+    f.max_anisotropy = s.max_anisotropy;
+    f.max_lod = s.max_lod;
+    f.mip_lod_bias = s.mip_lod_bias;
+    return f;
 }
+inline bool WantsAniso(const SamplerFacts& s) { return af::IsWorld(AfFacts(s)); }
 
 inline float ClampLod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
 
 // The sampler as the policy wants it; returns true when anything changed.
-// `bias_target` 0 keeps the game's bias; `af` 0 keeps the game's filtering.
-inline bool ApplyPolicy(SamplerFacts& s, float bias_target, uint32_t af)
+// `bias_target` 0 keeps the game's bias; `af_action` (af::Action) kKeep keeps the game's filtering.
+inline bool ApplyPolicy(SamplerFacts& s, float bias_target, uint32_t af_action)
 {
     bool changed = false;
     if (bias_target != 0.0f && WantsBias(s)) {
         const float b = ClampLod(bias_target);
         if (b != s.mip_lod_bias) { s.mip_lod_bias = b; changed = true; }
     }
-    if (af && WantsAniso(s) && !(sampler_bits::Anisotropic(s.filter) && s.max_anisotropy >= af)) {
-        s.filter = sampler_bits::kAnisotropic;
-        s.max_anisotropy = af > 16 ? 16 : af;
+    af::Facts f = AfFacts(s);
+    if (af::Apply(f, af_action)) {
+        s.filter = f.filter;
+        s.max_anisotropy = f.max_anisotropy;
         changed = true;
     }
     return changed;

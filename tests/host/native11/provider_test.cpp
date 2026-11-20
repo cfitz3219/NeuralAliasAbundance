@@ -24,6 +24,7 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
 #include "core/referee_recovery.hpp"
+#include "core/anisotropic_auto.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -2801,6 +2802,41 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
            "the next frame's scene draws get 16x AF and the -1 mip bias back");
+    // Automatic AF (no menu control, core/anisotropic_auto.hpp): the game samplers seen so far are
+    // tiling trilinear, so the shared detector says the game lacks AF and the host raises them to
+    // 16x when it follows the detector. When the game then creates its own 16x world samplers, the
+    // decision flips live to the game's own filtering, with no new sampler bind by the game.
+    {
+        na::observe::SetSamplerMipBias(0.f);
+        na::observe::SetSamplerAfFollow(2);
+        expect(na::af::Global().Get().state == na::af::Detector::State::GameLacksAf &&
+               na::observe::SamplerAfActionWanted() == na::af::kAuto16,
+               "automatic AF finds no 8x/16x world samplers and raises them");
+        material_raw = material.Get();
+        g.ctx->PSSetSamplers(0, 1, &material_raw);
+        g.ctx->Draw(4, 0);
+        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        if (bound) bound->GetDesc(&applied);
+        expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16,
+               "automatic AF binds 16x on the tiling material sampler");
+        D3D11_SAMPLER_DESC own16 = sampler;
+        own16.Filter = D3D11_FILTER_ANISOTROPIC; own16.MaxAnisotropy = 16;
+        std::vector<ComPtr<ID3D11SamplerState>> game16;
+        for (int i = 0; i < 64 && na::observe::SamplerAfActionWanted() != na::af::kKeep; ++i) {
+            own16.MipLODBias = -0.125f * float(i); // distinct descriptions: each counts once
+            game16.emplace_back();
+            g.device->CreateSamplerState(&own16, &game16.back());
+        }
+        expect(na::observe::SamplerAfActionWanted() == na::af::kKeep &&
+               na::af::Global().Get().state == na::af::Detector::State::GameHasAf,
+               "the game's own 8x/16x world samplers switch our filtering off, live");
+        g.ctx->Draw(4, 0);
+        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        if (bound) bound->GetDesc(&applied);
+        expect(bound && applied.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && applied.MaxAnisotropy == 1,
+               "after the switch the draw samples with the game's own sampler");
+        na::observe::SetSamplerAfFollow(0);
+    }
     // Material textures: a published replacement is sampled in place of the game's view from the
     // next Present on, with no new bind by the game, and the game still reads back its own view.
     // The game's texture samples green at this LOD; the marker is white on every texel.

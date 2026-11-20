@@ -1,5 +1,6 @@
 // Native DX11 route: DLAA texture detail (mip bias) and anisotropic filtering on
-// the game's own D3D11 samplers, live from the existing menu state (no restart).
+// the game's own D3D11 samplers, live (no restart). AF is automatic (no menu control):
+// every sampler the game creates feeds the shared detector in core/anisotropic_auto.hpp.
 //
 // The game's sampler states are recorded at CreateSamplerState. When the policy
 // is on, each eligible sampler bound with PSSetSamplers / CSSetSamplers is
@@ -13,7 +14,7 @@
 
 namespace na::native11 {
 
-// The menu's wanted bias target (0 = game's own) and AF level (0 / 4 / 8 / 16), read on each bind.
+// The wanted bias target (0 = game's own) and AF action (af::Action, core/anisotropic_auto.hpp), read on each bind.
 using SamplerBiasFn = float (*)();
 using SamplerAfFn = uint32_t (*)();
 
@@ -41,7 +42,7 @@ struct SamplerStats {
     uint64_t after_scene = 0;      // eligible binds left as the game's own after the scene was handed to DLSS
     float original_bias = 0.0f;
     float bias = 0.0f;             // actual total bias at the last eligible material bind
-    uint32_t af = 0;
+    uint32_t af = 0;               // level of the last eligible world sampler bound (1 = not anisotropic)
     bool installed = false;
 };
 SamplerStats GetSamplerStats();
