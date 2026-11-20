@@ -1,9 +1,33 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 #include <map>
 
 namespace na::j2 {
+// A reader can follow a later lighting image only if its final writer
+// used a same-view image from the same scene and depth, with an observed
+// write-to-read interval. Mirrored occurrences are proved separately.
+template<class Operations, class View, class Writer, class HasGap>
+uint64_t LightingPeer(const Operations& ops, size_t reader, uint64_t scene, uint64_t depth,
+                      const View& input, Writer writer, HasGap has_gap)
+{
+    const size_t light = writer(input.id, reader);
+    if (light >= reader || light != writer(input.id, ops.size()) || has_gap(light, reader)) return 0;
+    const auto& op = ops[light];
+    if (op.paired_depth != depth || !op.direct || !op.reflected || op.inferred || op.heap_indexing || op.late) return 0;
+    uint64_t peer = 0;
+    for (const auto& base : op.in) {
+        if (!base.whole || !input.whole || base.id == input.id || base.w != input.w || base.h != input.h ||
+            base.vfmt != input.vfmt || (input.id != scene && base.id != scene)) continue;
+        const auto base_writer = writer(base.id, light);
+        if (base_writer >= light || ops[base_writer].paired_depth != depth || has_gap(base_writer, light)) continue;
+        if (peer && peer != base.id) return 0;
+        peer = base.id;
+    }
+    return peer;
+}
+
 // CPU-only recording evidence; never retains game objects or waits for the GPU.
 // A read binding is an insertion candidate, not proof of an AA/tonemap shader.
 // Operation kinds (P4-0D consumer anchor). Op::Unknown events are classified from
@@ -157,6 +181,31 @@ struct ColorEvent {
     uint64_t producer = 0;     // consumer/barrier: pipeline of the preceding write in this recording
     bool list_start = false;   // first event of a recording (frame sequences span several lists)
 };
+
+// Work backwards from the first actual read of the final scene version.
+// A barrier can end the producer list, but it cannot consume a picture.
+inline const ColorEvent* SeparateSceneReader(const std::vector<ColorEvent>& events, uint64_t* producer = nullptr)
+{
+    bool crossed_list = false;
+    const ColorEvent* reader = nullptr;
+    for (auto i = events.rbegin(); i != events.rend(); ++i) {
+        if (i->write) {
+            if (!crossed_list || !i->with_depth) return nullptr;
+            if (producer) *producer = i->producer;
+            return reader;
+        }
+        if (IsConsumer(i->op)) {
+            reader = &*i;
+            crossed_list = false;
+        } else if (reader && crossed_list && IsEntry(i->op)) {
+            // This recording could already have forwarded the output by
+            // a binding we could not trace. Do not nominate a later read.
+            reader = nullptr;
+        }
+        crossed_list |= i->list_start;
+    }
+    return nullptr;
+}
 // What one later list of a submission says about a scene ending placed before it:
 //  +1 the scene continues (a draw into the colour before the picture is copied onward),
 //  -1 the picture is copied onward here (anything later reuses the texture; stop looking),

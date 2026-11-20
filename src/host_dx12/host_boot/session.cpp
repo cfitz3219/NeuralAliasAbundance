@@ -9,7 +9,6 @@
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include <cmath>
-#include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
 #include "host_dx12/upscalers/xess_intercept.hpp"
@@ -96,7 +95,6 @@ void ActivateSavedRequests(const wchar_t* ini){
     if(settings::CanPersist())na::fg::preset::Initialize();
     slb::SetFgRequest(safe?slb::FgRequest{}:slb::FgRequest{static_cast<slb::FgMode>(st.native_fg_mode.load()),st.native_fg_frames.load()});
     j2::SetPaused(safe);
-    if(safe)j2::flow::SetEnabled(false);
     if(j2::Configured()){
         // The menu's Texture mip bias choice (automatic = total -1). The old [j2] mip_bias key
         // chooses nothing: a legacy saved Off must not switch texture detail off.

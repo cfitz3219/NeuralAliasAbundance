@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <vector>
 #include "core/referee_selection.hpp"
+#include "core/referee_trial.hpp"
 
 namespace na::referee::gpu {
 
@@ -44,6 +45,7 @@ struct Presentation {
     bool submitted = false;
     bool native11 = false;
     shadow::Context alternate;
+    bool await_result = false;
 };
 
 // Cheap: whether the next evaluation should be offered (a sample is due or half taken).
@@ -52,11 +54,13 @@ bool Wanted();
 void NotifyEvaluationReset();
 // In the evaluation's list, after DLSS ran. Returns a token (0: nothing recorded).
 uint32_t Record(ID3D12GraphicsCommandList* list, const Evaluation& e);
-void Submitted(uint32_t token, ID3D12CommandQueue* queue);
+void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint8_t tools = 0, uint8_t applied = 0);
 // The list will not be submitted by us. may_still_run: someone else may still run it.
 void Discard(uint32_t token, bool may_still_run);
 bool NeedsScreen(Presentation frame);
 void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec);
+void PresentResult(const void* swapchain, uint64_t ordinal, bool accepted);
+bool TakeTrialSample(uint64_t ticket, TrialSample& sample);
 void InvalidatePresentation(const void* swapchain);
 // Consume a visual rollback decision scoped to a native DX11 screen proof.
 uint64_t TakeNativeScreenLoss(const void* swapchain);
@@ -64,6 +68,8 @@ uint64_t TakeNativeScreenLoss(const void* swapchain);
 struct Stats {
     uint64_t samples = 0, pairs = 0, screens = 0, logged = 0;
     uint64_t pre = 0, main = 0, restarted = 0, discarded = 0, unpaired = 0, failed = 0;
+    uint64_t trace_pairs = 0, trace_reversals = 0, rejected_presents = 0;
+    uint64_t trial_pairs = 0, trial_comparable = 0;
     bool running = false, stopped = false;
     char why[160] = "";
 };
@@ -75,6 +81,8 @@ struct LastSample {
     bool screen = false, tiles = false, pair = false;
     float jitter_change = 0;
     uint64_t number = 0; // GetStats().samples when it was read
+    uint32_t centered_layout = 0; // nonzero only if multiple regions favored the same padded mapping
+    uint8_t flicker_stage = 0;
 };
 void EnableSampleReceiptForTests();
 LastSample GetLastSample();

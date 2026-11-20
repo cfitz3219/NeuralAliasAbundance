@@ -23,6 +23,7 @@
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
+#include "core/referee_recovery.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -97,8 +98,37 @@ void gs_passthrough(triangle GsVertex input[3], inout TriangleStream<GsVertex> o
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
 float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
+float4 ps_letterbox(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(0,2), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
 float4 ps_screen_check(float4 p : SV_Position) : SV_Target { return float4(scene.Load(int3(int2(p.xy), 0)).rgb * 0.75, 1); }
+struct LitVertex { float4 p : SV_Position; float2 surface : TEXCOORD0; };
+LitVertex vs_reflection(uint id : SV_VertexID) {
+    LitVertex v;
+    v.p = vs_post(id);
+    v.surface = float2((v.p.x+1)*160, (1-v.p.y)*90);
+    return v;
+}
+float4 ps_reflection(float4 p : SV_Position, float2 surface : TEXCOORD0) : SV_Target {
+    float3 base = scene.Load(int3(int2(p.xy), 0)).rgb;
+    float2 q = (surface - float2(148,88))/float2(46,25);
+    float light = exp(-dot(q,q)) * (.45 + .10 * cos((surface.x+surface.y)*1.57));
+    return float4(base * .45 + light, 1);
+}
+float4 ps_trial_surface(float4 p : SV_Position) : SV_Target {
+    float v = .28 + .10 * sin(p.x * .16) * cos(p.y * .27);
+    return float4(v, v, v, 1);
+}
+float4 ps_trial_light(float4 p : SV_Position, float2 surface : TEXCOORD0) : SV_Target {
+    float3 base = scene.Load(int3(int2(p.xy), 0)).rgb;
+    float2 q = (surface - float2(148,88))/float2(35,22);
+    float light = saturate(1 - dot(q,q)) * (.20 + .09 * cos((surface.x+surface.y)*1.57));
+    return float4(base + light, 1);
+}
+float4 ps_trial_screen(float4 p : SV_Position) : SV_Target {
+    float3 base = scene.Load(int3(int2(p.xy), 0)).rgb;
+    bool region = p.x >= 120 && p.x < 160 && p.y >= 68 && p.y < 90;
+    return float4(base * (region ? 1 + offset.x : 1), 1);
+}
 Texture2D<float> test_depth : register(t1);
 RWTexture2D<float> mask_out : register(u0);
 float4 vs_depth_ramp(uint id : SV_VertexID) : SV_Position {
@@ -154,6 +184,7 @@ struct Game {
     ComPtr<IDXGISwapChain> swap;
     HWND wnd = nullptr;
     UINT w = 320, h = 180;
+    bool padded_hdr = false;
     bool shader_depth = false;
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
@@ -215,10 +246,17 @@ bool MakeTargets(Game& g)
     }
     if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.depth)) ||
         FAILED(g.device->CreateDepthStencilView(g.depth.Get(), g.shader_depth ? &depth_view : nullptr, &g.dsv))) return false;
-    d.Format = kSceneFormat;
+    d.Format = g.padded_hdr ? DXGI_FORMAT_R16G16B16A16_TYPELESS : kSceneFormat;
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.color)) || FAILED(g.device->CreateRenderTargetView(g.color.Get(), nullptr, &g.color_rtv)) ||
-        FAILED(g.device->CreateShaderResourceView(g.color.Get(), nullptr, &g.color_srv)))
+    D3D11_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = g.padded_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : kSceneFormat;
+    rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = rv.Format;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    if (FAILED(g.device->CreateTexture2D(&d, nullptr, &g.color)) || FAILED(g.device->CreateRenderTargetView(g.color.Get(), &rv, &g.color_rtv)) ||
+        FAILED(g.device->CreateShaderResourceView(g.color.Get(), &sv, &g.color_srv)))
         return false;
     return true;
 }
@@ -234,7 +272,7 @@ bool MakeGame(Game& g, bool warp, bool debug = false)
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 2;
     sd.BufferDesc.Width = g.w;
-    sd.BufferDesc.Height = g.h;
+    sd.BufferDesc.Height = g.h + (g.padded_hdr ? 3 : 0);
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = g.wnd;
@@ -850,7 +888,9 @@ int DepthReadFixture(Game& g, bool debug_layer)
 }
 #endif
 
-int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
+int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[maybe_unused]] bool rotating_lights = false,
+                       [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false,
+                       [[maybe_unused]] bool reuse_depth = false)
 {
     struct Surface {
         ComPtr<ID3D11Texture2D> picture;
@@ -880,7 +920,9 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
         game.device->CreateTexture2D(&staging, nullptr, &result);
         return result;
     };
-    const auto before = color_copy(kSceneFormat), after = color_copy(kSceneFormat);
+    const auto format = game.padded_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : kSceneFormat;
+    const auto before = color_copy(format), after = color_copy(format);
+    if (game.padded_hdr) desc.Height += 3;
     const auto shown = color_copy(DXGI_FORMAT_R8G8B8A8_UNORM);
     if (!before || !after || !shown) return 1;
 #endif
@@ -927,6 +969,12 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
 #if defined(NA_TEST_NATIVE_DLAA)
         ID3D11Texture2D* before;
         ID3D11Texture2D* after;
+        ID3D11Resource* peer = nullptr;
+        ID3D11Resource* received = nullptr;
+        ID3D11RenderTargetView* expected_reader = nullptr;
+        uint64_t scene_stream = 0, camera_stream = 0;
+        bool reset = false, displayed_reader = false;
+        unsigned sharpening_trial_frames = 0;
 #endif
     } evaluator{game
 #if defined(NA_TEST_NATIVE_DLAA)
@@ -937,12 +985,28 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
         auto& state = *static_cast<Evaluator*>(user);
         auto& g = state.game;
         if (!state.ordinary && !frame.screen_proof) return false;
-        if (frame.color.d3d11_resource != g.color.Get() || frame.depth.d3d11_resource != g.depth.Get()) return false;
+        auto* source = static_cast<ID3D11Resource*>(frame.color.d3d11_resource);
+        if (frame.depth.d3d11_resource != g.depth.Get()) return false;
+#if defined(NA_TEST_NATIVE_DLAA)
+        if (source != g.color.Get() && (!state.peer || source != state.peer)) return false;
+#else
+        if (source != g.color.Get()) return false;
+#endif
         auto* ctx = static_cast<ID3D11DeviceContext*>(context);
 #if defined(NA_TEST_NATIVE_DLAA)
-        ctx->CopyResource(state.before, g.color.Get());
+        ctx->CopyResource(state.before, source);
+        if (state.expected_reader) {
+            ComPtr<ID3D11RenderTargetView> actual;
+            ctx->OMGetRenderTargets(1, &actual, nullptr);
+            state.displayed_reader = actual.Get() == state.expected_reader;
+        }
         if (!na::native_d3d11::EvaluateFrame(nullptr, context, frame)) return false;
-        ctx->CopyResource(state.after, g.color.Get());
+        if (frame.recovery_tool == na::referee::RecoveryTool::Sharpen) ++state.sharpening_trial_frames;
+        ctx->CopyResource(state.after, source);
+        state.received = source;
+        state.scene_stream = frame.scene_stream;
+        state.camera_stream = frame.stream;
+        state.reset = frame.scene_changed || frame.selection_changed;
 #else
         const float replacement[]{.75f, .25f, .125f, 1.f};
         ctx->ClearRenderTargetView(g.color_rtv.Get(), replacement);
@@ -951,7 +1015,20 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
         state.proof = frame.screen_proof;
         return true;
     };
+#if defined(NA_TEST_NATIVE_DLAA)
+    const auto recovery_evidence = +[](uint64_t ticket, na::referee::TrialSample& sample) {
+        if (!na::referee::gpu::TakeTrialSample(ticket, sample)) return false;
+        std::printf("accepted frame=%llu ticket=%llx delivered=%d comparable=%d first=%s region=%u tools=%u applied=%u\n",
+            static_cast<unsigned long long>(sample.ordinal), static_cast<unsigned long long>(ticket),
+            sample.delivered, sample.comparable, na::referee::StageName(sample.origin.stage), sample.origin.region,
+            unsigned(sample.tools), unsigned(sample.applied));
+        return true;
+    };
+    if (!na::native11::Install(game.device.Get(), consume, &evaluator, compare_routes,
+            composition_fault ? recovery_evidence : compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
+#else
     if (!na::native11::Install(game.device.Get(), consume, &evaluator)) return 1;
+#endif
     na::native11::SetCameraUse(adaptive ? na::native11::CameraUse::Off : na::native11::CameraUse::Optional);
     // The synthetic quads use the opposite winding to the default cull state.
     D3D11_RASTERIZER_DESC raster{};
@@ -961,6 +1038,299 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
     ComPtr<ID3D11RasterizerState> visible;
     if (FAILED(game.device->CreateRasterizerState(&raster, &visible))) return 1;
     game.ctx->RSSetState(visible.Get());
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (rotating_lights) {
+        Surface peer;
+        D3D11_TEXTURE2D_DESC hdr{};
+        game.color->GetDesc(&hdr);
+        D3D11_RENDER_TARGET_VIEW_DESC rv{};
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        game.color_rtv->GetDesc(&rv);
+        game.color_srv->GetDesc(&sv);
+        if (FAILED(game.device->CreateTexture2D(&hdr, nullptr, &peer.picture)) ||
+            FAILED(game.device->CreateRenderTargetView(peer.picture.Get(), &rv, &peer.rtv)) ||
+            FAILED(game.device->CreateShaderResourceView(peer.picture.Get(), &sv, &peer.srv))) return 1;
+        auto box_code = Compile("ps_letterbox", "ps_5_0");
+        ComPtr<ID3D11PixelShader> letterbox;
+        if (!box_code || FAILED(game.device->CreatePixelShader(box_code->GetBufferPointer(), box_code->GetBufferSize(), nullptr, &letterbox))) return 1;
+        evaluator.peer = peer.picture.Get();
+        evaluator.expected_reader = game.padded_hdr ? other_canvas.rtv.Get() : game.back_rtv.Get();
+        auto blob = Compile(compare_routes ? "ps_trial_light" : "ps_reflection", "ps_5_0");
+        auto vertex = Compile("vs_reflection", "vs_5_0");
+        ComPtr<ID3D11VertexShader> lit_vs;
+        ComPtr<ID3D11PixelShader> reflection;
+        if (!blob || FAILED(game.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &reflection)) ||
+            !vertex || FAILED(game.device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &lit_vs))) return 1;
+        ComPtr<ID3D11PixelShader> trial_surface, trial_screen;
+        ComPtr<ID3D11Buffer> trial_flash;
+        if (compare_routes) {
+            auto surface = Compile("ps_trial_surface", "ps_5_0");
+            auto screen_shader = Compile("ps_trial_screen", "ps_5_0");
+            const D3D11_BUFFER_DESC flags{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+            if (!surface || !screen_shader ||
+                FAILED(game.device->CreatePixelShader(surface->GetBufferPointer(), surface->GetBufferSize(), nullptr, &trial_surface)) ||
+                FAILED(game.device->CreatePixelShader(screen_shader->GetBufferPointer(), screen_shader->GetBufferSize(), nullptr, &trial_screen)) ||
+                FAILED(game.device->CreateBuffer(&flags, nullptr, &trial_flash))) return 1;
+        }
+        na::native11::SetCameraUse(na::native11::CameraUse::Off);
+        ComPtr<ID3D11Texture2D> back;
+        if (FAILED(game.swap->GetBuffer(0, IID_PPV_ARGS(&back)))) return 1;
+        struct Sample {
+            int correct = 0, evaluated = 0, proven = 0, fixed_history = 0, displayed_readers = 0;
+            size_t changed = 0, reached = 0, comparisons = 0;
+            double movement = 0, brightness = 0;
+            uint64_t scene = 0, camera = 0;
+            std::vector<int> previous;
+        };
+        bool start_fault = !composition_fault;
+        auto record = [&](int i, bool light_on, Sample* sample, bool pinned = false, bool overwrite = false,
+                          bool clear_before_reader = false) {
+            Pump();
+            const auto start = evaluator.writes;
+            evaluator.received = nullptr;
+            evaluator.proof = 0;
+            // Include consecutive frames with the same owner: parity cannot solve this route.
+            const bool swap_roles = !pinned && (i % 7 == 2 || i % 7 == 4 || i % 7 == 5);
+            auto* early_rt = swap_roles ? peer.rtv.Get() : game.color_rtv.Get();
+            auto* late_rt = swap_roles ? game.color_rtv.Get() : peer.rtv.Get();
+            auto* early = swap_roles ? peer.srv.Get() : game.color_srv.Get();
+            auto* late = swap_roles ? game.color_srv.Get() : peer.srv.Get();
+            auto* expected = swap_roles ? game.color.Get() : peer.picture.Get();
+            auto* c = game.ctx.Get();
+            const D3D11_VIEWPORT vp{0, 0, float(game.w), float(game.h), 0, 1};
+            c->RSSetViewports(1, &vp);
+            c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            c->VSSetShader(game.vs_post.Get(), nullptr, 0);
+            c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+            c->OMSetDepthStencilState(nullptr, 0);
+            ID3D11RenderTargetView* layers[]{canvas.rtv.Get(), second_output.rtv.Get()};
+            c->OMSetRenderTargets(2, layers, game.dsv.Get());
+            c->PSSetShader(compare_routes ? trial_surface.Get() : game.ps_scene.Get(), nullptr, 0);
+            for (int n = 0; n < 34; ++n) c->Draw(4, 0);
+            // Keep the depth test active against the layer depth and draw coplanar fullscreen lighting.
+            c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+            c->OMSetRenderTargets(1, &early_rt, game.dsv.Get());
+            auto* material = canvas.srv.Get();
+            c->PSSetShaderResources(0, 1, &material);
+            c->PSSetShader(game.ps_tonemap.Get(), nullptr, 0);
+            for (int n = 0; n < 9; ++n) c->Draw(4, 0);
+            c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+            c->OMSetRenderTargets(1, &late_rt, game.dsv.Get());
+            c->PSSetShaderResources(0, 1, &early);
+            c->VSSetShader(lit_vs.Get(), nullptr, 0);
+            // Keep the exposure identical across the rotating owners in the
+            // isolated composition case. The other fixture's .75 gain would
+            // introduce a second, whole-picture change at the earlier route.
+            c->PSSetShader(light_on ? reflection.Get() : composition_fault ? game.ps_tonemap.Get() : composite.Get(), nullptr, 0);
+            for (int n = 0; n < 6; ++n) c->Draw(4, 0);
+            if (overwrite) {
+                const float new_picture[]{.2f, .3f, .4f, 1};
+                c->ClearRenderTargetView(late_rt, new_picture);
+            }
+            if (clear_before_reader) c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+            c->VSSetShader(game.vs_post.Get(), nullptr, 0);
+            reader(decoy.rtv.Get(), late, game.ps_tonemap.Get());
+            if (game.padded_hdr) {
+                reader(other_canvas.rtv.Get(), late, game.ps_tonemap.Get());
+                D3D11_VIEWPORT screen_vp = vp;
+                screen_vp.Height += 3;
+                c->RSSetViewports(1, &screen_vp);
+                reader(game.back_rtv.Get(), other_canvas.srv.Get(), letterbox.Get());
+            } else if (compare_routes) {
+                // This fixture deliberately flashes one region when DLAA has
+                // already evaluated the early surface. The controlled path
+                // uses the same final shader and resources for every frame.
+                const bool flash_on = composition_fault ? (start_fault && (i & 1) != 0) : evaluator.received && evaluator.received != expected;
+                const float flash[4]{flash_on ? .80f : 0.f};
+                c->UpdateSubresource(trial_flash.Get(), 0, nullptr, flash, 0, 0);
+                auto* control = trial_flash.Get();
+                c->PSSetConstantBuffers(1, 1, &control);
+                reader(game.back_rtv.Get(), late, trial_screen.Get());
+            } else reader(game.back_rtv.Get(), late, game.ps_tonemap.Get());
+            // A post layer can clear/reuse the depth attachment after the
+            // lighting reader has consumed the scene color.
+            if (reuse_depth) c->ClearDepthStencilView(game.dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+            if (sample) {
+                auto& s = *sample;
+                s.correct += evaluator.received == expected;
+                s.evaluated += evaluator.writes == start + 1;
+                s.proven += evaluator.proof != 0;
+                s.displayed_readers += evaluator.proof && evaluator.displayed_reader;
+                s.fixed_history += !evaluator.reset && (!s.scene ||
+                    (s.scene == evaluator.scene_stream && s.camera == evaluator.camera_stream));
+                s.scene = evaluator.scene_stream;
+                s.camera = evaluator.camera_stream;
+                na::native11::OwnWorkScope own;
+                c->CopyResource(shown.Get(), back.Get());
+                D3D11_MAPPED_SUBRESOURCE display{}, input{}, output{};
+                if (FAILED(c->Map(shown.Get(), 0, D3D11_MAP_READ, 0, &display)) ||
+                    FAILED(c->Map(before.Get(), 0, D3D11_MAP_READ, 0, &input)) ||
+                    FAILED(c->Map(after.Get(), 0, D3D11_MAP_READ, 0, &output))) return false;
+                const auto red = [&](const D3D11_MAPPED_SUBRESOURCE& m, UINT x, UINT y) {
+                    if (game.padded_hdr) {
+                        uint16_t half;
+                        std::memcpy(&half, static_cast<const BYTE*>(m.pData) + y * m.RowPitch + 8*x, sizeof(half));
+                        return int(std::lround(std::clamp(DirectX::PackedVector::XMConvertHalfToFloat(half), 0.f, 1.f) * 255));
+                    }
+                    DirectX::PackedVector::XMFLOAT3PK texel;
+                    std::memcpy(&texel, static_cast<const BYTE*>(m.pData) + y * m.RowPitch + 4*x, sizeof(texel));
+                    DirectX::XMFLOAT3 rgb;
+                    DirectX::XMStoreFloat3(&rgb, DirectX::PackedVector::XMLoadFloat3PK(&texel));
+                    return int(std::lround(std::clamp(rgb.x, 0.f, 1.f) * 255));
+                };
+                std::vector<int> current;
+                for (UINT y = 60; y < 116; ++y) for (UINT x = 100; x < 196; ++x) {
+                    const UINT screen_y = y + (game.padded_hdr ? 2 : 0);
+                    const int visible_pixel = static_cast<const BYTE*>(display.pData)[screen_y*display.RowPitch + 4*x];
+                    const int in = red(input, x, y), out = red(output, x, y);
+                    if (std::abs(in-out) >= 5) {
+                        ++s.changed;
+                        s.reached += std::abs(out-visible_pixel) <= 2;
+                    }
+                    if (!s.previous.empty()) {
+                        s.movement += std::abs(visible_pixel-s.previous[current.size()]);
+                        ++s.comparisons;
+                    }
+                    s.brightness += visible_pixel;
+                    current.push_back(visible_pixel);
+                }
+                s.previous = std::move(current);
+                c->Unmap(after.Get(), 0);
+                c->Unmap(before.Get(), 0);
+                c->Unmap(shown.Get(), 0);
+            }
+            return SUCCEEDED(game.swap->Present(0, 0));
+        };
+        Sample baseline, fixed, dim, pinned, pinned_dim;
+        for (int i = 0; i < 70; ++i) if (!record(i, true, i < 42 ? nullptr : &baseline)) return 1;
+        na::settings::Get().referee_enabled.store(1);
+        na::native11::SetScreenCheck(true);
+        if (composition_fault) {
+            // The final game shader flashes independently of the amount of
+            // sharpening. The real provider must try the real RCAS control,
+            // then restore it while continuing to deliver NGX.
+            auto& options = na::settings::Get();
+            options.referee_every_ms.store(100);
+            options.j2_sharpness.store(50);
+            const auto end = GetTickCount64() + 90000;
+            int i = 0;
+            bool excluded = false, placement_rejected = false;
+            while (!excluded && GetTickCount64() < end) {
+                if (!record(i++, false, nullptr)) return 1;
+                Sleep(6);
+                for (const auto& line : na::eventlog::Drain()) {
+                    if (line.find("native11_route_trial") != std::string::npos) {
+                        std::printf("%s", line.c_str());
+                        if (line.find("phase=baseline ") != std::string::npos) start_fault = true;
+                        if (line.find("phase=rejected ") != std::string::npos &&
+                            line.find("did not improve") != std::string::npos) placement_rejected = true;
+                    }
+                    if (line.find("referee_recovery") != std::string::npos) {
+                        std::printf("%s\n", line.c_str());
+                        excluded |= line.find("tool=reduce_sharpening phase=restored ruled_out=16") != std::string::npos;
+                    }
+                }
+            }
+            const auto tried = evaluator.sharpening_trial_frames;
+            Sample restored;
+            for (unsigned j = 0; j < 28; ++j) if (!record(i++, false, &restored)) return 1;
+            std::printf("composition recovery: tried=%u restored=%d/28 changes=%zu visible=%zu exclusions=%d\n",
+                tried, restored.evaluated, restored.changed, restored.reached, int(excluded));
+            expect(placement_rejected, "failed lighting placement hands the same fault to the stage-specific selector");
+            expect(tried && excluded && evaluator.sharpening_trial_frames == tried && options.j2_sharpness.load() == 50,
+                   "actual DX11 trial rejects a compositing flash independent of sharpening and restores user settings");
+            expect(restored.evaluated == 28, "real DLAA stays engaged after the unsuccessful correction");
+            na::native11::Uninstall();
+            return g_failed ? 1 : 0;
+        }
+        if (compare_routes) {
+            na::settings::Get().referee_every_ms.store(100);
+            const auto until = GetTickCount64() + 18000;
+            int i = 0;
+            while (GetTickCount64() < until) {
+                if (!record(i++, true, nullptr)) return 1;
+                Sleep(7);
+            }
+            for (int j = 0; j < 28; ++j) if (!record(i++, true, &fixed)) return 1;
+            const double old_delta = baseline.movement / baseline.comparisons;
+            const double new_delta = fixed.movement / fixed.comparisons;
+            const auto stats = na::referee::gpu::GetStats();
+            std::printf("controlled native scene: before=%.4f after=%.4f late=%d/28, visible result=%zu/%zu, GPU pairs=%llu comparable=%llu\n",
+                        old_delta, new_delta, fixed.correct, fixed.reached, fixed.changed,
+                        static_cast<unsigned long long>(stats.trial_pairs), static_cast<unsigned long long>(stats.trial_comparable));
+            expect(fixed.correct == 28 && fixed.proven == 28 && fixed.displayed_readers == 28,
+                   "the actual provider keeps the improved screen-proved route");
+            expect(fixed.changed > 100 && fixed.reached * 100 >= fixed.changed * 98 && new_delta < old_delta * .25,
+                   "real NGX reaches the screen and the reflected light stops flickering");
+            auto& sharpness = na::settings::Get().j2_sharpness;
+            const auto previous_sharpness = sharpness.load();
+            sharpness.store(previous_sharpness ? 0 : 1);
+            const auto changed_until = GetTickCount64() + 4000;
+            while (GetTickCount64() < changed_until) {
+                if (!record(i++, true, nullptr)) return 1;
+                Sleep(7);
+            }
+            Sample after_change;
+            for (int j = 0; j < 28; ++j) if (!record(i++, true, &after_change)) return 1;
+            sharpness.store(previous_sharpness);
+            std::printf("after settings change: ordinary delivered=%d/28 later reader=%d/28\n", after_change.evaluated, after_change.correct);
+            expect(after_change.evaluated == 28 && after_change.correct == baseline.correct,
+                   "settings change restores the ordinary route and preserves DLAA on every test frame");
+            na::native11::Uninstall();
+            return g_failed ? 1 : 0;
+        }
+        const auto resets = [] {
+            char status[2048]{};
+            na::native_d3d11::FormatStatus(status, sizeof(status));
+            std::array<unsigned long long, 5> result{};
+            const auto* history = std::strstr(status, "history_resets{");
+            const auto* measured = std::strstr(status, "measured{reset_first_picture=");
+            unsigned last_reason = 0;
+            if (!history || !measured ||
+                sscanf_s(history, "history_resets{camera_cut=%llu inputs_changed=%llu frame_gap=%llu", &result[0], &result[1], &result[2]) != 3 ||
+                sscanf_s(measured, "measured{reset_first_picture=%llu last_no_pair=%u reset_scene_cut=%llu", &result[3], &last_reason, &result[4]) != 3)
+                expect(false, "read actual evaluator history counters");
+            return result;
+        };
+        for (int i = 0; i < 322; ++i) if (!record(i, true, nullptr)) return 1;
+        const auto before_swaps = resets();
+        for (int i = 322; i < 350; ++i) if (!record(i, true, &fixed)) return 1;
+        expect(resets() == before_swaps, "actual DLAA and measured-motion histories survive every qualified swap");
+        for (int i = 0; i < 56; ++i) if (!record(i, true, i < 28 ? nullptr : &pinned, true)) return 1;
+        for (int i = 0; i < 21; ++i) if (!record(i, false, i >= 14 ? &dim : nullptr)) return 1;
+        for (int i = 0; i < 21; ++i) if (!record(i, false, i >= 14 ? &pinned_dim : nullptr, true)) return 1;
+        double old_delta = baseline.movement / baseline.comparisons, new_delta = fixed.movement / fixed.comparisons;
+        std::printf("fixed-owner control reflection delta=%.4f\n", pinned.movement/pinned.comparisons);
+        std::printf("reflection swaps: baseline late=%d/28, delta=%.4f; qualified late=%d/28, submissions=%d, proofs=%d, stable histories=%d, delta=%.4f, display matches=%zu/%zu, light on/off=%.2f/%.2f\n",
+            baseline.correct, old_delta, fixed.correct, fixed.evaluated, fixed.proven, fixed.fixed_history, new_delta,
+            fixed.reached, fixed.changed, fixed.brightness/(28*5376), dim.brightness/(7*5376));
+        expect(baseline.correct < 28 && old_delta > 1, "physical selection reproduces visible reflection flicker");
+        expect(fixed.correct == 28 && fixed.evaluated == 28 && fixed.proven == 28 && fixed.fixed_history == 28,
+               "both fully lit surfaces reach one continuous DLAA history");
+        expect(fixed.displayed_readers == 28, "the identical shader drawing into the undisplayed decoy never steers DLAA");
+        expect(fixed.changed > 100 && fixed.reached*100 >= fixed.changed*98, "displayed reflection matches real NGX output on differentiated pixels");
+        expect(new_delta < 1 && new_delta < old_delta*.25, "stationary reflection stops alternating when the physical buffers swap");
+        expect(std::abs(new_delta - pinned.movement/pinned.comparisons) < .25, "swapping and pinned surfaces have the same residual flicker within a quarter of a display level");
+        // Measure the response using this model/runtime on a single physical
+        // owner. Different NVIDIA runtimes can render the same change with
+        // different contrast, even when both deliver the correct result.
+        constexpr double pixels = 5376;
+        const double pinned_drop = (pinned.brightness / 28 - pinned_dim.brightness / 7) / pixels;
+        const double rotating_drop = (fixed.brightness / 28 - dim.brightness / 7) / pixels;
+        std::printf("intentional light change: pinned=%.3f rotating=%.3f display levels\n", pinned_drop, rotating_drop);
+        expect(pinned_drop >= 8 && std::abs(rotating_drop - pinned_drop) <= .10 * pinned_drop,
+               "rotating placement preserves the fixed owner's response when a real light goes out");
+        if (reuse_depth) {
+            if (!record(0, true, nullptr, false, false, true)) return 1;
+            expect(!evaluator.proof, "the lighting reader refuses a depth clear before it consumes the scene");
+        }
+        if (!record(0, true, nullptr, false, true)) return 1;
+        expect(!evaluator.proof, "a clear between the final lighting draw and its reader invalidates the source");
+        if (g_failed)
+            for (const auto& event : na::eventlog::Drain()) if (event.find("lit_role") != std::string::npos) std::printf("%s", event.c_str());
+        return g_failed ? 1 : 0;
+    }
+#endif
     if (adaptive) {
         // Learn a numbered read on order A, then put a plausible draw at
         // that number before more scene work. B and C both share A's inputs.
@@ -1118,6 +1488,15 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false)
         na::native11::RejectScreenProof(proof[0]);
         expect(render(1, true) && evaluator.proof == proof[1] && !render(0, true) && !evaluator.proof,
                "a lost screen proof retires only its own draw order");
+#if !defined(NA_TEST_NATIVE_DLAA)
+        bool recovered = false;
+        for (int i = 0; i < 176 && !recovered; ++i) {
+            const bool reached = render(0, true);
+            if (i < 112) expect(!evaluator.proof, "rejected reader stays off during cooldown");
+            recovered = reached && evaluator.proof && evaluator.proof != proof[0];
+        }
+        expect(recovered, "a returning reader can earn a fresh screen proof after cooldown");
+#endif
         std::printf("adaptive DX11 screen: %d/32 alternating, %llu confirmed, %llu rejected, %llu paired\n",
                     alternating, (unsigned long long)discovered.screen_confirmed,
                     (unsigned long long)discovered.screen_refuted, (unsigned long long)discovered.screen_pairs);
@@ -1261,11 +1640,22 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                                                        std::strcmp(argv[1], "--adaptive-screen-warp") == 0));
 #if defined(NA_TEST_NATIVE_DLAA)
     const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
+    const bool padded_hdr = argc > 1 && std::strcmp(argv[1], "--lit-role-padded") == 0;
+    const bool trial_reused_depth = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-reused-depth") == 0;
+    const bool reuse_depth = trial_reused_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role-reused-depth") == 0);
+    const bool composition_fault = argc > 1 && std::strcmp(argv[1], "--composition-recovery") == 0;
+    const bool compare_routes = composition_fault || trial_reused_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
+    const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const auto dir = std::filesystem::path(exe).parent_path();
-    const auto scope = L"Native11Activation-" + std::to_wstring(GetCurrentProcessId());
+    // The host persists settings across runs. Windows reuses PIDs, so a fresh
+    // fixture must also distinguish the run that previously held the same PID.
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    const auto ticks = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    const auto scope = L"Native11Activation-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(ticks);
     const auto ini_name = scope + L".ini";
     const auto ini = dir / ini_name;
     const auto status_path = dir / (scope + L".log");
@@ -1284,7 +1674,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
-        !set(L"j2", L"camera", (camera_off_start || adaptive) ? L"0" : L"2") ||
+        !set(L"j2", L"camera", (camera_off_start || adaptive || rotating_lights) ? L"0" : L"2") ||
 
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
     na::host::WaitForObserveInstall();
@@ -1295,6 +1685,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (g_failed) return 1;
 #endif
     Game g;
+#if defined(NA_TEST_NATIVE_DLAA)
+    g.padded_hdr = padded_hdr;
+#endif
     bool warp = false;
     const bool screen_warp = argc > 1 && (std::strcmp(argv[1], "--screen-check-warp") == 0 ||
                                          std::strcmp(argv[1], "--adaptive-screen-warp") == 0);
@@ -1341,9 +1734,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
            std::strstr(activation, "dx11on12 enabled=0") != nullptr && std::strstr(activation, "wrapped=0") != nullptr,
            "production host installed the native provider exactly once");
     if (g_failed) return 1;
-    if (adaptive) {
+    if (adaptive || rotating_lights) {
         na::j2::SetJitter(true);
-        const int result = ScreenCheckFixture(g, true, missed_order);
+        const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes, composition_fault, reuse_depth);
         DeleteFileW(ini.c_str());
         std::fflush(stdout);
         ExitProcess(result);

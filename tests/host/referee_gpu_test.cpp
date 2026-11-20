@@ -9,8 +9,11 @@
 #include "test_support.hpp"
 #include "referee_gpu_scene.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
+#include "host_dx12/capture/screen_marker.hpp"
+#include "core/referee_recovery.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "core/referee_placement.hpp"
 #include "host_dx12/settings.hpp"
 
 #include <cmath>
@@ -100,25 +103,43 @@ ComPtr<ID3D12Resource> ScreenTexture(test::Device& d, test::List& l, const std::
     return t;
 }
 
-struct Images { ID3D12Resource *prev, *input, *output, *motion, *screen; };
+struct Images {
+    ID3D12Resource *prev, *input, *output, *motion, *screen;
+    bool unknown_geometry = false;
+};
+using PlacementPath = na::referee::shadow::Path;
+struct TracePair {
+    ID3D12Resource* before_output;
+    ID3D12Resource* before_screen;
+    bool accept = true;
+    uint64_t ticket = 0, configuration = 0;
+    bool returned_present = true;
+    uint8_t tools = 0, applied = 0, main_tools = 255;
+    PlacementPath path = PlacementPath::Inline, alternate = PlacementPath::None;
+};
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
 // Returns false (with a FAIL line) when the referee did not take it.
 bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images& im, rg::LastSample& got,
                 bool late = false, ID3D12CommandQueue* blocked = nullptr, ID3D12Fence* release = nullptr,
                 bool changed_scene = false, bool reset = false, bool display_vectors = false, bool unsampled_reset = false,
-                uint64_t native_proof = 0)
+                uint64_t native_proof = 0, bool rotate = false, const TracePair* trace = nullptr)
 {
     const uint64_t before = rg::GetStats().samples;
     CHECK(rg::Wanted());
     rg::Evaluation e;
-    e.color = im.prev; e.output = im.output; e.motion = im.motion;
+    e.color = im.prev; e.output = trace ? trace->before_output : im.output; e.motion = im.motion;
     e.render_w = rs::kW; e.render_h = rs::kH;
     e.output_w = display_vectors ? 2 * rs::kW : rs::kW;
     e.output_h = display_vectors ? 2 * rs::kH : rs::kH;
     e.mv_display_res = display_vectors;
     e.context = {{native_proof ? na::referee::shadow::Path::Native11 : na::referee::shadow::Path::Inline, 22},
                  1, 2, 3, 0, rs::kW, rs::kH, native_proof};
+    if (trace) {
+        e.context.trial_ticket = trace->ticket;
+        e.context.trial_configuration = trace->configuration;
+        if (!native_proof) e.context.placement.path = trace->path;
+    }
     const bool native11 = native_proof != 0;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterBefore[0]; e.jitter_y = rs::kJitterBefore[1];
@@ -132,14 +153,22 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         rg::Submitted(pre, blocked);
     } else {
         Run(d, l);
-        rg::Submitted(pre, d.queue.Get());
+        rg::Submitted(pre, d.queue.Get(), trace ? trace->tools : 0, trace ? trace->applied : 0);
     }
     CHECK(!rg::NeedsScreen({ordinal, &d}));
-    rg::OnPresent({ordinal, &d, true, true, native11}, d.queue.Get(), nullptr, Execute);
+    rg::Presentation earlier{ordinal, &d, true, true, native11};
+    if (trace) earlier.await_result = true;
+    rg::OnPresent(earlier, d.queue.Get(), trace ? trace->before_screen : nullptr, Execute);
+    if (trace) rg::PresentResult(&d, ordinal, true);
 
     CHECK(rg::Wanted()); // half taken: the next evaluation is wanted
     e.color = im.input;
+    e.output = im.output;
     if (changed_scene) ++e.context.color;
+    if (rotate) {
+        ++e.context.color;
+        ++e.context.native_screen_proof;
+    }
     if (unsampled_reset) rg::NotifyEvaluationReset();
     e.reset = reset;
     e.present_ordinal = ++ordinal;
@@ -150,14 +179,34 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     if (!second) return false;
     rg::Discard(pre, false);
     Run(d, main);
-    rg::Submitted(second, d.queue.Get());
+    rg::Submitted(second, d.queue.Get(), trace ? trace->tools & trace->main_tools : 0, trace ? trace->applied : 0);
     CHECK(rg::NeedsScreen({ordinal, &d, true, true, native11}));
     CHECK(!rg::NeedsScreen({ordinal, &d, true, false, native11}));
     rg::OnPresent({ordinal, &l, true, true, native11}, d.queue.Get(), im.screen, Execute);
     CHECK(!rg::NeedsScreen({ordinal + 7, &d}));
     CHECK(!rg::NeedsScreen({ordinal, &l}));
     if (late && !blocked) ordinal += 7;
-    rg::OnPresent({ordinal, &d, true, true, native11}, d.queue.Get(), im.screen, Execute);
+    rg::Presentation current{ordinal, &d, true, true, native11};
+    if (trace) {
+        current.await_result = trace->returned_present;
+        current.alternate = e.context;
+        current.alternate.placement = {trace->alternate, 0};
+    }
+    rg::OnPresent(current, d.queue.Get(), im.screen, Execute);
+    if (trace && trace->returned_present) {
+        d.WaitIdle();
+        rg::PresentResult(&l, ordinal, true); // a different chain cannot sign for this scene
+        rg::PresentResult(&d, ordinal + 1, true); // nor a different frame
+        rg::Wanted();
+        CHECK(na::background::WaitIdle(3000));
+        CHECK(rg::GetStats().samples == before);
+        rg::PresentResult(&d, ordinal, trace->accept);
+        if (!trace->accept) {
+            rg::Wanted();
+            CHECK(na::background::WaitIdle(3000));
+            return rg::GetStats().samples == before;
+        }
+    }
     if (blocked) {
         ComPtr<ID3D12Fence> presenting_done, producer_done;
         const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -185,7 +234,8 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
         return false;
     }
     got = rg::GetLastSample();
-    CHECK(got.screen == !late && got.tiles == (!late && !display_vectors) && got.pair == (im.motion && !changed_scene && !reset && !unsampled_reset));
+    CHECK(got.screen == !late && got.tiles == (!late && !display_vectors && !im.unknown_geometry) &&
+          got.pair == (im.motion && !changed_scene && !reset && !unsampled_reset));
     CHECK(std::fabs(got.jitter_change - (got.pair ? rs::JitterChange() : 0.f)) < 1e-4f);
     CHECK(got.data.size() == na::referee::kResultFloats);
     return got.data.size() == na::referee::kResultFloats;
@@ -222,6 +272,30 @@ void Report(const char* what, const na::referee::Verdicts& v)
 
 int main()
 {
+    {
+        using namespace na::screen_marker;
+        Vote real, inverted, parity, discarded;
+        for (uint32_t i = 1; i < kSession; ++i) {
+            float prev[3], next[3], inv_prev[3], inv_next[3], natural_prev[3], natural_next[3], flat[3]{};
+            for (uint32_t k = 0; k < 3; ++k) {
+                prev[k] = ((kPatterns[i - 1] >> k) & 1u) ? .7f : .2f;
+                next[k] = ((kPatterns[i] >> k) & 1u) ? .7f : .2f;
+                inv_prev[k] = 1.f - prev[k];
+                inv_next[k] = 1.f - next[k];
+                natural_prev[k] = (i & 1u) ? .2f : .7f;
+                natural_next[k] = 1.f - natural_prev[k];
+            }
+            const uint32_t before = kPatterns[i - 1], after = kPatterns[i];
+            real.Add(before, prev, after, next);
+            inverted.Add(before, inv_prev, after, inv_next);
+            parity.Add(before, natural_prev, after, natural_next);
+            discarded.Add(before, flat, after, flat);
+        }
+        CHECK(real.ResultOf() == Vote::Result::Reached);
+        CHECK(inverted.ResultOf() == Vote::Result::Reached);
+        CHECK(parity.ResultOf() != Vote::Result::Reached);
+        CHECK(discarded.ResultOf() == Vote::Result::Discarded);
+    }
 #ifndef NA_HAVE_REFEREE_SHADERS
     std::puts("SKIP: Windows SDK FXC was unavailable");
     return test::kSkip;
@@ -463,6 +537,364 @@ int main()
                        false, nullptr, nullptr, false, false, false, false, 18));
     CHECK(rg::TakeNativeScreenLoss(&d) == 18);
     CHECK(!rg::TakeNativeScreenLoss(&d)); // proof 19 stays qualified
+    Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), t_motion.Get(), tiny_output.Get()},
+                       got, false, nullptr, nullptr, false, false, false, false, 31, true));
+    CHECK(got.pair); // different physical sources and proofs, one verified scene history
+    for (unsigned i = 0; i < 2; ++i) {
+        if (i) ++ordinal;
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), nullptr, tiny_input.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 41));
+    }
+    rg::NotifyEvaluationReset();
+    CHECK(!rg::TakeNativeScreenLoss(&d)); // pending pre-reset decisions cannot retire the live reader
+    // Identical scene and output size, seven additional rows on the display. The same
+    // registration must identify a shown input, shown output, and unrelated overlay.
+    // Exercise both roundings of the odd margin and the existing scaled layout.
+    for (int which = 0; which < 4; ++which) {
+        const uint32_t pw = rs::kW, ph = rs::kH + 7;
+        const auto& source = which == 0 ? shows_input : shows_output;
+        std::vector<uint8_t> pixels(size_t(pw) * ph, 0);
+        for (uint32_t y = 0; y < ph; ++y) {
+            for (uint32_t x = 0; x < pw; ++x) {
+                if (which == 2) {
+                    pixels[size_t(y) * pw + x] = uint8_t((rs::Grain(x, y, 37) + .5f) * 255.f);
+                } else if (which == 3) {
+                    float sy = std::clamp((float(y) + .5f) * rs::kH / ph - .5f, 0.f, float(rs::kH - 1));
+                    uint32_t lo = uint32_t(sy), hi = (std::min)(lo + 1, rs::kH - 1);
+                    pixels[size_t(y) * pw + x] = uint8_t(std::lround(source[size_t(lo) * pw + x] * (1 - (sy - lo)) +
+                                                                      source[size_t(hi) * pw + x] * (sy - lo)));
+                } else {
+                    const uint32_t top = which == 0 ? 3 : 4;
+                    if (y >= top && y - top < rs::kH) pixels[size_t(y) * pw + x] = source[size_t(y - top) * pw + x];
+                }
+            }
+        }
+        auto composition = ScreenTexture(d, l, pixels, keep, pw, ph);
+        REQUIRE(composition);
+        Run(d, l);
+        keep.clear();
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_prev.Get(), t_input.Get(), t_output.Get(), nullptr, composition.Get(), which == 2}, got));
+        const auto vote = na::referee::shadow::VoteScreen(na::referee::Score({got.data.data(), got.screen, got.tiles, false, 0}));
+        std::printf("padded screen case %d: layout %u, vote %d\n", which, got.centered_layout, int(vote));
+        CHECK(vote == (which == 0 ? ScreenVote::Input : which == 2 ? ScreenVote::Unknown : ScreenVote::Output));
+        CHECK(got.centered_layout == (which < 2 ? uint32_t(which + 1) : 0u));
+    }
+    // Isolate the first changed stage with the same two luma levels, then
+    // deny a Present receipt to make sure a copied picture cannot vote.
+    auto bright = output;
+    for (uint32_t y = bright.h / 2; y < bright.h * 5 / 8; ++y)
+        for (uint32_t x = bright.w / 2; x < bright.w * 5 / 8; ++x)
+            bright.v[size_t(y) * bright.w + x] *= 1.8f;
+    auto lit_in = Picture(d, l, bright, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+    auto lit_out = Picture(d, l, bright, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, keep);
+    auto lit_display = ScreenTexture(d, l, rs::ScreenBytes(bright), keep);
+    Run(d, l);
+    keep.clear();
+    REQUIRE(lit_in && lit_out && lit_display);
+    const auto unlit_in = Picture(d, l, output, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+    const auto padded = [&](const na::referee::Image& image) {
+        const auto pixels = rs::ScreenBytes(image);
+        std::vector<uint8_t> aligned(size_t(image.w) * (image.h + 7));
+        std::copy(pixels.begin(), pixels.end(), aligned.begin() + 3 * image.w);
+        return ScreenTexture(d, l, aligned, keep, image.w, image.h + 7);
+    };
+    const auto unlit_padded = padded(output), lit_padded = padded(bright);
+    Run(d, l);
+    keep.clear();
+    REQUIRE(unlit_in && unlit_padded && lit_padded);
+    using na::referee::FlickerStage;
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+        const unsigned first = (std::min)(scenario, 2u);
+        const bool has_padding = scenario == 3;
+        rg::NotifyEvaluationReset();
+        for (unsigned reverse = 0; reverse < 2; ++reverse) {
+            const bool up = reverse == 0;
+            auto* old_in = first == 0 && !up ? lit_in.Get() : unlit_in.Get();
+            auto* new_in = first == 0 && up ? lit_in.Get() : unlit_in.Get();
+            auto* old_output = first <= 1 && !up ? lit_out.Get() : t_output.Get();
+            auto* new_output = first <= 1 && up ? lit_out.Get() : t_output.Get();
+            auto* lit_screen = has_padding ? lit_padded.Get() : lit_display.Get();
+            auto* unlit_screen = has_padding ? unlit_padded.Get() : t_screen.Get();
+            TracePair trace{old_output, up ? unlit_screen : lit_screen};
+            Sleep(150);
+            REQUIRE(TakeSample(d, l, ordinal, {old_in, new_in, new_output, nullptr,
+                                              up ? lit_screen : unlit_screen}, got,
+                              false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+            const auto stage = static_cast<FlickerStage>(got.flicker_stage);
+            std::printf("trace expected=%u reversal=%u layout=%u actual=%s\n", first + 1, reverse, got.centered_layout, na::referee::StageName(stage));
+            CHECK(got.flicker_stage == (reverse ? first + 1 : 0));
+        }
+    }
+    TracePair rejected{t_output.Get(), t_screen.Get(), false, 62};
+    Sleep(150);
+    REQUIRE(TakeSample(d, l, ordinal, {unlit_in.Get(), unlit_in.Get(), t_output.Get(), nullptr, lit_display.Get()},
+                       got, false, nullptr, nullptr, false, false, false, false, 0, false, &rejected));
+    CHECK(rg::GetStats().trace_pairs == 8 && rg::GetStats().trace_reversals == 4 && rg::GetStats().rejected_presents == 1);
+    {
+        using namespace na::referee;
+        TrialSample measured;
+        CHECK(!rg::TakeTrialSample(rejected.ticket, measured));
+        // Even with an independently proved reader, identical input and
+        // output pixels give no evidence about which reached the screen.
+        TracePair identical{t_output.Get(), t_screen.Get(), true, 2051, 70};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {unlit_in.Get(), unlit_in.Get(), t_output.Get(), nullptr, t_screen.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 9991, false, &identical));
+        REQUIRE(rg::TakeTrialSample(identical.ticket, measured));
+        CHECK(!measured.delivered && !measured.bypassed);
+        TracePair unacknowledged{t_output.Get(), t_screen.Get(), true, 2059, 70, false};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, t_screen.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 9992, false, &unacknowledged));
+        CHECK(!rg::TakeTrialSample(unacknowledged.ticket, measured));
+        TracePair resized{t_output.Get(), t_screen.Get(), true, 2067, 70};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, t_screen.Get()},
+                           got, false, nullptr, nullptr, false, false, false, false, 9993, false, &resized));
+        rg::InvalidatePresentation(&d);
+        CHECK(!rg::TakeTrialSample(resized.ticket, measured));
+        // Seed the second reader at its usual frame parity. A new pair can
+        // start at the first reader and still needs the second reader's image.
+        const uint64_t first_reader = 10001;
+        const Images rotating{t_input.Get(), t_input.Get(), t_output.Get(), nullptr, unlit_padded.Get()};
+        TracePair established{t_output.Get(), unlit_padded.Get(), true, 7363, 70};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, rotating, got, false, nullptr, nullptr, false, false, false, false,
+                           first_reader + 1, false, &established));
+        REQUIRE(rg::TakeTrialSample(established.ticket, measured));
+        CHECK(measured.comparable && measured.delivered);
+        TracePair handoff{t_output.Get(), unlit_padded.Get(), true, 7371, 70};
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, rotating, got, false, nullptr, nullptr, false, false, false, false,
+                           first_reader, true, &handoff));
+        REQUIRE(rg::TakeTrialSample(handoff.ticket, measured));
+        CHECK(measured.ordinal == ordinal && measured.comparable && measured.delivered);
+        // A stable left-side bypass has no flicker amplitude. Sample the real GPU mailbox
+        // against the same input/output textures and a tone-mapped, split final screen.
+        auto split_bytes = shows_output;
+        for (unsigned y = 0; y < rs::kH; ++y)
+            for (unsigned x = 0; x < rs::kW / 2; ++x)
+                split_bytes[y * rs::kW + x] = shows_input[y * rs::kW + x];
+        const auto small_overlay = [&](unsigned mode) {
+            auto bytes = shows_output;
+            for (int y = TileTop(0, rs::kH); y < TileTop(0, rs::kH) + int(kTile); ++y)
+                for (int x = TileLeft(0, rs::kW); x < TileLeft(0, rs::kW) + int(kTile); ++x) {
+                    const auto i = size_t(y) * rs::kW + x;
+                    bytes[i] = mode == 0 ? shows_input[i] : mode == 1 ? uint8_t((3 * shows_output[i] + 80) / 4) : 113;
+                }
+            return ScreenTexture(d, l, bytes, keep);
+        };
+        auto raw_patch = small_overlay(0), translucent = small_overlay(1), covered = small_overlay(2);
+        auto split = ScreenTexture(d, l, split_bytes, keep);
+        REQUIRE(split);
+        Run(d, l);
+        keep.clear();
+        for (unsigned mode = 0; mode < 5; ++mode) {
+            ID3D12Resource* displayed[] = {raw_patch.Get(), translucent.Get(), covered.Get(), t_screen_input.Get(), t_screen.Get()};
+            TracePair trace{t_output.Get(), displayed[mode], true, 6995, 72};
+            Sleep(150);
+            REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, displayed[mode]}, got,
+                               false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+            REQUIRE(rg::TakeTrialSample(trace.ticket, measured));
+            std::printf("regional control %u: input=%02x output=%02x confirmed=%02x\n", mode,
+                        unsigned(measured.tiles.input), unsigned(measured.tiles.output), unsigned(measured.tiles.confirmed_input));
+            CHECK(measured.tiles.Mixed() == (mode == 0));
+            if (mode == 0) CHECK(measured.tiles.confirmed_input == 1);
+            if (mode == 1) CHECK(measured.delivered && (measured.tiles.output & 1));
+            if (mode == 2) CHECK(measured.delivered && !((measured.tiles.input | measured.tiles.output) & 1));
+            if (mode >= 3) CHECK(mode == 3 ? measured.bypassed : measured.delivered);
+        }
+        PlacementTrial regional;
+        const PlacementTrial::Scope scope{1, 2, 3, 1};
+        TracePair nomination{t_output.Get(), split.Get(), true, 714, 711};
+        nomination.alternate = PlacementPath::Between;
+        Sleep(150);
+        REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, split.Get()}, got,
+                           false, nullptr, nullptr, false, false, false, false, 0, false, &nomination));
+        REQUIRE(rg::TakeTrialSample(nomination.ticket, measured));
+        REQUIRE(regional.Begin(scope, measured, ordinal, GetTickCount64()));
+        for (unsigned arm = 0; arm < 3; ++arm) {
+            ordinal += RouteTrial::warmup_frames + 1;
+            const auto ticket = regional.Ticket(ordinal);
+            REQUIRE(ticket);
+            for (unsigned i = 0; i < RouteTrial::samples; ++i) {
+                auto* displayed = arm == 1 ? t_screen.Get() : split.Get();
+                TracePair trace{t_output.Get(), displayed, true, ticket, 711};
+                trace.path = arm == 1 ? PlacementPath::Between : PlacementPath::Inline;
+                trace.alternate = arm == 1 ? PlacementPath::None : PlacementPath::Between;
+                Sleep(150);
+                REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), t_output.Get(), nullptr, displayed}, got,
+                                   false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+                REQUIRE(rg::TakeTrialSample(ticket, measured));
+                if (!i) std::printf("regional arm %u: input=%02x output=%02x comparable=%u\n",
+                                    arm, unsigned(measured.tiles.input), unsigned(measured.tiles.output), unsigned(measured.comparable));
+                CHECK(arm == 1 ? measured.delivered : measured.tiles.Mixed());
+                regional.Tick(GetTickCount64(), true);
+                regional.Add(scope, ticket, measured, ordinal, GetTickCount64());
+            }
+        }
+        CHECK(regional.Comparison().Regional() && regional.Comparison().Current() == RouteTrial::Phase::Kept);
+        // The test reflector alternates about one stop. The alternative either
+        // removes it, delivers the same artifact, or puts the input on screen.
+        for (unsigned mode = 0; mode < 3; ++mode) {
+            PlacementTrial placement;
+            using Phase = RouteTrial::Phase;
+            const auto& trial = placement.Comparison();
+            TracePair reflection{t_output.Get(), t_screen.Get(), true, 952 + mode * 8u, 70};
+            Sleep(150);
+            REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), lit_out.Get(), nullptr, lit_display.Get()},
+                               got, false, nullptr, nullptr, false, false, false, false, 0, false, &reflection));
+            REQUIRE(rg::TakeTrialSample(reflection.ticket, measured));
+            CHECK(measured.delivered && !measured.tiles.Mixed());
+            REQUIRE(placement.Begin(scope, measured, ordinal, GetTickCount64()));
+            for (unsigned arm = 0; arm < 3 && trial.Active(); ++arm) {
+                ordinal += RouteTrial::warmup_frames + 1;
+                const auto ticket = placement.Ticket(ordinal);
+                REQUIRE(ticket);
+                const bool quiet = arm == 1 && mode == 0;
+                const bool bypass = arm == 1 && mode == 2;
+                for (unsigned i = 0; i < RouteTrial::samples && placement.Ticket(ordinal) == ticket; ++i) {
+                    const bool reverse = i % 2 != 0;
+                    TracePair trace{!quiet && reverse ? lit_out.Get() : t_output.Get(),
+                                    !quiet && reverse ? lit_display.Get() : t_screen.Get(), true, ticket, 70};
+                    Sleep(150);
+                    REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(),
+                                      !quiet && !reverse ? lit_out.Get() : t_output.Get(),
+                                      nullptr, bypass ? t_screen_input.Get() :
+                                      !quiet && !reverse ? lit_display.Get() : t_screen.Get()}, got,
+                                      false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+                    CHECK(!rg::TakeTrialSample(ticket ^ 8u, measured));
+                    REQUIRE(rg::TakeTrialSample(ticket, measured));
+                    CHECK(measured.ordinal == ordinal && measured.configuration == 70);
+                    CHECK(measured.delivered != bypass && measured.bypassed == bypass);
+                    CHECK(!rg::TakeTrialSample(ticket, measured));
+                    placement.Add(scope, ticket, measured, ordinal, GetTickCount64());
+                }
+            }
+            std::printf("screen trial case %u: %s stops %.3f/%.3f/%.3f (%s)\n", mode, trial.Name(),
+                        trial.Baseline(), trial.Candidate(), trial.Confirmation(), trial.Reason());
+            CHECK(trial.Current() == (mode == 0 ? Phase::Kept : Phase::Rejected));
+            if (mode == 0) {
+                ordinal += RouteTrial::warmup_frames + 1;
+                const auto watch = placement.Ticket(ordinal);
+                REQUIRE(watch);
+                for (unsigned i = 0; i < 4; ++i) {
+                    const bool reverse = i % 2 != 0;
+                    TracePair trace{reverse ? lit_out.Get() : t_output.Get(),
+                                    reverse ? lit_display.Get() : t_screen.Get(), true, watch, 70};
+                    Sleep(150);
+                    REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_input.Get(), reverse ? t_output.Get() : lit_out.Get(),
+                                       nullptr, reverse ? t_screen.Get() : lit_display.Get()}, got,
+                                       false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+                    REQUIRE(rg::TakeTrialSample(watch, measured));
+                    placement.Add(scope, watch, measured, ordinal, GetTickCount64());
+                }
+                CHECK(trial.Current() == Phase::Rejected && !trial.UsesCandidate());
+            }
+        }
+    }
+    {
+        // The fixture controls a pre-DLAA lighting fault. Reducing bloom leaves
+        // it visible, and taking AO from the current frame removes it. The
+        // selector receives only the GPU's three image stages and receipts.
+        using namespace na::referee;
+        using Tool = RecoveryTool;
+        auto bright_input = input;
+        for (unsigned y = input.h / 2; y < input.h * 5 / 8; ++y)
+            for (unsigned x = input.w / 2; x < input.w * 5 / 8; ++x)
+                bright_input.v[size_t(y) * input.w + x] *= 1.8f;
+        auto input_up = Picture(d, l, bright_input, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+        REQUIRE(input_up);
+        Run(d, l);
+        keep.clear();
+        StageRecovery recovery;
+        recovery.SetScene({1, 2, rs::kW, rs::kH});
+        bool saw_bloom = false, saw_ambient = false;
+        unsigned direction = 0;
+        constexpr uint8_t available = Bit(Tool::Bloom) | Bit(Tool::AmbientHistory) | Bit(Tool::Sharpen);
+        for (unsigned i = 0; i < 42 && recovery.Comparison().Current() != RouteTrial::Phase::Kept; ++i) {
+            ordinal += RouteTrial::warmup_frames + 1;
+            const auto ticket = recovery.Ticket(ordinal);
+            REQUIRE(ticket);
+            const auto active = recovery.ToolInUse();
+            saw_bloom |= active == Tool::Bloom;
+            saw_ambient |= active == Tool::AmbientHistory;
+            const bool quiet = active == Tool::AmbientHistory;
+            const bool reverse = direction++ % 2 != 0;
+            const bool from_lit = !quiet && reverse, to_lit = !quiet && !reverse;
+            TracePair trace{from_lit ? lit_out.Get() : t_output.Get(), from_lit ? lit_display.Get() : t_screen.Get(),
+                            true, ticket, 981, true, available, Bit(active)};
+            if (i == 0) trace.main_tools = Bit(Tool::Sharpen); // one submission lacked both input controls
+            Sleep(150);
+            REQUIRE(TakeSample(d, l, ordinal, {from_lit ? input_up.Get() : t_input.Get(), to_lit ? input_up.Get() : t_input.Get(),
+                              to_lit ? lit_out.Get() : t_output.Get(), nullptr, to_lit ? lit_display.Get() : t_screen.Get()},
+                              got, false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
+            TrialSample sample;
+            REQUIRE(rg::TakeTrialSample(ticket, sample));
+            CHECK(sample.delivered && sample.comparable && sample.tools == (available & trace.main_tools));
+            if (!quiet) CHECK(sample.origin.stage == FlickerStage::Input && sample.origin.region == 36);
+            recovery.Tick(GetTickCount64());
+            recovery.Add(ticket, sample, ordinal + 1, GetTickCount64());
+        }
+        const auto& result = recovery.Comparison();
+        std::printf("staged recovery: failed bloom=%d excluded=%u tried ambient=%d phase=%s stops %.3f/%.3f/%.3f\n",
+                    saw_bloom, recovery.Excluded(), saw_ambient, result.Name(), result.Baseline(), result.Candidate(), result.Confirmation());
+        CHECK(saw_bloom && saw_ambient && recovery.Excluded() == Bit(Tool::Bloom));
+        CHECK(result.Current() == RouteTrial::Phase::Kept && recovery.ToolInUse() == Tool::AmbientHistory);
+    }
+    Sleep(150);
+    REQUIRE(rg::Wanted());
+    {
+        auto relit = input;
+        for (unsigned y = 0; y < relit.h; ++y)
+            for (unsigned x = 0; x < relit.w; ++x)
+                relit.v[size_t(y) * relit.w + x] *= ((x / 37 + y / 29) % 2) ? 2.f : .5f;
+        std::vector<float> still(motion.size(), 0.f);
+        auto t_lit = Picture(d, l, relit, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+        auto t_still = MotionTexture(d, l, still, keep);
+        REQUIRE(t_lit && t_still);
+        Run(d, l);
+        keep.clear();
+        REQUIRE(TakeSample(d, l, ordinal, {t_input.Get(), t_lit.Get(), t_output.Get(), t_still.Get(), t_screen.Get()}, got));
+        auto measured = na::referee::Score({got.data.data(), got.screen, got.tiles, got.pair, got.jitter_change});
+        const auto ref = rs::Expected(input, relit, output, rs::ScreenImage(shows_output), still);
+        const auto expected = na::referee::Score({ref.data(), true, true, true, got.jitter_change});
+        std::printf("patchy light: compatible=%u unresolved=%u pattern=%u of %u still points\n",
+                    measured.light_compatible, measured.ambiguous_still, measured.changed_still, measured.still_points);
+        CHECK(measured.light_compatible == expected.light_compatible && measured.changed_still == expected.changed_still);
+        // A patch crossing two differently lit materials genuinely changes shape. Compare
+        // against the known light field on the interiors, after the normal jitter gate.
+        unsigned interiors = 0;
+        const auto* light_samples = got.data.data() + na::referee::BlockOffset(na::referee::kPoints);
+        for (unsigned j = 0; j < na::referee::kGridH; ++j) for (unsigned i = 0; i < na::referee::kGridW; ++i) {
+            const int x = int(na::referee::PointX(i, relit.w)), y = int(na::referee::PointY(j, relit.h));
+            if ((x - 1) / 37 != (x + 1) / 37 || (y - 1) / 29 != (y + 1) / 29) continue;
+            const float* p = light_samples + (j * na::referee::kGridW + i) * na::referee::kPointValues;
+            if (p[na::referee::kContrast] < .03f || p[na::referee::kStill] <= .08f ||
+                p[measured.placement] <= .8f * p[na::referee::kStill]) continue;
+            const double gain = ((x / 37 + y / 29) % 2) ? 2. : .5;
+            double deltas[9]{}, mean = 0;
+            unsigned n = 0;
+            for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
+                const double v = (std::max)(0., double(input.At(x + dx, y + dy)));
+                const double floor = na::referee::kLumaFloor;
+                if ((std::max)(v, v * gain) + floor <= 1. / 1024) continue;
+                deltas[n] = std::log2((v * gain + floor) / (v + floor));
+                mean += deltas[n++];
+            }
+            if (n < 5) { CHECK(p[na::referee::kStillStructure] < 0); continue; }
+            mean /= n;
+            double residual = 0;
+            for (unsigned k = 0; k < n; ++k) residual += std::fabs(deltas[k] - mean);
+            residual /= n;
+            CHECK(std::fabs(p[na::referee::kStillStructure] - residual) < .002);
+            if (residual <= (std::min)(.04, .25 * p[na::referee::kStill])) ++interiors;
+        }
+        CHECK(interiors > 3000 && measured.light_compatible >= interiors);
+    }
     Sleep(150);
     REQUIRE(rg::Wanted());
     rg::Evaluation discarded;

@@ -1,5 +1,6 @@
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/j2/flow_shaders.hpp"
+#include "host_dx12/settings.hpp"
 #include "host_dx12/ffx_flow/ffx_flow.hpp"
 #include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
 #include "host_dx12/nvof/flow_expand.hpp"
@@ -17,7 +18,7 @@
 #include <cstring>
 
 namespace na::j2::compute_flow {
-std::atomic<uint32_t> g_loosen{50}; // SetLoosen; read at each Record
+std::atomic<uint32_t> g_loosen{settings::kObjectFlowLoosen}; // tests can exercise other thresholds
 std::atomic<bool> g_candidates{true}; // SetFrameCandidates; read at each Record
 std::atomic<bool> g_screen_fit{true}; // SetScreenFit; read at each Record
 using Microsoft::WRL::ComPtr;using Lease=na::nr::native::RecordingLease;
@@ -381,7 +382,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         // cannot measure, and the search's raw vector is never handed on. Cort's Sniper Elite
         // Resistance run of 2026-11-17 (3621e3a8): about two thirds of a real frame is in that case.
         ID3D12Resource* model=nullptr;
-        stats.screen_on=c->pso_fit_solve && g_screen_fit.load(std::memory_order_relaxed);
+        stats.screen_on=c->pso_fit_solve && f.use_screen_fit && g_screen_fit.load(std::memory_order_relaxed);
         if(ok && stats.screen_on){
             const na::motion::screen::Params fp;
             Constants fc=cb;

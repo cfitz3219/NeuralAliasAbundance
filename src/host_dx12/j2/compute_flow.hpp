@@ -23,6 +23,7 @@ struct Frame {
     // motion is measured on the two pictures (flow_shaders.hpp `measure`, core/total_motion.hpp)
     // and handed on as TOTAL motion in Tier3::total / total_valid. `residual` is ignored.
     bool total=false;
+    bool use_screen_fit=true; // local to this recording; direct measurements still run
     // total only: the newest frame already submitted with a DLSS reset (0 = none yet). A scene cut
     // measured on a later pair than that makes Record ask for a reset through Ticket::cut_reset.
     uint64_t last_reset_frame=0;

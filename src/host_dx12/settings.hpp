@@ -20,6 +20,9 @@
 
 namespace na::settings {
 
+// Live DLAA keeps the former slider at its 50% setting for all game profiles.
+inline constexpr uint32_t kObjectFlowLoosen = 50;
+
 enum class DlssMode : uint32_t {
     DLAA = 0,         // 100% â€” render at output resolution
     Quality = 1,      // 66.7%
@@ -82,7 +85,6 @@ struct Settings {
     // Render-small HUD: 0 = the HUD goes through DLSS with the scene; 1..100 = HUD pixels are
     // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
     std::atomic<uint32_t> j2_hud_nis{50};
-    std::atomic<uint32_t> j2_flow_loosen{50}; // J2 moving-object flow: 0 = the original acceptance rules, 100 = loosest (Cort 2026-11-03)
     std::atomic<uint32_t> j2_jitter_r2{0}; // jitter sequence: 0 Halton 2,3 (default), 1 R2; [j2] jitter_sequence; live
     std::atomic<uint32_t> aniso16{0}; // anisotropic filtering level on the game's surface textures: 0 off, 4, 8, 16; [j2] anisotropic; read at game start
     // J2 texture detail in effect at full resolution, x 100: a mirror of the choice below, written at
@@ -124,12 +126,6 @@ struct Settings {
     // Draw replay ([j2] draw_replay, 1 = on): per-object motion from the game's own draws replayed with
     // stream output, fed as engine motion (Cort 2026-11-06, SE5 sweatshirt smear). Off by default (Cort).
     std::atomic<uint32_t> j2_draw_replay{0};
-    // Depth reads ([j2] depth_reads, 1 = on): while viewport jitter supplies the samples, the game's own
-    // shader reads of the scene depth get the depth with the jitter taken back out (Cort's Sniper Elite
-    // Resistance run on 7933efc, 2026-11-18: a far ground mark and a lamp's pool of light switched with
-    // the jitter sample). Depth tests and DLSS keep the game's depth. Live, saved per game.
-    // Off by default until it has run in a game on Cort's screen; then on for every game.
-    std::atomic<uint32_t> j2_depth_reads{0};
     // Expanded vertices draw replay may run again per frame ([j2] replay_vertex_budget, 0 = no budget).
     // 3 million a frame cost about 10 ms on an RTX 5070 Ti at 3440x1440 (Cort's Resistance run, 2026-11-17).
     std::atomic<uint32_t> j2_replay_budget{1000000};

@@ -25,6 +25,10 @@ def image(folder, meta, name, width, height):
 def luma(rows, fmt, width, height):
     if rows is None:
         return None
+    if fmt == 10:
+        rgba = rows.view("<f2").reshape(height, width, 4)
+        return sum(rgba[..., channel].astype("<f4") * weight
+                   for channel, weight in enumerate((.2126, .7152, .0722)))
     rgb = rows.view("<f4").reshape(height, width, 4)[..., :3] if fmt == 2 else colour(rows, fmt)[0]
     if rgb is None:
         return None
@@ -49,7 +53,10 @@ def write_frame(stream, folder, meta, control):
     screen = None
     if (meta.get("frame_closed") and meta.get("present_closed_frame") == ordinal
             and meta.get("present_pairing") == "overlay_present"):
-        screen = luma(*image(folder, meta, "present", width, height), width, height)
+        desc = next((p for p in meta["planes"] if p["name"] == "present"), None)
+        if desc and 0 < desc["width"] <= 8192 and 0 < desc["height"] <= 8192:
+            dims = (desc["width"], desc["height"])
+            screen = luma(*image(folder, meta, "present", *dims), *dims)
     if screen is not None:
         if control == "bypass" or (control == "alternating" and meta["index"] % 2):
             screen = color
@@ -64,12 +71,16 @@ def write_frame(stream, folder, meta, control):
     view = meta.get("view", {})
     route = meta.get("route", 0)
     flags = int(have_screen) | (int(motion is not None) << 1) | (int(bool(meta.get("reset"))) << 2)
+    if have_screen and screen.shape != (height, width):
+        flags |= 8
     stream.write(struct.pack(
         "<5Q5I4f", ordinal, view.get("color", 0), view.get("depth", 0),
         meta.get("referee_boundary", meta.get("insertion_signature", 0)), meta.get("history_generation", 0),
         route if route in (1, 2) else 0, view.get("color_sub", 0), width, height, flags,
         *meta.get("jitter_px", (0, 0)), *meta.get("mv_scale", (1, 1)),
     ))
+    if flags & 8:
+        stream.write(struct.pack("<2I", screen.shape[1], screen.shape[0]))
     stream.write(color.tobytes())
     if have_screen:
         stream.write(output.tobytes())

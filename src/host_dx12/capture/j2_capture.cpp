@@ -446,9 +446,9 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, cons
     return static_cast<uint32_t>(s - g.slots) + 1;
 }
 
-void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission)
+void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission, uint8_t tools, uint8_t applied)
 {
-    na::referee::gpu::Submitted(token >> kRefereeShift, queue);
+    na::referee::gpu::Submitted(token >> kRefereeShift, queue, tools, applied);
     token &= kOwnMask;
     if (!token) return;
     std::lock_guard<std::mutex> lock(g.m);

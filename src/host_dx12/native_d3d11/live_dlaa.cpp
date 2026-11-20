@@ -2,6 +2,7 @@
 #include "shared_resources.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
+#include "host_dx12/diag/referee_recovery.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/capture/frame_capture.hpp"
@@ -315,8 +316,9 @@ bool FailSession(Session& s, const char* why)
 
 void SyncCameraUse()
 {
-    native11::SetDepthReads(settings::Get().j2_depth_reads.load(std::memory_order_relaxed) != 0);
-    native11::SetEvaluationPaused(!j2::Enabled() || j2::Paused());
+    const bool paused = !j2::Enabled() || j2::Paused();
+    native11::SetEvaluationPaused(paused);
+    native11::SetDepthReads(!paused && j2::Jitter());
     const int setting = settings::Get().j2_camera.load(std::memory_order_relaxed);
     native11::SetCameraUse(setting == 0 ? native11::CameraUse::Off : setting == 2 ? native11::CameraUse::Required
                                                                                 : native11::CameraUse::Optional);
@@ -395,6 +397,21 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // on that frame and would ask for a reset that the measured motion does not need.
     const bool measured = camera_setting != 2 &&
         (!cam.valid || (cam.camera_cut && s.measured_last && frame.frame == s.last_frame + 1 && !frame.scene_changed));
+    using Tool = referee::RecoveryTool;
+    const auto lighting = donut::CurrentOptions();
+    const uint32_t preset = settings::Get().j2_preset.load();
+    const auto configuration = [&] {
+        return referee::EvaluationConfiguration(preset == 255 ? 12u : preset, cf, df, hdr, frame.reversed_depth,
+            camera_setting, measured, j2::Jitter(), j2::flow::Enabled());
+    };
+    // Settings changes take precedence even between GPU observations.
+    const Tool tool = frame.recovery_tool != Tool::None && settings::Get().referee_enabled.load() &&
+        frame.recovery_configuration == configuration() ? frame.recovery_tool : Tool::None;
+    uint8_t recorded_tools = 0, applied_tool = 0;
+    const auto recorded = [&](Tool alternative) {
+        recorded_tools |= referee::Bit(alternative);
+        if (alternative == tool) applied_tool |= referee::Bit(alternative);
+    };
     observe::HostWorkScope own;
     if (!s.native && !Start(s, native.Get())) {
         // Says WHY: on the companion route the companion's own reason is the useful one.
@@ -482,9 +499,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         // Measured: the sample is exactly known on every frame (zero when none was applied), so an
         // unjittered first picture pairs with the jittered one after it.
         ff.raster_sample = true; ff.raster_confirmed = measured || frame.raster.applied;
+        ff.use_screen_fit = tool != Tool::ScreenFit;
         ff.total = measured; ff.last_reset_frame = s.last_reset_frame;
         j2::compute_flow::Tier3 tier;
-        j2::compute_flow::SetLoosen(settings::Get().j2_flow_loosen.load());
         flow = j2::compute_flow::Record(list, s.queue.Get(), slot.color.Effects(), shared_depth, in, ff, tier);
         if (measured) {
             if (!flow.context || (flow.pair && !tier.total)) {
@@ -501,6 +518,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                 // TOTAL motion, labelled as estimated (never as the game's own), in the slot that stands
                 // behind tier 1 (motion_arbiter.hpp EstimatedInput): the same slot the DX12 host uses, so
                 // a tier-1 supplier added here later covers its own pixels and cannot erase the rest.
+                if (tier.screen_model || (tool == Tool::ScreenFit && tier.total_valid)) recorded(Tool::ScreenFit);
                 in.estimated_valid_flag = true;
                 in.estimated_motion = tier.total; in.estimated_valid = tier.total_valid;
                 if (flow.cut_reset && !reset_history) {
@@ -525,9 +543,16 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         }
     }
     motion::gpu::Outputs motion_out{slot.motion.Get(), slot.provenance.Get(), nullptr, ci.width, ci.height};
-    if (!s.arbiter.Dispatch(list, in, motion_out, index)) {
+    motion::gpu::RecordedSuppliers suppliers;
+    in.prefer_camera_without_residual = tool == Tool::CameraResidual;
+    if (!s.arbiter.Dispatch(list, in, motion_out, index, &suppliers)) {
         list->Close();
         return Skip(measured ? "Measured motion could not be recorded." : "Camera motion could not be recorded.");
+    }
+    if (suppliers.camera_with_residual_available) recorded(Tool::CameraResidual);
+    if (!suppliers.estimated) {
+        recorded_tools &= uint8_t(~referee::Bit(Tool::ScreenFit));
+        applied_tool &= uint8_t(~referee::Bit(Tool::ScreenFit));
     }
     Barrier(list, slot.motion.Get(), kWrite, kRead);
     dlss::EvalDesc eval{};
@@ -547,8 +572,15 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         // Ambient shading rebuilds positions from the depth: that needs the camera's projection.
         if (measured) xegtao::ScenePass().Unavailable("Ambient shading needs the scene camera; this frame has none.");
         else if (xegtao::FromViewProjection(column.data(), ai.projection)) {
-            slot.ambient = xegtao::ScenePass().Prepare(s.device.Get(), s.queue.Get(), ai, xegtao::CurrentOptions());
-            if (slot.ambient && slot.ambient->Record(list)) eval.color = slot.ambient->Color();
+            auto options = xegtao::CurrentOptions();
+            const bool history_requested = options.temporal > 0;
+            if (tool == Tool::AmbientHistory) options.temporal = 0;
+            slot.ambient = xegtao::ScenePass().Prepare(s.device.Get(), s.queue.Get(), ai, options);
+            if (slot.ambient && slot.ambient->Record(list)) {
+                eval.color = slot.ambient->Color();
+                if (history_requested && (tool == Tool::AmbientHistory ||
+                    slot.ambient->CompositedVisibility() != slot.ambient->Occlusion())) recorded(Tool::AmbientHistory);
+            }
         } else xegtao::ScenePass().Unavailable("Waiting for supported native camera geometry.");
     }
     eval.depth = shared_depth;
@@ -562,17 +594,20 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     eval.jitter_x = in.jitter_current_px[0];
     eval.jitter_y = in.jitter_current_px[1];
     eval.reset = reset_history;
-    const uint32_t preset = settings::Get().j2_preset.load();
     eval.preset = preset == 255 ? 12 : preset;
     constexpr uint64_t kNativeView = 0x4e41544956453131ull;
     eval.view_id = kNativeView;
-    const auto lighting = donut::CurrentOptions();
     if (lighting.tone || lighting.bloom) {
         donut::Inputs gi;
         gi.color = eval.color; gi.format = cf; gi.width = ci.width; gi.height = ci.height;
         gi.srgb = !hdr; gi.reset = reset_history; gi.stream = kNativeView;
-        slot.grade = donut::ScenePass().Prepare(s.device.Get(), s.queue.Get(), gi, lighting);
-        if (slot.grade && slot.grade->Record(list)) eval.color = slot.grade->Color();
+        auto options = lighting;
+        if (tool == Tool::Bloom) options.bloom_amount *= .5f;
+        slot.grade = donut::ScenePass().Prepare(s.device.Get(), s.queue.Get(), gi, options);
+        if (slot.grade && slot.grade->Record(list)) {
+            eval.color = slot.grade->Color();
+            if (options.bloom && options.bloom_amount > 0) recorded(Tool::Bloom);
+        }
     }
     // Companion route: this recording ends here with every shared image handed back in the common
     // state, DLSS runs in the companion at submission, and the rest of the frame is recorded into
@@ -630,9 +665,11 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.reset = eval.reset;
         id.dlss_mv_jittered = eval.mv_jittered;
         id.dlss_mv_lowres = !eval.mv_display_res;
-        const referee::shadow::Context identity{
+        referee::shadow::Context identity{
             {referee::shadow::Path::Native11, static_cast<uint64_t>(frame.boundary)},
             frame.color.incarnation, frame.depth.incarnation, frame.scene_stream, csub, 0, 0, frame.screen_proof};
+        identity.trial_ticket = frame.trial_ticket;
+        if (identity.trial_ticket) identity.trial_configuration = configuration();
         capture_token = capture::j2::RecordReferee(list, planes, id, eval.render_w, eval.render_h, eval.out_w, eval.out_h, identity);
     } else if (evaluated && eval.reset) {
         referee::gpu::NotifyEvaluationReset();
@@ -674,7 +711,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.camera_cut = !measured && cam.camera_cut;
         id.cut_reason = measured ? 0u : static_cast<uint32_t>(cam.cut_reason);
         id.flow_ran = in.tier3_valid_flag || in.tier1_valid_flag || in.estimated_valid_flag;
-        id.flow_loosen = settings::Get().j2_flow_loosen.load();
+        id.flow_loosen = settings::kObjectFlowLoosen;
         id.flow_jitter_x = flow.frame.jitter[0];
         id.flow_jitter_y = flow.frame.jitter[1];
         id.flow_jitter_convention = flow.colour_convention;
@@ -701,13 +738,14 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // The menu value is 0..100; the RCAS pass takes 0..200 (100 = standard RCAS). The DX12 host
     // doubles it at every call site; without that the slider's top was plain RCAS and its upper,
     // stronger half was unreachable (p37752: 0 and 100 looked alike).
-    const uint32_t sharpness = 2u * settings::Get().j2_sharpness.load();
+    const uint32_t sharpness = (tool == Tool::Sharpen ? 1u : 2u) * settings::Get().j2_sharpness.load();
     if (evaluated && sharpness) {
         Barrier(list, slot.output.Effects(), kWrite, kRead);
         Barrier(list, slot.color.Effects(), kRead, kWrite);
         if (j2::RecordNativeRcas(s.device.Get(), list, slot.output.Effects(), slot.color.Effects(), shared_depth,
                                  ci.width, ci.height, sharpness, cf, index, frame.reversed_depth)) {
             result = slot.color.Native();
+            recorded(Tool::Sharpen);
             sharpened = sharpness / 2; // reported on the menu scale
         }
         Barrier(list, slot.output.Effects(), kRead, kCommon);
@@ -780,7 +818,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     dlss::OnExecuted(s.queue.Get(), 1, lists);
     if (capture_token) {
-        capture::j2::Submitted(capture_token, s.queue.Get(), frame.frame);
+        capture::j2::Submitted(capture_token, s.queue.Get(), frame.frame, recorded_tools, applied_tool);
         if (capture::j2::NeedsPresentCapture(capture_token))
             evaluation_capture_pending.store(true, std::memory_order_release);
     }
@@ -830,7 +868,8 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue, co
         uint64_t native_done = 0, effects_done = 0;
     };
     static auto* state = new std::unique_ptr<PresentCopy>;
-    const referee::gpu::Presentation frame{receipt.ordinal, swap, receipt.scene, receipt.submitted, true};
+    referee::gpu::Presentation frame{receipt.ordinal, swap, receipt.EligibleForDlaa(), receipt.submitted, true};
+    frame.await_result = true;
     const bool witness = referee::gpu::NeedsScreen(frame);
     ComPtr<ID3D12CommandQueue> evaluation_queue;
     if (witness || eval || burst) {

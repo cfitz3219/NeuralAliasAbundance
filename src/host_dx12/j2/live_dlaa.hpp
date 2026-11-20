@@ -192,6 +192,7 @@ struct NativeBridgeStats {
     // best consecutive run), producer-order refusals, deliveries whose target was
     // written again later in the same list, and every refusal reason with its count.
     uint64_t delivered=0,first_delivery_frame=0,streak=0,best_streak=0,order_refused=0,later_written=0;
+    uint64_t lighting_reader = 0;
     char refusals[1300]{};
     char probe[320]{}; // delivery probe: sessions, pairs, per-point follow/invert/flat, verdict
     char stages[480]{}; // Quality route stage counts, furthest stage reached and its stop reason
@@ -206,11 +207,13 @@ void NativeTraceResult(char* out,size_t n,uint64_t* traces);
 // texels of the presented image (PRESENT state) with `exec` (unhooked; null = direct).
 void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame,
                         void(__stdcall* exec)(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*),
-                        uint64_t ordinal = 0, const void* source = nullptr);
+                        uint64_t ordinal = 0, const void* source = nullptr, bool await_result = false);
+void NativeProbeResult(const void* source, uint64_t ordinal, bool accepted);
 // Starts one probe session (24 marked deliveries) now, as an armed J2 capture does.
 void RequestDeliveryProbe();
 // Tests: presents between re-verifying traces once a crossing is learned (default 900).
-void SetNativeTraceIntervalForTests(uint32_t presents);
+void SetNativeTraceIntervalForTests(uint32_t presents, bool inspect_lighting = false);
+bool StartVerifiedLightingArmForTests();
 // Quality stability gate: consecutive deliverable frames before DLSS is written (default 30).
 void SetQualityWarmupForTests(uint32_t frames);
 // P4-4 no-slider route (Astra's Layer2, contract agreed on COMMS 2026-11-01): an optional

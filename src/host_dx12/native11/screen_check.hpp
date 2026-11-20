@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host_dx12/capture/screen_marker.hpp"
+#include "core/referee.hpp"
 #include "host_dx12/native11/frame_model.hpp"
 #include "host_dx12/j2/post_entry.hpp"
 
@@ -22,11 +23,9 @@ class ScreenCheck {
 
     // Every location changes polarity on both frame parities. A fixed edge or
     // an alternating post-process cannot substitute for the challenge pattern.
-    static constexpr std::array<UINT, screen_marker::kSession> kPatterns{0, 7, 5, 2, 3, 4, 6, 1};
-
     static bool FirstIsHigh(UINT sample, UINT pair)
     {
-        return (kPatterns[sample] & (1u << pair)) != 0;
+        return (screen_marker::kPatterns[sample] & (1u << pair)) != 0;
     }
 
 public:
@@ -146,13 +145,13 @@ public:
         return false;
     }
 
-    bool RejectProof(uint64_t proof)
+    bool RejectProof(uint64_t proof, uint64_t frame)
     {
         if (!proof) return false;
         const auto match = std::find_if(routes_.begin(), routes_.end(),
             [proof](const Route& route) { return route.proof == proof; });
         if (match != routes_.end()) {
-            Reject(match->reader);
+            Defer(match->reader, frame);
             routes_.erase(match);
             if (routes_.empty()) {
                 steering_ = false;
@@ -161,7 +160,7 @@ public:
             return true;
         }
         if (!verified_ || proof != proof_) return false;
-        RetireVerified();
+        RetireVerified(frame);
         return true;
     }
     bool MayInspect() const
@@ -169,6 +168,10 @@ public:
         return adaptive_ || verified_ || (!ordinary_this_frame_ && ordinary_gaps_ >= kOrdinaryGrace);
     }
     bool AwaitingSamples() const { return !!candidate_; }
+    void CancelChallenge() { if (candidate_) ResetAttempt(); }
+    // A rotating scene owner supplies its own completed-frame qualification.
+    // Reuse the same asynchronous reader challenge and independent proof IDs.
+    void IndependentReaders() { adaptive_ = true; }
     uint64_t Confirmed() const { return confirmed_; }
     uint64_t Refuted() const { return refuted_; }
     uint64_t Paired() const { return paired_; }
@@ -183,7 +186,9 @@ public:
             frame - last_marked_ >= 2 * screen_marker::kSession) ResetAttempt();
         const auto& rejected = adaptive_ ? rejected_ : legacy_rejected_;
         if (verified_ || marked_ || (adaptive_ && frame_proof_) ||
-            std::find(rejected.begin(), rejected.end(), reader) != rejected.end()) return {};
+            std::any_of(rejected.begin(), rejected.end(), [&](const Retry& retry) {
+                return retry.reader == reader && frame < retry.after;
+            })) return {};
         if (candidate_ && !(reader == candidate_)) return {};
         if (candidate_ && !seen_) {
             seen_ = true;
@@ -213,6 +218,8 @@ public:
         }
 
         candidate_ = reader;
+        marker_width_ = desc.Width;
+        marker_height_ = desc.Height;
         if (!issued_) opened_ = frame;
         Mark mark{source, original_, Points(desc.Width, desc.Height)};
         CopyPoints(context, source, original_.Get(), mark.rects);
@@ -258,8 +265,17 @@ public:
         }
     }
 
+    void PresentResult(uint64_t frame, bool accepted)
+    {
+        for (auto& slot : slots_) {
+            if (!slot.pending || slot.frame != frame) continue;
+            if (accepted) slot.awaiting_result = false;
+            else slot.pending = false;
+        }
+    }
+
     const char* Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
-                        uint32_t scene_draws, bool attempted)
+                        uint32_t scene_draws, bool attempted, bool await_result = false)
     {
         const auto finish = [&](const char* outcome) {
             ResetFrame();
@@ -293,7 +309,7 @@ public:
             }
             if (!truncated_) entries_.Observe(sequence_, true, frame);
             if (frame_proof_ && delivery_epoch_ != epoch_) {
-                RejectProof(frame_proof_);
+                RejectProof(frame_proof_, frame);
                 if (marked_ && (marked_epoch_ != epoch_ || truncated_)) ResetAttempt();
                 else marked_ = false;
                 return finish("adaptive_later_scene_write");
@@ -301,7 +317,7 @@ public:
             // The candidate may be absent on a different draw order. Only
             // its own sampled frames can qualify or disprove it.
             if (marked_ && (marked_epoch_ != epoch_ || truncated_)) {
-                Reject(candidate_);
+                Defer(candidate_, frame);
                 ResetAttempt();
                 return finish("adaptive_candidate_mid_scene");
             }
@@ -324,7 +340,7 @@ public:
             const bool overwritten = delivered_this_frame_ && scene_draws != delivered_draws_;
             delivered_this_frame_ = false;
             if (overwritten || (missed && recent_miss_)) {
-                RetireVerified();
+                RetireVerified(frame);
                 return finish("lost_coverage");
             }
             if (missed) recent_miss_ = screen_marker::kSession;
@@ -335,7 +351,7 @@ public:
         // Only a reader seen at the right point on every scene frame can earn
         // control. The staging samples may finish later than those draws.
         if (!adaptive_ && scene_draws && (!seen_ || reader_draws_ != scene_draws)) {
-            Reject(candidate_);
+            Defer(candidate_, frame);
             ResetAttempt();
             return finish("intermittent");
         }
@@ -352,10 +368,20 @@ public:
                 }
                 if (slot->image) {
                     CopyPoints(context, screen, slot->image.Get(), Points(desc.Width, desc.Height));
+                    slot->layouts = na::referee::PaddedLayouts(marker_width_, marker_height_, desc.Width, desc.Height);
+                    for (UINT layout = 0; layout < slot->layouts; ++layout) {
+                        const UINT dx = desc.Width - marker_width_, dy = desc.Height - marker_height_;
+                        const LONG x = LONG(dx / 2 + layout % (1 + (dx & 1)));
+                        const LONG y = LONG(dy / 2 + layout / (1 + (dx & 1)));
+                        auto points = Points(marker_width_, marker_height_);
+                        for (auto& r : points) { r.left += x; r.right += x; r.top += y; r.bottom += y; }
+                        CopyPoints(context, screen, slot->image.Get(), points, (layout + 1) * kPoints);
+                    }
                     slot->frame = frame;
                     slot->sample = issued_ - 1;
                     slot->format = desc.Format;
                     slot->pending = true;
+                    slot->awaiting_result = await_result;
                 }
             }
         }
@@ -364,9 +390,14 @@ public:
         if (frame - opened_ < deadline && (issued_ < screen_marker::kSession ||
             std::any_of(slots_.begin(), slots_.end(), [](const auto& slot) { return slot.pending; }))) return finish(nullptr);
         const bool sampled_all = samples_ == screen_marker::kSession;
-        const bool confirmed = sampled_all && (follow_ == samples_ || invert_ == samples_);
-        const bool refuted = sampled_all && flat_ == samples_;
-        const bool intermittent = sampled_all && (follow_ || invert_) && !confirmed;
+        bool confirmed = false, any_response = false;
+        bool refuted = sampled_all;
+        for (const auto& layout : votes_) {
+            confirmed |= sampled_all && (layout.follow == samples_ || layout.invert == samples_);
+            any_response |= layout.follow || layout.invert;
+            if (layout.seen && layout.flat != samples_) refuted = false;
+        }
+        const bool intermittent = sampled_all && any_response && !confirmed;
         if (confirmed) {
             if (adaptive_) {
                 if (routes_.size() >= 24) routes_.erase(routes_.begin());
@@ -379,9 +410,9 @@ public:
             }
             ++confirmed_;
         } else {
-            // A recurring order that did not appear often enough can retry.
-            // Measured bypasses and contradictory placements are retained.
-            if (!adaptive_ || sampled_all) Reject(candidate_);
+            // A timeout or a display change is not a permanent property of a
+            // shader and target. Prove the reader again after a quiet interval.
+            Defer(candidate_, frame, refuted ? 1024 : 128);
             if (refuted) ++refuted_;
         }
         ResetAttempt();
@@ -392,6 +423,7 @@ public:
 
 private:
     struct Route { Reader reader; uint64_t proof; };
+    struct Retry { Reader reader; uint64_t after = 0, delay = 0; };
 
     void Append(const na::j2::ColorEvent& event)
     {
@@ -410,9 +442,10 @@ private:
     struct Slot {
         Texture image;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        UINT layouts = 0;
         uint64_t frame = 0;
         UINT sample = 0;
-        bool pending = false;
+        bool pending = false, awaiting_result = false;
     };
 
     static UINT Bytes(DXGI_FORMAT format)
@@ -437,7 +470,7 @@ private:
     static bool MakeStrip(ID3D11DeviceContext* context, DXGI_FORMAT format, bool readback, Texture& out)
     {
         D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = kPoints;
+        desc.Width = readback ? kPoints * 5 : kPoints;
         desc.Height = desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
         desc.Format = format;
         if (readback) {
@@ -463,12 +496,12 @@ private:
     }
 
     static void CopyPoints(ID3D11DeviceContext* context, ID3D11Texture2D* source,
-                           ID3D11Texture2D* destination, const ProbeRects& points)
+                           ID3D11Texture2D* destination, const ProbeRects& points, UINT offset = 0)
     {
         for (UINT i = 0; i < points.size(); ++i) {
             const auto& r = points[i];
             const D3D11_BOX box{UINT(r.left), UINT(r.top), 0, UINT(r.right), UINT(r.bottom), 1};
-            context->CopySubresourceRegion(destination, 0, i, 0, 0, source, 0, &box);
+            context->CopySubresourceRegion(destination, 0, offset + i, 0, 0, source, 0, &box);
         }
     }
 
@@ -478,7 +511,7 @@ private:
             Slot* next = nullptr;
             for (auto& slot : slots_)
                 if (slot.pending && (!next || slot.frame < next->frame)) next = &slot;
-            if (!next) return;
+            if (!next || next->awaiting_result) return;
             D3D11_MAPPED_SUBRESOURCE map{};
             const HRESULT hr = context->Map(next->image.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
             if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return;
@@ -486,35 +519,45 @@ private:
             if (FAILED(hr)) continue;
             const auto* data = static_cast<const uint8_t*>(map.pData);
             const UINT stride = Bytes(next->format);
-            UINT follows = 0, inverts = 0, flat = 0;
-            for (UINT pair = 0; pair < kPairs; ++pair) {
-                const float first = screen_marker::Luma(data + 2 * pair * stride, next->format);
-                const float second = screen_marker::Luma(data + (2 * pair + 1) * stride, next->format);
-                const float contrast = FirstIsHigh(next->sample, pair) ? first - second : second - first;
-                if (!std::isfinite(contrast)) continue;
-                follows += contrast > .02f;
-                inverts += contrast < -.02f;
-                flat += std::abs(contrast) <= .02f;
+            for (UINT i = 0; i <= next->layouts; ++i) {
+                UINT follows = 0, inverts = 0, flat = 0;
+                for (UINT pair = 0; pair < kPairs; ++pair) {
+                    const auto* point = data + (i * kPoints + 2 * pair) * stride;
+                    const float first = screen_marker::Luma(point, next->format);
+                    const float second = screen_marker::Luma(point + stride, next->format);
+                    const float contrast = FirstIsHigh(next->sample, pair) ? first - second : second - first;
+                    if (!std::isfinite(contrast)) continue;
+                    follows += contrast > .02f;
+                    inverts += contrast < -.02f;
+                    flat += std::abs(contrast) <= .02f;
+                }
+                auto& v = votes_[i];
+                ++v.seen;
+                v.follow += follows >= 2;
+                v.invert += inverts >= 2;
+                v.flat += flat >= 2;
             }
             context->Unmap(next->image.Get(), 0);
-            follow_ += follows >= 2;
-            invert_ += inverts >= 2;
-            flat_ += flat >= 2;
             ++samples_;
             ++paired_;
         }
     }
 
-    void Reject(Reader reader)
+    void Defer(Reader reader, uint64_t frame, uint64_t initial_delay = 128)
     {
-        auto& rejected = reader.color ? rejected_ : legacy_rejected_;
-        if (rejected.size() >= 24) rejected.erase(rejected.begin());
-        rejected.push_back(reader);
+        auto& rejected = adaptive_ ? rejected_ : legacy_rejected_;
+        const auto existing = std::find_if(rejected.begin(), rejected.end(),
+            [&](const Retry& retry) { return retry.reader == reader; });
+        const uint64_t delay = existing == rejected.end() ? initial_delay :
+            (std::clamp)(existing->delay * 2, initial_delay, uint64_t(4096));
+        if (existing != rejected.end()) rejected.erase(existing);
+        else if (rejected.size() >= 24) rejected.erase(rejected.begin());
+        rejected.push_back({reader, frame + delay, delay});
     }
 
-    void RetireVerified()
+    void RetireVerified(uint64_t frame)
     {
-        Reject(verified_);
+        Defer(verified_, frame);
         verified_ = {};
         ordinary_gaps_ = 0;
         ResetAttempt();
@@ -527,7 +570,8 @@ private:
         original_.Reset();
         marker_view_.Reset();
         issued_ = recent_miss_ = 0;
-        samples_ = follow_ = invert_ = flat_ = 0;
+        samples_ = 0;
+        votes_ = {};
         marked_ = seen_ = delivered_this_frame_ = false;
     }
 
@@ -543,11 +587,13 @@ private:
 
     Id color_ = 0, depth_ = 0;
     Reader candidate_{}, verified_{};
-    std::vector<Reader> rejected_, legacy_rejected_;
+    std::vector<Retry> rejected_, legacy_rejected_;
     Texture original_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> marker_view_;
     std::array<Slot, screen_marker::kSession> slots_{};
-    UINT samples_ = 0, follow_ = 0, invert_ = 0, flat_ = 0;
+    UINT samples_ = 0, marker_width_ = 0, marker_height_ = 0;
+    struct LayoutVote { UINT seen = 0, follow = 0, invert = 0, flat = 0; };
+    std::array<LayoutVote, 5> votes_{};
     static constexpr uint32_t kOrdinaryGrace = 4;
     uint64_t opened_ = 0, last_marked_ = 0;
     static inline uint64_t next_proof_ = 0; // all provider screen state is under the frame lock

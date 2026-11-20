@@ -312,6 +312,12 @@ uint fit_tile_word(uint tile, uint k) { return (FIT_HEAD + fit_tiles() * FIT_VAL
 bool fit_holds(float nearness, float split) { return fit_row == 0u ? (split <= 0.0 || nearness < split) : (split > 0.0 && nearness >= split); }
 static const float kFitConverged = 0.001; // screen_motion.hpp Params::converged_px
 bool fin(float a) { return (asuint(a) & 0x7fffffffu) < 0x7f800000u; }
+// Match screen_motion.hpp Usable/Window before either fitting or binning.
+// A zero distance (sky) is valid. A negative distance cannot belong to a depth group.
+bool fit_usable(float4 a) {
+    return a.w > 0.5 && fin(a.x) && fin(a.y) && fin(a.z) &&
+           a.z >= 0.0 && a.z < 3.0e38 && abs(a.x) < kFitMaxVector && abs(a.y) < kFitMaxVector;
+}
 // A depth value's distance from the far end; 0 for a value that is not a depth.
 float nearness_of(float d) { return fin(d) && d >= 0.0 && d <= 1.0 ? abs(d - depth_far) : 0.0; }
 // The two rows of one position's terms (screen_motion.hpp Terms).
@@ -360,8 +366,7 @@ void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     uint used = 0u;
     if (!idle && cell.x < gw && cell.y < gh) {
         const float4 a = t_hist[cell];
-        if (a.w > 0.5 && fin(a.x) && fin(a.y) && fin(a.z) && abs(a.x) < kFitMaxVector && abs(a.y) < kFitMaxVector &&
-            fit_holds(a.z, asfloat(u_cnt.Load(FIT_SPLIT * 4)))) {
+        if (fit_usable(a) && fit_holds(a.z, asfloat(u_cnt.Load(FIT_SPLIT * 4)))) {
             used = 1u;
             const uint base = gi * FIT_GATHER;
             const float2 p = float2(cell * block + block / 2) + 0.5 - float2(jitter_x, jitter_y);
@@ -442,7 +447,7 @@ void fit_split(uint gi) {
         const uint cells = gw * gh;
         [loop] for (uint at = gi; at < cells; at += 64u) {
             const float4 a = t_hist[uint2(at % gw, at / gw)];
-            if (a.w > 0.5 && fin(a.x) && fin(a.y) && fin(a.z) && abs(a.x) < kFitMaxVector && abs(a.y) < kFitMaxVector) own[fit_bin(a.z)] += 1u;
+            if (fit_usable(a)) own[fit_bin(a.z)] += 1u;
         }
         [loop] for (uint b1 = 0; b1 < FIT_BINS; ++b1) gbin[gi * FIT_BINS + b1] = own[b1];
     }

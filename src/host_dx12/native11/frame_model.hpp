@@ -189,6 +189,7 @@ public:
     const Selection& Current() const { return sel_; }
     const Stats& GetStats() const { return stats_; }
     uint32_t SceneDrawsThisFrame() const { return scene_draws_; }
+    uint64_t FrameEventCount() const { return events_; }
     // The scene was seen to be drawn through material layers (kept until the scene depth changes).
     bool Layered() const { return wide_; }
     // The layers' first render target (the most-drawn one); 0 when the scene has no layers.
@@ -216,6 +217,30 @@ public:
         std::vector<Id> more_layers;        // other sets of layers written with the scene depth
     };
     const ChoiceNote& LastChoice() const { return note_; }
+    // Two equally-sized HDR surfaces whose contents are consumed in sequence.
+    // Only the completed frame can train the rule. During recording use its
+    // actual first writer, never a frame-parity prediction.
+    struct LitOrder { Id early = 0, late = 0, first = 0, depth = 0; };
+    LitOrder CompletedLitOrder() const { return completed_lit_; }
+    Id FirstLitWriter(Id a, Id b) const
+    {
+        const auto x = color_.find({sel_.depth, a}), y = color_.find({sel_.depth, b});
+        if (x == color_.end()) return y == color_.end() ? 0 : b;
+        if (y == color_.end()) return a;
+        return x->second.first_draw < y->second.first_draw ? a : b;
+    }
+    uint64_t LitWrite(Id early, Id late, bool require_current_depth = true) const
+    {
+        const auto x = target_.find(early), y = target_.find(late);
+        const auto scene = color_.find({sel_.depth, late});
+        const auto depth = depth_.find(sel_.depth);
+        if (x == target_.end() || y == target_.end() || scene == color_.end() || depth == depth_.end() ||
+            x->second.last_other_write > x->second.last_draw || y->second.last_other_write > y->second.last_draw ||
+            (require_current_depth && depth->second.last_clear > scene->second.last_draw) ||
+            !x->second.read_after || x->second.read_after >= y->second.last_draw ||
+            y->second.last_draw != scene->second.last_draw) return 0;
+        return y->second.last_draw;
+    }
     bool FiredThisFrame() const { return fired_; }
     // The tag of the read learned as the DLSS point (Vulkan); 0 = none or not unique.
     uint64_t LearnedTag() const { return learned_tag_; }
@@ -310,6 +335,7 @@ public:
         case Kind::ClearDepth: {
             Cand& d = depth_[e.resource];
             ++d.clears;
+            d.last_clear = events_;
             break;
         }
         case Kind::Read: {
@@ -329,7 +355,7 @@ public:
                 }
             }
             break;
-        case Kind::ColorWrite: break; // the placement profile tracks these separately
+        case Kind::ColorWrite: target_[e.resource].last_other_write = events_; break;
         case Kind::CbUpdate: return track_camera_ ? ++cb_version_[e.resource] : 0;
         }
         return 0;
@@ -409,7 +435,7 @@ public:
     // The engine found the camera's matrices in this buffer (or, with 0, gave up on it).
     void SetCamera(Id cb, int slot) { sel_.camera_cb = cb; sel_.camera_slot = slot; }
 
-    void EndFrame()
+    void EndFrame(bool inspect_lit_order = false, Id verified_peer = 0)
     {
         ++stats_.frames;
         // At the untested-HUD point the HUD draws that follow still carry the scene depth; only a
@@ -450,7 +476,9 @@ public:
             }
         }
 
-        Choose();
+        completed_lit_ = {};
+        inspect_lit_order_ = inspect_lit_order;
+        Choose(verified_peer);
         stats_.learned_read = learned_read_;
         stats_.learned_overlay = learned_overlay_;
         stats_.learned_flat = learned_flat_;
@@ -522,9 +550,9 @@ public:
     }
 
 private:
-    struct Cand { uint64_t draws = 0, vertices = 0, clears = 0; bool indirect = false; };
+    struct Cand { uint64_t draws = 0, vertices = 0, clears = 0, last_clear = 0; bool indirect = false; };
     struct PairCount { uint64_t draws = 0, multi_target_draws = 0, first_draw = 0, last_draw = 0; };
-    struct TargetUse { uint64_t last_draw = 0, first_read = 0, read_after = 0, last_read = 0; }; // event order within the frame
+    struct TargetUse { uint64_t last_draw = 0, first_read = 0, read_after = 0, last_read = 0, last_other_write = 0; }; // event order within the frame
 
     static constexpr size_t kFlowSteps = 96;
     void NoteFlow(bool read, Id target, Id depth, bool multi, bool tested, uint64_t vertices = 0)
@@ -618,7 +646,7 @@ private:
         return std::fabs(a - s) <= 0.1 && rx >= 0.5 && rx <= 1.85 && ry >= 0.5 && ry <= 1.85;
     }
 
-    void Choose()
+    void Choose(Id verified_peer)
     {
         // Loading screens and menus: one depth with <= 8 draws -> keep the old choice.
         uint64_t total_depth_draws = 0;
@@ -651,6 +679,12 @@ private:
         if (!best_color) return; // nothing usable this frame: keep the old choice
         const Id most_drawn = best_color;
         const bool layered = AfterLayers(best_depth, best_color);
+        // Preserve the camera and its learned bindings across a proven pair.
+        // The reader chooses the current physical surface at execution time.
+        if (verified_peer && completed_lit_.depth == sel_.depth &&
+            ((completed_lit_.early == verified_peer && completed_lit_.late == sel_.color) ||
+             (completed_lit_.late == verified_peer && completed_lit_.early == sel_.color)))
+            best_color = sel_.color;
         if (layered) {
             ++stats_.layered_frames;
             if (best_depth == sel_.depth && best_color == sel_.color) {
@@ -815,6 +849,24 @@ private:
         if (!picture) { note_.why = why; return false; }
         note_.rule = PictureRule::AfterLayers;
         note_.second_depth = second_depth;
+        if (inspect_lit_order_ && !second_depth && depth == sel_.depth) {
+            const ColourNote* a = nullptr;
+            const ColourNote* b = nullptr;
+            for (const auto& n : all) {
+                if (!n.same_size || !n.float_colour || !n.draws) continue;
+                if (!a) a = &n;
+                else if (!b) b = &n;
+                else { b = nullptr; break; }
+            }
+            if (a && b && a->format == b->format && (sel_.color == a->id || sel_.color == b->id)) {
+                if (a->last_draw > b->last_draw) std::swap(a, b);
+                // This labels completed color order. Depth can be reused
+                // downstream after the reader has consumed the scene. The live
+                // reader checks for intact depth again before evaluating DLAA.
+                if (a->read_after > a->last_draw && b->read_after > b->last_draw && LitWrite(a->id, b->id, false))
+                    completed_lit_ = {a->id, b->id, FirstLitWriter(a->id, b->id), depth};
+            }
+        }
         // The other sets of layers written with the scene depth: their depth-tested draws are scene too.
         note_.more_layers.clear();
         for (const auto& n : all)
@@ -845,6 +897,8 @@ private:
     std::vector<FlowStep> flow_, last_flow_;
     uint32_t flow_dropped_ = 0, last_flow_dropped_ = 0;
     ChoiceNote note_;
+    LitOrder completed_lit_{};
+    bool inspect_lit_order_ = false;
     bool wide_ = false; // the scene is drawn through material layers (until the scene depth changes)
     Id layer_ = 0;      // their most-drawn target
     Id second_depth_ = 0;           // scene/after-layers-second-depth

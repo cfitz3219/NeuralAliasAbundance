@@ -180,6 +180,10 @@ inline int SolveControlled(test::Device& d) {
             samples.push_back(a);size_t k=(size_t(y)*gw+x)*4;grid[k]=a.vx;grid[k+1]=a.vy;grid[k+2]=a.nearness;grid[k+3]=a.confirmed?1.f:0.f;
         }
         const auto layers=sm::FitLayers(samples.data(),samples.size(),w,h);const auto& ref=layers.far_fit;
+        // Variant 0 supplies 2,048 confirmed samples including 28 negative
+        // distances. Variant 2 supplies valid zero distances for sky.
+        if(variant==0)CHECK(ref.samples==2020);
+        if(variant==2)CHECK(ref.samples==2048);
         auto input=g.Upload(gw,gh,DXGI_FORMAT_R32G32B32A32_FLOAT,16,grid.data());
         auto state=test::CreateBuffer(d.device.Get(),words*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         auto zero=test::CreateBuffer(d.device.Get(),80,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);void* z=nullptr;REQUIRE(SUCCEEDED(zero->Map(0,nullptr,&z)));std::memset(z,0,80);zero->Unmap(0,nullptr);
@@ -334,6 +338,20 @@ inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhe
         std::sort(ms.begin(),ms.end());auto s=cf::GetStats();
         std::printf("screen fit timing %ux%u on=%d samples=%zu median=%.4f min=%.4f max=%.4f ms model=%d samples=%.0f agree=%.0f steps=%u\n",w,h,enabled,ms.size(),(ms[9]+ms[10])*.5,ms.front(),ms.back(),s.screen_last_valid,s.screen_samples,s.screen_agree,s.screen_steps);
         CHECK(s.screen_pairs==(enabled?25u:0u));
+        if (enabled && !overhead) {
+            // Change just one recording and restore on the next one, in the
+            // same stream. Direct motion and its validity must survive both.
+            for (unsigned i = 26; i < 28; ++i) {
+                cf::Frame f;
+                f.frame=9000+i;f.previous=f.frame-1;f.generation=303;f.source_generation=303;
+                f.total=f.raster_sample=f.raster_confirmed=true;f.use_screen_fit=i==27;
+                cf::Tier3 t;
+                const auto ticket=cf::Record(g.l.list.Get(),d.queue.Get(),image[i%2].Get(),dep.Get(),in,f,t);
+                REQUIRE(ticket.context && ticket.pair && t.total && t.total_valid);
+                CHECK(bool(t.screen_model)==f.use_screen_fit);
+                REQUIRE(g.Execute()==0);cf::Committed(ticket);g.Reset();
+            }
+        }
         if(overhead){
             std::sort(record_us.begin(),record_us.end());std::sort(cut_ms.begin(),cut_ms.end());
             std::printf("steady %ux%u: record median %.2f us p95 %.2f us; ordinary cut-show median %.4f ms p95 %.4f ms; block wall %.2f s\n",

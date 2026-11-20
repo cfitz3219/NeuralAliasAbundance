@@ -10,17 +10,23 @@ namespace na::screen_marker {
 inline constexpr float kAt[3][2]{{.30f, .62f}, {.70f, .62f}, {.50f, .38f}};
 inline constexpr float kLow = .2f, kHigh = .8f;
 inline constexpr uint32_t kSession = 8;
+// VARIANT: referee/independent-region-code
+// Each region visits high and low twice on each challenge parity. A common
+// every-other-frame change in the game cannot stand in for these three codes.
+inline constexpr uint32_t kPatterns[kSession]{0, 7, 5, 2, 3, 4, 6, 1};
 
 struct Vote {
-    uint32_t follow[3]{}, invert[3]{}, flat[3]{}, steps = 0;
+    uint32_t follow[3]{}, invert[3]{}, flat[3]{}, steps[3]{};
 
     void Add(uint32_t before, const float* previous, uint32_t after, const float* current)
     {
-        if (before == after) return;
-        ++steps;
-        const float direction = after ? 1.f : -1.f;
         for (int k = 0; k < 3; ++k) {
+            const uint32_t bit = 1u << k;
+            if (!((before ^ after) & bit)) continue;
+            ++steps[k];
+            const float direction = (after & bit) ? 1.f : -1.f;
             const float delta = current[k] - previous[k];
+            if (!std::isfinite(delta)) continue;
             if (std::fabs(delta) < .02f) ++flat[k];
             else if (delta * direction > 0) ++follow[k];
             else ++invert[k];
@@ -30,11 +36,11 @@ struct Vote {
     enum class Result { Unknown, Reached, Discarded };
     Result ResultOf() const
     {
-        if (steps < 5) return Result::Unknown;
         uint32_t reach = 0, still = 0;
         for (int k = 0; k < 3; ++k) {
-            if (follow[k] * 4 >= steps * 3 || invert[k] * 4 >= steps * 3) ++reach;
-            if (flat[k] * 4 >= steps * 3) ++still;
+            if (steps[k] < 4) continue;
+            if (follow[k] == steps[k] || invert[k] == steps[k]) ++reach;
+            if (flat[k] * 4 >= steps[k] * 3) ++still;
         }
         return reach >= 2 ? Result::Reached : still == 3 ? Result::Discarded : Result::Unknown;
     }

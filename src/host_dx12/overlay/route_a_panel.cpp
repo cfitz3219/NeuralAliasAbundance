@@ -1099,20 +1099,18 @@ void DrawLiveDlaa()
         if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
         ImGui::EndDisabled();
         EndRow();
-        if (!native) {   // Draw-replay motion on/off (Cort 2026-11-06): live, remembered.
-            na::settings::Settings& rs = na::settings::Get();
-            bool replay = rs.j2_draw_replay.load() != 0;
-            BeginRow("Object motion (draw replay)", "Tests whether replaying matching scene draws reduces smearing on moving objects. Uses extra GPU time and applies live.", S(220));
-            if (ImGui::Checkbox("##drawreplay", &replay)) { rs.j2_draw_replay.store(replay ? 1u : 0u); na::settings::Save(); }
-            EndRow();
-            if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
-        }
         {
             na::settings::Settings& rs = na::settings::Get();
-            bool reads = rs.j2_depth_reads.load() != 0;
-            BeginRow("Steady distant lighting", "Reduces jitter-related flicker in lights and ground marks by correcting the depth the game's lighting reads. Applies live.", S(220));
-            if (ImGui::Checkbox("##depthreads", &reads)) { rs.j2_depth_reads.store(reads ? 1u : 0u); na::settings::Save(); }
+            bool replay = !native && rs.j2_draw_replay.load() != 0;
+            BeginRow("Object motion (draw replay)",
+                     native ? "Draw replay is unavailable on native DirectX 11."
+                            : "Replays matching scene draws to reduce smearing on moving objects. Uses extra GPU time and applies live.",
+                     S(220));
+            ImGui::BeginDisabled(native);
+            if (ImGui::Checkbox("##drawreplay", &replay)) { rs.j2_draw_replay.store(replay ? 1u : 0u); na::settings::Save(); }
+            ImGui::EndDisabled();
             EndRow();
+            if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
         }
         if (!native) {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
             const bool running = na::j2::SmearTestRunning();
@@ -1199,46 +1197,16 @@ void DrawLiveDlaaEnhancements()
         }
         EndRow();
     }
-    {
-        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
-        bool fl = na::j2::flow::Enabled();
-        BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
-        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
-        EndRow();
-        if (na::j2::compute_flow::GetStats().camera_reconstruct)
-            ImGui::TextWrapped("This game's camera data has no camera movement, so camera motion is rebuilt from the picture. AMD flow keeps running (extra GPU time) even with the switch off; the switch only controls moving-object motion.");
-        {
-            na::settings::Settings& ss = na::settings::Get();
-            int loose = static_cast<int>(ss.j2_flow_loosen.load());
-            BeginRow("Moving-object rules", "How much of what the optical flow finds is accepted. 0% = the original strict rules. Higher accepts more moving objects (including ones against the sky) but can add smearing or shimmer. Compare with the Motion vectors debug view.", S(220));
-            ImGui::SetNextItemWidth(S(220));
-            if (ImGui::SliderInt("##j2flowloose", &loose, 0, 100, loose ? "%d%% looser" : "Strict (original)", ImGuiSliderFlags_AlwaysClamp))
-                ss.j2_flow_loosen.store(static_cast<uint32_t>(loose));
-            if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
-            EndRow();
-        }
-        if (fl) {
-            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
-            const auto cs=na::j2::compute_flow::GetStats();
-            if(na::on12::NativeRoute() || na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
-                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
-                StatusLine(0,line);
-                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
-                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
-                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
-                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
-                    Hint(detail);}
-            }else{
-            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
-            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
-            char tb[360];
-            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
-            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
-                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
-                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
-                          static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
-            StatusLine(fs.latched ? 2 : 0, tb);
-            }
+    if (na::j2::flow::Enabled() && !na::j2::Paused()) {
+        const auto hardware = na::j2::flow::GetStats();
+        const auto compute = na::j2::compute_flow::GetStats();
+        char line[500];
+        if (na::on12::NativeRoute() || na::j2::GetStats().inline_mode || (!hardware.available && compute.recorded)) {
+            na::j2::compute_flow::DescribeStats(compute, line, sizeof line);
+            StatusLine(0, line);
+        } else {
+            std::snprintf(line, sizeof line, "Optical flow  %s GPU cost averages %.2f ms.", hardware.reason, hardware.ms_avg);
+            StatusLine(hardware.latched ? 2 : 0, line);
         }
     }
     {
