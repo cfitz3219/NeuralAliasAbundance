@@ -13,11 +13,13 @@
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/j2/replay_motion.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/effects/donut.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
+#include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/textures.hpp"
 #include "host_dx12/observe/producers.hpp"
@@ -26,6 +28,8 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 #include <atomic>
 #include <cstdio>
 #include <memory>
@@ -55,6 +59,9 @@ struct Slot {
     uint64_t native_done = 0, effects_done = 0;
     std::shared_ptr<xegtao::Frame> ambient;
     std::shared_ptr<donut::Frame> grade;
+    // Draw replay: this frame's replayed positions, packed by the game's context (native11/draw_replay.hpp Pack).
+    SharedTexture positions;
+    ComPtr<ID3D11UnorderedAccessView> positions_view;
 };
 struct Session {
     ComPtr<ID3D11Device> native;
@@ -75,6 +82,18 @@ struct Session {
     uint64_t last_reset_frame = 0; // the newest frame delivered with a DLSS reset
     bool measured_last = false;    // the last delivered frame's motion was measured, not from a camera
     bool failed = false;
+    // Draw replay (native11/draw_replay.hpp): the DX12 host's rasteriser (j2/replay_motion.hpp) on
+    // this device. Each frame's positions are copied out of its slot's shared texture into one of
+    // these buffers, which stays as the next frame's history; a buffer is reused once the DX12 work
+    // that last read it has completed.
+    j2::replay_motion::Pass replay;
+    bool replay_tried = false;
+    struct ReplayBuffer { ComPtr<ID3D12Resource> buffer; uint64_t native_done = 0, effects_done = 0; };
+    ReplayBuffer replay_buffers[3];
+    int replay_prev = -1;          // the buffer holding the last submitted frame's positions (-1 none)
+    uint64_t replay_prev_frame = 0;
+    std::vector<observe::ReplayRecord> replay_prev_draws;
+    uint64_t replay_fed_frame = 0; // the last frame DLSS got replay motion on
     // VARIANT: dlss/in-companion
     // DLSS runs in the 64-bit companion program instead of in this process (a 32-bit game cannot
     // load it). Chosen by what this build is, not by which game it is in.
@@ -105,6 +124,8 @@ std::atomic<uint32_t> applied_preset{0}, applied_sharpness{0};
 std::atomic<uint64_t> companion_shaded{0};
 std::atomic<int> raster_slot{-1};
 std::atomic<bool> evaluation_capture_pending{false};
+// Draw replay: when replay motion last reached DLSS (menu status).
+std::atomic<uint64_t> replay_fed_at{0};
 
 bool Skip(const char* why)
 {
@@ -307,6 +328,27 @@ camera::CameraFrame Pose(Session& s, const native11::SceneFrame& frame, UINT w, 
     return result;
 }
 
+// What the replay pass learned about each draw goes to the DX11 producer's movers table.
+void ReplayLearnSink(const observe::ReplayObservation* seen, size_t n)
+{
+    std::vector<native11::draw_replay::Observation> o(n);
+    for (size_t i = 0; i < n; ++i) o[i] = {seen[i].sig, seen[i].vb, seen[i].visible, seen[i].apart};
+    native11::draw_replay::Learn(o.data(), n);
+}
+
+bool ReplayBufferMade(ID3D12Device* dev, ComPtr<ID3D12Resource>& out)
+{
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    d.Width = uint64_t(native11::draw_replay::kCapacity) * 16u;
+    d.Height = d.DepthOrArraySize = d.MipLevels = 1;
+    d.SampleDesc.Count = 1;
+    d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return SUCCEEDED(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, kCommon, nullptr, IID_PPV_ARGS(&out)));
+}
+
 bool FailSession(Session& s, const char* why)
 {
     s.failed = true;
@@ -330,6 +372,14 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // existing session worker so it can qualify settings and enable effects.
     if (context) host::RendererObserved();
     native11::SetNextJitter(0, 0);
+    // Draw replay ([j2] draw_replay, the same switch, budget and movers rule as DX12): this frame's
+    // replayed draws end here (later draws of the frame are not the scene), and the setting is
+    // applied to the next frame's draws.
+    const bool replay_setting = settings::Get().j2_draw_replay.load(std::memory_order_relaxed) != 0;
+    native11::draw_replay::Configure(replay_setting && context && j2::Enabled() && !j2::Paused(),
+                                     settings::Get().j2_replay_budget.load(std::memory_order_relaxed),
+                                     settings::Get().j2_replay_movers.load(std::memory_order_relaxed) != 0);
+    native11::draw_replay::Sealed sealed = native11::draw_replay::Seal(frame.frame);
     if (!context || !j2::Enabled() || j2::Paused()) return Skip("DLAA paused.");
     std::lock_guard<std::mutex> lock(mutex);
     auto& s = State();
@@ -483,6 +533,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     else if (measured ? frame.scene_changed : frame.selection_changed) resets_changed.fetch_add(1, std::memory_order_relaxed);
     else if (reset_history) resets_gap.fetch_add(1, std::memory_order_relaxed);
     j2::compute_flow::Ticket flow;
+    ID3D12Resource* screen_model = nullptr; // the measured supplier's fitted screen motion (what replay learns movers against)
     if (measured || j2::flow::Enabled()) {
         j2::compute_flow::Frame ff;
         ff.frame = frame.frame;
@@ -503,6 +554,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         ff.total = measured; ff.last_reset_frame = s.last_reset_frame;
         j2::compute_flow::Tier3 tier;
         flow = j2::compute_flow::Record(list, s.queue.Get(), slot.color.Effects(), shared_depth, in, ff, tier);
+        screen_model = tier.screen_model;
         if (measured) {
             if (!flow.context || (flow.pair && !tier.total)) {
                 // No measurement can be made at all (its programs or working memory are missing, or
@@ -540,6 +592,129 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                 in.tier3_residual = tier.residual; in.tier3_valid = tier.valid; in.tier3_mask = tier.mask;
             }
             in.fix = tier.fix;
+        }
+    }
+    // Tier 1 from the game's own draws replayed with stream output (native11/draw_replay.hpp), as
+    // the DX12 host does: exact per-object motion where a replayed draw is the visible surface. The
+    // camera or the measured motion keeps every other pixel (the arbiter's tiers behind it).
+    // Matrix jitter would sit inside the clip positions: replay is used with viewport jitter only.
+    int replay_cur = -1, replay_prev_used = -1;
+    std::vector<observe::ReplayRecord> replay_draws;
+    if (replay_setting && !sealed.draws.empty() && sealed.verts <= native11::draw_replay::kCapacity &&
+        !(frame.raster.applied && !frame.raster.viewport)) {
+        if (!s.replay_tried) {
+            s.replay_tried = true;
+            if (s.replay.Init(s.device.Get())) s.replay.SetLearnSink(&ReplayLearnSink);
+            na::eventlog::Emit("draw_replay11_pass", "ready=%d", s.replay.Ready() ? 1 : 0);
+        }
+        for (int i = 0; s.replay.Ready() && i < 3 && replay_cur < 0; ++i) {
+            auto& b = s.replay_buffers[i];
+            if (i == s.replay_prev) continue; // the history this frame reads
+            if (b.buffer ? !s.fences.Retired(b.native_done, b.effects_done) : !ReplayBufferMade(s.device.Get(), b.buffer)) continue;
+            replay_cur = i;
+        }
+        if (replay_cur >= 0 && !slot.positions_view) {
+            const ImageDesc pd{native11::draw_replay::kPackWidth, native11::draw_replay::kPackRows, DXGI_FORMAT_R32G32B32A32_FLOAT, true};
+            if (FAILED(slot.positions.Create(s.native.Get(), s.device.Get(), pd)) ||
+                FAILED(s.native->CreateUnorderedAccessView(slot.positions.Native(), nullptr, &slot.positions_view))) {
+                slot.positions_view.Reset();
+                replay_cur = -1;
+                na::eventlog::Emit("draw_replay11_pass", "shared_positions=failed");
+            }
+        }
+        // The game's context packs the positions now (in its order: after the frame's last replayed
+        // draw, before the native signal below); this list copies them out after its wait.
+        if (replay_cur >= 0 && !native11::draw_replay::Pack(ctx, slot.positions_view.Get(), sealed.verts)) replay_cur = -1;
+    }
+    if (replay_cur >= 0) {
+        auto* buffer = s.replay_buffers[replay_cur].buffer.Get();
+        auto* packed = slot.positions.Effects();
+        const UINT rows = native11::draw_replay::PackRows(sealed.verts);
+        Barrier(list, packed, kCommon, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(list, buffer, kCommon, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+        to.pResource = buffer;
+        to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, native11::draw_replay::kPackWidth, rows, 1,
+                                        native11::draw_replay::kPackWidth * 16u};
+        from.pResource = packed;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const D3D12_BOX box{0, 0, 0, native11::draw_replay::kPackWidth, rows, 1};
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+        Barrier(list, packed, D3D12_RESOURCE_STATE_COPY_SOURCE, kCommon);
+        Barrier(list, buffer, D3D12_RESOURCE_STATE_COPY_DEST, kCommon);
+        observe::ReplayFrame rf;
+        rf.cur = buffer;
+        replay_draws.reserve(sealed.draws.size());
+        for (const auto& replayed : sealed.draws) {
+            observe::ReplayRecord r{};
+            r.sig = replayed.sig; r.vb = replayed.vb; r.first = replayed.first; r.verts = replayed.verts;
+            r.width = replayed.width; r.height = replayed.height;
+            std::copy(replayed.scissor, replayed.scissor + 4, r.scissor);
+            replay_draws.push_back(r);
+        }
+        rf.cur_draws = replay_draws;
+        if (s.replay_prev >= 0 && s.replay_prev_frame + 1 == frame.frame) {
+            replay_prev_used = s.replay_prev;
+            rf.prev = s.replay_buffers[s.replay_prev].buffer.Get();
+            rf.prev_draws = s.replay_prev_draws;
+        }
+        // What the pass compares each draw with, to learn which move by themselves: the camera this
+        // frame used, or with no camera the screen motion fitted for this pair (as the DX12 host).
+        j2::replay_motion::Reference learn{};
+        learn.depth_far = in.depth_clear;
+        if (!measured && in.tier2_valid_flag) {
+            learn.mode = 1;
+            std::memcpy(learn.matrix, in.inv_view_proj_current.m, sizeof learn.matrix);
+            learn.fix = in.fix;
+        } else if (measured && screen_model) {
+            learn.mode = 2;
+            learn.model = screen_model;
+        }
+        const bool viewport_sample = frame.raster.applied && frame.raster.viewport;
+        const float viewport_jitter[2] = {viewport_sample ? frame.raster.jitter_px[0] : 0.f, viewport_sample ? frame.raster.jitter_px[1] : 0.f};
+        const auto rm = s.replay.Record(list, s.queue.Get(), shared_depth, ci.width, ci.height, frame.reversed_depth, reset_history,
+                                        viewport_jitter, &learn, rf, viewport_sample && frame.raster.expanded);
+        if (rm.motion) {
+            in.tier1_motion = rm.motion;
+            in.tier1_valid = rm.valid;
+            in.tier1_valid_flag = true;
+            in.tier1_source = motion::Tier1Source::Engine;
+            s.replay_fed_frame = frame.frame;
+            replay_fed_at.store(GetTickCount64(), std::memory_order_relaxed);
+        }
+    }
+    if (replay_setting) {
+        // WHY log, as the DX12 host's draw_replay lines: what was replayed, what stopped the rest,
+        // what the pass matched and drew, and what the movers rule spends the budget on.
+        const auto p = s.replay.GetStats();
+        static uint64_t next_log = 0, logs = 0;
+        if (frame.frame >= next_log) {
+            next_log = frame.frame + (logs ? 600 : 120);
+            ++logs;
+            const auto q = native11::draw_replay::GetStats();
+            na::eventlog::Emit("draw_replay11", "route=native_dx11 on=%d noted=%llu built=%llu build_failed=%llu replayed=%llu verts=%llu "
+                "twin_queued=%llu building=%llu twin_failed=%llu no_shader=%llu overflow=%llu sealed=%llu packed=%llu pack_failed=%llu gates{%s} | "
+                "frames=%llu fed=%llu draws=%llu prev_draws=%llu exact=%llu unmatched=%llu raster_verts=%llu gpu_read=%llu gpu_nonzero=%llu "
+                "gpu_samples=%llu gpu_last=%u last_draws=%u last_pairs=%u fed_now=%d",
+                q.on ? 1 : 0, (unsigned long long)q.noted, (unsigned long long)q.built, (unsigned long long)q.build_failed,
+                (unsigned long long)q.replayed, (unsigned long long)q.vertices, (unsigned long long)q.twin_queued,
+                (unsigned long long)q.twin_building, (unsigned long long)q.twin_failed, (unsigned long long)q.no_shader,
+                (unsigned long long)q.overflow, (unsigned long long)q.sealed, (unsigned long long)q.packed, (unsigned long long)q.pack_failed, q.gates,
+                (unsigned long long)p.frames, (unsigned long long)p.fed, (unsigned long long)p.draws, (unsigned long long)p.prev_draws,
+                (unsigned long long)p.matched_exact, (unsigned long long)p.unmatched, (unsigned long long)p.verts,
+                (unsigned long long)p.gpu_read, (unsigned long long)p.gpu_nonzero, (unsigned long long)p.gpu_samples, p.gpu_last,
+                p.last_draws, p.last_pairs, s.replay_fed_frame == frame.frame ? 1 : 0);
+            na::eventlog::Emit("draw_replay11_budget", "variant=replay/movers-first budget=%llu threshold=%u of 65536 not_sampled=%llu "
+                "draw_too_large=%llu frame_full=%llu movers_on=%d movers=%llu suspects=%llu promoted=%llu let_go=%llu mover_draws=%llu "
+                "mover_verts=%llu movers_left_out=%llu rotating_share_verts=%llu reports=%llu compared_with{camera=%llu screen_fit=%llu nothing=%llu} "
+                "samples{seen=%llu apart=%llu}",
+                (unsigned long long)q.budget, q.budget_threshold, (unsigned long long)q.not_sampled, (unsigned long long)q.draw_too_large,
+                (unsigned long long)q.frame_full, q.movers_on ? 1 : 0, (unsigned long long)q.movers, (unsigned long long)q.suspects,
+                (unsigned long long)q.promoted, (unsigned long long)q.let_go, (unsigned long long)q.mover_draws, (unsigned long long)q.mover_verts,
+                (unsigned long long)q.movers_left_out, (unsigned long long)q.probe_verts, (unsigned long long)q.reports,
+                (unsigned long long)p.learn_camera, (unsigned long long)p.learn_screen, (unsigned long long)p.learn_none,
+                (unsigned long long)p.learn_visible, (unsigned long long)p.learn_apart);
         }
     }
     motion::gpu::Outputs motion_out{slot.motion.Get(), slot.provenance.Get(), nullptr, ci.width, ci.height};
@@ -804,6 +979,16 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     j2::compute_flow::Committed(flow);
     // The picture is acquired: really submitted, whatever happens to this frame's DLSS step.
     if (flow.context) s.flow_frame = frame.frame;
+    // Replay history: this frame's positions are the next frame's previous ones (submitted, so the
+    // next frame's copy and reads come after them on this queue).
+    if (replay_cur >= 0) {
+        s.replay_prev = replay_cur;
+        s.replay_prev_frame = frame.frame;
+        s.replay_prev_draws = std::move(replay_draws);
+    } else {
+        s.replay_prev = -1;
+        s.replay_prev_draws.clear();
+    }
     const auto ask_next_jitter = [&] {
         const auto phase = static_cast<uint32_t>(frame.frame);
         const auto sample = native11::DlaaJitterSample(phase, settings::Get().j2_jitter_r2.load() != 0);
@@ -823,6 +1008,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             evaluation_capture_pending.store(true, std::memory_order_release);
     }
     if (FAILED(s.fences.SignalEffects(&slot.effects_done))) return FailSession(s, "DX12 effects submission failed.");
+    // The replay buffers this frame wrote or read are free again once this frame's DX12 work is done.
+    for (const int used : {replay_cur, replay_prev_used})
+        if (used >= 0) { s.replay_buffers[used].native_done = slot.native_done; s.replay_buffers[used].effects_done = slot.effects_done; }
     if (!evaluated) {
         if (!s.companion) return Skip("DLAA evaluation rejected this frame.");
         static char why[200];
@@ -974,6 +1162,20 @@ int FormatStatus(char* out, size_t capacity)
     }
     return n;
 }
+bool FormatReplayStatus(char* out, size_t capacity)
+{
+    if (!out || !capacity) return false;
+    out[0] = '\0';
+    if (!settings::Get().j2_draw_replay.load(std::memory_order_relaxed)) return false;
+    const auto d = native11::draw_replay::GetStats();
+    const auto fed = replay_fed_at.load(std::memory_order_relaxed);
+    const char* state = fed && GetTickCount64() - fed < 1000 ? "Replay motion available to DLSS." :
+        !d.built && d.build_failed ? "Could not prepare a replay pipeline." :
+        "Waiting for matching scene draws.";
+    std::snprintf(out, capacity, "%s", state);
+    return true;
+}
+
 bool FormatMenuStatus(char* out, size_t capacity)
 {
     const auto last = delivered_at.load(std::memory_order_relaxed);

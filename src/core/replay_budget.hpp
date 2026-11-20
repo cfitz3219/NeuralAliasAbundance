@@ -105,4 +105,47 @@ inline uint32_t NextThreshold(uint32_t current, uint64_t offered, uint64_t used,
     return static_cast<uint32_t>(t);
 }
 
+// The per-frame state and the decision for one draw, the same for every replay producer (the DX12
+// observe layer and the native DX11 provider): known movers first up to the whole budget, then the
+// sample (VARIANT replay/movers-first), or the sample alone. The caller keeps one FrameBudget per producer.
+struct FrameBudget { uint64_t frame = 0, used = 0, offered = 0, mover_used = 0; uint32_t threshold = kFull, phase = 0; bool full = false, movers = false; };
+struct Rules { uint32_t rotate_frames = 240, probe_share = 4, probe_frames = 24; };
+enum class Choice : uint32_t { Admit, MoverAdmit, MoverLeftOut, DrawTooLarge, NotSampled, FrameFull };
+// `is_mover`: the movers table names this draw (only asked when `movers` is on). `*closed`: set when
+// the frame is full and, without movers, nothing later in it can be admitted (the caller may then
+// turn every later draw of the frame away at the door). Needs a budget (non-zero).
+inline Choice Choose(FrameBudget& s, uint64_t frame, uint64_t budget, bool movers, bool is_mover, uint64_t sig, uint64_t vb, uint64_t verts,
+                     const Rules& r, bool* closed = nullptr)
+{
+    if (closed) *closed = false;
+    const uint64_t share = movers && r.probe_share ? budget / r.probe_share : budget; // what the sampled draws may take
+    if (s.frame != frame) { // a new frame: the threshold follows what the last one offered and admitted
+        if (s.movers != movers) { s.threshold = kFull; s.movers = movers; } // another rule: start it afresh
+        else if (s.frame) s.threshold = NextThreshold(s.threshold, s.offered, s.used, share, s.full);
+        if (r.probe_frames && frame / r.probe_frames != s.frame / r.probe_frames) s.phase = NextPhase(s.phase, s.threshold);
+        s.frame = frame; s.used = 0; s.offered = 0; s.mover_used = 0; s.full = false;
+    }
+    if (movers && is_mover) {
+        // A draw known to move by itself: replayed while the movers together fit the budget.
+        if (s.mover_used + verts > budget) return Choice::MoverLeftOut;
+        s.mover_used += verts;
+        return Choice::MoverAdmit;
+    }
+    const Verdict verdict = movers
+        ? DecideWithin(SweepValue(sig, vb, s.phase), s.threshold, verts, s.used, DrawLimit(budget), ProbeFrameLimit(budget, share))
+        : Decide(DrawValue(sig, vb, frame, r.rotate_frames), s.threshold, verts, s.used, budget);
+    switch (verdict) {
+    case Verdict::DrawTooLarge: return Choice::DrawTooLarge;
+    case Verdict::NotSampled: s.offered += verts; return Choice::NotSampled;
+    case Verdict::FrameFull:
+        s.full = true;
+        if (movers) s.offered += verts;
+        else if (closed) *closed = true;
+        return Choice::FrameFull;
+    case Verdict::Admit: break;
+    }
+    s.offered += verts; s.used += verts;
+    return Choice::Admit;
+}
+
 } // namespace na::replay_budget

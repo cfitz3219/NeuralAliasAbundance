@@ -219,7 +219,7 @@ void Pass::harvest()
         stats_.gpu_last = v;
         if (learned) {
             ++stats_.learn_read;
-            na::observe::ReplayLearn(seen.data(), seen.size());
+            learn_(seen.data(), seen.size());
             learned_[i].clear();
         }
     }
@@ -233,6 +233,22 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     harvest();
     na::observe::ReplayFrame f;
     if (!na::observe::ReplayTakeFrame(l, q, &f)) return out;
+    return record(l, depth, rw, rh, reversed, reset, viewport_jitter, reference, f, false);
+}
+
+Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue*, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
+                    const float viewport_jitter[2], const Reference* reference, const na::observe::ReplayFrame& f, bool expanded)
+{
+    Output out;
+    if (!Ready() || !l || !depth || !rw || !rh || !f.cur || f.cur_draws.empty()) return out;
+    harvest();
+    return record(l, depth, rw, rh, reversed, reset, viewport_jitter, reference, f, expanded);
+}
+
+Output Pass::record(ID3D12GraphicsCommandList* l, ID3D12Resource* depth, uint32_t rw, uint32_t rh, bool reversed, bool reset,
+                    const float viewport_jitter[2], const Reference* reference, const na::observe::ReplayFrame& f, bool expanded)
+{
+    Output out;
     ++stats_.frames;
     stats_.draws += f.cur_draws.size();
     stats_.prev_draws += f.prev_draws.size();
@@ -339,13 +355,19 @@ Output Pass::Record(ID3D12GraphicsCommandList* l, ID3D12CommandQueue* q, ID3D12R
     Globals g{};
     g.w = rw; g.h = rh;
     g.jx = viewport_jitter ? viewport_jitter[0] : 0.f; g.jy = viewport_jitter ? viewport_jitter[1] : 0.f;
+    if (expanded) {
+        // The game's grid: clip -1..1 spans W+1 pixels starting half a pixel left of (and above) the
+        // target. The shader's pixel arithmetic then works on that grid unchanged.
+        g.w = rw + 1; g.h = rh + 1;
+        g.jx -= 0.5f; g.jy -= 0.5f;
+    }
     g.ref_mode = ref.mode | (fix ? 256u : 0u);
     g.depth_far = ref.depth_far; g.apart_px = ref.apart_px; g.apart_rel = ref.apart_rel;
     std::memcpy(g.reproj, ref.matrix, sizeof g.reproj);
     l->SetGraphicsRoot32BitConstants(1, sizeof(Globals) / 4, &g, kPerDraw);
     if (ref.mode == 1) ++stats_.learn_camera; else if (ref.mode == 2) ++stats_.learn_screen; else ++stats_.learn_none;
     learned_[set].reserve(learn);
-    const D3D12_VIEWPORT vp{g.jx, g.jy, static_cast<float>(rw), static_cast<float>(rh), 0.f, 1.f};
+    const D3D12_VIEWPORT vp{g.jx, g.jy, static_cast<float>(g.w), static_cast<float>(g.h), 0.f, 1.f};
     l->RSSetViewports(1, &vp);
     l->OMSetRenderTargets(2, rt, FALSE, &dsv);
     l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

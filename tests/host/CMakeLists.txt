@@ -96,6 +96,8 @@ if(NA_HAVE_NGX_SDK)
   set_tests_properties(host_j2_screen_motion_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
   na_host_test(draw_replay_test SOURCES draw_replay_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
+  # The same rasteriser fed by another producer's positions (the native DX11 route); WARP on the runner.
+  na_host_test(replay_motion_frame_test SOURCES replay_motion_frame_test.cpp LIBS host_dx12 dxgi d3dcompiler)
 endif()
 na_host_test(camera_fit_gpu_test SOURCES camera_fit_gpu_test.cpp LIBS core_gpu dxgi LABELS gpu)
 # The J2 flow programs, the camera-free ones included, through the real HLSL compiler (no device).
@@ -483,6 +485,8 @@ na_host_test(native11_frame_model_test SOURCES native11/frame_model_test.cpp)
 if(TARGET host_native11)
   # The B1 provider on a synthetic DX11 game (hardware, else WARP): runs on the hosted runner.
   na_host_test(native11_provider_test SOURCES native11/provider_test.cpp LIBS host_native11 d3dcompiler)
+  # Draw replay on the native DX11 route (native11/draw_replay.hpp): hardware, else WARP on the runner.
+  na_host_test(native11_draw_replay_test SOURCES native11/draw_replay_test.cpp LIBS host_native11 d3d11 d3dcompiler)
   add_test(NAME host_native11_screen_check_warp_test COMMAND native11_provider_test --screen-check-warp)
   set_tests_properties(host_native11_screen_check_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host")
   add_test(NAME host_native11_screen_check_test COMMAND native11_provider_test --screen-check)

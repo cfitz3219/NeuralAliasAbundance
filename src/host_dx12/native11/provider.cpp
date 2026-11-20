@@ -31,6 +31,7 @@
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/native11/depth_reads.hpp"
@@ -2530,40 +2531,63 @@ void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
     }
 }
 
+// Draw replay (draw_replay.hpp): after the game's draw has run, a qualifying scene draw on the
+// immediate context is drawn again with stream output into this frame's position buffer.
+void ReplayAfterDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs& a)
+{
+    if (!x || !draw_replay::Active()) return;
+    draw_replay::DrawFacts f;
+    f.frame = g_frame;
+    f.deferred = x->deferred;
+    const Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
+    f.scene_depth = scene_depth && x->depth == scene_depth && x->depth_test;
+    f.depth_read_only = x->depth_read_only;
+    f.query_active = x->raster_queries != 0;
+    f.viewport = &x->vps[0].TopLeftX; // D3D11_VIEWPORT: TopLeftX, TopLeftY, Width, Height, MinDepth, MaxDepth
+    f.viewports = x->vp_n;
+    draw_replay::AfterDraw(c, f, a);
+}
 void STDMETHODCALLTYPE DrawIndexed_d(ID3D11DeviceContext* c, UINT count, UINT start, INT base)
 {
     Ctx* x = DrawEvent(c, count, false);
     ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed(c, count, start, base); });
+    ReplayAfterDraw(c, x, {true, false, count, 1, start, 0, base});
 }
 void STDMETHODCALLTYPE Draw_d(ID3D11DeviceContext* c, UINT count, UINT start)
 {
     Ctx* x = DrawEvent(c, count, false);
     ForwardGameDraw(c, x, [&] { O(c, x).draw(c, count, start); });
+    ReplayAfterDraw(c, x, {false, false, count, 1, start, 0, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
 {
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
     ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
+    if (inst) ReplayAfterDraw(c, x, {true, false, count, inst, start, start_inst, base});
 }
 void STDMETHODCALLTYPE DrawInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, UINT start_inst)
 {
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
     ForwardGameDraw(c, x, [&] { O(c, x).draw_instanced(c, count, inst, start, start_inst); });
+    if (inst) ReplayAfterDraw(c, x, {false, false, count, inst, start, start_inst, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
     Ctx* x = DrawEvent(c, 0, true);
     ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_indirect(c, b, off); });
+    ReplayAfterDraw(c, x, {true, true});
 }
 void STDMETHODCALLTYPE DrawInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
     Ctx* x = DrawEvent(c, 0, true);
     ForwardGameDraw(c, x, [&] { O(c, x).draw_indirect(c, b, off); });
+    ReplayAfterDraw(c, x, {false, true});
 }
 void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
 {
     Ctx* x = DrawEvent(c, 0, true);
     ForwardGameDraw(c, x, [&] { O(c, x).draw_auto(c); });
+    ReplayAfterDraw(c, x, {false, true});
 }
 void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
 {

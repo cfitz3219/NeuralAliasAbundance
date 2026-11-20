@@ -111,6 +111,29 @@ int main()
         check(NextThreshold(1, 1ull << 50, 1ull << 40, 1000000, true) == 1, "never below 1");
         check(NextThreshold(123, 5, 5, 0, false) == kFull, "no budget: every draw");
     }
+    { // Choose: the per-frame decision both producers (DX12 and native DX11) share
+        const Rules rules{240, 4, 24};
+        FrameBudget s;
+        bool closed = false;
+        // Movers first, up to the whole budget, whatever the sample says.
+        check(Choose(s, 5, 1000, true, true, 1, 2, 600, rules, &closed) == Choice::MoverAdmit, "a known mover is admitted");
+        check(Choose(s, 5, 1000, true, true, 3, 4, 300, rules, &closed) == Choice::MoverAdmit, "movers fit the budget together");
+        check(Choose(s, 5, 1000, true, true, 5, 6, 200, rules, &closed) == Choice::MoverLeftOut && s.mover_used == 900,
+              "a mover over the budget is left out and takes nothing");
+        // Sample alone: the whole view fits at the full threshold; a frame that fills closes the door.
+        FrameBudget t;
+        check(Choose(t, 7, 1000, false, false, 1, 2, 400, rules, &closed) == Choice::Admit && t.used == 400, "the sample admits under the budget");
+        check(Choose(t, 7, 1000, false, false, 3, 4, 501, rules, &closed) == Choice::DrawTooLarge && !closed, "over half the budget is too large");
+        check(Choose(t, 7, 1000, false, false, 3, 4, 450, rules, &closed) == Choice::Admit, "still within 5/4");
+        check(Choose(t, 7, 1000, false, false, 9, 9, 450, rules, &closed) == Choice::FrameFull && closed && t.full, "a full frame closes without movers");
+        // A new frame: the last one stopped at its limit, so the threshold comes down a quarter; counts start afresh.
+        Choose(t, 8, 1000, false, false, 1, 2, 10, rules, &closed);
+        check(t.frame == 8 && !t.full && t.threshold == kFull * 3 / 4 && t.used <= 10, "a new frame follows the last one and starts its counts afresh");
+        // Switching the rule starts the threshold afresh.
+        t.threshold = 100;
+        Choose(t, 9, 1000, true, false, 1, 2, 10, rules, &closed);
+        check(t.threshold == kFull && t.movers, "another rule starts the threshold at every draw");
+    }
     std::printf("replay_budget: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
     return failures ? 1 : 0;
 }
