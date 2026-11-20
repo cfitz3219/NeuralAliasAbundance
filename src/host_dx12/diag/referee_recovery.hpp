@@ -58,7 +58,8 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
     const auto exhausted = recovery.Exhausted();
     const auto ticket = recovery.Ticket(frame);
     recovery.Tick(now);
-    // VARIANT: referee/proved-roles-kept. Both adapters offer `screen_proved`
+    // VARIANT: referee/proved-roles-kept
+    // Both adapters offer `screen_proved`
     // only for a rotating scene pair whose two roles each reached the screen.
     // The role-following route is kept at once (core/referee_trial.hpp), even
     // over a stage-recovery comparison on the ordinary route: that route
