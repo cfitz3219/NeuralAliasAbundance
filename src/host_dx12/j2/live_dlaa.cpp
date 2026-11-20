@@ -6577,7 +6577,8 @@ void note_handoff_reader(const na::j2::InsertionEvent& e, UINT list, bool after_
 
 int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                             uint64_t color, uint64_t depth,
-                            ID3D12GraphicsCommandList** ours, PendingHistory& pending, bool trial = false)
+                            ID3D12GraphicsCommandList** ours, PendingHistory& pending,
+                            bool trial, UINT after_last_write)
 {
     auto& saved = g.waiting_scene;
     if (saved.frame != g.frame || saved.color != color || saved.depth != depth) {
@@ -6628,7 +6629,7 @@ int record_between_consumer(ID3D12CommandList* const* lists, UINT count,
                 const bool qualified = entry || verdict == V::Accepted || verdict == V::AcceptedWithProducer;
                 // A trial takes only an actual, qualified read. Don't place before an
                 // earlier unresolved entry, or after a reader in a previous submission.
-                if (qualified && (!trial || (!earlier && !saved.read_before && g.frame_seq_complete &&
+                if (qualified && (!trial || (i >= after_last_write && !earlier && !saved.read_before && g.frame_seq_complete &&
                     na::j2::HasSeparateSceneReader(g.frame_seq)))) {
                     g.capture_entry=entry?e.raw:na::j2::InsertionEvent{};
                     pending.referee_handoff = trial;
@@ -8692,7 +8693,11 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
             if (placement_invalidated)
                 placement.Invalidate(now);
             if (placement.OwnsComparison()) {
-                placement.Tick(now, o.executed && !o.later_scene_write && g.placement_submitted == g.frame);
+                // Recording can run ahead of Present. An intact inline recording
+                // may finish during warmup, but never counts as a candidate sample.
+                const bool warmup_fallback = g.inl_frame == g.frame && !placement.Ticket(g.frame);
+                placement.Tick(now, o.executed && !o.later_scene_write &&
+                    (g.placement_submitted == g.frame || warmup_fallback));
                 const auto ticket = placement.Ticket(g.frame);
                 static referee::TrialSample proof;
                 if (ticket && referee::gpu::TakeTrialSample(ticket, proof)) placement.Add(ticket, proof, g.frame, now);
@@ -8959,10 +8964,12 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         }
     }
     na::wwii::SceneCameraReceipt scene_camera_to_submit;
+    UINT after_last_selected_write = 0;
     if (selected_color && selected_depth) for (UINT i = 0; i < count; ++i) {
         if (!lists[i]) continue;
         const auto id = na::observe::IdOf(lists[i]);
         const auto decision = na::observe::ListInsertionDecision(lists[i], selected_color);
+        if (decision.writes) after_last_selected_write = i + 1;
         if (decision.writes && g.scene_w && g.scene_h) { // I1.1: this frame's scene was drawn at this size
             g.stats.seen_scene_w = g.scene_w; g.stats.seen_scene_h = g.scene_h; g.stats.seen_scene_frame = g.frame;
         }
@@ -9096,7 +9103,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (before<0 && !g_native_reduced.load(std::memory_order_relaxed) && !verified_native_reader() && !g.inl.valid &&
             g.submitted_frame != g.frame && g.queue.Get() == queue && g.dlss_ready &&
             selected_color && selected_depth && g.router.Mode() == na::j2::RouteMode::Auto)
-            before=record_between_consumer(lists,count,selected_color,selected_depth,&ours,pending,placement_candidate);
+            before=record_between_consumer(lists,count,selected_color,selected_depth,&ours,pending,placement_candidate,after_last_selected_write);
         else if (before<0 && !g_native_reduced.load(std::memory_order_relaxed))
         {
             g.frame_handoff |= g.inl.valid ? kHoBlockedInline : g.submitted_frame == g.frame ? kHoBlockedOwned : kHoBlockedOther;
