@@ -362,6 +362,11 @@ void SyncCameraUse()
     const bool paused = !j2::Enabled() || j2::Paused();
     native11::SetEvaluationPaused(paused);
     native11::SetDepthReads(!paused && j2::Jitter());
+    // Apply the switch at Present even when a frame supplies no scene to DLAA.
+    const auto& options = settings::Get();
+    native11::draw_replay::Configure(!paused && options.j2_draw_replay.load(std::memory_order_relaxed) != 0,
+                                     options.j2_replay_budget.load(std::memory_order_relaxed),
+                                     options.j2_replay_movers.load(std::memory_order_relaxed) != 0);
     const int setting = settings::Get().j2_camera.load(std::memory_order_relaxed);
     native11::SetCameraUse(setting == 0 ? native11::CameraUse::Off : setting == 2 ? native11::CameraUse::Required
                                                                                 : native11::CameraUse::Optional);
@@ -373,14 +378,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // existing session worker so it can qualify settings and enable effects.
     if (context) host::RendererObserved();
     native11::SetNextJitter(0, 0);
-    // Draw replay ([j2] draw_replay, the same switch, budget and movers rule as DX12): this frame's
-    // replayed draws end here (later draws of the frame are not the scene), and the setting is
-    // applied to the next frame's draws.
+    // Seal at the scene boundary. Later draws belong to post-processing or HUD.
     const bool replay_setting = settings::Get().j2_draw_replay.load(std::memory_order_relaxed) != 0;
-    native11::draw_replay::Configure(replay_setting && context && j2::Enabled() && !j2::Paused(),
-                                     settings::Get().j2_replay_budget.load(std::memory_order_relaxed),
-                                     settings::Get().j2_replay_movers.load(std::memory_order_relaxed) != 0);
-    native11::draw_replay::Sealed sealed = native11::draw_replay::Seal(frame.frame);
+    const auto sealed = replay_setting ? native11::draw_replay::Seal(frame.frame) : native11::draw_replay::Sealed{};
     if (!context || !j2::Enabled() || j2::Paused()) return Skip("DLAA paused.");
     std::lock_guard<std::mutex> lock(mutex);
     auto& s = State();

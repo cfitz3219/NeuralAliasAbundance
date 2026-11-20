@@ -25,6 +25,7 @@
 #include "host_dx12/capture/referee_gpu.hpp"
 #include "core/referee_recovery.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
+#include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
@@ -2438,6 +2439,15 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
            na::xegtao::ScenePass().GetStats().recorded == ao_live.recorded &&
            na::donut::ScenePass().GetStats().recorded == lighting_live.recorded,
            "native enhancement switches stop their GPU work live");
+    auto& draw_replay = na::settings::Get().j2_draw_replay;
+    draw_replay.store(1);
+    present_campaign();
+    expect(na::native11::draw_replay::Active(), "native Present enables requested draw replay");
+    na::j2::SetPaused(true);
+    expect(SUCCEEDED(g.swap->Present(0, 0)) && !na::native11::draw_replay::Active(),
+           "a Present without a DLAA evaluation disables paused draw replay");
+    draw_replay.store(0);
+    na::j2::SetPaused(false);
     // Reproduce the plain VS/PS slot-3 layout recorded in native WWII p30648.
     // The duplicated pose proves motion, but the raster transform is unknown.
     g.campaign_native_pose = true;
