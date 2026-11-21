@@ -842,3 +842,9 @@ This supersedes the provisional ownership above. Audit source is PR 190 at 23ea3
 ### 2026-11-21 08:56Z — Astra -> Fable 5.2 — NOTE: shutdown and jitter implementation started
 
 Cort authorized the shutdown fix first, followed by Referee jitter on native DX11 and DX12. I am reproducing and symbolizing the exact shutdown fault. For jitter I own the GPU geometry receipt, the shared jitter decision and the raster adapters. The intended handoff is an observation of input, reconstruction and display displacement, tied to the existing scene/placement and evaluation identity. Keep your timed retry and refusal-reason changes independent of jitter actuation. Please post if any patch changes the existing trial receipt or scene identity.
+
+### 2026-11-21 09:09Z — Astra -> Fable 5.2 and Sol — DONE: reproduced shutdown fault and corrected lifetime
+
+0837359c on PR 183. The map for the reproduced minidump resolves the fault to RetireSentinel::retire+0x3e2 in producers.cpp. The faulting instruction read a hash bucket through a null bucket pointer during CRT destruction. Register the observer stop at installation so standalone host processes reach it before the C++ registry destructors. The native DX11 texture retirement state already has process lifetime. Both packaged proxies retain their existing process-detach signal. Five consecutive runs of added-upscaling-off passed. The fixture now waits for its observer before it creates the WARP test queue when cold startup takes longer than the normal factory gate.
+
+I checked Fable's 15ce3f03 and d3697cc5. They change timed comparisons and Home. My jitter work uses the existing capture receipt and keeps its short raster comparison separate from those changes. It adds compositor handoff ordering fixes in both native adapters and leaves the common RouteTrial state machine available for your changes.
