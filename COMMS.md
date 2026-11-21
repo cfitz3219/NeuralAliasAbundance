@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**Three Kingdoms first run.** Exact RCAS candidate fb1dac70 is staged in Windows Documents as NA-ThreeKingdoms-DLAA-INSTALL.cmd, -RESULTS.cmd and -UNINSTALL.cmd. Cort owns the live run.
+**Three Kingdoms and Pharaoh.** Original RCAS and the automatic Route B Referee are staged in the existing Documents CMDs at a072227a, PR 193. Cort's first Three Kingdoms run proved campaign screen delivery and localized a mixed-jitter riverbank. The recorded Referee state was Off. New game verification remains with Cort.
 
 **November 21 integration and package.** PR 181 merged Astra's shutdown and shared jitter work (abb2d5f2) and Fable's timing, launch-memory and companion binding work (555cce2d) to main at 393db03a. Tested runtime 3e2eb03d is staged for Pharaoh Dynasties. Cort owns the first live run. Windows Documents has NA-PharaohDynasties-DLAA-INSTALL.cmd, -RESULTS.cmd and -UNINSTALL.cmd. Details and the accepted fixture exception are below.
 
@@ -1014,3 +1014,12 @@ All eight CI jobs pass on 60706c4 (Linux, both Windows x64, x86 scope with 0 err
 - **Asked of RTX, when Pharaoh and RCAS work allows:** (1) `host_referee_gpu_test` on the 5070 Ti; (2) one real Route A game with the Referee on: look for `referee_route_a action=witness` and ordinary `referee` verdict lines with `game_dlss`, or `action=no_witness` with its reason. Nothing to install for Cort from this PR.
 - **Win32 screen fixture:** a Win32 configure now registers `native11_dlaa_test` plus `host_native11_dlaa_win32_route_trial_test`, `..._route_trial_disagreeing_scene_test`, `..._parity_lighting_test`. They need `NeuralAliasDlaa64.exe` (x64 build, same commit) and `nvngx_dlss.dll` beside the test. The x86 CI summary does not list test programs, so I only know the build had no errors; please tell me if the target is missing or fails to link on your Win32 build.
 - **My assigned audit list (3, 5, 6, 8, 9, 11, 12, 14, 15):** all written. Open only as proof: the two RTX items above. The Frame Generation preset part of 14 stays parked on Cort's hold.
+
+### 2026-11-21 10:59Z — Astra -> Fable and Sol — HANDOVER: automatic Referee and original RCAS for both Total War packages
+
+Three Kingdoms results 20261121-024125-625 (PID 10476): all 150 paired captures favored DLAA over the input on discriminating screen gradients; all 40 consecutive present counters advanced by one. After the last paused checkpoint delivery advanced 18,116 times over 18,228 observed frame intervals. A 3.907-second gap was sampled across the resolution transition. Three 1080p captures reproduced a localized riverbank outline that barely followed horizontal raster jitter in the input (0.02–0.04 pixels per pixel) and moved oppositely in both raw DLAA and the display (roughly 0.8). Ordinary terrain stabilized. The affected draw itself is not identified. Raw observations, crop and methods in the PR WORKLOG. Local 16-frame viewing strip in Documents/NA-ThreeKingdoms-river-jitter.webp.
+
+The ordinary build hid the switch and still defaulted to Off. Startup settings and the saved game profile both report zero and no screen checks ran. PR 193, a072227a, hooks the existing common route activation, removes the switch, excludes the old value from saves and renderer refresh, and records automatic startup separately from screen evidence. Both API paths exercised on the RTX 5070 Ti. Seven Release checks and the offline Results checks passed. Both GPU jitter fixtures retained half-strength on their controlled input. This is not a live river correction result. PR 191 remains independent; existing optional Route A witness behavior is preserved.
+
+Cort rejected the sharpening change in PR 192. It was rolled back on the branch (fdb21d1e) and closed unmerged. Original RCAS is included in both current packages. Updated both sets of Windows Documents launchers and the Pharaoh RCAS update shortcut. Tested upgrades from fb1dac70, Results and exact rollback for both games in temporary folders. Production proxy SHA-256 D4677E5B44B7B21A732E6CF53680478C12FDE04A193093DDC157FE6BE1CFD747. No live deployment or game testing.
+

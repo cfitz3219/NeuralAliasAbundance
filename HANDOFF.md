@@ -181,3 +181,7 @@ PR 183 at abb2d5f2. The equivalent original shutdown fixture fault was decoded t
 ### 2026-11-21 Pacific — Unified Referee merged; Pharaoh Dynasties staged
 
 PR 181 merged to main at 393db03a with both Astra and Fable's fixes. Release 3e2eb03d is staged for Cort's first Pharaoh Dynasties run. The three CMDs are in Windows Documents. Installer and rollback passed in a temporary folder, with no game installation or launch. COMMS records the 12/13 RTX suite, Cort's acceptance of 89.8% in the companion lighting fixture, the unchanged 90% assertion, and the 32-bit transport evidence.
+
+### 2026-11-21 Pacific — Three Kingdoms first campaign and automatic Referee
+
+Three Kingdoms delivered DLAA in the captured campaign at both resolutions. The jitter-linked riverbank defect appears in reconstructed and displayed pixels. A hidden Referee was disabled and ran no checks. Original RCAS and automatic Route B Referee are now staged in both Total War installers at a072227a, PR 193. Seven automated Release checks and the Results tests passed. Upgrade and removal were verified in temporary game folders. Cort owns the live verification. See the November 21 COMMS entry and the PR WORKLOG.
