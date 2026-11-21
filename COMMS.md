@@ -33,10 +33,10 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 - Round robin: make progress, post here, check here, repeat.
 
 ### Code lines and PRs
-- **Trunk:** `main`. Astra's backlog pass on 2026-11-17 merged PRs 132-135 and 144 into `astra/route-b-dlaa-consolidation` and then that into `main` (PR 158, 82fe548), so `main` now has the consolidated DX11/DX12 source and GameCheck. 24 obsolete PRs were closed (decisions in `docs/PR-BACKLOG-20261117.md`).
-- **Active line:** `claude/project-thread-axt148`, **draft PR 145** (base `claude/project-thread-3euhfs`), "DLAA without a camera on both routes". Holds camera-free DLAA, measured motion + screen fit, movers-first draw replay, capture cleanup, strobe rules 62547e09, referee stage 1 (off), depth reads DX12 + DX11 (PR 162 merged in as eadb1a71). Head around fb6d5dbf at 04:23Z.
-- Other open PRs: 142 Astra material preparation; 143 Astra adaptive-runtime audit (docs); older drafts 83, 88, 89, 90, 91, 92, 93, 94 are parked (not current work).
-- Rule: no branch sprawl. New code work goes on the active line or a short branch that merges back into it.
+
+- **Trunk:** `main`. The unified runtime is in PR 181 at 393db03a. Continue runtime work on short branches from the unified line.
+- **Open draft:** PR 142, material preparation at c8ff9284. It contains unique Material Lab and Rome II preparation files and diverging runtime changes. Keep the branch for a scoped material integration.
+- PRs 184 and 189 merged the archive move and the installer plan reviews. The installer plan mentions GameCheck as historical design context. Cort retired that dependency.
 
 ### On Cort's PC
 - **Installed:** Sniper Elite Resistance on `7933efc` (DX12, camera off, viewport jitter on). Cort 01:47Z: "I cannot deny it has improved. However, it not eliminated." Log `Documents\NA-ser-results-20261117-174531`, fps median 84; capture analysis in `Documents\NA-strobe-7933efc`.
@@ -948,3 +948,12 @@ PR 181 merged to main at 393db03a. Verified both abb2d5f2 and 555cce2d are ances
 RTX Release suite: 12/13 passed. Near miss accepted by Cort for this first package: forced-companion irregular-order lighting reduced the known footprint from 45.9868 to 4.6928 (89.8% vs 90% in the fixture). It delivered on 28/28 frames and all 69,520 distinguishing pixels. The fixture's 90% assertion stays intact. Native DX11 and companion parity passed, as did DX12 rotating lighting, both jitter receipt paths, automatic API detection with real NGX and the shutdown fixture. Win32 transport separately bound 120/120 DLAA replies; all three injected stale WARP replies were refused. Full Win32 screen witness and Route A witness remain separate work.
 
 Ran the deploy self-test and rehearsed install, results and uninstall with the exact payload in a temporary folder. SHA-256 manifest and rollback verified. The test package auto-selects the graphics API, starts with the Referee row hidden and Route B added upscaling, Frame Generation and D3D11On12 off. No game files changed and no game launched. Logs: NA-referee-controls/local/pharaoh-final-tests.log, pharaoh-win32-dlss.log, pharaoh-win32-stale.log, pharaoh-deploy-selftest.log. Cort tests Pharaoh Dynasties first.
+
+
+### 2026-11-21 10:01Z — Astra -> Fable 5.2 and Sol — DONE: clear the pull-request backlog
+
+Reviewed 18 open PRs. Merged the byte-identical archive move #184 at 1d24e501 and the installer plan notes #189 at f145fdc6. Both are documentation only.
+
+Closed #170–#180, #182 and #190 after verifying their exact heads are ancestors of main. Closed #145 after verifying the integrated motion-fit changes at 4e6c3ee3 and later corrections, the exact capture replay source, and the same Draw Replay sources from 30eb0512 at port a3ba3fa5. Closed #186 after verifying its only remaining patch's parity reset in current referee_gpu.cpp, with stricter swap-chain and scene scoping.
+
+GitHub shows one open PR, draft #142. It holds distinct Material Lab, Rome II asset preparation, and older native material changes. Branches were preserved. The Pharaoh runtime and installers are unaffected by these documentation merges. New Referee follow-up work should use main as its base.
