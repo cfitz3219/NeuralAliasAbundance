@@ -1034,7 +1034,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const auto ask_next_jitter = [&] {
         const auto phase = static_cast<uint32_t>(frame.frame);
         const auto sample = native11::DlaaJitterSample(phase, settings::Get().j2_jitter_r2.load() != 0);
-        const auto amount = !debug_jitter.value && frame.recovery_tool == referee::RecoveryTool::None &&
+        // The matched depth and material raster can use the full sequence.
+        const auto amount = !frame.raster.shader_depth_aligned && !debug_jitter.value &&
+            frame.recovery_tool == referee::RecoveryTool::None &&
             referee::RouteTrial::WatchTicket(frame.trial_ticket)
             ? referee::gpu::SceneJitterAmount(frame.presentation_source, referee::shadow::Path::Native11,
                 frame.color.incarnation, frame.depth.incarnation, frame.scene_stream, frame.frame, frame.screen_proof)

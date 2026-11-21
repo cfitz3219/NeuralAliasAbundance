@@ -138,6 +138,12 @@ float4 vs_depth_ramp(uint id : SV_VertexID) : SV_Position {
     float2 p = float2((id << 1) & 2, id & 2) * 2 - 1;
     return float4(p, 0.45 + 0.05 * p.x + 0.13 * p.y, 1);
 }
+float4 vs_shader_depth_mesh(uint id : SV_VertexID) : SV_Position { return vs_depth_ramp(id % 3); }
+float ps_write_shader_depth(float4 p : SV_Position) : SV_Target { return p.z; }
+float4 ps_test_shader_depth(float4 p : SV_Position) : SV_Target {
+    float same = abs(test_depth.Load(int3(uint2(p.xy), 0)) - p.z) < 0.0001 ? 1 : 0;
+    return float4(same, same, same, 1);
+}
 float slab(uint2 pixel) {
     float2 p = float2(pixel) + 0.5;
     float expected = 0.45 + 0.05 * (p.x / 160.0 - 1) + 0.13 * (1 - p.y / 90.0);
@@ -676,6 +682,90 @@ bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
 } // namespace
 
 #if !defined(NA_TEST_NATIVE_DLAA)
+void ShaderDepthLayerFixture(Game& g, int& frame, ID3D11RasterizerState* raster)
+{
+    const auto setup = [](bool ok, const char* what) { expect(ok, what); return ok; };
+    // The game's geometry uses an R32 render target as its depth texture. A
+    // direct texel comparison produces black when the grids are split.
+    const auto vs_code = Compile("vs_shader_depth_mesh", "vs_5_0");
+    const auto producer_code = Compile("ps_write_shader_depth", "ps_5_0");
+    const auto consumer_code = Compile("ps_test_shader_depth", "ps_5_0");
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> producer, consumer;
+    if (!setup(vs_code && producer_code && consumer_code &&
+        SUCCEEDED(g.device->CreateVertexShader(vs_code->GetBufferPointer(), vs_code->GetBufferSize(), nullptr, &vs)) &&
+        SUCCEEDED(g.device->CreatePixelShader(producer_code->GetBufferPointer(), producer_code->GetBufferSize(), nullptr, &producer)) &&
+        SUCCEEDED(g.device->CreatePixelShader(consumer_code->GetBufferPointer(), consumer_code->GetBufferSize(), nullptr, &consumer)),
+        "create shader-depth geometry")) return;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = g.w; desc.Height = g.h;
+    desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> depth_layer, unproved_copy, colours[2];
+    ComPtr<ID3D11RenderTargetView> depth_rtv, colour_rtv[2];
+    ComPtr<ID3D11ShaderResourceView> depth_srv, copy_srv;
+    if (!setup(SUCCEEDED(g.device->CreateTexture2D(&desc, nullptr, &depth_layer)) &&
+        SUCCEEDED(g.device->CreateTexture2D(&desc, nullptr, &unproved_copy)) &&
+        SUCCEEDED(g.device->CreateRenderTargetView(depth_layer.Get(), nullptr, &depth_rtv)) &&
+        SUCCEEDED(g.device->CreateShaderResourceView(depth_layer.Get(), nullptr, &depth_srv)) &&
+        SUCCEEDED(g.device->CreateShaderResourceView(unproved_copy.Get(), nullptr, &copy_srv)),
+        "create original and unproved depth-colour surfaces")) return;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    for (unsigned i = 0; i < 2; ++i)
+        if (!setup(SUCCEEDED(g.device->CreateTexture2D(&desc, nullptr, &colours[i])) &&
+            SUCCEEDED(g.device->CreateRenderTargetView(colours[i].Get(), nullptr, &colour_rtv[i])),
+            "create material buffers")) return;
+    const auto render = [&](float dx, float dy, bool copy, UINT vertices) {
+        na::native11::SetNextJitter(dx, dy);
+        g.swap->Present(0, 0);
+        auto* c = g.ctx.Get();
+        Scene(c, g, frame++);
+        c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH, 1.f, 0);
+        auto* target = depth_rtv.Get();
+        c->OMSetDepthStencilState(nullptr, 0);
+        c->OMSetRenderTargets(1, &target, g.dsv.Get());
+        Viewport(c, g.w, g.h);
+        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        c->RSSetState(raster);
+        c->VSSetShader(vs.Get(), nullptr, 0);
+        c->PSSetShader(producer.Get(), nullptr, 0);
+        c->Draw(9, 0);
+        ID3D11RenderTargetView* materials[]{colour_rtv[0].Get(), colour_rtv[1].Get()};
+        c->OMSetRenderTargets(2, materials, g.dsv.Get());
+        if (copy) c->CopyResource(unproved_copy.Get(), depth_layer.Get());
+        auto* source = copy ? copy_srv.Get() : depth_srv.Get();
+        c->PSSetShaderResources(1, 1, &source);
+        c->PSSetShader(consumer.Get(), nullptr, 0);
+        c->OMSetDepthStencilState(g.depth_off.Get(), 0);
+        c->Draw(vertices, 0);
+        D3D11_VIEWPORT vp{};
+        UINT count = 1;
+        c->RSGetViewports(&count, &vp);
+        const bool same_grid = count == 1 && std::fabs(vp.TopLeftX - (dx - .5f)) < 1.e-6f &&
+            std::fabs(vp.TopLeftY - (dy - .5f)) < 1.e-6f && vp.Width == float(g.w) + 1;
+        source = nullptr;
+        c->PSSetShaderResources(1, 1, &source);
+        c->OMSetRenderTargets(0, nullptr, nullptr);
+        float pixel[4]{};
+        const bool read = ReadCopy(g, pixel, colours[0].Get());
+        c->OMSetDepthStencilState(nullptr, 0);
+        Post(c, g, true);
+        return std::pair{read ? pixel[0] : -1.f, same_grid};
+    };
+    const auto unrelated = render(.323165f, -.452396f, true, 9);
+    const auto fullscreen = render(.323165f, -.452396f, false, 3);
+    const auto negative = render(.323165f, -.452396f, false, 9);
+    const auto positive = render(-.470734f, .419042f, false, 9);
+    std::printf("shader-depth material pixels: unproved %.1f, fullscreen %.1f, matched %.1f/%.1f\n",
+                unrelated.first, fullscreen.first, negative.first, positive.first);
+    expect(unrelated.first == 0 && !unrelated.second, "an unrelated depth texture retains the original viewport");
+    expect(fullscreen.first == 0 && !fullscreen.second, "a fullscreen reader retains the original viewport");
+    expect(negative.first == 1 && negative.second && positive.first == 1 && positive.second,
+           "full-strength offsets preserve material pixels when shader and depth share the raster");
+}
+
 int DepthReadFixture(Game& g, bool debug_layer)
 {
     const auto ramp = Compile("vs_depth_ramp", "vs_5_0");
@@ -870,6 +960,7 @@ int DepthReadFixture(Game& g, bool debug_layer)
     }
     expect(deferred == raw_positive, "an external deferred list leaves the game's depth reads alone");
     expect(queried == raw_positive, "the correction does not add work to an active game occlusion query");
+    if (!debug_layer) ShaderDepthLayerFixture(g, frame, raster.Get());
     ComPtr<ID3D11InfoQueue> debug;
     if (SUCCEEDED(g.device.As(&debug))) {
         for (UINT64 index = 0; index < debug->GetNumStoredMessages(); ++index) {

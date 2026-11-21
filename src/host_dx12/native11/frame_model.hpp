@@ -130,6 +130,7 @@ struct Event {
     uint16_t cb_first[kCbBindSlots] = {}, cb_count[kCbBindSlots] = {}; // in 16-byte constants
     uint64_t viewport_sample = 0; // Draw: actual native viewport offset encoded as two floats
     bool viewport_expanded = false; // Draw: actual viewport border expansion, travels with deferred recording
+    bool viewport_shader_depth = false; // Draw: shares the raster of a proved shader-readable depth layer
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
     // Depth direction evidence (depth_direction.hpp). Last on purpose: hosts that do not say leave them 0.
     uint8_t depth_func = 0;       // Draw: the depth comparison (D3D11 numbering, 1..8) when this draw tests AND WRITES the depth; 0 otherwise
@@ -275,7 +276,8 @@ public:
         if (e.kind != Kind::Draw || e.rt0 != sel_.color) return false;
         if (learned_overlay_) return !IsSceneDraw(e) && overlay_draws_ + 1 == learned_overlay_;
         // VARIANT: point/before-untested-hud
-        return learned_flat_ && tested_draws_ && IsSceneDraw(e) && !e.depth_test && flat_draws_ + 1 == learned_flat_;
+        return learned_flat_ && tested_draws_ && IsSceneDraw(e) && !e.depth_test &&
+               !e.viewport_shader_depth && flat_draws_ + 1 == learned_flat_;
     }
     // Which point the next frame will fire at: 1 = before a read, 2 = before the
     // first HUD draw (HUD rule), 3 = before the first HUD draw that keeps the scene
@@ -540,7 +542,7 @@ public:
     {
         if (!sel_.valid()) return false;
         if (e.depth == sel_.depth) {
-            if (e.rt0 == sel_.color) return true;
+            if (e.rt0 == sel_.color || e.viewport_shader_depth) return true;
             if (!wide_ || !e.depth_test) return false;
             if (e.rt0 == layer_) return true;
             for (Id l : more_layers_) if (e.rt0 == l) return true;
@@ -600,7 +602,7 @@ private:
             pending_tag_ = 0;
             first_overlay_after_scene_pending_ = 0; // so was a non-scene draw into the colour
             if (e.rt0 == sel_.color) {
-                if (e.depth_test) {
+                if (e.depth_test || e.viewport_shader_depth) {
                     ++tested_draws_;
                     first_flat_after_tested_pending_ = 0; // an untested draw before this one was mid-scene
                 } else {
