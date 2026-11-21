@@ -53,6 +53,10 @@ std::unordered_map<ID3D11SamplerState*, std::shared_ptr<Entry>> g_entries;
 
 std::atomic<uint64_t> g_created{0}, g_elig_bias{0}, g_elig_af{0}, g_variants{0}, g_variant_failures{0};
 std::atomic<uint64_t> g_binds{0}, g_swapped{0}, g_unknown{0};
+// Game samplers first met at a bind, not at their creation: the game made them before these hooks
+// were installed (the hooks go in at the first present when the graphics API is detected
+// automatically, after an engine has built its whole sampler table).
+std::atomic<uint64_t> g_adopted{0};
 std::atomic<float> g_last_bias{0.0f};
 std::atomic<uint32_t> g_last_af{0};
 std::atomic<uint64_t> g_material_binds{0};
@@ -110,6 +114,43 @@ HRESULT STDMETHODCALLTYPE CreateSamplerState_d(ID3D11Device* dev, const D3D11_SA
     return hr;
 }
 
+// VARIANT: samplers/adopt-at-bind
+// A sampler the game binds that was never seen at CreateSamplerState: record it from its own
+// description, exactly as its creation would have. Without this a game whose samplers all exist
+// before the hooks do keeps its own texture detail and filtering for the whole session, with the
+// menu showing a bias that no draw uses. Our variants are already in the table, and work of our
+// own on the game's device is not the game's, so neither is adopted. Null = leave it alone.
+std::shared_ptr<Entry> Adopt(ID3D11SamplerState* sampler)
+{
+    if (!sampler || IsOwnWork()) return nullptr;
+    ComPtr<ID3D11Device> owner;
+    sampler->GetDevice(&owner);
+    if (!owner || owner.Get() != g_device.load(std::memory_order_acquire)) return nullptr;
+    auto e = std::make_shared<Entry>();
+    sampler->GetDesc(&e->desc);
+    e->original = sampler;
+    const SamplerFacts f = Facts(e->desc);
+    e->wants_bias = WantsBias(f);
+    e->wants_af = WantsAniso(f);
+    {
+        std::unique_lock<std::shared_mutex> l(g_mu);
+        const auto [it, fresh] = g_entries.emplace(sampler, e);
+        if (!fresh) return it->second; // another thread met it first
+    }
+    if (e->wants_bias) g_elig_bias.fetch_add(1, std::memory_order_relaxed);
+    if (e->wants_af) g_elig_af.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t n = g_adopted.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Says why, once per sampler for the first few and then at round counts.
+    if (n <= 8 || (n & (n - 1)) == 0)
+        na::eventlog::Emit("native11_samplers", "adopted=%llu why=\"bound by the game but created before the sampler hooks were "
+                           "installed\" filter=0x%x address=%u,%u max_aniso=%u bias=%.3f material=%d world=%d",
+                           static_cast<unsigned long long>(n), unsigned(e->desc.Filter), unsigned(e->desc.AddressU),
+                           unsigned(e->desc.AddressV), unsigned(e->desc.MaxAnisotropy), e->desc.MipLODBias,
+                           e->wants_bias ? 1 : 0, e->wants_af ? 1 : 0);
+    af::Global().Observe(AfFacts(f)); // automatic AF judges the game by all its samplers
+    return e;
+}
+
 // The variant of `e` for (bias, af), made on first use; null = bind the game's own.
 ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af, bool& created)
 {
@@ -164,6 +205,8 @@ void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n,
             if (it != g_entries.end()) entries[i] = it->second;
         }
     }
+    for (UINT i = 0; i < n; ++i)
+        if (!entries[i] && requested[i]) entries[i] = Adopt(requested[i]);
     uint64_t unknown = 0, changed = 0;
     for (UINT i = 0; i < n; ++i) {
         swapped[i] = requested[i];
@@ -303,6 +346,7 @@ SamplerStats GetSamplerStats()
     s.binds = g_binds.load();
     s.swapped = g_swapped.load();
     s.unknown = g_unknown.load();
+    s.adopted = g_adopted.load();
     s.material_binds = g_material_binds.load();
     s.after_scene = g_after_scene.load();
     s.original_bias = g_original_bias.load();
@@ -320,12 +364,13 @@ int FormatSamplerStatus(char* out, unsigned long n)
     return std::snprintf(out, n,
                          "native11_samplers{installed=%d want_bias=%.3f want_af=%s applied_bias=%.3f applied_af=%u created=%llu "
                          "material=%llu af_eligible=%llu variants=%llu variant_failures=%llu binds=%llu swapped=%llu unknown=%llu "
-                         "after_scene_own=%llu}",
+                         "adopted=%llu after_scene_own=%llu}",
                          s.installed ? 1 : 0, want_bias, af::ActionName(want_af), s.bias, s.af, static_cast<unsigned long long>(s.created),
                          static_cast<unsigned long long>(s.eligible_bias), static_cast<unsigned long long>(s.eligible_af),
                          static_cast<unsigned long long>(s.variants), static_cast<unsigned long long>(s.variant_failures),
                          static_cast<unsigned long long>(s.binds), static_cast<unsigned long long>(s.swapped),
-                         static_cast<unsigned long long>(s.unknown), static_cast<unsigned long long>(s.after_scene));
+                         static_cast<unsigned long long>(s.unknown), static_cast<unsigned long long>(s.adopted),
+                         static_cast<unsigned long long>(s.after_scene));
 }
 
 } // namespace na::native11

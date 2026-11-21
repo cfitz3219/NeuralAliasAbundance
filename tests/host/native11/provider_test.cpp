@@ -2798,6 +2798,38 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.MipLODBias == -1.f && na::native11::GetSamplerStats().original_bias == -1.f,
            "native mip total avoids double bias when the game already requests -1");
+    // A sampler the game made before the hooks existed (automatic API detection installs them at the
+    // first present, after an engine has built its sampler table) is never seen at creation. It is
+    // recorded the first time the game binds it and gets the same texture detail: pixels, not counters.
+    {
+        D3D11_SAMPLER_DESC early = sampler;
+        early.MipLODBias = 0.f;
+        early.AddressW = D3D11_TEXTURE_ADDRESS_MIRROR; // a description no other sampler here has
+        ComPtr<ID3D11SamplerState> unseen;
+        {
+            na::native11::OwnWorkScope not_recorded; // creation passes the hook unrecorded, as before install
+            g.device->CreateSamplerState(&early, &unseen);
+        }
+        const auto before = na::native11::GetSamplerStats();
+        na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(0);
+        auto* unseen_raw = unseen.Get();
+        g.ctx->PSSetSamplers(0, 1, &unseen_raw);
+        float early_on[4]{}, early_off[4]{};
+        g.ctx->Draw(4, 0); ReadCopy(g, early_on, g.color.Get());
+        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        if (bound) bound->GetDesc(&applied);
+        na::observe::SetSamplerMipBias(0.f);
+        g.ctx->Draw(4, 0); ReadCopy(g, early_off, g.color.Get());
+        const auto after = na::native11::GetSamplerStats();
+        std::printf("native mip pixels, sampler made before the hooks: -1 %.2f/%.2f, own %.2f/%.2f adopted=%llu\n",
+                    early_on[0], early_on[1], early_off[0], early_off[1],
+                    static_cast<unsigned long long>(after.adopted - before.adopted));
+        expect(unseen && after.adopted == before.adopted + 1 && after.eligible_bias == before.eligible_bias + 1 &&
+               after.unknown == before.unknown && bound && applied.MipLODBias == -1.f &&
+               early_on[0] > .9f && early_on[1] < .1f && early_off[1] > .9f,
+               "a sampler created before the hooks gets the mip bias at its first bind and restores live");
+        na::observe::SetSamplerMipBias(-1.f);
+    }
     // After the frame's picture is handed to DLSS the game's later passes keep its own samplers;
     // the next frame's scene gets the policy again. Neither needs a new sampler bind by the game.
     na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(16);
