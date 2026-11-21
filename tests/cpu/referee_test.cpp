@@ -867,7 +867,7 @@ void TestRetryAndReasons()
     }
     {
         // Frame-time acceptance: same picture result, three pacing cases.
-        const auto paced = [&](uint64_t ordinary_ms, uint64_t replacement_ms, uint64_t recheck_ms, bool spike) {
+        const auto paced = [&](uint64_t ordinary_ms, uint64_t replacement_ms, uint64_t recheck_ms, bool spike, bool stagger = false) {
             RouteTrial trial;
             uint64_t ordinal = 0, now = 100;
             trial.Start(51, ordinal, now);
@@ -881,7 +881,9 @@ void TestRetryAndReasons()
                     now += 10 * pace[phase] + (spike && phase == 1 && i == 2 ? 400 : 0);
                     TrialSample frame;
                     frame.ordinal = ordinal;
-                    frame.observed_at = now;
+                    frame.presented_us = now * 1000;
+                    // The readback is published late and unevenly; that must not matter.
+                    frame.observed_at = now + (stagger ? (i * 37 + phase * 53) % 90 : 0);
                     frame.configuration = 1;
                     frame.delivered = true;
                     frame.width = 3440; frame.height = 1440;
@@ -902,6 +904,12 @@ void TestRetryAndReasons()
               "frame time: a replacement 30 percent slower than both ordinary measurements is not kept");
         check(paced(10, 13, 14, false).Current() == Phase::Kept,
               "frame time: a game that slowed down by itself does not condemn the replacement");
+        const auto staggered = paced(10, 10, 10, false, true);
+        check(staggered.Current() == Phase::Kept && std::fabs(staggered.FrameMs(Phase::Candidate) - 10.f) < .01f &&
+              std::fabs(staggered.FrameMs(Phase::Baseline) - 10.f) < .01f,
+              "frame time: identical real cadence with staggered readbacks measures the same pace");
+        TrialSample untimed;
+        check(untimed.presented_us == 0, "frame time: a receipt without a present time takes no part in timing");
         check(paced(10, 10, 10, true).Current() == Phase::Kept,
               "frame time: one load spike during the replacement cannot decide");
     }

@@ -73,6 +73,11 @@ struct State {
     uint64_t observed_dx12 = 0, submitted_dx12 = 0, observed_dx11 = 0, submitted_dx11 = 0;
     shadow::DeliveryContinuity continuity11, continuity12;
     uint64_t pre_ordinal = 0, main_ordinal = 0;
+    // When each recent present reached its endpoint, for frame-time comparison.
+    // Stamped as the present is handed over and again when it returns; a GPU
+    // readback published later looks its own frame up here.
+    struct PresentTime { const void* chain = nullptr; uint64_t ordinal = 0, at_us = 0; };
+    std::array<PresentTime, 64> present_times{};
     uint64_t epoch = 0, pre_epoch = 0, main_epoch = 0;
     float pre_jitter[2]{}, main_jitter[2]{}, mv_scale[2]{1, 1};
     uint8_t pre_jitter_amount = 0, main_jitter_amount = 0;
@@ -622,6 +627,7 @@ void collect_sample()
         if (trial.ordinal && enabled() && g.preview_exact && !g.invalidated) {
             g.trial_sample = trial;
             g.trial_sample.observed_at = GetTickCount64();
+            g.trial_sample.presented_us = presented_at_locked(g.swapchain, trial.ordinal);
             g.trial_source = g.swapchain;
             g.trial_last_ticket = g.captured_context.trial_ticket;
             g.trial_sample_ticket.store(g.trial_last_ticket, std::memory_order_release);
@@ -1271,10 +1277,29 @@ static bool CopyPreviousScreen(ID3D12CommandQueue* queue, ID3D12Resource* image,
     return true;
 }
 
+uint64_t present_clock_us()
+{
+    static const LONGLONG frequency = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return frequency > 0 ? uint64_t(now.QuadPart / frequency) * 1000000ull +
+                           uint64_t(now.QuadPart % frequency) * 1000000ull / uint64_t(frequency) : 0;
+}
+void stamp_present_locked(const void* chain, uint64_t ordinal)
+{
+    g.present_times[ordinal % g.present_times.size()] = {chain, ordinal, present_clock_us()};
+}
+uint64_t presented_at_locked(const void* chain, uint64_t ordinal)
+{
+    const auto& slot = g.present_times[ordinal % g.present_times.size()];
+    return slot.chain == chain && slot.ordinal == ordinal ? slot.at_us : 0;
+}
+
 void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec)
 {
     if (!enabled() || !frame.swapchain) return;
     std::lock_guard<std::mutex> lock(g.m);
+    stamp_present_locked(frame.swapchain, frame.ordinal);
     if (frame.await_result) {
         const auto existing = std::find_if(g.pending_presents.begin(), g.pending_presents.end(),
             [&](const Presentation& p) { return p.swapchain == frame.swapchain && p.ordinal == frame.ordinal; });
@@ -1330,6 +1355,7 @@ void PresentResult(const void* swapchain, uint64_t ordinal, bool accepted)
 {
     if (!swapchain || !g.pending_receipt.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lock(g.m);
+    if (accepted) stamp_present_locked(swapchain, ordinal); // the real presentation endpoint
     const auto slot = std::find_if(g.pending_presents.begin(), g.pending_presents.end(),
         [&](const Presentation& p) { return p.swapchain == swapchain && p.ordinal == ordinal; });
     if (slot == g.pending_presents.end()) return;

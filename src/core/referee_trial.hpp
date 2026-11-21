@@ -65,6 +65,10 @@ struct TrialSample {
     using Change = std::array<float, subdivisions * subdivisions>;
     uint64_t ordinal = 0;
     uint64_t observed_at = 0; // monotonic time of the receipt, supplied by the live observer
+    // Microseconds at which this frame's present reached its endpoint (0: not
+    // known). Frame-time comparison uses only this: the receipt time above
+    // also contains GPU readback and polling delay.
+    uint64_t presented_us = 0;
     uint64_t configuration = 0;
     uint32_t layout = 0, width = 0, height = 0;
     std::array<Change, FlickerTransition::count> change{};
@@ -231,8 +235,9 @@ public:
     static constexpr unsigned inconclusive_limit = 3;
     // VARIANT: referee/frame-time-acceptance
     // A replacement that cures the symptom must not pay for it in frame time.
-    // Each phase measures the real time per game frame between its own
-    // accepted receipts (median of the intervals, so one load spike or menu
+    // Each phase measures the real time per presented frame between its own
+    // accepted receipts, from the time each frame's present reached its
+    // endpoint (median of the intervals, so one load spike or menu
     // hitch cannot decide). The replacement is compared with the SLOWER of the
     // two ordinary-route measurements, so a game that slowed down by itself
     // during the trial does not condemn a good route. Without three intervals
@@ -733,12 +738,12 @@ private:
     }
     void Time(const TrialSample& sample)
     {
-        if (sample.observed_at && timed_at_ && sample.observed_at > timed_at_ && sample.ordinal > timed_ordinal_) {
+        if (sample.presented_us && timed_at_ && sample.presented_us > timed_at_ && sample.ordinal > timed_ordinal_) {
             intervals_[interval_count_ % intervals_.size()] =
-                float(sample.observed_at - timed_at_) / float(sample.ordinal - timed_ordinal_);
+                float(sample.presented_us - timed_at_) * .001f / float(sample.ordinal - timed_ordinal_);
             ++interval_count_;
         }
-        timed_at_ = sample.observed_at;
+        timed_at_ = sample.presented_us;
         timed_ordinal_ = sample.ordinal;
     }
     float MedianInterval() const
