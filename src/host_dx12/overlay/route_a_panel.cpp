@@ -1037,7 +1037,7 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpens edges and texture while limiting extra sharpening on one-pixel patterns that can shimmer. 0% turns it off. HUD elements drawn into the scene can also be sharpened.", S(220));
+        BeginRow("Sharpness", "RCAS sharpens the reconstructed picture. 0% turns it off, 67% gives standard sharpening, and 100% gives twice standard strength. HUD elements drawn into the scene can also be sharpened.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
