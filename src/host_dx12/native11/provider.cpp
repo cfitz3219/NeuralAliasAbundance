@@ -269,6 +269,7 @@ struct Ctx {
     uint32_t target_width = 0, target_height = 0;
     bool depth_layer_target = false, material_layer_target = false;
     bool vpj_shader_depth = false;
+    bool vpj_still_mesh = false; // VARIANT: referee/sample-locked-dropout (moved at the Referee's ask)
     uint8_t depth_func = kCompareLess; // the bound state's comparison when it tests AND writes depth, else 0 (default state: LESS, writing)
     Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
     uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
@@ -310,7 +311,7 @@ struct Ctx {
         rt_count = 0;
         raster_depth_layer = {};
         target_width = target_height = 0;
-        depth_layer_target = material_layer_target = vpj_shader_depth = false;
+        depth_layer_target = material_layer_target = vpj_shader_depth = vpj_still_mesh = false;
         depth_test = true;
         depth_read_only = false;
         for (auto& mask : depth_reads.slots) mask.reset();
@@ -489,6 +490,10 @@ uint32_t g_vpj_frame_unshifted = 0; // draws into the scene colour left unshifte
 // sub-pixel samples for those: their edges stay as the game drew them).
 uint64_t g_vpj_frame_shifted_vertices = 0, g_vpj_frame_still_vertices = 0;
 uint32_t g_vpj_frame_still_meshes = 0, g_vpj_frame_still_untested = 0, g_vpj_frame_shader_depth = 0;
+// VARIANT: referee/sample-locked-dropout
+// Set by the Referee through SetStillMeshJitter while it tries or keeps its reaction to dropouts.
+std::atomic<bool> g_vpj_still_asked{false};
+uint32_t g_vpj_frame_still_moved = 0;
 constexpr uint64_t kFullScreenPassVertices = 6; // two triangles: more than this is a mesh
 std::atomic<uint64_t> g_vpj_unshifted{0};
 std::atomic<uint64_t> g_vpj_told{0}; // the sample last handed to the consumer (two floats, pixels)
@@ -1411,6 +1416,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     // (it writes the sample into one); the viewport route never does.
     f.raster.viewport = vpj_route;
     f.raster.shader_depth_aligned = vpj_route && g_vpj_frame_shader_depth != 0;
+    f.raster.still_meshes_moved = vpj_route ? g_vpj_frame_still_moved : 0;
     f.raster.qualified = vpj_route || (have_camera && f.camera.vs_slot >= 0 && cam.raster_jitter_qualified);
     f.raster.expanded = vpj_route && g_vpj_executed_expanded;
     f.raster.applied = vpj_route ? g_vpj_executed_sample != 0 : (f.raster.qualified && g_jitter_written);
@@ -1443,7 +1449,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
             na::eventlog::Emit("native11_jitter",
                                "frame=%llu route=%s told_px=%.4f,%.4f viewport_shift_px=%.4f,%.4f applied=%d shifted_draws=%u "
                                "unshifted_colour_draws=%u scene_draws=%u held=%d scene=%.0fx%.0f depth=%ux%u "
-                               "shifted_vertices=%llu still_meshes{draws=%u untested=%u vertices=%llu} aligned_shader_depth_draws=%u",
+                               "shifted_vertices=%llu still_meshes{draws=%u untested=%u vertices=%llu} aligned_shader_depth_draws=%u "
+                               "referee_still_meshes{asked=%d moved_draws=%u}",
                                static_cast<unsigned long long>(g_frame), vpj_route ? "viewport" : "matrix",
                                f.camera.jitter_px[0], f.camera.jitter_px[1], shift[0], shift[1], f.camera.jitter_applied ? 1 : 0,
                                g_vpj_frame_draws, g_vpj_frame_unshifted, g_model.SceneDrawsThisFrame(), held ? 1 : 0,
@@ -1451,7 +1458,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
                                g_sel_depth_h.load(std::memory_order_relaxed),
                                static_cast<unsigned long long>(g_vpj_frame_shifted_vertices), g_vpj_frame_still_meshes,
                                g_vpj_frame_still_untested, static_cast<unsigned long long>(g_vpj_frame_still_vertices),
-                               g_vpj_frame_shader_depth);
+                               g_vpj_frame_shader_depth, g_vpj_still_asked.load(std::memory_order_relaxed) ? 1 : 0,
+                               g_vpj_frame_still_moved);
         }
         uint64_t told = 0;
         std::memcpy(&told, f.camera.jitter_px, sizeof told);
@@ -1666,6 +1674,7 @@ void NoteViewportDraw(const Event& e)
         ++g_vpj_frame_unshifted;
     if (e.viewport_sample) {
         g_vpj_frame_shader_depth += e.viewport_shader_depth ? 1u : 0u;
+        g_vpj_frame_still_moved += e.viewport_still_mesh ? 1u : 0u;
         g_vpj_frame_shifted_vertices += e.vertices;
     } else if (g_vpj_sample.load(std::memory_order_relaxed) && e.depth && e.vertices > kFullScreenPassVertices &&
                (e.depth == g_sel_depth.load(std::memory_order_relaxed) || e.depth == g_sel_depth2.load(std::memory_order_relaxed))) {
@@ -1807,7 +1816,7 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x, uint64_t vertices = 0)
 {
     const uint64_t sample = g_vpj_sample.load(std::memory_order_acquire);
     const bool on = sample != 0;
-    x->vpj_shader_depth = false;
+    x->vpj_shader_depth = x->vpj_still_mesh = false;
     if (!on && !x->vpj_applied) return;
     Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
     // VARIANT: scene/after-layers-second-depth
@@ -1828,7 +1837,23 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x, uint64_t vertices = 0)
             x->target_height == g_sel_depth_h.load(std::memory_order_relaxed) &&
             layer.min_depth == x->vps[0].MinDepth && layer.max_depth == x->vps[0].MaxDepth;
     }
-    const bool tests_scene_depth = x->depth_test || x->vpj_shader_depth;
+    // VARIANT: referee/sample-locked-dropout
+    // The Referee saw pixels drop out on some samples: while it asks, a scene mesh no rule above
+    // moved takes the full sample as well (any target; never a full-screen pass). Immediate context
+    // only: there the sample is cleared the moment the picture is handed over, so nothing after the
+    // scene moves; a deferred recording has no such order until it is executed.
+    if (on && !x->deferred && !x->vpj_shader_depth && g_vpj_still_asked.load(std::memory_order_relaxed)) {
+        neural_alias::StillMesh mesh;
+        mesh.asked = mesh.active = true;
+        mesh.tests_depth = x->depth_test;
+        mesh.scene_depth_bound = scene_depth && x->depth == scene_depth;
+        mesh.mesh = vertices > kFullScreenPassVertices;
+        mesh.scene_viewport = x->vp_n == 1 && x->vp_x == 0.f && x->vp_y == 0.f &&
+            x->vp_w == float(g_sel_depth_w.load(std::memory_order_relaxed)) &&
+            x->vp_h == float(g_sel_depth_h.load(std::memory_order_relaxed));
+        x->vpj_still_mesh = neural_alias::StillMeshTakesJitter(mesh);
+    }
+    const bool tests_scene_depth = x->depth_test || x->vpj_shader_depth || x->vpj_still_mesh;
     const bool scene = on && scene_depth && x->depth == scene_depth && tests_scene_depth;
     if (scene && !x->vp_n) g_vpj_unknown.fetch_add(1, std::memory_order_relaxed);
     const bool want = WantsViewportJitter(on, x->depth, scene_depth, tests_scene_depth, x->vp_n);
@@ -1976,6 +2001,7 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.viewport_sample = x->vpj_applied ? x->vpj_sample : 0;
     e.viewport_expanded = x->vpj_applied && x->vpj_expanded;
     e.viewport_shader_depth = x->vpj_shader_depth;
+    e.viewport_still_mesh = x->vpj_still_mesh && x->vpj_applied;
     const bool camera_tracking = CameraTracking();
     if (camera_tracking) {
         std::memcpy(e.cb, x->cb, sizeof(e.cb));
@@ -2423,7 +2449,8 @@ void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, F
     auto& reads = state->depth_reads;
     const bool has_binding = dispatch ? reads.slots[static_cast<size_t>(DepthStage::Compute)].any() :
         (reads.slots[static_cast<size_t>(DepthStage::Pixel)] | reads.slots[static_cast<size_t>(DepthStage::Vertex)]).any();
-    if (has_binding && (dispatch || !state->vpj_shader_depth) && (state->depth != depth || state->depth_read_only)) {
+    // A draw moved onto the sample reads the scene's own depth: both are on the same grid.
+    if (has_binding && (dispatch || !(state->vpj_shader_depth || state->vpj_still_mesh)) && (state->depth != depth || state->depth_read_only)) {
         DepthBindings bindings(context, state, depth, dispatch);
         forward();
     } else forward();
@@ -3428,7 +3455,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_vpj_unshifted.fetch_add(g_vpj_frame_unshifted, std::memory_order_relaxed);
     g_vpj_frame_unshifted = 0;
     g_vpj_frame_shifted_vertices = g_vpj_frame_still_vertices = 0;
-    g_vpj_frame_still_meshes = g_vpj_frame_still_untested = g_vpj_frame_shader_depth = 0;
+    g_vpj_frame_still_meshes = g_vpj_frame_still_untested = g_vpj_frame_shader_depth = g_vpj_frame_still_moved = 0;
     g_vpj_seen_draw = g_vpj_mixed = false;
     g_vpj_executed_sample = 0;
     g_vpj_executed_expanded = false;
@@ -3783,6 +3810,8 @@ void SetCameraUse(CameraUse use)
     na::eventlog::Emit("native11_camera_use", "frame=%llu use=%s", static_cast<unsigned long long>(g_frame),
                        use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required");
 }
+
+void SetStillMeshJitter(bool asked) { g_vpj_still_asked.store(asked, std::memory_order_relaxed); }
 
 void SetNextJitter(float x_px, float y_px)
 {

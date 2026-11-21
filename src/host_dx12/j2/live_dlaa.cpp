@@ -2821,6 +2821,13 @@ void vpj_advance()
         na::observe::GetLiveSelection(&depth, &color);
         amount = referee::gpu::SceneJitterAmount(g.recovery_swapchain, path, color, depth,
                                                  route.history_generation, g.submitted_frame);
+        // VARIANT: referee/sample-locked-dropout
+        // The Referee's reaction to pixels that drop out on some samples: the meshes the fixed rule
+        // left on the game's grid take the sample too, and the sample stays at full strength while
+        // it tries or keeps that (a weaker sample would hide the dropouts it is checking for).
+        const bool still = referee::gpu::SceneStillMeshes(g.recovery_swapchain, path, color, depth, route.history_generation);
+        na::observe::SetStillMeshJitter(still);
+        if (still) amount = referee::normal_jitter;
     }
     auto& e = g.vpj[g.frame % 8];
     e = {g.frame, static_cast<float>(js.x_pixels) * (amount * .01f),

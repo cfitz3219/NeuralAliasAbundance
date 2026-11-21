@@ -79,6 +79,7 @@ struct RasterFacts {
     bool applied = false;    // this frame's scene draws carried jitter_px (false: the picture is exactly unjittered)
     float jitter_px[2] = {0, 0}; // the sample, in pixels of the scene extent (DLSS convention)
     bool shader_depth_aligned = false; // full grid shared by the depth layer and its material draws
+    uint32_t still_meshes_moved = 0;   // untested meshes that took the sample at the Referee's ask
 };
 
 enum class Boundary : uint8_t {
@@ -193,6 +194,11 @@ void Uninstall();
 // it into the camera bytes the game uploads (the same write the DX12 route makes) and reports it back
 // in CameraFacts so colour, depth, camera and jitter always belong to one scene.
 void SetNextJitter(float x_px, float y_px);
+// VARIANT: referee/sample-locked-dropout
+// The Referee's ask (referee::gpu::SceneStillMeshes): while true, a scene mesh drawn with the depth
+// test off and the scene depth bound takes the frame's full sample too (core/temporal_jitter.hpp,
+// StillMeshTakesJitter). The DX11 side of na::observe::SetStillMeshJitter.
+void SetStillMeshJitter(bool asked);
 // How SetNextJitter's sample reaches the picture.
 //  Matrix (default):  written into the scene camera's ViewProjection at the game's upload. Needs a
 //                     camera layout the adapter has qualified for the raster transform.

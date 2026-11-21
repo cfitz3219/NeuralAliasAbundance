@@ -39,6 +39,17 @@ int main() { return test::run({
         no = r; no.scene_depth_bound = false; CHECK(!ShaderDepthReaderTakesJitter(no));
         no = r; no.active = false; CHECK(!ShaderDepthReaderTakesJitter(no));
     }},
+    {"a mesh the fixed rules left behind moves only while the Referee asks", [] {
+        StillMesh m;
+        m.asked = m.active = m.scene_depth_bound = m.mesh = m.scene_viewport = true;
+        CHECK(StillMeshTakesJitter(m));
+        auto no = m; no.asked = false; CHECK(!StillMeshTakesJitter(no));       // no ask: the game's own grid
+        no = m; no.active = false; CHECK(!StillMeshTakesJitter(no));           // no sample, or the scene is handed over
+        no = m; no.tests_depth = true; CHECK(!StillMeshTakesJitter(no));       // the ordinary rule's draw
+        no = m; no.scene_depth_bound = false; CHECK(!StillMeshTakesJitter(no)); // another view
+        no = m; no.mesh = false; CHECK(!StillMeshTakesJitter(no));             // a full-screen pass never moves
+        no = m; no.scene_viewport = false; CHECK(!StillMeshTakesJitter(no));   // a partial view
+    }},
     {"known Halton samples and wrapping", [] {
         const double xs[] = {0, -.25, .25, -.375};
         const double ys[] = {-1./6, 1./6, -7./18, -1./18};

@@ -50,6 +50,25 @@ constexpr ShaderDepthRefusal ShaderDepthReaderRefusal(const ShaderDepthReader& r
     if (!r.reads_layer) return ShaderDepthRefusal::NotRead;
     return ShaderDepthRefusal::None;
 }
+// VARIANT: referee/sample-locked-dropout
+// The Referee's reaction to pixels that go exactly black on some samples and come back on others
+// (core/referee_dropout.hpp): while it asks, every scene mesh the fixed rules above left on the
+// game's own grid takes the frame's full sample too, whatever it reads and wherever it draws. The
+// Referee keeps the move only if the dropouts stop on the samples that produced them, and takes it
+// back otherwise. A full-screen pass is never moved, and nothing moves once the scene is handed over
+// (the hosts clear the sample or prove the resolve there, as for every other scene draw).
+struct StillMesh {
+    bool asked = false;             // the Referee asks for the move on this scene
+    bool active = false;            // a sample is in force for this draw's frame
+    bool tests_depth = false;       // hardware depth test on: the ordinary rule already decides
+    bool scene_depth_bound = false; // the scene's depth buffer is the bound depth
+    bool mesh = false;              // more vertices than a full-screen pass
+    bool scene_viewport = false;    // one viewport covering the whole scene target
+};
+constexpr bool StillMeshTakesJitter(const StillMesh& m)
+{
+    return m.asked && m.active && !m.tests_depth && m.scene_depth_bound && m.mesh && m.scene_viewport;
+}
 // The overlay owns this session-only transform. NVIDIA's F9/F10 hotkeys
 // have no reported state we can reliably return to zero.
 struct JitterDiagnostic {

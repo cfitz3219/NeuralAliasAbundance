@@ -9,7 +9,10 @@ namespace na::referee {
 // There is no synchronous readback and the search only runs on signed native-grid pairs.
 constexpr unsigned mixed_cols(unsigned w) { return (std::min)(192u, (w + 19) / 20); }
 constexpr unsigned mixed_rows(unsigned h) { return (std::min)(108u, (h + 19) / 20); }
-constexpr unsigned mixed_values = 10;
+// Values 0..9 are the fit's moments. 10 and 11 are the share of the footprint's 49 places that are
+// exactly black (red, green and blue all zero over the place's 3x3 pixels) in the input before and
+// now: the dropout watch's evidence (core/referee_dropout.hpp).
+constexpr unsigned mixed_values = 12, mixed_black_before = 10, mixed_black_now = 11;
 struct MixedRasterField {
     struct Cell { float v[mixed_values]{}; };
     std::vector<Cell> cells;

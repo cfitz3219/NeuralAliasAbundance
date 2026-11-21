@@ -96,7 +96,7 @@ O PSRead(V v){float s=layer.Load(int3(v.p.xy,0));O o;o.a=o.b=float4(abs(s-v.p.z)
         dst.pResource=rb.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.PlacedFootprint.Footprint={F4,W,H,1,W*16};
         l->CopyTextureRegion(&dst,0,0,0,&src,nullptr);std::swap(b.Transition.StateBefore,b.Transition.StateAfter);l->ResourceBarrier(1,&b);
     };
-    const auto check=[&](const char* what){
+    const auto check=[&](const char* what)->int{
         float* pixels=nullptr;REQUIRE(SUCCEEDED(rb->Map(0,nullptr,reinterpret_cast<void**>(&pixels))));
         const auto ok=[&](UINT x,UINT y){return pixels[(y*W+x)*4];};
         std::printf("%s: layer reader %.0f/%.0f, copy reader %.0f/%.0f, full-screen reader %.0f/%.0f, untouched %.1f\n",what,
@@ -106,6 +106,7 @@ O PSRead(V v){float s=layer.Load(int3(v.p.xy,0));O o;o.a=o.b=float4(abs(s-v.p.z)
         CHECK(ok(24,25)==0.f&&ok(48,25)==0.f); // a full-screen pass is never moved
         CHECK(ok(24,11)==.5f&&ok(24,21)==.5f); // the scissors held
         rb->Unmap(0,nullptr);
+        return 0;
     };
     test::List l;REQUIRE(l.Create(dev));
     // Frame 1, one recording: writer, then readers. The jitter is the sample Three Kingdoms failed on.
@@ -118,7 +119,7 @@ O PSRead(V v){float s=layer.Load(int3(v.p.xy,0));O o;o.a=o.b=float4(abs(s-v.p.z)
     }
     consume(l.list.Get());read_back(l.list.Get());
     REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* one[]={l.list.Get()};d.queue->ExecuteCommandLists(1,one);d.WaitIdle();
-    check("frame 1, one recording");
+    REQUIRE(check("frame 1, one recording")==0);
     auto stats=na::observe::GetViewportJitterStats();
     CHECK(stats.shader_depth==1);CHECK(stats.shader_depth_refused.not_read==1);
 
@@ -143,7 +144,7 @@ O PSRead(V v){float s=layer.Load(int3(v.p.xy,0));O o;o.a=o.b=float4(abs(s-v.p.z)
         b[0]=test::Transition(layer.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,PSR);l.list->ResourceBarrier(2,b);
     }
     REQUIRE(SUCCEEDED(l.list->Close()));ID3D12CommandList* two[]={l.list.Get(),reader.list.Get()};d.queue->ExecuteCommandLists(2,two);d.WaitIdle();
-    check("frame 2, reader recorded first");
+    REQUIRE(check("frame 2, reader recorded first")==0);
     stats=na::observe::GetViewportJitterStats();
     CHECK(stats.shader_depth==2);CHECK(stats.shader_depth_refused.not_read==2);
 

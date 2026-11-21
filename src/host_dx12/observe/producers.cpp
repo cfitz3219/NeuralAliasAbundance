@@ -5447,6 +5447,10 @@ std::atomic<uint32_t> g_vpj_layer_frame{0}; // newest frame a layer was written 
 std::atomic<uint64_t> g_vpj_shader_depth{0};
 std::atomic<uint64_t> g_vpj_shader_depth_refused[static_cast<size_t>(neural_alias::ShaderDepthRefusal::Count)]{};
 constexpr uint64_t kVpjFullScreenVertices = 6; // two triangles: more than this is a mesh
+// VARIANT: referee/sample-locked-dropout
+// Set by the Referee through SetStillMeshJitter while it tries or keeps its reaction to dropouts.
+std::atomic<bool> g_vpj_still_meshes{false};
+std::atomic<uint64_t> g_vpj_still_moved{0}, g_vpj_still_asks{0};
 inline uint32_t vpj_frame(uint64_t sample) { return static_cast<uint32_t>(sample >> 32); }
 // this frame, the one before, or (a list still recording the frame before) the one after
 inline bool vpj_layer_fresh(uint32_t frame, uint32_t layer_frame) { return layer_frame && frame - layer_frame + 1u <= 2u; }
@@ -5574,16 +5578,19 @@ void vpj_before_draw(GL* l, uint64_t vertices = 0)
         // VARIANT: jitter/shader-depth-readers
         // A mesh with the hardware test off that compares against a sampled depth layer in its
         // shader is scene geometry on that layer's grid. Looked at only once a layer exists.
-        if (sample && pc && !tests_depth && vertices > kVpjFullScreenVertices &&
-            vpj_layer_fresh(vpj_frame(sample), g_vpj_layer_frame.load(std::memory_order_acquire))) {
-            neural_alias::ShaderDepthReader reader;
-            reader.active = reader.scene_depth_bound = reader.mesh = true;
-            reader.several_targets = ls->cur_nrt > 1;
+        const bool untested_mesh = sample && pc && !tests_depth && vertices > kVpjFullScreenVertices;
+        const auto scene_viewport = [&] {
             uint32_t dw = 0, dh = 0, dfmt = 0;
-            reader.scene_viewport = ls->raster_viewports_known && ls->raster_viewport_count == 1 &&
+            return ls->raster_viewports_known && ls->raster_viewport_count == 1 &&
                 ls->raster_viewports[0].TopLeftX == 0.f && ls->raster_viewports[0].TopLeftY == 0.f &&
                 resource_dims_locked(sel_depth, &dw, &dh, &dfmt) &&
                 ls->raster_viewports[0].Width == static_cast<float>(dw) && ls->raster_viewports[0].Height == static_cast<float>(dh);
+        };
+        if (untested_mesh && vpj_layer_fresh(vpj_frame(sample), g_vpj_layer_frame.load(std::memory_order_acquire))) {
+            neural_alias::ShaderDepthReader reader;
+            reader.active = reader.scene_depth_bound = reader.mesh = true;
+            reader.several_targets = ls->cur_nrt > 1;
+            reader.scene_viewport = scene_viewport();
             na_object_id layers[4] = {};
             const uint32_t fresh = vpj_fresh_layers(*ls, vpj_frame(sample), sel_depth, layers, &reader.writes_layer);
             reader.layer_took_sample = fresh != 0 || reader.writes_layer;
@@ -5596,9 +5603,21 @@ void vpj_before_draw(GL* l, uint64_t vertices = 0)
                 g_vpj_shader_depth_refused[static_cast<size_t>(neural_alias::ShaderDepthReaderRefusal(reader))].fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // VARIANT: referee/sample-locked-dropout
+        // The Referee saw pixels drop out on some samples: while it asks, a scene mesh no fixed rule
+        // moved takes the full sample as well. The resolve proof below still stops it after the scene.
+        bool still_mesh = false;
+        if (untested_mesh && !tests_depth && g_vpj_still_meshes.load(std::memory_order_relaxed)) {
+            neural_alias::StillMesh mesh;
+            mesh.asked = mesh.active = mesh.scene_depth_bound = mesh.mesh = true;
+            mesh.scene_viewport = scene_viewport();
+            still_mesh = neural_alias::StillMeshTakesJitter(mesh);
+            if (still_mesh) tests_depth = true;
+        }
         bool after_resolve = false;
         bool want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, false);
-        if (want && ls->cur_nrt == 1 && pc->depth_write == 0) {
+        // A pipeline with the test off writes no depth, whatever its write mask says.
+        if (want && ls->cur_nrt == 1 && (pc->depth_write == 0 || pc->depth_enable != 1)) {
             // A depth test also belongs to glass, particles and other compositing draws.
             // Once the scene is reconstructed, their colour is on the display pixel grid.
             const auto matches = [&](const ResolvedRaster& r) {
@@ -5631,6 +5650,7 @@ void vpj_before_draw(GL* l, uint64_t vertices = 0)
         want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, after_resolve);
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
+            if (still_mesh) g_vpj_still_moved.fetch_add(1, std::memory_order_relaxed);
             if (pc && pc->depth_enable == 1) vpj_note_depth_layer_locked(*ls, sample, sel_depth);
             const bool first_pin = !ls->vpj_scene;
             if (first_pin) g_vpj_recordings.fetch_add(1, std::memory_order_release);
@@ -9727,6 +9747,11 @@ void SubmitResolvedRaster(const ResolvedRaster& raster)
     std::unique_lock<RegistryLock> lock(g_m);
     if (g_vpj.load(std::memory_order_acquire) == raster.sample) g_vpj_submitted = raster;
 }
+void SetStillMeshJitter(bool asked)
+{
+    if (g_vpj_still_meshes.exchange(asked, std::memory_order_relaxed) != asked && asked)
+        g_vpj_still_asks.fetch_add(1, std::memory_order_relaxed);
+}
 void SetSceneViewportJitter(uint64_t frame, float x, float y)
 {
     if (!frame) {
@@ -9978,7 +10003,9 @@ ViewportJitterStats GetViewportJitterStats()
             g_vpj_shader_depth.load(std::memory_order_relaxed),
             {g_vpj_shader_depth_refused[1].load(std::memory_order_relaxed), g_vpj_shader_depth_refused[2].load(std::memory_order_relaxed),
              g_vpj_shader_depth_refused[3].load(std::memory_order_relaxed), g_vpj_shader_depth_refused[4].load(std::memory_order_relaxed),
-             g_vpj_shader_depth_refused[5].load(std::memory_order_relaxed)}};
+             g_vpj_shader_depth_refused[5].load(std::memory_order_relaxed)},
+            g_vpj_still_moved.load(std::memory_order_relaxed), g_vpj_still_asks.load(std::memory_order_relaxed),
+            g_vpj_still_meshes.load(std::memory_order_relaxed)};
 }
 uint64_t LiveSelectionVersion()
 {

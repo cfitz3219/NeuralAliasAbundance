@@ -23,6 +23,7 @@
 #include "core/referee_trace.hpp"
 #include "core/referee_placement.hpp"
 #include "core/referee_present_times.hpp"
+#include "core/referee_dropout.hpp"
 #include "core/referee_mixed_raster.hpp"
 #include "core/referee_parity.hpp"
 
@@ -117,9 +118,15 @@ struct State {
         MixedRasterField field;
         uint8_t amount = 0;
         uint64_t field_ordinal = 0;
+        // VARIANT: referee/sample-locked-dropout
+        DropoutWatch dropout;
+        std::array<float, FlickerTransition::count> dropout_view{};
+        bool dropout_view_known = false;
+        uint64_t dropout_events = 0, dropout_logged = 0;
     };
     std::array<JitterControl, 2> jitter_controls;
     std::atomic<unsigned> jitter_active{0};
+    std::atomic<unsigned> still_meshes_active{0}; // bit per control: its dropout watch asks for the move
     std::atomic<uint64_t> trial_sample_ticket{0};
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
     const void* trial_source = nullptr;
@@ -180,6 +187,34 @@ void publish_jitter(unsigned index)
 {
     if (g.jitter_controls[index].trial.NeedsReference()) g.jitter_active.fetch_or(1u << index, std::memory_order_release);
     else g.jitter_active.fetch_and(~(1u << index), std::memory_order_release);
+    if (g.jitter_controls[index].dropout.MoveStillMeshes()) g.still_meshes_active.fetch_or(1u << index, std::memory_order_release);
+    else g.still_meshes_active.fetch_and(~(1u << index), std::memory_order_release);
+}
+
+const char* dropout_phase(DropoutWatch::Phase phase)
+{
+    switch (phase) {
+    case DropoutWatch::Phase::Trial: return "trial";
+    case DropoutWatch::Phase::Kept: return "kept";
+    case DropoutWatch::Phase::RuledOut: return "ruled_out";
+    default: return "watch";
+    }
+}
+
+// Says what was seen and why the Referee acted: the samples the surfaces went black on, in pixels.
+void log_dropout(const DropoutWatch& watch, shadow::Path path, uint64_t frame, const DropoutPair& pair)
+{
+    char samples[160] = "";
+    int at = 0;
+    for (unsigned i = 0; i < watch.BlackSamples() && at < int(sizeof samples) - 20; ++i)
+        at += std::snprintf(samples + at, sizeof samples - size_t(at), "%s%.3f,%.3f", i ? " " : "",
+                            watch.BlackSample(i).x, watch.BlackSample(i).y);
+    na::eventlog::Emit("referee_dropout",
+        "frame=%llu path=%s phase=%s move_still_meshes=%d why=\"%s\" pair{gone=%u back=%u cells=%u} onsets=%u returns=%u "
+        "black_samples_px=\"%s\" trial{pairs=%u events=%u challenges=%u} recurred=%u",
+        static_cast<unsigned long long>(frame), path == shadow::Path::Native11 ? "native11" : "dx12",
+        dropout_phase(watch.Current()), watch.MoveStillMeshes() ? 1 : 0, watch.Why(), pair.gone, pair.back, pair.cells,
+        watch.Onsets(), watch.Returns(), samples, watch.TrialPairs(), watch.TrialEvents(), watch.Challenges(), watch.Recurred());
 }
 
 void log_jitter(const JitterTrial& trial, shadow::Path path, uint64_t frame)
@@ -616,11 +651,37 @@ void collect_sample()
                 const unsigned index = jitter_index(scene.placement.path);
                 auto& control = g.jitter_controls[index];
                 if (control.source != g.swapchain || !same_jitter_scene(control.scene, scene)) {
+                    // What the dropout watch proved is about how the game draws, not about one scene's
+                    // textures: a move it kept stays through a new scene on the same presentation. A
+                    // trial in progress, and anything else, starts again.
+                    const bool keep_move = control.source == g.swapchain && control.dropout.Current() == DropoutWatch::Phase::Kept;
+                    const auto kept = control.dropout;
                     control = {};
                     control.source = g.swapchain;
                     control.scene = scene;
+                    if (keep_move) control.dropout = kept;
+                    publish_jitter(index);
                 }
                 control.ordinal = g.main_ordinal;
+                // VARIANT: referee/sample-locked-dropout
+                // Every measured pair of this scene is looked at, whatever the strength trial is doing.
+                if (trial.delivered && !raster_field.empty()) {
+                    const auto pair = CountDropouts(raster_field.data(), unsigned(raster_field.size() / mixed_values),
+                                                    mixed_values, mixed_black_before, mixed_black_now);
+                    const bool same_view = control.dropout_view_known && SameJitterPicture(control.dropout_view, trial.image);
+                    control.dropout_view = trial.image;
+                    control.dropout_view_known = true;
+                    const bool changed = control.dropout.Observe(pair, {g.pre_jitter[0], g.pre_jitter[1]},
+                                                                 {g.main_jitter[0], g.main_jitter[1]}, same_view);
+                    if (pair.Any() && same_view) ++control.dropout_events;
+                    if (changed) publish_jitter(index);
+                    // The first few events of a scene are written out too, so a run that never reaches a
+                    // trial still says what was seen.
+                    if (changed || (pair.Any() && same_view && control.dropout_logged < 8)) {
+                        ++control.dropout_logged;
+                        log_dropout(control.dropout, scene.placement.path, g.main_ordinal, pair);
+                    }
+                }
                 auto& test = control.trial;
                 const auto phase = test.Current();
                 const auto before_strength = test.Amount();
@@ -1144,10 +1205,11 @@ void NotifyEvaluationReset()
 bool Wanted()
 {
     if (!enabled()) {
-        if (g.jitter_active.load(std::memory_order_acquire)) {
+        if (g.jitter_active.load(std::memory_order_acquire) || g.still_meshes_active.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> lock(g.m);
             g.jitter_controls = {};
             g.jitter_active.store(0, std::memory_order_release);
+            g.still_meshes_active.store(0, std::memory_order_release);
             g.geometry = {};
         }
         return false;
@@ -1494,6 +1556,26 @@ uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t col
         publish_jitter(index);
     }
     return control.trial.Amount();
+}
+
+// VARIANT: referee/sample-locked-dropout
+// Whether the meshes of this scene that kept the game's own viewport should take the frame's
+// sample: the dropout watch is trying that, or has proved it on this scene.
+bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, uint64_t depth,
+                      uint64_t generation, uint64_t screen_proof)
+{
+    if (!swapchain || !color || !depth || !generation || !enabled()) return false;
+    const unsigned index = jitter_index(path);
+    if (!(g.still_meshes_active.load(std::memory_order_acquire) & (1u << index))) return false;
+    std::lock_guard<std::mutex> lock(g.m);
+    const auto& control = g.jitter_controls[index];
+    const auto& scene = control.scene;
+    if (control.source != swapchain || path != scene.placement.path) return false;
+    // Proved: holds for this presentation through scene changes. On trial: this exact scene only.
+    if (control.dropout.Current() == DropoutWatch::Phase::Kept) return true;
+    const bool rotating = path == shadow::Path::Native11 && screen_proof && scene.native_screen_proof;
+    if (depth != scene.depth || generation != scene.generation || (color != scene.color && !rotating)) return false;
+    return control.dropout.MoveStillMeshes();
 }
 
 void InvalidatePresentation(const void* swapchain)
