@@ -1116,3 +1116,10 @@ Withdrawn from my 11:40Z entry: the "16 to 18% less fine detail" figure (its ref
 ### 2026-11-21 — Three Kingdoms live terrain result
 
 After the d8d38932 full-jitter package was staged, Cort reported that the dark texture patches are fixed in live Three Kingdoms testing. This closes the reported terrain reproduction. No new capture, whole-run stability measurement, or independent validation in another title accompanied this report.
+
+
+### 2026-11-21 — Assassin's Creed IV: Black Flag staged for the new-engine trial
+
+Cort requested install, Results and uninstall CMDs. The installed Steam build is 11650134 and its single-player executable AC4BFSP.exe is 32-bit and imports D3D11CreateDevice and CreateDXGIFactory1. Stage: C:/Users/Cort/Documents/NeuralAlias-BlackFlag-DLAA-d8d38932; three NA-BlackFlag-DLAA shortcuts are in Windows Documents. The package uses the same d8d38932 source revision as the confirmed Three Kingdoms fix, a freshly built Win32 DXGI proxy and the existing x64 companion and DLSS runtime. It uses automatic API selection and configures only AC4BFSP.exe. The Win32 proxy and matching x64 companion can be reused for other games at this revision.
+
+Four Win32 proxy/provider/screen/depth regressions passed, and the Win32 client with the x64 companion passed two more checks. It bound 120/120 real DLAA results on the RTX and refused all three stale WARP responses. Logs in NA-referee-controls/local/black-flag-win32-tests.log. All three CMD actions passed in a temporary folder containing an x86 stand-in with the same single-player filename. The launcher sets a local default Windows PowerShell module search path because in the first fixture a PowerShell 7 module path leaked into Windows PowerShell and made its hash checker unavailable. Manifest and installed test file hashes matched, Results collected a fixture log, and uninstall restored the fixture. No game files were changed and no game was launched. Cort owns the first live check.
