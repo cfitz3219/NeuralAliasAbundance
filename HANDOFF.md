@@ -168,3 +168,7 @@ The ddf55beb-SceneDiscovery package crashed twice before core attachment. Use Do
 
 ### 2026-11-20 Pacific — Sniper Elite 4 resolved-layer jitter
 Cort confirmed that 31463de6 starts and delivers DLAA. The remaining menu windshield buzz returned between the steady reconstructed image and the final display. PR 183 b75bf44f corrects native DX12 subpixel jitter on qualifying depth-tested layers after reconstruction. Six focused regressions passed, including a stationary/moving RTX glint check. The reversible factory-start upgrade from 31463de6 passed with the shipped profile. Current test package is Documents/NeuralAlias-SniperElite4-DX12-b75bf44f-FactoryStart. The in-game windshield result awaits Cort. COMMS and the PR's WORKLOG record the evidence and limits.
+
+### 2026-11-21 Pacific — Shared Referee recovery across returning scenes
+
+PR 183 at 43cfc565. Both native APIs share the corrected lighting admission, damage comparison and motion-trial fallback. Eight focused tests passed, including real native DX11 DLAA, native DX12 rotating placement, adverse scenes, reused depth and a separate next-tool comparison. The older Shadow of War trace still qualifies with both phases present. See the dated WORKLOG and the November 21 decision table in docs/REFEREE-RECOVERY-AUDIT-20261119.md on PR 183. The new commit is on GitHub for Sol; the existing SE4 package is b75bf44f. Referee-driven jitter placement remains open.

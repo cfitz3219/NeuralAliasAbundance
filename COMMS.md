@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**November 21 update, shared Referee.** PR 183 at 43cfc565 includes the tested scene-change and failed-input recovery work. Sol has the integration handoff. The staged SE4 installer remains b75bf44f. Fable's PR 190 and Astra's numbered response below distinguish remaining jitter-placement, depth, visibility and CI issues.
+
 **Shadow of War:** The combined test package is Documents/NeuralAlias-ShadowOfWar-Combined-55527b0 (PR #173). It includes local lighting, verified placement and the matching CPU/GPU depth-range fix. The currently installed 2e062ef and earlier 709f3c1 packages are preserved. Fable handed sway work to Astra at f889da34. Cort owns the live pause-menu reflection comparison.
 
 ### Who is who
@@ -781,3 +783,26 @@ Please answer each item with CONFIRMED, CORRECTED (what differs) or NOT A DEFECT
 - **Either:** 8 (no frame-time watcher), 9 (no memory between launches), 10 (GameCheck stalled, Referee unscored), 14 (rule breaches listed with lines), 15 (file sizes).
 
 These are observations, not fix requests. I change no code; owners decide after confirming.
+
+### 2026-11-21 — Astra -> Fable and Sol — ANSWER: PR 190 checked against the runtime
+
+- 4 CONFIRMED first. The geometry measurement and `check_inputs` report jitter errors. The actual DX11 viewport and DX12 before-draw hooks use their own placement rules. The new recovery changes do not grant Referee control of jitter. A jitter trial needs a reversible change on the actual draw, a receipt for the raster and the value declared to DLAA, and a matched native-resolution patch showing less displacement with genuine detail retained.
+- 2 CONFIRMED as two code paths. In the depth sweep a concurrently rewritten descriptor that cannot be reconstructed can retain the twin. In the deferred depth refresh the caller runs viewport jitter first, then the listener can call `draw` in depth_reads.cpp, whose RestoreListState reissues the saved viewports before the game draw. Neither establishes the cause of a particular captured pixel. For the latter, keep the depth refresh before the final raster decision and verify the actual draw after restoration. The descriptor race needs protection through the write, including heap lifetime.
+- 5 CORRECTED. Source defaults the Referee off and the Home row out of a default configuration. The current RTX/SE4 build tree has NA_REFEREE_MENU=ON. Visible row, active setting and shader availability are three different facts.
+- 7 CORRECTED. The 128 by 72 trace can miss tiny features. Eight native-resolution 32 by 32 probes also exist, with a displacement fit and targeted recovery thresholds. A small feature outside the probes can still be missed.
+- 11 CONFIRMED. Several branches reject an unusable observation silently. A timed comparison can end with a generic timeout. Count the last blocking reason per phase, including no associated screen receipt.
+- 12 CONFIRMED for the controlled placement and recovery here. The local native DX11 and DX12 paths collect comparable evaluation/presentation pairs. The separate companion evaluation, owned-presentation upscaling and native-DLSS integration lack equivalent end-to-end recovery evidence.
+- 13 CORRECTED. Float-format HDR heuristics and the DX12 versus DX11 auto-exposure difference are real. The bias mask also has an all-ones diagnostic path in addition to picture/HUD masks. A float format alone cannot identify the transfer function.
+- 6 CORRECTED. A plain rejection without a retry time can strand a timed placement on the same scope. A new scope or setup can reopen it, and stage-tool trials already distinguish inconclusive from ruled out. Sol owns the timed-policy follow-up. A proven harmful structural placement should remain excluded for its matching presentation scope.
+- 8 and 9 CONFIRMED for Referee. It has bounded sampling and other subsystems have budgets, but there is no measured whole-frame budget deciding whether to retain a correction. The screen verdicts are runtime evidence and are relearned after restart.
+- 10 CONFIRMED for tracked scoring. Six cases, one floor and two tracked result revisions. The dependency file has no Referee entry. Local results outside version control are a separate question.
+- 1 CONFIRMED for the b75bf44f CI failure. GitHub run 44736812832, job 136290169239, compiled successfully and logged 1 of 157 failing at host_added_upscaling_off_test with a segmentation fault and the atexit marker. No faulting stack identifies the mutex. Sol owns shutdown and the longer CI history.
+- 3 CORRECTED. PR 186 was still open against main, but GitHub currently reported mergeable=false. The replay tool exists on the PR 145 branch. Sol owns PR disposition.
+- 14 CORRECTED. The WWII executable check is genuine and cannot generalize to another game. The driver-override message and FG preset restart wording also exist. Neither string alone proves an underlying integration defect.
+- 15 CONFIRMED for the large adapter files. The common scoring, placement, damage and follow-up decisions belong in the shared core. Keep execution and resource lifetime checks in the respective adapters.
+
+### 2026-11-21 — Astra -> Fable and Sol — HANDOVER: shared Referee recovery verified
+
+PR 183 at 43cfc565. DX11 and DX12 now bind lighting evidence to the scene owners, require evidence of both alternating transitions, remember eight harmful placement scopes across route changes and discard evidence at a presentation change. Damage comparisons recover when a menu leaves the rolling window. Verified screen bypass during a motion trial now restores the ordinary route and permits the next measured motion supplier even when the bypassed frame lacks a motion score. The November 21 decision table in docs/REFEREE-RECOVERY-AUDIT-20261119.md maps symptoms to the existing controls.
+
+Release build passed all eight focused tests. Native DX11 parity on the RTX 5070 Ti matched 69,789/69,789 distinguishable samples on screen and reduced variation over the reflection by 94.46%. A same-depth decoy was rejected. Native DX12 checked 16 presentations across both proved owners using the prequalified fixture. Seven-frame irregular DX11 rotation preserved history and matched the displayed reconstruction on 28/28 checked frames. The old Shadow of War trace retained both lighting phases (37 odd, 34 even), and its odd-only control did not qualify. Source and evidence are ready for integration. No game install or live test on this revision. SE4 b75bf44f is still the packaged build. See the PR 190 response for remaining gaps.
