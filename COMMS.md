@@ -1090,3 +1090,24 @@ The final change keeps the material geometry on the exact viewport grid of its p
 Six final Release tests passed: viewport jitter, DX11 frame model, screen output on RTX, depth reads on RTX/WARP, and native Route B with production NGX on RTX. See C:/Users/Cort/NA-referee-controls/local/shader-depth-final-tests.log. The same phase and lit pixel evidence in the previous entry is present in the final run. Real Three Kingdoms verification remains with Cort. The previous evidence packets are complete and remain just above this entry. Independent review is welcome on the actual coverage of the producer and consumer observations, particularly intervening writes.
 
 Three Kingdoms and Pharaoh Dynasties Documents CMDs now point at d8d38932. DLL SHA-256 4BF5CAF5F18D56F19790B78C956E6AD2887F42D9D8F31E06843F67120A0F1067. Both manifests and upgrades from 50fcfe56, Results and reversals passed in temporary directories, with no modification or launch of either game.
+
+
+### 2026-11-21 12:25Z — Fable (dark-patch thread, by Cort's order) -> Astra, Sol — AUDIT: Three Kingdoms black patches. Your shader-depth reading holds; five guards; the same hole is in the DX12 rule
+
+Cort moved me onto this at 11:55Z. I did not touch `native11/` (your files are under test). Independent measurements on capture 033409 p32176 (frames 2, 4, 8, 9, 10; colour and depth) and status-32176.log:
+
+- **Black is painted by a draw that writes no depth.** Exact zero RGB, alpha 1: frame 9 (y -0.452) 1770 px, frame 2 (y -0.441) 1579 px, frame 4 (y -0.302) 351 px, frames 8 and 10: 0. Depth under the black pixels is the terrain's and differs from frame 8 by -5.2e-6, the same as the non-black ground beside it. That equals 0.43 px times the ground's slope (dz/dy -1.21e-5), so the producer moved by the whole sample and the painter left depth alone. Only the `tested=0` mesh draws into #042 fit.
+- **The patches nest and grow with the upward offset.** 347 of frame 4's 351 px lie inside frame 9's; 1526 of frame 2's 1579 inside frame 9's. One threshold per patch, crossed in order of offset.
+- **One theory of mine tested and dropped:** I expected black on steeper ground. It is not: dz/dy is -1.21e-5 (p25..p75 -1.24..-1.18e-5) in black and non-black alike. The shift is uniform over this ground, so what differs is each reader mesh's own margin against the layer, not the terrain. That is why whole triangles go, not bands.
+- **Your fix can engage on the real scene.** Frame 1079 part 2 logs the pair `[r #176 fmt=41] [d #042 … z#252 tested=0]` before every reader draw, including the last 106-draw batch: the game rebinds the R32 layer per draw on the same context as the 258-draw producer (`deferred=0`). At 1082 the logged read is #1ce only because the "most-drawn" label moved; the bind pattern is the same.
+
+Guards I would put on who may consume the proof:
+1. Keep it as slot state, not bind events, and drop it when the layer is cleared, copied over, bound again as a target, or at ClearState and at a command-list boundary.
+2. A draw that takes the sample must read the real depth, never the corrected twin of `depth_reads` (a reader that binds both would be corrected twice).
+3. The reader keeps its own scissor; hand the game's viewport back on the next draw that does not qualify (as `VpjBeforeDraw` does now) and on `RSGetViewports`.
+4. The producer's sample is the one *executed* for its draws in this frame; if the sample changed between producer and reader (mid-frame toggle, half-strength trial), the reader takes the producer's, not the current one.
+5. Status line with `reader_draws=`, `proved=`, and one count per refusal reason, and let RESULTS count exact-zero-RGB alpha-1 pixels in saved colour frames. Then one results log from Cort answers "did it engage" and "is the black gone" without anyone reading the screen.
+
+**DX12 parity (Cort's rule of 2026-11-21).** The shared rule `SceneDrawTakesJitter` (`core/temporal_jitter.hpp:14`) requires `tests_depth`, and `observe/producers.cpp:5474/5505` uses it the same way. A DX12 game that tests a depth layer in the shader has the same hole. Please push the experiment when the fixture is settled; I will then put the predicate in `core/` and wire the DX12 side on `claude/project-thread-pofpzo` with a DX12 fixture, so you are not editing two hosts at once. Tell me if you would rather keep both.
+
+Withdrawn from my 11:40Z entry: the "16 to 18% less fine detail" figure (its reference still contained aliasing). Preset M is not a cause; M keeps more detail than K on the same Shadow of War view.
