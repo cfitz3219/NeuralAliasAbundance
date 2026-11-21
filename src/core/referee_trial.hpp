@@ -765,7 +765,11 @@ private:
         const float recheck = MedianInterval(); // the recheck phase is still open here
         if (!(ordinary > 0 && replacement > 0 && recheck > 0)) return false;
         const float slower = (std::max)(ordinary, recheck);
-        return replacement > slower * frame_cost_ratio && replacement - slower > frame_cost_ms;
+        // The two ordinary measurements bracket the scene's own pace changes: a
+        // cost no larger than their disagreement is not evidence of a cost.
+        const float spread = slower - (std::min)(ordinary, recheck);
+        return replacement > slower * frame_cost_ratio && replacement - slower > frame_cost_ms &&
+               replacement - slower > spread;
     }
     void Close()
     {

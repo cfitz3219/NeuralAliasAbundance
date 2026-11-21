@@ -908,6 +908,9 @@ int main(int argc, char** argv)
                     CHECK(measured.ordinal == ordinal && measured.configuration == 70);
                     CHECK(measured.delivered != bypass && measured.bypassed == bypass);
                     CHECK(!rg::TakeTrialSample(ticket, measured));
+                    // These cases judge the picture only. The fixture's cadence is its own
+                    // sleeps on a shared runner, not a game's pace (covered in referee_test.cpp).
+                    measured.presented_us = 0;
                     placement.Add(scope, ticket, measured, ordinal, GetTickCount64());
                 }
             }
