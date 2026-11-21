@@ -190,3 +190,8 @@ Three Kingdoms delivered DLAA in the captured campaign at both resolutions. The 
 ### 2026-11-21 — Three Kingdoms riverbank
 
 PR 193 build 37b9be05 is staged in Windows Documents. Both Route B APIs now recognize a local stationary input edge displaced by reconstruction jitter and compare reduced strengths using final-screen evidence. See the Three Kingdoms mixed jitter entry in COMMS for the saved-frame findings, RTX comparison and test limits. Cort owns the game test.
+
+
+### 2026-11-21 — Automatic mip bias restored
+
+Build 8d6913ca on PR 193 combines Fable's late DX11 sampler discovery and the follow-up that preserves the game's original sampler state. RTX checks verified sampled pixels and live restoration. The Three Kingdoms and Pharaoh Dynasties installers in Windows Documents are staged at the same build. COMMS and WORKLOG record the fixture evidence and packaging checks.
