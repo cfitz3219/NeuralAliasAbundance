@@ -1752,6 +1752,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
+        !set(L"referee", L"enabled", L"0") || // legacy disabled package
         !set(L"j2", L"camera", (camera_off_start || adaptive || rotating_lights) ? L"0" : L"2") ||
 
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
@@ -1760,6 +1761,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     while (!na::host::GetStatus().init_complete && GetTickCount64() < init_deadline) Sleep(5);
     expect(na::host::GetStatus().init_complete && na::on12::NativeRoute() != automatic && !na::on12::Enabled(),
            "production host starts with the bridge disabled");
+    expect(na::settings::Get().referee_enabled.load() == unsigned(na::referee::gpu::Supported()),
+           "added DLAA automatically starts the supported Referee despite a legacy Off setting");
     if (g_failed) return 1;
 #endif
     Game g;

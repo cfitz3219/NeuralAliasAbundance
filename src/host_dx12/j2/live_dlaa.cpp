@@ -29,6 +29,7 @@
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/capture/referee_gpu.hpp"
 #include "host_dx12/capture/screen_marker.hpp"
 #include "host_dx12/ngx_observe/ngx_observe.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -8354,6 +8355,7 @@ void InstallScreenDiscovery();
 
 void SetEnabled(bool on)
 {
+    na::settings::ConfigureReferee(on, referee::gpu::Supported());
     g.enabled.store(on);
     g.configured.store(on);
     if (on) {

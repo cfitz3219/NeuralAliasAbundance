@@ -63,7 +63,11 @@ function Get-RefereeSummary([string[]] $Lines) {
     $kept = @($Lines | Where-Object { $_ -match '\breferee_roles frame=\d+ kept=1' })
     if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry -and -not $parity -and -not $kept) {
         $enabled = $Lines | Where-Object { $_ -match '\b(?:setting |settings_all\s+.*\b)referee_enabled=1\b' } | Select-Object -First 1
-        if ($enabled) { $out.Add('Referee was enabled during this run. The log has no screen or delivery checks.') }
+        $startup = $Lines | Where-Object { $_ -match '\breferee_start automatic_dlaa=1 gpu_checks=([01]) enabled=([01])' } | Select-Object -Last 1
+        if ($startup -match 'gpu_checks=1 enabled=1') { $out.Add('Referee started automatically with DLAA. The log has no screen or delivery checks.') }
+        elseif ($startup -match 'gpu_checks=0') { $out.Add('This build lacks the GPU checks required for Referee. No screen checks ran.') }
+        elseif ($enabled) { $out.Add('Referee was enabled during this run. The log has no screen or delivery checks.') }
+        elseif ($Lines -match '\breferee_enabled=0\b') { $out.Add('Referee was recorded off. No screen or delivery checks were logged.') }
         else { $out.Add('The log has no Referee screen or delivery checks.') }
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out

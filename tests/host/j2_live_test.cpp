@@ -262,8 +262,8 @@ int main(int argc,char** argv)
     std::printf("step: install producers\n");
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
     if (native_dlaa) {
-        na::settings::Get().referee_enabled.store(1);
         na::j2::SetEnabled(true); // before descriptor creation
+        CHECK(na::settings::Get().referee_enabled.load() == unsigned(na::referee::gpu::Supported()));
     } else if (native_scale) na::j2::EnableNativeScaleBridge(true);
     // Every native-scale variant uses recording leases, as does production.
     // A Reset must create a new receipt, including the short direct-pass tests.
