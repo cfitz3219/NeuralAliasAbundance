@@ -3,6 +3,7 @@
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/diag/dred.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/referee_recovery.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
@@ -321,6 +322,10 @@ DWORD WINAPI InitThread(LPVOID)
     // Each route supplies scene inputs through its own observer.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        (native11 || dx12_producers || na::on12::Automatic()));
+    // Gap audit 2026-11-21 item 9: what the Referee's stage recovery established in earlier
+    // launches of this game orders this launch's live attempts (never replaces them).
+    // [referee] memory=0 switches it off.
+    if (GetPrivateProfileIntW(L"referee", L"memory", 1, g_ini) != 0) na::referee::memory::Enable();
     // Gap audit 2026-11-21 item 14: no executable name decides this. The relative
     // scene-camera decoder is offered to every translated DX11 game and accepts a
     // constant block only by its content (block size, scene extent and the

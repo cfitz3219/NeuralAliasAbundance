@@ -129,6 +129,10 @@ public:
                 return;
             }
             trial_.Add(ticket, s, next_frame);
+            if (trial_.Current() == RouteTrial::Phase::Kept && !kept_reported_) {
+                kept_reported_ = true;
+                result_ = {tool_, e.example.origin.stage, TrialOutcome::Improved, trial_.VerifiedReduction(), hinted_};
+            }
             if (s.comparable && s.delivered) last_witness_ = now;
             if (trial_.Current() == RouteTrial::Phase::Rejected) Finish(now, trial_.RuledOut(), trial_.Reason());
             return;
@@ -154,8 +158,8 @@ public:
         auto eligible = uint8_t(available & ~e.ruled_out);
         for (unsigned i = 0; i < e.after.size(); ++i)
             if (now < e.after[i]) eligible &= uint8_t(~(1u << i));
-        tool_ = NextTool(s.origin.stage, eligible & ~e.attempted);
-        if (tool_ == Tool::None) tool_ = NextTool(s.origin.stage, eligible);
+        tool_ = Choose(s.origin.stage, uint8_t(eligible & ~e.attempted));
+        if (tool_ == Tool::None) tool_ = Choose(s.origin.stage, eligible);
         if (!Busy()) {
             if (!e.reported || e.last_available != available) {
                 ++exhausted_;
@@ -172,7 +176,34 @@ public:
         last_witness_ = now;
         original_motion_ = s.motion_error;
         lost_view_ = motion_losses_ = 0;
+        kept_reported_ = false;
+        hinted_ = (Bit(tool_) & Preferred(s.origin.stage)) != 0;
         trial_.StartAt(Serial(), next_frame, now, s);
+    }
+    // VARIANT: referee/launch-memory (core/referee_memory.hpp). Hints only
+    // reorder the live attempts for a stage: `prefer` first, `avoid` last.
+    void SetHints(FlickerStage stage, uint8_t prefer, uint8_t avoid)
+    {
+        const unsigned i = unsigned(stage) - 1;
+        if (i < hints_.size()) hints_[i] = {prefer, avoid};
+    }
+    bool Dx12() const { return domain_ == (uint64_t{1} << 59); }
+    bool Hinted() const { return Busy() && hinted_; }
+    // One finished attempt, for the owner's launch memory: the control, the
+    // stage it was tried for and what the screen established.
+    struct Result {
+        Tool tool = Tool::None;
+        FlickerStage stage = FlickerStage::Unknown;
+        TrialOutcome outcome = TrialOutcome::Pending;
+        float reduction = -1.f;
+        bool hinted = false;
+    };
+    bool TakeResult(Result& out)
+    {
+        if (result_.tool == Tool::None) return false;
+        out = result_;
+        result_ = {};
+        return true;
     }
     Tool Selected() const { return tool_; }
     const RouteTrial& Comparison() const { return trial_; }
@@ -235,15 +266,39 @@ private:
         previous_.ordinal = 0;
         watch_ = Serial() << 3;
     }
+    uint8_t Preferred(FlickerStage stage) const
+    {
+        const unsigned i = unsigned(stage) - 1;
+        return i < hints_.size() ? hints_[i].prefer : uint8_t(0);
+    }
+    Tool Choose(FlickerStage stage, uint8_t set) const
+    {
+        const unsigned i = unsigned(stage) - 1;
+        if (i >= hints_.size()) return NextTool(stage, set);
+        auto tool = NextTool(stage, uint8_t(set & hints_[i].prefer));
+        if (tool == Tool::None) tool = NextTool(stage, uint8_t(set & ~hints_[i].avoid));
+        return tool == Tool::None ? NextTool(stage, set) : tool;
+    }
     void Finish(uint64_t now, bool ruled_out, const char* reason)
     {
         auto& e = entries_[entry_];
+        // A control that was kept and later only lost its evidence was not disproved.
+        if (!kept_reported_ || ruled_out)
+            result_ = {tool_, e.example.origin.stage,
+                       ruled_out ? TrialOutcome::Harm :
+                       trial_.Outcome() == TrialOutcome::Pending || trial_.Outcome() == TrialOutcome::Improved ||
+                       trial_.Outcome() == TrialOutcome::Harm ? TrialOutcome::Insufficient : trial_.Outcome(),
+                       -1.f, hinted_};
         if (ruled_out) e.ruled_out |= Bit(tool_);
         else for (unsigned i = 0; i < e.after.size(); ++i)
             if (Bit(tool_) == (1u << i)) e.after[i] = now + 30000;
         why_ = reason;
         Observe();
     }
+    struct Hint { uint8_t prefer = 0, avoid = 0; };
+    std::array<Hint, 3> hints_{};
+    Result result_{};
+    bool kept_reported_ = false, hinted_ = false;
     Scene scene_{};
     RouteTrial trial_;
     std::array<EntryData, 8> entries_{};

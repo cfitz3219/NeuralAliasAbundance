@@ -1,9 +1,15 @@
 #pragma once
 #include "core/referee_recovery.hpp"
 #include "core/referee_placement.hpp"
+#include "core/referee_memory.hpp"
 #include "core/anisotropic_auto.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
+
+#include <windows.h>
+#include <cwctype>
+#include <mutex>
+#include <string>
 
 namespace na::referee {
 inline uint64_t EvaluationConfiguration(uint32_t preset, uint32_t cf, uint32_t df, bool hdr, bool reversed,
@@ -55,6 +61,120 @@ inline void EmitTrialEvidence(const char* owner, uint64_t frame, const RouteTria
         trial.FrameMs(RouteTrial::Phase::Candidate), trial.FrameMs(RouteTrial::Phase::ConfirmBaseline));
 }
 
+// VARIANT: referee/launch-memory (core/referee_memory.hpp)
+// One small text file per game under the user's NeuralAlias folder. It is
+// read once per launch and rewritten when a stage-recovery attempt ends, which
+// happens a few times a session. Off until the host asks for it at start-up
+// (Enable), so tests and tools never read or write it. Both API adapters go
+// through AdvancePlacement below, so they share this one store and behave alike.
+namespace memory {
+struct Store {
+    std::mutex m;
+    bool enabled = false, loaded = false;
+    Memory record;
+    std::wstring path;
+    std::string game, runtime;
+};
+inline Store& State()
+{
+    static Store& store = *new Store; // process lifetime: nothing to destroy at exit
+    return store;
+}
+// Size and last-write time of a file: changes when the game or the runtime is updated.
+inline std::string FileIdentity(const wchar_t* path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!path[0] || !GetFileAttributesExW(path, GetFileExInfoStandard, &data)) return {};
+    char text[64];
+    std::snprintf(text, sizeof text, "%08lx%08lx-%08lx%08lx", data.nFileSizeHigh, data.nFileSizeLow,
+                  data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime);
+    return text;
+}
+inline void Enable()
+{
+    auto& store = State();
+    std::lock_guard<std::mutex> lock(store.m);
+    if (store.enabled) return;
+    wchar_t game[MAX_PATH]{}, runtime[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, game, MAX_PATH);
+    HMODULE self = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&FileIdentity), &self))
+        GetModuleFileNameW(self, runtime, MAX_PATH);
+    store.game = FileIdentity(game);
+    store.runtime = FileIdentity(runtime);
+    const wchar_t* user = settings::UserIniPath();
+    if (store.game.empty() || store.runtime.empty() || !user || !user[0]) return;
+    // The file is named by a hash of the game's full path: no path is stored inside it.
+    uint64_t hash = 14695981039346656037ull;
+    for (const wchar_t* c = game; *c; ++c) hash = (hash ^ uint64_t(towlower(*c))) * 1099511628211ull;
+    std::wstring folder(user);
+    const auto slash = folder.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return;
+    wchar_t name[64];
+    swprintf_s(name, L"referee-memory-%016llx.txt", static_cast<unsigned long long>(hash));
+    store.path = folder.substr(0, slash + 1) + name;
+    store.enabled = true;
+}
+inline void LoadLocked(Store& store)
+{
+    store.loaded = true;
+    std::string text;
+    const HANDLE file = CreateFileW(store.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        char bytes[8193];
+        DWORD got = 0;
+        if (ReadFile(file, bytes, sizeof bytes, &got, nullptr)) text.assign(bytes, got);
+        CloseHandle(file);
+    }
+    const auto result = store.record.Decode(text, store.game, store.runtime);
+    constexpr const char* names[] = {"loaded", "missing", "invalid", "stale"};
+    eventlog::Emit("referee_memory", "action=load result=%s why=%s", names[static_cast<unsigned>(result)],
+        result == Memory::Load::Loaded ? "hints from an earlier launch of this game and runtime order the live attempts" :
+        result == Memory::Load::Missing ? "first launch for this game: nothing remembered, discovery runs as usual" :
+        result == Memory::Load::Stale ? "the game, the runtime or the record format changed: old hints discarded" :
+                                        "the record could not be read: ignored, discovery runs as usual");
+}
+inline void SaveLocked(Store& store)
+{
+    const auto text = store.record.Encode(store.game, store.runtime);
+    if (text.empty()) return;
+    const std::wstring temporary = store.path + L".tmp";
+    const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    const bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr) && wrote == text.size();
+    CloseHandle(file);
+    if (!ok || !MoveFileExW(temporary.c_str(), store.path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(temporary.c_str());
+}
+// Give this launch's recovery the remembered order for each stage.
+inline void Apply(StageRecovery& recovery)
+{
+    auto& store = State();
+    std::lock_guard<std::mutex> lock(store.m);
+    if (!store.enabled) return;
+    if (!store.loaded) LoadLocked(store);
+    for (auto stage : {FlickerStage::Input, FlickerStage::Reconstruction, FlickerStage::Composition})
+        recovery.SetHints(stage, store.record.Preferred(recovery.Dx12(), stage), store.record.Avoided(recovery.Dx12(), stage));
+}
+// Record what a finished attempt established on the screen.
+inline void Collect(StageRecovery& recovery, uint64_t frame)
+{
+    StageRecovery::Result result;
+    if (!recovery.TakeResult(result)) return;
+    auto& store = State();
+    std::lock_guard<std::mutex> lock(store.m);
+    if (!store.enabled) return;
+    if (!store.loaded) LoadLocked(store);
+    if (!store.record.Note(recovery.Dx12(), result.stage, result.tool, result.outcome, result.reduction)) return;
+    SaveLocked(store);
+    eventlog::Emit("referee_memory", "action=note frame=%llu api=%s first_stage=%s tool=%s outcome=%s reduction=%.4f tried_first_from_memory=%u",
+                   (unsigned long long)frame, recovery.Dx12() ? "dx12" : "dx11", StageName(result.stage), ToolName(result.tool),
+                   TrialOutcomeName(result.outcome), result.reduction, unsigned(result.hinted));
+}
+} // namespace memory
+
 // Both API adapters poll the same bounded GPU mailbox after closing a frame.
 // Each adapter supplies its own scratch sample under its existing render lock.
 template<class Reader, class Accept>
@@ -101,7 +221,9 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
     const auto phase = recovery.Comparison().Current();
     const auto exhausted = recovery.Exhausted();
     const auto ticket = recovery.Ticket(frame);
+    memory::Apply(recovery);
     recovery.Tick(now);
+    memory::Collect(recovery, frame);
     if (!on_kept_route && !recovery.Busy() && can_nominate && screen_proved && placement.BeginVerified(scope, frame, now)) {
         recovery.Suspend();
         return;
@@ -124,6 +246,7 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
     }
     if (got && !on_kept_route && previous == RecoveryTool::None) placement.ObserveIncumbent(sample);
     if (got) recovery.Add(ticket, sample, frame + 1, now);
+    memory::Collect(recovery, frame);
     const bool exhausted_now = exhausted != recovery.Exhausted();
     if (exhausted_now || previous != recovery.Selected() ||
         (recovery.Busy() && phase != recovery.Comparison().Current())) {

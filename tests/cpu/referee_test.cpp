@@ -10,6 +10,7 @@
 #include "test_support.hpp"
 #include "core/referee_selection.hpp"
 #include "core/referee_recovery.hpp"
+#include "core/referee_memory.hpp"
 #include "core/referee_placement.hpp"
 #include "core/referee_parity.hpp"
 #include "core/referee_jitter.hpp"
@@ -1117,6 +1118,122 @@ void TestStageRecovery()
     }
 }
 
+// Audit item 9: what stage recovery learned in an earlier launch reorders the
+// live attempts and never replaces the proof on the screen. The record and the
+// chooser are shared, so the DX11 and DX12 tables are exercised side by side.
+void TestLaunchMemory()
+{
+    using T = RecoveryTool;
+    using S = FlickerStage;
+    const std::string game = "game-1a2b", runtime = "runtime-3c4d";
+    {
+        Memory m;
+        check(m.Empty() && !m.Preferred(true, S::Input) && !m.Avoided(false, S::Input), "memory: a new record holds no hints");
+        check(m.Note(true, S::Input, T::AmbientHistory, TrialOutcome::Improved, .93f) &&
+              m.Note(true, S::Input, T::Bloom, TrialOutcome::Harm) &&
+              m.Note(false, S::Reconstruction, T::ScreenFit, TrialOutcome::Improved, .5f) &&
+              m.Note(false, S::Reconstruction, T::CameraResidual, TrialOutcome::Slower),
+              "memory: outcomes are recorded per API, stage and control");
+        check(!m.Note(true, S::Unknown, T::Bloom, TrialOutcome::Harm) && !m.Note(true, S::Input, T::None, TrialOutcome::Harm) &&
+              !m.Note(true, S::Input, T::Bloom, TrialOutcome::Pending), "memory: unknown stage, no control or no outcome records nothing");
+        check(m.Preferred(true, S::Input) == Bit(T::AmbientHistory) && m.Avoided(true, S::Input) == Bit(T::Bloom) &&
+              m.Preferred(false, S::Reconstruction) == Bit(T::ScreenFit) && !m.Avoided(false, S::Reconstruction) &&
+              !m.Preferred(false, S::Input) && !m.Preferred(true, S::Reconstruction),
+              "memory: DX11 and DX12 keep separate tables; no verdict is not harm");
+        const auto text = m.Encode(game, runtime);
+        Memory again;
+        check(again.Decode(text, game, runtime) == Memory::Load::Loaded &&
+              again.Preferred(true, S::Input) == Bit(T::AmbientHistory) && again.Avoided(true, S::Input) == Bit(T::Bloom) &&
+              again.Get(true, S::Input, T::AmbientHistory)->kept == 1 &&
+              std::fabs(again.Get(true, S::Input, T::AmbientHistory)->reduction - .93f) < .001f &&
+              again.Get(false, S::Reconstruction, T::CameraResidual)->inconclusive == 1,
+              "memory: a second launch reads back what the first one saved");
+        check(again.Decode(text, "game-updated", runtime) == Memory::Load::Stale && again.Empty(),
+              "memory: a changed game executable discards the record");
+        check(again.Decode(text, game, "runtime-new") == Memory::Load::Stale && again.Empty(),
+              "memory: a changed runtime discards the record");
+        auto newer = text;
+        newer.replace(newer.find(" 1\n"), 3, " 2\n");
+        check(again.Decode(newer, game, runtime) == Memory::Load::Stale && again.Empty(), "memory: another schema is not read");
+        check(again.Decode("", game, runtime) == Memory::Load::Missing &&
+              again.Decode(text + "9 9 9 1 1 1 0\n", game, runtime) == Memory::Load::Invalid && again.Empty() &&
+              again.Decode(text + text.substr(text.rfind('\n', text.size() - 2) + 1), game, runtime) == Memory::Load::Invalid &&
+              again.Decode(text.substr(0, text.size() - 8), game, runtime) == Memory::Load::Invalid &&
+              again.Decode(std::string(9000, 'x'), game, runtime) == Memory::Load::Invalid && again.Empty(),
+              "memory: missing, out-of-range, repeated, truncated or oversized records leave no hints");
+        check(m.Encode("has space", runtime).empty() && m.Encode(game, "").empty(), "memory: identities must be plain tokens");
+    }
+    // The chooser. Flicker first measured at the input stage with both input
+    // controls available; only the hints differ.
+    const auto first_choice = [](bool dx12, uint8_t prefer, uint8_t avoid, uint8_t available) {
+        StageRecovery r(dx12);
+        r.SetScene({1, 2, 1920, 1080});
+        r.SetHints(S::Input, prefer, avoid);
+        TrialSample s;
+        s.width = 1920; s.height = 1080; s.configuration = 8;
+        s.comparable = s.delivered = true; s.tools = available;
+        s.origin = {S::Input, 33, {.3f, .3f, .3f}}; // an input change carries through to the screen
+        uint64_t now = 101;
+        for (int i = 0; i < 2; ++i) {
+            s.ordinal += RouteTrial::warmup_frames + 1;
+            now += 100;
+            for (auto& stop : s.origin.stops) stop *= -1;
+            s.change[33].fill(s.origin.stops[0] > 0 ? .3f : -.3f);
+            s.contrast[33] = .2f;
+            r.Tick(now);
+            r.Add(r.Ticket(s.ordinal), s, s.ordinal + 1, now);
+        }
+        return r;
+    };
+    const uint8_t both = Bit(T::Bloom) | Bit(T::AmbientHistory);
+    for (bool dx12 : {false, true}) {
+        check(first_choice(dx12, 0, 0, both).Selected() == T::Bloom && !first_choice(dx12, 0, 0, both).Hinted(),
+              "memory: without hints the usual order applies");
+        const auto preferred = first_choice(dx12, Bit(T::AmbientHistory), 0, both);
+        check(preferred.Selected() == T::AmbientHistory && preferred.Hinted() && preferred.ToolInUse() == T::None,
+              "memory: a control kept before is tried first, and still starts with the ordinary-route measurement");
+        check(first_choice(dx12, 0, Bit(T::Bloom), both).Selected() == T::AmbientHistory,
+              "memory: a control that only did harm before goes last");
+        check(first_choice(dx12, 0, Bit(T::Bloom), Bit(T::Bloom)).Selected() == T::Bloom,
+              "memory: a control that did harm before is still tried when it is the only one");
+        check(first_choice(dx12, Bit(T::Sharpen), 0, both).Selected() == T::Bloom,
+              "memory: a hint for a control of another stage changes nothing");
+        check(first_choice(dx12, Bit(T::AmbientHistory), 0, Bit(T::Bloom)).Selected() == T::Bloom,
+              "memory: a preferred control that this frame did not use is not chosen");
+    }
+    {
+        // A finished attempt is reported once, with what the screen established.
+        StageRecovery r;
+        r.SetScene({1, 2, 1920, 1080});
+        TrialSample s;
+        s.width = 1920; s.height = 1080; s.configuration = 8;
+        s.comparable = s.delivered = true; s.tools = Bit(T::Sharpen);
+        s.origin = {S::Composition, 33, {0, 0, .3f}};
+        uint64_t now = 101;
+        const auto send = [&](float amplitude, float contrast, uint8_t applied = 0) {
+            s.ordinal += RouteTrial::warmup_frames + 1;
+            now += 100;
+            s.origin.stops[2] *= -1;
+            s.change[33].fill(s.origin.stops[2] > 0 ? amplitude : -amplitude);
+            s.contrast[33] = contrast;
+            s.applied = applied;
+            r.Tick(now);
+            r.Add(r.Ticket(s.ordinal), s, s.ordinal + 1, now);
+        };
+        StageRecovery::Result result;
+        for (int i = 0; i < 6; ++i) send(.3f, .2f);
+        check(r.ToolInUse() == T::Sharpen && !r.TakeResult(result), "memory: nothing is reported while an attempt runs");
+        for (int i = 0; i < 4; ++i) send(.01f, .01f, Bit(T::Sharpen));
+        check(r.TakeResult(result) && result.tool == T::Sharpen && result.stage == S::Composition &&
+              result.outcome == TrialOutcome::Harm && !result.hinted && !r.TakeResult(result),
+              "memory: lost detail is reported once as harm for that control and stage");
+        Memory m;
+        m.Note(r.Dx12(), result.stage, result.tool, result.outcome, result.reduction);
+        check(!r.Dx12() && m.Avoided(false, S::Composition) == Bit(T::Sharpen) && !m.Avoided(true, S::Composition),
+              "memory: the reported harm lands in the reporting API's table only");
+    }
+}
+
 void TestRotatingRoles()
 {
     {
@@ -1337,6 +1454,7 @@ int main()
     TestPictureScoring();
     TestRouteTrials();
     TestRetryAndReasons();
+    TestLaunchMemory();
     TestStageRecovery();
     TestRotatingRoles();
     {
