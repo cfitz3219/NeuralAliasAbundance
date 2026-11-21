@@ -31,6 +31,7 @@
 #include <type_traits>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <memory>
@@ -7542,6 +7543,10 @@ bool InstallProducers(ID3D12Device* device, ID3D12CommandQueue* queue, bool hook
 {
     std::call_once(g_install_once, [&] {
         if (!device || !queue) return;
+        // The observer can be linked into an EXE as well as a proxy DLL.
+        // An EXE runs CRT destructors before ExitProcess. Stop sentinel
+        // callbacks before those destructors can dismantle the registry.
+        if (std::atexit(&SetProcessExiting) != 0) return;
         for (uint32_t ty = 0; ty < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; ++ty)
             descriptor_increment(device, static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(ty));
         ID3D12Device2* d2 = nullptr;
