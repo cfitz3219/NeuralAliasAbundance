@@ -16,6 +16,40 @@ constexpr bool SceneDrawTakesJitter(bool active, uint64_t bound_depth, uint64_t 
 {
     return active && scene_depth && bound_depth == scene_depth && tests_depth && !after_resolve;
 }
+// VARIANT: jitter/shader-depth-readers
+// A scene can write a depth-like layer as colour with its depth-tested draws and compare against
+// that layer later in its mesh shaders, with the hardware depth test off (Three Kingdoms terrain,
+// 2026-11-21: road and ground patches painted black on the samples that moved the layer furthest).
+// Those readers are scene geometry on the layer's raster grid: they take the frame's full sample,
+// like the draws that wrote the layer. Each field is a fact the host observed for this one draw;
+// nothing here names a game, a format or a resource.
+struct ShaderDepthReader {
+    bool active = false;            // a sample is in force for this draw's frame
+    bool tests_depth = false;       // hardware depth test on: the ordinary rule already decides
+    bool scene_depth_bound = false; // the scene's depth buffer is the bound depth
+    bool layer_took_sample = false; // a full-size depth-like colour layer was written by sampled, depth-tested scene draws
+    bool reads_layer = false;       // this draw's pixel shader has that layer bound
+    bool writes_layer = false;      // ... and must not be writing it
+    bool mesh = false;              // more vertices than a full-screen pass
+    bool several_targets = false;   // a material pass, not a composite into one picture
+    bool scene_viewport = false;    // one viewport covering the whole scene target
+};
+constexpr bool ShaderDepthReaderTakesJitter(const ShaderDepthReader& r)
+{
+    return r.active && !r.tests_depth && r.scene_depth_bound && r.layer_took_sample && r.reads_layer &&
+           !r.writes_layer && r.mesh && r.several_targets && r.scene_viewport;
+}
+// Why a candidate reader (depth test off, scene depth bound, a mesh) kept the game's own viewport.
+enum class ShaderDepthRefusal : uint8_t { None, NoLayer, NotRead, WritesLayer, OneTarget, Viewport, Count };
+constexpr ShaderDepthRefusal ShaderDepthReaderRefusal(const ShaderDepthReader& r)
+{
+    if (!r.layer_took_sample) return ShaderDepthRefusal::NoLayer;
+    if (!r.several_targets) return ShaderDepthRefusal::OneTarget;
+    if (!r.scene_viewport) return ShaderDepthRefusal::Viewport;
+    if (r.writes_layer) return ShaderDepthRefusal::WritesLayer;
+    if (!r.reads_layer) return ShaderDepthRefusal::NotRead;
+    return ShaderDepthRefusal::None;
+}
 // The overlay owns this session-only transform. NVIDIA's F9/F10 hotkeys
 // have no reported state we can reliably return to zero.
 struct JitterDiagnostic {

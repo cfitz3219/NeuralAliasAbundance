@@ -489,7 +489,14 @@ void GetDrawReplayStats(DrawReplayStats* out);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
-struct ViewportJitterStats { uint64_t draws, sets, restores, unknown, local_layers, submitted_layers; };
+// shader_depth: meshes with the depth test off that took the sample because their shader reads a
+// sampled depth layer. shader_depth_refused: candidates that kept the game's viewport, by reason
+// (no layer, layer not read, writes the layer, one target, viewport not the scene's).
+struct ViewportJitterStats {
+    uint64_t draws, sets, restores, unknown, local_layers, submitted_layers;
+    uint64_t shader_depth = 0;
+    struct Refused { uint64_t no_layer = 0, not_read = 0, writes_layer = 0, one_target = 0, viewport = 0; } shader_depth_refused;
+};
 ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,
