@@ -387,6 +387,8 @@ void GetLiveSelection(uint64_t* depth, uint64_t* color, bool* requires_screen = 
 // Includes the unverified scene, for the screen challenge only.
 void GetScreenSelection(uint64_t* depth, uint64_t* color, bool* requires_screen = nullptr);
 bool SetScreenSelectionProven(uint64_t depth, uint64_t color, bool proven);
+// True while the pair offered to the screen challenge is the proven, published scene.
+bool ScreenSelectionProven(uint64_t depth, uint64_t color);
 // Changes whenever the published depth/colour pair changes.
 uint64_t LiveSelectionVersion();
 // Viewport jitter: real sub-pixel samples. While set (frame != 0), every draw whose bound depth

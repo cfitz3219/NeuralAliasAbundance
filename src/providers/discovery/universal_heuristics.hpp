@@ -216,8 +216,8 @@ public:
             const auto ci = resources_.find(c.first);
             if (ci == resources_.end() || !single_image(ci->second)) continue;
             const auto& image = ci->second;
-            if (image.width > swap_w_ || SimilarAspect(uint32_t(image.width), image.height) ||
-                !presentation::CenteredNativeRegion(uint32_t(image.width), image.height, swap_w_, swap_h_)) continue;
+            if (SimilarAspect(uint32_t(image.width), image.height) ||
+                !PlacedOrStretched(uint32_t(image.width), image.height)) continue;
             const bool float_color = image.format == 2 || image.format == 10 || image.format == 26;
             for (const auto& paired : c.second.with_depth) {
                 if (paired.second <= 8) continue;
@@ -247,7 +247,7 @@ public:
     // like a scene, is not the screen's shape, and cannot be taken as a picture placed inside the
     // screen, with what stood in the way. No behaviour depends on it.
     struct RefusedRegion {
-        enum class Why : uint8_t { None, Multisampled, SmallerBothWays } why = Why::None;
+        enum class Why : uint8_t { None, Multisampled } why = Why::None;
         uint32_t width = 0, height = 0, samples = 1;
         uint64_t vertices = 0;
     };
@@ -262,8 +262,7 @@ public:
             const auto& image = ci->second;
             const uint32_t w = uint32_t(image.width), h = image.height;
             if (image.width > swap_w_ || h > swap_h_ || SimilarAspect(w, h)) continue;
-            const bool placed = presentation::CenteredNativeRegion(w, h, swap_w_, swap_h_);
-            const bool both = w < swap_w_ && h < swap_h_ && uint64_t(w) * 2 >= swap_w_ && uint64_t(h) * 2 >= swap_h_;
+            const bool placed = PlacedOrStretched(w, h);
             for (const auto& paired : c.second.with_depth) {
                 if (paired.second <= 8) continue;
                 const auto di = resources_.find(paired.first);
@@ -273,8 +272,7 @@ public:
                 const auto& depth = observed->second;
                 if (depth.vertices <= 3 && !depth.indirect) continue;
                 const uint32_t samples = (std::max)(uint32_t(image.sample_count), uint32_t(di->second.sample_count));
-                const auto why = placed && samples > 1 ? RefusedRegion::Why::Multisampled :
-                                 both ? RefusedRegion::Why::SmallerBothWays : RefusedRegion::Why::None;
+                const auto why = placed && samples > 1 ? RefusedRegion::Why::Multisampled : RefusedRegion::Why::None;
                 const uint64_t vertices = depth.vertices ? depth.vertices : depth.draws;
                 if (why == RefusedRegion::Why::None || (out.why != RefusedRegion::Why::None && vertices <= out.vertices)) continue;
                 out = {why, w, h, samples, vertices};
@@ -474,6 +472,12 @@ private:
         f = it->second.format;
     }
     bool AspectMatch(uint32_t w, uint32_t h) const { return SimilarAspect(w, h); }
+    // A picture no larger than the screen and at least half of it each way: bars on one side pair,
+    // bars all round, or a smaller picture the game stretches (native11 FrameModel::PlacedOrStretched).
+    bool PlacedOrStretched(uint32_t w, uint32_t h) const {
+        return w && h && w <= swap_w_ && h <= swap_h_ && !(w == swap_w_ && h == swap_h_) &&
+               uint64_t(w) * 2 >= swap_w_ && uint64_t(h) * 2 >= swap_h_;
+    }
     // generic_depth check_aspect_ratio, similar_aspect_ratio mode.
     bool SimilarAspect(uint32_t w, uint32_t h) const {
         if (!swap_w_ || !swap_h_ || !w || !h) return false;

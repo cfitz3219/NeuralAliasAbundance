@@ -264,7 +264,7 @@ int main(int argc,char** argv) {
              CHECK(!msaa.first.second && msaa.second.why == Why::Multisampled && msaa.second.samples == 4 &&
                    msaa.second.width == 2560 && msaa.second.height == 1440);
              const auto small = run(1920, 1080, 1);
-             CHECK(!small.first.second && small.second.why == Why::SmallerBothWays && small.second.width == 1920);
+             CHECK(small.first.second == 6 && small.second.why == Why::None); // offered: stretched or boxed
              const auto placed = run(2560, 1440, 1);
              CHECK(placed.first.second == 6 && placed.second.why == Why::None);
          }},

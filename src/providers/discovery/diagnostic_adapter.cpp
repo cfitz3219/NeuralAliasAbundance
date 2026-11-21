@@ -46,6 +46,7 @@ struct Consumer {
     uint64_t live_depth{},live_color{},pick_challenger{}; unsigned pick_streak{}; // J2 pick hysteresis
     na::discovery::DepthPick pick; uint64_t pick_events{}; // depth role from accumulated frames
     uint64_t refused_said{}; // the last no_scene reason written (WHY log)
+    uint64_t region_depth{}, region_color{}, region_since{}; bool region_pushed{}; // scene/pushed-without-screen-proof
     bool overflow{}; unsigned reports{};
     uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
     // P4-4 Stage M ([stage_m] map=1): read-only pass maps of single frames, own log file.
@@ -177,7 +178,22 @@ void PublishLivePicks(Consumer& c) {
         na::observe::SetLiveSelection(c.live_depth, c.live_color);
     } else {
         const auto [region_depth, region_color] = c.heuristics.ScreenRegionPair();
-        if (region_color) na::observe::SetLiveSelection(region_depth, region_color, true);
+        // VARIANT: scene/pushed-without-screen-proof
+        // A picture that is not the screen's shape is offered to the screen challenge first. One the
+        // challenge has not proved in three seconds (a stretched picture never gives a pixel match)
+        // is published as the scene anyway, so DLAA is not held back; it stays so while it is offered.
+        const uint64_t now = GetTickCount64();
+        if (!region_color) { c.region_depth = c.region_color = 0; c.region_pushed = false; }
+        else if (region_depth != c.region_depth || region_color != c.region_color) {
+            c.region_depth = region_depth; c.region_color = region_color; c.region_since = now; c.region_pushed = false;
+        }
+        if (region_color && !c.region_pushed && now - c.region_since >= 3000 &&
+            !na::observe::ScreenSelectionProven(region_depth, region_color)) {
+            c.region_pushed = true;
+            if (c.log) std::fprintf(c.log, "{\"type\":\"picture_region\",\"result\":\"pushed_without_screen_proof\",\"depth\":%llu,\"color\":%llu}\n",
+                (unsigned long long)region_depth, (unsigned long long)region_color);
+        }
+        if (region_color) na::observe::SetLiveSelection(region_depth, region_color, !c.region_pushed);
         else na::observe::SetLiveSelection(c.live_depth, 0);
         // WHY log: a scene-like picture that cannot be used, said when the reason or its size changes.
         if (!region_color && c.log) {
@@ -189,9 +205,7 @@ void PublishLivePicks(Consumer& c) {
                 std::fprintf(c.log, "{\"type\":\"no_scene\",\"picture\":[%u,%u],\"samples\":%u,\"screen\":[%u,%u],\"scene_vertices\":%llu,\"why\":\"%s\"}\n",
                     refused.width, refused.height, refused.samples, c.heuristics.SwapchainWidth(), c.heuristics.SwapchainHeight(),
                     (unsigned long long)refused.vertices,
-                    refused.why == Why::Multisampled
-                        ? "The game's own anti-aliasing is on (the scene picture is multisampled): DLAA needs it off in the game's settings."
-                        : "The game's picture is smaller than the screen in both width and height: DLAA needs the game's resolution to match the screen's width or its height.");
+                    "The game's own anti-aliasing is on (the scene picture is multisampled): DLAA needs it off in the game's settings.");
             }
             c.refused_said = refused.why != Why::None ? key : 0;
         }
