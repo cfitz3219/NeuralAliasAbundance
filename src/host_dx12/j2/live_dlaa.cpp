@@ -2164,16 +2164,18 @@ void main(uint3 id : SV_DispatchThreadID) {
     float lobe = max(-3.0 / 16.0, min(max3(lobeRGB.r, lobeRGB.g, lobeRGB.b), 0.0));
     lobe *= nz;
     lobe *= lerp(1.0, 0.35, edge);
-    // Strength (Cort 2026-11-04: the same rate over the whole slider): RCAS at 100 % adds
-    // g1 = 4a/(1-4a) times (centre - cross mean); the slider multiplies that gain, doubling it
-    // every 50 % (x1/4 at 0+, x1 at 100 %, x4 at 200 %), and the lobe is solved back from it,
-    // so it stays below 1/4 (finite) at any strength. 100 % is RCAS unchanged.
-    if (gain != 1.0) {
-        const float a1 = -lobe, g = gain * 4.0 * a1 / (1.0 - 4.0 * a1);
-        lobe = -g / (4.0 * (1.0 + g));
-    }
-    float rcpL = 1.0 / (4.0 * lobe + 1.0);
-    float3 o = (lobe * b + lobe * d + lobe * hh + lobe * f + e) * rcpL;
+    // Limit the sharpening to contrast supported at a two-pixel radius. Division by four
+    // compensates for the squared step in a second difference, preserving broad contours.
+    // On a one-pixel alternating pattern the wide taps equal the centre: the sharpened
+    // result retains the original samples without magnifying a change of sampling phase.
+    const float3 fine = e - 0.25 * (b + d + f + hh);
+    const float3 wide = 0.25 * (e - 0.25 * (tap(p + int2(0, -2)) + tap(p + int2(-2, 0)) +
+                                            tap(p + int2(2, 0)) + tap(p + int2(0, 2))));
+    const float3 direction = sign(fine);
+    const float3 detail = direction * min(abs(fine), max(0.0, direction * wide));
+    // The existing RCAS local contrast, depth, noise and user gain shape the supported detail.
+    const float detail_gain = gain * (-4.0 * lobe) / (1.0 + 4.0 * lobe);
+    float3 o = e + detail_gain * detail;
     // Soft halo control (the idea of separate soft bright/dark overshoot limits is from
     // bacondither's Adaptive-sharpen, BSD-2; this is our own formulation): where the centre lies
     // inside its cross's range (an edge or gradient, where halos form), overshoot beyond that
