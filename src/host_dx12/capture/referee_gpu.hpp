@@ -72,7 +72,7 @@ uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t col
 // True while the Referee asks this scene's meshes that kept the game's viewport to take the
 // frame's sample (surfaces were seen dropping to black on particular samples). Cheap when not.
 bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, uint64_t depth,
-                      uint64_t generation, uint64_t screen_proof = 0);
+                      uint64_t generation, uint64_t frame, uint64_t screen_proof = 0);
 void InvalidatePresentation(const void* swapchain);
 // Consume a visual rollback decision scoped to a native DX11 screen proof.
 uint64_t TakeNativeScreenLoss(const void* swapchain);

@@ -2806,7 +2806,12 @@ void update_draw_replay()
 void vpj_advance()
 {
     const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
-    if (!vpj_mode() || !g.jitter_on || !running || !g.w) { na::observe::SetSceneViewportJitter(0, 0.f, 0.f); return; }
+    if (!vpj_mode() || !g.jitter_on || !running || !g.w) {
+        na::observe::SetStillMeshJitter(false);
+        na::observe::SetSceneViewportJitter(0, 0.f, 0.f);
+        return;
+    }
+    bool still_meshes = false;
     const neural_alias::JitterSample js = jitter_sample(++g.vpj_phase, jitter_phases());
     uint8_t amount = referee::normal_jitter;
     if (g.recovery_swapchain && !settings::Get().j2_debug_jitter.load(std::memory_order_relaxed) &&
@@ -2825,10 +2830,11 @@ void vpj_advance()
         // The Referee's reaction to pixels that drop out on some samples: the meshes the fixed rule
         // left on the game's grid take the sample too, and the sample stays at full strength while
         // it tries or keeps that (a weaker sample would hide the dropouts it is checking for).
-        const bool still = referee::gpu::SceneStillMeshes(g.recovery_swapchain, path, color, depth, route.history_generation);
-        na::observe::SetStillMeshJitter(still);
-        if (still) amount = referee::normal_jitter;
+        still_meshes = referee::gpu::SceneStillMeshes(g.recovery_swapchain, path, color, depth,
+            route.history_generation, g.submitted_frame);
+        if (still_meshes) amount = referee::normal_jitter;
     }
+    na::observe::SetStillMeshJitter(still_meshes);
     auto& e = g.vpj[g.frame % 8];
     e = {g.frame, static_cast<float>(js.x_pixels) * (amount * .01f),
                   static_cast<float>(js.y_pixels) * (amount * .01f), amount};

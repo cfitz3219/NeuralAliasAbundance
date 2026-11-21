@@ -1041,7 +1041,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         // it tries or keeps that (a weaker sample would hide the dropouts it is checking for).
         const bool still_meshes = !debug_jitter.value && referee::gpu::SceneStillMeshes(frame.presentation_source,
             referee::shadow::Path::Native11, frame.color.incarnation, frame.depth.incarnation, frame.scene_stream,
-            frame.screen_proof);
+            frame.frame, frame.screen_proof);
         native11::SetStillMeshJitter(still_meshes);
         const auto amount = !frame.raster.shader_depth_aligned && !still_meshes && !debug_jitter.value &&
             frame.recovery_tool == referee::RecoveryTool::None &&

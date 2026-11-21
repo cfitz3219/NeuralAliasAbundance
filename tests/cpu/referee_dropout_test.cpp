@@ -62,9 +62,23 @@ int main()
             CHECK(kept >= DropoutWatch::kTrialLeast && kept < 100); // decided by the challenge samples, not by waiting
             CHECK(w.Current() == DropoutWatch::Phase::Kept && w.MoveStillMeshes());
             CHECK(w.Challenges() >= DropoutWatch::kChallenges && w.TrialEvents() == 0);
-            // Kept is not reopened by a later event; it is counted for the log.
-            CHECK(Run(w, at, 64, [] { return true; }) == 0);
-            CHECK(w.Current() == DropoutWatch::Phase::Kept && w.Recurred() > 0);
+            // The original fault returning revokes the change.
+            CHECK(Run(w, at, 64, [] { return true; }) > 0);
+            CHECK(w.Current() == DropoutWatch::Phase::RuledOut && !w.MoveStillMeshes());
+        }},
+        {"a trial expires if it never revisits the formerly bad samples", [] {
+            for (bool same_picture : {false, true}) {
+                DropoutWatch w;
+                unsigned at = 0;
+                CHECK(Run(w, at, 200, [] { return true; }) > 0);
+                CHECK(w.Current() == DropoutWatch::Phase::Trial);
+                const DropoutPair clean{0, 0, kCells};
+                const S other{0.75f, 0.75f};
+                for (unsigned i = 0; i < DropoutWatch::kTrialMost; ++i)
+                    w.Observe(clean, other, other, same_picture);
+                CHECK(w.Current() == DropoutWatch::Phase::RuledOut && !w.MoveStillMeshes());
+                CHECK(w.Challenges() == 0);
+            }
         }},
         {"dropouts that continue with the meshes moved put the game's viewports back", [] {
             DropoutWatch w;

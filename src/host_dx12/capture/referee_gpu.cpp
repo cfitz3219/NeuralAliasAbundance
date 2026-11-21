@@ -651,15 +651,10 @@ void collect_sample()
                 const unsigned index = jitter_index(scene.placement.path);
                 auto& control = g.jitter_controls[index];
                 if (control.source != g.swapchain || !same_jitter_scene(control.scene, scene)) {
-                    // What the dropout watch proved is about how the game draws, not about one scene's
-                    // textures: a move it kept stays through a new scene on the same presentation. A
-                    // trial in progress, and anything else, starts again.
-                    const bool keep_move = control.source == g.swapchain && control.dropout.Current() == DropoutWatch::Phase::Kept;
-                    const auto kept = control.dropout;
+                    // A result belongs to the scene that supplied its evidence.
                     control = {};
                     control.source = g.swapchain;
                     control.scene = scene;
-                    if (keep_move) control.dropout = kept;
                     publish_jitter(index);
                 }
                 control.ordinal = g.main_ordinal;
@@ -1562,7 +1557,7 @@ uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t col
 // Whether the meshes of this scene that kept the game's own viewport should take the frame's
 // sample: the dropout watch is trying that, or has proved it on this scene.
 bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, uint64_t depth,
-                      uint64_t generation, uint64_t screen_proof)
+                      uint64_t generation, uint64_t frame, uint64_t screen_proof)
 {
     if (!swapchain || !color || !depth || !generation || !enabled()) return false;
     const unsigned index = jitter_index(path);
@@ -1570,9 +1565,8 @@ bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, 
     std::lock_guard<std::mutex> lock(g.m);
     const auto& control = g.jitter_controls[index];
     const auto& scene = control.scene;
-    if (control.source != swapchain || path != scene.placement.path) return false;
-    // Proved: holds for this presentation through scene changes. On trial: this exact scene only.
-    if (control.dropout.Current() == DropoutWatch::Phase::Kept) return true;
+    if (control.source != swapchain || path != scene.placement.path ||
+        frame < control.ordinal || frame - control.ordinal > DropoutWatch::kWindow) return false;
     const bool rotating = path == shadow::Path::Native11 && screen_proof && scene.native_screen_proof;
     if (depth != scene.depth || generation != scene.generation || (color != scene.color && !rotating)) return false;
     return control.dropout.MoveStillMeshes();

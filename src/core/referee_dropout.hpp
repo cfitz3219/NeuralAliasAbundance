@@ -75,33 +75,37 @@ public:
             Forget();
             if (event) Note(pair, before, now);
             if (gone_ >= 3 && back_ >= 2) {
+                trial_started_ = pairs_;
                 trial_pairs_ = trial_events_ = challenges_ = 0;
                 Set(Phase::Trial, "surfaces drop to black on particular jitter samples: moving the meshes that kept the game's viewport onto the sample");
             }
             break;
         case Phase::Trial:
-            if (!same_picture) break; // not evidence either way
-            if (++trial_pairs_ <= kSettle) break;
-            if (event) ++trial_events_;
-            else if (Challenge(before) || Challenge(now)) ++challenges_;
+            if (same_picture && ++trial_pairs_ > kSettle) {
+                if (event) ++trial_events_;
+                else if (Challenge(now)) ++challenges_;
+            }
             if (trial_events_ >= 3) {
-                retry_at_ = pairs_ + kRetryAfter;
-                Set(Phase::RuledOut, "the dropouts continued with the meshes moved: put back, another cause");
-            } else if (!trial_events_ && ((challenges_ >= kChallenges && trial_pairs_ >= kTrialLeast) || trial_pairs_ >= kTrialMost)) {
-                Set(Phase::Kept, challenges_ >= kChallenges ? "no dropout on the samples that produced them: kept"
-                                                            : "no dropout for the whole trial: kept");
-            } else if (trial_pairs_ >= kTrialMost) {
-                retry_at_ = pairs_ + kRetryAfter;
-                Set(Phase::RuledOut, "dropouts still seen during the trial: put back");
+                RuleOut("the dropouts continued with the meshes moved: put back, another cause");
+            } else if (!trial_events_ && challenges_ >= kChallenges && trial_pairs_ >= kTrialLeast) {
+                Set(Phase::Kept, "no dropout on the samples that produced them: kept");
+            } else if (pairs_ - trial_started_ >= kTrialMost) {
+                RuleOut("the trial did not verify the fix on the samples that produced the dropouts: put back");
             }
             break;
         case Phase::Kept:
-            if (event) ++recurred_; // reported, not acted on: the move was proved on this scene
+            if (event) {
+                if (!recurred_at_ || pairs_ - recurred_at_ > kWindow) {
+                    recurred_at_ = pairs_;
+                    recurred_ = 0;
+                }
+                if (++recurred_ >= 3) RuleOut("dropouts returned on this scene: put back");
+            }
             break;
         case Phase::RuledOut:
             if (pairs_ >= retry_at_) {
-                gone_ = back_ = black_n_ = 0;
-                first_event_ = 0;
+                gone_ = back_ = black_n_ = recurred_ = 0;
+                first_event_ = recurred_at_ = 0;
                 Set(Phase::Watch, "looking again");
             }
             break;
@@ -111,6 +115,11 @@ public:
 
 private:
     void Set(Phase phase, const char* why) { phase_ = phase; why_ = why; }
+    void RuleOut(const char* why)
+    {
+        retry_at_ = pairs_ + kRetryAfter;
+        Set(Phase::RuledOut, why);
+    }
     void Forget()
     {
         if (first_event_ && pairs_ - first_event_ > kWindow) {
@@ -140,7 +149,7 @@ private:
 
     Phase phase_ = Phase::Watch;
     const char* why_ = "watching";
-    uint64_t pairs_ = 0, first_event_ = 0, retry_at_ = 0;
+    uint64_t pairs_ = 0, first_event_ = 0, retry_at_ = 0, trial_started_ = 0, recurred_at_ = 0;
     unsigned gone_ = 0, back_ = 0, recurred_ = 0;
     unsigned trial_pairs_ = 0, trial_events_ = 0, challenges_ = 0;
     std::array<Sample, 8> black_{};
