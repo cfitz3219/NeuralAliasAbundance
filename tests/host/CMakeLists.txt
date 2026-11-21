@@ -640,3 +640,15 @@ if(NA_HAVE_NVRHI AND NA_HAVE_NGX_SDK)
   add_test(NAME host_j2_nvrhi_test COMMAND j2_live_test --nvrhi)
   set_tests_properties(host_j2_nvrhi_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 endif()
+
+# A measuring tool, not a test: replays a saved DLAA capture through DLSS on this machine's card with
+# one input changed at a time (see the head of the source). Built everywhere so the hosted build
+# compiles it; it only runs where an RTX card, the NGX library and the DLSS runtime are present.
+# Carried from PR 145 (gap audit 2026-11-21 item 3) so the active line holds the only copy no longer.
+add_executable(dlss_capture_replay dlss_capture_replay.cpp)
+target_link_libraries(dlss_capture_replay PRIVATE abundance_options host_dlss dxgi d3d12)
+target_include_directories(dlss_capture_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
+  add_custom_command(TARGET dlss_capture_replay POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_capture_replay>")
+endif()
