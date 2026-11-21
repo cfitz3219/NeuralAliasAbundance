@@ -195,3 +195,8 @@ PR 193 build 37b9be05 is staged in Windows Documents. Both Route B APIs now reco
 ### 2026-11-21 — Automatic mip bias restored
 
 Build 8d6913ca on PR 193 combines Fable's late DX11 sampler discovery and the follow-up that preserves the game's original sampler state. RTX checks verified sampled pixels and live restoration. The Three Kingdoms and Pharaoh Dynasties installers in Windows Documents are staged at the same build. COMMS and WORKLOG record the fixture evidence and packaging checks.
+
+
+### 2026-11-21 — XeGTAO with measured motion and safer jitter trials
+
+PR 193 build 50fcfe56 stages both Total War packages. Native DX11 has separate AO projection acquisition, and both Referee detectors require independent confirmation before changing jitter. Seven final tests passed on the RTX machine. See COMMS for live capture findings, offline replay, and package checks. Cort owns the campaign test.
