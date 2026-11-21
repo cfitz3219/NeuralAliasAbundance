@@ -362,6 +362,8 @@ int TestAdaptiveJitter(test::Device& d, test::List& l, bool localized = false, b
                 return true;
             };
             REQUIRE(window(normal_jitter));
+            CHECK(amount() == normal_jitter);
+            REQUIRE(window(normal_jitter));
             CHECK(amount() == reduced_jitter);
             REQUIRE(window(reduced_jitter));
             if (try_quarter) {

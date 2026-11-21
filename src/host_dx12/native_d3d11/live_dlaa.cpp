@@ -373,8 +373,11 @@ void SyncCameraUse()
                                      options.j2_replay_budget.load(std::memory_order_relaxed),
                                      options.j2_replay_movers.load(std::memory_order_relaxed) != 0);
     const int setting = settings::Get().j2_camera.load(std::memory_order_relaxed);
-    native11::SetCameraUse(setting == 0 ? native11::CameraUse::Off : setting == 2 ? native11::CameraUse::Required
-                                                                                : native11::CameraUse::Optional);
+    // XeGTAO reads projection geometry independently of DLAA's motion supplier.
+    const bool ambient = options.xegtao_enabled.load(std::memory_order_relaxed) &&
+                         options.xegtao_amount.load(std::memory_order_relaxed) != 0;
+    native11::SetCameraUse(setting == 2 ? native11::CameraUse::Required :
+        (setting == 1 || ambient) ? native11::CameraUse::Optional : native11::CameraUse::Off);
 }
 
 bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
@@ -443,8 +446,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // looked for. A camera can improve the motion; it never decides whether DLAA starts, keeps
     // delivering or keeps its history.
     const int camera_setting = settings::Get().j2_camera.load(std::memory_order_relaxed);
+    const auto ambient_options = xegtao::CurrentOptions();
+    const bool ambient_requested = ambient_options.enabled && ambient_options.amount != 0;
     camera::CameraFrame cam{};
-    if (frame.camera_known && camera_setting != 0) cam = Pose(s, frame, ci.width, ci.height);
+    if (frame.camera_known && (camera_setting != 0 || ambient_requested)) cam = Pose(s, frame, ci.width, ci.height);
     if (camera_setting == 2 && !cam.valid) return Skip("Waiting for the current scene camera.");
     // VARIANT: motion/measured-total
     // Whose motion this frame gets. The camera's, when there is a valid one. Measured from the two
@@ -452,7 +457,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // first appears while measured frames are being delivered: the tracker has no previous camera
     // on that frame and would ask for a reset that the measured motion does not need.
     const bool measured = camera_setting != 2 &&
-        (!cam.valid || (cam.camera_cut && s.measured_last && frame.frame == s.last_frame + 1 && !frame.scene_changed));
+        (camera_setting == 0 || !cam.valid ||
+            (cam.camera_cut && s.measured_last && frame.frame == s.last_frame + 1 && !frame.scene_changed));
     using Tool = referee::RecoveryTool;
     const auto lighting = donut::CurrentOptions();
     const uint32_t preset = settings::Get().j2_preset.load();
@@ -749,7 +755,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // The two optional passes (ambient shading, bloom) each hand DLSS a picture of their own. On the
     // companion route that picture is copied into the shared scene colour below, because the shared
     // colour is the one the companion reads.
-    if (settings::Get().xegtao_enabled.load()) {
+    if (ambient_requested) {
         xegtao::Inputs ai;
         ai.color = eval.color; ai.depth = shared_depth; ai.motion = slot.motion.Get();
         ai.color_format = cf; ai.width = ci.width; ai.height = ci.height;
@@ -759,11 +765,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         ai.scene_epoch = frame.scene_stream; ai.reset = reset_history || cam.camera_cut;
         const auto column = camera::TransposeMatrix(cam.view_proj_current_row);
         // The projection is independent of whether DLAA uses measured motion during camera acquisition.
-        if (!cam.valid) xegtao::ScenePass().Unavailable(camera_setting == 0
-            ? "To use XeGTAO, set Scene camera to Use it when found."
-            : "Waiting for the scene camera to run XeGTAO.");
+        if (!cam.valid) xegtao::ScenePass().Unavailable("Waiting for scene projection for XeGTAO.");
         else if (xegtao::FromViewProjection(column.data(), ai.projection)) {
-            auto options = xegtao::CurrentOptions();
+            auto options = ambient_options;
             const bool history_requested = options.temporal > 0;
             if (tool == Tool::AmbientHistory) options.temporal = 0;
             slot.ambient = xegtao::ScenePass().Prepare(s.device.Get(), s.queue.Get(), ai, options);

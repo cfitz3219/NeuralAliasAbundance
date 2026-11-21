@@ -910,6 +910,15 @@ void write_status_line()
         const int bytes = snprintf(line, sizeof line, "%02u:%02u:%02u fps=%.1f frame_ms=%.2f | %s\r\n",
                                    t.wHour, t.wMinute, t.wSecond, fps, fps > 0 ? 1000.0 / fps : 0.0, status);
         append_status_text(line, (std::min)(bytes, int(sizeof line) - 1));
+        const auto ambient = na::xegtao::ScenePass().GetStats();
+        const unsigned enabled = na::settings::Get().xegtao_enabled.load();
+        if (enabled || ambient.recorded) {
+            char fx[256];
+            const int count = std::snprintf(fx, sizeof fx,
+                "effects xegtao{enabled=%u recorded=%llu compiling=%u reason=\"%s\"}\r\n",
+                enabled, static_cast<unsigned long long>(ambient.recorded), ambient.compiling ? 1u : 0u, ambient.reason);
+            if (count > 0) append_status_text(fx, (std::min)(count, int(sizeof fx) - 1));
+        }
         return;
     }
     {

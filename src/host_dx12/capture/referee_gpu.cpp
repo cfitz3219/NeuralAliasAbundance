@@ -644,6 +644,7 @@ void collect_sample()
                     if (control.field.Measure(test.NeedsReference() ? &test.Reference() : nullptr, candidate, nullptr, amount)) {
                         candidate.layout = layout;
                         candidate.controls = regions;
+                        candidate.locations = g.sampled_locations;
                         candidate.image = trial.image;
                         if (g.keep_receipt && test.NeedsReference())
                             na::eventlog::Emit("referee_field_comparison",
@@ -654,6 +655,7 @@ void collect_sample()
                         test.Observe(candidate, amount, now);
                         field_measured = true;
                         if (phase != test.Current() || before_strength != test.Amount()) {
+                            control.field.pairs = 0; // required even when Confirm uses the same strength
                             na::eventlog::Emit("referee_mixed_raster", "frame=%llu center=%d,%d screen_phase_px=%.4f detail=%.4f compared=%u improved=%u baseline_edges=%zu",
                                 (unsigned long long)g.main_ordinal,candidate.at.x,candidate.at.y,candidate.shift,candidate.detail,
                                 candidate.regional_checks,candidate.regional_improved,test.Reference().witnesses.size());
@@ -668,7 +670,14 @@ void collect_sample()
                         test.Observe({regions.at[tile], layout, screen.shift, output.shift,
                                       regions.detail[tile], screen.locked, trial.image}, amount, now);
                 }
-                if (phase != test.Current() || before_strength != test.Amount()) log_jitter(test, scene.placement.path, control.ordinal);
+                if (phase != test.Current() || before_strength != test.Amount()) {
+                    // A confirmation must be independent of its first observation.
+                    if (test.Current() == JitterTrial::Phase::Confirm) {
+                        w.window = {};
+                        w.reported = {};
+                    }
+                    log_jitter(test, scene.placement.path, control.ordinal);
+                }
                 publish_jitter(index);
             }
         }
@@ -972,6 +981,12 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
         std::hypot(g.main_jitter[0] - g.pre_jitter[0], g.main_jitter[1] - g.pre_jitter[1]) >= .25f * (g.main_jitter_amount ? g.main_jitter_amount * .01f : 1.f);
     g.sampled_locations = g.swapchain == g.tile_source && g.captured_context.SameTemporalSequence(g.tile_context)
         ? g.tile_locations : TileLocations{};
+    const auto& jitter_control = g.jitter_controls[jitter_index(g.captured_context.placement.path)];
+    if (g.trace_geometry && jitter_control.source == g.swapchain &&
+        same_jitter_scene(jitter_control.scene, g.captured_context) && jitter_control.trial.NeedsReference() &&
+        jitter_control.trial.Reference().field) {
+        g.sampled_locations = jitter_control.trial.Reference().locations;
+    }
     for (int i = 0; screen && i < 3; ++i) {
         k = {};
         k.src = thumbs[i];

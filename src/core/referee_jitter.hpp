@@ -16,6 +16,18 @@ inline uint8_t VerifiedJitterAmount(uint8_t amount, float requested_x, float req
            std::hypot(x, y) > tolerance ? amount : 0;
 }
 
+// Compare the scene structure independently of a uniform change in log luminance.
+inline bool SameJitterPicture(const std::array<float, FlickerTransition::count>& a,
+                              const std::array<float, FlickerTransition::count>& b)
+{
+    float mean = 0;
+    for (unsigned i = 0; i < a.size(); ++i) mean += a[i] - b[i];
+    mean /= float(a.size());
+    float difference = 0;
+    for (unsigned i = 0; i < a.size(); ++i) difference += std::fabs(a[i] - b[i] - mean);
+    return difference <= .10f * a.size();
+}
+
 // VARIANT: referee/jitter-control
 // One window compares the same visible edge at normal and reduced strength.
 // A second normal-strength window must reproduce the problem. Never promote
@@ -31,21 +43,24 @@ public:
         std::array<float, FlickerTransition::count> image{};
         bool field = false;
         RegionalTiles controls{};
+        TileLocations locations{};
         float phase_step = 0;
         struct Witness { unsigned index; float shift, detail; };
         std::vector<Witness> witnesses;
         unsigned regional_checks = 0, regional_improved = 0, regional_worse = 0;
     };
-    enum class Phase : uint8_t { Observe, Reduce, Recheck, Keep, Cooldown };
+    enum class Phase : uint8_t { Observe, Confirm, Reduce, Recheck, Keep, Cooldown };
     Phase Current() const { return phase_; }
     const Measurement& Reference() const { return reference_; }
-    bool NeedsReference() const { return phase_ == Phase::Reduce || phase_ == Phase::Recheck || phase_ == Phase::Keep; }
+    bool NeedsReference() const {
+        return phase_ == Phase::Confirm || phase_ == Phase::Reduce || phase_ == Phase::Recheck || phase_ == Phase::Keep;
+    }
     uint8_t Amount() const { return phase_ == Phase::Reduce || phase_ == Phase::Keep ? strength_ : normal_jitter; }
     const char* Reason() const { return reason_; }
     float Baseline() const { return std::fabs(reference_.shift); }
     float Candidate() const { return candidate_; }
     const char* Name() const {
-        constexpr const char* names[]{"observe", "reduce", "recheck", "kept", "restored"};
+        constexpr const char* names[]{"observe", "confirm", "reduce", "recheck", "kept", "restored"};
         return names[static_cast<unsigned>(phase_)];
     }
     void Tick(uint64_t now)
@@ -65,13 +80,22 @@ public:
             if (!m.locked || wobble < .12f || m.detail <= .02f) return;
             if (m.field && std::count_if(m.controls.detail.begin(), m.controls.detail.end(),
                     [](float detail) { return detail >= .02f; }) < 3) return;
+            if (rejected_view_ && SameJitterPicture(reference_.image, m.image)) return;
+            rejected_view_ = false;
             strength_ = reduced_jitter;
             reference_ = m;
-            Set(Phase::Reduce, now, wobble > std::fabs(m.reconstructed) + .05f
-                ? "displayed edge moves with jitter after reconstruction" : "reconstructed edge moves with raster jitter");
+            candidate_ = 0;
+            Set(Phase::Confirm, now, "checking the same problem edges again before adjusting jitter");
             return;
         }
         if (m.field != reference_.field || !SameView(m)) return;
+        const bool repeated = m.locked && m.shift * reference_.shift > 0.f &&
+            wobble >= .70f * Baseline() && wobble <= 1.45f * Baseline();
+        if (phase_ == Phase::Confirm) {
+            if (repeated)
+                Set(Phase::Reduce, now, "the same displayed edges vibrated in a second independent window");
+            return;
+        }
         if (m.field && amount != normal_jitter) {
             // Follow the original group of problem edges. One improving edge cannot
             // hide persistent shimmer at the other locations that triggered the test.
@@ -119,9 +143,7 @@ public:
             Set(Phase::Recheck, now, "displayed edge improved and retained detail");
             return;
         }
-        if (m.locked && m.shift * reference_.shift > 0.f &&
-            wobble >= .70f * std::fabs(reference_.shift) && wobble <= 1.45f * std::fabs(reference_.shift) &&
-            Improves(candidate_, wobble)) {
+        if (repeated && Improves(candidate_, wobble)) {
             Set(Phase::Keep, now, "the same vibration returned at normal strength");
         } else {
             Reject(now, "the original vibration did not repeat");
@@ -134,14 +156,21 @@ private:
     }
     bool SameView(const Measurement& m) const {
         if (m.at.x != reference_.at.x || m.at.y != reference_.at.y || m.layout != reference_.layout) return false;
+        if (m.field) return SameJitterPicture(reference_.image, m.image);
         float difference = 0;
         for (unsigned i = 0; i < m.image.size(); ++i) difference += std::fabs(m.image[i] - reference_.image[i]);
         return difference <= m.image.size() * .10f;
     }
     void Set(Phase phase, uint64_t now, const char* why) {
-        phase_ = phase; deadline_ = now + comparison_ms; losses_ = 0; reason_ = why;
+        phase_ = phase;
+        deadline_ = now + (phase == Phase::Reduce ? 8000 : comparison_ms);
+        losses_ = 0;
+        reason_ = why;
     }
     void Reject(uint64_t now, const char* why) {
+        // A comparison that actually changed this view must not repeat the
+        // visible disturbance until the picture or scene identity changes.
+        rejected_view_ = phase_ != Phase::Confirm;
         Set(Phase::Cooldown, now, why);
         deadline_ = now + 30000;
     }
@@ -152,6 +181,7 @@ private:
     uint8_t strength_ = reduced_jitter;
     uint64_t deadline_ = 0;
     float candidate_ = 0;
+    bool rejected_view_ = false;
     const char* reason_ = "";
 };
 

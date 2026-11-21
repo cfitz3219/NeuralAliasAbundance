@@ -18,9 +18,7 @@ struct MixedRasterField {
     float xmin = 0, xmax = 0, ymin = 0, ymax = 0, distance2 = 0;
     std::array<float,FlickerTransition::count> scene{};
     bool SamePicture(const std::array<float,FlickerTransition::count>& current) const {
-        float sum = 0;
-        for (unsigned i = 0; i < scene.size(); ++i) sum += std::fabs(current[i] - scene[i]);
-        return sum < .10f * scene.size();
+        return SameJitterPicture(scene, current);
     }
     void Add(const float* values, unsigned width, unsigned height, float dx, float dy,
              const std::array<float,FlickerTransition::count>& view, uint8_t amount = normal_jitter) {

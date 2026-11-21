@@ -404,6 +404,7 @@ uint64_t g_scene_key[2] = {};             // colour and depth lifetime ids
 // VARIANT: camera/optional
 // Whether a frame needs a camera to be handed over (input_provider.hpp CameraUse). Off: nothing
 // camera-related runs at all, on any thread, so it is read without g_mu.
+// The effective camera acquisition mode, including an optional reader such as XeGTAO.
 std::atomic<uint8_t> g_camera_use{static_cast<uint8_t>(CameraUse::Required)};
 std::atomic<bool> g_eval_paused{false}, g_camera_suspended{false};
 uint32_t g_camera_failures = 0, g_camera_retry_frames = 0;

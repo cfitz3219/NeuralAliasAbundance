@@ -2539,10 +2539,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const auto delivered_with_no_camera = evaluations;
     for (int i = 0; i < 4; ++i) present_campaign();
     const auto ambient_status = na::xegtao::ScenePass().GetStats();
+    char measured_ao[4096]{};
+    na::native_d3d11::FormatStatus(measured_ao, sizeof measured_ao);
     expect(na::donut::ScenePass().GetStats().recorded == bloom_with_no_camera + 4 &&
-           evaluations == delivered_with_no_camera + 4 && ambient_status.recorded == ao_with_no_camera &&
-           std::strstr(ambient_status.reason, "Use it when found"),
-           "on native DX11, bloom and DLAA keep running without a camera while XeGTAO explains what it needs");
+           evaluations == delivered_with_no_camera + 4 && ambient_status.recorded == ao_with_no_camera + 4 &&
+           g_seen.last.camera_known && std::strstr(measured_ao, "motion measured, no camera"),
+           "XeGTAO finds native projection while DLAA keeps using picture-measured motion");
     effect_options.xegtao_enabled.store(0);
     effect_options.donut_bloom.store(0);
     effect_options.j2_camera.store(prior_camera);
