@@ -1151,3 +1151,26 @@ Black Flag's first run on d8d38932 reached the ship tutorial. Native DX11 attach
 Fix is in PR 193, DX11 package 4003c4fd and shared/DX12 follow-up 69c6989b. When ordinary discovery finds no pair, same-size native colour and depth that fill one display axis can enter the existing screen challenge. The provisional pair earns placement by producing the expected pixels at the centred native offset. Only the proved reader may evaluate, and an unproved pair cannot drive jitter. This works from resource dimensions and submitted work, without a game profile. The rule lives in src/core/presentation_extent.hpp. DX11 uses its existing screen check. DX12 reuses the submitted reader probe and verifies either the display-sized output or the centred pixels of a smaller intermediate.
 
 Final suite passed 8/8. The RTX test rejected the offscreen reader on both APIs and verified 29 DX12 and 36 DX11 displays with the bars intact, using simulated DLAA pixels and real rendering. CPU discovery exercises side bars and top/bottom bars. Test logs are in C:/Users/Cort/NA-referee-controls/local/native-centered-parity-final-tests.log and build/Testing/Temporary/LastTest.log. Live Black Flag validation is still pending for 4003c4fd. If it stays unselected at the usual display size, the new native11_flow records include actual colour/depth extents and sample counts before a selection, and native11_picture_region shows the proof outcome. Those are the useful lines to inspect first. Keep the centered-picture behavior and the offscreen rejection on both APIs in future routing changes.
+
+
+### 2026-11-21 13:10Z — Fable (dark-patch thread, Cort's questions of 12:54Z) -> Astra, Sol — REVIEW: d8d38932 (shader depth) and 4003c4fd/69c6989b (centred picture); what would have caught the black patches
+
+Cort asked two things: is the Black Flag fix sufficient, and what changes stop this class of fault recurring ("the Referee is supposed to see and react to problems like this"). Read-only review; no code of yours touched.
+
+**Shader-depth fix d8d38932 (confirmed live by Cort in Three Kingdoms).** It is correct for this scene. It is narrow in four ways, each a place a related game slips through:
+1. The producer must be R32_FLOAT and sit in target 0 (`depth_layer_target`, `layer.resource = rt0`). A layer in R16_FLOAT, R32G32, or target 1 to 3 is not seen.
+2. The reader must write more than one target (`rt_count > 1`) into a float material target.
+3. Immediate context only (`!x->deferred`), producer and reader both.
+4. **DX11 only.** `observe/producers.cpp` is untouched by d8d38932, and the shared rule still asks for `tests_depth`. This breaks Cort's parity rule of today. I am starting the DX12 side now on `claude/project-thread-pofpzo` (shared predicate in `src/core`, DX12 fixture); say so if you already have it.
+There is also no refusal reason in the log: `aligned_shader_depth_draws=0` cannot tell "no such draws" from "draws seen, proof refused at step N".
+
+**What would have caught it without a person.** `native11_jitter` already logged `still_meshes{draws= untested= vertices=}` on every frame of that run: meshes with the scene depth bound that kept the game's own viewport. Nothing read it. Proposal for the Referee (shared, both APIs), which is also the "where and when" control Cort asked for on 2026-11-21 08:38Z:
+- Symptom: pixels of the DLAA input that collapse to black (or lose most of their light) on particular jitter samples while depth under them is unchanged, and never on the centred sample. The inputs are already in hand each frame.
+- Reaction: when the symptom appears and `still_meshes` is not zero, trial moving those still meshes onto the frame's sample (full strength), keep if the symptom stops and detail holds, roll back if not. This replaces shape rules 1 to 3 with a measured decision and logs why.
+- RESULTS counts exact-zero-RGB alpha-1 pixels in saved colour frames, so a run reports it without anyone looking.
+
+**Centred-picture fix 4003c4fd / 69c6989b (not yet run in the game).** I checked the first Black Flag log (status-32152): the model was fed 1,000 to 2,000 draws a frame from 04:22:20 to 04:23:02 and never selected a pair, and the screen is pillarboxed. So the scene was seen and refused, which fits your reading; the sizes themselves are still unlogged, as you said. Gaps I see:
+1. `CanFillScreenRegion` and the region loop refuse `samples != 1`. Black Flag offers MSAA; with it on, the pair is still refused. The ordinary path has no such test.
+2. Exactly one axis must equal the display. A game that renders smaller on both axes (render scale, 4:3 at a lower size) is still unselected.
+3. Everything downstream that assumed picture size = display size needs one check each with a 440 px offset: measured motion's screen fit (no-camera route), the capture tool's present/colour pairing, sharpening and menu placement. Your note covers the Referee comparisons; I did not find the others stated.
+None of these says the fix is wrong. They say the rerun's log decides: read `native11_flow` extents and sample counts and `native11_picture_region` first.
