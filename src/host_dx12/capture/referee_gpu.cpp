@@ -198,6 +198,24 @@ void update_visual_pending()
 }
 
 void set_phase(Phase p) { g.phase = p; g.phase_at = GetTickCount64(); }
+uint64_t present_clock_us()
+{
+    static const LONGLONG frequency = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return frequency > 0 ? uint64_t(now.QuadPart / frequency) * 1000000ull +
+                           uint64_t(now.QuadPart % frequency) * 1000000ull / uint64_t(frequency) : 0;
+}
+void stamp_present_locked(const void* chain, uint64_t ordinal)
+{
+    g.present_times[ordinal % g.present_times.size()] = {chain, ordinal, present_clock_us()};
+}
+uint64_t presented_at_locked(const void* chain, uint64_t ordinal)
+{
+    const auto& slot = g.present_times[ordinal % g.present_times.size()];
+    return slot.chain == chain && slot.ordinal == ordinal ? slot.at_us : 0;
+}
+
 bool enabled() { return na::settings::Get().referee_enabled.load(std::memory_order_relaxed) != 0; }
 ULONGLONG every_ms()
 {
@@ -1275,24 +1293,6 @@ static bool CopyPreviousScreen(ID3D12CommandQueue* queue, ID3D12Resource* image,
         return false;
     }
     return true;
-}
-
-uint64_t present_clock_us()
-{
-    static const LONGLONG frequency = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
-    LARGE_INTEGER now{};
-    QueryPerformanceCounter(&now);
-    return frequency > 0 ? uint64_t(now.QuadPart / frequency) * 1000000ull +
-                           uint64_t(now.QuadPart % frequency) * 1000000ull / uint64_t(frequency) : 0;
-}
-void stamp_present_locked(const void* chain, uint64_t ordinal)
-{
-    g.present_times[ordinal % g.present_times.size()] = {chain, ordinal, present_clock_us()};
-}
-uint64_t presented_at_locked(const void* chain, uint64_t ordinal)
-{
-    const auto& slot = g.present_times[ordinal % g.present_times.size()];
-    return slot.chain == chain && slot.ordinal == ordinal ? slot.at_us : 0;
 }
 
 void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec)
