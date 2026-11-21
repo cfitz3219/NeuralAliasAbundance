@@ -952,10 +952,10 @@ void DrawLiveDlaa()
     }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
-    // Gap audit 2026-11-21 item 5: the Referee row is part of every ordinary build
-    // (NA_REFEREE_MENU defaults ON; configure with OFF to hold it back). The switch
-    // itself still starts off and keeps whatever the player chose. A build without
-    // the Referee's GPU checks shows the row and says so, instead of hiding it.
+    // Cort 2026-11-18, confirmed 2026-11-21: no ordinary package shows the Referee switch
+    // yet. The row is built only when NA_REFEREE_MENU is asked for at configure time
+    // (default OFF). Where it is built, a build without the Referee's GPU checks shows
+    // the row disabled and says so, instead of hiding it (gap audit item 5).
 #if defined(NA_REFEREE_MENU)
     auto& referee_enabled = na::settings::Get().referee_enabled;
     bool referee_on = referee_enabled.load() != 0;
