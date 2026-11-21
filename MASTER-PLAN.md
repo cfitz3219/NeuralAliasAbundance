@@ -17,6 +17,18 @@ The full previous text (905 lines, 139 KB: phase plans 1-4, task lists, gate his
 
 **Required guide for ALL future project work (2026-11-07, Cort's instruction):** Every contributor/agent must read and apply the five rules at the top of [COLLABORATION.md](COLLABORATION.md) when starting or resuming any NeuralAliasAbundance task: reuse existing mechanisms; trace the complete cause-and-effect chain; make each diagnostic run decide the next action; change the approach when evidence stops improving; deliver reusable, visibly verified work without scope expansion. This covers planning, research, architecture, implementation, performance, UI, installers, testing and handoffs across games and phases. Carry this requirement into future handoffs. Inspired by Fable 5.1's discovery; no extra approval or review cycle.
 
+## Current DLAA test sequence (2026-11-21, Cort)
+
+Finish the current integration, remaining Referee fixes and automated checks before staging the candidate for Cort's live testing. Use the same integrated source for the first attempt on each game.
+
+1. Total War: Pharaoh Dynasties
+2. Total War: Three Kingdoms
+3. Assassin's Creed IV: Black Flag
+
+Use the existing Results logs and what Cort sees during play. Check that native-resolution DLAA reaches the presented image, stays on during play and recovers after returning from menus, with responsive pacing and no crashes or hangs. Record the build and the first result for each game. If a title exposes a new rendering pattern, work from that evidence and check the shared change against the titles already tested.
+
+Route B DLSS upscaling stays disabled during this work. Once all three are stable, discuss render-size reduction using the prior experiments and the three games' evidence. The design problem is how to lower actual scene rendering across games while preserving a full-resolution presentation and HUD, then verify that the DLSS output reaches the screen.
+
 ## Current architecture — two routes (2026-11-10, Cort)
 
 NeuralAlias has two supported routes, defined by whether the game ships native DLSS.
