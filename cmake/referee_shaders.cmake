@@ -11,7 +11,7 @@ if(NA_REFEREE_FXC)
   set(referee_source "${CMAKE_CURRENT_SOURCE_DIR}/src/host_dx12/capture/referee_shader.hlsl")
   set(referee_output "${CMAKE_CURRENT_BINARY_DIR}/generated/referee")
   file(MAKE_DIRECTORY "${referee_output}")
-  foreach(entry thumb tiles points)
+  foreach(entry thumb tiles points raster_field)
     set(output "${referee_output}/referee_${entry}.h")
     add_custom_command(OUTPUT "${output}"
       COMMAND "${NA_REFEREE_FXC}" /nologo /T cs_5_0 /E "${entry}" /O3 /Gis

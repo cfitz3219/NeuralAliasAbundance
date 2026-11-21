@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstring>
+#include "core/referee_mixed_raster.hpp"
 #include <vector>
 
 namespace {
@@ -121,6 +122,7 @@ struct TracePair {
     float recovery_floor = 0.f;
     uint8_t jitter_amount = 0;
     float before_jitter[2]{}, after_jitter[2]{};
+    bool recorded_phase = false;
 };
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
@@ -134,12 +136,14 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     CHECK(rg::Wanted());
     rg::Evaluation e;
     e.color = im.prev; e.output = trace ? trace->before_output : im.output; e.motion = im.motion;
-    e.render_w = rs::kW; e.render_h = rs::kH;
-    e.output_w = display_vectors ? 2 * rs::kW : rs::kW;
-    e.output_h = display_vectors ? 2 * rs::kH : rs::kH;
+    const auto source = im.input->GetDesc();
+    e.render_w = trace && trace->recorded_phase ? static_cast<unsigned>(source.Width) : rs::kW;
+    e.render_h = trace && trace->recorded_phase ? source.Height : rs::kH;
+    e.output_w = display_vectors ? 2 * e.render_w : e.render_w;
+    e.output_h = display_vectors ? 2 * e.render_h : e.render_h;
     e.mv_display_res = display_vectors;
     e.context = {{native_proof ? na::referee::shadow::Path::Native11 : na::referee::shadow::Path::Inline, 22},
-                 1, 2, 3, 0, rs::kW, rs::kH, native_proof};
+                 1, 2, 3, 0, e.render_w, e.render_h, native_proof};
     if (trace) {
         e.context.trial_ticket = trace->ticket;
         e.context.trial_configuration = trace->configuration;
@@ -150,12 +154,13 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     const bool native11 = native_proof != 0;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterBefore[0]; e.jitter_y = rs::kJitterBefore[1];
-    if (trace && trace->jitter_amount) {
+    if (trace && (trace->jitter_amount || trace->recorded_phase)) {
         e.scene_jitter_amount = trace->jitter_amount;
         e.jitter_x = trace->before_jitter[0];
         e.jitter_y = trace->before_jitter[1];
     }
     uint32_t pre = rg::Record(l.list.Get(), e);
+    if (!pre && trace && trace->recorded_phase) { got = {}; return true; } // sampling deliberately skipped this parity
     if (!pre && trace && trace->jitter_amount) {
         // Native proof sampling may prefer the other present parity.
         e.present_ordinal = ++ordinal;
@@ -190,7 +195,7 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     e.reset = reset;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterNow[0]; e.jitter_y = rs::kJitterNow[1];
-    if (trace && trace->jitter_amount) {
+    if (trace && (trace->jitter_amount || trace->recorded_phase)) {
         e.jitter_x = trace->after_jitter[0];
         e.jitter_y = trace->after_jitter[1];
     }
@@ -290,7 +295,7 @@ void Report(const char* what, const na::referee::Verdicts& v)
 }
 
 
-int TestAdaptiveJitter(test::Device& d, test::List& l)
+int TestAdaptiveJitter(test::Device& d, test::List& l, bool localized = false, bool try_quarter = false)
 {
     uint64_t ordinal = 0;
     rg::LastSample got;
@@ -305,9 +310,24 @@ int TestAdaptiveJitter(test::Device& d, test::List& l)
                 for (unsigned i = 0; i < 8; ++i) {
                     const float x = i % 2 ? -.004f * strength : .004f * strength;
                     const float y = i % 4 < 2 ? -.0035f * strength : .0035f * strength;
-                    const auto a = rs::Render(-x + 1.4f, -y, 0.f, 0), b = rs::Render(x + 1.52f, y, 0.f, 0);
-                    const auto c = rs::Render(-.28f * x, -.28f * y, 0.f, 0);
-                    const auto e = rs::Render(.12f + .28f * x, .28f * y, 0.f, 0);
+                    auto a = rs::Render(-x + 1.4f, -y, 0.f, 0), b = rs::Render(x + 1.52f, y, 0.f, 0);
+                    auto c = rs::Render(-.28f * x, -.28f * y, 0.f, 0);
+                    auto e = rs::Render(.12f + .28f * x, .28f * y, 0.f, 0);
+                    if (localized) {
+                        const auto steady = rs::Render(0,0,0,0);
+                        // The reconstruction is recognizably distinct from input even
+                        // under small jitter. The stationary island lies between all
+                        // eight original tiles. Locations are never sent to the Referee.
+                        a = rs::Render(1.4f-x,-y,0,0); b = rs::Render(1.4f+x,y,0,0);
+                        c = e = steady;
+                        const float vibration = try_quarter && strength == reduced_jitter ? 1.30f : .80f;
+                        for (unsigned v=90;v<133;++v) for (unsigned u=126;u<254;++u) {
+                            const auto at=v*rs::kW+u;
+                            a.v[at]=b.v[at]=rs::Scene(u+.5f-1.4f,v+.5f);
+                            c.v[at]=rs::Scene(u+.5f-vibration*x,v+.5f-vibration*y);
+                            e.v[at]=rs::Scene(u+.5f+vibration*x,v+.5f+vibration*y);
+                        }
+                    }
                     auto old_input = Picture(d, l, a, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
                     auto new_input = Picture(d, l, b, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
                     constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -321,6 +341,7 @@ int TestAdaptiveJitter(test::Device& d, test::List& l)
                     keep.clear();
                     TracePair trace{old_output.Get(), old_screen.Get(), true, 28160, 90};
                     trace.path = path;
+                    if (localized && path == PlacementPath::Inline) trace.ticket = 0;
                     trace.jitter_amount = strength;
                     trace.before_jitter[0] = -x; trace.before_jitter[1] = -y;
                     trace.after_jitter[0] = x; trace.after_jitter[1] = y;
@@ -328,11 +349,14 @@ int TestAdaptiveJitter(test::Device& d, test::List& l)
                     if (!TakeSample(d, l, ordinal, {old_input.Get(), new_input.Get(), new_output.Get(), nullptr, new_screen.Get()},
                                     got, false, nullptr, nullptr, false, false, false, false, proof, false, &trace)) return false;
                     TrialSample sample;
-                    if (!rg::TakeTrialSample(trace.ticket, sample)) return false;
-                    CHECK(sample.delivered);
+                    if (trace.ticket) {
+                        if (!rg::TakeTrialSample(trace.ticket, sample)) return false;
+                        CHECK(sample.delivered);
+                    } else CHECK(!got.local_phase.empty());
                     for (const auto& line : na::eventlog::Drain())
                         if (line.find("referee_jitter_geometry") != std::string::npos ||
-                            line.find("referee_jitter_trial") != std::string::npos) std::puts(line.c_str());
+                            line.find("referee_jitter_trial") != std::string::npos ||
+                            line.find("referee_field_comparison") != std::string::npos) std::puts(line.c_str());
                     if (amount() != strength) return true;
                 }
                 return true;
@@ -340,9 +364,13 @@ int TestAdaptiveJitter(test::Device& d, test::List& l)
             REQUIRE(window(normal_jitter));
             CHECK(amount() == reduced_jitter);
             REQUIRE(window(reduced_jitter));
+            if (try_quarter) {
+                CHECK(amount() == quarter_jitter);
+                REQUIRE(window(quarter_jitter));
+            }
             CHECK(amount() == normal_jitter);
             REQUIRE(window(normal_jitter));
-            CHECK(amount() == reduced_jitter);
+            CHECK(amount() == (try_quarter ? quarter_jitter : reduced_jitter));
             CHECK(rg::SceneJitterAmount(&d, path, 1, 3, 3, ordinal, proof) == normal_jitter);
             CHECK(rg::SceneJitterAmount(&l, path, 1, 2, 3, ordinal, proof) == normal_jitter);
             std::printf("Referee jitter %s: kept strength %u\n", shadow::Name(path), unsigned(amount()));
@@ -357,6 +385,97 @@ int TestAdaptiveJitter(test::Device& d, test::List& l)
 }
 
 } // namespace
+
+// Capture mode accepts exact ordered pairs validated by scripts/replay_referee.py.
+namespace {
+int ReplayField(const char* folder, test::Device& d, test::List& l) {
+    using namespace na::referee;
+    struct Frame {
+        unsigned index = 0, w = 0, h = 0, verified = 0, epoch = 0;
+        unsigned long long ordinal = 0;
+        float x = 0, y = 0;
+        test::ComPtr<ID3D12Resource> planes[3];
+    } last;
+    MixedRasterField field;
+    unsigned checked = 0, requested = 0, eligible = 0;
+    std::vector<bool> found;
+    for (;;) {
+        Frame f;
+        unsigned format[3]{}, pitch[3]{};
+        int n = scanf_s("%u %llu %u %u %f %f %u %u %u %u %u %u %u %u",
+            &f.index,&f.ordinal,&f.w,&f.h,&f.x,&f.y,&f.verified,&f.epoch,
+            &format[0],&pitch[0],&format[1],&pitch[1],&format[2],&pitch[2]);
+        if (n == EOF) break;
+        REQUIRE(n == 14 && f.w > 0 && f.h > 0 && f.w <= 8192 && f.h <= 8192);
+        std::vector<ComPtr<ID3D12Resource>> keep;
+        for (unsigned k=0;k<3;++k) {
+            const char* names[]{"color","dlssout","present"};
+            const auto fmt=DXGI_FORMAT(format[k]);
+            const unsigned bytes = fmt==DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 :
+                fmt==DXGI_FORMAT_R8G8B8A8_UNORM || fmt==DXGI_FORMAT_B8G8R8A8_UNORM ? 4 : 0;
+            REQUIRE(bytes && pitch[k] >= f.w*bytes && pitch[k] <= f.w*bytes+65536);
+            char filename[64];
+            std::snprintf(filename,sizeof filename,"/%05u-%s.raw",f.index,names[k]);
+            FILE* file=nullptr;
+            REQUIRE(!fopen_s(&file,(std::string(folder)+filename).c_str(),"rb"));
+            std::vector<uint8_t> tight(size_t(f.w)*bytes*f.h), row(pitch[k]);
+            bool complete = true;
+            for (unsigned y=0;y<f.h && complete;++y) {
+                complete = std::fread(row.data(),1,row.size(),file) >= f.w*bytes;
+                if (complete) std::memcpy(tight.data()+size_t(y)*f.w*bytes,row.data(),f.w*bytes);
+            }
+            std::fclose(file);
+            REQUIRE(complete);
+            const auto flags=k==1 ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+            const auto end=k==0 ? NPSR : k==1 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_PRESENT;
+            f.planes[k]=test::CreateTexture(d.device.Get(),f.w,f.h,fmt,D3D12_RESOURCE_STATE_COPY_DEST,flags);
+            REQUIRE(f.planes[k] && Upload(d,l,f.planes[k].Get(),tight.data(),size_t(f.w)*bytes,keep));
+            auto barrier=test::Transition(f.planes[k].Get(),D3D12_RESOURCE_STATE_COPY_DEST,end);
+            l.list->ResourceBarrier(1,&barrier);
+        }
+        Run(d,l);
+        if (last.epoch != f.epoch || last.w != f.w || last.h != f.h) {
+            rg::InvalidatePresentation(&d); field = {}; found.clear();
+        }
+        if (last.planes[0] && last.ordinal+1==f.ordinal && last.epoch==f.epoch && last.w==f.w && last.h==f.h) {
+            TracePair trace{last.planes[1].Get(),last.planes[2].Get(),true,0,90};
+            trace.path=PlacementPath::Native11;
+            trace.recorded_phase=true;
+            trace.jitter_amount=last.verified && f.verified ? normal_jitter : 0;
+            trace.before_jitter[0]=last.x;trace.before_jitter[1]=last.y;
+            trace.after_jitter[0]=f.x;trace.after_jitter[1]=f.y;
+            uint64_t ord=last.ordinal-1;
+            rg::LastSample sample;
+            Sleep(115);
+            REQUIRE(TakeSample(d,l,ord,{last.planes[0].Get(),f.planes[0].Get(),f.planes[1].Get(),nullptr,f.planes[2].Get()},
+                sample,false,nullptr,nullptr,false,false,false,false,90010,false,&trace));
+            if (!sample.number) { last=std::move(f); continue; }
+            REQUIRE(ord==f.ordinal);
+            ++checked;
+            if (!sample.local_phase.empty()) {
+                ++eligible;
+                field.Add(sample.local_phase.data(),f.w,f.h,f.x-last.x,f.y-last.y,sample.local_picture);
+                JitterTrial::Measurement candidate;
+                if (field.Measure(nullptr,candidate)) {
+                    found.resize(field.cells.size());
+                    for (unsigned i=0;i<found.size();++i) if (!found[i] && field.Mismatch(field.At(i))) {
+                        auto at=field.Position(i);
+                        std::printf("local_mismatch x=%d y=%d frame=%llu\n",at.x,at.y,f.ordinal);
+                        found[i]=true;
+                    }
+                }
+            }
+            if (rg::SceneJitterAmount(&d,PlacementPath::Native11,1,2,3,f.ordinal,90010)==reduced_jitter) ++requested;
+            for (const auto& line:na::eventlog::Drain())
+                if(line.find("referee_jitter_trial")!=std::string::npos || line.find("referee_mixed_raster")!=std::string::npos)
+                    std::puts(line.c_str());
+        }
+        last=std::move(f);
+    }
+    std::printf("capture_consecutive_pairs=%u eligible=%u requested_reduction=%u\n",checked,eligible,requested);
+    return checked ? 0 : 1;
+}
+}
 
 int main(int argc, char** argv)
 {
@@ -403,8 +522,13 @@ int main(int argc, char** argv)
     test::List l;
     REQUIRE(l.Create(d.device.Get()));
 
-    if (argc > 1 && std::strcmp(argv[1], "--jitter") == 0) {
-        REQUIRE(TestAdaptiveJitter(d, l) == 0);
+    if (argc == 3 && std::strcmp(argv[1], "--capture-field") == 0) {
+        REQUIRE(ReplayField(argv[2],d,l)==0);
+        CHECK(na::background::Stop(3000));
+        return test::finish("referee_gpu_capture_field");
+    }
+    if (argc > 1 && (std::strcmp(argv[1], "--jitter") == 0 || std::strcmp(argv[1], "--local-jitter") == 0 || std::strcmp(argv[1], "--quarter") == 0)) {
+        REQUIRE(TestAdaptiveJitter(d, l, std::strcmp(argv[1], "--jitter") != 0, std::strcmp(argv[1], "--quarter") == 0) == 0);
         CHECK(na::background::Stop(3000));
         return test::finish("referee_gpu_jitter_test");
     }

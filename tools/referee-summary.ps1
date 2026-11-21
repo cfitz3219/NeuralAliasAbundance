@@ -57,11 +57,13 @@ function Get-RefereeSummary([string[]] $Lines) {
     $traces = @($Lines | Where-Object { $_ -match '\breferee_trace\s+frames=\d+,\d+ first_stage=(input|reconstruction|composition) ' })
     $trials = @($Lines | Where-Object { $_ -match '\b(?:native11|dx12)_route_trial next_frame=\d+ phase=' })
     $recovery = @($Lines | Where-Object { $_ -match '\breferee_recovery frame=\d+ first_stage=' })
+    $localRaster = $Lines | Where-Object { $_ -match '\breferee_mixed_raster frame=' } | Select-Object -Last 1
+    $jitterAction = $Lines | Where-Object { $_ -match '\breferee_jitter_trial frame=' } | Select-Object -Last 1
     $jitterGeometry = $Lines | Where-Object { $_ -match '\breferee_jitter_geometry frame=' } | Select-Object -Last 1
     $composite = $Lines | Where-Object { $_ -match '\breferee_composite frame=\d+ path=' } | Select-Object -Last 1
     $parity = @($Lines | Where-Object { $_ -match '\breferee_parity_swap frames=\d+,\d+ ' })
     $kept = @($Lines | Where-Object { $_ -match '\breferee_roles frame=\d+ kept=1' })
-    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry -and -not $parity -and -not $kept) {
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry -and -not $localRaster -and -not $jitterAction -and -not $parity -and -not $kept) {
         $enabled = $Lines | Where-Object { $_ -match '\b(?:setting |settings_all\s+.*\b)referee_enabled=1\b' } | Select-Object -First 1
         $startup = $Lines | Where-Object { $_ -match '\breferee_start automatic_dlaa=1 gpu_checks=([01]) enabled=([01])' } | Select-Object -Last 1
         if ($startup -match 'gpu_checks=1 enabled=1') { $out.Add('Referee started automatically with DLAA. The log has no screen or delivery checks.') }
@@ -168,6 +170,12 @@ function Get-RefereeSummary([string[]] $Lines) {
         if ($recovery[-1] -match 'tool=(\w+) phase=(baseline|replacement|baseline_recheck) ') {
             $out.Add("  Comparison still in progress at the last observation for '$($names[$Matches[1]])'.")
         }
+    }
+    if ($localRaster -match 'center=(\d+,\d+).*baseline_edges=(\d+)') {
+        $out.Add("  Local jitter detected at $($Matches[2]) sampled edges. Reference point ($($Matches[1])).")
+    }
+    if ($jitterAction -match 'phase=(\w+) strength=(\d+).*why="([^"]+)"') {
+        $out.Add("  Jitter adjustment: $($Matches[1]), strength $($Matches[2])%. $($Matches[3]).")
     }
     if ($jitterGeometry -match 'tile_xy=(\d+,\d+) samples=(\d+) phase_residual_screen_px=([-\d.]+) phase_residual_dlaa_px=([-\d.]+)(?: locked=(\d+))?') {
         $qualifier = if ($Matches[5] -eq '0') { 'No consistent jitter phase in these pairs.' } else { 'Movement follows the jitter phase.' }
