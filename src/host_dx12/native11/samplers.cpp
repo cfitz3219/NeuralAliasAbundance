@@ -122,15 +122,8 @@ HRESULT STDMETHODCALLTYPE CreateSamplerState_d(ID3D11Device* dev, const D3D11_SA
 
 // VARIANT: samplers/adopt-at-bind
 // A sampler the game binds that was never seen at CreateSamplerState: record it from its own
-<<<<<<< HEAD
-// description, exactly as its creation would have. Without this a game whose samplers all exist
-// before the hooks do keeps its own texture detail and filtering for the whole session, with the
-// menu showing a bias that no draw uses. Our variants are already in the table, and work of our
-// own on the game's device is not the game's, so neither is adopted. Null = leave it alone.
-=======
 // description. This also handles a sampler that was already bound when the hooks were installed,
 // because the draw-time policy refresh reads each context's bound slots.
->>>>>>> origin/astra/automatic-route-b-referee
 std::shared_ptr<Entry> Adopt(ID3D11SamplerState* sampler)
 {
     if (!sampler || IsOwnWork()) return nullptr;
