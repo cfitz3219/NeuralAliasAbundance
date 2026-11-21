@@ -3224,6 +3224,39 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_model.EndFrame(check_lit && !previous.screen_region,
         check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0, check_lit);
     const auto& picked = g_model.Current();
+    // WHY log: frames keep coming with a scene-like picture that cannot be used. Said once per reason
+    // and extent, and again every 600 frames while it lasts, in the words the results file shows.
+    if (const auto& refused = g_model.RefusedScene(); !picked.valid() && refused.why != FrameModel::NoScene::None) {
+        static FrameModel::Refused said;
+        static uint64_t said_at = 0;
+        char why[224];
+        switch (refused.why) {
+        case FrameModel::NoScene::Multisampled:
+            std::snprintf(why, sizeof why,
+                "The game's own anti-aliasing is on (scene picture %ux multisampled, %ux%u inside a %ux%u screen): DLAA needs it off in the game's settings.",
+                refused.samples, refused.width, refused.height, refused.screen_width, refused.screen_height);
+            break;
+        case FrameModel::NoScene::SmallerBothWays:
+            std::snprintf(why, sizeof why,
+                "The game's picture (%ux%u) is smaller than the screen (%ux%u) in both width and height: DLAA needs the game's resolution to match the screen's width or its height.",
+                refused.width, refused.height, refused.screen_width, refused.screen_height);
+            break;
+        default:
+            std::snprintf(why, sizeof why,
+                "The game's picture (%ux%u) was not found on the screen (%ux%u) in 96 frames: trying again shortly.",
+                refused.width, refused.height, refused.screen_width, refused.screen_height);
+            break;
+        }
+        SetReason(why);
+        if (said.why != refused.why || said.width != refused.width || said.height != refused.height ||
+            said.samples != refused.samples || g_frame - said_at >= 600) {
+            said = refused;
+            said_at = g_frame;
+            na::eventlog::Emit("native11_no_scene", "frame=%llu picture=%ux%u samples=%u screen=%ux%u scene_vertices=%llu why=\"%s\"",
+                static_cast<unsigned long long>(g_frame), refused.width, refused.height, refused.samples,
+                refused.screen_width, refused.screen_height, static_cast<unsigned long long>(refused.vertices), why);
+        }
+    }
     if (picked.screen_region && (!previous.screen_region || previous.color != picked.color || previous.depth != picked.depth)) {
         g_region_started = g_frame;
         na::eventlog::Emit("native11_picture_region", "result=probing extent=%ux%u",

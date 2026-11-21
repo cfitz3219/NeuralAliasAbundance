@@ -175,6 +175,17 @@ public:
         const char* last_miss = "";
     };
 
+    // WHY log: the biggest scene-like pair that was looked at and not chosen in the last frame with
+    // no screen-shaped picture, and what stood in the way. Says nothing when a scene is chosen.
+    enum class NoScene : uint8_t { None, Multisampled, SmallerBothWays, AwaitingScreenProof };
+    struct Refused {
+        NoScene why = NoScene::None;
+        uint32_t width = 0, height = 0, samples = 1;
+        uint64_t vertices = 0;
+        uint32_t screen_width = 0, screen_height = 0;
+    };
+    const Refused& RefusedScene() const { return refused_; }
+
     void SetSwapChainSize(uint32_t w, uint32_t h)
     {
         if (w != swap_w_ || h != swap_h_) region_retry_.clear();
@@ -680,6 +691,34 @@ private:
         return r.samples == 1 && presentation::CenteredNativeRegion(r.width, r.height, swap_w_, swap_h_);
     }
 
+    // The pair with the most vertices among those that are drawn like a scene, are not the screen's
+    // shape, and cannot be taken as a picture placed inside the screen.
+    void NoteRefusedScene()
+    {
+        if (!swap_w_ || !swap_h_) return;
+        for (const auto& kv : color_) {
+            const auto d = info_.find(kv.first.first), c = info_.find(kv.first.second);
+            if (d == info_.end() || c == info_.end() || AspectOk(d->second) || kv.second.draws <= 8 ||
+                c->second.width != d->second.width || c->second.height != d->second.height) continue;
+            const auto usage = depth_.find(kv.first.first);
+            if (usage == depth_.end() || (usage->second.vertices <= 3 && !usage->second.indirect)) continue;
+            const auto& r = d->second;
+            const uint32_t samples = (std::max)(r.samples, c->second.samples);
+            const bool placed = presentation::CenteredNativeRegion(r.width, r.height, swap_w_, swap_h_);
+            NoScene why = NoScene::None;
+            if (placed && samples != 1) why = NoScene::Multisampled;
+            else if (placed) {
+                const auto defer = region_retry_.find(kv.first);
+                if (defer != region_retry_.end() && defer->second > stats_.frames) why = NoScene::AwaitingScreenProof;
+            } else if (r.width < swap_w_ && r.height < swap_h_ &&
+                       uint64_t(r.width) * 2 >= swap_w_ && uint64_t(r.height) * 2 >= swap_h_) {
+                why = NoScene::SmallerBothWays;
+            }
+            if (why == NoScene::None || (refused_.why != NoScene::None && usage->second.vertices <= refused_.vertices)) continue;
+            refused_ = {why, r.width, r.height, samples, usage->second.vertices, swap_w_, swap_h_};
+        }
+    }
+
     void Choose(Id verified_peer, bool detect_screen_regions)
     {
         // Loading screens and menus: one depth with <= 8 draws -> keep the old choice.
@@ -711,6 +750,8 @@ private:
             }
         }
         bool screen_region = false;
+        refused_ = {};
+        if (!best_color) NoteRefusedScene();
         if (!best_color && detect_screen_regions) {
             best_v = 0;
             // Use the real dimensions of the colour/depth pair. Final-screen proof
@@ -736,6 +777,7 @@ private:
             screen_region = best_color != 0;
         }
         if (!best_color) return; // nothing usable this frame: keep the old choice
+        refused_ = {}; // a pair is being chosen: nothing to explain
         const Id most_drawn = best_color;
         const bool layered = AfterLayers(best_depth, best_color);
         if (screen_region) {
@@ -954,6 +996,7 @@ private:
 
     uint32_t swap_w_ = 0, swap_h_ = 0;
     std::map<std::pair<Id, Id>, uint64_t> region_retry_;
+    Refused refused_;
     std::unordered_map<Id, ResourceInfo> info_;
     std::unordered_map<Id, Cand> depth_;
     std::unordered_map<std::pair<Id, Id>, PairCount, PairHash> color_;

@@ -45,6 +45,7 @@ struct Consumer {
     uint64_t session{},epoch{},batches{},events{},malformed{},submissions{},presents{},snapshots{},matrices{},samples{},last_log{},last_sample{},last_pick{};
     uint64_t live_depth{},live_color{},pick_challenger{}; unsigned pick_streak{}; // J2 pick hysteresis
     na::discovery::DepthPick pick; uint64_t pick_events{}; // depth role from accumulated frames
+    uint64_t refused_said{}; // the last no_scene reason written (WHY log)
     bool overflow{}; unsigned reports{};
     uint64_t draws{}, binds{}, unresolved_views{}, captured_snapshots{}, truncated_snapshots{}, unmapped_snapshots{}, gpu_snapshots{}, matrix_scans{};
     // P4-4 Stage M ([stage_m] map=1): read-only pass maps of single frames, own log file.
@@ -178,6 +179,22 @@ void PublishLivePicks(Consumer& c) {
         const auto [region_depth, region_color] = c.heuristics.ScreenRegionPair();
         if (region_color) na::observe::SetLiveSelection(region_depth, region_color, true);
         else na::observe::SetLiveSelection(c.live_depth, 0);
+        // WHY log: a scene-like picture that cannot be used, said when the reason or its size changes.
+        if (!region_color && c.log) {
+            const auto refused = c.heuristics.RefusedScreenRegion();
+            using Why = na::discovery::UniversalHeuristics::RefusedRegion::Why;
+            const uint64_t key = (uint64_t(refused.why) << 60) | (uint64_t(refused.samples) << 48) |
+                                 (uint64_t(refused.width) << 24) | refused.height;
+            if (refused.why != Why::None && key != c.refused_said) {
+                std::fprintf(c.log, "{\"type\":\"no_scene\",\"picture\":[%u,%u],\"samples\":%u,\"screen\":[%u,%u],\"scene_vertices\":%llu,\"why\":\"%s\"}\n",
+                    refused.width, refused.height, refused.samples, c.heuristics.SwapchainWidth(), c.heuristics.SwapchainHeight(),
+                    (unsigned long long)refused.vertices,
+                    refused.why == Why::Multisampled
+                        ? "The game's own anti-aliasing is on (the scene picture is multisampled): DLAA needs it off in the game's settings."
+                        : "The game's picture is smaller than the screen in both width and height: DLAA needs the game's resolution to match the screen's width or its height.");
+            }
+            c.refused_said = refused.why != Why::None ? key : 0;
+        }
     }
 }
 void Report(Consumer& c,const na_observe_status& status,const char* phase) {

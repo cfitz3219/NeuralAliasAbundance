@@ -243,6 +243,46 @@ public:
         return best;
     }
 
+    // WHY log (the DX12 side of native11's FrameModel::RefusedScene): the biggest pair that is drawn
+    // like a scene, is not the screen's shape, and cannot be taken as a picture placed inside the
+    // screen, with what stood in the way. No behaviour depends on it.
+    struct RefusedRegion {
+        enum class Why : uint8_t { None, Multisampled, SmallerBothWays } why = Why::None;
+        uint32_t width = 0, height = 0, samples = 1;
+        uint64_t vertices = 0;
+    };
+    RefusedRegion RefusedScreenRegion() const {
+        const auto& f = Scored();
+        RefusedRegion out;
+        if (!swap_w_ || !swap_h_) return out;
+        const auto flat = [](const auto& r) { return r.dimension == 3 && r.depth_or_array == 1 && r.mip_levels == 1; };
+        for (const auto& c : f.color) {
+            const auto ci = resources_.find(c.first);
+            if (ci == resources_.end() || !flat(ci->second)) continue;
+            const auto& image = ci->second;
+            const uint32_t w = uint32_t(image.width), h = image.height;
+            if (image.width > swap_w_ || h > swap_h_ || SimilarAspect(w, h)) continue;
+            const bool placed = presentation::CenteredNativeRegion(w, h, swap_w_, swap_h_);
+            const bool both = w < swap_w_ && h < swap_h_ && uint64_t(w) * 2 >= swap_w_ && uint64_t(h) * 2 >= swap_h_;
+            for (const auto& paired : c.second.with_depth) {
+                if (paired.second <= 8) continue;
+                const auto di = resources_.find(paired.first);
+                const auto observed = f.depth.find(paired.first);
+                if (di == resources_.end() || observed == f.depth.end() || !flat(di->second) ||
+                    di->second.width != image.width || di->second.height != image.height) continue;
+                const auto& depth = observed->second;
+                if (depth.vertices <= 3 && !depth.indirect) continue;
+                const uint32_t samples = (std::max)(uint32_t(image.sample_count), uint32_t(di->second.sample_count));
+                const auto why = placed && samples > 1 ? RefusedRegion::Why::Multisampled :
+                                 both ? RefusedRegion::Why::SmallerBothWays : RefusedRegion::Why::None;
+                const uint64_t vertices = depth.vertices ? depth.vertices : depth.draws;
+                if (why == RefusedRegion::Why::None || (out.why != RefusedRegion::Why::None && vertices <= out.vertices)) continue;
+                out = {why, w, h, samples, vertices};
+            }
+        }
+        return out;
+    }
+
     // Scene colour (pre-HUD): render targets written by 3D draws before an
     // observed HUD boundary rank first; the target that receives the HUD is
     // the composite (it holds scene + HUD) and is ranked below them.
