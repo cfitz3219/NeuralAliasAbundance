@@ -1120,6 +1120,7 @@ int main(int argc, char** argv)
         ra::OnPresent(owned);
         CHECK(owned.ordinal == ordinal + 1000 && !ra::GetStats().active);
         ordinal += 2000; // later cases use their own, larger ordinals
+        got = rg::GetLastSample(); // the closing case below counts from the newest sample
     }
     Sleep(150);
     REQUIRE(rg::Wanted());
