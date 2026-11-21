@@ -6,16 +6,28 @@ namespace na::referee {
 
 // Adapters certify a runnable reader and identify its scene lifetime. Color
 // identifies the logical scene when the adapter has proved rotating owners.
+struct PlacementScope {
+    uint64_t color = 0, depth = 0, generation = 0, selection = 0, reader = 0, peer_color = 0;
+    explicit operator bool() const { return color && depth && generation; }
+    bool operator==(const PlacementScope& other) const {
+        return color == other.color && depth == other.depth && generation == other.generation &&
+               selection == other.selection && reader == other.reader && peer_color == other.peer_color;
+    }
+    bool OwnsPicture(const shadow::Context& c) const {
+        if (!*this || !c.color || c.depth != depth) return false;
+        // Native11's ordinary scene-stream generation and the verified
+        // lighting-pair generation are independent counters. Its two
+        // texture incarnation IDs and depth incarnation identify the owners.
+        if (peer_color) return c.placement.path == shadow::Path::Native11 &&
+                               (c.color == color || c.color == peer_color);
+        return (c.placement.path == shadow::Path::Inline || c.placement.path == shadow::Path::Between) &&
+               c.color == color && c.generation == generation;
+    }
+};
+
 class PlacementTrial {
 public:
-    struct Scope {
-        uint64_t color = 0, depth = 0, generation = 0, selection = 0, reader = 0;
-        explicit operator bool() const { return color && depth && generation; }
-        bool operator==(const Scope& other) const {
-            return color == other.color && depth == other.depth &&
-                   generation == other.generation && selection == other.selection && reader == other.reader;
-        }
-    };
+    using Scope = PlacementScope;
     using Phase = RouteTrial::Phase;
 
     explicit PlacementTrial(uint64_t domain = uint64_t{1} << 58) : domain_(domain) {}
@@ -36,12 +48,23 @@ public:
         next_attempt_ = now + 8000;
     }
 
+    void ClearPresentation()
+    {
+        if (!scope_ && !observed_count_ && !damage_count_ && !next_attempt_) return;
+        trial_ = {};
+        scope_ = {};
+        observed_count_ = 0;
+        damage_count_ = next_damage_ = 0;
+        next_attempt_ = 0;
+        // Keep serial_ monotonic so outstanding GPU receipts cannot match a new trial.
+    }
+
     // An independently screen-proved alternative can begin measuring the
     // ordinary picture immediately. Baseline evidence still decides whether
     // any replacement is tried.
     bool BeginVerified(Scope offer, uint64_t frame, uint64_t now)
     {
-        if (!offer || OwnsComparison() || now < next_attempt_ ||
+        if (!offer || OwnsComparison() || Damaged(offer) || now < next_attempt_ ||
             (offer == scope_ && !trial_.CanStart(now))) return false;
         if (!(offer == scope_)) trial_ = {};
         configuration_ = 0;
@@ -63,7 +86,7 @@ public:
     // for the same scope.
     bool KeepProvedRoles(Scope offer, bool parity_seen, uint64_t frame, uint64_t now)
     {
-        if (!offer || !parity_seen) return false;
+        if (!offer || !parity_seen || Damaged(offer)) return false;
         if (OwnsComparison()) {
             if (!(offer == scope_)) return false;
             if (trial_.Structural()) return true;
@@ -75,11 +98,11 @@ public:
         independently_verified_ = true;
         scope_ = offer;
         const auto fresh = [&](const TrialSample& s) { return s.observed_at && now >= s.observed_at && now - s.observed_at <= 20000; };
-        std::array<TrialSample, RouteTrial::incumbent_samples> evidence{};
+        std::array<const TrialSample*, RouteTrial::incumbent_samples> evidence{};
         unsigned count = 0;
         for (unsigned i = 0; i < observed_count_; ++i)
-            if (fresh(observed_[i])) evidence[count++] = observed_[i];
-        trial_.KeepProvedRoles(domain_ | ++serial_, frame + 1, now, evidence.data(), count);
+            if (fresh(observed_[i]) && offer.OwnsPicture(observed_[i].context)) evidence[count++] = &observed_[i];
+        trial_.KeepProvedRoles(domain_ | ++serial_, frame + 1, now, evidence);
         return true;
     }
     bool KeptByStructure() const { return trial_.Structural(); }
@@ -88,7 +111,7 @@ public:
     // damage reference for a later structural keep.
     void ObserveIncumbent(const TrialSample& sample)
     {
-        if (UsesCandidate() || !sample.comparable || !sample.delivered || sample.bypassed) return;
+        if (UsesCandidate() || sample.applied || !sample.comparable || !sample.delivered || sample.bypassed) return;
         if (observed_count_ && (observed_[0].width != sample.width || observed_[0].height != sample.height ||
                                 observed_[0].layout != sample.layout || observed_[0].configuration != sample.configuration))
             observed_count_ = 0;
@@ -101,7 +124,7 @@ public:
 
     bool Begin(Scope offer, const TrialSample& witness, uint64_t frame, uint64_t now)
     {
-        if (!offer || OwnsComparison() || now < next_attempt_ || !Fresh(witness, frame, now) || witness.broad_light ||
+        if (!offer || OwnsComparison() || Damaged(offer) || now < next_attempt_ || !Fresh(witness, frame, now) || witness.broad_light ||
             !witness.comparable || !HasSymptom(witness)) return false;
         const bool same = offer == scope_ && witness.configuration == configuration_ &&
             witness.layout == layout_ && witness.width == width_ && witness.height == height_;
@@ -129,6 +152,11 @@ public:
             else if (!(incumbent_ == sample.context.placement)) return;
         }
         trial_.Add(ticket, sample, frame + 1);
+        if (trial_.WasStructural() && trial_.RuledOut() && !Damaged(scope)) {
+            damaged_[next_damage_] = scope;
+            next_damage_ = (next_damage_ + 1) % damaged_.size();
+            if (damage_count_ < damaged_.size()) ++damage_count_;
+        }
         if (!configuration_ && sample.comparable && ticket == trial_.Ticket(sample.ordinal)) Remember(sample);
         if (trial_.Current() == Phase::Rejected) next_attempt_ = now + 8000;
     }
@@ -139,6 +167,9 @@ public:
     }
 
 private:
+    bool Damaged(const Scope& scope) const {
+        return std::find(damaged_.begin(), damaged_.begin() + damage_count_, scope) != damaged_.begin() + damage_count_;
+    }
     void Start(Scope offer, uint64_t frame, uint64_t now)
     {
         scope_ = offer;
@@ -164,6 +195,8 @@ private:
 
     RouteTrial trial_;
     Scope scope_;
+    std::array<Scope, 8> damaged_{};
+    size_t damage_count_ = 0, next_damage_ = 0;
     shadow::Placement incumbent_;
     uint64_t domain_, next_attempt_ = 0, serial_ = 0, configuration_ = 0;
     uint32_t layout_ = 0, width_ = 0, height_ = 0;

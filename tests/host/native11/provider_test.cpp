@@ -24,6 +24,7 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
 #include "core/referee_recovery.hpp"
+#include "core/referee_placement.hpp"
 #include "core/anisotropic_auto.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/native11/draw_replay.hpp"
@@ -1030,7 +1031,22 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                         sample.screen_structure, sample.quiet_regions);
         return true;
     };
-    na::native11::SetParitySignal(&na::referee::gpu::ParityRoleSwapSeen);
+    static bool checked_decoy = false;
+    checked_decoy = false;
+    na::native11::SetParitySignal([](const void* swap, const na::referee::PlacementScope& scope) {
+        const bool seen = na::referee::gpu::ParityRoleSwapSeen(swap, scope);
+        if (seen && !checked_decoy) {
+            // Same presentation, depth and generation as the actual pair,
+            // but two different texture incarnations.
+            auto decoy = scope;
+            decoy.color = UINT64_MAX;
+            decoy.peer_color = UINT64_MAX - 1;
+            expect(!na::referee::gpu::ParityRoleSwapSeen(swap, decoy),
+                   "an unrelated lighting pair sharing the same depth cannot borrow the screen signature");
+            checked_decoy = true;
+        }
+        return seen;
+    });
     if (!na::native11::Install(game.device.Get(), consume, &evaluator, compare_routes,
             composition_fault || disagreeing_scene ? recovery_evidence : compare_routes ? &na::referee::gpu::TakeTrialSample : nullptr)) return 1;
 #else
@@ -1306,7 +1322,7 @@ int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[m
                 return g_failed ? 1 : 0;
             }
             if (parity_roles)
-                expect(kept_by_roles && stats.parity_recognitions > 0,
+                expect(kept_by_roles && checked_decoy && stats.parity_recognitions > 0,
                        "measured parity flicker keeps the proved readers past the former timeout");
             expect(fixed.correct == 28 && fixed.proven == 28 && fixed.displayed_readers == 28,
                    "the actual provider keeps the improved screen-proved route");

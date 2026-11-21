@@ -20,6 +20,7 @@
 #include <mutex>
 #include <vector>
 #include "core/referee_trace.hpp"
+#include "core/referee_placement.hpp"
 #include "core/referee_parity.hpp"
 
 using Microsoft::WRL::ComPtr;
@@ -1320,11 +1321,11 @@ void InvalidatePresentation(const void* swapchain)
     }
 }
 
-bool ParityRoleSwapSeen(const void* swapchain, uint64_t depth)
+bool ParityRoleSwapSeen(const void* swapchain, const PlacementScope& scope)
 {
-    if (!swapchain || !depth || !enabled() || !g_parity_seen.load(std::memory_order_relaxed)) return false;
+    if (!swapchain || !scope || !enabled() || !g_parity_seen.load(std::memory_order_relaxed)) return false;
     std::lock_guard<std::mutex> lock(g.m);
-    return g.trace_source == swapchain && g.trace_context.depth == depth &&
+    return g.trace_source == swapchain && scope.OwnsPicture(g.trace_context) &&
         g.parity.Recognized() && GetTickCount64() - g.parity_at <= 20000;
 }
 Stats GetStats()

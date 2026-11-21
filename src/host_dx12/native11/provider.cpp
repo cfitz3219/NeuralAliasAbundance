@@ -332,14 +332,14 @@ ScreenCheck g_screen;
 LitScene g_lit;
 referee::PlacementTrial g_placement{uint64_t{1} << 57};
 referee::StageRecovery g_recovery;
-bool ParitySeen(const void* swapchain, uint64_t depth)
+bool ParitySeen(const void* swapchain, const referee::PlacementScope& scope)
 {
     const auto seen = g_parity_signal.load(std::memory_order_relaxed);
-    return seen && seen(swapchain, depth);
+    return seen && seen(swapchain, scope);
 }
 referee::PlacementTrial::Scope LightingScope()
 {
-    return {g_lit.incarnations[0], g_lit.depth_incarnation, g_lit.generation};
+    return {g_lit.incarnations[0], g_lit.depth_incarnation, g_lit.generation, 0, 0, g_lit.incarnations[1]};
 }
 std::atomic<Id> g_lit_peer{0};
 uint64_t g_last_lit_generation = 0;
@@ -3037,6 +3037,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         if (FAILED(swap->GetDevice(IID_PPV_ARGS(&d))) || d.Get() != game) return false;
         g_swap = swap;
         g_screen.ResetPlacement();
+        g_placement.ClearPresentation();
         g_lit.Clear();
         g_recovery.Clear();
         g_lit_peer.store(0, std::memory_order_relaxed);
@@ -3091,9 +3092,8 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         referee::AdvancePlacement(g_placement, scope, bool(scope), bool(scope), g_frame_delivered_lit,
             g_recovery, g_frame - 1, GetTickCount64(), g_trial_reader,
             [&](const referee::TrialSample& seen, bool, bool) {
-                return seen.context.placement.path == referee::shadow::Path::Native11 &&
-                    seen.context.depth == scope.depth;
-            }, sample, scope && ParitySeen(swap, scope.depth));
+                return scope.OwnsPicture(seen.context);
+            }, sample, scope && ParitySeen(swap, scope));
         const auto& trial = g_placement.Comparison();
         if (before != trial.Current())
             na::eventlog::Emit("native11_route_trial",
@@ -3103,7 +3103,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                 trial.VerifiedReduction(), trial.Reason());
         g_lit.steer = g_lit.steer && g_placement.UsesCandidate();
     } else {
-        if (g_placement.OwnsComparison()) g_placement.Invalidate(GetTickCount64());
+        g_placement.ClearPresentation();
         g_recovery.Clear();
     }
     if (was_steering != g_lit.steer)
@@ -3352,6 +3352,7 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
     std::lock_guard<std::mutex> l(g_mu);
     if (s == g_swap) {
         g_screen.ResetPlacement();
+        g_placement.ClearPresentation();
         g_lit.Clear();
         g_recovery.Clear();
         g_lit_peer.store(0, std::memory_order_relaxed);
@@ -3569,6 +3570,7 @@ void Uninstall()
     g_cb_user = nullptr;
     g_trial_reader = nullptr;
     g_screen = {};
+    g_placement.ClearPresentation();
     g_lit.Clear();
     g_recovery.Clear();
     g_lit_peer.store(0, std::memory_order_relaxed);

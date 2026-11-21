@@ -1,5 +1,7 @@
 # Referee proof and recovery audit
 
+The original review below records the November 19 behavior. The [November 21 decision table](#november-21-update--what-happens-next-during-play) includes the subsequently implemented motion-input and placement trials.
+
 This review covers the native DLAA paths and their shared picture, delivery, motion and jitter checks. It follows up the rotating lighting fix at e1d2db6. The latest available Shadow of War captures used 2e062ef. They show alternating scene input and local warping that first appears in K's output. The recordings contain one of the two lighting buffers at any sampled evaluation. The replay work in Fable's branch tests the output-side warp separately.
 
 ## What the Referee should look for
@@ -36,3 +38,19 @@ The next two concrete profiles are a compute/deferred compositor with execution 
 - [Microsoft DXGI Present flags](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-present)
 - [Microsoft Direct3D 12 resource barriers](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12)
 - [Microsoft Direct3D 12 UAV clear](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-clearunorderedaccessviewfloat)
+
+## November 21 update — What happens next during play
+
+These decisions run with Referee enabled on the native DX11 and DX12 DLAA paths. Each adapter observes its own graphics commands. Both use the same screen comparisons, placement trials and stage-recovery rules.
+
+| What the program observes | What it does |
+|---|---|
+| An unfamiliar scene, or a previously useful draw has moved | Keep the ordinary path available. The adapter follows executed writers and readers and challenges an available alternative against the presented image. A missed or ambiguous observation alone cannot prove that a replacement is better. |
+| Two textures exchange lighting roles | Qualify both owners on the screen and follow the observed role. A timed comparison can establish a benefit when swaps are irregular. The faster admission for alternate-frame lighting also requires six agreeing transitions, including two in each direction on separate frame pairs. The depth buffer alone cannot identify the scene that produced the signature. |
+| DLAA arrives, but a region still flashes | Trace the same region through scene input, reconstruction and presentation. On the input side, compare subdued Bloom or current-frame ambient shading if that effect ran. During reconstruction, compare camera motion without the residual or directly measured motion in place of the fitted field when the corresponding supplier ran. After reconstruction, compare reduced sharpening if sharpening ran. |
+| A candidate frame shows the untreated picture | Roll back an applied candidate on a verified screen bypass. A missing optional motion score cannot hold up that decision. With renewed evidence, the next eligible tool gets its own comparison. An unknown screen vote alone cannot rule a tool out. |
+| A menu or a different view interrupts a comparison | Compare damage using ordinary pictures from the qualifying scene and matching view. The set of matching reference pictures travels with the sliding window. Once a different view leaves that window it stops affecting the verdict. |
+| A previously harmful lighting placement returns | Remember up to eight proved harmful placement scopes within one presentation. The ordinary, timed and immediate admission paths respect that history. A different scene generation can qualify on its own. Presentation changes and Referee opt-out clear this memory. Stage-tool exclusions and inconclusive retries retain their existing separate rules. |
+| No observable stage or runnable correction fits | Continue observing while the qualified renderer handles available frames. Keep a proved improvement while testing a smaller residual. A motion or jitter diagnostic on its own does not authorize guessing an input convention. |
+
+The fast lighting decision applies to an independently proved pair. Three or more ambiguous scene owners, an unobserved compositor, or a real motion source that no adapter can supply still require additional acquisition support. The logic makes no game-name checks. Its memory is bounded to the active presentation.

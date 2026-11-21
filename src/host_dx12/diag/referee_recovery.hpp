@@ -95,7 +95,7 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
         recovery.Suspend();
         return;
     }
-    if (got && !on_kept_route) placement.ObserveIncumbent(sample);
+    if (got && !on_kept_route && previous == RecoveryTool::None) placement.ObserveIncumbent(sample);
     if (got) recovery.Add(ticket, sample, frame + 1, now);
     const bool exhausted_now = exhausted != recovery.Exhausted();
     if (exhausted_now || previous != recovery.Selected() ||

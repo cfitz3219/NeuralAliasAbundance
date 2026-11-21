@@ -8893,7 +8893,10 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
             const bool lost_lighting = g.placement_lighting && g.placement_lighting != lighting;
             const bool placement_invalidated = placement.OwnsComparison() &&
                 (source_changed || !placement.Matches(scope) || lost_lighting);
-            if (placement_invalidated) placement.Invalidate(now);
+            if (source_changed) {
+                placement.ClearPresentation();
+                g.placement_lighting = 0;
+            } else if (placement_invalidated) placement.Invalidate(now);
             if (source) {
                 using na::referee::shadow::Path;
                 static referee::TrialSample sample;
@@ -8929,7 +8932,7 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
                             return (lighting && seen.alternate == referee::shadow::Placement{Path::Inline, lighting}) ||
                                 (!verified_native_reader() && seen.alternate.path == Path::Between);
                         return true;
-                    }, sample, lighting && referee::gpu::ParityRoleSwapSeen(source, depth));
+                    }, sample, lighting && referee::gpu::ParityRoleSwapSeen(source, scope));
                 if (previous_phase != referee::RouteTrial::Phase::Baseline &&
                     placement.Comparison().Current() == referee::RouteTrial::Phase::Baseline)
                     g.placement_lighting = lighting;

@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace na::referee { struct TrialSample; enum class RecoveryTool : uint8_t; }
+namespace na::referee { struct TrialSample; struct PlacementScope; enum class RecoveryTool : uint8_t; }
 
 namespace na::native11 {
 
@@ -157,7 +157,7 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present 
 // VARIANT: referee/parity-role-swap
 // The host's Referee says whether it has
 // recognized the parity signature (admission for referee/proved-roles-kept).
-using ParitySignal = bool (*)(const void* swapchain, uint64_t depth);
+using ParitySignal = bool (*)(const void* swapchain, const referee::PlacementScope& scope);
 void SetParitySignal(ParitySignal seen);
 // The hosted path receives DXGI events through the overlay's existing hooks.
 void SetScreenCheck(bool on);

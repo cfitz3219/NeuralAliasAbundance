@@ -214,14 +214,22 @@ public:
     // also ends it; an isolated missed submission does not.
     static constexpr unsigned incumbent_samples = 4, missed_limit = 30;
     void KeepProvedRoles(uint64_t id, uint64_t frame, uint64_t now,
-                         const TrialSample* incumbent = nullptr, unsigned incumbent_count = 0)
+                         const std::array<const TrialSample*, incumbent_samples>& incumbent)
     {
         Start(id, frame, now);
         structural_ = true;
         incumbent_count_ = 0;
-        for (unsigned i = 0; incumbent && i < incumbent_count && i < incumbent_samples; ++i)
-            incumbent_[incumbent_count_++] = incumbent[i];
-        if (incumbent_count_) anchor_ = incumbent_[incumbent_count_ - 1];
+        for (const auto* source : incumbent) {
+            if (!source) break;
+            auto& ref = incumbent_[incumbent_count_++];
+            ref.width = source->width; ref.height = source->height;
+            ref.configuration = source->configuration; ref.layout = source->layout;
+            ref.image = source->image;
+            ref.contrast = source->contrast;
+            for (unsigned r = 0; r < FlickerTransition::count; ++r)
+                ref.change[r] = TrialMagnitude(source->change[r]);
+        }
+        if (incumbent_count_) anchor_ = *incumbent[incumbent_count_ - 1];
         Next(Phase::Kept, frame);
         reason_ = incumbent_count_ ? "both rotating scene roles reach the screen and the parity flicker was recognized; the role-following route is kept"
                                    : "both rotating scene roles reach the screen and the parity flicker was recognized; kept without incumbent regional evidence";
@@ -289,6 +297,7 @@ public:
         }
         if (!sample.comparable || (UsesCandidate() && !sample.delivered && !regional_)) {
             if (regional_ && Active()) count_ = lost_region_ = 0;
+            if (Structural()) { count_ = 0; prior_detail_loss_ = 0; }
             watch_same_ = watch_opposite_ = 0;
             return;
         }
@@ -508,49 +517,58 @@ private:
     // Kept by structure: watch the delivered picture. Roll back only on
     // positive damage in a view matching the incumbent's; hand a recurring
     // residual to stage recovery and let that target expire once quiet.
-    bool MatchesIncumbent(const TrialSample& sample) const
+    unsigned MatchingViews(const TrialSample& sample) const
     {
-        if (!incumbent_count_ || !SameSetup(anchor_, sample)) return false;
-        // Regions that flickered on the incumbent are expected to change.
-        float change = 0;
-        unsigned count = 0;
-        for (unsigned i = 0; i < FlickerTransition::count; ++i) {
-            if (IncumbentFlicker(i) >= minimum_flicker / 3.f) continue;
-            change += std::fabs(anchor_.image[i] - sample.image[i]);
-            ++count;
+        unsigned matches = 0;
+        for (unsigned k = 0; k < incumbent_count_; ++k) {
+            const auto& ref = incumbent_[k];
+            if (!SameSetup(ref, sample)) continue;
+            float change = 0;
+            unsigned count = 0;
+            for (unsigned r = 0; r < FlickerTransition::count; ++r) {
+                if (ref.change[r] >= minimum_flicker / 3.f) continue;
+                change += std::fabs(ref.image[r] - sample.image[r]);
+                ++count;
+            }
+            if (count >= FlickerTransition::count / 2 && change <= float(count) * .10f) matches |= 1u << k;
         }
-        return count >= FlickerTransition::count / 2 && change <= float(count) * .10f;
+        return matches;
     }
-    float IncumbentFlicker(unsigned region) const
+    float IncumbentFlicker(unsigned region, unsigned views) const
     {
         float most = 0.f;
-        for (unsigned i = 0; i < incumbent_count_; ++i) most = (std::max)(most, TrialMagnitude(incumbent_[i].change[region]));
+        for (unsigned i = 0; i < incumbent_count_; ++i)
+            if (views & (1u << i)) most = (std::max)(most, incumbent_[i].change[region]);
         return most;
     }
     void KeepStructural(const TrialSample& sample)
     {
-        const bool matched = MatchesIncumbent(sample);
-        if (matched) {
-            // Lost detail: two or more textured regions of the incumbent
-            // fall below three quarters of their contrast, on two matched
-            // samples in a row.
+        const unsigned views = MatchingViews(sample);
+        unsigned lost_views = 0;
+        for (unsigned k = 0; k < incumbent_count_; ++k) {
+            if (!(views & (1u << k))) continue;
             unsigned lost = 0;
-            for (unsigned i = 0; i < FlickerTransition::count; ++i) {
-                float detail = 0.f;
-                for (unsigned k = 0; k < incumbent_count_; ++k) detail = (std::max)(detail, incumbent_[k].contrast[i]);
-                if (detail > .04f && sample.contrast[i] < .75f * detail) ++lost;
+            for (unsigned r = 0; r < FlickerTransition::count && lost < 2; ++r) {
+                const float detail = incumbent_[k].contrast[r];
+                if (detail > .04f && sample.contrast[r] < .75f * detail) ++lost;
             }
-            detail_losses_ = lost >= 2 ? detail_losses_ + 1 : 0;
-            if (detail_losses_ >= 2) {
-                ruled_out_ = true;
-                Retry("the role-following route lost visible detail against the ordinary route's picture");
-                return;
-            }
+            if (lost >= 2) lost_views |= 1u << k;
         }
+        // If any comparable ordinary picture already had this level of
+        // detail, the replacement has not been shown to cause the loss.
+        const unsigned loss = lost_views == views ? views : 0;
+        if (prior_detail_loss_ & loss) {
+            ruled_out_ = true;
+            Retry("the role-following route lost visible detail against the ordinary route's picture");
+            return;
+        }
+        prior_detail_loss_ = loss;
         if (count_ && !SameSetup(window_[0], sample)) count_ = 0;
+        window_views_[count_] = views;
         window_[count_++] = sample;
-        window_matched_ = count_ == 1 ? matched : (window_matched_ && matched);
         if (count_ >= samples) {
+            unsigned common_views = views;
+            for (unsigned i = 0; i < count_; ++i) common_views &= window_views_[i];
             float strongest = 0.f;
             uint32_t at = 0;
             const TrialSample* pattern = nullptr;
@@ -559,8 +577,8 @@ private:
                 const float amplitude = Repeated(i, nullptr, reference);
                 // A recurring flash where the incumbent was measured quiet is
                 // damage done by the role route, not a residual.
-                if (window_matched_ && amplitude >= minimum_flicker &&
-                    IncumbentFlicker(i) < minimum_flicker / 3.f) {
+                if (common_views && amplitude >= minimum_flicker &&
+                    IncumbentFlicker(i, common_views) < minimum_flicker / 3.f) {
                     ruled_out_ = true;
                     Retry("the role-following route introduced flicker in an area the ordinary route showed quiet");
                     return;
@@ -583,6 +601,7 @@ private:
             }
         }
         if (count_ == window_.size()) {
+            std::move(window_views_.begin() + 1, window_views_.end(), window_views_.begin());
             std::move(window_.begin() + 1, window_.end(), window_.begin());
             --count_;
         }
@@ -647,7 +666,8 @@ private:
         }
         return (std::min)(same[1], opposite[1]);
     }
-    static bool SameSetup(const TrialSample& a, const TrialSample& b)
+    template<class Reference>
+    static bool SameSetup(const Reference& a, const TrialSample& b)
     {
         return a.width == b.width && a.height == b.height && a.layout == b.layout && a.configuration == b.configuration;
     }
@@ -672,9 +692,13 @@ private:
     uint64_t now_ = 0, retry_at_ = 0, retry_delay_ = 8000, last_ordinal_ = 0, watch_at_ = 0;
     uint8_t watch_same_ = 0, watch_opposite_ = 0;
     bool targeted_ = false, ruled_out_ = false, regional_ = false, spatial_only_ = false, structural_ = false;
-    bool window_matched_ = false;
-    unsigned missed_ = 0, detail_losses_ = 0, incumbent_count_ = 0;
-    std::array<TrialSample, incumbent_samples> incumbent_{};
+    unsigned missed_ = 0, prior_detail_loss_ = 0, incumbent_count_ = 0;
+    struct IncumbentView {
+        uint64_t configuration = 0;
+        uint32_t layout = 0, width = 0, height = 0;
+        std::array<float, FlickerTransition::count> image{}, contrast{}, change{};
+    };
+    std::array<IncumbentView, incumbent_samples> incumbent_{};
     uint8_t lost_region_ = 0;
     uint64_t regional_seen_ = 0;
     uint32_t region_ = 0;
@@ -686,6 +710,7 @@ private:
     const char* reason_ = "";
     TrialSample anchor_;
     static constexpr unsigned incumbent_window = 8;
+    std::array<unsigned, incumbent_window> window_views_{};
     std::array<TrialSample, incumbent_window> window_{};
     struct RegionEvidence {
         TrialSample::Change pattern{};

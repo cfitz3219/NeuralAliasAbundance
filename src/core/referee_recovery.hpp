@@ -110,7 +110,10 @@ public:
                 return;
             }
             const bool candidate = trial_.UsesCandidate();
-            if (tool_ == Tool::ScreenFit || tool_ == Tool::CameraResidual) {
+            // A positive screen bypass is already a verdict on delivery.
+            // Pass it to the comparison even when this pair has no usable
+            // motion measurement. Unknown delivery still needs the usual evidence.
+            if (!(candidate && s.bypassed) && (tool_ == Tool::ScreenFit || tool_ == Tool::CameraResidual)) {
                 if (!(s.motion_error >= 0)) return;
                 if (candidate && s.motion_error > original_motion_ * 1.30f + .025f) {
                     if (++motion_losses_ >= 2) { Finish(now, true, "motion predicted the image less accurately"); return; }

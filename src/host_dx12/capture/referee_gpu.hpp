@@ -19,6 +19,7 @@
 #include "core/referee_selection.hpp"
 #include "core/referee_trial.hpp"
 
+namespace na::referee { struct PlacementScope; }
 namespace na::referee::gpu {
 
 struct Evaluation {
@@ -79,7 +80,7 @@ Stats GetStats();
 // True once the trace recognized the
 // parity signature on the current presentation; consulted for admission of
 // referee/proved-roles-kept by both adapters.
-bool ParityRoleSwapSeen(const void* swapchain, uint64_t depth);
+bool ParityRoleSwapSeen(const void* swapchain, const PlacementScope& scope);
 
 // The last sample as read back (core/referee.hpp layout) and what it holds; for tests and tools.
 struct LastSample {

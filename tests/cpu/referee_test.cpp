@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 using namespace na::referee;
@@ -112,15 +113,15 @@ std::vector<float> Vectors(float vx, float vy)
     for (size_t i = 0; i < m.size(); i += 2) { m[i] = vx; m[i + 1] = vy; }
     return m;
 }
-} // namespace
-
-int main()
+int failures = 0;
+void check(bool ok, const char* what)
 {
-    int failures = 0;
-    auto check = [&](bool ok, const char* what) {
-        std::printf("%s: %s\n", ok ? "ok" : "FAIL", what);
-        if (!ok) ++failures;
-    };
+    std::printf("%s: %s\n", ok ? "ok" : "FAIL", what);
+    if (!ok) ++failures;
+}
+
+void TestPictureScoring()
+{
     auto line = [](const Window& w, const Verdicts& v) {
         static char buf[2048];
         Format(buf, sizeof buf, w, v);
@@ -451,6 +452,10 @@ int main()
         }
         check(witnesses == 4 && controls == 4, "ambiguous textured views: four probes find distinguishing detail and four retain independent coverage");
     }
+}
+
+void TestRouteTrials()
+{
     {
         using Phase = RouteTrial::Phase;
         constexpr unsigned region = 18;
@@ -748,8 +753,11 @@ int main()
               "trial: close a quiet measurement window with a cooldown");
         check(quiet.CanStart(RouteTrial::maximum_ms + 8000), "trial: a later change can still trigger a comparison");
     }
+}
+
+void TestStageRecovery()
+{
     {
-        using namespace na::referee;
         using T = RecoveryTool;
         using S = FlickerStage;
         check(NextTool(S::Unknown, 255) == T::None && NextTool(S::Reconstruction, Bit(T::Bloom)) == T::None &&
@@ -811,6 +819,29 @@ int main()
         send(.45f, .2f, Bit(T::Sharpen));
         for (int i = 0; i < 7; ++i) send(.01f, .2f, Bit(T::Sharpen));
         check(!r.Busy() && !r.Excluded(), "one unrelated flash is inconclusive, not a lasting rejection");
+        r.Clear();
+        r.SetScene(scene);
+        s.tools = Bit(T::CameraResidual) | Bit(T::ScreenFit);
+        s.motion_error = .08f;
+        s.origin = {S::Reconstruction, 33, {0.f, .3f, .3f}};
+        send(.3f, .2f); send(.3f, .2f);
+        for (unsigned i = 0; i < RouteTrial::samples; ++i) send(.3f, .2f);
+        check(r.ToolInUse() == T::CameraResidual, "first reconstruction trial changes only the motion supplier");
+        s.delivered = false; s.bypassed = true; s.motion_error = -1;
+        send(.3f, .2f, Bit(T::CameraResidual));
+        check(!r.Busy() && r.Excluded() == Bit(T::CameraResidual),
+              "measured screen bypass restores a motion trial even when motion accuracy is unavailable");
+        s.delivered = true; s.bypassed = false; s.motion_error = .08f;
+        send(.3f, .2f); send(.3f, .2f);
+        check(r.Selected() == T::ScreenFit, "fresh evidence after rollback selects the remaining measured motion supplier");
+        for (unsigned i = 0; i < RouteTrial::samples; ++i) send(.3f, .2f);
+        s.motion_error = .03f;
+        for (unsigned i = 0; i < RouteTrial::samples; ++i) send(.01f, .2f, Bit(T::ScreenFit));
+        s.motion_error = .08f;
+        for (unsigned i = 0; i < RouteTrial::samples; ++i) send(.3f, .2f);
+        check(r.Comparison().Current() == RouteTrial::Phase::Kept && r.ToolInUse() == T::ScreenFit &&
+              r.Comparison().VerifiedReduction() > .90f,
+              "the second supplier is kept after the original flicker returns on recheck, with delivery and detail intact");
         StageRecovery dx12(true);
         dx12.SetScene(scene);
         check(dx12.Ticket(s.ordinal) != r.Ticket(s.ordinal), "DX11 and DX12 mailboxes are independent");
@@ -869,6 +900,10 @@ int main()
               .25f * .10f > dx12.Comparison().CandidateAffectedRegion(),
               "residual trial preserves delivery and improves more than ninety percent of the original fault");
     }
+}
+
+void TestRotatingRoles()
+{
     {
         // referee/parity-role-swap: stops as traced in Shadow of War 18dea9e
         // (results 231420-994): odd frames brighter on screen, DLAA input
@@ -906,14 +941,33 @@ int main()
             wrongly |= unlocked.Observe(first, first + 1, {-.30f * sign, 0.f, .62f * sign});
         }
         check(!wrongly, "a flicker not locked to frame parity is not a role swap");
+        ParityRoleSwap one_side;
+        for (unsigned i = 0; i < 12; ++i) {
+            const uint64_t first = 5000 + 2 * i;
+            one_side.Observe(first, first + 1, {-.30f, 0.f, .62f});
+        }
+        check(!one_side.Recognized(), "repeated brightening observed on odd frames alone cannot establish alternation");
+        one_side.Observe(5025, 5026, {.30f, 0.f, -.62f});
+        one_side.Observe(5027, 5028, {.30f, 0.f, -.62f});
+        check(one_side.Recognized(), "the opposite transition independently confirms the sampled lighting cycle");
+        for (unsigned i = 0; i < ParityRoleSwap::needed; ++i) {
+            const uint64_t first = 5030 + 2 * i;
+            one_side.Observe(first, first + 1, {.30f, 0.f, -.62f});
+        }
+        check(!one_side.Recognized(), "one-sided observations of a new phase cannot inherit the old phase's proof");
+        for (unsigned i = 0; i < 6; ++i) one_side.Observe(5043, 5044, {-.30f, 0.f, .62f});
+        check(!one_side.Recognized(), "one repeated receipt counts once");
+        one_side.Observe(5045, 5046, {-.30f, 0.f, .62f});
+        check(one_side.Recognized() && one_side.Phase() < 0, "a reversed cycle can earn its own proof");
         ParityRoleSwap gaps;
         for (unsigned i = 0; i < 12; ++i) wrongly |= gaps.Observe(4000 + 3 * i, 4002 + 3 * i, {-.3f, 0.f, .6f});
         check(!wrongly, "only adjacent frame pairs can show the parity signature");
 
         // referee/proved-roles-kept, after Astra's review of c5197c8d.
         const PlacementTrial::Scope scope{31, 41, 3, 12};
-        const auto picture = [](uint64_t ordinal, uint64_t now) {
+        const auto picture = [&](uint64_t ordinal, uint64_t now) {
             TrialSample t;
+            t.context = {{shadow::Path::Inline, 9}, scope.color, scope.depth, scope.generation};
             t.ordinal = ordinal;
             t.observed_at = now;
             t.width = 960; t.height = 540; t.layout = 1; t.configuration = 1;
@@ -982,6 +1036,45 @@ int main()
                   "a new flash in an area the ordinary route showed quiet rolls the keep back for this scope");
             check(adverse.KeepProvedRoles({31, 41, 4, 12}, true, ordinal, 2000 + 600000),
                   "a new scene generation can be judged again");
+            check(adverse.IncumbentSamples() == 0, "new generation cannot borrow comparison pictures from the old one");
+            adverse.Invalidate(602001);
+            check(!adverse.KeepProvedRoles(scope, true, ordinal + 2, 620000) &&
+                  !adverse.BeginVerified(scope, ordinal + 2, 620000),
+                  "returning to a previously damaging placement cannot rearm it through either admission path");
+            adverse.ClearPresentation();
+            check(adverse.KeepProvedRoles(scope, true, ordinal + 3, 620001) && !adverse.IncumbentSamples(),
+                  "a new presentation starts a new damage history even if resource numbers repeat");
+        }
+        {
+            auto unrelated = std::make_unique<PlacementTrial>();
+            for (unsigned i = 0; i < RouteTrial::incumbent_samples; ++i) {
+                auto t = picture(i + 1, 1000 + i);
+                t.context.depth = 987;
+                unrelated->ObserveIncumbent(t);
+            }
+            check(unrelated->KeepProvedRoles(scope, true, 6, 1100) && !unrelated->IncumbentSamples(),
+                  "a different depth owner at identical size and settings cannot supply the damage baseline");
+            unrelated->ClearPresentation();
+            const PlacementTrial::Scope native{31, 41, 12, 0, 0, 32};
+            for (uint64_t color : {31u, 32u, 33u}) {
+                auto t = picture(color, 1000 + color);
+                t.context = {{shadow::Path::Native11, 9}, color, native.depth, 890};
+                unrelated->ObserveIncumbent(t);
+            }
+            check(unrelated->KeepProvedRoles(native, true, 40, 1100) && unrelated->IncumbentSamples() == 2,
+                  "either verified DX11 texture can supply the ordinary picture and a third texture cannot");
+            unrelated->ClearPresentation();
+            for (unsigned i = 0; i < 4; ++i) {
+                auto t = picture(i + 1, 1000 + i);
+                if (i % 2) { t.image.fill(.8f); t.contrast.fill(.20f); }
+                unrelated->ObserveIncumbent(t);
+            }
+            check(unrelated->KeepProvedRoles(scope, true, 5, 1100), "two ordinary views retained within one route");
+            ordinal = 6 + RouteTrial::warmup_frames;
+            kept_window(*unrelated, 2000, [](TrialSample&, unsigned) {});
+            check(unrelated->UsesCandidate(), "a clearer but unrelated view cannot manufacture a detail loss");
+            kept_window(*unrelated, 2100, [](TrialSample& t, unsigned) { t.contrast.fill(.03f); });
+            check(unrelated->Comparison().RuledOut(), "real detail loss in the returning view rolls the replacement back");
         }
         {
             PlacementTrial blurred;
@@ -1003,6 +1096,10 @@ int main()
                 t.change[40].fill(i % 2 ? .25f : -.25f);
             });
             check(moved.UsesCandidate(), "a different view is not evidence of damage");
+            kept_window(moved, 3000, [](TrialSample& t, unsigned i) { t.change[40].fill(i % 2 ? .25f : -.25f); });
+            kept_window(moved, 3100, [](TrialSample& t, unsigned i) { t.change[40].fill(i % 2 ? .25f : -.25f); });
+            check(moved.Comparison().RuledOut(),
+                  "once the other view leaves the sliding window, new damage in the original view is judged again");
         }
         {
             // A timed trial already measuring the same scope is upgraded
@@ -1017,6 +1114,15 @@ int main()
                   "a different scope cannot take over a running comparison");
         }
     }
+}
+} // namespace
+
+int main()
+{
+    TestPictureScoring();
+    TestRouteTrials();
+    TestStageRecovery();
+    TestRotatingRoles();
     std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
     return failures ? 1 : 0;
 }
