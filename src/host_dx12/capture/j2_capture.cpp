@@ -389,6 +389,7 @@ uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& p, const I
     e.mv_jittered = id.dlss_mv_jittered;
     e.mv_display_res = !id.dlss_mv_lowres;
     e.jitter_x = id.jitter_x; e.jitter_y = id.jitter_y;
+    e.scene_jitter_amount = id.referee_jitter_amount;
     e.mv_scale_x = id.mv_scale_x; e.mv_scale_y = id.mv_scale_y;
     e.reset = id.reset != 0;
     context.width = render_w;

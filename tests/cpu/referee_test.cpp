@@ -12,6 +12,7 @@
 #include "core/referee_recovery.hpp"
 #include "core/referee_placement.hpp"
 #include "core/referee_parity.hpp"
+#include "core/referee_jitter.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include <cmath>
 #include <cstdio>
@@ -1123,6 +1124,43 @@ int main()
     TestRouteTrials();
     TestStageRecovery();
     TestRotatingRoles();
+    {
+        JitterTrial jitter;
+        JitterTrial::Measurement edge;
+        edge.at = {64, 32};
+        edge.detail = .2f;
+        edge.shift = .29f;
+        edge.reconstructed = .02f;
+        jitter.Observe(edge, normal_jitter, 100);
+        check(jitter.Amount() == normal_jitter, "a camera pan without phase-locked displacement cannot change jitter");
+        edge.locked = true;
+        jitter.Observe(edge, normal_jitter, 200);
+        check(jitter.Amount() == reduced_jitter, "the measured displayed edge starts a reduced-jitter trial");
+        auto replacement = edge;
+        replacement.shift = .13f;
+        replacement.image.fill(.4f);
+        jitter.Observe(replacement, reduced_jitter, 300);
+        check(jitter.Current() == JitterTrial::Phase::Reduce, "unrelated views cannot qualify the same trial");
+        replacement.image = edge.image;
+        jitter.Observe(replacement, reduced_jitter, 400);
+        check(jitter.Current() == JitterTrial::Phase::Recheck && jitter.Amount() == normal_jitter,
+              "a stable sharp edge triggers an ordinary-jitter recheck");
+        jitter.Observe(edge, normal_jitter, 500);
+        check(jitter.Current() == JitterTrial::Phase::Keep && jitter.Amount() == reduced_jitter,
+              "recurring vibration confirms the jitter change");
+        jitter.Bypassed(600);
+        check(jitter.Current() == JitterTrial::Phase::Cooldown && jitter.Amount() == normal_jitter,
+              "proof of visible bypass restores the ordinary sample");
+        JitterTrial blur;
+        blur.Observe(edge, normal_jitter, 100);
+        replacement.detail = .11f;
+        blur.Observe(replacement, reduced_jitter, 200);
+        blur.Observe(replacement, reduced_jitter, 300);
+        check(blur.Current() == JitterTrial::Phase::Cooldown, "reduced wobble cannot compensate for blur");
+        check(VerifiedJitterAmount(50, .11f, .13f, .11f, .13f) == 50 &&
+              VerifiedJitterAmount(50, .11f, .13f, 0.f, 0.f) == 0,
+              "only the actual raster offset can qualify an amount");
+    }
     std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);
     return failures ? 1 : 0;
 }

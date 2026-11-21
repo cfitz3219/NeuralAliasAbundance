@@ -21,6 +21,7 @@
 #include <vector>
 #include "core/referee_trace.hpp"
 #include "core/referee_placement.hpp"
+#include "core/referee_jitter.hpp"
 #include "core/referee_parity.hpp"
 
 using Microsoft::WRL::ComPtr;
@@ -74,6 +75,7 @@ struct State {
     uint64_t pre_ordinal = 0, main_ordinal = 0;
     uint64_t epoch = 0, pre_epoch = 0, main_epoch = 0;
     float pre_jitter[2]{}, main_jitter[2]{}, mv_scale[2]{1, 1};
+    uint8_t pre_jitter_amount = 0, main_jitter_amount = 0;
     const void* swapchain = nullptr;
     const void* screen_only_source = nullptr; // a missed pair can still supply a single exact screen
     bool screen_elapsed = false, have_motion = false, invalidated = false, single_main = false;
@@ -98,7 +100,16 @@ struct State {
         TileLocations locations;
         std::array<JitterVibration, kTiles> window;
         JitterVibration::Estimate reported;
+        uint8_t amount = 0;
     } geometry;
+    struct JitterControl {
+        const void* source = nullptr;
+        shadow::Context scene;
+        uint64_t ordinal = 0;
+        JitterTrial trial;
+    };
+    std::array<JitterControl, 2> jitter_controls;
+    std::atomic<unsigned> jitter_active{0};
     std::atomic<uint64_t> trial_sample_ticket{0};
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
     const void* trial_source = nullptr;
@@ -138,7 +149,35 @@ struct State {
     bool keep_receipt = false;
     LastSample last;
 };
+
+bool same_jitter_scene(const shadow::Context& a, const shadow::Context& b)
+{
+    if (!(a.placement == b.placement) || a.trial_configuration != b.trial_configuration) return false;
+    if (a.generation != b.generation || !a.generation || a.depth != b.depth || !a.depth) return false;
+    if (a.width != b.width || a.height != b.height || a.subresource != b.subresource) return false;
+    return a.color == b.color || (a.placement.path == shadow::Path::Native11 &&
+        a.native_screen_proof && b.native_screen_proof);
+}
 State& g = *new State; // never destroyed: its D3D12 objects must not be released by the CRT at exit
+
+unsigned jitter_index(shadow::Path path)
+{
+    return path == shadow::Path::Native11 ? 0 : 1;
+}
+
+void publish_jitter(unsigned index)
+{
+    if (g.jitter_controls[index].trial.NeedsReference()) g.jitter_active.fetch_or(1u << index, std::memory_order_release);
+    else g.jitter_active.fetch_and(~(1u << index), std::memory_order_release);
+}
+
+void log_jitter(const JitterTrial& trial, shadow::Path path, uint64_t frame)
+{
+    na::eventlog::Emit("referee_jitter_trial",
+        "frame=%llu path=%s phase=%s strength=%u normal_px=%.4f candidate_px=%.4f why=\"%s\"",
+        static_cast<unsigned long long>(frame), shadow::Name(path), trial.Name(), unsigned(trial.Amount()),
+        trial.Baseline(), trial.Candidate(), trial.Reason());
+}
 
 auto visual_proof(uint64_t proof)
 {
@@ -469,7 +508,7 @@ void collect_sample()
                 trial.bypassed = vote == shadow::ScreenVote::Input;
                 trial.delivered = vote == shadow::ScreenVote::Output;
             }
-            if (g.trace_geometry && trial.delivered && trial.comparable) {
+            if (g.trace_geometry && trial.delivered && trial.screen_structure >= .90f) {
                 const float* earlier = samples + kGeometryOffset;
                 const float* earlier_screen = earlier + (2 + (layout ? layout - 1 : 0)) * kTileFloats;
                 const float* present = screen_tiles ? screen_tiles : samples + BlockOffset(kTileScreen);
@@ -506,8 +545,11 @@ void collect_sample()
         FlickerStage trace = FlickerStage::Unknown;
         if (g.trace_geometry && enabled() && g.preview_exact && !g.invalidated && g.main_epoch == g.epoch) {
             auto& w = g.geometry;
+            const auto& scene = g.captured_context;
+            const uint8_t amount = g.pre_jitter_amount == g.main_jitter_amount ? g.main_jitter_amount : 0;
             if (w.source != g.swapchain || !w.view.SameTemporalSequence(g.captured_context) ||
                 w.layout != layout || w.width != g.img[kScreen].desc.Width || w.height != g.img[kScreen].desc.Height ||
+                w.amount != amount ||
                 g.main_ordinal <= w.ordinal || g.main_ordinal - w.ordinal > 240 ||
                 !std::equal(std::begin(w.locations.cell), std::end(w.locations.cell), std::begin(g.sampled_locations.cell))) {
                 w = {};
@@ -517,6 +559,7 @@ void collect_sample()
                 w.width = uint32_t(g.img[kScreen].desc.Width);
                 w.height = g.img[kScreen].desc.Height;
                 w.locations = g.sampled_locations;
+                w.amount = amount;
             }
             w.ordinal = g.main_ordinal;
             unsigned tile = 0;
@@ -537,6 +580,39 @@ void collect_sample()
                     "frame=%llu tile_xy=%d,%d samples=%u phase_residual_screen_px=%.4f phase_residual_dlaa_px=%.4f locked=%u",
                     (unsigned long long)g.main_ordinal, regions.at[tile].x, regions.at[tile].y,
                     w.window[tile].count, best.shift, w.window[tile].Measure(true).shift, unsigned(best.locked));
+            }
+            // Keep the layer/region, settings and recording scope stable
+            // throughout the comparison. Other live recovery tools own
+            // their own frames and cannot supply evidence for this test.
+            if (amount && scene.placement.path != shadow::Path::None && trial.screen_structure >= .90f &&
+                (trial.delivered || trial.bypassed) && !g.trial_applied && RouteTrial::WatchTicket(scene.trial_ticket)) {
+                const unsigned index = jitter_index(scene.placement.path);
+                auto& control = g.jitter_controls[index];
+                if (control.source != g.swapchain || !same_jitter_scene(control.scene, scene)) {
+                    control = {};
+                    control.source = g.swapchain;
+                    control.scene = scene;
+                }
+                control.ordinal = g.main_ordinal;
+                auto& test = control.trial;
+                const auto phase = test.Current();
+                const auto now = GetTickCount64();
+                test.Tick(now);
+                if (trial.bypassed && amount == reduced_jitter) test.Bypassed(now);
+                if (trial.delivered && test.NeedsReference()) {
+                    const auto ref = test.Reference().at;
+                    for (tile = 0; tile < kTiles; ++tile)
+                        if (ref.x == regions.at[tile].x && ref.y == regions.at[tile].y) break;
+                }
+                if (trial.delivered && tile < kTiles && geometry[tile].Valid()) {
+                    const auto screen = w.window[tile].Measure(false);
+                    const auto output = w.window[tile].Measure(true);
+                    if (screen.valid && output.valid)
+                        test.Observe({regions.at[tile], layout, screen.shift, output.shift,
+                                      regions.detail[tile], screen.locked, trial.image}, amount, now);
+                }
+                if (phase != test.Current()) log_jitter(test, scene.placement.path, control.ordinal);
+                publish_jitter(index);
             }
         }
         if (g.trace_pair && g.trial_adjacent && g.preview_exact && !g.invalidated) {
@@ -971,7 +1047,15 @@ void NotifyEvaluationReset()
 
 bool Wanted()
 {
-    if (!enabled()) return false;
+    if (!enabled()) {
+        if (g.jitter_active.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(g.m);
+            g.jitter_controls = {};
+            g.jitter_active.store(0, std::memory_order_release);
+            g.geometry = {};
+        }
+        return false;
+    }
     std::lock_guard<std::mutex> lock(g.m);
     watchdog();
     maintain();
@@ -1038,6 +1122,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
         g.pre_epoch = g.epoch;
         g.pre_jitter[0] = e.jitter_x;
         g.pre_jitter[1] = e.jitter_y;
+        g.pre_jitter_amount = e.scene_jitter_amount;
         ++g.sample_serial;
         ++g.stats.pre;
         set_phase(Phase::PreRecorded);
@@ -1074,6 +1159,7 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
     g.main_epoch = g.epoch;
     g.main_jitter[0] = e.jitter_x;
     g.main_jitter[1] = e.jitter_y;
+    g.main_jitter_amount = e.scene_jitter_amount;
     // The point shader predicts in input pixels; display-resolution vectors use output pixels.
     g.mv_scale[0] = e.mv_scale_x * (float(rw) / float(mw));
     g.mv_scale[1] = e.mv_scale_y * (float(rh) / float(mh));
@@ -1282,9 +1368,34 @@ bool TakeTrialSample(uint64_t ticket, TrialSample& sample)
     return true;
 }
 
+uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t color,
+                         uint64_t depth, uint64_t generation, uint64_t frame, uint64_t screen_proof)
+{
+    if (!swapchain || !color || !depth || !generation || !enabled()) return normal_jitter;
+    const unsigned index = jitter_index(path);
+    if (!(g.jitter_active.load(std::memory_order_acquire) & (1u << index))) return normal_jitter;
+    std::lock_guard<std::mutex> lock(g.m);
+    auto& control = g.jitter_controls[index];
+    const auto& scene = control.scene;
+    const bool rotating = path == shadow::Path::Native11 && screen_proof && scene.native_screen_proof;
+    if (control.source != swapchain || path != scene.placement.path || depth != scene.depth ||
+        generation != scene.generation || (color != scene.color && !rotating) || frame < control.ordinal)
+        return normal_jitter;
+    const auto phase = control.trial.Current();
+    control.trial.Tick(GetTickCount64());
+    if (phase != control.trial.Current()) {
+        if (control.trial.Current() == JitterTrial::Phase::Cooldown) log_jitter(control.trial, path, frame);
+        publish_jitter(index);
+    }
+    return control.trial.Amount();
+}
+
 void InvalidatePresentation(const void* swapchain)
 {
     std::lock_guard<std::mutex> lock(g.m);
+    for (unsigned i = 0; i < g.jitter_controls.size(); ++i) {
+        if (g.jitter_controls[i].source == swapchain) { g.jitter_controls[i] = {}; publish_jitter(i); }
+    }
     if (g.trial_source == swapchain) {
         g.trial_source = nullptr;
         g.trial_last_ticket = g.trial_last_ordinal = 0;

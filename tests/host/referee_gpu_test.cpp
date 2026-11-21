@@ -14,6 +14,7 @@
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "core/referee_placement.hpp"
+#include "core/referee_jitter.hpp"
 #include "host_dx12/settings.hpp"
 
 #include <cmath>
@@ -118,6 +119,8 @@ struct TracePair {
     PlacementPath path = PlacementPath::Inline, alternate = PlacementPath::None;
     uint32_t recovery_region = 0;
     float recovery_floor = 0.f;
+    uint8_t jitter_amount = 0;
+    float before_jitter[2]{}, after_jitter[2]{};
 };
 
 // One referee sample: two consecutive evaluations and their Presents, as the program calls them.
@@ -147,7 +150,17 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     const bool native11 = native_proof != 0;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterBefore[0]; e.jitter_y = rs::kJitterBefore[1];
-    const uint32_t pre = rg::Record(l.list.Get(), e);
+    if (trace && trace->jitter_amount) {
+        e.scene_jitter_amount = trace->jitter_amount;
+        e.jitter_x = trace->before_jitter[0];
+        e.jitter_y = trace->before_jitter[1];
+    }
+    uint32_t pre = rg::Record(l.list.Get(), e);
+    if (!pre && trace && trace->jitter_amount) {
+        // Native proof sampling may prefer the other present parity.
+        e.present_ordinal = ++ordinal;
+        pre = rg::Record(l.list.Get(), e);
+    }
     CHECK(pre != 0);
     test::List next_list;
     if (blocked) {
@@ -177,6 +190,10 @@ bool TakeSample(test::Device& d, test::List& l, uint64_t& ordinal, const Images&
     e.reset = reset;
     e.present_ordinal = ++ordinal;
     e.jitter_x = rs::kJitterNow[0]; e.jitter_y = rs::kJitterNow[1];
+    if (trace && trace->jitter_amount) {
+        e.jitter_x = trace->after_jitter[0];
+        e.jitter_y = trace->after_jitter[1];
+    }
     auto& main = blocked ? next_list : l;
     const uint32_t second = rg::Record(main.list.Get(), e);
     CHECK(second > pre);
@@ -272,9 +289,76 @@ void Report(const char* what, const na::referee::Verdicts& v)
                 v.result_why, VerdictName(v.motion), v.motion_why, VerdictName(v.jitter), v.jitter_why);
 }
 
+
+int TestAdaptiveJitter(test::Device& d, test::List& l)
+{
+    uint64_t ordinal = 0;
+    rg::LastSample got;
+    std::vector<ComPtr<ID3D12Resource>> keep;
+    {
+        using namespace na::referee;
+        for (const auto path : {PlacementPath::Inline, PlacementPath::Native11}) {
+            rg::InvalidatePresentation(&d);
+            const uint64_t proof = path == PlacementPath::Native11 ? 90010 : 0;
+            const auto amount = [&] { return rg::SceneJitterAmount(&d, path, 1, 2, 3, ordinal, proof); };
+            const auto window = [&](uint8_t strength) {
+                for (unsigned i = 0; i < 8; ++i) {
+                    const float x = i % 2 ? -.004f * strength : .004f * strength;
+                    const float y = i % 4 < 2 ? -.0035f * strength : .0035f * strength;
+                    const auto a = rs::Render(-x + 1.4f, -y, 0.f, 0), b = rs::Render(x + 1.52f, y, 0.f, 0);
+                    const auto c = rs::Render(-.28f * x, -.28f * y, 0.f, 0);
+                    const auto e = rs::Render(.12f + .28f * x, .28f * y, 0.f, 0);
+                    auto old_input = Picture(d, l, a, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+                    auto new_input = Picture(d, l, b, NPSR, D3D12_RESOURCE_FLAG_NONE, keep);
+                    constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    constexpr auto allow_uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                    auto old_output = Picture(d, l, c, uav, allow_uav, keep);
+                    auto new_output = Picture(d, l, e, uav, allow_uav, keep);
+                    auto old_screen = ScreenTexture(d, l, rs::ScreenBytes(c), keep);
+                    auto new_screen = ScreenTexture(d, l, rs::ScreenBytes(e), keep);
+                    if (!old_input || !new_input || !old_output || !new_output || !old_screen || !new_screen) return false;
+                    Run(d, l);
+                    keep.clear();
+                    TracePair trace{old_output.Get(), old_screen.Get(), true, 28160, 90};
+                    trace.path = path;
+                    trace.jitter_amount = strength;
+                    trace.before_jitter[0] = -x; trace.before_jitter[1] = -y;
+                    trace.after_jitter[0] = x; trace.after_jitter[1] = y;
+                    Sleep(150);
+                    if (!TakeSample(d, l, ordinal, {old_input.Get(), new_input.Get(), new_output.Get(), nullptr, new_screen.Get()},
+                                    got, false, nullptr, nullptr, false, false, false, false, proof, false, &trace)) return false;
+                    TrialSample sample;
+                    if (!rg::TakeTrialSample(trace.ticket, sample)) return false;
+                    CHECK(sample.delivered);
+                    for (const auto& line : na::eventlog::Drain())
+                        if (line.find("referee_jitter_geometry") != std::string::npos ||
+                            line.find("referee_jitter_trial") != std::string::npos) std::puts(line.c_str());
+                    if (amount() != strength) return true;
+                }
+                return true;
+            };
+            REQUIRE(window(normal_jitter));
+            CHECK(amount() == reduced_jitter);
+            REQUIRE(window(reduced_jitter));
+            CHECK(amount() == normal_jitter);
+            REQUIRE(window(normal_jitter));
+            CHECK(amount() == reduced_jitter);
+            CHECK(rg::SceneJitterAmount(&d, path, 1, 3, 3, ordinal, proof) == normal_jitter);
+            CHECK(rg::SceneJitterAmount(&l, path, 1, 2, 3, ordinal, proof) == normal_jitter);
+            std::printf("Referee jitter %s: kept strength %u\n", shadow::Name(path), unsigned(amount()));
+            na::settings::Get().referee_enabled.store(0);
+            CHECK(amount() == normal_jitter);
+            CHECK(!rg::Wanted());
+            na::settings::Get().referee_enabled.store(1);
+            CHECK(amount() == normal_jitter);
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     {
         using namespace na::screen_marker;
@@ -318,6 +402,12 @@ int main()
     na::settings::Get().referee_log_s.store(1);
     test::List l;
     REQUIRE(l.Create(d.device.Get()));
+
+    if (argc > 1 && std::strcmp(argv[1], "--jitter") == 0) {
+        REQUIRE(TestAdaptiveJitter(d, l) == 0);
+        CHECK(na::background::Stop(3000));
+        return test::finish("referee_gpu_jitter_test");
+    }
 
     const na::referee::Image prev = rs::Previous(), input = rs::Input(), output = rs::Output();
     const std::vector<float> motion = rs::Motion();

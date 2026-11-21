@@ -20,6 +20,7 @@
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/hud_picture.hpp"
 #include "core/jitter_domain.hpp"
+#include "core/referee_jitter.hpp"
 #include "host_dx12/j2/route_selector.hpp"
 #include "host_dx12/j2/consumer_profile.hpp"
 #include "host_dx12/j2/post_entry.hpp"
@@ -429,7 +430,7 @@ struct State {
     } win;
     bool jitter_on = true; // DLAA needs jitter (with the texture mip bias set at start-up)
     // Viewport jitter: the sample set for each recent frame (index frame % 8).
-    struct VpjEntry { uint64_t frame = 0; float x = 0.f, y = 0.f; };
+    struct VpjEntry { uint64_t frame = 0; float x = 0.f, y = 0.f; uint8_t amount = 0; };
     VpjEntry vpj[8];
     uint32_t vpj_phase = 0;
     uint64_t vpj_submitted_sample=0,vpj_submitted_frame=0,vpj_submitted_depth=0;
@@ -2749,8 +2750,23 @@ void vpj_advance()
     const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
     if (!vpj_mode() || !g.jitter_on || !running || !g.w) { na::observe::SetSceneViewportJitter(0, 0.f, 0.f); return; }
     const neural_alias::JitterSample js = jitter_sample(++g.vpj_phase, jitter_phases());
+    uint8_t amount = referee::normal_jitter;
+    if (g.recovery_swapchain && !settings::Get().j2_debug_jitter.load(std::memory_order_relaxed) &&
+        settings::Get().j2_viewport_jitter.load(std::memory_order_relaxed) >= 0 &&
+        g.recovery.ToolInUse() == referee::RecoveryTool::None &&
+        !g.placement_trial.Comparison().Active() && g.frame == g.submitted_frame + 1) {
+        const auto& route = g.router.Current();
+        using Path = referee::shadow::Path;
+        const auto path = route.route == Route::Inline ? Path::Inline :
+                          route.route == Route::Between ? Path::Between : Path::None;
+        uint64_t depth = 0, color = 0;
+        na::observe::GetLiveSelection(&depth, &color);
+        amount = referee::gpu::SceneJitterAmount(g.recovery_swapchain, path, color, depth,
+                                                 route.history_generation, g.submitted_frame);
+    }
     auto& e = g.vpj[g.frame % 8];
-    e.frame = g.frame; e.x = static_cast<float>(js.x_pixels); e.y = static_cast<float>(js.y_pixels);
+    e = {g.frame, static_cast<float>(js.x_pixels) * (amount * .01f),
+                  static_cast<float>(js.y_pixels) * (amount * .01f), amount};
     na::observe::SetSceneViewportJitter(g.frame, e.x, e.y);
     ++g.stats.vpj_frames;
 }
@@ -5077,6 +5093,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         id.present_ordinal = g.frame;
         id.jitter_x = e.jitter_x;
         id.jitter_y = e.jitter_y;
+        const auto& requested = g.vpj[g.frame % 8];
+        if (requested.frame == g.frame && viewport_sample_known && !debug_jitter.value &&
+            tool == referee::RecoveryTool::None)
+            id.referee_jitter_amount = referee::VerifiedJitterAmount(requested.amount, requested.x, requested.y,
+                                                                    e.jitter_x, e.jitter_y);
         id.mv_scale_x = e.mv_scale_x;
         id.mv_scale_y = e.mv_scale_y;
         id.reset = e.reset ? 1u : 0u;

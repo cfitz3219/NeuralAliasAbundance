@@ -67,6 +67,7 @@ struct Identity {
     uint32_t flow_loosen = 0, flow_ran = 0;
     float raster_jitter_x = 0, raster_jitter_y = 0;
     uint32_t jitter_convention = 0;
+    uint8_t referee_jitter_amount = 0;
     uint64_t jitter_epoch = 0;
     uint64_t hud_probe_source=0,hud_probe_generation=0;
     float flow_jitter_x=0,flow_jitter_y=0;uint32_t flow_jitter_convention=0;uint64_t flow_jitter_epoch=0;

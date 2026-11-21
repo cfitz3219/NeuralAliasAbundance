@@ -2,6 +2,7 @@
 #include "core/replay_budget.hpp"
 #include "core/replay_movers.hpp"
 #include "core/anisotropic_auto.hpp"
+#include "core/temporal_jitter.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/observe/producers.hpp"
 
@@ -5468,8 +5469,9 @@ void vpj_before_draw(GL* l)
         if (evidence && pc && pc->depth_enable == 1 && pc->depth_write == 1) ls->de.write(sel_depth, pc->depth_func);
         if (!moving) return; // counted only: no viewport of the game's is touched
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
-        bool want = sample && sel_depth && ls->cur_ds == sel_depth;
-        if (want) want = pc && pc->depth_enable == 1;
+        const bool tests_depth = pc && pc->depth_enable == 1;
+        bool after_resolve = false;
+        bool want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, false);
         if (want && ls->cur_nrt == 1 && pc->depth_write == 0) {
             // A depth test also belongs to glass, particles and other compositing draws.
             // Once the scene is reconstructed, their colour is on the display pixel grid.
@@ -5482,7 +5484,7 @@ void vpj_before_draw(GL* l)
             };
             const auto& local = ls->vpj_resolved;
             if (matches(local) && ((ls->cur_rt == local.color && ls->cur_rt_sub == local.color_sub) || destination(local))) {
-                want = false;
+                after_resolve = true;
                 if (!ls->vpj_counted_local) {
                     ls->vpj_counted_local = true;
                     g_vpj_local_layers.fetch_add(1, std::memory_order_relaxed);
@@ -5493,13 +5495,14 @@ void vpj_before_draw(GL* l)
                        std::find(ls->cleared.begin(), ls->cleared.end(), ls->cur_rt) == ls->cleared.end()) {
                 // A separate list loading/blending into the submitted consumer's exact view.
                 // A different phase, a replacement blend or a cleared target has no such proof.
-                want = false;
+                after_resolve = true;
                 if (!ls->vpj_counted_submitted) {
                     ls->vpj_counted_submitted = true;
                     g_vpj_submitted_layers.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
+        want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, after_resolve);
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
             const bool first_pin = !ls->vpj_scene;
@@ -6126,9 +6129,6 @@ struct ListHook<Slot, R(A...)> {
                 return native_fn(forwarded_list,arguments...);
             }else return native_fn(forwarded_list,arguments...);
         };
-        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
-                      Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
-            if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
             if (t_dr_pending == l && !t_host_work && scope.outermost && !scope.ambiguous) depth_pending_before(l);
@@ -6219,6 +6219,11 @@ struct ListHook<Slot, R(A...)> {
                 if (scope.outermost && !scope.ambiguous) { const CostScope c(kCostShaderUse); before_shader_use(l, Slot == sl::list::Dispatch); }
             if constexpr(Slot==sl::list::ExecuteIndirect)
                 if(scope.outermost && !scope.ambiguous){ const CostScope c(kCostShaderUse); before_shader_use(l,false,true); }
+            // Depth refresh and scene reconstruction can both restore the
+            // original viewports. Choose the raster for the draw that follows.
+            if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
+                          Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
+                if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
             if constexpr(Slot==sl::list::ExecuteIndirect) {
                 if(pure_indirect) {
                     const auto hooks=std::atomic_load_explicit(&g_shader_hooks,std::memory_order_acquire);
