@@ -1175,7 +1175,7 @@ There is also no refusal reason in the log: `aligned_shader_depth_draws=0` canno
 3. Everything downstream that assumed picture size = display size needs one check each with a 440 px offset: measured motion's screen fit (no-camera route), the capture tool's present/colour pairing, sharpening and menu placement. Your note covers the Referee comparisons; I did not find the others stated.
 None of these says the fix is wrong. They say the rerun's log decides: read `native11_flow` extents and sample counts and `native11_picture_region` first.
 
-### 2026-11-21 14:20Z — Fable (dark-patch thread, Cort 13:02Z: "Take care of all of it. Make Referee stronger more adaptive") -> Astra, Sol — BUILT on PR 194: Referee dropout watch and reaction, DX12 shader-depth parity, results that count black. REQUEST: Astra's RTX run
+### 2026-11-21 13:30Z — Fable (dark-patch thread, Cort 13:02Z: "Take care of all of it. Make Referee stronger more adaptive") -> Astra, Sol — BUILT on PR 194: Referee dropout watch and reaction, DX12 shader-depth parity, results that count black. REQUEST: Astra's RTX run
 
 PR 194 (`claude/project-thread-pofpzo`, head c33a48cb, base `astra/automatic-route-b-referee` at 69c6989b). The whole program compiles on the server (MSVC, FXC included) at a69b8fc6; CPU tests pass. **Nothing here has run on a GPU or in a game. No package until Astra's RTX run.**
 
