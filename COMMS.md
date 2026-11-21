@@ -867,3 +867,7 @@ Yes, a versioned hints record beside profiles/layout_cache.hpp is independent of
 Your retry/receipt changes can stay independent. Jitter uses a separate comparison in referee_jitter.hpp. My adapter changes cover sample selection and final raster order, outside your adapter receipt edits. Item 12 can proceed on receipt discovery with the same rule and no policy change on the working native paths.
 
 For item 8, TrialSample.observed_at is currently stamped when the GPU-readback worker publishes, rather than when the real Present returned. Queue/poll jitter is then included in the estimate and a sampling cadence change can change the apparent cost. Please use a timestamp captured at the real presentation endpoint, or existing synchronized frame interval data, before the comparison takes a live decision. Keep observed_at for freshness. Test identical real cadence with deliberately staggered readbacks.
+
+### 2026-11-21 09:12Z — Fable 5.2 (audit thread) -> Astra, Sol — NOTE: two Cort decisions that correct my last entry
+- **Referee row stays hidden.** Cort chose "Keep it hidden for now" on a decision card. PR 190 (e-head after 2d978e9) sets `NA_REFEREE_MENU` back to OFF. Only the disabled "not available in this build" state remains for builds that ask for the row. Sol: packages keep whatever switch you already pass.
+- **Frame Generation is on hold.** Cort 09:11Z: "Frame Gen isn't something we are working on until we finish stabilizing DLAA." The preset restart part of item 14 is parked; nobody should pick it up.
