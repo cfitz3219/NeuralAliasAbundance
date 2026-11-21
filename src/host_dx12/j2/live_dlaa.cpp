@@ -128,6 +128,7 @@ struct PendingHistory {
     referee::StageRecovery::Scene recovery_scene{};
     uint8_t recovery_tools = 0, recovery_applied = 0;
     uint64_t referee_boundary = 0; // verified at the current recording, zero when unavailable
+    bool screen_region = false; // only the proven reader may reconstruct this native scene
     na::j2::compute_flow::Ticket compute_flow;
     uint32_t depth_source=0, camera_source=0;
     uint64_t camera_age=0;
@@ -600,6 +601,7 @@ struct NativeCrossing {
             rw==b.rw&&rh==b.rh&&ow==b.ow&&oh==b.oh&&in_view==b.in_view&&out_view==b.out_view&&
             gx==b.gx&&gy==b.gy&&gz==b.gz&&input_param==b.input_param&&input_offset==b.input_offset;
     }
+    bool screen_region() const { return native_depth && (rw != ow || rh != oh); }
     bool lighting_pair(const NativeCrossing& other) const {
         return light_peer && light_peer == other.input && other.light_peer == input &&
             native_depth == other.native_depth && same_step(other);
@@ -1068,7 +1070,8 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         g_dump_armed_seen=armed;
     }
     uint64_t depth=0, scene=0;
-    na::observe::GetLiveSelection(&depth,&scene);
+    if (g_trace.native_resolution) na::observe::GetScreenSelection(&depth, &scene);
+    else na::observe::GetLiveSelection(&depth, &scene);
     const auto& ops=g_trace.frame;
     auto* result=g_trace.result;
     const size_t capacity=sizeof g_trace.result;
@@ -1120,7 +1123,9 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
         // Offer only actual readers of the selected, depth-paired scene after its
         // final write. Ask the existing screen probe which consumer survives.
         const auto scene_writer = writer(scene, ops.size());
-        const bool inspect_lighting = g_trace.find_lighting && !g_trace.lighting_pso.load(std::memory_order_relaxed);
+        const bool screen_region = e.rw != e.ow || e.rh != e.oh;
+        const bool inspect_lighting = !screen_region && g_trace.find_lighting &&
+            !g_trace.lighting_pso.load(std::memory_order_relaxed);
         if (g_trace.provisional.light_peer && inspect_lighting &&
             g_trace.presents - g_trace.lighting_probe_at <= 240) return; // finish the current screen challenge first
         if (scene_writer < ops.size() && depth && ops[scene_writer].paired_depth == depth &&
@@ -1131,7 +1136,9 @@ void trace_analyze(ID3D12CommandQueue* queue, uint64_t presented, bool sdr_prese
                     op.heap_indexing || op.late || op.depth || op.blend || op.out.size() != 1)
                     continue;
                 const auto& out = op.out.front();
-                if (!out.whole || out.id == scene || out.w != e.ow || out.h != e.oh ||
+                const bool output_extent = (out.w == e.ow && out.h == e.oh) ||
+                    (screen_region && out.w == e.rw && out.h == e.rh);
+                if (!out.whole || out.id == scene || !output_extent ||
                     writer(out.id, ops.size()) != i ||
                     (op.compute ? (op.uavs != 1 || !op.gx || !op.gy || op.gz != 1) : out.binding != 'r'))
                     continue;
@@ -1492,8 +1499,12 @@ void native_delivery_submitted(bool producer_order,const char* refusal,uint32_t 
 //    example SE5's bindless final dispatch) is marked on the game's own image,
 //    BEFORE any DLSS goes there; it is learned only when the screen follows;
 //  * delivery: the first sustained delivery (30 frames) or an armed J2 capture.
-struct DeliveryProbe : na::screen_marker::Vote {
+struct DeliveryProbe {
+    static constexpr UINT kLayouts = 4, kPoints = 3;
+    static constexpr UINT64 kStride = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
     std::mutex m;
+    std::array<na::screen_marker::Vote, kLayouts> votes{};
+    UINT proved_layout = 0;
     uint32_t remaining=0;uint64_t sessions=0;bool auto_done=false;
     bool verify=false;NativeCrossing target;uint32_t verify_attempts=0;
     uint64_t last_verify_visit=0;
@@ -1505,16 +1516,22 @@ struct DeliveryProbe : na::screen_marker::Vote {
     std::deque<Mark> marks;
     struct Slot{ComPtr<ID3D12CommandAllocator> alloc;ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> rb;
         uint64_t fence=0, session=0;uint32_t value=0;uint64_t frame=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;bool busy=false;
-        const void* await_source=nullptr;uint64_t await_ordinal=0;bool rejected=false;};
+        const void* await_source=nullptr;uint64_t await_ordinal=0;bool rejected=false;UINT layouts=1;};
     Slot slots[6];ComPtr<ID3D12Fence> fence;uint64_t fence_next=1;
     std::atomic<bool> pending_result{false};
-    struct Sample{uint32_t value=0;float luma[3]{};uint64_t frame=0;};
+    struct Sample {
+        uint32_t value=0;
+        float luma[kLayouts][kPoints]{};
+        uint64_t frame=0;
+        UINT layouts=0;
+    };
     std::vector<Sample> seq;
     uint64_t marked=0,paired=0,unpaired=0,size_mismatch=0,verified=0,refuted=0;
     char verdict[48]="none";
     void start(bool verifying){
         remaining=na::screen_marker::kSession;++sessions;seq.clear();marks.clear();verify=verifying;
-        static_cast<na::screen_marker::Vote&>(*this) = {};
+        votes = {};
+        proved_layout = 0;
         std::snprintf(verdict,sizeof verdict,"%s","running");
     }
 };
@@ -1637,13 +1654,23 @@ void probe_judge_locked(){
     // Steps between consecutive paired presents: luma moves with the marker?
     for(size_t i=1;i<p.seq.size();++i){
         const auto& a=p.seq[i-1];const auto& b=p.seq[i];
-        p.Add(a.value, a.luma, b.value, b.luma);
+        for (UINT layout = 0; layout < (std::min)(a.layouts, b.layouts); ++layout)
+            p.votes[layout].Add(a.value, a.luma[layout], b.value, b.luma[layout]);
     }
     p.seq.erase(p.seq.begin(),p.seq.end()-(p.seq.empty()?0:1));
     using Result = na::screen_marker::Vote::Result;
-    const auto result = p.ResultOf();
-    std::snprintf(p.verdict, sizeof p.verdict, "%s", result == Result::Reached ? "confirmed_in_presented" :
-                  result == Result::Discarded ? "replaced_before_present" : "unresolved_mixed");
+    bool reached = false, discarded = true;
+    const UINT layouts = p.seq.empty() ? 0 : p.seq.front().layouts;
+    for (UINT layout = 0; layout < layouts; ++layout) {
+        const auto result = p.votes[layout].ResultOf();
+        if (result == Result::Reached && !reached) {
+            p.proved_layout = layout;
+            reached = true;
+        }
+        discarded &= result == Result::Discarded;
+    }
+    std::snprintf(p.verdict, sizeof p.verdict, "%s", reached ? "confirmed_in_presented" :
+                  (layouts && discarded) ? "replaced_before_present" : "unresolved_mixed");
 }
 // Collect finished readbacks (never waits on the GPU).
 void probe_collect_locked(){
@@ -1655,11 +1682,19 @@ void probe_collect_locked(){
         if(!s.busy||s.fence>done||s.await_source)continue;
         s.busy=false;
         if (s.session != p.sessions || s.rejected) continue;
-        uint8_t* data=nullptr;D3D12_RANGE r{0,3*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT};
+        uint8_t* data=nullptr;
+        D3D12_RANGE r{0, SIZE_T(s.layouts * DeliveryProbe::kPoints * DeliveryProbe::kStride)};
         if(FAILED(s.rb->Map(0,&r,reinterpret_cast<void**>(&data)))||!data)continue;
-        DeliveryProbe::Sample x;x.value=s.value;x.frame=s.frame;
+        DeliveryProbe::Sample x;
+        x.value=s.value;x.frame=s.frame;x.layouts=s.layouts;
         bool ok=true;
-        for(int k=0;k<3;++k){x.luma[k]=na::screen_marker::Luma(data+k*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,s.format);ok&=x.luma[k]>=0;}
+        for (UINT layout = 0; layout < s.layouts; ++layout) {
+            for (UINT k = 0; k < DeliveryProbe::kPoints; ++k) {
+                auto& luma = x.luma[layout][k];
+                luma = na::screen_marker::Luma(data + (layout * DeliveryProbe::kPoints + k) * DeliveryProbe::kStride, s.format);
+                ok &= luma >= 0;
+            }
+        }
         D3D12_RANGE none{0,0};s.rb->Unmap(0,&none);
         if(ok){p.seq.push_back(x);++p.paired;}
     }
@@ -1708,7 +1743,16 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
                 if(it->frame < (native ? ordinal : (g.frame > 2 ? g.frame-2 : 0))){++p.unpaired;it=p.marks.erase(it);}else ++it;
             mark=std::find_if(p.marks.rbegin(),p.marks.rend(),matches);
             const auto desc=frame->GetDesc();
-            if(mark!=p.marks.rend()&&(desc.Width!=p.expect_w||desc.Height!=p.expect_h)){++p.size_mismatch;p.marks.clear();mark=p.marks.rend();}
+            UINT layouts = desc.Width == p.expect_w && desc.Height == p.expect_h ? 1u : 0u;
+            if (native && p.target.screen_region()) {
+                if (desc.Width != p.target.ow || desc.Height != p.target.oh) layouts = 0;
+                else if (!layouts) layouts = referee::PaddedLayouts(p.expect_w, p.expect_h, p.target.ow, p.target.oh);
+            }
+            if (mark != p.marks.rend() && !layouts) {
+                ++p.size_mismatch;
+                p.marks.clear();
+                mark = p.marks.rend();
+            }
             if(mark!=p.marks.rend()&&(p.fence||SUCCEEDED(g.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&p.fence))))){
                 auto* slot=std::find_if(std::begin(p.slots),std::end(p.slots),[](const auto& s){return !s.busy;});
                 bool ready=slot!=std::end(p.slots);
@@ -1718,7 +1762,7 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
                     if(ready){
                         slot->list->Close();
                         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_READBACK;
-                        D3D12_RESOURCE_DESC rd{};rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rd.Width=3*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;rd.Height=1;rd.DepthOrArraySize=1;rd.MipLevels=1;rd.SampleDesc.Count=1;rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                        D3D12_RESOURCE_DESC rd{};rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rd.Width=DeliveryProbe::kLayouts*DeliveryProbe::kPoints*DeliveryProbe::kStride;rd.Height=1;rd.DepthOrArraySize=1;rd.MipLevels=1;rd.SampleDesc.Count=1;rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
                         ready=SUCCEEDED(g.device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&slot->rb)));
                     }
                     if(!ready){slot->alloc.Reset();slot->list.Reset();}
@@ -1727,13 +1771,21 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
                     auto* l=slot->list.Get();
                     D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=frame;b.Transition.Subresource=0;
                     b.Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;l->ResourceBarrier(1,&b);
-                    for(int k=0;k<3;++k){
-                        D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=frame;src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                        dst.pResource=slot->rb.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                        dst.PlacedFootprint.Offset=UINT64(k)*D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;dst.PlacedFootprint.Footprint={desc.Format,1,1,1,D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
-                        const UINT x=UINT(na::screen_marker::kAt[k][0]*float(desc.Width)),y=UINT(na::screen_marker::kAt[k][1]*float(desc.Height));
-                        const D3D12_BOX box{x,y,0,x+1,y+1,1};
-                        l->CopyTextureRegion(&dst,0,0,0,&src,&box);
+                    const UINT dx = UINT(desc.Width) - p.expect_w, dy = desc.Height - p.expect_h;
+                    for (UINT layout = 0; layout < layouts; ++layout) {
+                        const UINT ox = dx / 2 + layout % (1 + (dx & 1u));
+                        const UINT oy = dy / 2 + layout / (1 + (dx & 1u));
+                        for (UINT k = 0; k < DeliveryProbe::kPoints; ++k) {
+                            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+                            src.pResource = frame; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            dst.pResource = slot->rb.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                            dst.PlacedFootprint.Offset = (layout * DeliveryProbe::kPoints + k) * DeliveryProbe::kStride;
+                            dst.PlacedFootprint.Footprint = {desc.Format, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+                            const UINT x = ox + UINT(na::screen_marker::kAt[k][0] * float(p.expect_w));
+                            const UINT y = oy + UINT(na::screen_marker::kAt[k][1] * float(p.expect_h));
+                            const D3D12_BOX box{x, y, 0, x + 1, y + 1, 1};
+                            l->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+                        }
                     }
                     std::swap(b.Transition.StateBefore,b.Transition.StateAfter);l->ResourceBarrier(1,&b);
                     if(SUCCEEDED(l->Close())){
@@ -1742,6 +1794,7 @@ void NativeProbePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, void(_
                         slot->fence=p.fence_next++;queue->Signal(p.fence.Get(),slot->fence);
                         slot->busy=true;slot->session=p.sessions;slot->value=mark->value;slot->frame=mark->frame;slot->format=desc.Format;
                         slot->await_source=await_result?source:nullptr;slot->await_ordinal=ordinal;slot->rejected=false;
+                        slot->layouts = layouts;
                         if (slot->await_source) p.pending_result.store(true, std::memory_order_release);
                         p.marks.erase(std::next(mark).base());
                     }
@@ -1772,6 +1825,8 @@ void apply_probe_outcome(int outcome,const NativeCrossing& c)
     std::lock_guard<std::mutex> lock(g_trace.m);
     if(!(g_trace.provisional==c))return; // the trace moved on meanwhile
     if(outcome==1){
+        if (c.screen_region() && !na::observe::SetScreenSelectionProven(c.native_depth, c.scene, true))
+            return;
         if (c.light_peer) {
             if (g_trace.lighting[0].lighting_pair(c)) {
                 g_trace.lighting[1] = c;
@@ -1850,12 +1905,14 @@ void RequestDeliveryProbe()
 namespace {
 void probe_stats(char* out,size_t n){
     std::lock_guard<std::mutex> lock(g_probe.m);auto& p=g_probe;
+    const auto& vote = p.votes[p.proved_layout];
     // Said explicitly when there is nothing to judge (Sol 6a48746: no verdict from absence).
     if(!p.paired)std::snprintf(p.verdict,sizeof p.verdict,"%s",p.marked?"unresolved_no_paired_present":"unresolved_no_marked_delivery");
     std::snprintf(out,n,"sessions=%llu marked=%llu paired=%llu unpaired=%llu size_mismatch=%llu verified=%llu refuted=%llu steps=%u/%u/%u follow=%u/%u/%u invert=%u/%u/%u flat=%u/%u/%u verdict=%s",
         (unsigned long long)p.sessions,(unsigned long long)p.marked,(unsigned long long)p.paired,(unsigned long long)p.unpaired,(unsigned long long)p.size_mismatch,
         (unsigned long long)p.verified,(unsigned long long)p.refuted,
-        p.steps[0],p.steps[1],p.steps[2],p.follow[0],p.follow[1],p.follow[2],p.invert[0],p.invert[1],p.invert[2],p.flat[0],p.flat[1],p.flat[2],p.verdict);
+        vote.steps[0],vote.steps[1],vote.steps[2],vote.follow[0],vote.follow[1],vote.follow[2],
+        vote.invert[0],vote.invert[1],vote.invert[2],vote.flat[0],vote.flat[1],vote.flat[2],p.verdict);
 }
 PhysicalInputProvider g_phys; // under g_up_m
 
@@ -4024,6 +4081,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             bool* touched = nullptr, const SceneInput* saved = nullptr, UINT prefix = 0,
             na::j2::flow::Ticket* flow_ticket = nullptr, bool flow_pair_ok = false, bool repeat_only = false)
 {
+    if (!pending.screen_region) {
+        uint64_t selected_depth = 0, selected_color = 0;
+        bool requires_screen = false;
+        na::observe::GetLiveSelection(&selected_depth, &selected_color, &requires_screen);
+        if (requires_screen) return false;
+    }
     // repeat_only (projection window): this windowed frame could not be evaluated; put the last
     // DLSS result back into the scene colour so the clipped corner is never presented raw.
     // P4-4 Layer2: an optional immutable physical snapshot for these logical ids.
@@ -5392,8 +5455,9 @@ void on_table_bind_impl(ID3D12GraphicsCommandList* l, const na_object_id* srvs, 
     const InlineCostBind bind_ic(&ic);
     if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed)) return;
     uint64_t depth_id = 0, color_id = 0;
-    na::observe::GetLiveSelection(&depth_id, &color_id);
-    if (!color_id || !depth_id) return;
+    bool requires_screen = false;
+    na::observe::GetLiveSelection(&depth_id, &color_id, &requires_screen);
+    if (requires_screen || !color_id || !depth_id) return;
     bool hit = false;
     for (uint32_t i = 0; i < n && !hit; ++i) hit = srvs[i] == color_id;
     if (!hit) return;
@@ -6273,7 +6337,8 @@ public:
         if (rotating && !p.lighting_pair(peer)) return {};
         if (p.native_depth) {
             uint64_t color = 0, depth = 0;
-            na::observe::GetLiveSelection(&depth, &color);
+            if (learned) na::observe::GetLiveSelection(&depth, &color);
+            else na::observe::GetScreenSelection(&depth, &color);
             if (p.scene != color || p.native_depth != depth || !na::observe::ListStateRestorable(l) ||
                 na::observe::ListPredication(l, nullptr, nullptr, nullptr)) return {};
         }
@@ -6417,6 +6482,7 @@ public:
             g.inline_sample_locked=true;
             const uint32_t slot=g.slot;PendingHistory pending;ID3D12GraphicsCommandList* out=nullptr;bool touched=false;
             if (c->native_dlaa) pending.referee_boundary = c->crossing.pso;
+            pending.screen_region = c->native_dlaa && c->crossing.screen_region();
             if (rotating) {
                 pending.referee_handoff = true;
                 pending.referee_logical_color = color;
@@ -8452,10 +8518,20 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
                 submitted = g.submitted_frame == ordinal;
             }
             if (native) {
-                na::observe::GetLiveSelection(&depth, &color);
+                bool requires_screen = false;
+                na::observe::GetScreenSelection(&depth, &color, &requires_screen);
                 const auto d = frame->GetDesc();
                 picture = {uint32_t(d.Width), d.Height, uint32_t(d.Width), d.Height};
                 native = color && depth && picture.ow && picture.oh;
+                if (native && requires_screen) {
+                    ComPtr<ID3D12Resource> input;
+                    input.Attach(na::observe::AcquireResource(color));
+                    const auto view = input ? input->GetDesc() : D3D12_RESOURCE_DESC{};
+                    native = view.Width <= picture.ow &&
+                        presentation::CenteredNativeRegion(uint32_t(view.Width), view.Height, picture.ow, picture.oh);
+                    picture.rw = uint32_t(view.Width);
+                    picture.rh = view.Height;
+                }
             }
         }
         // Install before the first discovery window. A persisted setting also
@@ -8465,7 +8541,10 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         if (g_trace.native_resolution != native || (native &&
             (g_trace.discovery_color != color || g_trace.discovery_depth != depth ||
              g_trace.discovery_extent.ow != picture.ow || g_trace.discovery_extent.oh != picture.oh ||
+             g_trace.discovery_extent.rw != picture.rw || g_trace.discovery_extent.rh != picture.rh ||
              g_trace.discovery_queue != queue || g_trace.discovery_source != source))) {
+            if (g_trace.learned.screen_region())
+                na::observe::SetScreenSelectionProven(g_trace.learned.native_depth, g_trace.learned.scene, false);
             g_trace.native_resolution = native;
             g_trace.discovery_color = color;
             g_trace.discovery_depth = depth;
@@ -8492,6 +8571,8 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         if (native && g_trace.learned.pso) {
             g_trace.discovery_misses = submitted ? 0 : g_trace.discovery_misses + 1;
             if (g_trace.discovery_misses >= 16) {
+                if (g_trace.learned.screen_region())
+                    na::observe::SetScreenSelectionProven(g_trace.learned.native_depth, g_trace.learned.scene, false);
                 g_trace.learned = {};
                 g_trace.learned_pso.store(0, std::memory_order_release);
                 g_trace.refuted.clear();
@@ -9199,7 +9280,18 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         apply_route_locked(queue);
     }
     uint64_t selected_depth = 0, selected_color = 0;
-    na::observe::GetLiveSelection(&selected_depth, &selected_color);
+    bool requires_screen = false;
+    na::observe::GetLiveSelection(&selected_depth, &selected_color, &requires_screen);
+    if (requires_screen && !selected_color && !g.device && native_discovery_enabled() &&
+        queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        uint64_t depth = 0, color = 0;
+        na::observe::GetScreenSelection(&depth, &color);
+        for (UINT i = 0; color && depth && i < count; ++i) {
+            if (!lists[i] || !na::observe::ListRendersTo(lists[i], color, depth)) continue;
+            ensure_device(queue);
+            break;
+        }
+    }
     depth_batch_open_locked(lists, count, selected_depth);
     if(vpj_mode()&&selected_depth)for(UINT i=0;i<count;++i){
         const auto sample=na::observe::ListSceneViewportJitter(lists[i],selected_depth);
@@ -9450,6 +9542,12 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         g.inl.valid = false;
         reason(g_native_reduced.load(std::memory_order_relaxed)?"Native scene DLSS reconstructed at full output before later game draws.":
             "Live DLAA is running inside the game's scene list (post-processing shares it).");
+        return;
+    }
+    if (requires_screen) {
+        if (!selected_color) reason("Waiting for the active scene rectangle to reach the screen.");
+        lock.unlock();
+        forward(queue, count, lists);
         return;
     }
     if (g.router.Current().route != na::j2::Route::Between) {

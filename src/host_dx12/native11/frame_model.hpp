@@ -83,6 +83,8 @@
 // provider of the one program, src/host_dx12/native11; see input_provider.hpp.)
 #pragma once
 
+#include "core/presentation_extent.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -674,9 +676,7 @@ private:
 
     bool CanFillScreenRegion(const ResourceInfo& r) const
     {
-        if (!swap_w_ || !swap_h_ || r.samples != 1 || r.width > swap_w_ || r.height > swap_h_) return false;
-        if (r.width == swap_w_) return r.height < swap_h_ && uint64_t(r.height) * 2 >= swap_h_;
-        return r.height == swap_h_ && uint64_t(r.width) * 2 >= swap_w_;
+        return r.samples == 1 && presentation::CenteredNativeRegion(r.width, r.height, swap_w_, swap_h_);
     }
 
     void Choose(Id verified_peer, bool detect_screen_regions)

@@ -382,8 +382,11 @@ uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_
 uint32_t FindTextures(const uint32_t* formats, uint32_t format_count, uint32_t w, uint32_t h, na_object_id* out, uint32_t max);
 ID3D12Resource* AcquireResource(na_object_id id);                         // AddRef'd, or null
 // Current discovery picks (written by the discovery adapter, read by J2).
-void SetLiveSelection(uint64_t depth, uint64_t color);
-void GetLiveSelection(uint64_t* depth, uint64_t* color);
+void SetLiveSelection(uint64_t depth, uint64_t color, bool requires_screen = false);
+void GetLiveSelection(uint64_t* depth, uint64_t* color, bool* requires_screen = nullptr);
+// Includes the unverified scene, for the screen challenge only.
+void GetScreenSelection(uint64_t* depth, uint64_t* color, bool* requires_screen = nullptr);
+bool SetScreenSelectionProven(uint64_t depth, uint64_t color, bool proven);
 // Changes whenever the published depth/colour pair changes.
 uint64_t LiveSelectionVersion();
 // Viewport jitter: real sub-pixel samples. While set (frame != 0), every draw whose bound depth
