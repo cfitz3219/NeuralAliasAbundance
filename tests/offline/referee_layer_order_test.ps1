@@ -33,6 +33,13 @@ $enabledWithoutEvidence = @(Get-RefereeSummary @(
 if ($enabledWithoutEvidence -notlike '*enabled during this run*no screen or delivery checks*') {
     throw 'Lost the Referee setting change when no screen checks ran'
 }
+foreach ($case in @(
+    @('event referee_start automatic_dlaa=1 gpu_checks=1 enabled=1', '*started automatically*no screen*'),
+    @('event referee_start automatic_dlaa=1 gpu_checks=0 enabled=0', '*lacks the GPU checks*'),
+    @('event settings_all referee_enabled=0', '*recorded off*')
+)) {
+    if (-not (@(Get-RefereeSummary @($case[0])) -like $case[1])) { throw "Wrong startup description for $($case[0])" }
+}
 $coverage = @(Get-RefereeSummary @('event referee_coverage dx12_scene=90 dx12_submitted=0 dx11_presents=25 dx11_submitted=22'))
 if (($coverage -like '*not running*') -or -not ($coverage -like '*DX12 submitted DLAA on 0 of 90*') -or
     -not ($coverage -like '*DX11 submitted DLAA on 22 of 25*')) { throw 'Lost coverage before first qualified image' }

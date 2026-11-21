@@ -90,6 +90,8 @@ bool ParityRoleSwapSeen(const void* swapchain, const PlacementScope& scope);
 
 // The last sample as read back (core/referee.hpp layout) and what it holds; for tests and tools.
 struct LastSample {
+    std::array<float, FlickerTransition::count> local_picture{};
+    std::vector<float> local_phase; // test receipt only, native-grid moment sums for this pair
     std::vector<float> data;
     bool screen = false, tiles = false, pair = false;
     float jitter_change = 0;

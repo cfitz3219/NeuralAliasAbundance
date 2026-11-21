@@ -172,7 +172,13 @@ void PublishLivePicks(Consumer& c) {
                 (unsigned long long)c.heuristics.FramesWithoutDepth());
         }
     }
-    na::observe::SetLiveSelection(c.live_depth,c.live_depth?c.live_color:0);
+    if (c.live_depth && c.live_color) {
+        na::observe::SetLiveSelection(c.live_depth, c.live_color);
+    } else {
+        const auto [region_depth, region_color] = c.heuristics.ScreenRegionPair();
+        if (region_color) na::observe::SetLiveSelection(region_depth, region_color, true);
+        else na::observe::SetLiveSelection(c.live_depth, 0);
+    }
 }
 void Report(Consumer& c,const na_observe_status& status,const char* phase) {
     if(!c.log) return;

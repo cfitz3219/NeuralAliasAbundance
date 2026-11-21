@@ -9503,30 +9503,71 @@ namespace {
 std::mutex g_live_m;
 std::atomic<uint64_t> g_live_depth{0}, g_live_color{0}, g_live_seq{0};
 uint64_t g_live_version = 0;
-}
-void SetLiveSelection(uint64_t depth, uint64_t color)
+uint64_t g_screen_depth = 0, g_screen_color = 0;
+std::atomic<bool> g_live_requires_screen{false};
+
+void PublishLiveSelectionLocked(uint64_t depth, uint64_t color, bool requires_screen)
 {
-    std::lock_guard<std::mutex> lock(g_live_m);
     const uint64_t d0 = g_live_depth.load(std::memory_order_relaxed), c0 = g_live_color.load(std::memory_order_relaxed);
-    if (depth == d0 && color == c0) return;
+    if (depth == d0 && color == c0 && requires_screen == g_live_requires_screen.load(std::memory_order_relaxed)) return;
     if (color != c0) g_hot_ready.store(false, std::memory_order_release); // bits were built for the old colour
     ++g_live_version;
     g_live_seq.fetch_add(1, std::memory_order_acq_rel); // odd: update in progress
     g_live_depth.store(depth, std::memory_order_relaxed);
     g_live_color.store(color, std::memory_order_relaxed);
+    g_live_requires_screen.store(requires_screen, std::memory_order_relaxed);
     g_live_seq.fetch_add(1, std::memory_order_release); // even: consistent
     // Again after the publish: RefreshReadFilter stores ready=true and then re-reads the selection,
     // so a change is either seen by that re-read or its own false here lands after the true.
     if (color != c0) g_hot_ready.store(false, std::memory_order_release);
 }
-void GetLiveSelection(uint64_t* depth, uint64_t* color)
+} // namespace
+
+void SetLiveSelection(uint64_t depth, uint64_t color, bool requires_screen)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    if (requires_screen && depth && color) {
+        if (g_screen_depth == depth && g_screen_color == color) return;
+        g_screen_depth = depth;
+        g_screen_color = color;
+        PublishLiveSelectionLocked(0, 0, true);
+    } else {
+        g_screen_depth = g_screen_color = 0;
+        PublishLiveSelectionLocked(depth, color, false);
+    }
+}
+
+void GetScreenSelection(uint64_t* depth, uint64_t* color, bool* requires_screen)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    const bool probing = g_screen_depth && g_screen_color;
+    *depth = probing ? g_screen_depth : g_live_depth.load(std::memory_order_relaxed);
+    *color = probing ? g_screen_color : g_live_color.load(std::memory_order_relaxed);
+    if (requires_screen) *requires_screen = probing;
+}
+
+bool SetScreenSelectionProven(uint64_t depth, uint64_t color, bool proven)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    if (!depth || !color || g_screen_depth != depth || g_screen_color != color) return false;
+    PublishLiveSelectionLocked(proven ? depth : 0, proven ? color : 0, true);
+    return true;
+}
+
+void GetLiveSelection(uint64_t* depth, uint64_t* color, bool* requires_screen)
 {
     for (;;) {
         const uint64_t s0 = g_live_seq.load(std::memory_order_acquire);
         if (s0 & 1) continue;
         const uint64_t d = g_live_depth.load(std::memory_order_acquire), c = g_live_color.load(std::memory_order_acquire);
+        const bool screen = requires_screen && g_live_requires_screen.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
-        if (g_live_seq.load(std::memory_order_relaxed) == s0) { *depth = d; *color = c; return; }
+        if (g_live_seq.load(std::memory_order_relaxed) == s0) {
+            *depth = d;
+            *color = c;
+            if (requires_screen) *requires_screen = screen;
+            return;
+        }
     }
 }
 ResolvedRaster FinishSceneRaster(ID3D12CommandList* list, uint64_t color, uint32_t color_sub,

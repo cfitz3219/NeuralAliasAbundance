@@ -26,11 +26,17 @@ using Microsoft::WRL::ComPtr;
 enum : uint32_t { kCreateSamplerState = 23 };                 // ID3D11Device
 enum : uint32_t { kPSSetSamplers = 10, kCSSetSamplers = 70 }; // ID3D11DeviceContext
 
+enum : uint32_t { kPSGetSamplers = 75, kCSGetSamplers = 108 }; // ID3D11DeviceContext
+
 using PFN_CreateSampler = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
 using PFN_SetSamplers = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11SamplerState* const*);
 
+using PFN_GetSamplers = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11SamplerState**);
+
 PFN_CreateSampler g_create = nullptr;
 PFN_SetSamplers g_ps[2] = {}, g_cs[2] = {}; // [0] immediate class, [1] deferred class
+
+PFN_GetSamplers g_ps_get[2] = {}, g_cs_get[2] = {};
 
 SamplerBiasFn g_bias_fn = nullptr;
 SamplerAfFn g_af_fn = nullptr;
@@ -53,6 +59,10 @@ std::unordered_map<ID3D11SamplerState*, std::shared_ptr<Entry>> g_entries;
 
 std::atomic<uint64_t> g_created{0}, g_elig_bias{0}, g_elig_af{0}, g_variants{0}, g_variant_failures{0};
 std::atomic<uint64_t> g_binds{0}, g_swapped{0}, g_unknown{0};
+// Game samplers first met at a bind, not at their creation: the game made them before these hooks
+// were installed (the hooks go in at the first present when the graphics API is detected
+// automatically, after an engine has built its whole sampler table).
+std::atomic<uint64_t> g_adopted{0};
 std::atomic<float> g_last_bias{0.0f};
 std::atomic<uint32_t> g_last_af{0};
 std::atomic<uint64_t> g_material_binds{0};
@@ -110,8 +120,43 @@ HRESULT STDMETHODCALLTYPE CreateSamplerState_d(ID3D11Device* dev, const D3D11_SA
     return hr;
 }
 
+// VARIANT: samplers/adopt-at-bind
+// A sampler the game binds that was never seen at CreateSamplerState: record it from its own
+// description. This also handles a sampler that was already bound when the hooks were installed,
+// because the draw-time policy refresh reads each context's bound slots.
+std::shared_ptr<Entry> Adopt(ID3D11SamplerState* sampler)
+{
+    if (!sampler || IsOwnWork()) return nullptr;
+    ComPtr<ID3D11Device> owner;
+    sampler->GetDevice(&owner);
+    if (!owner || owner.Get() != g_device.load(std::memory_order_acquire)) return nullptr;
+    auto e = std::make_shared<Entry>();
+    sampler->GetDesc(&e->desc);
+    e->original = sampler;
+    const SamplerFacts f = Facts(e->desc);
+    e->wants_bias = WantsBias(f);
+    e->wants_af = WantsAniso(f);
+    {
+        std::unique_lock<std::shared_mutex> l(g_mu);
+        const auto [it, fresh] = g_entries.emplace(sampler, e);
+        if (!fresh) return it->second; // another thread met it first
+    }
+    if (e->wants_bias) g_elig_bias.fetch_add(1, std::memory_order_relaxed);
+    if (e->wants_af) g_elig_af.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t n = g_adopted.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Says why, once per sampler for the first few and then at round counts.
+    if (n <= 8 || (n & (n - 1)) == 0)
+        na::eventlog::Emit("native11_samplers", "adopted=%llu why=\"bound by the game but created before the sampler hooks were "
+                           "installed\" filter=0x%x address=%u,%u max_aniso=%u bias=%.3f material=%d world=%d",
+                           static_cast<unsigned long long>(n), unsigned(e->desc.Filter), unsigned(e->desc.AddressU),
+                           unsigned(e->desc.AddressV), unsigned(e->desc.MaxAnisotropy), e->desc.MipLODBias,
+                           e->wants_bias ? 1 : 0, e->wants_af ? 1 : 0);
+    af::Global().Observe(AfFacts(f)); // automatic AF judges the game by all its samplers
+    return e;
+}
+
 // The variant of `e` for (bias, af), made on first use; null = bind the game's own.
-ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af, bool& created)
+ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af)
 {
     if (!(e.wants_bias && bias != 0.0f) && !(e.wants_af && af)) return nullptr;
     const uint64_t key = Key(bias, af);
@@ -132,7 +177,6 @@ ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af, bool& created)
             made.Reset();
         } else {
             g_variants.fetch_add(1, std::memory_order_relaxed);
-            created = true;
         }
     }
     e.variants.emplace_back(key, made); // a null entry remembers "nothing to change" for this key
@@ -164,20 +208,15 @@ void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n,
             if (it != g_entries.end()) entries[i] = it->second;
         }
     }
+    for (UINT i = 0; i < n; ++i)
+        if (!entries[i] && requested[i]) entries[i] = Adopt(requested[i]);
     uint64_t unknown = 0, changed = 0;
     for (UINT i = 0; i < n; ++i) {
         swapped[i] = requested[i];
         const auto& e = entries[i];
         if (!e) { slots[i] = {}; unknown += requested[i] != nullptr; continue; }
         swapped[i] = e->original.Get();
-        bool created = false;
-        if (auto* v = VariantOf(*e, bias, af, created)) {
-            swapped[i] = v;
-            if (created) {
-                std::unique_lock<std::shared_mutex> lock(g_mu);
-                g_entries.emplace(v, e); // lets a cached/GetSamplers variant restore its original
-            }
-        }
+        if (auto* v = VariantOf(*e, bias, af)) swapped[i] = v;
         if (swapped[i] != e->original.Get()) {
             slots[i].original = e->original;
             slots[i].applied = swapped[i];
@@ -225,6 +264,27 @@ void STDMETHODCALLTYPE CSSetSamplersDeferred_d(ID3D11DeviceContext* c, UINT star
     Bind(g_cs[1], c, start, n, s, true);
 }
 
+// The same object can be a replacement in one slot and the game's own
+// sampler in another. Report what the game bound using this context's slot.
+template<unsigned Kind, bool Compute>
+void STDMETHODCALLTYPE GetSamplers_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11SamplerState** out)
+{
+    const auto original = Compute ? g_cs_get[Kind] : g_ps_get[Kind];
+    original(c, start, n, out);
+    constexpr unsigned count = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
+    if (!out || start >= count || n > count - start) return;
+    const auto* shadow = SamplerShadowOf(c);
+    if (!shadow) return;
+    const auto* slots = (Compute ? shadow->compute : shadow->pixel) + start;
+    for (UINT i = 0; i < n; ++i) {
+        if (!out[i] || out[i] != slots[i].applied || !slots[i].original) continue;
+        auto* game = slots[i].original.Get();
+        game->AddRef();
+        out[i]->Release();
+        out[i] = game;
+    }
+}
+
 } // namespace
 
 bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af)
@@ -247,6 +307,10 @@ bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af)
                                               reinterpret_cast<void**>(&g_ps[0]));
     ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kCSSetSamplers, reinterpret_cast<void*>(&CSSetSamplers_d),
                                               reinterpret_cast<void**>(&g_cs[0]));
+    ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kPSGetSamplers, reinterpret_cast<void*>(&GetSamplers_d<0, false>),
+                                              reinterpret_cast<void**>(&g_ps_get[0]));
+    ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kCSGetSamplers, reinterpret_cast<void*>(&GetSamplers_d<0, true>),
+                                              reinterpret_cast<void**>(&g_cs_get[0]));
     if (ok && def) {
         // The deferred class may share the immediate class's functions; the core then returns the
         // existing trampoline and the immediate detour serves both.
@@ -258,6 +322,12 @@ bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af)
         if (ok && vt_def[kCSSetSamplers] != vt_imm[kCSSetSamplers])
             ok = na::hooking::PrepareVTableSlot(def.Get(), kCSSetSamplers, reinterpret_cast<void*>(&CSSetSamplersDeferred_d),
                                                 reinterpret_cast<void**>(&g_cs[1]));
+        if (ok && vt_def[kPSGetSamplers] != vt_imm[kPSGetSamplers])
+            ok = na::hooking::PrepareVTableSlot(def.Get(), kPSGetSamplers, reinterpret_cast<void*>(&GetSamplers_d<1, false>),
+                                                reinterpret_cast<void**>(&g_ps_get[1]));
+        if (ok && vt_def[kCSGetSamplers] != vt_imm[kCSGetSamplers])
+            ok = na::hooking::PrepareVTableSlot(def.Get(), kCSGetSamplers, reinterpret_cast<void*>(&GetSamplers_d<1, true>),
+                                                reinterpret_cast<void**>(&g_cs_get[1]));
     }
     if (ok) ok = na::hooking::CommitInstall();
     else na::hooking::AbandonInstall();
@@ -284,10 +354,12 @@ void RefreshSamplers(void* context)
     if (!g_installed.load() || !IsGameWork(c)) return;
     ID3D11SamplerState* bound[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
     const int deferred = c->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED ? 1 : 0;
-    c->PSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    const auto get_ps = g_ps_get[deferred] ? g_ps_get[deferred] : g_ps_get[0];
+    get_ps(c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
     Bind(g_ps[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound, false, true);
     for (auto* s : bound) if (s) s->Release();
-    c->CSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    const auto get_cs = g_cs_get[deferred] ? g_cs_get[deferred] : g_cs_get[0];
+    get_cs(c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
     Bind(g_cs[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound, true, true);
     for (auto* s : bound) if (s) s->Release();
 }
@@ -303,6 +375,7 @@ SamplerStats GetSamplerStats()
     s.binds = g_binds.load();
     s.swapped = g_swapped.load();
     s.unknown = g_unknown.load();
+    s.adopted = g_adopted.load();
     s.material_binds = g_material_binds.load();
     s.after_scene = g_after_scene.load();
     s.original_bias = g_original_bias.load();
@@ -320,12 +393,13 @@ int FormatSamplerStatus(char* out, unsigned long n)
     return std::snprintf(out, n,
                          "native11_samplers{installed=%d want_bias=%.3f want_af=%s applied_bias=%.3f applied_af=%u created=%llu "
                          "material=%llu af_eligible=%llu variants=%llu variant_failures=%llu binds=%llu swapped=%llu unknown=%llu "
-                         "after_scene_own=%llu}",
+                         "adopted=%llu after_scene_own=%llu}",
                          s.installed ? 1 : 0, want_bias, af::ActionName(want_af), s.bias, s.af, static_cast<unsigned long long>(s.created),
                          static_cast<unsigned long long>(s.eligible_bias), static_cast<unsigned long long>(s.eligible_af),
                          static_cast<unsigned long long>(s.variants), static_cast<unsigned long long>(s.variant_failures),
                          static_cast<unsigned long long>(s.binds), static_cast<unsigned long long>(s.swapped),
-                         static_cast<unsigned long long>(s.unknown), static_cast<unsigned long long>(s.after_scene));
+                         static_cast<unsigned long long>(s.unknown), static_cast<unsigned long long>(s.adopted),
+                         static_cast<unsigned long long>(s.after_scene));
 }
 
 } // namespace na::native11
