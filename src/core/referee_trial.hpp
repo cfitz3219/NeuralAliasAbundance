@@ -745,8 +745,13 @@ private:
     {
         const unsigned n = (std::min)(interval_count_, unsigned(intervals_.size()));
         if (n < frame_intervals) return -1.f;
-        auto sorted = intervals_;
-        std::sort(sorted.begin(), sorted.begin() + n);
+        // Insertion sort over at most eight values with explicit bounds.
+        std::array<float, 8> sorted{};
+        for (unsigned i = 0; i < n && i < sorted.size(); ++i) {
+            unsigned at = i;
+            for (; at > 0 && sorted[at - 1] > intervals_[i]; --at) sorted[at] = sorted[at - 1];
+            sorted[at] = intervals_[i];
+        }
         return n % 2 ? sorted[n / 2] : .5f * (sorted[n / 2 - 1] + sorted[n / 2]);
     }
     bool CostsFrameTime() const
