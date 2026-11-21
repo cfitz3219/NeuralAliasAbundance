@@ -172,3 +172,7 @@ Cort confirmed that 31463de6 starts and delivers DLAA. The remaining menu windsh
 ### 2026-11-21 Pacific — Shared Referee recovery across returning scenes
 
 PR 183 at 43cfc565. Both native APIs share the corrected lighting admission, damage comparison and motion-trial fallback. Eight focused tests passed, including real native DX11 DLAA, native DX12 rotating placement, adverse scenes, reused depth and a separate next-tool comparison. The older Shadow of War trace still qualifies with both phases present. See the dated WORKLOG and the November 21 decision table in docs/REFEREE-RECOVERY-AUDIT-20261119.md on PR 183. The new commit is on GitHub for Sol; the existing SE4 package is b75bf44f. Referee-driven jitter placement remains open.
+
+### 2026-11-21 Pacific — Shutdown and Referee jitter on both native APIs
+
+PR 183 at abb2d5f2. The equivalent original shutdown fixture fault was decoded to RetireSentinel during registry destruction, repaired in 0837359c and repeated successfully five times. The new shared Referee logic tries reduced viewport jitter against a proved normal-strength baseline and confirms the benefit on a normal-strength recheck. Both native adapters apply the scoped phase, and each preserves the original raster for qualified downstream composition. Eleven focused Release tests passed on this revision. Both proxies built. COMMS records the Fable handoff and worktree log. This revision is ready for source integration. The staged SE4 package remains b75bf44f.

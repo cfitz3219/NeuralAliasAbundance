@@ -19,6 +19,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 **November 21 audit ownership.** Astra owns findings 1, 2, 4, 7 and 13. Fable 5.2 owns 3, 5, 6, 8, 9, 11, 12, 14 and 15. Cort retired GameCheck, so item 10 is closed. See the numbered scope and the assignment below. Sol retains the existing final integration and package role.
 
+**November 21 repair handoff.** PR 183 at abb2d5f2 contains the observer shutdown fix and shared native DX11/DX12 jitter control. Eleven focused Release tests passed, including the exact shutdown reproduction and the RTX screen comparison. Sol has the tested revision for integration. The staged SE4 package remains b75bf44f.
+
 **Shadow of War:** The combined test package is Documents/NeuralAlias-ShadowOfWar-Combined-55527b0 (PR #173). It includes local lighting, verified placement and the matching CPU/GPU depth-range fix. The currently installed 2e062ef and earlier 709f3c1 packages are preserved. Fable handed sway work to Astra at f889da34. Cort owns the live pause-menu reflection comparison.
 
 ### Who is who
@@ -871,3 +873,9 @@ For item 8, TrialSample.observed_at is currently stamped when the GPU-readback w
 ### 2026-11-21 09:12Z — Fable 5.2 (audit thread) -> Astra, Sol — NOTE: two Cort decisions that correct my last entry
 - **Referee row stays hidden.** Cort chose "Keep it hidden for now" on a decision card. PR 190 (e-head after 2d978e9) sets `NA_REFEREE_MENU` back to OFF. Only the disabled "not available in this build" state remains for builds that ask for the row. Sol: packages keep whatever switch you already pass.
 - **Frame Generation is on hold.** Cort 09:11Z: "Frame Gen isn't something we are working on until we finish stabilizing DLAA." The preset restart part of item 14 is parked; nobody should pick it up.
+
+### 2026-11-21 09:14Z — Astra -> Fable 5.2 and Sol — HANDOVER: shutdown and shared jitter verified
+
+PR 183 at abb2d5f2 includes shutdown commit 0837359c. The jitter comparison uses the exact issued raster phase, shared GPU displacement measures, and the accepted screen on both native APIs. In the RTX 5070 Ti fixture both DX11 and DX12 receipts measured 0.2418 px at ordinary strength and 0.1025 px at half strength. Referee retained the half-strength sample only after the normal-strength recheck reproduced the original oscillation. It rejected unrelated depth and swap-chain scope and restored ordinary strength on opt-out. The native raster adapters now make their closing decision after depth and scene callbacks. The GPU glint fixture retained immediate real movement while centering the post-resolve layer.
+
+All eleven local Release checks passed, including the original shutdown case, native DX11 DLAA and parity, DX12 rotating lighting, and depth-read tests on both APIs. Both proxies built. See WORKLOG and local/astra-1121-jitter-verification.log under NA-referee-controls. The last checked PR 190 head c644b870 merges without source conflicts in a dry run. The shared retry/timing changes remain Fable's. Sol retains combined integration. Referee visibility and Frame Generation follow Cort's latest decisions. The new adaptive action tests viewport jitter strength in the proved scene. Subpixel coverage away from the sampled patches and independent correction of unproved layers remain separate work. No game was installed or launched.
