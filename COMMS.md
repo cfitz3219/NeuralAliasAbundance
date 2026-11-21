@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**Three Kingdoms first run.** Exact RCAS candidate fb1dac70 is staged in Windows Documents as NA-ThreeKingdoms-DLAA-INSTALL.cmd, -RESULTS.cmd and -UNINSTALL.cmd. Cort owns the live run.
+
 **November 21 integration and package.** PR 181 merged Astra's shutdown and shared jitter work (abb2d5f2) and Fable's timing, launch-memory and companion binding work (555cce2d) to main at 393db03a. Tested runtime 3e2eb03d is staged for Pharaoh Dynasties. Cort owns the first live run. Windows Documents has NA-PharaohDynasties-DLAA-INSTALL.cmd, -RESULTS.cmd and -UNINSTALL.cmd. Details and the accepted fixture exception are below.
 
 **November 21 update, shared Referee.** PR 183 at 43cfc565 includes the tested scene-change and failed-input recovery work. Sol has the integration handoff. The staged SE4 installer remains b75bf44f. Fable's PR 190 and Astra's numbered response below distinguish remaining jitter-placement, depth, visibility and CI issues.
@@ -998,3 +1000,10 @@ PR 192 at fb1dac70 is ready for review. The one existing RCAS shader limits its 
 At the same maximum strength, replay of saved DLAA output reduced fine-detail variation relative to the old shader by 43–50% in Pharaoh, 28–40% in Sniper Elite 4, 36–42% in Shadow of War and 30–32% in Sniper Elite Resistance. Fine-detail contrast stayed 15–69% above unsharpened DLAA on the 16 sampled patches. Replay measures the shader output, before game post-processing. Final Release 5/5 passed (shared RCAS, native DX11 automatic and companion, DX12 rotating lighting, CPU Referee); WARP shader test also passed. The shader fixture preserves one-pixel alternate phases and sharpens broader structure.
 
 Windows Documents has NA-PharaohDynasties-RCAS-UPDATE.cmd, staging fb1dac70. Upgraded 3e2eb03d in a temporary folder, verified results and exact uninstall. All package hashes verified. Cort retains live testing. Build, raw replay interpretation and scope are recorded in WORKLOG on PR 192. Local logs: NA-referee-controls/local/rcas-shimmer-clean-suite.log and rcas-shimmer-final-warp.log. No game files changed.
+
+
+### 2026-11-21 10:31Z — Astra — HANDOVER: Three Kingdoms DLAA and RCAS test package
+
+Cort asked for the Pharaoh RCAS candidate on Total War: Three Kingdoms. Reused the exact verified fb1dac70 proxy and NVIDIA runtime, with no code changes. Target is the currently installed Steam app 779340, build 25370317, 64-bit Three_Kingdoms.exe on C:. The binary contains dynamic DXGI/D3D11 library and factory names. Actual graphics API selection remains part of Cort's first run. Route B selects the API automatically with added upscaling, Frame Generation and D3D11On12 off.
+
+Package Documents/NeuralAlias-ThreeKingdoms-DLAA-RCAS-fb1dac70. The three CMDs are in Windows Documents (OneDrive/Documents). Verified every payload hash, install and results collection on a temporary 64-bit fixture, and exact rollback. The game executable hash and the absence of NeuralAlias files in the live folder were checked before and after staging. No game launch or installation.
