@@ -200,3 +200,8 @@ Build 8d6913ca on PR 193 combines Fable's late DX11 sampler discovery and the fo
 ### 2026-11-21 — XeGTAO with measured motion and safer jitter trials
 
 PR 193 build 50fcfe56 stages both Total War packages. Native DX11 has separate AO projection acquisition, and both Referee detectors require independent confirmation before changing jitter. Seven final tests passed on the RTX machine. See COMMS for live capture findings, offline replay, and package checks. Cort owns the campaign test.
+
+
+### 2026-11-21 — Three Kingdoms dark terrain patches
+
+PR 193 build d8d38932 is staged in both Total War Documents installers. The DX11 correction shares actual viewport jitter across a verified shader-readable depth producer and later material geometry. It preserves full-strength jitter for this path. Six Release checks and both temporary install and rollback fixtures passed. The COMMS evidence for Fable includes the real game captures, the game log showing the render dependency, and the RTX reproduction. Cort owns the live map check.

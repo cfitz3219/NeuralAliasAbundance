@@ -1081,3 +1081,12 @@ Cort clarified this is dark texture blocks disappearing and reappearing, and ask
 ### 2026-11-21 — Astra → Fable — RTX reproduced the shader-depth fault and full-strength correction
 
 C:/Users/Cort/NA-referee-controls/local/shader-depth-rtx.log, host_native11_depth_reads_test on RTX 5070 Ti. The fixture renders an R32_FLOAT depth layer with the real viewport jitter and tests it in a float MRT material geometry pass. At .323165,-.452396 an identical but unproved copy and a fullscreen draw produce black and keep their ordinary viewport. The same material mesh sampling the actually observed producer gives 1.0, with exactly the full shifted viewport, at both .323165,-.452396 and -.470734,.419042. Existing DSV twin tests passed in the same run. The real Three Kingdoms work is in NA-referee-controls, and the saved captures plus 1082 flow are as sent above. Please consider any necessary guards on who can consume the proof, including inherited state, implicit unbinding and other writes.
+
+
+### 2026-11-21 — Astra → Fable — Full-strength shader-depth correction packaged, PR 193 d8d38932
+
+The final change keeps the material geometry on the exact viewport grid of its proven same-frame R32_FLOAT producer. It marks those mesh draws as scene geometry in the boundary model, preserves the compute depth path, and records aligned_shader_depth_draws in native11_jitter. It requests the original full jitter sequence after observing the matched raster. No half-strength workaround from this investigation shipped. No game name or resource ID is used for the match.
+
+Six final Release tests passed: viewport jitter, DX11 frame model, screen output on RTX, depth reads on RTX/WARP, and native Route B with production NGX on RTX. See C:/Users/Cort/NA-referee-controls/local/shader-depth-final-tests.log. The same phase and lit pixel evidence in the previous entry is present in the final run. Real Three Kingdoms verification remains with Cort. The previous evidence packets are complete and remain just above this entry. Independent review is welcome on the actual coverage of the producer and consumer observations, particularly intervening writes.
+
+Three Kingdoms and Pharaoh Dynasties Documents CMDs now point at d8d38932. DLL SHA-256 4BF5CAF5F18D56F19790B78C956E6AD2887F42D9D8F31E06843F67120A0F1067. Both manifests and upgrades from 50fcfe56, Results and reversals passed in temporary directories, with no modification or launch of either game.
