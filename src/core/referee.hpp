@@ -251,13 +251,16 @@ inline float EdgeEnergy(const float* a, uint32_t w, uint32_t h)
 }
 
 // A display can scale the scene to fit or centre it at one source pixel per display pixel.
-// Only sample the latter layouts for small padding. Odd padding has two possible origins
+// Sample the latter for small padding or a centred picture that fills one display axis.
+// Odd padding has two possible origins
 // on each odd axis. The normalized screen occupies the original block even when testing these.
 inline uint32_t PaddedLayouts(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh)
 {
     if (w < kTile || h < kTile || sw < w || sh < h || (w == sw && h == sh)) return 0;
     const uint32_t dx = sw - w, dy = sh - h;
-    if (dx > (std::min)(16u, w / 16) || dy > (std::min)(16u, h / 16)) return 0;
+    const bool close = dx <= (std::min)(16u, w / 16) && dy <= (std::min)(16u, h / 16);
+    const bool fits_one_axis = (!dx && uint64_t(h) * 2 >= sh) || (!dy && uint64_t(w) * 2 >= sw);
+    if (!close && !fits_one_axis) return 0;
     return (1u + (dx & 1u)) * (1u + (dy & 1u));
 }
 

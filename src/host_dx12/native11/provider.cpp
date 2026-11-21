@@ -364,6 +364,7 @@ uint64_t g_list_order = 0;
 std::atomic<ID3D11Device*> g_device_raw{nullptr};
 IDXGISwapChain* g_swap = nullptr; // identity only
 Id g_backbuffer = 0;              // identity only, never pins a swap-chain buffer
+uint64_t g_region_started = 0;    // largest allowed search window for a provisional colour/depth pair
 std::atomic<Id> g_sel_color{0};    // readable from any thread
 // VARIANT: scene/after-layers (the rule is native11/frame_model.hpp)
 std::atomic<Id> g_sel_layer{0};         // the scene is drawn through material layers: their most-drawn target (0 = no layers)
@@ -1205,6 +1206,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     ++g_stats.fired;
     SetSceneHanded(true); // whatever the outcome below, the game's scene draws for this frame are over
     if (!g_cb) return SetReason("No consumer is attached.");
+    if (g_model.Current().screen_region && !verified_reader)
+        return SetReason("Waiting for the active scene rectangle to reach the screen.");
     // CameraNow may learn the camera for this very callback.
     const Selection& sel = g_model.Current();
     if (boundary == Boundary::BeforeHud && IdOf(g_color_ref.Get()) != sel.color && immediate) {
@@ -2442,16 +2445,16 @@ void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, F
 ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
 {
     if (!x || x->deferred || x->rt_count != 1 || !x->rt0 || (x->depth && x->depth_test) ||
-        x->screen_slots.none() || x->vp_n != 1 || x->vp_x != 0.f || x->vp_y != 0.f ||
+        x->screen_slots.none() || x->vp_n != 1 ||
         !g_screen_enabled.load(std::memory_order_relaxed)) return {};
 
     std::unique_lock<std::mutex> lock(g_mu);
     const auto& scene = g_model.Current();
     const auto draws = g_model.SceneDrawsThisFrame();
-    const bool inspect = g_screen.MayInspect();
-    const Id lit = g_lit.Predicted(g_model);
+    const bool inspect = scene.screen_region || g_screen.MayInspect();
+    const Id lit = scene.screen_region ? 0 : g_lit.Predicted(g_model);
     const uint64_t lit_write = lit ? g_model.LitWrite(g_lit.Peer(lit), lit) : 0;
-    const bool missed_ordinal = !g_model.FiredThisFrame() && g_model.LearnedPointKind() == 1 &&
+    const bool missed_ordinal = !scene.screen_region && !g_model.FiredThisFrame() && g_model.LearnedPointKind() == 1 &&
         !g_screen.Adaptive() && !g_screen.Verified(scene.color, scene.depth);
     if ((!inspect && !missed_ordinal && !lit_write) || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
         scene.color == g_backbuffer || !g_swap || x->raster_queries ||
@@ -2462,14 +2465,24 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     const auto close_extent = [](uint32_t a, uint32_t b) {
         return a && b && uint64_t((std::min)(a, b)) * 100 >= uint64_t((std::max)(a, b)) * 98;
     };
-    if (!g_model.InfoOf(x->rt0, output) || !close_extent(output.width, scene.color_info.width) ||
-        !close_extent(output.height, scene.color_info.height) || output.samples != 1 || scene.color_info.samples != 1) return {};
+    if (!g_model.InfoOf(x->rt0, output) || output.samples != 1 || scene.color_info.samples != 1) return {};
+    const auto& source_size = scene.color_info;
+    const bool direct_region = scene.screen_region && x->rt0 == g_backbuffer &&
+        referee::PaddedLayouts(source_size.width, source_size.height, output.width, output.height) != 0;
+    if (!direct_region && (!close_extent(output.width, source_size.width) ||
+                           !close_extent(output.height, source_size.height))) return {};
     const auto covers_picture = [](float viewport, uint32_t extent) {
         // Alignment padding can leave a few unused rows in a full-size texture.
         // The exact presented pixels still qualify the reader.
         return viewport <= float(extent) && viewport >= .98f * float(extent);
     };
-    if (!covers_picture(x->vp_w, output.width) || !covers_picture(x->vp_h, output.height)) return {};
+    const bool full_view = !x->vp_x && !x->vp_y &&
+        covers_picture(x->vp_w, output.width) && covers_picture(x->vp_h, output.height);
+    const bool centered_view = direct_region && x->vp_w == float(source_size.width) &&
+        x->vp_h == float(source_size.height) &&
+        std::fabs(2.f * x->vp_x + x->vp_w - float(output.width)) <= 1.f &&
+        std::fabs(2.f * x->vp_y + x->vp_h - float(output.height)) <= 1.f;
+    if (!full_view && !centered_view) return {};
 
     Inside own;
     ComPtr<ID3D11Predicate> predicate;
@@ -3138,6 +3151,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
     }
+    const auto previous = g_model.Current();
     const bool reserved_before = g_screen.ReservesPixelRead();
     if (g_screen_enabled.load(std::memory_order_relaxed)) {
         Inside own;
@@ -3147,10 +3161,11 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             game->GetImmediateContext(&context);
             swap->GetBuffer(0, IID_PPV_ARGS(&screen));
         }
-        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
+        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr, previous.screen_region)) {
             na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
                                outcome, (unsigned long long)g_screen.Paired(),
                                (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
+        }
         if (g_lit.Learned()) {
             if (const char* outcome = g_lit.screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
                 na::eventlog::Emit("native11_lit_role", "frame=%llu reader=%s", (unsigned long long)g_frame, outcome);
@@ -3172,8 +3187,21 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_model.SetScreenTarget(g_backbuffer);
     const bool check_lit = g_screen_enabled.load(std::memory_order_relaxed);
     const bool was_steering = g_lit.steer;
-    g_model.EndFrame(check_lit, check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0);
+    if (previous.screen_region && g_screen.Verified(previous.color, previous.depth))
+        g_region_started = g_frame;
+    if (previous.screen_region && g_frame - g_region_started > 96) {
+        na::eventlog::Emit("native11_picture_region", "result=no_screen_proof extent=%ux%u",
+            previous.color_info.width, previous.color_info.height);
+        g_model.DeferScreenRegion();
+    }
+    g_model.EndFrame(check_lit && !previous.screen_region,
+        check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0, check_lit);
     const auto& picked = g_model.Current();
+    if (picked.screen_region && (!previous.screen_region || previous.color != picked.color || previous.depth != picked.depth)) {
+        g_region_started = g_frame;
+        na::eventlog::Emit("native11_picture_region", "result=probing extent=%ux%u",
+            picked.color_info.width, picked.color_info.height);
+    }
     const auto order = g_model.CompletedLitOrder();
     g_lit.Finish(check_lit && (picked.color == order.late || picked.color == order.early) && picked.depth == order.depth
                  ? order : FrameModel::LitOrder{});
@@ -3320,9 +3348,9 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         static uint32_t logged = 0;
         const uint64_t signature = (s.color * 1099511628211ull) ^ (note.most_drawn << 1) ^ (note.picture * 31) ^
                                    static_cast<uint64_t>(note.rule) ^ (reinterpret_cast<uintptr_t>(note.why) << 3);
-        if (signature != last_signature && logged < 300 && !note.candidates.empty()) {
-            last_signature = signature;
-            ++logged;
+        const bool report_selection = signature != last_signature && logged < 300 && !note.candidates.empty();
+        const bool report_unselected = !s.valid() && !g_model.LastFlow().empty() && (g_frame % 120 == 1);
+        if (report_selection || report_unselected) {
             char list[2400] = "";
             int at = 0;
             for (const auto& n : note.candidates) {
@@ -3334,16 +3362,21 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                                     static_cast<unsigned long long>(n.first_read), static_cast<unsigned long long>(n.read_after),
                                     static_cast<unsigned long long>(n.last_read), n.float_colour ? 1 : 0, n.same_size ? 1 : 0);
             }
-            na::eventlog::Emit("native11_scene", "frame=%llu rule=%s layered=%d why=\"%s\" candidates:%s",
-                               static_cast<unsigned long long>(g_frame),
-                               note.rule != FrameModel::PictureRule::AfterLayers ? "most-drawn" : note.second_depth ? "after-layers-second-depth" : "after-layers",
-                               g_model.Layered() ? 1 : 0, note.why, list);
+            if (report_selection) {
+                last_signature = signature;
+                ++logged;
+                na::eventlog::Emit("native11_scene", "frame=%llu rule=%s layered=%d why=\"%s\" candidates:%s",
+                    static_cast<unsigned long long>(g_frame),
+                    note.rule != FrameModel::PictureRule::AfterLayers ? "most-drawn" : note.second_depth ? "after-layers-second-depth" : "after-layers",
+                    g_model.Layered() ? 1 : 0, note.why, list);
+            }
             // WHY log: the order of that frame, so a renderer we have not met shows where its picture
             // is finished. Runs of draws into one target (d) and the reads we watch (r), in order;
             // #id tells two targets of the same format apart; z#id is the depth buffer bound.
-            static uint32_t flows = 0;
-            if (flows < 16) {
-                ++flows;
+            static uint32_t flows = 0, unselected_flows = 0;
+            if ((report_selection && flows < 16) || (report_unselected && unselected_flows < 12)) {
+                if (report_unselected) ++unselected_flows;
+                else ++flows;
                 // A long frame goes out as several lines (part=1, 2, ...): one event line holds about 4,000 characters.
                 char flow[3600] = "";
                 int fa = 0;
@@ -3355,7 +3388,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                     flow[0] = 0;
                 };
                 for (const auto& f : g_model.LastFlow()) {
-                    if (fa >= static_cast<int>(sizeof flow) - 140) emit();
+                    if (fa >= static_cast<int>(sizeof flow) - 184) emit();
                     ResourceInfo ri{};
                     g_model.InfoOf(f.target, ri);
                     const unsigned tag = static_cast<unsigned>((f.target >> 4) & 0xfff);
@@ -3364,10 +3397,14 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                         fa += std::snprintf(flow + fa, sizeof flow - fa, " [r #%03x fmt=%u %s]", tag, ri.format, role);
                     else
                     {
-                        char z[24] = "no-depth";
-                        if (f.depth)
-                            std::snprintf(z, sizeof z, "z#%03x%s", static_cast<unsigned>((f.depth >> 4) & 0xfff),
-                                          f.depth == s.depth ? "=scene" : f.depth == note.second_depth ? "=second" : "");
+                        char z[64] = "no-depth";
+                        if (f.depth) {
+                            ResourceInfo depth_info{};
+                            g_model.InfoOf(f.depth, depth_info);
+                            std::snprintf(z, sizeof z, "z#%03x%s(%ux%u,s=%u)", static_cast<unsigned>((f.depth >> 4) & 0xfff),
+                                f.depth == s.depth ? "=scene" : f.depth == note.second_depth ? "=second" : "",
+                                depth_info.width, depth_info.height, depth_info.samples);
+                        }
                         // v= all the run's vertices: a few per draw is a full-screen pass, many is geometry.
                         fa += std::snprintf(flow + fa, sizeof flow - fa, " [d #%03x fmt=%u %ux%u %s n=%u multi=%u tested=%u v=%llu %s]", tag, ri.format,
                                             ri.width, ri.height, z, f.draws, f.multi, f.tested, static_cast<unsigned long long>(f.vertices), role);
@@ -3382,7 +3419,8 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_jitter_written = false;
     // A request covers exactly the frame that starts here: without a new one (a missed or failed
     // evaluation), the next frame's camera is the game's own, unjittered.
-    g_jitter_active = g_jitter_requested && g_camera.found && CameraTracking(); // the matrix write needs a camera that is being looked for
+    const bool region_ready = !s.screen_region || g_screen.Verified(s.color, s.depth);
+    g_jitter_active = region_ready && g_jitter_requested && g_camera.found && CameraTracking();
     g_jitter = neural_alias::JitterSample{g_next_jitter[0], g_next_jitter[1]};
     // Viewport route: the same one-frame request, applied on the scene draws of the frame starting here.
     const uint32_t jittered_draws = g_vpj_frame_draws;
@@ -3400,7 +3438,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_sel_depth_w.store(s.depth_info.width, std::memory_order_relaxed);
     g_sel_depth_h.store(s.depth_info.height, std::memory_order_relaxed);
     uint64_t sample = 0;
-    if (g_vpj_route.load(std::memory_order_relaxed) && g_jitter_requested && s.valid() &&
+    if (region_ready && g_vpj_route.load(std::memory_order_relaxed) && g_jitter_requested && s.valid() &&
         (g_next_jitter[0] != 0.f || g_next_jitter[1] != 0.f)) {
         std::memcpy(&sample, g_next_jitter, sizeof(sample));
     }

@@ -102,6 +102,7 @@ float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0
 float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_letterbox(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(0,2), 0)); }
+float4 ps_centered_scene(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(44,0), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
 float4 ps_screen_check(float4 p : SV_Position) : SV_Target { return float4(scene.Load(int3(int2(p.xy), 0)).rgb * 0.75, 1); }
 struct LitVertex { float4 p : SV_Position; float2 surface : TEXCOORD0; };
@@ -193,6 +194,7 @@ struct Game {
     ComPtr<IDXGISwapChain> swap;
     HWND wnd = nullptr;
     UINT w = 320, h = 180;
+    UINT screen_extra_width = 0;
     bool padded_hdr = false;
     bool shader_depth = false;
     bool campaign_camera = false;
@@ -280,7 +282,7 @@ bool MakeGame(Game& g, bool warp, bool debug = false)
     g.wnd = CreateWindowExW(0, wc.lpszClassName, L"test", WS_OVERLAPPEDWINDOW, 0, 0, int(g.w), int(g.h), nullptr, nullptr, wc.hInstance, nullptr);
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 2;
-    sd.BufferDesc.Width = g.w;
+    sd.BufferDesc.Width = g.w + g.screen_extra_width;
     sd.BufferDesc.Height = g.h + (g.padded_hdr ? 3 : 0);
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -981,6 +983,119 @@ int DepthReadFixture(Game& g, bool debug_layer)
     return g_failed ? 1 : 0;
 }
 #endif
+
+// A game sends a native-sized picture to the middle of a wider swap chain.
+// The same source can feed an invisible target first; that read cannot authorize DLAA.
+int CenteredSceneFixture(Game& game)
+{
+    D3D11_TEXTURE2D_DESC d{};
+    game.color->GetDesc(&d);
+    ComPtr<ID3D11Texture2D> decoy;
+    ComPtr<ID3D11RenderTargetView> decoy_rtv;
+    if (FAILED(game.device->CreateTexture2D(&d, nullptr, &decoy)) ||
+        FAILED(game.device->CreateRenderTargetView(decoy.Get(), nullptr, &decoy_rtv))) return 1;
+    const auto ps_code = Compile("ps_centered_scene", "ps_5_0");
+    ComPtr<ID3D11PixelShader> ps;
+    if (!ps_code || FAILED(game.device->CreatePixelShader(ps_code->GetBufferPointer(), ps_code->GetBufferSize(), nullptr, &ps))) return 1;
+
+    struct Consumer {
+        Game& game;
+        unsigned accepted = 0;
+    } consumer{game};
+    const auto evaluate = [](void* opaque, void* context, const na::native11::SceneFrame& f) {
+        auto& state = *static_cast<Consumer*>(opaque);
+        const auto& g = state.game;
+        expect(f.screen_proof && f.color.d3d11_resource == g.color.Get() && f.depth.d3d11_resource == g.depth.Get() &&
+               f.color.active_w == g.w && f.color.active_h == g.h && !f.color.active_x && !f.color.active_y,
+               "the evaluator receives the exact native scene rectangle with a screen receipt");
+        auto* ctx = static_cast<ID3D11DeviceContext*>(context);
+        ComPtr<ID3D11RenderTargetView> target;
+        ctx->OMGetRenderTargets(1, &target, nullptr);
+        expect(target.Get() == g.back_rtv.Get(), "only the visible reader can enter the evaluator");
+        const float replacement[]{.75f, .25f, .125f, 1.f};
+        ctx->ClearRenderTargetView(g.color_rtv.Get(), replacement);
+        ++state.accepted;
+        return true;
+    };
+    if (!na::native11::Install(game.device.Get(), evaluate, &consumer)) return 1;
+    na::native11::SetScreenCheck(true);
+    D3D11_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D11_FILL_SOLID;
+    raster.CullMode = D3D11_CULL_NONE;
+    raster.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> visible_quads;
+    if (FAILED(game.device->CreateRasterizerState(&raster, &visible_quads))) return 1;
+    game.ctx->RSSetState(visible_quads.Get());
+    D3D11_TEXTURE2D_DESC pixel_desc{};
+    pixel_desc.Width = pixel_desc.Height = pixel_desc.MipLevels = pixel_desc.ArraySize = 1;
+    pixel_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pixel_desc.SampleDesc.Count = 1;
+    pixel_desc.Usage = D3D11_USAGE_STAGING;
+    pixel_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> pixel;
+    if (FAILED(game.device->CreateTexture2D(&pixel_desc, nullptr, &pixel))) return 1;
+
+    auto frame = [&](bool show) {
+        Pump();
+        auto* ctx = game.ctx.Get();
+        Scene(ctx, game, 0);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
+        auto* rt = decoy_rtv.Get();
+        ctx->OMSetRenderTargets(1, &rt, nullptr);
+        auto* view = game.color_srv.Get();
+        ctx->PSSetShaderResources(0, 1, &view);
+        ctx->PSSetShader(game.ps_tonemap.Get(), nullptr, 0);
+        ctx->Draw(4, 0);
+
+        rt = game.back_rtv.Get();
+        ctx->OMSetRenderTargets(1, &rt, nullptr);
+        constexpr float black[]{0.f, 0.f, 0.f, 1.f};
+        ctx->ClearRenderTargetView(rt, black);
+        if (show) {
+            const D3D11_VIEWPORT vp{44.f, 0.f, float(game.w), float(game.h), 0.f, 1.f};
+            ctx->RSSetViewports(1, &vp);
+            ctx->PSSetShaderResources(0, 1, &view);
+            ctx->PSSetShader(ps.Get(), nullptr, 0);
+            ctx->Draw(4, 0);
+        }
+        view = nullptr;
+        ctx->PSSetShaderResources(0, 1, &view);
+        bool displayed = false;
+        if (show && consumer.accepted) {
+            na::native11::OwnWorkScope own;
+            ComPtr<ID3D11Texture2D> screen;
+            if (SUCCEEDED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) {
+                const auto read_red = [&](UINT x) {
+                    const D3D11_BOX box{x, 2, 0, x + 1, 3, 1};
+                    ctx->CopySubresourceRegion(pixel.Get(), 0, 0, 0, 0, screen.Get(), 0, &box);
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    if (FAILED(ctx->Map(pixel.Get(), 0, D3D11_MAP_READ, 0, &map))) return -1;
+                    const int red = *static_cast<const uint8_t*>(map.pData);
+                    ctx->Unmap(pixel.Get(), 0);
+                    return red;
+                };
+                displayed = std::abs(read_red(46) - 191) <= 2 && read_red(2) == 0 && read_red(game.w + 50) == 0;
+            }
+        }
+        expect(SUCCEEDED(game.swap->Present(0, 0)), "present the centered scene");
+        return displayed;
+    };
+
+    for (unsigned i = 0; i < 42; ++i) frame(false);
+    const auto invisible = na::native11::Stats();
+    expect(!consumer.accepted && invisible.screen_refuted >= 1 && !invisible.screen_confirmed,
+           "an otherwise identical offscreen reader fails the centered screen challenge");
+    unsigned visible = 0;
+    for (unsigned i = 0; i < 46; ++i) visible += frame(true);
+    const auto shown = na::native11::Stats();
+    expect(shown.screen_confirmed == 1 && consumer.accepted >= 16 && visible == consumer.accepted,
+           "the centered reader carries every accepted result to the display with the side bars intact");
+    std::printf("centered scene: decoy rejected=%llu, screen confirmed=%llu, displayed=%u\n",
+                (unsigned long long)shown.screen_refuted, (unsigned long long)shown.screen_confirmed, visible);
+    na::native11::Uninstall();
+    return g_failed ? 1 : 0;
+}
 
 int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[maybe_unused]] bool rotating_lights = false,
                        [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false,
@@ -1860,6 +1975,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     g.padded_hdr = padded_hdr;
 #endif
+    const bool centered_scene = argc > 1 && std::strcmp(argv[1], "--centered-scene") == 0;
+    if (centered_scene) g.screen_extra_width = 88;
     bool warp = false;
     const bool screen_warp = argc > 1 && (std::strcmp(argv[1], "--screen-check-warp") == 0 ||
                                          std::strcmp(argv[1], "--adaptive-screen-warp") == 0);
@@ -1869,6 +1986,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     g.shader_depth = depth_reads;
     if (screen_warp || depth_warp || depth_debug || !MakeGame(g, false)) {
         g = Game{};
+        if (centered_scene) g.screen_extra_width = 88;
         g.shader_depth = depth_reads;
         if (!MakeGame(g, true, depth_debug)) {
             std::printf("SKIP: no %s DX11 device\n", depth_debug ? "debug-layer" : "WARP");
@@ -1882,6 +2000,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->GetDesc(&adapter_desc);
     std::printf("device: %ls (%s)\n", adapter_desc.Description, warp ? "WARP" : "hardware");
 #if !defined(NA_TEST_NATIVE_DLAA)
+    if (centered_scene) return CenteredSceneFixture(g);
     if (adaptive || screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g, adaptive, missed_order);
 #endif
 #if defined(NA_TEST_NATIVE_DLAA)
