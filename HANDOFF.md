@@ -185,3 +185,8 @@ PR 181 merged to main at 393db03a with both Astra and Fable's fixes. Release 3e2
 ### 2026-11-21 Pacific — Three Kingdoms first campaign and automatic Referee
 
 Three Kingdoms delivered DLAA in the captured campaign at both resolutions. The jitter-linked riverbank defect appears in reconstructed and displayed pixels. A hidden Referee was disabled and ran no checks. Original RCAS and automatic Route B Referee are now staged in both Total War installers at a072227a, PR 193. Seven automated Release checks and the Results tests passed. Upgrade and removal were verified in temporary game folders. Cort owns the live verification. See the November 21 COMMS entry and the PR WORKLOG.
+
+
+### 2026-11-21 — Three Kingdoms riverbank
+
+PR 193 build 37b9be05 is staged in Windows Documents. Both Route B APIs now recognize a local stationary input edge displaced by reconstruction jitter and compare reduced strengths using final-screen evidence. See the Three Kingdoms mixed jitter entry in COMMS for the saved-frame findings, RTX comparison and test limits. Cort owns the game test.
