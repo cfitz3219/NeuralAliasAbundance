@@ -860,6 +860,7 @@ int main(int argc, char** argv)
                                     arm, unsigned(measured.tiles.input), unsigned(measured.tiles.output), unsigned(measured.comparable));
                 CHECK(arm == 1 ? measured.delivered : measured.tiles.Mixed());
                 regional.Tick(GetTickCount64(), true);
+                measured.presented_us = 0; // picture case: fixture cadence is not a game's pace
                 regional.Add(scope, ticket, measured, ordinal, GetTickCount64());
             }
         }
@@ -908,6 +909,9 @@ int main(int argc, char** argv)
                     CHECK(measured.ordinal == ordinal && measured.configuration == 70);
                     CHECK(measured.delivered != bypass && measured.bypassed == bypass);
                     CHECK(!rg::TakeTrialSample(ticket, measured));
+                    // These cases judge the picture only. The fixture's cadence is its own
+                    // sleeps on a shared runner, not a game's pace (covered in referee_test.cpp).
+                    measured.presented_us = 0;
                     placement.Add(scope, ticket, measured, ordinal, GetTickCount64());
                 }
             }
@@ -940,6 +944,7 @@ int main(int argc, char** argv)
                                        nullptr, reverse ? t_screen.Get() : lit_display.Get()}, got,
                                        false, nullptr, nullptr, false, false, false, false, 0, false, &trace));
                     REQUIRE(rg::TakeTrialSample(watch, measured));
+                    measured.presented_us = 0; // picture case: fixture cadence is not a game's pace
                     placement.Add(scope, watch, measured, ordinal, GetTickCount64());
                 }
                 CHECK(trial.Current() == Phase::Rejected && !trial.UsesCandidate());
@@ -987,6 +992,7 @@ int main(int argc, char** argv)
             CHECK(sample.delivered && sample.comparable && sample.tools == (available & trace.main_tools));
             if (!quiet) CHECK(sample.origin.stage == FlickerStage::Input && sample.origin.region == 36);
             recovery.Tick(GetTickCount64());
+            sample.presented_us = 0; // picture case: fixture cadence is not a game's pace
             recovery.Add(ticket, sample, ordinal + 1, GetTickCount64());
         }
         const auto& result = recovery.Comparison();

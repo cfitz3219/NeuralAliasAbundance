@@ -907,6 +907,10 @@ void TestRetryAndReasons()
               "frame time: a replacement 30 percent slower than both ordinary measurements is not kept");
         check(paced(10, 13, 14, false).Current() == Phase::Kept,
               "frame time: a game that slowed down by itself does not condemn the replacement");
+        check(paced(10, 16, 14, false).Current() == Phase::Kept,
+              "frame time: a cost smaller than the disagreement between the two ordinary measurements is not evidence");
+        check(paced(10, 20, 14, false).Outcome() == TrialOutcome::Slower,
+              "frame time: a cost beyond the scene's own pace change is still caught");
         const auto staggered = paced(10, 10, 10, false, true);
         check(staggered.Current() == Phase::Kept && std::fabs(staggered.FrameMs(Phase::Candidate) - 10.f) < .01f &&
               std::fabs(staggered.FrameMs(Phase::Baseline) - 10.f) < .01f,
