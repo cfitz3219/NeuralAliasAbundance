@@ -27,11 +27,17 @@
 #include "host_dx12/native11/textures.hpp"
 
 #include "core/temporal_jitter.hpp"
+#include "host_dx12/diag/referee_recovery.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
+#include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
+#include "host_dx12/native11/depth_direction.hpp"
+#include "host_dx12/native11/depth_reads.hpp"
 #include "host_dx12/native11/frame_model.hpp"
+#include "host_dx12/native11/screen_check.hpp"
+#include "host_dx12/native11/lit_scene.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
 #include "providers/camera/camera_admission.hpp"
@@ -44,6 +50,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -61,11 +68,12 @@ using Microsoft::WRL::ComPtr;
 
 // ID3D11DeviceContext vtable (d3d11.h order).
 enum CtxSlot : uint32_t {
-    kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kPSSetConstantBuffers = 16, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
+    kVSSetConstantBuffers = 7, kPSSetShaderResources = 8, kPSSetShader = 9, kPSSetConstantBuffers = 16, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
     kDrawIndexedInstanced = 20, kDrawInstanced = 21, kVSSetShaderResources = 25, kOMSetRenderTargets = 33,
     kOMSetRenderTargetsAndUAVs = 34, kOMSetDepthStencilState = 36, kDrawIndexedInstancedIndirect = 39,
-    kDrawInstancedIndirect = 40, kRSSetViewports = 44, kCopySubresourceRegion = 46, kCopyResource = 47, kUpdateSubresource = 48,
-    kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
+    kBegin = 27, kEnd = 28, kDrawInstancedIndirect = 40, kDrawAuto = 38, kDispatch = 41, kDispatchIndirect = 42,
+    kRSSetViewports = 44, kCopySubresourceRegion = 46, kCopyResource = 47, kUpdateSubresource = 48,
+    kClearRenderTargetView = 50, kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
     kClearState = 110, kFinishCommandList = 114,
     // ID3D11DeviceContext1
     kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
@@ -134,16 +142,124 @@ constexpr size_t kMaxListEvents = 200000; // per deferred recording; beyond this
 constexpr size_t kMaxCandidates = 8;       // constant buffers searched for the camera (VS and PS)
 constexpr size_t kMaxLists = 512;          // recorded command lists kept
 
+enum class DepthStage : size_t { Pixel, Vertex, Compute };
+constexpr UINT kDepthSlots = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+std::atomic<bool> g_depth_reads_enabled{false};
+struct DepthReads {
+    std::bitset<kDepthSlots> slots[3];
+    std::unique_ptr<DepthReadTwin> twin;
+    Id resource = 0;
+    uint32_t frame = 0;
+    uint64_t sample = 0;
+    UINT width = 0, height = 0;
+    bool cleared = false, seen = false, mixed = false, dirty = true, deferred = false, expanded = false;
+    // Qualify recovery for each clearing/lighting role independently. A late
+    // unsafe read must not make a stable earlier reader change texture.
+    struct Reader {
+        uint64_t key = 0;
+        uint32_t frame = 0;
+        uint8_t good = 0;
+        bool blocked = false;
+        const char* reason = nullptr;
+    };
+    std::array<Reader, 24> readers{};
+
+    void Start(uint32_t ordinal, Id depth)
+    {
+        if (frame == ordinal && resource == depth) return;
+        if (resource != depth) {
+            twin.reset();
+            readers = {};
+        }
+        frame = ordinal;
+        resource = depth;
+        sample = 0;
+        width = height = 0;
+        cleared = seen = mixed = deferred = expanded = false;
+        dirty = true;
+    }
+    void Write(uint64_t raster_sample, bool expanded_viewport, UINT w, UINT h)
+    {
+        if (!raster_sample || !w || !h ||
+            (seen && (sample != raster_sample || expanded != expanded_viewport || width != w || height != h))) mixed = true;
+        sample = raster_sample;
+        width = w;
+        height = h;
+        expanded = expanded_viewport;
+        seen = dirty = true;
+    }
+    void Report(Reader& reader, const char* state, const char* reason)
+    {
+        if (reader.reason && std::strcmp(reader.reason, reason) == 0) return;
+        reader.reason = reason;
+        static std::atomic<unsigned> budget{0};
+        if (budget.fetch_add(1, std::memory_order_relaxed) >= 256) return;
+        na::eventlog::Emit("depth_reads", "variant=depth-reads/twin api=dx11 frame=%u reader=%llx state=%s why=\"%s\"",
+                           frame - 1, static_cast<unsigned long long>(reader.key), state, reason);
+    }
+    bool Refresh(ID3D11DeviceContext* context, ID3D11Resource* depth, uint64_t key, bool query)
+    {
+        auto it = std::find_if(readers.begin(), readers.end(), [key](const Reader& r) { return r.key == key; });
+        if (it == readers.end()) {
+            it = std::min_element(readers.begin(), readers.end(), [](const Reader& a, const Reader& b) {
+                return a.frame < b.frame;
+            });
+            *it = {key};
+        }
+        auto& reader = *it;
+        const bool new_frame = reader.frame != frame;
+        reader.frame = frame;
+        const auto refuse = [&](const char* reason) {
+            reader.blocked = true;
+            reader.good = 0;
+            Report(reader, "refused", reason);
+            return false;
+        };
+        if (deferred || mixed) return refuse(deferred ? "deferred game work in this frame" : "mixed or unqualified depth writes");
+        if (!cleared || !seen) return refuse("waiting for a clear and viewport-jittered scene depth writes");
+        if (dirty && query) return refuse("a game raster query is active");
+        if (reader.blocked) {
+            if (new_frame && reader.good < 3) ++reader.good;
+            if (reader.good < 3) {
+                Report(reader, "recovering", "waiting for three usable frames from this reader");
+                return false;
+            }
+            reader.blocked = false;
+        }
+        if (dirty) {
+            if (!twin) twin = std::make_unique<DepthReadTwin>();
+            float offset[2];
+            std::memcpy(offset, &sample, sizeof offset);
+            if (!twin->Refresh(context, depth, offset[0], offset[1], expanded, width, height)) return refuse(twin->Reason());
+            dirty = false;
+        }
+        Report(reader, "on", "current scene depth corrected");
+        return true;
+    }
+};
+
+// The view the scene used on a selected texture (typed format, subresource).
+struct ViewUse { uint32_t format = 0, mip = 0, slice = 0; };
 struct Ctx {
     bool game = false; // a context of the game's device
     uint32_t gen = 0;  // the game-device generation that answer was given in
     uint64_t sampler_policy = ~uint64_t{0};
+    SamplerShadow sampler_shadow;
     uint64_t texture_policy = ~uint64_t{0};
+    Id screen_color = 0, screen_peer = 0;
+    ID3D11PixelShader* pixel_shader = nullptr; // context owns the binding
+    uint64_t writer_shader = 0;
+    bool pixel_shader_known = false;
+    std::bitset<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> screen_slots;
     PsShadow ps_shadow;                // the game's views behind bound material replacements (textures.hpp)
     bool deferred = false;
     Id rt0 = 0, depth = 0;
     uint8_t rt_count = 0;              // render targets bound together
     bool depth_test = true;
+    bool depth_read_only = false;
+    uint32_t raster_queries = 0;
+    DepthReads depth_reads;
+    uint8_t depth_func = kCompareLess; // the bound state's comparison when it tests AND writes depth, else 0 (default state: LESS, writing)
     Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
     uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
     float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0; // viewport 0
@@ -154,6 +270,8 @@ struct Ctx {
     uint64_t vpj_sample = 0;          // the exact sample they carry
     uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
+    bool events_truncated = false;
+    ViewUse rt_view, ds_view;
     std::vector<DeferredUpload> cb_bytes; // (event index, bytes) for CbUpdate events
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
     // Large constant buffers this context has itself mapped for writing since its state began.
@@ -169,11 +287,21 @@ struct Ctx {
     void reset_state()
     {
         sampler_policy = ~uint64_t{0};
+        sampler_shadow = {};
         texture_policy = ~uint64_t{0};
         ps_shadow.Clear();
+        screen_color = screen_peer = 0;
+        pixel_shader = nullptr;
+        writer_shader = 0;
+        pixel_shader_known = false;
+        screen_slots.reset();
         rt0 = depth = 0;
+        rt_view = ds_view = {};
         rt_count = 0;
         depth_test = true;
+        depth_read_only = false;
+        for (auto& mask : depth_reads.slots) mask.reset();
+        depth_func = kCompareLess;
         std::memset(cb, 0, sizeof(cb));
         std::memset(cb_first, 0, sizeof(cb_first));
         std::memset(cb_num, 0, sizeof(cb_num));
@@ -187,17 +315,36 @@ struct ListRecord {
     std::vector<DeferredUpload> cb_bytes;
     std::vector<DeferredExact> draw_bytes;
     uint64_t order = 0;
+    uint64_t incarnation = 0;
+    bool complete = false;
 };
-// The view the scene used on a selected texture (typed format, subresource).
-struct ViewUse { uint32_t format = 0, mip = 0, slice = 0; };
 
 std::mutex g_install_mu;
 std::atomic<bool> g_installed{false};
 SceneCallback g_cb = nullptr;
 void* g_cb_user = nullptr;
+TrialReader g_trial_reader = nullptr;
+std::atomic<ParitySignal> g_parity_signal{nullptr}; // referee/parity-role-swap
 
 std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
+ScreenCheck g_screen;
+LitScene g_lit;
+referee::PlacementTrial g_placement{uint64_t{1} << 57};
+referee::StageRecovery g_recovery;
+bool ParitySeen(const void* swapchain, const referee::PlacementScope& scope)
+{
+    const auto seen = g_parity_signal.load(std::memory_order_relaxed);
+    return seen && seen(swapchain, scope);
+}
+referee::PlacementTrial::Scope LightingScope()
+{
+    return {g_lit.incarnations[0], g_lit.depth_incarnation, g_lit.generation, 0, 0, g_lit.incarnations[1]};
+}
+std::atomic<Id> g_lit_peer{0};
+uint64_t g_last_lit_generation = 0;
+std::atomic<bool> g_screen_enabled{false};
+std::atomic<bool> g_adaptive_scene{false}; // skip writer tagging on stable frames
 std::unordered_map<ID3D11DeviceContext*, std::unique_ptr<Ctx>> g_ctx;
 std::map<ID3D11CommandList*, ListRecord> g_lists;
 uint64_t g_list_order = 0;
@@ -252,6 +399,31 @@ float g_scene_vp_x = 0, g_scene_vp_y = 0, g_scene_vp_w = 0, g_scene_vp_h = 0; //
 uint32_t g_camera_first = 0, g_camera_num = 0; // exact bound range of the selected camera
 uint64_t g_stream = 0;                    // SceneFrame::stream; bumps when any input object changes
 uint64_t g_stream_key[4] = {};            // colour and depth lifetime ids, camera buffer id and its lifetime id (0 = untagged)
+uint64_t g_scene_stream = 0;              // SceneFrame::scene_stream; bumps when the colour or depth object changes, never for a camera
+uint64_t g_scene_key[2] = {};             // colour and depth lifetime ids
+// VARIANT: camera/optional
+// Whether a frame needs a camera to be handed over (input_provider.hpp CameraUse). Off: nothing
+// camera-related runs at all, on any thread, so it is read without g_mu.
+std::atomic<uint8_t> g_camera_use{static_cast<uint8_t>(CameraUse::Required)};
+std::atomic<bool> g_eval_paused{false}, g_camera_suspended{false};
+uint32_t g_camera_failures = 0, g_camera_retry_frames = 0;
+bool g_frame_delivered = false;
+bool g_frame_delivered_lit = false;
+constexpr uint32_t kCameraSearchBurst = 8, kCameraRetryFrames = 120;
+
+CameraUse CameraSetting()
+{
+    return static_cast<CameraUse>(g_camera_use.load(std::memory_order_relaxed));
+}
+bool CameraTracking()
+{
+    return !g_eval_paused.load(std::memory_order_relaxed) && !g_camera_suspended.load(std::memory_order_relaxed) &&
+           CameraSetting() != CameraUse::Off;
+}
+// VARIANT: depth/direction-from-depth-writes
+// Which end of the selected depth is near, from that depth's own scene writes (depth_direction.hpp).
+// Gathered on every frame, under g_mu; used when the frame has no camera to say it.
+DepthDirection g_depth_dir;
 
 CameraPick g_camera;
 // VARIANT: camera11/held
@@ -381,7 +553,7 @@ ResourceInfo InfoOf(ID3D11Resource* r, bool depth)
 }
 bool IsCandidate(Id id)
 {
-    if (!id) return false;
+    if (!id || !CameraTracking()) return false;
     if (g_collect_camera.load(std::memory_order_relaxed) ||
         g_split_candidate.load(std::memory_order_relaxed) == id) return true;
     for (auto& c : g_cand)
@@ -418,6 +590,8 @@ Ctx* Get(ID3D11DeviceContext* c)
             if (is && !was) g_ctx_became_game.fetch_add(1, std::memory_order_relaxed);
             // What was remembered belongs to the other device's objects.
             slot->reset_state();
+            slot->depth_reads = {};
+            slot->raster_queries = 0;
             slot->events.clear();
             slot->cb_bytes.clear();
             slot->mapped.clear();
@@ -445,6 +619,9 @@ using PFN_Draw = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using PFN_DrawIndexedInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
 using PFN_DrawInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
 using PFN_DrawIndirect = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+using PFN_DrawAuto = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*);
+using PFN_Dispatch = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT);
+using PFN_Query = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Asynchronous*);
 using PFN_Map = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
 using PFN_Unmap = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
 using PFN_OMSetRT = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
@@ -469,12 +646,18 @@ using PFN_Resize = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT
 struct Originals {
     PFN_VSSetCB vs_cb = nullptr, ps_cb = nullptr;
     PFN_VSSetCB1 vs_cb1 = nullptr, ps_cb1 = nullptr;
+    void (STDMETHODCALLTYPE *ps_shader)(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT) = nullptr;
+    void (STDMETHODCALLTYPE *clear_rtv)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT*) = nullptr;
     PFN_SetSRV ps_srv = nullptr, cs_srv = nullptr, vs_srv = nullptr;
     PFN_DrawIndexed draw_indexed = nullptr;
     PFN_Draw draw = nullptr;
     PFN_DrawIndexedInstanced draw_indexed_instanced = nullptr;
     PFN_DrawInstanced draw_instanced = nullptr;
     PFN_DrawIndirect draw_indexed_indirect = nullptr, draw_indirect = nullptr;
+    PFN_DrawAuto draw_auto = nullptr;
+    PFN_Dispatch dispatch = nullptr;
+    PFN_DrawIndirect dispatch_indirect = nullptr;
+    PFN_Query begin = nullptr, end = nullptr;
     PFN_Map map = nullptr;
     PFN_Unmap unmap = nullptr;
     PFN_OMSetRT om_rt = nullptr;
@@ -1002,7 +1185,8 @@ void DiagnoseCameraMiss()
 // before the list / HUD draw that holds it). Under g_mu (`lk`), on the immediate context's thread,
 // before the read is forwarded. g_mu is let go during the callback so the game's other threads never
 // wait behind it; the facts handed over are copies or references we hold.
-void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary)
+void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary, bool verified_reader = false,
+          ID3D11Resource* lit_color = nullptr, ViewUse lit_view = {}, uint64_t lit_proof = 0)
 {
     ++g_stats.fired;
     SetSceneHanded(true); // whatever the outcome below, the game's scene draws for this frame are over
@@ -1019,7 +1203,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         if (bound) bound->GetResource(&picture);
         if (picture && IdOf(picture.Get()) == sel.color) g_color_ref = picture;
     }
-    if (!g_color_ref || IdOf(g_color_ref.Get()) != sel.color || !g_depth_ref || IdOf(g_depth_ref.Get()) != sel.depth) {
+    if ((!lit_color && (!g_color_ref || IdOf(g_color_ref.Get()) != sel.color)) || !g_depth_ref || IdOf(g_depth_ref.Get()) != sel.depth) {
         ++g_stats.missed;
         return SetReason("The scene colour or depth is not held from a live game view yet.");
     }
@@ -1028,13 +1212,25 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     uint64_t version = 0;
     PoseCheck pose_check = PoseCheck::NoPacket;
     std::optional<CameraFacts::RelativePose> split_pose;
-    const bool found = CameraNow(&cam, &upload, &version, pose_check, split_pose);
-    CountPoseCheck(pose_check);
+    // VARIANT: camera/optional
+    // A camera is looked for exactly as before unless the host said never to (Off). What changes is
+    // what a frame without one means: Required, a miss (as before); Optional and Off, the frame is
+    // handed over all the same with camera_known = false, and nothing below reads a camera.
+    const auto use = CameraTracking() ? CameraSetting() : CameraUse::Off;
+    bool found = false;
+    if (use != CameraUse::Off) {
+        found = CameraNow(&cam, &upload, &version, pose_check, split_pose);
+        CountPoseCheck(pose_check);
+    }
     g_frame_fired = true;
     g_frame_found = found;
-    g_frame_no_bytes = !found && pose_check == PoseCheck::NoPacket;
+    g_frame_no_bytes = use != CameraUse::Off && !found && pose_check == PoseCheck::NoPacket;
     bool held = false;
-    if (!found) {
+    bool have_camera = found;
+    if (use == CameraUse::Off) {
+        g_held.valid = false;
+        ++g_stats.camera_off;
+    } else if (!found) {
         DiagnoseCameraMiss();
         // At most kHoldFrames in a row, and only for the same scene textures.
         if (!g_held.valid || g_frame <= g_held.frame || g_frame - g_held.frame > kHoldFrames ||
@@ -1042,25 +1238,29 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
             !HeldCameraUnreadable(g_held.cb, g_held.slot)) {
             g_held.valid = false;
             ++g_stats.camera_missing;
-            return SetReason("No supported camera was found in the scene's constant buffers.");
+            if (use == CameraUse::Required)
+                return SetReason("No supported camera was found in the scene's constant buffers.");
+            ++g_stats.camera_absent; // handed over without one
+        } else {
+            held = true;
+            have_camera = true;
+            ++g_stats.camera_held;
+            cam = g_held.cam;
+            upload = &g_held.upload;
+            version = g_held.version;
+            split_pose = g_held.split;
+            // The learned place stays learned: the next frame re-reads it first.
+            g_camera = cam;
+            g_model.SetCamera(g_held.cb, g_held.slot);
+            g_camera_first = g_held.first;
+            g_camera_num = g_held.num;
         }
-        held = true;
-        ++g_stats.camera_held;
-        cam = g_held.cam;
-        upload = &g_held.upload;
-        version = g_held.version;
-        split_pose = g_held.split;
-        // The learned place stays learned: the next frame re-reads it first.
-        g_camera = cam;
-        g_model.SetCamera(g_held.cb, g_held.slot);
-        g_camera_first = g_held.first;
-        g_camera_num = g_held.num;
     } else {
         ++g_stats.camera_found;
     }
     if (split_pose) ++g_stats.pose_split;
     const Selection cam_sel = g_model.Current(); // CameraNow may have just chosen (or changed) the camera buffer
-    {
+    if (have_camera) {
         // WHY log: one line whenever the kind of camera in use changes (which rule, which place in
         // the block, with or without a position), so a run that alternates between cameras shows it.
         static uint64_t last_signature = ~uint64_t{0};
@@ -1081,7 +1281,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
                                upload->windowed && upload->first_constant == g_camera_first ? 1 : 0);
         }
     }
-    if (!held) {
+    if (have_camera && !held) {
         g_held.valid = true;
         g_held.cam = cam;
         g_held.upload = *upload;
@@ -1096,6 +1296,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         g_held.frame = g_frame;
     }
     SceneFrame f;
+    f.presentation_source = g_swap;
     f.frame = g_frame;
     const auto texture = [](TextureFacts& t, ID3D11Resource* r, const ResourceInfo& info, const ViewUse& view) {
         const float vx = g_scene_vp_x, vy = g_scene_vp_y, vw = g_scene_vp_w, vh = g_scene_vp_h;
@@ -1119,40 +1320,95 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         t.active_h = vh >= 1.f ? std::min(mh - t.active_y, static_cast<uint32_t>(vh + 0.5f)) : mh - t.active_y;
     };
     // Our own references for the callback's duration (nothing another thread does can free them).
-    const ComPtr<ID3D11Resource> color = g_color_ref, depth = g_depth_ref;
-    texture(f.color, color.Get(), sel.color_info, g_color_view);
+    const ComPtr<ID3D11Resource> color(lit_color ? lit_color : g_color_ref.Get()), depth = g_depth_ref;
+    texture(f.color, color.Get(), sel.color_info, lit_color ? lit_view : g_color_view);
     texture(f.depth, depth.Get(), sel.depth_info, g_depth_view);
-    f.reversed_depth = cam.reversed;
-    std::vector<uint8_t> camera_bytes(*upload->bytes); // the callback runs without g_mu
-    f.camera.buffer = cam_sel.camera_cb;
-    f.camera.vs_slot = cam_sel.camera_slot >= 0 && cam_sel.camera_slot < kPsCbBase ? cam_sel.camera_slot : -1;
-    f.camera.ps_slot = cam_sel.camera_slot >= kPsCbBase ? cam_sel.camera_slot - kPsCbBase : -1;
-    f.camera.first_constant = g_camera_first;
-    f.camera.held = held;
-    f.camera.num_constants = g_camera_num;
-    f.camera.version = version;
-    f.camera.bytes_first_constant = upload->first_constant;
-    f.camera.split_pose = split_pose;
-    if (cam.derived_inverse) f.camera.no_inverse_pose = cam.vp;
-    f.camera.bytes = camera_bytes.data();
-    f.camera.size = static_cast<uint32_t>(camera_bytes.size());
+    {
+        // VARIANT: depth/direction-from-depth-writes
+        // Which end of the depth is near. The evidence of the depth's own writes is weighed on every
+        // frame; a frame with a camera keeps the camera's answer (as before), a frame without one
+        // uses what the writes have proven, and is not handed over while nothing is proven.
+        DepthVerdict verdict = DepthVerdict::NoWrites;
+        const DepthCompare proven = g_depth_dir.Decide(f.depth.incarnation, &verdict);
+        const DepthEvidence& ev = g_depth_dir.Last();
+        {
+            // WHY log: one line whenever the answer or the reason for it changes, with the evidence.
+            static uint64_t last_signature = ~uint64_t{0};
+            static uint32_t logged = 0;
+            const uint64_t signature = (f.depth.incarnation << 8) ^ (uint64_t(static_cast<int>(proven)) << 4) ^
+                                       uint64_t(static_cast<int>(verdict)) ^ (have_camera ? 0x80u : 0u) ^
+                                       (have_camera && cam.reversed ? 0x40u : 0u);
+            if (signature != last_signature && logged < 400) {
+                last_signature = signature;
+                ++logged;
+                na::eventlog::Emit("native11_depth",
+                                   "frame=%llu direction=%s verdict=%s writes{near_is_less=%u near_is_greater=%u equal=%u other=%u} "
+                                   "clears=%u clear=%.6g clear_mixed=%d flips=%llu camera=%s",
+                                   static_cast<unsigned long long>(g_frame),
+                                   proven == DepthCompare::NearIsLess ? "near_is_less" : proven == DepthCompare::NearIsGreater ? "near_is_greater" : "unproven",
+                                   DepthVerdictName(verdict), ev.less, ev.greater, ev.equal, ev.other, ev.clears, ev.clear,
+                                   ev.clear_mixed ? 1 : 0, static_cast<unsigned long long>(g_depth_dir.Flips()),
+                                   !have_camera ? "none" : cam.reversed ? "says_near_is_greater" : "says_near_is_less");
+            }
+        }
+        if (have_camera) {
+            f.reversed_depth = cam.reversed;
+            if (proven != DepthCompare::None && (proven == DepthCompare::NearIsGreater) != cam.reversed)
+                ++g_stats.depth_camera_disagrees;
+        } else if (proven == DepthCompare::None) {
+            ++g_stats.depth_unproven;
+            ++g_stats.missed;
+            static char why[192];
+            std::snprintf(why, sizeof why,
+                          "No camera, and the depth direction is not proven yet from the scene's own depth writes (%s: %u and %u writing draws either way, %u clears).",
+                          DepthVerdictName(verdict), ev.less, ev.greater, ev.clears);
+            return SetReason(why);
+        } else {
+            f.reversed_depth = proven == DepthCompare::NearIsGreater;
+        }
+    }
+    f.camera_known = have_camera;
+    std::vector<uint8_t> camera_bytes; // the callback runs without g_mu
+    if (have_camera) {
+        camera_bytes = *upload->bytes;
+        f.camera.buffer = cam_sel.camera_cb;
+        f.camera.vs_slot = cam_sel.camera_slot >= 0 && cam_sel.camera_slot < kPsCbBase ? cam_sel.camera_slot : -1;
+        f.camera.ps_slot = cam_sel.camera_slot >= kPsCbBase ? cam_sel.camera_slot - kPsCbBase : -1;
+        f.camera.first_constant = g_camera_first;
+        f.camera.held = held;
+        f.camera.num_constants = g_camera_num;
+        f.camera.version = version;
+        f.camera.bytes_first_constant = upload->first_constant;
+        f.camera.split_pose = split_pose;
+        if (cam.derived_inverse) f.camera.no_inverse_pose = cam.vp;
+        f.camera.bytes = camera_bytes.data();
+        f.camera.size = static_cast<uint32_t>(camera_bytes.size());
+    }
     const bool vpj_route = g_vpj_route.load(std::memory_order_relaxed);
     if (vpj_route && g_vpj_mixed) {
         ++g_vpj_mixed_frames;
         ++g_stats.missed;
         return SetReason("Scene draws used different viewport jitter samples or raster footprints.");
     }
-    f.camera.raster_jitter_qualified = vpj_route || (f.camera.vs_slot >= 0 && cam.raster_jitter_qualified);
-    f.camera.viewport_jitter = vpj_route;
-    f.camera.viewport_expanded = vpj_route && g_vpj_executed_expanded;
-    f.camera.jitter_applied = vpj_route ? g_vpj_executed_sample != 0 : (f.camera.raster_jitter_qualified && g_jitter_written);
+    // The raster sample is a fact about how the scene was drawn. Only the matrix route needs a camera
+    // (it writes the sample into one); the viewport route never does.
+    f.raster.viewport = vpj_route;
+    f.raster.qualified = vpj_route || (have_camera && f.camera.vs_slot >= 0 && cam.raster_jitter_qualified);
+    f.raster.expanded = vpj_route && g_vpj_executed_expanded;
+    f.raster.applied = vpj_route ? g_vpj_executed_sample != 0 : (f.raster.qualified && g_jitter_written);
     if (vpj_route) {
-        static_assert(sizeof(f.camera.jitter_px) == sizeof(g_vpj_executed_sample));
-        std::memcpy(f.camera.jitter_px, &g_vpj_executed_sample, sizeof(f.camera.jitter_px));
-    } else if (f.camera.jitter_applied) {
-        f.camera.jitter_px[0] = static_cast<float>(g_jitter.x_pixels);
-        f.camera.jitter_px[1] = static_cast<float>(g_jitter.y_pixels);
+        static_assert(sizeof(f.raster.jitter_px) == sizeof(g_vpj_executed_sample));
+        std::memcpy(f.raster.jitter_px, &g_vpj_executed_sample, sizeof(f.raster.jitter_px));
+    } else if (f.raster.applied) {
+        f.raster.jitter_px[0] = static_cast<float>(g_jitter.x_pixels);
+        f.raster.jitter_px[1] = static_cast<float>(g_jitter.y_pixels);
     }
+    // The same facts where the camera's readers have always found them.
+    f.camera.raster_jitter_qualified = f.raster.qualified;
+    f.camera.viewport_jitter = f.raster.viewport;
+    f.camera.viewport_expanded = f.raster.expanded;
+    f.camera.jitter_applied = f.raster.applied;
+    std::memcpy(f.camera.jitter_px, f.raster.jitter_px, sizeof(f.camera.jitter_px));
     {
         // WHY log: what the consumer is told the jitter was, beside what the scene draws carried.
         // The first frames of a session, then a burst of sixteen about every ten seconds, so one
@@ -1182,7 +1438,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         std::memcpy(&told, f.camera.jitter_px, sizeof told);
         g_vpj_told.store(told, std::memory_order_relaxed);
     }
-    {
+    if (have_camera) {
         // WHY log: the delivered camera's path. A camera read from one source moves smoothly; one
         // that hops between two sources steps back and forth.
         static bool have = false;
@@ -1209,29 +1465,65 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         }
     }
     f.boundary = boundary;
+    f.screen_proof = lit_color ? lit_proof : verified_reader ? g_screen.Proof() : 0;
+    if (g_trial_reader && g_screen_enabled.load(std::memory_order_relaxed)) {
+        const auto lighting = LightingScope();
+        const bool trial = g_placement.Matches(lighting);
+        if (trial && !g_placement.AllowsStageRecovery()) {
+            if (g_placement.UsesCandidate() == bool(lit_color)) f.trial_ticket = g_placement.Ticket(g_frame);
+        } else if (bool(lit_color) == trial) {
+            referee::StageRecovery::Scene scene{lit_color ? lighting.color : f.color.incarnation,
+                f.depth.incarnation, f.color.active_w, f.color.active_h,
+                f.color.mip, f.depth.mip, f.color.array_slice, f.depth.array_slice, f.color.active_x, f.color.active_y};
+            if (lit_color) scene.generation = lighting.generation;
+            g_recovery.SetScene(scene);
+            f.trial_ticket = g_recovery.Ticket(g_frame);
+            f.recovery_tool = g_recovery.ToolInUse();
+            f.recovery_configuration = g_recovery.Configuration();
+            if (lit_color) {
+                f.recovery_region = g_placement.RecoveryRegion();
+                f.recovery_floor = g_placement.RecoveryFloor();
+            }
+        }
+    }
     f.scene_draws = g_model.SceneDrawsThisFrame();
     // The camera buffer is only named by pointer here (it may be gone), so its lifetime id is the one
     // tagged when the game last uploaded to it.
     // A buffer selected before its first candidate upload has no tag yet: its first tag is not a change.
     uint64_t cam_inc = 0;
-    if (cam_sel.camera_cb) {
+    if (have_camera && cam_sel.camera_cb) {
         auto it = g_cb_incarnation.find(cam_sel.camera_cb);
         if (it != g_cb_incarnation.end()) cam_inc = it->second;
     }
+    // The scene's own identity (colour and depth objects). A camera buffer that changes, appears or
+    // goes is not a change of scene: it moves `stream` below, which only the camera's consumer reads.
+    const uint64_t lit_generation = lit_color ? g_lit.generation : 0;
+    const uint64_t history_color = lit_color ? 0 : f.color.incarnation;
+    f.scene_changed = !g_scene_stream || g_last_lit_generation != lit_generation ||
+                      history_color != g_scene_key[0] || f.depth.incarnation != g_scene_key[1];
+    g_last_lit_generation = lit_generation;
+    if (f.scene_changed) ++g_scene_stream;
+    g_scene_key[0] = history_color;
+    g_scene_key[1] = f.depth.incarnation;
+    f.scene_stream = g_scene_stream;
     // VARIANT: camera11/all-uploads-when-buffers-rotate
     // A game that binds a different buffer object every frame gives a new camera buffer on every
     // frame; that says nothing about the scene, and counting it as a change of inputs made DLSS
     // drop its history each frame (p40940: reset on 30 of 30 captured frames). A real cut is
     // still found from the camera's own path.
-    const bool camera_changed = !g_collect_all &&
+    // A frame handed over without a camera neither changes nor forgets the camera's key: the same
+    // camera buffer met again afterwards is not a change of inputs.
+    const bool camera_changed = have_camera && !g_collect_all &&
         (cam_sel.camera_cb != g_stream_key[2] || (cam_inc && g_stream_key[3] && cam_inc != g_stream_key[3]));
-    f.selection_changed = !g_stream || f.color.incarnation != g_stream_key[0] || f.depth.incarnation != g_stream_key[1] ||
+    f.selection_changed = !g_stream || f.scene_changed || history_color != g_stream_key[0] || f.depth.incarnation != g_stream_key[1] ||
                           camera_changed;
     if (f.selection_changed) ++g_stream;
-    g_stream_key[0] = f.color.incarnation;
+    g_stream_key[0] = history_color;
     g_stream_key[1] = f.depth.incarnation;
-    g_stream_key[2] = cam_sel.camera_cb;
-    if (cam_inc || f.selection_changed) g_stream_key[3] = cam_inc;
+    if (have_camera) {
+        g_stream_key[2] = cam_sel.camera_cb;
+        if (cam_inc || f.selection_changed) g_stream_key[3] = cam_inc;
+    }
     f.stream = g_stream;
     g_last_selection = cam_sel;
     const SceneCallback cb = g_cb;
@@ -1244,6 +1536,19 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     lk.lock();
     if (!ok) ++g_stats.missed;
+    else if (g_frame == f.frame) {
+        g_frame_delivered = true;
+        g_frame_delivered_lit = lit_proof != 0;
+        if (g_screen_enabled.load(std::memory_order_relaxed)) {
+            if (lit_proof) {
+                g_lit.screen.NoteDelivery(true, f.scene_draws);
+                const auto deliveries = g_lit.screen.Delivered();
+                if (deliveries <= 2 || (deliveries & (deliveries - 1)) == 0)
+                    na::eventlog::Emit("native11_lit_role", "frame=%llu role_deliveries=%llu scene_stream=%llu",
+                        (unsigned long long)f.frame, (unsigned long long)deliveries, (unsigned long long)f.scene_stream);
+            } else g_screen.NoteDelivery(verified_reader, f.scene_draws);
+        }
+    }
 }
 
 CameraUpload CaptureUpload(const void* data, size_t size, uint32_t first_constant, bool windowed)
@@ -1287,7 +1592,7 @@ void RememberSplitDraw(const Event& e, int ws, int ps, const CameraUpload& world
 // or a different binding in the same ring cannot erase this draw's evidence.
 void RememberSceneUploads(const Event& e, const std::vector<ExactRange>* exact = nullptr)
 {
-    if (e.kind != Kind::Draw || !g_model.IsSceneDraw(e)) return;
+    if (e.kind != Kind::Draw || !CameraTracking() || !g_model.IsSceneDraw(e)) return;
     // Ranges read at this very draw stand for the draw's own upload version.
     std::array<CameraUpload, kCbBindSlots> exact_upload;
     if (exact) {
@@ -1360,12 +1665,65 @@ void NoteViewportDraw(const Event& e)
     if (e.viewport_sample) ++g_vpj_frame_draws;
 }
 
+// Depth direction evidence (depth_direction.hpp), in immediate draw order and while replaying
+// executed command lists, under g_mu: writes into the selected depth and its clears. Draws after
+// the scene was handed over are the HUD's and are not evidence about the scene.
+void NoteDepthDirection(const Event& e)
+{
+    const Id depth = g_model.Current().depth;
+    if (!depth) return;
+    if (e.kind == Kind::Draw) {
+        if (e.depth == depth && e.depth_func && !g_frame_fired) g_depth_dir.NoteWrite(e.depth_func);
+    } else if (e.kind == Kind::ClearDepth && e.resource == depth && !g_frame_fired) {
+        g_depth_dir.NoteClear(e.clear_depth);
+    }
+}
+
 // ---------------------------------------------------------------- events
 void StopViewportJitterAfterScene();
-void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {}, const ExactSet& exact = {})
+void TrackPlacementWrite(const Event& e, const Ctx* live = nullptr)
+{
+    if (e.kind == Kind::Draw && g_lit.Learned() && g_lit.Peer(e.rt0)) {
+        auto& view = g_lit.written[e.rt0 == g_lit.members[1]];
+        view = {};
+        if (live && e.depth == g_lit.depth && !live->rt_view.mip && !live->rt_view.slice &&
+            live->vp_n == 1 && live->vp_x == 0.f && live->vp_y == 0.f &&
+            live->vp_w > 0.f && live->vp_h > 0.f) {
+            view = {UINT(live->vp_w), UINT(live->vp_h), live->rt_view.format,
+                    live->ds_view.format, live->ds_view.mip, live->ds_view.slice};
+        }
+    }
+    // The lighting read has already been admitted with live, intact depth.
+    // Clearing depth in a later pass cannot change the color it read.
+    if (g_lit.observed_member &&
+        ((e.kind == Kind::Draw && g_lit.Peer(e.rt0)) || (e.kind == Kind::ColorWrite && g_lit.Peer(e.resource)))) {
+        g_lit.screen.Write(0);
+        const auto index = g_lit.observed_member == g_lit.members[1];
+        if (g_lit.observed_proven) g_lit.Revoke(g_lit.proofs[index], g_frame);
+        g_lit.observed_member = g_lit.observed_write = 0;
+    }
+    if (!g_screen.Adaptive() || !g_screen_enabled.load(std::memory_order_relaxed)) return;
+    const auto& scene = g_model.Current();
+    if (!scene.valid()) return;
+    if (e.kind == Kind::Draw && (e.rt0 == scene.color || g_model.IsSceneDraw(e))) {
+        // A depth/blend variant of the same shader can occupy another pass.
+        const uint64_t writer = e.placement_writer ? (e.placement_writer << 8) |
+            (uint64_t(e.depth_test) << 7) | (uint64_t(e.depth_func) << 3) | std::min<uint8_t>(7, e.rt_count) : 0;
+        g_screen.Write(writer);
+    } else if ((e.kind == Kind::ColorWrite && e.resource == scene.color) ||
+               (e.kind == Kind::ClearDepth && e.resource == scene.depth)) {
+        g_screen.Write(0);
+    }
+}
+
+void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads = {}, const ExactSet& exact = {},
+          bool pixel_read = false)
 {
     if (x->deferred) {
-        if (x->events.size() >= kMaxListEvents) return;
+        if (x->events.size() >= kMaxListEvents) {
+            x->events_truncated = true;
+            return;
+        }
         x->events.push_back(e);
         if (e.kind == Kind::Draw && (exact.get() != x->exact_recorded || !x->exact_recorded_any) &&
             (exact || x->exact_recorded)) {
@@ -1378,18 +1736,34 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
         return;
     }
     std::unique_lock<std::mutex> l(g_mu);
-    if (e.kind == Kind::Read && g_model.ShouldFireBeforeRead(e.resource)) {
+    const auto& scene = g_model.Current();
+    // VARIANT: point/native11-screen-verified
+    const bool screen_enabled = g_screen_enabled.load(std::memory_order_relaxed);
+    const bool screen_verified = pixel_read && screen_enabled && g_screen.Verified(scene.color, scene.depth);
+    // Let discovery run alongside normal delivery until a proven reader can
+    // take its place. A search with no suitable reader must not claim the frame.
+    // VARIANT: point/native11-adaptive-reader
+    const bool adaptive_read = pixel_read && screen_enabled && g_screen.ReservesPixelRead() &&
+        scene.color != g_backbuffer && scene.color_info.samples == 1;
+    const auto reserve_lit = [&] { return screen_enabled && g_lit.steer && g_lit.Predicted(g_model); };
+    if (e.kind == Kind::Read && !screen_verified && !adaptive_read && g_model.ShouldFireBeforeRead(e.resource) && !reserve_lit()) {
+        if (pixel_read && screen_enabled) {
+            g_screen.SetScene(scene.color, scene.depth);
+            g_screen.NoteOrdinalPixel(g_model.SceneDrawsThisFrame());
+        }
         g_model.MarkFired();
         Fire(c, l, Boundary::BeforeRead);
         StopViewportJitterAfterScene();
-    } else if (e.kind == Kind::Draw && g_model.ShouldFireBeforeDraw(e)) {
+    } else if (e.kind == Kind::Draw && g_model.ShouldFireBeforeDraw(e) && !reserve_lit()) {
         g_model.MarkFired();
         Fire(c, l, Boundary::BeforeHud);
         StopViewportJitterAfterScene();
     }
+    TrackPlacementWrite(e, x);
     const uint32_t v = g_model.Feed(e);
     RememberSceneUploads(e, exact.get());
     NoteViewportDraw(e);
+    NoteDepthDirection(e);
     if (e.kind == Kind::CbUpdate && uploads.primary.bytes)
         SaveCameraUpload(e.resource, v, std::move(uploads));
 }
@@ -1534,10 +1908,10 @@ ExactSet ExactForDraw(ID3D11DeviceContext* c, Ctx* x)
     return x->exact_set;
 }
 
-void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
+Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
 {
     Ctx* x = Get(c);
-    if (!x) return;
+    if (!x) return nullptr;
     VpjBeforeDraw(c, x);
     const auto refresh_samplers = [&] {
         const uint64_t policy = SamplerPolicyKey();
@@ -1559,18 +1933,36 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.rt_count = x->rt_count;
     e.depth = x->depth;
     e.depth_test = x->depth_test;
+    e.depth_func = x->depth_read_only ? 0 : x->depth_func;
     e.vertices = vertices;
     e.indirect = indirect;
     e.viewport_sample = x->vpj_applied ? x->vpj_sample : 0;
     e.viewport_expanded = x->vpj_applied && x->vpj_expanded;
-    std::memcpy(e.cb, x->cb, sizeof(e.cb));
-    for (int i = 0; i < kCbBindSlots; ++i) {
-        e.cb_first[i] = static_cast<uint16_t>(x->cb_first[i]);
-        e.cb_count[i] = static_cast<uint16_t>(x->cb_num[i]);
+    const bool camera_tracking = CameraTracking();
+    if (camera_tracking) {
+        std::memcpy(e.cb, x->cb, sizeof(e.cb));
+        for (int i = 0; i < kCbBindSlots; ++i) {
+            e.cb_first[i] = static_cast<uint16_t>(x->cb_first[i]);
+            e.cb_count[i] = static_cast<uint16_t>(x->cb_num[i]);
+        }
     }
     const bool picture_draw = e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed);
     const bool layer_draw = e.depth_test && e.rt0 && e.rt0 == g_sel_layer.load(std::memory_order_relaxed) &&
                             e.depth == g_sel_depth.load(std::memory_order_relaxed);
+    if ((picture_draw || layer_draw) && g_adaptive_scene.load(std::memory_order_relaxed)) {
+        if (!x->pixel_shader_known) {
+            Inside in;
+            ComPtr<ID3D11PixelShader> shader;
+            c->PSGetShader(&shader, nullptr, nullptr);
+            x->pixel_shader = shader.Get();
+            x->pixel_shader_known = true;
+        }
+        if (!x->writer_shader && x->pixel_shader) {
+            Inside in;
+            x->writer_shader = IncarnationOf(x->pixel_shader);
+        }
+        e.placement_writer = x->writer_shader;
+    }
     if (!x->deferred && (picture_draw || layer_draw)) {
         // Scene-draw facts the frame model does not keep: viewport extent and the camera's offset binding.
         std::lock_guard<std::mutex> l(g_mu);
@@ -1583,9 +1975,10 @@ void DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         }
     }
     ExactSet exact;
-    if (picture_draw || layer_draw) exact = ExactForDraw(c, x);
+    if ((picture_draw || layer_draw) && camera_tracking) exact = ExactForDraw(c, x); // camera bytes: not read when no camera is looked for
     Emit(x, c, e, {}, exact);
     if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
+    return x;
 }
 // The scene colour first met through a read, before any bind as a render target: its view as read.
 ViewUse SrvUse(ID3D11ShaderResourceView* v)
@@ -1609,21 +2002,36 @@ bool Watched(Id r, Id color)
         if (w.load(std::memory_order_relaxed) == r) return true;
     return false;
 }
-void ReadEvents(ID3D11DeviceContext* c, UINT n, ID3D11ShaderResourceView* const* views)
+void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID3D11ShaderResourceView* const* views)
 {
     Ctx* x = Get(c);
-    if (!x || !views) return;
+    if (!x) return;
+    auto& depth_slots = x->depth_reads.slots[static_cast<size_t>(stage)];
+    const bool track_depth = !x->deferred && g_depth_reads_enabled.load(std::memory_order_relaxed);
+    const bool screen = !x->deferred && stage == DepthStage::Pixel && g_screen_enabled.load(std::memory_order_relaxed);
+    if (!track_depth && !views && !screen) return;
+    const Id depth = track_depth ? g_sel_depth.load(std::memory_order_relaxed) : 0;
     const Id color = g_sel_color.load(std::memory_order_relaxed);
-    if (!color && !g_watch[0].load(std::memory_order_relaxed)) return;
+    const Id peer = screen ? g_lit_peer.load(std::memory_order_relaxed) : 0;
+    if (screen && (x->screen_color != color || x->screen_peer != peer)) {
+        x->screen_color = color;
+        x->screen_peer = peer;
+        x->screen_slots.reset();
+    }
+    if (!depth && !color && !g_watch[0].load(std::memory_order_relaxed)) return;
     Id sent[kWatch + 1] = {};
     size_t sent_n = 0;
     for (UINT i = 0; i < n; ++i) {
-        if (!views[i]) continue;
         Id r = 0;
-        {
+        if (views && views[i]) {
             Inside in;
             r = ResourceOfView(views[i]);
         }
+        if (screen && start < x->screen_slots.size() && i < x->screen_slots.size() - start)
+            x->screen_slots.set(start + i, r && (r == color || r == peer));
+        if (track_depth && start < kDepthSlots && i < kDepthSlots - start)
+            depth_slots.set(start + i, r && r == depth);
+        if (!r || sent_n == kWatch + 1) continue;
         if (!Watched(r, color)) continue;
         bool again = false;
         for (size_t k = 0; k < sent_n; ++k) again = again || sent[k] == r;
@@ -1642,9 +2050,9 @@ void ReadEvents(ID3D11DeviceContext* c, UINT n, ID3D11ShaderResourceView* const*
         Event e;
         e.kind = Kind::Read;
         e.resource = r;
-        Emit(x, c, e);
+        Emit(x, c, e, {}, {}, stage == DepthStage::Pixel);
         if (sent_n < kWatch + 1) sent[sent_n++] = r;
-        if (sent_n == kWatch + 1) return;
+        if (sent_n == kWatch + 1 && !track_depth && !screen) return;
     }
 }
 void ReadResource(ID3D11DeviceContext* c, ID3D11Resource* src)
@@ -1716,6 +2124,7 @@ bool JitterUpload(void* bytes, size_t size, Id cb)
     {
         std::lock_guard<std::mutex> l(g_mu);
         if (g_vpj_route.load(std::memory_order_relaxed)) return false; // jitter goes through the viewports; never both
+        if (!CameraTracking()) return false;
         const auto& selection = g_model.Current();
         // A PS-only pose can reconstruct camera motion. Rewriting it cannot
         // move the scene's raster samples and must not be reported as jitter.
@@ -1806,9 +2215,21 @@ void STDMETHODCALLTYPE PSSetConstantBuffers1_d(ID3D11DeviceContext1* c, UINT sta
     NoteCbs(x, kPsCbBase, start, n, b, first, num);
     O(c, x).ps_cb1(c, start, n, b, first, num);
 }
+void STDMETHODCALLTYPE PSSetShader_d(ID3D11DeviceContext* c, ID3D11PixelShader* shader,
+                                     ID3D11ClassInstance* const* instances, UINT count)
+{
+    Ctx* x = Get(c);
+    if (x && (!x->pixel_shader_known || x->pixel_shader != shader)) {
+        x->pixel_shader = shader;
+        x->pixel_shader_known = true;
+        x->writer_shader = 0;
+    }
+    O(c, x).ps_shader(c, shader, instances, count);
+}
+
 void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
-    ReadEvents(c, n, v);
+    ReadEvents(c, DepthStage::Pixel, start, n, v);
     // Material textures: a published replacement is bound in place of the game's view (textures.hpp).
     ID3D11ShaderResourceView* swapped[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
     Ctx* x = Get(c); // null inside our own work and on other devices' contexts: bound as given
@@ -1818,49 +2239,395 @@ void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start
 }
 void STDMETHODCALLTYPE CSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
-    ReadEvents(c, n, v);
+    ReadEvents(c, DepthStage::Compute, start, n, v);
     O(c, t_inside ? nullptr : Get(c)).cs_srv(c, start, n, v);
 }
 void STDMETHODCALLTYPE VSSetShaderResources_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11ShaderResourceView* const* v)
 {
-    ReadEvents(c, n, v);
+    ReadEvents(c, DepthStage::Vertex, start, n, v);
     O(c, t_inside ? nullptr : Get(c)).vs_srv(c, start, n, v);
+}
+Id DepthReadsSource(Ctx* state)
+{
+    return state && !state->deferred && g_depth_reads_enabled.load(std::memory_order_relaxed) &&
+        g_vpj_route.load(std::memory_order_relaxed) ? g_sel_depth.load(std::memory_order_relaxed) : 0;
+}
+
+bool CountsRasterWork(ID3D11Asynchronous* object)
+{
+    ComPtr<ID3D11Query> query;
+    if (!object || FAILED(object->QueryInterface(IID_PPV_ARGS(&query)))) return false;
+    D3D11_QUERY_DESC desc{};
+    query->GetDesc(&desc);
+    return desc.Query == D3D11_QUERY_OCCLUSION || desc.Query == D3D11_QUERY_OCCLUSION_PREDICATE ||
+           desc.Query == D3D11_QUERY_PIPELINE_STATISTICS;
+}
+
+void STDMETHODCALLTYPE Begin_d(ID3D11DeviceContext* c, ID3D11Asynchronous* object)
+{
+    Ctx* x = Get(c);
+    if (x && !x->deferred && CountsRasterWork(object)) ++x->raster_queries;
+    O(c, x).begin(c, object);
+}
+
+void STDMETHODCALLTYPE End_d(ID3D11DeviceContext* c, ID3D11Asynchronous* object)
+{
+    Ctx* x = Get(c);
+    O(c, x).end(c, object);
+    if (x && x->raster_queries && CountsRasterWork(object)) --x->raster_queries;
+}
+
+class DepthBindings {
+public:
+    DepthBindings(ID3D11DeviceContext* context, Ctx* state, Id depth, bool compute)
+        : context_(context), state_(state)
+    {
+        if (!depth || (state->depth == depth && !state->depth_read_only)) return;
+        auto& reads = state->depth_reads;
+        reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+        Inside own;
+        if (compute) Bind(DepthStage::Compute);
+        else {
+            Bind(DepthStage::Pixel);
+            Bind(DepthStage::Vertex);
+        }
+    }
+    ~DepthBindings()
+    {
+        if (!count_) return;
+        Inside own;
+        while (count_) {
+            const auto& saved = slots_[--count_];
+            Set(saved.stage, saved.slot, saved.view);
+            saved.view->Release();
+        }
+    }
+    DepthBindings(const DepthBindings&) = delete;
+    DepthBindings& operator=(const DepthBindings&) = delete;
+
+private:
+    void Set(DepthStage stage, UINT slot, ID3D11ShaderResourceView* view)
+    {
+        const auto& original = O(context_, state_);
+        const auto set = stage == DepthStage::Pixel ? original.ps_srv :
+                         stage == DepthStage::Vertex ? original.vs_srv : original.cs_srv;
+        set(context_, slot, 1, &view);
+    }
+    void Bind(DepthStage stage)
+    {
+        auto& reads = state_->depth_reads;
+        const auto& mask = reads.slots[static_cast<size_t>(stage)];
+        if (mask.none()) return;
+        uint64_t shader = 0;
+        for (UINT slot = 0; slot < kDepthSlots; ++slot) {
+            if (!mask.test(slot)) continue;
+            ComPtr<ID3D11ShaderResourceView> original;
+            if (stage == DepthStage::Pixel) context_->PSGetShaderResources(slot, 1, &original);
+            else if (stage == DepthStage::Vertex) context_->VSGetShaderResources(slot, 1, &original);
+            else context_->CSGetShaderResources(slot, 1, &original);
+            if (!original) continue;
+            D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+            original->GetDesc(&view);
+            if (view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || view.Texture2D.MostDetailedMip != 0 ||
+                (view.Texture2D.MipLevels != 1 && view.Texture2D.MipLevels != UINT(-1)) ||
+                (view.Format != DXGI_FORMAT_R32_FLOAT && view.Format != DXGI_FORMAT_R16_UNORM &&
+                 view.Format != DXGI_FORMAT_R24_UNORM_X8_TYPELESS && view.Format != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS))
+                continue;
+            ComPtr<ID3D11Resource> resource;
+            original->GetResource(&resource);
+            if (IdOf(resource.Get()) != reads.resource) continue;
+            if (!shader) {
+                if (stage == DepthStage::Pixel) {
+                    ComPtr<ID3D11PixelShader> current;
+                    context_->PSGetShader(&current, nullptr, nullptr);
+                    shader = IncarnationOf(current.Get());
+                } else if (stage == DepthStage::Vertex) {
+                    ComPtr<ID3D11VertexShader> current;
+                    context_->VSGetShader(&current, nullptr, nullptr);
+                    shader = IncarnationOf(current.Get());
+                } else {
+                    ComPtr<ID3D11ComputeShader> current;
+                    context_->CSGetShader(&current, nullptr, nullptr);
+                    shader = IncarnationOf(current.Get());
+                }
+                if (!shader) return;
+            }
+            const uint64_t key = (shader << 11) | (uint64_t(stage) << 9) |
+                (uint64_t(state_->depth == reads.resource) << 8) | slot;
+            if (!reads.Refresh(context_, resource.Get(), key, state_->raster_queries != 0)) continue;
+            if (auto* twin = reads.twin->ViewFor(original.Get())) {
+                Set(stage, slot, twin);
+                slots_[count_++] = {stage, slot, original.Detach()};
+            }
+        }
+    }
+    struct Slot { DepthStage stage; UINT slot; ID3D11ShaderResourceView* view; };
+    ID3D11DeviceContext* context_;
+    Ctx* state_;
+    Slot slots_[kDepthSlots * 2];
+    size_t count_ = 0;
+};
+
+template<class Forward>
+void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, Forward forward)
+{
+    const Id depth = DepthReadsSource(state);
+    if (!depth) { forward(); return; }
+    auto& reads = state->depth_reads;
+    const bool has_binding = dispatch ? reads.slots[static_cast<size_t>(DepthStage::Compute)].any() :
+        (reads.slots[static_cast<size_t>(DepthStage::Pixel)] | reads.slots[static_cast<size_t>(DepthStage::Vertex)]).any();
+    if (has_binding && (state->depth != depth || state->depth_read_only)) {
+        DepthBindings bindings(context, state, depth, dispatch);
+        forward();
+    } else forward();
+    if (!dispatch && state->depth == depth && !state->depth_read_only && state->depth_func) {
+        reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+        const auto width = g_sel_depth_w.load(std::memory_order_relaxed);
+        const auto height = g_sel_depth_h.load(std::memory_order_relaxed);
+        const auto valid = [](float dimension, UINT target) {
+            return target && dimension >= float(target) * .98f && dimension <= float(target) &&
+                dimension == float(static_cast<UINT>(dimension));
+        };
+        const bool picture = state->vp_n == 1 && state->vp_x == 0.f && state->vp_y == 0.f &&
+            valid(state->vp_w, width) && valid(state->vp_h, height);
+        reads.Write(state->vpj_applied ? state->vpj_sample : 0, state->vpj_applied && state->vpj_expanded,
+                    picture ? static_cast<UINT>(state->vp_w) : 0, picture ? static_cast<UINT>(state->vp_h) : 0);
+    }
+}
+
+ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
+{
+    if (!x || x->deferred || x->rt_count != 1 || !x->rt0 || (x->depth && x->depth_test) ||
+        x->screen_slots.none() || x->vp_n != 1 || x->vp_x != 0.f || x->vp_y != 0.f ||
+        !g_screen_enabled.load(std::memory_order_relaxed)) return {};
+
+    std::unique_lock<std::mutex> lock(g_mu);
+    const auto& scene = g_model.Current();
+    const auto draws = g_model.SceneDrawsThisFrame();
+    const bool inspect = g_screen.MayInspect();
+    const Id lit = g_lit.Predicted(g_model);
+    const uint64_t lit_write = lit ? g_model.LitWrite(g_lit.Peer(lit), lit) : 0;
+    const bool missed_ordinal = !g_model.FiredThisFrame() && g_model.LearnedPointKind() == 1 &&
+        !g_screen.Adaptive() && !g_screen.Verified(scene.color, scene.depth);
+    if ((!inspect && !missed_ordinal && !lit_write) || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
+        scene.color == g_backbuffer || !g_swap || x->raster_queries ||
+        IdOf(g_color_ref.Get()) != scene.color || g_color_view.mip || g_color_view.slice) return {};
+    ResourceInfo output{};
+    // A compositor may draw the active picture into an alignment-padded target.
+    // Qualify that reader by its on-screen pixels, with a bounded extent check.
+    const auto close_extent = [](uint32_t a, uint32_t b) {
+        return a && b && uint64_t((std::min)(a, b)) * 100 >= uint64_t((std::max)(a, b)) * 98;
+    };
+    if (!g_model.InfoOf(x->rt0, output) || !close_extent(output.width, scene.color_info.width) ||
+        !close_extent(output.height, scene.color_info.height) || output.samples != 1 || scene.color_info.samples != 1) return {};
+    const auto covers_picture = [](float viewport, uint32_t extent) {
+        // Alignment padding can leave a few unused rows in a full-size texture.
+        // The exact presented pixels still qualify the reader.
+        return viewport <= float(extent) && viewport >= .98f * float(extent);
+    };
+    if (!covers_picture(x->vp_w, output.width) || !covers_picture(x->vp_h, output.height)) return {};
+
+    Inside own;
+    ComPtr<ID3D11Predicate> predicate;
+    BOOL predicate_value = FALSE;
+    c->GetPredication(&predicate, &predicate_value);
+    if (predicate) return {};
+    ComPtr<ID3D11PixelShader> shader;
+    c->PSGetShader(&shader, nullptr, nullptr);
+    if (!shader) return {};
+    ComPtr<ID3D11RenderTargetView> target;
+    c->OMGetRenderTargets(1, &target, nullptr);
+    if (!target) return {};
+    D3D11_RENDER_TARGET_VIEW_DESC target_view{};
+    target->GetDesc(&target_view);
+    if (target_view.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || target_view.Texture2D.MipSlice) return {};
+    ComPtr<ID3D11Resource> destination;
+    target->GetResource(&destination);
+    if (IdOf(destination.Get()) != x->rt0) return {};
+    for (UINT slot = 0; slot < x->screen_slots.size(); ++slot) {
+        if (!x->screen_slots.test(slot)) continue;
+        ComPtr<ID3D11ShaderResourceView> view;
+        c->PSGetShaderResources(slot, 1, &view); // the runtime may have automatically unbound it
+        if (!view) continue;
+        const Id bound = ResourceOfView(view.Get());
+        if (bound != scene.color && bound != lit) continue;
+        D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+        view->GetDesc(&desc);
+        if (desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || desc.Texture2D.MostDetailedMip) continue;
+        if (lit_write && bound == lit && !g_lit.Peer(x->rt0) && IdOf(g_depth_ref.Get()) == g_lit.depth &&
+            g_color_view.format == static_cast<uint32_t>(desc.Format) &&
+            x->vp_w == g_scene_vp_w && x->vp_h == g_scene_vp_h && !g_scene_vp_x && !g_scene_vp_y) {
+            ComPtr<ID3D11Resource> source;
+            view->GetResource(&source);
+            ComPtr<ID3D11Texture2D> texture;
+            if (FAILED(source.As(&texture))) continue;
+            D3D11_TEXTURE2D_DESC td{};
+            texture->GetDesc(&td);
+            if (td.MipLevels != 1 || td.ArraySize != 1 || td.SampleDesc.Count != 1) continue;
+            ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format),
+                                       IncarnationOf(source.Get()), IncarnationOf(g_depth_ref.Get())};
+            if (!g_lit.ObserveView(lit == g_lit.members[1], reader.color, reader.depth,
+                    {UINT(x->vp_w), UINT(x->vp_h), UINT(desc.Format), g_depth_view.format, g_depth_view.mip, g_depth_view.slice}))
+                continue;
+            auto& probe = g_lit.screen;
+            if (probe.Select(reader, true)) {
+                const auto member = lit == g_lit.members[1];
+                static unsigned logged_readers = 0;
+                if (g_lit.proofs[member] != probe.Proof() && logged_readers < 32) {
+                    ++logged_readers;
+                    na::eventlog::Emit("native11_lit_role",
+                        "frame=%llu draw_event=%llu proof=%llu source=%03x destination=%03x shader=%llu slot=%u",
+                        (unsigned long long)g_frame, (unsigned long long)g_model.FrameEventCount(),
+                        (unsigned long long)probe.Proof(), unsigned((lit >> 4) & 0xfff),
+                        unsigned((x->rt0 >> 4) & 0xfff), (unsigned long long)reader.shader, reader.slot);
+                }
+                g_lit.proofs[member] = probe.Proof();
+                g_lit.observed_member = lit;
+                g_lit.observed_write = lit_write;
+                g_lit.observed_proven = true;
+                if (g_lit.steer && !g_model.FiredThisFrame()) {
+                    g_model.MarkFired();
+                    Fire(c, lock, Boundary::BeforeRead, false, source.Get(), SrvUse(view.Get()), probe.Proof());
+                    StopViewportJitterAfterScene();
+                    g_lit.observed_proven = g_frame_delivered;
+                }
+                if (g_lit.steer) return {};
+            } else if (!g_screen.AwaitingSamples()) {
+                auto mark = probe.Begin(c, reader, texture.Get(), desc.Format, g_frame, draws);
+                if (mark.source) {
+                    g_lit.observed_member = lit;
+                    g_lit.observed_write = lit_write;
+                    g_lit.observed_proven = false;
+                    return mark;
+                }
+            }
+        }
+        if (bound != scene.color || (!inspect && !missed_ordinal) || (lit && g_lit.steer)) continue;
+        g_screen.SetScene(scene.color, scene.depth);
+        if (missed_ordinal) g_screen.NoteActualPixel(draws);
+        if (!inspect) return {};
+        ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format)};
+        if (g_screen.Adaptive()) {
+            reader.color = IncarnationOf(g_color_ref.Get());
+            if (IdOf(g_depth_ref.Get()) != scene.depth) return {};
+            reader.depth = IncarnationOf(g_depth_ref.Get());
+            if (!g_screen.Learn(reader, output.width, output.height)) return {};
+            if (!g_screen.Select(reader, !g_model.FiredThisFrame())) {
+                ComPtr<ID3D11Texture2D> source;
+                if (FAILED(g_color_ref.As(&source))) return {};
+                if (!g_lit.screen.AwaitingSamples()) return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+                continue;
+            }
+            if (g_model.FiredThisFrame()) return {}; // witness the route without evaluating twice
+            g_model.MarkFired();
+            Fire(c, lock, Boundary::BeforeRead, true);
+            StopViewportJitterAfterScene();
+            return {};
+        }
+        if (g_screen.Verified(scene.color, scene.depth)) {
+            if (!g_screen.Matches(reader) || g_model.FiredThisFrame()) return {};
+            g_model.MarkFired();
+            Fire(c, lock, Boundary::BeforeRead, true);
+            StopViewportJitterAfterScene();
+            return {};
+        }
+        ComPtr<ID3D11Texture2D> source;
+        if (FAILED(g_color_ref.As(&source))) return {};
+        if (!g_lit.screen.AwaitingSamples()) return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+    }
+    return {};
+}
+
+template<class Forward>
+void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
+{
+    const auto mark = CheckScreenReader(c, state);
+    // The draw event or this reader can complete the scene before the
+    // same draw is forwarded. Restore it on that draw, not one draw later.
+    if (state && !state->deferred && state->vpj_applied && !g_vpj_sample.load(std::memory_order_acquire))
+        VpjBeforeDraw(c, state);
+    ForwardDepthRead(c, state, false, forward);
+    if (mark.source) {
+        Inside own;
+        ScreenCheck::Restore(c, mark);
+    }
+}
+
+// Draw replay (draw_replay.hpp): after the game's draw has run, a qualifying scene draw on the
+// immediate context is drawn again with stream output into this frame's position buffer.
+void ReplayAfterDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs& a)
+{
+    if (!x || !draw_replay::Active()) return;
+    draw_replay::DrawFacts f;
+    f.frame = g_frame;
+    f.deferred = x->deferred;
+    const Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
+    f.scene_depth = scene_depth && x->depth == scene_depth && x->depth_test;
+    f.depth_read_only = x->depth_read_only;
+    f.query_active = x->raster_queries != 0;
+    const auto& vp = x->vps[0];
+    const float viewport[]{vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, vp.MinDepth, vp.MaxDepth};
+    f.viewport = viewport;
+    f.viewports = x->vp_n;
+    draw_replay::AfterDraw(c, f, a);
 }
 void STDMETHODCALLTYPE DrawIndexed_d(ID3D11DeviceContext* c, UINT count, UINT start, INT base)
 {
-    DrawEvent(c, count, false);
-    O(c, t_inside ? nullptr : Get(c)).draw_indexed(c, count, start, base);
+    Ctx* x = DrawEvent(c, count, false);
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed(c, count, start, base); });
+    ReplayAfterDraw(c, x, {true, false, count, 1, start, 0, base});
 }
 void STDMETHODCALLTYPE Draw_d(ID3D11DeviceContext* c, UINT count, UINT start)
 {
-    DrawEvent(c, count, false);
-    O(c, t_inside ? nullptr : Get(c)).draw(c, count, start);
+    Ctx* x = DrawEvent(c, count, false);
+    ForwardGameDraw(c, x, [&] { O(c, x).draw(c, count, start); });
+    ReplayAfterDraw(c, x, {false, false, count, 1, start, 0, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
 {
-    DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
-    O(c, t_inside ? nullptr : Get(c)).draw_indexed_instanced(c, count, inst, start, base, start_inst);
+    Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
+    if (inst) ReplayAfterDraw(c, x, {true, false, count, inst, start, start_inst, base});
 }
 void STDMETHODCALLTYPE DrawInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, UINT start_inst)
 {
-    DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
-    O(c, t_inside ? nullptr : Get(c)).draw_instanced(c, count, inst, start, start_inst);
+    Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_instanced(c, count, inst, start, start_inst); });
+    if (inst) ReplayAfterDraw(c, x, {false, false, count, inst, start, start_inst, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
-    DrawEvent(c, 0, true);
-    O(c, t_inside ? nullptr : Get(c)).draw_indexed_indirect(c, b, off);
+    Ctx* x = DrawEvent(c, 0, true);
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_indirect(c, b, off); });
+    ReplayAfterDraw(c, x, {true, true});
 }
 void STDMETHODCALLTYPE DrawInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
-    DrawEvent(c, 0, true);
-    O(c, t_inside ? nullptr : Get(c)).draw_indirect(c, b, off);
+    Ctx* x = DrawEvent(c, 0, true);
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_indirect(c, b, off); });
+    ReplayAfterDraw(c, x, {false, true});
+}
+void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
+{
+    Ctx* x = DrawEvent(c, 0, true);
+    ForwardGameDraw(c, x, [&] { O(c, x).draw_auto(c); });
+    ReplayAfterDraw(c, x, {false, true});
+}
+void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
+{
+    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? Get(c) : nullptr;
+    ForwardDepthRead(c, x, true, [&] { O(c, x).dispatch(c, x_groups, y_groups, z_groups); });
+}
+void STDMETHODCALLTYPE DispatchIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT offset)
+{
+    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? Get(c) : nullptr;
+    ForwardDepthRead(c, x, true, [&] { O(c, x).dispatch_indirect(c, args, offset); });
 }
 HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m)
 {
     Ctx* x = Get(c);
     const HRESULT hr = O(c, x).map(c, r, sub, type, flags, m);
-    if (x && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
+    if (x && CameraTracking() && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
                                     type == D3D11_MAP_READ_WRITE)) {
         const Id id = IdOf(r);
         UINT size = 0;
@@ -1884,6 +2651,11 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
     Ctx* x = Get(c);
     if (x) {
         const Id id = IdOf(r);
+        if (!CameraTracking()) {
+            if (!x->mapped.empty()) x->mapped.erase(id);
+            O(c, x).unmap(c, r, sub);
+            return;
+        }
         UINT size = 0;
         bool cb = false;
         {
@@ -1913,7 +2685,7 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
 }
 void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11_BOX* box, const void*& src, std::vector<uint8_t>& tmp)
 {
-    if (!x || !r || !src) return;
+    if (!x || !r || !src || !CameraTracking()) return;
     UINT size = 0;
     bool cb = false;
     {
@@ -1922,17 +2694,26 @@ void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11
     }
     if (!cb) return;
     if (box || !IsCandidate(IdOf(r))) { CbUpdate(c, r, nullptr, 0); return; } // constant buffers are updated whole
+    if (g_vpj_route.load(std::memory_order_relaxed)) {
+        CbUpdate(c, r, src, size);
+        return;
+    }
     tmp.assign(static_cast<const uint8_t*>(src), static_cast<const uint8_t*>(src) + size);
     if (JitterUpload(tmp.data(), tmp.size(), IdOf(r))) src = tmp.data(); // the game's upload, jittered
     CbUpdate(c, r, tmp.data(), tmp.size());
 }
+void InvalidateDepthWrite(Ctx* context, ID3D11Resource* resource);
+void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource);
+
 void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub, const D3D11_BOX* box, const void* src, UINT rp,
                                            UINT dp)
 {
     Ctx* x = Get(c);
     std::vector<uint8_t> tmp;
     UpdateCommon(c, x, r, box, src, tmp);
+    TrackPlacementColorWrite(c, x, IdOf(r));
     O(c, x).update(c, r, sub, box, src, rp, dp);
+    InvalidateDepthWrite(x, r);
 }
 void STDMETHODCALLTYPE UpdateSubresource1_d(ID3D11DeviceContext1* c, ID3D11Resource* r, UINT sub, const D3D11_BOX* box, const void* src,
                                             UINT rp, UINT dp, UINT flags)
@@ -1940,7 +2721,9 @@ void STDMETHODCALLTYPE UpdateSubresource1_d(ID3D11DeviceContext1* c, ID3D11Resou
     Ctx* x = Get(c);
     std::vector<uint8_t> tmp;
     UpdateCommon(c, x, r, box, src, tmp);
+    TrackPlacementColorWrite(c, x, IdOf(r));
     O(c, x).update1(c, r, sub, box, src, rp, dp, flags);
+    InvalidateDepthWrite(x, r);
 }
 ViewUse RtvUse(ID3D11RenderTargetView* v)
 {
@@ -1953,10 +2736,11 @@ ViewUse RtvUse(ID3D11RenderTargetView* v)
     else if (d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY) u.slice = d.Texture2DMSArray.FirstArraySlice;
     return u;
 }
-ViewUse DsvUse(ID3D11DepthStencilView* v)
+ViewUse DsvUse(ID3D11DepthStencilView* v, bool* read_only = nullptr)
 {
     D3D11_DEPTH_STENCIL_VIEW_DESC d{};
     v->GetDesc(&d);
+    if (read_only) *read_only = (d.Flags & D3D11_DSV_READ_ONLY_DEPTH) != 0;
     ViewUse u;
     u.format = d.Format;
     if (d.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D) u.mip = d.Texture2D.MipSlice;
@@ -1969,13 +2753,16 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
     ID3D11Resource* rt = nullptr;
     ID3D11Resource* ds = nullptr;
     ViewUse rt_use, ds_use;
+    x->depth_read_only = false;
     {
         Inside in;
         if (n && rtvs && rtvs[0]) { rtvs[0]->GetResource(&rt); rt_use = RtvUse(rtvs[0]); }
-        if (dsv) { dsv->GetResource(&ds); ds_use = DsvUse(dsv); }
+        if (dsv) { dsv->GetResource(&ds); ds_use = DsvUse(dsv, &x->depth_read_only); }
     }
     x->rt0 = IdOf(rt);
     x->depth = IdOf(ds);
+    x->rt_view = rt_use;
+    x->ds_view = ds_use;
     UINT bound = 0;
     for (UINT i = 0; rtvs && i < n; ++i)
         if (rtvs[i]) ++bound;
@@ -2023,12 +2810,14 @@ void STDMETHODCALLTYPE OMSetDepthStencilState_d(ID3D11DeviceContext* c, ID3D11De
 {
     Ctx* x = Get(c);
     if (x) {
-        if (!s) x->depth_test = true; // default state: depth test on
+        if (!s) { x->depth_test = true; x->depth_func = kCompareLess; } // default state: depth test on, LESS, writing
         else {
             D3D11_DEPTH_STENCIL_DESC d{};
             Inside in;
             s->GetDesc(&d);
             x->depth_test = d.DepthEnable != FALSE;
+            // Depth direction evidence: the comparison counts only on draws that also write the depth.
+            x->depth_func = d.DepthEnable && d.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL ? static_cast<uint8_t>(d.DepthFunc) : uint8_t{0};
         }
     }
     O(c, x).om_dss(c, s, ref);
@@ -2048,21 +2837,73 @@ void STDMETHODCALLTYPE RSSetViewports_d(ID3D11DeviceContext* c, UINT n, const D3
     }
     O(c, x).rs_vp(c, n, v);
 }
+void InvalidateDepthWrite(Ctx* context, ID3D11Resource* resource)
+{
+    const Id depth = DepthReadsSource(context);
+    if (!depth || IdOf(resource) != depth) return;
+    auto& reads = context->depth_reads;
+    reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+    reads.mixed = true;
+}
+
+ID3D11Resource* DepthCopySource(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* dst, ID3D11Resource* src)
+{
+    const Id depth = DepthReadsSource(x);
+    if (!depth || IdOf(src) != depth || dst == src) return src;
+    auto& reads = x->depth_reads;
+    reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+    Inside own;
+    constexpr uint64_t copy_reader = ~uint64_t{0};
+    if (!reads.Refresh(c, src, copy_reader, x->raster_queries != 0)) return src;
+    auto* twin = reads.twin->SourceForCopy(dst);
+    return twin ? twin : src;
+}
+
+void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
+{
+    if (!x || !resource) return;
+    const Id peer = g_lit_peer.load(std::memory_order_relaxed);
+    if ((!peer && !g_adaptive_scene.load(std::memory_order_relaxed)) ||
+        (resource != peer && resource != g_sel_color.load(std::memory_order_relaxed))) return;
+    Event e;
+    e.kind = Kind::ColorWrite;
+    e.resource = resource;
+    Emit(x, c, e);
+}
+
+void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11RenderTargetView* view, const FLOAT color[4])
+{
+    Ctx* x = Get(c);
+    if (x && (g_adaptive_scene.load(std::memory_order_relaxed) || g_lit_peer.load(std::memory_order_relaxed)))
+        TrackPlacementColorWrite(c, x, ResourceOfView(view));
+    O(c, x).clear_rtv(c, view, color);
+}
+
 void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y0, UINT z0, ID3D11Resource* src,
                                                UINT ss, const D3D11_BOX* box)
 {
     ReadResource(c, src);
-    O(c, t_inside ? nullptr : Get(c)).copy_region(c, dst, ds, x0, y0, z0, src, ss, box);
+    Ctx* x = Get(c);
+    auto* source = !ds && !ss && !x0 && !y0 && !z0 && !box ? DepthCopySource(c, x, dst, src) : src;
+    O(c, x).copy_region(c, dst, ds, x0, y0, z0, source, ss, box);
+    InvalidateDepthWrite(x, dst);
+    TrackPlacementColorWrite(c, x, IdOf(dst));
 }
 void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src)
 {
     ReadResource(c, src);
-    O(c, t_inside ? nullptr : Get(c)).copy_resource(c, dst, src);
+    Ctx* x = Get(c);
+    O(c, x).copy_resource(c, dst, DepthCopySource(c, x, dst, src));
+    InvalidateDepthWrite(x, dst);
+    TrackPlacementColorWrite(c, x, IdOf(dst));
 }
 void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT f)
 {
     ReadResource(c, src);
-    O(c, t_inside ? nullptr : Get(c)).resolve(c, dst, ds, src, ss, f);
+    Ctx* x = Get(c);
+    O(c, x).resolve(c, dst, ds, src, ss, f);
+    InvalidateDepthWrite(x, dst);
+    TrackPlacementColorWrite(c, x, IdOf(dst));
 }
 void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT flags, FLOAT d, UINT8 s)
 {
@@ -2076,7 +2917,15 @@ void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11Dep
         Event e;
         e.kind = Kind::ClearDepth;
         e.resource = id;
+        e.clear_depth = d;
         Emit(x, c, e);
+        if (id && id == DepthReadsSource(x)) {
+            auto& reads = x->depth_reads;
+            reads.Start(g_exact_frame.load(std::memory_order_relaxed), id);
+            reads.cleared = true;
+            reads.seen = reads.mixed = false;
+            reads.dirty = true;
+        }
     }
     O(c, x).clear_dsv(c, v, flags, d, s);
 }
@@ -2098,6 +2947,8 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
             rec.cb_bytes = std::move(x->cb_bytes);
             rec.draw_bytes = std::move(x->draw_bytes);
             rec.order = ++g_list_order;
+            rec.incarnation = IncarnationOf(*out);
+            rec.complete = !x->events_truncated;
             if (g_lists.size() > kMaxLists) {
                 auto oldest = g_lists.begin();
                 for (auto it = g_lists.begin(); it != g_lists.end(); ++it)
@@ -2106,6 +2957,7 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
             }
         }
         x->events.clear();
+        x->events_truncated = false;
         x->cb_bytes.clear();
         x->draw_bytes.clear();
         // A new recording must map with discard before it may map without overwrite again.
@@ -2121,9 +2973,17 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
 void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11CommandList* list, BOOL restore)
 {
     Ctx* x = Get(c);
+    if (const Id depth = list ? DepthReadsSource(x) : 0) {
+        auto& reads = x->depth_reads;
+        reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
+        reads.deferred = true;
+    }
     if (x && !x->deferred && list) {
         std::unique_lock<std::mutex> l(g_mu);
         auto it = g_lists.find(list);
+        if (it != g_lists.end() && it->second.incarnation != IncarnationOf(list)) it = g_lists.end();
+        if (g_screen_enabled.load(std::memory_order_relaxed) && (it == g_lists.end() || !it->second.complete))
+            g_lit.LostObservation();
         if (it != g_lists.end() && g_model.ShouldFireBeforeList(g_model.Summarize(it->second.events))) {
             g_model.MarkFired();
             Fire(c, l, Boundary::BeforeList);
@@ -2138,10 +2998,12 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
             size_t next_exact = 0;
             const std::vector<ExactRange>* current_exact = nullptr;
             for (size_t i = 0; i < events.size(); ++i) {
+                TrackPlacementWrite(events[i]);
                 const uint32_t v = g_model.Feed(events[i]);
                 if (next_exact < exact.size() && exact[next_exact].first == i) current_exact = exact[next_exact++].second.get();
                 RememberSceneUploads(events[i], current_exact);
                 NoteViewportDraw(events[i]);
+                NoteDepthDirection(events[i]);
                 if (events[i].kind == Kind::CbUpdate && next_bytes < bytes.size() && bytes[next_bytes].first == i) {
                     const auto& upload = bytes[next_bytes++].second;
                     SaveCameraUpload(events[i].resource, v, upload);
@@ -2166,7 +3028,7 @@ void ObserveBackbuffer(IDXGISwapChain* swap)
     g_backbuffer = SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&buffer))) ? IdOf(buffer.Get()) : 0;
 }
 
-bool OnPresent(IDXGISwapChain* swap)
+bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
 {
     if (t_inside) return false;
     ID3D11Device* game = g_device_raw.load(std::memory_order_acquire);
@@ -2179,15 +3041,40 @@ bool OnPresent(IDXGISwapChain* swap)
         ComPtr<ID3D11Device> d;
         if (FAILED(swap->GetDevice(IID_PPV_ARGS(&d))) || d.Get() != game) return false;
         g_swap = swap;
+        g_screen.ResetPlacement();
+        g_placement.ClearPresentation();
+        g_lit.Clear();
+        g_recovery.Clear();
+        g_lit_peer.store(0, std::memory_order_relaxed);
         DXGI_SWAP_CHAIN_DESC sd{};
         swap->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
     }
+    const bool reserved_before = g_screen.ReservesPixelRead();
+    if (g_screen_enabled.load(std::memory_order_relaxed)) {
+        Inside own;
+        ComPtr<ID3D11DeviceContext> context;
+        ComPtr<ID3D11Texture2D> screen;
+        if (g_screen.AwaitingSamples() || g_lit.screen.AwaitingSamples()) {
+            game->GetImmediateContext(&context);
+            swap->GetBuffer(0, IID_PPV_ARGS(&screen));
+        }
+        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
+            na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
+                               outcome, (unsigned long long)g_screen.Paired(),
+                               (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
+        if (g_lit.Learned()) {
+            if (const char* outcome = g_lit.screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
+                na::eventlog::Emit("native11_lit_role", "frame=%llu reader=%s", (unsigned long long)g_frame, outcome);
+        }
+    } else if (g_screen.Active()) g_screen.ResetPlacement();
+    if (receipt) *receipt = {g_frame, g_frame_delivered || g_model.SceneDrawsThisFrame() != 0, g_frame_delivered,
+                             g_eval_paused.load(std::memory_order_relaxed)};
     ++g_frame;
     g_exact_frame.fetch_add(1, std::memory_order_relaxed);
     ++g_stats.frames;
-    LearnLargeCbWindows();
+    if (CameraTracking()) LearnLargeCbWindows();
     // A swap chain's buffer is never held across a present: a game may let go of its swap chain at
     // any time, and a reference of ours would keep the old one alive. Fire takes it again.
     if (g_backbuffer && g_color_ref && IdOf(g_color_ref.Get()) == g_backbuffer) g_color_ref.Reset();
@@ -2196,7 +3083,45 @@ bool OnPresent(IDXGISwapChain* swap)
     // (frame_model.hpp) the model
     // is told which target is the screen; a picture drawn straight onto it has no read to wait for.
     g_model.SetScreenTarget(g_backbuffer);
-    g_model.EndFrame();
+    const bool check_lit = g_screen_enabled.load(std::memory_order_relaxed);
+    const bool was_steering = g_lit.steer;
+    g_model.EndFrame(check_lit, check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0);
+    const auto& picked = g_model.Current();
+    const auto order = g_model.CompletedLitOrder();
+    g_lit.Finish(check_lit && (picked.color == order.late || picked.color == order.early) && picked.depth == order.depth
+                 ? order : FrameModel::LitOrder{});
+    if (g_trial_reader && check_lit) {
+        const auto before = g_placement.Comparison().Current();
+        const auto scope = g_lit.steer ? LightingScope() : referee::PlacementTrial::Scope{};
+        static referee::TrialSample sample;
+        referee::AdvancePlacement(g_placement, scope, bool(scope), bool(scope), g_frame_delivered_lit,
+            g_recovery, g_frame - 1, GetTickCount64(), g_trial_reader,
+            [&](const referee::TrialSample& seen, bool, bool) {
+                return scope.OwnsPicture(seen.context);
+            }, sample, scope && ParitySeen(swap, scope));
+        const auto& trial = g_placement.Comparison();
+        if (before != trial.Current())
+            na::eventlog::Emit("native11_route_trial",
+                "next_frame=%llu phase=%s region=%u stops=%.3f/%.3f/%.3f regional=%u verified_reduction=%.4f why=%s",
+                (unsigned long long)g_frame, trial.Name(), trial.Region(),
+                trial.Baseline(), trial.Candidate(), trial.Confirmation(), unsigned(trial.Regional()),
+                trial.VerifiedReduction(), trial.Reason());
+        if (before != trial.Current()) referee::EmitTrialEvidence("native11_route", g_frame, trial);
+        g_lit.steer = g_lit.steer && g_placement.UsesCandidate();
+    } else {
+        g_placement.ClearPresentation();
+        g_recovery.Clear();
+    }
+    if (was_steering != g_lit.steer)
+        na::eventlog::Emit("native11_lit_role", "next_frame=%llu steering=%d", (unsigned long long)g_frame, int(g_lit.steer));
+    g_lit_peer.store(g_lit.Learned() ? g_lit.Peer(picked.color) : 0, std::memory_order_relaxed);
+    if (g_screen_enabled.load(std::memory_order_relaxed)) g_screen.SetScene(picked.color, picked.depth);
+    g_adaptive_scene.store(g_screen.Adaptive(), std::memory_order_relaxed);
+    if (reserved_before != g_screen.ReservesPixelRead()) {
+        na::eventlog::Emit("native11_placement", "next_frame=%llu reader=%s",
+                           static_cast<unsigned long long>(g_frame),
+                           g_screen.ReservesPixelRead() ? "screen_proven" : "ordinary");
+    }
     const auto& ms = g_model.GetStats();
     {
         // WHY log: one line whenever the place DLSS runs at changes kind, with what the frame showed.
@@ -2227,6 +3152,7 @@ bool OnPresent(IDXGISwapChain* swap)
     }
     g_stats.unplaceable = ms.unplaceable;
     g_stats.contradictions = ms.contradictions;
+    const bool scene_changed = g_stats.selection_changes != ms.selection_changes;
     g_stats.selection_changes = ms.selection_changes;
     size_t k = 0;
     const Selection& s = g_model.Current();
@@ -2239,8 +3165,31 @@ bool OnPresent(IDXGISwapChain* swap)
     g_split_votes.clear();
     g_split_candidate.store(g_split_world, std::memory_order_relaxed);
     g_split_world = 0;
+    // If measured motion already delivered the frame, failed Optional searches may sleep.
+    // Keep Required mode searching and retry automatically after scene changes or at low cadence.
+    if (CameraSetting() == CameraUse::Optional && !g_eval_paused.load(std::memory_order_relaxed)) {
+        if (g_camera_suspended.load(std::memory_order_relaxed)) {
+            if (ms.last_scene_draws && g_camera_retry_frames) --g_camera_retry_frames;
+            if (!g_camera_retry_frames || scene_changed || (g_frame_fired && !g_frame_delivered)) {
+                g_camera_failures = kCameraSearchBurst - 1; // one retry frame unless the camera returns
+                g_camera_suspended.store(false, std::memory_order_relaxed);
+                g_collect_camera.store(true, std::memory_order_relaxed);
+                g_model.SetCameraTracking(true);
+            }
+        } else if (g_frame_found) g_camera_failures = 0;
+        else if (g_frame_fired && g_frame_delivered && ++g_camera_failures >= kCameraSearchBurst) {
+            g_camera_retry_frames = kCameraRetryFrames;
+            g_camera_suspended.store(true, std::memory_order_relaxed);
+            g_held.valid = false;
+            g_cb_latest.clear();
+            g_large_cb_windows.clear();
+            g_model.SetCameraTracking(false);
+            na::eventlog::Emit("native11_camera_budget", "frame=%llu retry_scene_frames=%u",
+                               static_cast<unsigned long long>(g_frame), g_camera_retry_frames);
+        }
+    }
     // Learning the relative layout needs every scene range's upload for one frame.
-    if (g_frame_fired && !g_collect_all) {
+    if (CameraTracking() && g_frame_fired && !g_collect_all) {
         const bool collecting = g_collect_camera.load(std::memory_order_relaxed); // how this frame's uploads were kept
         if (!collecting && g_frame_no_bytes && g_prev_found_collecting) {
             if (++g_rotation_misses >= 2) {
@@ -2256,10 +3205,13 @@ bool OnPresent(IDXGISwapChain* swap)
         }
         g_prev_found_collecting = collecting && g_frame_found;
     }
-    g_frame_fired = g_frame_found = g_frame_no_bytes = false;
+    g_frame_fired = g_frame_found = g_frame_no_bytes = g_frame_delivered = false;
+    g_frame_delivered_lit = false;
+    g_depth_dir.EndFrame(); // the next frame's evidence starts empty; what is proven stays
     SetSceneHanded(false);
     TexturesOnPresent();
-    g_collect_camera.store(!g_camera.found || g_rel_learner.armed() || g_collect_all, std::memory_order_relaxed);
+    g_collect_camera.store(CameraTracking() && (!g_camera.found || g_rel_learner.armed() || g_collect_all || g_camera_failures),
+                           std::memory_order_relaxed);
     // Retire upload shadows not in the next scene's acquisition set. Draw-time
     // snapshots keep their own ownership until this frame is closed.
     if (g_cb_latest.size() > 512) {
@@ -2343,7 +3295,7 @@ bool OnPresent(IDXGISwapChain* swap)
     g_jitter_written = false;
     // A request covers exactly the frame that starts here: without a new one (a missed or failed
     // evaluation), the next frame's camera is the game's own, unjittered.
-    g_jitter_active = g_jitter_requested && g_camera.found;
+    g_jitter_active = g_jitter_requested && g_camera.found && CameraTracking(); // the matrix write needs a camera that is being looked for
     g_jitter = neural_alias::JitterSample{g_next_jitter[0], g_next_jitter[1]};
     // Viewport route: the same one-frame request, applied on the scene draws of the frame starting here.
     const uint32_t jittered_draws = g_vpj_frame_draws;
@@ -2373,18 +3325,23 @@ bool OnPresent(IDXGISwapChain* swap)
 HRESULT STDMETHODCALLTYPE Present_d(IDXGISwapChain* s, UINT sync, UINT flags)
 {
     const bool outer = !t_in_present;
-    if (outer && !(flags & DXGI_PRESENT_TEST)) OnPresent(s);
+    PresentReceipt receipt{};
+    const bool observed = outer && !(flags & DXGI_PRESENT_TEST) && OnPresent(s, &receipt);
     t_in_present = true;
     const HRESULT hr = g_present(s, sync, flags);
+    if (observed) ObservePresentResult(s, receipt.ordinal, hr == S_OK && !(flags & DXGI_PRESENT_DO_NOT_SEQUENCE));
     if (outer) t_in_present = false;
     return hr;
 }
 HRESULT STDMETHODCALLTYPE Present1_d(IDXGISwapChain1* s, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p)
 {
     const bool outer = !t_in_present;
-    if (outer && !(flags & DXGI_PRESENT_TEST)) OnPresent(s);
+    PresentReceipt receipt{};
+    const bool observed = outer && !(flags & DXGI_PRESENT_TEST) && OnPresent(s, &receipt);
     t_in_present = true;
     const HRESULT hr = g_present1(s, sync, flags, p);
+    if (observed) ObservePresentResult(s, receipt.ordinal, hr == S_OK && !(flags & DXGI_PRESENT_DO_NOT_SEQUENCE) &&
+        (!p || (!p->DirtyRectsCount && !p->pScrollRect)));
     if (outer) t_in_present = false;
     return hr;
 }
@@ -2400,6 +3357,12 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
 {
     std::lock_guard<std::mutex> l(g_mu);
     if (s == g_swap) {
+        g_screen.ResetPlacement();
+        g_placement.ClearPresentation();
+        g_lit.Clear();
+        g_recovery.Clear();
+        g_lit_peer.store(0, std::memory_order_relaxed);
+        g_adaptive_scene.store(false, std::memory_order_relaxed);
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
         g_color_ref.Reset();
         g_depth_ref.Reset();
@@ -2437,6 +3400,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     std::vector<H> hooks = {
         {kVSSetConstantBuffers, reinterpret_cast<void*>(&VSSetConstantBuffers_d), reinterpret_cast<void**>(&o.vs_cb)},
         {kPSSetConstantBuffers, reinterpret_cast<void*>(&PSSetConstantBuffers_d), reinterpret_cast<void**>(&o.ps_cb)},
+        {kPSSetShader, reinterpret_cast<void*>(&PSSetShader_d), reinterpret_cast<void**>(&o.ps_shader)},
         {kPSSetShaderResources, reinterpret_cast<void*>(&PSSetShaderResources_d), reinterpret_cast<void**>(&o.ps_srv)},
         {kCSSetShaderResources, reinterpret_cast<void*>(&CSSetShaderResources_d), reinterpret_cast<void**>(&o.cs_srv)},
         {kVSSetShaderResources, reinterpret_cast<void*>(&VSSetShaderResources_d), reinterpret_cast<void**>(&o.vs_srv)},
@@ -2446,6 +3410,11 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
         {kDrawInstanced, reinterpret_cast<void*>(&DrawInstanced_d), reinterpret_cast<void**>(&o.draw_instanced)},
         {kDrawIndexedInstancedIndirect, reinterpret_cast<void*>(&DrawIndexedInstancedIndirect_d), reinterpret_cast<void**>(&o.draw_indexed_indirect)},
         {kDrawInstancedIndirect, reinterpret_cast<void*>(&DrawInstancedIndirect_d), reinterpret_cast<void**>(&o.draw_indirect)},
+        {kDrawAuto, reinterpret_cast<void*>(&DrawAuto_d), reinterpret_cast<void**>(&o.draw_auto)},
+        {kDispatch, reinterpret_cast<void*>(&Dispatch_d), reinterpret_cast<void**>(&o.dispatch)},
+        {kDispatchIndirect, reinterpret_cast<void*>(&DispatchIndirect_d), reinterpret_cast<void**>(&o.dispatch_indirect)},
+        {kBegin, reinterpret_cast<void*>(&Begin_d), reinterpret_cast<void**>(&o.begin)},
+        {kEnd, reinterpret_cast<void*>(&End_d), reinterpret_cast<void**>(&o.end)},
         {kMap, reinterpret_cast<void*>(&Map_d), reinterpret_cast<void**>(&o.map)},
         {kUnmap, reinterpret_cast<void*>(&Unmap_d), reinterpret_cast<void**>(&o.unmap)},
         {kOMSetRenderTargets, reinterpret_cast<void*>(&OMSetRenderTargets_d), reinterpret_cast<void**>(&o.om_rt)},
@@ -2455,6 +3424,7 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
         {kCopySubresourceRegion, reinterpret_cast<void*>(&CopySubresourceRegion_d), reinterpret_cast<void**>(&o.copy_region)},
         {kCopyResource, reinterpret_cast<void*>(&CopyResource_d), reinterpret_cast<void**>(&o.copy_resource)},
         {kUpdateSubresource, reinterpret_cast<void*>(&UpdateSubresource_d), reinterpret_cast<void**>(&o.update)},
+        {kClearRenderTargetView, reinterpret_cast<void*>(&ClearRenderTargetView_d), reinterpret_cast<void**>(&o.clear_rtv)},
         {kClearDepthStencilView, reinterpret_cast<void*>(&ClearDepthStencilView_d), reinterpret_cast<void**>(&o.clear_dsv)},
         {kResolveSubresource, reinterpret_cast<void*>(&ResolveSubresource_d), reinterpret_cast<void**>(&o.resolve)},
         {kClearState, reinterpret_cast<void*>(&ClearState_d), reinterpret_cast<void**>(&o.clear_state)},
@@ -2530,19 +3500,42 @@ bool InstallHooks(bool host_owns_present)
 
 } // namespace
 
-bool ObservePresent(void* swapchain) { return OnPresent(static_cast<IDXGISwapChain*>(swapchain)); }
+void SetScreenCheck(bool on) { g_screen_enabled.store(on, std::memory_order_relaxed); }
+
+void RejectScreenProof(uint64_t proof)
+{
+    if (!proof || !g_screen_enabled.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_lit.Revoke(proof, g_frame) || g_screen.RejectProof(proof, g_frame))
+        na::eventlog::Emit("native11_screen", "candidate=replaced_after_delivery proof=%llu",
+                           static_cast<unsigned long long>(proof));
+}
+bool ObservePresent(void* swapchain, PresentReceipt* receipt)
+{
+    return OnPresent(static_cast<IDXGISwapChain*>(swapchain), receipt);
+}
+void ObservePresentResult(void* swapchain, uint64_t ordinal, bool accepted)
+{
+    if (!g_screen_enabled.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (swapchain != g_swap) return;
+    g_screen.PresentResult(ordinal, accepted);
+    g_lit.screen.PresentResult(ordinal, accepted);
+}
 void BeforeResize(void* swapchain) { ReleaseResizeInputs(static_cast<IDXGISwapChain*>(swapchain)); }
 void AfterResize(void* swapchain, long result) { UpdateResizeExtent(static_cast<IDXGISwapChain*>(swapchain), result); }
 OwnWorkScope::OwnWorkScope() : was_(t_inside) { t_inside = true; }
 OwnWorkScope::~OwnWorkScope() { t_inside = was_; }
 
-bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present)
+void SetParitySignal(ParitySignal seen) { g_parity_signal.store(seen, std::memory_order_relaxed); }
+bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present, TrialReader trial_reader)
 {
     std::lock_guard<std::mutex> g(g_install_mu);
     {
         std::lock_guard<std::mutex> l(g_mu);
         g_cb = cb;
         g_cb_user = user;
+        g_trial_reader = trial_reader;
     }
     if (device) {
         ID3D11Device* was = g_device_raw.exchange(static_cast<ID3D11Device*>(device), std::memory_order_acq_rel);
@@ -2561,6 +3554,11 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present)
 }
 
 bool IsGameWork(void* context) { return Get(static_cast<ID3D11DeviceContext*>(context)) != nullptr; }
+SamplerShadow* SamplerShadowOf(ID3D11DeviceContext* context)
+{
+    Ctx* x = Get(context);
+    return x ? &x->sampler_shadow : nullptr;
+}
 PsShadow* TextureShadowOf(ID3D11DeviceContext* c)
 {
     Ctx* x = Get(c);
@@ -2576,9 +3574,27 @@ void Uninstall()
     std::lock_guard<std::mutex> l(g_mu);
     g_cb = nullptr;
     g_cb_user = nullptr;
+    g_trial_reader = nullptr;
+    g_screen = {};
+    g_placement.ClearPresentation();
+    g_lit.Clear();
+    g_recovery.Clear();
+    g_lit_peer.store(0, std::memory_order_relaxed);
+    g_adaptive_scene.store(false, std::memory_order_relaxed);
+    g_screen_enabled.store(false, std::memory_order_relaxed);
     g_swap = nullptr;
     g_backbuffer = 0;
     g_collect_all = false;
+    g_camera_suspended.store(false, std::memory_order_relaxed);
+    g_eval_paused.store(false, std::memory_order_relaxed);
+    g_camera_failures = g_camera_retry_frames = 0;
+    g_frame_delivered = false;
+    g_frame_delivered_lit = false;
+    g_cb_latest.clear();
+    g_scene_uploads.clear();
+    g_large_cb_windows.clear();
+    g_model.SetCameraTracking(CameraTracking());
+    g_collect_camera.store(CameraTracking(), std::memory_order_relaxed);
     g_twin_wait_until = 0;
     g_rotation_misses = 0;
     g_frame_fired = g_frame_found = g_frame_no_bytes = g_prev_found_collecting = false;
@@ -2593,12 +3609,54 @@ void Uninstall()
     g_sel_depth.store(0);
     g_sel_depth2.store(0);
     g_vpj_sample.store(0);
+    g_depth_dir.Reset();
 }
 
 void SetJitterRoute(JitterRoute route)
 {
     g_vpj_route.store(route == JitterRoute::Viewport, std::memory_order_relaxed);
     if (route != JitterRoute::Viewport) g_vpj_sample.store(0, std::memory_order_release); // bound copies restore at the next draw
+}
+
+void SetDepthReads(bool enabled)
+{
+    if (g_depth_reads_enabled.exchange(enabled) != enabled)
+        na::eventlog::Emit("depth_reads", "variant=depth-reads/twin api=dx11 state=%s why=\"%s\"",
+                           enabled ? "filling" : "off", enabled ? "waiting for qualified raster depth" : "disabled");
+}
+
+static void ResetCameraAcquisition()
+{
+    g_camera_failures = g_camera_retry_frames = 0;
+    g_camera_suspended.store(false, std::memory_order_relaxed);
+    g_held.valid = false;
+    g_cb_latest.clear();
+    g_scene_uploads.clear();
+    g_large_cb_windows.clear();
+    const bool tracking = CameraTracking();
+    g_collect_camera.store(tracking, std::memory_order_relaxed);
+    g_model.SetCameraTracking(tracking);
+}
+
+void SetEvaluationPaused(bool paused)
+{
+    if (g_eval_paused.exchange(paused, std::memory_order_relaxed) == paused) return;
+    std::lock_guard<std::mutex> l(g_mu);
+    ResetCameraAcquisition();
+    if (paused) {
+        g_vpj_sample.store(0, std::memory_order_release);
+        g_jitter_active = g_jitter_requested = false;
+    }
+}
+
+void SetCameraUse(CameraUse use)
+{
+    const auto next = static_cast<uint8_t>(use);
+    if (g_camera_use.exchange(next, std::memory_order_relaxed) == next) return;
+    std::lock_guard<std::mutex> l(g_mu);
+    ResetCameraAcquisition();
+    na::eventlog::Emit("native11_camera_use", "frame=%llu use=%s", static_cast<unsigned long long>(g_frame),
+                       use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required");
 }
 
 void SetNextJitter(float x_px, float y_px)
@@ -2612,7 +3670,12 @@ void SetNextJitter(float x_px, float y_px)
 ProviderStats Stats()
 {
     std::lock_guard<std::mutex> l(g_mu);
-    return g_stats;
+    ProviderStats stats = g_stats;
+    stats.screen_confirmed = g_screen.Confirmed();
+    stats.screen_refuted = g_screen.Refuted();
+    stats.screen_pairs = g_screen.Paired();
+    stats.screen_delivered = g_screen.Delivered();
+    return stats;
 }
 
 int FormatStatus(char* out, unsigned long n)
@@ -2630,8 +3693,14 @@ int FormatStatus(char* out, unsigned long n)
     int is_backbuffer = -1;
     bool keep_all = false;
     FrameModel::Stats placement;
+    DepthCompare depth_proven = DepthCompare::None;
+    DepthEvidence depth_seen;
+    uint64_t depth_flips = 0;
     {
         std::lock_guard<std::mutex> l(g_mu);
+        depth_proven = g_depth_dir.Proven();
+        depth_seen = g_depth_dir.Last();
+        depth_flips = g_depth_dir.Flips();
         layout = g_rel_layout;
         layout_learned = g_rel_learned;
         scene_layered = g_model.Layered();
@@ -2719,7 +3788,21 @@ int FormatStatus(char* out, unsigned long n)
                                    static_cast<unsigned long long>(g_foreign_calls.load(std::memory_order_relaxed)),
                                    g_sel_depth2.load(std::memory_order_relaxed) ? 1 : 0,
                                    static_cast<unsigned long long>(g_vpj_stopped_after_scene.load(std::memory_order_relaxed)));
-    return tail < 0 ? head : head + tail;
+    if (tail < 0 || static_cast<size_t>(head + tail) >= n) return tail < 0 ? head : head + tail;
+    // The camera's part in handing frames over, and the depth direction learned without one.
+    const auto use = CameraSetting();
+    const char* camera_work = g_eval_paused.load(std::memory_order_relaxed) ? "paused" :
+        g_camera_suspended.load(std::memory_order_relaxed) ? "backoff" : use == CameraUse::Off ? "off" : "active";
+    const int more = std::snprintf(out + head + tail, n - head - tail,
+                                   " camera_use{mode=%s work=%s handed_without_looking=%llu handed_none_found=%llu} "
+                                   "depth_direction{%s writes_less=%u writes_greater=%u equal=%u clears=%u clear=%.6g unproven_frames=%llu flips=%llu camera_disagrees=%llu}",
+                                   use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required", camera_work,
+                                   static_cast<unsigned long long>(s.camera_off), static_cast<unsigned long long>(s.camera_absent),
+                                   depth_proven == DepthCompare::NearIsLess ? "near_is_less" : depth_proven == DepthCompare::NearIsGreater ? "near_is_greater" : "unproven",
+                                   depth_seen.less, depth_seen.greater, depth_seen.equal, depth_seen.clears, depth_seen.clear,
+                                   static_cast<unsigned long long>(s.depth_unproven), static_cast<unsigned long long>(depth_flips),
+                                   static_cast<unsigned long long>(s.depth_camera_disagrees));
+    return more < 0 ? head + tail : head + tail + more;
 }
 
 } // namespace na::native11

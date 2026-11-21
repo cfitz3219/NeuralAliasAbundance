@@ -177,6 +177,10 @@ bool RestoreBindingState(ID3D12GraphicsCommandList*,bool compute,bool heaps,uint
 // restoration. Existing executable recordings keep their captured state.
 void SetRasterStateTracking(bool enabled);
 bool ListRasterStateRestorable(ID3D12CommandList* list);
+// Weaker: raster tracking was latched for this recording, so RestoreListState hands back whichever of the
+// targets, viewports, scissors and topology the game has set on it so far. One it has not set yet (a
+// recording starts with none, and a render pass ends with no targets) the game must set before it draws.
+bool ListRasterStateTracked(ID3D12CommandList* list);
 bool ListStateRestorable(ID3D12CommandList* list); // RestoreListState would succeed
 // Bounded snapshot of the current native shader bindings, for scoped private
 // descriptor heaps. Rebind ALL resource tables when changing their heap, and
@@ -330,17 +334,26 @@ struct MipLiveStats {
 };
 MipLiveStats GetMipLiveStats();
 float SamplerMipBias();
-uint32_t SamplerAnisotropyWanted(); // the menu's AF level (0 / 4 / 8 / 16), as SamplerMipBias is the bias
+uint32_t SamplerAnisotropyWanted(); // the AF level wanted for world samplers (0 = the game's own, 16)
+uint32_t SamplerAfActionWanted();   // the af::Action wanted (core/anisotropic_auto.hpp), read by the native DX11 binds
 void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers);
 // Every distinct sampler the game created (heap, heap v2, root-signature static), most used first.
 std::string FormatSamplerTable(uint64_t* total = nullptr);
-// Anisotropic filtering (0 off, 4 / 8 / 16) on eligible standard linear samplers,
-// including clamp-addressed materials. Live static variants; newly created sampler descriptors.
+// Anisotropic filtering on world samplers (core/anisotropic_auto.hpp: not comparison, not point,
+// mips, WRAP/MIRROR). Automatic, no menu control: the host follows the shared detector.
+// stage 0 = stop following and keep the game's own (safe start), 1 = at load (twins built at
+// creation and new heap samplers follow the detector; nothing activated yet), 2 = live (every
+// decision change switches the twins in the background, no restart). [j2] anisotropic_filter.
+void SetSamplerAfFollow(int stage);
+// Explicit actions (af::Action), without the detector: live variants and newly created descriptors.
+void SetSamplerAfAction(uint32_t action);
+void SetSamplerAfActionPrebuild(uint32_t action);
+// Explicit level (tests): 0 = the game's own, any other = forced 16x on world samplers.
 void SetSamplerAnisotropy(uint32_t level);
-// The saved anisotropic level: twins for it are built at creation (before activation).
 void SetSamplerAnisotropyPrebuild(uint32_t level);
 struct AnisoStats {
-    uint32_t level = 0;
+    uint32_t level = 0;  // 0 = the game's own, 16
+    uint32_t action = 0; // af::Action in use
     uint64_t samplers = 0, static_samplers = 0, already = 0;
     uint64_t native_surface=0,native_16=0; // original observed surface samplers, before our override
     uint64_t sampler_calls = 0, sampler2_calls = 0; // the game's CreateSampler / CreateSampler2 calls (all, eligible or not)
@@ -377,11 +390,35 @@ uint64_t LiveSelectionVersion();
 // is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
 // by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
-// Draw-replay probe: per frame, the scene-depth draws and how many match a draw of the frame
-// before (same pipeline, vertex shader, counts, vertex layout); of those, how many kept the same
-// vertex/index buffers. untracked: vertex buffers unknown ([observe] raster tracking off).
-struct ReplayProbeStats { uint32_t draws, prev_draws, unique, matched, same_buffers, moved_buffers, untracked, extra_stages, instanced; };
-void SetReplayProbe(bool on);
+// A successful native-size resolve ends the scene sample for layers drawn over its image.
+// The second target is the observed full-size consumer, when it is known.
+struct ResolvedRaster {
+    uint64_t sample = 0, color = 0, depth = 0, destination = 0;
+    uint32_t color_sub = 0, depth_sub = 0, destination_sub = 0;
+};
+ResolvedRaster FinishSceneRaster(ID3D12CommandList* list, uint64_t color, uint32_t color_sub,
+                                 uint64_t depth, uint32_t depth_sub, uint64_t destination);
+void SubmitResolvedRaster(const ResolvedRaster& raster);
+// Depth direction evidence (camera-free DLAA; the DX12 half of VARIANT
+// depth/direction-from-depth-writes, decided by native11/depth_direction.hpp). While on, every
+// game draw whose bound depth is the live scene depth and whose pipeline tests AND writes depth is
+// counted by its comparison, and every clear of that depth with its value. Off (the default) adds
+// nothing to the draw path.
+// The counts belong to the recording they were recorded in and are cleared when that list is
+// Reset. A recording proves nothing until it is submitted: the host asks for the facts of each
+// list it actually submits, in execution order, and adds them up itself (a closed list that is
+// executed again counts again, as it draws again). Nothing here is a frame total.
+struct DepthWriteEvidence {
+    uint64_t depth = 0;             // the depth the counts below belong to (0 = none recorded about it)
+    uint32_t less = 0, greater = 0; // depth-writing draws by the way their comparison runs
+    uint32_t equal = 0, other = 0;  // such draws comparing EQUAL, and ALWAYS / NEVER / NOT_EQUAL
+    uint32_t clears = 0;
+    float clear = 0;                // the last clear's value
+    bool clear_mixed = false;       // cleared to different values within the recording
+};
+void SetDepthWriteEvidence(bool on);
+// This recording's facts about `depth` (empty when it recorded none, or recorded another depth).
+DepthWriteEvidence ListDepthWriteEvidence(ID3D12CommandList* list, uint64_t depth);
 // Draw replay (per-object motion): every qualifying scene draw is drawn again with a stream-output
 // twin of its pipeline, writing each expanded vertex's clip position (float4) into this frame's
 // slot buffer. Capture and current-frame consumption must share one recording.
@@ -420,16 +457,36 @@ struct DrawReplayStats {
     uint64_t pending_stamped = 0, stamps = 0; // unsubmitted segments used under a GPU stamp check; stamps written at Close
     uint64_t reuse_unretired = 0; // no slot for a frame because writer lists were not reset yet (could execute again)
     uint64_t slots = 0; // position slots created (3 at start, more while SE5 keeps lists)
+    // The vertex budget (core/replay_budget.hpp): draws left out by the sample, draws over half the budget,
+    // draws after a frame reached its limit; the budget in force and the last threshold (65536 = every draw).
+    uint64_t not_sampled = 0, draw_too_large = 0, frame_full = 0, budget = 0;
+    uint32_t budget_threshold = 0;
+    // Movers (core/replay_movers.hpp): draws known to move by themselves now, draws seen moving but not
+    // three times yet, draws ever made movers and let go again; mover draws and their vertices replayed,
+    // mover draws left out because the movers alone were over the budget; the rotating share's vertices;
+    // draw reports received from the replay pass.
+    bool movers_on = false;
+    uint64_t movers = 0, suspects = 0, promoted = 0, let_go = 0, mover_draws = 0, mover_verts = 0, movers_left_out = 0, probe_verts = 0, reports = 0;
     char gates[256] = {}; // why scene draws were not replayed: "name=count ..." (only non-zero)
 };
 void SetDrawReplay(uint64_t frame, ReplayRetain retain);
+// Expanded vertices a frame may replay (0 = no budget). Live.
+void SetDrawReplayBudget(uint64_t expanded_vertices);
+// VARIANT: replay/movers-first
+// On: within the budget, draws known to move by themselves are replayed first and every other draw
+// is tried in turn on a quarter of the budget (core/replay_movers.hpp). Off: the budget's hashed
+// sample alone (core/replay_budget.hpp). No budget: every draw, as before. Live.
+void SetDrawReplayMovers(bool on);
+// What the replay pass saw of the draws it rasterised, compared with the screen's own motion:
+// sampled pixels where the draw is the visible surface, and those of them apart from the screen.
+struct ReplayObservation { uint64_t sig = 0, vb = 0; uint32_t visible = 0, apart = 0; };
+void ReplayLearn(const ReplayObservation* seen, size_t count);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);
 void GetDrawReplayStats(DrawReplayStats* out);
-bool ReplayProbeFrame(ReplayProbeStats* out); // call once per frame (Present); swaps frames
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
-struct ViewportJitterStats { uint64_t draws, sets, restores, unknown; };
+struct ViewportJitterStats { uint64_t draws, sets, restores, unknown, local_layers, submitted_layers; };
 ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,

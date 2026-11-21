@@ -30,6 +30,16 @@ struct Fake : SampleApi {
 };
 static SamplePlan plan() { return {3,0,2,2,40}; }
 int main() { return test::run({
+    {"camera-off cancels buffer requests only and can resume in the same scope", [] {
+        Fake f;SampleAcquisition a(f);a.Scope(1,2);
+        CHECK(a.Begin(plan()));
+        f.buffer=true;SamplePlan p{4,0,64,1,0,true,(1ull<<32)+256};CHECK(a.Begin(p));
+        a.CancelBuffers();CHECK(a.Pending()==1 && f.releases==1 && f.reads==0);
+        a.CancelBuffers();CHECK(a.Pending()==1 && f.releases==1);
+        f.buffer=false;auto out=a.Pump();CHECK(out.size()==1 && out[0].status==AcquisitionStatus::Ready);
+        CHECK(out[0].plan.resource==3 && f.reads==1 && f.releases==2);
+        f.buffer=true;CHECK(a.Begin(p));a.CancelBuffers();CHECK(a.Pending()==0 && f.releases==3);
+    }},
     {"timeout releases its lease and the same resource can complete on retry", [] {
         Fake f;SampleAcquisition a(f);a.Scope(1,2);CHECK(a.Begin(plan()));
         f.info.status=NA_SAMPLE_FAILED;f.info.reason=NA_SAMPLE_E_TIMEOUT;

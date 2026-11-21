@@ -40,6 +40,47 @@ void SetTextureOperationHook(TextureLane, std::shared_ptr<TextureOperationHook>)
 // clears depth, before it is forwarded, with the view's resource id. Records nothing.
 using DepthClearListener = void (*)(ID3D12GraphicsCommandList*, uint64_t target_id);
 void SetDepthClearListener(DepthClearListener);
+// Depth reads (j2/depth_reads.cpp). The game's shader reads of `game_depth`'s depth plane are made
+// on `twin` (same description): every view of it the game creates from now on, and, through
+// RedirectExistingDepthReads, the views it made before. Null, null = none. The twin must outlive
+// every descriptor that may name it, so the owner keeps it at least as long as the game's depth.
+void SetDepthReadTwin(ID3D12Resource* game_depth, ID3D12Resource* twin);
+// Rewrites the existing views (and recorded copies of them) of `game_depth`'s depth plane to
+// `target`: the twin, or the game's depth itself to undo. Returns how many. Call at the game's
+// Present with the game's queue idle, once per change.
+uint32_t RedirectExistingDepthReads(ID3D12Resource* game_depth, ID3D12Resource* target);
+// Called (as host work) after the game's barrier whose last word on the twinned depth's depth plane
+// is a transition, on the recording that holds it. before/after = the game's states;
+// all_planes = the barrier named every subresource.
+using DepthReadableListener = void (*)(ID3D12GraphicsCommandList* list, ID3D12Resource* game_depth, uint32_t state_before, uint32_t state_after, bool all_planes);
+void SetDepthReadableListener(DepthReadableListener);
+// A recording marked with SetDepthReadPending (on the recording thread) gets this call, as host
+// work, before each of its following draws and dispatches until the mark is taken off (null).
+using DepthPendingListener = void (*)(ID3D12GraphicsCommandList* list);
+void SetDepthPendingListener(DepthPendingListener);
+void SetDepthReadPending(ID3D12GraphicsCommandList* list);
+// created: views made on the twin at creation; swept: existing views rewritten; readable: barriers
+// that made the depth shader-readable; other: barriers that left it not shader-readable;
+// unknown_view: existing views left alone because their exact description was not recorded;
+// raced: slots the game wrote during a sweep (given back what the game wrote).
+struct DepthReadStats { uint64_t created, swept, readable, other, unknown_view, raced; };
+DepthReadStats GetDepthReadStats();
+// What the scene's depth was drawn with, as far as `list`'s recording can know: its own pinned
+// scene draws, else another recording's pin for the same depth and the sample of the frame being
+// recorded now. False: not nudged, not known, or not one shape.
+struct SceneRaster { uint64_t sample = 0; bool expanded = false; bool own = false; };
+bool SceneRasterFor(ID3D12CommandList* list, uint64_t depth, SceneRaster& out);
+// A host draw can be recorded here and everything handed back: a DIRECT recording outside passes,
+// with targets, viewports, scissors, topology, pipeline, root and heaps all known, no game query
+// counting. Predication is the caller's to take off and put back (ListPredication).
+bool ListHostDrawAllowed(ID3D12CommandList* list);
+// A host copy can be recorded here: a DIRECT recording outside passes (predication: as above).
+bool ListHostCopyAllowed(ID3D12CommandList* list);
+// The predication the game has bound on this recording now (what its last SetPredication said).
+// False: none. Predication skips copies and draws alike, the host's with the game's.
+bool ListPredication(ID3D12CommandList* list, ID3D12Resource** buffer, UINT64* offset, D3D12_PREDICATION_OP* op);
+// The game's own viewports were just bound by host work: the next scene draw applies the sample again.
+void ViewportJitterDropped(ID3D12CommandList* list);
 // Called only for a forwarded game texture operation, with the actual call arguments.
 using TextureTraceListener = void (*)(ID3D12GraphicsCommandList*, const TextureCall&) noexcept;
 void SetTextureTraceListener(TextureTraceListener);

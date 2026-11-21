@@ -2,6 +2,7 @@
 
 #include "core/motion_arbiter_gpu.hpp"
 
+#include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/nvof/flow_expand.hpp"
 #include "host_dx12/nvof/nvof_flow.hpp"
 #include "host_dx12/settings.hpp"
@@ -39,20 +40,8 @@ constexpr uint32_t kCostMax = 160;     // engine cost above this rejects the blo
 // The temporal direction test now carries the flicker rejection, so the snap drops to 0.5 px
 // (above the engine's ~0.5 px flat-area fill, which the texture gate also removes).
 constexpr float kSnapPx = 0.5f;
-constexpr float kImageAbs = 0.08f;     // the flow must explain the image (mean luma error, 3x3 encoded texels)
-constexpr float kImageMargin = 0.f; // reserved constant-buffer field; no absolute-error bypass
-// The flow must explain the image clearly better than the camera alone: e_flow <= kImageRatio *
-// e_cam. Still posts under jitter (bfed885, RTX 5070 Ti): the
-// stabilised encode leaves a different sub-pixel blur on each frame's edges, so e_cam is not 0
-// at an edge (~0.05-0.1); a coherent 2 px flow along a post axis near its end (aperture
-// ambiguity, kept alive by temporal hints) had e_flow ~ e_cam and passed the old
-// e_flow <= e_cam + margin test: a 1-3 px halo of false motion past every post end and bar.
-constexpr float kImageRatio = 0.5f;
-// Minimum local contrast (3x3 encoded luma, max - min) for a residual to count. On flat
-// areas the engine fills vectors in from nearby edges (RTX 5070 Ti: ~0.5 px drift on a
-// flat background), cost and image checks cannot reject them, and camera motion
-// reprojects a flat area just as well. Flat pixels stay camera-only.
-constexpr float kTextureMin = 0.03f;
+// Image thresholds share the compute-flow tuning below. A match must improve on
+// camera-only reprojection, including on thin, jittered edges (bfed885).
 // Temporal agreement. Anno capture j2-20261031-182516 (1a43e50, still camera, 30 frames): 0.5-7.7 %
 // of the picture carried 1-4 px residuals spread over the whole screen, flipping direction
 // between consecutive frames (agreement -0.97..-1.00) in step with the DLAA jitter: the
@@ -66,9 +55,7 @@ constexpr float kTextureMin = 0.03f;
 // discriminating test. Slow movers (1-3 px/frame) carry the same +-1-2 px misread on top of
 // their true motion, so a tight magnitude match rejected them. Now: one previous agreeing pair
 // (accepted from the second pair on), direction within 60 degrees, magnitude loosely bounded.
-constexpr uint32_t kAgreeMin = 1;   // previous agreeing pairs needed (the second pair is the first accepted)
-constexpr float kAgreeCos = 0.5f;   // cos 60: direction agreement
-constexpr float kAgreePx = 3.0f;    // |r - r_prev| <= max(kAgreePx, |r|)
+constexpr uint32_t kAgreeMin = 1; // NVOFA needs a previous agreeing pair at every strength.
 // Jitter-stabilised input (Sol, COMMS 6cb1720, idea B). J1 renders frame t with its raster
 // sample at pixel centre - j_t in the unjittered projection, so the scene point that belongs
 // at unjittered position q is found at texel q + j_t. The encode samples there: both images
@@ -1018,8 +1005,15 @@ bool RecordFusion(ID3D12GraphicsCommandList* l, Ticket& t, ID3D12Resource* depth
     c.cost_max = kCostMax;
     c.cnt_off = off;
     c.gw = g.engine->OutWidth(); c.gh = g.engine->OutHeight();
-    c.snap_px = kSnapPx; c.image_margin = kImageMargin; c.image_abs = kImageAbs; c.texture_min = kTextureMin; c.image_ratio = kImageRatio;
-    c.have_hist = have_hist ? 1u : 0u; c.agree_min = kAgreeMin; c.agree_px = kAgreePx; c.agree_cos = kAgreeCos;
+    const auto gates = compute_flow::GatesFor(settings::kObjectFlowLoosen);
+    c.snap_px = kSnapPx;
+    c.image_abs = gates.image_abs;
+    c.texture_min = gates.texture_min;
+    c.image_ratio = gates.image_ratio;
+    c.have_hist = have_hist ? 1u : 0u;
+    c.agree_min = kAgreeMin;
+    c.agree_px = gates.agree_px;
+    c.agree_cos = gates.agree_cos;
     ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
     l->SetComputeRootSignature(g.root.Get());

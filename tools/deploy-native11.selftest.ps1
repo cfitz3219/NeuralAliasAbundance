@@ -17,8 +17,8 @@ $exe32 = Join-Path $env:WINDIR 'SysWOW64\notepad.exe'; $exe64 = Join-Path $env:W
 $fail = 0
 function Check([bool] $ok, [string] $what) { if ($ok) { Write-Output "ok    $what" } else { Write-Output "FAIL  $what"; $script:fail++ } }
 function Game([string] $name, [string] $from) { $d = Join-Path $root $name; New-Item -ItemType Directory -Force -Path $d | Out-Null; Copy-Item -LiteralPath $from -Destination (Join-Path $d 'NaSelfTestGame.exe'); $d }
-function Run([string] $action, [string] $dir, [string] $label) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $pkg 'deploy-native11.ps1') -Action $action -GameDir $dir -Exe 'NaSelfTestGame.exe' -Label $label -DocumentsDirectory $docs -EvidenceRoot $runs | Out-Host
+function Run([string] $action, [string] $dir, [string] $label, [string] $api = 'Native11') {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $pkg 'deploy-native11.ps1') -Action $action -GameDir $dir -Exe 'NaSelfTestGame.exe' -Label $label -DocumentsDirectory $docs -EvidenceRoot $runs -GraphicsApi $api | Out-Host
     $LASTEXITCODE
 }
 $same = Game 'same' $(if ($dllIs32) { $exe32 } else { $exe64 })
@@ -32,6 +32,7 @@ Check ((Run 'Deploy' $same 'same') -eq 0) 'installs into a game of the same kind
 Check (Test-Path -LiteralPath (Join-Path $same 'dxgi.dll')) 'dxgi.dll is in the game folder'
 $ini = Join-Path $same 'NeuralAliasHost.ini'
 Check ((Test-Path -LiteralPath $ini) -and ((Get-Content -LiteralPath $ini -Raw) -match '(?m)^build_commit=0123abc\r?$')) 'settings file names the build'
+Check ((Get-Content -LiteralPath $ini -Raw) -match '(?m)^\[adapter\]\r?\nenabled=0\r?$') 'native DX11 keeps the DX12 discovery adapter off'
 Check (-not (Test-Path -LiteralPath (Join-Path $same 'nvngx_dlss.dll'))) 'no DLSS runtime is installed when the package has none'
 Check ((Run 'Deploy' $same 'same') -eq 0) 'a second install replaces the first cleanly'
 
@@ -59,6 +60,20 @@ Check (-not (Compare-Object $before $after)) 'game folder and its subfolders are
 Write-Package @(@{ name = 'extra.pack'; sha256 = (Get-FileHash -LiteralPath (Join-Path $pkg 'extra.pack')).Hash; dest = '..\escape.pack' })
 Check ((Run 'Deploy' $same 'same') -ne 0) 'refuses a component that points outside the game folder'
 Check (-not (Test-Path -LiteralPath (Join-Path $same 'dxgi.dll'))) 'and installs nothing in that case'
-Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+Write-Package @()
+$auto = Game 'auto' $(if ($dllIs32) { $exe32 } else { $exe64 })
+Check ((Run 'Deploy' $auto 'auto' 'Auto') -eq 0) 'installs the automatic graphics API profile'
+$autoIni = Get-Content -LiteralPath (Join-Path $auto 'NeuralAliasHost.ini') -Raw
+Check ($autoIni -match '(?m)^graphics_api=auto\r?$' -and
+       $autoIni -match '(?m)^\[adapter\]\r?\nenabled=1\r?$' -and
+       $autoIni -match '(?m)^\[discovery\]\r?\nenabled=1\r?\nread_only=1\r?$' -and
+       $autoIni -match '(?m)^producers=1\r?\nearly_install=1\r?$') 'automatic DX12 can publish scene selection from early observations'
+Check ((Run 'Rollback' $auto 'auto' 'Auto') -eq 0) 'uninstalls the automatic graphics API profile'
+$resolved = (Resolve-Path -LiteralPath $root).ProviderPath
+$temp = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).ProviderPath.TrimEnd('\')
+if ((Split-Path -Parent $resolved) -eq $temp -and
+    (Split-Path -Leaf $resolved) -match '^na-deploy-selftest-[a-f0-9]{32}$') {
+    Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction SilentlyContinue
+}
 if ($fail) { Write-Output "deploy-native11 selftest: $fail failed"; exit 1 }
 Write-Output 'deploy-native11 selftest: all passed'

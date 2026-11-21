@@ -56,7 +56,15 @@
 
 namespace na::motion {
 
-enum class Tier : uint32_t { None = 0, EngineDxil = 1, CameraReprojection = 2, ResidualOpticalFlow = 3 };
+enum class Tier : uint32_t { None = 0, EngineDxil = 1, CameraReprojection = 2, ResidualOpticalFlow = 3,
+                             EstimatedTotal = 4 }; // Tier 1 filled by a Tier1Source::Estimated supplier
+
+// Who supplied the Tier 1 field. The arithmetic is the same for both (a complete vector per pixel,
+// taken as it is, never snapped, clamped or combined with a camera); only the label and the counter
+// differ, so a measured field can never be reported as the game's own motion vectors.
+//   Engine     the game's own motion vectors (the default; behaviour exactly as before the tag).
+//   Estimated  TOTAL motion measured from the pictures (core/total_motion.hpp). Never a residual.
+enum class Tier1Source : uint8_t { Engine = 0, Estimated = 1 };
 
 struct Field2 {          // 2 floats per pixel
     const float* xy = nullptr;
@@ -76,6 +84,19 @@ struct Tier1Input {
     Field1 valid_mask;       // per-pixel: finite value in (0,1] = written by
                              // the engine; 0 = not written; anything else
                              // (NaN/Inf/<0/>1) = malformed -> INVALID; null = all
+    Tier1Source source = Tier1Source::Engine; // last on purpose: existing aggregate initialisers keep meaning Engine
+};
+
+// TOTAL motion measured from the pictures (core/total_motion.hpp), standing BEHIND tier 1: at a
+// pixel where tier 1 gives no vector (no tier 1, not written there, malformed, not finite) the
+// measured vector is taken as it is, with provenance NA_MOTION_ESTIMATED. A game's or a replay's
+// vectors cover only what they cover; before this slot a partial tier-1 field replaced the measured
+// one whole, and everything outside it was left with no motion (Astra, 2026-11-17, on Cort's
+// Sniper Elite Resistance run of 3621e3a8). Never a residual, never combined with a camera.
+struct EstimatedInput {
+    bool valid = false;
+    Field2 motion;           // arbiter convention, complete vector per pixel
+    Field1 valid_mask;       // same domain rule as tier 1's; null = all
 };
 
 struct Tier2Input {
@@ -109,6 +130,7 @@ enum Provenance : uint8_t {
     NA_MOTION_ENGINE = 1,           // Tier 1
     NA_MOTION_CAMERA = 2,           // Tier 2 only (static geometry assumption)
     NA_MOTION_CAMERA_RESIDUAL = 3,  // Tier 2 + Tier 3 (estimated)
+    NA_MOTION_ESTIMATED = 4,        // Tier 1 from a Tier1Source::Estimated supplier (measured total motion)
 };
 enum ProvenanceFlags : uint8_t {
     NA_MOTION_F_FILTERED = 0x10,    // residual was snapped or clamped
@@ -123,7 +145,8 @@ struct Output {
 
 struct Stats {
     Tier tier_used = Tier::None;
-    uint64_t pixels_engine = 0;
+    uint64_t pixels_engine = 0;      // Tier 1, Tier1Source::Engine
+    uint64_t pixels_estimated = 0;   // measured total motion: Tier1Source::Estimated or the EstimatedInput (never counted as engine)
     uint64_t pixels_camera = 0;
     uint64_t pixels_residual_added = 0;
     uint64_t pixels_residual_snapped = 0;
@@ -140,6 +163,10 @@ bool ValidateConfig(const Config& cfg);
 // Runs the arbitration for one frame. A tier whose extent mismatches `out`
 // is rejected as a whole. Returns false only if `out` or `cfg` is unusable.
 bool Arbitrate(const Tier1Input& t1, const Tier2Input& t2, const Tier3Input& t3,
+               const Config& cfg, Output& out, Stats* stats);
+// The same with measured total motion behind tier 1 (EstimatedInput): per pixel tier 1, then the
+// measured vector, then the camera tiers, then nothing.
+bool Arbitrate(const Tier1Input& t1, const EstimatedInput& estimated, const Tier2Input& t2, const Tier3Input& t3,
                const Config& cfg, Output& out, Stats* stats);
 
 // Analytical reprojection for one pixel: v = p_prev - p_cur in pixels using

@@ -10,8 +10,25 @@ int main() {
     WritePrivateProfileStringW(L"dlss",L"follow_game_resolution",L"1",ini);
     WritePrivateProfileStringW(L"fg",L"preset",L"3",ini);
     WritePrivateProfileStringW(L"fg",L"profile_override",L"1",ini);
+    WritePrivateProfileStringW(L"j2",L"flow_loosen",L"0",ini);
     na::settings::SetIniPath(ini); na::settings::Load();
     auto& s=na::settings::Get();
+    for (unsigned old = 0; old <= 100; ++old)
+        CHECK(na::settings::RcasStrength(na::settings::RcasSliderFromLegacy(old)) == 2 * (old > 75 ? 75 : old));
+    CHECK(na::settings::RcasStrength(s.j2_sharpness) == 100);
+    WritePrivateProfileStringW(L"j2", L"sharpen", L"90", ini);
+    na::settings::Load();
+    CHECK(s.j2_sharpness == 100);
+    s.j2_sharpness = 53;
+    CHECK(na::settings::Save());
+    s.j2_sharpness = 0;
+    na::settings::Load();
+    CHECK(s.j2_sharpness == 53);
+    // A rollback can edit the legacy key while the newer key remains on disk.
+    WritePrivateProfileStringW(L"j2", L"sharpen", L"50", na::settings::UserIniPath());
+    na::settings::Load();
+    CHECK(na::settings::RcasStrength(s.j2_sharpness) == 100);
+    CHECK(strstr(na::settings::EffectiveSummary(), "j2.flow_loosen=50(builtin)") != nullptr);
     CHECK(s.donut_tone==0&&s.donut_bloom==0&&s.donut_bias==800&&s.donut_white==3000);
     WritePrivateProfileStringW(L"experimental",L"nvrhi",L"1",na::settings::UserIniPath());
     s.donut_tone=1;s.donut_bloom=1;s.donut_bias=625;s.donut_curve=1;s.donut_bloom_sigma=24000;
@@ -26,7 +43,9 @@ int main() {
     CHECK(s.follow_game_resolution==1);
     CHECK(wcsstr(na::settings::UserIniPath(),scope)!=nullptr);
     CHECK(na::settings::Save());
+    WritePrivateProfileStringW(L"j2",L"flow_loosen",L"100",na::settings::UserIniPath());
     s.fg_preset=1; s.dlss_mode=0; s.follow_game_resolution=0; na::settings::Load();
+    CHECK(strstr(na::settings::EffectiveSummary(), "j2.flow_loosen=50(builtin)") != nullptr);
     CHECK(s.follow_game_resolution==1);
     CHECK(s.fg_preset==3 && s.dlss_mode==4);
     CHECK(s.xegtao_enabled==1&&s.xegtao_radius_x1000==1250&&s.xegtao_denoise==3&&s.xegtao_falloff==450);

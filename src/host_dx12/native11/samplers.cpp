@@ -103,6 +103,9 @@ HRESULT STDMETHODCALLTYPE CreateSamplerState_d(ID3D11Device* dev, const D3D11_SA
             if (e->wants_af) g_elig_af.fetch_add(1, std::memory_order_relaxed);
             slot = std::move(e);
         }
+        l.unlock();
+        // Automatic AF: the game's own description, before any variant of ours (one detector, both APIs).
+        if (fresh) af::Global().Observe(AfFacts(f));
     }
     return hr;
 }
@@ -136,29 +139,36 @@ ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af, bool& created)
     return made.Get();
 }
 
-void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n, ID3D11SamplerState* const* s)
+void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n,
+          ID3D11SamplerState* const* s, bool compute, bool refresh = false)
 {
-    if (!IsGameWork(c) || !s || !n || start >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
+    if (!s || !n || start >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
         n > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT - start) return original(c, start, n, s);
+    auto* shadow = SamplerShadowOf(c);
+    if (!shadow) return original(c, start, n, s);
+    auto* slots = (compute ? shadow->compute : shadow->pixel) + start;
     const bool after_scene = g_scene_handed.load(std::memory_order_relaxed) && c->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
     const float bias = after_scene ? 0.0f : g_bias_fn ? g_bias_fn() : 0.0f;
     const uint32_t af = after_scene ? 0u : g_af_fn ? g_af_fn() : 0u;
     uint64_t kept_own = 0;
+    ID3D11SamplerState* requested[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
     ID3D11SamplerState* swapped[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
     std::shared_ptr<Entry> entries[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
     {
         std::shared_lock<std::shared_mutex> lock(g_mu);
         for (UINT i = 0; i < n; ++i) {
-            const auto it = g_entries.find(s[i]);
+            // Refreshes read physical bindings. An explicit game bind always
+            // takes its own argument, even if another slot shares that object.
+            requested[i] = refresh && s[i] && s[i] == slots[i].applied ? slots[i].original.Get() : s[i];
+            const auto it = g_entries.find(requested[i]);
             if (it != g_entries.end()) entries[i] = it->second;
         }
     }
     uint64_t unknown = 0, changed = 0;
     for (UINT i = 0; i < n; ++i) {
-        swapped[i] = s[i];
-        if (!s[i]) continue;
+        swapped[i] = requested[i];
         const auto& e = entries[i];
-        if (!e) { ++unknown; continue; }
+        if (!e) { slots[i] = {}; unknown += requested[i] != nullptr; continue; }
         swapped[i] = e->original.Get();
         bool created = false;
         if (auto* v = VariantOf(*e, bias, af, created)) {
@@ -168,7 +178,11 @@ void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n, 
                 g_entries.emplace(v, e); // lets a cached/GetSamplers variant restore its original
             }
         }
-        if (swapped[i] != e->original.Get()) ++changed;
+        if (swapped[i] != e->original.Get()) {
+            slots[i].original = e->original;
+            slots[i].applied = swapped[i];
+            ++changed;
+        } else slots[i] = {};
         if (after_scene) {
             if (e->wants_bias || e->wants_af) ++kept_own;
             continue; // the menu's "applied" readout stays the scene's
@@ -195,20 +209,20 @@ void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n, 
 // Immediate-class detours (also serve the deferred class when both share these functions).
 void STDMETHODCALLTYPE PSSetSamplers_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11SamplerState* const* s)
 {
-    Bind(g_ps[0], c, start, n, s);
+    Bind(g_ps[0], c, start, n, s, false);
 }
 void STDMETHODCALLTYPE CSSetSamplers_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11SamplerState* const* s)
 {
-    Bind(g_cs[0], c, start, n, s);
+    Bind(g_cs[0], c, start, n, s, true);
 }
 // Deferred-class detours (separate trampolines when the two classes have different functions).
 void STDMETHODCALLTYPE PSSetSamplersDeferred_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11SamplerState* const* s)
 {
-    Bind(g_ps[1], c, start, n, s);
+    Bind(g_ps[1], c, start, n, s, false);
 }
 void STDMETHODCALLTYPE CSSetSamplersDeferred_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11SamplerState* const* s)
 {
-    Bind(g_cs[1], c, start, n, s);
+    Bind(g_cs[1], c, start, n, s, true);
 }
 
 } // namespace
@@ -259,8 +273,8 @@ uint64_t SamplerPolicyKey()
     if (!g_installed.load(std::memory_order_relaxed)) return 0;
     // A value no (bias, af) pair has, so the first draw after the scene is handed over, and the first
     // draw of the next frame, each refresh what is bound.
-    if (g_scene_handed.load(std::memory_order_relaxed)) return ~uint64_t{1};
-    return Key(g_bias_fn ? g_bias_fn() : 0.f, g_af_fn ? g_af_fn() : 0u);
+    const uint64_t key = Key(g_bias_fn ? g_bias_fn() : 0.f, g_af_fn ? g_af_fn() : 0u);
+    return key && g_scene_handed.load(std::memory_order_relaxed) ? ~uint64_t{1} : key;
 }
 void SetSceneHanded(bool handed) { g_scene_handed.store(handed, std::memory_order_relaxed); }
 bool SceneHanded() { return g_scene_handed.load(std::memory_order_relaxed); }
@@ -271,10 +285,10 @@ void RefreshSamplers(void* context)
     ID3D11SamplerState* bound[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
     const int deferred = c->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED ? 1 : 0;
     c->PSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
-    Bind(g_ps[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    Bind(g_ps[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound, false, true);
     for (auto* s : bound) if (s) s->Release();
     c->CSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
-    Bind(g_cs[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    Bind(g_cs[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound, true, true);
     for (auto* s : bound) if (s) s->Release();
 }
 
@@ -304,10 +318,10 @@ int FormatSamplerStatus(char* out, unsigned long n)
     const float want_bias = g_bias_fn ? g_bias_fn() : 0.0f;
     const uint32_t want_af = g_af_fn ? g_af_fn() : 0u;
     return std::snprintf(out, n,
-                         "native11_samplers{installed=%d want_bias=%.3f want_af=%u applied_bias=%.3f applied_af=%u created=%llu "
+                         "native11_samplers{installed=%d want_bias=%.3f want_af=%s applied_bias=%.3f applied_af=%u created=%llu "
                          "material=%llu af_eligible=%llu variants=%llu variant_failures=%llu binds=%llu swapped=%llu unknown=%llu "
                          "after_scene_own=%llu}",
-                         s.installed ? 1 : 0, want_bias, want_af, s.bias, s.af, static_cast<unsigned long long>(s.created),
+                         s.installed ? 1 : 0, want_bias, af::ActionName(want_af), s.bias, s.af, static_cast<unsigned long long>(s.created),
                          static_cast<unsigned long long>(s.eligible_bias), static_cast<unsigned long long>(s.eligible_af),
                          static_cast<unsigned long long>(s.variants), static_cast<unsigned long long>(s.variant_failures),
                          static_cast<unsigned long long>(s.binds), static_cast<unsigned long long>(s.swapped),

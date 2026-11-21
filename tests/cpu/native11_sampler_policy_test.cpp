@@ -2,9 +2,13 @@
 // rules as the DX12 host, on D3D11's encodings.
 #include "test_support.hpp"
 #include "host_dx12/native11/sampler_policy.hpp"
+#include "core/anisotropic_auto.hpp"
 
 using na::native11::ApplyPolicy;
 using na::native11::SamplerFacts;
+using na::af::kAuto16;
+using na::af::kForce16;
+using na::af::kKeep;
 
 namespace {
 constexpr uint32_t kMinMagMipLinear = 0x15, kMinMagMipPoint = 0x00, kAniso = 0x55, kCmpLinear = 0x95, kMinLinearMagMipPoint = 0x10;
@@ -27,33 +31,43 @@ int main()
     return test::run({
         {"a tiling trilinear material sampler gets the total target bias and 16x AF", [] {
             auto s = S(kMinMagMipLinear, kWrap, kWrap, -0.5f);
-            CHECK(ApplyPolicy(s, -1.0f, 16));
+            CHECK(ApplyPolicy(s, -1.0f, kAuto16));
             CHECK(s.mip_lod_bias == -1.0f);
             CHECK(s.filter == kAniso && s.max_anisotropy == 16);
         }},
-        {"a clamped linear screen-space sampler gets AF but never the bias", [] {
+        {"a clamped linear screen-space sampler gets neither AF nor the bias", [] {
             auto s = S(kMinMagMipLinear, kClamp, kClamp, 0.0f);
-            CHECK(ApplyPolicy(s, -1.0f, 8));
+            CHECK(!ApplyPolicy(s, -1.0f, kForce16));
             CHECK(s.mip_lod_bias == 0.0f);
-            CHECK(s.filter == kAniso && s.max_anisotropy == 8);
+            CHECK(s.filter == kMinMagMipLinear && s.max_anisotropy == 1);
         }},
         {"point, comparison and mip-less samplers are untouched", [] {
             auto p = S(kMinMagMipPoint, kWrap, kWrap);
-            CHECK(!ApplyPolicy(p, -1.0f, 16));
+            CHECK(!ApplyPolicy(p, -1.0f, kForce16));
             auto c = S(kCmpLinear, kWrap, kWrap);
-            CHECK(!ApplyPolicy(c, -1.0f, 16));
+            CHECK(!ApplyPolicy(c, -1.0f, kForce16));
             auto m = S(kMinMagMipLinear, kWrap, kWrap, 0.0f, 1, 0.0f);
-            CHECK(!ApplyPolicy(m, -1.0f, 16));
+            CHECK(!ApplyPolicy(m, -1.0f, kForce16));
         }},
-        {"the game's own higher anisotropy is never lowered; target 0 keeps its bias", [] {
+        {"the game's own 8x/16x stay under automatic; target 0 keeps its bias", [] {
             auto s = S(kAniso, kWrap, kWrap, -0.25f, 16);
-            CHECK(!ApplyPolicy(s, 0.0f, 8));
+            CHECK(!ApplyPolicy(s, 0.0f, kForce16));
             CHECK(s.max_anisotropy == 16 && s.mip_lod_bias == -0.25f);
+            auto e = S(kAniso, kWrap, kWrap, 0.0f, 8);
+            CHECK(!ApplyPolicy(e, 0.0f, kAuto16));
+            CHECK(e.max_anisotropy == 8);
+            CHECK(ApplyPolicy(e, 0.0f, kForce16));
+            CHECK(e.max_anisotropy == 16);
+            auto k = S(kMinMagMipLinear, kWrap, kWrap);
+            CHECK(!ApplyPolicy(k, 0.0f, kKeep));
         }},
         {"linear minification with point mips still counts as a material (bias moves the mip)", [] {
             auto s = S(kMinLinearMagMipPoint, kWrap, kClamp);
-            CHECK(ApplyPolicy(s, -1.0f, 0));
+            CHECK(ApplyPolicy(s, -1.0f, kKeep));
             CHECK(s.mip_lod_bias == -1.0f && s.filter == kMinLinearMagMipPoint);
+            // Point magnification is deliberate: never made anisotropic.
+            auto a = S(kMinLinearMagMipPoint, kWrap, kWrap);
+            CHECK(!ApplyPolicy(a, 0.0f, kForce16));
         }},
     });
 }

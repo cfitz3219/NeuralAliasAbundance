@@ -33,6 +33,8 @@ struct State {
     Slot slots[kSlots];
     bool copy = false;
     uint64_t signalled = 0;
+    uint32_t stale_every = 0; // tests only (Hello::stale_every_for_tests)
+    uint64_t frames_answered = 0;
 };
 
 Reply Fail(HRESULT hr, const char* why)
@@ -85,6 +87,7 @@ Reply OnHello(State& s, const Hello& h)
     const HRESULT hr2 = OpenAndClose(s.device.Get(), h.done_fence, s.done);
     if (FAILED(hr) || FAILED(hr2)) return Fail(FAILED(hr) ? hr : hr2, "The companion could not open the shared frame fences.");
     s.copy = h.copy_for_tests != 0;
+    s.stale_every = h.stale_every_for_tests;
     Reply r{};
     r.ok = 1;
     if (s.copy) {
@@ -227,7 +230,13 @@ int RunCompanion(const wchar_t* name, DWORD game_pid)
         switch (request.kind) {
         case Kind::Hello: reply = OnHello(*state, request.hello); break;
         case Kind::Bind: reply = OnBind(*state, request.bind); break;
-        case Kind::Frame: reply = OnFrame(*state, request.frame); break;
+        case Kind::Frame:
+            reply = OnFrame(*state, request.frame);
+            reply.value = request.frame.value;
+            reply.slot = request.frame.slot;
+            // Tests only: answer as if for the frame before, which the in-game half must refuse.
+            if (state->stale_every && ++state->frames_answered % state->stale_every == 0) --reply.value;
+            break;
         case Kind::Bye: reply.ok = 1; bye = true; break;
         default: reply = Fail(E_NOTIMPL, "A request this companion does not know; the two halves are from different builds."); break;
         }

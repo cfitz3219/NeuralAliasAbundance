@@ -1,4 +1,5 @@
 #include "host_dx12/settings.hpp"
+#include "core/anisotropic_auto.hpp"
 #include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/effects/donut.hpp"
 // J2 on Anno's shape (the run that crashed, 2026-10-26): the path the game takes,
@@ -243,11 +244,11 @@ int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float n
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT of{};const auto od=out->GetDesc();dev->GetCopyableFootprints(&od,0,1,0,&of,nullptr,nullptr,&bytes);
     auto rb=test::CreateBuffer(dev,bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);REQUIRE(rb);test::List list;REQUIRE(list.Create(dev));REQUIRE(SUCCEEDED(list.list->Close()));
     std::vector<float> original;unsigned pass=0;
-    const std::vector<float> choices=mip_pixels?std::vector<float>{0,-1,-.5f,-1.5849625f,-2,-2.25f,4,0}:std::vector<float>{0,16,0,4,8,16,0};
+    const std::vector<float> choices=mip_pixels?std::vector<float>{0,-1,-.5f,-1.5849625f,-2,-2.25f,4,0}:std::vector<float>{0,float(na::af::kForce16),0,float(na::af::kAuto16),float(na::af::kForce16),0};
     for(float choice:choices){
         const UINT af=mip_pixels?0u:UINT(choice);
         const auto before=na::observe::GetMipLiveStats();
-        if(mip_pixels)na::observe::SetSamplerMipBiasLive(choice);else na::observe::SetSamplerAnisotropy(af);
+        if(mip_pixels)na::observe::SetSamplerMipBiasLive(choice);else na::observe::SetSamplerAfAction(af); // af::Action
         REQUIRE(na::observe::WaitSamplerVariant(10000));
         const auto after=na::observe::GetMipLiveStats();
         // Three root levels exist, but switching AF must compile only the one
@@ -280,7 +281,7 @@ int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float n
         // never an extra readback or capture in the game's live hooks.
         char directory[MAX_PATH]{};
         if(GetEnvironmentVariableA("NA_TEST_AF_CAPTURE",directory,MAX_PATH)>0){
-            char name[MAX_PATH]{};sprintf_s(name,"%s/%s-%02u-%ux.pgm",directory,clamp?"clamp":"wrap",pass,af);
+            char name[MAX_PATH]{};sprintf_s(name,"%s/%s-%02u-action%u.pgm",directory,clamp?"clamp":"wrap",pass,af);
             FILE* image=nullptr;REQUIRE(fopen_s(&image,name,"wb")==0&&image);
             std::fprintf(image,"P5\n%u %u\n255\n",W,H);
             for(float value:values)std::fputc(int(std::lround(std::clamp(value,0.f,1.f)*255)),image);
@@ -293,7 +294,7 @@ int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float n
             else control+=std::abs(values[i]-original[i]);
         }
         change/=W*H/2;contrast/=W*H/2;control/=W*H/2;
-        if(!mip_pixels)std::printf("AF pixels %s %ux: oblique change %.6f contrast %.6f isotropic change %.6f effective%u\n",clamp?"clamp":"wrap",af,change,contrast,control,na::observe::GetMipLiveStats().live_aniso);
+        if(!mip_pixels)std::printf("AF pixels %s action %u: oblique change %.6f contrast %.6f isotropic change %.6f effective%u\n",clamp?"clamp":"wrap",af,change,contrast,control,na::observe::GetMipLiveStats().live_aniso);
         if(mip_pixels){
             double mean=0;for(size_t i=0;i<values.size();++i)if(i%W<W/2)mean+=values[i];mean/=W*H/2;
             // The same pre-existing root/PSO/texture are rebound after each live request.
@@ -302,7 +303,11 @@ int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float n
             std::printf("mip live pixels requested %.2f active %.2f: mean %.6f expected %.6f, change %.6f direct-load control %.6f\n",choice,after.live_bias,mean,expected,change,control);
             CHECK(std::abs(mean-expected)<.006);CHECK(after.live_bias==choice);
             if(choice==0||choice==native_bias)CHECK(change<.00001);else CHECK(change>.001);
-        }else {if(af==0)CHECK(change<.01);if(af==16)CHECK(change>.15);}
+        }else {
+            // Automatic and forced both raise this tiling trilinear sampler to 16x; a CLAMP sampler
+            // is not a world sampler (core/anisotropic_auto.hpp rule 4) and never changes.
+            if(af==0||clamp)CHECK(change<.01);else CHECK(change>.15);
+        }
         CHECK(control<.01);CHECK(dev->GetDeviceRemovedReason()==S_OK);
     }
     REQUIRE(na_observe_stop()==NA_OK);na::observe::SetProcessExiting();return test::finish(mip_pixels?"live mip pixels":"AF pixels");
@@ -664,10 +669,10 @@ int main(int argc, char** argv)
             na::observe::SetSamplerMipBiasLive(-1.0f);
         }
         na::observe::SetSamplerMipBias(0.0f);
-        // 16x anisotropic filtering (menu switch, no mip bias): a tiling linear sampler and an
-        // 8x static sampler become 16x (the root signature is rebuilt even with no bias change);
-        // clamped linear materials are included; shadow comparisons stay unchanged;
-        // a native 16x sampler is left at the game's own setting.
+        // Forced 16x anisotropic filtering (hidden [j2] anisotropic_filter=16, no mip bias): a
+        // tiling linear sampler and an 8x static sampler become 16x (the root signature is rebuilt
+        // even with no bias change); clamped samplers (post-processing, HUD) and shadow
+        // comparisons stay unchanged; a native 16x sampler is left at the game's own setting.
         {
             na::observe::SetSamplerAnisotropy(16);
             const auto a0 = na::observe::GetAnisoStats();
@@ -694,7 +699,7 @@ int main(int argc, char** argv)
             sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             dev->CreateSampler(&sd, h2);
             const auto a3 = na::observe::GetAnisoStats();
-            CHECK(a3.samplers == a2.samplers + 1);
+            CHECK(a3.samplers == a2.samplers); // CLAMP: not a world sampler (core/anisotropic_auto.hpp rule 4)
             sd.Filter = D3D12_FILTER_ANISOTROPIC;
             sd.MaxAnisotropy = 16;
             sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -1277,6 +1282,11 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(dev->GetDeviceRemovedReason() == S_OK);
         // Evidence capture: written only after each slot's fences completed.
         d.WaitIdle();
+        // The writer thread puts the frames on disk one after another, and Shutdown gives it two
+        // seconds. Three of these tests write at once in CI, and on a busy machine that was not
+        // always enough (3536dbba: recorded 3, written 2, in one of two runs of the same code). The
+        // check below is unchanged; the test only lets the writer finish first.
+        for (int wait = 0; wait < 400 && na::capture::j2::GetStats().written < na::capture::j2::GetStats().submitted; ++wait) Sleep(50);
         na::capture::j2::Shutdown();
         const auto cs = na::capture::j2::GetStats();
         std::printf("capture: recorded %u submitted %u written %u busy %u discarded %u retired %u no-present %u errors %u\n",
@@ -1324,6 +1334,7 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return image.Load(int4(int2(po
         CHECK(depth_total==st.frames && camera_total==st.frames); // count submissions, not attempts
         CHECK(evaluations()-evals0>=17 && evaluations()-evals0<=(entry_retire ? 40 : 24));
         CHECK(dev->GetDeviceRemovedReason()==S_OK);
+        for(int wait=0;wait<400&&na::capture::j2::GetStats().written<na::capture::j2::GetStats().submitted;++wait)Sleep(50); // let the writer finish first (see the same wait above)
         na::capture::j2::Shutdown();
         const auto cs=na::capture::j2::GetStats();
         CHECK(cs.written==3 && cs.errors==0 && cs.without_present==0);

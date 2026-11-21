@@ -1,8 +1,14 @@
 // Shared pipeline construction adapted from j2_flow.cpp.
-    ComPtr<ID3DBlob> cs_encode, cs_accept, err;
-    if (FAILED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "encode", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_encode, &err)) ||
-        FAILED(D3DCompile(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", nullptr, nullptr, "accept", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_accept, &err)))
+    const auto compile = [](const char* entry, ComPtr<ID3DBlob>& shader) {
+        return compile_flow_shader(na::j2::kFlowShader, sizeof na::j2::kFlowShader - 1, "j2_flow", entry, shader);
+    };
+    ComPtr<ID3DBlob> cs_encode, cs_accept, cs_measure, cs_cut_state, cs_cut_show, err;
+    if (!compile("encode",cs_encode) || !compile("accept",cs_accept))
         return false;
+    // The camera-free programs. A failure here leaves the residual path above working: measured
+    // motion is then unavailable and says so (Record, Frame::total).
+    const bool camera_free =
+        compile("measure",cs_measure) && compile("cut_state",cs_cut_state) && compile("cut_show",cs_cut_show);
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 8;
@@ -38,4 +44,46 @@
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_encode)))) return false;
     pd.CS = {cs_accept->GetBufferPointer(), cs_accept->GetBufferSize()};
     if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_accept)))) return false;
+    if (camera_free) {
+        pd.CS = {cs_measure->GetBufferPointer(), cs_measure->GetBufferSize()};
+        const bool a = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_measure)));
+        pd.CS = {cs_cut_state->GetBufferPointer(), cs_cut_state->GetBufferSize()};
+        const bool b = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_cut_state)));
+        pd.CS = {cs_cut_show->GetBufferPointer(), cs_cut_show->GetBufferSize()};
+        const bool c = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_cut_show)));
+        if (!a || !b || !c) { g.pso_measure.Reset(); g.pso_cut_state.Reset(); g.pso_cut_show.Reset(); }
+    }
+    {
+        // VARIANT: motion/screen-fit (flow_shaders.hpp fit_sample / fit_accum / fit_solve). All three
+        // programs or none: without them `measure` has no model to follow, and the j2screenfit line
+        // says on=0.
+        static const char* const entries[3] = {"fit_sample", "fit_accum", "fit_solve"};
+        ComPtr<ID3D12PipelineState>* const states[3] = {&g.pso_fit_sample, &g.pso_fit_accum, &g.pso_fit_solve};
+        bool all = camera_free && g.pso_measure;
+        for (int i = 0; i < 3 && all; ++i) {
+            ComPtr<ID3DBlob> cs;
+            all = compile(entries[i],cs);
+            if (all) {
+                pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+                all = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(states[i]->ReleaseAndGetAddressOf())));
+            }
+        }
+        if (!all) for (auto* state : states) state->Reset();
+    }
+    {
+        // VARIANT: flow/frame-candidates (flow_shaders.hpp kCandidateShader). All four programs or
+        // none: without them the search's grid is used as it is, and the j2candidates line says on=0.
+        static const char* const entries[4] = {"cand_clear", "cand_count", "cand_pick", "cand_apply"};
+        ComPtr<ID3D12PipelineState>* const states[4] = {&g.pso_cand_clear, &g.pso_cand_count, &g.pso_cand_pick, &g.pso_cand_apply};
+        bool all = true;
+        for (int i = 0; i < 4 && all; ++i) {
+            ComPtr<ID3DBlob> cs;
+            all = compile_flow_shader(na::j2::kCandidateShader, sizeof na::j2::kCandidateShader - 1, "j2_candidates", entries[i], cs);
+            if (all) {
+                pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+                all = SUCCEEDED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(states[i]->ReleaseAndGetAddressOf())));
+            }
+        }
+        if (!all) for (auto* state : states) state->Reset();
+    }
     return true;

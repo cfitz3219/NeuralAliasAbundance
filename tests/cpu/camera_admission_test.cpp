@@ -137,6 +137,36 @@ int main()
             CHECK(!ContinuesCamera(last, Camera(0.3, {100, 20, -50}, 3))); // zoomed to twice the lens
             CHECK(StartContinues(Camera(0.3, {100, 20, -50}), Camera(0.6, {130, 20, -50}))); // the start rule allows more
         }},
+        {"a matrix with another horizontal lens scale does not continue the camera", [] {
+            // The two matrices of Cort's Sniper Elite Resistance capture j2-20261116-205627 (build 3621e3a8),
+            // as the reader holds them. `camera` is the game's (a projection alone, 3440x1440). `other` was
+            // admitted as its continuation on frames 4, 7 and 29 of 30: the same forward direction, a
+            // vertical scale 2 % off, 0.23 away, and no horizontal scale to speak of.
+            const Matrix camera{0.897701, 0, 0, 0, 0, -2.14451, 0, 0, 0, 0, -5.00025e-05, 0.100005, 0, 0, 1, 0};
+            const Matrix other{0, 0, -1.83802, 0, 2.05819e-05, 2.09627, 0, 0.000696492, 3.62936e-42, 0, 0, 0.83, -0.00146003, 0, 1, -0.000332254};
+            VpGeometry last{}, g{};
+            CHECK(DecomposeViewProjection(camera, last) && DecomposeViewProjection(other, g));
+            NEAR(last.sx, 0.897701, 1e-6);
+            NEAR(g.sy, 2.09627, 1e-4);
+            CHECK(g.sx < 0.01); // what the vertical scale alone could not see
+            CHECK(!SameLens(last, g));
+            CHECK(!ContinuesCamera(last, other));
+            CHECK(!ContinuesView(last, other));
+            CHECK(!StartContinues(camera, other) && !StartContinues(other, camera));
+            CHECK(!MatchesSceneAspect(other, kW, kH) && MatchesSceneAspect(camera, kW, kH));
+            // The log says why: it continued the camera in everything but the lens.
+            VpGeometry seen{};
+            CHECK(ContinuesButForLens(last, other, &seen) && seen.sx < 0.01 && !ContinuesButForLens(last, camera));
+            // The camera itself, and itself a frame later, still continue.
+            CHECK(ContinuesCamera(last, camera) && ContinuesView(last, camera) && StartContinues(camera, camera));
+            // A real lens change is told by either scale: 6 % wider only, then 6 % taller only.
+            Matrix wider = camera, taller = camera;
+            wider[0] *= 1.06;
+            taller[5] *= 1.06;
+            CHECK(!ContinuesCamera(last, wider) && !ContinuesCamera(last, taller));
+            wider[0] = camera[0] * 1.04;
+            CHECK(ContinuesCamera(last, wider));
+        }},
         {"a matrix with the camera position removed is camera-relative", [] {
             CHECK(IsCameraRelative(Stored(Camera(0.3))));
             CHECK(!IsCameraRelative(Stored(Camera(0.3, {11659, -8018, 1746}))));

@@ -1,4 +1,4 @@
-# One install / uninstall / results script for any native DX11 game. The game is a parameter, never code:
+# One install / uninstall / results script for Route B. The game is a parameter, never code:
 # the caller (a package's .cmd files) passes the folder, the exe name and a short label.
 # Additive only: it refuses to overwrite anything the game ships, records what it added, and removes exactly that.
 param([ValidateSet('Deploy','Rollback','Results')] [string] $Action = 'Deploy',
@@ -7,7 +7,10 @@ param([ValidateSet('Deploy','Rollback','Results')] [string] $Action = 'Deploy',
     [Parameter(Mandatory = $true)] [string] $Label,        # short name for folders and logs, letters/digits/dashes
     [string] $Title = $Label,
     [string] $DocumentsDirectory = (Join-Path $env:USERPROFILE 'Documents'),
-    [string] $EvidenceRoot = (Join-Path $env:LOCALAPPDATA 'NeuralAlias\runs'))
+    [string] $EvidenceRoot = (Join-Path $env:LOCALAPPDATA 'NeuralAlias\runs'),
+    [ValidateSet('Native11','Auto')] [string] $GraphicsApi = 'Native11',
+    [switch] $StartAfterFactory,
+    [string[]] $AlsoClose = @())
 $ErrorActionPreference = 'Stop'
 if ($Label -notmatch '^[A-Za-z0-9-]{1,40}$') { throw 'Label must be letters, digits and dashes.' }
 $Docs = $DocumentsDirectory
@@ -15,6 +18,7 @@ $Log = Join-Path $Docs "NA-$Label-log.txt"
 $Evid = Join-Path ([IO.Path]::GetFullPath($EvidenceRoot)) $Label
 $Manifest = Join-Path $Evid 'manifest.json'
 $ExeBase = [IO.Path]::GetFileNameWithoutExtension($Exe)
+$autoApi = $GraphicsApi -eq 'Auto'
 $Owned = 'dxgi.dll', 'nvngx_dlss.dll', 'NeuralAliasDlaa64.exe', 'NeuralAliasHost.ini', 'NeuralAlias-AMD-OpticalFlow-LICENSE.txt'
 function Log([string] $m) { $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m; Write-Host $line; Add-Content -LiteralPath $Log -Value $line }
 # 0x8664 = 64-bit, 0x014c = 32-bit. A proxy of the wrong kind is never loaded by the game, silently.
@@ -55,6 +59,9 @@ function Save-Results([string] $why) {
             $last = $lines | Where-Object { $_ -match $pattern } | Select-Object -Last 1
             if ($last) { $summary.Add($last) }
         }
+        # What the referee found, said plainly (the raw lines stay in the copied log).
+        $rs = Join-Path $PSScriptRoot 'referee-summary.ps1'
+        if (Test-Path -LiteralPath $rs) { . $rs; foreach ($l in (Get-RefereeSummary $lines)) { $summary.Add($l) } }
     }
     foreach ($s in @($logs | Where-Object { $_.Name -like 'startup*' })) {
         $summary.Add(''); $summary.Add("== $($s.Name) (first 60 lines)")
@@ -112,7 +119,7 @@ try {
     $GameDir = (Resolve-Path -LiteralPath $GameDir).ProviderPath
     $gameExe = Join-Path $GameDir $Exe
     if (-not (Test-Path -LiteralPath $gameExe)) { throw "Game not found at $gameExe. Nothing changed." }
-    if (Get-Process -Name $ExeBase -ErrorAction SilentlyContinue) { throw "$Title is running. Save and exit first." }
+    if (Get-Process -Name (@($ExeBase) + $AlsoClose) -ErrorAction SilentlyContinue) { throw "$Title is running. Save and exit first." }
     if ($Action -eq 'Rollback') { [void](Save-Results 'before uninstall'); Invoke-Rollback; exit 0 }
 
     Set-Content -LiteralPath $Log -Value "NeuralAlias install for $Title, $(Get-Date -Format o)"
@@ -164,14 +171,16 @@ try {
 [host]
 build_commit=$commit
 executable=$Exe
+graphics_api=$(if ($autoApi) { 'auto' })
+start_after_factory=$(if ($StartAfterFactory) { 1 } else { 0 })
 startup_log=$Evid\startup.log
 status_log=$Evid\status.log
 enabled=1
-tag=Native DX11 ($Title)
+tag=$(if ($autoApi) { "NeuralAlias ($Title)" } else { "Native DX11 ($Title)" })
 [dx11on12]
 enabled=0
 [native11]
-enabled=1
+enabled=$(if ($autoApi) { 0 } else { 1 })
 [overlay]
 enabled=1
 [settings]
@@ -199,14 +208,14 @@ enabled=0
 [fg]
 enabled=0
 [adapter]
-enabled=0
+enabled=$(if ($autoApi) { 1 } else { 0 })
 [observe]
 profile_hooks=0
 usage_log=1
-producers=0
-early_install=0
+producers=$(if ($autoApi) { 1 } else { 0 })
+early_install=$(if ($autoApi) { 1 } else { 0 })
 [discovery]
-enabled=0
+enabled=$(if ($autoApi) { 1 } else { 0 })
 read_only=1
 log=$Evid\discovery.jsonl
 [j2]

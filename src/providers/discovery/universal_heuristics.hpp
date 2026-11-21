@@ -72,8 +72,10 @@ public:
     void Consume(const DecodedBatch& b, const na_observe_status& status) {
         if (session_ != status.session || epoch_ != status.epoch) {
             const double max_ratio = max_ratio_;
+            const bool camera_enabled = camera_enabled_;
             *this = UniversalHeuristics{};
             max_ratio_ = max_ratio;
+            camera_enabled_ = camera_enabled;
             session_ = status.session;
             epoch_ = status.epoch;
         }
@@ -276,10 +278,21 @@ public:
     }
     // Rank (1-based) of a binding among the top camera blocks, 0 if not ranked.
     size_t CameraRank(uint64_t resource, uint64_t offset, size_t top = 8) const {
-        const auto ranked = RankCameraBlocks(top);
-        for (size_t i = 0; i < ranked.size(); ++i)
-            if (ranked[i].resource == resource && ranked[i].offset == offset) return i + 1;
-        return 0;
+        if (!top) return 0;
+        const auto& blocks = Scored().cbv;
+        const auto key = std::make_pair(resource,offset);
+        const auto found = blocks.find(key);
+        if (found == blocks.end() || found->second.draws < 8) return 0;
+        // Most snapshot queries are object constants. Avoid allocating and
+        // sorting every block just to discover one binding is unranked.
+        // Equal draws retain the map key order, like the existing stable_sort.
+        size_t rank = 1;
+        for (const auto& block : blocks) {
+            if (block.second.draws > found->second.draws ||
+                (block.second.draws == found->second.draws && block.first < key))
+                if (++rank > top) return 0;
+        }
+        return rank;
     }
 
     // Render-small (P4-4): the game's whole scene is drawn at `min_scale` of the swapchain or more
@@ -287,6 +300,17 @@ public:
     // generic_depth's 1.85 limit stays for every other game.
     void AllowRenderScale(double min_scale) {
         if (min_scale > 0.0 && min_scale < 1.0) max_ratio_ = std::max(kGenericMaxRatio, 1.0 / min_scale + 0.01);
+    }
+    // This ranking is a camera-acquisition consumer only. Scene/depth scoring
+    // does not need per-draw constant-buffer tallies when camera search is off.
+    void SetCameraDiscovery(bool enabled) {
+        if(camera_enabled_==enabled)return;
+        camera_enabled_=enabled;
+        frame_.cbv.clear();last_.cbv.clear();
+        for(auto& pair:recordings_){
+            pair.second.cbv_draws.clear();
+            for(auto& bindings:pair.second.root_cbv)bindings.clear();
+        }
     }
     // Scene-pick evidence (scene_pick.hpp): the top eligible depth of every completed frame.
     const DepthWindow& RecentTopDepths() const { return recent_top_; }
@@ -345,6 +369,7 @@ private:
     uint32_t swap_w_{}, swap_h_{};
     static constexpr double kGenericMaxRatio = 1.85;
     double max_ratio_ = kGenericMaxRatio; // swapchain / buffer size; see AllowRenderScale
+    bool camera_enabled_=true;
     std::map<uint64_t, na_ev_resource_created> resources_;
     std::map<uint64_t, Pipe> pipelines_;
     std::map<uint64_t, Recording> recordings_; // by list: the recording in progress or last closed
@@ -408,7 +433,7 @@ private:
             break;
         }
         case NA_OP_SET_ROOT_VIEW:
-            if (e.a[3] == NA_DESC_CBV && e.a[2] < 64) r.root_cbv[e.a[4] ? 1 : 0][e.a[2]] = {e.a[0], e.a[1]};
+            if (camera_enabled_ && e.a[3] == NA_DESC_CBV && e.a[2] < 64) r.root_cbv[e.a[4] ? 1 : 0][e.a[2]] = {e.a[0], e.a[1]};
             break;
         case NA_OP_OM_SET_RENDER_TARGETS: {
             r.targets.clear();

@@ -1,5 +1,6 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/capture_session.hpp"
+#include "host_dx12/capture/referee_gpu.hpp"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -229,8 +230,8 @@ void write_slot(const Slot& s)
         mat("vp_current_row", id.vp_cur, ",");
         mat("vp_previous_row", id.vp_prev, ",");
         mat("inv_vp_current_row", id.inv_vp_cur, "");
-        std::fprintf(fp, "  },\n  \"selection_version\": %llu,\n  \"tracker_restart\": %u,\n  \"cut_reason\": %u,\n  \"depth_reversed\": %u,\n  \"flow\": {\"ran\": %u, \"loosen\": %u, \"colour_jitter\": [%.6f, %.6f], \"convention\": %u, \"epoch\": %llu},\n",
-            (unsigned long long)id.selection_version, id.tracker_restart, id.cut_reason, id.depth_reversed, id.flow_ran, id.flow_loosen,
+        std::fprintf(fp, "  },\n  \"referee_boundary\": %llu,\n  \"selection_version\": %llu,\n  \"tracker_restart\": %u,\n  \"cut_reason\": %u,\n  \"depth_reversed\": %u,\n  \"flow\": {\"ran\": %u, \"loosen\": %u, \"colour_jitter\": [%.6f, %.6f], \"convention\": %u, \"epoch\": %llu},\n",
+            (unsigned long long)id.referee_boundary, (unsigned long long)id.selection_version, id.tracker_restart, id.cut_reason, id.depth_reversed, id.flow_ran, id.flow_loosen,
             id.flow_jitter_x,id.flow_jitter_y,id.flow_jitter_convention,(unsigned long long)id.flow_jitter_epoch);
         std::fprintf(fp, "  \"dlss\": {\"hdr\": %s, \"depth_inverted\": %s, \"auto_exposure\": %s, \"mv_lowres\": %s, \"mv_jittered\": %s, "
             "\"pre_exposure\": %.6g, \"exposure_scale\": %.6g, \"quality\": %u, \"bias_current_color\": %s, \"jitter_shifted\": %s},\n"
@@ -370,6 +371,35 @@ bool Armed()
     return g.armed.load(std::memory_order_acquire) && GetTickCount64() >= g.start_at.load(std::memory_order_relaxed);
 }
 
+// The capture's token is 1..kSlots in the low byte; the referee uses the high 24 bits.
+constexpr uint32_t kOwnMask = 0xff, kRefereeShift = 8;
+
+uint32_t RecordReferee(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id,
+                       uint32_t render_w, uint32_t render_h, uint32_t output_w, uint32_t output_h,
+                       na::referee::shadow::Context context)
+{
+    if (id.presentation_only || id.owns_present) return 0;
+    na::referee::gpu::Evaluation e;
+    e.color = p.color; e.color_state = p.color_state;
+    e.motion = p.motion; e.motion_state = p.motion_state;
+    e.output = p.output; e.output_state = p.output_state;
+    e.present_ordinal = id.present_ordinal;
+    e.render_w = render_w; e.render_h = render_h;
+    e.output_w = output_w; e.output_h = output_h;
+    e.mv_jittered = id.dlss_mv_jittered;
+    e.mv_display_res = !id.dlss_mv_lowres;
+    e.jitter_x = id.jitter_x; e.jitter_y = id.jitter_y;
+    e.scene_jitter_amount = id.referee_jitter_amount;
+    e.mv_scale_x = id.mv_scale_x; e.mv_scale_y = id.mv_scale_y;
+    e.reset = id.reset != 0;
+    context.width = render_w;
+    context.height = render_h;
+    e.context = context;
+    return na::referee::gpu::Record(list, e) << kRefereeShift;
+}
+
+bool RefereeWanted() { return na::referee::gpu::Wanted(); }
+
 uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, const Identity& id)
 {
     if (!Armed() || !list) return 0;
@@ -417,8 +447,11 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, cons
     return static_cast<uint32_t>(s - g.slots) + 1;
 }
 
-void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission)
+void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission, uint8_t tools, uint8_t applied)
 {
+    na::referee::gpu::Submitted(token >> kRefereeShift, queue, tools, applied);
+    token &= kOwnMask;
+    if (!token) return;
     std::lock_guard<std::mutex> lock(g.m);
     Slot* s = slot_of(token);
     if (!s || s->state != SlotState::Recorded || !queue || !g.fence) return;
@@ -432,6 +465,9 @@ void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission)
 
 void Discard(uint32_t token, bool may_still_run)
 {
+    na::referee::gpu::Discard(token >> kRefereeShift, may_still_run);
+    token &= kOwnMask;
+    if (!token) return;
     std::lock_guard<std::mutex> lock(g.m);
     Slot* s = slot_of(token);
     if (!s || s->state != SlotState::Recorded) return;
@@ -458,8 +494,11 @@ void OnFrameClosed(uint64_t present_ordinal, uint64_t late_writes)
     if (g.wake) SetEvent(g.wake);
 }
 
-void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec)
+bool NeedsPresentCapture(uint32_t token) { return (token & kOwnMask) != 0; }
+
+void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec, na::referee::gpu::Presentation frame)
 {
+    na::referee::gpu::OnPresent(frame, queue, presented, exec);
     std::lock_guard<std::mutex> lock(g.m);
     Slot* s = nullptr;
     for (auto& c : g.slots)

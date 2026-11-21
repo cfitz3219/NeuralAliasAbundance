@@ -25,7 +25,7 @@ struct Candidate {
 struct Output { ID3D12Resource* motion = nullptr; ID3D12Resource* valid = nullptr; }; // NPSR when set
 
 struct Stats {
-    uint64_t recorded = 0, scored = 0, fed = 0, collected = 0, candidate_changes = 0;
+    uint64_t recorded = 0, scored = 0, fed = 0, collected = 0, candidate_changes = 0, deferred = 0;
     uint64_t measured = 0, good = 0, locked = 0, dropped = 0;
     uint32_t candidates = 0;
     int used_candidate = -1, used_encoding = -1;
@@ -57,7 +57,8 @@ private:
         bool recorded = false;
     };
     bool ensure_textures(ID3D12Resource* color, uint32_t rw, uint32_t rh);
-    void collect(uint32_t slot);
+    enum class Sample { None, Rejected, Promising };
+    Sample collect(uint32_t slot);
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_score_, pso_convert_;
@@ -69,6 +70,7 @@ private:
     uint64_t current_id_[kCandidates]{};
     bool prev_valid_ = false;
     bool force_ = false;
+    uint32_t rejected_ = 0, quiet_frames_ = 0;
     DXGI_FORMAT prev_format_ = DXGI_FORMAT_UNKNOWN;
     uint32_t tw_ = 0, th_ = 0;
     Decider decider_;

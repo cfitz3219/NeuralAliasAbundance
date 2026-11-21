@@ -134,7 +134,13 @@ bool PairFlow::Record(ID3D12GraphicsCommandList* l,ID3D12Resource* cur,ID3D12Res
     if(recording_heap&&p->bind_tables)p->device->CopyDescriptorsSimple(static_cast<UINT>(p->tex.size()),p->cpu(0),p->template_cpu(0),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     ID3D12DescriptorHeap* heap=p->active_heap;l->SetDescriptorHeaps(1,&heap);
     p->table=permanent+slot*per_slot;
-    for(unsigned i=0;i<p->tex.size();++i)p->clear(l,i);p->barrier(l);
+    // PrepareLuma writes every pixel at level zero (32x32 output pixels per
+    // group, dispatch rounded up). The scene-change scratch is cleared below,
+    // immediately before each divergence pass. Neither needs an initial clear.
+    for(unsigned i=0;i<p->tex.size();++i){
+        if(i!=p->luma[0][0]&&i!=p->luma[1][0]&&i!=p->scd&&i!=p->temp)p->clear(l,i);
+    }
+    p->barrier(l);
     for(unsigned image=0;image<2;++image){
         const auto q=p->luma[image];
         p->run(l,Pass::PrepareLuma,{},{{0,q[0]}},0,(p->w+31)/32,(p->h+31)/32,1,image?cur:prev);

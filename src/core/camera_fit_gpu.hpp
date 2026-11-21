@@ -56,7 +56,7 @@ struct FitResult {
     float photo_e_fit = 0, photo_e_cam = 0; // mean image error on the tested cells
 };
 
-// The pair's encoded images (R8G8B8A8_UNORM, w x h, NON_PIXEL_SHADER_RESOURCE) for the image
+// The pair's typed, float-sampleable encoded images (w x h, NON_PIXEL_SHADER_RESOURCE) for the image
 // check, and the stabilisation jitter delta (current - previous, pixels) used by the encode.
 struct FitImages {
     ID3D12Resource* current = nullptr;

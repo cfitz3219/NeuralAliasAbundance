@@ -42,6 +42,10 @@ endif()
 # 32-bit games (a 32-bit copy of the in-game half beside a 64-bit DLAA companion) are being
 # brought up: NA_ALLOW_X86 lets a Win32 configure through so CI can list what does not build yet.
 option(NA_ALLOW_X86 "Allow a 32-bit (Win32) configure of the host while 32-bit support is brought up" OFF)
+option(NA_REFEREE_MENU "Show the Referee switch on the Home menu (held back until Cort says so; confirmed 2026-11-21)" OFF)
+if(NA_REFEREE_MENU)
+  add_compile_definitions(NA_REFEREE_MENU)
+endif()
 if(NOT MSVC OR (NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT NA_ALLOW_X86))
   message(FATAL_ERROR "The DX12 host requires MSVC and x64.")
 endif()
@@ -163,7 +167,7 @@ target_link_libraries(host_observe PUBLIC abundance_options)
 # Layer 2 owns independent reduced scene allocations; the game's native
 # resources remain the bypass. Recognition/binding integration is separate.
 add_library(host_scene_scale STATIC src/host_dx12/scale/scene_group.cpp src/host_dx12/scale/depth_restore.cpp
-  src/host_dx12/scale/gpu_constants.cpp)
+  src/host_dx12/scale/depth_unjitter.cpp src/host_dx12/scale/gpu_constants.cpp)
 target_link_libraries(host_scene_scale PUBLIC abundance_options d3d12 d3dcompiler)
 
 # C8a: H1 observation producers (device/queue hooks emitting ABI events).
@@ -176,14 +180,17 @@ target_link_libraries(host_observe_producers PUBLIC abundance_options host_obser
 # Plan B1 (native DX11 route): D3D11 input provider. Isolated and inactive:
 # nothing installs it until Astra's B2 handoff lands; built so CI compiles it.
 add_library(host_native11 STATIC src/host_dx12/native11/provider.cpp src/host_dx12/native11/samplers.cpp
-            src/host_dx12/native11/textures.cpp src/host_dx12/native11/texture_loader.cpp)
-target_link_libraries(host_native11 PUBLIC abundance_options host_hooking d3d11 dxgi)
+            src/host_dx12/native11/textures.cpp src/host_dx12/native11/texture_loader.cpp src/host_dx12/native11/depth_reads.cpp
+            src/host_dx12/native11/draw_replay.cpp)
+target_link_libraries(host_native11 PUBLIC abundance_options host_hooking d3d11 dxgi PRIVATE d3dcompiler)
 
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
 target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole32)
 
-add_library(host_capture STATIC src/host_dx12/capture/frame_capture.cpp src/host_dx12/capture/j2_capture.cpp src/host_dx12/capture/capture_session.cpp)
-target_link_libraries(host_capture PUBLIC abundance_options d3d12 dxgi PRIVATE shell32 ole32)
+add_library(host_capture STATIC src/host_dx12/capture/frame_capture.cpp src/host_dx12/capture/j2_capture.cpp src/host_dx12/capture/capture_session.cpp
+  src/host_dx12/capture/referee_gpu.cpp)
+target_link_libraries(host_capture PUBLIC abundance_options d3d12 dxgi PRIVATE host_settings d3dcompiler shell32 ole32)
+include(cmake/referee_shaders.cmake)
 
 add_library(core_gpu STATIC src/core/motion_arbiter_gpu.cpp src/core/camera_fit_gpu.cpp src/core/jitter_probe_gpu.cpp)
 target_link_libraries(core_gpu PUBLIC abundance_core d3d12 d3dcompiler)
@@ -247,6 +254,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/j2/compute_flow.cpp
   src/host_dx12/j2/game_motion.cpp
   src/host_dx12/j2/replay_motion.cpp
+  src/host_dx12/j2/depth_reads.cpp
   src/host_dx12/j2/nis_scaler.cpp
   src/host_dx12/j2/native_hud.cpp
   src/host_dx12/j2/hud_unblend.cpp
@@ -293,6 +301,7 @@ include(cmake/taskflow.cmake)
 add_library(host_background STATIC src/host_dx12/background/work.cpp)
 set_target_properties(host_background PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 target_link_libraries(host_background PUBLIC abundance_options host_observe_producers PRIVATE na_taskflow_headers)
+target_link_libraries(host_capture PRIVATE host_background)
 
 add_library(host_gpu_memory STATIC src/host_dx12/gpu/mem_alloc.cpp)
 target_link_libraries(host_gpu_memory PUBLIC abundance_options host_observe_producers d3d12ma d3d12 dxgi)

@@ -436,8 +436,10 @@ ID3D12Resource* CameraFit::Record(ID3D12GraphicsCommandList* l, uint32_t slot, I
     tex(1, flow, DXGI_FORMAT_R32G32_FLOAT);
     tex(2, flow_valid, DXGI_FORMAT_R32_FLOAT);
     const bool photo = images && images->current && images->previous;
-    tex(4, photo ? images->current : nullptr, DXGI_FORMAT_R8G8B8A8_UNORM);
-    tex(5, photo ? images->previous : nullptr, DXGI_FORMAT_R8G8B8A8_UNORM);
+    // The stabilized pictures can retain more than 8 bits. Match their typed resource format;
+    // reinterpreting a packed10 or RGBA16 image through an RGBA8 view is not a valid D3D12 view.
+    tex(4, photo ? images->current : nullptr, photo ? images->current->GetDesc().Format : DXGI_FORMAT_R8G8B8A8_UNORM);
+    tex(5, photo ? images->previous : nullptr, photo ? images->previous->GetDesc().Format : DXGI_FORMAT_R8G8B8A8_UNORM);
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC d{};
         d.Format = DXGI_FORMAT_R32_TYPELESS;

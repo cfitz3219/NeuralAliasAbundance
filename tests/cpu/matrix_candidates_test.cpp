@@ -108,6 +108,47 @@ int main() { return test::run({
         CHECK(CompareViews(prior,a,next,b,false,0.5,0.5)==Continuity::Unknown);
         ++next.epoch; CHECK(CompareViews(prior,a,next,b,true,0.5,0.5)==Continuity::Unknown);
     }},
+    {"paired-only scan chooses the same camera as the full scan", [] {
+        const Matrix v{0.8,0,0.6,-12,0,1,0,3,-0.6,0,0.8,-20,0,0,0,1};
+        auto compare = [](const Snapshot& s) {
+            const auto full = FindMatrices(s);
+            const auto expected = std::find_if(full.candidates.begin(), full.candidates.end(), [](const Candidate& c) {
+                return c.kind == Kind::ViewProjection && c.has_inverse_pair;
+            });
+            Candidate got{};
+            const bool found = FindPairedViewProjection(s.bytes, got);
+            CHECK(found == (expected != full.candidates.end()));
+            if (found && expected != full.candidates.end()) {
+                CHECK(got.byte_offset + s.base_offset == expected->byte_offset);
+                CHECK(got.inverse_byte_offset + s.base_offset == expected->inverse_byte_offset);
+                CHECK(got.layout == expected->layout && got.matrix == expected->matrix && got.reversed == expected->reversed);
+            }
+            return found;
+        };
+        for (bool reverse : {false,true}) for (bool column : {false,true}) {
+            const auto projection = perspective(reverse);
+            Matrix vp{};
+            for (size_t r = 0; r < 4; ++r) for (size_t c = 0; c < 4; ++c) for (size_t k = 0; k < 4; ++k)
+                vp[r*4+c] += projection[r*4+k] * v[k*4+c];
+            Matrix inverse{};
+            CHECK(Invert(vp, inverse));
+            auto s = snapshot(v, column);
+            const auto matrix = snapshot(vp, column).bytes;
+            const auto inverse_bytes = snapshot(inverse, column).bytes;
+            s.bytes.insert(s.bytes.end(), inverse_bytes.begin(), inverse_bytes.end());
+            s.bytes.insert(s.bytes.end(), matrix.begin(), matrix.end());
+            CHECK(compare(s)); // inverse before VP and a rigid block at the head
+            for (unsigned i = 0; i < 260; ++i)
+                s.bytes.insert(s.bytes.end(), matrix.begin(), matrix.end());
+            CHECK(!compare(s)); // retain the full scan's combined-candidate overflow behavior
+        }
+        auto s = snapshot(view());
+        s.bytes.resize(512);
+        for (unsigned i = 0; i < 32; ++i) {
+            for (size_t j = 0; j < s.bytes.size(); ++j) s.bytes[j] = uint8_t(j * 37 + i * 13);
+            CHECK(!compare(s));
+        }
+    }},
     {"C12: a view-projection stored with its inverse is marked as an inverse pair", [] {
         Matrix v{0.8,0,0.6,-12,0,1,0,3,-0.6,0,0.8,-20,0,0,0,1};
         const auto p=perspective(true);Matrix vp{};

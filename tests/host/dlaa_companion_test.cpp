@@ -6,6 +6,7 @@
 //   --dlss         hardware device, real DLSS in the companion; prints the handoff cost
 // CPU waits and readback here belong only to the test's pixel checks.
 #include "dlaa_remote/client.hpp"
+#include "core/referee_companion.hpp"
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdio>
@@ -51,6 +52,9 @@ int wmain(int argc, wchar_t** argv)
 {
     const bool warp = argc > 1 && !wcscmp(argv[1], L"--warp");
     const bool real = argc > 1 && !wcscmp(argv[1], L"--dlss");
+    // Every second reply names the frame before it: the in-game half must refuse exactly those,
+    // and the Referee's binding rule must call them stale (gap audit 2026-11-21 item 12).
+    const bool stale = argc > 2 && !wcscmp(argv[2], L"--stale");
     ComPtr<IDXGIFactory4> factory;
     REQUIRE(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))));
     ComPtr<IDXGIAdapter1> adapter;
@@ -119,13 +123,13 @@ int wmain(int argc, wchar_t** argv)
     wcscat_s(data, L"NeuralAlias-ngx");
     CreateDirectoryW(data, nullptr);
     const std::wstring exe = Beside(L"NeuralAliasDlaa64.exe");
-    if (!dlaa_remote::Start(dev.Get(), queue.Get(), data, exe.c_str(), !real)) {
+    if (!dlaa_remote::Start(dev.Get(), queue.Get(), data, exe.c_str(), !real, stale ? 2u : 0u)) {
         std::printf("%s companion did not start: %s\n", real ? "SKIP" : "FAIL", dlaa_remote::GetStats().reason);
         return real ? 77 : 1;
     }
     REQUIRE(dlaa_remote::Bind(1, w, h, color.Get(), depth.Get(), motion.Get(), output.Get()));
 
-    const int frames = real ? 120 : 3;
+    const int frames = real ? 120 : stale ? 6 : 3;
     for (int i = 0; i < frames; ++i) {
         // This side's "scene": a flat colour that changes every frame, so a stale or early read shows.
         // With real DLSS the colour stays put: its history would otherwise lag a changing one.
@@ -153,7 +157,19 @@ int wmain(int argc, wchar_t** argv)
         f.quality = 5; // DLAA
         f.view_id = 77;
         f.flags = i == 0 ? dlaa_remote::kReset : 0u;
-        REQUIRE(dlaa_remote::Evaluate(f));
+        dlaa_remote::Handoff sent;
+        const bool ran = dlaa_remote::Evaluate(f, &sent);
+        const bool expect_stale = stale && (i + 1) % 2 == 0;
+        const na::referee::CompanionHandoff handoff{static_cast<uint64_t>(i + 1), sent.asked, sent.answered,
+                                                    sent.asked_slot, sent.answered_slot, sent.replied, sent.ran};
+        const auto binding = na::referee::Judge(handoff);
+        std::printf("frame %d: asked=%llu answered=%llu slot=%u/%u ran=%d binding=%s\n", i,
+                    static_cast<unsigned long long>(sent.asked), static_cast<unsigned long long>(sent.answered),
+                    sent.asked_slot, sent.answered_slot, int(ran), na::referee::CompanionBindingName(binding));
+        REQUIRE(sent.replied && sent.asked == static_cast<uint64_t>(i + 1) && sent.asked_slot == 1 && sent.answered_slot == 1);
+        REQUIRE(ran == !expect_stale && sent.ran == ran);
+        REQUIRE(sent.answered == (expect_stale ? sent.asked - 1 : sent.asked));
+        REQUIRE(binding == (expect_stale ? na::referee::CompanionBinding::Stale : na::referee::CompanionBinding::Bound));
         // Recorded after Evaluate, so the queue runs it only once the companion's output exists.
         REQUIRE(SUCCEEDED(list->Reset(alloc.Get(), nullptr)));
         Transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -180,6 +196,7 @@ int wmain(int argc, wchar_t** argv)
     std::printf("%s\n", line);
     const auto stats = dlaa_remote::GetStats();
     REQUIRE(stats.frames == static_cast<uint64_t>(frames) && stats.refused == 0 && !stats.failed);
+    REQUIRE(stats.stale == (stale ? static_cast<uint64_t>(frames / 2) : 0u));
     dlaa_remote::Stop();
     std::printf("dlaa_companion_test (%s): all passed\n", real ? "DLSS" : warp ? "software device, copy" : "copy");
     return 0;

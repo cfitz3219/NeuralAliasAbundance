@@ -1,6 +1,7 @@
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/settings.hpp"
 #include "core/jitter_domain.hpp"
+#include "core/anisotropic_auto.hpp"
 
 #include <shlobj.h>
 #include <windows.h>
@@ -19,7 +20,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(j2_texture_detail_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(j2_texture_detail_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames) F(referee_enabled)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -125,22 +126,27 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     target.xegtao_temporal.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"temporal",850,ini),950u));
     target.nr_intensity.store(pct(L"intensity", 100));
     {
-        // [j2] sharpen: the menu's 0..100 (= RCAS 0..200). Older files only have [j2] sharpness
-        // on the RCAS scale (0..150): halved, rounded up, so 150 -> 75 and 100 -> 50.
-        int v = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen", -1, ini));
-        if (v < 0) {
-            const int old = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", 100, ini));
-            v = old <= 0 ? 0 : (old + 1) / 2;
+        const int current = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen_v2", -1, ini));
+        const int legacy = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen", -1, ini));
+        if (current >= 0 && (legacy < 0 || legacy == static_cast<int>((RcasStrength(current) + 1) / 2)))
+            target.j2_sharpness.store((std::min)(static_cast<uint32_t>(current), 100u));
+        else if (legacy >= 0)
+            target.j2_sharpness.store(RcasSliderFromLegacy(legacy));
+        else {
+            const int old = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpness", -1, ini));
+            if (old >= 0) target.j2_sharpness.store(RcasSliderFromLegacy(((std::min)(old, 150) + 1) / 2));
+            else if (!only_if_present) target.j2_sharpness.store(RcasSliderFromLegacy(50));
         }
-        target.j2_sharpness.store(static_cast<uint32_t>(v > 100 ? 100 : v));
         const int hud = static_cast<int>(GetPrivateProfileIntW(L"j2", L"hud_nis", 50, ini));
         target.j2_hud_nis.store(static_cast<uint32_t>(hud < 0 ? 0 : (hud > 100 ? 100 : hud)));
-        const int fl = static_cast<int>(GetPrivateProfileIntW(L"j2", L"flow_loosen", 50, ini));
-        target.j2_flow_loosen.store(static_cast<uint32_t>(fl < 0 ? 0 : (fl > 100 ? 100 : fl)));
+        // Legacy flow and flow_loosen keys are ignored by this build.
         {
-            const int af = static_cast<int>(GetPrivateProfileIntW(L"j2", L"anisotropic", 0, ini));
-            // 1 = the first build's on switch (16x).
-            target.aniso16.store(af == 1 || af >= 16 ? 16u : af >= 8 ? 8u : af >= 4 ? 4u : 0u);
+            // Hidden [j2] anisotropic_filter (no menu control): -1 / auto, 0 / off, 16 / force.
+            // The old menu key [j2] anisotropic is not read: a level saved by the removed control
+            // must not override automatic filtering.
+            int32_t af_setting = 0;
+            if (ReadAnisotropicFilter(ini, &af_setting)) target.af_mode.store(af_setting);
+            else if (!only_if_present) target.af_mode.store(-1);
         }
         {
             wchar_t js[16] = {};
@@ -189,7 +195,14 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         const int vj = static_cast<int>(GetPrivateProfileIntW(L"j2", L"viewport_jitter", 1, ini));
         target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
         target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);
+        target.j2_replay_budget.store(GetPrivateProfileIntW(L"j2", L"replay_vertex_budget", 1000000, ini));
+        target.j2_replay_movers.store(GetPrivateProfileIntW(L"j2", L"replay_movers", 1, ini) ? 1u : 0u);
+        const int cam = static_cast<int>(GetPrivateProfileIntW(L"j2", L"camera", 1, ini));
+        target.j2_camera.store(cam < 0 || cam > 2 ? 1 : cam);
     }
+    target.referee_enabled.store(GetPrivateProfileIntW(L"referee", L"enabled", target.referee_enabled.load(), ini) ? 1u : 0u);
+    target.referee_every_ms.store(GetPrivateProfileIntW(L"referee", L"every_ms", target.referee_every_ms.load(), ini));
+    target.referee_log_s.store(GetPrivateProfileIntW(L"referee", L"log_seconds", target.referee_log_s.load(), ini));
     target.nr_structure.store(pct(L"structure", 100));
     target.nr_tone.store(pct(L"tone", 0));
     target.nr_skin.store(pct(L"skin", 100));
@@ -258,20 +271,28 @@ const char* source_of(const wchar_t* section, const wchar_t* key)
 }
 void describe_effective()
 {
-    // Astra 20cddb8 point 5: the 05dc62b deploy log printed flow_loosen=50/preset L while the
-    // game ran 0/M from the saved user choices. Log every effective value with its source.
+    // Log what the runtime actually uses, with the origin of each setting.
     std::snprintf(g_effective, sizeof g_effective,
         "settings_effective game_ini=\"%ls\" user_ini=\"%ls\" j2.flow_loosen=%u(%s) j2.preset=%u(%s) j2.sharpen=%u(%s) "
-        "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s)",
+        "j2.hud_nis=%u(%s) j2.scale_mode=%u(%s) j2.mip_bias_x100=%d(%s) dlss.mode=%u(%s) dlss.preset=%d(%s) j2.camera=%d(%s)",
         g_ini_defaults, g_ini_user,
-        g_settings.j2_flow_loosen.load(), source_of(L"j2", L"flow_loosen"),
+        kObjectFlowLoosen, "builtin",
         g_settings.j2_preset.load(), [] { const char* s = source_of(L"j2", L"preset_v2"); return strcmp(s, "builtin") ? s : source_of(L"j2", L"preset"); }(),
-        g_settings.j2_sharpness.load(), source_of(L"j2", L"sharpen"),
+        g_settings.j2_sharpness.load(), [] {
+            const char* source = "builtin";
+            for (const auto* key : {L"sharpen_v2", L"sharpen", L"sharpness"}) {
+                const auto* at = source_of(L"j2", key);
+                if (!strcmp(at, "user")) return at;
+                if (!strcmp(at, "game")) source = at;
+            }
+            return source;
+        }(),
         g_settings.j2_hud_nis.load(), source_of(L"j2", L"hud_nis"),
         g_settings.j2_scale_mode.load(), source_of(L"j2", L"scale_mode"),
         g_settings.j2_mip_bias_x100.load(), source_of(L"j2", L"mip_bias"),
         g_settings.dlss_mode.load(), source_of(L"dlss", L"mode"),
-        g_settings.preset.load(), source_of(L"dlss", L"preset"));
+        g_settings.preset.load(), source_of(L"dlss", L"preset"),
+        g_settings.j2_camera.load(), source_of(L"j2", L"camera"));
 }
 } // namespace
 const char* EffectiveSummary() { return g_effective; }
@@ -288,6 +309,8 @@ void Load()
     g_settings.fg_profile_override.store(g_ini_defaults[0] && GetPrivateProfileIntW(L"fg", L"profile_override", 0, g_ini_defaults) == 1);
     resolve_user_ini();
     load_from(g_ini_user, true); // user choices win when present
+    ApplyAnisotropicMode();
+    PollHiddenSettings(); // records the ini times, so only a later edit counts as a change
     // Insertion mode is an explicit per-game deployment choice, never inherited
     // from another game's global menu preferences.
     g_settings.j2_inline.store(g_ini_defaults[0] && GetPrivateProfileIntW(L"j2", L"inline", 0, g_ini_defaults) != 0);
@@ -346,6 +369,8 @@ bool SaveFromWorker()
     ok &= WritePrivateProfileStringW(L"dlss", L"rr_preset", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.text_bold.load());
     ok &= WritePrivateProfileStringW(L"overlay", L"text_bold", v, ini) != 0;
+    swprintf_s(v, L"%u", g_settings.referee_enabled.load());
+    ok &= WritePrivateProfileStringW(L"referee", L"enabled", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.fill_screen.load());
     ok &= WritePrivateProfileStringW(L"present", L"fill_screen", v, ini) != 0;
     struct { const wchar_t* key; int32_t value; } win[] = {
@@ -397,17 +422,20 @@ bool SaveFromWorker()
         ok &= WritePrivateProfileStringW(L"motion", kv.key, v, ini) != 0;
     }
     const auto sharpness = g_settings.j2_sharpness.load();
-    swprintf_s(v, L"%u", sharpness > 100 ? 100 : sharpness);
+    swprintf_s(v, L"%u", (std::min)(sharpness, 100u));
+    ok &= WritePrivateProfileStringW(L"j2", L"sharpen_v2", v, ini) != 0;
+    // Older binaries retain the same approximate strength if the user rolls back.
+    swprintf_s(v, L"%u", (RcasStrength(sharpness) + 1) / 2);
     ok &= WritePrivateProfileStringW(L"j2", L"sharpen", v, ini) != 0;
     WritePrivateProfileStringW(L"j2", L"sharpness", nullptr, ini); // the old RCAS-scale key
     swprintf_s(v, L"%u", (std::min)(g_settings.j2_hud_nis.load(), 100u));
     ok &= WritePrivateProfileStringW(L"j2", L"hud_nis", v, ini) != 0;
-    swprintf_s(v, L"%u", g_settings.j2_flow_loosen.load() > 100 ? 100u : g_settings.j2_flow_loosen.load());
-    ok &= WritePrivateProfileStringW(L"j2", L"flow_loosen", v, ini) != 0;
-    swprintf_s(v, L"%u", g_settings.aniso16.load());
-    ok &= WritePrivateProfileStringW(L"j2", L"anisotropic", v, ini) != 0;
+    // The removed menu control's key; [j2] anisotropic_filter is hidden and never written here.
+    WritePrivateProfileStringW(L"j2", L"anisotropic", nullptr, ini);
     ok &= WritePrivateProfileStringW(L"j2", L"jitter_sequence", g_settings.j2_jitter_r2.load() ? L"r2" : L"halton", ini) != 0;
     ok &= WritePrivateProfileStringW(L"j2", L"draw_replay", g_settings.j2_draw_replay.load() ? L"1" : L"0", ini) != 0;
+    swprintf_s(v, L"%d", g_settings.j2_camera.load());
+    ok &= WritePrivateProfileStringW(L"j2", L"camera", v, ini) != 0;
     {
         const uint32_t pv = g_settings.j2_preset.load();
         if (pv == 255) swprintf_s(v, L"auto");
@@ -464,6 +492,63 @@ uint32_t LastSaveResult() { return g_last_save.load(); }
 
 // Event log: every persisted setting change, with old and new value and who made it
 // (the caller's source tag; the panel, ini reload and mode commit set one).
+bool ReadAnisotropicFilter(const wchar_t* ini, int32_t* mode)
+{
+    if (!ini || !ini[0]) return false;
+    wchar_t v[32] = {};
+    GetPrivateProfileStringW(L"j2", L"anisotropic_filter", L"", v, 32, ini);
+    const wchar_t* p = v;
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (!*p) return false;
+    int32_t m = -1;
+    if (!_wcsnicmp(p, L"auto", 4)) m = -1;
+    else if (!_wcsnicmp(p, L"off", 3)) m = 0;
+    else if (!_wcsnicmp(p, L"force", 5)) m = 16;
+    else {
+        const int n = _wtoi(p);
+        m = n < 0 ? -1 : n == 0 ? 0 : 16;
+    }
+    *mode = m;
+    return true;
+}
+
+void ApplyAnisotropicMode()
+{
+    const int32_t m = g_settings.af_mode.load();
+    na::af::Global().SetMode(na::af::ModeFromSetting(m));
+}
+
+bool PollHiddenSettings()
+{
+    // Live without a menu or restart (Cort: no restarts for any setting): the hidden key is
+    // re-read when either ini file changes, checked at most once a second.
+    // Never destroyed: the discovery thread may still poll while the process exits.
+    static std::mutex& m = *new std::mutex();
+    static ULONGLONG last_check = 0;
+    static FILETIME seen[2] = {};
+    std::lock_guard<std::mutex> lk(m);
+    const ULONGLONG now = GetTickCount64();
+    if (last_check && now - last_check < 1000) return false;
+    last_check = now;
+    const wchar_t* files[2] = {g_ini_defaults, g_ini_user};
+    bool changed = false;
+    for (int i = 0; i < 2; ++i) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        FILETIME t{};
+        if (files[i][0] && GetFileAttributesExW(files[i], GetFileExInfoStandard, &a)) t = a.ftLastWriteTime;
+        if (CompareFileTime(&t, &seen[i]) != 0) { seen[i] = t; changed = true; }
+    }
+    if (!changed) return false;
+    int32_t mode = -1, from = 0;
+    if (ReadAnisotropicFilter(g_ini_defaults, &from)) mode = from;
+    if (g_ini_user[0] && ReadAnisotropicFilter(g_ini_user, &from)) mode = from;
+    const int32_t was = g_settings.af_mode.exchange(mode);
+    if (was == mode) return false;
+    na::eventlog::Emit("setting", "af_mode=%d was=%d source=ini_change", mode, was);
+    ApplyAnisotropicMode();
+    return true;
+}
+
 void WatchChanges(const char* source)
 {
     static std::mutex m;

@@ -18,6 +18,8 @@ Texture2D<float2> t_residual : register(t3);
 Texture2D<float>  t_mask     : register(t4);
 Texture2D<float>  t_rvalid   : register(t5);
 ByteAddressBuffer t_fix      : register(t6);   // M3 correction G (16 floats) + valid word (F_FIX)
+Texture2D<float2> t_est      : register(t7);   // measured total motion behind tier 1 (F_EST)
+Texture2D<float>  t_estvalid : register(t8);   // its validity (F_ESTMASK)
 RWTexture2D<float2> u_xy     : register(u0);
 RWTexture2D<uint>   u_prov   : register(u1);
 RWByteAddressBuffer u_stats  : register(u2);
@@ -44,11 +46,15 @@ cbuffer C : register(b0) {
 #define F_T3VALID 32u
 #define F_STATS   64u
 #define F_FIX     128u
+#define F_T1EST   256u   // tier 1 is measured total motion (Tier1Source::Estimated), not the game's own vectors
+#define F_EST     512u   // measured total motion stands behind tier 1 (EstimatedInput)
+#define F_ESTMASK 1024u
 
 #define PROV_INVALID 0u
 #define PROV_ENGINE 1u
 #define PROV_CAMERA 2u
 #define PROV_CAMERA_RESIDUAL 3u
+#define PROV_ESTIMATED 4u
 #define PROV_F_FILTERED 0x10u
 #define PROV_F_OFFSCREEN 0x20u
 
@@ -123,8 +129,25 @@ void main(uint3 id : SV_DispatchThreadID) {
             float2 e = t_engine[p];
             if (finite2(e)) {
                 u_xy[p] = e;
-                u_prov[p] = PROV_ENGINE;
+                u_prov[p] = (flags & F_T1EST) ? PROV_ESTIMATED : PROV_ENGINE;
                 stat(0);
+                return;
+            }
+            stat(7);
+        }
+    }
+
+    // ---- Measured total motion behind tier 1 (EstimatedInput): where tier 1 gave nothing here.
+    // Counter 8 is its own, so the game's vectors and measured ones are never added together.
+    if (flags & F_EST) {
+        uint ms = (flags & F_ESTMASK) ? mask_state(t_estvalid[p]) : 0u;
+        if (ms == 2u) stat(7);
+        if (ms == 0u) {
+            float2 e = t_est[p];
+            if (finite2(e)) {
+                u_xy[p] = e;
+                u_prov[p] = PROV_ESTIMATED;
+                stat(8);
                 return;
             }
             stat(7);
@@ -247,13 +270,13 @@ bool Arbiter::Init(ID3D12Device* device, uint32_t max_frames_in_flight)
 
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 7;
+    ranges[0].NumDescriptors = kSrvs;
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 4;
     ranges[1].BaseShaderRegister = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 7;
+    ranges[1].OffsetInDescriptorsFromTableStart = kSrvs;
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 2;
@@ -340,7 +363,8 @@ void Arbiter::fix_srv(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource* fix)
     device_->CreateShaderResourceView(fix ? fix : dummy_fix_.Get(), &d, h);
 }
 
-bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const Outputs& out, uint32_t frame_slot)
+bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const Outputs& out, uint32_t frame_slot,
+                       RecordedSuppliers* suppliers)
 {
     if (!list || !pso_ || !out.xy || !out.provenance || out.width == 0 || out.height == 0 || frame_slot >= slots_)
         return false;
@@ -353,21 +377,27 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     };
     uint32_t flags = 0;
     bool use1 = in.tier1_valid_flag && extent_ok(in.tier1_motion) && (!in.tier1_valid || extent_ok(in.tier1_valid));
+    bool use_est = in.estimated_valid_flag && extent_ok(in.estimated_motion) && (!in.estimated_valid || extent_ok(in.estimated_valid));
     bool use2 = in.tier2_valid_flag && extent_ok(in.depth);
     bool use3 = in.tier3_valid_flag && extent_ok(in.tier3_residual) && (!in.tier3_mask || extent_ok(in.tier3_mask)) &&
                 (!in.tier3_valid || extent_ok(in.tier3_valid));
+    if (use_est) flags |= 512u;
+    if (use_est && in.estimated_valid) flags |= 1024u;
     if (use1) flags |= 1u;
     if (use1 && in.tier1_valid) flags |= 2u;
     if (use2) flags |= 4u;
-    if (use3) flags |= 8u;
-    if (use3 && in.tier3_mask) flags |= 16u;
-    if (use3 && in.tier3_valid) flags |= 32u;
+    const bool residual = use3 && !(use2 && in.prefer_camera_without_residual);
+    if (residual) flags |= 8u;
+    if (residual && in.tier3_mask) flags |= 16u;
+    if (residual && in.tier3_valid) flags |= 32u;
     if (out.stats) flags |= 64u;
     if (use2 && in.fix) flags |= 128u;
+    if (use1 && in.tier1_source == Tier1Source::Estimated) flags |= 256u; // label and counter only
     // Whole-tier rejections are counted by the caller-visible stats exactly
     // like the CPU (motion_arbiter.cpp:138-140): add width*height per rejected tier.
     uint32_t whole_rejects = 0;
     if (in.tier1_valid_flag && !use1) ++whole_rejects;
+    if (in.estimated_valid_flag && !use_est) ++whole_rejects;
     if (in.tier2_valid_flag && !use2) ++whole_rejects;
     if (in.tier3_valid_flag && !use3) ++whole_rejects;
 
@@ -392,21 +422,25 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     srv(4, use3 ? in.tier3_mask : nullptr, DXGI_FORMAT_R32_FLOAT, dummy_.Get());
     srv(5, use3 ? in.tier3_valid : nullptr, DXGI_FORMAT_R32_FLOAT, dummy_.Get());
     fix_srv(cpu(6), (flags & 128u) ? in.fix : nullptr);
+    srv(7, use_est ? in.estimated_motion : nullptr, DXGI_FORMAT_R32G32_FLOAT, dummy2_.Get());
+    srv(8, use_est ? in.estimated_valid : nullptr, DXGI_FORMAT_R32_FLOAT, dummy_.Get());
     {
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
         d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         d.Format = DXGI_FORMAT_R32G32_FLOAT;
-        device_->CreateUnorderedAccessView(out.xy, nullptr, &d, cpu(7));
+        device_->CreateUnorderedAccessView(out.xy, nullptr, &d, cpu(kSrvs + 0));
         d.Format = DXGI_FORMAT_R8_UINT;
-        device_->CreateUnorderedAccessView(out.provenance, nullptr, &d, cpu(8));
+        device_->CreateUnorderedAccessView(out.provenance, nullptr, &d, cpu(kSrvs + 1));
         D3D12_UNORDERED_ACCESS_VIEW_DESC b{};
         b.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         b.Format = DXGI_FORMAT_R32_TYPELESS;
-        b.Buffer.NumElements = 8;
+        // The ninth counter (measured motion behind tier 1) exists where the caller's buffer holds it;
+        // a 32-byte buffer keeps its eight, and a write past the view is dropped by the device.
+        b.Buffer.NumElements = out.stats && out.stats->GetDesc().Width >= 4u * kStatCounters ? kStatCounters : 8;
         b.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-        device_->CreateUnorderedAccessView(out.stats ? out.stats : dummy_stats_.Get(), nullptr, &b, cpu(9));
+        device_->CreateUnorderedAccessView(out.stats ? out.stats : dummy_stats_.Get(), nullptr, &b, cpu(kSrvs + 2));
         d.Format = DXGI_FORMAT_R32_FLOAT;
-        device_->CreateUnorderedAccessView(dummy_uav_.Get(), nullptr, &d, cpu(10)); // u3 unused by main
+        device_->CreateUnorderedAccessView(dummy_uav_.Get(), nullptr, &d, cpu(kSrvs + 3)); // u3 unused by main
     }
 
     Constants c{};
@@ -433,6 +467,8 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     // Whole-tier rejections are known on the CPU side (extent checks) and are
     // added by DecodeStats, exactly like motion_arbiter.cpp:138-140.
     whole_rejects_last_ = whole_rejects * static_cast<uint64_t>(out.width) * out.height;
+    tier1_source_last_ = in.tier1_source;
+    if (suppliers) *suppliers = {use_est, use2 && use3};
     return true;
 }
 
@@ -478,22 +514,24 @@ bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Reso
     srv(4, dummy_.Get(), DXGI_FORMAT_R32_FLOAT);
     srv(5, raw_valid ? raw_valid : dummy_.Get(), DXGI_FORMAT_R32_FLOAT);
     fix_srv(cpu(6), camera.fix);
+    srv(7, dummy2_.Get(), DXGI_FORMAT_R32G32_FLOAT);
+    srv(8, dummy_.Get(), DXGI_FORMAT_R32_FLOAT);
     D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
     d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     d.Format = DXGI_FORMAT_R32G32_FLOAT;
-    device_->CreateUnorderedAccessView(residual_out, nullptr, &d, cpu(7));
+    device_->CreateUnorderedAccessView(residual_out, nullptr, &d, cpu(kSrvs + 0));
     d.Format = DXGI_FORMAT_R8_UINT;
     // u1 (provenance) is unused by derive_residual; bind a dummy typed UAV.
     d.Format = DXGI_FORMAT_R32_FLOAT;
-    device_->CreateUnorderedAccessView(dummy_uav_.Get(), nullptr, &d, cpu(8));
+    device_->CreateUnorderedAccessView(dummy_uav_.Get(), nullptr, &d, cpu(kSrvs + 1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC b{};
     b.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     b.Format = DXGI_FORMAT_R32_TYPELESS;
     b.Buffer.NumElements = 8;
     b.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    device_->CreateUnorderedAccessView(dummy_stats_.Get(), nullptr, &b, cpu(9));
+    device_->CreateUnorderedAccessView(dummy_stats_.Get(), nullptr, &b, cpu(kSrvs + 2));
     d.Format = DXGI_FORMAT_R32_FLOAT;
-    device_->CreateUnorderedAccessView(valid_out, nullptr, &d, cpu(10));
+    device_->CreateUnorderedAccessView(valid_out, nullptr, &d, cpu(kSrvs + 3));
 
     Constants c{};
     std::memcpy(c.inv_vp_cur, camera.inv_view_proj_current.m, sizeof(c.inv_vp_cur));
@@ -520,10 +558,13 @@ bool Arbiter::DispatchDeriveResidual(ID3D12GraphicsCommandList* list, ID3D12Reso
     return true;
 }
 
-Stats Arbiter::DecodeStats(const uint32_t counters[8]) const
+Stats Arbiter::DecodeStats(const uint32_t* counters, uint32_t count) const
 {
     Stats s{};
-    s.pixels_engine = counters[STAT_ENGINE];
+    // Counter 0 is "tier 1 taken"; whose field that was decides which total it joins.
+    if (tier1_source_last_ == Tier1Source::Estimated) s.pixels_estimated = counters[STAT_ENGINE];
+    else s.pixels_engine = counters[STAT_ENGINE];
+    if (count > STAT_ESTIMATED_BEHIND) s.pixels_estimated += counters[STAT_ESTIMATED_BEHIND];
     s.pixels_camera = counters[STAT_CAMERA];
     s.pixels_residual_added = counters[STAT_RESIDUAL_ADDED];
     s.pixels_residual_snapped = counters[STAT_RESIDUAL_SNAPPED];
@@ -532,6 +573,7 @@ Stats Arbiter::DecodeStats(const uint32_t counters[8]) const
     s.pixels_invalid = counters[STAT_INVALID];
     s.pixels_rejected = counters[STAT_REJECTED] + whole_rejects_last_;
     if (s.pixels_engine) s.tier_used = Tier::EngineDxil;
+    else if (s.pixels_estimated) s.tier_used = Tier::EstimatedTotal;
     else if (s.pixels_residual_added) s.tier_used = Tier::ResidualOpticalFlow;
     else if (s.pixels_camera) s.tier_used = Tier::CameraReprojection;
     else s.tier_used = Tier::None;

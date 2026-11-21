@@ -20,6 +20,22 @@
 
 namespace na::settings {
 
+inline constexpr uint32_t kMaxRcasStrength = 150;
+inline constexpr uint32_t RcasSliderFromLegacy(uint32_t old_percent) {
+    return old_percent >= 75 ? 100 : (old_percent * 4 + 1) / 3;
+}
+inline constexpr uint32_t RcasStrength(uint32_t percent, bool reduced = false) {
+    if (percent > 100) percent = 100;
+    // Round half steps to even. Every surviving old slider setting maps
+    // back to its exact (even) shader strength after profile migration.
+    uint32_t strength = percent * 3 / 2;
+    if ((percent % 2) && (strength % 2)) ++strength;
+    return reduced ? strength / 2 : strength;
+}
+
+// Live DLAA keeps the former slider at its 50% setting for all game profiles.
+inline constexpr uint32_t kObjectFlowLoosen = 50;
+
 enum class DlssMode : uint32_t {
     DLAA = 0,         // 100% â€” render at output resolution
     Quality = 1,      // 66.7%
@@ -78,13 +94,16 @@ struct Settings {
     std::atomic<uint32_t> xegtao_thin_occluder{0}, xegtao_final_power{2200}, xegtao_depth_mip_offset{3300};
     std::atomic<uint32_t> xegtao_temporal{850}; // x1000: share of earlier frames kept (0 = off); stops edge shimmer while panning
     std::atomic<uint32_t> nr_intensity{100};
-    std::atomic<uint32_t> j2_sharpness{50}; // J2 sharpening, menu scale 0..100 = RCAS 0..200 (0 = off; 50 = standard RCAS full strength)
+    std::atomic<uint32_t> j2_sharpness{RcasSliderFromLegacy(50)}; // menu 0..100 = shader strength 0..150
+    std::atomic<uint32_t> j2_debug_jitter{0}; // session only, normal declaration at launch
     // Render-small HUD: 0 = the HUD goes through DLSS with the scene; 1..100 = HUD pixels are
     // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
     std::atomic<uint32_t> j2_hud_nis{50};
-    std::atomic<uint32_t> j2_flow_loosen{50}; // J2 moving-object flow: 0 = the original acceptance rules, 100 = loosest (Cort 2026-11-03)
     std::atomic<uint32_t> j2_jitter_r2{0}; // jitter sequence: 0 Halton 2,3 (default), 1 R2; [j2] jitter_sequence; live
-    std::atomic<uint32_t> aniso16{0}; // anisotropic filtering level on the game's surface textures: 0 off, 4, 8, 16; [j2] anisotropic; read at game start
+    // Anisotropic filtering on the game's world textures, no menu control (Cort 2026-11-20):
+    // hidden [j2] anisotropic_filter = -1 automatic (default), 0 off (the game's own), 16 forced.
+    // Re-read live when either ini changes (PollHiddenSettings). Rule: core/anisotropic_auto.hpp.
+    std::atomic<int32_t> af_mode{-1};
     // J2 texture detail in effect at full resolution, x 100: a mirror of the choice below, written at
     // game start and when the menu changes it. The old [j2] mip_bias key no longer chooses anything.
     std::atomic<int32_t> j2_mip_bias_x100{-100};
@@ -114,9 +133,28 @@ struct Settings {
     // the opposite sign, 0 = off: the camera-matrix route). Cort 2026-11-04. Loading the ini
     // turns it on unless the ini says otherwise; without a Load (tests) the camera-matrix route stays.
     std::atomic<int32_t> j2_viewport_jitter{0};
+    // VARIANT: camera/optional
+    // [j2] camera: what the scene camera is to DLAA on the native DX11 route (2026-11-16, Cort:
+    // "eliminate the dependency"). 1 = used when found (default): a frame without one still gets DLAA,
+    // with motion measured from the picture. 0 = never looked for: nothing camera-related runs.
+    // 2 = required: a frame without a camera is left alone (the behaviour before this setting).
+    // Live, saved per game.
+    std::atomic<int32_t> j2_camera{1};
     // Draw replay ([j2] draw_replay, 1 = on): per-object motion from the game's own draws replayed with
     // stream output, fed as engine motion (Cort 2026-11-06, SE5 sweatshirt smear). Off by default (Cort).
     std::atomic<uint32_t> j2_draw_replay{0};
+    // Expanded vertices draw replay may run again per frame ([j2] replay_vertex_budget, 0 = no budget).
+    // 3 million a frame cost about 10 ms on an RTX 5070 Ti at 3440x1440 (Cort's Resistance run, 2026-11-17).
+    std::atomic<uint32_t> j2_replay_budget{1000000};
+    // VARIANT: replay/movers-first ([j2] replay_movers, 1 = on): within the budget, draws known to move
+    // by themselves are replayed first and the rest are tried in turn (core/replay_movers.hpp).
+    // 0 = the budget's hashed sample alone.
+    std::atomic<uint32_t> j2_replay_movers{1};
+    // The referee (stage 1 of the unify plan, capture/referee_gpu.cpp): watches DLSS's picture,
+    // result, motion and jitter a few times a second and logs event `referee`. Changes nothing shown.
+    std::atomic<uint32_t> referee_enabled{0};   // [referee] enabled (live)
+    std::atomic<uint32_t> referee_every_ms{500}; // [referee] every_ms: one pair of frames this often
+    std::atomic<uint32_t> referee_log_s{5};      // [referee] log_seconds: one `referee` line this often
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
     std::atomic<uint32_t> nr_structure{100};
     std::atomic<uint32_t> nr_tone{0};
@@ -185,6 +223,12 @@ const wchar_t* UserIniPath();
 void Load();  // defaults ini, then user ini overrides when present
 // Event log: emits one "setting" event per changed persisted field since the last call.
 void WatchChanges(const char* source = nullptr);
+// Hidden [j2] anisotropic_filter from one ini: false when the key is absent.
+bool ReadAnisotropicFilter(const wchar_t* ini, int32_t* mode);
+// af_mode -> the shared AF detector (core/anisotropic_auto.hpp).
+void ApplyAnisotropicMode();
+// Re-reads hidden ini settings when an ini file changed (at most once a second); true on a change.
+bool PollHiddenSettings();
 // One line with every effective J2/DLSS value and where it came from (user / game / builtin).
 const char* EffectiveSummary();
 // Settings -> user ini (only our keys). Returns false when any write failed;

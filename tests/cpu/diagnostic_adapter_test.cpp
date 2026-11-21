@@ -3,6 +3,7 @@
 #include "host_dx12/host_boot/game_adapter.h"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/host_observe_internal.hpp"
+#include "host_dx12/settings.hpp"
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -10,7 +11,7 @@
 
 // Real GPU work through the production adapter. Test-only idle waits keep
 // allocator reuse valid; the adapter itself must remain fully asynchronous.
-static int RenderProbe(test::Device& d) {
+static int RenderProbe(test::Device& d,bool camera_live=false) {
     D3D12_ROOT_PARAMETER parameter{};parameter.ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     D3D12_ROOT_SIGNATURE_DESC rd{1,&parameter,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
     test::ComPtr<ID3DBlob> root_blob,error,vs,ps;
@@ -54,6 +55,7 @@ float4 PS(float4 p:SV_Position):SV_Target {return float4(p.xy/128,0.25,1);}
     REQUIRE(SUCCEEDED(list->Close()));
     const auto start=GetTickCount64();
     while(GetTickCount64()-start<4500) {
+        if(camera_live) na::settings::Get().j2_camera.store(GetTickCount64()-start>=1500 && GetTickCount64()-start<3000?0:1);
         REQUIRE(SUCCEEDED(allocator->Reset()));REQUIRE(SUCCEEDED(list->Reset(allocator.Get(),nullptr)));
         D3D12_RESOURCE_BARRIER barriers[]={test::Transition(depth.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE),
             test::Transition(color.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET)};
@@ -71,7 +73,10 @@ float4 PS(float4 p:SV_Position):SV_Target {return float4(p.xy/128,0.25,1);}
     return 0;
 }
 
-int main() {
+int main(int argc,char** argv) {
+    const bool camera_off=argc>1 && std::string(argv[1])=="--camera-off";
+    const bool camera_live=argc>1 && std::string(argv[1])=="--camera-live";
+    na::settings::Get().j2_camera.store(camera_off?0:1);
     wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
     const auto dir=std::filesystem::path(exe).parent_path();
     const auto ini=dir/L"NeuralAliasHost.ini",log=dir/L"diagnostic-test.jsonl";
@@ -88,6 +93,7 @@ int main() {
     test::Device d;if(!test::CreateDevice(d)) return test::SkipNoDevice("diagnostic_adapter");
     REQUIRE(na::observe::InstallProducers(d.device.Get(),d.queue.Get(),true));
     REQUIRE(na_adapter_start()==1);
+    CHECK(na::observe_internal::KindSkipped(NA_EV_SNAPSHOT)==camera_off);
     { std::ifstream live(log);CHECK(live.is_open()); }
     CHECK(na_adapter_start()==0);
     auto resource=test::CreateBuffer(d.device.Get(),4096,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COMMON);
@@ -111,7 +117,7 @@ int main() {
     fixture.event.hdr.size_bytes=sizeof(fixture);
     fixture.matrix[0]=fixture.matrix[5]=fixture.matrix[10]=fixture.matrix[15]=1;
     REQUIRE(na::observe_internal::Emit(&fixture,NA_GROUP_SNAPSHOT));
-    REQUIRE(RenderProbe(d)==0);
+    REQUIRE(RenderProbe(d,camera_live)==0);
     // Stop drains the real transport, including its final batch, before freeing context.
     na_adapter_stop();na_adapter_stop();
     std::ifstream file(log);const std::string text((std::istreambuf_iterator<char>(file)),{});
@@ -119,16 +125,27 @@ int main() {
     CHECK(text.find("\"phase\":\"stopped\"")!=std::string::npos);
     CHECK(text.find("\"malformed\":0")!=std::string::npos);
     CHECK(text.find("\"confirmed_inputs\":0")!=std::string::npos);
-    CHECK(text.find("\"hypotheses\":2")!=std::string::npos);
-    CHECK(text.find("\"execution_qualified\":false")!=std::string::npos);
+    CHECK((text.find("\"hypotheses\":2")!=std::string::npos)==!camera_off);
+    CHECK((text.find("\"execution_qualified\":false")!=std::string::npos)==!camera_off);
     CHECK(text.find("\"signal\":\"depth\"")!=std::string::npos);
     CHECK(text.find("\"signal\":\"scene_color\"")!=std::string::npos);
     CHECK(text.find("\"confidence\":\"candidate\"")!=std::string::npos);
     CHECK(text.find("\"matched_execution\":true")!=std::string::npos);
     CHECK(text.find("\"scalar_decoded\":true")!=std::string::npos);
-    CHECK(text.find("\"type\":\"gpu_camera_hypothesis\"")!=std::string::npos);
+    CHECK((text.find("\"type\":\"gpu_camera_hypothesis\"")!=std::string::npos)==!camera_off);
     CHECK(text.find("\"type\":\"heuristics\"")!=std::string::npos);     // C13 rankings always reported
-    CHECK(text.find("\"inverse_pairs\":")!=std::string::npos);
+    CHECK((text.find("\"inverse_pairs\":")!=std::string::npos)==!camera_off);
     CHECK(text.find("classifier_reasons")==std::string::npos);            // R41-3: rankings never claim classifier evidence
+    if(camera_live){
+        const auto off=text.find("\"type\":\"camera_discovery\",\"enabled\":false");
+        const auto on=off==std::string::npos?std::string::npos:text.find("\"type\":\"camera_discovery\",\"enabled\":true",off);
+        CHECK(off!=std::string::npos && on!=std::string::npos);
+        if(off!=std::string::npos && on!=std::string::npos){
+            const auto disabled=text.substr(off,on-off),resumed=text.substr(on);
+            CHECK(disabled.find("\"type\":\"matrix_scan\"")==std::string::npos);
+            CHECK(disabled.find("\"type\":\"gpu_camera_hypothesis\"")==std::string::npos);
+            CHECK(resumed.find("\"type\":\"matrix_scan\"")!=std::string::npos);
+        }
+    }
     return test::finish("diagnostic_adapter");
 }
