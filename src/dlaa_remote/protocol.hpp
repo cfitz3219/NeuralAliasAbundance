@@ -10,7 +10,7 @@
 namespace na::dlaa_remote {
 
 constexpr uint32_t kMagic = 0x41414c44; // "DLAA"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2; // 2: a Frame reply names the frame it answers
 constexpr uint32_t kSlots = 3; // the in-game half's frame slots
 
 enum class Kind : uint32_t { None = 0, Hello = 1, Bind = 2, Frame = 3, Bye = 4 };
@@ -24,7 +24,7 @@ struct Hello {
     uint64_t ready_fence;
     uint64_t done_fence;
     uint32_t copy_for_tests; // 1 = copy colour to output instead of DLSS (machines without DLSS)
-    uint32_t reserved;
+    uint32_t stale_every_for_tests; // N > 0: every Nth Frame reply names the frame before it (tests only)
     char16_t data_path[260]; // writable folder for the DLSS runtime's own files
 };
 
@@ -69,6 +69,12 @@ struct Reply {
     uint32_t available; // Hello: DLSS can run on this device
     uint32_t micros;    // time the companion spent on this request
     char reason[160];   // plain language when !ok or !available
+    // Frame: the frame this reply answers, copied from the request. The in-game half uses a
+    // result only when both match what it sent, so an answer to another frame is never shown
+    // as this one or judged by the Referee.
+    uint64_t value;
+    uint32_t slot;
+    uint32_t reserved;
 };
 
 // The shared block: one request and its reply at a time. The in-game half waits for each reply,
@@ -85,7 +91,7 @@ static_assert(sizeof(Hello) == 32 + 520, "Hello layout");
 static_assert(sizeof(Bind) == 48, "Bind layout");
 static_assert(sizeof(Frame) == 56, "Frame layout");
 static_assert(sizeof(Request) == 8 + sizeof(Hello), "Request layout");
-static_assert(sizeof(Reply) == 176, "Reply layout");
+static_assert(sizeof(Reply) == 192, "Reply layout");
 static_assert(sizeof(Block) == 16 + sizeof(Request) + sizeof(Reply), "Block layout");
 
 } // namespace na::dlaa_remote

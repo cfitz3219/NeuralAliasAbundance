@@ -90,12 +90,13 @@ int FormatStatus(char* out, size_t capacity)
     const Stats s = GetStats();
     const unsigned long long avg = s.frames ? s.total_wait_us / s.frames : 0;
     return std::snprintf(out, capacity,
-        "dlaa_companion started=%d available=%d failed=%d frames=%llu refused=%llu handoff_us{last=%u avg=%llu max=%u companion_last=%u} \"%s\"",
+        "dlaa_companion started=%d available=%d failed=%d frames=%llu refused=%llu stale=%llu handoff_us{last=%u avg=%llu max=%u companion_last=%u} \"%s\"",
         s.started, s.available, s.failed, static_cast<unsigned long long>(s.frames),
-        static_cast<unsigned long long>(s.refused), s.last_wait_us, avg, s.max_wait_us, s.last_companion_us, s.reason);
+        static_cast<unsigned long long>(s.refused), static_cast<unsigned long long>(s.stale), s.last_wait_us, avg, s.max_wait_us, s.last_companion_us, s.reason);
 }
 
-bool Start(ID3D12Device* device, ID3D12CommandQueue* queue, const wchar_t* data_path, const wchar_t* exe, bool copy_for_tests)
+bool Start(ID3D12Device* device, ID3D12CommandQueue* queue, const wchar_t* data_path, const wchar_t* exe, bool copy_for_tests,
+           uint32_t stale_every_for_tests)
 {
     std::lock_guard<std::mutex> lock(g_m);
     Client& c = C();
@@ -131,6 +132,7 @@ bool Start(ID3D12Device* device, ID3D12CommandQueue* queue, const wchar_t* data_
     request.hello.ready_fence = Give(c, c.ready.Get());
     request.hello.done_fence = Give(c, c.done.Get());
     request.hello.copy_for_tests = copy_for_tests ? 1u : 0u;
+    request.hello.stale_every_for_tests = stale_every_for_tests;
     for (size_t i = 0; data_path && i < 259 && data_path[i]; ++i) request.hello.data_path[i] = static_cast<char16_t>(data_path[i]);
     if (!request.hello.ready_fence || !request.hello.done_fence) return Fail(c, "The frame fences could not be shared with the DLAA companion.");
     Reply reply{};
@@ -166,7 +168,7 @@ bool Bind(uint32_t slot, uint32_t width, uint32_t height, ID3D12Resource* color,
     return true;
 }
 
-bool Evaluate(Frame frame)
+bool Evaluate(Frame frame, Handoff* handoff)
 {
     std::lock_guard<std::mutex> lock(g_m);
     Client& c = C();
@@ -176,6 +178,9 @@ bool Evaluate(Frame frame)
     frame.value = ++c.value;
     c.queue->Signal(c.ready.Get(), frame.value);
     bool ran = false;
+    Handoff seen;
+    seen.asked = frame.value;
+    seen.asked_slot = frame.slot;
     if (c.stats.available) {
         Request request{};
         request.kind = Kind::Frame;
@@ -195,8 +200,16 @@ bool Evaluate(Frame frame)
             c.stats.total_wait_us += us;
             c.stats.last_companion_us = reply.micros;
             ++c.stats.frames;
+            seen.replied = true;
+            seen.answered = reply.value;
+            seen.answered_slot = reply.slot;
             ran = reply.ok != 0;
-            if (!ran) {
+            if (reply.value != frame.value || reply.slot != frame.slot) {
+                // An answer to another frame: this frame's picture is whatever was there before.
+                ran = false;
+                ++c.stats.stale;
+                strncpy_s(c.stats.reason, "The DLAA companion answered a different frame; this frame was not used.", _TRUNCATE);
+            } else if (!ran) {
                 ++c.stats.refused;
                 strncpy_s(c.stats.reason, reply.reason[0] ? reply.reason : "DLSS refused this frame.", _TRUNCATE);
             }
@@ -206,6 +219,8 @@ bool Evaluate(Frame frame)
     // one, or is gone, nothing else will: release the value here.
     if (c.stats.failed && c.done->GetCompletedValue() < frame.value) c.done->Signal(frame.value);
     c.queue->Wait(c.done.Get(), frame.value);
+    seen.ran = ran;
+    if (handoff) *handoff = seen;
     return ran;
 }
 

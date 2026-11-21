@@ -2,6 +2,7 @@
 #include "shared_resources.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
+#include "core/referee_companion.hpp"
 #include "core/referee_jitter.hpp"
 #include "host_dx12/diag/referee_recovery.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
@@ -985,8 +986,24 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                    (eval.auto_exposure ? dlaa_remote::kAutoExposure : 0u);
         // Orders the rest of this frame after the companion's output. The second list still runs
         // when DLSS did not: it returns the shared images to their resting state.
-        evaluated = dlaa_remote::Evaluate(rf);
-        if (!evaluated && capture_token) {
+        dlaa_remote::Handoff sent;
+        evaluated = dlaa_remote::Evaluate(rf, &sent);
+        // Gap audit 2026-11-21 item 12: the Referee judges a companion frame only when the
+        // prepared inputs, the companion's result and (through the present result that the
+        // capture already waits for) the accepted screen are the same frame.
+        referee::CompanionHandoff handoff{frame.frame, sent.asked, sent.answered, sent.asked_slot, sent.answered_slot,
+                                          sent.replied, sent.ran};
+        const auto binding = referee::Judge(handoff);
+        static std::atomic<uint8_t> last_binding{0xff};
+        if (last_binding.exchange(uint8_t(binding), std::memory_order_relaxed) != uint8_t(binding) ||
+            binding == referee::CompanionBinding::Stale)
+            eventlog::Emit("referee_companion", "frame=%llu asked=%llu answered=%llu slot=%u/%u binding=%s witnessed=%u why=%s",
+                           (unsigned long long)handoff.ordinal, (unsigned long long)handoff.asked,
+                           (unsigned long long)handoff.answered, handoff.asked_slot, handoff.answered_slot,
+                           referee::CompanionBindingName(binding),
+                           unsigned(binding == referee::CompanionBinding::Bound && capture_token != 0),
+                           referee::CompanionBindingWhy(binding));
+        if ((!evaluated || binding != referee::CompanionBinding::Bound) && capture_token) {
             capture::j2::Discard(capture_token, false);
             capture_token = 0;
         }

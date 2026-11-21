@@ -11,6 +11,7 @@
 #include "core/referee_selection.hpp"
 #include "core/referee_recovery.hpp"
 #include "core/referee_memory.hpp"
+#include "core/referee_companion.hpp"
 #include "core/referee_placement.hpp"
 #include "core/referee_present_times.hpp"
 #include "core/referee_parity.hpp"
@@ -1156,6 +1157,24 @@ void TestPresentTimes()
     check(untimed.presented_us == 0, "present times: the missing time reaches the trial as 'not timed'");
 }
 
+// Gap audit 2026-11-21 item 12: a 32-bit game's frame is judged only when the
+// companion's result names the very frame that was sent.
+void TestCompanionBinding()
+{
+    using namespace na::referee;
+    CompanionHandoff h{40, 7, 7, 1, 1, true, true};
+    check(Judge(h) == CompanionBinding::Bound, "companion: a result that names the sent frame and slot is bound");
+    h.answered = 6;
+    check(Judge(h) == CompanionBinding::Stale, "companion: a result for the frame before is stale, even if DLSS ran");
+    h.answered = 7; h.answered_slot = 2;
+    check(Judge(h) == CompanionBinding::Stale, "companion: a result for another slot is stale");
+    h.answered_slot = 1; h.ran = false;
+    check(Judge(h) == CompanionBinding::Refused, "companion: DLSS not run for the right frame is refused, not stale");
+    h.ran = true; h.replied = false;
+    check(Judge(h) == CompanionBinding::NoReply, "companion: no reply is never bound");
+    check(Judge(CompanionHandoff{}) == CompanionBinding::NoReply, "companion: nothing sent is never bound");
+}
+
 void TestLaunchMemory()
 {
     using T = RecoveryTool;
@@ -1490,6 +1509,7 @@ int main()
     TestRouteTrials();
     TestRetryAndReasons();
     TestPresentTimes();
+    TestCompanionBinding();
     TestLaunchMemory();
     TestStageRecovery();
     TestRotatingRoles();

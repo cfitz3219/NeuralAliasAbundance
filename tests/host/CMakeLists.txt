@@ -30,6 +30,10 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
   set_tests_properties(host_dlaa_companion_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_dlaa_companion_warp_test COMMAND dlaa_companion_test --warp)
   set_tests_properties(host_dlaa_companion_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  # Gap audit 2026-11-21 item 12, negative case: a reply that names another frame is refused by
+  # the in-game half and called stale by the Referee's binding rule. Runs on the software device.
+  add_test(NAME host_dlaa_companion_warp_test_stale COMMAND dlaa_companion_test --warp --stale)
+  set_tests_properties(host_dlaa_companion_warp_test_stale PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_dlaa_companion_dlss_test COMMAND dlaa_companion_test --dlss)
   set_tests_properties(host_dlaa_companion_dlss_test PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
@@ -527,6 +531,15 @@ if(TARGET host_native11)
       add_test(NAME host_native11_dlaa_companion_test COMMAND native11_dlaa_test)
       set_tests_properties(host_native11_dlaa_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
         LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
+      # Gap audit 2026-11-21 item 12: the Referee's own verdicts with DLSS in the companion.
+      # Each binds the prepared inputs, the companion's result and the accepted screen to one
+      # frame, and its refusal cases (disagreeing scene, unrelated pair) are the same as in-process.
+      add_test(NAME host_native11_dlaa_route_trial_companion_test COMMAND native11_dlaa_test --lit-role-trial)
+      add_test(NAME host_native11_dlaa_route_trial_disagreeing_scene_companion_test COMMAND native11_dlaa_test --lit-role-trial-disagreeing-scene)
+      add_test(NAME host_native11_dlaa_parity_lighting_companion_test COMMAND native11_dlaa_test --lit-role-parity)
+      set_tests_properties(host_native11_dlaa_route_trial_companion_test
+        host_native11_dlaa_route_trial_disagreeing_scene_companion_test host_native11_dlaa_parity_lighting_companion_test
+        PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
       add_test(NAME host_native11_dlaa_camera_off_start_companion_test COMMAND native11_dlaa_test --camera-off-start)
       set_tests_properties(host_native11_dlaa_camera_off_start_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
         LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")

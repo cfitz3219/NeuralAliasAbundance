@@ -15,6 +15,7 @@ bool Wanted();
 struct Stats {
     bool started = false, available = false, failed = false;
     uint64_t frames = 0, refused = 0;
+    uint64_t stale = 0; // replies that named a different frame or slot: never shown, never judged
     // The handoff cost Cort asked to see as a number: time the game's thread spends per frame
     // between asking the companion and getting its answer, and the companion's own share of it.
     uint32_t last_wait_us = 0, max_wait_us = 0, last_companion_us = 0;
@@ -28,7 +29,7 @@ int FormatStatus(char* out, size_t capacity);
 // creates the two fences on `device` and waits for the companion to report whether DLSS can run.
 // False with a reason in GetStats() when it cannot. Safe to call again after it succeeded.
 bool Start(ID3D12Device* device, ID3D12CommandQueue* queue, const wchar_t* data_path,
-           const wchar_t* exe = nullptr, bool copy_for_tests = false);
+           const wchar_t* exe = nullptr, bool copy_for_tests = false, uint32_t stale_every_for_tests = 0);
 
 // Gives the companion the four textures of one frame slot. All four live on shared heaps of
 // `device`. Call again whenever a slot's textures are recreated.
@@ -41,7 +42,15 @@ bool Bind(uint32_t slot, uint32_t width, uint32_t height, ID3D12Resource* color,
 // work executed afterwards sees the finished output. `frame.slot` and the scalar fields must be
 // filled in; `frame.value` is assigned here. True when DLSS ran. Whatever the outcome, the queue
 // is never left waiting for something that cannot arrive.
-bool Evaluate(Frame frame);
+// `handoff`, when given, receives what was sent and what the reply named, so the caller can
+// bind the result to the frame it belongs to (core/referee_companion.hpp). A reply that names
+// another frame or slot counts as not run.
+struct Handoff {
+    uint64_t asked = 0, answered = 0;
+    uint32_t asked_slot = 0, answered_slot = 0;
+    bool replied = false, ran = false;
+};
+bool Evaluate(Frame frame, Handoff* handoff = nullptr);
 
 // Ends the companion. The caller guarantees no frame is in flight.
 void Stop();
