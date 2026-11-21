@@ -2,6 +2,7 @@
 #include "shared_resources.hpp"
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
+#include "core/referee_jitter.hpp"
 #include "host_dx12/diag/referee_recovery.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
@@ -74,6 +75,9 @@ struct Session {
     camera::CameraTracker camera;
     native11::CameraPick pick;
     uint64_t stream = 0, last_frame = 0; // the last DELIVERED frame and its input stream
+    uint64_t requested_jitter_frame = 0;
+    float requested_jitter_x = 0.f, requested_jitter_y = 0.f;
+    uint8_t requested_jitter_amount = 0;
     // What was ACQUIRED, kept apart from what was delivered (Astra's correction 4, 2026-11-16): a
     // frame whose DLSS step failed after its recording was submitted has still given its picture to
     // the next pair, and a frame that was never submitted has given nothing.
@@ -847,6 +851,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         id.present_ordinal = frame.frame;
         id.jitter_x = eval.jitter_x;
         id.jitter_y = eval.jitter_y;
+        if (s.requested_jitter_frame == frame.frame && frame.raster.applied && !debug_jitter.value &&
+            frame.recovery_tool == referee::RecoveryTool::None)
+            id.referee_jitter_amount = referee::VerifiedJitterAmount(s.requested_jitter_amount,
+                s.requested_jitter_x, s.requested_jitter_y, eval.jitter_x, eval.jitter_y);
         id.mv_scale_x = eval.mv_scale_x;
         id.mv_scale_y = eval.mv_scale_y;
         id.reset = eval.reset;
@@ -1005,7 +1013,16 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const auto ask_next_jitter = [&] {
         const auto phase = static_cast<uint32_t>(frame.frame);
         const auto sample = native11::DlaaJitterSample(phase, settings::Get().j2_jitter_r2.load() != 0);
-        native11::SetNextJitter(static_cast<float>(sample.x_pixels), static_cast<float>(sample.y_pixels));
+        const auto amount = !debug_jitter.value && frame.recovery_tool == referee::RecoveryTool::None &&
+            referee::RouteTrial::WatchTicket(frame.trial_ticket)
+            ? referee::gpu::SceneJitterAmount(frame.presentation_source, referee::shadow::Path::Native11,
+                frame.color.incarnation, frame.depth.incarnation, frame.scene_stream, frame.frame, frame.screen_proof)
+            : referee::normal_jitter;
+        s.requested_jitter_frame = frame.frame + 1;
+        s.requested_jitter_amount = amount;
+        s.requested_jitter_x = static_cast<float>(sample.x_pixels) * (amount * .01f);
+        s.requested_jitter_y = static_cast<float>(sample.y_pixels) * (amount * .01f);
+        native11::SetNextJitter(s.requested_jitter_x, s.requested_jitter_y);
     };
     // Measured: the next frame's sample is asked for here, not at delivery, so one failed DLSS step
     // does not take a sample out of the sequence. Bounded: see kJitterGraceFrames.

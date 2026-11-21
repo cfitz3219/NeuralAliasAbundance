@@ -1296,6 +1296,7 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         g_held.frame = g_frame;
     }
     SceneFrame f;
+    f.presentation_source = g_swap;
     f.frame = g_frame;
     const auto texture = [](TextureFacts& t, ID3D11Resource* r, const ResourceInfo& info, const ViewUse& view) {
         const float vx = g_scene_vp_x, vy = g_scene_vp_y, vw = g_scene_vp_w, vh = g_scene_vp_h;
@@ -2541,6 +2542,10 @@ template<class Forward>
 void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
 {
     const auto mark = CheckScreenReader(c, state);
+    // The draw event or this reader can complete the scene before the
+    // same draw is forwarded. Restore it on that draw, not one draw later.
+    if (state && !state->deferred && state->vpj_applied && !g_vpj_sample.load(std::memory_order_acquire))
+        VpjBeforeDraw(c, state);
     ForwardDepthRead(c, state, false, forward);
     if (mark.source) {
         Inside own;

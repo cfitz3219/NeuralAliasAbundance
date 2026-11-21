@@ -151,6 +151,14 @@ int main(int argc,char** argv) {
     REQUIRE(na::host::StartFromIni(GetModuleHandleW(nullptr),name.c_str(),"BOOT TEST"));
     // Same ordering as our DXGI proxy's exported CreateDXGIFactory entry.
     na::host::WaitForObserveInstall();
+    if (added_upscaling_off) {
+        // This case tests policy and exit with the real observer installed.
+        // If cold WARP initialization outlasts the factory gate, its test
+        // queue must still be created after observation has started.
+        const ULONGLONG deadline = GetTickCount64() + 20000;
+        while (!na::host::GetStatus().init_complete && GetTickCount64() < deadline) Sleep(5);
+        REQUIRE(na::host::GetStatus().init_complete == 1);
+    }
     test::Device d;
     REQUIRE(SUCCEEDED(CreateDXGIFactory2(0,IID_PPV_ARGS(&d.factory))));
     test::ComPtr<IDXGIAdapter> warp;
@@ -180,13 +188,7 @@ int main(int argc,char** argv) {
     test::ComPtr<ID3D12CommandQueue> observed;
     observed.Attach(na::overlay::AcquirePresentQueue(chain.Get()));
     CHECK(observed.Get()==d.queue.Get());
-    if (added_upscaling_off) {
-        // This WARP fixture also installs the DX12 observation producers. Allow
-        // that setup to finish before checking policy, even if the factory gate
-        // released the test thread first. The production gate stays unchanged.
-        const ULONGLONG init_deadline = GetTickCount64() + 20000;
-        while (!na::host::GetStatus().init_complete && GetTickCount64() < init_deadline) Sleep(5);
-    } else {
+    if (!added_upscaling_off) {
         for(unsigned i=0;i<400 && !na::host::GetStatus().init_complete;++i)Sleep(5);
     }
     REQUIRE(na::host::GetStatus().init_complete==1);

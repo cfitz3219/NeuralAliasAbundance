@@ -104,6 +104,8 @@ na_host_test(camera_fit_gpu_test SOURCES camera_fit_gpu_test.cpp LIBS core_gpu d
 na_host_test(j2_flow_shaders_compile_test SOURCES j2_flow_shaders_compile_test.cpp LIBS d3dcompiler)
 # The referee on the card end to end (not labelled gpu: it runs on WARP in CI).
 na_host_test(referee_gpu_test SOURCES referee_gpu_test.cpp LIBS host_capture host_settings d3dcompiler dxgi)
+add_test(NAME host_referee_jitter_gpu_test COMMAND referee_gpu_test --jitter)
+set_tests_properties(host_referee_jitter_gpu_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
 na_host_test(scene_group_test SOURCES scene_group_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 na_host_test(depth_restore_test SOURCES depth_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)

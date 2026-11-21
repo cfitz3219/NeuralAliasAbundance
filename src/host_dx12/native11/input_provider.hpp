@@ -89,6 +89,7 @@ enum class Boundary : uint8_t {
 };
 
 struct SceneFrame {
+    const void* presentation_source = nullptr; // identity only, valid for this provider frame
     uint64_t frame = 0;            // provider frame counter (advances at Present)
     uint64_t stream = 0;           // input stream id: stays while colour/depth/camera objects stay; new on any change
     TextureFacts color, depth;

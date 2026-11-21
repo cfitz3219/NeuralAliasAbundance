@@ -7,6 +7,15 @@ namespace neural_alias {
 // Independent sampling math, applied by the verified Alien camera adapter.
 // The adapter owns sequence advancement/reset and must select the main scene camera.
 struct JitterSample { double x_pixels, y_pixels; };
+
+// Applies equally to a scene prepass and its color draws. Once an adapter
+// proves the scene has resolved, the game's subsequent composition stays
+// on its original raster grid.
+constexpr bool SceneDrawTakesJitter(bool active, uint64_t bound_depth, uint64_t scene_depth,
+                                    bool tests_depth, bool after_resolve)
+{
+    return active && scene_depth && bound_depth == scene_depth && tests_depth && !after_resolve;
+}
 // The overlay owns this session-only transform. NVIDIA's F9/F10 hotkeys
 // have no reported state we can reliably return to zero.
 struct JitterDiagnostic {

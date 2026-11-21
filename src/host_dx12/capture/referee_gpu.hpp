@@ -34,6 +34,7 @@ struct Evaluation {
     bool owns_present = false;        // render-small: the output is the presented image (not judged)
     bool mv_jittered = false;
     bool mv_display_res = false;
+    uint8_t scene_jitter_amount = 0; // verified against the submitted raster
     shadow::Context context;
 };
 
@@ -65,6 +66,8 @@ bool NeedsScreen(Presentation frame);
 void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exec);
 void PresentResult(const void* swapchain, uint64_t ordinal, bool accepted);
 bool TakeTrialSample(uint64_t ticket, TrialSample& sample);
+uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t color,
+                          uint64_t depth, uint64_t generation, uint64_t frame, uint64_t screen_proof = 0);
 void InvalidatePresentation(const void* swapchain);
 // Consume a visual rollback decision scoped to a native DX11 screen proof.
 uint64_t TakeNativeScreenLoss(const void* swapchain);

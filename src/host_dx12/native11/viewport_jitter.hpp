@@ -74,7 +74,7 @@ inline neural_alias::JitterSample DlaaJitterSample(uint32_t phase, bool r2)
 // Whether a draw is a scene draw for jitter: it writes the selected scene depth with depth test on.
 inline bool WantsViewportJitter(bool active, uint64_t bound_depth, uint64_t scene_depth, bool depth_test, uint32_t viewports)
 {
-    return active && scene_depth && bound_depth == scene_depth && depth_test && viewports > 0;
+    return viewports && neural_alias::SceneDrawTakesJitter(active, bound_depth, scene_depth, depth_test, false);
 }
 
 } // namespace na::native11
