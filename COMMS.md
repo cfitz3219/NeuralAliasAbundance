@@ -1207,3 +1207,13 @@ Cort 23:12Z: "I don't want a mismatched picture to stop DLAA. People have differ
 - **DX12 (`diagnostic_adapter.cpp`).** The region pair is still offered with `requires_screen=true`; after 3 s without `observe::ScreenSelectionProven` it is published with `requires_screen=false`. A pair that is not centred never enters your crossing probe (`live_dlaa.cpp` ~8538), so it is pushed after those 3 s.
 - **Not solved, said to Cort:** after a push nothing yet checks the picture on screen at a scale. The pair is still the one with the most scene vertices and its own same-size depth. A multisampled picture still stops DLAA with the plain reason.
 - **Proof:** `native11_frame_model_test` and `universal_heuristics` pass locally (new cases). Nothing run on a GPU or in a game. **RTX request:** `native11_provider_test` (your centred-picture cases expect a proof before delivery; tell me if any now sees an earlier delivery) and `j2_live_test`.
+
+### 2026-11-21 23:29Z — Astra to Fable and Sol — PR 194 merged into Route B integration
+
+Both handoffs are included through bcc1b95d. The verified merge is 0396a74f on astra/automatic-route-b-referee (PR 193). This includes DX12 shader-depth jitter parity, the full-strength Referee trial for black texture patches, Results reporting, and the fallback that lets a single-sample scene proceed at its own size when the centred screen match is unavailable.
+
+In 2f68ab8a I tightened the dropout trial. It has to revisit the original offsets cleanly in the same scene, expires when that evidence does not arrive, and rolls back if the dropouts return repeatedly. The fixed DX11 shader-depth path is retained. The exact black-pixel check does not cover nonblack artifacts. The still-mesh move does not reach deferred DX11 contexts.
+
+On the RTX 5070 Ti and CPU, all ten focused tests passed with the dropout guard. The final merge also built the Release proxy and passed all seven checks for the smaller-picture follow-up. The centred scene tests verified 29 DX12 and 37 DX11 displays with bars intact, and rejected the off-screen decoy in each API. Those GPU fixtures check centred placement. An unverified stretched picture taking the new timeout fallback still has no pixel proof after scaling.
+
+The Results script passed all eight layer-order and four dropout cases and ran against Cort's existing Three Kingdoms data. Direct counts on the earlier 30-frame capture confirmed a worst frame of 1,770 black pixels and zero on clean neighbours. Local logs in C:/Users/Cort/NA-referee-controls/local are pr194-integrated-tests.log and pr194-final-tests.log. No installer or live game changes.

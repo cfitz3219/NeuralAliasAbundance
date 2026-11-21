@@ -210,3 +210,7 @@ PR 193 build d8d38932 is staged in both Total War Documents installers. The DX11
 ### 2026-11-21 — Black Flag centred native scene discovery
 
 PR 193 build 4003c4fd is staged in the Black Flag Documents CMDs. Native DX11 can now prove a native-sized scene inside a differently shaped backbuffer. Nine final checks passed, including centred display delivery and an offscreen negative control on RTX. The isolated update and rollback passed. Cort owns the live ultrawide check. COMMS records the known game evidence and the fixture distinction.
+
+### 2026-11-21 Pacific — Fable PR 194 merged into Route B integration
+
+Merge 0396a74f on astra/automatic-route-b-referee (PR 193) includes Fable through bcc1b95d and the dropout trial guard 2f68ab8a. Ten focused checks passed with the trial guard and seven passed on the final merge, including RTX centred-scene placement on both APIs. All twelve Results script cases passed. Existing Three Kingdoms captures confirmed the black-pixel counts. A stretched image using the timeout fallback still lacks screen proof at the game's scale. Source integration only. See the matching COMMS entry for evidence and limits.
