@@ -2304,3 +2304,11 @@ RTX 5070 Ti, actual NGX model M re-evaluation: first 16 consecutive frames of 02
 
 The controlled RTX regression exercises both route paths, including a localized defect away from the old tiles, a half-strength winner and a quarter-strength winner after a partial half-strength correction. CPU cases explicitly reject sharpness loss and degradation on another affected edge. The full game test is Cort's.
 Ten targeted Release tests passed on the RTX machine, including both APIs' lighting, automatic DLAA, RCAS, settings and all four Referee GPU cases. The Results summary passed eight offline cases and surfaced the trial strength on replay logs.
+
+## 2026-11-21 — Restore mip bias after automatic DX11 startup
+
+Three Kingdoms process 10476 ended with -1.000 requested, 0.000 applied, zero eligible and replaced samplers, and 13,511,952 unrecognized binds. Fable found the same problem in Pharaoh Dynasties. With automatic API selection, the first real Present installs native sampler interception after the game has made its sampler states. Integrated Fable's PR 194 (cbf0ec6a) to read the original sampler description when it first appears in a bind or policy refresh.
+
+Direct3D 11 can return the same object for identical sampler descriptions. A preexisting game sampler can therefore be the very object used as another sampler's replacement. The original is now resolved per context and slot for game queries and restoration. Explicit game binds retain their own description, including an original bias of -1. Runtime-internal calls while finishing a deferred list run inside the existing scope guard so a state restore cannot be mistaken for a new game bind.
+
+The production automatic-DX11 fixture created both samplers before Present on the RTX 5070 Ti. Original 0 sampled green mip 1, total -1 sampled red mip 0, and switching the policy off restored green without any game rebind. The sampler already at -1 kept red even with the policy off. Immediate and deferred mip readbacks passed, together with actual 16x AF binding and native DLAA. Six focused provider and Referee regressions passed during integration. Logs live under local/late-mip-*.log. In-game texture appearance remains for Cort to verify.

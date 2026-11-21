@@ -2938,7 +2938,13 @@ void STDMETHODCALLTYPE ClearState_d(ID3D11DeviceContext* c)
 HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL restore, ID3D11CommandList** out)
 {
     Ctx* x = Get(c);
-    const HRESULT hr = O(c, x).finish(c, restore, out);
+    HRESULT hr;
+    {
+        // Runtime state restoration can call the hooked setters with physical
+        // bindings. Keep the game's tracked state for restore=TRUE.
+        Inside in;
+        hr = O(c, x).finish(c, restore, out);
+    }
     if (x) {
         if (SUCCEEDED(hr) && out && *out) {
             std::lock_guard<std::mutex> l(g_mu);

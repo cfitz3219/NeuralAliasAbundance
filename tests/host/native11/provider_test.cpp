@@ -1795,6 +1795,22 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #endif
 #if defined(NA_TEST_NATIVE_DLAA)
     if (warp) return 77;
+    D3D11_SAMPLER_DESC early_desc{};
+    early_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    early_desc.AddressU = early_desc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    early_desc.AddressW = D3D11_TEXTURE_ADDRESS_MIRROR;
+    early_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    early_desc.MaxAnisotropy = 1;
+    ComPtr<ID3D11SamplerState> early_original, early_already_biased;
+    {
+        // In automatic mode this really runs before the first Present installs
+        // hooks. In the explicit route, keep the same states out of the ledger.
+        na::native11::OwnWorkScope own_work;
+        expect(SUCCEEDED(g.device->CreateSamplerState(&early_desc, &early_original)), "create startup sampler");
+        early_desc.MipLODBias = -1.f;
+        expect(SUCCEEDED(g.device->CreateSamplerState(&early_desc, &early_already_biased)),
+               "create startup sampler already at the policy's target");
+    }
     ComPtr<ID3D11On12Device> translated;
     expect(FAILED(g.device.As(&translated)), "game device is native DX11");
     if (automatic) {
@@ -2761,7 +2777,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(16);
     g.ctx->Draw(4, 0);
     ComPtr<ID3D11SamplerState> bound;
-    g.ctx->PSGetSamplers(0, 1, &bound); D3D11_SAMPLER_DESC applied{};
+    const auto get_applied_sampler = [&] {
+        na::native11::OwnWorkScope own_work;
+        bound.Reset();
+        g.ctx->PSGetSamplers(0, 1, &bound);
+    };
+    get_applied_sampler();
+    D3D11_SAMPLER_DESC applied{};
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
            "the actual native draw binding has 16x AF and total -1 mip bias");
@@ -2788,6 +2810,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(SUCCEEDED(dc->FinishCommandList(TRUE, &recorded)), "record native sampler restoration");
         if (recorded) g.ctx->ExecuteCommandList(recorded.Get(), TRUE);
         ReadCopy(g, deferred_off, g.color.Get());
+        std::printf("native deferred mip pixels: -1 %.2f/%.2f, own %.2f/%.2f\n",
+                    deferred_on[0], deferred_on[1], deferred_off[0], deferred_off[1]);
         expect(deferred_on[0] > .9f && deferred_off[1] > .9f,
                "deferred draws update and restore mip pixels without rebinding");
     } else expect(false, "create deferred material context");
@@ -2797,40 +2821,42 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     ComPtr<ID3D11SamplerState> already;
     g.device->CreateSamplerState(&sampler, &already); material_raw = already.Get();
     g.ctx->PSSetSamplers(0, 1, &material_raw);
-    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound);
+    get_applied_sampler();
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.MipLODBias == -1.f && na::native11::GetSamplerStats().original_bias == -1.f,
            "native mip total avoids double bias when the game already requests -1");
-    // A sampler the game made before the hooks existed (automatic API detection installs them at the
-    // first present, after an engine has built its sampler table) is never seen at creation. It is
-    // recorded the first time the game binds it and gets the same texture detail: pixels, not counters.
+    // The startup sampler was never logged at creation. Check the result of a real draw.
     {
-        D3D11_SAMPLER_DESC early = sampler;
-        early.MipLODBias = 0.f;
-        early.AddressW = D3D11_TEXTURE_ADDRESS_MIRROR; // a description no other sampler here has
-        ComPtr<ID3D11SamplerState> unseen;
-        {
-            na::native11::OwnWorkScope not_recorded; // creation passes the hook unrecorded, as before install
-            g.device->CreateSamplerState(&early, &unseen);
-        }
         const auto before = na::native11::GetSamplerStats();
         na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(0);
-        auto* unseen_raw = unseen.Get();
+        auto* unseen_raw = early_original.Get();
         g.ctx->PSSetSamplers(0, 1, &unseen_raw);
         float early_on[4]{}, early_off[4]{};
         g.ctx->Draw(4, 0); ReadCopy(g, early_on, g.color.Get());
-        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        get_applied_sampler(); applied = {};
         if (bound) bound->GetDesc(&applied);
+        ComPtr<ID3D11SamplerState> read_by_game;
+        g.ctx->PSGetSamplers(0, 1, &read_by_game);
+        expect(bound.Get() == early_already_biased.Get() && read_by_game.Get() == early_original.Get(),
+               "an interned replacement is reported to the game as this slot's original");
         na::observe::SetSamplerMipBias(0.f);
         g.ctx->Draw(4, 0); ReadCopy(g, early_off, g.color.Get());
         const auto after = na::native11::GetSamplerStats();
         std::printf("native mip pixels, sampler made before the hooks: -1 %.2f/%.2f, own %.2f/%.2f adopted=%llu\n",
                     early_on[0], early_on[1], early_off[0], early_off[1],
                     static_cast<unsigned long long>(after.adopted - before.adopted));
-        expect(unseen && after.adopted == before.adopted + 1 && after.eligible_bias == before.eligible_bias + 1 &&
+        expect(early_original && after.adopted == before.adopted + 1 && after.eligible_bias == before.eligible_bias + 1 &&
                after.unknown == before.unknown && bound && applied.MipLODBias == -1.f &&
                early_on[0] > .9f && early_on[1] < .1f && early_off[1] > .9f,
                "a sampler created before the hooks gets the mip bias at its first bind and restores live");
+        auto* game_already_biased = early_already_biased.Get();
+        g.ctx->PSSetSamplers(0, 1, &game_already_biased);
+        float early_game_bias[4]{};
+        g.ctx->Draw(4, 0); ReadCopy(g, early_game_bias, g.color.Get());
+        get_applied_sampler();
+        expect(bound.Get() == game_already_biased && early_game_bias[0] > .9f &&
+               na::native11::GetSamplerStats().adopted == after.adopted + 1,
+               "a pre-hook game sampler shared with an existing replacement keeps its own bias");
         na::observe::SetSamplerMipBias(-1.f);
     }
     // After the frame's picture is handed to DLSS the game's later passes keep its own samplers;
@@ -2842,14 +2868,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const uint64_t own_before = na::native11::GetSamplerStats().after_scene;
     na::native11::SetSceneHanded(true);
     g.ctx->Draw(4, 0);
-    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+    get_applied_sampler(); applied = {};
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && applied.MipLODBias == 0.f &&
            na::native11::GetSamplerStats().after_scene > own_before,
            "draws after the scene is handed to DLSS sample with the game's own sampler");
     na::native11::SetSceneHanded(false);
     g.ctx->Draw(4, 0);
-    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+    get_applied_sampler(); applied = {};
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
            "the next frame's scene draws get 16x AF and the -1 mip bias back");
@@ -2866,7 +2892,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         material_raw = material.Get();
         g.ctx->PSSetSamplers(0, 1, &material_raw);
         g.ctx->Draw(4, 0);
-        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        get_applied_sampler(); applied = {};
         if (bound) bound->GetDesc(&applied);
         expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16,
                "automatic AF binds 16x on the tiling material sampler");
@@ -2886,7 +2912,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                na::af::Global().Get().state == na::af::Detector::State::GameHasAf,
                "the game's own 8x/16x world samplers switch our filtering off, live");
         g.ctx->Draw(4, 0);
-        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        get_applied_sampler(); applied = {};
         if (bound) bound->GetDesc(&applied);
         D3D11_SAMPLER_DESC original{};
         if (material) material->GetDesc(&original);
@@ -2897,7 +2923,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         auto* game_owned16 = shared16.Get();
         g.ctx->PSSetSamplers(0, 1, &game_owned16);
         g.ctx->Draw(4, 0);
-        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound);
+        get_applied_sampler();
         expect(bound.Get() == shared16.Get(),
                "a new explicit game bind keeps the same 16x sampler");
         g.ctx->PSSetSamplers(0, 1, &material_raw);
