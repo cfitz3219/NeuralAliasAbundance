@@ -4,7 +4,8 @@
 
 namespace na::referee::shadow {
 
-enum class Path : uint8_t { None, Between, Inline, Native11 };
+// Game: the game's own DLSS evaluation (Route A), watched but never placed by us.
+enum class Path : uint8_t { None, Between, Inline, Native11, Game };
 
 inline const char* Name(Path path)
 {
@@ -12,6 +13,7 @@ inline const char* Name(Path path)
     case Path::Between: return "between";
     case Path::Inline: return "inline";
     case Path::Native11: return "native11";
+    case Path::Game: return "game_dlss";
     default: return "none";
     }
 }
