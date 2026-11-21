@@ -3430,7 +3430,8 @@ void dump_camera_inputs(const std::vector<const Block*>& order, na_object_id dep
                        (unsigned long long)count, total, path);
 }
 
-// Only consider this adapter on the translated campaign path. The pixel
+// Considered on every translated DX11 game; a block qualifies by content only
+// (no game or executable name). The pixel
 // constants of the scene-producing list carry the current world pose; the
 // VP-only slot on the list reading the scene can lag that pose by a frame.
 na::wwii::SceneCameraReceipt wwii_scene_camera(ID3D12CommandList* list, uint64_t color,
@@ -8340,7 +8341,7 @@ void SetEnabled(bool on)
     }
     na::observe::SetEntryCallback(on?&on_entry:nullptr);
 }
-void EnableWwiiSceneCamera(bool on) { g.wwii_scene_camera.store(on, std::memory_order_relaxed); }
+void EnableRelativeSceneCamera(bool on) { g.wwii_scene_camera.store(on, std::memory_order_relaxed); }
 bool Enabled() { return na::settings::EffectsReady() && g.enabled.load(); }
 PhysicalReport::~PhysicalReport()
 {

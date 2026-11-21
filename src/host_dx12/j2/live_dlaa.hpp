@@ -38,7 +38,7 @@ using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList*
 void SetEnabled(bool on);   // from the INI at start-up
 bool Enabled();
 bool Configured();          // enabled at start-up (the overlay shows its section)
-void EnableWwiiSceneCamera(bool on);
+void EnableRelativeSceneCamera(bool on);
 void SetPaused(bool paused); // the overlay's on/off switch (history resets on resume)
 bool Paused();
 // The native DX11 route uses the same sharpening kernel with its own slots.

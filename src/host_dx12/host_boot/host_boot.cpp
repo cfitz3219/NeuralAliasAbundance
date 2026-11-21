@@ -321,11 +321,12 @@ DWORD WINAPI InitThread(LPVOID)
     // Each route supplies scene inputs through its own observer.
     na::j2::SetEnabled(GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 &&
                        (native11 || dx12_producers || na::on12::Automatic()));
-    wchar_t scene_camera_exe[MAX_PATH]{};
-    GetPrivateProfileStringW(L"host", L"executable", L"", scene_camera_exe, MAX_PATH, g_ini);
-    na::j2::EnableWwiiSceneCamera(na::j2::Configured() &&
-        GetPrivateProfileIntW(L"dx11on12", L"enabled", 0, g_ini) == 1 &&
-        lstrcmpiW(scene_camera_exe, L"s2_sp64_ship.exe") == 0);
+    // Gap audit 2026-11-21 item 14: no executable name decides this. The relative
+    // scene-camera decoder is offered to every translated DX11 game and accepts a
+    // constant block only by its content (block size, scene extent and the
+    // redundant pose fields, checked on every read), as native DX11 already does.
+    na::j2::EnableRelativeSceneCamera(na::j2::Configured() &&
+        GetPrivateProfileIntW(L"dx11on12", L"enabled", 0, g_ini) == 1);
     // P4-4 projection window ([j2] window=1): the no-slider route that windows J1's camera;
     // Layer2 stays off with it (both would change the scene's render size).
     // P4-4 render-small ([present] render_small=1, plan COMMS 4e30a94): the game renders its whole
