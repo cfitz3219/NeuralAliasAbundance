@@ -3217,9 +3217,12 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     if (previous.screen_region && g_screen.Verified(previous.color, previous.depth))
         g_region_started = g_frame;
     if (previous.screen_region && g_frame - g_region_started > 96) {
-        na::eventlog::Emit("native11_picture_region", "result=no_screen_proof extent=%ux%u",
+        // VARIANT: scene/pushed-without-screen-proof
+        // No pixel-for-pixel match on the screen in 96 frames (a stretched picture never gives one).
+        // DLAA is not held back for that: it goes ahead on this picture at its own size.
+        na::eventlog::Emit("native11_picture_region", "result=pushed_without_screen_proof extent=%ux%u",
             previous.color_info.width, previous.color_info.height);
-        g_model.DeferScreenRegion();
+        g_model.PushScreenRegion();
     }
     g_model.EndFrame(check_lit && !previous.screen_region,
         check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0, check_lit);
@@ -3235,11 +3238,6 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             std::snprintf(why, sizeof why,
                 "The game's own anti-aliasing is on (scene picture %ux multisampled, %ux%u inside a %ux%u screen): DLAA needs it off in the game's settings.",
                 refused.samples, refused.width, refused.height, refused.screen_width, refused.screen_height);
-            break;
-        case FrameModel::NoScene::SmallerBothWays:
-            std::snprintf(why, sizeof why,
-                "The game's picture (%ux%u) is smaller than the screen (%ux%u) in both width and height: DLAA needs the game's resolution to match the screen's width or its height.",
-                refused.width, refused.height, refused.screen_width, refused.screen_height);
             break;
         default:
             std::snprintf(why, sizeof why,

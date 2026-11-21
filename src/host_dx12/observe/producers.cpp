@@ -9707,6 +9707,13 @@ bool SetScreenSelectionProven(uint64_t depth, uint64_t color, bool proven)
     return true;
 }
 
+bool ScreenSelectionProven(uint64_t depth, uint64_t color)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    return depth && color && g_screen_depth == depth && g_screen_color == color &&
+           g_live_depth.load(std::memory_order_relaxed) == depth && g_live_color.load(std::memory_order_relaxed) == color;
+}
+
 void GetLiveSelection(uint64_t* depth, uint64_t* color, bool* requires_screen)
 {
     for (;;) {

@@ -90,6 +90,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -162,6 +163,7 @@ public:
     struct Stats {
         uint64_t frames = 0, selected_frames = 0, fired = 0, missed = 0, unplaceable = 0, contradictions = 0;
         uint64_t selection_changes = 0, loading_frames = 0;
+        uint64_t pushed_pictures = 0;    // pictures delivered without screen proof (scene/pushed-without-screen-proof)
         uint32_t last_scene_draws = 0, last_draws = 0, learned_read = 0, last_reads = 0;
         uint32_t camera_scene_draws = 0; // scene draws with the camera cb bound (last frame)
         uint64_t tag_not_unique = 0;     // frames whose point's tag named more than one read
@@ -177,7 +179,7 @@ public:
 
     // WHY log: the biggest scene-like pair that was looked at and not chosen in the last frame with
     // no screen-shaped picture, and what stood in the way. Says nothing when a scene is chosen.
-    enum class NoScene : uint8_t { None, Multisampled, SmallerBothWays, AwaitingScreenProof };
+    enum class NoScene : uint8_t { None, Multisampled, AwaitingScreenProof };
     struct Refused {
         NoScene why = NoScene::None;
         uint32_t width = 0, height = 0, samples = 1;
@@ -188,9 +190,23 @@ public:
 
     void SetSwapChainSize(uint32_t w, uint32_t h)
     {
-        if (w != swap_w_ || h != swap_h_) region_retry_.clear();
+        if (w != swap_w_ || h != swap_h_) { region_retry_.clear(); pushed_.clear(); }
         swap_w_ = w;
         swap_h_ = h;
+    }
+    // VARIANT: scene/pushed-without-screen-proof
+    // A picture that is not the screen's shape could not be matched to the screen pixel for pixel
+    // (the game stretches it, or draws it through passes the challenge cannot follow). It is still
+    // the most-drawn scene with its own depth, so DLAA is delivered on it at the ordinary point,
+    // at the picture's own size. The pair is remembered, so it is chosen directly from then on.
+    bool PushScreenRegion()
+    {
+        if (!sel_.screen_region) return false;
+        pushed_.insert({sel_.depth, sel_.color});
+        if (wide_ && layer_) pushed_.insert({sel_.depth, layer_});
+        sel_.screen_region = false;
+        ++stats_.pushed_pictures;
+        return true;
     }
     void DeferScreenRegion()
     {
@@ -686,9 +702,17 @@ private:
         return std::fabs(a - s) <= 0.1 && rx >= 0.5 && rx <= 1.85 && ry >= 0.5 && ry <= 1.85;
     }
 
+    // A single-sample picture no larger than the screen and at least half of it each way: bars on one
+    // side pair (CenteredNativeRegion), bars all round, or a smaller picture the game stretches.
     bool CanFillScreenRegion(const ResourceInfo& r) const
     {
-        return r.samples == 1 && presentation::CenteredNativeRegion(r.width, r.height, swap_w_, swap_h_);
+        return r.samples == 1 && PlacedOrStretched(r);
+    }
+    bool PlacedOrStretched(const ResourceInfo& r) const
+    {
+        return r.width && r.height && r.width <= swap_w_ && r.height <= swap_h_ &&
+               !(r.width == swap_w_ && r.height == swap_h_) &&
+               uint64_t(r.width) * 2 >= swap_w_ && uint64_t(r.height) * 2 >= swap_h_;
     }
 
     // The pair with the most vertices among those that are drawn like a scene, are not the screen's
@@ -704,15 +728,12 @@ private:
             if (usage == depth_.end() || (usage->second.vertices <= 3 && !usage->second.indirect)) continue;
             const auto& r = d->second;
             const uint32_t samples = (std::max)(r.samples, c->second.samples);
-            const bool placed = presentation::CenteredNativeRegion(r.width, r.height, swap_w_, swap_h_);
+            const bool placed = PlacedOrStretched(r);
             NoScene why = NoScene::None;
             if (placed && samples != 1) why = NoScene::Multisampled;
             else if (placed) {
                 const auto defer = region_retry_.find(kv.first);
                 if (defer != region_retry_.end() && defer->second > stats_.frames) why = NoScene::AwaitingScreenProof;
-            } else if (r.width < swap_w_ && r.height < swap_h_ &&
-                       uint64_t(r.width) * 2 >= swap_w_ && uint64_t(r.height) * 2 >= swap_h_) {
-                why = NoScene::SmallerBothWays;
             }
             if (why == NoScene::None || (refused_.why != NoScene::None && usage->second.vertices <= refused_.vertices)) continue;
             refused_ = {why, r.width, r.height, samples, usage->second.vertices, swap_w_, swap_h_};
@@ -752,10 +773,10 @@ private:
         bool screen_region = false;
         refused_ = {};
         if (!best_color) NoteRefusedScene();
-        if (!best_color && detect_screen_regions) {
+        if (!best_color) {
             best_v = 0;
-            // Use the real dimensions of the colour/depth pair. Final-screen proof
-            // is required before running DLAA on this otherwise mismatched pair.
+            // Use the real dimensions of the colour/depth pair. The screen challenge is tried first
+            // where it is available; a pair it cannot prove is pushed (PushScreenRegion), never dropped.
             for (const auto& kv : color_) {
                 const auto d = info_.find(kv.first.first), c = info_.find(kv.first.second);
                 if (d == info_.end() || c == info_.end() || AspectOk(d->second) ||
@@ -774,7 +795,7 @@ private:
                     best_cd = kv.second.draws;
                 }
             }
-            screen_region = best_color != 0;
+            screen_region = best_color != 0 && detect_screen_regions && !pushed_.count({best_depth, best_color});
         }
         if (!best_color) return; // nothing usable this frame: keep the old choice
         refused_ = {}; // a pair is being chosen: nothing to explain
@@ -997,6 +1018,7 @@ private:
     uint32_t swap_w_ = 0, swap_h_ = 0;
     std::map<std::pair<Id, Id>, uint64_t> region_retry_;
     Refused refused_;
+    std::set<std::pair<Id, Id>> pushed_;
     std::unordered_map<Id, ResourceInfo> info_;
     std::unordered_map<Id, Cand> depth_;
     std::unordered_map<std::pair<Id, Id>, PairCount, PairHash> color_;

@@ -782,11 +782,28 @@ int main()
                msaa.RefusedScene().samples == 4 && msaa.RefusedScene().width == 2560 && msaa.RefusedScene().height == 1440,
                "a multisampled placed picture is not chosen, and the model says it is the game's anti-aliasing");
         run(1920, 1080, 1, true, small);
-        expect(!small.Current().valid() && small.RefusedScene().why == FrameModel::NoScene::SmallerBothWays &&
-               small.RefusedScene().width == 1920, "a picture smaller than the screen both ways is not chosen, and the model says so");
+        expect(small.Current().valid() && small.Current().screen_region && small.RefusedScene().why == FrameModel::NoScene::None,
+               "a picture smaller than the screen both ways is taken too, pending screen proof");
+        // No proof comes (the game stretches it): DLAA is pushed on it and the pair stays chosen.
+        expect(small.PushScreenRegion() && small.Current().valid() && !small.Current().screen_region &&
+               small.GetStats().pushed_pictures == 1, "without screen proof the picture is pushed, not dropped");
+        bool fires = false;
+        for (int frame = 0; frame < 4; ++frame) {
+            for (int i = 0; i < 40; ++i) small.Feed(Draw(kColor, kDepth, 3000));
+            fires = small.ShouldFireBeforeRead(kColor);
+            small.Feed(Read(kColor));
+            small.Feed(Draw(kBackBuffer, 0, 3));
+            small.EndFrame(false, 0, true);
+        }
+        expect(small.Current().color == kColor && !small.Current().screen_region && fires,
+               "a pushed picture keeps its place and delivers at the ordinary point, before its first read");
+        FrameModel unchecked;
+        run(1920, 1080, 1, false, unchecked);
+        expect(unchecked.Current().valid() && !unchecked.Current().screen_region,
+               "with the screen challenge unavailable the picture is chosen directly");
         run(2560, 1440, 4, false, off);
         expect(!off.Current().valid() && off.RefusedScene().why == FrameModel::NoScene::Multisampled,
-               "the reason is known whether or not placed pictures are being looked for");
+               "the reason is known whether or not the screen challenge is available");
     }
 
     std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: DX11 frame model\n", g_failed);
