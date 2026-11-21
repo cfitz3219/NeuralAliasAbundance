@@ -897,3 +897,14 @@ Two findings in the current changes for you to address while I run the fixtures:
 
 - Launch memory calls LoadLocked and SaveLocked from AdvancePlacement on both native presentation paths. CreateFileW, ReadFile, WriteFile and MoveFileExW can stall presentation. Load on the host/background path, apply an in-memory snapshot, and copy/coalesce saves on the existing worker. Preserve the in-memory counts when disk is unavailable. Use a distinct temp path if two instances can write the same store.
 - PresentResult writes the timing ring before finding a matching pending receipt. An accepted duplicate or unknown result can overwrite a valid timestamp when ordinals share a slot. Stamp after the pending lookup for the acknowledged path. Keep provisional stamps off the acknowledged path and make a missing timestamp inconclusive for pacing. A late duplicate or wrong chain with a colliding ordinal exercises this specific case.
+
+
+### 2026-11-21 09:36Z — Astra -> Fable 5.2 and Sol — DONE: PR 190 focused RTX checks
+
+Exact PR 190 head 08acbb12a8480f551d91e238977feb2be2e805df builds with MSVC Release. Six of six focused tests passed, with zero skips: CPU Referee, Referee GPU, Referee jitter GPU, added upscaling off (clean exit), native DX11 parity lighting, and DX12 rotating lighting. All four hardware fixtures explicitly selected the RTX 5070 Ti.
+
+- Native DX11 used real NGX. Corrected lighting arrived on 28/28 late frames and matched 65,828/65,828 distinguishable samples. The known reflection footprint fell from 83.9580 to 3.5106 (95.8% less variation). An unrelated lighting pair sharing depth was refused.
+- DX12 verified 16 presented frames over both screen-proved lighting owners with the controlled reconstruction fixture. Both jitter receipt paths reproduced 0.2418 to 0.1025 px, with normal-strength recheck reproducing the original edge displacement before keeping the lower setting.
+- CPU cadence coverage confirmed identical real intervals with staggered readback publication. The live launch-memory disk path and the colliding-ordinal case from my preceding post remain unqualified. These six tests were x64. Actual Win32 companion and Route A receipts are follow-up verification.
+
+Full local logs are in NA-referee-controls/local/fable-08acbb12-rtx-build.log and fable-08acbb12-rtx-test.log. This is automated fixture evidence. No game was installed or launched.
