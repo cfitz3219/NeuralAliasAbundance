@@ -205,10 +205,10 @@ struct TrialEvidence {
     }
 };
 // What a finished comparison established. Only Harm excludes the candidate.
-enum class TrialOutcome : uint8_t { Pending, Improved, Harm, Insufficient, Unavailable };
+enum class TrialOutcome : uint8_t { Pending, Improved, Harm, Insufficient, Unavailable, Slower };
 inline const char* TrialOutcomeName(TrialOutcome outcome)
 {
-    constexpr const char* names[] = {"pending", "improved", "harm", "insufficient_evidence", "unavailable"};
+    constexpr const char* names[] = {"pending", "improved", "harm", "insufficient_evidence", "unavailable", "slower"};
     return names[static_cast<unsigned>(outcome)];
 }
 
@@ -229,6 +229,16 @@ public:
     // a growing wait, at most this many times for one scope and setup.
     // Demonstrated harm (RuledOut) is never reopened here.
     static constexpr unsigned inconclusive_limit = 3;
+    // VARIANT: referee/frame-time-acceptance
+    // A replacement that cures the symptom must not pay for it in frame time.
+    // Each phase measures the real time per game frame between its own
+    // accepted receipts (median of the intervals, so one load spike or menu
+    // hitch cannot decide). The replacement is compared with the SLOWER of the
+    // two ordinary-route measurements, so a game that slowed down by itself
+    // during the trial does not condemn a good route. Without three intervals
+    // in every phase there is no timing verdict and the picture decides alone.
+    static constexpr float frame_cost_ratio = 1.10f, frame_cost_ms = .5f;
+    static constexpr unsigned frame_intervals = 3;
 
     void Start(uint64_t id, uint64_t frame, uint64_t now)
     {
@@ -444,6 +454,7 @@ public:
             }
             return;
         }
+        Time(sample);
         window_[count_++] = sample;
         if (count_ < samples) return;
         if (phase_ == Phase::Baseline || phase_ == Phase::ConfirmBaseline) {
@@ -514,6 +525,11 @@ public:
                     Inconclusive("the original flicker did not return consistently");
                     return;
                 }
+                if (CostsFrameTime()) {
+                    Inconclusive("the replacement cost too much frame time against both ordinary measurements",
+                                 TrialOutcome::Slower);
+                    return;
+                }
                 if (!targeted_ && !regional_) SelectResidualRegion();
                 Next(Phase::Kept, next_frame);
                 retry_delay_ = 8000;
@@ -577,6 +593,13 @@ public:
         }
     }
     const char* Reason() const { return reason_; }
+    // Median milliseconds per game frame in the ordinary, replacement and
+    // ordinary-recheck phases; negative where it could not be measured.
+    float FrameMs(Phase phase) const
+    {
+        const unsigned i = static_cast<unsigned>(phase) - static_cast<unsigned>(Phase::Baseline);
+        return i < frame_ms_.size() ? frame_ms_[i] : -1.f;
+    }
     float Baseline() const { return baseline_; }
     float Candidate() const { return replacement_; }
     float Confirmation() const { return confirmation_; }
@@ -708,9 +731,38 @@ private:
     {
         if (Active()) ++live_.refused[static_cast<unsigned>(gate)];
     }
+    void Time(const TrialSample& sample)
+    {
+        if (sample.observed_at && timed_at_ && sample.observed_at > timed_at_ && sample.ordinal > timed_ordinal_) {
+            intervals_[interval_count_ % intervals_.size()] =
+                float(sample.observed_at - timed_at_) / float(sample.ordinal - timed_ordinal_);
+            ++interval_count_;
+        }
+        timed_at_ = sample.observed_at;
+        timed_ordinal_ = sample.ordinal;
+    }
+    float MedianInterval() const
+    {
+        const unsigned n = (std::min)(interval_count_, unsigned(intervals_.size()));
+        if (n < frame_intervals) return -1.f;
+        auto sorted = intervals_;
+        std::sort(sorted.begin(), sorted.begin() + n);
+        return n % 2 ? sorted[n / 2] : .5f * (sorted[n / 2 - 1] + sorted[n / 2]);
+    }
+    bool CostsFrameTime() const
+    {
+        const float ordinary = FrameMs(Phase::Baseline), replacement = FrameMs(Phase::Candidate);
+        const float recheck = MedianInterval(); // the recheck phase is still open here
+        if (!(ordinary > 0 && replacement > 0 && recheck > 0)) return false;
+        const float slower = (std::max)(ordinary, recheck);
+        return replacement > slower * frame_cost_ratio && replacement - slower > frame_cost_ms;
+    }
     void Close()
     {
         if (!Active()) return;
+        frame_ms_[static_cast<unsigned>(phase_) - static_cast<unsigned>(Phase::Baseline)] = MedianInterval();
+        interval_count_ = 0;
+        timed_at_ = timed_ordinal_ = 0;
         closed_ = live_;
         closed_phase_ = phase_;
         live_ = {};
@@ -758,11 +810,11 @@ private:
         retry_delay_ = (std::min)(retry_delay_ * 2, uint64_t{60000});
     }
     // No verdict either way: allow a bounded number of fresh attempts.
-    void Inconclusive(const char* reason)
+    void Inconclusive(const char* reason, TrialOutcome outcome = TrialOutcome::Insufficient)
     {
-        if (inconclusive_ >= inconclusive_limit) { Reject(reason); return; }
+        if (inconclusive_ >= inconclusive_limit) { Reject(reason, outcome); return; }
         ++inconclusive_;
-        Retry(reason);
+        Retry(reason, outcome);
     }
     bool ImprovesWith(float replacement, float ordinary) const
     {
@@ -835,6 +887,10 @@ private:
     TrialOutcome outcome_ = TrialOutcome::Pending;
     TrialEvidence live_{}, closed_{};
     Phase closed_phase_ = Phase::Idle;
+    std::array<float, 3> frame_ms_{-1.f, -1.f, -1.f};
+    std::array<float, 8> intervals_{};
+    unsigned interval_count_ = 0;
+    uint64_t timed_at_ = 0, timed_ordinal_ = 0;
     TrialSample anchor_;
     static constexpr unsigned incumbent_window = 8;
     std::array<unsigned, incumbent_window> window_views_{};

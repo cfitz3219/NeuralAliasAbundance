@@ -864,6 +864,46 @@ void TestRetryAndReasons()
         lost.trial.Tick(++lost.now, false);
         check(lost.trial.Outcome() == TrialOutcome::Unavailable, "reasons: a lost route is unavailable, not harmful");
     }
+    {
+        // Frame-time acceptance: same picture result, three pacing cases.
+        const auto paced = [&](uint64_t ordinary_ms, uint64_t replacement_ms, uint64_t recheck_ms, bool spike) {
+            RouteTrial trial;
+            uint64_t ordinal = 0, now = 100;
+            trial.Start(51, ordinal, now);
+            const uint64_t pace[] = {ordinary_ms, replacement_ms, recheck_ms};
+            const float amplitude[] = {.25f, .07f, .24f};
+            for (unsigned phase = 0; phase < 3 && trial.Active(); ++phase) {
+                ordinal += RouteTrial::warmup_frames + 1;
+                for (unsigned i = 0; i < RouteTrial::samples; ++i) {
+                    // Receipts arrive every tenth game frame.
+                    ordinal += 10;
+                    now += 10 * pace[phase] + (spike && phase == 1 && i == 2 ? 400 : 0);
+                    TrialSample frame;
+                    frame.ordinal = ordinal;
+                    frame.observed_at = now;
+                    frame.configuration = 1;
+                    frame.delivered = true;
+                    frame.width = 3440; frame.height = 1440;
+                    for (unsigned j = 0; j < frame.change[region].size(); ++j)
+                        frame.change[region][j] = (i + j) % 2 ? -amplitude[phase] : amplitude[phase];
+                    trial.Tick(now, true);
+                    trial.Add(trial.Ticket(ordinal), frame, ordinal + 1);
+                }
+            }
+            return trial;
+        };
+        const auto same = paced(10, 10, 10, false);
+        check(same.Current() == Phase::Kept && std::fabs(same.FrameMs(Phase::Candidate) - 10.f) < .01f,
+              "frame time: an equally fast replacement is kept and its pace is recorded");
+        const auto slow = paced(10, 13, 10, false);
+        check(slow.Current() == Phase::Rejected && slow.Outcome() == TrialOutcome::Slower && !slow.RuledOut() &&
+              std::strstr(slow.Reason(), "frame time"),
+              "frame time: a replacement 30 percent slower than both ordinary measurements is not kept");
+        check(paced(10, 13, 14, false).Current() == Phase::Kept,
+              "frame time: a game that slowed down by itself does not condemn the replacement");
+        check(paced(10, 10, 10, true).Current() == Phase::Kept,
+              "frame time: one load spike during the replacement cannot decide");
+    }
     // Same policy through the placement owner with each API's receipt shape.
     for (auto path : {shadow::Path::Native11, shadow::Path::Inline}) {
         PlacementTrial trial;

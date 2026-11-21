@@ -122,7 +122,7 @@ function Get-RefereeSummary([string[]] $Lines) {
     $evidence = @($Lines | Where-Object { $_ -match '\breferee_evidence owner=\w+ frame=\d+ phase=\w+ now=rejected ' })
     if ($evidence) {
         $outcomes = $evidence | ForEach-Object { if ($_ -match '\boutcome=(\w+)') { $Matches[1] } } | Group-Object
-        $labels = @{ harm = 'made the picture worse'; insufficient_evidence = 'not enough evidence'; unavailable = 'replacement could not run' }
+        $labels = @{ harm = 'made the picture worse'; insufficient_evidence = 'not enough evidence'; unavailable = 'replacement could not run'; slower = 'cost too much frame time' }
         $out.Add('  Ended comparisons: ' + (($outcomes | ForEach-Object {
             $label = if ($labels.ContainsKey($_.Name)) { $labels[$_.Name] } else { $_.Name }
             "$label ($($_.Count))" }) -join ', ') + '.')
@@ -139,6 +139,9 @@ function Get-RefereeSummary([string[]] $Lines) {
             $phase = $Matches[2] -replace '_', ' '
             $again = if ($Matches[3] -eq 'harm') { 'It will not be tried again for this scene.' } else { 'It can be tried again.' }
             $out.Add("  Last ended comparison ($($Matches[1]), $phase phase): $($Matches[5]) of $($Matches[4]) screen checks were usable; main blocker: $block. $again")
+            if ($evidence[-1] -match '\bframe_ms=([\d.]+)/([\d.]+)/([\d.]+)') {
+                $out.Add("  Frame time per game frame in milliseconds (ordinary / replacement / ordinary retest): $($Matches[1]) / $($Matches[2]) / $($Matches[3]).")
+            }
         }
     }
     if ($layerOrder) { $out.Add($layerOrder) }

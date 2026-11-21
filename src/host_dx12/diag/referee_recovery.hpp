@@ -47,11 +47,12 @@ inline void EmitTrialEvidence(const char* owner, uint64_t frame, const RouteTria
     }
     const auto decisive = evidence.Decisive();
     eventlog::Emit("referee_evidence",
-        "owner=%s frame=%llu phase=%s now=%s outcome=%s receipts=%u used=%u decisive=%s retries=%u refused=%s",
+        "owner=%s frame=%llu phase=%s now=%s outcome=%s receipts=%u used=%u decisive=%s retries=%u refused=%s frame_ms=%.2f/%.2f/%.2f",
         owner, (unsigned long long)frame, trial.EvidencePhase(), trial.Name(), TrialOutcomeName(trial.Outcome()),
         evidence.receipts, evidence.Used(),
         !evidence.receipts ? "no_receipt" : decisive == TrialGate::Count ? "none" : TrialGateName(decisive),
-        trial.InconclusiveAttempts(), refused);
+        trial.InconclusiveAttempts(), refused, trial.FrameMs(RouteTrial::Phase::Baseline),
+        trial.FrameMs(RouteTrial::Phase::Candidate), trial.FrameMs(RouteTrial::Phase::ConfirmBaseline));
 }
 
 // Both API adapters poll the same bounded GPU mailbox after closing a frame.
