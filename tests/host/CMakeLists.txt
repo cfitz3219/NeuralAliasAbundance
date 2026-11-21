@@ -50,6 +50,7 @@ na_host_test(gpu_breadcrumbs_test SOURCES gpu_breadcrumbs_test.cpp LIBS host_dia
 na_host_test(mem_alloc_test SOURCES mem_alloc_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(xegtao_test SOURCES xegtao_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(viewport_jitter_test SOURCES viewport_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
+na_host_test(shader_depth_jitter_test SOURCES shader_depth_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
 na_host_test(scene_viewport_jitter_test SOURCES scene_viewport_jitter_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
 if(NA_HAVE_NGX_SDK)
   # Optional real-DX12 CPU command-tracking benchmark; no model evaluation.

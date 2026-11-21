@@ -393,6 +393,11 @@ uint64_t LiveSelectionVersion();
 // is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
 // by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
+// VARIANT: referee/sample-locked-dropout
+// The Referee's ask (referee::gpu::SceneStillMeshes): while true, a scene mesh drawn with the depth
+// test off and the scene depth bound takes the frame's full sample too (core/temporal_jitter.hpp,
+// StillMeshTakesJitter). Costs one relaxed load per untested mesh draw; nothing when never asked.
+void SetStillMeshJitter(bool asked);
 // A successful native-size resolve ends the scene sample for layers drawn over its image.
 // The second target is the observed full-size consumer, when it is known.
 struct ResolvedRaster {
@@ -489,7 +494,16 @@ void GetDrawReplayStats(DrawReplayStats* out);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
-struct ViewportJitterStats { uint64_t draws, sets, restores, unknown, local_layers, submitted_layers; };
+// shader_depth: meshes with the depth test off that took the sample because their shader reads a
+// sampled depth layer. shader_depth_refused: candidates that kept the game's viewport, by reason
+// (no layer, layer not read, writes the layer, one target, viewport not the scene's).
+struct ViewportJitterStats {
+    uint64_t draws, sets, restores, unknown, local_layers, submitted_layers;
+    uint64_t shader_depth = 0;
+    struct Refused { uint64_t no_layer = 0, not_read = 0, writes_layer = 0, one_target = 0, viewport = 0; } shader_depth_refused;
+    uint64_t still_moved = 0, still_asks = 0; // meshes moved at the Referee's ask; times it started asking
+    bool still_asked = false;
+};
 ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,

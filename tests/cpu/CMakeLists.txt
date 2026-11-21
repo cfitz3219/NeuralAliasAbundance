@@ -73,6 +73,7 @@ na_add_cpu_test(replay_budget)
 na_add_cpu_test(replay_movers)
 # The referee's scoring (stage 1 of the unify plan): picture, result, motion, jitter on known pictures.
 na_add_cpu_test(referee)
+na_add_cpu_test(referee_dropout)
 add_executable(na_referee_replay referee_replay.cpp)
 target_link_libraries(na_referee_replay PRIVATE na_cpu_test_options)
 na_add_cpu_test(pass_map)
