@@ -325,7 +325,7 @@ DWORD WINAPI InitThread(LPVOID)
     // Gap audit 2026-11-21 item 9: what the Referee's stage recovery established in earlier
     // launches of this game orders this launch's live attempts (never replaces them).
     // [referee] memory=0 switches it off.
-    if (GetPrivateProfileIntW(L"referee", L"memory", 1, g_ini) != 0) na::referee::memory::Enable();
+    if (GetPrivateProfileIntW(L"referee", L"memory", 1, g_ini) != 0) na::referee::memory::Enable(&na::background::Submit);
     // Gap audit 2026-11-21 item 14: no executable name decides this. The relative
     // scene-camera decoder is offered to every translated DX11 game and accepts a
     // constant block only by its content (block size, scene extent and the

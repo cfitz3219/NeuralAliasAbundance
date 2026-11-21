@@ -12,6 +12,7 @@
 #include "core/referee_recovery.hpp"
 #include "core/referee_memory.hpp"
 #include "core/referee_placement.hpp"
+#include "core/referee_present_times.hpp"
 #include "core/referee_parity.hpp"
 #include "core/referee_jitter.hpp"
 #include "host_dx12/native11/input_provider.hpp"
@@ -1121,6 +1122,40 @@ void TestStageRecovery()
 // Audit item 9: what stage recovery learned in an earlier launch reorders the
 // live attempts and never replaces the proof on the screen. The record and the
 // chooser are shared, so the DX11 and DX12 tables are exercised side by side.
+// Astra's finding on PR 190: a duplicate, unknown or refused present result
+// must not time a frame, and must not replace the time of another frame that
+// shares its slot.
+void TestPresentTimes()
+{
+    using na::referee::PresentTimes;
+    int chain_a = 0, chain_b = 0;
+    PresentTimes times;
+    check(times.Presented(&chain_a, 10, false, 1000) && times.At(&chain_a, 10) == 1000,
+          "present times: a frame that needs no result is timed when it is presented");
+    check(!times.Presented(&chain_a, 11, true, 2000) && times.At(&chain_a, 11) == 0,
+          "present times: a frame that waits for its result is not timed provisionally");
+    check(!times.Acknowledged(&chain_a, 11, true, false, 2100) && times.At(&chain_a, 11) == 0,
+          "present times: a refused present stays without a time");
+    check(times.Acknowledged(&chain_a, 12, true, true, 3000) && times.At(&chain_a, 12) == 3000,
+          "present times: an accepted, expected result times its frame");
+    check(!times.Acknowledged(&chain_a, 12, false, true, 9000) && times.At(&chain_a, 12) == 3000,
+          "present times: a late duplicate result leaves the first time in place");
+    // 12 + 64 lands in the same slot as 12.
+    check(!times.Acknowledged(&chain_a, 76, false, true, 9100) && times.At(&chain_a, 12) == 3000,
+          "present times: an unknown result with a colliding ordinal leaves the valid time in place");
+    check(!times.Acknowledged(&chain_b, 12, false, true, 9200) && times.At(&chain_a, 12) == 3000 &&
+          times.At(&chain_b, 12) == 0,
+          "present times: a result for another swap chain with the same ordinal times nothing");
+    times.Stamp(&chain_b, 76, 9300);
+    check(times.At(&chain_a, 12) == 0 && times.At(&chain_b, 76) == 9300,
+          "present times: an overwritten slot reads as missing, never as another frame's time");
+
+    // A receipt whose time is missing takes no part in pacing.
+    na::referee::TrialSample untimed;
+    untimed.presented_us = times.At(&chain_a, 12);
+    check(untimed.presented_us == 0, "present times: the missing time reaches the trial as 'not timed'");
+}
+
 void TestLaunchMemory()
 {
     using T = RecoveryTool;
@@ -1454,6 +1489,7 @@ int main()
     TestPictureScoring();
     TestRouteTrials();
     TestRetryAndReasons();
+    TestPresentTimes();
     TestLaunchMemory();
     TestStageRecovery();
     TestRotatingRoles();

@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <cwctype>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -70,7 +71,8 @@ inline void EmitTrialEvidence(const char* owner, uint64_t frame, const RouteTria
 namespace memory {
 struct Store {
     std::mutex m;
-    bool enabled = false, loaded = false;
+    bool enabled = false, dirty = false, saving = false, save_failed = false;
+    bool (*submit)(std::function<void()>) = nullptr;
     Memory record;
     std::wstring path;
     std::string game, runtime;
@@ -90,7 +92,29 @@ inline std::string FileIdentity(const wchar_t* path)
                   data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime);
     return text;
 }
-inline void Enable()
+inline void LoadLocked(Store& store)
+{
+    std::string text;
+    const HANDLE file = CreateFileW(store.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        char bytes[8193];
+        DWORD got = 0;
+        if (ReadFile(file, bytes, sizeof bytes, &got, nullptr)) text.assign(bytes, got);
+        CloseHandle(file);
+    }
+    const auto result = store.record.Decode(text, store.game, store.runtime);
+    constexpr const char* names[] = {"loaded", "missing", "invalid", "stale"};
+    eventlog::Emit("referee_memory", "action=load result=%s why=%s", names[static_cast<unsigned>(result)],
+        result == Memory::Load::Loaded ? "hints from an earlier launch of this game and runtime order the live attempts" :
+        result == Memory::Load::Missing ? "first launch for this game: nothing remembered, discovery runs as usual" :
+        result == Memory::Load::Stale ? "the game, the runtime or the record format changed: old hints discarded" :
+                                        "the record could not be read: ignored, discovery runs as usual");
+}
+// Called once from host start-up, never from a presentation path: the record
+// is read here and only the in-memory copy is used afterwards. `submit` is the
+// host's existing background worker; every write to disk happens there.
+inline void Enable(bool (*submit)(std::function<void()>))
 {
     auto& store = State();
     std::lock_guard<std::mutex> lock(store.m);
@@ -114,39 +138,56 @@ inline void Enable()
     wchar_t name[64];
     swprintf_s(name, L"referee-memory-%016llx.txt", static_cast<unsigned long long>(hash));
     store.path = folder.substr(0, slash + 1) + name;
+    store.submit = submit;
+    LoadLocked(store);
     store.enabled = true;
 }
-inline void LoadLocked(Store& store)
+// Runs on the background worker. Writes the newest record; notes that arrive
+// while it writes are picked up by the same job. A failed write keeps the
+// counts in memory and is tried again after a later note.
+inline void SaveJob()
 {
-    store.loaded = true;
-    std::string text;
-    const HANDLE file = CreateFileW(store.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                    FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        char bytes[8193];
-        DWORD got = 0;
-        if (ReadFile(file, bytes, sizeof bytes, &got, nullptr)) text.assign(bytes, got);
-        CloseHandle(file);
+    auto& store = State();
+    for (;;) {
+        std::string text;
+        std::wstring path;
+        {
+            std::lock_guard<std::mutex> lock(store.m);
+            if (!store.dirty) { store.saving = false; return; }
+            text = store.record.Encode(store.game, store.runtime);
+            path = store.path;
+            store.dirty = false;
+        }
+        bool ok = text.empty();
+        if (!ok) {
+            // One temporary file per process: two running copies of a game never share it.
+            wchar_t suffix[32];
+            swprintf_s(suffix, L".%lu.tmp", static_cast<unsigned long>(GetCurrentProcessId()));
+            const std::wstring temporary = path + suffix;
+            const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                DWORD wrote = 0;
+                ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr) && wrote == text.size();
+                CloseHandle(file);
+                ok = ok && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+                if (!ok) DeleteFileW(temporary.c_str());
+            }
+        }
+        std::lock_guard<std::mutex> lock(store.m);
+        if (ok == store.save_failed)
+            eventlog::Emit("referee_memory", "action=save result=%s why=%s", ok ? "saved" : "failed",
+                ok ? "the record reached disk again" :
+                     "the record could not be written: this launch keeps its counts in memory and tries again after the next result");
+        store.save_failed = !ok;
+        if (!ok) { store.saving = false; return; }
     }
-    const auto result = store.record.Decode(text, store.game, store.runtime);
-    constexpr const char* names[] = {"loaded", "missing", "invalid", "stale"};
-    eventlog::Emit("referee_memory", "action=load result=%s why=%s", names[static_cast<unsigned>(result)],
-        result == Memory::Load::Loaded ? "hints from an earlier launch of this game and runtime order the live attempts" :
-        result == Memory::Load::Missing ? "first launch for this game: nothing remembered, discovery runs as usual" :
-        result == Memory::Load::Stale ? "the game, the runtime or the record format changed: old hints discarded" :
-                                        "the record could not be read: ignored, discovery runs as usual");
 }
-inline void SaveLocked(Store& store)
+// Presentation paths only ask the worker; they never touch the disk.
+inline void ScheduleLocked(Store& store)
 {
-    const auto text = store.record.Encode(store.game, store.runtime);
-    if (text.empty()) return;
-    const std::wstring temporary = store.path + L".tmp";
-    const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
-    DWORD wrote = 0;
-    const bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr) && wrote == text.size();
-    CloseHandle(file);
-    if (!ok || !MoveFileExW(temporary.c_str(), store.path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(temporary.c_str());
+    if (!store.dirty || store.saving || store.save_failed || !store.submit) return;
+    store.saving = true;
+    if (!store.submit(&SaveJob)) store.saving = false;
 }
 // Give this launch's recovery the remembered order for each stage.
 inline void Apply(StageRecovery& recovery)
@@ -154,7 +195,7 @@ inline void Apply(StageRecovery& recovery)
     auto& store = State();
     std::lock_guard<std::mutex> lock(store.m);
     if (!store.enabled) return;
-    if (!store.loaded) LoadLocked(store);
+    ScheduleLocked(store); // a save the worker could not take earlier
     for (auto stage : {FlickerStage::Input, FlickerStage::Reconstruction, FlickerStage::Composition})
         recovery.SetHints(stage, store.record.Preferred(recovery.Dx12(), stage), store.record.Avoided(recovery.Dx12(), stage));
 }
@@ -166,9 +207,10 @@ inline void Collect(StageRecovery& recovery, uint64_t frame)
     auto& store = State();
     std::lock_guard<std::mutex> lock(store.m);
     if (!store.enabled) return;
-    if (!store.loaded) LoadLocked(store);
     if (!store.record.Note(recovery.Dx12(), result.stage, result.tool, result.outcome, result.reduction)) return;
-    SaveLocked(store);
+    store.dirty = true;
+    store.save_failed = false; // a new result is the next attempt to write
+    ScheduleLocked(store);
     eventlog::Emit("referee_memory", "action=note frame=%llu api=%s first_stage=%s tool=%s outcome=%s reduction=%.4f tried_first_from_memory=%u",
                    (unsigned long long)frame, recovery.Dx12() ? "dx12" : "dx11", StageName(result.stage), ToolName(result.tool),
                    TrialOutcomeName(result.outcome), result.reduction, unsigned(result.hinted));
