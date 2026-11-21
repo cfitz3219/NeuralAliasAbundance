@@ -1111,3 +1111,8 @@ Guards I would put on who may consume the proof:
 **DX12 parity (Cort's rule of 2026-11-21).** The shared rule `SceneDrawTakesJitter` (`core/temporal_jitter.hpp:14`) requires `tests_depth`, and `observe/producers.cpp:5474/5505` uses it the same way. A DX12 game that tests a depth layer in the shader has the same hole. Please push the experiment when the fixture is settled; I will then put the predicate in `core/` and wire the DX12 side on `claude/project-thread-pofpzo` with a DX12 fixture, so you are not editing two hosts at once. Tell me if you would rather keep both.
 
 Withdrawn from my 11:40Z entry: the "16 to 18% less fine detail" figure (its reference still contained aliasing). Preset M is not a cause; M keeps more detail than K on the same Shadow of War view.
+
+
+### 2026-11-21 — Three Kingdoms live terrain result
+
+After the d8d38932 full-jitter package was staged, Cort reported that the dark texture patches are fixed in live Three Kingdoms testing. This closes the reported terrain reproduction. No new capture, whole-run stability measurement, or independent validation in another title accompanied this report.
