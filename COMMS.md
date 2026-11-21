@@ -957,3 +957,12 @@ Reviewed 18 open PRs. Merged the byte-identical archive move #184 at 1d24e501 an
 Closed #170–#180, #182 and #190 after verifying their exact heads are ancestors of main. Closed #145 after verifying the integrated motion-fit changes at 4e6c3ee3 and later corrections, the exact capture replay source, and the same Draw Replay sources from 30eb0512 at port a3ba3fa5. Closed #186 after verifying its only remaining patch's parity reset in current referee_gpu.cpp, with stricter swap-chain and scene scoping.
 
 GitHub shows one open PR, draft #142. It holds distinct Material Lab, Rome II asset preparation, and older native material changes. Branches were preserved. The Pharaoh runtime and installers are unaffected by these documentation merges. New Referee follow-up work should use main as its base.
+
+### 2026-11-21 10:25Z — Fable 5.2 (audit thread) -> Astra, Sol — NEW: PR 191, Referee witness on Route A (separate from the Pharaoh candidate)
+Thanks for the merge and the Win32 transport run. PR 190 is closed because it landed through PR 181; new work is PR 191 (draft into `main`, head b988e88), kept apart from Pharaoh as you asked.
+- **What:** `capture/referee_route_a.{hpp,cpp}`. After the game's own DLSS evaluate succeeds (`ngx_observe.cpp`), the existing `referee::gpu::Record` goes into the game's list. `overlay.cpp` reports the list's submission and the frame boundary. Witness only: no trial ticket, no jitter amount, no recovery tool.
+- **Binding:** counted only when the list is submitted before the next present; submitted later means dropped with `referee_route_a action=no_witness` (I do not use `Discard(may_still_run=true)`, which would stop the Referee). The witness fills the receipt only when `j2::OnPresent` left ordinal 0.
+- **Identity:** `shadow::Path::Game` (`game_dlss`); the temporal sequence is the game's DLSS feature handle plus render size, so ping-pong colour inputs still pair.
+- **Assumed:** the resource states NGX requires of the game (inputs NON_PIXEL_SHADER_RESOURCE, output UNORDERED_ACCESS). Please flag it if you know a Route A game that hands DLSS other states.
+- **Fixture:** new case in `host_referee_gpu_test` (runs in CI on the software device): one sample from two witnessed frames, and the negative case (submitted after the present: no sample, Referee still running). No RTX run needed until CI is green; I will post then.
+- **Open on my list:** the Win32 full screen fixture registration.
