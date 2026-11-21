@@ -90,6 +90,43 @@ def write_frame(stream, folder, meta, control):
     return True
 
 
+def field_replay(runner, folder, metas):
+    """Send identities and original pitches. The test uploads the unmodified planes to the GPU."""
+    lines = []
+    previous = None
+    epoch = 0
+    for path in metas:
+        m = json.loads(path.read_text(encoding="utf-8-sig"))
+        ordinal = m.get("present_ordinal")
+        if (m.get("capture_kind") != "evaluation" or not m.get("evaluation_succeeded")
+                or not m.get("frame_closed") or m.get("debug_view")
+                or m.get("present_pairing") != "overlay_present"
+                or ordinal != m.get("inputs_frame") or ordinal != m.get("present_closed_frame")):
+            continue
+        planes = {p["name"]: p for p in m["planes"]}
+        names = ("color", "dlssout", "present")
+        if any(k not in planes or [planes[k]["width"], planes[k]["height"]] != m["size"]
+               for k in names):
+            continue
+        identity = (m.get("pid"), m.get("view"), m.get("history_generation"), m["size"],
+                    [planes[k]["dxgi_format"] for k in names], m.get("preset"))
+        if identity != previous or m.get("reset") or m.get("camera_cut"):
+            epoch += 1
+        previous = identity
+        jitter = m["jitter_px"]
+        raster = m.get("raster_jitter_px")
+        verified = (raster is not None and not m.get("dlss", {}).get("jitter_shifted")
+                    and np.allclose(raster, jitter, rtol=0, atol=1 / 32768) and np.linalg.norm(raster) > 1 / 32768)
+        row = [m["index"], ordinal, *m["size"], *jitter, int(verified), epoch]
+        for k in names:
+            row.extend((planes[k]["dxgi_format"], planes[k]["row_pitch"]))
+        lines.append(" ".join(map(str, row)))
+    if not lines:
+        raise ValueError("no exact evaluation and presentation tuples")
+    return subprocess.run([str(runner.resolve()), "--capture-field", str(folder.resolve())],
+                          input="\n".join(lines) + "\n", text=True).returncode
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
@@ -97,12 +134,17 @@ def main():
     parser.add_argument("--frames", type=int, default=12)
     parser.add_argument("--control", choices=("actual", "bypass", "output", "alternating"), default="actual",
                         help="controls substitute captured input, output or alternating saved images for the matched screen")
+    parser.add_argument("--gpu-field", action="store_true", help="use referee_gpu_test and the actual captured native textures")
     args = parser.parse_args()
     if args.frames < 1:
         parser.error("--frames must be positive")
     metas = sorted(args.folder.glob("*-meta.json"))[: args.frames]
     if not metas:
         parser.error("no captured frames found")
+    if args.gpu_field:
+        if args.control != "actual":
+            parser.error("GPU field replay uses the actual presentation")
+        return field_replay(args.runner, args.folder, metas)
     print(f"{args.folder.name}: screen={args.control} metadata_frames={len(metas)}", flush=True)
     with subprocess.Popen([str(args.runner.resolve())], stdin=subprocess.PIPE) as runner:
         kept = 0

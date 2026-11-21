@@ -22,7 +22,7 @@ namespace na::native11 {
 using SamplerBiasFn = float (*)();
 using SamplerAfFn = uint32_t (*)();
 
-// Hooks the game's device (ID3D11Device*) CreateSamplerState and its contexts' PS/CS sampler binds.
+// Hooks CreateSamplerState and PS/CS sampler set and get. The game reads its own state back.
 // Idempotent. May be installed after the game has made its samplers: those are adopted at their first bind.
 bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af);
 

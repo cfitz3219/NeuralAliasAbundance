@@ -102,6 +102,7 @@ float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0
 float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_letterbox(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(0,2), 0)); }
+float4 ps_centered_scene(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(44,0), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
 float4 ps_screen_check(float4 p : SV_Position) : SV_Target { return float4(scene.Load(int3(int2(p.xy), 0)).rgb * 0.75, 1); }
 struct LitVertex { float4 p : SV_Position; float2 surface : TEXCOORD0; };
@@ -137,6 +138,12 @@ RWTexture2D<float> mask_out : register(u0);
 float4 vs_depth_ramp(uint id : SV_VertexID) : SV_Position {
     float2 p = float2((id << 1) & 2, id & 2) * 2 - 1;
     return float4(p, 0.45 + 0.05 * p.x + 0.13 * p.y, 1);
+}
+float4 vs_shader_depth_mesh(uint id : SV_VertexID) : SV_Position { return vs_depth_ramp(id % 3); }
+float ps_write_shader_depth(float4 p : SV_Position) : SV_Target { return p.z; }
+float4 ps_test_shader_depth(float4 p : SV_Position) : SV_Target {
+    float same = abs(test_depth.Load(int3(uint2(p.xy), 0)) - p.z) < 0.0001 ? 1 : 0;
+    return float4(same, same, same, 1);
 }
 float slab(uint2 pixel) {
     float2 p = float2(pixel) + 0.5;
@@ -187,6 +194,7 @@ struct Game {
     ComPtr<IDXGISwapChain> swap;
     HWND wnd = nullptr;
     UINT w = 320, h = 180;
+    UINT screen_extra_width = 0;
     bool padded_hdr = false;
     bool shader_depth = false;
     bool campaign_camera = false;
@@ -274,7 +282,7 @@ bool MakeGame(Game& g, bool warp, bool debug = false)
     g.wnd = CreateWindowExW(0, wc.lpszClassName, L"test", WS_OVERLAPPEDWINDOW, 0, 0, int(g.w), int(g.h), nullptr, nullptr, wc.hInstance, nullptr);
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 2;
-    sd.BufferDesc.Width = g.w;
+    sd.BufferDesc.Width = g.w + g.screen_extra_width;
     sd.BufferDesc.Height = g.h + (g.padded_hdr ? 3 : 0);
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -676,6 +684,90 @@ bool ReadCopy(Game& g, float out[4], ID3D11Texture2D* source = nullptr)
 } // namespace
 
 #if !defined(NA_TEST_NATIVE_DLAA)
+void ShaderDepthLayerFixture(Game& g, int& frame, ID3D11RasterizerState* raster)
+{
+    const auto setup = [](bool ok, const char* what) { expect(ok, what); return ok; };
+    // The game's geometry uses an R32 render target as its depth texture. A
+    // direct texel comparison produces black when the grids are split.
+    const auto vs_code = Compile("vs_shader_depth_mesh", "vs_5_0");
+    const auto producer_code = Compile("ps_write_shader_depth", "ps_5_0");
+    const auto consumer_code = Compile("ps_test_shader_depth", "ps_5_0");
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> producer, consumer;
+    if (!setup(vs_code && producer_code && consumer_code &&
+        SUCCEEDED(g.device->CreateVertexShader(vs_code->GetBufferPointer(), vs_code->GetBufferSize(), nullptr, &vs)) &&
+        SUCCEEDED(g.device->CreatePixelShader(producer_code->GetBufferPointer(), producer_code->GetBufferSize(), nullptr, &producer)) &&
+        SUCCEEDED(g.device->CreatePixelShader(consumer_code->GetBufferPointer(), consumer_code->GetBufferSize(), nullptr, &consumer)),
+        "create shader-depth geometry")) return;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = g.w; desc.Height = g.h;
+    desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> depth_layer, unproved_copy, colours[2];
+    ComPtr<ID3D11RenderTargetView> depth_rtv, colour_rtv[2];
+    ComPtr<ID3D11ShaderResourceView> depth_srv, copy_srv;
+    if (!setup(SUCCEEDED(g.device->CreateTexture2D(&desc, nullptr, &depth_layer)) &&
+        SUCCEEDED(g.device->CreateTexture2D(&desc, nullptr, &unproved_copy)) &&
+        SUCCEEDED(g.device->CreateRenderTargetView(depth_layer.Get(), nullptr, &depth_rtv)) &&
+        SUCCEEDED(g.device->CreateShaderResourceView(depth_layer.Get(), nullptr, &depth_srv)) &&
+        SUCCEEDED(g.device->CreateShaderResourceView(unproved_copy.Get(), nullptr, &copy_srv)),
+        "create original and unproved depth-colour surfaces")) return;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    for (unsigned i = 0; i < 2; ++i)
+        if (!setup(SUCCEEDED(g.device->CreateTexture2D(&desc, nullptr, &colours[i])) &&
+            SUCCEEDED(g.device->CreateRenderTargetView(colours[i].Get(), nullptr, &colour_rtv[i])),
+            "create material buffers")) return;
+    const auto render = [&](float dx, float dy, bool copy, UINT vertices) {
+        na::native11::SetNextJitter(dx, dy);
+        g.swap->Present(0, 0);
+        auto* c = g.ctx.Get();
+        Scene(c, g, frame++);
+        c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH, 1.f, 0);
+        auto* target = depth_rtv.Get();
+        c->OMSetDepthStencilState(nullptr, 0);
+        c->OMSetRenderTargets(1, &target, g.dsv.Get());
+        Viewport(c, g.w, g.h);
+        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        c->RSSetState(raster);
+        c->VSSetShader(vs.Get(), nullptr, 0);
+        c->PSSetShader(producer.Get(), nullptr, 0);
+        c->Draw(9, 0);
+        ID3D11RenderTargetView* materials[]{colour_rtv[0].Get(), colour_rtv[1].Get()};
+        c->OMSetRenderTargets(2, materials, g.dsv.Get());
+        if (copy) c->CopyResource(unproved_copy.Get(), depth_layer.Get());
+        auto* source = copy ? copy_srv.Get() : depth_srv.Get();
+        c->PSSetShaderResources(1, 1, &source);
+        c->PSSetShader(consumer.Get(), nullptr, 0);
+        c->OMSetDepthStencilState(g.depth_off.Get(), 0);
+        c->Draw(vertices, 0);
+        D3D11_VIEWPORT vp{};
+        UINT count = 1;
+        c->RSGetViewports(&count, &vp);
+        const bool same_grid = count == 1 && std::fabs(vp.TopLeftX - (dx - .5f)) < 1.e-6f &&
+            std::fabs(vp.TopLeftY - (dy - .5f)) < 1.e-6f && vp.Width == float(g.w) + 1;
+        source = nullptr;
+        c->PSSetShaderResources(1, 1, &source);
+        c->OMSetRenderTargets(0, nullptr, nullptr);
+        float pixel[4]{};
+        const bool read = ReadCopy(g, pixel, colours[0].Get());
+        c->OMSetDepthStencilState(nullptr, 0);
+        Post(c, g, true);
+        return std::pair{read ? pixel[0] : -1.f, same_grid};
+    };
+    const auto unrelated = render(.323165f, -.452396f, true, 9);
+    const auto fullscreen = render(.323165f, -.452396f, false, 3);
+    const auto negative = render(.323165f, -.452396f, false, 9);
+    const auto positive = render(-.470734f, .419042f, false, 9);
+    std::printf("shader-depth material pixels: unproved %.1f, fullscreen %.1f, matched %.1f/%.1f\n",
+                unrelated.first, fullscreen.first, negative.first, positive.first);
+    expect(unrelated.first == 0 && !unrelated.second, "an unrelated depth texture retains the original viewport");
+    expect(fullscreen.first == 0 && !fullscreen.second, "a fullscreen reader retains the original viewport");
+    expect(negative.first == 1 && negative.second && positive.first == 1 && positive.second,
+           "full-strength offsets preserve material pixels when shader and depth share the raster");
+}
+
 int DepthReadFixture(Game& g, bool debug_layer)
 {
     const auto ramp = Compile("vs_depth_ramp", "vs_5_0");
@@ -870,6 +962,7 @@ int DepthReadFixture(Game& g, bool debug_layer)
     }
     expect(deferred == raw_positive, "an external deferred list leaves the game's depth reads alone");
     expect(queried == raw_positive, "the correction does not add work to an active game occlusion query");
+    if (!debug_layer) ShaderDepthLayerFixture(g, frame, raster.Get());
     ComPtr<ID3D11InfoQueue> debug;
     if (SUCCEEDED(g.device.As(&debug))) {
         for (UINT64 index = 0; index < debug->GetNumStoredMessages(); ++index) {
@@ -890,6 +983,119 @@ int DepthReadFixture(Game& g, bool debug_layer)
     return g_failed ? 1 : 0;
 }
 #endif
+
+// A game sends a native-sized picture to the middle of a wider swap chain.
+// The same source can feed an invisible target first; that read cannot authorize DLAA.
+int CenteredSceneFixture(Game& game)
+{
+    D3D11_TEXTURE2D_DESC d{};
+    game.color->GetDesc(&d);
+    ComPtr<ID3D11Texture2D> decoy;
+    ComPtr<ID3D11RenderTargetView> decoy_rtv;
+    if (FAILED(game.device->CreateTexture2D(&d, nullptr, &decoy)) ||
+        FAILED(game.device->CreateRenderTargetView(decoy.Get(), nullptr, &decoy_rtv))) return 1;
+    const auto ps_code = Compile("ps_centered_scene", "ps_5_0");
+    ComPtr<ID3D11PixelShader> ps;
+    if (!ps_code || FAILED(game.device->CreatePixelShader(ps_code->GetBufferPointer(), ps_code->GetBufferSize(), nullptr, &ps))) return 1;
+
+    struct Consumer {
+        Game& game;
+        unsigned accepted = 0;
+    } consumer{game};
+    const auto evaluate = [](void* opaque, void* context, const na::native11::SceneFrame& f) {
+        auto& state = *static_cast<Consumer*>(opaque);
+        const auto& g = state.game;
+        expect(f.screen_proof && f.color.d3d11_resource == g.color.Get() && f.depth.d3d11_resource == g.depth.Get() &&
+               f.color.active_w == g.w && f.color.active_h == g.h && !f.color.active_x && !f.color.active_y,
+               "the evaluator receives the exact native scene rectangle with a screen receipt");
+        auto* ctx = static_cast<ID3D11DeviceContext*>(context);
+        ComPtr<ID3D11RenderTargetView> target;
+        ctx->OMGetRenderTargets(1, &target, nullptr);
+        expect(target.Get() == g.back_rtv.Get(), "only the visible reader can enter the evaluator");
+        const float replacement[]{.75f, .25f, .125f, 1.f};
+        ctx->ClearRenderTargetView(g.color_rtv.Get(), replacement);
+        ++state.accepted;
+        return true;
+    };
+    if (!na::native11::Install(game.device.Get(), evaluate, &consumer)) return 1;
+    na::native11::SetScreenCheck(true);
+    D3D11_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D11_FILL_SOLID;
+    raster.CullMode = D3D11_CULL_NONE;
+    raster.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> visible_quads;
+    if (FAILED(game.device->CreateRasterizerState(&raster, &visible_quads))) return 1;
+    game.ctx->RSSetState(visible_quads.Get());
+    D3D11_TEXTURE2D_DESC pixel_desc{};
+    pixel_desc.Width = pixel_desc.Height = pixel_desc.MipLevels = pixel_desc.ArraySize = 1;
+    pixel_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pixel_desc.SampleDesc.Count = 1;
+    pixel_desc.Usage = D3D11_USAGE_STAGING;
+    pixel_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> pixel;
+    if (FAILED(game.device->CreateTexture2D(&pixel_desc, nullptr, &pixel))) return 1;
+
+    auto frame = [&](bool show) {
+        Pump();
+        auto* ctx = game.ctx.Get();
+        Scene(ctx, game, 0);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
+        auto* rt = decoy_rtv.Get();
+        ctx->OMSetRenderTargets(1, &rt, nullptr);
+        auto* view = game.color_srv.Get();
+        ctx->PSSetShaderResources(0, 1, &view);
+        ctx->PSSetShader(game.ps_tonemap.Get(), nullptr, 0);
+        ctx->Draw(4, 0);
+
+        rt = game.back_rtv.Get();
+        ctx->OMSetRenderTargets(1, &rt, nullptr);
+        constexpr float black[]{0.f, 0.f, 0.f, 1.f};
+        ctx->ClearRenderTargetView(rt, black);
+        if (show) {
+            const D3D11_VIEWPORT vp{44.f, 0.f, float(game.w), float(game.h), 0.f, 1.f};
+            ctx->RSSetViewports(1, &vp);
+            ctx->PSSetShaderResources(0, 1, &view);
+            ctx->PSSetShader(ps.Get(), nullptr, 0);
+            ctx->Draw(4, 0);
+        }
+        view = nullptr;
+        ctx->PSSetShaderResources(0, 1, &view);
+        bool displayed = false;
+        if (show && consumer.accepted) {
+            na::native11::OwnWorkScope own;
+            ComPtr<ID3D11Texture2D> screen;
+            if (SUCCEEDED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) {
+                const auto read_red = [&](UINT x) {
+                    const D3D11_BOX box{x, 2, 0, x + 1, 3, 1};
+                    ctx->CopySubresourceRegion(pixel.Get(), 0, 0, 0, 0, screen.Get(), 0, &box);
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    if (FAILED(ctx->Map(pixel.Get(), 0, D3D11_MAP_READ, 0, &map))) return -1;
+                    const int red = *static_cast<const uint8_t*>(map.pData);
+                    ctx->Unmap(pixel.Get(), 0);
+                    return red;
+                };
+                displayed = std::abs(read_red(46) - 191) <= 2 && read_red(2) == 0 && read_red(game.w + 50) == 0;
+            }
+        }
+        expect(SUCCEEDED(game.swap->Present(0, 0)), "present the centered scene");
+        return displayed;
+    };
+
+    for (unsigned i = 0; i < 42; ++i) frame(false);
+    const auto invisible = na::native11::Stats();
+    expect(!consumer.accepted && invisible.screen_refuted >= 1 && !invisible.screen_confirmed,
+           "an otherwise identical offscreen reader fails the centered screen challenge");
+    unsigned visible = 0;
+    for (unsigned i = 0; i < 46; ++i) visible += frame(true);
+    const auto shown = na::native11::Stats();
+    expect(shown.screen_confirmed == 1 && consumer.accepted >= 16 && visible == consumer.accepted,
+           "the centered reader carries every accepted result to the display with the side bars intact");
+    std::printf("centered scene: decoy rejected=%llu, screen confirmed=%llu, displayed=%u\n",
+                (unsigned long long)shown.screen_refuted, (unsigned long long)shown.screen_confirmed, visible);
+    na::native11::Uninstall();
+    return g_failed ? 1 : 0;
+}
 
 int ScreenCheckFixture(Game& game, bool adaptive, bool missed_order = false, [[maybe_unused]] bool rotating_lights = false,
                        [[maybe_unused]] bool compare_routes = false, [[maybe_unused]] bool composition_fault = false,
@@ -1752,6 +1958,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
+        !set(L"referee", L"enabled", L"0") || // legacy disabled package
         !set(L"j2", L"camera", (camera_off_start || adaptive || rotating_lights) ? L"0" : L"2") ||
 
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
@@ -1760,12 +1967,16 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     while (!na::host::GetStatus().init_complete && GetTickCount64() < init_deadline) Sleep(5);
     expect(na::host::GetStatus().init_complete && na::on12::NativeRoute() != automatic && !na::on12::Enabled(),
            "production host starts with the bridge disabled");
+    expect(na::settings::Get().referee_enabled.load() == unsigned(na::referee::gpu::Supported()),
+           "added DLAA automatically starts the supported Referee despite a legacy Off setting");
     if (g_failed) return 1;
 #endif
     Game g;
 #if defined(NA_TEST_NATIVE_DLAA)
     g.padded_hdr = padded_hdr;
 #endif
+    const bool centered_scene = argc > 1 && std::strcmp(argv[1], "--centered-scene") == 0;
+    if (centered_scene) g.screen_extra_width = 88;
     bool warp = false;
     const bool screen_warp = argc > 1 && (std::strcmp(argv[1], "--screen-check-warp") == 0 ||
                                          std::strcmp(argv[1], "--adaptive-screen-warp") == 0);
@@ -1775,6 +1986,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     g.shader_depth = depth_reads;
     if (screen_warp || depth_warp || depth_debug || !MakeGame(g, false)) {
         g = Game{};
+        if (centered_scene) g.screen_extra_width = 88;
         g.shader_depth = depth_reads;
         if (!MakeGame(g, true, depth_debug)) {
             std::printf("SKIP: no %s DX11 device\n", depth_debug ? "debug-layer" : "WARP");
@@ -1788,10 +2000,27 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->GetDesc(&adapter_desc);
     std::printf("device: %ls (%s)\n", adapter_desc.Description, warp ? "WARP" : "hardware");
 #if !defined(NA_TEST_NATIVE_DLAA)
+    if (centered_scene) return CenteredSceneFixture(g);
     if (adaptive || screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g, adaptive, missed_order);
 #endif
 #if defined(NA_TEST_NATIVE_DLAA)
     if (warp) return 77;
+    D3D11_SAMPLER_DESC early_desc{};
+    early_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    early_desc.AddressU = early_desc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    early_desc.AddressW = D3D11_TEXTURE_ADDRESS_MIRROR;
+    early_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    early_desc.MaxAnisotropy = 1;
+    ComPtr<ID3D11SamplerState> early_original, early_already_biased;
+    {
+        // In automatic mode this really runs before the first Present installs
+        // hooks. In the explicit route, keep the same states out of the ledger.
+        na::native11::OwnWorkScope own_work;
+        expect(SUCCEEDED(g.device->CreateSamplerState(&early_desc, &early_original)), "create startup sampler");
+        early_desc.MipLODBias = -1.f;
+        expect(SUCCEEDED(g.device->CreateSamplerState(&early_desc, &early_already_biased)),
+               "create startup sampler already at the policy's target");
+    }
     ComPtr<ID3D11On12Device> translated;
     expect(FAILED(g.device.As(&translated)), "game device is native DX11");
     if (automatic) {
@@ -2520,10 +2749,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const auto delivered_with_no_camera = evaluations;
     for (int i = 0; i < 4; ++i) present_campaign();
     const auto ambient_status = na::xegtao::ScenePass().GetStats();
+    char measured_ao[4096]{};
+    na::native_d3d11::FormatStatus(measured_ao, sizeof measured_ao);
     expect(na::donut::ScenePass().GetStats().recorded == bloom_with_no_camera + 4 &&
-           evaluations == delivered_with_no_camera + 4 && ambient_status.recorded == ao_with_no_camera &&
-           std::strstr(ambient_status.reason, "Use it when found"),
-           "on native DX11, bloom and DLAA keep running without a camera while XeGTAO explains what it needs");
+           evaluations == delivered_with_no_camera + 4 && ambient_status.recorded == ao_with_no_camera + 4 &&
+           g_seen.last.camera_known && std::strstr(measured_ao, "motion measured, no camera"),
+           "XeGTAO finds native projection while DLAA keeps using picture-measured motion");
     effect_options.xegtao_enabled.store(0);
     effect_options.donut_bloom.store(0);
     effect_options.j2_camera.store(prior_camera);
@@ -2758,7 +2989,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(16);
     g.ctx->Draw(4, 0);
     ComPtr<ID3D11SamplerState> bound;
-    g.ctx->PSGetSamplers(0, 1, &bound); D3D11_SAMPLER_DESC applied{};
+    const auto get_applied_sampler = [&] {
+        na::native11::OwnWorkScope own_work;
+        bound.Reset();
+        g.ctx->PSGetSamplers(0, 1, &bound);
+    };
+    get_applied_sampler();
+    D3D11_SAMPLER_DESC applied{};
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
            "the actual native draw binding has 16x AF and total -1 mip bias");
@@ -2785,6 +3022,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(SUCCEEDED(dc->FinishCommandList(TRUE, &recorded)), "record native sampler restoration");
         if (recorded) g.ctx->ExecuteCommandList(recorded.Get(), TRUE);
         ReadCopy(g, deferred_off, g.color.Get());
+        std::printf("native deferred mip pixels: -1 %.2f/%.2f, own %.2f/%.2f\n",
+                    deferred_on[0], deferred_on[1], deferred_off[0], deferred_off[1]);
         expect(deferred_on[0] > .9f && deferred_off[1] > .9f,
                "deferred draws update and restore mip pixels without rebinding");
     } else expect(false, "create deferred material context");
@@ -2794,40 +3033,42 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     ComPtr<ID3D11SamplerState> already;
     g.device->CreateSamplerState(&sampler, &already); material_raw = already.Get();
     g.ctx->PSSetSamplers(0, 1, &material_raw);
-    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound);
+    get_applied_sampler();
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.MipLODBias == -1.f && na::native11::GetSamplerStats().original_bias == -1.f,
            "native mip total avoids double bias when the game already requests -1");
-    // A sampler the game made before the hooks existed (automatic API detection installs them at the
-    // first present, after an engine has built its sampler table) is never seen at creation. It is
-    // recorded the first time the game binds it and gets the same texture detail: pixels, not counters.
+    // The startup sampler was never logged at creation. Check the result of a real draw.
     {
-        D3D11_SAMPLER_DESC early = sampler;
-        early.MipLODBias = 0.f;
-        early.AddressW = D3D11_TEXTURE_ADDRESS_MIRROR; // a description no other sampler here has
-        ComPtr<ID3D11SamplerState> unseen;
-        {
-            na::native11::OwnWorkScope not_recorded; // creation passes the hook unrecorded, as before install
-            g.device->CreateSamplerState(&early, &unseen);
-        }
         const auto before = na::native11::GetSamplerStats();
         na::observe::SetSamplerMipBias(-1.f); na::observe::SetSamplerAnisotropy(0);
-        auto* unseen_raw = unseen.Get();
+        auto* unseen_raw = early_original.Get();
         g.ctx->PSSetSamplers(0, 1, &unseen_raw);
         float early_on[4]{}, early_off[4]{};
         g.ctx->Draw(4, 0); ReadCopy(g, early_on, g.color.Get());
-        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        get_applied_sampler(); applied = {};
         if (bound) bound->GetDesc(&applied);
+        ComPtr<ID3D11SamplerState> read_by_game;
+        g.ctx->PSGetSamplers(0, 1, &read_by_game);
+        expect(bound.Get() == early_already_biased.Get() && read_by_game.Get() == early_original.Get(),
+               "an interned replacement is reported to the game as this slot's original");
         na::observe::SetSamplerMipBias(0.f);
         g.ctx->Draw(4, 0); ReadCopy(g, early_off, g.color.Get());
         const auto after = na::native11::GetSamplerStats();
         std::printf("native mip pixels, sampler made before the hooks: -1 %.2f/%.2f, own %.2f/%.2f adopted=%llu\n",
                     early_on[0], early_on[1], early_off[0], early_off[1],
                     static_cast<unsigned long long>(after.adopted - before.adopted));
-        expect(unseen && after.adopted == before.adopted + 1 && after.eligible_bias == before.eligible_bias + 1 &&
+        expect(early_original && after.adopted == before.adopted + 1 && after.eligible_bias == before.eligible_bias + 1 &&
                after.unknown == before.unknown && bound && applied.MipLODBias == -1.f &&
                early_on[0] > .9f && early_on[1] < .1f && early_off[1] > .9f,
                "a sampler created before the hooks gets the mip bias at its first bind and restores live");
+        auto* game_already_biased = early_already_biased.Get();
+        g.ctx->PSSetSamplers(0, 1, &game_already_biased);
+        float early_game_bias[4]{};
+        g.ctx->Draw(4, 0); ReadCopy(g, early_game_bias, g.color.Get());
+        get_applied_sampler();
+        expect(bound.Get() == game_already_biased && early_game_bias[0] > .9f &&
+               na::native11::GetSamplerStats().adopted == after.adopted + 1,
+               "a pre-hook game sampler shared with an existing replacement keeps its own bias");
         na::observe::SetSamplerMipBias(-1.f);
     }
     // After the frame's picture is handed to DLSS the game's later passes keep its own samplers;
@@ -2839,14 +3080,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const uint64_t own_before = na::native11::GetSamplerStats().after_scene;
     na::native11::SetSceneHanded(true);
     g.ctx->Draw(4, 0);
-    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+    get_applied_sampler(); applied = {};
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR && applied.MipLODBias == 0.f &&
            na::native11::GetSamplerStats().after_scene > own_before,
            "draws after the scene is handed to DLSS sample with the game's own sampler");
     na::native11::SetSceneHanded(false);
     g.ctx->Draw(4, 0);
-    bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+    get_applied_sampler(); applied = {};
     if (bound) bound->GetDesc(&applied);
     expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16 && applied.MipLODBias == -1.f,
            "the next frame's scene draws get 16x AF and the -1 mip bias back");
@@ -2863,7 +3104,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         material_raw = material.Get();
         g.ctx->PSSetSamplers(0, 1, &material_raw);
         g.ctx->Draw(4, 0);
-        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        get_applied_sampler(); applied = {};
         if (bound) bound->GetDesc(&applied);
         expect(bound && applied.Filter == D3D11_FILTER_ANISOTROPIC && applied.MaxAnisotropy == 16,
                "automatic AF binds 16x on the tiling material sampler");
@@ -2883,7 +3124,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                na::af::Global().Get().state == na::af::Detector::State::GameHasAf,
                "the game's own 8x/16x world samplers switch our filtering off, live");
         g.ctx->Draw(4, 0);
-        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound); applied = {};
+        get_applied_sampler(); applied = {};
         if (bound) bound->GetDesc(&applied);
         D3D11_SAMPLER_DESC original{};
         if (material) material->GetDesc(&original);
@@ -2894,7 +3135,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         auto* game_owned16 = shared16.Get();
         g.ctx->PSSetSamplers(0, 1, &game_owned16);
         g.ctx->Draw(4, 0);
-        bound.Reset(); g.ctx->PSGetSamplers(0, 1, &bound);
+        get_applied_sampler();
         expect(bound.Get() == shared16.Get(),
                "a new explicit game bind keeps the same 16x sampler");
         g.ctx->PSSetSamplers(0, 1, &material_raw);

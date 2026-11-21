@@ -78,6 +78,7 @@ struct RasterFacts {
     bool expanded = false;   // executed scene viewport includes the half-pixel border on each side
     bool applied = false;    // this frame's scene draws carried jitter_px (false: the picture is exactly unjittered)
     float jitter_px[2] = {0, 0}; // the sample, in pixels of the scene extent (DLSS convention)
+    bool shader_depth_aligned = false; // full grid shared by the depth layer and its material draws
 };
 
 enum class Boundary : uint8_t {

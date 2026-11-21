@@ -20,7 +20,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(j2_texture_detail_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames) F(referee_enabled)
+#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(j2_texture_detail_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -200,7 +200,6 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         const int cam = static_cast<int>(GetPrivateProfileIntW(L"j2", L"camera", 1, ini));
         target.j2_camera.store(cam < 0 || cam > 2 ? 1 : cam);
     }
-    target.referee_enabled.store(GetPrivateProfileIntW(L"referee", L"enabled", target.referee_enabled.load(), ini) ? 1u : 0u);
     target.referee_every_ms.store(GetPrivateProfileIntW(L"referee", L"every_ms", target.referee_every_ms.load(), ini));
     target.referee_log_s.store(GetPrivateProfileIntW(L"referee", L"log_seconds", target.referee_log_s.load(), ini));
     target.nr_structure.store(pct(L"structure", 100));
@@ -237,6 +236,21 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
 } // namespace
 
 Settings& Get() { return g_settings; }
+
+void ConfigureReferee(bool added_dlaa, bool gpu_checks)
+{
+    // Route B owns this decision. A saved value from the old switch must
+    // never override it during startup, a save, or renderer election.
+    bool requested = added_dlaa;
+    if (!added_dlaa) {
+        const UINT deployed = g_ini_defaults[0] && GetPrivateProfileIntW(L"referee", L"enabled", 0, g_ini_defaults);
+        requested = g_ini_user[0] ? GetPrivateProfileIntW(L"referee", L"enabled", deployed, g_ini_user) != 0 : deployed != 0;
+    }
+    const bool active = requested && gpu_checks;
+    g_settings.referee_enabled.store(active);
+    na::eventlog::Emit("referee_start", "automatic_dlaa=%u gpu_checks=%u enabled=%u",
+                       unsigned(added_dlaa), unsigned(gpu_checks), unsigned(active));
+}
 void SetNrEnabled(bool enabled,NrWriteSource source,uint32_t input_flags) {
     std::lock_guard<std::mutex> lock(g_nr_write_mutex);
     if(source==NrWriteSource::Overlay){g_safe_overrides.fetch_and(~2u);g_nr_user_touched.store(true);} // explicit Off is also a user choice
@@ -369,8 +383,6 @@ bool SaveFromWorker()
     ok &= WritePrivateProfileStringW(L"dlss", L"rr_preset", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.text_bold.load());
     ok &= WritePrivateProfileStringW(L"overlay", L"text_bold", v, ini) != 0;
-    swprintf_s(v, L"%u", g_settings.referee_enabled.load());
-    ok &= WritePrivateProfileStringW(L"referee", L"enabled", v, ini) != 0;
     swprintf_s(v, L"%u", g_settings.fill_screen.load());
     ok &= WritePrivateProfileStringW(L"present", L"fill_screen", v, ini) != 0;
     struct { const wchar_t* key; int32_t value; } win[] = {

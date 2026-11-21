@@ -83,6 +83,8 @@
 // provider of the one program, src/host_dx12/native11; see input_provider.hpp.)
 #pragma once
 
+#include "core/presentation_extent.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -130,6 +132,7 @@ struct Event {
     uint16_t cb_first[kCbBindSlots] = {}, cb_count[kCbBindSlots] = {}; // in 16-byte constants
     uint64_t viewport_sample = 0; // Draw: actual native viewport offset encoded as two floats
     bool viewport_expanded = false; // Draw: actual viewport border expansion, travels with deferred recording
+    bool viewport_shader_depth = false; // Draw: shares the raster of a proved shader-readable depth layer
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
     // Depth direction evidence (depth_direction.hpp). Last on purpose: hosts that do not say leave them 0.
     uint8_t depth_func = 0;       // Draw: the depth comparison (D3D11 numbering, 1..8) when this draw tests AND WRITES the depth; 0 otherwise
@@ -141,6 +144,7 @@ struct Selection {
     Id depth = 0, color = 0, camera_cb = 0;
     int camera_slot = -1;
     ResourceInfo depth_info, color_info;
+    bool screen_region = false; // requires the screen challenge before this pair can deliver
     bool valid() const { return depth && color; }
 };
 
@@ -170,7 +174,30 @@ public:
         const char* last_miss = "";
     };
 
-    void SetSwapChainSize(uint32_t w, uint32_t h) { swap_w_ = w; swap_h_ = h; }
+    void SetSwapChainSize(uint32_t w, uint32_t h)
+    {
+        if (w != swap_w_ || h != swap_h_) region_retry_.clear();
+        swap_w_ = w;
+        swap_h_ = h;
+    }
+    void DeferScreenRegion()
+    {
+        if (!sel_.screen_region) return;
+        const auto defer = [&](Id target) {
+            if (!target) return;
+            if (region_retry_.size() >= 16) region_retry_.erase(region_retry_.begin());
+            region_retry_[{sel_.depth, target}] = stats_.frames + 512;
+        };
+        defer(sel_.color);
+        if (wide_) defer(layer_);
+        sel_ = {};
+        learned_read_ = learned_overlay_ = learned_flat_ = 0;
+        learned_tag_ = 0;
+        wide_ = false;
+        layer_ = second_depth_ = 0;
+        more_layers_.clear();
+        ++stats_.selection_changes;
+    }
     // Opt in to the HUD rule (a host that calls ShouldFireBeforeDraw). Off by default.
     void EnableOverlayRule(bool on) { overlay_rule_ = on; }
     // The target shown on screen (the swap chain's back buffer), 0 = unknown. When the picture is
@@ -249,13 +276,13 @@ public:
     // An immediate-context read of `resource` is about to happen.
     bool ShouldFireBeforeRead(Id resource) const
     {
-        if (fired_ || !sel_.valid() || resource != sel_.color || !learned_read_ || !scene_draws_) return false;
+        if (fired_ || !sel_.valid() || sel_.screen_region || resource != sel_.color || !learned_read_ || !scene_draws_) return false;
         return color_reads_ + 1 == learned_read_;
     }
     // The immediate context is about to execute a command list with this summary.
     bool ShouldFireBeforeList(const ListSummary& l)
     {
-        if (fired_ || !sel_.valid() || !learned_read_ || !l.color_reads) return false;
+        if (fired_ || !sel_.valid() || sel_.screen_region || !learned_read_ || !l.color_reads) return false;
         if (color_reads_ >= learned_read_ || color_reads_ + l.color_reads < learned_read_) return false;
         if (color_reads_ + 1 != learned_read_ || l.scene_draws_before_first_read || l.color_writes_before_first_read) {
             // The target read is inside this list, after scene work or other writes to the scene
@@ -271,11 +298,12 @@ public:
     // back buffer, no read of it). Only when no read point was learned.
     bool ShouldFireBeforeDraw(const Event& e) const
     {
-        if (fired_ || !sel_.valid() || learned_read_ || !scene_draws_) return false;
+        if (fired_ || !sel_.valid() || sel_.screen_region || learned_read_ || !scene_draws_) return false;
         if (e.kind != Kind::Draw || e.rt0 != sel_.color) return false;
         if (learned_overlay_) return !IsSceneDraw(e) && overlay_draws_ + 1 == learned_overlay_;
         // VARIANT: point/before-untested-hud
-        return learned_flat_ && tested_draws_ && IsSceneDraw(e) && !e.depth_test && flat_draws_ + 1 == learned_flat_;
+        return learned_flat_ && tested_draws_ && IsSceneDraw(e) && !e.depth_test &&
+               !e.viewport_shader_depth && flat_draws_ + 1 == learned_flat_;
     }
     // Which point the next frame will fire at: 1 = before a read, 2 = before the
     // first HUD draw (HUD rule), 3 = before the first HUD draw that keeps the scene
@@ -435,7 +463,7 @@ public:
     // The engine found the camera's matrices in this buffer (or, with 0, gave up on it).
     void SetCamera(Id cb, int slot) { sel_.camera_cb = cb; sel_.camera_slot = slot; }
 
-    void EndFrame(bool inspect_lit_order = false, Id verified_peer = 0)
+    void EndFrame(bool inspect_lit_order = false, Id verified_peer = 0, bool detect_screen_regions = false)
     {
         ++stats_.frames;
         // At the untested-HUD point the HUD draws that follow still carry the scene depth; only a
@@ -478,7 +506,7 @@ public:
 
         completed_lit_ = {};
         inspect_lit_order_ = inspect_lit_order;
-        Choose(verified_peer);
+        Choose(verified_peer, detect_screen_regions);
         stats_.learned_read = learned_read_;
         stats_.learned_overlay = learned_overlay_;
         stats_.learned_flat = learned_flat_;
@@ -540,7 +568,7 @@ public:
     {
         if (!sel_.valid()) return false;
         if (e.depth == sel_.depth) {
-            if (e.rt0 == sel_.color) return true;
+            if (e.rt0 == sel_.color || e.viewport_shader_depth) return true;
             if (!wide_ || !e.depth_test) return false;
             if (e.rt0 == layer_) return true;
             for (Id l : more_layers_) if (e.rt0 == l) return true;
@@ -600,7 +628,7 @@ private:
             pending_tag_ = 0;
             first_overlay_after_scene_pending_ = 0; // so was a non-scene draw into the colour
             if (e.rt0 == sel_.color) {
-                if (e.depth_test) {
+                if (e.depth_test || e.viewport_shader_depth) {
                     ++tested_draws_;
                     first_flat_after_tested_pending_ = 0; // an untested draw before this one was mid-scene
                 } else {
@@ -646,7 +674,12 @@ private:
         return std::fabs(a - s) <= 0.1 && rx >= 0.5 && rx <= 1.85 && ry >= 0.5 && ry <= 1.85;
     }
 
-    void Choose(Id verified_peer)
+    bool CanFillScreenRegion(const ResourceInfo& r) const
+    {
+        return r.samples == 1 && presentation::CenteredNativeRegion(r.width, r.height, swap_w_, swap_h_);
+    }
+
+    void Choose(Id verified_peer, bool detect_screen_regions)
     {
         // Loading screens and menus: one depth with <= 8 draws -> keep the old choice.
         uint64_t total_depth_draws = 0;
@@ -676,9 +709,38 @@ private:
                 if (kv.second.draws > best_cd) { best_cd = kv.second.draws; best_color = kv.first.second; }
             }
         }
+        bool screen_region = false;
+        if (!best_color && detect_screen_regions) {
+            best_v = 0;
+            // Use the real dimensions of the colour/depth pair. Final-screen proof
+            // is required before running DLAA on this otherwise mismatched pair.
+            for (const auto& kv : color_) {
+                const auto d = info_.find(kv.first.first), c = info_.find(kv.first.second);
+                if (d == info_.end() || c == info_.end() || AspectOk(d->second) ||
+                    !CanFillScreenRegion(d->second) || c->second.samples != 1 ||
+                    c->second.width != d->second.width || c->second.height != d->second.height ||
+                    kv.second.draws <= 8) continue;
+                const auto usage = depth_.find(kv.first.first);
+                if (usage == depth_.end() || (usage->second.vertices <= 3 && !usage->second.indirect)) continue;
+                const auto defer = region_retry_.find(kv.first);
+                if (defer != region_retry_.end() && defer->second > stats_.frames) continue;
+                const auto vertices = usage->second.vertices;
+                if (!best_color || vertices > best_v || (vertices == best_v && kv.second.draws > best_cd)) {
+                    best_depth = kv.first.first;
+                    best_color = kv.first.second;
+                    best_v = vertices;
+                    best_cd = kv.second.draws;
+                }
+            }
+            screen_region = best_color != 0;
+        }
         if (!best_color) return; // nothing usable this frame: keep the old choice
         const Id most_drawn = best_color;
         const bool layered = AfterLayers(best_depth, best_color);
+        if (screen_region) {
+            const auto defer = region_retry_.find({best_depth, best_color});
+            if (defer != region_retry_.end() && defer->second > stats_.frames) return;
+        }
         // Preserve the camera and its learned bindings across a proven pair.
         // The reader chooses the current physical surface at execution time.
         if (verified_peer && completed_lit_.depth == sel_.depth &&
@@ -703,6 +765,7 @@ private:
             if (layered) { wide_ = true; layer_ = most_drawn; second_depth_ = note_.second_depth; more_layers_ = note_.more_layers; }
             sel_.depth = best_depth;
             sel_.color = best_color;
+            sel_.screen_region = screen_region;
             sel_.depth_info = info_[best_depth];
             sel_.color_info = info_[best_color];
             sel_.camera_cb = 0;
@@ -889,6 +952,7 @@ private:
     };
 
     uint32_t swap_w_ = 0, swap_h_ = 0;
+    std::map<std::pair<Id, Id>, uint64_t> region_retry_;
     std::unordered_map<Id, ResourceInfo> info_;
     std::unordered_map<Id, Cand> depth_;
     std::unordered_map<std::pair<Id, Id>, PairCount, PairHash> color_;

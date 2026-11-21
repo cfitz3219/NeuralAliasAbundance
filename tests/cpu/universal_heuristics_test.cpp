@@ -45,12 +45,15 @@ struct Feed {
         CHECK(decoded.valid);
         h.Consume(decoded, status);
     }
-    void Resource(uint64_t id, uint32_t w, uint32_t hgt, uint32_t format) {
+    void Resource(uint64_t id, uint32_t w, uint32_t hgt, uint32_t format, uint32_t samples = 1) {
         na_ev_resource_created r{};
         r.resource = id;
         r.width = w;
         r.height = hgt;
         r.format = format;
+        r.dimension = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        r.sample_count = samples;
+        r.depth_or_array = r.mip_levels = 1;
         Event(r, NA_EV_RESOURCE_CREATED);
     }
     void Pipeline(uint64_t id, uint32_t depth, uint32_t write, uint32_t blend) {
@@ -214,6 +217,32 @@ int main(int argc,char** argv) {
              resize.width=1024;resize.height=768;resize.hresult=static_cast<int32_t>(0x80004005u);
              f.Event(resize,NA_EV_SWAPCHAIN_RESIZED);
              CHECK(f.h.SwapchainWidth()==1280 && f.h.SwapchainHeight()==720);
+         }},
+        {"a native picture inside a larger display is offered separately from ordinary depth", [] {
+             for (bool horizontal : {false, true}) {
+                 Feed f;
+                 f.Swapchain(horizontal ? 3440 : 2560, horizontal ? 1440 : 1800);
+                 f.Resource(3, 2560, 1440, 40);
+                 f.Resource(6, 2560, 1440, 10);
+                 f.Resource(4, 2048, 2048, 40);
+                 f.Resource(8, 2048, 2048, 10);
+                 f.Resource(5, 2560, 1440, 40, 4);
+                 f.Resource(9, 2560, 1440, 10, 4);
+                 f.Pipeline(10, 1, 1, 0);
+                 f.Reset();
+                 f.SetPipeline(10);
+                 f.Targets({8}, 4);
+                 for (int i = 0; i < 30; ++i) f.Draw(900);
+                 f.Targets({9}, 5);
+                 for (int i = 0; i < 30; ++i) f.Draw(900);
+                 f.Targets({6}, 3);
+                 for (int i = 0; i < 20; ++i) f.Draw(120);
+                 f.Execute();
+                 f.Present();
+                 const auto pair = f.h.ScreenRegionPair();
+                 CHECK(pair.first == 3 && pair.second == 6);
+                 CHECK(!f.h.RankDepth(1).empty() && f.h.RankDepth(1)[0].score == 0);
+             }
          }},
         {"generic_depth picks the swapchain-aspect main depth over shadow and half-res buffers", [] {
              Feed f;

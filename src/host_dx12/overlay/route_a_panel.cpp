@@ -38,7 +38,6 @@
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
-namespace na::referee::gpu { bool Supported(); } // capture/referee_gpu.hpp
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
@@ -952,24 +951,6 @@ void DrawLiveDlaa()
     }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
-    // Cort 2026-11-18, confirmed 2026-11-21: no ordinary package shows the Referee switch
-    // yet. The row is built only when NA_REFEREE_MENU is asked for at configure time
-    // (default OFF). Where it is built, a build without the Referee's GPU checks shows
-    // the row disabled and says so, instead of hiding it (gap audit item 5).
-#if defined(NA_REFEREE_MENU)
-    auto& referee_enabled = na::settings::Get().referee_enabled;
-    bool referee_on = referee_enabled.load() != 0;
-    const bool referee_supported = na::referee::gpu::Supported();
-    BeginRow("Referee", "Checks DLAA while you play and records its findings in the results log.", SwitchWidth());
-    ImGui::BeginDisabled(!referee_supported);
-    if (Switch("referee", &referee_on) && referee_supported) {
-        referee_enabled.store(referee_on ? 1u : 0u);
-        na::settings::Save();
-    }
-    ImGui::EndDisabled();
-    EndRow();
-    if (!referee_supported) Hint("Not available in this build: it was made without the Referee's screen checks.");
-#endif
     if (na::settings::AddedUpscalingAllowed() &&
         (na::scale::native::Available() || na::scale::SliderRouteActive() ||
          na::scale::GetAutomaticSceneStats().enabled || na::j2::ProjectionWindow() || na::j2::RenderSmall())) {
@@ -1195,11 +1176,11 @@ void DrawLiveDlaaEnhancements()
         // VARIANT: camera/optional
         // One control, live, saved per game ([j2] camera), on both routes.
         na::settings::Settings& cs = na::settings::Get();
-        static const char* kCameraUse[] = {"Use it when found", "Never look for it", "Require it (old behaviour)"};
+        static const char* kCameraUse[] = {"Use it when found", "Measure motion from picture", "Require it (old behaviour)"};
         static const int kCameraValue[] = {1, 0, 2};
         const int now = cs.j2_camera.load();
         int pick = now == 0 ? 1 : now == 2 ? 2 : 0;
-        BeginRow("Scene camera", "DLAA no longer needs to find the game's camera. Use it when found: the camera's exact motion is used on frames where it is found, and motion measured from the picture on frames where it is not. Never look for it: motion is always measured from the picture. Require it: frames without a camera are left as the game drew them, as before. Takes effect on the next frame.", S(220));
+        BeginRow("Scene camera", "DLAA no longer needs to find the game's camera. Use it when found: the camera's exact motion is used on frames where it is found, and motion measured from the picture on frames where it is not. Measure motion from picture: DLAA always measures motion. On native DX11, XeGTAO can still read the camera projection for shading. Require it: frames without a camera are left as the game drew them, as before. Takes effect on the next frame.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2camera", &pick, kCameraUse, 3)) {
             cs.j2_camera.store(kCameraValue[pick]);

@@ -21,11 +21,13 @@
 #pragma once
 #include "capture_decoder.hpp"
 #include "scene_pick.hpp"
+#include "core/presentation_extent.hpp"
 #include <algorithm>
 #include <cmath>
 #include <map>
 #include <string>
 #include <utility>
+#include <tuple>
 #include <vector>
 
 namespace na::discovery {
@@ -198,6 +200,47 @@ public:
         std::stable_sort(out.begin(), out.end(), [](const DepthCandidate& a, const DepthCandidate& b) { return a.score > b.score; });
         if (out.size() > n) out.resize(n);
         return out;
+    }
+
+    // Secondary discovery path. These paired buffers stay provisional until
+    // the existing native reader challenge reaches the presented rectangle.
+    std::pair<uint64_t, uint64_t> ScreenRegionPair() const {
+        const auto& f = Scored();
+        std::pair<uint64_t, uint64_t> best{};
+        uint64_t best_vertices = 0, best_draws = 0, best_order = 0;
+        bool best_float = false;
+        const auto single_image = [](const auto& r) {
+            return r.dimension == 3 && r.sample_count == 1 && r.depth_or_array == 1 && r.mip_levels == 1;
+        };
+        for (const auto& c : f.color) {
+            const auto ci = resources_.find(c.first);
+            if (ci == resources_.end() || !single_image(ci->second)) continue;
+            const auto& image = ci->second;
+            if (image.width > swap_w_ || SimilarAspect(uint32_t(image.width), image.height) ||
+                !presentation::CenteredNativeRegion(uint32_t(image.width), image.height, swap_w_, swap_h_)) continue;
+            const bool float_color = image.format == 2 || image.format == 10 || image.format == 26;
+            for (const auto& paired : c.second.with_depth) {
+                if (paired.second <= 8) continue;
+                const auto di = resources_.find(paired.first);
+                const auto observed = f.depth.find(paired.first);
+                if (di == resources_.end() || observed == f.depth.end() || !single_image(di->second) ||
+                    di->second.width != image.width || di->second.height != image.height) continue;
+                const auto& depth = observed->second;
+                if (depth.vertices <= 3 && !depth.indirect) continue;
+                const uint64_t vertices = depth.vertices ? depth.vertices : depth.draws;
+                const uint64_t order = c.second.last.ticket;
+                if (best.first && vertices < best_vertices) continue;
+                if (best.first && vertices == best_vertices &&
+                    std::make_tuple(float_color, paired.second, order) <=
+                    std::make_tuple(best_float, best_draws, best_order)) continue;
+                best = {paired.first, c.first};
+                best_vertices = vertices;
+                best_draws = paired.second;
+                best_float = float_color;
+                best_order = order;
+            }
+        }
+        return best;
     }
 
     // Scene colour (pre-HUD): render targets written by 3D draws before an

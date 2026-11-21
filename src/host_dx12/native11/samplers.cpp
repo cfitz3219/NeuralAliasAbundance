@@ -26,11 +26,17 @@ using Microsoft::WRL::ComPtr;
 enum : uint32_t { kCreateSamplerState = 23 };                 // ID3D11Device
 enum : uint32_t { kPSSetSamplers = 10, kCSSetSamplers = 70 }; // ID3D11DeviceContext
 
+enum : uint32_t { kPSGetSamplers = 75, kCSGetSamplers = 108 }; // ID3D11DeviceContext
+
 using PFN_CreateSampler = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
 using PFN_SetSamplers = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11SamplerState* const*);
 
+using PFN_GetSamplers = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11SamplerState**);
+
 PFN_CreateSampler g_create = nullptr;
 PFN_SetSamplers g_ps[2] = {}, g_cs[2] = {}; // [0] immediate class, [1] deferred class
+
+PFN_GetSamplers g_ps_get[2] = {}, g_cs_get[2] = {};
 
 SamplerBiasFn g_bias_fn = nullptr;
 SamplerAfFn g_af_fn = nullptr;
@@ -116,10 +122,15 @@ HRESULT STDMETHODCALLTYPE CreateSamplerState_d(ID3D11Device* dev, const D3D11_SA
 
 // VARIANT: samplers/adopt-at-bind
 // A sampler the game binds that was never seen at CreateSamplerState: record it from its own
+<<<<<<< HEAD
 // description, exactly as its creation would have. Without this a game whose samplers all exist
 // before the hooks do keeps its own texture detail and filtering for the whole session, with the
 // menu showing a bias that no draw uses. Our variants are already in the table, and work of our
 // own on the game's device is not the game's, so neither is adopted. Null = leave it alone.
+=======
+// description. This also handles a sampler that was already bound when the hooks were installed,
+// because the draw-time policy refresh reads each context's bound slots.
+>>>>>>> origin/astra/automatic-route-b-referee
 std::shared_ptr<Entry> Adopt(ID3D11SamplerState* sampler)
 {
     if (!sampler || IsOwnWork()) return nullptr;
@@ -152,7 +163,7 @@ std::shared_ptr<Entry> Adopt(ID3D11SamplerState* sampler)
 }
 
 // The variant of `e` for (bias, af), made on first use; null = bind the game's own.
-ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af, bool& created)
+ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af)
 {
     if (!(e.wants_bias && bias != 0.0f) && !(e.wants_af && af)) return nullptr;
     const uint64_t key = Key(bias, af);
@@ -173,7 +184,6 @@ ID3D11SamplerState* VariantOf(Entry& e, float bias, uint32_t af, bool& created)
             made.Reset();
         } else {
             g_variants.fetch_add(1, std::memory_order_relaxed);
-            created = true;
         }
     }
     e.variants.emplace_back(key, made); // a null entry remembers "nothing to change" for this key
@@ -213,14 +223,7 @@ void Bind(PFN_SetSamplers original, ID3D11DeviceContext* c, UINT start, UINT n,
         const auto& e = entries[i];
         if (!e) { slots[i] = {}; unknown += requested[i] != nullptr; continue; }
         swapped[i] = e->original.Get();
-        bool created = false;
-        if (auto* v = VariantOf(*e, bias, af, created)) {
-            swapped[i] = v;
-            if (created) {
-                std::unique_lock<std::shared_mutex> lock(g_mu);
-                g_entries.emplace(v, e); // lets a cached/GetSamplers variant restore its original
-            }
-        }
+        if (auto* v = VariantOf(*e, bias, af)) swapped[i] = v;
         if (swapped[i] != e->original.Get()) {
             slots[i].original = e->original;
             slots[i].applied = swapped[i];
@@ -268,6 +271,27 @@ void STDMETHODCALLTYPE CSSetSamplersDeferred_d(ID3D11DeviceContext* c, UINT star
     Bind(g_cs[1], c, start, n, s, true);
 }
 
+// The same object can be a replacement in one slot and the game's own
+// sampler in another. Report what the game bound using this context's slot.
+template<unsigned Kind, bool Compute>
+void STDMETHODCALLTYPE GetSamplers_d(ID3D11DeviceContext* c, UINT start, UINT n, ID3D11SamplerState** out)
+{
+    const auto original = Compute ? g_cs_get[Kind] : g_ps_get[Kind];
+    original(c, start, n, out);
+    constexpr unsigned count = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
+    if (!out || start >= count || n > count - start) return;
+    const auto* shadow = SamplerShadowOf(c);
+    if (!shadow) return;
+    const auto* slots = (Compute ? shadow->compute : shadow->pixel) + start;
+    for (UINT i = 0; i < n; ++i) {
+        if (!out[i] || out[i] != slots[i].applied || !slots[i].original) continue;
+        auto* game = slots[i].original.Get();
+        game->AddRef();
+        out[i]->Release();
+        out[i] = game;
+    }
+}
+
 } // namespace
 
 bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af)
@@ -290,6 +314,10 @@ bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af)
                                               reinterpret_cast<void**>(&g_ps[0]));
     ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kCSSetSamplers, reinterpret_cast<void*>(&CSSetSamplers_d),
                                               reinterpret_cast<void**>(&g_cs[0]));
+    ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kPSGetSamplers, reinterpret_cast<void*>(&GetSamplers_d<0, false>),
+                                              reinterpret_cast<void**>(&g_ps_get[0]));
+    ok = ok && na::hooking::PrepareVTableSlot(imm.Get(), kCSGetSamplers, reinterpret_cast<void*>(&GetSamplers_d<0, true>),
+                                              reinterpret_cast<void**>(&g_cs_get[0]));
     if (ok && def) {
         // The deferred class may share the immediate class's functions; the core then returns the
         // existing trampoline and the immediate detour serves both.
@@ -301,6 +329,12 @@ bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af)
         if (ok && vt_def[kCSSetSamplers] != vt_imm[kCSSetSamplers])
             ok = na::hooking::PrepareVTableSlot(def.Get(), kCSSetSamplers, reinterpret_cast<void*>(&CSSetSamplersDeferred_d),
                                                 reinterpret_cast<void**>(&g_cs[1]));
+        if (ok && vt_def[kPSGetSamplers] != vt_imm[kPSGetSamplers])
+            ok = na::hooking::PrepareVTableSlot(def.Get(), kPSGetSamplers, reinterpret_cast<void*>(&GetSamplers_d<1, false>),
+                                                reinterpret_cast<void**>(&g_ps_get[1]));
+        if (ok && vt_def[kCSGetSamplers] != vt_imm[kCSGetSamplers])
+            ok = na::hooking::PrepareVTableSlot(def.Get(), kCSGetSamplers, reinterpret_cast<void*>(&GetSamplers_d<1, true>),
+                                                reinterpret_cast<void**>(&g_cs_get[1]));
     }
     if (ok) ok = na::hooking::CommitInstall();
     else na::hooking::AbandonInstall();
@@ -327,10 +361,12 @@ void RefreshSamplers(void* context)
     if (!g_installed.load() || !IsGameWork(c)) return;
     ID3D11SamplerState* bound[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
     const int deferred = c->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED ? 1 : 0;
-    c->PSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    const auto get_ps = g_ps_get[deferred] ? g_ps_get[deferred] : g_ps_get[0];
+    get_ps(c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
     Bind(g_ps[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound, false, true);
     for (auto* s : bound) if (s) s->Release();
-    c->CSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
+    const auto get_cs = g_cs_get[deferred] ? g_cs_get[deferred] : g_cs_get[0];
+    get_cs(c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound);
     Bind(g_cs[deferred], c, 0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, bound, true, true);
     for (auto* s : bound) if (s) s->Release();
 }

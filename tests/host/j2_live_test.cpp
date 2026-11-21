@@ -214,6 +214,7 @@ int main(int argc,char** argv)
 {
     const bool native_dlaa = argc > 1 && std::strstr(argv[1], "native-dlaa") != nullptr;
     const bool native_lighting = native_dlaa && std::strstr(argv[1], "rotating-lighting");
+    const bool native_region = native_dlaa && std::strstr(argv[1], "centered");
     const bool native_scale=argc>1&&std::strstr(argv[1],"--native-scale")!=nullptr;
     const bool native_merged=argc>1&&std::strstr(argv[1],"merged")!=nullptr;
     const bool native_late=argc>1&&std::strstr(argv[1],"late")!=nullptr;
@@ -262,8 +263,8 @@ int main(int argc,char** argv)
     std::printf("step: install producers\n");
     REQUIRE(na::observe::InstallProducers(dev, d.queue.Get(), /*hook_queue_execute=*/true));
     if (native_dlaa) {
-        na::settings::Get().referee_enabled.store(1);
         na::j2::SetEnabled(true); // before descriptor creation
+        CHECK(na::settings::Get().referee_enabled.load() == unsigned(na::referee::gpu::Supported()));
     } else if (native_scale) na::j2::EnableNativeScaleBridge(true);
     // Every native-scale variant uses recording leases, as does production.
     // A Reset must create a new receipt, including the short direct-pass tests.
@@ -273,7 +274,7 @@ int main(int argc,char** argv)
     REQUIRE(na_observe_start(&cfg, &Sink, nullptr) == NA_OK);
     na::dlss::SetInitOwnOverrideForTests([](ID3D12Device* device, const wchar_t*) { return na::dlss::Attach(device, fake::MakeApi()); });
 
-    const uint32_t W = native_dlaa ? 96 : 64, H = native_dlaa ? 48 : 32;
+    const uint32_t W = native_dlaa && !native_region ? 96 : 64, H = native_dlaa ? 48 : 32;
     auto color = test::CreateTexture(dev, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     auto depth = test::CreateTexture(dev, W, H, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
     auto cb = test::CreateBuffer(dev, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -397,7 +398,14 @@ int main(int argc,char** argv)
         frame(0);
         CHECK(g_forwarded.size() == 2);
     }
-    na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()));
+    na::observe::SetLiveSelection(na::observe::IdOf(depth.Get()), na::observe::IdOf(color.Get()), native_region);
+    if (native_region) {
+        uint64_t live_depth = 0, live_color = 0;
+        bool requires_screen = false;
+        na::observe::GetLiveSelection(&live_depth, &live_color, &requires_screen);
+        CHECK(requires_screen && !live_depth && !live_color);
+        CHECK(!na::observe::SetScreenSelectionProven(na::observe::IdOf(depth.Get()), UINT64_MAX, true));
+    }
     const int evals0 = fake::evals;
     auto st = na::j2::GetStats();
     if (!native_dlaa) {
@@ -429,13 +437,14 @@ int main(int argc,char** argv)
         const auto format=native_late&&!late_fp16&&!native_dlaa?DXGI_FORMAT_R8G8B8A8_TYPELESS:DXGI_FORMAT_R16G16B16A16_FLOAT;
         const auto view_format=native_late&&!late_fp16&&!native_dlaa?DXGI_FORMAT_R8G8B8A8_UNORM:format;
         const auto flags=D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-        auto native=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
+        const uint32_t canvas_w = native_region ? W : OW;
+        auto native=test::CreateTexture(dev,canvas_w,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
         REQUIRE(native);
         test::ComPtr<ID3D12Resource> late, decoy, presented, aux;
         test::ComPtr<IDXGISwapChain1> witness_chain;HWND witness_window=nullptr;
         if (native_late) {
             late=test::CreateTexture(dev,W,H,format,D3D12_RESOURCE_STATE_COMMON,flags);
-            decoy=test::CreateTexture(dev,OW,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
+            decoy=test::CreateTexture(dev,canvas_w,OH,format,D3D12_RESOURCE_STATE_COMMON,flags);
             // SE5: the presented image is FP16 (p49436 swap chain format 10).
             if(native_dxgi){
                 witness_window=test::CreateTestWindow(L"Backbuffer provenance witness",OW,OH);
@@ -640,9 +649,9 @@ int main(int argc,char** argv)
             REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&d2,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error)));
             REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&se5_root))));
             const char up[]=R"(Texture2D<float4> image:register(t0);Texture2D<float4> aux:register(t1);RWTexture2D<float4> output:register(u0);
-                [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){uint w,h;image.GetDimensions(w,h);if(p.x<96&&p.y<48){
-                    float4 c=image.Load(int3(p.xy*uint2(w,h)/uint2(96,48),0))+min(aux.Load(int3(0,0,0)),0);
-                    output[p.xy]=w==96 ? float4(c.rgb*0.75,c.a) : c;
+                 [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){uint w,h,ow,oh;image.GetDimensions(w,h);output.GetDimensions(ow,oh);if(p.x<ow&&p.y<oh){
+                    float4 c=image.Load(int3(p.xy*uint2(w,h)/uint2(ow,oh),0))+min(aux.Load(int3(0,0,0)),0);
+                    output[p.xy]=w==ow && h==oh ? float4(c.rgb*0.75,c.a) : c;
                 }})";
             test::ComPtr<ID3DBlob> cs;
             REQUIRE(SUCCEEDED(D3DCompile(up,sizeof up,"se5_upscale",nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&cs,&error)));
@@ -666,7 +675,15 @@ int main(int argc,char** argv)
             REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error)));
             REQUIRE(SUCCEEDED(dev->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&bindless_root))));
             const char bl[]=R"(Texture2D<float4> imgs[]:register(t0);RWTexture2D<float4> o:register(u0);cbuffer C:register(b0){uint idx;};
-                [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){if(p.x<96&&p.y<48){float4 c=imgs[NonUniformResourceIndex(idx)].Load(int3(p.xy,0));o[p.xy]=float4(pow(c.rgb,2.2),c.a);}})";
+                 [numthreads(8,8,1)]void main(uint3 p:SV_DispatchThreadID){
+                    uint w,h;imgs[NonUniformResourceIndex(idx)].GetDimensions(w,h);
+                    if(p.x<96&&p.y<48){
+                        const uint2 start=uint2((96-w)/2,(48-h)/2);
+                        const bool inside=all(p.xy>=start)&&all(p.xy<start+uint2(w,h));
+                        float4 c=inside?imgs[NonUniformResourceIndex(idx)].Load(int3(p.xy-start,0)):float4(0,0,0,1);
+                        o[p.xy]=float4(pow(c.rgb,2.2),c.a);
+                    }
+                })";
             test::ComPtr<ID3DBlob> cs;
             const HRESULT hr=D3DCompile(bl,sizeof bl,"bindless_present",nullptr,nullptr,"main","cs_5_1",D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES,0,&cs,&error);
             if(FAILED(hr)&&error)std::printf("%s\n",static_cast<const char*>(error->GetBufferPointer()));
@@ -1203,8 +1220,14 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     // The evaluation's own pixels, through J2's normal write-back, the game's HUD,
                     // and the game's explicit UNORM -> FP16 conversion into the presented image.
                     const auto q=[](float v){return std::round(v*255.f)/255.f;};
-                    const auto world=ReadTexel(d,presented.Get(),OW-1,OH-1),hud=ReadTexel(d,presented.Get(),1,1);
-                    const auto game=ReadTexel(d,native.Get(),OW-1,OH-1);
+                    const UINT sample_x = native_region ? (OW - W) / 2 + W - 1 : OW - 1;
+                    const auto world=ReadTexel(d,presented.Get(),sample_x,OH-1),hud=ReadTexel(d,presented.Get(),1,1);
+                    const auto game=ReadTexel(d,native.Get(),canvas_w-1,OH-1);
+                    if (native_region) {
+                        const auto right = ReadTexel(d, presented.Get(), OW - 1, 1);
+                        CHECK(hud[0] == 0.f && hud[1] == 0.f && hud[2] == 0.f);
+                        CHECK(right[0] == 0.f && right[1] == 0.f && right[2] == 0.f);
+                    }
                     if(native_layout_change){
                         if(iteration>=80&&iteration<120)CHECK(hud[0]<.001f&&hud[1]>.999f&&hud[2]<.001f);
                         void* bytes=nullptr;D3D12_RANGE range{0,8};REQUIRE(SUCCEEDED(g_input_probe->Map(0,&range,&bytes)));
@@ -1219,7 +1242,7 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     (void)q;
                     if (native_dlaa) {
                         CHECK(st.render_w == W && st.render_h == H && st.out_w == W && st.out_h == H);
-                        const auto untouched = ReadTexel(d, decoy.Get(), OW-1, OH-1);
+                        const auto untouched = ReadTexel(d, decoy.Get(), canvas_w-1, OH-1);
                         for (int c = 0; c < 3; ++c) {
                             CHECK(std::fabs(untouched[c] - .3f) < .002f);
                             CHECK(std::fabs(game[c] - g_pattern[c] * .75f) < .002f);
@@ -1260,7 +1283,7 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
             }
             std::printf("native scale %s iteration%u: evaluations=%d %ux%u->%ux%u active=%u reason=%s\n",native_merged?"merged":"separate",iteration,fake::evals-before_native,st.render_w,st.render_h,st.out_w,st.out_h,st.active,st.reason);
             CHECK(st.active&&st.render_w==W&&st.render_h==H&&st.out_w==OW&&st.out_h==OH);
-            const auto corner_native=ReadTexel(d,native.Get(),OW-1,OH-1),hud_native=ReadTexel(d,native.Get(),1,1);
+            const auto corner_native=ReadTexel(d,native.Get(),canvas_w-1,OH-1),hud_native=ReadTexel(d,native.Get(),1,1);
             CHECK(corner_native[0]==0&&corner_native[3]==1);CHECK(hud_native[1]==1);
         }
         if(native_late){
@@ -1289,7 +1312,14 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
                     CHECK(std::strstr(trace, "dlaa_screen_candidate=") && std::strstr(trace, "refuted=1"));
                     CHECK(std::strstr(nbs.probe, "verified=1") && std::strstr(nbs.probe, "refuted=1"));
                 }
-                CHECK(late_deliveries >= 2);
+                CHECK(late_deliveries >= (native_region ? 12u : 2u));
+                if (native_region) {
+                    uint64_t live_depth = 0, live_color = 0;
+                    bool requires_screen = false;
+                    na::observe::GetLiveSelection(&live_depth, &live_color, &requires_screen);
+                    CHECK(requires_screen && live_depth == na::observe::IdOf(depth.Get()) && live_color == na::observe::IdOf(color.Get()));
+                    std::printf("DX12 centered scene: %u verified displays with both bars intact\n", late_deliveries);
+                }
             }else if(native_bindless){
                 // Unreadable presenting dispatch: the decoy crossing was refuted by the
                 // screen probe, the game's upscale step confirmed, then delivered.
