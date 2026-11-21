@@ -755,6 +755,172 @@ void TestRouteTrials()
     }
 }
 
+// Audit items 6 and 11: a comparison without a verdict may run again on fresh
+// evidence, demonstrated harm stays excluded, and a phase that runs out of
+// time names the gate that blocked it. The trial is shared, so the same
+// expectations are exercised with both adapters' receipt shapes below.
+void TestRetryAndReasons()
+{
+    using Phase = RouteTrial::Phase;
+    constexpr unsigned region = 18;
+    struct Run {
+        RouteTrial trial;
+        uint64_t ordinal = 0, now = 100;
+        void Window(float amplitude, bool delivered = true, float far_image = 0.f, uint64_t wrong_ticket = 0)
+        {
+            ordinal += RouteTrial::warmup_frames + 1;
+            const auto ticket = trial.Ticket(ordinal);
+            for (unsigned i = 0; i < RouteTrial::samples; ++i) {
+                TrialSample frame;
+                frame.ordinal = ordinal++;
+                frame.configuration = 1;
+                frame.delivered = delivered;
+                frame.bypassed = !delivered;
+                frame.width = 3440;
+                frame.height = 1440;
+                frame.image.fill(far_image);
+                for (unsigned j = 0; j < frame.change[region].size(); ++j)
+                    frame.change[region][j] = (i + j) % 2 ? -amplitude : amplitude;
+                trial.Tick(++now, true);
+                trial.Add(ticket ^ wrong_ticket, frame, ordinal);
+            }
+        }
+        void Begin() { trial.Start(51, ordinal, now); }
+        void Expire() { now += RouteTrial::maximum_ms; trial.Tick(now, true); }
+    };
+    {
+        // Unchanged recurring symptom: the recheck shows a much weaker symptom three times, then
+        // the same symptom returns and the same candidate is accepted.
+        Run r;
+        for (unsigned attempt = 1; attempt <= RouteTrial::inconclusive_limit; ++attempt) {
+            r.Begin();
+            r.Window(.25f); r.Window(.07f); r.Window(.14f);
+            check(r.trial.Current() == Phase::Rejected && !r.trial.RuledOut() &&
+                  r.trial.Outcome() == TrialOutcome::Insufficient && r.trial.InconclusiveAttempts() == attempt,
+                  "retry: an inconsistent recheck is insufficient evidence, not harm");
+            check(!r.trial.CanStart(r.now + 1000), "retry: an inconclusive comparison waits before it repeats");
+            r.now += 60000;
+            check(r.trial.CanStart(r.now), "retry: an inconclusive comparison can run again after its wait");
+        }
+        auto exhausted = r;
+        exhausted.Begin();
+        exhausted.Window(.25f); exhausted.Window(.07f); exhausted.Window(.14f);
+        check(exhausted.trial.Current() == Phase::Rejected && !exhausted.trial.CanStart(exhausted.now + 10000000),
+              "retry: the number of inconclusive repeats for one scope is bounded");
+        r.Begin();
+        r.Window(.25f); r.Window(.07f); r.Window(.24f);
+        check(r.trial.Current() == Phase::Kept && r.trial.Outcome() == TrialOutcome::Improved &&
+              r.trial.InconclusiveAttempts() == 0,
+              "retry: the recurring symptom lets the retried candidate win and clears the count");
+    }
+    {
+        // Return to a harmful candidate: proof of bypass is never reopened.
+        Run r;
+        r.Begin();
+        r.Window(.25f); r.Window(.07f, false);
+        check(r.trial.RuledOut() && r.trial.Outcome() == TrialOutcome::Harm &&
+              !r.trial.CanStart(r.now + 10000000), "retry: demonstrated harm stays excluded");
+    }
+    {
+        // A cut during the replacement: the view no longer matches, the phase
+        // times out, says why, and may be tried again.
+        Run r;
+        r.Begin();
+        r.Window(.25f);
+        r.Window(.07f, true, 1.f); r.Window(.07f, true, 1.f);
+        check(r.trial.Current() == Phase::Candidate, "reasons: a different view cannot vote on the replacement");
+        r.Expire();
+        check(r.trial.Current() == Phase::Rejected && !r.trial.RuledOut() &&
+              std::strstr(r.trial.Reason(), "view kept changing") &&
+              r.trial.Evidence().Decisive() == TrialGate::View && r.trial.Evidence().receipts == 8 &&
+              r.trial.Evidence().Used() == 0 && !std::strcmp(r.trial.EvidencePhase(), "replacement"),
+              "reasons: a timed-out replacement names the changed view and counts its receipts");
+        check(r.trial.CanStart(r.now + 60000), "retry: a cut does not exclude the candidate");
+    }
+    {
+        Run none;
+        none.Begin();
+        none.Expire();
+        check(std::strstr(none.trial.Reason(), "no screen receipt") && none.trial.Evidence().receipts == 0 &&
+              !std::strcmp(none.trial.EvidencePhase(), "baseline"),
+              "reasons: zero receipts is reported as its own cause");
+        Run other;
+        other.Begin();
+        other.Window(.25f, true, 0.f, 8);
+        other.Expire();
+        check(std::strstr(other.trial.Reason(), "another experiment") &&
+              other.trial.Evidence().Decisive() == TrialGate::Experiment,
+              "reasons: receipts for another experiment are named");
+        Run quiet;
+        quiet.Begin();
+        quiet.Window(.01f); quiet.Window(.01f);
+        quiet.Expire();
+        check(std::strstr(quiet.trial.Reason(), "symptom did not recur") &&
+              quiet.trial.Evidence().Decisive() == TrialGate::Symptom,
+              "reasons: a baseline that never shows the symptom says so");
+        Run lost;
+        lost.Begin();
+        lost.Window(.25f);
+        lost.trial.Tick(++lost.now, false);
+        check(lost.trial.Outcome() == TrialOutcome::Unavailable, "reasons: a lost route is unavailable, not harmful");
+    }
+    // Same policy through the placement owner with each API's receipt shape.
+    for (auto path : {shadow::Path::Native11, shadow::Path::Inline}) {
+        PlacementTrial trial;
+        const PlacementTrial::Scope scope{31, 41, 3, 12};
+        TrialSample sample;
+        sample.width = 960; sample.height = 540; sample.layout = 1; sample.configuration = 1;
+        sample.delivered = true;
+        sample.context = {{path, 17}, 31, 41, 3, 0, sample.width, sample.height, 0, 0, sample.configuration};
+        sample.tiles.Set(TileVotes{0, 0xff}, sample.width, sample.height, {});
+        sample.tiles.detail.fill(.10f);
+        uint64_t ordinal = 1, now = 100;
+        const auto witness = [&] {
+            sample.ordinal = ordinal; sample.observed_at = now;
+            sample.context.color = 31; sample.context.placement.path = path;
+            sample.change[13].fill(.24f);
+        };
+        const auto arm = [&](unsigned which, float recheck) {
+            ordinal += RouteTrial::warmup_frames + 2;
+            for (unsigned i = 0; i < RouteTrial::samples; ++i, ++ordinal) {
+                sample.ordinal = ordinal;
+                sample.observed_at = ++now;
+                sample.context.color = which == 1 ? 31 + (i % 2) : 31;
+                sample.context.placement.path = which == 1 && path == shadow::Path::Inline ? shadow::Path::Between : path;
+                const float amplitude = which == 1 ? .01f : which == 2 ? recheck : .24f;
+                sample.change[13].fill(i % 2 ? amplitude : -amplitude);
+                const auto ticket = trial.Ticket(ordinal);
+                trial.Tick(now, true);
+                trial.Add(scope, ticket, sample, ordinal, now);
+            }
+        };
+        witness();
+        check(trial.Begin(scope, sample, ordinal, now), "both APIs: localized flicker starts the comparison");
+        arm(0, 0); arm(1, 0); arm(2, .14f);
+        check(trial.Comparison().Current() == Phase::Rejected && !trial.Comparison().RuledOut() &&
+              trial.Comparison().Outcome() == TrialOutcome::Insufficient,
+              "both APIs: an inconsistent recheck ends without a verdict");
+        now += 1000; ordinal += 10; witness();
+        check(!trial.Begin(scope, sample, ordinal, now), "both APIs: the repeat waits");
+        now += 60000; ordinal += 10; witness();
+        check(trial.Begin(scope, sample, ordinal, now), "both APIs: fresh evidence reopens an inconclusive placement");
+        // A receipt older than the freshness window is counted against the phase.
+        ordinal += RouteTrial::warmup_frames + 2;
+        sample.ordinal = ordinal; sample.observed_at = now; sample.change[13].fill(.24f);
+        const auto ticket = trial.Ticket(ordinal);
+        trial.Add(scope, ticket, sample, ordinal, now + 5000);
+        trial.Refused(TrialGate::Scope);
+        check(trial.Comparison().Evidence().refused[unsigned(TrialGate::Stale)] == 1 &&
+              trial.Comparison().Evidence().refused[unsigned(TrialGate::Scope)] == 1 &&
+              trial.Comparison().Evidence().receipts == 2,
+              "both APIs: stale and wrong-scene receipts are counted by their own gates");
+        ++ordinal; now += 10;
+        arm(0, 0); arm(1, 0); arm(2, .24f);
+        check(trial.Comparison().Current() == Phase::Kept && trial.UsesCandidate(),
+              "both APIs: the retried placement is kept once the symptom recurs");
+    }
+}
+
 void TestStageRecovery()
 {
     {
@@ -1121,6 +1287,7 @@ int main()
 {
     TestPictureScoring();
     TestRouteTrials();
+    TestRetryAndReasons();
     TestStageRecovery();
     TestRotatingRoles();
     std::printf("referee_test: %s (%d failures)\n", failures ? "FAILED" : "ok", failures);

@@ -80,3 +80,11 @@ $residual = @(Get-RefereeSummary @(
 ))
 if (-not ($residual -like '*region 11, below the 90% target*') -or -not ($residual -like '*Both corrections reduced the original flicker*in region 12*') -or
     -not ($residual -like '*Jitter-aligned edge movement measured at (1120,380)*')) { throw 'Lost verified reduction or geometry in the results' }
+$ended = @(Get-RefereeSummary @(
+    'event dx12_route_trial next_frame=900 phase=rejected region=18 stops=0.250/0.070/0.000 regional=0 verified_reduction=-1.0000 why=timed out: the view kept changing'
+    'event referee_evidence owner=dx12_route frame=900 phase=replacement now=rejected outcome=insufficient_evidence receipts=8 used=0 decisive=view_changed retries=0 refused=view_changed:8'
+))
+if (-not ($ended -like '*not enough evidence (1)*') -or
+    -not ($ended -like '*0 of 8 screen checks were usable; main blocker: the view kept changing. It can be tried again.*')) {
+    throw 'Missing the reason an ended comparison lacked evidence'
+}

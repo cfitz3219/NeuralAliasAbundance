@@ -30,6 +30,30 @@ inline uint64_t EvaluationConfiguration(uint32_t preset, uint32_t cf, uint32_t d
     return hash;
 }
 
+// One line per trial transition, identical on both APIs: what the phase that
+// just ended established, how many screen receipts it was offered, how many
+// it could use and which gate refused the rest. `owner` names the caller.
+inline void EmitTrialEvidence(const char* owner, uint64_t frame, const RouteTrial& trial)
+{
+    const auto& evidence = trial.Evidence();
+    char refused[256] = "none";
+    size_t at = 0;
+    for (unsigned i = 0; i < evidence.refused.size(); ++i) {
+        if (!evidence.refused[i] || at >= sizeof(refused) - 1) continue;
+        const int wrote = std::snprintf(refused + at, sizeof(refused) - at, "%s%s:%u", at ? "," : "",
+                                        TrialGateName(static_cast<TrialGate>(i)), evidence.refused[i]);
+        if (wrote <= 0) break;
+        at = (std::min)(sizeof(refused) - 1, at + size_t(wrote));
+    }
+    const auto decisive = evidence.Decisive();
+    eventlog::Emit("referee_evidence",
+        "owner=%s frame=%llu phase=%s now=%s outcome=%s receipts=%u used=%u decisive=%s retries=%u refused=%s",
+        owner, (unsigned long long)frame, trial.EvidencePhase(), trial.Name(), TrialOutcomeName(trial.Outcome()),
+        evidence.receipts, evidence.Used(),
+        !evidence.receipts ? "no_receipt" : decisive == TrialGate::Count ? "none" : TrialGateName(decisive),
+        trial.InconclusiveAttempts(), refused);
+}
+
 // Both API adapters poll the same bounded GPU mailbox after closing a frame.
 // Each adapter supplies its own scratch sample under its existing render lock.
 template<class Reader, class Accept>
@@ -63,9 +87,11 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
         if (!on_kept_route || !placement.AllowsStageRecovery()) {
             recovery.Suspend();
             const auto ticket = placement.Ticket(frame);
-            if (ticket && read(ticket, sample) && accept(sample, true, placement.UsesCandidate())) {
-                if (!placement.UsesCandidate()) placement.ObserveIncumbent(sample);
-                placement.Add(scope, ticket, sample, frame, now);
+            if (ticket && read(ticket, sample)) {
+                if (accept(sample, true, placement.UsesCandidate())) {
+                    if (!placement.UsesCandidate()) placement.ObserveIncumbent(sample);
+                    placement.Add(scope, ticket, sample, frame, now);
+                } else placement.Refused(TrialGate::Scope);
             }
             return;
         }
@@ -111,6 +137,7 @@ void AdvancePlacement(PlacementTrial& placement, PlacementTrial::Scope scope, bo
             exhausted_now ? "no_matching_tool" : recovery.Busy() ? trial.Name() : "restored",
             unsigned(recovery.Excluded()), trial.Baseline(), trial.Candidate(), trial.Confirmation(),
             recovery.Busy() ? trial.VerifiedReduction() : -1.f, total, recovery.Reason());
+        if (!exhausted_now) EmitTrialEvidence("recovery", frame, trial);
     }
 }
 } // namespace na::referee

@@ -146,10 +146,12 @@ public:
 
     void Add(Scope scope, uint64_t ticket, const TrialSample& sample, uint64_t frame, uint64_t now)
     {
-        if (!Matches(scope) || !Fresh(sample, frame, now) || (sample.broad_light && !independently_verified_)) return;
+        if (!Matches(scope)) return;
+        if (!Fresh(sample, frame, now)) { trial_.Note(TrialGate::Stale); return; }
+        if (sample.broad_light && !independently_verified_) { trial_.Note(TrialGate::Incomparable); return; }
         if (!UsesCandidate() && sample.comparable && ticket == trial_.Ticket(sample.ordinal)) {
             if (incumbent_.path == shadow::Path::None) incumbent_ = sample.context.placement;
-            else if (!(incumbent_ == sample.context.placement)) return;
+            else if (!(incumbent_ == sample.context.placement)) { trial_.Note(TrialGate::Scope); return; }
         }
         trial_.Add(ticket, sample, frame + 1);
         if (trial_.WasStructural() && trial_.RuledOut() && !Damaged(scope)) {
@@ -160,6 +162,8 @@ public:
         if (!configuration_ && sample.comparable && ticket == trial_.Ticket(sample.ordinal)) Remember(sample);
         if (trial_.Current() == Phase::Rejected) next_attempt_ = now + 8000;
     }
+    // The adapter's own scene test refused a receipt meant for this trial.
+    void Refused(TrialGate gate) { trial_.Note(gate); }
     static bool ShowsFlicker(const TrialSample& sample)
     {
         return sample.comparable && sample.delivered && std::any_of(sample.change.begin(), sample.change.end(),

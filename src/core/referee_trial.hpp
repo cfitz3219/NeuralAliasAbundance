@@ -167,6 +167,51 @@ inline bool MeasureTrialScreen(const float* before, const float* after, TrialSam
     return sample.broad_light;
 }
 
+// Why a screen receipt did not advance a phase. The owner of each gate counts
+// its own refusals, so a phase that runs out of time can name what blocked it.
+enum class TrialGate : uint8_t {
+    Experiment, // receipt carried another trial's ticket, or repeated a pair
+    Stale,      // receipt was too old to describe the current picture
+    Scope,      // receipt showed a different scene or route than the one on trial
+    Incomparable, // the two frames of the pair could not be compared
+    Undelivered,  // the replacement was not confirmed on the screen
+    Invalid,    // non-finite measurement
+    View,       // the camera or picture moved away from the measured view
+    Region,     // the disputed output area could not be verified
+    Symptom,    // the full window did not show the recurring symptom
+    Motion,     // no usable motion measurement for a motion control
+    Count
+};
+inline const char* TrialGateName(TrialGate gate)
+{
+    constexpr const char* names[] = {"other_experiment", "stale", "other_scope", "not_comparable", "not_delivered",
+                                     "invalid", "view_changed", "region_unverified", "symptom_absent", "no_motion"};
+    return names[static_cast<unsigned>(gate)];
+}
+struct TrialEvidence {
+    uint32_t receipts = 0; // screen receipts offered to the phase
+    std::array<uint32_t, static_cast<unsigned>(TrialGate::Count)> refused{};
+    uint32_t Used() const
+    {
+        uint32_t total = 0;
+        for (auto n : refused) total += n;
+        return receipts - (std::min)(receipts, total);
+    }
+    // The gate that refused the most receipts; Count when none did.
+    TrialGate Decisive() const
+    {
+        const auto most = std::max_element(refused.begin(), refused.end());
+        return *most ? static_cast<TrialGate>(most - refused.begin()) : TrialGate::Count;
+    }
+};
+// What a finished comparison established. Only Harm excludes the candidate.
+enum class TrialOutcome : uint8_t { Pending, Improved, Harm, Insufficient, Unavailable };
+inline const char* TrialOutcomeName(TrialOutcome outcome)
+{
+    constexpr const char* names[] = {"pending", "improved", "harm", "insufficient_evidence", "unavailable"};
+    return names[static_cast<unsigned>(outcome)];
+}
+
 // VARIANT: referee/controlled-route-trial
 // API adapters provide a proved candidate and the ability to restore the
 // incumbent. Three runs share a screen region and a registered scene.
@@ -177,12 +222,21 @@ public:
     static constexpr float minimum_flicker = .12f;
     static constexpr float residual_fraction = .10f;
     static constexpr uint64_t warmup_frames = 16, maximum_ms = 18000;
+    // VARIANT: referee/inconclusive-retry
+    // A comparison that ended without a verdict (the original symptom did not
+    // return on the recheck, or one unrelated change spoiled the window) says
+    // nothing against the candidate. It may run again on fresh evidence after
+    // a growing wait, at most this many times for one scope and setup.
+    // Demonstrated harm (RuledOut) is never reopened here.
+    static constexpr unsigned inconclusive_limit = 3;
 
     void Start(uint64_t id, uint64_t frame, uint64_t now)
     {
         const auto delay = retry_delay_;
+        const auto inconclusive = inconclusive_;
         *this = {};
         retry_delay_ = delay;
+        inconclusive_ = inconclusive;
         now_ = now;
         id_ = id;
         Next(Phase::Baseline, frame);
@@ -269,16 +323,35 @@ public:
             // loss ends the keep; one missed submission does not.
             if (!Structural()) return;
             missed_ = available ? 0 : missed_ + 1;
-            if (missed_ >= missed_limit) Retry("the role-following route stopped delivering");
+            if (missed_ >= missed_limit) Retry("the role-following route stopped delivering", TrialOutcome::Unavailable);
             return;
         }
-        if (UsesCandidate() && !available) Retry("replacement lost its screen route");
+        if (UsesCandidate() && !available) Retry("replacement lost its screen route", TrialOutcome::Unavailable);
         if (phase_ == Phase::Kept && regional_ && now - regional_seen_ >= maximum_ms) Retry("regional screen evidence expired");
-        if (Active() && now >= expires_) Retry("timed out without comparable presented evidence");
+        if (Active() && now >= expires_) Retry(TimeoutReason());
     }
+    // A gate outside this class (freshness, scene ownership, motion) refused a
+    // receipt that was meant for the running phase.
+    void Note(TrialGate gate)
+    {
+        if (!Active()) return;
+        ++live_.receipts;
+        ++live_.refused[static_cast<unsigned>(gate)];
+    }
+    // Evidence of the phase that most recently ended (or of the running one).
+    const TrialEvidence& Evidence() const { return Active() ? live_ : closed_; }
+    const char* EvidencePhase() const
+    {
+        constexpr const char* names[] = {"idle", "baseline", "replacement", "baseline_recheck", "kept", "rejected"};
+        return names[static_cast<unsigned>(Active() ? phase_ : closed_phase_)];
+    }
+    TrialOutcome Outcome() const { return outcome_; }
+    unsigned InconclusiveAttempts() const { return inconclusive_; }
     void Add(uint64_t ticket, const TrialSample& sample, uint64_t next_frame)
     {
-        if (!ticket || ticket != Ticket(sample.ordinal) || sample.ordinal <= last_ordinal_) return;
+        if (!ticket) return;
+        if (ticket != Ticket(sample.ordinal) || sample.ordinal <= last_ordinal_) { Note(TrialGate::Experiment); return; }
+        if (Active()) ++live_.receipts;
         last_ordinal_ = sample.ordinal;
         if ((baseline_ || regional_) && !SameSetup(anchor_, sample)) {
             Retry("the display layout or evaluation settings changed");
@@ -296,6 +369,7 @@ public:
             return;
         }
         if (!sample.comparable || (UsesCandidate() && !sample.delivered && !regional_)) {
+            Refuse(sample.comparable ? TrialGate::Undelivered : TrialGate::Incomparable);
             if (regional_ && Active()) count_ = lost_region_ = 0;
             if (Structural()) { count_ = 0; prior_detail_loss_ = 0; }
             watch_same_ = watch_opposite_ = 0;
@@ -305,12 +379,13 @@ public:
         if (!std::all_of(sample.change.begin(), sample.change.end(), [&](const auto& region) {
                 return std::all_of(region.begin(), region.end(), finite);
             }) ||
-            !std::all_of(sample.image.begin(), sample.image.end(), finite)) return;
+            !std::all_of(sample.image.begin(), sample.image.end(), finite)) { Refuse(TrialGate::Invalid); return; }
         if (structural_) {
             KeepStructural(sample);
             return;
         }
         if ((targeted_ || phase_ != Phase::Baseline) && !SameView(anchor_, sample)) {
+            Refuse(TrialGate::View);
             if (regional_ && Active()) count_ = 0;
             watch_same_ = watch_opposite_ = 0;
             return;
@@ -330,6 +405,7 @@ public:
                 return;
             }
             if (match != RegionalTiles::Match::Improved) {
+                Refuse(TrialGate::Region);
                 count_ = 0;
                 if (phase_ == Phase::Kept) {
                     if (++lost_region_ >= 2) Retry("regional delivery could no longer be verified");
@@ -422,6 +498,7 @@ public:
                 comparable = anchor_.tiles.Compare(window_[i].tiles) == RegionalTiles::Match::Original;
             for (unsigned i = 0; comparable && i < count_; ++i) comparable = SameView(anchor_, window_[i]);
             if (!comparable) {
+                Refuse(TrialGate::Symptom);
                 if (count_ == window_.size()) {
                     for (unsigned i = 1; i < count_; ++i) window_[i - 1] = window_[i];
                     --count_;
@@ -434,12 +511,14 @@ public:
             } else {
                 confirmation_ = strongest;
                 if (!spatial_only_ && (!Improves(confirmation_) || confirmation_ < baseline_ * .67f || confirmation_ > baseline_ * 1.5f)) {
-                    Reject("the original flicker did not return consistently");
+                    Inconclusive("the original flicker did not return consistently");
                     return;
                 }
                 if (!targeted_ && !regional_) SelectResidualRegion();
                 Next(Phase::Kept, next_frame);
                 retry_delay_ = 8000;
+                inconclusive_ = 0;
+                outcome_ = TrialOutcome::Improved;
                 regional_seen_ = now_;
                 reason_ = regional_ ? "disputed tiles switched to reconstructed detail, clear controls held, and the original bypass returned on recheck" :
                     "the replacement reduced flicker against both ordinary-route measurements";
@@ -460,7 +539,7 @@ public:
                 return;
             }
             if (spatial_only_ && replacement_ >= minimum_flicker) {
-                Reject("new visible variation during the regional replacement");
+                Inconclusive("new visible variation during the regional replacement");
                 return;
             }
             if (!spatial_only_ && !Improves(baseline_)) {
@@ -473,8 +552,8 @@ public:
                     ruled_out_ = !ImprovesWith(severity, baseline_);
                 }
                 if (!ruled_out_ && count_ < window_.size()) return;
-                Reject(ruled_out_ ? "the replacement did not improve the presented picture" :
-                                    "an isolated change prevented a reliable verdict");
+                if (ruled_out_) Reject("the replacement did not improve the presented picture");
+                else Inconclusive("an isolated change prevented a reliable verdict");
                 return;
             }
             if (!targeted_ && !regional_) {
@@ -625,8 +704,39 @@ private:
             }
         }
     }
+    void Refuse(TrialGate gate)
+    {
+        if (Active()) ++live_.refused[static_cast<unsigned>(gate)];
+    }
+    void Close()
+    {
+        if (!Active()) return;
+        closed_ = live_;
+        closed_phase_ = phase_;
+        live_ = {};
+    }
+    // Name the gate that kept the phase from finishing instead of one generic
+    // timeout. Zero receipts is its own answer.
+    const char* TimeoutReason() const
+    {
+        if (!live_.receipts) return "timed out: no screen receipt arrived for this phase";
+        switch (live_.Decisive()) {
+        case TrialGate::Experiment: return "timed out: the receipts belonged to another experiment";
+        case TrialGate::Stale: return "timed out: the receipts were too old to use";
+        case TrialGate::Scope: return "timed out: the receipts showed a different scene or route";
+        case TrialGate::Incomparable: return "timed out: the frame pairs could not be compared";
+        case TrialGate::Undelivered: return "timed out: the replacement was not confirmed on the screen";
+        case TrialGate::Invalid: return "timed out: the measurements were not finite";
+        case TrialGate::View: return "timed out: the view kept changing";
+        case TrialGate::Region: return "timed out: the disputed output area could not be verified";
+        case TrialGate::Symptom: return "timed out: the symptom did not recur in a full window";
+        case TrialGate::Motion: return "timed out: no usable motion measurement arrived";
+        default: return "timed out: too few usable screen receipts to fill a window";
+        }
+    }
     void Next(Phase phase, uint64_t frame)
     {
+        Close();
         phase_ = phase;
         count_ = lost_region_ = 0;
         // A slow but conclusive baseline must leave the candidate its own
@@ -634,12 +744,25 @@ private:
         expires_ = now_ + maximum_ms;
         measured_from_ = frame + warmup_frames;
     }
-    void Reject(const char* reason) { phase_ = Phase::Rejected; reason_ = reason; }
-    void Retry(const char* reason)
+    void Reject(const char* reason, TrialOutcome outcome = TrialOutcome::Insufficient)
     {
-        Reject(reason);
+        Close();
+        phase_ = Phase::Rejected;
+        reason_ = reason;
+        outcome_ = ruled_out_ ? TrialOutcome::Harm : outcome;
+    }
+    void Retry(const char* reason, TrialOutcome outcome = TrialOutcome::Insufficient)
+    {
+        Reject(reason, outcome);
         retry_at_ = now_ + retry_delay_;
         retry_delay_ = (std::min)(retry_delay_ * 2, uint64_t{60000});
+    }
+    // No verdict either way: allow a bounded number of fresh attempts.
+    void Inconclusive(const char* reason)
+    {
+        if (inconclusive_ >= inconclusive_limit) { Reject(reason); return; }
+        ++inconclusive_;
+        Retry(reason);
     }
     bool ImprovesWith(float replacement, float ordinary) const
     {
@@ -708,6 +831,10 @@ private:
     float flicker_floor_ = minimum_flicker;
     float residual_baseline_ = 0.f;
     const char* reason_ = "";
+    unsigned inconclusive_ = 0;
+    TrialOutcome outcome_ = TrialOutcome::Pending;
+    TrialEvidence live_{}, closed_{};
+    Phase closed_phase_ = Phase::Idle;
     TrialSample anchor_;
     static constexpr unsigned incumbent_window = 8;
     std::array<unsigned, incumbent_window> window_views_{};

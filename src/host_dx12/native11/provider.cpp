@@ -3101,6 +3101,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                 (unsigned long long)g_frame, trial.Name(), trial.Region(),
                 trial.Baseline(), trial.Candidate(), trial.Confirmation(), unsigned(trial.Regional()),
                 trial.VerifiedReduction(), trial.Reason());
+        if (before != trial.Current()) referee::EmitTrialEvidence("native11_route", g_frame, trial);
         g_lit.steer = g_lit.steer && g_placement.UsesCandidate();
     } else {
         g_placement.ClearPresentation();

@@ -119,6 +119,28 @@ function Get-RefereeSummary([string[]] $Lines) {
             $out.Add(('  Measured {0:P1} less brightness variation in region {1}, {2} for that region.' -f $reduction, $primaryRegion, $goal))
         }
     }
+    $evidence = @($Lines | Where-Object { $_ -match '\breferee_evidence owner=\w+ frame=\d+ phase=\w+ now=rejected ' })
+    if ($evidence) {
+        $outcomes = $evidence | ForEach-Object { if ($_ -match '\boutcome=(\w+)') { $Matches[1] } } | Group-Object
+        $labels = @{ harm = 'made the picture worse'; insufficient_evidence = 'not enough evidence'; unavailable = 'replacement could not run' }
+        $out.Add('  Ended comparisons: ' + (($outcomes | ForEach-Object {
+            $label = if ($labels.ContainsKey($_.Name)) { $labels[$_.Name] } else { $_.Name }
+            "$label ($($_.Count))" }) -join ', ') + '.')
+        if ($evidence[-1] -match 'owner=(\w+) frame=\d+ phase=(\w+) now=\w+ outcome=(\w+) receipts=(\d+) used=(\d+) decisive=(\w+) retries=(\d+) refused=(\S+)') {
+            $gates = @{
+                no_receipt = 'no screen check arrived'; other_experiment = 'the screen checks belonged to another comparison'
+                stale = 'the screen checks were too old'; other_scope = 'the screen checks showed a different scene or route'
+                not_comparable = 'the frame pairs could not be compared'; not_delivered = 'the replacement was not confirmed on screen'
+                invalid = 'the measurements were not usable numbers'; view_changed = 'the view kept changing'
+                region_unverified = 'the disputed area could not be verified'; symptom_absent = 'the symptom did not come back'
+                no_motion = 'no motion measurement arrived'; none = 'nothing was refused'
+            }
+            $block = if ($gates.ContainsKey($Matches[6])) { $gates[$Matches[6]] } else { $Matches[6] }
+            $phase = $Matches[2] -replace '_', ' '
+            $again = if ($Matches[3] -eq 'harm') { 'It will not be tried again for this scene.' } else { 'It can be tried again.' }
+            $out.Add("  Last ended comparison ($($Matches[1]), $phase phase): $($Matches[5]) of $($Matches[4]) screen checks were usable; main blocker: $block. $again")
+        }
+    }
     if ($layerOrder) { $out.Add($layerOrder) }
     if ($recovery) {
         $names = @{

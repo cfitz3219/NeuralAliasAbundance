@@ -8952,6 +8952,8 @@ void OnPresent(ID3D12CommandQueue* queue, na::referee::gpu::Presentation* receip
                     comparison.Baseline(), comparison.Candidate(), comparison.Confirmation(),
                     unsigned(comparison.Regional()), comparison.VerifiedReduction(),
                     placement_invalidated ? "the scene or comparison scope changed" : comparison.Reason());
+            if (comparison.Current() != previous_phase && !placement_invalidated)
+                referee::EmitTrialEvidence("dx12_route", g.frame + 1, comparison);
             const auto& d = g.router.OnFrame(o, placement.OwnsComparison());
             g.frame_agg.Reset();
             auto& r = g.stats.route;

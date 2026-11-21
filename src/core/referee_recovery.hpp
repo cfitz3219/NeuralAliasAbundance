@@ -114,14 +114,20 @@ public:
             // Pass it to the comparison even when this pair has no usable
             // motion measurement. Unknown delivery still needs the usual evidence.
             if (!(candidate && s.bypassed) && (tool_ == Tool::ScreenFit || tool_ == Tool::CameraResidual)) {
-                if (!(s.motion_error >= 0)) return;
+                if (!(s.motion_error >= 0)) { trial_.Note(TrialGate::Motion); return; }
                 if (candidate && s.motion_error > original_motion_ * 1.30f + .025f) {
                     if (++motion_losses_ >= 2) { Finish(now, true, "motion predicted the image less accurately"); return; }
                 } else motion_losses_ = 0;
             }
-            if (!candidate && (!s.delivered || !s.comparable)) return;
+            if (!candidate && (!s.delivered || !s.comparable)) {
+                trial_.Note(s.comparable ? TrialGate::Undelivered : TrialGate::Incomparable);
+                return;
+            }
             if (!candidate && s.origin.stage != FlickerStage::Unknown &&
-                (s.origin.stage != e.example.origin.stage || s.origin.region != e.example.origin.region)) return;
+                (s.origin.stage != e.example.origin.stage || s.origin.region != e.example.origin.region)) {
+                trial_.Note(TrialGate::Symptom);
+                return;
+            }
             trial_.Add(ticket, s, next_frame);
             if (s.comparable && s.delivered) last_witness_ = now;
             if (trial_.Current() == RouteTrial::Phase::Rejected) Finish(now, trial_.RuledOut(), trial_.Reason());
