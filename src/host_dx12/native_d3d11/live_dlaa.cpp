@@ -1035,7 +1035,15 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         const auto phase = static_cast<uint32_t>(frame.frame);
         const auto sample = native11::DlaaJitterSample(phase, settings::Get().j2_jitter_r2.load() != 0);
         // The matched depth and material raster can use the full sequence.
-        const auto amount = !frame.raster.shader_depth_aligned && !debug_jitter.value &&
+        // VARIANT: referee/sample-locked-dropout
+        // The Referee's reaction to pixels that drop out on some samples: the meshes the fixed rules
+        // left on the game's grid take the sample too, and the sample stays at full strength while
+        // it tries or keeps that (a weaker sample would hide the dropouts it is checking for).
+        const bool still_meshes = !debug_jitter.value && referee::gpu::SceneStillMeshes(frame.presentation_source,
+            referee::shadow::Path::Native11, frame.color.incarnation, frame.depth.incarnation, frame.scene_stream,
+            frame.frame, frame.screen_proof);
+        native11::SetStillMeshJitter(still_meshes);
+        const auto amount = !frame.raster.shader_depth_aligned && !still_meshes && !debug_jitter.value &&
             frame.recovery_tool == referee::RecoveryTool::None &&
             referee::RouteTrial::WatchTicket(frame.trial_ticket)
             ? referee::gpu::SceneJitterAmount(frame.presentation_source, referee::shadow::Path::Native11,

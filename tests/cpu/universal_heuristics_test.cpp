@@ -244,6 +244,30 @@ int main(int argc,char** argv) {
                  CHECK(!f.h.RankDepth(1).empty() && f.h.RankDepth(1)[0].score == 0);
              }
          }},
+        {"a scene that cannot be taken as a placed picture says what stood in the way", [] {
+             using Why = na::discovery::UniversalHeuristics::RefusedRegion::Why;
+             const auto run = [](uint32_t w, uint32_t hgt, uint32_t samples) {
+                 Feed f;
+                 f.Swapchain(3440, 1440);
+                 f.Resource(3, w, hgt, 40, samples);
+                 f.Resource(6, w, hgt, 10, samples);
+                 f.Pipeline(10, 1, 1, 0);
+                 f.Reset();
+                 f.SetPipeline(10);
+                 f.Targets({6}, 3);
+                 for (int i = 0; i < 30; ++i) f.Draw(900);
+                 f.Execute();
+                 f.Present();
+                 return std::make_pair(f.h.ScreenRegionPair(), f.h.RefusedScreenRegion());
+             };
+             const auto msaa = run(2560, 1440, 4);
+             CHECK(!msaa.first.second && msaa.second.why == Why::Multisampled && msaa.second.samples == 4 &&
+                   msaa.second.width == 2560 && msaa.second.height == 1440);
+             const auto small = run(1920, 1080, 1);
+             CHECK(!small.first.second && small.second.why == Why::SmallerBothWays && small.second.width == 1920);
+             const auto placed = run(2560, 1440, 1);
+             CHECK(placed.first.second == 6 && placed.second.why == Why::None);
+         }},
         {"generic_depth picks the swapchain-aspect main depth over shadow and half-res buffers", [] {
              Feed f;
              f.Swapchain(1920, 1080);

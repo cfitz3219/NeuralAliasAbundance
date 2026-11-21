@@ -752,6 +752,43 @@ int main()
                "a game that draws its scene into one target keeps the most-drawn rule");
     }
 
+    // A scene that is not the screen's shape: taken as a picture placed inside the screen when it can
+    // be, and otherwise the model says what stood in the way (WHY log, no behaviour).
+    {
+        const auto run = [](uint32_t w, uint32_t h, uint32_t samples, bool detect, FrameModel& m) {
+            m.SetSwapChainSize(3440, 1440);
+            m.SetInfo(kDepth, {w, h, 0, samples, true});
+            m.SetInfo(kColor, {w, h, 0, samples, false});
+            m.SetInfo(kBackBuffer, {3440, 1440, 0, 1, false});
+            for (int frame = 0; frame < 4; ++frame) {
+                for (int i = 0; i < 40; ++i) m.Feed(Draw(kColor, kDepth, 3000));
+                m.Feed(Read(kColor));
+                m.Feed(Draw(kBackBuffer, 0, 3));
+                m.EndFrame(false, 0, detect);
+            }
+        };
+        FrameModel placed, msaa, small, off;
+        run(2560, 1440, 1, true, placed);
+        expect(placed.Current().valid() && placed.Current().screen_region &&
+               placed.RefusedScene().why == FrameModel::NoScene::None,
+               "a picture as tall as the screen is taken as placed inside it, pending screen proof");
+        placed.DeferScreenRegion();
+        for (int i = 0; i < 40; ++i) placed.Feed(Draw(kColor, kDepth, 3000));
+        placed.EndFrame(false, 0, true);
+        expect(!placed.Current().valid() && placed.RefusedScene().why == FrameModel::NoScene::AwaitingScreenProof &&
+               placed.RefusedScene().width == 2560, "after a failed screen proof the model says it is waiting to try again");
+        run(2560, 1440, 4, true, msaa);
+        expect(!msaa.Current().valid() && msaa.RefusedScene().why == FrameModel::NoScene::Multisampled &&
+               msaa.RefusedScene().samples == 4 && msaa.RefusedScene().width == 2560 && msaa.RefusedScene().height == 1440,
+               "a multisampled placed picture is not chosen, and the model says it is the game's anti-aliasing");
+        run(1920, 1080, 1, true, small);
+        expect(!small.Current().valid() && small.RefusedScene().why == FrameModel::NoScene::SmallerBothWays &&
+               small.RefusedScene().width == 1920, "a picture smaller than the screen both ways is not chosen, and the model says so");
+        run(2560, 1440, 4, false, off);
+        expect(!off.Current().valid() && off.RefusedScene().why == FrameModel::NoScene::Multisampled,
+               "the reason is known whether or not placed pictures are being looked for");
+    }
+
     std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: DX11 frame model\n", g_failed);
     return g_failed ? 1 : 0;
 }
