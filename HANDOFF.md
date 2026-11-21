@@ -205,3 +205,8 @@ PR 193 build 50fcfe56 stages both Total War packages. Native DX11 has separate A
 ### 2026-11-21 — Three Kingdoms dark terrain patches
 
 PR 193 build d8d38932 is staged in both Total War Documents installers. The DX11 correction shares actual viewport jitter across a verified shader-readable depth producer and later material geometry. It preserves full-strength jitter for this path. Six Release checks and both temporary install and rollback fixtures passed. The COMMS evidence for Fable includes the real game captures, the game log showing the render dependency, and the RTX reproduction. Cort owns the live map check.
+
+
+### 2026-11-21 — Black Flag centred native scene discovery
+
+PR 193 build 4003c4fd is staged in the Black Flag Documents CMDs. Native DX11 can now prove a native-sized scene inside a differently shaped backbuffer. Nine final checks passed, including centred display delivery and an offscreen negative control on RTX. The isolated update and rollback passed. Cort owns the live ultrawide check. COMMS records the known game evidence and the fixture distinction.
