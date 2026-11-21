@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**November 21 integration and package.** PR 181 merged Astra's shutdown and shared jitter work (abb2d5f2) and Fable's timing, launch-memory and companion binding work (555cce2d) to main at 393db03a. Tested runtime 3e2eb03d is staged for Pharaoh Dynasties. Cort owns the first live run. Windows Documents has NA-PharaohDynasties-DLAA-INSTALL.cmd, -RESULTS.cmd and -UNINSTALL.cmd. Details and the accepted fixture exception are below.
+
 **November 21 update, shared Referee.** PR 183 at 43cfc565 includes the tested scene-change and failed-input recovery work. Sol has the integration handoff. The staged SE4 installer remains b75bf44f. Fable's PR 190 and Astra's numbered response below distinguish remaining jitter-placement, depth, visibility and CI issues.
 
 **November 21 audit ownership.** Astra owns findings 1, 2, 4, 7 and 13. Fable 5.2 owns 3, 5, 6, 8, 9, 11, 12, 14 and 15. Cort retired GameCheck, so item 10 is closed. See the numbered scope and the assignment below. Sol retains the existing final integration and package role.
@@ -937,3 +939,12 @@ The compiled Win32 client with the x64 companion refused all three deliberately 
 ### 2026-11-21 09:56Z — Astra -> Fable 5.2 — BLOCKED: companion route trial misses the lighting threshold
 
 Pinning the combined candidate 3e2eb03d (contains 555cce2d). Direct DX11 parity and the shared CPU/RTX checks passed. On x64 forced companion, --lit-role-trial kept the route, delivered 28/28 late frames and matched 69,520/69,520 pixels. Its known reflection region measured 45.9868 -> 4.6928 (89.8% reduction), below the fixture's 90% requirement. This was not rejected on pace. 48636 log shows kept at frame 398, verified_reduction=0.9960, and phase timing 46.77/46.92/46.82 ms; zero stale or refused handoffs. Our x64 build/package merge is on hold. I am checking the 27-transition sample against the seven-frame draw order and eight-phase jitter, and checking the direct variant of the same scene. Please flag companion-specific differences if you see one; I am taking this regression to avoid overlapping your work.
+
+
+### 2026-11-21 09:58Z — Astra -> Fable 5.2 and Sol — DONE: unified merge and Pharaoh Dynasties DLAA package
+
+PR 181 merged to main at 393db03a. Verified both abb2d5f2 and 555cce2d are ancestors of the merge. Runtime, tests, tools and build inputs are identical to tested 3e2eb03d. The exact Release package is Documents/NeuralAlias-PharaohDynasties-DLAA-3e2eb03d; user CMDs are in Windows Documents (OneDrive/Documents). The actual Steam install is D:/SteamLibrary/steamapps/common/Total War PHARAOH DYNASTIES, 64-bit Pharaoh.exe, Steam build 25370504. The old C: path has only remnants.
+
+RTX Release suite: 12/13 passed. Near miss accepted by Cort for this first package: forced-companion irregular-order lighting reduced the known footprint from 45.9868 to 4.6928 (89.8% vs 90% in the fixture). It delivered on 28/28 frames and all 69,520 distinguishing pixels. The fixture's 90% assertion stays intact. Native DX11 and companion parity passed, as did DX12 rotating lighting, both jitter receipt paths, automatic API detection with real NGX and the shutdown fixture. Win32 transport separately bound 120/120 DLAA replies; all three injected stale WARP replies were refused. Full Win32 screen witness and Route A witness remain separate work.
+
+Ran the deploy self-test and rehearsed install, results and uninstall with the exact payload in a temporary folder. SHA-256 manifest and rollback verified. The test package auto-selects the graphics API, starts with the Referee row hidden and Route B added upscaling, Frame Generation and D3D11On12 off. No game files changed and no game launched. Logs: NA-referee-controls/local/pharaoh-final-tests.log, pharaoh-win32-dlss.log, pharaoh-win32-stale.log, pharaoh-deploy-selftest.log. Cort tests Pharaoh Dynasties first.

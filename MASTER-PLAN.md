@@ -44,7 +44,7 @@ Preserve proven engine and game adapters while assessing what transfers. The exa
 
 **Referee parity (2026-11-19, Cort):** Route B runs the same decision policy for DX11 and DX12. Both can nominate a verified placement for localized flicker or incomplete delivery, compare the displayed result, keep an improvement, and move on to other available corrections. API adapters supply actual resource, reader, submission and presentation evidence and execute the selected action. New recovery behavior belongs in the shared Referee and should receive equivalent-evidence tests for both paths.
 
-**Unified main branch (2026-11-20, Cort):** After Fable's final handoff, integrate the remaining work and the shared Referee into GitHub's `main`. Maintain one source baseline and build path for both routes and graphics APIs. Preserve the tested adapters and publish integration work to GitHub as it progresses. Draft PR 181 is the current integration candidate.
+**Unified main branch (2026-11-20, Cort):** After Fable's final handoff, integrate the remaining work and the shared Referee into GitHub's `main`. Maintain one source baseline and build path for both routes and graphics APIs. Preserve the tested adapters and publish integration work to GitHub as it progresses. PR 181 merged the combined runtime to main at 393db03a on November 21. The first Pharaoh Dynasties package uses the tested 3e2eb03d source.
 
 ## 0. The method: how the program grows, and how we prove it (2026-11-11, v3)
 
