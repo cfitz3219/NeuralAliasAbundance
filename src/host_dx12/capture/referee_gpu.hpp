@@ -49,6 +49,9 @@ struct Presentation {
     bool await_result = false;
 };
 
+// Whether this build carries the Referee's GPU checks at all. The Home menu
+// shows the switch either way and says so when they are absent.
+bool Supported();
 // Cheap: whether the next evaluation should be offered (a sample is due or half taken).
 bool Wanted();
 // A provider can reset DLSS history between scheduled samples.

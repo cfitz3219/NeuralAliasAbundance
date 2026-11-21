@@ -38,6 +38,7 @@
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+namespace na::referee::gpu { bool Supported(); } // capture/referee_gpu.hpp
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
@@ -951,17 +952,23 @@ void DrawLiveDlaa()
     }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
-    // Cort 2026-11-18: no package shows the Referee switch until he says the false motion is dealt
-    // with. The row is built only when NA_REFEREE_MENU is asked for at configure time (default OFF).
-#if defined(NA_HAVE_REFEREE_SHADERS) && defined(NA_REFEREE_MENU)
+    // Gap audit 2026-11-21 item 5: the Referee row is part of every ordinary build
+    // (NA_REFEREE_MENU defaults ON; configure with OFF to hold it back). The switch
+    // itself still starts off and keeps whatever the player chose. A build without
+    // the Referee's GPU checks shows the row and says so, instead of hiding it.
+#if defined(NA_REFEREE_MENU)
     auto& referee_enabled = na::settings::Get().referee_enabled;
     bool referee_on = referee_enabled.load() != 0;
+    const bool referee_supported = na::referee::gpu::Supported();
     BeginRow("Referee", "Checks DLAA while you play and records its findings in the results log.", SwitchWidth());
-    if (Switch("referee", &referee_on)) {
+    ImGui::BeginDisabled(!referee_supported);
+    if (Switch("referee", &referee_on) && referee_supported) {
         referee_enabled.store(referee_on ? 1u : 0u);
         na::settings::Save();
     }
+    ImGui::EndDisabled();
     EndRow();
+    if (!referee_supported) Hint("Not available in this build: it was made without the Referee's screen checks.");
 #endif
     if (na::settings::AddedUpscalingAllowed() &&
         (na::scale::native::Available() || na::scale::SliderRouteActive() ||

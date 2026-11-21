@@ -962,6 +962,15 @@ void reset_evidence_locked()
 
 } // namespace
 
+bool Supported()
+{
+#ifdef NA_HAVE_REFEREE_SHADERS
+    return true;
+#else
+    return false;
+#endif
+}
+
 void NotifyEvaluationReset()
 {
     if (!enabled()) return;

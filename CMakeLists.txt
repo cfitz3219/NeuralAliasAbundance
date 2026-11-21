@@ -42,7 +42,7 @@ endif()
 # 32-bit games (a 32-bit copy of the in-game half beside a 64-bit DLAA companion) are being
 # brought up: NA_ALLOW_X86 lets a Win32 configure through so CI can list what does not build yet.
 option(NA_ALLOW_X86 "Allow a 32-bit (Win32) configure of the host while 32-bit support is brought up" OFF)
-option(NA_REFEREE_MENU "Show the Referee switch on the Home menu (held back until Cort says so)" OFF)
+option(NA_REFEREE_MENU "Show the Referee switch on the Home menu (the switch itself starts off; OFF hides the row)" ON)
 if(NA_REFEREE_MENU)
   add_compile_definitions(NA_REFEREE_MENU)
 endif()
