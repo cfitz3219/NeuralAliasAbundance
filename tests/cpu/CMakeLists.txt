@@ -54,6 +54,27 @@ na_add_cpu_test(matrix_candidates)
 na_add_cpu_test(universal_heuristics)
 na_add_cpu_test(scene_pick)
 na_add_cpu_test(camera_fit_basis)
+na_add_cpu_test(total_motion "${NA_CPU_ROOT}/src/core/motion_arbiter.cpp")
+na_add_cpu_test(depth_direction)
+# R3: can AMD's pyramid search follow the flow fixtures' pictures (CPU model of the pinned shaders)?
+na_add_cpu_test(flow_fixture_pictures)
+set_tests_properties(na.cpu.flow_fixture_pictures PROPERTIES TIMEOUT 120)
+na_add_cpu_test(flow_candidates)
+set_tests_properties(na.cpu.flow_candidates PROPERTIES TIMEOUT 240)
+# The screen's own motion: the lens-free whole-picture fit that pixels the pictures cannot measure follow.
+na_add_cpu_test(screen_motion)
+set_tests_properties(na.cpu.screen_motion PROPERTIES TIMEOUT 120)
+# The captures folder's budget: oldest folders first, never the run in progress.
+na_add_cpu_test(capture_retention)
+# Scene depth with the raster jitter taken back out, for the game's own shader reads (far marks and lamp pools that switch with the jitter).
+na_add_cpu_test(depth_unjitter)
+# Draw replay's vertex budget: about the budget a frame, the same draws in adjacent frames.
+na_add_cpu_test(replay_budget)
+na_add_cpu_test(replay_movers)
+# The referee's scoring (stage 1 of the unify plan): picture, result, motion, jitter on known pictures.
+na_add_cpu_test(referee)
+add_executable(na_referee_replay referee_replay.cpp)
+target_link_libraries(na_referee_replay PRIVATE na_cpu_test_options)
 na_add_cpu_test(pass_map)
 na_add_cpu_test(live_judge)
 na_add_cpu_test(camera_tracker "${NA_CPU_ROOT}/src/core/motion_arbiter.cpp")
@@ -156,11 +177,19 @@ if(WIN32 AND MSVC AND TARGET host_observe_producers)
   add_test(NAME na.host.observe_exit COMMAND na_observe_exit)
   set_tests_properties(na.host.observe_exit PROPERTIES LABELS "host;capture" TIMEOUT 10)
   add_library(na_discovery_diagnostics STATIC "${NA_CPU_ROOT}/src/providers/discovery/diagnostic_adapter.cpp")
-  target_link_libraries(na_discovery_diagnostics PUBLIC na_cpu_test_options host_observe_producers)
+  target_link_libraries(na_discovery_diagnostics PUBLIC na_cpu_test_options host_observe_producers host_settings)
   add_executable(na_diagnostic_adapter diagnostic_adapter_test.cpp)
   target_link_libraries(na_diagnostic_adapter PRIVATE na_discovery_diagnostics dxgi d3dcompiler)
   add_test(NAME na.host.diagnostic_adapter COMMAND na_diagnostic_adapter)
+  add_test(NAME na.host.diagnostic_adapter_camera_off COMMAND na_diagnostic_adapter --camera-off)
+  set_tests_properties(na.host.diagnostic_adapter_camera_off PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
+  add_test(NAME na.host.diagnostic_adapter_camera_live COMMAND na_diagnostic_adapter --camera-live)
+  set_tests_properties(na.host.diagnostic_adapter_camera_live PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
   set_tests_properties(na.host.diagnostic_adapter PROPERTIES LABELS "host;capture" TIMEOUT 30 SKIP_RETURN_CODE 77)
+  # The three runs are one executable writing one settings file and one log beside it, and each
+  # refuses to start when that settings file is already there: never two at once.
+  set_tests_properties(na.host.diagnostic_adapter na.host.diagnostic_adapter_camera_off na.host.diagnostic_adapter_camera_live
+    PROPERTIES RESOURCE_LOCK na_diagnostic_adapter_files)
   if(Python3_Interpreter_FOUND AND NA_GAME_ADAPTER_LIB STREQUAL "na_discovery_diagnostics")
     add_test(NAME na.host.diagnostic_dll_exit COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_LIST_DIR}/test_diagnostic_dll_exit.py" "$<TARGET_FILE:NeuralAliasDXGI>")
@@ -218,6 +247,7 @@ if(WIN32 AND MSVC AND TARGET host_observe_producers AND EXISTS "${NA_CPU_ROOT}/s
   set_tests_properties(na.host.sample_worker_wakeup PROPERTIES LABELS "host;capture" TIMEOUT 15 SKIP_RETURN_CODE 77)
 endif()
 na_add_cpu_test(native11_sampler_policy)
+na_add_cpu_test(anisotropic_auto)
 na_add_cpu_test(native11_texture_policy)
 na_add_cpu_test(texture_subresources_v1)
 na_add_cpu_test(material_manifest_reader)

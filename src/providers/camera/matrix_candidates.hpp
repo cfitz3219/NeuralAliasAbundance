@@ -144,21 +144,85 @@ inline Matrix LoadMatrix(const std::vector<uint8_t>& bytes,size_t offset,Layout 
     }
     return m;
 }
-// Marks candidates whose inverse lies in the same snapshot, searched at 16-byte
-// steps (constant-buffer register packing) within 4 KiB of the candidate.
-inline void FindInversePairs(const Snapshot& s,Scan& result) {
-    if(s.bytes.size()<128) return;
-    for(auto& c:result.candidates) {
-        const uint64_t local=c.byte_offset-s.base_offset;
-        const uint64_t lo=local>4096 ? ((local-4096)&~uint64_t(15)) : 0;
-        const uint64_t hi=std::min<uint64_t>(s.bytes.size()-64,local+4096);
-        for(uint64_t off=lo;off<=hi;off+=16) {
-            if(off+64>local && off<local+64) continue; // overlaps the candidate itself
-            if(IsInversePair(c.matrix,LoadMatrix(s.bytes,static_cast<size_t>(off),c.layout))) {
-                c.has_inverse_pair=true;c.inverse_byte_offset=s.base_offset+off;++result.inverse_pairs;break;
-            }
+// Search the same 16-byte register grid within 4 KiB of the candidate.
+inline bool FindInversePair(const std::vector<uint8_t>& bytes, uint64_t base_offset, Candidate& candidate)
+{
+    if (bytes.size() < 128) return false;
+    const uint64_t local = candidate.byte_offset - base_offset;
+    const uint64_t lo = local > 4096 ? ((local - 4096) & ~uint64_t(15)) : 0;
+    const uint64_t hi = std::min<uint64_t>(bytes.size() - 64, local + 4096);
+    for (uint64_t offset = lo; offset <= hi; offset += 16) {
+        if (offset + 64 > local && offset < local + 64) continue;
+        if (IsInversePair(candidate.matrix, LoadMatrix(bytes, static_cast<size_t>(offset), candidate.layout))) {
+            candidate.has_inverse_pair = true;
+            candidate.inverse_byte_offset = base_offset + offset;
+            return true;
         }
     }
+    return false;
+}
+
+inline void FindInversePairs(const Snapshot& s, Scan& result)
+{
+    for (auto& candidate : result.candidates)
+        if (FindInversePair(s.bytes, s.base_offset, candidate)) ++result.inverse_pairs;
+}
+
+inline bool HasPerspectiveDirection(const uint8_t* bytes, Layout layout)
+{
+    // The projective row must have unit length in its first three entries.
+    // Test only those entries before decoding or classifying the whole matrix.
+    const size_t first = layout == Layout::RowMajor ? 12 : 3;
+    const size_t step = layout == Layout::RowMajor ? 1 : 4;
+    double norm = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        float value;
+        std::memcpy(&value, bytes + (first + i * step) * sizeof(value), sizeof(value));
+        norm += double(value) * value;
+    }
+    return Near(norm, 1, 2e-3);
+}
+
+// For callers that require a paired VP, retain FindMatrices' ordering,
+// exclusion of simple matrices and per-kind overflow rule. Classifying
+// inverse-only or rigid-view candidates cannot change this result.
+inline bool FindPairedViewProjection(const std::vector<uint8_t>& bytes, Candidate& paired)
+{
+    if (bytes.size() < 128 || bytes.size() % 4 || bytes.size() > 1024 * 1024) return false;
+    std::vector<Candidate> candidates;
+    for (size_t offset = 0; offset <= bytes.size() - 64; offset += 4) {
+        const uint8_t* block = bytes.data() + offset;
+        const bool row = HasPerspectiveDirection(block, Layout::RowMajor);
+        const bool column = HasPerspectiveDirection(block, Layout::ColumnMajor);
+        if (!row && !column) continue;
+
+        const Matrix r = LoadMatrix(bytes, offset, Layout::RowMajor);
+        const Matrix c = LoadMatrix(bytes, offset, Layout::ColumnMajor);
+        Candidate vp_row{}, vp_column{};
+        const bool row_vp = row && ViewProjection(r, vp_row);
+        const bool column_vp = column && ViewProjection(c, vp_column);
+        if (!row_vp && !column_vp) continue;
+        Candidate simple{};
+        if (Projection(r, simple) || RigidView(r, simple) || Projection(c, simple) || RigidView(c, simple)) continue;
+
+        if (row_vp) {
+            vp_row.layout = Layout::RowMajor;
+            vp_row.byte_offset = offset;
+            candidates.push_back(vp_row);
+        }
+        if (column_vp) {
+            vp_column.layout = Layout::ColumnMajor;
+            vp_column.byte_offset = offset;
+            candidates.push_back(vp_column);
+        }
+        if (candidates.size() > 256) return false;
+    }
+    for (auto& candidate : candidates) {
+        if (!FindInversePair(bytes, 0, candidate)) continue;
+        paired = candidate;
+        return true;
+    }
+    return false;
 }
 inline Scan FindMatrices(const Snapshot& s,bool allow_partial_hypotheses=false) {
     Scan result{}; result.sync = s.sync;result.partial_capture=!s.complete;

@@ -82,13 +82,38 @@ if(NA_HAVE_NGX_SDK)
   add_test(NAME host_auto_scene_proxy_present_test COMMAND auto_scene_test --proxy-present)
   set_tests_properties(host_auto_scene_proxy_present_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_compute_flow_test SOURCES j2_compute_flow_test.cpp LIBS host_dx12 LABELS gpu)
+  # The same fixture at 1920x1080, the size a game runs at (R3 of the 2026-11-16 audit). Real GPU
+  # only, like the line above: the AMD search needs 32/64-lane wave operations.
+  add_test(NAME host_j2_compute_flow_1080p_test COMMAND j2_compute_flow_test 1920)
+  set_tests_properties(host_j2_compute_flow_1080p_test PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  # Actual search -> shared candidate correction -> total motion, including reversed repeated
+  # patterns and an independently moving region. CPU candidate experiments cannot satisfy it.
+  add_test(NAME host_j2_compute_flow_ambiguity_test COMMAND j2_compute_flow_test --ambiguity)
+  set_tests_properties(host_j2_compute_flow_ambiguity_test PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  # Pixel-level replay holes, partial/nonfinite masks, flat-screen motion, known eleven-term
+  # samples, independently moving foreground and far-only depth. Hardware results, not CPU predictions.
+  add_test(NAME host_j2_screen_motion_test COMMAND j2_compute_flow_test --screen-fit --debug)
+  set_tests_properties(host_j2_screen_motion_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_flow_retention_test SOURCES j2_flow_retention_test.cpp LIBS host_dx12 LABELS gpu)
   na_host_test(draw_replay_test SOURCES draw_replay_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
+  # The same rasteriser fed by another producer's positions (the native DX11 route); WARP on the runner.
+  na_host_test(replay_motion_frame_test SOURCES replay_motion_frame_test.cpp LIBS host_dx12 dxgi d3dcompiler)
 endif()
 na_host_test(camera_fit_gpu_test SOURCES camera_fit_gpu_test.cpp LIBS core_gpu dxgi LABELS gpu)
+# The J2 flow programs, the camera-free ones included, through the real HLSL compiler (no device).
+na_host_test(j2_flow_shaders_compile_test SOURCES j2_flow_shaders_compile_test.cpp LIBS d3dcompiler)
+# The referee on the card end to end (not labelled gpu: it runs on WARP in CI).
+na_host_test(referee_gpu_test SOURCES referee_gpu_test.cpp LIBS host_capture host_settings d3dcompiler dxgi)
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
 na_host_test(scene_group_test SOURCES scene_group_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 na_host_test(depth_restore_test SOURCES depth_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
+# Scene depth with the raster jitter taken back out: the card's program against its processor reference (runs on WARP in CI).
+na_host_test(depth_unjitter_test SOURCES depth_unjitter_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
+# Depth reads end to end through the real hooks, no game (not labelled gpu: it runs on WARP in CI).
+# Needs the recording tracker (which recordings were submitted and finished), built only with the NGX headers.
+if(NA_HAVE_NGX_SDK)
+  na_host_test(depth_reads_test SOURCES depth_reads_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+endif()
 na_host_test(color_restore_test SOURCES color_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 add_test(NAME host_color_restore_warp_test COMMAND color_restore_test --warp)
 set_tests_properties(host_color_restore_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
@@ -177,6 +202,8 @@ set_tests_properties(host_on12_present_order_test PROPERTIES TIMEOUT 30 LABELS "
 set_tests_properties(host_on12_bootstrap_ownership_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(overlay_input_handover_test SOURCES overlay_input_handover_test.cpp LIBS host_dx12)
 na_host_test(overlay_boundary_fallback_test SOURCES overlay_boundary_fallback_test.cpp)
+# Home menu flicker (2026-11-20): new menu text never costs a menu frame; old font images are released by fence.
+na_host_test(menu_texture_test SOURCES menu_texture_test.cpp LIBS imgui d3d12 dxgi LABELS gpu)
 add_test(NAME host_overlay_hardware_test COMMAND overlay_test --hardware)
 set_tests_properties(host_overlay_hardware_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 
@@ -232,6 +259,12 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss dxgi)
   # J2 live DLAA end to end (discovery picks -> inserted DLAA list) on the fake runtime.
   na_host_test(j2_live_test SOURCES j2_live_test.cpp LIBS host_dx12 dxgi)
+  # The same host with no scene camera: never looked for, lost mid-play, required (fake runtime, WARP-capable).
+  na_host_test(j2_no_camera_test SOURCES j2_no_camera_test.cpp LIBS host_dx12 dxgi d3dcompiler)
+  # Only recordings the queue was really given prove the depth direction (never submitted, Reset,
+  # recorded ahead, submitted in reverse order). Needs no measured motion: WARP-capable, runs in CI.
+  add_test(NAME host_j2_no_camera_recording_proof_test COMMAND j2_no_camera_test --recording-proof)
+  set_tests_properties(host_j2_no_camera_recording_proof_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host")
   add_test(NAME host_j2_native_scale_test COMMAND j2_live_test --native-scale)
   add_test(NAME host_j2_native_scale_merged_test COMMAND j2_live_test --native-scale-merged)
   add_test(NAME host_j2_native_scale_graphics_test COMMAND j2_live_test --native-scale-graphics)
@@ -244,6 +277,10 @@ if(NA_HAVE_NGX_SDK)
   add_test(NAME host_j2_native_scale_late_composite_se5_order_tail_test COMMAND j2_live_test --native-scale-late-composite-se5-tail)
   add_test(NAME host_j2_native_scale_late_composite_se5_replace_test COMMAND j2_live_test --native-scale-late-composite-se5-replace)
   add_test(NAME host_j2_native_scale_late_composite_se5_stale_test COMMAND j2_live_test --native-scale-late-composite-se5-stale)
+  add_test(NAME host_j2_native_dlaa_screen_test COMMAND j2_live_test --native-scale-late-composite-se5-bindless-native-dlaa)
+  set_tests_properties(host_j2_native_dlaa_screen_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_j2_native_dlaa_rotating_lighting_test COMMAND j2_live_test --native-scale-late-composite-se5-bindless-native-dlaa-rotating-lighting)
+  set_tests_properties(host_j2_native_dlaa_rotating_lighting_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_j2_native_scale_late_composite_se5_bindless_test COMMAND j2_live_test --native-scale-late-composite-se5-bindless)
   add_test(NAME host_j2_native_scale_late_composite_se5_dxgi_test COMMAND j2_live_test --native-scale-late-composite-se5-dxgi)
   add_test(NAME host_j2_native_scale_late_composite_se5_unseen_test COMMAND j2_live_test --native-scale-late-composite-se5-unseen)
@@ -429,16 +466,53 @@ target_include_directories(upscaler_jitter_test PRIVATE "${PROJECT_SOURCE_DIR}/s
 
 # C8a: H1 producers on a real device (WARP on CI).
 na_host_test(observe_producers_test SOURCES observe_producers_test.cpp LIBS host_observe_producers dxgi)
+na_host_test(observe_bookkeeping_test SOURCES observe_bookkeeping_test.cpp LIBS host_observe_producers d3d12 dxgi)
+add_test(NAME host_observe_snapshot_budget_test COMMAND observe_snapshot_test --budget)
+add_test(NAME host_observe_snapshot_suppression_test COMMAND observe_snapshot_test --suppression)
+set_tests_properties(host_observe_snapshot_suppression_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
+set_tests_properties(host_observe_snapshot_budget_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS host)
 # Native DX11 route (WWII plan B1): the portable frame model of the DX11 input provider.
 na_host_test(native11_frame_model_test SOURCES native11/frame_model_test.cpp)
 if(TARGET host_native11)
   # The B1 provider on a synthetic DX11 game (hardware, else WARP): runs on the hosted runner.
   na_host_test(native11_provider_test SOURCES native11/provider_test.cpp LIBS host_native11 d3dcompiler)
+  # Draw replay on the native DX11 route (native11/draw_replay.hpp): hardware, else WARP on the runner.
+  na_host_test(native11_draw_replay_test SOURCES native11/draw_replay_test.cpp LIBS host_native11 d3d11 d3dcompiler)
+  add_test(NAME host_native11_screen_check_warp_test COMMAND native11_provider_test --screen-check-warp)
+  set_tests_properties(host_native11_screen_check_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host")
+  add_test(NAME host_native11_screen_check_test COMMAND native11_provider_test --screen-check)
+  set_tests_properties(host_native11_screen_check_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_native11_adaptive_screen_test COMMAND native11_provider_test --adaptive-screen)
+  add_test(NAME host_native11_adaptive_screen_warp_test COMMAND native11_provider_test --adaptive-screen-warp)
+  add_test(NAME host_native11_adaptive_screen_miss_test COMMAND native11_provider_test --adaptive-screen-miss)
+  set_tests_properties(host_native11_adaptive_screen_test host_native11_adaptive_screen_warp_test host_native11_adaptive_screen_miss_test
+    PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host")
+  add_test(NAME host_native11_depth_reads_test COMMAND native11_provider_test --depth-reads)
+  add_test(NAME host_native11_depth_reads_warp_test COMMAND native11_provider_test --depth-reads-warp)
+  add_test(NAME host_native11_depth_reads_debug_test COMMAND native11_provider_test --depth-reads-debug)
+  set_tests_properties(host_native11_depth_reads_test host_native11_depth_reads_warp_test host_native11_depth_reads_debug_test
+    PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   if(NA_HAVE_NGX_LIB AND NA_DLSS_DLL)
     na_host_test(native11_dlaa_test SOURCES native11/provider_test.cpp LIBS host_dx12 LABELS "gpu;nvidia")
     target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
     add_test(NAME host_native11_dlaa_automatic_test COMMAND native11_dlaa_test --automatic)
     set_tests_properties(host_native11_dlaa_automatic_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    add_test(NAME host_native11_dlaa_camera_off_start_test COMMAND native11_dlaa_test --camera-off-start)
+    set_tests_properties(host_native11_dlaa_camera_off_start_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    add_test(NAME host_native11_dlaa_adaptive_screen_test COMMAND native11_dlaa_test --adaptive-screen)
+    add_test(NAME host_native11_dlaa_rotating_lighting_test COMMAND native11_dlaa_test --lit-role)
+    add_test(NAME host_native11_dlaa_rotating_padded_lighting_test COMMAND native11_dlaa_test --lit-role-padded)
+    add_test(NAME host_native11_dlaa_rotating_reused_depth_test COMMAND native11_dlaa_test --lit-role-reused-depth)
+    add_test(NAME host_native11_dlaa_route_trial_test COMMAND native11_dlaa_test --lit-role-trial)
+    add_test(NAME host_native11_dlaa_route_trial_reused_depth_test COMMAND native11_dlaa_test --lit-role-trial-reused-depth)
+    add_test(NAME host_native11_dlaa_route_trial_disagreeing_scene_test COMMAND native11_dlaa_test --lit-role-trial-disagreeing-scene)
+    add_test(NAME host_native11_dlaa_parity_lighting_test COMMAND native11_dlaa_test --lit-role-parity)
+    add_test(NAME host_native11_dlaa_composition_recovery_test COMMAND native11_dlaa_test --composition-recovery)
+    set_tests_properties(host_native11_dlaa_composition_recovery_test host_native11_dlaa_rotating_lighting_test host_native11_dlaa_rotating_padded_lighting_test
+      host_native11_dlaa_rotating_reused_depth_test host_native11_dlaa_route_trial_test
+      host_native11_dlaa_route_trial_reused_depth_test host_native11_dlaa_route_trial_disagreeing_scene_test host_native11_dlaa_parity_lighting_test
+      PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    set_tests_properties(host_native11_dlaa_adaptive_screen_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_custom_command(TARGET native11_dlaa_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_dlaa_test>")
     # The same test with DLSS in the 64-bit companion program: the route every 32-bit game takes.
@@ -450,6 +524,9 @@ if(TARGET host_native11)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:NeuralAliasDlaa64>" "$<TARGET_FILE_DIR:native11_dlaa_test>")
       add_test(NAME host_native11_dlaa_companion_test COMMAND native11_dlaa_test)
       set_tests_properties(host_native11_dlaa_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
+        LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
+      add_test(NAME host_native11_dlaa_camera_off_start_companion_test COMMAND native11_dlaa_test --camera-off-start)
+      set_tests_properties(host_native11_dlaa_camera_off_start_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
         LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
     endif()
   endif()

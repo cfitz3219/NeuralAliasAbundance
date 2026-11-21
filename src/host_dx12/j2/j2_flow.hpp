@@ -79,7 +79,7 @@ public:
 void SetEngineForTests(Engine* engine); // nullptr = NVIDIA hardware optical flow
 void SetWatchdogMsForTests(uint32_t ms); // default 1000
 
-// The menu switch ([j2] flow=1 sets it at start). Off by default.
+// The host enables this for added DLAA. Test fixtures configure it directly.
 void SetEnabled(bool on);
 bool Enabled();
 // Pair frames whose scene list is followed by more game lists in the same submission

@@ -1,4 +1,6 @@
 #include "host_dx12/native11/samplers.hpp"
+#include "core/temporal_jitter.hpp"
+#include <cmath>
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
@@ -949,6 +951,18 @@ void DrawLiveDlaa()
     }
     EndRow();
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
+    // Cort 2026-11-18: no package shows the Referee switch until he says the false motion is dealt
+    // with. The row is built only when NA_REFEREE_MENU is asked for at configure time (default OFF).
+#if defined(NA_HAVE_REFEREE_SHADERS) && defined(NA_REFEREE_MENU)
+    auto& referee_enabled = na::settings::Get().referee_enabled;
+    bool referee_on = referee_enabled.load() != 0;
+    BeginRow("Referee", "Checks DLAA while you play and records its findings in the results log.", SwitchWidth());
+    if (Switch("referee", &referee_on)) {
+        referee_enabled.store(referee_on ? 1u : 0u);
+        na::settings::Save();
+    }
+    EndRow();
+#endif
     if (na::settings::AddedUpscalingAllowed() &&
         (na::scale::native::Available() || na::scale::SliderRouteActive() ||
          na::scale::GetAutomaticSceneStats().enabled || na::j2::ProjectionWindow() || na::j2::RenderSmall())) {
@@ -1016,7 +1030,7 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "Sharpening after DLSS: RCAS with soft halo control, easing off at depth edges so silhouettes keep clean outlines. 0 = off. The strength doubles every 25 points: 50% is standard RCAS at full strength, 75% is twice it and 100% four times. Native HUD is composed afterward. If separation is unavailable, HUD in the game image can also be sharpened.", S(220));
+        BeginRow("Sharpness", "RCAS sharpens the reconstructed picture. 0% turns it off, 67% gives standard sharpening, and 100% gives twice standard strength. HUD elements drawn into the scene can also be sharpened.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
@@ -1087,13 +1101,19 @@ void DrawLiveDlaa()
         if (Button(lbl)) na::capture::j2::RequestTimestamped(n);
         ImGui::EndDisabled();
         EndRow();
-        if (!native) {   // Draw-replay motion on/off (Cort 2026-11-06): live, remembered.
+        {
             na::settings::Settings& rs = na::settings::Get();
             bool replay = rs.j2_draw_replay.load() != 0;
-            BeginRow("Object motion (draw replay)", "Tests whether replaying matching scene draws reduces smearing on moving objects. Uses extra GPU time and applies live.", S(220));
+            BeginRow("Object motion (draw replay)",
+                     "Replays matching scene draws to reduce smearing on moving objects. Uses extra GPU time and applies live.",
+                     S(220));
             if (ImGui::Checkbox("##drawreplay", &replay)) { rs.j2_draw_replay.store(replay ? 1u : 0u); na::settings::Save(); }
             EndRow();
-            if (replay && st.draw_replay[0]) StatusLine(0, st.draw_replay);
+            // Native DirectX 11 has its own replay producer (native11/draw_replay.hpp) on the same switch.
+            char native_replay[96] = {};
+            if (native) na::native_d3d11::FormatReplayStatus(native_replay, sizeof native_replay);
+            const char* replay_status = native ? native_replay : st.draw_replay;
+            if (replay && replay_status[0]) StatusLine(0, replay_status);
         }
         if (!native) {   // Smear test: DLAA variants back to back, 8 captured frames each (Cort 2026-11-06).
             const bool running = na::j2::SmearTestRunning();
@@ -1165,45 +1185,31 @@ void DrawLiveDlaaEnhancements()
     if (Switch("j2jit", &jit)) na::j2::SetJitter(jit);
     EndRow();
     {
-        // P4-0b: moving-object motion from NVIDIA hardware optical flow (test; off by default).
-        bool fl = na::j2::flow::Enabled();
-        BeginRow("Moving-object motion (test)", "Adds estimated motion for moving objects. Uses NVIDIA flow between command lists, or AMD compute flow inside the game's list. Requires extra GPU time. Turn it off to compare; the Motion vectors debug view shows the result.", SwitchWidth());
-        if (Switch("j2flow", &fl)) na::j2::flow::SetEnabled(fl);
-        EndRow();
-        if (na::j2::compute_flow::GetStats().camera_reconstruct)
-            ImGui::TextWrapped("This game's camera data has no camera movement, so camera motion is rebuilt from the picture. AMD flow keeps running (extra GPU time) even with the switch off; the switch only controls moving-object motion.");
-        {
-            na::settings::Settings& ss = na::settings::Get();
-            int loose = static_cast<int>(ss.j2_flow_loosen.load());
-            BeginRow("Moving-object rules", "How much of what the optical flow finds is accepted. 0% = the original strict rules. Higher accepts more moving objects (including ones against the sky) but can add smearing or shimmer. Compare with the Motion vectors debug view.", S(220));
-            ImGui::SetNextItemWidth(S(220));
-            if (ImGui::SliderInt("##j2flowloose", &loose, 0, 100, loose ? "%d%% looser" : "Strict (original)", ImGuiSliderFlags_AlwaysClamp))
-                ss.j2_flow_loosen.store(static_cast<uint32_t>(loose));
-            if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
-            EndRow();
+        // VARIANT: camera/optional
+        // One control, live, saved per game ([j2] camera), on both routes.
+        na::settings::Settings& cs = na::settings::Get();
+        static const char* kCameraUse[] = {"Use it when found", "Never look for it", "Require it (old behaviour)"};
+        static const int kCameraValue[] = {1, 0, 2};
+        const int now = cs.j2_camera.load();
+        int pick = now == 0 ? 1 : now == 2 ? 2 : 0;
+        BeginRow("Scene camera", "DLAA no longer needs to find the game's camera. Use it when found: the camera's exact motion is used on frames where it is found, and motion measured from the picture on frames where it is not. Never look for it: motion is always measured from the picture. Require it: frames without a camera are left as the game drew them, as before. Takes effect on the next frame.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2camera", &pick, kCameraUse, 3)) {
+            cs.j2_camera.store(kCameraValue[pick]);
+            na::settings::Save();
         }
-        if (fl) {
-            const na::j2::flow::Stats fs = na::j2::flow::GetStats();
-            const auto cs=na::j2::compute_flow::GetStats();
-            if(na::on12::NativeRoute() || na::j2::GetStats().inline_mode || (!fs.available && cs.recorded)){
-                char line[500];na::j2::compute_flow::DescribeStats(cs,line,sizeof line);
-                StatusLine(0,line);
-                if(cs.samples && cs.total){char detail[330];std::snprintf(detail,sizeof detail,
-                    "Last sample excluded: small motion %.1f%%, invalid/depth %.1f%%, image/flat %.1f%%, offscreen %.1f%%. Recording resources %u, history images %u.",
-                    100.0*double(cs.rejected_small)/double(cs.total),100.0*double(cs.rejected_invalid)/double(cs.total),
-                    100.0*double(cs.rejected_image)/double(cs.total),100.0*double(cs.rejected_offscreen)/double(cs.total),cs.recording_slots,cs.image_slots);
-                    Hint(detail);}
-            }else{
-            const uint64_t px = fs.px_accepted + fs.px_invalid + fs.px_small + fs.px_cost + fs.px_offscreen + fs.px_image + fs.px_flicker;
-            const double pct = px ? 100.0 * static_cast<double>(fs.px_accepted) / static_cast<double>(px) : 0.0;
-            char tb[360];
-            const double flick = px ? 100.0 * static_cast<double>(fs.px_flicker) / static_cast<double>(px) : 0.0;
-            std::snprintf(tb, sizeof tb, "%s Moving pixels found: %.1f%% of the picture (%.1f%% rejected as jitter flicker). Cost %.2f ms (average %.2f). Pairs %llu, camera-only frames %llu (batch %llu, busy %llu, reset %llu).",
-                          fs.reason, pct, flick, fs.ms_last, fs.ms_avg, static_cast<unsigned long long>(fs.consumed),
-                          static_cast<unsigned long long>(fs.encode_only + fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_split),
-                          static_cast<unsigned long long>(fs.skipped_busy), static_cast<unsigned long long>(fs.skipped_reset));
-            StatusLine(fs.latched ? 2 : 0, tb);
-            }
+        EndRow();
+    }
+    if (na::j2::flow::Enabled() && !na::j2::Paused()) {
+        const auto hardware = na::j2::flow::GetStats();
+        const auto compute = na::j2::compute_flow::GetStats();
+        char line[500];
+        if (na::on12::NativeRoute() || na::j2::GetStats().inline_mode || (!hardware.available && compute.recorded)) {
+            na::j2::compute_flow::DescribeStats(compute, line, sizeof line);
+            StatusLine(0, line);
+        } else {
+            std::snprintf(line, sizeof line, "Optical flow  %s GPU cost averages %.2f ms.", hardware.reason, hardware.ms_avg);
+            StatusLine(hardware.latched ? 2 : 0, line);
         }
     }
     {
@@ -1268,65 +1274,15 @@ void DrawLiveDlaaEnhancements()
         if (!native && !ml.enabled) StatusLine(2, "Live texture adjustments are disabled for this session.");
     }
     {
-        // Anisotropic filtering on the game's surface textures (before DLSS, where the game
-        // samples them). Live, through the same twins as Texture detail (no restarts).
-        static const char* kAniso[] = {"Off (game's own)", "4x", "8x", "16x"};
-        static const uint32_t kAnisoLevel[] = {0, 4, 8, 16};
-        na::settings::Settings& ss = na::settings::Get();
-        const uint32_t cur = ss.aniso16.load();
-        int idx = 0;
-        for (int i = 0; i < 4; ++i) if (kAnisoLevel[i] == cur) idx = i;
-        BeginRow("Anisotropic filtering", "Raises eligible linear texture filtering to 4x, 8x or 16x, improving detail at steep angles before DLSS, including textures that use clamp addressing. Off restores the game's own filtering, which may already be 16x. Point, comparison and min/max samplers keep their filtering. A new level prepares in the background; the status below shows which level is active. Remembered for this game.", S(220));
-        // A profile read is diagnostic evidence, not a GPU sampling result.
-        // In particular a cached startup value must not disable the live
-        // selector after the profile changes or a read becomes unavailable.
+        // Anisotropic filtering has no control (Cort 2026-11-20): it is automatic for DX11 and
+        // DX12 (core/anisotropic_auto.hpp), hidden [j2] anisotropic_filter, decisions in the log.
+        // Only a driver override that forces filtering over every game is worth a line here.
         const auto drv = na::fg::preset::GetAnisoOverride();
-        ImGui::SetNextItemWidth(S(220));
-        ImGui::BeginDisabled(drv.ForcedNow());
-        if (ImGui::Combo("##aniso", &idx, kAniso, 4)) {
-            ss.aniso16.store(kAnisoLevel[idx]);
-            na::observe::SetSamplerAnisotropy(kAnisoLevel[idx]);
-            na::settings::Save();
-        }
-        ImGui::EndDisabled();
-        EndRow();
-        const auto warn = [](const char* text) {
-            ImGui::PushTextWrapPos(0.f);
-            StatusLine(2, text);
-            ImGui::PopTextWrapPos();
-        };
         if (drv.ForcedNow()) {
-            warn("Set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls");
-        } else if(drv.ForcedThisRun())
-            Hint("The current driver profile leaves filtering to the application. If its old override is still active, it clears on the next game launch.");
-        else if (!drv.available)
-            Hint("If this choice makes no difference, set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls.");
-        const auto as = na::observe::GetAnisoStats();
-        char tb[240];
-        const auto ml2 = na::observe::GetMipLiveStats();
-        if (native) {
-            const auto applied = na::native11::GetSamplerStats();
-            std::snprintf(tb, sizeof tb, "Native material filtering last bound: %ux. Changed bindings: %llu; variant errors: %llu.",
-                          applied.af, static_cast<unsigned long long>(applied.swapped),
-                          static_cast<unsigned long long>(applied.variant_failures));
-        } else if (ml2.preparing && ml2.want_aniso != ml2.live_aniso)
-            std::snprintf(tb, sizeof tb, "Preparing %ux in the background (%llu of %llu objects); the current filtering stays until it is complete.", ml2.want_aniso,
-                          static_cast<unsigned long long>(ml2.prepare_done), static_cast<unsigned long long>(ml2.prepare_total));
-        else if (as.level)
-            std::snprintf(tb, sizeof tb, "Application samplers: %ux. Built %llu static sampler overrides; raised %llu sampler descriptors.", as.level,
-                          static_cast<unsigned long long>(as.static_samplers), static_cast<unsigned long long>(as.samplers));
-        else
-            std::snprintf(tb, sizeof tb, "In use: off (the game's own filtering).");
-        StatusLine(0, tb);
-        if (!native && as.level) {
-            // Draw-time proof: how often the game's draws really went to the GPU with our
-            // changed pipelines, against with its own (which never carry the change).
-            std::snprintf(tb, sizeof tb, "Changed pipeline bindings recorded: %llu; original pipeline bindings: %llu.",
-                          static_cast<unsigned long long>(ml2.bound_pso_twin), static_cast<unsigned long long>(ml2.bound_pso_game));
-            Hint(tb);
+            ImGui::PushTextWrapPos(0.f);
+            StatusLine(2, "Set Anisotropic filtering to \"Application-controlled\" in your graphics driver controls");
+            ImGui::PopTextWrapPos();
         }
-        if(as.native_surface&&as.native_16==as.native_surface)
-            Hint("The game already requested 16x for all observed surface samplers.");
     }
     {
         // Jitter sequence (Cort 2026-11-05): where inside each pixel DLAA/DLSS samples, frame
@@ -1380,13 +1336,43 @@ void DrawDlssDebug()
     if (i.indicator_known && i.indicator) { if (Button("Turn off")) na::dlss_debug::SetIndicator(false); }
     else if (Button("Turn on")) na::dlss_debug::SetIndicator(true);
     EndRow();
-    SectionTitle("Development DLL hotkeys (sent to the game, menu open)");
-    Hint("Only NVIDIA's development DLL reacts. The combination is held for a few frames; its on-screen text names the current view or jitter configuration.");
+    SectionTitle("Jitter diagnostic");
+    auto& selection = na::settings::Get().j2_debug_jitter;
+    const auto before = selection.load(std::memory_order_relaxed);
+    neural_alias::JitterDiagnostic mode{before};
+    BeginRow("Test jitter", "If edges shake, press Reset.", ButtonWidth("Next setting") + ImGui::GetStyle().ItemSpacing.x + ButtonWidth("Reset"));
+    if (Button("Next setting")) mode.value = mode.WithConfig(mode.Config() + 1);
+    ImGui::SameLine();
+    if (Button("Reset")) mode.value = 0;
+    EndRow();
+    bool swapped = mode.Swapped();
+    BeginRow("Swap sideways and up/down", nullptr, SwitchWidth());
+    if (ImGui::Checkbox("##swapaxes", &swapped)) mode.value = mode.ToggleAxes();
+    EndRow();
+    if (before != mode.value) selection.store(mode.value, std::memory_order_relaxed);
+    BeginGroupBox("##selected-jitter");
+    Eyebrow("CURRENT SETTING");
+    const auto& config = mode.scales[mode.Config()];
+    PushLabelStrong();
+    ImGui::PushTextWrapPos(0.f);
+    ImGui::TextColored(mode.value ? kWarn : kOk, "%s", swapped && !mode.Config() ? "Directions swapped" : config.name);
+    ImGui::PopTextWrapPos();
+    PopFont();
+    if (swapped) {
+        const auto movement = [](float gain) {
+            return std::fabs(gain) == .5f ? " (half)" : std::fabs(gain) == 2.f ? " (double)" : "";
+        };
+        std::snprintf(line, sizeof line, "Right becomes %s%s. Down becomes %s%s.",
+                      config.x < 0 ? "up" : "down", movement(config.x),
+                      config.y < 0 ? "left" : "right", movement(config.y));
+        Hint(line);
+    }
+    EndGroupBox();
+    SectionTitle("Development DLL hotkeys");
+    Hint("NVIDIA keyboard shortcuts are separate.");
     struct Key { const char* label; const char* help; int vk; const char* btn; };
     const Key keys[] = {
         {"Debug view", "CTRL+ALT+F12: cycles the development DLL's overlays (jitter, motion vectors, depth, exposure, ...).", VK_F12, "Next view"},
-        {"Jitter configuration", "CTRL+ALT+F9: the DLL halves, doubles or flips the jitter it was told about. If the picture reacts, DLSS receives our jitter; if nothing changes, it does not.", VK_F9, "Next config"},
-        {"Jitter negate / swap", "CTRL+ALT+F10: negates and swaps the declared jitter axes.", VK_F10, "Press"},
         {"Accumulation", "CTRL+ALT+F6: toggles temporal accumulation (a single-frame picture shows what one frame alone contains).", VK_F6, "Toggle"},
     };
     for (const Key& k : keys) {
@@ -1486,10 +1472,12 @@ static void DrawDonutLighting()
 static void DrawAmbientOcclusion()
 {
     using namespace na::ui;
+    constexpr char ao_tip[] = "Disable in-game Ambient Occlusion before enabling XeGTAO";
     auto& s=na::settings::Get();bool enabled=s.xegtao_enabled.load()!=0;
     const ImGuiID xegtao_popup=ImGui::GetID("XeGTAO settings"); // outside the row: see DrawDonutLighting
-    BeginRow("XeGTAO (Ambient Occlusion)", "Adds soft shading around corners and where objects meet. Turn the game's ambient occlusion off where possible to avoid doubling its shading.", S(220));
+    BeginRow("XeGTAO (Ambient Occlusion)", "Adds soft shading around corners and where objects meet.", S(220), ao_tip);
     if(ImGui::Checkbox("##xegtao",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);na::settings::Save();}
+    ImGui::SetItemTooltip("%s", ao_tip);
     ImGui::SameLine();if(Button("Settings..."))ImGui::OpenPopup(xegtao_popup);EndRow();
     ImGui::SetNextWindowSize(ImVec2(S(580),0),ImGuiCond_Appearing);
     // The modal stays open on outside clicks; its own X dismisses it.
@@ -1497,6 +1485,7 @@ static void DrawAmbientOcclusion()
     if(!ImGui::BeginPopupModal("XeGTAO settings",&open,ImGuiWindowFlags_AlwaysAutoResize))return;
     bool changed=false;
     if(ImGui::Checkbox("Enable XeGTAO",&enabled)){s.xegtao_enabled.store(enabled?1u:0u);changed=true;}
+    ImGui::SetItemTooltip("%s", ao_tip);
     const auto title=[&](const char* label,const char* tip){
         ImGui::TextUnformatted(label);if(ImGui::IsItemHovered())ImGui::SetTooltip("%s",tip);
         ImGui::SameLine(S(220));ImGui::SetNextItemWidth(S(310));

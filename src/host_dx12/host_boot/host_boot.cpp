@@ -1,6 +1,8 @@
 #include "host_dx12/background/work.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/diag/dred.hpp"
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/overlay/usage_sampler.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
@@ -57,13 +59,15 @@ wchar_t g_ini[MAX_PATH] = {};
 // G3-03: with [observe] producers=1, the game's first DXGI factory waits
 // (bounded) until the init thread has installed the observation producers, so
 // the game's device, heaps and resources are created under observation.
-HANDLE g_install_event = nullptr;              // manual reset; set once install was attempted
+std::atomic<HANDLE> g_install_event{nullptr};  // manual reset; set once install was attempted
+bool g_start_after_factory = false;            // set at DLL attachment before the exports are callable
+std::once_flag g_factory_start;
 std::atomic<DWORD> g_init_thread{0};
 std::atomic<uint32_t> g_gate_expired{0};
 thread_local unsigned t_internal_factory_depth = 0;
 void signal_install_attempted()
 {
-    if (g_install_event) SetEvent(g_install_event);
+    if (const HANDLE event = g_install_event.load(std::memory_order_acquire)) SetEvent(event);
 }
 
 // Optional worker-side startup diagnostics, including failures before Present.
@@ -101,6 +105,7 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(line);
     }
     boot_log("host init thread entered");
+    if (g_start_after_factory) boot_log("host startup requested by DXGI factory creation");
     // Once hooks go in, this module must never unload.
     HMODULE pinned = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -119,6 +124,8 @@ DWORD WINAPI InitThread(LPVOID)
     }
     na::settings::SetIniPath(g_ini);
     na::settings::Load();
+    // The captures folder's budget ([capture] keep_gb, min_free_gb): old captures are removed, oldest first.
+    na::capture::SetRetention(g_ini, [](const char* line) { na::eventlog::Emit("capture_retention", "%s", line); });
     // The combined package selects the native provider at presentation.
     // Older explicit DX11 packages still install their device hook here.
     na::on12::Start(g_ini, &boot_log);
@@ -192,7 +199,9 @@ DWORD WINAPI InitThread(LPVOID)
                 for (int m = 1; m < n; ++m) wanted[m] = na::j2::SmallMipBias(user, static_cast<float>(na::scale::FractionForMode(m)));
             }
             na::observe::SetSamplerMipLevelsWanted(wanted, n);
-            na::observe::SetSamplerAnisotropyPrebuild(st.aniso16.load());
+            // Anisotropic filtering is automatic (core/anisotropic_auto.hpp): twins built at
+            // creation and new heap samplers follow the shared detector from the first sampler.
+            na::observe::SetSamplerAfFollow(1);
         }
     }
 
@@ -391,7 +400,7 @@ DWORD WINAPI InitThread(LPVOID)
         if (!added_upscaling) boot_log("added upscaling: held off");
         na::overlay::RegisterLiveDlaaMenu();
     }
-    na::j2::flow::SetEnabled(GetPrivateProfileIntW(L"j2",L"flow",0,g_ini)==1);
+    na::j2::flow::SetEnabled(na::j2::Configured());
     if(na::settings::SafeStart())na::j2::SetPaused(true);
     na::background::Start(); // two below-normal workers, never hardware_concurrency
     na::observe::SetBackgroundSubmitter(&na::background::Submit); // mip/AF variant compiles share the pool
@@ -448,11 +457,27 @@ DWORD WINAPI InitThread(LPVOID)
     return 0;
 }
 
+bool StartWorker()
+{
+    if (na::on12::AutomaticRequested(g_ini) || GetPrivateProfileIntW(L"native11", L"enabled", 0, g_ini) == 1 ||
+        ((GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 ||
+          GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1) &&
+         GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1))
+        g_install_event.store(CreateEventW(nullptr, TRUE, FALSE, nullptr), std::memory_order_release);
+    HANDLE thread = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
+    if (!thread) {
+        signal_install_attempted();
+        return false;
+    }
+    CloseHandle(thread);
+    return true;
+}
+
 } // namespace
 
 void NotifyProcessExit() { na::background::RequestStop();na::observe::SetProcessExiting(); }
 
-bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag)
+bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag, bool has_factory_callback)
 {
     g_self = self;
     wchar_t dir[MAX_PATH] = {};
@@ -481,29 +506,30 @@ bool StartFromIni(HMODULE self, const wchar_t* ini_name, const char* default_tag
         if (tag_w[0]) WideCharToMultiByte(CP_ACP, 0, tag_w, -1, tag_a, 32, nullptr, nullptr);
         strncpy_s(g_status.tag, tag_a[0] ? tag_a : (default_tag ? default_tag : "HOST"), _TRUNCATE);
     }
-    if (na::on12::AutomaticRequested(g_ini) || GetPrivateProfileIntW(L"native11", L"enabled", 0, g_ini) == 1 ||
-        ((GetPrivateProfileIntW(L"observe", L"producers", 0, g_ini) == 1 ||
-          GetPrivateProfileIntW(L"route_a", L"enabled", 0, g_ini) == 1) &&
-         GetPrivateProfileIntW(L"observe", L"early_install", 1, g_ini) == 1))
-        g_install_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE t = CreateThread(nullptr, 0, &InitThread, nullptr, 0, nullptr);
-    if (!t) {
-        signal_install_attempted();
-        return false;
-    }
-    CloseHandle(t);
-    return true;
+    g_start_after_factory = has_factory_callback &&
+        GetPrivateProfileIntW(L"host", L"start_after_factory", 0, g_ini) == 1;
+    return g_start_after_factory || StartWorker();
+}
+
+bool FactoryStartupDeferred() { return g_start_after_factory; }
+
+void StartAfterFactory()
+{
+    if (IsInternalGraphicsCall()) return;
+    std::call_once(g_factory_start, [] { StartWorker(); });
+    WaitForObserveInstall();
 }
 
 void WaitForObserveInstall()
 {
-    if (!g_install_event || t_internal_factory_depth) return;
+    const HANDLE event = g_install_event.load(std::memory_order_acquire);
+    if (!event || t_internal_factory_depth) return;
     // The init thread's own setup creates factories through this proxy.
     const DWORD init = g_init_thread.load();
     if (init && init == GetCurrentThreadId()) return;
     // Bounded: if the init thread cannot progress (e.g. the caller holds the
     // loader lock), the game continues and early objects stay PREEXISTING.
-    if(WaitForSingleObject(g_install_event,3000)==WAIT_TIMEOUT)g_gate_expired.fetch_add(1);
+    if(WaitForSingleObject(event,3000)==WAIT_TIMEOUT)g_gate_expired.fetch_add(1);
 }
 
 InternalFactoryScope::InternalFactoryScope() { ++t_internal_factory_depth; }

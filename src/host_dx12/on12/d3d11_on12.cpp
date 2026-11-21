@@ -1,8 +1,11 @@
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/host_boot/host_boot.hpp"
+#include "host_dx12/capture/referee_gpu.hpp"
+#include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/samplers.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/textures.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
@@ -308,15 +311,24 @@ void install_native(ID3D11Device* device)
     if (!device) return;
     if (!setup_native_menu(device)) g_native_install_failures.fetch_add(1); // DLAA can still run; the menu cannot
     // DLAA texture detail (mip bias) and AF on the game's own samplers, live from the menu's state.
-    if (!na::native11::InstallSamplers(device, [] { return na::observe::SamplerMipBias(); },
-                                       [] { return na::observe::SamplerAnisotropyWanted(); }))
+    if (!na::native11::InstallSamplers(device, [] {
+            return na::j2::Enabled() && !na::j2::Paused() ? na::observe::SamplerMipBias() : 0.f;
+        }, [] { return na::observe::SamplerAfActionWanted(); }))
         note("native DX11 route: the sampler hooks (texture detail / AF) could not be installed");
+    // Draw replay: the game's vertex shaders are kept from creation, so a scene draw can be replayed
+    // with stream output when [j2] draw_replay is on (native11/draw_replay.hpp).
+    if (!na::native11::draw_replay::Install(device))
+        note("native DX11 route: the draw replay hook (vertex shader creation) could not be installed");
     // Material textures: census of what the game draws its surfaces with, and prepared replacements.
     if (!na::native11::InstallTextures(device))
         note("native DX11 route: the material texture hooks could not be installed");
     // Jitter through the game's viewports: no camera layout has to be proven per game.
     na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
-    if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true)) {
+    // [j2] camera: whether a frame needs a camera at all (kept in step at every present too).
+    na::native_d3d11::SyncCameraUse();
+    na::native11::SetParitySignal(&na::referee::gpu::ParityRoleSwapSeen);
+    if (na::native11::Install(device, &na::native_d3d11::EvaluateFrame, nullptr, true,
+                             &na::referee::gpu::TakeTrialSample)) {
         g_native_installs.fetch_add(1);
         note("native DX11 route: the input provider is on the game's own D3D11 device");
     } else {

@@ -1,5 +1,6 @@
 // Native DX11 route: DLAA texture detail (mip bias) and anisotropic filtering on
-// the game's own D3D11 samplers, live from the existing menu state (no restart).
+// the game's own D3D11 samplers, live (no restart). AF is automatic (no menu control):
+// every sampler the game creates feeds the shared detector in core/anisotropic_auto.hpp.
 //
 // The game's sampler states are recorded at CreateSamplerState. When the policy
 // is on, each eligible sampler bound with PSSetSamplers / CSSetSamplers is
@@ -9,17 +10,31 @@
 // sampler_policy.hpp (the DX12 host's rules on D3D11's fields).
 #pragma once
 
+#include <d3d11.h>
+#include <wrl/client.h>
 #include <cstdint>
 
 namespace na::native11 {
 
-// The menu's wanted bias target (0 = game's own) and AF level (0 / 4 / 8 / 16), read on each bind.
+// The wanted bias target (0 = game's own) and AF action (af::Action, core/anisotropic_auto.hpp), read on each bind.
 using SamplerBiasFn = float (*)();
 using SamplerAfFn = uint32_t (*)();
 
 // Hooks the game's device (ID3D11Device*) CreateSamplerState and its contexts' PS/CS sampler binds.
 // Idempotent. Install it when the device is created, before the game makes its samplers.
 bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af);
+
+// A sampler state may be shared by our replacement and a game-created state.
+// Remember the original per bound slot, with the reference the context would hold.
+struct SamplerShadow {
+    struct Slot {
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> original;
+        ID3D11SamplerState* applied = nullptr;
+    };
+    Slot pixel[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+    Slot compute[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+};
+SamplerShadow* SamplerShadowOf(ID3D11DeviceContext* context);
 
 uint64_t SamplerPolicyKey();
 void RefreshSamplers(void* context);
@@ -41,7 +56,7 @@ struct SamplerStats {
     uint64_t after_scene = 0;      // eligible binds left as the game's own after the scene was handed to DLSS
     float original_bias = 0.0f;
     float bias = 0.0f;             // actual total bias at the last eligible material bind
-    uint32_t af = 0;
+    uint32_t af = 0;               // level of the last eligible world sampler bound (1 = not anisotropic)
     bool installed = false;
 };
 SamplerStats GetSamplerStats();

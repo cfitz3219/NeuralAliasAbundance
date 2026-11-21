@@ -1,4 +1,7 @@
 // C8a: H1 observation producers. See producers.hpp.
+#include "core/replay_budget.hpp"
+#include "core/replay_movers.hpp"
+#include "core/anisotropic_auto.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/observe/producers.hpp"
 
@@ -66,6 +69,42 @@ struct DescHeap;
 // Recordings with a pinned viewport sample may still need it after the global
 // request goes away. Only an entirely idle jitter path can skip the list locks.
 std::atomic<uint64_t> g_vpj_recordings{0};
+std::atomic<bool> g_vpj_ever{false};
+// What the most recent recording pinned for its scene draws: the sample, the depth it drew into and
+// whether its one full-size viewport was widened (that is part of where the picture landed).
+struct VpjPinned { uint64_t sample = 0, depth = 0; bool expanded = false; };
+std::mutex g_vpj_pinned_m;
+VpjPinned g_vpj_pinned;
+ResolvedRaster g_vpj_submitted; // protected by the observation registry lock
+// Depth direction evidence (SetDepthWriteEvidence). The facts belong to the RECORDING they were
+// recorded in (ListState::de, cleared when the list is Reset) and say nothing until that recording
+// is submitted: a list recorded ahead, discarded or reset proves nothing about the picture on
+// screen (Astra's R5, 2026-11-16). The host adds up the recordings it actually submits, in
+// execution order (ListDepthWriteEvidence). This switch only says whether recordings keep them.
+std::atomic<bool> g_de_on{false};
+struct DepthWrites {
+    uint64_t depth = 0;             // the scene depth these facts are about (0 = none yet)
+    uint32_t less = 0, greater = 0, equal = 0, other = 0, clears = 0, clear_bits = 0;
+    bool clear_mixed = false;
+    void select(uint64_t d) { if (depth != d) { *this = DepthWrites{}; depth = d; } }
+    void write(uint64_t d, uint32_t func)
+    {
+        select(d);
+        ++(func == D3D12_COMPARISON_FUNC_LESS || func == D3D12_COMPARISON_FUNC_LESS_EQUAL ? less
+         : func == D3D12_COMPARISON_FUNC_GREATER || func == D3D12_COMPARISON_FUNC_GREATER_EQUAL ? greater
+         : func == D3D12_COMPARISON_FUNC_EQUAL ? equal : other);
+    }
+    void clear(uint64_t d, float value)
+    {
+        select(d);
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof bits);
+        if (clears && clear_bits != bits) clear_mixed = true;
+        clear_bits = bits;
+        ++clears;
+    }
+};
+float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
 struct ListState {
     uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
     std::atomic<uint64_t> generation{0};
@@ -109,6 +148,7 @@ struct ListState {
     // every resource they reference. Bounded; overflow clears uses_complete.
     std::vector<na_object_id> uses;
     bool uses_complete = true;
+    bool uses_sorted = false; // compact once at capacity, then bounded membership/insertion
     // (render target, depth target or 0) per OMSetRenderTargets in this recording, in order (under bind_m).
     struct Target {
         na_object_id rt = 0, ds = 0;
@@ -121,6 +161,11 @@ struct ListState {
     // Explicit bounded SRV-table observations are a pass-order hint, not proof
     // of a particular AA shader or a requirement for DLAA eligibility.
     std::vector<na_object_id> sampled_textures;
+    // This is historical membership, not the live binding state. A range which
+    // was already recorded at the same descriptor revision adds no information.
+    struct SampledRange { na_object_id heap=0; uint64_t first=0,revision=0; uint32_t count=0; };
+    SampledRange sampled_ranges[16]{};
+    uint32_t sampled_range_next=0;
     std::vector<na_object_id> cleared; // render targets this recording cleared (ClearRenderTargetView)
     // Inline insertion (J2): the game's pipeline state in this recording, so host
     // work recorded INTO the game's list can hand the list back exactly as the game
@@ -154,7 +199,7 @@ struct ListState {
     na_object_id last_draw_rt = 0; // actual draw evidence survives OM unbinding
     na_object_id cur_rts[8] = {};
     uint32_t cur_nrt = 0;
-    uint32_t cur_ds_sub = NA_UNKNOWN_U32;
+    uint32_t cur_ds_sub = NA_UNKNOWN_U32, cur_rt_sub = NA_UNKNOWN_U32;
     na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
     uint32_t entry_barrier=0;
     bool restorable = true;              // false after work whose state effects we cannot replay
@@ -185,8 +230,22 @@ struct ListState {
     uint32_t mip_pso_twin = 0, mip_pso_game = 0, mip_rs_twin = 0, mip_rs_game = 0;
     // Viewport jitter: our offset copies of the game's viewports are bound now (vpj_value),
     // and the value the last scene draw of this recording was drawn with (vpj_scene, 0 = none).
+    ResolvedRaster vpj_resolved;
+    // A new depth image in this recording cannot inherit a previous resolve.
+    uint64_t vpj_cleared_depth = 0;
+    bool vpj_counted_local = false, vpj_counted_submitted = false;
+    bool vpj_discarded = false;
+    void NewDepthImage(uint64_t depth) {
+        if (!g_vpj_ever.load(std::memory_order_relaxed)) return;
+        uint64_t selected = 0, color = 0;
+        GetLiveSelection(&selected, &color);
+        if (selected == depth) vpj_cleared_depth = depth;
+        if (depth && vpj_resolved.depth == depth) vpj_resolved = {};
+    }
     bool vpj_applied = false;
     uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
+    bool vpj_scene_expanded = false, vpj_scene_mixed = false; // the pinned scene draws' raster shape; mixed = not one shape
+    DepthWrites de; // this recording's depth-writing draws and clears of the scene depth (bind_m)
     ~ListState() { if (vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release); }
 };
 
@@ -1222,6 +1281,25 @@ struct SamplerRecipe final : DescriptorDetails {
     bool modern = false;
 #endif
     float native_bias = 0.0f, stored_bias = 0.0f;
+    // Anisotropic filtering of a world sampler follows the action in force at each upload too
+    // (automatic AF may decide after the game created its heap samplers): the game's own filter
+    // and anisotropy, and what the stored descriptor holds.
+    bool world = false;
+    uint32_t native_filter = 0, native_aniso = 0, stored_filter = 0, stored_aniso = 0;
+    // The game's own sampler as the AF rule sees it (addressing and LOD range are never changed).
+    na::af::Facts native_af() const
+    {
+        na::af::Facts f;
+#if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+        if (modern) { f.address_u = uint32_t(desc2.AddressU); f.address_v = uint32_t(desc2.AddressV); f.max_lod = desc2.MaxLOD; }
+        else
+#endif
+        { f.address_u = uint32_t(desc.AddressU); f.address_v = uint32_t(desc.AddressV); f.max_lod = desc.MaxLOD; }
+        f.filter = native_filter;
+        f.max_anisotropy = native_aniso;
+        f.mip_lod_bias = native_bias;
+        return f;
+    }
 };
 
 void publish_details(DescHeap::SlotInfo& info, std::shared_ptr<const DescriptorDetails> old, const DescriptorDetails* view,
@@ -1935,14 +2013,47 @@ void STDMETHODCALLTYPE D_CreateConstantBufferView(ID3D12Device* dev, const D3D12
     if (want) emit(e, NA_GROUP_DESCRIPTOR);
 }
 
+// ---- Depth reads (j2/depth_reads.cpp; core/depth_unjitter.hpp says why). The game's shader
+// reads of one depth texture are made on a TWIN the host fills with the raster jitter taken back
+// out. The game's depth itself is untouched: depth tests, the host's own readers and the registry
+// all keep the game's texture, and the registry keeps recording the game's view as the game made
+// it. Only the descriptor the DRIVER gets names the twin, and only for a view of the depth plane
+// (a stencil view stays on the game's texture). One pointer comparison on the view-creation path.
+// A read that is missed (a view in a heap the registry never saw, a copy of the depth texture
+// itself) simply stays on the game's depth, as without this.
+std::atomic<ID3D12Resource*> g_dr_depth{nullptr}, g_dr_twin{nullptr};
+std::atomic<uint64_t> g_dr_created{0}, g_dr_swept{0}, g_dr_readable{0}, g_dr_other{0};
+std::atomic<DepthReadableListener> g_dr_listener{nullptr};
+std::atomic<DepthPendingListener> g_dr_pending_listener{nullptr};
+std::atomic<uint64_t> g_dr_unknown_view{0}, g_dr_raced{0};
+thread_local ID3D12GraphicsCommandList* t_dr_pending = nullptr; // this thread's recording waiting for its next draw
+thread_local int t_barrier_nest = 0; // a runtime or debug layer forwarding ONE game barrier through another list
+inline bool depth_plane_view(uint32_t format)
+{
+    return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
+           format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || format == DXGI_FORMAT_R16_UNORM;
+}
+
 void STDMETHODCALLTYPE D_CreateShaderResourceView(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
-    o_CreateShaderResourceView(dev, r, d, h);
+    ID3D12Resource* driver = r;
+    if (r && d && r == g_dr_depth.load(std::memory_order_acquire) && !t_host_work &&
+        d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && depth_plane_view(static_cast<uint32_t>(d->Format))) {
+        if (ID3D12Resource* twin = g_dr_twin.load(std::memory_order_acquire)) {
+            driver = twin;
+            g_dr_created.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    o_CreateShaderResourceView(dev, driver, d, h);
     uint32_t first = NA_UNKNOWN_U32, count = NA_UNKNOWN_U32;
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { first = d->Texture2D.MostDetailedMip; count = d->Texture2D.MipLevels; }
     DescriptorDetails view_args;
     const DescriptorDetails* view = nullptr;
-    if (g_operation_snapshots.load() && !t_host_work) {
+    // A view of a depth plane always keeps its exact description: should the depth get a twin later,
+    // the view (and every copy of it) can then be recreated on the twin exactly as the game made it.
+    const bool depth_plane = r && d && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && depth_plane_view(static_cast<uint32_t>(d->Format)) &&
+                             (r->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    if ((g_operation_snapshots.load() || depth_plane) && !t_host_work) {
         view = &view_args; view_args.explicit_view = d != nullptr; if (d) view_args.srv = *d;
     }
     note_descriptor_write(h, NA_DESC_SRV, r, d ? static_cast<uint32_t>(d->Format) : NA_UNKNOWN_U32, first, count,view);
@@ -2032,7 +2143,9 @@ std::atomic<float> g_mip_bias{0.0f};
 constexpr int kMipCount = 7;
 constexpr float kMipLevels[kMipCount] = {0.0f, -0.5f, -1.0f, -1.5849625f, -2.0f, -2.25f, 4.0f};
 static_assert(kMipCount <= 7, "Obj::Twins holds 7 levels");
-constexpr uint32_t kAfLevels[4] = {0, 4, 8, 16};
+// Anisotropic index of a variant = af::Action (core/anisotropic_auto.hpp): 0 the game's own,
+// 1 automatic (world samplers below 8x -> 16x), 2 forced 16x; 3 is unused. Levels for readouts.
+constexpr uint32_t kAfLevels[4] = {0, 16, 16, 0};
 std::atomic<uint32_t> g_mip_level_mask{0x7u}; // levels built at creation (bit i = kMipLevels[i])
 // Background warm-up (Cort 2026-11-06: "mip does nothing"; a choice not built at load took
 // 25-30 s, so a quick A/B never switched). After the chosen level is live, the worker builds the
@@ -2063,7 +2176,7 @@ std::atomic<uint64_t> g_mip_bound_pso_twin{0}, g_mip_bound_pso_game{0}, g_mip_bo
 int var_level(uint32_t v) { return static_cast<int>(v & 15u) < kMipCount ? static_cast<int>(v & 15u) : 0; }
 int var_af(uint32_t v) { return static_cast<int>(v >> 4 & 3u); }
 uint32_t var_pack(int level, int af) { return static_cast<uint32_t>(level) | static_cast<uint32_t>(af) << 4; }
-int af_index(uint32_t level) { return level >= 16 ? 3 : level >= 8 ? 2 : level ? 1 : 0; }
+int af_index(uint32_t action) { return action == na::af::kAuto16 ? 1 : action == na::af::kForce16 ? 2 : 0; }
 int nearest_mip_level(float b)
 {
     int best = 0;
@@ -2094,36 +2207,49 @@ bool sampler_wants_bias(const SD& d)
     const bool surface = aniso || (linear_min && (tiles(d.AddressU) || tiles(d.AddressV)));
     return surface && d.MaxLOD > 0.0f;
 }
+// Anisotropic filtering: one rule for DX11 and DX12, core/anisotropic_auto.hpp (Cort 2026-11-20).
+// World samplers only: not comparison / min-max, not point, mips, WRAP/MIRROR on U or V.
 template <typename SD>
-bool sampler_wants_aniso(const SD& d)
+na::af::Facts af_facts(const SD& d)
 {
-    // Addressing does not determine the texture footprint. Atlased/unique-UV
-    // materials commonly clamp; exclude data/comparison/point lookups, but do
-    // not apply mip-bias's WRAP-only material heuristic to filtering.
-    return D3D12_DECODE_FILTER_REDUCTION(d.Filter)==D3D12_FILTER_REDUCTION_TYPE_STANDARD&&d.MaxLOD>0&&
-        (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter)||D3D12_DECODE_MIN_FILTER(d.Filter)==D3D12_FILTER_TYPE_LINEAR);
+    na::af::Facts f;
+    f.filter = uint32_t(d.Filter);
+    f.address_u = uint32_t(d.AddressU);
+    f.address_v = uint32_t(d.AddressV);
+    f.max_anisotropy = d.MaxAnisotropy;
+    f.max_lod = d.MaxLOD;
+    f.mip_lod_bias = d.MipLODBias;
+    return f;
+}
+template <typename SD>
+bool sampler_wants_aniso(const SD& d) { return na::af::IsWorld(af_facts(d)); }
+// The anisotropic part of a variant (no counters): `action` (af::Action) on one sampler.
+template <typename SD>
+bool aniso_to(SD& d, uint32_t action)
+{
+    na::af::Facts f = af_facts(d);
+    if (!na::af::Apply(f, action)) return false;
+    d.Filter = D3D12_FILTER(f.filter);
+    d.MaxAnisotropy = f.max_anisotropy;
+    return true;
 }
 float clamp_lod(float v) { return v < -16.0f ? -16.0f : (v > 15.99f ? 15.99f : v); }
-// Anisotropic filtering 4x/8x/16x: eligible standard linear samplers, including
-// clamp-addressed materials, are made anisotropic at that level.
-// It is applied where the game samples its textures, before DLSS, so DLSS gets the sharper
-// oblique detail. Comparison / min-max / point samplers are untouched. Unlike mip bias,
-// an isotropic screen-space footprint needs no addressing-based exclusion.
-std::atomic<uint32_t> g_aniso_level{0}; // 0 off, else 4 / 8 / 16 (menu)
+// Anisotropic filtering on world samplers (af::Apply), where the game samples its textures,
+// before DLSS, so DLSS gets the sharper oblique detail. Heap samplers get the action in force
+// when the game creates them, and again whenever the game copies them into a shader-visible
+// heap (apply_sampler_upload); static samplers through the live twins.
+std::atomic<uint32_t> g_aniso_level{0}; // af::Action for sampler descriptors created from now on
 std::atomic<uint64_t> g_aniso_samplers{0}, g_aniso_static{0}, g_aniso_already{0};
 std::atomic<uint64_t> g_sampler_calls{0}, g_sampler2_calls{0}; // the game's CreateSampler / CreateSampler2 calls
 template <typename SD>
 bool apply_aniso(SD& d)
 {
-    const uint32_t level = g_aniso_level.load(std::memory_order_relaxed);
-    if (!level || !sampler_wants_aniso(d)) return false;
-    // Never lowers the game's own: an anisotropic sampler at or above the chosen level stays.
-    if (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level) {
-        g_aniso_already.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t action = g_aniso_level.load(std::memory_order_relaxed);
+    if (action == na::af::kKeep || !sampler_wants_aniso(d)) return false;
+    if (!aniso_to(d, action)) {
+        g_aniso_already.fetch_add(1, std::memory_order_relaxed); // the game's own filtering already meets it
         return false;
     }
-    d.Filter = D3D12_FILTER_ANISOTROPIC;
-    d.MaxAnisotropy = level;
     return true;
 }
 // Cort's total-bias rule: DLAA automatically targets exactly -1, including the
@@ -2133,15 +2259,6 @@ float biased(float native, float target)
 {
     if (target == 0.0f) return native;
     return clamp_lod(target);
-}
-// The anisotropic part of a variant (no counters): as apply_aniso, at an explicit level.
-template <typename SD>
-bool aniso_to(SD& d, uint32_t level)
-{
-    if (!level || (D3D12_DECODE_IS_ANISOTROPIC_FILTER(d.Filter) && d.MaxAnisotropy >= level)) return false;
-    d.Filter = D3D12_FILTER_ANISOTROPIC;
-    d.MaxAnisotropy = level;
-    return true;
 }
 // The game's static samplers as variant (level, af) wants them; returns how many changed.
 uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level, int af,uint32_t* aniso_changed=nullptr)
@@ -2153,7 +2270,7 @@ uint32_t variant_samplers(std::vector<D3D12_STATIC_SAMPLER_DESC>& ss, int level,
         bool c = false;
         const float nb = bias?biased(x.MipLODBias, kMipLevels[level]):x.MipLODBias;
         if (nb != x.MipLODBias) { x.MipLODBias = nb; c = true; }
-        if (aniso&&aniso_to(x, kAfLevels[af])) { c = true;if(aniso_changed)++*aniso_changed; }
+        if (aniso&&aniso_to(x, uint32_t(af))) { c = true;if(aniso_changed)++*aniso_changed; }
         if (c) ++changed;
     }
     return changed;
@@ -2216,7 +2333,7 @@ bool shader_visible_sampler(D3D12_CPU_DESCRIPTOR_HANDLE handle)
 void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     if (!t_host_work) g_sampler_calls.fetch_add(1, std::memory_order_relaxed);
-    if (d && !t_host_work) note_sampler_desc(0, *d);
+    if (d && !t_host_work) { note_sampler_desc(0, *d); na::af::Global().Observe(af_facts(*d)); }
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
     const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
@@ -2238,6 +2355,9 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
         recipe.desc = m;
         recipe.native_bias = d->MipLODBias;
         recipe.stored_bias = m.MipLODBias;
+        recipe.world = aniso_surface;
+        recipe.native_filter = uint32_t(d->Filter); recipe.native_aniso = d->MaxAnisotropy;
+        recipe.stored_filter = uint32_t(m.Filter); recipe.stored_aniso = m.MaxAnisotropy;
         if (shader_visible_sampler(h)) visible_sampler_bias(recipe.stored_bias);
     }
     note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, retain ? &recipe : nullptr);
@@ -2250,7 +2370,7 @@ void STDMETHODCALLTYPE D_CreateSampler(ID3D12Device* dev, const D3D12_SAMPLER_DE
 void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER_DESC2* d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
     if (!t_host_work) g_sampler2_calls.fetch_add(1, std::memory_order_relaxed);
-    if (d && !t_host_work) note_sampler_desc(1, *d);
+    if (d && !t_host_work) { note_sampler_desc(1, *d); na::af::Global().Observe(af_facts(*d)); }
     const float bias = g_mip_bias.load(std::memory_order_relaxed);
     const bool surface = d && !t_host_work && sampler_wants_bias(*d);
     const bool aniso_surface = d && !t_host_work && sampler_wants_aniso(*d);
@@ -2273,6 +2393,9 @@ void STDMETHODCALLTYPE D_CreateSampler2(ID3D12Device11* dev, const D3D12_SAMPLER
         recipe.modern = true;
         recipe.native_bias = d->MipLODBias;
         recipe.stored_bias = m.MipLODBias;
+        recipe.world = aniso_surface;
+        recipe.native_filter = uint32_t(d->Filter); recipe.native_aniso = d->MaxAnisotropy;
+        recipe.stored_filter = uint32_t(m.Filter); recipe.stored_aniso = m.MaxAnisotropy;
         if (shader_visible_sampler(h)) visible_sampler_bias(recipe.stored_bias);
     }
     note_descriptor_write(h, NA_DESC_SAMPLER, nullptr, NA_UNKNOWN_U32, NA_UNKNOWN_U32, NA_UNKNOWN_U32, retain ? &recipe : nullptr);
@@ -2286,6 +2409,7 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
 {
     if (!n || t_host_work || !g_mip_live_enabled.load(std::memory_order_relaxed)) return;
     const float target = g_mip_bias.load(std::memory_order_relaxed);
+    const uint32_t af_action = g_aniso_level.load(std::memory_order_relaxed);
 #if defined(__ID3D12Device11_INTERFACE_DEFINED__)
     Microsoft::WRL::ComPtr<ID3D12Device11> device11;
 #endif
@@ -2313,7 +2437,13 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
             const auto& recipe = recipes[i];
             if (!recipe) continue;
             float total = biased(recipe->native_bias, target);
-            if (total != recipe->stored_bias) {
+            uint32_t filter = recipe->stored_filter, aniso = recipe->stored_aniso;
+            if (recipe->world) {
+                na::af::Facts f = recipe->native_af();
+                na::af::Apply(f, af_action);
+                filter = f.filter; aniso = f.max_anisotropy;
+            }
+            if (total != recipe->stored_bias || filter != recipe->stored_filter || aniso != recipe->stored_aniso) {
                 const D3D12_CPU_DESCRIPTOR_HANDLE handle{static_cast<SIZE_T>(dst + uint64_t(copied + i) * inc)};
 #if defined(__ID3D12Device11_INTERFACE_DEFINED__)
                 if (recipe->modern) {
@@ -2321,6 +2451,8 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
                     if (device11) {
                         auto desc = recipe->desc2;
                         desc.MipLODBias = total;
+                        desc.Filter = D3D12_FILTER(filter);
+                        desc.MaxAnisotropy = aniso;
                         o_CreateSampler2(device11.Get(), &desc, handle);
                     } else total = recipe->stored_bias;
                 } else
@@ -2328,6 +2460,8 @@ void apply_sampler_upload(ID3D12Device* dev, uint64_t dst, uint64_t src, uint32_
                 {
                     auto desc = recipe->desc;
                     desc.MipLODBias = total;
+                    desc.Filter = D3D12_FILTER(filter);
+                    desc.MaxAnisotropy = aniso;
                     o_CreateSampler(dev, &desc, handle);
                 }
             }
@@ -3160,7 +3294,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
             decodable = true;
             const UINT ns = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.NumStaticSamplers : u->Desc_1_1.NumStaticSamplers;
             const D3D12_STATIC_SAMPLER_DESC* src = u->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ? u->Desc_1_0.pStaticSamplers : u->Desc_1_1.pStaticSamplers;
-            for (UINT i = 0; i < ns; ++i) note_sampler_desc(2, src[i]);
+            for (UINT i = 0; i < ns; ++i) { note_sampler_desc(2, src[i]); na::af::Global().Observe(af_facts(src[i])); }
             for (UINT i = 0; i < ns; ++i) if (sampler_wants_aniso(src[i])) {
                 has_surface=true;note_native(src[i].MipLODBias,D3D12_DECODE_IS_ANISOTROPIC_FILTER(src[i].Filter)?src[i].MaxAnisotropy:0,sampler_wants_bias(src[i]));
             }
@@ -3173,7 +3307,7 @@ HRESULT STDMETHODCALLTYPE D_CreateRootSignature(ID3D12Device* dev, UINT mask, co
                     if(!bias&&!aniso)continue;
                     const float nb = bias?biased(x.MipLODBias, kMipLevels[var_level(want)]):x.MipLODBias;
                     if (nb != x.MipLODBias) { x.MipLODBias = nb; ++biased_n; }
-                    if (aniso&&aniso_to(x, kAfLevels[var_af(want)])) ++aniso_n;
+                    if (aniso&&aniso_to(x, uint32_t(var_af(want)))) ++aniso_n;
                 }
                 if (biased_n || aniso_n) {
                     D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *u;
@@ -3596,18 +3730,36 @@ void with_list_state(const void* l, F&& f)
     na_object_id id = 0;
     if (ListState* ls = list_state_locked(l, &id)) f(*ls);
 }
+// A clear of the live scene depth, kept with the recording it was recorded in.
+void de_clear(const void* l, uint64_t resource, float value)
+{
+    uint64_t sel_depth = 0, sel_color = 0;
+    GetLiveSelection(&sel_depth, &sel_color);
+    if (!resource || resource != sel_depth) return;
+    with_list_state(l, [&](ListState& ls) {
+        std::lock_guard<std::mutex> bl(ls.bind_m);
+        ls.de.clear(sel_depth, value);
+    });
+}
 
 constexpr size_t kMaxListUses = 4096;
 void add_use_locked(ListState& ls, na_object_id id)
 {
     if (!id || id == NA_UNKNOWN_U64 || (!ls.uses.empty() && ls.uses.back() == id)) return;
-    if (ls.uses.size() >= kMaxListUses) { // compact before giving up (targets are rebound often)
+    if (!ls.uses_sorted && ls.uses.size() >= kMaxListUses) {
         std::sort(ls.uses.begin(), ls.uses.end());
         ls.uses.erase(std::unique(ls.uses.begin(), ls.uses.end()), ls.uses.end());
-        if (ls.uses.size() >= kMaxListUses * 3 / 4) {
-            ls.uses_complete = false;
-            return;
-        }
+        ls.uses_sorted = true;
+    }
+    if (ls.uses_sorted) {
+        // Previously a saturated list sorted all 4096 IDs on EVERY later use,
+        // even duplicates. Keep its compacted set sorted for the rest of this
+        // recording. The small-list append path remains unchanged.
+        const auto at = std::lower_bound(ls.uses.begin(), ls.uses.end(), id);
+        if (at != ls.uses.end() && *at == id) return;
+        if (ls.uses.size() == kMaxListUses) { ls.uses_complete = false; return; }
+        ls.uses.insert(at, id);
+        return;
     }
     ls.uses.push_back(id);
 }
@@ -3835,16 +3987,22 @@ struct On<sl::list::Reset> {
                 {
                     std::lock_guard<std::mutex> bl(ls->bind_m);
                     ls->bindings.clear();
+                    ls->vpj_resolved = {};
+                    ls->vpj_cleared_depth = 0;
+                    ls->vpj_counted_local = ls->vpj_counted_submitted = ls->vpj_discarded = false;
                     ls->states.clear();
                     ls->evidence_complete = true;
                     ls->uses.clear();
                     ls->uses_complete = true;
+                    ls->uses_sorted = false;
                     ls->targets.clear();
                     ls->insertion.Reset();
                     ls->last_draw_rt = 0;
                     ls->pending_entry = 0;
                     ls->entry_barrier=0;
                     ls->sampled_textures.clear();
+                    std::fill_n(ls->sampled_ranges,16,ListState::SampledRange{});
+                    ls->sampled_range_next=0;
                     ls->cleared.clear();
                     ls->pso = pso;
                     ls->heaps[0] = ls->heaps[1] = nullptr;
@@ -3856,6 +4014,7 @@ struct On<sl::list::Reset> {
                     ls->args[1].clear();
                     ls->cur_rt = ls->cur_ds = 0;
                     ls->cur_nrt = 0;
+                    ls->de = DepthWrites{}; // a new recording: the old one's depth facts go with it
                     ls->native_colors.clear();
                     ls->native_depth.reset();
                     ls->restorable = true;
@@ -4385,10 +4544,16 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                         const na_root_range& range = rr[rp.first_range + q];
                         if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && range.table_offset != NA_UNKNOWN_U32 && ls->sampled_textures.size()<256) {
                             const CostScope sampled(kCostSampled);
-
+                            const uint64_t first=uint64_t(slot)+range.table_offset;
+                            const uint32_t count=std::min<uint32_t>(range.num_descriptors,64);
+                            const uint64_t revision=g_operation_revision.load();
+                            const auto seen=std::find_if(std::begin(ls->sampled_ranges),std::end(ls->sampled_ranges),[&](const auto& r){
+                                return r.heap==dh->id&&r.first==first&&r.count==count&&r.revision==revision;
+                            });
+                            if(seen!=std::end(ls->sampled_ranges))continue;
                             SlotShared stripe;
-                            for (uint32_t k = 0; k < std::min<uint32_t>(range.num_descriptors, 64) && ls->sampled_textures.size()<256; ++k) {
-                                const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                            for (uint32_t k = 0; k < count && ls->sampled_textures.size()<256; ++k) {
+                                const uint64_t index = first + k;
                                 if (index >= dh->count) break;
                                 stripe.lock(dh, index);
                                 const auto& si = dh->info[static_cast<size_t>(index)];
@@ -4397,6 +4562,7 @@ void root_table(GL* l,UINT param,D3D12_GPU_DESCRIPTOR_HANDLE h){
                                     std::find(ls->sampled_textures.begin(), ls->sampled_textures.end(), si.resource) == ls->sampled_textures.end())
                                     ls->sampled_textures.push_back(si.resource);
                             }
+                            ls->sampled_ranges[ls->sampled_range_next++%16]={dh->id,first,revision,count};
                         }
                         if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV || range.table_offset == NA_UNKNOWN_U32) continue;
                         // Cover the complete conventional hardware CB register bank.
@@ -4497,6 +4663,7 @@ void set_targets_locked(ListState& ls, const na_view_ref* refs, uint32_t m, bool
 {
     const uint32_t nrt = has_dsv ? (m ? m - 1 : 0) : m;
     ls.cur_rt = nrt ? refs[0].resource : 0;
+    ls.cur_rt_sub = nrt ? refs[0].first_subresource : NA_UNKNOWN_U32;
     ls.cur_nrt = nrt;
     for (uint32_t i = 0; i < nrt; ++i) ls.cur_rts[i] = refs[i].resource;
     ls.cur_ds = has_dsv && m ? refs[m - 1].resource : 0;
@@ -4545,23 +4712,25 @@ struct On<sl::list::OMSetRenderTargets> {
 };
 template <>
 struct On<sl::list::ClearDepthStencilView> {
-    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT depth, UINT8 stencil, UINT, const D3D12_RECT*)
+    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT*)
     {
         Rec r;
         if (!begin_op(l, &r)) return;
         const na_view_ref v = cpu_ref(h);
         emit_op(r, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(f), float_bits(depth, 0.f), stencil}, &v, sizeof(v), sizeof(v), 0, NA_GROUP_RESOURCE_USE);
+        if ((f & D3D12_CLEAR_FLAG_DEPTH) && g_de_on.load(std::memory_order_relaxed)) de_clear(l, v.resource, depth);
         note_uses(l, {v.resource});
         if ((f & D3D12_CLEAR_FLAG_DEPTH) && v.resource && v.first_subresource != NA_UNKNOWN_U32)
             with_list_state(l, [&](ListState& ls) {
                 std::lock_guard<std::mutex> bl(ls.bind_m);
+                if (!rect_count) ls.NewDepthImage(v.resource);
                 if (ls.states.size() < 4096) ls.states.push_back({v.resource, v.first_subresource, D3D12_RESOURCE_STATE_DEPTH_WRITE});
             });
     }
 };
 template <>
 struct On<sl::list::ClearRenderTargetView> {
-    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT* c, UINT, const D3D12_RECT*)
+    static void run(GL* l, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT* c, UINT rect_count, const D3D12_RECT*)
     {
         Rec r;
         if (!begin_op(l, &r)) return;
@@ -4572,7 +4741,9 @@ struct On<sl::list::ClearRenderTargetView> {
         note_uses(l, {v.resource});
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
-            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, na::j2::Op::ClearWrite});
+            if (v.resource && !rect_count && (ls.vpj_resolved.color == v.resource || ls.vpj_resolved.destination == v.resource))
+                ls.vpj_resolved = {};
+            if (v.resource) ls.insertion.Add({v.resource, 0, 0, true, rect_count ? na::j2::Op::ClearWrite : na::j2::Op::FullViewClear});
             if (v.resource == ls.pending_entry) ls.pending_entry = 0;
             if (v.resource && ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), v.resource) == ls.cleared.end())
                 ls.cleared.push_back(v.resource);
@@ -4587,7 +4758,19 @@ struct TailWork {
 };
 template<> struct On<sl::list::ClearUnorderedAccessViewUint> : TailWork {};
 template<> struct On<sl::list::ClearUnorderedAccessViewFloat> : TailWork {};
-template<> struct On<sl::list::DiscardResource> : TailWork {};
+template<> struct On<sl::list::DiscardResource> {
+    static void run(GL* list, ID3D12Resource* resource, const D3D12_DISCARD_REGION*) {
+        Rec r;
+        if (!begin_op(list, &r) || !resource || !g_vpj_ever.load(std::memory_order_relaxed)) return;
+        const auto id = IdOf(resource);
+        with_list_state(list, [&](ListState& ls) {
+            std::lock_guard<std::mutex> lock(ls.bind_m);
+            ls.vpj_discarded = true;
+            if (id == ls.vpj_resolved.color || id == ls.vpj_resolved.depth || id == ls.vpj_resolved.destination)
+                ls.vpj_resolved = {};
+        });
+    }
+};
 
 template <>
 struct On<sl::list::ExecuteIndirect> {
@@ -4675,18 +4858,26 @@ struct On<sl::list::BeginRenderPass> {
                 const auto& v = ds->DepthBeginningAccess.Clear.ClearValue.DepthStencil;
                 emit_op(rc, NA_OP_CLEAR_DSV, {static_cast<uint64_t>(D3D12_CLEAR_FLAG_DEPTH), float_bits(v.Depth, 0.f), v.Stencil}, &refs[m - 1],
                         sizeof(refs[m - 1]), sizeof(refs[m - 1]), 0, NA_GROUP_RESOURCE_USE);
+                if (g_de_on.load(std::memory_order_relaxed)) de_clear(l, refs[m - 1].resource, v.Depth);
             }
         }
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             set_targets_locked(ls, refs, m, ds != nullptr);
             ls.in_render_pass = true;
+            if (ds && (depth_clear || ds->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD))
+                ls.NewDepthImage(refs[m - 1].resource);
             ls.raster_targets_known = false; // in-pass snapshots are observation only
             ls.native_colors.assign(color_views,color_views+nrt);
             ls.native_depth=std::move(depth_view);
             for (uint32_t i = 0; i < nrt; ++i) {
-                if (rts[i].BeginningAccess.Type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
-                ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::ClearWrite});
+                const auto access = rts[i].BeginningAccess.Type;
+                if ((access == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || access == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD) &&
+                    refs[i].resource && (ls.vpj_resolved.color == refs[i].resource || ls.vpj_resolved.destination == refs[i].resource))
+                    ls.vpj_resolved = {};
+                if (access == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD) ls.vpj_discarded = true;
+                if (access != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR || !refs[i].resource) continue;
+                ls.insertion.Add({refs[i].resource, 0, 0, true, na::j2::Op::FullViewClear});
                 if (ls.cleared.size() < 64 && std::find(ls.cleared.begin(), ls.cleared.end(), refs[i].resource) == ls.cleared.end())
                     ls.cleared.push_back(refs[i].resource);
             }
@@ -5111,6 +5302,42 @@ struct TextureHooks { std::shared_ptr<TextureOperationHook> lane[2]; };
 auto& g_texture_hooks = *new std::shared_ptr<const TextureHooks>();
 std::mutex g_texture_hooks_m;
 std::atomic<DepthClearListener> g_depth_clear_listener{nullptr};
+// Depth reads: the game has just moved the twinned depth from "being written" to "readable by a
+// shader" on this recording. The listener refreshes the twin here, AFTER the game's barrier, so
+// every read the game records from now on sees the depth as it is at this point of the list.
+void after_depth_readable(GL* l, UINT n, const D3D12_RESOURCE_BARRIER* b)
+{
+    ID3D12Resource* depth = g_dr_depth.load(std::memory_order_relaxed);
+    if (!depth || t_host_work || !b) return;
+    constexpr UINT shader = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    // The depth plane's LAST transition of the batch decides (plane 0 or all planes; a split
+    // barrier counts where it completes).
+    const D3D12_RESOURCE_BARRIER* last = nullptr;
+    for (UINT i = 0; i < n; ++i) {
+        const auto& x = b[i];
+        if (x.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || x.Transition.pResource != depth ||
+            (x.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) continue;
+        if (x.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && x.Transition.Subresource != 0) continue;
+        last = &x;
+    }
+    if (!last) return;
+    const UINT before = last->Transition.StateBefore, after = last->Transition.StateAfter;
+    if ((after & shader) && !(before & shader)) g_dr_readable.fetch_add(1, std::memory_order_relaxed);
+    else if (!(after & shader)) g_dr_other.fetch_add(1, std::memory_order_relaxed);
+    if (const auto listen = g_dr_listener.load(std::memory_order_acquire)) {
+        HostWorkScope own;
+        listen(l, depth, before, after, last->Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    }
+}
+// A recording that could only take a plain copy at its barrier asks to be called before its next
+// draw or dispatch, when the game has bound everything a host draw must hand back.
+void depth_pending_before(GL* l)
+{
+    if (const auto listen = g_dr_pending_listener.load(std::memory_order_acquire)) {
+        HostWorkScope own;
+        listen(l);
+    } else t_dr_pending = nullptr;
+}
 
 
 void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets,
@@ -5196,10 +5423,9 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
 // or depth test off: full-screen passes) keep the game's own viewports, so nothing is shifted
 // twice. Packed: frame (low 32 bits, never 0) << 32 | x << 16 | y, x/y int16 in 1/65536 px.
 std::atomic<uint64_t> g_vpj{0};
-std::atomic<bool> g_vpj_ever{false};
+std::atomic<uint64_t> g_vpj_local_layers{0}, g_vpj_submitted_layers{0};
 std::atomic<uint64_t> g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_draws{0}, g_vpj_unknown{0};
 thread_local bool t_vpj_self = false; // our own RSSetViewports: not a change of the game's
-float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
 // The game (or host work restoring the game's state) set viewports, or the list restarted:
 // our offset copies are no longer bound.
 void vpj_viewports_replaced(GL* l, bool reset)
@@ -5213,14 +5439,18 @@ void vpj_viewports_replaced(GL* l, bool reset)
     ls->vpj_applied = false;
     if (reset) {
         if (ls->vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release);
-        ls->vpj_scene = 0; ls->vpj_depth = 0;
+        ls->vpj_scene = 0; ls->vpj_depth = 0; ls->vpj_scene_expanded = ls->vpj_scene_mixed = false;
     }
 }
 void vpj_before_draw(GL* l)
 {
-    if (!g_vpj_ever.load(std::memory_order_relaxed)) return;
-    const uint64_t cur = g_vpj.load(std::memory_order_acquire);
-    if (!cur && !g_vpj_recordings.load(std::memory_order_acquire)) return;
+    // Two readers of the same per-draw facts: viewport jitter, and (only while asked for) the depth
+    // direction evidence. With the evidence off this is the viewport jitter's own early return.
+    const bool evidence = g_de_on.load(std::memory_order_relaxed);
+    const bool vpj = g_vpj_ever.load(std::memory_order_relaxed);
+    const uint64_t cur = vpj ? g_vpj.load(std::memory_order_acquire) : 0;
+    const bool moving = vpj && (cur || g_vpj_recordings.load(std::memory_order_acquire));
+    if (!moving && !evidence) return;
     D3D12_VIEWPORT v[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     UINT n = 0;
     {
@@ -5233,15 +5463,46 @@ void vpj_before_draw(GL* l)
         std::lock_guard<std::mutex> bl(ls->bind_m);
         // A Present on another thread must not change half a scene recording's
         // sample. The first eligible draw owns it until this list is Reset.
+        const na_ev_pipeline_created* pc = sel_depth && ls->cur_ds == sel_depth ? pso_created_locked(*ls) : nullptr;
+        if (evidence && pc && pc->depth_enable == 1 && pc->depth_write == 1) ls->de.write(sel_depth, pc->depth_func);
+        if (!moving) return; // counted only: no viewport of the game's is touched
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
         bool want = sample && sel_depth && ls->cur_ds == sel_depth;
-        if (want) {
-            const na_ev_pipeline_created* pc = pso_created_locked(*ls);
-            want = pc && pc->depth_enable == 1;
+        if (want) want = pc && pc->depth_enable == 1;
+        if (want && ls->cur_nrt == 1 && pc->depth_write == 0) {
+            // A depth test also belongs to glass, particles and other compositing draws.
+            // Once the scene is reconstructed, their colour is on the display pixel grid.
+            const auto matches = [&](const ResolvedRaster& r) {
+                return r.sample == sample && r.color == sel_color && r.depth == sel_depth &&
+                       r.depth_sub == ls->cur_ds_sub;
+            };
+            const auto destination = [&](const ResolvedRaster& r) {
+                return r.destination && ls->cur_rt == r.destination && ls->cur_rt_sub == r.destination_sub;
+            };
+            const auto& local = ls->vpj_resolved;
+            if (matches(local) && ((ls->cur_rt == local.color && ls->cur_rt_sub == local.color_sub) || destination(local))) {
+                want = false;
+                if (!ls->vpj_counted_local) {
+                    ls->vpj_counted_local = true;
+                    g_vpj_local_layers.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (sample == cur && matches(g_vpj_submitted) && destination(g_vpj_submitted) &&
+                       !ls->vpj_discarded && ls->vpj_cleared_depth != sel_depth && ls->cleared.size() < 64 &&
+                       pso_obj_locked(*ls)->blend_class == 2 &&
+                       std::find(ls->cleared.begin(), ls->cleared.end(), ls->cur_rt) == ls->cleared.end()) {
+                // A separate list loading/blending into the submitted consumer's exact view.
+                // A different phase, a replacement blend or a cleared target has no such proof.
+                want = false;
+                if (!ls->vpj_counted_submitted) {
+                    ls->vpj_counted_submitted = true;
+                    g_vpj_submitted_layers.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
-            if (!ls->vpj_scene) g_vpj_recordings.fetch_add(1, std::memory_order_release);
+            const bool first_pin = !ls->vpj_scene;
+            if (first_pin) g_vpj_recordings.fetch_add(1, std::memory_order_release);
             ls->vpj_scene = sample;
             ls->vpj_depth=sel_depth;
             g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
@@ -5255,6 +5516,7 @@ void vpj_before_draw(GL* l)
             // The depth attachment and original scissor still clip writes,
             // and the centred expansion keeps the declared jitter unchanged.
             uint32_t width = 0, height = 0, format = 0;
+            bool expanded = false;
             if (n == 1 && v[0].TopLeftX == 0.f && v[0].TopLeftY == 0.f &&
                 ls->cur_ds_sub == 0 && resource_dims_locked(sel_depth, &width, &height, &format) &&
                 v[0].Width == static_cast<float>(width) && v[0].Height == static_cast<float>(height)) {
@@ -5262,7 +5524,11 @@ void vpj_before_draw(GL* l)
                 v[0].TopLeftY -= .5f;
                 v[0].Width += 1.f;
                 v[0].Height += 1.f;
+                expanded = true;
             }
+            if (!first_pin && ls->vpj_scene_expanded != expanded) ls->vpj_scene_mixed = true;
+            ls->vpj_scene_expanded = expanded;
+            { std::lock_guard<std::mutex> pin(g_vpj_pinned_m); g_vpj_pinned = {sample, sel_depth, expanded}; }
             for (UINT i = 0; i < n; ++i) {
                 v[i].TopLeftX += dx;
                 v[i].TopLeftY += dy;
@@ -5285,51 +5551,7 @@ void vpj_before_draw(GL* l)
     l->RSSetViewports(n, n ? v : nullptr);
     t_vpj_self = false;
 }
-// Draw-replay probe (2026-11-06, SE5 smear): can the scene's draws be matched to the same draws
-// last frame, and are they posed in the vertex shader (no tessellation/geometry stages)? Every
-// draw on the live scene depth with a depth-testing pipeline adds a signature: pipeline, vertex
-// shader, counts, vertex buffer layout. The vertex buffer addresses are kept apart, so a match
-// whose buffers moved (double-buffered or compute-posed meshes) is counted separately.
-struct ReplayDraw { uint64_t sig = 0, vb = 0; bool tracked = false, stages = false; uint32_t instances = 0; };
-std::atomic<bool> g_rp_on{false};
-std::mutex g_rp_m;
-std::vector<ReplayDraw> g_rp_cur, g_rp_prev;
 uint64_t rp_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); return h; }
-void replay_probe_draw(GL* l, UINT count, UINT instances, bool indexed)
-{
-    if (!g_rp_on.load(std::memory_order_relaxed) || t_vpj_self) return;
-    uint64_t sel_depth = 0, sel_color = 0;
-    GetLiveSelection(&sel_depth, &sel_color);
-    if (!sel_depth) return;
-    ReplayDraw d;
-    {
-        std::shared_lock<RegistryLock> lock(g_m);
-        na_object_id id = 0;
-        auto* ls = list_state_locked(l, &id);
-        if (!ls) return;
-        std::lock_guard<std::mutex> bl(ls->bind_m);
-        if (ls->cur_ds != sel_depth) return;
-        const na_ev_pipeline_created* pc = pso_created_locked(*ls);
-        if (!pc || pc->depth_enable != 1) return;
-        uint64_t h = rp_mix(0, reinterpret_cast<uintptr_t>(ls->pso));
-        h = rp_mix(h, pc->stage_hash[NA_STAGE_VS]); h = rp_mix(h, count); h = rp_mix(h, instances); h = rp_mix(h, indexed);
-        d.stages = pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS];
-        d.tracked = ls->raster_tracking;
-        if (d.tracked) {
-            h = rp_mix(h, ls->vertex_mask);
-            uint64_t vb = 0;
-            for (UINT i = 0; i < 32; ++i) if (ls->vertex_mask & (1u << i)) {
-                h = rp_mix(h, ls->vertex_buffers[i].StrideInBytes); h = rp_mix(h, ls->vertex_buffers[i].SizeInBytes);
-                vb = rp_mix(vb, ls->vertex_buffers[i].BufferLocation);
-            }
-            if (ls->index_known) { h = rp_mix(h, ls->index_buffer.Format); vb = rp_mix(vb, ls->index_buffer.BufferLocation); }
-            d.vb = vb;
-        }
-        d.sig = h; d.instances = instances;
-    }
-    std::lock_guard<std::mutex> g(g_rp_m);
-    if (g_rp_cur.size() < 65536) g_rp_cur.push_back(d);
-}
 // ---- Draw replay (2026-11-06, SE5 sweatshirt smear; the TOX2-recomp idea in DX12): right after a
 // scene draw (live scene depth, depth test and write, triangle list, vertex shader only), the same
 // draw runs again with a stream-output twin of its pipeline (no pixel shader, nothing rasterised)
@@ -5415,13 +5637,29 @@ RpSlot* rp_find(uint64_t frame)
     for (uint32_t i = 0; i < g_rp_slots; ++i) if (rp_slot(i).frame == frame && rp_slot(i).buf) return &rp_slot(i);
     return nullptr;
 }
-std::atomic<uint64_t> g_rp_stat[32]; // see DrawReplayStats
+std::atomic<uint64_t> g_rp_stat[40]; // see DrawReplayStats
 enum : uint32_t { kRpReplayed, kRpVerts, kRpNoTwin, kRpBuilding, kRpFailedTwin, kRpOverflow, kRpTopology, kRpStages, kRpUntwinned,
                   kRpNoRecipe, kRpNotReady, kRpBuilt, kRpBuildFailed, kRpNoted, kRpHashMismatch, kRpOtherList,
                   kRpTakeUnclaimed, kRpTakeOtherList, kRpTakeSealed, kRpTaken, kRpSegments, kRpPendingSegs,
-                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade, kRpStatCount };
-static_assert(kRpStatCount <= 32, "g_rp_stat size");
+                  kRpPendingStamped, kRpStamps, kRpReuseUnretired, kRpSlotsMade,
+                  kRpNotSampled, kRpDrawTooLarge, kRpFrameFull, kRpMoverDraws, kRpMoverVerts, kRpMoverLeftOut, kRpProbeVerts, kRpStatCount };
+static_assert(kRpStatCount <= 40, "g_rp_stat size");
 void rp_count(uint32_t k, uint64_t n = 1) { g_rp_stat[k].fetch_add(n, std::memory_order_relaxed); }
+// The vertex budget (core/replay_budget.hpp): which draws of a frame are replayed. The frame state
+// is under g_replay_slots_m; g_rp_full_frame lets every later draw of a full frame leave at the door.
+std::atomic<uint64_t> g_rp_budget{0}, g_rp_full_frame{0};
+std::atomic<uint32_t> g_rp_threshold_seen{na::replay_budget::kFull};
+constexpr uint32_t kRpRotateFrames = 240;
+// VARIANT: replay/movers-first (core/replay_movers.hpp). Known movers are replayed first, up to the
+// whole budget; every other draw is tried in turn on budget / kRpProbeShare vertices a frame, the
+// same draws for kRpProbeFrames frames (a draw needs three moving frames in a row of pairs to be
+// learned), then the next slice. The table and the frame state are under g_replay_slots_m.
+constexpr uint32_t kRpProbeShare = 4, kRpProbeFrames = 24;
+std::atomic<bool> g_rp_movers_on{false};
+na::replay_movers::Table g_rp_table;
+std::atomic<uint64_t> g_rp_movers{0}, g_rp_suspects{0}, g_rp_promoted{0}, g_rp_let_go{0}, g_rp_reports{0};
+uint64_t g_rp_learn_clock = 0; // reports are dated by their order (under g_replay_slots_m)
+na::replay_budget::FrameBudget g_rpb; // core/replay_budget.hpp Choose (the native DX11 producer keeps its own)
 // 83b0749/8cc8cb6 runs: noted=240 built=0 twin_queued=0 no_recipe=0, so every draw
 // stopped at a gate before the recipe lookup without a count. Each gate is counted.
 enum : uint32_t { kGateNotDirect, kGateNoRetain, kGateNoDepth, kGateNoList, kGateOtherDepth, kGateRenderPass, kGateState, kGateBundle, kGatePredicate, kGateStreamOut,
@@ -5592,6 +5830,8 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
 {
     const uint64_t frame = g_rp_frame.load(std::memory_order_acquire);
     if (!frame) return;
+    // This frame has replayed its budget: nothing more to decide for the rest of its draws.
+    if (g_rp_full_frame.load(std::memory_order_relaxed) == frame) { rp_count(kRpFrameFull); return; }
     if (l->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) { rp_gate(kGateNotDirect); return; }
     const auto retain = g_rp_retain.load(std::memory_order_acquire);
     if (!retain) { rp_gate(kGateNoRetain); return; }
@@ -5737,6 +5977,28 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
     if (!verts) return;
     std::lock_guard<std::mutex> replay_lock(g_replay_slots_m);
     if (frame != g_rp_frame.load(std::memory_order_acquire)) return;
+    if (const uint64_t budget = g_rp_budget.load(std::memory_order_relaxed)) {
+        namespace rb = na::replay_budget;
+        const bool movers = g_rp_movers_on.load(std::memory_order_relaxed);
+        bool closed = false;
+        const rb::Choice choice = rb::Choose(g_rpb, frame, budget, movers, movers && g_rp_table.IsMover(rec.sig, rec.vb), rec.sig, rec.vb, verts,
+                                             {kRpRotateFrames, kRpProbeShare, kRpProbeFrames}, &closed);
+        g_rp_threshold_seen.store(g_rpb.threshold, std::memory_order_relaxed);
+        switch (choice) {
+        case rb::Choice::MoverLeftOut: rp_count(kRpMoverLeftOut); return;
+        case rb::Choice::MoverAdmit: rp_count(kRpMoverDraws); rp_count(kRpMoverVerts, verts); break;
+        case rb::Choice::DrawTooLarge: rp_count(kRpDrawTooLarge); return;
+        case rb::Choice::NotSampled: rp_count(kRpNotSampled); return;
+        case rb::Choice::FrameFull:
+            // Without movers nothing later in the frame can be admitted: leave at the door from here on.
+            if (closed) g_rp_full_frame.store(frame, std::memory_order_relaxed);
+            rp_count(kRpFrameFull);
+            return;
+        case rb::Choice::Admit:
+            if (movers) rp_count(kRpProbeVerts, verts);
+            break;
+        }
+    }
     const HostWorkScope own;
     RpSlot* found = rp_find(frame);
     uint32_t slot_index = found ? static_cast<uint32_t>(found - &rp_slot(0)) : 0;
@@ -5858,16 +6120,17 @@ struct ListHook<Slot, R(A...)> {
                 // second time; observe the outer call after it returns.
                 const HostWorkScope runtime;
                 return native_fn(forwarded_list,arguments...);
+            }else if constexpr(Slot==sl::list::ResourceBarrier){
+                struct Nest{Nest(){++t_barrier_nest;}~Nest(){--t_barrier_nest;}}nest;
+                return native_fn(forwarded_list,arguments...);
             }else return native_fn(forwarded_list,arguments...);
         };
         if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                       Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
             if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
-        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced)
-            if (!t_host_work && scope.outermost && !scope.ambiguous) {
-                const auto args = std::forward_as_tuple(a...);
-                replay_probe_draw(l, std::get<0>(args), std::get<1>(args), Slot == sl::list::DrawIndexedInstanced);
-            }
+        if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced || Slot == sl::list::Dispatch ||
+                      Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
+            if (t_dr_pending == l && !t_host_work && scope.outermost && !scope.ambiguous) depth_pending_before(l);
         if constexpr (Slot == sl::list::RSSetViewports || Slot == sl::list::Reset)
             if (scope.outermost && !scope.ambiguous) vpj_viewports_replaced(l, Slot == sl::list::Reset);
         if constexpr (Slot == sl::list::ResourceBarrier) {
@@ -6089,6 +6352,8 @@ struct ListHook<Slot, R(A...)> {
                 }
             }
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, a...);
+            if constexpr (Slot == sl::list::ResourceBarrier)
+                if (scope.outermost && !scope.ambiguous && !t_barrier_nest) after_depth_readable(l, a...);
         } else {
             const R r = fn(l, a...);
             if (scope.outermost && !scope.ambiguous) On<Slot>::run(l, r, a...);
@@ -6254,7 +6519,7 @@ std::atomic<void*> g_copy_probe_user{nullptr};
 // at the submission boundary. APP_SYNC_UNKNOWN always.
 void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D12CommandList* const* lists)
 {
-    if (!na::observe_internal::Started() || !lists) return;
+    if (!na::observe_internal::Started() || !lists || na::observe_internal::KindSkipped(NA_EV_SNAPSHOT)) return;
     constexpr uint32_t kMaxSnaps = 64, kMaxBytes = 4096, kBudget = 64 * 1024;
     struct Out {
         na_ev_snapshot e;
@@ -6264,6 +6529,7 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
     uint32_t snaps = 0, total = 0;
     bool budget_reported = false;
     for (uint32_t li = 0; li < count; ++li) {
+        if (budget_reported) return;
         std::vector<ListState::Binding> binds;
         na_object_id lid = 0;
         uint64_t gen = NA_UNKNOWN_U64;
@@ -6273,7 +6539,11 @@ void snapshot_submission(na_object_id qid, uint64_t ticket, uint32_t count, ID3D
             if (!ls) continue;
             gen = ls->generation_known.load() ? ls->generation.load() : NA_UNKNOWN_U64;
             std::lock_guard<std::mutex> bl(ls->bind_m);
-            binds = ls->bindings;
+            // At most the remaining count budget plus its one overflow receipt
+            // can be visited. Do not allocate/copy the other thousands of
+            // historical bindings while holding the game's recording lock.
+            const size_t needed=std::min<size_t>(ls->bindings.size(),kMaxSnaps-snaps+1);
+            binds.assign(ls->bindings.begin(),ls->bindings.begin()+needed);
         }
         for (const ListState::Binding& b : binds) {
             // C9-H3-REVIEW-1 #3: no de-duplication. Every binding keeps its own
@@ -7640,7 +7910,8 @@ bool ListReferences(ID3D12CommandList* list, na_object_id id)
     ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
     if (!ls || !ls->recording_observed.load()) return false;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    return std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
+    return ls->uses_sorted ? std::binary_search(ls->uses.begin(),ls->uses.end(),id) :
+        std::find(ls->uses.begin(), ls->uses.end(), id) != ls->uses.end();
 }
 bool ListRendersTo(ID3D12CommandList* list, na_object_id color, na_object_id depth)
 {
@@ -7999,6 +8270,137 @@ void SetShaderOperationHook(ShaderLane lane, std::shared_ptr<ShaderOperationHook
 }
 void SetTextureTraceListener(TextureTraceListener listener) { g_texture_trace_listener.store(listener, std::memory_order_release); }
 void SetDepthClearListener(DepthClearListener listener) { g_depth_clear_listener.store(listener, std::memory_order_release); }
+void SetDepthReadableListener(DepthReadableListener listener) { g_dr_listener.store(listener, std::memory_order_release); }
+void SetDepthPendingListener(DepthPendingListener listener) { g_dr_pending_listener.store(listener, std::memory_order_release); }
+void SetDepthReadPending(ID3D12GraphicsCommandList* list) { t_dr_pending = list; }
+bool ListHostDrawAllowed(ID3D12CommandList* list)
+{
+    if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->raster_tracking && ls->restorable && !ls->in_render_pass && ls->raster_targets_known &&
+           ls->raster_viewports_known && ls->raster_scissors_known && ls->raster_topology_known &&
+           ls->pso && ls->root_sig[0] && ls->nheaps && !ls->active_queries &&
+           ls->args[0].size() <= 64 && ls->args[1].size() <= 64;
+}
+bool ListHostCopyAllowed(ID3D12CommandList* list)
+{
+    if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return !ls->in_render_pass;
+}
+bool ListPredication(ID3D12CommandList* list, ID3D12Resource** buffer, UINT64* offset, D3D12_PREDICATION_OP* op)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->predicate) return false;
+    if (buffer) *buffer = ls->predicate;
+    if (offset) *offset = ls->predicate_offset;
+    if (op) *op = ls->predicate_op;
+    return true;
+}
+void ViewportJitterDropped(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (ls->vpj_applied) { ls->vpj_applied = false; ++ls->viewport_serial; }
+}
+void SetDepthReadTwin(ID3D12Resource* game_depth, ID3D12Resource* twin)
+{
+    // Twin first when setting, depth first when clearing: a view creation that sees the depth sees a twin.
+    if (game_depth) { g_dr_twin.store(twin, std::memory_order_release); g_dr_depth.store(game_depth, std::memory_order_release); }
+    else { g_dr_depth.store(nullptr, std::memory_order_release); g_dr_twin.store(nullptr, std::memory_order_release); }
+}
+uint32_t RedirectExistingDepthReads(ID3D12Resource* game_depth, ID3D12Resource* target)
+{
+    // Views of the depth plane the game made BEFORE the twin existed, and every copy of them the
+    // registry has seen, each recreated with the game's EXACT view description (component mapping,
+    // LOD clamp and all). A view whose description was not recorded is left alone.
+    // Found under the registry lock (which first applies every queued view write), written after
+    // it: the registry lock is never held across a D3D12 call. Each slot is then looked at again:
+    // one the game wrote in that gap gets the game's own view back.
+    if (!game_depth || !target) return 0;
+    struct Hit { DescHeap* heap; uint64_t slot; D3D12_CPU_DESCRIPTOR_HANDLE handle; std::shared_ptr<const DescriptorDetails> details; };
+    std::vector<Hit> hits;
+    na_object_id id = 0;
+    const auto depth_view = [&](const DescHeap::SlotInfo& si) {
+        return si.kind == NA_DESC_SRV && si.resource == id && si.details && si.details->explicit_view &&
+               si.details->srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && depth_plane_view(static_cast<uint32_t>(si.details->srv.Format));
+    };
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        id = id_locked(game_depth);
+        if (!id) return 0;
+        for (const auto& h : g_heaps) {
+            if (h->type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !h->stripes) continue;
+            for (uint32_t st = 0; st < h->nstripes; ++st) {
+                const uint64_t base = uint64_t(st) << kStripeShift;
+                if (base >= h->count) break;
+                std::shared_lock<std::shared_mutex> stripe(h->stripes[st]);
+                for (uint32_t b = 0; b < 64 && base + b < h->count; ++b) {
+                    const auto& si = h->info[static_cast<size_t>(base + b)];
+                    if (si.kind != NA_DESC_SRV || si.resource != id || !depth_plane_view(si.format)) continue;
+                    if (!depth_view(si)) { g_dr_unknown_view.fetch_add(1, std::memory_order_relaxed); continue; }
+                    hits.push_back({h.get(), base + b, {static_cast<SIZE_T>(h->cpu_start + (base + b) * h->increment)}, si.details});
+                }
+            }
+        }
+    }
+    if (hits.empty()) return 0;
+    ID3D12Device* device = nullptr;
+    if (FAILED(target->GetDevice(IID_PPV_ARGS(&device))) || !device) return 0;
+    HostWorkScope own;
+    for (const Hit& hit : hits) o_CreateShaderResourceView(device, target, &hit.details->srv, hit.handle);
+    // Second look. `again`: the game wrote the slot meanwhile; what it wrote is put back as it was written.
+    struct Again { D3D12_CPU_DESCRIPTOR_HANDLE handle; std::shared_ptr<const DescriptorDetails> details; na_object_id resource; uint32_t kind; };
+    std::vector<Again> again;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        for (const Hit& hit : hits) {
+            bool live = false;
+            for (const auto& h : g_heaps) if (h.get() == hit.heap) { live = true; break; }
+            if (!live) continue; // the heap is gone; so is the slot
+            const SlotShared stripe(hit.heap, hit.slot);
+            const auto& si = hit.heap->info[static_cast<size_t>(hit.slot)];
+            if (si.details == hit.details) continue;
+            again.push_back({hit.handle, si.details, si.resource, si.kind});
+        }
+    }
+    for (const Again& a : again) {
+        g_dr_raced.fetch_add(1, std::memory_order_relaxed);
+        if (a.kind != NA_DESC_SRV || !a.details) continue; // not a view this can rebuild: counted, left as the sweep wrote it
+        ID3D12Resource* resource = a.resource == id ? target : AcquireResource(a.resource);
+        if (a.resource != id && !resource) continue;
+        const bool to_target = a.resource == id && a.details->explicit_view && a.details->srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+                               depth_plane_view(static_cast<uint32_t>(a.details->srv.Format));
+        ID3D12Resource* use = a.resource == id ? (to_target ? target : game_depth) : resource;
+        o_CreateShaderResourceView(device, use, a.details->explicit_view ? &a.details->srv : nullptr, a.handle);
+        if (a.resource != id) resource->Release();
+    }
+    device->Release();
+    g_dr_swept.fetch_add(hits.size(), std::memory_order_relaxed);
+    return static_cast<uint32_t>(hits.size());
+}
+DepthReadStats GetDepthReadStats()
+{
+    return {g_dr_created.load(std::memory_order_relaxed), g_dr_swept.load(std::memory_order_relaxed),
+            g_dr_readable.load(std::memory_order_relaxed), g_dr_other.load(std::memory_order_relaxed),
+            g_dr_unknown_view.load(std::memory_order_relaxed), g_dr_raced.load(std::memory_order_relaxed)};
+}
+
 void SetTextureOperationHook(std::shared_ptr<TextureOperationHook> hook)
 {
     SetTextureOperationHook(TextureLane::Effects, std::move(hook));
@@ -8018,6 +8420,15 @@ void SetTextureOperationHook(TextureLane lane, std::shared_ptr<TextureOperationH
     } // callbacks and GPU-owning objects are released outside the registry lock
 }
 void SetRasterStateTracking(bool enabled) { g_raster_tracking.store(enabled, std::memory_order_release); }
+bool ListRasterStateTracked(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    ListState* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !ls->recording_observed.load() || !ls->coverage_complete.load()) return false;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->raster_tracking && ls->restorable && !ls->in_render_pass;
+}
 bool ListRasterStateRestorable(ID3D12CommandList* list)
 {
     std::shared_lock<RegistryLock> lock(g_m);
@@ -8722,31 +9133,71 @@ void MipBiasCounts(uint64_t* samplers, uint64_t* static_samplers)
         *static_samplers = g_biased_static.load(std::memory_order_relaxed) +
                            (var_level(live) ? g_var_static_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
 }
-void SetSamplerAnisotropy(uint32_t level)
+void SetSamplerAfAction(uint32_t action)
 {
-    const int af = af_index(level);
+    const int af = af_index(action);
     {
         static na::eventlog::Edge e;
         int64_t was = 0;
         if (e.Changed(af, &was))
-            na::eventlog::Emit("af", "requested level=%u asked=%u was_index=%lld", kAfLevels[af], level, (long long)was);
+            na::eventlog::Emit("af", "requested action=%s was_index=%lld", na::af::ActionName(uint32_t(af)), (long long)was);
     }
-    g_aniso_level.store(kAfLevels[af], std::memory_order_relaxed); // sampler descriptors created from now on
+    g_aniso_level.store(uint32_t(af), std::memory_order_relaxed); // sampler descriptors created from now on
     request_variant([af](uint32_t w) { return var_pack(var_level(w), af); });
 }
-void SetSamplerAnisotropyPrebuild(uint32_t level)
+void SetSamplerAfActionPrebuild(uint32_t action)
 {
-    g_pre_af.store(af_index(level), std::memory_order_relaxed);
+    g_pre_af.store(af_index(action), std::memory_order_relaxed);
     // Descriptor-heap samplers are created once, at load, long before the saved settings are
-    // activated: give them the saved level from the start (as the static twins get it), or
-    // a game whose materials use heap samplers never gets the filtering at all.
-    g_aniso_level.store(kAfLevels[af_index(level)], std::memory_order_relaxed);
+    // activated: give them the action from the start (as the static twins get it), or a game
+    // whose materials use heap samplers never gets the filtering at all.
+    g_aniso_level.store(uint32_t(af_index(action)), std::memory_order_relaxed);
 }
+void SetSamplerAnisotropy(uint32_t level) { SetSamplerAfAction(level ? na::af::kForce16 : na::af::kKeep); }
+void SetSamplerAnisotropyPrebuild(uint32_t level) { SetSamplerAfActionPrebuild(level ? na::af::kForce16 : na::af::kKeep); }
+namespace {
+// 0 = not following (explicit calls only), 1 = load: creation follows the detector, 2 = live.
+std::atomic<int> g_af_follow{0};
+void af_detector_changed(uint32_t action)
+{
+    const int stage = g_af_follow.load(std::memory_order_acquire);
+    if (stage >= 1) SetSamplerAfActionPrebuild(action);
+    if (stage >= 2) SetSamplerAfAction(action);
+}
+void af_detector_report(const char* line) { na::eventlog::Emit("af", "%s", line); }
+} // namespace
+void SetSamplerAfFollow(int stage)
+{
+    auto& detector = na::af::Global();
+    static std::once_flag connected;
+    std::call_once(connected, [&detector] {
+        detector.SetOnChange(&af_detector_changed);
+        detector.SetOnReport(&af_detector_report);
+        // A decision made before this point (samplers created at load) still reaches the log.
+        if (detector.ReportCount()) {
+            char line[700];
+            detector.LastReport(line, sizeof line);
+            na::eventlog::Emit("af", "%s (made before activation)", line);
+        }
+    });
+    stage = stage < 0 ? 0 : (stage > 2 ? 2 : stage);
+    g_af_follow.store(stage, std::memory_order_release);
+    // Re-read after applying: a decision made on another thread meanwhile must not be overwritten.
+    for (uint32_t applied = ~0u;;) {
+        const uint32_t action = stage ? detector.Current() : uint32_t(na::af::kKeep);
+        if (action == applied) break;
+        if (stage == 1) SetSamplerAfActionPrebuild(action);
+        else SetSamplerAfAction(action); // 0: the game's own (safe start); 2: live
+        applied = action;
+    }
+}
+uint32_t SamplerAfActionWanted() { return uint32_t(var_af(g_var_want.load(std::memory_order_relaxed))); }
 AnisoStats GetAnisoStats()
 {
     AnisoStats a;
     const uint32_t live = g_var_live.load(std::memory_order_relaxed);
-    a.level = g_mip_live_enabled.load(std::memory_order_relaxed) ? kAfLevels[var_af(live)] : g_aniso_level.load(std::memory_order_relaxed);
+    a.level = g_mip_live_enabled.load(std::memory_order_relaxed) ? kAfLevels[var_af(live)] : na::af::ActionLevel(g_aniso_level.load(std::memory_order_relaxed));
+    a.action = g_mip_live_enabled.load(std::memory_order_relaxed) ? uint32_t(var_af(live)) : g_aniso_level.load(std::memory_order_relaxed);
     a.samplers = g_aniso_samplers.load(std::memory_order_relaxed);
     a.static_samplers = g_aniso_static.load(std::memory_order_relaxed) +
                         (var_af(live) ? g_var_aniso_changed[var_level(live) * 4 + var_af(live)].load(std::memory_order_relaxed) : 0);
@@ -9068,41 +9519,86 @@ void GetLiveSelection(uint64_t* depth, uint64_t* color)
         if (g_live_seq.load(std::memory_order_relaxed) == s0) { *depth = d; *color = c; return; }
     }
 }
+ResolvedRaster FinishSceneRaster(ID3D12CommandList* list, uint64_t color, uint32_t color_sub,
+                                 uint64_t depth, uint32_t depth_sub, uint64_t destination)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls || !color || !depth) return {};
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (!ls->vpj_scene || ls->vpj_depth != depth) return {};
+    auto& raster = ls->vpj_resolved;
+    raster = {ls->vpj_scene, color, depth, 0, color_sub, depth_sub, 0};
+    if (destination && destination != color && ls->cur_nrt == 1 && ls->cur_rt == destination &&
+        ls->cur_rt_sub != NA_UNKNOWN_U32) {
+        raster.destination = destination;
+        raster.destination_sub = ls->cur_rt_sub;
+    }
+    return raster;
+}
+void SubmitResolvedRaster(const ResolvedRaster& raster)
+{
+    if (!raster.sample || !raster.destination) return;
+    std::unique_lock<RegistryLock> lock(g_m);
+    if (g_vpj.load(std::memory_order_acquire) == raster.sample) g_vpj_submitted = raster;
+}
 void SetSceneViewportJitter(uint64_t frame, float x, float y)
 {
-    if (!frame) { g_vpj.store(0, std::memory_order_release); return; }
+    if (!frame) {
+        if (g_vpj.exchange(0, std::memory_order_acq_rel)) {
+            std::unique_lock<RegistryLock> lock(g_m);
+            g_vpj_submitted = {};
+        }
+        return;
+    }
     const auto q = [](float f) { return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(std::lround(double(f) * 65536.0), -32767L, 32767L))); };
     uint32_t f32 = static_cast<uint32_t>(frame);
     if (!f32) f32 = 1;
     g_vpj_ever.store(true, std::memory_order_relaxed);
     g_vpj.store(uint64_t(f32) << 32 | uint64_t(q(x)) << 16 | q(y), std::memory_order_release);
 }
-void SetReplayProbe(bool on) { g_rp_on.store(on, std::memory_order_relaxed); }
-bool ReplayProbeFrame(ReplayProbeStats* out)
+void SetDepthWriteEvidence(bool on) { g_de_on.store(on, std::memory_order_relaxed); }
+DepthWriteEvidence ListDepthWriteEvidence(ID3D12CommandList* list, uint64_t depth)
 {
-    std::vector<ReplayDraw> cur;
-    { std::lock_guard<std::mutex> g(g_rp_m); cur.swap(g_rp_cur); }
-    ReplayProbeStats st{};
-    st.draws = static_cast<uint32_t>(cur.size());
-    std::unordered_map<uint64_t, std::vector<uint64_t>> prev; // signature -> buffer hashes, in order
-    for (const auto& d : g_rp_prev) prev[d.sig].push_back(d.vb);
-    std::unordered_map<uint64_t, uint32_t> used, seen;
-    for (const auto& d : cur) {
-        if (!d.tracked) ++st.untracked;
-        if (d.stages) ++st.extra_stages;
-        if (d.instances > 1) ++st.instanced;
-        if (++seen[d.sig] == 1) ++st.unique;
-        auto it = prev.find(d.sig);
-        uint32_t& u = used[d.sig];
-        if (it == prev.end() || u >= it->second.size()) continue;
-        ++st.matched;
-        if (it->second[u] == d.vb) ++st.same_buffers; else ++st.moved_buffers;
-        ++u;
-    }
-    st.prev_draws = static_cast<uint32_t>(g_rp_prev.size());
-    g_rp_prev.swap(cur);
-    *out = st;
-    return st.draws || st.prev_draws;
+    DepthWriteEvidence e;
+    if (!list || !depth) return e;
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list_state_locked(list, &id);
+    if (!ls) return e;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    const DepthWrites& d = ls->de;
+    if (d.depth != depth) return e; // nothing recorded about this depth
+    e.depth = d.depth;
+    e.less = d.less; e.greater = d.greater; e.equal = d.equal; e.other = d.other;
+    e.clears = d.clears; e.clear_mixed = d.clear_mixed;
+    std::memcpy(&e.clear, &d.clear_bits, sizeof d.clear_bits);
+    return e;
+}
+void SetDrawReplayBudget(uint64_t expanded_vertices)
+{
+    g_rp_budget.store(expanded_vertices, std::memory_order_relaxed);
+}
+void SetDrawReplayMovers(bool on)
+{
+    if (g_rp_movers_on.exchange(on, std::memory_order_relaxed) == on || on) return;
+    std::lock_guard<std::mutex> lock(g_replay_slots_m); // turned off: what was learned goes with it
+    g_rp_table.Clear();
+    g_rp_movers.store(0, std::memory_order_relaxed);
+    g_rp_suspects.store(0, std::memory_order_relaxed);
+}
+void ReplayLearn(const ReplayObservation* seen, size_t count)
+{
+    if (!seen || !count || !g_rp_movers_on.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_replay_slots_m);
+    ++g_rp_learn_clock;
+    for (size_t i = 0; i < count; ++i) g_rp_table.Report(seen[i].sig, seen[i].vb, seen[i].visible, seen[i].apart, g_rp_learn_clock);
+    g_rp_reports.fetch_add(count, std::memory_order_relaxed);
+    g_rp_movers.store(g_rp_table.Movers(), std::memory_order_relaxed);
+    g_rp_suspects.store(g_rp_table.Suspects(), std::memory_order_relaxed);
+    g_rp_promoted.store(g_rp_table.Promoted(), std::memory_order_relaxed);
+    g_rp_let_go.store(g_rp_table.LetGo(), std::memory_order_relaxed);
 }
 void SetDrawReplay(uint64_t frame, ReplayRetain retain)
 {
@@ -9188,6 +9684,13 @@ void GetDrawReplayStats(DrawReplayStats* out)
     out->take_sealed = v(kRpTakeSealed); out->taken = v(kRpTaken);
     out->segments = v(kRpSegments); out->pending_segments = v(kRpPendingSegs);
     out->pending_stamped = v(kRpPendingStamped); out->stamps = v(kRpStamps); out->reuse_unretired = v(kRpReuseUnretired); out->slots = v(kRpSlotsMade);
+    out->not_sampled = v(kRpNotSampled); out->draw_too_large = v(kRpDrawTooLarge); out->frame_full = v(kRpFrameFull);
+    out->budget = g_rp_budget.load(std::memory_order_relaxed); out->budget_threshold = g_rp_threshold_seen.load(std::memory_order_relaxed);
+    out->movers_on = g_rp_movers_on.load(std::memory_order_relaxed);
+    out->movers = g_rp_movers.load(std::memory_order_relaxed); out->suspects = g_rp_suspects.load(std::memory_order_relaxed);
+    out->promoted = g_rp_promoted.load(std::memory_order_relaxed); out->let_go = g_rp_let_go.load(std::memory_order_relaxed);
+    out->mover_draws = v(kRpMoverDraws); out->mover_verts = v(kRpMoverVerts); out->movers_left_out = v(kRpMoverLeftOut);
+    out->probe_verts = v(kRpProbeVerts); out->reports = g_rp_reports.load(std::memory_order_relaxed);
     static const char* const names[kGateCount] = {"not_direct", "no_retain", "no_depth", "no_list", "other_depth", "render_pass", "no_pso", "bundle", "predicated", "stream_out",
         "recording", "no_pipeline", "no_depth_write", "msaa", "viewport", "root_mismatch", "root_unknown", "direct_heap", "vs_uav", "no_vb", "admitted_depth_tested"};
     int used = 0;
@@ -9205,6 +9708,31 @@ bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float
     if (frame) *frame = static_cast<uint32_t>(packed >> 32);
     if (x) *x = vpj_axis(packed, 16);
     if (y) *y = vpj_axis(packed, 0);
+    return true;
+}
+bool SceneRasterFor(ID3D12CommandList* list, uint64_t depth, SceneRaster& out)
+{
+    out = {};
+    if (!depth) return false;
+    {
+        std::shared_lock<RegistryLock> lock(g_m);
+        na_object_id id = 0;
+        auto* ls = list ? list_state_locked(list, &id) : nullptr;
+        if (ls) {
+            std::lock_guard<std::mutex> bl(ls->bind_m);
+            if (ls->vpj_scene && ls->vpj_depth == depth) {
+                if (ls->vpj_scene_mixed) return false;
+                out = {ls->vpj_scene, ls->vpj_scene_expanded, true};
+                return true;
+            }
+        }
+    }
+    // Another recording drew the scene. Its pin counts only for this depth and for the sample the
+    // frame being recorded now carries (a pin left from an earlier frame says nothing about this one).
+    const uint64_t current = g_vpj.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> pin(g_vpj_pinned_m);
+    if (!current || g_vpj_pinned.sample != current || g_vpj_pinned.depth != depth) return false;
+    out = {g_vpj_pinned.sample, g_vpj_pinned.expanded, false};
     return true;
 }
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth)
@@ -9261,7 +9789,8 @@ void FormatHookCost(char* out, size_t n)
 ViewportJitterStats GetViewportJitterStats()
 {
     return {g_vpj_draws.load(std::memory_order_relaxed), g_vpj_sets.load(std::memory_order_relaxed),
-            g_vpj_restores.load(std::memory_order_relaxed), g_vpj_unknown.load(std::memory_order_relaxed)};
+            g_vpj_restores.load(std::memory_order_relaxed), g_vpj_unknown.load(std::memory_order_relaxed),
+            g_vpj_local_layers.load(std::memory_order_relaxed), g_vpj_submitted_layers.load(std::memory_order_relaxed)};
 }
 uint64_t LiveSelectionVersion()
 {

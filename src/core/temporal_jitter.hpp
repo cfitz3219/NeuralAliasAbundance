@@ -7,6 +7,55 @@ namespace neural_alias {
 // Independent sampling math, applied by the verified Alien camera adapter.
 // The adapter owns sequence advancement/reset and must select the main scene camera.
 struct JitterSample { double x_pixels, y_pixels; };
+// The overlay owns this session-only transform. NVIDIA's F9/F10 hotkeys
+// have no reported state we can reliably return to zero.
+struct JitterDiagnostic {
+    struct Scale { float x, y; };
+    struct Configuration { float x, y; const char* name; };
+    inline static constexpr Configuration scales[] = {
+        {1, 1, "Normal jitter"},
+        {.5f, .5f, "Half both ways"},
+        {.5f, -.5f, "Half both ways. Flip up/down."},
+        {-.5f, .5f, "Half both ways. Flip left/right."},
+        {-.5f, -.5f, "Half both ways. Flip both."},
+        {2, 2, "Double both ways"},
+        {2, -2, "Double both ways. Flip up/down."},
+        {-2, 2, "Double both ways. Flip left/right."},
+        {-2, -2, "Double both ways. Flip both."},
+        {1, -1, "Flip up/down only"},
+        {-1, 1, "Flip left/right only"},
+        {-1, -1, "Flip both directions"},
+        {.5f, 1, "Half sideways only"}, {1, .5f, "Half up/down only"},
+        {-.5f, 1, "Half and flip sideways only"}, {1, -.5f, "Half and flip up/down only"},
+        {2, 1, "Double sideways only"}, {1, 2, "Double up/down only"},
+        {-2, 1, "Double and flip sideways only"}, {1, -2, "Double and flip up/down only"}
+    };
+    static constexpr uint32_t count = sizeof(scales) / sizeof(scales[0]);
+    uint32_t value = 0; // first count = normal axes, next count = swapped
+    constexpr uint32_t Config() const { return value % count; }
+    constexpr bool Swapped() const { return value >= count; }
+    constexpr uint32_t WithConfig(uint32_t config) const { return (Swapped() ? count : 0) + config % count; }
+    constexpr uint32_t ToggleAxes() const { return Config() + (Swapped() ? 0 : count); }
+    constexpr Scale Declared(float x, float y) const {
+        const auto scale = scales[Config()];
+        const float sx = x * scale.x, sy = y * scale.y;
+        return Swapped() ? Scale{sy, sx} : Scale{sx, sy};
+    }
+};
+enum class JitterMode : uint8_t { Unset, Unshifted, Shifted };
+
+// A recorded frame can still carry the previous setting. The history changes
+// mode only on an evaluated frame whose raster agrees with the new request.
+constexpr JitterMode JitterHistoryForFrame(JitterMode previous, bool requested, bool raster_shifted,
+                                          JitterDiagnostic diagnostic = {}) {
+    if (requested != raster_shifted) return previous;
+    // Each declared transform has its own shifted history on this view.
+    return raster_shifted ? static_cast<JitterMode>(static_cast<unsigned>(JitterMode::Shifted) + diagnostic.value)
+                          : JitterMode::Unshifted;
+}
+constexpr bool JitterHistoryChanged(JitterMode previous, JitterMode next) {
+    return previous != JitterMode::Unset && next != JitterMode::Unset && previous != next;
+}
 inline double radical_inverse(uint32_t index, uint32_t base) {
     double result=0, weight=1;
     while(index) { weight/=base; result+=double(index%base)*weight; index/=base; }

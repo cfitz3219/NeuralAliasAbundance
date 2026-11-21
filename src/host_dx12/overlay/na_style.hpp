@@ -325,7 +325,7 @@ inline RowState& Row_()
     static RowState r{};
     return r;
 }
-inline void BeginRow(const char* label, const char* help, float control_w)
+inline void BeginRow(const char* label, const char* help, float control_w, const char* tooltip = nullptr)
 {
     float avail = ImGui::GetContentRegionAvail().x;
     float text_w = avail - control_w - S(24);
@@ -338,6 +338,7 @@ inline void BeginRow(const char* label, const char* help, float control_w)
     ImGui::TextColored(kText, "%s", label);
     ImGui::PopTextWrapPos();
     PopFont();
+    if (tooltip) ImGui::SetItemTooltip("%s", tooltip);
     if (help && help[0]) {
         PushHelp();
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + text_w);

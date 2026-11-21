@@ -22,7 +22,7 @@ int Start(const na_observe_config* c,na_event_sink sink,void* user) {
 #undef main
 #undef na_observe_start
 int main() {
-    const int result=RunHostSnapshotFixture();
+    const int result=RunHostSnapshotFixture(0,nullptr); // no arguments: the snapshot fixture itself, not its --budget case
     if(result) return result;
     CHECK(decoder_bridge::invalid.load()==0);
     CHECK(decoder_bridge::h3_events.load()>0);
