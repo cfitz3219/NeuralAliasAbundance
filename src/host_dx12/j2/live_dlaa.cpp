@@ -2321,8 +2321,11 @@ bool rcas_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Resou
     l->SetPipelineState(pass.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
     const uint32_t pc = (std::min)(percent, na::settings::kMaxRcasStrength);
-    const float gain = pc == 100 ? 1.0f : std::exp2((static_cast<float>(pc) - 100.0f) / 50.0f);
-    const float open = pc > 100 ? (std::min)(1.0f, std::log2(gain) / 2.0f) : 0.0f;
+    // Preserve the standard range. Ease the extra 30% detail gain into the upper third
+    // of the displayed slider, reaching 2.6x standard at the existing 100% stop.
+    const float upper = pc > 100 ? static_cast<float>(pc - 100) / 50.0f : 0.0f;
+    const float gain = std::exp2((static_cast<float>(pc) - 100.0f) / 50.0f) * (1.0f + 0.30f * upper * upper);
+    const float open = 0.5f * upper;  // the extra gain uses the same halo limits as before
     const float con = gain, limit = open;
     uint32_t c[8] = {0, w, h, 0, depth ? 1u : 0u, reversed ? 1u : 0u, dw, dh};
     std::memcpy(&c[0], &con, 4);

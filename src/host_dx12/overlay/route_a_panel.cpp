@@ -30,6 +30,7 @@
 #include <string>
 
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/capture_session.hpp"
@@ -52,6 +53,7 @@
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/dlss_debug.hpp"
 #include "host_dx12/overlay/na_style.hpp"
+#include "host_dx12/overlay/sharpness_preview.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/scale/live_driver.hpp"
@@ -1018,12 +1020,20 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "RCAS sharpens the reconstructed picture. 0% turns it off, 67% gives standard sharpening, and 100% gives twice standard strength. HUD elements drawn into the scene can also be sharpened.", S(220));
+        BeginRow("Sharpness", "Drag to see more of the picture. Move away to bring the menu back. 0% is off, 67% is standard, and 100% gives 2.6 times standard detail gain.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
+        auto& preview = PicturePreview();
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, (std::min)(1.0f, ImGui::GetStyle().Alpha / preview.opacity));
+        const ImVec2 pad = ImGui::GetStyle().FramePadding;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(pad.x, pad.y + S(5)));
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
         }
+        preview.ObserveSlider();
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+        if (ImGui::IsItemVisible() && !ImGui::TempInputIsActive(ImGui::GetItemID()))
+            DrawSharpnessTrack(sharp, preview.opacity < .95f);
+        ImGui::PopStyleVar(2);
         EndRow();
     }
     if (na::j2::RenderSmall() && na::j2::native_hud::Automatic()) {
