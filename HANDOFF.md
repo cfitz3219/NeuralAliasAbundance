@@ -214,3 +214,8 @@ PR 193 build 4003c4fd is staged in the Black Flag Documents CMDs. Native DX11 ca
 ### 2026-11-21 Pacific — Fable PR 194 merged into Route B integration
 
 Merge 0396a74f on astra/automatic-route-b-referee (PR 193) includes Fable through bcc1b95d and the dropout trial guard 2f68ab8a. Ten focused checks passed with the trial guard and seven passed on the final merge, including RTX centred-scene placement on both APIs. All twelve Results script cases passed. Existing Three Kingdoms captures confirmed the black-pixel counts. A stretched image using the timeout fallback still lacks screen proof at the game's scale. Source integration only. See the matching COMMS entry for evidence and limits.
+
+
+### 2026-11-21 Pacific — Graphite overlay and sharpness preview
+
+PR 196 merged to the Route B integration branch at 492bd4b1. At displayed 100%, RCAS now reaches 2.6x standard detail gain on both graphics APIs. The graphite menu fades around its anchored slider during deliberate drags and stays steady between clicks. Five Release tests passed, including RTX readback and native DX11 automatic DLAA. WORKLOG at e8bf0ed8 records the measured contrast, transition fix and input tests. Production DLL built in the integration worktree. Game installers continue to identify their own packaged versions.
