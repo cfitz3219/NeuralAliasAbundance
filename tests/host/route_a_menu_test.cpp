@@ -5,6 +5,7 @@
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
+#include "host_dx12/overlay/sharpness_preview.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/observe/producers.hpp"
@@ -32,6 +33,48 @@ int main() {
     io.Fonts->AddFontDefault();
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
     na::ui::ApplyStyle();
+    {
+        na::ui::SharpnessPreview preview;
+        int sharp = 45;
+        auto frame = [&](float x, bool down, bool reopen = false) {
+            io.AddMousePosEvent(x, 62);
+            io.AddMouseButtonEvent(ImGuiMouseButton_Left, down);
+            ImGui::NewFrame();
+            preview.BeginFrame(reopen);
+            ImGui::SetNextWindowPos({10, 10}); ImGui::SetNextWindowSize({500, 200});
+            ImGui::Begin("Preview test", nullptr, ImGuiWindowFlags_NoTitleBar);
+            ImGui::SetCursorScreenPos({50, 50});
+            ImGui::SetNextItemWidth(240);
+            ImGui::SliderInt("##sharp", &sharp, 0, 100);
+            preview.ObserveSlider();
+            na::ui::DrawSharpnessTrack(sharp, preview.opacity < .95f);
+            ImGui::End(); ImGui::Render();
+        };
+        frame(100, false, true);
+        for (int i = 0; i < 5; ++i) { frame(100, true); frame(100, false); }
+        CHECK(preview.opacity == 1.f);
+        frame(100, true);
+        for (int i = 0; i < 35; ++i) frame(190, true);
+        CHECK(preview.inspecting && preview.opacity < .01f && sharp > 50);
+        const ImVec2 anchor = preview.lo;
+        frame(190, false);
+        for (int i = 0; i < 4; ++i) { frame(160, true); frame(160, false); }
+        CHECK(preview.opacity < .01f && preview.lo.x == anchor.x && preview.lo.y == anchor.y);
+        for (int i = 0; i < 12; ++i) frame(330, false);
+        frame(160, false);
+        CHECK(preview.inspecting);
+        frame(330, true);
+        CHECK(preview.dismiss_press && preview.opacity == 1.f);
+        frame(330, false);
+        CHECK(!preview.dismiss_press);
+        frame(110, true);
+        for (int i = 0; i < 35; ++i) frame(200, true);
+        frame(200, false);
+        for (int i = 0; i < 60; ++i) frame(350, false);
+        CHECK(!preview.inspecting && preview.opacity == 1.f);
+        frame(150, false, true);
+        CHECK(!preview.inspecting && preview.pressed_at < 0);
+    }
     na::overlay::RegisterRouteAMenu();
     CHECK(na::menu::kPageCount==5);
     CHECK(!strcmp(na::menu::PageName(na::menu::Page::Experimental),"Experimental"));

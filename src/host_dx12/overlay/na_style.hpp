@@ -4,9 +4,8 @@
 // linking Route A code.
 //
 // A30 direction (Astra's redesign, approved by the user): quiet dark
-// surfaces, readable type, generous spacing, one restrained blue selection
-// accent. Premium through alignment and clarity; no glass, charts, gradients
-// or a coding-tool look. One logo, in the title bar. Every metric derives
+// satin graphite surfaces, warm text, and a muted jade accent.
+// One logo, in the title bar. Every metric derives
 // from one scale factor (SetScale, default 1.25 since A42) plus an optional
 // "Bold" text weight preference (A44; it replaced the earlier "Large" size).
 // Colour always accompanies words: no state is conveyed by colour alone.
@@ -14,6 +13,8 @@
 
 #include <imgui.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace na::ui {
@@ -25,22 +26,22 @@ inline ImVec4 Rgb(unsigned hex, float a = 1.0f)
 }
 
 // ---- Tokens (DESIGN.md "Tokens and layout") ----
-inline const ImVec4 kBg       = Rgb(0x191B1F);        // window
-inline const ImVec4 kBgNav    = Rgb(0x16181B);        // navigation column
-inline const ImVec4 kBgRow    = Rgb(0x202328);        // rows / groups
-inline const ImVec4 kBgRaised = Rgb(0x2B2E34);        // buttons, inputs
-inline const ImVec4 kBgHover  = Rgb(0x343840);
-inline const ImVec4 kBgCard   = Rgb(0x23262B);        // mode cards
-inline const ImVec4 kBgCardOn = Rgb(0x283548);        // selected card
-inline const ImVec4 kBgNavOn  = Rgb(0x2A3039);        // current page
-inline const ImVec4 kLine     = Rgb(0x373B42);
-inline const ImVec4 kLineSoft = Rgb(0x505660);
-inline const ImVec4 kText     = Rgb(0xF1F2F4);
-inline const ImVec4 kTextDim  = Rgb(0xB2B7C0);
-inline const ImVec4 kAccent   = Rgb(0x85B5FF);        // selection
-inline const ImVec4 kFocus    = Rgb(0xA9CDFF);        // keyboard/controller focus
-inline const ImVec4 kSwitchOn = Rgb(0x5283D0);
-inline const ImVec4 kSwitchOff= Rgb(0x59616B);
+inline const ImVec4 kBg       = Rgb(0x242522);        // window
+inline const ImVec4 kBgNav    = Rgb(0x1E201E);        // navigation column
+inline const ImVec4 kBgRow    = Rgb(0x2B2C29);        // rows / groups
+inline const ImVec4 kBgRaised = Rgb(0x393B37);        // buttons, inputs
+inline const ImVec4 kBgHover  = Rgb(0x464942);
+inline const ImVec4 kBgCard   = Rgb(0x30322E);        // mode cards
+inline const ImVec4 kBgCardOn = Rgb(0x37493E);        // selected card
+inline const ImVec4 kBgNavOn  = Rgb(0x323C35);        // current page
+inline const ImVec4 kLine     = Rgb(0x40443E);
+inline const ImVec4 kLineSoft = Rgb(0x62675F);
+inline const ImVec4 kText     = Rgb(0xF4F0E7);
+inline const ImVec4 kTextDim  = Rgb(0xC4C5BC);
+inline const ImVec4 kAccent   = Rgb(0xA6CDB2);        // selection
+inline const ImVec4 kFocus    = Rgb(0xC7E4CE);        // keyboard/controller focus
+inline const ImVec4 kSwitchOn = Rgb(0x729B82);
+inline const ImVec4 kSwitchOff= Rgb(0x5E655F);
 inline const ImVec4 kOk       = Rgb(0x9BDBB5);        // "good", with words
 inline const ImVec4 kWarn     = Rgb(0xF1CA8A);        // "attention", with words
 inline const ImVec4 kError    = Rgb(0xFF8A94);        // failures, with words
@@ -278,12 +279,12 @@ inline void StatusBanner(int state, const char* text)
     PopFont();
     float h = ts.y + pad * 2;
     ImVec2 p = ImGui::GetCursorScreenPos();
-    ImU32 border = ImGui::ColorConvertFloat4ToU32(state == 2 ? Rgb(0x635139) : kLine);
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(kBgRow), S(kRadiusGroup));
+    ImU32 border = ImGui::GetColorU32(state == 2 ? Rgb(0x635139) : kLine);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(kBgRow), S(kRadiusGroup));
     dl->AddRect(p, ImVec2(p.x + w, p.y + h), border, S(kRadiusGroup));
     ImVec4 dotc = state == 1 ? kOk : (state == 2 ? kWarn : kTextDim);
     float r = S(4.5f);
-    dl->AddCircleFilled(ImVec2(p.x + pad + r, p.y + h * 0.5f), r, ImGui::ColorConvertFloat4ToU32(dotc));
+    dl->AddCircleFilled(ImVec2(p.x + pad + r, p.y + h * 0.5f), r, ImGui::GetColorU32(dotc));
     ImGui::SetCursorScreenPos(ImVec2(p.x + pad + S(24), p.y + pad));
     PushLabel();
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w - pad * 2 - S(24));
@@ -362,6 +363,31 @@ inline void EndRow()
     ImGui::PopID();
 }
 
+// The stock integer slider owns editing, navigation and its grab. Paint a tactile track
+// over it using the same integer endpoints, leaving its keyboard focus outline visible.
+inline void DrawSharpnessTrack(int percent, bool show_label)
+{
+    const ImVec2 lo = ImGui::GetItemRectMin(), hi = ImGui::GetItemRectMax();
+    const float width = hi.x - lo.x;
+    if (width < S(60)) return;
+    const float grab = (std::min)(width - 4.f, (std::max)(ImGui::GetStyle().GrabMinSize, (width - 4.f) / 101.f));
+    const float start = lo.x + 2.f + grab * .5f, end = hi.x - 2.f - grab * .5f;
+    const float x = start + (end - start) * (percent / 100.f);
+    const float r = S(5), y = hi.y - r - S(4);
+    auto* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(lo, hi, ImGui::GetColorU32(kBgRaised), S(kRadiusControl));
+    dl->AddLine({start, y}, {end, y}, ImGui::GetColorU32(kLineSoft), S(2));
+    dl->AddLine({start, y}, {x, y}, ImGui::GetColorU32(kAccent), S(2));
+    dl->AddCircleFilled({x, y + S(1)}, r, ImGui::GetColorU32(kBgNav));
+    dl->AddCircleFilled({x, y}, r, ImGui::GetColorU32(Rgb(0xC7C2B4)));
+    dl->AddLine({x - .55f*r, y - .48f*r}, {x + .55f*r, y - .48f*r}, ImGui::GetColorU32(kText));
+    char value[8];
+    std::snprintf(value, sizeof(value), "%d%%", percent);
+    const float label_y = lo.y + S(2);
+    dl->AddText({hi.x - S(8) - ImGui::CalcTextSize(value).x, label_y}, ImGui::GetColorU32(kText), value);
+    if (show_label) dl->AddText({lo.x + S(8), label_y}, ImGui::GetColorU32(kText), "Sharpness");
+}
+
 // Small outlined tag ("Unavailable", "Planned"). Width for BeginRow via BadgeWidth.
 inline float BadgeWidth(const char* text)
 {
@@ -377,8 +403,8 @@ inline void Badge(const char* text)
     ImVec2 ts = ImGui::CalcTextSize(text);
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImVec2 sz(ts.x + S(18), ts.y + S(8));
-    dl->AddRect(p, ImVec2(p.x + sz.x, p.y + sz.y), ImGui::ColorConvertFloat4ToU32(kLineSoft), S(6));
-    dl->AddText(ImVec2(p.x + S(9), p.y + S(4)), ImGui::ColorConvertFloat4ToU32(kTextDim), text);
+    dl->AddRect(p, ImVec2(p.x + sz.x, p.y + sz.y), ImGui::GetColorU32(kLineSoft), S(6));
+    dl->AddText(ImVec2(p.x + S(9), p.y + S(4)), ImGui::GetColorU32(kTextDim), text);
     ImGui::Dummy(sz);
     PopFont();
 }
@@ -405,17 +431,17 @@ inline bool Switch(const char* id, bool* value)
     float r = h * 0.5f;
     ImVec4 bgc = *value ? kSwitchOn : kSwitchOff;
     if (disabled) bgc.w = 0.5f;
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(bgc), r);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(bgc), r);
     if (ImGui::IsItemFocused() || ImGui::IsItemHovered())
         dl->AddRect(ImVec2(p.x - S(3), p.y - S(3)), ImVec2(p.x + w + S(3), p.y + h + S(3)),
-                    ImGui::ColorConvertFloat4ToU32(kFocus), r + S(3), S(2));
+                    ImGui::GetColorU32(kFocus), r + S(3), S(2));
     float pad = S(3);
     float kd = h - 2 * pad;
     float kx = *value ? p.x + w - pad - kd : p.x + pad;
     ImVec4 knob = Rgb(0xF5F6F8);
     if (disabled) knob.w = 0.6f;
     dl->AddCircleFilled(ImVec2(kx + kd * 0.5f, p.y + pad + kd * 0.5f), kd * 0.5f,
-                        ImGui::ColorConvertFloat4ToU32(knob));
+                        ImGui::GetColorU32(knob));
     ImGui::PopID();
     return clicked;
 }
@@ -479,30 +505,30 @@ inline bool ModeCard(const char* title, const char* line1, const char* line2,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec4 bg = selected ? kBgCardOn : (hovered ? kBgHover : kBgCard);
     if (disabled) bg.w = 0.65f;
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(bg), S(kRadiusGroup));
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(bg), S(kRadiusGroup));
     dl->AddRect(p, ImVec2(p.x + w, p.y + h),
-                ImGui::ColorConvertFloat4ToU32(selected ? kAccent : kLine), S(kRadiusGroup),
+                ImGui::GetColorU32(selected ? kAccent : kLine), S(kRadiusGroup),
                 selected ? S(2) : 1.0f);
     if (focused)
         dl->AddRect(ImVec2(p.x - S(3), p.y - S(3)), ImVec2(p.x + w + S(3), p.y + h + S(3)),
-                    ImGui::ColorConvertFloat4ToU32(kFocus), S(kRadiusGroup) + S(3), S(2));
+                    ImGui::GetColorU32(kFocus), S(kRadiusGroup) + S(3), S(2));
     ImVec4 tc = kText, hc = kTextDim;
     if (disabled) { tc.w = 0.65f; hc.w = 0.65f; }
     float x = p.x + pad, y = p.y + pad;
     PushLabelStrong();
-    dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(tc), title);
+    dl->AddText(ImVec2(x, y), ImGui::GetColorU32(tc), title);
     PopFont();
     y += title_h + S(8);
     PushHelp();
-    dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(hc), line1);
+    dl->AddText(ImVec2(x, y), ImGui::GetColorU32(hc), line1);
     y += help_h + S(2);
-    dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(hc), line2);
+    dl->AddText(ImVec2(x, y), ImGui::GetColorU32(hc), line2);
     PopFont();
     if (selected) {
         // Check mark drawn with lines (no glyph dependency).
         float cs = S(11);
         ImVec2 c(p.x + w - pad - cs, p.y + S(11));
-        ImU32 col = ImGui::ColorConvertFloat4ToU32(kAccent);
+        ImU32 col = ImGui::GetColorU32(kAccent);
         dl->AddLine(ImVec2(c.x, c.y + cs * 0.55f), ImVec2(c.x + cs * 0.38f, c.y + cs), col, S(2));
         dl->AddLine(ImVec2(c.x + cs * 0.38f, c.y + cs), ImVec2(c.x + cs, c.y + cs * 0.1f), col, S(2));
     }
@@ -529,10 +555,10 @@ inline bool NavButton(const char* label, bool current, float w)
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (current || ImGui::IsItemHovered())
         dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
-                          ImGui::ColorConvertFloat4ToU32(current ? kBgNavOn : kBgHover), S(kRadiusControl));
+                          ImGui::GetColorU32(current ? kBgNavOn : kBgHover), S(kRadiusControl));
     if (ImGui::IsItemFocused())
-        dl->AddRect(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(kFocus), S(kRadiusControl), S(2));
-    dl->AddText(ImVec2(p.x + S(16), p.y + S(12)), ImGui::ColorConvertFloat4ToU32(current ? kText : kTextDim), label);
+        dl->AddRect(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(kFocus), S(kRadiusControl), S(2));
+    dl->AddText(ImVec2(p.x + S(16), p.y + S(12)), ImGui::GetColorU32(current ? kText : kTextDim), label);
     PopFont();
     ImGui::PopID();
     return clicked;
@@ -576,7 +602,7 @@ inline void Logo(ImVec4 color, float size)
     float line_h = ImGui::GetTextLineHeight();
     p.y += (line_h - size) * 0.5f;
     float u = size / 3.0f;
-    ImU32 col = ImGui::ColorConvertFloat4ToU32(color);
+    ImU32 col = ImGui::GetColorU32(color);
     dl->AddRectFilled(ImVec2(p.x, p.y + 2 * u), ImVec2(p.x + 3 * u, p.y + 3 * u), col);
     dl->AddRectFilled(ImVec2(p.x + u, p.y + u), ImVec2(p.x + 3 * u, p.y + 2 * u), col);
     dl->AddRectFilled(ImVec2(p.x + 2 * u, p.y), ImVec2(p.x + 3 * u, p.y + u), col);
@@ -597,7 +623,7 @@ inline bool TitleBar(const char* game_name)
         PushHelp();
         ImVec2 p = ImGui::GetCursorScreenPos();
         ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y), ImVec2(p.x, p.y + BrandPx()),
-                                            ImGui::ColorConvertFloat4ToU32(kLine));
+                                            ImGui::GetColorU32(kLine));
         ImGui::SetCursorScreenPos(ImVec2(p.x + S(18), p.y + (BrandPx() - ImGui::GetTextLineHeight()) * 0.5f));
         ImGui::TextColored(kTextDim, "%s", game_name);
         PopFont();
@@ -609,9 +635,9 @@ inline bool TitleBar(const char* game_name)
     bool close = ImGui::InvisibleButton("##close", ImVec2(bw, BrandPx()));
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (ImGui::IsItemHovered() || ImGui::IsItemFocused())
-        dl->AddRectFilled(p, ImVec2(p.x + bw, p.y + BrandPx()), ImGui::ColorConvertFloat4ToU32(kBgHover), S(kRadiusControl));
+        dl->AddRectFilled(p, ImVec2(p.x + bw, p.y + BrandPx()), ImGui::GetColorU32(kBgHover), S(kRadiusControl));
     float cx = p.x + bw * 0.5f, cy = p.y + BrandPx() * 0.5f, a = S(7);
-    ImU32 col = ImGui::ColorConvertFloat4ToU32(kTextDim);
+    ImU32 col = ImGui::GetColorU32(kTextDim);
     dl->AddLine(ImVec2(cx - a, cy - a), ImVec2(cx + a, cy + a), col, S(2));
     dl->AddLine(ImVec2(cx - a, cy + a), ImVec2(cx + a, cy - a), col, S(2));
     return close;
