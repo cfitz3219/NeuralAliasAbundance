@@ -3235,9 +3235,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         char why[224];
         switch (refused.why) {
         case FrameModel::NoScene::Multisampled:
-            std::snprintf(why, sizeof why,
-                "The game's own anti-aliasing is on (scene picture %ux multisampled, %ux%u inside a %ux%u screen): DLAA needs it off in the game's settings.",
-                refused.samples, refused.width, refused.height, refused.screen_width, refused.screen_height);
+            std::snprintf(why, sizeof why, "%s", "NeuralAlias cannot run DLAA on top of in-game anti-aliasing. Please disable all in-game AA.");
             break;
         default:
             std::snprintf(why, sizeof why,
