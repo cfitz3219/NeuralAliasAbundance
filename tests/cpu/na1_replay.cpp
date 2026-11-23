@@ -196,7 +196,7 @@ void PrintNumbers(const char* title, const na::enhancer::Numbers& n)
 int main(int argc, char** argv)
 {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: na_na1_replay <capture dir> <frame index> <out prefix> [checks=24]\n");
+        std::fprintf(stderr, "usage: na_na1_replay <capture dir> <frame index> <out prefix> [checks=24] [strength=1]\n");
         return 2;
     }
     const int checks = argc > 4 ? (std::max)(std::atoi(argv[4]), 1) : 24;
@@ -264,7 +264,22 @@ int main(int argc, char** argv)
         std::printf("\n");
     }
 
-    na::enhancer::Governor governor;
+    // Optional: the same goals and limits, all scaled together, to see what a stronger setting looks like.
+    const float strength = argc > 5 ? (std::max)(float(std::atof(argv[5])), 0.f) : 1.f;
+    na::enhancer::Governor::Params params;
+    if (strength != 1.f) {
+        params.texture_goal = 1.f + (params.texture_goal - 1.f) * strength;
+        params.texture_low = 1.f + (params.texture_low - 1.f) * strength;
+        params.texture_high = 1.f + (params.texture_high - 1.f) * strength;
+        params.colour_gain = 1.f + (params.colour_gain - 1.f) * strength;
+        params.glow_most *= strength;
+        params.white_rise_most *= strength;
+        params.broad_most = 1.f + (params.broad_most - 1.f) * strength;
+        params.broad_least = 1.f - (1.f - params.broad_least) * strength;
+        params.dial_most *= strength;
+        std::printf("strength %.2f: texture goal x%.2f, colour x%.2f\n", double(strength), double(params.texture_goal), double(params.colour_gain));
+    }
+    na::enhancer::Governor governor(params);
     std::vector<float> cells(size_t(kCellsW) * kCellsH * kCellFloats);
     uint64_t now_ms = 0;
     char line[1024];

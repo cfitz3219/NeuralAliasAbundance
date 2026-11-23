@@ -1,5 +1,6 @@
 // The Referee's control rule for the enhancer (docs/NA1-ENHANCER.md section 5), on simulated
 // scenes: each "plant" answers the dials the way a picture would.
+#include <vector>
 #include "core/enhancer_governor.hpp"
 #include "test_support.hpp"
 
@@ -460,8 +461,10 @@ int main()
             CHECK(n > 0 && n < int(sizeof line));
             for (const char* part : {"sample 12", "texture", "light", "colour", "key", "black", "white", "glow", "scene m0", "running"})
                 CHECK(std::strstr(line, part));
-            char small[16];
-            CHECK(l.governor.Format(small, sizeof small) > 15 && std::strlen(small) == 15);  // cut, never overrun
+            // The size is hidden from the compiler: a newer GCC otherwise rejects the deliberate cut as a truncation warning.
+            volatile size_t room = 16;
+            std::vector<char> small(room);
+            CHECK(l.governor.Format(small.data(), small.size()) > 15 && std::strlen(small.data()) == 15);  // cut, never overrun
             for (int d = 0; d < Governor::kDials; ++d) CHECK(std::strlen(l.governor.DialWhy(d)) > 0);
             CHECK(std::strlen(l.governor.DialWhy(99)) == 0);
         }},
