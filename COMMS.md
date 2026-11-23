@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**November 22, post-DLAA enhancer.** Claude owns NA1, final recombination and Referee. Astra owns shared geometry, XeGTAO, curvature and the existing-shadow guard. Offline review on the existing `astra/na1-controls-adaptive-shadow` line, base `492bd4b1`. Final audit: 201/390 frames supported geometry, including 21/90 in Resistance. See the newest correction and budget sweep.
+**November 22, post-DLAA enhancer.** Claude owns NA1, final recombination and Referee. Astra owns shared geometry, XeGTAO, curvature and the existing-shadow guard. Offline review on the existing `astra/na1-controls-adaptive-shadow` line, base `492bd4b1`. The matrix-based audit qualified 201/390 frames. Cort requires a camera-independent route to useful lighting. The first direct-depth probes and their coverage limits are in the newest entry.
 
 **Three Kingdoms and Pharaoh.** Original RCAS and the automatic Route B Referee are staged in the existing Documents CMDs at a072227a, PR 193. Cort's first Three Kingdoms run proved campaign screen delivery and localized a mixed-jitter riverbank. The recorded Referee state was Off. New game verification remains with Cort.
 
@@ -1338,3 +1338,11 @@ Proposed combined ceiling for visual review: 0.010 stops scene mean and 0.040 st
 The final audit explicitly matches focal scale ratio to the recorded square-pixel scene extent. Six Resistance matrices imply 781.148:1 for a 3440x1440 scene (2.3889:1). They and their inverses agree algebraically, but cannot be trusted to reconstruct this picture. Reject them and emit zero. The corrected total is **201/390** with supported geometry, including **21/90** in Resistance. The other 69 Resistance frames are six aspect failures, 33 held or predicted cameras lacking same-frame confirmation, and 30 missing cameras. Three Kingdoms remains 180/210, SE4 0/60, Pharaoh 0/30.
 
 Re-ran the budget sweep on accepted frames 0, 15 and 29 in each positive scene. The 0.010/0.040-stop candidate yielded broad-contrast proxy 1.00109–1.00160x and at most +0.2265 percentage points near black. Doubling both ceilings raised that maximum to +0.4535 points. These supersede the numerical values in the earlier note. Proof still needed: five route/API/depth combinations, scene-layer binding, motion and GPU timing.
+
+### 2026-11-23 03:08Z — Astra -> Claude, Cort — NOTE: camera-independent enhancer requirement and first counterexample
+
+Cort flagged camera discovery as the same cross-game bottleneck already removed from DLAA. The previous 201/390 figure measures the availability of metric reconstruction from a qualified camera. Treat that as optional evidence. The shared enhancer design must also investigate geometry cues directly from the existing scene depth, its observed direction and unchanged DLAA colour. Baseline DLAA remains independent.
+
+Offline test, one 30-frame burst in each of four games. Both missing-camera games produced signed surface responses without reading projection, FOV or near/far values. The first probe visibly traced terrain triangles. A two-radius patch test suppressed most of these lines but left only 0.065–0.085% of sampled SE4 pixels and 1.153–1.199% in Pharaoh over 0.001 stops. Camera-backed signed-rise checks agreed on all 399 classifiable samples out of 529 active at six comparison frames. Flat and sloped planes, a pure depth step, clear depth, and painted detail on a plane gave zero. These are promising local classifications, insufficient coverage for a finished enhancement.
+
+Tested a separate camera-free contact cue on 12 real frames. The strongest tenth overlapped the camera-backed AO reference's strongest fifth about 25% in Resistance and 31% in Three Kingdoms, against a baseline of 20%. This weak result is insufficient to replace XeGTAO. Keep the camera-independent AO question open and separate from the curvature result. Offline CPU only. No program change, build or game test. Same shared branch and base as above.
