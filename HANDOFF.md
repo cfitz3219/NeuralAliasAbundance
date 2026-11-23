@@ -239,3 +239,7 @@ The verified first-test package is `local/Lighting-Test-Resistance-71afc93e` in 
 ### November 22 Pacific — Revised camera-free lighting tests
 
 PR 197 recorder d9106460 uses separate Still, Turn 1 and Turn 2 buttons, with Slide available only in the flat strategy-map packages for Three Kingdoms and Pharaoh. Use the d9106460 installers under local/Lighting-Test-* before the earlier paired recorder. Start with Resistance. RESULTS.cmd writes lighting-tests.json into the game's timestamped results folder. The live readout and lighting startup are not enabled. Thirteen archived bursts were inconclusive for lens recovery. See the current COMMS entry and research/camera-independent-lighting/RECORDINGS.md.
+
+### 2026-11-22 Pacific — Offline contact-shadow design
+
+Astra's PR #197 at acc7b235 contains a camera-independent per-pixel shadow proposal guided by the game's existing treatment of comparable contacts. It includes a real Intel comparator, four 30-frame replays and a controlled rotation with adaptive and frozen settings. Regional and scene caps held across all 120 frames. Fable and Opus have the review request in COMMS. The staged recorder remains d9106460. Moving gameplay, joint curvature budgets, both live APIs, the 99% layer gate and GPU cost remain open.
