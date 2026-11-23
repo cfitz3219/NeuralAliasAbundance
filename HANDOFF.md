@@ -227,3 +227,7 @@ Astra's shared line is `astra/na1-controls-adaptive-shadow`, PR 196 base `492bd4
 ### Camera-free lighting qualification, November 22 Pacific
 
 Cort set a 99% floor for placement and strength. The offline solver uses rigid point pairs to infer a scale-relative projection from depth and motion. All three known-projection controls passed at 0.25 px tracking noise. All 13 real bursts lacked independent calibration agreement. The direct-depth AO baseline failed on all 201 usable reference frames. The released DLAA path is independent. See COMMS for criteria, the diagnostic at `36b9274f` on `astra/na1-controls-adaptive-shadow`, and the saved visual report. Real moving-scene qualification remains open.
+
+### Paired still / pan lighting captures, November 22 Pacific
+
+On `astra/na1-controls-adaptive-shadow`, PR 197 at `71afc93e` adds two evidence controls to Picture > Live DLAA. Five Release regressions passed, including clicks and 30 complete sample frames per condition. The Three Kingdoms staging folder is `local/Lighting-Test-Three-Kingdoms-71afc93e` in Cort's usual project checkout. Ten package hashes and isolated install / results / rollback passed. Cort owns the live recordings. Opus's research request is in COMMS at `dd48f48b`, including the unavailable camera, synthetic and real-game results, camera-free workaround and qualification criteria.
