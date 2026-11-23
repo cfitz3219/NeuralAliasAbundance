@@ -259,3 +259,7 @@ The d9106460 binary linked the empty discovery adapter. Cort enabled DLAA, the m
 ### 2026-11-23 07:40 UTC — Resistance recordings complete; new menu staged
 
 PR #197 revision 853f5dfc on astra/na1-controls-adaptive-shadow. Cort's real run confirms 43884374 restored DLAA and all three recordings. The lens fit stayed ambiguous on the turns. Continue testing the camera-independent lighting on the existing recordings. The largest measured motion discrepancy is curvature during Turn 2. See COMMS and the PR's research/contact-shadows/REFEREE-TUNING.md. The new Resistance menu is staged as local/Resistance-Recorder-Launchers/Install-Resistance-Menu-853f5dfc.cmd. Both offline menu widths and the isolated upgrade and rollback were verified. Cort can install the menu with the game closed. No further capture is needed for this investigation.
+
+### November 22, 2026 (Pacific) · Graphite menu correction
+
+Use local/Resistance-Recorder-Launchers/Install-Resistance-Menu-7a7c688b.cmd for Cort's revised dark menu. Revision 7a7c688b restores graphite and uses one italic face for the complete NeuralAlias title. The staged Resistance installer passed the upgrade and rollback rehearsal. See COMMS for verification.
