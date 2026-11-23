@@ -231,3 +231,7 @@ Cort set a 99% floor for placement and strength. The offline solver uses rigid p
 ### Paired still / pan lighting captures, November 22 Pacific
 
 On `astra/na1-controls-adaptive-shadow`, PR 197 at `71afc93e` adds two evidence controls to Picture > Live DLAA. Five Release regressions passed, including clicks and 30 complete sample frames per condition. The Three Kingdoms staging folder is `local/Lighting-Test-Three-Kingdoms-71afc93e` in Cort's usual project checkout. Ten package hashes and isolated install / results / rollback passed. Cort owns the live recordings. Opus's research request is in COMMS at `dd48f48b`, including the unavailable camera, synthetic and real-game results, camera-free workaround and qualification criteria.
+
+### November 22 Pacific — Resistance lighting recorder staged
+
+The verified first-test package is `local/Lighting-Test-Resistance-71afc93e` in Cort's project checkout. INSTALL.cmd uses the existing Resistance receipt. A temporary-directory upgrade from the deployed release, paired metadata collection, rollback and all 12 final payload hashes passed. The live game still has `39fdbc53`. Cort owns the two 15-second campaign recordings with recorder `71afc93e`. Three Kingdoms remains available for the second game.
