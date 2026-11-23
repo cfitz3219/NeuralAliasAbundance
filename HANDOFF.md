@@ -223,3 +223,7 @@ PR 196 merged to the Route B integration branch at 492bd4b1. At displayed 100%, 
 ### November 22, 2026 (Pacific) — Post-DLAA enhancer, first offline review
 
 Astra's shared line is `astra/na1-controls-adaptive-shadow`, PR 196 base `492bd4b1`. The invalid-camera SE4 after-picture is bit-identical to the captured DLAA plane. Of 390 complete Route B frames, 201 passed both matrix reconstruction and viewport-scale checks. Six invertible Resistance matrices failed the latter. The same two-sided lighting controls await Claude's recombine stage and Cort's comparison. Proposed shared darkening budget for that review is 0.010 stops on average and 0.040 in the worst 1/16-height tile. See the November 23 UTC correction in COMMS for capture coverage and remaining qualification. No game build or deployment.
+
+### Camera-free lighting qualification, November 22 Pacific
+
+Cort set a 99% floor for placement and strength. The offline solver uses rigid point pairs to infer a scale-relative projection from depth and motion. All three known-projection controls passed at 0.25 px tracking noise. All 13 real bursts lacked independent calibration agreement. The direct-depth AO baseline failed on all 201 usable reference frames. The released DLAA path is independent. See COMMS for criteria, the diagnostic at `36b9274f` on `astra/na1-controls-adaptive-shadow`, and the saved visual report. Real moving-scene qualification remains open.
