@@ -1,5 +1,7 @@
 # Picture-conditioned contact shadows
 
+Cort rejected the visual strength of this first experiment. The stronger contact and curved-lighting candidate, native-resolution pictures, revised test limits and results are documented in [Visible lighting](VISIBLE-LIGHTING.md).
+
 Offline experiment for the post-DLAA lighting layer. The existing Intel XeGTAO renderer supplies an independent visual comparison. The candidate estimates its own field from the registered input picture and directed device depth. It requires neither an engine camera nor an assumed field of view. It does not recover metric depth or surface normals for the separate curved-lighting pass.
 
 ## What determines a pixel's shade
