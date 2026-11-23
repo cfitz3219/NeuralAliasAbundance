@@ -247,3 +247,7 @@ Astra's PR #197 at acc7b235 contains a camera-independent per-pixel shadow propo
 ### November 22 Pacific — Stronger lighting proof
 
 Cort rejected the first Astra photos as too mild. PR #197 at c8fa3442 has the stronger offline candidate, individual layer controls, four 3440 × 1440 comparisons and a 120-frame replay. Local proofs are under local/lighting-strength-study. The 0.24/0.82 stop budget is provisional for visual review. Nothing was installed. Moving gameplay and GPU cost remain open. See research/contact-shadows/VISIBLE-LIGHTING.md.
+
+### 2026-11-23 — Referee chooses shadow and curvature settings in saved-scene tests
+
+PR #197 at 68604450 contains the adaptive offline auditions and the exact 50 FPS quality switch. Five saved recordings covered 150 custom lighting frames and 75 qualified Intel frames. Checking a carried shadow fit on an independent Three Kingdoms scene rejected it and retained the useful curvature fit. The full-resolution custom comparison and reports are under local/referee-lighting-calibration. See research/contact-shadows/REFEREE-TUNING.md on the PR. Cort still needs the Resistance recorder at d9106460 for 15 seconds each of Still, Turn 1 and Turn 2. Live integration, sustained motion, 99% location and strength agreement, and gameplay timing remain open.
