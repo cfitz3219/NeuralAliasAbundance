@@ -243,3 +243,7 @@ PR 197 recorder d9106460 uses separate Still, Turn 1 and Turn 2 buttons, with Sl
 ### 2026-11-22 Pacific — Offline contact-shadow design
 
 Astra's PR #197 at acc7b235 contains a camera-independent per-pixel shadow proposal guided by the game's existing treatment of comparable contacts. It includes a real Intel comparator, four 30-frame replays and a controlled rotation with adaptive and frozen settings. Regional and scene caps held across all 120 frames. Fable and Opus have the review request in COMMS. The staged recorder remains d9106460. Moving gameplay, joint curvature budgets, both live APIs, the 99% layer gate and GPU cost remain open.
+
+### November 22 Pacific — Stronger lighting proof
+
+Cort rejected the first Astra photos as too mild. PR #197 at c8fa3442 has the stronger offline candidate, individual layer controls, four 3440 × 1440 comparisons and a 120-frame replay. Local proofs are under local/lighting-strength-study. The 0.24/0.82 stop budget is provisional for visual review. Nothing was installed. Moving gameplay and GPU cost remain open. See research/contact-shadows/VISIBLE-LIGHTING.md.
