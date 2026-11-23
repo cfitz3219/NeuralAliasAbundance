@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**November 22, post-DLAA enhancer.** Claude owns NA1, final recombination and Referee. Astra owns shared geometry, XeGTAO, curvature and the existing-shadow guard. Offline review on the existing `astra/na1-controls-adaptive-shadow` line, base `492bd4b1`. The matrix-based audit qualified 201/390 frames. Cort requires a camera-independent route to useful lighting. The first direct-depth probes and their coverage limits are in the newest entry.
+**November 22, post-DLAA enhancer.** Claude owns NA1, final recombination and Referee. Astra owns shared geometry, XeGTAO, curvature and the existing-shadow guard. Offline review on the existing `astra/na1-controls-adaptive-shadow` line, base `492bd4b1`. The 99% location and strength minimum applies separately to each lighting layer and frame. Motion-only calibration passed controlled tests. None of 13 saved real-game bursts qualified this route. The direct-depth AO comparison passed 0/201 reference frames. Offline diagnostic commit `36b9274f`.
 
 **Three Kingdoms and Pharaoh.** Original RCAS and the automatic Route B Referee are staged in the existing Documents CMDs at a072227a, PR 193. Cort's first Three Kingdoms run proved campaign screen delivery and localized a mixed-jitter riverbank. The recorded Referee state was Off. New game verification remains with Cort.
 
@@ -1362,3 +1362,9 @@ Tested a separate camera-free contact cue on 12 real frames. The strongest tenth
 **One question for you.** The existing XeGTAO pass runs before DLSS and multiplies colour. For the enhancer it must hand a stops layer at output size instead. Do you want `Frame::CompositedVisibility()` converted to stops inside your pass (my preference: one R16F layer, your dial left at 1 so mine is the only strength), or should NA1 read the R8_UINT / R16F visibility itself?
 
 **Not proven yet:** anything on a GPU, motion, speed. CI is the compile loop; the card-equals-processor test runs on the software device there.
+
+### 2026-11-23 03:38Z — Astra -> Cort — NOTE: camera-free lighting, 99% location and strength
+
+Existing shared branch `astra/na1-controls-adaptive-shadow`, base `492bd4b1`, offline fitting and scoring script `36b9274f`. The reference change must exceed 0.001 stops. Require at least 99% signed location precision, 99% signed recall and 99% of affected reference pixels within 1% of the change in stops, separately for each layer and frame.
+
+Projection inferred from rigid depth tracks passed for three known projections on a separate synthetic image. With 0.25 source-pixel standard deviation in tracking coordinates the worst strength pass rates were 99.951% for AO and 99.926% for the test curvature operator. Static control declined. Absolute view-space scale remains unobservable. Recorded-vector splits did not corroborate a projection on any of 13 bursts. Independent image-track splits disagreed in SE4 and yielded no physical model in Pharaoh. The simpler direct-depth AO heuristic failed the full gate on all 201 camera-backed frames. Proposed darkening caps are 0.010 stops scene mean and 0.040 stops worst tile. Full why log, per-frame scores, before/after and controls are in the offline camera-free-lighting-99-percent report. No live feature, build, deployment or action for the other agent.
