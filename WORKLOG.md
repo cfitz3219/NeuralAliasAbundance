@@ -2424,3 +2424,7 @@ Resistance build 43884374 recorded Still, Turn 1 and Turn 2 at 30 frames each wi
 ### November 22, 2026 (Pacific) · Independent lens recovery on Cort's two turns
 
 A second offline approach used color matches plus both saved depth images and produced 50.75 and 50.50 degrees in Resistance. A known synthetic lens was recovered on the search grid. Turn 1 had only two qualifying pairs. Against a historical 50-degree lens under a fixed-lens assumption, neither result reaches the 1% focal-error threshold. Runtime and the installer are unchanged. See research/camera-independent-lighting/RECORDINGS.md for method, sampling sensitivity and limits.
+
+### November 22, 2026 (Pacific) · Restore Cort's dark in-game palette
+
+Cort reported the pearl workspace and evergreen header were jarring during play and asked why only Alias was italicized. Restored the pre-redesign graphite window, grouped controls, text and status colors from the earlier shared style. The header and toolbar now use the original navigation and selection colors. The resize handle uses the same palette. The complete NeuralAlias name renders in a single Georgia Italic run, with the full name slanted in the embedded display font if Georgia is unavailable. Retained the 60% larger text, 125% larger brand and responsive page layout. Staged the correction for the Resistance recorder. Player installation remains separate.

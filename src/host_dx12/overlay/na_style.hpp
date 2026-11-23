@@ -3,8 +3,7 @@
 // do not fork per route. Header-only so Route B can include it without
 // linking Route A code.
 //
-// An evergreen masthead and pearl workspace share one responsive layout on both routes.
-// The split wordmark pairs the light display face with a script-like italic.
+// Both routes share graphite surfaces, warm text, and one italic wordmark.
 // Metrics use one scale factor (SetScale, default 1.25 since A42) plus an optional
 // "Bold" text weight preference (A44; it replaced the earlier "Large" size).
 // Colour always accompanies words: no state is conveyed by colour alone.
@@ -25,16 +24,30 @@ inline ImVec4 Rgb(unsigned hex, float a = 1.0f)
                   (hex & 0xFF) / 255.0f, a);
 }
 
-// Pearl content and grouped settings sit below an evergreen title and toolbar.
-inline const ImVec4 kBg = Rgb(0xE9EBE7), kBgRow = Rgb(0xFAFBF8), kBgRaised = Rgb(0xE8ECE7);
-inline const ImVec4 kBgHover = Rgb(0xD9E3DA), kBgCard = Rgb(0xF3F5F1), kBgCardOn = Rgb(0xDDE9D9);
-inline const ImVec4 kBgNavOn = Rgb(0xCDDFCE), kLine = Rgb(0xC6CDC6), kLineSoft = Rgb(0x9CA99F);
-inline const ImVec4 kText = Rgb(0x182921), kTextDim = Rgb(0x4F6057);
-inline const ImVec4 kAccent = Rgb(0x426E51), kFocus = Rgb(0x41775D);
-inline const ImVec4 kSwitchOn = Rgb(0x548467), kSwitchOff = Rgb(0x87928C);
-inline const ImVec4 kOk = Rgb(0x316547), kWarn = Rgb(0x785414), kError = Rgb(0x9B3737);
-inline const ImVec4 kChrome = Rgb(0x14241E), kChromeText = Rgb(0xF4F3E8), kChromeMuted = Rgb(0xBDCDC0);
-inline const ImVec4 kBgPanel = kBg, kSignal = kAccent, kSignalDim = kSwitchOn;
+// ---- Tokens (DESIGN.md "Tokens and layout") ----
+inline const ImVec4 kBg       = Rgb(0x111716);        // window
+inline const ImVec4 kBgNav    = Rgb(0x151C1A);        // navigation and title bar
+inline const ImVec4 kBgRow    = Rgb(0x1E2524);        // rows / groups
+inline const ImVec4 kBgRaised = Rgb(0x2E3733);        // buttons, inputs
+inline const ImVec4 kBgHover  = Rgb(0x464942);
+inline const ImVec4 kBgCard   = Rgb(0x30322E);        // mode cards
+inline const ImVec4 kBgCardOn = Rgb(0x37493E);        // selected card
+inline const ImVec4 kBgNavOn  = Rgb(0x323C35);        // current page
+inline const ImVec4 kLine     = Rgb(0x28302E);
+inline const ImVec4 kLineSoft = Rgb(0x62675F);
+inline const ImVec4 kText     = Rgb(0xF2F2EA);
+inline const ImVec4 kTextDim  = Rgb(0xB8C2BB);
+inline const ImVec4 kAccent   = Rgb(0xB7CF97);        // selection
+inline const ImVec4 kFocus    = Rgb(0xC7E4CE);        // keyboard/controller focus
+inline const ImVec4 kSwitchOn = Rgb(0x729B82);
+inline const ImVec4 kSwitchOff= Rgb(0x5E655F);
+inline const ImVec4 kOk       = Rgb(0x9BDBB5);        // "good", with words
+inline const ImVec4 kWarn     = Rgb(0xE2C685);        // "attention", with words
+inline const ImVec4 kError    = Rgb(0xFF8A94);        // failures, with words
+// Compatibility aliases (earlier tokens still referenced by route code).
+inline const ImVec4 kBgPanel  = kBg;
+inline const ImVec4 kSignal   = kAccent;
+inline const ImVec4 kSignalDim= kSwitchOn;
 
 constexpr float kBaseBodyPx = 16.5f * 1.60f, kBaseLabelPx = 15.0f * 1.60f, kBaseHelpPx = 12.0f * 1.60f;
 constexpr float kBaseTitlePx = 29.0f * 1.60f, kBaseBrandPx = 20.0f * 2.25f;
@@ -173,7 +186,7 @@ inline void ApplyStyle()
 
     ImVec4* c = s.Colors;
     c[ImGuiCol_WindowBg] = kBg;
-    c[ImGuiCol_TextSelectedBg] = Rgb(0xB7CFC0);
+    c[ImGuiCol_TextSelectedBg] = kBgHover;
     c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_PopupBg] = kBgRaised;
     c[ImGuiCol_Border] = kLine;
@@ -202,6 +215,9 @@ inline void ApplyStyle()
     c[ImGuiCol_ScrollbarGrab] = kLine;
     c[ImGuiCol_ScrollbarGrabHovered] = kLineSoft;
     c[ImGuiCol_ScrollbarGrabActive] = kAccent;
+    c[ImGuiCol_ResizeGrip] = kLine;
+    c[ImGuiCol_ResizeGripHovered] = kLineSoft;
+    c[ImGuiCol_ResizeGripActive] = kFocus;
     c[ImGuiCol_NavCursor] = kFocus;
     c[ImGuiCol_TableBorderLight] = kLine;
     c[ImGuiCol_TableBorderStrong] = kLine;
@@ -287,7 +303,7 @@ inline void StatusBanner(int state, const char* text)
     PopFont();
     float h = ts.y + pad * 2;
     ImVec2 p = ImGui::GetCursorScreenPos();
-    ImU32 border = ImGui::GetColorU32(state == 2 ? Rgb(0xB3A485) : kLine);
+    ImU32 border = ImGui::GetColorU32(state == 2 ? Rgb(0x635139) : kLine);
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(kBgRow), S(kRadiusGroup));
     dl->AddRect(p, ImVec2(p.x + w, p.y + h), border, S(kRadiusGroup));
     ImVec4 dotc = state == 1 ? kOk : (state == 2 ? kWarn : kTextDim);
@@ -390,7 +406,7 @@ inline void DrawSharpnessTrack(int percent, bool show_label)
     dl->AddRectFilled(lo, hi, ImGui::GetColorU32(kBgRaised), S(kRadiusControl));
     dl->AddLine({start, y}, {end, y}, ImGui::GetColorU32(kLineSoft), S(2));
     dl->AddLine({start, y}, {x, y}, ImGui::GetColorU32(kAccent), S(2));
-    dl->AddCircleFilled({x, y + S(1)}, r, ImGui::GetColorU32(kLineSoft));
+    dl->AddCircleFilled({x, y + S(1)}, r, ImGui::GetColorU32(kBgNav));
     dl->AddCircleFilled({x, y}, r, ImGui::GetColorU32(Rgb(0xC7C2B4)));
     dl->AddLine({x - .55f*r, y - .48f*r}, {x + .55f*r, y - .48f*r}, ImGui::GetColorU32(kText));
     char value[8];
@@ -568,9 +584,9 @@ inline bool NavButton(const char* label, bool current, float width)
     ImDrawList* draw = ImGui::GetWindowDrawList();
     if (current || ImGui::IsItemHovered())
         draw->AddRectFilled(pos, {pos.x+width,pos.y+height},
-            ImGui::GetColorU32(current ? Rgb(0xE2EBDD) : Rgb(0x34483C)), height/2);
-    if (ImGui::IsItemFocused()) draw->AddRect(pos,{pos.x+width,pos.y+height},ImGui::GetColorU32(kChromeMuted),height/2);
-    draw->AddText({pos.x+S(15),pos.y+S(6)}, ImGui::GetColorU32(current ? kText : kChromeText),label);
+            ImGui::GetColorU32(current ? kBgNavOn : kBgHover), height/2);
+    if (ImGui::IsItemFocused()) draw->AddRect(pos,{pos.x+width,pos.y+height},ImGui::GetColorU32(kFocus),height/2);
+    draw->AddText({pos.x+S(15),pos.y+S(6)}, ImGui::GetColorU32(current ? kText : kTextDim),label);
     PopFont();
     return clicked;
 }
@@ -605,26 +621,23 @@ inline bool BeginDetails(const char* label)
     return open;
 }
 
-// Two typographic voices form the wordmark. The staircase has no drawing or hit area.
+// Render the product name as one italic run so both halves share the same face and spacing.
 inline bool TitleBar(const char* game_name)
 {
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const float width = ImGui::GetContentRegionAvail().x;
     const float size = BrandPx(), close_width = S(36);
-    const ImU32 ink = ImGui::GetColorU32(kChromeText);
-    ImGui::PushFont(Cfg().display, size);
-    draw->AddText(pos, ink, "Neural");
-    const float split = ImGui::CalcTextSize("Neural").x;
-    ImGui::PopFont();
+    const ImU32 ink = ImGui::GetColorU32(kText);
+    constexpr char wordmark[] = "NeuralAlias";
     ImGui::PushFont(Cfg().wordmark_italic ? Cfg().wordmark_italic : Cfg().display, size);
     const int begin = draw->VtxBuffer.Size;
-    draw->AddText({pos.x+split,pos.y}, ink, "Alias");
+    draw->AddText(pos, ink, wordmark);
     if (!Cfg().wordmark_italic) {
         for (int i = begin; i < draw->VtxBuffer.Size; ++i)
             draw->VtxBuffer[i].pos.x += (pos.y + size*.80f - draw->VtxBuffer[i].pos.y)*.20f;
     }
-    const float brand_width = split + ImGui::CalcTextSize("Alias").x + S(10);
+    const float brand_width = ImGui::CalcTextSize(wordmark).x + S(10);
     ImGui::PopFont();
     const float close_x = pos.x + width - close_width;
     if (game_name && *game_name) {
@@ -632,13 +645,13 @@ inline bool TitleBar(const char* game_name)
         const float name_width = ImGui::CalcTextSize(game_name).x;
         const float x = close_x - S(18) - name_width;
         if (x >= pos.x + brand_width + S(12))
-            draw->AddText({x,pos.y+(size-HelpPx())*.5f}, ImGui::GetColorU32(kChromeMuted), game_name);
+            draw->AddText({x,pos.y+(size-HelpPx())*.5f}, ImGui::GetColorU32(kTextDim), game_name);
         PopFont();
     }
     ImGui::SetCursorScreenPos({close_x,pos.y+(size-close_width)*.5f});
     const bool close = ImGui::InvisibleButton("Close menu", {close_width,close_width}, ImGuiButtonFlags_EnableNav);
     const ImVec2 center{close_x+close_width*.5f,pos.y+size*.5f};
-    draw->AddCircleFilled(center,close_width*.46f,ImGui::GetColorU32(ImGui::IsItemHovered() ? Rgb(0x53685A) : Rgb(0x34483C)));
+    draw->AddCircleFilled(center,close_width*.46f,ImGui::GetColorU32(ImGui::IsItemHovered() ? kBgHover : kBgRaised));
     const float r=S(5.5f);
     draw->AddLine({center.x-r,center.y-r},{center.x+r,center.y+r},ink,S(1.6f));
     draw->AddLine({center.x-r,center.y+r},{center.x+r,center.y-r},ink,S(1.6f));

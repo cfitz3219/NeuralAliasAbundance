@@ -2919,13 +2919,9 @@ void draw_panel(bool just_opened)
     const float chrome_h = tab_y + LabelPx() + S(28);
     const ImVec2 origin = ImGui::GetWindowPos();
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(origin,{origin.x+w,origin.y+chrome_h}, ImGui::GetColorU32(kChrome),
+    draw->AddRectFilled(origin,{origin.x+w,origin.y+chrome_h}, ImGui::GetColorU32(kBgNav),
                         S(kRadiusWindow),ImDrawFlags_RoundCornersTop);
-    // A soft directional reflection stays inside the chrome, with a single hairline at the edge.
-    const ImU32 glow = IM_COL32(169,190,163,28), clear = IM_COL32(169,190,163,0);
-    draw->AddRectFilledMultiColor({origin.x+S(kRadiusWindow),origin.y+1},
-        {origin.x+w-S(kRadiusWindow),origin.y+chrome_h},glow,clear,clear,clear);
-    draw->AddLine({origin.x+S(kRadiusWindow),origin.y+1},{origin.x+w-S(kRadiusWindow),origin.y+1},IM_COL32(217,229,215,76));
+    draw->AddLine({origin.x,origin.y+chrome_h},{origin.x+w,origin.y+chrome_h},ImGui::GetColorU32(kLine));
     ImGui::SetCursorPos({pad_x,S(20)});
     ImGui::BeginChild("##masthead",{w-pad_x*2,BrandPx()+S(4)},ImGuiChildFlags_None,
                        ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse|ImGuiWindowFlags_NoBackground);
