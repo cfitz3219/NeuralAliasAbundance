@@ -12,6 +12,7 @@
 #pragma once
 
 #include <imgui.h>
+#include <windows.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -26,24 +27,24 @@ inline ImVec4 Rgb(unsigned hex, float a = 1.0f)
 }
 
 // ---- Tokens (DESIGN.md "Tokens and layout") ----
-inline const ImVec4 kBg       = Rgb(0x242522);        // window
-inline const ImVec4 kBgNav    = Rgb(0x1E201E);        // navigation column
-inline const ImVec4 kBgRow    = Rgb(0x2B2C29);        // rows / groups
-inline const ImVec4 kBgRaised = Rgb(0x393B37);        // buttons, inputs
+inline const ImVec4 kBg       = Rgb(0x111716);        // window
+inline const ImVec4 kBgNav    = Rgb(0x151C1A);        // navigation column
+inline const ImVec4 kBgRow    = Rgb(0x1E2524);        // rows / groups
+inline const ImVec4 kBgRaised = Rgb(0x2E3733);        // buttons, inputs
 inline const ImVec4 kBgHover  = Rgb(0x464942);
 inline const ImVec4 kBgCard   = Rgb(0x30322E);        // mode cards
 inline const ImVec4 kBgCardOn = Rgb(0x37493E);        // selected card
 inline const ImVec4 kBgNavOn  = Rgb(0x323C35);        // current page
-inline const ImVec4 kLine     = Rgb(0x40443E);
+inline const ImVec4 kLine     = Rgb(0x28302E);
 inline const ImVec4 kLineSoft = Rgb(0x62675F);
-inline const ImVec4 kText     = Rgb(0xF4F0E7);
-inline const ImVec4 kTextDim  = Rgb(0xC4C5BC);
-inline const ImVec4 kAccent   = Rgb(0xA6CDB2);        // selection
+inline const ImVec4 kText     = Rgb(0xF2F2EA);
+inline const ImVec4 kTextDim  = Rgb(0xB8C2BB);
+inline const ImVec4 kAccent   = Rgb(0xB7CF97);        // selection
 inline const ImVec4 kFocus    = Rgb(0xC7E4CE);        // keyboard/controller focus
 inline const ImVec4 kSwitchOn = Rgb(0x729B82);
 inline const ImVec4 kSwitchOff= Rgb(0x5E655F);
 inline const ImVec4 kOk       = Rgb(0x9BDBB5);        // "good", with words
-inline const ImVec4 kWarn     = Rgb(0xF1CA8A);        // "attention", with words
+inline const ImVec4 kWarn     = Rgb(0xE2C685);        // "attention", with words
 inline const ImVec4 kError    = Rgb(0xFF8A94);        // failures, with words
 // Compatibility aliases (earlier tokens still referenced by route code).
 inline const ImVec4 kBgPanel  = kBg;
@@ -72,8 +73,9 @@ constexpr float kRadiusWindow = 22.0f, kRadiusGroup = 12.0f, kRadiusControl = 10
 struct Config {
     float scale = 1.25f;  // A42: the user asked for half of the 2.5 default after session 6
     bool bold = false;    // A44: Preferences > Text weight: Bold (body text set in the heavier face)
-    char font_body[260] = "C:\\Windows\\Fonts\\Inter-Regular.ttf";
-    char font_title[260] = "C:\\Windows\\Fonts\\Inter-SemiBold.ttf";
+    char font_body[260]{};
+    char font_title[260]{};
+    ImFont* display = nullptr;
     ImFont* body = nullptr;
     ImFont* title = nullptr;
 };
@@ -127,21 +129,41 @@ inline ImFont* TextFace() { return (Cfg().bold && Cfg().title) ? Cfg().title : C
 
 // Call once after ImGui::CreateContext(), before the backend init. ImGui
 // 1.92 fonts are dynamically sized, so one face per weight is enough.
+inline ImFont* BundledPoise(WORD resource, const char* name, float size)
+{
+    // The same shared style runs in either proxy. Get the module containing this code.
+    static const int module_anchor = 0;
+    HMODULE module{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&module_anchor), &module)) return nullptr;
+    HRSRC entry = FindResourceW(module, MAKEINTRESOURCEW(resource), MAKEINTRESOURCEW(10));
+    if (!entry) return nullptr;
+    HGLOBAL handle = LoadResource(module, entry);
+    void* bytes = handle ? LockResource(handle) : nullptr;
+    const DWORD length = SizeofResource(module, entry);
+    if (!bytes || !length) return nullptr;
+    ImFontConfig font;
+    font.FontDataOwnedByAtlas = false; // the module owns the immutable bytes
+    std::snprintf(font.Name, sizeof font.Name, "%s", name);
+    return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(bytes, static_cast<int>(length), size, &font);
+}
+
 inline void LoadFonts()
 {
     ImGuiIO& io = ImGui::GetIO();
     Config& c = Cfg();
-    c.body = io.Fonts->AddFontFromFileTTF(c.font_body, S(kBaseBodyPx));
-    if (!c.body) c.body = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", S(kBaseBodyPx));
-    c.title = io.Fonts->AddFontFromFileTTF(c.font_title, S(kBaseTitlePx));
-    if (!c.title) c.title = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuisb.ttf", S(kBaseTitlePx));
-    if (!c.title) c.title = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", S(kBaseTitlePx));
+    c.body = c.font_body[0] ? io.Fonts->AddFontFromFileTTF(c.font_body, BodyPx()) : nullptr;
+    if (!c.body) c.body = BundledPoise(111, "Poise Regular", BodyPx());
+    c.title = c.font_title[0] ? io.Fonts->AddFontFromFileTTF(c.font_title, TitlePx()) : nullptr;
+    c.display = c.title ? c.title : BundledPoise(110, "Poise Light", TitlePx());
+    if (!c.title) c.title = BundledPoise(112, "Poise Medium", LabelPx());
     if (!c.body) {
         ImFontConfig fc;
         fc.SizePixels = S(kBaseBodyPx);
         c.body = io.Fonts->AddFontDefault(&fc);
     }
     if (!c.title) c.title = c.body;
+    if (!c.display) c.display = c.title;
     io.FontDefault = c.body;
 }
 
@@ -206,7 +228,7 @@ inline void PushBody() { ImGui::PushFont(TextFace(), BodyPx()); }
 inline void PushLabel() { ImGui::PushFont(TextFace(), LabelPx()); }
 inline void PushLabelStrong() { ImGui::PushFont(Cfg().title, LabelPx()); }
 inline void PushHelp() { ImGui::PushFont(TextFace(), HelpPx()); }
-inline void PushTitle() { ImGui::PushFont(Cfg().title, TitlePx()); }
+inline void PushTitle() { ImGui::PushFont(Cfg().display, TitlePx()); }
 inline void PopFont() { ImGui::PopFont(); }
 
 // Small uppercase-ish line above a page heading ("IMAGE QUALITY").
@@ -614,7 +636,7 @@ inline void Logo(ImVec4 color, float size)
 // Returns true when the close button was pressed.
 inline bool TitleBar(const char* game_name)
 {
-    ImGui::PushFont(Cfg().title, BrandPx());
+    ImGui::PushFont(Cfg().display, BrandPx());
     Logo(Rgb(0xDFE5EF), BrandPx() * 0.8f);
     ImGui::TextColored(kText, "NeuralAlias");
     ImGui::PopFont();

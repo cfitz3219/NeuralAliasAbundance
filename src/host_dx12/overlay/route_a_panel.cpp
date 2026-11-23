@@ -953,7 +953,10 @@ void DrawLiveDlaa()
             na::observe::SetSamplerMipBiasLive(on ? na::settings::DlaaMipBias(na::settings::Get()) : 0.0f);
     }
     EndRow();
-    DrawLightingTrials(on);
+    char native_status[200]{};
+    const bool recording_ready = na::on12::NativeRoute() ? na::native_d3d11::FormatMenuStatus(native_status, sizeof native_status) : st.active;
+    DrawLightingTrials(on && recording_ready);
+    if (on && !recording_ready) Hint("Recording will be available when Live DLAA starts producing frames.");
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
     if (na::settings::AddedUpscalingAllowed() &&
         (na::scale::native::Available() || na::scale::SliderRouteActive() ||
@@ -1066,10 +1069,7 @@ void DrawLiveDlaa()
     }
     const bool native = na::on12::NativeRoute();
     if (native) {
-        // Camera jitter has one switch for every route: Enhancements > DLAA enhancements.
-        char status[200]{};
-        const bool running = na::native_d3d11::FormatMenuStatus(status, sizeof status);
-        StatusLine(running ? 1 : 0, status);
+        StatusLine(recording_ready ? 1 : 0, native_status);
     }
     if (!native) {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};

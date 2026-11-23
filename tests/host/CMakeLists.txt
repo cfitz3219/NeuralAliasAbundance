@@ -133,7 +133,7 @@ na_host_test(render_scale_patch_test SOURCES render_scale_patch_test.cpp)
 na_host_test(settings_read_hook_test SOURCES settings_read_hook_test.cpp LIBS host_scale)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
-na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp LIBS host_dx12)
+na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12)
 
 # Fake NGX runtime (the one non-driver name ngx_observe accepts).
 add_library(nvngx_stub SHARED ngx_stub.cpp)
@@ -201,7 +201,7 @@ na_host_test(lighting_capture_test SOURCES lighting_capture_test.cpp LIBS host_c
 na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 
-na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
+na_host_test(overlay_test SOURCES overlay_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12 user32)
 na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32 d3d11)
 add_test(NAME host_overlay_bootstrap_automatic_test COMMAND overlay_bootstrap_test --automatic)
 set_tests_properties(host_overlay_bootstrap_automatic_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS host)
