@@ -235,3 +235,7 @@ On `astra/na1-controls-adaptive-shadow`, PR 197 at `71afc93e` adds two evidence 
 ### November 22 Pacific — Resistance lighting recorder staged
 
 The verified first-test package is `local/Lighting-Test-Resistance-71afc93e` in Cort's project checkout. INSTALL.cmd uses the existing Resistance receipt. A temporary-directory upgrade from the deployed release, paired metadata collection, rollback and all 12 final payload hashes passed. The live game still has `39fdbc53`. Cort owns the two 15-second campaign recordings with recorder `71afc93e`. Three Kingdoms remains available for the second game.
+
+### November 22 Pacific — Revised camera-free lighting tests
+
+PR 197 recorder d9106460 uses separate Still, Turn 1 and Turn 2 buttons, with Slide available only in the flat strategy-map packages for Three Kingdoms and Pharaoh. Use the d9106460 installers under local/Lighting-Test-* before the earlier paired recorder. Start with Resistance. RESULTS.cmd writes lighting-tests.json into the game's timestamped results folder. The live readout and lighting startup are not enabled. Thirteen archived bursts were inconclusive for lens recovery. See the current COMMS entry and research/camera-independent-lighting/RECORDINGS.md.
