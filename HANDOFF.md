@@ -219,3 +219,7 @@ Merge 0396a74f on astra/automatic-route-b-referee (PR 193) includes Fable throug
 ### 2026-11-21 Pacific — Graphite overlay and sharpness preview
 
 PR 196 merged to the Route B integration branch at 492bd4b1. At displayed 100%, RCAS now reaches 2.6x standard detail gain on both graphics APIs. The graphite menu fades around its anchored slider during deliberate drags and stays steady between clicks. Five Release tests passed, including RTX readback and native DX11 automatic DLAA. WORKLOG at e8bf0ed8 records the measured contrast, transition fix and input tests. Production DLL built in the integration worktree. Game installers continue to identify their own packaged versions.
+
+### November 22, 2026 (Pacific) — Post-DLAA enhancer, first offline review
+
+Astra's shared line is `astra/na1-controls-adaptive-shadow`, PR 196 base `492bd4b1`. The invalid-camera SE4 after-picture is bit-identical to the captured DLAA plane. Of 390 complete Route B frames, 201 passed both matrix reconstruction and viewport-scale checks. Six invertible Resistance matrices failed the latter. The same two-sided lighting controls await Claude's recombine stage and Cort's comparison. Proposed shared darkening budget for that review is 0.010 stops on average and 0.040 in the worst 1/16-height tile. See the November 23 UTC correction in COMMS for capture coverage and remaining qualification. No game build or deployment.
