@@ -47,6 +47,9 @@
 #include "host_dx12/settings.hpp"
 #include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/effects/donut.hpp"
+#if defined(NA_HAVE_NA1)
+#include "host_dx12/effects/na1.hpp"
+#endif
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "providers/camera/camera_admission.hpp"
@@ -58,6 +61,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <array>
 #include <cmath>
@@ -110,6 +114,9 @@ struct Slot {
     std::array<ComPtr<ID3D12Resource>, 4> native_scale_resources;
     std::shared_ptr<na::donut::Frame> grade;
     std::shared_ptr<na::xegtao::Frame> ambient; // existing slot fence owns AO descriptors/resources
+#if defined(NA_HAVE_NA1)
+    std::shared_ptr<na::na1::Frame> enhance;    // NA1's frame on this slot's list, kept the same way
+#endif
     std::shared_ptr<const PhysicalInput> physical; // Layer2 payload used by this slot's list: kept
                                                    // until the slot is reused (its fence completed)
 };
@@ -152,6 +159,12 @@ struct PendingHistory {
     UINT depth_lists = 0;
     uint64_t depth_submission = 0, depth_id = 0;
     na::native11::DepthEvidence depth_prefix{};
+#if defined(NA_HAVE_NA1)
+    // NA1's frame recorded with this evaluation. It is told when its list is really submitted
+    // (effects/na1.hpp Frame::Submitted): that is how the Referee's measurement comes back with
+    // nothing waiting. A recording that is thrown away never tells it.
+    std::shared_ptr<na::na1::Frame> enhance;
+#endif
 };
 
 // CPU metadata of this frame's last submitted scene. No pooled command-list
@@ -5038,6 +5051,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         }
     }
     if (deferred) { // render-small: depth/motion retained for Present, optional AO goes into the pre-HUD scene
+#if defined(NA_HAVE_NA1)
+        // NA1 is not built for this route (docs/NA1-ENHANCER.md section 1): the log says so.
+        if (na::na1::CurrentOptions().enabled)
+            na::na1::ScenePass().Unavailable("NA1 does not run on render-small frames (DLSS runs at Present there), so the picture is unchanged.");
+#endif
         if(ambient){
             const UINT from=color_msaa?D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:SRC;
             const UINT into=color_msaa?D3D12_RESOURCE_STATE_RENDER_TARGET:DST;
@@ -5216,6 +5234,69 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (t_ic) t_ic->mark(kIcFinish);
     if (!evaluated) ++g.stats.dlss_failed;
     if (shifted) { add(b, g.jshift.Get(), NPSR, UAV); flush(l, b); }
+#if defined(NA_HAVE_NA1)
+    // NA1 enhancer (docs/NA1-ENHANCER.md section 1): after DLSS, the Referee's copies and the cut
+    // show, before sharpening. Here it only READS the DLSS output and depth and writes a texture of
+    // its own; that texture is copied over the output further down, after an armed capture has
+    // saved the plain output. Whenever NA1 does not run, nothing below changes and the plain DLAA
+    // picture goes on; the reason is kept for the log.
+    std::shared_ptr<na::na1::Frame> enhance;
+    {
+        const na::na1::Options enhance_options = na::na1::CurrentOptions();
+        const int enhance_view = g_debug_view.load(std::memory_order_relaxed);
+        const char* enhance_skip = nullptr;
+        if (!enhance_options.enabled) {
+            // Not a skip: Prepare below answers "switched off" at once and lets go of its dials.
+        } else if (!evaluated) {
+            enhance_skip = "DLSS did not produce a picture this frame, so NA1 was not run.";
+        } else if (upscaling || skip_color) {
+            enhance_skip = "NA1 does not run on upscaled or Present-time frames, so the picture is unchanged.";
+        } else if (enhance_view >= 1 && enhance_view <= 3) {
+            enhance_skip = "A debug view is showing, so NA1 is not run.";
+        } else if (smear >= 0) {
+            enhance_skip = "The smear test is running, so NA1 is not run.";
+        } else if (rw != ow || rh != oh || w != ow || h != oh) {
+            enhance_skip = "Depth is not the same size as the DLSS output (a scaled or windowed frame), so NA1 is not run.";
+        }
+        if (enhance_skip) {
+            na::na1::ScenePass().Unavailable(enhance_skip);
+        } else {
+            na::na1::Inputs ni;
+            ni.color = g.output.Get();
+            ni.color_format = cf;
+            ni.depth = g.depth32.Get();
+            ni.depth_format = DXGI_FORMAT_R32_FLOAT;
+            ni.width = ow;
+            ni.height = oh;
+            ni.srgb = cf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || cf == DXGI_FORMAT_R8G8B8A8_UNORM; // the same rule the grade pass uses
+            ni.reversed = reversed;
+            ni.reset = e.reset;
+            // ni.delta[] stays empty in this build: the lighting layers of the other parts
+            // (docs/NA1-ENHANCER.md section 6) are passed here once those parts exist.
+            ni.now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            ni.frame_ms = 0; // no present-interval figure is at hand on this path; NA1 then uses its own fallback
+            enhance = na::na1::ScenePass().Prepare(g.device.Get(), g.queue.Get(), ni, enhance_options);
+            // Ownership before any command refers to it, exactly as the ambient and grade frames:
+            // the game's list keeps it through its submission, our own list keeps it in its ring slot.
+            if (inl) {
+                if (enhance && !na::nr::native::RetainRecording(l, enhance)) {
+                    enhance.reset();
+                    na::na1::ScenePass().Unavailable("The game's command list could not keep NA1's frame alive, so NA1 was not run.");
+                }
+            } else s.enhance = enhance; // also lets go of the frame this slot held before (its work has finished)
+            if (enhance) {
+                b.push_back(uav_barrier(g.output.Get()));
+                add(b, g.output.Get(), UAV, NPSR);
+                flush(l, b);
+                const bool enhance_recorded = enhance->Record(l); // compute only; it says why itself when it refuses
+                add(b, g.output.Get(), NPSR, UAV); // back to the state everything below expects, recorded or not
+                flush(l, b);
+                if (!enhance_recorded) enhance.reset();
+            }
+        }
+    }
+#endif
     if (capture_armed) {
         // Evidence capture: copied in this same list right after the evaluate, so the GPU
         // order makes them exactly this evaluation's inputs and raw DLSS output.
@@ -5231,6 +5312,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             if (resolved && resolved != spatial)
                 cp.extra[cp.extra_count++] = {"ao_temporal", resolved};
         }
+#if defined(NA_HAVE_NA1)
+        // The enhanced picture as NA1 wrote it, next to the plain DLSS output (cp.output) above.
+        if (enhance && enhance->Color() && cp.extra_count < na::capture::j2::kMaxExtra)
+            cp.extra[cp.extra_count++] = {"na1_out", enhance->Color()};
+#endif
         na::capture::j2::Identity ci;
         ci.present_ordinal = g.frame;
         ci.submission = g.stats.submissions;
@@ -5351,6 +5437,27 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             pending.capture = na::capture::j2::RecordEvaluation(l, cp, ci);
         }
     }
+#if defined(NA_HAVE_NA1)
+    if (enhance) {
+        // NA1's picture over the DLSS output, so sharpening, the write-back, repeat frames and
+        // everything else below see it in the texture they already use. A frame that only measured
+        // (every dial at zero) has no picture: nothing is copied and the output stays as DLSS left it.
+        if (ID3D12Resource* const enhanced = enhance->Color()) {
+            add(b, enhanced, NPSR, SRC);
+            add(b, g.output.Get(), UAV, DST);
+            flush(l, b);
+            D3D12_TEXTURE_COPY_LOCATION es{}, ed{};
+            es.Type = ed.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            es.pResource = enhanced;
+            ed.pResource = g.output.Get();
+            l->CopyTextureRegion(&ed, 0, 0, 0, &es, nullptr);
+            add(b, enhanced, SRC, NPSR); // NA1's texture goes back as NA1 left it
+            add(b, g.output.Get(), DST, UAV);
+            flush(l, b);
+        }
+        pending.enhance = enhance; // told when this list is really submitted (Execute)
+    }
+#endif
     if (evaluated) {
         const int dv = g_debug_view.load(std::memory_order_relaxed);
         if (dv >= 1 && dv <= 3) {
@@ -8435,8 +8542,21 @@ bool PreHudUpscale(ID3D12CommandQueue* queue,ID3D12Resource* frame,uint32_t rw,u
 
 void InstallScreenDiscovery();
 
+#if defined(NA_HAVE_NA1)
+// The Referee's paired thumbnails (DLSS output and presented screen) go to NA1, which fits its
+// display curve from them. The Referee's library cannot call NA1 itself (this library links it, not
+// the other way round), so it is handed this function. Runs on the Referee's background worker.
+static void na1_screen_pair(const float* output_log2, const float* screen_log2, uint32_t count, bool screen_is_sdr)
+{
+    na::na1::ScenePass().SetScreenPair(output_log2, screen_log2, count, screen_is_sdr);
+}
+#endif
 void SetEnabled(bool on)
 {
+#if defined(NA_HAVE_NA1)
+    // Both added-DLAA routes (DX12 and native DX11) are switched on through here.
+    referee::gpu::SetThumbnailSink(on ? &na1_screen_pair : nullptr);
+#endif
     na::settings::ConfigureReferee(on, referee::gpu::Supported());
     g.enabled.store(on);
     g.configured.store(on);
@@ -9493,6 +9613,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
                 g.slot = (g.slot + 1) % kRing;
                 na::dlss::BeforeExecute(queue, static_cast<UINT>(batch.size()), batch.data());
                 forward(queue, static_cast<UINT>(batch.size()), batch.data());
+#if defined(NA_HAVE_NA1)
+                if (pending.enhance) pending.enhance->Submitted(queue); // our list is on the queue: NA1's measurement can come back
+#endif
                 na::dlss::OnExecuted(queue, static_cast<UINT>(batch.size()), batch.data());
                 g.tracker = pending.tracker;
                 if (pending.has_interlopers) g.interlopers = pending.interlopers;
@@ -9554,6 +9677,10 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         if (g.inl_redirected) { g_nb.redirect_submitted.fetch_add(1, std::memory_order_relaxed); g.inl_redirected = false; }
         na::capture::j2::Submitted(g.inl.history.capture, queue, g.stats.submissions, g.inl.history.recovery_tools, g.inl.history.recovery_applied);
         na::j2::compute_flow::Committed(g.inl.history.compute_flow);
+#if defined(NA_HAVE_NA1)
+        // The game has submitted the list that holds NA1's passes (forwarded above).
+        if (g.inl.history.enhance) { g.inl.history.enhance->Submitted(queue); g.inl.history.enhance.reset(); }
+#endif
         g.inl.history.capture = 0;
         g.inl.valid = false;
         reason(g_native_reduced.load(std::memory_order_relaxed)?"Native scene DLSS reconstructed at full output before later game draws.":
@@ -9685,6 +9812,9 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
     g.slot = (g.slot + 1) % kRing;
     na::dlss::BeforeExecute(queue, n2, batch.data());
     na::j2::flow::Submit(queue, flow_ticket, batch.data(), n2, ours_at, forward); // one forward unless a flow pair is consumed
+#if defined(NA_HAVE_NA1)
+    if (pending.enhance) pending.enhance->Submitted(queue); // our list is on the queue: NA1's measurement can come back
+#endif
     if (g.jitter_on) count_post_dlaa(lists, static_cast<UINT>(scene) + 1, count, depth_id); // same batch, after the DLAA list
     // The void D3D12 forward has now submitted our list. Failed recording/NGX
     // attempts above must never replace the previous submitted camera.

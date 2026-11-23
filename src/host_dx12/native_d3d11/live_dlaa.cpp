@@ -19,6 +19,9 @@
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/effects/donut.hpp"
+#if defined(NA_HAVE_NA1)
+#include "host_dx12/effects/na1.hpp"
+#endif
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/draw_replay.hpp"
@@ -33,6 +36,7 @@
 #include <cstring>
 #include <vector>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -61,6 +65,9 @@ struct Slot {
     uint64_t native_done = 0, effects_done = 0;
     std::shared_ptr<xegtao::Frame> ambient;
     std::shared_ptr<donut::Frame> grade;
+#if defined(NA_HAVE_NA1)
+    std::shared_ptr<na1::Frame> enhance; // NA1's frame on this slot's list; let go when the slot is reused
+#endif
     // Draw replay: this frame's replayed positions, packed by the game's context (native11/draw_replay.hpp Pack).
     SharedTexture positions;
     ComPtr<ID3D11UnorderedAccessView> positions_view;
@@ -512,6 +519,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     if (slot.after) nr::native::Reset(slot.after.Get());
     slot.ambient.reset();
     slot.grade.reset();
+#if defined(NA_HAVE_NA1)
+    slot.enhance.reset();
+#endif
     if (FAILED(slot.allocator->Reset()) || FAILED(list->Reset(slot.allocator.Get(), nullptr)))
         return FailSession(s, "Could not reset the native effects list.");
     auto* shared_depth = slot.depth.Effects();
@@ -881,6 +891,44 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // execution order, with no wait (compute_flow.hpp RecordCutShow). Nothing happens on other frames.
     if (measured && evaluated && flow.pair)
         j2::compute_flow::RecordCutShow(list, flow, eval.color, slot.output.Effects());
+#if defined(NA_HAVE_NA1)
+    // NA1 enhancer (docs/NA1-ENHANCER.md section 1): after DLSS, the Referee's copies and the cut
+    // show, before sharpening; on the companion route this is the list that follows DLSS. Here it
+    // only READS the DLSS output and depth and writes a texture of its own; that texture is copied
+    // over the output further down, after an armed capture has saved the plain output. Whenever NA1
+    // does not run, nothing below changes and the plain DLAA picture goes on; the reason is kept
+    // for the log. Every branch leaves the shared images in the states it found them in.
+    {
+        const na1::Options enhance_options = na1::CurrentOptions();
+        if (enhance_options.enabled && !evaluated) {
+            na1::ScenePass().Unavailable("DLSS did not produce a picture this frame, so NA1 was not run.");
+        } else {
+            // Switched off also comes through here: Prepare answers "switched off" at once.
+            na1::Inputs ni;
+            ni.color = slot.output.Effects();
+            ni.color_format = cf;
+            ni.depth = shared_depth; // the same size as the picture on this route (checked above)
+            ni.depth_format = DXGI_FORMAT_R32_FLOAT;
+            ni.width = ci.width;
+            ni.height = ci.height;
+            ni.srgb = !hdr; // the same rule the ambient and grade passes use
+            ni.reversed = frame.reversed_depth;
+            ni.reset = eval.reset;
+            // ni.delta[] stays empty in this build: the lighting layers of the other parts
+            // (docs/NA1-ENHANCER.md section 6) are passed here once those parts exist.
+            ni.now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            ni.frame_ms = 0; // no present-interval figure is at hand on this path; NA1 then uses its own fallback
+            slot.enhance = na1::ScenePass().Prepare(s.device.Get(), s.queue.Get(), ni, enhance_options);
+            if (slot.enhance) {
+                Barrier(list, slot.output.Effects(), kWrite, kRead);
+                const bool enhance_recorded = slot.enhance->Record(list); // it says why itself when it refuses
+                Barrier(list, slot.output.Effects(), kRead, kWrite); // as everything below expects, recorded or not
+                if (!enhance_recorded) slot.enhance.reset();
+            }
+        }
+    }
+#endif
     if (capture_armed) {
         // A saved capture also takes the scene's source textures, once per capture folder.
         static std::wstring texture_dump_for;
@@ -898,6 +946,11 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         // against a differently shaded image. No extra live readback.
         if (eval.color != slot.color.Effects())
             planes.extra[planes.extra_count++] = {"source_color", slot.color.Effects(), kRead};
+#if defined(NA_HAVE_NA1)
+        // The enhanced picture as NA1 wrote it, next to the plain DLSS output (planes.output) above.
+        if (slot.enhance && slot.enhance->Color())
+            planes.extra[planes.extra_count++] = {"na1_out", slot.enhance->Color(), kRead};
+#endif
         capture::j2::Identity id;
         id.present_ordinal = id.inputs_frame = frame.frame;
         id.view_color = c.incarnation;
@@ -935,6 +988,24 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         }
         capture_token = capture::j2::RecordEvaluation(list, planes, id);
     }
+#if defined(NA_HAVE_NA1)
+    // NA1's picture over the DLSS output, so sharpening and the copy back to the game see it in the
+    // texture they already use. A frame that only measured (every dial at zero) has no picture:
+    // nothing is copied and the output stays as DLSS left it.
+    if (ID3D12Resource* const enhanced = slot.enhance ? slot.enhance->Color() : nullptr) {
+        constexpr auto kCopyFrom = D3D12_RESOURCE_STATE_COPY_SOURCE, kCopyTo = D3D12_RESOURCE_STATE_COPY_DEST;
+        Barrier(list, enhanced, kRead, kCopyFrom);
+        Barrier(list, slot.output.Effects(), kWrite, kCopyTo);
+        D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+        to.pResource = slot.output.Effects();
+        to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = enhanced;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        Barrier(list, enhanced, kCopyFrom, kRead); // NA1's texture goes back as NA1 left it
+        Barrier(list, slot.output.Effects(), kCopyTo, kWrite);
+    }
+#endif
     auto* result = slot.output.Native();
     uint32_t sharpened = 0;
     const uint32_t slider = (std::min)(settings::Get().j2_sharpness.load(), 100u);
@@ -1018,6 +1089,12 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         nr::native::Submission submitted(s.queue.Get(), 1, lists);
         s.queue->ExecuteCommandLists(1, lists);
     }
+#if defined(NA_HAVE_NA1)
+    // The list that holds NA1's passes is on the queue: its measurement can come back with nothing
+    // waiting (effects/na1.hpp Frame::Submitted). Not when DLSS turned out not to have run (the
+    // companion route learns that only here): that list measured a picture nobody will see.
+    if (slot.enhance && evaluated) slot.enhance->Submitted(s.queue.Get());
+#endif
     j2::compute_flow::Committed(flow);
     // The picture is acquired: really submitted, whatever happens to this frame's DLSS step.
     if (flow.context) s.flow_frame = frame.frame;

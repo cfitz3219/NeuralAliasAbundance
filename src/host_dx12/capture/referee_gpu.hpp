@@ -104,6 +104,19 @@ struct LastSample {
     uint32_t centered_layout = 0; // nonzero only if multiple regions favored the same padded mapping
     uint8_t flicker_stage = 0;
 };
+// The paired thumbnails of one sample, for one listener outside this library (the NA1 enhancer fits
+// its display curve from them; this library cannot call it, so the host hands the function in).
+// output_log2 is the DLSS output and screen_log2 the presented screen of the same frame: `count`
+// cells each (128 x 72, row by row), cell for cell, each the log2 of (luma + 1e-4) of the picture
+// as it is read (float pictures as they are, plain 8-bit pictures as their stored bytes).
+// Called on the background worker that scores the sample, never on a game thread, and only when
+// the two pictures cover the same view. The pointers are valid only during the call.
+// screen_is_sdr is true only when the presented buffer is proven to be a plain 8-bit picture; a
+// 10-bit, float or sRGB-typed buffer gives false, and the listener must then not trust the screen
+// values as display bytes. Null removes the listener.
+using ThumbnailSink = void (*)(const float* output_log2, const float* screen_log2, uint32_t count, bool screen_is_sdr);
+void SetThumbnailSink(ThumbnailSink sink);
+
 void EnableSampleReceiptForTests();
 LastSample GetLastSample();
 

@@ -20,7 +20,7 @@
 // from %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini.
 namespace na::settings {
 namespace {
-#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(j2_texture_detail_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
+#define NA_PERSISTED_FIELDS(F) F(donut_bloom) F(donut_amount) F(donut_bias) F(donut_white) F(donut_speed_up) F(donut_speed_down) F(donut_curve) F(donut_bloom_amount) F(donut_bloom_sigma) F(donut_bloom_threshold) F(xegtao_enabled) F(xegtao_amount) F(xegtao_quality) F(xegtao_radius_x1000) F(xegtao_denoise) F(xegtao_radius_multiplier) F(xegtao_falloff) F(xegtao_sample_distribution) F(xegtao_thin_occluder) F(xegtao_final_power) F(xegtao_depth_mip_offset) F(xegtao_temporal) F(na1_enabled) F(enabled) F(dlss_mode) F(follow_game_resolution) F(preset) F(rr_preset) F(text_bold) F(fill_screen) F(win_x) F(win_y) F(win_w) F(win_h) F(nr_enabled) F(nr_intensity) F(nr_structure) F(nr_tone) F(nr_skin) F(nr_paper_white) F(nr_hdr_mode) F(nr_model) F(motion_enabled) F(motion_grid) F(motion_perf) F(motion_downscale) F(j2_sharpness) F(j2_hud_nis) F(j2_scale_mode) F(j2_preset) F(j2_mip_bias_x100) F(j2_texture_detail_x100) F(reflex_mode) F(fg_enabled) F(fg_mode) F(fg_preset) F(fg_multiplier) F(fg_target_fps) F(fg_frozen_at) F(fg_profile_override) F(native_fg_mode) F(native_fg_frames)
 Settings g_settings;
 Settings g_loaded_values;
 std::atomic<bool> g_nr_user_touched{false};
@@ -124,6 +124,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     target.xegtao_final_power.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"final_power",2200,ini),5000u));
     target.xegtao_depth_mip_offset.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"depth_mip_offset",3300,ini),30000u));
     target.xegtao_temporal.store((std::min)(GetPrivateProfileIntW(L"xegtao",L"temporal",850,ini),950u));
+    target.na1_enabled.store(GetPrivateProfileIntW(L"na1",L"enabled",0,ini)!=0); // absent = off
     target.nr_intensity.store(pct(L"intensity", 100));
     {
         const int current = static_cast<int>(GetPrivateProfileIntW(L"j2", L"sharpen_v2", -1, ini));
@@ -426,6 +427,8 @@ bool SaveFromWorker()
         swprintf_s(v,L"%u",kv.value);
         ok &= WritePrivateProfileStringW(L"xegtao",kv.key,v,ini)!=0;
     }
+    // Only the master switch: the strengths belong to the Referee and are not settings.
+    ok &= WritePrivateProfileStringW(L"na1",L"enabled",g_settings.na1_enabled.load()?L"1":L"0",ini)!=0;
     struct { const wchar_t* key; uint32_t value; } motion[] = {
         {L"enabled", PersistedSwitch(2,g_settings.motion_enabled.load())}, {L"grid", g_settings.motion_grid.load()}, {L"perf", g_settings.motion_perf.load()},
         {L"downscale", g_settings.motion_downscale.load()}};

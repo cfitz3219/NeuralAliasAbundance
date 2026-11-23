@@ -118,6 +118,9 @@ na_host_test(scene_group_test SOURCES scene_group_test.cpp LIBS host_scene_scale
 na_host_test(depth_restore_test SOURCES depth_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 # Scene depth with the raster jitter taken back out: the card's program against its processor reference (runs on WARP in CI).
 na_host_test(depth_unjitter_test SOURCES depth_unjitter_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
+# The NA1 enhancer: the card's programs against the processor reference, the measurement readback and
+# the governor moving a dial (not labelled gpu and outside the NGX block: it runs on WARP in every CI job).
+na_host_test(na1_test SOURCES na1_test.cpp LIBS host_dx12 dxgi)
 # Depth reads end to end through the real hooks, no game (not labelled gpu: it runs on WARP in CI).
 # Needs the recording tracker (which recordings were submitted and finished), built only with the NGX headers.
 if(NA_HAVE_NGX_SDK)

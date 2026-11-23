@@ -32,6 +32,8 @@ using Microsoft::WRL::ComPtr;
 namespace na::referee::gpu {
 namespace {
 std::atomic<bool> g_parity_seen{false}; // referee/parity-role-swap, current presentation
+// The host's listener for the paired thumbnails (referee_gpu.hpp); null when nobody listens.
+std::atomic<ThumbnailSink> g_thumbnail_sink{nullptr};
 
 constexpr auto NPSR = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 enum Img : uint32_t { kPrev, kInput, kOutput, kScreen, kMotion, kPrevOutput, kPrevScreen, kImages };
@@ -598,6 +600,17 @@ void collect_sample()
         if (keep_receipt) {
             g.data.assign(samples, samples + kResultFloats);
             if (screen_tiles) std::copy_n(screen_tiles, kTileFloats, g.data.data() + BlockOffset(kTileScreen));
+        }
+        // The paired thumbnails for the host's listener (referee_gpu.hpp SetThumbnailSink), here on
+        // the worker and outside the lock. Only when the screen was really copied and it shows the
+        // same view at the same shape as the output, so cell N of one is cell N of the other.
+        if (const ThumbnailSink sink = g_thumbnail_sink.load(std::memory_order_acquire); sink && g.done_screen && g.scaled_tiles) {
+            // Proven SDR bytes: a plain 8-bit buffer, read as stored. An sRGB-typed buffer is read
+            // decoded, and 10-bit or float buffers may be HDR: none of those is claimed as SDR.
+            const DXGI_FORMAT shown = view_format(g.img[kScreen].desc.Format);
+            const bool screen_is_sdr = shown == DXGI_FORMAT_R8G8B8A8_UNORM || shown == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                                       shown == DXGI_FORMAT_B8G8R8X8_UNORM;
+            sink(samples + BlockOffset(kThumbOutput), samples + BlockOffset(kThumbScreen), kThumbFloats, screen_is_sdr);
         }
         const D3D12_RANGE none{0, 0};
         g.readback->Unmap(0, &none);
@@ -1180,6 +1193,8 @@ void reset_evidence_locked()
 }
 
 } // namespace
+
+void SetThumbnailSink(ThumbnailSink sink) { g_thumbnail_sink.store(sink, std::memory_order_release); }
 
 bool Supported()
 {

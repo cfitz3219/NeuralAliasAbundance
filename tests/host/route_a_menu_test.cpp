@@ -22,7 +22,7 @@ int main() {
     CHECK(na::mode::BuildSavedRequest(0,13,3440,1440,saved) && saved.render_w==3440 && saved.render_h==1440);
     CHECK(!na::mode::BuildSavedRequest(99,13,3440,1440,saved));
     auto& st=na::settings::Get();
-    CHECK(!st.donut_tone && !st.donut_bloom && !st.xegtao_enabled);
+    CHECK(!st.donut_tone && !st.donut_bloom && !st.xegtao_enabled && !st.na1_enabled);
     st.motion_enabled=0; st.nr_paper_white=200; st.dlss_mode=4; st.fg_preset=3;
     auto ms=na::motion::GetStats();
     std::printf("motion requested=0 observed=%u\n",ms.enabled);
@@ -100,8 +100,21 @@ int main() {
     for(int i=0;i<na::menu::Count();++i){const auto* section=na::menu::At(i);
         if(!strcmp(section->title,"XeGTAO (Ambient Occlusion)")){CHECK(section->page==na::menu::Page::Enhancements);++effects;}
         if(!strcmp(section->title,"Lighting")||!strcmp(section->title,"GPU infrastructure")){CHECK(section->page==na::menu::Page::Experimental);++effects;}
+        if(!strcmp(section->title,"NA1 Enhance")){CHECK(section->page==na::menu::Page::Enhancements);++effects;}
     }
-    CHECK(effects==3);
+    CHECK(effects==4);
+    // The NA1 row draws with the switch off and on (on shows its status line), and registering
+    // the same menu again does not add a second row.
+    na::overlay::RegisterLiveDlaaMenu();int na1_rows=0;const na::menu::Section* na1_row=nullptr;
+    for(int i=0;i<na::menu::Count();++i)if(!strcmp(na::menu::At(i)->title,"NA1 Enhance")){na1_row=na::menu::At(i);++na1_rows;}
+    CHECK(na1_rows==1);REQUIRE(na1_row && na1_row->draw);
+    for(int on=0;on<2;++on) {
+        st.na1_enabled=on!=0;
+        ImGui::NewFrame(); ImGui::SetNextWindowSize({1400,800}); ImGui::Begin("NeuralAlias");
+        na1_row->draw();
+        ImGui::End(); ImGui::Render();
+    }
+    st.na1_enabled=false;
     na::j2::SetEnabled(false);na::observe::SetProcessExiting();
     ImGui::DestroyContext();
     return test::finish("route_a_menu_test");
