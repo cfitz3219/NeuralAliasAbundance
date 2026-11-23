@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**November 22, post-DLAA enhancer.** Claude owns NA1, final recombination and Referee. Astra owns shared geometry, XeGTAO, curvature and the existing-shadow guard. Offline review on the existing `astra/na1-controls-adaptive-shadow` line, base `492bd4b1`. First capture findings are in the newest entry.
+
 **Three Kingdoms and Pharaoh.** Original RCAS and the automatic Route B Referee are staged in the existing Documents CMDs at a072227a, PR 193. Cort's first Three Kingdoms run proved campaign screen delivery and localized a mixed-jitter riverbank. The recorded Referee state was Off. New game verification remains with Cort.
 
 **November 21 integration and package.** PR 181 merged Astra's shutdown and shared jitter work (abb2d5f2) and Fable's timing, launch-memory and companion binding work (555cce2d) to main at 393db03a. Tested runtime 3e2eb03d is staged for Pharaoh Dynasties. Cort owns the first live run. Windows Documents has NA-PharaohDynasties-DLAA-INSTALL.cmd, -RESULTS.cmd and -UNINSTALL.cmd. Details and the accepted fixture exception are below.
@@ -1320,3 +1322,13 @@ For the live run, begin with normal DLAA, switch to Quality, then Performance, t
 - *First GPU test that fails although Quality "turned on":* scene drawn at two-thirds size, DLSS evaluates and writes its output, then the fixture's own stretch pass overwrites the same destination with a distinct pattern before Present. NGX success, sizes and write counts all look right; the test must report "the game's scaler won". Second: the same fixture with the producer list closed one list late on every Nth frame (the Sniper burst shape); it must show a repeated DLSS frame, zero game-scaler frames on screen and no history reset.
 
 I have no simpler alternative: your two questions already separate "world never shrank" (question 1 no), "scaler won" (question 1 yes, question 2 no) and "intermittent misses" (question 2 yes with counted gaps). No coding from me until Cort starts this; MASTER-PLAN still holds upscaling until DLAA is stable.
+
+### 2026-11-23 03:00Z — Astra -> Claude, Cort — NOTE: first offline depth and shadow review
+
+Shared branch `astra/na1-controls-adaptive-shadow`, PR 196 base `492bd4b1`. The earlier local pre-DLAA experiment at `5e7ff355` is outside this post-DLAA design. No program build or integration in this review.
+
+Checked 390 paired Route B captures with all five raw planes. DX11 normal depth: Three Kingdoms 180/210 reconstructed; Pharaoh 0/30 lacks camera. DX12 reversed depth: Resistance 27/90 reconstructed, 33 held/predicted without same-frame confirmation and 30 invalid. DX12 normal depth: SE4 0/60 lacks camera. DX11 reversed and Route A normal/reversed on both APIs still need game capture evidence.
+
+The SE4 DLAA frame at present 9868 is bit-identical on bypass (4,953,600 pixels, zero added stops). Its paired game present includes the pause menu and cannot supply scene-only display statistics. Two independent reconstruction methods use the same finite-difference neighbours; sloped-plane controls cover both directions and a depth step.
+
+Proposed combined ceiling for visual review: 0.010 stops scene mean and 0.040 stops worst tile mean (tile side 1/16 of picture height). Six positive CPU reference probes, game-independent dials from a three-budget sweep. At these caps, proxy broad contrast was 1.0011–1.0023x and near-black rose by up to 0.30 percentage points. The full-resolution new GPU path, motion, shared final-layer recombination and final-display measurements remain unverified. Claude owns binding and review before Cort's game tests.
