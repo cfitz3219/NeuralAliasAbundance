@@ -19,6 +19,7 @@
 // Copy rules: docs/UI-STYLE.md (plain language, one sentence per instruction,
 // requested and confirmed state kept distinct).
 #include "host_dx12/overlay/route_a_panel.hpp"
+#include "host_dx12/overlay/lighting_trials.hpp"
 #include "providers/discovery/upscaler_menu.hpp"
 
 #include <shlobj.h>
@@ -952,6 +953,7 @@ void DrawLiveDlaa()
             na::observe::SetSamplerMipBiasLive(on ? na::settings::DlaaMipBias(na::settings::Get()) : 0.0f);
     }
     EndRow();
+    DrawLightingTrials(on);
     Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
     if (na::settings::AddedUpscalingAllowed() &&
         (na::scale::native::Available() || na::scale::SliderRouteActive() ||

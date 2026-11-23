@@ -17,7 +17,7 @@ struct Session {
 const Session& ThisProcess();
 // LocalAppData\NeuralAlias\captures\<kind>-<local time>-<exe>-p<pid> (directories created). False when
 // LocalAppData is unavailable or the drive has less than the floor left (the reason is logged).
-bool MakeDir(const wchar_t* kind, wchar_t* out, size_t out_chars);
+bool MakeDir(const wchar_t* kind, wchar_t* out, size_t out_chars, bool require_new = false);
 // Old captures are removed by build count (core/capture_retention.hpp; Cort 2026-11-17, after 819 GB
 // of captures filled his drive). Every capture folder's session.json names the build that made it
 // ([host] build_commit). MakeDir starts a background pass: when captures of `builds_trigger` builds

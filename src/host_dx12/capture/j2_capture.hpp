@@ -99,6 +99,12 @@ using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList*
 void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms = 0);
 // Same, into %LOCALAPPDATA%\NeuralAlias\captures\j2-<timestamp> (hotkey / menu / ini).
 bool RequestTimestamped(uint32_t frames, uint32_t delay_ms = 0);
+enum class LightingTrial { None, Still, Pan };
+enum class TrialStart { Started, Busy, FolderUnavailable };
+constexpr uint32_t kLightingFrames = 30;
+constexpr uint32_t kLightingDelayMs = 3000;
+constexpr uint32_t kLightingWindowMs = 12000;
+TrialStart StartLightingTrial(LightingTrial trial);
 bool Armed(); // a capture is requested, its delay has passed, frames remain
 
 // In J2's recording, right after a successful DLSS evaluate on `list`. Returns a token
@@ -144,6 +150,8 @@ void Trigger(const char* why, uint32_t frames);
 void SetAutoTrigger(bool on, uint32_t max_sessions, uint32_t cooldown_ms);
 
 struct Stats {
+    LightingTrial lighting_trial = LightingTrial::None;
+    bool capture_busy = false; // includes the lead-in and pending frame writes
     uint32_t requested = 0, recorded = 0, submitted = 0, written = 0;
     uint32_t dropped_busy = 0, discarded = 0, retired = 0, errors = 0;
     uint32_t without_present = 0; // frames written without a presented image

@@ -196,6 +196,8 @@ set_target_properties(sl_proxy_missing_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY 
 add_dependencies(sl_proxy_missing_test NeuralAliasSLProxy sl_interposer_real_min)
 
 
+na_host_test(lighting_capture_test SOURCES lighting_capture_test.cpp LIBS host_capture imgui
+             ARGS "${CMAKE_CURRENT_BINARY_DIR}/lighting-trial-out")
 na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 

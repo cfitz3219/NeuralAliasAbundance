@@ -56,6 +56,7 @@ struct State {
     uint32_t session = 0;
     uint32_t requested = 0;
     Stats stats{};
+    ULONGLONG lighting_deadline = 0;
     wchar_t dir[MAX_PATH] = {};
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12Fence> fence;
@@ -164,18 +165,33 @@ Slot* slot_of(uint32_t token)
     return &g.slots[token - 1];
 }
 
+// Call under g.m. A never-submitted evaluation must not lock the test buttons forever.
+bool busy_locked()
+{
+    if (g.lighting_deadline && GetTickCount64() >= g.lighting_deadline) {
+        g.armed.store(false, std::memory_order_release);
+        return false;
+    }
+    if (g.armed.load()) return true;
+    for (const auto& slot : g.slots)
+        if (slot.session == g.session && slot.state != SlotState::Free && slot.state != SlotState::Retired)
+            return true;
+    return false;
+}
+
 // Closed slots that will not get a presented image any more become ready without it.
 void release_unpresented(uint64_t newer_than)
 {
     for (auto& s : g.slots)
         if (s.state == SlotState::Submitted && s.closed && s.id.present_ordinal < newer_than) {
             s.state = SlotState::Ready;
-            ++g.stats.without_present;
+            if (s.session == g.session) ++g.stats.without_present;
         }
 }
 
-void write_slot(const Slot& s)
+bool write_slot(const Slot& s)
 {
+    bool saved = true;
     wchar_t path[MAX_PATH + 64];
     for (int i = 0; i < kPlaneCount + static_cast<int>(kMaxExtra); ++i) {
         const Plane& p = i < kPlaneCount ? s.planes[i] : s.extra[i - kPlaneCount];
@@ -184,11 +200,17 @@ void write_slot(const Slot& s)
         swprintf_s(path, L"%s\\%05u-%S.raw", s.dir, s.index, name);
         void* mapped = nullptr;
         D3D12_RANGE range{0, static_cast<SIZE_T>(p.bytes)};
-        if (FAILED(p.readback->Map(0, &range, &mapped)) || !mapped) continue;
+        if (FAILED(p.readback->Map(0, &range, &mapped)) || !mapped) {
+            saved = false;
+            continue;
+        }
         FILE* fp = nullptr;
         if (_wfopen_s(&fp, path, L"wb") == 0 && fp) {
-            fwrite(mapped, 1, static_cast<size_t>(p.bytes), fp);
-            fclose(fp);
+            const size_t bytes = static_cast<size_t>(p.bytes);
+            if (fwrite(mapped, 1, bytes, fp) != bytes) saved = false;
+            if (fclose(fp) != 0) saved = false;
+        } else {
+            saved = false;
         }
         D3D12_RANGE none{0, 0};
         p.readback->Unmap(0, &none);
@@ -255,7 +277,10 @@ void write_slot(const Slot& s)
             first = false;
         }
         std::fprintf(fp, "\n  ]\n}\n");
-        std::fclose(fp);
+        if (std::ferror(fp)) saved = false;
+        if (std::fclose(fp) != 0) saved = false;
+    } else {
+        saved = false;
     }
     swprintf_s(path, L"%s\\index.csv", s.dir);
     fp = nullptr;
@@ -266,8 +291,12 @@ void write_slot(const Slot& s)
                      (unsigned long long)id.submission, id.route, id.route_mode, id.history_generation,
                      (unsigned long long)id.insertion_signature, id.jitter_x, id.jitter_y, id.reset, id.camera_cut,
                      (unsigned long long)s.late_writes, s.planes[kPresent].valid ? 1u : 0u);
-        std::fclose(fp);
+        if (std::ferror(fp)) saved = false;
+        if (std::fclose(fp) != 0) saved = false;
+    } else {
+        saved = false;
     }
+    return saved;
 }
 
 // Appends notes not yet written to <notes_dir>\\frames.csv (writer thread only).
@@ -304,6 +333,11 @@ void writer_main()
 {
     while (!g.stop.load()) {
         WaitForSingleObject(g.wake, 100);
+        {
+            std::lock_guard<std::mutex> lock(g.m);
+            if (g.lighting_deadline && GetTickCount64() >= g.lighting_deadline)
+                g.armed.store(false, std::memory_order_release);
+        }
         flush_notes();
         for (;;) {
             Slot* next = nullptr;
@@ -320,10 +354,13 @@ void writer_main()
                 if (next) next->state = SlotState::Writing;
             }
             if (!next) break;
-            write_slot(*next); // only the writer touches a Writing slot
+            const bool saved = write_slot(*next); // only the writer touches a Writing slot
             std::lock_guard<std::mutex> lock(g.m);
             next->state = SlotState::Free;
-            ++g.stats.written;
+            if (next->session == g.session) {
+                if (saved) ++g.stats.written;
+                else ++g.stats.errors;
+            }
         }
     }
     g.writer_running.store(false);
@@ -331,10 +368,8 @@ void writer_main()
 
 } // namespace
 
-void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
+static void start_locked(uint32_t frames, const wchar_t* dir, uint32_t delay_ms, LightingTrial trial)
 {
-    if (!dir || !frames) return;
-    std::lock_guard<std::mutex> lock(g.m);
     wcsncpy_s(g.dir, dir, _TRUNCATE);
     CreateDirectoryW(g.dir, nullptr);
     TagDir(g.dir, "j2");
@@ -345,6 +380,8 @@ void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
     g.stats.requested = g.requested;
     g.stats.retired = keep.retired; // retired slots stay retired for the process
     g.start_at = GetTickCount64() + delay_ms;
+    g.stats.lighting_trial = trial;
+    g.lighting_deadline = trial == LightingTrial::None ? 0 : g.start_at.load() + kLightingWindowMs;
     // Per-frame notes: the 512 frames before the request too, then everything until 30 s after.
     wcsncpy_s(g.notes_dir, g.dir, _TRUNCATE);
     g.notes_flushed = g.notes_written > 512 ? g.notes_written - 512 : 0;
@@ -358,11 +395,34 @@ void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
     g.armed.store(true, std::memory_order_release);
 }
 
+void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
+{
+    if (!dir || !frames) return;
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.stats.lighting_trial != LightingTrial::None && busy_locked()) return;
+    start_locked(frames, dir, delay_ms, LightingTrial::None);
+}
+
+TrialStart StartLightingTrial(LightingTrial trial)
+{
+    wchar_t dir[MAX_PATH];
+    std::lock_guard<std::mutex> lock(g.m);
+    if (busy_locked()) return TrialStart::Busy;
+    const wchar_t* kind = trial == LightingTrial::Still ? L"j2-lighting-still" : L"j2-lighting-pan";
+    if (trial == LightingTrial::None || !MakeDir(kind, dir, MAX_PATH, true))
+        return TrialStart::FolderUnavailable;
+    start_locked(kLightingFrames, dir, kLightingDelayMs, trial);
+    return TrialStart::Started;
+}
+
 bool RequestTimestamped(uint32_t frames, uint32_t delay_ms)
 {
     wchar_t dir[MAX_PATH];
+    if (!frames) return false;
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.stats.lighting_trial != LightingTrial::None && busy_locked()) return false;
     if (!MakeDir(L"j2", dir, MAX_PATH)) return false;
-    Request(frames, dir, delay_ms);
+    start_locked(frames, dir, delay_ms, LightingTrial::None);
     return true;
 }
 
@@ -405,6 +465,11 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, cons
     if (!Armed() || !list) return 0;
     if(!p.color||!p.output||(!id.presentation_only&&(!p.depth||!p.motion)))return 0;
     std::lock_guard<std::mutex> lock(g.m);
+    if (!Armed()) return 0; // another request may have replaced a session before the lock
+    if (g.stats.lighting_trial != LightingTrial::None) {
+        if (GetTickCount64() >= g.lighting_deadline) { g.armed.store(false); return 0; }
+        if (id.presentation_only || !id.evaluation_succeeded) return 0;
+    }
     if (g.stats.recorded >= g.requested) { g.armed.store(false); return 0; }
     ComPtr<ID3D12Device> dev;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev))) || !ensure_device(dev.Get())) { ++g.stats.errors; return 0; }
@@ -424,7 +489,7 @@ uint32_t RecordEvaluation(ID3D12GraphicsCommandList* list, const Planes& p, cons
     UINT64 used = 0;
     for (int i = 0; i < 4; ++i) if(s->planes[i].valid) used += s->planes[i].bytes;
     for (uint32_t i = 0; i < kMaxExtra; ++i) { s->extra[i].valid = false; s->extra_name[i] = nullptr; }
-    for (uint32_t i = 0; i < p.extra_count && i < kMaxExtra; ++i) {
+    for (uint32_t i = 0; g.stats.lighting_trial == LightingTrial::None && i < p.extra_count && i < kMaxExtra; ++i) {
         const ExtraPlane& x = p.extra[i];
         if (!x.res || !x.name) continue;
         if (!ensure_readback(s->extra[i], x.res)) { ++g.stats.extra_skipped; continue; }
@@ -459,7 +524,7 @@ void Submitted(uint32_t token, ID3D12CommandQueue* queue, uint64_t submission, u
     queue->Signal(g.fence.Get(), s->eval_fence);
     s->submit_ordinal = submission;
     s->state = s->id.owns_present ? SlotState::Ready : SlotState::Submitted; // its output IS the presented picture
-    ++g.stats.submitted;
+    if (s->session == g.session) ++g.stats.submitted;
     if (s->id.owns_present && g.wake) SetEvent(g.wake);
 }
 
@@ -477,7 +542,7 @@ void Discard(uint32_t token, bool may_still_run)
         ++g.stats.retired;
     } else {
         s->state = SlotState::Free; // the list is reset before any GPU use
-        ++g.stats.discarded;
+        if (s->session == g.session) ++g.stats.discarded;
     }
 }
 
@@ -527,10 +592,10 @@ void OnPresent(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn e
             queue->Signal(g.fence.Get(), s->present_fence);
         } else {
             s->planes[kPresent].valid = false;
-            ++g.stats.errors;
+            if (s->session == g.session) ++g.stats.errors;
         }
     }
-    if (!s->planes[kPresent].valid) ++g.stats.without_present;
+    if (s->session == g.session && !s->planes[kPresent].valid) ++g.stats.without_present;
     s->present_closed = g.last_closed;
     s->state = SlotState::Ready;
     release_unpresented(s->id.present_ordinal + 1);
@@ -573,7 +638,9 @@ void Trigger(const char* why, uint32_t frames)
 Stats GetStats()
 {
     std::lock_guard<std::mutex> lock(g.m);
-    return g.stats;
+    Stats snapshot = g.stats;
+    snapshot.capture_busy = busy_locked();
+    return snapshot;
 }
 
 const wchar_t* Directory() { return g.dir; }
