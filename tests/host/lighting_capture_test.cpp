@@ -39,7 +39,7 @@ void SetOpen(bool open) { trial_menu_open = open; }
 namespace {
 // Click through ordinary ImGui input at the centers of the visible buttons.
 // The fixture provides the window, the output directory and the overlay-close sink.
-void click_trial(bool pan, bool dlaa_on = true)
+void click_trial(recorder::LightingTrial trial, bool dlaa_on = true)
 {
     ImVec2 target{};
     ImGuiIO& io = ImGui::GetIO();
@@ -53,10 +53,14 @@ void click_trial(bool pan, bool dlaa_on = true)
         ImGui::Begin("Picture", nullptr, ImGuiWindowFlags_NoTitleBar);
         const ImVec2 pos = ImGui::GetCursorScreenPos();
         const float right = pos.x + ImGui::GetContentRegionAvail().x;
-        const float pan_width = na::ui::ButtonWidth("Record pan");
-        const float still_width = na::ui::ButtonWidth("Record still");
-        target = ImVec2(pan ? right - pan_width/2 :
-                        right - pan_width - ImGui::GetStyle().ItemSpacing.x - still_width/2, pos.y + 10);
+        const char* names[] = {"Still","Turn 1","Turn 2","Slide"};
+        const int count = recorder::FlatMapLightingTest() ? 4 : 3;
+        float edge = right;
+        for (int i = count - 1; i >= 0; --i) {
+            const float width = na::ui::ButtonWidth(names[i]);
+            if (i == static_cast<int>(trial)-1) target = ImVec2(edge-width/2, pos.y+10);
+            edge -= width + ImGui::GetStyle().ItemSpacing.x;
+        }
         na::overlay::DrawLightingTrials(dlaa_on);
         ImGui::End();
         ImGui::Render();
@@ -90,21 +94,23 @@ int wmain(int argc, wchar_t** argv)
     io.DisplaySize = ImVec2(800, 400);
     io.DeltaTime = 1.f / 60.f;
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
-    click_trial(false, false);
+    click_trial(Trial::Still, false);
     REQUIRE(!recorder::GetStats().capture_busy && na::overlay::trial_menu_open);
     reject_folder = true;
-    click_trial(false);
+    click_trial(Trial::Still);
     REQUIRE(na::overlay::trial_menu_open);
     REQUIRE(recorder::StartLightingTrial(Trial::Still) == Start::FolderUnavailable);
     REQUIRE(!recorder::GetStats().capture_busy);
     reject_folder = false;
-    for (const Trial trial : {Trial::Still, Trial::Pan}) {
+    REQUIRE(recorder::StartLightingTrial(Trial::Slide) == Start::NotApplicable);
+    for (const Trial trial : {Trial::Still, Trial::Turn1, Trial::Turn2, Trial::Slide}) {
+        recorder::SetFlatMapLightingTest(trial == Trial::Slide);
         na::overlay::trial_menu_open = true;
-        click_trial(trial == Trial::Pan);
+        click_trial(trial);
         REQUIRE(!na::overlay::trial_menu_open);
         REQUIRE(!recorder::Armed());
         REQUIRE(recorder::GetStats().capture_busy);
-        REQUIRE(recorder::StartLightingTrial(Trial::Pan) == Start::Busy);
+        REQUIRE(recorder::StartLightingTrial(Trial::Turn1) == Start::Busy);
         REQUIRE(!recorder::RequestTimestamped(1));
         recorder::Request(1, (sandbox / L"interloper").c_str());
         REQUIRE(!fs::exists(sandbox / L"interloper"));
@@ -138,7 +144,8 @@ int wmain(int argc, wchar_t** argv)
         const auto stats = recorder::GetStats();
         REQUIRE(stats.written == recorder::kLightingFrames);
         REQUIRE(!stats.capture_busy && !stats.errors && !stats.without_present);
-        const auto dir = sandbox / (trial == Trial::Still ? L"j2-lighting-still" : L"j2-lighting-pan");
+        const wchar_t* kinds[] = {L"j2-lighting-still", L"j2-lighting-turn1", L"j2-lighting-turn2", L"j2-lighting-slide"};
+        const auto dir = sandbox / kinds[static_cast<int>(trial)-1];
         for (unsigned i = 0; i < recorder::kLightingFrames; ++i) {
             wchar_t prefix[12]; swprintf_s(prefix, L"%05u-", i);
             for (const auto* plane : {L"color", L"depth", L"motion", L"dlssout", L"present"})

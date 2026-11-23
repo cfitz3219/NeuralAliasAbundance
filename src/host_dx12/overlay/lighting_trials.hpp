@@ -10,13 +10,24 @@ inline void DrawLightingTrials(bool dlaa_on)
     namespace capture = na::capture::j2;
     const auto stats = capture::GetStats();
     static const char* problem = nullptr;
-    BeginRow("Lighting test", "Both methods use the same 30 frames. The menu closes immediately. Hold still or pan steadily for 15 seconds, starting at the click.",
-             ButtonWidth("Record still") + ImGui::GetStyle().ItemSpacing.x + ButtonWidth("Record pan"));
+    using Trial = capture::LightingTrial;
+    const bool map = capture::FlatMapLightingTest();
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    const float width = ButtonWidth("Still") + ButtonWidth("Turn 1") + ButtonWidth("Turn 2") + 2 * gap;
+    BeginRow("Lighting test", map ? "Record still, then rotate twice. For Slide, move sideways across the map with heading and zoom fixed."
+                                 : "Record still, then turn the view twice from the same spot. Sweep gently sideways and slightly up or down. Keep zoom fixed.",
+             width + (map ? ButtonWidth("Slide") + gap : 0));
     ImGui::BeginDisabled(!dlaa_on || stats.capture_busy);
     capture::LightingTrial selected = capture::LightingTrial::None;
-    if (Button("Record still")) selected = capture::LightingTrial::Still;
+    if (Button("Still")) selected = Trial::Still;
     ImGui::SameLine();
-    if (Button("Record pan")) selected = capture::LightingTrial::Pan;
+    if (Button("Turn 1")) selected = Trial::Turn1;
+    ImGui::SameLine();
+    if (Button("Turn 2")) selected = Trial::Turn2;
+    if (map) {
+        ImGui::SameLine();
+        if (Button("Slide")) selected = Trial::Slide;
+    }
     ImGui::EndDisabled();
     EndRow();
     if (selected != capture::LightingTrial::None) {
@@ -28,6 +39,9 @@ inline void DrawLightingTrials(bool dlaa_on)
         case capture::TrialStart::Busy:
             problem = "A capture is already in progress.";
             break;
+        case capture::TrialStart::NotApplicable:
+            problem = "Slide applies to a flat strategy map.";
+            break;
         case capture::TrialStart::FolderUnavailable:
             problem = "Could not create the capture folder. Check free disk space and try again.";
             break;
@@ -35,7 +49,14 @@ inline void DrawLightingTrials(bool dlaa_on)
     }
     if (problem) StatusLine(2, problem);
     if (stats.lighting_trial == capture::LightingTrial::None) return;
-    const char* name = stats.lighting_trial == capture::LightingTrial::Still ? "Still" : "Pan";
+    const char* name = "";
+    switch (stats.lighting_trial) {
+    case Trial::Still: name = "Still"; break;
+    case Trial::Turn1: name = "Turn 1"; break;
+    case Trial::Turn2: name = "Turn 2"; break;
+    case Trial::Slide: name = "Slide"; break;
+    default: return;
+    }
     const bool complete = stats.written == capture::kLightingFrames && !stats.without_present && !stats.errors;
     const char* status = complete ? "ready for analysis" : (stats.capture_busy ? "in progress" : "incomplete");
     char line[160];

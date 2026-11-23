@@ -99,8 +99,10 @@ using ExecuteFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList*
 void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms = 0);
 // Same, into %LOCALAPPDATA%\NeuralAlias\captures\j2-<timestamp> (hotkey / menu / ini).
 bool RequestTimestamped(uint32_t frames, uint32_t delay_ms = 0);
-enum class LightingTrial { None, Still, Pan };
-enum class TrialStart { Started, Busy, FolderUnavailable };
+enum class LightingTrial { None, Still, Turn1, Turn2, Slide };
+enum class TrialStart { Started, Busy, FolderUnavailable, NotApplicable };
+void SetFlatMapLightingTest(bool enabled);
+bool FlatMapLightingTest();
 constexpr uint32_t kLightingFrames = 30;
 constexpr uint32_t kLightingDelayMs = 3000;
 constexpr uint32_t kLightingWindowMs = 12000;

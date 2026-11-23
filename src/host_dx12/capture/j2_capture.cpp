@@ -18,6 +18,8 @@ using Microsoft::WRL::ComPtr;
 namespace na::capture::j2 {
 namespace {
 
+std::atomic<bool> flat_map_lighting_test{false};
+
 enum PlaneIndex { kColor = 0, kDepth, kMotion, kOutput, kPresent, kPlaneCount };
 const char* const kPlaneNames[kPlaneCount] = {"color", "depth", "motion", "dlssout", "present"};
 
@@ -403,13 +405,26 @@ void Request(uint32_t frames, const wchar_t* dir, uint32_t delay_ms)
     start_locked(frames, dir, delay_ms, LightingTrial::None);
 }
 
+void SetFlatMapLightingTest(bool enabled) { flat_map_lighting_test.store(enabled); }
+bool FlatMapLightingTest() { return flat_map_lighting_test.load(); }
+
 TrialStart StartLightingTrial(LightingTrial trial)
 {
     wchar_t dir[MAX_PATH];
     std::lock_guard<std::mutex> lock(g.m);
     if (busy_locked()) return TrialStart::Busy;
-    const wchar_t* kind = trial == LightingTrial::Still ? L"j2-lighting-still" : L"j2-lighting-pan";
-    if (trial == LightingTrial::None || !MakeDir(kind, dir, MAX_PATH, true))
+    const wchar_t* kind;
+    switch (trial) {
+    case LightingTrial::Still: kind = L"j2-lighting-still"; break;
+    case LightingTrial::Turn1: kind = L"j2-lighting-turn1"; break;
+    case LightingTrial::Turn2: kind = L"j2-lighting-turn2"; break;
+    case LightingTrial::Slide:
+        if (!FlatMapLightingTest()) return TrialStart::NotApplicable;
+        kind = L"j2-lighting-slide";
+        break;
+    default: return TrialStart::NotApplicable;
+    }
+    if (!MakeDir(kind, dir, MAX_PATH, true))
         return TrialStart::FolderUnavailable;
     start_locked(kLightingFrames, dir, kLightingDelayMs, trial);
     return TrialStart::Started;
