@@ -62,3 +62,17 @@ The first qualified Three Kingdoms frame selected depth mip offset 3.116, thin-o
 The full-resolution Three Kingdoms contact-plus-curvature proof changed 32.6% of the picture by at least half a stop. Broad contrast was 1.060 times original, and 3.052% of pixels were near black both before and after. This proof uses the custom camera-independent path. The separate GPU reference does not contribute to that image.
 
 Replaying the controlled frame times 16.00, 20.00, 20.01, 22.00 and 20.00 ms produced Ultra, Ultra, Low, Low and Ultra. On the fixed input the GPU shadow image matched the first Ultra output exactly after recovery. Testing covers 16 Python cases and four GPU fixture cases. The captures, reports and native proof are on Cort's machine under local/referee-lighting-calibration. Player turns, the separate 99% accuracy check and actual in-game cost remain open.
+
+## Resistance player recordings, November 22, 2026
+
+Build `43884374` ran 14,094 DLAA evaluations at 3440 × 1440 without a reported evaluation failure. Still, Turn 1 and Turn 2 each saved all 30 requested five-plane samples. Both turns had usable motion on all 30 samples. Rotation and translation remained ambiguous on both turns. No frame provided independent projection ground truth. The camera-dependent Intel comparison therefore had no qualified frame. This result does not measure camera accuracy.
+
+The custom contact-shadow and curvature layers ran offline on all 90 samples. The still recording supplied the fit and each turn independently checked the proposed adjustment. At 860 × 360, combined broad contrast across frames was 1.002–1.100 times baseline and the near-black share stayed unchanged. On native first-turn frame 12, 27.47% of covered pixels moved by at least a quarter stop, the near-black share remained 33.85%, and broad contrast was 1.037 times baseline. Contact shadows alone darkened 11.60% of covered pixels by a quarter stop or more. Images share one exposure.
+
+| Recording | Adjacent pairs | Matched pixel observations | Contact mean / 95th percentile change, stops | Curvature mean / 95th percentile change, stops |
+| --- | ---: | ---: | ---: | ---: |
+| Still | 9 | 2,131,981 | 0.016 / 0.044 | 0.022 / 0.090 |
+| Turn 1 | 8 | 450,935 | 0.030 / 0.165 | 0.054 / 0.313 |
+| Turn 2 | 8 | 884,795 | 0.036 / 0.216 | 0.067 / 0.372 |
+
+Run `recorded_motion.py CAPTURE CALIBRATION OUTPUT` for each recording. The comparison uses one-quarter width and height, matched depth and luminance, saved motion vectors, and jitter compensation. It skips gaps and resets the controller at each break. Recorded frame intervals were unavailable, so the replay assumes 1/60 second. The 25 adjacent pairs establish a baseline for improving curvature under motion. They cannot qualify full-sequence or full-resolution stability, physical accuracy, or in-game GPU cost. Cort need not repeat these captures.

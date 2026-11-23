@@ -130,8 +130,7 @@ def spatial_gpu(frame,opt,exe,directory,previous=None):
     return guard_budget(proposed,frame.y,frame.valid,Budget().mean,Budget().tile)[0]
 
 
-def history_loss(old,current,old_delta,new_delta):
-    """Visible residual on stable surfaces and disagreement on newly exposed pixels."""
+def stable_surface_samples(old,current):
     h,w=current.z.shape
     yy,xx=np.indices((h,w))
     jitter=(np.asarray(old.m["jitter_px"])-np.asarray(current.m["jitter_px"]))*[w/current.m["size"][0],h/current.m["size"][1]]
@@ -144,6 +143,12 @@ def history_loss(old,current,old_delta,new_delta):
     same_depth=np.abs(old.z[y,x]-current.z)<.015*np.maximum(q,1e-6)
     same_light=np.abs(np.log2(np.maximum(old.y[y,x],1e-6)/np.maximum(current.y,1e-6)))<.16
     stable=inside&same_depth&same_light&current.valid&old.valid[y,x]
+    return y,x,stable
+
+
+def history_loss(old,current,old_delta,new_delta):
+    """Visible residual on stable surfaces and disagreement on newly exposed pixels."""
+    y,x,stable=stable_surface_samples(old,current)
     revealed=current.valid&~stable
     metric=image_loss(current,new_delta,current.contact)[0]
     if stable.any():

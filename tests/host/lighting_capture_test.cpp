@@ -1,6 +1,7 @@
 // Exercise the real asynchronous recorder with a small stand-in scene. Only the
 // session-directory provider is substituted, so CTest never touches game captures.
 #include "test_support.hpp"
+#include <imgui_internal.h>
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/overlay/lighting_trials.hpp"
@@ -41,30 +42,39 @@ namespace {
 // The fixture provides the window, the output directory and the overlay-close sink.
 void click_trial(recorder::LightingTrial trial, bool dlaa_on = true)
 {
-    ImVec2 target{};
     ImGuiIO& io = ImGui::GetIO();
-    for (int step = 0; step < 5; ++step) {
-        if (step == 1) io.AddMousePosEvent(target.x, target.y);
-        if (step == 2) io.AddMouseButtonEvent(0, true);
-        if (step == 3) io.AddMouseButtonEvent(0, false);
+    const char* names[] = {"Still","Turn 1","Turn 2","Slide"};
+    const auto draw = [&](bool enabled) {
         ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImVec2(710, 220));
         ImGui::Begin("Picture", nullptr, ImGuiWindowFlags_NoTitleBar);
-        const ImVec2 pos = ImGui::GetCursorScreenPos();
-        const float right = pos.x + ImGui::GetContentRegionAvail().x;
-        const char* names[] = {"Still","Turn 1","Turn 2","Slide"};
-        const int count = recorder::FlatMapLightingTest() ? 4 : 3;
-        float edge = right;
-        for (int i = count - 1; i >= 0; --i) {
-            const float width = na::ui::ButtonWidth(names[i]);
-            if (i == static_cast<int>(trial)-1) target = ImVec2(edge-width/2, pos.y+10);
-            edge -= width + ImGui::GetStyle().ItemSpacing.x;
-        }
-        na::overlay::DrawLightingTrials(dlaa_on);
+        ImGui::PushID("Lighting test");
+        const ImGuiID wanted = ImGui::GetID(names[static_cast<int>(trial)-1]);
+        ImGui::PopID();
+        na::overlay::DrawLightingTrials(enabled);
+        const bool found = ImGui::GetCurrentContext()->HoveredId == wanted;
         ImGui::End();
         ImGui::Render();
+        return found;
+    };
+    // The responsive row may put the buttons below its description. Locate the
+    // actual button by hit-testing the rendered window, then send ordinary input.
+    draw(true);
+    bool located = false;
+    for (int y = 8; y < 220 && !located; y += 12) {
+        for (int x = 8; x < 710 && !located; x += 16) {
+            io.AddMousePosEvent(static_cast<float>(x), static_cast<float>(y));
+            located = draw(true);
+        }
     }
+    CHECK(located);
+    if (!located) return;
+    draw(dlaa_on);
+    io.AddMouseButtonEvent(0, true);
+    draw(dlaa_on);
+    io.AddMouseButtonEvent(0, false);
+    draw(dlaa_on);
 }
 }
 
