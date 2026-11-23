@@ -122,7 +122,9 @@ int native(test::Device& d) {
 // stores width, height, clear depth, radius, the 16 column-vector VP entries,
 // then tightly packed float32 depth in a separate file. White input recovers
 // the visibility from the existing float compose path without color dependence.
-int export_visibility(const char* header, const char* depth_path, const char* output_path)
+int export_evaluation(test::Device& d, na::xegtao::Pass& pass, const char* header,
+                      const char* depth_path, const char* output_path,
+                      const char* motion_path, unsigned ordinal)
 {
     std::ifstream desc(header);
     unsigned w=0,h=0;
@@ -134,8 +136,6 @@ int export_visibility(const char* header, const char* depth_path, const char* ou
     std::vector<float> depth(size_t(w)*h), white(size_t(w)*h*4,1.f);
     std::ifstream source(depth_path,std::ios::binary);
     REQUIRE(source.read(reinterpret_cast<char*>(depth.data()),depth.size()*sizeof(float)));
-    test::Device d;
-    if (!test::CreateDevice(d)) return test::SkipNoDevice("XeGTAO");
     test::List list; REQUIRE(list.Create(d.device.Get()));
     auto z=input(d,list,w,h,DXGI_FORMAT_R32_FLOAT,depth,1);
     auto color=input(d,list,w,h,DXGI_FORMAT_R32G32B32A32_FLOAT,white,4);
@@ -143,7 +143,38 @@ int export_visibility(const char* header, const char* depth_path, const char* ou
     na::xegtao::Inputs in; in.width=w; in.height=h; in.clear_depth=clear;
     in.depth=z.texture.Get(); in.color=color.texture.Get(); in.color_format=DXGI_FORMAT_R32G32B32A32_FLOAT;
     REQUIRE(na::xegtao::FromViewProjection(matrix,in.projection));
-    na::xegtao::Pass pass; na::xegtao::Options opt; opt.enabled=true; opt.amount=100; opt.temporal=0; opt.radius=radius;
+    na::xegtao::Options opt; opt.enabled=true; opt.amount=100; opt.temporal=0; opt.radius=radius;
+    // Optional spatial controls for offline calibration. Keep the original
+    // header format and defaults for the existing reference exporter.
+    desc >> std::ws;
+    if (!desc.eof()) {
+        REQUIRE(desc >> opt.quality >> opt.denoise >> opt.amount
+                     >> opt.radius_multiplier >> opt.falloff >> opt.sample_distribution
+                     >> opt.thin_occluder >> opt.final_power >> opt.depth_mip_offset);
+        REQUIRE(opt.quality<=3 && opt.denoise<=3 && opt.amount<=100);
+        REQUIRE(opt.radius_multiplier>0 && opt.falloff>0 && opt.falloff<=1);
+        REQUIRE(opt.sample_distribution>0 && opt.thin_occluder>=0 && opt.thin_occluder<=1);
+        REQUIRE(opt.final_power>0 && opt.depth_mip_offset>=0);
+    }
+    Image motion;
+    if (ordinal) {
+        float keep=0;
+        REQUIRE(desc >> keep >> in.jitter_x >> in.jitter_y);
+        REQUIRE(keep>=0 && keep<=.95f);
+        opt.temporal=keep;
+        std::vector<float> vectors(size_t(w)*h*2);
+        if (motion_path) {
+            std::ifstream motion_file(motion_path,std::ios::binary);
+            REQUIRE(motion_file.read(reinterpret_cast<char*>(vectors.data()),vectors.size()*sizeof(float)));
+        }
+        motion=input(d,list,w,h,DXGI_FORMAT_R32G32_FLOAT,vectors,2);
+        REQUIRE(motion.texture);
+        in.motion=motion.texture.Get();
+        in.frame=ordinal;
+        in.motion_reference_frame=ordinal-1;
+        in.scene_epoch=1;
+        in.reset=ordinal==1;
+    }
     auto frame=pass.Prepare(d.device.Get(),d.queue.Get(),in,opt);
     if (!frame) { REQUIRE(pass.WaitPrepared(30000)); frame=pass.Prepare(d.device.Get(),d.queue.Get(),in,opt); }
     REQUIRE(frame && frame->Record(list.list.Get()));
@@ -152,13 +183,26 @@ int export_visibility(const char* header, const char* depth_path, const char* ou
     ID3D12CommandList* lists[]={list.list.Get()}; d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
     const auto rgba=pixels(rb); REQUIRE(rgba.size()==white.size());
     for (size_t i=0;i<depth.size();++i) { depth[i]=rgba[4*i]; REQUIRE(std::isfinite(depth[i])); }
-    std::ofstream file(output_path,std::ios::binary);REQUIRE(file.write(reinterpret_cast<const char*>(depth.data()),depth.size()*sizeof(float)));
-    file.close(); REQUIRE(file.good());
+    if (output_path) {
+        std::ofstream file(output_path,std::ios::binary);
+        REQUIRE(file.write(reinterpret_cast<const char*>(depth.data()),depth.size()*sizeof(float)));
+        file.close(); REQUIRE(file.good());
+    }
     return test::finish("XeGTAO saved visibility");
 }
 
 int main(int argc,char** argv) {
-    if (argc==5 && std::strcmp(argv[1],"--export-visibility")==0) return export_visibility(argv[2],argv[3],argv[4]);
+    const bool single=argc==5 && std::strcmp(argv[1],"--export-visibility")==0;
+    const bool pair=argc==8 && std::strcmp(argv[1],"--export-visibility-pair")==0;
+    if (single || pair) {
+        test::Device device;
+        if (!test::CreateDevice(device)) return test::SkipNoDevice("XeGTAO");
+        na::xegtao::Pass pass;
+        if (single) return export_evaluation(device,pass,argv[2],argv[3],argv[4],nullptr,0);
+        int seed=export_evaluation(device,pass,argv[2],argv[3],nullptr,nullptr,1);
+        if (seed!=0) return seed;
+        return export_evaluation(device,pass,argv[4],argv[5],argv[7],argv[6],2);
+    }
     if (argc!=1) return 2;
 
     CHECK(na::settings::Settings{}.xegtao_enabled.load()==0);

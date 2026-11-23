@@ -12,6 +12,9 @@ class Controls:
     light: float
     wide: float
     directions: int
+    edge_scale: float=1.
+    haze_scale: float=1.
+    guard_scale: float=1.
 
 
 @dataclass(frozen=True)
@@ -50,7 +53,7 @@ class FormReferee:
     def __init__(self):
         self.settings = None
 
-    def choose(self, speed, exposure_span, dt, reset, pressure):
+    def choose(self, speed, exposure_span, dt, reset, pressure, frame_ms=None):
         moving = 1. if speed is None else float(np.clip(speed/.60, 0, 1))
         soft = float(np.clip((5-exposure_span)/4, 0, 1))
         target = np.array([.055+.038*soft-.020*moving, 1.65+.55*soft-.18*moving,
@@ -105,20 +108,20 @@ class FormReferee:
             mv &= (xx+motion[...,0]>=0)&(xx+motion[...,0]<w)&(yy+motion[...,1]>=0)&(yy+motion[...,1]<h)
             if mv.sum()>=max(256,valid.sum()*.5):
                 speed = float(np.percentile(np.linalg.norm(motion[mv],axis=1),75)/(h*dt))
-        control = self.choose(speed, before, dt, reset, pressure)
+        control = self.choose(speed, before, dt, reset, pressure, frame_ms)
         h,w=q.shape
         light = np.log2(np.maximum(lum, 1e-6))
         base = box(light*valid,max(2,h*.009))/np.maximum(box(valid.astype("f4"),max(2,h*.009)),1e-6)
         surround = box(light*valid,max(4,h*.043))/np.maximum(box(valid.astype("f4"),max(4,h*.043)),1e-6)
         observed_shadow = np.maximum(0, surround-base)
-        guard = np.exp2(-1.35*observed_shadow)
+        guard = np.exp2(-1.35*control.guard_scale*observed_shadow)
         # Samples are in directed device depth. Opposite differences cancel any plane's affine slope.
         # The local derivative test vetoes immediate silhouettes; far, isolated steps cannot vote for a fold.
         unit = np.maximum(q, (hi-lo)*.005)
         edge = zeros.copy()
         for dx,dy in ((1,0),(0,1),(-1,0),(0,-1)):
             edge = np.maximum(edge, np.abs(q-neighbor(q,dx,dy)))
-        edge_ok = np.clip(1-(edge/unit-.16)/.38, 0, 1)*valid
+        edge_ok = np.clip(1-(edge/unit-.16*control.edge_scale)/(.38*control.edge_scale), 0, 1)*valid
         wide_support = zeros.copy()
         narrow_support = zeros.copy()
         for band, weight in ((.23,1-control.wide), (1.,control.wide)):
@@ -163,6 +166,7 @@ class FormReferee:
         proximity = np.clip((q-far_start)/max(near_end-far_start,1e-7),0,1)
         spread = box(np.abs(light-surround)*valid, max(2,h*.025))/np.maximum(box(valid.astype("f4"),max(2,h*.025)),1e-6)
         atmosphere = .06+.94*np.maximum(proximity,np.clip((spread-.19)/.85,0,1))
+        atmosphere = atmosphere**control.haze_scale
         wide_support *= atmosphere
         narrow_support *= atmosphere
         gate = np.minimum(1, np.abs(wide_support)*3.4)
