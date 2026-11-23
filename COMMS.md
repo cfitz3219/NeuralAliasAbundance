@@ -21,6 +21,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 **Visible lighting audition, November 22 Pacific.** Cort rejected the first shadow pass as too mild. Stronger contact shadows and separate curved-surface lighting are available for offline visual review at c8fa3442 on PR #197. Four native 3440 × 1440 A/Bs are in local/lighting-strength-study. The gameplay recorder remains at d9106460.
 
+**Resistance recorder download.** Use the standalone `Resistance-Recorder-Install.cmd` and `Resistance-Recorder-Results.cmd` from `local/Resistance-Recorder-Launchers`. They locate the staged `d9106460` package when opened from Downloads.
+
 **Adaptive shadow and curvature controls, November 22 Pacific.** Offline Referee tuning at 68604450 on PR #197. The stronger custom lighting runs without a camera. The optional Intel reference requires a fresh projection. An independent recording demonstrated why transferred settings need a scene check. Ultra at 50 FPS, Low below 50, and exact recovery were tested using controlled frame intervals. Resistance Still and two opposing turns remain with Cort. Production integration and live GPU timing remain open.
 
 **Three Kingdoms and Pharaoh.** Original RCAS and the automatic Route B Referee are staged in the existing Documents CMDs at a072227a, PR 193. Cort's first Three Kingdoms run proved campaign screen delivery and localized a mixed-jitter riverbank. The recorded Referee state was Off. New game verification remains with Cort.
@@ -1432,3 +1434,7 @@ A direct 3440 × 1440 render of fixed frame zero gives quarter-stop changes over
 PR #197, astra/na1-controls-adaptive-shadow, 68604450 on the stronger study at c8fa3442, contains the offline controller, qualified GPU comparisons and [the tuning results](https://github.com/cfitz3219/NeuralAliasAbundance/blob/68604450/research/contact-shadows/REFEREE-TUNING.md). Five archived recordings provided 150 custom lighting frames. The Intel comparison had 75 fresh projection frames. Pharaoh and Sniper Elite 4 supplied none. For Opus, the open question is motion and geometry when projection cannot be recovered. The custom path uses registered depth structure, without claiming measured world-space normals or a 99% match.
 
 A frozen shadow correction overshot on a second Three Kingdoms recording. Referee now rechecks it on that scene, discards both shadow corrections and keeps the independently useful curvature adjustment. Controlled GPU switches selected Ultra at 50 FPS, Low below 50 and Ultra again on recovery. Fable owns eventual binding and live timing. The existing Resistance recorder d9106460 is sufficient for three 15-second recordings. The slide is only for flat strategy maps. No game install or launch in this pass.
+
+### 2026-11-23 06:10Z — Astra -> Cort and Fable — DONE: Resistance recorder launch from Downloads
+
+Cort's single-file download of INSTALL.cmd looked in Downloads for deploy.ps1. The standalone launchers on PR #197 at df22c82e resolve the verified recorder folder from any download location. All 15 existing file hashes matched. Confirmed Install, Results and Uninstall against the original entry points in an isolated rehearsal. Cort owns the live install and recordings.
