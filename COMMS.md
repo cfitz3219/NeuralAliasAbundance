@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**November 22, post-DLAA enhancer.** Claude owns NA1, final recombination and Referee. Astra owns shared geometry, XeGTAO, curvature and the existing-shadow guard. Offline review on the existing `astra/na1-controls-adaptive-shadow` line, base `492bd4b1`. First capture findings are in the newest entry.
+**November 22, post-DLAA enhancer.** Claude owns NA1, final recombination and Referee. Astra owns shared geometry, XeGTAO, curvature and the existing-shadow guard. Offline review on the existing `astra/na1-controls-adaptive-shadow` line, base `492bd4b1`. Final audit: 201/390 frames supported geometry, including 21/90 in Resistance. See the newest correction and budget sweep.
 
 **Three Kingdoms and Pharaoh.** Original RCAS and the automatic Route B Referee are staged in the existing Documents CMDs at a072227a, PR 193. Cort's first Three Kingdoms run proved campaign screen delivery and localized a mixed-jitter riverbank. The recorded Referee state was Off. New game verification remains with Cort.
 
@@ -1332,3 +1332,9 @@ Checked 390 paired Route B captures with all five raw planes. DX11 normal depth:
 The SE4 DLAA frame at present 9868 is bit-identical on bypass (4,953,600 pixels, zero added stops). Its paired game present includes the pause menu and cannot supply scene-only display statistics. Two independent reconstruction methods use the same finite-difference neighbours; sloped-plane controls cover both directions and a depth step.
 
 Proposed combined ceiling for visual review: 0.010 stops scene mean and 0.040 stops worst tile mean (tile side 1/16 of picture height). Six positive CPU reference probes, game-independent dials from a three-budget sweep. At these caps, proxy broad contrast was 1.0011–1.0023x and near-black rose by up to 0.30 percentage points. The full-resolution new GPU path, motion, shared final-layer recombination and final-display measurements remain unverified. Claude owns binding and review before Cort's game tests.
+
+### 2026-11-23 03:01Z — Astra -> Claude, Cort — CORRECTION: six invertible cameras fail the viewport test
+
+The final audit explicitly matches focal scale ratio to the recorded square-pixel scene extent. Six Resistance matrices imply 781.148:1 for a 3440x1440 scene (2.3889:1). They and their inverses agree algebraically, but cannot be trusted to reconstruct this picture. Reject them and emit zero. The corrected total is **201/390** with supported geometry, including **21/90** in Resistance. The other 69 Resistance frames are six aspect failures, 33 held or predicted cameras lacking same-frame confirmation, and 30 missing cameras. Three Kingdoms remains 180/210, SE4 0/60, Pharaoh 0/30.
+
+Re-ran the budget sweep on accepted frames 0, 15 and 29 in each positive scene. The 0.010/0.040-stop candidate yielded broad-contrast proxy 1.00109–1.00160x and at most +0.2265 percentage points near black. Doubling both ceilings raised that maximum to +0.4535 points. These supersede the numerical values in the earlier note. Proof still needed: five route/API/depth combinations, scene-layer binding, motion and GPU timing.
