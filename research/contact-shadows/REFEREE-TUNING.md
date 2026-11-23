@@ -23,7 +23,7 @@ The inputs are registered linear DLAA color, oriented depth, and usable current-
 
 Use the current scene's thin-feature coverage, local luminance variation, distant haze evidence, existing darkening, eligible depth coverage and motion. The analytic rule maps these to bounded controls. Search neighboring settings offline, holding the input frame and exposure fixed. A tolerance around the approved look gives the search room to reduce fringe shading and excessive darkening. The objective penalizes missing the approved visible coverage as well as exceeding it.
 
-Fit spatial settings on the first frame and test the proposed correction on other frames before retaining it. The analytic setting wins a tie. For temporal corrections, reserve additional valid pairs and discard a correction if they fail to support it. The last frame is held out from spatial and temporal selection. Separate recordings can be evaluated with a frozen calibration. Continuous settings move toward their target over time. Invalid history clears immediately. Per-session corrections are evidence from an offline replay, never game-specific substitutions in the renderer.
+Fit spatial settings on the first frame and test the proposed correction on other frames before retaining it. The analytic setting wins a tie. For temporal corrections, reserve additional valid pairs and discard a correction if they fail to support it. The last frame is held out from spatial and temporal selection. When carrying corrections to another recording, keep the candidates frozen and repeat the held-out comparisons on the new scene. Reject the spatial and history corrections independently. Select reference frames by metadata and ordinal alone so a missing camera at a fixed ordinal cannot discard other qualified evidence. Continuous settings move toward their target over time. Invalid history clears immediately. Per-session corrections are evidence from an offline replay, never game-specific substitutions in the renderer.
 
 The current proof runs the actual Intel shader in a separate D3D12 test process. A paired export seeds GPU history on the preceding frame and uses real registered vectors and jitter on the next one. The custom contact and curvature estimator runs separately in NumPy. The Intel audition measures its own contribution against the accepted contact look. Adding stock Intel output on top of the accepted contact layer would double-darken some recesses. Production routing, per-view GPU reductions and fused budgets remain with the live integration after the motion review. No in-game parameter exploration or synchronous renderer readback is needed for this proof.
 
@@ -42,3 +42,23 @@ Comparisons assume 60 Hz for converting archive motion to speed if no frame inte
 ## Player recordings
 
 Use the existing Resistance recorder. Stand still for 15 seconds, then make two separate 15-second turns in opposite directions from the same spot, including a little up/down movement. Frame thin foreground cover against more distant objects so both shimmer and revealed surfaces are visible. Each button hides the overlay. The same three captures cover every candidate. Slide belongs only to a flat strategy map. These capture-only runs test motion and camera-independent geometry. A later instrumented live run is needed to measure GPU cost on the RTX 5070 Ti.
+
+## Saved-scene results, November 22 Pacific
+
+Each row covers 30 archived frames. Columns for Intel count only frames with trustworthy projection. The independent Three Kingdoms recording starts with correction candidates from the first recording and never refits them. Lower appearance loss means closer to the stronger approved reference under the scoring rule above.
+
+| Recording | Custom contact and curvature frames | Intel frames | Spatial AO loss on final frame, analytic to selected |
+| --- | ---: | ---: | --- |
+| Three Kingdoms, fit recording | 30 | 30 | 0.4240 to 0.4033 |
+| Sniper Elite Resistance | 30 | 15 | 0.3198 to 0.2816 |
+| Pharaoh | 30 | 0 | No fresh projection |
+| Sniper Elite 4 | 30 | 0 | No fresh projection |
+| Three Kingdoms, independent recording | 30 | 30 | 0.4863 to 0.4863 |
+
+Blind transfer scored 0.6614 on the last frame of the independent recording. Testing the proposed settings on the new scene rejected both the spatial and history shadow corrections, restored the scene-derived AO score to 0.4863, and retained the curvature correction, improving its score from 0.1635 to 0.1600.
+
+The first qualified Three Kingdoms frame selected depth mip offset 3.116, thin-object compensation 0.107 and two denoising passes. The Resistance frame selected 4.240, 0.189 and three passes. All are results of evaluating the captured scene. Three independent spatial checks in Resistance used ordinals 5, 11 and 20. The earlier fixed-ordinal sampler missed all three. Temporal fit support in this Resistance burst is only one independent pair.
+
+The full-resolution Three Kingdoms contact-plus-curvature proof changed 32.6% of the picture by at least half a stop. Broad contrast was 1.060 times original, and 3.052% of pixels were near black both before and after. This proof uses the custom camera-independent path. The separate GPU reference does not contribute to that image.
+
+Replaying the controlled frame times 16.00, 20.00, 20.01, 22.00 and 20.00 ms produced Ultra, Ultra, Low, Low and Ultra. On the fixed input the GPU shadow image matched the first Ultra output exactly after recovery. Testing covers 16 Python cases and four GPU fixture cases. The captures, reports and native proof are on Cort's machine under local/referee-lighting-calibration. Player turns, the separate 99% accuracy check and actual in-game cost remain open.

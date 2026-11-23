@@ -173,6 +173,18 @@ def coordinate_search(base,moves,evaluate,intel):
     return changes,trials
 
 
+def held_out_frames(eligible, anchors=(4,13,21)):
+    """Choose by ordinal and metadata alone, without looking at lighting scores."""
+    remaining=set(eligible)
+    selected=[]
+    for anchor in anchors:
+        if not remaining: break
+        nearest=min(remaining,key=lambda i:(abs(i-anchor),i))
+        remaining.remove(nearest)
+        selected.append(nearest)
+    return selected
+
+
 def run(folder,out,exe,step,frame_ms,external=None):
     first=SavedFrame(folder,0,step,frame_ms)
     sets={"shape":{},"ao":{}}
@@ -208,52 +220,61 @@ def run(folder,out,exe,step,frame_ms,external=None):
                 sets["ao"].update(steps)
                 trials["history"]=tested
         validation={}
-        if external is None:
-            # Validate a correction against the uncorrected scene-derived rule on other frames.
-            # Keep the analytic rule when a fitted correction cannot repeat its benefit.
-            for kind in ("shape","ao"):
-                if not sets[kind]: continue
-                scored=[]
-                for idx in (4,13,21):
-                    f=SavedFrame(folder,idx,step,frame_ms)
-                    if kind=="ao":
-                        base=propose_ao(f.picture,False)
-                        if base is None: continue
-                        def loss(option):
-                            return image_loss(f,spatial_gpu(f,option,exe,directory),f.contact)[0]
-                    else:
-                        base=propose_shape(f.picture)
-                        def loss(option):
-                            return image_loss(f,render_shape(f,option)[0],f.combined)[0]
-                    scored.append([idx,loss(base),loss(modify(base,sets[kind],kind=="ao"))])
+        # A calibration transferred from another recording must earn its place here too.
+        # Validate a correction against the uncorrected scene-derived rule on other frames.
+        # Keep the analytic rule when a fitted correction cannot repeat its benefit.
+        for kind in ("shape","ao"):
+            if not sets[kind]: continue
+            scored=[]
+            indices=(4,13,21)
+            if kind=="ao":
+                qualified=[]
+                # Keep the fit pair and the final holdout out of model selection.
+                for idx in range(2,29):
+                    meta=json.loads((folder/f"{idx:05d}-meta.json").read_text(encoding="utf-8-sig"))
+                    if reference(meta) is not None:
+                        qualified.append(idx)
+                indices=held_out_frames(qualified)
+            for idx in indices:
+                f=SavedFrame(folder,idx,step,frame_ms)
                 if kind=="ao":
-                    # A static validation frame says nothing about temporal keep.
-                    history={k:v for k,v in sets[kind].items() if k=="temporal"}
-                else: history={}
-                keep=bool(scored and np.mean([r[2]-r[1] for r in scored]) < -1e-5)
-                validation[kind]=dict(frames=scored,spatial_fit_retained=keep)
-                if not keep: sets[kind]=history
-            if "temporal" in sets["ao"]:
-                scored=[]
-                for idx in range(3,24):
-                    old=SavedFrame(folder,idx-1,step,frame_ms)
-                    new=SavedFrame(folder,idx,step,frame_ms)
-                    if (old.picture.depth_units is None or new.picture.depth_units is None or
-                        new.picture.speed is None or new.m["camera_cut"] or new.m["reset"] or
-                        identity(old.m)!=identity(new.m) or new.m["present_ordinal"]!=old.m["present_ordinal"]+1):
-                        continue
-                    opt=modify(propose_ao(old.picture,False),sets["ao"],True)
-                    old_layer=spatial_gpu(old,opt,exe,directory)
-                    ordinary=propose_ao(new.picture,True)
-                    new_opt=modify(ordinary,sets["ao"],True)
-                    def score(candidate):
-                        layer=spatial_gpu(new,candidate,exe,directory,(old,opt))
-                        return history_loss(old,new,old_layer,layer)
-                    scored.append([idx,score(replace(new_opt,temporal=ordinary.temporal)),score(new_opt)])
-                    if len(scored)==2: break
-                keep=bool(scored and np.mean([r[2]-r[1] for r in scored]) < -1e-5)
-                validation["history"]=dict(frames=scored,fit_retained=keep)
-                if not keep: del sets["ao"]["temporal"]
+                    base=propose_ao(f.picture,False)
+                    if base is None: continue
+                    def loss(option):
+                        return image_loss(f,spatial_gpu(f,option,exe,directory),f.contact)[0]
+                else:
+                    base=propose_shape(f.picture)
+                    def loss(option):
+                        return image_loss(f,render_shape(f,option)[0],f.combined)[0]
+                scored.append([idx,loss(base),loss(modify(base,sets[kind],kind=="ao"))])
+            if kind=="ao":
+                # A static validation frame says nothing about temporal keep.
+                history={k:v for k,v in sets[kind].items() if k=="temporal"}
+            else: history={}
+            keep=bool(scored and np.mean([r[2]-r[1] for r in scored]) < -1e-5)
+            validation[kind]=dict(frames=scored,spatial_fit_retained=keep)
+            if not keep: sets[kind]=history
+        if "temporal" in sets["ao"]:
+            scored=[]
+            for idx in range(3,24):
+                old=SavedFrame(folder,idx-1,step,frame_ms)
+                new=SavedFrame(folder,idx,step,frame_ms)
+                if (old.picture.depth_units is None or new.picture.depth_units is None or
+                    new.picture.speed is None or new.m["camera_cut"] or new.m["reset"] or
+                    identity(old.m)!=identity(new.m) or new.m["present_ordinal"]!=old.m["present_ordinal"]+1):
+                    continue
+                opt=modify(propose_ao(old.picture,False),sets["ao"],True)
+                old_layer=spatial_gpu(old,opt,exe,directory)
+                ordinary=propose_ao(new.picture,True)
+                new_opt=modify(ordinary,sets["ao"],True)
+                def score(candidate):
+                    layer=spatial_gpu(new,candidate,exe,directory,(old,opt))
+                    return history_loss(old,new,old_layer,layer)
+                scored.append([idx,score(replace(new_opt,temporal=ordinary.temporal)),score(new_opt)])
+                if len(scored)==2: break
+            keep=bool(scored and np.mean([r[2]-r[1] for r in scored]) < -1e-5)
+            validation["history"]=dict(frames=scored,fit_retained=keep)
+            if not keep: del sets["ao"]["temporal"]
         ref_contact,ref_combined=FormReferee(),FormReferee()
         analytic_shape=AdaptiveForm()
         analytic_scene=SceneReferee()
@@ -310,6 +331,6 @@ if __name__=="__main__":
     parser.add_argument("--gpu-fixture",type=Path,required=True)
     parser.add_argument("--step",type=int,default=4)
     parser.add_argument("--frame-ms",type=float,help="Known present interval for a controlled replay")
-    parser.add_argument("--calibration",type=Path,help="Apply prior settings corrections to a held-out recording")
+    parser.add_argument("--calibration",type=Path,help="Validate prior corrections against this recording before applying them")
     args=parser.parse_args()
     run(args.capture,args.report,args.gpu_fixture,args.step,args.frame_ms,args.calibration)

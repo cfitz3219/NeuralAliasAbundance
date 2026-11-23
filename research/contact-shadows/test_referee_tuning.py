@@ -5,7 +5,7 @@ import numpy as np
 from form_lighting import FormReferee
 from referee_tuning import AdaptiveForm, SceneReferee, Shape, observe, propose_ao, propose_shape, quality
 from test_form_lighting import fixture
-from tune_replay import modify
+from tune_replay import held_out_frames, modify
 
 
 class TuningTests(unittest.TestCase):
@@ -13,6 +13,12 @@ class TuningTests(unittest.TestCase):
         self.rgb,self.q=fixture()
         self.mv=np.zeros((*self.q.shape,2),"f4")
         self.features=observe(self.rgb,self.q,True,self.mv,1/60,20.,(1.3,0.,.1))
+
+    def test_selects_independent_qualified_frames_by_ordinal(self):
+        self.assertEqual(held_out_frames([3,5,9,17,24]),[3,9,24])
+        self.assertEqual(held_out_frames([17]),[17])
+        self.assertEqual(held_out_frames([]),[])
+        self.assertEqual(held_out_frames(range(2,29)),[4,13,21])
 
     def test_quality_boundary_apply_and_recover(self):
         governor=SceneReferee()
