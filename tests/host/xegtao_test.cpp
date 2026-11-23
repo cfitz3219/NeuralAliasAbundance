@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <fstream>
+#include <iomanip>
 #include <d3d12sdklayers.h>
 
 namespace {
@@ -116,7 +118,49 @@ int native(test::Device& d) {
 }
 #endif
 }
-int main() {
+// Compare a saved scene with the pinned XeGTAO kernel in isolation. The input
+// stores width, height, clear depth, radius, the 16 column-vector VP entries,
+// then tightly packed float32 depth in a separate file. White input recovers
+// the visibility from the existing float compose path without color dependence.
+int export_visibility(const char* header, const char* depth_path, const char* output_path)
+{
+    std::ifstream desc(header);
+    unsigned w=0,h=0;
+    float clear=0, radius=0;
+    double matrix[16]{};
+    REQUIRE(desc >> w >> h >> clear >> radius);
+    for (double& v : matrix) { REQUIRE(desc >> v); }
+    REQUIRE(w>=4 && w<=8192 && h>=4 && h<=8192 && radius>0 && radius<=100);
+    std::vector<float> depth(size_t(w)*h), white(size_t(w)*h*4,1.f);
+    std::ifstream source(depth_path,std::ios::binary);
+    REQUIRE(source.read(reinterpret_cast<char*>(depth.data()),depth.size()*sizeof(float)));
+    test::Device d;
+    if (!test::CreateDevice(d)) return test::SkipNoDevice("XeGTAO");
+    test::List list; REQUIRE(list.Create(d.device.Get()));
+    auto z=input(d,list,w,h,DXGI_FORMAT_R32_FLOAT,depth,1);
+    auto color=input(d,list,w,h,DXGI_FORMAT_R32G32B32A32_FLOAT,white,4);
+    REQUIRE(z.texture && color.texture);
+    na::xegtao::Inputs in; in.width=w; in.height=h; in.clear_depth=clear;
+    in.depth=z.texture.Get(); in.color=color.texture.Get(); in.color_format=DXGI_FORMAT_R32G32B32A32_FLOAT;
+    REQUIRE(na::xegtao::FromViewProjection(matrix,in.projection));
+    na::xegtao::Pass pass; na::xegtao::Options opt; opt.enabled=true; opt.amount=100; opt.temporal=0; opt.radius=radius;
+    auto frame=pass.Prepare(d.device.Get(),d.queue.Get(),in,opt);
+    if (!frame) { REQUIRE(pass.WaitPrepared(30000)); frame=pass.Prepare(d.device.Get(),d.queue.Get(),in,opt); }
+    REQUIRE(frame && frame->Record(list.list.Get()));
+    auto rb=capture(d,list,frame->Color());
+    REQUIRE(SUCCEEDED(list.list->Close()));
+    ID3D12CommandList* lists[]={list.list.Get()}; d.queue->ExecuteCommandLists(1,lists);d.WaitIdle();
+    const auto rgba=pixels(rb); REQUIRE(rgba.size()==white.size());
+    for (size_t i=0;i<depth.size();++i) { depth[i]=rgba[4*i]; REQUIRE(std::isfinite(depth[i])); }
+    std::ofstream file(output_path,std::ios::binary);REQUIRE(file.write(reinterpret_cast<const char*>(depth.data()),depth.size()*sizeof(float)));
+    file.close(); REQUIRE(file.good());
+    return test::finish("XeGTAO saved visibility");
+}
+
+int main(int argc,char** argv) {
+    if (argc==5 && std::strcmp(argv[1],"--export-visibility")==0) return export_visibility(argv[2],argv[3],argv[4]);
+    if (argc!=1) return 2;
+
     CHECK(na::settings::Settings{}.xegtao_enabled.load()==0);
 #if !defined(NA_HAVE_XEGTAO)
     std::printf("XeGTAO: SKIP (DXC shaders not built)\n");return 77;
