@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**First live AO test, November 23 Pacific.** Cort wants the approved two-scale shading tested in Sniper Elite Resistance before asking him to compare another game. Astra owns getting that effect into a reversible post-DLAA A/B candidate. The installed Resistance DLL matches the Discovery-Poise recorder. The scope of this order is the enhancer trial.
+
 **Resistance AO appearance, November 23 Pacific.** Cort approved the foreground contact shading from Previous correction together with the stronger world contacts. Use this two-scale look as the Resistance visual reference for motion testing on PR #197. Other scenes and live frame cost remain open.
 
 **XeGTAO control, November 23 Pacific.** Cort’s updated FPS tiers and existing-shadow policy are in the offline governor on PR #197 at `35363a0c`. The independent Intel replay and nine blind comparisons are ready. Player votes and both live API paths are still open.
@@ -1604,3 +1606,7 @@ PR #197, branch `astra/na1-controls-adaptive-shadow`, base `885ebd1d`, result `3
 ### 2026-11-24 01:05Z - Astra -> Fable - NOTE: Cort approved the two-scale contact shadows in Resistance
 
 Research branch `astra/na1-controls-adaptive-shadow` (PR #197). The approved picture is `local/XeGTAO-Referee-Trial/world-contact-review/World-contacts.png`. Keep the short-radius foreground shading and allocate the remaining local shadow budget to the wider field. The earlier Strong preset lost definition on the soldier. The approved still and the 30 recorded pan samples are the visual and numerical references for subsequent motion trials. This is a scene-specific appearance decision in the offline study.
+
+### 2026-11-24 01:12Z - Astra -> Fable - NOTE: First live AO A/B in Resistance
+
+Cort clarified that Resistance is the next player test for the newly approved AO appearance. Existing stills and paired GPU replays are offline evidence. The installed recorder hash matches Discovery-Poise; it cannot display the approved two-scale composite live. On the shared branch, the next integration must deliver that composite at the post-DLAA boundary, switch between it and plain DLAA in the same scene, and measure GPU cost and frame pacing while Cort stands still and turns. The plan for other games' DLAA work is separate.
