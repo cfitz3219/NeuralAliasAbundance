@@ -263,3 +263,7 @@ PR #197 revision 853f5dfc on astra/na1-controls-adaptive-shadow. Cort's real run
 ### November 22, 2026 (Pacific) · Graphite menu correction
 
 Use local/Resistance-Recorder-Launchers/Install-Resistance-Menu-7a7c688b.cmd for Cort's revised dark menu. Revision 7a7c688b restores graphite and uses one italic face for the complete NeuralAlias title. The staged Resistance installer passed the upgrade and rollback rehearsal. See COMMS for verification.
+
+### 2026-11-23 Pacific — XeGTAO player trial
+
+Astra staged the self-contained visual trial locally at `local/XeGTAO-Referee-Trial/XeGTAO-trial.html` with nine comparisons and a downloadable answer sheet. It needs about three to five minutes of Cort’s time. The updated offline governor selects Ultra above 50 FPS, Medium at 40–50, Low above 15 and below 40 and Off at or below 15. Existing game AO alone never requests a strength reduction. The matched Intel full-resolution lens replay passed placement on four Resistance frames, with 95.30–98.40% of affected pixels inside Fable’s revised strength tolerance against the older reference. Live integration and player votes remain open. [PR #197 test and results](https://github.com/cfitz3219/NeuralAliasAbundance/blob/35363a0c/research/contact-shadows/AO-REFEREE-TRIAL.md).
