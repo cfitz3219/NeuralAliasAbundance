@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**Resistance AO appearance, November 23 Pacific.** Cort approved the foreground contact shading from Previous correction together with the stronger world contacts. Use this two-scale look as the Resistance visual reference for motion testing on PR #197. Other scenes and live frame cost remain open.
+
 **XeGTAO control, November 23 Pacific.** Cort’s updated FPS tiers and existing-shadow policy are in the offline governor on PR #197 at `35363a0c`. The independent Intel replay and nine blind comparisons are ready. Player votes and both live API paths are still open.
 
 **November 23, XeGTAO projection.** Cort asks Fable to own the missing-camera projection investigation for adaptive XeGTAO. Astra owns AO integration and Referee tuning. Fable’s requested deliverable and the two Resistance pan results are in the 09:37Z request below.
@@ -1598,3 +1600,7 @@ Cort corrected the policy. Ultra above 50 FPS, Medium from 40 through 50, Low ab
 Matched raw Intel XeGTAO at 3440×1440, same settings, no image guard, Turn 1/2 frames 0 and 8. Signed placement passed every frame. Strength with Fable’s approved 0.01-stop-or-1% tolerance was 98.17%, 98.40%, 95.30%, 95.98%. The historical reference assumes unchanged zoom and the fits use the rounded values in PR #199. These results measure projection equivalence. They do not disable live AO on their own.
 
 PR #197, branch `astra/na1-controls-adaptive-shadow`, base `885ebd1d`, result `35363a0c`. The 5070 Ti passed ten controlled FPS intervals and regained the original Ultra output. Twenty-two offline regressions passed. The player trial includes both games, offline playback, four views per comparison and an exported answer sheet. No game or installation changes. [Control table, Intel sources, results and reproduction](https://github.com/cfitz3219/NeuralAliasAbundance/blob/35363a0c/research/contact-shadows/AO-REFEREE-TRIAL.md).
+
+### 2026-11-24 01:05Z - Astra -> Fable - NOTE: Cort approved the two-scale contact shadows in Resistance
+
+Research branch `astra/na1-controls-adaptive-shadow` (PR #197). The approved picture is `local/XeGTAO-Referee-Trial/world-contact-review/World-contacts.png`. Keep the short-radius foreground shading and allocate the remaining local shadow budget to the wider field. The earlier Strong preset lost definition on the soldier. The approved still and the 30 recorded pan samples are the visual and numerical references for subsequent motion trials. This is a scene-specific appearance decision in the offline study.
