@@ -24,10 +24,101 @@ class TuningTests(unittest.TestCase):
     def test_quality_boundary_apply_and_recover(self):
         governor=SceneReferee()
         for ms,tier in ((None,3),(19.999,3),(20.,1),(1000./41,1),(25.,1),(25.001,0),(1000./15.01,0),(1000./15,None),(80.,None),(25.,1),(16.,3)):
-            proposal=propose_ao(replace(self.features,frame_ms=ms),True)
-            result=governor.apply(proposal,1/60)
+            pic=replace(self.features,frame_ms=ms)
+            proposal=propose_ao(pic,True)
+            self.assertEqual(proposal.quality if proposal else None,tier)
+            for _ in range(70):
+                result=governor.apply(proposal,1/60,picture=pic)
             self.assertEqual(result.quality if result else None,tier)
         self.assertRaises(ValueError,quality,np.nan)
+
+
+    def test_visual_round_trip_holds_until_source_changes(self):
+        governor = SceneReferee()
+        first = replace(propose_ao(self.features, True), amount=75, radius=1.)
+        bigger = replace(first, amount=90, radius=1.5, denoise=3)
+        def feed(option, frames=120, picture=self.features):
+            for _ in range(frames):
+                result = governor.apply(option, 1/60, picture=picture)
+            return result
+        feed(first)
+        for index in range(240):
+            result = feed(bigger if index % 2 else first, 1)
+            self.assertEqual(result.amount, 75)
+            self.assertEqual(result.radius, 1.)
+        self.assertEqual(feed(bigger).amount, 90)
+        self.assertEqual(feed(first).amount, 75)
+        # Deliberately alternate slowly enough to defeat a cooldown alone.
+        for _ in range(4):
+            self.assertEqual(feed(bigger).amount, 75)
+            self.assertAlmostEqual(feed(first).radius, 1., places=4)
+        self.assertEqual(feed(replace(bigger, amount=0), 1).amount, 0)
+        changed = replace(self.features, detail=1.-self.features.detail,
+                          depth_units=self.features.depth_units*1.5)
+        self.assertEqual(feed(bigger, picture=changed).amount, 90)
+        self.assertAlmostEqual(feed(bigger, picture=changed).radius, 1.5, places=4)
+
+    def test_own_shadow_response_does_not_keep_restarting_probes(self):
+        governor = SceneReferee()
+        base = replace(propose_ao(self.features, True), amount=75)
+        result = governor.apply(base, .02, picture=self.features)
+        submitted = []
+        for _ in range(700):
+            # The same unchanged source alternately looks under/over target
+            # when judged through the output of this simulated strength dial.
+            wish = 90 if result.amount < 83 else 75
+            result = governor.apply(replace(base, amount=wish), .02, picture=self.features)
+            submitted.append(result.amount)
+        self.assertGreaterEqual(max(submitted), 83)
+        self.assertEqual(set(submitted[-400:]), {75})
+        self.assertIsNotNone(governor.targets["amount"].hold_at)
+        # An independently supported change to a different dial still works.
+        for _ in range(100):
+            result = governor.apply(replace(base, amount=90, falloff=.35), .02, picture=self.features)
+        self.assertAlmostEqual(result.falloff, .35, places=3)
+        self.assertEqual(result.amount, 75)
+
+    def test_fps_cost_feedback_settles_and_recovers(self):
+        governor = SceneReferee()
+        def frame(ms, reset=False):
+            pic = replace(self.features, frame_ms=ms)
+            opt = governor.apply(propose_ao(pic, True), ms/1000, reset, picture=pic)
+            return opt.quality if opt else -1
+        tier = frame(18.)
+        transitions = []
+        for i in range(900):
+            # Switching to Ultra itself costs enough to cross 50 FPS.
+            next_tier = frame(20.6 if tier == 3 else 18.2)
+            if tier != next_tier:
+                transitions.append(next_tier)
+            tier = next_tier
+        self.assertEqual(transitions, [1, 3, 1])
+        for _ in range(100):
+            tier = frame(17.)
+        self.assertEqual(tier, 3)
+        self.assertEqual(frame(1000/15), -1)
+        self.assertEqual(frame(20.), -1)
+        for _ in range(55):
+            tier = frame(20.)
+        self.assertEqual(tier, 1)
+        self.assertEqual(frame(30.), 0)
+        self.assertEqual(frame(16., reset=True), 3)
+
+    def test_noisy_timing_and_missing_inputs(self):
+        for boundary, upper, lower in [(20., 3, 1), (25., 1, 0), (1000/15, 0, -1)]:
+            governor = SceneReferee()
+            tiers = []
+            for index in range(360):
+                ms = boundary + (.04 if index % 2 else -.04)
+                pic = replace(self.features, frame_ms=ms)
+                opt = governor.apply(propose_ao(pic, True), ms/1000, picture=pic)
+                tiers.append(opt.quality if opt else -1)
+            self.assertEqual(tiers[0], upper)
+            self.assertEqual(set(tiers[1:]), {lower})
+            missing = replace(self.features, depth_units=None)
+            self.assertIsNone(governor.apply(None, .02, picture=missing))
+            self.assertEqual(governor.apply(propose_ao(self.features, True),.02,
+                                            picture=self.features).quality, 1)
 
     def test_existing_shadow_is_not_an_automatic_strength_penalty(self):
         light=propose_ao(replace(self.features,existing_shadow=0.),False)

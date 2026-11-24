@@ -1,6 +1,12 @@
 # XeGTAO control and the player trial
 
-Cort’s quality policy uses measured whole-frame FPS. Above 50 use Ultra, 40 through 50 use Medium, above 15 and below 40 use Low, and at or below 15 skip the pass and clear its history. The next healthy frame selects its own tier. Exactly 40 is Medium because Low starts below 40. The FPS rule governs performance. Missing resources or an uncomputable projection are separate execution conditions, logged as such. An existing game AO setting or dark paint alone supplies no reason to cut strength.
+Cort’s quality policy uses measured whole-frame FPS. Above 50 use Ultra, 40 through 50 use Medium, above 15 and below 40 use Low, and at or below 15 skip the pass and clear its history. A downshift takes effect immediately. Recovery requires one second of qualifying frame times. Exactly 40 is Medium because Low starts below 40. The FPS rule governs performance. Missing resources or an uncomputable projection are separate execution conditions, logged as such. An existing game AO setting or dark paint alone supplies no reason to cut strength.
+
+## Preventing control cycles in the Resistance test
+
+The offline SceneReferee reads geometry, motion and luminance from the unenhanced DLAA input. For each appearance dial it keeps the current target inside a small tolerance, requires a consistent direction for 0.20 seconds before accepting a change, and eases continuous controls toward that target. If a dial returns to its earlier target on materially the same source picture, it holds that value. A meaningful change in the original scene or an explicit reset reopens the decision. A zero amount or invalid temporal history takes effect immediately. Shadow limits are enforced separately on the current frame.
+
+Quality follows the existing 50, 40 and 15 FPS boundaries on a slowdown. After a failed upgrade, frame time must improve at least 0.5 ms over the conditions that just failed before retrying that tier. Lower tiers can recover independently. The one-second recovery window and the 0.5 ms retry margin are initial trial settings. The rule avoids repeatedly switching to Ultra every time Medium raises FPS. `quality_trial.py` now holds each input long enough to verify the settled tier. The replay report records why quality was held and which visual targets were held after a reversal. Live integration still needs to connect those decisions and verify them in Resistance.
 
 ## What to program
 

@@ -107,36 +107,156 @@ def propose_ao(picture,history_valid):
               (.78-.56*moving) if history_valid and f.speed is not None else 0.)
 
 
-class SceneReferee:
-    """Own continuous transitions; threshold quality and invalid temporal history take effect immediately."""
-    def __init__(self):
-        self.last_ao=None
-        self.denoise_wait=0.
-        self.pending_denoise=None
+# Small proposals do not justify a visible adjustment. The relative part also
+# handles changes in scene units. Integer settings need their own resolution.
+AO_DEADBAND = {
+    "amount": 1.0, "radius": .0001, "radius_multiplier": .015, "falloff": .01,
+    "sample_distribution": .03, "thin_occluder": .015, "final_power": .04,
+    "depth_mip_offset": .06, "denoise": 0., "temporal": .015,
+}
 
-    def apply(self,proposal,dt,reset=False):
-        if not np.isfinite(dt) or dt<=0: raise ValueError("invalid frame interval")
-        if proposal is None or reset or self.last_ao is None:
-            self.last_ao=proposal
-            self.denoise_wait=0.
-            self.pending_denoise=None
-            return proposal
-        last=self.last_ao
-        k=1-np.exp(-min(dt,.25)/.22)
-        values={n:getattr(last,n)+k*(v-getattr(last,n)) for n,v in asdict(proposal).items()}
-        # Amount is integral at submission. Keep the fractional accumulator to avoid rounding stalls.
-        denoise=last.denoise
-        if self.pending_denoise!=proposal.denoise:
-            self.denoise_wait=0.
-            self.pending_denoise=proposal.denoise
-        if denoise!=proposal.denoise:
-            self.denoise_wait+=dt
-            if self.denoise_wait>=.20: denoise=proposal.denoise; self.denoise_wait=0.
-        else: self.denoise_wait=0.
-        values.update(quality=proposal.quality,denoise=denoise)
-        if proposal.temporal==0: values["temporal"]=0.
-        self.last_ao=AO(**values)
-        return replace(self.last_ao,amount=round(self.last_ao.amount))
+
+def scene_changed(reference, current):
+    """Compare only pre-AO evidence. Quality's own cost cannot unlock a visual dial."""
+    if reference is None or current is None:
+        return True
+    for name in ("thin", "detail", "fog", "existing_shadow", "coverage"):
+        if abs(getattr(reference, name) - getattr(current, name)) >= .08:
+            return True
+    for name in ("depth_units", "focal"):
+        a, b = getattr(reference, name), getattr(current, name)
+        if a != b and (a is None or b is None or abs(a - b) >= .1 * abs(a)):
+            return True
+    a, b = reference.speed, current.speed
+    return a != b and (a is None or b is None or abs(a - b) >= .15)
+
+
+class VisualTarget:
+    """Confirm a direction, and remember a round trip on an equivalent source picture."""
+    def __init__(self, value):
+        self.value = value
+        self.previous = None
+        self.changed_at = None
+        self.hold_at = None
+        self.direction = 0
+        self.elapsed = 0.
+
+    def select(self, name, request, dt, picture):
+        if self.hold_at is not None:
+            if not scene_changed(self.hold_at, picture):
+                return self.value
+            self.hold_at = None
+            self.previous = None
+        tolerance = max(AO_DEADBAND[name], .02 * abs(self.value)) if name != "denoise" else 0.
+        error = request - self.value
+        direction = 0 if abs(error) <= tolerance else (1 if error > 0 else -1)
+        if direction == 0 or direction != self.direction:
+            self.elapsed = 0.
+        self.direction = direction
+        if direction:
+            self.elapsed += min(dt, .1)
+        if self.elapsed >= .20:
+            if (self.previous is not None and abs(request - self.previous) <= tolerance
+                    and not scene_changed(self.changed_at, picture)):
+                self.hold_at = picture
+            self.previous, self.value = self.value, request
+            self.changed_at = picture
+            self.direction, self.elapsed = 0, 0.
+        return self.value
+
+
+class QualityTarget:
+    """Downshift immediately. Qualify a recovery and remember the headroom of failed upgrades."""
+    def __init__(self):
+        self.tier = None
+        self.pending = None
+        self.elapsed = 0.
+        self.total_ms = 0.
+        self.promoted_from = {}
+        self.failed_ms = {}
+        self.reason = "initial"
+
+    def select(self, requested, frame_ms, dt):
+        self.reason = "steady"
+        if self.tier is None or requested < self.tier:
+            self.reason = "initial" if self.tier is None else "performance_drop"
+            for tier in list(self.promoted_from):
+                if tier > requested:
+                    self.failed_ms[tier] = self.promoted_from.pop(tier)
+            self.tier = requested
+        if requested == self.tier or frame_ms is None:
+            self.pending = None
+            self.elapsed = self.total_ms = 0.
+            return self.tier
+        # A previous upgrade to a tier failed at this frame time. A higher
+        # tier needs fresh headroom; intermediate qualities can still recover.
+        eligible = [tier for tier in (0, 1, 3) if self.tier < tier <= requested
+                    and (tier not in self.failed_ms or frame_ms <= self.failed_ms[tier] - .5)]
+        if not eligible:
+            self.reason = "hold_after_failed_upgrade"
+            self.pending = None
+            self.elapsed = self.total_ms = 0.
+            return self.tier
+        self.reason = "confirming_recovery"
+        requested = max(eligible)
+        if requested != self.pending:
+            self.pending = requested
+            self.elapsed = self.total_ms = 0.
+        sample = min(dt, .1)
+        self.elapsed += sample
+        self.total_ms += frame_ms * sample
+        if self.elapsed >= 1.:
+            self.reason = "recovered"
+            self.promoted_from[requested] = self.total_ms / self.elapsed
+            self.failed_ms.pop(requested, None)
+            self.tier = requested
+            self.pending = None
+            self.elapsed = self.total_ms = 0.
+        return self.tier
+
+
+class SceneReferee:
+    """Use separate stability rules for visual targets, performance and history validity."""
+    def __init__(self):
+        self.last_ao = None
+        self.targets = {}
+        self.quality_target = QualityTarget()
+
+    def apply(self, proposal, dt, reset=False, *, picture=None):
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError("invalid frame interval")
+        frame_ms = picture.frame_ms if picture is not None else dt * 1000
+        missing = proposal is None and (picture is None or picture.depth_units is None
+                                        or quality(frame_ms) is not None)
+        if reset or missing:
+            self.__init__()
+        if missing:
+            return None
+
+        requested = -1 if proposal is None else proposal.quality
+        tier = self.quality_target.select(requested, frame_ms, dt)
+        if tier < 0:
+            self.last_ao = None
+            self.targets.clear()
+            return None
+        if self.last_ao is None:
+            self.targets = {name: VisualTarget(getattr(proposal, name)) for name in AO_DEADBAND}
+            self.last_ao = replace(proposal, quality=tier)
+            return self.last_ao
+
+        values = {"quality": tier}
+        blend = 1 - np.exp(-min(dt, .25) / .22)
+        for name, target in self.targets.items():
+            requested_value = getattr(proposal, name)
+            if name in ("temporal", "amount") and requested_value == 0:
+                self.targets[name] = VisualTarget(0.)
+                values[name] = 0.
+                continue
+            goal = target.select(name, requested_value, dt, picture)
+            last_value = getattr(self.last_ao, name)
+            values[name] = goal if name == "denoise" else last_value + blend * (goal - last_value)
+        self.last_ao = AO(**values)
+        return replace(self.last_ao, amount=round(self.last_ao.amount))
 
 
 @dataclass(frozen=True)

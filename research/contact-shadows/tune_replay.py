@@ -312,10 +312,14 @@ def run(folder,out,exe,step,frame_ms,external=None):
                      contrast=s.get("contrast"),mean_dark=s.get("mean_dark"),tile_dark=s.get("tile_dark"),
                      black_before=s.get("near_black_before"),black_after=s.get("near_black_after"))
             base=propose_ao(f.picture,history_ok)
-            opt=scene.apply(modify(base,sets["ao"],True) if base else None,frame_ms/1000 if frame_ms is not None else 1/60,cut)
-            analytic=analytic_scene.apply(base,dt,cut)
+            opt=scene.apply(modify(base,sets["ao"],True) if base else None,frame_ms/1000 if frame_ms is not None else 1/60,cut,picture=f.picture)
+            analytic=analytic_scene.apply(base,dt,cut,picture=f.picture)
             row["ao_controls"]=asdict(opt) if opt else None
-            row["ao_status"]="active" if opt else ("15 FPS floor" if quality(frame_ms) is None else "no reliable input")
+            row["ao_status"] = ("active" if opt else "no reliable input" if f.picture.depth_units is None
+                                else "15 FPS floor" if quality(frame_ms) is None else "waiting for FPS recovery")
+            row["ao_quality_decision"] = scene.quality_target.reason
+            row["ao_dials_held_after_reversal"] = [name for name, target in scene.targets.items()
+                                                   if target.hold_at is not None]
             if opt is not None:
                 link=previous if history_ok and opt.temporal>0 else None
                 delta=spatial_gpu(f,opt,exe,directory,link)

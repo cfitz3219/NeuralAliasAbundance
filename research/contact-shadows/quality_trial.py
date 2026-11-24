@@ -20,7 +20,10 @@ def trial(folder,exe,fit):
         for ms in (16.,20.,1000./41,25.,25.01,1000./15.01,1000./15,80.,25.,16.):
             evidence=replace(f.picture,frame_ms=ms)
             proposal=propose_ao(evidence,False)
-            opt=state.apply(modify(proposal,fit["ao"],True) if proposal else None,ms/1000)
+            request=modify(proposal,fit["ao"],True) if proposal else None
+            # Hold each measured interval until the recovery observation window has elapsed.
+            for _ in range(int(np.ceil(1.05*1000/ms))):
+                opt=state.apply(request,ms/1000,picture=evidence)
             delta=spatial_gpu(f,opt,exe,temp) if opt else np.zeros_like(f.z)
             form.request=modify(propose_shape(evidence),fit["shape"],False)
             a,c,s=form.layers(f.rgb,f.z,f.rev,f.mv,frame_ms=ms,dt=ms/1000)
