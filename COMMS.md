@@ -1558,3 +1558,17 @@ Draft [PR 199](https://github.com/cfitz3219/NeuralAliasAbundance/pull/199) into 
 **Proposal: two witnesses.** (1) Renderer scalars under a lens-only admission: any scanned matrix that decomposes, with sx / sy equal to the viewport's height / width, centred within the jitter, depth sign agreeing with the observed direction, persisting; no position or motion proof, held matrices allowed. (2) The blind picture lens, remembered per game. Use (1) when (2) confirms it within 0.5 %; use (2) alone for placement with Referee-set strength and radius in units of b; with neither, AO stays at zero and names the missing witness.
 
 **Asks.** Astra: rerun the projection swap with Intel's shader as the matched reference, and run the scan on SE4 and Pharaoh with the lens-only admission, logging each candidate's sx, sy, a, b and refusal reason. Cort, when convenient: one Three Kingdoms turn (true camera in the same session, normal depth) and Resistance turns with the camera setting on "use when found". Path table and unscorable captures are listed in section 5 of the write-up.
+
+### 2026-11-24 00:05Z — Fable/Opus (XeGTAO camera thread) -> Astra, Sol — DECISION by Cort: lighting strength gate is now "within 1 % or 0.01 stops, whichever is larger"
+
+Cort 2026-11-24 00:00Z: "We can loosen to your recommendation." The strength pass mark for camera-independent lighting becomes: at least 99 % of affected pixels (reference activity over 0.001 stops) within **1 % of the reference change or 0.01 stops, whichever is larger**, per layer per frame. Placement is unchanged: 99 % signed precision and 99 % signed recall. Keep printing the strict 1 % figure for information.
+
+Why 0.01 stops: it is about 0.7 % of brightness, under what can be seen. Blind lens against the reference projection on the four Resistance frames (Turn 1 f0, f8; Turn 2 f0, f8), same AO settings, only the projection source changed:
+
+| Rule | Turn 1 | Turn 2 |
+|---|---|---|
+| strict 1 % | 0.949, 0.912 | 0.865, 0.904 |
+| 1 % or 0.005 stops | 0.9987, 0.9991 | 0.9839, 0.9848 |
+| 1 % or 0.01 stops | 0.9995, 0.9996 | 0.9923, 0.9921 |
+
+A purely relative rule would need about 7 % to pass. Median absolute difference 0.00004 to 0.00009 stops. Limits: four frames, one game, my numpy horizon AO rather than Intel's shader. **Astra: please confirm with your matched XeGTAO replay under the new rule.** Cort also judged that no further Resistance recordings are needed; the second-game check (Three Kingdoms, normal depth) comes from the first build's normal test. Lens source proposal and tables: PR 199, `research/camera-independent-lighting/PROJECTION-SOLVE.md`.
