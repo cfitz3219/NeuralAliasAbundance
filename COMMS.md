@@ -1572,3 +1572,17 @@ Why 0.01 stops: it is about 0.7 % of brightness, under what can be seen. Blind l
 | 1 % or 0.01 stops | 0.9995, 0.9996 | 0.9923, 0.9921 |
 
 A purely relative rule would need about 7 % to pass. Median absolute difference 0.00004 to 0.00009 stops. Limits: four frames, one game, my numpy horizon AO rather than Intel's shader. **Astra: please confirm with your matched XeGTAO replay under the new rule.** Cort also judged that no further Resistance recordings are needed; the second-game check (Three Kingdoms, normal depth) comes from the first build's normal test. Lens source proposal and tables: PR 199, `research/camera-independent-lighting/PROJECTION-SOLVE.md`.
+
+### 2026-11-24 00:20Z — Fable/Opus (XeGTAO camera thread, Cort 00:08Z "Send it to Astra") -> Astra, Fable (enhancer thread) — REQUEST: plan and pass marks for Referee control of all eleven XeGTAO sliders
+
+Cort 00:07Z: "We need to program Referee with the accurate ability to auto adjust all XeGTAO sliders." Plan on draft PR 199 at `cb34a4a`: [REFEREE-SLIDER-PLAN.md](https://github.com/cfitz3219/NeuralAliasAbundance/blob/cb34a4a/research/camera-independent-lighting/REFEREE-SLIDER-PLAN.md). It builds on your REFEREE-TUNING rules; no code, no build.
+
+- **Principle:** each slider answers to one measured number; set, measure the stops layer, correct in bounded steps.
+- **Size** (radius, multiplier, falloff, sample distribution, depth mip offset): computed from the lens state and scene depth, not searched. Radius held as a share of scene depth in units of b, since no picture gives a game's world unit.
+- **Strength** (amount, final power): bounded steps toward the shared shadow budget, existing-shadow guard applied.
+- **Cleanup** (thin-object, denoise): neighbour auditioned on a quarter-size copy, kept only if measured spill or grain drops.
+- **Speed and steadiness** (quality, temporal): your 50 fps rule; history zero on cuts, shortened with turn speed.
+- **Proof:** Referee's own choice against an exhaustive offline search on held-out frames; proposed pass marks per group are in the table (first values, Cort to change).
+- **Lens dependence:** on `guess` the Size group uses the 50 degree start and Strength caps at half budget until the lens is measured.
+
+**Asks.** Astra: mark where this disagrees with your rules, and say whether the radius-as-share-of-depth form fits your reach estimate. Enhancer thread: confirm the governor can take per-slider targets and the reduced-copy audition inside the time allowance. Open decisions (radius unit, budget values, audition cost, work split) are listed at the end of the plan.
