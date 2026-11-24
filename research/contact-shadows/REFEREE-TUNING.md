@@ -2,13 +2,15 @@
 
 Cort approved the stronger lighting study as the starting look. The offline Referee now observes the scene, proposes individual settings and renders competing choices before accepting corrections. The approved lighting is the reference for appearance. Physical correctness, the earlier 99% camera-independence gate and RTX game performance require separate evidence.
 
+[Current AO policy, Intel controls and interactive test](AO-REFEREE-TRIAL.md). The dated replay results below retain their original policies.
+
 ## What the Referee uses
 
 The inputs are registered linear DLAA color, oriented depth, and usable current-to-previous motion. The optional Intel comparison also needs a fresh qualified projection to convert projected reach into scene units. The custom contact and curvature path continues without it. Game names never select settings.
 
 | Control | How the proposal and selection work |
 | --- | --- |
-| XeGTAO quality | Use Ultra at or above 50 FPS. Below 50 FPS select Low immediately, a drop of three levels. Return to Ultra at 50. Use the selected view's whole-frame present interval. GPU effect duration is a separate budget. Missing timing starts the offline audition at Ultra and is recorded as unknown. |
+| XeGTAO quality | Use Ultra above 50 FPS, Medium from 40 through 50 inclusive, Low above 15 and below 40, and suspend AO at or below 15. Recover into the corresponding tier. Use the selected view's whole-frame present interval. GPU effect duration is a separate budget. Missing timing starts the offline audition at Ultra and is recorded as unknown. |
 | Radius and multiplier | Estimate a projected reach from foreground thinness, convert it to scene units with measured depth and focal length, then trim for atmospheric haze. Audition both values and log their combined result. |
 | Falloff | Test shorter and longer fading near the sampled contact. Reject extra shading along detached edges when another variant better matches supported recesses. |
 | Sample distribution | Concentrate more samples close to the receiver on scenes with narrow foreground features. Audition alternate concentrations. |
@@ -17,7 +19,7 @@ The inputs are registered linear DLAA color, oriented depth, and usable current-
 | Denoising | Compare Off and available spatial filter levels around the proposal. Smooth discrete denoiser transitions independently of the FPS quality switch. |
 | Amount and final power | Adjust overall visibility blend and shadow response separately. Thin-edge spill, already-dark pixels, visible coverage and agreement on affected surfaces contribute to the objective. |
 | Temporal stability | Set zero on cuts, gaps and invalid motion. Otherwise compare history weights on actual consecutive GPU evaluations, checking stable surface pixels and newly revealed areas separately. Longer continuous histories and fast camera turns still need player captures. |
-| Curved lighting | Use the same proposal, audition and validation process for screen reach, shadow depth, outward lift, scale mix, edge rejection, haze suppression and the existing-shadow guard. Near-black protection, regional budgets and broad contrast remain enforced. The adaptive curvature pass uses four directions at 50 FPS and above and two below 50 while the effect is active. The existing whole-frame time allowance can suspend the effect. |
+| Curved lighting | Use the same proposal, audition and validation process for screen reach, shadow depth, outward lift, scale mix, edge rejection, haze suppression and the existing-shadow guard. Near-black protection, regional budgets and broad contrast remain enforced. Curvature keeps its separate historical direction schedule. The existing whole-frame time allowance can suspend the effect. |
 
 ## Decision process
 
@@ -37,7 +39,7 @@ From research/contact-shadows, with NumPy and Pillow available:
     python quality_trial.py <camera-backed-capture> <report.json> <xegtao_test.exe> <threshold.json>
     python form_study.py proofs <capture> <output-folder> --referee-calibration <report.json>
 
-Comparisons assume 60 Hz for converting archive motion to speed if no frame interval is available. This assumption never fabricates an observed FPS threshold crossing. The threshold trial instead supplies explicit intervals, including 20.00 and 20.01 milliseconds, and compares the resulting real GPU shading after a drop and recovery.
+Comparisons assume 60 Hz for converting archive motion to speed if no frame interval is available. This assumption never fabricates an observed FPS threshold crossing. The current threshold trial supplies explicit intervals on both sides of all three boundaries and compares the real GPU shading after recovery.
 
 ## Player recordings
 
@@ -61,7 +63,7 @@ The first qualified Three Kingdoms frame selected depth mip offset 3.116, thin-o
 
 The full-resolution Three Kingdoms contact-plus-curvature proof changed 32.6% of the picture by at least half a stop. Broad contrast was 1.060 times original, and 3.052% of pixels were near black both before and after. This proof uses the custom camera-independent path. The separate GPU reference does not contribute to that image.
 
-Replaying the controlled frame times 16.00, 20.00, 20.01, 22.00 and 20.00 ms produced Ultra, Ultra, Low, Low and Ultra. On the fixed input the GPU shadow image matched the first Ultra output exactly after recovery. Testing covers 16 Python cases and four GPU fixture cases. The captures, reports and native proof are on Cort's machine under local/referee-lighting-calibration. Player turns, the separate 99% accuracy check and actual in-game cost remain open.
+Under the superseded November 22 FPS policy, replaying the controlled frame times 16.00, 20.00, 20.01, 22.00 and 20.00 ms produced Ultra, Ultra, Low, Low and Ultra. On the fixed input the GPU shadow image matched the first Ultra output exactly after recovery. Testing covers 16 Python cases and four GPU fixture cases. The captures, reports and native proof are on Cort's machine under local/referee-lighting-calibration. Player turns, the separate 99% accuracy check and actual in-game cost remain open.
 
 ## Resistance player recordings, November 22, 2026
 

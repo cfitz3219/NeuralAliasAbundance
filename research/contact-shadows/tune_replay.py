@@ -92,11 +92,11 @@ def image_loss(frame, delta, target):
     return cost,coverage
 
 
-def spatial_gpu(frame,opt,exe,directory,previous=None):
+def gpu_visibility(frame,opt,exe,directory,previous=None,matrix=None):
     path=Path(directory)
     h,w=frame.z.shape
     def inputs(f,settings,tag,keep=None):
-        mat=np.asarray(f.m["camera"]["vp_current_row"]).reshape(4,4).T.flatten()
+        mat=np.asarray(f.m["camera"]["vp_current_row"] if matrix is None else matrix).reshape(4,4).T.flatten()
         args=[w,h,0 if f.rev else 1,settings.radius,*mat,settings.quality,settings.denoise,settings.amount,
               settings.radius_multiplier,settings.falloff,settings.sample_distribution,settings.thin_occluder,
               settings.final_power,settings.depth_mip_offset]
@@ -126,8 +126,13 @@ def spatial_gpu(frame,opt,exe,directory,previous=None):
     if run.returncode: raise RuntimeError(run.stdout.decode(errors="replace")+run.stderr.decode(errors="replace"))
     vis=np.fromfile(path/"result",dtype="<f4").reshape(h,w)
     if not np.isfinite(vis).all() or vis.min()<-.001 or vis.max()>1.001: raise ValueError("invalid GPU response")
-    proposed=np.log2(np.clip(vis,1e-6,1))*frame.guard
-    return guard_budget(proposed,frame.y,frame.valid,Budget().mean,Budget().tile)[0]
+    return np.clip(vis,1e-6,1)
+
+
+def spatial_gpu(frame,opt,exe,directory,previous=None,matrix=None):
+    vis=gpu_visibility(frame,opt,exe,directory,previous,matrix)
+    return guard_budget(np.log2(vis),frame.y,frame.valid,Budget().mean,Budget().tile,
+                        ao_shadow_guard=frame.guard)[0]
 
 
 def stable_surface_samples(old,current):
@@ -259,7 +264,7 @@ def run(folder,out,exe,step,frame_ms,external=None):
             keep=bool(scored and np.mean([r[2]-r[1] for r in scored]) < -1e-5)
             validation[kind]=dict(frames=scored,spatial_fit_retained=keep)
             if not keep: sets[kind]=history
-        if "temporal" in sets["ao"]:
+        if "temporal" in sets["ao"] and quality(frame_ms) is not None:
             scored=[]
             for idx in range(3,24):
                 old=SavedFrame(folder,idx-1,step,frame_ms)
@@ -310,6 +315,7 @@ def run(folder,out,exe,step,frame_ms,external=None):
             opt=scene.apply(modify(base,sets["ao"],True) if base else None,frame_ms/1000 if frame_ms is not None else 1/60,cut)
             analytic=analytic_scene.apply(base,dt,cut)
             row["ao_controls"]=asdict(opt) if opt else None
+            row["ao_status"]="active" if opt else ("15 FPS floor" if quality(frame_ms) is None else "no reliable input")
             if opt is not None:
                 link=previous if history_ok and opt.temporal>0 else None
                 delta=spatial_gpu(f,opt,exe,directory,link)

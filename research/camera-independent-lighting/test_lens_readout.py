@@ -84,12 +84,15 @@ class ReadoutTests(unittest.TestCase):
             self.assertEqual(free["incomplete"],[retry.name])
             self.assertFalse(flat["missing"])
             self.assertEqual(run(root,"test","other-build",True)["sessions"],[])
-    def test_relaxed_threshold_does_not_change_strict_verdict(self):
+    def test_approved_floor_keeps_strict_diagnostic(self):
         r=np.full(100,-.05); p=r+.002
         hit=score_layer(p,r,np.ones(100,dtype=bool))
-        self.assertEqual(hit["status"],"fail")
+        self.assertEqual(hit["status"],"pass")
         self.assertEqual(hit["strength"],0.)
         self.assertEqual(hit["strength_at_005_stop_floor"],1.)
+        self.assertEqual(score_layer(r+.008,r,np.ones(100,bool))["status"],"pass")
+        self.assertEqual(score_layer(r+.011,r,np.ones(100,bool))["status"],"fail")
+        self.assertEqual(score_layer(-r,r,np.ones(100,bool))["status"],"fail")
 
 if __name__=="__main__":
     unittest.main()

@@ -86,18 +86,23 @@ def quality(frame_ms):
     # frame_ms is the measured whole-frame interval for the selected view.
     if frame_ms is None: return 3
     if not np.isfinite(frame_ms) or frame_ms<=0: raise ValueError("invalid present interval")
-    return 0 if frame_ms>20.0 else 3
+    if frame_ms < 20.: return 3       # above 50 FPS: Ultra
+    if frame_ms <= 25.: return 1      # 40 through 50 FPS: Medium
+    if frame_ms < 1000./15: return 0  # above 15 and below 40: Low
+    return None                       # 15 FPS or below: skip the AO pass
 
 
 def propose_ao(picture,history_valid):
     if picture is None or picture.depth_units is None: return None
     f=picture
+    tier=quality(f.frame_ms)
+    if tier is None: return None
     moving=1. if f.speed is None else unit(f.speed/.60)
     # Convert screen-relative reach into scene units once. Multiplier only trims that reach.
     radius=float(np.clip(2*f.depth_units*(.009+.020*(1-f.thin))/f.focal,.01,100))
-    return AO(quality(f.frame_ms), 1 if f.thin>.52 else 2, round(98-12*f.existing_shadow),
+    return AO(tier, 1 if f.thin>.52 else 2, 100,
               radius,1.30-.25*f.fog, .54+.33*f.thin, 1.48+1.32*f.thin,
-              .06+.86*f.thin, 2.45+.80*(1-f.existing_shadow)-.35*f.fog,
+              .06+.86*f.thin, 3.25-.35*f.fog,
               2.9+2.3*f.thin+.5*f.detail,
               (.78-.56*moving) if history_valid and f.speed is not None else 0.)
 
@@ -167,5 +172,5 @@ class AdaptiveForm(FormReferee):
                        for n,v in asdict(s).items()})
         self.current=s
         return Controls(c.radius*s.reach,c.dark*s.dark,c.light*s.lift,
-                        float(np.clip(c.wide*s.wide,.25,.90)),4 if quality(frame_ms)==3 else 2,
+                        float(np.clip(c.wide*s.wide,.25,.90)),4 if frame_ms is None or frame_ms<=20. else 2,
                         s.edge,s.haze,s.guard)

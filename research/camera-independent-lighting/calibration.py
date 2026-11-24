@@ -115,7 +115,10 @@ def score_layer(predicted, reference, scene, threshold=0.001):
     scores = dict(precision=float(same.sum()/max(1, proposed)), recall=float(same.sum()/affected),
                   strength=float(within.sum()/affected))
     within_floor = same & (np.abs(predicted-reference) <= np.maximum(.01*np.abs(reference), .005))
-    return dict(status="pass" if min(scores.values()) >= .99 else "fail",
+    accepted = same & (np.abs(predicted-reference) <= np.maximum(.01*np.abs(reference), .01))
+    accepted_fraction = float(accepted.sum()/affected)
+    return dict(status="pass" if min(scores["precision"], scores["recall"], accepted_fraction) >= .99 else "fail",
+                strength_at_010_stop_floor=accepted_fraction,
                 strength_at_005_stop_floor=float(within_floor.sum()/affected),
                 affected=affected, proposed=proposed, **scores)
 

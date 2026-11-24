@@ -222,7 +222,7 @@ def contact_band(q,light,chroma,valid,span,settings,mult):
     return deficit,observed,matched_tiles
 
 
-def guard_budget(delta,lum,valid,mean_cap,tile_cap):
+def guard_budget(delta,lum,valid,mean_cap,tile_cap,*,ao_shadow_guard=None):
     h,w=lum.shape; tile=max(1,round(h/16))
     before=lum[valid]
     # Protect existing near-black pixels and prevent creation of any new ones.
@@ -240,6 +240,12 @@ def guard_budget(delta,lum,valid,mean_cap,tile_cap):
             return arr.reshape(H//tile,tile,W//tile,tile).sum(axis=(1,3))
         return sums(padded)/np.maximum(sums(counts),1)
     initial=regions(delta)
+    if ao_shadow_guard is not None:
+        # Reserve existing shadow detail only where the proposed addition exceeds the tile allowance.
+        excess=np.maximum(0,1-tile_cap/np.maximum(initial,1e-10))
+        weight=np.repeat(np.repeat(excess,tile,axis=0),tile,axis=1)[:h,:w]
+        delta*=1-weight*(1-np.clip(ao_shadow_guard,0,1))
+        initial=regions(delta)
     local=np.minimum(1,tile_cap/np.maximum(initial,1e-10))
     # Never brighten. Hard caps override any smoothing or inferred preference.
     delta*=np.repeat(np.repeat(local,tile,axis=0),tile,axis=1)[:h,:w]
@@ -250,8 +256,23 @@ def guard_budget(delta,lum,valid,mean_cap,tile_cap):
     base=span(before)
     after=before*np.exp2(delta[valid])
     ratio=span(after)/base
+    if ao_shadow_guard is not None and base<=1e-6:
+        ratio=1.  # no measurable baseline contrast for a ratio; other budgets still apply
     if not .92<=ratio<=1.10:
-        delta.fill(0);after=before;ratio=1.
+        if ao_shadow_guard is None:
+            delta.fill(0)
+        else:
+            # Keep the greatest tested gain in budget. Zero is the known baseline.
+            low,high=0.,1.
+            scene_delta=delta[valid]
+            for _ in range(14):
+                middle=(low+high)*.5
+                measured=span(before*np.exp2(scene_delta*middle))/base
+                if .92<=measured<=1.10: low=middle
+                else: high=middle
+            delta*=low
+        after=before*np.exp2(delta[valid])
+        ratio=span(after)/base
     return delta,dict(mean_stops=float(-delta[valid].mean()),worst_tile_stops=float(regions(delta).max()),
                        near_black_before=float((before<black).mean()),near_black_after=float((after<black).mean()),
                        contrast_ratio=ratio,affected=int((delta<-.001).sum()))

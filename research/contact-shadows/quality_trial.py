@@ -17,20 +17,22 @@ def trial(folder,exe,fit):
     rows=[]
     layers=[]
     with TemporaryDirectory() as temp:
-        for ms in (16.,20.,20.01,22.,20.):
+        for ms in (16.,20.,1000./41,25.,25.01,1000./15.01,1000./15,80.,25.,16.):
             evidence=replace(f.picture,frame_ms=ms)
-            opt=state.apply(modify(propose_ao(evidence,False),fit["ao"],True),ms/1000)
-            delta=spatial_gpu(f,opt,exe,temp)
+            proposal=propose_ao(evidence,False)
+            opt=state.apply(modify(proposal,fit["ao"],True) if proposal else None,ms/1000)
+            delta=spatial_gpu(f,opt,exe,temp) if opt else np.zeros_like(f.z)
             form.request=modify(propose_shape(evidence),fit["shape"],False)
             a,c,s=form.layers(f.rgb,f.z,f.rev,f.mv,frame_ms=ms,dt=ms/1000)
-            rows.append(dict(frame_ms=ms,fps=1000/ms,quality=opt.quality,directions=s["controls"]["directions"],
+            rows.append(dict(frame_ms=ms,fps=1000/ms,quality=opt.quality if opt else None,ao_dispatched=opt is not None,directions=s.get("controls",{}).get("directions"),
                              mean_shading_change_vs_ultra=float(np.abs(delta-layers[0]).mean()) if layers else 0.,
-                             form_mean_absolute=s["mean_absolute"]))
+                             form_mean_absolute=s.get("mean_absolute")))
             layers.append(delta)
-    assert [r["quality"] for r in rows]==[3,3,0,0,3]
-    assert [r["directions"] for r in rows]==[4,4,2,2,4]
-    np.testing.assert_array_equal(layers[1], layers[0])
-    assert np.abs(layers[2]-layers[1]).max()>.001, "both GPU quality levels produced identical shading"
+    assert [r["quality"] for r in rows]==[3,1,1,1,0,0,None,None,1,3]
+    np.testing.assert_array_equal(layers[8], layers[1])
+    assert not layers[6].any() and not layers[7].any()
+    assert np.abs(layers[4]-layers[1]).max()>.001, "Low and Medium produced identical shading"
+    assert np.abs(layers[1]-layers[0]).max()>.001, "both GPU quality levels produced identical shading"
     np.testing.assert_array_equal(layers[-1],layers[0])
     return rows
 

@@ -5,6 +5,7 @@ import numpy as np
 from form_lighting import FormReferee
 from referee_tuning import AdaptiveForm, SceneReferee, Shape, observe, propose_ao, propose_shape, quality
 from test_form_lighting import fixture
+from contact_shadow import guard_budget
 from tune_replay import held_out_frames, modify
 
 
@@ -22,10 +23,29 @@ class TuningTests(unittest.TestCase):
 
     def test_quality_boundary_apply_and_recover(self):
         governor=SceneReferee()
-        for ms,tier in ((None,3),(19.999,3),(20.,3),(20.001,0),(24.9,0),(20.,3)):
+        for ms,tier in ((None,3),(19.999,3),(20.,1),(1000./41,1),(25.,1),(25.001,0),(1000./15.01,0),(1000./15,None),(80.,None),(25.,1),(16.,3)):
             proposal=propose_ao(replace(self.features,frame_ms=ms),True)
-            self.assertEqual(governor.apply(proposal,1/60).quality,tier)
+            result=governor.apply(proposal,1/60)
+            self.assertEqual(result.quality if result else None,tier)
         self.assertRaises(ValueError,quality,np.nan)
+
+    def test_existing_shadow_is_not_an_automatic_strength_penalty(self):
+        light=propose_ao(replace(self.features,existing_shadow=0.),False)
+        dark=propose_ao(replace(self.features,existing_shadow=1.),False)
+        self.assertEqual((light.amount,light.final_power),(dark.amount,dark.final_power))
+        y=np.linspace(.04,1,4096).reshape(64,64)
+        valid=np.ones_like(y,bool)
+        weak=np.full_like(y,-.08)
+        retained,_=guard_budget(weak,y,valid,.24,.82,ao_shadow_guard=np.zeros_like(y))
+        np.testing.assert_allclose(retained,weak,atol=1e-6)
+        heavy=np.where(y<.5,-1.5,0.)
+        retained,metrics=guard_budget(heavy,y,valid,.24,.82,ao_shadow_guard=np.zeros_like(y))
+        self.assertGreater(metrics["mean_stops"],0.)
+        self.assertLessEqual(metrics["mean_stops"],.240001)
+        self.assertLessEqual(metrics["worst_tile_stops"],.820001)
+        self.assertLessEqual(metrics["contrast_ratio"],1.100001)
+        self.assertTrue(np.all(retained[heavy==0]==0.))
+        self.assertTrue(np.all(retained<=0.))
 
     def test_real_thin_geometry_and_shader_sign(self):
         z=self.q.copy()
