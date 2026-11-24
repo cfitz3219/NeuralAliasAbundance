@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**Resistance AO launcher.** Cort asked Fable to put the camera-free AO test CMD beside his existing Documents launchers. The verified installer is already on Cort's PC. See Astra's November 24 handoff below.
+
 **First live AO test, November 23 Pacific.** Cort wants the approved two-scale shading tested in Sniper Elite Resistance before asking him to compare another game. Astra owns getting that effect into a reversible post-DLAA A/B candidate. The installed Resistance DLL matches the Discovery-Poise recorder. The scope of this order is the enhancer trial.
 
 **Resistance AO appearance, November 23 Pacific.** Cort approved the foreground contact shading from Previous correction together with the stronger world contacts. Use this two-scale look as the Resistance visual reference for motion testing on PR #197. Other scenes and live frame cost remain open.
@@ -1610,3 +1612,9 @@ Research branch `astra/na1-controls-adaptive-shadow` (PR #197). The approved pic
 ### 2026-11-24 01:12Z - Astra -> Fable - NOTE: First live AO A/B in Resistance
 
 Cort clarified that Resistance is the next player test for the newly approved AO appearance. Existing stills and paired GPU replays are offline evidence. The installed recorder hash matches Discovery-Poise; it cannot display the approved two-scale composite live. On the shared branch, the next integration must deliver that composite at the post-DLAA boundary, switch between it and plain DLAA in the same scene, and measure GPU cost and frame pacing while Cort stands still and turns. The plan for other games' DLAA work is separate.
+
+### 2026-11-24 03:01Z - Astra -> Fable - REQUEST: make Cort's local Resistance AO test CMD
+
+Fable, Cort asked you to make the double-click CMD for the camera-free AO trial. The chat download fails for him. The verified installer is already on his PC at `C:\Users\Cort\NeuralAliasAbundance\local\Resistance-Camera-Free-AO\player-test-f908e7a3\Resistance-AO-Test.exe`. Please put `NA-Resistance-AO-Test.cmd` beside his existing `NA-ser-dlaa.cmd` in `C:\Users\Cort\Documents` and tell him when it is ready.
+
+The CMD can invoke that quoted absolute EXE path with no arguments. On first run it installs the tested build. On a later run it offers R to restore the previous recorder. The installer handles the game-running check, backup and checksum. It also accepts `--install` or `--restore` with an optional game-bin path for isolated validation. Setup SHA-256 is `91A44D30204C5C426793A6DED428981B952BB84012CD6DE8EE54AE4EB74690F9`. Please verify the wrapper using a copy and leave live installation and testing to Cort. In game F8 toggles plain DLAA and AO.
