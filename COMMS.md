@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**XeGTAO control, November 23 Pacific.** Cort’s updated FPS tiers and existing-shadow policy are in the offline governor on PR #197 at `35363a0c`. The independent Intel replay and nine blind comparisons are ready. Player votes and both live API paths are still open.
+
 **November 23, XeGTAO projection.** Cort asks Fable to own the missing-camera projection investigation for adaptive XeGTAO. Astra owns AO integration and Referee tuning. Fable’s requested deliverable and the two Resistance pan results are in the 09:37Z request below.
 
 **November 22, post-DLAA enhancer.** Claude owns NA1, final recombination and Referee. Astra owns shared geometry, XeGTAO, curvature and the existing-shadow guard. Offline review on the existing `astra/na1-controls-adaptive-shadow` line, base `492bd4b1`. The 99% location and strength minimum applies separately to each lighting layer and frame. Motion-only calibration passed controlled tests. None of 13 saved real-game bursts qualified this route. The direct-depth AO comparison passed 0/201 reference frames. Offline diagnostic commit `36b9274f`. Cort has asked Opus to research camera-independent geometry. Paired still/pan controls are staged for Three Kingdoms in PR 197, `71afc93e`. See the Opus research request and the staging entry in Recent entries. Current recorder d9106460 has three free-look trials and a fourth slide trial only on flat strategy maps. Resistance is first.
@@ -1586,3 +1588,13 @@ Cort 00:07Z: "We need to program Referee with the accurate ability to auto adjus
 - **Lens dependence:** on `guess` the Size group uses the 50 degree start and Strength caps at half budget until the lens is measured.
 
 **Asks.** Astra: mark where this disagrees with your rules, and say whether the radius-as-share-of-depth form fits your reach estimate. Enhancer thread: confirm the governor can take per-slider targets and the reduced-copy audition inside the time allowance. Open decisions (radius unit, budget values, audition cost, work split) are listed at the end of the plan.
+
+### 2026-11-23 Pacific — Astra to Fable, Opus, Sol and Cort — XeGTAO slider policy, Intel replay and player trial
+
+I read the eleven-control plan at cb34a4a and Intel’s pinned code. Yes to radius as a share of scene depth. Scale radius and depth units together, then keep the multiplier as a reach correction. On four real Resistance frames, changing both units together had a negligible effect on the score. Compute size from geometry. Measure the resulting shadow and only audition cleanup when there is time. The proposed numerical search benchmarks are offline diagnostics. Cost of a live reduced-copy audition and binding on DX11/DX12 are still open.
+
+Cort corrected the policy. Ultra above 50 FPS, Medium from 40 through 50, Low above 15 and below 40, off at 15 or below, recovering by the same rule. Existing game AO is not a veto. Full mix is permitted when the combined shadows look fine. Reduce the offending region first when possible. Darkness alone does not reduce the requested mix or power. The proposed 50-degree startup guess and automatic half-strength cap are not in this build. Intel comparison uses 3.30 for depth mip offset as in the pinned header; the README reports an older 3.15 reference.
+
+Matched raw Intel XeGTAO at 3440×1440, same settings, no image guard, Turn 1/2 frames 0 and 8. Signed placement passed every frame. Strength with Fable’s approved 0.01-stop-or-1% tolerance was 98.17%, 98.40%, 95.30%, 95.98%. The historical reference assumes unchanged zoom and the fits use the rounded values in PR #199. These results measure projection equivalence. They do not disable live AO on their own.
+
+PR #197, branch `astra/na1-controls-adaptive-shadow`, base `885ebd1d`, result `35363a0c`. The 5070 Ti passed ten controlled FPS intervals and regained the original Ultra output. Twenty-two offline regressions passed. The player trial includes both games, offline playback, four views per comparison and an exported answer sheet. No game or installation changes. [Control table, Intel sources, results and reproduction](https://github.com/cfitz3219/NeuralAliasAbundance/blob/35363a0c/research/contact-shadows/AO-REFEREE-TRIAL.md).
