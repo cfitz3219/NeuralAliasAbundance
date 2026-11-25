@@ -64,6 +64,7 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 
 #include <algorithm>
+#include "core/fold_shading.hpp"
 #include <cmath>
 #include <cstdarg>
 #include <string>
@@ -380,13 +381,14 @@ bool Fill(ID3D12GraphicsCommandList* list, Texture* t, const std::vector<uint8_t
 }
 
 enum class MotionMode { Captured, Zero, FarZero };
-enum class FoldMode { Off, Cycle, Fixed };
-// One pixel of each 2x2 block: (2x + px, 2y + py). Tight rows in, tight rows out.
-void FoldRows(const std::vector<uint8_t>& in, uint32_t width, uint32_t bpp, uint32_t fw, uint32_t fh, uint32_t px, uint32_t py, std::vector<uint8_t>* out)
+enum class FoldMode { Off, Cycle, Fixed, Last };
+// One pixel of each block. Tight rows in, tight rows out.
+void FoldRows(const std::vector<uint8_t>& in, uint32_t width, uint32_t bpp, uint32_t fw, uint32_t fh,
+              uint32_t px, uint32_t py, uint32_t block_y, std::vector<uint8_t>* out)
 {
     out->resize(static_cast<size_t>(fw) * fh * bpp);
     for (uint32_t y = 0; y < fh; ++y) {
-        const uint8_t* src = in.data() + (static_cast<size_t>(2 * y + py) * width + px) * bpp;
+        const uint8_t* src = in.data() + (static_cast<size_t>(block_y * y + py) * width + px) * bpp;
         uint8_t* dst = out->data() + static_cast<size_t>(y) * fw * bpp;
         for (uint32_t x = 0; x < fw; ++x) std::memcpy(dst + static_cast<size_t>(x) * bpp, src + static_cast<size_t>(2 * x) * bpp, bpp);
     }
@@ -402,7 +404,8 @@ int Usage()
 {
     std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D] [--motion-dir DIR] [--bias-dir DIR]\n"
                 "    [--preset 0|10..13] [--parity all|even|odd] [--first INDEX] [--frames N] [--all] [--preroll N] [--pingpong N]\n"
-                "    [--crop X Y W H] [--save-last N] [--fold cycle|fixed] [--fold-declare pixel|block] [--fold-sign 1|-1]\n");
+                "    [--crop X Y W H] [--save-last N] [--fold cycle|fixed|last] [--fold-quality] [--fold-declare pixel|block] [--fold-sign 1|-1]\n"
+                "    [--full-create] [--gpu-time] [--peer-order before|after|refresh] [--ordered-features]\n");
     return 2;
 }
 } // namespace
@@ -423,6 +426,9 @@ int main(int argc, char** argv)
     float fold_sign = 1.0f;
     bool fold_block = false;
     bool second_feature = false;
+    bool full_create = false, gpu_time = false, ordered = false;
+    uint32_t block_y = 2;
+    std::string peer_order;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* value = i + 1 < argc ? argv[i + 1] : nullptr;
@@ -458,9 +464,18 @@ int main(int argc, char** argv)
             ++i;
             if (v == "cycle") fold = FoldMode::Cycle;
             else if (v == "fixed") fold = FoldMode::Fixed;
+            else if (v == "last") fold = FoldMode::Last;
             else return Usage();
         }
         else if (a == "--second-feature") second_feature = true;
+        else if (a == "--peer-order" && value) {
+            peer_order = value; ++i;
+            if (peer_order != "before" && peer_order != "after" && peer_order != "refresh") return Usage();
+        }
+        else if (a == "--full-create") full_create = true;
+        else if (a == "--gpu-time") gpu_time = true;
+        else if (a == "--ordered-features") ordered = true;
+        else if (a == "--fold-quality") block_y = 1;
         else if (a == "--fold-declare" && value) { fold_block = std::string(value) == "block"; ++i; }
         else if (a == "--fold-sign" && value) { fold_sign = std::strtod(value, nullptr) < 0 ? -1.0f : 1.0f; ++i; }
         else if (a == "--crop" && i + 4 < argc) {
@@ -510,7 +525,7 @@ int main(int argc, char** argv)
     if (head.jitter_shifted) Log("note: the capture marks its jitter as shifted");
     PlaneInfo out_plane = head.dlssout.valid && Bpp(head.dlssout.format) ? head.dlssout : head.color;
     // Folding: half-size inputs, and an output of exactly twice that (an odd row or column is dropped).
-    const uint32_t fold_w = head.color.width / 2, fold_h = head.color.height / 2;
+    const uint32_t fold_w = head.color.width / 2, fold_h = head.color.height / block_y;
     if (fold != FoldMode::Off) {
         if (head.depth.width != head.color.width || head.depth.height != head.color.height || head.motion.width != head.color.width ||
             head.motion.height != head.color.height || out_plane.width != head.color.width || out_plane.height != head.color.height) {
@@ -518,9 +533,11 @@ int main(int argc, char** argv)
             return 1;
         }
         out_plane.width = fold_w * 2;
-        out_plane.height = fold_h * 2;
-        Log("fold: %s, sign %+.0f: %u x %u kept from each %u x %u plane, output %u x %u, DLSS mode Performance", fold == FoldMode::Cycle ? "cycle" : "fixed",
-            static_cast<double>(fold_sign), fold_w, fold_h, head.color.width, head.color.height, out_plane.width, out_plane.height);
+        out_plane.height = fold_h * block_y;
+        Log("fold: %s, sign %+.0f: %u x %u kept from each %u x %u plane, output %u x %u, DLSS mode %s",
+            fold == FoldMode::Cycle ? "cycle" : fold == FoldMode::Last ? "last" : "fixed",
+            static_cast<double>(fold_sign), fold_w, fold_h, head.color.width, head.color.height, out_plane.width, out_plane.height,
+            block_y == 1 ? "Quality" : "Performance");
     }
     if (!crop_w || !crop_h || crop_x >= out_plane.width || crop_y >= out_plane.height) { crop_x = 0; crop_y = 0; crop_w = out_plane.width; crop_h = out_plane.height; }
     crop_w = std::min(crop_w, out_plane.width - crop_x);
@@ -604,6 +621,28 @@ int main(int argc, char** argv)
     auto readback = test::CreateBuffer(dev, out_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     REQUIRE(readback);
     test::List l;
+    Texture peer_color, peer_depth, peer_motion;
+    test::ComPtr<ID3D12Resource> peer_output;
+    const bool peer_small = fold == FoldMode::Off;
+    if (!peer_order.empty()) {
+        PlaneInfo c=head.color, z=head.depth, v=head.motion;
+        if (peer_small) { c.width=z.width=v.width=fold_w; c.height=z.height=v.height=fold_h; }
+        REQUIRE(MakeInput(dev,c,&peer_color) && MakeInput(dev,z,&peer_depth) && MakeInput(dev,v,&peer_motion));
+        peer_output=test::CreateTexture(dev,out_plane.width,out_plane.height,static_cast<DXGI_FORMAT>(out_plane.format),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        REQUIRE(peer_output);
+    }
+    test::ComPtr<ID3D12QueryHeap> queries;
+    test::ComPtr<ID3D12Resource> time_readback;
+    UINT64 frequency = 0;
+    std::vector<double> eval_ms;
+    if (gpu_time) {
+        const D3D12_QUERY_HEAP_DESC desc{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0};
+        REQUIRE(SUCCEEDED(dev->CreateQueryHeap(&desc, IID_PPV_ARGS(&queries))));
+        REQUIRE(SUCCEEDED(d.queue->GetTimestampFrequency(&frequency)) && frequency);
+        time_readback = test::CreateBuffer(dev,16,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        REQUIRE(time_readback);
+    }
     REQUIRE(l.Create(dev));
     REQUIRE(SUCCEEDED(l.list->Close()));
 
@@ -630,13 +669,14 @@ int main(int argc, char** argv)
         const Step& s = steps[si];
         const Meta& m = frames[selected[s.frame]];
         l.Reset();
-        const uint32_t fold_px = fold == FoldMode::Cycle ? kFoldPhase[si % 4][0] : 0, fold_py = fold == FoldMode::Cycle ? kFoldPhase[si % 4][1] : 0;
+        const uint32_t fold_px = fold == FoldMode::Cycle ? kFoldPhase[si % 4][0] : uint32_t(fold == FoldMode::Last);
+        const uint32_t fold_py = block_y == 1 ? 0u : fold == FoldMode::Cycle ? kFoldPhase[si % 4][1] : uint32_t(fold == FoldMode::Last);
         REQUIRE(ReadPlane(capture, m.index, "color", m.color, &rows));
         REQUIRE(ReadPlane(capture, m.index, "depth", m.depth, &depth_rows));
         if (fold != FoldMode::Off) {
-            FoldRows(rows, m.color.width, color.bpp, fold_w, fold_h, fold_px, fold_py, &folded);
+            FoldRows(rows, m.color.width, color.bpp, fold_w, fold_h, fold_px, fold_py, block_y, &folded);
             REQUIRE(Fill(l.list.Get(), &color, folded));
-            FoldRows(depth_rows, m.depth.width, depth.bpp, fold_w, fold_h, fold_px, fold_py, &folded);
+            FoldRows(depth_rows, m.depth.width, depth.bpp, fold_w, fold_h, fold_px, fold_py, block_y, &folded);
             REQUIRE(Fill(l.list.Get(), &depth, folded));
         } else {
             REQUIRE(Fill(l.list.Get(), &color, rows) && Fill(l.list.Get(), &depth, depth_rows));
@@ -672,7 +712,7 @@ int main(int argc, char** argv)
         }
         FloatToMotion(sum, m.motion.format, &motion_rows);
         if (fold != FoldMode::Off) {
-            FoldRows(motion_rows, m.motion.width, motion.bpp, fold_w, fold_h, fold_px, fold_py, &folded);
+            FoldRows(motion_rows, m.motion.width, motion.bpp, fold_w, fold_h, fold_px, fold_py, block_y, &folded);
             REQUIRE(Fill(l.list.Get(), &motion, folded));
         } else {
             REQUIRE(Fill(l.list.Get(), &motion, motion_rows));
@@ -694,6 +734,7 @@ int main(int argc, char** argv)
         e.pre_exposure = m.pre_exposure;
         e.exposure_scale = m.exposure_scale;
         e.view_id = 1;
+        if (ordered) e.ordered_feature_group = e.view_id;
         e.quality = static_cast<na::dlss::Quality>(static_cast<int>(m.quality));
         e.preset = use_preset;
         e.reset = si == 0;
@@ -703,11 +744,13 @@ int main(int argc, char** argv)
             // (full-size pixels) is half as large here. The saved vectors are full-size pixels too.
             e.render_w = fold_w;
             e.render_h = fold_h;
+            if (full_create) { e.max_render_w = m.color.width; e.max_render_h = m.color.height; }
             e.jitter_x = (fold_block ? 0.f : fold_sign * (0.25f - 0.5f * static_cast<float>(fold_px))) + 0.5f * m.jitter_x;
-            e.jitter_y = (fold_block ? 0.f : fold_sign * (0.25f - 0.5f * static_cast<float>(fold_py))) + 0.5f * m.jitter_y;
+            e.jitter_y = block_y == 1 ? m.jitter_y :
+                (fold_block ? 0.f : fold_sign * (0.25f - 0.5f * static_cast<float>(fold_py))) + 0.5f * m.jitter_y;
             e.mv_scale_x = 0.5f * m.mv_scale_x;
-            e.mv_scale_y = 0.5f * m.mv_scale_y;
-            e.quality = na::dlss::Quality::MaxPerformance;
+            e.mv_scale_y = m.mv_scale_y / static_cast<float>(block_y);
+            e.quality = block_y == 1 ? na::dlss::Quality::MaxQuality : na::dlss::Quality::MaxPerformance;
         }
         e.hdr = m.hdr;
         e.depth_inverted = m.depth_inverted;
@@ -732,9 +775,40 @@ int main(int argc, char** argv)
             const bool ok = na::dlss::Evaluate(l.list.Get(), x); // its picture is overwritten by the replayed frame below
             Log("second feature: %ux%u Performance on view %llu, %s", x.render_w, x.render_h, static_cast<unsigned long long>(x.view_id), ok ? "created and run" : na::dlss::GetStats().reason);
         }
+        // The peer owns separate inputs and output, as the warm-up does in the player.
+        // Compare the displayed view against an otherwise identical single-view replay.
+        if (!peer_order.empty() && si == (peer_order == "before" ? 0u : 1u)) {
+            const auto upload_peer = [&](Texture& t,const PlaneInfo& plane,const char* name) {
+                std::vector<uint8_t> raw, folded_rows;
+                if (!ReadPlane(capture,m.index,name,plane,&raw)) return false;
+                if (!peer_small) return Fill(l.list.Get(),&t,raw);
+                FoldRows(raw,plane.width,t.bpp,fold_w,fold_h,1,block_y-1,block_y,&folded_rows);
+                return Fill(l.list.Get(),&t,folded_rows);
+            };
+            REQUIRE(upload_peer(peer_color,m.color,"color") && upload_peer(peer_depth,m.depth,"depth") &&
+                    upload_peer(peer_motion,m.motion,"motion"));
+            auto peer=e;
+            peer.view_id=e.view_id+1;
+            peer.color=peer_color.tex.Get(); peer.depth=peer_depth.tex.Get(); peer.motion=peer_motion.tex.Get();
+            peer.output=peer_output.Get(); peer.bias_current_color=nullptr; peer.reset=true;
+            peer.render_w=peer.max_render_w=peer_small?fold_w:m.color.width;
+            peer.render_h=peer.max_render_h=peer_small?fold_h:m.color.height;
+            peer.quality=peer_small ? (block_y == 1 ? na::dlss::Quality::MaxQuality : na::dlss::Quality::MaxPerformance) : na::dlss::Quality::DLAA;
+            peer.mv_scale_x=peer_small ? .5f*m.mv_scale_x : m.mv_scale_x;
+            peer.mv_scale_y=peer_small ? m.mv_scale_y/static_cast<float>(block_y) : m.mv_scale_y;
+            peer.jitter_x=peer_small ? na::fold::DeclaredJitter(2,1,m.jitter_x) : m.jitter_x;
+            peer.jitter_y=peer_small ? na::fold::DeclaredJitter(block_y,block_y-1,m.jitter_y) : m.jitter_y;
+            REQUIRE(na::dlss::Evaluate(l.list.Get(),peer));
+            if (peer_order=="refresh") {na::dlss::ReleaseView(e.view_id);e.reset=true;}
+        }
+        if (gpu_time) l.list->EndQuery(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
         if (!na::dlss::Evaluate(l.list.Get(), e)) {
             Log("FATAL: evaluate refused at step %zu (saved frame %u): %s", si, m.index, na::dlss::GetStats().reason);
             return 1;
+        }
+        if (gpu_time) {
+            l.list->EndQuery(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
+            l.list->ResolveQueryData(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,time_readback.Get(),0);
         }
         if (!s.preroll) {
             D3D12_RESOURCE_BARRIER b = test::Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -755,6 +829,14 @@ int main(int argc, char** argv)
         d.queue->ExecuteCommandLists(1, lists);
         na::dlss::OnExecuted(d.queue.Get(), 1, lists);
         d.WaitIdle();
+        if (gpu_time && !s.preroll && si != 0) {
+            UINT64* stamps = nullptr;
+            const D3D12_RANGE read{0,16}, none{0,0};
+            REQUIRE(SUCCEEDED(time_readback->Map(0,&read,reinterpret_cast<void**>(&stamps))));
+            REQUIRE(stamps[1] >= stamps[0]);
+            eval_ms.push_back(double(stamps[1]-stamps[0])*1000.0/double(frequency));
+            time_readback->Unmap(0,&none);
+        }
         if (dev->GetDeviceRemovedReason() != S_OK) { Log("FATAL: the device was removed at step %zu", si); return 1; }
         if (s.preroll) continue;
         if (save_last && si + save_last < steps.size()) { ++written; continue; } // not kept on disk; the number is
@@ -806,6 +888,12 @@ int main(int argc, char** argv)
         ++written;
     }
     if (csv) std::fclose(csv);
+    if (!eval_ms.empty()) {
+        std::sort(eval_ms.begin(),eval_ms.end());
+        const size_t n=eval_ms.size();
+        Log("NGX evaluate GPU timestamp: %zu frames, median %.4f ms, p95 %.4f ms", n,
+            (eval_ms[(n-1)/2]+eval_ms[n/2])*.5, eval_ms[n-1-n/20]);
+    }
     const auto st = na::dlss::GetStats();
     if (!motion_dir.empty()) Log("motion planes taken from the given folder: %u", replaced_planes);
     if (!bias_dir.empty()) Log("bias masks taken from the given folder: %u", bias_planes);

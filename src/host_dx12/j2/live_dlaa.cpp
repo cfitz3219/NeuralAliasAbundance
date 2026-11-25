@@ -2630,16 +2630,8 @@ void fold_record(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, n
     out->color = p.color.Get();
     out->depth = p.depth.Get();
     out->motion = p.motion.Get();
-    out->render_w = p.w;
-    out->render_h = p.h;
-    // The feature is CREATED at the full size and evaluated at the folded one. Cort's fb0d69cd run: after
-    // the Performance level existed, DLAA and Quality put out bands of colour noise on a clean picture.
-    // Replays of his capture (dlss_capture_replay --second-feature) showed the trigger exactly: with this
-    // DLSS model, a later feature created at a SMALLER render size corrupts the earlier, larger one's
-    // output from that frame on; one created at the full size and run at the smaller size does not
-    // (DLAA byte-identical to a run without it), and its own folded picture is the same to 0.4%.
-    out->max_render_w = base.render_w;
-    out->max_render_h = base.render_h;
+    out->render_w = out->max_render_w = p.w;
+    out->render_h = out->max_render_h = p.h;
     out->mv_scale_x = base.mv_scale_x / static_cast<float>(blk.x); // the kept vectors are full-size pixels
     out->mv_scale_y = base.mv_scale_y / static_cast<float>(blk.y);
     out->mv_display_res = false;
@@ -5414,6 +5406,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // run beside it into a picture nobody sees until it has proven itself (Handover).
     ID3D12Resource* const full_color = e.color; // full size: what a measured cut shows (RecordCutShow)
     na::fold::Mode fold_shown = na::fold::Mode::Off;
+    e.ordered_feature_group = kViewId;
     {
         using na::fold::Mode;
         const Mode asked = na::fold::ModeFrom(na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
@@ -5484,8 +5477,10 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         g_fold.st_h.store(e.render_h, std::memory_order_relaxed);
     }
     if (t_ic) t_ic->mark(kIcEvaluate);
+    bool history_reset = false;
+    const bool evaluated = na::dlss::Evaluate(l, e, &history_reset);
+    if (evaluated) e.reset = history_reset;
     pending.reset = e.reset;
-    const bool evaluated = na::dlss::Evaluate(l, e);
     {   // Cort saw a flash of colour bars at a switch to Performance (f98ae48c) and the log held nothing
         // about that moment: every frame from a switch on, for a short while, says what DLSS was given.
         static na::fold::Mode last_shown = na::fold::Mode::Off;
