@@ -8,7 +8,13 @@
 // those leaves at full and at half size, at the strict acceptance rules and at looser ones, alone
 // and together with the supplied motion.
 //
-//   flow_motion_dump <capture folder> <out folder> --mode none|camera|total [--loosen 0..100] [--frames N]
+//   flow_motion_dump <capture folder> <out folder> --mode none|camera|total [--loosen 0..100] [--frames N] [--fold 2x2|2x1]
+//
+//   --fold 2x2 | 2x1  run on the folded picture (one pixel of each block kept, the last one, as the live
+//                   build keeps it) instead of the full-size one: what the motion stage costs and measures
+//                   when it runs at the size DLSS gets in Performance (2x2) or Quality (2x1).
+//   Every run logs the GPU time of the motion stage (the flow and the arbiter, timestamps) per frame and
+//   its median. Real game captures (rows padded to 256 bytes, the last row not) are read as well.
 //
 //   --mode none     no camera motion is known (the camera says "nothing moved"); the flow's
 //                   accepted measurements are all the motion there is. Optical flow alone, with its
@@ -33,6 +39,7 @@
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstring>
 #include <limits>
@@ -90,6 +97,26 @@ bool Two(const std::string& s, const char* key, float* a, float* b)
     if (end2 == q) return false;
     *a = static_cast<float>(x);
     *b = static_cast<float>(y);
+    return true;
+}
+// A saved plane as tight rows of the folded size: rows may be padded (a game capture pads them to 256
+// bytes and stores the last row without padding); of each bx x by block the last pixel is kept.
+bool Gather(const std::vector<uint8_t>& in, uint32_t w, uint32_t h, uint32_t bpp, uint32_t bx, uint32_t by, std::vector<uint8_t>* out)
+{
+    const size_t tight = static_cast<size_t>(w) * bpp;
+    size_t pitch = tight;
+    if (in.size() != tight * h) {
+        if (h < 2 || in.size() < tight || (in.size() - tight) % (h - 1)) return false;
+        pitch = (in.size() - tight) / (h - 1);
+        if (pitch < tight) return false;
+    }
+    const uint32_t fw = w / bx, fh = h / by;
+    out->resize(static_cast<size_t>(fw) * fh * bpp);
+    for (uint32_t y = 0; y < fh; ++y) {
+        const uint8_t* src = in.data() + static_cast<size_t>(by * y + by - 1) * pitch + static_cast<size_t>(bx - 1) * bpp;
+        uint8_t* dst = out->data() + static_cast<size_t>(y) * fw * bpp;
+        for (uint32_t x = 0; x < fw; ++x) std::memcpy(dst + static_cast<size_t>(x) * bpp, src + static_cast<size_t>(bx) * x * bpp, bpp);
+    }
     return true;
 }
 std::string FrameFile(const std::string& folder, uint32_t index, const char* what)
@@ -190,7 +217,7 @@ bool ReadOut(Result* r, std::vector<uint8_t>* rows)
 
 int Usage()
 {
-    std::printf("flow_motion_dump <capture folder> <out folder> --mode none|camera|total [--loosen 0..100] [--frames N]\n");
+    std::printf("flow_motion_dump <capture folder> <out folder> --mode none|camera|total [--loosen 0..100] [--frames N] [--fold 2x2|2x1]\n");
     return 2;
 }
 } // namespace
@@ -200,13 +227,20 @@ int main(int argc, char** argv)
     if (argc < 3) return Usage();
     const std::string folder = argv[1], out_dir = argv[2];
     std::string mode = "total";
-    uint32_t loosen = 0, max_frames = 0;
+    uint32_t loosen = 0, max_frames = 0, bx = 1, by = 1;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* value = i + 1 < argc ? argv[i + 1] : nullptr;
         if (a == "--mode" && value) { mode = value; ++i; }
         else if (a == "--loosen" && value) { loosen = static_cast<uint32_t>(std::strtoul(value, nullptr, 10)); ++i; }
         else if (a == "--frames" && value) { max_frames = static_cast<uint32_t>(std::strtoul(value, nullptr, 10)); ++i; }
+        else if (a == "--fold" && value) {
+            const std::string v = value;
+            ++i;
+            if (v == "2x2") bx = by = 2;
+            else if (v == "2x1") { bx = 2; by = 1; }
+            else return Usage();
+        }
         else return Usage();
     }
     const bool total = mode == "total", camera = mode == "camera";
@@ -220,7 +254,9 @@ int main(int argc, char** argv)
     std::string meta(bytes.begin(), bytes.end());
     float fw = 0, fh = 0, shear_x = 0, shear_y = 0;
     if (!Two(meta, "size", &fw, &fh) || fw < 16 || fh < 16) { Log("FATAL: the metadata gives no size"); return 1; }
-    const uint32_t w = static_cast<uint32_t>(fw + 0.5f), h = static_cast<uint32_t>(fh + 0.5f);
+    const uint32_t full_w = static_cast<uint32_t>(fw + 0.5f), full_h = static_cast<uint32_t>(fh + 0.5f);
+    const uint32_t w = full_w / bx, h = full_h / by; // the size the flow runs at
+    if (bx != 1 || by != 1) Log("fold %ux%u: the flow runs on %u x %u, one pixel of each block of the %u x %u picture (the last)", bx, by, w, h, full_w, full_h);
     const bool has_shear = Two(meta, "trial_shear_px", &shear_x, &shear_y);
     if (camera && !has_shear) { Log("FATAL: --mode camera needs \"trial_shear_px\" in the metadata"); return 1; }
     Log("size %u x %u, camera shear %g, %g pixels per unit of depth%s", w, h, static_cast<double>(shear_x), static_cast<double>(shear_y),
@@ -242,6 +278,15 @@ int main(int argc, char** argv)
     REQUIRE(arbiter.Init(dev));
     test::List l;
     REQUIRE(l.Create(dev));
+    test::ComPtr<ID3D12QueryHeap> queries;
+    test::ComPtr<ID3D12Resource> timing = test::CreateBuffer(dev, 16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    UINT64 frequency = 0;
+    {
+        const D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0};
+        REQUIRE(timing && SUCCEEDED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&queries))) && SUCCEEDED(d.queue->GetTimestampFrequency(&frequency)) && frequency);
+    }
+    std::vector<double> stage_ms;
+    std::vector<uint8_t> gathered;
 
     namespace cf = na::j2::compute_flow;
     cf::SetLoosen(loosen);
@@ -262,10 +307,17 @@ int main(int argc, char** argv)
         meta.assign(bytes.begin(), bytes.end());
         float jx = 0, jy = 0;
         REQUIRE(Two(meta, "jitter_px", &jx, &jy));
+        // The kept pixel (the last of its block) sits (b/2 - (b-1) - 0.5) full-size pixels before the
+        // block's centre: its jitter in folded pixels (core/fold_shading.hpp DeclaredJitter).
+        jx = (static_cast<float>(bx) * 0.5f - static_cast<float>(bx - 1) - 0.5f + jx) / static_cast<float>(bx);
+        jy = (static_cast<float>(by) * 0.5f - static_cast<float>(by - 1) - 0.5f + jy) / static_cast<float>(by);
         REQUIRE(ReadBytes(FrameFile(folder, index, "color.raw"), &bytes));
-        REQUIRE(Fill(l.list.Get(), &color, bytes));
+        REQUIRE(Gather(bytes, full_w, full_h, 8, bx, by, &gathered));
+        REQUIRE(Fill(l.list.Get(), &color, gathered));
         REQUIRE(ReadBytes(FrameFile(folder, index, "depth.raw"), &bytes));
-        REQUIRE(Fill(l.list.Get(), &depth, bytes));
+        REQUIRE(Gather(bytes, full_w, full_h, 4, bx, by, &gathered));
+        REQUIRE(Fill(l.list.Get(), &depth, gathered));
+        l.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
         // The scene's sample sits at pixel centre - jitter: the raster's own sample, known exactly.
         cf::Frame f;
@@ -331,6 +383,10 @@ int main(int argc, char** argv)
             o.width = w;
             o.height = h;
             REQUIRE(arbiter.Dispatch(l.list.Get(), in, o, 0));
+        }
+        l.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        l.list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, timing.Get(), 0);
+        if (dispatched) {
             CopyOut(l.list.Get(), &motion);
             CopyOut(l.list.Get(), &prov);
         }
@@ -343,6 +399,15 @@ int main(int argc, char** argv)
         d.WaitIdle();
         cf::Committed(ticket);
         if (dev->GetDeviceRemovedReason() != S_OK) { Log("FATAL: the device was removed at frame %u", index); return 1; }
+        {
+            UINT64* t = nullptr;
+            const D3D12_RANGE range{0, 16}, none{};
+            REQUIRE(SUCCEEDED(timing->Map(0, &range, reinterpret_cast<void**>(&t))));
+            const double ms = static_cast<double>(t[1] - t[0]) * 1000.0 / static_cast<double>(frequency);
+            timing->Unmap(0, &none);
+            Log("time: frame %u motion stage %.3f ms at %u x %u%s", index, ms, w, h, ticket.pair ? "" : " (no pair yet: not counted)");
+            if (ticket.pair) stage_ms.push_back(ms);
+        }
         na::nr::native::Reset(l.list.Get());
         na::nr::native::Maintain();
         l.Reset();
@@ -371,6 +436,13 @@ int main(int argc, char** argv)
     const cf::Stats st = cf::GetStats();
     cf::DescribeStats(st, text, sizeof text);
     Log("flow counters: %s", text);
+    if (!stage_ms.empty()) {
+        std::sort(stage_ms.begin(), stage_ms.end());
+        double mean = 0;
+        for (const double v : stage_ms) mean += v;
+        Log("time summary: motion stage (flow and arbiter) at %u x %u over %zu pairs: median %.3f ms, mean %.3f, fastest %.3f, slowest %.3f", w, h,
+            stage_ms.size(), stage_ms[stage_ms.size() / 2], mean / static_cast<double>(stage_ms.size()), stage_ms.front(), stage_ms.back());
+    }
     double all = 0;
     for (int j = 0; j < 8; ++j) all += static_cast<double>(tag_count[j]);
     Log("done: %u frames written to %s; over all frames nothing known %.1f%%, camera only %.1f%%, camera corrected by flow %.1f%%, measured total %.1f%%",
