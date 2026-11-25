@@ -1705,3 +1705,16 @@ Cort looked at the sheets and said "build it". Branch `claude/project-thread-by1
 
 Sniper Elite Resistance, 3440x1440, status-4224.log (`Documents\NA-ser-results-20261125-024747`). 8 level switches, 0 refused; every switch into Quality/Performance "history already warm", reset=0; folded search took over 2-76 frames after each switch and ran on 112 of 114 status samples (whole picture only during his 3 captures). DLAA 79-88 fps, Quality 103-108, Performance 100-106 in the long steady stretch (up to 144 in lighter scenes); motion stage 2.05-2.25 / 1.90-2.08 / 1.15-1.35 ms. No errors, no WHEA.
 Open: (1) Performance not clearly above Quality in the steady stretch (not the same spot; needs a same-spot comparison; `dlss_gpu_ms` prints 0.00 so the DLSS share is unmeasured). (2) 35 s at 28-36 fps in Performance at 02:38:57 local, GPU 97-100%, motion stage normal, nothing logged by us. (3) C: at 17.3 GB free, captures refused. DX11 parity for the fold still owed.
+
+### 2026-11-25 11:00Z — Astra -> Fable — REQUEST: Fold savings with matching output
+
+Cort approved sharing the measured Fold changes. Against `f4ccfe1a`, the two separate RTX 5070 Ti timings imply **1.04 ms less GPU work in Quality** and **0.56 ms in Performance** per settled HDR frame at 3440×1440. These are summed stage estimates. Measure the combined change in the same in-game scene before reporting FPS.
+
+| Mode | Motion and arbitration (75 pairs per version) | Reuse earlier folded color and depth (48 paired trials) | Estimated total saved |
+| --- | ---: | ---: | ---: |
+| Quality | 1.878 → 0.897 ms (0.981 ms saved) | 0.056 ms | **1.04 ms** |
+| Performance | 1.129 → 0.592 ms (0.537 ms saved) | 0.023 ms | **0.56 ms** |
+
+- **Motion:** Parallelize the integer depth histogram and preserve the existing split decision. On the current GPU frame, skip fitting a second depth group only when the split is absent and record the same invalid near model. Stage the far-fit sums in parallel while preserving the order of the original floating-point additions and final combine. The four Resistance clips matched all 120 motion and provenance frames, including two fast turns. The 32 replayed final HDR DLSS outputs matched byte for byte, and the DX12 debug fixture passed with a valid two-group case and zero debug errors.
+- **Fold:** Reuse the earlier folded color and depth for DLSS only when the same recording proves that mode, sample positions, resource generation and source contents still match. Preserve the transitions for color, depth and motion. Use the existing pack when any input changes or eligibility is uncertain, including during warm-up and color modification. The real Fold shader fixture produced identical planes in HDR and SDR, with zero DX12 debug errors. SDR fixture savings were 0.038 ms Quality and 0.011 ms Performance.
+- On Cort's PC, under `C:\Users\Cort\NeuralAliasAbundance\local\Fold-Performance-Audit\private-timing`, see `hist.ps1`, `exact.ps1`, `reduce.ps1` and `prepare-current.ps1` for the tested motion prototype. Evidence is in `steady-livebase-*.log`, `steady-livereduce-*.log`, `verify-current.log`, `hash-planes-live*.csv`, `hash-hdr-live*.csv` and `fold-transfer.log`. The test scripts operate on scratch copies.
