@@ -157,6 +157,11 @@ struct Feature {
     bool tainted = false;      // some use can never be proven complete: release only at Shutdown
     uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, flags = 0, preset = 0;
     Quality quality = Quality::MaxQuality;
+    // This feature's own NGX parameter object, used for its creation and every evaluation of it.
+    // One object used to serve every feature. Cort's fb0d69cd run and the replay of his capture
+    // (--second-feature) showed what that does once two features are alive: after a second feature is
+    // created, the first one's output fills with bands of huge values, more each frame, on clean input.
+    void* params = nullptr;
 };
 
 struct View {
@@ -207,6 +212,11 @@ void release_handle(void* h)
 {
     if (h && g.api.release_feature) reinterpret_cast<PfnRelease>(g.api.release_feature)(static_cast<NVSDK_NGX_Handle*>(h));
 }
+void release_params(void*& params)
+{
+    if (params && g.api.destroy_parameters) reinterpret_cast<PfnDestroy>(g.api.destroy_parameters)(static_cast<NVSDK_NGX_Parameter*>(params));
+    params = nullptr;
+}
 #endif
 
 void free_record(Record& r)
@@ -244,6 +254,7 @@ void collect_locked()
         if (!f.handle || !f.retired || f.tainted || f.outstanding) continue;
 #if defined(NA_HAVE_NGX_SDK)
         release_handle(f.handle);
+        release_params(f.params);
 #endif
         f = Feature{};
         ++g.stats.features_released;
@@ -445,6 +456,7 @@ void Shutdown()
         for (Feature& f : g.features)
             if (f.handle) {
                 release_handle(f.handle);
+                release_params(f.params);
                 ++g.stats.features_released;
             }
         if (g.eval_params) reinterpret_cast<PfnDestroy>(g.api.destroy_parameters)(EP());
@@ -602,7 +614,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         set_reason(g.stats.reason, "DLSS completion tracking is full; this frame uses the game's upscaler.");
         return false;
     }
-    NVSDK_NGX_Parameter* p = EP();
+    NVSDK_NGX_Parameter* p = cur && cur->params ? static_cast<NVSDK_NGX_Parameter*>(cur->params) : EP();
     if (!fits) {
         // R-305: secure a slot BEFORE giving up the current feature, so no handle is ever lost.
         const int slot = free_feature_slot_locked();
@@ -610,6 +622,15 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
             ++g.stats.refused_busy;
             set_reason(g.stats.reason, "Older DLSS work is still on the GPU; this frame is left to the game's own upscaler.");
             return false;
+        }
+        {   // a parameter object of the new feature's own (see Feature::params)
+            NVSDK_NGX_Parameter* own = nullptr;
+            if (NVSDK_NGX_FAILED(reinterpret_cast<PfnParams>(g.api.allocate_parameters)(&own)) || !own) {
+                ++g.stats.refused_busy;
+                set_reason(g.stats.reason, "DLSS could not allocate the settings for a new feature.");
+                return false;
+            }
+            p = own;
         }
         p->Reset();
         p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
@@ -638,11 +659,13 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
             std::snprintf(buf, sizeof(buf), "DLSS could not start at %ux%u -> %ux%u (NVIDIA code 0x%08X).", d.render_w,
                           d.render_h, d.out_w, d.out_h, static_cast<unsigned>(r));
             latch(buf);
+            reinterpret_cast<PfnDestroy>(g.api.destroy_parameters)(p);
             return false;
         }
         Feature& nf = g.features[slot];
         nf = Feature{};
         nf.handle = h;
+        nf.params = p;
         nf.render_w = create_w;
         nf.render_h = create_h;
         nf.out_w = d.out_w;
@@ -667,30 +690,9 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         collect_locked(); // the retired feature may already be free of uses
     }
     Feature& ft = g.features[view.feature];
+    p = static_cast<NVSDK_NGX_Parameter*>(ft.params);
     // Every key is written every frame: the object is shared with creation and
     // stale optional resources must never leak into a later evaluation.
-    // The creation keys too. This object is shared by every view, and creating one view's feature leaves
-    // ITS size, mode and flags in it. Until build fb0d69cd only one feature was ever alive, so they were
-    // always the evaluating feature's own. With the folded levels (core/fold_shading.hpp) three are, and
-    // Cort's run showed what stale ones do: DLAA evaluated after the Performance feature was created
-    // (keys 1720x720, Performance) wrote bands of huge values over a clean input, on every frame, reset
-    // or not (captures j2-20261125-002203 and -002211); the few frames a shown level shares with a newly
-    // created one were his "flash of colour bars". Each evaluation now carries its own feature's keys.
-    p->Set(NVSDK_NGX_Parameter_Width, ft.render_w);
-    p->Set(NVSDK_NGX_Parameter_Height, ft.render_h);
-    p->Set(NVSDK_NGX_Parameter_OutWidth, ft.out_w);
-    p->Set(NVSDK_NGX_Parameter_OutHeight, ft.out_h);
-    p->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(ft.quality));
-    p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, static_cast<int>(ft.flags));
-    {
-        const unsigned int pr = ft.preset ? ft.preset : static_cast<unsigned int>(NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
-        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, pr);
-        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, pr);
-        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, pr);
-        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, pr);
-        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, pr);
-        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, pr);
-    }
     p->Set(NVSDK_NGX_Parameter_Color, d.color);
     p->Set(NVSDK_NGX_Parameter_Depth, d.depth);
     p->Set(NVSDK_NGX_Parameter_MotionVectors, d.motion);
