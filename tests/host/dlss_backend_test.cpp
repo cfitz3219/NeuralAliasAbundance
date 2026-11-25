@@ -555,6 +555,42 @@ int main()
         too_big.max_render_w = 1280; too_big.max_render_h = 720;
         CHECK(na::dlss::Validate(too_big) != nullptr);
     }
+    {
+        // A mode switch first warms the smaller view, then evaluates the visible
+        // larger one. Only the latter must rebuild, with the reset reported to Referee.
+        auto native = Desc(1920,1080,1920,1080);
+        auto quality = Desc(960,1080,1920,1080);
+        auto performance = Desc(960,540,1920,1080);
+        native.view_id=31; quality.view_id=32; performance.view_id=33;
+        native.ordered_feature_group=quality.ordered_feature_group=performance.ordered_feature_group=31;
+        auto unrelated=native;
+        unrelated.view_id=34; unrelated.ordered_feature_group=0;
+        const auto run = [&](const na::dlss::EvalDesc& e, bool expect_reset) {
+            test::List list;
+            REQUIRE(list.Create(d.device.Get()));
+            bool reset=false;
+            REQUIRE(na::dlss::Evaluate(list.list.Get(),e,&reset));
+            CHECK(reset==expect_reset);
+            CHECK(fake::I(fake::last_eval,NVSDK_NGX_Parameter_Reset)==(expect_reset ? 1 : 0));
+            REQUIRE(SUCCEEDED(list.list->Close()));
+            Submit(d.queue.Get(),list);
+            d.WaitIdle();
+            return 0;
+        };
+        const auto count=na::dlss::GetStats().features_created;
+        REQUIRE(run(native,true)==0);
+        REQUIRE(run(quality,true)==0);
+        REQUIRE(run(native,true)==0);
+        REQUIRE(run(unrelated,true)==0);
+        REQUIRE(run(performance,true)==0);
+        REQUIRE(run(quality,true)==0);
+        REQUIRE(run(native,true)==0);
+        REQUIRE(run(unrelated,false)==0);
+        REQUIRE(run(performance,false)==0);
+        REQUIRE(run(quality,false)==0);
+        REQUIRE(run(native,false)==0);
+        CHECK(na::dlss::GetStats().features_created==count+7);
+    }
     for (int i = 0; i < 600; ++i) kick(d.queue.Get());
     d.WaitIdle();
     na::dlss::Shutdown();

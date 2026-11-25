@@ -1,5 +1,6 @@
 #include "host_dx12/native11/samplers.hpp"
 #include "core/temporal_jitter.hpp"
+#include <cstring>
 #include <cmath>
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
@@ -953,6 +954,20 @@ void DrawLiveDlaa()
             na::observe::SetSamplerMipBiasLive(on ? na::settings::DlaaMipBias(na::settings::Get()) : 0.0f);
     }
     EndRow();
+    if (!na::on12::NativeRoute()) {
+        // Fold the shading, live test (Cort 2026-11-25; core/fold_shading.hpp). One control; DLAA stays
+        // on screen until the chosen level has proven itself. Not saved: every launch starts on DLAA.
+        static const char* kFoldLevels[] = {"DLAA (full size)", "Quality (test)", "Performance (test)"};
+        na::settings::Settings& fs = na::settings::Get();
+        int level = static_cast<int>((std::min)(fs.j2_fold_mode.load(), 2u));
+        BeginRow("DLSS level (test)", "DLAA rebuilds the picture at full size. Quality and Performance make the game shade its 3D picture in small blocks (two pixels, or four) and let DLSS rebuild the full picture from one pixel of each block. The game's own settings and its HUD are not touched. DLAA stays on screen until the new level is truly ready, so there is no frozen picture. This is a test: every launch starts on DLAA.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2fold", &level, kFoldLevels, 3)) fs.j2_fold_mode.store(static_cast<uint32_t>(level));
+        EndRow();
+        char fold_status[320]{};
+        na::j2::FoldStatus(fold_status, sizeof fold_status);
+        if (level != 0 || std::strstr(fold_status, "DLAA (full size)") == nullptr) Hint(fold_status);
+    }
     char native_status[200]{};
     const bool recording_ready = na::on12::NativeRoute() ? na::native_d3d11::FormatMenuStatus(native_status, sizeof native_status) : st.active;
     DrawLightingTrials(on && recording_ready);

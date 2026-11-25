@@ -107,7 +107,7 @@ inline int ArbiterFallback(test::Device& d) {
 // A small harness dispatching the unchanged production programs with controlled inputs.
 struct Programs {
     Gpu& g; ComPtr<ID3D12RootSignature> root; ComPtr<ID3D12DescriptorHeap> heap;
-    std::array<ComPtr<ID3D12PipelineState>,4> psos; unsigned stride=0;
+    std::array<ComPtr<ID3D12PipelineState>,5> psos; unsigned stride=0; // [4] fit_reduce: it runs on fit_solve's table (2)
     explicit Programs(Gpu& gpu):g(gpu){}
     D3D12_CPU_DESCRIPTOR_HANDLE Cpu(unsigned table,unsigned i) {auto p=heap->GetCPUDescriptorHandleForHeapStart();p.ptr+=size_t(table*12+i)*stride;return p;}
     int Init() {
@@ -120,8 +120,8 @@ struct Programs {
         REQUIRE(SUCCEEDED(g.d.device->CreateRootSignature(0,sig->GetBufferPointer(),sig->GetBufferSize(),IID_PPV_ARGS(&root))));
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,48,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
         REQUIRE(SUCCEEDED(g.d.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))));stride=g.d.device->GetDescriptorHandleIncrementSize(hd.Type);
-        const char* names[]={"fit_sample","fit_accum","fit_solve","measure"};
-        for(unsigned i=0;i<4;++i) {ComPtr<ID3DBlob> cs;
+        const char* names[]={"fit_sample","fit_accum","fit_solve","measure","fit_reduce"};
+        for(unsigned i=0;i<5;++i) {ComPtr<ID3DBlob> cs;
             const HRESULT hr=D3DCompile(na::j2::kFlowShader,sizeof na::j2::kFlowShader-1,"screen-audit",nullptr,nullptr,names[i],"cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&cs,&err);
             if(FAILED(hr)&&err)std::printf("%s\n",static_cast<const char*>(err->GetBufferPointer()));REQUIRE(SUCCEEDED(hr));
             D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={cs->GetBufferPointer(),cs->GetBufferSize()};REQUIRE(SUCCEEDED(g.d.device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&psos[i]))));
@@ -135,26 +135,32 @@ struct Programs {
         for(unsigned i=0;i<8;++i)Srv(t,i,nullptr,i==4?DXGI_FORMAT_R32_UINT:i==3?DXGI_FORMAT_R32_FLOAT:(i==1||i==2)?DXGI_FORMAT_R32G32_FLOAT:DXGI_FORMAT_R32G32B32A32_FLOAT);
         Uav(t,8,nullptr,DXGI_FORMAT_R32G32B32A32_FLOAT);Uav(t,9,nullptr,DXGI_FORMAT_R32_FLOAT);Raw(t,nullptr,20);Uav(t,11,nullptr,DXGI_FORMAT_R32G32B32A32_FLOAT);
     }}
-    void Dispatch(unsigned table,const std::array<unsigned,28>& c,unsigned x=1,unsigned y=1) {
-        ID3D12DescriptorHeap* heaps[]={heap.Get()};g.l.list->SetDescriptorHeaps(1,heaps);g.l.list->SetComputeRootSignature(root.Get());g.l.list->SetPipelineState(psos[table].Get());
+    void Dispatch(unsigned table,const std::array<unsigned,28>& c,unsigned x=1,unsigned y=1,int program=-1) {
+        ID3D12DescriptorHeap* heaps[]={heap.Get()};g.l.list->SetDescriptorHeaps(1,heaps);g.l.list->SetComputeRootSignature(root.Get());g.l.list->SetPipelineState(psos[program<0?table:unsigned(program)].Get());
         auto h=heap->GetGPUDescriptorHandleForHeapStart();h.ptr+=size_t(table*12)*stride;g.l.list->SetComputeRootDescriptorTable(0,h);g.l.list->SetComputeRoot32BitConstants(1,28,c.data(),0);g.l.list->Dispatch(x,y,1);
     }
 };
 inline void Word(std::array<unsigned,28>& c,unsigned i,float v){std::memcpy(&c[i],&v,4);}
-// The production order of the fit's passes (compute_flow.cpp): the depth groups' split, then the far
-// group's fit and the near group's, each a plain step, the reweighted ones and the final evaluation.
+// The production order of the fit's passes (compute_flow.cpp): the samples' depths counted in parallel
+// (fit_solve mode 3, a group per 256 samples), the depth groups' split, then the far group's fit and
+// the near group's, each a plain step, the reweighted ones and the final evaluation. The far group's
+// sums are staged by fit_reduce before each of its solving steps. The state holds 3 x 81 words more
+// than the tiles' own for those sums (kFitReduceWords).
 // Table 1 is fit_accum, table 2 fit_solve (its t7 must be the grid). `heads`: a readback buffer of
 // 160 bytes that receives the far fit's head and then the near fit's.
 inline void FitPasses(Programs& p,Gpu& g,std::array<unsigned,28>& c,unsigned tiles,ID3D12Resource* state,ID3D12Resource* zero,ID3D12Resource* heads) {
     namespace sm=na::motion::screen;const sm::Params params;
-    c[4]=2;c[8]=0;p.Dispatch(2,c);g.Order();
+    c[4]=3;c[8]=0;p.Dispatch(2,c,(c[9]*c[10]+255u)/256u);g.Order();
+    c[4]=2;p.Dispatch(2,c);g.Order();
     for(unsigned row=0;row<2;++row) {
         if(row){g.Barrier(state,U,D3D12_RESOURCE_STATE_COPY_DEST);g.l.list->CopyBufferRegion(state,0,zero,0,76);g.Barrier(state,D3D12_RESOURCE_STATE_COPY_DEST,U);}
         c[8]=row;
         for(int step=0;step<=params.steps;++step) {
             Word(c,25,step==params.steps?params.robust_px:step?sm::ScaleAt(step,params):0.f);
             const float now=sm::TileScaleFor(step,params);Word(c,20,params.tile_px>0?(now>0?now:-1.f):0.f);Word(c,21,sm::TileScaleFor(step+1,params));
-            c[4]=0;p.Dispatch(1,c,tiles);g.Order();c[4]=step==params.steps?1u:0u;p.Dispatch(2,c);g.Order();
+            c[4]=0;p.Dispatch(1,c,tiles);g.Order();c[4]=step==params.steps?1u:0u;
+            if(!row){p.Dispatch(2,c,((81u+7u)/8u)*3u,1,4);g.Order();}
+            p.Dispatch(2,c);g.Order();
         }
         if(heads){g.Barrier(state,U,D3D12_RESOURCE_STATE_COPY_SOURCE);g.l.list->CopyBufferRegion(heads,row*80,state,0,80);g.Barrier(state,D3D12_RESOURCE_STATE_COPY_SOURCE,U);}
     }
@@ -163,7 +169,7 @@ inline void FitPasses(Programs& p,Gpu& g,std::array<unsigned,28>& c,unsigned til
 
 inline int SolveControlled(test::Device& d) {
     namespace sm=na::motion::screen;
-    constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=((gw+7)/8)*((gh+7)/8),words=20+86*groups; // a thread group is one tile of 8 x 8 samples; 81 sums and 5 tile words each
+    constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=((gw+7)/8)*((gh+7)/8),words=20+86*groups+3*81; // a thread group is one tile of 8 x 8 samples; 81 sums and 5 tile words each
     Gpu g(d); Programs p(g); REQUIRE(p.Init()==0);
     for(unsigned variant=0;variant<5;++variant) {
         p.Defaults(); std::vector<sm::Sample> samples;std::vector<float> grid(gw*gh*4);
@@ -212,7 +218,7 @@ inline int SolveControlled(test::Device& d) {
 }
 inline int SampleFitMeasure(test::Device& d) {
     namespace sm=na::motion::screen;namespace tm=na::motion::total;
-    constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=((gw+7)/8)*((gh+7)/8),words=20+86*groups; // a thread group is one tile of 8 x 8 samples; 81 sums and 5 tile words each
+    constexpr unsigned w=512,h=384,gw=w/8,gh=h/8,groups=((gw+7)/8)*((gh+7)/8),words=20+86*groups+3*81; // a thread group is one tile of 8 x 8 samples; 81 sums and 5 tile words each
     Gpu g(d);Programs p(g);REQUIRE(p.Init()==0);
     for(unsigned variant=0;variant<7;++variant) {
         p.Defaults(); sm::Model truth;truth.valid=true;truth.nearness_limit=1;
@@ -310,7 +316,8 @@ inline int SampleFitMeasure(test::Device& d) {
     return 0;
 }
 
-inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhead=false) {
+inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhead=false,
+                               unsigned block_x=1,unsigned block_y=1) {
     namespace cf=na::j2::compute_flow;Gpu g(d);std::vector<float> rgba(size_t(w)*h*4),depth(size_t(w)*h,.03f);ComPtr<ID3D12Resource> image[2];
     for(unsigned f=0;f<2;++f) {
         for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){float px=float(x)-3.f*f;
@@ -332,6 +339,7 @@ inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhe
         cf::Reset();cf::SetScreenFit(enabled);std::vector<double> ms,record_us,cut_ms;
         const auto start=std::chrono::steady_clock::now();
         for(unsigned i=0;i<26;++i){cf::Frame f;f.frame=9000+i;f.previous=i?f.frame-1:0;f.generation=303;f.source_generation=303;f.total=true;f.raster_sample=f.raster_confirmed=true;
+            f.block_x=static_cast<uint8_t>(block_x);f.block_y=static_cast<uint8_t>(block_y);
             const auto record_start=std::chrono::steady_clock::now();
             cf::Tier3 t;auto ticket=cf::Record(g.l.list.Get(),d.queue.Get(),image[i%2].Get(),dep.Get(),in,f,t);REQUIRE(ticket.context);CHECK(ticket.pair==(i!=0));
             if(overhead&&i>=6){

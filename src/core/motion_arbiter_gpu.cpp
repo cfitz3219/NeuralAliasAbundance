@@ -36,6 +36,8 @@ cbuffer C : register(b0) {
     uint   height;
     uint   flags;          // bit0 tier1, bit1 tier1 mask, bit2 tier2, bit3 tier3, bit4 tier3 mask, bit5 tier3 valid, bit6 stats
     float2 jitter_prev;    // DeriveResidual only
+    uint   sample;         // main only: block x | block y << 8 | pick x << 16 | pick y << 24; 0 = every pixel
+    uint   out_size;       // main only, with sample: the output's width | height << 16 (blocks)
 };
 
 #define F_T1      1u
@@ -49,6 +51,7 @@ cbuffer C : register(b0) {
 #define F_T1EST   256u   // tier 1 is measured total motion (Tier1Source::Estimated), not the game's own vectors
 #define F_EST     512u   // measured total motion stands behind tier 1 (EstimatedInput)
 #define F_ESTMASK 1024u
+#define F_ESTFOLD 2048u  // sampled output: the measured field is the OUTPUT's size and in its pixels (the flow ran on the folded picture)
 
 #define PROV_INVALID 0u
 #define PROV_ENGINE 1u
@@ -116,8 +119,13 @@ bool reproject(uint x, uint y, float depth, out float2 v, out bool offscreen) {
 
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    uint2 p = id.xy;
+    // p: the full-size pixel decided (every input is read there); q: where its result is written.
+    uint2 p = id.xy, q = id.xy;
+    if (sample != 0u) {
+        if (id.x >= (out_size & 0xffffu) || id.y >= (out_size >> 16)) return;
+        p = id.xy * uint2(max(sample & 255u, 1u), max((sample >> 8) & 255u, 1u)) + uint2((sample >> 16) & 255u, sample >> 24);
+    }
+    if (p.x >= width || p.y >= height) return;
     float2 o = 0;
     uint prov = PROV_INVALID;
 
@@ -128,8 +136,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (ms == 0u) {
             float2 e = t_engine[p];
             if (finite2(e)) {
-                u_xy[p] = e;
-                u_prov[p] = (flags & F_T1EST) ? PROV_ESTIMATED : PROV_ENGINE;
+                u_xy[q] = e;
+                u_prov[q] = (flags & F_T1EST) ? PROV_ESTIMATED : PROV_ENGINE;
                 stat(0);
                 return;
             }
@@ -140,13 +148,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     // ---- Measured total motion behind tier 1 (EstimatedInput): where tier 1 gave nothing here.
     // Counter 8 is its own, so the game's vectors and measured ones are never added together.
     if (flags & F_EST) {
-        uint ms = (flags & F_ESTMASK) ? mask_state(t_estvalid[p]) : 0u;
+        const bool est_fold = (flags & F_ESTFOLD) != 0u && sample != 0u;
+        const uint2 ep = est_fold ? q : p;
+        uint ms = (flags & F_ESTMASK) ? mask_state(t_estvalid[ep]) : 0u;
         if (ms == 2u) stat(7);
         if (ms == 0u) {
-            float2 e = t_est[p];
+            float2 e = t_est[ep];
+            // Folded pixels to the full-size pixels every other tier and the output are in.
+            if (est_fold) e *= float2(max(sample & 255u, 1u), max((sample >> 8) & 255u, 1u));
             if (finite2(e)) {
-                u_xy[p] = e;
-                u_prov[p] = PROV_ESTIMATED;
+                u_xy[q] = e;
+                u_prov[q] = PROV_ESTIMATED;
                 stat(8);
                 return;
             }
@@ -162,8 +174,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (!have_cam) stat(7);
     }
     if (!have_cam) {
-        u_xy[p] = 0;
-        u_prov[p] = PROV_INVALID;
+        u_xy[q] = 0;
+        u_prov[q] = PROV_INVALID;
         stat(6);
         return;
     }
@@ -211,8 +223,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (offscreen) { prov |= PROV_F_OFFSCREEN; stat(5); }
     stat(1);
     if (have_res) stat(2);
-    u_xy[p] = o;
-    u_prov[p] = prov;
+    u_xy[q] = o;
+    u_prov[q] = prov;
 }
 
 // DeriveResidual (motion_arbiter.cpp:99-122): residual = raw_flow - V_cam - (jitter_prev - jitter_cur);
@@ -240,8 +252,9 @@ struct Constants {
     float depth_clear, snap_px, max_px;
     uint32_t width, height, flags;
     float jitter_prev[2];
+    uint32_t sample, out_size;
 };
-static_assert(sizeof(Constants) == 42 * 4, "root constant size");
+static_assert(sizeof(Constants) == 44 * 4, "root constant size");
 
 bool create_dummy(ID3D12Device* dev, DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& out)
 {
@@ -369,20 +382,36 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     if (!list || !pso_ || !out.xy || !out.provenance || out.width == 0 || out.height == 0 || frame_slot >= slots_)
         return false;
     if (!ValidateConfig(in.config)) return false;
-    // Extent checks mirror field_ok(): a tier whose extent mismatches is rejected as a whole.
+    const bool sampled = out.block_x > 1 || out.block_y > 1;
+    const uint32_t src_w = sampled && out.source_width ? out.source_width : out.width;
+    const uint32_t src_h = sampled && out.source_height ? out.source_height : out.height;
+    if (sampled && (out.block_x == 0 || out.block_y == 0 || out.block_x > 255 || out.block_y > 255 || out.pick_x >= out.block_x ||
+                    out.pick_y >= out.block_y || out.width > 0xffffu || out.height > 0xffffu ||
+                    (out.width - 1) * out.block_x + out.pick_x >= src_w || (out.height - 1) * out.block_y + out.pick_y >= src_h))
+        return false;
+    // Extent checks mirror field_ok(): a tier whose extent mismatches is rejected as a whole. The
+    // inputs are the full-size picture's, also when the output is sampled.
     auto extent_ok = [&](ID3D12Resource* r) {
+        if (!r) return false;
+        D3D12_RESOURCE_DESC d = r->GetDesc();
+        return d.Width == src_w && d.Height == src_h;
+    };
+    uint32_t flags = 0;
+    bool use1 = in.tier1_valid_flag && extent_ok(in.tier1_motion) && (!in.tier1_valid || extent_ok(in.tier1_valid));
+    const bool est_fold = sampled && in.estimated_folded;
+    auto est_extent_ok = [&](ID3D12Resource* r) {
+        if (!est_fold) return extent_ok(r);
         if (!r) return false;
         D3D12_RESOURCE_DESC d = r->GetDesc();
         return d.Width == out.width && d.Height == out.height;
     };
-    uint32_t flags = 0;
-    bool use1 = in.tier1_valid_flag && extent_ok(in.tier1_motion) && (!in.tier1_valid || extent_ok(in.tier1_valid));
-    bool use_est = in.estimated_valid_flag && extent_ok(in.estimated_motion) && (!in.estimated_valid || extent_ok(in.estimated_valid));
+    bool use_est = in.estimated_valid_flag && est_extent_ok(in.estimated_motion) && (!in.estimated_valid || est_extent_ok(in.estimated_valid));
     bool use2 = in.tier2_valid_flag && extent_ok(in.depth);
     bool use3 = in.tier3_valid_flag && extent_ok(in.tier3_residual) && (!in.tier3_mask || extent_ok(in.tier3_mask)) &&
                 (!in.tier3_valid || extent_ok(in.tier3_valid));
     if (use_est) flags |= 512u;
     if (use_est && in.estimated_valid) flags |= 1024u;
+    if (use_est && est_fold) flags |= 2048u;
     if (use1) flags |= 1u;
     if (use1 && in.tier1_valid) flags |= 2u;
     if (use2) flags |= 4u;
@@ -451,9 +480,13 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     c.depth_clear = in.depth_clear;
     c.snap_px = in.config.residual_snap_px;
     c.max_px = in.config.residual_max_px;
-    c.width = out.width;
-    c.height = out.height;
+    c.width = src_w;
+    c.height = src_h;
     c.flags = flags;
+    if (sampled) {
+        c.sample = out.block_x | (out.block_y << 8) | (out.pick_x << 16) | (out.pick_y << 24);
+        c.out_size = out.width | (out.height << 16);
+    }
 
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     list->SetDescriptorHeaps(1, heaps);

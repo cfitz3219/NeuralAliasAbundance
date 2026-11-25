@@ -962,7 +962,7 @@ void write_status_line()
     char mode_line[1536]{};
     const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
-    {char usage_line[512];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
+    {char usage_line[1024];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
      if(usage_bytes>0)WriteFile(f,usage_line,DWORD((std::min)(usage_bytes,int(sizeof(usage_line)-1))),&written,nullptr);}
     { // Effects and shared GPU services: enabled state, work done, errors and the last reason.
         const auto& st = na::settings::Get();

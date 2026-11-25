@@ -11,6 +11,8 @@
 #include "core/screen_motion.hpp"
 #include <d3dcompiler.h>
 #include <mutex>
+#include <thread>
+#include <utility>
 #include <atomic>
 #include <vector>
 #include <algorithm>
@@ -74,7 +76,7 @@ struct Context {
     ComPtr<ID3D12PipelineState> pso_cand_clear,pso_cand_count,pso_cand_pick,pso_cand_apply;
     ComPtr<ID3D12Resource> votes,grid,top; // 256x256 R32_UINT, always UAV; the grid handed on (R16G16_SINT, one vector per 8x8 block); 48 bytes, always UAV
     // VARIANT: motion/screen-fit (flow_shaders.hpp fit_sample / fit_accum / fit_solve). All three programs or none.
-    ComPtr<ID3D12PipelineState> pso_fit_sample,pso_fit_accum,pso_fit_solve;
+    ComPtr<ID3D12PipelineState> pso_fit_sample,pso_fit_accum,pso_fit_solve,pso_fit_reduce;
     ComPtr<ID3D12Resource> fit_grid,fit_model,fit_state; // RGBA32F, one sample per 8x8 block; RG32F 9x2, the model `measure` reads (a row per group of depths); the terms, the tiles' sums and the tiles' own words, always UAV
     unsigned fit_words=0; // fit_state's size in words
     bool cut_seeded=false; // cut_state has been zeroed by a submitted recording
@@ -131,11 +133,18 @@ struct Context {
     }
 };
 std::mutex mutex;std::shared_ptr<Context> current;Stats stats;uint64_t last_submit_tick=0,sample_tick=0;
+// The contexts of other picture sizes on the same device and queue, kept whole (a folded DLSS level
+// measures at its own size; switching levels must not build programs on the frame's own time), and
+// the sizes Prepare is building on its own thread.
+std::vector<std::shared_ptr<Context>> cached;std::vector<std::pair<unsigned,unsigned>> building;
+constexpr size_t kCachedContexts=3;
 void reason(const char* r){strncpy_s(stats.reason,r,_TRUNCATE);}
 bool compile_flow_shader(const char* source,size_t bytes,const char* name,const char* entry,ComPtr<ID3DBlob>& result){
     // Fixed source strings and entry point names. Bytecode has no dependency on
     // the device, queue, or extent. Each context still owns its own pipelines.
-    // This is called only while holding the flow mutex.
+    // Called under the flow mutex, and by Prepare's thread without it: the cache has its own lock.
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> cache_lock(cache_mutex);
     struct Shader {
         const char* source;
         const char* entry;
@@ -169,7 +178,7 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     void* p=nullptr;if(FAILED(c.zero->Map(0,nullptr,&p)))return false;memset(p,0,96);c.zero->Unmap(0,nullptr);
     // The screen fit is optional: without its programs or working memory `measure` has no model to
     // follow, pixels the pictures cannot measure are not known, and the j2screenfit line says on=0.
-    {const unsigned gw=(w+7)/8,gh=(h+7)/8;c.fit_words=kFitHead+((gw+7)/8)*((gh+7)/8)*(kFitValues+kFitTile);} // a thread group is one tile of 8 x 8 samples (flow_shaders.hpp fit_tiles)
+    {const unsigned gw=(w+7)/8,gh=(h+7)/8;c.fit_words=kFitHead+((gw+7)/8)*((gh+7)/8)*(kFitValues+kFitTile)+3*kFitValues;} // a thread group is one tile of 8 x 8 samples (flow_shaders.hpp fit_tiles)
     if(c.pso_fit_solve && !(c.tex(DXGI_FORMAT_R32G32B32A32_FLOAT,c.fit_grid,(w+7)/8,(h+7)/8,S) && c.tex(DXGI_FORMAT_R32G32_FLOAT,c.fit_model,9,2,S) &&
         c.buffer(c.fit_words*4,D3D12_HEAP_TYPE_DEFAULT,U,c.fit_state))){
         c.pso_fit_sample.Reset();c.pso_fit_accum.Reset();c.pso_fit_solve.Reset();}
@@ -256,9 +265,18 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     if(!l || !queue || !color || !depth || !na::ffx_flow::Built()){++stats.unavailable;reason("AMD compute shaders unavailable or invalid frame");return {};}
     ComPtr<ID3D12Device> device;if(FAILED(l->GetDevice(IID_PPV_ARGS(&device))))return {};
     auto d=color->GetDesc();const unsigned w=static_cast<unsigned>(d.Width),h=d.Height;
-    if(!current || current->device.Get()!=device.Get() || current->queue.Get()!=queue || current->w!=w || current->h!=h){
-        reason("AMD working resources unavailable; camera motion used");
-        auto next=std::make_shared<Context>();if(!build(*next,device.Get(),queue,w,h))return {};current=std::move(next);++stats.resets;
+    if(current && (current->device.Get()!=device.Get() || current->queue.Get()!=queue)){current.reset();cached.clear();}
+    if(!current || current->w!=w || current->h!=h){
+        // Another size: the context kept for it (its last picture pairs only with the frame it names), else a new one.
+        std::shared_ptr<Context> next;
+        for(auto it=cached.begin();it!=cached.end();++it)if((*it)->device.Get()==device.Get() && (*it)->queue.Get()==queue && (*it)->w==w && (*it)->h==h){next=*it;cached.erase(it);break;}
+        if(next)++stats.context_swaps;
+        else{
+            reason("AMD working resources unavailable; camera motion used");
+            next=std::make_shared<Context>();if(!build(*next,device.Get(),queue,w,h))return {};++stats.resets;
+        }
+        if(current){cached.push_back(std::move(current));if(cached.size()>kCachedContexts)cached.erase(cached.begin());}
+        current=std::move(next);
     }
     auto c=current;
     if(f.total && (!c->pso_measure || !c->pso_cut_state || !c->pso_cut_show)){++stats.unavailable;reason("Measured motion: its GPU programs did not build on this device");return {};}
@@ -310,11 +328,12 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     // Jitter-stabilised encode (j2_flow fe8ea3e): sample texel q at q + this frame's jitter so both
     // images of a pair sit in the unjittered frame and the engine never sees DLAA's shake.
     cb.jitter_x=encode.x;cb.jitter_y=encode.y;
+    cb.cost=(f.block_x>1?2u:1u)|((f.block_y>1?2u:1u)<<8); // encode only: the block the picture was shaded in
     if(slot.timestamps)l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
     move(l,im.tex.Get(),S,U);move(l,im.raw_color.Get(),S,U);
     c->srv(work,0,0,color,d.Format);c->uav(work,0,kUav+0,im.tex.Get(),c->image_format);
     c->uav(work,0,kUav+3,im.raw_color.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
-    c->dispatch(l,work,0,c->pso_encode.Get(),cb);order(l);move(l,im.tex.Get(),U,S);move(l,im.raw_color.Get(),U,S);++stats.recorded;
+    c->dispatch(l,work,0,c->pso_encode.Get(),cb);cb.cost=0;order(l);move(l,im.tex.Get(),U,S);move(l,im.raw_color.Get(),U,S);++stats.recorded;
     if(!pair){++stats.waiting_history;reason(f.total?"Measured motion: this is the first picture of a pair":"AMD flow capturing matching scene history; camera motion used");return t;}
     auto& prev=*c->images[previous];prev.uses.push_back(lease);
     // Calibration reads the unshifted source pair: comparing two differently
@@ -339,7 +358,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         c->bind_compute(l,work,4);
         c->dispatch_bound(l,c->pso_cand_clear.Get(),cc,false,32,32);order(l);
         c->dispatch_bound(l,c->pso_cand_count.Get(),cc,false,groups_x,groups_y);order(l);
-        for(unsigned round=0;round<8;++round){cc.mode=round;c->dispatch_bound(l,c->pso_cand_pick.Get(),cc,false,groups_x,groups_y);order(l);}
+        c->dispatch_bound(l,c->pso_cand_pick.Get(),cc,false,32,32);order(l); // visit each of the 256x256 vote bins once
         c->dispatch_bound(l,c->pso_cand_apply.Get(),cc,false,cb.gw,cb.gh);order(l); // one thread group per block, one thread per pixel
         move(l,c->grid.Get(),U,S);
         move(l,c->top.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),64,c->top.Get(),0,40);move(l,c->top.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);
@@ -402,7 +421,10 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
             // Where the samples' depths fall into two groups with an empty stretch between them, each
             // group gets its own fit and a pixel its own group's (screen_motion.hpp FitLayers says why:
             // a large near figure moving by itself otherwise decides what the still far scene is handed).
-            fc.mode=2;fc.offset=0;
+            fc.mode=3;fc.offset=0;
+            l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
+            c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,false,(cb.gw*cb.gh+255u)/256u,1);order(l);
+            fc.mode=2;
             l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
             c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,true);order(l);
             // Row 0: the far group, or the one fit of every depth. Row 1: the near group; with no split
@@ -421,6 +443,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
                     c->dispatch_bound(l,c->pso_fit_accum.Get(),fc,false,tiles,1);order(l);
                     fc.mode=last?1u:0u;
                     l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
+                    if(!row){c->dispatch_bound(l,c->pso_fit_reduce.Get(),fc,false,((kFitValues+7)/8)*3,1);order(l);}
                     c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,true);order(l);}
                 move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),112+row*kFitHead*4,c->fit_state.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);}
             move(l,c->fit_model.Get(),U,S);
@@ -431,7 +454,16 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         c->srv(work,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,1,3,c->expanded.Get(),DXGI_FORMAT_R32_FLOAT);
         c->srv(work,1,5,im.tex.Get(),c->image_format);c->srv(work,1,6,prev.tex.Get(),c->image_format);
         c->uav(work,1,kUav+0,c->total.Get(),DXGI_FORMAT_R32G32_FLOAT);c->uav(work,1,kUav+1,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
-        if(ok)c->dispatch(l,work,1,c->pso_measure.Get(),cb);
+        if(ok){
+            const bool sampled=f.sample_x>1 || f.sample_y>1;
+            if(sampled && f.sample_pick_x<f.sample_x && f.sample_pick_y<f.sample_y){
+                // flow_shaders.hpp sample_code / sample_size (accept's two words; accept does not run here).
+                const unsigned sw=(w-f.sample_pick_x+f.sample_x-1)/f.sample_x,sh=(h-f.sample_pick_y+f.sample_y-1)/f.sample_y;
+                Constants mc=cb;mc.have_hist=unsigned(f.sample_x)|(unsigned(f.sample_y)<<8)|(unsigned(f.sample_pick_x)<<16)|(unsigned(f.sample_pick_y)<<24);
+                mc.agree_min=sw|(sh<<16);
+                c->dispatch(l,work,1,c->pso_measure.Get(),mc,false,(sw+7)/8,(sh+7)/8);++stats.sampled_pairs;
+            }else c->dispatch(l,work,1,c->pso_measure.Get(),cb);
+        }
         order(l);move(l,c->mask.Get(),U,S);move(l,c->total.Get(),U,S);
         if(ok){
             // The scene cut's state, in execution order, for RecordCutShow after DLSS (flow_shaders.hpp cut_state).
@@ -506,10 +538,34 @@ void RecordCutShow(ID3D12GraphicsCommandList* l,const Ticket& t,ID3D12Resource* 
 void SetLoosen(uint32_t percent){g_loosen.store(percent>100?100u:percent,std::memory_order_relaxed);}
 void SetFrameCandidates(bool on){g_candidates.store(on,std::memory_order_relaxed);}
 void SetScreenFit(bool on){g_screen_fit.store(on,std::memory_order_relaxed);}
-void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current)return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);memcpy(im.raster_jitter,t.frame.raster_jitter,sizeof im.raster_jitter);im.colour_epoch=t.colour_epoch;im.raster_confirmed=t.frame.raster_confirmed;c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
+void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current && std::find(cached.begin(),cached.end(),c)==cached.end())return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);memcpy(im.raster_jitter,t.frame.raster_jitter,sizeof im.raster_jitter);im.colour_epoch=t.colour_epoch;im.raster_confirmed=t.frame.raster_confirmed;c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
     if(slot.cut_seed){c->cut_seeded=true;slot.cut_seed=false;}
     if(slot.pair && slot.hist_written>=0){c->hist_read=static_cast<unsigned>(slot.hist_written);c->hist_frame=t.frame.frame;c->hist_generation=t.frame.generation;slot.hist_written=-1;}stats.last_submitted_frame=t.frame.frame;last_submit_tick=GetTickCount64();}
-void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();last_submit_tick=sample_tick=0;stats={};}
+void Prepare(ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,unsigned h){
+    if(!device || !queue || !w || !h || !na::ffx_flow::Built())return;
+    std::lock_guard<std::mutex> lock(mutex);
+    if(current && (current->device.Get()!=device || current->queue.Get()!=queue))return; // Record settles a new device first
+    if(current && current->w==w && current->h==h)return;
+    for(const auto& c:cached)if(c->w==w && c->h==h)return;
+    for(const auto& b:building)if(b.first==w && b.second==h)return;
+    building.emplace_back(w,h);
+    ComPtr<ID3D12Device> dev(device);ComPtr<ID3D12CommandQueue> q(queue);
+    std::thread([dev,q,w,h]{
+        auto next=std::make_shared<Context>();const bool ok=build(*next,dev.Get(),q.Get(),w,h);
+        std::lock_guard<std::mutex> lock(mutex);
+        building.erase(std::remove(building.begin(),building.end(),std::make_pair(w,h)),building.end());
+        if(!ok){++stats.prepare_failed;return;}
+        if(current && (current->device.Get()!=dev.Get() || current->queue.Get()!=q.Get()))return;
+        cached.push_back(std::move(next));++stats.prepared;if(cached.size()>kCachedContexts)cached.erase(cached.begin());
+    }).detach();
+}
+bool Ready(unsigned w,unsigned h){
+    std::lock_guard<std::mutex> lock(mutex);
+    if(current && current->w==w && current->h==h)return true;
+    for(const auto& c:cached)if(c->w==w && c->h==h)return true;
+    return false;
+}
+void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();cached.clear();last_submit_tick=sample_tick=0;stats={};}
 Stats GetStats(){na::nr::native::Maintain();std::lock_guard<std::mutex> lock(mutex);if(current){collect(*current);stats.colour_jitter_convention=static_cast<uint32_t>(current->raster_confirmed?na::jitter::Convention::Raster:current->colour_jitter.Get());stats.colour_jitter_epoch=current->colour_jitter.Epoch();}const auto now=GetTickCount64();stats.submit_age_ms=last_submit_tick?now-last_submit_tick:0;stats.sample_age_ms=sample_tick?now-sample_tick:0;return stats;}
 void DescribeStats(const Stats& s,char* text,size_t capacity){
     if(!text || !capacity)return;

@@ -394,7 +394,23 @@ uint64_t LiveSelectionVersion();
 // Viewport jitter: real sub-pixel samples. While set (frame != 0), every draw whose bound depth
 // is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
 // by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
+// The offset is kept in steps of 1 / kSceneViewportJitterUnits of a pixel (whole range: two pixels
+// each way); a caller that compares what it asked for with what was drawn rounds to that step first.
+constexpr float kSceneViewportJitterUnits = 16384.f;
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
+// Coarse shading of the scene (core/fold_shading.hpp). While rate != 0 (a D3D12_SHADING_RATE), the
+// draws that take the scene's sample (selected scene depth bound and tested) are shaded once per block
+// of pixels; every other draw of the game keeps one shading per pixel. 0 hands the game's own back.
+// The caller checks that the device supports variable-rate shading before asking.
+void SetSceneCoarseShading(uint32_t rate);
+struct CoarseShadingStats {
+    uint32_t rate = 0;        // what is asked for now
+    uint64_t draws = 0;       // draws drawn coarse
+    uint64_t sets = 0;        // times a recording was switched to the coarse rate
+    uint64_t restores = 0;    // times a recording was handed back to one per pixel
+    uint64_t unavailable = 0; // a recording had no interface for it
+};
+CoarseShadingStats GetCoarseShadingStats();
 // VARIANT: referee/sample-locked-dropout
 // The Referee's ask (referee::gpu::SceneStillMeshes): while true, a scene mesh drawn with the depth
 // test off and the scene depth bound takes the frame's full sample too (core/temporal_jitter.hpp,

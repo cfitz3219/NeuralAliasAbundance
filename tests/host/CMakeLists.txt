@@ -87,6 +87,13 @@ if(NA_HAVE_NGX_SDK)
   add_test(NAME host_auto_scene_proxy_present_test COMMAND auto_scene_test --proxy-present)
   set_tests_properties(host_auto_scene_proxy_present_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   na_host_test(j2_compute_flow_test SOURCES j2_compute_flow_test.cpp LIBS host_dx12 LABELS gpu)
+  add_test(NAME host_j2_fold_planes_test COMMAND j2_compute_flow_test --fold-planes)
+  set_tests_properties(host_j2_fold_planes_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  # Our flow run offline on a capture-format folder; its motion is saved as planes the replay tool
+  # takes with --motion-dir (fold trial 4, 2026-11-25). A measuring tool, not a test.
+  add_executable(flow_motion_dump flow_motion_dump.cpp)
+  target_link_libraries(flow_motion_dump PRIVATE abundance_options host_dx12)
+  target_include_directories(flow_motion_dump PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   # The same fixture at 1920x1080, the size a game runs at (R3 of the 2026-11-16 audit). Real GPU
   # only, like the line above: the AMD search needs 32/64-lane wave operations.
   add_test(NAME host_j2_compute_flow_1080p_test COMMAND j2_compute_flow_test 1920)

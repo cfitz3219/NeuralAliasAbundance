@@ -72,6 +72,12 @@ struct DescHeap;
 // request goes away. Only an entirely idle jitter path can skip the list locks.
 std::atomic<uint64_t> g_vpj_recordings{0};
 std::atomic<bool> g_vpj_ever{false};
+// Coarse shading of the scene (core/fold_shading.hpp): the D3D12_SHADING_RATE the selected scene's
+// depth-tested draws are given, 0 = the game's own. g_coarse_ever: it was asked for at least once in
+// this run, so recordings may still carry a rate that has to be handed back.
+std::atomic<uint32_t> g_coarse{0};
+std::atomic<bool> g_coarse_ever{false};
+std::atomic<uint64_t> g_coarse_draws{0}, g_coarse_sets{0}, g_coarse_restores{0}, g_coarse_unavailable{0};
 // What the most recent recording pinned for its scene draws: the sample, the depth it drew into and
 // whether its one full-size viewport was widened (that is part of where the picture landed).
 struct VpjPinned { uint64_t sample = 0, depth = 0; bool expanded = false; };
@@ -106,7 +112,10 @@ struct DepthWrites {
         ++clears;
     }
 };
-float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
+// Units of a packed viewport offset. 1/16384 px (was 1/65536, which stopped at half a pixel): the
+// folded-shading modes move the scene by up to a whole pixel (core/fold_shading.hpp).
+constexpr float kVpjUnits = kSceneViewportJitterUnits;
+float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / kVpjUnits; }
 struct ListState {
     uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
     std::atomic<uint64_t> generation{0};
@@ -256,6 +265,7 @@ struct ListState {
         if (depth && vpj_resolved.depth == depth) vpj_resolved = {};
     }
     bool vpj_applied = false;
+    uint32_t coarse_rate = 0; // the shading rate we set on this recording (0: the default, nothing to hand back)
     uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
     bool vpj_scene_expanded = false, vpj_scene_mixed = false; // the pinned scene draws' raster shape; mixed = not one shape
     DepthWrites de; // this recording's depth-writing draws and clears of the scene depth (bind_m)
@@ -5435,7 +5445,7 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
 // tests depth gets the game's viewports moved by (x, y) render pixels (+x right, +y down), the
 // content moves with them, and DLSS is told exactly that value. Post passes (no scene depth,
 // or depth test off: full-screen passes) keep the game's own viewports, so nothing is shifted
-// twice. Packed: frame (low 32 bits, never 0) << 32 | x << 16 | y, x/y int16 in 1/65536 px.
+// twice. Packed: frame (low 32 bits, never 0) << 32 | x << 16 | y, x/y int16 in 1/16384 px (kVpjUnits).
 std::atomic<uint64_t> g_vpj{0};
 std::atomic<uint64_t> g_vpj_local_layers{0}, g_vpj_submitted_layers{0};
 std::atomic<uint64_t> g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_draws{0}, g_vpj_unknown{0};
@@ -5545,19 +5555,50 @@ bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* l
 // our offset copies are no longer bound.
 void vpj_viewports_replaced(GL* l, bool reset)
 {
-    if (!g_vpj_ever.load(std::memory_order_relaxed) || t_vpj_self) return;
+    const bool vpj = g_vpj_ever.load(std::memory_order_relaxed) && !t_vpj_self;
+    const bool coarse = reset && g_coarse_ever.load(std::memory_order_relaxed);
+    if (!vpj && !coarse) return;
     std::shared_lock<RegistryLock> lock(g_m);
     na_object_id id = 0;
     auto* ls = list_state_locked(l, &id);
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (coarse) ls->coarse_rate = 0; // Reset puts the shading rate back to one per pixel
+    if (!vpj) return;
     ls->vpj_applied = false;
     if (reset) {
         if (ls->vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release);
         ls->vpj_scene = 0; ls->vpj_depth = 0; ls->vpj_scene_expanded = ls->vpj_scene_mixed = false;
     }
 }
+// The shading rate the draw that follows gets. Called under the recording's bind lock; the call to the
+// driver happens after the locks are released (coarse_apply). *set stays -1 when nothing changes.
+void coarse_decide(ListState& ls, uint32_t rate, int* set)
+{
+    if (rate) g_coarse_draws.fetch_add(1, std::memory_order_relaxed);
+    if (ls.coarse_rate == rate) return;
+    ls.coarse_rate = rate;
+    *set = static_cast<int>(rate);
+}
+void coarse_apply(GL* l, uint32_t rate)
+{
+    ID3D12GraphicsCommandList5* l5 = nullptr;
+    if (FAILED(l->QueryInterface(IID_PPV_ARGS(&l5))) || !l5) { g_coarse_unavailable.fetch_add(1, std::memory_order_relaxed); return; }
+    {
+        HostWorkScope own;
+        l5->RSSetShadingRate(static_cast<D3D12_SHADING_RATE>(rate), nullptr);
+    }
+    l5->Release();
+    (rate ? g_coarse_sets : g_coarse_restores).fetch_add(1, std::memory_order_relaxed);
+}
+void vpj_before_draw_body(GL* l, uint64_t vertices, int* coarse_set);
 void vpj_before_draw(GL* l, uint64_t vertices = 0)
+{
+    int coarse_set = -1;
+    vpj_before_draw_body(l, vertices, &coarse_set);
+    if (coarse_set >= 0) coarse_apply(l, static_cast<uint32_t>(coarse_set));
+}
+void vpj_before_draw_body(GL* l, uint64_t vertices, int* coarse_set)
 {
     // Two readers of the same per-draw facts: viewport jitter, and (only while asked for) the depth
     // direction evidence. With the evidence off this is the viewport jitter's own early return.
@@ -5565,7 +5606,9 @@ void vpj_before_draw(GL* l, uint64_t vertices = 0)
     const bool vpj = g_vpj_ever.load(std::memory_order_relaxed);
     const uint64_t cur = vpj ? g_vpj.load(std::memory_order_acquire) : 0;
     const bool moving = vpj && (cur || g_vpj_recordings.load(std::memory_order_acquire));
-    if (!moving && !evidence) return;
+    const bool coarse_ever = g_coarse_ever.load(std::memory_order_relaxed);
+    const uint32_t coarse_rate = coarse_ever ? g_coarse.load(std::memory_order_relaxed) : 0;
+    if (!moving && !evidence && !coarse_ever) return;
     D3D12_VIEWPORT v[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     UINT n = 0;
     {
@@ -5580,7 +5623,12 @@ void vpj_before_draw(GL* l, uint64_t vertices = 0)
         // sample. The first eligible draw owns it until this list is Reset.
         const na_ev_pipeline_created* pc = sel_depth && ls->cur_ds == sel_depth ? pso_created_locked(*ls) : nullptr;
         if (evidence && pc && pc->depth_enable == 1 && pc->depth_write == 1) ls->de.write(sel_depth, pc->depth_func);
-        if (!moving) return; // counted only: no viewport of the game's is touched
+        if (!moving) { // counted only: no viewport of the game's is touched
+            // Coarse shading without viewport jitter (the sample rides in the camera): the same draws,
+            // the selected scene depth bound and tested.
+            if (coarse_ever) coarse_decide(*ls, coarse_rate && pc && pc->depth_enable == 1 ? coarse_rate : 0, coarse_set);
+            return;
+        }
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
         bool tests_depth = pc && pc->depth_enable == 1;
         // VARIANT: jitter/shader-depth-readers
@@ -5656,6 +5704,11 @@ void vpj_before_draw(GL* l, uint64_t vertices = 0)
             }
         }
         want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, after_resolve);
+        // The draws that take the scene's sample are the draws shaded coarse: one rule for both.
+        // The draws that take the scene's sample are the draws shaded coarse: one rule for both. (Build
+        // fb0d69cd also shaded the full-screen passes of the scene's list in blocks: it found about five
+        // draws a frame, changed no frame rate, and Cort's picture broke. Removed.)
+        if (coarse_ever) coarse_decide(*ls, want ? coarse_rate : 0, coarse_set);
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
             if (still_mesh) g_vpj_still_moved.fetch_add(1, std::memory_order_relaxed);
@@ -9767,6 +9820,21 @@ void SetStillMeshJitter(bool asked)
     if (g_vpj_still_meshes.exchange(asked, std::memory_order_relaxed) != asked && asked)
         g_vpj_still_asks.fetch_add(1, std::memory_order_relaxed);
 }
+void SetSceneCoarseShading(uint32_t rate)
+{
+    if (rate) g_coarse_ever.store(true, std::memory_order_relaxed);
+    g_coarse.store(rate, std::memory_order_relaxed);
+}
+CoarseShadingStats GetCoarseShadingStats()
+{
+    CoarseShadingStats s;
+    s.rate = g_coarse.load(std::memory_order_relaxed);
+    s.draws = g_coarse_draws.load(std::memory_order_relaxed);
+    s.sets = g_coarse_sets.load(std::memory_order_relaxed);
+    s.restores = g_coarse_restores.load(std::memory_order_relaxed);
+    s.unavailable = g_coarse_unavailable.load(std::memory_order_relaxed);
+    return s;
+}
 void SetSceneViewportJitter(uint64_t frame, float x, float y)
 {
     if (!frame) {
@@ -9776,7 +9844,7 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y)
         }
         return;
     }
-    const auto q = [](float f) { return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(std::lround(double(f) * 65536.0), -32767L, 32767L))); };
+    const auto q = [](float f) { return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(std::lround(double(f) * double(kVpjUnits)), -32767L, 32767L))); };
     uint32_t f32 = static_cast<uint32_t>(frame);
     if (!f32) f32 = 1;
     g_vpj_ever.store(true, std::memory_order_relaxed);

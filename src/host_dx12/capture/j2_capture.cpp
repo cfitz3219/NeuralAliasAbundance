@@ -1,6 +1,7 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
+#include "host_dx12/diag/event_log.hpp"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -362,6 +363,10 @@ void writer_main()
             if (next->session == g.session) {
                 if (saved) ++g.stats.written;
                 else ++g.stats.errors;
+                // Cort, build fb0d69cd: "the captures no longer show if the capture was successful", and
+                // the log said nothing either. The log now says when a capture's last frame is on disk.
+                if (g.stats.requested && g.stats.written + g.stats.errors == g.stats.requested)
+                    na::eventlog::Emit("capture", "j2 capture finished: %u of %u frames saved, %u errors", g.stats.written, g.stats.requested, g.stats.errors);
             }
         }
     }
@@ -438,6 +443,7 @@ bool RequestTimestamped(uint32_t frames, uint32_t delay_ms)
     if (g.stats.lighting_trial != LightingTrial::None && busy_locked()) return false;
     if (!MakeDir(L"j2", dir, MAX_PATH)) return false;
     start_locked(frames, dir, delay_ms, LightingTrial::None);
+    na::eventlog::Emit("capture", "j2 capture started: %u frames to %ls", frames, dir);
     return true;
 }
 
