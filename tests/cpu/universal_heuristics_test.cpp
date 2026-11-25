@@ -45,12 +45,15 @@ struct Feed {
         CHECK(decoded.valid);
         h.Consume(decoded, status);
     }
-    void Resource(uint64_t id, uint32_t w, uint32_t hgt, uint32_t format) {
+    void Resource(uint64_t id, uint32_t w, uint32_t hgt, uint32_t format, uint32_t samples = 1) {
         na_ev_resource_created r{};
         r.resource = id;
         r.width = w;
         r.height = hgt;
         r.format = format;
+        r.dimension = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        r.sample_count = samples;
+        r.depth_or_array = r.mip_levels = 1;
         Event(r, NA_EV_RESOURCE_CREATED);
     }
     void Pipeline(uint64_t id, uint32_t depth, uint32_t write, uint32_t blend) {
@@ -214,6 +217,56 @@ int main(int argc,char** argv) {
              resize.width=1024;resize.height=768;resize.hresult=static_cast<int32_t>(0x80004005u);
              f.Event(resize,NA_EV_SWAPCHAIN_RESIZED);
              CHECK(f.h.SwapchainWidth()==1280 && f.h.SwapchainHeight()==720);
+         }},
+        {"a native picture inside a larger display is offered separately from ordinary depth", [] {
+             for (bool horizontal : {false, true}) {
+                 Feed f;
+                 f.Swapchain(horizontal ? 3440 : 2560, horizontal ? 1440 : 1800);
+                 f.Resource(3, 2560, 1440, 40);
+                 f.Resource(6, 2560, 1440, 10);
+                 f.Resource(4, 2048, 2048, 40);
+                 f.Resource(8, 2048, 2048, 10);
+                 f.Resource(5, 2560, 1440, 40, 4);
+                 f.Resource(9, 2560, 1440, 10, 4);
+                 f.Pipeline(10, 1, 1, 0);
+                 f.Reset();
+                 f.SetPipeline(10);
+                 f.Targets({8}, 4);
+                 for (int i = 0; i < 30; ++i) f.Draw(900);
+                 f.Targets({9}, 5);
+                 for (int i = 0; i < 30; ++i) f.Draw(900);
+                 f.Targets({6}, 3);
+                 for (int i = 0; i < 20; ++i) f.Draw(120);
+                 f.Execute();
+                 f.Present();
+                 const auto pair = f.h.ScreenRegionPair();
+                 CHECK(pair.first == 3 && pair.second == 6);
+                 CHECK(!f.h.RankDepth(1).empty() && f.h.RankDepth(1)[0].score == 0);
+             }
+         }},
+        {"a scene that cannot be taken as a placed picture says what stood in the way", [] {
+             using Why = na::discovery::UniversalHeuristics::RefusedRegion::Why;
+             const auto run = [](uint32_t w, uint32_t hgt, uint32_t samples) {
+                 Feed f;
+                 f.Swapchain(3440, 1440);
+                 f.Resource(3, w, hgt, 40, samples);
+                 f.Resource(6, w, hgt, 10, samples);
+                 f.Pipeline(10, 1, 1, 0);
+                 f.Reset();
+                 f.SetPipeline(10);
+                 f.Targets({6}, 3);
+                 for (int i = 0; i < 30; ++i) f.Draw(900);
+                 f.Execute();
+                 f.Present();
+                 return std::make_pair(f.h.ScreenRegionPair(), f.h.RefusedScreenRegion());
+             };
+             const auto msaa = run(2560, 1440, 4);
+             CHECK(!msaa.first.second && msaa.second.why == Why::Multisampled && msaa.second.samples == 4 &&
+                   msaa.second.width == 2560 && msaa.second.height == 1440);
+             const auto small = run(1920, 1080, 1);
+             CHECK(small.first.second == 6 && small.second.why == Why::None); // offered: stretched or boxed
+             const auto placed = run(2560, 1440, 1);
+             CHECK(placed.first.second == 6 && placed.second.why == Why::None);
          }},
         {"generic_depth picks the swapchain-aspect main depth over shadow and half-res buffers", [] {
              Feed f;

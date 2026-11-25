@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 #ifdef NA_HAVE_REFEREE_SHADERS
 #include "referee_thumb.h"
+#include "referee_raster_field.h"
 #include "referee_tiles.h"
 #include "referee_points.h"
 #endif
@@ -22,7 +23,8 @@
 #include "core/referee_trace.hpp"
 #include "core/referee_placement.hpp"
 #include "core/referee_present_times.hpp"
-#include "core/referee_jitter.hpp"
+#include "core/referee_dropout.hpp"
+#include "core/referee_mixed_raster.hpp"
 #include "core/referee_parity.hpp"
 
 using Microsoft::WRL::ComPtr;
@@ -36,6 +38,8 @@ enum Img : uint32_t { kPrev, kInput, kOutput, kScreen, kMotion, kPrevOutput, kPr
 constexpr uint32_t kTraceOffset = kResultFloats + 4 * kTileFloats;
 constexpr uint32_t kGeometryOffset = kTraceOffset + 4 * kThumbFloats;
 constexpr uint32_t kGeometryFloats = 6 * kTileFloats; // prior input, output and up to four screen origins
+constexpr unsigned kFieldOffset = kGeometryOffset + kGeometryFloats;
+constexpr unsigned kFieldCapacity = 192 * 108 * mixed_values;
 enum class Phase { Idle, PreRecorded, PreSubmitted, MainRecorded, MainSubmitted, Computing, Scoring, Retiring, Stopped };
 constexpr uint32_t kMaxToken = 0x00ffffff; // high 24 bits of the capture token
 constexpr ULONGLONG kStuckMs = 3000; // a half-taken sample is given up after this
@@ -57,7 +61,7 @@ struct State {
     std::mutex m;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> thumb, tiles, points;
+    ComPtr<ID3D12PipelineState> thumb, tiles, points, raster_field;
     ComPtr<ID3D12DescriptorHeap> heap;
     ComPtr<ID3D12Resource> results, readback;
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -84,7 +88,7 @@ struct State {
     const void* screen_only_source = nullptr; // a missed pair can still supply a single exact screen
     bool screen_elapsed = false, have_motion = false, invalidated = false, single_main = false;
     bool pre_trace_output = false, pre_trace_screen = false, pre_accepted = false, adjacent = false;
-    bool awaiting_result = false, trace_pair = false, trial_adjacent = false;
+    bool awaiting_result = false, trace_pair = false, trial_adjacent = false, raster_adjacent = false;
     bool trace_geometry = false;
     std::array<Presentation, 4> pending_presents{};
     std::atomic<bool> pending_receipt{false};
@@ -111,9 +115,18 @@ struct State {
         shadow::Context scene;
         uint64_t ordinal = 0;
         JitterTrial trial;
+        MixedRasterField field;
+        uint8_t amount = 0;
+        uint64_t field_ordinal = 0;
+        // VARIANT: referee/sample-locked-dropout
+        DropoutWatch dropout;
+        std::array<float, FlickerTransition::count> dropout_view{};
+        bool dropout_view_known = false;
+        uint64_t dropout_events = 0, dropout_logged = 0;
     };
     std::array<JitterControl, 2> jitter_controls;
     std::atomic<unsigned> jitter_active{0};
+    std::atomic<unsigned> still_meshes_active{0}; // bit per control: its dropout watch asks for the move
     std::atomic<uint64_t> trial_sample_ticket{0};
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
     const void* trial_source = nullptr;
@@ -122,6 +135,7 @@ struct State {
     uint64_t solo_screens = 0;
     uint32_t token = 0, next_token = 0;
     ComPtr<ID3D12CommandQueue> pre_queue, main_queue;
+    uint32_t field_size = 0;
     bool done_screen = false, done_tiles = false, done_pair = false;
     bool scaled_tiles = false;
     uint32_t padded_layouts = 0;
@@ -173,6 +187,34 @@ void publish_jitter(unsigned index)
 {
     if (g.jitter_controls[index].trial.NeedsReference()) g.jitter_active.fetch_or(1u << index, std::memory_order_release);
     else g.jitter_active.fetch_and(~(1u << index), std::memory_order_release);
+    if (g.jitter_controls[index].dropout.MoveStillMeshes()) g.still_meshes_active.fetch_or(1u << index, std::memory_order_release);
+    else g.still_meshes_active.fetch_and(~(1u << index), std::memory_order_release);
+}
+
+const char* dropout_phase(DropoutWatch::Phase phase)
+{
+    switch (phase) {
+    case DropoutWatch::Phase::Trial: return "trial";
+    case DropoutWatch::Phase::Kept: return "kept";
+    case DropoutWatch::Phase::RuledOut: return "ruled_out";
+    default: return "watch";
+    }
+}
+
+// Says what was seen and why the Referee acted: the samples the surfaces went black on, in pixels.
+void log_dropout(const DropoutWatch& watch, shadow::Path path, uint64_t frame, const DropoutPair& pair)
+{
+    char samples[160] = "";
+    int at = 0;
+    for (unsigned i = 0; i < watch.BlackSamples() && at < int(sizeof samples) - 20; ++i)
+        at += std::snprintf(samples + at, sizeof samples - size_t(at), "%s%.3f,%.3f", i ? " " : "",
+                            watch.BlackSample(i).x, watch.BlackSample(i).y);
+    na::eventlog::Emit("referee_dropout",
+        "frame=%llu path=%s phase=%s move_still_meshes=%d why=\"%s\" pair{gone=%u back=%u cells=%u} onsets=%u returns=%u "
+        "black_samples_px=\"%s\" trial{pairs=%u events=%u challenges=%u} recurred=%u",
+        static_cast<unsigned long long>(frame), path == shadow::Path::Native11 ? "native11" : "dx12",
+        dropout_phase(watch.Current()), watch.MoveStillMeshes() ? 1 : 0, watch.Why(), pair.gone, pair.back, pair.cells,
+        watch.Onsets(), watch.Returns(), samples, watch.TrialPairs(), watch.TrialEvents(), watch.Challenges(), watch.Recurred());
 }
 
 void log_jitter(const JitterTrial& trial, shadow::Path path, uint64_t frame)
@@ -285,14 +327,19 @@ bool init(ID3D12Device* dev)
     const D3D12_SHADER_BYTECODE shaders[] = {
         {referee_thumb, sizeof referee_thumb},
         {referee_tiles, sizeof referee_tiles},
-        {referee_points, sizeof referee_points}
+        {referee_points, sizeof referee_points},
+        {referee_raster_field, sizeof referee_raster_field}
     };
-    ComPtr<ID3D12PipelineState>* psos[3] = {&g.thumb, &g.tiles, &g.points};
-    for (int i = 0; i < 3; ++i) {
+    ComPtr<ID3D12PipelineState>* psos[] = {&g.thumb, &g.tiles, &g.points, &g.raster_field};
+    for (unsigned i = 0; i < std::size(psos); ++i) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = g.root.Get();
         pd.CS = shaders[i];
         if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(psos[i]->ReleaseAndGetAddressOf())))) {
+            if (i + 1 == std::size(psos)) {
+                na::eventlog::Emit("referee_state", "local raster scan unavailable on this device");
+                continue;
+            }
             stop("the referee's card programs could not be made");
             return false;
         }
@@ -302,7 +349,7 @@ bool init(ID3D12Device* dev)
     return false;
 #endif
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kImages, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    const UINT64 bytes = UINT64(kGeometryOffset + kGeometryFloats) * sizeof(float);
+    const UINT64 bytes = UINT64(kFieldOffset + kFieldCapacity) * sizeof(float);
     auto buffer = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags, ComPtr<ID3D12Resource>& r) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = type;
@@ -445,6 +492,7 @@ void retire()
 
 uint32_t sample_floats()
 {
+    if (g.field_size) return kFieldOffset + g.field_size;
     if (g.trace_geometry) return kGeometryOffset + (2 + (std::max)(1u, g.padded_layouts)) * kTileFloats;
     if (g.trace_pair) return kGeometryOffset;
     return kResultFloats + g.padded_layouts * kTileFloats;
@@ -464,6 +512,7 @@ void collect_sample()
     TrialSample trial;
     bool trial_valid = false;
     RegionalTiles regions;
+    std::vector<float> raster_field;
     std::array<JitterDisplacement, kTiles> geometry{};
     if (mapped) {
         const auto* samples = static_cast<const float*>(p);
@@ -475,7 +524,7 @@ void collect_sample()
         score = na::referee::Score(observations);
         shadow::ScreenVote vote = shadow::ScreenVote::Unknown;
         if (g.done_screen && comparable && (!g.padded_layouts || layout || scaled_matches) &&
-            (g.trial_adjacent || (score.local.input && score.local.output))) {
+            (g.trial_adjacent || g.raster_adjacent || (score.local.input && score.local.output))) {
             TileVotes local;
             const auto width = uint32_t((std::min)(g.img[kInput].desc.Width, g.img[kScreen].desc.Width));
             const auto height = (std::min)(g.img[kInput].desc.Height, g.img[kScreen].desc.Height);
@@ -490,11 +539,11 @@ void collect_sample()
                 transition = LocateTransition(samples + kTraceOffset, samples + BlockOffset(kThumbInput),
                     g.padded_layouts ? samples + kTraceOffset + 3 * kThumbFloats : nullptr,
                     g.captured_context.recovery_region, g.captured_context.recovery_floor);
-            if (g.trial_adjacent) {
+            if (g.trial_adjacent || g.raster_adjacent) {
                 const float* screen = g.padded_layouts ? samples + kTraceOffset + 3 * kThumbFloats : samples + BlockOffset(kThumbScreen);
                 trial_valid = MeasureTrialScreen(samples + kTraceOffset + 2 * kThumbFloats, screen, trial);
                 trial.comparable = trial_valid;
-                trial.ordinal = g.main_ordinal;
+                trial.ordinal = g.trial_adjacent ? g.main_ordinal : 0;
                 trial.context = g.captured_context;
                 trial.alternate = g.observed_alternate;
                 trial.configuration = g.captured_context.trial_configuration;
@@ -521,6 +570,7 @@ void collect_sample()
                 trial.delivered = vote == shadow::ScreenVote::Output;
             }
             if (g.trace_geometry && trial.delivered && trial.screen_structure >= .90f) {
+                if (g.field_size) raster_field.assign(samples + kFieldOffset, samples + kFieldOffset + g.field_size);
                 const float* earlier = samples + kGeometryOffset;
                 const float* earlier_screen = earlier + (2 + (layout ? layout - 1 : 0)) * kTileFloats;
                 const float* present = screen_tiles ? screen_tiles : samples + BlockOffset(kTileScreen);
@@ -601,29 +651,89 @@ void collect_sample()
                 const unsigned index = jitter_index(scene.placement.path);
                 auto& control = g.jitter_controls[index];
                 if (control.source != g.swapchain || !same_jitter_scene(control.scene, scene)) {
+                    // A result belongs to the scene that supplied its evidence.
                     control = {};
                     control.source = g.swapchain;
                     control.scene = scene;
+                    publish_jitter(index);
                 }
                 control.ordinal = g.main_ordinal;
+                // VARIANT: referee/sample-locked-dropout
+                // Every measured pair of this scene is looked at, whatever the strength trial is doing.
+                if (trial.delivered && !raster_field.empty()) {
+                    const auto pair = CountDropouts(raster_field.data(), unsigned(raster_field.size() / mixed_values),
+                                                    mixed_values, mixed_black_before, mixed_black_now);
+                    const bool same_view = control.dropout_view_known && SameJitterPicture(control.dropout_view, trial.image);
+                    control.dropout_view = trial.image;
+                    control.dropout_view_known = true;
+                    const bool changed = control.dropout.Observe(pair, {g.pre_jitter[0], g.pre_jitter[1]},
+                                                                 {g.main_jitter[0], g.main_jitter[1]}, same_view);
+                    if (pair.Any() && same_view) ++control.dropout_events;
+                    if (changed) publish_jitter(index);
+                    // The first few events of a scene are written out too, so a run that never reaches a
+                    // trial still says what was seen.
+                    if (changed || (pair.Any() && same_view && control.dropout_logged < 8)) {
+                        ++control.dropout_logged;
+                        log_dropout(control.dropout, scene.placement.path, g.main_ordinal, pair);
+                    }
+                }
                 auto& test = control.trial;
                 const auto phase = test.Current();
+                const auto before_strength = test.Amount();
                 const auto now = GetTickCount64();
                 test.Tick(now);
-                if (trial.bypassed && amount == reduced_jitter) test.Bypassed(now);
+                if (trial.bypassed && amount && amount != normal_jitter) test.Bypassed(now);
                 if (trial.delivered && test.NeedsReference()) {
                     const auto ref = test.Reference().at;
                     for (tile = 0; tile < kTiles; ++tile)
                         if (ref.x == regions.at[tile].x && ref.y == regions.at[tile].y) break;
                 }
-                if (trial.delivered && tile < kTiles && geometry[tile].Valid()) {
+                bool field_measured = false;
+                if (trial.delivered && !raster_field.empty() && (!test.NeedsReference() || test.Reference().field)) {
+                    if (control.amount != amount || g.main_ordinal <= control.field_ordinal ||
+                        g.main_ordinal - control.field_ordinal > 240) control.field.pairs = 0;
+                    control.amount = amount;
+                    control.field_ordinal = g.main_ordinal;
+                    control.field.Add(raster_field.data(), trial.width, trial.height,
+                        g.main_jitter[0]-g.pre_jitter[0], g.main_jitter[1]-g.pre_jitter[1], trial.image, amount);
+                    JitterTrial::Measurement candidate;
+                    if (control.field.Measure(test.NeedsReference() ? &test.Reference() : nullptr, candidate, nullptr, amount)) {
+                        candidate.layout = layout;
+                        candidate.controls = regions;
+                        candidate.locations = g.sampled_locations;
+                        candidate.image = trial.image;
+                        if (g.keep_receipt && test.NeedsReference())
+                            na::eventlog::Emit("referee_field_comparison",
+                                "samples=%u strength=%u before=%.4f now=%.4f detail=%.4f ref_detail=%.4f compared=%u improved=%u worse=%u baseline=%zu",
+                                control.field.pairs, unsigned(amount),test.Baseline(),candidate.shift,candidate.detail,
+                                test.Reference().detail,candidate.regional_checks,candidate.regional_improved,candidate.regional_worse,
+                                test.Reference().witnesses.size());
+                        test.Observe(candidate, amount, now);
+                        field_measured = true;
+                        if (phase != test.Current() || before_strength != test.Amount()) {
+                            control.field.pairs = 0; // required even when Confirm uses the same strength
+                            na::eventlog::Emit("referee_mixed_raster", "frame=%llu center=%d,%d screen_phase_px=%.4f detail=%.4f compared=%u improved=%u baseline_edges=%zu",
+                                (unsigned long long)g.main_ordinal,candidate.at.x,candidate.at.y,candidate.shift,candidate.detail,
+                                candidate.regional_checks,candidate.regional_improved,test.Reference().witnesses.size());
+                        }
+                    }
+                }
+                if (!field_measured && (!test.NeedsReference() || !test.Reference().field) &&
+                    trial.delivered && tile < kTiles && geometry[tile].Valid()) {
                     const auto screen = w.window[tile].Measure(false);
                     const auto output = w.window[tile].Measure(true);
                     if (screen.valid && output.valid)
                         test.Observe({regions.at[tile], layout, screen.shift, output.shift,
                                       regions.detail[tile], screen.locked, trial.image}, amount, now);
                 }
-                if (phase != test.Current()) log_jitter(test, scene.placement.path, control.ordinal);
+                if (phase != test.Current() || before_strength != test.Amount()) {
+                    // A confirmation must be independent of its first observation.
+                    if (test.Current() == JitterTrial::Phase::Confirm) {
+                        w.window = {};
+                        w.reported = {};
+                    }
+                    log_jitter(test, scene.placement.path, control.ordinal);
+                }
                 publish_jitter(index);
             }
         }
@@ -764,6 +874,8 @@ void collect_sample()
         }
         ++g.stats.samples;
         if (!g.data.empty()) {
+            g.last.local_phase = std::move(raster_field);
+            g.last.local_picture = trial.image;
             g.last.data.swap(g.data);
             g.data.clear();
             g.last.screen = g.done_screen; g.last.tiles = g.scaled_tiles || scaled_matches || layout != 0; g.last.pair = g.done_pair;
@@ -797,7 +909,7 @@ void maintain()
         g.main_queue.Reset();
         g.swapchain = nullptr;
         g.invalidated = false;
-        g.awaiting_result = g.trace_pair = g.trial_adjacent = false;
+        g.awaiting_result = g.trace_pair = g.raster_adjacent = g.trial_adjacent = false;
         set_phase(Phase::Idle);
     }
 }
@@ -919,12 +1031,18 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
         g.img[kPrevOutput].desc.Format == g.img[kOutput].desc.Format &&
         g.img[kPrevScreen].desc.Width == sw && g.img[kPrevScreen].desc.Height == shh &&
         g.img[kPrevScreen].desc.Format == g.img[kScreen].desc.Format;
-    g.trace_geometry = g.trace_pair && g.adjacent && g.trial_adjacent &&
+    g.trace_geometry = g.trace_pair && g.adjacent && (g.trial_adjacent || g.raster_adjacent) &&
         g.img[kPrev].desc.Width == iw && g.img[kPrev].desc.Height == ih &&
         g.img[kPrev].desc.Format == g.img[kInput].desc.Format &&
-        std::hypot(g.main_jitter[0] - g.pre_jitter[0], g.main_jitter[1] - g.pre_jitter[1]) >= .25f;
+        std::hypot(g.main_jitter[0] - g.pre_jitter[0], g.main_jitter[1] - g.pre_jitter[1]) >= .25f * (g.main_jitter_amount ? g.main_jitter_amount * .01f : 1.f);
     g.sampled_locations = g.swapchain == g.tile_source && g.captured_context.SameTemporalSequence(g.tile_context)
         ? g.tile_locations : TileLocations{};
+    const auto& jitter_control = g.jitter_controls[jitter_index(g.captured_context.placement.path)];
+    if (g.trace_geometry && jitter_control.source == g.swapchain &&
+        same_jitter_scene(jitter_control.scene, g.captured_context) && jitter_control.trial.NeedsReference() &&
+        jitter_control.trial.Reference().field) {
+        g.sampled_locations = jitter_control.trial.Reference().locations;
+    }
     for (int i = 0; screen && i < 3; ++i) {
         k = {};
         k.src = thumbs[i];
@@ -972,6 +1090,17 @@ void compute(ID3D12CommandQueue* queue, ID3D12Resource* presented, ExecuteFn exe
                 run(g.tiles.Get(), k, kTiles, k.pad0 ? g.padded_layouts : 1);
             }
         }
+    }
+    g.field_size = 0;
+    if (g.raster_field && g.trace_geometry && aligned && !g.trial_applied &&
+        RouteTrial::WatchTicket(g.captured_context.trial_ticket) &&
+        g.main_jitter_amount && g.main_jitter_amount == g.pre_jitter_amount) {
+        k = {};
+        k.w = iw; k.h = ih; k.mw = mixed_cols(iw); k.mh = mixed_rows(ih);
+        k.base = kFieldOffset;
+        k.djx = g.main_jitter[0]-g.pre_jitter[0]; k.djy = g.main_jitter[1]-g.pre_jitter[1];
+        run(g.raster_field.Get(), k, k.mw, k.mh);
+        g.field_size = k.mw * k.mh * mixed_values;
     }
     uint32_t pw = 0, ph = 0;
     size(kPrev, pw, ph);
@@ -1047,6 +1176,7 @@ void reset_evidence_locked()
     g.trace_source = nullptr;
     clear_parity_locked();
     g.geometry = {};
+    for (auto& control : g.jitter_controls) control.field.pairs = 0;
 }
 
 } // namespace
@@ -1070,10 +1200,11 @@ void NotifyEvaluationReset()
 bool Wanted()
 {
     if (!enabled()) {
-        if (g.jitter_active.load(std::memory_order_acquire)) {
+        if (g.jitter_active.load(std::memory_order_acquire) || g.still_meshes_active.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> lock(g.m);
             g.jitter_controls = {};
             g.jitter_active.store(0, std::memory_order_release);
+            g.still_meshes_active.store(0, std::memory_order_release);
             g.geometry = {};
         }
         return false;
@@ -1164,6 +1295,11 @@ uint32_t Record(ID3D12GraphicsCommandList* l, const Evaluation& e)
         e.context.trial_configuration == g.captured_context.trial_configuration &&
         e.context.placement.path == g.captured_context.placement.path &&
         rw == g.img[kPrev].desc.Width && rh == g.img[kPrev].desc.Height;
+    // Jitter is a separate comparison. A healthy route need not hold a
+    // placement trial ticket. Both Presents must still return successfully.
+    g.raster_adjacent = adjacent && !e.context.trial_ticket && !g.captured_context.trial_ticket &&
+        e.context.placement.path != shadow::Path::None && e.scene_jitter_amount &&
+        e.scene_jitter_amount == g.pre_jitter_amount;
     const uint32_t mw = e.mv_display_res ? ow : rw, mh = e.mv_display_res ? oh : rh;
     g.have_motion = adjacent && !e.mv_jittered && e.motion && ensure(kMotion, e.motion, mw, mh);
     if (!ensure(kInput, e.color, rw, rh) || !ensure(kOutput, e.output, ow, oh)) { ++g.stats.failed; return 0; }
@@ -1330,7 +1466,7 @@ void OnPresent(Presentation frame, ID3D12CommandQueue* queue, ID3D12Resource* pr
     if ((queue != g.pre_queue.Get() && !completed(g.pre_fence.Get(), g.pre_value)) ||
         (queue != g.main_queue.Get() && !completed(g.main_fence.Get(), g.main_value))) return;
     if ((!screen || !presented) && !g.have_motion) { retire(); return; }
-    if (!frame.await_result) g.trial_adjacent = false;
+    if (!frame.await_result) g.trial_adjacent = g.raster_adjacent = false;
     g.preview_exact = screen;
     g.awaiting_result = screen && frame.await_result;
     const auto& current = g.captured_context;
@@ -1415,6 +1551,25 @@ uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t col
         publish_jitter(index);
     }
     return control.trial.Amount();
+}
+
+// VARIANT: referee/sample-locked-dropout
+// Whether the meshes of this scene that kept the game's own viewport should take the frame's
+// sample: the dropout watch is trying that, or has proved it on this scene.
+bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, uint64_t depth,
+                      uint64_t generation, uint64_t frame, uint64_t screen_proof)
+{
+    if (!swapchain || !color || !depth || !generation || !enabled()) return false;
+    const unsigned index = jitter_index(path);
+    if (!(g.still_meshes_active.load(std::memory_order_acquire) & (1u << index))) return false;
+    std::lock_guard<std::mutex> lock(g.m);
+    const auto& control = g.jitter_controls[index];
+    const auto& scene = control.scene;
+    if (control.source != swapchain || path != scene.placement.path ||
+        frame < control.ordinal || frame - control.ordinal > DropoutWatch::kWindow) return false;
+    const bool rotating = path == shadow::Path::Native11 && screen_proof && scene.native_screen_proof;
+    if (depth != scene.depth || generation != scene.generation || (color != scene.color && !rotating)) return false;
+    return control.dropout.MoveStillMeshes();
 }
 
 void InvalidatePresentation(const void* swapchain)

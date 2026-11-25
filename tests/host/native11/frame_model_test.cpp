@@ -752,6 +752,60 @@ int main()
                "a game that draws its scene into one target keeps the most-drawn rule");
     }
 
+    // A scene that is not the screen's shape: taken as a picture placed inside the screen when it can
+    // be, and otherwise the model says what stood in the way (WHY log, no behaviour).
+    {
+        const auto run = [](uint32_t w, uint32_t h, uint32_t samples, bool detect, FrameModel& m) {
+            m.SetSwapChainSize(3440, 1440);
+            m.SetInfo(kDepth, {w, h, 0, samples, true});
+            m.SetInfo(kColor, {w, h, 0, samples, false});
+            m.SetInfo(kBackBuffer, {3440, 1440, 0, 1, false});
+            for (int frame = 0; frame < 4; ++frame) {
+                for (int i = 0; i < 40; ++i) m.Feed(Draw(kColor, kDepth, 3000));
+                m.Feed(Read(kColor));
+                m.Feed(Draw(kBackBuffer, 0, 3));
+                m.EndFrame(false, 0, detect);
+            }
+        };
+        FrameModel placed, msaa, small, off;
+        run(2560, 1440, 1, true, placed);
+        expect(placed.Current().valid() && placed.Current().screen_region &&
+               placed.RefusedScene().why == FrameModel::NoScene::None,
+               "a picture as tall as the screen is taken as placed inside it, pending screen proof");
+        placed.DeferScreenRegion();
+        for (int i = 0; i < 40; ++i) placed.Feed(Draw(kColor, kDepth, 3000));
+        placed.EndFrame(false, 0, true);
+        expect(!placed.Current().valid() && placed.RefusedScene().why == FrameModel::NoScene::AwaitingScreenProof &&
+               placed.RefusedScene().width == 2560, "after a failed screen proof the model says it is waiting to try again");
+        run(2560, 1440, 4, true, msaa);
+        expect(!msaa.Current().valid() && msaa.RefusedScene().why == FrameModel::NoScene::Multisampled &&
+               msaa.RefusedScene().samples == 4 && msaa.RefusedScene().width == 2560 && msaa.RefusedScene().height == 1440,
+               "a multisampled placed picture is not chosen, and the model says it is the game's anti-aliasing");
+        run(1920, 1080, 1, true, small);
+        expect(small.Current().valid() && small.Current().screen_region && small.RefusedScene().why == FrameModel::NoScene::None,
+               "a picture smaller than the screen both ways is taken too, pending screen proof");
+        // No proof comes (the game stretches it): DLAA is pushed on it and the pair stays chosen.
+        expect(small.PushScreenRegion() && small.Current().valid() && !small.Current().screen_region &&
+               small.GetStats().pushed_pictures == 1, "without screen proof the picture is pushed, not dropped");
+        bool fires = false;
+        for (int frame = 0; frame < 4; ++frame) {
+            for (int i = 0; i < 40; ++i) small.Feed(Draw(kColor, kDepth, 3000));
+            fires = small.ShouldFireBeforeRead(kColor);
+            small.Feed(Read(kColor));
+            small.Feed(Draw(kBackBuffer, 0, 3));
+            small.EndFrame(false, 0, true);
+        }
+        expect(small.Current().color == kColor && !small.Current().screen_region && fires,
+               "a pushed picture keeps its place and delivers at the ordinary point, before its first read");
+        FrameModel unchecked;
+        run(1920, 1080, 1, false, unchecked);
+        expect(unchecked.Current().valid() && !unchecked.Current().screen_region,
+               "with the screen challenge unavailable the picture is chosen directly");
+        run(2560, 1440, 4, false, off);
+        expect(!off.Current().valid() && off.RefusedScene().why == FrameModel::NoScene::Multisampled,
+               "the reason is known whether or not the screen challenge is available");
+    }
+
     std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: DX11 frame model\n", g_failed);
     return g_failed ? 1 : 0;
 }

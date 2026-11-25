@@ -50,6 +50,7 @@ na_host_test(gpu_breadcrumbs_test SOURCES gpu_breadcrumbs_test.cpp LIBS host_dia
 na_host_test(mem_alloc_test SOURCES mem_alloc_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(xegtao_test SOURCES xegtao_test.cpp LIBS host_dx12 dxgi LABELS gpu)
 na_host_test(viewport_jitter_test SOURCES viewport_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
+na_host_test(shader_depth_jitter_test SOURCES shader_depth_jitter_test.cpp LIBS host_observe_producers dxgi d3dcompiler LABELS gpu)
 na_host_test(scene_viewport_jitter_test SOURCES scene_viewport_jitter_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
 if(NA_HAVE_NGX_SDK)
   # Optional real-DX12 CPU command-tracking benchmark; no model evaluation.
@@ -114,7 +115,9 @@ na_host_test(j2_flow_shaders_compile_test SOURCES j2_flow_shaders_compile_test.c
 # The referee on the card end to end (not labelled gpu: it runs on WARP in CI).
 na_host_test(referee_gpu_test SOURCES referee_gpu_test.cpp LIBS host_capture host_settings d3dcompiler dxgi)
 add_test(NAME host_referee_jitter_gpu_test COMMAND referee_gpu_test --jitter)
-set_tests_properties(host_referee_jitter_gpu_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+add_test(NAME host_referee_local_jitter_gpu_test COMMAND referee_gpu_test --local-jitter)
+add_test(NAME host_referee_quarter_jitter_gpu_test COMMAND referee_gpu_test --quarter)
+set_tests_properties(host_referee_jitter_gpu_test host_referee_local_jitter_gpu_test host_referee_quarter_jitter_gpu_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(pbz_settings_test SOURCES pbz_settings_test.cpp LIBS host_settings)
 na_host_test(scene_group_test SOURCES scene_group_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
 na_host_test(depth_restore_test SOURCES depth_restore_test.cpp LIBS host_scene_scale d3d12 dxgi d3dcompiler)
@@ -135,7 +138,7 @@ na_host_test(render_scale_patch_test SOURCES render_scale_patch_test.cpp)
 na_host_test(settings_read_hook_test SOURCES settings_read_hook_test.cpp LIBS host_scale)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
-na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp LIBS host_dx12)
+na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12)
 
 # Fake NGX runtime (the one non-driver name ngx_observe accepts).
 add_library(nvngx_stub SHARED ngx_stub.cpp)
@@ -198,10 +201,12 @@ set_target_properties(sl_proxy_missing_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY 
 add_dependencies(sl_proxy_missing_test NeuralAliasSLProxy sl_interposer_real_min)
 
 
+na_host_test(lighting_capture_test SOURCES lighting_capture_test.cpp LIBS host_capture imgui
+             ARGS "${CMAKE_CURRENT_BINARY_DIR}/lighting-trial-out")
 na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
              ARGS "${CMAKE_CURRENT_BINARY_DIR}/capture-test-out")
 
-na_host_test(overlay_test SOURCES overlay_test.cpp LIBS host_dx12 user32)
+na_host_test(overlay_test SOURCES overlay_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12 user32)
 na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32 d3d11)
 add_test(NAME host_overlay_bootstrap_automatic_test COMMAND overlay_bootstrap_test --automatic)
 set_tests_properties(host_overlay_bootstrap_automatic_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS host)
@@ -289,7 +294,8 @@ if(NA_HAVE_NGX_SDK)
   add_test(NAME host_j2_native_scale_late_composite_se5_replace_test COMMAND j2_live_test --native-scale-late-composite-se5-replace)
   add_test(NAME host_j2_native_scale_late_composite_se5_stale_test COMMAND j2_live_test --native-scale-late-composite-se5-stale)
   add_test(NAME host_j2_native_dlaa_screen_test COMMAND j2_live_test --native-scale-late-composite-se5-bindless-native-dlaa)
-  set_tests_properties(host_j2_native_dlaa_screen_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
+  add_test(NAME host_j2_centered_native_dlaa_test COMMAND j2_live_test --native-scale-late-composite-se5-bindless-native-dlaa-centered)
+  set_tests_properties(host_j2_native_dlaa_screen_test host_j2_centered_native_dlaa_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_j2_native_dlaa_rotating_lighting_test COMMAND j2_live_test --native-scale-late-composite-se5-bindless-native-dlaa-rotating-lighting)
   set_tests_properties(host_j2_native_dlaa_rotating_lighting_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_j2_native_scale_late_composite_se5_bindless_test COMMAND j2_live_test --native-scale-late-composite-se5-bindless)
@@ -491,6 +497,8 @@ if(TARGET host_native11)
   na_host_test(native11_draw_replay_test SOURCES native11/draw_replay_test.cpp LIBS host_native11 d3d11 d3dcompiler)
   add_test(NAME host_native11_screen_check_warp_test COMMAND native11_provider_test --screen-check-warp)
   set_tests_properties(host_native11_screen_check_warp_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host")
+  add_test(NAME host_native11_centered_scene_test COMMAND native11_provider_test --centered-scene)
+  set_tests_properties(host_native11_centered_scene_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_native11_screen_check_test COMMAND native11_provider_test --screen-check)
   set_tests_properties(host_native11_screen_check_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   add_test(NAME host_native11_adaptive_screen_test COMMAND native11_provider_test --adaptive-screen)

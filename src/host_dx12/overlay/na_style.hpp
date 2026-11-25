@@ -3,17 +3,17 @@
 // do not fork per route. Header-only so Route B can include it without
 // linking Route A code.
 //
-// A30 direction (Astra's redesign, approved by the user): quiet dark
-// surfaces, readable type, generous spacing, one restrained blue selection
-// accent. Premium through alignment and clarity; no glass, charts, gradients
-// or a coding-tool look. One logo, in the title bar. Every metric derives
-// from one scale factor (SetScale, default 1.25 since A42) plus an optional
+// Both routes share graphite surfaces, warm text, and one italic wordmark.
+// Metrics use one scale factor (SetScale, default 1.25 since A42) plus an optional
 // "Bold" text weight preference (A44; it replaced the earlier "Large" size).
 // Colour always accompanies words: no state is conveyed by colour alone.
 #pragma once
 
 #include <imgui.h>
+#include <windows.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace na::ui {
@@ -25,54 +25,43 @@ inline ImVec4 Rgb(unsigned hex, float a = 1.0f)
 }
 
 // ---- Tokens (DESIGN.md "Tokens and layout") ----
-inline const ImVec4 kBg       = Rgb(0x191B1F);        // window
-inline const ImVec4 kBgNav    = Rgb(0x16181B);        // navigation column
-inline const ImVec4 kBgRow    = Rgb(0x202328);        // rows / groups
-inline const ImVec4 kBgRaised = Rgb(0x2B2E34);        // buttons, inputs
-inline const ImVec4 kBgHover  = Rgb(0x343840);
-inline const ImVec4 kBgCard   = Rgb(0x23262B);        // mode cards
-inline const ImVec4 kBgCardOn = Rgb(0x283548);        // selected card
-inline const ImVec4 kBgNavOn  = Rgb(0x2A3039);        // current page
-inline const ImVec4 kLine     = Rgb(0x373B42);
-inline const ImVec4 kLineSoft = Rgb(0x505660);
-inline const ImVec4 kText     = Rgb(0xF1F2F4);
-inline const ImVec4 kTextDim  = Rgb(0xB2B7C0);
-inline const ImVec4 kAccent   = Rgb(0x85B5FF);        // selection
-inline const ImVec4 kFocus    = Rgb(0xA9CDFF);        // keyboard/controller focus
-inline const ImVec4 kSwitchOn = Rgb(0x5283D0);
-inline const ImVec4 kSwitchOff= Rgb(0x59616B);
+inline const ImVec4 kBg       = Rgb(0x111716);        // window
+inline const ImVec4 kBgNav    = Rgb(0x151C1A);        // navigation and title bar
+inline const ImVec4 kBgRow    = Rgb(0x1E2524);        // rows / groups
+inline const ImVec4 kBgRaised = Rgb(0x2E3733);        // buttons, inputs
+inline const ImVec4 kBgHover  = Rgb(0x464942);
+inline const ImVec4 kBgCard   = Rgb(0x30322E);        // mode cards
+inline const ImVec4 kBgCardOn = Rgb(0x37493E);        // selected card
+inline const ImVec4 kBgNavOn  = Rgb(0x323C35);        // current page
+inline const ImVec4 kLine     = Rgb(0x28302E);
+inline const ImVec4 kLineSoft = Rgb(0x62675F);
+inline const ImVec4 kText     = Rgb(0xF2F2EA);
+inline const ImVec4 kTextDim  = Rgb(0xB8C2BB);
+inline const ImVec4 kAccent   = Rgb(0xB7CF97);        // selection
+inline const ImVec4 kFocus    = Rgb(0xC7E4CE);        // keyboard/controller focus
+inline const ImVec4 kSwitchOn = Rgb(0x729B82);
+inline const ImVec4 kSwitchOff= Rgb(0x5E655F);
 inline const ImVec4 kOk       = Rgb(0x9BDBB5);        // "good", with words
-inline const ImVec4 kWarn     = Rgb(0xF1CA8A);        // "attention", with words
+inline const ImVec4 kWarn     = Rgb(0xE2C685);        // "attention", with words
 inline const ImVec4 kError    = Rgb(0xFF8A94);        // failures, with words
 // Compatibility aliases (earlier tokens still referenced by route code).
 inline const ImVec4 kBgPanel  = kBg;
 inline const ImVec4 kSignal   = kAccent;
 inline const ImVec4 kSignalDim= kSwitchOn;
 
-// ---- Base metrics at scale 1.0 (default scale 1.25 since A42). ----
-// A44: every text size is 25 % smaller than A30's (22/20/16/39/27), per the
-// user after session 7; the default window follows, and the window is now
-// movable and resizable down to kBaseMinWindow* (text does not shrink with
-// it; the layout reflows: navigation moves on top below kBaseNarrowWidth,
-// mode cards go 2x2, rows wrap their text).
-constexpr float kBaseBodyPx = 16.5f;
-constexpr float kBaseLabelPx = 15.0f;
-constexpr float kBaseHelpPx = 12.0f;
-constexpr float kBaseTitlePx = 29.0f;   // page heading
-constexpr float kBaseBrandPx = 20.0f;   // "NeuralAlias" in the title bar
-constexpr float kBaseWindowWidth = 1120.0f;
-constexpr float kBaseWindowHeight = 640.0f;
-constexpr float kBaseMinWindowWidth = 560.0f;
-constexpr float kBaseMinWindowHeight = 380.0f;
-constexpr float kBaseNavWidth = 200.0f;
-constexpr float kBaseNarrowWidth = 700.0f;  // below: nav on top (cards go 2x2 by available width)
-constexpr float kRadiusWindow = 22.0f, kRadiusGroup = 12.0f, kRadiusControl = 10.0f;
+constexpr float kBaseBodyPx = 16.5f * 1.60f, kBaseLabelPx = 15.0f * 1.60f, kBaseHelpPx = 12.0f * 1.60f;
+constexpr float kBaseTitlePx = 29.0f * 1.60f, kBaseBrandPx = 20.0f * 2.25f;
+constexpr float kBaseWindowWidth = 1160.0f, kBaseWindowHeight = 760.0f;
+constexpr float kBaseMinWindowWidth = 560.0f, kBaseMinWindowHeight = 380.0f;
+constexpr float kRadiusWindow = 22.0f, kRadiusGroup = 15.0f, kRadiusControl = 9.0f;
 
 struct Config {
     float scale = 1.25f;  // A42: the user asked for half of the 2.5 default after session 6
     bool bold = false;    // A44: Preferences > Text weight: Bold (body text set in the heavier face)
-    char font_body[260] = "C:\\Windows\\Fonts\\Inter-Regular.ttf";
-    char font_title[260] = "C:\\Windows\\Fonts\\Inter-SemiBold.ttf";
+    char font_body[260]{};
+    char font_title[260]{};
+    ImFont* display = nullptr;
+    ImFont* wordmark_italic = nullptr;
     ImFont* body = nullptr;
     ImFont* title = nullptr;
 };
@@ -119,34 +108,64 @@ inline float WindowWidth() { return S(kBaseWindowWidth); }
 inline float WindowHeight() { return S(kBaseWindowHeight); }
 inline float MinWindowWidth() { return S(kBaseMinWindowWidth); }
 inline float MinWindowHeight() { return S(kBaseMinWindowHeight); }
-inline float NavWidth() { return S(kBaseNavWidth); }
 // The face used for running text: the regular face, or the heavier title
 // face when the user chose Bold (A44).
 inline ImFont* TextFace() { return (Cfg().bold && Cfg().title) ? Cfg().title : Cfg().body; }
 
 // Call once after ImGui::CreateContext(), before the backend init. ImGui
 // 1.92 fonts are dynamically sized, so one face per weight is enough.
+inline ImFont* BundledPoise(WORD resource, const char* name, float size)
+{
+    // The same shared style runs in either proxy. Get the module containing this code.
+    static const int module_anchor = 0;
+    HMODULE module{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&module_anchor), &module)) return nullptr;
+    HRSRC entry = FindResourceW(module, MAKEINTRESOURCEW(resource), MAKEINTRESOURCEW(10));
+    if (!entry) return nullptr;
+    HGLOBAL handle = LoadResource(module, entry);
+    void* bytes = handle ? LockResource(handle) : nullptr;
+    const DWORD length = SizeofResource(module, entry);
+    if (!bytes || !length) return nullptr;
+    ImFontConfig font;
+    font.FontDataOwnedByAtlas = false; // the module owns the immutable bytes
+    std::snprintf(font.Name, sizeof font.Name, "%s", name);
+    return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(bytes, static_cast<int>(length), size, &font);
+}
+
 inline void LoadFonts()
 {
     ImGuiIO& io = ImGui::GetIO();
     Config& c = Cfg();
-    c.body = io.Fonts->AddFontFromFileTTF(c.font_body, S(kBaseBodyPx));
-    if (!c.body) c.body = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", S(kBaseBodyPx));
-    c.title = io.Fonts->AddFontFromFileTTF(c.font_title, S(kBaseTitlePx));
-    if (!c.title) c.title = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuisb.ttf", S(kBaseTitlePx));
-    if (!c.title) c.title = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", S(kBaseTitlePx));
+    c.body = c.font_body[0] ? io.Fonts->AddFontFromFileTTF(c.font_body, BodyPx()) : nullptr;
+    if (!c.body) c.body = BundledPoise(111, "Poise Regular", BodyPx());
+    c.title = c.font_title[0] ? io.Fonts->AddFontFromFileTTF(c.font_title, TitlePx()) : nullptr;
+    c.display = c.title ? c.title : BundledPoise(110, "Poise Light", TitlePx());
+    if (!c.title) c.title = BundledPoise(112, "Poise Medium", LabelPx());
     if (!c.body) {
         ImFontConfig fc;
         fc.SizePixels = S(kBaseBodyPx);
         c.body = io.Fonts->AddFontDefault(&fc);
     }
     if (!c.title) c.title = c.body;
+    if (!c.display) c.display = c.title;
+    // Use the installed italic face for the signature only. A slanted Poise fallback
+    // keeps the wordmark available on Windows installations without Georgia.
+    char windows[MAX_PATH]{};
+    const UINT length = GetWindowsDirectoryA(windows, MAX_PATH);
+    c.wordmark_italic = nullptr;
+    if (length && length < MAX_PATH - 20) {
+        strcat_s(windows, "\\Fonts\\georgiai.ttf");
+        if (GetFileAttributesA(windows) != INVALID_FILE_ATTRIBUTES)
+            c.wordmark_italic = io.Fonts->AddFontFromFileTTF(windows, BrandPx());
+    }
     io.FontDefault = c.body;
 }
 
 inline void ApplyStyle()
 {
     ImGuiStyle& s = ImGui::GetStyle();
+    s.DisabledAlpha = 0.62f;
     s.WindowRounding = S(kRadiusWindow);
     s.ChildRounding = S(kRadiusGroup);
     s.FrameRounding = S(kRadiusControl);
@@ -167,6 +186,7 @@ inline void ApplyStyle()
 
     ImVec4* c = s.Colors;
     c[ImGuiCol_WindowBg] = kBg;
+    c[ImGuiCol_TextSelectedBg] = kBgHover;
     c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_PopupBg] = kBgRaised;
     c[ImGuiCol_Border] = kLine;
@@ -195,6 +215,9 @@ inline void ApplyStyle()
     c[ImGuiCol_ScrollbarGrab] = kLine;
     c[ImGuiCol_ScrollbarGrabHovered] = kLineSoft;
     c[ImGuiCol_ScrollbarGrabActive] = kAccent;
+    c[ImGuiCol_ResizeGrip] = kLine;
+    c[ImGuiCol_ResizeGripHovered] = kLineSoft;
+    c[ImGuiCol_ResizeGripActive] = kFocus;
     c[ImGuiCol_NavCursor] = kFocus;
     c[ImGuiCol_TableBorderLight] = kLine;
     c[ImGuiCol_TableBorderStrong] = kLine;
@@ -205,7 +228,7 @@ inline void PushBody() { ImGui::PushFont(TextFace(), BodyPx()); }
 inline void PushLabel() { ImGui::PushFont(TextFace(), LabelPx()); }
 inline void PushLabelStrong() { ImGui::PushFont(Cfg().title, LabelPx()); }
 inline void PushHelp() { ImGui::PushFont(TextFace(), HelpPx()); }
-inline void PushTitle() { ImGui::PushFont(Cfg().title, TitlePx()); }
+inline void PushTitle() { ImGui::PushFont(Cfg().display, TitlePx()); }
 inline void PopFont() { ImGui::PopFont(); }
 
 // Small uppercase-ish line above a page heading ("IMAGE QUALITY").
@@ -262,7 +285,9 @@ inline void StatusLine(int state, const char* text)
 {
     ImVec4 c = state == 1 ? kOk : (state == 2 ? kWarn : kTextDim);
     PushLabel();
+    ImGui::PushTextWrapPos(0.f);
     ImGui::TextColored(c, "%s", text);
+    ImGui::PopTextWrapPos();
     PopFont();
 }
 
@@ -278,12 +303,12 @@ inline void StatusBanner(int state, const char* text)
     PopFont();
     float h = ts.y + pad * 2;
     ImVec2 p = ImGui::GetCursorScreenPos();
-    ImU32 border = ImGui::ColorConvertFloat4ToU32(state == 2 ? Rgb(0x635139) : kLine);
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(kBgRow), S(kRadiusGroup));
+    ImU32 border = ImGui::GetColorU32(state == 2 ? Rgb(0x635139) : kLine);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(kBgRow), S(kRadiusGroup));
     dl->AddRect(p, ImVec2(p.x + w, p.y + h), border, S(kRadiusGroup));
     ImVec4 dotc = state == 1 ? kOk : (state == 2 ? kWarn : kTextDim);
     float r = S(4.5f);
-    dl->AddCircleFilled(ImVec2(p.x + pad + r, p.y + h * 0.5f), r, ImGui::ColorConvertFloat4ToU32(dotc));
+    dl->AddCircleFilled(ImVec2(p.x + pad + r, p.y + h * 0.5f), r, ImGui::GetColorU32(dotc));
     ImGui::SetCursorScreenPos(ImVec2(p.x + pad + S(24), p.y + pad));
     PushLabel();
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w - pad * 2 - S(24));
@@ -328,8 +353,8 @@ inline RowState& Row_()
 inline void BeginRow(const char* label, const char* help, float control_w, const char* tooltip = nullptr)
 {
     float avail = ImGui::GetContentRegionAvail().x;
-    float text_w = avail - control_w - S(24);
-    if (text_w < avail * 0.4f) text_w = avail * 0.4f;
+    const bool stack = control_w > 0 && avail - control_w < S(230);
+    const float text_w = stack ? avail : (std::max)(1.0f, avail - control_w - S(24));
     ImGui::PushID(label);
     Row_().x = ImGui::GetCursorScreenPos().x;
     ImGui::BeginGroup();
@@ -349,8 +374,12 @@ inline void BeginRow(const char* label, const char* help, float control_w, const
     ImGui::EndGroup();
     ImVec2 grp_min = ImGui::GetItemRectMin(), grp_max = ImGui::GetItemRectMax();
     Row_().bottom = grp_max.y;
-    ImGui::SameLine();
-    ImGui::SetCursorScreenPos(ImVec2(grp_min.x + avail - control_w, grp_min.y));
+    if (stack) {
+        ImGui::SetCursorScreenPos(ImVec2(grp_min.x, grp_max.y + S(7)));
+    } else {
+        ImGui::SameLine();
+        ImGui::SetCursorScreenPos(ImVec2(grp_min.x + avail - control_w, grp_min.y));
+    }
 }
 inline void EndRow()
 {
@@ -360,6 +389,31 @@ inline void EndRow()
     ImGui::SetCursorScreenPos(ImVec2(Row_().x, bottom + ImGui::GetStyle().ItemSpacing.y));
     ImGui::Dummy(ImVec2(0, 0));
     ImGui::PopID();
+}
+
+// The stock integer slider owns editing, navigation and its grab. Paint a tactile track
+// over it using the same integer endpoints, leaving its keyboard focus outline visible.
+inline void DrawSharpnessTrack(int percent, bool show_label)
+{
+    const ImVec2 lo = ImGui::GetItemRectMin(), hi = ImGui::GetItemRectMax();
+    const float width = hi.x - lo.x;
+    if (width < S(60)) return;
+    const float grab = (std::min)(width - 4.f, (std::max)(ImGui::GetStyle().GrabMinSize, (width - 4.f) / 101.f));
+    const float start = lo.x + 2.f + grab * .5f, end = hi.x - 2.f - grab * .5f;
+    const float x = start + (end - start) * (percent / 100.f);
+    const float r = S(5), y = hi.y - r - S(4);
+    auto* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(lo, hi, ImGui::GetColorU32(kBgRaised), S(kRadiusControl));
+    dl->AddLine({start, y}, {end, y}, ImGui::GetColorU32(kLineSoft), S(2));
+    dl->AddLine({start, y}, {x, y}, ImGui::GetColorU32(kAccent), S(2));
+    dl->AddCircleFilled({x, y + S(1)}, r, ImGui::GetColorU32(kBgNav));
+    dl->AddCircleFilled({x, y}, r, ImGui::GetColorU32(Rgb(0xC7C2B4)));
+    dl->AddLine({x - .55f*r, y - .48f*r}, {x + .55f*r, y - .48f*r}, ImGui::GetColorU32(kText));
+    char value[8];
+    std::snprintf(value, sizeof(value), "%d%%", percent);
+    const float label_y = lo.y + S(2);
+    dl->AddText({hi.x - S(8) - ImGui::CalcTextSize(value).x, label_y}, ImGui::GetColorU32(kText), value);
+    if (show_label) dl->AddText({lo.x + S(8), label_y}, ImGui::GetColorU32(kText), "Sharpness");
 }
 
 // Small outlined tag ("Unavailable", "Planned"). Width for BeginRow via BadgeWidth.
@@ -377,8 +431,8 @@ inline void Badge(const char* text)
     ImVec2 ts = ImGui::CalcTextSize(text);
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImVec2 sz(ts.x + S(18), ts.y + S(8));
-    dl->AddRect(p, ImVec2(p.x + sz.x, p.y + sz.y), ImGui::ColorConvertFloat4ToU32(kLineSoft), S(6));
-    dl->AddText(ImVec2(p.x + S(9), p.y + S(4)), ImGui::ColorConvertFloat4ToU32(kTextDim), text);
+    dl->AddRect(p, ImVec2(p.x + sz.x, p.y + sz.y), ImGui::GetColorU32(kLineSoft), S(6));
+    dl->AddText(ImVec2(p.x + S(9), p.y + S(4)), ImGui::GetColorU32(kTextDim), text);
     ImGui::Dummy(sz);
     PopFont();
 }
@@ -405,17 +459,17 @@ inline bool Switch(const char* id, bool* value)
     float r = h * 0.5f;
     ImVec4 bgc = *value ? kSwitchOn : kSwitchOff;
     if (disabled) bgc.w = 0.5f;
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(bgc), r);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(bgc), r);
     if (ImGui::IsItemFocused() || ImGui::IsItemHovered())
         dl->AddRect(ImVec2(p.x - S(3), p.y - S(3)), ImVec2(p.x + w + S(3), p.y + h + S(3)),
-                    ImGui::ColorConvertFloat4ToU32(kFocus), r + S(3), S(2));
+                    ImGui::GetColorU32(kFocus), r + S(3), S(2));
     float pad = S(3);
     float kd = h - 2 * pad;
     float kx = *value ? p.x + w - pad - kd : p.x + pad;
     ImVec4 knob = Rgb(0xF5F6F8);
     if (disabled) knob.w = 0.6f;
     dl->AddCircleFilled(ImVec2(kx + kd * 0.5f, p.y + pad + kd * 0.5f), kd * 0.5f,
-                        ImGui::ColorConvertFloat4ToU32(knob));
+                        ImGui::GetColorU32(knob));
     ImGui::PopID();
     return clicked;
 }
@@ -463,14 +517,17 @@ inline bool ModeCard(const char* title, const char* line1, const char* line2,
                      bool selected, float w)
 {
     ImGui::PushID(title);
-    PushLabel();
-    float title_h = ImGui::GetTextLineHeight();
+    const float pad = S(14);
+    const float text_w = (std::max)(1.f, w - pad * 2);
+    const float title_w = (std::max)(1.f, text_w - S(13));
+    PushLabelStrong();
+    const float title_h = ImGui::CalcTextSize(title, nullptr, false, title_w).y;
     PopFont();
     PushHelp();
-    float help_h = ImGui::GetTextLineHeight();
+    const float line1_h = ImGui::CalcTextSize(line1, nullptr, false, text_w).y;
+    const float line2_h = ImGui::CalcTextSize(line2, nullptr, false, text_w).y;
     PopFont();
-    float pad = S(14);
-    float h = pad + title_h + S(8) + help_h * 2 + S(4) + pad;
+    const float h = 2 * pad + title_h + S(8) + line1_h + S(4) + line2_h;
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool clicked = ImGui::InvisibleButton("##card", ImVec2(w, h));
     bool disabled = (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled) != 0;
@@ -479,30 +536,30 @@ inline bool ModeCard(const char* title, const char* line1, const char* line2,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec4 bg = selected ? kBgCardOn : (hovered ? kBgHover : kBgCard);
     if (disabled) bg.w = 0.65f;
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(bg), S(kRadiusGroup));
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(bg), S(kRadiusGroup));
     dl->AddRect(p, ImVec2(p.x + w, p.y + h),
-                ImGui::ColorConvertFloat4ToU32(selected ? kAccent : kLine), S(kRadiusGroup),
+                ImGui::GetColorU32(selected ? kAccent : kLine), S(kRadiusGroup),
                 selected ? S(2) : 1.0f);
     if (focused)
         dl->AddRect(ImVec2(p.x - S(3), p.y - S(3)), ImVec2(p.x + w + S(3), p.y + h + S(3)),
-                    ImGui::ColorConvertFloat4ToU32(kFocus), S(kRadiusGroup) + S(3), S(2));
+                    ImGui::GetColorU32(kFocus), S(kRadiusGroup) + S(3), S(2));
     ImVec4 tc = kText, hc = kTextDim;
     if (disabled) { tc.w = 0.65f; hc.w = 0.65f; }
     float x = p.x + pad, y = p.y + pad;
     PushLabelStrong();
-    dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(tc), title);
+    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(x, y), ImGui::GetColorU32(tc), title, nullptr, title_w);
     PopFont();
     y += title_h + S(8);
     PushHelp();
-    dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(hc), line1);
-    y += help_h + S(2);
-    dl->AddText(ImVec2(x, y), ImGui::ColorConvertFloat4ToU32(hc), line2);
+    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(x, y), ImGui::GetColorU32(hc), line1, nullptr, text_w);
+    y += line1_h + S(4);
+    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(x, y), ImGui::GetColorU32(hc), line2, nullptr, text_w);
     PopFont();
     if (selected) {
         // Check mark drawn with lines (no glyph dependency).
         float cs = S(11);
         ImVec2 c(p.x + w - pad - cs, p.y + S(11));
-        ImU32 col = ImGui::ColorConvertFloat4ToU32(kAccent);
+        ImU32 col = ImGui::GetColorU32(kAccent);
         dl->AddLine(ImVec2(c.x, c.y + cs * 0.55f), ImVec2(c.x + cs * 0.38f, c.y + cs), col, S(2));
         dl->AddLine(ImVec2(c.x + cs * 0.38f, c.y + cs), ImVec2(c.x + cs, c.y + cs * 0.1f), col, S(2));
     }
@@ -510,31 +567,27 @@ inline bool ModeCard(const char* title, const char* line1, const char* line2,
     return clicked;
 }
 
-// Navigation entry. Returns true when clicked. w <= 0 sizes to the label.
+// Tabs share one toolbar; the selected page has an ivory capsule.
 inline float NavButtonWidth(const char* label)
 {
     PushLabel();
-    float w = ImGui::CalcTextSize(label).x + S(32);
+    const float width = ImGui::CalcTextSize(label).x + S(30);
     PopFont();
-    return w;
+    return width;
 }
-inline bool NavButton(const char* label, bool current, float w)
+inline bool NavButton(const char* label, bool current, float width)
 {
-    if (w <= 0) w = NavButtonWidth(label);
-    ImGui::PushID(label);
     PushLabel();
-    float h = ImGui::GetTextLineHeight() + S(24);
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    bool clicked = ImGui::InvisibleButton("##nav", ImVec2(w, h));
-    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const float height = ImGui::GetTextLineHeight() + S(12);
+    const bool clicked = ImGui::InvisibleButton(label, {width,height}, ImGuiButtonFlags_EnableNav);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
     if (current || ImGui::IsItemHovered())
-        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
-                          ImGui::ColorConvertFloat4ToU32(current ? kBgNavOn : kBgHover), S(kRadiusControl));
-    if (ImGui::IsItemFocused())
-        dl->AddRect(p, ImVec2(p.x + w, p.y + h), ImGui::ColorConvertFloat4ToU32(kFocus), S(kRadiusControl), S(2));
-    dl->AddText(ImVec2(p.x + S(16), p.y + S(12)), ImGui::ColorConvertFloat4ToU32(current ? kText : kTextDim), label);
+        draw->AddRectFilled(pos, {pos.x+width,pos.y+height},
+            ImGui::GetColorU32(current ? kBgNavOn : kBgHover), height/2);
+    if (ImGui::IsItemFocused()) draw->AddRect(pos,{pos.x+width,pos.y+height},ImGui::GetColorU32(kFocus),height/2);
+    draw->AddText({pos.x+S(15),pos.y+S(6)}, ImGui::GetColorU32(current ? kText : kTextDim),label);
     PopFont();
-    ImGui::PopID();
     return clicked;
 }
 
@@ -568,52 +621,43 @@ inline bool BeginDetails(const char* label)
     return open;
 }
 
-// The logo: a three-step pixel staircase. Used ONCE, in the title bar.
-inline void Logo(ImVec4 color, float size)
-{
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float line_h = ImGui::GetTextLineHeight();
-    p.y += (line_h - size) * 0.5f;
-    float u = size / 3.0f;
-    ImU32 col = ImGui::ColorConvertFloat4ToU32(color);
-    dl->AddRectFilled(ImVec2(p.x, p.y + 2 * u), ImVec2(p.x + 3 * u, p.y + 3 * u), col);
-    dl->AddRectFilled(ImVec2(p.x + u, p.y + u), ImVec2(p.x + 3 * u, p.y + 2 * u), col);
-    dl->AddRectFilled(ImVec2(p.x + 2 * u, p.y), ImVec2(p.x + 3 * u, p.y + u), col);
-    ImGui::Dummy(ImVec2(size, line_h));
-    ImGui::SameLine(0.0f, S(12.0f));
-}
-
-// Title bar: logo, product name, optional game name, close button at right.
-// Returns true when the close button was pressed.
+// Render the product name as one italic run so both halves share the same face and spacing.
 inline bool TitleBar(const char* game_name)
 {
-    ImGui::PushFont(Cfg().title, BrandPx());
-    Logo(Rgb(0xDFE5EF), BrandPx() * 0.8f);
-    ImGui::TextColored(kText, "NeuralAlias");
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float size = BrandPx(), close_width = S(36);
+    const ImU32 ink = ImGui::GetColorU32(kText);
+    constexpr char wordmark[] = "NeuralAlias";
+    ImGui::PushFont(Cfg().wordmark_italic ? Cfg().wordmark_italic : Cfg().display, size);
+    const int begin = draw->VtxBuffer.Size;
+    draw->AddText(pos, ink, wordmark);
+    if (!Cfg().wordmark_italic) {
+        for (int i = begin; i < draw->VtxBuffer.Size; ++i)
+            draw->VtxBuffer[i].pos.x += (pos.y + size*.80f - draw->VtxBuffer[i].pos.y)*.20f;
+    }
+    const float brand_width = ImGui::CalcTextSize(wordmark).x + S(10);
     ImGui::PopFont();
-    if (game_name && game_name[0]) {
-        ImGui::SameLine(0.0f, S(18));
+    const float close_x = pos.x + width - close_width;
+    if (game_name && *game_name) {
         PushHelp();
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y), ImVec2(p.x, p.y + BrandPx()),
-                                            ImGui::ColorConvertFloat4ToU32(kLine));
-        ImGui::SetCursorScreenPos(ImVec2(p.x + S(18), p.y + (BrandPx() - ImGui::GetTextLineHeight()) * 0.5f));
-        ImGui::TextColored(kTextDim, "%s", game_name);
+        const float name_width = ImGui::CalcTextSize(game_name).x;
+        const float x = close_x - S(18) - name_width;
+        if (x >= pos.x + brand_width + S(12))
+            draw->AddText({x,pos.y+(size-HelpPx())*.5f}, ImGui::GetColorU32(kTextDim), game_name);
         PopFont();
     }
-    // Close button, right-aligned in the window.
-    float bw = S(44);
-    ImGui::SameLine(ImGui::GetWindowWidth() - S(30) - bw);
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    bool close = ImGui::InvisibleButton("##close", ImVec2(bw, BrandPx()));
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    if (ImGui::IsItemHovered() || ImGui::IsItemFocused())
-        dl->AddRectFilled(p, ImVec2(p.x + bw, p.y + BrandPx()), ImGui::ColorConvertFloat4ToU32(kBgHover), S(kRadiusControl));
-    float cx = p.x + bw * 0.5f, cy = p.y + BrandPx() * 0.5f, a = S(7);
-    ImU32 col = ImGui::ColorConvertFloat4ToU32(kTextDim);
-    dl->AddLine(ImVec2(cx - a, cy - a), ImVec2(cx + a, cy + a), col, S(2));
-    dl->AddLine(ImVec2(cx - a, cy + a), ImVec2(cx + a, cy - a), col, S(2));
+    ImGui::SetCursorScreenPos({close_x,pos.y+(size-close_width)*.5f});
+    const bool close = ImGui::InvisibleButton("Close menu", {close_width,close_width}, ImGuiButtonFlags_EnableNav);
+    const ImVec2 center{close_x+close_width*.5f,pos.y+size*.5f};
+    draw->AddCircleFilled(center,close_width*.46f,ImGui::GetColorU32(ImGui::IsItemHovered() ? kBgHover : kBgRaised));
+    const float r=S(5.5f);
+    draw->AddLine({center.x-r,center.y-r},{center.x+r,center.y+r},ink,S(1.6f));
+    draw->AddLine({center.x-r,center.y+r},{center.x+r,center.y-r},ink,S(1.6f));
+    if (ImGui::IsItemFocused()) draw->AddCircle(center,close_width*.48f,ink);
+    ImGui::SetCursorScreenPos({pos.x,pos.y});
+    ImGui::Dummy({brand_width,size});
     return close;
 }
 

@@ -1528,7 +1528,9 @@ int main()
         check(jitter.Amount() == normal_jitter, "a camera pan without phase-locked displacement cannot change jitter");
         edge.locked = true;
         jitter.Observe(edge, normal_jitter, 200);
-        check(jitter.Amount() == reduced_jitter, "the measured displayed edge starts a reduced-jitter trial");
+        check(jitter.Amount() == normal_jitter, "a single window at a displayed edge cannot change jitter");
+        jitter.Observe(edge, normal_jitter, 250);
+        check(jitter.Amount() == reduced_jitter, "the repeated displayed edge starts a reduced-jitter trial");
         auto replacement = edge;
         replacement.shift = .13f;
         replacement.image.fill(.4f);
@@ -1546,10 +1548,41 @@ int main()
               "proof of visible bypass restores the ordinary sample");
         JitterTrial blur;
         blur.Observe(edge, normal_jitter, 100);
+        blur.Observe(edge, normal_jitter, 150);
         replacement.detail = .11f;
         blur.Observe(replacement, reduced_jitter, 200);
         blur.Observe(replacement, reduced_jitter, 300);
         check(blur.Current() == JitterTrial::Phase::Cooldown, "reduced wobble cannot compensate for blur");
+        JitterTrial::Measurement localized = edge;
+        localized.field = true;
+        localized.witnesses = {{3,.29f,.2f},{15,.32f,.2f}};
+        localized.controls.output = 7;
+        for (unsigned i=0;i<3;++i) {
+            localized.controls.at[i] = {int(80*i),160};
+            localized.controls.detail[i]=.3f;
+        }
+        for (bool other_edge_worsens : {false,true}) {
+            JitterTrial guard;
+            guard.Observe(localized,normal_jitter,100);
+            check(guard.Current() == JitterTrial::Phase::Confirm && guard.Amount() == normal_jitter,
+                  "a single mixed-raster window keeps the original jitter");
+            guard.Observe(localized,normal_jitter,200);
+            check(guard.Amount() == reduced_jitter, "a repeated mixed-raster defect can start a comparison");
+            auto improved=localized;
+            improved.shift=.12f;
+            improved.regional_checks=improved.regional_improved=2;
+            if (other_edge_worsens) improved.regional_worse=1;
+            else improved.controls.detail[1]=.24f;
+            guard.Observe(improved,reduced_jitter,300);
+            guard.Observe(improved,reduced_jitter,400);
+            check(guard.Current()==JitterTrial::Phase::Cooldown && guard.Amount()==normal_jitter,
+                  "a steadier target cannot excuse a worsening edge or a softer control elsewhere");
+            guard.Tick(31000);
+            for (auto& pixel : localized.image) pixel += .23f;
+            guard.Observe(localized,normal_jitter,31100);
+            check(guard.Current() == JitterTrial::Phase::Observe && guard.Amount() == normal_jitter,
+                  "a uniform lighting change does not retry a rejected adjustment on the same view");
+        }
         check(VerifiedJitterAmount(50, .11f, .13f, .11f, .13f) == 50 &&
               VerifiedJitterAmount(50, .11f, .13f, 0.f, 0.f) == 0,
               "only the actual raster offset can qualify an amount");

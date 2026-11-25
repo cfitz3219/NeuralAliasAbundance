@@ -1,0 +1,34 @@
+# Camera-independent lighting recordings
+
+Use one unpaused gameplay scene at fixed zoom, preferably with foreground cover and textured distant scenery. Each click closes the overlay. Begin the movement immediately and continue for 15 seconds. The recorder waits three seconds and then takes 30 evaluations. Keep the previous captures when repeating an incomplete condition.
+
+| Recording | Sniper Elite Resistance and Sniper Elite 4 | Three Kingdoms and Pharaoh on a flat strategy map |
+| --- | --- | --- |
+| Still | Stand still with the view fixed. | Hold the view still. |
+| Turn 1 | Stand in place and look diagonally across the scene. Include a small vertical component. | Rotate the view across the map. Include tilt if the controls permit it. |
+| Turn 2 | From the starting view, make another independent diagonal sweep in the other direction. | Return to the original view and rotate again in the other direction. |
+| Slide | Inapplicable. | Move sideways across the map at fixed heading, pitch and zoom. |
+
+The shooter package displays three buttons. The flat-map package adds Slide. There is one set of captures for all offline methods. Use actual gameplay for SE4. On a map that locks tilt, record the normal turn and let the report identify the missing axis.
+
+Run RESULTS after quitting. Read lighting-tests.json in the timestamped results folder. It groups recordings by executable, build, PID and process start. Each condition needs its own complete 30 frames. Copies of the original raw planes stay in LocalAppData. A prior build's pan remains available as an unlabeled historical capture. A second recording is independent of the first, although both turn fits may use the same map slide for the depth offset.
+
+The readout samples the delivered motion and depth on a grid and robustly fits the eleven-term screen motion polynomial. It assumes a centered perspective with square pixels. The present offline implementation handles registered, unjittered vectors. The later GPU coefficient feed, startup handover, remembered lens, FOV changes and GPU cost still need independent runtime validation. The 50-degree start is a diagnostic comparator in this test. The recorder does not apply it to the picture.
+
+The report keeps a rotation-only focal estimate separate when the two axes agree but translation cannot constrain the depth offset. The lens checks are 1% relative focal error and 10% relative offset error with independent reference, 2% agreement between axes, and 1% focal repeatability. At an effectively zero reference offset, report absolute error and leave the relative verdict unscored. A reference-free repeat measures consistency only. The actual lighting acceptance still requires 99% signed precision, 99% signed recall and 99% of affected pixels within 1% strength per layer per frame. The 0.005-stop tolerance is printed alongside the strict strength score when registered reference and predicted layers are supplied to calibration.py --score. The capture report leaves shadow accuracy unscored until those layers have been evaluated.
+
+The optical-flow model comes from Longuet-Higgins and Prazdny, *The interpretation of a moving retinal image* (1980). The polynomial coordinates and coefficient order match src/core/screen_motion.hpp. The captured field can already include motion reconstruction, so a good fit alone does not qualify the lighting.
+
+## Comparing the contact-shadow designs
+
+One recording feeds all offline passes. Replay Still, Turn 1 and Turn 2 in Resistance, with Slide reserved for a flat strategy map. Compare the unchanged picture, the Intel pass where a camera reference qualifies, and the picture-conditioned contact pass. Run the latter twice on identical frames, with adaptive controls and with settings held at their initial still values. Use the same shadow caps and report the actual mean and worst tile for each. Compare at full motion, watching the same objects for crawling, halos, lingering shadows and settings that pulse after a turn stops. Inspect the selected crops at actual strength as well as the labelled diagnostic map. The controlled equal-geometry test distinguishes selective darkening from simply turning down Intel’s gain.
+
+The 99% camera-independence checks compare equivalent lighting targets with an independent qualified reference. A difference from Intel’s output measures a design difference. It cannot establish accuracy or visual preference. The new stop-layer quality, curved-lighting overlap, and runtime cost have their own tests.
+
+## Image and depth lens experiment on the two Resistance turns
+
+The older motion-vector readout declined both player turns. A second offline estimator matches corners in the color images and reads depth from each frame. It fits rigid rotation and translation at each candidate field of view and depth offset, then scores held-out pixels. It assumes centered perspective, square pixels and fixed intrinsics. This version samples 36–74 degrees on its coarse grid and refines around the minimum. The projection matrices and the delivered motion vectors never enter the estimate.
+
+Run `python image_depth_lens.py OUTPUT CAPTURE [CAPTURE ...]`. The synthetic check recovers a known 60-degree vertical lens and 0.001 offset on a noiseless synthetic point cloud. On the player's recordings, the fine grid gave 50.75 degrees / 0.00005 for Turn 1 (two matching pairs, 79 points total) and 50.50 degrees / 0.00005 for Turn 2 (12 matching pairs, some overlapping). Focal length differed by 0.57% between the runs. Several individual frame pairs favored other values. A first sparse choice of pairs yielded insufficient matching evidence on Turn 1 and a coarser 47.5-degree estimate on Turn 2. Sampling more pairs made an appreciable difference. The first turn is especially weak.
+
+Two older Resistance recordings supply 21 fresh qualified matrices corresponding to a 50.00-degree lens. Their own image motion was too small to produce a blind reading. An additional known-camera Three Kingdoms recording also lacked useful movement. If the player kept exactly the same lens as those older Resistance recordings, the two focal errors would be 1.69% and 1.13%. Identical current and historical lenses are unverified. Neither the 1% accuracy requirement nor pixel-level shadow accuracy has been established. The offline study establishes grounds to continue exploring lens recovery. No runtime promotion or new recording is required for this measurement.
