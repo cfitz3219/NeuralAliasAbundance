@@ -205,7 +205,7 @@ void PublishLivePicks(Consumer& c) {
                 std::fprintf(c.log, "{\"type\":\"no_scene\",\"picture\":[%u,%u],\"samples\":%u,\"screen\":[%u,%u],\"scene_vertices\":%llu,\"why\":\"%s\"}\n",
                     refused.width, refused.height, refused.samples, c.heuristics.SwapchainWidth(), c.heuristics.SwapchainHeight(),
                     (unsigned long long)refused.vertices,
-                    "The game's own anti-aliasing is on (the scene picture is multisampled): DLAA needs it off in the game's settings.");
+                    "NeuralAlias cannot run DLAA on top of in-game anti-aliasing. Please disable all in-game AA.");
             }
             c.refused_said = refused.why != Why::None ? key : 0;
         }
