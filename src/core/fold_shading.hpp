@@ -42,6 +42,14 @@ constexpr float DeclaredJitter(uint32_t block, uint32_t pick, float full)
     const float b = static_cast<float>(block ? block : 1);
     return (b * 0.5f - static_cast<float>(pick) - 0.5f + full) / b;
 }
+// What the draws' offset needs added, in full-size pixels on one axis, so that the kept pixel's
+// sample moves around the block's centre and the declared jitter stays inside DLSS's half-pixel
+// range. (Build fb0d69cd left this out: it declared up to 0.74 and Cort saw dots and lines.)
+// With draws offset by block * j + KeptPixelCentring, DeclaredJitter gives exactly j.
+constexpr float KeptPixelCentring(uint32_t block, uint32_t pick)
+{
+    return static_cast<float>(pick) + 0.5f - static_cast<float>(block ? block : 1) * 0.5f;
+}
 // Jitter positions per cycle: NVIDIA's 8 x (output pixels per rendered pixel), never under DLAA's count.
 constexpr uint32_t JitterPhases(Mode m, uint32_t dlaa_phases)
 {

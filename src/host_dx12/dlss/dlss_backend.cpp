@@ -669,6 +669,28 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     Feature& ft = g.features[view.feature];
     // Every key is written every frame: the object is shared with creation and
     // stale optional resources must never leak into a later evaluation.
+    // The creation keys too. This object is shared by every view, and creating one view's feature leaves
+    // ITS size, mode and flags in it. Until build fb0d69cd only one feature was ever alive, so they were
+    // always the evaluating feature's own. With the folded levels (core/fold_shading.hpp) three are, and
+    // Cort's run showed what stale ones do: DLAA evaluated after the Performance feature was created
+    // (keys 1720x720, Performance) wrote bands of huge values over a clean input, on every frame, reset
+    // or not (captures j2-20261125-002203 and -002211); the few frames a shown level shares with a newly
+    // created one were his "flash of colour bars". Each evaluation now carries its own feature's keys.
+    p->Set(NVSDK_NGX_Parameter_Width, ft.render_w);
+    p->Set(NVSDK_NGX_Parameter_Height, ft.render_h);
+    p->Set(NVSDK_NGX_Parameter_OutWidth, ft.out_w);
+    p->Set(NVSDK_NGX_Parameter_OutHeight, ft.out_h);
+    p->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(ft.quality));
+    p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, static_cast<int>(ft.flags));
+    {
+        const unsigned int pr = ft.preset ? ft.preset : static_cast<unsigned int>(NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
+        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, pr);
+        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, pr);
+        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, pr);
+        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, pr);
+        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, pr);
+        p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, pr);
+    }
     p->Set(NVSDK_NGX_Parameter_Color, d.color);
     p->Set(NVSDK_NGX_Parameter_Depth, d.depth);
     p->Set(NVSDK_NGX_Parameter_MotionVectors, d.motion);

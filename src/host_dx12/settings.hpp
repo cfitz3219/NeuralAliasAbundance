@@ -103,7 +103,6 @@ struct Settings {
     // Fold the shading, live test (core/fold_shading.hpp): 0 DLAA, 1 Quality (2x1 blocks), 2 Performance
     // (2x2 blocks). Menu only and never saved: every launch starts on DLAA.
     std::atomic<uint32_t> j2_fold_mode{0};
-    std::atomic<bool> j2_fold_wide{true}; // block shading also on the lighting passes (session only, test)
     // Anisotropic filtering on the game's world textures, no menu control (Cort 2026-11-20):
     // hidden [j2] anisotropic_filter = -1 automatic (default), 0 off (the game's own), 16 forced.
     // Re-read live when either ini changes (PollHiddenSettings). Rule: core/anisotropic_auto.hpp.

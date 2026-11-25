@@ -26,6 +26,13 @@ int main() { return test::run({
             CHECK(std::fabs(b * (X + 0.5f - J) - (b * X + p + 0.5f - j)) < 1e-5f);
         }
         CHECK(DeclaredJitter(1, 0, 0.25f) == 0.25f); // DLAA is unchanged
+        // With the draws centred on the kept pixel, DLSS is told the plain sample, inside its half-pixel range.
+        for (Mode m : {Mode::Off, Mode::Quality, Mode::Performance}) for (float j : {-0.5f, -0.2f, 0.f, 0.5f}) {
+            const Block b = BlockFor(m), p = Pick(m);
+            CHECK(std::fabs(DeclaredJitter(b.x, p.x, b.x * j + KeptPixelCentring(b.x, p.x)) - j) < 1e-6f);
+            CHECK(std::fabs(DeclaredJitter(b.y, p.y, b.y * j + KeptPixelCentring(b.y, p.y)) - j) < 1e-6f);
+        }
+        CHECK(KeptPixelCentring(1, 0) == 0.f);
     }},
     {"the screen keeps its mode until the new one has proven itself", [] {
         Handover h;
