@@ -87,6 +87,70 @@ void tiles(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 }
 
 // Bilinear in log luminance, pixel-centre coordinates (0.5 = the middle of column 0).
+
+// One workgroup loads each native-resolution footprint once. All three signals
+// are fitted along the actual two-dimensional raster step. Removing the mean
+// temporal change makes a uniform exposure variation supply no motion evidence.
+groupshared float3 raw_a[121], raw_b[121], smooth_a[81], smooth_b[81];
+// x: the input before, y: the input now. 1 where red, green and blue are all exactly zero.
+groupshared float2 raw_black[121], smooth_black[81];
+struct Sums { float3 g, d, gg, gd, dd; float detail; float2 black; };
+float input_log(float4 c) { return log2(max(dot(c.rgb, float3(.2126, .7152, .0722)), 0) + 1e-4); }
+groupshared Sums sums[64];
+[numthreads(8,8,1)]
+void raster_field(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    int2 center = int2((2*group.xy+1)*uint2(w,h)/(2*uint2(mw,mh)));
+    for (uint i=lane; i<121; i+=64) {
+        int2 p = center + int2(i%11,i/11)-5;
+        // The same values as load_log(0, ..) and load_log(1, ..), from one load each.
+        const int3 at = int3(clamp(p, int2(0, 0), int2(int(w) - 1, int(h) - 1)), 0);
+        const float4 before = t_prev.Load(at), now = t_input.Load(at);
+        raw_a[i] = float3(input_log(before),load_log(5,p,w,h),load_log(6,p,w,h));
+        raw_b[i] = float3(input_log(now),load_log(2,p,w,h),load_log(3,p,w,h));
+        raw_black[i] = float2(all(before.rgb == 0) ? 1 : 0, all(now.rgb == 0) ? 1 : 0);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint j=lane; j<81; j+=64) {
+        uint p=(j/9)*11+(j%9);
+        float3 a=0,b=0;
+        float2 black=1;
+        [unroll] for (uint y=0;y<3;++y) [unroll] for (uint x=0;x<3;++x) {
+            float weight=(x==1?2:1)*(y==1?2:1)/16.0;
+            a+=weight*raw_a[p+y*11+x]; b+=weight*raw_b[p+y*11+x];
+            black*=raw_black[p+y*11+x];
+        }
+        smooth_a[j]=a; smooth_b[j]=b; smooth_black[j]=black;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    Sums s=(Sums)0;
+    if(lane<49) {
+        uint p=(lane/7+1)*9+(lane%7+1);
+        float3 gx=.25*(smooth_a[p+1]-smooth_a[p-1]+smooth_b[p+1]-smooth_b[p-1]);
+        float3 gy=.25*(smooth_a[p+9]-smooth_a[p-9]+smooth_b[p+9]-smooth_b[p-9]);
+        s.g=gx*djx+gy*djy; s.d=smooth_a[p]-smooth_b[p];
+        s.gg=s.g*s.g; s.gd=s.g*s.d; s.dd=s.d*s.d;
+        s.detail=abs(gx.z)+abs(gy.z);
+        s.black=smooth_black[p];
+    }
+    sums[lane]=s;
+    [unroll] for(uint stride=32;stride>0;stride>>=1) {
+        GroupMemoryBarrierWithGroupSync();
+        if(lane<stride) {
+            Sums a=sums[lane],b=sums[lane+stride];
+            a.g+=b.g; a.d+=b.d; a.gg+=b.gg; a.gd+=b.gd; a.dd+=b.dd; a.detail+=b.detail; a.black+=b.black;
+            sums[lane]=a;
+        }
+    }
+    if(lane==0) {
+        Sums a=sums[0];
+        float3 g=a.g/49,d=a.d/49,power=a.gg/49-g*g,cross=a.gd/49-g*d,delta=a.dd/49-d*d;
+        uint at=(group.y*mw+group.x)*12; // mixed_values in core/referee_mixed_raster.hpp
+        [unroll] for(uint i=0;i<3;++i) { store(at+3*i,power[i]); store(at+3*i+1,cross[i]); store(at+3*i+2,delta[i]); }
+        store(at+9,a.detail/49);
+        store(at+10,a.black.x/49); store(at+11,a.black.y/49);
+    }
+}
+
 float log_at(uint which, float2 q) {
     const float2 f = q - .5;
     const int2 i0 = int2(floor(f));

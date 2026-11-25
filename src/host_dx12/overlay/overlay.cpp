@@ -76,6 +76,7 @@
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
+#include "host_dx12/overlay/sharpness_preview.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/overlay/freeze_watchdog.hpp"
 #include "host_dx12/nr/queue_trace.hpp"
@@ -910,6 +911,15 @@ void write_status_line()
         const int bytes = snprintf(line, sizeof line, "%02u:%02u:%02u fps=%.1f frame_ms=%.2f | %s\r\n",
                                    t.wHour, t.wMinute, t.wSecond, fps, fps > 0 ? 1000.0 / fps : 0.0, status);
         append_status_text(line, (std::min)(bytes, int(sizeof line) - 1));
+        const auto ambient = na::xegtao::ScenePass().GetStats();
+        const unsigned enabled = na::settings::Get().xegtao_enabled.load();
+        if (enabled || ambient.recorded) {
+            char fx[256];
+            const int count = std::snprintf(fx, sizeof fx,
+                "effects xegtao{enabled=%u recorded=%llu compiling=%u reason=\"%s\"}\r\n",
+                enabled, static_cast<unsigned long long>(ambient.recorded), ambient.compiling ? 1u : 0u, ambient.reason);
+            if (count > 0) append_status_text(fx, (std::min)(count, int(sizeof fx) - 1));
+        }
         return;
     }
     {
@@ -1147,13 +1157,19 @@ void write_status_line()
         }
         { // Viewport jitter ([j2] viewport_jitter): real samples through the game's viewports
             const auto vps = na::observe::GetViewportJitterStats();
-            char vl[400];
+            char vl[768];
             const int vn = snprintf(vl, sizeof vl,
-                "viewport_jitter mode=%d frames=%llu declared_list=%llu declared_submitted=%llu declared_none=%llu other_frame=%llu scene_draws=%llu sets=%llu restores=%llu unknown_viewports=%llu centered_layer_lists=%llu/%llu\r\n",
+                "viewport_jitter mode=%d frames=%llu declared_list=%llu declared_submitted=%llu declared_none=%llu other_frame=%llu scene_draws=%llu sets=%llu restores=%llu unknown_viewports=%llu centered_layer_lists=%llu/%llu "
+                "aligned_shader_depth_draws=%llu shader_depth_refused{no_layer=%llu not_read=%llu writes_layer=%llu one_target=%llu viewport=%llu} "
+                "referee_still_meshes{asked=%d asks=%llu moved_draws=%llu}\r\n",
                 na::settings::Get().j2_viewport_jitter.load(), (unsigned long long)j2.vpj_frames, (unsigned long long)j2.vpj_from_list,
                 (unsigned long long)j2.vpj_from_submitted, (unsigned long long)j2.vpj_none, (unsigned long long)j2.vpj_other_frame,
                 (unsigned long long)vps.draws, (unsigned long long)vps.sets, (unsigned long long)vps.restores, (unsigned long long)vps.unknown,
-                (unsigned long long)vps.local_layers, (unsigned long long)vps.submitted_layers);
+                (unsigned long long)vps.local_layers, (unsigned long long)vps.submitted_layers,
+                (unsigned long long)vps.shader_depth, (unsigned long long)vps.shader_depth_refused.no_layer,
+                (unsigned long long)vps.shader_depth_refused.not_read, (unsigned long long)vps.shader_depth_refused.writes_layer,
+                (unsigned long long)vps.shader_depth_refused.one_target, (unsigned long long)vps.shader_depth_refused.viewport,
+                vps.still_asked ? 1 : 0, (unsigned long long)vps.still_asks, (unsigned long long)vps.still_moved);
             if (vn > 0) WriteFile(f, vl, DWORD((std::min)(vn, int(sizeof vl - 1))), &written, nullptr);
         }
         { // anisotropic filtering (automatic, hidden [j2] anisotropic_filter): level/action = in use;
@@ -2890,7 +2906,8 @@ void draw_panel(bool just_opened)
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("##neuralalias", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
-                     ImGuiWindowFlags_NoScrollWithMouse);
+                     ImGuiWindowFlags_NoScrollWithMouse
+                     | (PicturePreview().dismiss_press ? ImGuiWindowFlags_NoMouseInputs | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize : 0));
     ImGui::PopStyleVar();
     // Actual placement after the user's drag/resize; keep it on screen and remember it.
     w = ImGui::GetWindowWidth();
@@ -2981,7 +2998,7 @@ void draw_panel(bool just_opened)
         ImGui::SameLine(0.0f, 0.0f);
         content_x = NavWidth();
         ImVec2 p = ImGui::GetCursorScreenPos();
-        ImGui::GetWindowDrawList()->AddLine(p, ImVec2(p.x, p.y + body_h), ImGui::ColorConvertFloat4ToU32(kLine));
+        ImGui::GetWindowDrawList()->AddLine(p, ImVec2(p.x, p.y + body_h), ImGui::GetColorU32(kLine));
     }
 
     // Content (scrolls; title, navigation and footer stay put).
@@ -3113,7 +3130,13 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ImGui::NewFrame();
     {
         na::eventlog::ScopedSource source("panel"); // settings changed while the panel draws are the user's
+        auto& preview = na::ui::PicturePreview();
+        preview.BeginFrame(just_opened || na::menu::CurrentPage() != na::menu::Page::Picture);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * preview.opacity);
+        ImGui::BeginDisabled(preview.dismiss_press);
         draw_panel(just_opened);
+        ImGui::EndDisabled();
+        ImGui::PopStyleVar();
         na::settings::WatchChanges();
     }
     ImGui::Render();

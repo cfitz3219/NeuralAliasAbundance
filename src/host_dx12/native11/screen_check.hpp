@@ -275,7 +275,7 @@ public:
     }
 
     const char* Present(ID3D11DeviceContext* context, ID3D11Texture2D* screen, uint64_t frame,
-                        uint32_t scene_draws, bool attempted, bool await_result = false)
+                        uint32_t scene_draws, bool attempted, bool await_result = false, bool centered_only = false)
     {
         const auto finish = [&](const char* outcome) {
             ResetFrame();
@@ -392,7 +392,8 @@ public:
         const bool sampled_all = samples_ == screen_marker::kSession;
         bool confirmed = false, any_response = false;
         bool refuted = sampled_all;
-        for (const auto& layout : votes_) {
+        for (size_t i = centered_only ? 1 : 0; i < votes_.size(); ++i) {
+            const auto& layout = votes_[i];
             confirmed |= sampled_all && (layout.follow == samples_ || layout.invert == samples_);
             any_response |= layout.follow || layout.invert;
             if (layout.seen && layout.flat != samples_) refuted = false;

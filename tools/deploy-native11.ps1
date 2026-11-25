@@ -79,6 +79,11 @@ function Save-Results([string] $why) {
             $cdst = Join-Path $dst ('captures\' + $cd.Name); New-Item -ItemType Directory -Force -Path $cdst | Out-Null
             Get-ChildItem -LiteralPath $cd.FullName -File | Where-Object { $_.Extension -ne '.raw' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $cdst }
             $summary.Add("  $($cd.Name): metadata copied; raw planes stay in $($cd.FullName)")
+            # The picture before DLAA is checked here, so nobody has to open a frame to find black patches.
+            if ($cd.Name -like 'j2-*' -and (Get-Command Get-NABlackPixels -ErrorAction SilentlyContinue)) {
+                try { foreach ($l in (Get-NABlackPixels -Capture $cd.FullName)) { $summary.Add("    $l") } }
+                catch { $summary.Add("    Black pixel count failed: $($_.Exception.Message)") }
+            }
         }
     }
     $summary | Set-Content -LiteralPath (Join-Path $dst 'summary.txt') -Encoding UTF8

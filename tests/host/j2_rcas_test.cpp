@@ -185,7 +185,12 @@ int main()
         CHECK(std::fabs(result[y * W + 60] - 4.0f) < 0.05f);
         if (percent == 100) CHECK(result == o);
         if (percent == 101) for (size_t i = 0; i < result.size(); ++i) CHECK(std::fabs(result[i] - o[i]) < 0.02f);
-        if (percent == 150) { CHECK(contrast > baseContrast + 0.005f); maximum = result; }
+        if (percent == 150) {
+            // The former 2x ceiling delivered 0.502808 on this soft edge (RTX, RGBA16F).
+            // Distinguish an actual increase in the read-back image from a changed menu label.
+            CHECK(contrast > 0.505f);
+            maximum = result;
+        }
         if (percent > 150) CHECK(result == maximum);
         std::printf("RCAS %u%%: soft-edge contrast %.6f (100%% %.6f)\n", percent, contrast, baseContrast);
     }

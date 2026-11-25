@@ -83,11 +83,14 @@
 // provider of the one program, src/host_dx12/native11; see input_provider.hpp.)
 #pragma once
 
+#include "core/presentation_extent.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -130,6 +133,8 @@ struct Event {
     uint16_t cb_first[kCbBindSlots] = {}, cb_count[kCbBindSlots] = {}; // in 16-byte constants
     uint64_t viewport_sample = 0; // Draw: actual native viewport offset encoded as two floats
     bool viewport_expanded = false; // Draw: actual viewport border expansion, travels with deferred recording
+    bool viewport_shader_depth = false; // Draw: shares the raster of a proved shader-readable depth layer
+    bool viewport_still_mesh = false;   // Draw: an untested mesh moved at the Referee's ask (counted, not classified)
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
     // Depth direction evidence (depth_direction.hpp). Last on purpose: hosts that do not say leave them 0.
     uint8_t depth_func = 0;       // Draw: the depth comparison (D3D11 numbering, 1..8) when this draw tests AND WRITES the depth; 0 otherwise
@@ -141,6 +146,7 @@ struct Selection {
     Id depth = 0, color = 0, camera_cb = 0;
     int camera_slot = -1;
     ResourceInfo depth_info, color_info;
+    bool screen_region = false; // requires the screen challenge before this pair can deliver
     bool valid() const { return depth && color; }
 };
 
@@ -157,6 +163,7 @@ public:
     struct Stats {
         uint64_t frames = 0, selected_frames = 0, fired = 0, missed = 0, unplaceable = 0, contradictions = 0;
         uint64_t selection_changes = 0, loading_frames = 0;
+        uint64_t pushed_pictures = 0;    // pictures delivered without screen proof (scene/pushed-without-screen-proof)
         uint32_t last_scene_draws = 0, last_draws = 0, learned_read = 0, last_reads = 0;
         uint32_t camera_scene_draws = 0; // scene draws with the camera cb bound (last frame)
         uint64_t tag_not_unique = 0;     // frames whose point's tag named more than one read
@@ -170,7 +177,55 @@ public:
         const char* last_miss = "";
     };
 
-    void SetSwapChainSize(uint32_t w, uint32_t h) { swap_w_ = w; swap_h_ = h; }
+    // WHY log: the biggest scene-like pair that was looked at and not chosen in the last frame with
+    // no screen-shaped picture, and what stood in the way. Says nothing when a scene is chosen.
+    enum class NoScene : uint8_t { None, Multisampled, AwaitingScreenProof };
+    struct Refused {
+        NoScene why = NoScene::None;
+        uint32_t width = 0, height = 0, samples = 1;
+        uint64_t vertices = 0;
+        uint32_t screen_width = 0, screen_height = 0;
+    };
+    const Refused& RefusedScene() const { return refused_; }
+
+    void SetSwapChainSize(uint32_t w, uint32_t h)
+    {
+        if (w != swap_w_ || h != swap_h_) { region_retry_.clear(); pushed_.clear(); }
+        swap_w_ = w;
+        swap_h_ = h;
+    }
+    // VARIANT: scene/pushed-without-screen-proof
+    // A picture that is not the screen's shape could not be matched to the screen pixel for pixel
+    // (the game stretches it, or draws it through passes the challenge cannot follow). It is still
+    // the most-drawn scene with its own depth, so DLAA is delivered on it at the ordinary point,
+    // at the picture's own size. The pair is remembered, so it is chosen directly from then on.
+    bool PushScreenRegion()
+    {
+        if (!sel_.screen_region) return false;
+        pushed_.insert({sel_.depth, sel_.color});
+        if (wide_ && layer_) pushed_.insert({sel_.depth, layer_});
+        sel_.screen_region = false;
+        ++stats_.pushed_pictures;
+        return true;
+    }
+    void DeferScreenRegion()
+    {
+        if (!sel_.screen_region) return;
+        const auto defer = [&](Id target) {
+            if (!target) return;
+            if (region_retry_.size() >= 16) region_retry_.erase(region_retry_.begin());
+            region_retry_[{sel_.depth, target}] = stats_.frames + 512;
+        };
+        defer(sel_.color);
+        if (wide_) defer(layer_);
+        sel_ = {};
+        learned_read_ = learned_overlay_ = learned_flat_ = 0;
+        learned_tag_ = 0;
+        wide_ = false;
+        layer_ = second_depth_ = 0;
+        more_layers_.clear();
+        ++stats_.selection_changes;
+    }
     // Opt in to the HUD rule (a host that calls ShouldFireBeforeDraw). Off by default.
     void EnableOverlayRule(bool on) { overlay_rule_ = on; }
     // The target shown on screen (the swap chain's back buffer), 0 = unknown. When the picture is
@@ -249,13 +304,13 @@ public:
     // An immediate-context read of `resource` is about to happen.
     bool ShouldFireBeforeRead(Id resource) const
     {
-        if (fired_ || !sel_.valid() || resource != sel_.color || !learned_read_ || !scene_draws_) return false;
+        if (fired_ || !sel_.valid() || sel_.screen_region || resource != sel_.color || !learned_read_ || !scene_draws_) return false;
         return color_reads_ + 1 == learned_read_;
     }
     // The immediate context is about to execute a command list with this summary.
     bool ShouldFireBeforeList(const ListSummary& l)
     {
-        if (fired_ || !sel_.valid() || !learned_read_ || !l.color_reads) return false;
+        if (fired_ || !sel_.valid() || sel_.screen_region || !learned_read_ || !l.color_reads) return false;
         if (color_reads_ >= learned_read_ || color_reads_ + l.color_reads < learned_read_) return false;
         if (color_reads_ + 1 != learned_read_ || l.scene_draws_before_first_read || l.color_writes_before_first_read) {
             // The target read is inside this list, after scene work or other writes to the scene
@@ -271,11 +326,12 @@ public:
     // back buffer, no read of it). Only when no read point was learned.
     bool ShouldFireBeforeDraw(const Event& e) const
     {
-        if (fired_ || !sel_.valid() || learned_read_ || !scene_draws_) return false;
+        if (fired_ || !sel_.valid() || sel_.screen_region || learned_read_ || !scene_draws_) return false;
         if (e.kind != Kind::Draw || e.rt0 != sel_.color) return false;
         if (learned_overlay_) return !IsSceneDraw(e) && overlay_draws_ + 1 == learned_overlay_;
         // VARIANT: point/before-untested-hud
-        return learned_flat_ && tested_draws_ && IsSceneDraw(e) && !e.depth_test && flat_draws_ + 1 == learned_flat_;
+        return learned_flat_ && tested_draws_ && IsSceneDraw(e) && !e.depth_test &&
+               !e.viewport_shader_depth && flat_draws_ + 1 == learned_flat_;
     }
     // Which point the next frame will fire at: 1 = before a read, 2 = before the
     // first HUD draw (HUD rule), 3 = before the first HUD draw that keeps the scene
@@ -435,7 +491,7 @@ public:
     // The engine found the camera's matrices in this buffer (or, with 0, gave up on it).
     void SetCamera(Id cb, int slot) { sel_.camera_cb = cb; sel_.camera_slot = slot; }
 
-    void EndFrame(bool inspect_lit_order = false, Id verified_peer = 0)
+    void EndFrame(bool inspect_lit_order = false, Id verified_peer = 0, bool detect_screen_regions = false)
     {
         ++stats_.frames;
         // At the untested-HUD point the HUD draws that follow still carry the scene depth; only a
@@ -478,7 +534,7 @@ public:
 
         completed_lit_ = {};
         inspect_lit_order_ = inspect_lit_order;
-        Choose(verified_peer);
+        Choose(verified_peer, detect_screen_regions);
         stats_.learned_read = learned_read_;
         stats_.learned_overlay = learned_overlay_;
         stats_.learned_flat = learned_flat_;
@@ -540,7 +596,7 @@ public:
     {
         if (!sel_.valid()) return false;
         if (e.depth == sel_.depth) {
-            if (e.rt0 == sel_.color) return true;
+            if (e.rt0 == sel_.color || e.viewport_shader_depth) return true;
             if (!wide_ || !e.depth_test) return false;
             if (e.rt0 == layer_) return true;
             for (Id l : more_layers_) if (e.rt0 == l) return true;
@@ -600,7 +656,7 @@ private:
             pending_tag_ = 0;
             first_overlay_after_scene_pending_ = 0; // so was a non-scene draw into the colour
             if (e.rt0 == sel_.color) {
-                if (e.depth_test) {
+                if (e.depth_test || e.viewport_shader_depth) {
                     ++tested_draws_;
                     first_flat_after_tested_pending_ = 0; // an untested draw before this one was mid-scene
                 } else {
@@ -646,7 +702,45 @@ private:
         return std::fabs(a - s) <= 0.1 && rx >= 0.5 && rx <= 1.85 && ry >= 0.5 && ry <= 1.85;
     }
 
-    void Choose(Id verified_peer)
+    // A single-sample picture no larger than the screen and at least half of it each way: bars on one
+    // side pair (CenteredNativeRegion), bars all round, or a smaller picture the game stretches.
+    bool CanFillScreenRegion(const ResourceInfo& r) const
+    {
+        return r.samples == 1 && PlacedOrStretched(r);
+    }
+    bool PlacedOrStretched(const ResourceInfo& r) const
+    {
+        return r.width && r.height && r.width <= swap_w_ && r.height <= swap_h_ &&
+               !(r.width == swap_w_ && r.height == swap_h_) &&
+               uint64_t(r.width) * 2 >= swap_w_ && uint64_t(r.height) * 2 >= swap_h_;
+    }
+
+    // The pair with the most vertices among those that are drawn like a scene, are not the screen's
+    // shape, and cannot be taken as a picture placed inside the screen.
+    void NoteRefusedScene()
+    {
+        if (!swap_w_ || !swap_h_) return;
+        for (const auto& kv : color_) {
+            const auto d = info_.find(kv.first.first), c = info_.find(kv.first.second);
+            if (d == info_.end() || c == info_.end() || AspectOk(d->second) || kv.second.draws <= 8 ||
+                c->second.width != d->second.width || c->second.height != d->second.height) continue;
+            const auto usage = depth_.find(kv.first.first);
+            if (usage == depth_.end() || (usage->second.vertices <= 3 && !usage->second.indirect)) continue;
+            const auto& r = d->second;
+            const uint32_t samples = (std::max)(r.samples, c->second.samples);
+            const bool placed = PlacedOrStretched(r);
+            NoScene why = NoScene::None;
+            if (placed && samples != 1) why = NoScene::Multisampled;
+            else if (placed) {
+                const auto defer = region_retry_.find(kv.first);
+                if (defer != region_retry_.end() && defer->second > stats_.frames) why = NoScene::AwaitingScreenProof;
+            }
+            if (why == NoScene::None || (refused_.why != NoScene::None && usage->second.vertices <= refused_.vertices)) continue;
+            refused_ = {why, r.width, r.height, samples, usage->second.vertices, swap_w_, swap_h_};
+        }
+    }
+
+    void Choose(Id verified_peer, bool detect_screen_regions)
     {
         // Loading screens and menus: one depth with <= 8 draws -> keep the old choice.
         uint64_t total_depth_draws = 0;
@@ -676,9 +770,41 @@ private:
                 if (kv.second.draws > best_cd) { best_cd = kv.second.draws; best_color = kv.first.second; }
             }
         }
+        bool screen_region = false;
+        refused_ = {};
+        if (!best_color) NoteRefusedScene();
+        if (!best_color) {
+            best_v = 0;
+            // Use the real dimensions of the colour/depth pair. The screen challenge is tried first
+            // where it is available; a pair it cannot prove is pushed (PushScreenRegion), never dropped.
+            for (const auto& kv : color_) {
+                const auto d = info_.find(kv.first.first), c = info_.find(kv.first.second);
+                if (d == info_.end() || c == info_.end() || AspectOk(d->second) ||
+                    !CanFillScreenRegion(d->second) || c->second.samples != 1 ||
+                    c->second.width != d->second.width || c->second.height != d->second.height ||
+                    kv.second.draws <= 8) continue;
+                const auto usage = depth_.find(kv.first.first);
+                if (usage == depth_.end() || (usage->second.vertices <= 3 && !usage->second.indirect)) continue;
+                const auto defer = region_retry_.find(kv.first);
+                if (defer != region_retry_.end() && defer->second > stats_.frames) continue;
+                const auto vertices = usage->second.vertices;
+                if (!best_color || vertices > best_v || (vertices == best_v && kv.second.draws > best_cd)) {
+                    best_depth = kv.first.first;
+                    best_color = kv.first.second;
+                    best_v = vertices;
+                    best_cd = kv.second.draws;
+                }
+            }
+            screen_region = best_color != 0 && detect_screen_regions && !pushed_.count({best_depth, best_color});
+        }
         if (!best_color) return; // nothing usable this frame: keep the old choice
+        refused_ = {}; // a pair is being chosen: nothing to explain
         const Id most_drawn = best_color;
         const bool layered = AfterLayers(best_depth, best_color);
+        if (screen_region) {
+            const auto defer = region_retry_.find({best_depth, best_color});
+            if (defer != region_retry_.end() && defer->second > stats_.frames) return;
+        }
         // Preserve the camera and its learned bindings across a proven pair.
         // The reader chooses the current physical surface at execution time.
         if (verified_peer && completed_lit_.depth == sel_.depth &&
@@ -703,6 +829,7 @@ private:
             if (layered) { wide_ = true; layer_ = most_drawn; second_depth_ = note_.second_depth; more_layers_ = note_.more_layers; }
             sel_.depth = best_depth;
             sel_.color = best_color;
+            sel_.screen_region = screen_region;
             sel_.depth_info = info_[best_depth];
             sel_.color_info = info_[best_color];
             sel_.camera_cb = 0;
@@ -889,6 +1016,9 @@ private:
     };
 
     uint32_t swap_w_ = 0, swap_h_ = 0;
+    std::map<std::pair<Id, Id>, uint64_t> region_retry_;
+    Refused refused_;
+    std::set<std::pair<Id, Id>> pushed_;
     std::unordered_map<Id, ResourceInfo> info_;
     std::unordered_map<Id, Cand> depth_;
     std::unordered_map<std::pair<Id, Id>, PairCount, PairHash> color_;

@@ -2,7 +2,9 @@
 // the game's own D3D11 samplers, live (no restart). AF is automatic (no menu control):
 // every sampler the game creates feeds the shared detector in core/anisotropic_auto.hpp.
 //
-// The game's sampler states are recorded at CreateSamplerState. When the policy
+// The game's sampler states are recorded at CreateSamplerState, and one made before
+// the hooks existed is recorded from its own description the first time the game
+// binds it (samplers/adopt-at-bind). When the policy
 // is on, each eligible sampler bound with PSSetSamplers / CSSetSamplers is
 // swapped for a variant (same state, policy bias / AF) created on demand and
 // kept for the process. Policy changes also refresh existing bindings at the
@@ -20,8 +22,8 @@ namespace na::native11 {
 using SamplerBiasFn = float (*)();
 using SamplerAfFn = uint32_t (*)();
 
-// Hooks the game's device (ID3D11Device*) CreateSamplerState and its contexts' PS/CS sampler binds.
-// Idempotent. Install it when the device is created, before the game makes its samplers.
+// Hooks CreateSamplerState and PS/CS sampler set and get. The game reads its own state back.
+// Idempotent. May be installed after the game has made its samplers: those are adopted at their first bind.
 bool InstallSamplers(void* device, SamplerBiasFn bias, SamplerAfFn af);
 
 // A sampler state may be shared by our replacement and a game-created state.
@@ -51,7 +53,8 @@ struct SamplerStats {
     uint64_t variant_failures = 0;
     uint64_t binds = 0;            // observed game sampler slots bound
     uint64_t swapped = 0;          // of those, bound as our variant
-    uint64_t unknown = 0;          // bound samplers we never saw created (passed through)
+    uint64_t unknown = 0;          // bound samplers that could not be recorded (passed through)
+    uint64_t adopted = 0;          // game samplers first met at a bind: created before the hooks existed
     uint64_t material_binds = 0;
     uint64_t after_scene = 0;      // eligible binds left as the game's own after the scene was handed to DLSS
     float original_bias = 0.0f;
