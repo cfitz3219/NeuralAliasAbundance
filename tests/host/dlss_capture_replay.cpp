@@ -13,6 +13,11 @@
 //   --motion-dir DIR                      a saved frame's motion comes from DIR\NNNNN-motion.raw when that
 //                                         file exists (two 32-bit floats a pixel, tight rows, the motion
 //                                         plane's size): motion computed another way for the same frames
+//   --motion-folded                       with --fold and --motion-dir: DIR's planes are the folded level's own
+//                                         (folded size, tight rows, folded pixels, as flow_motion_dump --fold-input
+//                                         writes them), scaled by the block and given to DLSS without folding
+//   --fold-pick first | last              with --fold fixed: keep the first (default) or the last pixel of each
+//                                         block; last is what the live program keeps (core/fold_shading.hpp)
 //   --bias-dir DIR                        DLSS's "trust this frame's colour here" mask comes from DIR\NNNNN-bias.raw
 //                                         when that file exists (one 32-bit float a pixel, tight rows, the
 //                                         colour plane's size; 1 = lean on this frame, 0 = normal). Not with --fold.
@@ -458,7 +463,8 @@ int Usage()
 {
     std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D] [--motion-dir DIR] [--bias-dir DIR]\n"
                 "    [--preset 0|10..13] [--parity all|even|odd] [--first INDEX] [--frames N] [--all] [--preroll N] [--pingpong N]\n"
-                "    [--crop X Y W H] [--save-last N] [--fold cycle|fixed] [--fold-block 2x2|2x1] [--fold-create folded|full] [--fold-declare pixel|block] [--fold-sign 1|-1] [--time]\n");
+                "    [--crop X Y W H] [--save-last N] [--fold cycle|fixed] [--fold-block 2x2|2x1] [--fold-create folded|full] [--fold-declare pixel|block] [--fold-sign 1|-1] [--time]\n"
+                "    [--fold-pick first|last] [--motion-folded] [--second-at S] [--second-every] [--second-release-at S] [--main-recreate-at S] [--ordered-features]\n");
     return 2;
 }
 } // namespace
@@ -482,6 +488,7 @@ int main(int argc, char** argv)
     uint32_t fold_bx = 2, fold_by = 2;
     int second_at = -1, second_release_at = -1, main_recreate_at = -1;
     bool second_every = false, ordered_features = false;
+    bool fold_pick_last = false, motion_folded = false;
     bool fold_create_full = false, timing = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
@@ -522,6 +529,13 @@ int main(int argc, char** argv)
         }
         else if (a == "--second-feature") second_feature = true;
         else if (a == "--ordered-features") ordered_features = true;
+        else if (a == "--motion-folded") motion_folded = true;
+        else if (a == "--fold-pick" && value) {
+            const std::string v = value;
+            ++i;
+            if (v == "last") fold_pick_last = true;
+            else if (v != "first") return Usage();
+        }
         else if (a == "--second-at" && value) { second_at = std::atoi(value); ++i; }
         else if (a == "--second-every") second_every = true;
         else if (a == "--second-release-at" && value) { second_release_at = std::atoi(value); ++i; }
@@ -555,7 +569,12 @@ int main(int argc, char** argv)
     const std::string out_dir = out_root + "\\" + name;
     CreateDirectoryA(out_dir.c_str(), nullptr);
     fopen_s(&g_log, (out_dir + "\\replay.log").c_str(), "wb");
-    if (!motion_dir.empty()) Log("motion planes from %s where present", motion_dir.c_str());
+    if (motion_folded && (motion_dir.empty() || fold == FoldMode::Off || mode == MotionMode::FarZero)) {
+        Log("FATAL: --motion-folded needs --motion-dir and --fold, and not --motion far-zero");
+        return 1;
+    }
+    if (!motion_dir.empty()) Log("motion planes from %s%s", motion_dir.c_str(), motion_folded ? " (folded level's own, every frame)" : " where present");
+    if (fold_pick_last) Log("fold: the kept pixel is the last of each block (the live program's)");
     if (!bias_dir.empty()) Log("bias masks from %s where present", bias_dir.c_str());
     Log("dlss_capture_replay: capture=%s name=%s motion=%s far_depth=%g preset=%u parity=%s first=%u frames=%u all=%d preroll=%u pingpong=%u",
         capture.c_str(), name.c_str(), mode_name, far_depth, preset, parity < 0 ? "all" : parity ? "odd" : "even", first, max_frames,
@@ -737,7 +756,7 @@ int main(int argc, char** argv)
     uint32_t bias_planes = 0;
     // The pixel of each 2x2 block kept at each step: all four in turn, opposite corners first.
     static const uint32_t kFoldPhase[4][2] = {{0, 0}, {1, 1}, {1, 0}, {0, 1}};
-    std::vector<float> vectors, sum;
+    std::vector<float> vectors, sum, fsum;
     const size_t pixels = static_cast<size_t>(head.motion.width) * head.motion.height;
     uint32_t written = 0, replaced_planes = 0;
     for (size_t si = 0; si < steps.size(); ++si) {
@@ -746,6 +765,7 @@ int main(int argc, char** argv)
         l.Reset();
         uint32_t fold_px = fold == FoldMode::Cycle ? kFoldPhase[si % 4][0] : 0, fold_py = fold == FoldMode::Cycle ? kFoldPhase[si % 4][1] : 0;
         if (fold_bx == 2 && fold_by == 1) { fold_px = fold == FoldMode::Cycle ? static_cast<uint32_t>(si % 2) : 0; fold_py = 0; }
+        if (fold == FoldMode::Fixed && fold_pick_last) { fold_px = fold_bx - 1; fold_py = fold_by - 1; } // the live program's kept pixel
         REQUIRE(ReadPlane(capture, m.index, "color", m.color, &rows));
         REQUIRE(ReadPlane(capture, m.index, "depth", m.depth, &depth_rows));
         if (fold != FoldMode::Off) {
@@ -759,10 +779,31 @@ int main(int argc, char** argv)
         // This step's motion: none without a step before or when asked for none; else the saved planes of
         // every saved frame the step covers, added up, negated when the walk runs backwards.
         sum.assign(pixels * 2, 0.0f);
+        // --motion-folded: the given planes are already the folded level's (the flow run on the folded picture).
+        const size_t folded_pixels = static_cast<size_t>(fold_w) * fold_h;
+        fsum.assign(motion_folded ? folded_pixels * 2 : 0, 0.0f);
         if (s.direction != 0 && mode != MotionMode::Zero) {
             for (const size_t f : s.motions) {
                 // A replacement plane when one was given for this frame, else the saved one.
                 bool replaced = false;
+                if (motion_folded) {
+                    // Folded size, tight rows, in folded pixels (flow_motion_dump --fold-input): scaled by the block
+                    // to the full-size pixels every other plane here is in.
+                    PlaneInfo given = frames[f].motion;
+                    given.format = 16;
+                    given.width = fold_w;
+                    given.height = fold_h;
+                    given.row_pitch = fold_w * 8;
+                    REQUIRE(ReadPlane(motion_dir, frames[f].index, "motion", given, &motion_rows) && MotionToFloat(motion_rows, 16, &vectors));
+                    REQUIRE(vectors.size() == fsum.size());
+                    ++replaced_planes;
+                    const float sign = s.direction < 0 ? -1.0f : 1.0f;
+                    for (size_t i = 0; i < folded_pixels; ++i) {
+                        fsum[2 * i] += sign * vectors[2 * i] * static_cast<float>(fold_bx);
+                        fsum[2 * i + 1] += sign * vectors[2 * i + 1] * static_cast<float>(fold_by);
+                    }
+                    continue;
+                }
                 if (!motion_dir.empty()) {
                     PlaneInfo given = frames[f].motion;
                     given.format = 16;
@@ -785,11 +826,15 @@ int main(int argc, char** argv)
                 }
             }
         }
-        FloatToMotion(sum, m.motion.format, &motion_rows);
-        if (fold != FoldMode::Off) {
+        if (motion_folded) {
+            FloatToMotion(fsum, m.motion.format, &folded);
+            REQUIRE(Fill(l.list.Get(), &motion, folded));
+        } else if (fold != FoldMode::Off) {
+            FloatToMotion(sum, m.motion.format, &motion_rows);
             FoldRows(motion_rows, m.motion.width, motion.bpp, fold_w, fold_h, fold_px, fold_py, &folded, fold_bx, fold_by);
             REQUIRE(Fill(l.list.Get(), &motion, folded));
         } else {
+            FloatToMotion(sum, m.motion.format, &motion_rows);
             REQUIRE(Fill(l.list.Get(), &motion, motion_rows));
         }
 
