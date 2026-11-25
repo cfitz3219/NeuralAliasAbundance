@@ -73,6 +73,13 @@ def vnoise(x, y, seed):
     return (a + (b - a) * fx) * (1 - fy) + (c + (d - c) * fx) * fy
 
 
+# Depth (reversed: larger is nearer) is this times a layer's share of the pan, as a sideways camera
+# movement gives it: the supplied motion is then exactly "depth times a shear", which our flow's
+# camera path can be given as a camera (tests/host/flow_motion_dump --mode camera).
+DEPTH_PER_PAR = 0.30
+# Trial 4: the band of leaves along the top (left of 0.55 W) sways this many times harder than the
+# leaves on the right, like a gust: up to about 3.5 full-size pixels a frame against 0.9. 0 = that band is still.
+GUST = 0.0
 LEAF_MOTION = False  # True: the swaying leaves' own motion is in the motion vectors (as optical flow would supply)
 
 
@@ -92,7 +99,7 @@ def scene(gx, gy, sx, sy, t):
     v = np.clip(sy / H, 0, 1)
     sky = np.stack([0.55 + 0.25 * cloud - 0.15 * v, 0.62 + 0.25 * cloud - 0.10 * v, 0.72 + 0.22 * cloud], -1)
     col[:] = sky
-    depth[:] = 0.0005
+    depth[:] = DEPTH_PER_PAR * par[0]
 
     # 1 far lattice and wires: thin dark geometry (coverage at the geometry sample).
     wx, wy = gx + cam[0] * par[1], gy + cam[1] * par[1]
@@ -106,7 +113,7 @@ def scene(gx, gy, sx, sy, t):
     barb = (np.abs(wy - sag) < 3.2) & ((wx % 13.0) < 1.1)
     m1 = lattice | wire | barb
     col[m1] = np.array([0.07, 0.07, 0.08])
-    depth[m1] = 0.02
+    depth[m1] = DEPTH_PER_PAR * par[1]
     layer[m1] = 1
 
     # 2 wall: top edge at a shallow angle (geometry), brick and grit (colour program).
@@ -122,18 +129,18 @@ def scene(gx, gy, sx, sy, t):
     brick = np.stack([0.42 + 0.22 * tone, 0.20 + 0.10 * tone, 0.14 + 0.06 * tone], -1) * (0.55 + 0.9 * grit)[..., None]
     brick[mortar] = np.array([0.50, 0.48, 0.44]) * (0.6 + 0.6 * grit[mortar])[..., None]
     col[m2] = brick[m2]
-    depth[m2] = 0.08
+    depth[m2] = DEPTH_PER_PAR * par[2]
     layer[m2] = 2
 
     # 3 foliage: an alpha-tested card over the right part and a band along the top. The alpha test is part
     #   of the colour program. Right of x = 0.82 W the leaves sway; the sway is not in the motion vectors.
     wx, wy = sx + cam[0] * par[3], sy + cam[1] * par[3]
-    sway = (sx > W * 0.82)
-    dx = np.where(sway, 1.6 * np.sin(t * 0.55 + wy / 37.0), 0.0)
-    dx_before = np.where(sway, 1.6 * np.sin((t - 1) * 0.55 + wy / 37.0), 0.0)
+    sway = np.where(sx > W * 0.82, 1.0, np.where((sy < H * 0.13) & (sx < W * 0.55), GUST, 0.0))
+    dx = sway * 1.6 * np.sin(t * 0.55 + wy / 37.0)
+    dx_before = sway * 1.6 * np.sin((t - 1) * 0.55 + wy / 37.0)
     wx = wx + dx
-    dy = np.where(sway, 0.9 * np.sin(t * 0.41 + wx / 53.0), 0.0)
-    dy_before = np.where(sway, 0.9 * np.sin((t - 1) * 0.41 + wx / 53.0), 0.0)
+    dy = sway * 0.9 * np.sin(t * 0.41 + wx / 53.0)
+    dy_before = sway * 0.9 * np.sin((t - 1) * 0.41 + wx / 53.0)
     wy = wy + dy
     n = vnoise(wx / 19.0, wy / 19.0, 6) * 0.5 + vnoise(wx / 6.5, wy / 6.5, 7) * 0.32 + vnoise(wx / 2.6, wy / 2.6, 8) * 0.18
     region = np.maximum(np.clip((sx - W * 0.60) / (W * 0.10), 0, 1), np.clip((H * 0.13 - sy) / (H * 0.08), 0, 1))
@@ -144,17 +151,19 @@ def scene(gx, gy, sx, sy, t):
     leaf = np.stack([0.10 + 0.22 * hue, 0.26 + 0.34 * shade, 0.06 + 0.10 * hue], -1) * (0.45 + 0.9 * shade)[..., None]
     leaf[twig] = np.array([0.16, 0.11, 0.07])
     col[alpha] = leaf[alpha]
-    depth[alpha] = 0.30
+    depth[alpha] = DEPTH_PER_PAR * par[3]
     layer[alpha] = 3
 
     mv = np.zeros(shape + (2,))
     for k in range(4):
         mv[layer == k] = PAN * par[k]
+    # A leaf point sits at screen = world - camera - sway, so previous - current = pan + sway now - sway before.
+    exact = mv.copy()
+    exact[..., 0] += np.where(layer == 3, dx - dx_before, 0.0)
+    exact[..., 1] += np.where(layer == 3, dy - dy_before, 0.0)
     if LEAF_MOTION:
-        # A leaf point sits at screen = world - camera - sway, so previous - current = pan + sway now - sway before.
-        mv[..., 0] += np.where(layer == 3, dx - dx_before, 0.0)
-        mv[..., 1] += np.where(layer == 3, dy - dy_before, 0.0)
-    return col, depth, mv
+        mv = exact
+    return col, depth, mv, exact
 
 
 def grid(w, h):
@@ -162,9 +171,12 @@ def grid(w, h):
     return x.astype(np.float64), y.astype(np.float64)
 
 
-def write_frame(folder, index, col, depth, mv, jit, quality, out_wh):
+def write_frame(folder, index, col, depth, mv, jit, quality, out_wh, exact=None):
     if not os.path.isdir(folder):
         return  # a variant this run does not make
+    side = os.path.join(os.path.dirname(folder), "exact", os.path.basename(folder))
+    if exact is not None and os.path.isdir(side):
+        exact.astype(np.float32).tofile(os.path.join(side, "%05d-motion.raw" % index))
     h, w = depth.shape
     rgba = np.concatenate([col, np.ones((h, w, 1))], -1).astype(np.float16)
     rgba.tofile(os.path.join(folder, "%05d-color.raw" % index))
@@ -177,6 +189,8 @@ def write_meta(folder, index, w, h, jit, quality, out_wh):
     meta = {
         "capture_kind": "evaluation", "evaluation_succeeded": True, "present_ordinal": 1000 + index,
         "size": [w, h], "jitter_px": [float(jit[0]), float(jit[1])], "mv_scale": [1.0, 1.0],
+        # the supplied motion as a camera: pixels (of this picture) per unit of depth
+        "trial_shear_px": [float(PAN[0] / DEPTH_PER_PAR * w / W), float(PAN[1] / DEPTH_PER_PAR * w / W)],
         "preset": 13, "debug_view": 0, "quality": quality, "pre_exposure": 1.0, "exposure_scale": 1.0,
         "hdr": True, "depth_inverted": True, "auto_exposure": True, "mv_lowres": True, "mv_jittered": False,
         "planes": [
@@ -193,7 +207,7 @@ def write_meta(folder, index, w, h, jit, quality, out_wh):
 VARIANTS = ["native", "half-true", "half-4phase", "fold-pick", "fold-cycle", "fold-split", "repro-trial1"]
 
 
-def generate(out, frames=FRAMES, size=None, only=None):
+def generate(out, frames=FRAMES, size=None, only=None, exact=False):
     global W, H
     keep = only or VARIANTS
     if size:
@@ -201,13 +215,16 @@ def generate(out, frames=FRAMES, size=None, only=None):
     hw, hh = W // 2, H // 2
     for v in list(keep) + ["truth"]:
         os.makedirs(os.path.join(out, v), exist_ok=True)
+    if exact:  # the motion with the leaves' sway in it, beside each variant (replay --motion-dir)
+        for v in keep:
+            os.makedirs(os.path.join(out, "exact", v), exist_ok=True)
     X, Y = grid(W, H)
     hx, hy = grid(hw, hh)
     for t in range(frames):
         # native: sample = pixel centre - jitter.
         jn = jitter(t, 16)
-        col, dep, mv = scene(X + 0.5 - jn[0], Y + 0.5 - jn[1], X + 0.5 - jn[0], Y + 0.5 - jn[1], t)
-        write_frame(os.path.join(out, "native"), t, col, dep, mv, jn, 5, (W, H))
+        col, dep, mv, ex = scene(X + 0.5 - jn[0], Y + 0.5 - jn[1], X + 0.5 - jn[0], Y + 0.5 - jn[1], t)
+        write_frame(os.path.join(out, "native"), t, col, dep, mv, jn, 5, (W, H), ex)
 
         # the first trial's fold of those native frames: four picks in turn, DLAA's small jitter.
         px, py = PICKS[t % 4]
@@ -218,31 +235,31 @@ def generate(out, frames=FRAMES, size=None, only=None):
         for name, phases in (("half-true", 64), ("half-4phase", 4)):
             jh = jitter(t, phases)
             sx, sy = 2.0 * (hx + 0.5 - jh[0]), 2.0 * (hy + 0.5 - jh[1])
-            col, dep, mv = scene(sx, sy, sx, sy, t)
-            write_frame(os.path.join(out, name), t, col, dep, mv * 0.5, jh, 0, (W, H))
+            col, dep, mv, ex = scene(sx, sy, sx, sy, t)
+            write_frame(os.path.join(out, name), t, col, dep, mv * 0.5, jh, 0, (W, H), ex * 0.5)
 
         # coarse shading on a full-size picture whose jitter is twice as wide: colour at the block centre,
         # geometry at the kept pixel's centre.
         jh = jitter(t, 64)
         sx, sy = 2.0 * (hx + 0.5 - jh[0]), 2.0 * (hy + 0.5 - jh[1])
-        col, dep, mv = scene(sx + 0.5, sy + 0.5, sx, sy, t)  # kept pixel (1, 1)
+        col, dep, mv, ex = scene(sx + 0.5, sy + 0.5, sx, sy, t)  # kept pixel (1, 1)
         write_frame(os.path.join(out, "fold-pick"), t, col, dep, mv * 0.5, jh, 0, (W, H))
         write_frame(os.path.join(out, "fold-split"), t, col, dep, mv * 0.5, (jh[0] - 0.125, jh[1] - 0.125), 0, (W, H))
         px, py = PICKS[t % 4]
-        col, dep, mv = scene(sx - 0.5 + px, sy - 0.5 + py, sx, sy, t)
-        write_frame(os.path.join(out, "fold-cycle"), t, col, dep, mv * 0.5, jh, 0, (W, H))
+        col, dep, mv, ex = scene(sx - 0.5 + px, sy - 0.5 + py, sx, sy, t)
+        write_frame(os.path.join(out, "fold-cycle"), t, col, dep, mv * 0.5, jh, 0, (W, H), ex * 0.5)
 
         if t >= frames - TRUTH_LAST:
             acc = np.zeros((H, W, 3))
             for a in range(4):
                 for b in range(4):
                     ox, oy = (a + 0.5) / 4.0, (b + 0.5) / 4.0
-                    c, _, _ = scene(X + ox, Y + oy, X + ox, Y + oy, t)
+                    c = scene(X + ox, Y + oy, X + ox, Y + oy, t)[0]
                     acc += c
             np.save(os.path.join(out, "truth", "%05d.npy" % t), (acc / 16.0).astype(np.float32))
         print("frame", t, flush=True)
     with open(os.path.join(out, "scene.json"), "w") as f:
-        json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": list(keep), "leaf_motion": LEAF_MOTION}, f)
+        json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": list(keep), "leaf_motion": LEAF_MOTION, "gust": GUST}, f)
 
 
 def display(x):
@@ -255,8 +272,15 @@ def luma(d):
     return 0.2126 * d[..., 0] + 0.7152 * d[..., 1] + 0.0722 * d[..., 2]
 
 
-def regions(w, h):
+def regions(w, h, gust=False):
     """Name -> (x, y, w, h), 320x200 each, placed on the scene's parts."""
+    r = regions_base(w, h)
+    if gust:
+        r["F-leaves-gusting"] = (int(w * 0.08), 0, 320, int(h * 0.11))
+    return r
+
+
+def regions_base(w, h):
     return {
         "A-wire": (int(w * 0.20), int(h * 0.17), 320, 200),
         "B-brick": (int(w * 0.18), int(h * 0.74), 320, 200),
@@ -320,16 +344,306 @@ def evaluate(out, replay):
     over.save(os.path.join(pics, "overview.jpg"), quality=90)
 
 
+# ---- Fold trial 4 (2026-11-25): our own optical flow on this scene -------------------------------
+# Cort: "test a few things. With optical flow alone at strict rules, 50% looser, and 100% looser.
+# Whichever is best, then run a test combining that with the other supplied motion."
+# The flow is the program's own (tests/host/flow_motion_dump runs compute_flow and the arbiter on the
+# scene's pictures); every motion field then goes through DLSS with the replay tool and is measured
+# against the exact picture.
+FLOW_VARIANTS = ["native", "half-true", "fold-cycle"]
+FLOW_VARIANT_NAMES = {"native": "DLAA", "half-true": "Performance", "fold-cycle": "Fold"}
+FLOW_DUMPS = [  # name, --mode, --loosen
+    ("alone-0", "none", 0), ("alone-50", "none", 50), ("alone-100", "none", 100), ("total", "total", 0),
+    ("correct-0", "camera", 0), ("correct-50", "camera", 50), ("correct-100", "camera", 100),
+]
+FLOW_LABELS = {
+    "supplied": "Supplied only (no leaf motion)",
+    "alone-0": "Flow alone, strict",
+    "alone-50": "Flow alone, 50% looser",
+    "alone-100": "Flow alone, 100% looser",
+    "total": "Flow alone, no-camera measuring",
+    "correct-0": "Supplied first, flow corrects, strict",
+    "correct-50": "Supplied first, flow corrects, 50%",
+    "correct-100": "Supplied first, flow corrects, 100%",
+    "average": "Average of supplied and flow",
+    "flowfirst": "Flow first, supplied elsewhere",
+    "exact": "Exact leaf motion (best possible)",
+}
+FLOW_ORDER = ["supplied", "alone-0", "alone-50", "alone-100", "total", "correct-0", "correct-50", "correct-100",
+              "average", "flowfirst", "exact"]
+
+
+def safe_cores():
+    """Cort's PC: keep this process, and everything it starts, on the cores of mask 00FF33CC."""
+    if os.name != "nt":
+        return
+    import ctypes
+    k = ctypes.windll.kernel32
+    k.GetCurrentProcess.restype = ctypes.c_void_p
+    k.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    ok = k.SetProcessAffinityMask(k.GetCurrentProcess(), 0x00FF33CC)
+    print("processor mask 00FF33CC:", "set" if ok else "NOT SET (this machine has other processors?)", flush=True)
+
+
+def flow_run(cmd, log):
+    import subprocess
+    with open(log, "w") as f:
+        f.write(" ".join(cmd) + "\n")
+        f.flush()
+        code = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
+    return code
+
+
+def flow_planes(folder, t, w, h):
+    mv = np.fromfile(os.path.join(folder, "%05d-motion.raw" % t), dtype=np.float32).reshape(h, w, 2)
+    path = os.path.join(folder, "%05d-prov.raw" % t)
+    prov = np.fromfile(path, dtype=np.uint8).reshape(h, w) & 7 if os.path.isfile(path) else None
+    return mv, prov
+
+
+def flowtrial(scene_dir, work, bindir):
+    """Everything after the scene exists: flow dumps, combinations, replays, numbers, pictures.
+    Finished steps are skipped when it is started again. Nothing is deleted."""
+    from PIL import Image, ImageDraw
+    info = json.load(open(os.path.join(scene_dir, "scene.json")))
+    W_, H_, frames = info["width"], info["height"], info["frames"]
+    last = min(info["truth_last"], frames)
+    dump_exe = os.path.join(bindir, "flow_motion_dump.exe")
+    replay_exe = os.path.join(bindir, "dlss_capture_replay.exe")
+    for exe in (dump_exe, replay_exe):
+        if not os.path.isfile(exe):
+            print("FATAL: missing", exe)
+            return 1
+    logs = os.path.join(work, "logs")
+    os.makedirs(logs, exist_ok=True)
+    notes = []
+
+    def note(text):
+        notes.append(text)
+        print(text, flush=True)
+
+    def size_of(v):
+        return (W_, H_) if v == "native" else (W_ // 2, H_ // 2)
+
+    def dump_dir(v, name):
+        return os.path.join(work, "flow", v, name)
+
+    def motion_dir(v, name):
+        if name == "supplied":
+            return None
+        if name == "exact":
+            return os.path.join(scene_dir, "exact", v)
+        return dump_dir(v, name)
+
+    def do_dump(v, name, mode, loosen):
+        out = dump_dir(v, name)
+        if os.path.isfile(os.path.join(out, "%05d-motion.raw" % (frames - 1))):
+            return True
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        code = flow_run([dump_exe, os.path.join(scene_dir, v), out, "--mode", mode, "--loosen", str(loosen)],
+                        os.path.join(logs, "flow-%s-%s.txt" % (v, name)))
+        if code != 0:
+            note("FAILED (exit %d): flow %s %s; see logs" % (code, v, name))
+        return code == 0
+
+    def do_replay(v, name):
+        root = os.path.join(work, "replay", v)
+        if os.path.isfile(os.path.join(root, name, "%05d-dlssout.raw" % (frames - 1))):
+            return True
+        os.makedirs(root, exist_ok=True)
+        cmd = [replay_exe, os.path.join(scene_dir, v), root, "--name", name, "--preroll", "0", "--save-last", str(last)]
+        md = motion_dir(v, name)
+        if md:
+            if not os.path.isfile(os.path.join(md, "%05d-motion.raw" % (frames - 1))):
+                return False
+            cmd += ["--motion-dir", md]
+        code = flow_run(cmd, os.path.join(logs, "replay-%s-%s.txt" % (v, name)))
+        if code != 0:
+            note("FAILED (exit %d): replay %s %s; see logs" % (code, v, name))
+        return code == 0
+
+    truth = {t: display(np.load(os.path.join(scene_dir, "truth", "%05d.npy" % t))) for t in range(frames - last, frames)}
+    truth_luma = {t: luma(d) for t, d in truth.items()}
+    reg = regions(W_, H_, info.get("gust", 0) > 0)
+    cols = ["whole"] + list(reg)
+    err, final = {}, {}
+    shown = [c for c in ["F-leaves-gusting", "E-leaves-swaying", "D-leaves-still", "A-wire", "C-wall-edge", "B-brick", "whole"] if c in cols]
+
+    def measure(v, name):
+        """Picture error by region for one replay, or None."""
+        if (v, name) in err:
+            return err[(v, name)]
+        folder = os.path.join(work, "replay", v, name)
+        if not os.path.isfile(os.path.join(folder, "%05d-dlssout.raw" % (frames - 1))):
+            return None
+        e = {c: [] for c in cols}
+        for t in range(frames - last, frames):
+            d = display(np.fromfile(os.path.join(folder, "%05d-dlssout.raw" % t), dtype=np.float16).reshape(H_, W_, 4)[..., :3])
+            if t == frames - 1:
+                final[(v, name)] = d
+            diff = np.abs(luma(d) - truth_luma[t])
+            e["whole"].append(diff.mean())
+            for r, (x, y, rw, rh) in reg.items():
+                e[r].append(diff[y:y + rh, x:x + rw].mean())
+        err[(v, name)] = {c: (float(np.mean(e[c])), float(np.std(e[c]))) for c in cols}
+        return err[(v, name)]
+
+    # 1. the flow's motion, each way, for each picture size; and the replays that need nothing combined.
+    #    Half size gets every way; DLAA and the fold get the ones that say how they compare (the
+    #    full-size motion planes are 11 MB a frame each).
+    def wanted(v, name):
+        return v == "half-true" or name in ("supplied", "exact", "total", "correct-0", "correct-50", "correct-100")
+    for v in FLOW_VARIANTS:
+        for name, mode, loosen in FLOW_DUMPS:
+            if wanted(v, name):
+                do_dump(v, name, mode, loosen)
+        for name in ["supplied", "exact"] + [n for n, _, _ in FLOW_DUMPS]:
+            if wanted(v, name):
+                do_replay(v, name)
+                measure(v, name)
+
+    # 2. which strictness is best for flow alone: lowest error on the swaying leaves at half size
+    #    (where the motion matters most), the whole picture deciding a tie.
+    def score(name):
+        m = measure("half-true", name)
+        if not m:
+            return (1e9, 1e9)
+        return (round(m["E-leaves-swaying"][0] + (m["F-leaves-gusting"][0] if "F-leaves-gusting" in m else 0.0), 2), m["whole"][0])
+    alone = ["alone-0", "alone-50", "alone-100"]
+    best = min(alone, key=score)
+    note("Best strictness for flow alone (lowest error on the swaying and gusting leaves at half size): %s" % FLOW_LABELS[best])
+    note("Combinations use that flow field. 'Supplied first, flow corrects' is run at all three strictness levels.")
+
+    # 3. the two combinations made here from the best flow-alone field and the supplied motion.
+    for v in ["half-true"]:
+        w, h = size_of(v)
+        src = dump_dir(v, best)
+        if not os.path.isfile(os.path.join(src, "%05d-motion.raw" % (frames - 1))):
+            continue
+        for name in ("average", "flowfirst"):
+            os.makedirs(dump_dir(v, name), exist_ok=True)
+        for t in range(frames):
+            if os.path.isfile(os.path.join(dump_dir(v, "flowfirst"), "%05d-motion.raw" % t)) and \
+               os.path.isfile(os.path.join(dump_dir(v, "average"), "%05d-motion.raw" % t)):
+                continue
+            flow, prov = flow_planes(src, t, w, h)
+            given = np.fromfile(os.path.join(scene_dir, v, "%05d-motion.raw" % t), dtype=np.float32).reshape(h, w, 2)
+            known = (prov == 3)[..., None]  # the flow measured this pixel and its rules accepted it
+            np.where(known, 0.5 * (flow + given), given).astype(np.float32).tofile(os.path.join(dump_dir(v, "average"), "%05d-motion.raw" % t))
+            np.where(known, flow, given).astype(np.float32).tofile(os.path.join(dump_dir(v, "flowfirst"), "%05d-motion.raw" % t))
+        for name in ("average", "flowfirst"):
+            do_replay(v, name)
+            measure(v, name)
+
+    # 4. numbers.
+    pics = os.path.join(work, "compare")
+    os.makedirs(pics, exist_ok=True)
+    lines = ["Fold trial 4: our own optical flow on the made-up scene. The supplied motion has no leaf sway in it.",
+             "Picture error against the exact picture (0..255 display scale), mean of the last %d frames. Lower is better." % last,
+             "In brackets: how much that error varies from frame to frame.", ""]
+    lines += notes + [""]
+    for c in shown:
+        lines.append("Region: %s" % c)
+        lines.append("%-40s" % "motion given to DLSS" + "".join("%18s" % FLOW_VARIANT_NAMES[v] for v in FLOW_VARIANTS))
+        for name in FLOW_ORDER:
+            row = "%-40s" % (FLOW_LABELS[name] + (" *" if name == best else ""))
+            for v in FLOW_VARIANTS:
+                m = measure(v, name)
+                row += "%18s" % ("%.2f (%.2f)" % m[c] if m else "-")
+            lines.append(row)
+        lines.append("")
+    lines.append("* = the flow-alone strictness the two made-here combinations use.")
+    lines.append("")
+
+    # how good the motion itself is: distance from the exact motion, in full-size pixels, and how much
+    # of the region the flow answered for.
+    for c in [c for c in shown if c in ("F-leaves-gusting", "E-leaves-swaying", "D-leaves-still", "whole")]:
+        lines.append("Motion error against the exact motion, full-size pixels, region %s (last %d frames); in brackets the share of pixels the flow answered for" % (c, last))
+        lines.append("%-40s" % "motion" + "".join("%22s" % FLOW_VARIANT_NAMES[v] for v in FLOW_VARIANTS))
+        for name in FLOW_ORDER:
+            if name == "exact":
+                continue
+            row = "%-40s" % FLOW_LABELS[name]
+            for v in FLOW_VARIANTS:
+                w, h = size_of(v)
+                k = W_ // w
+                md = motion_dir(v, name) or os.path.join(scene_dir, v)
+                if not os.path.isfile(os.path.join(md, "%05d-motion.raw" % (frames - 1))):
+                    row += "%22s" % "-"
+                    continue
+                if c == "whole":
+                    x0, y0, x1, y1 = 0, 0, w, h
+                else:
+                    x, y, rw, rh = reg[c]
+                    x0, y0, x1, y1 = x // k, y // k, (x + rw) // k, (y + rh) // k
+                dist, share = [], []
+                for t in range(frames - last, frames):
+                    mv, prov = flow_planes(md, t, w, h)
+                    ex = np.fromfile(os.path.join(scene_dir, "exact", v, "%05d-motion.raw" % t), dtype=np.float32).reshape(h, w, 2)
+                    dd = np.hypot(mv[..., 0] - ex[..., 0], mv[..., 1] - ex[..., 1])[y0:y1, x0:x1] * k
+                    dist.append(dd.mean())
+                    if prov is not None:
+                        share.append(((prov[y0:y1, x0:x1] == 3) | (prov[y0:y1, x0:x1] == 4)).mean())
+                row += "%22s" % ("%.3f px (%s)" % (np.mean(dist), "%.0f%%" % (100 * np.mean(share)) if share else "-"))
+            lines.append(row)
+        lines.append("")
+    open(os.path.join(pics, "numbers.txt"), "w").write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+    # 5. pictures: one sheet a region and picture size, every motion source side by side, last frame.
+    for c in [c for c in shown if c in ("F-leaves-gusting", "E-leaves-swaying", "D-leaves-still", "A-wire")]:
+        x, y, rw, rh = reg[c]
+        for v in FLOW_VARIANTS:
+            panels = [("Exact picture", truth[frames - 1])]
+            if ("native", "supplied") in final and v != "native":
+                panels.append(("DLAA, supplied motion", final[("native", "supplied")]))
+            for name in FLOW_ORDER:
+                if (v, name) in final:
+                    panels.append(("%s: %s  [%.2f]" % (FLOW_VARIANT_NAMES[v], FLOW_LABELS[name], err[(v, name)][c][0]), final[(v, name)]))
+            per_row = 4
+            rows_n = (len(panels) + per_row - 1) // per_row
+            sheet = Image.new("RGB", ((rw * 2 + 8) * per_row, (rh * 2 + 30) * rows_n), (24, 24, 24))
+            dr = ImageDraw.Draw(sheet)
+            for k, (label, pic) in enumerate(panels):
+                crop = Image.fromarray(np.clip(pic[y:y + rh, x:x + rw], 0, 255).astype(np.uint8)).resize((rw * 2, rh * 2), Image.NEAREST)
+                ox, oy = (k % per_row) * (rw * 2 + 8), (k // per_row) * (rh * 2 + 30)
+                dr.text((ox + 4, oy + 8), label, fill=(255, 255, 255))
+                sheet.paste(crop, (ox, oy + 30))
+            sheet.save(os.path.join(pics, "compare-%s-%s.jpg" % (c, v)), quality=92)
+
+    # A script Cort can run to remove the bulky in-between motion planes (the results stay).
+    with open(os.path.join(work, "DELETE-flow-planes.cmd"), "w") as f:
+        f.write("@echo off\r\nrem Removes only the in-between motion planes of fold trial 4. Numbers and pictures stay.\r\n"
+                "rmdir /s /q \"%~dp0flow\"\r\necho Done.\r\npause\r\n")
+    return 0
+
+
+
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "generate":
-        generate(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else FRAMES,
-                 (int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) > 5 else None)
-    elif len(sys.argv) >= 3 and sys.argv[1] == "generate-leafmotion":
+    args = sys.argv[1:]
+    if len(args) >= 2 and any(a.startswith("-") for a in args[1:]):
+        print("This script takes folders and numbers only, no options:", " ".join(args[1:]))
+        sys.exit(2)
+    if len(args) >= 2 and args[0] == "generate":
+        safe_cores()
+        generate(args[1], int(args[2]) if len(args) > 2 else FRAMES, (int(args[3]), int(args[4])) if len(args) > 4 else None)
+    elif len(args) >= 2 and args[0] == "generate-leafmotion":
         # The same scene, with the swaying leaves' motion in the vectors: DLAA, ordinary half size, the fold.
+        safe_cores()
         LEAF_MOTION = True
-        generate(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else FRAMES, None, ["native", "half-true", "fold-cycle"])
-    elif len(sys.argv) >= 4 and sys.argv[1] == "evaluate":
-        evaluate(sys.argv[2], sys.argv[3])
+        generate(args[1], int(args[2]) if len(args) > 2 else FRAMES, None, ["native", "half-true", "fold-cycle"])
+    elif len(args) >= 2 and args[0] == "generate-flowtrial":
+        # Trial 4's scene: DLAA, ordinary half size and the fold, supplied motion without the sway, and the
+        # exact motion beside each.
+        safe_cores()
+        GUST = 4.0
+        generate(args[1], int(args[2]) if len(args) > 2 else FRAMES, (int(args[3]), int(args[4])) if len(args) > 4 else None,
+                 FLOW_VARIANTS, exact=True)
+    elif len(args) >= 4 and args[0] == "flowtrial":
+        safe_cores()
+        sys.exit(flowtrial(args[1], args[2], args[3]))
+    elif len(args) >= 3 and args[0] == "evaluate":
+        evaluate(args[1], args[2])
     else:
         print(__doc__)
         sys.exit(2)

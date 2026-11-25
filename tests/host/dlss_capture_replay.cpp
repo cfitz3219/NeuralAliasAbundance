@@ -27,6 +27,8 @@
 //                                         saved motion is negated): a longer sequence from few frames
 //   --crop X Y W H                        save only this rectangle of each output (a whole 3440x1433
 //                                         output is 20 to 40 MB a frame; the region studied is far less)
+//   --save-last N                         write only the last N outputs to disk (every frame still goes
+//                                         through DLSS, and the files keep their numbers)
 //
 //   --fold cycle | fixed                  the "fold the shading" trial (2026-11-24): every plane is folded to
 //                                         half size by keeping ONE pixel of each 2x2 block, and DLSS is
@@ -388,7 +390,7 @@ int Usage()
 {
     std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D] [--motion-dir DIR]\n"
                 "    [--preset 0|10..13] [--parity all|even|odd] [--first INDEX] [--frames N] [--all] [--preroll N] [--pingpong N]\n"
-                "    [--crop X Y W H] [--fold cycle|fixed] [--fold-sign 1|-1]\n");
+                "    [--crop X Y W H] [--save-last N] [--fold cycle|fixed] [--fold-sign 1|-1]\n");
     return 2;
 }
 } // namespace
@@ -401,7 +403,7 @@ int main(int argc, char** argv)
     MotionMode mode = MotionMode::Captured;
     const char* mode_name = "captured";
     float far_depth = 0.005f;
-    uint32_t preset = 0, first = 0, max_frames = 0, preroll = 16, pingpong = 0;
+    uint32_t preset = 0, first = 0, max_frames = 0, preroll = 16, pingpong = 0, save_last = 0;
     uint32_t crop_x = 0, crop_y = 0, crop_w = 0, crop_h = 0; // 0 size = the whole output
     int parity = -1;
     bool all = false;
@@ -428,6 +430,7 @@ int main(int argc, char** argv)
         else if (a == "--frames") { if (!number(&max_frames)) return Usage(); }
         else if (a == "--preroll") { if (!number(&preroll)) return Usage(); }
         else if (a == "--pingpong") { if (!number(&pingpong)) return Usage(); }
+        else if (a == "--save-last") { if (!number(&save_last)) return Usage(); }
         else if (a == "--parity" && value) {
             const std::string v = value;
             ++i;
@@ -708,6 +711,7 @@ int main(int argc, char** argv)
         d.WaitIdle();
         if (dev->GetDeviceRemovedReason() != S_OK) { Log("FATAL: the device was removed at step %zu", si); return 1; }
         if (s.preroll) continue;
+        if (save_last && si + save_last < steps.size()) { ++written; continue; } // not kept on disk; the number is
 
         // The replayed output as tight rows, and (first forward pass) how far it is from the saved output.
         const size_t tight = static_cast<size_t>(out_plane.width) * out_bpp;
