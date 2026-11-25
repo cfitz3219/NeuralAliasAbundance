@@ -83,9 +83,19 @@ GUST = 0.0
 LEAF_MOTION = False  # True: the swaying leaves' own motion is in the motion vectors (as optical flow would supply)
 
 
-def scene(gx, gy, sx, sy, t):
+def scene(gx, gy, sx, sy, t, foot=0.0, parts=False):
     """Colour (h, w, 3), depth, motion (full-size pixels, current to previous) for samples whose geometry is
-    taken at (gx, gy) and whose colour program runs at (sx, sy). Full-size pixel coordinates."""
+    taken at (gx, gy) and whose colour program runs at (sx, sy). Full-size pixel coordinates.
+    foot > 0: the colour program's textures (brick, leaves and the leaves' cut-out) are read as a game's
+    mip-mapped textures are, averaged over a square of `foot` full-size pixels, the cut-out tested after
+    the averaging. foot = 0 reads them at the exact point (no mip filtering at all)."""
+    if foot > 0.0:
+        acc = None
+        for ox, oy in ((-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)):
+            p = scene(gx, gy, sx + ox * foot, sy + oy * foot, t, 0.0, True)
+            acc = p if acc is None else [a + b for a, b in zip(acc, p)]
+        col, leaf, alpha, depth, layer, sdx, sdy = [a / 4.0 for a in acc]
+        return _finish(col, leaf, alpha >= 0.5, depth, np.rint(layer).astype(np.int32), sdx, sdy)
     cam = PAN * t
     par = [0.05, 0.30, 0.60, 1.00]
     shape = gx.shape
@@ -150,17 +160,28 @@ def scene(gx, gy, sx, sy, t):
     hue = vnoise(wx / 23.0, wy / 23.0, 10)
     leaf = np.stack([0.10 + 0.22 * hue, 0.26 + 0.34 * shade, 0.06 + 0.10 * hue], -1) * (0.45 + 0.9 * shade)[..., None]
     leaf[twig] = np.array([0.16, 0.11, 0.07])
+    if parts:
+        return [col, leaf, alpha.astype(np.float64), depth, layer.astype(np.float64), dx - dx_before, dy - dy_before]
+    return _finish(col, leaf, alpha, depth, layer, dx - dx_before, dy - dy_before)
+
+
+def _finish(col, leaf, alpha, depth, layer, sdx, sdy):
+    """The leaves over what is behind them, and the motion of the result."""
+    par = [0.05, 0.30, 0.60, 1.00]
+    col = col.copy()
+    depth = depth.copy()
+    layer = layer.copy()
     col[alpha] = leaf[alpha]
     depth[alpha] = DEPTH_PER_PAR * par[3]
     layer[alpha] = 3
 
-    mv = np.zeros(shape + (2,))
+    mv = np.zeros(depth.shape + (2,))
     for k in range(4):
         mv[layer == k] = PAN * par[k]
     # A leaf point sits at screen = world - camera - sway, so previous - current = pan + sway now - sway before.
     exact = mv.copy()
-    exact[..., 0] += np.where(layer == 3, dx - dx_before, 0.0)
-    exact[..., 1] += np.where(layer == 3, dy - dy_before, 0.0)
+    exact[..., 0] += np.where(layer == 3, sdx, 0.0)
+    exact[..., 1] += np.where(layer == 3, sdy, 0.0)
     if LEAF_MOTION:
         mv = exact
     return col, depth, mv, exact
@@ -262,6 +283,61 @@ def generate(out, frames=FRAMES, size=None, only=None, exact=False):
         json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": list(keep), "leaf_motion": LEAF_MOTION, "gust": GUST}, f)
 
 
+MIP_VARIANTS = ["native-b1", "half-b0", "half-b1", "half-b2", "half-b225", "half-b2-halton", "fold-b0", "fold-b2", "fold-b225"]
+
+
+def jitter_r2(i, phases):
+    """Martin Roberts' R2 sequence, as src/core/temporal_jitter.hpp temporal_jitter_r2 gives it."""
+    n = float(i % phases + 1)
+    return (0.5 + n * 0.7548776662466927) % 1.0 - 0.5, (0.5 + n * 0.5698402909980532) % 1.0 - 0.5
+
+
+def generate_mip(out, frames=FRAMES, size=None):
+    """Trial 5 (Cort, 2026-11-25: "include the required mip bias"; R2 jitter preferred): the scene's
+    textures read as mip-mapped ones. NVIDIA's rule is bias = log2(render / display) - 1: DLAA -1,
+    Performance -2 (our program uses -2.25 there). A picture rendered at share s of full size with bias b
+    reads its textures over 2^b / s full-size pixels: DLAA at -1 over half a pixel, half size with no bias
+    over two, half size at -2 over half a pixel again. Coarse shading picks its mip like a half-size
+    render. The leaves' exact motion is supplied, so only the texture reading differs."""
+    global W, H, LEAF_MOTION
+    LEAF_MOTION = True
+    if size:
+        W, H = size
+    hw, hh = W // 2, H // 2
+    for v in MIP_VARIANTS + ["truth"]:
+        os.makedirs(os.path.join(out, v), exist_ok=True)
+    X, Y = grid(W, H)
+    hx, hy = grid(hw, hh)
+    foot = {"b0": 2.0, "b1": 1.0, "b2": 0.5, "b225": 2.0 * 2.0 ** -2.25}
+    for t in range(frames):
+        jn = jitter_r2(t, 16)
+        col, dep, mv, _ = scene(X + 0.5 - jn[0], Y + 0.5 - jn[1], X + 0.5 - jn[0], Y + 0.5 - jn[1], t, 0.5)
+        write_frame(os.path.join(out, "native-b1"), t, col, dep, mv, jn, 5, (W, H))
+        jh = jitter_r2(t, 64)
+        sx, sy = 2.0 * (hx + 0.5 - jh[0]), 2.0 * (hy + 0.5 - jh[1])
+        for b in ("b0", "b1", "b2", "b225"):
+            col, dep, mv, _ = scene(sx, sy, sx, sy, t, foot[b])
+            write_frame(os.path.join(out, "half-" + b), t, col, dep, mv * 0.5, jh, 0, (W, H))
+        px, py = PICKS[t % 4]
+        for b in ("b0", "b2", "b225"):
+            col, dep, mv, _ = scene(sx - 0.5 + px, sy - 0.5 + py, sx, sy, t, foot[b])
+            write_frame(os.path.join(out, "fold-" + b), t, col, dep, mv * 0.5, jh, 0, (W, H))
+        jo = jitter(t, 64)  # Halton, for the comparison with R2
+        ox_, oy_ = 2.0 * (hx + 0.5 - jo[0]), 2.0 * (hy + 0.5 - jo[1])
+        col, dep, mv, _ = scene(ox_, oy_, ox_, oy_, t, foot["b2"])
+        write_frame(os.path.join(out, "half-b2-halton"), t, col, dep, mv * 0.5, jo, 0, (W, H))
+        if t >= frames - TRUTH_LAST:
+            acc = np.zeros((H, W, 3))
+            for a in range(4):
+                for b in range(4):
+                    ox, oy = (a + 0.5) / 4.0, (b + 0.5) / 4.0
+                    acc += scene(X + ox, Y + oy, X + ox, Y + oy, t)[0]
+            np.save(os.path.join(out, "truth", "%05d.npy" % t), (acc / 16.0).astype(np.float32))
+        print("frame", t, flush=True)
+    with open(os.path.join(out, "scene.json"), "w") as f:
+        json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": MIP_VARIANTS, "leaf_motion": True, "gust": GUST}, f)
+
+
 def display(x):
     x = np.nan_to_num(np.maximum(x.astype(np.float64), 0.0))
     x = x / (1.0 + x)
@@ -301,7 +377,10 @@ def evaluate(out, replay):
     lines = []
     labels = {"native": "DLAA today", "half-true": "Normal DLSS Performance", "half-4phase": "Performance, 4 jitter spots",
               "fold-pick": "Fold (as proposed)", "fold-cycle": "Fold, pixel in turn", "fold-split": "Fold, jitter nudged",
-              "repro-trial1": "First trial's method"}
+              "repro-trial1": "First trial's method",
+              "native-b1": "DLAA, bias -1 (R2)", "half-b0": "Performance, no bias", "half-b1": "Performance, bias -1",
+              "half-b2": "Performance, bias -2", "half-b225": "Performance, bias -2.25", "half-b2-halton": "Perf., bias -2, Halton",
+              "fold-b0": "Fold, no bias", "fold-b2": "Fold, bias -2", "fold-b225": "Fold, bias -2.25"}
     err = {v: {r: [] for r in list(reg) + ["whole"]} for v in info["variants"]}
     final = {}
     for t in range(frames - last, frames):
@@ -325,10 +404,10 @@ def evaluate(out, replay):
         lines.append("%-30s" % labels[v] + "".join("%20s" % ("%.2f (wobble %.2f)" % (np.mean(err[v][c]), np.std(err[v][c]))) for c in cols))
     open(os.path.join(pics, "numbers.txt"), "w").write("\n".join(lines) + "\n")
     print("\n".join(lines))
-    order = [v for v in ["truth", "native", "half-true", "fold-pick", "fold-cycle", "fold-split", "half-4phase", "repro-trial1"] if v in final]
+    order = [v for v in ["truth", "native", "half-true"] + MIP_VARIANTS + ["fold-pick", "fold-cycle", "fold-split", "half-4phase", "repro-trial1"] if v in final]
     names = dict(labels, truth="Exact picture")
     for r, (x, y, rw, rh) in reg.items():
-        sheet = Image.new("RGB", ((rw * 2 + 8) * 4, (rh * 2 + 30) * 2), (24, 24, 24))
+        sheet = Image.new("RGB", ((rw * 2 + 8) * 4, (rh * 2 + 30) * ((len(order) + 3) // 4)), (24, 24, 24))
         dr = ImageDraw.Draw(sheet)
         for k, v in enumerate(order):
             crop = Image.fromarray(np.clip(final[v][y:y + rh, x:x + rw], 0, 255).astype(np.uint8)).resize((rw * 2, rh * 2), Image.NEAREST)
@@ -336,7 +415,7 @@ def evaluate(out, replay):
             dr.text((ox + 4, oy + 8), names[v], fill=(255, 255, 255))
             sheet.paste(crop, (ox, oy + 30))
         sheet.save(os.path.join(pics, "compare-%s.jpg" % r), quality=92)
-    over = Image.fromarray(np.clip(final["fold-cycle"], 0, 255).astype(np.uint8))
+    over = Image.fromarray(np.clip(final["fold-cycle" if "fold-cycle" in final else order[-1]], 0, 255).astype(np.uint8))
     dr = ImageDraw.Draw(over)
     for r, (x, y, rw, rh) in reg.items():
         dr.rectangle([x, y, x + rw, y + rh], outline=(255, 230, 0), width=3)
@@ -639,6 +718,9 @@ if __name__ == "__main__":
         GUST = 4.0
         generate(args[1], int(args[2]) if len(args) > 2 else FRAMES, (int(args[3]), int(args[4])) if len(args) > 4 else None,
                  FLOW_VARIANTS, exact=True)
+    elif len(args) >= 2 and args[0] == "generate-mip":
+        safe_cores()
+        generate_mip(args[1], int(args[2]) if len(args) > 2 else FRAMES, (int(args[3]), int(args[4])) if len(args) > 4 else None)
     elif len(args) >= 4 and args[0] == "flowtrial":
         safe_cores()
         sys.exit(flowtrial(args[1], args[2], args[3]))
