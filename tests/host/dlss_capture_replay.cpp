@@ -48,6 +48,11 @@
 //                                         pixel's own centre. block: the block's centre whichever pixel was kept,
 //                                         which is what the live test build f98ae48c told DLSS for a scene shaded
 //                                         in blocks (use it on a capture taken in a live folded mode).
+//   --second-feature                      at the second replayed frame, a second DLSS feature (another view,
+//                                         half the render size, Performance) is created and run once on the same
+//                                         planes, then the replay carries on. Shows whether one feature's creation
+//                                         disturbs another's later frames (Cort's fb0d69cd run: DLAA turned to
+//                                         colour noise after the Performance level had been created).
 // Output, in <out folder>\<name>: one NNNNN-dlssout.raw per replayed frame (tight rows, the capture's
 // own pixel format), replay.csv (which saved frame each step is, and the rectangle saved) and
 // replay.log (every setting, and per frame how far the whole replayed output is from the output the
@@ -417,6 +422,7 @@ int main(int argc, char** argv)
     FoldMode fold = FoldMode::Off;
     float fold_sign = 1.0f;
     bool fold_block = false;
+    bool second_feature = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* value = i + 1 < argc ? argv[i + 1] : nullptr;
@@ -454,6 +460,7 @@ int main(int argc, char** argv)
             else if (v == "fixed") fold = FoldMode::Fixed;
             else return Usage();
         }
+        else if (a == "--second-feature") second_feature = true;
         else if (a == "--fold-declare" && value) { fold_block = std::string(value) == "block"; ++i; }
         else if (a == "--fold-sign" && value) { fold_sign = std::strtod(value, nullptr) < 0 ? -1.0f : 1.0f; ++i; }
         else if (a == "--crop" && i + 4 < argc) {
@@ -712,6 +719,18 @@ int main(int argc, char** argv)
             REQUIRE(Fill(l.list.Get(), &bias, bias_rows));
             e.bias_current_color = bias.tex.Get();
             ++bias_planes;
+        }
+        if (second_feature && si == 1) {
+            na::dlss::EvalDesc x = e;
+            x.view_id = e.view_id + 1;
+            x.render_w = x.max_render_w = e.render_w / 2;
+            x.render_h = x.max_render_h = e.render_h / 2;
+            x.quality = na::dlss::Quality::MaxPerformance;
+            x.mv_display_res = false;
+            x.reset = true;
+            x.bias_current_color = nullptr;
+            const bool ok = na::dlss::Evaluate(l.list.Get(), x); // its picture is overwritten by the replayed frame below
+            Log("second feature: %ux%u Performance on view %llu, %s", x.render_w, x.render_h, static_cast<unsigned long long>(x.view_id), ok ? "created and run" : na::dlss::GetStats().reason);
         }
         if (!na::dlss::Evaluate(l.list.Get(), e)) {
             Log("FATAL: evaluate refused at step %zu (saved frame %u): %s", si, m.index, na::dlss::GetStats().reason);
