@@ -2642,8 +2642,16 @@ void fold_record(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, n
     out->color = p.color.Get();
     out->depth = p.depth.Get();
     out->motion = p.motion.Get();
-    out->render_w = out->max_render_w = p.w;
-    out->render_h = out->max_render_h = p.h;
+    out->render_w = p.w;
+    out->render_h = p.h;
+    // The feature is CREATED at the full size and evaluated at the folded one. Cort's fb0d69cd run: after
+    // the Performance level existed, DLAA and Quality put out bands of colour noise on a clean picture.
+    // Replays of his capture (dlss_capture_replay --second-feature) showed the trigger exactly: with this
+    // DLSS model, a later feature created at a SMALLER render size corrupts the earlier, larger one's
+    // output from that frame on; one created at the full size and run at the smaller size does not
+    // (DLAA byte-identical to a run without it), and its own folded picture is the same to 0.4%.
+    out->max_render_w = base.render_w;
+    out->max_render_h = base.render_h;
     out->mv_scale_x = base.mv_scale_x / static_cast<float>(blk.x); // the kept vectors are full-size pixels
     out->mv_scale_y = base.mv_scale_y / static_cast<float>(blk.y);
     out->mv_display_res = false;
