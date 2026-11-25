@@ -5057,6 +5057,23 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                                static_cast<unsigned long long>(g.frame), na::fold::Name(was_sampled ? sampled_mode : shown));
         }
     }
+    // Folded flow (Astra's candidate, accepted by Cort 2026-11-25 from the offline pictures, COMMS 10:05Z):
+    // with no camera in use the whole measuring stage (search, fit, measure) runs on the level's own folded
+    // picture, a half or a quarter of the pixels, and the sampled arbiter scales its vectors to full-size
+    // pixels beside the full-size tiers (the game's own vectors, draw replay). Same conditions as sampled
+    // motion; with a camera in use the whole-picture search stays.
+    const bool folded_flow = sampled_mode != na::fold::Mode::Off && measured && g_fold.ok;
+    {
+        static int was_folded_flow = -1;
+        if (static_cast<int>(folded_flow) != was_folded_flow) {
+            was_folded_flow = folded_flow ? 1 : 0;
+            na::eventlog::Emit("fold", "motion search %s at frame %llu: %s", folded_flow ? "ON THE FOLDED PICTURE" : "on the whole picture",
+                               static_cast<unsigned long long>(g.frame),
+                               folded_flow ? "a settled folded level with no camera in use"
+                               : sampled_mode == na::fold::Mode::Off ? "no settled folded level, or something needs the whole motion field (warm-up, capture, debug view, MSAA, ambient shading)"
+                               : !measured ? "a camera is in use (the search serves the camera fit at full size)" : "the fold pass is not available");
+        }
+    }
     if (g.arbiter_ok) {
         na::motion::gpu::Inputs in{};
         in.depth = g.depth32.Get();
@@ -5112,12 +5129,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                     frame.block_x = static_cast<uint8_t>(fb.x); frame.block_y = static_cast<uint8_t>(fb.y);
                 }
                 na::j2::compute_flow::SetLoosen(folded ? 0u : na::settings::kObjectFlowLoosen);
-                if (sampled_mode != na::fold::Mode::Off) {
+                if (sampled_mode != na::fold::Mode::Off && !folded_flow) {
                     const auto sb = na::fold::BlockFor(sampled_mode);
                     const auto sp = na::fold::Pick(sampled_mode);
                     frame.sample_x = static_cast<uint8_t>(sb.x); frame.sample_y = static_cast<uint8_t>(sb.y);
                     frame.sample_pick_x = static_cast<uint8_t>(sp.x); frame.sample_pick_y = static_cast<uint8_t>(sp.y);
                 }
+                if (folded_flow) { frame.block_x = frame.block_y = 1; } // the folded picture has one shaded value a pixel
             }
             // Measured with viewport jitter: the sample is the viewports' own, exactly zero when no
             // draw carried one, so an unjittered first picture pairs with the jittered one after it.
@@ -5129,6 +5147,33 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             frame.use_screen_fit = tool != Tool::ScreenFit || !compare_fit;
             frame.total=measured;frame.last_reset_frame=g.last_reset_frame;
             na::j2::compute_flow::Tier3 tier;
+            if (folded_flow) {
+                // The level's folded colour and depth now (the fold before DLSS makes them again, after
+                // anything that changes the picture in between), on the warm-up's table: no level warms here.
+                const auto fb = na::fold::BlockFor(sampled_mode);
+                const auto fp = na::fold::Pick(sampled_mode);
+                auto& planes = g_fold.planes[static_cast<uint32_t>(sampled_mode)];
+                na::dlss::EvalDesc src{};
+                src.color = g.color_in.Get(); src.depth = g.depth32.Get(); src.motion = g.motion.Get();
+                fold_dispatch(l, src, planes, fb, fp, (g.slot % kRing) * 2 + 1, true);
+                std::vector<D3D12_RESOURCE_BARRIER> fbar;
+                fbar.push_back(uav_barrier(planes.color.Get())); fbar.push_back(uav_barrier(planes.depth.Get()));
+                add(fbar, planes.color.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                add(fbar, planes.depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                flush(l, fbar);
+                // The kept pixel's sample in folded pixels: the same offset DLSS is told for this level.
+                na::motion::gpu::Inputs fin = in;
+                fin.depth = planes.depth.Get();
+                frame.jitter[0] = na::fold::DeclaredJitter(fb.x, fp.x, in.jitter_current_px[0]);
+                frame.jitter[1] = na::fold::DeclaredJitter(fb.y, fp.y, in.jitter_current_px[1]);
+                frame.raster_jitter[0] = frame.jitter[0]; frame.raster_jitter[1] = frame.jitter[1];
+                fin.jitter_current_px[0] = frame.jitter[0]; fin.jitter_current_px[1] = frame.jitter[1];
+                pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),planes.color.Get(),planes.depth.Get(),fin,frame,tier);
+                add(fbar, planes.color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                add(fbar, planes.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                flush(l, fbar);
+                in.estimated_folded = true; // the arbiter reads it at the output position and scales it by the block
+            } else
             pending.compute_flow=na::j2::compute_flow::Record(l,g.queue.Get(),g.color_in.Get(),g.depth32.Get(),in,frame,tier);
             if(measured){
                 // Nothing can be measured at all (the programs or working memory are missing, or the
@@ -5227,7 +5272,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                 learn.mode = 1;
                 std::memcpy(learn.matrix, in.inv_view_proj_current.m, sizeof learn.matrix);
                 learn.fix = in.fix;
-            } else if (measured && flow_tier.screen_model) {
+            } else if (measured && flow_tier.screen_model && !folded_flow) { // a folded model is in folded pixels: nothing learned
                 learn.mode = 2;
                 learn.model = flow_tier.screen_model;
             }
@@ -5522,7 +5567,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                                cs.rate, static_cast<unsigned long long>(cs.draws), static_cast<unsigned long long>(cs.sets),
                                static_cast<unsigned long long>(cs.restores), static_cast<unsigned long long>(cs.unavailable),
                                jitter_phases(), e.jitter_x, e.jitter_y, e.render_w, e.render_h,
-                               sampled_mode != Mode::Off ? "sampled" : "whole", static_cast<unsigned long long>(na::j2::compute_flow::GetStats().sampled_pairs));
+                               folded_flow ? "folded-search" : sampled_mode != Mode::Off ? "sampled" : "whole", static_cast<unsigned long long>(na::j2::compute_flow::GetStats().sampled_pairs));
         g_fold.st_asked.store(static_cast<uint32_t>(asked), std::memory_order_relaxed);
         g_fold.st_shown.store(static_cast<uint32_t>(step.show), std::memory_order_relaxed);
         g_fold.st_warming.store(static_cast<uint32_t>(g_fold.hand.warming), std::memory_order_relaxed);

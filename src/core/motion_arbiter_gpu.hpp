@@ -54,6 +54,9 @@ struct Inputs {
     ID3D12Resource* estimated_motion = nullptr;
     ID3D12Resource* estimated_valid = nullptr;
     bool estimated_valid_flag = false;
+    // With a sampled output (Outputs::block_x/y): the measured field was made on the folded picture, so it
+    // is the output's size and in the output's pixels; it is read at the output position and scaled by the block.
+    bool estimated_folded = false;
     bool tier2_valid_flag = false;
     bool tier3_valid_flag = false;
     float depth_clear = 1.0f;

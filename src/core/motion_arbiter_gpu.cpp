@@ -51,6 +51,7 @@ cbuffer C : register(b0) {
 #define F_T1EST   256u   // tier 1 is measured total motion (Tier1Source::Estimated), not the game's own vectors
 #define F_EST     512u   // measured total motion stands behind tier 1 (EstimatedInput)
 #define F_ESTMASK 1024u
+#define F_ESTFOLD 2048u  // sampled output: the measured field is the OUTPUT's size and in its pixels (the flow ran on the folded picture)
 
 #define PROV_INVALID 0u
 #define PROV_ENGINE 1u
@@ -147,10 +148,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     // ---- Measured total motion behind tier 1 (EstimatedInput): where tier 1 gave nothing here.
     // Counter 8 is its own, so the game's vectors and measured ones are never added together.
     if (flags & F_EST) {
-        uint ms = (flags & F_ESTMASK) ? mask_state(t_estvalid[p]) : 0u;
+        const bool est_fold = (flags & F_ESTFOLD) != 0u && sample != 0u;
+        const uint2 ep = est_fold ? q : p;
+        uint ms = (flags & F_ESTMASK) ? mask_state(t_estvalid[ep]) : 0u;
         if (ms == 2u) stat(7);
         if (ms == 0u) {
-            float2 e = t_est[p];
+            float2 e = t_est[ep];
+            // Folded pixels to the full-size pixels every other tier and the output are in.
+            if (est_fold) e *= float2(max(sample & 255u, 1u), max((sample >> 8) & 255u, 1u));
             if (finite2(e)) {
                 u_xy[q] = e;
                 u_prov[q] = PROV_ESTIMATED;
@@ -393,12 +398,20 @@ bool Arbiter::Dispatch(ID3D12GraphicsCommandList* list, const Inputs& in, const 
     };
     uint32_t flags = 0;
     bool use1 = in.tier1_valid_flag && extent_ok(in.tier1_motion) && (!in.tier1_valid || extent_ok(in.tier1_valid));
-    bool use_est = in.estimated_valid_flag && extent_ok(in.estimated_motion) && (!in.estimated_valid || extent_ok(in.estimated_valid));
+    const bool est_fold = sampled && in.estimated_folded;
+    auto est_extent_ok = [&](ID3D12Resource* r) {
+        if (!est_fold) return extent_ok(r);
+        if (!r) return false;
+        D3D12_RESOURCE_DESC d = r->GetDesc();
+        return d.Width == out.width && d.Height == out.height;
+    };
+    bool use_est = in.estimated_valid_flag && est_extent_ok(in.estimated_motion) && (!in.estimated_valid || est_extent_ok(in.estimated_valid));
     bool use2 = in.tier2_valid_flag && extent_ok(in.depth);
     bool use3 = in.tier3_valid_flag && extent_ok(in.tier3_residual) && (!in.tier3_mask || extent_ok(in.tier3_mask)) &&
                 (!in.tier3_valid || extent_ok(in.tier3_valid));
     if (use_est) flags |= 512u;
     if (use_est && in.estimated_valid) flags |= 1024u;
+    if (use_est && est_fold) flags |= 2048u;
     if (use1) flags |= 1u;
     if (use1 && in.tier1_valid) flags |= 2u;
     if (use2) flags |= 4u;
