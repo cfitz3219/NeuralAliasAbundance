@@ -5070,14 +5070,14 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     static na::fold::Mode folded_last_mode = na::fold::Mode::Off;
     bool folded_ready = false;
     {
-        const na::fold::Mode asked = na::fold::ModeFrom(na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
-        if (asked != na::fold::Mode::Off && measured && g_fold.ok) {
-            const auto ab = na::fold::BlockFor(asked);
-            na::j2::compute_flow::Prepare(g.device.Get(), g.queue.Get(), na::fold::Folded(rw, ab.x), na::fold::Folded(rh, ab.y));
+        const na::fold::Mode fold_asked = na::fold::ModeFrom(na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
+        if (fold_asked != na::fold::Mode::Off && measured && g_fold.ok) {
+            const auto asked_blk = na::fold::BlockFor(fold_asked);
+            na::j2::compute_flow::Prepare(g.device.Get(), g.queue.Get(), na::fold::Folded(rw, asked_blk.x), na::fold::Folded(rh, asked_blk.y));
         }
         if (sampled_mode != na::fold::Mode::Off && measured && g_fold.ok) {
-            const auto& planes = g_fold.planes[static_cast<uint32_t>(sampled_mode)];
-            folded_ready = na::j2::compute_flow::Ready(planes.w, planes.h);
+            const auto& ready_planes = g_fold.planes[static_cast<uint32_t>(sampled_mode)];
+            folded_ready = na::j2::compute_flow::Ready(ready_planes.w, ready_planes.h);
         }
     }
     const bool folded_flow = folded_ready && folded_last_mode == sampled_mode && folded_last_frame != 0 && folded_last_frame == g.submitted_frame;
@@ -5170,38 +5170,38 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             if (folded_flow || folded_prime) {
                 // The level's folded colour and depth now (the fold before DLSS makes them again, after
                 // anything that changes the picture in between), on the warm-up's table: no level warms here.
-                const auto fb = na::fold::BlockFor(sampled_mode);
-                const auto fp = na::fold::Pick(sampled_mode);
-                auto& planes = g_fold.planes[static_cast<uint32_t>(sampled_mode)];
-                na::dlss::EvalDesc src{};
-                src.color = g.color_in.Get(); src.depth = g.depth32.Get(); src.motion = g.motion.Get();
-                fold_dispatch(l, src, planes, fb, fp, (g.slot % kRing) * 2 + 1, true);
-                std::vector<D3D12_RESOURCE_BARRIER> fbar;
-                fbar.push_back(uav_barrier(planes.color.Get())); fbar.push_back(uav_barrier(planes.depth.Get()));
-                add(fbar, planes.color.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                add(fbar, planes.depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                flush(l, fbar);
+                const auto fold_blk = na::fold::BlockFor(sampled_mode);
+                const auto fold_pick = na::fold::Pick(sampled_mode);
+                auto& fold_planes = g_fold.planes[static_cast<uint32_t>(sampled_mode)];
+                na::dlss::EvalDesc fold_src{};
+                fold_src.color = g.color_in.Get(); fold_src.depth = g.depth32.Get(); fold_src.motion = g.motion.Get();
+                fold_dispatch(l, fold_src, fold_planes, fold_blk, fold_pick, (g.slot % kRing) * 2 + 1, true);
+                std::vector<D3D12_RESOURCE_BARRIER> fold_bars;
+                fold_bars.push_back(uav_barrier(fold_planes.color.Get())); fold_bars.push_back(uav_barrier(fold_planes.depth.Get()));
+                add(fold_bars, fold_planes.color.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                add(fold_bars, fold_planes.depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                flush(l, fold_bars);
                 // The kept pixel's sample in folded pixels: the same offset DLSS is told for this level.
-                na::motion::gpu::Inputs fin = in;
-                fin.depth = planes.depth.Get();
-                na::j2::compute_flow::Frame ff = frame;
-                ff.block_x = ff.block_y = 1; // the folded picture has one shaded value a pixel
-                ff.sample_x = ff.sample_y = 1; ff.sample_pick_x = ff.sample_pick_y = 0;
-                ff.jitter[0] = na::fold::DeclaredJitter(fb.x, fp.x, in.jitter_current_px[0]);
-                ff.jitter[1] = na::fold::DeclaredJitter(fb.y, fp.y, in.jitter_current_px[1]);
-                ff.raster_jitter[0] = ff.jitter[0]; ff.raster_jitter[1] = ff.jitter[1];
-                fin.jitter_current_px[0] = ff.jitter[0]; fin.jitter_current_px[1] = ff.jitter[1];
-                na::j2::compute_flow::Tier3 ft3;
-                auto ticket = na::j2::compute_flow::Record(l,g.queue.Get(),planes.color.Get(),planes.depth.Get(),fin,ff,ft3);
-                add(fbar, planes.color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                add(fbar, planes.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                flush(l, fbar);
-                folded_last_frame = ticket.context ? g.frame : 0; folded_last_mode = sampled_mode;
+                na::motion::gpu::Inputs fold_in = in;
+                fold_in.depth = fold_planes.depth.Get();
+                na::j2::compute_flow::Frame fold_frame = frame;
+                fold_frame.block_x = fold_frame.block_y = 1; // the folded picture has one shaded value a pixel
+                fold_frame.sample_x = fold_frame.sample_y = 1; fold_frame.sample_pick_x = fold_frame.sample_pick_y = 0;
+                fold_frame.jitter[0] = na::fold::DeclaredJitter(fold_blk.x, fold_pick.x, in.jitter_current_px[0]);
+                fold_frame.jitter[1] = na::fold::DeclaredJitter(fold_blk.y, fold_pick.y, in.jitter_current_px[1]);
+                fold_frame.raster_jitter[0] = fold_frame.jitter[0]; fold_frame.raster_jitter[1] = fold_frame.jitter[1];
+                fold_in.jitter_current_px[0] = fold_frame.jitter[0]; fold_in.jitter_current_px[1] = fold_frame.jitter[1];
+                na::j2::compute_flow::Tier3 fold_tier;
+                auto fold_ticket = na::j2::compute_flow::Record(l,g.queue.Get(),fold_planes.color.Get(),fold_planes.depth.Get(),fold_in,fold_frame,fold_tier);
+                add(fold_bars, fold_planes.color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                add(fold_bars, fold_planes.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                flush(l, fold_bars);
+                folded_last_frame = fold_ticket.context ? g.frame : 0; folded_last_mode = sampled_mode;
                 if (folded_flow) {
-                    pending.compute_flow = ticket; tier = ft3;
+                    pending.compute_flow = fold_ticket; tier = fold_tier;
                     in.estimated_folded = true; // the arbiter reads it at the output position and scales it by the block
                 } else {
-                    pending.compute_flow_prime = ticket; // its picture only; this frame's motion is the whole-picture pair's
+                    pending.compute_flow_prime = fold_ticket; // its picture only; this frame's motion is the whole-picture pair's
                 }
             }
             if (!folded_flow)
