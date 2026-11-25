@@ -122,6 +122,7 @@ struct State {
         DropoutWatch dropout;
         std::array<float, FlickerTransition::count> dropout_view{};
         bool dropout_view_known = false;
+        ULONGLONG dropout_observed_at = 0;
         uint64_t dropout_events = 0, dropout_logged = 0;
     };
     std::array<JitterControl, 2> jitter_controls;
@@ -664,8 +665,12 @@ void collect_sample()
                     const auto pair = CountDropouts(raster_field.data(), unsigned(raster_field.size() / mixed_values),
                                                     mixed_values, mixed_black_before, mixed_black_now);
                     const bool same_view = control.dropout_view_known && SameJitterPicture(control.dropout_view, trial.image);
-                    control.dropout_view = trial.image;
-                    control.dropout_view_known = true;
+                    // Keep comparing against the symptom's picture until the trial ends.
+                    if (control.dropout.Current() != DropoutWatch::Phase::Trial) {
+                        control.dropout_view = trial.image;
+                        control.dropout_view_known = true;
+                    }
+                    control.dropout_observed_at = GetTickCount64();
                     const bool changed = control.dropout.Observe(pair, {g.pre_jitter[0], g.pre_jitter[1]},
                                                                  {g.main_jitter[0], g.main_jitter[1]}, same_view);
                     if (pair.Any() && same_view) ++control.dropout_events;
@@ -1566,7 +1571,8 @@ bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, 
     const auto& control = g.jitter_controls[index];
     const auto& scene = control.scene;
     if (control.source != swapchain || path != scene.placement.path ||
-        frame < control.ordinal || frame - control.ordinal > DropoutWatch::kWindow) return false;
+        frame < control.ordinal || !control.dropout_observed_at ||
+        GetTickCount64() - control.dropout_observed_at > 4 * every_ms() + kStuckMs) return false;
     const bool rotating = path == shadow::Path::Native11 && screen_proof && scene.native_screen_proof;
     if (depth != scene.depth || generation != scene.generation || (color != scene.color && !rotating)) return false;
     return control.dropout.MoveStillMeshes();
