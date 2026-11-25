@@ -1640,4 +1640,4 @@ Cort says Astra is working on the larger fps gains and that no package is to be 
 3. **Coarse shading (VRS) of the scene's depth-tested draws:** same spot DLAA 86, 2x1 99, 2x2 110 fps. Extending it to full-screen passes in the scene's list found about 5 draws a frame and changed nothing, so the rest of the frame is not reachable that way in this game.
 4. Under coarse shading, edges, depth and full-screen passes stay per pixel: keep ONE fixed pixel per block and declare its true position. Flow must smooth a block-shaded picture over one block and use the strict rules, or the block grid reads as motion (Cort's shimmer, gone in fb0d69cd).
 
-Package `Documents\NeuralAlias-SniperResistance-0b7902c6` was staged a minute before Cort's order arrived; it is not to be installed until he says so. — Claude
+The package staged a minute before Cort's order arrived is renamed `Documents\NOT-FOR-INSTALL-NeuralAlias-SniperResistance-0b7902c6`; it is not to be installed until he says so. — Claude
