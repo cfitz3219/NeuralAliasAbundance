@@ -4,6 +4,7 @@
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/diag/gpu_breadcrumbs.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/j2/fold_shader.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/j2/camera_interloper.hpp"
 #include "host_dx12/j2/game_motion.hpp"
@@ -2494,7 +2495,7 @@ struct FoldPlanes { ComPtr<ID3D12Resource> color, depth, motion; uint32_t w = 0,
 struct FoldPass {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso;
-    ComPtr<ID3D12DescriptorHeap> heap; // kRing x 6 passes x (t0, u0)
+    ComPtr<ID3D12DescriptorHeap> heap; // two independent tables per slot: displayed and warm-up
     UINT inc = 0;
     bool tried = false, ok = false;
     FoldPlanes planes[na::fold::kModes];
@@ -2512,27 +2513,16 @@ struct FoldPass {
     std::mutex why_m;
     char why[160]{};
 } g_fold;
-constexpr char kFoldHlsl[] = R"(
-Texture2D<float4> t_in : register(t0);
-RWTexture2D<float4> u_out : register(u0);
-cbuffer C : register(b0) { uint bx; uint by; uint px; uint py; };
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint w, h;
-    u_out.GetDimensions(w, h);
-    if (id.x >= w || id.y >= h) return;
-    u_out[id.xy] = t_in[uint2(id.x * bx + px, id.y * by + py)]; // the kept pixel of this block
-})";
 bool fold_init()
 {
     if (g_fold.tried) return g_fold.ok;
     g_fold.tried = true;
     D3D12_DESCRIPTOR_RANGE r[2]{};
     r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    r[0].NumDescriptors = 1;
+    r[0].NumDescriptors = 3;
     r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    r[1].NumDescriptors = 1;
-    r[1].OffsetInDescriptorsFromTableStart = 1;
+    r[1].NumDescriptors = 3;
+    r[1].OffsetInDescriptorsFromTableStart = 3;
     D3D12_ROOT_PARAMETER p[2]{};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     p[0].DescriptorTable.NumDescriptorRanges = 2;
@@ -2544,7 +2534,7 @@ bool fold_init()
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_fold.root))))
         return false;
-    if (FAILED(D3DCompile(kFoldHlsl, sizeof(kFoldHlsl) - 1, "j2_fold.hlsl", nullptr, nullptr, "main", "cs_5_0",
+    if (FAILED(D3DCompile(na::j2::kFoldHlsl, sizeof(na::j2::kFoldHlsl) - 1, "j2_fold.hlsl", nullptr, nullptr, "main", "cs_5_0",
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
         return false;
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
@@ -2588,25 +2578,29 @@ bool fold_targets(na::fold::Mode m, uint32_t w, uint32_t h, DXGI_FORMAT color_fo
     }
     return true;
 }
-// `in` readable, `out` UNORDERED_ACCESS. index: this frame's ring slot x 6 + pass.
-void fold_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, DXGI_FORMAT in_format, ID3D12Resource* out, DXGI_FORMAT out_format,
-                   na::fold::Block blk, na::fold::Block pick, UINT index)
+void fold_dispatch(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, const FoldPlanes& planes,
+                   na::fold::Block blk, na::fold::Block pick, UINT table)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_fold.heap->GetCPUDescriptorHandleForHeapStart();
-    c.ptr += static_cast<SIZE_T>(index) * 2 * g_fold.inc;
+    c.ptr += static_cast<SIZE_T>(table) * 6 * g_fold.inc;
+    ID3D12Resource* const inputs[] = {base.color, base.depth, base.motion};
+    ID3D12Resource* const outputs[] = {planes.color.Get(), planes.depth.Get(), planes.motion.Get()};
+    const DXGI_FORMAT formats[] = {typed(planes.color_format), DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = in_format;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;
-    g.device->CreateShaderResourceView(in, &sv, c);
-    c.ptr += g_fold.inc;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
-    uv.Format = out_format;
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g.device->CreateUnorderedAccessView(out, nullptr, &uv, c);
+    for (UINT i = 0; i < 3; ++i) {
+        sv.Format = uv.Format = formats[i];
+        g.device->CreateShaderResourceView(inputs[i], &sv, c);
+        const D3D12_CPU_DESCRIPTOR_HANDLE output{c.ptr + 3 * g_fold.inc};
+        g.device->CreateUnorderedAccessView(outputs[i], nullptr, &uv, output);
+        c.ptr += g_fold.inc;
+    }
     D3D12_GPU_DESCRIPTOR_HANDLE gh = g_fold.heap->GetGPUDescriptorHandleForHeapStart();
-    gh.ptr += static_cast<UINT64>(index) * 2 * g_fold.inc;
+    gh.ptr += static_cast<UINT64>(table) * 6 * g_fold.inc;
     ID3D12DescriptorHeap* heaps[] = {g_fold.heap.Get()};
     l->SetDescriptorHeaps(1, heaps);
     l->SetComputeRootSignature(g_fold.root.Get());
@@ -2614,27 +2608,21 @@ void fold_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, DXGI_FORMAT
     l->SetComputeRootDescriptorTable(0, gh);
     const uint32_t k[4] = {blk.x, blk.y, pick.x, pick.y};
     l->SetComputeRoot32BitConstants(1, 4, k, 0);
-    const auto d = out->GetDesc();
-    l->Dispatch((static_cast<UINT>(d.Width) + 7) / 8, (d.Height + 7) / 8, 1);
+    l->Dispatch((planes.w + 7) / 8, (planes.h + 7) / 8, 1);
 }
 // Folds `base`'s colour, depth and motion (all readable, full size) for mode m and describes the
-// result for DLSS in *out. `coarse`: this frame's scene draws were shaded once per block. pass0: 0 for
-// the mode on screen, 3 for the warming one (two modes can run in one frame). The planes are left
+// result for DLSS in *out. A separate table serves the warm-up in the same recording. The planes are left
 // readable; fold_done hands them back after the evaluate.
-void fold_record(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, na::fold::Mode m, bool coarse, uint64_t frame, UINT slot, UINT pass0,
+void fold_record(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, na::fold::Mode m, UINT slot, bool warming,
                  na::dlss::EvalDesc* out)
 {
     const auto blk = na::fold::BlockFor(m);
     const auto pick = na::fold::Pick(m);
-    (void)frame; (void)coarse;
     auto& p = g_fold.planes[static_cast<uint32_t>(m)];
-    const UINT index = (slot % kRing) * 6 + pass0;
-    fold_dispatch(l, base.color, typed(base.color->GetDesc().Format), p.color.Get(), typed(p.color_format), blk, pick, index);
-    fold_dispatch(l, base.depth, DXGI_FORMAT_R32_FLOAT, p.depth.Get(), DXGI_FORMAT_R32_FLOAT, blk, pick, index + 1);
-    fold_dispatch(l, base.motion, DXGI_FORMAT_R32G32_FLOAT, p.motion.Get(), DXGI_FORMAT_R32G32_FLOAT, blk, pick, index + 2);
+    const UINT table = (slot % kRing) * 2 + (warming ? 1u : 0u);
+    fold_dispatch(l, base, p, blk, pick, table);
     std::vector<D3D12_RESOURCE_BARRIER> b;
     for (ID3D12Resource* r : {p.color.Get(), p.depth.Get(), p.motion.Get()}) {
-        b.push_back(uav_barrier(r));
         add(b, r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     flush(l, b);
@@ -5446,7 +5434,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         const bool coarse = g_fold.rate_set != 0 && g.frame > g_fold.rate_frame;
         if (step.warm != Mode::Off) {
             na::dlss::EvalDesc we{};
-            fold_record(l, e, step.warm, coarse, g.frame, g.slot, 3, &we);
+            fold_record(l, e, step.warm, g.slot, true, &we);
             we.output = g_fold.unseen.Get();
             we.reset = e.reset || step.warm_reset;
             const bool ok = na::dlss::Evaluate(l, we);
@@ -5464,7 +5452,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (step.show_reset) e.reset = true;
         if (step.show != Mode::Off) {
             na::dlss::EvalDesc fe{};
-            fold_record(l, e, step.show, coarse, g.frame, g.slot, 0, &fe);
+            fold_record(l, e, step.show, g.slot, false, &fe);
             e = fe;
             fold_shown = step.show;
             ++(coarse ? g_fold.coarse_frames : g_fold.fine_frames);
@@ -5498,7 +5486,6 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (t_ic) t_ic->mark(kIcEvaluate);
     pending.reset = e.reset;
     const bool evaluated = na::dlss::Evaluate(l, e);
-    if (fold_shown != na::fold::Mode::Off) fold_done(l, fold_shown);
     {   // Cort saw a flash of colour bars at a switch to Performance (f98ae48c) and the log held nothing
         // about that moment: every frame from a switch on, for a short while, says what DLSS was given.
         static na::fold::Mode last_shown = na::fold::Mode::Off;
@@ -5555,6 +5542,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     } else if (evaluated && e.reset) {
         na::referee::gpu::NotifyEvaluationReset();
     }
+    // Referee also reads the displayed folded inputs as SRVs in this command list.
+    if (fold_shown != na::fold::Mode::Off) fold_done(l, fold_shown);
     // A measured scene cut that DLSS has not been reset for yet: the temporal output still holds the
     // old scene, so those frames show the picture DLSS was given instead. Decided on the GPU, in
     // execution order, with no wait (compute_flow.hpp RecordCutShow). Nothing happens on other frames.

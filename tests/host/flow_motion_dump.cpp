@@ -28,11 +28,13 @@
 // game, install or setting.
 #include "test_support.hpp"
 #include "core/motion_arbiter_gpu.hpp"
+#include "core/fold_shading.hpp"
 #include "host_dx12/ffx_flow/ffx_flow.hpp"
 #include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstring>
 #include <limits>
@@ -116,15 +118,28 @@ bool MakeInput(ID3D12Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT format, ui
     t->upload = test::CreateBuffer(dev, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     return t->upload != nullptr;
 }
-bool Fill(ID3D12GraphicsCommandList* list, Input* t, const std::vector<uint8_t>& rows)
+bool Fill(ID3D12GraphicsCommandList* list, Input* t, const std::vector<uint8_t>& rows,
+          uint32_t source_w, uint32_t source_h, na::fold::Block block)
 {
     constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    const size_t tight = static_cast<size_t>(t->fp.Footprint.Width) * t->bpp;
-    if (rows.size() != tight * t->fp.Footprint.Height) return false;
+    const size_t tight = static_cast<size_t>(source_w) * t->bpp;
+    const size_t height = source_h;
+    const size_t padded = (tight + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    size_t source_pitch = tight;
+    if (rows.size() != tight * height) {
+        // A live capture stores the D3D footprint. Its final row can omit trailing alignment.
+        if (rows.size() != padded * height && rows.size() != padded * (height - 1) + tight) return false;
+        source_pitch = padded;
+    }
     uint8_t* p = nullptr;
     if (FAILED(t->upload->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return false;
-    for (UINT y = 0; y < t->fp.Footprint.Height; ++y)
-        std::memcpy(p + static_cast<size_t>(y) * t->fp.Footprint.RowPitch, rows.data() + tight * y, tight);
+    for (UINT y = 0; y < t->fp.Footprint.Height; ++y) {
+        auto* dst = p + static_cast<size_t>(y) * t->fp.Footprint.RowPitch;
+        const auto* src = rows.data() + (static_cast<size_t>(y) * block.y + block.y - 1) * source_pitch;
+        if (block.x == 1) std::memcpy(dst, src, tight);
+        else for (UINT x = 0; x < t->fp.Footprint.Width; ++x)
+            std::memcpy(dst + size_t(x) * t->bpp, src + (size_t(x) * block.x + block.x - 1) * t->bpp, t->bpp);
+    }
     t->upload->Unmap(0, nullptr);
     if (t->filled) {
         const D3D12_RESOURCE_BARRIER b = test::Transition(t->tex.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -190,7 +205,7 @@ bool ReadOut(Result* r, std::vector<uint8_t>* rows)
 
 int Usage()
 {
-    std::printf("flow_motion_dump <capture folder> <out folder> --mode none|camera|total [--loosen 0..100] [--frames N]\n");
+    std::printf("flow_motion_dump <capture folder> <out folder> --mode none|camera|total [--loosen 0..100] [--frames N] [--fold-source quality|performance | --fold-input quality|performance]\n");
     return 2;
 }
 } // namespace
@@ -200,17 +215,27 @@ int main(int argc, char** argv)
     if (argc < 3) return Usage();
     const std::string folder = argv[1], out_dir = argv[2];
     std::string mode = "total";
+    na::fold::Block source_block{};
+    na::fold::Block input_block{};
     uint32_t loosen = 0, max_frames = 0;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* value = i + 1 < argc ? argv[i + 1] : nullptr;
         if (a == "--mode" && value) { mode = value; ++i; }
+        else if ((a == "--fold-source" || a == "--fold-input") && value) {
+            const std::string level(value);
+            if (source_block.x != 1 || input_block.x != 1 || (level != "quality" && level != "performance")) return Usage();
+            auto& block = a == "--fold-source" ? source_block : input_block;
+            block = na::fold::BlockFor(level == "quality" ? na::fold::Mode::Quality : na::fold::Mode::Performance);
+            ++i;
+        }
         else if (a == "--loosen" && value) { loosen = static_cast<uint32_t>(std::strtoul(value, nullptr, 10)); ++i; }
         else if (a == "--frames" && value) { max_frames = static_cast<uint32_t>(std::strtoul(value, nullptr, 10)); ++i; }
         else return Usage();
     }
     const bool total = mode == "total", camera = mode == "camera";
     if (!total && !camera && mode != "none") return Usage();
+    if (!total && input_block.x != 1) return Usage();
     CreateDirectoryA(out_dir.c_str(), nullptr);
     fopen_s(&g_log, (out_dir + "\\flow.log").c_str(), "wb");
     Log("flow_motion_dump: folder=%s mode=%s loosen=%u", folder.c_str(), mode.c_str(), loosen);
@@ -220,7 +245,8 @@ int main(int argc, char** argv)
     std::string meta(bytes.begin(), bytes.end());
     float fw = 0, fh = 0, shear_x = 0, shear_y = 0;
     if (!Two(meta, "size", &fw, &fh) || fw < 16 || fh < 16) { Log("FATAL: the metadata gives no size"); return 1; }
-    const uint32_t w = static_cast<uint32_t>(fw + 0.5f), h = static_cast<uint32_t>(fh + 0.5f);
+    const uint32_t source_w = static_cast<uint32_t>(fw + 0.5f), source_h = static_cast<uint32_t>(fh + 0.5f);
+    const uint32_t w = na::fold::Folded(source_w, input_block.x), h = na::fold::Folded(source_h, input_block.y);
     const bool has_shear = Two(meta, "trial_shear_px", &shear_x, &shear_y);
     if (camera && !has_shear) { Log("FATAL: --mode camera needs \"trial_shear_px\" in the metadata"); return 1; }
     Log("size %u x %u, camera shear %g, %g pixels per unit of depth%s", w, h, static_cast<double>(shear_x), static_cast<double>(shear_y),
@@ -255,6 +281,7 @@ int main(int argc, char** argv)
 
     std::vector<uint8_t> rows, tags;
     uint64_t tag_count[8]{};
+    std::vector<double> pair_ms;
     uint32_t written = 0;
     const uint64_t first_frame = 100;
     for (uint32_t index = 0; !max_frames || index < max_frames; ++index) {
@@ -263,9 +290,11 @@ int main(int argc, char** argv)
         float jx = 0, jy = 0;
         REQUIRE(Two(meta, "jitter_px", &jx, &jy));
         REQUIRE(ReadBytes(FrameFile(folder, index, "color.raw"), &bytes));
-        REQUIRE(Fill(l.list.Get(), &color, bytes));
+        REQUIRE(Fill(l.list.Get(), &color, bytes, source_w, source_h, input_block));
         REQUIRE(ReadBytes(FrameFile(folder, index, "depth.raw"), &bytes));
-        REQUIRE(Fill(l.list.Get(), &depth, bytes));
+        REQUIRE(Fill(l.list.Get(), &depth, bytes, source_w, source_h, input_block));
+        jx = na::fold::DeclaredJitter(input_block.x, input_block.x - 1, jx);
+        jy = na::fold::DeclaredJitter(input_block.y, input_block.y - 1, jy);
 
         // The scene's sample sits at pixel centre - jitter: the raster's own sample, known exactly.
         cf::Frame f;
@@ -274,6 +303,8 @@ int main(int argc, char** argv)
         f.generation = 1;
         f.source_generation = 1;
         f.hdr = true;
+        f.block_x = static_cast<uint8_t>(source_block.x);
+        f.block_y = static_cast<uint8_t>(source_block.y);
         f.jitter[0] = f.raster_jitter[0] = jx;
         f.jitter[1] = f.raster_jitter[1] = jy;
         f.raster_sample = f.raster_confirmed = true;
@@ -345,6 +376,10 @@ int main(int argc, char** argv)
         if (dev->GetDeviceRemovedReason() != S_OK) { Log("FATAL: the device was removed at frame %u", index); return 1; }
         na::nr::native::Reset(l.list.Get());
         na::nr::native::Maintain();
+        if (index >= 5 && ticket.pair) {
+            const auto timing = cf::GetStats();
+            if (timing.sample_frame == f.frame && timing.ms > 0) pair_ms.push_back(timing.ms);
+        }
         l.Reset();
 
         if (dispatched) {
@@ -367,6 +402,12 @@ int main(int argc, char** argv)
         ++written;
     }
     if (!written) { Log("FATAL: no frame read from %s", folder.c_str()); return 1; }
+    if (!pair_ms.empty()) {
+        std::sort(pair_ms.begin(), pair_ms.end());
+        const size_t n = pair_ms.size();
+        Log("motion GPU timestamp: %zu pairs after warm-up, median %.4f ms, p95 %.4f ms", n,
+            (pair_ms[(n - 1) / 2] + pair_ms[n / 2]) * .5, pair_ms[n - 1 - n / 20]);
+    }
     char text[1024]{};
     const cf::Stats st = cf::GetStats();
     cf::DescribeStats(st, text, sizeof text);
