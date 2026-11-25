@@ -5401,7 +5401,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             const DXGI_FORMAT in_format = e.color->GetDesc().Format;
             if (rw != w || rh != h || ow != w || oh != h) why = "the picture is not at full size on this path";
             else if (color_msaa) why = "the scene is multisampled (switch the game's anti-aliasing off)";
-            else if (smear) why = "a smear test is running";
+            else if (smear >= 0) why = "a smear test is running"; // smear_mode(): -1 when no test runs
             else if (!fold_init()) why = "the fold pass could not be prepared on this graphics card";
             else for (const Mode m : {asked, g_fold.hand.shown})
                 if (m != Mode::Off && !why && !fold_targets(m, rw, rh, in_format, ow, oh, cf)) why = "the folded working textures could not be made for this colour format";
