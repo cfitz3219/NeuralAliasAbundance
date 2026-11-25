@@ -1,0 +1,5 @@
+// Poise is distributed under the embedded SIL Open Font License.
+110 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/design/poise/fonts/Poise-Light.ttf"
+111 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/fonts/poise/Poise-Regular.ttf"
+112 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/fonts/poise/Poise-Medium.ttf"
+113 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/fonts/poise/OFL.txt"

@@ -256,7 +256,7 @@ const Session& ThisProcess()
     return s;
 }
 
-bool MakeDir(const wchar_t* kind, wchar_t* out, size_t out_chars)
+bool MakeDir(const wchar_t* kind, wchar_t* out, size_t out_chars, bool require_new)
 {
     if (!out || !out_chars) return false;
     out[0] = 0;
@@ -290,7 +290,8 @@ bool MakeDir(const wchar_t* kind, wchar_t* out, size_t out_chars)
     GetLocalTime(&t);
     swprintf_s(out, out_chars, L"%s\\%s-%04u%02u%02u-%02u%02u%02u-%s-p%u", base, kind ? kind : L"capture", t.wYear, t.wMonth,
                t.wDay, t.wHour, t.wMinute, t.wSecond, s.exe, s.pid);
-    CreateDirectoryW(out, nullptr);
+    if (!CreateDirectoryW(out, nullptr) && (GetLastError() != ERROR_ALREADY_EXISTS || require_new))
+        return false;
     {   // Every capture folder says which build made it: the cleanup counts builds.
         char k[64];
         json_escape(kind ? kind : L"capture", k, sizeof k);

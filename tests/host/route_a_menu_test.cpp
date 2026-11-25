@@ -30,7 +30,12 @@ int main() {
     ImGui::CreateContext();
     auto& io=ImGui::GetIO(); io.DisplaySize={3440,1440}; io.DeltaTime=1.f/60;
     io.IniFilename=nullptr;
-    io.Fonts->AddFontDefault();
+    na::ui::LoadFonts();
+    const auto& faces = na::ui::Cfg();
+    CHECK(faces.body && faces.display && faces.title);
+    CHECK(strcmp(faces.body->GetDebugName(), "Poise Regular") == 0);
+    CHECK(strcmp(faces.display->GetDebugName(), "Poise Light") == 0);
+    CHECK(strcmp(faces.title->GetDebugName(), "Poise Medium") == 0);
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
     na::ui::ApplyStyle();
     {
