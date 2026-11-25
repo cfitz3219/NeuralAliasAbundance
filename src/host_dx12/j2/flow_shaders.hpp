@@ -298,6 +298,8 @@ bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, bool match_light
 #define fit_row cnt_off       // which group of depths this fit is: 0 the far group (every depth when there is no split), 1 the near group
 #define fit_tile_now agree_px  // the tile scale of the weights this pass uses; 0 no tile weights at all; under 0 none yet at this step
 #define fit_tile_next agree_cos // the tile scale of the weights this pass leaves for the next; 0 or less: every weight 1
+#define sample_code have_hist  // measure: block x | block y << 8 | pick x << 16 | pick y << 24; 0 = every pixel (accept's own words)
+#define sample_size agree_min  // measure, sampled: the grid of kept pixels, width | height << 16
 static const float kFitRobust = 1.5, kFitMinSamples = 256.0, kFitMinAgree = 0.5, kFitMaxVector = 512.0, kFitDamping = 1e-4;
 static const float kFitTileFinal = 0.1, kFitTileNoise = 9.0; // screen_motion.hpp Params::tile_final_px, tile_noise
 // screen_motion.hpp LayerParams and kDepthBins.
@@ -703,7 +705,16 @@ int screen_row(float nearness) {
 void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi < 10) gs[gi] = 0;
     GroupMemoryBarrierWithGroupSync();
-    if (id.x < w && id.y < h) {
+    // px: the full-size pixel measured. Sampled (a folded DLSS level, core/fold_shading.hpp): only the
+    // pixel each block keeps, read and written at its own full-size position, so it is exactly the value
+    // the whole-picture pass gives it and every other pixel is left as it was.
+    uint2 px = id.xy;
+    bool inside = true;
+    if (sample_code != 0u) {
+        inside = id.x < (sample_size & 0xffffu) && id.y < (sample_size >> 16);
+        px = id.xy * uint2(max(sample_code & 255u, 1u), max((sample_code >> 8) & 255u, 1u)) + uint2((sample_code >> 16) & 255u, sample_code >> 24);
+    }
+    if (inside && px.x < w && px.y < h) {
         // 0 measured, moving by itself; 1 nothing known; 2 not measurable, follows the screen's
         // motion; 7 measured, moving with the screen (exactly still when there is no model).
         // 4 and 5 (the search's vector handed on) are no longer written. Slot 8: a scene cut.
@@ -715,15 +726,15 @@ void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             // shown and the DLSS reset are cut_state's and the caller's business, not this field's.
             if (id.x == 0 && id.y == 0) InterlockedAdd(gs[8], 1u);
         } else {
-            float ev = t_valid[id.xy];
-            float2 raw = t_raw[id.xy];
+            float ev = t_valid[px];
+            float2 raw = t_raw[px];
             bool have_raw = ev > 0.0 && ev <= 1.0 && !any(isnan(raw)) && !any(isinf(raw));
-            float2 p = float2(id.xy) + 0.5 - float2(jitter_x, jitter_y);
+            float2 p = float2(px) + 0.5 - float2(jitter_x, jitter_y);
             float2 q = p + raw;
             bool raw_on = have_raw && q.x >= 0.0 && q.y >= 0.0 && q.x <= float(w) && q.y <= float(h);
             // The hypothesis "nothing moved by itself": the screen's own motion here, never asked
             // about a depth nearer than its nearest agreeing sample; exact stillness with no model.
-            const float own_nearness = nearness_of(t_color[id.xy].x);
+            const float own_nearness = nearness_of(t_color[px].x);
             const int row = screen_row(own_nearness);
             bool have_screen = row >= 0;
             float2 hyp = 0;
@@ -746,8 +757,8 @@ void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 else { why = 0; v = best; }
             } else if (have_screen) { v = hyp; valid = kTotalApproximate; why = 2; }
         }
-        u_enc[id.xy] = float4(v, 0, 0);
-        u_mask[id.xy] = valid;
+        u_enc[px] = float4(v, 0, 0);
+        u_mask[px] = valid;
         InterlockedAdd(gs[why], 1u);
     }
     GroupMemoryBarrierWithGroupSync();

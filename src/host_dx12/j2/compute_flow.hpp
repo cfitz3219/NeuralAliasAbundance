@@ -14,6 +14,11 @@ struct Frame {
     // then averages over one block, so the block grid, which stays put on the screen while the sample
     // moves, is not read as movement.
     uint8_t block_x=1,block_y=1;
+    // total only. Sampled measuring (a folded DLSS level on screen, nothing else needing the whole
+    // field): the search still runs on the whole picture, but `measure` decides only the pixel (pick)
+    // of each sample_x x sample_y block, at its own full-size position in Tier3::total / total_valid;
+    // the other pixels of those textures are left as they were (stale). 1 x 1: every pixel.
+    uint8_t sample_x=1,sample_y=1,sample_pick_x=0,sample_pick_y=0;
     bool raster_confirmed=false; // exact viewport writes reached this source recording; not a learned convention
     uint64_t source_generation=0;
     // false: only the M3 camera fit runs (the camera needs reconstructing but the user turned
@@ -106,6 +111,7 @@ struct Stats {
     // is exactly still when there is no model; 4 and 5, the search's vector handed on, are no longer
     // written; 3 and 6 are not used). Kept apart from `sum`: those count residuals against a camera.
     uint64_t total_frames=0,total_pairs=0,total_sum[8]{},total_sum_pairs=0;
+    uint64_t sampled_pairs=0; // total pairs whose `measure` decided only the pixels a folded level keeps (Frame::sample_x)
     bool total_mode=false; // the latest recording was a Frame::total one (the last sample's counts are then the measure codes)
     // Scene cuts measured (AMD's whole-frame scene change on a total pair), the newest one's frame,
     // and resets asked for through Ticket::cut_reset.

@@ -15,6 +15,12 @@
 //                   the live build keeps it) instead of the full-size one: what the motion stage costs and
 //                   measures when it runs at the size DLSS gets.
 //   --fold-source L   the full-size picture was shaded in level L's blocks (the flow smooths over a block).
+//   --sample L        the whole-picture search, but `measure` and the arbiter decide only the pixel level L
+//                   keeps of each block (Astra's plan, COMMS 2026-11-25): the output is folded size, and
+//                   each kept vector should be exactly the whole-picture run's vector at that pixel.
+//   --compare DIR     a whole-picture run's output folder (its motion.raw planes): every frame's kept
+//                   vectors are compared with that run's at the same pixels (bit for bit, and the largest
+//                   difference), when this run samples or folds.
 //   Every run logs the GPU time of the motion stage (the flow and the arbiter, timestamps) per frame and
 //   its median. Real game captures (rows padded to 256 bytes, the last row not) are read as well.
 //
@@ -43,6 +49,7 @@
 #include "host_dx12/nr/native_fg.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstring>
 #include <limits>
@@ -213,7 +220,7 @@ bool ReadOut(Result* r, std::vector<uint8_t>* rows)
 
 int Usage()
 {
-    std::printf("flow_motion_dump <capture folder> <out folder> --mode none|camera|total [--loosen 0..100] [--frames N] [--fold-source quality|performance | --fold-input quality|performance]\n");
+    std::printf("flow_motion_dump <capture folder> <out folder> --mode none|camera|total [--loosen 0..100] [--frames N] [--fold-source quality|performance | --fold-input quality|performance | --sample quality|performance] [--compare DIR]\n");
     return 2;
 }
 } // namespace
@@ -226,6 +233,8 @@ int main(int argc, char** argv)
     na::fold::Block source_block{};
     na::fold::Block input_block{};
     uint32_t loosen = 0, max_frames = 0;
+    na::fold::Block sample_block{};
+    std::string compare_dir;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* value = i + 1 < argc ? argv[i + 1] : nullptr;
@@ -237,6 +246,13 @@ int main(int argc, char** argv)
             block = na::fold::BlockFor(level == "quality" ? na::fold::Mode::Quality : na::fold::Mode::Performance);
             ++i;
         }
+        else if (a == "--sample" && value) {
+            const std::string level(value);
+            if (level != "quality" && level != "performance") return Usage();
+            sample_block = na::fold::BlockFor(level == "quality" ? na::fold::Mode::Quality : na::fold::Mode::Performance);
+            ++i;
+        }
+        else if (a == "--compare" && value) { compare_dir = value; ++i; }
         else if (a == "--loosen" && value) { loosen = static_cast<uint32_t>(std::strtoul(value, nullptr, 10)); ++i; }
         else if (a == "--frames" && value) { max_frames = static_cast<uint32_t>(std::strtoul(value, nullptr, 10)); ++i; }
         else return Usage();
@@ -244,6 +260,8 @@ int main(int argc, char** argv)
     const bool total = mode == "total", camera = mode == "camera";
     if (!total && !camera && mode != "none") return Usage();
     if (!total && input_block.x != 1) return Usage();
+    const bool sampled = sample_block.x != 1 || sample_block.y != 1;
+    if (sampled && (!total || input_block.x != 1 || input_block.y != 1)) return Usage();
     CreateDirectoryA(out_dir.c_str(), nullptr);
     fopen_s(&g_log, (out_dir + "\\flow.log").c_str(), "wb");
     Log("flow_motion_dump: folder=%s mode=%s loosen=%u", folder.c_str(), mode.c_str(), loosen);
@@ -255,6 +273,11 @@ int main(int argc, char** argv)
     if (!Two(meta, "size", &fw, &fh) || fw < 16 || fh < 16) { Log("FATAL: the metadata gives no size"); return 1; }
     const uint32_t source_w = static_cast<uint32_t>(fw + 0.5f), source_h = static_cast<uint32_t>(fh + 0.5f);
     const uint32_t w = na::fold::Folded(source_w, input_block.x), h = na::fold::Folded(source_h, input_block.y);
+    // The output's size: the flow's own, or with --sample the kept pixels' grid.
+    const uint32_t ow = sampled ? na::fold::Folded(w, sample_block.x) : w, oh = sampled ? na::fold::Folded(h, sample_block.y) : h;
+    const na::fold::Block kept_block = sampled ? sample_block : input_block; // the block each output vector stands for
+    if (sampled) Log("sampled: the search runs on %u x %u; `measure` and the arbiter decide the last pixel of each %u x %u block: output %u x %u",
+                     w, h, sample_block.x, sample_block.y, ow, oh);
     const bool has_shear = Two(meta, "trial_shear_px", &shear_x, &shear_y);
     if (camera && !has_shear) { Log("FATAL: --mode camera needs \"trial_shear_px\" in the metadata"); return 1; }
     Log("size %u x %u, camera shear %g, %g pixels per unit of depth%s", w, h, static_cast<double>(shear_x), static_cast<double>(shear_y),
@@ -270,8 +293,10 @@ int main(int argc, char** argv)
     REQUIRE(MakeInput(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &color));
     REQUIRE(MakeInput(dev, w, h, DXGI_FORMAT_R32_FLOAT, 4, &depth));
     Result motion, prov;
-    REQUIRE(MakeResult(dev, w, h, DXGI_FORMAT_R32G32_FLOAT, 8, &motion));
-    REQUIRE(MakeResult(dev, w, h, DXGI_FORMAT_R8_UINT, 1, &prov));
+    REQUIRE(MakeResult(dev, ow, oh, DXGI_FORMAT_R32G32_FLOAT, 8, &motion));
+    REQUIRE(MakeResult(dev, ow, oh, DXGI_FORMAT_R8_UINT, 1, &prov));
+    uint64_t compared = 0, identical = 0, compare_frames = 0;
+    double compare_max = 0;
     na::motion::gpu::Arbiter arbiter;
     REQUIRE(arbiter.Init(dev));
     test::List l;
@@ -328,6 +353,13 @@ int main(int argc, char** argv)
         f.residual = true;
         f.total = total;
         f.last_reset_frame = first_frame;
+        if (sampled) {
+            const auto pick = na::fold::Pick(sample_block.y == 2 ? na::fold::Mode::Performance : na::fold::Mode::Quality);
+            f.sample_x = static_cast<uint8_t>(sample_block.x);
+            f.sample_y = static_cast<uint8_t>(sample_block.y);
+            f.sample_pick_x = static_cast<uint8_t>(pick.x);
+            f.sample_pick_y = static_cast<uint8_t>(pick.y);
+        }
 
         na::motion::gpu::Inputs in{};
         in.depth = depth.tex.Get();
@@ -376,8 +408,16 @@ int main(int argc, char** argv)
             na::motion::gpu::Outputs o;
             o.xy = motion.tex.Get();
             o.provenance = prov.tex.Get();
-            o.width = w;
-            o.height = h;
+            o.width = ow;
+            o.height = oh;
+            if (sampled) {
+                o.block_x = sample_block.x;
+                o.block_y = sample_block.y;
+                o.pick_x = f.sample_pick_x;
+                o.pick_y = f.sample_pick_y;
+                o.source_width = w;
+                o.source_height = h;
+            }
             REQUIRE(arbiter.Dispatch(l.list.Get(), in, o, 0));
         }
         l.list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
@@ -415,8 +455,39 @@ int main(int argc, char** argv)
         if (dispatched) {
             REQUIRE(ReadOut(&motion, &rows) && ReadOut(&prov, &tags));
         } else {
-            rows.assign(static_cast<size_t>(w) * h * 8, 0); // no pair yet: nothing known
-            tags.assign(static_cast<size_t>(w) * h, 0);
+            rows.assign(static_cast<size_t>(ow) * oh * 8, 0); // no pair yet: nothing known
+            tags.assign(static_cast<size_t>(ow) * oh, 0);
+        }
+        if (!compare_dir.empty() && dispatched && (kept_block.x != 1 || kept_block.y != 1)) {
+            // The whole-picture run's vectors at the kept pixels (the last of each block) against this run's.
+            std::vector<uint8_t> other;
+            if (ReadBytes(FrameFile(compare_dir, index, "motion.raw"), &other) && other.size() == static_cast<size_t>(source_w) * source_h * 8) {
+                uint64_t same = 0, n = 0;
+                double worst = 0;
+                for (uint32_t y = 0; y < oh; ++y)
+                    for (uint32_t x = 0; x < ow; ++x) {
+                        const size_t sx = static_cast<size_t>(x) * kept_block.x + kept_block.x - 1, sy = static_cast<size_t>(y) * kept_block.y + kept_block.y - 1;
+                        const uint8_t* a = rows.data() + (static_cast<size_t>(y) * ow + x) * 8;
+                        const uint8_t* b = other.data() + (sy * source_w + sx) * 8;
+                        ++n;
+                        if (sampled && std::memcmp(a, b, 8) == 0) { ++same; continue; }
+                        float va[2], vb[2];
+                        std::memcpy(va, a, 8);
+                        std::memcpy(vb, b, 8);
+                        va[0] *= static_cast<float>(input_block.x); // a folded run's vectors are folded pixels
+                        va[1] *= static_cast<float>(input_block.y);
+                        if (va[0] == vb[0] && va[1] == vb[1]) { ++same; continue; }
+                        const double dx = static_cast<double>(va[0]) - vb[0], dy = static_cast<double>(va[1]) - vb[1];
+                        const double dist = std::sqrt(dx * dx + dy * dy);
+                        worst = std::isfinite(dist) ? (std::max)(worst, dist) : 1e30;
+                    }
+                compared += n; identical += same; ++compare_frames;
+                compare_max = (std::max)(compare_max, worst);
+                Log("compare: frame %u: %llu of %llu kept vectors bit-identical to the whole-picture run, largest difference %.4f px", index,
+                    static_cast<unsigned long long>(same), static_cast<unsigned long long>(n), worst);
+            } else {
+                Log("compare: frame %u: no whole-picture motion plane of %u x %u in %s", index, source_w, source_h, compare_dir.c_str());
+            }
         }
         uint64_t count[8]{};
         for (const uint8_t t : tags) ++count[t & 7u];
@@ -432,6 +503,10 @@ int main(int argc, char** argv)
         ++written;
     }
     if (!written) { Log("FATAL: no frame read from %s", folder.c_str()); return 1; }
+    if (compare_frames)
+        Log("compare summary: %llu frames, %llu of %llu kept vectors bit-identical (%.4f%%), largest difference %.4f px",
+            static_cast<unsigned long long>(compare_frames), static_cast<unsigned long long>(identical), static_cast<unsigned long long>(compared),
+            compared ? 100.0 * static_cast<double>(identical) / static_cast<double>(compared) : 0.0, compare_max);
     if (!pair_ms.empty()) {
         std::sort(pair_ms.begin(), pair_ms.end());
         const size_t n = pair_ms.size();

@@ -2528,7 +2528,7 @@ bool fold_init()
     p[0].DescriptorTable.NumDescriptorRanges = 2;
     p[0].DescriptorTable.pDescriptorRanges = r;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    p[1].Constants.Num32BitValues = 4;
+    p[1].Constants.Num32BitValues = 5;
     D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> sig, err, code;
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
@@ -2579,7 +2579,7 @@ bool fold_targets(na::fold::Mode m, uint32_t w, uint32_t h, DXGI_FORMAT color_fo
     return true;
 }
 void fold_dispatch(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, const FoldPlanes& planes,
-                   na::fold::Block blk, na::fold::Block pick, UINT table)
+                   na::fold::Block blk, na::fold::Block pick, UINT table, bool motion_ready)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_fold.heap->GetCPUDescriptorHandleForHeapStart();
     c.ptr += static_cast<SIZE_T>(table) * 6 * g_fold.inc;
@@ -2606,21 +2606,22 @@ void fold_dispatch(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base,
     l->SetComputeRootSignature(g_fold.root.Get());
     l->SetPipelineState(g_fold.pso.Get());
     l->SetComputeRootDescriptorTable(0, gh);
-    const uint32_t k[4] = {blk.x, blk.y, pick.x, pick.y};
-    l->SetComputeRoot32BitConstants(1, 4, k, 0);
+    const uint32_t k[5] = {blk.x, blk.y, pick.x, pick.y, motion_ready ? 1u : 0u};
+    l->SetComputeRoot32BitConstants(1, 5, k, 0);
     l->Dispatch((planes.w + 7) / 8, (planes.h + 7) / 8, 1);
 }
 // Folds `base`'s colour, depth and motion (all readable, full size) for mode m and describes the
 // result for DLSS in *out. A separate table serves the warm-up in the same recording. The planes are left
 // readable; fold_done hands them back after the evaluate.
+// motion_ready: this mode's motion plane already holds this frame's kept vectors (sampled motion).
 void fold_record(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, na::fold::Mode m, UINT slot, bool warming,
-                 na::dlss::EvalDesc* out)
+                 na::dlss::EvalDesc* out, bool motion_ready = false)
 {
     const auto blk = na::fold::BlockFor(m);
     const auto pick = na::fold::Pick(m);
     auto& p = g_fold.planes[static_cast<uint32_t>(m)];
     const UINT table = (slot % kRing) * 2 + (warming ? 1u : 0u);
-    fold_dispatch(l, base, p, blk, pick, table);
+    fold_dispatch(l, base, p, blk, pick, table, motion_ready);
     std::vector<D3D12_RESOURCE_BARRIER> b;
     for (ID3D12Resource* r : {p.color.Get(), p.depth.Get(), p.motion.Get()}) {
         add(b, r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -5028,6 +5029,34 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     bool in_tier1_fed = false;
     bool measured_failed = false, measured_no_pair = false, measured_cut = false;
     na::j2::compute_flow::Tier3 flow_tier{}; // evidence capture
+    // Sampled motion (Astra's plan, COMMS 2026-11-25): while a folded level is on screen and nothing else
+    // needs the whole field, the search still runs on the whole picture, but the per-pixel passes
+    // (`measure` with no camera, then the arbiter) decide only the pixel that level keeps of each block,
+    // written straight into its folded motion plane. Each kept vector is the one the whole-picture pass
+    // gives that pixel (flow_motion_dump --sample --compare). Not while a level warms up beside DLAA, a
+    // capture or debug view runs, or ambient shading reads the motion.
+    na::fold::Mode sampled_mode = na::fold::Mode::Off;
+    ID3D12Resource* sampled_motion = nullptr;
+    {
+        const na::fold::Mode shown = g_fold.hand.shown;
+        const na::fold::Mode asked = na::fold::ModeFrom(na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
+        if (shown != na::fold::Mode::Off && asked == shown && g_fold.hand.warming == na::fold::Mode::Off && g.arbiter_ok && !deferred &&
+            rw == w && rh == h && ow == w && oh == h && !color_msaa && smear < 0 && g_debug_view.load(std::memory_order_relaxed) == 0 &&
+            !na::capture::j2::Armed() && !(na::settings::Get().xegtao_enabled.load(std::memory_order_relaxed) && !no_camera)) {
+            const auto blk = na::fold::BlockFor(shown);
+            const auto& planes = g_fold.planes[static_cast<uint32_t>(shown)];
+            if (planes.motion && planes.w == na::fold::Folded(rw, blk.x) && planes.h == na::fold::Folded(rh, blk.y)) {
+                sampled_mode = shown;
+                sampled_motion = planes.motion.Get();
+            }
+        }
+        static bool was_sampled = false;
+        if ((sampled_mode != na::fold::Mode::Off) != was_sampled) {
+            was_sampled = sampled_mode != na::fold::Mode::Off;
+            na::eventlog::Emit("fold", "motion %s at frame %llu (level %s)", was_sampled ? "SAMPLED: the per-pixel passes decide only the kept pixels" : "for the whole picture",
+                               static_cast<unsigned long long>(g.frame), na::fold::Name(was_sampled ? sampled_mode : shown));
+        }
+    }
     if (g.arbiter_ok) {
         na::motion::gpu::Inputs in{};
         in.depth = g.depth32.Get();
@@ -5083,6 +5112,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                     frame.block_x = static_cast<uint8_t>(fb.x); frame.block_y = static_cast<uint8_t>(fb.y);
                 }
                 na::j2::compute_flow::SetLoosen(folded ? 0u : na::settings::kObjectFlowLoosen);
+                if (sampled_mode != na::fold::Mode::Off) {
+                    const auto sb = na::fold::BlockFor(sampled_mode);
+                    const auto sp = na::fold::Pick(sampled_mode);
+                    frame.sample_x = static_cast<uint8_t>(sb.x); frame.sample_y = static_cast<uint8_t>(sb.y);
+                    frame.sample_pick_x = static_cast<uint8_t>(sp.x); frame.sample_pick_y = static_cast<uint8_t>(sp.y);
+                }
             }
             // Measured with viewport jitter: the sample is the viewports' own, exactly zero when no
             // draw carried one, so an unjittered first picture pairs with the jittered one after it.
@@ -5221,6 +5256,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         o.provenance = g.provenance.Get();
         o.width = rw; // the active extent (top left); render pixels
         o.height = rh;
+        if (sampled_mode != na::fold::Mode::Off) { // straight into the level's folded plane (UNORDERED_ACCESS at rest)
+            const auto sb = na::fold::BlockFor(sampled_mode);
+            const auto sp = na::fold::Pick(sampled_mode);
+            const auto& planes = g_fold.planes[static_cast<uint32_t>(sampled_mode)];
+            o.xy = sampled_motion;
+            o.width = planes.w; o.height = planes.h; // the provenance's top left holds the kept pixels' tags
+            o.block_x = sb.x; o.block_y = sb.y; o.pick_x = sp.x; o.pick_y = sp.y;
+            o.source_width = rw; o.source_height = rh;
+        }
         na::motion::gpu::RecordedSuppliers suppliers;
         have_motion = !measured_failed && g.arbiter.Dispatch(l, in, o, g.slot, &suppliers);
         if (suppliers.camera_with_residual_available) recorded(Tool::CameraResidual);
@@ -5443,9 +5487,19 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                                    na::fold::Name(step.warm), na::fold::Handover::kGiveUp, we.render_w, we.render_h, rw, rh, na::fold::Name(g_fold.hand.shown));
         }
         if (step.show_reset) e.reset = true;
+        // Sampled motion holds only the kept pixels of the level decided before this point. Should the
+        // screen not show that level after all (refused, or its planes were made again), this frame has no
+        // usable motion: DLSS restarts its history on it (a reset needs no motion), and the log says so.
+        const bool sampled_ok = sampled_mode != Mode::Off && step.show == sampled_mode &&
+                                g_fold.planes[static_cast<uint32_t>(sampled_mode)].motion.Get() == sampled_motion;
+        if (sampled_mode != Mode::Off && !sampled_ok) {
+            e.reset = true;
+            na::eventlog::Emit("fold", "sampled motion for %s not usable at frame %llu (screen shows %s): DLSS history restarted on this frame",
+                               na::fold::Name(sampled_mode), static_cast<unsigned long long>(g.frame), na::fold::Name(step.show));
+        }
         if (step.show != Mode::Off) {
             na::dlss::EvalDesc fe{};
-            fold_record(l, e, step.show, g.slot, false, &fe);
+            fold_record(l, e, step.show, g.slot, false, &fe, sampled_ok);
             e = fe;
             fold_shown = step.show;
             ++(coarse ? g_fold.coarse_frames : g_fold.fine_frames);
@@ -5459,7 +5513,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                                na::fold::Name(asked), static_cast<unsigned long long>(g_fold.hand.switches), static_cast<unsigned long long>(g_fold.hand.refusals));
         if ((asked != Mode::Off || step.show != Mode::Off) && g.frame % 600 == 0)
             na::eventlog::Emit("fold", "asked=%s shown=%s warming=%s good=%u | frames dlaa=%llu quality=%llu performance=%llu warm=%llu warm_failed=%llu drawn_in_blocks=%llu drawn_per_pixel=%llu unable=%llu | "
-                               "coarse rate=%u draws=%llu sets=%llu restores=%llu no_interface=%llu | jitter phases=%u declared=%.4f,%.4f input=%ux%u kept_pixel=last flow_rules=strict",
+                               "coarse rate=%u draws=%llu sets=%llu restores=%llu no_interface=%llu | jitter phases=%u declared=%.4f,%.4f input=%ux%u kept_pixel=last flow_rules=strict motion=%s sampled_pairs=%llu",
                                na::fold::Name(asked), na::fold::Name(step.show), na::fold::Name(g_fold.hand.warming), g_fold.hand.good,
                                static_cast<unsigned long long>(g_fold.shown_frames[0]), static_cast<unsigned long long>(g_fold.shown_frames[1]),
                                static_cast<unsigned long long>(g_fold.shown_frames[2]), static_cast<unsigned long long>(g_fold.warm_frames),
@@ -5467,7 +5521,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                                static_cast<unsigned long long>(g_fold.fine_frames), static_cast<unsigned long long>(g_fold.unable_frames),
                                cs.rate, static_cast<unsigned long long>(cs.draws), static_cast<unsigned long long>(cs.sets),
                                static_cast<unsigned long long>(cs.restores), static_cast<unsigned long long>(cs.unavailable),
-                               jitter_phases(), e.jitter_x, e.jitter_y, e.render_w, e.render_h);
+                               jitter_phases(), e.jitter_x, e.jitter_y, e.render_w, e.render_h,
+                               sampled_mode != Mode::Off ? "sampled" : "whole", static_cast<unsigned long long>(na::j2::compute_flow::GetStats().sampled_pairs));
         g_fold.st_asked.store(static_cast<uint32_t>(asked), std::memory_order_relaxed);
         g_fold.st_shown.store(static_cast<uint32_t>(step.show), std::memory_order_relaxed);
         g_fold.st_warming.store(static_cast<uint32_t>(g_fold.hand.warming), std::memory_order_relaxed);

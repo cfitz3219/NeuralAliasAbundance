@@ -80,6 +80,13 @@ struct Outputs {
     ID3D12Resource* provenance = nullptr;  // R8_UINT, UAV
     ID3D12Resource* stats = nullptr;       // optional raw buffer, >= 32 bytes (36 for the ninth counter), UAV, zeroed by caller
     uint32_t width = 0, height = 0;
+    // Sampled output (folded DLSS levels, core/fold_shading.hpp): when block_x or block_y is above 1,
+    // only the pixel (block * o + pick) of each block of the full-size inputs is decided, and written at
+    // o into an output of width x height blocks. Every input stays full size (source_width x
+    // source_height) and is read at that pixel exactly as the full-size pass reads it, so each kept
+    // vector is the one the full-size pass gives that pixel. 1 x 1: the whole field, as before.
+    uint32_t block_x = 1, block_y = 1, pick_x = 0, pick_y = 0;
+    uint32_t source_width = 0, source_height = 0; // 0: the output's size (no sampling)
 };
 
 // Order of the counters in the stats buffer (uint32 each). The ninth is written only into a buffer

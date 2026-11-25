@@ -432,7 +432,16 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         c->srv(work,1,1,c->raw.Get(),DXGI_FORMAT_R32G32_FLOAT);c->srv(work,1,3,c->expanded.Get(),DXGI_FORMAT_R32_FLOAT);
         c->srv(work,1,5,im.tex.Get(),c->image_format);c->srv(work,1,6,prev.tex.Get(),c->image_format);
         c->uav(work,1,kUav+0,c->total.Get(),DXGI_FORMAT_R32G32_FLOAT);c->uav(work,1,kUav+1,c->mask.Get(),DXGI_FORMAT_R32_FLOAT);
-        if(ok)c->dispatch(l,work,1,c->pso_measure.Get(),cb);
+        if(ok){
+            const bool sampled=f.sample_x>1 || f.sample_y>1;
+            if(sampled && f.sample_pick_x<f.sample_x && f.sample_pick_y<f.sample_y){
+                // flow_shaders.hpp sample_code / sample_size (accept's two words; accept does not run here).
+                const unsigned sw=(w-f.sample_pick_x+f.sample_x-1)/f.sample_x,sh=(h-f.sample_pick_y+f.sample_y-1)/f.sample_y;
+                Constants mc=cb;mc.have_hist=unsigned(f.sample_x)|(unsigned(f.sample_y)<<8)|(unsigned(f.sample_pick_x)<<16)|(unsigned(f.sample_pick_y)<<24);
+                mc.agree_min=sw|(sh<<16);
+                c->dispatch(l,work,1,c->pso_measure.Get(),mc,false,(sw+7)/8,(sh+7)/8);++stats.sampled_pairs;
+            }else c->dispatch(l,work,1,c->pso_measure.Get(),cb);
+        }
         order(l);move(l,c->mask.Get(),U,S);move(l,c->total.Get(),U,S);
         if(ok){
             // The scene cut's state, in execution order, for RecordCutShow after DLSS (flow_shaders.hpp cut_state).
