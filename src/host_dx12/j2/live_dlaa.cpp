@@ -518,6 +518,10 @@ std::mutex g_up_m;
 UpscaleTarget g_up;
 std::atomic<bool> g_native_bridge{false},g_native_reduced{false},g_native_discovery{false};
 std::atomic<bool> g_screen_discovery_installed{false};
+// A capture's frame record in a route without screen discovery (the inline route, a folded level):
+// while set, the operation hook records the armed frame's ops and nothing else changes.
+std::atomic<bool> g_capture_frame_record{false};
+uint32_t g_record_stage=0;bool g_record_done=false,g_record_owns_hooks=false; // the presenting thread's only
 bool native_discovery_enabled() {
     const auto& s = na::settings::Get();
     return na::settings::EffectsReady() && g.enabled.load(std::memory_order_relaxed) &&
@@ -6697,7 +6701,9 @@ public:
     na::observe::ShaderScope Before(ID3D12GraphicsCommandList* l,na::observe::ShaderCall& call) noexcept override {
         const bool reduced = g_native_reduced.load(std::memory_order_relaxed);
         const bool discover = g_native_discovery.load(std::memory_order_relaxed) && native_discovery_enabled();
-        if(!reduced && !discover){t_native_hint=nullptr;return {};}
+        if(!reduced && !discover){
+            if(g_capture_frame_record.load(std::memory_order_relaxed) && g_trace.armed.load(std::memory_order_relaxed)){try{trace_op(l,call);}catch(...){}}
+            t_native_hint=nullptr;return {};}
         try{
             if (discover && !reduced) {
                 if (g_trace.armed.load(std::memory_order_relaxed)) trace_op(l, call);
@@ -9028,6 +9034,9 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         // Install before the first discovery window. A persisted setting also
         // starts observation at boot, before the game's early descriptors exist.
         if (native && !g_screen_discovery_installed.load(std::memory_order_acquire)) InstallScreenDiscovery();
+        // A capture's frame record needs the same hooks for its few frames (below); installed here, outside the trace lock.
+        if (!reduced && !native && frame && !g_record_stage && !g_record_done && na::capture::j2::Armed() &&
+            !g_screen_discovery_installed.load(std::memory_order_acquire)) { InstallScreenDiscovery(); g_record_owns_hooks = true; }
         std::lock_guard<std::mutex> lock(g_trace.m);
         if (g_trace.native_resolution != native || (native &&
             (g_trace.discovery_color != color || g_trace.discovery_depth != depth ||
@@ -9072,6 +9081,42 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
         }
         g_native_discovery.store(native, std::memory_order_relaxed);
         if(!reduced && !native){
+            // One traced frame per armed capture (F8), written and never analysed: every op in
+            // submission order with its targets, so the record shows what the game draws after
+            // our point (its finishing passes, its HUD, the last copy to the screen). The hooks
+            // it needs are on for those frames only.
+            const bool capture_armed=frame&&na::capture::j2::Armed();
+            if(!capture_armed&&!g_record_stage)g_record_done=false;
+            if(g_record_stage||(capture_armed&&!g_record_done)){
+                const uint64_t shown=frame?uint64_t(na::observe::IdOf(frame)):0;
+                if(shown&&!trace_is_presented(shown)){
+                    g_trace.presented_ids[2].store(g_trace.presented_ids[1].load());
+                    g_trace.presented_ids[1].store(g_trace.presented_ids[0].load());
+                    g_trace.presented_ids[0].store(shown);
+                }
+                if(!g_record_stage){
+                    g_trace.recs.clear();g_trace.frame.clear();g_trace.frames=0;g_trace.untraced=g_trace.traced_lists=0;g_trace.ops=0;g_trace.untraced_lists.clear();
+                    g_trace.late_ops=g_trace.late_tabled=0;
+                    g_capture_frame_record.store(true,std::memory_order_release);g_trace.armed.store(true);
+                    g_record_stage=1;g_record_done=true;
+                    return;
+                }
+                if(g_record_stage==1){ // this frame holds lists recorded before the hooks were on: start over
+                    g_trace.frame.clear();g_trace.untraced=g_trace.traced_lists=0;g_trace.untraced_lists.clear();g_trace.late_ops=g_trace.late_tabled=0;
+                    g_record_stage=2;return;
+                }
+                NativeExtent shown_size{};
+                if(frame){const auto d=frame->GetDesc();shown_size={uint32_t(d.Width),d.Height,uint32_t(d.Width),d.Height};}
+                trace_dump_frame(queue,shown,shown_size,ordinal);
+                g_trace.armed.store(false);g_capture_frame_record.store(false,std::memory_order_release);
+                g_trace.recs.clear();g_trace.frame.clear();
+                if(g_record_owns_hooks){
+                    na::observe::SetOperationSnapshots(false);na::observe::SetRasterStateTracking(false);
+                    g_screen_discovery_installed.store(false,std::memory_order_release);g_record_owns_hooks=false;
+                }
+                g_record_stage=0;
+                return;
+            }
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
             g_trace.previous={};g_trace.learned={};g_trace.learned_inputs.clear();g_trace.learned_pso.store(0);
             if (g_trace.find_lighting || g_trace.lighting_pso.load(std::memory_order_relaxed)) g_trace.ClearLighting();
