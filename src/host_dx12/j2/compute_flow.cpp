@@ -11,6 +11,8 @@
 #include "core/screen_motion.hpp"
 #include <d3dcompiler.h>
 #include <mutex>
+#include <thread>
+#include <utility>
 #include <atomic>
 #include <vector>
 #include <algorithm>
@@ -131,11 +133,18 @@ struct Context {
     }
 };
 std::mutex mutex;std::shared_ptr<Context> current;Stats stats;uint64_t last_submit_tick=0,sample_tick=0;
+// The contexts of other picture sizes on the same device and queue, kept whole (a folded DLSS level
+// measures at its own size; switching levels must not build programs on the frame's own time), and
+// the sizes Prepare is building on its own thread.
+std::vector<std::shared_ptr<Context>> cached;std::vector<std::pair<unsigned,unsigned>> building;
+constexpr size_t kCachedContexts=3;
 void reason(const char* r){strncpy_s(stats.reason,r,_TRUNCATE);}
 bool compile_flow_shader(const char* source,size_t bytes,const char* name,const char* entry,ComPtr<ID3DBlob>& result){
     // Fixed source strings and entry point names. Bytecode has no dependency on
     // the device, queue, or extent. Each context still owns its own pipelines.
-    // This is called only while holding the flow mutex.
+    // Called under the flow mutex, and by Prepare's thread without it: the cache has its own lock.
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> cache_lock(cache_mutex);
     struct Shader {
         const char* source;
         const char* entry;
@@ -256,9 +265,18 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     if(!l || !queue || !color || !depth || !na::ffx_flow::Built()){++stats.unavailable;reason("AMD compute shaders unavailable or invalid frame");return {};}
     ComPtr<ID3D12Device> device;if(FAILED(l->GetDevice(IID_PPV_ARGS(&device))))return {};
     auto d=color->GetDesc();const unsigned w=static_cast<unsigned>(d.Width),h=d.Height;
-    if(!current || current->device.Get()!=device.Get() || current->queue.Get()!=queue || current->w!=w || current->h!=h){
-        reason("AMD working resources unavailable; camera motion used");
-        auto next=std::make_shared<Context>();if(!build(*next,device.Get(),queue,w,h))return {};current=std::move(next);++stats.resets;
+    if(current && (current->device.Get()!=device.Get() || current->queue.Get()!=queue)){current.reset();cached.clear();}
+    if(!current || current->w!=w || current->h!=h){
+        // Another size: the context kept for it (its last picture pairs only with the frame it names), else a new one.
+        std::shared_ptr<Context> next;
+        for(auto it=cached.begin();it!=cached.end();++it)if((*it)->device.Get()==device.Get() && (*it)->queue.Get()==queue && (*it)->w==w && (*it)->h==h){next=*it;cached.erase(it);break;}
+        if(next)++stats.context_swaps;
+        else{
+            reason("AMD working resources unavailable; camera motion used");
+            next=std::make_shared<Context>();if(!build(*next,device.Get(),queue,w,h))return {};++stats.resets;
+        }
+        if(current){cached.push_back(std::move(current));if(cached.size()>kCachedContexts)cached.erase(cached.begin());}
+        current=std::move(next);
     }
     auto c=current;
     if(f.total && (!c->pso_measure || !c->pso_cut_state || !c->pso_cut_show)){++stats.unavailable;reason("Measured motion: its GPU programs did not build on this device");return {};}
@@ -516,10 +534,34 @@ void RecordCutShow(ID3D12GraphicsCommandList* l,const Ticket& t,ID3D12Resource* 
 void SetLoosen(uint32_t percent){g_loosen.store(percent>100?100u:percent,std::memory_order_relaxed);}
 void SetFrameCandidates(bool on){g_candidates.store(on,std::memory_order_relaxed);}
 void SetScreenFit(bool on){g_screen_fit.store(on,std::memory_order_relaxed);}
-void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current)return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);memcpy(im.raster_jitter,t.frame.raster_jitter,sizeof im.raster_jitter);im.colour_epoch=t.colour_epoch;im.raster_confirmed=t.frame.raster_confirmed;c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
+void Committed(const Ticket& t){if(!t.context)return;std::lock_guard<std::mutex> lock(mutex);auto c=std::static_pointer_cast<Context>(t.context);if(c!=current && std::find(cached.begin(),cached.end(),c)==cached.end())return;auto& im=*c->images[t.image];im.frame=t.frame.frame;im.generation=t.frame.generation;memcpy(im.jitter,t.frame.jitter,sizeof im.jitter);memcpy(im.raster_jitter,t.frame.raster_jitter,sizeof im.raster_jitter);im.colour_epoch=t.colour_epoch;im.raster_confirmed=t.frame.raster_confirmed;c->last=static_cast<int>(t.image);auto& slot=*c->leases[t.slot];slot.submitted=true;++stats.submitted;if(slot.pair)++stats.submitted_pairs;
     if(slot.cut_seed){c->cut_seeded=true;slot.cut_seed=false;}
     if(slot.pair && slot.hist_written>=0){c->hist_read=static_cast<unsigned>(slot.hist_written);c->hist_frame=t.frame.frame;c->hist_generation=t.frame.generation;slot.hist_written=-1;}stats.last_submitted_frame=t.frame.frame;last_submit_tick=GetTickCount64();}
-void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();last_submit_tick=sample_tick=0;stats={};}
+void Prepare(ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,unsigned h){
+    if(!device || !queue || !w || !h || !na::ffx_flow::Built())return;
+    std::lock_guard<std::mutex> lock(mutex);
+    if(current && (current->device.Get()!=device || current->queue.Get()!=queue))return; // Record settles a new device first
+    if(current && current->w==w && current->h==h)return;
+    for(const auto& c:cached)if(c->w==w && c->h==h)return;
+    for(const auto& b:building)if(b.first==w && b.second==h)return;
+    building.emplace_back(w,h);
+    ComPtr<ID3D12Device> dev(device);ComPtr<ID3D12CommandQueue> q(queue);
+    std::thread([dev,q,w,h]{
+        auto next=std::make_shared<Context>();const bool ok=build(*next,dev.Get(),q.Get(),w,h);
+        std::lock_guard<std::mutex> lock(mutex);
+        building.erase(std::remove(building.begin(),building.end(),std::make_pair(w,h)),building.end());
+        if(!ok){++stats.prepare_failed;return;}
+        if(current && (current->device.Get()!=dev.Get() || current->queue.Get()!=q.Get()))return;
+        cached.push_back(std::move(next));++stats.prepared;if(cached.size()>kCachedContexts)cached.erase(cached.begin());
+    }).detach();
+}
+bool Ready(unsigned w,unsigned h){
+    std::lock_guard<std::mutex> lock(mutex);
+    if(current && current->w==w && current->h==h)return true;
+    for(const auto& c:cached)if(c->w==w && c->h==h)return true;
+    return false;
+}
+void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();cached.clear();last_submit_tick=sample_tick=0;stats={};}
 Stats GetStats(){na::nr::native::Maintain();std::lock_guard<std::mutex> lock(mutex);if(current){collect(*current);stats.colour_jitter_convention=static_cast<uint32_t>(current->raster_confirmed?na::jitter::Convention::Raster:current->colour_jitter.Get());stats.colour_jitter_epoch=current->colour_jitter.Epoch();}const auto now=GetTickCount64();stats.submit_age_ms=last_submit_tick?now-last_submit_tick:0;stats.sample_age_ms=sample_tick?now-sample_tick:0;return stats;}
 void DescribeStats(const Stats& s,char* text,size_t capacity){
     if(!text || !capacity)return;

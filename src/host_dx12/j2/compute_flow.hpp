@@ -94,8 +94,15 @@ void SetScreenFit(bool on);
 struct Gates { float image_ratio, image_abs, texture_min, agree_px, agree_cos, consistency_px; uint32_t agree_min; bool sky; };
 Gates GatesFor(uint32_t percent); // pure, for tests and the panel
 void Reset(); // old contexts stay retained by their executable/GPU recordings
+// Another picture size is coming (a folded DLSS level measures at its own size): its working
+// resources and programs are built on a thread of their own, and Record takes them when a picture of
+// that size arrives, keeping the present size's for the way back. No frame waits on it. Ready says
+// whether Record would find that size without building anything.
+void Prepare(ID3D12Device*,ID3D12CommandQueue*,unsigned w,unsigned h);
+bool Ready(unsigned w,unsigned h);
 struct Stats {
     uint64_t recorded=0,submitted=0,pairs=0,busy=0,resets=0,accepted=0,total=0;
+    uint64_t context_swaps=0,prepared=0,prepare_failed=0; // sizes taken from the kept contexts; built ahead by Prepare; failed there
     uint64_t attempts=0,submitted_pairs=0,waiting_history=0,unavailable=0,samples=0;
     uint64_t last_submitted_frame=0,sample_frame=0,submit_age_ms=0,sample_age_ms=0;
     uint64_t rejected_invalid=0,rejected_small=0,rejected_cost=0,rejected_offscreen=0,rejected_image=0,rejected_flicker=0; // flicker: passed every check, no agreeing previous pair yet
