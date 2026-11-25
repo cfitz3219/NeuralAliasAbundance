@@ -73,6 +73,9 @@ def vnoise(x, y, seed):
     return (a + (b - a) * fx) * (1 - fy) + (c + (d - c) * fx) * fy
 
 
+LEAF_MOTION = False  # True: the swaying leaves' own motion is in the motion vectors (as optical flow would supply)
+
+
 def scene(gx, gy, sx, sy, t):
     """Colour (h, w, 3), depth, motion (full-size pixels, current to previous) for samples whose geometry is
     taken at (gx, gy) and whose colour program runs at (sx, sy). Full-size pixel coordinates."""
@@ -126,8 +129,12 @@ def scene(gx, gy, sx, sy, t):
     #   of the colour program. Right of x = 0.82 W the leaves sway; the sway is not in the motion vectors.
     wx, wy = sx + cam[0] * par[3], sy + cam[1] * par[3]
     sway = (sx > W * 0.82)
-    wx = wx + np.where(sway, 1.6 * np.sin(t * 0.55 + wy / 37.0), 0.0)
-    wy = wy + np.where(sway, 0.9 * np.sin(t * 0.41 + wx / 53.0), 0.0)
+    dx = np.where(sway, 1.6 * np.sin(t * 0.55 + wy / 37.0), 0.0)
+    dx_before = np.where(sway, 1.6 * np.sin((t - 1) * 0.55 + wy / 37.0), 0.0)
+    wx = wx + dx
+    dy = np.where(sway, 0.9 * np.sin(t * 0.41 + wx / 53.0), 0.0)
+    dy_before = np.where(sway, 0.9 * np.sin((t - 1) * 0.41 + wx / 53.0), 0.0)
+    wy = wy + dy
     n = vnoise(wx / 19.0, wy / 19.0, 6) * 0.5 + vnoise(wx / 6.5, wy / 6.5, 7) * 0.32 + vnoise(wx / 2.6, wy / 2.6, 8) * 0.18
     region = np.maximum(np.clip((sx - W * 0.60) / (W * 0.10), 0, 1), np.clip((H * 0.13 - sy) / (H * 0.08), 0, 1))
     twig = (np.abs(((wx * 0.8 + wy * 0.6) % 83.0) - 41.0) < 0.7) | (np.abs(((wx * -0.3 + wy * 0.95) % 71.0) - 35.0) < 0.6)
@@ -143,6 +150,10 @@ def scene(gx, gy, sx, sy, t):
     mv = np.zeros(shape + (2,))
     for k in range(4):
         mv[layer == k] = PAN * par[k]
+    if LEAF_MOTION:
+        # A leaf point sits at screen = world - camera - sway, so previous - current = pan + sway now - sway before.
+        mv[..., 0] += np.where(layer == 3, dx - dx_before, 0.0)
+        mv[..., 1] += np.where(layer == 3, dy - dy_before, 0.0)
     return col, depth, mv
 
 
@@ -152,6 +163,8 @@ def grid(w, h):
 
 
 def write_frame(folder, index, col, depth, mv, jit, quality, out_wh):
+    if not os.path.isdir(folder):
+        return  # a variant this run does not make
     h, w = depth.shape
     rgba = np.concatenate([col, np.ones((h, w, 1))], -1).astype(np.float16)
     rgba.tofile(os.path.join(folder, "%05d-color.raw" % index))
@@ -180,12 +193,13 @@ def write_meta(folder, index, w, h, jit, quality, out_wh):
 VARIANTS = ["native", "half-true", "half-4phase", "fold-pick", "fold-cycle", "fold-split", "repro-trial1"]
 
 
-def generate(out, frames=FRAMES, size=None):
+def generate(out, frames=FRAMES, size=None, only=None):
     global W, H
+    keep = only or VARIANTS
     if size:
         W, H = size
     hw, hh = W // 2, H // 2
-    for v in VARIANTS + ["truth"]:
+    for v in list(keep) + ["truth"]:
         os.makedirs(os.path.join(out, v), exist_ok=True)
     X, Y = grid(W, H)
     hx, hy = grid(hw, hh)
@@ -228,7 +242,7 @@ def generate(out, frames=FRAMES, size=None):
             np.save(os.path.join(out, "truth", "%05d.npy" % t), (acc / 16.0).astype(np.float32))
         print("frame", t, flush=True)
     with open(os.path.join(out, "scene.json"), "w") as f:
-        json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": VARIANTS}, f)
+        json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": list(keep), "leaf_motion": LEAF_MOTION}, f)
 
 
 def display(x):
@@ -287,7 +301,7 @@ def evaluate(out, replay):
         lines.append("%-30s" % labels[v] + "".join("%20s" % ("%.2f (wobble %.2f)" % (np.mean(err[v][c]), np.std(err[v][c]))) for c in cols))
     open(os.path.join(pics, "numbers.txt"), "w").write("\n".join(lines) + "\n")
     print("\n".join(lines))
-    order = ["truth", "native", "half-true", "fold-pick", "fold-cycle", "fold-split", "half-4phase", "repro-trial1"]
+    order = [v for v in ["truth", "native", "half-true", "fold-pick", "fold-cycle", "fold-split", "half-4phase", "repro-trial1"] if v in final]
     names = dict(labels, truth="Exact picture")
     for r, (x, y, rw, rh) in reg.items():
         sheet = Image.new("RGB", ((rw * 2 + 8) * 4, (rh * 2 + 30) * 2), (24, 24, 24))
@@ -298,7 +312,7 @@ def evaluate(out, replay):
             dr.text((ox + 4, oy + 8), names[v], fill=(255, 255, 255))
             sheet.paste(crop, (ox, oy + 30))
         sheet.save(os.path.join(pics, "compare-%s.jpg" % r), quality=92)
-    over = Image.fromarray(np.clip(final["fold-pick"], 0, 255).astype(np.uint8))
+    over = Image.fromarray(np.clip(final["fold-cycle"], 0, 255).astype(np.uint8))
     dr = ImageDraw.Draw(over)
     for r, (x, y, rw, rh) in reg.items():
         dr.rectangle([x, y, x + rw, y + rh], outline=(255, 230, 0), width=3)
@@ -310,6 +324,10 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "generate":
         generate(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else FRAMES,
                  (int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) > 5 else None)
+    elif len(sys.argv) >= 3 and sys.argv[1] == "generate-leafmotion":
+        # The same scene, with the swaying leaves' motion in the vectors: DLAA, ordinary half size, the fold.
+        LEAF_MOTION = True
+        generate(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else FRAMES, None, ["native", "half-true", "fold-cycle"])
     elif len(sys.argv) >= 4 and sys.argv[1] == "evaluate":
         evaluate(sys.argv[2], sys.argv[3])
     else:
