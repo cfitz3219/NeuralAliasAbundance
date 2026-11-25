@@ -215,7 +215,12 @@ struct ListState {
     // answer to "does this draw's shader read a layer".
     na_object_id vpj_layer_seen_rt = 0;
     uint32_t vpj_layer_seen_frame = 0;
-    struct VpjLayerRead { uint64_t state_revision = 0, registry_revision = 0; uint32_t frame = 0; bool valid = false, reads = false; } vpj_layer_read;
+    struct VpjLayerRead {
+        uint64_t state_revision = 0, registry_revision = 0;
+        uint32_t frame = 0, count = 0;
+        std::array<na_object_id, 4> layers{};
+        bool valid = false, reads = false;
+    } vpj_layer_read;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32, cur_rt_sub = NA_UNKNOWN_U32;
     na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
     uint32_t entry_barrier=0;
@@ -5507,7 +5512,8 @@ bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* l
 {
     auto& cached = ls.vpj_layer_read;
     const uint64_t revision_now = g_operation_revision.load();
-    if (cached.valid && cached.state_revision == ls.read_revision[0] && cached.registry_revision == revision_now && cached.frame == frame)
+    if (cached.valid && cached.state_revision == ls.read_revision[0] && cached.registry_revision == revision_now && cached.frame == frame &&
+        cached.count == count && std::equal(layers, layers + count, cached.layers.begin()))
         return cached.reads;
     bool reads = false;
     if (const Obj* sig = root_sig_obj_locked(ls, 0)) {
@@ -5539,6 +5545,8 @@ bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* l
     cached.state_revision = ls.read_revision[0];
     cached.registry_revision = revision_now;
     cached.frame = frame;
+    cached.count = count;
+    std::copy_n(layers, count, cached.layers.begin());
     cached.reads = reads;
     cached.valid = true;
     return reads;
