@@ -447,8 +447,8 @@ int main(int argc, char** argv)
         na::nr::native::Reset(l.list.Get());
         na::nr::native::Maintain();
         if (index >= 5 && ticket.pair) {
-            const auto timing = cf::GetStats();
-            if (timing.sample_frame == f.frame && timing.ms > 0) pair_ms.push_back(timing.ms);
+            const auto pair_stats = cf::GetStats();
+            if (pair_stats.sample_frame == f.frame && pair_stats.ms > 0) pair_ms.push_back(pair_stats.ms);
         }
         l.Reset();
 
