@@ -53,6 +53,17 @@
 //                                         planes, then the replay carries on. Shows whether one feature's creation
 //                                         disturbs another's later frames (Cort's fb0d69cd run: DLAA turned to
 //                                         colour noise after the Performance level had been created).
+//   Two features at once (Cort's fb0d69cd colour noise; which orders of creating, running and releasing
+//   two DLSS features of different sizes keep both pictures right). The second feature is a Performance
+//   one: this step's planes folded to half size (the last pixel of each 2x2 block kept), created at
+//   that half size, on view 2, with its own output.
+//     --second-at N          create and run it at step N (0: before the main feature is first created)
+//     --second-every         run it on every step from N on (else only at N)
+//     --second-release-at N  release it at step N, before anything is run
+//     --main-recreate-at N   release the main feature at step N and create it again (history restarts)
+//   Every replayed step logs "stats" of the main output (and of the second's when it ran): the largest
+//   value, the mean, the share of pixels with a channel above 64 and of values not finite. Clean output
+//   here is under 64 everywhere; the noise reached thousands.
 //   --fold-block 2x2 | 2x1                which block the fold keeps one pixel of: 2x2 (Performance, the default)
 //                                         or 2x1 (the live Quality level: half width, full height).
 //   --fold-create folded | full           the size the DLSS feature is created at: folded (the default, as the
@@ -72,6 +83,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -398,6 +410,37 @@ void FoldRows(const std::vector<uint8_t>& in, uint32_t width, uint32_t bpp, uint
         for (uint32_t x = 0; x < fw; ++x) std::memcpy(dst + static_cast<size_t>(x) * bpp, src + static_cast<size_t>(bx * x) * bpp, bpp);
     }
 }
+struct OutStats { float max = 0; double mean = 0, above = 0; uint64_t nonfinite = 0; };
+OutStats Measure(const uint8_t* p, size_t pitch, uint32_t w, uint32_t h, uint32_t format, uint32_t bpp)
+{
+    OutStats o;
+    uint64_t n = 0, above = 0;
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* q = p + static_cast<size_t>(y) * pitch + static_cast<size_t>(x) * bpp;
+            float c[3];
+            if (format == 10) {
+                uint16_t v[3];
+                std::memcpy(v, q, 6);
+                c[0] = FromHalf(v[0]); c[1] = FromHalf(v[1]); c[2] = FromHalf(v[2]);
+            } else {
+                c[0] = c[1] = c[2] = Luma(q, format);
+            }
+            bool bad = false, high = false;
+            for (const float v : c) {
+                if (!std::isfinite(v)) { bad = true; continue; }
+                o.max = (std::max)(o.max, v);
+                high |= v > 64.0f;
+            }
+            if (bad) { ++o.nonfinite; continue; }
+            o.mean += (static_cast<double>(c[0]) + c[1] + c[2]) / 3.0;
+            above += high ? 1 : 0;
+            ++n;
+        }
+    o.mean = n ? o.mean / static_cast<double>(n) : 0.0;
+    o.above = n ? 100.0 * static_cast<double>(above) / static_cast<double>(n) : 0.0;
+    return o;
+}
 struct Step {
     size_t frame = 0;            // index into the selected frames
     bool preroll = false;
@@ -431,6 +474,8 @@ int main(int argc, char** argv)
     bool fold_block = false;
     bool second_feature = false;
     uint32_t fold_bx = 2, fold_by = 2;
+    int second_at = -1, second_release_at = -1, main_recreate_at = -1;
+    bool second_every = false;
     bool fold_create_full = false, timing = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
@@ -470,6 +515,10 @@ int main(int argc, char** argv)
             else return Usage();
         }
         else if (a == "--second-feature") second_feature = true;
+        else if (a == "--second-at" && value) { second_at = std::atoi(value); ++i; }
+        else if (a == "--second-every") second_every = true;
+        else if (a == "--second-release-at" && value) { second_release_at = std::atoi(value); ++i; }
+        else if (a == "--main-recreate-at" && value) { main_recreate_at = std::atoi(value); ++i; }
         else if (a == "--fold-block" && value) {
             const std::string v = value;
             ++i;
@@ -635,6 +684,29 @@ int main(int argc, char** argv)
     test::ComPtr<ID3D12Resource> time_readback;
     UINT64 time_frequency = 0;
     std::vector<double> evaluate_ms;
+    if (second_feature && second_at < 0) second_at = 1; // the original one-off trial
+    // The second feature's own inputs (one pixel of each 2x2 block), output and readback.
+    Texture color2, depth2, motion2;
+    test::ComPtr<ID3D12Resource> output2, readback2;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT out2_fp{};
+    UINT64 out2_bytes = 0;
+    const uint32_t half_w = head.color.width / 2, half_h = head.color.height / 2;
+    if (second_at >= 0) {
+        PlaneInfo c = head.color, z = head.depth, v = head.motion;
+        c.width = z.width = v.width = half_w;
+        c.height = z.height = v.height = half_h;
+        REQUIRE(MakeInput(dev, c, &color2) && MakeInput(dev, z, &depth2) && MakeInput(dev, v, &motion2));
+        output2 = test::CreateTexture(dev, half_w * 2, half_h * 2, TextureFormat(out_plane.format), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        REQUIRE(output2);
+        const D3D12_RESOURCE_DESC desc = output2->GetDesc();
+        dev->GetCopyableFootprints(&desc, 0, 1, 0, &out2_fp, nullptr, nullptr, &out2_bytes);
+        readback2 = test::CreateBuffer(dev, out2_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        REQUIRE(readback2);
+        Log("second feature: %ux%u Performance on view 2, created at that size, at step %d%s; released at step %d; main recreated at step %d",
+            half_w, half_h, second_at, second_every ? ", run every step after" : ", run once", second_release_at, main_recreate_at);
+    }
+    bool second_ran = false;
     if (timing) {
         const D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0};
         time_readback = test::CreateBuffer(dev, 16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -766,17 +838,58 @@ int main(int argc, char** argv)
             e.bias_current_color = bias.tex.Get();
             ++bias_planes;
         }
-        if (second_feature && si == 1) {
+        if (second_release_at >= 0 && si == static_cast<size_t>(second_release_at)) {
+            na::dlss::ReleaseView(e.view_id + 1);
+            Log("step %zu: second feature released", si);
+        }
+        if (main_recreate_at >= 0 && si == static_cast<size_t>(main_recreate_at)) {
+            na::dlss::ReleaseView(e.view_id);
+            e.reset = true;
+            Log("step %zu: main feature released, created again on this step", si);
+        }
+        second_ran = false;
+        const bool second_released = second_release_at >= 0 && si >= static_cast<size_t>(second_release_at);
+        if (second_at >= 0 && !second_released && (si == static_cast<size_t>(second_at) || (second_every && si > static_cast<size_t>(second_at)))) {
+            FoldRows(rows, m.color.width, color.bpp, half_w, half_h, 1, 1, &folded);
+            REQUIRE(Fill(l.list.Get(), &color2, folded));
+            FoldRows(depth_rows, m.depth.width, depth.bpp, half_w, half_h, 1, 1, &folded);
+            REQUIRE(Fill(l.list.Get(), &depth2, folded));
+            FoldRows(motion_rows, m.motion.width, motion.bpp, half_w, half_h, 1, 1, &folded);
+            REQUIRE(Fill(l.list.Get(), &motion2, folded));
             na::dlss::EvalDesc x = e;
+            x.color = color2.tex.Get();
+            x.depth = depth2.tex.Get();
+            x.motion = motion2.tex.Get();
+            x.output = output2.Get();
             x.view_id = e.view_id + 1;
-            x.render_w = x.max_render_w = e.render_w / 2;
-            x.render_h = x.max_render_h = e.render_h / 2;
+            x.render_w = x.max_render_w = half_w;
+            x.render_h = x.max_render_h = half_h;
+            x.out_w = half_w * 2;
+            x.out_h = half_h * 2;
+            x.jitter_x = (m.jitter_x - 0.5f) * 0.5f; // the kept pixel (1,1) is half a full-size pixel past the block's centre
+            x.jitter_y = (m.jitter_y - 0.5f) * 0.5f;
+            x.mv_scale_x = m.mv_scale_x * 0.5f;
+            x.mv_scale_y = m.mv_scale_y * 0.5f;
             x.quality = na::dlss::Quality::MaxPerformance;
             x.mv_display_res = false;
-            x.reset = true;
+            x.reset = si == static_cast<size_t>(second_at);
             x.bias_current_color = nullptr;
-            const bool ok = na::dlss::Evaluate(l.list.Get(), x); // its picture is overwritten by the replayed frame below
-            Log("second feature: %ux%u Performance on view %llu, %s", x.render_w, x.render_h, static_cast<unsigned long long>(x.view_id), ok ? "created and run" : na::dlss::GetStats().reason);
+            const bool ok = na::dlss::Evaluate(l.list.Get(), x);
+            if (!ok) Log("step %zu: the second feature was refused: %s", si, na::dlss::GetStats().reason);
+            if (ok) {
+                D3D12_RESOURCE_BARRIER b = test::Transition(output2.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                l.list->ResourceBarrier(1, &b);
+                D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+                src.pResource = output2.Get();
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.pResource = readback2.Get();
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint = out2_fp;
+                l.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                b = test::Transition(output2.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                l.list->ResourceBarrier(1, &b);
+                second_ran = true;
+            }
         }
         if (timing) l.list->EndQuery(time_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         const bool evaluated = na::dlss::Evaluate(l.list.Get(), e);
@@ -818,6 +931,27 @@ int main(int argc, char** argv)
             if (si) evaluate_ms.push_back(ms);
         }
         if (s.preroll) continue;
+        {
+            uint8_t* mp = nullptr;
+            const D3D12_RANGE whole{0, static_cast<SIZE_T>(out_bytes)}, none{0, 0};
+            REQUIRE(SUCCEEDED(readback->Map(0, &whole, reinterpret_cast<void**>(&mp))));
+            const OutStats a = Measure(mp, out_fp.Footprint.RowPitch, out_plane.width, out_plane.height, out_plane.format, out_bpp);
+            readback->Unmap(0, &none);
+            char second_text[160] = " | second: not run";
+            if (second_ran) {
+                const D3D12_RANGE whole2{0, static_cast<SIZE_T>(out2_bytes)};
+                REQUIRE(SUCCEEDED(readback2->Map(0, &whole2, reinterpret_cast<void**>(&mp))));
+                const OutStats b2 = Measure(mp, out2_fp.Footprint.RowPitch, half_w * 2, half_h * 2, out_plane.format, out_bpp);
+                readback2->Unmap(0, &none);
+                std::snprintf(second_text, sizeof second_text, " | second: max %.3f mean %.5f above64 %.2f%% nonfinite %llu", static_cast<double>(b2.max), b2.mean, b2.above,
+                              static_cast<unsigned long long>(b2.nonfinite));
+            }
+            const na::dlss::Stats fs = na::dlss::GetStats();
+            Log("stats: step %zu main: max %.3f mean %.5f above64 %.2f%% nonfinite %llu%s | features created %llu released %llu waiting %llu, views %u", si,
+                static_cast<double>(a.max), a.mean, a.above, static_cast<unsigned long long>(a.nonfinite), second_text,
+                static_cast<unsigned long long>(fs.features_created), static_cast<unsigned long long>(fs.features_released),
+                static_cast<unsigned long long>(fs.features_pending), fs.views_active);
+        }
         if (save_last && si + save_last < steps.size()) { ++written; continue; } // not kept on disk; the number is
 
         // The replayed output as tight rows, and (first forward pass) how far it is from the saved output.
