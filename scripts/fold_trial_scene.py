@@ -220,7 +220,7 @@ def write_meta(folder, index, w, h, jit, quality, out_wh):
         "capture_kind": "evaluation", "evaluation_succeeded": True, "present_ordinal": 1000 + index,
         "size": [w, h], "jitter_px": [float(jit[0]), float(jit[1])], "mv_scale": [1.0, 1.0],
         # the supplied motion as a camera: pixels (of this picture) per unit of depth
-        "trial_shear_px": [float(PAN[0] / DEPTH_PER_PAR * w / W), float(PAN[1] / DEPTH_PER_PAR * w / W)],
+        "trial_shear_px": [float(PAN[0] / DEPTH_PER_PAR * w / W), float(PAN[1] / DEPTH_PER_PAR * h / H)],
         "preset": 13, "debug_view": 0, "quality": quality, "pre_exposure": 1.0, "exposure_scale": 1.0,
         "hdr": True, "depth_inverted": True, "auto_exposure": True, "mv_lowres": True, "mv_jittered": False,
         "planes": [
@@ -350,6 +350,110 @@ def generate_mip(out, frames=FRAMES, size=None):
         json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": MIP_VARIANTS, "leaf_motion": True, "gust": GUST}, f)
 
 
+# ---- Trial 8 (2026-11-25): a Quality-like step for the fold --------------------------------------
+# Cort: "If it's possible to have Quality level, do it." The 2x2 fold shades a quarter of the pixels
+# (Performance). Coarse shading in 2x1 blocks shades half of them, a little above Quality's 44%. Keeping
+# one pixel of each pair gives DLSS a picture that is half size in ONE direction only; whether DLSS
+# takes such a picture, and how it compares with real Quality, is the question. Exact motion supplied
+# (as in trial 5), R2 jitter, mip bias by NVIDIA's rule for every variant.
+QUALITY_VARIANTS = ["native", "quality-true", "half-true", "fold2x1-q", "fold2x1-p", "fold1x2-q", "fold-cycle"]
+QUALITY_LABELS = {"native": "DLAA", "quality-true": "Real Quality (67%)", "half-true": "Real Performance (50%)",
+                  "fold2x1-q": "Fold 2x1, Quality model", "fold2x1-p": "Fold 2x1, Performance model",
+                  "fold1x2-q": "Fold 1x2, Quality model", "fold-cycle": "Fold 2x2 (Performance)"}
+
+
+def _quality_frame(job):
+    out, t, frames, size = job
+    global W, H, LEAF_MOTION
+    W, H = size
+    LEAF_MOTION = True
+    X, Y = grid(W, H)
+    F = 0.5  # every variant carries its NVIDIA bias, so its textures are read over half a full-size pixel
+    jn = jitter_r2(t, 16)
+    col, dep, mv, _ = scene(X + 0.5 - jn[0], Y + 0.5 - jn[1], X + 0.5 - jn[0], Y + 0.5 - jn[1], t, F)
+    write_frame(os.path.join(out, "native"), t, col, dep, mv, jn, 5, (W, H))
+    # real Quality: two thirds of each side
+    qw, qh = int(round(W / 1.5)), int(round(H / 1.5))
+    qx, qy = grid(qw, qh)
+    jq = jitter_r2(t, 32)
+    sx, sy = (qx + 0.5 - jq[0]) * W / qw, (qy + 0.5 - jq[1]) * H / qh
+    col, dep, mv, _ = scene(sx, sy, sx, sy, t, F)
+    write_frame(os.path.join(out, "quality-true"), t, col, dep, mv * np.array([qw / W, qh / H]), jq, 2, (W, H))
+    # real Performance and the 2x2 fold
+    hw, hh = W // 2, H // 2
+    hx, hy = grid(hw, hh)
+    jh = jitter_r2(t, 64)
+    sx, sy = 2.0 * (hx + 0.5 - jh[0]), 2.0 * (hy + 0.5 - jh[1])
+    col, dep, mv, _ = scene(sx, sy, sx, sy, t, F)
+    write_frame(os.path.join(out, "half-true"), t, col, dep, mv * 0.5, jh, 0, (W, H))
+    px, py = PICKS[t % 4]
+    col, dep, mv, _ = scene(sx - 0.5 + px, sy - 0.5 + py, sx, sy, t, F)
+    write_frame(os.path.join(out, "fold-cycle"), t, col, dep, mv * 0.5, jh, 0, (W, H))
+    # 2x1 fold: half size across, full size down. Colour once per pair at the pair's centre, coverage and
+    # depth at the kept pixel (left and right in turn).
+    j2 = jitter_r2(t, 32)
+    ax, ay = grid(hw, H)
+    sx, sy = 2.0 * (ax + 0.5 - j2[0]), ay + 0.5 - j2[1]
+    col, dep, mv, _ = scene(sx - 0.5 + (t % 2), sy, sx, sy, t, F)
+    for name, q in (("fold2x1-q", 2), ("fold2x1-p", 0)):
+        write_frame(os.path.join(out, name), t, col, dep, mv * np.array([0.5, 1.0]), j2, q, (W, H))
+    # 1x2 fold: full size across, half size down.
+    bx, by = grid(W, hh)
+    sx, sy = bx + 0.5 - j2[0], 2.0 * (by + 0.5 - j2[1])
+    col, dep, mv, _ = scene(sx, sy - 0.5 + (t % 2), sx, sy, t, F)
+    write_frame(os.path.join(out, "fold1x2-q"), t, col, dep, mv * np.array([1.0, 0.5]), j2, 2, (W, H))
+    if t >= frames - TRUTH_LAST:
+        acc = np.zeros((H, W, 3))
+        for a in range(4):
+            for b in range(4):
+                ox, oy = (a + 0.5) / 4.0, (b + 0.5) / 4.0
+                acc += scene(X + ox, Y + oy, X + ox, Y + oy, t)[0]
+        np.save(os.path.join(out, "truth", "%05d.npy" % t), (acc / 16.0).astype(np.float32))
+    return t
+
+
+def generate_quality(out, frames=FRAMES, size=None, workers=0):
+    """Frames are drawn several at a time (one process each): the drawing is plain numpy on one core."""
+    import multiprocessing
+    size = tuple(size) if size else (W, H)
+    for v in QUALITY_VARIANTS + ["truth"]:
+        os.makedirs(os.path.join(out, v), exist_ok=True)
+    workers = workers or max(1, min(12, (os.cpu_count() or 2) // 2))
+    jobs = [(out, t, frames, size) for t in range(frames)]
+    with multiprocessing.Pool(workers) as pool:
+        for t in pool.imap_unordered(_quality_frame, jobs):
+            print("frame", t, flush=True)
+    with open(os.path.join(out, "scene.json"), "w") as f:
+        json.dump({"width": size[0], "height": size[1], "frames": frames, "truth_last": TRUTH_LAST, "variants": QUALITY_VARIANTS,
+                   "leaf_motion": True, "gust": 0, "jitter": "R2", "trial": "quality"}, f)
+
+
+def quality_run(scene_dir, work, bindir):
+    """Every variant through DLSS (tests/host/dlss_capture_replay), then the numbers and pictures. A variant
+    DLSS refuses is reported and left out; that refusal is itself an answer."""
+    info = json.load(open(os.path.join(scene_dir, "scene.json")))
+    frames, last = info["frames"], min(info["truth_last"], info["frames"])
+    exe = os.path.join(bindir, "dlss_capture_replay.exe")
+    logs = os.path.join(work, "logs")
+    os.makedirs(logs, exist_ok=True)
+    done = []
+    for v in info["variants"]:
+        target = os.path.join(work, "replay", v, "%05d-dlssout.raw" % (frames - 1))
+        code = 0
+        if not os.path.isfile(target):
+            code = flow_run([exe, os.path.join(scene_dir, v), os.path.join(work, "replay"), "--name", v, "--preroll", "0", "--save-last", str(last)],
+                            os.path.join(logs, "replay-%s.txt" % v))
+        if code == 0 and os.path.isfile(target):
+            done.append(v)
+        else:
+            print("REFUSED or FAILED (exit %d): %s; see %s" % (code, QUALITY_LABELS.get(v, v), os.path.join(logs, "replay-%s.txt" % v)), flush=True)
+    info["variants"] = done
+    with open(os.path.join(work, "scene.json"), "w") as f:
+        json.dump(info, f)
+    evaluate(scene_dir, os.path.join(work, "replay"), info)
+    return 0 if len(done) > 1 else 1
+
+
 def display(x):
     x = np.nan_to_num(np.maximum(x.astype(np.float64), 0.0))
     x = x / (1.0 + x)
@@ -383,9 +487,9 @@ def regions_base(w, h):
     }
 
 
-def evaluate(out, replay):
+def evaluate(out, replay, info=None):
     from PIL import Image, ImageDraw
-    info = json.load(open(os.path.join(out, "scene.json")))
+    info = info or json.load(open(os.path.join(out, "scene.json")))
     w, h, frames = info["width"], info["height"], info["frames"]
     last = min(info["truth_last"], frames)
     reg = regions(w, h)
@@ -398,6 +502,8 @@ def evaluate(out, replay):
               "native-b1": "DLAA, bias -1 (R2)", "half-b0": "Performance, no bias", "half-b1": "Performance, bias -1",
               "half-b2": "Performance, bias -2", "half-b225": "Performance, bias -2.25", "half-b2-halton": "Perf., bias -2, Halton",
               "fold-b0": "Fold, no bias", "fold-b2": "Fold, bias -2", "fold-b225": "Fold, bias -2.25"}
+    if info.get("trial") == "quality":
+        labels = dict(labels, **QUALITY_LABELS)
     err = {v: {r: [] for r in list(reg) + ["whole"]} for v in info["variants"]}
     final = {}
     for t in range(frames - last, frames):
@@ -422,6 +528,8 @@ def evaluate(out, replay):
     open(os.path.join(pics, "numbers.txt"), "w").write("\n".join(lines) + "\n")
     print("\n".join(lines))
     order = [v for v in ["truth", "native", "half-true"] + MIP_VARIANTS + ["fold-pick", "fold-cycle", "fold-split", "half-4phase", "repro-trial1"] if v in final]
+    if info.get("trial") == "quality":
+        order = ["truth"] + [v for v in info["variants"] if v in final]
     names = dict(labels, truth="Exact picture")
     for r, (x, y, rw, rh) in reg.items():
         sheet = Image.new("RGB", ((rw * 2 + 8) * 4, (rh * 2 + 30) * ((len(order) + 3) // 4)), (24, 24, 24))
@@ -512,15 +620,9 @@ FLOW_ORDER = ["supplied", "alone-0", "alone-50", "alone-100", "total", "correct-
 
 
 def safe_cores():
-    """Cort's PC: keep this process, and everything it starts, on the cores of mask 00FF33CC."""
-    if os.name != "nt":
-        return
-    import ctypes
-    k = ctypes.windll.kernel32
-    k.GetCurrentProcess.restype = ctypes.c_void_p
-    k.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    ok = k.SetProcessAffinityMask(k.GetCurrentProcess(), 0x00FF33CC)
-    print("processor mask 00FF33CC:", "set" if ok else "NOT SET (this machine has other processors?)", flush=True)
+    """Was: keep to the cores of mask 00FF33CC on Cort's PC. Cort lifted that on 2026-11-25 ("Drop that core
+    requirement. You can use everything."; the instability is on all P-cores), so this does nothing now."""
+    return
 
 
 def flow_run(cmd, log):
@@ -883,6 +985,10 @@ if __name__ == "__main__":
         USE_R2 = True
         MIP_BIAS = float(args[2]) if len(args) > 2 else -2.0
         generate(args[1], int(args[3]) if len(args) > 3 else FRAMES, None, FLOW_VARIANTS, exact=True)
+    elif len(args) >= 2 and args[0] == "generate-quality":
+        generate_quality(args[1], int(args[2]) if len(args) > 2 else FRAMES, None, int(args[3]) if len(args) > 3 else 0)
+    elif len(args) >= 4 and args[0] == "quality-run":
+        sys.exit(quality_run(args[1], args[2], args[3]))
     elif len(args) >= 5 and args[0] == "clip":
         safe_cores()
         clip(args[1], args[2], args[3], args[4:])
