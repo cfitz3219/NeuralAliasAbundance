@@ -57,10 +57,10 @@
         // VARIANT: motion/screen-fit (flow_shaders.hpp fit_sample / fit_accum / fit_solve). All three
         // programs or none: without them `measure` has no model to follow, and the j2screenfit line
         // says on=0.
-        static const char* const entries[3] = {"fit_sample", "fit_accum", "fit_solve"};
-        ComPtr<ID3D12PipelineState>* const states[3] = {&g.pso_fit_sample, &g.pso_fit_accum, &g.pso_fit_solve};
+        static const char* const entries[4] = {"fit_sample", "fit_accum", "fit_solve","fit_reduce"};
+        ComPtr<ID3D12PipelineState>* const states[4] = {&g.pso_fit_sample, &g.pso_fit_accum, &g.pso_fit_solve,&g.pso_fit_reduce};
         bool all = camera_free && g.pso_measure;
-        for (int i = 0; i < 3 && all; ++i) {
+        for (int i = 0; i < 4 && all; ++i) {
             ComPtr<ID3DBlob> cs;
             all = compile(entries[i],cs);
             if (all) {

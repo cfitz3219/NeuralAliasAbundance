@@ -386,7 +386,7 @@ groupshared uint gc[64];
 void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     // The fit has stopped and its final pass is already in the buffer: nothing to do. (No lane
     // leaves before the barrier.)
-    const bool idle = u_cnt.Load(FIT_STOP * 4) >= 2u;
+    const bool idle = u_cnt.Load(FIT_STOP * 4) >= 2u || (fit_row==1u && u_cnt.Load(FIT_SPLIT * 4)==0u);
     const uint across = fit_tiles_across();
     const uint2 cell = uint2((gid.x % across) * 8u + (gi & 7u), (gid.x / across) * 8u + (gi >> 3));
     uint used = 0u;
@@ -467,26 +467,16 @@ uint fit_bin(float nearness) { // screen_motion.hpp DepthBin
     return uint(clamp(49 + int(floor(2.0 * log2(nearness))), 1, FIT_BINS - 1));
 }
 void fit_split(uint gi) {
-    if (gi < 64u) {
-        uint own[FIT_BINS];
-        [loop] for (uint b0 = 0; b0 < FIT_BINS; ++b0) own[b0] = 0u;
-        const uint cells = gw * gh;
-        [loop] for (uint at = gi; at < cells; at += 64u) {
-            const float4 a = t_hist[uint2(at % gw, at / gw)];
-            if (fit_usable(a)) own[fit_bin(a.z)] += 1u;
-        }
-        [loop] for (uint b1 = 0; b1 < FIT_BINS; ++b1) gbin[gi * FIT_BINS + b1] = own[b1];
+    const uint batches=(gw*gh+255u)/256u;
+    if (gi < FIT_BINS) {
+        uint sum=0;
+        for (uint g=0;g<batches;++g) sum += u_cnt.Load((FIT_HEAD+g*FIT_BINS+gi)*4);
+        gbin[gi]=sum;
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi != 0u) return;
-    float bins[FIT_BINS];
-    float total = 0;
-    [loop] for (uint b = 0; b < FIT_BINS; ++b) {
-        uint n = 0u;
-        [loop] for (uint lane = 0; lane < 64u; ++lane) n += gbin[lane * FIT_BINS + b];
-        bins[b] = float(n);
-        total += float(n);
-    }
+    float bins[FIT_BINS]; float total=0;
+    [loop] for(uint i=0;i<FIT_BINS;++i) { bins[i]=float(gbin[i]); total+=bins[i]; }
     const float stray_max = kFitGapStray * total;
     // The nearest bin that holds more than strays.
     uint top = FIT_BINS - 1;
@@ -517,18 +507,55 @@ void fit_split(uint gi) {
     }
     u_cnt.Store(FIT_SPLIT * 4, asuint(split));
 }
+
+groupshared float cachedTerms[8*256];
+[numthreads(256,1,1)]
+void fit_reduce(uint3 group : SV_GroupID,uint lane : SV_GroupIndex) {
+    const uint tiles=fit_tiles(), chain=group.x%3u, band=group.x/3u;
+    const uint term=band*8u+(lane%8u);
+    const bool active=!(mode==0u && u_cnt.Load(FIT_STOP*4u)>=1u);
+    float sum=0;
+    const uint rows=(tiles+2u-chain)/3u;
+    for(uint base=0;base<rows;base+=256u){
+        [unroll] for(uint s=0;s<8u;++s){
+            uint slot=lane+256u*s, row=base+slot/8u;
+            cachedTerms[slot]=(active && row<rows && term<FIT_VALUES)?
+              asfloat(u_cnt.Load((FIT_HEAD+(row*3u+chain)*FIT_VALUES+term)*4u)):0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if(active && lane<8u && term<FIT_VALUES){
+            [loop] for(uint i=0;i<min(256u,rows-base);++i) {
+                float v=cachedTerms[i*8u+lane];
+                sum=term==FIT_NEAREST?max(sum,v):sum+v;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if(lane<8u && term<FIT_VALUES) u_cnt.Store((FIT_HEAD+tiles*(FIT_VALUES+FIT_TILE)+chain*FIT_VALUES+term)*4u,asuint(sum));
+}
 [numthreads(256, 1, 1)]
-void fit_solve(uint gi : SV_GroupIndex) {
+void fit_solve(uint gi : SV_GroupIndex, uint3 group : SV_GroupID) {
+    if(mode==3u) {
+        if(gi<FIT_BINS) gbin[gi]=0;
+        GroupMemoryBarrierWithGroupSync();
+        uint at=group.x*256u+gi;
+        if(at<gw*gh) {float4 a=t_hist[uint2(at%gw,at/gw)]; if(fit_usable(a)) InterlockedAdd(gbin[fit_bin(a.z)],1u);}
+        GroupMemoryBarrierWithGroupSync();
+        if(gi<FIT_BINS) u_cnt.Store((FIT_HEAD+group.x*FIT_BINS+gi)*4,gbin[gi]);
+        return;
+    }
     if (mode == 2u) { fit_split(gi); return; }
     const uint groups = fit_tiles();
     const uint stop = u_cnt.Load(FIT_STOP * 4);
     // A solving step after the fit has stopped: 1 keeps this pass's sums as the final evaluation,
     // 2 has nothing left to do. Either way nothing is reduced or solved.
-    const bool idle = mode == 0u && stop >= 1u;
+    const bool absent=fit_row==1u && u_cnt.Load(FIT_SPLIT * 4)==0u;
+    const bool idle = absent || (mode == 0u && stop >= 1u);
     float part = 0;
     if (!idle && gi < 3 * FIT_VALUES) {
         const uint value = gi % FIT_VALUES;
-        [loop] for (uint g = gi / FIT_VALUES; g < groups; g += 3) {
+        if (fit_row==0u) part=asfloat(u_cnt.Load((FIT_HEAD+groups*(FIT_VALUES+FIT_TILE)+gi)*4u));
+        else [loop] for (uint g = gi / FIT_VALUES; g < groups; g += 3) {
             const float x = asfloat(u_cnt.Load((FIT_HEAD + g * FIT_VALUES + value) * 4));
             part = value == FIT_NEAREST ? max(part, x) : part + x;
         }
@@ -554,7 +581,7 @@ void fit_solve(uint gi : SV_GroupIndex) {
         const float x0 = gr[gi], x1 = gr[gi + FIT_VALUES], x2 = gr[gi + 2 * FIT_VALUES];
         gt[gi] = gi == FIT_NEAREST ? max(x0, max(x1, x2)) : x0 + x1 + x2;
     }
-    if (gi == 255u) { // a lane with nothing else to do here
+    if (gi == 255u && weigh) { // a lane with nothing else to do here
         float sp = 0, wt = 0;
         [loop] for (uint lane = 0; lane < 256u; ++lane) { sp += gq[lane]; wt += gq[256 + lane]; }
         gvar = wt > 0.0 ? max(sp / wt, 0.0) : 0.0;
@@ -573,6 +600,10 @@ void fit_solve(uint gi : SV_GroupIndex) {
         }
     }
     if (gi != 0) return;
+    if(absent) {
+        if (mode==1u) { [unroll] for(uint px=0;px<9u;++px) u_enc[uint2(px,1)] = float4(0,0,0,0); }
+        u_cnt.Store(16u*4u,1u); return;
+    }
     if (idle) {
         if (stop == 1u) u_cnt.Store(FIT_STOP * 4, 2u);
         return;

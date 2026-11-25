@@ -76,7 +76,7 @@ struct Context {
     ComPtr<ID3D12PipelineState> pso_cand_clear,pso_cand_count,pso_cand_pick,pso_cand_apply;
     ComPtr<ID3D12Resource> votes,grid,top; // 256x256 R32_UINT, always UAV; the grid handed on (R16G16_SINT, one vector per 8x8 block); 48 bytes, always UAV
     // VARIANT: motion/screen-fit (flow_shaders.hpp fit_sample / fit_accum / fit_solve). All three programs or none.
-    ComPtr<ID3D12PipelineState> pso_fit_sample,pso_fit_accum,pso_fit_solve;
+    ComPtr<ID3D12PipelineState> pso_fit_sample,pso_fit_accum,pso_fit_solve,pso_fit_reduce;
     ComPtr<ID3D12Resource> fit_grid,fit_model,fit_state; // RGBA32F, one sample per 8x8 block; RG32F 9x2, the model `measure` reads (a row per group of depths); the terms, the tiles' sums and the tiles' own words, always UAV
     unsigned fit_words=0; // fit_state's size in words
     bool cut_seeded=false; // cut_state has been zeroed by a submitted recording
@@ -178,7 +178,7 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     void* p=nullptr;if(FAILED(c.zero->Map(0,nullptr,&p)))return false;memset(p,0,96);c.zero->Unmap(0,nullptr);
     // The screen fit is optional: without its programs or working memory `measure` has no model to
     // follow, pixels the pictures cannot measure are not known, and the j2screenfit line says on=0.
-    {const unsigned gw=(w+7)/8,gh=(h+7)/8;c.fit_words=kFitHead+((gw+7)/8)*((gh+7)/8)*(kFitValues+kFitTile);} // a thread group is one tile of 8 x 8 samples (flow_shaders.hpp fit_tiles)
+    {const unsigned gw=(w+7)/8,gh=(h+7)/8;c.fit_words=kFitHead+((gw+7)/8)*((gh+7)/8)*(kFitValues+kFitTile)+3*kFitValues;} // a thread group is one tile of 8 x 8 samples (flow_shaders.hpp fit_tiles)
     if(c.pso_fit_solve && !(c.tex(DXGI_FORMAT_R32G32B32A32_FLOAT,c.fit_grid,(w+7)/8,(h+7)/8,S) && c.tex(DXGI_FORMAT_R32G32_FLOAT,c.fit_model,9,2,S) &&
         c.buffer(c.fit_words*4,D3D12_HEAP_TYPE_DEFAULT,U,c.fit_state))){
         c.pso_fit_sample.Reset();c.pso_fit_accum.Reset();c.pso_fit_solve.Reset();}
@@ -421,7 +421,10 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
             // Where the samples' depths fall into two groups with an empty stretch between them, each
             // group gets its own fit and a pixel its own group's (screen_motion.hpp FitLayers says why:
             // a large near figure moving by itself otherwise decides what the still far scene is handed).
-            fc.mode=2;fc.offset=0;
+            fc.mode=3;fc.offset=0;
+            l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
+            c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,false,(cb.gw*cb.gh+255u)/256u,1);order(l);
+            fc.mode=2;
             l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
             c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,true);order(l);
             // Row 0: the far group, or the one fit of every depth. Row 1: the near group; with no split
@@ -440,6 +443,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
                     c->dispatch_bound(l,c->pso_fit_accum.Get(),fc,false,tiles,1);order(l);
                     fc.mode=last?1u:0u;
                     l->SetComputeRootDescriptorTable(0,c->gpu(work,7));
+                    if(!row){c->dispatch_bound(l,c->pso_fit_reduce.Get(),fc,false,((kFitValues+7)/8)*3,1);order(l);}
                     c->dispatch_bound(l,c->pso_fit_solve.Get(),fc,true);order(l);}
                 move(l,c->fit_state.Get(),U,D3D12_RESOURCE_STATE_COPY_SOURCE);l->CopyBufferRegion(slot.readback.Get(),112+row*kFitHead*4,c->fit_state.Get(),0,kFitHead*4);move(l,c->fit_state.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,U);}
             move(l,c->fit_model.Get(),U,S);
