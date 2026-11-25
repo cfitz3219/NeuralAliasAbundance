@@ -2504,6 +2504,7 @@ struct FoldPass {
     // Frame start (fold_advance): what this frame's scene draws were asked to be.
     na::fold::Mode frame_mode = na::fold::Mode::Off;
     uint32_t rate_set = 0;
+    bool wide_set = false;
     uint64_t rate_frame = 0;
     int mip_extra = 0;
     // Counters and the plain-word state for the menu and the log.
@@ -2625,7 +2626,8 @@ void fold_record(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, n
                  na::dlss::EvalDesc* out)
 {
     const auto blk = na::fold::BlockFor(m);
-    const auto pick = na::fold::Pick(m, frame);
+    const auto pick = na::fold::Pick(m);
+    (void)frame; (void)coarse;
     auto& p = g_fold.planes[static_cast<uint32_t>(m)];
     const UINT index = (slot % kRing) * 6 + pass0;
     fold_dispatch(l, base.color, typed(base.color->GetDesc().Format), p.color.Get(), typed(p.color_format), blk, pick, index);
@@ -2646,8 +2648,8 @@ void fold_record(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, n
     out->mv_scale_x = base.mv_scale_x / static_cast<float>(blk.x); // the kept vectors are full-size pixels
     out->mv_scale_y = base.mv_scale_y / static_cast<float>(blk.y);
     out->mv_display_res = false;
-    out->jitter_x = na::fold::DeclaredJitter(blk.x, pick.x, base.jitter_x, coarse);
-    out->jitter_y = na::fold::DeclaredJitter(blk.y, pick.y, base.jitter_y, coarse);
+    out->jitter_x = na::fold::DeclaredJitter(blk.x, pick.x, base.jitter_x);
+    out->jitter_y = na::fold::DeclaredJitter(blk.y, pick.y, base.jitter_y);
     out->quality = m == na::fold::Mode::Performance ? na::dlss::Quality::MaxPerformance : na::dlss::Quality::MaxQuality;
     out->preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), p.w, base.out_w);
     out->view_id = kFoldViewId + static_cast<uint64_t>(m);
@@ -2686,10 +2688,23 @@ void fold_advance(bool running)
     const na::fold::Mode m = running && !g.paused.load() ? g_fold.hand.shown : na::fold::Mode::Off;
     g_fold.frame_mode = m;
     const uint32_t rate = g_fold.vrs_ok ? na::fold::ShadingRateFor(m) : 0u;
-    if (rate != g_fold.rate_set) {
-        na::observe::SetSceneCoarseShading(rate);
+    const bool wide = rate != 0 && na::settings::Get().j2_fold_wide.load(std::memory_order_relaxed);
+    if (rate != g_fold.rate_set || wide != g_fold.wide_set) {
+        na::observe::SetSceneCoarseShading(rate, wide);
+        if (rate != g_fold.rate_set) g_fold.rate_frame = g.frame;
         g_fold.rate_set = rate;
-        g_fold.rate_frame = g.frame;
+        g_fold.wide_set = wide;
+        na::eventlog::Emit("fold", "block shading asked: rate=%u (0 none, 4 = 2x1, 5 = 2x2) lighting_passes=%d from frame %llu", rate, wide ? 1 : 0,
+                           static_cast<unsigned long long>(g.frame));
+    }
+    {   // Cort's jitter changes were not in the f98ae48c log: say every change here.
+        static int last_on = -1; static int last_pattern = -1;
+        const int on = g.jitter_on ? 1 : 0;
+        const int pattern = static_cast<int>(na::settings::Get().j2_jitter_r2.load(std::memory_order_relaxed));
+        if (on != last_on || pattern != last_pattern) {
+            last_on = on; last_pattern = pattern;
+            na::eventlog::Emit("fold", "jitter setting: on=%d pattern=%s level=%s", on, pattern ? "R2" : "Halton", na::fold::Name(m));
+        }
     }
     // NVIDIA's texture bias is log2(render / display) - 1; a block-shaded scene picks its textures as
     // a half-size render does, so it needs one step more than DLAA.
@@ -5071,6 +5086,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             frame.reset=hist_reset;frame.hdr=is_float_color(cf);
             frame.jitter[0]=in.jitter_current_px[0];frame.jitter[1]=in.jitter_current_px[1];
             frame.raster_jitter[0]=frame.jitter[0];frame.raster_jitter[1]=frame.jitter[1];frame.raster_sample=true;
+            {   // A folded frame (core/fold_shading.hpp): the picture is in blocks, and the offline trials
+                // (trial 7) found the strict acceptance rules best for a half-size picture.
+                const bool folded = fold_frame_mode() != na::fold::Mode::Off;
+                if (folded && g_fold.rate_set != 0 && g.frame > g_fold.rate_frame) {
+                    const auto fb = na::fold::BlockFor(fold_frame_mode());
+                    frame.block_x = static_cast<uint8_t>(fb.x); frame.block_y = static_cast<uint8_t>(fb.y);
+                }
+                na::j2::compute_flow::SetLoosen(folded ? 0u : na::settings::kObjectFlowLoosen);
+            }
             // Measured with viewport jitter: the sample is the viewports' own, exactly zero when no
             // draw carried one, so an unjittered first picture pairs with the jittered one after it.
             frame.raster_confirmed=measured ? (vpj_mode() || (frame.jitter[0]==0.f && frame.jitter[1]==0.f)) : viewport_sample_known;
@@ -5445,13 +5469,13 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                                na::fold::Name(asked), static_cast<unsigned long long>(g_fold.hand.switches), static_cast<unsigned long long>(g_fold.hand.refusals));
         if ((asked != Mode::Off || step.show != Mode::Off) && g.frame % 600 == 0)
             na::eventlog::Emit("fold", "asked=%s shown=%s warming=%s good=%u | frames dlaa=%llu quality=%llu performance=%llu warm=%llu warm_failed=%llu drawn_in_blocks=%llu drawn_per_pixel=%llu unable=%llu | "
-                               "coarse rate=%u draws=%llu sets=%llu restores=%llu no_interface=%llu | jitter phases=%u declared=%.4f,%.4f input=%ux%u",
+                               "coarse rate=%u draws=%llu lighting_pass_draws=%llu sets=%llu restores=%llu no_interface=%llu | jitter phases=%u declared=%.4f,%.4f input=%ux%u kept_pixel=last flow_rules=strict",
                                na::fold::Name(asked), na::fold::Name(step.show), na::fold::Name(g_fold.hand.warming), g_fold.hand.good,
                                static_cast<unsigned long long>(g_fold.shown_frames[0]), static_cast<unsigned long long>(g_fold.shown_frames[1]),
                                static_cast<unsigned long long>(g_fold.shown_frames[2]), static_cast<unsigned long long>(g_fold.warm_frames),
                                static_cast<unsigned long long>(g_fold.warm_failed), static_cast<unsigned long long>(g_fold.coarse_frames),
                                static_cast<unsigned long long>(g_fold.fine_frames), static_cast<unsigned long long>(g_fold.unable_frames),
-                               cs.rate, static_cast<unsigned long long>(cs.draws), static_cast<unsigned long long>(cs.sets),
+                               cs.rate, static_cast<unsigned long long>(cs.draws), static_cast<unsigned long long>(cs.wide_draws), static_cast<unsigned long long>(cs.sets),
                                static_cast<unsigned long long>(cs.restores), static_cast<unsigned long long>(cs.unavailable),
                                jitter_phases(), e.jitter_x, e.jitter_y, e.render_w, e.render_h);
         g_fold.st_asked.store(static_cast<uint32_t>(asked), std::memory_order_relaxed);
@@ -5466,6 +5490,19 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     pending.reset = e.reset;
     const bool evaluated = na::dlss::Evaluate(l, e);
     if (fold_shown != na::fold::Mode::Off) fold_done(l, fold_shown);
+    {   // Cort saw a flash of colour bars at a switch to Performance (f98ae48c) and the log held nothing
+        // about that moment: every frame from a switch on, for a short while, says what DLSS was given.
+        static na::fold::Mode last_shown = na::fold::Mode::Off;
+        static uint32_t after_switch = 0;
+        if (fold_shown != last_shown) { last_shown = fold_shown; after_switch = 12; }
+        if (after_switch) {
+            --after_switch;
+            na::eventlog::Emit("fold", "after switch: frame=%llu level=%s dlss_ok=%d reset=%d input=%ux%u output=%ux%u declared=%.4f,%.4f blocks_asked=%u since_frame=%llu warming=%s",
+                               static_cast<unsigned long long>(g.frame), na::fold::Name(fold_shown), evaluated ? 1 : 0, e.reset ? 1 : 0, e.render_w, e.render_h,
+                               e.out_w, e.out_h, e.jitter_x, e.jitter_y, g_fold.rate_set, static_cast<unsigned long long>(g_fold.rate_frame),
+                               na::fold::Name(g_fold.hand.warming));
+        }
+    }
     if (evaluated) pending.jitter_history = jitter_history;
     const bool capture_armed = evaluated && na::capture::j2::Armed();
     if (evaluated && !capture_armed && g_debug_view.load(std::memory_order_relaxed) == 0 &&
@@ -5742,6 +5779,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         reason(why);
         return false; // nothing useful to submit; retried next frame
     }
+    if (inl) na::observe::MarkSceneHandedOver(inl); // whatever follows in this list is not shaded in blocks
     if (inl && vpj_mode() && !upscaling && !windowed && !phys && !deferred && !skip_color &&
         rw == ow && rh == oh && viewport_sample_known) {
         // Snapshot the game's actual consumer binding. Host commands do not alter its shadow.

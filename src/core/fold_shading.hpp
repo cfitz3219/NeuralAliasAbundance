@@ -21,29 +21,25 @@ constexpr uint32_t ShadingRateFor(Mode m) { return m == Mode::Performance ? 5u :
 // The folded picture's size (a last odd column or row is left out).
 constexpr uint32_t Folded(uint32_t full, uint32_t block) { return block ? full / block : full; }
 
-// The kept pixel of each block, in turn (the offline trials: a pixel kept in turn rebuilt edges
-// better than one fixed pixel). 2x2: four positions; 2x1: left, right.
-constexpr Block Pick(Mode m, uint64_t frame)
+// The kept pixel of each block: always the same one, the last (2x2: the lower right). Live run
+// f98ae48c kept each pixel in turn and told DLSS the block's centre; Cort saw small objects shake.
+// Under coarse shading only the inside of a surface is shaded per block: edges, depth and every
+// full-screen pass are still per pixel, so a kept pixel that moves makes them step half a block
+// against the declared sample. One fixed pixel has one true sample position. The last pixel is the
+// one a full-screen pass shaded per block computes exactly (the block's centre, taken as a whole
+// pixel coordinate, is that pixel), so it stays exact when those passes are coarse too.
+constexpr Block Pick(Mode m)
 {
     const Block b = BlockFor(m);
-    if (b.x == 2 && b.y == 2) {
-        constexpr Block k[4] = {{0, 0}, {1, 1}, {1, 0}, {0, 1}};
-        return k[frame % 4];
-    }
-    if (b.x == 2) return {static_cast<uint32_t>(frame % 2), 0};
-    return {0, 0};
+    return {b.x - 1, b.y - 1};
 }
 
 // The jitter DLSS is told, in pixels of the folded picture, for one axis. `full` is the offset the
-// game's draws really carried, in full-size pixels (sample = pixel centre - offset).
-//   coarse: the colour of a block was shaded once at the block's centre, so the folded pixel's sample
-//           is its own centre moved by full / block, whichever pixel was kept.
-//   not coarse (every pixel shaded by itself, as while warming up): the kept pixel's own centre sits
-//           (block / 2 - pick - 0.5) full-size pixels before the block's centre.
-constexpr float DeclaredJitter(uint32_t block, uint32_t pick, float full, bool coarse)
+// game's draws really carried, in full-size pixels (sample = pixel centre - offset). The kept
+// pixel's own centre sits (block / 2 - pick - 0.5) full-size pixels before the block's centre.
+constexpr float DeclaredJitter(uint32_t block, uint32_t pick, float full)
 {
     const float b = static_cast<float>(block ? block : 1);
-    if (coarse) return full / b;
     return (b * 0.5f - static_cast<float>(pick) - 0.5f + full) / b;
 }
 // Jitter positions per cycle: NVIDIA's 8 x (output pixels per rendered pixel), never under DLAA's count.

@@ -12,25 +12,20 @@ int main() { return test::run({
         CHECK(Folded(3440, 2) == 1720 && Folded(1441, 2) == 720 && Folded(1440, 1) == 1440);
         CHECK(JitterPhases(Mode::Off, 16) == 16 && JitterPhases(Mode::Quality, 16) == 16 && JitterPhases(Mode::Performance, 16) == 32);
     }},
-    {"every pixel of a block is kept once per cycle", [] {
-        uint32_t seen = 0;
-        for (uint64_t f = 0; f < 4; ++f) { const Block p = Pick(Mode::Performance, f); CHECK(p.x < 2 && p.y < 2); seen |= 1u << (p.y * 2 + p.x); }
-        CHECK(seen == 15);
-        CHECK(Pick(Mode::Quality, 0).x == 0 && Pick(Mode::Quality, 1).x == 1 && Pick(Mode::Quality, 1).y == 0);
-        CHECK(Pick(Mode::Off, 7).x == 0 && Pick(Mode::Off, 7).y == 0);
+    {"one fixed pixel of each block is kept: the last", [] {
+        CHECK(Pick(Mode::Performance).x == 1 && Pick(Mode::Performance).y == 1);
+        CHECK(Pick(Mode::Quality).x == 1 && Pick(Mode::Quality).y == 0);
+        CHECK(Pick(Mode::Off).x == 0 && Pick(Mode::Off).y == 0);
     }},
-    {"declared jitter matches where the kept sample really is", [] {
-        // Folded pixel X, block b, kept pixel p: the sample is at full-size b*X + p + 0.5 - j when every
-        // pixel is shaded by itself, and at the block's centre b*X + b/2 - j when shaded coarse. DLSS
+    {"declared jitter matches where the kept pixel really is", [] {
+        // Folded pixel X, block b, kept pixel p: the sample is at full-size b*X + p + 0.5 - j. DLSS
         // reads the declaration as: sample = (X + 0.5 - J) folded pixels = b*(X + 0.5 - J) full-size.
-        for (uint32_t b : {1u, 2u}) for (uint32_t p = 0; p < b; ++p) for (float j : {-0.4f, 0.f, 0.3f}) {
+        for (uint32_t b : {1u, 2u}) for (uint32_t p = 0; p < b; ++p) for (float j : {-0.9f, -0.4f, 0.f, 0.3f}) {
             const float X = 5;
-            const float fine = DeclaredJitter(b, p, j, false);
-            CHECK(std::fabs(b * (X + 0.5f - fine) - (b * X + p + 0.5f - j)) < 1e-5f);
-            const float coarse = DeclaredJitter(b, p, j, true);
-            CHECK(std::fabs(b * (X + 0.5f - coarse) - (b * X + b * 0.5f - j)) < 1e-5f);
+            const float J = DeclaredJitter(b, p, j);
+            CHECK(std::fabs(b * (X + 0.5f - J) - (b * X + p + 0.5f - j)) < 1e-5f);
         }
-        CHECK(DeclaredJitter(1, 0, 0.25f, false) == 0.25f); // DLAA is unchanged
+        CHECK(DeclaredJitter(1, 0, 0.25f) == 0.25f); // DLAA is unchanged
     }},
     {"the screen keeps its mode until the new one has proven itself", [] {
         Handover h;

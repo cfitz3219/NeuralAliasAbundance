@@ -310,11 +310,12 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     // Jitter-stabilised encode (j2_flow fe8ea3e): sample texel q at q + this frame's jitter so both
     // images of a pair sit in the unjittered frame and the engine never sees DLAA's shake.
     cb.jitter_x=encode.x;cb.jitter_y=encode.y;
+    cb.cost=(f.block_x>1?2u:1u)|((f.block_y>1?2u:1u)<<8); // encode only: the block the picture was shaded in
     if(slot.timestamps)l->EndQuery(slot.timestamps.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
     move(l,im.tex.Get(),S,U);move(l,im.raw_color.Get(),S,U);
     c->srv(work,0,0,color,d.Format);c->uav(work,0,kUav+0,im.tex.Get(),c->image_format);
     c->uav(work,0,kUav+3,im.raw_color.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
-    c->dispatch(l,work,0,c->pso_encode.Get(),cb);order(l);move(l,im.tex.Get(),U,S);move(l,im.raw_color.Get(),U,S);++stats.recorded;
+    c->dispatch(l,work,0,c->pso_encode.Get(),cb);cb.cost=0;order(l);move(l,im.tex.Get(),U,S);move(l,im.raw_color.Get(),U,S);++stats.recorded;
     if(!pair){++stats.waiting_history;reason(f.total?"Measured motion: this is the first picture of a pair":"AMD flow capturing matching scene history; camera motion used");return t;}
     auto& prev=*c->images[previous];prev.uses.push_back(lease);
     // Calibration reads the unshifted source pair: comparing two differently

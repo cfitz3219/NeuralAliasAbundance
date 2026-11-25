@@ -42,7 +42,14 @@ void encode(uint3 id : SV_DispatchThreadID) {
     if (id.x >= ew || id.y >= eh) return;
     float2 q = (float2(id.xy) + 0.5) * float2(w, h) / float2(ew, eh);
     float2 uv = (q + float2(jitter_x, jitter_y)) / float2(w, h);
+    // has_cost carries, for this pass only, the block the picture was shaded in (x | y << 8). A
+    // block-shaded picture is averaged over one block: its grid stays on the screen while the sample
+    // moves, and unsmoothed that grid reads as movement.
+    float2 half_block = (float2(has_cost & 255u, (has_cost >> 8) & 255u) - 1.0) * 0.5 / float2(w, h);
     float3 c = t_color.SampleLevel(s_lin, uv, 0).rgb;
+    if (half_block.x > 0 || half_block.y > 0)
+        c = 0.25 * (t_color.SampleLevel(s_lin, uv + half_block * float2(-1, -1), 0).rgb + t_color.SampleLevel(s_lin, uv + half_block * float2(1, -1), 0).rgb +
+                    t_color.SampleLevel(s_lin, uv + half_block * float2(-1, 1), 0).rgb + t_color.SampleLevel(s_lin, uv + half_block * float2(1, 1), 0).rgb);
     if (any(isnan(c)) || any(isinf(c))) c = float3(0, 0, 0);
     if (mode == 1) { c = max(c, 0.0); c = srgb_encode(c / (1.0 + c)); }
     else c = saturate(c);

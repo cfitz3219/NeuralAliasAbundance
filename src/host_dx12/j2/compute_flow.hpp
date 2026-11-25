@@ -10,6 +10,10 @@ struct Frame {
     uint64_t frame=0,previous=0;uint32_t generation=0,slot=0;bool reset=false,hdr=false;
     float jitter[2]{}; // nominal on input; Ticket.frame carries the calibrated encode shift
     float raster_jitter[2]{}; bool raster_sample=false;
+    // The picture was shaded once per block of this many pixels (core/fold_shading.hpp). The encode
+    // then averages over one block, so the block grid, which stays put on the screen while the sample
+    // moves, is not read as movement.
+    uint8_t block_x=1,block_y=1;
     bool raster_confirmed=false; // exact viewport writes reached this source recording; not a learned convention
     uint64_t source_generation=0;
     // false: only the M3 camera fit runs (the camera needs reconstructing but the user turned

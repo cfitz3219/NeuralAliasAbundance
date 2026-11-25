@@ -77,6 +77,8 @@ std::atomic<bool> g_vpj_ever{false};
 // this run, so recordings may still carry a rate that has to be handed back.
 std::atomic<uint32_t> g_coarse{0};
 std::atomic<bool> g_coarse_ever{false};
+std::atomic<bool> g_coarse_wide{false}; // also the full-screen passes between the scene's draws and its hand-over
+std::atomic<uint64_t> g_coarse_wide_draws{0};
 std::atomic<uint64_t> g_coarse_draws{0}, g_coarse_sets{0}, g_coarse_restores{0}, g_coarse_unavailable{0};
 // What the most recent recording pinned for its scene draws: the sample, the depth it drew into and
 // whether its one full-size viewport was widened (that is part of where the picture landed).
@@ -261,6 +263,9 @@ struct ListState {
     }
     bool vpj_applied = false;
     uint32_t coarse_rate = 0; // the shading rate we set on this recording (0: the default, nothing to hand back)
+    // The scene of this recording was handed over (FinishSceneRaster was reached): what follows works on
+    // the finished picture and is never shaded in blocks. Unlike vpj_resolved it is cleared only by Reset.
+    bool coarse_handed = false;
     uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
     bool vpj_scene_expanded = false, vpj_scene_mixed = false; // the pinned scene draws' raster shape; mixed = not one shape
     DepthWrites de; // this recording's depth-writing draws and clears of the scene depth (bind_m)
@@ -5555,7 +5560,7 @@ void vpj_viewports_replaced(GL* l, bool reset)
     auto* ls = list_state_locked(l, &id);
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
-    if (coarse) ls->coarse_rate = 0; // Reset puts the shading rate back to one per pixel
+    if (coarse) { ls->coarse_rate = 0; ls->coarse_handed = false; } // Reset puts the shading rate back to one per pixel
     if (!vpj) return;
     ls->vpj_applied = false;
     if (reset) {
@@ -5697,7 +5702,18 @@ void vpj_before_draw_body(GL* l, uint64_t vertices, int* coarse_set)
         }
         want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, after_resolve);
         // The draws that take the scene's sample are the draws shaded coarse: one rule for both.
-        if (coarse_ever) coarse_decide(*ls, want ? coarse_rate : 0, coarse_set);
+        // Wide (Cort 2026-11-25: "we really need to make this save performance"): the passes that light
+        // and finish the scene run on every pixel too, and they are most of the frame. A draw that takes
+        // no sample is shaded per block as well when it is recorded in the scene's own list, after the
+        // scene's draws began and before the scene is handed over, into a target of the scene's full
+        // size. The block's one shading sits on the kept pixel (core/fold_shading.hpp, Pick).
+        bool wide = false;
+        if (coarse_rate && !want && sample && ls->vpj_scene == sample && !ls->coarse_handed && ls->vpj_resolved.sample != sample &&
+            g_coarse_wide.load(std::memory_order_relaxed) && pc && ls->cur_nrt >= 1 && scene_viewport()) {
+            wide = true;
+            g_coarse_wide_draws.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (coarse_ever) coarse_decide(*ls, want || wide ? coarse_rate : 0, coarse_set);
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
             if (still_mesh) g_vpj_still_moved.fetch_add(1, std::memory_order_relaxed);
@@ -9780,6 +9796,15 @@ void GetLiveSelection(uint64_t* depth, uint64_t* color, bool* requires_screen)
         }
     }
 }
+void MarkSceneHandedOver(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> lock(g_m);
+    na_object_id id = 0;
+    auto* ls = list ? list_state_locked(list, &id) : nullptr;
+    if (!ls) return;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    ls->coarse_handed = true;
+}
 ResolvedRaster FinishSceneRaster(ID3D12CommandList* list, uint64_t color, uint32_t color_sub,
                                  uint64_t depth, uint32_t depth_sub, uint64_t destination)
 {
@@ -9788,6 +9813,7 @@ ResolvedRaster FinishSceneRaster(ID3D12CommandList* list, uint64_t color, uint32
     auto* ls = list ? list_state_locked(list, &id) : nullptr;
     if (!ls || !color || !depth) return {};
     std::lock_guard<std::mutex> bl(ls->bind_m);
+    ls->coarse_handed = true;
     if (!ls->vpj_scene || ls->vpj_depth != depth) return {};
     auto& raster = ls->vpj_resolved;
     raster = {ls->vpj_scene, color, depth, 0, color_sub, depth_sub, 0};
@@ -9809,8 +9835,9 @@ void SetStillMeshJitter(bool asked)
     if (g_vpj_still_meshes.exchange(asked, std::memory_order_relaxed) != asked && asked)
         g_vpj_still_asks.fetch_add(1, std::memory_order_relaxed);
 }
-void SetSceneCoarseShading(uint32_t rate)
+void SetSceneCoarseShading(uint32_t rate, bool wide)
 {
+    g_coarse_wide.store(wide, std::memory_order_relaxed);
     if (rate) g_coarse_ever.store(true, std::memory_order_relaxed);
     g_coarse.store(rate, std::memory_order_relaxed);
 }
@@ -9822,6 +9849,7 @@ CoarseShadingStats GetCoarseShadingStats()
     s.sets = g_coarse_sets.load(std::memory_order_relaxed);
     s.restores = g_coarse_restores.load(std::memory_order_relaxed);
     s.unavailable = g_coarse_unavailable.load(std::memory_order_relaxed);
+    s.wide_draws = g_coarse_wide_draws.load(std::memory_order_relaxed);
     return s;
 }
 void SetSceneViewportJitter(uint64_t frame, float x, float y)

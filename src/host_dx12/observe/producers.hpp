@@ -402,15 +402,20 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y);
 // draws that take the scene's sample (selected scene depth bound and tested) are shaded once per block
 // of pixels; every other draw of the game keeps one shading per pixel. 0 hands the game's own back.
 // The caller checks that the device supports variable-rate shading before asking.
-void SetSceneCoarseShading(uint32_t rate);
+// wide: also the full-screen passes recorded in the scene's list between its draws and its hand-over.
+void SetSceneCoarseShading(uint32_t rate, bool wide = false);
 struct CoarseShadingStats {
     uint32_t rate = 0;        // what is asked for now
     uint64_t draws = 0;       // draws drawn coarse
     uint64_t sets = 0;        // times a recording was switched to the coarse rate
     uint64_t restores = 0;    // times a recording was handed back to one per pixel
     uint64_t unavailable = 0; // a recording had no interface for it
+    uint64_t wide_draws = 0;  // of draws: full-screen passes drawn coarse
 };
 CoarseShadingStats GetCoarseShadingStats();
+// The scene recorded in this list has been handed over: the draws that follow in it work on the
+// finished picture and are never shaded in blocks (cleared when the list is Reset).
+void MarkSceneHandedOver(ID3D12CommandList* list);
 // VARIANT: referee/sample-locked-dropout
 // The Referee's ask (referee::gpu::SceneStillMeshes): while true, a scene mesh drawn with the depth
 // test off and the scene depth bound takes the frame's full sample too (core/temporal_jitter.hpp,
