@@ -64,6 +64,12 @@
 //   Every replayed step logs "stats" of the main output (and of the second's when it ran): the largest
 //   value, the mean, the share of pixels with a channel above 64 and of values not finite. Clean output
 //   here is under 64 everywhere; the noise reached thousands.
+//   --ordered-features                    the main and second features share one ordered group (dlss_backend.hpp
+//                                         EvalDesc::ordered_feature_group, Astra's 9b669223): a larger feature a later
+//                                         smaller creation spoiled is created again, with a reset, before its next use.
+//                                         Astra's own runs of that commit used her copy of this tool; her flags map to
+//                                         these: --fold-quality = --fold-block 2x1, --full-create = --fold-create full,
+//                                         --gpu-time = --time, --peer-order after = --second-at 1 --second-every.
 //   --fold-block 2x2 | 2x1                which block the fold keeps one pixel of: 2x2 (Performance, the default)
 //                                         or 2x1 (the live Quality level: half width, full height).
 //   --fold-create folded | full           the size the DLSS feature is created at: folded (the default, as the
@@ -475,7 +481,7 @@ int main(int argc, char** argv)
     bool second_feature = false;
     uint32_t fold_bx = 2, fold_by = 2;
     int second_at = -1, second_release_at = -1, main_recreate_at = -1;
-    bool second_every = false;
+    bool second_every = false, ordered_features = false;
     bool fold_create_full = false, timing = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
@@ -515,6 +521,7 @@ int main(int argc, char** argv)
             else return Usage();
         }
         else if (a == "--second-feature") second_feature = true;
+        else if (a == "--ordered-features") ordered_features = true;
         else if (a == "--second-at" && value) { second_at = std::atoi(value); ++i; }
         else if (a == "--second-every") second_every = true;
         else if (a == "--second-release-at" && value) { second_release_at = std::atoi(value); ++i; }
@@ -802,6 +809,7 @@ int main(int argc, char** argv)
         e.pre_exposure = m.pre_exposure;
         e.exposure_scale = m.exposure_scale;
         e.view_id = 1;
+        if (ordered_features) e.ordered_feature_group = 1;
         e.quality = static_cast<na::dlss::Quality>(static_cast<int>(m.quality));
         e.preset = use_preset;
         e.reset = si == 0;
@@ -892,7 +900,9 @@ int main(int argc, char** argv)
             }
         }
         if (timing) l.list->EndQuery(time_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-        const bool evaluated = na::dlss::Evaluate(l.list.Get(), e);
+        bool main_reset = false;
+        const bool evaluated = na::dlss::Evaluate(l.list.Get(), e, &main_reset);
+        if (evaluated && main_reset && !e.reset) Log("step %zu: the backend restarted the main feature's history (created again after a smaller one)", si);
         if (timing) {
             l.list->EndQuery(time_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
             l.list->ResolveQueryData(time_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, time_readback.Get(), 0);

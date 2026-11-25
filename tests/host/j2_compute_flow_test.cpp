@@ -15,12 +15,17 @@
 #include "flow_ambiguity_gpu_audit.hpp"
 #include "flow_fixture_pictures.hpp"
 #include "screen_motion_gpu_audit.hpp"
+#include "fold_planes_gpu.hpp"
 int main(int argc,char** argv){
     if(!na::ffx_flow::Built())return test::kSkip;
     const bool debug_mode=(argc>1 && !std::strcmp(argv[1],"--debug")) || (argc>2 && !std::strcmp(argv[2],"--debug"));
     test::ComPtr<ID3D12Debug> debug;
     if(debug_mode){REQUIRE(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))));debug->EnableDebugLayer();}
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    if(argc>1 && !std::strcmp(argv[1],"--fold-planes")) {
+        REQUIRE(AuditFoldPlanes(d)==0);
+        return test::finish("j2_fold_planes_gpu");
+    }
     if(argc>1 && !std::strcmp(argv[1],"--screen-fit")) {
         REQUIRE(screen_audit::ArbiterFallback(d)==0);
         REQUIRE(screen_audit::SolveControlled(d)==0);
@@ -40,6 +45,19 @@ int main(int argc,char** argv){
     if(argc>1 && !std::strcmp(argv[1],"--overhead-benchmark")) {
         REQUIRE(screen_audit::ProductionBenchmark(d,3440,1440,true)==0);
         return test::finish("j2_overhead_benchmark");
+    }
+    if(argc>1 && !std::strcmp(argv[1],"--fold-motion-benchmark")) {
+        // First two runs match the live motion workload. The last two measure the
+        // cost if the motion pipeline itself were given a truly smaller scene.
+        for(unsigned block_y : {1u, 2u}) {
+            std::printf("Folded input, motion at display size, block=2x%u\n", block_y);
+            REQUIRE(screen_audit::ProductionBenchmark(d,3440,1440,true,2,block_y)==0);
+        }
+        for(unsigned height : {1440u, 720u}) {
+            std::printf("Motion at input size, 1720x%u\n", height);
+            REQUIRE(screen_audit::ProductionBenchmark(d,1720,height,true)==0);
+        }
+        return test::finish("j2_fold_motion_benchmark");
     }
     if(argc>1 && !std::strcmp(argv[1],"--screen-benchmark")) {
         REQUIRE(screen_audit::ProductionBenchmark(d,1920,1080)==0);

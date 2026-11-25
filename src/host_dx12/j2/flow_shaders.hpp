@@ -800,8 +800,8 @@ void cut_show(uint3 group : SV_GroupID, uint3 lane : SV_GroupThreadID) {
 //   u1 the grid handed on
 //   u2 words 0..7 the candidates, strongest first, as (support << 16) | (y + 128) << 8 | (x + 128);
 //      word 8 blocks that took a candidate, word 9 blocks that had one to compare
-//   mode: cand_pick's round (0..7)      cost_max: the support a vector needs to be offered
-// cand_clear, cand_count and cand_pick run one thread per block; cand_apply one thread GROUP per block.
+//   cost_max: the support a vector needs to be offered
+// cand_clear and cand_pick visit histogram cells; cand_count visits blocks; cand_apply dispatches a group per block.
 inline const char kCandidateShader[] = R"(
 Texture2D<int2>   t_grid : register(t0);
 Texture2D<float4> t_cur  : register(t5);
@@ -824,7 +824,6 @@ static const uint kCount = 8;
 static const float kRatio = 0.8, kGain = 0.001;
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 bool votes(int2 v) { return any(v != 0) && abs(v.x) <= kWindow && abs(v.y) <= kWindow; }
-uint key_of(int2 v) { return (uint(v.y + 128) << 8) | uint(v.x + 128); }
 int2 vector_of(uint packed) { return int2(int(packed & 255u) - 128, int((packed >> 8) & 255u) - 128); }
 [numthreads(8, 8, 1)]
 void cand_clear(uint3 id : SV_DispatchThreadID) {
@@ -836,20 +835,21 @@ void cand_count(uint3 id : SV_DispatchThreadID) {
     int2 v = t_grid.Load(int3(id.xy, 0));
     if (votes(v)) InterlockedAdd(u_votes[uint2(v + 128)], 1u);
 }
-// One round per candidate: the strongest vector not already taken by an earlier round.
+// Each occupied cell contributes one unique packed key. Each atomic keeps the
+// larger key in its slot and passes the smaller on. When all threads finish,
+// each slot holds the maximum of everything that reached it, in the same tie
+// order as the CPU reference. The host clears all eight slots before dispatch.
 [numthreads(8, 8, 1)]
 void cand_pick(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= gw || id.y >= gh) return;
-    int2 v = t_grid.Load(int3(id.xy, 0));
-    if (!votes(v)) return;
-    uint n = u_votes[uint2(v + 128)];
+    uint n = u_votes[id.xy];
     if (n < cost_max) return;
-    uint packed = (min(n, 65535u) << 16) | key_of(v);
-    bool taken = false;
-    [unroll] for (uint j = 0; j < 7; ++j) {
-        if (j < mode && u_top.Load(j * 4) == packed) taken = true;
+    uint key = (min(n, 65535u) << 16) | (id.y << 8) | id.x;
+    [unroll] for (uint slot = 0; slot < kCount; ++slot) {
+        uint previous;
+        u_top.InterlockedMax(slot * 4, key, previous);
+        key = min(key, previous);
+        if (key == 0) break;
     }
-    if (!taken) u_top.InterlockedMax(mode * 4, packed);
 }
 // One thread group is one 8x8 block and one thread is one of its pixels, so a block's 64 pixels are
 // compared side by side (the first version walked them one after another in a single thread and
@@ -874,26 +874,33 @@ void cand_apply(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID, uint 
     uint2 q = b * 8 + thread.xy;
     bool inside = in_grid && q.x < w && q.y < h;
     int2 own = in_grid ? t_grid.Load(int3(b, 0)) : int2(0, 0);
-    bool moving = in_grid && any(own != 0); // a block the search called still stays still
+    bool moving = in_grid && any(own != 0);
     int2 lo = int2(b) * 8, hi = min(lo + 8, int2(w, h));
-    float c = inside ? luma(t_cur.Load(int3(q, 0)).rgb) : 0.0;
     uint offered = 0; // bit k: candidate k may be offered to this block (the same in every thread of the group)
-    gc_err[lane] = inside && moving ? abs(c - prev_at(q, float2(own))) : 0.0;
-    [unroll] for (uint k = 0; k < kCount; ++k) {
-        uint packed = u_top.Load(k * 4);
-        int2 cv = vector_of(packed);
-        int2 d = abs(cv - own);
-        // nearer than the search's own reach: the search compared those itself;
-        // and the whole block must come from inside the picture
-        bool may = moving && packed != 0u && max(d.x, d.y) > kReach && all(lo + cv >= 0) && all(hi + cv <= int2(w, h));
-        if (may) { // slots of candidates not offered are never read
-            offered |= 1u << k;
-            gc_err[(k + 1) * 64 + lane] = inside ? abs(c - prev_at(q, float2(cv))) : 0.0;
+    if (moving) {
+        [unroll] for (uint k = 0; k < kCount; ++k) {
+            uint packed = u_top.Load(k * 4);
+            int2 cv = vector_of(packed);
+            int2 d = abs(cv - own);
+            // The search already compared nearby vectors. The whole block must have a source inside the picture.
+            if (packed != 0u && max(d.x, d.y) > kReach && all(lo + cv >= 0) && all(hi + cv <= int2(w, h))) offered |= 1u << k;
+        }
+    }
+    float c = 0;
+    if (offered != 0) {
+        c = inside ? luma(t_cur.Load(int3(q, 0)).rgb) : 0.0;
+        gc_err[lane] = inside ? abs(c - prev_at(q, float2(own))) : 0.0;
+        [unroll] for (uint slot = 0; slot < kCount; ++slot) {
+            if ((offered >> slot) & 1u) {
+                int2 cv = vector_of(u_top.Load(slot * 4));
+                gc_err[(slot + 1) * 64 + lane] = inside ? abs(c - prev_at(q, float2(cv))) : 0.0;
+            }
         }
     }
     GroupMemoryBarrierWithGroupSync();
     float pixels = float(max(hi.x - lo.x, 0) * max(hi.y - lo.y, 0));
-    if (lane == 0) {
+    if (lane == 0 && offered == 0) { gc_pick = -1; gc_step2 = 0; }
+    if (lane == 0 && offered != 0) {
         int pick = -1;
         float least = 1e9;
         [loop] for (uint k1 = 0; k1 < kCount; ++k1) {

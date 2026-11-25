@@ -310,7 +310,8 @@ inline int SampleFitMeasure(test::Device& d) {
     return 0;
 }
 
-inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhead=false) {
+inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhead=false,
+                               unsigned block_x=1,unsigned block_y=1) {
     namespace cf=na::j2::compute_flow;Gpu g(d);std::vector<float> rgba(size_t(w)*h*4),depth(size_t(w)*h,.03f);ComPtr<ID3D12Resource> image[2];
     for(unsigned f=0;f<2;++f) {
         for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){float px=float(x)-3.f*f;
@@ -332,6 +333,7 @@ inline int ProductionBenchmark(test::Device& d,unsigned w,unsigned h,bool overhe
         cf::Reset();cf::SetScreenFit(enabled);std::vector<double> ms,record_us,cut_ms;
         const auto start=std::chrono::steady_clock::now();
         for(unsigned i=0;i<26;++i){cf::Frame f;f.frame=9000+i;f.previous=i?f.frame-1:0;f.generation=303;f.source_generation=303;f.total=true;f.raster_sample=f.raster_confirmed=true;
+            f.block_x=static_cast<uint8_t>(block_x);f.block_y=static_cast<uint8_t>(block_y);
             const auto record_start=std::chrono::steady_clock::now();
             cf::Tier3 t;auto ticket=cf::Record(g.l.list.Get(),d.queue.Get(),image[i%2].Get(),dep.Get(),in,f,t);REQUIRE(ticket.context);CHECK(ticket.pair==(i!=0));
             if(overhead&&i>=6){
