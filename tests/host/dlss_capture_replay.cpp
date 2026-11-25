@@ -44,6 +44,10 @@
 //   --fold-sign 1 | -1                    -1 tells DLSS the kept pixel's offset with the opposite sign (a
 //                                         check of the convention: the wrong sign is visibly softer)
 //
+//   --fold-declare pixel | block          what DLSS is told about the folded sample. pixel (default): the kept
+//                                         pixel's own centre. block: the block's centre whichever pixel was kept,
+//                                         which is what the live test build f98ae48c told DLSS for a scene shaded
+//                                         in blocks (use it on a capture taken in a live folded mode).
 // Output, in <out folder>\<name>: one NNNNN-dlssout.raw per replayed frame (tight rows, the capture's
 // own pixel format), replay.csv (which saved frame each step is, and the rectangle saved) and
 // replay.log (every setting, and per frame how far the whole replayed output is from the output the
@@ -393,7 +397,7 @@ int Usage()
 {
     std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D] [--motion-dir DIR] [--bias-dir DIR]\n"
                 "    [--preset 0|10..13] [--parity all|even|odd] [--first INDEX] [--frames N] [--all] [--preroll N] [--pingpong N]\n"
-                "    [--crop X Y W H] [--save-last N] [--fold cycle|fixed] [--fold-sign 1|-1]\n");
+                "    [--crop X Y W H] [--save-last N] [--fold cycle|fixed] [--fold-declare pixel|block] [--fold-sign 1|-1]\n");
     return 2;
 }
 } // namespace
@@ -412,6 +416,7 @@ int main(int argc, char** argv)
     bool all = false;
     FoldMode fold = FoldMode::Off;
     float fold_sign = 1.0f;
+    bool fold_block = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const char* value = i + 1 < argc ? argv[i + 1] : nullptr;
@@ -449,6 +454,7 @@ int main(int argc, char** argv)
             else if (v == "fixed") fold = FoldMode::Fixed;
             else return Usage();
         }
+        else if (a == "--fold-declare" && value) { fold_block = std::string(value) == "block"; ++i; }
         else if (a == "--fold-sign" && value) { fold_sign = std::strtod(value, nullptr) < 0 ? -1.0f : 1.0f; ++i; }
         else if (a == "--crop" && i + 4 < argc) {
             crop_x = static_cast<uint32_t>(std::strtoul(argv[i + 1], nullptr, 10));
@@ -690,8 +696,8 @@ int main(int argc, char** argv)
             // (full-size pixels) is half as large here. The saved vectors are full-size pixels too.
             e.render_w = fold_w;
             e.render_h = fold_h;
-            e.jitter_x = fold_sign * (0.25f - 0.5f * static_cast<float>(fold_px)) + 0.5f * m.jitter_x;
-            e.jitter_y = fold_sign * (0.25f - 0.5f * static_cast<float>(fold_py)) + 0.5f * m.jitter_y;
+            e.jitter_x = (fold_block ? 0.f : fold_sign * (0.25f - 0.5f * static_cast<float>(fold_px))) + 0.5f * m.jitter_x;
+            e.jitter_y = (fold_block ? 0.f : fold_sign * (0.25f - 0.5f * static_cast<float>(fold_py))) + 0.5f * m.jitter_y;
             e.mv_scale_x = 0.5f * m.mv_scale_x;
             e.mv_scale_y = 0.5f * m.mv_scale_y;
             e.quality = na::dlss::Quality::MaxPerformance;
