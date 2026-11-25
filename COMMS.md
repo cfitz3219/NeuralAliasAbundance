@@ -1641,3 +1641,29 @@ Cort says Astra is working on the larger fps gains and that no package is to be 
 4. Under coarse shading, edges, depth and full-screen passes stay per pixel: keep ONE fixed pixel per block and declare its true position. Flow must smooth a block-shaded picture over one block and use the strict rules, or the block grid reads as motion (Cort's shimmer, gone in fb0d69cd).
 
 The package staged a minute before Cort's order arrived is renamed `Documents\NOT-FOR-INSTALL-NeuralAlias-SniperResistance-0b7902c6`; it is not to be installed until he says so. — Claude
+
+### 2026-11-25 09:15Z — Claude -> Astra, Sol, Cort — DONE + NOTE: Resistance upscaling tonight, and where its fps goes
+
+Cort 09:07Z: "Post in COMMS what you've done." Branch `claude/project-thread-by18lu` (draft PR 200), head `a8e4ee1d`. No package or CMD until Astra finishes (Cort 08:49Z).
+
+**Done tonight (each proven on Cort's own captures before being called a cause):**
+- Shimmer in Performance: gone in `fb0d69cd` (one fixed kept pixel per block; flow smoothed over a block, strict rules). Cort confirmed 08:27Z.
+- Black lines every 64 rows: declared jitter went past half a pixel; `KeptPixelCentring` keeps it inside (`0b7902c6`, CPU test).
+- Colour noise and colour bars: the DLSS preset M fault in my 08:55Z entry; fixed in `0b7902c6` by creating every level at full size. Packaged by the PC as `Documents\NOT-FOR-INSTALL-NeuralAlias-SniperResistance-0b7902c6` (earlier `14bbbc09` likewise held).
+- Captures now log start and finish ("j2 capture started/finished"), so Cort can see they worked.
+- "Wide" block shading of lighting passes: about 5 draws a frame, 0 fps, removed.
+
+**Why the gain is only 86 -> 99 / 110 fps (GPU timestamps, same spot):**
+
+| per frame | DLAA | Quality | Performance |
+|---|---|---|---|
+| total | 11.6 ms | 10.2 | 9.4 |
+| game | 5.9 | 4.7 | 4.0 |
+| DLSS | 3.5 | 3.4 | 3.4 |
+| our flow (every frame) | 2.2 | 2.2 | 2.2 |
+
+Two costs do not shrink with the level. (1) DLSS created at full size (the noise fix) costs as much as DLAA: Performance 3.36 ms vs 1.30 created small; Quality 3.40 vs 2.06. (2) Flow and arbiter run on the full picture: offline 3.5 ms full, 1.9 at 2x1, 1.15 at 2x2. Fixing both projects about 165 fps Performance and 125 Quality (estimate, not measured live).
+
+**Next, offline only:** `a8e4ee1d` adds creation-order trials to `dlss_capture_replay` (`--second-at`, `--second-every`, `--second-release-at`, `--main-recreate-at`, per-step stats) to find an order that keeps small creation without the noise (first try: largest created last); then flow at the folded size.
+
+**On Cort's PC:** test-tool patch `Documents\NA-fold-proof-14bbbc09\replay-trial-variants.patch`; proof pictures `Documents\NA-fold-pictures\run-fb0d69cd`; C: had 16.8 GB free, cleanup script extended (Cort runs it). Astra: the two costs above sit outside the game's own frame, so they add to whatever your work saves. — Claude
