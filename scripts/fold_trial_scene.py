@@ -45,6 +45,10 @@ def halton(i, b):
     return r
 
 
+# None: textures read at the exact point (no mips). A number: textures read as mip-mapped ones with this
+# bias for the half-size and folded pictures (NVIDIA's Performance value is -2); the full-size DLAA
+# picture then uses -1, its own value.
+MIP_BIAS = None
 USE_R2 = False  # True: Roberts' R2 jitter instead of Halton (Cort's preference, 2026-11-25)
 
 
@@ -249,7 +253,9 @@ def generate(out, frames=FRAMES, size=None, only=None, exact=False):
     for t in range(frames):
         # native: sample = pixel centre - jitter.
         jn = jitter(t, 16)
-        col, dep, mv, ex = scene(X + 0.5 - jn[0], Y + 0.5 - jn[1], X + 0.5 - jn[0], Y + 0.5 - jn[1], t)
+        foot_n = 0.0 if MIP_BIAS is None else 0.5
+        foot_h = 0.0 if MIP_BIAS is None else 2.0 * 2.0 ** MIP_BIAS
+        col, dep, mv, ex = scene(X + 0.5 - jn[0], Y + 0.5 - jn[1], X + 0.5 - jn[0], Y + 0.5 - jn[1], t, foot_n)
         write_frame(os.path.join(out, "native"), t, col, dep, mv, jn, 5, (W, H), ex)
 
         # the first trial's fold of those native frames: four picks in turn, DLAA's small jitter.
@@ -261,18 +267,18 @@ def generate(out, frames=FRAMES, size=None, only=None, exact=False):
         for name, phases in (("half-true", 64), ("half-4phase", 4)):
             jh = jitter(t, phases)
             sx, sy = 2.0 * (hx + 0.5 - jh[0]), 2.0 * (hy + 0.5 - jh[1])
-            col, dep, mv, ex = scene(sx, sy, sx, sy, t)
+            col, dep, mv, ex = scene(sx, sy, sx, sy, t, foot_h)
             write_frame(os.path.join(out, name), t, col, dep, mv * 0.5, jh, 0, (W, H), ex * 0.5)
 
         # coarse shading on a full-size picture whose jitter is twice as wide: colour at the block centre,
         # geometry at the kept pixel's centre.
         jh = jitter(t, 64)
         sx, sy = 2.0 * (hx + 0.5 - jh[0]), 2.0 * (hy + 0.5 - jh[1])
-        col, dep, mv, ex = scene(sx + 0.5, sy + 0.5, sx, sy, t)  # kept pixel (1, 1)
+        col, dep, mv, ex = scene(sx + 0.5, sy + 0.5, sx, sy, t, foot_h)  # kept pixel (1, 1)
         write_frame(os.path.join(out, "fold-pick"), t, col, dep, mv * 0.5, jh, 0, (W, H))
         write_frame(os.path.join(out, "fold-split"), t, col, dep, mv * 0.5, (jh[0] - 0.125, jh[1] - 0.125), 0, (W, H))
         px, py = PICKS[t % 4]
-        col, dep, mv, ex = scene(sx - 0.5 + px, sy - 0.5 + py, sx, sy, t)
+        col, dep, mv, ex = scene(sx - 0.5 + px, sy - 0.5 + py, sx, sy, t, foot_h)
         write_frame(os.path.join(out, "fold-cycle"), t, col, dep, mv * 0.5, jh, 0, (W, H), ex * 0.5)
 
         if t >= frames - TRUTH_LAST:
@@ -285,7 +291,8 @@ def generate(out, frames=FRAMES, size=None, only=None, exact=False):
             np.save(os.path.join(out, "truth", "%05d.npy" % t), (acc / 16.0).astype(np.float32))
         print("frame", t, flush=True)
     with open(os.path.join(out, "scene.json"), "w") as f:
-        json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": list(keep), "leaf_motion": LEAF_MOTION, "gust": GUST}, f)
+        json.dump({"width": W, "height": H, "frames": frames, "truth_last": TRUTH_LAST, "variants": list(keep), "leaf_motion": LEAF_MOTION, "gust": GUST,
+                   "mip_bias": MIP_BIAS, "jitter": "R2" if USE_R2 else "Halton"}, f)
 
 
 MIP_VARIANTS = ["native-b1", "half-b0", "half-b1", "half-b2", "half-b225", "half-b2-halton", "fold-b0", "fold-b2", "fold-b225"]
@@ -811,9 +818,37 @@ def flowtrial(scene_dir, work, bindir):
 
 
 
+def clip(scene_dir, out_gif, region, panels, scale=2, fps=8):
+    """A moving picture for Cort to judge in motion: one region of every given replay, side by side,
+    every saved frame in order. panels: "Label=folder" (a replay output folder of NNNNN-dlssout.raw)."""
+    from PIL import Image, ImageDraw
+    info = json.load(open(os.path.join(scene_dir, "scene.json")))
+    w, h = info["width"], info["height"]
+    x, y, rw, rh = regions(w, h, info.get("gust", 0) > 0)[region]
+    cols = []
+    for p in panels:
+        label, folder = p.split("=", 1)
+        files = sorted(f for f in os.listdir(folder) if f.endswith("-dlssout.raw"))
+        cols.append((label, folder, files))
+    n = min(len(c[2]) for c in cols)
+    pw, ph = rw * scale, rh * scale
+    frames = []
+    for i in range(n):
+        sheet = Image.new("RGB", ((pw + 6) * len(cols), ph + 26), (24, 24, 24))
+        dr = ImageDraw.Draw(sheet)
+        for k, (label, folder, files) in enumerate(cols):
+            raw = np.fromfile(os.path.join(folder, files[len(files) - n + i]), dtype=np.float16).reshape(h, w, 4)[..., :3]
+            crop = np.clip(display(raw)[y:y + rh, x:x + rw], 0, 255).astype(np.uint8)
+            sheet.paste(Image.fromarray(crop).resize((pw, ph), Image.NEAREST), (k * (pw + 6), 26))
+            dr.text((k * (pw + 6) + 4, 6), label, fill=(255, 255, 255))
+        frames.append(sheet)
+    frames[0].save(out_gif, save_all=True, append_images=frames[1:], duration=int(1000 / fps), loop=0)
+    print("clip:", out_gif, n, "frames")
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if len(args) >= 2 and any(a.startswith("-") for a in args[1:]):
+    if len(args) >= 2 and any(a.startswith("-") and not a[1:2].isdigit() for a in args[1:]):
         print("This script takes folders and numbers only, no options:", " ".join(args[1:]))
         sys.exit(2)
     if len(args) >= 2 and args[0] == "generate":
@@ -835,6 +870,17 @@ if __name__ == "__main__":
     elif len(args) >= 2 and args[0] == "generate-mip":
         safe_cores()
         generate_mip(args[1], int(args[2]) if len(args) > 2 else FRAMES, (int(args[3]), int(args[4])) if len(args) > 4 else None)
+    elif len(args) >= 2 and args[0] == "generate-final":
+        # The combined test: R2 jitter, the gusting band, the exact motion beside each variant, and the
+        # given mip bias for the half-size and folded pictures (DLAA keeps -1).
+        safe_cores()
+        GUST = 4.0
+        USE_R2 = True
+        MIP_BIAS = float(args[2]) if len(args) > 2 else -2.0
+        generate(args[1], int(args[3]) if len(args) > 3 else FRAMES, None, FLOW_VARIANTS, exact=True)
+    elif len(args) >= 5 and args[0] == "clip":
+        safe_cores()
+        clip(args[1], args[2], args[3], args[4:])
     elif len(args) >= 4 and args[0] == "flowtrial":
         safe_cores()
         sys.exit(flowtrial(args[1], args[2], args[3]))
