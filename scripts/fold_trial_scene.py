@@ -360,6 +360,9 @@ def luma(d):
     return 0.2126 * d[..., 0] + 0.7152 * d[..., 1] + 0.0722 * d[..., 2]
 
 
+WHOLE_ROWS = 0.80  # the "whole" number leaves out the bottom fifth (the DLSS indicator's text, when it is on)
+
+
 def regions(w, h, gust=False):
     """Name -> (x, y, w, h), 320x200 each, placed on the scene's parts."""
     r = regions_base(w, h)
@@ -371,7 +374,9 @@ def regions(w, h, gust=False):
 def regions_base(w, h):
     return {
         "A-wire": (int(w * 0.20), int(h * 0.17), 320, 200),
-        "B-brick": (int(w * 0.18), int(h * 0.74), 320, 200),
+        # Above the bottom fifth: with NVIDIA's DLSS indicator switched on (as on Cort's PC) its text is
+        # burned into the bottom-left of every DLSS output, and until 2026-11-25 this region sat under it.
+        "B-brick": (int(w * 0.18), int(h * 0.655), 320, int(h * 0.14)),
         "C-wall-edge": (int(w * 0.30), int(h * 0.57), 320, 200),
         "D-leaves-still": (int(w * 0.66) - 160 + 80, int(h * 0.36), 320, 200),
         "E-leaves-swaying": (int(w * 0.84), int(h * 0.36), 320 if w * 0.84 + 320 <= w else w - int(w * 0.84), 200),
@@ -405,7 +410,7 @@ def evaluate(out, replay):
             if t == frames - 1:
                 final[v] = d
             diff = np.abs(luma(d) - truth)
-            err[v]["whole"].append(diff.mean())
+            err[v]["whole"].append(diff[:int(h * WHOLE_ROWS)].mean())
             for r, (x, y, rw, rh) in reg.items():
                 err[v][r].append(diff[y:y + rh, x:x + rw].mean())
     lines.append("Mean absolute brightness error against the exact picture (0..255 display scale), last %d frames." % last)
@@ -629,7 +634,7 @@ def flowtrial(scene_dir, work, bindir):
             if t == frames - 1:
                 final[(v, name)] = d
             diff = np.abs(luma(d) - truth_luma[t])
-            e["whole"].append(diff.mean())
+            e["whole"].append(diff[:int(H_ * WHOLE_ROWS)].mean())
             for r, (x, y, rw, rh) in reg.items():
                 e[r].append(diff[y:y + rh, x:x + rw].mean())
         err[(v, name)] = {c: (float(np.mean(e[c])), float(np.std(e[c]))) for c in cols}
