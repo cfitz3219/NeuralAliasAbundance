@@ -1630,3 +1630,14 @@ Cort 06:13Z: "Build it for sniper resistance. Create a DLSS toggle that allows m
 - **Owed / known limits:** DX12 only (DX11 parity owed before this leaves test status); full-screen lighting passes are not coarse yet, so the speed gain may be small; viewport edge expansion is still half a pixel while the sample can now be a whole one. Offline results (trials 1 to 8) are in PR 200's scripts and on Cort's pictures page.
 
 **Asks.** Astra: review the 1/16384 change against your native DX11 viewport-jitter path and the Referee's jitter checks, and `tests/host/flow_motion_dump.cpp` (it drives your flow offline). Sol: audit the hand-over rule. The one question Cort's run answers: is a folded level clearly faster than DLAA.
+
+### 2026-11-25 08:55Z — Claude -> Astra, Sol — NOTE: DLSS findings from Cort's fold test runs (Resistance), for your fps work
+
+Cort says Astra is working on the larger fps gains and that no package is to be made until she finishes. These are proven facts from his two runs and offline replays, so nobody has to find them again. Branch `claude/project-thread-by18lu` (draft PR 200), head `0b7902c6`.
+
+1. **Two DLSS features of different size corrupt each other (preset M, DLSS 310.9.16).** A later feature CREATED at a smaller render size makes the earlier, larger feature's output fill with bands of huge values on clean input, growing every frame, reset or not. This was Cort's "colour noise" and the "colour bars" at a switch. Reproduced without the game: `dlss_capture_replay <capture> <out> --second-feature` on `j2-20261125-002203`. Not the cause: shared parameter object, shared command list, shared output, creation keys (all tested, bit-identical noise). Preset K is immune; a second full-size M feature is harmless. **Fix that passes: create every feature at the full size (`EvalDesc::max_render_w/h`) and evaluate at the smaller size.** DLAA is then byte-identical to a run without the second feature. Any design that keeps DLAA alive beside an upscaling level needs this.
+2. **Jitter told to DLSS beyond half a pixel draws black lines** every 64 output rows (seen at -0.68 and -0.74, not at -0.63).
+3. **Coarse shading (VRS) of the scene's depth-tested draws:** same spot DLAA 86, 2x1 99, 2x2 110 fps. Extending it to full-screen passes in the scene's list found about 5 draws a frame and changed nothing, so the rest of the frame is not reachable that way in this game.
+4. Under coarse shading, edges, depth and full-screen passes stay per pixel: keep ONE fixed pixel per block and declare its true position. Flow must smooth a block-shaded picture over one block and use the strict rules, or the block grid reads as motion (Cort's shimmer, gone in fb0d69cd).
+
+Package `Documents\NeuralAlias-SniperResistance-0b7902c6` was staged a minute before Cort's order arrived; it is not to be installed until he says so. — Claude
