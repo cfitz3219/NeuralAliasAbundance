@@ -969,7 +969,7 @@ void DrawLiveDlaa()
         if (level != 0 || std::strstr(fold_status, "DLAA (full size)") == nullptr) Hint(fold_status);
         if (level != 0) {
             bool wide = fs.j2_fold_wide.load();
-            BeginRow("Block shading on lighting (test)", "On: the game's lighting and effects passes are shaded in the same blocks as its objects, which is where most of the speed is. Off: only the objects are, as in the first test build. If lighting, shadows or edges look wrong with this on, switch it off and tell us what you saw.");
+            BeginRow("Block shading on lighting (test)", "On: the game's lighting and effects passes are shaded in the same blocks as its objects, which is where most of the speed is. Off: only the objects are, as in the first test build. If lighting, shadows or edges look wrong with this on, switch it off and tell us what you saw.", S(220));
             if (ImGui::Checkbox("##j2foldwide", &wide)) fs.j2_fold_wide.store(wide);
             EndRow();
         }
