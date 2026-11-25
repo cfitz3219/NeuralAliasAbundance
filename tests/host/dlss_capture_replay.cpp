@@ -13,6 +13,9 @@
 //   --motion-dir DIR                      a saved frame's motion comes from DIR\NNNNN-motion.raw when that
 //                                         file exists (two 32-bit floats a pixel, tight rows, the motion
 //                                         plane's size): motion computed another way for the same frames
+//   --bias-dir DIR                        DLSS's "trust this frame's colour here" mask comes from DIR\NNNNN-bias.raw
+//                                         when that file exists (one 32-bit float a pixel, tight rows, the
+//                                         colour plane's size; 1 = lean on this frame, 0 = normal). Not with --fold.
 //   --preset 0 | 10..13                   the DLSS model (0 = as captured; 11 K, 13 M)
 //   --parity all | even | odd             every frame, or only those with an even / odd present
 //                                         ordinal (the motion of a skipped frame is added to the next)
@@ -388,7 +391,7 @@ struct Step {
 
 int Usage()
 {
-    std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D] [--motion-dir DIR]\n"
+    std::printf("dlss_capture_replay <capture folder> <out folder> [--name N] [--motion captured|zero|far-zero] [--far-depth D] [--motion-dir DIR] [--bias-dir DIR]\n"
                 "    [--preset 0|10..13] [--parity all|even|odd] [--first INDEX] [--frames N] [--all] [--preroll N] [--pingpong N]\n"
                 "    [--crop X Y W H] [--save-last N] [--fold cycle|fixed] [--fold-sign 1|-1]\n");
     return 2;
@@ -399,7 +402,7 @@ int main(int argc, char** argv)
 {
     if (argc < 3) return Usage();
     const std::string capture = argv[1], out_root = argv[2];
-    std::string name = "replay", motion_dir;
+    std::string name = "replay", motion_dir, bias_dir;
     MotionMode mode = MotionMode::Captured;
     const char* mode_name = "captured";
     float far_depth = 0.005f;
@@ -424,6 +427,7 @@ int main(int argc, char** argv)
             mode_name = argv[i];
         }
         else if (a == "--motion-dir" && value) { motion_dir = value; ++i; }
+        else if (a == "--bias-dir" && value) { bias_dir = value; ++i; }
         else if (a == "--far-depth" && value) { far_depth = static_cast<float>(std::strtod(value, nullptr)); ++i; }
         else if (a == "--preset") { if (!number(&preset)) return Usage(); }
         else if (a == "--first") { if (!number(&first)) return Usage(); }
@@ -460,6 +464,7 @@ int main(int argc, char** argv)
     CreateDirectoryA(out_dir.c_str(), nullptr);
     fopen_s(&g_log, (out_dir + "\\replay.log").c_str(), "wb");
     if (!motion_dir.empty()) Log("motion planes from %s where present", motion_dir.c_str());
+    if (!bias_dir.empty()) Log("bias masks from %s where present", bias_dir.c_str());
     Log("dlss_capture_replay: capture=%s name=%s motion=%s far_depth=%g preset=%u parity=%s first=%u frames=%u all=%d preroll=%u pingpong=%u",
         capture.c_str(), name.c_str(), mode_name, far_depth, preset, parity < 0 ? "all" : parity ? "odd" : "even", first, max_frames,
         all ? 1 : 0, preroll, pingpong);
@@ -557,7 +562,17 @@ int main(int argc, char** argv)
     if (!init_ok || !caps.available) return 1;
 
     ID3D12Device* dev = d.device.Get();
-    Texture color, depth, motion;
+    Texture color, depth, motion, bias;
+    PlaneInfo bias_plane;
+    if (!bias_dir.empty()) {
+        if (fold != FoldMode::Off) { Log("FATAL: --bias-dir is not read with --fold"); return 1; }
+        bias_plane.valid = true;
+        bias_plane.width = head.color.width;
+        bias_plane.height = head.color.height;
+        bias_plane.format = 41; // R32_FLOAT
+        bias_plane.row_pitch = bias_plane.width * 4;
+        REQUIRE(MakeInput(dev, bias_plane, &bias));
+    }
     {
         PlaneInfo c = head.color, z = head.depth, v = head.motion;
         if (fold != FoldMode::Off) { c.width = z.width = v.width = fold_w; c.height = z.height = v.height = fold_h; }
@@ -591,7 +606,8 @@ int main(int argc, char** argv)
     fopen_s(&csv, (out_dir + "\\replay.csv").c_str(), "wb");
     if (csv) std::fprintf(csv, "step,file,source_index,present_ordinal,direction,jitter_x,jitter_y,motion_planes,width,height,dxgi_format,bytes_per_pixel,crop_x,crop_y\n");
 
-    std::vector<uint8_t> rows, depth_rows, motion_rows, saved_rows, folded;
+    std::vector<uint8_t> rows, depth_rows, motion_rows, saved_rows, folded, bias_rows;
+    uint32_t bias_planes = 0;
     // The pixel of each 2x2 block kept at each step: all four in turn, opposite corners first.
     static const uint32_t kFoldPhase[4][2] = {{0, 0}, {1, 1}, {1, 0}, {0, 1}};
     std::vector<float> vectors, sum;
@@ -686,6 +702,11 @@ int main(int argc, char** argv)
         e.mv_display_res = !m.mv_lowres;
         if (fold != FoldMode::Off) e.mv_display_res = false; // the folded motion plane is render size
         e.auto_exposure = m.auto_exposure;
+        if (!bias_dir.empty() && ReadPlane(bias_dir, m.index, "bias", bias_plane, &bias_rows)) {
+            REQUIRE(Fill(l.list.Get(), &bias, bias_rows));
+            e.bias_current_color = bias.tex.Get();
+            ++bias_planes;
+        }
         if (!na::dlss::Evaluate(l.list.Get(), e)) {
             Log("FATAL: evaluate refused at step %zu (saved frame %u): %s", si, m.index, na::dlss::GetStats().reason);
             return 1;
@@ -762,6 +783,7 @@ int main(int argc, char** argv)
     if (csv) std::fclose(csv);
     const auto st = na::dlss::GetStats();
     if (!motion_dir.empty()) Log("motion planes taken from the given folder: %u", replaced_planes);
+    if (!bias_dir.empty()) Log("bias masks taken from the given folder: %u", bias_planes);
     Log("done: %u outputs written to %s; evaluates=%llu features created=%llu (preset requested %u)", written, out_dir.c_str(),
         static_cast<unsigned long long>(st.evaluates), static_cast<unsigned long long>(st.features_created), st.feature_preset);
     d.WaitIdle();

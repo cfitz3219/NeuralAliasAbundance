@@ -45,7 +45,12 @@ def halton(i, b):
     return r
 
 
+USE_R2 = False  # True: Roberts' R2 jitter instead of Halton (Cort's preference, 2026-11-25)
+
+
 def jitter(i, phases):
+    if USE_R2:
+        return jitter_r2(i, phases)
     k = (i % phases) + 1
     return halton(k, 2) - 0.5, halton(k, 3) - 0.5
 
@@ -446,10 +451,52 @@ FLOW_LABELS = {
     "correct-100": "Supplied first, flow corrects, 100%",
     "average": "Average of supplied and flow",
     "flowfirst": "Flow first, supplied elsewhere",
+    "block-oracle": "Flow only on moving things (perfect block)",
+    "block-oracle-alone": "Perfect block, flow alone inside",
+    "block-detect": "Flow only where pictures disagree (real block)",
+    "lean-oracle": "Supplied + lean on this frame (perfect zone)",
+    "lean-detect": "Supplied + lean on this frame (real zone)",
+    "lean-block-oracle": "Perfect block + lean on this frame",
     "exact": "Exact leaf motion (best possible)",
 }
+BLOCK_NAMES = ["block-oracle", "block-oracle-alone", "block-detect", "lean-oracle", "lean-detect", "lean-block-oracle"]
+DETECT_THRESHOLD = 0.028  # mean brightness difference (0..1) after lining two frames up with the supplied motion
+
+
+def _bilinear(img, x, y):
+    h, w = img.shape
+    x = np.clip(x, 0, w - 1.001)
+    y = np.clip(y, 0, h - 1.001)
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    fx, fy = x - x0, y - y0
+    return (img[y0, x0] * (1 - fx) + img[y0, x0 + 1] * fx) * (1 - fy) + (img[y0 + 1, x0] * (1 - fx) + img[y0 + 1, x0 + 1] * fx) * fy
+
+
+def _box(a, r):
+    k = 2 * r + 1
+    c = np.cumsum(np.cumsum(np.pad(a, r, mode="edge"), 0), 1)
+    c = np.pad(c, ((1, 0), (1, 0)))
+    return (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / (k * k)
+
+
+def _frame_luma(folder, t, w, h):
+    c = np.fromfile(os.path.join(folder, "%05d-color.raw" % t), dtype=np.float16).reshape(h, w, 4)[..., :3]
+    return luma(display(c)) / 255.0
+
+
+def _disagreement(folder, t, w, h):
+    """How different this frame is from the one before after lining them up with the supplied motion
+    (both frames' jitter taken out), averaged over a 7x7 window. Our own data only."""
+    cur, prev = _frame_luma(folder, t, w, h), _frame_luma(folder, t - 1, w, h)
+    mv = np.fromfile(os.path.join(folder, "%05d-motion.raw" % t), dtype=np.float32).reshape(h, w, 2).astype(np.float64)
+    j = json.load(open(os.path.join(folder, "%05d-meta.json" % t)))["jitter_px"]
+    jp = json.load(open(os.path.join(folder, "%05d-meta.json" % (t - 1))))["jitter_px"]
+    y, x = np.mgrid[0:h, 0:w].astype(np.float64)
+    return _box(np.abs(cur - _bilinear(prev, x + mv[..., 0] + jp[0] - j[0], y + mv[..., 1] + jp[1] - j[1])), 3)
+
 FLOW_ORDER = ["supplied", "alone-0", "alone-50", "alone-100", "total", "correct-0", "correct-50", "correct-100",
-              "average", "flowfirst", "exact"]
+              "average", "flowfirst"] + BLOCK_NAMES + ["exact"]
 
 
 def safe_cores():
@@ -507,9 +554,18 @@ def flowtrial(scene_dir, work, bindir):
     def dump_dir(v, name):
         return os.path.join(work, "flow", v, name)
 
+    def bias_dir(v, name):
+        if name in ("lean-oracle", "lean-block-oracle"):
+            return os.path.join(work, "bias", v, "oracle")
+        if name == "lean-detect":
+            return os.path.join(work, "bias", v, "detect")
+        return None
+
     def motion_dir(v, name):
-        if name == "supplied":
+        if name in ("supplied", "lean-oracle", "lean-detect"):
             return None
+        if name == "lean-block-oracle":
+            return dump_dir(v, "block-oracle")
         if name == "exact":
             return os.path.join(scene_dir, "exact", v)
         return dump_dir(v, name)
@@ -536,6 +592,11 @@ def flowtrial(scene_dir, work, bindir):
             if not os.path.isfile(os.path.join(md, "%05d-motion.raw" % (frames - 1))):
                 return False
             cmd += ["--motion-dir", md]
+        bd = bias_dir(v, name)
+        if bd:
+            if not os.path.isfile(os.path.join(bd, "%05d-bias.raw" % (frames - 1))):
+                return False
+            cmd += ["--bias-dir", bd]
         code = flow_run(cmd, os.path.join(logs, "replay-%s-%s.txt" % (v, name)))
         if code != 0:
             note("FAILED (exit %d): replay %s %s; see logs" % (code, v, name))
@@ -571,7 +632,8 @@ def flowtrial(scene_dir, work, bindir):
     #    Half size gets every way; DLAA and the fold get the ones that say how they compare (the
     #    full-size motion planes are 11 MB a frame each).
     def wanted(v, name):
-        return v == "half-true" or name in ("supplied", "exact", "total", "correct-0", "correct-50", "correct-100")
+        return v == "half-true" or name in ("supplied", "exact", "total", "correct-0", "correct-50", "correct-100") or \
+            (v == "fold-cycle" and name == "alone-0")
     for v in FLOW_VARIANTS:
         for name, mode, loosen in FLOW_DUMPS:
             if wanted(v, name):
@@ -614,6 +676,52 @@ def flowtrial(scene_dir, work, bindir):
             do_replay(v, name)
             measure(v, name)
 
+    # 3b. Cort, 2026-11-25: "Perhaps we just need it to be blocked from estimating motion on still objects."
+    #     Half size and the fold. The flow's motion is used only inside a zone and the supplied motion
+    #     everywhere else. "Perfect" zone: where the exact motion differs from the supplied one (what a
+    #     faultless detector would give; the upper limit of the idea). "Real" zone: where two frames,
+    #     lined up with the supplied motion, still disagree (our own pictures only). The same zones are
+    #     also given to DLSS as its "lean on this frame" mask with the supplied motion.
+    zone_share = {}
+    for v in ["half-true", "fold-cycle"]:
+        w, h = size_of(v)
+        k = W_ // w
+        src = os.path.join(scene_dir, v)
+        need = [dump_dir(v, "correct-100"), dump_dir(v, "alone-0")]
+        if not all(os.path.isfile(os.path.join(d, "%05d-motion.raw" % (frames - 1))) for d in need):
+            note("Block test skipped for %s: its flow planes are missing" % v)
+            continue
+        for sub in ("oracle", "detect"):
+            os.makedirs(os.path.join(work, "bias", v, sub), exist_ok=True)
+        for name in ("block-oracle", "block-oracle-alone", "block-detect"):
+            os.makedirs(dump_dir(v, name), exist_ok=True)
+        recent = []
+        share = {c: {"oracle": [], "detect": []} for c in reg}
+        for t in range(frames):
+            given = np.fromfile(os.path.join(src, "%05d-motion.raw" % t), dtype=np.float32).reshape(h, w, 2)
+            ex = np.fromfile(os.path.join(scene_dir, "exact", v, "%05d-motion.raw" % t), dtype=np.float32).reshape(h, w, 2)
+            oracle = _box((np.hypot(ex[..., 0] - given[..., 0], ex[..., 1] - given[..., 1]) > 0.02).astype(np.float64), 2) > 0.0
+            if t >= 1:
+                recent = (recent + [_disagreement(src, t, w, h)])[-4:]
+                detect = _box((np.mean(recent, 0) > DETECT_THRESHOLD).astype(np.float64), 2) > 0.0
+            else:
+                detect = np.zeros((h, w), dtype=bool)
+            oracle.astype(np.float32).tofile(os.path.join(work, "bias", v, "oracle", "%05d-bias.raw" % t))
+            detect.astype(np.float32).tofile(os.path.join(work, "bias", v, "detect", "%05d-bias.raw" % t))
+            loose = flow_planes(dump_dir(v, "correct-100"), t, w, h)[0]
+            alone0, prov0 = flow_planes(dump_dir(v, "alone-0"), t, w, h)
+            np.where(oracle[..., None], loose, given).astype(np.float32).tofile(os.path.join(dump_dir(v, "block-oracle"), "%05d-motion.raw" % t))
+            np.where((oracle & (prov0 == 3))[..., None], alone0, given).astype(np.float32).tofile(os.path.join(dump_dir(v, "block-oracle-alone"), "%05d-motion.raw" % t))
+            np.where(detect[..., None], loose, given).astype(np.float32).tofile(os.path.join(dump_dir(v, "block-detect"), "%05d-motion.raw" % t))
+            if t >= frames - last:
+                for c, (x, y, rw, rh) in reg.items():
+                    share[c]["oracle"].append(oracle[y // k:(y + rh) // k, x // k:(x + rw) // k].mean())
+                    share[c]["detect"].append(detect[y // k:(y + rh) // k, x // k:(x + rw) // k].mean())
+        zone_share[v] = {c: (float(np.mean(share[c]["oracle"])), float(np.mean(share[c]["detect"]))) for c in reg}
+        for name in BLOCK_NAMES:
+            do_replay(v, name)
+            measure(v, name)
+
     # 4. numbers.
     pics = os.path.join(work, "compare")
     os.makedirs(pics, exist_ok=True)
@@ -623,9 +731,9 @@ def flowtrial(scene_dir, work, bindir):
     lines += notes + [""]
     for c in shown:
         lines.append("Region: %s" % c)
-        lines.append("%-40s" % "motion given to DLSS" + "".join("%18s" % FLOW_VARIANT_NAMES[v] for v in FLOW_VARIANTS))
+        lines.append("%-48s" % "motion given to DLSS" + "".join("%18s" % FLOW_VARIANT_NAMES[v] for v in FLOW_VARIANTS))
         for name in FLOW_ORDER:
-            row = "%-40s" % (FLOW_LABELS[name] + (" *" if name == best else ""))
+            row = "%-48s" % (FLOW_LABELS[name] + (" *" if name == best else ""))
             for v in FLOW_VARIANTS:
                 m = measure(v, name)
                 row += "%18s" % ("%.2f (%.2f)" % m[c] if m else "-")
@@ -633,16 +741,21 @@ def flowtrial(scene_dir, work, bindir):
         lines.append("")
     lines.append("* = the flow-alone strictness the two made-here combinations use.")
     lines.append("")
+    for v in zone_share:
+        lines.append("Share of each region inside the zone, %s: perfect zone / real zone (threshold %.3f)" % (FLOW_VARIANT_NAMES[v], DETECT_THRESHOLD))
+        for c in [c for c in shown if c in zone_share[v]]:
+            lines.append("    %-20s %3.0f%% / %3.0f%%" % (c, 100 * zone_share[v][c][0], 100 * zone_share[v][c][1]))
+        lines.append("")
 
     # how good the motion itself is: distance from the exact motion, in full-size pixels, and how much
     # of the region the flow answered for.
     for c in [c for c in shown if c in ("F-leaves-gusting", "E-leaves-swaying", "D-leaves-still", "whole")]:
         lines.append("Motion error against the exact motion, full-size pixels, region %s (last %d frames); in brackets the share of pixels the flow answered for" % (c, last))
-        lines.append("%-40s" % "motion" + "".join("%22s" % FLOW_VARIANT_NAMES[v] for v in FLOW_VARIANTS))
+        lines.append("%-48s" % "motion" + "".join("%22s" % FLOW_VARIANT_NAMES[v] for v in FLOW_VARIANTS))
         for name in FLOW_ORDER:
-            if name == "exact":
+            if name == "exact" or name.startswith("lean-"):
                 continue
-            row = "%-40s" % FLOW_LABELS[name]
+            row = "%-48s" % FLOW_LABELS[name]
             for v in FLOW_VARIANTS:
                 w, h = size_of(v)
                 k = W_ // w
@@ -716,6 +829,7 @@ if __name__ == "__main__":
         # exact motion beside each.
         safe_cores()
         GUST = 4.0
+        USE_R2 = True
         generate(args[1], int(args[2]) if len(args) > 2 else FRAMES, (int(args[3]), int(args[4])) if len(args) > 4 else None,
                  FLOW_VARIANTS, exact=True)
     elif len(args) >= 2 and args[0] == "generate-mip":
