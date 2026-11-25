@@ -501,6 +501,8 @@ struct Stats {
 // Per-phase time of the inline DLAA scene-read callback since the last call (status line j2_inline_cost).
 int FormatInlineCost(char* out, size_t n);
 Stats GetStats();
+// Fold the shading (core/fold_shading.hpp): one plain sentence on what is on screen and why, for the menu.
+void FoldStatus(char* out, size_t n);
 // Smear test (live_dlaa.cpp): a fixed sequence of DLAA variants, 8 captured frames each, into
 // captures\smear-<time>-<exe>-p<pid>\<n-variant>. Starts with the next native DLAA frame.
 void StartSmearTest();

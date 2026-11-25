@@ -37,6 +37,7 @@
 
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/temporal_jitter.hpp"
+#include "core/fold_shading.hpp"
 #include "core/projection_window.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
@@ -2482,6 +2483,223 @@ bool jshift_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Res
     ++g.stats.jitter_shifted;
     return true;
 }
+// ---- Fold the shading (core/fold_shading.hpp; Cort 2026-11-25, live test) ---------------------
+// The game draws at full size with its scene shaded once per block (coarse shading, set on the
+// scene's draws by na::observe::SetSceneCoarseShading). Here one pixel of every block is kept from
+// colour, depth and motion, DLSS gets that smaller picture and writes the full-size one into the
+// same output DLAA uses, so everything after DLSS is unchanged. Each folded mode has its own DLSS
+// view (history); DLAA's view is never released by a mode change.
+constexpr uint64_t kFoldViewId = kViewId + 0x10; // + mode
+struct FoldPlanes { ComPtr<ID3D12Resource> color, depth, motion; uint32_t w = 0, h = 0; DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN; };
+struct FoldPass {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12DescriptorHeap> heap; // kRing x 6 passes x (t0, u0)
+    UINT inc = 0;
+    bool tried = false, ok = false;
+    FoldPlanes planes[na::fold::kModes];
+    ComPtr<ID3D12Resource> unseen; // the warming mode's output: nobody sees it
+    na::fold::Handover hand;
+    bool vrs_checked = false, vrs_ok = false;
+    // Frame start (fold_advance): what this frame's scene draws were asked to be.
+    na::fold::Mode frame_mode = na::fold::Mode::Off;
+    uint32_t rate_set = 0;
+    uint64_t rate_frame = 0;
+    int mip_extra = 0;
+    // Counters and the plain-word state for the menu and the log.
+    uint64_t shown_frames[na::fold::kModes]{}, warm_frames = 0, warm_failed = 0, coarse_frames = 0, fine_frames = 0, unable_frames = 0;
+    std::atomic<uint32_t> st_asked{0}, st_shown{0}, st_warming{0}, st_good{0}, st_refused{0}, st_vrs{0}, st_w{0}, st_h{0};
+    std::mutex why_m;
+    char why[160]{};
+} g_fold;
+constexpr char kFoldHlsl[] = R"(
+Texture2D<float4> t_in : register(t0);
+RWTexture2D<float4> u_out : register(u0);
+cbuffer C : register(b0) { uint bx; uint by; uint px; uint py; };
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    u_out.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    u_out[id.xy] = t_in[uint2(id.x * bx + px, id.y * by + py)]; // the kept pixel of this block
+})";
+bool fold_init()
+{
+    if (g_fold.tried) return g_fold.ok;
+    g_fold.tried = true;
+    D3D12_DESCRIPTOR_RANGE r[2]{};
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    r[0].NumDescriptors = 1;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    r[1].NumDescriptors = 1;
+    r[1].OffsetInDescriptorsFromTableStart = 1;
+    D3D12_ROOT_PARAMETER p[2]{};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[0].DescriptorTable.NumDescriptorRanges = 2;
+    p[0].DescriptorTable.pDescriptorRanges = r;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[1].Constants.Num32BitValues = 4;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> sig, err, code;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        FAILED(g.device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_fold.root))))
+        return false;
+    if (FAILED(D3DCompile(kFoldHlsl, sizeof(kFoldHlsl) - 1, "j2_fold.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_fold.root.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_fold.pso)))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kRing * 6 * 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fold.heap)))) return false;
+    g_fold.inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_fold.ok = true;
+    return true;
+}
+// The folded planes of one mode and the unseen output, in UNORDERED_ACCESS between uses. Replaced
+// only when the picture's size or format changes (the same moment the DLAA textures are).
+bool fold_targets(na::fold::Mode m, uint32_t w, uint32_t h, DXGI_FORMAT color_format, uint32_t ow, uint32_t oh, DXGI_FORMAT out_format)
+{
+    const auto blk = na::fold::BlockFor(m);
+    const uint32_t fw = na::fold::Folded(w, blk.x), fh = na::fold::Folded(h, blk.y);
+    if (fw < 16 || fh < 16) return false;
+    auto& p = g_fold.planes[static_cast<uint32_t>(m)];
+    if (!p.color || p.w != fw || p.h != fh || p.color_format != color_format) {
+        p = FoldPlanes{};
+        if (!texture(fw, fh, color_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, p.color) ||
+            !texture(fw, fh, DXGI_FORMAT_R32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, p.depth) ||
+            !texture(fw, fh, DXGI_FORMAT_R32G32_FLOAT, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, p.motion)) {
+            p = FoldPlanes{};
+            return false;
+        }
+        p.w = fw; p.h = fh; p.color_format = color_format;
+        p.color->SetName(L"NeuralAlias folded colour");
+        p.depth->SetName(L"NeuralAlias folded depth");
+        p.motion->SetName(L"NeuralAlias folded motion");
+    }
+    if (g_fold.unseen) {
+        const auto d = g_fold.unseen->GetDesc();
+        if (d.Width != ow || d.Height != oh || d.Format != out_format) g_fold.unseen.Reset();
+    }
+    if (!g_fold.unseen) {
+        if (!texture(ow, oh, out_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_fold.unseen)) return false;
+        g_fold.unseen->SetName(L"NeuralAlias fold warm-up output");
+    }
+    return true;
+}
+// `in` readable, `out` UNORDERED_ACCESS. index: this frame's ring slot x 6 + pass.
+void fold_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, DXGI_FORMAT in_format, ID3D12Resource* out, DXGI_FORMAT out_format,
+                   na::fold::Block blk, na::fold::Block pick, UINT index)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE c = g_fold.heap->GetCPUDescriptorHandleForHeapStart();
+    c.ptr += static_cast<SIZE_T>(index) * 2 * g_fold.inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = in_format;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    g.device->CreateShaderResourceView(in, &sv, c);
+    c.ptr += g_fold.inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = out_format;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(out, nullptr, &uv, c);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = g_fold.heap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += static_cast<UINT64>(index) * 2 * g_fold.inc;
+    ID3D12DescriptorHeap* heaps[] = {g_fold.heap.Get()};
+    l->SetDescriptorHeaps(1, heaps);
+    l->SetComputeRootSignature(g_fold.root.Get());
+    l->SetPipelineState(g_fold.pso.Get());
+    l->SetComputeRootDescriptorTable(0, gh);
+    const uint32_t k[4] = {blk.x, blk.y, pick.x, pick.y};
+    l->SetComputeRoot32BitConstants(1, 4, k, 0);
+    const auto d = out->GetDesc();
+    l->Dispatch((static_cast<UINT>(d.Width) + 7) / 8, (d.Height + 7) / 8, 1);
+}
+// Folds `base`'s colour, depth and motion (all readable, full size) for mode m and describes the
+// result for DLSS in *out. `coarse`: this frame's scene draws were shaded once per block. pass0: 0 for
+// the mode on screen, 3 for the warming one (two modes can run in one frame). The planes are left
+// readable; fold_done hands them back after the evaluate.
+void fold_record(ID3D12GraphicsCommandList* l, const na::dlss::EvalDesc& base, na::fold::Mode m, bool coarse, uint64_t frame, UINT slot, UINT pass0,
+                 na::dlss::EvalDesc* out)
+{
+    const auto blk = na::fold::BlockFor(m);
+    const auto pick = na::fold::Pick(m, frame);
+    auto& p = g_fold.planes[static_cast<uint32_t>(m)];
+    const UINT index = (slot % kRing) * 6 + pass0;
+    fold_dispatch(l, base.color, typed(base.color->GetDesc().Format), p.color.Get(), typed(p.color_format), blk, pick, index);
+    fold_dispatch(l, base.depth, DXGI_FORMAT_R32_FLOAT, p.depth.Get(), DXGI_FORMAT_R32_FLOAT, blk, pick, index + 1);
+    fold_dispatch(l, base.motion, DXGI_FORMAT_R32G32_FLOAT, p.motion.Get(), DXGI_FORMAT_R32G32_FLOAT, blk, pick, index + 2);
+    std::vector<D3D12_RESOURCE_BARRIER> b;
+    for (ID3D12Resource* r : {p.color.Get(), p.depth.Get(), p.motion.Get()}) {
+        b.push_back(uav_barrier(r));
+        add(b, r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    flush(l, b);
+    *out = base;
+    out->color = p.color.Get();
+    out->depth = p.depth.Get();
+    out->motion = p.motion.Get();
+    out->render_w = out->max_render_w = p.w;
+    out->render_h = out->max_render_h = p.h;
+    out->mv_scale_x = base.mv_scale_x / static_cast<float>(blk.x); // the kept vectors are full-size pixels
+    out->mv_scale_y = base.mv_scale_y / static_cast<float>(blk.y);
+    out->mv_display_res = false;
+    out->jitter_x = na::fold::DeclaredJitter(blk.x, pick.x, base.jitter_x, coarse);
+    out->jitter_y = na::fold::DeclaredJitter(blk.y, pick.y, base.jitter_y, coarse);
+    out->quality = m == na::fold::Mode::Performance ? na::dlss::Quality::MaxPerformance : na::dlss::Quality::MaxQuality;
+    out->preset = na::j2::PresetFor(na::settings::Get().j2_preset.load(), p.w, base.out_w);
+    out->view_id = kFoldViewId + static_cast<uint64_t>(m);
+    out->bias_current_color = nullptr;
+}
+void fold_done(ID3D12GraphicsCommandList* l, na::fold::Mode m)
+{
+    auto& p = g_fold.planes[static_cast<uint32_t>(m)];
+    std::vector<D3D12_RESOURCE_BARRIER> b;
+    for (ID3D12Resource* r : {p.color.Get(), p.depth.Get(), p.motion.Get()})
+        add(b, r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    flush(l, b);
+}
+na::fold::Mode fold_frame_mode() { return g_fold.frame_mode; }
+void fold_why(const char* text)
+{
+    std::lock_guard<std::mutex> lk(g_fold.why_m);
+    if (std::strncmp(g_fold.why, text ? text : "", sizeof g_fold.why - 1) == 0) return;
+    std::snprintf(g_fold.why, sizeof g_fold.why, "%s", text ? text : "");
+    if (text && *text) na::eventlog::Emit("fold", "cannot fold: %s", text);
+}
+// Frame start: the mode this frame's scene draws are drawn for. Coarse shading, the larger jitter
+// and the sharper texture bias are asked for only while folded frames are really being delivered,
+// so a stopped or switched-off DLAA never leaves the game's own picture drawn in blocks.
+void fold_advance(bool running)
+{
+    if (!g_fold.vrs_checked && g.device) {
+        g_fold.vrs_checked = true;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6{};
+        g_fold.vrs_ok = SUCCEEDED(g.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof o6)) &&
+                        o6.VariableShadingRateTier != D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+        g_fold.st_vrs.store(g_fold.vrs_ok ? 1u : 0u);
+        na::eventlog::Emit("fold", "coarse shading %s on this graphics card (tier %d)", g_fold.vrs_ok ? "is available" : "is NOT available: folded modes will run without the shading saving",
+                           static_cast<int>(o6.VariableShadingRateTier));
+    }
+    const na::fold::Mode m = running && !g.paused.load() ? g_fold.hand.shown : na::fold::Mode::Off;
+    g_fold.frame_mode = m;
+    const uint32_t rate = g_fold.vrs_ok ? na::fold::ShadingRateFor(m) : 0u;
+    if (rate != g_fold.rate_set) {
+        na::observe::SetSceneCoarseShading(rate);
+        g_fold.rate_set = rate;
+        g_fold.rate_frame = g.frame;
+    }
+    // NVIDIA's texture bias is log2(render / display) - 1; a block-shaded scene picks its textures as
+    // a half-size render does, so it needs one step more than DLAA.
+    const int extra = m != na::fold::Mode::Off ? -1 : 0;
+    if (extra != g_fold.mip_extra) {
+        g_fold.mip_extra = extra;
+        if (!g.paused.load() && na::observe::GetMipLiveStats().enabled)
+            na::observe::SetSamplerMipBiasLive(na::settings::DlaaMipBias(na::settings::Get()) + static_cast<float>(extra));
+    }
+}
 // Retained for the standalone NIS test helper; the live slider uses RCAS only.
 bool rcas_record(ID3D12GraphicsCommandList* l, uint32_t percent, DXGI_FORMAT fmt)
 {
@@ -2595,7 +2813,8 @@ uint32_t jitter_phases()
 {
     // Render-small: the output is the window, known once PresentUpscale has run.
     if (g_render_small.load(std::memory_order_relaxed) && g.rw && g.stats.small_ow) return JitterPhasesFor(g.rw, g.stats.small_ow);
-    return g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kDlaaJitterPhases;
+    const uint32_t phases = g.ow && g.rw ? JitterPhasesFor(g.rw, g.ow) : kDlaaJitterPhases;
+    return fold_frame_mode() != na::fold::Mode::Off ? na::fold::JitterPhases(fold_frame_mode(), phases) : phases;
 }
 // VARIANT: camera/optional
 // [j2] camera: 1 = a found scene camera is used and a frame without one is no longer left alone,
@@ -2809,6 +3028,7 @@ void update_draw_replay()
 void vpj_advance()
 {
     const bool running = g.submitted_frame && g.frame <= g.submitted_frame + 2;
+    fold_advance(running && g.w);
     if (!vpj_mode() || !g.jitter_on || !running || !g.w) {
         na::observe::SetStillMeshJitter(false);
         na::observe::SetSceneViewportJitter(0, 0.f, 0.f);
@@ -2839,8 +3059,13 @@ void vpj_advance()
     }
     na::observe::SetStillMeshJitter(still_meshes);
     auto& e = g.vpj[g.frame % 8];
-    e = {g.frame, static_cast<float>(js.x_pixels) * (amount * .01f),
-                  static_cast<float>(js.y_pixels) * (amount * .01f), amount};
+    // A folded scene's sample covers a whole block, not one pixel (core/fold_shading.hpp).
+    const auto fold_block = na::fold::BlockFor(g_fold.frame_mode);
+    e = {g.frame, static_cast<float>(js.x_pixels) * (amount * .01f) * static_cast<float>(fold_block.x),
+                  static_cast<float>(js.y_pixels) * (amount * .01f) * static_cast<float>(fold_block.y), amount};
+    // Exactly what the draws will carry, so the request and the drawn sample compare equal.
+    e.x = std::round(e.x * na::observe::kSceneViewportJitterUnits) / na::observe::kSceneViewportJitterUnits;
+    e.y = std::round(e.y * na::observe::kSceneViewportJitterUnits) / na::observe::kSceneViewportJitterUnits;
     na::observe::SetSceneViewportJitter(g.frame, e.x, e.y);
     ++g.stats.vpj_frames;
 }
@@ -3034,7 +3259,12 @@ bool begin_jitter(uint64_t res, uint64_t off, const std::vector<uint8_t>& in_byt
         }
         remember_main_camera(m);
         const uint32_t phases = windowed ? JitterPhasesFor(jw, g.win.w) : jitter_phases();
-        const neural_alias::JitterSample js = jitter_sample(++g.jit.phase, phases);
+        neural_alias::JitterSample js = jitter_sample(++g.jit.phase, phases);
+        if (!windowed) { // a folded scene's sample covers a whole block (core/fold_shading.hpp)
+            const auto fold_block = na::fold::BlockFor(g_fold.frame_mode);
+            js.x_pixels *= fold_block.x;
+            js.y_pixels *= fold_block.y;
+        }
         std::array<double, 16> src{};
         for (int i = 0; i < 16; ++i) src[i] = m[i];
         const auto jm = neural_alias::jitter_projection(src, js, jw, jh);
@@ -5159,9 +5389,83 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if ((smear == 4) != preset_test) { preset_test = smear == 4; na::dlss::ReleaseView(kViewId); e.reset = true; }
         if (smear == 4) e.preset = 12; // NVSDK_NGX_DLSS_Hint_Render_Preset_L
     }
+    // Fold the shading (core/fold_shading.hpp). The mode on screen keeps running; a newly asked mode is
+    // run beside it into a picture nobody sees until it has proven itself (Handover).
+    ID3D12Resource* const full_color = e.color; // full size: what a measured cut shows (RecordCutShow)
+    na::fold::Mode fold_shown = na::fold::Mode::Off;
+    {
+        using na::fold::Mode;
+        const Mode asked = na::fold::ModeFrom(na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
+        const char* why = nullptr;
+        if (asked != Mode::Off || g_fold.hand.shown != Mode::Off) {
+            const DXGI_FORMAT in_format = e.color->GetDesc().Format;
+            if (rw != w || rh != h || ow != w || oh != h) why = "the picture is not at full size on this path";
+            else if (color_msaa) why = "the scene is multisampled (switch the game's anti-aliasing off)";
+            else if (smear) why = "a smear test is running";
+            else if (!fold_init()) why = "the fold pass could not be prepared on this graphics card";
+            else for (const Mode m : {asked, g_fold.hand.shown})
+                if (m != Mode::Off && !why && !fold_targets(m, rw, rh, in_format, ow, oh, cf)) why = "the folded working textures could not be made for this colour format";
+        }
+        fold_why(why);
+        if (why) ++g_fold.unable_frames;
+        const auto step = g_fold.hand.Begin(asked, !why);
+        // This frame's scene was drawn in blocks only if that was asked for before its draws were recorded.
+        const bool coarse = g_fold.rate_set != 0 && g.frame > g_fold.rate_frame;
+        if (step.warm != Mode::Off) {
+            na::dlss::EvalDesc we{};
+            fold_record(l, e, step.warm, coarse, g.frame, g.slot, 3, &we);
+            we.output = g_fold.unseen.Get();
+            we.reset = e.reset || step.warm_reset;
+            const bool ok = na::dlss::Evaluate(l, we);
+            fold_done(l, step.warm);
+            g_fold.hand.WarmResult(ok);
+            ++g_fold.warm_frames;
+            if (!ok) {
+                ++g_fold.warm_failed;
+                fold_why("DLSS did not accept the folded picture while it was being readied");
+            }
+            if (g_fold.hand.refused == step.warm)
+                na::eventlog::Emit("fold", "REFUSED %s after %u failed warm-up frames: DLSS did not accept the folded picture (%ux%u from %ux%u). The screen stays on %s.",
+                                   na::fold::Name(step.warm), na::fold::Handover::kGiveUp, we.render_w, we.render_h, rw, rh, na::fold::Name(g_fold.hand.shown));
+        }
+        if (step.show_reset) e.reset = true;
+        if (step.show != Mode::Off) {
+            na::dlss::EvalDesc fe{};
+            fold_record(l, e, step.show, coarse, g.frame, g.slot, 0, &fe);
+            e = fe;
+            fold_shown = step.show;
+            ++(coarse ? g_fold.coarse_frames : g_fold.fine_frames);
+        }
+        ++g_fold.shown_frames[static_cast<uint32_t>(step.show)];
+        const auto cs = na::observe::GetCoarseShadingStats();
+        if (step.switched)
+            na::eventlog::Emit("fold", "SWITCHED to %s at frame %llu: DLSS input %ux%u -> output %ux%u, coarse shading %s, history %s. asked=%s switches=%llu refusals=%llu",
+                               na::fold::Name(step.show), static_cast<unsigned long long>(g.frame), e.render_w, e.render_h, e.out_w, e.out_h,
+                               g_fold.vrs_ok ? "available" : "NOT available", step.show_reset ? "restarted" : "already warm",
+                               na::fold::Name(asked), static_cast<unsigned long long>(g_fold.hand.switches), static_cast<unsigned long long>(g_fold.hand.refusals));
+        if ((asked != Mode::Off || step.show != Mode::Off) && g.frame % 600 == 0)
+            na::eventlog::Emit("fold", "asked=%s shown=%s warming=%s good=%u | frames dlaa=%llu quality=%llu performance=%llu warm=%llu warm_failed=%llu drawn_in_blocks=%llu drawn_per_pixel=%llu unable=%llu | "
+                               "coarse rate=%u draws=%llu sets=%llu restores=%llu no_interface=%llu | jitter phases=%u declared=%.4f,%.4f input=%ux%u",
+                               na::fold::Name(asked), na::fold::Name(step.show), na::fold::Name(g_fold.hand.warming), g_fold.hand.good,
+                               static_cast<unsigned long long>(g_fold.shown_frames[0]), static_cast<unsigned long long>(g_fold.shown_frames[1]),
+                               static_cast<unsigned long long>(g_fold.shown_frames[2]), static_cast<unsigned long long>(g_fold.warm_frames),
+                               static_cast<unsigned long long>(g_fold.warm_failed), static_cast<unsigned long long>(g_fold.coarse_frames),
+                               static_cast<unsigned long long>(g_fold.fine_frames), static_cast<unsigned long long>(g_fold.unable_frames),
+                               cs.rate, static_cast<unsigned long long>(cs.draws), static_cast<unsigned long long>(cs.sets),
+                               static_cast<unsigned long long>(cs.restores), static_cast<unsigned long long>(cs.unavailable),
+                               jitter_phases(), e.jitter_x, e.jitter_y, e.render_w, e.render_h);
+        g_fold.st_asked.store(static_cast<uint32_t>(asked), std::memory_order_relaxed);
+        g_fold.st_shown.store(static_cast<uint32_t>(step.show), std::memory_order_relaxed);
+        g_fold.st_warming.store(static_cast<uint32_t>(g_fold.hand.warming), std::memory_order_relaxed);
+        g_fold.st_good.store(g_fold.hand.good, std::memory_order_relaxed);
+        g_fold.st_refused.store(static_cast<uint32_t>(g_fold.hand.refused), std::memory_order_relaxed);
+        g_fold.st_w.store(e.render_w, std::memory_order_relaxed);
+        g_fold.st_h.store(e.render_h, std::memory_order_relaxed);
+    }
     if (t_ic) t_ic->mark(kIcEvaluate);
     pending.reset = e.reset;
     const bool evaluated = na::dlss::Evaluate(l, e);
+    if (fold_shown != na::fold::Mode::Off) fold_done(l, fold_shown);
     if (evaluated) pending.jitter_history = jitter_history;
     const bool capture_armed = evaluated && na::capture::j2::Armed();
     if (evaluated && !capture_armed && g_debug_view.load(std::memory_order_relaxed) == 0 &&
@@ -5178,7 +5482,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (requested.frame == g.frame && viewport_sample_known && !debug_jitter.value &&
             tool == referee::RecoveryTool::None)
             id.referee_jitter_amount = referee::VerifiedJitterAmount(requested.amount, requested.x, requested.y,
-                                                                    e.jitter_x, e.jitter_y);
+                                                                    declared.x, declared.y); // full-size pixels (e's are folded ones in a folded mode)
         id.mv_scale_x = e.mv_scale_x;
         id.mv_scale_y = e.mv_scale_y;
         id.reset = e.reset ? 1u : 0u;
@@ -5211,7 +5515,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     if (measured && evaluated && pending.compute_flow.pair) {
         b.push_back(uav_barrier(g.output.Get()));
         flush(l, b);
-        na::j2::compute_flow::RecordCutShow(l, pending.compute_flow, e.color, g.output.Get());
+        na::j2::compute_flow::RecordCutShow(l, pending.compute_flow, full_color, g.output.Get());
     }
     if (t_ic) t_ic->mark(kIcFinish);
     if (!evaluated) ++g.stats.dlss_failed;
@@ -5250,10 +5554,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         ci.width = w;
         ci.height = h;
         ci.color_format = static_cast<uint32_t>(cf);
-        ci.jitter_x = e.jitter_x;
-        ci.jitter_y = e.jitter_y;
-        ci.mv_scale_x = e.mv_scale_x;
-        ci.mv_scale_y = e.mv_scale_y;
+        // The saved planes are the full-size ones, so their jitter and motion scale are the full-size
+        // values (in a folded mode DLSS got the folded ones; the "fold" log lines say which).
+        ci.jitter_x = declared.x;
+        ci.jitter_y = declared.y;
+        ci.mv_scale_x = fold_shown != na::fold::Mode::Off ? 1.f : e.mv_scale_x;
+        ci.mv_scale_y = fold_shown != na::fold::Mode::Off ? 1.f : e.mv_scale_y;
         ci.reset = e.reset ? 1u : 0u;
         ci.camera_cut = cam.camera_cut ? 1u : 0u;
         ci.preset = static_cast<uint32_t>(e.preset);
@@ -6545,6 +6851,8 @@ public:
             if(touched){
                 // Appended, never replaced: the prepared tables' resources stay owned too.
                 for(const auto& r:{c->source,c->guide,c->target,g.color_in,g.depth32,g.motion,g.output,g.sharp,g.provenance,g.jshift})if(r)owned->push_back(r);
+                for(const auto& fp:g_fold.planes)for(const auto& r:{fp.color,fp.depth,fp.motion})if(r)owned->push_back(r);
+                if(g_fold.unseen)owned->push_back(g_fold.unseen);
                 if(op)owned->push_back(full_.tex); // Sol 697b223: the private image lives as long as the recording
                 if(c->late_input && g.slots[slot].late_input_buffer.resource)owned->push_back(g.slots[slot].late_input_buffer.resource);
                 g.slots[slot].native_scale_use=lease;
@@ -9737,6 +10045,28 @@ int FormatInlineCost(char* out, size_t n)
         t[kIcRecord] * us, t[kIcCamera] * us, t[kIcEvaluate] * us, t[kIcAfter] * us, t[kIcSetup]*us, t[kIcCopies]*us, t[kIcFlow]*us, t[kIcTextures]*us, t[kIcGameMotion]*us, t[kIcMotion]*us, t[kIcAO]*us, t[kIcFinish]*us, double(mx) * us);
 }
 
+void FoldStatus(char* out, size_t n)
+{
+    if (!out || !n) return;
+    using na::fold::Mode;
+    const Mode asked = na::fold::ModeFrom(g_fold.st_asked.load()), shown = na::fold::ModeFrom(g_fold.st_shown.load());
+    const Mode warming = na::fold::ModeFrom(g_fold.st_warming.load()), refused = na::fold::ModeFrom(g_fold.st_refused.load());
+    char why[160] = {};
+    { std::lock_guard<std::mutex> lk(g_fold.why_m); std::snprintf(why, sizeof why, "%s", g_fold.why); }
+    const bool vrs = g_fold.st_vrs.load() != 0;
+    if (refused != Mode::Off && refused == asked)
+        std::snprintf(out, n, "%s could not start, so %s stays on screen. Reason: %s.", na::fold::Name(refused), na::fold::Name(shown), *why ? why : "DLSS did not accept the folded picture");
+    else if (asked != shown && *why)
+        std::snprintf(out, n, "%s stays on screen: %s.", na::fold::Name(shown), why);
+    else if (warming != Mode::Off)
+        std::snprintf(out, n, "Getting %s ready (%u of %u good frames). %s stays on screen until it is.", na::fold::Name(warming), g_fold.st_good.load(),
+                      na::fold::Handover::kWarmFrames, na::fold::Name(shown));
+    else if (shown == Mode::Off)
+        std::snprintf(out, n, "On screen: DLAA (full size).");
+    else
+        std::snprintf(out, n, "On screen: %s. DLSS gets %ux%u and rebuilds the full picture. Coarse shading: %s.", na::fold::Name(shown), g_fold.st_w.load(), g_fold.st_h.load(),
+                      vrs ? "on" : "not available on this card (no speed gain from shading)");
+}
 Stats GetStats()
 {
     std::lock_guard<std::mutex> lock(g.m);
@@ -9782,6 +10112,10 @@ void Shutdown()
     g_dbg = DebugPass{};
     g_rcas = RcasPass{};
     g_jshift = JitterShift{}; // released here, not in static destruction after D3D12 has gone
+    na::observe::SetSceneCoarseShading(0);
+    for (auto& fp : g_fold.planes) fp = FoldPlanes{};
+    g_fold.unseen.Reset(); g_fold.root.Reset(); g_fold.pso.Reset(); g_fold.heap.Reset();
+    g_fold.tried = g_fold.ok = false; g_fold.hand = na::fold::Handover{}; g_fold.frame_mode = na::fold::Mode::Off; g_fold.rate_set = 0;
     g_small.jshift.Reset();
     g.arbiter_ok = false;
     g.tracker.Reset();
