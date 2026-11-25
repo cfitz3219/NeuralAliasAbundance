@@ -28,6 +28,7 @@
 #include "host_dx12/j2/jitter_writes.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
+#include "host_dx12/ngx_observe/gpu_timing.hpp"
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
@@ -5609,7 +5610,12 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     }
     if (t_ic) t_ic->mark(kIcEvaluate);
     bool history_reset = false;
+    // DLSS's own GPU time in the status line (dlss_gpu_ms; it read 0.00 on this path, so a slow stretch could
+    // not be put on DLSS or cleared of it). Only on the game's own list: the timer learns of the submission
+    // from the game's ExecuteCommandLists.
+    if (inl) na::gputime::Begin(l);
     const bool evaluated = na::dlss::Evaluate(l, e, &history_reset);
+    if (inl) na::gputime::End(l);
     if (evaluated) e.reset = history_reset;
     pending.reset = e.reset;
     {   // Cort saw a flash of colour bars at a switch to Performance (f98ae48c) and the log held nothing

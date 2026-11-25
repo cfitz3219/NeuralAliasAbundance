@@ -4,6 +4,7 @@
 #include <tlhelp32.h>
 #include <pdh.h>
 #include <pdhmsg.h>
+#include <dxgi1_4.h>
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #pragma comment(lib, "pdh.lib")
+#pragma comment(lib, "dxgi.lib")
 
 namespace na::usage {
 namespace {
@@ -31,6 +33,13 @@ struct Snapshot {
     double gpu3d_all = 0, gpu3d_ours = 0, gpu_compute_all = 0, gpu_copy_all = 0;
     unsigned logical = 0, threads = 0;
     TopThread top[4];
+    // Video memory (2026-11-25: a 35 s drop to a third of the frame rate with the GPU busy and nothing
+    // else in the log; a full card does that and nothing recorded it). MB. The card's own memory in use
+    // by everything and by this process, the system memory standing in for it, and the amount Windows
+    // currently lets this process use on the card: use above budget, or shared use rising, is the sign.
+    bool vram_ok = false, budget_ok = false;
+    double vram_all = 0, vram_shared_all = 0, vram_ours = 0, vram_shared_ours = 0;
+    double vram_card = 0, vram_budget = 0, vram_dxgi_ours = 0;
 };
 
 std::mutex g_m;                     // leaked with the process: the sampler never stops
@@ -86,11 +95,39 @@ DWORD WINAPI sampler(void*)
 
     PDH_HQUERY q = nullptr;
     PDH_HCOUNTER cpu = nullptr, gpu = nullptr;
+    PDH_HCOUNTER mem[4] = {}; // adapter dedicated, adapter shared, process dedicated, process shared
     if (PdhOpenQueryW(nullptr, 0, &q) == ERROR_SUCCESS) {
         if (PdhAddEnglishCounterW(q, L"\\Processor Information(_Total)\\% Processor Utility", 0, &cpu) != ERROR_SUCCESS)
             if (PdhAddEnglishCounterW(q, L"\\Processor(_Total)\\% Processor Time", 0, &cpu) != ERROR_SUCCESS) cpu = nullptr;
         if (PdhAddEnglishCounterW(q, L"\\GPU Engine(*)\\Utilization Percentage", 0, &gpu) != ERROR_SUCCESS) gpu = nullptr;
+        static const wchar_t* const kMem[4] = {L"\\GPU Adapter Memory(*)\\Dedicated Usage", L"\\GPU Adapter Memory(*)\\Shared Usage",
+                                               L"\\GPU Process Memory(*)\\Dedicated Usage", L"\\GPU Process Memory(*)\\Shared Usage"};
+        for (int i = 0; i < 4; ++i)
+            if (PdhAddEnglishCounterW(q, kMem[i], 0, &mem[i]) != ERROR_SUCCESS) mem[i] = nullptr;
         PdhCollectQueryData(q);
+    }
+    // The card with the most memory of its own: its size, and this process's budget on it.
+    IDXGIAdapter3* card = nullptr;
+    double card_mb = 0;
+    {
+        IDXGIFactory1* factory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
+            IDXGIAdapter1* a = nullptr;
+            for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
+                DXGI_ADAPTER_DESC1 d{};
+                if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && double(d.DedicatedVideoMemory) / 1048576.0 > card_mb) {
+                    IDXGIAdapter3* a3 = nullptr;
+                    if (SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&a3))) && a3) {
+                        if (card) card->Release();
+                        card = a3;
+                        card_mb = double(d.DedicatedVideoMemory) / 1048576.0;
+                    }
+                }
+                a->Release();
+                a = nullptr;
+            }
+            factory->Release();
+        }
     }
     wchar_t ours[32];
     swprintf(ours, 32, L"pid_%lu_", static_cast<unsigned long>(pid));
@@ -180,6 +217,35 @@ DWORD WINAPI sampler(void*)
                 }
             }
         }
+        if (q) {
+            double* const all_out[2] = {&s.vram_all, &s.vram_shared_all};
+            double* const ours_out[2] = {&s.vram_ours, &s.vram_shared_ours};
+            for (int m = 0; m < 4; ++m) {
+                DWORD bytes = 0, count = 0;
+                if (!mem[m] || PdhGetFormattedCounterArrayW(mem[m], PDH_FMT_DOUBLE, &bytes, &count, nullptr) != PDH_MORE_DATA || !bytes) continue;
+                buf.resize(bytes);
+                auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
+                if (PdhGetFormattedCounterArrayW(mem[m], PDH_FMT_DOUBLE, &bytes, &count, items) != ERROR_SUCCESS) continue;
+                s.vram_ok = true;
+                double sum = 0, largest = 0;
+                for (DWORD i = 0; i < count; ++i) {
+                    if (items[i].FmtValue.CStatus != ERROR_SUCCESS || !items[i].szName) continue;
+                    const double mb = items[i].FmtValue.doubleValue / 1048576.0;
+                    if (m < 2) largest = (std::max)(largest, mb); // one row per adapter: the busiest card
+                    else if (std::wcsstr(items[i].szName, ours)) sum += mb;
+                }
+                if (m < 2) *all_out[m] = largest; else *ours_out[m - 2] = sum;
+            }
+        }
+        if (card) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+            if (SUCCEEDED(card->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+                s.budget_ok = true;
+                s.vram_card = card_mb;
+                s.vram_budget = double(info.Budget) / 1048576.0;
+                s.vram_dxgi_ours = double(info.CurrentUsage) / 1048576.0;
+            }
+        }
         if (first) { first = false; continue; } // thread deltas need two samples
         s.valid = true;
         std::lock_guard<std::mutex> lock(g_m);
@@ -220,9 +286,15 @@ int FormatLine(char* out, std::size_t size)
     }
     return std::snprintf(out, size,
         "usage cpu_ok=%d cpu_total=%.1f%% proc_cores=%.2f proc_pct=%.1f%% logical=%u threads=%u top_threads=%s "
-        "gpu_ok=%d gpu3d_all=%.1f%% gpu3d_ours=%.1f%% gpu_compute_all=%.1f%% gpu_copy_all=%.1f%%\r\n",
+        "gpu_ok=%d gpu3d_all=%.1f%% gpu3d_ours=%.1f%% gpu_compute_all=%.1f%% gpu_copy_all=%.1f%% | "
+        "video_memory ok=%d card_mb=%.0f in_use_all_mb=%.0f in_use_process_mb=%.0f shared_all_mb=%.0f shared_process_mb=%.0f "
+        "budget_ok=%d budget_mb=%.0f process_against_budget_mb=%.0f state=%s\r\n",
         s.cpu_ok ? 1 : 0, s.cpu_total, s.proc_cores, s.proc_pct, s.logical, s.threads, top[0] ? top : "-",
-        s.gpu_ok ? 1 : 0, s.gpu3d_all, s.gpu3d_ours, s.gpu_compute_all, s.gpu_copy_all);
+        s.gpu_ok ? 1 : 0, s.gpu3d_all, s.gpu3d_ours, s.gpu_compute_all, s.gpu_copy_all,
+        s.vram_ok ? 1 : 0, s.vram_card, s.vram_all, s.vram_ours, s.vram_shared_all, s.vram_shared_ours,
+        s.budget_ok ? 1 : 0, s.vram_budget, s.vram_dxgi_ours,
+        !s.budget_ok ? "unknown" : s.vram_dxgi_ours > s.vram_budget ? "OVER_BUDGET: the card is full, pictures are being moved to system memory"
+        : s.vram_dxgi_ours > 0.92 * s.vram_budget ? "near_budget" : "within_budget");
 }
 
 } // namespace na::usage
