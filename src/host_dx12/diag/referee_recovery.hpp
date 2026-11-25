@@ -30,7 +30,10 @@ inline uint64_t EvaluationConfiguration(uint32_t preset, uint32_t cf, uint32_t d
         set.xegtao_final_power.load(), set.xegtao_depth_mip_offset.load(), set.xegtao_temporal.load(),
         set.donut_tone.load(), set.donut_bloom.load(), set.donut_curve.load(), set.donut_amount.load(),
         set.donut_bias.load(), set.donut_white.load(), set.donut_speed_up.load(), set.donut_speed_down.load(),
-        set.donut_bloom_amount.load(), set.donut_bloom_sigma.load(), set.donut_bloom_threshold.load()
+        set.donut_bloom_amount.load(), set.donut_bloom_sigma.load(), set.donut_bloom_threshold.load(),
+        // NA1: the master switch only. The strengths it runs at are moved by its governor every
+        // few frames; hashing them would make every trial look like a changed configuration.
+        uint32_t(set.na1_enabled.load())
     };
     uint64_t hash = 14695981039346656037ull;
     for (const auto value : configuration) hash = (hash ^ value) * 1099511628211ull;

@@ -93,6 +93,10 @@ struct Settings {
     std::atomic<uint32_t> xegtao_denoise{1}, xegtao_radius_multiplier{1457}, xegtao_falloff{615}, xegtao_sample_distribution{2000};
     std::atomic<uint32_t> xegtao_thin_occluder{0}, xegtao_final_power{2200}, xegtao_depth_mip_offset{3300};
     std::atomic<uint32_t> xegtao_temporal{850}; // x1000: share of earlier frames kept (0 = off); stops edge shimmer while panning
+    // NA1 enhancer master switch; [na1] enabled, remembered per game, live. Off = the program is
+    // exactly as before. It is the only NA1 setting a person sets: the Referee governs the strengths
+    // while playing and they are never saved (docs/NA1-ENHANCER.md).
+    std::atomic<bool> na1_enabled{false};
     std::atomic<uint32_t> nr_intensity{100};
     std::atomic<uint32_t> j2_sharpness{RcasSliderFromLegacy(50)}; // menu 0..100 = shader strength 0..150
     std::atomic<uint32_t> j2_debug_jitter{0}; // session only, normal declaration at launch

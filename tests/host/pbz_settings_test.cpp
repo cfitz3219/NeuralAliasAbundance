@@ -39,6 +39,8 @@ int main() {
     CHECK(s.xegtao_radius_x1000==500&&s.xegtao_radius_multiplier==1457&&s.xegtao_falloff==615);
     CHECK(s.xegtao_sample_distribution==2000&&s.xegtao_thin_occluder==0&&s.xegtao_final_power==2200&&s.xegtao_depth_mip_offset==3300);
     s.xegtao_enabled=1;s.xegtao_radius_x1000=1250;s.xegtao_denoise=3;s.xegtao_falloff=450;
+    // The NA1 enhancer is off until someone turns it on, and the choice survives save and load.
+    CHECK(!s.na1_enabled);s.na1_enabled=true;
     CHECK(s.dlss_mode==4 && s.fg_preset==3 && s.fg_profile_override==1);
     CHECK(s.follow_game_resolution==1);
     CHECK(wcsstr(na::settings::UserIniPath(),scope)!=nullptr);
@@ -49,6 +51,8 @@ int main() {
     CHECK(s.follow_game_resolution==1);
     CHECK(s.fg_preset==3 && s.dlss_mode==4);
     CHECK(s.xegtao_enabled==1&&s.xegtao_radius_x1000==1250&&s.xegtao_denoise==3&&s.xegtao_falloff==450);
+    CHECK(s.na1_enabled && GetPrivateProfileIntW(L"na1",L"enabled",0,na::settings::UserIniPath())==1);
+    s.na1_enabled=false;CHECK(na::settings::Save());s.na1_enabled=true;na::settings::Load();CHECK(!s.na1_enabled);
     // Texture mip bias choice: automatic by default, a chosen total survives save and load, and the
     // old mip_bias key chooses nothing.
     CHECK(s.j2_texture_detail_x100==na::settings::kTextureDetailAuto && na::settings::DlaaMipBiasX100(s)==-100);

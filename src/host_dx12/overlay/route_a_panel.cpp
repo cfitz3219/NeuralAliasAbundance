@@ -44,6 +44,9 @@
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/effects/xegtao.hpp"
+#if defined(NA_HAVE_NA1) // the enhancer is only part of builds that could compile its shaders
+#include "host_dx12/effects/na1.hpp"
+#endif
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/fg/preset_profile.hpp"
@@ -1405,6 +1408,7 @@ void DrawDlssDebug()
 static void DrawExperimentalGpu();
 static void DrawDonutLighting();
 static void DrawAmbientOcclusion();
+static void DrawNa1Enhance();
 
 void RegisterLiveDlaaMenu()
 {
@@ -1421,6 +1425,10 @@ void RegisterLiveDlaaMenu()
     };
     if (!registered(&DrawAmbientOcclusion))
         na::menu::Register({"XeGTAO (Ambient Occlusion)", na::menu::Availability::Available, nullptr, &DrawAmbientOcclusion, na::menu::Page::Enhancements});
+    // NA1 works on the picture DLAA produces, so its row belongs to this menu only: the Route A
+    // menu alone (the game's own DLSS) has nothing for the switch to act on in this build.
+    if (!registered(&DrawNa1Enhance))
+        na::menu::Register({"NA1 Enhance", na::menu::Availability::Available, nullptr, &DrawNa1Enhance, na::menu::Page::Enhancements});
     if (!registered(&DrawDonutLighting))
         na::menu::Register({"Lighting", na::menu::Availability::Available, nullptr, &DrawDonutLighting, na::menu::Page::Experimental});
     if (!registered(&DrawExperimentalGpu))
@@ -1519,6 +1527,29 @@ static void DrawAmbientOcclusion()
     if(enabled){const auto status=na::xegtao::ScenePass().GetStats();StatusLine(0,status.reason);}
     else Hint("Off. Settings are remembered; enable XeGTAO to see changes while playing.");
     ImGui::EndPopup();
+}
+
+// NA1 enhancer: one switch, live, saved per game ([na1] enabled). There are no strength controls
+// on purpose: the Referee measures each scene and sets them (docs/NA1-ENHANCER.md).
+static void DrawNa1Enhance()
+{
+    using namespace na::ui;
+    auto& s=na::settings::Get();bool enabled=s.na1_enabled.load();
+    BeginRow("NA1 Enhance", "Brings out texture, light and colour after DLAA. The Referee sets the strength for each scene. Applies live; remembered for this game.", SwitchWidth());
+    if(Switch("na1",&enabled)){s.na1_enabled.store(enabled);na::settings::Save();}
+    EndRow();
+    // One line under the switch says what the enhancer is doing, or why it is not running.
+    // Off needs no line: the switch already says so and nothing runs.
+    if(!enabled)return;
+#if defined(NA_HAVE_NA1)
+    const auto status=na::na1::ScenePass().GetStats();
+    // The reason is written when a DLAA frame reaches the enhancer; before the first one it is empty.
+    ImGui::PushTextWrapPos(0.f);
+    StatusLine(0,status.reason[0]?status.reason:"Waiting for the first DLAA frame.");
+    ImGui::PopTextWrapPos();
+#else
+    StatusLine(2,"NA1 was not included in this build, so the picture is unchanged.");
+#endif
 }
 
 void RegisterRouteAMenu()

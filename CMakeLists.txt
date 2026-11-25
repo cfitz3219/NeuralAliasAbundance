@@ -207,6 +207,7 @@ target_link_libraries(host_nvof PUBLIC abundance_options d3d12 d3dcompiler)
 include(cmake/ffx_flow_shaders.cmake)
 include(cmake/xegtao_shaders.cmake)
 include(cmake/donut_shaders.cmake)
+include(cmake/na1_shaders.cmake)
 include(cmake/nvrhi.cmake)
 add_library(host_ffx_flow STATIC src/host_dx12/ffx_flow/ffx_flow_shaders.cpp src/host_dx12/ffx_flow/ffx_flow.cpp)
 target_link_libraries(host_ffx_flow PUBLIC abundance_options d3d12)
@@ -245,6 +246,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/effects/donut_native.cpp
   src/host_dx12/effects/xegtao.cpp
   src/host_dx12/effects/xegtao_native.cpp
+  src/host_dx12/effects/na1.cpp
   src/host_dx12/j2/projection_window.cpp
   src/host_dx12/j2/j2_flow.cpp
   src/host_dx12/j2/compute_flow.cpp
@@ -291,6 +293,13 @@ if(NA_HAVE_DONUT)
   target_compile_definitions(host_dx12 PUBLIC NA_HAVE_DONUT)
   target_include_directories(host_dx12 PRIVATE "${CMAKE_BINARY_DIR}/generated/donut")
   add_dependencies(host_dx12 donut_shaders)
+endif()
+# NA1 enhancer: FXC headers built before host_dx12 compiles (cmake/na1_shaders.cmake). PUBLIC so the
+# menu and the tests know whether the programs are in this build; without FXC na1.cpp is a stub.
+if(NA_HAVE_NA1)
+  target_compile_definitions(host_dx12 PUBLIC NA_HAVE_NA1)
+  target_include_directories(host_dx12 PRIVATE "${CMAKE_BINARY_DIR}/generated/na1")
+  add_dependencies(host_dx12 na1_shaders)
 endif()
 
 include(cmake/taskflow.cmake)

@@ -1,6 +1,9 @@
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/effects/donut.hpp"
 #include "host_dx12/effects/xegtao.hpp"
+#if defined(NA_HAVE_NA1)
+#include "host_dx12/effects/na1.hpp"
+#endif
 #include "host_dx12/gpu/services.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/host_boot/process_log.hpp"
@@ -883,11 +886,54 @@ void flush_events()
     for (const std::string& e : events) all += e;
     append_status_text(all.data(), static_cast<int>(all.size()));
 }
+#if defined(NA_HAVE_NA1)
+// NA1 enhancer's log events (docs/NA1-ENHANCER.md section 7), the same on the DX12 and the native
+// DX11 route. Run every time the status writer runs, not only every five seconds: the Referee can
+// move a dial several times a second and NA1 keeps only the latest line of each kind.
+void emit_na1_events()
+{
+    na::na1::Pass& pass = na::na1::ScenePass();
+    if (na::settings::Get().na1_enabled.load(std::memory_order_relaxed)) {
+        // Where no added-DLAA frame reaches NA1, nobody else is there to say why it is not running.
+        if (!na::j2::Configured())
+            pass.Unavailable("NA1 is not built for this route yet: it runs only where DLAA is added to the game, so the picture is unchanged.");
+        else if (!na::j2::Enabled() || na::j2::Paused())
+            pass.Unavailable("DLAA is paused or has not started, so NA1 has no picture to work on.");
+    }
+    char text[1024];
+    if (pass.TakeGovernorLine(text, sizeof text)) na::eventlog::Emit("na1_governor", "%s", text);
+    if (pass.TakeCurveLine(text, sizeof text)) na::eventlog::Emit("na1_curve", "%s", text);
+    static std::string last_reason; // one writer thread
+    const na::na1::Stats stats = pass.GetStats();
+    if (last_reason != stats.reason) {
+        last_reason = stats.reason;
+        na::eventlog::Emit("na1", "reason=\"%s\"", stats.reason);
+    }
+}
+// The five-second status block, in the same words on both routes. Nothing while NA1 is off and has
+// never run, as for the other effects on the native DX11 route. Returns the characters written.
+int format_na1_status(char* out, size_t capacity)
+{
+    const na::na1::Stats stats = na::na1::ScenePass().GetStats();
+    const unsigned enabled = na::settings::Get().na1_enabled.load(std::memory_order_relaxed) ? 1u : 0u;
+    if (!enabled && !stats.recorded) return 0;
+    const int count = std::snprintf(out, capacity,
+        "effects na1{enabled=%u recorded=%llu allocations=%llu busy=%llu samples=%llu compiling=%u gpu_ms=%.3f "
+        "texture=%.3f light=%.3f colour=%.3f key=%.3f reason=\"%s\"}\r\n",
+        enabled, static_cast<unsigned long long>(stats.recorded), static_cast<unsigned long long>(stats.allocations),
+        static_cast<unsigned long long>(stats.busy), static_cast<unsigned long long>(stats.samples), stats.compiling ? 1u : 0u,
+        double(stats.gpu_ms), double(stats.texture), double(stats.light), double(stats.colour), double(stats.key), stats.reason);
+    return count > 0 ? (std::min)(count, int(capacity) - 1) : 0;
+}
+#endif
 void write_status_line()
 {
     na::settings::PollHiddenSettings(); // hidden ini keys stay live (at most one check a second)
     if (!g_status_log[0]) return;
     ULONGLONG now = GetTickCount64();
+#if defined(NA_HAVE_NA1)
+    emit_na1_events(); // before the flush below, so its lines are written on this same pass
+#endif
     flush_events(); // timed transitions, written as soon as the discovery thread runs
     if (now - g_status_last_tick < 5000) return;
     const bool have_interval = g_status_last_tick != 0;
@@ -920,6 +966,13 @@ void write_status_line()
                 enabled, static_cast<unsigned long long>(ambient.recorded), ambient.compiling ? 1u : 0u, ambient.reason);
             if (count > 0) append_status_text(fx, (std::min)(count, int(sizeof fx) - 1));
         }
+#if defined(NA_HAVE_NA1)
+        {
+            char na1_line[512];
+            const int na1_bytes = format_na1_status(na1_line, sizeof na1_line);
+            if (na1_bytes > 0) append_status_text(na1_line, na1_bytes);
+        }
+#endif
         return;
     }
     {
@@ -984,6 +1037,13 @@ void write_status_line()
             (unsigned long long)gs.collections, (unsigned long long)gs.errors, (unsigned long long)gs.dispatches,
             (unsigned long long)gs.bindings, (unsigned long long)gs.retained);
         if (fn > 0) WriteFile(f, fx, DWORD((std::min)(fn, int(sizeof fx) - 1)), &written, nullptr);
+#if defined(NA_HAVE_NA1)
+        {
+            char na1_line[512];
+            const int na1_bytes = format_na1_status(na1_line, sizeof na1_line);
+            if (na1_bytes > 0) WriteFile(f, na1_line, DWORD(na1_bytes), &written, nullptr);
+        }
+#endif
         static std::string last_x, last_b;
         static uint64_t last_errors = 0;
         if (last_x != xs.reason) { last_x = xs.reason; na::eventlog::Emit("xegtao", "reason=\"%s\"", xs.reason); }

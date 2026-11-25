@@ -20,6 +20,9 @@ The 5 s status samples stay. These additions sit next to them in the same per-pr
 | `swapchain` | every swap chain change | size, format, buffers, swap effect, flags, windowed, client size, refresh |
 | `identity` | first frame | API, exe, pid, ms from process start to first frame, adapter, vendor/device id, VRAM |
 | `xegtao`, `bloom`, `gpu_services` | reason text or error count changes | reason / errors |
+| `na1` | NA1's reason text changes | why NA1 is or is not running |
+| `na1_governor` | the Referee changed an NA1 dial, state or reason | dials, numbers before and after, scene feel, each dial's why, GPU ms |
+| `na1_curve` | the screen-brightness curve changed kind | fitted, display-referred or assumed, and why |
 | `camera_cut` | the camera history is reset | why (no_history/gap/translation/rotation/fov/origin/restart_*), value, held, from_j1; `fov` = a zoom such as a scope |
 | `virtual_screen` | the screen the game is told about changes (scale, monitor or window origin); every game move/resize of its own window; every ResizeTarget mapped back | game and physical size, scale, monitor real->virtual, origin, primary, device; `window_pos game=... physical=... clamped=`; `resize_target game= physical=` |
 | `swapchain set_fullscreen` | the game (or anyone) switches DXGI fullscreen | want, target, hr, state after, caller game/other, advertised size |
@@ -36,6 +39,7 @@ The 5 s status samples stay. These additions sit next to them in the same per-pr
 
 - `event_log frame= total= dropped=` every 5 s (dropped > 0 means the queue overflowed).
 - `effects xegtao{...} bloom{...} gpu_services{...}` every 5 s.
+- `effects na1{...}` every 5 s while NA1 is on or has run.
 - `af_auto` line every interval: the automatic anisotropic filtering detector's mode, decision, action and counts (same fields as the `af` decision event), followed by the `anisotropic` line (level and action in use, samplers changed). Hidden setting `[j2] anisotropic_filter`: -1 automatic (default), 0 the game's own, 16 forced; an ini edit applies live within a second (`setting af_mode=...`).
 - `sampler_table` and `sampler_row` lines, at most once a minute and only when the game created new samplers. Each distinct sampler is listed (heap, heap2, root-signature static) with filter, anisotropy, address modes, bias, LOD range, comparison and count.
 - `virtual_screen on= scale= monitor=WxH->WxH primary= rewrites{monitor display_modes metrics outputs output_modes window_moves clamped display_change resize_target}` every 5 s in render-small: how many of the game's screen-size answers were scaled (one mechanism for windowed, borderless and fullscreen).
