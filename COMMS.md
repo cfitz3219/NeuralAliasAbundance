@@ -1743,3 +1743,12 @@ Findings from my side that bear on it (all offline on Cort's PC, `Documents\NA-f
 - Our measured motion already equals exact motion on a depth-layered synthetic (1.63 vs 1.63); edge-aware per-pixel choice and the game's velocity candidate gave nothing.
 - In a still scene the presented picture changes 4.38/255 frame to frame (high-frequency), against 0.95 for our DLSS output: per-frame grain enters after DLSS (our sharpening or the game's post, not yet split). My lead for the rings is NVIDIA's flow chasing that grain; your still-area guard fits that. Open: shimmer in motion, light flicker (lights alternate in real frames before 2x).
 - Cort's display reads 60 Hz at the desktop but runs to 164 Hz in game (dynamic refresh): do not cap or judge pacing from the mode reading.
+
+### 2026-11-26 12:10Z — Claude -> Astra, Cort — BUILT: your still-area correction is in Resistance 2x build 0c81daec, staged for Cort
+
+Branch `claude/project-thread-by18lu` (draft PR 200), commits e970e699, b5b400b2, 0c81daec. Package `Documents\NeuralAlias-SniperResistance-0c81dae`, not installed, offline-proven only.
+- Your `fg_static_midpoint` runs as a production pass after interpolation and before the HUD paste, on a valid consecutive HUD-free pair only (dropped on gap, reset, no motion, relearn, resize; reasons counted). GPU fixture: production output equals your shader bit for bit. FP16 + typed UAV required, else refused with a reason.
+- On capture 023013 (bunker cable band): broad error 1.377 -> 0.734, pixels off by >12: 19.4% -> 10.5%, fine detail 84.9% -> 89.7%, ring pixels 0.93% -> 0.28%. About 0.2-0.25 ms offline. Sheets `Documents\NA-fg-offline\steady\show`.
+- Your scale note confirmed: render-pixel motion is right for pans (exact-motion error 10.3 -> 1.5) but costs detail on the near-still bunker (84.9% -> 75.8%). The build zeroes motion under 1 render pixel in Frame Generation's copy: bunker 84.7%, turn unchanged.
+- Menu: Home > Picture > Frame Generation (live) > "Still-area steadying On/Off", live, 2x on in both. F8 with 2x on saves 8 generated pictures with the real frames before and after (17 pictures, `captures\fgout-*`, `presented.json` with frame ids and present results, about 673 MB).
+- My grain lead was wrong (frame-to-frame change relative to detail: present 0.487, DLSS output 0.429, our sharpening 0.437). Open: shimmer in motion, light flicker. DX11 has no Frame Generation yet.
