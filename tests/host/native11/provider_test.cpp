@@ -37,6 +37,9 @@
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/overlay/overlay.hpp"
+#include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/fg/frame_gen.hpp"
+#include "core/live_frame_gen.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/native11/texture_loader.hpp"
@@ -197,6 +200,8 @@ struct Game {
     UINT screen_extra_width = 0;
     bool padded_hdr = false;
     bool shader_depth = false;
+    DXGI_FORMAT back_format = DXGI_FORMAT_R8G8B8A8_UNORM; // the swap chain's format
+    ComPtr<ID3D11RasterizerState> hud_scissor;            // set: the HUD covers only kHudRect
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
     uint32_t camera_ring_offset = 24576;
@@ -284,7 +289,7 @@ bool MakeGame(Game& g, bool warp, bool debug = false)
     sd.BufferCount = 2;
     sd.BufferDesc.Width = g.w + g.screen_extra_width;
     sd.BufferDesc.Height = g.h + (g.padded_hdr ? 3 : 0);
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.Format = g.back_format;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = g.wnd;
     sd.SampleDesc.Count = 1;
@@ -499,6 +504,7 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
 
 
 
+constexpr LONG kHudRect[4] = {40, 30, 200, 90}; // left, top, right, bottom (the live x2 fixture's HUD panel)
 void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 {
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -531,7 +537,13 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
     const float bf[4] = {};
     c->OMSetBlendState(g.blend.Get(), bf, 0xffffffffu);
     c->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+    if (g.hud_scissor) { // a HUD panel, not the whole screen (live x2 fixture)
+        c->RSSetState(g.hud_scissor.Get());
+        const D3D11_RECT r{kHudRect[0], kHudRect[1], kHudRect[2], kHudRect[3]};
+        c->RSSetScissorRects(1, &r);
+    }
     for (int i = 0; i < 6; ++i) c->Draw(4, 0);
+    if (g.hud_scissor) c->RSSetState(nullptr);
     c->OMSetBlendState(nullptr, bf, 0xffffffffu);
 }
 
@@ -1931,6 +1943,15 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
     const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
+    // One presenter for both APIs, stage 3: live x2 on a DX11 game (proxy chain, native DLAA inputs,
+    // HUD-free picture, presenter), 8-bit SDR or FP16 back buffer.
+    const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
+    const bool fg_x2 = fg_x2_hdr || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
+    wchar_t fg_folder[MAX_PATH]{};
+    if (fg_x2 && !GetEnvironmentVariableW(L"NA_FG_SEARCH", fg_folder, MAX_PATH)) {
+        std::printf("SKIP: NA_FG_SEARCH (the folder with nvngx_dlssg.dll) is not set\n");
+        return 77;
+    }
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const auto dir = std::filesystem::path(exe).parent_path();
@@ -1959,7 +1980,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
         !set(L"referee", L"enabled", L"0") || // legacy disabled package
-        !set(L"j2", L"camera", (camera_off_start || adaptive || rotating_lights) ? L"0" : L"2") ||
+        !set(L"j2", L"camera", (camera_off_start || fg_x2 || adaptive || rotating_lights) ? L"0" : L"2") ||
+        (fg_x2 && (!set(L"fg", L"live", L"1") || !set(L"fg", L"search_path", fg_folder))) ||
+        (GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) && !set(L"present", L"dx11_proxy", L"0")) ||
 
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
     na::host::WaitForObserveInstall();
@@ -1974,6 +1997,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     Game g;
 #if defined(NA_TEST_NATIVE_DLAA)
     g.padded_hdr = padded_hdr;
+    if (fg_x2_hdr) g.back_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 #endif
     const bool centered_scene = argc > 1 && std::strcmp(argv[1], "--centered-scene") == 0;
     if (centered_scene) g.screen_extra_width = 88;
@@ -2085,6 +2109,146 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (depth_reads) return DepthReadFixture(g, depth_debug);
 #endif
 #if defined(NA_TEST_NATIVE_DLAA)
+    if (fg_x2) {
+        // The game's chain is a DX11 proxy served by the presenter (live Frame Generation package).
+        expect(na::on12::NativeProxyOn() && na::on12::NativeProxy(g.swap.Get()), "the game's DX11 chain is presented through our D3D12 queue");
+        D3D11_RASTERIZER_DESC rd{};
+        rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+        expect(SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.hud_scissor)), "HUD panel state");
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        auto& st = na::settings::Get();
+        st.fg_mode.store(0); st.fg_multiplier.store(2); st.fg_enabled.store(GetEnvironmentVariableW(L"NA_TEST_FG_OFF", nullptr, 0) ? 0u : 1u); // x2, as the menu sets it
+        if (GetEnvironmentVariableW(L"NA_TEST_DLAA_HASH", nullptr, 0)) {
+            // DLAA alone (x2 Off): a fixed run, then a hash of the scene picture after DLAA's write-back.
+            // Run once with the proxy (DLAA on the presentation queue) and once without (its own queue).
+            st.fg_enabled.store(0);
+            for (int frame = 0; frame < 60; ++frame) { Pump(); Scene(g.ctx.Get(), g, frame); Post(g.ctx.Get(), g, true); g.swap->Present(0, 0); }
+            D3D11_TEXTURE2D_DESC d{};
+            g.color->GetDesc(&d);
+            d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+            ComPtr<ID3D11Texture2D> stg;
+            uint64_t h = 1469598103934665603ull;
+            if (SUCCEEDED(g.device->CreateTexture2D(&d, nullptr, &stg))) {
+                g.ctx->CopyResource(stg.Get(), g.color.Get());
+                D3D11_MAPPED_SUBRESOURCE m{};
+                if (SUCCEEDED(g.ctx->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+                    for (UINT y = 0; y < d.Height; ++y) {
+                        const auto* row = static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch;
+                        for (UINT i = 0; i < d.Width * 4; ++i) { h ^= row[i]; h *= 1099511628211ull; }
+                    }
+                    g.ctx->Unmap(stg.Get(), 0);
+                }
+            }
+            std::printf("DLAA picture hash after 60 frames (%s): %016llx, delivered %llu\n", na::on12::NativeProxy(g.swap.Get()) ? "proxy, presentation queue" : "no proxy, own queue",
+                        static_cast<unsigned long long>(h), static_cast<unsigned long long>(evaluations));
+            DeleteFileW(ini.c_str());
+            std::fflush(stdout);
+            ExitProcess(0);
+        }
+        bool asked = false;
+        static std::atomic<ULONGLONG> last_frame_at{GetTickCount64()};
+        std::thread([] { // a frame that never returns: say where everything stood, then stop
+            for (;;) {
+                Sleep(1000);
+                if (GetTickCount64() - last_frame_at.load() < 8000) continue;
+                std::printf("HANG: a frame did not return within 8 s\n");
+                std::fflush(stdout);
+                ExitProcess(3);
+            }
+        }).detach();
+        for (int frame = 0; frame < 400; ++frame) {
+            last_frame_at.store(GetTickCount64());
+            const ULONGLONG t0 = GetTickCount64();
+            Pump();
+            Scene(g.ctx.Get(), g, frame);
+            Post(g.ctx.Get(), g, true);
+            g.swap->Present(0, 0);
+            if (GetTickCount64() - t0 > 200) std::printf("  frame %d took %llu ms\n", frame, GetTickCount64() - t0);
+            const auto pr = na::present::GetStats();
+            if (!asked && pr.generated_shown >= 20) { // x2 runs: save the presented real / generated / real pictures
+                char why[160]{};
+                asked = na::present::RequestOutputCapture(3, why, sizeof why);
+                expect(asked, "the presented-picture capture starts");
+            }
+            const auto lv = na::present::GetLiveStats();
+            if (asked && std::strstr(lv.capture, "saved:")) break;
+        }
+        Sleep(500); // the capture writer finishes on its own thread
+        const auto pr = na::present::GetStats();
+        const auto fs = na::fg::GetStats();
+        const auto lv = na::present::GetLiveStats();
+        const auto hud = na::j2::GetLiveHudStatsAnyApi();
+        std::printf("x2 on DX11 (%s): real fps %.1f shown %.1f, generated shown %llu, evaluates %llu, fg \"%s\"\n  HUD: %s\n  steady %llu frames, %.2f %%, dropped gap=%llu reset=%llu\n  capture: %s\n  ms: copy %.3f hudcopy %.3f eval %.3f steady %.3f paste %.3f off %.3f\n",
+                    fg_x2_hdr ? "FP16" : "8-bit SDR", pr.base_fps, pr.shown_fps, static_cast<unsigned long long>(pr.generated_shown),
+                    static_cast<unsigned long long>(fs.evaluates), fs.reason, hud.method, static_cast<unsigned long long>(lv.steady_frames), lv.steady_share,
+                    static_cast<unsigned long long>(lv.steady_drop_gap), static_cast<unsigned long long>(lv.steady_drop_reset), lv.capture,
+                    lv.copy_avg, lv.hudcopy_avg, lv.eval_avg, lv.steady_avg, lv.paste_avg, lv.off_avg);
+        expect(pr.generated_shown >= 20, "generated pictures are presented between the game's own frames");
+        expect(hud.learned && std::strstr(hud.method, "hudfree/") != nullptr, "the HUD-free picture's variant was learned from the frame's shape");
+        // The presented burst: in every generated picture the HUD panel (inside, one pixel in) equals the next real frame's.
+        const char* at = std::strstr(lv.capture, "C:\\");
+        expect(at != nullptr, "the capture folder is named");
+        if (at) {
+            const std::filesystem::path cap{std::string(at)};
+            const uint32_t bpp = fg_x2_hdr ? 8u : 4u;
+            auto read = [&](const std::string& name) {
+                std::vector<uint8_t> b;
+                FILE* f = nullptr;
+                if (_wfopen_s(&f, (cap / name).c_str(), L"rb") == 0 && f) { std::fseek(f, 0, SEEK_END); b.resize(size_t(std::ftell(f))); std::fseek(f, 0, SEEK_SET); std::fread(b.data(), 1, b.size(), f); std::fclose(f); }
+                return b;
+            };
+            std::string json;
+            { auto j = read("presented.json"); json.assign(j.begin(), j.end()); }
+            std::vector<std::string> files, kinds;
+            for (size_t p = 0; (p = json.find("\"kind\": \"", p)) != std::string::npos;) {
+                p += 9; const size_t e = json.find('"', p); kinds.push_back(json.substr(p, e - p));
+                const size_t fp = json.find("\"file\": \"", e) + 9; files.push_back(json.substr(fp, json.find('"', fp) - fp));
+                p = e;
+            }
+            const UINT W = g.w, H = g.h;
+            uint32_t checked = 0, wrong = 0;
+            bool raw_logged = false;
+            for (size_t i = 0; i + 1 < kinds.size(); ++i) {
+                if (kinds[i] != "generated" || kinds[i + 1] != "next-real" || files[i].empty() || files[i + 1].empty()) continue;
+                const auto gen = read(files[i]), real = read(files[i + 1]);
+                if (gen.size() < size_t(W) * H * bpp || real.size() != gen.size()) continue;
+                const UINT stride = UINT(gen.size() / (size_t(H) * bpp)); // capture width
+                for (LONG y = kHudRect[1] + 1; y < kHudRect[3] - 1; ++y)
+                    for (LONG x = kHudRect[0] + 1; x < kHudRect[2] - 1; ++x) {
+                        const size_t o = (size_t(y) * stride + size_t(x)) * bpp;
+                        if (bpp == 4) { wrong += std::memcmp(&gen[o], &real[o], bpp) != 0; continue; }
+                        // FP16 (scRGB): exact in what the screen shows (the paste rule's display terms; values
+                        // above 1.0 clip to white there, where the real and HUD-free pictures cannot differ).
+                        bool differs = false;
+                        for (int ch = 0; ch < 3; ++ch) {
+                            uint16_t hg = 0, hr = 0;
+                            std::memcpy(&hg, &gen[o + size_t(ch) * 2], 2); std::memcpy(&hr, &real[o + size_t(ch) * 2], 2);
+                            const float vg = na::fglive::DisplayValue(DirectX::PackedVector::XMConvertHalfToFloat(hg));
+                            const float vr = na::fglive::DisplayValue(DirectX::PackedVector::XMConvertHalfToFloat(hr));
+                            differs = differs || std::fabs(vg - vr) > 0.5f / 255.f;
+                        }
+                        if (differs && !raw_logged) {
+                            raw_logged = true;
+                            uint16_t hg = 0, hr = 0;
+                            std::memcpy(&hg, &gen[o], 2); std::memcpy(&hr, &real[o], 2);
+                            std::printf("  first differing HUD pixel (%ld,%ld): generated R %.4f, next real R %.4f\n", x, y,
+                                        DirectX::PackedVector::XMConvertHalfToFloat(hg), DirectX::PackedVector::XMConvertHalfToFloat(hr));
+                        }
+                        wrong += differs;
+                    }
+                ++checked;
+            }
+            std::printf("  presented burst: %zu pictures, %u generated pictures checked, HUD pixels differing from the next real frame: %u\n", kinds.size(), checked, wrong);
+            expect(checked >= 2 && wrong == 0, "the interface is exact in generated pictures (the newer real frame's own HUD)");
+            for (const auto& e : std::filesystem::directory_iterator(cap)) { std::error_code ec; std::filesystem::remove(e.path(), ec); }
+            std::error_code ec; std::filesystem::remove(cap, ec);
+        }
+        expect(pr.device_hr == S_OK, "no device removal");
+        DeleteFileW(ini.c_str());
+        std::printf(g_failed ? "FAIL: %d live x2 check(s) failed\n" : "PASS: live x2 on a DX11 game\n", g_failed);
+        std::fflush(stdout);
+        ExitProcess(g_failed ? 1u : 0u);
+    }
     if (camera_off_start) {
         // Cold start: no earlier camera-backed frame, no hand-written next jitter, no warm flow pair.
         // Run the production host and real NGX (also via NA_DLAA_COMPANION=1). Camera bytes exist in

@@ -27,6 +27,8 @@
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/settings.hpp"
 #include "dlaa_remote/client.hpp"
+#include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
 #include <d3dcompiler.h>
 
 #include <algorithm>
@@ -147,9 +149,19 @@ bool Start(Session& s, ID3D11Device* native)
     if (FAILED(native->QueryInterface(IID_PPV_ARGS(&dxgi))) ||
         FAILED(dxgi->GetAdapter(&adapter)) ||
         FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&s.device)))) return false;
-    D3D12_COMMAND_QUEUE_DESC q{};
-    q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(s.device->CreateCommandQueue(&q, IID_PPV_ARGS(&s.queue))) ||
+    // Queue rule. With the DX11 proxy (a package that offers live Frame Generation) DLAA submits on the
+    // per-adapter queue the chain presents from: Frame Generation needs its depth and motion on the queue
+    // that generates. Otherwise DLAA keeps its own queue, exactly as before.
+    if (na::on12::NativeProxyOn()) {
+        s.queue.Attach(na::on12::NativePresentQueue(native));
+        eventlog::Emit("native11_dlaa", "queue: the DX11 proxy's presentation queue (live Frame Generation needs its inputs there)");
+    } else {
+        D3D12_COMMAND_QUEUE_DESC q{};
+        q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(s.device->CreateCommandQueue(&q, IID_PPV_ARGS(&s.queue)))) return false;
+        eventlog::Emit("native11_dlaa", "queue: its own (no DX11 proxy in this package)");
+    }
+    if (!s.queue ||
         FAILED(s.fences.Create(native, s.device.Get(), s.queue.Get())) ||
         !s.arbiter.Init(s.device.Get(), kSlots)) return false;
     wchar_t path[MAX_PATH]{};
@@ -845,6 +857,28 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     } else {
         evaluated = dlss::Evaluate(list, eval);
     }
+    if (evaluated && fg::WantsInputs()) {
+        // Live Frame Generation: this frame's depth and motion (render size, value * mv_scale = render
+        // pixels), recorded on this list, published when it is submitted (fg::Execute below). No game
+        // camera is given (the proven camera-free configuration); the motion is prepared by the module.
+        fg::EvalInputs fi;
+        fi.engine_frame = frame.frame;
+        fi.depth = shared_depth;
+        fi.motion = slot.motion.Get();
+        fi.render_w = fi.out_w = ci.width;
+        fi.render_h = fi.out_h = ci.height;
+        fi.jitter_x = eval.jitter_x;
+        fi.jitter_y = eval.jitter_y;
+        fi.mv_scale_x = eval.mv_scale_x;
+        fi.mv_scale_y = eval.mv_scale_y;
+        fi.mv_low_res = true;
+        fi.reset = eval.reset ? 1u : 0u;
+        fi.reset_reason = eval.reset ? (!measured && cam.camera_cut ? 1u : 2u) : 0u;
+        fi.depth_inverted = eval.depth_inverted ? 1u : 0u;
+        fi.mv_jittered = eval.mv_jittered ? 1u : 0u;
+        fi.camera_free = true;
+        fg::OnEvaluate(list, fi);
+    }
     uint32_t capture_token = 0;
     const bool capture_armed = evaluated && capture::j2::Armed();
     if (evaluated && !capture_armed && capture::j2::RefereeWanted()) {
@@ -1016,6 +1050,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     dlss::BeforeExecute(s.queue.Get(), 1, lists);
     {
         nr::native::Submission submitted(s.queue.Get(), 1, lists);
+        // The hooked ExecuteCommandLists (overlay) publishes Frame Generation's inputs once this list is submitted.
         s.queue->ExecuteCommandLists(1, lists);
     }
     j2::compute_flow::Committed(flow);

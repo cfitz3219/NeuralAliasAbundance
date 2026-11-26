@@ -1455,7 +1455,7 @@ static void DrawLiveFrameGeneration()
     EndRow();
     const na::fg::Stats fs = na::fg::GetStats();
     const auto lv = na::present::GetLiveStats();
-    const auto hud = na::j2::GetLiveHudStats();
+    const auto hud = na::j2::GetLiveHudStatsAnyApi();
     const auto pr = na::present::GetStats();
     char line[320];
     if (!can && !waiting) StatusLine(2, why);
@@ -1470,6 +1470,12 @@ static void DrawLiveFrameGeneration()
         }
         snprintf(line, sizeof line, "HUD: %s", hud.learned ? hud.method : hud.verdict);
         Hint(line);
+    }
+    {   // DX11: a chain our presenter could not serve keeps the game's own (x2 cannot run there)
+        char reason[160] = {};
+        unsigned long long refused = 0;
+        na::on12::ProxyReason(reason, sizeof reason, &refused);
+        if (na::on12::NativeRoute() && refused) StatusLine(2, reason);
     }
     if (on) {
         // Still-area steadying (Astra): live A/B, x2 stays on either way.

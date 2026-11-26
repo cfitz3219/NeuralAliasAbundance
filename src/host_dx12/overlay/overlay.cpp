@@ -964,7 +964,7 @@ void write_status_line()
         // Route B live Frame Generation: one line per status interval, every figure the RESULTS
         // section reads. Milliseconds are GPU time per real frame, last/average.
         const auto lv = na::present::GetLiveStats();
-        const auto hud = na::j2::GetLiveHudStats();
+        const auto hud = na::j2::GetLiveHudStatsAnyApi();
         const auto file = na::fg::GetRuntimeFile();
         const float hud_last = hud.grab_ms + hud.redraw_ms + lv.hudcopy_ms + lv.paste_ms;
         const float hud_avg = hud.grab_avg + hud.redraw_avg + lv.hudcopy_avg + lv.paste_avg;
@@ -3743,12 +3743,14 @@ void small_follow_mode()
     }
     carry_out(change);
 }
-HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
+HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp,
+                          na::on12::GraphicsApi api = na::on12::GraphicsApi::Dx12)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12CommandQueue> retained_queue;
-    if (!present_prelude(sc, queue,retained_queue)) {
+    const bool dx11 = api == na::on12::GraphicsApi::Dx11; // a DX11 proxy chain: no DX12 scene path on its frames
+    if (!present_prelude(sc, queue,retained_queue, nullptr, nullptr, api)) {
         // No queue or not initialised yet: the frame sits in a proxy; forward so
         // the chain keeps turning (a black frame at most, at start-up).
         return g_orig_present(sc, sync, flags);
@@ -3758,8 +3760,8 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     const HRESULT picture_desc_hr = sc->GetDesc(&picture_desc);
     if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
         na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
-    const auto receipt = game_frame_boundary(queue, sc); // generated frames bypass this game-facing entry
-    note_identity(sc, queue);
+    const auto receipt = dx11 ? na::referee::gpu::Presentation{} : game_frame_boundary(queue, sc); // generated frames bypass this game-facing entry
+    if (!dx11) note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::j2::RenderSmall()) small_follow_mode();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
@@ -3774,7 +3776,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.hdr = na::color::IsHdr(na::color::Classify(picture_desc.BufferDesc.Format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
     bool open = g_open.load(std::memory_order_acquire);
     a.menu_open = open || g_state.was_open; // closing frame still processes cursor restoration
-    a.frame = &presenter_frame_cb;
+    a.frame = dx11 ? nullptr : &presenter_frame_cb; // DX11: the native route handled the frame before Present
     a.menu = &presenter_menu_cb;
     // MenuFn runs on this recording thread before the owned frame copy. A
     // Home message after this snapshot is handled next frame.
@@ -3829,7 +3831,7 @@ struct Native11Present {
     bool outer = !t_native11_present;
     bool observed = false;
     na::native11::PresentReceipt receipt{};
-    Native11Present(IDXGISwapChain* sc, UINT flags) {
+    Native11Present(IDXGISwapChain* sc, UINT flags, bool menu_by_presenter = false) {
         if (!outer) return;
         t_native11_present = true;
         if (flags & DXGI_PRESENT_TEST) return;
@@ -3847,7 +3849,7 @@ struct Native11Present {
         // The Referee and evaluator need the game picture. The diagnostic
         // burst separately saves the composed frame, including our own menu.
         na::native_d3d11::CapturePresent(sc, queue, receipt, PresentPicture::Game);
-        if (ready)
+        if (ready && !menu_by_presenter)
             menu_step(sc, queue, g_open.load(std::memory_order_acquire));
         na::native_d3d11::CapturePresent(sc, queue, receipt, PresentPicture::WithHome);
     }
@@ -3861,17 +3863,30 @@ struct Native11Present {
     ~Native11Present() { if (outer) t_native11_present = false; }
 };
 
+// A DX11 proxy chain the presenter serves (live Frame Generation): the HUD-free picture is wanted while x2 is on.
+bool dx11_served(IDXGISwapChain* sc, UINT flags)
+{
+    if ((flags & DXGI_PRESENT_TEST) || !na::on12::NativeProxy(sc)) return false;
+    const bool live = na::present::LiveFrameGeneration();
+    if (live) na::native11::hud_free::SetWanted(na::settings::Get().fg_enabled.load(std::memory_order_relaxed) != 0);
+    return live && na::present::Enabled();
+}
+
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     const auto api = presentation_api(sc);
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present(sc, sync, flags);
     if (api == na::on12::GraphicsApi::Dx11) {
-        // DX11 proxy chain: the game's picture into the real D3D12 buffer first; the Home menu then
-        // draws on that D3D12 buffer as it does for a DX12 game (a proxy is never a D3D11 back buffer).
+        // DX11 proxy chain: the game's picture into the real D3D12 buffer first (or into the presenter's
+        // buffer when the presenter serves the chain: live Frame Generation); the Home menu then draws on
+        // that D3D12 picture as it does for a DX12 game.
+        const bool served = dx11_served(sc, flags);
         na::on12::BeforePresent(sc, flags);
-        Native11Present frame(sc, flags);
+        Native11Present frame(sc, flags, served);
         const uint64_t tp = qpc_us();
-        const HRESULT hr = g_orig_present(sc, sync, flags);
+        HRESULT hr;
+        if (served) { hr = presenter_present(sc, sync, flags, nullptr, na::on12::GraphicsApi::Dx11); na::on12::AfterPresenterFrame(sc); }
+        else hr = g_orig_present(sc, sync, flags);
         na::on12::AfterPresent(sc, flags, qpc_us() - tp);
         frame.Complete(sc, flags, hr);
         return hr;
@@ -3917,10 +3932,13 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     const auto api = presentation_api(sc);
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present1(sc, sync, flags, pp);
     if (api == na::on12::GraphicsApi::Dx11) {
+        const bool served = dx11_served(sc, flags);
         na::on12::BeforePresent(sc, flags); // DX11 proxy chain (see DetourPresent)
-        Native11Present frame(sc, flags);
+        Native11Present frame(sc, flags, served);
         const uint64_t tp = qpc_us();
-        const HRESULT hr = g_orig_present1(sc, sync, flags, pp);
+        HRESULT hr;
+        if (served) { hr = presenter_present(sc, sync, flags, pp, na::on12::GraphicsApi::Dx11); na::on12::AfterPresenterFrame(sc); }
+        else hr = g_orig_present1(sc, sync, flags, pp);
         na::on12::AfterPresent(sc, flags, qpc_us() - tp);
         frame.Complete(sc, flags, hr, pp);
         return hr;

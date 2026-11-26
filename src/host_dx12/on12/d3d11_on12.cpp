@@ -5,6 +5,7 @@
 #include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/proxy_views.hpp"
+#include "host_dx12/native11/hud_free.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/native11/texture_loader.hpp"
@@ -1370,7 +1371,7 @@ ID3D12CommandQueue* native_present_queue(ID3D11Device* d11)
 bool translate_native(IUnknown* device, DXGI_FORMAT format, UINT samples, UINT flags, BOOL stereo, ID3D12CommandQueue** queue)
 {
     if (!g_native_proxy.load(std::memory_order_acquire) || g_native_proxy_test_off.load() || !device || !queue) return false;
-    if (na::host::IsInternalGraphicsCall()) return false; // our own helpers keep their chains
+    if (na::host::IsInternalGraphicsCall() || na::native11::IsOwnWork()) return false; // our own helpers (and the provider's probe chain) keep theirs
     ComPtr<ID3D11Device> d11;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&d11)))) return false; // a D3D12 queue: DX12 path, unchanged
     if (const char* why = native_refusal(device, format, samples, flags, stereo)) {
@@ -1539,6 +1540,7 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
                   static_cast<int>(game_format), c->game_samples.Count);
     tnote(line);
     if (c->native) {
+        na::native11::hud_free::SetEffectsDevice(c->d12.Get()); // live x2: the HUD-free picture is shared with this device
         g_proxied.fetch_add(1);
         std::snprintf(line, sizeof line, "native DX11 chain presented through our D3D12 queue (%ux%u, game format %d, swap effect %d, %u buffer(s))",
                       c->width, c->height, static_cast<int>(game_format), static_cast<int>(game_effect), game_count);
@@ -1836,6 +1838,17 @@ void ForgetSwapChain(IDXGISwapChain* chain)
 }
 
 bool NativeProxyOn() { return g_native_proxy.load(std::memory_order_acquire); }
+
+void AfterPresenterFrame(IDXGISwapChain* chain)
+{
+    if (!g_tchain_count.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::recursive_mutex> lk(g_tm);
+    TChain* c = tfind(chain);
+    if (!c || !c->native || !c->fences) return;
+    uint64_t v = 0;
+    if (SUCCEEDED(c->fences->SignalEffects(&v)) && SUCCEEDED(c->fences->WaitNative(v))) c->effects_done = v;
+}
+ID3D12CommandQueue* NativePresentQueue(ID3D11Device* device) { return device ? native_present_queue(device) : nullptr; }
 
 bool NativeProxy(IDXGISwapChain* chain)
 {

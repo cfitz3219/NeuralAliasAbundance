@@ -533,6 +533,8 @@ struct LiveHudStats {
     float grab_ms = 0, grab_avg = 0, redraw_ms = 0, redraw_avg = 0; // GPU time in the game's lists
 };
 LiveHudStats GetLiveHudStats();
+// The same figures for the API the game runs: on the native DX11 route they come from native11/hud_free.
+LiveHudStats GetLiveHudStatsAnyApi();
 
 // Releases GPU objects (test hosts; the caller guarantees GPU idle).
 void Shutdown();

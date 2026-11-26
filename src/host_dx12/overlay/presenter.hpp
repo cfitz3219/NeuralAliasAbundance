@@ -127,9 +127,10 @@ using MenuFn = void (*)(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Res
 // that frame shows no generated picture (never a warped HUD).
 void SetLiveFrameGeneration(bool on);
 bool LiveFrameGeneration();
-// The HUD-free picture of the frame now being presented: back-buffer size and format, at rest in
-// RENDER_TARGET state; null with `why` (plain words) when there is none for this frame.
-using HudFreeFn = ID3D12Resource* (*)(const char** why);
+// The HUD-free picture of the frame now being presented: back-buffer size and format; null with `why`
+// (plain words) when there is none for this frame. `state` receives its resting state (DX12: the game's
+// recording leaves it in RENDER_TARGET; DX11 proxy: a shared image, COMMON).
+using HudFreeFn = ID3D12Resource* (*)(const char** why, D3D12_RESOURCE_STATES* state);
 void SetHudFreeProvider(HudFreeFn fn);
 // The HUD sheet was learned again (live DLAA): the still-area steadying drops its pair of frames.
 void NoteHudRelearn();

@@ -1636,15 +1636,16 @@ HRESULT Present(const PresentArgs& a)
         c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery);
         const char* why = nullptr;
         const HudFreeFn provider = g_hudfree_fn.load(std::memory_order_acquire);
-        ID3D12Resource* hf = provider ? provider(&why) : nullptr;
+        D3D12_RESOURCE_STATES hf_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        ID3D12Resource* hf = provider ? provider(&why, &hf_state) : nullptr;
         if (!want_fg) set_live_text(g_hudfree_text, ""); // a menu or an Off frame: the HUD-free reason no longer applies
         if (want_fg) {
             if (hf && s.hudfree) {
-                D3D12_RESOURCE_BARRIER pre[2] = {transition(hf, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                D3D12_RESOURCE_BARRIER pre[2] = {transition(hf, hf_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                                                  transition(s.hudfree.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
                 c->list_gen->ResourceBarrier(2, pre);
                 c->list_gen->CopyResource(s.hudfree.Get(), hf);
-                D3D12_RESOURCE_BARRIER post[2] = {transition(hf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                D3D12_RESOURCE_BARRIER post[2] = {transition(hf, D3D12_RESOURCE_STATE_COPY_SOURCE, hf_state),
                                                   transition(s.hudfree.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
                 c->list_gen->ResourceBarrier(2, post);
                 gen_color = s.hudfree.Get();

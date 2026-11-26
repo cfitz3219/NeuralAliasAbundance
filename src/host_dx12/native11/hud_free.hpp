@@ -15,6 +15,7 @@
 #pragma once
 
 #include <d3d11.h>
+#include <d3d12.h>
 #include <cstdint>
 
 #include "host_dx12/native11/draw_replay.hpp"
@@ -44,6 +45,11 @@ void OnPresent(ID3D11DeviceContext* immediate, uint64_t shown, uint32_t shown_w,
 // The HUD-free picture of the frame now being presented (same size; the back buffer's format family),
 // or null with `why` in plain words. Valid until the next Present.
 ID3D11Texture2D* Picture(const char** why);
+// Live x2 on a DX11 proxy chain: the picture is made as an image shared with this D3D12 device (the
+// presentation queue's), and the presenter reads it as a D3D12 resource (COMMON at rest; written by
+// D3D11 before the frame's Present, ordered by the proxy's shared fences). Null device: D3D11 only.
+void SetEffectsDevice(ID3D12Device* device);
+ID3D12Resource* EffectsPicture(const char** why);
 
 // F8 on the native DX11 route: for the next `frames` frames, the shown picture is saved just before
 // each of its first 4 draws ("pre-interface" candidates, whatever shape the frame has) and, when a

@@ -2,12 +2,14 @@
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "core/live_frame_gen.hpp"
+#include "host_dx12/native_d3d11/shared_resources.hpp"
 
 #include <wrl/client.h>
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -53,6 +55,9 @@ struct State {
     uint32_t frames_without = 0;
     // GPU objects (immediate context's device)
     ComPtr<ID3D11Texture2D> picture, pre, save;
+    ComPtr<ID3D12Device> effects;                                  // set: the picture is shared with D3D12
+    std::shared_ptr<na::native_d3d11::SharedTexture> shared_picture;
+    std::vector<std::shared_ptr<na::native_d3d11::SharedTexture>> retired; // replaced shared pictures (kept for a while)
     ComPtr<ID3D11Resource> sheet_res; // hudfree/sheet-redraw: the learned sheet, from its first draw this frame
     ComPtr<ID3D11RenderTargetView> picture_rtv;
     DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
@@ -160,6 +165,29 @@ bool ensure(ComPtr<ID3D11Texture2D>& t, ID3D11Texture2D* like, bool rt)
     return dev && SUCCEEDED(dev->CreateTexture2D(&n, nullptr, &t));
 }
 
+// Our picture, like `like`: an image shared with the presenter's D3D12 device when one is set.
+bool ensure_picture(ID3D11Texture2D* like) // caller holds g.m
+{
+    if (!g.effects) return ensure(g.picture, like, true);
+    D3D11_TEXTURE2D_DESC d{};
+    like->GetDesc(&d);
+    if (g.shared_picture) {
+        const auto& c = g.shared_picture->Description();
+        if (c.width == d.Width && c.height == d.Height && c.format == typeless_of(d.Format)) return true;
+        g.retired.push_back(g.shared_picture); // the presenter may still read it this frame
+        if (g.retired.size() > 4) g.retired.erase(g.retired.begin());
+        g.shared_picture.reset(); g.picture.Reset(); g.picture_rtv.Reset(); g.rtv_format = DXGI_FORMAT_UNKNOWN;
+    }
+    ComPtr<ID3D11Device> dev;
+    like->GetDevice(&dev);
+    auto t = std::make_shared<na::native_d3d11::SharedTexture>();
+    na::native_d3d11::ImageDesc id{d.Width, d.Height, typeless_of(d.Format), false};
+    if (!dev || FAILED(t->Create(dev.Get(), g.effects.Get(), id))) return false;
+    g.shared_picture = t;
+    g.picture = t->Native();
+    return true;
+}
+
 ComPtr<ID3D11Resource> bound_rt0(ID3D11DeviceContext* c, DXGI_FORMAT* view_format = nullptr)
 {
     ComPtr<ID3D11RenderTargetView> v;
@@ -204,7 +232,7 @@ void redraw(ID3D11DeviceContext* c, const draw_replay::DrawArgs& a, IssueDraw is
     if (FAILED(shown.As(&shown_t))) { skip("the shown picture is not a 2D texture"); return; }
     ComPtr<ID3D11Device> dev;
     c->GetDevice(&dev);
-    if (!ensure(g.picture, shown_t.Get(), true)) { skip("the HUD-free picture could not be made"); return; }
+    if (!ensure_picture(shown_t.Get())) { skip("the HUD-free picture could not be made"); return; }
     if (!g.picture_rtv || g.rtv_format != vd.Format) {
         g.picture_rtv.Reset();
         D3D11_RENDER_TARGET_VIEW_DESC pv{};
@@ -271,7 +299,7 @@ void BeforeDraw(ID3D11DeviceContext* c, const DrawFacts& f, const draw_replay::D
         D3D11_TEXTURE2D_DESC d{};
         t->GetDesc(&d);
         if (d.SampleDesc.Count != 1) { skip("the shown picture is multisampled"); return; }
-        if (!ensure(g.picture, t.Get(), true)) { skip("the HUD-free picture could not be made"); return; }
+        if (!ensure_picture(t.Get())) { skip("the HUD-free picture could not be made"); return; }
         na::native11::OwnWorkScope own;
         c->CopyResource(g.picture.Get(), shown.Get());
         g.taken = true;
@@ -391,6 +419,25 @@ ID3D11Texture2D* Picture(const char** why)
     return nullptr;
 }
 
+void SetEffectsDevice(ID3D12Device* device)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.effects.Get() == device) return;
+    g.effects = device;
+    if (g.shared_picture) g.retired.push_back(g.shared_picture);
+    g.shared_picture.reset(); g.picture.Reset(); g.picture_rtv.Reset(); g.rtv_format = DXGI_FORMAT_UNKNOWN;
+}
+
+ID3D12Resource* EffectsPicture(const char** why)
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.fresh && g.shared_picture) { g.fresh = false; return g.shared_picture->Effects(); }
+    thread_local char t_why[200];
+    strncpy_s(t_why, !g.effects ? "the HUD-free picture is not shared with the presenter (no DX11 proxy chain)" : g.learned ? g.why : g.verdict, _TRUNCATE);
+    if (why) *why = t_why;
+    return nullptr;
+}
+
 Stats GetStats()
 {
     Stats s;
@@ -420,7 +467,7 @@ void Reset()
 {
     std::lock_guard<std::mutex> lock(g.m);
     g.recording = false; g.ops.clear(); g.learned = 0; g.variant = na::fglive::HudVariant::None;
-    g.picture.Reset(); g.pre.Reset(); g.save.Reset(); g.picture_rtv.Reset(); g.sheet_res.Reset();
+    g.picture.Reset(); g.pre.Reset(); g.save.Reset(); g.picture_rtv.Reset(); g.sheet_res.Reset(); g.shared_picture.reset();
     g.fresh = g.taken = g.pre_taken = false; g.shown_draws = 0; g.learn_after = g.frame;
 }
 

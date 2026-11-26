@@ -178,7 +178,7 @@ target_link_libraries(host_observe_producers PUBLIC abundance_options host_obser
 add_library(host_native11 STATIC src/host_dx12/native11/provider.cpp src/host_dx12/native11/samplers.cpp
             src/host_dx12/native11/textures.cpp src/host_dx12/native11/proxy_views.cpp src/host_dx12/native11/hud_free.cpp src/host_dx12/native11/texture_loader.cpp src/host_dx12/native11/depth_reads.cpp
             src/host_dx12/native11/draw_replay.cpp)
-target_link_libraries(host_native11 PUBLIC abundance_options host_hooking d3d11 dxgi PRIVATE d3dcompiler)
+target_link_libraries(host_native11 PUBLIC abundance_options host_hooking host_native_d3d11_shared d3d11 dxgi PRIVATE d3dcompiler)
 
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
 target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole32)

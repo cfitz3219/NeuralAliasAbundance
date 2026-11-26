@@ -19,6 +19,7 @@
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/native11/hud_free.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/j2/projection_window.hpp"
@@ -391,7 +392,14 @@ DWORD WINAPI InitThread(LPVOID)
             na::settings::BindFrameGenerationToGame(key);
             na::present::SetEnabled(true);
             na::present::SetLiveFrameGeneration(true);
-            na::present::SetHudFreeProvider(&na::j2::LiveHudFree);
+            // One presenter for both APIs: the HUD-free picture comes from the DX12 scene path (left in
+            // RENDER_TARGET by the game's recording) or, on a DX11 proxy chain, from native11/hud_free
+            // (a shared image, COMMON at rest).
+            na::present::SetHudFreeProvider([](const char** why, D3D12_RESOURCE_STATES* state) -> ID3D12Resource* {
+                if (na::on12::NativeRoute()) { if (state) *state = D3D12_RESOURCE_STATE_COMMON; return na::native11::hud_free::EffectsPicture(why); }
+                if (state) *state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                return na::j2::LiveHudFree(why);
+            });
             na::j2::SetLiveFrameGeneration(true);
             char line[400], folder8[MAX_PATH] = {};
             WideCharToMultiByte(CP_UTF8, 0, folder, -1, folder8, sizeof folder8, nullptr, nullptr);

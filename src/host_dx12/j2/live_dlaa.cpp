@@ -54,6 +54,8 @@
 #include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/effects/donut.hpp"
 #include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/on12/d3d11_on12.hpp"
+#include "host_dx12/native11/hud_free.hpp"
 #include "host_dx12/scale/settings_read_hook.hpp"
 #include "providers/camera/camera_admission.hpp"
 #include "providers/camera/camera_tracker.hpp"
@@ -10840,6 +10842,23 @@ ID3D12Resource* LiveHudFree(const char** why)
     else strncpy_s(t_why, g_live_hud.why, _TRUNCATE);
     if (why) *why = t_why;
     return nullptr;
+}
+
+LiveHudStats GetLiveHudStatsAnyApi()
+{
+    if (!na::on12::NativeRoute()) return GetLiveHudStats();
+    const auto h = na::native11::hud_free::GetStats();
+    LiveHudStats s;
+    s.learned = h.learned;
+    s.learn_attempts = h.learn_attempts;
+    s.grabs = s.redraws = s.submitted = h.pictures;
+    s.skipped = h.skipped;
+    s.relearns = h.relearns;
+    strncpy_s(s.verdict, h.verdict, _TRUNCATE);
+    strncpy_s(s.last_skip, h.last_skip, _TRUNCATE);
+    strncpy_s(s.method, h.method, _TRUNCATE);
+    snprintf(s.skip_counts, sizeof s.skip_counts, "%llu skipped (DX11: last reason in last_skip)", static_cast<unsigned long long>(h.skipped));
+    return s; // GPU ms of the DX11 copies are not measured separately (they are in the game's own D3D11 work)
 }
 
 LiveHudStats GetLiveHudStats()

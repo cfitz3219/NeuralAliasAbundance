@@ -21,6 +21,7 @@ struct ID3D12CommandQueue;
 struct ID3D12Device;
 struct ID3D12Resource;
 struct ID3D12Fence;
+struct ID3D11Device;
 
 namespace na::on12 {
 
@@ -140,7 +141,13 @@ void ForgetSwapChain(IDXGISwapChain* chain);
 // in the status line and the game keeps its own chain. The setting is read at start; a chain is a
 // proxy or not from its creation on.
 bool NativeProxyOn(); // [present] dx11_proxy=1 was read at start
+// Our D3D12 direct queue on the device's adapter (one per adapter; the proxy chains present from it and
+// the native menu draws on it). AddRef'ed, or null.
+ID3D12CommandQueue* NativePresentQueue(ID3D11Device* device);
 bool NativeProxy(IDXGISwapChain* chain);
+// After the presenter submitted its frame for a proxy chain (it read the HUD-free picture and the game's
+// frame on our queue): the game's next D3D11 writes wait for that on the GPU (shared fences).
+void AfterPresenterFrame(IDXGISwapChain* chain);
 // The encoding of a translated or proxied chain, in one place: the format the game asked for and
 // the real D3D12 chain's buffer format. The colour space is what the game set with SetColorSpace1
 // on the same (real) chain: na::overlay::SwapChainColorSpace(chain).
