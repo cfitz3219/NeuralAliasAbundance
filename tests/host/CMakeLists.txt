@@ -632,6 +632,8 @@ set_tests_properties(host_overlay_menu_failure_test PROPERTIES TIMEOUT 30 SKIP_R
 na_host_test(presenter_ownership_test SOURCES presenter_ownership_test.cpp LIBS host_dx12 user32)
 # Live Frame Generation T2 HUD paste on the GPU equals the CPU reference (WARP when no GPU).
 na_host_test(fg_hud_paste_test SOURCES fg_hud_paste_test.cpp LIBS host_dx12 d3d12 dxgi LABELS gpu)
+# Live Frame Generation: the HUD sheet state at the final draw from same-recording barriers only (WARP).
+na_host_test(fg_sheet_state_test SOURCES fg_sheet_state_test.cpp LIBS host_dx12 d3d12 dxgi)
 na_host_test(display_independent_present_test SOURCES display_independent_present_test.cpp LIBS host_dx12 user32)
 na_host_test(fullscreen_resize_test SOURCES fullscreen_resize_test.cpp LIBS host_dx12 user32 na_native_present_foreign)
 add_custom_command(TARGET fullscreen_resize_test POST_BUILD

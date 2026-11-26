@@ -8882,6 +8882,27 @@ bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, ui
 {
     return ListStateSub(list, id, sub, state) == StateLookup::Known;
 }
+bool ListInRenderPass(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls) return true;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->in_render_pass;
+}
+bool ListStateFlags(ID3D12CommandList* list, bool* observed, bool* coverage, bool* evidence)
+{
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls) return false;
+    if (observed) *observed = ls->recording_observed.load();
+    if (coverage) *coverage = ls->coverage_complete.load();
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (evidence) *evidence = ls->evidence_complete;
+    return true;
+}
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
 {
     std::shared_lock<RegistryLock> rl(g_m);

@@ -144,6 +144,65 @@ Sheet LearnSheet(const Ops& ops, uint64_t shown, uint32_t shown_w, uint32_t show
     return r;
 }
 
+// ---- The sheet's state at the final draw -----------------------------------------------------
+// To swap the sheet's contents just before the game's final draw, the exact state the game left
+// it in is needed (a wrong barrier state is a device removal, never a guess). The proof used:
+// the sheet was the bound render target at its first HUD draw (the copy is taken there) and is
+// read by the final draw. When both happen in the SAME recording of the same command list, the
+// game must have changed its state inside that recording between the two, and with legacy
+// barriers the state after the last change inside a list is the state the GPU sees at that point,
+// whatever other lists do or in which order they were recorded. So only states recorded in this
+// recording count: the last whole-resource transition, the last transition naming subresource 0,
+// and the independent per-list barrier tracker. Every source that knows must agree.
+enum class Lookup : uint8_t { Known, Absent, Unavailable };
+struct StateSource {
+    Lookup lookup = Lookup::Unavailable;
+    uint32_t state = 0;
+};
+struct SheetStateInputs {
+    bool same_recording_as_copy = false; // the pre-HUD copy (sheet as render target) was taken in this recording
+    StateSource whole, sub0, tracker;
+};
+struct SheetState {
+    bool known = false;
+    uint32_t state = 0;
+    const char* source = "";
+    const char* why = "";
+};
+constexpr uint32_t kRenderTarget = 0x4; // D3D12_RESOURCE_STATE_RENDER_TARGET
+inline SheetState ResolveSheetState(const SheetStateInputs& in)
+{
+    SheetState r;
+    if (!in.same_recording_as_copy) {
+        r.why = "the HUD is drawn in another command list (or recording) than the final draw, so the sheet's state there cannot be proven";
+        return r;
+    }
+    const StateSource* sources[3] = {&in.whole, &in.sub0, &in.tracker};
+    const char* names[3] = {"whole-resource transition", "subresource-0 transition", "barrier tracker"};
+    int first = -1;
+    for (int i = 0; i < 3; ++i) {
+        if (sources[i]->lookup != Lookup::Known) continue;
+        if (first < 0) { first = i; continue; }
+        if (sources[i]->state != sources[first]->state) {
+            r.why = "two records of the game's barriers disagree about the HUD sheet's state";
+            return r;
+        }
+    }
+    if (first < 0) {
+        const bool all_absent = in.whole.lookup == Lookup::Absent && in.sub0.lookup == Lookup::Absent && in.tracker.lookup == Lookup::Absent;
+        r.why = all_absent ? "no change of the HUD sheet's state was seen in this list although it was drawn into and is now read (a barrier method that is not observed)"
+                           : "this list's record of barriers is incomplete, so the HUD sheet's state is not known";
+        return r;
+    }
+    const uint32_t s = sources[first]->state;
+    if (s == 0) { r.why = "the HUD sheet was put in the COMMON state, whose real state after use cannot be known"; return r; }
+    if (s & kRenderTarget) { r.why = "the HUD sheet is still a render target at the final draw (not a state it can be read in)"; return r; }
+    r.known = true;
+    r.state = s;
+    r.source = names[first];
+    return r;
+}
+
 // ---- The HUD mask (CPU reference of the GPU paste) -------------------------------------------
 // A pixel belongs to the newer real frame's HUD when, in display terms (linear light clipped at 0,
 // to the power 1/2.2, clipped at 1), any channel of the real frame differs from its HUD-free

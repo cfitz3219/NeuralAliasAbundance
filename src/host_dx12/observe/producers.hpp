@@ -291,6 +291,12 @@ void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t su
 bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
 enum class StateLookup { Absent, Known, Unavailable };
 StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
+// Diagnostics for the lookups above: whether this recording was observed from its Reset, whether
+// every method variant it used is hooked, and whether its barrier record is complete. False = unknown list.
+bool ListStateFlags(ID3D12CommandList* list, bool* observed, bool* coverage, bool* evidence);
+// True while the recording is inside BeginRenderPass/EndRenderPass (no barriers may be recorded
+// there); also true when the list is unknown (the safe answer).
+bool ListInRenderPass(ID3D12CommandList* list);
 // Texture LOD bias for the game's mip-mapped surface samplers (sampler descriptors and
 // root-signature static samplers); 0 = off. For J2 DLAA with jitter (temporal
 // reconstruction needs sharper per-frame texture samples).

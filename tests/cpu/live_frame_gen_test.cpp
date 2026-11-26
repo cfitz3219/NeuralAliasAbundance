@@ -110,6 +110,39 @@ int main() { return test::run({
                        SheetVerdict::ShortRun, SheetVerdict::OtherWrites})
             CHECK(std::strlen(SheetWhy(v)) > 10);
     }},
+    {"sheet state at the final draw: only states proven inside this recording, all agreeing", [] {
+        constexpr uint32_t PSR = 0x80, NPSR_PSR = 0xC0, RT = 0x4;
+        const StateSource known_psr{Lookup::Known, PSR}, absent{Lookup::Absent, 0}, unavailable{Lookup::Unavailable, 0};
+        // (a) the game moves subresource 0 only: the whole-resource lookup has nothing, the
+        // subresource-0 lookup and the tracker know it (Cort's 2026-11-26 run refused this case).
+        SheetStateInputs a{true, absent, known_psr, known_psr};
+        SheetState s = ResolveSheetState(a);
+        CHECK(s.known && s.state == PSR && !std::strcmp(s.source, "subresource-0 transition"));
+        // whole-resource transition known, others agree
+        SheetStateInputs w{true, {Lookup::Known, NPSR_PSR}, {Lookup::Known, NPSR_PSR}, {Lookup::Known, NPSR_PSR}};
+        CHECK(ResolveSheetState(w).known && ResolveSheetState(w).state == NPSR_PSR);
+        // only the independent tracker saw it (the main record was incomplete)
+        SheetStateInputs t{true, unavailable, unavailable, known_psr};
+        CHECK(ResolveSheetState(t).known && !std::strcmp(ResolveSheetState(t).source, "barrier tracker"));
+        // (b) the HUD drawn in another list than the final draw: never resolved at recording time
+        SheetStateInputs b{false, known_psr, known_psr, known_psr};
+        s = ResolveSheetState(b);
+        CHECK(!s.known && std::strstr(s.why, "another command list"));
+        // disagreement is refused
+        SheetStateInputs d{true, {Lookup::Known, PSR}, {Lookup::Known, NPSR_PSR}, absent};
+        CHECK(!ResolveSheetState(d).known && std::strstr(ResolveSheetState(d).why, "disagree"));
+        // nothing seen at all although drawn and read in this list: an unobserved barrier method
+        SheetStateInputs n{true, absent, absent, absent};
+        CHECK(!ResolveSheetState(n).known && std::strstr(ResolveSheetState(n).why, "not observed"));
+        // incomplete records
+        SheetStateInputs u{true, unavailable, absent, unavailable};
+        CHECK(!ResolveSheetState(u).known && std::strstr(ResolveSheetState(u).why, "incomplete"));
+        // COMMON and render-target states are never used
+        SheetStateInputs c{true, {Lookup::Known, 0}, absent, absent};
+        CHECK(!ResolveSheetState(c).known && std::strstr(ResolveSheetState(c).why, "COMMON"));
+        SheetStateInputs r{true, {Lookup::Known, RT}, absent, absent};
+        CHECK(!ResolveSheetState(r).known && std::strstr(ResolveSheetState(r).why, "render target"));
+    }},
     {"HUD paste: real pixels within one pixel of a HUD difference replace the generated picture", [] {
         const uint32_t w = 7, h = 5;
         std::vector<float> real(w * h * 3, 0.2f), hf(w * h * 3, 0.2f), gen(w * h * 3, 0.5f);
