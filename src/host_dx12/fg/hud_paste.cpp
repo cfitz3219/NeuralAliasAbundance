@@ -1,5 +1,7 @@
 #include "host_dx12/fg/hud_paste.hpp"
 
+#include "host_dx12/color/color_space.hpp"
+
 #include <d3dcompiler.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
@@ -16,7 +18,21 @@ Texture2D<float4> hud_free : register(t1);
 RWTexture2D<float4> generated : register(u0);
 cbuffer K : register(b0) { uint w, h; };
 groupshared uint flags[18 * 18];
+// NA_PICTURE (na::color::ShaderMode): 2 linear FP16 (the proven rule), 0 SDR display-encoded
+// (the stored value is already in display terms), 1 PQ (decoded to the linear scale of mode 2).
+#if NA_PICTURE == 0
+float3 display(float3 c) { return saturate(c); }
+#elif NA_PICTURE == 1
+float3 linear80(float3 e)
+{
+    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    float3 p = pow(saturate(e), 1.0 / m2);
+    return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1) * 125.0;
+}
+float3 display(float3 c) { return min(pow(max(linear80(c), 0.0), 1.0 / 2.2), 1.0); }
+#else
 float3 display(float3 c) { return min(pow(max(c, 0.0), 1.0 / 2.2), 1.0); }
+#endif
 uint hud_at(int2 p)
 {
     if (p.x < 0 || p.y < 0 || p.x >= int(w) || p.y >= int(h)) return 0;
@@ -37,18 +53,6 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_Gro
     if (any) generated[p] = real_frame[p];
 }
 )";
-DXGI_FORMAT view_format(DXGI_FORMAT f)
-{
-    switch (f) {
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    default: return f;
-    }
-}
 } // namespace
 
 bool HudPaste::Init(ID3D12Device* device)
@@ -66,26 +70,40 @@ bool HudPaste::Init(ID3D12Device* device)
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_))))
         return false;
-    if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "hud_paste", nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
-        return false;
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = root_.Get();
-    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    // One pipeline per picture encoding. The linear FP16 one (the proven rule) decides whether the
+    // pass is usable at all; a failed SDR or PQ variant only leaves that encoding unsupported
+    // (its pictures are then not shown, with the reason, as before this change).
+    ComPtr<ID3D12PipelineState> made[kEncodings];
+    for (uint32_t e = 0; e < kEncodings; ++e) {
+        char mode[2] = {char('0' + e), 0};
+        const D3D_SHADER_MACRO defines[] = {{"NA_PICTURE", mode}, {nullptr, nullptr}};
+        code.Reset();
+        err.Reset();
+        if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "hud_paste", defines, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+            continue;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = root_.Get();
+        pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&made[e])))) made[e].Reset();
+    }
+    if (!made[kLinear]) return false;
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3 * kPages, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    ComPtr<ID3D12PipelineState> pso;
-    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso))) || FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_))))
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_))))
         return false;
     inc_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     device_ = device;
-    pso_ = pso;
+    for (uint32_t e = 0; e < kEncodings; ++e) variants_[e] = made[e];
+    pso_ = made[kLinear];
     return true;
 }
 
 bool HudPaste::Record(ID3D12GraphicsCommandList* list, ID3D12Resource* generated, ID3D12Resource* real, ID3D12Resource* hudfree,
-                      uint32_t w, uint32_t h, DXGI_FORMAT format, uint32_t slot)
+                      uint32_t w, uint32_t h, DXGI_FORMAT format, uint32_t slot, uint32_t encoding)
 {
-    if (!pso_ || !list || !generated || !real || !hudfree || !w || !h) return false;
-    const DXGI_FORMAT vf = view_format(format);
+    if (!pso_ || !list || !generated || !real || !hudfree || !w || !h || encoding >= kEncodings) return false;
+    ID3D12PipelineState* pso = variants_[encoding].Get();
+    if (!pso) return false; // this picture encoding's variant did not build (Init kept the others)
+    const DXGI_FORMAT vf = na::color::ViewFormat(format);
     auto cpu = heap_->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += SIZE_T(slot % kPages) * 3 * inc_;
     auto gpu = heap_->GetGPUDescriptorHandleForHeapStart();
@@ -107,7 +125,7 @@ bool HudPaste::Record(ID3D12GraphicsCommandList* list, ID3D12Resource* generated
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootSignature(root_.Get());
-    list->SetPipelineState(pso_.Get());
+    list->SetPipelineState(pso);
     list->SetComputeRootDescriptorTable(0, gpu);
     const uint32_t k[2] = {w, h};
     list->SetComputeRoot32BitConstants(1, 2, k, 0);

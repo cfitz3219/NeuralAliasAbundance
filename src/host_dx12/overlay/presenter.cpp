@@ -15,6 +15,7 @@
 #include <mutex>
 #include <vector>
 
+#include "host_dx12/color/color_space.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/fg/hud_paste.hpp"
 #include "host_dx12/fg/steady_pass.hpp"
@@ -1698,6 +1699,7 @@ HRESULT Present(const PresentArgs& a)
             // Still-area steadying (Astra): on the generated picture, before the HUD paste, from the two
             // consecutive real HUD-free frames. Only a valid pair: anything else shows the unmodified picture.
             s.steady_ran = false;
+            const uint32_t picture = na::color::ShaderMode(na::color::ForStoredPicture(fi.format, fi.hdr)); // SDR / PQ / linear FP16
             if (count) {
                 const fg::UsedMotion um = fg::LastUsedMotion();
                 const uint64_t prev_id = c->steady_prev_id, epoch = g_hud_epoch.load(std::memory_order_relaxed);
@@ -1713,7 +1715,7 @@ HRESULT Present(const PresentArgs& a)
                 else {
                     const uint32_t page = static_cast<uint32_t>(c->frame_id % na::fg::SteadyPass::kPages);
                     if (g_steady.Record(c->list_gen.Get(), outs[0], older.hudfree.Get(), s.hudfree.Get(), um.filled, fi.width, fi.height,
-                                        um.mv_scale_x, um.mv_scale_y, page)) {
+                                        um.mv_scale_x, um.mv_scale_y, page, picture)) {
                         s.steady_ran = true;
                         s.steady_page = page;
                         s.steady_pixels = fi.width * fi.height;
@@ -1728,7 +1730,7 @@ HRESULT Present(const PresentArgs& a)
             // A generated picture whose HUD could not be pasted is never shown (it would carry a warped HUD).
             for (uint32_t i = 0; i < count; ++i)
                 if (!g_paste.Record(c->list_gen.Get(), outs[i], s.real_copy.Get(), s.hudfree.Get(), fi.width, fi.height, fi.format,
-                                    static_cast<uint32_t>((c->frame_id * kMaxGenerated + i) % na::fg::HudPaste::kPages))) {
+                                    static_cast<uint32_t>((c->frame_id * kMaxGenerated + i) % na::fg::HudPaste::kPages), picture)) {
                     live_first("HUD pasted onto the generated picture", false, "the paste pass is not ready; the picture is not shown");
                     count = 0;
                     break;
