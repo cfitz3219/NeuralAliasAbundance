@@ -36,6 +36,9 @@
 #include "test_support.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/fg/hud_paste.hpp"
+#include "host_dx12/fg/steady_pass.hpp"
+#include "core/fold_shading.hpp"
+#include <algorithm>
 #include "host_dx12/settings.hpp"
 
 
@@ -334,7 +337,11 @@ int main(int argc, char** argv)
     const std::string lut_dir = argc > 8 ? argv[8] : out;
     CreateDirectoryA(out.c_str(), nullptr);
     char tag[64];
-    snprintf(tag, sizeof tag, "%s-h%d-x%u", cam_name.c_str(), hud_mode, mult);
+    {
+        char tag_env[24] = {};
+        GetEnvironmentVariableA("NA_FG_TAG", tag_env, sizeof tag_env);
+        snprintf(tag, sizeof tag, "%s-h%d-x%u%s%s", cam_name.c_str(), hud_mode, mult, tag_env[0] ? "-" : "", tag_env);
+    }
     fopen_s(&g_log, (out + "\\fg-" + tag + ".log").c_str(), "wb");
     fopen_s(&g_ngx_log, (out + "\\ngx-" + tag + ".log").c_str(), "wb");
     Log("fg_capture_replay %s frames %u..%u camera %s hudless %d multiplier %u", cap.c_str(), first, last, cam_name.c_str(), use_hudless ? 1 : 0, mult);
@@ -404,12 +411,37 @@ int main(int argc, char** argv)
     na::fg::Camera cam{};
     const bool zero_cam = cam_name == "zero";
     if (!zero_cam) cam = MakeCamera(static_cast<float>(std::atof(cam_name.c_str() + 1)), aspect, m0.depth_inverted);
+    {   // NA_FG_CAMMOTION=1: the motion INCLUDES the camera's motion (CameraMotionIncluded=1) even with the zero camera
+        char cm[8] = {};
+        if (GetEnvironmentVariableA("NA_FG_CAMMOTION", cm, sizeof cm) && cm[0] == '1') cam.camera_motion = 1;
+        Log("camera motion included in the motion: %u", cam.camera_motion);
+        char iv[32] = {};
+        if (GetEnvironmentVariableA("NA_FG_INVALID", iv, sizeof iv)) cam.invalid_motion = static_cast<float>(std::atof(iv)); // the value meaning "no motion known"
+        if (GetEnvironmentVariableA("NA_FG_DILATED", iv, sizeof iv) && iv[0] == '1') cam.dilated = 1;
+        Log("motion invalid value %g, dilated %u", cam.invalid_motion, cam.dilated);
+    }
     Log("camera %s: fov %.1f deg aspect %.4f near %.2f far %.0f inverted %u, matrices pair-check %d", cam_name.c_str(), cam.fov * 57.29578f, cam.aspect,
         cam.near_plane, cam.far_plane, cam.inverted, na::fg::InversePair(cam.view_to_clip, cam.clip_to_view) ? 1 : 0);
 
+    // Live-input variants (2026-11-26, the shimmer study), by environment so the argument list stays:
+    //   NA_FG_FOLD=performance  depth and motion as the live Performance level hands them to Frame Generation:
+    //                           half size, the last pixel of each 2x2 block, jitter declared for that pixel
+    //                           (core/fold_shading.hpp), motion in folded pixels.
+    //   NA_FG_MOTION_DIR=DIR    motion from DIR\NNNNN-motion.raw (float2, tight rows, render size of this run;
+    //                           flow_motion_dump --fold-input performance writes the folded ones, folded pixels)
+    //   NA_FG_ZERO_MOTION=1     all motion zero (what NVIDIA does with no motion from us)
+    //   NA_FG_TAG=text          appended to the output names
+    char env[512] = {};
+    const bool fold_perf = GetEnvironmentVariableA("NA_FG_FOLD", env, sizeof env) && !std::strcmp(env, "performance");
+    std::string motion_dir;
+    if (GetEnvironmentVariableA("NA_FG_MOTION_DIR", env, sizeof env)) motion_dir = env;
+    const bool zero_motion = GetEnvironmentVariableA("NA_FG_ZERO_MOTION", env, sizeof env) && env[0] == '1';
+    const uint32_t iw = fold_perf ? (rw + 1) / 2 : rw, ih = fold_perf ? (rh + 1) / 2 : rh;
+    Log("inputs: %s depth %ux%u, motion %s", fold_perf ? "folded (Performance, kept pixel 1,1)" : "full-size", iw, ih,
+        zero_motion ? "zero" : motion_dir.empty() ? (fold_perf ? "capture motion at the kept pixel" : "capture motion") : motion_dir.c_str());
     Texture depth, motion, color, hudless;
-    if (!MakeTexture(d.device.Get(), rw, rh, DXGI_FORMAT_R32_FLOAT, 4, &depth) ||
-        !MakeTexture(d.device.Get(), m0.motion.w, m0.motion.h, static_cast<DXGI_FORMAT>(m0.motion.format), Bpp(m0.motion.format), &motion) ||
+    if (!MakeTexture(d.device.Get(), iw, ih, DXGI_FORMAT_R32_FLOAT, 4, &depth) ||
+        !MakeTexture(d.device.Get(), iw, ih, DXGI_FORMAT_R32G32_FLOAT, 8, &motion) ||
         !MakeTexture(d.device.Get(), W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &color) ||
         !MakeTexture(d.device.Get(), W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &hudless)) { Log("texture creation failed"); return 1; }
     // UI inputs for NVIDIA's recomposition (SDK: UI = four channels, colour pre-multiplied by alpha;
@@ -438,6 +470,13 @@ int main(int argc, char** argv)
     la.list->Close();
     lb.list->Close();
 
+    char steady_env[8] = {}, raw_env[8] = {};
+    const bool steady_on = GetEnvironmentVariableA("NA_FG_STEADY", steady_env, sizeof steady_env) && steady_env[0] == '1';
+    const bool raw_out = GetEnvironmentVariableA("NA_FG_RAW_OUT", raw_env, sizeof raw_env) && raw_env[0] == '1';
+    na::fg::SteadyPass steady;
+    if (steady_on) { char why[160] = {}; if (!steady.Init(d.device.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, why, sizeof why)) { Log("steadying: %s", why); return 1; } }
+    auto color_prev = test::CreateTexture(d.device.Get(), W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_FLAG_NONE);
+    bool have_prev = false;
     na::fg::HudPaste paste; // live T2 (mode 5)
     if (hud_mode == 5 && !paste.Init(d.device.Get())) { Log("HUD paste pass could not be built"); return 1; }
     float lut[3][256] = {};
@@ -445,13 +484,67 @@ int main(int argc, char** argv)
     uint64_t frame_id = 0;
     double total_ms = 0;
     uint32_t timed = 0, generated_total = 0;
-    for (uint32_t j = first; j <= last; ++j) {
+    // NA_FG_STEP=2: every other saved frame is a "real" frame and the skipped one in between is the truth the
+    // generated picture can be compared with; the motion of a pair is the sum of its two saved planes.
+    char step_env[8] = {};
+    const uint32_t step = GetEnvironmentVariableA("NA_FG_STEP", step_env, sizeof step_env) && step_env[0] == '2' ? 2u : 1u;
+    for (uint32_t j = first; j <= last; j += step) {
         Meta m;
         if (!ReadMeta(cap, j, &m)) { Log("cannot read meta %u", j); return 1; }
         // Inputs at the "evaluate": depth and motion of frame j.
         la.Reset();
-        if (!ReadPlane(cap, j, "depth", m.depth, &rows) || !Fill(la.list.Get(), &depth, rows) ||
-            !ReadPlane(cap, j, "motion", m.motion, &rows) || !Fill(la.list.Get(), &motion, rows)) { Log("frame %u: depth/motion not readable", j); return 1; }
+        std::vector<uint8_t> drows, mrows;
+        if (!ReadPlane(cap, j, "depth", m.depth, &drows) || !ReadPlane(cap, j, "motion", m.motion, &mrows) || m.motion.format != 16) { Log("frame %u: depth/motion not readable", j); return 1; }
+        if (step == 2 && j > first) { // pair (j-2 -> j): add the skipped frame's motion
+            std::vector<uint8_t> prev;
+            Meta mp;
+            if (!ReadMeta(cap, j - 1, &mp) || !ReadPlane(cap, j - 1, "motion", mp.motion, &prev) || prev.size() != mrows.size()) { Log("frame %u: motion of %u not readable", j, j - 1); return 1; }
+            for (size_t k = 0; k + 4 <= mrows.size(); k += 4) { float u, v; std::memcpy(&u, &mrows[k], 4); std::memcpy(&v, &prev[k], 4); u += v; std::memcpy(&mrows[k], &u, 4); }
+        }
+        float mv_div = 1.f; // capture motion is in full-size pixels; folded pixels are half of that
+        if (fold_perf) {
+            std::vector<uint8_t> fd(static_cast<size_t>(iw) * ih * 4), fm(static_cast<size_t>(iw) * ih * 8);
+            for (uint32_t y = 0; y < ih; ++y)
+                for (uint32_t x = 0; x < iw; ++x) {
+                    const size_t sx = (std::min)(2u * x + 1u, rw - 1), sy = (std::min)(2u * y + 1u, rh - 1);
+                    std::memcpy(&fd[(static_cast<size_t>(y) * iw + x) * 4], &drows[(sy * rw + sx) * 4], 4);
+                    std::memcpy(&fm[(static_cast<size_t>(y) * iw + x) * 8], &mrows[(sy * m.motion.w + sx) * 8], 8);
+                }
+            drows.swap(fd); mrows.swap(fm); mv_div = 2.f;
+        }
+        if (!motion_dir.empty()) {
+            char mf[64];
+            snprintf(mf, sizeof mf, "\\%05u-motion.raw", j);
+            FILE* fp = nullptr;
+            std::vector<uint8_t> given(static_cast<size_t>(iw) * ih * 8);
+            if (fopen_s(&fp, (motion_dir + mf).c_str(), "rb") != 0 || !fp || std::fread(given.data(), 1, given.size(), fp) != given.size()) {
+                if (fp) std::fclose(fp);
+                Log("frame %u: motion plane %s%s not readable at %ux%u", j, motion_dir.c_str(), mf, iw, ih); return 1;
+            }
+            std::fclose(fp);
+            mrows.swap(given); mv_div = 1.f; // already in this run's pixels
+        }
+        if (zero_motion) std::fill(mrows.begin(), mrows.end(), static_cast<uint8_t>(0));
+        {   // NA_FG_CONST_MOTION=px: every vector (px, 0) in this run's pixels: does the runtime follow our motion at all?
+            char cmv[16] = {};
+            if (GetEnvironmentVariableA("NA_FG_CONST_MOTION", cmv, sizeof cmv)) {
+                const float v = static_cast<float>(std::atof(cmv)) * mv_div, z = 0.f;
+                for (size_t k = 0; k + 8 <= mrows.size(); k += 8) { std::memcpy(&mrows[k], &v, 4); std::memcpy(&mrows[k + 4], &z, 4); }
+            }
+        }
+        if (mv_div != 1.f)
+            for (size_t k = 0; k + 4 <= mrows.size(); k += 4) { float v; std::memcpy(&v, &mrows[k], 4); v /= mv_div; std::memcpy(&mrows[k], &v, 4); }
+        {   // NA_FG_DEADZONE=px: vectors shorter than this (render pixels) become exactly zero
+            char dz[16] = {};
+            if (GetEnvironmentVariableA("NA_FG_DEADZONE", dz, sizeof dz)) {
+                const float lim = static_cast<float>(std::atof(dz));
+                for (size_t k = 0; k + 8 <= mrows.size(); k += 8) {
+                    float u, v; std::memcpy(&u, &mrows[k], 4); std::memcpy(&v, &mrows[k + 4], 4);
+                    if (u * u + v * v < lim * lim) { u = v = 0.f; std::memcpy(&mrows[k], &u, 4); std::memcpy(&mrows[k + 4], &v, 4); }
+                }
+            }
+        }
+        if (!Fill(la.list.Get(), &depth, drows) || !Fill(la.list.Get(), &motion, mrows)) { Log("frame %u: depth/motion not filled", j); return 1; }
         na::fg::EvalInputs in{};
         in.engine_frame = m.ordinal;
         in.camera = cam;
@@ -459,9 +552,21 @@ int main(int argc, char** argv)
         in.camera_free = hud_mode == 5;  // live T2: the module's own Route B camera-free path
         in.depth = depth.tex.Get();
         in.motion = motion.tex.Get();
-        in.render_w = rw; in.render_h = rh; in.out_w = W; in.out_h = H;
-        in.jitter_x = m.jitter_x; in.jitter_y = m.jitter_y;
+        in.render_w = iw; in.render_h = ih; in.out_w = W; in.out_h = H;
+        in.jitter_x = fold_perf ? na::fold::DeclaredJitter(2, 1, m.jitter_x) : m.jitter_x;
+        in.jitter_y = fold_perf ? na::fold::DeclaredJitter(2, 1, m.jitter_y) : m.jitter_y;
         in.mv_scale_x = m.mv_x; in.mv_scale_y = m.mv_y;
+        {   // NA_FG_MVSCALE_PIXELS=1: hand the runtime a scale that leaves the vectors in pixels (MvecScale = 1)
+            char ms[8] = {};
+            if (GetEnvironmentVariableA("NA_FG_MVSCALE_PIXELS", ms, sizeof ms) && ms[0] == '1') { in.mv_scale_x *= static_cast<float>(iw); in.mv_scale_y *= static_cast<float>(ih); }
+        }
+        {   // NA_FG_PXSCALE=kx,ky: MvecScale handed to the runtime = (kx, ky) times "render-size pixels"
+            char ps[48] = {};
+            if (GetEnvironmentVariableA("NA_FG_PXSCALE", ps, sizeof ps)) {
+                float kx = 1.f, ky = 1.f;
+                if (sscanf_s(ps, "%f,%f", &kx, &ky) == 2) { in.mv_scale_x = m.mv_x * kx * static_cast<float>(iw); in.mv_scale_y = m.mv_y * ky * static_cast<float>(ih); }
+            }
+        }
         in.mv_low_res = true;
         in.reset = j == first ? 1u : 0u;
         in.depth_inverted = m.depth_inverted ? 1u : 0u;
@@ -472,7 +577,22 @@ int main(int argc, char** argv)
         na::fg::Execute(d.queue.Get(), 1, al, Forward);
         // The real frame and (optionally) its HUD-free picture.
         lb.Reset();
-        if (!ReadPlane(cap, j, "present", m.present, &rows)) { Log("frame %u: present not readable", j); return 1; }
+        {   // NA_FG_BB_PLANE=name: another saved plane as the back buffer (e.g. dlssout, before our sharpening and the
+            // game's post); NA_FG_BB_DIR=DIR: DIR\NNNNN-bb.raw (RGBA16F, tight rows) made offline.
+            char bbp[32] = {}, bbd[400] = {};
+            const bool by_dir = GetEnvironmentVariableA("NA_FG_BB_DIR", bbd, sizeof bbd) != 0;
+            const bool by_plane = !by_dir && GetEnvironmentVariableA("NA_FG_BB_PLANE", bbp, sizeof bbp) != 0;
+            if (by_dir) {
+                char bf[64]; snprintf(bf, sizeof bf, "\\%05u-bb.raw", j);
+                FILE* fp = nullptr; rows.assign(static_cast<size_t>(W) * H * 8, 0);
+                if (fopen_s(&fp, (std::string(bbd) + bf).c_str(), "rb") != 0 || !fp || std::fread(rows.data(), 1, rows.size(), fp) != rows.size()) {
+                    if (fp) std::fclose(fp); Log("frame %u: back buffer file not readable", j); return 1; }
+                std::fclose(fp);
+            } else if (by_plane) {
+                const PlaneInfo pi = Plane(m.text, bbp);
+                if (!ReadPlane(cap, j, bbp, pi, &rows)) { Log("frame %u: plane %s not readable", j, bbp); return 1; }
+            } else if (!ReadPlane(cap, j, "present", m.present, &rows)) { Log("frame %u: present not readable", j); return 1; }
+        }
         bool have_hudless = false, have_ui = false, have_alpha = false;
         std::vector<uint8_t> hl;
         if (use_hudless) {
@@ -540,11 +660,29 @@ int main(int argc, char** argv)
         ID3D12Resource* op[kOut] = {outs[0].Get(), outs[1].Get()};
         lb.list->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         const uint32_t n = na::fg::Generate(lb.list.Get(), d.device.Get(), f, op, mult - 1 < kOut ? mult - 1 : kOut);
+        // NA_FG_STEADY=1: Astra's still-area steadying (fg/steady_pass), as the live presenter runs it: on the
+        // generated picture, with the previous and current back buffers and the motion in render pixels.
+        // Route B (mode 5) uses the module's prepared motion (filled, no dead zone) exactly as live does.
+        if (steady_on && have_prev) {
+            const na::fg::UsedMotion um = na::fg::LastUsedMotion();
+            ID3D12Resource* sm = um.filled ? um.filled : motion.tex.Get();
+            const float sx = um.filled ? um.mv_scale_x : m.mv_x, sy = um.filled ? um.mv_scale_y : m.mv_y;
+            for (uint32_t i = 0; i < n; ++i)
+                if (!steady.Record(lb.list.Get(), outs[i].Get(), color_prev.Get(), color.tex.Get(), sm, W, H, sx, sy, i)) { Log("frame %u: steadying not recorded", j); return 1; }
+        }
         if (hud_mode == 5) /* live T2: the real frame's HUD through its own mask, by the live pass */
             for (uint32_t i = 0; i < n; ++i)
                 if (!paste.Record(lb.list.Get(), outs[i].Get(), hudless.tex.Get(), color.tex.Get(), W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, i)) { Log("frame %u: HUD paste not recorded", j); return 1; }
         lb.list->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
         lb.list->ResolveQueryData(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, qrb.Get(), 0);
+        {   // keep this back buffer as the next pair's older picture
+            D3D12_RESOURCE_BARRIER pb[2] = {test::Transition(color.tex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                            test::Transition(color_prev.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+            lb.list->ResourceBarrier(2, pb);
+            lb.list->CopyResource(color_prev.Get(), color.tex.Get());
+            for (auto& x : pb) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            lb.list->ResourceBarrier(2, pb);
+        }
         for (uint32_t i = 0; i < n; ++i) {
             const auto b1 = test::Transition(outs[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             lb.list->ResourceBarrier(1, &b1);
@@ -576,7 +714,16 @@ int main(int argc, char** argv)
             char fn[160];
             snprintf(fn, sizeof fn, "\\gen-%s-%05u-%u.ppm", tag, j, i + 1);
             SavePpm(out + fn, o, ofp.Footprint.RowPitch, W, H);
+            if (raw_out) { // tight RGBA16F, before any display clamp (Astra's measure.py reads these)
+                snprintf(fn, sizeof fn, "\\gen-%s-%05u-%u.raw", tag, j, i + 1);
+                FILE* fp = nullptr;
+                if (fopen_s(&fp, (out + fn).c_str(), "wb") == 0 && fp) {
+                    for (uint32_t y = 0; y < H; ++y) std::fwrite(o.data() + static_cast<size_t>(y) * ofp.Footprint.RowPitch, 1, static_cast<size_t>(W) * 8, fp);
+                    std::fclose(fp);
+                }
+            }
         }
+        have_prev = true;
         if (s.latched_off) {
             // The runtime may report a recoverable first-evaluate error ("Re-initializing DLSS-FG from recoverable
             // error state" in its log). Retry once to see whether the next frame works; a second failure stops.
