@@ -19,6 +19,9 @@
 #include "host_dx12/fg/hud_paste.hpp"
 #include "host_dx12/settings.hpp"
 #include "core/live_frame_gen.hpp"
+#include "host_dx12/diag/event_log.hpp"
+
+#include <string>
 
 #include <dxgi1_4.h>
 #include <thread>
@@ -88,6 +91,21 @@ std::mutex g_live_text_m;
 char g_prepare_text[112] = "";
 char g_hudfree_text[112] = "";
 void set_live_text(char* dst, const char* text) { std::lock_guard<std::mutex> lock(g_live_text_m); strncpy_s(dst, 112, text ? text : "", _TRUNCATE); }
+// x2 chosen since / last generated picture recorded (GetTickCount64): "on but waiting" after a second.
+std::atomic<uint64_t> g_fg_on_since{0}, g_last_generated_tick{0};
+// Every live link logs its first success and its first failure, once each.
+void live_first(const char* link, bool ok, const char* detail)
+{
+    static std::mutex m;
+    static std::vector<std::string> seen;
+    const std::string key = std::string(ok ? "+" : "-") + link;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto& s : seen) if (s == key) return;
+        if (seen.size() < 64) seen.push_back(key);
+    }
+    na::eventlog::Emit("fg_live", "FIRST %s %s%s%s", ok ? "SUCCESS" : "FAILURE", link, detail && *detail ? ": " : "", detail ? detail : "");
+}
 
 void set_reason(const char* t)
 {
@@ -817,8 +835,8 @@ DWORD WINAPI present_thread(LPVOID p)
                 HRESULT ghr = present_texture(c, pq, s.interp[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, s.alloc_present[i].Get(),
                                               job.sync, job.flags, true, job.engine_frame, job.slot*kQueriesPerSlot+2+i);
                 if (SUCCEEDED(ghr) || ghr==DXGI_ERROR_WAS_STILL_DRAWING) s.copied_mask |= 1u<<i;
-                if (FAILED(ghr)) g_generated_dropped.fetch_add(1, std::memory_order_relaxed);
-                else g_generated_shown.fetch_add(1, std::memory_order_relaxed);
+                if (FAILED(ghr)) { g_generated_dropped.fetch_add(1, std::memory_order_relaxed); if (g_live.load(std::memory_order_relaxed)) { char d[64]; snprintf(d, sizeof d, "Present returned 0x%08X", static_cast<unsigned>(ghr)); live_first("generated picture presented", false, d); } }
+                else { g_generated_shown.fetch_add(1, std::memory_order_relaxed); if (g_live.load(std::memory_order_relaxed)) live_first("generated picture presented", true, nullptr); }
             } else {
                 HRESULT rhr=present_texture(c, pq, s.real_copy.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.alloc_present[i].Get(),
                                 job.sync, job.flags, false, job.engine_frame, job.slot*kQueriesPerSlot+2+i);
@@ -940,9 +958,23 @@ LiveStats GetLiveStats()
     s.vram_budget_mb = g_vram_budget_mb.load();
     s.vram_usage_mb = g_vram_usage_mb.load();
     s.extra_mb = g_extra_mb.load();
-    std::lock_guard<std::mutex> lock(g_live_text_m);
-    strncpy_s(s.prepare, g_prepare_text, _TRUNCATE);
-    strncpy_s(s.hudfree_why, g_hudfree_text, _TRUNCATE);
+    const fg::Stats fs = fg::GetStats(); // before our text lock: fg's own lock is never taken under it
+    {
+        std::lock_guard<std::mutex> lock(g_live_text_m);
+        strncpy_s(s.prepare, g_prepare_text, _TRUNCATE);
+        strncpy_s(s.hudfree_why, g_hudfree_text, _TRUNCATE);
+    }
+    // Never a silent "nothing": x2 chosen, and no generated picture for more than a second.
+    const uint64_t since = g_fg_on_since.load(), last = g_last_generated_tick.load(), now = GetTickCount64();
+    if (s.live && since) {
+        const uint64_t from = last > since ? last : since;
+        if (now > from + 1000) {
+            s.waiting_ms = static_cast<uint32_t>(now - from);
+            if (!s.ready) snprintf(s.waiting, sizeof s.waiting, "x2 is on but waiting: %s", s.prepare[0] ? s.prepare : "the extra textures are not ready yet");
+            else if (s.hudfree_why[0]) snprintf(s.waiting, sizeof s.waiting, "x2 is on but waiting: the picture without the HUD could not be made (%s)", s.hudfree_why);
+            else snprintf(s.waiting, sizeof s.waiting, "x2 is on but waiting: %s", fs.reason);
+        }
+    }
     return s;
 }
 void SetRenderScale(float scale, UpscaleFn upscale, void* user)
@@ -1229,6 +1261,10 @@ HRESULT Present(const PresentArgs& a)
         }
     }
     bool fg_on = na::settings::Get().fg_enabled.load(std::memory_order_relaxed) != 0;
+    if (live) { // "x2 is on but waiting" is measured from the moment x2 was chosen
+        if (!fg_on) g_fg_on_since.store(0, std::memory_order_relaxed);
+        else if (!g_fg_on_since.load(std::memory_order_relaxed)) g_fg_on_since.store(GetTickCount64(), std::memory_order_relaxed);
+    }
     uint32_t backlog_now;
     {
         std::lock_guard<std::mutex> jl(c->jm);
@@ -1329,6 +1365,7 @@ HRESULT Present(const PresentArgs& a)
         const char* why = nullptr;
         const HudFreeFn provider = g_hudfree_fn.load(std::memory_order_acquire);
         ID3D12Resource* hf = provider ? provider(&why) : nullptr;
+        if (!want_fg) set_live_text(g_hudfree_text, ""); // a menu or an Off frame: the HUD-free reason no longer applies
         if (want_fg) {
             if (hf && s.hudfree) {
                 D3D12_RESOURCE_BARRIER pre[2] = {transition(hf, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -1339,13 +1376,15 @@ HRESULT Present(const PresentArgs& a)
                                                   transition(s.hudfree.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
                 c->list_gen->ResourceBarrier(2, post);
                 gen_color = s.hudfree.Get();
+                live_first("HUD-free picture used as Frame Generation's input", true, nullptr);
                 s.hudfree_used = true;
                 set_live_text(g_hudfree_text, "");
             } else {
                 char text[112];
                 snprintf(text, sizeof text, "No generated picture this frame: %s", why ? why : "the HUD-free picture is not ready.");
-                set_live_text(g_hudfree_text, text);
+                set_live_text(g_hudfree_text, why ? why : "the picture without the HUD could not be made");
                 fg::NotePaused(text);
+                live_first("HUD-free picture used as Frame Generation's input", false, text);
                 g_skip_hudfree.fetch_add(1, std::memory_order_relaxed);
                 want_fg = false;
             }
@@ -1386,9 +1425,18 @@ HRESULT Present(const PresentArgs& a)
         if (live) {
             c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 2);
             // T2: the newer real frame's HUD, exactly, through its own HUD mask.
+            // A generated picture whose HUD could not be pasted is never shown (it would carry a warped HUD).
             for (uint32_t i = 0; i < count; ++i)
-                g_paste.Record(c->list_gen.Get(), outs[i], s.real_copy.Get(), s.hudfree.Get(), fi.width, fi.height, fi.format,
-                               static_cast<uint32_t>((c->frame_id * kMaxGenerated + i) % na::fg::HudPaste::kPages));
+                if (!g_paste.Record(c->list_gen.Get(), outs[i], s.real_copy.Get(), s.hudfree.Get(), fi.width, fi.height, fi.format,
+                                    static_cast<uint32_t>((c->frame_id * kMaxGenerated + i) % na::fg::HudPaste::kPages))) {
+                    live_first("HUD pasted onto the generated picture", false, "the paste pass is not ready; the picture is not shown");
+                    count = 0;
+                    break;
+                }
+            if (count) {
+                live_first("HUD pasted onto the generated picture", true, nullptr);
+                g_last_generated_tick.store(GetTickCount64(), std::memory_order_relaxed);
+            }
         }
         if (count) { // copy the runtime's answer out for the present thread
             D3D12_RESOURCE_BARRIER b3 = transition(s.veto.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);

@@ -12,6 +12,9 @@
 #include <vector>
 
 #include "host_dx12/settings.hpp"
+#include "host_dx12/diag/event_log.hpp"
+
+#include <string>
 
 #pragma comment(lib, "version.lib")
 
@@ -157,7 +160,30 @@ void note_loaded_file()
 }
 #endif
 
-void set_reason(const char* text) { strncpy_s(g.reason, text, _TRUNCATE); }
+// Live Frame Generation: one run must show how far it got. Every link logs its first success and
+// its first failure (once each), and every distinct reason text is logged the first time it appears.
+void milestone(const char* link, bool ok, const char* detail)
+{
+    static std::mutex m;
+    static std::vector<std::string> seen;
+    std::string key = std::string(ok ? "+" : "-") + link;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto& s : seen) if (s == key) return;
+        if (seen.size() < 64) seen.push_back(key);
+    }
+    na::eventlog::Emit("fg_live", "FIRST %s %s%s%s", ok ? "SUCCESS" : "FAILURE", link, detail && *detail ? ": " : "", detail ? detail : "");
+}
+void set_reason(const char* text)
+{
+    if (std::strcmp(g.reason, text)) {
+        static std::vector<std::string> seen; // caller holds g.m
+        bool fresh = seen.size() < 48;
+        for (const auto& s : seen) if (s == text) { fresh = false; break; }
+        if (fresh) { seen.emplace_back(text); na::eventlog::Emit("fg_live", "reason: %s", text); }
+    }
+    strncpy_s(g.reason, text, _TRUNCATE);
+}
 void latch(const char* text)
 {
     set_reason(text);
@@ -310,6 +336,11 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
         return false;
     }
     g.feature = handle;
+    {
+        char d[160];
+        snprintf(d, sizeof d, "%ux%u format %u from %ux%u, HUD-less %u", f.width, f.height, static_cast<unsigned>(f.format), g.in_w, g.in_h, f.hudless ? 1u : 0u);
+        milestone("NVIDIA Frame Generation feature created", true, d);
+    }
     note_loaded_file();
     g.feat_w = f.width;
     g.feat_h = f.height;
@@ -439,6 +470,7 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
         return false;
     }
     g.evaluates.fetch_add(1, std::memory_order_relaxed);
+    milestone("Frame Generation evaluate recorded", true, nullptr);
     return true;
 }
 #endif
@@ -485,6 +517,7 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         !covers(md, in.mv_base_x, in.mv_base_y, in.render_w, in.render_h)) {
         g.skipped.fetch_add(1, std::memory_order_relaxed);
         g.mv_size_mismatch.store(1, std::memory_order_release); // A74 review: say so instead of "waiting"
+        milestone("inputs recorded at the DLSS evaluate", false, "the motion or depth does not cover the rendering size");
         return;
     }
     g.mv_size_mismatch.store(0, std::memory_order_relaxed);
@@ -537,6 +570,11 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     receipt->depth = g.recording_depth;
     receipt->motion = g.recording_motion;
     g.inputs_recorded.fetch_add(1, std::memory_order_relaxed);
+    {
+        char d[96];
+        snprintf(d, sizeof d, "%ux%u, camera %s, reset %u", in.render_w, in.render_h, in.camera_free ? "free (zero)" : (in.camera_valid ? "game" : "none"), in.reset);
+        milestone("inputs recorded at the DLSS evaluate", true, d);
+    }
 }
 
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
@@ -556,6 +594,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         p = {};
         g.pending_count.fetch_sub(1, std::memory_order_release);
         g.inputs_submitted.fetch_add(1, std::memory_order_relaxed);
+        milestone("inputs submitted with the game's list", true, nullptr);
     }
 }
 
@@ -661,7 +700,7 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
         return 0;
     }
     g.inputs_fresh = 0;
-    if(f.engine_frame && g.last_in.engine_frame!=f.engine_frame) {
+    if(f.engine_frame && !g.last_in.camera_free && g.last_in.engine_frame!=f.engine_frame) { // Route B has no engine frame to match
         g.need_reset=1; g.active.store(0); g.skipped.fetch_add(1);
         set_reason("Frame Generation is paused: camera and displayed frame do not match.");
         return 0;

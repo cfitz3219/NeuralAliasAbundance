@@ -969,13 +969,13 @@ void write_status_line()
         const float hud_avg = hud.grab_avg + hud.redraw_avg + lv.hudcopy_avg + lv.paste_avg;
         char why[160] = {};
         const bool can = na::fg::Available(why, sizeof why);
-        char fl[2048];
+        char fl[4096];
         const int fn = snprintf(fl, sizeof fl,
             "fglive on=%u choice=%s can_run=%u active=%u real_fps=%.1f shown_fps=%.1f generated_shown=%llu real_frames=%llu inline_frames=%llu presenter_frames=%llu "
             "skipped{no_hudfree=%llu menu=%llu preparing=%llu runtime_veto=%llu runtime=%llu gen_dropped=%llu late=%llu} resets{cut=%llu other=%llu} "
-            "hud{learned=%u method=\"%s\" grabs=%llu redraws=%llu skipped=%llu blended=%llu last_skip=\"%s\" verdict=\"%s\"} "
+            "hud{learned=%u method=\"%s\" grabs=%llu redraws=%llu skipped=%llu blended=%llu last_skip=\"%s\" verdict=\"%s\" submitted=%llu relearns=%llu skip_counts=\"%s\"} "
             "ms{off=%.3f/%.3f fg_eval=%.3f/%.3f hud=%.3f/%.3f grab=%.3f redraw=%.3f hudcopy=%.3f paste=%.3f presenter=%.3f/%.3f total=%.3f/%.3f} "
-            "vram_mb{budget=%llu usage=%llu extra=%llu} dlssg{path=\"%s\" version=%s loaded=%u} prepare=\"%s\" reason=\"%s\" why_not=\"%s\"\r\n",
+            "vram_mb{budget=%llu usage=%llu extra=%llu} dlssg{path=\"%s\" version=%s loaded=%u} prepare=\"%s\" reason=\"%s\" why_not=\"%s\" waiting_ms=%u waiting=\"%s\"\r\n",
             fg.enabled, fg.enabled ? "x2" : "Off", can ? 1u : 0u, fg.active, pr.base_fps, pr.shown_fps,
             static_cast<unsigned long long>(pr.generated_shown), static_cast<unsigned long long>(fg.real_frames),
             static_cast<unsigned long long>(lv.frames_inline), static_cast<unsigned long long>(lv.frames_worker),
@@ -985,15 +985,21 @@ void write_status_line()
             static_cast<unsigned long long>(fg.resets_cut), static_cast<unsigned long long>(fg.resets_other),
             hud.learned, hud.method, static_cast<unsigned long long>(hud.grabs), static_cast<unsigned long long>(hud.redraws),
             static_cast<unsigned long long>(hud.skipped), static_cast<unsigned long long>(hud.blended_backgrounds), hud.last_skip, hud.verdict,
+            static_cast<unsigned long long>(hud.submitted), static_cast<unsigned long long>(hud.relearns), hud.skip_counts,
             lv.off_ms, lv.off_avg, lv.eval_ms, lv.eval_avg, hud_last, hud_avg, hud.grab_avg, hud.redraw_avg, lv.hudcopy_avg, lv.paste_avg,
             lv.copy_ms, lv.copy_avg, lv.eval_ms + hud_last + lv.copy_ms, lv.eval_avg + hud_avg + lv.copy_avg,
             static_cast<unsigned long long>(lv.vram_budget_mb), static_cast<unsigned long long>(lv.vram_usage_mb), static_cast<unsigned long long>(lv.extra_mb),
-            file.path, file.version[0] ? file.version : "none", file.loaded ? 1u : 0u, lv.prepare, fg.reason, can ? "" : why);
+            file.path, file.version[0] ? file.version : "none", file.loaded ? 1u : 0u, lv.prepare, fg.reason, can ? "" : why, lv.waiting_ms, lv.waiting);
         if (fn > 0) WriteFile(f, fl, DWORD((std::min)(fn, int(sizeof fl) - 1)), &written, nullptr);
         static char last_why[160] = {};
         if (std::strcmp(last_why, why)) { // the log says WHY when it cannot run, once per change
             strncpy_s(last_why, why, _TRUNCATE);
             na::eventlog::Emit("fg_live", "%s", can ? "Frame Generation can run here." : why);
+        }
+        static char last_wait[200] = {};
+        if (std::strcmp(last_wait, lv.waiting)) { // x2 on but nothing generated for over a second: say why, once per change
+            strncpy_s(last_wait, lv.waiting, _TRUNCATE);
+            na::eventlog::Emit("fg_live", "%s", lv.waiting[0] ? lv.waiting : "x2 is generating pictures (or Off).");
         }
     }
     char mode_line[1536]{};

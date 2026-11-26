@@ -525,6 +525,8 @@ struct LiveHudStats {
     uint64_t sheet = 0, learn_attempts = 0;
     uint32_t run = 0;
     uint64_t grabs = 0, redraws = 0, skipped = 0, blended_backgrounds = 0;
+    uint64_t submitted = 0, relearns = 0; // HUD-free pictures whose list was submitted; shape changes relearned
+    char skip_counts[1200] = "";   // "count x reason; ..." for every skip reason seen
     char verdict[160] = "";        // what learning found (plain words)
     char last_skip[112] = "";      // why the last redraw did not happen
     char method[96] = "";          // the HUD method in use (for the results log)

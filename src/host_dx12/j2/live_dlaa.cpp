@@ -31,6 +31,7 @@
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "core/live_frame_gen.hpp"
+#include "host_dx12/nr/fg_states.hpp"
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
@@ -533,6 +534,9 @@ struct HudSheetGrab {
     ComPtr<ID3D12Resource> copy; // COPY_DEST at rest; created once, never replaced
     bool has=false,refused=false;
     uint64_t grabs=0;
+    uint64_t list_id=0,recording=0; // the recording that holds the latest copy (the sheet was its bound render target there)
+    std::vector<std::pair<ComPtr<ID3D12Resource>,uint64_t>> retired; // a replaced copy lives on until this present count
+    const char* last_refusal="the HUD sheet was not copied before its first HUD draw"; // why the last copy did not happen (static text)
 } g_hud_sheet;
 std::atomic<uint64_t> g_hud_sheet_id{0};
 std::atomic<bool> g_hud_sheet_taken{false};
@@ -540,7 +544,9 @@ void hud_sheet_grab(ID3D12GraphicsCommandList* l,uint64_t sheet) noexcept
 {
     try{
         std::lock_guard<std::mutex> lock(g_hud_sheet.m);
-        if(g_hud_sheet.refused||g_hud_sheet_taken.load(std::memory_order_relaxed))return;
+        const uint64_t list_id=uint64_t(na::observe::IdOf(l)),recording=na::observe::ListRecording(l);
+        if(g_hud_sheet.refused||(list_id&&list_id==g_hud_sheet.list_id&&recording==g_hud_sheet.recording))return; // once per recording
+        if(na::observe::ListInRenderPass(l)){g_hud_sheet.last_refusal="the HUD is drawn inside a render pass, where no copy may be recorded";return;}
         ComPtr<ID3D12Resource> r;r.Attach(na::observe::AcquireResource(static_cast<na_object_id>(sheet)));
         if(!r)return;
         const auto d=r->GetDesc();
@@ -565,7 +571,7 @@ void hud_sheet_grab(ID3D12GraphicsCommandList* l,uint64_t sheet) noexcept
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
         l->ResourceBarrier(1,&b);
         na::gputime::End(l,1);
-        g_hud_sheet.has=true;++g_hud_sheet.grabs;
+        g_hud_sheet.has=true;++g_hud_sheet.grabs;g_hud_sheet.list_id=list_id;g_hud_sheet.recording=recording;
         g_hud_sheet_taken.store(true,std::memory_order_release);
     }catch(...){}
 }
@@ -578,15 +584,26 @@ struct LiveHud {
     ComPtr<ID3D12Resource> target; // the HUD-free picture (RENDER_TARGET at rest)
     ComPtr<ID3D12DescriptorHeap> rtv;
     DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
-    bool refused = false;          // a resource could not be made: no more attempts this session
-    bool fresh = false;            // redrawn since the presenter last asked
-    bool redrawn_this_frame = false;
+    std::vector<std::pair<ComPtr<ID3D12Resource>, uint64_t>> retired; // replaced textures live until this present count
+    bool refused = false;          // a resource could not be made: no more attempts until relearned
+    bool restore_failed = false;   // the game's render target could not be put back once: off for this session
+    // The recording whose re-run succeeded, and whether the presenter may use the picture: it may
+    // only once that recording has been SUBMITTED (lists can be recorded ahead of the Present
+    // that belongs to the previous frame).
+    uint64_t done_list = 0, done_recording = 0;   // recorded, not yet submitted
+    uint64_t tried_list = 0, tried_recording = 0; // one attempt per recording, whatever the outcome
+    bool fresh = false;            // submitted since the presenter last asked
+    uint64_t fresh_present = 0;    // the present count when it was submitted: valid only for the very next Present
     uint64_t shown[3]{};           // the pictures the game presented lately (the presenter's proxies)
-    uint64_t learn_attempts = 0, grabs_seen = 0, redraws = 0, skipped = 0, blended = 0;
+    uint64_t learn_attempts = 0, redraws = 0, submitted = 0, skipped = 0, blended = 0, relearns = 0;
     uint64_t learn_after = 0;      // presents: a failed learning is tried again after this many
-    uint64_t presents = 0;
+    uint64_t presents = 0, attempts_at_present = 0, copies_at_present = 0;
+    uint32_t frames_without_final = 0, frames_without_copy = 0; // consecutive presents (relearn after 120)
     uint32_t learned = 0, run = 0;
     uint64_t sheet = 0;
+    bool barrier_logged = false, first_ok_logged = false, first_submit_logged = false;
+    struct Why { char text[112]; uint64_t n; };
+    Why whys[10]{};                // skips counted by reason (RESULTS)
     char verdict[160] = "The HUD sheet has not been looked for yet (it is learned when Frame Generation is first on).";
     char why[112] = "The HUD-free picture is not ready yet.";
     char method[96] = "none yet";
@@ -594,6 +611,10 @@ struct LiveHud {
 void live_hud_skip(const char* why) // caller holds g_live_hud.m
 {
     ++g_live_hud.skipped;
+    for (auto& w : g_live_hud.whys) {
+        if (!w.n) { strncpy_s(w.text, why, _TRUNCATE); w.n = 1; break; }
+        if (!std::strncmp(w.text, why, sizeof w.text - 1)) { ++w.n; break; }
+    }
     if (std::strcmp(g_live_hud.why, why)) {
         strncpy_s(g_live_hud.why, why, _TRUNCATE);
         na::eventlog::Emit("fg_hud", "HUD-free picture skipped: %s (skips so far %llu)", why, static_cast<unsigned long long>(g_live_hud.skipped));
@@ -618,16 +639,50 @@ void live_copy0(ID3D12GraphicsCommandList* l, ID3D12Resource* dst, ID3D12Resourc
     s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     l->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
 }
+const char* lookup_name(na::fglive::Lookup l) { return l == na::fglive::Lookup::Known ? "known" : l == na::fglive::Lookup::Absent ? "none" : "unavailable"; }
+// The sheet's state at the final draw, from the records of THIS recording only (core/live_frame_gen.hpp
+// ResolveSheetState has the proof). `diag` gets every lookup's answer for the log.
+na::fglive::SheetState live_sheet_state(ID3D12GraphicsCommandList* l, uint64_t sheet_id, ID3D12Resource* sheet, bool same_recording, char* diag, size_t n)
+{
+    using na::fglive::Lookup;
+    na::fglive::SheetStateInputs in;
+    in.same_recording_as_copy = same_recording;
+    uint32_t st = 0;
+    in.whole.lookup = na::observe::ListLastState(l, static_cast<na_object_id>(sheet_id), &st) ? Lookup::Known : Lookup::Unavailable;
+    in.whole.state = st;
+    st = 0;
+    switch (na::observe::ListStateSub(l, static_cast<na_object_id>(sheet_id), 0, &st)) {
+    case na::observe::StateLookup::Known: in.sub0 = {Lookup::Known, st}; break;
+    case na::observe::StateLookup::Absent: in.sub0 = {Lookup::Absent, 0}; break;
+    default: in.sub0 = {Lookup::Unavailable, 0}; break;
+    }
+    if (in.whole.lookup != Lookup::Known && in.sub0.lookup == Lookup::Absent) in.whole.lookup = Lookup::Absent; // nothing named it at all
+    D3D12_RESOURCE_STATES ts{};
+    const auto ev = na::nr::states::Inspect(l, sheet, ts);
+    if (ev == na::nr::states::Evidence::Known) in.tracker = {Lookup::Known, static_cast<uint32_t>(ts)};
+    else if (ev == na::nr::states::Evidence::NoTransition) in.tracker = {Lookup::Absent, 0};
+    else in.tracker = {Lookup::Unavailable, 0};
+    bool observed = false, coverage = false, evidence = false;
+    const bool flags = na::observe::ListStateFlags(l, &observed, &coverage, &evidence);
+    snprintf(diag, n, "whole=%s(0x%X) sub0=%s(0x%X) tracker=%s(0x%X,%s) list{known=%d observed=%d coverage=%d evidence=%d} same_recording=%d",
+             lookup_name(in.whole.lookup), in.whole.state, lookup_name(in.sub0.lookup), in.sub0.state, lookup_name(in.tracker.lookup),
+             in.tracker.state, na::nr::states::Name(ev), flags ? 1 : 0, observed ? 1 : 0, coverage ? 1 : 0, evidence ? 1 : 0, same_recording ? 1 : 0);
+    return na::fglive::ResolveSheetState(in);
+}
 // At the game's final draw into the shown picture (called before it is recorded): run it once
-// more into our own target with the sheet's contents swapped for the pre-HUD copy, then put the
-// sheet back. Every refusal happens before anything is recorded, so the game's draw always sees
-// its own sheet. Caller holds no J2 lock; the hook runs in HostWorkScope (our commands are host work).
+// more into our own target with the sheet's contents swapped for this recording's pre-HUD copy,
+// then put the sheet back. Every refusal happens before anything is recorded, so the game's draw
+// always sees its own sheet. The hook runs in HostWorkScope (our commands are host work).
 void live_hud_redraw(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall& call, uint64_t sheet_id, uint64_t shown_id) noexcept
 {
     try {
         std::lock_guard<std::mutex> lock(g_live_hud.m);
-        if (g_live_hud.redrawn_this_frame) return;
-        g_live_hud.redrawn_this_frame = true; // one attempt per frame, whatever the outcome
+        const uint64_t list_id = uint64_t(na::observe::IdOf(l)), recording = na::observe::ListRecording(l);
+        if (list_id && list_id == g_live_hud.tried_list && recording == g_live_hud.tried_recording) return; // one attempt per recording
+        g_live_hud.tried_list = list_id;
+        g_live_hud.tried_recording = recording;
+        ++g_live_hud.attempts_at_present;
+        if (g_live_hud.restore_failed) { live_hud_skip("the game's render target could not be put back once; the HUD-free picture is off for this session"); return; }
         if (g_live_hud.refused) { live_hud_skip("the HUD-free picture's textures could not be made on the graphics card"); return; }
         if (call.indirect) { live_hud_skip("the game's final draw takes its arguments from the graphics card (indirect), so it cannot be run again"); return; }
         na::observe::DrawInfo di{};
@@ -636,29 +691,47 @@ void live_hud_redraw(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall
         if (di.rt_count != 1 || di.pso_rt_count > 1) { live_hud_skip("the final draw writes more than one picture"); return; }
         if (di.ds || (di.dsv_format && di.depth_enable != 0)) { live_hud_skip("the final draw uses a depth buffer"); return; }
         std::lock_guard<std::mutex> sheet_lock(g_hud_sheet.m);
-        if (!g_hud_sheet.copy || !g_hud_sheet_taken.load(std::memory_order_acquire)) { live_hud_skip("the HUD sheet was not copied before its first HUD draw this frame"); return; }
+        const bool same_recording = g_hud_sheet.copy && list_id && g_hud_sheet.list_id == list_id && g_hud_sheet.recording == recording;
+        if (!g_hud_sheet.copy || (!same_recording && g_hud_sheet.list_id == 0)) { live_hud_skip(g_hud_sheet.last_refusal); return; }
         ComPtr<ID3D12Resource> sheet, shown;
         sheet.Attach(na::observe::AcquireResource(static_cast<na_object_id>(sheet_id)));
         shown.Attach(na::observe::AcquireResource(static_cast<na_object_id>(shown_id)));
         if (!sheet || !shown) { live_hud_skip("the HUD sheet or the shown picture has gone"); return; }
-        uint32_t sheet_state = 0;
-        if (!na::observe::ListLastState(l, static_cast<na_object_id>(sheet_id), &sheet_state) &&
-            !na::observe::KnownSubStateNow(static_cast<na_object_id>(sheet_id), 0, &sheet_state)) {
-            live_hud_skip("the HUD sheet's state at the final draw is not known");
+        char diag[256];
+        const auto resolved = live_sheet_state(l, sheet_id, sheet.Get(), same_recording, diag, sizeof diag);
+        if (!g_live_hud.barrier_logged) { // once: what the records say about the sheet at the first final draw
+            g_live_hud.barrier_logged = true;
+            na::eventlog::Emit("fg_hud", "sheet #%llu at the first final draw: %s -> %s%s", static_cast<unsigned long long>(sheet_id), diag,
+                               resolved.known ? "state 0x" : "refused: ", resolved.known ? "" : resolved.why);
+            if (resolved.known) na::eventlog::Emit("fg_hud", "sheet state 0x%X from the %s", resolved.state, resolved.source);
+        }
+        if (!resolved.known) {
+            char why[112];
+            snprintf(why, sizeof why, "HUD sheet state not proven: %.90s", resolved.why);
+            live_hud_skip(why);
+            static uint64_t logged_at = 0; // the full record now and then (the reason line above appears once per change)
+            if (g_live_hud.skipped - logged_at >= 600 || !logged_at) { logged_at = g_live_hud.skipped; na::eventlog::Emit("fg_hud", "state lookups: %s", diag); }
             return;
         }
-        uint32_t shown_state = D3D12_RESOURCE_STATE_RENDER_TARGET; // it is the bound render target of this draw
+        const uint32_t shown_state = D3D12_RESOURCE_STATE_RENDER_TARGET; // it is the bound render target of this draw
         const auto sd = sheet->GetDesc(), bd = shown->GetDesc();
         ComPtr<ID3D12Device> dev;
         if (FAILED(l->GetDevice(IID_PPV_ARGS(&dev)))) { live_hud_skip("no device"); return; }
         const DXGI_FORMAT view = di.rtv_format ? static_cast<DXGI_FORMAT>(di.rtv_format) : bd.Format;
+        const auto pd = g_hud_sheet.copy->GetDesc();
+        if (pd.Width != sd.Width || pd.Height != sd.Height || pd.Format != sd.Format) { live_hud_skip("the HUD sheet changed size or format since it was learned"); return; }
+        // A size or format change (resize, mode switch) replaces our textures; the old ones may still
+        // be read by lists in flight, so they live on for a while.
         if (g_live_hud.save) {
             const auto c = g_live_hud.save->GetDesc();
-            if (c.Width != sd.Width || c.Height != sd.Height || c.Format != sd.Format) { live_hud_skip("the HUD sheet changed size or format (the picture is learned again after a resize)"); return; }
+            if (c.Width != sd.Width || c.Height != sd.Height || c.Format != sd.Format) { g_live_hud.retired.push_back({g_live_hud.save, g_live_hud.presents + 16}); g_live_hud.save.Reset(); }
         }
         if (g_live_hud.target) {
             const auto c = g_live_hud.target->GetDesc();
-            if (c.Width != bd.Width || c.Height != bd.Height || c.Format != bd.Format) { live_hud_skip("the shown picture changed size or format"); return; }
+            if (c.Width != bd.Width || c.Height != bd.Height || c.Format != bd.Format) {
+                g_live_hud.retired.push_back({g_live_hud.target, g_live_hud.presents + 16}); g_live_hud.target.Reset();
+                g_live_hud.rtv_format = DXGI_FORMAT_UNKNOWN;
+            }
         }
         if (!g_live_hud.save || !g_live_hud.target || !g_live_hud.rtv || g_live_hud.rtv_format != view) {
             D3D12_HEAP_PROPERTIES hp{};
@@ -686,7 +759,7 @@ void live_hud_redraw(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall
             dev->CreateRenderTargetView(g_live_hud.target.Get(), &rv, g_live_hud.rtv->GetCPUDescriptorHandleForHeapStart());
             g_live_hud.rtv_format = view;
         }
-        const auto S = static_cast<D3D12_RESOURCE_STATES>(sheet_state);
+        const auto S = static_cast<D3D12_RESOURCE_STATES>(resolved.state);
         constexpr auto CS = D3D12_RESOURCE_STATE_COPY_SOURCE, CD = D3D12_RESOURCE_STATE_COPY_DEST, RT = D3D12_RESOURCE_STATE_RENDER_TARGET;
         ID3D12Resource* pre = g_hud_sheet.copy.Get();
         ID3D12Resource* save = g_live_hud.save.Get();
@@ -723,16 +796,73 @@ void live_hud_redraw(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall
         na::gputime::End(l, 2);
         if (!restored) {
             // The game's draw would land in our picture: never again this session (and say so).
-            g_live_hud.refused = true;
+            g_live_hud.restore_failed = true;
             live_hud_skip("the game's render target could not be put back after the second draw; the HUD-free picture is switched off");
-            na::eventlog::Emit("fg_hud", "ERROR: render target restore failed after the HUD-free draw (frame's final draw may be lost once)");
+            na::eventlog::Emit("fg_hud", "FIRST FAILURE render target restore after the HUD-free draw (frame's final draw may be lost once)");
             return;
         }
         ++g_live_hud.redraws;
-        g_live_hud.fresh = true;
+        g_live_hud.done_list = list_id;
+        g_live_hud.done_recording = recording;
+        if (!g_live_hud.first_ok_logged) {
+            g_live_hud.first_ok_logged = true;
+            na::eventlog::Emit("fg_hud", "FIRST SUCCESS HUD-free draw recorded (sheet state 0x%X from the %s; %s background; render target restored)",
+                               resolved.state, resolved.source, blended ? "copied" : "no");
+        }
         snprintf(g_live_hud.method, sizeof g_live_hud.method, "T2: HUD-free picture by running the game's final draw again%s",
                  blended ? " (over its background)" : "");
     } catch (...) {}
+}
+// From J2's ExecuteCommandLists: the HUD-free picture becomes usable once the recording that drew
+// it is submitted (queue order is certain there).
+void live_hud_submitted(UINT count, ID3D12CommandList* const* lists)
+{
+    if (!g_live_fg.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_live_hud.m);
+    if (!g_live_hud.done_list) return;
+    for (UINT i = 0; i < count; ++i) {
+        if (!lists[i] || uint64_t(na::observe::IdOf(lists[i])) != g_live_hud.done_list) continue;
+        if (na::observe::ListRecording(lists[i]) != g_live_hud.done_recording) continue;
+        g_live_hud.fresh = true;
+        g_live_hud.fresh_present = g_live_hud.presents;
+        ++g_live_hud.submitted;
+        g_live_hud.done_list = g_live_hud.done_recording = 0;
+        if (!g_live_hud.first_submit_logged) { g_live_hud.first_submit_logged = true; na::eventlog::Emit("fg_hud", "FIRST SUCCESS HUD-free picture submitted"); }
+        return;
+    }
+}
+// Present-time bookkeeping while the sheet is in use: the pictures the game presents, frames with
+// no final draw or no sheet copy (menus, loading, cutscenes, a changed frame shape), relearning.
+// Returns true when the learned shape no longer matches and must be learned again.
+bool live_hud_present(uint64_t shown, uint64_t sheet_copies)
+{
+    std::lock_guard<std::mutex> lock(g_live_hud.m);
+    ++g_live_hud.presents;
+    for (size_t i = 0; i < g_live_hud.retired.size();)
+        if (g_live_hud.retired[i].second <= g_live_hud.presents) g_live_hud.retired.erase(g_live_hud.retired.begin() + static_cast<std::ptrdiff_t>(i)); else ++i;
+    if (shown && !live_hud_is_shown(shown)) { g_live_hud.shown[2] = g_live_hud.shown[1]; g_live_hud.shown[1] = g_live_hud.shown[0]; g_live_hud.shown[0] = shown; }
+    if (!g_live_hud.learned) return false;
+    const bool copied = sheet_copies != g_live_hud.copies_at_present;
+    g_live_hud.copies_at_present = sheet_copies;
+    const bool final_seen = g_live_hud.attempts_at_present != 0;
+    g_live_hud.attempts_at_present = 0;
+    g_live_hud.frames_without_copy = copied ? 0 : g_live_hud.frames_without_copy + 1;
+    g_live_hud.frames_without_final = final_seen ? 0 : g_live_hud.frames_without_final + 1;
+    if (!copied) live_hud_skip("no HUD was drawn on the learned sheet this frame (menu, loading or cutscene)");
+    else if (!final_seen) live_hud_skip("the game's final draw into the shown picture was not seen this frame");
+    if (g_live_hud.frames_without_copy >= 120 || g_live_hud.frames_without_final >= 120) {
+        const bool no_copy = g_live_hud.frames_without_copy >= 120;
+        ++g_live_hud.relearns;
+        na::eventlog::Emit("fg_hud", "relearning the HUD sheet (%llu): %s for 120 frames in a row", static_cast<unsigned long long>(g_live_hud.relearns),
+                           no_copy ? "nothing was drawn on the learned sheet" : "no final draw into the shown picture was seen");
+        g_live_hud.frames_without_copy = g_live_hud.frames_without_final = 0;
+        g_live_hud.learned = 0;
+        g_live_hud.refused = false;
+        g_live_hud.learn_after = g_live_hud.presents; // at once
+        snprintf(g_live_hud.verdict, sizeof g_live_hud.verdict, "The HUD sheet is being learned again (the frame's shape changed).");
+        return true;
+    }
+    return false;
 }
 bool native_discovery_enabled() {
     const auto& s = na::settings::Get();
@@ -6942,17 +7072,18 @@ public:
         const bool discover = g_native_discovery.load(std::memory_order_relaxed) && native_discovery_enabled();
         if(!reduced && !discover){
             if(g_capture_frame_record.load(std::memory_order_relaxed) && g_trace.armed.load(std::memory_order_relaxed)){try{trace_op(l,call);}catch(...){}}
-            if(const uint64_t sheet=g_hud_sheet_id.load(std::memory_order_relaxed);sheet && !g_hud_sheet_taken.load(std::memory_order_relaxed) &&
-               call.kind!=na::observe::ShaderKind::Dispatch){
+            if(const uint64_t sheet=g_hud_sheet_id.load(std::memory_order_relaxed);sheet && call.kind!=na::observe::ShaderKind::Dispatch){
+                // The sheet's first HUD draw in a recording takes the pre-HUD copy; with live Frame
+                // Generation, the draw into a shown picture is the final draw, run once more per recording.
                 na_object_id rt=0,ds=0;
-                if(na::observe::ListCurrentTargets(l,&rt,&ds)&&uint64_t(rt)==sheet)hud_sheet_grab(l,sheet);
-            }else if(sheet && call.kind!=na::observe::ShaderKind::Dispatch && live_fg_on()){
-                // Live Frame Generation: the draw into the shown picture, after this frame's HUD
-                // sheet copy, is the final draw; run it once more into the HUD-free picture.
-                na_object_id rt=0,ds=0;
-                bool shown=false;
-                if(na::observe::ListCurrentTargets(l,&rt,&ds)&&rt){std::lock_guard<std::mutex> hud_lock(g_live_hud.m);shown=live_hud_is_shown(uint64_t(rt))&&!g_live_hud.redrawn_this_frame;}
-                if(shown)live_hud_redraw(l,call,sheet,uint64_t(rt));
+                if(na::observe::ListCurrentTargets(l,&rt,&ds)&&rt){
+                    if(uint64_t(rt)==sheet)hud_sheet_grab(l,sheet);
+                    else if(live_fg_on()){
+                        bool shown=false;
+                        {std::lock_guard<std::mutex> hud_lock(g_live_hud.m);shown=g_live_hud.learned&&live_hud_is_shown(uint64_t(rt));}
+                        if(shown)live_hud_redraw(l,call,sheet,uint64_t(rt));
+                    }
+                }
             }
             t_native_hint=nullptr;return {};}
         try{
@@ -9344,16 +9475,24 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             // our point (its finishing passes, its HUD, the last copy to the screen). The hooks
             // it needs are on for those frames only.
             const bool capture_armed=frame&&na::capture::j2::Armed();
-            const bool live_keep=frame&&live_fg_on()&&g_hud_sheet_id.load(std::memory_order_acquire)!=0;
-            {
-                std::lock_guard<std::mutex> hud_lock(g_live_hud.m);
-                ++g_live_hud.presents;
-                if(live_keep){ // the pictures the game presents: the final draw is the draw into one of them
-                    const uint64_t shown=frame?uint64_t(na::observe::IdOf(frame)):0;
-                    if(shown&&!live_hud_is_shown(shown)){g_live_hud.shown[2]=g_live_hud.shown[1];g_live_hud.shown[1]=g_live_hud.shown[0];g_live_hud.shown[0]=shown;}
-                    if(!g_live_hud.redrawn_this_frame&&g_live_hud.learned)live_hud_skip("the game's final draw into the shown picture was not seen this frame");
+            bool live_keep=frame&&live_fg_on()&&g_hud_sheet_id.load(std::memory_order_acquire)!=0;
+            if(live_keep){ // live Frame Generation: shown pictures, frames without HUD or final draw, relearning
+                uint64_t copies=0;
+                {std::lock_guard<std::mutex> sheet_lock(g_hud_sheet.m);copies=g_hud_sheet.grabs;}
+                if(live_hud_present(frame?uint64_t(na::observe::IdOf(frame)):0,copies)){
+                    live_keep=false; // the stage-3 clean-up below forgets the sheet; the next present traces a frame again
+                    std::lock_guard<std::mutex> sheet_lock(g_hud_sheet.m);
+                    if(g_hud_sheet.refused&&g_hud_sheet.copy){ // a changed sheet: the old copy may still be read by lists in flight
+                        uint64_t now=0;{std::lock_guard<std::mutex> hud_lock(g_live_hud.m);now=g_live_hud.presents;}
+                        g_hud_sheet.retired.push_back({g_hud_sheet.copy,now+16});g_hud_sheet.copy.Reset();
+                    }
+                    g_hud_sheet.refused=false;g_hud_sheet.list_id=g_hud_sheet.recording=0;
                 }
-                g_live_hud.redrawn_this_frame=false;
+            }else{std::lock_guard<std::mutex> hud_lock(g_live_hud.m);++g_live_hud.presents;}
+            {   // replaced sheet copies whose lists have long finished
+                uint64_t now=0;{std::lock_guard<std::mutex> hud_lock(g_live_hud.m);now=g_live_hud.presents;}
+                std::lock_guard<std::mutex> sheet_lock(g_hud_sheet.m);
+                for(size_t i=0;i<g_hud_sheet.retired.size();)if(g_hud_sheet.retired[i].second<=now)g_hud_sheet.retired.erase(g_hud_sheet.retired.begin()+std::ptrdiff_t(i));else ++i;
             }
             if(!capture_armed&&!g_record_stage&&!live_learn)g_record_done=false;
             if(g_record_stage==3){ // the record is written; the sheet is copied each frame until the capture ends
@@ -9420,10 +9559,23 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
                 if(live_fg_on()){
                     const auto learned=na::fglive::LearnSheet(g_trace.frame,shown,shown_size.ow,shown_size.oh);
                     live_found=learned.verdict==na::fglive::SheetVerdict::Found;
+                    // The proof of the sheet's state at the final draw needs the HUD run and the final draw in
+                    // one recording (core/live_frame_gen.hpp ResolveSheetState): the shape must show it.
+                    const char* same_list_why=nullptr;
+                    if(live_found){
+                        const auto& fin=g_trace.frame[learned.final_op];
+                        for(size_t i=learned.final_op;i-->0;){
+                            const auto& op=g_trace.frame[i];
+                            if(op.out.empty()||op.out[0].id!=learned.sheet)continue;
+                            if(op.list!=fin.list||op.recording!=fin.recording)same_list_why="the HUD is drawn in another command list than the final draw (not supported: its state there cannot be proven)";
+                            break;
+                        }
+                        if(same_list_why)live_found=false;
+                    }
                     std::lock_guard<std::mutex> hud_lock(g_live_hud.m);
                     ++g_live_hud.learn_attempts;
                     g_live_hud.learned=live_found?1u:0u;g_live_hud.sheet=learned.sheet;g_live_hud.run=learned.run;
-                    snprintf(g_live_hud.verdict,sizeof g_live_hud.verdict,"%s%s",live_found?"":"No generated pictures: the HUD could not be separated (",
+                    snprintf(g_live_hud.verdict,sizeof g_live_hud.verdict,"%s%s",live_found?"":"No generated pictures: the HUD could not be separated (",same_list_why?same_list_why:
                              na::fglive::SheetWhy(learned.verdict));
                     if(!live_found){
                         const size_t n=strlen(g_live_hud.verdict);
@@ -10121,6 +10273,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
 {
     if (forward) g_forward.store(forward, std::memory_order_relaxed);
     if (lists && count) { try { trace_submit(queue, count, lists); } catch (...) {} }
+    if (lists && count) { try { live_hud_submitted(count, lists); } catch (...) {} } // live Frame Generation: queue order is certain here
     if (!na::settings::EffectsReady() || !g.enabled.load(std::memory_order_relaxed) || g.paused.load(std::memory_order_relaxed) || !queue || !lists || !count) {
         forward(queue, count, lists);
         return;
@@ -10570,10 +10723,9 @@ ID3D12Resource* LiveHudFree(const char** why)
 {
     thread_local char t_why[112];
     std::lock_guard<std::mutex> lock(g_live_hud.m);
-    if (g_live_hud.fresh && g_live_hud.target) {
-        g_live_hud.fresh = false;
-        return g_live_hud.target.Get();
-    }
+    const bool for_this_frame = g_live_hud.fresh && g_live_hud.fresh_present + 1 == g_live_hud.presents; // submitted before THIS Present
+    g_live_hud.fresh = false;
+    if (for_this_frame && g_live_hud.target) return g_live_hud.target.Get();
     if (!g_live_hud.learned) strncpy_s(t_why, g_live_hud.verdict, _TRUNCATE);
     else strncpy_s(t_why, g_live_hud.why, _TRUNCATE);
     if (why) *why = t_why;
@@ -10595,6 +10747,14 @@ LiveHudStats GetLiveHudStats()
         strncpy_s(s.verdict, g_live_hud.verdict, _TRUNCATE);
         strncpy_s(s.last_skip, g_live_hud.why, _TRUNCATE);
         strncpy_s(s.method, g_live_hud.method, _TRUNCATE);
+        s.submitted = g_live_hud.submitted;
+        s.relearns = g_live_hud.relearns;
+        size_t used = 0;
+        for (const auto& w : g_live_hud.whys) {
+            if (!w.n || used + 140 >= sizeof s.skip_counts) break;
+            const int k = snprintf(s.skip_counts + used, sizeof s.skip_counts - used, "%s%llu x %s", used ? "; " : "", static_cast<unsigned long long>(w.n), w.text);
+            if (k > 0) used += size_t(k);
+        }
     }
     {
         std::lock_guard<std::mutex> lock(g_hud_sheet.m);

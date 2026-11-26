@@ -142,6 +142,9 @@ struct LiveStats {
     uint64_t vram_budget_mb = 0, vram_usage_mb = 0, extra_mb = 0;
     char prepare[112] = "";
     char hudfree_why[112] = "";
+    // x2 chosen and no generated picture for more than a second: how long, and why in plain words.
+    uint32_t waiting_ms = 0;
+    char waiting[200] = "";
 };
 LiveStats GetLiveStats();
 

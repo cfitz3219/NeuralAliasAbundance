@@ -1461,7 +1461,8 @@ static void DrawLiveFrameGeneration()
     if (!can && !waiting) StatusLine(2, why);
     else if (!on) StatusLine(0, waiting ? why : "Off. Pictures are presented exactly as the game renders them.");
     else {
-        StatusLine(fs.latched_off ? 2 : (fs.active ? 1 : 0), fs.reason);
+        if (lv.waiting_ms) StatusLine(2, lv.waiting); // never a silent "nothing"
+        else StatusLine(fs.latched_off ? 2 : (fs.active ? 1 : 0), fs.reason);
         if (fs.active || fs.generated) {
             snprintf(line, sizeof line, "%.0f pictures per second shown from %.0f rendered. Graphics-card time per rendered frame: Frame Generation %.2f ms, HUD %.2f ms, presenting %.2f ms.",
                      pr.shown_fps, pr.base_fps, lv.eval_avg, lv.hudcopy_avg + lv.paste_avg + hud.grab_avg + hud.redraw_avg, lv.copy_avg);
