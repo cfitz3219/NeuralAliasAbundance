@@ -4553,13 +4553,13 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 // Swap-chain creation on the shared factory vtable (after our own dummy
                 // chain exists, so it is never recorded). Late attachments recover
                 // per-buffer queues from submitted writes instead.
-                if (na::j2::RenderSmall() || na::on12::Enabled()) { // render-small size spoof / DX11 bridge description
+                if (na::j2::RenderSmall() || na::on12::Enabled() || na::on12::NativeProxyOn()) { // render-small size spoof / DX11 bridge or proxy description
                     prepare_start_hook(sc.Get(), kSwapGetDescSlot, reinterpret_cast<void*>(&DetourGetDesc),
                                        reinterpret_cast<void**>(&g_orig_get_desc));
                     prepare_start_hook(sc.Get(), kSwap1GetDesc1Slot, reinterpret_cast<void*>(&DetourGetDesc1),
                                        reinterpret_cast<void**>(&g_orig_get_desc1));
                 }
-                if (na::on12::Enabled()) // the game's ID3D11Device from its (D3D12) swap chain
+                if (na::on12::Enabled() || na::on12::NativeProxyOn()) // the game's ID3D11Device from its (D3D12) swap chain
                     prepare_start_hook(sc.Get(), kSwapGetDeviceSlot, reinterpret_cast<void*>(&DetourGetDevice),
                                        reinterpret_cast<void**>(&g_orig_get_device));
                 prepare_start_hook(factory.Get(), kFactoryCreateSwapChainSlot,
