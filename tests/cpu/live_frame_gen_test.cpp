@@ -169,4 +169,27 @@ int main() { return test::run({
         f[0] = std::pow(DisplayValue(0.5f) + 5.f / 255.f, 2.2f);
         CHECK(HudPixel(e, f));
     }},
+    {"HUD paste on SDR and PQ pictures: the HUD test is in display terms of the stored values", [] {
+        // SDR (8-bit): stored values are display-encoded, so the 4/255 threshold is on them directly.
+        const float dark[3] = {10.f / 255, 10.f / 255, 10.f / 255}, dark2[3] = {12.f / 255, 12.f / 255, 12.f / 255};
+        CHECK(!HudPixel(dark, dark2, kPictureSdr));   // 2 codes in a shadow: not HUD
+        CHECK(HudPixel(dark, dark2, kPictureLinear)); // (the linear rule called it HUD)
+        const float hi[3] = {240.f / 255, 240.f / 255, 240.f / 255}, hi7[3] = {247.f / 255, 247.f / 255, 247.f / 255};
+        CHECK(HudPixel(hi, hi7, kPictureSdr));        // 7 codes in a highlight: HUD
+        CHECK(!HudPixel(hi, hi7, kPictureLinear));    // (the linear rule missed it)
+        const float x3[3] = {0.5f, 0.5f, 0.5f}, y3[3] = {0.5f + 3.f / 255, 0.5f, 0.5f}, y5[3] = {0.5f + 5.f / 255, 0.5f, 0.5f};
+        CHECK(!HudPixel(x3, y3, kPictureSdr));
+        CHECK(HudPixel(x3, y5, kPictureSdr));
+        // PQ: decoded to the linear scale of FP16 (1.0 = 80 nits), then the linear rule.
+        CHECK(std::fabs(PqToLinear80(0.f)) < 1e-6f);
+        CHECK(std::fabs(PqToLinear80(1.f) - 125.f) < 1e-2f);                // 10000 nits
+        CHECK(std::fabs(PqToLinear80(0.5080784f) * 80.f - 100.f) < 0.1f);   // PQ 0.508 = 100 nits
+        const float p1[3] = {0.40f, 0.40f, 0.40f}, p2[3] = {0.41f, 0.40f, 0.40f};
+        CHECK(HudPixel(p1, p2, kPicturePq) ==
+              (std::fabs(DisplayValue(PqToLinear80(0.40f)) - DisplayValue(PqToLinear80(0.41f))) > kHudThreshold));
+        const float b1[3] = {0.80f, 0.80f, 0.80f}, b2[3] = {0.90f, 0.90f, 0.90f};
+        CHECK(!HudPixel(b1, b2, kPicturePq)); // both above 80 nits: clipped in display terms, as FP16
+        // The default stays the proven linear FP16 rule.
+        CHECK(HudPixel(dark, dark2) == HudPixel(dark, dark2, kPictureLinear));
+    }},
 }); }

@@ -204,25 +204,46 @@ inline SheetState ResolveSheetState(const SheetStateInputs& in)
 }
 
 // ---- The HUD mask (CPU reference of the GPU paste) -------------------------------------------
-// A pixel belongs to the newer real frame's HUD when, in display terms (linear light clipped at 0,
-// to the power 1/2.2, clipped at 1), any channel of the real frame differs from its HUD-free
-// picture by more than 4/255. The mask is grown by one pixel (3x3). Exactly the offline T2 rule.
+// A pixel belongs to the newer real frame's HUD when, in display terms, any channel of the real
+// frame differs from its HUD-free picture by more than 4/255. The mask is grown by one pixel (3x3).
+// Exactly the offline T2 rule. "Display terms" depend on how the picture stores its values (the
+// mode numbers are na::color::ShaderMode's):
+//   2 linear (FP16, scRGB scale): clipped at 0, to the power 1/2.2, clipped at 1 (as proven);
+//   0 SDR (8-bit or 10-bit, already display-encoded): the stored value, clipped to 0..1;
+//   1 PQ (HDR10): decoded to linear on the same scale as mode 2 (1.0 = 80 nits), then as mode 2.
+constexpr uint32_t kPictureSdr = 0, kPicturePq = 1, kPictureLinear = 2;
+// PQ (SMPTE ST 2084) code value 0..1 to linear light with 1.0 = 80 nits (the scRGB scale).
+inline float PqToLinear80(float e)
+{
+    constexpr float m1 = 0.1593017578125f, m2 = 78.84375f, c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+    e = e < 0.f ? 0.f : (e > 1.f ? 1.f : e);
+    const float p = std::pow(e, 1.f / m2);
+    const float num = p - c1 > 0.f ? p - c1 : 0.f;
+    return std::pow(num / (c2 - c3 * p), 1.f / m1) * 125.f; // 10000 / 80
+}
 inline float DisplayValue(float linear)
 {
     if (!(linear > 0.f)) return 0.f;
     const float v = std::pow(linear, 1.f / 2.2f);
     return v > 1.f ? 1.f : v;
 }
+inline float DisplayValue(float stored, uint32_t mode)
+{
+    if (mode == kPictureSdr) return !(stored > 0.f) ? 0.f : (stored > 1.f ? 1.f : stored);
+    if (mode == kPicturePq) return DisplayValue(PqToLinear80(stored));
+    return DisplayValue(stored);
+}
 constexpr float kHudThreshold = 4.f / 255.f;
 // rgb: three floats a pixel, rows of w. True where the real frame's HUD is (before growing).
-inline bool HudPixel(const float* real_rgb, const float* hudfree_rgb)
+inline bool HudPixel(const float* real_rgb, const float* hudfree_rgb, uint32_t mode = kPictureLinear)
 {
     for (int c = 0; c < 3; ++c)
-        if (std::fabs(DisplayValue(real_rgb[c]) - DisplayValue(hudfree_rgb[c])) > kHudThreshold) return true;
+        if (std::fabs(DisplayValue(real_rgb[c], mode) - DisplayValue(hudfree_rgb[c], mode)) > kHudThreshold) return true;
     return false;
 }
 // out = generated, with every pixel within one pixel (3x3) of a HUD pixel replaced by the real frame.
-inline void PasteHud(const float* real, const float* hudfree, float* generated, uint32_t w, uint32_t h)
+inline void PasteHud(const float* real, const float* hudfree, float* generated, uint32_t w, uint32_t h,
+                     uint32_t mode = kPictureLinear)
 {
     for (uint32_t y = 0; y < h; ++y)
         for (uint32_t x = 0; x < w; ++x) {
@@ -232,7 +253,7 @@ inline void PasteHud(const float* real, const float* hudfree, float* generated, 
                     const int64_t sx = int64_t(x) + dx, sy = int64_t(y) + dy;
                     if (sx < 0 || sy < 0 || sx >= int64_t(w) || sy >= int64_t(h)) continue;
                     const size_t i = (size_t(sy) * w + size_t(sx)) * 3;
-                    hud = HudPixel(real + i, hudfree + i);
+                    hud = HudPixel(real + i, hudfree + i, mode);
                 }
             if (hud) {
                 const size_t i = (size_t(y) * w + x) * 3;

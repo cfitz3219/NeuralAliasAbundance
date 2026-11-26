@@ -1,5 +1,7 @@
 #include "host_dx12/fg/steady_pass.hpp"
 
+#include "host_dx12/color/color_space.hpp"
+
 #include <d3dcompiler.h>
 
 #include <cstdio>
@@ -15,8 +17,39 @@ namespace {
 // Added: the cbuffer carries mvScale (each motion sample is decoded to render pixels with it before the
 // existing render-to-display scale), and a count of the pixels it changed (one atomic per 16x16 group
 // into `touched` at `countAt`; the early return became an `inside` test so every lane reaches the
-// group's last barrier).
+// group's last barrier). Added 2026-11-26 (SDR and PQ pictures): every colour read goes through
+// DECODE and the write through ENCODE, chosen by NA_PICTURE (na::color::ShaderMode). For linear FP16
+// (NA_PICTURE 2) both are the identity, so that variant is Astra's shader exactly; SDR (sRGB-encoded)
+// and PQ pictures are decoded to the same linear scale (1.0 = SDR white = 80 nits) before her
+// agreement test and midpoint, as her README requires, and the result is encoded back.
 constexpr char kShader[] = R"(
+#if NA_PICTURE == 0
+float3 decodeSdr(float3 c) {
+    c=saturate(c);
+    return lerp(pow((c+.055)/1.055,2.4), c/12.92, step(c,.04045));
+}
+float3 encodeSdr(float3 c) {
+    c=saturate(c);
+    return lerp(1.055*pow(c,1.0/2.4)-.055, c*12.92, step(c,.0031308));
+}
+#define DECODE(c) decodeSdr(c)
+#define ENCODE(c) encodeSdr(c)
+#elif NA_PICTURE == 1
+static const float pqM1=.1593017578125, pqM2=78.84375, pqC1=.8359375, pqC2=18.8515625, pqC3=18.6875;
+float3 decodePq(float3 e) {
+    float3 p=pow(saturate(e),1.0/pqM2);
+    return pow(max(p-pqC1,0.0)/(pqC2-pqC3*p),1.0/pqM1)*125.0;
+}
+float3 encodePq(float3 c) {
+    float3 y=pow(max(c,0.0)/125.0,pqM1);
+    return pow((pqC1+pqC2*y)/(1.0+pqC3*y),pqM2);
+}
+#define DECODE(c) decodePq(c)
+#define ENCODE(c) encodePq(c)
+#else
+#define DECODE(c) (c)
+#define ENCODE(c) (c)
+#endif
 Texture2D<float4> older : register(t0);
 Texture2D<float4> newer : register(t1);
 Texture2D<float2> motion : register(t2);
@@ -40,7 +73,7 @@ void main(uint3 tile:SV_GroupID, uint3 tid:SV_GroupThreadID, uint lane:SV_GroupI
     if(lane==0) changed=0;
     for(uint i=lane;i<28*28;i+=256) {
         int2 samplePos=clamp(int2(tile.xy*16)+int2(i%28,i/28)-6,int2(0,0),edge);
-        diff[i]=proxyLuma(older[samplePos].rgb)-proxyLuma(newer[samplePos].rgb);
+        diff[i]=proxyLuma(DECODE(older[samplePos].rgb))-proxyLuma(DECODE(newer[samplePos].rgb));
     }
     GroupMemoryBarrierWithGroupSync();
     for(uint i=lane;i<28*24;i+=256) {
@@ -81,8 +114,8 @@ void main(uint3 tile:SV_GroupID, uint3 tid:SV_GroupThreadID, uint lane:SV_GroupI
     float weight=saturate((.85-speed)/.55)*saturate((2.3-disagreement)/1.4);
     if(weight>0) {
         float4 g=generated[p];
-        float3 mid=.5*(older[p].rgb+newer[p].rgb);
-        generated[p]=float4(lerp(g.rgb,mid,weight),g.a);
+        float3 mid=.5*(DECODE(older[p].rgb)+DECODE(newer[p].rgb));
+        generated[p]=float4(ENCODE(lerp(DECODE(g.rgb),mid,weight)),g.a);
         InterlockedAdd(changed,1);
     }
     }
@@ -97,15 +130,24 @@ const char* SteadyPass::Source() { return kShader; }
 bool SteadyPass::Init(ID3D12Device* device, DXGI_FORMAT format, char* reason, size_t n)
 {
     auto why = [&](const char* t) { if (reason && n) snprintf(reason, n, "%s", t); return false; };
-    if (pso_ && format == format_) return true;
+    const DXGI_FORMAT view = na::color::ViewFormat(format);
+    if (pso_ && view == format_) return true;
     if (!device) return why("no device");
-    // Linear FP16 only: the agreement test assumes linear light (Astra's README).
-    if (format != DXGI_FORMAT_R16G16B16A16_FLOAT) return why("Still-area steadying needs a linear FP16 (HDR) picture; this game's picture format is not supported yet.");
+    // Her agreement test assumes linear light (Astra's README): linear FP16 is read as it is; SDR
+    // (8-bit or 10-bit) and PQ (10-bit HDR) pictures are decoded to linear and encoded back.
+    bool need[kEncodings] = {};
+    switch (view) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: need[kLinear] = true; break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: need[0] = need[1] = true; break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: need[0] = true; break;
+    default: return why("Still-area steadying does not support this game's picture format yet.");
+    }
     D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
-    fs.Format = format;
+    fs.Format = view;
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) ||
         !(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) || !(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
-        return why("Still-area steadying needs typed UAV reads and writes of FP16 pictures, which this graphics card does not report.");
+        return why("Still-area steadying needs typed UAV reads and writes of this game's picture format, which this graphics card does not report.");
     D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 3}};
     D3D12_ROOT_PARAMETER p[2]{};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -117,14 +159,23 @@ bool SteadyPass::Init(ID3D12Device* device, DXGI_FORMAT format, char* reason, si
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_))))
         return why("Still-area steadying could not build its root signature.");
-    if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "fg_static_midpoint", nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
-        return why("Still-area steadying could not compile its shader.");
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = root_.Get();
-    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> made[kEncodings];
+    for (uint32_t e = 0; e < kEncodings; ++e) {
+        if (!need[e]) continue;
+        char mode[2] = {char('0' + e), 0};
+        const D3D_SHADER_MACRO defines[] = {{"NA_PICTURE", mode}, {nullptr, nullptr}};
+        code.Reset();
+        err.Reset();
+        if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "fg_static_midpoint", defines, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+            return why("Still-area steadying could not compile its shader.");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = root_.Get();
+        pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&made[e]))))
+            return why("Still-area steadying could not create its pipeline.");
+    }
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5 * kPages, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    ComPtr<ID3D12PipelineState> pso;
-    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso))) || FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_))))
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_))))
         return why("Still-area steadying could not create its pipeline.");
     {   // the changed-pixel counters: one uint per page, and their readback copy
         D3D12_HEAP_PROPERTIES hp{};
@@ -145,15 +196,19 @@ bool SteadyPass::Init(ID3D12Device* device, DXGI_FORMAT format, char* reason, si
     }
     inc_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     device_ = device;
-    format_ = format;
-    pso_ = pso;
+    format_ = view;
+    for (uint32_t e = 0; e < kEncodings; ++e) variants_[e] = made[e];
+    pso_ = made[kLinear] ? made[kLinear] : made[0]; // Ready(): the variants this format needs all built
     return true;
 }
 
 bool SteadyPass::Record(ID3D12GraphicsCommandList* list, ID3D12Resource* generated, ID3D12Resource* older, ID3D12Resource* newer,
-                        ID3D12Resource* motion, uint32_t w, uint32_t h, float mv_scale_x, float mv_scale_y, uint32_t page)
+                        ID3D12Resource* motion, uint32_t w, uint32_t h, float mv_scale_x, float mv_scale_y, uint32_t page,
+                        uint32_t encoding)
 {
-    if (!pso_ || !list || !generated || !older || !newer || !motion || !w || !h) return false;
+    if (!pso_ || !list || !generated || !older || !newer || !motion || !w || !h || encoding >= kEncodings) return false;
+    ID3D12PipelineState* pso = variants_[encoding].Get();
+    if (!pso) return false; // this format has no such encoding (e.g. PQ on an 8-bit picture)
     auto cpu = heap_->GetCPUDescriptorHandleForHeapStart();
     page %= kPages;
     cpu.ptr += SIZE_T(page) * 5 * inc_;
@@ -162,7 +217,7 @@ bool SteadyPass::Record(ID3D12GraphicsCommandList* list, ID3D12Resource* generat
     ID3D12Resource* srvs[3] = {older, newer, motion};
     for (ID3D12Resource* r : srvs) {
         D3D12_SHADER_RESOURCE_VIEW_DESC v{};
-        v.Format = r->GetDesc().Format;
+        v.Format = na::color::ViewFormat(r->GetDesc().Format);
         v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         v.Texture2D.MipLevels = 1;
@@ -200,7 +255,7 @@ bool SteadyPass::Record(ID3D12GraphicsCommandList* list, ID3D12Resource* generat
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootSignature(root_.Get());
-    list->SetPipelineState(pso_.Get());
+    list->SetPipelineState(pso);
     list->SetComputeRootDescriptorTable(0, gpu);
     struct { uint32_t w, h; float sx, sy; uint32_t at; } k{w, h, mv_scale_x, mv_scale_y, 4u * page};
     list->SetComputeRoot32BitConstants(1, 5, &k, 0);

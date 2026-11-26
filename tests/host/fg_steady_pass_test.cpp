@@ -5,6 +5,9 @@
 // units), and with mv_scale 0.5 against her shader given the motion already halved. Its changed-pixel
 // count matches the pixels that changed. Also the motion preparation (fg/motion_prep.cpp): exact
 // zeros are filled from the nearest known vectors; Frame Generation's copy has a 1-pixel dead zone.
+// SDR (2026-11-26): on an 8-bit sRGB-encoded picture the pass decodes to linear, runs her test and
+// midpoint, and encodes back; checked against her shader given the same pictures decoded to linear
+// (32-bit float) and encoded back, within one 8-bit code.
 #include "test_support.hpp"
 #include "host_dx12/fg/motion_prep.hpp"
 #include "host_dx12/fg/steady_pass.hpp"
@@ -181,7 +184,7 @@ struct Reference {
             cpu.ptr += inc;
         }
         D3D12_UNORDERED_ACCESS_VIEW_DESC u{};
-        u.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        u.Format = gen->GetDesc().Format; // FP16 in her runs; 32-bit float for the SDR comparison
         u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         dev->CreateUnorderedAccessView(gen, nullptr, &u, cpu);
         ID3D12DescriptorHeap* heaps[] = {heap.Get()};
@@ -208,8 +211,8 @@ int main()
     {   // A format other than linear FP16 is refused with a plain reason.
         na::fg::SteadyPass refused;
         char why[112] = {};
-        CHECK(!refused.Init(d.device.Get(), DXGI_FORMAT_R10G10B10A2_UNORM, why, sizeof why));
-        CHECK(std::strstr(why, "FP16") != nullptr);
+        CHECK(!refused.Init(d.device.Get(), DXGI_FORMAT_R11G11B10_FLOAT, why, sizeof why));
+        CHECK(std::strstr(why, "format") != nullptr);
     }
     // Pictures: a textured scene. Left part identical in both real frames (still), a block that
     // changes brightness between them (disagreement), HDR values above 1. The generated picture
@@ -293,6 +296,81 @@ int main()
     };
     if (run(motion, 1.f, motion, "mv_scale 1") != 0) return 1;
     if (run(motion, 0.5f, halved, "mv_scale 0.5") != 0) return 1;
+
+    {   // SDR: 8-bit sRGB-encoded pictures (the same scene, clipped to SDR white).
+        auto dec = [](float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); };
+        auto enc = [](float c) {
+            c = c < 0.f ? 0.f : (c > 1.f ? 1.f : c);
+            return c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.f / 2.4f) - 0.055f;
+        };
+        auto to8 = [&](const std::vector<pv::HALF>& lin) {
+            std::vector<uint8_t> out(n * 4);
+            for (size_t i = 0; i < n * 4; ++i) {
+                const float v = (i % 4 == 3) ? 1.f : enc(pv::XMConvertHalfToFloat(lin[i]));
+                out[i] = static_cast<uint8_t>(std::lround(v * 255.f));
+            }
+            return out;
+        };
+        auto to32 = [&](const std::vector<uint8_t>& b) { // her input: the stored codes decoded to linear
+            std::vector<float> out(n * 4);
+            for (size_t i = 0; i < n * 4; ++i) out[i] = (i % 4 == 3) ? 1.f : dec(float(b[i]) / 255.f);
+            return out;
+        };
+        const auto o8 = to8(older), n8 = to8(newer), g8 = to8(gen);
+        const auto oL = to32(o8), nL = to32(n8), gL = to32(g8);
+        const DXGI_FORMAT f8 = DXGI_FORMAT_R8G8B8A8_UNORM, fL = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        na::fg::SteadyPass sdr;
+        char why8[112] = {};
+        const bool ready = sdr.Init(d.device.Get(), f8, why8, sizeof why8);
+        if (!ready) std::printf("SDR steadying refused: %s\n", why8);
+        REQUIRE(ready);
+        test::List l;
+        REQUIRE(l.Create(d.device.Get()));
+        std::vector<ComPtr<ID3D12Resource>> keep;
+        auto mk = [&](DXGI_FORMAT f, uint32_t w, uint32_t h, bool uav) {
+            return test::CreateTexture(d.device.Get(), w, h, f, D3D12_RESOURCE_STATE_COPY_DEST, uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+        };
+        auto t_o8 = mk(f8, W, H, false), t_n8 = mk(f8, W, H, false), g_prod = mk(f8, W, H, true);
+        auto t_oL = mk(fL, W, H, false), t_nL = mk(fL, W, H, false), g_ref = mk(fL, W, H, true);
+        auto m_prod = mk(DXGI_FORMAT_R32G32_FLOAT, MW, MH, false), m_ref = mk(DXGI_FORMAT_R32G32_FLOAT, MW, MH, false);
+        REQUIRE(t_o8 && t_n8 && g_prod && t_oL && t_nL && g_ref && m_prod && m_ref);
+        const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        upload(d, l, t_o8.Get(), o8.data(), W * 4, H, srv, keep);
+        upload(d, l, t_n8.Get(), n8.data(), W * 4, H, srv, keep);
+        upload(d, l, g_prod.Get(), g8.data(), W * 4, H, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, keep);
+        upload(d, l, t_oL.Get(), oL.data(), W * 16, H, srv, keep);
+        upload(d, l, t_nL.Get(), nL.data(), W * 16, H, srv, keep);
+        upload(d, l, g_ref.Get(), gL.data(), W * 16, H, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, keep);
+        upload(d, l, m_prod.Get(), motion.data(), MW * 8, MH, srv, keep);
+        upload(d, l, m_ref.Get(), motion.data(), MW * 8, MH, srv, keep);
+        REQUIRE(sdr.Record(l.list.Get(), g_prod.Get(), t_o8.Get(), t_n8.Get(), m_prod.Get(), W, H, 1.f, 1.f, 6, 0));
+        CHECK(!sdr.Record(l.list.Get(), g_prod.Get(), t_o8.Get(), t_n8.Get(), m_prod.Get(), W, H, 1.f, 1.f, 7, 1)); // no PQ on 8-bit
+        ref.Record(d.device.Get(), l.list.Get(), g_ref.Get(), t_oL.Get(), t_nL.Get(), m_ref.Get());
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fa{}, fb{};
+        auto ra = readback(d, l, g_prod.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, fa);
+        auto rb = readback(d, l, g_ref.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, fb);
+        REQUIRE(SUCCEEDED(l.list->Close()));
+        ID3D12CommandList* lists[] = {l.list.Get()};
+        d.queue->ExecuteCommandLists(1, lists);
+        d.WaitIdle();
+        const auto a = rows_of<uint8_t>(ra.Get(), fa, W * 4, H);
+        const auto b = rows_of<float>(rb.Get(), fb, W * 4, H);
+        uint32_t off_by_more = 0, off_by_one = 0, changed = 0;
+        for (size_t i = 0; i < n; ++i) {
+            bool diff = false;
+            for (int c = 0; c < 4; ++c) {
+                const long want = (c == 3) ? 255 : std::lround(enc(b[i * 4 + c]) * 255.f);
+                const long d8 = std::labs(long(a[i * 4 + c]) - want);
+                if (d8 > 1) ++off_by_more; else if (d8 == 1) ++off_by_one;
+                if (a[i * 4 + c] != g8[i * 4 + c]) diff = true;
+            }
+            if (diff) ++changed;
+        }
+        std::printf("SDR 8-bit: pixels %zu, changed %u, off by one code %u, off by more %u (against her shader on the decoded pictures)\n",
+                    n, changed, off_by_one, off_by_more);
+        CHECK(off_by_more == 0);
+        CHECK(changed > 200 && changed < n - 200);
+    }
 
     {   // Motion preparation: fill and dead zone.
         constexpr uint32_t PW = 37, PH = 21;
