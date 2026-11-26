@@ -181,6 +181,9 @@ struct Settings {
     std::atomic<uint32_t> fg_preset{1}; // NVIDIA driver-profile request: A=1 (default), B=2, C=3; restart after change
     std::atomic<uint32_t> fg_multiplier{2};
     std::atomic<uint32_t> fg_target_fps{0};
+    // Route B live x2: Astra's still-area steadying on the generated picture (fg/steady_pass.hpp).
+    // 1 On (default), 0 Off. Remembered per game under [fg_steady_games] <game key>; applies live.
+    std::atomic<uint32_t> fg_steady{1};
     // A69: the freeze watchdog switched Frame Generation off at this time
     // (seconds since 1970, 0 = never). Shown in the menu until FG is re-enabled.
     std::atomic<uint32_t> fg_frozen_at{0};

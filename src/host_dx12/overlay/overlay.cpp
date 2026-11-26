@@ -969,13 +969,15 @@ void write_status_line()
         const float hud_avg = hud.grab_avg + hud.redraw_avg + lv.hudcopy_avg + lv.paste_avg;
         char why[160] = {};
         const bool can = na::fg::Available(why, sizeof why);
-        char fl[4096];
+        char fl[6144];
         const int fn = snprintf(fl, sizeof fl,
             "fglive on=%u choice=%s can_run=%u active=%u real_fps=%.1f shown_fps=%.1f generated_shown=%llu real_frames=%llu inline_frames=%llu presenter_frames=%llu "
             "skipped{no_hudfree=%llu menu=%llu preparing=%llu runtime_veto=%llu runtime=%llu gen_dropped=%llu late=%llu} resets{cut=%llu other=%llu} "
             "hud{learned=%u method=\"%s\" grabs=%llu redraws=%llu skipped=%llu blended=%llu last_skip=\"%s\" verdict=\"%s\" submitted=%llu relearns=%llu skip_counts=\"%s\"} "
             "ms{off=%.3f/%.3f fg_eval=%.3f/%.3f hud=%.3f/%.3f grab=%.3f redraw=%.3f hudcopy=%.3f paste=%.3f presenter=%.3f/%.3f total=%.3f/%.3f} "
-            "vram_mb{budget=%llu usage=%llu extra=%llu} dlssg{path=\"%s\" version=%s loaded=%u} prepare=\"%s\" reason=\"%s\" why_not=\"%s\" waiting_ms=%u waiting=\"%s\"\r\n",
+            "vram_mb{budget=%llu usage=%llu extra=%llu} dlssg{path=\"%s\" version=%s loaded=%u} prepare=\"%s\" reason=\"%s\" why_not=\"%s\" waiting_ms=%u waiting=\"%s\" "
+            "steady{setting=%s ready=%u corrected=%llu off_frames=%llu share_pct=%.2f ms=%.3f/%.3f dropped{gap=%llu reset=%llu no_motion=%llu relearn=%llu resize=%llu refused=%llu} why=\"%s\"} "
+            "display{reported_hz=%.0f max_hz=%.0f dynamic=\"%s\" skipped_above_max=%llu} capture=\"%s\"\r\n",
             fg.enabled, fg.enabled ? "x2" : "Off", can ? 1u : 0u, fg.active, pr.base_fps, pr.shown_fps,
             static_cast<unsigned long long>(pr.generated_shown), static_cast<unsigned long long>(fg.real_frames),
             static_cast<unsigned long long>(lv.frames_inline), static_cast<unsigned long long>(lv.frames_worker),
@@ -989,7 +991,12 @@ void write_status_line()
             lv.off_ms, lv.off_avg, lv.eval_ms, lv.eval_avg, hud_last, hud_avg, hud.grab_avg, hud.redraw_avg, lv.hudcopy_avg, lv.paste_avg,
             lv.copy_ms, lv.copy_avg, lv.eval_ms + hud_last + lv.copy_ms, lv.eval_avg + hud_avg + lv.copy_avg,
             static_cast<unsigned long long>(lv.vram_budget_mb), static_cast<unsigned long long>(lv.vram_usage_mb), static_cast<unsigned long long>(lv.extra_mb),
-            file.path, file.version[0] ? file.version : "none", file.loaded ? 1u : 0u, lv.prepare, fg.reason, can ? "" : why, lv.waiting_ms, lv.waiting);
+            file.path, file.version[0] ? file.version : "none", file.loaded ? 1u : 0u, lv.prepare, fg.reason, can ? "" : why, lv.waiting_ms, lv.waiting,
+            lv.steady_on ? "On" : "Off", lv.steady_ready, static_cast<unsigned long long>(lv.steady_frames), static_cast<unsigned long long>(lv.steady_off_frames),
+            lv.steady_share, lv.steady_ms, lv.steady_avg, static_cast<unsigned long long>(lv.steady_drop_gap), static_cast<unsigned long long>(lv.steady_drop_reset),
+            static_cast<unsigned long long>(lv.steady_drop_motion), static_cast<unsigned long long>(lv.steady_drop_relearn),
+            static_cast<unsigned long long>(lv.steady_drop_resize), static_cast<unsigned long long>(lv.steady_drop_refused), lv.steady_why,
+            lv.display_reported_hz, lv.display_max_hz, lv.display_dynamic, static_cast<unsigned long long>(lv.skipped_display), lv.capture);
         if (fn > 0) WriteFile(f, fl, DWORD((std::min)(fn, int(sizeof fl) - 1)), &written, nullptr);
         static char last_why[160] = {};
         if (std::strcmp(last_why, why)) { // the log says WHY when it cannot run, once per change
@@ -2370,6 +2377,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (key && wp == key && !na::capture::j2::Armed()) { // J2 evidence capture, N consecutive frames
             if (GetKeyState(VK_SHIFT) & 0x8000) { if (!na::j2::SmearTestRunning()) na::j2::StartSmearTest(); } // Shift: the smear test
             else na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+        }
+    }
+    if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && !(GetKeyState(VK_SHIFT) & 0x8000) && na::present::LiveFrameGeneration() &&
+        na::settings::Get().fg_enabled.load(std::memory_order_relaxed)) {
+        // Live x2: the capture key also saves the pictures actually presented (previous-real / generated / next-real).
+        const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
+        if (key && wp == key) {
+            char why[160] = {};
+            if (!na::present::RequestOutputCapture(8, why, sizeof why)) na::eventlog::Emit("fg_capture", "%s", why);
+            else na::eventlog::Emit("fg_capture", "requested: 8 generated pictures with the real frames around them");
         }
     }
     if (msg == kMsgCursorShow || msg == kMsgCursorRestore) {

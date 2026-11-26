@@ -17,6 +17,8 @@
 
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/fg/hud_paste.hpp"
+#include "host_dx12/fg/steady_pass.hpp"
+#include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/settings.hpp"
 #include "core/live_frame_gen.hpp"
 #include "host_dx12/diag/event_log.hpp"
@@ -41,9 +43,10 @@ constexpr uint32_t kSlots = 3;        // real frames in flight through the prese
 constexpr uint32_t kMaxGenerated = 5; // 6x
 constexpr uint32_t kPresentsPerSlot = kMaxGenerated + 1;
 // Per slot: [0] start, [1] end of the generate list, [2..] each present, then the live path's
-// split of the generate list: after the real-frame copy, after the HUD-free copy, after evaluate.
+// split of the generate list: after the real-frame copy, after the HUD-free copy, after evaluate,
+// after the still-area steadying.
 constexpr uint32_t kLiveQuery = 2 + kPresentsPerSlot;
-constexpr uint32_t kQueriesPerSlot = kLiveQuery + 3;
+constexpr uint32_t kQueriesPerSlot = kLiveQuery + 4;
 constexpr uint32_t kJobs = 4;
 constexpr uint32_t kChains = 16; // eight proxy/base pairs; GPU objects remain lazy
 
@@ -84,13 +87,26 @@ std::atomic<bool> g_paste_ready{false};
 std::atomic<uint64_t> g_live_inline{0}, g_live_worker{0}, g_skip_hudfree{0}, g_skip_menu{0}, g_skip_preparing{0};
 struct Timing { std::atomic<float> last{0.f}, avg{0.f};
     void add(float ms) { last.store(ms); const float a = avg.load(); avg.store(a > 0.f ? a * 0.95f + ms * 0.05f : ms); } };
-Timing g_t_off, g_t_copy, g_t_hudcopy, g_t_eval, g_t_paste;
+Timing g_t_off, g_t_copy, g_t_hudcopy, g_t_eval, g_t_paste, g_t_steady;
+// Still-area steadying (Astra): compiled by the preparation thread with the paste; refused with a reason.
+na::fg::SteadyPass g_steady;
+std::atomic<bool> g_steady_ready{false};
+char g_steady_refused[112] = "";
+std::atomic<uint64_t> g_steady_frames{0}, g_steady_off{0}, g_steady_changed{0}, g_steady_counted{0};
+std::atomic<uint64_t> g_drop_gap{0}, g_drop_reset{0}, g_drop_motion{0}, g_drop_relearn{0}, g_drop_resize{0}, g_drop_refused{0};
+std::atomic<uint64_t> g_hud_epoch{0};
+std::atomic<uint64_t> g_skip_display{0};
+std::atomic<float> g_display_reported{0.f};
+char g_display_dynamic[64] = "";
+// Presented-picture capture (F8, x2 on).
+std::atomic<uint32_t> g_cap_request{0};
+char g_cap_text[220] = "";
 std::atomic<uint64_t> g_vram_budget_mb{0}, g_vram_usage_mb{0}, g_extra_mb{0};
 std::atomic<uint32_t> g_inline_owner{1}, g_live_ready{0}, g_live_preparing{0};
 std::mutex g_live_text_m;
 char g_prepare_text[112] = "";
 char g_hudfree_text[112] = "";
-void set_live_text(char* dst, const char* text) { std::lock_guard<std::mutex> lock(g_live_text_m); strncpy_s(dst, 112, text ? text : "", _TRUNCATE); }
+void set_live_text(char* dst, const char* text, size_t n = 112) { std::lock_guard<std::mutex> lock(g_live_text_m); strncpy_s(dst, n, text ? text : "", _TRUNCATE); }
 // x2 chosen since / last generated picture recorded (GetTickCount64): "on but waiting" after a second.
 std::atomic<uint64_t> g_fg_on_since{0}, g_last_generated_tick{0};
 // Every live link logs its first success and its first failure, once each.
@@ -142,6 +158,34 @@ struct Slot {
     ComPtr<ID3D12Resource> hudfree;
     bool live_split = false, hudfree_used = false;
     bool off_timed = false;
+    // Still-area steadying ran on this slot's generated picture (its counter page is read once the
+    // generate fence passed).
+    bool steady_ran = false;
+    uint32_t steady_page = 0, steady_pixels = 0;
+};
+
+// Presented-picture capture (F8): readback buffers for each captured present, filled on the
+// presentation queue right after the copy into the back buffer; written to disk by its own thread
+// once its fence passed.
+struct CaptureShot {
+    ComPtr<ID3D12Resource> buffer;   // READBACK, footprint of the presented texture
+    const char* kind = "";           // previous-real / generated / next-real
+    uint64_t frame_id = 0, engine_frame = 0;
+    HRESULT hr = S_OK;
+    bool presented = false, copied = false;
+    LONGLONG qpc = 0;
+};
+struct Capture {
+    std::atomic<uint32_t> state{0};  // 0 idle, 1 buffers being made, 2 ready (waits for a job with x2), 3 running
+    uint32_t triples = 0, jobs_seen = 0, used = 0;
+    std::vector<CaptureShot> shots;
+    ComPtr<ID3D12Fence> fence;
+    UINT64 fence_value = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT w = 0, h = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    std::thread maker;
+    std::atomic<bool> made{false}, failed{false};
 };
 
 struct Job {
@@ -152,6 +196,7 @@ struct Job {
     UINT flags = 0;
     LONGLONG arrival = 0;
     float frame_ms = 0;
+    uint64_t frame_id = 0;
     ID3D12CommandQueue* queue = nullptr; // the chain holds a reference
 };
 
@@ -203,7 +248,13 @@ struct Chain {
     float last_blocked_ms = 0.f;        // time the previous Present spent waiting on our slot ring / job queue
     bool orphaned = false;              // A75: the game let go but our teardown timed out; retried from later presents / Shutdown
     uint32_t hitch_skips = 0;
-    float display_hz = 0.f;
+    float display_hz = 0.f;                // x2's ceiling: the display's maximum refresh (else the reported rate)
+    float display_reported_hz = 0.f, display_max_hz = 0.f;
+    // Still-area steadying: the frame whose HUD-free picture the previous slot holds (UINT64_MAX none),
+    // the HUD epoch it was made in, and a resize since (the slot textures were made again).
+    uint64_t steady_prev_id = UINT64_MAX, steady_prev_epoch = 0;
+    bool steady_resized = false;
+    Capture cap;
     std::atomic<UINT> game_latency{0};  // A63: what the game asked for (0 = never asked)
     UINT latency_applied = 0;           // what the real chain currently has from us
     std::atomic<HRESULT> last_hr{S_OK};
@@ -220,8 +271,9 @@ Chain g_chains[kChains];
 std::atomic<ID3D12CommandQueue*> g_private_queues[kChains]{};
 std::mutex g_chains_m;
 
-float refresh_hz_for(HWND hwnd)
+float refresh_hz_for(HWND hwnd, float* max_hz = nullptr)
 {
+    if (max_hz) *max_hz = 0.f;
     HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
@@ -229,6 +281,15 @@ float refresh_hz_for(HWND hwnd)
     DEVMODEW dm{};
     dm.dmSize = sizeof(dm);
     if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) return 0.f;
+    if (max_hz) { // the highest refresh the display offers at its current size: x2's ceiling
+        DWORD best = dm.dmDisplayFrequency;
+        DEVMODEW m{};
+        m.dmSize = sizeof(m);
+        for (DWORD i = 0; EnumDisplaySettingsW(mi.szDevice, i, &m); ++i)
+            if (m.dmPelsWidth == dm.dmPelsWidth && m.dmPelsHeight == dm.dmPelsHeight && m.dmDisplayFrequency > best && m.dmDisplayFrequency < 1000)
+                best = m.dmDisplayFrequency;
+        *max_hz = static_cast<float>(best);
+    }
     return static_cast<float>(dm.dmDisplayFrequency);
 }
 
@@ -323,8 +384,15 @@ bool ensure_proxies_locked(Chain& c)
         } else if (!ours) np::CommitBuffers(c.desc.OutputWindow, out, act);
         np::ctl::Allocated({act.w, act.h}, GetTickCount64());
     }
-    c.display_hz = refresh_hz_for(c.desc.OutputWindow);
+    // Display (Cort 2026-11-26: dynamic refresh raises the rate in game; the desktop reads 60 Hz). The
+    // ceiling is the display's maximum refresh, never the reported desktop mode. Windows does not tell a
+    // program whether its dynamic refresh is on, so that is logged as not readable.
+    c.display_reported_hz = refresh_hz_for(c.desc.OutputWindow, &c.display_max_hz);
+    c.display_hz = c.display_max_hz > 0.f ? c.display_max_hz : c.display_reported_hz;
     g_display_hz.store(c.display_hz);
+    g_display_reported.store(c.display_reported_hz);
+    set_live_text(g_display_dynamic, "not readable (Windows does not report it to programs)", sizeof g_display_dynamic);
+    na::eventlog::Emit("display", "refresh reported %.0f Hz, maximum %.0f Hz (x2's ceiling), dynamic refresh: not readable", c.display_reported_hz, c.display_max_hz);
     c.proxy_count.store(n,std::memory_order_release);
     g_proxied.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -541,7 +609,13 @@ bool release_size_dependent_locked(Chain& c)
         c.worker_owner = false;
         g_inline_owner.store(1);
     }
-    for (Slot& s : c.slots) s.hudfree.Reset();
+    for (Slot& s : c.slots) { s.hudfree.Reset(); s.steady_ran = false; }
+    c.steady_prev_id = UINT64_MAX; // the slots' HUD-free pictures are made again
+    c.steady_resized = true;
+    if (c.cap.state.load() >= 2) { // F8 capture: the picture size changes, so an unfinished burst is dropped
+        c.cap.shots.clear(); c.cap.used = 0; c.cap.state = 0;
+        set_live_text(g_cap_text, "Presented-picture capture stopped: the picture size changed.", sizeof g_cap_text);
+    }
     if (!c.proxies.empty()) g_proxied.fetch_sub(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> buffers_lock(c.buffers_m);
@@ -642,6 +716,13 @@ void prepare_live_locked(Chain& c)
             ok = g_paste.Init(device);
             g_paste_ready.store(ok, std::memory_order_release);
         }
+        if (ok && !g_steady_ready.load(std::memory_order_acquire)) { // optional: x2 runs without it, with the reason shown
+            char why[112] = {};
+            const bool steady = g_steady.Init(device, fmt, why, sizeof why);
+            set_live_text(g_steady_refused, steady ? "" : why);
+            if (!steady) na::eventlog::Emit("fg_steady", "not available: %s", why);
+            g_steady_ready.store(steady, std::memory_order_release);
+        }
         g_live_preparing.store(0);
         if (!ok) {
             set_live_text(g_prepare_text, uav ? "Frame Generation could not make its textures on the graphics card."
@@ -661,7 +742,7 @@ void prepare_live_locked(Chain& c)
 // instead of blocking this thread, and nothing is counted as presented.
 HRESULT present_texture(Chain& c, ID3D12CommandQueue* queue, ID3D12Resource* tex, D3D12_RESOURCE_STATES state,
                         ID3D12CommandAllocator* alloc, UINT sync, UINT flags, bool no_wait = false, uint64_t engine_frame = 0,
-                        UINT query = UINT_MAX, int off_slot = -1)
+                        UINT query = UINT_MAX, int off_slot = -1, CaptureShot* shot = nullptr)
 {
     UINT idx = g_orig.get_index(c.sc3.Get());
     if (idx >= c.desc.BufferCount) return DXGI_ERROR_INVALID_CALL;
@@ -679,6 +760,13 @@ HRESULT present_texture(Chain& c, ID3D12CommandQueue* queue, ID3D12Resource* tex
                                      transition(tex, state, D3D12_RESOURCE_STATE_COPY_SOURCE)};
     c.list_present->ResourceBarrier(2, pre);
     c.list_present->CopyResource(bb, tex);
+    if (shot && shot->buffer) { // F8 capture: exactly the picture copied into the back buffer
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = shot->buffer.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = c.cap.fp;
+        src.pResource = tex; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        c.list_present->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        shot->copied = true;
+    }
     D3D12_RESOURCE_BARRIER post[2] = {transition(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
                                       transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, state)};
     c.list_present->ResourceBarrier(2, post);
@@ -705,6 +793,12 @@ HRESULT present_texture(Chain& c, ID3D12CommandQueue* queue, ID3D12Resource* tex
     HRESULT hr = g_orig.present(c.sc, sync, pflags);
     if (no_wait) na::latency::GeneratedPresent(engine_frame, true);
     else na::latency::EngineMark(engine_frame, na::latency::Phase::Presented);
+    if (shot) {
+        shot->hr = hr;
+        shot->presented = SUCCEEDED(hr) && hr != DXGI_ERROR_WAS_STILL_DRAWING;
+        QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&shot->qpc));
+        if (shot->copied && c.cap.fence) queue->Signal(c.cap.fence.Get(), ++c.cap.fence_value);
+    }
     if (no_wait && hr == DXGI_ERROR_WAS_STILL_DRAWING) return hr; // queue full: not shown, not counted
     c.last_hr.store(hr);
     if (FAILED(hr)) return hr;
@@ -739,6 +833,85 @@ void wait_until(const Chain& c, LONGLONG target)
     }
 }
 
+// F8 capture, present thread: the next shot to fill (null = not capturing this present). The burst is
+// one real frame, then `triples` jobs each giving a generated picture and its real frame.
+CaptureShot* capture_shot(Chain& c, const char* kind, uint64_t frame_id, uint64_t engine_frame)
+{
+    if (c.cap.state != 3 || c.cap.used >= c.cap.shots.size()) return nullptr;
+    CaptureShot& s = c.cap.shots[c.cap.used++];
+    s.kind = kind; s.frame_id = frame_id; s.engine_frame = engine_frame;
+    return &s;
+}
+void capture_write(Chain& c)
+{
+    // Hand the buffers to a writer thread (it waits for the capture fence, then writes and releases).
+    std::vector<CaptureShot> shots;
+    shots.swap(c.cap.shots);
+    shots.resize(c.cap.used);
+    ComPtr<ID3D12Fence> fence = c.cap.fence;
+    const UINT64 last = c.cap.fence_value;
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = c.cap.fp;
+    const UINT w = c.cap.w, h = c.cap.h;
+    const DXGI_FORMAT format = c.cap.format;
+    const double qpf = static_cast<double>(c.qpc.QuadPart);
+    if (c.cap.maker.joinable()) c.cap.maker.join(); // finished (it set `made`)
+    c.cap.used = 0;
+    c.cap.state = 0;
+    std::thread([shots = std::move(shots), fence, last, fp, w, h, format, qpf]() mutable {
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (fence && fence->GetCompletedValue() < last && ev) { fence->SetEventOnCompletion(last, ev); WaitForSingleObject(ev, 5000); }
+        if (ev) CloseHandle(ev);
+        if (!fence || fence->GetCompletedValue() < last) { set_live_text(g_cap_text, "Presented-picture capture failed: the graphics card did not finish the copies.", sizeof g_cap_text); return; }
+        wchar_t dir[MAX_PATH];
+        if (!na::capture::MakeDir(L"fgout", dir, MAX_PATH, true)) { set_live_text(g_cap_text, "Presented-picture capture failed: the captures folder could not be made (disk nearly full?).", sizeof g_cap_text); return; }
+        na::capture::TagDir(dir, "fgout");
+        const uint32_t bpp = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+        uint64_t bytes = 0;
+        std::string json = "{\n  \"width\": " + std::to_string(w) + ", \"height\": " + std::to_string(h) + ", \"format\": " + std::to_string(static_cast<unsigned>(format)) +
+                           ", \"bytes_per_pixel\": " + std::to_string(bpp) + ", \"layout\": \"tight rows, top to bottom\",\n  \"pictures\": [\n";
+        for (size_t i = 0; i < shots.size(); ++i) {
+            CaptureShot& s = shots[i];
+            char name[64] = "";
+            if (s.copied && s.buffer) {
+                snprintf(name, sizeof name, "%02zu-%s.raw", i, s.kind);
+                wchar_t path[MAX_PATH], wname[64];
+                MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 64);
+                swprintf_s(path, L"%s\\%s", dir, wname);
+                void* m = nullptr;
+                D3D12_RANGE rr{0, SIZE_T(fp.Footprint.RowPitch) * h};
+                HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (f != INVALID_HANDLE_VALUE && SUCCEEDED(s.buffer->Map(0, &rr, &m))) {
+                    for (UINT y = 0; y < h; ++y) {
+                        DWORD wr = 0;
+                        WriteFile(f, static_cast<const uint8_t*>(m) + fp.Offset + size_t(y) * fp.Footprint.RowPitch, w * bpp, &wr, nullptr);
+                        bytes += wr;
+                    }
+                    D3D12_RANGE none{0, 0};
+                    s.buffer->Unmap(0, &none);
+                } else name[0] = 0;
+                if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+            }
+            s.buffer.Reset(); // release as we go
+            char line[400];
+            snprintf(line, sizeof line, "    {\"index\": %zu, \"kind\": \"%s\", \"frame_id\": %llu, \"engine_frame\": %llu, \"presented\": %s, \"present_result\": \"0x%08X\", \"time_ms\": %.3f, \"file\": \"%s\"}%s\n",
+                     i, s.kind, static_cast<unsigned long long>(s.frame_id), static_cast<unsigned long long>(s.engine_frame), s.presented ? "true" : "false",
+                     static_cast<unsigned>(s.hr), qpf > 0 ? 1000.0 * static_cast<double>(s.qpc) / qpf : 0.0, name, i + 1 < shots.size() ? "," : "");
+            json += line;
+        }
+        json += "  ]\n}\n";
+        wchar_t jp[MAX_PATH];
+        swprintf_s(jp, L"%s\\presented.json", dir);
+        HANDLE f = CreateFileW(jp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) { DWORD wr = 0; WriteFile(f, json.data(), static_cast<DWORD>(json.size()), &wr, nullptr); CloseHandle(f); }
+        char dir8[MAX_PATH] = {};
+        WideCharToMultiByte(CP_UTF8, 0, dir, -1, dir8, sizeof dir8, nullptr, nullptr);
+        char text[220];
+        snprintf(text, sizeof text, "Presented-picture capture saved: %zu pictures, %.0f MB, %s", shots.size(), double(bytes) / (1024.0 * 1024.0), dir8);
+        set_live_text(g_cap_text, text, sizeof g_cap_text);
+        na::eventlog::Emit("fg_capture", "%s", text);
+    }).detach();
+}
+
 DWORD WINAPI present_thread(LPVOID p)
 {
     Chain& c = *static_cast<Chain*>(p);
@@ -754,6 +927,13 @@ DWORD WINAPI present_thread(LPVOID p)
         }
         Slot& s = c.slots[job.slot];
         auto pq=display_queue(c);
+        if (c.cap.state == 2 && c.cap.made.load(std::memory_order_acquire) && job.count) { c.cap.state = 3; c.cap.jobs_seen = 0; }
+        if (c.cap.state == 1 && c.cap.failed.load(std::memory_order_acquire)) { if (c.cap.maker.joinable()) c.cap.maker.join(); c.cap.shots.clear(); c.cap.state = 0; }
+        if (c.cap.state == 2 && (!g_live.load(std::memory_order_relaxed) || c.cap.w != c.desc.BufferDesc.Width || c.cap.h != c.desc.BufferDesc.Height)) {
+            c.cap.shots.clear(); c.cap.state = 0; // x2 went away or the picture size changed while the buffers were made
+            set_live_text(g_cap_text, "Presented-picture capture stopped before it began (x2 off or the picture size changed).", sizeof g_cap_text);
+        }
+        if (c.cap.state == 1 && c.cap.made.load(std::memory_order_acquire)) c.cap.state = 2;
         // Rendering does not wait for presentation. Separate fences prevent
         // an earlier value on one queue falsely completing work on the other.
         if(c.queues_bound && FAILED(pq->Wait(c.fence.Get(),s.gen_fence.load()))) {
@@ -831,18 +1011,25 @@ DWORD WINAPI present_thread(LPVOID p)
                 // (floor of 4 ms: scheduler jitter alone must not drop pictures when steps are tiny)
                 double drop_after_ms = interval_ms > 4.0 ? interval_ms : 4.0;
                 bool whole_step_late = now.QuadPart > target + static_cast<LONGLONG>(drop_after_ms * ticks_per_ms);
-                if (whole_step_late) { g_generated_dropped.fetch_add(1, std::memory_order_relaxed); continue; }
+                if (whole_step_late) {
+                    g_generated_dropped.fetch_add(1, std::memory_order_relaxed);
+                    if (c.cap.jobs_seen) if (CaptureShot* shot = capture_shot(c, "generated", job.frame_id, job.engine_frame)) { shot->buffer.Reset(); shot->hr = DXGI_ERROR_WAS_STILL_DRAWING; }
+                    continue;
+                }
+                CaptureShot* shot = c.cap.jobs_seen ? capture_shot(c, "generated", job.frame_id, job.engine_frame) : nullptr;
                 HRESULT ghr = present_texture(c, pq, s.interp[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, s.alloc_present[i].Get(),
-                                              job.sync, job.flags, true, job.engine_frame, job.slot*kQueriesPerSlot+2+i);
+                                              job.sync, job.flags, true, job.engine_frame, job.slot*kQueriesPerSlot+2+i, -1, shot);
                 if (SUCCEEDED(ghr) || ghr==DXGI_ERROR_WAS_STILL_DRAWING) s.copied_mask |= 1u<<i;
                 if (FAILED(ghr)) { g_generated_dropped.fetch_add(1, std::memory_order_relaxed); if (g_live.load(std::memory_order_relaxed)) { char d[64]; snprintf(d, sizeof d, "Present returned 0x%08X", static_cast<unsigned>(ghr)); live_first("generated picture presented", false, d); } }
                 else { g_generated_shown.fetch_add(1, std::memory_order_relaxed); if (g_live.load(std::memory_order_relaxed)) live_first("generated picture presented", true, nullptr); }
             } else {
+                CaptureShot* shot = capture_shot(c, c.cap.jobs_seen ? "next-real" : "previous-real", job.frame_id, job.engine_frame);
                 HRESULT rhr=present_texture(c, pq, s.real_copy.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.alloc_present[i].Get(),
-                                job.sync, job.flags, false, job.engine_frame, job.slot*kQueriesPerSlot+2+i);
+                                job.sync, job.flags, false, job.engine_frame, job.slot*kQueriesPerSlot+2+i, -1, shot);
                 if (SUCCEEDED(rhr)) s.copied_mask |= 1u<<i;
             }
         }
+        if (c.cap.state == 3 && ++c.cap.jobs_seen > c.cap.triples) capture_write(c);
         LARGE_INTEGER finished; QueryPerformanceCounter(&finished);
         { std::lock_guard<std::mutex> metrics(g_metrics_m); g_real_ages.Add(static_cast<float>(1000.0 * static_cast<double>(finished.QuadPart - job.arrival) / static_cast<double>(c.qpc.QuadPart))); }
         release_slot(c, s, pq);
@@ -877,14 +1064,23 @@ void read_timing_locked(Chain& c, Slot& s, uint32_t slot_index)
         float avg = g_fg_avg_ms.load();
         g_fg_avg_ms.store(avg > 0 ? avg * 0.9f + ms * 0.1f : ms);
     }
-    if (s.live_split) { // live x2: real-frame copy | HUD-free copy | evaluate | HUD paste
-        const UINT64 a = st[0], b = st[kLiveQuery], h = st[kLiveQuery + 1], e = st[kLiveQuery + 2], z = st[1];
+    if (s.live_split) { // live x2: real-frame copy | HUD-free copy | evaluate | steadying | HUD paste
+        const UINT64 a = st[0], b = st[kLiveQuery], h = st[kLiveQuery + 1], e = st[kLiveQuery + 2], d = st[kLiveQuery + 3], z = st[1];
         const auto ms = [&](UINT64 from, UINT64 to) { return to >= from && from ? 1000.f * float(to - from) / float(freq) : -1.f; };
         if (const float v = ms(a, b); v >= 0.f) g_t_copy.add(v);
         if (s.hudfree_used) {
             if (const float v = ms(b, h); v >= 0.f) g_t_hudcopy.add(v);
             if (const float v = ms(h, e); v >= 0.f) g_t_eval.add(v);
-            if (const float v = ms(e, z); v >= 0.f) g_t_paste.add(v);
+            if (const float v = ms(d, z); v >= 0.f) g_t_paste.add(v);
+        }
+        if (s.steady_ran) {
+            if (const float v = ms(e, d); v >= 0.f) g_t_steady.add(v);
+            uint32_t changed = 0;
+            if (g_steady.ReadChanged(s.steady_page, &changed)) {
+                g_steady_changed.fetch_add(changed, std::memory_order_relaxed);
+                g_steady_counted.fetch_add(s.steady_pixels, std::memory_order_relaxed);
+            }
+            s.steady_ran = false;
         }
         s.live_split = false;
     }
@@ -937,6 +1133,18 @@ void SetEnabled(bool enabled) { g_enabled.store(enabled, std::memory_order_relea
 void SetLiveFrameGeneration(bool on) { g_live.store(on, std::memory_order_release); }
 bool LiveFrameGeneration() { return g_live.load(std::memory_order_acquire); }
 void SetHudFreeProvider(HudFreeFn fn) { g_hudfree_fn.store(fn, std::memory_order_release); }
+void NoteHudRelearn() { g_hud_epoch.fetch_add(1, std::memory_order_relaxed); }
+bool RequestOutputCapture(uint32_t triples, char* why, size_t n)
+{
+    auto say = [&](const char* t) { if (why && n) strncpy_s(why, n, t, _TRUNCATE); set_live_text(g_cap_text, t, sizeof g_cap_text); return false; };
+    if (!g_live.load(std::memory_order_acquire)) return say("Presented-picture capture needs live Frame Generation.");
+    if (!na::settings::Get().fg_enabled.load(std::memory_order_relaxed)) return say("Presented-picture capture: switch x2 on first (it saves what x2 presents).");
+    if (triples < 1) triples = 1;
+    if (triples > 16) triples = 16;
+    g_cap_request.store(triples, std::memory_order_release);
+    if (why && n) why[0] = 0;
+    return true;
+}
 LiveStats GetLiveStats()
 {
     LiveStats s;
@@ -955,6 +1163,15 @@ LiveStats GetLiveStats()
     s.hudcopy_ms = g_t_hudcopy.last.load(); s.hudcopy_avg = g_t_hudcopy.avg.load();
     s.eval_ms = g_t_eval.last.load(); s.eval_avg = g_t_eval.avg.load();
     s.paste_ms = g_t_paste.last.load(); s.paste_avg = g_t_paste.avg.load();
+    s.steady_on = na::settings::Get().fg_steady.load(std::memory_order_relaxed) ? 1u : 0u;
+    s.steady_ready = g_steady_ready.load() ? 1u : 0u;
+    s.steady_frames = g_steady_frames.load(); s.steady_off_frames = g_steady_off.load();
+    { const uint64_t counted = g_steady_counted.load(); s.steady_share = counted ? 100.f * float(double(g_steady_changed.load()) / double(counted)) : 0.f; }
+    s.steady_ms = g_t_steady.last.load(); s.steady_avg = g_t_steady.avg.load();
+    s.steady_drop_gap = g_drop_gap.load(); s.steady_drop_reset = g_drop_reset.load(); s.steady_drop_motion = g_drop_motion.load();
+    s.steady_drop_relearn = g_drop_relearn.load(); s.steady_drop_resize = g_drop_resize.load(); s.steady_drop_refused = g_drop_refused.load();
+    s.display_reported_hz = g_display_reported.load(); s.display_max_hz = g_display_hz.load();
+    s.skipped_display = g_skip_display.load();
     s.vram_budget_mb = g_vram_budget_mb.load();
     s.vram_usage_mb = g_vram_usage_mb.load();
     s.extra_mb = g_extra_mb.load();
@@ -963,6 +1180,9 @@ LiveStats GetLiveStats()
         std::lock_guard<std::mutex> lock(g_live_text_m);
         strncpy_s(s.prepare, g_prepare_text, _TRUNCATE);
         strncpy_s(s.hudfree_why, g_hudfree_text, _TRUNCATE);
+        strncpy_s(s.steady_why, g_steady_refused, _TRUNCATE);
+        strncpy_s(s.display_dynamic, g_display_dynamic, _TRUNCATE);
+        strncpy_s(s.capture, g_cap_text, _TRUNCATE);
     }
     // Never a silent "nothing": x2 chosen, and no generated picture for more than a second.
     const uint64_t since = g_fg_on_since.load(), last = g_last_generated_tick.load(), now = GetTickCount64();
@@ -1292,6 +1512,14 @@ HRESULT Present(const PresentArgs& a)
     } else if (fg_on) {
         c->worker_owner = true;
     }
+    if (live && fg_on && c->display_hz > 0.f && c->render_ms > 0.f && 1000.f / c->render_ms > c->display_hz * 1.02f) {
+        // Even the display's maximum refresh is below the game's own rate: x2 could show nothing extra.
+        char why[112];
+        snprintf(why, sizeof why, "x2 waits: the game already renders %.0f fps, above the display's maximum of %.0f Hz.", 1000.f / c->render_ms, c->display_hz);
+        fg::NotePaused(why);
+        g_skip_display.fetch_add(1, std::memory_order_relaxed);
+        fg_on = false;
+    }
     bool want_fg = !c->external_owner && c->uav_ok && !a.menu_open && fg_on;
     // A73: say WHY nothing is generated right now instead of leaving the last
     // message standing (session 13: "starting" stayed on screen because the
@@ -1322,6 +1550,49 @@ HRESULT Present(const PresentArgs& a)
         return hr;
     }
     if (live) g_live_worker.fetch_add(1, std::memory_order_relaxed);
+    if (const uint32_t want = g_cap_request.exchange(0, std::memory_order_acq_rel)) {
+        // F8 with x2 on: readback buffers for the burst, made off this thread (one per present).
+        if (c->cap.state != 0 || c->cap.maker.joinable()) set_live_text(g_cap_text, "Presented-picture capture is already running.", sizeof g_cap_text);
+        else {
+            c->cap.triples = want;
+            c->cap.used = 0;
+            c->cap.w = c->desc.BufferDesc.Width; c->cap.h = c->desc.BufferDesc.Height; c->cap.format = c->desc.BufferDesc.Format;
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; td.Width = c->cap.w; td.Height = c->cap.h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+            td.Format = c->cap.format; td.SampleDesc.Count = 1;
+            UINT64 total = 0;
+            c->device->GetCopyableFootprints(&td, 0, 1, 0, &c->cap.fp, nullptr, nullptr, &total);
+            c->cap.shots.assign(size_t(want) * 2 + 1, CaptureShot{});
+            c->cap.made.store(false); c->cap.failed.store(false);
+            if (!c->cap.fence && FAILED(c->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c->cap.fence)))) c->cap.fence.Reset();
+            char text[220];
+            snprintf(text, sizeof text, "Presented-picture capture: preparing %u pictures (%.0f MB of memory, the same on disk).", want * 2 + 1,
+                     double(total) * double(want * 2 + 1) / (1024.0 * 1024.0));
+            set_live_text(g_cap_text, text, sizeof g_cap_text);
+            na::eventlog::Emit("fg_capture", "%s", text);
+            c->cap.state = 1;
+            ID3D12Device* device = c->device.Get();
+            Capture* cap = &c->cap;
+            cap->maker = std::thread([cap, device, total] {
+                D3D12_HEAP_PROPERTIES hp{};
+                hp.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC bd{};
+                bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+                bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                bool ok = cap->fence != nullptr;
+                for (auto& shot : cap->shots)
+                    if (ok) ok = SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&shot.buffer)));
+                if (!ok) {
+                    for (auto& shot : cap->shots) shot.buffer.Reset();
+                    set_live_text(g_cap_text, "Presented-picture capture failed: not enough memory for the readback buffers.", sizeof g_cap_text);
+                    cap->failed.store(true, std::memory_order_release);
+                    return;
+                }
+                set_live_text(g_cap_text, "Presented-picture capture: waiting for the next frame with a generated picture.", sizeof g_cap_text);
+                cap->made.store(true, std::memory_order_release);
+            });
+        }
+    }
 
     // Render-small: the upscaler turns the render-size picture into the native slot texture on
     // the game's queue (its own list, executed before ours), then the menu draws on it.
@@ -1424,6 +1695,35 @@ HRESULT Present(const PresentArgs& a)
         count = c->external_owner ? 0 : fg::Generate(c->list_gen.Get(), c->device.Get(), fi, outs, capacity);
         if (live) {
             c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 2);
+            // Still-area steadying (Astra): on the generated picture, before the HUD paste, from the two
+            // consecutive real HUD-free frames. Only a valid pair: anything else shows the unmodified picture.
+            s.steady_ran = false;
+            if (count) {
+                const fg::UsedMotion um = fg::LastUsedMotion();
+                const uint64_t prev_id = c->steady_prev_id, epoch = g_hud_epoch.load(std::memory_order_relaxed);
+                Slot& older = c->slots[(si + kSlots - 1) % kSlots];
+                const char* drop = nullptr;
+                if (!na::settings::Get().fg_steady.load(std::memory_order_relaxed)) { g_steady_off.fetch_add(1, std::memory_order_relaxed); }
+                else if (!g_steady_ready.load(std::memory_order_acquire)) { g_drop_refused.fetch_add(1, std::memory_order_relaxed); drop = "refused"; }
+                else if (c->steady_resized) { g_drop_resize.fetch_add(1, std::memory_order_relaxed); drop = "resize"; }
+                else if (prev_id == UINT64_MAX || prev_id + 1 != c->frame_id || !older.hudfree) { g_drop_gap.fetch_add(1, std::memory_order_relaxed); drop = "gap"; }
+                else if (c->steady_prev_epoch != epoch) { g_drop_relearn.fetch_add(1, std::memory_order_relaxed); drop = "HUD relearned"; }
+                else if (um.reset || um.frame_id != c->frame_id) { g_drop_reset.fetch_add(1, std::memory_order_relaxed); drop = "history reset"; }
+                else if (!um.filled) { g_drop_motion.fetch_add(1, std::memory_order_relaxed); drop = "no motion guide"; }
+                else {
+                    const uint32_t page = static_cast<uint32_t>(c->frame_id % na::fg::SteadyPass::kPages);
+                    if (g_steady.Record(c->list_gen.Get(), outs[0], older.hudfree.Get(), s.hudfree.Get(), um.filled, fi.width, fi.height,
+                                        um.mv_scale_x, um.mv_scale_y, page)) {
+                        s.steady_ran = true;
+                        s.steady_page = page;
+                        s.steady_pixels = fi.width * fi.height;
+                        g_steady_frames.fetch_add(1, std::memory_order_relaxed);
+                        live_first("still-area steadying applied", true, nullptr);
+                    }
+                }
+                if (drop) live_first("still-area steadying used a frame pair", false, drop);
+            }
+            c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 3);
             // T2: the newer real frame's HUD, exactly, through its own HUD mask.
             // A generated picture whose HUD could not be pasted is never shown (it would carry a warped HUD).
             for (uint32_t i = 0; i < count; ++i)
@@ -1451,12 +1751,19 @@ HRESULT Present(const PresentArgs& a)
     if (live) {
         if (!count) { // nothing was evaluated: the split marks still need values to resolve
             c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 2);
+            c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 3);
             s.hudfree_used = false;
+            s.steady_ran = false;
         }
-        c->list_gen->ResolveQueryData(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery, 3, c->query_readback.Get(),
+        c->list_gen->ResolveQueryData(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery, 4, c->query_readback.Get(),
                                       (si * kQueriesPerSlot + kLiveQuery) * sizeof(UINT64));
     }
     c->list_gen->Close();
+    if (live) { // this slot's HUD-free picture is the next frame's older one (only when it was made this frame)
+        c->steady_prev_id = s.hudfree_used ? c->frame_id : UINT64_MAX;
+        c->steady_prev_epoch = g_hud_epoch.load(std::memory_order_relaxed);
+        if (s.hudfree_used) c->steady_resized = false;
+    }
     apply_latency_locked(*c, count);
     ID3D12CommandList* lists[] = {c->list_gen.Get()};
     a.queue->ExecuteCommandLists(1, lists);
@@ -1478,6 +1785,7 @@ HRESULT Present(const PresentArgs& a)
     job.arrival = now.QuadPart;
     job.frame_ms = c->frame_ms > 0 ? c->frame_ms : 16.7f;
     job.queue = a.queue;
+    job.frame_id = c->frame_id - 1; // incremented above
     {
         std::unique_lock<std::mutex> jl(c->jm);
         LARGE_INTEGER b0, b1;
@@ -1565,6 +1873,10 @@ bool teardown_chain_locked(Chain& c, uint32_t timeout_ms)
     if (c.live_prep.joinable()) c.live_prep.join(); // it writes the slots' textures
     if (!drain_locked(c, timeout_ms)) return false;
     if (!stop_thread(c, timeout_ms)) return false;
+    if (c.cap.maker.joinable()) c.cap.maker.join(); // F8 capture: an unfinished burst is dropped
+    c.cap.shots.clear();
+    c.cap.used = 0;
+    c.cap.state = 0;
     if (!wait_fence(c, c.last_signal.load(), timeout_ms) || !wait_presentation(c,c.presentation_last.load(),timeout_ms)) return false;
     if (!c.proxies.empty()) g_proxied.fetch_sub(1, std::memory_order_relaxed);
     {

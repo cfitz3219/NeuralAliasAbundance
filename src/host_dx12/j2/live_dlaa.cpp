@@ -853,6 +853,7 @@ bool live_hud_present(uint64_t shown, uint64_t sheet_copies)
     if (g_live_hud.frames_without_copy >= 120 || g_live_hud.frames_without_final >= 120) {
         const bool no_copy = g_live_hud.frames_without_copy >= 120;
         ++g_live_hud.relearns;
+        na::present::NoteHudRelearn(); // the still-area steadying drops its frame pair
         na::eventlog::Emit("fg_hud", "relearning the HUD sheet (%llu): %s for 120 frames in a row", static_cast<unsigned long long>(g_live_hud.relearns),
                            no_copy ? "nothing was drawn on the learned sheet" : "no final draw into the shown picture was seen");
         g_live_hud.frames_without_copy = g_live_hud.frames_without_final = 0;

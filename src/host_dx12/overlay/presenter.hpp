@@ -131,6 +131,13 @@ bool LiveFrameGeneration();
 // RENDER_TARGET state; null with `why` (plain words) when there is none for this frame.
 using HudFreeFn = ID3D12Resource* (*)(const char** why);
 void SetHudFreeProvider(HudFreeFn fn);
+// The HUD sheet was learned again (live DLAA): the still-area steadying drops its pair of frames.
+void NoteHudRelearn();
+// F8 with x2 on: the pictures actually presented next are saved, `triples` generated pictures with the
+// real frames before and after each (previous-real / generated / next-real), with frame ids and present
+// results, to LocalAppData\NeuralAlias\captures\fgout-<time>-<exe>-p<pid>. The pictures are read
+// back only during the burst. false + why (plain words) when it cannot start now.
+bool RequestOutputCapture(uint32_t triples, char* why, size_t why_size);
 struct LiveStats {
     uint32_t live = 0, ready = 0, preparing = 0, inline_owner = 1;
     uint64_t frames_inline = 0, frames_worker = 0;
@@ -142,6 +149,21 @@ struct LiveStats {
     uint64_t vram_budget_mb = 0, vram_usage_mb = 0, extra_mb = 0;
     char prepare[112] = "";
     char hudfree_why[112] = "";
+    // Still-area steadying (fg/steady_pass.hpp, Astra): the setting, frames corrected, the share of the
+    // picture it changed on those frames (percent, counted on the GPU), its GPU time, frames with x2 and
+    // the setting Off, and why a frame pair was not used (the unmodified picture was shown then).
+    uint32_t steady_on = 1, steady_ready = 0;
+    uint64_t steady_frames = 0, steady_off_frames = 0;
+    float steady_share = 0, steady_ms = 0, steady_avg = 0;
+    uint64_t steady_drop_gap = 0, steady_drop_reset = 0, steady_drop_motion = 0, steady_drop_relearn = 0, steady_drop_resize = 0, steady_drop_refused = 0;
+    char steady_why[112] = "";
+    // Display: the refresh rate Windows reports now, the display's maximum (x2's ceiling), whether
+    // dynamic refresh is on, and frames shown without x2 because even the maximum is below the real rate.
+    float display_reported_hz = 0, display_max_hz = 0;
+    char display_dynamic[64] = "";
+    uint64_t skipped_display = 0;
+    // Presented-picture capture (F8 with x2 on): state in plain words.
+    char capture[220] = "";
     // x2 chosen and no generated picture for more than a second: how long, and why in plain words.
     uint32_t waiting_ms = 0;
     char waiting[200] = "";

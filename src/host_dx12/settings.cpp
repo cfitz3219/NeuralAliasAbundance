@@ -343,6 +343,7 @@ void BindFrameGenerationToGame(const wchar_t* game)
     g_loaded_values.fg_enabled.store(g_settings.fg_enabled.load());
     g_loaded_values.fg_mode.store(0);
     g_loaded_values.fg_multiplier.store(g_settings.fg_multiplier.load());
+    g_settings.fg_steady.store(g_ini_user[0] ? (GetPrivateProfileIntW(L"fg_steady_games", key, 1, g_ini_user) ? 1u : 0u) : 1u);
 }
 const wchar_t* FrameGenerationGameKey() { return g_fg_game; }
 
@@ -507,6 +508,8 @@ bool SaveFromWorker()
         const uint32_t on = PersistedSwitch(3, g_settings.fg_enabled.load());
         swprintf_s(v, L"%u", na::fglive::StoredFromGenerated(on ? g_settings.fg_multiplier.load() - 1 : 0));
         ok &= WritePrivateProfileStringW(L"fg_games", g_fg_game, v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.fg_steady.load() ? 1u : 0u);
+        ok &= WritePrivateProfileStringW(L"fg_steady_games", g_fg_game, v, ini) != 0;
     } else {
         struct { const wchar_t* key; uint32_t value; } fg[] = {
             {L"enabled", PersistedSwitch(3,g_settings.fg_enabled.load())}, {L"mode", g_settings.fg_mode.load()}, {L"preset", g_settings.fg_preset.load()},

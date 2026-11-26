@@ -1471,6 +1471,28 @@ static void DrawLiveFrameGeneration()
         snprintf(line, sizeof line, "HUD: %s", hud.learned ? hud.method : hud.verdict);
         Hint(line);
     }
+    if (on) {
+        // Still-area steadying (Astra): live A/B, x2 stays on either way.
+        int steady = st.fg_steady.load() ? 0 : 1;
+        static const char* kSteady[] = {"On", "Off"};
+        BeginRow("Still-area steadying",
+                 "Where the picture is still, the generated picture is steadied toward the two real frames around it (less shimmer on thin wires and edges "
+                 "when you hold still). Moving parts keep the generated picture. x2 stays on either way; switch to compare.",
+                 DropdownWidth());
+        if (Combo("fgsteady", &steady, kSteady, 2, DropdownWidth())) {
+            st.fg_steady.store(steady == 0 ? 1u : 0u);
+            na::settings::Save();
+            na::eventlog::Emit("fg_steady", "menu: Still-area steadying %s", steady == 0 ? "On" : "Off");
+        }
+        EndRow();
+        if (lv.steady_why[0]) StatusLine(2, lv.steady_why);
+        else if (st.fg_steady.load() && lv.steady_frames) {
+            snprintf(line, sizeof line, "Steadied %llu generated pictures, %.1f %% of each picture on average, %.2f ms per rendered frame.",
+                     static_cast<unsigned long long>(lv.steady_frames), lv.steady_share, lv.steady_avg);
+            Hint(line);
+        }
+        if (lv.capture[0]) Hint(lv.capture);
+    }
 }
 
 void RegisterLiveDlaaMenu()
