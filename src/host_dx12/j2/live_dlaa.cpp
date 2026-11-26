@@ -522,6 +522,49 @@ std::atomic<bool> g_screen_discovery_installed{false};
 // while set, the operation hook records the armed frame's ops and nothing else changes.
 std::atomic<bool> g_capture_frame_record{false};
 uint32_t g_record_stage=0;bool g_record_done=false,g_record_owns_hooks=false; // the presenting thread's only
+// The game's HUD sheet (learned from the traced frame: the output-size target whose run of blended
+// draws ends right before the one write to the shown buffer), copied once a frame at its first
+// draw while a capture runs. The copy is the sheet BEFORE any HUD draw of that frame; the capture
+// saves it with the next evaluation as "hud_sheet_before_prev". Diagnostic only.
+struct HudSheetGrab {
+    std::mutex m;
+    ComPtr<ID3D12Resource> copy; // COPY_DEST at rest; created once, never replaced
+    bool has=false,refused=false;
+    uint64_t grabs=0;
+} g_hud_sheet;
+std::atomic<uint64_t> g_hud_sheet_id{0};
+std::atomic<bool> g_hud_sheet_taken{false};
+void hud_sheet_grab(ID3D12GraphicsCommandList* l,uint64_t sheet) noexcept
+{
+    try{
+        std::lock_guard<std::mutex> lock(g_hud_sheet.m);
+        if(g_hud_sheet.refused||g_hud_sheet_taken.load(std::memory_order_relaxed))return;
+        ComPtr<ID3D12Resource> r;r.Attach(na::observe::AcquireResource(static_cast<na_object_id>(sheet)));
+        if(!r)return;
+        const auto d=r->GetDesc();
+        if(d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||d.SampleDesc.Count!=1||d.DepthOrArraySize!=1){g_hud_sheet.refused=true;return;}
+        if(!g_hud_sheet.copy){
+            ComPtr<ID3D12Device> dev;if(FAILED(l->GetDevice(IID_PPV_ARGS(&dev))))return;
+            D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC cd=d;cd.Flags=D3D12_RESOURCE_FLAG_NONE;cd.MipLevels=1;cd.Alignment=0;
+            if(FAILED(dev->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&cd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&g_hud_sheet.copy)))){g_hud_sheet.refused=true;return;}
+        }else{
+            const auto c=g_hud_sheet.copy->GetDesc();
+            if(c.Width!=d.Width||c.Height!=d.Height||c.Format!=d.Format){g_hud_sheet.refused=true;return;} // a changed sheet ends the grab; the copy is never replaced under a recorded list
+        }
+        // The sheet is the bound render target of the draw about to be recorded.
+        D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=r.Get();b.Transition.Subresource=0;
+        b.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        l->ResourceBarrier(1,&b);
+        D3D12_TEXTURE_COPY_LOCATION dst{},src{};dst.pResource=g_hud_sheet.copy.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource=r.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        l->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
+        l->ResourceBarrier(1,&b);
+        g_hud_sheet.has=true;++g_hud_sheet.grabs;
+        g_hud_sheet_taken.store(true,std::memory_order_release);
+    }catch(...){}
+}
 bool native_discovery_enabled() {
     const auto& s = na::settings::Get();
     return na::settings::EffectsReady() && g.enabled.load(std::memory_order_relaxed) &&
@@ -5699,6 +5742,11 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         cp.depth = g.depth32.Get();
         cp.motion = g.motion.Get();
         cp.output = g.output.Get();
+        {   // last frame's HUD sheet as it stood before the game's first HUD draw (a capture's diagnostic)
+            std::lock_guard<std::mutex> sheet_lock(g_hud_sheet.m);
+            if (g_hud_sheet.has && g_hud_sheet.copy && g_hud_sheet_id.load(std::memory_order_relaxed))
+                cp.extra[cp.extra_count++] = {"hud_sheet_before_prev", g_hud_sheet.copy.Get(), D3D12_RESOURCE_STATE_COPY_DEST};
+        }
         if (ambient) {
             auto* spatial = ambient->Occlusion();
             cp.extra[cp.extra_count++] = {"ao_spatial", spatial};
@@ -6703,6 +6751,11 @@ public:
         const bool discover = g_native_discovery.load(std::memory_order_relaxed) && native_discovery_enabled();
         if(!reduced && !discover){
             if(g_capture_frame_record.load(std::memory_order_relaxed) && g_trace.armed.load(std::memory_order_relaxed)){try{trace_op(l,call);}catch(...){}}
+            if(const uint64_t sheet=g_hud_sheet_id.load(std::memory_order_relaxed);sheet && !g_hud_sheet_taken.load(std::memory_order_relaxed) &&
+               call.kind!=na::observe::ShaderKind::Dispatch){
+                na_object_id rt=0,ds=0;
+                if(na::observe::ListCurrentTargets(l,&rt,&ds)&&uint64_t(rt)==sheet)hud_sheet_grab(l,sheet);
+            }
             t_native_hint=nullptr;return {};}
         try{
             if (discover && !reduced) {
@@ -9087,6 +9140,17 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
             // it needs are on for those frames only.
             const bool capture_armed=frame&&na::capture::j2::Armed();
             if(!capture_armed&&!g_record_stage)g_record_done=false;
+            if(g_record_stage==3){ // the record is written; the sheet is copied each frame until the capture ends
+                g_hud_sheet_taken.store(false,std::memory_order_release);
+                if(capture_armed)return;
+                g_hud_sheet_id.store(0,std::memory_order_release);
+                if(g_record_owns_hooks){
+                    na::observe::SetOperationSnapshots(false);na::observe::SetRasterStateTracking(false);
+                    g_screen_discovery_installed.store(false,std::memory_order_release);g_record_owns_hooks=false;
+                }
+                g_record_stage=0;
+                return;
+            }
             if(g_record_stage||(capture_armed&&!g_record_done)){
                 const uint64_t shown=frame?uint64_t(na::observe::IdOf(frame)):0;
                 if(shown&&!trace_is_presented(shown)){
@@ -9108,13 +9172,37 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
                 NativeExtent shown_size{};
                 if(frame){const auto d=frame->GetDesc();shown_size={uint32_t(d.Width),d.Height,uint32_t(d.Width),d.Height};}
                 trace_dump_frame(queue,shown,shown_size,ordinal);
+                // The HUD sheet: walking back from the one write to the shown buffer, the output-size
+                // target of the blended, depth-less draws right before it, when it is not the shown
+                // buffer itself and nothing but that run wrote it in the frame.
+                uint64_t sheet=0;uint32_t run=0,other=0;
+                {
+                    const auto& ops=g_trace.frame;size_t last=ops.size();
+                    for(size_t i=ops.size();i-->0;){
+                        bool hit=false;for(const auto& o:ops[i].out)if(o.id==shown)hit=true;
+                        if(hit){last=i;break;}
+                    }
+                    for(size_t i=last;i<ops.size()&&i-->0;){
+                        const auto& op=ops[i];
+                        if(op.compute||op.transfer||op.out.empty())continue;
+                        const auto& o=op.out[0];
+                        if(!sheet){
+                            if(!op.blend||op.depth||o.id==shown||o.w!=shown_size.ow||o.h!=shown_size.oh)break;
+                            sheet=o.id;run=1;continue;
+                        }
+                        if(o.id==sheet&&op.blend&&!op.depth){++run;continue;}
+                        break;
+                    }
+                    if(sheet)for(const auto& op:ops)for(const auto& o:op.out)if(o.id==sheet&&!(op.blend&&!op.depth))++other;
+                }
+                na::eventlog::Emit("hud_sheet","frame=%llu sheet=#%llu run=%u other_writes=%u -> %s",(unsigned long long)ordinal,(unsigned long long)sheet,run,other,
+                    !sheet?"no sheet: the write to the shown buffer is not preceded by blended draws into another output-size target":
+                    run<4?"not taken: fewer than 4 draws in the run":"copied at its first draw of each frame while the capture runs (hud_sheet_before_prev)");
                 g_trace.armed.store(false);g_capture_frame_record.store(false,std::memory_order_release);
                 g_trace.recs.clear();g_trace.frame.clear();
-                if(g_record_owns_hooks){
-                    na::observe::SetOperationSnapshots(false);na::observe::SetRasterStateTracking(false);
-                    g_screen_discovery_installed.store(false,std::memory_order_release);g_record_owns_hooks=false;
-                }
-                g_record_stage=0;
+                g_hud_sheet_taken.store(false,std::memory_order_release);
+                g_hud_sheet_id.store(sheet&&run>=4?sheet:0,std::memory_order_release);
+                g_record_stage=3;
                 return;
             }
             if(g_trace.armed.load()){g_trace.armed.store(false);g_trace.recs.clear();g_trace.frame.clear();}
