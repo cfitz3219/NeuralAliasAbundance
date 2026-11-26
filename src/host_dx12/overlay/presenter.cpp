@@ -16,7 +16,12 @@
 #include <vector>
 
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/fg/hud_paste.hpp"
 #include "host_dx12/settings.hpp"
+#include "core/live_frame_gen.hpp"
+
+#include <dxgi1_4.h>
+#include <thread>
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/native_present/size_controller.hpp"
 #include "host_dx12/latency/nvidia_latency.hpp"
@@ -32,7 +37,10 @@ namespace {
 constexpr uint32_t kSlots = 3;        // real frames in flight through the presenter
 constexpr uint32_t kMaxGenerated = 5; // 6x
 constexpr uint32_t kPresentsPerSlot = kMaxGenerated + 1;
-constexpr uint32_t kQueriesPerSlot = 2 + kPresentsPerSlot;
+// Per slot: [0] start, [1] end of the generate list, [2..] each present, then the live path's
+// split of the generate list: after the real-frame copy, after the HUD-free copy, after evaluate.
+constexpr uint32_t kLiveQuery = 2 + kPresentsPerSlot;
+constexpr uint32_t kQueriesPerSlot = kLiveQuery + 3;
 constexpr uint32_t kJobs = 4;
 constexpr uint32_t kChains = 16; // eight proxy/base pairs; GPU objects remain lazy
 
@@ -65,6 +73,21 @@ std::atomic<bool> g_present_dlaa{false};
 std::atomic<void*> g_upscale_user{nullptr};
 std::atomic<uint64_t> g_upscaled{0}, g_upscale_failed{0};
 std::atomic<uint32_t> g_scaled_w{0}, g_scaled_h{0}, g_native_w{0}, g_native_h{0};
+// Route B live Frame Generation (SetLiveFrameGeneration).
+std::atomic<bool> g_live{false};
+std::atomic<HudFreeFn> g_hudfree_fn{nullptr};
+na::fg::HudPaste g_paste; // compiled by the preparation thread, used on the game's thread afterwards
+std::atomic<bool> g_paste_ready{false};
+std::atomic<uint64_t> g_live_inline{0}, g_live_worker{0}, g_skip_hudfree{0}, g_skip_menu{0}, g_skip_preparing{0};
+struct Timing { std::atomic<float> last{0.f}, avg{0.f};
+    void add(float ms) { last.store(ms); const float a = avg.load(); avg.store(a > 0.f ? a * 0.95f + ms * 0.05f : ms); } };
+Timing g_t_off, g_t_copy, g_t_hudcopy, g_t_eval, g_t_paste;
+std::atomic<uint64_t> g_vram_budget_mb{0}, g_vram_usage_mb{0}, g_extra_mb{0};
+std::atomic<uint32_t> g_inline_owner{1}, g_live_ready{0}, g_live_preparing{0};
+std::mutex g_live_text_m;
+char g_prepare_text[112] = "";
+char g_hudfree_text[112] = "";
+void set_live_text(char* dst, const char* text) { std::lock_guard<std::mutex> lock(g_live_text_m); strncpy_s(dst, 112, text ? text : "", _TRUNCATE); }
 
 void set_reason(const char* t)
 {
@@ -96,6 +119,11 @@ struct Slot {
     std::atomic<UINT64> free_fence{0};             // slot reusable once the fence passed this (thread writes, hook reads)
     std::atomic<UINT64> gen_fence{0};              // generate list done (timestamps and veto readable)
     uint32_t copied_mask = 0; // worker writes; read only after ownership and free fence retire
+    // Live Frame Generation: this frame's HUD-free picture (NPSR at rest), what the generate list
+    // measured (the split timestamps are valid), and whether the Off path's copy was timed.
+    ComPtr<ID3D12Resource> hudfree;
+    bool live_split = false, hudfree_used = false;
+    bool off_timed = false;
 };
 
 struct Job {
@@ -138,7 +166,13 @@ struct Chain {
     ComPtr<ID3D12QueryHeap> queries;
     ComPtr<ID3D12Resource> query_readback;
     bool ready = false;
-    bool worker_owner = false; // once FG starts, real presentation stays on this worker
+    bool worker_owner = false; // once FG starts, real presentation stays on this worker (live: until it is off and drained)
+    // Live Frame Generation: textures prepared off the game's thread; Off-path copy timing.
+    std::atomic<bool> live_ready{false};
+    std::thread live_prep;
+    ULONGLONG live_retry_after = 0;           // a refused preparation (memory budget) is asked again after this tick
+    ComPtr<ID3D12QueryHeap> off_queries;      // 2 per slot: before / after the Off path's copy (presentation queue)
+    ComPtr<ID3D12Resource> off_readback;
     HANDLE queried_latency_handle = nullptr; // diagnostics: query only, never wait/signal
     bool uav_ok = false;
     bool scaled = false;  // render-small: proxies are pw x ph, the real chain desc size
@@ -391,6 +425,40 @@ bool ensure_ready_locked(Chain& c)
             return false;
         QueryPerformanceFrequency(&c.qpc);
     }
+    if (g_live.load(std::memory_order_acquire) && !c.off_queries) {
+        // The Off path's own copy, timed on the queue that runs it (failure only loses the figure).
+        D3D12_QUERY_HEAP_DESC qh{};
+        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qh.Count = 2 * kSlots;
+        D3D12_HEAP_PROPERTIES rb{};
+        rb.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = sizeof(UINT64) * 2 * kSlots;
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(c.device->CreateQueryHeap(&qh, IID_PPV_ARGS(&c.off_queries))) ||
+            FAILED(c.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&c.off_readback)))) {
+            c.off_queries.Reset();
+            c.off_readback.Reset();
+        }
+    }
+    // Live Frame Generation: the per-slot textures exist only once it is switched on (prepared on
+    // a background thread, see prepare_live); the Off path presents straight from the proxy.
+    if (g_live.load(std::memory_order_acquire)) {
+        if (!c.thread) {
+            c.stop = false;
+            c.thread = CreateThread(nullptr, 0, &present_thread, &c, 0, nullptr);
+            if (!c.thread) return false;
+        }
+        c.ready = true;
+        c.last_arrival.QuadPart = 0;
+        c.last_shown.QuadPart = 0;
+        set_reason(c.uav_ok ? "Presenter is active (Frame Generation Off: frames presented on the game's thread)."
+                            : "Presenter is active; this picture format allows no generated frames.");
+        return true;
+    }
     for (Slot& s : c.slots) {
         // Render-small: the upscaler writes it (UAV) and the menu draws on it (render target).
         if (!create_texture(c, c.desc.BufferDesc.Width, c.desc.BufferDesc.Height, c.desc.BufferDesc.Format, c.uav_ok, c.scaled,
@@ -447,7 +515,15 @@ bool drain_locked(Chain& c, DWORD timeout_ms)
 // could not be drained in time: nothing size-dependent may be freed then.
 bool release_size_dependent_locked(Chain& c)
 {
+    if (c.live_prep.joinable()) c.live_prep.join(); // it writes the slots' textures
     if (!drain_locked(c, 2000) || !wait_fence(c, c.last_signal.load(), 2000) || !wait_presentation(c,c.presentation_last.load(),2000)) return false;
+    if (g_live.load(std::memory_order_acquire)) { // drained above: the next frames start on the game's thread
+        c.live_ready.store(false, std::memory_order_release);
+        g_live_ready.store(0);
+        c.worker_owner = false;
+        g_inline_owner.store(1);
+    }
+    for (Slot& s : c.slots) s.hudfree.Reset();
     if (!c.proxies.empty()) g_proxied.fetch_sub(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> buffers_lock(c.buffers_m);
@@ -468,6 +544,98 @@ bool release_size_dependent_locked(Chain& c)
     return true;
 }
 
+uint32_t bytes_per_pixel(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_UNORM: return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+    default: return 4;
+    }
+}
+bool video_memory(ID3D12Device* d, uint64_t* budget, uint64_t* usage)
+{
+    ComPtr<IDXGIFactory4> f;
+    ComPtr<IDXGIAdapter3> a;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (!d || FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f))) || FAILED(f->EnumAdapterByLuid(d->GetAdapterLuid(), IID_PPV_ARGS(&a))) ||
+        FAILED(a->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return false;
+    *budget = info.Budget;
+    *usage = info.CurrentUsage;
+    return true;
+}
+// Live Frame Generation is switched on: the x2 textures (per slot: the real frame's copy, one
+// generated picture, the HUD-free picture) and the HUD paste pass are made on a background thread
+// while the Off path stays on screen, so switching never stalls a frame. Refused, with the reason
+// in the log and the menu, when the graphics-memory budget cannot hold them.
+void prepare_live_locked(Chain& c)
+{
+    if (c.live_ready.load(std::memory_order_acquire)) return;
+    if (c.live_prep.joinable()) return; // already running
+    const UINT w = c.desc.BufferDesc.Width, h = c.desc.BufferDesc.Height;
+    const DXGI_FORMAT fmt = c.desc.BufferDesc.Format;
+    const uint64_t need = uint64_t(w) * h * bytes_per_pixel(fmt) * 3 * kSlots + (1ull << 20) * 8;
+    g_extra_mb.store(need >> 20);
+    uint64_t budget = 0, usage = 0;
+    if (video_memory(c.device.Get(), &budget, &usage)) {
+        g_vram_budget_mb.store(budget >> 20);
+        g_vram_usage_mb.store(usage >> 20);
+        constexpr uint64_t kMargin = 256ull << 20; // what Frame Generation's own feature needs, roughly
+        if (usage + need + kMargin > budget) {
+            char why[112];
+            snprintf(why, sizeof why, "Frame Generation is off: it needs about %llu MB more graphics memory (%llu of %llu MB in use).",
+                     static_cast<unsigned long long>((need + kMargin) >> 20), static_cast<unsigned long long>(usage >> 20),
+                     static_cast<unsigned long long>(budget >> 20));
+            set_live_text(g_prepare_text, why);
+            fg::NotePaused(why);
+            return;
+        }
+    }
+    set_live_text(g_prepare_text, "Preparing Frame Generation (graphics memory); the picture stays as it is meanwhile.");
+    g_live_preparing.store(1);
+    ID3D12Device* device = c.device.Get();
+    const bool uav = c.uav_ok;
+    c.live_prep = std::thread([&c, device, w, h, fmt, uav] {
+        bool ok = uav;
+        for (Slot& s : c.slots) {
+            if (!ok) break;
+            ok = create_texture(c, w, h, fmt, uav, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.real_copy) &&
+                 create_texture(c, w, h, fmt, true, false, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, s.interp[0]) &&
+                 create_texture(c, w, h, fmt, false, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.hudfree);
+            for (uint32_t i = 1; i < kMaxGenerated; ++i) s.interp[i].Reset(); // this build shows x2 at most
+            if (ok && !s.veto) {
+                D3D12_HEAP_PROPERTIES hp{};
+                hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC bd{};
+                bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                bd.Width = 16;
+                bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+                bd.SampleDesc.Count = 1;
+                bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                ok = SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&s.veto)));
+                D3D12_HEAP_PROPERTIES rb{};
+                rb.Type = D3D12_HEAP_TYPE_READBACK;
+                bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+                ok = ok && SUCCEEDED(device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s.veto_readback)));
+            }
+        }
+        if (ok && !g_paste_ready.load(std::memory_order_acquire)) {
+            ok = g_paste.Init(device);
+            g_paste_ready.store(ok, std::memory_order_release);
+        }
+        g_live_preparing.store(0);
+        if (!ok) {
+            set_live_text(g_prepare_text, uav ? "Frame Generation could not make its textures on the graphics card."
+                                              : "Frame Generation is not possible with this picture format (no shader writes).");
+            return;
+        }
+        set_live_text(g_prepare_text, "Frame Generation textures are ready.");
+        g_live_ready.store(1);
+        c.live_ready.store(true, std::memory_order_release);
+    });
+}
+
 // Copies `tex` into the real current back buffer and presents. `state` is
 // the texture's resting state. Runs on whichever thread calls it.
 // `no_wait` (A71): present with DXGI_PRESENT_DO_NOT_WAIT; when the chain's
@@ -475,7 +643,7 @@ bool release_size_dependent_locked(Chain& c)
 // instead of blocking this thread, and nothing is counted as presented.
 HRESULT present_texture(Chain& c, ID3D12CommandQueue* queue, ID3D12Resource* tex, D3D12_RESOURCE_STATES state,
                         ID3D12CommandAllocator* alloc, UINT sync, UINT flags, bool no_wait = false, uint64_t engine_frame = 0,
-                        UINT query = UINT_MAX)
+                        UINT query = UINT_MAX, int off_slot = -1)
 {
     UINT idx = g_orig.get_index(c.sc3.Get());
     if (idx >= c.desc.BufferCount) return DXGI_ERROR_INVALID_CALL;
@@ -486,6 +654,9 @@ HRESULT present_texture(Chain& c, ID3D12CommandQueue* queue, ID3D12Resource* tex
     if (FAILED(setup_hr)) return setup_hr;
     setup_hr = c.list_present->Reset(alloc, nullptr);
     if (FAILED(setup_hr)) return setup_hr;
+    // Live Frame Generation Off path: the copy's own GPU time (the cost of presenting through a proxy).
+    const bool off_timed = off_slot >= 0 && c.off_queries && c.off_readback;
+    if (off_timed) c.list_present->EndQuery(c.off_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(off_slot) * 2);
     D3D12_RESOURCE_BARRIER pre[2] = {transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
                                      transition(tex, state, D3D12_RESOURCE_STATE_COPY_SOURCE)};
     c.list_present->ResourceBarrier(2, pre);
@@ -493,6 +664,11 @@ HRESULT present_texture(Chain& c, ID3D12CommandQueue* queue, ID3D12Resource* tex
     D3D12_RESOURCE_BARRIER post[2] = {transition(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
                                       transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, state)};
     c.list_present->ResourceBarrier(2, post);
+    if (off_timed) {
+        c.list_present->EndQuery(c.off_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(off_slot) * 2 + 1);
+        c.list_present->ResolveQueryData(c.off_queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(off_slot) * 2, 2,
+                                         c.off_readback.Get(), sizeof(UINT64) * 2 * UINT(off_slot));
+    }
     if (query != UINT_MAX) {
         c.list_present->EndQuery(c.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query);
         c.list_present->ResolveQueryData(c.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query, 1,
@@ -683,6 +859,17 @@ void read_timing_locked(Chain& c, Slot& s, uint32_t slot_index)
         float avg = g_fg_avg_ms.load();
         g_fg_avg_ms.store(avg > 0 ? avg * 0.9f + ms * 0.1f : ms);
     }
+    if (s.live_split) { // live x2: real-frame copy | HUD-free copy | evaluate | HUD paste
+        const UINT64 a = st[0], b = st[kLiveQuery], h = st[kLiveQuery + 1], e = st[kLiveQuery + 2], z = st[1];
+        const auto ms = [&](UINT64 from, UINT64 to) { return to >= from && from ? 1000.f * float(to - from) / float(freq) : -1.f; };
+        if (const float v = ms(a, b); v >= 0.f) g_t_copy.add(v);
+        if (s.hudfree_used) {
+            if (const float v = ms(b, h); v >= 0.f) g_t_hudcopy.add(v);
+            if (const float v = ms(h, e); v >= 0.f) g_t_eval.add(v);
+            if (const float v = ms(e, z); v >= 0.f) g_t_paste.add(v);
+        }
+        s.live_split = false;
+    }
     // GPU timestamps are independent of CPU Present cadence. No diagnostic
     // waits: the caller already retired this slot before allocator reuse.
     UINT64 previous=st[1]; bool first=true;
@@ -729,6 +916,35 @@ bool OwnsQueue(ID3D12CommandQueue* q) {
     return false;
 }
 void SetEnabled(bool enabled) { g_enabled.store(enabled, std::memory_order_release); }
+void SetLiveFrameGeneration(bool on) { g_live.store(on, std::memory_order_release); }
+bool LiveFrameGeneration() { return g_live.load(std::memory_order_acquire); }
+void SetHudFreeProvider(HudFreeFn fn) { g_hudfree_fn.store(fn, std::memory_order_release); }
+LiveStats GetLiveStats()
+{
+    LiveStats s;
+    s.live = g_live.load() ? 1u : 0u;
+    s.ready = g_live_ready.load();
+    s.preparing = g_live_preparing.load();
+    s.inline_owner = g_inline_owner.load();
+    s.frames_inline = g_live_inline.load();
+    s.frames_worker = g_live_worker.load();
+    s.skipped_no_hudfree = g_skip_hudfree.load();
+    s.skipped_menu = g_skip_menu.load();
+    s.skipped_preparing = g_skip_preparing.load();
+    s.skipped_veto = g_vetoed.load();
+    s.off_ms = g_t_off.last.load(); s.off_avg = g_t_off.avg.load();
+    s.copy_ms = g_t_copy.last.load(); s.copy_avg = g_t_copy.avg.load();
+    s.hudcopy_ms = g_t_hudcopy.last.load(); s.hudcopy_avg = g_t_hudcopy.avg.load();
+    s.eval_ms = g_t_eval.last.load(); s.eval_avg = g_t_eval.avg.load();
+    s.paste_ms = g_t_paste.last.load(); s.paste_avg = g_t_paste.avg.load();
+    s.vram_budget_mb = g_vram_budget_mb.load();
+    s.vram_usage_mb = g_vram_usage_mb.load();
+    s.extra_mb = g_extra_mb.load();
+    std::lock_guard<std::mutex> lock(g_live_text_m);
+    strncpy_s(s.prepare, g_prepare_text, _TRUNCATE);
+    strncpy_s(s.hudfree_why, g_hudfree_text, _TRUNCATE);
+    return s;
+}
 void SetRenderScale(float scale, UpscaleFn upscale, void* user)
 {
     g_upscale_user.store(user, std::memory_order_release);
@@ -997,8 +1213,49 @@ HRESULT Present(const PresentArgs& a)
     }
     s.owned.store(true, std::memory_order_release);
     read_timing_locked(*c, s, si);
+    const bool live = g_live.load(std::memory_order_acquire);
+    if (live && s.off_timed) { // the Off path's copy that last used this slot has completed (free fence above)
+        s.off_timed = false;
+        UINT64 st[2]{}, freq = 0;
+        void* m = nullptr;
+        const SIZE_T off = SIZE_T(si) * 2 * sizeof(UINT64);
+        D3D12_RANGE rr{off, off + 2 * sizeof(UINT64)};
+        auto pq = display_queue(*c);
+        if (pq && SUCCEEDED(pq->GetTimestampFrequency(&freq)) && freq && SUCCEEDED(c->off_readback->Map(0, &rr, &m))) {
+            std::memcpy(st, static_cast<uint8_t*>(m) + off, sizeof(st));
+            D3D12_RANGE none{0, 0};
+            c->off_readback->Unmap(0, &none);
+            if (st[0] && st[1] >= st[0]) g_t_off.add(1000.f * float(st[1] - st[0]) / float(freq));
+        }
+    }
     bool fg_on = na::settings::Get().fg_enabled.load(std::memory_order_relaxed) != 0;
-    if (fg_on) c->worker_owner = true;
+    uint32_t backlog_now;
+    {
+        std::lock_guard<std::mutex> jl(c->jm);
+        backlog_now = c->backlog;
+    }
+    if (live) {
+        // Route B: x2 needs its textures first; they are made off this thread while Off stays on screen.
+        if (c->live_prep.joinable() && c->live_ready.load(std::memory_order_acquire)) c->live_prep.join();
+        if (fg_on && !c->live_ready.load(std::memory_order_acquire)) {
+            const ULONGLONG now_ms = GetTickCount64();
+            if (!c->live_prep.joinable() && now_ms >= c->live_retry_after) {
+                prepare_live_locked(*c);
+                if (!c->live_prep.joinable()) c->live_retry_after = now_ms + 5000; // refused (memory): ask again in 5 s
+            }
+            char why[112];
+            { std::lock_guard<std::mutex> text_lock(g_live_text_m); strncpy_s(why, g_prepare_text, _TRUNCATE); }
+            fg::NotePaused(why[0] ? why : "Preparing Frame Generation.");
+            g_skip_preparing.fetch_add(1, std::memory_order_relaxed);
+        }
+        const bool ready = c->live_ready.load(std::memory_order_acquire);
+        const auto owner = na::fglive::NextOwner(fg_on && ready, c->worker_owner ? na::fglive::Owner::PresenterThread : na::fglive::Owner::GameThread, backlog_now);
+        c->worker_owner = owner == na::fglive::Owner::PresenterThread;
+        g_inline_owner.store(c->worker_owner ? 0u : 1u);
+        if (!ready) fg_on = false; // nothing to generate with yet
+    } else if (fg_on) {
+        c->worker_owner = true;
+    }
     bool want_fg = !c->external_owner && c->uav_ok && !a.menu_open && fg_on;
     // A73: say WHY nothing is generated right now instead of leaving the last
     // message standing (session 13: "starting" stayed on screen because the
@@ -1006,13 +1263,10 @@ HRESULT Present(const PresentArgs& a)
     if (fg_on && !want_fg) {
         if (!c->uav_ok) fg::NotePaused("Frame Generation is paused: this picture format allows no generated frames.");
         else fg::NotePaused("Frame Generation is paused while this menu is open; it resumes the moment you close it (Home).");
-    }
-    uint32_t backlog_now;
-    {
-        std::lock_guard<std::mutex> jl(c->jm);
-        backlog_now = c->backlog;
+        if (live && a.menu_open) g_skip_menu.fetch_add(1, std::memory_order_relaxed);
     }
     if (!c->worker_owner && !want_fg && backlog_now == 0 && !c->scaled) {
+        if (live) g_live_inline.fetch_add(1, std::memory_order_relaxed);
         // A62 fast path (nothing to generate, thread idle): present straight
         // from the game's proxy, one copy, no intermediate texture: the old
         // path's cost plus that single copy.
@@ -1025,10 +1279,13 @@ HRESULT Present(const PresentArgs& a)
         auto pq=display_queue(*c);
         if(render_done==UINT64_MAX) return DXGI_ERROR_DEVICE_REMOVED;
         if(c->queues_bound) { const HRESULT whr=pq->Wait(c->fence.Get(),render_done); if(FAILED(whr)) return whr; }
-        HRESULT hr = present_texture(*c, pq, src, D3D12_RESOURCE_STATE_PRESENT, s.alloc_present[0].Get(), a.sync, a.flags, false, engine_frame);
+        HRESULT hr = present_texture(*c, pq, src, D3D12_RESOURCE_STATE_PRESENT, s.alloc_present[0].Get(), a.sync, a.flags, false, engine_frame,
+                                     UINT_MAX, live && c->off_queries ? static_cast<int>(si) : -1);
+        if (live && c->off_queries) s.off_timed = true;
         release_slot(*c, s, pq);
         return hr;
     }
+    if (live) g_live_worker.fetch_add(1, std::memory_order_relaxed);
 
     // Render-small: the upscaler turns the render-size picture into the native slot texture on
     // the game's queue (its own list, executed before ours), then the menu draws on it.
@@ -1062,11 +1319,44 @@ HRESULT Present(const PresentArgs& a)
                                           transition(s.real_copy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
         c->list_gen->ResourceBarrier(2, post);
     }
+    // Live x2 (T2): Frame Generation is given this frame's HUD-free picture as its back buffer.
+    // Without one there is nothing safe to generate from: this frame shows the real picture only.
+    ID3D12Resource* gen_color = s.real_copy.Get();
+    s.live_split = live;
+    s.hudfree_used = false;
+    if (live) {
+        c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery);
+        const char* why = nullptr;
+        const HudFreeFn provider = g_hudfree_fn.load(std::memory_order_acquire);
+        ID3D12Resource* hf = provider ? provider(&why) : nullptr;
+        if (want_fg) {
+            if (hf && s.hudfree) {
+                D3D12_RESOURCE_BARRIER pre[2] = {transition(hf, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                 transition(s.hudfree.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+                c->list_gen->ResourceBarrier(2, pre);
+                c->list_gen->CopyResource(s.hudfree.Get(), hf);
+                D3D12_RESOURCE_BARRIER post[2] = {transition(hf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                                                  transition(s.hudfree.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+                c->list_gen->ResourceBarrier(2, post);
+                gen_color = s.hudfree.Get();
+                s.hudfree_used = true;
+                set_live_text(g_hudfree_text, "");
+            } else {
+                char text[112];
+                snprintf(text, sizeof text, "No generated picture this frame: %s", why ? why : "the HUD-free picture is not ready.");
+                set_live_text(g_hudfree_text, text);
+                fg::NotePaused(text);
+                g_skip_hudfree.fetch_add(1, std::memory_order_relaxed);
+                want_fg = false;
+            }
+        }
+        c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 1);
+    }
     uint32_t count = 0;
     if (want_fg) {
         fg::FrameInfo fi;
         fi.engine_frame=engine_frame;
-        fi.color = s.real_copy.Get();
+        fi.color = gen_color;
         fi.format = c->desc.BufferDesc.Format;
         fi.width = c->desc.BufferDesc.Width;
         fi.height = c->desc.BufferDesc.Height;
@@ -1091,7 +1381,15 @@ HRESULT Present(const PresentArgs& a)
             D3D12_RESOURCE_BARRIER b2 = transition(s.veto.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             c->list_gen->ResourceBarrier(1, &b2);
         }
-        count = c->external_owner ? 0 : fg::Generate(c->list_gen.Get(), c->device.Get(), fi, outs, kMaxGenerated);
+        const uint32_t capacity = live ? na::fglive::kMaxGeneratedThisBuild : kMaxGenerated;
+        count = c->external_owner ? 0 : fg::Generate(c->list_gen.Get(), c->device.Get(), fi, outs, capacity);
+        if (live) {
+            c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 2);
+            // T2: the newer real frame's HUD, exactly, through its own HUD mask.
+            for (uint32_t i = 0; i < count; ++i)
+                g_paste.Record(c->list_gen.Get(), outs[i], s.real_copy.Get(), s.hudfree.Get(), fi.width, fi.height, fi.format,
+                               static_cast<uint32_t>((c->frame_id * kMaxGenerated + i) % na::fg::HudPaste::kPages));
+        }
         if (count) { // copy the runtime's answer out for the present thread
             D3D12_RESOURCE_BARRIER b3 = transition(s.veto.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             c->list_gen->ResourceBarrier(1, &b3);
@@ -1102,6 +1400,14 @@ HRESULT Present(const PresentArgs& a)
     }
     c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + 1);
     c->list_gen->ResolveQueryData(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot, 2, c->query_readback.Get(), si * kQueriesPerSlot*sizeof(UINT64));
+    if (live) {
+        if (!count) { // nothing was evaluated: the split marks still need values to resolve
+            c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 2);
+            s.hudfree_used = false;
+        }
+        c->list_gen->ResolveQueryData(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery, 3, c->query_readback.Get(),
+                                      (si * kQueriesPerSlot + kLiveQuery) * sizeof(UINT64));
+    }
     c->list_gen->Close();
     apply_latency_locked(*c, count);
     ID3D12CommandList* lists[] = {c->list_gen.Get()};
@@ -1208,6 +1514,7 @@ namespace {
 // thread did not stop within the timeout (state retained; call again).
 bool teardown_chain_locked(Chain& c, uint32_t timeout_ms)
 {
+    if (c.live_prep.joinable()) c.live_prep.join(); // it writes the slots' textures
     if (!drain_locked(c, timeout_ms)) return false;
     if (!stop_thread(c, timeout_ms)) return false;
     if (!wait_fence(c, c.last_signal.load(), timeout_ms) || !wait_presentation(c,c.presentation_last.load(),timeout_ms)) return false;
@@ -1235,6 +1542,11 @@ bool teardown_chain_locked(Chain& c, uint32_t timeout_ms)
     c.list_present.Reset();
     c.queries.Reset();
     c.query_readback.Reset();
+    c.off_queries.Reset();
+    c.off_readback.Reset();
+    c.live_ready.store(false);
+    c.worker_owner = false;
+    for (Slot& s : c.slots) { s.hudfree.Reset(); s.off_timed = false; s.live_split = false; }
     c.fence.Reset();
     c.presentation_fence.Reset(); c.presentation_queue.Reset();
     g_private_queues[&c-g_chains].store(nullptr,std::memory_order_release);
