@@ -85,6 +85,11 @@ struct FrameInfo {
     // NON_PIXEL_SHADER_RESOURCE). Given, the runtime is told it has HUD-less colour;
     // the feature is created again when this choice changes. Null = as before.
     ID3D12Resource* hudless = nullptr;
+    // Optional, with hudless: the HUD for NVIDIA's own UI recomposition (UserInterfaceRecompositionEnabled=1).
+    // ui: four channels, colour pre-multiplied by alpha (backbuffer = ui + (1 - alpha) * hudless);
+    // ui_alpha: one channel, 0..1. Either is enough. Both NON_PIXEL_SHADER_RESOURCE, back-buffer size.
+    ID3D12Resource* ui = nullptr;
+    ID3D12Resource* ui_alpha = nullptr;
 };
 
 // Records the generated frames for `f` on `list` (open, ours, executed by

@@ -3,7 +3,7 @@
 // through OUR module (src/host_dx12/fg/frame_gen.cpp: OnEvaluate -> Execute -> Generate), from our own
 // NGX instance, and the generated pictures are saved.
 //
-//   fg_capture_replay <capture folder> <out folder> <first> <last> <camera> <hudless 0|1> [multiplier 2|3] [lut folder]
+//   fg_capture_replay <capture folder> <out folder> <first> <last> <camera> <hud mode 0..4> [multiplier 2|3] [lut folder]
 //
 //   <first>..<last>  consecutive capture indices, each one real frame (index j: present plane j as the back
 //                    buffer; depth and motion planes j). The first frame creates the feature, the second
@@ -13,10 +13,14 @@
 //                    clip-to-previous = identity; the motion already holds the camera's motion).
 //                    zero: every camera field zero, passed as valid (the module's camera gate is bypassed
 //                    here only) to see what the runtime does with no camera.
-//   <hudless>        1: the HUD-free picture of frame j is given as NVSDK_NGX_DLSSG_Parameter_HUDLess. It is
+//   <hud mode>       0 none. 1: the HUD-free picture of frame j is given as NVSDK_NGX_DLSSG_Parameter_HUDLess. It is
 //                    the capture's hud_sheet_before_prev plane of index j+1 (the sheet of the frame before
 //                    that evaluation) through a 256-level lookup per channel (<lut folder>\lut-NNNNN.txt: three
 //                    lines of 256 values, linear, made offline from the same pair of planes).
+//                    2: HUD-less colour + UI alpha (the exact HUD mask: shown vs HUD-free beyond 4/255 after
+//                    value^(1/2.2), grown 1 px, as 0/1) with NVIDIA's UI recomposition on. 3: HUD-less colour +
+//                    UI colour (shown inside the mask, alpha 1, pre-multiplied) with recomposition.
+//                    4: the HUD-free picture IS the back buffer (NVIDIA gets no HUD; paste-back is offline).
 //   [multiplier]     2 (default): one generated picture per real frame; 3: two, when the runtime allows it.
 //
 // NGX search: the runtime looks for nvngx_dlssg.dll beside this executable and in the driver store. The
@@ -313,17 +317,21 @@ bool ReadLut(const std::string& path, float lut[3][256])
 int main(int argc, char** argv)
 {
     if (argc < 7) {
-        std::printf("usage: fg_capture_replay <capture> <out> <first> <last> <a50|a30|a90|zero> <hudless 0|1> [multiplier 2|3] [lut folder]\n");
+        std::printf("usage: fg_capture_replay <capture> <out> <first> <last> <a50|a30|a90|zero> <hud mode 0..4> [multiplier 2|3] [lut folder]\n");
         return 2;
     }
     const std::string cap = argv[1], out = argv[2], cam_name = argv[5];
     const uint32_t first = static_cast<uint32_t>(std::atoi(argv[3])), last = static_cast<uint32_t>(std::atoi(argv[4]));
-    const bool use_hudless = std::atoi(argv[6]) != 0;
+    // HUD mode: 0 none, 1 HUD-less colour, 2 + UI alpha (exact mask, 0/1) with NVIDIA's UI recomposition,
+    // 3 + UI colour (pre-multiplied: shown inside the mask, alpha = mask) with recomposition,
+    // 4 the HUD-free picture AS the back buffer (NVIDIA never sees a HUD; paste-back is done offline).
+    const int hud_mode = std::atoi(argv[6]);
+    const bool use_hudless = hud_mode != 0;
     const uint32_t mult = argc > 7 ? static_cast<uint32_t>(std::atoi(argv[7])) : 2u;
     const std::string lut_dir = argc > 8 ? argv[8] : out;
     CreateDirectoryA(out.c_str(), nullptr);
     char tag[64];
-    snprintf(tag, sizeof tag, "%s-h%d-x%u", cam_name.c_str(), use_hudless ? 1 : 0, mult);
+    snprintf(tag, sizeof tag, "%s-h%d-x%u", cam_name.c_str(), hud_mode, mult);
     fopen_s(&g_log, (out + "\\fg-" + tag + ".log").c_str(), "wb");
     fopen_s(&g_ngx_log, (out + "\\ngx-" + tag + ".log").c_str(), "wb");
     Log("fg_capture_replay %s frames %u..%u camera %s hudless %d multiplier %u", cap.c_str(), first, last, cam_name.c_str(), use_hudless ? 1 : 0, mult);
@@ -401,6 +409,11 @@ int main(int argc, char** argv)
         !MakeTexture(d.device.Get(), m0.motion.w, m0.motion.h, static_cast<DXGI_FORMAT>(m0.motion.format), Bpp(m0.motion.format), &motion) ||
         !MakeTexture(d.device.Get(), W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &color) ||
         !MakeTexture(d.device.Get(), W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &hudless)) { Log("texture creation failed"); return 1; }
+    // UI inputs for NVIDIA's recomposition (SDK: UI = four channels, colour pre-multiplied by alpha;
+    // UIAlpha = one channel 0..1). Created only for the modes that use them.
+    Texture ui_alpha, ui_tex;
+    if (hud_mode == 2 && !MakeTexture(d.device.Get(), W, H, DXGI_FORMAT_R8_UNORM, 1, &ui_alpha)) { Log("UI alpha texture failed"); return 1; }
+    if (hud_mode == 3 && !MakeTexture(d.device.Get(), W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &ui_tex)) { Log("UI texture failed"); return 1; }
     const uint32_t kOut = 2;
     test::ComPtr<ID3D12Resource> outs[kOut], readback[kOut];
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT ofp{};
@@ -453,22 +466,58 @@ int main(int argc, char** argv)
         na::fg::Execute(d.queue.Get(), 1, al, Forward);
         // The real frame and (optionally) its HUD-free picture.
         lb.Reset();
-        if (!ReadPlane(cap, j, "present", m.present, &rows) || !Fill(lb.list.Get(), &color, rows)) { Log("frame %u: present not readable", j); return 1; }
-        bool have_hudless = false;
+        if (!ReadPlane(cap, j, "present", m.present, &rows)) { Log("frame %u: present not readable", j); return 1; }
+        bool have_hudless = false, have_ui = false, have_alpha = false;
+        std::vector<uint8_t> hl;
         if (use_hudless) {
             Meta mn;
             char lname[64];
             snprintf(lname, sizeof lname, "\\lut-%05u.txt", j);
             if (ReadMeta(cap, j + 1, &mn) && mn.sheet.valid && ReadPlane(cap, j + 1, "hud_sheet_before_prev", mn.sheet, &rows2) && ReadLut(lut_dir + lname, lut)) {
-                std::vector<uint8_t> hl(static_cast<size_t>(W) * H * 8);
+                hl.assign(static_cast<size_t>(W) * H * 8, 0);
                 uint16_t* o = reinterpret_cast<uint16_t*>(hl.data());
                 for (size_t px = 0; px < static_cast<size_t>(W) * H; ++px) {
                     for (int c = 0; c < 3; ++c) o[px * 4 + c] = ToHalf(lut[c][rows2[px * 4 + c]]);
                     o[px * 4 + 3] = ToHalf(1.f);
                 }
-                have_hudless = Fill(lb.list.Get(), &hudless, hl);
             }
-            if (!have_hudless) { Log("frame %u: HUD-free picture not available (sheet of %u or %s missing)", j, j + 1, lname + 1); return 1; }
+            if (hl.empty()) { Log("frame %u: HUD-free picture not available (sheet of %u or %s missing)", j, j + 1, lname + 1); return 1; }
+        }
+        if (hud_mode == 4) {
+            if (!Fill(lb.list.Get(), &color, hl)) return 1; // NVIDIA gets the HUD-free picture as the frame itself
+        } else {
+            if (!Fill(lb.list.Get(), &color, rows)) return 1;
+            if (use_hudless) have_hudless = Fill(lb.list.Get(), &hudless, hl);
+        }
+        if (hud_mode == 2 || hud_mode == 3) {
+            // The exact HUD mask: shown vs HUD-free beyond 4/255 after value^(1/2.2) in any channel, grown by 1 pixel.
+            const uint16_t* sp = reinterpret_cast<const uint16_t*>(rows.data());
+            const uint16_t* hp = reinterpret_cast<const uint16_t*>(hl.data());
+            std::vector<uint8_t> raw_mask(static_cast<size_t>(W) * H, 0), mask(static_cast<size_t>(W) * H, 0);
+            auto enc = [](float v) { return v > 0.f ? std::pow(v, 1.f / 2.2f) : 0.f; };
+            for (size_t px = 0; px < raw_mask.size(); ++px)
+                for (int c = 0; c < 3; ++c)
+                    if (std::fabs(enc(FromHalf(sp[px * 4 + c])) - enc(FromHalf(hp[px * 4 + c]))) > 4.f / 255.f) { raw_mask[px] = 1; break; }
+            for (uint32_t y = 0; y < H; ++y)
+                for (uint32_t x = 0; x < W; ++x) {
+                    const size_t i = static_cast<size_t>(y) * W + x;
+                    mask[i] = raw_mask[i] || (x && raw_mask[i - 1]) || (x + 1 < W && raw_mask[i + 1]) || (y && raw_mask[i - W]) || (y + 1 < H && raw_mask[i + W]);
+                }
+            if (hud_mode == 2) {
+                std::vector<uint8_t> a(mask.size());
+                for (size_t i = 0; i < a.size(); ++i) a[i] = mask[i] ? 255 : 0;
+                have_alpha = Fill(lb.list.Get(), &ui_alpha, a);
+            } else {
+                std::vector<uint8_t> u(static_cast<size_t>(W) * H * 8, 0);
+                uint16_t* o = reinterpret_cast<uint16_t*>(u.data());
+                for (size_t i = 0; i < mask.size(); ++i) {
+                    if (!mask[i]) continue; // colour pre-multiplied by alpha 0: all zero
+                    for (int c = 0; c < 3; ++c) o[i * 4 + c] = sp[i * 4 + c];
+                    o[i * 4 + 3] = ToHalf(1.f);
+                }
+                have_ui = Fill(lb.list.Get(), &ui_tex, u);
+            }
+            if (!have_ui && !have_alpha) { Log("frame %u: UI input not made", j); return 1; }
         }
         na::fg::FrameInfo f{};
         f.engine_frame = m.ordinal;
@@ -479,6 +528,8 @@ int main(int argc, char** argv)
         f.frame_id = ++frame_id;
         f.queue = d.queue.Get();
         f.hudless = have_hudless ? hudless.tex.Get() : nullptr;
+        f.ui = have_ui ? ui_tex.tex.Get() : nullptr;
+        f.ui_alpha = have_alpha ? ui_alpha.tex.Get() : nullptr;
         ID3D12Resource* op[kOut] = {outs[0].Get(), outs[1].Get()};
         lb.list->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         const uint32_t n = na::fg::Generate(lb.list.Get(), d.device.Get(), f, op, mult - 1 < kOut ? mult - 1 : kOut);

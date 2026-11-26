@@ -67,6 +67,7 @@ struct State {
     uint32_t feat_w = 0, feat_h = 0, feat_rw = 0, feat_rh = 0;
     DXGI_FORMAT feat_format = DXGI_FORMAT_UNKNOWN;
     uint32_t feat_hudless = 0; // the feature was created told that HUD-less colour comes with each frame
+    uint32_t feat_ui = 0;      // bit 0: UI colour given, bit 1: UI alpha given (UI recomposition on when either, with HUD-less)
     uint32_t feature_pending = 0; // created on this frame's list; evaluate from the next frame
     uint32_t need_reset = 1;
     uint32_t max_supported = 0;
@@ -154,7 +155,8 @@ NVSDK_NGX_Parameter* P() { return static_cast<NVSDK_NGX_Parameter*>(g.params); }
 bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
 {
     if (g.feature && g.feat_w == f.width && g.feat_h == f.height && g.feat_format == f.format &&
-        g.feat_rw == g.in_w && g.feat_rh == g.in_h && g.feat_hudless == (f.hudless ? 1u : 0u))
+        g.feat_rw == g.in_w && g.feat_rh == g.in_h && g.feat_hudless == (f.hudless ? 1u : 0u) &&
+        g.feat_ui == ((f.hudless && f.ui ? 1u : 0u) | (f.hudless && f.ui_alpha ? 2u : 0u)))
         return true;
     release_feature_locked();
     if (!g.params) {
@@ -194,12 +196,15 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
     p->Set(NVSDK_NGX_DLSSG_Parameter_InternalWidth, g.in_w);
     p->Set(NVSDK_NGX_DLSSG_Parameter_InternalHeight, g.in_h);
     p->Set(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0u);
-    // No UI layers or distortion field; HUD-less colour only when the caller supplies it.
-    unsigned never = NVSDK_NGX_DLSSG_ResourceFlags_UI | NVSDK_NGX_DLSSG_ResourceFlags_UIAlpha |
-                     NVSDK_NGX_DLSSG_ResourceFlags_BidirectionalDistortionField;
+    // No distortion field; HUD-less colour and UI layers only when the caller supplies them.
+    // UI recomposition needs HUD-less colour plus UI colour or UI alpha (SDK header).
+    const bool ui = f.hudless && f.ui, ui_alpha = f.hudless && f.ui_alpha;
+    unsigned never = NVSDK_NGX_DLSSG_ResourceFlags_BidirectionalDistortionField;
     if (!f.hudless) never |= NVSDK_NGX_DLSSG_ResourceFlags_HUDLess;
+    if (!ui) never |= NVSDK_NGX_DLSSG_ResourceFlags_UI;
+    if (!ui_alpha) never |= NVSDK_NGX_DLSSG_ResourceFlags_UIAlpha;
     p->Set(NVSDK_NGX_DLSSG_Parameter_ResourceNeverProvided_Flags, never);
-    p->Set(NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled, 0u);
+    p->Set(NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled, (ui || ui_alpha) ? 1u : 0u);
     void* handle = nullptr;
     int32_t r = reinterpret_cast<PfnCreate>(g.rt.create_feature)(list, kFeatureFrameGeneration, g.params, &handle);
     if (!NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(r)) || !handle) {
@@ -215,6 +220,7 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
     g.feat_rh = g.in_h;
     g.feat_format = f.format;
     g.feat_hudless = f.hudless ? 1u : 0u;
+    g.feat_ui = (ui ? 1u : 0u) | (ui_alpha ? 2u : 0u);
     g.feature_pending = 1;
     g.need_reset = 1;
     return true;
@@ -227,8 +233,20 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     p->Set(NVSDK_NGX_DLSSG_Parameter_MVecs, g.motion_copy.Get());
     p->Set(NVSDK_NGX_DLSSG_Parameter_Depth, g.depth_copy.Get());
     p->Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, f.hudless);
-    p->Set(NVSDK_NGX_DLSSG_Parameter_UI, static_cast<ID3D12Resource*>(nullptr));
-    p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, static_cast<ID3D12Resource*>(nullptr));
+    p->Set(NVSDK_NGX_DLSSG_Parameter_UI, (g.feat_ui & 1u) ? f.ui : static_cast<ID3D12Resource*>(nullptr));
+    p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, (g.feat_ui & 2u) ? f.ui_alpha : static_cast<ID3D12Resource*>(nullptr));
+    if (g.feat_ui & 1u) {
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UISubrectBaseX, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UISubrectBaseY, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UISubrectWidth, f.width);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UISubrectHeight, f.height);
+    }
+    if (g.feat_ui & 2u) {
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectBaseX, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectBaseY, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectWidth, f.width);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectHeight, f.height);
+    }
     p->Set(NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField, static_cast<ID3D12Resource*>(nullptr));
     p->Set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, output);
     p->Set(NVSDK_NGX_DLSSG_Parameter_OutputReal, static_cast<ID3D12Resource*>(nullptr));
@@ -661,6 +679,7 @@ void Shutdown()
     g.feat_w = g.feat_h = g.feat_rw = g.feat_rh = 0;
     g.feat_format = DXGI_FORMAT_UNKNOWN;
     g.feat_hudless = 0;
+    g.feat_ui = 0;
     g.last_count = 0;
     g.active.store(0, std::memory_order_release);
 }
