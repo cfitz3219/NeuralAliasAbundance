@@ -21,6 +21,7 @@
 #include <d3d12.h>
 #include <dxgi1_2.h>
 #include <dxgi1_4.h>
+#include <dxgi1_3.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -74,6 +75,7 @@ std::atomic<bool> g_native_proxy{false};
 std::atomic<bool> g_native_proxy_test_off{false};
 std::atomic<CopyObserver> g_copy_observer{nullptr};
 std::atomic<void*> g_copy_observer_user{nullptr};
+thread_local bool t_latency_added = false; // TranslateSwapChain -> AttachSwapChain, same thread: we added the waitable flag
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
 struct Entry { IUnknown* identity = nullptr; ID3D12Device* device = nullptr; ID3D12CommandQueue* queue = nullptr; };
@@ -452,8 +454,17 @@ bool Automatic() { return g_automatic.load(std::memory_order_acquire); }
 void Start(const wchar_t* ini, LogFn log)
 {
     g_log = log;
-    g_native_proxy.store(GetPrivateProfileIntW(L"present", L"dx11_proxy", 0, ini) == 1);
-    if (g_native_proxy.load()) proxy_note("on: native DX11 swap chains are presented through our D3D12 queue", false);
+    // Packages that offer live Frame Generation ([fg] live=1) present a DX11 game's chain through our
+    // queue from its creation, so x2 can be switched on and off with no restart (Cort's rule). Others
+    // keep the game's own chain until a real game has run through the proxy; dx11_proxy=0/1 overrides.
+    const int proxy_key = static_cast<int>(GetPrivateProfileIntW(L"present", L"dx11_proxy", -1, ini));
+    const bool fg_live = GetPrivateProfileIntW(L"fg", L"live", 0, ini) == 1;
+    g_native_proxy.store(proxy_key == 1 || (proxy_key == -1 && fg_live));
+    proxy_note(g_native_proxy.load() ? (proxy_key == 1 ? "on ([present] dx11_proxy=1): native DX11 swap chains are presented through our D3D12 queue"
+                                                       : "on (live Frame Generation is offered): native DX11 swap chains are presented through our D3D12 queue")
+                                     : (proxy_key == 0 ? "off ([present] dx11_proxy=0): native DX11 games keep their own swap chain"
+                                                       : "off (this package does not offer Frame Generation): native DX11 games keep their own swap chain"),
+               false);
     if (AutomaticRequested(ini)) {
         // Automatic selection observes the game's own swap chain. Never
         // intercept device creation or opt into the legacy translation path.
@@ -1032,6 +1043,12 @@ struct TChain {
     ComPtr<ID3D12QueryHeap> queries;                          // two timestamps per slot around the copy
     ComPtr<ID3D12Resource> query_readback;
     uint64_t timestamp_hz = 0;
+    // Frame latency: a D3D11 game sets it on its DXGI device (default 3). A D3D12 chain honours it only
+    // through its waitable object, which we add (hidden from the game) and wait on at each Present.
+    bool latency_ours = false;
+    HANDLE waitable = nullptr;
+    UINT latency_applied = 0;
+    uint64_t latency_waits = 0;
 };
 // Recursive: BeforePresent asks the chain for its D3D12 buffer through the hooked GetBuffer.
 std::recursive_mutex g_tm;
@@ -1433,8 +1450,10 @@ bool NativeRoute()
 
 bool TranslateSwapChain(IUnknown* device, const DXGI_SWAP_CHAIN_DESC& game, DXGI_SWAP_CHAIN_DESC& real, ID3D12CommandQueue** queue)
 {
+    t_latency_added = false;
+    bool native = false;
     if (!translate_common(device, game.BufferDesc.Format, queue) &&
-        !translate_native(device, game.BufferDesc.Format, game.SampleDesc.Count, game.Flags, FALSE, queue)) return false;
+        !(native = translate_native(device, game.BufferDesc.Format, game.SampleDesc.Count, game.Flags, FALSE, queue))) return false;
     real = game;
     real.BufferDesc.Format = flip_format(game.BufferDesc.Format);
     real.BufferCount = flip_count(game.BufferCount ? game.BufferCount : 1);
@@ -1442,13 +1461,16 @@ bool TranslateSwapChain(IUnknown* device, const DXGI_SWAP_CHAIN_DESC& game, DXGI
     real.SampleDesc = {1, 0};
     real.BufferUsage = flip_usage(game.BufferUsage);
     real.Flags = flip_flags(game.Flags);
+    if (native && !(real.Flags & static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))) { real.Flags |= static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT); t_latency_added = true; }
     return true;
 }
 
 bool TranslateSwapChain1(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1& game, DXGI_SWAP_CHAIN_DESC1& real, ID3D12CommandQueue** queue)
 {
+    t_latency_added = false;
+    bool native = false;
     if (!translate_common(device, game.Format, queue) &&
-        !translate_native(device, game.Format, game.SampleDesc.Count, game.Flags, game.Stereo, queue)) return false;
+        !(native = translate_native(device, game.Format, game.SampleDesc.Count, game.Flags, game.Stereo, queue))) return false;
     real = game;
     real.Format = flip_format(game.Format);
     real.BufferCount = flip_count(game.BufferCount ? game.BufferCount : 1);
@@ -1457,6 +1479,7 @@ bool TranslateSwapChain1(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1& game, DX
     real.BufferUsage = flip_usage(game.BufferUsage);
     real.Flags = flip_flags(game.Flags);
     if (real.Scaling == DXGI_SCALING_ASPECT_RATIO_STRETCH) real.Scaling = DXGI_SCALING_STRETCH; // composition-only mode
+    if (native && !(real.Flags & static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))) { real.Flags |= static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT); t_latency_added = true; }
     return true;
 }
 
@@ -1470,8 +1493,10 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
     auto& published = g_tchain_ids[c - g_tchains];
     const bool reused = c->sc == chain;
     if (c->event) CloseHandle(c->event);
+    if (c->waitable) CloseHandle(c->waitable);
     *c = TChain{};
     auto fail = [&](const char* why) {
+        if (c->waitable) CloseHandle(c->waitable);
         *c = TChain{};
         if (reused) {
             published.store(nullptr);
@@ -1493,6 +1518,12 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
     c->game_usage = game_usage;
     read_size(*c);
     if (!build_virtual(*c)) return fail("the game's back buffer could not be built; the game gets its own chain");
+    if (c->native && t_latency_added) {
+        ComPtr<IDXGISwapChain2> sc2;
+        if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&sc2)))) c->waitable = sc2->GetFrameLatencyWaitableObject();
+        c->latency_ours = c->waitable != nullptr;
+    }
+    t_latency_added = false;
     if (c->native) {
         ComPtr<ID3D11Texture2D> t;
         if (FAILED(c->virt11.As(&t)) || !na::native11::proxy_views::Install(c->d11.Get(), t.Get())) {
@@ -1554,6 +1585,7 @@ void RewriteDesc(IDXGISwapChain* chain, DXGI_SWAP_CHAIN_DESC* d)
     d->SwapEffect = c->game_effect;
     d->SampleDesc = c->game_samples;
     d->BufferUsage = c->game_usage;
+    if (c->latency_ours) d->Flags &= ~static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
 }
 
 void RewriteDesc1(IDXGISwapChain* chain, DXGI_SWAP_CHAIN_DESC1* d)
@@ -1567,6 +1599,7 @@ void RewriteDesc1(IDXGISwapChain* chain, DXGI_SWAP_CHAIN_DESC1* d)
     d->SwapEffect = c->game_effect;
     d->SampleDesc = c->game_samples;
     d->BufferUsage = c->game_usage;
+    if (c->latency_ours) d->Flags &= ~static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
 }
 
 void BeforePresent(IDXGISwapChain* chain, unsigned flags)
@@ -1596,6 +1629,18 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
     if (c->native) {
         // D3D11's frame first (flushed), our queue waits for it on the GPU, copies, then D3D11 waits
         // for the copy before the game writes its next frame into the shared buffer.
+        if (c->latency_ours) { // the game's own frame-latency setting, as a D3D11 Present would block for it
+            UINT want = 3;
+            ComPtr<IDXGIDevice1> dd;
+            if (SUCCEEDED(c->d11.As(&dd))) dd->GetMaximumFrameLatency(&want);
+            if (!want) want = 3;
+            if (want != c->latency_applied) {
+                ComPtr<IDXGISwapChain2> sc2;
+                if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&sc2))) && SUCCEEDED(sc2->SetMaximumFrameLatency(want))) c->latency_applied = want;
+            }
+            WaitForSingleObjectEx(c->waitable, 1000, TRUE);
+            ++c->latency_waits;
+        }
         const uint64_t t0 = now_us();
         uint64_t drawn = 0;
         g_t_handoffs.fetch_add(1, std::memory_order_relaxed);
@@ -1741,6 +1786,7 @@ bool BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, u
     }
     if (*count) *count = flip_count(*count);
     *flags = flip_flags(*flags);
+    if (c->latency_ours) *flags |= static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT); // a chain's waitable flag cannot change on resize
     g_tresizes.fetch_add(1);
     return true;
 }
@@ -1784,6 +1830,7 @@ void ForgetSwapChain(IDXGISwapChain* chain)
     tdrain(*c);
     drop_virtual(*c);
     if (c->event) CloseHandle(c->event);
+    if (c->waitable) CloseHandle(c->waitable);
     *c = TChain{};
     g_tchain_count.fetch_sub(1);
 }
@@ -1796,6 +1843,24 @@ bool NativeProxy(IDXGISwapChain* chain)
     std::lock_guard<std::recursive_mutex> lk(g_tm);
     const TChain* c = tfind(chain);
     return c && c->native;
+}
+
+bool ProxyLatency(IDXGISwapChain* chain, unsigned* applied, unsigned long long* waits)
+{
+    if (!g_tchain_count.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::recursive_mutex> lk(g_tm);
+    const TChain* c = tfind(chain);
+    if (!c || !c->latency_ours) return false;
+    if (applied) *applied = c->latency_applied;
+    if (waits) *waits = c->latency_waits;
+    return true;
+}
+
+void ProxyReason(char* out, size_t n, unsigned long long* refused)
+{
+    std::lock_guard<std::mutex> lk(g_m);
+    if (out && n) std::snprintf(out, n, "%s", g_proxy_reason);
+    if (refused) *refused = g_proxy_refused.load();
 }
 
 bool ProxyEncoding(IDXGISwapChain* chain, DXGI_FORMAT* game_format, DXGI_FORMAT* real_format)

@@ -5,6 +5,8 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <d3d11_3.h>
+
 #include <atomic>
 #include <mutex>
 
@@ -13,6 +15,7 @@ namespace {
 
 enum : uint32_t { kCreateUnorderedAccessView = 8, kCreateRenderTargetView = 9 }; // ID3D11Device
 enum : uint32_t { kTexture2DGetDesc = 10 };                                      // ID3D11Texture2D
+enum : uint32_t { kCreateShaderResourceView1 = 57, kCreateUnorderedAccessView1 = 58, kCreateRenderTargetView1 = 59 }; // ID3D11Device3
 
 struct Entry { std::atomic<ID3D11Resource*> res{nullptr}; std::atomic<DXGI_FORMAT> format{DXGI_FORMAT_UNKNOWN}; };
 Entry g_entries[4];
@@ -26,6 +29,40 @@ using GetDescFn = void(STDMETHODCALLTYPE*)(ID3D11Texture2D*, D3D11_TEXTURE2D_DES
 CreateRtvFn g_rtv = nullptr;
 CreateUavFn g_uav = nullptr;
 GetDescFn g_get_desc = nullptr;
+using CreateSrv1Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device3*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC1*, ID3D11ShaderResourceView1**);
+using CreateUav1Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device3*, ID3D11Resource*, const D3D11_UNORDERED_ACCESS_VIEW_DESC1*, ID3D11UnorderedAccessView1**);
+using CreateRtv1Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device3*, ID3D11Resource*, const D3D11_RENDER_TARGET_VIEW_DESC1*, ID3D11RenderTargetView1**);
+CreateSrv1Fn g_srv1 = nullptr;
+CreateUav1Fn g_uav1 = nullptr;
+CreateRtv1Fn g_rtv1 = nullptr;
+
+// D3D11.3 view descriptions: same rule (no description or an unknown format -> the chain's format).
+template <class Desc> const Desc* fix1(ID3D11Resource* r, const Desc* in, Desc& s, UINT dimension)
+{
+    DXGI_FORMAT f;
+    if ((in && in->Format != DXGI_FORMAT_UNKNOWN) || !Lookup(r, &f)) return in;
+    if (in) s = *in;
+    else { s = {}; s.ViewDimension = static_cast<decltype(s.ViewDimension)>(dimension); }
+    s.Format = f;
+    return &s;
+}
+HRESULT STDMETHODCALLTYPE CreateSrv1_d(ID3D11Device3* d, ID3D11Resource* r, const D3D11_SHADER_RESOURCE_VIEW_DESC1* desc, ID3D11ShaderResourceView1** out)
+{
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 s{};
+    const auto* use = fix1(r, desc, s, D3D11_SRV_DIMENSION_TEXTURE2D);
+    if (use == &s && !desc) s.Texture2D.MipLevels = 1;
+    return g_srv1(d, r, use, out);
+}
+HRESULT STDMETHODCALLTYPE CreateUav1_d(ID3D11Device3* d, ID3D11Resource* r, const D3D11_UNORDERED_ACCESS_VIEW_DESC1* desc, ID3D11UnorderedAccessView1** out)
+{
+    D3D11_UNORDERED_ACCESS_VIEW_DESC1 s{};
+    return g_uav1(d, r, fix1(r, desc, s, D3D11_UAV_DIMENSION_TEXTURE2D), out);
+}
+HRESULT STDMETHODCALLTYPE CreateRtv1_d(ID3D11Device3* d, ID3D11Resource* r, const D3D11_RENDER_TARGET_VIEW_DESC1* desc, ID3D11RenderTargetView1** out)
+{
+    D3D11_RENDER_TARGET_VIEW_DESC1 s{};
+    return g_rtv1(d, r, fix1(r, desc, s, D3D11_RTV_DIMENSION_TEXTURE2D), out);
+}
 
 HRESULT STDMETHODCALLTYPE CreateRtv_d(ID3D11Device* d, ID3D11Resource* r, const D3D11_RENDER_TARGET_VIEW_DESC* desc, ID3D11RenderTargetView** out)
 {
@@ -131,6 +168,13 @@ bool Install(ID3D11Device* device, ID3D11Texture2D* proxy)
     ok = ok && na::hooking::PrepareVTableSlot(device, kCreateRenderTargetView, reinterpret_cast<void*>(&CreateRtv_d), reinterpret_cast<void**>(&g_rtv));
     ok = ok && na::hooking::PrepareVTableSlot(device, kCreateUnorderedAccessView, reinterpret_cast<void*>(&CreateUav_d), reinterpret_cast<void**>(&g_uav));
     ok = ok && na::hooking::PrepareVTableSlot(proxy, kTexture2DGetDesc, reinterpret_cast<void*>(&GetDesc_d), reinterpret_cast<void**>(&g_get_desc));
+    ID3D11Device3* d3 = nullptr; // D3D11.3 view calls (the device always offers them on Windows 10)
+    if (ok && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&d3))) && d3) {
+        ok = na::hooking::PrepareVTableSlot(d3, kCreateShaderResourceView1, reinterpret_cast<void*>(&CreateSrv1_d), reinterpret_cast<void**>(&g_srv1)) &&
+             na::hooking::PrepareVTableSlot(d3, kCreateUnorderedAccessView1, reinterpret_cast<void*>(&CreateUav1_d), reinterpret_cast<void**>(&g_uav1)) &&
+             na::hooking::PrepareVTableSlot(d3, kCreateRenderTargetView1, reinterpret_cast<void*>(&CreateRtv1_d), reinterpret_cast<void**>(&g_rtv1));
+        d3->Release();
+    }
     if (ok) ok = na::hooking::CommitInstall();
     else na::hooking::AbandonInstall();
     g_installed = ok;

@@ -145,6 +145,11 @@ bool NativeProxy(IDXGISwapChain* chain);
 // the real D3D12 chain's buffer format. The colour space is what the game set with SetColorSpace1
 // on the same (real) chain: na::overlay::SwapChainColorSpace(chain).
 bool ProxyEncoding(IDXGISwapChain* chain, DXGI_FORMAT* game_format, DXGI_FORMAT* real_format);
+// Frame latency on a proxy chain: the game's IDXGIDevice1::SetMaximumFrameLatency, applied to the D3D12
+// chain through its waitable object (added by us, hidden from the game; not when the game asked for it).
+bool ProxyLatency(IDXGISwapChain* chain, unsigned* applied, unsigned long long* waits);
+// The proxy's last decision in plain words (for the Frame Generation menu row) and chains refused so far.
+void ProxyReason(char* out, size_t n, unsigned long long* refused);
 // Tests: called on the presenting thread right after the copy into `target` (PRESENT state) was
 // submitted on `queue`, before DXGI's Present. `SetNativeProxyForTests(false)` makes the next chains
 // the game's own (to compare against).

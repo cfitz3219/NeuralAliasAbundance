@@ -17,6 +17,8 @@
 #include "host_dx12/settings.hpp"
 
 #include <d3d11_1.h>
+#include <d3d11_3.h>
+#include <dxgi1_3.h>
 #include <dxgi1_2.h>
 #include <cstring>
 #include <filesystem>
@@ -101,6 +103,13 @@ std::vector<uint8_t> draw_and_read(ID3D11Device* dev, ID3D11DeviceContext* ctx, 
     }
     ComPtr<ID3D11ShaderResourceView> srv; // a game may also sample its back buffer: a view with no description
     CHECK(SUCCEEDED(dev->CreateShaderResourceView(buffer.Get(), nullptr, &srv)));
+    ComPtr<ID3D11Device3> dev3; // and the D3D11.3 calls for the same views
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev3)))) {
+        ComPtr<ID3D11RenderTargetView1> rtv1;
+        ComPtr<ID3D11ShaderResourceView1> srv1;
+        CHECK(SUCCEEDED(dev3->CreateRenderTargetView1(buffer.Get(), nullptr, &rtv1)));
+        CHECK(SUCCEEDED(dev3->CreateShaderResourceView1(buffer.Get(), nullptr, &srv1)));
+    }
     const float a[4] = {0.1f + 0.05f * frame, 0.4f, 0.7f, 1.f}, b[4] = {0.9f, 0.25f, 0.05f + 0.1f * frame, 1.f};
     ctx->ClearRenderTargetView(rtv.Get(), a);
     ComPtr<ID3D11DeviceContext1> ctx1;
@@ -332,6 +341,38 @@ int main(int argc, char** argv)
         const auto after = na::overlay::GetStats().frames_rendered;
         std::printf("Home menu on the proxied chain: frames rendered %llu -> %llu\n", static_cast<unsigned long long>(before), static_cast<unsigned long long>(after));
         CHECK(after > before);
+        {   // the game's frame latency (IDXGIDevice1) is honoured by the D3D12 chain through its waitable object
+            ComPtr<IDXGIDevice1> dd;
+            REQUIRE(SUCCEEDED(dev.As(&dd)));
+            REQUIRE(SUCCEEDED(dd->SetMaximumFrameLatency(1)));
+            for (int i = 0; i < 5; ++i) chain->Present(0, 0);
+            unsigned applied = 0;
+            unsigned long long waits = 0;
+            CHECK(na::on12::ProxyLatency(chain.Get(), &applied, &waits));
+            ComPtr<IDXGISwapChain2> sc2;
+            UINT real = 0;
+            if (SUCCEEDED(chain.As(&sc2))) sc2->GetMaximumFrameLatency(&real);
+            std::printf("frame latency: game set 1, proxy applied %u, real chain reports %u, waits %llu\n", applied, real, waits);
+            CHECK(applied == 1 && real == 1 && waits > 0);
+            DXGI_SWAP_CHAIN_DESC gd{};
+            chain->GetDesc(&gd);
+            na::on12::RewriteDesc(chain.Get(), &gd);
+            CHECK(!(gd.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)); // our flag is not the game's
+            dd->SetMaximumFrameLatency(3);
+        }
+        {   // ResizeTarget and frame statistics pass through to the real chain
+            DXGI_MODE_DESC md{};
+            md.Width = 800; md.Height = 450;
+            CHECK(SUCCEEDED(chain->ResizeTarget(&md)));
+            DXGI_FRAME_STATISTICS fs{};
+            const HRESULT st = chain->GetFrameStatistics(&fs);
+            UINT count = 0;
+            CHECK(SUCCEEDED(chain->GetLastPresentCount(&count)) && count > 0);
+            std::printf("ResizeTarget ok; GetFrameStatistics 0x%08lX; last present count %u\n", static_cast<unsigned long>(st), count);
+            CHECK(SUCCEEDED(st) || st == DXGI_ERROR_FRAME_STATISTICS_DISJOINT);
+            ctx->ClearState(); ctx->Flush();
+            CHECK(SUCCEEDED(chain->ResizeBuffers(0, 1920, 1080, DXGI_FORMAT_UNKNOWN, 0)));
+        }
         {   // the menu's pixels reach the presented picture: compare a presented frame with the menu open
             // against the game's own picture (the copy observer reads the real buffer after our copy, i.e.
             // before the menu; the D3D12 menu draw follows on the same queue before DXGI's Present).
