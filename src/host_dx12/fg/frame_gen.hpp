@@ -146,6 +146,13 @@ struct Stats {
     char reason[112];
 };
 Stats GetStats();
+// Route B (camera_free), after a Generate that returned > 0: the motion Frame Generation used, for the
+// still-area steadying on the same list. `filled` = the motion with "nothing known" (exactly zero) vectors
+// filled from neighbours, without the dead zone (NON_PIXEL_SHADER_RESOURCE, render size, value * mv_scale =
+// render pixels). `reset`: the runtime was told to restart its history for this frame. Null `filled` when
+// the last Generate did not use prepared motion (Route A, or the format has no typed UAV stores).
+struct UsedMotion { ID3D12Resource* filled; float mv_scale_x, mv_scale_y; uint32_t reset; uint64_t frame_id; };
+UsedMotion LastUsedMotion(); // call on the presenter's thread right after Generate (same lock order)
 void ResetLatch();
 void Shutdown(); // releases the feature and resources (game exit / tests)
 // A73: the presenter is not offering frames right now for a reason of its

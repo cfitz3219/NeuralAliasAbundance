@@ -1,5 +1,6 @@
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/depth_format.hpp"
+#include "host_dx12/fg/motion_prep.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -53,6 +54,10 @@ struct State {
     EvalInputs last_in{};
     uint32_t have_inputs = 0;
     uint32_t inputs_fresh = 0; // an evaluate happened since the last Generate
+    // Route B: motion prepared for Frame Generation (fill + dead zone) and for the steadying (fill only).
+    MotionPrep prep;
+    ID3D12Resource* mvecs = nullptr; // what evaluate_locked hands the runtime this frame
+    UsedMotion used{};
     // Recording and submission are different events. Protect receipts with a
     // separate lock, never held across NGX calls or GPU waits.
     struct InputReceipt {
@@ -358,7 +363,7 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
 {
     NVSDK_NGX_Parameter* p = P();
     p->Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, f.color);
-    p->Set(NVSDK_NGX_DLSSG_Parameter_MVecs, g.motion_copy.Get());
+    p->Set(NVSDK_NGX_DLSSG_Parameter_MVecs, g.mvecs ? g.mvecs : g.motion_copy.Get());
     p->Set(NVSDK_NGX_DLSSG_Parameter_Depth, g.depth_copy.Get());
     p->Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, f.hudless);
     p->Set(NVSDK_NGX_DLSSG_Parameter_UI, (g.feat_ui & 1u) ? f.ui : static_cast<ID3D12Resource*>(nullptr));
@@ -395,9 +400,13 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     p->Set(NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, static_cast<void*>(have_camera ? camera.previous_to_clip : zero));
     p->Set(NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, g.last_in.jitter_x);
     p->Set(NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, g.last_in.jitter_y);
-    // DLSS: value * scale = render pixels. DLSS-G wants values normalised to
-    // the render extent, so divide the pixel scale by the render size.
+    // DLSS: value * scale = render pixels. The SDK header calls DLSS-G's scale "normalised"; Route A keeps
+    // that (scale / render size). Route B passes the render-pixel scale itself: with the normalised value
+    // the runtime in effect ignored our motion (exact-motion pan, fg_capture_replay 2026-11-26: error 10.3
+    // normalised against 1.5 in render pixels, 1.5 being the same as perfect motion). Route A is unchanged
+    // because its games were never tried with the other reading.
     float rw = static_cast<float>(g.in_w ? g.in_w : 1u), rh = static_cast<float>(g.in_h ? g.in_h : 1u);
+    if (g.last_in.camera_free) { rw = 1.f; rh = 1.f; }
     p->Set(NVSDK_NGX_DLSSG_Parameter_MvecScaleX, g.last_in.mv_scale_x / rw);
     p->Set(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, g.last_in.mv_scale_y / rh);
     p->Set(NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, have_camera ? camera.pinhole[0] : 0.f);
@@ -425,6 +434,7 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     p->Set(NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, have_camera ? unsigned(camera.camera_motion) : 1u);
     const bool reset = g.need_reset || g.last_in.reset || (have_camera && camera.reset);
     if (reset && index == 1) (g.last_in.reset_reason == 1 ? g.resets_cut : g.resets_other).fetch_add(1, std::memory_order_relaxed);
+    if (index == 1) g.used.reset = reset ? 1u : 0u;
     p->Set(NVSDK_NGX_DLSSG_Parameter_Reset, reset ? 1u : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, have_camera ? unsigned(camera.not_game) : 0u);
@@ -720,6 +730,30 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
         g.skipped.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
+    // Route B: fill "nothing known" motion, and give Frame Generation a 1-render-pixel dead zone
+    // (motion_prep.hpp). Without typed UAV stores for the motion format, the copy goes as it is.
+    g.mvecs = nullptr;
+    g.used = {};
+    if (g.last_in.camera_free && g.motion_copy) {
+        if (ID3D12Resource* old = g.prep.Filled()) {
+            const auto a = old->GetDesc(), b = g.motion_copy->GetDesc();
+            if (a.Width != b.Width || a.Height != b.Height || a.Format != b.Format) {
+                g.retired.push_back({nullptr, {g.prep.Filled(), g.prep.ForFg()}, g.generate_calls + kRetireAfter});
+                g.prep.Release();
+            }
+        }
+        if (g.prep.Record(list, g.device.Get(), g.motion_copy.Get(), g.last_in.mv_scale_x, g.last_in.mv_scale_y, 1.0f,
+                          static_cast<uint32_t>(g.generate_calls % MotionPrep::kPages))) {
+            g.mvecs = g.prep.ForFg();
+            g.used.filled = g.prep.Filled();
+            g.used.mv_scale_x = g.last_in.mv_scale_x;
+            g.used.mv_scale_y = g.last_in.mv_scale_y;
+            g.used.frame_id = f.frame_id;
+            milestone("motion prepared for Frame Generation (filled, 1-pixel dead zone)", true, nullptr);
+        } else {
+            milestone("motion prepared for Frame Generation (filled, 1-pixel dead zone)", false, "typed UAV stores of the motion format are not supported, or no memory; the motion goes as measured");
+        }
+    }
     uint32_t mult = st.fg_multiplier.load(std::memory_order_relaxed);
     if (mult < 2) mult = 2;
     if (mult > 6) mult = 6;
@@ -740,7 +774,7 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
     // V-Sync off tears above the refresh rate, V-Sync on queues and paces.
     if (count < 1) count = 1;
     for (uint32_t i = 0; i < count; ++i) {
-        if (!evaluate_locked(list, f, outputs[i], count, i + 1)) return i; // latched; earlier outputs stay usable
+        if (!evaluate_locked(list, f, outputs[i], count, i + 1)) { if (!i) g.used = {}; return i; } // latched; earlier outputs stay usable
     }
     g.need_reset=0;
     g.last_count = count;
@@ -756,6 +790,12 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
     latch("Frame Generation needs a build with the NVIDIA SDK.");
     return 0;
 #endif
+}
+
+UsedMotion LastUsedMotion()
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.used;
 }
 
 Stats GetStats()
@@ -842,6 +882,9 @@ void Shutdown()
     g.params = nullptr;
     g.depth_copy.Reset();
     g.motion_copy.Reset();
+    g.prep.Release();
+    g.mvecs = nullptr;
+    g.used = {};
     g.recording_depth.Reset(); g.recording_motion.Reset();
     for (auto& p : g.pending) p = {};
     g.ready = {};
