@@ -682,3 +682,9 @@ if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
   add_custom_command(TARGET dlss_capture_replay POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_capture_replay>")
 endif()
+
+# Offline proof for Frame Generation (NGX feature 11) through our own module on a saved capture (see the head
+# of the source). Not a CTest: it only runs where an RTX card, the NGX library and the runtime are present.
+add_executable(fg_capture_replay fg_capture_replay.cpp)
+target_link_libraries(fg_capture_replay PRIVATE abundance_options host_dx12 version dxgi d3d12)
+target_include_directories(fg_capture_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

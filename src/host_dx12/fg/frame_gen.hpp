@@ -81,6 +81,10 @@ struct FrameInfo {
     // NOT be shown this frame (its own full-screen-menu detection). The
     // presenter reads it back and shows the real frame only.
     ID3D12Resource* disable_flag = nullptr;
+    // Optional: the finished frame WITHOUT the HUD (back-buffer format and size,
+    // NON_PIXEL_SHADER_RESOURCE). Given, the runtime is told it has HUD-less colour;
+    // the feature is created again when this choice changes. Null = as before.
+    ID3D12Resource* hudless = nullptr;
 };
 
 // Records the generated frames for `f` on `list` (open, ours, executed by
