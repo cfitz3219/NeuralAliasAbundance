@@ -23,8 +23,18 @@ bool OwnInit(ID3D12Device* device, const wchar_t* data_path, Api* api, char* rea
         std::snprintf(reason, 128, "DLSS start-up was called without a device or data folder.");
         return false;
     }
+    // Route B live Frame Generation: the package's own folder is one more read-only place NVIDIA's
+    // runtime looks for its feature files (nvngx_dlssg.dll). Nothing is copied anywhere.
+    NVSDK_NGX_FeatureCommonInfo info{};
+    const wchar_t* folder = OwnSearchFolder();
+    const wchar_t* paths[1] = {folder};
+    if (folder && folder[0]) {
+        info.PathListInfo.Path = paths;
+        info.PathListInfo.Length = 1;
+    }
     const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                                                                   kEngineVersion, data_path, device, nullptr);
+                                                                   kEngineVersion, data_path, device,
+                                                                   folder && folder[0] ? &info : nullptr);
     if (NVSDK_NGX_FAILED(r)) {
         std::snprintf(reason, 128, "The NVIDIA DLSS runtime did not start (code 0x%08X). Is this an RTX GPU with a current driver?",
                       static_cast<unsigned>(r));

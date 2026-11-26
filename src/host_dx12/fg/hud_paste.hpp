@@ -1,0 +1,35 @@
+// The HUD of a generated picture, exact by the T2 method (offline 2026-11-25): Frame Generation is
+// given the HUD-free picture as its back buffer, so it never warps the HUD; afterwards every pixel
+// of the generated picture within one pixel of the newer real frame's HUD is replaced by that real
+// frame's pixel. A pixel is HUD where, in display terms, the real frame differs from its HUD-free
+// picture by more than 4/255 in any channel (CPU reference: core/live_frame_gen.hpp PasteHud).
+#pragma once
+
+#include <d3d12.h>
+#include <wrl/client.h>
+
+#include <cstdint>
+
+namespace na::fg {
+
+class HudPaste {
+public:
+    // Compiles the pass (call while nothing is shown with it, so its first use never stalls a frame).
+    bool Init(ID3D12Device* device);
+    bool Ready() const { return pso_ != nullptr; }
+    // Records the paste on `list`. `generated` is in UNORDERED_ACCESS state and stays there; `real`
+    // and `hudfree` are in NON_PIXEL_SHADER_RESOURCE and stay there. All three are w x h, the same
+    // format family. `slot` picks a descriptor page (< kPages) not used by work still in flight.
+    static constexpr uint32_t kPages = 16;
+    bool Record(ID3D12GraphicsCommandList* list, ID3D12Resource* generated, ID3D12Resource* real, ID3D12Resource* hudfree,
+                uint32_t w, uint32_t h, DXGI_FORMAT format, uint32_t slot);
+
+private:
+    Microsoft::WRL::ComPtr<ID3D12Device> device_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
+    uint32_t inc_ = 0;
+};
+
+} // namespace na::fg

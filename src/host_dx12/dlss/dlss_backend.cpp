@@ -339,6 +339,14 @@ bool OwnInit(ID3D12Device* device, const wchar_t* data_path, Api* api, char* rea
 void OwnShutdown(ID3D12Device* device);
 #endif
 
+namespace {
+std::atomic<OwnAttachedFn> g_own_attached{nullptr};
+wchar_t g_search_folder[260] = {}; // written once at boot, before our NGX starts
+} // namespace
+void SetOwnAttachedListener(OwnAttachedFn fn) { g_own_attached.store(fn, std::memory_order_release); }
+void SetOwnSearchFolder(const wchar_t* folder) { wcsncpy_s(g_search_folder, folder ? folder : L"", _TRUNCATE); }
+const wchar_t* OwnSearchFolder() { return g_search_folder; }
+
 bool Attach(ID3D12Device* device, const Api& api)
 {
     std::lock_guard<std::recursive_mutex> life(g_life_m);
@@ -418,13 +426,19 @@ bool InitOwn(ID3D12Device* device, const wchar_t* data_path)
         return false;
     }
     const bool ok = Attach(device, api);
-    std::lock_guard<std::mutex> lock(g.m);
-    if (g.attached) {
-        g.own = true;
-        g.caps.own_instance = true;
-    } else {
-        OwnShutdown(device);
+    bool attached = false;
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        if (g.attached) {
+            g.own = true;
+            g.caps.own_instance = true;
+            attached = true;
+        } else {
+            OwnShutdown(device);
+        }
     }
+    if (attached)
+        if (const OwnAttachedFn fn = g_own_attached.load(std::memory_order_acquire)) fn(api);
     return ok;
 #else
     (void)device;

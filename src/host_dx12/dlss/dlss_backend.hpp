@@ -169,6 +169,14 @@ bool FromFrame(const abundance::Frame& f, const FrameResources& r, Quality q, Ev
 // build with the NGX static library (NA_HAVE_NGX_LIB); otherwise returns false
 // with a reason. `data_path` is a writable folder for NGX logs/cache.
 bool InitOwn(ID3D12Device* device, const wchar_t* data_path);
+// Route B live Frame Generation: one extra folder NVIDIA's runtime searches (read-only) for its
+// feature files (nvngx_dlssg.dll), given to our own NGX instance at start-up. Empty = none.
+void SetOwnSearchFolder(const wchar_t* folder);
+const wchar_t* OwnSearchFolder();
+// Called once our own NGX instance is attached, with its entry points (Frame Generation uses the
+// same instance). Null = none.
+using OwnAttachedFn = void (*)(const Api& api);
+void SetOwnAttachedListener(OwnAttachedFn fn);
 // Connect an already-initialised runtime (game's NGX via the proxy, or a fake).
 bool Attach(ID3D12Device* device, const Api& api);
 // Releases features and parameter objects (and our NGX instance if we own

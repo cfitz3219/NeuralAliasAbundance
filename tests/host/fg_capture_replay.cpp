@@ -3,7 +3,7 @@
 // through OUR module (src/host_dx12/fg/frame_gen.cpp: OnEvaluate -> Execute -> Generate), from our own
 // NGX instance, and the generated pictures are saved.
 //
-//   fg_capture_replay <capture folder> <out folder> <first> <last> <camera> <hud mode 0..4> [multiplier 2|3] [lut folder]
+//   fg_capture_replay <capture folder> <out folder> <first> <last> <camera> <hud mode 0..5> [multiplier 2|3] [lut folder]
 //
 //   <first>..<last>  consecutive capture indices, each one real frame (index j: present plane j as the back
 //                    buffer; depth and motion planes j). The first frame creates the feature, the second
@@ -21,6 +21,8 @@
 //                    value^(1/2.2), grown 1 px, as 0/1) with NVIDIA's UI recomposition on. 3: HUD-less colour +
 //                    UI colour (shown inside the mask, alpha 1, pre-multiplied) with recomposition.
 //                    4: the HUD-free picture IS the back buffer (NVIDIA gets no HUD; paste-back is offline).
+//                    5: the live T2 path: as 4, with the module's camera-free input (camera "zero") and the
+//                    real frame's HUD pasted on the GPU by the live pass (fg/hud_paste.cpp).
 //   [multiplier]     2 (default): one generated picture per real frame; 3: two, when the runtime allows it.
 //
 // NGX search: the runtime looks for nvngx_dlssg.dll beside this executable and in the driver store. The
@@ -33,6 +35,7 @@
 // install or setting.
 #include "test_support.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
+#include "host_dx12/fg/hud_paste.hpp"
 #include "host_dx12/settings.hpp"
 
 
@@ -317,7 +320,7 @@ bool ReadLut(const std::string& path, float lut[3][256])
 int main(int argc, char** argv)
 {
     if (argc < 7) {
-        std::printf("usage: fg_capture_replay <capture> <out> <first> <last> <a50|a30|a90|zero> <hud mode 0..4> [multiplier 2|3] [lut folder]\n");
+        std::printf("usage: fg_capture_replay <capture> <out> <first> <last> <a50|a30|a90|zero> <hud mode 0..5> [multiplier 2|3] [lut folder]\n");
         return 2;
     }
     const std::string cap = argv[1], out = argv[2], cam_name = argv[5];
@@ -435,6 +438,8 @@ int main(int argc, char** argv)
     la.list->Close();
     lb.list->Close();
 
+    na::fg::HudPaste paste; // live T2 (mode 5)
+    if (hud_mode == 5 && !paste.Init(d.device.Get())) { Log("HUD paste pass could not be built"); return 1; }
     float lut[3][256] = {};
     std::vector<uint8_t> rows, rows2;
     uint64_t frame_id = 0;
@@ -450,7 +455,8 @@ int main(int argc, char** argv)
         na::fg::EvalInputs in{};
         in.engine_frame = m.ordinal;
         in.camera = cam;
-        in.camera_valid = true; // the zero variant is passed as valid on purpose (tool only)
+        in.camera_valid = hud_mode != 5; // the zero variant is passed as valid on purpose (tool only)
+        in.camera_free = hud_mode == 5;  // live T2: the module's own Route B camera-free path
         in.depth = depth.tex.Get();
         in.motion = motion.tex.Get();
         in.render_w = rw; in.render_h = rh; in.out_w = W; in.out_h = H;
@@ -483,8 +489,9 @@ int main(int argc, char** argv)
             }
             if (hl.empty()) { Log("frame %u: HUD-free picture not available (sheet of %u or %s missing)", j, j + 1, lname + 1); return 1; }
         }
-        if (hud_mode == 4) {
+        if (hud_mode == 4 || hud_mode == 5) {
             if (!Fill(lb.list.Get(), &color, hl)) return 1; // NVIDIA gets the HUD-free picture as the frame itself
+            if (hud_mode == 5 && !Fill(lb.list.Get(), &hudless, rows)) return 1; // live T2: the real frame, for the paste
         } else {
             if (!Fill(lb.list.Get(), &color, rows)) return 1;
             if (use_hudless) have_hudless = Fill(lb.list.Get(), &hudless, hl);
@@ -527,12 +534,15 @@ int main(int argc, char** argv)
         f.hdr = true;
         f.frame_id = ++frame_id;
         f.queue = d.queue.Get();
-        f.hudless = have_hudless ? hudless.tex.Get() : nullptr;
+        f.hudless = have_hudless && hud_mode != 5 ? hudless.tex.Get() : nullptr;
         f.ui = have_ui ? ui_tex.tex.Get() : nullptr;
         f.ui_alpha = have_alpha ? ui_alpha.tex.Get() : nullptr;
         ID3D12Resource* op[kOut] = {outs[0].Get(), outs[1].Get()};
         lb.list->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         const uint32_t n = na::fg::Generate(lb.list.Get(), d.device.Get(), f, op, mult - 1 < kOut ? mult - 1 : kOut);
+        if (hud_mode == 5) /* live T2: the real frame's HUD through its own mask, by the live pass */
+            for (uint32_t i = 0; i < n; ++i)
+                if (!paste.Record(lb.list.Get(), outs[i].Get(), hudless.tex.Get(), color.tex.Get(), W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, i)) { Log("frame %u: HUD paste not recorded", j); return 1; }
         lb.list->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
         lb.list->ResolveQueryData(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, qrb.Get(), 0);
         for (uint32_t i = 0; i < n; ++i) {

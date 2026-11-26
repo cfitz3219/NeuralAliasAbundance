@@ -13,6 +13,8 @@
 
 #include "host_dx12/settings.hpp"
 
+#pragma comment(lib, "version.lib")
+
 #if defined(NA_HAVE_NGX_SDK)
 #pragma warning(push, 3)
 #include <nvsdk_ngx.h>
@@ -86,9 +88,74 @@ struct State {
     std::atomic<uint32_t> active{0}, latched{0};
     std::atomic<uint64_t> evaluates{0}, generated{0}, real_frames{0}, skipped{0};
     std::atomic<float> target_fps{0.f};
+    std::atomic<uint64_t> resets_cut{0}, resets_other{0};
     char reason[112] = "Frame Generation is off.";
+    // Route B: the package's folder for nvngx_dlssg.dll, and what was found / loaded.
+    std::mutex file_m;
+    wchar_t folder[MAX_PATH] = {};
+    RuntimeFile file{};
 };
 State g;
+
+#if defined(NA_HAVE_NGX_SDK)
+// Version of a DLL file as "a.b.c.d"; false when the file has no version record.
+bool file_version(const wchar_t* path, uint32_t* major, uint32_t* minor, char* text, size_t n)
+{
+    DWORD h = 0, size = GetFileVersionInfoSizeW(path, &h);
+    if (!size) return false;
+    std::vector<uint8_t> info(size);
+    VS_FIXEDFILEINFO* v = nullptr;
+    UINT vl = 0;
+    if (!GetFileVersionInfoW(path, 0, size, info.data()) || !VerQueryValueW(info.data(), L"\\", reinterpret_cast<void**>(&v), &vl) || !v)
+        return false;
+    *major = HIWORD(v->dwFileVersionMS);
+    *minor = LOWORD(v->dwFileVersionMS);
+    snprintf(text, n, "%u.%u.%u.%u", HIWORD(v->dwFileVersionMS), LOWORD(v->dwFileVersionMS), HIWORD(v->dwFileVersionLS), LOWORD(v->dwFileVersionLS));
+    return true;
+}
+// The file the package should hold. false + plain-words reason when it is missing or too old.
+bool check_folder_file(char* reason, size_t n)
+{
+    wchar_t folder[MAX_PATH];
+    { std::lock_guard<std::mutex> lock(g.file_m); wcsncpy_s(folder, g.folder, _TRUNCATE); }
+    if (!folder[0]) return true; // not a Route B package: the runtime finds its own file
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%s\\nvngx_dlssg.dll", folder);
+    char path8[MAX_PATH] = {};
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, path8, sizeof path8, nullptr, nullptr);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        snprintf(reason, n, "NVIDIA's Frame Generation file nvngx_dlssg.dll (version %u.%u or newer) is missing from %s.", kNeededMajor, kNeededMinor, path8);
+        return false;
+    }
+    uint32_t major = 0, minor = 0;
+    char ver[32] = "unknown";
+    const bool have = file_version(path, &major, &minor, ver, sizeof ver);
+    {
+        std::lock_guard<std::mutex> lock(g.file_m);
+        if (!g.file.loaded) { strncpy_s(g.file.path, path8, _TRUNCATE); strncpy_s(g.file.version, ver, _TRUNCATE); }
+    }
+    if (!have || major < kNeededMajor || (major == kNeededMajor && minor < kNeededMinor)) {
+        snprintf(reason, n, "nvngx_dlssg.dll in %s is version %s; Frame Generation here needs %u.%u or newer.", path8, ver, kNeededMajor, kNeededMinor);
+        return false;
+    }
+    return true;
+}
+// After the feature was created: which nvngx_dlssg.dll the runtime actually loaded.
+void note_loaded_file()
+{
+    HMODULE m = GetModuleHandleW(L"nvngx_dlssg.dll");
+    if (!m) return;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return;
+    uint32_t major = 0, minor = 0;
+    char ver[32] = "unknown";
+    file_version(path, &major, &minor, ver, sizeof ver);
+    std::lock_guard<std::mutex> lock(g.file_m);
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, g.file.path, sizeof g.file.path, nullptr, nullptr);
+    strncpy_s(g.file.version, ver, _TRUNCATE);
+    g.file.loaded = true;
+}
+#endif
 
 void set_reason(const char* text) { strncpy_s(g.reason, text, _TRUNCATE); }
 void latch(const char* text)
@@ -152,6 +219,41 @@ void release_feature_locked()
 #if defined(NA_HAVE_NGX_SDK)
 NVSDK_NGX_Parameter* P() { return static_cast<NVSDK_NGX_Parameter*>(g.params); }
 
+// NVIDIA's capability record for Frame Generation, in plain words. Caller holds g.m.
+bool capability_locked(char* why, size_t n, unsigned* max_count)
+{
+    if (!check_folder_file(why, n)) return false;
+    if (!g.rt.get_capability_parameters) { snprintf(why, n, "Frame Generation is waiting for the DLSS connection."); return false; }
+    void* cap = nullptr;
+    const int32_t r = reinterpret_cast<PfnAllocParams>(g.rt.get_capability_parameters)(&cap);
+    if (!NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(r)) || !cap) {
+        snprintf(why, n, "NVIDIA's runtime did not answer the Frame Generation question (code 0x%08X).", static_cast<unsigned>(r));
+        return false;
+    }
+    auto* c = static_cast<NVSDK_NGX_Parameter*>(cap);
+    int avail = 0, needs = 0, init = 0;
+    unsigned maj = 0, mnr = 0;
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_Available, &avail);
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver, &needs);
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult, &init);
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMajor, &maj);
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMinor, &mnr);
+    if (max_count) c->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, max_count);
+    if (avail) return true;
+    if (needs) {
+        if (maj) snprintf(why, n, "Frame Generation needs a newer NVIDIA graphics driver (%u.%u or newer).", maj, mnr);
+        else snprintf(why, n, "Frame Generation needs a newer NVIDIA graphics driver.");
+    } else if (static_cast<uint32_t>(init) == static_cast<uint32_t>(NVSDK_NGX_Result_FAIL_FeatureNotSupported) ||
+               static_cast<uint32_t>(init) == static_cast<uint32_t>(NVSDK_NGX_Result_FAIL_PlatformError)) {
+        snprintf(why, n, "This graphics card does not support NVIDIA Frame Generation (it needs a GeForce RTX 40 series or newer).");
+    } else if (static_cast<uint32_t>(init) == static_cast<uint32_t>(NVSDK_NGX_Result_FAIL_FeatureNotFound)) {
+        snprintf(why, n, "NVIDIA's Frame Generation file nvngx_dlssg.dll was not found by the runtime.");
+    } else {
+        snprintf(why, n, "NVIDIA Frame Generation is not available here (NVIDIA code 0x%08X).", static_cast<unsigned>(init));
+    }
+    return false;
+}
+
 bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
 {
     if (g.feature && g.feat_w == f.width && g.feat_h == f.height && g.feat_format == f.format &&
@@ -169,16 +271,10 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
         g.params = p;
     }
     if (g.rt.get_capability_parameters) {
-        void* cap = nullptr;
-        int32_t r = reinterpret_cast<PfnAllocParams>(g.rt.get_capability_parameters)(&cap);
-        int avail = 0;
+        char why[112];
         unsigned mx = 0;
-        if (NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(r)) && cap) {
-            static_cast<NVSDK_NGX_Parameter*>(cap)->Get(NVSDK_NGX_Parameter_FrameGeneration_Available, &avail);
-            static_cast<NVSDK_NGX_Parameter*>(cap)->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &mx);
-        }
-        if (!avail) {
-            latch("Frame Generation runtime not found beside the game (nvngx_dlssg.dll) or not supported here.");
+        if (!capability_locked(why, sizeof why, &mx)) {
+            latch(why);
             return false;
         }
         g.max_supported = mx ? (mx > kHardMaxCount ? kHardMaxCount : mx) : 1;
@@ -214,6 +310,7 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
         return false;
     }
     g.feature = handle;
+    note_loaded_file();
     g.feat_w = f.width;
     g.feat_h = f.height;
     g.feat_rw = g.in_w;
@@ -258,7 +355,8 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     static float zero[16]{};
     static float identity[16]{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
     auto& camera = g.last_in.camera;
-    const bool have_camera = g.last_in.camera_valid;
+    // Route B: the all-zero camera of the proven offline configuration, passed as a camera.
+    const bool have_camera = g.last_in.camera_valid || g.last_in.camera_free;
     p->Set(NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, static_cast<void*>(have_camera ? camera.view_to_clip : zero));
     p->Set(NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, static_cast<void*>(have_camera ? camera.clip_to_view : zero));
     p->Set(NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, static_cast<void*>(identity)); // TLOU provides no lens field
@@ -294,7 +392,9 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     p->Set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, f.hdr ? 1u : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_DepthInverted, g.last_in.depth_inverted ? 1u : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, have_camera ? unsigned(camera.camera_motion) : 1u);
-    p->Set(NVSDK_NGX_DLSSG_Parameter_Reset, (g.need_reset || g.last_in.reset || (have_camera && camera.reset)) ? 1u : 0u);
+    const bool reset = g.need_reset || g.last_in.reset || (have_camera && camera.reset);
+    if (reset && index == 1) (g.last_in.reset_reason == 1 ? g.resets_cut : g.resets_other).fetch_add(1, std::memory_order_relaxed);
+    p->Set(NVSDK_NGX_DLSSG_Parameter_Reset, reset ? 1u : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, have_camera ? unsigned(camera.not_game) : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_OrthoProjection, have_camera ? unsigned(camera.ortho) : 0u);
@@ -568,7 +668,7 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
     }
     // Argon audit #3: DLSS-G needs the real camera. Never feed zero (singular)
     // matrices / zero near-far-FOV; without a validated camera, do not generate.
-    if (!g.last_in.camera_valid) {
+    if (!g.last_in.camera_valid && !g.last_in.camera_free) {
         g.need_reset = 1; g.active.store(0); g.skipped.fetch_add(1);
         set_reason("Frame Generation is paused: the game's camera is not available for this frame.");
         return 0;
@@ -636,6 +736,8 @@ Stats GetStats()
     s.inputs_recorded = g.inputs_recorded.load(); s.inputs_submitted = g.inputs_submitted.load();
     s.inputs_overwritten = g.inputs_overwritten.load(); s.missing_inputs = g.missing_inputs.load();
     s.target_fps = g.target_fps.load();
+    s.resets_cut = g.resets_cut.load();
+    s.resets_other = g.resets_other.load();
     if (g.m.try_lock()) {
         s.max_supported = g.max_supported;
         s.last_count = g.last_count;
@@ -648,6 +750,39 @@ Stats GetStats()
     }
     if (!s.enabled) strncpy_s(s.reason, "Frame Generation is off.", _TRUNCATE);
     return s;
+}
+
+void SetRuntimeFolder(const wchar_t* folder)
+{
+    std::lock_guard<std::mutex> lock(g.file_m);
+    wcsncpy_s(g.folder, folder ? folder : L"", _TRUNCATE);
+    size_t n = wcslen(g.folder);
+    while (n && (g.folder[n - 1] == L'\\' || g.folder[n - 1] == L'/')) g.folder[--n] = 0;
+}
+
+RuntimeFile GetRuntimeFile()
+{
+    std::lock_guard<std::mutex> lock(g.file_m);
+    return g.file;
+}
+
+bool Available(char* reason, size_t reason_size)
+{
+    if (!reason || !reason_size) return false;
+    reason[0] = 0;
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.latched.load(std::memory_order_acquire)) { strncpy_s(reason, reason_size, g.reason, _TRUNCATE); return false; }
+#if defined(NA_HAVE_NGX_SDK)
+    if (!HasRuntime()) {
+        if (!check_folder_file(reason, reason_size)) return false;
+        snprintf(reason, reason_size, "Frame Generation is waiting for DLSS to start (it starts with the first DLAA frame).");
+        return false;
+    }
+    return capability_locked(reason, reason_size, nullptr);
+#else
+    snprintf(reason, reason_size, "This build has no NVIDIA Frame Generation support.");
+    return false;
+#endif
 }
 
 void ResetLatch()

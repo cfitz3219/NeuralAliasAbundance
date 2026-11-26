@@ -24,6 +24,7 @@
 #include <d3d12.h>
 #include <dxgiformat.h>
 
+#include <cstddef>
 #include <cstdint>
 #include "host_dx12/fg/camera.hpp"
 
@@ -57,7 +58,24 @@ struct EvalInputs {
     uint32_t reset = 0;
     uint32_t depth_inverted = 0;
     uint32_t mv_jittered = 0;
+    // Route B (DLSS added by NeuralAlias): no game camera exists. The motion is our own measured
+    // screen motion, so the runtime gets the all-zero camera that was proven offline
+    // (fg_capture_replay "zero", 2026-11-25) instead of being refused for having none.
+    bool camera_free = false;
+    // Why `reset` is set (counted for the results log): 1 our confirmed scene cut, 2 any other
+    // DLSS history restart (resize, mode change, first frame of a pair, resume).
+    uint32_t reset_reason = 0;
 };
+// Route B: where the package keeps NVIDIA's Frame Generation file (read-only; nothing is copied).
+// Used for the plain-words reason when the runtime is missing or too old.
+void SetRuntimeFolder(const wchar_t* folder);
+// What the menu can say before Frame Generation is switched on: false + reason when it cannot run
+// here (file missing or too old, GPU or driver unsupported). Cheap; reads NVIDIA's capability record.
+bool Available(char* reason, size_t reason_size);
+// The nvngx_dlssg.dll that was loaded (after the feature was created) or found (before).
+struct RuntimeFile { char path[260]; char version[32]; bool loaded; };
+RuntimeFile GetRuntimeFile();
+constexpr uint32_t kNeededMajor = 310, kNeededMinor = 9; // driver-store 310.2.1 fails (Backbuffer extent)
 bool WantsInputs(); // enabled, runtime present, not latched
 void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in);
 // Publish recorded inputs only after their actual queue submission. Nested
@@ -123,6 +141,7 @@ struct Stats {
     uint64_t real_frames;       // real frames offered to Generate
     uint64_t skipped;           // real frames with no generation (no fresh inputs, starting, ...)
     uint64_t inputs_recorded, inputs_submitted, inputs_overwritten, missing_inputs;
+    uint64_t resets_cut, resets_other; // runtime resets: our confirmed scene cut / any other history restart
     float target_fps;           // what dynamic mode aims for
     char reason[112];
 };
