@@ -7,8 +7,12 @@
 //  - hudfree/snapshot-before-interface, the interface drawn straight onto the shown picture: right before its first interface draw
 //    (the learned k-th draw into it in the frame), the shown picture is copied into ours.
 // Everything runs on the game's immediate context in order, so no state needs to be proven: D3D11
-// tracks resource states itself. Deferred contexts are not followed (a frame whose interface is
-// drawn through a deferred context is learned as "not separable" and x2 waits with that reason).
+// tracks resource states itself. Deferred contexts are not followed draw by draw: the provider
+// reports each command list the immediate context runs with every colour target its recording
+// wrote (OnExecuteList). A list that writes the shown picture where the copy point would bake it
+// in (between the scene and the first interface draw), writes the sheet before the final draw, or
+// whose writes are not known, makes learning refuse with that plain reason; on a learned frame it
+// makes that frame's picture unusable (real frames only for that frame).
 //
 // The provider (native11/provider.cpp) calls BeforeDraw for every immediate-context draw, BeforeCopy
 // for copies, and OnPresent at the game's Present; nothing runs while the picture is not wanted.
@@ -39,6 +43,10 @@ using IssueDraw = void (*)(ID3D11DeviceContext* c, const draw_replay::DrawArgs& 
 void BeforeDraw(ID3D11DeviceContext* c, const DrawFacts& f, const draw_replay::DrawArgs& a, IssueDraw issue, void* user);
 // A copy into `dst` (identity) of `w` x `h` on the immediate context (learning only).
 void BeforeCopy(uint64_t dst, uint32_t w, uint32_t h);
+// The immediate context runs a command list recorded on a deferred context. `writes`: every colour
+// target (identity) its recording wrote by draws, clears and copies; known=false: not known (the
+// list was recorded before the provider was installed, or wrote too many targets to list).
+void OnExecuteList(const uint64_t* writes, size_t count, bool known);
 // At the game's Present: ends the frame (learning, per-frame counts, relearning).
 void OnPresent(ID3D11DeviceContext* immediate, uint64_t shown, uint32_t shown_w, uint32_t shown_h);
 

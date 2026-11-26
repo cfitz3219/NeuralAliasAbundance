@@ -324,6 +324,7 @@ HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, 
         { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, dev, d, out); }
     }
     if (SUCCEEDED(hr) && out && *out) {
+        na::on12::NoteChainCreated(*out);
         note_swapchain_queue(on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, *out);
         if (d) small_attach(d->OutputWindow, *out);
     }
@@ -349,6 +350,7 @@ HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, H
         { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, dev, w, d, fs, o, out); }
     }
     if (SUCCEEDED(hr) && out && *out) {
+        na::on12::NoteChainCreated(*out);
         note_swapchain_queue(on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, *out);
         small_attach(w, *out);
     }
@@ -3836,6 +3838,7 @@ struct Native11Present {
         t_native11_present = true;
         if (flags & DXGI_PRESENT_TEST) return;
         na::on12::AttachNativePresentation(sc);
+        na::on12::NotePresentedChain(sc); // a chain made before we could take it over: the menu says why x2 cannot run
         na::native_d3d11::SyncCameraUse(); // [j2] camera, live: before this present closes the frame
         na::native11::SetScreenCheck(na::j2::Enabled() && !na::j2::Paused() &&
             na::settings::Get().referee_enabled.load(std::memory_order_relaxed));

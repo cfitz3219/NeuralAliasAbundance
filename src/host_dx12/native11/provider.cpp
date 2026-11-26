@@ -283,6 +283,10 @@ struct Ctx {
     uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
     bool events_truncated = false;
+    // Deferred recording: every colour target it writes (draws, clears, copies), so the HUD-free
+    // picture can tell whether a command list draws into the shown picture (hud_free::OnExecuteList).
+    std::vector<Id> list_writes;
+    bool list_writes_unknown = false;
     ViewUse rt_view, ds_view;
     std::vector<DeferredUpload> cb_bytes; // (event index, bytes) for CbUpdate events
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
@@ -327,6 +331,8 @@ struct Ctx {
 };
 struct ListRecord {
     std::vector<Event> events;
+    std::vector<Id> writes;      // colour targets the recording wrote (draws, clears, copies)
+    bool writes_unknown = false; // too many to list
     std::vector<DeferredUpload> cb_bytes;
     std::vector<DeferredExact> draw_bytes;
     uint64_t order = 0;
@@ -2664,8 +2670,27 @@ void IssueHudFreeDraw(ID3D11DeviceContext* c, const draw_replay::DrawArgs& a, vo
     if (a.indexed) O(c, x).draw_indexed_instanced(c, a.count, inst, a.start, a.base_vertex, a.start_instance);
     else O(c, x).draw_instanced(c, a.count, inst, a.start, a.start_instance);
 }
+// A deferred recording's colour writes (hud_free::OnExecuteList). Cheap: a short list per recording.
+constexpr size_t kMaxListWrites = 256;
+void NoteListWrite(Ctx* x, Id r)
+{
+    if (!x || !x->deferred || !r || x->list_writes_unknown) return;
+    for (Id w : x->list_writes) if (w == r) return;
+    if (x->list_writes.size() >= kMaxListWrites) { x->list_writes_unknown = true; x->list_writes.clear(); return; }
+    x->list_writes.push_back(r);
+}
+void NoteListDrawWrites(ID3D11DeviceContext* c, Ctx* x)
+{
+    if (!x || !x->deferred) return;
+    if (x->rt_count <= 1) { NoteListWrite(x, x->rt0); return; }
+    ID3D11RenderTargetView* v[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, v, nullptr);
+    for (auto* r : v) if (r) { NoteListWrite(x, ResourceOfView(r)); r->Release(); }
+}
+
 void HudFreeBeforeDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs& a)
 {
+    if (x && x->deferred && !t_inside) NoteListDrawWrites(c, x);
     if (!hud_free::Wanted() || !x || x->deferred || t_inside) return;
     hud_free::DrawFacts f;
     f.rt0 = uint64_t(x->rt0);
@@ -2843,6 +2868,7 @@ void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resourc
     std::vector<uint8_t> tmp;
     UpdateCommon(c, x, r, box, src, tmp);
     TrackPlacementColorWrite(c, x, IdOf(r));
+    if (x && x->deferred) NoteListWrite(x, IdOf(r));
     O(c, x).update(c, r, sub, box, src, rp, dp);
     InvalidateDepthWrite(x, r);
 }
@@ -3026,6 +3052,7 @@ void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11Ren
     if (x && (x->raster_depth_layer.resource || g_adaptive_scene.load(std::memory_order_relaxed) ||
               g_lit_peer.load(std::memory_order_relaxed)))
         TrackPlacementColorWrite(c, x, ResourceOfView(view));
+    if (x && x->deferred) NoteListWrite(x, ResourceOfView(view));
     O(c, x).clear_rtv(c, view, color);
 }
 
@@ -3035,6 +3062,7 @@ void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Res
     ReadResource(c, src);
     Ctx* x = Get(c);
     if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
+    if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     auto* source = !ds && !ss && !x0 && !y0 && !z0 && !box ? DepthCopySource(c, x, dst, src) : src;
     O(c, x).copy_region(c, dst, ds, x0, y0, z0, source, ss, box);
     InvalidateDepthWrite(x, dst);
@@ -3045,6 +3073,7 @@ void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* ds
     ReadResource(c, src);
     Ctx* x = Get(c);
     if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
+    if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     O(c, x).copy_resource(c, dst, DepthCopySource(c, x, dst, src));
     InvalidateDepthWrite(x, dst);
     TrackPlacementColorWrite(c, x, IdOf(dst));
@@ -3053,6 +3082,7 @@ void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resour
 {
     ReadResource(c, src);
     Ctx* x = Get(c);
+    if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     O(c, x).resolve(c, dst, ds, src, ss, f);
     InvalidateDepthWrite(x, dst);
     TrackPlacementColorWrite(c, x, IdOf(dst));
@@ -3107,6 +3137,8 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
             rec.order = ++g_list_order;
             rec.incarnation = IncarnationOf(*out);
             rec.complete = !x->events_truncated;
+            rec.writes = std::move(x->list_writes);
+            rec.writes_unknown = x->list_writes_unknown;
             if (g_lists.size() > kMaxLists) {
                 auto oldest = g_lists.begin();
                 for (auto it = g_lists.begin(); it != g_lists.end(); ++it)
@@ -3116,6 +3148,8 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
         }
         x->events.clear();
         x->events_truncated = false;
+        x->list_writes.clear();
+        x->list_writes_unknown = false;
         x->cb_bytes.clear();
         x->draw_bytes.clear();
         // A new recording must map with discard before it may map without overwrite again.
@@ -3131,6 +3165,22 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
 void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11CommandList* list, BOOL restore)
 {
     Ctx* x = Get(c);
+    if (x && list && !t_inside && (x->deferred || hud_free::Wanted())) {
+        // What the list's recording wrote: carried into an enclosing recording, or told to the HUD-free picture.
+        std::vector<Id> writes;
+        bool unknown = true;
+        {
+            std::lock_guard<std::mutex> l(g_mu);
+            auto it = g_lists.find(list);
+            if (it != g_lists.end() && it->second.incarnation == IncarnationOf(list)) { writes = it->second.writes; unknown = it->second.writes_unknown; }
+        }
+        if (x->deferred) {
+            if (unknown) { x->list_writes_unknown = true; x->list_writes.clear(); }
+            else for (Id w : writes) NoteListWrite(x, w);
+        } else {
+            hud_free::OnExecuteList(writes.data(), writes.size(), !unknown);
+        }
+    }
     if (const Id depth = list ? DepthReadsSource(x) : 0) {
         auto& reads = x->depth_reads;
         reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);

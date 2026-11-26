@@ -1869,6 +1869,28 @@ bool ProxyLatency(IDXGISwapChain* chain, unsigned* applied, unsigned long long* 
     return true;
 }
 
+namespace {
+constexpr GUID kChainSeen{0x5b0e7c21, 0x3f4a, 0x4d8e, {0x9a, 0x61, 0x2c, 0x7e, 0x15, 0xd0, 0x48, 0xb3}};
+}
+void NoteChainCreated(IDXGISwapChain* chain)
+{
+    // Tests: a chain made while the proxy is switched off for tests stands for one made before NeuralAlias.
+    if (!chain || !g_native_proxy.load(std::memory_order_acquire) || g_native_proxy_test_off.load()) return;
+    const uint32_t seen = 1;
+    chain->SetPrivateData(kChainSeen, sizeof seen, &seen);
+}
+void NotePresentedChain(IDXGISwapChain* chain)
+{
+    if (!chain || !g_native_proxy.load(std::memory_order_acquire) || g_native_proxy_test_off.load()) return;
+    if (na::host::IsInternalGraphicsCall() || na::native11::IsOwnWork() || NativeProxy(chain)) return;
+    uint32_t seen = 0;
+    UINT bytes = sizeof seen;
+    if (SUCCEEDED(chain->GetPrivateData(kChainSeen, &bytes, &seen))) return; // made through our hook: its creation-time reason stands
+    seen = 2; // said once per chain
+    chain->SetPrivateData(kChainSeen, sizeof seen, &seen);
+    proxy_note("x2 cannot run: the game's DX11 swap chain was made before NeuralAlias could take it over (or in a way it does not), so the game presents it itself", true);
+}
+
 void ProxyReason(char* out, size_t n, unsigned long long* refused)
 {
     std::lock_guard<std::mutex> lk(g_m);

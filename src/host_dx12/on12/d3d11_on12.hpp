@@ -157,6 +157,12 @@ bool ProxyEncoding(IDXGISwapChain* chain, DXGI_FORMAT* game_format, DXGI_FORMAT*
 bool ProxyLatency(IDXGISwapChain* chain, unsigned* applied, unsigned long long* waits);
 // The proxy's last decision in plain words (for the Frame Generation menu row) and chains refused so far.
 void ProxyReason(char* out, size_t n, unsigned long long* refused);
+// Chain creation through the hooked DXGI factory (every chain, proxied or not): marks the chain as
+// seen when it was made. A native DX11 chain presented without that mark and without a proxy was
+// made before NeuralAlias could take it over (or in a way it does not take over): NotePresentedChain
+// (at its first present) makes that the proxy's refusal reason, so the menu says why x2 cannot run.
+void NoteChainCreated(IDXGISwapChain* chain);
+void NotePresentedChain(IDXGISwapChain* chain);
 // Tests: called on the presenting thread right after the copy into `target` (PRESENT state) was
 // submitted on `queue`, before DXGI's Present. `SetNativeProxyForTests(false)` makes the next chains
 // the game's own (to compare against).

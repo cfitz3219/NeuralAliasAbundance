@@ -530,7 +530,15 @@ if(TARGET host_native11)
     # Stage 3: live x2 on a DX11 game with the real nvngx_dlssg (NA_FG_SEARCH names its folder; skipped without it).
     add_test(NAME host_native11_fg_x2_test COMMAND native11_dlaa_test --fg-x2)
     add_test(NAME host_native11_fg_x2_fp16_test COMMAND native11_dlaa_test --fg-x2-fp16)
-    set_tests_properties(host_native11_fg_x2_test host_native11_fg_x2_fp16_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    # The same in the automatic-API mode (graphics API found at the first present, proxy from chain creation),
+    # an interface drawn through deferred contexts (x2 waits with the plain reason), and a chain made before the takeover.
+    add_test(NAME host_native11_fg_x2_auto_test COMMAND native11_dlaa_test --fg-x2-auto)
+    add_test(NAME host_native11_fg_x2_auto_deferred_hud_test COMMAND native11_dlaa_test --fg-x2-auto-deferred-hud)
+    add_test(NAME host_native11_fg_x2_auto_deferred_hud_mixed_test COMMAND native11_dlaa_test --fg-x2-auto-deferred-hud-mixed)
+    add_test(NAME host_native11_fg_x2_auto_late_chain_test COMMAND native11_dlaa_test --fg-x2-auto-late-chain)
+    set_tests_properties(host_native11_fg_x2_test host_native11_fg_x2_fp16_test host_native11_fg_x2_auto_test
+      host_native11_fg_x2_auto_deferred_hud_test host_native11_fg_x2_auto_deferred_hud_mixed_test host_native11_fg_x2_auto_late_chain_test
+      PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     set_tests_properties(host_native11_dlaa_camera_off_start_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_test(NAME host_native11_dlaa_adaptive_screen_test COMMAND native11_dlaa_test --adaptive-screen)
     add_test(NAME host_native11_dlaa_rotating_lighting_test COMMAND native11_dlaa_test --lit-role)

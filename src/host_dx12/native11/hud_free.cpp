@@ -22,6 +22,7 @@ namespace {
 struct Out { uint64_t id; uint32_t w, h; };
 struct Op {
     bool compute = false, transfer = false, blend = false, depth = false;
+    bool listed = false, unknown = false; // a deferred command list run here (out = what it wrote; unknown: not known)
     std::vector<Out> out;
     uint64_t list = 0, recording = 0;
 };
@@ -52,6 +53,8 @@ struct State {
     // Per frame
     uint32_t shown_draws = 0;
     bool pre_taken = false, taken = false, fresh = false;
+    bool list_hit = false;             // a deferred list wrote the shown picture (or sheet) where the copy would bake it in
+    uint64_t shown_id = 0;             // the shown picture (identity), from the last Present
     uint32_t frames_without = 0;
     // GPU objects (immediate context's device)
     ComPtr<ID3D11Texture2D> picture, pre, save;
@@ -337,6 +340,76 @@ void BeforeCopy(uint64_t dst, uint32_t w, uint32_t h)
     g.ops.push_back(std::move(op));
 }
 
+void OnExecuteList(const uint64_t* writes, size_t count, bool known)
+{
+    if (!Wanted()) return;
+    std::lock_guard<std::mutex> lock(g.m);
+    auto hits = [&](uint64_t id) {
+        if (!known) return true;
+        for (size_t i = 0; i < count; ++i) if (writes[i] == id) return true;
+        return false;
+    };
+    if (g.recording) {
+        Op op;
+        op.listed = true;
+        op.unknown = !known;
+        op.recording = g.frame;
+        for (size_t i = 0; i < count; ++i) op.out.push_back({writes[i], 0, 0});
+        g.ops.push_back(std::move(op));
+    }
+    if (!g.learned || g.taken) return; // after the copy, anything drawn counts as interface (the paste rule keeps it)
+    if (g.variant == na::fglive::HudVariant::Snapshot) {
+        if (g.shown_draws >= g.snap_k && g.shown_id && hits(g.shown_id)) g.list_hit = true; // after the scene, before the copy point
+    } else if (g.variant == na::fglive::HudVariant::SheetRedraw) {
+        if (g.sheet && hits(g.sheet)) g.list_hit = true;
+    }
+}
+
+namespace {
+constexpr const char* kDeferredVerdict =
+    "The shown picture is also drawn from deferred command lists (multithreaded DX11), which the HUD-free methods cannot follow: real frames only";
+
+// Learning with the deferred command lists of the recorded frame: the variant from the immediate
+// context's own ops, then refused when a list writes where the copy would bake it in. Caller holds g.m.
+na::fglive::HudVariant learn(uint64_t shown, uint32_t shown_w, uint32_t shown_h, na::fglive::Sheet* sheet, na::fglive::Snapshot* snap, bool* deferred)
+{
+    std::vector<Op> plain;
+    std::vector<size_t> at;
+    plain.reserve(g.ops.size());
+    for (size_t i = 0; i < g.ops.size(); ++i)
+        if (!g.ops[i].listed) { plain.push_back(g.ops[i]); at.push_back(i); }
+    auto list_writes = [&](size_t from, size_t to, uint64_t id) { // a list in g.ops[from, to) writes `id` (or its writes are unknown)
+        for (size_t i = from; i < to && i < g.ops.size(); ++i) {
+            const Op& o = g.ops[i];
+            if (!o.listed) continue;
+            if (o.unknown) return true;
+            for (const auto& w : o.out) if (w.id == id) return true;
+        }
+        return false;
+    };
+    auto v = na::fglive::ChooseHudVariant(plain, shown, shown_w, shown_h, sheet, snap);
+    *deferred = false;
+    if (v == na::fglive::HudVariant::SheetRedraw) {
+        *deferred = list_writes(0, at[sheet->final_op], sheet->sheet);
+    } else if (v == na::fglive::HudVariant::Snapshot) {
+        size_t scene = snap->first_hud_op; // the scene's write: the last write to the shown picture before the interface
+        while (scene-- > 0) {
+            bool hit = false;
+            for (const auto& o : plain[scene].out) if (o.id == shown) hit = true;
+            if (hit) break;
+        }
+        const size_t from = scene < plain.size() ? at[scene] + 1 : 0;
+        *deferred = list_writes(from, at[snap->first_hud_op], shown);
+    } else {
+        *deferred = list_writes(0, g.ops.size(), shown);
+    }
+    if (*deferred)
+        na::eventlog::Emit("hud_free11", "deferred command lists write the shown picture or its sheet where the copy would keep them; from the immediate "
+                           "context's draws alone the frame would have been learned as: %s", na::fglive::HudVariantName(v));
+    return *deferred ? na::fglive::HudVariant::None : v;
+}
+} // namespace
+
 void OnPresent(ID3D11DeviceContext* immediate, uint64_t shown, uint32_t shown_w, uint32_t shown_h)
 {
     if (g.capturing.load(std::memory_order_acquire) && immediate) {
@@ -356,18 +429,23 @@ void OnPresent(ID3D11DeviceContext* immediate, uint64_t shown, uint32_t shown_w,
     if (!Wanted()) {
         std::lock_guard<std::mutex> lock(g.m);
         g.fresh = false; g.recording = false; g.ops.clear();
-        g.shown_draws = 0; g.taken = g.pre_taken = false;
+        g.shown_draws = 0; g.taken = g.pre_taken = g.list_hit = false;
         return;
     }
     std::lock_guard<std::mutex> lock(g.m);
     ++g.frame;
+    g.shown_id = shown;
     if (g.recording) { // the recorded frame ends here: learn it
         g.recording = false;
         ++g.learn_attempts;
         na::fglive::Sheet sheet;
         na::fglive::Snapshot snap;
-        g.variant = na::fglive::ChooseHudVariant(g.ops, shown, shown_w, shown_h, &sheet, &snap);
-        if (g.variant == na::fglive::HudVariant::SheetRedraw) {
+        bool deferred = false;
+        g.variant = learn(shown, shown_w, shown_h, &sheet, &snap, &deferred);
+        if (deferred) {
+            snprintf(g.verdict, sizeof g.verdict, "%s", kDeferredVerdict);
+            g.learn_after = g.frame + 600;
+        } else if (g.variant == na::fglive::HudVariant::SheetRedraw) {
             g.sheet = sheet.sheet;
             g.final_k = 0;
             for (size_t i = 0; i < sheet.final_op; ++i)
@@ -388,11 +466,12 @@ void OnPresent(ID3D11DeviceContext* immediate, uint64_t shown, uint32_t shown_w,
         g.ops.clear();
         g.frames_without = 0;
     } else if (g.learned) { // a learned frame: was the picture taken?
-        g.fresh = g.taken;
-        if (g.taken) { ++g.pictures; g.frames_without = 0; }
+        g.fresh = g.taken && !g.list_hit;
+        if (g.fresh) { ++g.pictures; g.frames_without = 0; }
         else {
-            skip(g.variant == na::fglive::HudVariant::SheetRedraw ? "no HUD sheet or final draw was seen this frame (menu, loading or cutscene)"
-                                                                 : "the interface's first draw on the shown picture was not seen this frame");
+            skip(g.list_hit ? "a deferred command list drew into the shown picture (or the HUD sheet) before the copy point this frame"
+                 : g.variant == na::fglive::HudVariant::SheetRedraw ? "no HUD sheet or final draw was seen this frame (menu, loading or cutscene)"
+                                                                     : "the interface's first draw on the shown picture was not seen this frame");
             if (++g.frames_without >= 120) {
                 ++g.relearns;
                 g.learned = 0;
@@ -405,7 +484,7 @@ void OnPresent(ID3D11DeviceContext* immediate, uint64_t shown, uint32_t shown_w,
         }
     }
     g.shown_draws = 0;
-    g.taken = g.pre_taken = false;
+    g.taken = g.pre_taken = g.list_hit = false;
     if (!g.learned && g.frame >= g.learn_after) { g.recording = true; g.ops.clear(); }
 }
 
@@ -468,7 +547,7 @@ void Reset()
     std::lock_guard<std::mutex> lock(g.m);
     g.recording = false; g.ops.clear(); g.learned = 0; g.variant = na::fglive::HudVariant::None;
     g.picture.Reset(); g.pre.Reset(); g.save.Reset(); g.picture_rtv.Reset(); g.sheet_res.Reset(); g.shared_picture.reset();
-    g.fresh = g.taken = g.pre_taken = false; g.shown_draws = 0; g.learn_after = g.frame;
+    g.fresh = g.taken = g.pre_taken = g.list_hit = false; g.shown_draws = 0; g.learn_after = g.frame;
 }
 
 } // namespace na::native11::hud_free

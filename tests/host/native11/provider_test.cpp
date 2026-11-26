@@ -202,6 +202,10 @@ struct Game {
     bool shader_depth = false;
     DXGI_FORMAT back_format = DXGI_FORMAT_R8G8B8A8_UNORM; // the swap chain's format
     ComPtr<ID3D11RasterizerState> hud_scissor;            // set: the HUD covers only kHudRect
+    // The interface recorded on a deferred context and run by the immediate one (multithreaded DX11):
+    // 1 = the whole interface, 2 = part of it, between the scene and the immediate interface draws.
+    int deferred_hud = 0;
+    ComPtr<ID3D11DeviceContext> hud_dc;
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
     uint32_t camera_ring_offset = 24576;
@@ -535,6 +539,24 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
     c->PSSetShaderResources(0, 1, &none);
     // HUD.
     const float bf[4] = {};
+    if (g.deferred_hud && g.hud_dc && immediate) {
+        ID3D11DeviceContext* d = g.hud_dc.Get();
+        d->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        d->VSSetShader(g.vs_post.Get(), nullptr, 0);
+        d->OMSetRenderTargets(1, &bb, nullptr);
+        d->OMSetBlendState(g.blend.Get(), bf, 0xffffffffu);
+        d->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+        Viewport(d, g.w, g.h);
+        if (g.hud_scissor) {
+            d->RSSetState(g.hud_scissor.Get());
+            const D3D11_RECT r{kHudRect[0], kHudRect[1], kHudRect[2], kHudRect[3]};
+            d->RSSetScissorRects(1, &r);
+        }
+        for (int i = 0; i < 3; ++i) d->Draw(4, 0);
+        ComPtr<ID3D11CommandList> list;
+        if (SUCCEEDED(d->FinishCommandList(FALSE, &list))) c->ExecuteCommandList(list.Get(), TRUE);
+        if (g.deferred_hud == 1) return;
+    }
     c->OMSetBlendState(g.blend.Get(), bf, 0xffffffffu);
     c->PSSetShader(g.ps_hud.Get(), nullptr, 0);
     if (g.hud_scissor) { // a HUD panel, not the whole screen (live x2 fixture)
@@ -1932,7 +1954,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool adaptive = missed_order || (argc > 1 && (std::strcmp(argv[1], "--adaptive-screen") == 0 ||
                                                        std::strcmp(argv[1], "--adaptive-screen-warp") == 0));
 #if defined(NA_TEST_NATIVE_DLAA)
-    const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
+    // Live x2 in the automatic-API mode (the graphics API found at the first present, the DX11 proxy from
+    // chain creation): 1 = interface on the shown picture; 2 = the interface from a deferred context only;
+    // 3 = part of it from a deferred context between the scene and the immediate interface draws;
+    // 4 = a chain made before NeuralAlias could take it over.
+    const char* arg1 = argc > 1 ? argv[1] : "";
+    const int fg_auto = !std::strcmp(arg1, "--fg-x2-auto") ? 1 : !std::strcmp(arg1, "--fg-x2-auto-deferred-hud") ? 2 :
+                        !std::strcmp(arg1, "--fg-x2-auto-deferred-hud-mixed") ? 3 : !std::strcmp(arg1, "--fg-x2-auto-late-chain") ? 4 : 0;
+    const bool automatic = fg_auto != 0 || (argc > 1 && std::strcmp(argv[1], "--automatic") == 0);
     const bool padded_hdr = argc > 1 && std::strcmp(argv[1], "--lit-role-padded") == 0;
     const bool disagreeing_scene = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-disagreeing-scene") == 0;
     const bool trial_reused_depth = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-reused-depth") == 0;
@@ -1946,7 +1975,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     // One presenter for both APIs, stage 3: live x2 on a DX11 game (proxy chain, native DLAA inputs,
     // HUD-free picture, presenter), 8-bit SDR or FP16 back buffer.
     const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
-    const bool fg_x2 = fg_x2_hdr || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
+    const bool fg_x2 = fg_x2_hdr || fg_auto != 0 || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
+    const bool proxy_env_off = GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) != 0;
     wchar_t fg_folder[MAX_PATH]{};
     if (fg_x2 && !GetEnvironmentVariableW(L"NA_FG_SEARCH", fg_folder, MAX_PATH)) {
         std::printf("SKIP: NA_FG_SEARCH (the folder with nvngx_dlssg.dll) is not set\n");
@@ -1970,11 +2000,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         return WritePrivateProfileStringW(section, key, value, ini.c_str()) != FALSE;
     };
     if (!set(L"host", L"enabled", L"1") || !set(L"host", L"status_log", status_path.c_str()) ||
-        !set(L"dx11on12", L"enabled", automatic ? L"1" : L"0") ||
+        !set(L"dx11on12", L"enabled", (automatic && !fg_auto) ? L"1" : L"0") ||
         !set(L"native11", L"enabled", automatic ? L"0" : L"1") ||
         !set(L"host", L"graphics_api", automatic ? L"auto" : L"") ||
         !set(L"overlay", L"enabled", L"1") || !set(L"adapter", L"enabled", L"0") ||
-        !set(L"observe", L"producers", automatic ? L"1" : L"0") ||
+        !set(L"observe", L"producers", (automatic && !fg_auto) ? L"1" : L"0") ||
         !set(L"observe", L"early_install", L"0") ||
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
@@ -2008,6 +2038,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool depth_debug = argc > 1 && std::strcmp(argv[1], "--depth-reads-debug") == 0;
     const bool depth_reads = depth_warp || depth_debug || (argc > 1 && std::strcmp(argv[1], "--depth-reads") == 0);
     g.shader_depth = depth_reads;
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (fg_auto == 4) na::on12::SetNativeProxyForTests(false); // the chain is made as if NeuralAlias had not seen it
+#endif
     if (screen_warp || depth_warp || depth_debug || !MakeGame(g, false)) {
         g = Game{};
         if (centered_scene) g.screen_extra_width = 88;
@@ -2047,6 +2080,18 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     }
     ComPtr<ID3D11On12Device> translated;
     expect(FAILED(g.device.As(&translated)), "game device is native DX11");
+    if (fg_auto == 4) na::on12::SetNativeProxyForTests(true);
+    if (fg_auto && !proxy_env_off) {
+        // Order of events: the chain is made through the hooked DXGI factory, so the proxy exists from its
+        // creation; the graphics API is chosen, and the DX11 hooks installed, only at the first present.
+        static char before[8192]{};
+        na::on12::FormatStatus(before, sizeof before);
+        expect(!na::on12::NativeRoute() && std::strstr(before, "native11_route=active") == nullptr,
+               "automatic mode: no graphics API chosen and no DX11 hooks before the first present");
+        expect(na::on12::NativeProxy(g.swap.Get()) == (fg_auto != 4),
+               fg_auto == 4 ? "a chain made before the takeover stays the game's own"
+                            : "the chain is presented through our D3D12 queue from its creation, before the first present");
+    }
     if (automatic) {
         expect(na::on12::SwapchainApi(g.swap.Get()) == na::on12::GraphicsApi::Dx11,
                "automatic selection identifies the swap chain's native DX11 device");
@@ -2111,7 +2156,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     if (fg_x2) {
         // The game's chain is a DX11 proxy served by the presenter (live Frame Generation package).
-        expect(na::on12::NativeProxyOn() && na::on12::NativeProxy(g.swap.Get()), "the game's DX11 chain is presented through our D3D12 queue");
+        if (fg_auto != 4 && !proxy_env_off)
+            expect(na::on12::NativeProxyOn() && na::on12::NativeProxy(g.swap.Get()), "the game's DX11 chain is presented through our D3D12 queue");
         D3D11_RASTERIZER_DESC rd{};
         rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
         expect(SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.hud_scissor)), "HUD panel state");
@@ -2144,6 +2190,38 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             DeleteFileW(ini.c_str());
             std::fflush(stdout);
             ExitProcess(0);
+        }
+        if (fg_auto >= 2) {
+            // x2 is on but cannot run with this frame: it must wait with a plain reason, present the game's
+            // own frames unchanged, and never stall or remove the device.
+            if (fg_auto == 2 || fg_auto == 3) {
+                g.deferred_hud = fg_auto == 2 ? 1 : 2;
+                expect(SUCCEEDED(g.device->CreateDeferredContext(0, &g.hud_dc)), "a deferred context for the interface");
+            }
+            for (int frame = 0; frame < 240; ++frame) { Pump(); Scene(g.ctx.Get(), g, frame); Post(g.ctx.Get(), g, true); g.swap->Present(0, 0); }
+            const auto pr = na::present::GetStats();
+            const auto fs = na::fg::GetStats();
+            const auto hud = na::j2::GetLiveHudStatsAnyApi();
+            char reason[160] = {};
+            unsigned long long refused = 0;
+            na::on12::ProxyReason(reason, sizeof reason, &refused);
+            std::printf("x2 on, cannot run (%s): shown %.1f from %.1f real, generated shown %llu, fg \"%s\"\n  HUD learned=%u verdict: %s\n  last skip: %s\n  proxy: refused=%llu \"%s\"\n",
+                        fg_auto == 2 ? "interface from a deferred context" : fg_auto == 3 ? "part of the interface from a deferred context" : "chain made before the takeover",
+                        pr.shown_fps, pr.base_fps, static_cast<unsigned long long>(pr.generated_shown), fs.reason, hud.learned, hud.verdict, hud.last_skip, refused, reason);
+            expect(pr.generated_shown == 0, "no generated picture is shown");
+            if (fg_auto == 4) {
+                expect(!na::on12::NativeProxy(g.swap.Get()) && refused >= 1 && std::strstr(reason, "made before NeuralAlias could take it over") != nullptr,
+                       "the menu row's reason says the chain was made before the takeover");
+            } else {
+                expect(!hud.learned && std::strstr(hud.verdict, "deferred command lists") != nullptr,
+                       "the HUD verdict names the deferred command lists, in plain words");
+                expect(hud.learn_attempts >= 1, "the frame was looked at");
+            }
+            expect(pr.device_hr == S_OK, "no device removal");
+            DeleteFileW(ini.c_str());
+            std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: x2 waits with the plain reason\n", g_failed);
+            std::fflush(stdout);
+            ExitProcess(g_failed ? 1u : 0u);
         }
         bool asked = false;
         static std::atomic<ULONGLONG> last_frame_at{GetTickCount64()};
