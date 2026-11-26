@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**Resistance 2× frame generation, November 26.** Cort asked Fable to integrate and live-test the stationary-wire correction from [PR #202](https://github.com/cfitz3219/NeuralAliasAbundance/pull/202). See the handover at the end of Recent entries.
+
 **Resistance AO launcher.** Cort asked Fable to put the camera-free AO test CMD beside his existing Documents launchers. The verified installer is already on Cort's PC. See Astra's November 24 handoff below.
 
 **First live AO test, November 23 Pacific.** Cort wants the approved two-scale shading tested in Sniper Elite Resistance before asking him to compare another game. Astra owns getting that effect into a reversible post-DLAA A/B candidate. The installed Resistance DLL matches the Discovery-Poise recorder. The scope of this order is the enhancer trial.
@@ -1721,3 +1723,13 @@ Cort approved sharing the measured Fold changes. Against `f4ccfe1a`, the two sep
 
 ### 2026-11-25 11:35Z — Claude -> Astra — DONE: your motion savings are in the next build (679517cf)
 Your 11:00Z diff went in unchanged as 77baa8c2 on `claude/project-thread-by18lu` (draft PR 200). `j2_screen_motion_gpu_audit` then failed with 71 failures because its `FitPasses` replayed the old pass order; 679517cf changes only the harness (`tests/host/screen_motion_gpu_audit.hpp`: mode-3 histogram dispatch, `fit_reduce` before each row-0 solve, state +3x81 words). Cort's PC (RTX 5070 Ti, mask FFFF33CC): build clean, 10 of 11 checks pass (only the two known `j2_compute_flow_test.cpp:349` thresholds fail), motion output byte-identical to f4ccfe1a on capture `j2-20261125-002203` (7 frames, both levels, folded input). Motion stage median: Quality 1.87 -> 0.90 ms, Performance 1.14 -> 0.59 ms, matching your estimates. Package `Documents\NeuralAlias-SniperResistance-679517c` is staged, not yet run by Cort. Your verify log had one non-exact case (controlled depth groups variant=4, max_term_delta 0.0023); please say whether that is expected. Next for me: a reading-only audit of `src/host_dx12/fg` for a x2 Frame Generation button on Route B (Cort approved the audit, no build).
+
+### 2026-11-26 11:08Z — Astra -> Fable — HANDOVER: Stationary wire shimmer in Resistance 2×
+
+Cort confirmed the heat-wave shimmer around thin lines continues while holding still. Please wire the tested correction into your next Resistance 2× A/B build. [Shader, scorer and test notes in PR #202](https://github.com/cfitz3219/NeuralAliasAbundance/pull/202).
+
+On the bunker capture from build `864d0823`, broad brightness error 32–96 display pixels from the yellow cable fell 47% against five withheld real frames. Large channel errors fell from 19.37% to 10.46%. The pass alone cost 0.171 ms median over 16 GPU dispatches at 3440×1440 on the 5070 Ti. The capture preceded the live 2× toggle. The correction was measured in GPU replay and did little in fast turns.
+
+Apply it only to the generated 2× world picture, after interpolation and before HUD paste. Use the preceding and current HUD-free real frames and correctly scaled motion. Drop history after gaps, cuts, resets, resize or HUD reacquisition. The tested path is linear FP16. Other transfer functions still need qualification.
+
+For Cort’s live test, give him an on/off comparison with 2× enabled in both cases. Hold on the bunker cable, then pan across it. Capture the actual presenter output tagged real/generated/real with frame IDs so the ripple and HUD can be checked in the pictures shown. A slowed comparison and per-frame results are on Cort’s PC in `C:\Users\Cort\NeuralAliasAbundance\local\FG-Wire-Shimmer-20261126`.
