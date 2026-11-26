@@ -223,6 +223,11 @@ void SetIniPath(const wchar_t* path);
 void ConfigureReferee(bool added_dlaa, bool gpu_checks);
 // Where user changes are saved: %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini
 const wchar_t* UserIniPath();
+// Route B live Frame Generation: remember the Off / x2 choice for THIS game (the executable name)
+// under [fg_games] in the user ini, instead of the shared [fg] keys other games use. Applies the
+// saved choice now (Fixed mode, count from the saved multiplier; safe start keeps it off).
+void BindFrameGenerationToGame(const wchar_t* game);
+const wchar_t* FrameGenerationGameKey(); // empty when not bound
 void Load();  // defaults ini, then user ini overrides when present
 // Event log: emits one "setting" event per changed persisted field since the last call.
 void WatchChanges(const char* source = nullptr);

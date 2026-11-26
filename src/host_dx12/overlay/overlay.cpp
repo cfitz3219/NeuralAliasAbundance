@@ -959,6 +959,43 @@ void write_status_line()
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(f, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)-1))), &written, nullptr);
+    if (na::present::LiveFrameGeneration()) {
+        // Route B live Frame Generation: one line per status interval, every figure the RESULTS
+        // section reads. Milliseconds are GPU time per real frame, last/average.
+        const auto lv = na::present::GetLiveStats();
+        const auto hud = na::j2::GetLiveHudStats();
+        const auto file = na::fg::GetRuntimeFile();
+        const float hud_last = hud.grab_ms + hud.redraw_ms + lv.hudcopy_ms + lv.paste_ms;
+        const float hud_avg = hud.grab_avg + hud.redraw_avg + lv.hudcopy_avg + lv.paste_avg;
+        char why[160] = {};
+        const bool can = na::fg::Available(why, sizeof why);
+        char fl[2048];
+        const int fn = snprintf(fl, sizeof fl,
+            "fglive on=%u choice=%s can_run=%u active=%u real_fps=%.1f shown_fps=%.1f generated_shown=%llu real_frames=%llu inline_frames=%llu presenter_frames=%llu "
+            "skipped{no_hudfree=%llu menu=%llu preparing=%llu runtime_veto=%llu runtime=%llu gen_dropped=%llu late=%llu} resets{cut=%llu other=%llu} "
+            "hud{learned=%u method=\"%s\" grabs=%llu redraws=%llu skipped=%llu blended=%llu last_skip=\"%s\" verdict=\"%s\"} "
+            "ms{off=%.3f/%.3f fg_eval=%.3f/%.3f hud=%.3f/%.3f grab=%.3f redraw=%.3f hudcopy=%.3f paste=%.3f presenter=%.3f/%.3f total=%.3f/%.3f} "
+            "vram_mb{budget=%llu usage=%llu extra=%llu} dlssg{path=\"%s\" version=%s loaded=%u} prepare=\"%s\" reason=\"%s\" why_not=\"%s\"\r\n",
+            fg.enabled, fg.enabled ? "x2" : "Off", can ? 1u : 0u, fg.active, pr.base_fps, pr.shown_fps,
+            static_cast<unsigned long long>(pr.generated_shown), static_cast<unsigned long long>(fg.real_frames),
+            static_cast<unsigned long long>(lv.frames_inline), static_cast<unsigned long long>(lv.frames_worker),
+            static_cast<unsigned long long>(lv.skipped_no_hudfree), static_cast<unsigned long long>(lv.skipped_menu),
+            static_cast<unsigned long long>(lv.skipped_preparing), static_cast<unsigned long long>(lv.skipped_veto),
+            static_cast<unsigned long long>(fg.skipped), static_cast<unsigned long long>(pr.generated_dropped), static_cast<unsigned long long>(pr.late),
+            static_cast<unsigned long long>(fg.resets_cut), static_cast<unsigned long long>(fg.resets_other),
+            hud.learned, hud.method, static_cast<unsigned long long>(hud.grabs), static_cast<unsigned long long>(hud.redraws),
+            static_cast<unsigned long long>(hud.skipped), static_cast<unsigned long long>(hud.blended_backgrounds), hud.last_skip, hud.verdict,
+            lv.off_ms, lv.off_avg, lv.eval_ms, lv.eval_avg, hud_last, hud_avg, hud.grab_avg, hud.redraw_avg, lv.hudcopy_avg, lv.paste_avg,
+            lv.copy_ms, lv.copy_avg, lv.eval_ms + hud_last + lv.copy_ms, lv.eval_avg + hud_avg + lv.copy_avg,
+            static_cast<unsigned long long>(lv.vram_budget_mb), static_cast<unsigned long long>(lv.vram_usage_mb), static_cast<unsigned long long>(lv.extra_mb),
+            file.path, file.version[0] ? file.version : "none", file.loaded ? 1u : 0u, lv.prepare, fg.reason, can ? "" : why);
+        if (fn > 0) WriteFile(f, fl, DWORD((std::min)(fn, int(sizeof fl) - 1)), &written, nullptr);
+        static char last_why[160] = {};
+        if (std::strcmp(last_why, why)) { // the log says WHY when it cannot run, once per change
+            strncpy_s(last_why, why, _TRUNCATE);
+            na::eventlog::Emit("fg_live", "%s", can ? "Frame Generation can run here." : why);
+        }
+    }
     char mode_line[1536]{};
     const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}

@@ -509,6 +509,29 @@ void StartSmearTest();
 bool SmearTestRunning();
 void SmearTestStatus(char* text, size_t capacity);
 
+// Route B live Frame Generation (2026-11-26). While it is on: DLSS's depth and motion of every
+// evaluated frame go to Frame Generation (zero camera, reset on our confirmed scene cut); the
+// game's HUD sheet is learned by its shape from one traced frame; each frame the sheet is copied
+// at its first HUD draw, and at the game's final draw into the shown picture the sheet's contents
+// are swapped for that copy, the same draw is run once more into our own target (the HUD-free
+// picture), and the sheet is restored before the game's own draw. No descriptor or heap of the
+// game is written.
+void SetLiveFrameGeneration(bool on);
+// The presenter asks once per frame: this frame's HUD-free picture (RENDER_TARGET at rest), or
+// null and why in plain words.
+ID3D12Resource* LiveHudFree(const char** why);
+struct LiveHudStats {
+    uint32_t learned = 0;          // the sheet and the final draw are known
+    uint64_t sheet = 0, learn_attempts = 0;
+    uint32_t run = 0;
+    uint64_t grabs = 0, redraws = 0, skipped = 0, blended_backgrounds = 0;
+    char verdict[160] = "";        // what learning found (plain words)
+    char last_skip[112] = "";      // why the last redraw did not happen
+    char method[96] = "";          // the HUD method in use (for the results log)
+    float grab_ms = 0, grab_avg = 0, redraw_ms = 0, redraw_avg = 0; // GPU time in the game's lists
+};
+LiveHudStats GetLiveHudStats();
+
 // Releases GPU objects (test hosts; the caller guarantees GPU idle).
 void Shutdown();
 

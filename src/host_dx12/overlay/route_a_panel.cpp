@@ -38,6 +38,8 @@
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
+#include "core/live_frame_gen.hpp"
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -1421,8 +1423,59 @@ static void DrawExperimentalGpu();
 static void DrawDonutLighting();
 static void DrawAmbientOcclusion();
 
+// Route B live Frame Generation (2026-11-26): one control, Off / x2, live with no restart and
+// remembered for this game. When it cannot run, the row says why in plain words.
+static void DrawLiveFrameGeneration()
+{
+    using namespace na::ui;
+    na::settings::Settings& st = na::settings::Get();
+    char why[160] = {};
+    const bool can = na::fg::Available(why, sizeof why);
+    const bool on = st.fg_enabled.load() != 0;
+    const uint32_t generated = on ? (st.fg_multiplier.load() > 1 ? st.fg_multiplier.load() - 1 : 1) : 0;
+    int choice = static_cast<int>(generated > na::fglive::kMaxGeneratedThisBuild ? na::fglive::kMaxGeneratedThisBuild : generated);
+    static const char* kItems[] = {na::fglive::ChoiceLabel(0), na::fglive::ChoiceLabel(1)};
+    BeginRow("Frame Generation",
+             "Shows one extra picture between each pair of rendered frames (x2), made by NVIDIA's Frame Generation from NeuralAlias's own depth and motion. "
+             "Works with DLAA, Quality and Performance and switches at once, no restart. The HUD stays exact: generated pictures carry the newer real frame's HUD. "
+             "The delay between your input and the picture grows a little.",
+             DropdownWidth());
+    // Switching OFF is always allowed; switching on only when NVIDIA's runtime says it can run here
+    // (before DLSS has started it cannot know yet, so the choice is accepted and applied then).
+    const bool waiting = !can && std::strstr(why, "waiting for DLSS") != nullptr;
+    ImGui::BeginDisabled(!can && !on && !waiting);
+    if (Combo("fglive", &choice, kItems, 2, DropdownWidth())) {
+        const bool want = choice > 0;
+        if (want) { st.fg_mode.store(0); st.fg_multiplier.store(static_cast<uint32_t>(choice) + 1); na::fg::ResetLatch(); }
+        st.fg_enabled.store(want ? 1u : 0u);
+        na::settings::Save();
+        na::eventlog::Emit("fg_live", "menu: Frame Generation %s", na::fglive::ChoiceLabel(want ? static_cast<uint32_t>(choice) : 0));
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    const na::fg::Stats fs = na::fg::GetStats();
+    const auto lv = na::present::GetLiveStats();
+    const auto hud = na::j2::GetLiveHudStats();
+    const auto pr = na::present::GetStats();
+    char line[320];
+    if (!can && !waiting) StatusLine(2, why);
+    else if (!on) StatusLine(0, waiting ? why : "Off. Pictures are presented exactly as the game renders them.");
+    else {
+        StatusLine(fs.latched_off ? 2 : (fs.active ? 1 : 0), fs.reason);
+        if (fs.active || fs.generated) {
+            snprintf(line, sizeof line, "%.0f pictures per second shown from %.0f rendered. Graphics-card time per rendered frame: Frame Generation %.2f ms, HUD %.2f ms, presenting %.2f ms.",
+                     pr.shown_fps, pr.base_fps, lv.eval_avg, lv.hudcopy_avg + lv.paste_avg + hud.grab_avg + hud.redraw_avg, lv.copy_avg);
+            Hint(line);
+        }
+        snprintf(line, sizeof line, "HUD: %s", hud.learned ? hud.method : hud.verdict);
+        Hint(line);
+    }
+}
+
 void RegisterLiveDlaaMenu()
 {
+    if (na::present::LiveFrameGeneration())
+        na::menu::Register({"Frame Generation (live)", na::menu::Availability::Available, nullptr, &DrawLiveFrameGeneration, na::menu::Page::Picture});
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
     na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
     na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});
