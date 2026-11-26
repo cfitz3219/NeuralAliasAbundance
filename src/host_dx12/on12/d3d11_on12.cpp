@@ -4,6 +4,7 @@
 #include "host_dx12/capture/referee_gpu.hpp"
 #include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/input_provider.hpp"
+#include "host_dx12/native11/proxy_views.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/native11/texture_loader.hpp"
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 
 using Microsoft::WRL::ComPtr;
@@ -66,6 +68,12 @@ std::atomic<uint32_t> g_native_installs{0}, g_native_install_failures{0};
 std::atomic<int> g_menu_buffer{1};
 std::atomic<bool> g_copy_with_d3d11{false};
 std::atomic<bool> g_keep_game_swapchain{false};
+// [present] dx11_proxy=1: a native DX11 game's swap chain is created as a real D3D12 chain on our
+// presentation queue; the game draws into one shared back buffer (see "Native proxy" below).
+std::atomic<bool> g_native_proxy{false};
+std::atomic<bool> g_native_proxy_test_off{false};
+std::atomic<CopyObserver> g_copy_observer{nullptr};
+std::atomic<void*> g_copy_observer_user{nullptr};
 thread_local int t_inside = 0; // 11on12 may call D3D11CreateDevice itself: inner calls go to the original
 
 struct Entry { IUnknown* identity = nullptr; ID3D12Device* device = nullptr; ID3D12CommandQueue* queue = nullptr; };
@@ -302,6 +310,8 @@ bool wanted(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, UINT flags, void* out_d
 }
 
 bool setup_native_menu(ID3D11Device* d11); // below, with the menu canvas
+ID3D12CommandQueue* native_present_queue(ID3D11Device* d11); // below, with the DX11 proxy
+void proxy_note(const char* why, bool refused); // below, with the DX11 proxy
 
 // Native route: the game's own device, created by the original call, gets the input provider with
 // the DX12 effects handoff as its consumer. The provider's probe device goes straight to the
@@ -442,6 +452,8 @@ bool Automatic() { return g_automatic.load(std::memory_order_acquire); }
 void Start(const wchar_t* ini, LogFn log)
 {
     g_log = log;
+    g_native_proxy.store(GetPrivateProfileIntW(L"present", L"dx11_proxy", 0, ini) == 1);
+    if (g_native_proxy.load()) proxy_note("on: native DX11 swap chains are presented through our D3D12 queue", false);
     if (AutomaticRequested(ini)) {
         // Automatic selection observes the game's own swap chain. Never
         // intercept device creation or opt into the legacy translation path.
@@ -777,20 +789,13 @@ bool is_native_device(IUnknown* device)
 // queue, plus the shared fence the game's context waits on. Registered like a bridge device.
 bool setup_native_menu(ID3D11Device* d11)
 {
-    ComPtr<IDXGIDevice> dxgi;
-    ComPtr<IDXGIAdapter> adapter;
     NativeMenu m;
     m.d11 = d11;
     m.identity = identity_of(d11);
-    HRESULT hr = d11->QueryInterface(IID_PPV_ARGS(&dxgi));
-    if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);
-    if (SUCCEEDED(hr)) {
-        na::host::InternalFactoryScope internal;
-        hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m.d12));
-    }
-    D3D12_COMMAND_QUEUE_DESC qd{};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (SUCCEEDED(hr)) hr = m.d12->CreateCommandQueue(&qd, IID_PPV_ARGS(&m.queue));
+    // One queue per adapter for the menu AND a DX11 proxy chain's presentation: the menu's draw and
+    // the shared fence that orders it must be on the queue the chain presents from.
+    m.queue.Attach(native_present_queue(d11));
+    HRESULT hr = m.queue ? m.queue->GetDevice(IID_PPV_ARGS(&m.d12)) : E_FAIL;
     if (SUCCEEDED(hr)) {
         m.fences = std::make_unique<na::native_d3d11::SharedFences>();
         hr = m.fences->Create(d11, m.d12.Get(), m.queue.Get());
@@ -1015,8 +1020,18 @@ struct TChain {
     bool resizing = false;
     UINT pending_count = 0;
     DXGI_FORMAT pending_format = DXGI_FORMAT_UNKNOWN;
-    struct Slot { ComPtr<ID3D12CommandAllocator> alloc; ComPtr<ID3D12GraphicsCommandList> list; uint64_t value = 0; } slots[4];
+    struct Slot { ComPtr<ID3D12CommandAllocator> alloc; ComPtr<ID3D12GraphicsCommandList> list; uint64_t value = 0; bool timed = false; } slots[4];
     uint32_t next = 0;
+    // Native proxy (the game's own D3D11 device): the back buffer is one image shared by both APIs,
+    // ordered by two shared fences (native_d3d11/shared_resources.hpp); no 11on12 device exists.
+    bool native = false;
+    DXGI_FORMAT virt_format = DXGI_FORMAT_UNKNOWN;            // TYPELESS for 8-bit chains (sRGB and UNORM views both work)
+    std::shared_ptr<na::native_d3d11::SharedTexture> shared;  // the game's back buffer
+    std::shared_ptr<na::native_d3d11::SharedFences> fences;
+    uint64_t native_done = 0, effects_done = 0;
+    ComPtr<ID3D12QueryHeap> queries;                          // two timestamps per slot around the copy
+    ComPtr<ID3D12Resource> query_readback;
+    uint64_t timestamp_hz = 0;
 };
 // Recursive: BeforePresent asks the chain for its D3D12 buffer through the hooked GetBuffer.
 std::recursive_mutex g_tm;
@@ -1034,6 +1049,9 @@ std::atomic<uint64_t> g_t_release_us{0}, g_t_release_max{0}, g_t_copy_us{0}, g_t
     g_t_present_us{0}, g_t_present_max{0}, g_t_presents{0}, g_t_handoffs{0};
 std::atomic<long> g_tlast_hr{0};
 char g_treason[160] = "No translated swap chain yet.";
+// Native proxy: chains made / refused (with the last reason), and the copy's GPU time on our queue.
+std::atomic<uint64_t> g_proxied{0}, g_proxy_refused{0}, g_copy_gpu_ns{0}, g_copy_gpu_samples{0}, g_copy_gpu_max_ns{0};
+char g_proxy_reason[160] = "DX11 proxy swap chain: off ([present] dx11_proxy=0).";
 
 void tnote(const char* reason, HRESULT hr = S_OK)
 {
@@ -1085,6 +1103,10 @@ bool twait(TChain& c, uint64_t value, DWORD ms)
 bool tdrain(TChain& c)
 {
     if (!c.queue || !c.fence) return true;
+    if (c.native && c.fences && c.shared) { // D3D11's last writes into the shared buffer are ordered before the drain signal
+        uint64_t v = 0;
+        if (SUCCEEDED(c.fences->SignalNative(&v))) c.fences->WaitEffects(v);
+    }
     if (c.ctx) c.ctx->Flush();
     if (FAILED(c.queue->Signal(c.fence.Get(), ++c.fence_value))) return false;
     const bool done = twait(c, c.fence_value, 2000);
@@ -1126,8 +1148,41 @@ HRESULT copy_on_d3d11(TChain& c, ID3D12Resource* target, DXGI_FORMAT format, boo
 
 void drop_virtual(TChain& c)
 {
+    if (c.native && c.virt11) {
+        ComPtr<ID3D11Texture2D> t;
+        if (SUCCEEDED(c.virt11.As(&t))) na::native11::proxy_views::Unregister(t.Get());
+    }
     c.virt11.Reset();
     c.virt12.Reset();
+    c.shared.reset();
+}
+
+// The shared image's format: 8-bit chains get the TYPELESS family (a real swap chain buffer takes
+// both sRGB and UNORM views; native11/proxy_views.hpp gives the game's own format back to it).
+DXGI_FORMAT native_virtual_format(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    default: return f;
+    }
+}
+
+bool build_native_virtual(TChain& c)
+{
+    drop_virtual(c);
+    if (!c.width || !c.height || c.game_format == DXGI_FORMAT_UNKNOWN) return false;
+    c.virt_format = native_virtual_format(c.game_format);
+    auto image = std::make_shared<na::native_d3d11::SharedTexture>();
+    na::native_d3d11::ImageDesc d{c.width, c.height, c.virt_format, (c.game_usage & DXGI_USAGE_UNORDERED_ACCESS) != 0};
+    const HRESULT hr = image->Create(c.d11.Get(), c.d12.Get(), d);
+    if (FAILED(hr)) { tnote("the game's back buffer could not be shared between D3D11 and D3D12", hr); return false; }
+    c.shared = image;
+    c.virt12 = image->Effects();
+    c.virt11 = image->Native();
+    c.virt_state = D3D12_RESOURCE_STATE_COMMON; // simultaneous access: our copy reads it from COMMON
+    na::native11::proxy_views::Register(image->Native(), c.game_format);
+    return true;
 }
 
 // The game's back buffer: a D3D12 texture of ours with the format, samples and
@@ -1135,6 +1190,7 @@ void drop_virtual(TChain& c)
 // except inside our Present copy.
 bool build_virtual(TChain& c)
 {
+    if (c.native) return build_native_virtual(c);
     drop_virtual(c);
     if (!c.width || !c.height || c.game_format == DXGI_FORMAT_UNKNOWN) return false;
     const bool msaa = c.game_samples.Count > 1;
@@ -1166,8 +1222,27 @@ bool build_virtual(TChain& c)
 
 bool tlist(TChain& c, TChain::Slot*& out)
 {
-    TChain::Slot& s = c.slots[c.next++ % 4];
+    const uint32_t index = c.next++ % 4;
+    TChain::Slot& s = c.slots[index];
     if (!twait(c, s.value, 1000)) return false;
+    if (s.timed && c.query_readback && c.timestamp_hz) { // its copy has completed: GPU time of the Off path's copy
+        s.timed = false;
+        void* m = nullptr;
+        const D3D12_RANGE rr{index * 16u, index * 16u + 16u};
+        if (SUCCEEDED(c.query_readback->Map(0, &rr, &m))) {
+            uint64_t t[2];
+            std::memcpy(t, static_cast<const uint8_t*>(m) + index * 16u, 16);
+            const D3D12_RANGE none{0, 0};
+            c.query_readback->Unmap(0, &none);
+            if (t[1] >= t[0] && t[0]) {
+                const uint64_t ns = (t[1] - t[0]) * 1000000000ull / c.timestamp_hz;
+                g_copy_gpu_ns.fetch_add(ns, std::memory_order_relaxed);
+                g_copy_gpu_samples.fetch_add(1, std::memory_order_relaxed);
+                uint64_t peak = g_copy_gpu_max_ns.load(std::memory_order_relaxed);
+                while (ns > peak && !g_copy_gpu_max_ns.compare_exchange_weak(peak, ns)) {}
+            }
+        }
+    }
     if (!s.alloc) {
         if (FAILED(c.d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s.alloc))) ||
             FAILED(c.d12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.alloc.Get(), nullptr, IID_PPV_ARGS(&s.list)))) {
@@ -1207,6 +1282,125 @@ void read_size(TChain& c)
     if (SUCCEEDED(c.sc->GetDesc(&d))) { c.width = d.BufferDesc.Width; c.height = d.BufferDesc.Height; } // our module: real values
 }
 
+// ---- Native proxy -----------------------------------------------------------
+// The game keeps its own D3D11 device. Its swap chain is created as a real D3D12 chain on our
+// presentation queue (on the game's adapter); the game draws into one image shared by both APIs and
+// at Present that image is copied into the chain's current buffer, ordered by shared fences (the GPU
+// waits, the CPU never does). With nothing else enabled this is the "Off path" of one presenter for
+// DX11 and DX12 games: the picture the game drew, presented with its own sync interval and flags.
+struct NativePresentDevice { LUID luid{}; ComPtr<ID3D12Device> d12; ComPtr<ID3D12CommandQueue> queue; };
+std::mutex g_npd_m;
+NativePresentDevice g_npd;
+
+void proxy_note(const char* why, bool refused)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_m);
+        std::snprintf(g_proxy_reason, sizeof g_proxy_reason, "%s", why);
+    }
+    if (refused) g_proxy_refused.fetch_add(1);
+    if (g_log) {
+        char line[224];
+        std::snprintf(line, sizeof line, "dx11 proxy: %s", why);
+        g_log(line);
+    }
+}
+
+// Why a native DX11 chain stays the game's own (null = it can be a proxy).
+const char* native_refusal(IUnknown* device, DXGI_FORMAT format, UINT samples, UINT flags, BOOL stereo)
+{
+    ComPtr<ID3D11Device> d11;
+    ComPtr<ID3D11On12Device> translated;
+    if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&d11)))) return nullptr; // not a D3D11 device: nothing to say
+    if (SUCCEEDED(d11.As(&translated))) return "the device is a D3D11On12 device";
+    ComPtr<ID3D11Device5> d11_5;
+    ComPtr<ID3D11DeviceContext> ctx;
+    d11->GetImmediateContext(&ctx);
+    ComPtr<ID3D11DeviceContext4> ctx4;
+    if (FAILED(d11.As(&d11_5)) || !ctx || FAILED(ctx.As(&ctx4))) return "this D3D11 device has no shared fences (needs Windows 10 1703 or newer)";
+    if (d11->GetCreationFlags() & D3D11_CREATE_DEVICE_DEBUG) return "the game asked for a debug-layer device";
+    if (flip_format(format) == DXGI_FORMAT_UNKNOWN) return "the game's back-buffer format has no D3D12 swap chain equivalent";
+    if (samples > 1) return "the game asked for a multisampled back buffer";
+    if (flags & DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE) return "the game asked for a GDI-compatible back buffer";
+    if (stereo) return "the game asked for a stereo swap chain";
+    return nullptr;
+}
+
+// Our D3D12 device on the game's adapter (one per adapter: the effects and the menu get the same
+// object) and our presentation queue. AddRef'ed queue, or null.
+ID3D12CommandQueue* native_present_queue(ID3D11Device* d11)
+{
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC ad{};
+    if (FAILED(d11->QueryInterface(IID_PPV_ARGS(&dxgi))) || FAILED(dxgi->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&ad))) return nullptr;
+    std::lock_guard<std::mutex> lk(g_npd_m);
+    if (!g_npd.queue || g_npd.luid.LowPart != ad.AdapterLuid.LowPart || g_npd.luid.HighPart != ad.AdapterLuid.HighPart) {
+        NativePresentDevice n;
+        n.luid = ad.AdapterLuid;
+        na::host::InternalFactoryScope internal;
+        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&n.d12)))) return nullptr;
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(n.d12->CreateCommandQueue(&qd, IID_PPV_ARGS(&n.queue)))) return nullptr;
+        n.queue->SetName(L"NeuralAlias DX11 proxy presentation queue");
+        g_npd = std::move(n);
+    }
+    g_npd.queue->AddRef();
+    return g_npd.queue.Get();
+}
+
+bool translate_native(IUnknown* device, DXGI_FORMAT format, UINT samples, UINT flags, BOOL stereo, ID3D12CommandQueue** queue)
+{
+    if (!g_native_proxy.load(std::memory_order_acquire) || g_native_proxy_test_off.load() || !device || !queue) return false;
+    if (na::host::IsInternalGraphicsCall()) return false; // our own helpers keep their chains
+    ComPtr<ID3D11Device> d11;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&d11)))) return false; // a D3D12 queue: DX12 path, unchanged
+    if (const char* why = native_refusal(device, format, samples, flags, stereo)) {
+        char line[200];
+        std::snprintf(line, sizeof line, "the game keeps its own swap chain (%s); it runs exactly as without NeuralAlias's presenter", why);
+        proxy_note(line, true);
+        return false;
+    }
+    *queue = native_present_queue(d11.Get());
+    if (!*queue) { proxy_note("our D3D12 presentation queue could not be created; the game keeps its own swap chain", true); return false; }
+    return true;
+}
+
+bool init_native(TChain& c, IDXGISwapChain* sc, IUnknown* device)
+{
+    ComPtr<IUnknown> unk(device);
+    if (FAILED(unk.As(&c.d11))) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_npd_m);
+        c.d12 = g_npd.d12;
+        c.queue = g_npd.queue;
+    }
+    if (!c.d12 || !c.queue) return false;
+    c.d11->GetImmediateContext(&c.ctx);
+    c.fences = std::make_shared<na::native_d3d11::SharedFences>();
+    if (!c.ctx || FAILED(c.fences->Create(c.d11.Get(), c.d12.Get(), c.queue.Get())) ||
+        FAILED(c.d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.fence)))) return false;
+    // Two timestamps per slot around our copy (the Off path's GPU cost); optional.
+    D3D12_QUERY_HEAP_DESC qh{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 8, 0};
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = 64;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(c.d12->CreateQueryHeap(&qh, IID_PPV_ARGS(&c.queries))) ||
+        FAILED(c.d12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&c.query_readback))) ||
+        FAILED(c.queue->GetTimestampFrequency(&c.timestamp_hz))) {
+        c.queries.Reset(); c.query_readback.Reset(); c.timestamp_hz = 0;
+    }
+    c.native = true;
+    c.sc = sc;
+    return true;
+}
+
 bool translate_common(IUnknown* device, DXGI_FORMAT format, ID3D12CommandQueue** queue)
 {
     if (!g_hooked.load() || !device || !queue) return false;
@@ -1239,7 +1433,8 @@ bool NativeRoute()
 
 bool TranslateSwapChain(IUnknown* device, const DXGI_SWAP_CHAIN_DESC& game, DXGI_SWAP_CHAIN_DESC& real, ID3D12CommandQueue** queue)
 {
-    if (!translate_common(device, game.BufferDesc.Format, queue)) return false;
+    if (!translate_common(device, game.BufferDesc.Format, queue) &&
+        !translate_native(device, game.BufferDesc.Format, game.SampleDesc.Count, game.Flags, FALSE, queue)) return false;
     real = game;
     real.BufferDesc.Format = flip_format(game.BufferDesc.Format);
     real.BufferCount = flip_count(game.BufferCount ? game.BufferCount : 1);
@@ -1252,7 +1447,8 @@ bool TranslateSwapChain(IUnknown* device, const DXGI_SWAP_CHAIN_DESC& game, DXGI
 
 bool TranslateSwapChain1(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1& game, DXGI_SWAP_CHAIN_DESC1& real, ID3D12CommandQueue** queue)
 {
-    if (!translate_common(device, game.Format, queue)) return false;
+    if (!translate_common(device, game.Format, queue) &&
+        !translate_native(device, game.Format, game.SampleDesc.Count, game.Flags, game.Stereo, queue)) return false;
     real = game;
     real.Format = flip_format(game.Format);
     real.BufferCount = flip_count(game.BufferCount ? game.BufferCount : 1);
@@ -1285,7 +1481,11 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
         tnote(why);
         return false;
     };
-    if (!init_translated(*c, chain, device)) return fail("the translated swap chain could not be attached; the game gets its own chain");
+    ComPtr<ID3D11On12Device> bridge;
+    const bool native = device && FAILED(device->QueryInterface(IID_PPV_ARGS(&bridge)));
+    if (native ? !init_native(*c, chain, device) : !init_translated(*c, chain, device))
+        return fail(native ? "the DX11 proxy chain could not be attached (shared fences); the game gets its own chain"
+                           : "the translated swap chain could not be attached; the game gets its own chain");
     c->game_format = game_format;
     c->game_count = game_count;
     c->game_effect = game_effect;
@@ -1293,6 +1493,13 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
     c->game_usage = game_usage;
     read_size(*c);
     if (!build_virtual(*c)) return fail("the game's back buffer could not be built; the game gets its own chain");
+    if (c->native) {
+        ComPtr<ID3D11Texture2D> t;
+        if (FAILED(c->virt11.As(&t)) || !na::native11::proxy_views::Install(c->d11.Get(), t.Get())) {
+            drop_virtual(*c);
+            return fail("the DX11 proxy's view hooks could not be installed; the game gets its own chain");
+        }
+    }
     published.store(chain);
     if (!reused) g_tchain_count.fetch_add(1);
     g_translated.fetch_add(1);
@@ -1300,6 +1507,12 @@ bool AttachSwapChain(IDXGISwapChain* chain, IUnknown* device, DXGI_FORMAT game_f
     std::snprintf(line, sizeof line, "the game presents through a D3D12 swap chain (%ux%u, format %d, %u sample(s))", c->width, c->height,
                   static_cast<int>(game_format), c->game_samples.Count);
     tnote(line);
+    if (c->native) {
+        g_proxied.fetch_add(1);
+        std::snprintf(line, sizeof line, "native DX11 chain presented through our D3D12 queue (%ux%u, game format %d, swap effect %d, %u buffer(s))",
+                      c->width, c->height, static_cast<int>(game_format), static_cast<int>(game_effect), game_count);
+        proxy_note(line, false);
+    }
     return true;
 }
 
@@ -1378,6 +1591,53 @@ void BeforePresent(IDXGISwapChain* chain, unsigned flags)
         g_tcopy_failures.fetch_add(1); // nothing is transferred this frame; the game's buffer stays acquired
         tnote(msaa ? "the chain's buffer size differs from the game's multisampled back buffer; no resolve this frame"
                    : "the chain's buffer format no longer matches the game's back buffer; picture not copied");
+        return;
+    }
+    if (c->native) {
+        // D3D11's frame first (flushed), our queue waits for it on the GPU, copies, then D3D11 waits
+        // for the copy before the game writes its next frame into the shared buffer.
+        const uint64_t t0 = now_us();
+        uint64_t drawn = 0;
+        g_t_handoffs.fetch_add(1, std::memory_order_relaxed);
+        if (FAILED(hr = c->fences->SignalNative(&drawn)) || FAILED(hr = c->fences->WaitEffects(drawn))) {
+            g_tcopy_failures.fetch_add(1); g_tlast_hr.store(hr); tnote("the DX11 proxy could not order the game's frame before the copy", hr); return;
+        }
+        c->native_done = drawn;
+        add_time(g_t_release_us, g_t_release_max, now_us() - t0);
+        const uint64_t t_copy = now_us();
+        TChain::Slot* s = nullptr;
+        const uint32_t qslot = c->next % 4;
+        if (!tlist(*c, s)) { g_tcopy_failures.fetch_add(1); return; }
+        ID3D12GraphicsCommandList* l = s->list.Get();
+        if (c->queries) l->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, qslot * 2);
+        barrier(l, target.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (same_size) {
+            l->CopyResource(target.Get(), c->virt12.Get());
+        } else {
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = target.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.pResource = c->virt12.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const D3D12_BOX box{0, 0, 0, static_cast<UINT>((std::min<UINT64>)(td.Width, c->width)), (std::min)(td.Height, c->height), 1};
+            l->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+        }
+        barrier(l, target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+        if (c->queries) {
+            l->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, qslot * 2 + 1);
+            l->ResolveQueryData(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, qslot * 2, 2, c->query_readback.Get(), qslot * 16u);
+        }
+        if (FAILED(hr = l->Close())) { g_tcopy_failures.fetch_add(1); g_tlast_hr.store(hr); return; }
+        ID3D12CommandList* lists[] = {l};
+        c->queue->ExecuteCommandLists(1, lists);
+        if (CopyObserver observe = g_copy_observer.load()) observe(c->queue.Get(), target.Get(), g_copy_observer_user.load());
+        hr = c->queue->Signal(c->fence.Get(), c->fence_value + 1);
+        if (SUCCEEDED(hr)) { s->value = ++c->fence_value; s->timed = c->queries != nullptr; g_tcopies.fetch_add(1, std::memory_order_relaxed); }
+        else { s->value = UINT64_MAX; g_tcopy_failures.fetch_add(1); g_tlast_hr.store(hr); }
+        uint64_t copied = 0;
+        if (FAILED(hr = c->fences->SignalEffects(&copied)) || FAILED(hr = c->fences->WaitNative(copied))) {
+            g_tcopy_failures.fetch_add(1); g_tlast_hr.store(hr); tnote("the DX11 proxy could not order the game's next frame after the copy", hr);
+        }
+        c->effects_done = copied;
+        add_time(g_t_copy_us, g_t_copy_max, now_us() - t_copy);
         return;
     }
     if (g_copy_with_d3d11.load(std::memory_order_relaxed)) {
@@ -1467,7 +1727,7 @@ bool BeforeResize(IDXGISwapChain* chain, unsigned* count, DXGI_FORMAT* format, u
     // of the game's is touched (a later resize retries). The game's buffer is handed back from
     // D3D11 but kept, with everything advertised about it, until DXGI has decided.
     if (!tdrain(*c)) { tnote("a copy to the chain had not completed; this ResizeBuffers is refused unchanged"); return false; }
-    if (!g_copy_with_d3d11.load(std::memory_order_relaxed)) {
+    if (!c->native && !g_copy_with_d3d11.load(std::memory_order_relaxed)) {
         if (c->virt11) { ID3D11Resource* r[] = {c->virt11.Get()}; c->on12->ReleaseWrappedResources(r, 1); }
         c->ctx->Flush();
     }
@@ -1495,7 +1755,7 @@ void AfterResize(IDXGISwapChain* chain, long result)
     if (FAILED(result)) {
         // The game keeps the exact buffer it had: back under D3D11, same description.
         tnote("the game's ResizeBuffers was refused; its back buffer is unchanged", result);
-        if (c->virt11 && !g_copy_with_d3d11.load(std::memory_order_relaxed)) {
+        if (c->virt11 && !c->native && !g_copy_with_d3d11.load(std::memory_order_relaxed)) {
             ID3D11Resource* r[] = {c->virt11.Get()};
             c->on12->AcquireWrappedResources(r, 1);
         }
@@ -1522,10 +1782,39 @@ void ForgetSwapChain(IDXGISwapChain* chain)
     if (!c) return;
     g_tchain_ids[c - g_tchains].store(nullptr);
     tdrain(*c);
+    drop_virtual(*c);
     if (c->event) CloseHandle(c->event);
     *c = TChain{};
     g_tchain_count.fetch_sub(1);
 }
+
+bool NativeProxyOn() { return g_native_proxy.load(std::memory_order_acquire); }
+
+bool NativeProxy(IDXGISwapChain* chain)
+{
+    if (!g_tchain_count.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::recursive_mutex> lk(g_tm);
+    const TChain* c = tfind(chain);
+    return c && c->native;
+}
+
+bool ProxyEncoding(IDXGISwapChain* chain, DXGI_FORMAT* game_format, DXGI_FORMAT* real_format)
+{
+    if (!g_tchain_count.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::recursive_mutex> lk(g_tm);
+    const TChain* c = tfind(chain);
+    if (!c) return false;
+    if (game_format) *game_format = c->game_format;
+    if (real_format) *real_format = flip_format(c->game_format);
+    return true;
+}
+
+void SetCopyObserverForTests(CopyObserver fn, void* user)
+{
+    g_copy_observer_user.store(user);
+    g_copy_observer.store(fn);
+}
+void SetNativeProxyForTests(bool on) { g_native_proxy_test_off.store(!on); }
 
 int FormatStatus(char* out, size_t capacity)
 {
@@ -1542,6 +1831,14 @@ int FormatStatus(char* out, size_t capacity)
     take(g_t_copy_us, g_t_copy_max, handoffs, copy_avg, copy_max);
     take(g_t_acquire_us, g_t_acquire_max, handoffs, acq_avg, acq_max);
     take(g_t_present_us, g_t_present_max, presents, pres_avg, pres_max);
+    {   // Native proxy (the Off path for DX11 games): the copy's GPU time on our queue, avg/max over the window.
+        const uint64_t samples = g_copy_gpu_samples.exchange(0), ns = g_copy_gpu_ns.exchange(0), mx = g_copy_gpu_max_ns.exchange(0);
+        const int m = std::snprintf(out, capacity, "dx11_proxy on=%u proxied=%llu refused=%llu copy_gpu_ms=%.3f/max%.3f samples=%llu reason=\"%s\" | ",
+                                    g_native_proxy.load() ? 1u : 0u, static_cast<unsigned long long>(g_proxied.load()),
+                                    static_cast<unsigned long long>(g_proxy_refused.load()), samples ? double(ns) / double(samples) / 1e6 : 0.0,
+                                    double(mx) / 1e6, static_cast<unsigned long long>(samples), g_proxy_reason);
+        if (m > 0 && static_cast<size_t>(m) < capacity) { out += m; capacity -= static_cast<size_t>(m); }
+    }
     const int n = std::snprintf(out, capacity,
                                 "dx11on12_present chains=%u translated=%llu untranslated=%llu copies=%llu copies_d3d11=%llu copy_failures=%llu resizes=%llu resize_wait_timeouts=%llu "
                                 "window{presents=%llu release_flush_us=%llu/max%llu copy_us=%llu/max%llu acquire_us=%llu/max%llu dxgi_present_us=%llu/max%llu} last_hr=0x%08lX reason=\"%s\" | ",

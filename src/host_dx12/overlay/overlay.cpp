@@ -308,7 +308,7 @@ HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, 
     // DX11 game on our 11on12 device: its swap chain becomes a real D3D12 chain on our queue
     // (the game keeps one virtual D3D11 back buffer; see on12::TranslateSwapChain).
     ComPtr<ID3D12CommandQueue> on12_queue;
-    if (d && na::on12::Enabled()) {
+    if (d && (na::on12::Enabled() || na::on12::NativeProxyOn())) { // the bridge's device, or a native DX11 proxy chain
         DXGI_SWAP_CHAIN_DESC real{};
         if (na::on12::TranslateSwapChain(dev, use_copy ? copy : *d, real, on12_queue.ReleaseAndGetAddressOf())) { copy = real; use_copy = true; }
     }
@@ -335,7 +335,7 @@ HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, H
     bool use_copy = false;
     if (d && na::j2::RenderSmall()) { copy = *d; use_copy = true; small_native_dims(w, copy.Width, copy.Height); }
     ComPtr<ID3D12CommandQueue> on12_queue; // DX11 bridge: real D3D12 chain on our queue
-    if (d && na::on12::Enabled()) {
+    if (d && (na::on12::Enabled() || na::on12::NativeProxyOn())) {
         DXGI_SWAP_CHAIN_DESC1 real{};
         if (na::on12::TranslateSwapChain1(dev, use_copy ? copy : *d, real, on12_queue.ReleaseAndGetAddressOf())) { copy = real; use_copy = true; }
     }
@@ -3860,8 +3860,13 @@ HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flag
     const auto api = presentation_api(sc);
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present(sc, sync, flags);
     if (api == na::on12::GraphicsApi::Dx11) {
+        // DX11 proxy chain: the game's picture into the real D3D12 buffer first; the Home menu then
+        // draws on that D3D12 buffer as it does for a DX12 game (a proxy is never a D3D11 back buffer).
+        na::on12::BeforePresent(sc, flags);
         Native11Present frame(sc, flags);
+        const uint64_t tp = qpc_us();
         const HRESULT hr = g_orig_present(sc, sync, flags);
+        na::on12::AfterPresent(sc, flags, qpc_us() - tp);
         frame.Complete(sc, flags, hr);
         return hr;
     }
@@ -3906,8 +3911,11 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     const auto api = presentation_api(sc);
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present1(sc, sync, flags, pp);
     if (api == na::on12::GraphicsApi::Dx11) {
+        na::on12::BeforePresent(sc, flags); // DX11 proxy chain (see DetourPresent)
         Native11Present frame(sc, flags);
+        const uint64_t tp = qpc_us();
         const HRESULT hr = g_orig_present1(sc, sync, flags, pp);
+        na::on12::AfterPresent(sc, flags, qpc_us() - tp);
         frame.Complete(sc, flags, hr, pp);
         return hr;
     }
@@ -4102,7 +4110,10 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
             std::lock_guard<std::mutex> lock(g_state.mutex);
             if (g_state.swapchain == sc) release_buffers_locked();
         }
+        // DX11 proxy chain: D3D12 chain parameters; the shared back buffer is rebuilt on success.
+        if (!na::on12::BeforeResize(sc, &count, &fmt, &flags)) { na::native11::AfterResize(sc, DXGI_ERROR_INVALID_CALL); return DXGI_ERROR_INVALID_CALL; }
         const auto result = g_orig_resize(sc, count, w, h, fmt, flags);
+        na::on12::AfterResize(sc, result);
         na::native11::AfterResize(sc, result);
         return result;
     }
@@ -4137,7 +4148,11 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
             std::lock_guard<std::mutex> lock(g_state.mutex);
             if (g_state.swapchain == sc) release_buffers_locked();
         }
-        const auto result = g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+        if (!na::on12::BeforeResize(sc, &count, &fmt, &flags)) { na::native11::AfterResize(sc, DXGI_ERROR_INVALID_CALL); return DXGI_ERROR_INVALID_CALL; }
+        // A proxy chain's real buffers live on our queue: the game's D3D11 "queues" do not apply.
+        const bool proxy = na::on12::NativeProxy(sc);
+        const auto result = g_orig_resize1(sc, count, w, h, fmt, flags, proxy ? nullptr : node_masks, proxy ? nullptr : queues);
+        na::on12::AfterResize(sc, result);
         na::native11::AfterResize(sc, result);
         return result;
     }

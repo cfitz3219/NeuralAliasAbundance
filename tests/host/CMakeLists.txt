@@ -210,6 +210,8 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
 
 na_host_test(overlay_test SOURCES overlay_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12 user32)
 na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32 d3d11)
+# One presenter for both APIs, stage 2: native DX11 chains presented through our D3D12 queue (Off path, bit-exact).
+na_host_test(dx11_proxy_chain_test SOURCES dx11_proxy_chain_test.cpp LIBS host_dx12 user32 d3d11 d3d12 dxgi LABELS gpu)
 add_test(NAME host_overlay_bootstrap_automatic_test COMMAND overlay_bootstrap_test --automatic)
 set_tests_properties(host_overlay_bootstrap_automatic_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS host)
 add_test(NAME host_added_upscaling_off_test COMMAND overlay_bootstrap_test --added-upscaling-off)

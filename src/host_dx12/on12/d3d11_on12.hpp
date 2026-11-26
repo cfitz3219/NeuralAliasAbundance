@@ -130,6 +130,28 @@ void AfterResize(IDXGISwapChain* chain, long result);
 void BeforeFinalRelease(IDXGISwapChain* chain);
 void ForgetSwapChain(IDXGISwapChain* chain);
 
+// ---- Native DX11 proxy ([present] dx11_proxy=1, 2026-11-26) -----------------
+// The same translated presentation for a game that keeps its OWN D3D11 device (the native DX11
+// route): the game's swap chain is created as a real D3D12 chain on our presentation queue, the game
+// draws into one image shared by both APIs (8-bit: TYPELESS, with native11/proxy_views.hpp keeping
+// its views and GetDesc as the game expects), and at Present that image is copied into the chain's
+// current buffer, ordered by shared fences. Anything unsupported (multisampled, GDI-compatible,
+// stereo, a format a D3D12 chain cannot present, no shared fences) is refused with a plain reason
+// in the status line and the game keeps its own chain. The setting is read at start; a chain is a
+// proxy or not from its creation on.
+bool NativeProxyOn(); // [present] dx11_proxy=1 was read at start
+bool NativeProxy(IDXGISwapChain* chain);
+// The encoding of a translated or proxied chain, in one place: the format the game asked for and
+// the real D3D12 chain's buffer format. The colour space is what the game set with SetColorSpace1
+// on the same (real) chain: na::overlay::SwapChainColorSpace(chain).
+bool ProxyEncoding(IDXGISwapChain* chain, DXGI_FORMAT* game_format, DXGI_FORMAT* real_format);
+// Tests: called on the presenting thread right after the copy into `target` (PRESENT state) was
+// submitted on `queue`, before DXGI's Present. `SetNativeProxyForTests(false)` makes the next chains
+// the game's own (to compare against).
+using CopyObserver = void (*)(ID3D12CommandQueue* queue, ID3D12Resource* target, void* user);
+void SetCopyObserverForTests(CopyObserver fn, void* user);
+void SetNativeProxyForTests(bool on);
+
 // One status line (no newline) for the 5-second status log.
 int FormatStatus(char* out, size_t capacity);
 

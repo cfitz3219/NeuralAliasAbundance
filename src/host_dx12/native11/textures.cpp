@@ -1,5 +1,6 @@
 // Native DX11 route: material texture census and replacement (see textures.hpp).
 #include "host_dx12/native11/textures.hpp"
+#include "host_dx12/native11/proxy_views.hpp"
 
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
@@ -231,6 +232,8 @@ MaterialTextureFacts FactsOf(ID3D11Resource* resource, ID3D11ShaderResourceView*
 HRESULT STDMETHODCALLTYPE CreateShaderResourceView_d(ID3D11Device* dev, ID3D11Resource* r, const D3D11_SHADER_RESOURCE_VIEW_DESC* d,
                                                      ID3D11ShaderResourceView** out)
 {
+    D3D11_SHADER_RESOURCE_VIEW_DESC proxy_scratch{};
+    d = proxy_views::FixSrv(r, d, proxy_scratch); // a proxy back buffer (on12 [present] dx11_proxy) gets its chain's format
     const HRESULT hr = g_create(dev, r, d, out);
     if (FAILED(hr) || !r || !out || !*out || dev != g_device.load(std::memory_order_acquire) || IsOwnWork()) return hr;
     ID3D11ShaderResourceView* view = *out;
