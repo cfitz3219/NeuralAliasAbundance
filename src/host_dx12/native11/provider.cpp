@@ -3214,7 +3214,9 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         Inside in;
         DXGI_SWAP_CHAIN_DESC hd{};
         swap->GetDesc(&hd);
-        hud_free::OnPresent(nullptr, uint64_t(g_backbuffer), hd.BufferDesc.Width, hd.BufferDesc.Height);
+        ComPtr<ID3D11DeviceContext> immediate;
+        game->GetImmediateContext(&immediate);
+        hud_free::OnPresent(immediate.Get(), uint64_t(g_backbuffer), hd.BufferDesc.Width, hd.BufferDesc.Height);
     }
     const auto previous = g_model.Current();
     const bool reserved_before = g_screen.ReservesPixelRead();

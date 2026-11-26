@@ -85,7 +85,7 @@ int main() { return test::run({
             ops.push_back(draw(kShown, W, H, true, true));
             CHECK(LearnSnapshot(ops, kShown).verdict == SnapshotVerdict::NoRun);
         }
-        CHECK(std::strstr(HudVariantName(HudVariant::Snapshot), "T3") != nullptr);
+        CHECK(std::strstr(HudVariantName(HudVariant::Snapshot), "hudfree/snapshot-before-interface") != nullptr);
     }},
     {"the menu choice is stored as the shown multiplier and clamped to this build", [] {
         CHECK(GeneratedFromStored(0) == 0 && GeneratedFromStored(1) == 0);

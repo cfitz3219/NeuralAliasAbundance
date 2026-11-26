@@ -607,13 +607,13 @@ struct LiveHud {
     char verdict[160] = "The HUD sheet has not been looked for yet (it is learned when Frame Generation is first on).";
     char why[112] = "The HUD-free picture is not ready yet.";
     char method[128] = "none yet";
-    // T3 (interface drawn on the shown picture): the copy point and per-recording draw counts.
+    // hudfree/snapshot-before-interface (interface drawn on the shown picture): the copy point and per-recording draw counts.
     uint32_t variant = 0;          // na::fglive::HudVariant
     uint64_t snapshots = 0;        // copies taken (the "sheet copies" of this variant)
     struct Count { uint64_t list = 0, recording = 0; uint32_t draws = 0; };
     Count counts[16]{};
 } g_live_hud;
-// T3 active: the k-th draw into the shown picture in a recording is the first interface draw (-1 = off).
+// hudfree/snapshot-before-interface active: the k-th draw into the shown picture in a recording is the first interface draw (-1 = off).
 std::atomic<int64_t> g_live_snapshot_k{-1};
 bool live_variant_active();
 void live_hud_skip(const char* why) // caller holds g_live_hud.m
@@ -817,11 +817,11 @@ void live_hud_redraw(ID3D12GraphicsCommandList* l, const na::observe::ShaderCall
             na::eventlog::Emit("fg_hud", "FIRST SUCCESS HUD-free draw recorded (sheet state 0x%X from the %s; %s background; render target restored)",
                                resolved.state, resolved.source, blended ? "copied" : "no");
         }
-        snprintf(g_live_hud.method, sizeof g_live_hud.method, "T2: HUD-free picture by running the game's final draw again%s",
+        snprintf(g_live_hud.method, sizeof g_live_hud.method, "hudfree/sheet-redraw: the HUD-free picture by running the game's final draw again%s",
                  blended ? " (over its background)" : "");
     } catch (...) {}
 }
-// T3: just before the first interface draw on the shown picture (its bound render target, so in
+// hudfree/snapshot-before-interface: just before the first interface draw on the shown picture (its bound render target, so in
 // RENDER_TARGET state there), copy it into our HUD-free picture. Everything happens in the game's own
 // recording, in order; the game's render target binding is not touched.
 void live_hud_snapshot(ID3D12GraphicsCommandList* l, uint64_t shown_id) noexcept // caller holds g_live_hud.m
@@ -871,7 +871,7 @@ void live_hud_snapshot(ID3D12GraphicsCommandList* l, uint64_t shown_id) noexcept
         g_live_hud.done_recording = recording;
         if (!g_live_hud.first_ok_logged) {
             g_live_hud.first_ok_logged = true;
-            na::eventlog::Emit("fg_hud", "FIRST SUCCESS HUD-free picture copied just before the first interface draw (T3)");
+            na::eventlog::Emit("fg_hud", "FIRST SUCCESS HUD-free picture copied just before the first interface draw (hudfree/snapshot-before-interface)");
         }
     } catch (...) {}
 }
@@ -7153,7 +7153,7 @@ public:
         if(!reduced && !discover){
             if(g_capture_frame_record.load(std::memory_order_relaxed) && g_trace.armed.load(std::memory_order_relaxed)){try{trace_op(l,call);}catch(...){}}
             if(const int64_t k=g_live_snapshot_k.load(std::memory_order_relaxed);k>=0 && call.kind!=na::observe::ShaderKind::Dispatch && live_fg_on()){
-                na_object_id rt=0,ds=0; // T3: the first interface draw on the shown picture takes the HUD-free copy
+                na_object_id rt=0,ds=0; // hudfree/snapshot-before-interface: the first interface draw on the shown picture takes the HUD-free copy
                 if(na::observe::ListCurrentTargets(l,&rt,&ds)&&rt)live_hud_count_draw(l,uint64_t(rt),k);
             }
             if(const uint64_t sheet=g_hud_sheet_id.load(std::memory_order_relaxed);sheet && call.kind!=na::observe::ShaderKind::Dispatch){
@@ -9659,7 +9659,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
                         }
                         if(same_list_why)live_found=false;
                     }
-                    // T3 when the frame has no separate sheet (or its sheet's state cannot be proven) but
+                    // hudfree/snapshot-before-interface when the frame has no separate sheet (or its sheet's state cannot be proven) but
                     // draws its interface straight onto the shown picture.
                     if(!live_found&&snap.verdict!=na::fglive::SnapshotVerdict::Found&&variant!=na::fglive::HudVariant::Snapshot)
                         snap=na::fglive::LearnSnapshot(g_trace.frame,shown);
@@ -9675,7 +9675,7 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
                         snprintf(g_live_hud.verdict,sizeof g_live_hud.verdict,"%s (sheet: %s)",na::fglive::SnapshotWhy(snap.verdict),
                                  same_list_why?same_list_why:na::fglive::SheetWhy(learned.verdict));
                         snprintf(g_live_hud.method,sizeof g_live_hud.method,"%s",na::fglive::HudVariantName(na::fglive::HudVariant::Snapshot));
-                        na::eventlog::Emit("fg_hud","learn attempt %llu: variant T3, run=%u first_interface_op=%zu copy at draw %u into the shown picture of its recording; why not T2: %s",
+                        na::eventlog::Emit("fg_hud","learn attempt %llu: variant hudfree/snapshot-before-interface, run=%u first_interface_op=%zu copy at draw %u into the shown picture of its recording; why not T2: %s",
                             (unsigned long long)g_live_hud.learn_attempts,snap.run,snap.first_hud_op,snap.draws_before,
                             same_list_why?same_list_why:na::fglive::SheetWhy(learned.verdict));
                     }else{
@@ -9689,14 +9689,14 @@ void NativeTracePresent(ID3D12CommandQueue* queue, ID3D12Resource* frame, bool s
                         snprintf(g_live_hud.method,sizeof g_live_hud.method,"none: HUD not separable, real frames only");
                     }else{
                         g_live_hud.shown[0]=shown;g_live_hud.shown[1]=g_live_hud.shown[2]=0;
-                        snprintf(g_live_hud.method,sizeof g_live_hud.method,"T2: HUD-free picture by running the game's final draw again");
+                        snprintf(g_live_hud.method,sizeof g_live_hud.method,"%s",na::fglive::HudVariantName(na::fglive::HudVariant::SheetRedraw));
                     }
                     if(!live_found){ // both variants' reasons in the verdict
                         const size_t n=strlen(g_live_hud.verdict);
                         snprintf(g_live_hud.verdict+n,sizeof g_live_hud.verdict-n,"; interface on the shown picture: %s",na::fglive::SnapshotWhy(snap.verdict));
                     }
                     na::eventlog::Emit("fg_hud","learn attempt %llu: %s sheet=#%llu run=%u other=%u final_op=%zu -> %s",
-                        (unsigned long long)g_live_hud.learn_attempts,live_found?"variant T2":"no variant",(unsigned long long)learned.sheet,learned.run,learned.other,learned.final_op,
+                        (unsigned long long)g_live_hud.learn_attempts,live_found?"variant hudfree/sheet-redraw":"no variant",(unsigned long long)learned.sheet,learned.run,learned.other,learned.final_op,
                         g_live_hud.verdict);
                     }
                 }

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -44,7 +45,7 @@ struct State {
     uint32_t learned = 0;
     na::fglive::HudVariant variant = na::fglive::HudVariant::None;
     uint64_t sheet = 0;
-    uint32_t snap_k = 0;               // T3: draws into the shown picture before the first interface draw
+    uint32_t snap_k = 0;               // hudfree/snapshot-before-interface: draws into the shown picture before the first interface draw
     uint32_t final_k = 0;              // T2: draws into the shown picture before the final draw
     // Per frame
     uint32_t shown_draws = 0;
@@ -52,7 +53,7 @@ struct State {
     uint32_t frames_without = 0;
     // GPU objects (immediate context's device)
     ComPtr<ID3D11Texture2D> picture, pre, save;
-    ComPtr<ID3D11Resource> sheet_res; // T2: the learned sheet, from its first draw this frame
+    ComPtr<ID3D11Resource> sheet_res; // hudfree/sheet-redraw: the learned sheet, from its first draw this frame
     ComPtr<ID3D11RenderTargetView> picture_rtv;
     DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
     // Stats
@@ -60,7 +61,73 @@ struct State {
     char verdict[200] = "The HUD-free picture has not been looked for yet (it is learned when it is first wanted).";
     char method[128] = "none yet";
     char why[112] = "The HUD-free picture is not ready yet.";
+    // F8 capture (CaptureFrames)
+    std::atomic<bool> capturing{false};
+    std::wstring cap_dir;
+    uint32_t cap_frames = 0, cap_draws = 0;
+    struct Shot { ComPtr<ID3D11Texture2D> staging; uint64_t frame = 0; int kind = 0; uint32_t w = 0, h = 0; DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; };
+    std::vector<Shot> shots;
+    uint64_t cap_written = 0, cap_bytes = 0;
 } g;
+
+constexpr uint32_t kCaptureDraws = 4;
+
+// A staging copy of `src` (immediate context, in order). Caller holds g.m.
+void capture_copy(ID3D11DeviceContext* c, ID3D11Resource* src, int kind)
+{
+    ComPtr<ID3D11Texture2D> t;
+    if (!src || FAILED(src->QueryInterface(IID_PPV_ARGS(&t)))) return;
+    D3D11_TEXTURE2D_DESC d{};
+    t->GetDesc(&d);
+    if (d.SampleDesc.Count != 1) return;
+    ComPtr<ID3D11Device> dev;
+    c->GetDevice(&dev);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Format = typeless_of(d.Format);
+    sd.MipLevels = 1; sd.ArraySize = 1; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+    State::Shot shot;
+    if (!dev || FAILED(dev->CreateTexture2D(&sd, nullptr, &shot.staging))) return;
+    na::native11::OwnWorkScope own;
+    c->CopySubresourceRegion(shot.staging.Get(), 0, 0, 0, 0, t.Get(), 0, nullptr);
+    shot.frame = g.frame; shot.kind = kind; shot.w = d.Width; shot.h = d.Height; shot.format = d.Format;
+    g.shots.push_back(std::move(shot));
+}
+
+// Writes the staging copies the GPU has finished (never waits). Caller holds g.m.
+void capture_write(ID3D11DeviceContext* c)
+{
+    for (size_t i = 0; i < g.shots.size();) {
+        auto& s = g.shots[i];
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (c->Map(s.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m) == DXGI_ERROR_WAS_STILL_DRAWING) { ++i; continue; }
+        if (m.pData) {
+            const uint32_t bpp = s.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+            wchar_t name[96];
+            if (s.kind < 0) swprintf_s(name, L"\\pre-interface-%05llu-hudfree.raw", static_cast<unsigned long long>(s.frame));
+            else swprintf_s(name, L"\\pre-interface-%05llu-before-draw%d.raw", static_cast<unsigned long long>(s.frame), s.kind);
+            const std::wstring path = g.cap_dir + name;
+            HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                for (uint32_t y = 0; y < s.h; ++y) {
+                    DWORD wr = 0;
+                    WriteFile(f, static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch, s.w * bpp, &wr, nullptr);
+                    g.cap_bytes += wr;
+                }
+                CloseHandle(f);
+            }
+            c->Unmap(s.staging.Get(), 0);
+            char line[400];
+            const int n = snprintf(line, sizeof line, "{\"frame\": %llu, \"kind\": \"%s%d\", \"width\": %u, \"height\": %u, \"format\": %u, \"method\": \"%s\"}\r\n",
+                                   static_cast<unsigned long long>(s.frame), s.kind < 0 ? "hudfree" : "before-draw", s.kind < 0 ? 0 : s.kind, s.w, s.h,
+                                   static_cast<unsigned>(s.format), g.method);
+            const std::wstring jpath = g.cap_dir + L"\\pre-interface.json";
+            HANDLE j = CreateFileW(jpath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (j != INVALID_HANDLE_VALUE) { DWORD wr = 0; WriteFile(j, line, DWORD(n > 0 ? n : 0), &wr, nullptr); CloseHandle(j); }
+            ++g.cap_written;
+        }
+        g.shots.erase(g.shots.begin() + std::ptrdiff_t(i));
+    }
+}
 
 void skip(const char* why) // caller holds g.m
 {
@@ -117,7 +184,7 @@ bool blend_enabled(ID3D11DeviceContext* c)
     return d.RenderTarget[0].BlendEnable != FALSE;
 }
 
-// T2's second draw: the sheet's contents swapped for the pre-HUD copy, the same draw into our picture.
+// hudfree/sheet-redraw's second draw: the sheet's contents swapped for the pre-HUD copy, the same draw into our picture.
 void redraw(ID3D11DeviceContext* c, const draw_replay::DrawArgs& a, IssueDraw issue, void* user) // caller holds g.m
 {
     if (a.indirect) { skip("the game's final draw takes its arguments from the graphics card (indirect), so it cannot be run again"); return; }
@@ -162,12 +229,29 @@ void redraw(ID3D11DeviceContext* c, const draw_replay::DrawArgs& a, IssueDraw is
 } // namespace
 
 void SetWanted(bool on) { g.wanted.store(on, std::memory_order_release); }
-bool Wanted() { return g.wanted.load(std::memory_order_acquire); }
+bool Wanted() { return g.wanted.load(std::memory_order_acquire) || g.capturing.load(std::memory_order_acquire); }
+
+void CaptureFrames(const wchar_t* dir, uint32_t frames)
+{
+    if (!dir || !*dir || !frames) return;
+    std::lock_guard<std::mutex> lock(g.m);
+    g.cap_dir = dir;
+    g.cap_frames = frames > 8 ? 8 : frames;
+    g.cap_draws = 0;
+    g.capturing.store(true, std::memory_order_release);
+    na::eventlog::Emit("hud_free11", "capture: the shown picture before its first %u draws and the HUD-free picture, for %u frames, to the capture folder",
+                       kCaptureDraws, g.cap_frames);
+}
 
 void BeforeDraw(ID3D11DeviceContext* c, const DrawFacts& f, const draw_replay::DrawArgs& a, IssueDraw issue, void* user)
 {
     if (!Wanted() || !c || !f.rt0) return;
     std::lock_guard<std::mutex> lock(g.m);
+    if (g.capturing.load(std::memory_order_relaxed) && g.cap_frames && f.rt0 == f.shown && g.cap_draws < kCaptureDraws) {
+        ComPtr<ID3D11Resource> shown = bound_rt0(c);
+        capture_copy(c, shown.Get(), int(g.cap_draws));
+        ++g.cap_draws;
+    }
     if (g.recording) {
         Op op;
         op.blend = blend_enabled(c);
@@ -227,7 +311,20 @@ void BeforeCopy(uint64_t dst, uint32_t w, uint32_t h)
 
 void OnPresent(ID3D11DeviceContext* immediate, uint64_t shown, uint32_t shown_w, uint32_t shown_h)
 {
-    (void)immediate;
+    if (g.capturing.load(std::memory_order_acquire) && immediate) {
+        std::lock_guard<std::mutex> lock(g.m);
+        if (g.cap_frames) {
+            if (g.taken && g.picture) capture_copy(immediate, g.picture.Get(), -1);
+            --g.cap_frames;
+            g.cap_draws = 0;
+        }
+        capture_write(immediate);
+        if (!g.cap_frames && g.shots.empty()) {
+            g.capturing.store(false, std::memory_order_release);
+            na::eventlog::Emit("hud_free11", "capture written: %llu pictures, %.1f MB", static_cast<unsigned long long>(g.cap_written), double(g.cap_bytes) / 1048576.0);
+            g.cap_written = g.cap_bytes = 0;
+        }
+    }
     if (!Wanted()) {
         std::lock_guard<std::mutex> lock(g.m);
         g.fresh = false; g.recording = false; g.ops.clear();

@@ -1,10 +1,10 @@
 // The HUD-free picture on the native DX11 route: the same two variants as on DX12 (j2/live_dlaa.cpp),
 // learned the same way (core/live_frame_gen.hpp ChooseHudVariant) from one recorded frame:
-//  - T2, a separate HUD sheet composited by one final draw into the shown picture: at the sheet's
+//  - hudfree/sheet-redraw, a separate HUD sheet composited by one final draw into the shown picture: at the sheet's
 //    first draw of the frame its contents are copied (pre-HUD); at the final draw the sheet's contents
 //    are swapped for that copy, the same draw is issued once more into our picture, and the game's
 //    render targets and sheet are put back before the game's own draw runs.
-//  - T3, the interface drawn straight onto the shown picture: right before its first interface draw
+//  - hudfree/snapshot-before-interface, the interface drawn straight onto the shown picture: right before its first interface draw
 //    (the learned k-th draw into it in the frame), the shown picture is copied into ours.
 // Everything runs on the game's immediate context in order, so no state needs to be proven: D3D11
 // tracks resource states itself. Deferred contexts are not followed (a frame whose interface is
@@ -34,7 +34,7 @@ struct DrawFacts {
 };
 using IssueDraw = void (*)(ID3D11DeviceContext* c, const draw_replay::DrawArgs& a, void* user);
 // Before the game's draw is forwarded (immediate context only). `issue` draws with the original
-// (unhooked) entry point; used for T2's second draw.
+// (unhooked) entry point; used for hudfree/sheet-redraw's second draw.
 void BeforeDraw(ID3D11DeviceContext* c, const DrawFacts& f, const draw_replay::DrawArgs& a, IssueDraw issue, void* user);
 // A copy into `dst` (identity) of `w` x `h` on the immediate context (learning only).
 void BeforeCopy(uint64_t dst, uint32_t w, uint32_t h);
@@ -44,6 +44,14 @@ void OnPresent(ID3D11DeviceContext* immediate, uint64_t shown, uint32_t shown_w,
 // The HUD-free picture of the frame now being presented (same size; the back buffer's format family),
 // or null with `why` in plain words. Valid until the next Present.
 ID3D11Texture2D* Picture(const char** why);
+
+// F8 on the native DX11 route: for the next `frames` frames, the shown picture is saved just before
+// each of its first 4 draws ("pre-interface" candidates, whatever shape the frame has) and, when a
+// variant is learned, the HUD-free picture itself. Files go to `dir` (the capture's folder):
+// pre-interface-<frame>-before-draw<k>.raw / -hudfree.raw (tight rows) and pre-interface.json (one
+// line per picture: frame, kind, size, format, the learned method). The pictures are read back from
+// staging copies a frame or more later (never waiting on the GPU). While capturing, learning runs too.
+void CaptureFrames(const wchar_t* dir, uint32_t frames);
 
 struct Stats {
     uint32_t wanted = 0, learned = 0, variant = 0; // na::fglive::HudVariant

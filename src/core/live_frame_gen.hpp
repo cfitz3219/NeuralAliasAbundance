@@ -216,13 +216,13 @@ Snapshot LearnSnapshot(const Ops& ops, uint64_t shown, uint32_t min_run = 4)
     return r;
 }
 
-// Which HUD-free variant a traced frame supports: the separate sheet re-drawn (T2) first, else the
-// snapshot before the first interface draw (T3), else none (x2 waits with both reasons).
+// Which HUD-free variant a traced frame supports (docs/VARIANTS.md names): the separate sheet re-drawn first, else the
+// snapshot before the first interface draw, else none (x2 waits with both reasons).
 enum class HudVariant { None, SheetRedraw, Snapshot };
 inline const char* HudVariantName(HudVariant v)
 {
-    return v == HudVariant::SheetRedraw ? "T2: HUD-free picture by running the game's final draw again (separate HUD sheet)"
-         : v == HudVariant::Snapshot    ? "T3: HUD-free picture copied just before the first interface draw (interface on the shown picture)"
+    return v == HudVariant::SheetRedraw ? "hudfree/sheet-redraw: the HUD-free picture by running the game's final draw again (separate HUD sheet)"
+         : v == HudVariant::Snapshot    ? "hudfree/snapshot-before-interface: the HUD-free picture copied just before the first interface draw (interface on the shown picture)"
                                         : "none: HUD not separable, real frames only";
 }
 // VARIANT: hudfree/sheet-redraw

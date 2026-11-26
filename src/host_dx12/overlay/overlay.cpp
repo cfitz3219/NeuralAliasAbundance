@@ -78,6 +78,7 @@
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/sharpness_preview.hpp"
 #include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/native11/hud_free.hpp"
 #include "host_dx12/overlay/freeze_watchdog.hpp"
 #include "host_dx12/nr/queue_trace.hpp"
 #include <ctime>
@@ -2376,7 +2377,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
         if (key && wp == key && !na::capture::j2::Armed()) { // J2 evidence capture, N consecutive frames
             if (GetKeyState(VK_SHIFT) & 0x8000) { if (!na::j2::SmearTestRunning()) na::j2::StartSmearTest(); } // Shift: the smear test
-            else na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+            else {
+                na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+                // Native DX11: the shown picture before its first draws and the HUD-free picture too (stage 0 data).
+                if (na::on12::NativeRoute() && na::capture::j2::Directory() && *na::capture::j2::Directory())
+                    na::native11::hud_free::CaptureFrames(na::capture::j2::Directory(), na::settings::Get().j2_capture_frames.load());
+            }
         }
     }
     if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && !(GetKeyState(VK_SHIFT) & 0x8000) && na::present::LiveFrameGeneration() &&

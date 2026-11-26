@@ -1,9 +1,9 @@
 // The HUD-free picture on the native DX11 route (native11/hud_free), through the real hooks: a DX11
 // "game" on its own device, presented through the DX11 proxy chain, draws a scene and then an interface
 // in each of the two shapes; the program learns the shape from one frame by itself.
-//  - T3, interface drawn straight onto the shown picture: an opaque scene pass into the back buffer,
+//  - hudfree/snapshot-before-interface, interface drawn straight onto the shown picture: an opaque scene pass into the back buffer,
 //    then blended interface rectangles on it.
-//  - T2, separate HUD sheet: the scene in its own texture, interface rectangles blended into a sheet,
+//  - hudfree/sheet-redraw, separate HUD sheet: the scene in its own texture, interface rectangles blended into a sheet,
 //    then ONE final draw composites scene + sheet into the back buffer.
 // For each: the HUD-free picture equals the scene exactly (bytes), and the paste rule
 // (core/live_frame_gen.hpp PasteHud, the CPU reference of the GPU paste) restores every interface pixel
@@ -249,8 +249,30 @@ int main()
     REQUIRE(na::on12::NativeProxy(chain.Get()));
     REQUIRE(SUCCEEDED(chain->Present(0, 0))); // the native route installs its provider at the first present
     { ComPtr<ID3D11Device> d; CHECK(SUCCEEDED(chain->GetDevice(IID_PPV_ARGS(&d))) && d.Get() == g.dev.Get()); } // the game asks its proxied chain for its own device
-    REQUIRE(run_shape(g, chain.Get(), false, "T3 interface on the shown picture") == 0);
-    REQUIRE(run_shape(g, chain.Get(), true, "T2 separate HUD sheet + one final draw") == 0);
+    REQUIRE(run_shape(g, chain.Get(), false, "hudfree/snapshot-before-interface") == 0);
+    REQUIRE(run_shape(g, chain.Get(), true, "hudfree/sheet-redraw") == 0);
+    {   // F8 on the native route: the shown picture before its first 4 draws, and the HUD-free picture, for 6 frames
+        const auto cap = dir / (L"hud-free11-capture-" + suffix);
+        CreateDirectoryW(cap.c_str(), nullptr);
+        na::native11::hud_free::CaptureFrames(cap.c_str(), 6);
+        for (int i = 0; i < 2; ++i) REQUIRE(run_shape(g, chain.Get(), true, "hudfree/sheet-redraw (capturing)") == 0);
+        for (int i = 0; i < 4; ++i) chain->Present(0, 0); // later presents write the staging copies
+        size_t raws = 0, before = 0, hudfree = 0;
+        for (const auto& e : std::filesystem::directory_iterator(cap)) {
+            const auto n = e.path().filename().wstring();
+            if (e.path().extension() == L".raw") {
+                ++raws;
+                if (n.find(L"before-draw") != std::wstring::npos) ++before;
+                if (n.find(L"hudfree") != std::wstring::npos) ++hudfree;
+                CHECK(e.file_size() == uintmax_t(W) * H * 4);
+            }
+        }
+        std::printf("F8 capture: %zu pictures (%zu before a draw, %zu HUD-free), json %s\n", raws, before, hudfree,
+                    std::filesystem::exists(cap / L"pre-interface.json") ? "written" : "missing");
+        CHECK(before >= 2 && hudfree >= 1 && std::filesystem::exists(cap / L"pre-interface.json"));
+        for (const auto& e : std::filesystem::directory_iterator(cap)) { std::error_code ec; std::filesystem::remove(e.path(), ec); }
+        RemoveDirectoryW(cap.c_str());
+    }
 
     na::host::StopSessionForTests();
     REQUIRE(na::overlay::Stop());
