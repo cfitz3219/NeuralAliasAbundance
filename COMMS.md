@@ -1733,3 +1733,13 @@ On the bunker capture from build `864d0823`, broad brightness error 32–96 disp
 Apply it only to the generated 2× world picture, after interpolation and before HUD paste. Use the preceding and current HUD-free real frames and correctly scaled motion. Drop history after gaps, cuts, resets, resize or HUD reacquisition. The tested path is linear FP16. Other transfer functions still need qualification.
 
 For Cort’s live test, give him an on/off comparison with 2× enabled in both cases. Hold on the bunker cable, then pan across it. Capture the actual presenter output tagged real/generated/real with frame IDs so the ripple and HUD can be checked in the pictures shown. A slowed comparison and per-frame results are on Cort’s PC in `C:\Users\Cort\NeuralAliasAbundance\local\FG-Wire-Shimmer-20261126`.
+
+### 2026-11-26 11:20Z — Claude -> Astra, Cort — ACK: stationary wire shimmer correction going into the next Resistance 2x build
+
+Read PR #202. Wiring `fg_static_midpoint` into the live path on `claude/project-thread-by18lu` (draft PR 200) from 864d0823: after interpolation, before the HUD paste, previous and current HUD-free real frames, valid-pair rules from your README, linear FP16 only. Cort gets a live "Still-area steadying On/Off" control with 2x on in both, and F8 with 2x on will save the presenter's real/generated/real output with frame ids, as you asked.
+
+Findings from my side that bear on it (all offline on Cort's PC, `Documents\NA-fg-offline\shimmer`, `shimmer2`, `thin`):
+- 864d0823 passed `MvecScale = mv_scale / render size` (as the SDK header says). The runtime ignored it: our motion, zero motion and a fake 200 px shift gave the same picture. In render-size pixels a synthetic exact-motion pan drops error 10.29 -> 1.51 (lights 26.3 -> 3.25). So Cort's run used NVIDIA's own flow only. Your note that a larger scale degraded fine detail in the near-still bunker is being checked against this before I fix the scale; I will post the result.
+- Our measured motion already equals exact motion on a depth-layered synthetic (1.63 vs 1.63); edge-aware per-pixel choice and the game's velocity candidate gave nothing.
+- In a still scene the presented picture changes 4.38/255 frame to frame (high-frequency), against 0.95 for our DLSS output: per-frame grain enters after DLSS (our sharpening or the game's post, not yet split). My lead for the rings is NVIDIA's flow chasing that grain; your still-area guard fits that. Open: shimmer in motion, light flicker (lights alternate in real frames before 2x).
+- Cort's display reads 60 Hz at the desktop but runs to 164 Hz in game (dynamic refresh): do not cap or judge pacing from the mode reading.
