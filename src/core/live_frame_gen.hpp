@@ -144,6 +144,100 @@ Sheet LearnSheet(const Ops& ops, uint64_t shown, uint32_t shown_w, uint32_t show
     return r;
 }
 
+// ---- The interface drawn straight onto the shown picture (snapshot variant) ------------------
+// Many games draw the scene (or its tone-mapped composite) into the shown picture and then the
+// interface on top of it, with no separate sheet. The HUD-free picture is then the shown picture
+// itself just before the first interface draw: a copy of it taken right there. Learned from one
+// traced frame by shape: walking back from the last write to the shown picture, a run of blended,
+// depth-less draws into it (other ops in between that do not write it are passed over), preceded
+// by a write to it that is not interface-like (the scene or its composite). The copy point is "the
+// k-th draw into the shown picture in that recording" (k = draws into it before the run there), so
+// the composite and the first interface draw must be in the same recording of the same list.
+// Op: as for LearnSheet, plus uint64_t list, recording.
+enum class SnapshotVerdict {
+    Found,           // copy point known
+    NoShownWrite,    // nothing in the traced frame wrote the shown picture
+    ShownNotDrawn,   // the last write to the shown picture is a copy or a compute pass
+    NoRun,           // the last write to the shown picture is not an interface-like (blended, depth-less) draw
+    ShortRun,        // fewer than `min_run` interface draws
+    NoScene,         // no non-interface write to the shown picture before the run: nothing HUD-free to copy
+    SplitRecording,  // the scene's write and the first interface draw are in different recordings
+};
+struct Snapshot {
+    SnapshotVerdict verdict = SnapshotVerdict::NoShownWrite;
+    uint32_t run = 0;
+    size_t first_hud_op = 0;   // index of the first interface draw
+    uint32_t draws_before = 0; // draws into the shown picture in that recording before it (the copy point)
+    uint64_t list = 0, recording = 0;
+};
+inline const char* SnapshotWhy(SnapshotVerdict v)
+{
+    switch (v) {
+    case SnapshotVerdict::Found: return "interface drawn on the shown picture: it is copied just before the first interface draw";
+    case SnapshotVerdict::NoShownWrite: return "nothing in the traced frame wrote the shown picture";
+    case SnapshotVerdict::ShownNotDrawn: return "the shown picture is finished by a copy or compute pass, not by interface draws";
+    case SnapshotVerdict::NoRun: return "the shown picture's last write is not an interface-like draw (blended, without depth)";
+    case SnapshotVerdict::ShortRun: return "fewer than 4 interface draws on the shown picture";
+    case SnapshotVerdict::NoScene: return "nothing but interface-like draws writes the shown picture, so there is no HUD-free point to copy";
+    case SnapshotVerdict::SplitRecording: return "the scene and the interface are drawn into the shown picture from different command lists";
+    }
+    return "unknown";
+}
+template <class Ops>
+Snapshot LearnSnapshot(const Ops& ops, uint64_t shown, uint32_t min_run = 4)
+{
+    Snapshot r;
+    const size_t n = ops.size();
+    auto writes_shown = [&](size_t i) { for (const auto& o : ops[i].out) if (o.id == shown) return true; return false; };
+    auto hud_like = [&](size_t i) { const auto& op = ops[i]; return !op.compute && !op.transfer && op.blend && !op.depth && !op.out.empty() && op.out[0].id == shown; };
+    size_t last = n;
+    for (size_t i = n; i-- > 0;) if (writes_shown(i)) { last = i; break; }
+    if (last == n) { r.verdict = SnapshotVerdict::NoShownWrite; return r; }
+    if (ops[last].compute || ops[last].transfer) { r.verdict = SnapshotVerdict::ShownNotDrawn; return r; }
+    if (!hud_like(last)) { r.verdict = SnapshotVerdict::NoRun; return r; }
+    size_t first = last, scene = n;
+    for (size_t i = last + 1; i-- > 0;) {
+        if (!writes_shown(i)) continue;
+        if (hud_like(i)) { ++r.run; first = i; continue; }
+        scene = i;
+        break;
+    }
+    r.first_hud_op = first;
+    if (r.run < min_run) { r.verdict = SnapshotVerdict::ShortRun; return r; }
+    if (scene == n) { r.verdict = SnapshotVerdict::NoScene; return r; }
+    r.list = ops[first].list;
+    r.recording = ops[first].recording;
+    if (ops[scene].list != r.list || ops[scene].recording != r.recording) { r.verdict = SnapshotVerdict::SplitRecording; return r; }
+    for (size_t i = 0; i < first; ++i) {
+        const auto& op = ops[i];
+        if (op.list == r.list && op.recording == r.recording && !op.compute && !op.transfer && !op.out.empty() && op.out[0].id == shown) ++r.draws_before;
+    }
+    r.verdict = SnapshotVerdict::Found;
+    return r;
+}
+
+// Which HUD-free variant a traced frame supports: the separate sheet re-drawn (T2) first, else the
+// snapshot before the first interface draw (T3), else none (x2 waits with both reasons).
+enum class HudVariant { None, SheetRedraw, Snapshot };
+inline const char* HudVariantName(HudVariant v)
+{
+    return v == HudVariant::SheetRedraw ? "T2: HUD-free picture by running the game's final draw again (separate HUD sheet)"
+         : v == HudVariant::Snapshot    ? "T3: HUD-free picture copied just before the first interface draw (interface on the shown picture)"
+                                        : "none: HUD not separable, real frames only";
+}
+// VARIANT: hudfree/sheet-redraw
+// VARIANT: hudfree/snapshot-before-interface
+template <class Ops>
+HudVariant ChooseHudVariant(const Ops& ops, uint64_t shown, uint32_t shown_w, uint32_t shown_h, Sheet* sheet, Snapshot* snap)
+{
+    const Sheet a = LearnSheet(ops, shown, shown_w, shown_h);
+    if (sheet) *sheet = a;
+    if (a.verdict == SheetVerdict::Found) return HudVariant::SheetRedraw;
+    const Snapshot b = LearnSnapshot(ops, shown);
+    if (snap) *snap = b;
+    return b.verdict == SnapshotVerdict::Found ? HudVariant::Snapshot : HudVariant::None;
+}
+
 // ---- The sheet's state at the final draw -----------------------------------------------------
 // To swap the sheet's contents just before the game's final draw, the exact state the game left
 // it in is needed (a wrong barrier state is a device removal, never a guess). The proof used:

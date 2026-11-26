@@ -32,6 +32,7 @@
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/draw_replay.hpp"
+#include "host_dx12/native11/hud_free.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/native11/depth_reads.hpp"
@@ -2654,6 +2655,28 @@ void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
     }
 }
 
+// The HUD-free picture (hud_free.hpp): before an immediate-context draw is forwarded. Its second
+// draw (T2) goes straight to the original entry point.
+void IssueHudFreeDraw(ID3D11DeviceContext* c, const draw_replay::DrawArgs& a, void* user)
+{
+    Ctx* x = static_cast<Ctx*>(user);
+    const UINT inst = a.instances ? a.instances : 1;
+    if (a.indexed) O(c, x).draw_indexed_instanced(c, a.count, inst, a.start, a.base_vertex, a.start_instance);
+    else O(c, x).draw_instanced(c, a.count, inst, a.start, a.start_instance);
+}
+void HudFreeBeforeDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs& a)
+{
+    if (!hud_free::Wanted() || !x || x->deferred || t_inside) return;
+    hud_free::DrawFacts f;
+    f.rt0 = uint64_t(x->rt0);
+    f.shown = uint64_t(g_backbuffer);
+    f.rt_w = x->target_width;
+    f.rt_h = x->target_height;
+    f.rt_count = x->rt_count;
+    f.depth = x->depth && x->depth_test;
+    hud_free::BeforeDraw(c, f, a, &IssueHudFreeDraw, x);
+}
+
 // Draw replay (draw_replay.hpp): after the game's draw has run, a qualifying scene draw on the
 // immediate context is drawn again with stream output into this frame's position buffer.
 void ReplayAfterDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs& a)
@@ -2675,42 +2698,49 @@ void ReplayAfterDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs
 void STDMETHODCALLTYPE DrawIndexed_d(ID3D11DeviceContext* c, UINT count, UINT start, INT base)
 {
     Ctx* x = DrawEvent(c, count, false);
+    HudFreeBeforeDraw(c, x, {true, false, count, 1, start, 0, base});
     ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed(c, count, start, base); });
     ReplayAfterDraw(c, x, {true, false, count, 1, start, 0, base});
 }
 void STDMETHODCALLTYPE Draw_d(ID3D11DeviceContext* c, UINT count, UINT start)
 {
     Ctx* x = DrawEvent(c, count, false);
+    HudFreeBeforeDraw(c, x, {false, false, count, 1, start, 0, 0});
     ForwardGameDraw(c, x, [&] { O(c, x).draw(c, count, start); });
     ReplayAfterDraw(c, x, {false, false, count, 1, start, 0, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
 {
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
+    HudFreeBeforeDraw(c, x, {true, false, count, inst, start, start_inst, base});
     ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
     if (inst) ReplayAfterDraw(c, x, {true, false, count, inst, start, start_inst, base});
 }
 void STDMETHODCALLTYPE DrawInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, UINT start_inst)
 {
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
+    HudFreeBeforeDraw(c, x, {false, false, count, inst, start, start_inst, 0});
     ForwardGameDraw(c, x, [&] { O(c, x).draw_instanced(c, count, inst, start, start_inst); });
     if (inst) ReplayAfterDraw(c, x, {false, false, count, inst, start, start_inst, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
     Ctx* x = DrawEvent(c, 0, true);
+    HudFreeBeforeDraw(c, x, {true, true});
     ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_indirect(c, b, off); });
     ReplayAfterDraw(c, x, {true, true});
 }
 void STDMETHODCALLTYPE DrawInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
     Ctx* x = DrawEvent(c, 0, true);
+    HudFreeBeforeDraw(c, x, {false, true});
     ForwardGameDraw(c, x, [&] { O(c, x).draw_indirect(c, b, off); });
     ReplayAfterDraw(c, x, {false, true});
 }
 void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
 {
     Ctx* x = DrawEvent(c, 0, true);
+    HudFreeBeforeDraw(c, x, {false, true});
     ForwardGameDraw(c, x, [&] { O(c, x).draw_auto(c); });
     ReplayAfterDraw(c, x, {false, true});
 }
@@ -3004,6 +3034,7 @@ void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Res
 {
     ReadResource(c, src);
     Ctx* x = Get(c);
+    if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
     auto* source = !ds && !ss && !x0 && !y0 && !z0 && !box ? DepthCopySource(c, x, dst, src) : src;
     O(c, x).copy_region(c, dst, ds, x0, y0, z0, source, ss, box);
     InvalidateDepthWrite(x, dst);
@@ -3013,6 +3044,7 @@ void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* ds
 {
     ReadResource(c, src);
     Ctx* x = Get(c);
+    if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
     O(c, x).copy_resource(c, dst, DepthCopySource(c, x, dst, src));
     InvalidateDepthWrite(x, dst);
     TrackPlacementColorWrite(c, x, IdOf(dst));
@@ -3177,6 +3209,12 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         swap->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
+    }
+    if (hud_free::Wanted()) { // the HUD-free picture: the frame ends here (learning, per-frame counts)
+        Inside in;
+        DXGI_SWAP_CHAIN_DESC hd{};
+        swap->GetDesc(&hd);
+        hud_free::OnPresent(nullptr, uint64_t(g_backbuffer), hd.BufferDesc.Width, hd.BufferDesc.Height);
     }
     const auto previous = g_model.Current();
     const bool reserved_before = g_screen.ReservesPixelRead();

@@ -12,6 +12,7 @@ struct Out { uint64_t id; uint32_t w, h; };
 struct Op {
     bool compute = false, transfer = false, blend = false, depth = false;
     std::vector<Out> out;
+    uint64_t list = 1, recording = 1;
 };
 Op draw(uint64_t rt, uint32_t w, uint32_t h, bool blend, bool depth) { Op o; o.blend = blend; o.depth = depth; o.out.push_back({rt, w, h}); return o; }
 Op copy(uint64_t dst, uint32_t w, uint32_t h) { Op o; o.transfer = true; o.out.push_back({dst, w, h}); return o; }
@@ -30,7 +31,62 @@ std::vector<Op> typical(uint32_t hud_draws)
 }
 }
 
+namespace {
+// The interface drawn straight onto the shown picture: scene, composite into the shown picture,
+// interface draws (blended, depth-less) on it, with unrelated work in between.
+std::vector<Op> on_screen(uint32_t hud_draws)
+{
+    std::vector<Op> ops;
+    ops.push_back(draw(kScene, W, H, false, true));
+    ops.push_back(draw(kShown, W, H, false, false)); // tone map into the shown picture
+    for (uint32_t i = 0; i < hud_draws; ++i) {
+        ops.push_back(draw(kShown, W, H, true, false));
+        if (i == 2) ops.push_back(draw(4242, 256, 256, false, false)); // a text atlas between interface draws
+    }
+    return ops;
+}
+}
+
 int main() { return test::run({
+    {"interface on the shown picture: the copy point is the draw after the composite", [] {
+        const auto ops = on_screen(20);
+        const Snapshot s = LearnSnapshot(ops, kShown);
+        CHECK(s.verdict == SnapshotVerdict::Found);
+        CHECK(s.run == 20 && s.first_hud_op == 2 && s.draws_before == 1);
+        Sheet sheet;
+        Snapshot snap;
+        CHECK(ChooseHudVariant(ops, kShown, W, H, &sheet, &snap) == HudVariant::Snapshot);
+        CHECK(sheet.verdict != SheetVerdict::Found);
+        // A separate sheet wins when the frame has one.
+        CHECK(ChooseHudVariant(typical(85), kShown, W, H, &sheet, &snap) == HudVariant::SheetRedraw);
+        CHECK(LearnSnapshot(typical(85), kShown).verdict == SnapshotVerdict::NoRun); // its last write is the opaque composite
+    }},
+    {"interface on the shown picture: refusals", [] {
+        CHECK(LearnSnapshot(on_screen(3), kShown).verdict == SnapshotVerdict::ShortRun);
+        CHECK(LearnSnapshot(on_screen(20), 31337).verdict == SnapshotVerdict::NoShownWrite);
+        {   // only interface-like draws: no HUD-free point
+            std::vector<Op> ops;
+            for (int i = 0; i < 10; ++i) ops.push_back(draw(kShown, W, H, true, false));
+            CHECK(LearnSnapshot(ops, kShown).verdict == SnapshotVerdict::NoScene);
+            CHECK(ChooseHudVariant(ops, kShown, W, H, nullptr, nullptr) == HudVariant::None);
+        }
+        {   // finished by a copy
+            auto ops = on_screen(20);
+            ops.push_back(copy(kShown, W, H));
+            CHECK(LearnSnapshot(ops, kShown).verdict == SnapshotVerdict::ShownNotDrawn);
+        }
+        {   // composite and interface from different recordings: the k-th draw is not provable
+            auto ops = on_screen(20);
+            for (size_t i = 2; i < ops.size(); ++i) ops[i].recording = 2;
+            CHECK(LearnSnapshot(ops, kShown).verdict == SnapshotVerdict::SplitRecording);
+        }
+        {   // a depth-tested draw last: not interface-like
+            auto ops = on_screen(20);
+            ops.push_back(draw(kShown, W, H, true, true));
+            CHECK(LearnSnapshot(ops, kShown).verdict == SnapshotVerdict::NoRun);
+        }
+        CHECK(std::strstr(HudVariantName(HudVariant::Snapshot), "T3") != nullptr);
+    }},
     {"the menu choice is stored as the shown multiplier and clamped to this build", [] {
         CHECK(GeneratedFromStored(0) == 0 && GeneratedFromStored(1) == 0);
         CHECK(GeneratedFromStored(2) == 1);
