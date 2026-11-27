@@ -48,6 +48,8 @@ Preserve proven engine and game adapters while assessing what transfers. The exa
 
 ## 0. The method: how the program grows, and how we prove it (2026-11-11, v3)
 
+> **2026-11-27, Cort: GameCheck (the growth checker) is removed.** He called it a failed idea on 2026-11-21 and ordered its deletion on 2026-11-27. `tools/growth_checker/`, `growth/` and `GameCheck.cmd` are gone from the repository, along with its CI step. Everything below that describes the checker (0.1, 0.5 to 0.10) is kept as history only; do not rebuild or cite it. The replay check `scripts/score_run.py` and the variants register stay.
+
 **Cort, 2026-11-11:** "We need a planned method after we confirm it works in all games tested. After that we need an actual way to solidly confirm we are growing and not receding. Something professional... a method to the madness that's consistent. That a program becomes intelligent and adaptive to any game type it comes in contact with. We do not want a simple hodge podge of code scripts lazily bound together." Later: the checker "would be separate from the main program."
 
 Status: v3 joins Claude's draft, Sol's corrections, Claude's feasibility review and Astra's review (all in COMMS, 2026-11-11), and the build plan Cort asked for at 02:49 PT: most of the work is Claude's, the hard judgment rules are Astra's, Claude compiles the result (0.10). It adds no review gate: it replaces "does it feel better" with evidence each build must show.
