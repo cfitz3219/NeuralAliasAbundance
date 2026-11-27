@@ -65,6 +65,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -437,7 +438,7 @@ void Viewport(ID3D11DeviceContext* c, UINT w, UINT h)
 }
 
 
-void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
+void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false, bool replay_mesh = false)
 {
     g_tonemap_bound = false;
     if (g.rotate_camera) g.cam_cb = g.cam_pool[frame & 1];
@@ -506,7 +507,12 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
                 c1->VSSetConstantBuffers1(2, 1, &ring, &first, &count);
             }
         }
-        SetObject(c, g, i); c->Draw(4, 0);
+        SetObject(c, g, i);
+        if (replay_mesh && i == 39) {
+            c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            c->DrawInstanced(3, 350, 0, 0); // 1,050 positions span two packed rows.
+            c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        } else c->Draw(4, 0);
     }
     if (g.main_stats) c->End(g.main_stats);
     if (g.scene_rs) c->RSSetState(nullptr);
@@ -1997,7 +2003,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool compare_routes = composition_fault || trial_reused_depth || disagreeing_scene || parity_roles ||
         (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
-    const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
+    const bool replay_handoff = !std::strcmp(arg1, "--replay-handoff");
+    const bool camera_off_start = replay_handoff || !std::strcmp(arg1, "--camera-off-start");
     // One presenter for both APIs, stage 3: live x2 on a DX11 game (proxy chain, native DLAA inputs,
     // HUD-free picture, presenter), 8-bit SDR or FP16 back buffer.
     const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
@@ -2619,10 +2626,15 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         g_no_camera_phase = 1;
         na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
         unsigned raster_samples = 0;
+        if (replay_handoff) {
+            na::settings::Get().j2_draw_replay.store(1);
+            na::settings::Get().j2_replay_budget.store(0);
+            na::settings::Get().j2_replay_movers.store(0);
+        }
         for (int frame = 0; frame < 48; ++frame) {
             Pump();
             const auto before = g_seen.calls;
-            Scene(g.ctx.Get(), g, frame);
+            Scene(g.ctx.Get(), g, frame, false, replay_handoff);
             Post(g.ctx.Get(), g, true);
             g.swap->Present(0, 0);
             if (g_seen.calls > before && g_seen.last.raster.applied &&
@@ -2641,6 +2653,17 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(g_seen.wrong_inputs == 0 && g_seen.no_scene == 0 && g_seen.scene_changed == 1 && g_seen.twice == 0,
                "correct scene/depth identity survives bootstrap without repeated resets or duplicate deliveries");
         expect(raster_samples >= 20, "production delivery schedules actual viewport samples without a test-provided jitter");
+        if (replay_handoff) {
+            const auto replay = na::native11::draw_replay::GetStats();
+            constexpr char key[] = "replay_delivered=";
+            const char* field = std::strstr(wide, key);
+            const auto replay_frames = field ? std::strtoull(field + sizeof(key) - 1, nullptr, 10) : 0ull;
+            std::printf("DX11 replay handoff: replayed=%llu packed=%llu pack_failed=%llu delivered_with_replay=%llu gates=%s\n",
+                        (unsigned long long)replay.replayed, (unsigned long long)replay.packed,
+                        (unsigned long long)replay.pack_failed, replay_frames, replay.gates);
+            expect(replay.packed >= 20 && !replay.pack_failed && replay_frames >= 20,
+                   "GPU-packed positions reach the native DLSS motion path across the slot ring");
+        }
         expect(std::strstr(wide, "camera_setting=0") && std::strstr(wide, "measured=0}") == nullptr,
                "the production consumer names camera-independent measured motion");
         DeleteFileW(ini.c_str());

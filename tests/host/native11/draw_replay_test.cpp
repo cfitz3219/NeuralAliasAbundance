@@ -93,7 +93,7 @@ float4 ps() : SV_Target { return 1; }
     REQUIRE(SUCCEEDED(dev->CreateDepthStencilView(depth.Get(), nullptr, &dsv)));
     REQUIRE(SUCCEEDED(dev->CreateRenderTargetView(color.Get(), nullptr, &rtv)));
     // The pack's target: one row holds this test's positions.
-    td.Width = dr::kPackWidth; td.Height = 1; td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    td.Width = dr::kPackWidth; td.Height = 2; td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
     ComPtr<ID3D11Texture2D> packed, staging;
     REQUIRE(SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &packed)));
     td.BindFlags = 0; td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -104,7 +104,7 @@ float4 ps() : SV_Target { return 1; }
     const D3D11_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
     const float* vp_words = &vp.TopLeftX;
     // One frame of the "game": the quad drawn into the scene depth, then the provider's AfterDraw.
-    const auto draw = [&](uint64_t frame, float shift, bool scene) {
+    const auto draw = [&](uint64_t frame, float shift, bool scene, UINT instances = 1) {
         const float s[4] = {shift, 0, 0, 0};
         ctx->UpdateSubresource(cb.Get(), 0, nullptr, s, 0, 0);
         ID3D11Buffer* vbs[] = {vb.Get()};
@@ -121,13 +121,14 @@ float4 ps() : SV_Target { return 1; }
         ID3D11RenderTargetView* rtvs[] = {rtv.Get()};
         ctx->OMSetRenderTargets(1, rtvs, dsv.Get());
         ctx->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
-        ctx->DrawIndexed(6, 0, 0);
+        if (instances == 1) ctx->DrawIndexed(6, 0, 0);
+        else ctx->DrawIndexedInstanced(6, instances, 0, 0, 0);
         dr::DrawFacts f;
         f.frame = frame;
         f.scene_depth = scene;
         f.viewport = vp_words;
         f.viewports = 1;
-        dr::AfterDraw(ctx.Get(), f, {true, false, 6, 1, 0, 0, 0});
+        dr::AfterDraw(ctx.Get(), f, {true, false, 6, instances, 0, 0, 0});
     };
     const auto read_positions = [&](float out[6][4]) {
         ctx->CopyResource(staging.Get(), packed.Get());
@@ -210,6 +211,25 @@ float4 ps() : SV_Target { return 1; }
     const uint64_t replayed = dr::GetStats().replayed;
     draw(6, 0, true);
     CHECK(dr::Seal(6).draws.empty() && dr::GetStats().replayed == replayed);
+
+    dr::Configure(true, 0, false);
+    draw(7, .25f, true, 173);
+    const auto many = dr::Seal(7);
+    REQUIRE(many.verts == 1038 && dr::PackRows(many.verts) == 2);
+    REQUIRE(dr::Pack(ctx.Get(), packed_view.Get(), many.verts));
+    ctx->CopyResource(staging.Get(), packed.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    REQUIRE(SUCCEEDED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)));
+    bool exact = true;
+    for (UINT i = 0; i < many.verts; ++i) {
+        const UINT k = indices[i % 6];
+        const float expected[4] = {quad[2 * k] + .25f, quad[2 * k + 1], .5f, 1.f};
+        const auto* row = static_cast<const unsigned char*>(mapped.pData) + (i / dr::kVerticesPerRow) * mapped.RowPitch;
+        if (std::memcmp(row + (i % dr::kVerticesPerRow) * sizeof(expected), expected, sizeof(expected))) exact = false;
+    }
+    ctx->Unmap(staging.Get(), 0);
+    CHECK(exact);
+    std::printf("packed %llu positions across two rows, byte-exact=%d\n", (unsigned long long)many.verts, int(exact));
 
     const auto st = dr::GetStats();
     std::printf("noted %llu built %llu replayed %llu verts %llu packed %llu gates {%s}\n", (unsigned long long)st.noted,

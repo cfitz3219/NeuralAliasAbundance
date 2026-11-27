@@ -37,7 +37,10 @@ struct Record {
 };
 
 // Positions a frame can hold (float4 each). The packed texture is kPackWidth texels wide.
-constexpr uint32_t kCapacity = 4096u * 384u, kPackWidth = 4096u, kPackRows = kCapacity / kPackWidth;
+constexpr uint32_t kCapacity = 4096u * 384u, kPackWidth = 4096u;
+constexpr uint32_t kVerticesPerRow = kPackWidth / 4u;
+constexpr uint32_t PackRows(uint64_t verts) { return static_cast<uint32_t>((verts + kVerticesPerRow - 1) / kVerticesPerRow); }
+constexpr uint32_t kPackRows = PackRows(kCapacity);
 
 // Hooks the device's CreateVertexShader to keep each vertex shader's bytecode. Idempotent.
 bool Install(void* device);
@@ -72,10 +75,10 @@ void AfterDraw(ID3D11DeviceContext* context, const DrawFacts& facts, const DrawA
 struct Sealed { uint64_t frame = 0, verts = 0; std::vector<Record> draws; };
 Sealed Seal(uint64_t frame);
 // Records on `context` (the immediate one) the copy of the sealed frame's positions into `target`
-// (R32G32B32A32_FLOAT, kPackWidth x at least rows(verts), a UAV of it): texel i = position i. Must
+// (RGBA8_UNORM, kPackWidth x at least PackRows(verts)): one texel carries the four bytes of one
+// float component. A row-major copy restores the original float4 bytes without a decoder. Must
 // come after the frame's last replayed draw and before that context's next scene draws.
 bool Pack(ID3D11DeviceContext* context, ID3D11UnorderedAccessView* target, uint64_t verts);
-inline uint32_t PackRows(uint64_t verts) { return static_cast<uint32_t>((verts + kPackWidth - 1) / kPackWidth); }
 
 // What the rasteriser learned about the draws it drew (the DX12 pass's learn sink).
 struct Observation { uint64_t sig = 0, vb = 0; uint32_t visible = 0, apart = 0; };
