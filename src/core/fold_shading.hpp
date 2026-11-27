@@ -57,6 +57,26 @@ constexpr uint32_t JitterPhases(Mode m, uint32_t dlaa_phases)
     const uint32_t want = 8u * b.x * b.y;
     return want > dlaa_phases ? want : dlaa_phases;
 }
+// The sample spacing a frame is drawn with: the shown level's blocks; while another level warms beside it,
+// the smaller block on each axis. Both levels' declared jitter (DeclaredJitter) then stays inside DLSS's
+// half-pixel range. With the shown level's spacing alone, a Quality level warming beside Performance was
+// told up to 1.5 px on the vertical axis and DLSS refused every warm-up frame.
+struct Spacing { Block block, pick; };
+constexpr Spacing JitterSpacing(Mode shown, Mode warming)
+{
+    Block b = BlockFor(shown);
+    if (warming != Mode::Off) {
+        const Block w = BlockFor(warming);
+        if (w.x < b.x) b.x = w.x;
+        if (w.y < b.y) b.y = w.y;
+    }
+    return {b, {b.x - 1, b.y - 1}}; // the kept pixel is the last of each block (Pick)
+}
+constexpr uint32_t JitterPhases(Spacing s, uint32_t dlaa_phases)
+{
+    const uint32_t want = 8u * s.block.x * s.block.y;
+    return s.block.x * s.block.y > 1 && want > dlaa_phases ? want : dlaa_phases;
+}
 
 // The hand-over. Cort: "Make sure that it keeps DLAA going until the handover is truly ready, no need to
 // leave me sitting at a frozen picture wondering if it'll crash." While a new mode is asked for, the

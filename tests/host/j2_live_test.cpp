@@ -212,6 +212,7 @@ void WritePattern(ID3D12GraphicsCommandList* l, const std::map<std::string, test
 
 int main(int argc,char** argv)
 {
+    na::settings::Get().j2_fold_prewarm.store(0); // these checks count exactly one DLSS evaluation per frame
     const bool native_dlaa = argc > 1 && std::strstr(argv[1], "native-dlaa") != nullptr;
     const bool native_lighting = native_dlaa && std::strstr(argv[1], "rotating-lighting");
     const bool native_region = native_dlaa && std::strstr(argv[1], "centered");

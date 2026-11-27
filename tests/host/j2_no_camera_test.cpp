@@ -93,6 +93,7 @@ void Store(uint8_t* dst, const M& m)
 
 int main(int argc, char** argv)
 {
+    na::settings::Get().j2_fold_prewarm.store(0); // these checks count exactly one DLSS evaluation per frame
     na::gpu::SetBackendForTests(na::gpu::TestBackend::Native);
     setvbuf(stdout, nullptr, _IONBF, 0); // progress survives a timeout kill
     test::Device d;

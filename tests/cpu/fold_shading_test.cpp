@@ -34,6 +34,27 @@ int main() { return test::run({
         }
         CHECK(KeptPixelCentring(1, 0) == 0.f);
     }},
+    {"while a level warms beside another, both are told jitter inside the half-pixel range", [] {
+        // The frame is drawn with JitterSpacing(shown, warming); each level declares its own jitter from it.
+        for (Mode shown : {Mode::Off, Mode::Quality, Mode::Performance})
+            for (Mode warm : {Mode::Off, Mode::Quality, Mode::Performance}) {
+                const Spacing sp = JitterSpacing(shown, warm);
+                for (float j : {-0.5f, -0.25f, 0.f, 0.25f, 0.49f}) {
+                    const float fx = sp.block.x * j + KeptPixelCentring(sp.block.x, sp.pick.x);
+                    const float fy = sp.block.y * j + KeptPixelCentring(sp.block.y, sp.pick.y);
+                    for (Mode m : {shown, warm}) {
+                        if (m == warm && warm == Mode::Off) continue; // nothing warms (DLAA is never warmed: going back is immediate)
+                        const Block b = BlockFor(m), p = Pick(m);
+                        CHECK(std::fabs(DeclaredJitter(b.x, p.x, fx)) <= 0.5f + 1e-6f);
+                        CHECK(std::fabs(DeclaredJitter(b.y, p.y, fy)) <= 0.5f + 1e-6f);
+                    }
+                }
+            }
+        // Alone (or with DLAA beside it), a level keeps its own spacing; DLAA is unchanged.
+        CHECK(JitterSpacing(Mode::Performance, Mode::Off).block.y == 2 && JitterSpacing(Mode::Off, Mode::Quality).block.x == 1);
+        CHECK(JitterSpacing(Mode::Performance, Mode::Quality).block.x == 2 && JitterSpacing(Mode::Performance, Mode::Quality).block.y == 1);
+        CHECK(JitterPhases(JitterSpacing(Mode::Off, Mode::Off), 16) == 16 && JitterPhases(JitterSpacing(Mode::Performance, Mode::Off), 16) == 32);
+    }},
     {"the screen keeps its mode until the new one has proven itself", [] {
         Handover h;
         auto s = h.Begin(Mode::Off, true);
