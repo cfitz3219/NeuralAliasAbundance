@@ -1,4 +1,5 @@
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 #include "host_dx12/effects/donut.hpp"
 #include "host_dx12/effects/xegtao.hpp"
 #include "host_dx12/gpu/services.hpp"
@@ -1017,6 +1018,14 @@ void write_status_line()
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
     {char usage_line[1024];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
      if(usage_bytes>0)WriteFile(f,usage_line,DWORD((std::min)(usage_bytes,int(sizeof(usage_line)-1))),&written,nullptr);}
+    { // Our own video memory, item by item, beside the process figure (which holds the game's memory too).
+        char vram_line[1536];int vn=na::vram::FormatLine(vram_line,sizeof(vram_line)-160);
+        if(vn>0){double process_mb=0,budget_mb=0;const double ours_mb=na::vram::Mb(na::vram::TotalBytes());
+            if(na::usage::VideoMemory(&process_mb,&budget_mb))
+                vn+=std::snprintf(vram_line+vn,sizeof(vram_line)-size_t(vn)," process_mb=%.0f budget_mb=%.0f game_mb=%.0f",process_mb,budget_mb,process_mb>ours_mb?process_mb-ours_mb:0.0);
+            else vn+=std::snprintf(vram_line+vn,sizeof(vram_line)-size_t(vn)," process_mb=unknown");
+            vn+=std::snprintf(vram_line+vn,sizeof(vram_line)-size_t(vn),"\r\n");
+            WriteFile(f,vram_line,DWORD((std::min)(vn,int(sizeof(vram_line)-1))),&written,nullptr);}}
     { // Effects and shared GPU services: enabled state, work done, errors and the last reason.
         const auto& st = na::settings::Get();
         const auto xs = na::xegtao::ScenePass().GetStats();
@@ -1956,12 +1965,12 @@ UINT64 menu_completed_prefix() {
 void write_menu_progress(HANDLE log)
 {
     const auto cf=na::j2::compute_flow::GetStats();char cfline[950];DWORD cfw=0;
-    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u} flow_loosen=%u sum{pairs=%llu accepted=%llu invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu}\r\n",
+    const int cfn=snprintf(cfline,sizeof cfline,"j2compute engine=amd recorded=%llu submitted=%llu pairs=%llu busy=%llu accepted=%llu total=%llu ms=%.3f reason=\"%s\" attempts=%llu paired_submissions=%llu unavailable=%llu history_only=%llu last_frame=%llu submit_age_ms=%llu sample_frame=%llu sample_age_ms=%llu samples=%llu excluded{invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu} pool{recordings=%u images=%u busy_peak=%u} flow_loosen=%u sum{pairs=%llu accepted=%llu invalid=%llu small=%llu cost=%llu offscreen=%llu image=%llu flicker=%llu}\r\n",
         static_cast<unsigned long long>(cf.recorded),static_cast<unsigned long long>(cf.submitted),static_cast<unsigned long long>(cf.pairs),
         static_cast<unsigned long long>(cf.busy),static_cast<unsigned long long>(cf.accepted),static_cast<unsigned long long>(cf.total),cf.ms,cf.reason,
         (unsigned long long)cf.attempts,(unsigned long long)cf.submitted_pairs,(unsigned long long)cf.unavailable,(unsigned long long)cf.waiting_history,
         (unsigned long long)cf.last_submitted_frame,(unsigned long long)cf.submit_age_ms,(unsigned long long)cf.sample_frame,(unsigned long long)cf.sample_age_ms,(unsigned long long)cf.samples,
-        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,cf.loosen,
+        (unsigned long long)cf.rejected_invalid,(unsigned long long)cf.rejected_small,(unsigned long long)cf.rejected_cost,(unsigned long long)cf.rejected_offscreen,(unsigned long long)cf.rejected_image,(unsigned long long)cf.rejected_flicker,cf.recording_slots,cf.image_slots,cf.images_busy_peak,cf.loosen,
         (unsigned long long)cf.sum_pairs,(unsigned long long)cf.sum[0],(unsigned long long)cf.sum[1],(unsigned long long)cf.sum[2],(unsigned long long)cf.sum[3],
         (unsigned long long)cf.sum[4],(unsigned long long)cf.sum[5],(unsigned long long)cf.sum[6]);
     if(cfn>0)WriteFile(log,cfline,(std::min)(DWORD(cfn),DWORD(sizeof(cfline)-1)),&cfw,nullptr);

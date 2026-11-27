@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <vector>
 
 #include "core/fold_shading.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
@@ -27,9 +28,19 @@ public:
     // The compute program and a descriptor ring of `ring` slots (two tables a slot: shown and warm-up).
     bool Init(ID3D12Device* device, uint32_t ring);
     bool Ok() const { return ok_; }
-    // The folded planes of mode m and the unseen warm-up output, in UNORDERED_ACCESS between uses.
-    // Replaced only when the picture's size or format changes.
+    // The folded planes of mode m, in UNORDERED_ACCESS between uses. Replaced only when the picture's size
+    // or format changes. (ow, oh, out_format are no longer used: nothing is run unseen any more.)
     bool Targets(Mode m, uint32_t w, uint32_t h, DXGI_FORMAT color_format, uint32_t ow, uint32_t oh, DXGI_FORMAT out_format);
+    // Mode m's planes are not needed any more (no level, or another one): they are given back a few seconds
+    // later (Collect), when no frame in flight can still read them.
+    void Release(Mode m);
+    // Once a frame: frees released planes whose time has come.
+    void Collect();
+    // What DLSS will be given for mode m on a picture described by `base` (as Record would describe it, without
+    // any work or resources): the DLSS feature a level needs is made from this before the level is shown.
+    static void Describe(const dlss::EvalDesc& base, Mode m, uint64_t view_base, uint32_t preset, dlss::EvalDesc* out);
+    // The name this pass's items carry in the video memory log ("dx12", "dx11").
+    void Tag(const char* tag) { tag_ = tag; }
     // Keeps pixel `pick` of each `blk` block of colour, depth and motion into `planes` (descriptor table `table`).
     // motion_ready: the motion plane already holds the kept vectors (left as it is).
     void Dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motion,
@@ -40,7 +51,6 @@ public:
                 dlss::EvalDesc* out, uint64_t view_base, uint32_t preset, bool motion_ready = false);
     void Done(ID3D12GraphicsCommandList* l, Mode m);
     Planes& PlanesFor(Mode m) { return planes_[static_cast<uint32_t>(m)]; }
-    ID3D12Resource* Unseen() const { return unseen_.Get(); }
     uint32_t Ring() const { return ring_; }
     // Every resource the pass owns (a recording keeps them alive until it has run).
     template <class F> void ForEachResource(F f) const
@@ -50,13 +60,18 @@ public:
             if (p.depth) f(p.depth);
             if (p.motion) f(p.motion);
         }
-        if (unseen_) f(unseen_);
+        for (const auto& r : released_) {
+            if (r.planes.color) f(r.planes.color);
+            if (r.planes.depth) f(r.planes.depth);
+            if (r.planes.motion) f(r.planes.motion);
+        }
     }
     // Everything released (device change, shutdown); the waiting period starts over.
     void Reset()
     {
-        for (auto& p : planes_) p = Planes{};
-        unseen_.Reset(); root_.Reset(); pso_.Reset(); heap_.Reset(); device_.Reset();
+        for (uint32_t i = 0; i < kModes; ++i) if (planes_[i].color) Release(static_cast<Mode>(i));
+        released_.clear();
+        root_.Reset(); pso_.Reset(); heap_.Reset(); device_.Reset();
         tried_ = ok_ = false;
         hand = Handover{};
     }
@@ -68,8 +83,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
-    Microsoft::WRL::ComPtr<ID3D12Resource> unseen_;
     Planes planes_[kModes];
+    struct Released { Planes planes; uint64_t at_ms = 0; };
+    std::vector<Released> released_;
+    const char* tag_ = "fold";
     uint32_t inc_ = 0, ring_ = 1;
     bool tried_ = false, ok_ = false;
 };

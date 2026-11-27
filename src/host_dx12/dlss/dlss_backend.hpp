@@ -196,6 +196,31 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
 // invalid input or when latched off; the reason is in GetStats().
 bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_reset = nullptr);
 
+// One DLSS feature at a time (coordinator 2026-11-27: a DLSS level change holds only the feature in use).
+// A level change makes the next feature off the frame: PrepareFeature, called right after a frame's
+// Evaluate, starts a background thread that makes the feature `d` describes (render and output size,
+// quality, flags, preset, view) on its own command list and queue. NVIDIA's NGX is not thread safe, so it
+// holds the backend's lock while NVIDIA makes it: an Evaluate that comes during that time waits for it.
+// The view's next Evaluate whose description matches adopts the feature (its GPU work waits for the
+// feature's own on the GPU, never on the CPU) and the view's old feature is retired. The caller releases
+// the view that was on screen (ReleaseView) right after that Evaluate, so the old feature is never
+// evaluated again after the new one exists (DLSS 310.9.16 spoils a larger feature evaluated after a
+// smaller one was made; see ordered_feature_group).
+enum class Prepared { None, Making, Ready, Failed };
+Prepared PrepareFeature(const EvalDesc& d);
+// The state for `d` without starting anything (None: nothing is being made for it).
+Prepared PreparedState(const EvalDesc& d);
+// Waits until the feature being made for `d` is made (Ready / Failed), or returns None at once when
+// nothing is being made for it. *waited_ms: how long this call waited.
+Prepared WaitPrepared(const EvalDesc& d, double* waited_ms = nullptr);
+// A made feature nobody adopted is retired (the request changed).
+void CancelPrepared();
+// Called first on each background thread of the backend (the host marks the thread's D3D12 work as its own).
+void SetBackgroundThreadInit(void (*init)());
+// The last off-frame creation: how long NVIDIA took (CPU) and for which size.
+struct PrepareStats { uint64_t made = 0, failed = 0, adopted = 0, cancelled = 0; double last_ms = 0, longest_ms = 0; uint32_t w = 0, h = 0; };
+PrepareStats GetPrepareStats();
+
 // From the host's ExecuteCommandLists path, after the original call returned
 // (no waits): signals completion for tracked evaluations in this submission
 // and releases retired features whose last use has completed.

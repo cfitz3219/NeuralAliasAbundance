@@ -5,6 +5,9 @@
 #include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
 #include "host_dx12/nvof/flow_expand.hpp"
 #include "host_dx12/nr/native_fg.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
+#include <windows.h>
+#include <string>
 #include "core/motion_arbiter_gpu.hpp"
 #include "core/camera_fit_gpu.hpp"
 #include "core/jitter_probe_gpu.hpp"
@@ -66,6 +69,11 @@ struct Slot {
     int hist_written=-1; // temporal history this recording's pair writes (published at Committed)
 };
 struct Context {
+    // Video memory (diag/vram_ledger.hpp): this context's item, and when it last measured a frame (an
+    // unused context of another size is given back after kDropAfterMs).
+    std::string vram_name;ULONGLONG used_ms=0;
+    ~Context(){if(!vram_name.empty())na::vram::Set(vram_name.c_str(),0,"measured motion at this size is no longer used: released");}
+    void note_vram(const char* why);
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;unsigned w=0,h=0,stride=0;int last=-1;
     DXGI_FORMAT image_format=DXGI_FORMAT_R8G8B8A8_UNORM;
     ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> pso_encode,pso_accept;
@@ -138,6 +146,27 @@ std::mutex mutex;std::shared_ptr<Context> current;Stats stats;uint64_t last_subm
 // the sizes Prepare is building on its own thread.
 std::vector<std::shared_ptr<Context>> cached;std::vector<std::pair<unsigned,unsigned>> building;
 constexpr size_t kCachedContexts=3;
+constexpr ULONGLONG kDropAfterMs=5000; // a context of another size not used this long is released
+struct FailedSize{unsigned w,h;ULONGLONG at_ms;};
+std::vector<FailedSize> failed_sizes; // under mutex
+// The context's video memory as one item (its own textures; AMD's flow pyramids are a few MB more).
+void Context::note_vram(const char* why){
+    uint64_t bytes=0;
+    for(auto* r:{raw.Get(),expanded.Get(),residual.Get(),valid.Get(),mask.Get(),counters.Get(),zero.Get(),hist[0].Get(),hist[1].Get(),total.Get(),cut_state.Get(),
+                  votes.Get(),grid.Get(),top.Get(),fit_grid.Get(),fit_model.Get(),fit_state.Get()})bytes+=na::vram::SizeOf(r);
+    for(const auto& i:images)if(i)bytes+=na::vram::SizeOf(i->tex.Get())+na::vram::SizeOf(i->raw_color.Get());
+    if(vram_name.empty()){char n[48];std::snprintf(n,sizeof n,"motion_context_%ux%u",w,h);vram_name=n;}
+    na::vram::Set(vram_name.c_str(),bytes,why);
+}
+// Contexts of other sizes nobody measured with for kDropAfterMs (a level left, an old picture size) are
+// released: the GPU finished with them long before (a ticket still holding one keeps it until committed).
+void drop_unused_locked(ULONGLONG now){
+    // Released on a thread of their own: freeing a whole working set (dozens of textures) took a frame's worth of
+    // time on the frame (the measured DX11 fixture: a 66 ms frame against 35 ms).
+    std::vector<std::shared_ptr<Context>> dropped;
+    for(auto it=cached.begin();it!=cached.end();){if(now-(*it)->used_ms>kDropAfterMs){dropped.push_back(std::move(*it));it=cached.erase(it);}else ++it;}
+    if(!dropped.empty())std::thread([d=std::move(dropped)]() mutable {SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);d.clear();}).detach();
+}
 void reason(const char* r){strncpy_s(stats.reason,r,_TRUNCATE);}
 bool compile_flow_shader(const char* source,size_t bytes,const char* name,const char* entry,ComPtr<ID3DBlob>& result){
     // Fixed source strings and entry point names. Bytecode has no dependency on
@@ -185,7 +214,8 @@ bool build(Context& c,ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,
     // The frame candidates are optional: without their programs or working memory the search's grid is used as it is.
     if(c.pso_cand_apply && !(c.tex(DXGI_FORMAT_R32_UINT,c.votes,256,256,U) && c.tex(DXGI_FORMAT_R16G16_SINT,c.grid,(w+7)/8,(h+7)/8,S) && c.buffer(48,D3D12_HEAP_TYPE_DEFAULT,U,c.top))){
         c.pso_cand_clear.Reset();c.pso_cand_count.Reset();c.pso_cand_pick.Reset();c.pso_cand_apply.Reset();}
-    queue->GetTimestampFrequency(&c.frequency);return true;
+    queue->GetTimestampFrequency(&c.frequency);c.used_ms=GetTickCount64();
+    c.note_vram("measured motion at this picture size (8 kept pictures and the measuring textures)");return true;
 }
 bool free(Image& i){i.uses.erase(std::remove_if(i.uses.begin(),i.uses.end(),[](const Lease& l){return l.Retired();}),i.uses.end());return i.uses.empty();}
 void collect(Context& c){for(size_t index=0;index<c.leases.size();++index){auto& s=*c.leases[index];if((!s.pair && !s.probe) || !s.lease.Retired())continue;
@@ -279,6 +309,7 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         current=std::move(next);
     }
     auto c=current;
+    {const ULONGLONG now=GetTickCount64();c->used_ms=now;drop_unused_locked(now);}
     if(f.total && (!c->pso_measure || !c->pso_cut_state || !c->pso_cut_show)){++stats.unavailable;reason("Measured motion: its GPU programs did not build on this device");return {};}
     const na::jitter::Source colour_key{f.source_generation,w,h,static_cast<uint32_t>(d.Format)};
     if(!(colour_key==c->colour_jitter.Key())){
@@ -300,9 +331,11 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
     unsigned work=0;while(work<c->leases.size() && in_use(*c->leases[work]))++work;
     if(work==c->leases.size())c->leases.push_back(std::make_unique<Slot>());
     auto& slot=*c->leases[work];if(!prepare_slot(*c,work)){++stats.unavailable;reason("AMD recording descriptor allocation failed; camera motion used");return {};}
+    {uint32_t busy=1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)==c->last || !free(*c->images[j]))++busy; // +1: the one this recording takes
+     if(busy>stats.images_busy_peak)stats.images_busy_peak=busy;}
     int image=-1;for(unsigned j=0;j<c->images.size();++j)if(static_cast<int>(j)!=c->last && free(*c->images[j])){image=static_cast<int>(j);break;}
     if(image<0){auto next=std::make_unique<Image>();if(!c->tex(c->image_format,next->tex) || !c->tex(DXGI_FORMAT_R8G8B8A8_UNORM,next->raw_color)){++stats.unavailable;reason("AMD history image allocation failed; camera motion used");return {};}
-        image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));}
+        image=static_cast<int>(c->images.size());c->images.push_back(std::move(next));c->note_vram("measured motion needed one more kept picture");}
     slot.lease=lease;slot.after={};slot.pair=slot.probe=false;slot.submitted=false;slot.fit_only=!f.residual && !f.total;slot.total=f.total;slot.cut_seed=false;slot.candidates=false;slot.screen=false;slot.hist_written=-1;slot.frame=f.frame;auto& im=*c->images[image];im.uses.push_back(lease);im.producer=lease;
     slot.color_input=color;slot.depth_input=depth;
     stats.recording_slots=static_cast<uint32_t>(c->leases.size());stats.image_slots=static_cast<uint32_t>(c->images.size());
@@ -546,18 +579,32 @@ void Prepare(ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,unsigned 
     std::lock_guard<std::mutex> lock(mutex);
     if(current && (current->device.Get()!=device || current->queue.Get()!=queue))return; // Record settles a new device first
     if(current && current->w==w && current->h==h)return;
-    for(const auto& c:cached)if(c->w==w && c->h==h)return;
+    for(const auto& c:cached)if(c->w==w && c->h==h){c->used_ms=GetTickCount64();return;} // asked for: kept
     for(const auto& b:building)if(b.first==w && b.second==h)return;
+    // A size whose working set could not be made (too small for the flow) is not tried again for a while: a new
+    // build thread every frame would cost and would always look busy.
+    for(const auto& f:failed_sizes)if(f.w==w && f.h==h && GetTickCount64()-f.at_ms<30000)return;
     building.emplace_back(w,h);
     ComPtr<ID3D12Device> dev(device);ComPtr<ID3D12CommandQueue> q(queue);
     std::thread([dev,q,w,h]{
         auto next=std::make_shared<Context>();const bool ok=build(*next,dev.Get(),q.Get(),w,h);
         std::lock_guard<std::mutex> lock(mutex);
         building.erase(std::remove(building.begin(),building.end(),std::make_pair(w,h)),building.end());
-        if(!ok){++stats.prepare_failed;return;}
+        if(!ok){++stats.prepare_failed;failed_sizes.push_back({w,h,GetTickCount64()});if(failed_sizes.size()>8)failed_sizes.erase(failed_sizes.begin());return;}
         if(current && (current->device.Get()!=dev.Get() || current->queue.Get()!=q.Get()))return;
         cached.push_back(std::move(next));++stats.prepared;if(cached.size()>kCachedContexts)cached.erase(cached.begin());
     }).detach();
+}
+bool Building(unsigned w,unsigned h){
+    std::lock_guard<std::mutex> lock(mutex);
+    for(const auto& b:building)if(b.first==w && b.second==h)return true;
+    return false;
+}
+void Keep(unsigned w,unsigned h){
+    std::lock_guard<std::mutex> lock(mutex);
+    const ULONGLONG now=GetTickCount64();
+    if(current && current->w==w && current->h==h)current->used_ms=now;
+    for(const auto& c:cached)if(c->w==w && c->h==h)c->used_ms=now;
 }
 bool Ready(unsigned w,unsigned h){
     std::lock_guard<std::mutex> lock(mutex);

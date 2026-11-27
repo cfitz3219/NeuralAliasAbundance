@@ -66,6 +66,9 @@ struct DrawArgs {
 
 // Live settings, called once a frame by the consumer. `on` false: no draw is replayed (nothing else changes).
 void Configure(bool on, uint64_t budget, bool movers);
+// Replay is off: the stream-output buffer is released (made again when replay is next on). Its last
+// frame's draws have long been packed (the caller waited a few seconds).
+void ReleaseBuffers();
 bool Active();
 // After the game's draw has been forwarded (immediate context, the game's thread).
 void AfterDraw(ID3D11DeviceContext* context, const DrawFacts& facts, const DrawArgs& args);

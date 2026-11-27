@@ -13,6 +13,7 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/j2/replay_motion.hpp"
@@ -117,9 +118,12 @@ struct Session {
     // Folded flow (as on DX12): the frame whose folded picture the folded working set holds.
     uint64_t folded_last_frame = 0;
     na::fold::Mode folded_last_mode = na::fold::Mode::Off;
-    // The picture the levels' DLSS features were made for (with DLAA's; see the fold block).
-    uint32_t levels_w = 0, levels_h = 0, levels_preset = ~0u;
-    DXGI_FORMAT levels_format = DXGI_FORMAT_UNKNOWN;
+    // One DLSS feature at a time (the fold block): the next mode's feature is started right after this
+    // frame's Evaluate; the frame that shows a new mode releases the view the old one used.
+    bool fold_prepare_after = false;
+    dlss::EvalDesc fold_prepare_desc{};
+    uint64_t fold_release_view_after = 0;
+    double fold_prepare_wait_ms = 0;
     // GPU time of this route's own stages (timestamps on the effects list, read back a few frames later).
     ComPtr<ID3D12QueryHeap> gpu_queries;
     ComPtr<ID3D12Resource> gpu_readback;
@@ -318,7 +322,15 @@ bool Prepare(Session& s, Slot& slot, const ImageDesc& color, const ImageDesc& de
                                                       nullptr, IID_PPV_ARGS(&slot.after))) ||
                         FAILED(slot.after->Close()))) return false;
     slot.depth_format = packed;
-    return packed == DXGI_FORMAT_R32_FLOAT || PreparePackedDepth(s, slot, depth, packed);
+    const bool ok = packed == DXGI_FORMAT_R32_FLOAT || PreparePackedDepth(s, slot, depth, packed);
+    uint64_t bytes = 0;
+    for (const auto& sl : s.slots) {
+        if (!sl) continue;
+        bytes += na::vram::SizeOf(sl->color.Effects()) + na::vram::SizeOf(sl->depth.Effects()) + na::vram::SizeOf(sl->output.Effects()) +
+                 na::vram::SizeOf(sl->motion.Get()) + na::vram::SizeOf(sl->provenance.Get());
+    }
+    na::vram::Set("dlaa_core_dx11", bytes, "DLAA's working pictures for each frame in flight (colour, depth, output, motion, provenance)");
+    return ok;
 }
 
 void Barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* image,
@@ -400,6 +412,15 @@ void ReplayLearnSink(const observe::ReplayObservation* seen, size_t n)
     native11::draw_replay::Learn(o.data(), n);
 }
 
+// This route's draw replay buffers (the frames' positions, and each slot's packed copy) as one item.
+void ReplayVram(Session& s, const char* why)
+{
+    uint64_t bytes = 0;
+    for (const auto& b : s.replay_buffers) bytes += na::vram::SizeOf(b.buffer.Get());
+    for (const auto& sl : s.slots) if (sl) bytes += na::vram::SizeOf(sl->positions.Effects());
+    na::vram::Set("draw_replay_dx11", bytes, why);
+}
+
 HRESULT MakeReplayBuffer(ID3D12Device* dev, ComPtr<ID3D12Resource>& out)
 {
     D3D12_HEAP_PROPERTIES heap{};
@@ -472,6 +493,33 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     std::lock_guard<std::mutex> lock(mutex);
     auto& s = State();
     if (s.failed) return false;
+    {   // Draw replay off for a few seconds: its buffers on both devices are given back once every frame
+        // that used them has retired (made again when replay is next on).
+        static ULONGLONG off_since = 0;
+        static bool released = true;
+        if (replay_setting) { off_since = 0; released = false; }
+        else if (!released) {
+            if (!off_since) off_since = GetTickCount64();
+            else if (GetTickCount64() - off_since > 3000) {
+                bool all = true;
+                for (auto& b : s.replay_buffers) {
+                    if (b.buffer && s.fences.Retired(b.native_done, b.effects_done)) b.buffer.Reset();
+                    all = all && !b.buffer;
+                }
+                for (auto& sl : s.slots) {
+                    if (!sl) continue;
+                    if (sl->positions.Effects() && s.fences.Retired(sl->native_done, sl->effects_done)) { sl->positions_view.Reset(); sl->positions.Reset(); }
+                    all = all && !sl->positions.Effects();
+                }
+                if (all) {
+                    s.replay_prev = -1;
+                    native11::draw_replay::ReleaseBuffers();
+                    ReplayVram(s, "draw replay has been off for a few seconds: its buffers are released");
+                    released = true;
+                }
+            }
+        }
+    }
     auto* ctx = static_cast<ID3D11DeviceContext*>(context);
     ComPtr<ID3D11Device> native;
     ctx->GetDevice(&native);
@@ -696,7 +744,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                                         : na::fold::ModeFrom(settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
     {
         const na::fold::Mode shown = s.fold.hand.shown;
-        if (shown != na::fold::Mode::Off && fold_setting == shown && s.fold.hand.warming == na::fold::Mode::Off && s.fold.Ok() &&
+        if (shown != na::fold::Mode::Off && fold_setting == shown && s.fold.hand.preparing == na::fold::Mode::Off && s.fold.Ok() &&
             !ambient_requested && !s.companion && !capture::j2::Armed()) {
             const auto blk = na::fold::BlockFor(shown);
             const auto& planes = s.fold.PlanesFor(shown);
@@ -710,6 +758,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // folded picture. The folded size's working set is built on its own thread from the moment a level is
     // asked for; the level's first frame on screen records its folded picture beside the whole-picture pair.
     bool folded_ready = false;
+    if (measured) j2::compute_flow::Keep(ci.width, ci.height); // the whole picture's working set stays while motion is measured
     if (fold_setting != na::fold::Mode::Off && measured && s.fold.Ok()) {
         const auto ab = na::fold::BlockFor(fold_setting);
         j2::compute_flow::Prepare(s.device.Get(), s.queue.Get(), na::fold::Folded(ci.width, ab.x), na::fold::Folded(ci.height, ab.y));
@@ -865,6 +914,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             if (!b.buffer) {
                 const HRESULT hr = MakeReplayBuffer(s.device.Get(), b.buffer);
                 if (FAILED(hr)) { ReplayHandoffFailed(s, hr, "allocate_DX12_history_buffer"); break; }
+                ReplayVram(s, "draw replay is on: the frames' replayed positions");
             }
             replay_cur = i;
         }
@@ -880,6 +930,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                 slot.positions.Reset(); // This slot has retired and its new allocation has never been submitted.
                 replay_cur = -1;
                 ReplayHandoffFailed(s, hr, operation);
+            } else {
+                ReplayVram(s, "draw replay is on: this slot's packed positions");
             }
         }
         // The game's context packs the positions now (in its order: after the frame's last replayed
@@ -1057,14 +1109,14 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         }
     }
     // DLSS Quality / Performance (the fold, fold/fold_pass.hpp, the same as on the DX12 route). The level
-    // on screen keeps running; a newly asked level is run beside it into a picture nobody sees until it has
-    // proven itself (Handover). A level that cannot save the game's shading is refused when it is chosen,
-    // and the level on screen stays.
+    // on screen keeps running while everything a newly asked level needs is made beside it, off the frame;
+    // the screen changes once it all exists (Handover). A level that cannot save the game's shading is
+    // refused when it is chosen, and the level on screen stays.
     ID3D12Resource* const full_color = eval.color; // full size: what a measured cut shows (RecordCutShow)
     na::fold::Mode fold_shown = na::fold::Mode::Off;
     // CPU time of this frame's level work (ms), logged on the frames of a waiting period and a switch.
     const auto now_ms = [] { LARGE_INTEGER t, f; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f); return double(t.QuadPart) * 1000.0 / double(f.QuadPart); };
-    double fold_cpu_prepare = 0, fold_cpu_warm = 0, fold_cpu_show = 0;
+    double fold_cpu_prepare = 0, fold_cpu_show = 0;
     bool fold_log_frame = false;
     {
         using na::fold::Mode;
@@ -1073,6 +1125,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         const char* why = nullptr;
         const char* coarse_why = nullptr;
         const double t_prepare = now_ms();
+        s.fold.Tag("dx11"); // its items' names in the video memory log
         if (asked != Mode::Off || s.fold.hand.shown != Mode::Off) {
             const DXGI_FORMAT in_format = eval.color->GetDesc().Format;
             if (s.companion) why = "DLSS runs in the separate 64-bit helper program for this game, where the folded picture cannot be handed over yet";
@@ -1082,63 +1135,75 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                 if (m != Mode::Off && !why && !s.fold.Targets(m, ci.width, ci.height, in_format, ci.width, ci.height, slot.output.Effects()->GetDesc().Format))
                     why = "the folded working textures could not be made for this colour format";
         }
-        fold_cpu_prepare = now_ms() - t_prepare;
         g_fold_status.Why("fold11", why);
         if (why) ++s.fold_unable;
-        // The levels' DLSS features are made together with DLAA's, on the first frame at this picture size and
-        // before DLAA's own (smallest first: DLSS 310.9.16 spoils a larger feature when a smaller one is made after
-        // it, and making DLAA's again would cost the same once more and restart its history). A level asked for
-        // later has nothing left to make: its waiting period only warms its history and the switch adds no work.
-        bool prewarmed = false;
-        {
-            const DXGI_FORMAT in_format = eval.color->GetDesc().Format;
-            if (settings::Get().j2_fold_prewarm.load(std::memory_order_relaxed) && !s.companion && native11::CoarseShadingAvailable() &&
-                (s.levels_w != ci.width || s.levels_h != ci.height || s.levels_format != in_format || s.levels_preset != preset)) {
-                const double t_levels = now_ms();
-                const DXGI_FORMAT out_format = slot.output.Effects()->GetDesc().Format;
-                bool ok = s.fold.Init(s.device.Get(), kSlots);
-                for (const Mode m : {Mode::Performance, Mode::Quality})
-                    ok = ok && s.fold.Targets(m, ci.width, ci.height, in_format, ci.width, ci.height, out_format);
-                for (const Mode m : {Mode::Performance, Mode::Quality}) {
-                    if (!ok) break;
-                    dlss::EvalDesc pe{};
-                    s.fold.Record(list, eval, m, index, m == Mode::Quality, &pe, kFoldView, preset); // its own table each
-                    pe.output = s.fold.Unseen();
-                    pe.reset = true;
-                    ok = dlss::Evaluate(list, pe);
-                    s.fold.Done(list, m);
+        // One DLSS feature at a time (coordinator 2026-11-27), as on the DX12 route: the level asked for is
+        // ready once its planes (above), its measured-motion working set and its DLSS feature exist. The
+        // feature is started right after an Evaluate (below) on a thread of its own; the next frame shows
+        // the level, waiting here only for whatever of NVIDIA's work is left.
+        bool ready = false;
+        s.fold_prepare_wait_ms = 0;
+        const Mode shown_before = s.fold.hand.shown;
+        const Mode target = why ? Mode::Off : (asked != Mode::Off && asked == s.fold.hand.refused ? shown_before : asked);
+        if (target != shown_before) {
+            bool others = true;
+            if (measured && !s.companion) {
+                const auto blk = na::fold::BlockFor(target);
+                const unsigned mw = target == Mode::Off ? ci.width : na::fold::Folded(ci.width, blk.x);
+                const unsigned mh = target == Mode::Off ? ci.height : na::fold::Folded(ci.height, blk.y);
+                j2::compute_flow::Prepare(s.device.Get(), s.queue.Get(), mw, mh);
+                // Waits only while that size is being built: a size the flow cannot work at (too small) leaves the
+                // level on the whole picture's motion, as before.
+                // ...and for at most kFlowWaitMs: the level never waits on a working set that does not come.
+                static ULONGLONG waiting_since = 0;
+                others = j2::compute_flow::Ready(mw, mh) || !j2::compute_flow::Building(mw, mh);
+                if (others) waiting_since = 0;
+                else if (!waiting_since) waiting_since = GetTickCount64();
+                else if (GetTickCount64() - waiting_since > 1500) others = true;
+                static bool was_waiting = false;
+                if (!others != was_waiting) {
+                    was_waiting = !others;
+                    na::eventlog::Emit("fold11", "preparing %s: measured motion at %ux%u %s", na::fold::Name(target), mw, mh,
+                                       others ? "ready (or not possible at this size: the whole picture's motion is used)" : "being built");
                 }
-                prewarmed = true;
-                s.levels_w = ci.width; s.levels_h = ci.height; s.levels_format = in_format; s.levels_preset = preset;
-                na::eventlog::Emit("fold11", "levels' DLSS made with DLAA's at %ux%u (Performance, then Quality, then DLAA): %s in %.2f ms on this first frame",
-                                   ci.width, ci.height, ok ? "ready" : "NOT made (a level asked for will make its own in its waiting period)", now_ms() - t_levels);
+            }
+            if (others) {
+                dlss::EvalDesc want{};
+                if (target == Mode::Off) want = eval;
+                else na::fold::Pass::Describe(eval, target, kFoldView, preset, &want);
+                auto st = dlss::PreparedState(want);
+                if (st == dlss::Prepared::Making) st = dlss::WaitPrepared(want, &s.fold_prepare_wait_ms);
+                {   // WHY log: how the mode being prepared stands (on each change).
+                    static int last = -1;
+                    const int now = int(target) * 16 + int(st) * 2 + (others ? 1 : 0);
+                    if (now != last) {
+                        last = now;
+                        na::eventlog::Emit("fold11", "preparing %s: feature %s, render %ux%u -> %ux%u view=0x%llx",
+                                           na::fold::Name(target), st == dlss::Prepared::Ready ? "ready" : st == dlss::Prepared::Making ? "being made"
+                                           : st == dlss::Prepared::Failed ? "refused" : "not started", want.render_w, want.render_h, want.out_w, want.out_h,
+                                           static_cast<unsigned long long>(want.view_id));
+                    }
+                }
+                if (st == dlss::Prepared::Ready) ready = true;
+                else if (st == dlss::Prepared::Failed) {
+                    s.fold.hand.Refuse(target);
+                    g_fold_status.Why("fold11", "NVIDIA did not make the DLSS feature for this level");
+                    na::eventlog::Emit("fold11", "REFUSED %s: NVIDIA did not make its DLSS feature (%ux%u -> %ux%u). The screen stays on %s.",
+                                       na::fold::Name(target), want.render_w, want.render_h, want.out_w, want.out_h, na::fold::Name(shown_before));
+                } else if (st == dlss::Prepared::None) {
+                    s.fold_prepare_desc = want; // started right after this frame's Evaluate
+                    s.fold_prepare_after = true;
+                }
             }
         }
-        // On that frame the tables are taken: the screen shows DLAA (a new picture size starts DLSS over anyway).
-        const auto step = s.fold.hand.Begin(prewarmed ? Mode::Off : asked, !why && !prewarmed);
-        fold_log_frame = step.warm != Mode::Off || step.switched;
+        fold_cpu_prepare = now_ms() - t_prepare;
+        const auto step = s.fold.hand.Begin(asked, !why, ready);
+        if (step.switched) s.fold_release_view_after = shown_before == Mode::Off ? kNativeView : kFoldView + static_cast<uint64_t>(shown_before);
+        for (const Mode m : {Mode::Quality, Mode::Performance})
+            if (m != step.show && m != asked) s.fold.Release(m);
+        s.fold.Collect();
+        fold_log_frame = step.prepare != Mode::Off || step.switched;
         const bool coarse = g_fold_rate.load(std::memory_order_relaxed) != 0 && frame.frame > s.fold_rate_frame;
-        if (step.warm != Mode::Off) {
-            dlss::EvalDesc we{};
-            s.fold.Record(list, eval, step.warm, index, true, &we, kFoldView, preset);
-            we.output = s.fold.Unseen();
-            we.reset = eval.reset || step.warm_reset;
-            const double t_warm = now_ms();
-            const bool ok = dlss::Evaluate(list, we);
-            fold_cpu_warm = now_ms() - t_warm;
-            s.fold.Done(list, step.warm);
-            s.fold.hand.WarmResult(ok);
-            ++s.fold_warm_frames;
-            if (!ok) {
-                ++s.fold_warm_failed;
-                static char warm_why[160];
-                std::snprintf(warm_why, sizeof warm_why, "DLSS did not accept the folded picture while it was being readied: %s", dlss::GetStats().reason);
-                g_fold_status.Why("fold11", warm_why);
-            }
-            if (s.fold.hand.refused == step.warm)
-                na::eventlog::Emit("fold11", "REFUSED %s after %u failed warm-up frames: DLSS did not accept the folded picture (%ux%u from %ux%u). The screen stays on %s.",
-                                   na::fold::Name(step.warm), na::fold::Handover::kGiveUp, we.render_w, we.render_h, ci.width, ci.height, na::fold::Name(s.fold.hand.shown));
-        }
         if (step.show_reset) eval.reset = true;
         // Sampled motion holds only the kept pixels of the level decided before this point. Should the screen
         // not show that level after all, this frame has no usable motion: DLSS restarts its history on it.
@@ -1168,7 +1233,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         if ((asked != Mode::Off || step.show != Mode::Off) && frame.frame % 600 == 0)
             na::eventlog::Emit("fold11", "asked=%s shown=%s warming=%s good=%u | frames dlaa=%llu quality=%llu performance=%llu warm=%llu warm_failed=%llu drawn_in_blocks=%llu drawn_per_pixel=%llu unable=%llu | "
                                "coarse rate=%u draws=%llu sets=%llu restores=%llu before_lists=%llu failures=%llu frames=%llu | declared=%.4f,%.4f input=%ux%u",
-                               na::fold::Name(asked), na::fold::Name(step.show), na::fold::Name(s.fold.hand.warming), s.fold.hand.good,
+                               na::fold::Name(asked), na::fold::Name(step.show), na::fold::Name(s.fold.hand.preparing), s.fold.hand.waited,
                                static_cast<unsigned long long>(s.fold_shown_frames[0]), static_cast<unsigned long long>(s.fold_shown_frames[1]),
                                static_cast<unsigned long long>(s.fold_shown_frames[2]), static_cast<unsigned long long>(s.fold_warm_frames),
                                static_cast<unsigned long long>(s.fold_warm_failed), static_cast<unsigned long long>(s.fold_coarse_frames),
@@ -1179,8 +1244,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                                eval.jitter_x, eval.jitter_y, eval.render_w, eval.render_h);
         g_fold_status.asked.store(static_cast<uint32_t>(asked), std::memory_order_relaxed);
         g_fold_status.shown.store(static_cast<uint32_t>(step.show), std::memory_order_relaxed);
-        g_fold_status.warming.store(static_cast<uint32_t>(s.fold.hand.warming), std::memory_order_relaxed);
-        g_fold_status.good.store(s.fold.hand.good, std::memory_order_relaxed);
+        g_fold_status.warming.store(static_cast<uint32_t>(s.fold.hand.preparing), std::memory_order_relaxed);
+        g_fold_status.good.store(s.fold.hand.waited, std::memory_order_relaxed);
         g_fold_status.refused.store(static_cast<uint32_t>(s.fold.hand.refused), std::memory_order_relaxed);
         g_fold_status.shading.store(coarse_why && *coarse_why ? 0u : 1u, std::memory_order_relaxed);
         g_fold_status.w.store(eval.render_w, std::memory_order_relaxed);
@@ -1229,9 +1294,23 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         evaluated = dlss::Evaluate(list, eval);
         fold_cpu_show = now_ms() - t_show;
     }
+    {   // One DLSS feature at a time (the fold block above): the old mode's view goes on the frame the new
+        // one is shown, and the next mode's feature is started now, right after this Evaluate.
+        if (s.fold_release_view_after) { dlss::ReleaseView(s.fold_release_view_after); s.fold_release_view_after = 0; }
+        if (!evaluated && fold_shown != na::fold::Mode::Off && !s.companion) {
+            s.fold.hand.Refuse(fold_shown);
+            g_fold_status.Why("fold11", "DLSS did not accept the folded picture");
+            na::eventlog::Emit("fold11", "REFUSED %s at frame %llu: DLSS did not accept the folded picture (%ux%u). DLAA takes over.",
+                               na::fold::Name(fold_shown), static_cast<unsigned long long>(frame.frame), eval.render_w, eval.render_h);
+        }
+        if (s.fold_prepare_after) {
+            s.fold_prepare_after = false;
+            dlss::PrepareFeature(s.fold_prepare_desc);
+        }
+    }
     if (fold_log_frame)
-        na::eventlog::Emit("fold11", "level work at frame %llu (CPU ms on the game's thread): prepare %.2f, warming level's DLSS %.2f, shown level's DLSS %.2f; features created so far %llu",
-                           static_cast<unsigned long long>(frame.frame), fold_cpu_prepare, fold_cpu_warm, fold_cpu_show,
+        na::eventlog::Emit("fold11", "level work at frame %llu (CPU ms on this route's thread): prepare %.2f (of it waiting for NVIDIA %.2f), shown level's DLSS %.2f; features created so far %llu",
+                           static_cast<unsigned long long>(frame.frame), fold_cpu_prepare, s.fold_prepare_wait_ms, fold_cpu_show,
                            static_cast<unsigned long long>(dlss::GetStats().features_created));
     gpu_mark(kGpuDlss);
     if (evaluated && fg::WantsInputs()) {
@@ -1456,7 +1535,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         const auto phase = static_cast<uint32_t>(frame.frame);
         const bool r2 = settings::Get().j2_jitter_r2.load() != 0;
         const na::fold::Mode level = s.fold_next;
-        const auto spacing = na::fold::JitterSpacing(level, level != na::fold::Mode::Off ? s.fold.hand.warming : na::fold::Mode::Off);
+        const auto spacing = na::fold::JitterSpacing(level, na::fold::Mode::Off); // nothing runs unseen beside the shown level
         const auto fold_block = spacing.block;
         const auto fold_pick = spacing.pick;
         const bool spaced = fold_block.x * fold_block.y > 1;

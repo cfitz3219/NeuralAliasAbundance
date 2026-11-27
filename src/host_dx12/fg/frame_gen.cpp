@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +15,7 @@
 
 #include "host_dx12/settings.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 
 #include <string>
 
@@ -237,6 +239,8 @@ void drain_retired_locked(bool all)
             ++i;
         }
     }
+    if (!g.feature && std::none_of(g.retired.begin(), g.retired.end(), [](const State::Retired& r) { return r.feature != nullptr; }))
+        na::vram::Set("fg_feature", 0, all ? "x2 is off or the picture size changed: its feature is released" : "x2's old feature released");
 }
 
 void release_feature_locked()
@@ -356,6 +360,24 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
     g.feat_ui = (ui ? 1u : 0u) | (ui_alpha ? 2u : 0u);
     g.feature_pending = 1;
     g.need_reset = 1;
+    {   // Its video memory: NVIDIA's own estimate for these sizes and formats (it reports no exact figure).
+        size_t bytes = 0;
+        void* cap = nullptr;
+        if (g.rt.get_capability_parameters &&
+            NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(reinterpret_cast<PfnAllocParams>(g.rt.get_capability_parameters)(&cap))) && cap) {
+            void* cb = nullptr;
+            static_cast<NVSDK_NGX_Parameter*>(cap)->Get(NVSDK_NGX_DLSSG_Parameter_EstimateVRAMCallback, &cb);
+            const uint32_t mv_format = g.motion_copy ? static_cast<uint32_t>(g.motion_copy->GetDesc().Format) : static_cast<uint32_t>(DXGI_FORMAT_R16G16_FLOAT);
+            const uint32_t depth_format = g.depth_copy ? static_cast<uint32_t>(g.depth_copy->GetDesc().Format) : static_cast<uint32_t>(DXGI_FORMAT_R32_FLOAT);
+            if (cb && NVSDK_NGX_FAILED(reinterpret_cast<PFN_NVSDK_NGX_DLSSG_EstimateVRAMCallback>(cb)(
+                          g.in_w, g.in_h, f.width, f.height, static_cast<uint32_t>(f.format), mv_format, depth_format,
+                          f.hudless ? static_cast<uint32_t>(f.format) : 0u, 0u, &bytes)))
+                bytes = 0;
+            if (g.rt.destroy_parameters) reinterpret_cast<PfnDestroyParams>(g.rt.destroy_parameters)(cap);
+        }
+        na::vram::Set("fg_feature", bytes ? bytes : (256ull << 20), bytes ? "x2's NVIDIA Frame Generation feature (NVIDIA's estimate)"
+                                                                     : "x2's NVIDIA Frame Generation feature (no estimate from NVIDIA: 256 MB assumed)");
+    }
     return true;
 }
 
@@ -550,6 +572,8 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         }
         g.recording_depth = depth_new;
         g.recording_motion = motion_new;
+        na::vram::Set("fg_inputs", 2 * (na::vram::SizeOf(depth_new.Get()) + na::vram::SizeOf(motion_new.Get())),
+                      "x2's copies of the depth and motion DLSS used (the one being recorded and the one in use)");
     }
     D3D12_RESOURCE_BARRIER pre[4] = {
         transition(in.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -886,6 +910,7 @@ void Shutdown()
     g.mvecs = nullptr;
     g.used = {};
     g.recording_depth.Reset(); g.recording_motion.Reset();
+    na::vram::Set("fg_inputs", 0, "x2 is off or the picture size changed: its depth and motion copies are released");
     for (auto& p : g.pending) p = {};
     g.ready = {};
     g.pending_count.store(0);

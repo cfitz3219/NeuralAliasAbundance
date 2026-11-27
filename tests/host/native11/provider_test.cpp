@@ -18,6 +18,7 @@
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 #if defined(NA_TEST_NATIVE_DLAA)
 #include "host_dx12/adapters/wwii/scene_camera.hpp"
 #include "host_dx12/capture/frame_capture.hpp"
@@ -2465,6 +2466,56 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             expect(fold_on_screen(), "the DLSS level is on screen while x2 runs");
             expect(cs.frames > 0 && cs.failures == 0, "the scene was shaded in blocks with no failure");
         }
+        {   // Video memory with x2 on, then a few seconds after x2 Off (its textures and feature given back),
+            // then x2 on again (made again off the frame while the game's own frames keep showing).
+            const auto vram = [&](const char* when) {
+                static char line[1536];
+                na::vram::FormatLine(line, sizeof line);
+                double process_mb = 0;
+                ComPtr<IDXGIDevice> dd;
+                ComPtr<IDXGIAdapter> da;
+                ComPtr<IDXGIAdapter3> a3;
+                DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+                if (SUCCEEDED(g.device.As(&dd)) && SUCCEEDED(dd->GetAdapter(&da)) && SUCCEEDED(da.As(&a3)) &&
+                    SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
+                    process_mb = double(mi.CurrentUsage) / 1048576.0;
+                const auto ds = na::dlss::GetStats();
+                std::printf("  vram (%s): whole process %.1f MB | ours: %s | DLSS features held %llu\n", when, process_mb, line,
+                            static_cast<unsigned long long>(ds.features_created - ds.features_released));
+            };
+            LARGE_INTEGER hz{};
+            QueryPerformanceFrequency(&hz);
+            const auto timed_frame = [&](int frame) {
+                LARGE_INTEGER t0{}, t1{};
+                QueryPerformanceCounter(&t0);
+                last_frame_at.store(GetTickCount64());
+                Pump(); Scene(g.ctx.Get(), g, frame); Post(g.ctx.Get(), g, true); g.swap->Present(0, 0);
+                QueryPerformanceCounter(&t1);
+                return double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(hz.QuadPart);
+            };
+            int frame = 1000;
+            double on_sum = 0;
+            for (int k = 0; k < 60; ++k) on_sum += timed_frame(frame++);
+            vram(fg_fold ? (fg_fold == 2 ? "Performance + x2" : "Quality + x2") : "DLAA + x2");
+            st.fg_enabled.store(0);
+            double off_max = 0;
+            const ULONGLONG until = GetTickCount64() + 4500;
+            while (GetTickCount64() < until) off_max = (std::max)(off_max, timed_frame(frame++));
+            vram("x2 then Off, 4.5 s later");
+            expect(na::vram::Get("x2_textures") == 0 && na::vram::Get("fg_feature") == 0, "x2 Off: its textures and feature are released");
+            st.fg_enabled.store(1);
+            const auto gen_before = na::present::GetStats().generated_shown;
+            double back_max = 0;
+            int back_at = -1;
+            for (int k = 0; k < 400 && back_at < 0; ++k) {
+                back_max = (std::max)(back_max, timed_frame(frame++));
+                if (na::present::GetStats().generated_shown > gen_before + 4) back_at = k;
+            }
+            vram("x2 on again");
+            std::printf("  x2 Off then On: steady frame %.1f ms; longest frame while x2's memory was released %.1f ms; x2 generating again after %d frames, longest frame meanwhile %.1f ms\n",
+                        on_sum / 60, off_max, back_at, back_max);
+            expect(back_at >= 0, "x2 generates again after being turned back on");
+        }
         DeleteFileW(ini.c_str());
         std::printf(g_failed ? "FAIL: %d live x2 check(s) failed\n" : "PASS: live x2 on a DX11 game\n", g_failed);
         std::fflush(stdout);
@@ -2769,8 +2820,23 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             return std::string(status);
         };
         auto& st = na::settings::Get();
-        // NA_TEST_NO_PREWARM: the levels' DLSS is not made with DLAA's (for the memory comparison only).
-        if (GetEnvironmentVariableW(L"NA_TEST_NO_PREWARM", nullptr, 0)) st.j2_fold_prewarm.store(0);
+        // Our own video memory (diag/vram_ledger.hpp) and the DLSS features held, at each step.
+        const auto features_held = [] { const auto ds = na::dlss::GetStats(); return ds.features_created - ds.features_released; };
+        const auto print_ours = [&](const char* when) {
+            static char line[1536];
+            na::vram::FormatLine(line, sizeof line);
+            const auto cf = na::j2::compute_flow::GetStats();
+            double process_mb = 0;
+            ComPtr<IDXGIDevice> dd;
+            ComPtr<IDXGIAdapter> da;
+            ComPtr<IDXGIAdapter3> a3;
+            DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+            if (SUCCEEDED(g.device.As(&dd)) && SUCCEEDED(dd->GetAdapter(&da)) && SUCCEEDED(da.As(&a3)) &&
+                SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
+                process_mb = double(mi.CurrentUsage) / 1048576.0;
+            std::printf("  vram (%s): whole process %.1f MB | ours: %s | DLSS features held %llu | kept motion pictures: %u made, at most %u in use at once\n",
+                        when, process_mb, line, static_cast<unsigned long long>(features_held()), cf.image_slots, cf.images_busy_peak);
+        };
         const char* level_name = fold_level == 2 ? "Performance" : "Quality";
         int frame = 0;
         // A. DLAA.
@@ -2792,9 +2858,10 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
             if (SUCCEEDED(g.device.As(&dd)) && SUCCEEDED(dd->GetAdapter(&da)) && SUCCEEDED(da.As(&a3)) &&
                 SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
-                std::printf("  video memory held on DLAA at %ux%u (levels' DLSS made with DLAA's: %s): %.1f MB\n", g.w, g.h,
-                            st.j2_fold_prewarm.load() ? "yes" : "no", double(mi.CurrentUsage) / 1048576.0);
+                std::printf("  video memory held on DLAA at %ux%u (whole process): %.1f MB\n", g.w, g.h, double(mi.CurrentUsage) / 1048576.0);
         }
+        print_ours("DLAA");
+        expect(features_held() == 1, "on DLAA exactly one DLSS feature is held");
         // B. The level asked for: DLAA stays on screen while it is readied, then the switch.
         st.j2_fold_mode.store(fold_level);
         const int asked_at = frame;
@@ -2819,6 +2886,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             if (k < 3) switch_change = (std::max)(switch_change, s.change);
             if (k >= 30) { fold_ms_sum += s.ms; fold_scene += s.scene; fold_post += s.post; fold_change += s.change; ++fold_n; }
         }
+        print_ours(level_name);
+        expect(features_held() == 1, "on a level exactly one DLSS feature is held");
         static char line11[8192]{};
         na::native_d3d11::FormatStatus(line11, sizeof line11);
         const char* gpu = std::strstr(line11, "gpu_ms{");
@@ -2849,7 +2918,21 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             if (k < 20 && s.ms > dlaa_ms + 3.0) std::printf("  back to DLAA, frame +%d: %.1f ms\n", k, s.ms);
             if (k >= 20) { back_scene += s.scene; ++back_n; }
         }
-        std::printf("  switches (longest frame, steady DLAA frame %.1f ms): first frames %.1f ms (DLAA and the levels' DLSS made); DLAA -> %s %.1f ms; %s -> %s %.1f ms (on screen after %d frames); -> DLAA %.1f ms\n",
+        {   // A few seconds on DLAA: what the levels held is given back (planes, folded motion context).
+            const ULONGLONG until = GetTickCount64() + 6500;
+            double later_max_ms = 0;
+            while (GetTickCount64() < until) { later_max_ms = (std::max)(later_max_ms, run(frame).ms); ++frame; }
+            print_ours("back on DLAA, 6.5 s later");
+            expect(shown_now().find("On screen: DLAA") != std::string::npos, "DLAA is on screen again (its feature made off the frame)");
+            std::printf("  longest frame in those 6.5 s: %.1f ms\n", later_max_ms);
+            expect(features_held() == 1, "back on DLAA exactly one DLSS feature is held");
+            char planes_q[48], planes_p[48];
+            std::snprintf(planes_q, sizeof planes_q, "fold_planes_dx11_Quality");
+            std::snprintf(planes_p, sizeof planes_p, "fold_planes_dx11_Performance");
+            expect(na::vram::Get(planes_q) == 0 && na::vram::Get(planes_p) == 0, "back on DLAA the levels' folded planes are released");
+            expect(later_max_ms < dlaa_ms + 20.0, "no slow frame while the levels' memory is released");
+        }
+        std::printf("  switches (longest frame, steady DLAA frame %.1f ms): first frames %.1f ms (DLAA made); DLAA -> %s %.1f ms; %s -> %s %.1f ms (on screen after %d frames); -> DLAA %.1f ms\n",
                     dlaa_ms, start_max_ms, level_name, switch_max_ms, level_name, other_name, other_max_ms, other_at, back_max_ms);
         // One DLSS feature at a time (coordinator 2026-11-27): the new feature is made off the frame, and the switch frame waits
         // only for what is left of NVIDIA's work. The bar is the coordinator's: no switch more than 20 ms over a steady frame.
@@ -2870,8 +2953,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                     gpu ? int(std::strcspn(gpu, "}") + 1) : 0, gpu ? gpu : "", f11 ? int(std::strcspn(f11, "}") + 1) : 0, f11 ? f11 : "",
                     static_cast<unsigned long long>(cs.draws), static_cast<unsigned long long>(cs.sets), static_cast<unsigned long long>(cs.restores),
                     static_cast<unsigned long long>(cs.before_lists), static_cast<unsigned long long>(cs.failures), static_cast<unsigned long long>(cs.frames));
-        expect(switched_at >= asked_at + int(na::fold::Handover::kWarmFrames), "DLAA stays on screen until the level has proven itself (8 good frames)");
-        expect(switch_max_ms < dlaa_ms + margin, "no slow frame from DLAA to the level (within 20 % + 4 ms of a steady frame)");
+        expect(switched_at > asked_at, "DLAA stays on screen until the level's DLSS feature is made (at least one frame)");
+        expect(switch_max_ms < dlaa_ms + margin, "no switch frame more than 20 ms over a steady frame, DLAA to the level");
         expect(other_at >= 0 && other_max_ms < dlaa_ms + margin, "no slow frame from one level to the other");
         expect(back_max_ms < dlaa_ms + margin, "no slow frame back to DLAA");
         const bool quarter = fold_level == 2;

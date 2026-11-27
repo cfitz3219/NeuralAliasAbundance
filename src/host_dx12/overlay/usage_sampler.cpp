@@ -297,4 +297,14 @@ int FormatLine(char* out, std::size_t size)
         : s.vram_dxgi_ours > 0.92 * s.vram_budget ? "near_budget" : "within_budget");
 }
 
+bool VideoMemory(double* process_mb, double* budget_mb)
+{
+    if (!g_started.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::mutex> lock(g_m);
+    if (!g_snap.valid || !g_snap.vram_ok) return false;
+    if (process_mb) *process_mb = g_snap.vram_ours;
+    if (budget_mb) *budget_mb = g_snap.budget_ok ? g_snap.vram_budget : 0.0;
+    return true;
+}
+
 } // namespace na::usage

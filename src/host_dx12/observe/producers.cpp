@@ -4,6 +4,7 @@
 #include "core/anisotropic_auto.hpp"
 #include "core/temporal_jitter.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 #include "host_dx12/observe/producers.hpp"
 
 #include <utility>
@@ -6072,10 +6073,17 @@ void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS
     g_so[canon(pso)] = std::move(e); // a new pipeline at a reused address replaces the old copy
     if (!g_rp_device) g_rp_device = dev;
 }
+std::atomic<bool> g_rp_tried{false}; // one attempt at the buffers (again after ReleaseDrawReplayBuffers)
+void rp_note_vram(const char* why)
+{
+    uint64_t bytes = na::vram::SizeOf(g_rp_zeros.Get()) + na::vram::SizeOf(g_rp_stamps.Get());
+    for (uint32_t i = 0; i < kRpMaxSlots; ++i) bytes += na::vram::SizeOf(rp_slot(i).buf.Get());
+    na::vram::Set("draw_replay_dx12", bytes, why);
+}
 bool rp_ensure_buffers()
 {
     if (g_rp_bufs_ok.load(std::memory_order_acquire)) return true;
-    static std::atomic<bool> tried{false};
+    std::atomic<bool>& tried = g_rp_tried;
     if (tried.exchange(true)) return false;
     Microsoft::WRL::ComPtr<ID3D12Device> dev;
     { std::lock_guard<std::mutex> lk(g_so_m); dev = g_rp_device; if (!g_so_worker) { g_so_worker = true; std::thread(so_worker).detach(); } }
@@ -6096,6 +6104,7 @@ bool rp_ensure_buffers()
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_rp_stamps)))) return false;
     g_rp_bufs_ok.store(true, std::memory_order_release);
+    rp_note_vram("draw replay is on: the frames' replayed positions");
     return true;
 }
 // Close of any list that wrote replay positions: leave the slot buffer in COMMON
@@ -6332,6 +6341,7 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
             if (SUCCEEDED(g_rp_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&c.buf)))) {
                 found = &c; slot_index = g_rp_slots++;
                 rp_count(kRpSlotsMade);
+                rp_note_vram("draw replay needed one more frame's positions");
             }
         }
         if (!found) {
@@ -10090,6 +10100,27 @@ bool ReplayTakeFrame(GL* list, ID3D12CommandQueue* queue, ReplayFrame* f)
         }
     }
     (void)other;
+    return true;
+}
+
+bool ReleaseDrawReplayBuffers()
+{
+    if (!g_rp_bufs_ok.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lk(g_replay_slots_m);
+    for (uint32_t i = 0; i < g_rp_slots; ++i) {
+        const RpSlot& s = rp_slot(i);
+        if (!s.Free() || s.Unretired()) return false; // a frame in flight still writes or reads it: later
+    }
+    g_rp_bufs_ok.store(false, std::memory_order_release);
+    for (uint32_t i = 0; i < kRpMaxSlots; ++i) {
+        RpSlot& s = rp_slot(i);
+        s.buf.Reset(); s.reader.reset(); s.segs.clear(); s.frame = 0; s.verts = 0; s.counters = 0; s.sealed = false;
+    }
+    g_rp_slots = 0;
+    g_rp_zeros.Reset();
+    g_rp_stamps.Reset();
+    g_rp_tried.store(false, std::memory_order_release); // made again the next time replay is on
+    rp_note_vram("draw replay has been off for a few seconds: its buffers are released");
     return true;
 }
 

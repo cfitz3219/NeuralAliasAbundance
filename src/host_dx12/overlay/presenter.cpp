@@ -23,6 +23,7 @@
 #include "host_dx12/settings.hpp"
 #include "core/live_frame_gen.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 
 #include <string>
 
@@ -103,6 +104,7 @@ char g_display_dynamic[64] = "";
 std::atomic<uint32_t> g_cap_request{0};
 char g_cap_text[220] = "";
 std::atomic<uint64_t> g_vram_budget_mb{0}, g_vram_usage_mb{0}, g_extra_mb{0};
+constexpr ULONGLONG kLiveReleaseAfterMs = 3000; // x2 Off this long: its textures and feature are given back
 std::atomic<uint32_t> g_inline_owner{1}, g_live_ready{0}, g_live_preparing{0};
 std::mutex g_live_text_m;
 char g_prepare_text[112] = "";
@@ -235,6 +237,7 @@ struct Chain {
     std::atomic<bool> live_ready{false};
     std::thread live_prep;
     ULONGLONG live_retry_after = 0;           // a refused preparation (memory budget) is asked again after this tick
+    ULONGLONG live_off_since = 0;             // x2 turned Off at this tick with its textures still held (0: not)
     ComPtr<ID3D12QueryHeap> off_queries;      // 2 per slot: before / after the Off path's copy (presentation queue)
     ComPtr<ID3D12Resource> off_readback;
     HANDLE queried_latency_handle = nullptr; // diagnostics: query only, never wait/signal
@@ -631,6 +634,7 @@ bool release_size_dependent_locked(Chain& c)
         s.gen_fence = 0;
         s.owned = false;
     }
+    na::vram::Set("x2_textures", 0, "the picture size changed: x2's textures are made again at the new size");
     c.ready = false;
     c.queues_bound=false;
     c.virtual_index = 0;
@@ -684,7 +688,7 @@ void prepare_live_locked(Chain& c)
             return;
         }
     }
-    set_live_text(g_prepare_text, "Preparing Frame Generation (graphics memory); the picture stays as it is meanwhile.");
+    set_live_text(g_prepare_text, "x2 preparing: making its graphics memory; the picture stays as it is meanwhile.");
     g_live_preparing.store(1);
     ID3D12Device* device = c.device.Get();
     const bool uav = c.uav_ok;
@@ -731,9 +735,43 @@ void prepare_live_locked(Chain& c)
             return;
         }
         set_live_text(g_prepare_text, "Frame Generation textures are ready.");
+        uint64_t bytes = 0;
+        for (const Slot& s : c.slots) {
+            bytes += na::vram::SizeOf(s.real_copy.Get()) + na::vram::SizeOf(s.hudfree.Get());
+            for (const auto& t : s.interp) bytes += na::vram::SizeOf(t.Get());
+        }
+        g_extra_mb.store(bytes >> 20);
+        na::vram::Set("x2_textures", bytes, "x2 is on: per slot the real frame's copy, the generated picture and the HUD-free picture");
         g_live_ready.store(1);
         c.live_ready.store(true, std::memory_order_release);
     });
+}
+
+// x2 has been Off for kLiveReleaseAfterMs, the presenter thread is idle and the GPU finished every frame
+// that used x2 (the caller checked): its textures and NVIDIA's Frame Generation feature are released.
+// Turning x2 on again prepares them anew off the game's thread (prepare_live_locked) while Off stays on
+// screen; the menu says "x2 preparing" meanwhile.
+void release_live_locked(Chain& c)
+{
+    c.live_ready.store(false, std::memory_order_release);
+    g_live_ready.store(0);
+    c.worker_owner = false;
+    g_inline_owner.store(1);
+    for (Slot& s : c.slots) {
+        s.real_copy.Reset();
+        for (auto& t : s.interp) t.Reset();
+        s.hudfree.Reset();
+        s.steady_ran = false;
+        s.live_split = false;
+    }
+    c.steady_prev_id = UINT64_MAX;
+    c.steady_resized = true;
+    fg::Shutdown(); // the GPU is done with it (checked by the caller); it is made again when x2 is next on
+    g_extra_mb.store(0);
+    set_live_text(g_prepare_text, "x2 preparing: its graphics memory was given back while x2 was off.");
+    na::vram::Set("x2_textures", 0, "x2 has been off for a few seconds: its textures are released");
+    na::eventlog::Emit("fg_live", "x2 off for %u s: textures and the Frame Generation feature released (they are made again when x2 is on)",
+                       static_cast<unsigned>(kLiveReleaseAfterMs / 1000));
 }
 
 // Copies `tex` into the real current back buffer and presents. `state` is
@@ -1509,6 +1547,19 @@ HRESULT Present(const PresentArgs& a)
         const auto owner = na::fglive::NextOwner(fg_on && ready, c->worker_owner ? na::fglive::Owner::PresenterThread : na::fglive::Owner::GameThread, backlog_now);
         c->worker_owner = owner == na::fglive::Owner::PresenterThread;
         g_inline_owner.store(c->worker_owner ? 0u : 1u);
+        // x2 Off: its textures and NVIDIA's feature are given back a few seconds later (switching back and forth
+        // quickly does not make them again each time), once the presenter thread is idle and the GPU has finished
+        // every frame that used them. Nothing waits here: if anything is still running, the next frame looks again.
+        if (fg_on || c->worker_owner || !ready) c->live_off_since = 0;
+        else {
+            const ULONGLONG now_ms = GetTickCount64();
+            if (!c->live_off_since) c->live_off_since = now_ms;
+            else if (now_ms - c->live_off_since >= kLiveReleaseAfterMs && backlog_now == 0 && !c->live_prep.joinable() &&
+                     wait_fence(*c, c->last_signal.load(), 0) && wait_presentation(*c, c->presentation_last.load(), 0)) {
+                release_live_locked(*c);
+                c->live_off_since = 0;
+            }
+        }
         if (!ready) fg_on = false; // nothing to generate with yet
     } else if (fg_on) {
         c->worker_owner = true;

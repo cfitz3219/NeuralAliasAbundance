@@ -8,4 +8,7 @@
 namespace na::usage {
 void Start();                                   // idempotent; call after boot, never from DllMain
 int FormatLine(char* out, std::size_t size);    // "usage ...\r\n", or 0 when not started / no sample yet
+// The latest video memory sample in MB: the whole process (the game's memory and ours) and the budget.
+// False when the sampler is not running or has no sample yet.
+bool VideoMemory(double* process_mb, double* budget_mb);
 }

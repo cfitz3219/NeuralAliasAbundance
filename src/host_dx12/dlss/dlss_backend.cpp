@@ -13,6 +13,12 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <chrono>
+#include <condition_variable>
+#include <thread>
+
+#include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 
 #if defined(NA_HAVE_NGX_SDK)
 #include <nvsdk_ngx.h>
@@ -147,6 +153,8 @@ struct Record {
     // slot + generation). BeforeExecute orders this one after it on the GPU.
     int pred = -1;
     uint64_t pred_gen = 0;
+    ComPtr<ID3D12Fence> after; // the feature's off-frame creation, waited for on the GPU before this runs
+    uint64_t after_value = 0;
 };
 
 // R-301/R-305: every created handle lives in exactly one slot until released.
@@ -159,6 +167,10 @@ struct Feature {
     Quality quality = Quality::MaxQuality;
     uint64_t ordered_group = 0;
     bool recreate = false;
+    bool reserved = false;              // a background creation will put its handle here
+    bool prepared = false;              // made off the frame, not yet adopted by its view
+    ComPtr<ID3D12Fence> made_fence;     // the creation's own GPU work (made off the frame)
+    uint64_t made_value = 0;
 };
 
 struct View {
@@ -168,6 +180,20 @@ struct View {
     bool needs_reset = true;
     int last_rec = -1;          // record of its most recent evaluation (R-303)
     uint64_t last_rec_gen = 0;
+    ComPtr<ID3D12Fence> wait_fence; // an adopted feature's creation: its next evaluation waits for it on the GPU
+    uint64_t wait_value = 0;
+};
+
+// What a feature is made for (an off-frame creation is adopted only by the same description).
+struct Key {
+    uint64_t view = 0, group = 0;
+    uint32_t w = 0, h = 0, ow = 0, oh = 0, flags = 0, preset = 0;
+    Quality q = Quality::DLAA;
+    bool operator==(const Key& o) const
+    {
+        return view == o.view && group == o.group && w == o.w && h == o.h && ow == o.ow && oh == o.oh && flags == o.flags &&
+               preset == o.preset && q == o.q;
+    }
 };
 
 struct State {
@@ -184,8 +210,23 @@ struct State {
     uint64_t exec_calls = 0;
     uint64_t rec_gen = 0;
     Stats stats{};
+    // The one off-frame creation (PrepareFeature).
+    struct Prep {
+        Prepared state = Prepared::None;
+        Key key{};
+        int slot = -1;
+        uint64_t gen = 0;
+        ComPtr<ID3D12Fence> fence;
+        uint64_t value = 0;
+    } prep;
+    uint64_t prep_gen = 0;
+    ComPtr<ID3D12CommandQueue> make_queue; // the creations' own queue
+    void* make_params = nullptr;          // their own parameter object (allocated once)
+    PrepareStats prep_stats{};
 };
 State g;
+std::condition_variable g_prep_cv; // with g.m: a background creation finished
+std::atomic<void (*)()> g_thread_init{nullptr};
 std::recursive_mutex g_life_m; // serializes all public lifecycle mutations
 ComPtr<ID3D12Device> g_tried_device;
 std::atomic<void (*)()> g_release_view_hook{nullptr};
@@ -208,6 +249,25 @@ NVSDK_NGX_Parameter* CP() { return static_cast<NVSDK_NGX_Parameter*>(g.cap_param
 void release_handle(void* h)
 {
     if (h && g.api.release_feature) reinterpret_cast<PfnRelease>(g.api.release_feature)(static_cast<NVSDK_NGX_Handle*>(h));
+}
+
+// The video memory every DLSS feature of ours holds together, as NVIDIA reports it (its statistics
+// callback); one item in the ledger (diag/vram_ledger.hpp), with how many features hold it.
+void note_dlss_vram_locked(const char* why)
+{
+    unsigned long long bytes = 0;
+    uint32_t count = 0;
+    for (const Feature& f : g.features) count += f.handle ? 1u : 0u;
+    NVSDK_NGX_Parameter* p = CP();
+    void* cb = nullptr;
+    if (p && NVSDK_NGX_SUCCEED(p->Get(NVSDK_NGX_Parameter_DLSSGetStatsCallback, &cb)) && cb &&
+        NVSDK_NGX_SUCCEED(reinterpret_cast<PFN_NVSDK_NGX_DLSS_GetStatsCallback>(cb)(p)))
+        p->Get(NVSDK_NGX_Parameter_SizeInBytes, &bytes);
+    else if (count)
+        bytes = 0; // not reported by this runtime: the count alone is logged
+    char text[160];
+    std::snprintf(text, sizeof text, "%s (%u DLSS feature%s held%s)", why, count, count == 1 ? "" : "s", bytes || !count ? "" : "; NVIDIA reported no size");
+    na::vram::Set("dlss_features", count ? (bytes ? bytes : 1) : 0, text);
 }
 #endif
 
@@ -244,11 +304,15 @@ void collect_locked()
     }
     for (Feature& f : g.features) {
         if (!f.handle || !f.retired || f.tainted || f.outstanding) continue;
+        if (f.made_fence && f.made_fence->GetCompletedValue() < f.made_value) continue; // its creation still runs on the GPU
 #if defined(NA_HAVE_NGX_SDK)
         release_handle(f.handle);
 #endif
         f = Feature{};
         ++g.stats.features_released;
+#if defined(NA_HAVE_NGX_SDK)
+        note_dlss_vram_locked("a DLSS feature no longer in use was released");
+#endif
     }
 }
 
@@ -276,7 +340,7 @@ int find_view_locked(uint64_t id, bool create)
 int free_feature_slot_locked()
 {
     for (int i = 0; i < static_cast<int>(kFeatures); ++i)
-        if (!g.features[i].handle) return i;
+        if (!g.features[i].handle && !g.features[i].reserved) return i;
     return -1;
 }
 
@@ -289,6 +353,139 @@ uint32_t flags_for(const EvalDesc& d)
     if (d.depth_inverted) f |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (d.auto_exposure && !d.exposure) f |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     return f;
+}
+
+Key key_of(const EvalDesc& d)
+{
+    Key k;
+    k.view = d.view_id;
+    k.group = d.ordered_feature_group;
+    k.w = d.max_render_w ? d.max_render_w : d.render_w;
+    k.h = d.max_render_h ? d.max_render_h : d.render_h;
+    k.ow = d.out_w;
+    k.oh = d.out_h;
+    k.flags = flags_for(d);
+    k.preset = d.preset;
+    k.q = d.quality;
+    return k;
+}
+
+// The off-frame creation (PrepareFeature), on its own thread. Holds g.m only while NVIDIA makes the
+// feature (NGX is not thread safe); the command list and queue are its own.
+void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
+{
+    if (auto init = g_thread_init.load(std::memory_order_acquire)) init();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL); // the next frame may be waiting for it
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    ComPtr<ID3D12CommandQueue> queue;
+    bool ok = SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) &&
+              SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list))) &&
+              SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
+    int slot = -1;
+    double ms = 0;
+    int32_t code = 0;
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        if (g.prep.gen != gen || !g.attached || g.latched || g.device.Get() != dev.Get()) ok = false;
+        if (ok && !g.make_queue) {
+            D3D12_COMMAND_QUEUE_DESC qd{};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            ok = SUCCEEDED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g.make_queue)));
+            if (ok) g.make_queue->SetName(L"NeuralAlias DLSS feature creation");
+        }
+        if (ok && !g.make_params) {
+            NVSDK_NGX_Parameter* p = nullptr;
+            ok = NVSDK_NGX_SUCCEED(reinterpret_cast<PfnParams>(g.api.allocate_parameters)(&p)) && p;
+            g.make_params = p;
+        }
+        if (ok) {
+            slot = free_feature_slot_locked();
+            ok = slot >= 0;
+        }
+        if (ok) {
+            queue = g.make_queue;
+            NVSDK_NGX_Parameter* p = static_cast<NVSDK_NGX_Parameter*>(g.make_params);
+            p->Reset();
+            p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
+            p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
+            p->Set(NVSDK_NGX_Parameter_Width, k.w);
+            p->Set(NVSDK_NGX_Parameter_Height, k.h);
+            p->Set(NVSDK_NGX_Parameter_OutWidth, k.ow);
+            p->Set(NVSDK_NGX_Parameter_OutHeight, k.oh);
+            p->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(k.q));
+            p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, static_cast<int>(k.flags));
+            p->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
+            const unsigned int pr = k.preset ? k.preset : static_cast<unsigned int>(NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, pr);
+            NVSDK_NGX_Handle* h = nullptr;
+            const auto t0 = std::chrono::steady_clock::now();
+            const NVSDK_NGX_Result r = reinterpret_cast<PfnCreate>(g.api.create_feature)(list.Get(), NVSDK_NGX_Feature_SuperSampling, p, &h);
+            ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            code = static_cast<int32_t>(r);
+            ok = NVSDK_NGX_SUCCEED(r) && h;
+            if (ok) {
+                Feature& nf = g.features[slot];
+                nf = Feature{};
+                nf.handle = h;
+                nf.render_w = k.w;
+                nf.render_h = k.h;
+                nf.out_w = k.ow;
+                nf.out_h = k.oh;
+                nf.flags = k.flags;
+                nf.quality = k.q;
+                nf.preset = k.preset;
+                nf.ordered_group = k.group;
+                nf.prepared = true;
+                nf.made_fence = fence;
+                nf.made_value = 1;
+            } else {
+                slot = -1;
+            }
+        }
+    }
+    // Submitted outside the lock: the game's frames go on meanwhile.
+    if (ok) ok = SUCCEEDED(list->Close());
+    if (ok) {
+        ID3D12CommandList* lists[] = {list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        ok = SUCCEEDED(queue->Signal(fence.Get(), 1));
+    }
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        const bool current = g.prep.gen == gen;
+        if (slot >= 0 && g.features[slot].handle && g.features[slot].prepared && (!ok || !current)) {
+            // Never submitted, or nobody wants it any more: released once nothing of it can run on the GPU.
+            g.features[slot].prepared = false;
+            if (!ok) g.features[slot].made_fence.Reset();
+            retire_feature_locked(slot);
+            slot = -1;
+        }
+        if (current) {
+            g.prep.state = ok ? Prepared::Ready : Prepared::Failed;
+            g.prep.slot = ok ? slot : -1;
+            if (ok) g.prep.fence = fence;
+            else g.prep.fence.Reset();
+            g.prep.value = ok ? 1 : 0;
+            ++(ok ? g.prep_stats.made : g.prep_stats.failed);
+            g.prep_stats.last_ms = ms;
+            if (ms > g.prep_stats.longest_ms) g.prep_stats.longest_ms = ms;
+            g.prep_stats.w = k.w;
+            g.prep_stats.h = k.h;
+        }
+        collect_locked();
+        if (ok) note_dlss_vram_locked("a DLSS feature was made off the frame for the next level");
+    }
+    g_prep_cv.notify_all();
+    na::eventlog::Emit("dlss", "feature %s off the frame: %ux%u -> %ux%u quality=%s preset=%u view=0x%llx in %.1f ms (NVIDIA code 0x%08X)",
+                       ok ? "made" : "NOT made", k.w, k.h, k.ow, k.oh, QualityName(k.q), k.preset, static_cast<unsigned long long>(k.view), ms,
+                       static_cast<unsigned>(code));
 }
 #endif
 
@@ -465,7 +662,14 @@ void Shutdown()
             }
         if (g.eval_params) reinterpret_cast<PfnDestroy>(g.api.destroy_parameters)(EP());
         if (g.cap_params) reinterpret_cast<PfnDestroy>(g.api.destroy_parameters)(CP());
+        if (g.make_params) reinterpret_cast<PfnDestroy>(g.api.destroy_parameters)(static_cast<NVSDK_NGX_Parameter*>(g.make_params));
     }
+    g.make_params = nullptr;
+    g.make_queue.Reset();
+    g.prep = State::Prep{};
+    g.prep.gen = ++g.prep_gen; // a creation still running finds its generation gone and gives up
+    g_prep_cv.notify_all();
+    na::vram::Set("dlss_features", 0, "DLSS stopped: every feature released");
 #if defined(NA_HAVE_NGX_LIB)
     if (g.own && g.device) OwnShutdown(g.device.Get());
 #endif
@@ -621,6 +825,41 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_
         return false;
     }
     NVSDK_NGX_Parameter* p = EP();
+    if (!fits && g.prep.state == Prepared::Ready && g.prep.slot >= 0 && g.prep.key == key_of(d)) {
+        // Made off the frame for exactly this (PrepareFeature): adopted, nothing is made on this frame.
+        const int slot = g.prep.slot;
+        Feature& nf = g.features[slot];
+        nf.prepared = false;
+        if (nf.ordered_group) {
+            for (Feature& other : g.features) {
+                if (&other != &nf && other.handle && !other.retired && other.ordered_group == nf.ordered_group &&
+                    (other.render_w > nf.render_w || other.render_h > nf.render_h)) other.recreate = true;
+            }
+        }
+        retire_feature_locked(view.feature); // released once every use of it has completed
+        view.feature = slot;
+        view.needs_reset = true;
+        view.last_rec = -1; // a new feature: nothing to order against
+        view.wait_fence = g.prep.fence;
+        view.wait_value = g.prep.value;
+        ++g.stats.features_created;
+        ++g.prep_stats.adopted;
+        g.stats.feature_render_w = nf.render_w;
+        g.stats.feature_render_h = nf.render_h;
+        g.stats.feature_out_w = nf.out_w;
+        g.stats.feature_out_h = nf.out_h;
+        g.stats.feature_flags = nf.flags;
+        g.stats.feature_preset = nf.preset;
+        {
+            auto& c = g.stats.creates[g.stats.create_seq % 8];
+            c = {++g.stats.create_seq, d.view_id, nf.flags, nf.preset, static_cast<uint32_t>(nf.quality), nf.render_w, nf.render_h, nf.out_w, nf.out_h};
+        }
+        g.prep = State::Prep{};
+        g.prep.gen = ++g.prep_gen;
+        pred = -1;
+        fits = true;
+        collect_locked();
+    }
     if (!fits) {
         // R-305: secure a slot BEFORE giving up the current feature, so no handle is ever lost.
         const int slot = free_feature_slot_locked();
@@ -694,6 +933,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_
             c = {++g.stats.create_seq, d.view_id, flags, d.preset, static_cast<uint32_t>(d.quality), create_w, create_h, d.out_w, d.out_h};
         }
         collect_locked(); // the retired feature may already be free of uses
+        note_dlss_vram_locked("a DLSS feature was made on the frame");
     }
     Feature& ft = g.features[view.feature];
     // Every key is written every frame: the object is shared with creation and
@@ -750,6 +990,9 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_
         rec.gen = ++g.rec_gen;
         rec.pred = pred;
         rec.pred_gen = pred_gen;
+        rec.after = std::move(view.wait_fence); // the first evaluation of an adopted feature waits for its creation
+        rec.after_value = view.wait_value;
+        view.wait_value = 0;
         view.last_rec = ri;
         view.last_rec_gen = rec.gen;
         ++ft.outstanding;
@@ -842,6 +1085,12 @@ void BeforeExecute(ID3D12CommandQueue* queue, uint32_t count, ID3D12CommandList*
         return -1;
     };
     for (Record& rec : g.recs) {
+        if (rec.state == RecState::Recorded && rec.after && index_of(rec.list) >= 0) {
+            // The feature was made off the frame on our own queue: this queue waits for that on the GPU.
+            if (rec.after->GetCompletedValue() < rec.after_value && SUCCEEDED(queue->Wait(rec.after.Get(), rec.after_value)))
+                ++g.stats.queue_waits;
+            rec.after.Reset();
+        }
         if (rec.state != RecState::Recorded || rec.pred < 0) continue;
         const int self = index_of(rec.list);
         if (self < 0) continue;
@@ -907,6 +1156,103 @@ bool EnsureOn(ID3D12Device* device, const wchar_t* data_path)
 }
 
 void SetReleaseViewHookForTests(void (*hook)()) { g_release_view_hook.store(hook); }
+
+void SetBackgroundThreadInit(void (*init)()) { g_thread_init.store(init, std::memory_order_release); }
+
+#if defined(NA_HAVE_NGX_SDK)
+// The view of `k` already has a feature that serves it (nothing to make).
+bool view_has_locked(const Key& k)
+{
+    const int vi = find_view_locked(k.view, false);
+    if (vi < 0 || g.views[vi].feature < 0) return false;
+    const Feature& f = g.features[g.views[vi].feature];
+    return f.handle && !f.tainted && !f.recreate && f.ordered_group == k.group && f.out_w == k.ow && f.out_h == k.oh &&
+           f.flags == k.flags && f.quality == k.q && f.preset == k.preset && k.w <= f.render_w && k.h <= f.render_h;
+}
+#endif
+
+Prepared PreparedState(const EvalDesc& d)
+{
+#if defined(NA_HAVE_NGX_SDK)
+    std::lock_guard<std::mutex> lock(g.m);
+    const Key k = key_of(d);
+    if (g.prep.state != Prepared::None && g.prep.key == k) return g.prep.state;
+    return view_has_locked(k) ? Prepared::Ready : Prepared::None;
+#else
+    (void)d;
+    return Prepared::None;
+#endif
+}
+
+Prepared PrepareFeature(const EvalDesc& d)
+{
+#if defined(NA_HAVE_NGX_SDK)
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!g.attached || g.latched || !g.caps.available || !g.device) return Prepared::None;
+    const Key k = key_of(d);
+    if (g.prep.state != Prepared::None && g.prep.key == k) return g.prep.state;
+    if (g.prep.state == Prepared::Making) return Prepared::Making; // another one is being made: asked again next frame
+    if (view_has_locked(k)) return Prepared::Ready; // already the view's feature: nothing to make
+    if (g.prep.state == Prepared::Ready && g.prep.slot >= 0) { // made for another request: given up
+        g.features[g.prep.slot].prepared = false;
+        retire_feature_locked(g.prep.slot);
+        ++g.prep_stats.cancelled;
+    }
+    g.prep = State::Prep{};
+    g.prep.gen = ++g.prep_gen;
+    g.prep.key = k;
+    g.prep.state = Prepared::Making;
+    try {
+        std::thread(make_prepared, k, g.prep.gen, g.device).detach();
+    } catch (...) {
+        g.prep.state = Prepared::Failed;
+    }
+    return g.prep.state;
+#else
+    (void)d;
+    return Prepared::None;
+#endif
+}
+
+Prepared WaitPrepared(const EvalDesc& d, double* waited_ms)
+{
+    if (waited_ms) *waited_ms = 0;
+#if defined(NA_HAVE_NGX_SDK)
+    const auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(g.m);
+    const Key k = key_of(d);
+    if (g.prep.state == Prepared::None || !(g.prep.key == k)) return view_has_locked(k) ? Prepared::Ready : Prepared::None;
+    g_prep_cv.wait_for(lock, std::chrono::seconds(2), [&] { return g.prep.state != Prepared::Making || !(g.prep.key == k); });
+    if (waited_ms) *waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return g.prep.key == k ? g.prep.state : Prepared::None;
+#else
+    (void)d;
+    return Prepared::None;
+#endif
+}
+
+void CancelPrepared()
+{
+#if defined(NA_HAVE_NGX_SDK)
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.prep.state == Prepared::Ready && g.prep.slot >= 0) {
+        g.features[g.prep.slot].prepared = false;
+        retire_feature_locked(g.prep.slot);
+        ++g.prep_stats.cancelled;
+    }
+    if (g.prep.state != Prepared::None) {
+        g.prep = State::Prep{};
+        g.prep.gen = ++g.prep_gen;
+    }
+    collect_locked();
+#endif
+}
+
+PrepareStats GetPrepareStats()
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.prep_stats;
+}
 
 void ReleaseView(uint64_t view_id)
 {
