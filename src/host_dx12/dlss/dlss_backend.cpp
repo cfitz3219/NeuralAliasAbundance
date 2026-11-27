@@ -235,6 +235,7 @@ struct State {
     // first of its kind.
     bool warming = false;
     uint64_t warm_gen = 0;
+    int creating = 0; // off-frame creations inside NVIDIA's create call without g.m (Shutdown waits for them)
     const char* holder = "none"; // the background work last holding g.m (WHY log of the game's waits)
     std::array<Key, 2> warmed_keys{};
 };
@@ -242,6 +243,11 @@ State g;
 std::condition_variable g_prep_cv; // with g.m: a background creation finished
 std::atomic<void (*)()> g_thread_init{nullptr};
 std::recursive_mutex g_life_m; // serializes all public lifecycle mutations
+// Every call into NVIDIA's runtime (NGX is not thread safe). Taken after g.m where both are held; the off-frame
+// creation holds only this one while NVIDIA makes the feature, so the game thread's per-submission hooks
+// (BeforeExecute, OnExecuted), which never call NVIDIA, do not wait for it (2026-11-27: a 19.6 ms creation held
+// g.m and the frame it started on took +21 ms). Recursive: some NVIDIA calls are made from helpers of others.
+std::recursive_mutex g_ngx;
 ComPtr<ID3D12Device> g_tried_device;
 std::atomic<void (*)()> g_release_view_hook{nullptr};
 std::atomic<bool> g_any_attached{false}; // hot-path filter for OnExecuted (every game submission)
@@ -263,6 +269,7 @@ NVSDK_NGX_Parameter* CP() { return static_cast<NVSDK_NGX_Parameter*>(g.cap_param
 
 void release_handle(void* h)
 {
+    std::lock_guard<std::recursive_mutex> ngx(g_ngx);
     if (h && g.api.release_feature) reinterpret_cast<PfnRelease>(g.api.release_feature)(static_cast<NVSDK_NGX_Handle*>(h));
 }
 
@@ -273,6 +280,7 @@ void note_dlss_vram_locked(const char* why)
     unsigned long long bytes = 0;
     uint32_t count = 0;
     for (const Feature& f : g.features) count += f.handle ? 1u : 0u;
+    std::lock_guard<std::recursive_mutex> ngx(g_ngx);
     NVSDK_NGX_Parameter* p = CP();
     void* cb = nullptr;
     if (p && NVSDK_NGX_SUCCEED(p->Get(NVSDK_NGX_Parameter_DLSSGetStatsCallback, &cb)) && cb &&
@@ -336,23 +344,35 @@ void collect_locked()
 }
 
 #if defined(NA_HAVE_NGX_SDK)
-// Releases the handles collect_locked found free. NGX is not thread safe, so this holds g.m while NVIDIA
-// releases them; it starts right after the call that found them (an Evaluate, a submission, a view's
-// release), so the game's next DLSS call is a frame away. Times every release (PrepareStats).
+// Releases the handles collect_locked found free, under g_ngx only (NGX is not thread safe): the game
+// thread's per-submission hooks take g.m and are not held while NVIDIA releases. Shutdown waits for it
+// (g.releasing). Times every release (PrepareStats).
 void release_thread()
 {
     if (auto init = g_thread_init.load(std::memory_order_acquire)) init();
+    std::vector<void*> handles;
+    bool attached = false;
+    {
+        std::lock_guard<std::mutex> lock(g.m);
+        handles.swap(g.to_release);
+        attached = g.attached;
+    }
+    std::vector<double> times;
+    double total = 0;
+    {
+        std::lock_guard<std::recursive_mutex> ngx(g_ngx);
+        for (void* h : handles) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (attached) release_handle(h);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            na::diag::release_trace::Note("dlss_feature_release", ms, GetTickCount64());
+            times.push_back(ms);
+            total += ms;
+        }
+    }
     std::lock_guard<std::mutex> lock(g.m);
     g.holder = "release thread";
-    std::vector<void*> handles;
-    handles.swap(g.to_release);
-    double total = 0;
-    for (void* h : handles) {
-        const auto t0 = std::chrono::steady_clock::now();
-        if (g.attached) release_handle(h);
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        na::diag::release_trace::Note("dlss_feature_release", ms, GetTickCount64());
-        total += ms;
+    for (const double ms : times) {
         g.prep_stats.release_last_ms = ms;
         if (ms > g.prep_stats.release_longest_ms) g.prep_stats.release_longest_ms = ms;
         ++g.prep_stats.released_off_frame;
@@ -446,8 +466,9 @@ Key key_of(const EvalDesc& d)
     return k;
 }
 
-// The off-frame creation (PrepareFeature), on its own thread. Holds g.m only while NVIDIA makes the
-// feature (NGX is not thread safe); the command list and queue are its own.
+// The off-frame creation (PrepareFeature), on its own thread. NVIDIA makes the feature under g_ngx alone
+// (its slot reserved under g.m first), so the game's frames are not held while it does; the command list
+// and queue are its own.
 void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
 {
     if (auto init = g_thread_init.load(std::memory_order_acquire)) init();
@@ -473,6 +494,7 @@ void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
             if (ok) g.make_queue->SetName(L"NeuralAlias DLSS feature creation");
         }
         if (ok && !g.make_params) {
+            std::lock_guard<std::recursive_mutex> ngx(g_ngx);
             NVSDK_NGX_Parameter* p = nullptr;
             ok = NVSDK_NGX_SUCCEED(reinterpret_cast<PfnParams>(g.api.allocate_parameters)(&p)) && p;
             g.make_params = p;
@@ -482,7 +504,15 @@ void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
             ok = slot >= 0;
         }
         if (ok) {
+            g.features[slot].reserved = true;
+            ++g.creating;
             queue = g.make_queue;
+        }
+    }
+    NVSDK_NGX_Handle* made = nullptr;
+    if (ok) {   // NVIDIA makes the feature: g_ngx only
+        std::lock_guard<std::recursive_mutex> ngx(g_ngx);
+        {
             NVSDK_NGX_Parameter* p = static_cast<NVSDK_NGX_Parameter*>(g.make_params);
             p->Reset();
             p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
@@ -512,7 +542,17 @@ void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
             }
             code = static_cast<int32_t>(r);
             ok = NVSDK_NGX_SUCCEED(r) && h;
-            if (ok) {
+            made = ok ? h : nullptr;
+        }
+    }
+    if (slot >= 0) {
+        std::lock_guard<std::mutex> lock(g.m);
+        g.holder = "off-frame creation (record)";
+        g.features[slot].reserved = false;
+        --g.creating;
+        if (ok) {
+            NVSDK_NGX_Handle* h = made;
+            {
                 Feature& nf = g.features[slot];
                 nf = Feature{};
                 nf.handle = h;
@@ -527,11 +567,12 @@ void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
                 nf.prepared = true;
                 nf.made_fence = fence;
                 nf.made_value = 1;
-            } else {
-                slot = -1;
             }
+        } else {
+            slot = -1;
         }
     }
+    g_prep_cv.notify_all(); // Shutdown may be waiting for this creation to be recorded
     // Submitted outside the lock: the game's frames go on meanwhile.
     if (ok) ok = SUCCEEDED(list->Close());
     if (ok) {
@@ -605,6 +646,7 @@ void warm_levels(uint64_t gen, ComPtr<ID3D12Device> dev, std::array<Key, 2> keys
         std::lock_guard<std::mutex> lock(g.m);
         g.holder = "warm-up creation";
         if (g.warm_gen != gen || !g.attached || g.latched || g.device.Get() != dev.Get()) ok = false;
+        std::lock_guard<std::recursive_mutex> ngx(g_ngx);
         NVSDK_NGX_Parameter* p = nullptr;
         if (ok) ok = NVSDK_NGX_SUCCEED(reinterpret_cast<PfnParams>(g.api.allocate_parameters)(&p)) && p;
         for (int i = 0; ok && i < 2; ++i) {
@@ -839,6 +881,10 @@ void Shutdown()
     if (g.warming) g_prep_cv.wait_for(lock, std::chrono::seconds(6), [] { return !g.warming; });
     g.warming = false;
     ++g.warm_gen;
+    // An off-frame creation inside NVIDIA's call (without g.m) records its feature before NVIDIA is let go.
+    // ...and the release thread finishes the handles it took (it releases them without g.m).
+    if (g.creating || g.releasing) g_prep_cv.wait_for(lock, std::chrono::seconds(6), [] { return g.creating == 0 && !g.releasing; });
+    std::lock_guard<std::recursive_mutex> ngx(g_ngx);
     if (g.attached) {
         for (void* h : g.to_release) release_handle(h);
         g.to_release.clear();
@@ -905,6 +951,7 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
         *out = OptimalSettings{true, out_w, out_h, out_w, out_h, out_w, out_h};
         return true;
     }
+    std::lock_guard<std::recursive_mutex> ngx(g_ngx);
     NVSDK_NGX_Parameter* p = CP();
     void* cb = nullptr;
     if (p->Get(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &cb) != NVSDK_NGX_Result_Success || !cb) return false;
@@ -1100,7 +1147,11 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_
             p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, pr);
         }
         NVSDK_NGX_Handle* h = nullptr;
-        const NVSDK_NGX_Result r = reinterpret_cast<PfnCreate>(g.api.create_feature)(list, NVSDK_NGX_Feature_SuperSampling, p, &h);
+        NVSDK_NGX_Result r;
+        {
+            std::lock_guard<std::recursive_mutex> ngx(g_ngx);
+            r = reinterpret_cast<PfnCreate>(g.api.create_feature)(list, NVSDK_NGX_Feature_SuperSampling, p, &h);
+        }
         g.stats.last_ngx_result = static_cast<int32_t>(r);
         if (NVSDK_NGX_FAILED(r) || !h) {
             char buf[128];
@@ -1179,7 +1230,11 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_
     p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, 0u);
     p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y, 0u);
 #endif
-    const NVSDK_NGX_Result r = reinterpret_cast<PfnEvaluate>(g.api.evaluate_feature)(list, static_cast<NVSDK_NGX_Handle*>(ft.handle), p, nullptr);
+    NVSDK_NGX_Result r;
+    {
+        std::lock_guard<std::recursive_mutex> ngx(g_ngx);
+        r = reinterpret_cast<PfnEvaluate>(g.api.evaluate_feature)(list, static_cast<NVSDK_NGX_Handle*>(ft.handle), p, nullptr);
+    }
     g.stats.last_ngx_result = static_cast<int32_t>(r);
     if (NVSDK_NGX_FAILED(r)) {
         char buf[128];
