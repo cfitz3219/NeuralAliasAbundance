@@ -210,6 +210,12 @@ na_host_test(capture_test SOURCES capture_test.cpp LIBS host_capture
 
 na_host_test(overlay_test SOURCES overlay_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12 user32)
 na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host_dx12 user32 d3d11)
+# One presenter for both APIs, stage 2: native DX11 chains presented through our D3D12 queue (Off path, bit-exact).
+na_host_test(dx11_proxy_chain_test SOURCES dx11_proxy_chain_test.cpp LIBS host_dx12 user32 d3d11 d3d12 dxgi LABELS gpu)
+# HUD-free picture on the native DX11 route: both shapes learned from one frame, through the real hooks (exact).
+na_host_test(hud_free11_test SOURCES hud_free11_test.cpp LIBS host_dx12 user32 d3d11 d3d12 dxgi d3dcompiler LABELS gpu)
+# NVIDIA's D3D11 coarse shading (NVAPI), the basis of DLSS Quality / Performance on the native DX11 route.
+na_host_test(vrs11_test SOURCES vrs11_test.cpp LIBS d3d11 d3d12 dxgi d3dcompiler nvapi_headers LABELS gpu)
 add_test(NAME host_overlay_bootstrap_automatic_test COMMAND overlay_bootstrap_test --automatic)
 set_tests_properties(host_overlay_bootstrap_automatic_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS host)
 add_test(NAME host_added_upscaling_off_test COMMAND overlay_bootstrap_test --added-upscaling-off)
@@ -277,6 +283,10 @@ if(NA_HAVE_NGX_SDK)
   na_host_test(dlss_backend_test SOURCES dlss_backend_test.cpp LIBS host_dlss dxgi)
   # J2 live DLAA end to end (discovery picks -> inserted DLAA list) on the fake runtime.
   na_host_test(j2_live_test SOURCES j2_live_test.cpp LIBS host_dx12 dxgi)
+  # The HUD-free picture on DX12 end to end through the real hooks: both shapes learned and exact.
+  na_host_test(fg_hud_free12_test SOURCES fg_hud_free12_test.cpp LIBS host_dx12 dxgi d3dcompiler LABELS gpu)
+  add_test(NAME host_fg_hud_free12_sheet_test COMMAND fg_hud_free12_test --sheet)
+  set_tests_properties(host_fg_hud_free12_sheet_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   # The same host with no scene camera: never looked for, lost mid-play, required (fake runtime, WARP-capable).
   na_host_test(j2_no_camera_test SOURCES j2_no_camera_test.cpp LIBS host_dx12 dxgi d3dcompiler)
   # Only recordings the queue was really given prove the depth direction (never submitted, Reset,
@@ -458,6 +468,11 @@ if(NA_HAVE_NGX_LIB)
            COMMAND dlss_real_test "${CMAKE_CURRENT_BINARY_DIR}/dlss-stationary-test" --stationary)
   set_tests_properties(host_dlss_stationary_stability_test
     PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+  # VARIANT jitter/ramp-after-restart: the wobble after a history restart, full jitter against the ramp.
+  add_test(NAME host_dlss_restart_wobble_test
+           COMMAND dlss_real_test "${CMAKE_CURRENT_BINARY_DIR}/dlss-restart-test" --restart-wobble)
+  set_tests_properties(host_dlss_restart_wobble_test
+    PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   if(NA_DLSS_DLL)
     add_custom_command(TARGET dlss_real_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")
@@ -519,6 +534,52 @@ if(TARGET host_native11)
     add_test(NAME host_native11_dlaa_automatic_test COMMAND native11_dlaa_test --automatic)
     set_tests_properties(host_native11_dlaa_automatic_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_test(NAME host_native11_dlaa_camera_off_start_test COMMAND native11_dlaa_test --camera-off-start)
+    add_test(NAME host_native11_replay_handoff_test COMMAND native11_dlaa_test --replay-handoff)
+    set_tests_properties(host_native11_replay_handoff_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    # DLSS Quality / Performance on the native DX11 route: coarse shading on the scene draws (NVAPI), the shared
+    # fold pass, DLAA on screen until the level is ready, then back to DLAA.
+    add_test(NAME host_native11_fold_quality_test COMMAND native11_dlaa_test --fold-quality)
+    add_test(NAME host_native11_fold_performance_test COMMAND native11_dlaa_test --fold-performance)
+    # The same with no camera: motion measured, sampled at the kept pixels, the search on the folded picture.
+    add_test(NAME host_native11_fold_quality_measured_test COMMAND native11_dlaa_test --fold-quality-measured)
+    add_test(NAME host_native11_fold_performance_measured_test COMMAND native11_dlaa_test --fold-performance-measured)
+    set_tests_properties(host_native11_fold_quality_test host_native11_fold_performance_test host_native11_fold_quality_measured_test
+      host_native11_fold_performance_measured_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    # Map overlays (lines, labels) drawn into the scene picture with the depth test off take the jitter
+    # (jitter/scene-overlays; Hearts of Iron IV 2026-11-27), at DLAA, Quality and Performance; the interface stays put.
+    add_test(NAME host_native11_overlay_jitter_test COMMAND native11_dlaa_test --overlay-jitter)
+    add_test(NAME host_native11_overlay_jitter_quality_test COMMAND native11_dlaa_test --overlay-jitter-quality)
+    add_test(NAME host_native11_overlay_jitter_performance_test COMMAND native11_dlaa_test --overlay-jitter-performance)
+    set_tests_properties(host_native11_overlay_jitter_test host_native11_overlay_jitter_quality_test host_native11_overlay_jitter_performance_test
+      PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    # Stage 3: live x2 on a DX11 game with the real nvngx_dlssg (NA_FG_SEARCH names its folder; skipped without it).
+    add_test(NAME host_native11_fg_x2_test COMMAND native11_dlaa_test --fg-x2)
+    add_test(NAME host_native11_fg_x2_fp16_test COMMAND native11_dlaa_test --fg-x2-fp16)
+    # x2 together with a DLSS level: Frame Generation gets the level's folded depth and motion.
+    add_test(NAME host_native11_fg_x2_quality_test COMMAND native11_dlaa_test --fg-x2-quality)
+    add_test(NAME host_native11_fg_x2_performance_test COMMAND native11_dlaa_test --fg-x2-performance)
+    set_tests_properties(host_native11_fg_x2_quality_test host_native11_fg_x2_performance_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    # x2 with map names drawn after the hand-over that move with a panning map (hudpaste/moves-with-scene),
+    # at three pan speeds, and the same pasted the T2 way (hudpaste/screen-fixed) for the before figures.
+    foreach(speed IN ITEMS slow mid fast)
+      if(speed STREQUAL "mid")
+        set(names_arg "--fg-x2-names")
+      else()
+        set(names_arg "--fg-x2-names-${speed}")
+      endif()
+      add_test(NAME host_native11_fg_x2_names_${speed}_test COMMAND native11_dlaa_test ${names_arg})
+      add_test(NAME host_native11_fg_x2_names_${speed}_t2_test COMMAND native11_dlaa_test ${names_arg}-t2)
+      set_tests_properties(host_native11_fg_x2_names_${speed}_test host_native11_fg_x2_names_${speed}_t2_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    endforeach()
+    # The same in the automatic-API mode (graphics API found at the first present, proxy from chain creation),
+    # an interface drawn through deferred contexts (x2 waits with the plain reason), and a chain made before the takeover.
+    add_test(NAME host_native11_fg_x2_auto_test COMMAND native11_dlaa_test --fg-x2-auto)
+    add_test(NAME host_native11_fg_x2_auto_deferred_hud_test COMMAND native11_dlaa_test --fg-x2-auto-deferred-hud)
+    add_test(NAME host_native11_fg_x2_auto_deferred_hud_mixed_test COMMAND native11_dlaa_test --fg-x2-auto-deferred-hud-mixed)
+    add_test(NAME host_native11_fg_x2_auto_late_chain_test COMMAND native11_dlaa_test --fg-x2-auto-late-chain)
+    set_tests_properties(host_native11_fg_x2_test host_native11_fg_x2_fp16_test host_native11_fg_x2_auto_test
+      host_native11_fg_x2_auto_deferred_hud_test host_native11_fg_x2_auto_deferred_hud_mixed_test host_native11_fg_x2_auto_late_chain_test
+      PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     set_tests_properties(host_native11_dlaa_camera_off_start_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_test(NAME host_native11_dlaa_adaptive_screen_test COMMAND native11_dlaa_test --adaptive-screen)
     add_test(NAME host_native11_dlaa_rotating_lighting_test COMMAND native11_dlaa_test --lit-role)
@@ -643,6 +704,14 @@ set_tests_properties(host_overlay_bootstrap_recovery_test PROPERTIES TIMEOUT 30 
 add_test(NAME host_overlay_menu_failure_test COMMAND overlay_bootstrap_test --menu-failure)
 set_tests_properties(host_overlay_menu_failure_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "host;gpu")
 na_host_test(presenter_ownership_test SOURCES presenter_ownership_test.cpp LIBS host_dx12 user32)
+# Live Frame Generation T2 HUD paste on the GPU equals the CPU reference (WARP when no GPU).
+na_host_test(fg_hud_paste_test SOURCES fg_hud_paste_test.cpp LIBS host_dx12 d3d12 dxgi LABELS gpu)
+# VARIANT hudpaste/moves-with-scene: interface anchored to a panning map placed at the generated picture's time.
+na_host_test(fg_hud_move_test SOURCES fg_hud_move_test.cpp LIBS host_dx12 d3d12 dxgi d3dcompiler LABELS gpu)
+# Live x2 still-area steadying equals Astra's reference shader; motion fill and dead zone (WARP when no GPU).
+na_host_test(fg_steady_pass_test SOURCES fg_steady_pass_test.cpp LIBS host_dx12 d3d12 dxgi d3dcompiler LABELS gpu)
+# Live Frame Generation: the HUD sheet state at the final draw from same-recording barriers only (WARP).
+na_host_test(fg_sheet_state_test SOURCES fg_sheet_state_test.cpp LIBS host_dx12 d3d12 dxgi)
 na_host_test(display_independent_present_test SOURCES display_independent_present_test.cpp LIBS host_dx12 user32)
 na_host_test(fullscreen_resize_test SOURCES fullscreen_resize_test.cpp LIBS host_dx12 user32 na_native_present_foreign)
 add_custom_command(TARGET fullscreen_resize_test POST_BUILD
@@ -695,3 +764,9 @@ if(NA_DLSS_DLL AND EXISTS "${NA_DLSS_DLL}")
   add_custom_command(TARGET dlss_capture_replay POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_capture_replay>")
 endif()
+
+# Offline proof for Frame Generation (NGX feature 11) through our own module on a saved capture (see the head
+# of the source). Not a CTest: it only runs where an RTX card, the NGX library and the runtime are present.
+add_executable(fg_capture_replay fg_capture_replay.cpp)
+target_link_libraries(fg_capture_replay PRIVATE abundance_options host_dx12 version dxgi d3d12)
+target_include_directories(fg_capture_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

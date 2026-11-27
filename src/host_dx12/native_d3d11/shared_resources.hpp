@@ -30,10 +30,13 @@ public:
     SharedTexture& operator=(const SharedTexture&) = delete;
     SharedTexture(SharedTexture&&) = default;
     SharedTexture& operator=(SharedTexture&&) = delete;
-    HRESULT Create(ID3D11Device* native, ID3D12Device* effects, const ImageDesc& desc);
+    HRESULT Create(ID3D11Device* native, ID3D12Device* effects, const ImageDesc& desc,
+                   const char** failed_operation = nullptr);
     ID3D11Texture2D* Native() const { return native_.Get(); }
     ID3D12Resource* Effects() const { return effects_.Get(); }
     const ImageDesc& Description() const { return desc_; }
+    // Both halves released (the caller has seen every frame that used them retire).
+    void Reset() { native_.Reset(); effects_.Reset(); desc_ = ImageDesc{}; }
 private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> native_;
     Microsoft::WRL::ComPtr<ID3D12Resource> effects_;

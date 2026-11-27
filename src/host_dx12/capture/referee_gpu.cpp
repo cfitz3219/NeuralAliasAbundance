@@ -24,6 +24,8 @@
 #include "core/referee_placement.hpp"
 #include "core/referee_present_times.hpp"
 #include "core/referee_dropout.hpp"
+#include "core/referee_coverage.hpp"
+#include "host_dx12/diag/referee_recovery.hpp"
 #include "core/referee_mixed_raster.hpp"
 #include "core/referee_parity.hpp"
 
@@ -120,6 +122,13 @@ struct State {
         uint64_t field_ordinal = 0;
         // VARIANT: referee/sample-locked-dropout
         DropoutWatch dropout;
+        OverlayWatch overlay; // VARIANT: jitter/scene-overlays guard
+        // VARIANT: referee/coverage-trial: classes of draws left off the jitter tried on the sample; this window's
+        // measured pairs, black onsets/returns and lasting black cells (the trial's black guard).
+        CoverageTrial coverage;
+        bool coverage_hinted = false;
+        uint32_t win_pairs = 0;
+        float win_black_events = 0, win_black_cells = 0;
         std::array<float, FlickerTransition::count> dropout_view{};
         bool dropout_view_known = false;
         ULONGLONG dropout_observed_at = 0;
@@ -128,6 +137,14 @@ struct State {
     std::array<JitterControl, 2> jitter_controls;
     std::atomic<unsigned> jitter_active{0};
     std::atomic<unsigned> still_meshes_active{0}; // bit per control: its dropout watch asks for the move
+    std::atomic<unsigned> overlays_off{0};        // bit per control: its overlay watch tries or keeps the earlier rule
+    std::atomic<uint64_t> overlays_moved[2]{}, left_unjittered[2]{}; // the hosts' last-frame counts (NoteSceneMeshes)
+    std::atomic<uint64_t> left_by_class[2][kLeftClasses]{};          // the hosts' draws left off the jitter, this window
+    std::atomic<uint32_t> coverage_mask[2]{};                        // classes the hosts move onto the sample
+    std::atomic<uint64_t> coverage_decisions[2]{};
+    std::atomic<int> coverage_last_class[2]{-1, -1}, coverage_trial[2]{-1, -1};
+    std::atomic<bool> coverage_last_kept[2]{};
+    const char* overlay_why[2]{};
     std::atomic<uint64_t> trial_sample_ticket{0};
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
     const void* trial_source = nullptr;
@@ -188,8 +205,12 @@ void publish_jitter(unsigned index)
 {
     if (g.jitter_controls[index].trial.NeedsReference()) g.jitter_active.fetch_or(1u << index, std::memory_order_release);
     else g.jitter_active.fetch_and(~(1u << index), std::memory_order_release);
-    if (g.jitter_controls[index].dropout.MoveStillMeshes()) g.still_meshes_active.fetch_or(1u << index, std::memory_order_release);
+    const auto& c = g.jitter_controls[index];
+    if (c.dropout.MoveStillMeshes() || c.trial.MoveUnjittered()) g.still_meshes_active.fetch_or(1u << index, std::memory_order_release);
     else g.still_meshes_active.fetch_and(~(1u << index), std::memory_order_release);
+    if (!c.overlay.OverlaysOn()) g.overlays_off.fetch_or(1u << index, std::memory_order_release);
+    else g.overlays_off.fetch_and(~(1u << index), std::memory_order_release);
+    g.overlay_why[index] = c.overlay.Why();
 }
 
 const char* dropout_phase(DropoutWatch::Phase phase)
@@ -456,8 +477,50 @@ void emit_window(bool force)
     const uint32_t log_s = na::settings::Get().referee_log_s.load(std::memory_order_relaxed);
     if (!g.window.samples || (!force && now - g.window_at < ULONGLONG(log_s < 1 ? 1 : log_s) * 1000)) return;
     char line[2048];
-    na::referee::Format(line, sizeof line, g.window, na::referee::Judge(g.window));
+    const auto verdicts = na::referee::Judge(g.window);
+    na::referee::Format(line, sizeof line, g.window, verdicts);
     na::eventlog::Emit("referee", "%s centered_screen_samples=%u", line, g.centered_in_window);
+    {   // VARIANT: referee/coverage-trial: one window of the scene on screen.
+        const unsigned index = jitter_index(g.captured_context.placement.path);
+        auto& control = g.jitter_controls[index];
+        const auto& t = g.window.total;
+        const uint32_t decided = t.jitter_follows + t.jitter_reverse + t.jitter_none;
+        CoverageWindow cw;
+        cw.judged = verdicts.jitter != na::referee::Verdict::NotMeasured && verdicts.picture != na::referee::Verdict::Fail && decided >= 32;
+        cw.share = decided ? float(t.jitter_none) / float(decided) : 0.f;
+        cw.black_events = control.win_pairs ? control.win_black_events / float(control.win_pairs) : 0.f;
+        cw.black_cells = control.win_pairs ? control.win_black_cells / float(control.win_pairs) : 0.f;
+        for (unsigned c = 0; c < kLeftClasses; ++c) cw.left[c] = g.left_by_class[index][c].exchange(0, std::memory_order_relaxed);
+        control.win_pairs = 0;
+        control.win_black_events = control.win_black_cells = 0;
+        if (!control.coverage_hinted) {
+            control.coverage_hinted = true;
+            control.coverage.SetAvoided(na::referee::memory::CoverageAvoided(index == 1));
+        }
+        if (control.trial.ClassTrialWanted()) { control.coverage.Kick(); control.trial.ClassTrialTaken(); }
+        const uint64_t before = control.coverage.Decisions();
+        if (control.coverage.Observe(cw, now)) {
+            g.coverage_mask[index].store(control.coverage.MoveMask(), std::memory_order_release);
+            g.coverage_trial[index].store(control.coverage.TrialClass(), std::memory_order_release);
+            if (control.coverage.Decisions() != before) {
+                g.coverage_last_class[index].store(control.coverage.LastClass(), std::memory_order_relaxed);
+                g.coverage_last_kept[index].store(control.coverage.LastKept(), std::memory_order_relaxed);
+                g.coverage_decisions[index].store(control.coverage.Decisions(), std::memory_order_release);
+                na::referee::memory::NoteCoverage(index == 1, unsigned(control.coverage.LastClass()), control.coverage.LastKept());
+            }
+            char left[256] = "";
+            int at = 0;
+            for (unsigned c = 0; c < kLeftClasses && at < int(sizeof left) - 32; ++c)
+                at += std::snprintf(left + at, sizeof left - size_t(at), "%s%s=%llu", c ? " " : "", LeftClassName(c),
+                                    static_cast<unsigned long long>(cw.left[c]));
+            na::eventlog::Emit("referee_coverage_trial",
+                "path=%s phase=%s trial=%s moved_mask=0x%02x share_pct=%.3f judged=%d baseline_pct=%.3f measured_pct=%.3f "
+                "black{events_per_pair=%.3f lasting_cells_per_pair=%.3f} left{%s} why=\"%s\"",
+                index == 0 ? "native11" : "dx12", control.coverage.Name(), LeftClassName(unsigned(control.coverage.TrialClass())),
+                control.coverage.MoveMask(), cw.share * 100.f, cw.judged ? 1 : 0, control.coverage.Baseline() * 100.f,
+                control.coverage.Measured() * 100.f, cw.black_events, cw.black_cells, left, control.coverage.Why());
+        }
+    }
     if (g.preview_pending) {
         uint64_t first;
         const auto evidence = g.recent.For(g.preview_context, first);
@@ -665,14 +728,26 @@ void collect_sample()
                     const auto pair = CountDropouts(raster_field.data(), unsigned(raster_field.size() / mixed_values),
                                                     mixed_values, mixed_black_before, mixed_black_now);
                     const bool same_view = control.dropout_view_known && SameJitterPicture(control.dropout_view, trial.image);
+                    ++control.win_pairs;
+                    control.win_black_events += pair.Any() ? 1.f : 0.f;
+                    control.win_black_cells += float(pair.black);
                     // Keep comparing against the symptom's picture until the trial ends.
                     if (control.dropout.Current() != DropoutWatch::Phase::Trial) {
                         control.dropout_view = trial.image;
                         control.dropout_view_known = true;
                     }
                     control.dropout_observed_at = GetTickCount64();
-                    const bool changed = control.dropout.Observe(pair, {g.pre_jitter[0], g.pre_jitter[1]},
-                                                                 {g.main_jitter[0], g.main_jitter[1]}, same_view);
+                    // VARIANT: jitter/scene-overlays: its guard first; the still-mesh move waits while it tries.
+                    const bool overlay_changed = control.overlay.Observe(pair, same_view,
+                        g.overlays_moved[index].load(std::memory_order_relaxed) != 0);
+                    if (overlay_changed) {
+                        na::eventlog::Emit("referee_overlays", "frame=%llu path=%s phase=%s why=\"%s\" pair{gone=%u back=%u cells=%u}",
+                            static_cast<unsigned long long>(g.main_ordinal), scene.placement.path == shadow::Path::Native11 ? "native11" : "dx12",
+                            control.overlay.Name(), control.overlay.Why(), pair.gone, pair.back, pair.cells);
+                        publish_jitter(index);
+                    }
+                    const bool changed = !control.overlay.Busy() &&
+                        control.dropout.Observe(pair, {g.pre_jitter[0], g.pre_jitter[1]}, {g.main_jitter[0], g.main_jitter[1]}, same_view);
                     if (pair.Any() && same_view) ++control.dropout_events;
                     if (changed) publish_jitter(index);
                     // The first few events of a scene are written out too, so a run that never reaches a
@@ -694,6 +769,8 @@ void collect_sample()
                         if (ref.x == regions.at[tile].x && ref.y == regions.at[tile].y) break;
                 }
                 bool field_measured = false;
+                const bool had_move = test.MoveUnjittered();
+                test.NoteUnjittered(g.left_unjittered[index].load(std::memory_order_relaxed));
                 if (trial.delivered && !raster_field.empty() && (!test.NeedsReference() || test.Reference().field)) {
                     if (control.amount != amount || g.main_ordinal <= control.field_ordinal ||
                         g.main_ordinal - control.field_ordinal > 240) control.field.pairs = 0;
@@ -731,6 +808,7 @@ void collect_sample()
                         test.Observe({regions.at[tile], layout, screen.shift, output.shift,
                                       regions.detail[tile], screen.locked, trial.image}, amount, now);
                 }
+                if (!had_move && test.MoveUnjittered()) publish_jitter(index);
                 if (phase != test.Current() || before_strength != test.Amount()) {
                     // A confirmation must be independent of its first observation.
                     if (test.Current() == JitterTrial::Phase::Confirm) {
@@ -1558,6 +1636,49 @@ uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t col
     return control.trial.Amount();
 }
 
+bool SceneOverlays(const void* swapchain, shadow::Path path, const char** why)
+{
+    const unsigned index = jitter_index(path);
+    const bool off = swapchain && enabled() && (g.overlays_off.load(std::memory_order_acquire) & (1u << index));
+    if (why) *why = off && g.overlay_why[index] ? g.overlay_why[index] : "overlays on the frame's sample (scene content drawn without the depth test)";
+    return !off;
+}
+
+void NoteSceneMeshes(shadow::Path path, uint64_t overlays_moved, uint64_t left_unjittered)
+{
+    const unsigned index = jitter_index(path);
+    g.overlays_moved[index].store(overlays_moved, std::memory_order_relaxed);
+    g.left_unjittered[index].store(left_unjittered, std::memory_order_relaxed);
+}
+
+void NoteLeftByClass(shadow::Path path, const uint64_t (&left)[kLeftClasses])
+{
+    const unsigned index = jitter_index(path);
+    for (unsigned c = 0; c < kLeftClasses; ++c)
+        if (left[c]) g.left_by_class[index][c].fetch_add(left[c], std::memory_order_relaxed);
+}
+
+uint32_t CoverageMoveMask(shadow::Path path)
+{
+    return enabled() ? g.coverage_mask[jitter_index(path)].load(std::memory_order_acquire) : 0u;
+}
+
+CoverageDecision LastCoverageDecision(shadow::Path path)
+{
+    const unsigned index = jitter_index(path);
+    CoverageDecision d;
+    d.decisions = g.coverage_decisions[index].load(std::memory_order_acquire);
+    d.cls = g.coverage_last_class[index].load(std::memory_order_relaxed);
+    d.kept = g.coverage_last_kept[index].load(std::memory_order_relaxed);
+    d.trial = g.coverage_trial[index].load(std::memory_order_relaxed);
+    return d;
+}
+
+void SetCoverageMaskForTests(shadow::Path path, uint32_t mask)
+{
+    g.coverage_mask[jitter_index(path)].store(mask, std::memory_order_release);
+}
+
 // VARIANT: referee/sample-locked-dropout
 // Whether the meshes of this scene that kept the game's own viewport should take the frame's
 // sample: the dropout watch is trying that, or has proved it on this scene.
@@ -1575,7 +1696,7 @@ bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, 
         GetTickCount64() - control.dropout_observed_at > 4 * every_ms() + kStuckMs) return false;
     const bool rotating = path == shadow::Path::Native11 && screen_proof && scene.native_screen_proof;
     if (depth != scene.depth || generation != scene.generation || (color != scene.color && !rotating)) return false;
-    return control.dropout.MoveStillMeshes();
+    return control.dropout.MoveStillMeshes() || control.trial.MoveUnjittered();
 }
 
 void InvalidatePresentation(const void* swapchain)

@@ -32,6 +32,7 @@
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/native11/draw_replay.hpp"
+#include "host_dx12/native11/hud_free.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/native11/depth_reads.hpp"
@@ -40,12 +41,14 @@
 #include "host_dx12/native11/lit_scene.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
+#include "host_dx12/native11/coarse11.hpp"
 #include "providers/camera/camera_admission.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <array>
@@ -59,6 +62,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace na::native11 {
@@ -270,6 +274,12 @@ struct Ctx {
     bool depth_layer_target = false, material_layer_target = false;
     bool vpj_shader_depth = false;
     bool vpj_still_mesh = false; // VARIANT: referee/sample-locked-dropout (moved at the Referee's ask)
+    bool vpj_overlay = false;    // VARIANT: jitter/scene-overlays (an untested mesh into the scene colour)
+    // VARIANT: jitter/stationary-source-readers: depth-like layers written this frame on the game's own grid
+    // (R32_FLOAT targets drawn by draws that did not take the live sample), proven exact copies of them, and
+    // which pixel-shader slots read one now.
+    struct StationaryLayers { Id resource[4] = {}; uint32_t frame = 0; std::bitset<kDepthSlots> pixel_reads; } stationary;
+    uint8_t vpj_still_class = 0; // why an untested scene mesh kept the game's grid (StillClass)
     uint8_t depth_func = kCompareLess; // the bound state's comparison when it tests AND writes depth, else 0 (default state: LESS, writing)
     Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
     uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
@@ -277,11 +287,18 @@ struct Ctx {
     D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {}; // the game's own viewports
     UINT vp_n = 0;
     bool vpj_applied = false;          // our offset copies are bound on this context now
+    bool vpj_want = false;             // the draw being decided takes the scene's sample (VpjBeforeDraw)
+    uint32_t coarse_rate = 0;          // the shading rate we set on this context (0: one per pixel); never cleared by the
+                                       // game's state calls (NVAPI keeps it), reset by FinishCommandList
     bool vpj_expanded = false;
     uint64_t vpj_sample = 0;          // the exact sample they carry
     uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
     std::vector<Event> events;        // deferred recording
     bool events_truncated = false;
+    // Deferred recording: every colour target it writes (draws, clears, copies), so the HUD-free
+    // picture can tell whether a command list draws into the shown picture (hud_free::OnExecuteList).
+    std::vector<Id> list_writes;
+    bool list_writes_unknown = false;
     ViewUse rt_view, ds_view;
     std::vector<DeferredUpload> cb_bytes; // (event index, bytes) for CbUpdate events
     std::unordered_map<Id, void*> mapped; // candidate constant buffers mapped right now
@@ -311,7 +328,9 @@ struct Ctx {
         rt_count = 0;
         raster_depth_layer = {};
         target_width = target_height = 0;
-        depth_layer_target = material_layer_target = vpj_shader_depth = vpj_still_mesh = false;
+        depth_layer_target = material_layer_target = vpj_shader_depth = vpj_still_mesh = vpj_overlay = false;
+        stationary = {};
+        vpj_still_class = 0;
         depth_test = true;
         depth_read_only = false;
         for (auto& mask : depth_reads.slots) mask.reset();
@@ -326,6 +345,8 @@ struct Ctx {
 };
 struct ListRecord {
     std::vector<Event> events;
+    std::vector<Id> writes;      // colour targets the recording wrote (draws, clears, copies)
+    bool writes_unknown = false; // too many to list
     std::vector<DeferredUpload> cb_bytes;
     std::vector<DeferredExact> draw_bytes;
     uint64_t order = 0;
@@ -479,6 +500,10 @@ bool g_jitter_written = false; // this frame's camera upload carried our sample
 // without g_mu. While it is the route, the camera-matrix write (JitterUpload) stays out of it.
 std::atomic<bool> g_vpj_route{false}; // SetJitterRoute; the host turns it on for the native path
 std::atomic<uint64_t> g_vpj_sample{0}; // publish both float axes as one value
+// Coarse shading (SetSceneCoarseShading): the rate asked for, and whether this frame's scene is still open.
+std::atomic<uint32_t> g_coarse{0};
+std::atomic<bool> g_coarse_open{false};
+std::atomic<uint64_t> g_coarse_draws{0}, g_coarse_sets{0}, g_coarse_restores{0}, g_coarse_failures{0}, g_coarse_before_lists{0}, g_coarse_frames{0};
 std::atomic<Id> g_sel_depth{0};
 std::atomic<uint64_t> g_vpj_stopped_after_scene{0};
 std::atomic<Id> g_sel_depth2{0}; // the second depth the picture is drawn with (scene/after-layers-second-depth)
@@ -494,6 +519,93 @@ uint32_t g_vpj_frame_still_meshes = 0, g_vpj_frame_still_untested = 0, g_vpj_fra
 // Set by the Referee through SetStillMeshJitter while it tries or keeps its reaction to dropouts.
 std::atomic<bool> g_vpj_still_asked{false};
 uint32_t g_vpj_frame_still_moved = 0;
+// VARIANT: jitter/scene-overlays (on) | jitter/depth-tested-only (off; the Referee's dropout watch takes the
+// move back when pixels drop out on the samples after it). core/temporal_jitter.hpp SceneOverlayTakesJitter.
+std::atomic<bool> g_vpj_overlays{true};
+uint32_t g_vpj_frame_overlay_moved = 0;
+// Untested scene meshes that kept the game's grid, by why (counted per frame for the log).
+enum StillClass : uint8_t { kStillNone = 0, kStillDeferred, kStillOtherTarget, kStillOwnViewport, kStillRuleOff, kStillOther,
+                            kStillStationarySource, kStillFullScreen, kStillClasses };
+// VARIANT: referee/coverage-trial: the Referee's class (core/referee_coverage.hpp LeftClass) of a StillClass.
+int CoverageClassOf(uint8_t still)
+{
+    using L = na::referee::LeftClass;
+    switch (still) {
+    case kStillOtherTarget: return int(L::OtherTarget);
+    case kStillOwnViewport: return int(L::OwnViewport);
+    case kStillRuleOff: return int(L::RuleOff);
+    case kStillStationarySource: return int(L::StationarySource);
+    case kStillDeferred: return int(L::Deferred);
+    case kStillOther: return int(L::Other);
+    case kStillFullScreen: return int(L::FullScreen);
+    default: return -1;
+    }
+}
+const char* StillClassName(uint8_t still)
+{
+    const int c = CoverageClassOf(still);
+    return c >= 0 ? na::referee::LeftClassName(unsigned(c)) : "none";
+}
+// The classes the Referee moves onto the sample (kept, or on trial), the one on trial, and the draw signatures:
+// moved during the current trial, and put back by an earlier one (those stay on the game's grid).
+std::atomic<uint32_t> g_cov_mask{0};
+std::atomic<int> g_cov_trial{-1};
+std::mutex g_cov_m;
+std::unordered_set<uint64_t> g_cov_trial_sigs, g_cov_still_sigs; // under g_cov_m
+uint64_t g_cov_decisions = 0;                                    // under g_cov_m
+std::atomic<uint64_t> g_cov_moved{0}, g_cov_kept_still{0};
+std::atomic<uint64_t> g_cov_left_total[8]{}; // every frame's left-off draws by LeftClass, summed (tests, log)
+uint64_t CoverageSignature(const void* pixel_shader, uint64_t vertices, uint8_t still)
+{
+    return (reinterpret_cast<uintptr_t>(pixel_shader) * 1099511628211ull) ^ (vertices << 8) ^ still;
+}
+// WHY log (owed 2026-11-27): once a minute, every scene-colour draw of one frame left off the jitter, named.
+std::atomic<bool> g_left_name_frame{false};
+// WHY log (owed 2026-11-27): our CPU time on the game's thread, timed on one frame in eight (the timer itself costs):
+// camera finding and constant-upload keeping (camera), our own work around each draw call (draw_ours, the game's
+// draw call itself excluded, which is draw_driver). Reported per timed frame in milliseconds.
+std::atomic<bool> g_time_frame{false};
+std::atomic<uint64_t> g_tsc_camera{0}, g_tsc_draw_ours{0}, g_tsc_draw_driver{0}, g_timed_frames{0};
+std::atomic<uint64_t> g_cal_tsc0{0}, g_cal_qpc0{0};
+struct TscScope {
+    uint64_t t0;
+    std::atomic<uint64_t>& acc;
+    explicit TscScope(std::atomic<uint64_t>& a) : t0(g_time_frame.load(std::memory_order_relaxed) ? __rdtsc() : 0), acc(a) {}
+    ~TscScope() { if (t0) acc.fetch_add(__rdtsc() - t0, std::memory_order_relaxed); }
+};
+struct DrawTimer {
+    uint64_t t0 = g_time_frame.load(std::memory_order_relaxed) ? __rdtsc() : 0, driver = 0;
+    ~DrawTimer()
+    {
+        if (!t0) return;
+        const uint64_t all = __rdtsc() - t0;
+        g_tsc_draw_ours.fetch_add(all > driver ? all - driver : 0, std::memory_order_relaxed);
+        g_tsc_draw_driver.fetch_add(driver, std::memory_order_relaxed);
+    }
+};
+struct DriverScope {
+    DrawTimer& t;
+    uint64_t t0;
+    explicit DriverScope(DrawTimer& timer) : t(timer), t0(timer.t0 ? __rdtsc() : 0) {}
+    ~DriverScope() { if (t0) t.driver += __rdtsc() - t0; }
+};
+double TscPerMs()
+{
+    LARGE_INTEGER q{}, f{};
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&f);
+    const uint64_t t0 = g_cal_tsc0.load(), q0 = g_cal_qpc0.load();
+    if (!t0 || !f.QuadPart || uint64_t(q.QuadPart) <= q0) return 0;
+    const double ms = double(uint64_t(q.QuadPart) - q0) * 1000.0 / double(f.QuadPart);
+    return ms > 100 ? double(__rdtsc() - t0) / ms : 0;
+}
+std::atomic<uint64_t> g_left_name_at{0};
+uint32_t g_left_named = 0;
+// The context's stationary layers of this frame (jitter/stationary-source-readers).
+bool StationaryHas(const Ctx* x, Id r);
+void StationaryAdd(Ctx* x, Id r);
+void StationaryRemove(Ctx* x, Id r);
+uint32_t g_vpj_frame_still_by[kStillClasses] = {};
 constexpr uint64_t kFullScreenPassVertices = 6; // two triangles: more than this is a mesh
 std::atomic<uint64_t> g_vpj_unshifted{0};
 std::atomic<uint64_t> g_vpj_told{0}; // the sample last handed to the consumer (two floats, pixels)
@@ -1437,12 +1549,16 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         // WHY log: what the consumer is told the jitter was, beside what the scene draws carried.
         // The first frames of a session, then a burst of sixteen about every ten seconds, so one
         // whole jitter cycle is on record each time.
+        // After the first 1,500 lines, one a minute for the rest of the run (owed 2026-11-27: the 0f63301 run's
+        // detail stopped at 19:55, three and a half hours before the end).
         static uint32_t logged = 0;
-        static uint64_t burst_tick = 0, burst_left = 48;
+        static uint64_t burst_tick = 0, burst_left = 48, late_tick = 0;
         const uint64_t now = GetTickCount64();
         if (!burst_left && now - burst_tick >= 10000) burst_left = 16;
-        if (burst_left && logged < 1500 && (f.camera.jitter_applied || vpj_route)) {
-            if (!--burst_left) burst_tick = now;
+        const bool late = logged >= 1500 && now - late_tick >= 60000;
+        if (((burst_left && logged < 1500) || late) && (f.camera.jitter_applied || vpj_route)) {
+            if (late) late_tick = now;
+            else if (!--burst_left) burst_tick = now;
             ++logged;
             float shift[2]{};
             std::memcpy(shift, &g_vpj_executed_sample, sizeof shift);
@@ -1450,7 +1566,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
                                "frame=%llu route=%s told_px=%.4f,%.4f viewport_shift_px=%.4f,%.4f applied=%d shifted_draws=%u "
                                "unshifted_colour_draws=%u scene_draws=%u held=%d scene=%.0fx%.0f depth=%ux%u "
                                "shifted_vertices=%llu still_meshes{draws=%u untested=%u vertices=%llu} aligned_shader_depth_draws=%u "
-                               "referee_still_meshes{asked=%d moved_draws=%u}",
+                               "referee_still_meshes{asked=%d moved_draws=%u} variant=%s overlays_moved=%u "
+                               "still_by{deferred=%u other_target=%u own_viewport=%u rule_off=%u stationary_source=%u tested_or_other=%u}",
                                static_cast<unsigned long long>(g_frame), vpj_route ? "viewport" : "matrix",
                                f.camera.jitter_px[0], f.camera.jitter_px[1], shift[0], shift[1], f.camera.jitter_applied ? 1 : 0,
                                g_vpj_frame_draws, g_vpj_frame_unshifted, g_model.SceneDrawsThisFrame(), held ? 1 : 0,
@@ -1459,7 +1576,11 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
                                static_cast<unsigned long long>(g_vpj_frame_shifted_vertices), g_vpj_frame_still_meshes,
                                g_vpj_frame_still_untested, static_cast<unsigned long long>(g_vpj_frame_still_vertices),
                                g_vpj_frame_shader_depth, g_vpj_still_asked.load(std::memory_order_relaxed) ? 1 : 0,
-                               g_vpj_frame_still_moved);
+                               g_vpj_frame_still_moved,
+                               g_vpj_overlays.load(std::memory_order_relaxed) ? "jitter/scene-overlays" : "jitter/depth-tested-only",
+                               g_vpj_frame_overlay_moved, g_vpj_frame_still_by[kStillDeferred], g_vpj_frame_still_by[kStillOtherTarget],
+                               g_vpj_frame_still_by[kStillOwnViewport], g_vpj_frame_still_by[kStillRuleOff], g_vpj_frame_still_by[kStillStationarySource],
+                               g_vpj_frame_still_by[kStillNone] + g_vpj_frame_still_by[kStillOther]);
         }
         uint64_t told = 0;
         std::memcpy(&told, f.camera.jitter_px, sizeof told);
@@ -1620,6 +1741,7 @@ void RememberSplitDraw(const Event& e, int ws, int ps, const CameraUpload& world
 void RememberSceneUploads(const Event& e, const std::vector<ExactRange>* exact = nullptr)
 {
     if (e.kind != Kind::Draw || !CameraTracking() || !g_model.IsSceneDraw(e)) return;
+    TscScope timed(g_tsc_camera);
     // Ranges read at this very draw stand for the draw's own upload version.
     std::array<CameraUpload, kCbBindSlots> exact_upload;
     if (exact) {
@@ -1670,11 +1792,28 @@ void NoteViewportDraw(const Event& e)
     if (!g_vpj_route.load(std::memory_order_relaxed) || e.kind != Kind::Draw) return;
     // WHY log: draws into the scene colour that kept the game's own viewport on a frame whose
     // depth-tested scene draws were shifted (full-screen and untested passes).
-    if (!e.viewport_sample && g_vpj_executed_sample && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed))
+    if (!e.viewport_sample && g_vpj_executed_sample && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed)) {
         ++g_vpj_frame_unshifted;
+        if (e.still_class == kStillFullScreen && g_vpj_sample.load(std::memory_order_relaxed)) ++g_vpj_frame_still_by[kStillFullScreen];
+        if (g_left_name_frame.load(std::memory_order_relaxed) && g_left_named < 32) {
+            ++g_left_named;
+            const bool live = g_vpj_sample.load(std::memory_order_relaxed) != 0;
+            na::eventlog::Emit("native11_left_draw",
+                "frame=%llu class=%s vertices=%llu depth_test=%d depth_bound=%s rt_count=%u deferred_list=%d why=\"%s\"",
+                static_cast<unsigned long long>(g_frame), !live ? "after_handover" : e.still_class ? StillClassName(e.still_class) : "tested_or_other",
+                static_cast<unsigned long long>(e.vertices), e.depth_test ? 1 : 0,
+                !e.depth ? "none" : e.depth == g_sel_depth.load(std::memory_order_relaxed) ? "scene" : "other", unsigned(e.rt_count),
+                e.still_class == kStillDeferred ? 1 : 0,
+                !live ? "drawn into the scene colour after the hand-over: not part of what DLSS resolves, left on the game's grid by design"
+                : e.still_class == kStillFullScreen ? "a full-screen pass (the coverage trial tries it last)"
+                : e.still_class ? "an untested scene mesh the overlay rule left on the game's grid (the coverage trial may move its class)"
+                : "kept the game's viewport for another reason");
+        }
+    }
     if (e.viewport_sample) {
         g_vpj_frame_shader_depth += e.viewport_shader_depth ? 1u : 0u;
         g_vpj_frame_still_moved += e.viewport_still_mesh ? 1u : 0u;
+        g_vpj_frame_overlay_moved += e.viewport_overlay ? 1u : 0u;
         g_vpj_frame_shifted_vertices += e.vertices;
     } else if (g_vpj_sample.load(std::memory_order_relaxed) && e.depth && e.vertices > kFullScreenPassVertices &&
                (e.depth == g_sel_depth.load(std::memory_order_relaxed) || e.depth == g_sel_depth2.load(std::memory_order_relaxed))) {
@@ -1682,6 +1821,7 @@ void NoteViewportDraw(const Event& e)
         ++g_vpj_frame_still_meshes;
         g_vpj_frame_still_untested += e.depth_test ? 0u : 1u;
         g_vpj_frame_still_vertices += e.vertices;
+        ++g_vpj_frame_still_by[e.still_class < kStillClasses ? e.still_class : kStillOther];
     }
     if ((!e.depth_test && !e.viewport_shader_depth) || !g_model.IsSceneDraw(e)) return;
     if (!g_vpj_seen_draw) {
@@ -1804,6 +1944,7 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
 // Bound offset copies go back to the game's own viewports at the next draw.
 void StopViewportJitterAfterScene()
 {
+    g_coarse_open.store(false, std::memory_order_relaxed); // the scene is handed over: nothing after it is shaded in blocks
     if (g_vpj_sample.load(std::memory_order_relaxed)) {
         g_vpj_sample.store(0, std::memory_order_release);
         g_vpj_stopped_after_scene.fetch_add(1, std::memory_order_relaxed);
@@ -1817,6 +1958,7 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x, uint64_t vertices = 0)
     const uint64_t sample = g_vpj_sample.load(std::memory_order_acquire);
     const bool on = sample != 0;
     x->vpj_shader_depth = x->vpj_still_mesh = false;
+    x->vpj_want = false;
     if (!on && !x->vpj_applied) return;
     Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
     // VARIANT: scene/after-layers-second-depth
@@ -1853,10 +1995,60 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x, uint64_t vertices = 0)
             x->vp_h == float(g_sel_depth_h.load(std::memory_order_relaxed));
         x->vpj_still_mesh = neural_alias::StillMeshTakesJitter(mesh);
     }
-    const bool tests_scene_depth = x->depth_test || x->vpj_shader_depth || x->vpj_still_mesh;
+    // VARIANT: jitter/scene-overlays: An untested mesh drawn into the scene's own colour picture through
+    // the scene viewport, while the sample is in force (immediate context: the sample is cleared at the
+    // hand-over), is scene content laid over the terrain: it takes the sample like the depth-tested draws.
+    x->vpj_overlay = false;
+    x->vpj_still_class = kStillNone;
+    if (on && !x->depth_test && !x->vpj_shader_depth && !x->vpj_still_mesh && scene_depth && x->depth == scene_depth &&
+        vertices > kFullScreenPassVertices) {
+        neural_alias::SceneOverlay o;
+        o.enabled = g_vpj_overlays.load(std::memory_order_relaxed);
+        o.active = !x->deferred;
+        o.scene_depth_bound = true;
+        o.mesh = true;
+        const Id colour = g_sel_color.load(std::memory_order_relaxed);
+        o.scene_colour = colour && x->rt0 == colour;
+        o.reads_stationary_layer = x->stationary.frame == g_exact_frame.load(std::memory_order_relaxed) && x->stationary.pixel_reads.any();
+        o.scene_viewport = x->vp_n == 1 && x->vp_x == 0.f && x->vp_y == 0.f &&
+            x->vp_w == float(g_sel_depth_w.load(std::memory_order_relaxed)) &&
+            x->vp_h == float(g_sel_depth_h.load(std::memory_order_relaxed));
+        x->vpj_overlay = neural_alias::SceneOverlayTakesJitter(o);
+        if (!x->vpj_overlay)
+            x->vpj_still_class = x->deferred ? kStillDeferred : !o.scene_colour ? kStillOtherTarget : !o.scene_viewport ? kStillOwnViewport
+                               : !o.enabled ? kStillRuleOff : o.reads_stationary_layer ? kStillStationarySource : kStillOther;
+    }
+    // A full-screen pass into the scene colour while the sample is in force (before the hand-over): left still by
+    // design; the Referee's coverage trial may try it, last.
+    bool force = false;
+    if (on && !x->depth_test && !x->vpj_shader_depth && !x->vpj_still_mesh && !x->vpj_overlay && vertices && vertices <= kFullScreenPassVertices) {
+        const Id colour = g_sel_color.load(std::memory_order_relaxed);
+        if (colour && x->rt0 == colour) x->vpj_still_class = kStillFullScreen;
+    }
+    // VARIANT: referee/coverage-trial: the classes the Referee moves onto the sample, draw signature by draw signature.
+    if (on && x->vpj_still_class != kStillNone) {
+        const uint32_t mask = g_cov_mask.load(std::memory_order_acquire);
+        const int cls = CoverageClassOf(x->vpj_still_class);
+        if (cls >= 0 && (mask >> unsigned(cls)) & 1u) {
+            const uint64_t sig = CoverageSignature(x->pixel_shader, vertices, x->vpj_still_class);
+            std::lock_guard<std::mutex> lock(g_cov_m);
+            if (g_cov_still_sigs.count(sig)) {
+                g_cov_kept_still.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (g_cov_trial.load(std::memory_order_relaxed) == cls) g_cov_trial_sigs.insert(sig);
+                g_cov_moved.fetch_add(1, std::memory_order_relaxed);
+                if (x->vpj_still_class == kStillFullScreen) force = true;
+                else x->vpj_overlay = true;
+                x->vpj_still_class = kStillNone;
+            }
+        }
+    }
+    const bool tests_scene_depth = x->depth_test || x->vpj_shader_depth || x->vpj_still_mesh || x->vpj_overlay;
     const bool scene = on && scene_depth && x->depth == scene_depth && tests_scene_depth;
     if (scene && !x->vp_n) g_vpj_unknown.fetch_add(1, std::memory_order_relaxed);
-    const bool want = WantsViewportJitter(on, x->depth, scene_depth, tests_scene_depth, x->vp_n);
+    const bool want = WantsViewportJitter(on, x->depth, scene_depth, tests_scene_depth, x->vp_n) ||
+                      (on && x->vp_n && (force || (x->vpj_overlay && x->depth != scene_depth)));
+    x->vpj_want = want;
     const UINT n = x->vp_n;
     if (want) {
         g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
@@ -1970,11 +2162,44 @@ ExactSet ExactForDraw(ID3D11DeviceContext* c, Ctx* x)
     return x->exact_set;
 }
 
+// Coarse shading before a game draw (SetSceneCoarseShading): the draws that take the scene's sample are
+// the draws shaded in blocks, one rule with the DX12 route (observe/producers.cpp); with no sample this
+// frame, the depth-tested draws into the scene depth until the scene is handed over.
+void CoarseApply(ID3D11DeviceContext* c, Ctx* x, uint32_t rate)
+{
+    Inside in;
+    ID3D11Device* dev = g_device_raw.load(std::memory_order_acquire);
+    if (coarse::Apply(c, dev, rate, x->vp_n, g_sel_depth_w.load(std::memory_order_relaxed), g_sel_depth_h.load(std::memory_order_relaxed))) {
+        x->coarse_rate = rate;
+        (rate ? g_coarse_sets : g_coarse_restores).fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_coarse_failures.fetch_add(1, std::memory_order_relaxed);
+        if (!rate) x->coarse_rate = 0; // nothing more can be done about it
+    }
+}
+void CoarseBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
+{
+    const uint32_t rate = g_coarse.load(std::memory_order_relaxed);
+    if (!rate && !x->coarse_rate) return;
+    bool want = false;
+    if (rate && g_coarse_open.load(std::memory_order_relaxed)) {
+        if (g_vpj_sample.load(std::memory_order_relaxed)) want = x->vpj_want;
+        else {
+            const Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
+            want = scene_depth && x->depth == scene_depth && x->depth_test && x->vp_n;
+        }
+    }
+    const uint32_t r = want ? rate : 0;
+    if (r) g_coarse_draws.fetch_add(1, std::memory_order_relaxed);
+    if (r != x->coarse_rate) CoarseApply(c, x, r);
+}
+
 Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
 {
     Ctx* x = Get(c);
     if (!x) return nullptr;
     VpjBeforeDraw(c, x, vertices);
+    CoarseBeforeDraw(c, x);
     const auto refresh_samplers = [&] {
         const uint64_t policy = SamplerPolicyKey();
         if (x->sampler_policy != policy) {
@@ -2002,8 +2227,11 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.viewport_expanded = x->vpj_applied && x->vpj_expanded;
     e.viewport_shader_depth = x->vpj_shader_depth;
     e.viewport_still_mesh = x->vpj_still_mesh && x->vpj_applied;
+    e.viewport_overlay = x->vpj_overlay && x->vpj_applied;
+    e.still_class = x->vpj_still_class;
     const bool camera_tracking = CameraTracking();
     if (camera_tracking) {
+        TscScope timed(g_tsc_camera);
         std::memcpy(e.cb, x->cb, sizeof(e.cb));
         for (int i = 0; i < kCbBindSlots; ++i) {
             e.cb_first[i] = static_cast<uint16_t>(x->cb_first[i]);
@@ -2039,7 +2267,7 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         }
     }
     ExactSet exact;
-    if ((picture_draw || layer_draw) && camera_tracking) exact = ExactForDraw(c, x); // camera bytes: not read when no camera is looked for
+    if ((picture_draw || layer_draw) && camera_tracking) { TscScope timed(g_tsc_camera); exact = ExactForDraw(c, x); } // camera bytes: not read when no camera is looked for
     Emit(x, c, e, {}, exact);
     if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
     return x;
@@ -2096,6 +2324,15 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
             x->screen_slots.set(start + i, r && (r == color || r == peer));
         if (track_depth && start < kDepthSlots && i < kDepthSlots - start)
             depth_slots.set(start + i, r && r == depth);
+        if (stage == DepthStage::Pixel && !x->deferred && x->stationary.frame == g_exact_frame.load(std::memory_order_relaxed) &&
+            start < kDepthSlots && i < kDepthSlots - start) {
+            bool reads = false;
+            if (r && StationaryHas(x, r)) {
+                const auto use = SrvUse(views[i]);
+                reads = use.texture2d && use.format == DXGI_FORMAT_R32_FLOAT && !use.mip;
+            }
+            x->stationary.pixel_reads.set(start + i, reads);
+        }
         if (stage == DepthStage::Pixel && x->raster_depth_layer.resource && start < kDepthSlots && i < kDepthSlots - start) {
             bool reads_layer = false;
             if (r == x->raster_depth_layer.resource) {
@@ -2630,8 +2867,16 @@ void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
     // same draw is forwarded. Restore it on that draw, not one draw later.
     if (state && !state->deferred && state->vpj_applied && !g_vpj_sample.load(std::memory_order_acquire))
         VpjBeforeDraw(c, state);
+    if (state && !state->deferred && state->coarse_rate && !g_coarse_open.load(std::memory_order_relaxed))
+        CoarseBeforeDraw(c, state); // the scene was handed over by this very draw's event: it is not shaded in blocks
     ForwardDepthRead(c, state, false, forward);
     if (state && !state->deferred && state->depth_layer_target) {
+        // VARIANT: jitter/stationary-source-readers: a depth-like layer drawn this frame while the sample is live by a
+        // draw that kept the game's grid; drawn by a draw on the sample's grid, it is no longer one.
+        if (g_vpj_sample.load(std::memory_order_relaxed)) {
+            if (!state->vpj_applied) StationaryAdd(state, state->rt0);
+            else StationaryRemove(state, state->rt0);
+        }
         auto& layer = state->raster_depth_layer;
         const auto sample = g_vpj_sample.load(std::memory_order_relaxed);
         const auto depth = g_sel_depth.load(std::memory_order_relaxed);
@@ -2654,6 +2899,47 @@ void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
     }
 }
 
+// The HUD-free picture (hud_free.hpp): before an immediate-context draw is forwarded. Its second
+// draw (T2) goes straight to the original entry point.
+void IssueHudFreeDraw(ID3D11DeviceContext* c, const draw_replay::DrawArgs& a, void* user)
+{
+    Ctx* x = static_cast<Ctx*>(user);
+    const UINT inst = a.instances ? a.instances : 1;
+    if (a.indexed) O(c, x).draw_indexed_instanced(c, a.count, inst, a.start, a.base_vertex, a.start_instance);
+    else O(c, x).draw_instanced(c, a.count, inst, a.start, a.start_instance);
+}
+// A deferred recording's colour writes (hud_free::OnExecuteList). Cheap: a short list per recording.
+constexpr size_t kMaxListWrites = 256;
+void NoteListWrite(Ctx* x, Id r)
+{
+    if (!x || !x->deferred || !r || x->list_writes_unknown) return;
+    for (Id w : x->list_writes) if (w == r) return;
+    if (x->list_writes.size() >= kMaxListWrites) { x->list_writes_unknown = true; x->list_writes.clear(); return; }
+    x->list_writes.push_back(r);
+}
+void NoteListDrawWrites(ID3D11DeviceContext* c, Ctx* x)
+{
+    if (!x || !x->deferred) return;
+    if (x->rt_count <= 1) { NoteListWrite(x, x->rt0); return; }
+    ID3D11RenderTargetView* v[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, v, nullptr);
+    for (auto* r : v) if (r) { NoteListWrite(x, ResourceOfView(r)); r->Release(); }
+}
+
+void HudFreeBeforeDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs& a)
+{
+    if (x && x->deferred && !t_inside) NoteListDrawWrites(c, x);
+    if (!hud_free::Wanted() || !x || x->deferred || t_inside) return;
+    hud_free::DrawFacts f;
+    f.rt0 = uint64_t(x->rt0);
+    f.shown = uint64_t(g_backbuffer);
+    f.rt_w = x->target_width;
+    f.rt_h = x->target_height;
+    f.rt_count = x->rt_count;
+    f.depth = x->depth && x->depth_test;
+    hud_free::BeforeDraw(c, f, a, &IssueHudFreeDraw, x);
+}
+
 // Draw replay (draw_replay.hpp): after the game's draw has run, a qualifying scene draw on the
 // immediate context is drawn again with stream output into this frame's position buffer.
 void ReplayAfterDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs& a)
@@ -2674,44 +2960,58 @@ void ReplayAfterDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs
 }
 void STDMETHODCALLTYPE DrawIndexed_d(ID3D11DeviceContext* c, UINT count, UINT start, INT base)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, count, false);
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed(c, count, start, base); });
+    HudFreeBeforeDraw(c, x, {true, false, count, 1, start, 0, base});
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_indexed(c, count, start, base); });
     ReplayAfterDraw(c, x, {true, false, count, 1, start, 0, base});
 }
 void STDMETHODCALLTYPE Draw_d(ID3D11DeviceContext* c, UINT count, UINT start)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, count, false);
-    ForwardGameDraw(c, x, [&] { O(c, x).draw(c, count, start); });
+    HudFreeBeforeDraw(c, x, {false, false, count, 1, start, 0, 0});
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw(c, count, start); });
     ReplayAfterDraw(c, x, {false, false, count, 1, start, 0, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
+    HudFreeBeforeDraw(c, x, {true, false, count, inst, start, start_inst, base});
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
     if (inst) ReplayAfterDraw(c, x, {true, false, count, inst, start, start_inst, base});
 }
 void STDMETHODCALLTYPE DrawInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, UINT start_inst)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_instanced(c, count, inst, start, start_inst); });
+    HudFreeBeforeDraw(c, x, {false, false, count, inst, start, start_inst, 0});
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_instanced(c, count, inst, start, start_inst); });
     if (inst) ReplayAfterDraw(c, x, {false, false, count, inst, start, start_inst, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, 0, true);
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_indirect(c, b, off); });
+    HudFreeBeforeDraw(c, x, {true, true});
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_indexed_indirect(c, b, off); });
     ReplayAfterDraw(c, x, {true, true});
 }
 void STDMETHODCALLTYPE DrawInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, 0, true);
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_indirect(c, b, off); });
+    HudFreeBeforeDraw(c, x, {false, true});
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_indirect(c, b, off); });
     ReplayAfterDraw(c, x, {false, true});
 }
 void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, 0, true);
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_auto(c); });
+    HudFreeBeforeDraw(c, x, {false, true});
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_auto(c); });
     ReplayAfterDraw(c, x, {false, true});
 }
 void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
@@ -2730,6 +3030,7 @@ HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT 
     const HRESULT hr = O(c, x).map(c, r, sub, type, flags, m);
     if (x && CameraTracking() && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
                                     type == D3D11_MAP_READ_WRITE)) {
+        TscScope timed(g_tsc_camera);
         const Id id = IdOf(r);
         UINT size = 0;
         if (IsCandidate(id) && IsConstantBuffer(r, &size)) {
@@ -2757,6 +3058,7 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
             O(c, x).unmap(c, r, sub);
             return;
         }
+        TscScope timed(g_tsc_camera);
         UINT size = 0;
         bool cb = false;
         {
@@ -2787,6 +3089,7 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
 void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11_BOX* box, const void*& src, std::vector<uint8_t>& tmp)
 {
     if (!x || !r || !src || !CameraTracking()) return;
+    TscScope timed(g_tsc_camera);
     UINT size = 0;
     bool cb = false;
     {
@@ -2813,6 +3116,7 @@ void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resourc
     std::vector<uint8_t> tmp;
     UpdateCommon(c, x, r, box, src, tmp);
     TrackPlacementColorWrite(c, x, IdOf(r));
+    if (x && x->deferred) NoteListWrite(x, IdOf(r));
     O(c, x).update(c, r, sub, box, src, rp, dp);
     InvalidateDepthWrite(x, r);
 }
@@ -2977,6 +3281,27 @@ ID3D11Resource* DepthCopySource(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* 
     return twin ? twin : src;
 }
 
+bool StationaryHas(const Ctx* x, Id r)
+{
+    if (!x || !r || x->stationary.frame != g_exact_frame.load(std::memory_order_relaxed)) return false;
+    for (const Id s : x->stationary.resource) if (s == r) return true;
+    return false;
+}
+void StationaryAdd(Ctx* x, Id r)
+{
+    if (!x || !r) return;
+    const uint32_t frame = g_exact_frame.load(std::memory_order_relaxed);
+    if (x->stationary.frame != frame) { x->stationary = {}; x->stationary.frame = frame; }
+    for (Id& s : x->stationary.resource) if (s == r) return;
+    for (Id& s : x->stationary.resource) if (!s) { s = r; return; }
+    x->stationary.resource[0] = r; // four layers a frame at most: the newest replaces the oldest
+}
+void StationaryRemove(Ctx* x, Id r)
+{
+    if (!x || !r) return;
+    for (Id& s : x->stationary.resource) if (s == r) s = 0;
+}
+
 void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
 {
     if (!x || !resource) return;
@@ -2996,6 +3321,7 @@ void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11Ren
     if (x && (x->raster_depth_layer.resource || g_adaptive_scene.load(std::memory_order_relaxed) ||
               g_lit_peer.load(std::memory_order_relaxed)))
         TrackPlacementColorWrite(c, x, ResourceOfView(view));
+    if (x && x->deferred) NoteListWrite(x, ResourceOfView(view));
     O(c, x).clear_rtv(c, view, color);
 }
 
@@ -3004,6 +3330,8 @@ void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Res
 {
     ReadResource(c, src);
     Ctx* x = Get(c);
+    if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
+    if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     auto* source = !ds && !ss && !x0 && !y0 && !z0 && !box ? DepthCopySource(c, x, dst, src) : src;
     O(c, x).copy_region(c, dst, ds, x0, y0, z0, source, ss, box);
     InvalidateDepthWrite(x, dst);
@@ -3013,14 +3341,19 @@ void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* ds
 {
     ReadResource(c, src);
     Ctx* x = Get(c);
+    if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
+    if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     O(c, x).copy_resource(c, dst, DepthCopySource(c, x, dst, src));
     InvalidateDepthWrite(x, dst);
     TrackPlacementColorWrite(c, x, IdOf(dst));
+    // VARIANT: jitter/stationary-source-readers: an exact whole copy of a stationary layer is one too.
+    if (x && !x->deferred) { if (StationaryHas(x, IdOf(src))) StationaryAdd(x, IdOf(dst)); else StationaryRemove(x, IdOf(dst)); }
 }
 void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT f)
 {
     ReadResource(c, src);
     Ctx* x = Get(c);
+    if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     O(c, x).resolve(c, dst, ds, src, ss, f);
     InvalidateDepthWrite(x, dst);
     TrackPlacementColorWrite(c, x, IdOf(dst));
@@ -3075,6 +3408,8 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
             rec.order = ++g_list_order;
             rec.incarnation = IncarnationOf(*out);
             rec.complete = !x->events_truncated;
+            rec.writes = std::move(x->list_writes);
+            rec.writes_unknown = x->list_writes_unknown;
             if (g_lists.size() > kMaxLists) {
                 auto oldest = g_lists.begin();
                 for (auto it = g_lists.begin(); it != g_lists.end(); ++it)
@@ -3084,6 +3419,9 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
         }
         x->events.clear();
         x->events_truncated = false;
+        x->coarse_rate = 0; // the driver starts the next recording at one shading per pixel (vrs11_test (ii))
+        x->list_writes.clear();
+        x->list_writes_unknown = false;
         x->cb_bytes.clear();
         x->draw_bytes.clear();
         // A new recording must map with discard before it may map without overwrite again.
@@ -3099,6 +3437,28 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
 void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11CommandList* list, BOOL restore)
 {
     Ctx* x = Get(c);
+    if (x && !x->deferred && x->coarse_rate && !t_inside) {
+        // The immediate context's coarse shading would also apply to the list's draws (vrs11_test (ii)):
+        // a list shades in blocks only what its own recording asked for.
+        g_coarse_before_lists.fetch_add(1, std::memory_order_relaxed);
+        CoarseApply(c, x, 0);
+    }
+    if (x && list && !t_inside && (x->deferred || hud_free::Wanted())) {
+        // What the list's recording wrote: carried into an enclosing recording, or told to the HUD-free picture.
+        std::vector<Id> writes;
+        bool unknown = true;
+        {
+            std::lock_guard<std::mutex> l(g_mu);
+            auto it = g_lists.find(list);
+            if (it != g_lists.end() && it->second.incarnation == IncarnationOf(list)) { writes = it->second.writes; unknown = it->second.writes_unknown; }
+        }
+        if (x->deferred) {
+            if (unknown) { x->list_writes_unknown = true; x->list_writes.clear(); }
+            else for (Id w : writes) NoteListWrite(x, w);
+        } else {
+            hud_free::OnExecuteList(writes.data(), writes.size(), !unknown);
+        }
+    }
     if (const Id depth = list ? DepthReadsSource(x) : 0) {
         auto& reads = x->depth_reads;
         reads.Start(g_exact_frame.load(std::memory_order_relaxed), depth);
@@ -3177,6 +3537,14 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         swap->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
+    }
+    if (hud_free::Wanted()) { // the HUD-free picture: the frame ends here (learning, per-frame counts)
+        Inside in;
+        DXGI_SWAP_CHAIN_DESC hd{};
+        swap->GetDesc(&hd);
+        ComPtr<ID3D11DeviceContext> immediate;
+        game->GetImmediateContext(&immediate);
+        hud_free::OnPresent(immediate.Get(), uint64_t(g_backbuffer), hd.BufferDesc.Width, hd.BufferDesc.Height);
     }
     const auto previous = g_model.Current();
     const bool reserved_before = g_screen.ReservesPixelRead();
@@ -3485,6 +3853,29 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_vpj_frame_unshifted = 0;
     g_vpj_frame_shifted_vertices = g_vpj_frame_still_vertices = 0;
     g_vpj_frame_still_meshes = g_vpj_frame_still_untested = g_vpj_frame_shader_depth = g_vpj_frame_still_moved = 0;
+    g_vpj_frame_overlay_moved = 0;
+    for (uint8_t sc = 0; sc < kStillClasses; ++sc) {
+        const int cls = CoverageClassOf(sc);
+        if (cls >= 0 && g_vpj_frame_still_by[sc]) g_cov_left_total[cls].fetch_add(g_vpj_frame_still_by[sc], std::memory_order_relaxed);
+    }
+    for (auto& n : g_vpj_frame_still_by) n = 0;
+    {   // once a minute, one frame's draws left off the jitter are named in the log (native11_left_draw)
+        const uint64_t tick = GetTickCount64();
+        const bool name = tick - g_left_name_at.load(std::memory_order_relaxed) >= 60000;
+        if (name) g_left_name_at.store(tick, std::memory_order_relaxed);
+        g_left_name_frame.store(name, std::memory_order_relaxed);
+        g_left_named = 0;
+        static uint64_t frames = 0;
+        if (!g_cal_tsc0.load(std::memory_order_relaxed)) {
+            LARGE_INTEGER q{};
+            QueryPerformanceCounter(&q);
+            g_cal_qpc0.store(uint64_t(q.QuadPart));
+            g_cal_tsc0.store(__rdtsc());
+        }
+        const bool timed = (++frames & 7) == 0;
+        g_time_frame.store(timed, std::memory_order_relaxed);
+        if (timed) g_timed_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     g_vpj_seen_draw = g_vpj_mixed = false;
     g_vpj_executed_sample = 0;
     g_vpj_executed_expanded = false;
@@ -3500,6 +3891,9 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     }
     g_vpj_sample.store(sample, std::memory_order_release);
     g_jitter_requested = false;
+    const bool coarse = g_coarse.load(std::memory_order_relaxed) != 0;
+    g_coarse_open.store(coarse, std::memory_order_relaxed); // the next frame's scene may be shaded in blocks
+    if (coarse) g_coarse_frames.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -3841,6 +4235,71 @@ void SetCameraUse(CameraUse use)
 }
 
 void SetStillMeshJitter(bool asked) { g_vpj_still_asked.store(asked, std::memory_order_relaxed); }
+std::atomic<int> g_vpj_overlays_forced{-1}; // tests: -1 the Referee decides, 0 the earlier rule, 1 overlays
+void ForceSceneOverlayJitterForTests(int forced) { g_vpj_overlays_forced.store(forced, std::memory_order_relaxed); }
+void SetSceneOverlayJitter(bool on, const char* why)
+{
+    if (const int forced = g_vpj_overlays_forced.load(std::memory_order_relaxed); forced >= 0) { on = forced != 0; why = "a test chose it"; }
+    if (g_vpj_overlays.exchange(on, std::memory_order_relaxed) != on)
+        na::eventlog::Emit("jitter_variant", "api=dx11 variant=%s why=\"%s\"", on ? "jitter/scene-overlays" : "jitter/depth-tested-only", why ? why : "");
+}
+bool SceneOverlayJitter() { return g_vpj_overlays.load(std::memory_order_relaxed); }
+uint32_t UnjitteredSceneMeshes() { return g_vpj_frame_still_meshes; }
+void LeftByClass(uint64_t (&out)[na::referee::kLeftClasses])
+{
+    for (auto& n : out) n = 0;
+    for (uint8_t s = 0; s < kStillClasses; ++s) {
+        const int c = CoverageClassOf(s);
+        if (c >= 0) out[c] += g_vpj_frame_still_by[s];
+    }
+}
+void SetCoverage(uint32_t mask, int trial, uint64_t decisions, int last_class, bool last_kept)
+{
+    g_cov_mask.store(mask, std::memory_order_release);
+    g_cov_trial.store(trial, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_cov_m);
+    if (decisions == g_cov_decisions) return;
+    g_cov_decisions = decisions;
+    // The trial's draw signatures: put back with their class, they stay on the game's grid from now on
+    // (a later trial of the same class moves only the others); kept, the class mask moves them.
+    if (!last_kept && last_class >= 0) g_cov_still_sigs.insert(g_cov_trial_sigs.begin(), g_cov_trial_sigs.end());
+    na::eventlog::Emit("native11_coverage", "decision=%llu class=%s %s signatures=%zu still_signatures=%zu moved_draws=%llu left_by_signature=%llu",
+                       static_cast<unsigned long long>(decisions), na::referee::LeftClassName(unsigned(last_class)),
+                       last_kept ? "kept" : "put_back", g_cov_trial_sigs.size(), g_cov_still_sigs.size(),
+                       static_cast<unsigned long long>(g_cov_moved.load()), static_cast<unsigned long long>(g_cov_kept_still.load()));
+    g_cov_trial_sigs.clear();
+}
+CoverageStats GetCoverageStats()
+{
+    CoverageStats s;
+    s.mask = g_cov_mask.load();
+    s.trial = g_cov_trial.load();
+    s.moved_draws = g_cov_moved.load();
+    s.left_by_signature = g_cov_kept_still.load();
+    for (unsigned c = 0; c < na::referee::kLeftClasses; ++c) s.left_total[c] = g_cov_left_total[c].load();
+    std::lock_guard<std::mutex> lock(g_cov_m);
+    s.still_signatures = g_cov_still_sigs.size();
+    return s;
+}
+uint32_t OverlayMeshesMoved() { return g_vpj_frame_overlay_moved; }
+
+void SetSceneCoarseShading(uint32_t rate) { g_coarse.store(rate, std::memory_order_relaxed); }
+bool CoarseShadingAvailable(const char** why)
+{
+    return coarse::Available(g_device_raw.load(std::memory_order_acquire), why);
+}
+CoarseShadingStats GetCoarseShadingStats()
+{
+    CoarseShadingStats s;
+    s.rate = g_coarse.load(std::memory_order_relaxed);
+    s.draws = g_coarse_draws.load(std::memory_order_relaxed);
+    s.sets = g_coarse_sets.load(std::memory_order_relaxed);
+    s.restores = g_coarse_restores.load(std::memory_order_relaxed);
+    s.failures = g_coarse_failures.load(std::memory_order_relaxed);
+    s.before_lists = g_coarse_before_lists.load(std::memory_order_relaxed);
+    s.frames = g_coarse_frames.load(std::memory_order_relaxed);
+    return s;
+}
 
 void SetNextJitter(float x_px, float y_px)
 {
@@ -3899,6 +4358,8 @@ int FormatStatus(char* out, unsigned long n)
             if (g_backbuffer) is_backbuffer = selection.color == g_backbuffer ? 1 : 0;
         }
     }
+    const double tsc_ms = TscPerMs();
+    const auto cpu_ms = [&](const std::atomic<uint64_t>& t) { const uint64_t f = g_timed_frames.load(); return tsc_ms > 0 && f ? double(t.load()) / tsc_ms / double(f) : 0.0; };
     const int head = std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
                          "camera_found=%llu camera_missing=%llu camera_held=%llu jitter_written=%llu "
@@ -3910,7 +4371,7 @@ int FormatStatus(char* out, unsigned long n)
                          "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu} "
                          "exact_ranges{reads=%llu failed=%llu draws=%llu} "
                          "camera_path{steps=%llu reversals=%llu jumps=%llu} "
-                         "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu} "
+                         "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu} cpu_ms_per_frame{camera=%.3f draw_ours=%.3f draw_driver=%.3f timed_frames=%llu} "
                          "scene{picture=%s layered_frames=%llu colour_fmt=%u colour_float=%d} "
                          "scene_boundary{selected=%llu draws=%u scene_draws=%u reads=%u after_scene_read=%u after_scene_draw=%u "
                          "learned_read=%u learned_hud=%u backbuffer=%d color_samples=%u depth_samples=%u "
@@ -3948,6 +4409,8 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(s.camera_steps), static_cast<unsigned long long>(s.camera_reversals),
                          static_cast<unsigned long long>(s.camera_jumps), told[0], told[1],
                          static_cast<unsigned long long>(g_vpj_unshifted.load()),
+                         cpu_ms(g_tsc_camera), cpu_ms(g_tsc_draw_ours), cpu_ms(g_tsc_draw_driver),
+                         static_cast<unsigned long long>(g_timed_frames.load()),
                          scene_layered ? "after-layers" : "most-drawn", static_cast<unsigned long long>(scene_layered_frames),
                          scene_format, scene_float ? 1 : 0,
                          static_cast<unsigned long long>(placement.selected_frames),

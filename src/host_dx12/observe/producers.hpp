@@ -291,6 +291,12 @@ void DescribeStateEvidence(ID3D12CommandList* list, na_object_id id, uint32_t su
 bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
 enum class StateLookup { Absent, Known, Unavailable };
 StateLookup ListStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, uint32_t* state);
+// Diagnostics for the lookups above: whether this recording was observed from its Reset, whether
+// every method variant it used is hooked, and whether its barrier record is complete. False = unknown list.
+bool ListStateFlags(ID3D12CommandList* list, bool* observed, bool* coverage, bool* evidence);
+// True while the recording is inside BeginRenderPass/EndRenderPass (no barriers may be recorded
+// there); also true when the list is unknown (the safe answer).
+bool ListInRenderPass(ID3D12CommandList* list);
 // Texture LOD bias for the game's mip-mapped surface samplers (sampler descriptors and
 // root-signature static samplers); 0 = off. For J2 DLAA with jitter (temporal
 // reconstruction needs sharper per-frame texture samples).
@@ -521,8 +527,22 @@ struct ViewportJitterStats {
     struct Refused { uint64_t no_layer = 0, not_read = 0, writes_layer = 0, one_target = 0, viewport = 0; } shader_depth_refused;
     uint64_t still_moved = 0, still_asks = 0; // meshes moved at the Referee's ask; times it started asking
     bool still_asked = false;
+    bool overlays = true;        // VARIANT: jitter/scene-overlays in force (false: jitter/depth-tested-only)
+    uint64_t overlay_moved = 0;  // untested meshes into the scene colour that took the sample
+    struct Left { uint64_t other_target = 0, own_viewport = 0, rule_off = 0, after_handover = 0, stationary_source = 0; } left; // untested scene meshes left on the game's grid, by why
 };
 ViewportJitterStats GetViewportJitterStats();
+// VARIANT: jitter/scene-overlays (on by default) | jitter/depth-tested-only. Logged with `why` when it changes.
+void SetSceneOverlayJitter(bool on, const char* why);
+bool SceneOverlayJitter();
+// Untested scene meshes left on the game's grid so far (all reasons).
+uint64_t UnjitteredSceneMeshes();
+// VARIANT: referee/coverage-trial (core/referee_coverage.hpp, LeftClass order): untested scene meshes left off the
+// jitter by class since the last call; the classes the Referee moves onto the sample, the one on trial, and its
+// last decision (a put-back trial's pipelines stay on the game's grid from then on); draws moved so far.
+void LeftByClass(uint64_t (&out)[7]);
+void SetCoverage(uint32_t mask, int trial, uint64_t decisions, int last_class, bool last_kept);
+uint64_t CoverageMovedDraws();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,
 // "hook_cost ... s<slot>{ms_per_s calls_per_s us}" (slot = ID3D12GraphicsCommandList vtable index).

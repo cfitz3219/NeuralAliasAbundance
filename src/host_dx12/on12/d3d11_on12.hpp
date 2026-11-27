@@ -21,6 +21,7 @@ struct ID3D12CommandQueue;
 struct ID3D12Device;
 struct ID3D12Resource;
 struct ID3D12Fence;
+struct ID3D11Device;
 
 namespace na::on12 {
 
@@ -129,6 +130,45 @@ void AfterResize(IDXGISwapChain* chain, long result);
 // The game is about to drop its last reference: wait for our GPU copies.
 void BeforeFinalRelease(IDXGISwapChain* chain);
 void ForgetSwapChain(IDXGISwapChain* chain);
+
+// ---- Native DX11 proxy ([present] dx11_proxy=1, 2026-11-26) -----------------
+// The same translated presentation for a game that keeps its OWN D3D11 device (the native DX11
+// route): the game's swap chain is created as a real D3D12 chain on our presentation queue, the game
+// draws into one image shared by both APIs (8-bit: TYPELESS, with native11/proxy_views.hpp keeping
+// its views and GetDesc as the game expects), and at Present that image is copied into the chain's
+// current buffer, ordered by shared fences. Anything unsupported (multisampled, GDI-compatible,
+// stereo, a format a D3D12 chain cannot present, no shared fences) is refused with a plain reason
+// in the status line and the game keeps its own chain. The setting is read at start; a chain is a
+// proxy or not from its creation on.
+bool NativeProxyOn(); // [present] dx11_proxy=1 was read at start
+// Our D3D12 direct queue on the device's adapter (one per adapter; the proxy chains present from it and
+// the native menu draws on it). AddRef'ed, or null.
+ID3D12CommandQueue* NativePresentQueue(ID3D11Device* device);
+bool NativeProxy(IDXGISwapChain* chain);
+// After the presenter submitted its frame for a proxy chain (it read the HUD-free picture and the game's
+// frame on our queue): the game's next D3D11 writes wait for that on the GPU (shared fences).
+void AfterPresenterFrame(IDXGISwapChain* chain);
+// The encoding of a translated or proxied chain, in one place: the format the game asked for and
+// the real D3D12 chain's buffer format. The colour space is what the game set with SetColorSpace1
+// on the same (real) chain: na::overlay::SwapChainColorSpace(chain).
+bool ProxyEncoding(IDXGISwapChain* chain, DXGI_FORMAT* game_format, DXGI_FORMAT* real_format);
+// Frame latency on a proxy chain: the game's IDXGIDevice1::SetMaximumFrameLatency, applied to the D3D12
+// chain through its waitable object (added by us, hidden from the game; not when the game asked for it).
+bool ProxyLatency(IDXGISwapChain* chain, unsigned* applied, unsigned long long* waits);
+// The proxy's last decision in plain words (for the Frame Generation menu row) and chains refused so far.
+void ProxyReason(char* out, size_t n, unsigned long long* refused);
+// Chain creation through the hooked DXGI factory (every chain, proxied or not): marks the chain as
+// seen when it was made. A native DX11 chain presented without that mark and without a proxy was
+// made before NeuralAlias could take it over (or in a way it does not take over): NotePresentedChain
+// (at its first present) makes that the proxy's refusal reason, so the menu says why x2 cannot run.
+void NoteChainCreated(IDXGISwapChain* chain);
+void NotePresentedChain(IDXGISwapChain* chain);
+// Tests: called on the presenting thread right after the copy into `target` (PRESENT state) was
+// submitted on `queue`, before DXGI's Present. `SetNativeProxyForTests(false)` makes the next chains
+// the game's own (to compare against).
+using CopyObserver = void (*)(ID3D12CommandQueue* queue, ID3D12Resource* target, void* user);
+void SetCopyObserverForTests(CopyObserver fn, void* user);
+void SetNativeProxyForTests(bool on);
 
 // One status line (no newline) for the 5-second status log.
 int FormatStatus(char* out, size_t capacity);

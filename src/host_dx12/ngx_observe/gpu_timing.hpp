@@ -21,8 +21,10 @@ void SetDevice(ID3D12Device* device);
 
 // Called around the original evaluate, on the game's list. Safe if the
 // device refuses query heaps/fences: the module disables itself and returns.
-void Begin(ID3D12GraphicsCommandList* list);
-void End(ID3D12GraphicsCommandList* list);
+// `channel`: 0 the DLSS evaluate (default), 1 the HUD sheet grab, 2 the HUD-free redraw (Route B
+// live Frame Generation). Each channel keeps its own last / average figures.
+void Begin(ID3D12GraphicsCommandList* list, uint32_t channel = 0);
+void End(ID3D12GraphicsCommandList* list, uint32_t channel = 0);
 
 // From the host's ExecuteCommandLists detour, AFTER the original call returned
 // (game thread; no waits): associates measured lists with the queue that
@@ -42,7 +44,7 @@ struct Stats {
     uint64_t unsupported;  // list type without timestamp support here (bundle/copy/video)
     uint64_t quarantined;  // slots retired: never seen submitted, or not completed within kAbandonPresents, or Signal failed
 };
-Stats GetStats();
+Stats GetStats(uint32_t channel = 0);
 void SetEnabled(bool enabled);
 
 } // namespace na::gputime

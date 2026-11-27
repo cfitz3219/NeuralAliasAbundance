@@ -212,6 +212,7 @@ void WritePattern(ID3D12GraphicsCommandList* l, const std::map<std::string, test
 
 int main(int argc,char** argv)
 {
+    na::settings::Get().j2_fold_prewarm.store(0); // these checks count exactly one DLSS evaluation per frame
     const bool native_dlaa = argc > 1 && std::strstr(argv[1], "native-dlaa") != nullptr;
     const bool native_lighting = native_dlaa && std::strstr(argv[1], "rotating-lighting");
     const bool native_region = native_dlaa && std::strstr(argv[1], "centered");
@@ -1470,8 +1471,9 @@ static uint64_t seen=0;char tr[2048];uint64_t n=0;na::j2::NativeTraceResult(tr,s
     frame(500); // teleport: held for one frame (could be another camera for a frame)...
     CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     na::j2::OnPresent(d.queue.Get());
-    frame(500.01); // ...and confirmed by the next camera: history reset
-    CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 1);
+    frame(500.01); // ...and confirmed by the next camera. VARIANT: camera/cut-confirmed-by-pictures: the camera's
+    // cut alone no longer restarts DLSS; the pictures decide, and these two pictures are the same scene.
+    CHECK(fake::I(fake::last_eval, NVSDK_NGX_Parameter_Reset) == 0);
     na::j2::OnPresent(d.queue.Get());
     na::observe::SetLiveSelection(0, 0);
     frame(500.5); // an unprocessed game frame must not advance camera history...

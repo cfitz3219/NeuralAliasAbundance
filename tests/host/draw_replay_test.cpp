@@ -386,6 +386,125 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
         CHECK(visible_end > visible_mid && apart_end == apart_mid);   // the camera's step: seen, never apart
         na::observe::SetDrawReplayMovers(false);
     }
+    // Depth-tested draws that do not write depth (a G-buffer pass after a depth pre-pass): the gate admits
+    // them, so a replay recipe must exist for them too (before 2026-11-27 only depth-writing pipelines got one,
+    // and these draws died as no_recipe). Both ways a pipeline is made: described, and as a stream.
+    {
+        // The pre-pass writes the depth through a pipeline that is never replayed (it has a geometry stage).
+        const char pre_src[] = R"(
+cbuffer C : register(b0) { float shift; }
+struct V { float4 p : SV_Position; };
+V vs(uint id : SV_VertexID) { const float2 verts[3] = { float2(-.5,-.65), float2(-.5,.65), float2(.6,.65) }; V v; v.p = float4(verts[id] + float2(shift,0), .5, 1); return v; }
+[maxvertexcount(3)] void gs(triangle V i[3], inout TriangleStream<V> o) { [unroll] for (uint k = 0; k < 3; ++k) o.Append(i[k]); })";
+        test::ComPtr<ID3DBlob> pre_vs, pre_gs;
+        REQUIRE(SUCCEEDED(D3DCompile(pre_src, sizeof(pre_src) - 1, nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &pre_vs, nullptr)));
+        REQUIRE(SUCCEEDED(D3DCompile(pre_src, sizeof(pre_src) - 1, nullptr, nullptr, nullptr, "gs", "gs_5_0", 0, 0, &pre_gs, nullptr)));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pre = desc;
+        pre.VS = {pre_vs->GetBufferPointer(), pre_vs->GetBufferSize()};
+        pre.GS = {pre_gs->GetBufferPointer(), pre_gs->GetBufferSize()};
+        test::ComPtr<ID3D12PipelineState> pre_pso;
+        REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&pre, IID_PPV_ARGS(&pre_pso))));
+        // The G-buffer pass: the same triangle, depth tested LESS_EQUAL, no depth write.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC nowrite = desc;
+        nowrite.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        test::ComPtr<ID3D12PipelineState> described, streamed;
+        REQUIRE(SUCCEEDED(dev->CreateGraphicsPipelineState(&nowrite, IID_PPV_ARGS(&described))));
+        {
+            struct alignas(void*) Stream {
+                struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE; ID3D12RootSignature* v; } rs;
+                struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS; D3D12_SHADER_BYTECODE v; } vs;
+                struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER; D3D12_RASTERIZER_DESC v; } rast;
+                struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL; D3D12_DEPTH_STENCIL_DESC v; } ds;
+                struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT; DXGI_FORMAT v; } dsv;
+                struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY; D3D12_PRIMITIVE_TOPOLOGY_TYPE v; } topo;
+            } st;
+            st.rs.v = root.Get();
+            st.vs.v = nowrite.VS;
+            st.rast.v = nowrite.RasterizerState;
+            st.ds.v = nowrite.DepthStencilState;
+            st.dsv.v = DXGI_FORMAT_D32_FLOAT;
+            st.topo.v = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            test::ComPtr<ID3D12Device2> dev2;
+            REQUIRE(SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev2))));
+            const D3D12_PIPELINE_STATE_STREAM_DESC sd{sizeof st, &st};
+            REQUIRE(SUCCEEDED(dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&streamed))));
+        }
+        for (ID3D12PipelineState* gbuffer : {described.Get(), streamed.Get()}) {
+            const char* way = gbuffer == described.Get() ? "described" : "stream";
+            na::observe::DrawReplayStats before{};
+            na::observe::GetDrawReplayStats(&before);
+            uint32_t fed = 0, right = 0;
+            const uint32_t base = gbuffer == described.Get() ? 300u : 400u;
+            for (uint32_t frame = base; frame < base + 24; ++frame) {
+                na::nr::native::Reset(list.list.Get());
+                list.Reset();
+                const float jitter[2] = { frame % 2 ? .375f : -.25f, frame % 2 ? -.375f : .25f };
+                na::observe::SetSceneViewportJitter(frame, jitter[0], jitter[1]);
+                na::observe::SetDrawReplay(frame, retain);
+                const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
+                const D3D12_RECT sc{0, 0, 14, h};
+                auto* l = list.list.Get();
+                l->SetGraphicsRootSignature(root.Get());
+                const float shift = float(frame % 2) / (w / 2.f);
+                l->SetGraphicsRoot32BitConstants(0, 1, &shift, 0);
+                l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                l->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+                l->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+                l->RSSetViewports(1, &vp);
+                l->RSSetScissorRects(1, &sc);
+                l->SetPipelineState(pre_pso.Get());
+                l->DrawInstanced(3, 1, 0, 0); // depth pre-pass (not replayable)
+                l->SetPipelineState(gbuffer);
+                l->DrawInstanced(3, 1, 0, 0); // tested LESS_EQUAL, writes no depth: replayed
+                auto to_read = test::Transition(depth.Get(), depth_write, npsr);
+                l->ResourceBarrier(1, &to_read);
+                const na::j2::replay_motion::Output output = [&] {
+                    const na::observe::HostWorkScope host;
+                    return pass.Record(l, d.queue.Get(), depth.Get(), w, h, false, false, jitter);
+                }();
+                if (output.motion) {
+                    ++fed;
+                    ID3D12Resource* textures[] = {output.motion, output.valid};
+                    for (UINT i = 0; i < 2; ++i) {
+                        auto barrier = test::Transition(textures[i], npsr, copy_source);
+                        l->ResourceBarrier(1, &barrier);
+                        D3D12_TEXTURE_COPY_LOCATION src{textures[i], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                        D3D12_TEXTURE_COPY_LOCATION dst{rb.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                        dst.PlacedFootprint.Offset = uint64_t(i) * h * pitch;
+                        dst.PlacedFootprint.Footprint = {i ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32_FLOAT, w, h, 1, pitch};
+                        l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+                        l->ResourceBarrier(1, &barrier);
+                    }
+                }
+                std::swap(to_read.Transition.StateBefore, to_read.Transition.StateAfter);
+                l->ResourceBarrier(1, &to_read);
+                REQUIRE(SUCCEEDED(l->Close()));
+                ID3D12CommandList* commands[] = {l};
+                {
+                    na::nr::native::Submission submitted(d.queue.Get(), 1, commands);
+                    d.queue->ExecuteCommandLists(1, commands);
+                }
+                d.WaitIdle();
+                if (output.motion) {
+                    std::byte* mapped = nullptr;
+                    REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+                    const auto* motion = reinterpret_cast<const float*>(mapped + 7 * pitch);
+                    const auto* valid = reinterpret_cast<const float*>(mapped + (h + 7) * pitch);
+                    if (valid[12] == 1.f && std::abs(motion[24] - (frame % 2 ? -1.f : 1.f)) < 1e-3f && std::abs(motion[25]) < 1e-3f) ++right;
+                    rb->Unmap(0, nullptr);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            na::observe::DrawReplayStats after{};
+            na::observe::GetDrawReplayStats(&after);
+            std::printf("depth-tested draw that writes no depth (%s pipeline): motion on %u of 24 frames, right %u; no_recipe +%llu, noted +%llu, built +%llu\n",
+                        way, fed, right, (unsigned long long)(after.no_recipe - before.no_recipe),
+                        (unsigned long long)(after.noted - before.noted), (unsigned long long)(after.built - before.built));
+            CHECK(after.no_recipe == before.no_recipe); // every admitted draw has its recipe
+            CHECK(fed >= 20 && right >= 20);            // and is replayed with its exact motion
+        }
+    }
     test::ComPtr<ID3D12InfoQueue> messages;
     if (debug && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&messages)))) {
         std::puts("D3D12 debug layer enabled.");

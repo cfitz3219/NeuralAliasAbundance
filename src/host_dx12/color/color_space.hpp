@@ -45,8 +45,36 @@ inline Encoding Classify(DXGI_FORMAT format, DXGI_COLOR_SPACE_TYPE color_space)
 
 inline bool IsHdr(Encoding e) { return e != Encoding::SDR; }
 
+// How the values STORED in a picture of `format` are encoded, for passes that read and write the
+// presented picture itself (Frame Generation's still-area steadying and HUD paste). `hdr` is the
+// presenter's answer from Classify. FP16 is always linear (scRGB scale): the display compositor
+// reads FP16 chains as linear light whatever colour space is set, and this keeps the FP16 path
+// exactly as it was proven. 10-bit is PQ when the chain is HDR, otherwise display-encoded SDR.
+// 8-bit (and anything else) is display-encoded SDR.
+inline Encoding ForStoredPicture(DXGI_FORMAT format, bool hdr)
+{
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R16G16B16A16_TYPELESS) return Encoding::scRGB;
+    if ((format == DXGI_FORMAT_R10G10B10A2_UNORM || format == DXGI_FORMAT_R10G10B10A2_TYPELESS) && hdr) return Encoding::HDR10;
+    return Encoding::SDR;
+}
+
 // Shader-side mode value shared by the passes (0 SDR, 1 PQ, 2 scRGB).
 inline uint32_t ShaderMode(Encoding e) { return static_cast<uint32_t>(e); }
+
+// The format a shader reads and writes a stored picture through: the plain UNORM/FLOAT member of
+// its family (typeless and _SRGB chains read their stored values, which ForStoredPicture describes).
+inline DXGI_FORMAT ViewFormat(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default: return f;
+    }
+}
 
 inline const char* Name(Encoding e)
 {

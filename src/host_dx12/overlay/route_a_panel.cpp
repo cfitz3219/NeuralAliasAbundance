@@ -38,6 +38,8 @@
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
+#include "core/live_frame_gen.hpp"
+#include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -954,9 +956,10 @@ void DrawLiveDlaa()
             na::observe::SetSamplerMipBiasLive(on ? na::settings::DlaaMipBias(na::settings::Get()) : 0.0f);
     }
     EndRow();
-    if (!na::on12::NativeRoute()) {
-        // Fold the shading, live test (Cort 2026-11-25; core/fold_shading.hpp). One control; DLAA stays
-        // on screen until the chosen level has proven itself. Not saved: every launch starts on DLAA.
+    {
+        // Fold the shading, live test (Cort 2026-11-25; core/fold_shading.hpp). One control on both routes
+        // (DX12, native DX11); DLAA stays on screen until the chosen level has proven itself. Not saved:
+        // every launch starts on DLAA.
         static const char* kFoldLevels[] = {"DLAA (full size)", "Quality (test)", "Performance (test)"};
         na::settings::Settings& fs = na::settings::Get();
         int level = static_cast<int>((std::min)(fs.j2_fold_mode.load(), 2u));
@@ -965,7 +968,8 @@ void DrawLiveDlaa()
         if (ImGui::Combo("##j2fold", &level, kFoldLevels, 3)) fs.j2_fold_mode.store(static_cast<uint32_t>(level));
         EndRow();
         char fold_status[320]{};
-        na::j2::FoldStatus(fold_status, sizeof fold_status);
+        if (na::on12::NativeRoute()) na::native_d3d11::FoldStatus(fold_status, sizeof fold_status);
+        else na::j2::FoldStatus(fold_status, sizeof fold_status);
         if (level != 0 || std::strstr(fold_status, "DLAA (full size)") == nullptr) Hint(fold_status);
     }
     char native_status[200]{};
@@ -1421,8 +1425,88 @@ static void DrawExperimentalGpu();
 static void DrawDonutLighting();
 static void DrawAmbientOcclusion();
 
+// Route B live Frame Generation (2026-11-26): one control, Off / x2, live with no restart and
+// remembered for this game. When it cannot run, the row says why in plain words.
+static void DrawLiveFrameGeneration()
+{
+    using namespace na::ui;
+    na::settings::Settings& st = na::settings::Get();
+    char why[160] = {};
+    const bool can = na::fg::Available(why, sizeof why);
+    const bool on = st.fg_enabled.load() != 0;
+    const uint32_t generated = on ? (st.fg_multiplier.load() > 1 ? st.fg_multiplier.load() - 1 : 1) : 0;
+    int choice = static_cast<int>(generated > na::fglive::kMaxGeneratedThisBuild ? na::fglive::kMaxGeneratedThisBuild : generated);
+    static const char* kItems[] = {na::fglive::ChoiceLabel(0), na::fglive::ChoiceLabel(1)};
+    BeginRow("Frame Generation",
+             "Shows one extra picture between each pair of rendered frames (x2), made by NVIDIA's Frame Generation from NeuralAlias's own depth and motion. "
+             "Works with DLAA, Quality and Performance and switches at once, no restart. The HUD stays exact: generated pictures carry the newer real frame's HUD. "
+             "The delay between your input and the picture grows a little.",
+             DropdownWidth());
+    // Switching OFF is always allowed; switching on only when NVIDIA's runtime says it can run here
+    // (before DLSS has started it cannot know yet, so the choice is accepted and applied then).
+    const bool waiting = !can && std::strstr(why, "waiting for DLSS") != nullptr;
+    ImGui::BeginDisabled(!can && !on && !waiting);
+    if (Combo("fglive", &choice, kItems, 2, DropdownWidth())) {
+        const bool want = choice > 0;
+        if (want) { st.fg_mode.store(0); st.fg_multiplier.store(static_cast<uint32_t>(choice) + 1); na::fg::ResetLatch(); }
+        st.fg_enabled.store(want ? 1u : 0u);
+        na::settings::Save();
+        na::eventlog::Emit("fg_live", "menu: Frame Generation %s", na::fglive::ChoiceLabel(want ? static_cast<uint32_t>(choice) : 0));
+    }
+    ImGui::EndDisabled();
+    EndRow();
+    const na::fg::Stats fs = na::fg::GetStats();
+    const auto lv = na::present::GetLiveStats();
+    const auto hud = na::j2::GetLiveHudStatsAnyApi();
+    const auto pr = na::present::GetStats();
+    char line[320];
+    if (!can && !waiting) StatusLine(2, why);
+    else if (!on) StatusLine(0, waiting ? why : "Off. Pictures are presented exactly as the game renders them.");
+    else {
+        if (lv.waiting_ms) StatusLine(2, lv.waiting); // never a silent "nothing"
+        else StatusLine(fs.latched_off ? 2 : (fs.active ? 1 : 0), fs.reason);
+        if (fs.active || fs.generated) {
+            snprintf(line, sizeof line, "%.0f pictures per second shown from %.0f rendered. Graphics-card time per rendered frame: Frame Generation %.2f ms, HUD %.2f ms, presenting %.2f ms.",
+                     pr.shown_fps, pr.base_fps, lv.eval_avg, lv.hudcopy_avg + lv.paste_avg + hud.grab_avg + hud.redraw_avg, lv.copy_avg);
+            Hint(line);
+        }
+        snprintf(line, sizeof line, "HUD: %s", hud.learned ? hud.method : hud.verdict);
+        Hint(line);
+    }
+    {   // DX11: a chain our presenter could not serve keeps the game's own (x2 cannot run there)
+        char reason[160] = {};
+        unsigned long long refused = 0;
+        na::on12::ProxyReason(reason, sizeof reason, &refused);
+        if (na::on12::NativeRoute() && refused) StatusLine(2, reason);
+    }
+    if (on) {
+        // Still-area steadying (Astra): live A/B, x2 stays on either way.
+        int steady = st.fg_steady.load() ? 0 : 1;
+        static const char* kSteady[] = {"On", "Off"};
+        BeginRow("Still-area steadying",
+                 "Where the picture is still, the generated picture is steadied toward the two real frames around it (less shimmer on thin wires and edges "
+                 "when you hold still). Moving parts keep the generated picture. x2 stays on either way; switch to compare.",
+                 DropdownWidth());
+        if (Combo("fgsteady", &steady, kSteady, 2, DropdownWidth())) {
+            st.fg_steady.store(steady == 0 ? 1u : 0u);
+            na::settings::Save();
+            na::eventlog::Emit("fg_steady", "menu: Still-area steadying %s", steady == 0 ? "On" : "Off");
+        }
+        EndRow();
+        if (lv.steady_why[0]) StatusLine(2, lv.steady_why);
+        else if (st.fg_steady.load() && lv.steady_frames) {
+            snprintf(line, sizeof line, "Steadied %llu generated pictures, %.1f %% of each picture on average, %.2f ms per rendered frame.",
+                     static_cast<unsigned long long>(lv.steady_frames), lv.steady_share, lv.steady_avg);
+            Hint(line);
+        }
+        if (lv.capture[0]) Hint(lv.capture);
+    }
+}
+
 void RegisterLiveDlaaMenu()
 {
+    if (na::present::LiveFrameGeneration())
+        na::menu::Register({"Frame Generation (live)", na::menu::Availability::Available, nullptr, &DrawLiveFrameGeneration, na::menu::Page::Picture});
     na::menu::Register({"Live DLAA", na::menu::Availability::Available, nullptr, &DrawLiveDlaa, na::menu::Page::Picture});
     na::menu::Register({"DLSS debug", na::menu::Availability::Available, nullptr, &DrawDlssDebug, na::menu::Page::Details});
     na::menu::Register({"DLAA enhancements", na::menu::Availability::Available, nullptr, &DrawLiveDlaaEnhancements, na::menu::Page::Enhancements});

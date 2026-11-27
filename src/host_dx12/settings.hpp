@@ -103,6 +103,9 @@ struct Settings {
     // Fold the shading, live test (core/fold_shading.hpp): 0 DLAA, 1 Quality (2x1 blocks), 2 Performance
     // (2x2 blocks). Menu only and never saved: every launch starts on DLAA.
     std::atomic<uint32_t> j2_fold_mode{0};
+    // The levels' DLSS features are made together with DLAA's when DLAA starts, so a level switch makes nothing
+    // (on). Off only for tests that count exactly one DLSS evaluation per frame.
+    std::atomic<uint32_t> j2_fold_prewarm{1};
     // Anisotropic filtering on the game's world textures, no menu control (Cort 2026-11-20):
     // hidden [j2] anisotropic_filter = -1 automatic (default), 0 off (the game's own), 16 forced.
     // Re-read live when either ini changes (PollHiddenSettings). Rule: core/anisotropic_auto.hpp.
@@ -136,6 +139,9 @@ struct Settings {
     // the opposite sign, 0 = off: the camera-matrix route). Cort 2026-11-04. Loading the ini
     // turns it on unless the ini says otherwise; without a Load (tests) the camera-matrix route stays.
     std::atomic<int32_t> j2_viewport_jitter{0};
+    // VARIANT: jitter/ramp-after-restart: frames over which the jitter comes back after a DLSS history restart
+    // (core/temporal_jitter.hpp RestartJitterScale); 0 = jitter/full-after-restart. Hidden: [j2] restart_ramp.
+    std::atomic<uint32_t> j2_restart_ramp{8};
     // VARIANT: camera/optional
     // [j2] camera: what the scene camera is to DLAA on the native DX11 route (2026-11-16, Cort:
     // "eliminate the dependency"). 1 = used when found (default): a frame without one still gets DLAA,
@@ -181,6 +187,12 @@ struct Settings {
     std::atomic<uint32_t> fg_preset{1}; // NVIDIA driver-profile request: A=1 (default), B=2, C=3; restart after change
     std::atomic<uint32_t> fg_multiplier{2};
     std::atomic<uint32_t> fg_target_fps{0};
+    // Route B live x2: Astra's still-area steadying on the generated picture (fg/steady_pass.hpp).
+    // 1 On (default), 0 Off. Remembered per game under [fg_steady_games] <game key>; applies live.
+    std::atomic<uint32_t> fg_steady{1};
+    // VARIANT: hudpaste/moves-with-scene (1, default) | hudpaste/screen-fixed (0): x2 places interface that
+    // moves with the scene (map names) at each generated picture's time (fg/hud_move.hpp). Hidden: [fg] hud_move.
+    std::atomic<uint32_t> fg_hud_move{1};
     // A69: the freeze watchdog switched Frame Generation off at this time
     // (seconds since 1970, 0 = never). Shown in the menu until FG is re-enabled.
     std::atomic<uint32_t> fg_frozen_at{0};
@@ -223,6 +235,11 @@ void SetIniPath(const wchar_t* path);
 void ConfigureReferee(bool added_dlaa, bool gpu_checks);
 // Where user changes are saved: %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini
 const wchar_t* UserIniPath();
+// Route B live Frame Generation: remember the Off / x2 choice for THIS game (the executable name)
+// under [fg_games] in the user ini, instead of the shared [fg] keys other games use. Applies the
+// saved choice now (Fixed mode, count from the saved multiplier; safe start keeps it off).
+void BindFrameGenerationToGame(const wchar_t* game);
+const wchar_t* FrameGenerationGameKey(); // empty when not bound
 void Load();  // defaults ini, then user ini overrides when present
 // Event log: emits one "setting" event per changed persisted field since the last call.
 void WatchChanges(const char* source = nullptr);

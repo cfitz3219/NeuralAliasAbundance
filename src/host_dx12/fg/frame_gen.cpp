@@ -1,5 +1,6 @@
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/depth_format.hpp"
+#include "host_dx12/fg/motion_prep.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -12,6 +13,11 @@
 #include <vector>
 
 #include "host_dx12/settings.hpp"
+#include "host_dx12/diag/event_log.hpp"
+
+#include <string>
+
+#pragma comment(lib, "version.lib")
 
 #if defined(NA_HAVE_NGX_SDK)
 #pragma warning(push, 3)
@@ -48,6 +54,10 @@ struct State {
     EvalInputs last_in{};
     uint32_t have_inputs = 0;
     uint32_t inputs_fresh = 0; // an evaluate happened since the last Generate
+    // Route B: motion prepared for Frame Generation (fill + dead zone) and for the steadying (fill only).
+    MotionPrep prep;
+    ID3D12Resource* mvecs = nullptr; // what evaluate_locked hands the runtime this frame
+    UsedMotion used{};
     // Recording and submission are different events. Protect receipts with a
     // separate lock, never held across NGX calls or GPU waits.
     struct InputReceipt {
@@ -66,6 +76,8 @@ struct State {
     void* feature = nullptr;
     uint32_t feat_w = 0, feat_h = 0, feat_rw = 0, feat_rh = 0;
     DXGI_FORMAT feat_format = DXGI_FORMAT_UNKNOWN;
+    uint32_t feat_hudless = 0; // the feature was created told that HUD-less colour comes with each frame
+    uint32_t feat_ui = 0;      // bit 0: UI colour given, bit 1: UI alpha given (UI recomposition on when either, with HUD-less)
     uint32_t feature_pending = 0; // created on this frame's list; evaluate from the next frame
     uint32_t need_reset = 1;
     uint32_t max_supported = 0;
@@ -84,11 +96,99 @@ struct State {
     std::atomic<uint32_t> active{0}, latched{0};
     std::atomic<uint64_t> evaluates{0}, generated{0}, real_frames{0}, skipped{0};
     std::atomic<float> target_fps{0.f};
+    std::atomic<uint64_t> resets_cut{0}, resets_other{0};
     char reason[112] = "Frame Generation is off.";
+    // Route B: the package's folder for nvngx_dlssg.dll, and what was found / loaded.
+    std::mutex file_m;
+    wchar_t folder[MAX_PATH] = {};
+    RuntimeFile file{};
 };
 State g;
 
-void set_reason(const char* text) { strncpy_s(g.reason, text, _TRUNCATE); }
+#if defined(NA_HAVE_NGX_SDK)
+// Version of a DLL file as "a.b.c.d"; false when the file has no version record.
+bool file_version(const wchar_t* path, uint32_t* major, uint32_t* minor, char* text, size_t n)
+{
+    DWORD h = 0, size = GetFileVersionInfoSizeW(path, &h);
+    if (!size) return false;
+    std::vector<uint8_t> info(size);
+    VS_FIXEDFILEINFO* v = nullptr;
+    UINT vl = 0;
+    if (!GetFileVersionInfoW(path, 0, size, info.data()) || !VerQueryValueW(info.data(), L"\\", reinterpret_cast<void**>(&v), &vl) || !v)
+        return false;
+    *major = HIWORD(v->dwFileVersionMS);
+    *minor = LOWORD(v->dwFileVersionMS);
+    snprintf(text, n, "%u.%u.%u.%u", HIWORD(v->dwFileVersionMS), LOWORD(v->dwFileVersionMS), HIWORD(v->dwFileVersionLS), LOWORD(v->dwFileVersionLS));
+    return true;
+}
+// The file the package should hold. false + plain-words reason when it is missing or too old.
+bool check_folder_file(char* reason, size_t n)
+{
+    wchar_t folder[MAX_PATH];
+    { std::lock_guard<std::mutex> lock(g.file_m); wcsncpy_s(folder, g.folder, _TRUNCATE); }
+    if (!folder[0]) return true; // not a Route B package: the runtime finds its own file
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%s\\nvngx_dlssg.dll", folder);
+    char path8[MAX_PATH] = {};
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, path8, sizeof path8, nullptr, nullptr);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        snprintf(reason, n, "NVIDIA's Frame Generation file nvngx_dlssg.dll (version %u.%u or newer) is missing from %s.", kNeededMajor, kNeededMinor, path8);
+        return false;
+    }
+    uint32_t major = 0, minor = 0;
+    char ver[32] = "unknown";
+    const bool have = file_version(path, &major, &minor, ver, sizeof ver);
+    {
+        std::lock_guard<std::mutex> lock(g.file_m);
+        if (!g.file.loaded) { strncpy_s(g.file.path, path8, _TRUNCATE); strncpy_s(g.file.version, ver, _TRUNCATE); }
+    }
+    if (!have || major < kNeededMajor || (major == kNeededMajor && minor < kNeededMinor)) {
+        snprintf(reason, n, "nvngx_dlssg.dll in %s is version %s; Frame Generation here needs %u.%u or newer.", path8, ver, kNeededMajor, kNeededMinor);
+        return false;
+    }
+    return true;
+}
+// After the feature was created: which nvngx_dlssg.dll the runtime actually loaded.
+void note_loaded_file()
+{
+    HMODULE m = GetModuleHandleW(L"nvngx_dlssg.dll");
+    if (!m) return;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return;
+    uint32_t major = 0, minor = 0;
+    char ver[32] = "unknown";
+    file_version(path, &major, &minor, ver, sizeof ver);
+    std::lock_guard<std::mutex> lock(g.file_m);
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, g.file.path, sizeof g.file.path, nullptr, nullptr);
+    strncpy_s(g.file.version, ver, _TRUNCATE);
+    g.file.loaded = true;
+}
+#endif
+
+// Live Frame Generation: one run must show how far it got. Every link logs its first success and
+// its first failure (once each), and every distinct reason text is logged the first time it appears.
+void milestone(const char* link, bool ok, const char* detail)
+{
+    static std::mutex m;
+    static std::vector<std::string> seen;
+    std::string key = std::string(ok ? "+" : "-") + link;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto& s : seen) if (s == key) return;
+        if (seen.size() < 64) seen.push_back(key);
+    }
+    na::eventlog::Emit("fg_live", "FIRST %s %s%s%s", ok ? "SUCCESS" : "FAILURE", link, detail && *detail ? ": " : "", detail ? detail : "");
+}
+void set_reason(const char* text)
+{
+    if (std::strcmp(g.reason, text)) {
+        static std::vector<std::string> seen; // caller holds g.m
+        bool fresh = seen.size() < 48;
+        for (const auto& s : seen) if (s == text) { fresh = false; break; }
+        if (fresh) { seen.emplace_back(text); na::eventlog::Emit("fg_live", "reason: %s", text); }
+    }
+    strncpy_s(g.reason, text, _TRUNCATE);
+}
 void latch(const char* text)
 {
     set_reason(text);
@@ -150,10 +250,46 @@ void release_feature_locked()
 #if defined(NA_HAVE_NGX_SDK)
 NVSDK_NGX_Parameter* P() { return static_cast<NVSDK_NGX_Parameter*>(g.params); }
 
+// NVIDIA's capability record for Frame Generation, in plain words. Caller holds g.m.
+bool capability_locked(char* why, size_t n, unsigned* max_count)
+{
+    if (!check_folder_file(why, n)) return false;
+    if (!g.rt.get_capability_parameters) { snprintf(why, n, "Frame Generation is waiting for the DLSS connection."); return false; }
+    void* cap = nullptr;
+    const int32_t r = reinterpret_cast<PfnAllocParams>(g.rt.get_capability_parameters)(&cap);
+    if (!NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(r)) || !cap) {
+        snprintf(why, n, "NVIDIA's runtime did not answer the Frame Generation question (code 0x%08X).", static_cast<unsigned>(r));
+        return false;
+    }
+    auto* c = static_cast<NVSDK_NGX_Parameter*>(cap);
+    int avail = 0, needs = 0, init = 0;
+    unsigned maj = 0, mnr = 0;
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_Available, &avail);
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver, &needs);
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult, &init);
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMajor, &maj);
+    c->Get(NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMinor, &mnr);
+    if (max_count) c->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, max_count);
+    if (avail) return true;
+    if (needs) {
+        if (maj) snprintf(why, n, "Frame Generation needs a newer NVIDIA graphics driver (%u.%u or newer).", maj, mnr);
+        else snprintf(why, n, "Frame Generation needs a newer NVIDIA graphics driver.");
+    } else if (static_cast<uint32_t>(init) == static_cast<uint32_t>(NVSDK_NGX_Result_FAIL_FeatureNotSupported) ||
+               static_cast<uint32_t>(init) == static_cast<uint32_t>(NVSDK_NGX_Result_FAIL_PlatformError)) {
+        snprintf(why, n, "This graphics card does not support NVIDIA Frame Generation (it needs a GeForce RTX 40 series or newer).");
+    } else if (static_cast<uint32_t>(init) == static_cast<uint32_t>(NVSDK_NGX_Result_FAIL_FeatureNotFound)) {
+        snprintf(why, n, "NVIDIA's Frame Generation file nvngx_dlssg.dll was not found by the runtime.");
+    } else {
+        snprintf(why, n, "NVIDIA Frame Generation is not available here (NVIDIA code 0x%08X).", static_cast<unsigned>(init));
+    }
+    return false;
+}
+
 bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
 {
     if (g.feature && g.feat_w == f.width && g.feat_h == f.height && g.feat_format == f.format &&
-        g.feat_rw == g.in_w && g.feat_rh == g.in_h)
+        g.feat_rw == g.in_w && g.feat_rh == g.in_h && g.feat_hudless == (f.hudless ? 1u : 0u) &&
+        g.feat_ui == ((f.hudless && f.ui ? 1u : 0u) | (f.hudless && f.ui_alpha ? 2u : 0u)))
         return true;
     release_feature_locked();
     if (!g.params) {
@@ -166,16 +302,10 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
         g.params = p;
     }
     if (g.rt.get_capability_parameters) {
-        void* cap = nullptr;
-        int32_t r = reinterpret_cast<PfnAllocParams>(g.rt.get_capability_parameters)(&cap);
-        int avail = 0;
+        char why[112];
         unsigned mx = 0;
-        if (NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(r)) && cap) {
-            static_cast<NVSDK_NGX_Parameter*>(cap)->Get(NVSDK_NGX_Parameter_FrameGeneration_Available, &avail);
-            static_cast<NVSDK_NGX_Parameter*>(cap)->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &mx);
-        }
-        if (!avail) {
-            latch("Frame Generation runtime not found beside the game (nvngx_dlssg.dll) or not supported here.");
+        if (!capability_locked(why, sizeof why, &mx)) {
+            latch(why);
             return false;
         }
         g.max_supported = mx ? (mx > kHardMaxCount ? kHardMaxCount : mx) : 1;
@@ -193,11 +323,15 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
     p->Set(NVSDK_NGX_DLSSG_Parameter_InternalWidth, g.in_w);
     p->Set(NVSDK_NGX_DLSSG_Parameter_InternalHeight, g.in_h);
     p->Set(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0u);
-    // We never have HUD-less colour, UI layers or a distortion field.
-    p->Set(NVSDK_NGX_DLSSG_Parameter_ResourceNeverProvided_Flags,
-           static_cast<unsigned>(NVSDK_NGX_DLSSG_ResourceFlags_HUDLess | NVSDK_NGX_DLSSG_ResourceFlags_UI |
-                                 NVSDK_NGX_DLSSG_ResourceFlags_UIAlpha | NVSDK_NGX_DLSSG_ResourceFlags_BidirectionalDistortionField));
-    p->Set(NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled, 0u);
+    // No distortion field; HUD-less colour and UI layers only when the caller supplies them.
+    // UI recomposition needs HUD-less colour plus UI colour or UI alpha (SDK header).
+    const bool ui = f.hudless && f.ui, ui_alpha = f.hudless && f.ui_alpha;
+    unsigned never = NVSDK_NGX_DLSSG_ResourceFlags_BidirectionalDistortionField;
+    if (!f.hudless) never |= NVSDK_NGX_DLSSG_ResourceFlags_HUDLess;
+    if (!ui) never |= NVSDK_NGX_DLSSG_ResourceFlags_UI;
+    if (!ui_alpha) never |= NVSDK_NGX_DLSSG_ResourceFlags_UIAlpha;
+    p->Set(NVSDK_NGX_DLSSG_Parameter_ResourceNeverProvided_Flags, never);
+    p->Set(NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled, (ui || ui_alpha) ? 1u : 0u);
     void* handle = nullptr;
     int32_t r = reinterpret_cast<PfnCreate>(g.rt.create_feature)(list, kFeatureFrameGeneration, g.params, &handle);
     if (!NVSDK_NGX_SUCCEED(static_cast<NVSDK_NGX_Result>(r)) || !handle) {
@@ -207,11 +341,19 @@ bool ensure_feature_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f)
         return false;
     }
     g.feature = handle;
+    {
+        char d[160];
+        snprintf(d, sizeof d, "%ux%u format %u from %ux%u, HUD-less %u", f.width, f.height, static_cast<unsigned>(f.format), g.in_w, g.in_h, f.hudless ? 1u : 0u);
+        milestone("NVIDIA Frame Generation feature created", true, d);
+    }
+    note_loaded_file();
     g.feat_w = f.width;
     g.feat_h = f.height;
     g.feat_rw = g.in_w;
     g.feat_rh = g.in_h;
     g.feat_format = f.format;
+    g.feat_hudless = f.hudless ? 1u : 0u;
+    g.feat_ui = (ui ? 1u : 0u) | (ui_alpha ? 2u : 0u);
     g.feature_pending = 1;
     g.need_reset = 1;
     return true;
@@ -221,11 +363,23 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
 {
     NVSDK_NGX_Parameter* p = P();
     p->Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, f.color);
-    p->Set(NVSDK_NGX_DLSSG_Parameter_MVecs, g.motion_copy.Get());
+    p->Set(NVSDK_NGX_DLSSG_Parameter_MVecs, g.mvecs ? g.mvecs : g.motion_copy.Get());
     p->Set(NVSDK_NGX_DLSSG_Parameter_Depth, g.depth_copy.Get());
-    p->Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, static_cast<ID3D12Resource*>(nullptr));
-    p->Set(NVSDK_NGX_DLSSG_Parameter_UI, static_cast<ID3D12Resource*>(nullptr));
-    p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, static_cast<ID3D12Resource*>(nullptr));
+    p->Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, f.hudless);
+    p->Set(NVSDK_NGX_DLSSG_Parameter_UI, (g.feat_ui & 1u) ? f.ui : static_cast<ID3D12Resource*>(nullptr));
+    p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, (g.feat_ui & 2u) ? f.ui_alpha : static_cast<ID3D12Resource*>(nullptr));
+    if (g.feat_ui & 1u) {
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UISubrectBaseX, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UISubrectBaseY, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UISubrectWidth, f.width);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UISubrectHeight, f.height);
+    }
+    if (g.feat_ui & 2u) {
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectBaseX, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectBaseY, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectWidth, f.width);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectHeight, f.height);
+    }
     p->Set(NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField, static_cast<ID3D12Resource*>(nullptr));
     p->Set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, output);
     p->Set(NVSDK_NGX_DLSSG_Parameter_OutputReal, static_cast<ID3D12Resource*>(nullptr));
@@ -237,7 +391,8 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     static float zero[16]{};
     static float identity[16]{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
     auto& camera = g.last_in.camera;
-    const bool have_camera = g.last_in.camera_valid;
+    // Route B: the all-zero camera of the proven offline configuration, passed as a camera.
+    const bool have_camera = g.last_in.camera_valid || g.last_in.camera_free;
     p->Set(NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, static_cast<void*>(have_camera ? camera.view_to_clip : zero));
     p->Set(NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, static_cast<void*>(have_camera ? camera.clip_to_view : zero));
     p->Set(NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, static_cast<void*>(identity)); // TLOU provides no lens field
@@ -245,9 +400,13 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     p->Set(NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, static_cast<void*>(have_camera ? camera.previous_to_clip : zero));
     p->Set(NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, g.last_in.jitter_x);
     p->Set(NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, g.last_in.jitter_y);
-    // DLSS: value * scale = render pixels. DLSS-G wants values normalised to
-    // the render extent, so divide the pixel scale by the render size.
+    // DLSS: value * scale = render pixels. The SDK header calls DLSS-G's scale "normalised"; Route A keeps
+    // that (scale / render size). Route B passes the render-pixel scale itself: with the normalised value
+    // the runtime in effect ignored our motion (exact-motion pan, fg_capture_replay 2026-11-26: error 10.3
+    // normalised against 1.5 in render pixels, 1.5 being the same as perfect motion). Route A is unchanged
+    // because its games were never tried with the other reading.
     float rw = static_cast<float>(g.in_w ? g.in_w : 1u), rh = static_cast<float>(g.in_h ? g.in_h : 1u);
+    if (g.last_in.camera_free) { rw = 1.f; rh = 1.f; }
     p->Set(NVSDK_NGX_DLSSG_Parameter_MvecScaleX, g.last_in.mv_scale_x / rw);
     p->Set(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, g.last_in.mv_scale_y / rh);
     p->Set(NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, have_camera ? camera.pinhole[0] : 0.f);
@@ -273,7 +432,10 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     p->Set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, f.hdr ? 1u : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_DepthInverted, g.last_in.depth_inverted ? 1u : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, have_camera ? unsigned(camera.camera_motion) : 1u);
-    p->Set(NVSDK_NGX_DLSSG_Parameter_Reset, (g.need_reset || g.last_in.reset || (have_camera && camera.reset)) ? 1u : 0u);
+    const bool reset = g.need_reset || g.last_in.reset || (have_camera && camera.reset);
+    if (reset && index == 1) (g.last_in.reset_reason == 1 ? g.resets_cut : g.resets_other).fetch_add(1, std::memory_order_relaxed);
+    if (index == 1) g.used.reset = reset ? 1u : 0u;
+    p->Set(NVSDK_NGX_DLSSG_Parameter_Reset, reset ? 1u : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, have_camera ? unsigned(camera.not_game) : 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_OrthoProjection, have_camera ? unsigned(camera.ortho) : 0u);
@@ -293,6 +455,18 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
     p->Set(NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectBaseY, 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectWidth, f.width);
     p->Set(NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight, f.height);
+    // The deprecated whole-back-buffer extent too: the driver-store runtime (310.2.1) checks it
+    // ("Invalid Backbuffer resource extent", fg_capture_replay 2026-11-25). Same values.
+    p->Set(NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectBaseX, 0u);
+    p->Set(NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectBaseY, 0u);
+    p->Set(NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectWidth, f.width);
+    p->Set(NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectHeight, f.height);
+    if (f.hudless) {
+        p->Set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseX, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseY, 0u);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, f.width);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight, f.height);
+    }
     p->Set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectBaseX, 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectBaseY, 0u);
     p->Set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectWidth, f.width);
@@ -306,6 +480,7 @@ bool evaluate_locked(ID3D12GraphicsCommandList* list, const FrameInfo& f, ID3D12
         return false;
     }
     g.evaluates.fetch_add(1, std::memory_order_relaxed);
+    milestone("Frame Generation evaluate recorded", true, nullptr);
     return true;
 }
 #endif
@@ -352,6 +527,7 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
         !covers(md, in.mv_base_x, in.mv_base_y, in.render_w, in.render_h)) {
         g.skipped.fetch_add(1, std::memory_order_relaxed);
         g.mv_size_mismatch.store(1, std::memory_order_release); // A74 review: say so instead of "waiting"
+        milestone("inputs recorded at the DLSS evaluate", false, "the motion or depth does not cover the rendering size");
         return;
     }
     g.mv_size_mismatch.store(0, std::memory_order_relaxed);
@@ -404,6 +580,11 @@ void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in)
     receipt->depth = g.recording_depth;
     receipt->motion = g.recording_motion;
     g.inputs_recorded.fetch_add(1, std::memory_order_relaxed);
+    {
+        char d[96];
+        snprintf(d, sizeof d, "%ux%u, camera %s, reset %u", in.render_w, in.render_h, in.camera_free ? "free (zero)" : (in.camera_valid ? "game" : "none"), in.reset);
+        milestone("inputs recorded at the DLSS evaluate", true, d);
+    }
 }
 
 void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists, ExecuteFn forward)
@@ -423,6 +604,7 @@ void Execute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* li
         p = {};
         g.pending_count.fetch_sub(1, std::memory_order_release);
         g.inputs_submitted.fetch_add(1, std::memory_order_relaxed);
+        milestone("inputs submitted with the game's list", true, nullptr);
     }
 }
 
@@ -528,14 +710,14 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
         return 0;
     }
     g.inputs_fresh = 0;
-    if(f.engine_frame && g.last_in.engine_frame!=f.engine_frame) {
+    if(f.engine_frame && !g.last_in.camera_free && g.last_in.engine_frame!=f.engine_frame) { // Route B has no engine frame to match
         g.need_reset=1; g.active.store(0); g.skipped.fetch_add(1);
         set_reason("Frame Generation is paused: camera and displayed frame do not match.");
         return 0;
     }
     // Argon audit #3: DLSS-G needs the real camera. Never feed zero (singular)
     // matrices / zero near-far-FOV; without a validated camera, do not generate.
-    if (!g.last_in.camera_valid) {
+    if (!g.last_in.camera_valid && !g.last_in.camera_free) {
         g.need_reset = 1; g.active.store(0); g.skipped.fetch_add(1);
         set_reason("Frame Generation is paused: the game's camera is not available for this frame.");
         return 0;
@@ -547,6 +729,30 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
         set_reason("Frame Generation is starting.");
         g.skipped.fetch_add(1, std::memory_order_relaxed);
         return 0;
+    }
+    // Route B: fill "nothing known" motion, and give Frame Generation a 1-render-pixel dead zone
+    // (motion_prep.hpp). Without typed UAV stores for the motion format, the copy goes as it is.
+    g.mvecs = nullptr;
+    g.used = {};
+    if (g.last_in.camera_free && g.motion_copy) {
+        if (ID3D12Resource* old = g.prep.Filled()) {
+            const auto a = old->GetDesc(), b = g.motion_copy->GetDesc();
+            if (a.Width != b.Width || a.Height != b.Height || a.Format != b.Format) {
+                g.retired.push_back({nullptr, {g.prep.Filled(), g.prep.ForFg()}, g.generate_calls + kRetireAfter});
+                g.prep.Release();
+            }
+        }
+        if (g.prep.Record(list, g.device.Get(), g.motion_copy.Get(), g.last_in.mv_scale_x, g.last_in.mv_scale_y, 1.0f,
+                          static_cast<uint32_t>(g.generate_calls % MotionPrep::kPages))) {
+            g.mvecs = g.prep.ForFg();
+            g.used.filled = g.prep.Filled();
+            g.used.mv_scale_x = g.last_in.mv_scale_x;
+            g.used.mv_scale_y = g.last_in.mv_scale_y;
+            g.used.frame_id = f.frame_id;
+            milestone("motion prepared for Frame Generation (filled, 1-pixel dead zone)", true, nullptr);
+        } else {
+            milestone("motion prepared for Frame Generation (filled, 1-pixel dead zone)", false, "typed UAV stores of the motion format are not supported, or no memory; the motion goes as measured");
+        }
     }
     uint32_t mult = st.fg_multiplier.load(std::memory_order_relaxed);
     if (mult < 2) mult = 2;
@@ -568,7 +774,7 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
     // V-Sync off tears above the refresh rate, V-Sync on queues and paces.
     if (count < 1) count = 1;
     for (uint32_t i = 0; i < count; ++i) {
-        if (!evaluate_locked(list, f, outputs[i], count, i + 1)) return i; // latched; earlier outputs stay usable
+        if (!evaluate_locked(list, f, outputs[i], count, i + 1)) { if (!i) g.used = {}; return i; } // latched; earlier outputs stay usable
     }
     g.need_reset=0;
     g.last_count = count;
@@ -584,6 +790,12 @@ uint32_t Generate(ID3D12GraphicsCommandList* list, ID3D12Device* device, const F
     latch("Frame Generation needs a build with the NVIDIA SDK.");
     return 0;
 #endif
+}
+
+UsedMotion LastUsedMotion()
+{
+    std::lock_guard<std::mutex> lock(g.m);
+    return g.used;
 }
 
 Stats GetStats()
@@ -603,6 +815,8 @@ Stats GetStats()
     s.inputs_recorded = g.inputs_recorded.load(); s.inputs_submitted = g.inputs_submitted.load();
     s.inputs_overwritten = g.inputs_overwritten.load(); s.missing_inputs = g.missing_inputs.load();
     s.target_fps = g.target_fps.load();
+    s.resets_cut = g.resets_cut.load();
+    s.resets_other = g.resets_other.load();
     if (g.m.try_lock()) {
         s.max_supported = g.max_supported;
         s.last_count = g.last_count;
@@ -615,6 +829,39 @@ Stats GetStats()
     }
     if (!s.enabled) strncpy_s(s.reason, "Frame Generation is off.", _TRUNCATE);
     return s;
+}
+
+void SetRuntimeFolder(const wchar_t* folder)
+{
+    std::lock_guard<std::mutex> lock(g.file_m);
+    wcsncpy_s(g.folder, folder ? folder : L"", _TRUNCATE);
+    size_t n = wcslen(g.folder);
+    while (n && (g.folder[n - 1] == L'\\' || g.folder[n - 1] == L'/')) g.folder[--n] = 0;
+}
+
+RuntimeFile GetRuntimeFile()
+{
+    std::lock_guard<std::mutex> lock(g.file_m);
+    return g.file;
+}
+
+bool Available(char* reason, size_t reason_size)
+{
+    if (!reason || !reason_size) return false;
+    reason[0] = 0;
+    std::lock_guard<std::mutex> lock(g.m);
+    if (g.latched.load(std::memory_order_acquire)) { strncpy_s(reason, reason_size, g.reason, _TRUNCATE); return false; }
+#if defined(NA_HAVE_NGX_SDK)
+    if (!HasRuntime()) {
+        if (!check_folder_file(reason, reason_size)) return false;
+        snprintf(reason, reason_size, "Frame Generation is waiting for DLSS to start (it starts with the first DLAA frame).");
+        return false;
+    }
+    return capability_locked(reason, reason_size, nullptr);
+#else
+    snprintf(reason, reason_size, "This build has no NVIDIA Frame Generation support.");
+    return false;
+#endif
 }
 
 void ResetLatch()
@@ -635,6 +882,9 @@ void Shutdown()
     g.params = nullptr;
     g.depth_copy.Reset();
     g.motion_copy.Reset();
+    g.prep.Release();
+    g.mvecs = nullptr;
+    g.used = {};
     g.recording_depth.Reset(); g.recording_motion.Reset();
     for (auto& p : g.pending) p = {};
     g.ready = {};
@@ -645,6 +895,8 @@ void Shutdown()
     g.in_w = g.in_h = 0;
     g.feat_w = g.feat_h = g.feat_rw = g.feat_rh = 0;
     g.feat_format = DXGI_FORMAT_UNKNOWN;
+    g.feat_hudless = 0;
+    g.feat_ui = 0;
     g.last_count = 0;
     g.active.store(0, std::memory_order_release);
 }

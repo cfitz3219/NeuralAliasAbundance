@@ -13,6 +13,7 @@
 // SKIP (77) only when the machine has no NVIDIA GPU.
 #include "test_support.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "core/temporal_jitter.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -388,6 +389,162 @@ int StationaryStability(test::Device& d, bool timing = false)
 }
 } // namespace
 
+// VARIANT: jitter/ramp-after-restart. DLAA on a static scene of thin lines and fine stripes, rendered on the CPU at
+// the told sample (Halton 2,3), with a history restart at frame 48. The wobble is the mean change of the output
+// between consecutive frames; it is measured on the frames after the restart with the full jitter (the old way) and
+// with the jitter brought back over `ramp` frames (core/temporal_jitter.hpp RestartJitterScale). Reported: the
+// steady wobble before the restart, each of the first frames after it, and the first frame after which the wobble
+// stays within 1.5x the steady one. Measurement only; the pass condition is that the ramp lowers the wobble of the
+// first frames after the restart.
+int RestartWobble(test::Device& d)
+{
+    constexpr UINT w = 512, h = 256, kRestart = 48, kAfter = 24;
+    constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ID3D12Device* dev = d.device.Get();
+    auto color = test::CreateTexture(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    auto depth = test::CreateTexture(dev, w, h, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    auto motion = test::CreateTexture(dev, w, h, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+    auto output = test::CreateTexture(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    REQUIRE(color && depth && motion && output);
+    ID3D12Resource* inputs[] = {color.Get(), depth.Get(), motion.Get()};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[4]{};
+    UINT64 bytes[4]{};
+    for (int k = 0; k < 3; ++k) { auto desc = inputs[k]->GetDesc(); dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp[k], nullptr, nullptr, &bytes[k]); }
+    { auto desc = output->GetDesc(); dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp[3], nullptr, nullptr, &bytes[3]); }
+    auto up_color = test::CreateBuffer(dev, bytes[0], D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto up_rest = test::CreateBuffer(dev, bytes[1] + bytes[2] + 1024, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto rb = test::CreateBuffer(dev, bytes[3], D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    REQUIRE(up_color && up_rest && rb);
+    test::List l;
+    REQUIRE(l.Create(dev));
+    {   // depth (constant) and motion (zero), once
+        uint8_t* p = nullptr;
+        REQUIRE(SUCCEEDED(up_rest->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+        std::memset(p, 0, size_t(bytes[1] + bytes[2] + 1024));
+        for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) reinterpret_cast<float*>(p + y * fp[1].Footprint.RowPitch)[x] = .25f;
+        up_rest->Unmap(0, nullptr);
+        const UINT64 motion_at = (bytes[1] + 511) & ~UINT64(511);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fm = fp[2];
+        fm.Offset = motion_at;
+        for (int k = 1; k < 3; ++k) {
+            D3D12_TEXTURE_COPY_LOCATION a{}, b{};
+            a.pResource = up_rest.Get(); a.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; a.PlacedFootprint = k == 1 ? fp[1] : fm;
+            b.pResource = inputs[k]; b.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            l.list->CopyTextureRegion(&b, 0, 0, 0, &a, nullptr);
+            auto t = test::Transition(inputs[k], D3D12_RESOURCE_STATE_COPY_DEST, read);
+            l.list->ResourceBarrier(1, &t);
+        }
+        REQUIRE(SUCCEEDED(l.list->Close()));
+        ID3D12CommandList* ls[] = {l.list.Get()};
+        d.queue->ExecuteCommandLists(1, ls);
+        d.WaitIdle();
+    }
+    // The scene: thin lines of a map and fine stripes, point-sampled at the told sample (centre - jitter).
+    const auto scene = [](double x, double y) {
+        double v = .18 + .05 * std::sin(.05 * x) * std::cos(.07 * y);
+        if (std::fmod(std::fabs(x * .7 + y * .3), 23.0) < .9) v += .5;           // thin diagonal lines (borders, rails)
+        if (std::fmod(std::fabs(x), 9.0) < 1.3 && std::fmod(y, 40.0) < 12.0) v += .35; // fine vertical strokes (labels)
+        if (std::fabs(y - 128.0 - 40.0 * std::sin(x * .03)) < .6) v += .4;        // a river
+        return v;
+    };
+    const auto run = [&](uint32_t ramp, std::vector<double>& wobble) {
+        std::vector<float> prev, now(size_t(w) * h);
+        wobble.clear();
+        uint32_t since = 0;
+        for (UINT frame = 0; frame < kRestart + kAfter; ++frame) {
+            const bool reset = frame == 0 || frame == kRestart;
+            since = reset ? 0 : since + 1;
+            const float scale = frame < kRestart ? 1.f : neural_alias::RestartJitterScale(since, ramp);
+            const float jx = (Halton(frame % 8 + 1, 2) - .5f) * scale, jy = (Halton(frame % 8 + 1, 3) - .5f) * scale;
+            uint8_t* p = nullptr;
+            REQUIRE(SUCCEEDED(up_color->Map(0, nullptr, reinterpret_cast<void**>(&p))));
+            for (UINT y = 0; y < h; ++y) {
+                auto* row = reinterpret_cast<uint16_t*>(p + y * fp[0].Footprint.RowPitch);
+                for (UINT x = 0; x < w; ++x) {
+                    const float c = float(scene(x + .5 - jx, y + .5 - jy));
+                    row[4 * x] = row[4 * x + 1] = row[4 * x + 2] = ToHalf(c);
+                    row[4 * x + 3] = ToHalf(1.f);
+                }
+            }
+            up_color->Unmap(0, nullptr);
+            l.Reset();
+            {
+                auto t = test::Transition(color.Get(), read, D3D12_RESOURCE_STATE_COPY_DEST);
+                l.list->ResourceBarrier(1, &t);
+                D3D12_TEXTURE_COPY_LOCATION a{}, b{};
+                a.pResource = up_color.Get(); a.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; a.PlacedFootprint = fp[0];
+                b.pResource = color.Get(); b.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                l.list->CopyTextureRegion(&b, 0, 0, 0, &a, nullptr);
+                t = test::Transition(color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, read);
+                l.list->ResourceBarrier(1, &t);
+            }
+            na::dlss::EvalDesc e;
+            e.color = color.Get(); e.depth = depth.Get(); e.motion = motion.Get(); e.output = output.Get();
+            e.render_w = e.out_w = w; e.render_h = e.out_h = h;
+            e.quality = na::dlss::Quality::DLAA; e.preset = 13; e.hdr = true; e.auto_exposure = true; e.depth_inverted = true;
+            e.reset = reset; e.view_id = 803 + ramp;
+            e.jitter_x = jx; e.jitter_y = jy;
+            REQUIRE(na::dlss::Evaluate(l.list.Get(), e));
+            auto t = test::Transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            l.list->ResourceBarrier(1, &t);
+            D3D12_TEXTURE_COPY_LOCATION a{}, b{};
+            a.pResource = output.Get(); a.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            b.pResource = rb.Get(); b.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; b.PlacedFootprint = fp[3];
+            l.list->CopyTextureRegion(&b, 0, 0, 0, &a, nullptr);
+            t = test::Transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            l.list->ResourceBarrier(1, &t);
+            REQUIRE(SUCCEEDED(l.list->Close()));
+            ID3D12CommandList* ls[] = {l.list.Get()};
+            d.queue->ExecuteCommandLists(1, ls);
+            na::dlss::OnExecuted(d.queue.Get(), 1, ls);
+            d.WaitIdle();
+            uint8_t* o = nullptr;
+            REQUIRE(SUCCEEDED(rb->Map(0, nullptr, reinterpret_cast<void**>(&o))));
+            for (UINT y = 0; y < h; ++y)
+                for (UINT x = 0; x < w; ++x) now[size_t(y) * w + x] = FromHalf(reinterpret_cast<const uint16_t*>(o + y * fp[3].Footprint.RowPitch)[4 * x]);
+            rb->Unmap(0, nullptr);
+            if (!prev.empty()) {
+                double sum = 0;
+                for (UINT y = 4; y < h - 4; ++y) for (UINT x = 4; x < w - 4; ++x) sum += std::fabs(double(now[size_t(y) * w + x]) - prev[size_t(y) * w + x]);
+                wobble.push_back(sum / double((w - 8) * (h - 8)));
+            } else wobble.push_back(0);
+            prev = now;
+        }
+        return 0;
+    };
+    std::vector<double> full, ramped, ramp4;
+    REQUIRE(run(0, full) == 0);
+    REQUIRE(run(8, ramped) == 0);
+    REQUIRE(run(4, ramp4) == 0);
+    double steady = 0;
+    for (UINT f = kRestart - 16; f < kRestart; ++f) steady += full[f];
+    steady /= 16;
+    const auto settled = [&](const std::vector<double>& wv) {
+        for (UINT k = 0; k < kAfter; ++k) {
+            bool ok = true;
+            for (UINT j = k; j < kAfter; ++j) ok = ok && wv[kRestart + j] <= 1.5 * steady;
+            if (ok) return int(k);
+        }
+        return -1;
+    };
+    std::printf("restart wobble (mean |output change| a frame, DLAA 512x256 FP16, static scene): steady before the restart %.5f\n", steady);
+    std::printf("  frame after restart:   full jitter  /  ramp 8\n");
+    double first_full = 0, first_ramp = 0;
+    for (UINT k = 0; k < 16; ++k) {
+        std::printf("  %2u: %.5f (x%.1f)  /  %.5f (x%.1f)\n", k, full[kRestart + k], full[kRestart + k] / steady, ramped[kRestart + k],
+                    ramped[kRestart + k] / steady);
+        if (k >= 1 && k <= 8) { first_full += full[kRestart + k]; first_ramp += ramped[kRestart + k]; }
+    }
+    double first_ramp4 = 0;
+    for (UINT k = 1; k <= 8; ++k) first_ramp4 += ramp4[kRestart + k];
+    std::printf("  wobble within 1.5x steady from frame %d (full jitter) / %d (ramp 8) / %d (ramp 4); frames 1-8 mean x%.2f / x%.2f / x%.2f\n",
+                settled(full), settled(ramped), settled(ramp4), first_full / 8 / steady, first_ramp / 8 / steady, first_ramp4 / 8 / steady);
+    CHECK(first_ramp < first_full);
+    na::dlss::Shutdown();
+    return test::g_failures ? 1 : 0;
+}
+
 int main(int argc, char** argv)
 {
     test::Device d;
@@ -425,6 +582,8 @@ int main(int argc, char** argv)
     if (argc > 2 && std::string(argv[2]) == "--stationary") return StationaryStability(d);
 
     if (argc > 2 && std::string(argv[2]) == "--gpu-cost") return StationaryStability(d, true);
+
+    if (argc > 2 && std::string(argv[2]) == "--restart-wobble") return RestartWobble(d);
 
     const uint32_t ow = 1920, oh = 1080;
     for (na::dlss::Quality q : {na::dlss::Quality::MaxQuality, na::dlss::Quality::Balanced, na::dlss::Quality::MaxPerformance,

@@ -37,6 +37,8 @@
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
+#include "core/referee_coverage.hpp"
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -46,6 +48,7 @@
 #include "host_dx12/host_observe_internal.hpp"
 #include "host_dx12/host_observe_samples.h"
 #include "host_dx12/observe/d3d12_slots.hpp"
+#include "core/replay_depth.hpp"
 
 namespace na::observe {
 namespace {
@@ -3545,7 +3548,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
     // replaced sets (if any) are released outside g_m
 }
 
-void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d); // Draw replay (below)
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const na_ev_pipeline_created& e); // Draw replay (below)
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
     const CostScope cost(kCostPso, !t_host_work);
@@ -3574,7 +3577,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     g_next_blend_class=blend_class(d->BlendState);
     g_next_stream_output=d->StreamOutput.NumEntries!=0;
     emit_pipeline(dev, obj, e, d->pRootSignature);
-    replay_note_pipeline(dev, obj, *d);
+    replay_note_pipeline(dev, obj, *d, e);
     make_pso_twins(obj, d->pRootSignature, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC c = *d;
         c.pRootSignature = trs;
@@ -3635,6 +3638,15 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     size_t at = 0;
     size_t rs_offset = SIZE_MAX, cached_offset = SIZE_MAX; // live mip bias: subobjects patched in the twins
     bool saw_depth = false;
+    // Draw replay: the stream's graphics state as a description (its defaults where a subobject is absent),
+    // so a stream-created pipeline gets a replay recipe like a described one.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC replay_desc{};
+    replay_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    replay_desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    replay_desc.RasterizerState.DepthClipEnable = TRUE;
+    replay_desc.SampleMask = UINT_MAX;
+    replay_desc.SampleDesc.Count = 1;
+    bool replay_unusable = false;
     while (at + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= d->SizeInBytes) {
         const auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(p + at);
         const size_t n = sub_size(type);
@@ -3644,18 +3656,24 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
         }
         const uint8_t* s = p + at;
         switch (type) {
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: rs = inner_of<ID3D12RootSignature*>(s); rs_offset = at; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: rs = inner_of<ID3D12RootSignature*>(s); rs_offset = at; replay_desc.pRootSignature = rs; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: replay_desc.InputLayout = inner_of<D3D12_INPUT_LAYOUT_DESC>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: replay_desc.IBStripCutValue = inner_of<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: replay_desc.PrimitiveTopologyType = inner_of<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: replay_desc.RasterizerState = inner_of<D3D12_RASTERIZER_DESC>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: replay_desc.NodeMask = inner_of<UINT>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: replay_unusable = true; break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: cached_offset = at; break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: bytecode(e, NA_STAGE_VS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: bytecode(e, NA_STAGE_VS, inner_of<D3D12_SHADER_BYTECODE>(s)); replay_desc.VS = inner_of<D3D12_SHADER_BYTECODE>(s); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: bytecode(e, NA_STAGE_PS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: bytecode(e, NA_STAGE_DS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: bytecode(e, NA_STAGE_HS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: bytecode(e, NA_STAGE_GS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: bytecode(e, NA_STAGE_DS, inner_of<D3D12_SHADER_BYTECODE>(s)); replay_desc.DS = inner_of<D3D12_SHADER_BYTECODE>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: bytecode(e, NA_STAGE_HS, inner_of<D3D12_SHADER_BYTECODE>(s)); replay_desc.HS = inner_of<D3D12_SHADER_BYTECODE>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: bytecode(e, NA_STAGE_GS, inner_of<D3D12_SHADER_BYTECODE>(s)); replay_desc.GS = inner_of<D3D12_SHADER_BYTECODE>(s); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: bytecode(e, NA_STAGE_CS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: bytecode(e, NA_STAGE_AS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: bytecode(e, NA_STAGE_MS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: blend_mask(e, inner_of<D3D12_BLEND_DESC>(s)); g_next_hud_affine=hud_affine(inner_of<D3D12_BLEND_DESC>(s)); g_next_blend_class=blend_class(inner_of<D3D12_BLEND_DESC>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: g_next_stream_output=inner_of<D3D12_STREAM_OUTPUT_DESC>(s).NumEntries!=0;break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: g_next_stream_output=inner_of<D3D12_STREAM_OUTPUT_DESC>(s).NumEntries!=0;replay_desc.StreamOutput=inner_of<D3D12_STREAM_OUTPUT_DESC>(s);break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
             const auto& ds = inner_of<D3D12_DEPTH_STENCIL_DESC>(s);
             depth_blend(e, ds.DepthEnable, ds.DepthWriteMask, ds.DepthFunc);
@@ -3684,6 +3702,9 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     if (!saw_depth && e.stage_hash[NA_STAGE_CS] == 0) depth_blend(e, TRUE, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_LESS);
     if (e.blend_enable_mask == NA_UNKNOWN_U32 && e.stage_hash[NA_STAGE_CS] == 0) e.blend_enable_mask = 0; // default: no blending
     emit_pipeline(dev, obj, e, rs);
+    // Draw replay: a stream-created graphics pipeline gets a recipe too (before 2026-11-27 only described ones did).
+    if (!replay_unusable && e.stage_hash[NA_STAGE_CS] == 0 && e.stage_hash[NA_STAGE_MS] == 0 && e.stage_hash[NA_STAGE_AS] == 0)
+        replay_note_pipeline(dev, obj, replay_desc, e);
     if (rs_offset != SIZE_MAX)
         make_pso_twins(obj, rs, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
             // Copy the stream, point its root-signature subobject at the twin, drop any cache.
@@ -4189,10 +4210,12 @@ struct On<sl::list::CopyTextureRegion> {
         note_uses(l, {d, s});
     }
 };
+void vpj_note_still_copy(na_object_id dst, na_object_id src); // VARIANT: jitter/stationary-source-readers
 template <>
 struct On<sl::list::CopyResource> {
     static void run(GL* l, ID3D12Resource* dst, ID3D12Resource* src)
     {
+        vpj_note_still_copy(resource_id(dst), resource_id(src));
         Rec r;
         if (!begin_op(l, &r)) return;
         const na_object_id d = resource_id(dst), s = resource_id(src);
@@ -5459,6 +5482,11 @@ struct VpjDepthLayer { na_object_id resource = 0, depth = 0; uint32_t frame = 0;
 std::mutex g_vpj_layer_m;
 VpjDepthLayer g_vpj_layers[4];
 std::atomic<uint32_t> g_vpj_layer_frame{0}; // newest frame a layer was written in; 0 = never (the hot-path gate)
+// VARIANT: jitter/stationary-source-readers (Astra, 2026-11-26): depth-like layers written while a sample is live
+// by draws that kept the game's grid, and whole copies of them. A mesh whose shader reads one stays on that grid.
+VpjDepthLayer g_vpj_still_layers[4]; // under g_vpj_layer_m
+std::atomic<uint32_t> g_vpj_still_frame{0}; // newest frame a stationary layer was noted in; 0 = never (the gate)
+std::atomic<uint64_t> g_vpj_left_stationary{0};
 std::atomic<uint64_t> g_vpj_shader_depth{0};
 std::atomic<uint64_t> g_vpj_shader_depth_refused[static_cast<size_t>(neural_alias::ShaderDepthRefusal::Count)]{};
 constexpr uint64_t kVpjFullScreenVertices = 6; // two triangles: more than this is a mesh
@@ -5466,6 +5494,23 @@ constexpr uint64_t kVpjFullScreenVertices = 6; // two triangles: more than this 
 // Set by the Referee through SetStillMeshJitter while it tries or keeps its reaction to dropouts.
 std::atomic<bool> g_vpj_still_meshes{false};
 std::atomic<uint64_t> g_vpj_still_moved{0}, g_vpj_still_asks{0};
+// VARIANT: jitter/scene-overlays (on) | jitter/depth-tested-only (off; chosen again by the Referee's dropout
+// watch when pixels drop out after the move). core/temporal_jitter.hpp SceneOverlayTakesJitter.
+std::atomic<bool> g_vpj_overlays{true};
+std::atomic<uint64_t> g_vpj_overlay_moved{0};
+// Untested scene meshes (scene depth bound, sample in force) that kept the game's grid, by why:
+// another target than the scene colour, their own viewport, the rule switched off, after the hand-over.
+std::atomic<uint64_t> g_vpj_left_other_target{0}, g_vpj_left_own_viewport{0}, g_vpj_left_rule_off{0}, g_vpj_left_after_handover{0};
+std::atomic<uint64_t> g_vpj_left_total{0};
+// VARIANT: referee/coverage-trial (core/referee_coverage.hpp): the classes the Referee moves onto the sample, the
+// one on trial, and the pipeline signatures moved during the trial / put back by an earlier one.
+std::atomic<uint32_t> g_cov_mask{0};
+std::atomic<int> g_cov_trial{-1};
+std::mutex g_cov_m;
+std::unordered_set<uint64_t> g_cov_trial_sigs, g_cov_still_sigs; // under g_cov_m
+uint64_t g_cov_decisions = 0;                                    // under g_cov_m
+std::atomic<uint64_t> g_cov_moved{0}, g_cov_kept_still{0};
+uint64_t g_cov_last_left[na::referee::kLeftClasses] = {};          // cumulative counts at the last LeftByClass
 inline uint32_t vpj_frame(uint64_t sample) { return static_cast<uint32_t>(sample >> 32); }
 // this frame, the one before, or (a list still recording the frame before) the one after
 inline bool vpj_layer_fresh(uint32_t frame, uint32_t layer_frame) { return layer_frame && frame - layer_frame + 1u <= 2u; }
@@ -5491,6 +5536,53 @@ void vpj_note_depth_layer_locked(ListState& ls, uint64_t sample, na_object_id de
     *slot = {rt, depth, frame};
     g_vpj_layer_frame.store(frame, std::memory_order_release);
 }
+// A draw that kept the game's grid while the sample `sample` is live writes ls.cur_rt: a full-size R32_FLOAT
+// target becomes a stationary layer of this frame. A draw on the sample's grid writing it ends that.
+void vpj_note_still_layer_locked(const ListState& ls, uint64_t sample, na_object_id depth, bool on_sample)
+{
+    const na_object_id rt = ls.cur_rt;
+    if (!rt || !ls.cur_nrt || !depth) return;
+    if (on_sample) {
+        if (!g_vpj_still_frame.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lock(g_vpj_layer_m);
+        for (auto& e : g_vpj_still_layers) if (e.resource == rt) e = {};
+        return;
+    }
+    uint32_t w = 0, h = 0, fmt = 0, dw = 0, dh = 0, dfmt = 0;
+    if (!resource_dims_locked(rt, &w, &h, &fmt) || fmt != DXGI_FORMAT_R32_FLOAT ||
+        !resource_dims_locked(depth, &dw, &dh, &dfmt) || w != dw || h != dh) return;
+    const uint32_t frame = vpj_frame(sample);
+    std::lock_guard<std::mutex> lock(g_vpj_layer_m);
+    for (auto& e : g_vpj_layers) if (e.resource == rt) e = {}; // drawn again on the game's grid: no longer a sampled layer
+    VpjDepthLayer* slot = &g_vpj_still_layers[0];
+    for (auto& e : g_vpj_still_layers) {
+        if (e.resource == rt) { slot = &e; break; }
+        if (e.frame < slot->frame) slot = &e;
+    }
+    *slot = {rt, depth, frame};
+    g_vpj_still_frame.store(frame, std::memory_order_release);
+}
+void vpj_note_still_copy(na_object_id dst, na_object_id src)
+{
+    if (!dst || !g_vpj_still_frame.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_vpj_layer_m);
+    VpjDepthLayer from{};
+    for (const auto& e : g_vpj_still_layers) if (src && e.resource == src) from = e;
+    for (auto& e : g_vpj_still_layers) if (e.resource == dst) e = {};
+    if (!from.resource) return;
+    VpjDepthLayer* slot = &g_vpj_still_layers[0];
+    for (auto& e : g_vpj_still_layers) if (e.frame < slot->frame) slot = &e;
+    *slot = {dst, from.depth, from.frame};
+}
+uint32_t vpj_still_fresh_layers(uint32_t frame, na_object_id depth, na_object_id out[4])
+{
+    if (!g_vpj_still_frame.load(std::memory_order_acquire)) return 0;
+    uint32_t n = 0;
+    std::lock_guard<std::mutex> lock(g_vpj_layer_m);
+    for (const auto& e : g_vpj_still_layers)
+        if (e.resource && e.depth == depth && e.frame == frame) out[n++] = e.resource;
+    return n;
+}
 // The fresh layers of this scene depth that the list is not writing now. Returns how many; sets
 // *written when a fresh layer is among the bound targets.
 uint32_t vpj_fresh_layers(const ListState& ls, uint32_t frame, na_object_id depth, na_object_id out[4], bool* written)
@@ -5508,11 +5600,11 @@ uint32_t vpj_fresh_layers(const ListState& ls, uint32_t frame, na_object_id dept
 // Whether a graphics table bound for the coming draw holds a mip-0 R32_FLOAT view of one of
 // `layers`. Remembered per recording until a texture table or the registry changes.
 // Caller holds g_m and ls.bind_m.
-bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* layers, uint32_t count)
+bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* layers, uint32_t count, bool use_cache = true)
 {
     auto& cached = ls.vpj_layer_read;
     const uint64_t revision_now = g_operation_revision.load();
-    if (cached.valid && cached.state_revision == ls.read_revision[0] && cached.registry_revision == revision_now && cached.frame == frame &&
+    if (use_cache && cached.valid && cached.state_revision == ls.read_revision[0] && cached.registry_revision == revision_now && cached.frame == frame &&
         cached.count == count && std::equal(layers, layers + count, cached.layers.begin()))
         return cached.reads;
     bool reads = false;
@@ -5542,6 +5634,7 @@ bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* l
             }
         }
     }
+    if (!use_cache) return reads; // another set of layers: the cached answer is the shader-depth rule's
     cached.state_revision = ls.read_revision[0];
     cached.registry_revision = revision_now;
     cached.frame = frame;
@@ -5670,6 +5763,46 @@ void vpj_before_draw_body(GL* l, uint64_t vertices, int* coarse_set)
             still_mesh = neural_alias::StillMeshTakesJitter(mesh);
             if (still_mesh) tests_depth = true;
         }
+        // VARIANT: jitter/scene-overlays: An untested mesh drawn into the scene's own colour picture through the
+        // scene viewport, while the sample is in force, is scene content over the terrain: it takes the sample.
+        // The hand-over proof below (after_resolve) still keeps anything composited after the scene on its grid.
+        bool overlay = false;
+        if (untested_mesh && !tests_depth) {
+            neural_alias::SceneOverlay o;
+            o.enabled = g_vpj_overlays.load(std::memory_order_relaxed);
+            o.active = o.scene_depth_bound = o.mesh = true;
+            o.scene_colour = sel_color && ls->cur_rt == sel_color;
+            o.scene_viewport = scene_viewport();
+            // VARIANT: jitter/stationary-source-readers: a reader of a layer drawn on the game's grid stays on it.
+            if (o.scene_colour && o.scene_viewport) {
+                na_object_id still[4] = {};
+                const uint32_t sn = vpj_still_fresh_layers(vpj_frame(sample), sel_depth, still);
+                o.reads_stationary_layer = sn && vpj_reads_layer_locked(*ls, vpj_frame(sample), still, sn, false);
+            }
+            overlay = neural_alias::SceneOverlayTakesJitter(o);
+            if (!overlay) {
+                // VARIANT: referee/coverage-trial: a class the Referee moves onto the sample, pipeline by pipeline.
+                using L = na::referee::LeftClass;
+                const L cls = !o.scene_colour ? L::OtherTarget : !o.scene_viewport ? L::OwnViewport
+                            : o.reads_stationary_layer ? L::StationarySource : L::RuleOff;
+                if ((g_cov_mask.load(std::memory_order_acquire) >> unsigned(cls)) & 1u) {
+                    const uint64_t sig = (reinterpret_cast<uintptr_t>(pso_obj_locked(*ls)) * 1099511628211ull) ^ unsigned(cls);
+                    std::lock_guard<std::mutex> cov_lock(g_cov_m);
+                    if (g_cov_still_sigs.count(sig)) g_cov_kept_still.fetch_add(1, std::memory_order_relaxed);
+                    else {
+                        if (g_cov_trial.load(std::memory_order_relaxed) == int(cls)) g_cov_trial_sigs.insert(sig);
+                        g_cov_moved.fetch_add(1, std::memory_order_relaxed);
+                        overlay = true;
+                    }
+                }
+            }
+            if (overlay) tests_depth = true;
+            else {
+                g_vpj_left_total.fetch_add(1, std::memory_order_relaxed);
+                (!o.scene_colour ? g_vpj_left_other_target : !o.scene_viewport ? g_vpj_left_own_viewport
+                 : o.reads_stationary_layer ? g_vpj_left_stationary : g_vpj_left_rule_off).fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         bool after_resolve = false;
         bool want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, false);
         // A pipeline with the test off writes no depth, whatever its write mask says.
@@ -5710,8 +5843,11 @@ void vpj_before_draw_body(GL* l, uint64_t vertices, int* coarse_set)
         // draws a frame, changed no frame rate, and Cort's picture broke. Removed.)
         if (coarse_ever) coarse_decide(*ls, want ? coarse_rate : 0, coarse_set);
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
+        if (overlay && !want) { g_vpj_left_total.fetch_add(1, std::memory_order_relaxed); g_vpj_left_after_handover.fetch_add(1, std::memory_order_relaxed); }
+        if (sample) vpj_note_still_layer_locked(*ls, sample, sel_depth, want); // VARIANT: jitter/stationary-source-readers
         if (want) {
             if (still_mesh) g_vpj_still_moved.fetch_add(1, std::memory_order_relaxed);
+            if (overlay) g_vpj_overlay_moved.fetch_add(1, std::memory_order_relaxed);
             if (pc && pc->depth_enable == 1) vpj_note_depth_layer_locked(*ls, sample, sel_depth);
             const bool first_pin = !ls->vpj_scene;
             if (first_pin) g_vpj_recordings.fetch_add(1, std::memory_order_release);
@@ -5953,13 +6089,14 @@ void so_worker()
         }
     }
 }
-// Called from the pipeline-creation hook for every graphics pipeline: keeps a creation copy of the
-// ones a scene draw could replay (no hull/domain/geometry stage, no stream output of its own).
-void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d)
+// Called from the pipeline-creation hooks for every graphics pipeline (description and stream): keeps a
+// creation copy of the ones a scene draw could replay (no hull/domain/geometry stage, no stream output of
+// its own), by the same depth rule as the per-draw gate (core/replay_depth.hpp), from the same facts.
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const na_ev_pipeline_created& facts)
 {
     if (t_host_work || !pso || !d.pRootSignature || !d.VS.pShaderBytecode || d.HS.pShaderBytecode || d.DS.pShaderBytecode ||
-        d.GS.pShaderBytecode || d.StreamOutput.NumEntries || !d.DepthStencilState.DepthEnable ||
-        d.DepthStencilState.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ALL ||
+        d.GS.pShaderBytecode || d.StreamOutput.NumEntries ||
+        na::replay::DepthUseOf(facts.depth_enable == 1, facts.depth_write == 1, facts.blend_enable_mask != 0, facts.depth_func) == na::replay::DepthUse::No ||
         d.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return;
     auto e = std::make_shared<SoEntry>();
     e->recipe = recipe_of(dev, d);
@@ -6076,12 +6213,10 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
         // Opaque geometry whose depth is already in the scene depth also qualifies: engines with a
         // depth pre-pass draw their G-buffer pass with depth writes off and an EQUAL / LESS_EQUAL
         // (GREATER_EQUAL when reversed) test. Blended or other-test draws stay out.
-        const bool depth_written = pc->depth_enable == 1 && pc->depth_write == 1;
-        const bool depth_matched = pc->depth_enable == 1 && pc->depth_write == 0 && pc->blend_enable_mask == 0 &&
-                                   (pc->depth_func == D3D12_COMPARISON_FUNC_EQUAL || pc->depth_func == D3D12_COMPARISON_FUNC_LESS_EQUAL ||
-                                    pc->depth_func == D3D12_COMPARISON_FUNC_GREATER_EQUAL);
-        if (!depth_written && !depth_matched) { rp_gate(kGateNoDepthWrite); return; }
-        if (depth_matched) rp_gate(kGateDepthMatched);
+        // The same rule as the recipe kept at creation (core/replay_depth.hpp), from the same facts.
+        const auto depth_use = na::replay::DepthUseOf(pc->depth_enable == 1, pc->depth_write == 1, pc->blend_enable_mask != 0, pc->depth_func);
+        if (depth_use == na::replay::DepthUse::No) { rp_gate(kGateNoDepthWrite); return; }
+        if (depth_use == na::replay::DepthUse::Matched) rp_gate(kGateDepthMatched);
         if (pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS]) { rp_count(kRpStages); return; }
         if (!ls->raster_topology_known || ls->raster_topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) { rp_count(kRpTopology); return; }
         if (pc->sample_count != 1) { rp_gate(kGateMsaa); return; }
@@ -8890,6 +9025,27 @@ bool ListLastStateSub(ID3D12CommandList* list, na_object_id id, uint32_t sub, ui
 {
     return ListStateSub(list, id, sub, state) == StateLookup::Known;
 }
+bool ListInRenderPass(ID3D12CommandList* list)
+{
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls) return true;
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    return ls->in_render_pass;
+}
+bool ListStateFlags(ID3D12CommandList* list, bool* observed, bool* coverage, bool* evidence)
+{
+    std::shared_lock<RegistryLock> rl(g_m);
+    na_object_id lid = 0;
+    ListState* ls = list ? list_state_locked(list, &lid) : nullptr;
+    if (!ls) return false;
+    if (observed) *observed = ls->recording_observed.load();
+    if (coverage) *coverage = ls->coverage_complete.load();
+    std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (evidence) *evidence = ls->evidence_complete;
+    return true;
+}
 bool ListLastState(ID3D12CommandList* list, na_object_id id, uint32_t* state)
 {
     std::shared_lock<RegistryLock> rl(g_m);
@@ -9815,6 +9971,41 @@ void SubmitResolvedRaster(const ResolvedRaster& raster)
     std::unique_lock<RegistryLock> lock(g_m);
     if (g_vpj.load(std::memory_order_acquire) == raster.sample) g_vpj_submitted = raster;
 }
+void SetSceneOverlayJitter(bool on, const char* why)
+{
+    if (g_vpj_overlays.exchange(on, std::memory_order_relaxed) != on)
+        na::eventlog::Emit("jitter_variant", "api=dx12 variant=%s why=\"%s\"", on ? "jitter/scene-overlays" : "jitter/depth-tested-only", why ? why : "");
+}
+bool SceneOverlayJitter() { return g_vpj_overlays.load(std::memory_order_relaxed); }
+uint64_t UnjitteredSceneMeshes() { return g_vpj_left_total.load(std::memory_order_relaxed); }
+void LeftByClass(uint64_t (&out)[na::referee::kLeftClasses])
+{
+    using L = na::referee::LeftClass;
+    uint64_t now[na::referee::kLeftClasses] = {};
+    now[unsigned(L::OtherTarget)] = g_vpj_left_other_target.load(std::memory_order_relaxed);
+    now[unsigned(L::OwnViewport)] = g_vpj_left_own_viewport.load(std::memory_order_relaxed);
+    now[unsigned(L::RuleOff)] = g_vpj_left_rule_off.load(std::memory_order_relaxed);
+    now[unsigned(L::StationarySource)] = g_vpj_left_stationary.load(std::memory_order_relaxed);
+    for (unsigned c = 0; c < na::referee::kLeftClasses; ++c) {
+        out[c] = now[c] >= g_cov_last_left[c] ? now[c] - g_cov_last_left[c] : 0;
+        g_cov_last_left[c] = now[c];
+    }
+}
+void SetCoverage(uint32_t mask, int trial, uint64_t decisions, int last_class, bool last_kept)
+{
+    g_cov_mask.store(mask, std::memory_order_release);
+    g_cov_trial.store(trial, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_cov_m);
+    if (decisions == g_cov_decisions) return;
+    g_cov_decisions = decisions;
+    if (!last_kept && last_class >= 0) g_cov_still_sigs.insert(g_cov_trial_sigs.begin(), g_cov_trial_sigs.end());
+    na::eventlog::Emit("dx12_coverage", "decision=%llu class=%s %s signatures=%zu still_signatures=%zu moved_draws=%llu left_by_signature=%llu",
+                       static_cast<unsigned long long>(decisions), na::referee::LeftClassName(unsigned(last_class)),
+                       last_kept ? "kept" : "put_back", g_cov_trial_sigs.size(), g_cov_still_sigs.size(),
+                       static_cast<unsigned long long>(g_cov_moved.load()), static_cast<unsigned long long>(g_cov_kept_still.load()));
+    g_cov_trial_sigs.clear();
+}
+uint64_t CoverageMovedDraws() { return g_cov_moved.load(std::memory_order_relaxed); }
 void SetStillMeshJitter(bool asked)
 {
     if (g_vpj_still_meshes.exchange(asked, std::memory_order_relaxed) != asked && asked)
@@ -10088,7 +10279,11 @@ ViewportJitterStats GetViewportJitterStats()
              g_vpj_shader_depth_refused[3].load(std::memory_order_relaxed), g_vpj_shader_depth_refused[4].load(std::memory_order_relaxed),
              g_vpj_shader_depth_refused[5].load(std::memory_order_relaxed)},
             g_vpj_still_moved.load(std::memory_order_relaxed), g_vpj_still_asks.load(std::memory_order_relaxed),
-            g_vpj_still_meshes.load(std::memory_order_relaxed)};
+            g_vpj_still_meshes.load(std::memory_order_relaxed),
+            g_vpj_overlays.load(std::memory_order_relaxed), g_vpj_overlay_moved.load(std::memory_order_relaxed),
+            {g_vpj_left_other_target.load(std::memory_order_relaxed), g_vpj_left_own_viewport.load(std::memory_order_relaxed),
+             g_vpj_left_rule_off.load(std::memory_order_relaxed), g_vpj_left_after_handover.load(std::memory_order_relaxed),
+             g_vpj_left_stationary.load(std::memory_order_relaxed)}};
 }
 uint64_t LiveSelectionVersion()
 {

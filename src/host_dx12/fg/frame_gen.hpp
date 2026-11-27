@@ -24,6 +24,7 @@
 #include <d3d12.h>
 #include <dxgiformat.h>
 
+#include <cstddef>
 #include <cstdint>
 #include "host_dx12/fg/camera.hpp"
 
@@ -57,7 +58,24 @@ struct EvalInputs {
     uint32_t reset = 0;
     uint32_t depth_inverted = 0;
     uint32_t mv_jittered = 0;
+    // Route B (DLSS added by NeuralAlias): no game camera exists. The motion is our own measured
+    // screen motion, so the runtime gets the all-zero camera that was proven offline
+    // (fg_capture_replay "zero", 2026-11-25) instead of being refused for having none.
+    bool camera_free = false;
+    // Why `reset` is set (counted for the results log): 1 our confirmed scene cut, 2 any other
+    // DLSS history restart (resize, mode change, first frame of a pair, resume).
+    uint32_t reset_reason = 0;
 };
+// Route B: where the package keeps NVIDIA's Frame Generation file (read-only; nothing is copied).
+// Used for the plain-words reason when the runtime is missing or too old.
+void SetRuntimeFolder(const wchar_t* folder);
+// What the menu can say before Frame Generation is switched on: false + reason when it cannot run
+// here (file missing or too old, GPU or driver unsupported). Cheap; reads NVIDIA's capability record.
+bool Available(char* reason, size_t reason_size);
+// The nvngx_dlssg.dll that was loaded (after the feature was created) or found (before).
+struct RuntimeFile { char path[260]; char version[32]; bool loaded; };
+RuntimeFile GetRuntimeFile();
+constexpr uint32_t kNeededMajor = 310, kNeededMinor = 9; // driver-store 310.2.1 fails (Backbuffer extent)
 bool WantsInputs(); // enabled, runtime present, not latched
 void OnEvaluate(ID3D12GraphicsCommandList* list, const EvalInputs& in);
 // Publish recorded inputs only after their actual queue submission. Nested
@@ -81,6 +99,15 @@ struct FrameInfo {
     // NOT be shown this frame (its own full-screen-menu detection). The
     // presenter reads it back and shows the real frame only.
     ID3D12Resource* disable_flag = nullptr;
+    // Optional: the finished frame WITHOUT the HUD (back-buffer format and size,
+    // NON_PIXEL_SHADER_RESOURCE). Given, the runtime is told it has HUD-less colour;
+    // the feature is created again when this choice changes. Null = as before.
+    ID3D12Resource* hudless = nullptr;
+    // Optional, with hudless: the HUD for NVIDIA's own UI recomposition (UserInterfaceRecompositionEnabled=1).
+    // ui: four channels, colour pre-multiplied by alpha (backbuffer = ui + (1 - alpha) * hudless);
+    // ui_alpha: one channel, 0..1. Either is enough. Both NON_PIXEL_SHADER_RESOURCE, back-buffer size.
+    ID3D12Resource* ui = nullptr;
+    ID3D12Resource* ui_alpha = nullptr;
 };
 
 // Records the generated frames for `f` on `list` (open, ours, executed by
@@ -114,10 +141,18 @@ struct Stats {
     uint64_t real_frames;       // real frames offered to Generate
     uint64_t skipped;           // real frames with no generation (no fresh inputs, starting, ...)
     uint64_t inputs_recorded, inputs_submitted, inputs_overwritten, missing_inputs;
+    uint64_t resets_cut, resets_other; // runtime resets: our confirmed scene cut / any other history restart
     float target_fps;           // what dynamic mode aims for
     char reason[112];
 };
 Stats GetStats();
+// Route B (camera_free), after a Generate that returned > 0: the motion Frame Generation used, for the
+// still-area steadying on the same list. `filled` = the motion with "nothing known" (exactly zero) vectors
+// filled from neighbours, without the dead zone (NON_PIXEL_SHADER_RESOURCE, render size, value * mv_scale =
+// render pixels). `reset`: the runtime was told to restart its history for this frame. Null `filled` when
+// the last Generate did not use prepared motion (Route A, or the format has no typed UAV stores).
+struct UsedMotion { ID3D12Resource* filled; float mv_scale_x, mv_scale_y; uint32_t reset; uint64_t frame_id; };
+UsedMotion LastUsedMotion(); // call on the presenter's thread right after Generate (same lock order)
 void ResetLatch();
 void Shutdown(); // releases the feature and resources (game exit / tests)
 // A73: the presenter is not offering frames right now for a reason of its

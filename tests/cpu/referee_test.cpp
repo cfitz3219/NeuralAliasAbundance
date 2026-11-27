@@ -1211,7 +1211,7 @@ void TestLaunchMemory()
         check(again.Decode(text, game, "runtime-new") == Memory::Load::Stale && again.Empty(),
               "memory: a changed runtime discards the record");
         auto newer = text;
-        newer.replace(newer.find(" 1\n"), 3, " 2\n");
+        newer.replace(newer.find(" 2\n"), 3, " 3\n");
         check(again.Decode(newer, game, runtime) == Memory::Load::Stale && again.Empty(), "memory: another schema is not read");
         check(again.Decode("", game, runtime) == Memory::Load::Missing &&
               again.Decode(text + "9 9 9 1 1 1 0\n", game, runtime) == Memory::Load::Invalid && again.Empty() &&
@@ -1220,6 +1220,18 @@ void TestLaunchMemory()
               again.Decode(std::string(9000, 'x'), game, runtime) == Memory::Load::Invalid && again.Empty(),
               "memory: missing, out-of-range, repeated, truncated or oversized records leave no hints");
         check(m.Encode("has space", runtime).empty() && m.Encode(game, "").empty(), "memory: identities must be plain tokens");
+        {   // VARIANT: referee/coverage-trial rows ("c"): read back; a class put back and never kept is tried after the others.
+            Memory c = m;
+            check(c.NoteCoverage(false, unsigned(LeftClass::OtherTarget), false) && c.NoteCoverage(false, unsigned(LeftClass::OwnViewport), true) &&
+                  c.NoteCoverage(true, unsigned(LeftClass::StationarySource), false) && !c.NoteCoverage(true, kLeftClasses, true),
+                  "memory: coverage classes are noted per API");
+            Memory back;
+            check(back.Decode(c.Encode(game, runtime), game, runtime) == Memory::Load::Loaded &&
+                  back.CoverageAvoided(false) == (1u << unsigned(LeftClass::OtherTarget)) &&
+                  back.CoverageAvoided(true) == (1u << unsigned(LeftClass::StationarySource)) &&
+                  back.Preferred(true, S::Input) == Bit(T::AmbientHistory),
+                  "memory: coverage rows are read back beside the stage rows");
+        }
     }
     // The chooser. Flicker first measured at the input stage with both input
     // controls available; only the hints differ.
@@ -1518,6 +1530,8 @@ int main()
     TestStageRecovery();
     TestRotatingRoles();
     {
+        // VARIANT: referee/no-strength-reduction: repeated vibration never weakens the jitter. With scene meshes
+        // left off the jitter, those meshes take the sample; otherwise the coverage trial is asked for.
         JitterTrial jitter;
         JitterTrial::Measurement edge;
         edge.at = {64, 32};
@@ -1525,64 +1539,23 @@ int main()
         edge.shift = .29f;
         edge.reconstructed = .02f;
         jitter.Observe(edge, normal_jitter, 100);
-        check(jitter.Amount() == normal_jitter, "a camera pan without phase-locked displacement cannot change jitter");
+        check(jitter.Amount() == normal_jitter && jitter.Current() == JitterTrial::Phase::Observe,
+              "a camera pan without phase-locked displacement starts nothing");
         edge.locked = true;
         jitter.Observe(edge, normal_jitter, 200);
-        check(jitter.Amount() == normal_jitter, "a single window at a displayed edge cannot change jitter");
+        check(jitter.Current() == JitterTrial::Phase::Confirm && jitter.Amount() == normal_jitter,
+              "a single window at a displayed edge only asks for confirmation");
         jitter.Observe(edge, normal_jitter, 250);
-        check(jitter.Amount() == reduced_jitter, "the repeated displayed edge starts a reduced-jitter trial");
-        auto replacement = edge;
-        replacement.shift = .13f;
-        replacement.image.fill(.4f);
-        jitter.Observe(replacement, reduced_jitter, 300);
-        check(jitter.Current() == JitterTrial::Phase::Reduce, "unrelated views cannot qualify the same trial");
-        replacement.image = edge.image;
-        jitter.Observe(replacement, reduced_jitter, 400);
-        check(jitter.Current() == JitterTrial::Phase::Recheck && jitter.Amount() == normal_jitter,
-              "a stable sharp edge triggers an ordinary-jitter recheck");
-        jitter.Observe(edge, normal_jitter, 500);
-        check(jitter.Current() == JitterTrial::Phase::Keep && jitter.Amount() == reduced_jitter,
-              "recurring vibration confirms the jitter change");
-        jitter.Bypassed(600);
-        check(jitter.Current() == JitterTrial::Phase::Cooldown && jitter.Amount() == normal_jitter,
-              "proof of visible bypass restores the ordinary sample");
-        JitterTrial blur;
-        blur.Observe(edge, normal_jitter, 100);
-        blur.Observe(edge, normal_jitter, 150);
-        replacement.detail = .11f;
-        blur.Observe(replacement, reduced_jitter, 200);
-        blur.Observe(replacement, reduced_jitter, 300);
-        check(blur.Current() == JitterTrial::Phase::Cooldown, "reduced wobble cannot compensate for blur");
-        JitterTrial::Measurement localized = edge;
-        localized.field = true;
-        localized.witnesses = {{3,.29f,.2f},{15,.32f,.2f}};
-        localized.controls.output = 7;
-        for (unsigned i=0;i<3;++i) {
-            localized.controls.at[i] = {int(80*i),160};
-            localized.controls.detail[i]=.3f;
-        }
-        for (bool other_edge_worsens : {false,true}) {
-            JitterTrial guard;
-            guard.Observe(localized,normal_jitter,100);
-            check(guard.Current() == JitterTrial::Phase::Confirm && guard.Amount() == normal_jitter,
-                  "a single mixed-raster window keeps the original jitter");
-            guard.Observe(localized,normal_jitter,200);
-            check(guard.Amount() == reduced_jitter, "a repeated mixed-raster defect can start a comparison");
-            auto improved=localized;
-            improved.shift=.12f;
-            improved.regional_checks=improved.regional_improved=2;
-            if (other_edge_worsens) improved.regional_worse=1;
-            else improved.controls.detail[1]=.24f;
-            guard.Observe(improved,reduced_jitter,300);
-            guard.Observe(improved,reduced_jitter,400);
-            check(guard.Current()==JitterTrial::Phase::Cooldown && guard.Amount()==normal_jitter,
-                  "a steadier target cannot excuse a worsening edge or a softer control elsewhere");
-            guard.Tick(31000);
-            for (auto& pixel : localized.image) pixel += .23f;
-            guard.Observe(localized,normal_jitter,31100);
-            check(guard.Current() == JitterTrial::Phase::Observe && guard.Amount() == normal_jitter,
-                  "a uniform lighting change does not retry a rejected adjustment on the same view");
-        }
+        check(jitter.Amount() == normal_jitter && jitter.ClassTrialWanted() && !jitter.MoveUnjittered(),
+              "the repeated displayed edge asks for the coverage trial and leaves the jitter at full strength");
+        jitter.ClassTrialTaken();
+        check(!jitter.ClassTrialWanted(), "the request is taken once");
+        JitterTrial meshes;
+        meshes.NoteUnjittered(4);
+        meshes.Observe(edge, normal_jitter, 100);
+        meshes.Observe(edge, normal_jitter, 150);
+        check(meshes.MoveUnjittered() && !meshes.ClassTrialWanted() && meshes.Amount() == normal_jitter,
+              "with scene meshes left off the jitter, those meshes take the sample (strength unchanged)");
         check(VerifiedJitterAmount(50, .11f, .13f, .11f, .13f) == 50 &&
               VerifiedJitterAmount(50, .11f, .13f, 0.f, 0.f) == 0,
               "only the actual raster offset can qualify an amount");

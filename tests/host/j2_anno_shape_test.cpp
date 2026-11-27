@@ -315,6 +315,7 @@ int AnisoPixels(bool clamp,bool prewarm_only=false,bool mip_pixels=false,float n
 
 int main(int argc, char** argv)
 {
+    na::settings::Get().j2_fold_prewarm.store(0); // these checks count exactly one DLSS evaluation per frame
     setvbuf(stdout, nullptr, _IONBF, 0);
     // Counter-delta tests below measure demand compilation only. The separate
     // --mip-prewarm case enables and verifies background compilation explicitly.

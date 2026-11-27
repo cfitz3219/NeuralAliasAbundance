@@ -116,6 +116,67 @@ using FrameFn = void (*)(ID3D12CommandQueue* queue, ID3D12Resource* finished_fra
 // never called by the worker, and `user` need only live until Present returns.
 using MenuFn = void (*)(IDXGISwapChain* sc, ID3D12CommandQueue* queue, ID3D12Resource* frame, void* user);
 
+// Route B live Frame Generation (2026-11-26). The chain is proxied from its creation (SetEnabled
+// before the game creates it) so Frame Generation can be switched on and off with no restart.
+// While it is Off the game's own thread presents each frame inline (one copy from the proxy, no
+// present thread); its GPU cost is measured every frame. Turning it on prepares the extra
+// textures on a background thread while Off stays on screen; the presenter thread takes over
+// once they exist, and hands back after the last queued picture when it is turned off again.
+// Frame Generation gets the HUD-free picture (HudFreeFn) as its back buffer, and the newer real
+// frame's HUD is pasted onto each generated picture (T2). Without a HUD-free picture for a frame,
+// that frame shows no generated picture (never a warped HUD).
+void SetLiveFrameGeneration(bool on);
+bool LiveFrameGeneration();
+// The HUD-free picture of the frame now being presented: back-buffer size and format; null with `why`
+// (plain words) when there is none for this frame. `state` receives its resting state (DX12: the game's
+// recording leaves it in RENDER_TARGET; DX11 proxy: a shared image, COMMON).
+using HudFreeFn = ID3D12Resource* (*)(const char** why, D3D12_RESOURCE_STATES* state);
+void SetHudFreeProvider(HudFreeFn fn);
+// The HUD sheet was learned again (live DLAA): the still-area steadying drops its pair of frames.
+void NoteHudRelearn();
+// F8 with x2 on: the pictures actually presented next are saved, `triples` generated pictures with the
+// real frames before and after each (previous-real / generated / next-real), with frame ids and present
+// results, to LocalAppData\NeuralAlias\captures\fgout-<time>-<exe>-p<pid>. The pictures are read
+// back only during the burst. false + why (plain words) when it cannot start now.
+bool RequestOutputCapture(uint32_t triples, char* why, size_t why_size);
+struct LiveStats {
+    uint32_t live = 0, ready = 0, preparing = 0, inline_owner = 1;
+    uint64_t frames_inline = 0, frames_worker = 0;
+    uint64_t skipped_no_hudfree = 0, skipped_menu = 0, skipped_preparing = 0, skipped_veto = 0;
+    // GPU milliseconds, last and smoothed: Off path copy; x2 path: real-frame copy, HUD-free copy,
+    // Frame Generation evaluate, HUD paste.
+    float off_ms = 0, off_avg = 0, copy_ms = 0, copy_avg = 0, hudcopy_ms = 0, hudcopy_avg = 0;
+    float eval_ms = 0, eval_avg = 0, paste_ms = 0, paste_avg = 0;
+    uint64_t vram_budget_mb = 0, vram_usage_mb = 0, extra_mb = 0;
+    char prepare[112] = "";
+    char hudfree_why[112] = "";
+    // Still-area steadying (fg/steady_pass.hpp, Astra): the setting, frames corrected, the share of the
+    // picture it changed on those frames (percent, counted on the GPU), its GPU time, frames with x2 and
+    // the setting Off, and why a frame pair was not used (the unmodified picture was shown then).
+    uint32_t steady_on = 1, steady_ready = 0;
+    uint64_t steady_frames = 0, steady_off_frames = 0;
+    float steady_share = 0, steady_ms = 0, steady_avg = 0;
+    uint64_t steady_drop_gap = 0, steady_drop_reset = 0, steady_drop_motion = 0, steady_drop_relearn = 0, steady_drop_resize = 0, steady_drop_refused = 0;
+    // hudpaste/moves-with-scene (fg/hud_move.hpp): frames classified, generated pictures placed, interface tiles and
+    // pixels of each class (summed over frames), mean placement shift, frames pasted the T2 way and why.
+    uint32_t move_on = 1, move_ready = 0;
+    uint64_t move_frames = 0, move_pictures = 0, move_tiles_moving = 0, move_tiles_fixed = 0, move_pixels_moving = 0, move_pixels_fixed = 0;
+    float move_shift_px = 0;
+    uint64_t move_fb_pair = 0, move_fb_reset = 0, move_fb_motion = 0, move_fb_off = 0, move_fb_size = 0;
+    char steady_why[112] = "";
+    // Display: the refresh rate Windows reports now, the display's maximum (x2's ceiling), whether
+    // dynamic refresh is on, and frames shown without x2 because even the maximum is below the real rate.
+    float display_reported_hz = 0, display_max_hz = 0;
+    char display_dynamic[64] = "";
+    uint64_t skipped_display = 0;
+    // Presented-picture capture (F8 with x2 on): state in plain words.
+    char capture[220] = "";
+    // x2 chosen and no generated picture for more than a second: how long, and why in plain words.
+    uint32_t waiting_ms = 0;
+    char waiting[200] = "";
+};
+LiveStats GetLiveStats();
+
 struct PresentArgs {
     IDXGISwapChain* sc = nullptr;
     UINT sync = 0;

@@ -2,6 +2,7 @@
 #include "host_dx12/settings.hpp"
 #include "core/jitter_domain.hpp"
 #include "core/anisotropic_auto.hpp"
+#include "core/live_frame_gen.hpp"
 
 #include <shlobj.h>
 #include <windows.h>
@@ -39,6 +40,7 @@ uint64_t g_nr_write_sequence=0;
 std::atomic<bool> g_session_started{false},g_session_failed{false},g_safe_start{false};
 std::atomic<uint32_t> g_safe_overrides{0};
 uint32_t g_saved_switches[6]{};
+wchar_t g_fg_game[64]{}; // Route B: Frame Generation is remembered per game under [fg_games] <this key>
 bool g_safe_profile=false;
 wchar_t g_session_marker[MAX_PATH]{};
 const char* reason_text(uint32_t code){return code==2?"freeze":code==3?"crash":code?"unclean":"none";}
@@ -192,6 +194,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_jitter_conv_final.store(jn > 3 ? 0 : jn);
         const int js = static_cast<int>(GetPrivateProfileIntW(L"j2", L"jitter_shift", 1, ini));
         target.j2_jitter_shift.store(js < 0 ? -1 : (js > 0 ? 1 : 0));
+        target.j2_restart_ramp.store((std::min)(64u, static_cast<uint32_t>(GetPrivateProfileIntW(L"j2", L"restart_ramp", 8, ini))));
         const int vj = static_cast<int>(GetPrivateProfileIntW(L"j2", L"viewport_jitter", 1, ini));
         target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
         target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);
@@ -220,6 +223,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
     int reflex = static_cast<int>(GetPrivateProfileIntW(L"latency", L"reflex", 1, ini));
     target.reflex_mode.store(reflex >= 0 && reflex <= 2 ? reflex : 1);
     target.fg_enabled.store(GetPrivateProfileIntW(L"fg", L"enabled", 0, ini) ? 1u : 0u);
+    target.fg_hud_move.store(GetPrivateProfileIntW(L"fg", L"hud_move", 1, ini) ? 1u : 0u);
     const UINT fg_preset = GetPrivateProfileIntW(L"fg", L"preset", 1, ini);
     target.fg_preset.store(fg_preset >= 1 && fg_preset <= 3 ? fg_preset : 1u);
     target.fg_mode.store(GetPrivateProfileIntW(L"fg", L"mode", 1, ini) ? 1u : 0u);
@@ -316,6 +320,34 @@ const wchar_t* UserIniPath()
     resolve_user_ini();
     return g_ini_user;
 }
+
+void BindFrameGenerationToGame(const wchar_t* game)
+{
+    wchar_t key[64]{};
+    for (size_t i = 0, k = 0; game && game[i] && k + 1 < 64; ++i) {
+        const wchar_t c = game[i];
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'_' || c == L'-') key[k++] = c;
+    }
+    wcsncpy_s(g_fg_game, key, _TRUNCATE);
+    if (!key[0]) return;
+    resolve_user_ini();
+    const uint32_t stored = g_ini_user[0] ? GetPrivateProfileIntW(L"fg_games", key, 0, g_ini_user) : 0u;
+    const uint32_t generated = na::fglive::GeneratedFromStored(stored);
+    g_settings.fg_mode.store(0);                 // Fixed: exactly the chosen count
+    g_settings.fg_multiplier.store(generated + 1 < 2 ? 2 : generated + 1);
+    g_settings.fg_target_fps.store(0);
+    if (g_safe_overrides.load() & (1u << 3)) {  // started safe after a crash: off, the choice is kept
+        g_saved_switches[3] = generated ? 1u : 0u;
+        g_settings.fg_enabled.store(0);
+    } else {
+        g_settings.fg_enabled.store(generated ? 1u : 0u);
+    }
+    g_loaded_values.fg_enabled.store(g_settings.fg_enabled.load());
+    g_loaded_values.fg_mode.store(0);
+    g_loaded_values.fg_multiplier.store(g_settings.fg_multiplier.load());
+    g_settings.fg_steady.store(g_ini_user[0] ? (GetPrivateProfileIntW(L"fg_steady_games", key, 1, g_ini_user) ? 1u : 0u) : 1u);
+}
+const wchar_t* FrameGenerationGameKey() { return g_fg_game; }
 
 void Load()
 {
@@ -472,13 +504,23 @@ bool SaveFromWorker()
     }
     swprintf_s(v, L"%d", static_cast<int32_t>(PersistedSwitch(4,static_cast<uint32_t>(g_settings.reflex_mode.load()))));
     ok &= WritePrivateProfileStringW(L"latency", L"reflex", v, ini) != 0;
-    struct { const wchar_t* key; uint32_t value; } fg[] = {
-        {L"enabled", PersistedSwitch(3,g_settings.fg_enabled.load())}, {L"mode", g_settings.fg_mode.load()}, {L"preset", g_settings.fg_preset.load()},
-        {L"multiplier", g_settings.fg_multiplier.load()}, {L"target_fps", g_settings.fg_target_fps.load()},
-        {L"frozen_at", g_settings.fg_frozen_at.load()}};
-    for (const auto& kv : fg) {
-        swprintf_s(v, L"%u", kv.value);
-        ok &= WritePrivateProfileStringW(L"fg", kv.key, v, ini) != 0;
+    if (g_fg_game[0]) {
+        // Route B: this game's own Frame Generation choice, as the shown multiplier (0 = Off). The
+        // shared [fg] keys belong to other games and stay as they are.
+        const uint32_t on = PersistedSwitch(3, g_settings.fg_enabled.load());
+        swprintf_s(v, L"%u", na::fglive::StoredFromGenerated(on ? g_settings.fg_multiplier.load() - 1 : 0));
+        ok &= WritePrivateProfileStringW(L"fg_games", g_fg_game, v, ini) != 0;
+        swprintf_s(v, L"%u", g_settings.fg_steady.load() ? 1u : 0u);
+        ok &= WritePrivateProfileStringW(L"fg_steady_games", g_fg_game, v, ini) != 0;
+    } else {
+        struct { const wchar_t* key; uint32_t value; } fg[] = {
+            {L"enabled", PersistedSwitch(3,g_settings.fg_enabled.load())}, {L"mode", g_settings.fg_mode.load()}, {L"preset", g_settings.fg_preset.load()},
+            {L"multiplier", g_settings.fg_multiplier.load()}, {L"target_fps", g_settings.fg_target_fps.load()},
+            {L"frozen_at", g_settings.fg_frozen_at.load()}};
+        for (const auto& kv : fg) {
+            swprintf_s(v, L"%u", kv.value);
+            ok &= WritePrivateProfileStringW(L"fg", kv.key, v, ini) != 0;
+        }
     }
     swprintf_s(v, L"%u", g_settings.native_fg_mode.load());
     ok &= WritePrivateProfileStringW(L"native_fg", L"mode", v, ini) != 0;

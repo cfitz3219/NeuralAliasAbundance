@@ -176,9 +176,9 @@ target_link_libraries(host_observe_producers PUBLIC abundance_options host_obser
 # Plan B1 (native DX11 route): D3D11 input provider. Isolated and inactive:
 # nothing installs it until Astra's B2 handoff lands; built so CI compiles it.
 add_library(host_native11 STATIC src/host_dx12/native11/provider.cpp src/host_dx12/native11/samplers.cpp
-            src/host_dx12/native11/textures.cpp src/host_dx12/native11/texture_loader.cpp src/host_dx12/native11/depth_reads.cpp
+            src/host_dx12/native11/textures.cpp src/host_dx12/native11/proxy_views.cpp src/host_dx12/native11/hud_free.cpp src/host_dx12/native11/coarse11.cpp src/host_dx12/native11/texture_loader.cpp src/host_dx12/native11/depth_reads.cpp
             src/host_dx12/native11/draw_replay.cpp)
-target_link_libraries(host_native11 PUBLIC abundance_options host_hooking d3d11 dxgi PRIVATE d3dcompiler)
+target_link_libraries(host_native11 PUBLIC abundance_options host_hooking host_native_d3d11_shared d3d11 dxgi PRIVATE d3dcompiler nvapi_headers)
 
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
 target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole32)
@@ -233,6 +233,10 @@ add_library(host_dx12 STATIC
   src/host_dx12/overlay/freeze_watchdog.cpp
   src/host_dx12/fg/camera.cpp
   src/host_dx12/fg/frame_gen.cpp
+  src/host_dx12/fg/hud_paste.cpp
+  src/host_dx12/fg/hud_move.cpp
+  src/host_dx12/fg/steady_pass.cpp
+  src/host_dx12/fg/motion_prep.cpp
   src/host_dx12/fg/preset_profile.cpp
   src/host_dx12/nr/nr_pass.cpp
   src/host_dx12/nr/fg_composition.cpp
@@ -241,6 +245,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/nr/native_fg.cpp
   src/host_dx12/nr/fg_states.cpp
   src/host_dx12/j2/live_dlaa.cpp
+  src/host_dx12/fold/fold_pass.cpp
   src/host_dx12/effects/donut.cpp
   src/host_dx12/effects/donut_native.cpp
   src/host_dx12/effects/xegtao.cpp

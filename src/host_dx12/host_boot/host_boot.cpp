@@ -19,6 +19,7 @@
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
+#include "host_dx12/native11/hud_free.hpp"
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/native_present/size_spoof.hpp"
 #include "host_dx12/j2/projection_window.hpp"
@@ -45,6 +46,7 @@
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/overlay/route_a_panel.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -353,6 +355,59 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
+    // Route B live Frame Generation ([fg] live=1, 2026-11-26). The presenter serves the swap chain
+    // from its creation so Off / x2 switches live with no restart (Off presents inline on the
+    // game's thread); NVIDIA's file is read from [fg] search_path (read-only, never copied).
+    if (GetPrivateProfileIntW(L"fg", L"live", 0, g_ini) == 1) {
+        const char* refused = nullptr;
+        if (route_a) refused = "this game runs DLSS itself (Route A)";
+        else if (!na::j2::Configured()) refused = "NeuralAlias's own DLSS is not configured ([j2] enabled=1 and [observe] producers=1 needed)";
+        else if (small_asked || scene_asked) refused = "render-small uses the presenter for scaling";
+        if (refused) {
+            char line[200];
+            snprintf(line, sizeof line, "live frame generation: requested but OFF (%s)", refused);
+            boot_log(line);
+        } else {
+            wchar_t folder[MAX_PATH] = {};
+            GetPrivateProfileStringW(L"fg", L"search_path", L"", folder, MAX_PATH, g_ini);
+            na::dlss::SetOwnSearchFolder(folder);
+            na::fg::SetRuntimeFolder(folder);
+            na::dlss::SetOwnAttachedListener([](const na::dlss::Api& api) {
+                na::fg::Runtime fr;
+                fr.create_feature = api.create_feature;
+                fr.evaluate_feature = api.evaluate_feature;
+                fr.release_feature = api.release_feature;
+                fr.allocate_parameters = api.allocate_parameters;
+                fr.destroy_parameters = api.destroy_parameters;
+                fr.get_capability_parameters = api.get_capability_parameters;
+                na::fg::SetRuntime(fr);
+            });
+            wchar_t exe[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            const wchar_t* base = wcsrchr(exe, L'\\');
+            base = base ? base + 1 : exe;
+            wchar_t key[64] = {};
+            wcsncpy_s(key, base, _TRUNCATE);
+            if (wchar_t* dot = wcsrchr(key, L'.')) *dot = 0;
+            na::settings::BindFrameGenerationToGame(key);
+            na::present::SetEnabled(true);
+            na::present::SetLiveFrameGeneration(true);
+            // One presenter for both APIs: the HUD-free picture comes from the DX12 scene path (left in
+            // RENDER_TARGET by the game's recording) or, on a DX11 proxy chain, from native11/hud_free
+            // (a shared image, COMMON at rest).
+            na::present::SetHudFreeProvider([](const char** why, D3D12_RESOURCE_STATES* state) -> ID3D12Resource* {
+                if (na::on12::NativeRoute()) { if (state) *state = D3D12_RESOURCE_STATE_COMMON; return na::native11::hud_free::EffectsPicture(why); }
+                if (state) *state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                return na::j2::LiveHudFree(why);
+            });
+            na::j2::SetLiveFrameGeneration(true);
+            char line[400], folder8[MAX_PATH] = {};
+            WideCharToMultiByte(CP_UTF8, 0, folder, -1, folder8, sizeof folder8, nullptr, nullptr);
+            snprintf(line, sizeof line, "live frame generation: ON (presenter from swap-chain creation; choice remembered for this game: %s; NVIDIA file folder: %s)",
+                     na::settings::Get().fg_enabled.load() ? "x2" : "Off", folder8[0] ? folder8 : "(none given)");
+            boot_log(line);
+        }
+    }
     na::capture::j2::SetFlatMapLightingTest(GetPrivateProfileIntW(L"diagnostics", L"flat_map_lighting_test", 0, g_ini) == 1);
     na::j2::EnableCameraInputDiagnostic(GetPrivateProfileIntW(L"diagnostics", L"camera_inputs", 0, g_ini) == 1);
     {const bool profile=GetPrivateProfileIntW(L"observe",L"profile_hooks",0,g_ini)==1;

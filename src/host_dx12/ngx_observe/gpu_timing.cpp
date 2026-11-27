@@ -41,6 +41,7 @@ namespace na::gputime {
 namespace {
 
 constexpr uint32_t kSlots = 16;
+constexpr uint32_t kChannels = 4; // 0 DLSS evaluate, 1 HUD sheet grab, 2 HUD-free redraw (live Frame Generation)
 constexpr uint64_t kAbandonPresents = 240; // ~4 s at 60 fps without completion
 
 enum class SlotState : uint8_t { Free, Begun, Armed, Submitted, Quarantined };
@@ -48,6 +49,7 @@ enum class SlotState : uint8_t { Free, Begun, Armed, Submitted, Quarantined };
 struct Slot {
     ComPtr<ID3D12Resource> readback;           // 16 bytes: begin/end stamps
     SlotState state = SlotState::Free;
+    uint32_t channel = 0;
     ID3D12GraphicsCommandList* list = nullptr; // identity while Begun; never dereferenced after End
     ID3D12CommandList* last_list = nullptr;    // identity of the list carrying this slot's resolve (until completion)
     ComPtr<ID3D12Fence> fence;                // independent timeline: other queues cannot certify this slot
@@ -64,8 +66,8 @@ Slot g_slots[kSlots];
 uint64_t g_present_counter = 0;
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_failed{false};
-std::atomic<float> g_last{0.0f}, g_avg{0.0f};
-std::atomic<uint64_t> g_samples{0};
+std::atomic<float> g_last[kChannels]{}, g_avg[kChannels]{};
+std::atomic<uint64_t> g_samples[kChannels]{};
 std::atomic<uint64_t> g_skipped_busy{0}, g_unsupported{0}, g_quarantined{0};
 std::atomic<bool> g_any_resolved{false}; // fast path: no slot has ever resolved -> OnExecuted is a no-op
 
@@ -101,10 +103,10 @@ bool ensure()
     return true;
 }
 
-int find_begun(ID3D12GraphicsCommandList* list)
+int find_begun(ID3D12GraphicsCommandList* list, uint32_t channel)
 {
     for (uint32_t i = 0; i < kSlots; ++i)
-        if (g_slots[i].state == SlotState::Begun && g_slots[i].list == list) return static_cast<int>(i);
+        if (g_slots[i].state == SlotState::Begun && g_slots[i].list == list && g_slots[i].channel == channel) return static_cast<int>(i);
     return -1;
 }
 
@@ -125,12 +127,13 @@ void SetDevice(ID3D12Device* device)
     if (!g_device && device) g_device = device;
 }
 
-void Begin(ID3D12GraphicsCommandList* list)
+void Begin(ID3D12GraphicsCommandList* list, uint32_t channel)
 {
     if (!g_enabled.load() || !list) return;
     std::lock_guard<std::mutex> lock(g_m);
     if (!ensure()) return;
-    if (find_begun(list) >= 0) return; // nested/duplicate Begin on the same list: keep the outer pair
+    if (channel >= kChannels) return;
+    if (find_begun(list, channel) >= 0) return; // nested/duplicate Begin on the same list: keep the outer pair
     const D3D12_COMMAND_LIST_TYPE type = list->GetType();
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) {
         g_unsupported.fetch_add(1);
@@ -140,6 +143,7 @@ void Begin(ID3D12GraphicsCommandList* list)
         Slot& s = g_slots[i];
         if (s.state != SlotState::Free) continue;
         s.state = SlotState::Begun;
+        s.channel = channel;
         s.list = list;
         list->EndQuery(g_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, i * 2);
         return;
@@ -147,12 +151,12 @@ void Begin(ID3D12GraphicsCommandList* list)
     g_skipped_busy.fetch_add(1); // every slot in flight or quarantined: skip, never stall
 }
 
-void End(ID3D12GraphicsCommandList* list)
+void End(ID3D12GraphicsCommandList* list, uint32_t channel)
 {
     if (!g_enabled.load() || !list) return;
     std::lock_guard<std::mutex> lock(g_m);
     if (!g_heap) return;
-    const int idx = find_begun(list);
+    const int idx = find_begun(list, channel);
     if (idx < 0) return;
     Slot& s = g_slots[idx];
     const uint32_t i = static_cast<uint32_t>(idx);
@@ -235,17 +239,19 @@ void Poll(ID3D12CommandQueue* /*queue*/)
         if (!mapped_ok || !freq || stamps[1] < stamps[0]) continue;
         const float ms = static_cast<float>(static_cast<double>(stamps[1] - stamps[0]) * 1000.0 /
                                             static_cast<double>(freq));
-        g_last.store(ms);
-        const float prev = g_avg.load();
-        g_avg.store(prev > 0 ? prev * 0.95f + ms * 0.05f : ms);
-        g_samples.fetch_add(1);
+        const uint32_t ch = s.channel < kChannels ? s.channel : 0;
+        g_last[ch].store(ms);
+        const float prev = g_avg[ch].load();
+        g_avg[ch].store(prev > 0 ? prev * 0.95f + ms * 0.05f : ms);
+        g_samples[ch].fetch_add(1);
     }
     if (quarantined == kSlots) g_failed.store(true);
 }
 
-Stats GetStats()
+Stats GetStats(uint32_t channel)
 {
-    return Stats{g_last.load(), g_avg.load(), g_samples.load(),
+    if (channel >= kChannels) channel = 0;
+    return Stats{g_last[channel].load(), g_avg[channel].load(), g_samples[channel].load(),
                  (g_enabled.load() && !g_failed.load()) ? 1u : 0u,
                  g_skipped_busy.load(), g_unsupported.load(), g_quarantined.load()};
 }

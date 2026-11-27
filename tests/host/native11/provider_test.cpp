@@ -37,7 +37,12 @@
 #include "host_dx12/host_boot/process_log.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/overlay/overlay.hpp"
+#include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/fg/frame_gen.hpp"
+#include "core/live_frame_gen.hpp"
 #include "host_dx12/settings.hpp"
+#include "core/fold_shading.hpp"
+#include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/textures.hpp"
@@ -53,12 +58,14 @@
 #include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -99,11 +106,25 @@ void gs_passthrough(triangle GsVertex input[3], inout TriangleStream<GsVertex> o
     [unroll] for (uint i = 0; i < 3; ++i) output.Append(input[i]);
 }
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
+// The names fixture's map: a textured map panned by offset.z pixels, with a unit at x = offset.w moving against the pan.
+float4 ps_map(float4 p : SV_Position) : SV_Target {
+    if (p.x >= offset.w && p.x < offset.w + 64.0 && p.y >= 600.0 && p.y < 640.0) return float4(0.7, 0.08, 0.06, 1.0);
+    float x = p.x + offset.z, y = p.y;
+    float v = 0.12 + 0.06 * sin(x * 0.21) * cos(y * 0.17) + 0.04 * sin((x + y) * 0.05);
+    if (fmod(abs(x * 0.7 + y * 0.3), 40.0) < 1.6) v += 0.1;
+    return float4(v * 0.9, v * 1.1, v * 0.8, 1.0);
+}
 float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_letterbox(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(0,2), 0)); }
 float4 ps_centered_scene(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(44,0), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
+// The fold fixture: shading that depends on the pixel (a constant colour is not counted as pixel shading
+// by the driver's statistics, and a pattern shows where blocks were shaded once).
+// Each invocation also counts itself (the driver's own statistics leave these draws out).
+RWByteAddressBuffer shading_count : register(u1);
+float4 ps_scene_coords(float4 p : SV_Position) : SV_Target { shading_count.InterlockedAdd(0, 1); return float4(frac(p.x / 16.0), frac(p.y / 16.0), 0.5, 1.0); }
+float4 ps_hud_coords(float4 p : SV_Position) : SV_Target { shading_count.InterlockedAdd(4, 1); return float4(frac(p.x / 8.0), 1, 1, 0.5); }
 float4 ps_screen_check(float4 p : SV_Position) : SV_Target { return float4(scene.Load(int3(int2(p.xy), 0)).rgb * 0.75, 1); }
 struct LitVertex { float4 p : SV_Position; float2 surface : TEXCOORD0; };
 LitVertex vs_reflection(uint id : SV_VertexID) {
@@ -155,6 +176,35 @@ float ps_depth_slab(float4 p : SV_Position) : SV_Target { return slab(uint2(p.xy
 void cs_depth_slab(uint3 id : SV_DispatchThreadID) {
     if (id.x < 320 && id.y < 180) mask_out[id.xy] = slab(id.xy);
 }
+// The overlay fixture (Hearts of Iron IV's frame shape, 2026-11-27): thin lines and small labels drawn into
+// the scene picture with the depth test off and the scene depth bound, over depth-tested terrain.
+cbuffer OverlayCb : register(b2) { float4 overlay_size; }; // the picture's width and height in pixels
+uint quad_corner(uint id) { const uint corner = id % 6; return corner < 3 ? corner : corner == 3 ? 2 : corner == 4 ? 1 : 3; }
+float4 vs_overlay_lines(uint id : SV_VertexID) : SV_Position {
+    const uint line_index = id / 6, c = quad_corner(id);
+    const float along = (c & 1) ? 1.0 : 0.0, across = (c & 2) ? 0.5 : -0.5;
+    const float angle = 0.30 + 0.093 * line_index;
+    const float2 dir = float2(cos(angle), sin(angle));
+    const float2 nrm = float2(-dir.y, dir.x) * 1.4 / overlay_size.xy; // 0.7 pixel wide
+    const float2 start = float2(-0.95 + 0.11 * line_index, -0.85);
+    return float4(start + dir * along * 1.9 + nrm * across * 2.0, 0.5, 1.0);
+}
+float4 vs_overlay_text(uint id : SV_VertexID) : SV_Position {
+    const uint glyph = id / 6, c = quad_corner(id);
+    const float2 cell = float2(glyph % 48, glyph / 48);
+    const float2 px = float2(64.3, 120.6) + cell * float2(5.0, 7.0) + float2((c & 1) ? 2.0 : 0.0, (c & 2) ? 3.0 : 0.0);
+    return float4(px.x / overlay_size.x * 2 - 1, 1 - px.y / overlay_size.y * 2, 0.5, 1.0);
+}
+// A panel drawn before the hand-over with a scissor smaller than the scene: small blocks, clipped by the scissor.
+float4 vs_overlay_panel(uint id : SV_VertexID) : SV_Position {
+    const uint block = id / 6, c = quad_corner(id);
+    const float2 cell = float2(block % 30, block / 30);
+    const float2 px = float2(1060.3, 20.6) + cell * float2(6.0, 6.0) + float2((c & 1) ? 4.0 : 0.0, (c & 2) ? 4.0 : 0.0);
+    return float4(px.x / overlay_size.x * 2 - 1, 1 - px.y / overlay_size.y * 2, 0.5, 1.0);
+}
+float4 ps_overlay_panel(float4 p : SV_Position) : SV_Target { return float4(0.0, 1.0, 0.0, 1.0); }
+float4 ps_overlay_line(float4 p : SV_Position) : SV_Target { return float4(1.0, 0.85, 0.2, 1.0); }
+float4 ps_overlay_text(float4 p : SV_Position) : SV_Target { return float4(0.95, 0.95, 0.95, 1.0); }
 SamplerState material : register(s0);
 float4 ps_mips(float4 p : SV_Position) : SV_Target {
     return scene.SampleGrad(material, float2(0.5, 0.5), float2(2.0/64.0,0), float2(0,2.0/64.0));
@@ -197,6 +247,23 @@ struct Game {
     UINT screen_extra_width = 0;
     bool padded_hdr = false;
     bool shader_depth = false;
+    DXGI_FORMAT back_format = DXGI_FORMAT_R8G8B8A8_UNORM; // the swap chain's format
+    ComPtr<ID3D11RasterizerState> hud_scissor;            // set: the HUD covers only kHudRect
+    ID3D11Query* main_stats = nullptr;                    // set: pipeline statistics around the main scene's draws only
+    ComPtr<ID3D11PixelShader> ps_scene_main, ps_hud_main;
+    // The x2 names fixture (--fg-x2-names*): a map panned `pan` pixels a frame and names drawn after the hand-over
+    // that move with it (and the HUD panel that does not).
+    ComPtr<ID3D11PixelShader> ps_map;
+    ComPtr<ID3D11RasterizerState> names_rs; // no culling, no scissor: the full-screen passes and the names are drawn
+    bool names = false;
+    float pan = 0;
+    int frame_now = 0;  // set: the main scene's and the HUD's shading (fold fixture)
+    ComPtr<ID3D11UnorderedAccessView> count_uav;           // set: their invocations, counted (u1)
+    ComPtr<ID3D11RasterizerState> scene_rs;                // set: the main scene drawn with no face culling (its quads face away)
+    // The interface recorded on a deferred context and run by the immediate one (multithreaded DX11):
+    // 1 = the whole interface, 2 = part of it, between the scene and the immediate interface draws.
+    int deferred_hud = 0;
+    ComPtr<ID3D11DeviceContext> hud_dc;
     bool campaign_camera = false;
     bool campaign_pixel_range = false;
     uint32_t camera_ring_offset = 24576;
@@ -221,6 +288,14 @@ struct Game {
     bool rotate_camera = false;
     ComPtr<ID3D11Buffer> cam_pool[2];
     ComPtr<ID3D11DepthStencilState> depth_off;
+    // The overlay fixture: lines and labels into the scene picture with the depth test off, scene depth bound.
+    bool overlays = false;
+    static constexpr UINT kOverlayLines = 16, kOverlayGlyphs = 48 * 6, kPanelBlocks = 30 * 12;
+    static constexpr LONG kPanelScissor[4] = {1080, 30, 1210, 80}; // left, top, right, bottom: smaller than the panel
+    ComPtr<ID3D11VertexShader> vs_lines, vs_text, vs_panel;
+    ComPtr<ID3D11PixelShader> ps_line, ps_text, ps_panel;
+    ComPtr<ID3D11Buffer> overlay_cb;
+    ComPtr<ID3D11DepthStencilState> overlay_depth_off;
     ComPtr<ID3D11Texture2D> layer, layer2;
     ComPtr<ID3D11RenderTargetView> layer_rtv, layer2_rtv;
     ComPtr<ID3D11ShaderResourceView> layer_srv;
@@ -284,7 +359,7 @@ bool MakeGame(Game& g, bool warp, bool debug = false)
     sd.BufferCount = 2;
     sd.BufferDesc.Width = g.w + g.screen_extra_width;
     sd.BufferDesc.Height = g.h + (g.padded_hdr ? 3 : 0);
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.Format = g.back_format;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = g.wnd;
     sd.SampleDesc.Count = 1;
@@ -415,7 +490,7 @@ void Viewport(ID3D11DeviceContext* c, UINT w, UINT h)
 }
 
 
-void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
+void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false, bool replay_mesh = false)
 {
     g_tonemap_bound = false;
     if (g.rotate_camera) g.cam_cb = g.cam_pool[frame & 1];
@@ -456,7 +531,31 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
     c->ClearRenderTargetView(rt, clear);
     c->ClearDepthStencilView(g.dsv.Get(), g.shader_depth ? D3D11_CLEAR_DEPTH : D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
     Viewport(c, g.w, g.h);
+    if (g.names && g.ps_map) { // the names fixture: one depth-tested map draw (the objects after it fail the depth test)
+        g.frame_now = frame;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(c->Map(g.obj_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            const float o[4] = {0, 0, g.pan * float(frame), 200.f + 3.f * float(frame % 300)};
+            std::memcpy(m.pData, o, 16);
+            c->Unmap(g.obj_cb.Get(), 0);
+        }
+        ID3D11Buffer* ob = g.obj_cb.Get();
+        c->PSSetConstantBuffers(1, 1, &ob);
+        c->VSSetShader(g.vs_post.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_map.Get(), nullptr, 0);
+        c->RSSetState(g.names_rs.Get());
+        c->Draw(4, 0);
+        c->VSSetShader(g.vs.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_scene.Get(), nullptr, 0);
+    }
     if (g.campaign_split_camera) BindSplitCamera(c, g);
+    if (g.ps_scene_main) c->PSSetShader(g.ps_scene_main.Get(), nullptr, 0);
+    if (g.scene_rs) c->RSSetState(g.scene_rs.Get());
+    if (g.count_uav) {
+        ID3D11UnorderedAccessView* u = g.count_uav.Get();
+        c->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 1, 1, &u, nullptr);
+    }
+    if (g.main_stats) c->Begin(g.main_stats);
     for (int i = 0; i < 40; ++i) {
         // Rewrite the same buffer to an identity-basis object pose. These
         // draws must never get the support of the earlier world-buffer version.
@@ -477,8 +576,40 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
                 c1->VSSetConstantBuffers1(2, 1, &ring, &first, &count);
             }
         }
-        SetObject(c, g, i); c->Draw(4, 0);
+        SetObject(c, g, i);
+        if (replay_mesh && i == 39) {
+            c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            c->DrawInstanced(3, 350, 0, 0); // 1,050 positions span two packed rows.
+            c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        } else c->Draw(4, 0);
     }
+    if (g.overlays) {
+        // Map overlays: depth test off, the scene depth still bound, into the scene picture (Hearts of Iron IV).
+        c->OMSetDepthStencilState(g.overlay_depth_off.Get(), 0);
+        ID3D11Buffer* ocb = g.overlay_cb.Get();
+        c->VSSetConstantBuffers(2, 1, &ocb);
+        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        c->VSSetShader(g.vs_lines.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_line.Get(), nullptr, 0);
+        c->Draw(Game::kOverlayLines * 6, 0);
+        c->VSSetShader(g.vs_text.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_text.Get(), nullptr, 0);
+        c->Draw(Game::kOverlayGlyphs * 6, 0);
+        // A panel with the whole scene's viewport and a smaller scissor, still before the hand-over.
+        const D3D11_RECT clip{Game::kPanelScissor[0], Game::kPanelScissor[1], Game::kPanelScissor[2], Game::kPanelScissor[3]};
+        c->RSSetState(g.hud_scissor.Get());
+        c->RSSetScissorRects(1, &clip);
+        c->VSSetShader(g.vs_panel.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_panel.Get(), nullptr, 0);
+        c->Draw(Game::kPanelBlocks * 6, 0);
+        c->RSSetState(g.scene_rs ? g.scene_rs.Get() : nullptr);
+        c->OMSetDepthStencilState(nullptr, 0);
+        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        c->VSSetShader(g.vs.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_scene_main ? g.ps_scene_main.Get() : g.ps_scene.Get(), nullptr, 0);
+    }
+    if (g.main_stats) c->End(g.main_stats);
+    if (g.scene_rs) c->RSSetState(nullptr);
     if (g.layered) {
         // Lighting: reads the layers, writes the picture, no depth.
         c->OMSetRenderTargets(1, &rt, nullptr);
@@ -499,6 +630,10 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
 
 
 
+constexpr LONG kHudRect[4] = {40, 30, 200, 90}; // left, top, right, bottom (the live x2 fixture's HUD panel)
+constexpr float kNameW = 48.f, kNameH = 12.f;
+float NameY(int row) { return 150.f + 150.f * float(row) + (row == 3 ? 12.f : 0.f); } // row 3 lies over the unit's path
+float NameX(const Game& g, int row, int i) { return 100.f + 160.f * float(i) + 37.f * float(row) - g.pan * float(g.frame_now); }
 void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 {
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -519,6 +654,7 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
         return;
     }
     c->OMSetRenderTargets(1, &bb, nullptr);
+    if (g.names) c->RSSetState(g.names_rs.Get()); // the tonemap and the names (the HUD panel sets its own state)
     ID3D11ShaderResourceView* srv = g.color_srv.Get();
     c->PSSetShaderResources(0, 1, &srv);
     if (immediate) g_tonemap_bound = true;
@@ -529,9 +665,50 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
     c->PSSetShaderResources(0, 1, &none);
     // HUD.
     const float bf[4] = {};
+    if (g.deferred_hud && g.hud_dc && immediate) {
+        ID3D11DeviceContext* d = g.hud_dc.Get();
+        d->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        d->VSSetShader(g.vs_post.Get(), nullptr, 0);
+        d->OMSetRenderTargets(1, &bb, nullptr);
+        d->OMSetBlendState(g.blend.Get(), bf, 0xffffffffu);
+        d->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+        Viewport(d, g.w, g.h);
+        if (g.hud_scissor) {
+            d->RSSetState(g.hud_scissor.Get());
+            const D3D11_RECT r{kHudRect[0], kHudRect[1], kHudRect[2], kHudRect[3]};
+            d->RSSetScissorRects(1, &r);
+        }
+        for (int i = 0; i < 3; ++i) d->Draw(4, 0);
+        ComPtr<ID3D11CommandList> list;
+        if (SUCCEEDED(d->FinishCommandList(FALSE, &list))) c->ExecuteCommandList(list.Get(), TRUE);
+        if (g.deferred_hud == 1) return;
+    }
     c->OMSetBlendState(g.blend.Get(), bf, 0xffffffffu);
-    c->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+    c->PSSetShader(g.ps_hud_main ? g.ps_hud_main.Get() : g.ps_hud.Get(), nullptr, 0);
+    if (g.count_uav) {
+        ID3D11UnorderedAccessView* u = g.count_uav.Get();
+        c->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 1, 1, &u, nullptr);
+    }
+    if (g.hud_scissor) { // a HUD panel, not the whole screen (live x2 fixture)
+        c->RSSetState(g.hud_scissor.Get());
+        const D3D11_RECT r{kHudRect[0], kHudRect[1], kHudRect[2], kHudRect[3]};
+        c->RSSetScissorRects(1, &r);
+    }
     for (int i = 0; i < 6; ++i) c->Draw(4, 0);
+    if (g.hud_scissor) c->RSSetState(nullptr);
+    if (g.names) { // map names: interface drawn after the hand-over, anchored to the panning map
+        c->RSSetState(g.names_rs.Get());
+        c->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+        for (int row = 0; row < 4; ++row)
+            for (int i = 0; i < 80; ++i) {
+                const float x = NameX(g, row, i), y = NameY(row);
+                if (x < -60.f || x > float(g.w) + 10.f) continue;
+                const D3D11_VIEWPORT vp{x, y, kNameW, kNameH, 0.f, 1.f};
+                c->RSSetViewports(1, &vp);
+                c->Draw(4, 0);
+            }
+        Viewport(c, g.w, g.h);
+    }
     c->OMSetBlendState(nullptr, bf, 0xffffffffu);
 }
 
@@ -719,23 +896,23 @@ void ShaderDepthLayerFixture(Game& g, int& frame, ID3D11RasterizerState* raster)
         if (!setup(SUCCEEDED(g.device->CreateTexture2D(&desc, nullptr, &colours[i])) &&
             SUCCEEDED(g.device->CreateRenderTargetView(colours[i].Get(), nullptr, &colour_rtv[i])),
             "create material buffers")) return;
-    const auto render = [&](float dx, float dy, bool copy, UINT vertices) {
+    const auto render = [&](float dx, float dy, bool copy, UINT vertices, bool selected = false, bool stationary_source = false) {
         na::native11::SetNextJitter(dx, dy);
         g.swap->Present(0, 0);
         auto* c = g.ctx.Get();
         Scene(c, g, frame++);
         c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH, 1.f, 0);
         auto* target = depth_rtv.Get();
-        c->OMSetDepthStencilState(nullptr, 0);
-        c->OMSetRenderTargets(1, &target, g.dsv.Get());
+        c->OMSetDepthStencilState(stationary_source ? g.depth_off.Get() : nullptr, 0);
+        c->OMSetRenderTargets(1, &target, stationary_source ? nullptr : g.dsv.Get());
         Viewport(c, g.w, g.h);
         c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         c->RSSetState(raster);
         c->VSSetShader(vs.Get(), nullptr, 0);
         c->PSSetShader(producer.Get(), nullptr, 0);
         c->Draw(9, 0);
-        ID3D11RenderTargetView* materials[]{colour_rtv[0].Get(), colour_rtv[1].Get()};
-        c->OMSetRenderTargets(2, materials, g.dsv.Get());
+        ID3D11RenderTargetView* materials[]{selected ? g.color_rtv.Get() : colour_rtv[0].Get(), colour_rtv[1].Get()};
+        c->OMSetRenderTargets(selected ? 1 : 2, materials, g.dsv.Get());
         if (copy) c->CopyResource(unproved_copy.Get(), depth_layer.Get());
         auto* source = copy ? copy_srv.Get() : depth_srv.Get();
         c->PSSetShaderResources(1, 1, &source);
@@ -751,7 +928,7 @@ void ShaderDepthLayerFixture(Game& g, int& frame, ID3D11RasterizerState* raster)
         c->PSSetShaderResources(1, 1, &source);
         c->OMSetRenderTargets(0, nullptr, nullptr);
         float pixel[4]{};
-        const bool read = ReadCopy(g, pixel, colours[0].Get());
+        const bool read = ReadCopy(g, pixel, selected ? g.color.Get() : colours[0].Get());
         c->OMSetDepthStencilState(nullptr, 0);
         Post(c, g, true);
         return std::pair{read ? pixel[0] : -1.f, same_grid};
@@ -766,6 +943,21 @@ void ShaderDepthLayerFixture(Game& g, int& frame, ID3D11RasterizerState* raster)
     expect(fullscreen.first == 0 && !fullscreen.second, "a fullscreen reader retains the original viewport");
     expect(negative.first == 1 && negative.second && positive.first == 1 && positive.second,
            "full-strength offsets preserve material pixels when shader and depth share the raster");
+    for (const bool enabled : {false, true}) {
+        na::native11::ForceSceneOverlayJitterForTests(enabled ? 1 : 0);
+        na::native11::SetSceneOverlayJitter(enabled, "source raster comparison");
+        const auto a = render(.323165f, -.452396f, true, 9, true, false);
+        const auto b = render(.323165f, -.452396f, true, 9, true, true);
+        const auto c = render(-.470734f, .419042f, true, 9, true, true);
+        std::printf("selected scene mesh, overlay=%d: sampled-source pixel=%.1f moved=%d; stationary-source pixels=%.1f/%.1f moved=%d/%d\n",
+                    int(enabled), a.first, int(a.second), b.first, c.first, int(b.second), int(c.second));
+        // Astra's reproducer (2026-11-26). VARIANT: jitter/stationary-source-readers: a reader of a layer drawn on
+        // the game's grid (and of its exact copy) stays on that grid whatever the overlay rule says; a reader of a
+        // layer drawn on the sample's grid moves with the overlay rule.
+        expect(a.first == float(enabled) && b.first == 1.f && c.first == 1.f,
+               "a reader of a stationary layer keeps its grid; a reader of a sampled layer moves with the overlays");
+    }
+    na::native11::ForceSceneOverlayJitterForTests(-1);
 }
 
 int DepthReadFixture(Game& g, bool debug_layer)
@@ -1920,7 +2112,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool adaptive = missed_order || (argc > 1 && (std::strcmp(argv[1], "--adaptive-screen") == 0 ||
                                                        std::strcmp(argv[1], "--adaptive-screen-warp") == 0));
 #if defined(NA_TEST_NATIVE_DLAA)
-    const bool automatic = argc > 1 && std::strcmp(argv[1], "--automatic") == 0;
+    // Live x2 in the automatic-API mode (the graphics API found at the first present, the DX11 proxy from
+    // chain creation): 1 = interface on the shown picture; 2 = the interface from a deferred context only;
+    // 3 = part of it from a deferred context between the scene and the immediate interface draws;
+    // 4 = a chain made before NeuralAlias could take it over.
+    const char* arg1 = argc > 1 ? argv[1] : "";
+    const int fg_auto = !std::strcmp(arg1, "--fg-x2-auto") ? 1 : !std::strcmp(arg1, "--fg-x2-auto-deferred-hud") ? 2 :
+                        !std::strcmp(arg1, "--fg-x2-auto-deferred-hud-mixed") ? 3 : !std::strcmp(arg1, "--fg-x2-auto-late-chain") ? 4 : 0;
+    const bool automatic = fg_auto != 0 || (argc > 1 && std::strcmp(argv[1], "--automatic") == 0);
     const bool padded_hdr = argc > 1 && std::strcmp(argv[1], "--lit-role-padded") == 0;
     const bool disagreeing_scene = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-disagreeing-scene") == 0;
     const bool trial_reused_depth = argc > 1 && std::strcmp(argv[1], "--lit-role-trial-reused-depth") == 0;
@@ -1930,7 +2129,35 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool compare_routes = composition_fault || trial_reused_depth || disagreeing_scene || parity_roles ||
         (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
-    const bool camera_off_start = argc > 1 && std::strcmp(argv[1], "--camera-off-start") == 0;
+    const bool replay_handoff = !std::strcmp(arg1, "--replay-handoff");
+    const bool camera_off_start = replay_handoff || !std::strcmp(arg1, "--camera-off-start");
+    // One presenter for both APIs, stage 3: live x2 on a DX11 game (proxy chain, native DLAA inputs,
+    // HUD-free picture, presenter), 8-bit SDR or FP16 back buffer.
+    const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
+    // x2 together with a DLSS level (the fold): Frame Generation gets the level's folded depth and motion.
+    const uint32_t fg_fold = !std::strcmp(arg1, "--fg-x2-quality") ? 1u : !std::strcmp(arg1, "--fg-x2-performance") ? 2u : 0u;
+    // The names fixture (VARIANT hudpaste/moves-with-scene): map names drawn after the hand-over that move with a
+    // panning map, under x2. --fg-x2-names[-slow|-fast][-t2]: pan 5 px a frame (1.5 slow, 16 fast); -t2 pastes the
+    // interface the T2 way (hudpaste/screen-fixed) for the before figures.
+    const char* names_arg = std::strncmp(arg1, "--fg-x2-names", 13) == 0 ? arg1 + 13 : nullptr;
+    const bool fg_names = names_arg != nullptr;
+    const bool names_t2 = fg_names && std::strstr(names_arg, "-t2") != nullptr;
+    const float names_pan = !fg_names ? 0.f : std::strstr(names_arg, "-slow") ? 1.5f : std::strstr(names_arg, "-fast") ? 16.f : 5.f;
+    const bool fg_x2 = fg_x2_hdr || fg_auto != 0 || fg_fold != 0 || fg_names || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
+    const bool proxy_env_off = GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) != 0;
+    // DLSS Quality / Performance on the native DX11 route (the fold: coarse shading through NVAPI, the
+    // shared fold pass, the waiting period with DLAA on screen).
+    const uint32_t fold_level = !std::strcmp(arg1, "--fold-quality") || !std::strcmp(arg1, "--fold-quality-measured") ? 1u
+                              : !std::strcmp(arg1, "--fold-performance") || !std::strcmp(arg1, "--fold-performance-measured") ? 2u : 0u;
+    const bool fold_measured = fold_level && std::strstr(arg1, "-measured") != nullptr; // no camera: motion measured, folded flow
+    // The overlay fixture: --overlay-jitter (DLAA), --overlay-jitter-quality, --overlay-jitter-performance.
+    const int overlay_level = !std::strcmp(arg1, "--overlay-jitter") ? 0 : !std::strcmp(arg1, "--overlay-jitter-quality") ? 1
+                            : !std::strcmp(arg1, "--overlay-jitter-performance") ? 2 : -1;
+    wchar_t fg_folder[MAX_PATH]{};
+    if (fg_x2 && !GetEnvironmentVariableW(L"NA_FG_SEARCH", fg_folder, MAX_PATH)) {
+        std::printf("SKIP: NA_FG_SEARCH (the folder with nvngx_dlssg.dll) is not set\n");
+        return 77;
+    }
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const auto dir = std::filesystem::path(exe).parent_path();
@@ -1949,17 +2176,19 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         return WritePrivateProfileStringW(section, key, value, ini.c_str()) != FALSE;
     };
     if (!set(L"host", L"enabled", L"1") || !set(L"host", L"status_log", status_path.c_str()) ||
-        !set(L"dx11on12", L"enabled", automatic ? L"1" : L"0") ||
+        !set(L"dx11on12", L"enabled", (automatic && !fg_auto) ? L"1" : L"0") ||
         !set(L"native11", L"enabled", automatic ? L"0" : L"1") ||
         !set(L"host", L"graphics_api", automatic ? L"auto" : L"") ||
         !set(L"overlay", L"enabled", L"1") || !set(L"adapter", L"enabled", L"0") ||
-        !set(L"observe", L"producers", automatic ? L"1" : L"0") ||
+        !set(L"observe", L"producers", (automatic && !fg_auto) ? L"1" : L"0") ||
         !set(L"observe", L"early_install", L"0") ||
         !set(L"present", L"proxy", L"0") || !set(L"settings", L"scope", scope.c_str()) ||
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
         !set(L"referee", L"enabled", L"0") || // legacy disabled package
-        !set(L"j2", L"camera", (camera_off_start || adaptive || rotating_lights) ? L"0" : L"2") ||
+        !set(L"j2", L"camera", (camera_off_start || fg_x2 || adaptive || rotating_lights || fold_measured || overlay_level >= 0) ? L"0" : L"2") ||
+        (fg_x2 && (!set(L"fg", L"live", L"1") || !set(L"fg", L"search_path", fg_folder))) ||
+        (GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) && !set(L"present", L"dx11_proxy", L"0")) ||
 
         !na::host::StartFromIni(GetModuleHandleW(nullptr), ini_name.c_str(), "NATIVE DX11 TEST")) return 1;
     na::host::WaitForObserveInstall();
@@ -1974,6 +2203,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     Game g;
 #if defined(NA_TEST_NATIVE_DLAA)
     g.padded_hdr = padded_hdr;
+    if (fg_x2_hdr) g.back_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (fold_measured || overlay_level >= 0 || fg_names) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
+    {   // NA_TEST_FOLD_SIZE=WxH: the fold fixture at another picture size (e.g. 3440x1440 for the memory figure).
+        wchar_t sz[32]{};
+        unsigned fw = 0, fh = 0;
+        if (fold_level && GetEnvironmentVariableW(L"NA_TEST_FOLD_SIZE", sz, 32) && swscanf_s(sz, L"%ux%u", &fw, &fh) == 2 && fw && fh) { g.w = fw; g.h = fh; }
+    }
 #endif
     const bool centered_scene = argc > 1 && std::strcmp(argv[1], "--centered-scene") == 0;
     if (centered_scene) g.screen_extra_width = 88;
@@ -1984,6 +2220,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool depth_debug = argc > 1 && std::strcmp(argv[1], "--depth-reads-debug") == 0;
     const bool depth_reads = depth_warp || depth_debug || (argc > 1 && std::strcmp(argv[1], "--depth-reads") == 0);
     g.shader_depth = depth_reads;
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (fg_auto == 4) na::on12::SetNativeProxyForTests(false); // the chain is made as if NeuralAlias had not seen it
+#endif
     if (screen_warp || depth_warp || depth_debug || !MakeGame(g, false)) {
         g = Game{};
         if (centered_scene) g.screen_extra_width = 88;
@@ -2023,6 +2262,18 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     }
     ComPtr<ID3D11On12Device> translated;
     expect(FAILED(g.device.As(&translated)), "game device is native DX11");
+    if (fg_auto == 4) na::on12::SetNativeProxyForTests(true);
+    if (fg_auto && !proxy_env_off) {
+        // Order of events: the chain is made through the hooked DXGI factory, so the proxy exists from its
+        // creation; the graphics API is chosen, and the DX11 hooks installed, only at the first present.
+        static char before[8192]{};
+        na::on12::FormatStatus(before, sizeof before);
+        expect(!na::on12::NativeRoute() && std::strstr(before, "native11_route=active") == nullptr,
+               "automatic mode: no graphics API chosen and no DX11 hooks before the first present");
+        expect(na::on12::NativeProxy(g.swap.Get()) == (fg_auto != 4),
+               fg_auto == 4 ? "a chain made before the takeover stays the game's own"
+                            : "the chain is presented through our D3D12 queue from its creation, before the first present");
+    }
     if (automatic) {
         expect(na::on12::SwapchainApi(g.swap.Get()) == na::on12::GraphicsApi::Dx11,
                "automatic selection identifies the swap chain's native DX11 device");
@@ -2085,6 +2336,715 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (depth_reads) return DepthReadFixture(g, depth_debug);
 #endif
 #if defined(NA_TEST_NATIVE_DLAA)
+    if (fg_x2) {
+        // The game's chain is a DX11 proxy served by the presenter (live Frame Generation package).
+        if (fg_auto != 4 && !proxy_env_off)
+            expect(na::on12::NativeProxyOn() && na::on12::NativeProxy(g.swap.Get()), "the game's DX11 chain is presented through our D3D12 queue");
+        D3D11_RASTERIZER_DESC rd{};
+        rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+        expect(SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.hud_scissor)), "HUD panel state");
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        auto& st = na::settings::Get();
+        st.fg_mode.store(0); st.fg_multiplier.store(2); st.fg_enabled.store(GetEnvironmentVariableW(L"NA_TEST_FG_OFF", nullptr, 0) ? 0u : 1u); // x2, as the menu sets it
+        if (GetEnvironmentVariableW(L"NA_TEST_DLAA_HASH", nullptr, 0)) {
+            // DLAA alone (x2 Off): a fixed run, then a hash of the scene picture after DLAA's write-back.
+            // Run once with the proxy (DLAA on the presentation queue) and once without (its own queue).
+            st.fg_enabled.store(0);
+            for (int frame = 0; frame < 60; ++frame) { Pump(); Scene(g.ctx.Get(), g, frame); Post(g.ctx.Get(), g, true); g.swap->Present(0, 0); }
+            D3D11_TEXTURE2D_DESC d{};
+            g.color->GetDesc(&d);
+            d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+            ComPtr<ID3D11Texture2D> stg;
+            uint64_t h = 1469598103934665603ull;
+            if (SUCCEEDED(g.device->CreateTexture2D(&d, nullptr, &stg))) {
+                g.ctx->CopyResource(stg.Get(), g.color.Get());
+                D3D11_MAPPED_SUBRESOURCE m{};
+                if (SUCCEEDED(g.ctx->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+                    for (UINT y = 0; y < d.Height; ++y) {
+                        const auto* row = static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch;
+                        for (UINT i = 0; i < d.Width * 4; ++i) { h ^= row[i]; h *= 1099511628211ull; }
+                    }
+                    g.ctx->Unmap(stg.Get(), 0);
+                }
+            }
+            std::printf("DLAA picture hash after 60 frames (%s): %016llx, delivered %llu\n", na::on12::NativeProxy(g.swap.Get()) ? "proxy, presentation queue" : "no proxy, own queue",
+                        static_cast<unsigned long long>(h), static_cast<unsigned long long>(evaluations));
+            DeleteFileW(ini.c_str());
+            std::fflush(stdout);
+            ExitProcess(0);
+        }
+        if (fg_auto >= 2) {
+            // x2 is on but cannot run with this frame: it must wait with a plain reason, present the game's
+            // own frames unchanged, and never stall or remove the device.
+            if (fg_auto == 2 || fg_auto == 3) {
+                g.deferred_hud = fg_auto == 2 ? 1 : 2;
+                expect(SUCCEEDED(g.device->CreateDeferredContext(0, &g.hud_dc)), "a deferred context for the interface");
+            }
+            for (int frame = 0; frame < 240; ++frame) { Pump(); Scene(g.ctx.Get(), g, frame); Post(g.ctx.Get(), g, true); g.swap->Present(0, 0); }
+            const auto pr = na::present::GetStats();
+            const auto fs = na::fg::GetStats();
+            const auto hud = na::j2::GetLiveHudStatsAnyApi();
+            char reason[160] = {};
+            unsigned long long refused = 0;
+            na::on12::ProxyReason(reason, sizeof reason, &refused);
+            std::printf("x2 on, cannot run (%s): shown %.1f from %.1f real, generated shown %llu, fg \"%s\"\n  HUD learned=%u verdict: %s\n  last skip: %s\n  proxy: refused=%llu \"%s\"\n",
+                        fg_auto == 2 ? "interface from a deferred context" : fg_auto == 3 ? "part of the interface from a deferred context" : "chain made before the takeover",
+                        pr.shown_fps, pr.base_fps, static_cast<unsigned long long>(pr.generated_shown), fs.reason, hud.learned, hud.verdict, hud.last_skip, refused, reason);
+            expect(pr.generated_shown == 0, "no generated picture is shown");
+            if (fg_auto == 4) {
+                expect(!na::on12::NativeProxy(g.swap.Get()) && refused >= 1 && std::strstr(reason, "made before NeuralAlias could take it over") != nullptr,
+                       "the menu row's reason says the chain was made before the takeover");
+            } else {
+                expect(!hud.learned && std::strstr(hud.verdict, "deferred command lists") != nullptr,
+                       "the HUD verdict names the deferred command lists, in plain words");
+                expect(hud.learn_attempts >= 1, "the frame was looked at");
+            }
+            expect(pr.device_hr == S_OK, "no device removal");
+            DeleteFileW(ini.c_str());
+            std::printf(g_failed ? "FAIL: %d check(s) failed\n" : "PASS: x2 waits with the plain reason\n", g_failed);
+            std::fflush(stdout);
+            ExitProcess(g_failed ? 1u : 0u);
+        }
+        if (fg_fold) st.j2_fold_mode.store(fg_fold); // the level is asked for from the first frame; x2 runs beside it
+        if (fg_names) {
+            const auto code = Compile("ps_map", "ps_5_0");
+            expect(code && SUCCEEDED(g.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g.ps_map)), "the map shader");
+            D3D11_RASTERIZER_DESC nr{};
+            nr.FillMode = D3D11_FILL_SOLID; nr.CullMode = D3D11_CULL_NONE; nr.DepthClipEnable = TRUE;
+            expect(SUCCEEDED(g.device->CreateRasterizerState(&nr, &g.names_rs)), "the names fixture's rasterizer state");
+            g.names = true;
+            g.pan = names_pan;
+            st.fg_hud_move.store(names_t2 ? 0u : 1u);
+        }
+        const char* fold_name = fg_fold == 2 ? "Performance" : "Quality";
+        const auto fold_on_screen = [&] {
+            char fs11[512]{};
+            na::native_d3d11::FoldStatus(fs11, sizeof fs11);
+            return std::string(fs11).find(std::string("On screen: ") + fold_name) != std::string::npos;
+        };
+        bool asked = false;
+        static std::atomic<ULONGLONG> last_frame_at{GetTickCount64()};
+        std::thread([] { // a frame that never returns: say where everything stood, then stop
+            for (;;) {
+                Sleep(1000);
+                if (GetTickCount64() - last_frame_at.load() < 8000) continue;
+                std::printf("HANG: a frame did not return within 8 s\n");
+                std::fflush(stdout);
+                ExitProcess(3);
+            }
+        }).detach();
+        for (int frame = 0; frame < 400; ++frame) {
+            last_frame_at.store(GetTickCount64());
+            const ULONGLONG t0 = GetTickCount64();
+            Pump();
+            Scene(g.ctx.Get(), g, frame);
+            Post(g.ctx.Get(), g, true);
+            if (fg_names && (frame == 3 || frame == 20)) { // what the game's own picture holds before Present (map, names)
+                ComPtr<ID3D11Texture2D> bb, stg;
+                if (SUCCEEDED(g.swap->GetBuffer(0, IID_PPV_ARGS(&bb)))) {
+                    D3D11_TEXTURE2D_DESC d{};
+                    bb->GetDesc(&d);
+                    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+                    if (SUCCEEDED(g.device->CreateTexture2D(&d, nullptr, &stg))) {
+                        g.ctx->CopyResource(stg.Get(), bb.Get());
+                        D3D11_MAPPED_SUBRESOURCE m{};
+                        if (SUCCEEDED(g.ctx->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+                            const auto px = [&](int x, int y) { const auto* p = static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch + size_t(x) * 4; return std::array<int, 3>{p[0], p[1], p[2]}; };
+                            const float nx = NameX(g, 0, 1);
+                            const auto a = px(600, 400), b = px(int(nx) + 20, 156), c = px(100, 60);
+                            std::printf("  frame %d back buffer: map (600,400) %d,%d,%d; name at x %.1f: %d,%d,%d; HUD panel %d,%d,%d\n", frame, a[0], a[1], a[2], nx,
+                                        b[0], b[1], b[2], c[0], c[1], c[2]);
+                            g.ctx->Unmap(stg.Get(), 0);
+                        }
+                    }
+                }
+            }
+            g.swap->Present(0, 0);
+            if (GetTickCount64() - t0 > 200) std::printf("  frame %d took %llu ms\n", frame, GetTickCount64() - t0);
+            const auto pr = na::present::GetStats();
+            if (!asked && pr.generated_shown >= 20 && (!fg_fold || fold_on_screen())) { // x2 runs: save the presented real / generated / real pictures
+                char why[160]{};
+                asked = na::present::RequestOutputCapture(3, why, sizeof why);
+                expect(asked, "the presented-picture capture starts");
+            }
+            const auto lv = na::present::GetLiveStats();
+            if (asked && std::strstr(lv.capture, "saved:")) break;
+        }
+        Sleep(500); // the capture writer finishes on its own thread
+        const auto pr = na::present::GetStats();
+        const auto fs = na::fg::GetStats();
+        const auto lv = na::present::GetLiveStats();
+        const auto hud = na::j2::GetLiveHudStatsAnyApi();
+        std::printf("x2 on DX11 (%s): real fps %.1f shown %.1f, generated shown %llu, evaluates %llu, fg \"%s\"\n  HUD: %s\n  steady %llu frames, %.2f %%, dropped gap=%llu reset=%llu\n  capture: %s\n  ms: copy %.3f hudcopy %.3f eval %.3f steady %.3f paste %.3f off %.3f\n",
+                    fg_x2_hdr ? "FP16" : "8-bit SDR", pr.base_fps, pr.shown_fps, static_cast<unsigned long long>(pr.generated_shown),
+                    static_cast<unsigned long long>(fs.evaluates), fs.reason, hud.method, static_cast<unsigned long long>(lv.steady_frames), lv.steady_share,
+                    static_cast<unsigned long long>(lv.steady_drop_gap), static_cast<unsigned long long>(lv.steady_drop_reset), lv.capture,
+                    lv.copy_avg, lv.hudcopy_avg, lv.eval_avg, lv.steady_avg, lv.paste_avg, lv.off_avg);
+        expect(pr.generated_shown >= 20, "generated pictures are presented between the game's own frames");
+        expect(hud.learned && std::strstr(hud.method, "hudfree/") != nullptr, "the HUD-free picture's variant was learned from the frame's shape");
+        // The presented burst: in every generated picture the HUD panel (inside, one pixel in) equals the next real frame's.
+        const char* at = std::strstr(lv.capture, "C:\\");
+        expect(at != nullptr, "the capture folder is named");
+        if (at) {
+            const std::filesystem::path cap{std::string(at)};
+            const uint32_t bpp = fg_x2_hdr ? 8u : 4u;
+            auto read = [&](const std::string& name) {
+                std::vector<uint8_t> b;
+                FILE* f = nullptr;
+                if (_wfopen_s(&f, (cap / name).c_str(), L"rb") == 0 && f) { std::fseek(f, 0, SEEK_END); b.resize(size_t(std::ftell(f))); std::fseek(f, 0, SEEK_SET); std::fread(b.data(), 1, b.size(), f); std::fclose(f); }
+                return b;
+            };
+            std::string json;
+            { auto j = read("presented.json"); json.assign(j.begin(), j.end()); }
+            std::vector<std::string> files, kinds;
+            for (size_t p = 0; (p = json.find("\"kind\": \"", p)) != std::string::npos;) {
+                p += 9; const size_t e = json.find('"', p); kinds.push_back(json.substr(p, e - p));
+                const size_t fp = json.find("\"file\": \"", e) + 9; files.push_back(json.substr(fp, json.find('"', fp) - fp));
+                p = e;
+            }
+            const UINT W = g.w, H = g.h;
+            uint32_t checked = 0, wrong = 0;
+            bool raw_logged = false;
+            for (size_t i = 0; i + 1 < kinds.size(); ++i) {
+                if (kinds[i] != "generated" || kinds[i + 1] != "next-real" || files[i].empty() || files[i + 1].empty()) continue;
+                const auto gen = read(files[i]), real = read(files[i + 1]);
+                if (gen.size() < size_t(W) * H * bpp || real.size() != gen.size()) continue;
+                const UINT stride = UINT(gen.size() / (size_t(H) * bpp)); // capture width
+                for (LONG y = kHudRect[1] + 1; y < kHudRect[3] - 1; ++y)
+                    for (LONG x = kHudRect[0] + 1; x < kHudRect[2] - 1; ++x) {
+                        const size_t o = (size_t(y) * stride + size_t(x)) * bpp;
+                        if (bpp == 4) { wrong += std::memcmp(&gen[o], &real[o], bpp) != 0; continue; }
+                        // FP16 (scRGB): exact in what the screen shows (the paste rule's display terms; values
+                        // above 1.0 clip to white there, where the real and HUD-free pictures cannot differ).
+                        bool differs = false;
+                        for (int ch = 0; ch < 3; ++ch) {
+                            uint16_t hg = 0, hr = 0;
+                            std::memcpy(&hg, &gen[o + size_t(ch) * 2], 2); std::memcpy(&hr, &real[o + size_t(ch) * 2], 2);
+                            const float vg = na::fglive::DisplayValue(DirectX::PackedVector::XMConvertHalfToFloat(hg));
+                            const float vr = na::fglive::DisplayValue(DirectX::PackedVector::XMConvertHalfToFloat(hr));
+                            differs = differs || std::fabs(vg - vr) > 0.5f / 255.f;
+                        }
+                        if (differs && !raw_logged) {
+                            raw_logged = true;
+                            uint16_t hg = 0, hr = 0;
+                            std::memcpy(&hg, &gen[o], 2); std::memcpy(&hr, &real[o], 2);
+                            std::printf("  first differing HUD pixel (%ld,%ld): generated R %.4f, next real R %.4f\n", x, y,
+                                        DirectX::PackedVector::XMConvertHalfToFloat(hg), DirectX::PackedVector::XMConvertHalfToFloat(hr));
+                        }
+                        wrong += differs;
+                    }
+                ++checked;
+            }
+            std::printf("  presented burst: %zu pictures, %u generated pictures checked, HUD pixels differing from the next real frame: %u\n", kinds.size(), checked, wrong);
+            expect(checked >= 2 && wrong == 0, "the interface is exact in generated pictures (the newer real frame's own HUD)");
+            if (fg_names && bpp == 4) {
+                // Each name's centre (threshold crossings, to a fraction of a pixel) in the previous real, generated and
+                // next real pictures; the true place on the generated picture is halfway between the two real ones.
+                const auto centres = [&](const std::vector<uint8_t>& pic, int row) {
+                    std::vector<float> out;
+                    const UINT stride = UINT(pic.size() / (size_t(H) * 4));
+                    const int y = int(NameY(row) + kNameH * .5f);
+                    const auto lum = [&](int x) { const uint8_t* p = &pic[(size_t(y) * stride + size_t(x)) * 4]; return (p[0] + p[1] + p[2]) / (3.f * 255.f); };
+                    const float thr = .52f;
+                    for (int x = 1; x + 1 < int(W);) {
+                        if (lum(x) <= thr || lum(x - 1) > thr) { ++x; continue; }
+                        int e = x;
+                        while (e + 1 < int(W) && lum(e + 1) > thr) ++e;
+                        if (e - x >= 30 && x > 2 && e < int(W) - 3) {
+                            const float l0 = lum(x - 1), l1 = lum(x), r0 = lum(e), r1 = lum(e + 1);
+                            const float left = float(x - 1) + (l1 != l0 ? (thr - l0) / (l1 - l0) : 1.f);
+                            const float right = float(e) + (r1 != r0 ? (r0 - thr) / (r0 - r1) : 0.f);
+                            out.push_back(.5f * (left + right));
+                        }
+                        x = e + 1;
+                    }
+                    return out;
+                };
+                float worst = 0, sum = 0, worst_unit = 0;
+                int n = 0, n_unit = 0;
+                for (size_t i = 1; i + 1 < kinds.size(); ++i) {
+                    if (kinds[i] != "generated" || kinds[i + 1] != "next-real" || kinds[i - 1].find("real") == std::string::npos) continue;
+                    const auto prev = read(files[i - 1]), gen = read(files[i]), next = read(files[i + 1]);
+                    if (prev.size() != gen.size() || next.size() != gen.size() || gen.empty()) continue;
+                    for (int row = 0; row < 4; ++row) {
+                        const auto cp = centres(prev, row), cg = centres(gen, row), cn = centres(next, row);
+                        for (const float x : cg) {
+                            float bp = 1e9f, bn = 1e9f;
+                            for (const float p : cp) if (std::fabs(p - x) < std::fabs(bp - x)) bp = p;
+                            for (const float q : cn) if (std::fabs(q - x) < std::fabs(bn - x)) bn = q;
+                            if (std::fabs(bp - bn) > 2.f * g.pan + 4.f || std::fabs(bp - x) > g.pan + 4.f) continue; // not the same name
+                            if (std::fabs((bp - bn) - g.pan) > 1.f) continue; // the two real pictures are not consecutive frames (one was not shown)
+                            if (x > kHudRect[0] - 60 && x < kHudRect[2] + 60 && row == 0) continue;
+                            const float err = std::fabs(x - .5f * (bp + bn));
+                            if (err > .6f) std::printf("    name row %d at x %.2f: previous %.2f, next %.2f, error %.2f px (picture %zu)\n", row, x, bp, bn, err, i);
+                            if (row == 3) { worst_unit = (std::max)(worst_unit, err); ++n_unit; }
+                            worst = (std::max)(worst, err);
+                            sum += err;
+                            ++n;
+                        }
+                    }
+                }
+                const auto ls = na::present::GetLiveStats();
+                std::printf("  names (%s, pan %.1f px a frame): %d measured, mean error %.2f px, worst %.2f px (row over the moving unit: %d, worst %.2f px); "
+                            "hud_move frames %llu, pictures %llu, tiles moving %llu fixed %llu, mean shift %.2f px, pasted T2 pair=%llu reset=%llu motion=%llu off=%llu size=%llu\n",
+                            names_t2 ? "hudpaste/screen-fixed, before" : "hudpaste/moves-with-scene, after", g.pan, n, n ? sum / n : 0.f, worst, n_unit, worst_unit,
+                            static_cast<unsigned long long>(ls.move_frames), static_cast<unsigned long long>(ls.move_pictures),
+                            static_cast<unsigned long long>(ls.move_tiles_moving), static_cast<unsigned long long>(ls.move_tiles_fixed), ls.move_shift_px,
+                            static_cast<unsigned long long>(ls.move_fb_pair), static_cast<unsigned long long>(ls.move_fb_reset),
+                            static_cast<unsigned long long>(ls.move_fb_motion), static_cast<unsigned long long>(ls.move_fb_off),
+                            static_cast<unsigned long long>(ls.move_fb_size));
+                expect(n >= 4, "names were measured on generated pictures");
+                if (names_t2) expect(n && sum / n > .5f * g.pan - .6f, "pasted the T2 way, the names sit about half a real-frame step away");
+                else expect(n && worst < .6f, "names that move with the map are placed at the generated picture's time (within 0.6 px)");
+            }
+            if (fg_names && GetEnvironmentVariableW(L"NA_TEST_KEEP_CAPTURE", nullptr, 0)) {
+                std::printf("  capture kept: %s\n", cap.string().c_str());
+            } else
+            for (const auto& e : std::filesystem::directory_iterator(cap)) { std::error_code ec; std::filesystem::remove(e.path(), ec); }
+            std::error_code ec; std::filesystem::remove(cap, ec);
+        }
+        expect(pr.device_hr == S_OK, "no device removal");
+        if (fg_fold) {
+            char fs11[512]{};
+            na::native_d3d11::FoldStatus(fs11, sizeof fs11);
+            const auto cs = na::native11::GetCoarseShadingStats();
+            std::printf("  with %s: menu \"%s\"; coarse frames %llu, draws %llu, before lists %llu, failures %llu\n", fold_name, fs11,
+                        static_cast<unsigned long long>(cs.frames), static_cast<unsigned long long>(cs.draws),
+                        static_cast<unsigned long long>(cs.before_lists), static_cast<unsigned long long>(cs.failures));
+            expect(fold_on_screen(), "the DLSS level is on screen while x2 runs");
+            expect(cs.frames > 0 && cs.failures == 0, "the scene was shaded in blocks with no failure");
+        }
+        DeleteFileW(ini.c_str());
+        std::printf(g_failed ? "FAIL: %d live x2 check(s) failed\n" : "PASS: live x2 on a DX11 game\n", g_failed);
+        std::fflush(stdout);
+        ExitProcess(g_failed ? 1u : 0u);
+    }
+    if (overlay_level >= 0) {
+        // Hearts of Iron IV's frame shape (2026-11-27): depth-tested terrain, then thin lines and labels drawn into
+        // the scene picture with the depth test off and the scene depth bound, then the interface after the
+        // hand-over. Before (jitter/depth-tested-only) and after (jitter/scene-overlays) on a still view:
+        // the share of the picture's edges that never move with the jitter (the HoI4 frames showed 11-14 %),
+        // on the lines and labels and everywhere; the interface must stay exactly on the game's grid.
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        na::j2::SetJitter(true);
+        const char* level_name = overlay_level == 2 ? "Performance" : overlay_level == 1 ? "Quality" : "DLAA";
+        {
+            const auto lines_code = Compile("vs_overlay_lines", "vs_5_0"), text_code = Compile("vs_overlay_text", "vs_5_0");
+            const auto line_ps = Compile("ps_overlay_line", "ps_5_0"), text_ps = Compile("ps_overlay_text", "ps_5_0");
+            const auto panel_code = Compile("vs_overlay_panel", "vs_5_0"), panel_ps = Compile("ps_overlay_panel", "ps_5_0");
+            expect(panel_code && panel_ps &&
+                   SUCCEEDED(g.device->CreateVertexShader(panel_code->GetBufferPointer(), panel_code->GetBufferSize(), nullptr, &g.vs_panel)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(panel_ps->GetBufferPointer(), panel_ps->GetBufferSize(), nullptr, &g.ps_panel)),
+                   "scissored panel shaders");
+            D3D11_DEPTH_STENCIL_DESC dd{};
+            dd.DepthEnable = FALSE; dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            const float size[4] = {float(g.w), float(g.h), 0, 0};
+            D3D11_SUBRESOURCE_DATA init{size, 0, 0};
+            D3D11_RASTERIZER_DESC rd{};
+            rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+            expect(lines_code && text_code && line_ps && text_ps &&
+                   SUCCEEDED(g.device->CreateVertexShader(lines_code->GetBufferPointer(), lines_code->GetBufferSize(), nullptr, &g.vs_lines)) &&
+                   SUCCEEDED(g.device->CreateVertexShader(text_code->GetBufferPointer(), text_code->GetBufferSize(), nullptr, &g.vs_text)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(line_ps->GetBufferPointer(), line_ps->GetBufferSize(), nullptr, &g.ps_line)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(text_ps->GetBufferPointer(), text_ps->GetBufferSize(), nullptr, &g.ps_text)) &&
+                   SUCCEEDED(g.device->CreateDepthStencilState(&dd, &g.overlay_depth_off)) &&
+                   SUCCEEDED(g.device->CreateBuffer(&bd, &init, &g.overlay_cb)) &&
+                   SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.hud_scissor)), "overlay fixture shaders and states");
+            D3D11_RASTERIZER_DESC sr{};
+            sr.FillMode = D3D11_FILL_SOLID; sr.CullMode = D3D11_CULL_NONE; sr.DepthClipEnable = TRUE;
+            expect(SUCCEEDED(g.device->CreateRasterizerState(&sr, &g.scene_rs)), "scene state with no culling (the quads face away)");
+            g.overlays = true;
+        }
+        auto& st = na::settings::Get();
+        st.j2_fold_mode.store(static_cast<uint32_t>(overlay_level));
+        wchar_t temp[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, temp);
+        const auto root = std::filesystem::path(temp) / (L"NA-overlay-jitter-" + std::to_wstring(GetCurrentProcessId()));
+        int frame = 0;
+        const auto run = [&](int n) { for (int i = 0; i < n; ++i, ++frame) { Pump(); Scene(g.ctx.Get(), g, frame); Post(g.ctx.Get(), g, true); g.swap->Present(0, 0); } };
+        // Distance from a pixel centre to the nearest overlay line, and whether it is a label pixel (as the shaders draw them).
+        const auto near_line = [&](int x, int y) {
+            const float W = float(g.w), H = float(g.h);
+            for (UINT l = 0; l < Game::kOverlayLines; ++l) {
+                const float angle = 0.30f + 0.093f * float(l);
+                const float dx = std::cos(angle), dy = std::sin(angle);
+                const float sx = (-0.95f + 0.11f * float(l) + 1.f) * .5f * W, sy = (1.f - (-0.85f + 1.f) * .5f) * H; // NDC -> pixels
+                const float vx = dx * .5f * W, vy = -dy * .5f * H; // the direction in pixels (y down)
+                const float len = std::sqrt(vx * vx + vy * vy);
+                const float px = float(x) + .5f - sx, py = float(y) + .5f - sy;
+                const float t = (px * vx + py * vy) / len;
+                if (t < -2.f || t > 1.9f * len + 2.f) continue;
+                if (std::fabs((px * vy - py * vx) / len) < 2.5f) return true;
+            }
+            return false;
+        };
+        const auto near_text = [&](int x, int y) { return x >= 60 && x < 64 + 48 * 5 + 4 && y >= 116 && y < 121 + 6 * 7 + 4; };
+        const auto in_panel = [&](int x, int y) {
+            return x >= Game::kPanelScissor[0] + 1 && x < Game::kPanelScissor[2] - 1 && y >= Game::kPanelScissor[1] + 1 && y < Game::kPanelScissor[3] - 1;
+        };
+        struct Measure { uint64_t edges = 0, still = 0, line_edges = 0, line_still = 0, text_edges = 0, text_still = 0, other_edges = 0, other_still = 0;
+                         uint64_t panel_edges = 0, panel_still = 0, panel_outside = 0; int pairs = 0; bool hud_same = true; };
+        const auto measure = [&](const std::filesystem::path& cap) {
+            Measure m;
+            // Each frame's scene picture before DLSS (the folded levels' full-size input is "source_color").
+            const char* plane = overlay_level ? "source_color" : "color";
+            std::vector<std::vector<uint8_t>> frames;
+            std::vector<uint64_t> ordinals;
+            std::vector<std::vector<uint8_t>> presents;
+            uint32_t pitch = 0, bpp = 0, ppitch = 0;
+            for (int i = 0; i < 64; ++i) {
+                wchar_t name[32];
+                swprintf_s(name, L"%05d-meta.json", i);
+                FILE* f = nullptr;
+                if (_wfopen_s(&f, (cap / name).c_str(), L"rb") || !f) break;
+                std::string json;
+                char buf[4096];
+                for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) json.append(buf, n);
+                std::fclose(f);
+                const auto field = [&](const char* plane_name, const char* key) -> uint32_t {
+                    const size_t at = json.find(std::string("\"name\": \"") + plane_name + "\"");
+                    if (at == std::string::npos) return 0;
+                    const size_t k = json.find(std::string("\"") + key + "\": ", at);
+                    return k == std::string::npos ? 0 : uint32_t(std::strtoul(json.c_str() + k + std::strlen(key) + 4, nullptr, 10));
+                };
+                pitch = field(plane, "row_pitch");
+                bpp = pitch && g.w ? pitch / g.w : 0;
+                ppitch = field("present", "row_pitch");
+                const size_t o = json.find("\"present_ordinal\": ");
+                ordinals.push_back(o == std::string::npos ? 0 : std::strtoull(json.c_str() + o + 20, nullptr, 10));
+                const auto read = [&](const char* which, uint32_t p) {
+                    std::vector<uint8_t> b;
+                    wchar_t file[64];
+                    swprintf_s(file, L"%05d-%hs.raw", i, which);
+                    FILE* r = nullptr;
+                    if (!_wfopen_s(&r, (cap / file).c_str(), L"rb") && r) { b.resize(size_t(p) * g.h); b.resize(std::fread(b.data(), 1, b.size(), r)); std::fclose(r); }
+                    return b;
+                };
+                frames.push_back(read(plane, pitch));
+                presents.push_back(read("present", ppitch));
+            }
+            if (frames.size() < 2 || !bpp) return m;
+            const auto& f0 = frames[0];
+            const auto px = [&](const std::vector<uint8_t>& f, int x, int y) { return f.data() + size_t(y) * pitch + size_t(x) * bpp; };
+            std::vector<uint8_t> same(size_t(g.w) * g.h, 1), edge(size_t(g.w) * g.h, 0);
+            for (int y = 1; y + 1 < int(g.h); ++y)
+                for (int x = 1; x + 1 < int(g.w); ++x)
+                    edge[size_t(y) * g.w + x] = uint8_t((std::memcmp(px(f0, x, y), px(f0, x + 1, y), bpp) ? 1 : 0) | (std::memcmp(px(f0, x, y), px(f0, x, y + 1), bpp) ? 2 : 0));
+            for (size_t i = 0; i + 1 < frames.size(); ++i) {
+                if (ordinals[i + 1] != ordinals[i] + 1 || frames[i].size() < size_t(pitch) * g.h || frames[i + 1].size() < size_t(pitch) * g.h) continue;
+                ++m.pairs;
+                for (int y = 0; y < int(g.h); ++y)
+                    for (int x = 0; x < int(g.w); ++x)
+                        if (std::memcmp(px(frames[i], x, y), px(frames[i + 1], x, y), bpp)) same[size_t(y) * g.w + x] = 0;
+                // The interface (after the hand-over) is on the game's grid: its panel is the same in every frame.
+                if (presents[i].size() == presents[i + 1].size() && ppitch)
+                    for (int y = kHudRect[1] + 2; y < kHudRect[3] - 2; ++y)
+                        if (std::memcmp(presents[i].data() + size_t(y) * ppitch + size_t(kHudRect[0] + 2) * 4,
+                                        presents[i + 1].data() + size_t(y) * ppitch + size_t(kHudRect[0] + 2) * 4, size_t(kHudRect[2] - kHudRect[0] - 4) * 4))
+                            m.hud_same = false;
+            }
+            // The panel's own colour (pure green) never lands outside its scissor, in any frame (R11G11B10: red and blue
+            // zero, green set; other formats: the same test on the first and third channels).
+            for (const auto& f : frames)
+                for (int y = 0; y < int(g.h) && f.size() >= size_t(pitch) * g.h; ++y)
+                    for (int x = 1040; x < int(g.w); ++x) {
+                        if (x >= Game::kPanelScissor[0] && x < Game::kPanelScissor[2] && y >= Game::kPanelScissor[1] && y < Game::kPanelScissor[3]) continue;
+                        uint32_t v = 0;
+                        std::memcpy(&v, px(f, x, y), 4);
+                        const bool green = bpp == 4 ? ((v & 0x7FF) == 0 && (v >> 22) == 0 && ((v >> 11) & 0x7FF) != 0) : false;
+                        m.panel_outside += green ? 1 : 0;
+                    }
+            for (int y = 1; y + 1 < int(g.h); ++y)
+                for (int x = 1; x + 1 < int(g.w); ++x) {
+                    const size_t i = size_t(y) * g.w + x;
+                    if (!edge[i] || (x >= kHudRect[0] && x < kHudRect[2] && y >= kHudRect[1] && y < kHudRect[3])) continue;
+                    // An edge stays still when nothing within one pixel of it changes in any frame pair. (A single pixel is
+                    // not enough: the eight jitter phases span 0.81 pixel, so an edge whose position falls in the rest of
+                    // the pixel never flips its own pixel, while the pixel beside it does.)
+                    bool s = true;
+                    for (int dy = -1; dy <= 1 && s; ++dy)
+                        for (int dx = -1; dx <= 1 && s; ++dx) s = same[i + size_t(ptrdiff_t(dy) * ptrdiff_t(g.w)) + size_t(ptrdiff_t(dx))] != 0;
+                    ++m.edges; m.still += s;
+                    if (in_panel(x, y)) { ++m.panel_edges; m.panel_still += s; }
+                    else if (near_text(x, y)) { ++m.text_edges; m.text_still += s; }
+                    else if (near_line(x, y)) { ++m.line_edges; m.line_still += s; }
+                    else { ++m.other_edges; m.other_still += s; }
+                }
+            return m;
+        };
+        const auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
+        Measure result[2];
+        for (int variant = 0; variant < 2; ++variant) {
+            const bool after = variant == 1;
+            na::native11::ForceSceneOverlayJitterForTests(after ? 1 : 0);
+            run(180); // DLAA starts; a level is prepared and shown
+            const auto cap = root / (after ? L"after" : L"before");
+            std::filesystem::create_directories(cap);
+            na::capture::j2::Request(16, cap.c_str());
+            run(60);
+            Sleep(1500); // the capture writer finishes on its own thread
+            result[variant] = measure(cap);
+            const auto& m = result[variant];
+            std::printf("%s, %s (%s): %d frame pairs; edges never moved by the jitter: all %.2f %% (%llu of %llu), lines %.2f %% (%llu of %llu), "
+                        "labels %.2f %% (%llu of %llu), scissored panel %.2f %% (%llu of %llu; its colour outside the scissor %llu pixels), terrain %.2f %%; "
+                        "interface identical in every frame: %s; this frame's overlay meshes moved %u, "
+                        "scene meshes left on the game's grid %u\n  frames: %ls\n",
+                        level_name, after ? "after" : "before", after ? "jitter/scene-overlays" : "jitter/depth-tested-only", m.pairs,
+                        pct(m.still, m.edges), (unsigned long long)m.still, (unsigned long long)m.edges,
+                        pct(m.line_still, m.line_edges), (unsigned long long)m.line_still, (unsigned long long)m.line_edges,
+                        pct(m.text_still, m.text_edges), (unsigned long long)m.text_still, (unsigned long long)m.text_edges,
+                        pct(m.panel_still, m.panel_edges), (unsigned long long)m.panel_still, (unsigned long long)m.panel_edges,
+                        (unsigned long long)m.panel_outside,
+                        pct(m.other_still, m.other_edges), m.hud_same ? "yes" : "NO",
+                        na::native11::OverlayMeshesMoved(), na::native11::UnjitteredSceneMeshes(), cap.c_str());
+        }
+        na::native11::ForceSceneOverlayJitterForTests(-1);
+        expect(result[0].pairs >= 4 && result[1].pairs >= 4, "consecutive frame pairs were captured before and after");
+        expect(pct(result[0].line_still, result[0].line_edges) > 50.0, "before: the lines' edges stay on the game's grid (the HoI4 symptom reproduced)");
+        expect(pct(result[1].still, result[1].edges) < 1.0, "after: under 1 % of the picture's edges stay still while the jitter moves");
+        expect(pct(result[1].line_still, result[1].line_edges) < 1.0 && pct(result[1].text_still, result[1].text_edges) < 1.0,
+               "after: the lines and labels move with the jitter");
+        expect(result[0].hud_same && result[1].hud_same, "the interface after the hand-over stays exactly on the game's grid");
+        expect(pct(result[1].panel_still, result[1].panel_edges) < 1.0, "after: a scissored panel before the hand-over moves with the jitter");
+        expect(result[0].panel_outside == 0 && result[1].panel_outside == 0, "the scissored panel stays inside its scissor (the scissor is the game's)");
+        DeleteFileW(ini.c_str());
+        std::printf(g_failed ? "FAIL: %d overlay check(s) failed\n" : "PASS: overlays drawn without the depth test take the jitter\n", g_failed);
+        std::fflush(stdout);
+        ExitProcess(g_failed ? 1u : 0u);
+    }
+    if (fold_level) {
+        // The game draws at full size; from the level's first shown frame on, its main scene draws are shaded
+        // in blocks (pixel-shader invocations: one half / one quarter), the shadow pass, the tone map and the
+        // HUD are not, DLSS rebuilds the full picture from the kept pixels, and DLAA stays on screen until
+        // the level has proven itself (no frozen frame). Then back to DLAA.
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        D3D11_RASTERIZER_DESC rd{};
+        rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+        expect(SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.hud_scissor)), "HUD panel state");
+        rd.ScissorEnable = FALSE;
+        expect(SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.scene_rs)), "scene state with no culling");
+        ComPtr<ID3D11Query> main_q, post_q;
+        const D3D11_QUERY_DESC qd{D3D11_QUERY_PIPELINE_STATISTICS, 0};
+        expect(SUCCEEDED(g.device->CreateQuery(&qd, &main_q)) && SUCCEEDED(g.device->CreateQuery(&qd, &post_q)), "pipeline statistics queries");
+        g.main_stats = main_q.Get();
+        {
+            auto ps1 = Compile("ps_scene_coords", "ps_5_0"), ps2 = Compile("ps_hud_coords", "ps_5_0");
+            expect(ps1 && ps2 && SUCCEEDED(g.device->CreatePixelShader(ps1->GetBufferPointer(), ps1->GetBufferSize(), nullptr, &g.ps_scene_main)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(ps2->GetBufferPointer(), ps2->GetBufferSize(), nullptr, &g.ps_hud_main)), "pixel-dependent shading for the fixture");
+        }
+        ComPtr<ID3D11Buffer> count_buf, count_stg;
+        {
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = 16; bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS; bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = DXGI_FORMAT_R32_TYPELESS; ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER; ud.Buffer.NumElements = 4; ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+            D3D11_BUFFER_DESC sd2 = bd;
+            sd2.BindFlags = 0; sd2.MiscFlags = 0; sd2.Usage = D3D11_USAGE_STAGING; sd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            expect(SUCCEEDED(g.device->CreateBuffer(&bd, nullptr, &count_buf)) && SUCCEEDED(g.device->CreateUnorderedAccessView(count_buf.Get(), &ud, &g.count_uav)) &&
+                   SUCCEEDED(g.device->CreateBuffer(&sd2, nullptr, &count_stg)), "the shading counter");
+        }
+        D3D11_TEXTURE2D_DESC cd{};
+        g.color->GetDesc(&cd);
+        cd.Usage = D3D11_USAGE_STAGING; cd.BindFlags = 0; cd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; cd.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> stg;
+        expect(SUCCEEDED(g.device->CreateTexture2D(&cd, nullptr, &stg)), "picture read-back");
+        std::vector<float> prev, cur;
+        // The picture the game reads after DLSS (the scene colour, written back): RGB as floats.
+        const auto read_picture = [&](std::vector<float>& out) {
+            out.assign(size_t(g.w) * g.h * 3, 0.f);
+            g.ctx->CopyResource(stg.Get(), g.color.Get());
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (FAILED(g.ctx->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+            bool finite = true;
+            for (UINT y = 0; y < g.h; ++y) {
+                const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch);
+                for (UINT x = 0; x < g.w; ++x) {
+                    DirectX::PackedVector::XMFLOAT3PK pk(row[x]);
+                    DirectX::XMFLOAT3 f;
+                    DirectX::XMStoreFloat3(&f, DirectX::PackedVector::XMLoadFloat3PK(&pk));
+                    float* o = &out[(size_t(y) * g.w + x) * 3];
+                    o[0] = f.x; o[1] = f.y; o[2] = f.z;
+                    finite = finite && std::isfinite(f.x) && std::isfinite(f.y) && std::isfinite(f.z) && f.x < 64.f && f.y < 64.f && f.z < 64.f;
+                }
+            }
+            g.ctx->Unmap(stg.Get(), 0);
+            return finite;
+        };
+        const auto diff = [&](const std::vector<float>& a, const std::vector<float>& b) {
+            double s = 0;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) s += std::fabs(double(a[i]) - double(b[i]));
+            return a.empty() ? 0.0 : s / double(a.size());
+        };
+        struct Sample { UINT64 scene = 0, post = 0; double ms = 0, change = 0; bool finite = true; };
+        LARGE_INTEGER hz{};
+        QueryPerformanceFrequency(&hz);
+        const auto run = [&](int frame) {
+            Sample s;
+            LARGE_INTEGER t0{}, t1{};
+            QueryPerformanceCounter(&t0);
+            Pump();
+            const UINT zero[4] = {};
+            g.ctx->ClearUnorderedAccessViewUint(g.count_uav.Get(), zero);
+            Scene(g.ctx.Get(), g, frame);
+            g.ctx->Begin(post_q.Get());
+            Post(g.ctx.Get(), g, true);
+            g.ctx->End(post_q.Get());
+            g.ctx->CopyResource(count_stg.Get(), count_buf.Get());
+            g.swap->Present(0, 0);
+            QueryPerformanceCounter(&t1);
+            s.ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(hz.QuadPart);
+            D3D11_QUERY_DATA_PIPELINE_STATISTICS a{}, b{};
+            while (g.ctx->GetData(main_q.Get(), &a, sizeof a, 0) == S_FALSE) Sleep(0);
+            while (g.ctx->GetData(post_q.Get(), &b, sizeof b, 0) == S_FALSE) Sleep(0);
+            s.scene = a.PSInvocations; s.post = b.PSInvocations;
+            {
+                D3D11_MAPPED_SUBRESOURCE cm{};
+                if (SUCCEEDED(g.ctx->Map(count_stg.Get(), 0, D3D11_MAP_READ, 0, &cm))) {
+                    const auto* v = static_cast<const uint32_t*>(cm.pData);
+                    s.scene = v[0]; s.post = v[1]; // the main scene's and the HUD's own shading, counted by the shaders
+                    g.ctx->Unmap(count_stg.Get(), 0);
+                }
+            }
+            s.finite = read_picture(cur);
+            s.change = prev.empty() ? 0.0 : diff(cur, prev);
+            prev.swap(cur);
+            return s;
+        };
+        const auto shown_now = [] {
+            char status[512]{};
+            na::native_d3d11::FoldStatus(status, sizeof status);
+            return std::string(status);
+        };
+        auto& st = na::settings::Get();
+        // NA_TEST_NO_PREWARM: the levels' DLSS is not made with DLAA's (for the memory comparison only).
+        if (GetEnvironmentVariableW(L"NA_TEST_NO_PREWARM", nullptr, 0)) st.j2_fold_prewarm.store(0);
+        const char* level_name = fold_level == 2 ? "Performance" : "Quality";
+        int frame = 0;
+        // A. DLAA.
+        st.j2_fold_mode.store(0);
+        double dlaa_ms_sum = 0, dlaa_change = 0;
+        UINT64 dlaa_scene = 0, dlaa_post = 0;
+        int dlaa_n = 0;
+        double start_max_ms = 0; // the first frames: DLAA starts, and the levels' DLSS is made with it
+        for (; frame < 60; ++frame) {
+            const Sample s = run(frame);
+            if (frame < 10) start_max_ms = (std::max)(start_max_ms, s.ms);
+            if (frame >= 30) { dlaa_ms_sum += s.ms; dlaa_scene += s.scene; dlaa_post += s.post; dlaa_change += s.change; ++dlaa_n; }
+        }
+        const double dlaa_ms = dlaa_ms_sum / dlaa_n;
+        {   // Video memory this process holds after DLAA has run (with or without the levels' DLSS made beside it).
+            ComPtr<IDXGIDevice> dd;
+            ComPtr<IDXGIAdapter> da;
+            ComPtr<IDXGIAdapter3> a3;
+            DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+            if (SUCCEEDED(g.device.As(&dd)) && SUCCEEDED(dd->GetAdapter(&da)) && SUCCEEDED(da.As(&a3)) &&
+                SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
+                std::printf("  video memory held on DLAA at %ux%u (levels' DLSS made with DLAA's: %s): %.1f MB\n", g.w, g.h,
+                            st.j2_fold_prewarm.load() ? "yes" : "no", double(mi.CurrentUsage) / 1048576.0);
+        }
+        // B. The level asked for: DLAA stays on screen while it is readied, then the switch.
+        st.j2_fold_mode.store(fold_level);
+        const int asked_at = frame;
+        int switched_at = -1;
+        double switch_max_ms = 0;
+        bool finite = true;
+        for (; frame < asked_at + 200 && switched_at < 0; ++frame) {
+            const Sample s = run(frame);
+            if (s.ms > dlaa_ms + 3.0) std::printf("  frame %d (waiting period): %.1f ms\n", frame, s.ms);
+            switch_max_ms = (std::max)(switch_max_ms, s.ms);
+            finite = finite && s.finite;
+            if (shown_now().find(std::string("On screen: ") + level_name) != std::string::npos) switched_at = frame;
+        }
+        const std::string status_after = shown_now();
+        // C. The level on screen.
+        double fold_ms_sum = 0, fold_change = 0, switch_change = 0;
+        UINT64 fold_scene = 0, fold_post = 0;
+        int fold_n = 0;
+        for (int k = 0; k < 90 && switched_at >= 0; ++k, ++frame) {
+            const Sample s = run(frame);
+            finite = finite && s.finite;
+            if (k < 3) switch_change = (std::max)(switch_change, s.change);
+            if (k >= 30) { fold_ms_sum += s.ms; fold_scene += s.scene; fold_post += s.post; fold_change += s.change; ++fold_n; }
+        }
+        static char line11[8192]{};
+        na::native_d3d11::FormatStatus(line11, sizeof line11);
+        const char* gpu = std::strstr(line11, "gpu_ms{");
+        const char* f11 = std::strstr(line11, "fold11{");
+        // E. The other level, straight from this one.
+        const uint32_t other_level = fold_level == 1 ? 2u : 1u;
+        const char* other_name = other_level == 2 ? "Performance" : "Quality";
+        st.j2_fold_mode.store(other_level);
+        double other_max_ms = 0;
+        int other_at = -1;
+        for (int k = 0; k < 200 && other_at < 0; ++k, ++frame) {
+            const Sample s = run(frame);
+            other_max_ms = (std::max)(other_max_ms, s.ms);
+            if (s.ms > dlaa_ms + 3.0) std::printf("  to %s, frame +%d: %.1f ms\n", other_name, k, s.ms);
+            if (shown_now().find(std::string("On screen: ") + other_name) != std::string::npos) other_at = k;
+        }
+        if (other_at < 0) std::printf("  %s never came on screen: %s (DLSS: %s, NGX result 0x%08x)\n", other_name, shown_now().c_str(), na::dlss::GetStats().reason,
+                                      static_cast<unsigned>(na::dlss::GetStats().last_ngx_result));
+        for (int k = 0; k < 20; ++k, ++frame) other_max_ms = (std::max)(other_max_ms, run(frame).ms);
+        // D. Back to DLAA.
+        st.j2_fold_mode.store(0);
+        UINT64 back_scene = 0;
+        int back_n = 0;
+        double back_max_ms = 0;
+        for (int k = 0; k < 40; ++k, ++frame) {
+            const Sample s = run(frame);
+            if (k < 20) back_max_ms = (std::max)(back_max_ms, s.ms);
+            if (k < 20 && s.ms > dlaa_ms + 3.0) std::printf("  back to DLAA, frame +%d: %.1f ms\n", k, s.ms);
+            if (k >= 20) { back_scene += s.scene; ++back_n; }
+        }
+        std::printf("  switches (longest frame, steady DLAA frame %.1f ms): first frames %.1f ms (DLAA and the levels' DLSS made); DLAA -> %s %.1f ms; %s -> %s %.1f ms (on screen after %d frames); -> DLAA %.1f ms\n",
+                    dlaa_ms, start_max_ms, level_name, switch_max_ms, level_name, other_name, other_max_ms, other_at, back_max_ms);
+        // One DLSS feature at a time (coordinator 2026-11-27): the new feature is made off the frame, and the switch frame waits
+        // only for what is left of NVIDIA's work. The bar is the coordinator's: no switch more than 20 ms over a steady frame.
+        const double margin = 20.0;
+        const auto cs = na::native11::GetCoarseShadingStats();
+        const double r_scene = fold_n ? double(fold_scene) / fold_n / (double(dlaa_scene) / dlaa_n) : 0;
+        const double r_post = fold_n ? double(fold_post) / fold_n / (double(dlaa_post) / dlaa_n) : 0;
+        const double r_back = back_n ? double(back_scene) / back_n / (double(dlaa_scene) / dlaa_n) : 0;
+        std::printf("fold %s on the DX11 test game (%ux%u):\n"
+                    "  pixel-shader invocations per frame: main scene DLAA %.0f -> %s %.0f (x%.3f), HUD %.0f -> %.0f (x%.3f), back on DLAA x%.3f\n"
+                    "  waiting period: asked at frame %d, on screen at frame %d (%d frames); frame time DLAA %.1f ms, slowest while readied %.1f ms, on the level %.1f ms\n"
+                    "  picture change between frames (mean |d| RGB): DLAA %.5f, at the switch %.5f, on the level %.5f; finite %d\n"
+                    "  menu: %s\n  %.*s\n  %.*s\n  coarse: draws %llu sets %llu restores %llu before_lists %llu failures %llu frames %llu\n",
+                    level_name, g.w, g.h, double(dlaa_scene) / dlaa_n, level_name, fold_n ? double(fold_scene) / fold_n : 0.0, r_scene,
+                    double(dlaa_post) / dlaa_n, fold_n ? double(fold_post) / fold_n : 0.0, r_post, r_back,
+                    asked_at, switched_at, switched_at - asked_at, dlaa_ms, switch_max_ms, fold_n ? fold_ms_sum / fold_n : 0.0,
+                    dlaa_change / dlaa_n, switch_change, fold_n ? fold_change / fold_n : 0.0, finite ? 1 : 0, status_after.c_str(),
+                    gpu ? int(std::strcspn(gpu, "}") + 1) : 0, gpu ? gpu : "", f11 ? int(std::strcspn(f11, "}") + 1) : 0, f11 ? f11 : "",
+                    static_cast<unsigned long long>(cs.draws), static_cast<unsigned long long>(cs.sets), static_cast<unsigned long long>(cs.restores),
+                    static_cast<unsigned long long>(cs.before_lists), static_cast<unsigned long long>(cs.failures), static_cast<unsigned long long>(cs.frames));
+        expect(switched_at >= asked_at + int(na::fold::Handover::kWarmFrames), "DLAA stays on screen until the level has proven itself (8 good frames)");
+        expect(switch_max_ms < dlaa_ms + margin, "no slow frame from DLAA to the level (within 20 % + 4 ms of a steady frame)");
+        expect(other_at >= 0 && other_max_ms < dlaa_ms + margin, "no slow frame from one level to the other");
+        expect(back_max_ms < dlaa_ms + margin, "no slow frame back to DLAA");
+        const bool quarter = fold_level == 2;
+        expect(quarter ? (r_scene > 0.22 && r_scene < 0.34) : (r_scene > 0.47 && r_scene < 0.60),
+               quarter ? "the main scene's draws run about a quarter of the pixel shading" : "the main scene's draws run about half of the pixel shading");
+        expect(r_post > 0.999 && r_post < 1.001, "the HUD keeps full-rate shading");
+        expect(r_back > 0.999 && r_back < 1.001, "back on DLAA the scene is shaded per pixel again");
+        expect(finite && fold_n && fold_change / fold_n < 3.0 * (dlaa_change / dlaa_n) + 0.002 && switch_change < 4.0 * (dlaa_change / dlaa_n) + 0.004,
+               "DLSS's folded picture is sane: it changes from frame to frame like DLAA's, with no jump at the switch");
+        expect(gpu && std::strstr(gpu, "samples=0") == nullptr, "per-stage GPU ms are logged on the DX11 route");
+        expect(cs.failures == 0 && cs.draws > 0, "coarse shading was set with no failure");
+        if (fold_measured) {
+            const char* ff = f11 ? std::strstr(f11, "folded_flow=") : nullptr;
+            const char* sm = f11 ? std::strstr(f11, "sampled_motion=") : nullptr;
+            { const auto fs = na::j2::compute_flow::GetStats(); std::printf("  folded working set: prepared %llu, failed %llu\n", (unsigned long long)fs.prepared, (unsigned long long)fs.prepare_failed); }
+            expect(sm && std::strtoull(sm + 15, nullptr, 10) >= 30, "with no camera the motion is sampled: only the kept pixels are decided");
+            expect(ff && std::strtoull(ff + 12, nullptr, 10) >= 30, "with no camera the motion search runs on the folded picture");
+        }
+        DeleteFileW(ini.c_str());
+        if (g_failed) std::printf("FAIL: %d fold check(s) failed\n", g_failed);
+        else std::printf("PASS: DLSS %s on the native DX11 route\n", level_name);
+        std::fflush(stdout);
+        ExitProcess(g_failed ? 1u : 0u);
+    }
     if (camera_off_start) {
         // Cold start: no earlier camera-backed frame, no hand-written next jitter, no warm flow pair.
         // Run the production host and real NGX (also via NA_DLAA_COMPANION=1). Camera bytes exist in
@@ -2092,10 +3052,15 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         g_no_camera_phase = 1;
         na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
         unsigned raster_samples = 0;
+        if (replay_handoff) {
+            na::settings::Get().j2_draw_replay.store(1);
+            na::settings::Get().j2_replay_budget.store(0);
+            na::settings::Get().j2_replay_movers.store(0);
+        }
         for (int frame = 0; frame < 48; ++frame) {
             Pump();
             const auto before = g_seen.calls;
-            Scene(g.ctx.Get(), g, frame);
+            Scene(g.ctx.Get(), g, frame, false, replay_handoff);
             Post(g.ctx.Get(), g, true);
             g.swap->Present(0, 0);
             if (g_seen.calls > before && g_seen.last.raster.applied &&
@@ -2114,6 +3079,17 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(g_seen.wrong_inputs == 0 && g_seen.no_scene == 0 && g_seen.scene_changed == 1 && g_seen.twice == 0,
                "correct scene/depth identity survives bootstrap without repeated resets or duplicate deliveries");
         expect(raster_samples >= 20, "production delivery schedules actual viewport samples without a test-provided jitter");
+        if (replay_handoff) {
+            const auto replay = na::native11::draw_replay::GetStats();
+            constexpr char key[] = "replay_delivered=";
+            const char* field = std::strstr(wide, key);
+            const auto replay_frames = field ? std::strtoull(field + sizeof(key) - 1, nullptr, 10) : 0ull;
+            std::printf("DX11 replay handoff: replayed=%llu packed=%llu pack_failed=%llu delivered_with_replay=%llu gates=%s\n",
+                        (unsigned long long)replay.replayed, (unsigned long long)replay.packed,
+                        (unsigned long long)replay.pack_failed, replay_frames, replay.gates);
+            expect(replay.packed >= 20 && !replay.pack_failed && replay_frames >= 20,
+                   "GPU-packed positions reach the native DLSS motion path across the slot ring");
+        }
         expect(std::strstr(wide, "camera_setting=0") && std::strstr(wide, "measured=0}") == nullptr,
                "the production consumer names camera-independent measured motion");
         DeleteFileW(ini.c_str());

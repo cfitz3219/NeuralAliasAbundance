@@ -50,6 +50,20 @@ int main() { return test::run({
         no = m; no.mesh = false; CHECK(!StillMeshTakesJitter(no));             // a full-screen pass never moves
         no = m; no.scene_viewport = false; CHECK(!StillMeshTakesJitter(no));   // a partial view
     }},
+    {"an overlay drawn into the scene colour without the depth test takes the sample", [] {
+        SceneOverlay o;
+        o.active = o.scene_depth_bound = o.scene_colour = o.mesh = o.scene_viewport = true;
+        CHECK(SceneOverlayTakesJitter(o));                                        // rails, borders, labels on the map
+        auto no = o; no.enabled = false; CHECK(!SceneOverlayTakesJitter(no));     // jitter/depth-tested-only
+        no = o; no.active = false; CHECK(!SceneOverlayTakesJitter(no));           // no sample in force
+        no = o; no.tests_depth = true; CHECK(!SceneOverlayTakesJitter(no));       // the ordinary rule's draw
+        no = o; no.scene_depth_bound = false; CHECK(!SceneOverlayTakesJitter(no)); // another view
+        no = o; no.scene_colour = false; CHECK(!SceneOverlayTakesJitter(no));     // another target (a mask, a shadow)
+        no = o; no.mesh = false; CHECK(!SceneOverlayTakesJitter(no));             // a full-screen pass never moves
+        no = o; no.scene_viewport = false; CHECK(!SceneOverlayTakesJitter(no));   // its own viewport (a minimap)
+        no = o; no.after_handover = true; CHECK(!SceneOverlayTakesJitter(no));    // the interface after the hand-over
+        no = o; no.reads_stationary_layer = true; CHECK(!SceneOverlayTakesJitter(no)); // reads a layer on the game's grid: stays on it
+    }},
     {"known Halton samples and wrapping", [] {
         const double xs[] = {0, -.25, .25, -.375};
         const double ys[] = {-1./6, 1./6, -7./18, -1./18};
@@ -93,5 +107,14 @@ int main() { return test::run({
         NEAR((mul(j, 0) / mul(j, 3) - mul(m, 0) / mul(m, 3)) * 400, .25, 1e-12);
         NEAR((mul(j, 1) / mul(j, 3) - mul(m, 1) / mul(m, 3)) * -300, -.375, 1e-12);
         NEAR(mul(j, 2), mul(m, 2), 0); NEAR(mul(j, 3), mul(m, 3), 0); CHECK(m == original);
+    }},
+    {"jitter/ramp-after-restart: no offset on the first frame after a restart, then back in steps", [] {
+        // jitter/full-after-restart (ramp 0): always the full sample.
+        CHECK(RestartJitterScale(0, 0) == 1.f && RestartJitterScale(1, 0) == 1.f);
+        // Ramp 8: the first frame accumulated on the new history has no offset, frame 9 on the full sample.
+        CHECK(RestartJitterScale(1, 8) == 0.f);
+        CHECK(RestartJitterScale(2, 8) == .125f && RestartJitterScale(5, 8) == .5f && RestartJitterScale(8, 8) == .875f);
+        CHECK(RestartJitterScale(9, 8) == 1.f && RestartJitterScale(1000, 8) == 1.f);
+        for (uint32_t k = 1; k < 9; ++k) CHECK(RestartJitterScale(k + 1, 8) > RestartJitterScale(k, 8));
     }},
 }); }

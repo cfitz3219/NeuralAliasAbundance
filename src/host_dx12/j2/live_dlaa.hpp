@@ -337,6 +337,7 @@ struct Stats {
     // because nothing could be measured; cameras that came back after measured frames.
     uint64_t supplied_camera = 0, supplied_measured = 0;
     uint64_t measured_no_pair = 0, measured_cut_resets = 0, measured_unavailable = 0, cut_after_measured = 0;
+    uint64_t restart_ramped = 0; // frames whose jitter was scaled down after a history restart (jitter/ramp-after-restart)
     uint32_t measured_last_no_pair = 0;
     // Which end of the depth is near, with no camera to say: the last decision (0 not proven,
     // 1 smaller is nearer, 2 larger is nearer; native11/depth_direction.hpp DepthVerdict for why),
@@ -508,6 +509,33 @@ void FoldStatus(char* out, size_t n);
 void StartSmearTest();
 bool SmearTestRunning();
 void SmearTestStatus(char* text, size_t capacity);
+
+// Route B live Frame Generation (2026-11-26). While it is on: DLSS's depth and motion of every
+// evaluated frame go to Frame Generation (zero camera, reset on our confirmed scene cut); the
+// game's HUD sheet is learned by its shape from one traced frame; each frame the sheet is copied
+// at its first HUD draw, and at the game's final draw into the shown picture the sheet's contents
+// are swapped for that copy, the same draw is run once more into our own target (the HUD-free
+// picture), and the sheet is restored before the game's own draw. No descriptor or heap of the
+// game is written.
+void SetLiveFrameGeneration(bool on);
+// The presenter asks once per frame: this frame's HUD-free picture (RENDER_TARGET at rest), or
+// null and why in plain words.
+ID3D12Resource* LiveHudFree(const char** why);
+struct LiveHudStats {
+    uint32_t learned = 0;          // the sheet and the final draw are known
+    uint64_t sheet = 0, learn_attempts = 0;
+    uint32_t run = 0;
+    uint64_t grabs = 0, redraws = 0, skipped = 0, blended_backgrounds = 0;
+    uint64_t submitted = 0, relearns = 0; // HUD-free pictures whose list was submitted; shape changes relearned
+    char skip_counts[1200] = "";   // "count x reason; ..." for every skip reason seen
+    char verdict[160] = "";        // what learning found (plain words)
+    char last_skip[112] = "";      // why the last redraw did not happen
+    char method[96] = "";          // the HUD method in use (for the results log)
+    float grab_ms = 0, grab_avg = 0, redraw_ms = 0, redraw_avg = 0; // GPU time in the game's lists
+};
+LiveHudStats GetLiveHudStats();
+// The same figures for the API the game runs: on the native DX11 route they come from native11/hud_free.
+LiveHudStats GetLiveHudStatsAnyApi();
 
 // Releases GPU objects (test hosts; the caller guarantees GPU idle).
 void Shutdown();

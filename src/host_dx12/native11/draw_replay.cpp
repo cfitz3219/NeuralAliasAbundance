@@ -1,5 +1,6 @@
 // Draw replay on the native DX11 route: see draw_replay.hpp. Mirrors observe/producers.cpp "Draw
 // replay" (DX12) step by step; where D3D11 differs it says so.
+#include "core/replay_depth.hpp"
 #include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 
@@ -146,16 +147,19 @@ bool EnsureBuffers(ID3D11Device* dev)
     bd.Usage = D3D11_USAGE_DEFAULT;
     bd.BindFlags = D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_SHADER_RESOURCE;
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    sv.Format = DXGI_FORMAT_R32_UINT; // Read the stream-output words without floating point conversion.
     sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
     sv.Buffer.FirstElement = 0;
-    sv.Buffer.NumElements = kCapacity;
+    sv.Buffer.NumElements = kCapacity * 4u;
     static constexpr char kPackShader[] = R"(
-Buffer<float4> positions : register(t0);
-RWTexture2D<float4> packed : register(u0);
-[numthreads(64, 1, 1)] void main(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID) {
-    const uint x = g.x * 64u + t.x;
-    packed[uint2(x, g.y)] = positions[g.y * 4096u + x];
+Buffer<uint> words : register(t0);
+RWTexture2D<unorm float4> packed : register(u0);
+[numthreads(64, 1, 1)] void main(uint3 p : SV_DispatchThreadID) {
+    uint width, height;
+    packed.GetDimensions(width, height);
+    uint word = words[p.y * width + p.x];
+    uint4 bytes = uint4(word, word >> 8, word >> 16, word >> 24) & 255u;
+    packed[p.xy] = float4(bytes) / 255.0;
 }
 )";
     ComPtr<ID3DBlob> code;
@@ -324,10 +328,10 @@ void AfterDraw(ID3D11DeviceContext* c, const DrawFacts& facts, const DrawArgs& a
                 for (UINT i = 0; i < (b.IndependentBlendEnable ? 8u : 1u); ++i) blended = blended || b.RenderTarget[i].BlendEnable != FALSE;
             }
         }
-        const bool matched = d.DepthEnable && !written && !blended &&
-            (d.DepthFunc == D3D11_COMPARISON_EQUAL || d.DepthFunc == D3D11_COMPARISON_LESS_EQUAL || d.DepthFunc == D3D11_COMPARISON_GREATER_EQUAL);
-        if (!written && !matched) { gate(kGateNoDepthWrite); return; }
-        if (matched) gate(kGateDepthMatched);
+        // The same rule as DX12's recipe and gate (core/replay_depth.hpp).
+        const auto use = na::replay::DepthUseOf(d.DepthEnable != FALSE, written, blended, static_cast<uint32_t>(d.DepthFunc));
+        if (use == na::replay::DepthUse::No) { gate(kGateNoDepthWrite); return; }
+        if (use == na::replay::DepthUse::Matched) gate(kGateDepthMatched);
     }
     Held<ID3D11VertexShader> vs;
     c->VSGetShader(&vs.p, nullptr, nullptr);

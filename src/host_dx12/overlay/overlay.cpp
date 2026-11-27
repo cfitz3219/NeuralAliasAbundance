@@ -79,6 +79,7 @@
 #include "host_dx12/overlay/na_style.hpp"
 #include "host_dx12/overlay/sharpness_preview.hpp"
 #include "host_dx12/overlay/presenter.hpp"
+#include "host_dx12/native11/hud_free.hpp"
 #include "host_dx12/overlay/freeze_watchdog.hpp"
 #include "host_dx12/nr/queue_trace.hpp"
 #include <ctime>
@@ -309,7 +310,7 @@ HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, 
     // DX11 game on our 11on12 device: its swap chain becomes a real D3D12 chain on our queue
     // (the game keeps one virtual D3D11 back buffer; see on12::TranslateSwapChain).
     ComPtr<ID3D12CommandQueue> on12_queue;
-    if (d && na::on12::Enabled()) {
+    if (d && (na::on12::Enabled() || na::on12::NativeProxyOn())) { // the bridge's device, or a native DX11 proxy chain
         DXGI_SWAP_CHAIN_DESC real{};
         if (na::on12::TranslateSwapChain(dev, use_copy ? copy : *d, real, on12_queue.ReleaseAndGetAddressOf())) { copy = real; use_copy = true; }
     }
@@ -324,6 +325,7 @@ HRESULT STDMETHODCALLTYPE DetourCreateSwapChain(IDXGIFactory* f, IUnknown* dev, 
         { na::native_present::NativeScope native; hr = g_orig_create_swapchain(f, dev, d, out); }
     }
     if (SUCCEEDED(hr) && out && *out) {
+        na::on12::NoteChainCreated(*out);
         note_swapchain_queue(on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, *out);
         if (d) small_attach(d->OutputWindow, *out);
     }
@@ -336,7 +338,7 @@ HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, H
     bool use_copy = false;
     if (d && na::j2::RenderSmall()) { copy = *d; use_copy = true; small_native_dims(w, copy.Width, copy.Height); }
     ComPtr<ID3D12CommandQueue> on12_queue; // DX11 bridge: real D3D12 chain on our queue
-    if (d && na::on12::Enabled()) {
+    if (d && (na::on12::Enabled() || na::on12::NativeProxyOn())) {
         DXGI_SWAP_CHAIN_DESC1 real{};
         if (na::on12::TranslateSwapChain1(dev, use_copy ? copy : *d, real, on12_queue.ReleaseAndGetAddressOf())) { copy = real; use_copy = true; }
     }
@@ -349,6 +351,7 @@ HRESULT STDMETHODCALLTYPE DetourCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, H
         { na::native_present::NativeScope native; hr = g_orig_create_for_hwnd(f, dev, w, d, fs, o, out); }
     }
     if (SUCCEEDED(hr) && out && *out) {
+        na::on12::NoteChainCreated(*out);
         note_swapchain_queue(on12_queue ? static_cast<IUnknown*>(on12_queue.Get()) : dev, *out);
         small_attach(w, *out);
     }
@@ -884,6 +887,73 @@ void flush_events()
     for (const std::string& e : events) all += e;
     append_status_text(all.data(), static_cast<int>(all.size()));
 }
+// Route B live Frame Generation, one line per status interval: written on both routes (the native DX11
+// route returns early from write_status_line, so its x2 state was missing from the 5-second log).
+void write_fglive_line()
+{
+    if (!na::present::LiveFrameGeneration()) return;
+    na::fg::Stats fg = na::fg::GetStats();
+    na::present::Stats pr = na::present::GetStats();
+    {
+        // Route B live Frame Generation: one line per status interval, every figure the RESULTS
+        // section reads. Milliseconds are GPU time per real frame, last/average.
+        const auto lv = na::present::GetLiveStats();
+        const auto hud = na::j2::GetLiveHudStatsAnyApi();
+        const auto file = na::fg::GetRuntimeFile();
+        const float hud_last = hud.grab_ms + hud.redraw_ms + lv.hudcopy_ms + lv.paste_ms;
+        const float hud_avg = hud.grab_avg + hud.redraw_avg + lv.hudcopy_avg + lv.paste_avg;
+        char why[160] = {};
+        const bool can = na::fg::Available(why, sizeof why);
+        char fl[6144];
+        const int fn = snprintf(fl, sizeof fl,
+            "fglive on=%u choice=%s can_run=%u active=%u real_fps=%.1f shown_fps=%.1f generated_shown=%llu real_frames=%llu inline_frames=%llu presenter_frames=%llu "
+            "skipped{no_hudfree=%llu menu=%llu preparing=%llu runtime_veto=%llu runtime=%llu gen_dropped=%llu late=%llu} resets{cut=%llu other=%llu} "
+            "hud{learned=%u method=\"%s\" grabs=%llu redraws=%llu skipped=%llu blended=%llu last_skip=\"%s\" verdict=\"%s\" submitted=%llu relearns=%llu skip_counts=\"%s\"} "
+            "ms{off=%.3f/%.3f fg_eval=%.3f/%.3f hud=%.3f/%.3f grab=%.3f redraw=%.3f hudcopy=%.3f paste=%.3f presenter=%.3f/%.3f total=%.3f/%.3f} "
+            "vram_mb{budget=%llu usage=%llu extra=%llu} dlssg{path=\"%s\" version=%s loaded=%u} prepare=\"%s\" reason=\"%s\" why_not=\"%s\" waiting_ms=%u waiting=\"%s\" "
+            "steady{setting=%s ready=%u corrected=%llu off_frames=%llu share_pct=%.2f ms=%.3f/%.3f dropped{gap=%llu reset=%llu no_motion=%llu relearn=%llu resize=%llu refused=%llu} why=\"%s\"} "
+            "hud_move{variant=%s ready=%u frames=%llu pictures=%llu tiles{moving=%llu fixed=%llu} pixels{moving=%llu fixed=%llu} shift_px=%.2f "
+            "pasted_t2{pair=%llu reset=%llu motion=%llu off=%llu size=%llu}} "
+            "display{reported_hz=%.0f max_hz=%.0f dynamic=\"%s\" skipped_above_max=%llu} capture=\"%s\"\r\n",
+            fg.enabled, fg.enabled ? "x2" : "Off", can ? 1u : 0u, fg.active, pr.base_fps, pr.shown_fps,
+            static_cast<unsigned long long>(pr.generated_shown), static_cast<unsigned long long>(fg.real_frames),
+            static_cast<unsigned long long>(lv.frames_inline), static_cast<unsigned long long>(lv.frames_worker),
+            static_cast<unsigned long long>(lv.skipped_no_hudfree), static_cast<unsigned long long>(lv.skipped_menu),
+            static_cast<unsigned long long>(lv.skipped_preparing), static_cast<unsigned long long>(lv.skipped_veto),
+            static_cast<unsigned long long>(fg.skipped), static_cast<unsigned long long>(pr.generated_dropped), static_cast<unsigned long long>(pr.late),
+            static_cast<unsigned long long>(fg.resets_cut), static_cast<unsigned long long>(fg.resets_other),
+            hud.learned, hud.method, static_cast<unsigned long long>(hud.grabs), static_cast<unsigned long long>(hud.redraws),
+            static_cast<unsigned long long>(hud.skipped), static_cast<unsigned long long>(hud.blended_backgrounds), hud.last_skip, hud.verdict,
+            static_cast<unsigned long long>(hud.submitted), static_cast<unsigned long long>(hud.relearns), hud.skip_counts,
+            lv.off_ms, lv.off_avg, lv.eval_ms, lv.eval_avg, hud_last, hud_avg, hud.grab_avg, hud.redraw_avg, lv.hudcopy_avg, lv.paste_avg,
+            lv.copy_ms, lv.copy_avg, lv.eval_ms + hud_last + lv.copy_ms, lv.eval_avg + hud_avg + lv.copy_avg,
+            static_cast<unsigned long long>(lv.vram_budget_mb), static_cast<unsigned long long>(lv.vram_usage_mb), static_cast<unsigned long long>(lv.extra_mb),
+            file.path, file.version[0] ? file.version : "none", file.loaded ? 1u : 0u, lv.prepare, fg.reason, can ? "" : why, lv.waiting_ms, lv.waiting,
+            lv.steady_on ? "On" : "Off", lv.steady_ready, static_cast<unsigned long long>(lv.steady_frames), static_cast<unsigned long long>(lv.steady_off_frames),
+            lv.steady_share, lv.steady_ms, lv.steady_avg, static_cast<unsigned long long>(lv.steady_drop_gap), static_cast<unsigned long long>(lv.steady_drop_reset),
+            static_cast<unsigned long long>(lv.steady_drop_motion), static_cast<unsigned long long>(lv.steady_drop_relearn),
+            static_cast<unsigned long long>(lv.steady_drop_resize), static_cast<unsigned long long>(lv.steady_drop_refused), lv.steady_why,
+            lv.move_on ? "hudpaste/moves-with-scene" : "hudpaste/screen-fixed", lv.move_ready,
+            static_cast<unsigned long long>(lv.move_frames), static_cast<unsigned long long>(lv.move_pictures),
+            static_cast<unsigned long long>(lv.move_tiles_moving), static_cast<unsigned long long>(lv.move_tiles_fixed),
+            static_cast<unsigned long long>(lv.move_pixels_moving), static_cast<unsigned long long>(lv.move_pixels_fixed), lv.move_shift_px,
+            static_cast<unsigned long long>(lv.move_fb_pair), static_cast<unsigned long long>(lv.move_fb_reset),
+            static_cast<unsigned long long>(lv.move_fb_motion), static_cast<unsigned long long>(lv.move_fb_off),
+            static_cast<unsigned long long>(lv.move_fb_size),
+            lv.display_reported_hz, lv.display_max_hz, lv.display_dynamic, static_cast<unsigned long long>(lv.skipped_display), lv.capture);
+        if (fn > 0) append_status_text(fl, (std::min)(fn, int(sizeof fl) - 1));
+        static char last_why[160] = {};
+        if (std::strcmp(last_why, why)) { // the log says WHY when it cannot run, once per change
+            strncpy_s(last_why, why, _TRUNCATE);
+            na::eventlog::Emit("fg_live", "%s", can ? "Frame Generation can run here." : why);
+        }
+        static char last_wait[200] = {};
+        if (std::strcmp(last_wait, lv.waiting)) { // x2 on but nothing generated for over a second: say why, once per change
+            strncpy_s(last_wait, lv.waiting, _TRUNCATE);
+            na::eventlog::Emit("fg_live", "%s", lv.waiting[0] ? lv.waiting : "x2 is generating pictures (or Off).");
+        }
+    }
+}
 void write_status_line()
 {
     na::settings::PollHiddenSettings(); // hidden ini keys stay live (at most one check a second)
@@ -921,6 +991,7 @@ void write_status_line()
                 enabled, static_cast<unsigned long long>(ambient.recorded), ambient.compiling ? 1u : 0u, ambient.reason);
             if (count > 0) append_status_text(fx, (std::min)(count, int(sizeof fx) - 1));
         }
+        write_fglive_line();
         return;
     }
     {
@@ -960,6 +1031,7 @@ void write_status_line()
     if (f == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(f, line, static_cast<DWORD>((std::min)(n, static_cast<int>(sizeof(line)-1))), &written, nullptr);
+    write_fglive_line();
     char mode_line[1536]{};
     const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
@@ -1162,7 +1234,8 @@ void write_status_line()
             const int vn = snprintf(vl, sizeof vl,
                 "viewport_jitter mode=%d frames=%llu declared_list=%llu declared_submitted=%llu declared_none=%llu other_frame=%llu scene_draws=%llu sets=%llu restores=%llu unknown_viewports=%llu centered_layer_lists=%llu/%llu "
                 "aligned_shader_depth_draws=%llu shader_depth_refused{no_layer=%llu not_read=%llu writes_layer=%llu one_target=%llu viewport=%llu} "
-                "referee_still_meshes{asked=%d asks=%llu moved_draws=%llu}\r\n",
+                "referee_still_meshes{asked=%d asks=%llu moved_draws=%llu} variant=%s overlays_moved=%llu "
+                "left_on_game_grid{other_target=%llu own_viewport=%llu rule_off=%llu after_handover=%llu stationary_source=%llu}\r\n",
                 na::settings::Get().j2_viewport_jitter.load(), (unsigned long long)j2.vpj_frames, (unsigned long long)j2.vpj_from_list,
                 (unsigned long long)j2.vpj_from_submitted, (unsigned long long)j2.vpj_none, (unsigned long long)j2.vpj_other_frame,
                 (unsigned long long)vps.draws, (unsigned long long)vps.sets, (unsigned long long)vps.restores, (unsigned long long)vps.unknown,
@@ -1170,7 +1243,11 @@ void write_status_line()
                 (unsigned long long)vps.shader_depth, (unsigned long long)vps.shader_depth_refused.no_layer,
                 (unsigned long long)vps.shader_depth_refused.not_read, (unsigned long long)vps.shader_depth_refused.writes_layer,
                 (unsigned long long)vps.shader_depth_refused.one_target, (unsigned long long)vps.shader_depth_refused.viewport,
-                vps.still_asked ? 1 : 0, (unsigned long long)vps.still_asks, (unsigned long long)vps.still_moved);
+                vps.still_asked ? 1 : 0, (unsigned long long)vps.still_asks, (unsigned long long)vps.still_moved,
+                vps.overlays ? "jitter/scene-overlays" : "jitter/depth-tested-only", (unsigned long long)vps.overlay_moved,
+                (unsigned long long)vps.left.other_target, (unsigned long long)vps.left.own_viewport,
+                (unsigned long long)vps.left.rule_off, (unsigned long long)vps.left.after_handover,
+                (unsigned long long)vps.left.stationary_source);
             if (vn > 0) WriteFile(f, vl, DWORD((std::min)(vn, int(sizeof vl - 1))), &written, nullptr);
         }
         { // anisotropic filtering (automatic, hidden [j2] anisotropic_filter): level/action = in use;
@@ -1351,15 +1428,17 @@ void write_status_line()
                 // Camera-free DLAA on this route: whose motion the delivered frames got, the measured
                 // supplier's own resets, and how the depth direction was decided without a camera.
                 static const char* const kDepthEnd[] = {"not_proven", "smaller_is_nearer", "larger_is_nearer"};
-                char fl[640];
+                char fl[800];
                 const int fn = snprintf(fl, sizeof(fl),
                     "j2_camera_free camera_setting=%d motion_supplier{camera=%llu measured=%llu} measured{reset_first_picture=%llu last_no_pair=%u reset_scene_cut=%llu unavailable=%llu camera_back=%llu} "
+                    "restart_ramp{frames=%u ramped=%llu} "
                     "depth_direction{counting=%u decided=%s why=%s writes_less=%u writes_greater=%u equal=%u clears=%u clear=%.3f unproven_frames=%llu flips=%llu camera_disagrees=%llu}\r\n",
                     na::settings::Get().j2_camera.load(std::memory_order_relaxed),
                     static_cast<unsigned long long>(j2.supplied_camera), static_cast<unsigned long long>(j2.supplied_measured),
                     static_cast<unsigned long long>(j2.measured_no_pair), j2.measured_last_no_pair,
                     static_cast<unsigned long long>(j2.measured_cut_resets), static_cast<unsigned long long>(j2.measured_unavailable),
                     static_cast<unsigned long long>(j2.cut_after_measured),
+                    na::settings::Get().j2_restart_ramp.load(std::memory_order_relaxed), static_cast<unsigned long long>(j2.restart_ramped),
                     j2.depth_evidence ? 1u : 0u, kDepthEnd[j2.depth_near < 3 ? j2.depth_near : 0],
                     na::native11::DepthVerdictName(static_cast<na::native11::DepthVerdict>(j2.depth_verdict)),
                     j2.depth_writes_less, j2.depth_writes_greater, j2.depth_writes_equal, j2.depth_clears, static_cast<double>(j2.depth_clear),
@@ -2327,7 +2406,22 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
         if (key && wp == key && !na::capture::j2::Armed()) { // J2 evidence capture, N consecutive frames
             if (GetKeyState(VK_SHIFT) & 0x8000) { if (!na::j2::SmearTestRunning()) na::j2::StartSmearTest(); } // Shift: the smear test
-            else na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+            else {
+                na::capture::j2::RequestTimestamped(na::settings::Get().j2_capture_frames.load());
+                // Native DX11: the shown picture before its first draws and the HUD-free picture too (stage 0 data).
+                if (na::on12::NativeRoute() && na::capture::j2::Directory() && *na::capture::j2::Directory())
+                    na::native11::hud_free::CaptureFrames(na::capture::j2::Directory(), na::settings::Get().j2_capture_frames.load());
+            }
+        }
+    }
+    if (msg == WM_KEYDOWN && !(lp & (1 << 30)) && !(GetKeyState(VK_SHIFT) & 0x8000) && na::present::LiveFrameGeneration() &&
+        na::settings::Get().fg_enabled.load(std::memory_order_relaxed)) {
+        // Live x2: the capture key also saves the pictures actually presented (previous-real / generated / next-real).
+        const uint32_t key = na::settings::Get().j2_capture_key.load(std::memory_order_relaxed);
+        if (key && wp == key) {
+            char why[160] = {};
+            if (!na::present::RequestOutputCapture(8, why, sizeof why)) na::eventlog::Emit("fg_capture", "%s", why);
+            else na::eventlog::Emit("fg_capture", "requested: 8 generated pictures with the real frames around them");
         }
     }
     if (msg == kMsgCursorShow || msg == kMsgCursorRestore) {
@@ -3680,12 +3774,14 @@ void small_follow_mode()
     }
     carry_out(change);
 }
-HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
+HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp,
+                          na::on12::GraphicsApi api = na::on12::GraphicsApi::Dx12)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ID3D12CommandQueue* queue = nullptr;
     ComPtr<ID3D12CommandQueue> retained_queue;
-    if (!present_prelude(sc, queue,retained_queue)) {
+    const bool dx11 = api == na::on12::GraphicsApi::Dx11; // a DX11 proxy chain: no DX12 scene path on its frames
+    if (!present_prelude(sc, queue,retained_queue, nullptr, nullptr, api)) {
         // No queue or not initialised yet: the frame sits in a proxy; forward so
         // the chain keeps turning (a black frame at most, at start-up).
         return g_orig_present(sc, sync, flags);
@@ -3695,8 +3791,8 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     const HRESULT picture_desc_hr = sc->GetDesc(&picture_desc);
     if (na::j2::RenderSmall() && SUCCEEDED(picture_desc_hr))
         na::native_present::ObserveWindowMode(picture_desc.OutputWindow, picture_desc.Windowed != FALSE);
-    const auto receipt = game_frame_boundary(queue, sc); // generated frames bypass this game-facing entry
-    note_identity(sc, queue);
+    const auto receipt = dx11 ? na::referee::gpu::Presentation{} : game_frame_boundary(queue, sc); // generated frames bypass this game-facing entry
+    if (!dx11) note_identity(sc, queue);
     fill_screen_tick(sc);
     if (na::j2::RenderSmall()) small_follow_mode();
     if (na::scale::SliderRouteActive()) na::scale::TickLive(na::j2::GetStats().width); // P4-4: confirm a live render-scale change
@@ -3711,7 +3807,7 @@ HRESULT presenter_present(IDXGISwapChain* sc, UINT sync, UINT flags, const DXGI_
     a.hdr = na::color::IsHdr(na::color::Classify(picture_desc.BufferDesc.Format, static_cast<DXGI_COLOR_SPACE_TYPE>(g_color_space.load(std::memory_order_acquire)))); // A60
     bool open = g_open.load(std::memory_order_acquire);
     a.menu_open = open || g_state.was_open; // closing frame still processes cursor restoration
-    a.frame = &presenter_frame_cb;
+    a.frame = dx11 ? nullptr : &presenter_frame_cb; // DX11: the native route handled the frame before Present
     a.menu = &presenter_menu_cb;
     // MenuFn runs on this recording thread before the owned frame copy. A
     // Home message after this snapshot is handled next frame.
@@ -3766,11 +3862,12 @@ struct Native11Present {
     bool outer = !t_native11_present;
     bool observed = false;
     na::native11::PresentReceipt receipt{};
-    Native11Present(IDXGISwapChain* sc, UINT flags) {
+    Native11Present(IDXGISwapChain* sc, UINT flags, bool menu_by_presenter = false) {
         if (!outer) return;
         t_native11_present = true;
         if (flags & DXGI_PRESENT_TEST) return;
         na::on12::AttachNativePresentation(sc);
+        na::on12::NotePresentedChain(sc); // a chain made before we could take it over: the menu says why x2 cannot run
         na::native_d3d11::SyncCameraUse(); // [j2] camera, live: before this present closes the frame
         na::native11::SetScreenCheck(na::j2::Enabled() && !na::j2::Paused() &&
             na::settings::Get().referee_enabled.load(std::memory_order_relaxed));
@@ -3784,7 +3881,7 @@ struct Native11Present {
         // The Referee and evaluator need the game picture. The diagnostic
         // burst separately saves the composed frame, including our own menu.
         na::native_d3d11::CapturePresent(sc, queue, receipt, PresentPicture::Game);
-        if (ready)
+        if (ready && !menu_by_presenter)
             menu_step(sc, queue, g_open.load(std::memory_order_acquire));
         na::native_d3d11::CapturePresent(sc, queue, receipt, PresentPicture::WithHome);
     }
@@ -3798,13 +3895,31 @@ struct Native11Present {
     ~Native11Present() { if (outer) t_native11_present = false; }
 };
 
+// A DX11 proxy chain the presenter serves (live Frame Generation): the HUD-free picture is wanted while x2 is on.
+bool dx11_served(IDXGISwapChain* sc, UINT flags)
+{
+    if ((flags & DXGI_PRESENT_TEST) || !na::on12::NativeProxy(sc)) return false;
+    const bool live = na::present::LiveFrameGeneration();
+    if (live) na::native11::hud_free::SetWanted(na::settings::Get().fg_enabled.load(std::memory_order_relaxed) != 0);
+    return live && na::present::Enabled();
+}
+
 HRESULT STDMETHODCALLTYPE DetourPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     const auto api = presentation_api(sc);
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present(sc, sync, flags);
     if (api == na::on12::GraphicsApi::Dx11) {
-        Native11Present frame(sc, flags);
-        const HRESULT hr = g_orig_present(sc, sync, flags);
+        // DX11 proxy chain: the game's picture into the real D3D12 buffer first (or into the presenter's
+        // buffer when the presenter serves the chain: live Frame Generation); the Home menu then draws on
+        // that D3D12 picture as it does for a DX12 game.
+        const bool served = dx11_served(sc, flags);
+        na::on12::BeforePresent(sc, flags);
+        Native11Present frame(sc, flags, served);
+        const uint64_t tp = qpc_us();
+        HRESULT hr;
+        if (served) { hr = presenter_present(sc, sync, flags, nullptr, na::on12::GraphicsApi::Dx11); na::on12::AfterPresenterFrame(sc); }
+        else hr = g_orig_present(sc, sync, flags);
+        na::on12::AfterPresent(sc, flags, qpc_us() - tp);
         frame.Complete(sc, flags, hr);
         return hr;
     }
@@ -3849,8 +3964,14 @@ HRESULT STDMETHODCALLTYPE DetourPresent1(IDXGISwapChain1* sc, UINT sync, UINT fl
     const auto api = presentation_api(sc);
     if (api == na::on12::GraphicsApi::Dx11On12) return g_orig_present1(sc, sync, flags, pp);
     if (api == na::on12::GraphicsApi::Dx11) {
-        Native11Present frame(sc, flags);
-        const HRESULT hr = g_orig_present1(sc, sync, flags, pp);
+        const bool served = dx11_served(sc, flags);
+        na::on12::BeforePresent(sc, flags); // DX11 proxy chain (see DetourPresent)
+        Native11Present frame(sc, flags, served);
+        const uint64_t tp = qpc_us();
+        HRESULT hr;
+        if (served) { hr = presenter_present(sc, sync, flags, pp, na::on12::GraphicsApi::Dx11); na::on12::AfterPresenterFrame(sc); }
+        else hr = g_orig_present1(sc, sync, flags, pp);
+        na::on12::AfterPresent(sc, flags, qpc_us() - tp);
         frame.Complete(sc, flags, hr, pp);
         return hr;
     }
@@ -4045,7 +4166,10 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers(IDXGISwapChain* sc, UINT count, UI
             std::lock_guard<std::mutex> lock(g_state.mutex);
             if (g_state.swapchain == sc) release_buffers_locked();
         }
+        // DX11 proxy chain: D3D12 chain parameters; the shared back buffer is rebuilt on success.
+        if (!na::on12::BeforeResize(sc, &count, &fmt, &flags)) { na::native11::AfterResize(sc, DXGI_ERROR_INVALID_CALL); return DXGI_ERROR_INVALID_CALL; }
         const auto result = g_orig_resize(sc, count, w, h, fmt, flags);
+        na::on12::AfterResize(sc, result);
         na::native11::AfterResize(sc, result);
         return result;
     }
@@ -4080,7 +4204,11 @@ HRESULT STDMETHODCALLTYPE DetourResizeBuffers1(IDXGISwapChain3* sc, UINT count, 
             std::lock_guard<std::mutex> lock(g_state.mutex);
             if (g_state.swapchain == sc) release_buffers_locked();
         }
-        const auto result = g_orig_resize1(sc, count, w, h, fmt, flags, node_masks, queues);
+        if (!na::on12::BeforeResize(sc, &count, &fmt, &flags)) { na::native11::AfterResize(sc, DXGI_ERROR_INVALID_CALL); return DXGI_ERROR_INVALID_CALL; }
+        // A proxy chain's real buffers live on our queue: the game's D3D11 "queues" do not apply.
+        const bool proxy = na::on12::NativeProxy(sc);
+        const auto result = g_orig_resize1(sc, count, w, h, fmt, flags, proxy ? nullptr : node_masks, proxy ? nullptr : queues);
+        na::on12::AfterResize(sc, result);
         na::native11::AfterResize(sc, result);
         return result;
     }
@@ -4482,13 +4610,13 @@ bool StartCore(const char* route_tag, PanelFn controls)
                 // Swap-chain creation on the shared factory vtable (after our own dummy
                 // chain exists, so it is never recorded). Late attachments recover
                 // per-buffer queues from submitted writes instead.
-                if (na::j2::RenderSmall() || na::on12::Enabled()) { // render-small size spoof / DX11 bridge description
+                if (na::j2::RenderSmall() || na::on12::Enabled() || na::on12::NativeProxyOn()) { // render-small size spoof / DX11 bridge or proxy description
                     prepare_start_hook(sc.Get(), kSwapGetDescSlot, reinterpret_cast<void*>(&DetourGetDesc),
                                        reinterpret_cast<void**>(&g_orig_get_desc));
                     prepare_start_hook(sc.Get(), kSwap1GetDesc1Slot, reinterpret_cast<void*>(&DetourGetDesc1),
                                        reinterpret_cast<void**>(&g_orig_get_desc1));
                 }
-                if (na::on12::Enabled()) // the game's ID3D11Device from its (D3D12) swap chain
+                if (na::on12::Enabled() || na::on12::NativeProxyOn()) // the game's ID3D11Device from its (D3D12) swap chain
                     prepare_start_hook(sc.Get(), kSwapGetDeviceSlot, reinterpret_cast<void*>(&DetourGetDevice),
                                        reinterpret_cast<void**>(&g_orig_get_device));
                 prepare_start_hook(factory.Get(), kFactoryCreateSwapChainSlot,
