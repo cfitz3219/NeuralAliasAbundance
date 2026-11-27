@@ -187,6 +187,9 @@ struct Settings {
     // Route B live x2: Astra's still-area steadying on the generated picture (fg/steady_pass.hpp).
     // 1 On (default), 0 Off. Remembered per game under [fg_steady_games] <game key>; applies live.
     std::atomic<uint32_t> fg_steady{1};
+    // VARIANT: hudpaste/moves-with-scene (1, default) | hudpaste/screen-fixed (0): x2 places interface that
+    // moves with the scene (map names) at each generated picture's time (fg/hud_move.hpp). Hidden: [fg] hud_move.
+    std::atomic<uint32_t> fg_hud_move{1};
     // A69: the freeze watchdog switched Frame Generation off at this time
     // (seconds since 1970, 0 = never). Shown in the menu until FG is re-enabled.
     std::atomic<uint32_t> fg_frozen_at{0};

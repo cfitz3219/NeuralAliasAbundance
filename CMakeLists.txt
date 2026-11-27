@@ -234,6 +234,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/fg/camera.cpp
   src/host_dx12/fg/frame_gen.cpp
   src/host_dx12/fg/hud_paste.cpp
+  src/host_dx12/fg/hud_move.cpp
   src/host_dx12/fg/steady_pass.cpp
   src/host_dx12/fg/motion_prep.cpp
   src/host_dx12/fg/preset_profile.cpp

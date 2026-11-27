@@ -18,6 +18,7 @@
 #include "host_dx12/color/color_space.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/fg/hud_paste.hpp"
+#include "host_dx12/fg/hud_move.hpp"
 #include "host_dx12/fg/steady_pass.hpp"
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/settings.hpp"
@@ -92,6 +93,9 @@ Timing g_t_off, g_t_copy, g_t_hudcopy, g_t_eval, g_t_paste, g_t_steady;
 // Still-area steadying (Astra): compiled by the preparation thread with the paste; refused with a reason.
 na::fg::SteadyPass g_steady;
 std::atomic<bool> g_steady_ready{false};
+na::fg::HudMove g_move; // hudpaste/moves-with-scene; used on the game's thread after the preparation thread made it
+std::atomic<bool> g_move_ready{false};
+char g_move_refused[160] = "";
 char g_steady_refused[112] = "";
 std::atomic<uint64_t> g_steady_frames{0}, g_steady_off{0}, g_steady_changed{0}, g_steady_counted{0};
 std::atomic<uint64_t> g_drop_gap{0}, g_drop_reset{0}, g_drop_motion{0}, g_drop_relearn{0}, g_drop_resize{0}, g_drop_refused{0};
@@ -724,6 +728,12 @@ void prepare_live_locked(Chain& c)
             if (!steady) na::eventlog::Emit("fg_steady", "not available: %s", why);
             g_steady_ready.store(steady, std::memory_order_release);
         }
+        if (ok && !g_move_ready.load(std::memory_order_acquire)) { // optional: without it the interface is pasted the T2 way
+            const bool moved = g_move.Init(device);
+            set_live_text(g_move_refused, moved ? "" : "the moving-interface pass did not build");
+            if (!moved) na::eventlog::Emit("fg_hud_move", "not available: %s", g_move.Error());
+            g_move_ready.store(moved, std::memory_order_release);
+        }
         g_live_preparing.store(0);
         if (!ok) {
             set_live_text(g_prepare_text, uav ? "Frame Generation could not make its textures on the graphics card."
@@ -1169,6 +1179,17 @@ LiveStats GetLiveStats()
     s.steady_frames = g_steady_frames.load(); s.steady_off_frames = g_steady_off.load();
     { const uint64_t counted = g_steady_counted.load(); s.steady_share = counted ? 100.f * float(double(g_steady_changed.load()) / double(counted)) : 0.f; }
     s.steady_ms = g_t_steady.last.load(); s.steady_avg = g_t_steady.avg.load();
+    {
+        const auto ms = g_move.Read();
+        s.move_on = na::settings::Get().fg_hud_move.load(std::memory_order_relaxed) ? 1u : 0u;
+        s.move_ready = g_move_ready.load() ? 1u : 0u;
+        s.move_frames = ms.frames; s.move_pictures = ms.pictures;
+        s.move_tiles_moving = ms.tiles_moving; s.move_tiles_fixed = ms.tiles_fixed;
+        s.move_pixels_moving = ms.pixels_moving; s.move_pixels_fixed = ms.pixels_fixed;
+        s.move_shift_px = ms.shift_n ? float(ms.shift_px_sum / double(ms.shift_n)) : 0.f;
+        s.move_fb_pair = ms.fallback_pair; s.move_fb_reset = ms.fallback_reset; s.move_fb_motion = ms.fallback_motion;
+        s.move_fb_off = ms.fallback_off; s.move_fb_size = ms.fallback_size;
+    }
     s.steady_drop_gap = g_drop_gap.load(); s.steady_drop_reset = g_drop_reset.load(); s.steady_drop_motion = g_drop_motion.load();
     s.steady_drop_relearn = g_drop_relearn.load(); s.steady_drop_resize = g_drop_resize.load(); s.steady_drop_refused = g_drop_refused.load();
     s.display_reported_hz = g_display_reported.load(); s.display_max_hz = g_display_hz.load();
@@ -1727,9 +1748,38 @@ HRESULT Present(const PresentArgs& a)
                 if (drop) live_first("still-area steadying used a frame pair", false, drop);
             }
             c->list_gen->EndQuery(c->queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, si * kQueriesPerSlot + kLiveQuery + 3);
+            // VARIANT: hudpaste/moves-with-scene (default) | hudpaste/screen-fixed
+            // Interface that moves with the scene (map names drawn after the hand-over) is placed at each
+            // generated picture's time; screen-fixed interface is pasted the T2 way, exactly, on top. Without a
+            // continuous pair of real frames (or with the variant off) everything is pasted the T2 way.
+            bool moving_paste = false;
+            if (count) {
+                const fg::UsedMotion um = fg::LastUsedMotion();
+                Slot& older = c->slots[(si + kSlots - 1) % kSlots];
+                const char* fallback = nullptr;
+                if (!na::settings::Get().fg_hud_move.load(std::memory_order_relaxed)) fallback = "off";
+                else if (!g_move_ready.load(std::memory_order_acquire)) fallback = "off";
+                else if (c->steady_resized) fallback = "size";
+                else if (c->steady_prev_id == UINT64_MAX || c->steady_prev_id + 1 != c->frame_id || !older.hudfree || !older.real_copy ||
+                         c->steady_prev_epoch != g_hud_epoch.load(std::memory_order_relaxed)) fallback = "pair";
+                else if (um.reset || um.frame_id != c->frame_id) fallback = "reset";
+                else if (!um.filled) fallback = "motion";
+                if (!fallback && g_move.Classify(c->list_gen.Get(), s.real_copy.Get(), s.hudfree.Get(), older.real_copy.Get(), older.hudfree.Get(),
+                                                 um.filled, um.mv_scale_x, um.mv_scale_y, fi.width, fi.height, fi.format, picture, c->frame_id)) {
+                    moving_paste = true;
+                    for (uint32_t i = 0; i < count && moving_paste; ++i)
+                        moving_paste = g_move.Paste(c->list_gen.Get(), outs[i], s.real_copy.Get(), s.hudfree.Get(), um.filled, um.mv_scale_x,
+                                                    um.mv_scale_y, float(i + 1) / float(count + 1), fi.width, fi.height, fi.format, picture);
+                    if (!moving_paste) { count = 0; live_first("HUD pasted onto the generated picture", false, "the moving-interface paste failed; the picture is not shown"); }
+                    else live_first("interface that moves with the scene placed at the generated picture's time", true, nullptr);
+                } else {
+                    g_move.Forget();
+                    g_move.NoteFallback(fallback ? fallback : "size");
+                }
+            }
             // T2: the newer real frame's HUD, exactly, through its own HUD mask.
             // A generated picture whose HUD could not be pasted is never shown (it would carry a warped HUD).
-            for (uint32_t i = 0; i < count; ++i)
+            for (uint32_t i = 0; i < count && !moving_paste; ++i)
                 if (!g_paste.Record(c->list_gen.Get(), outs[i], s.real_copy.Get(), s.hudfree.Get(), fi.width, fi.height, fi.format,
                                     static_cast<uint32_t>((c->frame_id * kMaxGenerated + i) % na::fg::HudPaste::kPages), picture)) {
                     live_first("HUD pasted onto the generated picture", false, "the paste pass is not ready; the picture is not shown");

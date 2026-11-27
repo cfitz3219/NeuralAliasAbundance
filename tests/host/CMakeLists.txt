@@ -554,6 +554,18 @@ if(TARGET host_native11)
     add_test(NAME host_native11_fg_x2_quality_test COMMAND native11_dlaa_test --fg-x2-quality)
     add_test(NAME host_native11_fg_x2_performance_test COMMAND native11_dlaa_test --fg-x2-performance)
     set_tests_properties(host_native11_fg_x2_quality_test host_native11_fg_x2_performance_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    # x2 with map names drawn after the hand-over that move with a panning map (hudpaste/moves-with-scene),
+    # at three pan speeds, and the same pasted the T2 way (hudpaste/screen-fixed) for the before figures.
+    foreach(speed IN ITEMS slow mid fast)
+      if(speed STREQUAL "mid")
+        set(names_arg "--fg-x2-names")
+      else()
+        set(names_arg "--fg-x2-names-${speed}")
+      endif()
+      add_test(NAME host_native11_fg_x2_names_${speed}_test COMMAND native11_dlaa_test ${names_arg})
+      add_test(NAME host_native11_fg_x2_names_${speed}_t2_test COMMAND native11_dlaa_test ${names_arg}-t2)
+      set_tests_properties(host_native11_fg_x2_names_${speed}_test host_native11_fg_x2_names_${speed}_t2_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    endforeach()
     # The same in the automatic-API mode (graphics API found at the first present, proxy from chain creation),
     # an interface drawn through deferred contexts (x2 waits with the plain reason), and a chain made before the takeover.
     add_test(NAME host_native11_fg_x2_auto_test COMMAND native11_dlaa_test --fg-x2-auto)
@@ -676,6 +688,8 @@ set_tests_properties(host_overlay_menu_failure_test PROPERTIES TIMEOUT 30 SKIP_R
 na_host_test(presenter_ownership_test SOURCES presenter_ownership_test.cpp LIBS host_dx12 user32)
 # Live Frame Generation T2 HUD paste on the GPU equals the CPU reference (WARP when no GPU).
 na_host_test(fg_hud_paste_test SOURCES fg_hud_paste_test.cpp LIBS host_dx12 d3d12 dxgi LABELS gpu)
+# VARIANT hudpaste/moves-with-scene: interface anchored to a panning map placed at the generated picture's time.
+na_host_test(fg_hud_move_test SOURCES fg_hud_move_test.cpp LIBS host_dx12 d3d12 dxgi d3dcompiler LABELS gpu)
 # Live x2 still-area steadying equals Astra's reference shader; motion fill and dead zone (WARP when no GPU).
 na_host_test(fg_steady_pass_test SOURCES fg_steady_pass_test.cpp LIBS host_dx12 d3d12 dxgi d3dcompiler LABELS gpu)
 # Live Frame Generation: the HUD sheet state at the final draw from same-recording barriers only (WARP).
