@@ -44,6 +44,7 @@
 #include "host_dx12/settings.hpp"
 #include "core/fold_shading.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/diag/release_trace.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/textures.hpp"
@@ -2537,6 +2538,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
                 ++checked;
             }
             std::printf("  presented burst: %zu pictures, %u generated pictures checked, HUD pixels differing from the next real frame: %u\n", kinds.size(), checked, wrong);
+            if (checked < 2) std::printf("  presented.json:\n%s\n", json.c_str()); // why no pair could be checked
             expect(checked >= 2 && wrong == 0, "the interface is exact in generated pictures (the newer real frame's own HUD)");
             if (fg_names && bpp == 4) {
                 // Each name's centre (threshold crossings, to a fraction of a pixel) in the previous real, generated and
@@ -3025,6 +3027,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             if (shown_now().find(std::string("On screen: ") + level_name) != std::string::npos) switched_at = frame;
         }
         const std::string status_after = shown_now();
+        const auto made_after_b = na::dlss::GetPrepareStats(); // the level's feature: this session's first of its kind
         // C. The level on screen.
         double fold_ms_sum = 0, fold_change = 0, switch_change = 0;
         UINT64 fold_scene = 0, fold_post = 0;
@@ -3056,6 +3059,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         if (other_at < 0) std::printf("  %s never came on screen: %s (DLSS: %s, NGX result 0x%08x)\n", other_name, shown_now().c_str(), na::dlss::GetStats().reason,
                                       static_cast<unsigned>(na::dlss::GetStats().last_ngx_result));
         for (int k = 0; k < 20; ++k, ++frame) other_max_ms = (std::max)(other_max_ms, run(frame).ms);
+        const auto made_after_e = na::dlss::GetPrepareStats();
+        std::printf("  first creations (made off the frame): %s %.1f ms, %s %.1f ms\n", level_name, made_after_b.made ? made_after_b.last_ms : -1.0, other_name,
+                    made_after_e.made > made_after_b.made ? made_after_e.last_ms : -1.0);
         print_ours(other_level == 2 ? "Quality then Performance" : "Performance then Quality");
         // D. Back to DLAA.
         st.j2_fold_mode.store(0);
@@ -3087,6 +3093,46 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             std::snprintf(planes_p, sizeof planes_p, "fold_planes_dx11_Performance");
             expect(na::vram::Get(planes_q) == 0 && na::vram::Get(planes_p) == 0, "back on DLAA the levels' folded planes are released");
             expect(later_max_ms < dlaa_ms + 20.0, "no slow frame while the levels' memory is released");
+        }
+        {   // NA_TEST_FOLD_CYCLES=N: N more switch-and-free cycles (level, the other level, back to DLAA and 6.5 s for the
+            // memory to be given back); every frame more than 20 ms over steady is printed with what was being released.
+            wchar_t cv[16]{};
+            const int cycles = GetEnvironmentVariableW(L"NA_TEST_FOLD_CYCLES", cv, 16) ? _wtoi(cv) : 0;
+            double worst = 0;
+            int slow = 0;
+            for (int cycle = 0; cycle < cycles; ++cycle) {
+                const auto phase = [&](uint32_t mode, const char* name, ULONGLONG ms_after) {
+                    st.j2_fold_mode.store(mode);
+                    const ULONGLONG start = GetTickCount64();
+                    ULONGLONG until = start + 4000;
+                    bool on = false;
+                    while (GetTickCount64() < until) {
+                        const ULONGLONG at = GetTickCount64();
+                        const double ms = run(frame).ms;
+                        ++frame;
+                        worst = (std::max)(worst, ms - dlaa_ms);
+                        if (ms > dlaa_ms + 20.0) {
+                            ++slow;
+                            std::printf("  cycle %d, %s: slow frame %.1f ms (+%.1f) at tick %llu, %.2f s into the phase\n", cycle, name, ms, ms - dlaa_ms,
+                                        static_cast<unsigned long long>(at), (at - start) / 1000.0);
+                        }
+                        if (!on && (mode == 0 ? shown_now().find("On screen: DLAA") != std::string::npos
+                                              : shown_now().find(std::string("On screen: ") + (mode == 2 ? "Performance" : "Quality")) != std::string::npos)) {
+                            on = true;
+                            until = GetTickCount64() + ms_after;
+                        }
+                    }
+                    for (const auto& e : na::diag::release_trace::Take())
+                        if (e.ms > 4.0) std::printf("    %s %.1f ms at tick %llu\n", e.what.c_str(), e.ms, e.tick);
+                };
+                phase(fold_level, level_name, 700);
+                phase(fold_level == 1 ? 2u : 1u, fold_level == 1 ? "Performance" : "Quality", 700);
+                phase(0, "DLAA and memory given back", 6500);
+            }
+            if (cycles) {
+                std::printf("  %d switch-and-free cycles: worst frame +%.1f ms over steady (%.1f ms), %d frames more than 20 ms over\n", cycles, worst, dlaa_ms, slow);
+                expect(slow == 0, "no frame more than 20 ms over steady in the switch-and-free cycles");
+            }
         }
         std::printf("  switches (longest frame, steady DLAA frame %.1f ms): first frames %.1f ms (DLAA made); DLAA -> %s %.1f ms; %s -> %s %.1f ms (on screen after %d frames); -> DLAA %.1f ms\n",
                     dlaa_ms, start_max_ms, level_name, switch_max_ms, level_name, other_name, other_max_ms, other_at, back_max_ms);

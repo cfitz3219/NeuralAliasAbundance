@@ -17,9 +17,11 @@
 #include <condition_variable>
 #include <thread>
 #include <vector>
+#include <array>
 
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/diag/vram_ledger.hpp"
+#include "host_dx12/diag/release_trace.hpp"
 
 #if defined(NA_HAVE_NGX_SDK)
 #include <nvsdk_ngx.h>
@@ -233,6 +235,8 @@ struct State {
     // first of its kind.
     bool warming = false;
     uint64_t warm_gen = 0;
+    const char* holder = "none"; // the background work last holding g.m (WHY log of the game's waits)
+    std::array<Key, 2> warmed_keys{};
 };
 State g;
 std::condition_variable g_prep_cv; // with g.m: a background creation finished
@@ -339,6 +343,7 @@ void release_thread()
 {
     if (auto init = g_thread_init.load(std::memory_order_acquire)) init();
     std::lock_guard<std::mutex> lock(g.m);
+    g.holder = "release thread";
     std::vector<void*> handles;
     handles.swap(g.to_release);
     double total = 0;
@@ -346,6 +351,7 @@ void release_thread()
         const auto t0 = std::chrono::steady_clock::now();
         if (g.attached) release_handle(h);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        na::diag::release_trace::Note("dlss_feature_release", ms, GetTickCount64());
         total += ms;
         g.prep_stats.release_last_ms = ms;
         if (ms > g.prep_stats.release_longest_ms) g.prep_stats.release_longest_ms = ms;
@@ -458,6 +464,7 @@ void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
     int32_t code = 0;
     {
         std::lock_guard<std::mutex> lock(g.m);
+        g.holder = "off-frame creation";
         if (g.prep.gen != gen || !g.attached || g.latched || g.device.Get() != dev.Get()) ok = false;
         if (ok && !g.make_queue) {
             D3D12_COMMAND_QUEUE_DESC qd{};
@@ -498,6 +505,11 @@ void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
             const auto t0 = std::chrono::steady_clock::now();
             const NVSDK_NGX_Result r = reinterpret_cast<PfnCreate>(g.api.create_feature)(list.Get(), NVSDK_NGX_Feature_SuperSampling, p, &h);
             ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            {
+                char what[96];
+                std::snprintf(what, sizeof what, "dlss_create_off_frame %ux%u->%ux%u q%d", k.w, k.h, k.ow, k.oh, int(k.q));
+                na::diag::release_trace::Note(what, ms, GetTickCount64());
+            }
             code = static_cast<int32_t>(r);
             ok = NVSDK_NGX_SUCCEED(r) && h;
             if (ok) {
@@ -529,6 +541,7 @@ void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
     }
     {
         std::lock_guard<std::mutex> lock(g.m);
+        g.holder = "off-frame creation (after)";
         const bool current = g.prep.gen == gen;
         if (slot >= 0 && g.features[slot].handle && g.features[slot].prepared && (!ok || !current)) {
             // Never submitted, or nobody wants it any more: released once nothing of it can run on the GPU.
@@ -561,13 +574,15 @@ void make_prepared(Key k, uint64_t gen, ComPtr<ID3D12Device> dev)
 
 #if defined(NA_HAVE_NGX_SDK)
 // VARIANT: dlss/levels-warmed-at-start (coordinator 2026-11-27, option a)
-// At start-up, before the session's first DLSS feature: one small Quality and one small Performance feature
-// made on this thread and released again, so the first real creation of each level is not NVIDIA's first
-// of its kind (the measured first DLAA -> Quality creation took 62 ms against 15-28 ms later). Made before
-// any real feature: DLSS 310.9.16 spoils a larger feature evaluated after a smaller one was made, so an
-// Evaluate that would make the first real feature waits for this (Evaluate, below). Holds g.m only while
-// NVIDIA makes and releases them; their GPU work runs on its own queue, waited for on this thread.
-void warm_levels(uint64_t gen, ComPtr<ID3D12Device> dev)
+// At start-up, before the session's first DLSS feature: the Quality and Performance features exactly as the
+// levels will ask for them (the host's descriptions: render and output size, quality, flags, preset) made on
+// this thread and released again, so the first real creation of each level is not NVIDIA's first of its kind
+// (the first DLAA -> Quality creation took 62 ms against 10-20 ms later; with small stand-ins the first
+// Performance one still took up to 30 ms). Made before any real feature: DLSS 310.9.16 spoils a larger feature
+// evaluated after a smaller one was made, so an Evaluate that would make the first real feature waits for this
+// (Evaluate, below). Holds g.m only while NVIDIA makes and releases them; their GPU work runs on its own queue,
+// waited for on this thread. The alternative was small 640x360 stand-ins at Attach (2026-11-27, 932f89a0).
+void warm_levels(uint64_t gen, ComPtr<ID3D12Device> dev, std::array<Key, 2> keys)
 {
     if (auto init = g_thread_init.load(std::memory_order_acquire)) init();
     const auto start = std::chrono::steady_clock::now();
@@ -585,11 +600,10 @@ void warm_levels(uint64_t gen, ComPtr<ID3D12Device> dev)
     NVSDK_NGX_Handle* made[2] = {};
     double ms[2] = {0, 0};
     int32_t code[2] = {0, 0};
-    // Small: 640x360 out; Quality renders 2/3 of it, Performance 1/2.
-    const Quality levels[2] = {Quality::MaxQuality, Quality::MaxPerformance};
-    const uint32_t rw[2] = {427, 320}, rh[2] = {240, 180};
+
     {
         std::lock_guard<std::mutex> lock(g.m);
+        g.holder = "warm-up creation";
         if (g.warm_gen != gen || !g.attached || g.latched || g.device.Get() != dev.Get()) ok = false;
         NVSDK_NGX_Parameter* p = nullptr;
         if (ok) ok = NVSDK_NGX_SUCCEED(reinterpret_cast<PfnParams>(g.api.allocate_parameters)(&p)) && p;
@@ -597,14 +611,21 @@ void warm_levels(uint64_t gen, ComPtr<ID3D12Device> dev)
             p->Reset();
             p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
             p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
-            p->Set(NVSDK_NGX_Parameter_Width, rw[i]);
-            p->Set(NVSDK_NGX_Parameter_Height, rh[i]);
-            p->Set(NVSDK_NGX_Parameter_OutWidth, 640u);
-            p->Set(NVSDK_NGX_Parameter_OutHeight, 360u);
-            p->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(levels[i]));
-            p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
-                   static_cast<int>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted));
+            const Key& k = keys[i];
+            p->Set(NVSDK_NGX_Parameter_Width, k.w);
+            p->Set(NVSDK_NGX_Parameter_Height, k.h);
+            p->Set(NVSDK_NGX_Parameter_OutWidth, k.ow);
+            p->Set(NVSDK_NGX_Parameter_OutHeight, k.oh);
+            p->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(k.q));
+            p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, static_cast<int>(k.flags));
             p->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
+            const unsigned int pr = k.preset ? k.preset : static_cast<unsigned int>(NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, pr);
+            p->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, pr);
             const auto t0 = std::chrono::steady_clock::now();
             const NVSDK_NGX_Result r = reinterpret_cast<PfnCreate>(g.api.create_feature)(list.Get(), NVSDK_NGX_Feature_SuperSampling, p, &made[i]);
             ms[i] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -632,6 +653,7 @@ void warm_levels(uint64_t gen, ComPtr<ID3D12Device> dev)
     double release_ms = 0;
     {
         std::lock_guard<std::mutex> lock(g.m);
+        g.holder = "warm-up release";
         const auto t0 = std::chrono::steady_clock::now();
         // Released while NVIDIA is still attached (Shutdown waits for this thread); never evaluated. A
         // creation whose GPU work did not finish in 5 s is left (never happens unless the device is lost).
@@ -761,15 +783,6 @@ bool Attach(ID3D12Device* device, const Api& api)
     g.caps.attached = true;
     g_any_attached.store(true, std::memory_order_release);
     read_caps_locked();
-    if (g.caps.available && !g_inline_for_tests.load(std::memory_order_relaxed)) {
-        g.warming = true;
-        g.warm_gen = ++g.prep_gen;
-        try {
-            std::thread(warm_levels, g.warm_gen, g.device).detach();
-        } catch (...) {
-            g.warming = false;
-        }
-    }
     return g.caps.available;
 #else
     set_reason(g.caps.reason, "This build has no NVIDIA DLSS support (SDK headers were not found).");
@@ -925,7 +938,22 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_
     if (history_reset) *history_reset = false;
     const na::diag::crumbs::Scope crumb(list, "NeuralAlias DLSS evaluate");
     const InjectorCallScope origin;
+    LARGE_INTEGER lq0{};
+    QueryPerformanceCounter(&lq0);
     std::unique_lock<std::mutex> lock(g.m);
+    {   // WHY log: the game's thread waiting for the backend's lock (a creation, warm-up or release holds it).
+        LARGE_INTEGER lq1{}, hz{};
+        QueryPerformanceCounter(&lq1);
+        QueryPerformanceFrequency(&hz);
+        const double waited = double(lq1.QuadPart - lq0.QuadPart) * 1000.0 / double(hz.QuadPart);
+        if (waited > 2.0) {
+            char what[96];
+            std::snprintf(what, sizeof what, "dlss_lock_wait (held by %s)", g.holder);
+            na::diag::release_trace::Note(what, waited, GetTickCount64());
+            na::eventlog::Emit("release_trace", "what=dlss_lock_wait thread=game ms=%.2f holder=%s at_tick=%llu", waited, g.holder,
+                               static_cast<unsigned long long>(GetTickCount64()));
+        }
+    }
     if (!list) return false;
     if (const char* bad = Validate(d)) {
         ++g.stats.rejected;
@@ -1343,6 +1371,29 @@ void SetReleaseViewHookForTests(void (*hook)()) { g_release_view_hook.store(hook
 
 void SetBackgroundThreadInit(void (*init)()) { g_thread_init.store(init, std::memory_order_release); }
 void SetInlineForTests(bool inline_work) { g_inline_for_tests.store(inline_work, std::memory_order_relaxed); }
+
+bool WarmLevels(const EvalDesc& quality, const EvalDesc& performance)
+{
+#if defined(NA_HAVE_NGX_SDK)
+    std::lock_guard<std::mutex> lock(g.m);
+    if (!g.attached || g.latched || !g.caps.available || !g.device || g.warming || g_inline_for_tests.load(std::memory_order_relaxed)) return false;
+    const std::array<Key, 2> keys{key_of(quality), key_of(performance)};
+    if (g.warmed_keys == keys) return false; // these exact features were warmed already
+    g.warmed_keys = keys;
+    g.warming = true;
+    g.warm_gen = ++g.prep_gen;
+    try {
+        std::thread(warm_levels, g.warm_gen, g.device, keys).detach();
+    } catch (...) {
+        g.warming = false;
+        return false;
+    }
+    return true;
+#else
+    (void)quality; (void)performance;
+    return false;
+#endif
+}
 
 #if defined(NA_HAVE_NGX_SDK)
 // The view of `k` already has a feature that serves it (nothing to make).

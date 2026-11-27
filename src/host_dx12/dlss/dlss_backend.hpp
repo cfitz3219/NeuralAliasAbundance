@@ -223,7 +223,7 @@ struct PrepareStats {
     // Features no longer in use, released off the frame (their own thread): how long NVIDIA took per release,
     // and its size report after them.
     uint64_t released_off_frame = 0; double release_last_ms = 0, release_longest_ms = 0, size_query_longest_ms = 0;
-    // The start-up warm-up of the levels (dlss/levels-warmed-at-start): NVIDIA's time to make each small
+    // The start-up warm-up of the levels (dlss/levels-warmed-at-start): NVIDIA's time to make each level's
     // feature and to release both, the whole warm-up, and how long first frames waited for it.
     bool warmed = false; double warm_quality_ms = 0, warm_performance_ms = 0, warm_release_ms = 0, warm_total_ms = 0, warm_waited_ms = 0;
 };
@@ -261,6 +261,11 @@ void SetInitOwnOverrideForTests(bool (*init)(ID3D12Device* device, const wchar_t
 // Unit tests that count creations and releases one by one: no start-up warm-up of the levels and releases done
 // in place (off: the shipped behaviour, a background warm-up and releases on their own thread).
 void SetInlineForTests(bool inline_work);
+// VARIANT: dlss/levels-warmed-at-start: before the session's first DLSS feature, make the levels' features exactly
+// as they will be asked for and release them again, on a background thread (the first real creation of each level
+// then costs what later ones do). The first Evaluate that makes a feature waits for it. false: not started (no
+// runtime, already warmed for these descriptions, or warming now).
+bool WarmLevels(const EvalDesc& quality, const EvalDesc& performance);
 void SetDeviceRemovedProbeForTests(bool (*removed)(ID3D12Device* device));
 
 // The source of `view_id` is gone (e.g. its FSR/XeSS context was destroyed):

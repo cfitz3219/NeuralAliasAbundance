@@ -1,6 +1,7 @@
 #include "host_dx12/fold/fold_pass.hpp"
 
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/release_trace.hpp"
 #include "host_dx12/diag/vram_ledger.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/j2/fold_shader.hpp"
@@ -149,7 +150,19 @@ void Pass::Collect()
     std::vector<Released> gone(std::make_move_iterator(keep), std::make_move_iterator(released_.end()));
     released_.erase(keep, released_.end());
     try {
-        std::thread([g = std::move(gone)]() mutable { g.clear(); }).detach();
+        std::thread([g = std::move(gone)]() mutable {
+            LARGE_INTEGER q0{}, q1{}, hz{};
+            const ULONGLONG t0 = GetTickCount64();
+            QueryPerformanceCounter(&q0);
+            const size_t n = g.size();
+            g.clear();
+            QueryPerformanceCounter(&q1);
+            QueryPerformanceFrequency(&hz);
+            const double ms = double(q1.QuadPart - q0.QuadPart) * 1000.0 / double(hz.QuadPart);
+            na::diag::release_trace::Note("fold_planes", ms, t0);
+            na::eventlog::Emit("release_trace", "what=fold_planes sets=%zu thread=background ms=%.2f at_tick=%llu", n, ms,
+                               static_cast<unsigned long long>(t0));
+        }).detach();
     } catch (...) {
     }
 }

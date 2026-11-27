@@ -6003,6 +6003,18 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // not be put on DLSS or cleared of it). Only on the game's own list: the timer learns of the submission
     // from the game's ExecuteCommandLists.
     if (inl) na::gputime::Begin(l);
+    {   // VARIANT: dlss/levels-warmed-at-start: the levels' features as they will be asked for, made and released in
+        // the background before DLAA's first one (once per picture size).
+        static uint32_t warmed_w = 0, warmed_h = 0;
+        if (e.render_w == e.out_w && e.render_h == e.out_h && (warmed_w != e.out_w || warmed_h != e.out_h)) {
+            warmed_w = e.out_w;
+            warmed_h = e.out_h;
+            na::dlss::EvalDesc q{}, p{};
+            na::fold::Pass::Describe(e, na::fold::Mode::Quality, kFoldViewId, na::settings::Get().j2_preset.load(), &q);
+            na::fold::Pass::Describe(e, na::fold::Mode::Performance, kFoldViewId, na::settings::Get().j2_preset.load(), &p);
+            na::dlss::WarmLevels(q, p);
+        }
+    }
     const bool evaluated = na::dlss::Evaluate(l, e, &history_reset);
     if (inl) na::gputime::End(l);
     {   // One DLSS feature at a time (the fold block above): the view the old mode used is released on the

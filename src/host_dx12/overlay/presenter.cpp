@@ -921,15 +921,23 @@ void capture_write(Chain& c)
         for (size_t i = 0; i < shots.size(); ++i) {
             CaptureShot& s = shots[i];
             char name[64] = "";
+            char why[96] = ""; // why a picture has no file (the json's "why")
+            if (!s.buffer) snprintf(why, sizeof why, "no readback buffer");
+            else if (!s.copied) snprintf(why, sizeof why, "not copied");
             if (s.copied && s.buffer) {
                 snprintf(name, sizeof name, "%02zu-%s.raw", i, s.kind);
                 wchar_t path[MAX_PATH], wname[64];
                 MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 64);
                 swprintf_s(path, L"%s\\%s", dir, wname);
                 void* m = nullptr;
-                D3D12_RANGE rr{0, SIZE_T(fp.Footprint.RowPitch) * h};
+                // the whole buffer: the last row has no padding, so RowPitch * h runs past its end when the rows are padded
+                // (any width whose rows are not a multiple of 256 bytes, e.g. 3440 x 4 bytes: Map then fails E_INVALIDARG)
+                D3D12_RANGE rr{0, SIZE_T(s.buffer->GetDesc().Width)};
                 HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (f != INVALID_HANDLE_VALUE && SUCCEEDED(s.buffer->Map(0, &rr, &m))) {
+                const HRESULT mhr = f != INVALID_HANDLE_VALUE ? s.buffer->Map(0, &rr, &m) : E_FAIL;
+                if (f == INVALID_HANDLE_VALUE) snprintf(why, sizeof why, "file not created (error %lu)", GetLastError());
+                else if (FAILED(mhr)) snprintf(why, sizeof why, "readback Map 0x%08X", static_cast<unsigned>(mhr));
+                if (f != INVALID_HANDLE_VALUE && SUCCEEDED(mhr)) {
                     for (UINT y = 0; y < h; ++y) {
                         DWORD wr = 0;
                         WriteFile(f, static_cast<const uint8_t*>(m) + fp.Offset + size_t(y) * fp.Footprint.RowPitch, w * bpp, &wr, nullptr);
@@ -942,9 +950,9 @@ void capture_write(Chain& c)
             }
             s.buffer.Reset(); // release as we go
             char line[400];
-            snprintf(line, sizeof line, "    {\"index\": %zu, \"kind\": \"%s\", \"frame_id\": %llu, \"engine_frame\": %llu, \"presented\": %s, \"present_result\": \"0x%08X\", \"time_ms\": %.3f, \"file\": \"%s\"}%s\n",
+            snprintf(line, sizeof line, "    {\"index\": %zu, \"kind\": \"%s\", \"frame_id\": %llu, \"engine_frame\": %llu, \"presented\": %s, \"present_result\": \"0x%08X\", \"time_ms\": %.3f, \"file\": \"%s\", \"why\": \"%s\"}%s\n",
                      i, s.kind, static_cast<unsigned long long>(s.frame_id), static_cast<unsigned long long>(s.engine_frame), s.presented ? "true" : "false",
-                     static_cast<unsigned>(s.hr), qpf > 0 ? 1000.0 * static_cast<double>(s.qpc) / qpf : 0.0, name, i + 1 < shots.size() ? "," : "");
+                     static_cast<unsigned>(s.hr), qpf > 0 ? 1000.0 * static_cast<double>(s.qpc) / qpf : 0.0, name, why, i + 1 < shots.size() ? "," : "");
             json += line;
         }
         json += "  ]\n}\n";

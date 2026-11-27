@@ -1298,6 +1298,18 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         evaluated = true;
     } else {
         const double t_show = now_ms();
+        {   // VARIANT: dlss/levels-warmed-at-start: the levels' features as they will be asked for, made and released
+            // in the background before DLAA's first one (once per picture size).
+            static uint32_t warmed_w = 0, warmed_h = 0;
+            if (eval.render_w == eval.out_w && eval.render_h == eval.out_h && (warmed_w != eval.out_w || warmed_h != eval.out_h)) {
+                warmed_w = eval.out_w;
+                warmed_h = eval.out_h;
+                dlss::EvalDesc q{}, p{};
+                na::fold::Pass::Describe(eval, na::fold::Mode::Quality, kFoldView, preset, &q);
+                na::fold::Pass::Describe(eval, na::fold::Mode::Performance, kFoldView, preset, &p);
+                dlss::WarmLevels(q, p);
+            }
+        }
         evaluated = dlss::Evaluate(list, eval);
         fold_cpu_show = now_ms() - t_show;
     }

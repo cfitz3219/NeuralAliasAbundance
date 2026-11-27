@@ -6,6 +6,8 @@
 #include "host_dx12/nvof/flow_expand.hpp"
 #include "host_dx12/nr/native_fg.hpp"
 #include "host_dx12/diag/vram_ledger.hpp"
+#include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/release_trace.hpp"
 #include <windows.h>
 #include <string>
 #include "core/motion_arbiter_gpu.hpp"
@@ -168,7 +170,19 @@ void drop_unused_locked(ULONGLONG now){
     // time on the frame (the measured DX11 fixture: a 66 ms frame against 35 ms).
     std::vector<std::shared_ptr<Context>> dropped;
     for(auto it=cached.begin();it!=cached.end();){if(now-(*it)->used_ms>kDropAfterMs){dropped.push_back(std::move(*it));it=cached.erase(it);}else ++it;}
-    if(!dropped.empty())std::thread([d=std::move(dropped)]() mutable {SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);d.clear();}).detach();
+    // Normal priority (2026-11-27): a release below normal priority can hold the driver's lock while it is
+    // pre-empted, and the game's thread then waits behind it. Timed for the log (release_trace).
+    if(!dropped.empty())std::thread([d=std::move(dropped)]() mutable {
+        for(auto& ctx:d){
+            char what[64];std::snprintf(what,sizeof what,"motion_context_%ux%u",ctx->w,ctx->h);
+            const ULONGLONG t0=GetTickCount64();LARGE_INTEGER q0{},q1{},hz{};QueryPerformanceCounter(&q0);
+            ctx.reset();
+            QueryPerformanceCounter(&q1);QueryPerformanceFrequency(&hz);
+            const double ms=double(q1.QuadPart-q0.QuadPart)*1000.0/double(hz.QuadPart);
+            na::diag::release_trace::Note(what,ms,t0);
+            na::eventlog::Emit("release_trace","what=%s thread=background ms=%.2f at_tick=%llu",what,ms,static_cast<unsigned long long>(t0));
+        }
+    }).detach();
 }
 void reason(const char* r){strncpy_s(stats.reason,r,_TRUNCATE);}
 bool compile_flow_shader(const char* source,size_t bytes,const char* name,const char* entry,ComPtr<ID3DBlob>& result){
