@@ -12,6 +12,8 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <thread>
+#include <iterator>
 
 using Microsoft::WRL::ComPtr;
 
@@ -140,8 +142,16 @@ void Pass::Collect()
 {
     constexpr uint64_t kAfterMs = 2000; // every frame that used them has long finished on the GPU
     const uint64_t now = GetTickCount64();
-    released_.erase(std::remove_if(released_.begin(), released_.end(), [now](const Released& r) { return now - r.at_ms >= kAfterMs; }),
-                    released_.end());
+    const auto keep = std::stable_partition(released_.begin(), released_.end(), [now](const Released& r) { return now - r.at_ms < kAfterMs; });
+    if (keep == released_.end()) return;
+    // The planes' last references are dropped on a thread of their own: giving a level's planes back to the
+    // driver can take a frame's worth of time (measured for the motion contexts: a 66 ms frame).
+    std::vector<Released> gone(std::make_move_iterator(keep), std::make_move_iterator(released_.end()));
+    released_.erase(keep, released_.end());
+    try {
+        std::thread([g = std::move(gone)]() mutable { g.clear(); }).detach();
+    } catch (...) {
+    }
 }
 
 void Pass::Describe(const dlss::EvalDesc& base, Mode m, uint64_t view_base, uint32_t preset, dlss::EvalDesc* out)

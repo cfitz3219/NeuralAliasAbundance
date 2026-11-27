@@ -252,6 +252,12 @@ int main(int argc, char** argv)
         const double steady = s_sum / s_n;
         std::printf("  steady DLAA: %.2f ms of ours a frame | features held %llu | %s\n", steady, static_cast<unsigned long long>(Held()), ours());
         CHECK(Held() == 1);
+        {
+            const auto ps = na::dlss::GetPrepareStats();
+            std::printf("  levels warmed at start (dlss/levels-warmed-at-start): %s; Quality %.1f ms, Performance %.1f ms, released %.1f ms, "
+                        "%.1f ms in all; first frames waited %.1f ms for it\n", ps.warmed ? "yes" : "NO", ps.warm_quality_ms,
+                        ps.warm_performance_ms, ps.warm_release_ms, ps.warm_total_ms, ps.warm_waited_ms);
+        }
         struct Step { Mode to; const char* name; };
         const Step steps[] = {{Mode::Performance, "DLAA -> Performance"}, {Mode::Quality, "Performance -> Quality"}, {Mode::Off, "Quality -> DLAA"}};
         for (const auto& st : steps) {
@@ -263,7 +269,9 @@ int main(int argc, char** argv)
             CHECK(after >= 1);
             CHECK(Held() == 1);
             const auto ps = na::dlss::GetPrepareStats();
-            std::printf("    NVIDIA made the feature off the frame in %.1f ms (longest so far %.1f ms)\n", ps.last_ms, ps.longest_ms);
+            std::printf("    NVIDIA made the feature off the frame in %.1f ms (longest so far %.1f ms); old features released off the frame %llu, "
+                        "last release %.1f ms, longest %.1f ms, size report after a release longest %.1f ms\n", ps.last_ms, ps.longest_ms,
+                        static_cast<unsigned long long>(ps.released_off_frame), ps.release_last_ms, ps.release_longest_ms, ps.size_query_longest_ms);
         }
     }
 

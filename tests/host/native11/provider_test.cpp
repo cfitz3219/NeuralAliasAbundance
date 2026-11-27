@@ -2934,6 +2934,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         }
         std::printf("  switches (longest frame, steady DLAA frame %.1f ms): first frames %.1f ms (DLAA made); DLAA -> %s %.1f ms; %s -> %s %.1f ms (on screen after %d frames); -> DLAA %.1f ms\n",
                     dlaa_ms, start_max_ms, level_name, switch_max_ms, level_name, other_name, other_max_ms, other_at, back_max_ms);
+        {
+            const auto ps = na::dlss::GetPrepareStats();
+            std::printf("  DLSS: levels warmed at start %s (Quality %.1f ms, Performance %.1f ms, released %.1f ms, %.1f ms in all, first frames waited %.1f ms); "
+                        "features made off the frame %llu, last %.1f ms, longest %.1f ms; released off the frame %llu, longest release %.1f ms, "
+                        "size report after a release longest %.1f ms\n", ps.warmed ? "yes" : "NO", ps.warm_quality_ms, ps.warm_performance_ms,
+                        ps.warm_release_ms, ps.warm_total_ms, ps.warm_waited_ms, static_cast<unsigned long long>(ps.made), ps.last_ms, ps.longest_ms,
+                        static_cast<unsigned long long>(ps.released_off_frame), ps.release_longest_ms, ps.size_query_longest_ms);
+        }
         // One DLSS feature at a time (coordinator 2026-11-27): the new feature is made off the frame, and the switch frame waits
         // only for what is left of NVIDIA's work. The bar is the coordinator's: no switch more than 20 ms over a steady frame.
         const double margin = 20.0;

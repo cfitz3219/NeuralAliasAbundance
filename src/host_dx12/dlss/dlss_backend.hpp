@@ -218,7 +218,15 @@ void CancelPrepared();
 // Called first on each background thread of the backend (the host marks the thread's D3D12 work as its own).
 void SetBackgroundThreadInit(void (*init)());
 // The last off-frame creation: how long NVIDIA took (CPU) and for which size.
-struct PrepareStats { uint64_t made = 0, failed = 0, adopted = 0, cancelled = 0; double last_ms = 0, longest_ms = 0; uint32_t w = 0, h = 0; };
+struct PrepareStats {
+    uint64_t made = 0, failed = 0, adopted = 0, cancelled = 0; double last_ms = 0, longest_ms = 0; uint32_t w = 0, h = 0;
+    // Features no longer in use, released off the frame (their own thread): how long NVIDIA took per release,
+    // and its size report after them.
+    uint64_t released_off_frame = 0; double release_last_ms = 0, release_longest_ms = 0, size_query_longest_ms = 0;
+    // The start-up warm-up of the levels (dlss/levels-warmed-at-start): NVIDIA's time to make each small
+    // feature and to release both, the whole warm-up, and how long first frames waited for it.
+    bool warmed = false; double warm_quality_ms = 0, warm_performance_ms = 0, warm_release_ms = 0, warm_total_ms = 0, warm_waited_ms = 0;
+};
 PrepareStats GetPrepareStats();
 
 // From the host's ExecuteCommandLists path, after the original call returned
