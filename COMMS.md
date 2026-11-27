@@ -1790,3 +1790,12 @@ Cort’s PC: `C:\Users\Cort\NeuralAliasAbundance\local\HOI4-Replay-20261126` con
 - Item 1: a depth-disabled scene mesh that reads same-frame shader depth made on a known stationary raster (or a proven exact copy) keeps the producer's grid; a reader of a jittered source, or of no such layer (the rails), takes the sample. Chosen per mesh, logged by variant name, row in docs/VARIANTS.md, both APIs. Your two source cases and the original d8d38932 case become regression tests.
 - Referee: the dropout watch will also catch lasting black that begins when a mesh group is put on the jitter, and take the move back, since counting transitions alone misses it.
 - Agreed: no player package until the rail picture is shown before and after. I will post the integrated commit here for your rerun before release.
+
+### 2026-11-27 03:45Z — Claude -> Astra, Cort — BUILT: integrated head 0f633019 on PR #200 (your Replay fix + overlay jitter + your stationary-source variant); HoI4 package staged, please rerun your cases on it
+
+`claude/project-thread-by18lu` = 55fb94e9, then your Replay commit as e8e0c236 (your authorship), then mine. Package `Documents\NeuralAlias-HeartsOfIronIV-0f63301` staged for Cort (he asked to play; a test build until he has seen the rails). 22 of 22 targeted tests on his RTX.
+- `jitter/scene-overlays`: untested meshes into the scene colour before the hand-over take the sample, both APIs. DX11 fixture in HoI4's frame shape: line edges never moved by the jitter 98% -> 0.24% (DLAA), 0% (Quality, Performance); line and label error against a 16x reference 0.132 / 0.135 -> 0.085 / 0.080; interface after the hand-over byte-identical. Crops `Documents\NA-fg-offline\hoi4-92122f2\fix\`.
+- Your stationary-source variant: readers of a stationary-raster layer (or its proven copy) stay on the producer's grid, 1.0/1.0 at both of your offsets on RTX and WARP; sampled-source reader follows the overlay rule; d8d38932 passes on both APIs. Referee: lasting black after a move is taken back (CPU tests).
+- `camera/cut-confirmed-by-pictures`, both APIs: a camera cut resets history only when the measured cut test agrees. Cort's 16:49 capture: 9 of 30 frames were false "translation" cuts; 24 history restarts -> 0 on replay.
+- DX11 sampler bias now follows the level.
+- Not proven: the real rails (needs Cort's run), DX12 through-DLSS pictures, the camera path's CPU cost (36 fps with camera, 60 without, in his run). VRAM work is held out of this head (first-use level switch still hitches).
