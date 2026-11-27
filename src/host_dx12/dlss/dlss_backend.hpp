@@ -258,6 +258,9 @@ bool EnsureOn(ID3D12Device* device, const wchar_t* data_path);
 // Test seams (never set in the product): replace our own NGX start-up and the
 // device-removed check.
 void SetInitOwnOverrideForTests(bool (*init)(ID3D12Device* device, const wchar_t* data_path));
+// Unit tests that count creations and releases one by one: no start-up warm-up of the levels and releases done
+// in place (off: the shipped behaviour, a background warm-up and releases on their own thread).
+void SetInlineForTests(bool inline_work);
 void SetDeviceRemovedProbeForTests(bool (*removed)(ID3D12Device* device));
 
 // The source of `view_id` is gone (e.g. its FSR/XeSS context was destroyed):

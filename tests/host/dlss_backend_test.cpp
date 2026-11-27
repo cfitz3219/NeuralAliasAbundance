@@ -88,6 +88,7 @@ void Submit(ID3D12CommandQueue* q, test::List& l)
 int main()
 {
     using na::dlss::Quality;
+    na::dlss::SetInlineForTests(true); // these checks count every creation and release in place
     // 1. Validation and frame-contract mapping (no device needed).
     {
         auto d = Desc(1280, 720, 1920, 1080);

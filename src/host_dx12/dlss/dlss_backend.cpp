@@ -241,6 +241,7 @@ std::recursive_mutex g_life_m; // serializes all public lifecycle mutations
 ComPtr<ID3D12Device> g_tried_device;
 std::atomic<void (*)()> g_release_view_hook{nullptr};
 std::atomic<bool> g_any_attached{false}; // hot-path filter for OnExecuted (every game submission)
+std::atomic<bool> g_inline_for_tests{false}; // SetInlineForTests
 
 void set_reason(char* dst, const char* text) { std::snprintf(dst, 128, "%s", text ? text : ""); }
 
@@ -367,6 +368,12 @@ void release_thread()
 void kick_release_locked()
 {
     if (g.releasing || g.to_release.empty()) return;
+    if (g_inline_for_tests.load(std::memory_order_relaxed)) {
+        for (void* h : g.to_release) release_handle(h);
+        g.to_release.clear();
+        note_dlss_vram_locked("a DLSS feature no longer in use was released");
+        return;
+    }
     g.releasing = true;
     try {
         std::thread(release_thread).detach();
@@ -754,7 +761,7 @@ bool Attach(ID3D12Device* device, const Api& api)
     g.caps.attached = true;
     g_any_attached.store(true, std::memory_order_release);
     read_caps_locked();
-    if (g.caps.available) {
+    if (g.caps.available && !g_inline_for_tests.load(std::memory_order_relaxed)) {
         g.warming = true;
         g.warm_gen = ++g.prep_gen;
         try {
@@ -1335,6 +1342,7 @@ bool EnsureOn(ID3D12Device* device, const wchar_t* data_path)
 void SetReleaseViewHookForTests(void (*hook)()) { g_release_view_hook.store(hook); }
 
 void SetBackgroundThreadInit(void (*init)()) { g_thread_init.store(init, std::memory_order_release); }
+void SetInlineForTests(bool inline_work) { g_inline_for_tests.store(inline_work, std::memory_order_relaxed); }
 
 #if defined(NA_HAVE_NGX_SDK)
 // The view of `k` already has a feature that serves it (nothing to make).
