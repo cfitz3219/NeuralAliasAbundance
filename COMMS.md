@@ -1807,3 +1807,23 @@ Raw stdout, blob hashes and binary SHA-256s: `Documents\NA-fg-offline\hoi4-92122
 - DX12, RTX: stationary source at 0.323,-0.452 and -0.471,0.419: layer reader 1/1, copy reader 1/1, full-screen 1/1; `left_on_game_grid{stationary_source=4}`; overlays on: `variant=jitter/scene-overlays overlay_moved=1`.
 - Gaps, not hidden: the DX11 sampled-source reader runs at the first offset only; DX12 has no overlay-off arm for the stationary case; no DX12 WARP run. Closing them needs new test arms, so a later head.
 - PR #200 conflicts with main in `capture/referee_gpu.cpp` and `observe/producers.cpp` (base 679517cf, 31 ahead, 30 behind); I will merge main in after Cort's run. Cort installed 0f63301 at 19:35 PT and is playing.
+
+### 2026-11-27 07:49Z — Astra to Fable and Cort — DONE — PR #200 published-head Three Kingdoms and overlay rerun
+
+I confirmed PR #200 at `922999bc128587e88cdbea778fede582c3369fb7`, checked it out detached on Cort’s PC, and rebuilt the focused Release tests. The native overlay and stationary-reader change is in parent `0f63301989ce4eb5a0b75eb610cbbb4589a6a95e`. I verified the five saved source fingerprints against Git. The two native headers matched the earlier working-source test. The native provider, temporal jitter and dropout code changed. The production sources tested here match the published head.
+
+Offsets in pixels, A = (+0.323165, −0.452396) and B = (−0.470734, +0.419042). 1.0 is an intact test material and 0.0 is black. NVIDIA RTX 5070 Ti, driver 621.40. WARP independently reproduced the hardware readbacks on both APIs.
+
+| DX11 material readback | Overlay | A | B |
+|---|---|---:|---:|
+| Original Three Kingdoms matched ground | Original fixture | 1.0 | 1.0 |
+| Selected mesh reading stationary shader depth through a copy | Off | 1.0 | 1.0 |
+| Same stationary source | On | 1.0 | 1.0 |
+| Selected mesh reading jittered shader depth through a copy | Off | 0.0 | 0.0 |
+| Same jittered source | On | 1.0 | 1.0 |
+
+DX11 viewport readback confirmed that the stationary reader stayed still in all four observations. The jittered reader moved at both offsets with overlays on. The original unrelated and fullscreen controls each returned 0.0 at their recorded offset A.
+
+DX12 gave the same results at A and B, at both sampled locations per reader. With a stationary source the direct, copied and fullscreen readers each returned (1.0, 1.0) with overlays off and on. With a jittered source the direct reader returned (1.0, 1.0) and the fullscreen control returned (0.0, 0.0) in both settings. The copied reader changed from (0.0, 0.0) off to (1.0, 1.0) on. The original recording-order controls passed on both offsets. The CPU jitter and dropout suites passed 8/8 and 12/12.
+
+The first run used the fixtures as published. A second run extended only the two test files to measure the missing arms. Raw stdout, hashes and the test-only diff are on Cort’s PC under `local/HOI4-Replay-20261126/published-922999bc-cort/`. These offline fixtures cover the recorded Three Kingdoms failure shape and a synthetic exact-depth reader. They do not measure rail shimmer or smear in live HoI4, or establish detection for other ways a game may produce or transform its depth. No player package was made. This closes the requested published-head hardware follow-up.
