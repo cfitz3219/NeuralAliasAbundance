@@ -42,14 +42,10 @@ endif()
 # 32-bit games (a 32-bit copy of the in-game half beside a 64-bit DLAA companion) are being
 # brought up: NA_ALLOW_X86 lets a Win32 configure through so CI can list what does not build yet.
 option(NA_ALLOW_X86 "Allow a 32-bit (Win32) configure of the host while 32-bit support is brought up" OFF)
-option(NA_REFEREE_MENU "Show the Referee switch on the Home menu (held back until Cort says so; confirmed 2026-11-21)" OFF)
-if(NA_REFEREE_MENU)
-  add_compile_definitions(NA_REFEREE_MENU)
-endif()
 if(NOT MSVC OR (NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT NA_ALLOW_X86))
   message(FATAL_ERROR "The DX12 host requires MSVC and x64.")
 endif()
-enable_language(C)
+enable_language(C RC)
 
 # ------------------------------------------------------------ SDK discovery
 # All optional. Never vendored (license): NGX/DLSS SDK, Optical Flow SDK, pclstats.
@@ -417,11 +413,14 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
   target_include_directories(NeuralAliasDlaa64 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(NeuralAliasDlaa64 PRIVATE abundance_options host_dlss d3d12 dxgi shell32)
 endif()
-add_library(NeuralAliasDXGI SHARED src/runtime/dxgi_proxy.cpp src/runtime/dxgi_proxy.def)
+# Bundle approved typography with each UI module, independent of installer or working directory.
+configure_file(src/host_dx12/overlay/poise.rc.in generated/poise.rc @ONLY)
+set(NA_UI_RESOURCES "${CMAKE_CURRENT_BINARY_DIR}/generated/poise.rc")
+add_library(NeuralAliasDXGI SHARED ${NA_UI_RESOURCES} src/runtime/dxgi_proxy.cpp src/runtime/dxgi_proxy.def)
 target_link_libraries(NeuralAliasDXGI PRIVATE host_dx12)
 
 # sl.interposer forwarding proxy (Route A, Streamline titles such as TLOU).
-add_library(NeuralAliasSLProxy SHARED src/host_dx12/sl_proxy/sl_proxy.cpp)
+add_library(NeuralAliasSLProxy SHARED ${NA_UI_RESOURCES} src/host_dx12/sl_proxy/sl_proxy.cpp)
 set_target_properties(NeuralAliasSLProxy PROPERTIES OUTPUT_NAME "sl.interposer" PREFIX "")
 target_link_libraries(NeuralAliasSLProxy PRIVATE host_dx12)
 

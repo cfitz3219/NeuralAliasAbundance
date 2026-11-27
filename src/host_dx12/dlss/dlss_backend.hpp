@@ -133,6 +133,9 @@ struct EvalDesc {
     float pre_exposure = 1.f;
     float exposure_scale = 1.f; // multiplier applied to colour before upscaling (DLSS.Exposure.Scale)
     uint64_t view_id = 0;       // source of these frames (see Views above); 0 = the default view
+    // The related native and folded views share a group. A smaller feature's creation can
+    // corrupt an existing larger feature with preset M, so rebuild that feature before reusing it.
+    uint64_t ordered_feature_group = 0;
     Quality quality = Quality::MaxQuality;
     // DLSS render preset (NVSDK_NGX_DLSS_Hint_Render_Preset_*: 10 J, 11 K, 12 L, 13 M);
     // 0 = NVIDIA's default for the quality mode. Applied when the feature is created.
@@ -183,7 +186,7 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
 // Records DLSS into `list` (open, DIRECT or COMPUTE). Creates or recreates the
 // feature on this list when needed. Returns false (and records nothing) on
 // invalid input or when latched off; the reason is in GetStats().
-bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d);
+bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_reset = nullptr);
 
 // From the host's ExecuteCommandLists path, after the original call returned
 // (no waits): signals completion for tracked evaluations in this submission

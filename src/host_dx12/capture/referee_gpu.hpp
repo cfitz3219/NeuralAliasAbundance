@@ -68,6 +68,11 @@ void PresentResult(const void* swapchain, uint64_t ordinal, bool accepted);
 bool TakeTrialSample(uint64_t ticket, TrialSample& sample);
 uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t color,
                           uint64_t depth, uint64_t generation, uint64_t frame, uint64_t screen_proof = 0);
+// VARIANT: referee/sample-locked-dropout
+// True while the Referee asks this scene's meshes that kept the game's viewport to take the
+// frame's sample (surfaces were seen dropping to black on particular samples). Cheap when not.
+bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, uint64_t depth,
+                      uint64_t generation, uint64_t frame, uint64_t screen_proof = 0);
 void InvalidatePresentation(const void* swapchain);
 // Consume a visual rollback decision scoped to a native DX11 screen proof.
 uint64_t TakeNativeScreenLoss(const void* swapchain);
@@ -90,6 +95,8 @@ bool ParityRoleSwapSeen(const void* swapchain, const PlacementScope& scope);
 
 // The last sample as read back (core/referee.hpp layout) and what it holds; for tests and tools.
 struct LastSample {
+    std::array<float, FlickerTransition::count> local_picture{};
+    std::vector<float> local_phase; // test receipt only, native-grid moment sums for this pair
     std::vector<float> data;
     bool screen = false, tiles = false, pair = false;
     float jitter_change = 0;

@@ -100,6 +100,9 @@ struct Settings {
     // kept out of DLSS and upscaled by NIS at this sharpness. [j2] hud_nis.
     std::atomic<uint32_t> j2_hud_nis{50};
     std::atomic<uint32_t> j2_jitter_r2{0}; // jitter sequence: 0 Halton 2,3 (default), 1 R2; [j2] jitter_sequence; live
+    // Fold the shading, live test (core/fold_shading.hpp): 0 DLAA, 1 Quality (2x1 blocks), 2 Performance
+    // (2x2 blocks). Menu only and never saved: every launch starts on DLAA.
+    std::atomic<uint32_t> j2_fold_mode{0};
     // Anisotropic filtering on the game's world textures, no menu control (Cort 2026-11-20):
     // hidden [j2] anisotropic_filter = -1 automatic (default), 0 off (the game's own), 16 forced.
     // Re-read live when either ini changes (PollHiddenSettings). Rule: core/anisotropic_auto.hpp.
@@ -150,9 +153,8 @@ struct Settings {
     // by themselves are replayed first and the rest are tried in turn (core/replay_movers.hpp).
     // 0 = the budget's hashed sample alone.
     std::atomic<uint32_t> j2_replay_movers{1};
-    // The referee (stage 1 of the unify plan, capture/referee_gpu.cpp): watches DLSS's picture,
-    // result, motion and jitter a few times a second and logs event `referee`. Changes nothing shown.
-    std::atomic<uint32_t> referee_enabled{0};   // [referee] enabled (live)
+    // Effective runtime state, set when the host selects its rendering route.
+    std::atomic<uint32_t> referee_enabled{0};
     std::atomic<uint32_t> referee_every_ms{500}; // [referee] every_ms: one pair of frames this often
     std::atomic<uint32_t> referee_log_s{5};      // [referee] log_seconds: one `referee` line this often
     std::atomic<uint32_t> j2_preset{255};    // J2 DLSS render preset ([j2] preset_v2; 255 = Automatic: L for DLAA/Quality, M for Balanced/Performance; 12 = L, 0 = NVIDIA default)
@@ -218,6 +220,7 @@ NrWriteHistory GetNrWrites();
 
 // Deploy-time defaults ini (beside the proxy DLL; may be read-only).
 void SetIniPath(const wchar_t* path);
+void ConfigureReferee(bool added_dlaa, bool gpu_checks);
 // Where user changes are saved: %LOCALAPPDATA%\NeuralAlias\NeuralAliasSL.ini
 const wchar_t* UserIniPath();
 void Load();  // defaults ini, then user ini overrides when present

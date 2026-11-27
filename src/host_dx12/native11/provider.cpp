@@ -239,7 +239,7 @@ struct DepthReads {
 };
 
 // The view the scene used on a selected texture (typed format, subresource).
-struct ViewUse { uint32_t format = 0, mip = 0, slice = 0; };
+struct ViewUse { uint32_t format = 0, mip = 0, slice = 0; bool texture2d = false; };
 struct Ctx {
     bool game = false; // a context of the game's device
     uint32_t gen = 0;  // the game-device generation that answer was given in
@@ -259,6 +259,17 @@ struct Ctx {
     bool depth_read_only = false;
     uint32_t raster_queries = 0;
     DepthReads depth_reads;
+    struct RasterDepthLayer {
+        Id resource = 0, depth = 0;
+        uint64_t sample = 0;
+        uint32_t frame = 0;
+        float min_depth = 0, max_depth = 0;
+        std::bitset<kDepthSlots> pixel_reads;
+    } raster_depth_layer;
+    uint32_t target_width = 0, target_height = 0;
+    bool depth_layer_target = false, material_layer_target = false;
+    bool vpj_shader_depth = false;
+    bool vpj_still_mesh = false; // VARIANT: referee/sample-locked-dropout (moved at the Referee's ask)
     uint8_t depth_func = kCompareLess; // the bound state's comparison when it tests AND writes depth, else 0 (default state: LESS, writing)
     Id cb[kCbBindSlots] = {};          // VS slots, then PS slots at kPsCbBase
     uint32_t cb_first[kCbBindSlots] = {}; // *SSetConstantBuffers1 first constant per slot
@@ -298,6 +309,9 @@ struct Ctx {
         rt0 = depth = 0;
         rt_view = ds_view = {};
         rt_count = 0;
+        raster_depth_layer = {};
+        target_width = target_height = 0;
+        depth_layer_target = material_layer_target = vpj_shader_depth = vpj_still_mesh = false;
         depth_test = true;
         depth_read_only = false;
         for (auto& mask : depth_reads.slots) mask.reset();
@@ -351,6 +365,7 @@ uint64_t g_list_order = 0;
 std::atomic<ID3D11Device*> g_device_raw{nullptr};
 IDXGISwapChain* g_swap = nullptr; // identity only
 Id g_backbuffer = 0;              // identity only, never pins a swap-chain buffer
+uint64_t g_region_started = 0;    // largest allowed search window for a provisional colour/depth pair
 std::atomic<Id> g_sel_color{0};    // readable from any thread
 // VARIANT: scene/after-layers (the rule is native11/frame_model.hpp)
 std::atomic<Id> g_sel_layer{0};         // the scene is drawn through material layers: their most-drawn target (0 = no layers)
@@ -404,6 +419,7 @@ uint64_t g_scene_key[2] = {};             // colour and depth lifetime ids
 // VARIANT: camera/optional
 // Whether a frame needs a camera to be handed over (input_provider.hpp CameraUse). Off: nothing
 // camera-related runs at all, on any thread, so it is read without g_mu.
+// The effective camera acquisition mode, including an optional reader such as XeGTAO.
 std::atomic<uint8_t> g_camera_use{static_cast<uint8_t>(CameraUse::Required)};
 std::atomic<bool> g_eval_paused{false}, g_camera_suspended{false};
 uint32_t g_camera_failures = 0, g_camera_retry_frames = 0;
@@ -473,7 +489,11 @@ uint32_t g_vpj_frame_unshifted = 0; // draws into the scene colour left unshifte
 // the meshes drawn with the scene depth bound that kept the game's own viewport (DLSS gets no
 // sub-pixel samples for those: their edges stay as the game drew them).
 uint64_t g_vpj_frame_shifted_vertices = 0, g_vpj_frame_still_vertices = 0;
-uint32_t g_vpj_frame_still_meshes = 0, g_vpj_frame_still_untested = 0;
+uint32_t g_vpj_frame_still_meshes = 0, g_vpj_frame_still_untested = 0, g_vpj_frame_shader_depth = 0;
+// VARIANT: referee/sample-locked-dropout
+// Set by the Referee through SetStillMeshJitter while it tries or keeps its reaction to dropouts.
+std::atomic<bool> g_vpj_still_asked{false};
+uint32_t g_vpj_frame_still_moved = 0;
 constexpr uint64_t kFullScreenPassVertices = 6; // two triangles: more than this is a mesh
 std::atomic<uint64_t> g_vpj_unshifted{0};
 std::atomic<uint64_t> g_vpj_told{0}; // the sample last handed to the consumer (two floats, pixels)
@@ -1191,6 +1211,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     ++g_stats.fired;
     SetSceneHanded(true); // whatever the outcome below, the game's scene draws for this frame are over
     if (!g_cb) return SetReason("No consumer is attached.");
+    if (g_model.Current().screen_region && !verified_reader)
+        return SetReason("Waiting for the active scene rectangle to reach the screen.");
     // CameraNow may learn the camera for this very callback.
     const Selection& sel = g_model.Current();
     if (boundary == Boundary::BeforeHud && IdOf(g_color_ref.Get()) != sel.color && immediate) {
@@ -1393,6 +1415,8 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     // The raster sample is a fact about how the scene was drawn. Only the matrix route needs a camera
     // (it writes the sample into one); the viewport route never does.
     f.raster.viewport = vpj_route;
+    f.raster.shader_depth_aligned = vpj_route && g_vpj_frame_shader_depth != 0;
+    f.raster.still_meshes_moved = vpj_route ? g_vpj_frame_still_moved : 0;
     f.raster.qualified = vpj_route || (have_camera && f.camera.vs_slot >= 0 && cam.raster_jitter_qualified);
     f.raster.expanded = vpj_route && g_vpj_executed_expanded;
     f.raster.applied = vpj_route ? g_vpj_executed_sample != 0 : (f.raster.qualified && g_jitter_written);
@@ -1425,14 +1449,17 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
             na::eventlog::Emit("native11_jitter",
                                "frame=%llu route=%s told_px=%.4f,%.4f viewport_shift_px=%.4f,%.4f applied=%d shifted_draws=%u "
                                "unshifted_colour_draws=%u scene_draws=%u held=%d scene=%.0fx%.0f depth=%ux%u "
-                               "shifted_vertices=%llu still_meshes{draws=%u untested=%u vertices=%llu}",
+                               "shifted_vertices=%llu still_meshes{draws=%u untested=%u vertices=%llu} aligned_shader_depth_draws=%u "
+                               "referee_still_meshes{asked=%d moved_draws=%u}",
                                static_cast<unsigned long long>(g_frame), vpj_route ? "viewport" : "matrix",
                                f.camera.jitter_px[0], f.camera.jitter_px[1], shift[0], shift[1], f.camera.jitter_applied ? 1 : 0,
                                g_vpj_frame_draws, g_vpj_frame_unshifted, g_model.SceneDrawsThisFrame(), held ? 1 : 0,
                                g_scene_vp_w, g_scene_vp_h, g_sel_depth_w.load(std::memory_order_relaxed),
                                g_sel_depth_h.load(std::memory_order_relaxed),
                                static_cast<unsigned long long>(g_vpj_frame_shifted_vertices), g_vpj_frame_still_meshes,
-                               g_vpj_frame_still_untested, static_cast<unsigned long long>(g_vpj_frame_still_vertices));
+                               g_vpj_frame_still_untested, static_cast<unsigned long long>(g_vpj_frame_still_vertices),
+                               g_vpj_frame_shader_depth, g_vpj_still_asked.load(std::memory_order_relaxed) ? 1 : 0,
+                               g_vpj_frame_still_moved);
         }
         uint64_t told = 0;
         std::memcpy(&told, f.camera.jitter_px, sizeof told);
@@ -1646,6 +1673,8 @@ void NoteViewportDraw(const Event& e)
     if (!e.viewport_sample && g_vpj_executed_sample && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed))
         ++g_vpj_frame_unshifted;
     if (e.viewport_sample) {
+        g_vpj_frame_shader_depth += e.viewport_shader_depth ? 1u : 0u;
+        g_vpj_frame_still_moved += e.viewport_still_mesh ? 1u : 0u;
         g_vpj_frame_shifted_vertices += e.vertices;
     } else if (g_vpj_sample.load(std::memory_order_relaxed) && e.depth && e.vertices > kFullScreenPassVertices &&
                (e.depth == g_sel_depth.load(std::memory_order_relaxed) || e.depth == g_sel_depth2.load(std::memory_order_relaxed))) {
@@ -1654,7 +1683,7 @@ void NoteViewportDraw(const Event& e)
         g_vpj_frame_still_untested += e.depth_test ? 0u : 1u;
         g_vpj_frame_still_vertices += e.vertices;
     }
-    if (!e.depth_test || !g_model.IsSceneDraw(e)) return;
+    if ((!e.depth_test && !e.viewport_shader_depth) || !g_model.IsSceneDraw(e)) return;
     if (!g_vpj_seen_draw) {
         g_vpj_seen_draw = true;
         g_vpj_executed_sample = e.viewport_sample;
@@ -1780,10 +1809,14 @@ void StopViewportJitterAfterScene()
         g_vpj_stopped_after_scene.fetch_add(1, std::memory_order_relaxed);
     }
 }
-void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
+// A scene can write a depth-like texture as colour and test against that
+// same raster later in its mesh shaders, with hardware depth testing off.
+// Move these readers only when their producer actually took this sample.
+void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x, uint64_t vertices = 0)
 {
     const uint64_t sample = g_vpj_sample.load(std::memory_order_acquire);
     const bool on = sample != 0;
+    x->vpj_shader_depth = x->vpj_still_mesh = false;
     if (!on && !x->vpj_applied) return;
     Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
     // VARIANT: scene/after-layers-second-depth
@@ -1793,9 +1826,37 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
     // prepass (no colour target) and the colour passes tested against it must rasterise at the same
     // sub-pixel position, or the later passes fail their depth test over whole surfaces
     // (p42728: triangles dropped to black, differently for each sample).
-    const bool scene = on && scene_depth && x->depth == scene_depth && x->depth_test;
+    const auto& layer = x->raster_depth_layer;
+    if (on && !x->deferred && !x->depth_test && vertices > kFullScreenPassVertices &&
+        x->material_layer_target && x->rt_count > 1 && scene_depth && x->depth == scene_depth &&
+        layer.depth == scene_depth && layer.sample == sample && layer.pixel_reads.any() &&
+        layer.frame == g_exact_frame.load(std::memory_order_relaxed)) {
+        x->vpj_shader_depth = x->vp_n == 1 && x->vp_x == 0.f && x->vp_y == 0.f &&
+            x->vp_w == float(x->target_width) && x->vp_h == float(x->target_height) &&
+            x->target_width == g_sel_depth_w.load(std::memory_order_relaxed) &&
+            x->target_height == g_sel_depth_h.load(std::memory_order_relaxed) &&
+            layer.min_depth == x->vps[0].MinDepth && layer.max_depth == x->vps[0].MaxDepth;
+    }
+    // VARIANT: referee/sample-locked-dropout
+    // The Referee saw pixels drop out on some samples: while it asks, a scene mesh no rule above
+    // moved takes the full sample as well (any target; never a full-screen pass). Immediate context
+    // only: there the sample is cleared the moment the picture is handed over, so nothing after the
+    // scene moves; a deferred recording has no such order until it is executed.
+    if (on && !x->deferred && !x->vpj_shader_depth && g_vpj_still_asked.load(std::memory_order_relaxed)) {
+        neural_alias::StillMesh mesh;
+        mesh.asked = mesh.active = true;
+        mesh.tests_depth = x->depth_test;
+        mesh.scene_depth_bound = scene_depth && x->depth == scene_depth;
+        mesh.mesh = vertices > kFullScreenPassVertices;
+        mesh.scene_viewport = x->vp_n == 1 && x->vp_x == 0.f && x->vp_y == 0.f &&
+            x->vp_w == float(g_sel_depth_w.load(std::memory_order_relaxed)) &&
+            x->vp_h == float(g_sel_depth_h.load(std::memory_order_relaxed));
+        x->vpj_still_mesh = neural_alias::StillMeshTakesJitter(mesh);
+    }
+    const bool tests_scene_depth = x->depth_test || x->vpj_shader_depth || x->vpj_still_mesh;
+    const bool scene = on && scene_depth && x->depth == scene_depth && tests_scene_depth;
     if (scene && !x->vp_n) g_vpj_unknown.fetch_add(1, std::memory_order_relaxed);
-    const bool want = WantsViewportJitter(on, x->depth, scene_depth, x->depth_test, x->vp_n);
+    const bool want = WantsViewportJitter(on, x->depth, scene_depth, tests_scene_depth, x->vp_n);
     const UINT n = x->vp_n;
     if (want) {
         g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
@@ -1810,7 +1871,8 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
     if (want) {
         ViewportRect r[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
         for (UINT i = 0; i < n; ++i) r[i] = {x->vps[i].TopLeftX, x->vps[i].TopLeftY, x->vps[i].Width, x->vps[i].Height};
-        x->vpj_expanded = JitterViewports(r, n, offset[0], offset[1], g_sel_depth_w.load(std::memory_order_relaxed), g_sel_depth_h.load(std::memory_order_relaxed));
+        x->vpj_expanded = JitterViewports(r, n, offset[0], offset[1],
+            g_sel_depth_w.load(std::memory_order_relaxed), g_sel_depth_h.load(std::memory_order_relaxed));
         for (UINT i = 0; i < n; ++i) {
             v[i] = x->vps[i];
             v[i].TopLeftX = r[i].x;
@@ -1912,7 +1974,7 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
 {
     Ctx* x = Get(c);
     if (!x) return nullptr;
-    VpjBeforeDraw(c, x);
+    VpjBeforeDraw(c, x, vertices);
     const auto refresh_samplers = [&] {
         const uint64_t policy = SamplerPolicyKey();
         if (x->sampler_policy != policy) {
@@ -1938,6 +2000,8 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.indirect = indirect;
     e.viewport_sample = x->vpj_applied ? x->vpj_sample : 0;
     e.viewport_expanded = x->vpj_applied && x->vpj_expanded;
+    e.viewport_shader_depth = x->vpj_shader_depth;
+    e.viewport_still_mesh = x->vpj_still_mesh && x->vpj_applied;
     const bool camera_tracking = CameraTracking();
     if (camera_tracking) {
         std::memcpy(e.cb, x->cb, sizeof(e.cb));
@@ -1987,7 +2051,8 @@ ViewUse SrvUse(ID3D11ShaderResourceView* v)
     v->GetDesc(&d);
     ViewUse u;
     u.format = d.Format;
-    if (d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) u.mip = d.Texture2D.MostDetailedMip;
+    u.texture2d = d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D;
+    if (u.texture2d) u.mip = d.Texture2D.MostDetailedMip;
     else if (d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) { u.mip = d.Texture2DArray.MostDetailedMip; u.slice = d.Texture2DArray.FirstArraySlice; }
     else if (d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY) u.slice = d.Texture2DMSArray.FirstArraySlice;
     return u;
@@ -2031,6 +2096,14 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
             x->screen_slots.set(start + i, r && (r == color || r == peer));
         if (track_depth && start < kDepthSlots && i < kDepthSlots - start)
             depth_slots.set(start + i, r && r == depth);
+        if (stage == DepthStage::Pixel && x->raster_depth_layer.resource && start < kDepthSlots && i < kDepthSlots - start) {
+            bool reads_layer = false;
+            if (r == x->raster_depth_layer.resource) {
+                const auto use = SrvUse(views[i]);
+                reads_layer = use.texture2d && use.format == DXGI_FORMAT_R32_FLOAT && !use.mip;
+            }
+            x->raster_depth_layer.pixel_reads.set(start + i, reads_layer);
+        }
         if (!r || sent_n == kWatch + 1) continue;
         if (!Watched(r, color)) continue;
         bool again = false;
@@ -2376,7 +2449,8 @@ void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, F
     auto& reads = state->depth_reads;
     const bool has_binding = dispatch ? reads.slots[static_cast<size_t>(DepthStage::Compute)].any() :
         (reads.slots[static_cast<size_t>(DepthStage::Pixel)] | reads.slots[static_cast<size_t>(DepthStage::Vertex)]).any();
-    if (has_binding && (state->depth != depth || state->depth_read_only)) {
+    // A draw moved onto the sample reads the scene's own depth: both are on the same grid.
+    if (has_binding && (dispatch || !(state->vpj_shader_depth || state->vpj_still_mesh)) && (state->depth != depth || state->depth_read_only)) {
         DepthBindings bindings(context, state, depth, dispatch);
         forward();
     } else forward();
@@ -2398,16 +2472,16 @@ void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, F
 ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
 {
     if (!x || x->deferred || x->rt_count != 1 || !x->rt0 || (x->depth && x->depth_test) ||
-        x->screen_slots.none() || x->vp_n != 1 || x->vp_x != 0.f || x->vp_y != 0.f ||
+        x->screen_slots.none() || x->vp_n != 1 ||
         !g_screen_enabled.load(std::memory_order_relaxed)) return {};
 
     std::unique_lock<std::mutex> lock(g_mu);
     const auto& scene = g_model.Current();
     const auto draws = g_model.SceneDrawsThisFrame();
-    const bool inspect = g_screen.MayInspect();
-    const Id lit = g_lit.Predicted(g_model);
+    const bool inspect = scene.screen_region || g_screen.MayInspect();
+    const Id lit = scene.screen_region ? 0 : g_lit.Predicted(g_model);
     const uint64_t lit_write = lit ? g_model.LitWrite(g_lit.Peer(lit), lit) : 0;
-    const bool missed_ordinal = !g_model.FiredThisFrame() && g_model.LearnedPointKind() == 1 &&
+    const bool missed_ordinal = !scene.screen_region && !g_model.FiredThisFrame() && g_model.LearnedPointKind() == 1 &&
         !g_screen.Adaptive() && !g_screen.Verified(scene.color, scene.depth);
     if ((!inspect && !missed_ordinal && !lit_write) || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
         scene.color == g_backbuffer || !g_swap || x->raster_queries ||
@@ -2418,14 +2492,24 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     const auto close_extent = [](uint32_t a, uint32_t b) {
         return a && b && uint64_t((std::min)(a, b)) * 100 >= uint64_t((std::max)(a, b)) * 98;
     };
-    if (!g_model.InfoOf(x->rt0, output) || !close_extent(output.width, scene.color_info.width) ||
-        !close_extent(output.height, scene.color_info.height) || output.samples != 1 || scene.color_info.samples != 1) return {};
+    if (!g_model.InfoOf(x->rt0, output) || output.samples != 1 || scene.color_info.samples != 1) return {};
+    const auto& source_size = scene.color_info;
+    const bool direct_region = scene.screen_region && x->rt0 == g_backbuffer &&
+        referee::PaddedLayouts(source_size.width, source_size.height, output.width, output.height) != 0;
+    if (!direct_region && (!close_extent(output.width, source_size.width) ||
+                           !close_extent(output.height, source_size.height))) return {};
     const auto covers_picture = [](float viewport, uint32_t extent) {
         // Alignment padding can leave a few unused rows in a full-size texture.
         // The exact presented pixels still qualify the reader.
         return viewport <= float(extent) && viewport >= .98f * float(extent);
     };
-    if (!covers_picture(x->vp_w, output.width) || !covers_picture(x->vp_h, output.height)) return {};
+    const bool full_view = !x->vp_x && !x->vp_y &&
+        covers_picture(x->vp_w, output.width) && covers_picture(x->vp_h, output.height);
+    const bool centered_view = direct_region && x->vp_w == float(source_size.width) &&
+        x->vp_h == float(source_size.height) &&
+        std::fabs(2.f * x->vp_x + x->vp_w - float(output.width)) <= 1.f &&
+        std::fabs(2.f * x->vp_y + x->vp_h - float(output.height)) <= 1.f;
+    if (!full_view && !centered_view) return {};
 
     Inside own;
     ComPtr<ID3D11Predicate> predicate;
@@ -2547,6 +2631,23 @@ void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
     if (state && !state->deferred && state->vpj_applied && !g_vpj_sample.load(std::memory_order_acquire))
         VpjBeforeDraw(c, state);
     ForwardDepthRead(c, state, false, forward);
+    if (state && !state->deferred && state->depth_layer_target) {
+        auto& layer = state->raster_depth_layer;
+        const auto sample = g_vpj_sample.load(std::memory_order_relaxed);
+        const auto depth = g_sel_depth.load(std::memory_order_relaxed);
+        if (sample && state->vpj_applied && state->vpj_expanded &&
+            state->vpj_sample == sample && state->depth_test && state->depth == depth &&
+            state->target_width == g_sel_depth_w.load(std::memory_order_relaxed) &&
+            state->target_height == g_sel_depth_h.load(std::memory_order_relaxed)) {
+            layer.resource = state->rt0;
+            layer.depth = depth;
+            layer.sample = sample;
+            layer.min_depth = state->vps[0].MinDepth;
+            layer.max_depth = state->vps[0].MaxDepth;
+            layer.frame = g_exact_frame.load(std::memory_order_relaxed);
+            layer.pixel_reads.reset(); // cannot be both the RTV and an SRV
+        } else if (layer.resource == state->rt0) layer = {};
+    }
     if (mark.source) {
         Inside own;
         ScreenCheck::Restore(c, mark);
@@ -2731,7 +2832,8 @@ ViewUse RtvUse(ID3D11RenderTargetView* v)
     v->GetDesc(&d);
     ViewUse u;
     u.format = d.Format;
-    if (d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D) u.mip = d.Texture2D.MipSlice;
+    u.texture2d = d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D;
+    if (u.texture2d) u.mip = d.Texture2D.MipSlice;
     else if (d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY) { u.mip = d.Texture2DArray.MipSlice; u.slice = d.Texture2DArray.FirstArraySlice; }
     else if (d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY) u.slice = d.Texture2DMSArray.FirstArraySlice;
     return u;
@@ -2763,10 +2865,21 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
     x->depth = IdOf(ds);
     x->rt_view = rt_use;
     x->ds_view = ds_use;
+    x->depth_layer_target = x->material_layer_target = false;
+    x->target_width = x->target_height = 0;
     UINT bound = 0;
     for (UINT i = 0; rtvs && i < n; ++i)
         if (rtvs[i]) ++bound;
     x->rt_count = static_cast<uint8_t>(bound);
+    auto& layer = x->raster_depth_layer;
+    if (layer.resource) {
+        if (layer.frame != g_exact_frame.load(std::memory_order_relaxed) || layer.resource == x->rt0) layer = {};
+        else if (bound > 1) {
+            Inside in;
+            for (UINT i = 1; i < n; ++i)
+                if (ResourceOfView(rtvs[i]) == layer.resource) { layer = {}; break; }
+        }
+    }
     if (rt || ds) {
         std::lock_guard<std::mutex> l(g_mu);
         Inside in;
@@ -2776,6 +2889,11 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
             const uint32_t written = rt_use.format ? rt_use.format : info.format;
             info.float_colour = written == DXGI_FORMAT_R16G16B16A16_FLOAT || written == DXGI_FORMAT_R11G11B10_FLOAT ||
                                 written == DXGI_FORMAT_R32G32B32A32_FLOAT || written == DXGI_FORMAT_R32G32B32_FLOAT;
+            x->target_width = info.width;
+            x->target_height = info.height;
+            const bool plain = rt_use.texture2d && !rt_use.mip && info.samples == 1;
+            x->depth_layer_target = plain && written == DXGI_FORMAT_R32_FLOAT;
+            x->material_layer_target = plain && info.float_colour;
             g_model.SetInfo(IdOf(rt), info);
         }
         if (ds) {
@@ -2862,6 +2980,7 @@ ID3D11Resource* DepthCopySource(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* 
 void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
 {
     if (!x || !resource) return;
+    if (x->raster_depth_layer.resource == resource) x->raster_depth_layer = {};
     const Id peer = g_lit_peer.load(std::memory_order_relaxed);
     if ((!peer && !g_adaptive_scene.load(std::memory_order_relaxed)) ||
         (resource != peer && resource != g_sel_color.load(std::memory_order_relaxed))) return;
@@ -2874,7 +2993,8 @@ void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
 void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11RenderTargetView* view, const FLOAT color[4])
 {
     Ctx* x = Get(c);
-    if (x && (g_adaptive_scene.load(std::memory_order_relaxed) || g_lit_peer.load(std::memory_order_relaxed)))
+    if (x && (x->raster_depth_layer.resource || g_adaptive_scene.load(std::memory_order_relaxed) ||
+              g_lit_peer.load(std::memory_order_relaxed)))
         TrackPlacementColorWrite(c, x, ResourceOfView(view));
     O(c, x).clear_rtv(c, view, color);
 }
@@ -2938,7 +3058,13 @@ void STDMETHODCALLTYPE ClearState_d(ID3D11DeviceContext* c)
 HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL restore, ID3D11CommandList** out)
 {
     Ctx* x = Get(c);
-    const HRESULT hr = O(c, x).finish(c, restore, out);
+    HRESULT hr;
+    {
+        // Runtime state restoration can call the hooked setters with physical
+        // bindings. Keep the game's tracked state for restore=TRUE.
+        Inside in;
+        hr = O(c, x).finish(c, restore, out);
+    }
     if (x) {
         if (SUCCEEDED(hr) && out && *out) {
             std::lock_guard<std::mutex> l(g_mu);
@@ -3018,6 +3144,7 @@ void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11Comman
         O(c, x).execute(c, list, restore);
     }
     if (x && !restore) x->reset_state();
+    else if (x && list) x->raster_depth_layer = {}; // unproved intervening writes in another recording
 }
 
 // ---------------------------------------------------------------- frame boundary
@@ -3051,6 +3178,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
     }
+    const auto previous = g_model.Current();
     const bool reserved_before = g_screen.ReservesPixelRead();
     if (g_screen_enabled.load(std::memory_order_relaxed)) {
         Inside own;
@@ -3060,10 +3188,11 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             game->GetImmediateContext(&context);
             swap->GetBuffer(0, IID_PPV_ARGS(&screen));
         }
-        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
+        if (const char* outcome = g_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr, previous.screen_region)) {
             na::eventlog::Emit("native11_screen", "candidate=%s paired=%llu confirmed=%llu refuted=%llu",
                                outcome, (unsigned long long)g_screen.Paired(),
                                (unsigned long long)g_screen.Confirmed(), (unsigned long long)g_screen.Refuted());
+        }
         if (g_lit.Learned()) {
             if (const char* outcome = g_lit.screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
                 na::eventlog::Emit("native11_lit_role", "frame=%llu reader=%s", (unsigned long long)g_frame, outcome);
@@ -3085,8 +3214,50 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_model.SetScreenTarget(g_backbuffer);
     const bool check_lit = g_screen_enabled.load(std::memory_order_relaxed);
     const bool was_steering = g_lit.steer;
-    g_model.EndFrame(check_lit, check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0);
+    if (previous.screen_region && g_screen.Verified(previous.color, previous.depth))
+        g_region_started = g_frame;
+    if (previous.screen_region && g_frame - g_region_started > 96) {
+        // VARIANT: scene/pushed-without-screen-proof
+        // No pixel-for-pixel match on the screen in 96 frames (a stretched picture never gives one).
+        // DLAA is not held back for that: it goes ahead on this picture at its own size.
+        na::eventlog::Emit("native11_picture_region", "result=pushed_without_screen_proof extent=%ux%u",
+            previous.color_info.width, previous.color_info.height);
+        g_model.PushScreenRegion();
+    }
+    g_model.EndFrame(check_lit && !previous.screen_region,
+        check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0, check_lit);
     const auto& picked = g_model.Current();
+    // WHY log: frames keep coming with a scene-like picture that cannot be used. Said once per reason
+    // and extent, and again every 600 frames while it lasts, in the words the results file shows.
+    if (const auto& refused = g_model.RefusedScene(); !picked.valid() && refused.why != FrameModel::NoScene::None) {
+        static FrameModel::Refused said;
+        static uint64_t said_at = 0;
+        char why[224];
+        switch (refused.why) {
+        case FrameModel::NoScene::Multisampled:
+            std::snprintf(why, sizeof why, "%s", "NeuralAlias cannot run DLAA on top of in-game anti-aliasing. Please disable all in-game AA.");
+            break;
+        default:
+            std::snprintf(why, sizeof why,
+                "The game's picture (%ux%u) was not found on the screen (%ux%u) in 96 frames: trying again shortly.",
+                refused.width, refused.height, refused.screen_width, refused.screen_height);
+            break;
+        }
+        SetReason(why);
+        if (said.why != refused.why || said.width != refused.width || said.height != refused.height ||
+            said.samples != refused.samples || g_frame - said_at >= 600) {
+            said = refused;
+            said_at = g_frame;
+            na::eventlog::Emit("native11_no_scene", "frame=%llu picture=%ux%u samples=%u screen=%ux%u scene_vertices=%llu why=\"%s\"",
+                static_cast<unsigned long long>(g_frame), refused.width, refused.height, refused.samples,
+                refused.screen_width, refused.screen_height, static_cast<unsigned long long>(refused.vertices), why);
+        }
+    }
+    if (picked.screen_region && (!previous.screen_region || previous.color != picked.color || previous.depth != picked.depth)) {
+        g_region_started = g_frame;
+        na::eventlog::Emit("native11_picture_region", "result=probing extent=%ux%u",
+            picked.color_info.width, picked.color_info.height);
+    }
     const auto order = g_model.CompletedLitOrder();
     g_lit.Finish(check_lit && (picked.color == order.late || picked.color == order.early) && picked.depth == order.depth
                  ? order : FrameModel::LitOrder{});
@@ -3233,9 +3404,9 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         static uint32_t logged = 0;
         const uint64_t signature = (s.color * 1099511628211ull) ^ (note.most_drawn << 1) ^ (note.picture * 31) ^
                                    static_cast<uint64_t>(note.rule) ^ (reinterpret_cast<uintptr_t>(note.why) << 3);
-        if (signature != last_signature && logged < 300 && !note.candidates.empty()) {
-            last_signature = signature;
-            ++logged;
+        const bool report_selection = signature != last_signature && logged < 300 && !note.candidates.empty();
+        const bool report_unselected = !s.valid() && !g_model.LastFlow().empty() && (g_frame % 120 == 1);
+        if (report_selection || report_unselected) {
             char list[2400] = "";
             int at = 0;
             for (const auto& n : note.candidates) {
@@ -3247,16 +3418,21 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                                     static_cast<unsigned long long>(n.first_read), static_cast<unsigned long long>(n.read_after),
                                     static_cast<unsigned long long>(n.last_read), n.float_colour ? 1 : 0, n.same_size ? 1 : 0);
             }
-            na::eventlog::Emit("native11_scene", "frame=%llu rule=%s layered=%d why=\"%s\" candidates:%s",
-                               static_cast<unsigned long long>(g_frame),
-                               note.rule != FrameModel::PictureRule::AfterLayers ? "most-drawn" : note.second_depth ? "after-layers-second-depth" : "after-layers",
-                               g_model.Layered() ? 1 : 0, note.why, list);
+            if (report_selection) {
+                last_signature = signature;
+                ++logged;
+                na::eventlog::Emit("native11_scene", "frame=%llu rule=%s layered=%d why=\"%s\" candidates:%s",
+                    static_cast<unsigned long long>(g_frame),
+                    note.rule != FrameModel::PictureRule::AfterLayers ? "most-drawn" : note.second_depth ? "after-layers-second-depth" : "after-layers",
+                    g_model.Layered() ? 1 : 0, note.why, list);
+            }
             // WHY log: the order of that frame, so a renderer we have not met shows where its picture
             // is finished. Runs of draws into one target (d) and the reads we watch (r), in order;
             // #id tells two targets of the same format apart; z#id is the depth buffer bound.
-            static uint32_t flows = 0;
-            if (flows < 16) {
-                ++flows;
+            static uint32_t flows = 0, unselected_flows = 0;
+            if ((report_selection && flows < 16) || (report_unselected && unselected_flows < 12)) {
+                if (report_unselected) ++unselected_flows;
+                else ++flows;
                 // A long frame goes out as several lines (part=1, 2, ...): one event line holds about 4,000 characters.
                 char flow[3600] = "";
                 int fa = 0;
@@ -3268,7 +3444,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                     flow[0] = 0;
                 };
                 for (const auto& f : g_model.LastFlow()) {
-                    if (fa >= static_cast<int>(sizeof flow) - 140) emit();
+                    if (fa >= static_cast<int>(sizeof flow) - 184) emit();
                     ResourceInfo ri{};
                     g_model.InfoOf(f.target, ri);
                     const unsigned tag = static_cast<unsigned>((f.target >> 4) & 0xfff);
@@ -3277,10 +3453,14 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
                         fa += std::snprintf(flow + fa, sizeof flow - fa, " [r #%03x fmt=%u %s]", tag, ri.format, role);
                     else
                     {
-                        char z[24] = "no-depth";
-                        if (f.depth)
-                            std::snprintf(z, sizeof z, "z#%03x%s", static_cast<unsigned>((f.depth >> 4) & 0xfff),
-                                          f.depth == s.depth ? "=scene" : f.depth == note.second_depth ? "=second" : "");
+                        char z[64] = "no-depth";
+                        if (f.depth) {
+                            ResourceInfo depth_info{};
+                            g_model.InfoOf(f.depth, depth_info);
+                            std::snprintf(z, sizeof z, "z#%03x%s(%ux%u,s=%u)", static_cast<unsigned>((f.depth >> 4) & 0xfff),
+                                f.depth == s.depth ? "=scene" : f.depth == note.second_depth ? "=second" : "",
+                                depth_info.width, depth_info.height, depth_info.samples);
+                        }
                         // v= all the run's vertices: a few per draw is a full-screen pass, many is geometry.
                         fa += std::snprintf(flow + fa, sizeof flow - fa, " [d #%03x fmt=%u %ux%u %s n=%u multi=%u tested=%u v=%llu %s]", tag, ri.format,
                                             ri.width, ri.height, z, f.draws, f.multi, f.tested, static_cast<unsigned long long>(f.vertices), role);
@@ -3295,7 +3475,8 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_jitter_written = false;
     // A request covers exactly the frame that starts here: without a new one (a missed or failed
     // evaluation), the next frame's camera is the game's own, unjittered.
-    g_jitter_active = g_jitter_requested && g_camera.found && CameraTracking(); // the matrix write needs a camera that is being looked for
+    const bool region_ready = !s.screen_region || g_screen.Verified(s.color, s.depth);
+    g_jitter_active = region_ready && g_jitter_requested && g_camera.found && CameraTracking();
     g_jitter = neural_alias::JitterSample{g_next_jitter[0], g_next_jitter[1]};
     // Viewport route: the same one-frame request, applied on the scene draws of the frame starting here.
     const uint32_t jittered_draws = g_vpj_frame_draws;
@@ -3303,7 +3484,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_vpj_unshifted.fetch_add(g_vpj_frame_unshifted, std::memory_order_relaxed);
     g_vpj_frame_unshifted = 0;
     g_vpj_frame_shifted_vertices = g_vpj_frame_still_vertices = 0;
-    g_vpj_frame_still_meshes = g_vpj_frame_still_untested = 0;
+    g_vpj_frame_still_meshes = g_vpj_frame_still_untested = g_vpj_frame_shader_depth = g_vpj_frame_still_moved = 0;
     g_vpj_seen_draw = g_vpj_mixed = false;
     g_vpj_executed_sample = 0;
     g_vpj_executed_expanded = false;
@@ -3313,7 +3494,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_sel_depth_w.store(s.depth_info.width, std::memory_order_relaxed);
     g_sel_depth_h.store(s.depth_info.height, std::memory_order_relaxed);
     uint64_t sample = 0;
-    if (g_vpj_route.load(std::memory_order_relaxed) && g_jitter_requested && s.valid() &&
+    if (region_ready && g_vpj_route.load(std::memory_order_relaxed) && g_jitter_requested && s.valid() &&
         (g_next_jitter[0] != 0.f || g_next_jitter[1] != 0.f)) {
         std::memcpy(&sample, g_next_jitter, sizeof(sample));
     }
@@ -3658,6 +3839,8 @@ void SetCameraUse(CameraUse use)
     na::eventlog::Emit("native11_camera_use", "frame=%llu use=%s", static_cast<unsigned long long>(g_frame),
                        use == CameraUse::Off ? "off" : use == CameraUse::Optional ? "optional" : "required");
 }
+
+void SetStillMeshJitter(bool asked) { g_vpj_still_asked.store(asked, std::memory_order_relaxed); }
 
 void SetNextJitter(float x_px, float y_px)
 {

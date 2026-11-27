@@ -382,14 +382,40 @@ uint32_t WriteBuffer(na_object_id res, uint64_t offset, const void* src, uint32_
 uint32_t FindTextures(const uint32_t* formats, uint32_t format_count, uint32_t w, uint32_t h, na_object_id* out, uint32_t max);
 ID3D12Resource* AcquireResource(na_object_id id);                         // AddRef'd, or null
 // Current discovery picks (written by the discovery adapter, read by J2).
-void SetLiveSelection(uint64_t depth, uint64_t color);
-void GetLiveSelection(uint64_t* depth, uint64_t* color);
+void SetLiveSelection(uint64_t depth, uint64_t color, bool requires_screen = false);
+void GetLiveSelection(uint64_t* depth, uint64_t* color, bool* requires_screen = nullptr);
+// Includes the unverified scene, for the screen challenge only.
+void GetScreenSelection(uint64_t* depth, uint64_t* color, bool* requires_screen = nullptr);
+bool SetScreenSelectionProven(uint64_t depth, uint64_t color, bool proven);
+// True while the pair offered to the screen challenge is the proven, published scene.
+bool ScreenSelectionProven(uint64_t depth, uint64_t color);
 // Changes whenever the published depth/colour pair changes.
 uint64_t LiveSelectionVersion();
 // Viewport jitter: real sub-pixel samples. While set (frame != 0), every draw whose bound depth
 // is the live scene depth and whose pipeline tests depth is drawn with the game's viewports moved
 // by (x, y) render pixels (+x right, +y down). Other draws get the game's viewports back.
+// The offset is kept in steps of 1 / kSceneViewportJitterUnits of a pixel (whole range: two pixels
+// each way); a caller that compares what it asked for with what was drawn rounds to that step first.
+constexpr float kSceneViewportJitterUnits = 16384.f;
 void SetSceneViewportJitter(uint64_t frame, float x, float y);
+// Coarse shading of the scene (core/fold_shading.hpp). While rate != 0 (a D3D12_SHADING_RATE), the
+// draws that take the scene's sample (selected scene depth bound and tested) are shaded once per block
+// of pixels; every other draw of the game keeps one shading per pixel. 0 hands the game's own back.
+// The caller checks that the device supports variable-rate shading before asking.
+void SetSceneCoarseShading(uint32_t rate);
+struct CoarseShadingStats {
+    uint32_t rate = 0;        // what is asked for now
+    uint64_t draws = 0;       // draws drawn coarse
+    uint64_t sets = 0;        // times a recording was switched to the coarse rate
+    uint64_t restores = 0;    // times a recording was handed back to one per pixel
+    uint64_t unavailable = 0; // a recording had no interface for it
+};
+CoarseShadingStats GetCoarseShadingStats();
+// VARIANT: referee/sample-locked-dropout
+// The Referee's ask (referee::gpu::SceneStillMeshes): while true, a scene mesh drawn with the depth
+// test off and the scene depth bound takes the frame's full sample too (core/temporal_jitter.hpp,
+// StillMeshTakesJitter). Costs one relaxed load per untested mesh draw; nothing when never asked.
+void SetStillMeshJitter(bool asked);
 // A successful native-size resolve ends the scene sample for layers drawn over its image.
 // The second target is the observed full-size consumer, when it is known.
 struct ResolvedRaster {
@@ -486,7 +512,16 @@ void GetDrawReplayStats(DrawReplayStats* out);
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);
-struct ViewportJitterStats { uint64_t draws, sets, restores, unknown, local_layers, submitted_layers; };
+// shader_depth: meshes with the depth test off that took the sample because their shader reads a
+// sampled depth layer. shader_depth_refused: candidates that kept the game's viewport, by reason
+// (no layer, layer not read, writes the layer, one target, viewport not the scene's).
+struct ViewportJitterStats {
+    uint64_t draws, sets, restores, unknown, local_layers, submitted_layers;
+    uint64_t shader_depth = 0;
+    struct Refused { uint64_t no_layer = 0, not_read = 0, writes_layer = 0, one_target = 0, viewport = 0; } shader_depth_refused;
+    uint64_t still_moved = 0, still_asks = 0; // meshes moved at the Referee's ask; times it started asking
+    bool still_asked = false;
+};
 ViewportJitterStats GetViewportJitterStats();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,

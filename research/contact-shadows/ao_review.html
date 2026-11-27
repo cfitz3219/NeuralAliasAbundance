@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NeuralAlias · AO trial</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#15151a;color:#f3efeb;font:18px/1.45 "Segoe UI",sans-serif}
+main{max-width:1650px;margin:auto;padding:18px clamp(12px,3vw,42px)}header,.bar,nav{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+header{justify-content:space-between}h1{font:italic 500 2em Georgia,serif;margin:0}h2{font-size:1.35em;margin:.5em 0 0}
+p{margin:.35em 0 .7em}button,select{font:inherit;color:inherit;background:#302e36;border:1px solid #77717d;border-radius:8px;padding:6px 14px;cursor:pointer}button[aria-pressed=true]{background:#534654;border-color:#e1bdcd}button:focus-visible,select:focus-visible{outline:3px solid #cdb0be}button:disabled{opacity:.45}img{display:block;width:100%;aspect-ratio:43/18;object-fit:contain;background:#101014}figure{margin:12px 0}.bar,nav{margin:9px 0}label{display:inline-flex;align-items:center;gap:7px}#progress,small{color:#c4bec5}
+</style>
+<main><header><h1>NeuralAlias</h1><span id="progress"></span></header>
+<h2 id="title"></h2><p id="question"></p>
+<nav aria-label="Picture"><button id="original">Original</button><button id="intel" title="Intel tuning with matched base radius and quality">Intel reference</button><button id="a">A</button><button id="b">B</button><button id="play" hidden>Pause pan</button></nav>
+<figure><img id="image" alt="Recorded game scene at fixed exposure"></figure>
+<div class="bar"><label>Your verdict <select id="vote"><option value="">Choose…</option><option>A looks better</option><option>B looks better</option><option>No visible preference</option><option>Both too weak</option><option>Both too dark</option><option>Both show artifacts</option></select></label></div>
+<nav aria-label="Trials"><button id="prev">Previous</button><button id="next">Next</button><button id="save">Save answers</button><span id="status" role="status"></span></nav>
+<small>Switch pictures with 1 (original), 2 (A), or 3 (B). The pan loops in slow motion. Save answers downloads your choices and the settings behind each picture.</small></main>
+<script>
+const data=/*TRIAL_DATA*/null;
+const el=id=>document.getElementById(id);
+let trial=0,side=1,frame=0,playing=true;
+const key="neuralalias-ao-"+data.id;
+let answers=Array(data.trials.length).fill("");
+try{const old=JSON.parse(localStorage.getItem(key));if(Array.isArray(old)&&old.length===answers.length)answers=old;}catch{}
+function picture(){
+ const t=data.trials[trial],seq=side===0?t.original:side===3?t.intel:t.variants[side-1];
+ el("image").src=data.images[seq[frame]];
+ ["original","a","b","intel"].forEach((id,i)=>el(id).setAttribute("aria-pressed",String(i===side)));
+}
+function show(){
+ const t=data.trials[trial];frame=0;side=1;playing=true;
+ el("title").textContent=t.title;el("question").textContent=t.question;
+ el("progress").textContent="Comparison "+(trial+1)+" of "+data.trials.length;
+ el("vote").value=answers[trial];el("prev").disabled=trial===0;el("next").disabled=trial===data.trials.length-1;
+ el("play").hidden=t.frames.length<2;el("play").textContent="Pause pan";el("status").textContent="";picture();
+}
+["original","a","b","intel"].forEach((id,i)=>el(id).onclick=()=>{side=i;picture();});
+document.addEventListener("keydown",e=>{if(e.target.tagName==="SELECT")return;if(["1","2","3"].includes(e.key)){side=Number(e.key)-1;picture();}});
+el("prev").onclick=()=>{if(trial>0){trial--;show();}};
+el("next").onclick=()=>{if(trial+1<data.trials.length){trial++;show();}};
+el("play").onclick=()=>{playing=!playing;el("play").textContent=playing?"Pause pan":"Play pan";};
+setInterval(()=>{const n=data.trials[trial].frames.length;if(n>1&&playing){frame=(frame+1)%n;picture();}},180);
+el("vote").onchange=()=>{answers[trial]=el("vote").value;try{localStorage.setItem(key,JSON.stringify(answers));}catch{}};
+el("save").onclick=()=>{
+ const results=data.trials.map((t,i)=>({comparison:t.title,frames:t.frames,choice:answers[i]||"unanswered",A:t.settings[0],B:t.settings[1]}));
+ const url=URL.createObjectURL(new Blob([JSON.stringify({trial:data.id,results},null,2)],{type:"application/json"}));
+ const link=document.createElement("a");link.href=url;link.download="XeGTAO-verdicts.json";link.click();
+ setTimeout(()=>URL.revokeObjectURL(url),2000);el("status").textContent=answers.filter(Boolean).length+" of "+answers.length+" answered.";
+};show();
+</script></html>

@@ -57,13 +57,20 @@ function Get-RefereeSummary([string[]] $Lines) {
     $traces = @($Lines | Where-Object { $_ -match '\breferee_trace\s+frames=\d+,\d+ first_stage=(input|reconstruction|composition) ' })
     $trials = @($Lines | Where-Object { $_ -match '\b(?:native11|dx12)_route_trial next_frame=\d+ phase=' })
     $recovery = @($Lines | Where-Object { $_ -match '\breferee_recovery frame=\d+ first_stage=' })
+    $localRaster = $Lines | Where-Object { $_ -match '\breferee_mixed_raster frame=' } | Select-Object -Last 1
+    $jitterAction = $Lines | Where-Object { $_ -match '\breferee_jitter_trial frame=' } | Select-Object -Last 1
+    $dropouts = @($Lines | Where-Object { $_ -match '\breferee_dropout frame=' })
     $jitterGeometry = $Lines | Where-Object { $_ -match '\breferee_jitter_geometry frame=' } | Select-Object -Last 1
     $composite = $Lines | Where-Object { $_ -match '\breferee_composite frame=\d+ path=' } | Select-Object -Last 1
     $parity = @($Lines | Where-Object { $_ -match '\breferee_parity_swap frames=\d+,\d+ ' })
     $kept = @($Lines | Where-Object { $_ -match '\breferee_roles frame=\d+ kept=1' })
-    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry -and -not $parity -and -not $kept) {
+    if (-not $windows -and -not $states -and -not $roles -and -not $traces -and -not $trials -and -not $coverage -and -not $recovery -and -not $composite -and -not $jitterGeometry -and -not $localRaster -and -not $jitterAction -and -not $dropouts -and -not $parity -and -not $kept) {
         $enabled = $Lines | Where-Object { $_ -match '\b(?:setting |settings_all\s+.*\b)referee_enabled=1\b' } | Select-Object -First 1
-        if ($enabled) { $out.Add('Referee was enabled during this run. The log has no screen or delivery checks.') }
+        $startup = $Lines | Where-Object { $_ -match '\breferee_start automatic_dlaa=1 gpu_checks=([01]) enabled=([01])' } | Select-Object -Last 1
+        if ($startup -match 'gpu_checks=1 enabled=1') { $out.Add('Referee started automatically with DLAA. The log has no screen or delivery checks.') }
+        elseif ($startup -match 'gpu_checks=0') { $out.Add('This build lacks the GPU checks required for Referee. No screen checks ran.') }
+        elseif ($enabled) { $out.Add('Referee was enabled during this run. The log has no screen or delivery checks.') }
+        elseif ($Lines -match '\breferee_enabled=0\b') { $out.Add('Referee was recorded off. No screen or delivery checks were logged.') }
         else { $out.Add('The log has no Referee screen or delivery checks.') }
         if ($layerOrder) { $out.Add($layerOrder) }
         return $out
@@ -164,6 +171,31 @@ function Get-RefereeSummary([string[]] $Lines) {
         if ($recovery[-1] -match 'tool=(\w+) phase=(baseline|replacement|baseline_recheck) ') {
             $out.Add("  Comparison still in progress at the last observation for '$($names[$Matches[1]])'.")
         }
+    }
+    if ($localRaster -match 'center=(\d+,\d+).*baseline_edges=(\d+)') {
+        $out.Add("  Local jitter detected at $($Matches[2]) sampled edges. Reference point ($($Matches[1])).")
+    }
+    if ($jitterAction -match 'phase=(\w+) strength=(\d+).*why="([^"]+)"') {
+        $out.Add("  Jitter adjustment: $($Matches[1]), strength $($Matches[2])%. $($Matches[3]).")
+    }
+    # Surfaces that go exactly black on some jitter samples and come back on others (referee_dropout).
+    if ($dropouts) {
+        $last = $dropouts[-1]
+        $seen = @($dropouts | Where-Object { $_ -match 'pair\{gone=(\d+) back=(\d+)' -and ([int]$Matches[1] + [int]$Matches[2]) -gt 0 }).Count
+        $samples = if ($last -match 'black_samples_px="([^"]+)"') { " Jitter samples it happened on (px): $($Matches[1])." } else { '' }
+        $why = if ($last -match 'why="([^"]*)"') { $Matches[1] } else { '' }
+        $phase = if ($last -match 'phase=(\w+)') { $Matches[1] } else { 'watch' }
+        $recurred = if ($last -match 'recurred=(\d+)') { [int]$Matches[1] } else { 0 }
+        $text = switch ($phase) {
+            'trial'     { 'The Referee is moving the left-behind scene pieces onto the jitter (full strength) and checking. Still checking when the run ended.' }
+            'kept'      { "The Referee moved the left-behind scene pieces onto the jitter (full strength) and the black stopped, so it kept the move. Seen again since: $recurred." }
+            'ruled_out' { 'The Referee tried moving the left-behind scene pieces onto the jitter. The black continued, so it took the move back. NEEDS A LOOK.' }
+            default     { 'Too few to act on yet.' }
+        }
+        $out.Add("  BLACK DROPOUTS: parts of the picture went exactly black on some jitter samples and came back ($seen reported). $text$samples")
+        if ($why) { $out.Add("      why: $why") }
+    } else {
+        $out.Add('  Black dropouts (parts of the picture going exactly black on some jitter samples): none reported.')
     }
     if ($jitterGeometry -match 'tile_xy=(\d+,\d+) samples=(\d+) phase_residual_screen_px=([-\d.]+) phase_residual_dlaa_px=([-\d.]+)(?: locked=(\d+))?') {
         $qualifier = if ($Matches[5] -eq '0') { 'No consistent jitter phase in these pairs.' } else { 'Movement follows the jitter phase.' }

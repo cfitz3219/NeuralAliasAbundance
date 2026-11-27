@@ -13,10 +13,13 @@
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/overlay/present_queues.hpp"
 #include "host_dx12/overlay/route_a_panel.hpp"
+#include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/nr/fg_states.hpp"
+#include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include <filesystem>
+#include <vector>
 
 #include <atomic>
 #include <thread>
@@ -80,6 +83,8 @@ void Pump() { MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { Tr
 
 int main(int argc, char** argv)
 {
+    const bool compact_image = argc >= 3 && !strcmp(argv[1], "--save-compact-menu");
+    const char* image_path = argc >= 3 && (compact_image || !strcmp(argv[1], "--save-menu")) ? argv[2] : nullptr;
     const bool hardware = argc > 1 && !strcmp(argv[1], "--hardware");
     const bool boundary=argc>2 && !strcmp(argv[2],"--boundary");
     const bool busy_install=argc>2 && !strcmp(argv[2],"--busy-install");
@@ -112,7 +117,16 @@ int main(int argc, char** argv)
     }
 
     REQUIRE(na::hooking::Initialize());
-    na::overlay::RegisterRouteAMenu();
+    if (image_path) {
+        na::j2::SetEnabled(true);
+        na::overlay::RegisterLiveDlaaMenu();
+        if (argc > 3) {
+            for (auto page : na::menu::kPages)
+                if (!strcmp(na::menu::PageName(page), argv[3])) na::menu::SetCurrentPage(page);
+        }
+    } else {
+        na::overlay::RegisterRouteAMenu();
+    }
     if(!late_queue) {
         std::atomic<bool> held{false};std::thread competitor;
         if(busy_install)competitor=std::thread([&]{
@@ -127,7 +141,7 @@ int main(int argc, char** argv)
 
     WNDCLASSW wc{}; wc.lpfnWndProc = GameWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"NeuralAliasOverlayTestGame";
     RegisterClassW(&wc);
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"overlay_test", WS_OVERLAPPEDWINDOW, 100, 100, 640, 360, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"overlay_test", WS_OVERLAPPEDWINDOW, 100, 100, image_path ? (compact_image ? 650 : 1440) : 640, image_path ? (compact_image ? 1080 : 900) : 360, nullptr, nullptr, wc.hInstance, nullptr);
     REQUIRE(hwnd != nullptr);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -337,6 +351,18 @@ int main(int argc, char** argv)
             if(q[0]>8||q[1]>8||q[2]>8){++visible_pixels;last_x=(std::max)(last_x,x);last_y=(std::max)(last_y,y);}}
         std::printf("scaled overlay %ux%u visible=%llu bounds=%u,%u sample=%u,%u,%u\n",w,h,(unsigned long long)visible_pixels,last_x,last_y,p[0],p[1],p[2]);
         CHECK(p[0]>8 || p[1]>8 || p[2]>8); // old unscaled viewport leaves this pixel black
+        if (image_path) {
+            FILE* output = nullptr;
+            REQUIRE(fopen_s(&output, image_path, "wb") == 0 && output);
+            std::fprintf(output, "P6\n%u %u\n255\n", w, h);
+            std::vector<unsigned char> row(w * 3);
+            for (UINT y = 0; y < h; ++y) {
+                const auto* source = pixels + fp.Offset + y * fp.Footprint.RowPitch;
+                for (UINT x = 0; x < w; ++x) std::memcpy(&row[x * 3], source + x * 4, 3);
+                REQUIRE(std::fwrite(row.data(), 1, row.size(), output) == row.size());
+            }
+            REQUIRE(std::fclose(output) == 0);
+        }
         rb->Unmap(0,nullptr);
     }
 

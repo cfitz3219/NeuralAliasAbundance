@@ -181,3 +181,103 @@ PR 183 at abb2d5f2. The equivalent original shutdown fixture fault was decoded t
 ### 2026-11-21 Pacific — Unified Referee merged; Pharaoh Dynasties staged
 
 PR 181 merged to main at 393db03a with both Astra and Fable's fixes. Release 3e2eb03d is staged for Cort's first Pharaoh Dynasties run. The three CMDs are in Windows Documents. Installer and rollback passed in a temporary folder, with no game installation or launch. COMMS records the 12/13 RTX suite, Cort's acceptance of 89.8% in the companion lighting fixture, the unchanged 90% assertion, and the 32-bit transport evidence.
+
+### 2026-11-21 Pacific — Three Kingdoms first campaign and automatic Referee
+
+Three Kingdoms delivered DLAA in the captured campaign at both resolutions. The jitter-linked riverbank defect appears in reconstructed and displayed pixels. A hidden Referee was disabled and ran no checks. Original RCAS and automatic Route B Referee are now staged in both Total War installers at a072227a, PR 193. Seven automated Release checks and the Results tests passed. Upgrade and removal were verified in temporary game folders. Cort owns the live verification. See the November 21 COMMS entry and the PR WORKLOG.
+
+
+### 2026-11-21 — Three Kingdoms riverbank
+
+PR 193 build 37b9be05 is staged in Windows Documents. Both Route B APIs now recognize a local stationary input edge displaced by reconstruction jitter and compare reduced strengths using final-screen evidence. See the Three Kingdoms mixed jitter entry in COMMS for the saved-frame findings, RTX comparison and test limits. Cort owns the game test.
+
+
+### 2026-11-21 — Automatic mip bias restored
+
+Build 8d6913ca on PR 193 combines Fable's late DX11 sampler discovery and the follow-up that preserves the game's original sampler state. RTX checks verified sampled pixels and live restoration. The Three Kingdoms and Pharaoh Dynasties installers in Windows Documents are staged at the same build. COMMS and WORKLOG record the fixture evidence and packaging checks.
+
+
+### 2026-11-21 — XeGTAO with measured motion and safer jitter trials
+
+PR 193 build 50fcfe56 stages both Total War packages. Native DX11 has separate AO projection acquisition, and both Referee detectors require independent confirmation before changing jitter. Seven final tests passed on the RTX machine. See COMMS for live capture findings, offline replay, and package checks. Cort owns the campaign test.
+
+
+### 2026-11-21 — Three Kingdoms dark terrain patches
+
+PR 193 build d8d38932 is staged in both Total War Documents installers. The DX11 correction shares actual viewport jitter across a verified shader-readable depth producer and later material geometry. It preserves full-strength jitter for this path. Six Release checks and both temporary install and rollback fixtures passed. The COMMS evidence for Fable includes the real game captures, the game log showing the render dependency, and the RTX reproduction. Cort owns the live map check.
+
+
+### 2026-11-21 — Black Flag centred native scene discovery
+
+PR 193 build 4003c4fd is staged in the Black Flag Documents CMDs. Native DX11 can now prove a native-sized scene inside a differently shaped backbuffer. Nine final checks passed, including centred display delivery and an offscreen negative control on RTX. The isolated update and rollback passed. Cort owns the live ultrawide check. COMMS records the known game evidence and the fixture distinction.
+
+### 2026-11-21 Pacific — Fable PR 194 merged into Route B integration
+
+Merge 0396a74f on astra/automatic-route-b-referee (PR 193) includes Fable through bcc1b95d and the dropout trial guard 2f68ab8a. Ten focused checks passed with the trial guard and seven passed on the final merge, including RTX centred-scene placement on both APIs. All twelve Results script cases passed. Existing Three Kingdoms captures confirmed the black-pixel counts. A stretched image using the timeout fallback still lacks screen proof at the game's scale. Source integration only. See the matching COMMS entry for evidence and limits.
+
+
+### 2026-11-21 Pacific — Graphite overlay and sharpness preview
+
+PR 196 merged to the Route B integration branch at 492bd4b1. At displayed 100%, RCAS now reaches 2.6x standard detail gain on both graphics APIs. The graphite menu fades around its anchored slider during deliberate drags and stays steady between clicks. Five Release tests passed, including RTX readback and native DX11 automatic DLAA. WORKLOG at e8bf0ed8 records the measured contrast, transition fix and input tests. Production DLL built in the integration worktree. Game installers continue to identify their own packaged versions.
+
+### November 22, 2026 (Pacific) — Post-DLAA enhancer, first offline review
+
+Astra's shared line is `astra/na1-controls-adaptive-shadow`, PR 196 base `492bd4b1`. The invalid-camera SE4 after-picture is bit-identical to the captured DLAA plane. Of 390 complete Route B frames, 201 passed both matrix reconstruction and viewport-scale checks. Six invertible Resistance matrices failed the latter. The same two-sided lighting controls await Claude's recombine stage and Cort's comparison. Proposed shared darkening budget for that review is 0.010 stops on average and 0.040 in the worst 1/16-height tile. See the November 23 UTC correction in COMMS for capture coverage and remaining qualification. No game build or deployment.
+
+### Camera-free lighting qualification, November 22 Pacific
+
+Cort set a 99% floor for placement and strength. The offline solver uses rigid point pairs to infer a scale-relative projection from depth and motion. All three known-projection controls passed at 0.25 px tracking noise. All 13 real bursts lacked independent calibration agreement. The direct-depth AO baseline failed on all 201 usable reference frames. The released DLAA path is independent. See COMMS for criteria, the diagnostic at `36b9274f` on `astra/na1-controls-adaptive-shadow`, and the saved visual report. Real moving-scene qualification remains open.
+
+### Paired still / pan lighting captures, November 22 Pacific
+
+On `astra/na1-controls-adaptive-shadow`, PR 197 at `71afc93e` adds two evidence controls to Picture > Live DLAA. Five Release regressions passed, including clicks and 30 complete sample frames per condition. The Three Kingdoms staging folder is `local/Lighting-Test-Three-Kingdoms-71afc93e` in Cort's usual project checkout. Ten package hashes and isolated install / results / rollback passed. Cort owns the live recordings. Opus's research request is in COMMS at `dd48f48b`, including the unavailable camera, synthetic and real-game results, camera-free workaround and qualification criteria.
+
+### November 22 Pacific — Resistance lighting recorder staged
+
+The verified first-test package is `local/Lighting-Test-Resistance-71afc93e` in Cort's project checkout. INSTALL.cmd uses the existing Resistance receipt. A temporary-directory upgrade from the deployed release, paired metadata collection, rollback and all 12 final payload hashes passed. The live game still has `39fdbc53`. Cort owns the two 15-second campaign recordings with recorder `71afc93e`. Three Kingdoms remains available for the second game.
+
+### November 22 Pacific — Revised camera-free lighting tests
+
+PR 197 recorder d9106460 uses separate Still, Turn 1 and Turn 2 buttons, with Slide available only in the flat strategy-map packages for Three Kingdoms and Pharaoh. Use the d9106460 installers under local/Lighting-Test-* before the earlier paired recorder. Start with Resistance. RESULTS.cmd writes lighting-tests.json into the game's timestamped results folder. The live readout and lighting startup are not enabled. Thirteen archived bursts were inconclusive for lens recovery. See the current COMMS entry and research/camera-independent-lighting/RECORDINGS.md.
+
+### 2026-11-22 Pacific — Offline contact-shadow design
+
+Astra's PR #197 at acc7b235 contains a camera-independent per-pixel shadow proposal guided by the game's existing treatment of comparable contacts. It includes a real Intel comparator, four 30-frame replays and a controlled rotation with adaptive and frozen settings. Regional and scene caps held across all 120 frames. Fable and Opus have the review request in COMMS. The staged recorder remains d9106460. Moving gameplay, joint curvature budgets, both live APIs, the 99% layer gate and GPU cost remain open.
+
+### November 22 Pacific — Stronger lighting proof
+
+Cort rejected the first Astra photos as too mild. PR #197 at c8fa3442 has the stronger offline candidate, individual layer controls, four 3440 × 1440 comparisons and a 120-frame replay. Local proofs are under local/lighting-strength-study. The 0.24/0.82 stop budget is provisional for visual review. Nothing was installed. Moving gameplay and GPU cost remain open. See research/contact-shadows/VISIBLE-LIGHTING.md.
+
+### 2026-11-23 — Referee chooses shadow and curvature settings in saved-scene tests
+
+PR #197 at 68604450 contains the adaptive offline auditions and the exact 50 FPS quality switch. Five saved recordings covered 150 custom lighting frames and 75 qualified Intel frames. Checking a carried shadow fit on an independent Three Kingdoms scene rejected it and retained the useful curvature fit. The full-resolution custom comparison and reports are under local/referee-lighting-calibration. See research/contact-shadows/REFEREE-TUNING.md on the PR. Cort still needs the Resistance recorder at d9106460 for 15 seconds each of Still, Turn 1 and Turn 2. Live integration, sustained motion, 99% location and strength agreement, and gameplay timing remain open.
+
+### November 22 Pacific — Resistance recorder startup and Home design
+
+The d9106460 binary linked the empty discovery adapter. Cort enabled DLAA, the menu rendered, and 30 frames were requested, but no scene reached DLAA. Previous build 39fdbc53 did process the camera-free Resistance scene. Package 43884374 on PR #197 now requires the actual scene-discovery worker to start in the release DLL before staging. The Home design carries all three Poise faces and their license, plus the approved palette. The recorder reports waiting until DLAA produces frames. The game remains Cort's to install and test. Use local/Resistance-Recorder-Launchers/Install-Resistance-Recorder-43884374.cmd and the matching Results launcher. See COMMS for the old sibling packages and the real GPU check.
+
+### 2026-11-23 07:40 UTC — Resistance recordings complete; new menu staged
+
+PR #197 revision 853f5dfc on astra/na1-controls-adaptive-shadow. Cort's real run confirms 43884374 restored DLAA and all three recordings. The lens fit stayed ambiguous on the turns. Continue testing the camera-independent lighting on the existing recordings. The largest measured motion discrepancy is curvature during Turn 2. See COMMS and the PR's research/contact-shadows/REFEREE-TUNING.md. The new Resistance menu is staged as local/Resistance-Recorder-Launchers/Install-Resistance-Menu-853f5dfc.cmd. Both offline menu widths and the isolated upgrade and rollback were verified. Cort can install the menu with the game closed. No further capture is needed for this investigation.
+
+### November 22, 2026 (Pacific) · Graphite menu correction
+
+Use local/Resistance-Recorder-Launchers/Install-Resistance-Menu-7a7c688b.cmd for Cort's revised dark menu. Revision 7a7c688b restores graphite and uses one italic face for the complete NeuralAlias title. The staged Resistance installer passed the upgrade and rollback rehearsal. See COMMS for verification.
+
+### 2026-11-23 Pacific — XeGTAO player trial
+
+Astra staged the self-contained visual trial locally at `local/XeGTAO-Referee-Trial/XeGTAO-trial.html` with nine comparisons and a downloadable answer sheet. It needs about three to five minutes of Cort’s time. The updated offline governor selects Ultra above 50 FPS, Medium at 40–50, Low above 15 and below 40 and Off at or below 15. Existing game AO alone never requests a strength reduction. The matched Intel full-resolution lens replay passed placement on four Resistance frames, with 95.30–98.40% of affected pixels inside Fable’s revised strength tolerance against the older reference. Live integration and player votes remain open. [PR #197 test and results](https://github.com/cfitz3219/NeuralAliasAbundance/blob/35363a0c/research/contact-shadows/AO-REFEREE-TRIAL.md).
+
+## 2026-11-23 Pacific — Cort approved the Sniper Resistance contact-shadow appearance
+
+The accepted offline picture combines Previous correction on the foreground soldier with the stronger world contacts from the latest comparison. Use this exact still as the visual reference when working on motion or comparing later candidates. Earlier Strong and Extra strong are superseded for this scene. Referee should preserve the approved short-radius field and apply the wider AO only where it adds shading within the remaining budget. The compositing code is on the shared research branch `astra/na1-controls-adaptive-shadow`, in `research/contact-shadows/world_contacts.py`. Local reference: `local/XeGTAO-Referee-Trial/world-contact-review/World-contacts.png`. The approval covers this appearance in Resistance. Other games, continuous motion and live frame cost need their own evidence.
+
+## 2026-11-26 Pacific — Resistance 2× wire shimmer
+
+Cort sees heat-wave ripples around thin lines even while holding the camera still on build `864d0823`. [PR #202](https://github.com/cfitz3219/NeuralAliasAbundance/pull/202) contains a tested FP16 GPU pass for the generated world picture before HUD composition. Across five withheld real frames, mean broad luminance error 32–96 display pixels from the bunker cable fell 47%. Median isolated cost was 0.171 ms at 3440×1440 on the 5070 Ti across 16 dispatches. The morning capture precedes the live 2× toggle. The reported improvement is offline. Fable's player build still needs a visual A/B, and the pass largely abstains on fast turns.
+
+### November 26 Pacific — Hearts of Iron IV native DX11 Replay and Three Kingdoms overlay check
+
+Astra’s [PR #204](https://github.com/cfitz3219/NeuralAliasAbundance/pull/204) supplies Replay motion over the native DX11/DX12 bridge on top of Fable’s #200. Code commit `2eb2acac`. On the RTX 5070 Ti, the old shared texture failed at DX11 OpenSharedResource1. The accepted texture preserved every byte of 1,038 positions. The test delivered 46 DLAA frames, 44 with Replay motion. A deliberately rejected allocation logged once and normal DLAA delivered all 46 frames.
+
+Fable’s unpublished overlay variant preserved the original Three Kingdoms material at both recorded offsets. A second RTX/WARP case proves that an otherwise eligible mesh reading stationary shader depth can turn black when moved. Both the two-grid reproducer and the full Replay results are in `local/HOI4-Replay-20261126` on Cort’s PC. The COMMS entry gives Fable the two measured outcomes and the requested per-reader handling. Live HoI4 quality and the final integrated overlay revision remain open. Cort’s instruction to hold the player build applies.

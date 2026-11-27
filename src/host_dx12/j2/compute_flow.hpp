@@ -10,6 +10,15 @@ struct Frame {
     uint64_t frame=0,previous=0;uint32_t generation=0,slot=0;bool reset=false,hdr=false;
     float jitter[2]{}; // nominal on input; Ticket.frame carries the calibrated encode shift
     float raster_jitter[2]{}; bool raster_sample=false;
+    // The picture was shaded once per block of this many pixels (core/fold_shading.hpp). The encode
+    // then averages over one block, so the block grid, which stays put on the screen while the sample
+    // moves, is not read as movement.
+    uint8_t block_x=1,block_y=1;
+    // total only. Sampled measuring (a folded DLSS level on screen, nothing else needing the whole
+    // field): the search still runs on the whole picture, but `measure` decides only the pixel (pick)
+    // of each sample_x x sample_y block, at its own full-size position in Tier3::total / total_valid;
+    // the other pixels of those textures are left as they were (stale). 1 x 1: every pixel.
+    uint8_t sample_x=1,sample_y=1,sample_pick_x=0,sample_pick_y=0;
     bool raster_confirmed=false; // exact viewport writes reached this source recording; not a learned convention
     uint64_t source_generation=0;
     // false: only the M3 camera fit runs (the camera needs reconstructing but the user turned
@@ -85,8 +94,15 @@ void SetScreenFit(bool on);
 struct Gates { float image_ratio, image_abs, texture_min, agree_px, agree_cos, consistency_px; uint32_t agree_min; bool sky; };
 Gates GatesFor(uint32_t percent); // pure, for tests and the panel
 void Reset(); // old contexts stay retained by their executable/GPU recordings
+// Another picture size is coming (a folded DLSS level measures at its own size): its working
+// resources and programs are built on a thread of their own, and Record takes them when a picture of
+// that size arrives, keeping the present size's for the way back. No frame waits on it. Ready says
+// whether Record would find that size without building anything.
+void Prepare(ID3D12Device*,ID3D12CommandQueue*,unsigned w,unsigned h);
+bool Ready(unsigned w,unsigned h);
 struct Stats {
     uint64_t recorded=0,submitted=0,pairs=0,busy=0,resets=0,accepted=0,total=0;
+    uint64_t context_swaps=0,prepared=0,prepare_failed=0; // sizes taken from the kept contexts; built ahead by Prepare; failed there
     uint64_t attempts=0,submitted_pairs=0,waiting_history=0,unavailable=0,samples=0;
     uint64_t last_submitted_frame=0,sample_frame=0,submit_age_ms=0,sample_age_ms=0;
     uint64_t rejected_invalid=0,rejected_small=0,rejected_cost=0,rejected_offscreen=0,rejected_image=0,rejected_flicker=0; // flicker: passed every check, no agreeing previous pair yet
@@ -102,6 +118,7 @@ struct Stats {
     // is exactly still when there is no model; 4 and 5, the search's vector handed on, are no longer
     // written; 3 and 6 are not used). Kept apart from `sum`: those count residuals against a camera.
     uint64_t total_frames=0,total_pairs=0,total_sum[8]{},total_sum_pairs=0;
+    uint64_t sampled_pairs=0; // total pairs whose `measure` decided only the pixels a folded level keeps (Frame::sample_x)
     bool total_mode=false; // the latest recording was a Frame::total one (the last sample's counts are then the measure codes)
     // Scene cuts measured (AMD's whole-frame scene change on a total pair), the newest one's frame,
     // and resets asked for through Ticket::cut_reset.

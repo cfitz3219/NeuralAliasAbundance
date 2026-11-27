@@ -72,6 +72,12 @@ struct DescHeap;
 // request goes away. Only an entirely idle jitter path can skip the list locks.
 std::atomic<uint64_t> g_vpj_recordings{0};
 std::atomic<bool> g_vpj_ever{false};
+// Coarse shading of the scene (core/fold_shading.hpp): the D3D12_SHADING_RATE the selected scene's
+// depth-tested draws are given, 0 = the game's own. g_coarse_ever: it was asked for at least once in
+// this run, so recordings may still carry a rate that has to be handed back.
+std::atomic<uint32_t> g_coarse{0};
+std::atomic<bool> g_coarse_ever{false};
+std::atomic<uint64_t> g_coarse_draws{0}, g_coarse_sets{0}, g_coarse_restores{0}, g_coarse_unavailable{0};
 // What the most recent recording pinned for its scene draws: the sample, the depth it drew into and
 // whether its one full-size viewport was widened (that is part of where the picture landed).
 struct VpjPinned { uint64_t sample = 0, depth = 0; bool expanded = false; };
@@ -106,7 +112,10 @@ struct DepthWrites {
         ++clears;
     }
 };
-float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / 65536.f; }
+// Units of a packed viewport offset. 1/16384 px (was 1/65536, which stopped at half a pixel): the
+// folded-shading modes move the scene by up to a whole pixel (core/fold_shading.hpp).
+constexpr float kVpjUnits = kSceneViewportJitterUnits;
+float vpj_axis(uint64_t v, unsigned shift) { return static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(v >> shift))) / kVpjUnits; }
 struct ListState {
     uint32_t list_type=NA_UNKNOWN_U32; // immutable creation metadata
     std::atomic<uint64_t> generation{0};
@@ -201,6 +210,17 @@ struct ListState {
     na_object_id last_draw_rt = 0; // actual draw evidence survives OM unbinding
     na_object_id cur_rts[8] = {};
     uint32_t cur_nrt = 0;
+    // VARIANT: jitter/shader-depth-readers
+    // Per recording: the first target last examined as a possible depth-like layer, and the last
+    // answer to "does this draw's shader read a layer".
+    na_object_id vpj_layer_seen_rt = 0;
+    uint32_t vpj_layer_seen_frame = 0;
+    struct VpjLayerRead {
+        uint64_t state_revision = 0, registry_revision = 0;
+        uint32_t frame = 0, count = 0;
+        std::array<na_object_id, 4> layers{};
+        bool valid = false, reads = false;
+    } vpj_layer_read;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32, cur_rt_sub = NA_UNKNOWN_U32;
     na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
     uint32_t entry_barrier=0;
@@ -245,6 +265,7 @@ struct ListState {
         if (depth && vpj_resolved.depth == depth) vpj_resolved = {};
     }
     bool vpj_applied = false;
+    uint32_t coarse_rate = 0; // the shading rate we set on this recording (0: the default, nothing to hand back)
     uint64_t vpj_value = 0, vpj_scene = 0, vpj_depth = 0;
     bool vpj_scene_expanded = false, vpj_scene_mixed = false; // the pinned scene draws' raster shape; mixed = not one shape
     DepthWrites de; // this recording's depth-writing draws and clears of the scene depth (bind_m)
@@ -4004,6 +4025,7 @@ struct On<sl::list::Reset> {
                     ls->entry_barrier=0;
                     ls->sampled_textures.clear();
                     std::fill_n(ls->sampled_ranges,16,ListState::SampledRange{});
+                    ls->vpj_layer_seen_rt = 0; ls->vpj_layer_seen_frame = 0; ls->vpj_layer_read = {};
                     ls->sampled_range_next=0;
                     ls->cleared.clear();
                     ls->pso = pso;
@@ -5423,28 +5445,160 @@ void capture_raster_targets(GL* list, UINT count, const D3D12_CPU_DESCRIPTOR_HAN
 // tests depth gets the game's viewports moved by (x, y) render pixels (+x right, +y down), the
 // content moves with them, and DLSS is told exactly that value. Post passes (no scene depth,
 // or depth test off: full-screen passes) keep the game's own viewports, so nothing is shifted
-// twice. Packed: frame (low 32 bits, never 0) << 32 | x << 16 | y, x/y int16 in 1/65536 px.
+// twice. Packed: frame (low 32 bits, never 0) << 32 | x << 16 | y, x/y int16 in 1/16384 px (kVpjUnits).
 std::atomic<uint64_t> g_vpj{0};
 std::atomic<uint64_t> g_vpj_local_layers{0}, g_vpj_submitted_layers{0};
 std::atomic<uint64_t> g_vpj_sets{0}, g_vpj_restores{0}, g_vpj_draws{0}, g_vpj_unknown{0};
 thread_local bool t_vpj_self = false; // our own RSSetViewports: not a change of the game's
+// VARIANT: jitter/shader-depth-readers (the DX12 side of native11's aligned shader-depth draws).
+// A full-size R32_FLOAT colour target written first by depth-tested scene draws that took the
+// sample is a depth-like layer. Lists record in parallel, so a reader can be recorded before the
+// list that writes the layer this frame: a layer seen in this frame or the one before counts.
+// The same rule moves both in every frame, so the reader's sample is the writer's.
+struct VpjDepthLayer { na_object_id resource = 0, depth = 0; uint32_t frame = 0; };
+std::mutex g_vpj_layer_m;
+VpjDepthLayer g_vpj_layers[4];
+std::atomic<uint32_t> g_vpj_layer_frame{0}; // newest frame a layer was written in; 0 = never (the hot-path gate)
+std::atomic<uint64_t> g_vpj_shader_depth{0};
+std::atomic<uint64_t> g_vpj_shader_depth_refused[static_cast<size_t>(neural_alias::ShaderDepthRefusal::Count)]{};
+constexpr uint64_t kVpjFullScreenVertices = 6; // two triangles: more than this is a mesh
+// VARIANT: referee/sample-locked-dropout
+// Set by the Referee through SetStillMeshJitter while it tries or keeps its reaction to dropouts.
+std::atomic<bool> g_vpj_still_meshes{false};
+std::atomic<uint64_t> g_vpj_still_moved{0}, g_vpj_still_asks{0};
+inline uint32_t vpj_frame(uint64_t sample) { return static_cast<uint32_t>(sample >> 32); }
+// this frame, the one before, or (a list still recording the frame before) the one after
+inline bool vpj_layer_fresh(uint32_t frame, uint32_t layer_frame) { return layer_frame && frame - layer_frame + 1u <= 2u; }
+// The scene draw that is about to take the sample writes ls.cur_rt first. Caller holds g_m and ls.bind_m.
+void vpj_note_depth_layer_locked(ListState& ls, uint64_t sample, na_object_id depth)
+{
+    const uint32_t frame = vpj_frame(sample);
+    const na_object_id rt = ls.cur_rt;
+    if (!rt || !ls.cur_nrt || (ls.vpj_layer_seen_rt == rt && ls.vpj_layer_seen_frame == frame)) return;
+    ls.vpj_layer_seen_rt = rt;
+    ls.vpj_layer_seen_frame = frame;
+    uint32_t w = 0, h = 0, fmt = 0, dw = 0, dh = 0, dfmt = 0;
+    if (!resource_dims_locked(rt, &w, &h, &fmt) || fmt != DXGI_FORMAT_R32_FLOAT ||
+        !resource_dims_locked(depth, &dw, &dh, &dfmt) || w != dw || h != dh) return;
+    std::lock_guard<std::mutex> lock(g_vpj_layer_m);
+    VpjDepthLayer* slot = &g_vpj_layers[0];
+    for (auto& e : g_vpj_layers) {
+        if (e.resource == rt) { slot = &e; break; }
+        // otherwise the entry least worth keeping: a stale one first, then the oldest
+        const bool stale = !vpj_layer_fresh(frame, e.frame), slot_stale = !vpj_layer_fresh(frame, slot->frame);
+        if ((stale && !slot_stale) || (stale == slot_stale && e.frame < slot->frame)) slot = &e;
+    }
+    *slot = {rt, depth, frame};
+    g_vpj_layer_frame.store(frame, std::memory_order_release);
+}
+// The fresh layers of this scene depth that the list is not writing now. Returns how many; sets
+// *written when a fresh layer is among the bound targets.
+uint32_t vpj_fresh_layers(const ListState& ls, uint32_t frame, na_object_id depth, na_object_id out[4], bool* written)
+{
+    uint32_t n = 0;
+    std::lock_guard<std::mutex> lock(g_vpj_layer_m);
+    for (const auto& e : g_vpj_layers) {
+        if (!e.resource || e.depth != depth || !vpj_layer_fresh(frame, e.frame)) continue;
+        bool target = false;
+        for (uint32_t i = 0; i < ls.cur_nrt && i < 8; ++i) target = target || ls.cur_rts[i] == e.resource;
+        if (target) *written = true; else out[n++] = e.resource;
+    }
+    return n;
+}
+// Whether a graphics table bound for the coming draw holds a mip-0 R32_FLOAT view of one of
+// `layers`. Remembered per recording until a texture table or the registry changes.
+// Caller holds g_m and ls.bind_m.
+bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* layers, uint32_t count)
+{
+    auto& cached = ls.vpj_layer_read;
+    const uint64_t revision_now = g_operation_revision.load();
+    if (cached.valid && cached.state_revision == ls.read_revision[0] && cached.registry_revision == revision_now && cached.frame == frame &&
+        cached.count == count && std::equal(layers, layers + count, cached.layers.begin()))
+        return cached.reads;
+    bool reads = false;
+    if (const Obj* sig = root_sig_obj_locked(ls, 0)) {
+        const auto& params = sig->root_params;
+        const auto& ranges = sig->root_ranges;
+        for (size_t p = 0; !reads && p < ls.args[0].size() && p < params.size(); ++p) {
+            const auto& arg = ls.args[0][p];
+            if (arg.type != 1 || params[p].param_type != NA_ROOT_TABLE) continue;
+            uint32_t slot = 0;
+            auto* heap = bound_heap_for_gpu_locked(ls, arg.value, &slot);
+            if (!heap) continue;
+            for (uint32_t r = 0; !reads && r < params[p].count && params[p].first_range + r < ranges.size(); ++r) {
+                const auto& range = ranges[params[p].first_range + r];
+                if (range.table_offset == NA_UNKNOWN_U32 || range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV) continue;
+                SlotShared stripe;
+                for (uint32_t k = 0; !reads && k < std::min<uint32_t>(range.num_descriptors, 64); ++k) {
+                    const uint64_t index = uint64_t(slot) + range.table_offset + k;
+                    if (index >= heap->count) break;
+                    stripe.lock(heap, index);
+                    const auto& info = heap->info[static_cast<size_t>(index)];
+                    // A view made without a description takes the layer's own format and all its mips.
+                    if (info.kind != NA_DESC_SRV || (info.format != DXGI_FORMAT_R32_FLOAT && info.format != NA_UNKNOWN_U32) ||
+                        (info.first_sub != 0 && info.first_sub != NA_UNKNOWN_U32)) continue;
+                    for (uint32_t i = 0; i < count; ++i) reads = reads || info.resource == layers[i];
+                }
+            }
+        }
+    }
+    cached.state_revision = ls.read_revision[0];
+    cached.registry_revision = revision_now;
+    cached.frame = frame;
+    cached.count = count;
+    std::copy_n(layers, count, cached.layers.begin());
+    cached.reads = reads;
+    cached.valid = true;
+    return reads;
+}
 // The game (or host work restoring the game's state) set viewports, or the list restarted:
 // our offset copies are no longer bound.
 void vpj_viewports_replaced(GL* l, bool reset)
 {
-    if (!g_vpj_ever.load(std::memory_order_relaxed) || t_vpj_self) return;
+    const bool vpj = g_vpj_ever.load(std::memory_order_relaxed) && !t_vpj_self;
+    const bool coarse = reset && g_coarse_ever.load(std::memory_order_relaxed);
+    if (!vpj && !coarse) return;
     std::shared_lock<RegistryLock> lock(g_m);
     na_object_id id = 0;
     auto* ls = list_state_locked(l, &id);
     if (!ls) return;
     std::lock_guard<std::mutex> bl(ls->bind_m);
+    if (coarse) ls->coarse_rate = 0; // Reset puts the shading rate back to one per pixel
+    if (!vpj) return;
     ls->vpj_applied = false;
     if (reset) {
         if (ls->vpj_scene) g_vpj_recordings.fetch_sub(1, std::memory_order_release);
         ls->vpj_scene = 0; ls->vpj_depth = 0; ls->vpj_scene_expanded = ls->vpj_scene_mixed = false;
     }
 }
-void vpj_before_draw(GL* l)
+// The shading rate the draw that follows gets. Called under the recording's bind lock; the call to the
+// driver happens after the locks are released (coarse_apply). *set stays -1 when nothing changes.
+void coarse_decide(ListState& ls, uint32_t rate, int* set)
+{
+    if (rate) g_coarse_draws.fetch_add(1, std::memory_order_relaxed);
+    if (ls.coarse_rate == rate) return;
+    ls.coarse_rate = rate;
+    *set = static_cast<int>(rate);
+}
+void coarse_apply(GL* l, uint32_t rate)
+{
+    ID3D12GraphicsCommandList5* l5 = nullptr;
+    if (FAILED(l->QueryInterface(IID_PPV_ARGS(&l5))) || !l5) { g_coarse_unavailable.fetch_add(1, std::memory_order_relaxed); return; }
+    {
+        HostWorkScope own;
+        l5->RSSetShadingRate(static_cast<D3D12_SHADING_RATE>(rate), nullptr);
+    }
+    l5->Release();
+    (rate ? g_coarse_sets : g_coarse_restores).fetch_add(1, std::memory_order_relaxed);
+}
+void vpj_before_draw_body(GL* l, uint64_t vertices, int* coarse_set);
+void vpj_before_draw(GL* l, uint64_t vertices = 0)
+{
+    int coarse_set = -1;
+    vpj_before_draw_body(l, vertices, &coarse_set);
+    if (coarse_set >= 0) coarse_apply(l, static_cast<uint32_t>(coarse_set));
+}
+void vpj_before_draw_body(GL* l, uint64_t vertices, int* coarse_set)
 {
     // Two readers of the same per-draw facts: viewport jitter, and (only while asked for) the depth
     // direction evidence. With the evidence off this is the viewport jitter's own early return.
@@ -5452,7 +5606,9 @@ void vpj_before_draw(GL* l)
     const bool vpj = g_vpj_ever.load(std::memory_order_relaxed);
     const uint64_t cur = vpj ? g_vpj.load(std::memory_order_acquire) : 0;
     const bool moving = vpj && (cur || g_vpj_recordings.load(std::memory_order_acquire));
-    if (!moving && !evidence) return;
+    const bool coarse_ever = g_coarse_ever.load(std::memory_order_relaxed);
+    const uint32_t coarse_rate = coarse_ever ? g_coarse.load(std::memory_order_relaxed) : 0;
+    if (!moving && !evidence && !coarse_ever) return;
     D3D12_VIEWPORT v[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     UINT n = 0;
     {
@@ -5467,12 +5623,57 @@ void vpj_before_draw(GL* l)
         // sample. The first eligible draw owns it until this list is Reset.
         const na_ev_pipeline_created* pc = sel_depth && ls->cur_ds == sel_depth ? pso_created_locked(*ls) : nullptr;
         if (evidence && pc && pc->depth_enable == 1 && pc->depth_write == 1) ls->de.write(sel_depth, pc->depth_func);
-        if (!moving) return; // counted only: no viewport of the game's is touched
+        if (!moving) { // counted only: no viewport of the game's is touched
+            // Coarse shading without viewport jitter (the sample rides in the camera): the same draws,
+            // the selected scene depth bound and tested.
+            if (coarse_ever) coarse_decide(*ls, coarse_rate && pc && pc->depth_enable == 1 ? coarse_rate : 0, coarse_set);
+            return;
+        }
         const uint64_t sample=ls->vpj_scene&&ls->vpj_depth==sel_depth?ls->vpj_scene:cur;
-        const bool tests_depth = pc && pc->depth_enable == 1;
+        bool tests_depth = pc && pc->depth_enable == 1;
+        // VARIANT: jitter/shader-depth-readers
+        // A mesh with the hardware test off that compares against a sampled depth layer in its
+        // shader is scene geometry on that layer's grid. Looked at only once a layer exists.
+        const bool untested_mesh = sample && pc && !tests_depth && vertices > kVpjFullScreenVertices;
+        const auto scene_viewport = [&] {
+            uint32_t dw = 0, dh = 0, dfmt = 0;
+            return ls->raster_viewports_known && ls->raster_viewport_count == 1 &&
+                ls->raster_viewports[0].TopLeftX == 0.f && ls->raster_viewports[0].TopLeftY == 0.f &&
+                resource_dims_locked(sel_depth, &dw, &dh, &dfmt) &&
+                ls->raster_viewports[0].Width == static_cast<float>(dw) && ls->raster_viewports[0].Height == static_cast<float>(dh);
+        };
+        if (untested_mesh && vpj_layer_fresh(vpj_frame(sample), g_vpj_layer_frame.load(std::memory_order_acquire))) {
+            neural_alias::ShaderDepthReader reader;
+            reader.active = reader.scene_depth_bound = reader.mesh = true;
+            reader.several_targets = ls->cur_nrt > 1;
+            reader.scene_viewport = scene_viewport();
+            na_object_id layers[4] = {};
+            const uint32_t fresh = vpj_fresh_layers(*ls, vpj_frame(sample), sel_depth, layers, &reader.writes_layer);
+            reader.layer_took_sample = fresh != 0 || reader.writes_layer;
+            reader.reads_layer = fresh && reader.several_targets && reader.scene_viewport && !reader.writes_layer &&
+                                 vpj_reads_layer_locked(*ls, vpj_frame(sample), layers, fresh);
+            if (neural_alias::ShaderDepthReaderTakesJitter(reader)) {
+                tests_depth = true; // from here on it is a scene draw like the ones that wrote the layer
+                g_vpj_shader_depth.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_vpj_shader_depth_refused[static_cast<size_t>(neural_alias::ShaderDepthReaderRefusal(reader))].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // VARIANT: referee/sample-locked-dropout
+        // The Referee saw pixels drop out on some samples: while it asks, a scene mesh no fixed rule
+        // moved takes the full sample as well. The resolve proof below still stops it after the scene.
+        bool still_mesh = false;
+        if (untested_mesh && !tests_depth && g_vpj_still_meshes.load(std::memory_order_relaxed)) {
+            neural_alias::StillMesh mesh;
+            mesh.asked = mesh.active = mesh.scene_depth_bound = mesh.mesh = true;
+            mesh.scene_viewport = scene_viewport();
+            still_mesh = neural_alias::StillMeshTakesJitter(mesh);
+            if (still_mesh) tests_depth = true;
+        }
         bool after_resolve = false;
         bool want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, false);
-        if (want && ls->cur_nrt == 1 && pc->depth_write == 0) {
+        // A pipeline with the test off writes no depth, whatever its write mask says.
+        if (want && ls->cur_nrt == 1 && (pc->depth_write == 0 || pc->depth_enable != 1)) {
             // A depth test also belongs to glass, particles and other compositing draws.
             // Once the scene is reconstructed, their colour is on the display pixel grid.
             const auto matches = [&](const ResolvedRaster& r) {
@@ -5503,8 +5704,15 @@ void vpj_before_draw(GL* l)
             }
         }
         want = neural_alias::SceneDrawTakesJitter(sample != 0, ls->cur_ds, sel_depth, tests_depth, after_resolve);
+        // The draws that take the scene's sample are the draws shaded coarse: one rule for both.
+        // The draws that take the scene's sample are the draws shaded coarse: one rule for both. (Build
+        // fb0d69cd also shaded the full-screen passes of the scene's list in blocks: it found about five
+        // draws a frame, changed no frame rate, and Cort's picture broke. Removed.)
+        if (coarse_ever) coarse_decide(*ls, want ? coarse_rate : 0, coarse_set);
         if (want && !(ls->raster_viewports_known && ls->raster_viewport_count)) { g_vpj_unknown.fetch_add(1, std::memory_order_relaxed); want = false; }
         if (want) {
+            if (still_mesh) g_vpj_still_moved.fetch_add(1, std::memory_order_relaxed);
+            if (pc && pc->depth_enable == 1) vpj_note_depth_layer_locked(*ls, sample, sel_depth);
             const bool first_pin = !ls->vpj_scene;
             if (first_pin) g_vpj_recordings.fetch_add(1, std::memory_order_release);
             ls->vpj_scene = sample;
@@ -6223,7 +6431,13 @@ struct ListHook<Slot, R(A...)> {
             // original viewports. Choose the raster for the draw that follows.
             if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced ||
                           Slot == sl::list::ExecuteIndirect || Slot == sl::list::ExecuteBundle)
-                if (!t_host_work && scope.outermost && !scope.ambiguous) { const CostScope c(kCostVpj); vpj_before_draw(l); }
+                if (!t_host_work && scope.outermost && !scope.ambiguous) {
+                    const CostScope c(kCostVpj);
+                    uint64_t vertices = 0; // an indirect draw or a bundle does not say: never taken for a mesh reader
+                    if constexpr (Slot == sl::list::DrawInstanced || Slot == sl::list::DrawIndexedInstanced)
+                        vertices = std::get<0>(std::forward_as_tuple(a...));
+                    vpj_before_draw(l, vertices);
+                }
             if constexpr(Slot==sl::list::ExecuteIndirect) {
                 if(pure_indirect) {
                     const auto hooks=std::atomic_load_explicit(&g_shader_hooks,std::memory_order_acquire);
@@ -9503,30 +9717,78 @@ namespace {
 std::mutex g_live_m;
 std::atomic<uint64_t> g_live_depth{0}, g_live_color{0}, g_live_seq{0};
 uint64_t g_live_version = 0;
-}
-void SetLiveSelection(uint64_t depth, uint64_t color)
+uint64_t g_screen_depth = 0, g_screen_color = 0;
+std::atomic<bool> g_live_requires_screen{false};
+
+void PublishLiveSelectionLocked(uint64_t depth, uint64_t color, bool requires_screen)
 {
-    std::lock_guard<std::mutex> lock(g_live_m);
     const uint64_t d0 = g_live_depth.load(std::memory_order_relaxed), c0 = g_live_color.load(std::memory_order_relaxed);
-    if (depth == d0 && color == c0) return;
+    if (depth == d0 && color == c0 && requires_screen == g_live_requires_screen.load(std::memory_order_relaxed)) return;
     if (color != c0) g_hot_ready.store(false, std::memory_order_release); // bits were built for the old colour
     ++g_live_version;
     g_live_seq.fetch_add(1, std::memory_order_acq_rel); // odd: update in progress
     g_live_depth.store(depth, std::memory_order_relaxed);
     g_live_color.store(color, std::memory_order_relaxed);
+    g_live_requires_screen.store(requires_screen, std::memory_order_relaxed);
     g_live_seq.fetch_add(1, std::memory_order_release); // even: consistent
     // Again after the publish: RefreshReadFilter stores ready=true and then re-reads the selection,
     // so a change is either seen by that re-read or its own false here lands after the true.
     if (color != c0) g_hot_ready.store(false, std::memory_order_release);
 }
-void GetLiveSelection(uint64_t* depth, uint64_t* color)
+} // namespace
+
+void SetLiveSelection(uint64_t depth, uint64_t color, bool requires_screen)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    if (requires_screen && depth && color) {
+        if (g_screen_depth == depth && g_screen_color == color) return;
+        g_screen_depth = depth;
+        g_screen_color = color;
+        PublishLiveSelectionLocked(0, 0, true);
+    } else {
+        g_screen_depth = g_screen_color = 0;
+        PublishLiveSelectionLocked(depth, color, false);
+    }
+}
+
+void GetScreenSelection(uint64_t* depth, uint64_t* color, bool* requires_screen)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    const bool probing = g_screen_depth && g_screen_color;
+    *depth = probing ? g_screen_depth : g_live_depth.load(std::memory_order_relaxed);
+    *color = probing ? g_screen_color : g_live_color.load(std::memory_order_relaxed);
+    if (requires_screen) *requires_screen = probing;
+}
+
+bool SetScreenSelectionProven(uint64_t depth, uint64_t color, bool proven)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    if (!depth || !color || g_screen_depth != depth || g_screen_color != color) return false;
+    PublishLiveSelectionLocked(proven ? depth : 0, proven ? color : 0, true);
+    return true;
+}
+
+bool ScreenSelectionProven(uint64_t depth, uint64_t color)
+{
+    std::lock_guard<std::mutex> lock(g_live_m);
+    return depth && color && g_screen_depth == depth && g_screen_color == color &&
+           g_live_depth.load(std::memory_order_relaxed) == depth && g_live_color.load(std::memory_order_relaxed) == color;
+}
+
+void GetLiveSelection(uint64_t* depth, uint64_t* color, bool* requires_screen)
 {
     for (;;) {
         const uint64_t s0 = g_live_seq.load(std::memory_order_acquire);
         if (s0 & 1) continue;
         const uint64_t d = g_live_depth.load(std::memory_order_acquire), c = g_live_color.load(std::memory_order_acquire);
+        const bool screen = requires_screen && g_live_requires_screen.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
-        if (g_live_seq.load(std::memory_order_relaxed) == s0) { *depth = d; *color = c; return; }
+        if (g_live_seq.load(std::memory_order_relaxed) == s0) {
+            *depth = d;
+            *color = c;
+            if (requires_screen) *requires_screen = screen;
+            return;
+        }
     }
 }
 ResolvedRaster FinishSceneRaster(ID3D12CommandList* list, uint64_t color, uint32_t color_sub,
@@ -9553,6 +9815,26 @@ void SubmitResolvedRaster(const ResolvedRaster& raster)
     std::unique_lock<RegistryLock> lock(g_m);
     if (g_vpj.load(std::memory_order_acquire) == raster.sample) g_vpj_submitted = raster;
 }
+void SetStillMeshJitter(bool asked)
+{
+    if (g_vpj_still_meshes.exchange(asked, std::memory_order_relaxed) != asked && asked)
+        g_vpj_still_asks.fetch_add(1, std::memory_order_relaxed);
+}
+void SetSceneCoarseShading(uint32_t rate)
+{
+    if (rate) g_coarse_ever.store(true, std::memory_order_relaxed);
+    g_coarse.store(rate, std::memory_order_relaxed);
+}
+CoarseShadingStats GetCoarseShadingStats()
+{
+    CoarseShadingStats s;
+    s.rate = g_coarse.load(std::memory_order_relaxed);
+    s.draws = g_coarse_draws.load(std::memory_order_relaxed);
+    s.sets = g_coarse_sets.load(std::memory_order_relaxed);
+    s.restores = g_coarse_restores.load(std::memory_order_relaxed);
+    s.unavailable = g_coarse_unavailable.load(std::memory_order_relaxed);
+    return s;
+}
 void SetSceneViewportJitter(uint64_t frame, float x, float y)
 {
     if (!frame) {
@@ -9562,7 +9844,7 @@ void SetSceneViewportJitter(uint64_t frame, float x, float y)
         }
         return;
     }
-    const auto q = [](float f) { return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(std::lround(double(f) * 65536.0), -32767L, 32767L))); };
+    const auto q = [](float f) { return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(std::lround(double(f) * double(kVpjUnits)), -32767L, 32767L))); };
     uint32_t f32 = static_cast<uint32_t>(frame);
     if (!f32) f32 = 1;
     g_vpj_ever.store(true, std::memory_order_relaxed);
@@ -9800,7 +10082,13 @@ ViewportJitterStats GetViewportJitterStats()
 {
     return {g_vpj_draws.load(std::memory_order_relaxed), g_vpj_sets.load(std::memory_order_relaxed),
             g_vpj_restores.load(std::memory_order_relaxed), g_vpj_unknown.load(std::memory_order_relaxed),
-            g_vpj_local_layers.load(std::memory_order_relaxed), g_vpj_submitted_layers.load(std::memory_order_relaxed)};
+            g_vpj_local_layers.load(std::memory_order_relaxed), g_vpj_submitted_layers.load(std::memory_order_relaxed),
+            g_vpj_shader_depth.load(std::memory_order_relaxed),
+            {g_vpj_shader_depth_refused[1].load(std::memory_order_relaxed), g_vpj_shader_depth_refused[2].load(std::memory_order_relaxed),
+             g_vpj_shader_depth_refused[3].load(std::memory_order_relaxed), g_vpj_shader_depth_refused[4].load(std::memory_order_relaxed),
+             g_vpj_shader_depth_refused[5].load(std::memory_order_relaxed)},
+            g_vpj_still_moved.load(std::memory_order_relaxed), g_vpj_still_asks.load(std::memory_order_relaxed),
+            g_vpj_still_meshes.load(std::memory_order_relaxed)};
 }
 uint64_t LiveSelectionVersion()
 {

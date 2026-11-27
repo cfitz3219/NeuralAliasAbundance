@@ -157,6 +157,8 @@ struct Feature {
     bool tainted = false;      // some use can never be proven complete: release only at Shutdown
     uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0, flags = 0, preset = 0;
     Quality quality = Quality::MaxQuality;
+    uint64_t ordered_group = 0;
+    bool recreate = false;
 };
 
 struct View {
@@ -524,8 +526,9 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
 #endif
 }
 
-bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
+bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_reset)
 {
+    if (history_reset) *history_reset = false;
     const na::diag::crumbs::Scope crumb(list, "NeuralAlias DLSS evaluate");
     const InjectorCallScope origin;
     std::lock_guard<std::mutex> lock(g.m);
@@ -574,7 +577,8 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     // resolution anywhere up to it keeps the same feature and history.
     const uint32_t create_w = d.max_render_w ? d.max_render_w : d.render_w;
     const uint32_t create_h = d.max_render_h ? d.max_render_h : d.render_h;
-    bool fits = cur && !cur->tainted && cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
+    bool fits = cur && !cur->tainted && !cur->recreate && cur->ordered_group == d.ordered_feature_group &&
+                      cur->out_w == d.out_w && cur->out_h == d.out_h && cur->flags == flags &&
                       cur->quality == d.quality && cur->preset == d.preset && create_w <= cur->render_w && create_h <= cur->render_h;
     // A submitted predecessor supplies a fence dependency. A predecessor on
     // this same list is ordered by the list itself. Separate unsubmitted lists
@@ -650,6 +654,17 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         nf.flags = flags;
         nf.quality = d.quality;
         nf.preset = d.preset;
+        nf.ordered_group = d.ordered_feature_group;
+        if (nf.ordered_group) {
+            // Reproduced on an HDR Resistance replay with independent resources for the two views.
+            // A new small feature broke the existing larger view. A newly created larger view
+            // produced clean frames, and it did not change the small view's temporal output.
+            // Keep recorded/submitted work alive under the normal feature retirement rules.
+            for (Feature& other : g.features) {
+                if (other.handle && !other.retired && other.ordered_group == nf.ordered_group &&
+                    (other.render_w > create_w || other.render_h > create_h)) other.recreate = true;
+            }
+        }
         retire_feature_locked(view.feature); // released once every use of it has completed
         view.feature = slot;
         view.needs_reset = true;
@@ -682,7 +697,8 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
     p->Set(NVSDK_NGX_Parameter_MV_Scale_Y, d.mv_scale_y);
     p->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, d.pre_exposure);
     p->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, d.exposure_scale);
-    p->Set(NVSDK_NGX_Parameter_Reset, (d.reset || view.needs_reset) ? 1 : 0);
+    const bool reset = d.reset || view.needs_reset;
+    p->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, d.render_w);
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, d.render_h);
     p->Set(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, 0u);
@@ -736,6 +752,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d)
         ++g.stats.untracked;
     }
     ++g.stats.evaluates;
+    if (history_reset) *history_reset = reset;
     set_reason(g.stats.reason, "");
     return true;
 #else

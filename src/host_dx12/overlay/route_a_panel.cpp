@@ -1,5 +1,6 @@
 #include "host_dx12/native11/samplers.hpp"
 #include "core/temporal_jitter.hpp"
+#include <cstring>
 #include <cmath>
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
@@ -19,6 +20,7 @@
 // Copy rules: docs/UI-STYLE.md (plain language, one sentence per instruction,
 // requested and confirmed state kept distinct).
 #include "host_dx12/overlay/route_a_panel.hpp"
+#include "host_dx12/overlay/lighting_trials.hpp"
 #include "providers/discovery/upscaler_menu.hpp"
 
 #include <shlobj.h>
@@ -30,6 +32,7 @@
 #include <string>
 
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/capture_session.hpp"
@@ -38,7 +41,6 @@
 #include "host_dx12/j2/native_hud.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
-namespace na::referee::gpu { bool Supported(); } // capture/referee_gpu.hpp
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
@@ -53,6 +55,7 @@ namespace na::referee::gpu { bool Supported(); } // capture/referee_gpu.hpp
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/dlss_debug.hpp"
 #include "host_dx12/overlay/na_style.hpp"
+#include "host_dx12/overlay/sharpness_preview.hpp"
 #include "host_dx12/overlay/overlay.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/scale/live_driver.hpp"
@@ -951,25 +954,25 @@ void DrawLiveDlaa()
             na::observe::SetSamplerMipBiasLive(on ? na::settings::DlaaMipBias(na::settings::Get()) : 0.0f);
     }
     EndRow();
-    Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
-    // Cort 2026-11-18, confirmed 2026-11-21: no ordinary package shows the Referee switch
-    // yet. The row is built only when NA_REFEREE_MENU is asked for at configure time
-    // (default OFF). Where it is built, a build without the Referee's GPU checks shows
-    // the row disabled and says so, instead of hiding it (gap audit item 5).
-#if defined(NA_REFEREE_MENU)
-    auto& referee_enabled = na::settings::Get().referee_enabled;
-    bool referee_on = referee_enabled.load() != 0;
-    const bool referee_supported = na::referee::gpu::Supported();
-    BeginRow("Referee", "Checks DLAA while you play and records its findings in the results log.", SwitchWidth());
-    ImGui::BeginDisabled(!referee_supported);
-    if (Switch("referee", &referee_on) && referee_supported) {
-        referee_enabled.store(referee_on ? 1u : 0u);
-        na::settings::Save();
+    if (!na::on12::NativeRoute()) {
+        // Fold the shading, live test (Cort 2026-11-25; core/fold_shading.hpp). One control; DLAA stays
+        // on screen until the chosen level has proven itself. Not saved: every launch starts on DLAA.
+        static const char* kFoldLevels[] = {"DLAA (full size)", "Quality (test)", "Performance (test)"};
+        na::settings::Settings& fs = na::settings::Get();
+        int level = static_cast<int>((std::min)(fs.j2_fold_mode.load(), 2u));
+        BeginRow("DLSS level (test)", "DLAA rebuilds the picture at full size. Quality and Performance make the game shade its 3D picture in small blocks (two pixels, or four) and let DLSS rebuild the full picture from one pixel of each block. The game's own settings and its HUD are not touched. DLAA stays on screen until the new level is truly ready, so there is no frozen picture. This is a test: every launch starts on DLAA.", S(220));
+        ImGui::SetNextItemWidth(S(220));
+        if (ImGui::Combo("##j2fold", &level, kFoldLevels, 3)) fs.j2_fold_mode.store(static_cast<uint32_t>(level));
+        EndRow();
+        char fold_status[320]{};
+        na::j2::FoldStatus(fold_status, sizeof fold_status);
+        if (level != 0 || std::strstr(fold_status, "DLAA (full size)") == nullptr) Hint(fold_status);
     }
-    ImGui::EndDisabled();
-    EndRow();
-    if (!referee_supported) Hint("Not available in this build: it was made without the Referee's screen checks.");
-#endif
+    char native_status[200]{};
+    const bool recording_ready = na::on12::NativeRoute() ? na::native_d3d11::FormatMenuStatus(native_status, sizeof native_status) : st.active;
+    DrawLightingTrials(on && recording_ready);
+    if (on && !recording_ready) Hint("Recording will be available when Live DLAA starts producing frames.");
+    Hint("For sharpest results and best FPS, set Anti-Aliasing to Off in the game's video settings.");
     if (na::settings::AddedUpscalingAllowed() &&
         (na::scale::native::Available() || na::scale::SliderRouteActive() ||
          na::scale::GetAutomaticSceneStats().enabled || na::j2::ProjectionWindow() || na::j2::RenderSmall())) {
@@ -1037,12 +1040,20 @@ void DrawLiveDlaa()
     {
         na::settings::Settings& ss = na::settings::Get();
         int sharp = static_cast<int>(ss.j2_sharpness.load());
-        BeginRow("Sharpness", "RCAS sharpens the reconstructed picture. 0% turns it off, 67% gives standard sharpening, and 100% gives twice standard strength. HUD elements drawn into the scene can also be sharpened.", S(220));
+        BeginRow("Sharpness", "Drag to see more of the picture. Move away to bring the menu back. 0% is off, 67% is standard, and 100% gives 2.6 times standard detail gain.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, sharp ? "%d%%" : "Off", ImGuiSliderFlags_AlwaysClamp)) {
+        auto& preview = PicturePreview();
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, (std::min)(1.0f, ImGui::GetStyle().Alpha / preview.opacity));
+        const ImVec2 pad = ImGui::GetStyle().FramePadding;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(pad.x, pad.y + S(5)));
+        if (ImGui::SliderInt("##j2sharp", &sharp, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) {
             ss.j2_sharpness.store(static_cast<uint32_t>(sharp));
         }
+        preview.ObserveSlider();
         if (ImGui::IsItemDeactivatedAfterEdit()) na::settings::Save();
+        if (ImGui::IsItemVisible() && !ImGui::TempInputIsActive(ImGui::GetItemID()))
+            DrawSharpnessTrack(sharp, preview.opacity < .95f);
+        ImGui::PopStyleVar(2);
         EndRow();
     }
     if (na::j2::RenderSmall() && na::j2::native_hud::Automatic()) {
@@ -1073,10 +1084,7 @@ void DrawLiveDlaa()
     }
     const bool native = na::on12::NativeRoute();
     if (native) {
-        // Camera jitter has one switch for every route: Enhancements > DLAA enhancements.
-        char status[200]{};
-        const bool running = na::native_d3d11::FormatMenuStatus(status, sizeof status);
-        StatusLine(running ? 1 : 0, status);
+        StatusLine(recording_ready ? 1 : 0, native_status);
     }
     if (!native) {
         static const char* kViews[] = {"Off (normal picture)", "Motion vectors", "Fine motion (sub-pixel)", "Depth"};
@@ -1195,11 +1203,11 @@ void DrawLiveDlaaEnhancements()
         // VARIANT: camera/optional
         // One control, live, saved per game ([j2] camera), on both routes.
         na::settings::Settings& cs = na::settings::Get();
-        static const char* kCameraUse[] = {"Use it when found", "Never look for it", "Require it (old behaviour)"};
+        static const char* kCameraUse[] = {"Use it when found", "Measure motion from picture", "Require it (old behaviour)"};
         static const int kCameraValue[] = {1, 0, 2};
         const int now = cs.j2_camera.load();
         int pick = now == 0 ? 1 : now == 2 ? 2 : 0;
-        BeginRow("Scene camera", "DLAA no longer needs to find the game's camera. Use it when found: the camera's exact motion is used on frames where it is found, and motion measured from the picture on frames where it is not. Never look for it: motion is always measured from the picture. Require it: frames without a camera are left as the game drew them, as before. Takes effect on the next frame.", S(220));
+        BeginRow("Scene camera", "DLAA no longer needs to find the game's camera. Use it when found: the camera's exact motion is used on frames where it is found, and motion measured from the picture on frames where it is not. Measure motion from picture: DLAA always measures motion. On native DX11, XeGTAO can still read the camera projection for shading. Require it: frames without a camera are left as the game drew them, as before. Takes effect on the next frame.", S(220));
         ImGui::SetNextItemWidth(S(220));
         if (ImGui::Combo("##j2camera", &pick, kCameraUse, 3)) {
             cs.j2_camera.store(kCameraValue[pick]);

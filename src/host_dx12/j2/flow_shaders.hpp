@@ -42,7 +42,14 @@ void encode(uint3 id : SV_DispatchThreadID) {
     if (id.x >= ew || id.y >= eh) return;
     float2 q = (float2(id.xy) + 0.5) * float2(w, h) / float2(ew, eh);
     float2 uv = (q + float2(jitter_x, jitter_y)) / float2(w, h);
+    // has_cost carries, for this pass only, the block the picture was shaded in (x | y << 8). A
+    // block-shaded picture is averaged over one block: its grid stays on the screen while the sample
+    // moves, and unsmoothed that grid reads as movement.
+    float2 half_block = (float2(has_cost & 255u, (has_cost >> 8) & 255u) - 1.0) * 0.5 / float2(w, h);
     float3 c = t_color.SampleLevel(s_lin, uv, 0).rgb;
+    if (half_block.x > 0 || half_block.y > 0)
+        c = 0.25 * (t_color.SampleLevel(s_lin, uv + half_block * float2(-1, -1), 0).rgb + t_color.SampleLevel(s_lin, uv + half_block * float2(1, -1), 0).rgb +
+                    t_color.SampleLevel(s_lin, uv + half_block * float2(-1, 1), 0).rgb + t_color.SampleLevel(s_lin, uv + half_block * float2(1, 1), 0).rgb);
     if (any(isnan(c)) || any(isinf(c))) c = float3(0, 0, 0);
     if (mode == 1) { c = max(c, 0.0); c = srgb_encode(c / (1.0 + c)); }
     else c = saturate(c);
@@ -291,6 +298,8 @@ bool best_vector(float2 p, float2 hyp, bool raw_on, float2 raw, bool match_light
 #define fit_row cnt_off       // which group of depths this fit is: 0 the far group (every depth when there is no split), 1 the near group
 #define fit_tile_now agree_px  // the tile scale of the weights this pass uses; 0 no tile weights at all; under 0 none yet at this step
 #define fit_tile_next agree_cos // the tile scale of the weights this pass leaves for the next; 0 or less: every weight 1
+#define sample_code have_hist  // measure: block x | block y << 8 | pick x << 16 | pick y << 24; 0 = every pixel (accept's own words)
+#define sample_size agree_min  // measure, sampled: the grid of kept pixels, width | height << 16
 static const float kFitRobust = 1.5, kFitMinSamples = 256.0, kFitMinAgree = 0.5, kFitMaxVector = 512.0, kFitDamping = 1e-4;
 static const float kFitTileFinal = 0.1, kFitTileNoise = 9.0; // screen_motion.hpp Params::tile_final_px, tile_noise
 // screen_motion.hpp LayerParams and kDepthBins.
@@ -377,7 +386,7 @@ groupshared uint gc[64];
 void fit_accum(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     // The fit has stopped and its final pass is already in the buffer: nothing to do. (No lane
     // leaves before the barrier.)
-    const bool idle = u_cnt.Load(FIT_STOP * 4) >= 2u;
+    const bool idle = u_cnt.Load(FIT_STOP * 4) >= 2u || (fit_row==1u && u_cnt.Load(FIT_SPLIT * 4)==0u);
     const uint across = fit_tiles_across();
     const uint2 cell = uint2((gid.x % across) * 8u + (gi & 7u), (gid.x / across) * 8u + (gi >> 3));
     uint used = 0u;
@@ -458,26 +467,16 @@ uint fit_bin(float nearness) { // screen_motion.hpp DepthBin
     return uint(clamp(49 + int(floor(2.0 * log2(nearness))), 1, FIT_BINS - 1));
 }
 void fit_split(uint gi) {
-    if (gi < 64u) {
-        uint own[FIT_BINS];
-        [loop] for (uint b0 = 0; b0 < FIT_BINS; ++b0) own[b0] = 0u;
-        const uint cells = gw * gh;
-        [loop] for (uint at = gi; at < cells; at += 64u) {
-            const float4 a = t_hist[uint2(at % gw, at / gw)];
-            if (fit_usable(a)) own[fit_bin(a.z)] += 1u;
-        }
-        [loop] for (uint b1 = 0; b1 < FIT_BINS; ++b1) gbin[gi * FIT_BINS + b1] = own[b1];
+    const uint batches=(gw*gh+255u)/256u;
+    if (gi < FIT_BINS) {
+        uint sum=0;
+        for (uint g=0;g<batches;++g) sum += u_cnt.Load((FIT_HEAD+g*FIT_BINS+gi)*4);
+        gbin[gi]=sum;
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi != 0u) return;
-    float bins[FIT_BINS];
-    float total = 0;
-    [loop] for (uint b = 0; b < FIT_BINS; ++b) {
-        uint n = 0u;
-        [loop] for (uint lane = 0; lane < 64u; ++lane) n += gbin[lane * FIT_BINS + b];
-        bins[b] = float(n);
-        total += float(n);
-    }
+    float bins[FIT_BINS]; float total=0;
+    [loop] for(uint i=0;i<FIT_BINS;++i) { bins[i]=float(gbin[i]); total+=bins[i]; }
     const float stray_max = kFitGapStray * total;
     // The nearest bin that holds more than strays.
     uint top = FIT_BINS - 1;
@@ -508,18 +507,55 @@ void fit_split(uint gi) {
     }
     u_cnt.Store(FIT_SPLIT * 4, asuint(split));
 }
+
+groupshared float cachedTerms[8*256];
+[numthreads(256,1,1)]
+void fit_reduce(uint3 group : SV_GroupID,uint lane : SV_GroupIndex) {
+    const uint tiles=fit_tiles(), chain=group.x%3u, band=group.x/3u;
+    const uint term=band*8u+(lane%8u);
+    const bool active=!(mode==0u && u_cnt.Load(FIT_STOP*4u)>=1u);
+    float sum=0;
+    const uint rows=(tiles+2u-chain)/3u;
+    for(uint base=0;base<rows;base+=256u){
+        [unroll] for(uint s=0;s<8u;++s){
+            uint slot=lane+256u*s, row=base+slot/8u;
+            cachedTerms[slot]=(active && row<rows && term<FIT_VALUES)?
+              asfloat(u_cnt.Load((FIT_HEAD+(row*3u+chain)*FIT_VALUES+term)*4u)):0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if(active && lane<8u && term<FIT_VALUES){
+            [loop] for(uint i=0;i<min(256u,rows-base);++i) {
+                float v=cachedTerms[i*8u+lane];
+                sum=term==FIT_NEAREST?max(sum,v):sum+v;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if(lane<8u && term<FIT_VALUES) u_cnt.Store((FIT_HEAD+tiles*(FIT_VALUES+FIT_TILE)+chain*FIT_VALUES+term)*4u,asuint(sum));
+}
 [numthreads(256, 1, 1)]
-void fit_solve(uint gi : SV_GroupIndex) {
+void fit_solve(uint gi : SV_GroupIndex, uint3 group : SV_GroupID) {
+    if(mode==3u) {
+        if(gi<FIT_BINS) gbin[gi]=0;
+        GroupMemoryBarrierWithGroupSync();
+        uint at=group.x*256u+gi;
+        if(at<gw*gh) {float4 a=t_hist[uint2(at%gw,at/gw)]; if(fit_usable(a)) InterlockedAdd(gbin[fit_bin(a.z)],1u);}
+        GroupMemoryBarrierWithGroupSync();
+        if(gi<FIT_BINS) u_cnt.Store((FIT_HEAD+group.x*FIT_BINS+gi)*4,gbin[gi]);
+        return;
+    }
     if (mode == 2u) { fit_split(gi); return; }
     const uint groups = fit_tiles();
     const uint stop = u_cnt.Load(FIT_STOP * 4);
     // A solving step after the fit has stopped: 1 keeps this pass's sums as the final evaluation,
     // 2 has nothing left to do. Either way nothing is reduced or solved.
-    const bool idle = mode == 0u && stop >= 1u;
+    const bool absent=fit_row==1u && u_cnt.Load(FIT_SPLIT * 4)==0u;
+    const bool idle = absent || (mode == 0u && stop >= 1u);
     float part = 0;
     if (!idle && gi < 3 * FIT_VALUES) {
         const uint value = gi % FIT_VALUES;
-        [loop] for (uint g = gi / FIT_VALUES; g < groups; g += 3) {
+        if (fit_row==0u) part=asfloat(u_cnt.Load((FIT_HEAD+groups*(FIT_VALUES+FIT_TILE)+gi)*4u));
+        else [loop] for (uint g = gi / FIT_VALUES; g < groups; g += 3) {
             const float x = asfloat(u_cnt.Load((FIT_HEAD + g * FIT_VALUES + value) * 4));
             part = value == FIT_NEAREST ? max(part, x) : part + x;
         }
@@ -545,7 +581,7 @@ void fit_solve(uint gi : SV_GroupIndex) {
         const float x0 = gr[gi], x1 = gr[gi + FIT_VALUES], x2 = gr[gi + 2 * FIT_VALUES];
         gt[gi] = gi == FIT_NEAREST ? max(x0, max(x1, x2)) : x0 + x1 + x2;
     }
-    if (gi == 255u) { // a lane with nothing else to do here
+    if (gi == 255u && weigh) { // a lane with nothing else to do here
         float sp = 0, wt = 0;
         [loop] for (uint lane = 0; lane < 256u; ++lane) { sp += gq[lane]; wt += gq[256 + lane]; }
         gvar = wt > 0.0 ? max(sp / wt, 0.0) : 0.0;
@@ -564,6 +600,10 @@ void fit_solve(uint gi : SV_GroupIndex) {
         }
     }
     if (gi != 0) return;
+    if(absent) {
+        if (mode==1u) { [unroll] for(uint px=0;px<9u;++px) u_enc[uint2(px,1)] = float4(0,0,0,0); }
+        u_cnt.Store(16u*4u,1u); return;
+    }
     if (idle) {
         if (stop == 1u) u_cnt.Store(FIT_STOP * 4, 2u);
         return;
@@ -696,7 +736,16 @@ int screen_row(float nearness) {
 void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi < 10) gs[gi] = 0;
     GroupMemoryBarrierWithGroupSync();
-    if (id.x < w && id.y < h) {
+    // px: the full-size pixel measured. Sampled (a folded DLSS level, core/fold_shading.hpp): only the
+    // pixel each block keeps, read and written at its own full-size position, so it is exactly the value
+    // the whole-picture pass gives it and every other pixel is left as it was.
+    uint2 px = id.xy;
+    bool inside = true;
+    if (sample_code != 0u) {
+        inside = id.x < (sample_size & 0xffffu) && id.y < (sample_size >> 16);
+        px = id.xy * uint2(max(sample_code & 255u, 1u), max((sample_code >> 8) & 255u, 1u)) + uint2((sample_code >> 16) & 255u, sample_code >> 24);
+    }
+    if (inside && px.x < w && px.y < h) {
         // 0 measured, moving by itself; 1 nothing known; 2 not measurable, follows the screen's
         // motion; 7 measured, moving with the screen (exactly still when there is no model).
         // 4 and 5 (the search's vector handed on) are no longer written. Slot 8: a scene cut.
@@ -708,15 +757,15 @@ void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             // shown and the DLSS reset are cut_state's and the caller's business, not this field's.
             if (id.x == 0 && id.y == 0) InterlockedAdd(gs[8], 1u);
         } else {
-            float ev = t_valid[id.xy];
-            float2 raw = t_raw[id.xy];
+            float ev = t_valid[px];
+            float2 raw = t_raw[px];
             bool have_raw = ev > 0.0 && ev <= 1.0 && !any(isnan(raw)) && !any(isinf(raw));
-            float2 p = float2(id.xy) + 0.5 - float2(jitter_x, jitter_y);
+            float2 p = float2(px) + 0.5 - float2(jitter_x, jitter_y);
             float2 q = p + raw;
             bool raw_on = have_raw && q.x >= 0.0 && q.y >= 0.0 && q.x <= float(w) && q.y <= float(h);
             // The hypothesis "nothing moved by itself": the screen's own motion here, never asked
             // about a depth nearer than its nearest agreeing sample; exact stillness with no model.
-            const float own_nearness = nearness_of(t_color[id.xy].x);
+            const float own_nearness = nearness_of(t_color[px].x);
             const int row = screen_row(own_nearness);
             bool have_screen = row >= 0;
             float2 hyp = 0;
@@ -739,8 +788,8 @@ void measure(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 else { why = 0; v = best; }
             } else if (have_screen) { v = hyp; valid = kTotalApproximate; why = 2; }
         }
-        u_enc[id.xy] = float4(v, 0, 0);
-        u_mask[id.xy] = valid;
+        u_enc[px] = float4(v, 0, 0);
+        u_mask[px] = valid;
         InterlockedAdd(gs[why], 1u);
     }
     GroupMemoryBarrierWithGroupSync();
@@ -793,8 +842,8 @@ void cut_show(uint3 group : SV_GroupID, uint3 lane : SV_GroupThreadID) {
 //   u1 the grid handed on
 //   u2 words 0..7 the candidates, strongest first, as (support << 16) | (y + 128) << 8 | (x + 128);
 //      word 8 blocks that took a candidate, word 9 blocks that had one to compare
-//   mode: cand_pick's round (0..7)      cost_max: the support a vector needs to be offered
-// cand_clear, cand_count and cand_pick run one thread per block; cand_apply one thread GROUP per block.
+//   cost_max: the support a vector needs to be offered
+// cand_clear and cand_pick visit histogram cells; cand_count visits blocks; cand_apply dispatches a group per block.
 inline const char kCandidateShader[] = R"(
 Texture2D<int2>   t_grid : register(t0);
 Texture2D<float4> t_cur  : register(t5);
@@ -817,7 +866,6 @@ static const uint kCount = 8;
 static const float kRatio = 0.8, kGain = 0.001;
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 bool votes(int2 v) { return any(v != 0) && abs(v.x) <= kWindow && abs(v.y) <= kWindow; }
-uint key_of(int2 v) { return (uint(v.y + 128) << 8) | uint(v.x + 128); }
 int2 vector_of(uint packed) { return int2(int(packed & 255u) - 128, int((packed >> 8) & 255u) - 128); }
 [numthreads(8, 8, 1)]
 void cand_clear(uint3 id : SV_DispatchThreadID) {
@@ -829,20 +877,21 @@ void cand_count(uint3 id : SV_DispatchThreadID) {
     int2 v = t_grid.Load(int3(id.xy, 0));
     if (votes(v)) InterlockedAdd(u_votes[uint2(v + 128)], 1u);
 }
-// One round per candidate: the strongest vector not already taken by an earlier round.
+// Each occupied cell contributes one unique packed key. Each atomic keeps the
+// larger key in its slot and passes the smaller on. When all threads finish,
+// each slot holds the maximum of everything that reached it, in the same tie
+// order as the CPU reference. The host clears all eight slots before dispatch.
 [numthreads(8, 8, 1)]
 void cand_pick(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= gw || id.y >= gh) return;
-    int2 v = t_grid.Load(int3(id.xy, 0));
-    if (!votes(v)) return;
-    uint n = u_votes[uint2(v + 128)];
+    uint n = u_votes[id.xy];
     if (n < cost_max) return;
-    uint packed = (min(n, 65535u) << 16) | key_of(v);
-    bool taken = false;
-    [unroll] for (uint j = 0; j < 7; ++j) {
-        if (j < mode && u_top.Load(j * 4) == packed) taken = true;
+    uint key = (min(n, 65535u) << 16) | (id.y << 8) | id.x;
+    [unroll] for (uint slot = 0; slot < kCount; ++slot) {
+        uint previous;
+        u_top.InterlockedMax(slot * 4, key, previous);
+        key = min(key, previous);
+        if (key == 0) break;
     }
-    if (!taken) u_top.InterlockedMax(mode * 4, packed);
 }
 // One thread group is one 8x8 block and one thread is one of its pixels, so a block's 64 pixels are
 // compared side by side (the first version walked them one after another in a single thread and
@@ -867,26 +916,33 @@ void cand_apply(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID, uint 
     uint2 q = b * 8 + thread.xy;
     bool inside = in_grid && q.x < w && q.y < h;
     int2 own = in_grid ? t_grid.Load(int3(b, 0)) : int2(0, 0);
-    bool moving = in_grid && any(own != 0); // a block the search called still stays still
+    bool moving = in_grid && any(own != 0);
     int2 lo = int2(b) * 8, hi = min(lo + 8, int2(w, h));
-    float c = inside ? luma(t_cur.Load(int3(q, 0)).rgb) : 0.0;
     uint offered = 0; // bit k: candidate k may be offered to this block (the same in every thread of the group)
-    gc_err[lane] = inside && moving ? abs(c - prev_at(q, float2(own))) : 0.0;
-    [unroll] for (uint k = 0; k < kCount; ++k) {
-        uint packed = u_top.Load(k * 4);
-        int2 cv = vector_of(packed);
-        int2 d = abs(cv - own);
-        // nearer than the search's own reach: the search compared those itself;
-        // and the whole block must come from inside the picture
-        bool may = moving && packed != 0u && max(d.x, d.y) > kReach && all(lo + cv >= 0) && all(hi + cv <= int2(w, h));
-        if (may) { // slots of candidates not offered are never read
-            offered |= 1u << k;
-            gc_err[(k + 1) * 64 + lane] = inside ? abs(c - prev_at(q, float2(cv))) : 0.0;
+    if (moving) {
+        [unroll] for (uint k = 0; k < kCount; ++k) {
+            uint packed = u_top.Load(k * 4);
+            int2 cv = vector_of(packed);
+            int2 d = abs(cv - own);
+            // The search already compared nearby vectors. The whole block must have a source inside the picture.
+            if (packed != 0u && max(d.x, d.y) > kReach && all(lo + cv >= 0) && all(hi + cv <= int2(w, h))) offered |= 1u << k;
+        }
+    }
+    float c = 0;
+    if (offered != 0) {
+        c = inside ? luma(t_cur.Load(int3(q, 0)).rgb) : 0.0;
+        gc_err[lane] = inside ? abs(c - prev_at(q, float2(own))) : 0.0;
+        [unroll] for (uint slot = 0; slot < kCount; ++slot) {
+            if ((offered >> slot) & 1u) {
+                int2 cv = vector_of(u_top.Load(slot * 4));
+                gc_err[(slot + 1) * 64 + lane] = inside ? abs(c - prev_at(q, float2(cv))) : 0.0;
+            }
         }
     }
     GroupMemoryBarrierWithGroupSync();
     float pixels = float(max(hi.x - lo.x, 0) * max(hi.y - lo.y, 0));
-    if (lane == 0) {
+    if (lane == 0 && offered == 0) { gc_pick = -1; gc_step2 = 0; }
+    if (lane == 0 && offered != 0) {
         int pick = -1;
         float least = 1e9;
         [loop] for (uint k1 = 0; k1 < kCount; ++k1) {

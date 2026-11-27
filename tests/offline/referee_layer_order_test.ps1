@@ -33,6 +33,13 @@ $enabledWithoutEvidence = @(Get-RefereeSummary @(
 if ($enabledWithoutEvidence -notlike '*enabled during this run*no screen or delivery checks*') {
     throw 'Lost the Referee setting change when no screen checks ran'
 }
+foreach ($case in @(
+    @('event referee_start automatic_dlaa=1 gpu_checks=1 enabled=1', '*started automatically*no screen*'),
+    @('event referee_start automatic_dlaa=1 gpu_checks=0 enabled=0', '*lacks the GPU checks*'),
+    @('event settings_all referee_enabled=0', '*recorded off*')
+)) {
+    if (-not (@(Get-RefereeSummary @($case[0])) -like $case[1])) { throw "Wrong startup description for $($case[0])" }
+}
 $coverage = @(Get-RefereeSummary @('event referee_coverage dx12_scene=90 dx12_submitted=0 dx11_presents=25 dx11_submitted=22'))
 if (($coverage -like '*not running*') -or -not ($coverage -like '*DX12 submitted DLAA on 0 of 90*') -or
     -not ($coverage -like '*DX11 submitted DLAA on 22 of 25*')) { throw 'Lost coverage before first qualified image' }
@@ -88,3 +95,14 @@ if (-not ($ended -like '*not enough evidence (1)*') -or
     -not ($ended -like '*0 of 8 screen checks were usable; main blocker: the view kept changing. It can be tried again.*')) {
     throw 'Missing the reason an ended comparison lacked evidence'
 }
+# Black dropouts: said plainly, with what the Referee did about them.
+$dropout = 'event src=code referee_dropout frame=4100 path=native11 phase={0} move_still_meshes={1} why="{2}" pair{{gone=6 back=0 cells=12384}} onsets=3 returns=2 black_samples_px="0.039,-0.441 0.323,-0.452" trial{{pairs={3} events={4} challenges={5}}} recurred=0'
+foreach ($case in @(
+    @(($dropout -f 'trial', 1, 'surfaces go black on some samples and return on others', 0, 0, 0), '*BLACK DROPOUTS*Still checking*0.039,-0.441*'),
+    @(($dropout -f 'kept', 1, 'no dropout on the samples that produced them', 30, 0, 5), '*BLACK DROPOUTS*kept the move*'),
+    @(($dropout -f 'ruled_out', 0, 'dropouts continued with the meshes moved', 12, 3, 2), '*BLACK DROPOUTS*took the move back*NEEDS A LOOK*'),
+    @('event referee_jitter_geometry frame=201 tile_xy=1120,380 samples=8 phase_residual_screen_px=0.2200 phase_residual_dlaa_px=0.2000', '*Black dropouts*none reported*')
+)) {
+    if (-not (@(Get-RefereeSummary @($case[0])) -like $case[1])) { throw "Black dropout summary lost: $($case[1])" }
+}
+Write-Output 'Referee black-dropout summary passed four cases.'

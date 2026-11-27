@@ -21,11 +21,13 @@
 #pragma once
 #include "capture_decoder.hpp"
 #include "scene_pick.hpp"
+#include "core/presentation_extent.hpp"
 #include <algorithm>
 #include <cmath>
 #include <map>
 #include <string>
 #include <utility>
+#include <tuple>
 #include <vector>
 
 namespace na::discovery {
@@ -197,6 +199,85 @@ public:
         }
         std::stable_sort(out.begin(), out.end(), [](const DepthCandidate& a, const DepthCandidate& b) { return a.score > b.score; });
         if (out.size() > n) out.resize(n);
+        return out;
+    }
+
+    // Secondary discovery path. These paired buffers stay provisional until
+    // the existing native reader challenge reaches the presented rectangle.
+    std::pair<uint64_t, uint64_t> ScreenRegionPair() const {
+        const auto& f = Scored();
+        std::pair<uint64_t, uint64_t> best{};
+        uint64_t best_vertices = 0, best_draws = 0, best_order = 0;
+        bool best_float = false;
+        const auto single_image = [](const auto& r) {
+            return r.dimension == 3 && r.sample_count == 1 && r.depth_or_array == 1 && r.mip_levels == 1;
+        };
+        for (const auto& c : f.color) {
+            const auto ci = resources_.find(c.first);
+            if (ci == resources_.end() || !single_image(ci->second)) continue;
+            const auto& image = ci->second;
+            if (SimilarAspect(uint32_t(image.width), image.height) ||
+                !PlacedOrStretched(uint32_t(image.width), image.height)) continue;
+            const bool float_color = image.format == 2 || image.format == 10 || image.format == 26;
+            for (const auto& paired : c.second.with_depth) {
+                if (paired.second <= 8) continue;
+                const auto di = resources_.find(paired.first);
+                const auto observed = f.depth.find(paired.first);
+                if (di == resources_.end() || observed == f.depth.end() || !single_image(di->second) ||
+                    di->second.width != image.width || di->second.height != image.height) continue;
+                const auto& depth = observed->second;
+                if (depth.vertices <= 3 && !depth.indirect) continue;
+                const uint64_t vertices = depth.vertices ? depth.vertices : depth.draws;
+                const uint64_t order = c.second.last.ticket;
+                if (best.first && vertices < best_vertices) continue;
+                if (best.first && vertices == best_vertices &&
+                    std::make_tuple(float_color, paired.second, order) <=
+                    std::make_tuple(best_float, best_draws, best_order)) continue;
+                best = {paired.first, c.first};
+                best_vertices = vertices;
+                best_draws = paired.second;
+                best_float = float_color;
+                best_order = order;
+            }
+        }
+        return best;
+    }
+
+    // WHY log (the DX12 side of native11's FrameModel::RefusedScene): the biggest pair that is drawn
+    // like a scene, is not the screen's shape, and cannot be taken as a picture placed inside the
+    // screen, with what stood in the way. No behaviour depends on it.
+    struct RefusedRegion {
+        enum class Why : uint8_t { None, Multisampled } why = Why::None;
+        uint32_t width = 0, height = 0, samples = 1;
+        uint64_t vertices = 0;
+    };
+    RefusedRegion RefusedScreenRegion() const {
+        const auto& f = Scored();
+        RefusedRegion out;
+        if (!swap_w_ || !swap_h_) return out;
+        const auto flat = [](const auto& r) { return r.dimension == 3 && r.depth_or_array == 1 && r.mip_levels == 1; };
+        for (const auto& c : f.color) {
+            const auto ci = resources_.find(c.first);
+            if (ci == resources_.end() || !flat(ci->second)) continue;
+            const auto& image = ci->second;
+            const uint32_t w = uint32_t(image.width), h = image.height;
+            if (image.width > swap_w_ || h > swap_h_ || SimilarAspect(w, h)) continue;
+            const bool placed = PlacedOrStretched(w, h);
+            for (const auto& paired : c.second.with_depth) {
+                if (paired.second <= 8) continue;
+                const auto di = resources_.find(paired.first);
+                const auto observed = f.depth.find(paired.first);
+                if (di == resources_.end() || observed == f.depth.end() || !flat(di->second) ||
+                    di->second.width != image.width || di->second.height != image.height) continue;
+                const auto& depth = observed->second;
+                if (depth.vertices <= 3 && !depth.indirect) continue;
+                const uint32_t samples = (std::max)(uint32_t(image.sample_count), uint32_t(di->second.sample_count));
+                const auto why = placed && samples > 1 ? RefusedRegion::Why::Multisampled : RefusedRegion::Why::None;
+                const uint64_t vertices = depth.vertices ? depth.vertices : depth.draws;
+                if (why == RefusedRegion::Why::None || (out.why != RefusedRegion::Why::None && vertices <= out.vertices)) continue;
+                out = {why, w, h, samples, vertices};
+            }
+        }
         return out;
     }
 
@@ -391,6 +472,12 @@ private:
         f = it->second.format;
     }
     bool AspectMatch(uint32_t w, uint32_t h) const { return SimilarAspect(w, h); }
+    // A picture no larger than the screen and at least half of it each way: bars on one side pair,
+    // bars all round, or a smaller picture the game stretches (native11 FrameModel::PlacedOrStretched).
+    bool PlacedOrStretched(uint32_t w, uint32_t h) const {
+        return w && h && w <= swap_w_ && h <= swap_h_ && !(w == swap_w_ && h == swap_h_) &&
+               uint64_t(w) * 2 >= swap_w_ && uint64_t(h) * 2 >= swap_h_;
+    }
     // generic_depth check_aspect_ratio, similar_aspect_ratio mode.
     bool SimilarAspect(uint32_t w, uint32_t h) const {
         if (!swap_w_ || !swap_h_ || !w || !h) return false;

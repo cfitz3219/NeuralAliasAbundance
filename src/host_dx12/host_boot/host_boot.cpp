@@ -1,3 +1,4 @@
+#include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/capture/capture_session.hpp"
 #include "host_dx12/j2/hud_unblend.hpp"
@@ -352,6 +353,7 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
+    na::capture::j2::SetFlatMapLightingTest(GetPrivateProfileIntW(L"diagnostics", L"flat_map_lighting_test", 0, g_ini) == 1);
     na::j2::EnableCameraInputDiagnostic(GetPrivateProfileIntW(L"diagnostics", L"camera_inputs", 0, g_ini) == 1);
     {const bool profile=GetPrivateProfileIntW(L"observe",L"profile_hooks",0,g_ini)==1;
      na::observe::SetHookProfiling(profile);

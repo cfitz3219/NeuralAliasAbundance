@@ -77,6 +77,7 @@
 #include "host_dx12/native11/depth_direction.hpp"
 #include "host_dx12/overlay/menu.hpp"
 #include "host_dx12/overlay/na_style.hpp"
+#include "host_dx12/overlay/sharpness_preview.hpp"
 #include "host_dx12/overlay/presenter.hpp"
 #include "host_dx12/overlay/freeze_watchdog.hpp"
 #include "host_dx12/nr/queue_trace.hpp"
@@ -911,6 +912,15 @@ void write_status_line()
         const int bytes = snprintf(line, sizeof line, "%02u:%02u:%02u fps=%.1f frame_ms=%.2f | %s\r\n",
                                    t.wHour, t.wMinute, t.wSecond, fps, fps > 0 ? 1000.0 / fps : 0.0, status);
         append_status_text(line, (std::min)(bytes, int(sizeof line) - 1));
+        const auto ambient = na::xegtao::ScenePass().GetStats();
+        const unsigned enabled = na::settings::Get().xegtao_enabled.load();
+        if (enabled || ambient.recorded) {
+            char fx[256];
+            const int count = std::snprintf(fx, sizeof fx,
+                "effects xegtao{enabled=%u recorded=%llu compiling=%u reason=\"%s\"}\r\n",
+                enabled, static_cast<unsigned long long>(ambient.recorded), ambient.compiling ? 1u : 0u, ambient.reason);
+            if (count > 0) append_status_text(fx, (std::min)(count, int(sizeof fx) - 1));
+        }
         return;
     }
     {
@@ -953,7 +963,7 @@ void write_status_line()
     char mode_line[1536]{};
     const int mode_bytes=na::mode::FormatStatus(mode_line,sizeof(mode_line));
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
-    {char usage_line[512];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
+    {char usage_line[1024];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
      if(usage_bytes>0)WriteFile(f,usage_line,DWORD((std::min)(usage_bytes,int(sizeof(usage_line)-1))),&written,nullptr);}
     { // Effects and shared GPU services: enabled state, work done, errors and the last reason.
         const auto& st = na::settings::Get();
@@ -1148,13 +1158,19 @@ void write_status_line()
         }
         { // Viewport jitter ([j2] viewport_jitter): real samples through the game's viewports
             const auto vps = na::observe::GetViewportJitterStats();
-            char vl[400];
+            char vl[768];
             const int vn = snprintf(vl, sizeof vl,
-                "viewport_jitter mode=%d frames=%llu declared_list=%llu declared_submitted=%llu declared_none=%llu other_frame=%llu scene_draws=%llu sets=%llu restores=%llu unknown_viewports=%llu centered_layer_lists=%llu/%llu\r\n",
+                "viewport_jitter mode=%d frames=%llu declared_list=%llu declared_submitted=%llu declared_none=%llu other_frame=%llu scene_draws=%llu sets=%llu restores=%llu unknown_viewports=%llu centered_layer_lists=%llu/%llu "
+                "aligned_shader_depth_draws=%llu shader_depth_refused{no_layer=%llu not_read=%llu writes_layer=%llu one_target=%llu viewport=%llu} "
+                "referee_still_meshes{asked=%d asks=%llu moved_draws=%llu}\r\n",
                 na::settings::Get().j2_viewport_jitter.load(), (unsigned long long)j2.vpj_frames, (unsigned long long)j2.vpj_from_list,
                 (unsigned long long)j2.vpj_from_submitted, (unsigned long long)j2.vpj_none, (unsigned long long)j2.vpj_other_frame,
                 (unsigned long long)vps.draws, (unsigned long long)vps.sets, (unsigned long long)vps.restores, (unsigned long long)vps.unknown,
-                (unsigned long long)vps.local_layers, (unsigned long long)vps.submitted_layers);
+                (unsigned long long)vps.local_layers, (unsigned long long)vps.submitted_layers,
+                (unsigned long long)vps.shader_depth, (unsigned long long)vps.shader_depth_refused.no_layer,
+                (unsigned long long)vps.shader_depth_refused.not_read, (unsigned long long)vps.shader_depth_refused.writes_layer,
+                (unsigned long long)vps.shader_depth_refused.one_target, (unsigned long long)vps.shader_depth_refused.viewport,
+                vps.still_asked ? 1 : 0, (unsigned long long)vps.still_asks, (unsigned long long)vps.still_moved);
             if (vn > 0) WriteFile(f, vl, DWORD((std::min)(vn, int(sizeof vl - 1))), &written, nullptr);
         }
         { // anisotropic filtering (automatic, hidden [j2] anisotropic_filter): level/action = in use;
@@ -2730,37 +2746,10 @@ bool ensure_init_locked(IDXGISwapChain* sc)
 }
 
 // ---- Host-owned pages ----
-void draw_page_intro(na::menu::Page p)
+void draw_page_intro(na::menu::Page page)
 {
-    using namespace na::ui;
-    switch (p) {
-    case na::menu::Page::Picture:
-        Eyebrow("IMAGE QUALITY");
-        Heading("A clearer picture.");
-        Lead("Choose the balance between fine detail and smoother performance.");
-        break;
-    case na::menu::Page::Enhancements:
-        Eyebrow("ADDITIONAL FEATURES");
-        Heading("More possibilities.");
-        Lead("Availability depends on the game and the installed version.");
-        break;
-    case na::menu::Page::Experimental:
-        Eyebrow("OPTIONAL EFFECTS");
-        Heading("Experimental.");
-        Lead("Try additional scene effects. Each starts off and can be adjusted live.");
-        break;
-    case na::menu::Page::Preferences:
-        Eyebrow("MAKE IT YOURS");
-        Heading("Quiet by design.");
-        Lead("Keep the game in view and the controls easy to read.");
-        break;
-    default:
-        Eyebrow("WHEN YOU NEED IT");
-        Heading("Details & support.");
-        Lead("Picture status and useful information in one place.");
-        break;
-    }
-    ImGui::Dummy(ImVec2(0, S(4)));
+    na::ui::Heading(na::menu::PageName(page));
+    ImGui::Dummy({0, na::ui::S(4)});
 }
 
 void draw_preferences()
@@ -2891,7 +2880,8 @@ void draw_panel(bool just_opened)
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("##neuralalias", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
-                     ImGuiWindowFlags_NoScrollWithMouse);
+                     ImGuiWindowFlags_NoScrollWithMouse
+                     | (PicturePreview().dismiss_press ? ImGuiWindowFlags_NoMouseInputs | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize : 0));
     ImGui::PopStyleVar();
     // Actual placement after the user's drag/resize; keep it on screen and remember it.
     w = ImGui::GetWindowWidth();
@@ -2918,86 +2908,54 @@ void draw_panel(bool just_opened)
             g_window_dirty = false;
         }
     }
-    bool narrow = w < S(kBaseNarrowWidth);
-    bool close = false;
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) close = true;
-
-    // Title bar.
-    float pad_x = S(30), pad_y = S(16);
-    ImGui::SetCursorPos(ImVec2(pad_x, pad_y));
-    ImGui::BeginGroup();
-    if (TitleBar(g_game_name)) close = true;
-    ImGui::EndGroup();
-    float title_h = ImGui::GetCursorPosY() + pad_y;
-    ImGui::SetCursorPos(ImVec2(0, title_h));
-    ImGui::Separator();
-
-    // Footer metrics.
-    PushHelp();
-    float foot_h = ImGui::GetTextLineHeight() + S(30);
-    PopFont();
-    float body_top = ImGui::GetCursorPosY();
-    float body_h = h - body_top - foot_h;
-
+    bool close = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    PushBody();
+    const float pad_x = S(26);
+    const float tab_gap = S(4);
     Page page = na::menu::CurrentPage();
-    auto nav = [&](float nav_w, bool horizontal) {
-        float used = 0, avail = ImGui::GetContentRegionAvail().x;
-        for (int i = 0; i < na::menu::kPageCount; ++i) {
-            Page p = na::menu::kPages[i];
-            float bw = horizontal ? NavButtonWidth(na::menu::PageName(p)) : nav_w;
-            if (horizontal && i) {
-                if (used + S(8) + bw <= avail) {
-                    ImGui::SameLine(0.0f, S(8));
-                    used += S(8);
-                } else {
-                    used = 0; // wrap to the next line
-                }
+    float tabs_width = -tab_gap;
+    for (Page p : na::menu::kPages) tabs_width += NavButtonWidth(na::menu::PageName(p)) + tab_gap;
+    const bool compact = tabs_width > w - pad_x*2;
+    const float tab_y = S(20) + BrandPx() + S(13);
+    const float chrome_h = tab_y + LabelPx() + S(28);
+    const ImVec2 origin = ImGui::GetWindowPos();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin,{origin.x+w,origin.y+chrome_h}, ImGui::GetColorU32(kBgNav),
+                        S(kRadiusWindow),ImDrawFlags_RoundCornersTop);
+    draw->AddLine({origin.x,origin.y+chrome_h},{origin.x+w,origin.y+chrome_h},ImGui::GetColorU32(kLine));
+    ImGui::SetCursorPos({pad_x,S(20)});
+    ImGui::BeginChild("##masthead",{w-pad_x*2,BrandPx()+S(4)},ImGuiChildFlags_None,
+                       ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse|ImGuiWindowFlags_NoBackground);
+    if (TitleBar(g_game_name)) close = true;
+    ImGui::EndChild();
+    ImGui::SetCursorPos({pad_x,tab_y});
+    if (compact) {
+        PushLabel();
+        ImGui::SetNextItemWidth((std::min)(w-pad_x*2,S(280)));
+        if (ImGui::BeginCombo("##pages",na::menu::PageName(page))) {
+            for (Page p : na::menu::kPages) {
+                if (ImGui::Selectable(na::menu::PageName(p),page==p)) page=p;
             }
-            if (NavButton(na::menu::PageName(p), p == page, bw)) {
-                page = p;
-                na::menu::SetCurrentPage(p);
-            }
-            used += bw;
+            ImGui::EndCombo();
         }
-    };
-
-    float content_x = 0;
-    if (!narrow) {
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, kBgNav);
-        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(S(14), S(26)));
-        ImGui::BeginChild("##nav", ImVec2(NavWidth(), body_h), ImGuiChildFlags_AlwaysUseWindowPadding,
-                          ImGuiWindowFlags_NoScrollbar);
-        nav(NavWidth() - S(28), false);
-        // Nav note at the bottom.
-        PushHelp();
-        float note_y = ImGui::GetWindowHeight() - ImGui::GetTextLineHeight() - S(30);
-        if (note_y > ImGui::GetCursorPosY()) ImGui::SetCursorPosY(note_y);
-        ImGui::SetCursorPosX(S(30));
-        ImGui::TextColored(kTextDim, "Your game. Refined.");
         PopFont();
-        ImGui::EndChild();
-        ImGui::PopStyleVar(2);
-        ImGui::PopStyleColor();
-        ImGui::SameLine(0.0f, 0.0f);
-        content_x = NavWidth();
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        ImGui::GetWindowDrawList()->AddLine(p, ImVec2(p.x, p.y + body_h), ImGui::ColorConvertFloat4ToU32(kLine));
+    } else {
+        for (int i=0; i<na::menu::kPageCount; ++i) {
+            const Page p=na::menu::kPages[i];
+            if (i) ImGui::SameLine(0,tab_gap);
+            const char* label=na::menu::PageName(p);
+            if (NavButton(label,p==page,NavButtonWidth(label))) page=p;
+        }
     }
-
-    // Content (scrolls; title, navigation and footer stay put).
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(S(36), S(20)));
-    ImGui::BeginChild("##content", ImVec2(w - content_x, body_h), ImGuiChildFlags_AlwaysUseWindowPadding);
+    na::menu::SetCurrentPage(page);
+    const float foot_h = HelpPx() + S(23);
+    ImGui::SetCursorPos({0,chrome_h});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(pad_x,S(15)));
+    ImGui::BeginChild("##content",{w,(std::max)(S(36),h-chrome_h-foot_h)},ImGuiChildFlags_AlwaysUseWindowPadding);
     if(na::settings::SafeStart()) {
         na::ui::StatusLine(2,"The last session didn't end normally, so NeuralAlias started off. Your settings are saved; turn features back on when ready.");
         const auto profile=na::fg::preset::GetStatus();
         if(profile.available && profile.result!=0)na::ui::StatusLine(2,"The driver preset could not be restored. Check Frame Generation details.");
-    }
-    if (narrow) {
-        nav(0, true);
-        ImGui::Dummy(ImVec2(0, S(8)));
-        ImGui::Separator();
-        ImGui::Dummy(ImVec2(0, S(8)));
     }
     if (g_controls) {
         g_controls(); // legacy full-body panel
@@ -3013,7 +2971,7 @@ void draw_panel(bool just_opened)
         case Page::Enhancements:
             na::menu::DrawPage(Page::Enhancements, true);
             ImGui::Dummy(ImVec2(0, S(8)));
-            Hint("New features appear here when they are ready. Unavailable features do not change your picture.");
+
             break;
         case Page::Experimental:
             na::menu::DrawPage(Page::Experimental, true);
@@ -3033,20 +2991,20 @@ void draw_panel(bool just_opened)
     ImGui::EndChild();
     ImGui::PopStyleVar();
 
-    // Footer.
-    ImGui::SetCursorPos(ImVec2(0, h - foot_h));
+    ImGui::SetCursorPos({0,h-foot_h});
     ImGui::Separator();
-    ImGui::SetCursorPos(ImVec2(pad_x, h - foot_h + S(14)));
+    ImGui::SetCursorPos({pad_x,h-foot_h+S(8)});
     PushHelp();
-    ImGui::TextColored(kTextDim, "Home closes the menu   Â·   the game continues running");
-    const char* right = "";
-    uint32_t save = na::settings::LastSaveResult();
-    if (save == 2) right = "Your choice is active for this session but could not be saved.";
-    else if (save == 1) right = "Settings saved";
-    else if (save == 3) right = "Saving settings...";
-    float rw = ImGui::CalcTextSize(right).x;
-    ImGui::SameLine(w - pad_x - rw);
-    ImGui::TextColored(save == 2 ? kWarn : kTextDim, "%s", right);
+    ImGui::TextColored(kTextDim,"Home  /  Close menu");
+    const float left_end = ImGui::GetItemRectMax().x;
+    const uint32_t save = na::settings::LastSaveResult();
+    const char* right = save==2 ? "Could not save settings" : save==1 ? "Settings saved" : save==3 ? "Saving settings..." : "";
+    const float right_x = w-pad_x-ImGui::CalcTextSize(right).x;
+    if (*right && origin.x+right_x>left_end+S(8)) {
+        ImGui::SameLine(right_x);
+        ImGui::TextColored(save==2 ? kWarn : kTextDim,"%s",right);
+    }
+    PopFont();
     PopFont();
     ImGui::End();
     if (close) {g_open.store(false, std::memory_order_release);request_cursor_sync(g_state.hwnd);}
@@ -3114,7 +3072,13 @@ void render_locked(IDXGISwapChain* sc, ID3D12CommandQueue* queue, bool just_open
     ImGui::NewFrame();
     {
         na::eventlog::ScopedSource source("panel"); // settings changed while the panel draws are the user's
+        auto& preview = na::ui::PicturePreview();
+        preview.BeginFrame(just_opened || na::menu::CurrentPage() != na::menu::Page::Picture);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * preview.opacity);
+        ImGui::BeginDisabled(preview.dismiss_press);
         draw_panel(just_opened);
+        ImGui::EndDisabled();
+        ImGui::PopStyleVar();
         na::settings::WatchChanges();
     }
     ImGui::Render();

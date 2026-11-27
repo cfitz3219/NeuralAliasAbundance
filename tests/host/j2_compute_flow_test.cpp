@@ -15,12 +15,17 @@
 #include "flow_ambiguity_gpu_audit.hpp"
 #include "flow_fixture_pictures.hpp"
 #include "screen_motion_gpu_audit.hpp"
+#include "fold_planes_gpu.hpp"
 int main(int argc,char** argv){
     if(!na::ffx_flow::Built())return test::kSkip;
     const bool debug_mode=(argc>1 && !std::strcmp(argv[1],"--debug")) || (argc>2 && !std::strcmp(argv[2],"--debug"));
     test::ComPtr<ID3D12Debug> debug;
     if(debug_mode){REQUIRE(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))));debug->EnableDebugLayer();}
     test::Device d;if(!test::CreateDevice(d))return test::kSkip;
+    if(argc>1 && !std::strcmp(argv[1],"--fold-planes")) {
+        REQUIRE(AuditFoldPlanes(d)==0);
+        return test::finish("j2_fold_planes_gpu");
+    }
     if(argc>1 && !std::strcmp(argv[1],"--screen-fit")) {
         REQUIRE(screen_audit::ArbiterFallback(d)==0);
         REQUIRE(screen_audit::SolveControlled(d)==0);
@@ -40,6 +45,19 @@ int main(int argc,char** argv){
     if(argc>1 && !std::strcmp(argv[1],"--overhead-benchmark")) {
         REQUIRE(screen_audit::ProductionBenchmark(d,3440,1440,true)==0);
         return test::finish("j2_overhead_benchmark");
+    }
+    if(argc>1 && !std::strcmp(argv[1],"--fold-motion-benchmark")) {
+        // First two runs match the live motion workload. The last two measure the
+        // cost if the motion pipeline itself were given a truly smaller scene.
+        for(unsigned block_y : {1u, 2u}) {
+            std::printf("Folded input, motion at display size, block=2x%u\n", block_y);
+            REQUIRE(screen_audit::ProductionBenchmark(d,3440,1440,true,2,block_y)==0);
+        }
+        for(unsigned height : {1440u, 720u}) {
+            std::printf("Motion at input size, 1720x%u\n", height);
+            REQUIRE(screen_audit::ProductionBenchmark(d,1720,height,true)==0);
+        }
+        return test::finish("j2_fold_motion_benchmark");
     }
     if(argc>1 && !std::strcmp(argv[1],"--screen-benchmark")) {
         REQUIRE(screen_audit::ProductionBenchmark(d,1920,1080)==0);
@@ -263,6 +281,21 @@ int main(int argc,char** argv){
             b.pResource=target;b.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;b.PlacedFootprint.Footprint={format,w,h,1,row};
             l.list->CopyTextureRegion(&b,0,0,0,&a,nullptr);std::swap(bar.Transition.StateBefore,bar.Transition.StateAfter);l.list->ResourceBarrier(1,&bar);
         };
+        // Sampled output (a folded DLSS level keeps one pixel of each 2x2 block, the last): the arbiter
+        // decides only those pixels, from the same full-size inputs, into a half-size plane; every kept
+        // vector and tag must be bit-identical to the whole-picture pass at that pixel.
+        const unsigned sw=w/2,sh=h/2;
+        auto motion_s=test::CreateTexture(d.device.Get(),sw,sh,DXGI_FORMAT_R32G32_FLOAT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto provenance_s=test::CreateTexture(d.device.Get(),sw,sh,DXGI_FORMAT_R8_UINT,U,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        const unsigned motion_s_stride=(sw*8+255u)&~255u,prov_s_stride=(sw+255u)&~255u;
+        auto read_s=test::CreateBuffer(d.device.Get(),motion_s_stride*sh,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        auto read_prov_s=test::CreateBuffer(d.device.Get(),prov_s_stride*sh,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        auto copy_s=[&](ID3D12Resource* texture,DXGI_FORMAT format,unsigned row,ID3D12Resource* target){
+            auto bar=test::Transition(texture,U,D3D12_RESOURCE_STATE_COPY_SOURCE);l.list->ResourceBarrier(1,&bar);
+            D3D12_TEXTURE_COPY_LOCATION a{},b{};a.pResource=texture;a.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            b.pResource=target;b.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;b.PlacedFootprint.Footprint={format,sw,sh,1,row};
+            l.list->CopyTextureRegion(&b,0,0,0,&a,nullptr);std::swap(bar.Transition.StateBefore,bar.Transition.StateAfter);l.list->ResourceBarrier(1,&bar);
+        };
         const float shifts[]={0,0,.125f,.375f,.125f,3.125f,3.125f};
         const float jitx[]={.25f,-.375f,.125f,-.25f,.375f,-.125f,.25f};
         const float jity[]={-.25f,.125f,.375f,-.125f,.25f,-.375f,-.25f};
@@ -278,6 +311,10 @@ int main(int argc,char** argv){
                 independent.tier1_motion=total_tier.total;independent.tier1_valid=total_tier.total_valid;independent.tier1_valid_flag=true;
                 na::motion::gpu::Outputs mo{motion.Get(),provenance.Get(),nullptr,w,h};REQUIRE(arbiter.Dispatch(l.list.Get(),independent,mo,0));
                 copy(motion.Get(),DXGI_FORMAT_R32G32_FLOAT,w*8,read.Get());copy(provenance.Get(),DXGI_FORMAT_R8_UINT,prov_stride,read_prov.Get());
+                na::motion::gpu::Outputs so{motion_s.Get(),provenance_s.Get(),nullptr,sw,sh};
+                so.block_x=so.block_y=2;so.pick_x=so.pick_y=1;so.source_width=w;so.source_height=h;
+                REQUIRE(arbiter.Dispatch(l.list.Get(),independent,so,1));
+                copy_s(motion_s.Get(),DXGI_FORMAT_R32G32_FLOAT,motion_s_stride,read_s.Get());copy_s(provenance_s.Get(),DXGI_FORMAT_R8_UINT,prov_s_stride,read_prov_s.Get());
             }
             execute();cf::Committed(ticket);reset();
             if(i){
@@ -291,6 +328,12 @@ int main(int argc,char** argv){
                     if(tag==na::motion::NA_MOTION_ESTIMATED)++estimated;
                     else if(tag!=na::motion::NA_MOTION_INVALID)++wrong_tag;
                 }
+                {   unsigned char* sv=nullptr;unsigned char* st=nullptr;unsigned differ=0;
+                    REQUIRE(SUCCEEDED(read_s->Map(0,nullptr,reinterpret_cast<void**>(&sv))));REQUIRE(SUCCEEDED(read_prov_s->Map(0,nullptr,reinterpret_cast<void**>(&st))));
+                    for(unsigned y=0;y<sh;++y)for(unsigned x=0;x<sw;++x){const size_t k=size_t(2*y+1)*w+(2*x+1);
+                        if(std::memcmp(sv+size_t(y)*motion_s_stride+size_t(x)*8,data+k*2,8)!=0 || st[size_t(y)*prov_s_stride+x]!=tags[size_t(2*y+1)*prov_stride+2*x+1])++differ;}
+                    read_s->Unmap(0,nullptr);read_prov_s->Unmap(0,nullptr);
+                    std::printf("sampled arbiter i=%u: %u of %u kept pixels differ from the whole-picture pass\n",i,differ,sw*sh);CHECK(differ==0);}
                 read->Unmap(0,nullptr);read_prov->Unmap(0,nullptr);
                 const auto s=cf::GetStats();
                 std::printf("total pipeline i=%u expected=%.3f mean=(%.4f,%.4f) error=%.4f estimated=%u/%u wrong_tag=%u GPU=%.3fms cuts=%llu format=%u\n",
