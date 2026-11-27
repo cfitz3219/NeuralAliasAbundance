@@ -559,6 +559,19 @@ if(TARGET host_native11)
       set_tests_properties(host_native11_dlaa_camera_off_start_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
         LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
     endif()
+  elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # Gap audit 2026-11-21 item 12: the real 32-bit arrangement. A Win32 host never links the
+    # DLSS library; DLSS runs in the 64-bit companion. Before running, put NeuralAliasDlaa64.exe
+    # (from an x64 build of the same commit) and nvngx_dlss.dll beside native11_dlaa_test.exe.
+    # These are the same on-screen Referee cases the x64 build runs with NA_DLAA_COMPANION=1.
+    na_host_test(native11_dlaa_test SOURCES native11/provider_test.cpp LIBS host_dx12 LABELS "gpu;nvidia")
+    target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
+    add_test(NAME host_native11_dlaa_win32_route_trial_test COMMAND native11_dlaa_test --lit-role-trial)
+    add_test(NAME host_native11_dlaa_win32_route_trial_disagreeing_scene_test COMMAND native11_dlaa_test --lit-role-trial-disagreeing-scene)
+    add_test(NAME host_native11_dlaa_win32_parity_lighting_test COMMAND native11_dlaa_test --lit-role-parity)
+    set_tests_properties(host_native11_dlaa_win32_route_trial_test host_native11_dlaa_win32_route_trial_disagreeing_scene_test
+      host_native11_dlaa_win32_parity_lighting_test
+      PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   endif()
 endif()
 # C8b: a frame with known passes must come back as exactly those ops (ABI 0.2).

@@ -8,6 +8,7 @@
 #include "host_dx12/motion/live_flow.hpp"
 
 #include "host_dx12/capture/frame_capture.hpp"
+#include "host_dx12/capture/referee_route_a.hpp"
 #include "host_dx12/fg/frame_gen.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 #include "host_dx12/ngx_observe/gpu_timing.hpp"
@@ -678,9 +679,42 @@ NgxResult EvaluateFeatureImpl(CoreSlot& s, void* cmd_list, const void* handle, c
     bool motion = na::motion::WantsInputs(); // A57: ground-truth comparison for the live flow
     bool fg = na::fg::WantsInputs();         // A59: Frame Generation inputs
     bool watch = g_confirm_active.load(std::memory_order_acquire); // A66: render-size confirmation armed
-    if (detail || capture || nr || motion || fg || watch) {
+    // Gap audit 2026-11-21 item 12: the Referee watches the game's own DLSS (witness only).
+    const bool referee = r == 1 && list && s.has_device.load(std::memory_order_acquire) &&
+                         na::settings::Get().referee_enabled.load(std::memory_order_relaxed) != 0;
+    if (detail || capture || nr || motion || fg || watch || referee) {
         EvalParams ep{};
         ReadEvalParams(params, &ep);
+        if (referee && ep.valid && ep.color && ep.output) {
+            uint32_t flags = ep.create_flags;
+            if (flags == 0xFFFFFFFFu) {
+                std::lock_guard<std::mutex> lock(g_confirm_m);
+                flags = g_feature_flags.Get(reinterpret_cast<uint64_t>(game_handle), reinterpret_cast<uint64_t>(&s));
+            }
+            const auto zero = [](uint32_t v) { return v == 0 || v == 0xFFFFFFFFu; }; // unknown origin reads as 0 in NGX
+            const uint32_t rw = ep.subrect_width != 0xFFFFFFFFu ? ep.subrect_width : ep.in_width;
+            const uint32_t rh = ep.subrect_height != 0xFFFFFFFFu ? ep.subrect_height : ep.in_height;
+            // Only a whole-texture evaluation of a known upscaler feature with known sizes and scalars.
+            if (flags != 0xFFFFFFFFu && rw && rh && rw != 0xFFFFFFFFu && rh != 0xFFFFFFFFu &&
+                ep.out_width && ep.out_height && ep.out_width != 0xFFFFFFFFu && ep.out_height != 0xFFFFFFFFu &&
+                zero(ep.color_base_x) && zero(ep.color_base_y) && zero(ep.mv_base_x) && zero(ep.mv_base_y) &&
+                zero(ep.out_base_x) && zero(ep.out_base_y) &&
+                confirm::ScalarInputsCoherent(ep.jitter_x, ep.jitter_y, ep.mv_scale_x, ep.mv_scale_y)) {
+                na::referee::route_a::Evaluated seen;
+                seen.feature = reinterpret_cast<uint64_t>(game_handle);
+                seen.color = reinterpret_cast<ID3D12Resource*>(ep.color);
+                seen.motion = reinterpret_cast<ID3D12Resource*>(ep.motion);
+                seen.output = reinterpret_cast<ID3D12Resource*>(ep.output);
+                seen.render_w = rw; seen.render_h = rh;
+                seen.output_w = ep.out_width; seen.output_h = ep.out_height;
+                seen.jitter_x = ep.jitter_x; seen.jitter_y = ep.jitter_y;
+                seen.mv_scale_x = ep.mv_scale_x; seen.mv_scale_y = ep.mv_scale_y;
+                seen.reset = ep.reset == 1;
+                seen.mv_jittered = (flags & 0x4u) != 0;
+                seen.mv_low_res = (flags & 0x2u) != 0;
+                na::referee::route_a::OnEvaluated(list, seen);
+            }
+        }
         if (watch) {
             // A66/A67 (Astra R2/R4): every evaluation reaches the monitor. A
             // failed call or unreadable parameters is an observation of the

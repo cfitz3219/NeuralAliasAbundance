@@ -50,6 +50,7 @@
 
 #include "host_dx12/capture/frame_capture.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
+#include "host_dx12/capture/referee_route_a.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/observe/producers.hpp"
 #include "host_dx12/upscalers/ffx_intercept.hpp"
@@ -3486,6 +3487,8 @@ na::referee::gpu::Presentation game_frame_boundary(ID3D12CommandQueue* queue, ID
     }
     na::settings::WatchChanges("code");
     na::scale::AutomaticScenePresent();
+    // A game that runs its own DLSS with no added route: the Referee's witness owns the receipt.
+    na::referee::route_a::OnPresent(receipt);
     return receipt;
 }
 void on_present(IDXGISwapChain* sc, ID3D12CommandQueue* queue_hint = nullptr,
@@ -4200,6 +4203,7 @@ void STDMETHODCALLTYPE DetourExecute(ID3D12CommandQueue* q, UINT n,
         na::overlay::AfterGameSubmission(q,n,lists);
     }
     na::nr::states::Submitted(q,n,lists);
+    na::referee::route_a::OnExecuted(q,n,lists);
     // Same queue-serialization scope, after actual game work and before the
     // application can signal completion/recycle its HUD buffers or tables.
     na::j2::native_hud::AfterSubmission(q,n,lists);
