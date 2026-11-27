@@ -28,7 +28,10 @@ std::atomic<bool> g_candidates{true}; // SetFrameCandidates; read at each Record
 std::atomic<bool> g_screen_fit{true}; // SetScreenFit; read at each Record
 using Microsoft::WRL::ComPtr;using Lease=na::nr::native::RecordingLease;
 namespace {
-constexpr unsigned warm_images=8;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+// Kept motion pictures made up front: at most two were ever in use at once in the fixtures (this frame's and the last;
+// the GPU finishes a pair before the next is recorded); one more for a frame in flight. More are made on demand
+// (Record), so fewer up front changes no output (2026-11-27: 8 -> 3, about 5 x 59 MB less at 3440x1440).
+constexpr unsigned warm_images=3;constexpr auto S=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,U=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 // Preserve small luminance differences at the same 32-bit storage cost as RGBA8. Alpha is
 // always 1 and motion reads RGB only. Query once per context, not from the per-frame hot path.
 DXGI_FORMAT stabilized_format(ID3D12Device* device){

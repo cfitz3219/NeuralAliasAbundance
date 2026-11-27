@@ -2209,7 +2209,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     {   // NA_TEST_FOLD_SIZE=WxH: the fold fixture at another picture size (e.g. 3440x1440 for the memory figure).
         wchar_t sz[32]{};
         unsigned fw = 0, fh = 0;
-        if (fold_level && GetEnvironmentVariableW(L"NA_TEST_FOLD_SIZE", sz, 32) && swscanf_s(sz, L"%ux%u", &fw, &fh) == 2 && fw && fh) { g.w = fw; g.h = fh; }
+        if ((fold_level || fg_x2) && GetEnvironmentVariableW(L"NA_TEST_FOLD_SIZE", sz, 32) && swscanf_s(sz, L"%ux%u", &fw, &fh) == 2 && fw && fh) { g.w = fw; g.h = fh; }
     }
 #endif
     const bool centered_scene = argc > 1 && std::strcmp(argv[1], "--centered-scene") == 0;
@@ -3056,6 +3056,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         if (other_at < 0) std::printf("  %s never came on screen: %s (DLSS: %s, NGX result 0x%08x)\n", other_name, shown_now().c_str(), na::dlss::GetStats().reason,
                                       static_cast<unsigned>(na::dlss::GetStats().last_ngx_result));
         for (int k = 0; k < 20; ++k, ++frame) other_max_ms = (std::max)(other_max_ms, run(frame).ms);
+        print_ours(other_level == 2 ? "Quality then Performance" : "Performance then Quality");
         // D. Back to DLAA.
         st.j2_fold_mode.store(0);
         UINT64 back_scene = 0;
@@ -3070,7 +3071,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         {   // A few seconds on DLAA: what the levels held is given back (planes, folded motion context).
             const ULONGLONG until = GetTickCount64() + 6500;
             double later_max_ms = 0;
-            while (GetTickCount64() < until) { later_max_ms = (std::max)(later_max_ms, run(frame).ms); ++frame; }
+            const ULONGLONG from = GetTickCount64();
+            while (GetTickCount64() < until) {
+                const double ms = run(frame).ms;
+                if (ms > dlaa_ms + 20.0) std::printf("  slow frame %.1f ms at %.2f s after DLAA came back\n", ms, (GetTickCount64() - from) / 1000.0);
+                later_max_ms = (std::max)(later_max_ms, ms);
+                ++frame;
+            }
             print_ours("back on DLAA, 6.5 s later");
             expect(shown_now().find("On screen: DLAA") != std::string::npos, "DLAA is on screen again (its feature made off the frame)");
             std::printf("  longest frame in those 6.5 s: %.1f ms\n", later_max_ms);
@@ -3126,7 +3133,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         if (fold_measured) {
             const char* ff = f11 ? std::strstr(f11, "folded_flow=") : nullptr;
             const char* sm = f11 ? std::strstr(f11, "sampled_motion=") : nullptr;
-            { const auto fs = na::j2::compute_flow::GetStats(); std::printf("  folded working set: prepared %llu, failed %llu\n", (unsigned long long)fs.prepared, (unsigned long long)fs.prepare_failed); }
+            { const auto fs = na::j2::compute_flow::GetStats(); std::printf("  folded working set: prepared %llu, failed %llu; kept motion pictures %u, at most %u in use at once\n", (unsigned long long)fs.prepared, (unsigned long long)fs.prepare_failed, fs.image_slots, fs.images_busy_peak); }
             expect(sm && std::strtoull(sm + 15, nullptr, 10) >= 30, "with no camera the motion is sampled: only the kept pixels are decided");
             expect(ff && std::strtoull(ff + 12, nullptr, 10) >= 30, "with no camera the motion search runs on the folded picture");
         }

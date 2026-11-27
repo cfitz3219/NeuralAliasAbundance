@@ -890,6 +890,22 @@ void flush_events()
 }
 // Route B live Frame Generation, one line per status interval: written on both routes (the native DX11
 // route returns early from write_status_line, so its x2 state was missing from the 5-second log).
+// Our own video memory, item by item, beside the process figure (which holds the game's memory too): written on
+// both routes (the native DX11 route returns early from write_status_line).
+void write_vram_line()
+{
+    char vram_line[1536];
+    int vn = na::vram::FormatLine(vram_line, sizeof(vram_line) - 160);
+    if (vn <= 0) return;
+    double process_mb = 0, budget_mb = 0;
+    const double ours_mb = na::vram::Mb(na::vram::TotalBytes());
+    if (na::usage::VideoMemory(&process_mb, &budget_mb))
+        vn += std::snprintf(vram_line + vn, sizeof(vram_line) - size_t(vn), " process_mb=%.0f budget_mb=%.0f game_mb=%.0f", process_mb, budget_mb,
+                            process_mb > ours_mb ? process_mb - ours_mb : 0.0);
+    else vn += std::snprintf(vram_line + vn, sizeof(vram_line) - size_t(vn), " process_mb=unknown");
+    vn += std::snprintf(vram_line + vn, sizeof(vram_line) - size_t(vn), "\r\n");
+    append_status_text(vram_line, (std::min)(vn, int(sizeof(vram_line) - 1)));
+}
 void write_fglive_line()
 {
     if (!na::present::LiveFrameGeneration()) return;
@@ -993,6 +1009,7 @@ void write_status_line()
             if (count > 0) append_status_text(fx, (std::min)(count, int(sizeof fx) - 1));
         }
         write_fglive_line();
+        write_vram_line();
         return;
     }
     {
@@ -1038,14 +1055,7 @@ void write_status_line()
     if(mode_bytes>0){WriteFile(f,mode_line,DWORD((std::min)(mode_bytes,int(sizeof(mode_line)-1))),&written,nullptr);WriteFile(f,"\r\n",2,&written,nullptr);}
     {char usage_line[1024];const int usage_bytes=na::usage::FormatLine(usage_line,sizeof(usage_line));
      if(usage_bytes>0)WriteFile(f,usage_line,DWORD((std::min)(usage_bytes,int(sizeof(usage_line)-1))),&written,nullptr);}
-    { // Our own video memory, item by item, beside the process figure (which holds the game's memory too).
-        char vram_line[1536];int vn=na::vram::FormatLine(vram_line,sizeof(vram_line)-160);
-        if(vn>0){double process_mb=0,budget_mb=0;const double ours_mb=na::vram::Mb(na::vram::TotalBytes());
-            if(na::usage::VideoMemory(&process_mb,&budget_mb))
-                vn+=std::snprintf(vram_line+vn,sizeof(vram_line)-size_t(vn)," process_mb=%.0f budget_mb=%.0f game_mb=%.0f",process_mb,budget_mb,process_mb>ours_mb?process_mb-ours_mb:0.0);
-            else vn+=std::snprintf(vram_line+vn,sizeof(vram_line)-size_t(vn)," process_mb=unknown");
-            vn+=std::snprintf(vram_line+vn,sizeof(vram_line)-size_t(vn),"\r\n");
-            WriteFile(f,vram_line,DWORD((std::min)(vn,int(sizeof(vram_line)-1))),&written,nullptr);}}
+    write_vram_line();
     { // Effects and shared GPU services: enabled state, work done, errors and the last reason.
         const auto& st = na::settings::Get();
         const auto xs = na::xegtao::ScenePass().GetStats();
