@@ -3362,6 +3362,18 @@ void vpj_advance()
         if (still_meshes) amount = referee::normal_jitter;
     }
     na::observe::SetStillMeshJitter(still_meshes);
+    {   // VARIANT: jitter/scene-overlays | jitter/depth-tested-only: the Referee's overlay watch decides (on unless
+        // dropouts followed the move); it reads the last frame's counts.
+        static uint64_t moved_before = 0, left_before = 0;
+        const auto vps = na::observe::GetViewportJitterStats();
+        const uint64_t left = na::observe::UnjitteredSceneMeshes();
+        referee::gpu::NoteSceneMeshes(referee::shadow::Path::Inline, vps.overlay_moved - moved_before, left - left_before);
+        moved_before = vps.overlay_moved;
+        left_before = left;
+        const char* why = nullptr;
+        const bool overlays = !g.recovery_swapchain || referee::gpu::SceneOverlays(g.recovery_swapchain, referee::shadow::Path::Inline, &why);
+        na::observe::SetSceneOverlayJitter(overlays, why);
+    }
     auto& e = g.vpj[g.frame % 8];
     // A folded scene's sample covers a whole block, not one pixel (core/fold_shading.hpp).
     const auto fold_block = g_fold.spacing.block;
@@ -5139,8 +5151,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // come back after measured frames. In the second case its tracker has no previous camera yet and
     // would ask for a reset the pictures do not need: the frame still pairs with the measured one
     // before it, and the camera takes over on the next.
-    const bool measured = no_camera || (tracker_stale && cam.camera_cut && camera_use != 2 && !cannot_measure && !gap_restart && !resize &&
-                                        !g.measured_refused);
+    // VARIANT: camera/cut-confirmed-by-pictures
+    // A cut the camera reports (a jump, a turn or a zoom past its limits) restarts DLSS's history only when
+    // the two pictures confirm a new scene (the measured cut test): until then the frame is measured, the
+    // camera's motion for it is dropped and the history kept. A camera the setting requires keeps the old rule.
+    const bool camera_cut_unconfirmed = !no_camera && cam.camera_cut && camera_use == 1 && !cannot_measure && !gap_restart && !resize &&
+                                        !g.measured_refused;
+    const bool measured = no_camera || camera_cut_unconfirmed ||
+                          (tracker_stale && cam.camera_cut && camera_use != 2 && !cannot_measure && !gap_restart && !resize &&
+                           !g.measured_refused);
     bool viewport_sample_known=false;
     if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
         float vx = 0.f, vy = 0.f;
@@ -5210,7 +5229,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         std::snprintf(merged, sizeof merged, "%s%s", one, g.stats.recent_cuts);
         std::memcpy(g.stats.recent_cuts, merged, sizeof merged);
         // Event log: every camera cut, timed to the frame (a "fov" cut is a zoom, e.g. a scope).
-        na::eventlog::Emit("camera_cut", "why=%s value=%.4g held=%u from_j1=%u", why, cam.cut_value, held ? 1u : 0u, from_j1 ? 1u : 0u);
+        na::eventlog::Emit("camera_cut", "api=dx12 why=%s value=%.4g held=%u from_j1=%u verdict=%s", why, cam.cut_value, held ? 1u : 0u, from_j1 ? 1u : 0u,
+                           measured ? "measured_instead (history kept unless the pictures show a new scene)" : "reset");
         if (gap_restart) ++g.stats.cut_restarts;
         else if (tracker_stale) ++g.stats.cut_after_measured; // the camera returning after measured frames: no reset when that frame is measured too
         else if (cam.cut_reason == 2) ++g.stats.cut_gap;
@@ -5790,6 +5810,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // carries the reset. Until now those frames showed their own picture (RecordCutShow below).
         ++g.stats.measured_cut_resets;
         e.reset = true;
+        na::eventlog::Emit("camera_cut", "api=dx12 frame=%llu verdict=reset_confirmed_by_pictures", static_cast<unsigned long long>(g.frame));
     }
     e.hdr = is_float_color(cf);
     e.depth_inverted = reversed;

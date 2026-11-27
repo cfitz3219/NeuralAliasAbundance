@@ -139,6 +139,7 @@ std::atomic<uint64_t> resets_cut{0}, resets_changed{0}, resets_gap{0}, resets_ji
 // Which supplier gave each delivered frame its motion, and the measured supplier's own resets:
 // no pair yet (the first picture, by compute_flow's Ticket::no_pair code) and a measured scene cut.
 std::atomic<uint64_t> supplied_camera{0}, supplied_measured{0}, resets_no_pair{0}, resets_measured_cut{0};
+std::atomic<uint64_t> cuts_camera{0}, cuts_measured_instead{0}; // camera-reported cuts, and those measured instead of reset
 std::atomic<uint64_t> measured_unavailable{0}, jitter_kept_after_miss{0};
 std::atomic<uint32_t> last_no_pair{0};
 // Jitter for the next frame is asked for once this frame's recording is submitted, for this many
@@ -534,9 +535,24 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // pictures (j2/compute_flow Frame::total) when there is none, and also on the frame a camera
     // first appears while measured frames are being delivered: the tracker has no previous camera
     // on that frame and would ask for a reset that the measured motion does not need.
+    // VARIANT: camera/cut-confirmed-by-pictures
+    // A cut the camera reports (it jumped, turned or zoomed past its limits) restarts DLSS's history only
+    // when the two pictures confirm a new scene (the measured cut test in j2/compute_flow). Until then the
+    // frame is measured: its motion comes from the pictures, the camera's motion for it is dropped, and the
+    // history is kept (Hearts of Iron IV, 2026-11-27: map pans and zooms tripped the camera's limits about
+    // six times a second and every one restarted DLSS). A camera the setting requires keeps the old rule.
+    const bool camera_cut_unconfirmed = camera_setting == 1 && cam.valid && cam.camera_cut && !frame.scene_changed;
     const bool measured = camera_setting != 2 &&
-        (camera_setting == 0 || !cam.valid ||
+        (camera_setting == 0 || !cam.valid || camera_cut_unconfirmed ||
             (cam.camera_cut && s.measured_last && frame.frame == s.last_frame + 1 && !frame.scene_changed));
+    if (cam.valid && cam.camera_cut) {
+        static const char* const kWhy[] = {"none", "no_history", "gap", "translation", "rotation", "fov", "origin"};
+        cuts_camera.fetch_add(1, std::memory_order_relaxed);
+        if (measured) cuts_measured_instead.fetch_add(1, std::memory_order_relaxed);
+        na::eventlog::Emit("camera_cut", "api=dx11 frame=%llu why=%s value=%.4g verdict=%s", static_cast<unsigned long long>(frame.frame),
+                           kWhy[cam.cut_reason < 7 ? cam.cut_reason : 0], cam.cut_value,
+                           measured ? "measured_instead (history kept unless the pictures show a new scene)" : "reset (the camera is required)");
+    }
     using Tool = referee::RecoveryTool;
     const auto lighting = donut::CurrentOptions();
     const uint32_t preset = settings::Get().j2_preset.load();
@@ -809,6 +825,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                     // this frame carries the reset. Until then those frames showed their own picture.
                     reset_history = true;
                     resets_measured_cut.fetch_add(1, std::memory_order_relaxed);
+                    na::eventlog::Emit("camera_cut", "api=dx11 frame=%llu verdict=reset_confirmed_by_pictures camera_cut_frame=%d",
+                                       static_cast<unsigned long long>(frame.frame), camera_cut_unconfirmed ? 1 : 0);
                 }
             } else {
                 // The first picture of a pair: nothing to measure against yet. DLSS starts a new
@@ -1454,6 +1472,13 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             referee::shadow::Path::Native11, frame.color.incarnation, frame.depth.incarnation, frame.scene_stream,
             frame.frame, frame.screen_proof);
         native11::SetStillMeshJitter(still_meshes);
+        {   // VARIANT: jitter/scene-overlays | jitter/depth-tested-only: the Referee's overlay watch decides (on
+            // unless dropouts followed the move); it reads this frame's counts.
+            referee::gpu::NoteSceneMeshes(referee::shadow::Path::Native11, native11::OverlayMeshesMoved(), native11::UnjitteredSceneMeshes());
+            const char* why = nullptr;
+            const bool overlays = debug_jitter.value || referee::gpu::SceneOverlays(frame.presentation_source, referee::shadow::Path::Native11, &why);
+            native11::SetSceneOverlayJitter(overlays, why);
+        }
         const auto amount = !frame.raster.shader_depth_aligned && !still_meshes && !debug_jitter.value &&
             frame.recovery_tool == referee::RecoveryTool::None &&
             referee::RouteTrial::WatchTicket(frame.trial_ticket)
@@ -1620,13 +1645,14 @@ int FormatStatus(char* out, size_t capacity)
     // a measured scene cut), frames left alone because nothing could be measured, and jitter samples
     // kept in sequence after a frame that was not delivered.
     int n = std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d history_resets{camera_cut=%llu inputs_changed=%llu frame_gap=%llu jitter_switch=%llu} "
-                         "camera_setting=%d motion_supplier{camera=%llu measured=%llu} replay_delivered=%llu measured{reset_first_picture=%llu last_no_pair=%u reset_scene_cut=%llu unavailable=%llu jitter_kept_after_miss=%llu} \"%s\"",
+                         "camera_cuts{reported=%llu measured_instead=%llu} camera_setting=%d motion_supplier{camera=%llu measured=%llu} replay_delivered=%llu measured{reset_first_picture=%llu last_no_pair=%u reset_scene_cut=%llu unavailable=%llu jitter_kept_after_miss=%llu} \"%s\"",
                          static_cast<unsigned long long>(delivered.load()), last_ms,
                          static_cast<unsigned long long>(busy.load()),
                          static_cast<unsigned long long>(rejected.load()), applied_preset.load(), applied_sharpness.load(),
                          raster_slot.load(), static_cast<unsigned long long>(resets_cut.load()),
                          static_cast<unsigned long long>(resets_changed.load()), static_cast<unsigned long long>(resets_gap.load()),
                          static_cast<unsigned long long>(resets_jitter_switch.load()),
+                         static_cast<unsigned long long>(cuts_camera.load()), static_cast<unsigned long long>(cuts_measured_instead.load()),
                          settings::Get().j2_camera.load(std::memory_order_relaxed),
                          static_cast<unsigned long long>(supplied_camera.load()), static_cast<unsigned long long>(supplied_measured.load()),
                          static_cast<unsigned long long>(replay_delivered.load()),

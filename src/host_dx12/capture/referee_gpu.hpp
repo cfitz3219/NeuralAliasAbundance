@@ -71,6 +71,13 @@ uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t col
 // VARIANT: referee/sample-locked-dropout
 // True while the Referee asks this scene's meshes that kept the game's viewport to take the
 // frame's sample (surfaces were seen dropping to black on particular samples). Cheap when not.
+// VARIANT: jitter/scene-overlays | jitter/depth-tested-only. Whether this scene's overlay meshes (drawn into
+// the scene colour with the depth test off) take the frame's sample: true unless the Referee's overlay watch
+// saw dropouts after the move and is trying, or keeps, the earlier rule. `why` says why (for the host's log).
+bool SceneOverlays(const void* swapchain, shadow::Path path, const char** why = nullptr);
+// The host's counts for its last frame: overlay meshes that took the sample, and scene meshes it left on the
+// game's grid. The overlay watch and the jitter-strength trial read them.
+void NoteSceneMeshes(shadow::Path path, uint64_t overlays_moved, uint64_t left_unjittered);
 bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, uint64_t depth,
                       uint64_t generation, uint64_t frame, uint64_t screen_proof = 0);
 void InvalidatePresentation(const void* swapchain);

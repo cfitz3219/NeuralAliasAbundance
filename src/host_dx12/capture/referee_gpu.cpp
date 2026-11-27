@@ -120,6 +120,7 @@ struct State {
         uint64_t field_ordinal = 0;
         // VARIANT: referee/sample-locked-dropout
         DropoutWatch dropout;
+        OverlayWatch overlay; // VARIANT: jitter/scene-overlays guard
         std::array<float, FlickerTransition::count> dropout_view{};
         bool dropout_view_known = false;
         uint64_t dropout_events = 0, dropout_logged = 0;
@@ -127,6 +128,9 @@ struct State {
     std::array<JitterControl, 2> jitter_controls;
     std::atomic<unsigned> jitter_active{0};
     std::atomic<unsigned> still_meshes_active{0}; // bit per control: its dropout watch asks for the move
+    std::atomic<unsigned> overlays_off{0};        // bit per control: its overlay watch tries or keeps the earlier rule
+    std::atomic<uint64_t> overlays_moved[2]{}, left_unjittered[2]{}; // the hosts' last-frame counts (NoteSceneMeshes)
+    const char* overlay_why[2]{};
     std::atomic<uint64_t> trial_sample_ticket{0};
     uint64_t trial_last_ticket = 0, trial_last_ordinal = 0;
     const void* trial_source = nullptr;
@@ -187,8 +191,12 @@ void publish_jitter(unsigned index)
 {
     if (g.jitter_controls[index].trial.NeedsReference()) g.jitter_active.fetch_or(1u << index, std::memory_order_release);
     else g.jitter_active.fetch_and(~(1u << index), std::memory_order_release);
-    if (g.jitter_controls[index].dropout.MoveStillMeshes()) g.still_meshes_active.fetch_or(1u << index, std::memory_order_release);
+    const auto& c = g.jitter_controls[index];
+    if (c.dropout.MoveStillMeshes() || c.trial.MoveUnjittered()) g.still_meshes_active.fetch_or(1u << index, std::memory_order_release);
     else g.still_meshes_active.fetch_and(~(1u << index), std::memory_order_release);
+    if (!c.overlay.OverlaysOn()) g.overlays_off.fetch_or(1u << index, std::memory_order_release);
+    else g.overlays_off.fetch_and(~(1u << index), std::memory_order_release);
+    g.overlay_why[index] = c.overlay.Why();
 }
 
 const char* dropout_phase(DropoutWatch::Phase phase)
@@ -666,8 +674,17 @@ void collect_sample()
                     const bool same_view = control.dropout_view_known && SameJitterPicture(control.dropout_view, trial.image);
                     control.dropout_view = trial.image;
                     control.dropout_view_known = true;
-                    const bool changed = control.dropout.Observe(pair, {g.pre_jitter[0], g.pre_jitter[1]},
-                                                                 {g.main_jitter[0], g.main_jitter[1]}, same_view);
+                    // VARIANT: jitter/scene-overlays: its guard first; the still-mesh move waits while it tries.
+                    const bool overlay_changed = control.overlay.Observe(pair, same_view,
+                        g.overlays_moved[index].load(std::memory_order_relaxed) != 0);
+                    if (overlay_changed) {
+                        na::eventlog::Emit("referee_overlays", "frame=%llu path=%s phase=%s why=\"%s\" pair{gone=%u back=%u cells=%u}",
+                            static_cast<unsigned long long>(g.main_ordinal), scene.placement.path == shadow::Path::Native11 ? "native11" : "dx12",
+                            control.overlay.Name(), control.overlay.Why(), pair.gone, pair.back, pair.cells);
+                        publish_jitter(index);
+                    }
+                    const bool changed = !control.overlay.Busy() &&
+                        control.dropout.Observe(pair, {g.pre_jitter[0], g.pre_jitter[1]}, {g.main_jitter[0], g.main_jitter[1]}, same_view);
                     if (pair.Any() && same_view) ++control.dropout_events;
                     if (changed) publish_jitter(index);
                     // The first few events of a scene are written out too, so a run that never reaches a
@@ -689,6 +706,8 @@ void collect_sample()
                         if (ref.x == regions.at[tile].x && ref.y == regions.at[tile].y) break;
                 }
                 bool field_measured = false;
+                const bool had_move = test.MoveUnjittered();
+                test.NoteUnjittered(g.left_unjittered[index].load(std::memory_order_relaxed));
                 if (trial.delivered && !raster_field.empty() && (!test.NeedsReference() || test.Reference().field)) {
                     if (control.amount != amount || g.main_ordinal <= control.field_ordinal ||
                         g.main_ordinal - control.field_ordinal > 240) control.field.pairs = 0;
@@ -726,6 +745,7 @@ void collect_sample()
                         test.Observe({regions.at[tile], layout, screen.shift, output.shift,
                                       regions.detail[tile], screen.locked, trial.image}, amount, now);
                 }
+                if (!had_move && test.MoveUnjittered()) publish_jitter(index);
                 if (phase != test.Current() || before_strength != test.Amount()) {
                     // A confirmation must be independent of its first observation.
                     if (test.Current() == JitterTrial::Phase::Confirm) {
@@ -1553,6 +1573,21 @@ uint8_t SceneJitterAmount(const void* swapchain, shadow::Path path, uint64_t col
     return control.trial.Amount();
 }
 
+bool SceneOverlays(const void* swapchain, shadow::Path path, const char** why)
+{
+    const unsigned index = jitter_index(path);
+    const bool off = swapchain && enabled() && (g.overlays_off.load(std::memory_order_acquire) & (1u << index));
+    if (why) *why = off && g.overlay_why[index] ? g.overlay_why[index] : "overlays on the frame's sample (scene content drawn without the depth test)";
+    return !off;
+}
+
+void NoteSceneMeshes(shadow::Path path, uint64_t overlays_moved, uint64_t left_unjittered)
+{
+    const unsigned index = jitter_index(path);
+    g.overlays_moved[index].store(overlays_moved, std::memory_order_relaxed);
+    g.left_unjittered[index].store(left_unjittered, std::memory_order_relaxed);
+}
+
 // VARIANT: referee/sample-locked-dropout
 // Whether the meshes of this scene that kept the game's own viewport should take the frame's
 // sample: the dropout watch is trying that, or has proved it on this scene.
@@ -1569,7 +1604,7 @@ bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, 
         frame < control.ordinal || frame - control.ordinal > DropoutWatch::kWindow) return false;
     const bool rotating = path == shadow::Path::Native11 && screen_proof && scene.native_screen_proof;
     if (depth != scene.depth || generation != scene.generation || (color != scene.color && !rotating)) return false;
-    return control.dropout.MoveStillMeshes();
+    return control.dropout.MoveStillMeshes() || control.trial.MoveUnjittered();
 }
 
 void InvalidatePresentation(const void* swapchain)

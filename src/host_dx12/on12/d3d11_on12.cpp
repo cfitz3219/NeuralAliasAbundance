@@ -325,9 +325,11 @@ void install_native(ID3D11Device* device)
     if (!setup_native_menu(device)) g_native_install_failures.fetch_add(1); // DLAA can still run; the menu cannot
     // DLAA texture detail (mip bias) and AF on the game's own samplers, live from the menu's state.
     if (!na::native11::InstallSamplers(device, [] {
-            // A folded level (DLSS Quality / Performance) picks textures as a half-size render does: one step more.
-            return na::j2::Enabled() && !na::j2::Paused()
-                ? na::observe::SamplerMipBias() + (na::observe::GetMipLiveStats().enabled ? na::native_d3d11::FoldMipExtra() : 0.f) : 0.f;
+            // A folded level (DLSS Quality / Performance) picks textures as a half-size render does: one step more,
+            // the same step as the DX12 route. This route's samplers follow the bias live (native11/samplers.cpp),
+            // so the step is not gated on the DX12 route's live mip engine (it was, and never applied: HoI4,
+            // 2026-11-27, applied_bias unchanged at Performance).
+            return na::j2::Enabled() && !na::j2::Paused() ? na::observe::SamplerMipBias() + na::native_d3d11::FoldMipExtra() : 0.f;
         }, [] { return na::observe::SamplerAfActionWanted(); }))
         note("native DX11 route: the sampler hooks (texture detail / AF) could not be installed");
     // Draw replay: the game's vertex shaders are kept from creation, so a scene draw can be replayed

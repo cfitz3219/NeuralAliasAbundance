@@ -135,6 +135,8 @@ struct Event {
     bool viewport_expanded = false; // Draw: actual viewport border expansion, travels with deferred recording
     bool viewport_shader_depth = false; // Draw: shares the raster of a proved shader-readable depth layer
     bool viewport_still_mesh = false;   // Draw: an untested mesh moved at the Referee's ask (counted, not classified)
+    bool viewport_overlay = false;      // Draw: an untested mesh into the scene colour moved as a scene overlay (jitter/scene-overlays)
+    uint8_t still_class = 0;            // Draw: why an untested scene mesh kept the game's grid (StillClass in provider.cpp)
     uint64_t tag = 0;             // Read: the host's key for where the read sits (Vulkan); 0 = none
     // Depth direction evidence (depth_direction.hpp). Last on purpose: hosts that do not say leave them 0.
     uint8_t depth_func = 0;       // Draw: the depth comparison (D3D11 numbering, 1..8) when this draw tests AND WRITES the depth; 0 otherwise

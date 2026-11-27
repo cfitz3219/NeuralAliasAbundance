@@ -1214,7 +1214,8 @@ void write_status_line()
             const int vn = snprintf(vl, sizeof vl,
                 "viewport_jitter mode=%d frames=%llu declared_list=%llu declared_submitted=%llu declared_none=%llu other_frame=%llu scene_draws=%llu sets=%llu restores=%llu unknown_viewports=%llu centered_layer_lists=%llu/%llu "
                 "aligned_shader_depth_draws=%llu shader_depth_refused{no_layer=%llu not_read=%llu writes_layer=%llu one_target=%llu viewport=%llu} "
-                "referee_still_meshes{asked=%d asks=%llu moved_draws=%llu}\r\n",
+                "referee_still_meshes{asked=%d asks=%llu moved_draws=%llu} variant=%s overlays_moved=%llu "
+                "left_on_game_grid{other_target=%llu own_viewport=%llu rule_off=%llu after_handover=%llu stationary_source=%llu}\r\n",
                 na::settings::Get().j2_viewport_jitter.load(), (unsigned long long)j2.vpj_frames, (unsigned long long)j2.vpj_from_list,
                 (unsigned long long)j2.vpj_from_submitted, (unsigned long long)j2.vpj_none, (unsigned long long)j2.vpj_other_frame,
                 (unsigned long long)vps.draws, (unsigned long long)vps.sets, (unsigned long long)vps.restores, (unsigned long long)vps.unknown,
@@ -1222,7 +1223,11 @@ void write_status_line()
                 (unsigned long long)vps.shader_depth, (unsigned long long)vps.shader_depth_refused.no_layer,
                 (unsigned long long)vps.shader_depth_refused.not_read, (unsigned long long)vps.shader_depth_refused.writes_layer,
                 (unsigned long long)vps.shader_depth_refused.one_target, (unsigned long long)vps.shader_depth_refused.viewport,
-                vps.still_asked ? 1 : 0, (unsigned long long)vps.still_asks, (unsigned long long)vps.still_moved);
+                vps.still_asked ? 1 : 0, (unsigned long long)vps.still_asks, (unsigned long long)vps.still_moved,
+                vps.overlays ? "jitter/scene-overlays" : "jitter/depth-tested-only", (unsigned long long)vps.overlay_moved,
+                (unsigned long long)vps.left.other_target, (unsigned long long)vps.left.own_viewport,
+                (unsigned long long)vps.left.rule_off, (unsigned long long)vps.left.after_handover,
+                (unsigned long long)vps.left.stationary_source);
             if (vn > 0) WriteFile(f, vl, DWORD((std::min)(vn, int(sizeof vl - 1))), &written, nullptr);
         }
         { // anisotropic filtering (automatic, hidden [j2] anisotropic_filter): level/action = in use;

@@ -121,6 +121,7 @@ struct Meta {
     uint32_t preset = 0, debug_view = 0, quality = 5;
     bool hdr = false, depth_inverted = false, auto_exposure = false, mv_lowres = true, mv_jittered = false;
     bool jitter_shifted = false, evaluation = false, bias_mask = false;
+    bool reset = false, camera_cut = false; // what the live program told DLSS on this frame
     PlaneInfo color, depth, motion, dlssout;
 };
 
@@ -214,6 +215,8 @@ bool ReadMeta(const std::string& dir, uint32_t index, Meta* m)
     if (Number(s, "pre_exposure", &v)) m->pre_exposure = static_cast<float>(v);
     if (Number(s, "exposure_scale", &v)) m->exposure_scale = static_cast<float>(v);
     m->hdr = Flag(s, "hdr", false);
+    m->reset = Count(s, "reset", 0) != 0;
+    m->camera_cut = Count(s, "camera_cut", 0) != 0;
     m->depth_inverted = Flag(s, "depth_inverted", false);
     m->auto_exposure = Flag(s, "auto_exposure", false);
     m->mv_lowres = Flag(s, "mv_lowres", true);
@@ -488,6 +491,8 @@ int main(int argc, char** argv)
     uint32_t fold_bx = 2, fold_by = 2;
     int second_at = -1, second_release_at = -1, main_recreate_at = -1;
     bool second_every = false, ordered_features = false;
+    int resets_mode = 0;           // --resets: 0 first frame only, 1 as captured, 2 as captured without the camera's cuts
+    uint64_t replay_resets = 0;    // history restarts after the first frame
     bool fold_pick_last = false, motion_folded = false;
     bool fold_create_full = false, timing = false;
     for (int i = 3; i < argc; ++i) {
@@ -508,6 +513,13 @@ int main(int argc, char** argv)
         else if (a == "--bias-dir" && value) { bias_dir = value; ++i; }
         else if (a == "--far-depth" && value) { far_depth = static_cast<float>(std::strtod(value, nullptr)); ++i; }
         else if (a == "--preset") { if (!number(&preset)) return Usage(); }
+        else if (a == "--resets" && i + 1 < argc) {
+            // captured: every history restart the live program asked for, as it ran; no-camera-cuts: the same
+            // without the restarts the camera's cuts asked for (camera/cut-confirmed-by-pictures); none: only
+            // the first frame (the default).
+            const std::string v = argv[++i];
+            if (v == "captured") resets_mode = 1; else if (v == "no-camera-cuts") resets_mode = 2; else if (v == "none") resets_mode = 0; else return Usage();
+        }
         else if (a == "--first") { if (!number(&first)) return Usage(); }
         else if (a == "--frames") { if (!number(&max_frames)) return Usage(); }
         else if (a == "--preroll") { if (!number(&preroll)) return Usage(); }
@@ -857,7 +869,8 @@ int main(int argc, char** argv)
         if (ordered_features) e.ordered_feature_group = 1;
         e.quality = static_cast<na::dlss::Quality>(static_cast<int>(m.quality));
         e.preset = use_preset;
-        e.reset = si == 0;
+        e.reset = si == 0 || (resets_mode == 1 && m.reset) || (resets_mode == 2 && m.reset && !m.camera_cut);
+        if (e.reset && si) ++replay_resets;
         if (fold != FoldMode::Off) {
             // A half-size picture whose pixel (x, y) is the full-size pixel (2x + px, 2y + py). In half-size
             // pixels that sample sits at centre - (0.25 - px / 2) from the pick, and the capture's own jitter
@@ -1068,6 +1081,8 @@ int main(int argc, char** argv)
         Log("time summary: DLSS evaluate over %zu steps: median %.3f ms, mean %.3f, fastest %.3f, slowest %.3f", sorted.size(),
             sorted[sorted.size() / 2], mean, sorted.front(), sorted.back());
     }
+    Log("history restarts after the first frame: %llu (--resets %s)", static_cast<unsigned long long>(replay_resets),
+        resets_mode == 1 ? "captured" : resets_mode == 2 ? "no-camera-cuts" : "none");
     Log("done: %u outputs written to %s; evaluates=%llu features created=%llu (preset requested %u)", written, out_dir.c_str(),
         static_cast<unsigned long long>(st.evaluates), static_cast<unsigned long long>(st.features_created), st.feature_preset);
     d.WaitIdle();

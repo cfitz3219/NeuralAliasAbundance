@@ -199,6 +199,13 @@ void SetNextJitter(float x_px, float y_px);
 // test off and the scene depth bound takes the frame's full sample too (core/temporal_jitter.hpp,
 // StillMeshTakesJitter). The DX11 side of na::observe::SetStillMeshJitter.
 void SetStillMeshJitter(bool asked);
+// VARIANT: jitter/scene-overlays (core/temporal_jitter.hpp SceneOverlayTakesJitter): on by default; off chooses
+// jitter/depth-tested-only (logged with `why`). The last frame's scene meshes that kept the game's grid.
+void SetSceneOverlayJitter(bool on, const char* why);
+bool SceneOverlayJitter();
+void ForceSceneOverlayJitterForTests(int forced); // -1: the Referee decides; 0: the earlier rule; 1: overlays
+uint32_t UnjitteredSceneMeshes();
+uint32_t OverlayMeshesMoved(); // this frame's overlay meshes that took the sample
 // Coarse shading on the scene's draws (the fold, core/fold_shading.hpp; native11/coarse11.hpp): from the
 // next frame, the draws that take the scene's sample (or, with no sample, the depth-tested draws into
 // the scene depth until the scene is handed over) are shaded once per block. 0 = one shading per pixel,

@@ -69,6 +69,38 @@ constexpr bool StillMeshTakesJitter(const StillMesh& m)
 {
     return m.asked && m.active && !m.tests_depth && m.scene_depth_bound && m.mesh && m.scene_viewport;
 }
+// VARIANT: jitter/scene-overlays (default) | jitter/depth-tested-only (the earlier rule)
+// A mesh drawn into the scene's own colour picture while the frame's sample is in force, through the
+// scene viewport with the scene depth bound, is scene content even with the hardware depth test off:
+// map overlays, lines, decals and labels laid over the terrain (Hearts of Iron IV, 2026-11-27: rails
+// and border bands drawn this way stayed on the game's grid, wobbled by the jitter under DLAA and
+// smeared at Quality and Performance). It takes the frame's full sample like the depth-tested draws.
+// Full-screen passes, other targets and anything after the scene is handed over are not scene
+// overlays and keep the game's grid. The earlier rule (depth-tested draws only) is chosen again by
+// the Referee's dropout watch when pixels drop out on the samples after the move (the hosts log the
+// variant in force with the reason).
+struct SceneOverlay {
+    // VARIANT: jitter/depth-tested-only when `enabled` is false (the Referee's overlay watch chose it)
+    bool enabled = true;            // jitter/scene-overlays in force (false: jitter/depth-tested-only)
+    bool active = false;            // a sample is in force for this draw's frame
+    bool tests_depth = false;       // hardware depth test on: the ordinary rule already decides
+    bool scene_depth_bound = false; // the scene's depth buffer is the bound depth
+    bool scene_colour = false;      // the scene's own colour picture is a bound target
+    bool mesh = false;              // more vertices than a full-screen pass
+    bool scene_viewport = false;    // one viewport covering the whole scene target
+    bool after_handover = false;    // the scene was already handed to DLSS (or proven resolved)
+    // VARIANT: jitter/stationary-source-readers (Astra, 2026-11-26): the mesh's pixel shader reads a depth-like
+    // layer written THIS frame on the game's own grid (by draws that did not take the sample), or a proven exact
+    // copy of one. Its exact texel lookups only agree with that grid: it stays on it, or it reads the wrong texel
+    // (black on every sample in Astra's fixture). A mesh reading a layer written on the sample's grid is the
+    // shader-depth rule's; a mesh reading no such layer (the rails) takes the sample.
+    bool reads_stationary_layer = false;
+};
+constexpr bool SceneOverlayTakesJitter(const SceneOverlay& o)
+{
+    return o.enabled && o.active && !o.tests_depth && o.scene_depth_bound && o.scene_colour && o.mesh && o.scene_viewport &&
+           !o.after_handover && !o.reads_stationary_layer;
+}
 // The overlay owns this session-only transform. NVIDIA's F9/F10 hotkeys
 // have no reported state we can reliably return to zero.
 struct JitterDiagnostic {

@@ -527,8 +527,16 @@ struct ViewportJitterStats {
     struct Refused { uint64_t no_layer = 0, not_read = 0, writes_layer = 0, one_target = 0, viewport = 0; } shader_depth_refused;
     uint64_t still_moved = 0, still_asks = 0; // meshes moved at the Referee's ask; times it started asking
     bool still_asked = false;
+    bool overlays = true;        // VARIANT: jitter/scene-overlays in force (false: jitter/depth-tested-only)
+    uint64_t overlay_moved = 0;  // untested meshes into the scene colour that took the sample
+    struct Left { uint64_t other_target = 0, own_viewport = 0, rule_off = 0, after_handover = 0, stationary_source = 0; } left; // untested scene meshes left on the game's grid, by why
 };
 ViewportJitterStats GetViewportJitterStats();
+// VARIANT: jitter/scene-overlays (on by default) | jitter/depth-tested-only. Logged with `why` when it changes.
+void SetSceneOverlayJitter(bool on, const char* why);
+bool SceneOverlayJitter();
+// Untested scene meshes left on the game's grid so far (all reasons).
+uint64_t UnjitteredSceneMeshes();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,
 // "hook_cost ... s<slot>{ms_per_s calls_per_s us}" (slot = ID3D12GraphicsCommandList vtable index).

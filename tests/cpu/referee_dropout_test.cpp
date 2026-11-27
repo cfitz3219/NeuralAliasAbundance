@@ -106,6 +106,64 @@ int main()
                 CHECK(!w.Observe(i % 2 ? local_back : local, kSamples[i % 16], kSamples[(i + 1) % 16], false));
             CHECK(w.Current() == DropoutWatch::Phase::Watch && w.Onsets() == 0);
         }},
+        {"overlay watch: dropouts after the overlay move try the earlier rule, kept when they stop", [] {
+            OverlayWatch w;
+            CHECK(w.OverlaysOn());
+            DropoutPair gone; gone.cells = kCells; gone.gone = 3;
+            DropoutPair back; back.cells = kCells; back.back = 3;
+            const DropoutPair none{0, 0, kCells};
+            for (unsigned i = 0; i < 6 && w.Current() == OverlayWatch::Phase::On; ++i) w.Observe(i % 2 ? back : gone, true, true);
+            CHECK(w.Current() == OverlayWatch::Phase::TrialOff && !w.OverlaysOn() && w.Busy());
+            for (unsigned i = 0; i < OverlayWatch::kTrialLeast + OverlayWatch::kSettle + 1; ++i) w.Observe(none, true, false);
+            CHECK(w.Current() == OverlayWatch::Phase::Off && !w.OverlaysOn());
+            for (unsigned i = 0; i < OverlayWatch::kRetryAfter; ++i) w.Observe(none, true, false);
+            CHECK(w.Current() == OverlayWatch::Phase::On && w.OverlaysOn()); // looked at again
+        }},
+        {"overlay watch: dropouts that continue without the move put the overlays back", [] {
+            OverlayWatch w;
+            DropoutPair gone; gone.cells = kCells; gone.gone = 3;
+            DropoutPair back; back.cells = kCells; back.back = 3;
+            for (unsigned i = 0; i < 6 && w.Current() == OverlayWatch::Phase::On; ++i) w.Observe(i % 2 ? back : gone, true, true);
+            CHECK(w.Current() == OverlayWatch::Phase::TrialOff);
+            for (unsigned i = 0; i < 20 && w.Current() == OverlayWatch::Phase::TrialOff; ++i) w.Observe(i % 2 ? back : gone, true, false);
+            CHECK(w.Current() == OverlayWatch::Phase::RuledOut && w.OverlaysOn() && !w.Busy());
+        }},
+        {"overlay watch: persistent black with the overlays moved is tried off, kept off when the black goes", [] {
+            OverlayWatch w;
+            DropoutPair black; black.cells = kCells; black.black = 8;   // black on both frames of every pair
+            const DropoutPair clean{0, 0, kCells};
+            for (unsigned i = 0; i < OverlayWatch::kTrialLeast; ++i) w.Observe(black, true, true);
+            CHECK(w.Current() == OverlayWatch::Phase::TrialOff);
+            for (unsigned i = 0; i < OverlayWatch::kTrialLeast + OverlayWatch::kSettle + 1; ++i) w.Observe(clean, true, false);
+            CHECK(w.Current() == OverlayWatch::Phase::Off && !w.OverlaysOn());
+        }},
+        {"overlay watch: persistent black that stays without the move puts the overlays back, once a scene", [] {
+            OverlayWatch w;
+            DropoutPair black; black.cells = kCells; black.black = 8;
+            for (unsigned i = 0; i < OverlayWatch::kTrialLeast; ++i) w.Observe(black, true, true);
+            CHECK(w.Current() == OverlayWatch::Phase::TrialOff);
+            for (unsigned i = 0; i < OverlayWatch::kTrialLeast + OverlayWatch::kSettle + 1; ++i) w.Observe(black, true, false);
+            CHECK(w.Current() == OverlayWatch::Phase::RuledOut && w.OverlaysOn());
+        }},
+        {"dropout watch: a move that leaves surfaces black for good is taken back", [] {
+            DropoutWatch w;
+            DropoutPair gone; gone.cells = kCells; gone.gone = 3;
+            DropoutPair back; back.cells = kCells; back.back = 3;
+            for (unsigned i = 0; i < 6 && w.Current() == DropoutWatch::Phase::Watch; ++i)
+                w.Observe(i % 2 ? back : gone, kSamples[i % 16], kSamples[(i + 1) % 16], true);
+            CHECK(w.Current() == DropoutWatch::Phase::Trial);
+            DropoutPair black; black.cells = kCells; black.black = 10;  // no onset, no return: black on every sample
+            for (unsigned i = 0; i < 40 && w.Current() == DropoutWatch::Phase::Trial; ++i)
+                w.Observe(black, kSamples[i % 16], kSamples[(i + 1) % 16], true);
+            CHECK(w.Current() == DropoutWatch::Phase::RuledOut && !w.MoveStillMeshes());
+        }},
+        {"overlay watch: dropouts while no overlay moved are not its business", [] {
+            OverlayWatch w;
+            DropoutPair gone; gone.cells = kCells; gone.gone = 3;
+            DropoutPair back; back.cells = kCells; back.back = 3;
+            for (unsigned i = 0; i < 40; ++i) CHECK(!w.Observe(i % 2 ? back : gone, true, false));
+            CHECK(w.Current() == OverlayWatch::Phase::On);
+        }},
         {"two isolated events far apart are forgotten", [] {
             DropoutWatch w;
             DropoutPair gone; gone.cells = kCells; gone.gone = 2;

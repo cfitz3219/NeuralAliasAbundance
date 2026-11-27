@@ -540,6 +540,13 @@ if(TARGET host_native11)
     add_test(NAME host_native11_fold_performance_measured_test COMMAND native11_dlaa_test --fold-performance-measured)
     set_tests_properties(host_native11_fold_quality_test host_native11_fold_performance_test host_native11_fold_quality_measured_test
       host_native11_fold_performance_measured_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    # Map overlays (lines, labels) drawn into the scene picture with the depth test off take the jitter
+    # (jitter/scene-overlays; Hearts of Iron IV 2026-11-27), at DLAA, Quality and Performance; the interface stays put.
+    add_test(NAME host_native11_overlay_jitter_test COMMAND native11_dlaa_test --overlay-jitter)
+    add_test(NAME host_native11_overlay_jitter_quality_test COMMAND native11_dlaa_test --overlay-jitter-quality)
+    add_test(NAME host_native11_overlay_jitter_performance_test COMMAND native11_dlaa_test --overlay-jitter-performance)
+    set_tests_properties(host_native11_overlay_jitter_test host_native11_overlay_jitter_quality_test host_native11_overlay_jitter_performance_test
+      PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     # Stage 3: live x2 on a DX11 game with the real nvngx_dlssg (NA_FG_SEARCH names its folder; skipped without it).
     add_test(NAME host_native11_fg_x2_test COMMAND native11_dlaa_test --fg-x2)
     add_test(NAME host_native11_fg_x2_fp16_test COMMAND native11_dlaa_test --fg-x2-fp16)

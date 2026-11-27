@@ -56,6 +56,10 @@ public:
         return phase_ == Phase::Confirm || phase_ == Phase::Reduce || phase_ == Phase::Recheck || phase_ == Phase::Keep;
     }
     uint8_t Amount() const { return phase_ == Phase::Reduce || phase_ == Phase::Keep ? strength_ : normal_jitter; }
+    // Scene meshes the host left off the frame's sample on the frames being compared (0: none).
+    void NoteUnjittered(uint64_t meshes) { unjittered_meshes_ = meshes; }
+    // The answer to vibration when such meshes exist: the host moves them onto the sample.
+    bool MoveUnjittered() const { return move_unjittered_; }
     const char* Reason() const { return reason_; }
     float Baseline() const { return std::fabs(reference_.shift); }
     float Candidate() const { return candidate_; }
@@ -92,8 +96,16 @@ public:
         const bool repeated = m.locked && m.shift * reference_.shift > 0.f &&
             wobble >= .70f * Baseline() && wobble <= 1.45f * Baseline();
         if (phase_ == Phase::Confirm) {
-            if (repeated)
-                Set(Phase::Reduce, now, "the same displayed edges vibrated in a second independent window");
+            if (repeated) {
+                // Edges that vibrate while scene meshes were drawn off the jitter are those meshes, not the
+                // jitter's strength: they take the frame's sample first, and strength stays as it is.
+                if (unjittered_meshes_) {
+                    move_unjittered_ = true;
+                    Reject(now, "the vibrating edges belong to scene meshes drawn off the jitter: those meshes take the frame's sample first (strength unchanged)");
+                    return;
+                }
+                Set(Phase::Reduce, now, "the same displayed edges vibrated in a second independent window (no scene mesh was left off the jitter)");
+            }
             return;
         }
         if (m.field && amount != normal_jitter) {
@@ -182,6 +194,8 @@ private:
     uint64_t deadline_ = 0;
     float candidate_ = 0;
     bool rejected_view_ = false;
+    uint64_t unjittered_meshes_ = 0;
+    bool move_unjittered_ = false;
     const char* reason_ = "";
 };
 

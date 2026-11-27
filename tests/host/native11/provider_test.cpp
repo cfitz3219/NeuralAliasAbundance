@@ -168,6 +168,35 @@ float ps_depth_slab(float4 p : SV_Position) : SV_Target { return slab(uint2(p.xy
 void cs_depth_slab(uint3 id : SV_DispatchThreadID) {
     if (id.x < 320 && id.y < 180) mask_out[id.xy] = slab(id.xy);
 }
+// The overlay fixture (Hearts of Iron IV's frame shape, 2026-11-27): thin lines and small labels drawn into
+// the scene picture with the depth test off and the scene depth bound, over depth-tested terrain.
+cbuffer OverlayCb : register(b2) { float4 overlay_size; }; // the picture's width and height in pixels
+uint quad_corner(uint id) { const uint corner = id % 6; return corner < 3 ? corner : corner == 3 ? 2 : corner == 4 ? 1 : 3; }
+float4 vs_overlay_lines(uint id : SV_VertexID) : SV_Position {
+    const uint line_index = id / 6, c = quad_corner(id);
+    const float along = (c & 1) ? 1.0 : 0.0, across = (c & 2) ? 0.5 : -0.5;
+    const float angle = 0.30 + 0.093 * line_index;
+    const float2 dir = float2(cos(angle), sin(angle));
+    const float2 nrm = float2(-dir.y, dir.x) * 1.4 / overlay_size.xy; // 0.7 pixel wide
+    const float2 start = float2(-0.95 + 0.11 * line_index, -0.85);
+    return float4(start + dir * along * 1.9 + nrm * across * 2.0, 0.5, 1.0);
+}
+float4 vs_overlay_text(uint id : SV_VertexID) : SV_Position {
+    const uint glyph = id / 6, c = quad_corner(id);
+    const float2 cell = float2(glyph % 48, glyph / 48);
+    const float2 px = float2(64.3, 120.6) + cell * float2(5.0, 7.0) + float2((c & 1) ? 2.0 : 0.0, (c & 2) ? 3.0 : 0.0);
+    return float4(px.x / overlay_size.x * 2 - 1, 1 - px.y / overlay_size.y * 2, 0.5, 1.0);
+}
+// A panel drawn before the hand-over with a scissor smaller than the scene: small blocks, clipped by the scissor.
+float4 vs_overlay_panel(uint id : SV_VertexID) : SV_Position {
+    const uint block = id / 6, c = quad_corner(id);
+    const float2 cell = float2(block % 30, block / 30);
+    const float2 px = float2(1060.3, 20.6) + cell * float2(6.0, 6.0) + float2((c & 1) ? 4.0 : 0.0, (c & 2) ? 4.0 : 0.0);
+    return float4(px.x / overlay_size.x * 2 - 1, 1 - px.y / overlay_size.y * 2, 0.5, 1.0);
+}
+float4 ps_overlay_panel(float4 p : SV_Position) : SV_Target { return float4(0.0, 1.0, 0.0, 1.0); }
+float4 ps_overlay_line(float4 p : SV_Position) : SV_Target { return float4(1.0, 0.85, 0.2, 1.0); }
+float4 ps_overlay_text(float4 p : SV_Position) : SV_Target { return float4(0.95, 0.95, 0.95, 1.0); }
 SamplerState material : register(s0);
 float4 ps_mips(float4 p : SV_Position) : SV_Target {
     return scene.SampleGrad(material, float2(0.5, 0.5), float2(2.0/64.0,0), float2(0,2.0/64.0));
@@ -244,6 +273,14 @@ struct Game {
     bool rotate_camera = false;
     ComPtr<ID3D11Buffer> cam_pool[2];
     ComPtr<ID3D11DepthStencilState> depth_off;
+    // The overlay fixture: lines and labels into the scene picture with the depth test off, scene depth bound.
+    bool overlays = false;
+    static constexpr UINT kOverlayLines = 16, kOverlayGlyphs = 48 * 6, kPanelBlocks = 30 * 12;
+    static constexpr LONG kPanelScissor[4] = {1080, 30, 1210, 80}; // left, top, right, bottom: smaller than the panel
+    ComPtr<ID3D11VertexShader> vs_lines, vs_text, vs_panel;
+    ComPtr<ID3D11PixelShader> ps_line, ps_text, ps_panel;
+    ComPtr<ID3D11Buffer> overlay_cb;
+    ComPtr<ID3D11DepthStencilState> overlay_depth_off;
     ComPtr<ID3D11Texture2D> layer, layer2;
     ComPtr<ID3D11RenderTargetView> layer_rtv, layer2_rtv;
     ComPtr<ID3D11ShaderResourceView> layer_srv;
@@ -513,6 +550,31 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false, boo
             c->DrawInstanced(3, 350, 0, 0); // 1,050 positions span two packed rows.
             c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         } else c->Draw(4, 0);
+    }
+    if (g.overlays) {
+        // Map overlays: depth test off, the scene depth still bound, into the scene picture (Hearts of Iron IV).
+        c->OMSetDepthStencilState(g.overlay_depth_off.Get(), 0);
+        ID3D11Buffer* ocb = g.overlay_cb.Get();
+        c->VSSetConstantBuffers(2, 1, &ocb);
+        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        c->VSSetShader(g.vs_lines.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_line.Get(), nullptr, 0);
+        c->Draw(Game::kOverlayLines * 6, 0);
+        c->VSSetShader(g.vs_text.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_text.Get(), nullptr, 0);
+        c->Draw(Game::kOverlayGlyphs * 6, 0);
+        // A panel with the whole scene's viewport and a smaller scissor, still before the hand-over.
+        const D3D11_RECT clip{Game::kPanelScissor[0], Game::kPanelScissor[1], Game::kPanelScissor[2], Game::kPanelScissor[3]};
+        c->RSSetState(g.hud_scissor.Get());
+        c->RSSetScissorRects(1, &clip);
+        c->VSSetShader(g.vs_panel.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_panel.Get(), nullptr, 0);
+        c->Draw(Game::kPanelBlocks * 6, 0);
+        c->RSSetState(g.scene_rs ? g.scene_rs.Get() : nullptr);
+        c->OMSetDepthStencilState(nullptr, 0);
+        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        c->VSSetShader(g.vs.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_scene_main ? g.ps_scene_main.Get() : g.ps_scene.Get(), nullptr, 0);
     }
     if (g.main_stats) c->End(g.main_stats);
     if (g.scene_rs) c->RSSetState(nullptr);
@@ -785,23 +847,23 @@ void ShaderDepthLayerFixture(Game& g, int& frame, ID3D11RasterizerState* raster)
         if (!setup(SUCCEEDED(g.device->CreateTexture2D(&desc, nullptr, &colours[i])) &&
             SUCCEEDED(g.device->CreateRenderTargetView(colours[i].Get(), nullptr, &colour_rtv[i])),
             "create material buffers")) return;
-    const auto render = [&](float dx, float dy, bool copy, UINT vertices) {
+    const auto render = [&](float dx, float dy, bool copy, UINT vertices, bool selected = false, bool stationary_source = false) {
         na::native11::SetNextJitter(dx, dy);
         g.swap->Present(0, 0);
         auto* c = g.ctx.Get();
         Scene(c, g, frame++);
         c->ClearDepthStencilView(g.dsv.Get(), D3D11_CLEAR_DEPTH, 1.f, 0);
         auto* target = depth_rtv.Get();
-        c->OMSetDepthStencilState(nullptr, 0);
-        c->OMSetRenderTargets(1, &target, g.dsv.Get());
+        c->OMSetDepthStencilState(stationary_source ? g.depth_off.Get() : nullptr, 0);
+        c->OMSetRenderTargets(1, &target, stationary_source ? nullptr : g.dsv.Get());
         Viewport(c, g.w, g.h);
         c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         c->RSSetState(raster);
         c->VSSetShader(vs.Get(), nullptr, 0);
         c->PSSetShader(producer.Get(), nullptr, 0);
         c->Draw(9, 0);
-        ID3D11RenderTargetView* materials[]{colour_rtv[0].Get(), colour_rtv[1].Get()};
-        c->OMSetRenderTargets(2, materials, g.dsv.Get());
+        ID3D11RenderTargetView* materials[]{selected ? g.color_rtv.Get() : colour_rtv[0].Get(), colour_rtv[1].Get()};
+        c->OMSetRenderTargets(selected ? 1 : 2, materials, g.dsv.Get());
         if (copy) c->CopyResource(unproved_copy.Get(), depth_layer.Get());
         auto* source = copy ? copy_srv.Get() : depth_srv.Get();
         c->PSSetShaderResources(1, 1, &source);
@@ -817,7 +879,7 @@ void ShaderDepthLayerFixture(Game& g, int& frame, ID3D11RasterizerState* raster)
         c->PSSetShaderResources(1, 1, &source);
         c->OMSetRenderTargets(0, nullptr, nullptr);
         float pixel[4]{};
-        const bool read = ReadCopy(g, pixel, colours[0].Get());
+        const bool read = ReadCopy(g, pixel, selected ? g.color.Get() : colours[0].Get());
         c->OMSetDepthStencilState(nullptr, 0);
         Post(c, g, true);
         return std::pair{read ? pixel[0] : -1.f, same_grid};
@@ -832,6 +894,21 @@ void ShaderDepthLayerFixture(Game& g, int& frame, ID3D11RasterizerState* raster)
     expect(fullscreen.first == 0 && !fullscreen.second, "a fullscreen reader retains the original viewport");
     expect(negative.first == 1 && negative.second && positive.first == 1 && positive.second,
            "full-strength offsets preserve material pixels when shader and depth share the raster");
+    for (const bool enabled : {false, true}) {
+        na::native11::ForceSceneOverlayJitterForTests(enabled ? 1 : 0);
+        na::native11::SetSceneOverlayJitter(enabled, "source raster comparison");
+        const auto a = render(.323165f, -.452396f, true, 9, true, false);
+        const auto b = render(.323165f, -.452396f, true, 9, true, true);
+        const auto c = render(-.470734f, .419042f, true, 9, true, true);
+        std::printf("selected scene mesh, overlay=%d: sampled-source pixel=%.1f moved=%d; stationary-source pixels=%.1f/%.1f moved=%d/%d\n",
+                    int(enabled), a.first, int(a.second), b.first, c.first, int(b.second), int(c.second));
+        // Astra's reproducer (2026-11-26). VARIANT: jitter/stationary-source-readers: a reader of a layer drawn on
+        // the game's grid (and of its exact copy) stays on that grid whatever the overlay rule says; a reader of a
+        // layer drawn on the sample's grid moves with the overlay rule.
+        expect(a.first == float(enabled) && b.first == 1.f && c.first == 1.f,
+               "a reader of a stationary layer keeps its grid; a reader of a sampled layer moves with the overlays");
+    }
+    na::native11::ForceSceneOverlayJitterForTests(-1);
 }
 
 int DepthReadFixture(Game& g, bool debug_layer)
@@ -2017,6 +2094,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const uint32_t fold_level = !std::strcmp(arg1, "--fold-quality") || !std::strcmp(arg1, "--fold-quality-measured") ? 1u
                               : !std::strcmp(arg1, "--fold-performance") || !std::strcmp(arg1, "--fold-performance-measured") ? 2u : 0u;
     const bool fold_measured = fold_level && std::strstr(arg1, "-measured") != nullptr; // no camera: motion measured, folded flow
+    // The overlay fixture: --overlay-jitter (DLAA), --overlay-jitter-quality, --overlay-jitter-performance.
+    const int overlay_level = !std::strcmp(arg1, "--overlay-jitter") ? 0 : !std::strcmp(arg1, "--overlay-jitter-quality") ? 1
+                            : !std::strcmp(arg1, "--overlay-jitter-performance") ? 2 : -1;
     wchar_t fg_folder[MAX_PATH]{};
     if (fg_x2 && !GetEnvironmentVariableW(L"NA_FG_SEARCH", fg_folder, MAX_PATH)) {
         std::printf("SKIP: NA_FG_SEARCH (the folder with nvngx_dlssg.dll) is not set\n");
@@ -2050,7 +2130,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
         !set(L"referee", L"enabled", L"0") || // legacy disabled package
-        !set(L"j2", L"camera", (camera_off_start || fg_x2 || adaptive || rotating_lights || fold_measured) ? L"0" : L"2") ||
+        !set(L"j2", L"camera", (camera_off_start || fg_x2 || adaptive || rotating_lights || fold_measured || overlay_level >= 0) ? L"0" : L"2") ||
         (fg_x2 && (!set(L"fg", L"live", L"1") || !set(L"fg", L"search_path", fg_folder))) ||
         (GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) && !set(L"present", L"dx11_proxy", L"0")) ||
 
@@ -2068,7 +2148,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     g.padded_hdr = padded_hdr;
     if (fg_x2_hdr) g.back_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (fold_measured) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
+    if (fold_measured || overlay_level >= 0) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
     {   // NA_TEST_FOLD_SIZE=WxH: the fold fixture at another picture size (e.g. 3440x1440 for the memory figure).
         wchar_t sz[32]{};
         unsigned fw = 0, fh = 0;
@@ -2390,6 +2470,201 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         std::fflush(stdout);
         ExitProcess(g_failed ? 1u : 0u);
     }
+    if (overlay_level >= 0) {
+        // Hearts of Iron IV's frame shape (2026-11-27): depth-tested terrain, then thin lines and labels drawn into
+        // the scene picture with the depth test off and the scene depth bound, then the interface after the
+        // hand-over. Before (jitter/depth-tested-only) and after (jitter/scene-overlays) on a still view:
+        // the share of the picture's edges that never move with the jitter (the HoI4 frames showed 11-14 %),
+        // on the lines and labels and everywhere; the interface must stay exactly on the game's grid.
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        na::j2::SetJitter(true);
+        const char* level_name = overlay_level == 2 ? "Performance" : overlay_level == 1 ? "Quality" : "DLAA";
+        {
+            const auto lines_code = Compile("vs_overlay_lines", "vs_5_0"), text_code = Compile("vs_overlay_text", "vs_5_0");
+            const auto line_ps = Compile("ps_overlay_line", "ps_5_0"), text_ps = Compile("ps_overlay_text", "ps_5_0");
+            const auto panel_code = Compile("vs_overlay_panel", "vs_5_0"), panel_ps = Compile("ps_overlay_panel", "ps_5_0");
+            expect(panel_code && panel_ps &&
+                   SUCCEEDED(g.device->CreateVertexShader(panel_code->GetBufferPointer(), panel_code->GetBufferSize(), nullptr, &g.vs_panel)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(panel_ps->GetBufferPointer(), panel_ps->GetBufferSize(), nullptr, &g.ps_panel)),
+                   "scissored panel shaders");
+            D3D11_DEPTH_STENCIL_DESC dd{};
+            dd.DepthEnable = FALSE; dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            const float size[4] = {float(g.w), float(g.h), 0, 0};
+            D3D11_SUBRESOURCE_DATA init{size, 0, 0};
+            D3D11_RASTERIZER_DESC rd{};
+            rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+            expect(lines_code && text_code && line_ps && text_ps &&
+                   SUCCEEDED(g.device->CreateVertexShader(lines_code->GetBufferPointer(), lines_code->GetBufferSize(), nullptr, &g.vs_lines)) &&
+                   SUCCEEDED(g.device->CreateVertexShader(text_code->GetBufferPointer(), text_code->GetBufferSize(), nullptr, &g.vs_text)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(line_ps->GetBufferPointer(), line_ps->GetBufferSize(), nullptr, &g.ps_line)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(text_ps->GetBufferPointer(), text_ps->GetBufferSize(), nullptr, &g.ps_text)) &&
+                   SUCCEEDED(g.device->CreateDepthStencilState(&dd, &g.overlay_depth_off)) &&
+                   SUCCEEDED(g.device->CreateBuffer(&bd, &init, &g.overlay_cb)) &&
+                   SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.hud_scissor)), "overlay fixture shaders and states");
+            D3D11_RASTERIZER_DESC sr{};
+            sr.FillMode = D3D11_FILL_SOLID; sr.CullMode = D3D11_CULL_NONE; sr.DepthClipEnable = TRUE;
+            expect(SUCCEEDED(g.device->CreateRasterizerState(&sr, &g.scene_rs)), "scene state with no culling (the quads face away)");
+            g.overlays = true;
+        }
+        auto& st = na::settings::Get();
+        st.j2_fold_mode.store(static_cast<uint32_t>(overlay_level));
+        wchar_t temp[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, temp);
+        const auto root = std::filesystem::path(temp) / (L"NA-overlay-jitter-" + std::to_wstring(GetCurrentProcessId()));
+        int frame = 0;
+        const auto run = [&](int n) { for (int i = 0; i < n; ++i, ++frame) { Pump(); Scene(g.ctx.Get(), g, frame); Post(g.ctx.Get(), g, true); g.swap->Present(0, 0); } };
+        // Distance from a pixel centre to the nearest overlay line, and whether it is a label pixel (as the shaders draw them).
+        const auto near_line = [&](int x, int y) {
+            const float W = float(g.w), H = float(g.h);
+            for (UINT l = 0; l < Game::kOverlayLines; ++l) {
+                const float angle = 0.30f + 0.093f * float(l);
+                const float dx = std::cos(angle), dy = std::sin(angle);
+                const float sx = (-0.95f + 0.11f * float(l) + 1.f) * .5f * W, sy = (1.f - (-0.85f + 1.f) * .5f) * H; // NDC -> pixels
+                const float vx = dx * .5f * W, vy = -dy * .5f * H; // the direction in pixels (y down)
+                const float len = std::sqrt(vx * vx + vy * vy);
+                const float px = float(x) + .5f - sx, py = float(y) + .5f - sy;
+                const float t = (px * vx + py * vy) / len;
+                if (t < -2.f || t > 1.9f * len + 2.f) continue;
+                if (std::fabs((px * vy - py * vx) / len) < 2.5f) return true;
+            }
+            return false;
+        };
+        const auto near_text = [&](int x, int y) { return x >= 60 && x < 64 + 48 * 5 + 4 && y >= 116 && y < 121 + 6 * 7 + 4; };
+        const auto in_panel = [&](int x, int y) {
+            return x >= Game::kPanelScissor[0] + 1 && x < Game::kPanelScissor[2] - 1 && y >= Game::kPanelScissor[1] + 1 && y < Game::kPanelScissor[3] - 1;
+        };
+        struct Measure { uint64_t edges = 0, still = 0, line_edges = 0, line_still = 0, text_edges = 0, text_still = 0, other_edges = 0, other_still = 0;
+                         uint64_t panel_edges = 0, panel_still = 0, panel_outside = 0; int pairs = 0; bool hud_same = true; };
+        const auto measure = [&](const std::filesystem::path& cap) {
+            Measure m;
+            // Each frame's scene picture before DLSS (the folded levels' full-size input is "source_color").
+            const char* plane = overlay_level ? "source_color" : "color";
+            std::vector<std::vector<uint8_t>> frames;
+            std::vector<uint64_t> ordinals;
+            std::vector<std::vector<uint8_t>> presents;
+            uint32_t pitch = 0, bpp = 0, ppitch = 0;
+            for (int i = 0; i < 64; ++i) {
+                wchar_t name[32];
+                swprintf_s(name, L"%05d-meta.json", i);
+                FILE* f = nullptr;
+                if (_wfopen_s(&f, (cap / name).c_str(), L"rb") || !f) break;
+                std::string json;
+                char buf[4096];
+                for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) json.append(buf, n);
+                std::fclose(f);
+                const auto field = [&](const char* plane_name, const char* key) -> uint32_t {
+                    const size_t at = json.find(std::string("\"name\": \"") + plane_name + "\"");
+                    if (at == std::string::npos) return 0;
+                    const size_t k = json.find(std::string("\"") + key + "\": ", at);
+                    return k == std::string::npos ? 0 : uint32_t(std::strtoul(json.c_str() + k + std::strlen(key) + 4, nullptr, 10));
+                };
+                pitch = field(plane, "row_pitch");
+                bpp = pitch && g.w ? pitch / g.w : 0;
+                ppitch = field("present", "row_pitch");
+                const size_t o = json.find("\"present_ordinal\": ");
+                ordinals.push_back(o == std::string::npos ? 0 : std::strtoull(json.c_str() + o + 20, nullptr, 10));
+                const auto read = [&](const char* which, uint32_t p) {
+                    std::vector<uint8_t> b;
+                    wchar_t file[64];
+                    swprintf_s(file, L"%05d-%hs.raw", i, which);
+                    FILE* r = nullptr;
+                    if (!_wfopen_s(&r, (cap / file).c_str(), L"rb") && r) { b.resize(size_t(p) * g.h); b.resize(std::fread(b.data(), 1, b.size(), r)); std::fclose(r); }
+                    return b;
+                };
+                frames.push_back(read(plane, pitch));
+                presents.push_back(read("present", ppitch));
+            }
+            if (frames.size() < 2 || !bpp) return m;
+            const auto& f0 = frames[0];
+            const auto px = [&](const std::vector<uint8_t>& f, int x, int y) { return f.data() + size_t(y) * pitch + size_t(x) * bpp; };
+            std::vector<uint8_t> same(size_t(g.w) * g.h, 1), edge(size_t(g.w) * g.h, 0);
+            for (int y = 1; y + 1 < int(g.h); ++y)
+                for (int x = 1; x + 1 < int(g.w); ++x)
+                    edge[size_t(y) * g.w + x] = uint8_t((std::memcmp(px(f0, x, y), px(f0, x + 1, y), bpp) ? 1 : 0) | (std::memcmp(px(f0, x, y), px(f0, x, y + 1), bpp) ? 2 : 0));
+            for (size_t i = 0; i + 1 < frames.size(); ++i) {
+                if (ordinals[i + 1] != ordinals[i] + 1 || frames[i].size() < size_t(pitch) * g.h || frames[i + 1].size() < size_t(pitch) * g.h) continue;
+                ++m.pairs;
+                for (int y = 0; y < int(g.h); ++y)
+                    for (int x = 0; x < int(g.w); ++x)
+                        if (std::memcmp(px(frames[i], x, y), px(frames[i + 1], x, y), bpp)) same[size_t(y) * g.w + x] = 0;
+                // The interface (after the hand-over) is on the game's grid: its panel is the same in every frame.
+                if (presents[i].size() == presents[i + 1].size() && ppitch)
+                    for (int y = kHudRect[1] + 2; y < kHudRect[3] - 2; ++y)
+                        if (std::memcmp(presents[i].data() + size_t(y) * ppitch + size_t(kHudRect[0] + 2) * 4,
+                                        presents[i + 1].data() + size_t(y) * ppitch + size_t(kHudRect[0] + 2) * 4, size_t(kHudRect[2] - kHudRect[0] - 4) * 4))
+                            m.hud_same = false;
+            }
+            // The panel's own colour (pure green) never lands outside its scissor, in any frame (R11G11B10: red and blue
+            // zero, green set; other formats: the same test on the first and third channels).
+            for (const auto& f : frames)
+                for (int y = 0; y < int(g.h) && f.size() >= size_t(pitch) * g.h; ++y)
+                    for (int x = 1040; x < int(g.w); ++x) {
+                        if (x >= Game::kPanelScissor[0] && x < Game::kPanelScissor[2] && y >= Game::kPanelScissor[1] && y < Game::kPanelScissor[3]) continue;
+                        uint32_t v = 0;
+                        std::memcpy(&v, px(f, x, y), 4);
+                        const bool green = bpp == 4 ? ((v & 0x7FF) == 0 && (v >> 22) == 0 && ((v >> 11) & 0x7FF) != 0) : false;
+                        m.panel_outside += green ? 1 : 0;
+                    }
+            for (int y = 1; y + 1 < int(g.h); ++y)
+                for (int x = 1; x + 1 < int(g.w); ++x) {
+                    const size_t i = size_t(y) * g.w + x;
+                    if (!edge[i] || (x >= kHudRect[0] && x < kHudRect[2] && y >= kHudRect[1] && y < kHudRect[3])) continue;
+                    // An edge stays still when nothing within one pixel of it changes in any frame pair. (A single pixel is
+                    // not enough: the eight jitter phases span 0.81 pixel, so an edge whose position falls in the rest of
+                    // the pixel never flips its own pixel, while the pixel beside it does.)
+                    bool s = true;
+                    for (int dy = -1; dy <= 1 && s; ++dy)
+                        for (int dx = -1; dx <= 1 && s; ++dx) s = same[i + size_t(ptrdiff_t(dy) * ptrdiff_t(g.w)) + size_t(ptrdiff_t(dx))] != 0;
+                    ++m.edges; m.still += s;
+                    if (in_panel(x, y)) { ++m.panel_edges; m.panel_still += s; }
+                    else if (near_text(x, y)) { ++m.text_edges; m.text_still += s; }
+                    else if (near_line(x, y)) { ++m.line_edges; m.line_still += s; }
+                    else { ++m.other_edges; m.other_still += s; }
+                }
+            return m;
+        };
+        const auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
+        Measure result[2];
+        for (int variant = 0; variant < 2; ++variant) {
+            const bool after = variant == 1;
+            na::native11::ForceSceneOverlayJitterForTests(after ? 1 : 0);
+            run(180); // DLAA starts; a level is prepared and shown
+            const auto cap = root / (after ? L"after" : L"before");
+            std::filesystem::create_directories(cap);
+            na::capture::j2::Request(16, cap.c_str());
+            run(60);
+            Sleep(1500); // the capture writer finishes on its own thread
+            result[variant] = measure(cap);
+            const auto& m = result[variant];
+            std::printf("%s, %s (%s): %d frame pairs; edges never moved by the jitter: all %.2f %% (%llu of %llu), lines %.2f %% (%llu of %llu), "
+                        "labels %.2f %% (%llu of %llu), scissored panel %.2f %% (%llu of %llu; its colour outside the scissor %llu pixels), terrain %.2f %%; "
+                        "interface identical in every frame: %s; this frame's overlay meshes moved %u, "
+                        "scene meshes left on the game's grid %u\n  frames: %ls\n",
+                        level_name, after ? "after" : "before", after ? "jitter/scene-overlays" : "jitter/depth-tested-only", m.pairs,
+                        pct(m.still, m.edges), (unsigned long long)m.still, (unsigned long long)m.edges,
+                        pct(m.line_still, m.line_edges), (unsigned long long)m.line_still, (unsigned long long)m.line_edges,
+                        pct(m.text_still, m.text_edges), (unsigned long long)m.text_still, (unsigned long long)m.text_edges,
+                        pct(m.panel_still, m.panel_edges), (unsigned long long)m.panel_still, (unsigned long long)m.panel_edges,
+                        (unsigned long long)m.panel_outside,
+                        pct(m.other_still, m.other_edges), m.hud_same ? "yes" : "NO",
+                        na::native11::OverlayMeshesMoved(), na::native11::UnjitteredSceneMeshes(), cap.c_str());
+        }
+        na::native11::ForceSceneOverlayJitterForTests(-1);
+        expect(result[0].pairs >= 4 && result[1].pairs >= 4, "consecutive frame pairs were captured before and after");
+        expect(pct(result[0].line_still, result[0].line_edges) > 50.0, "before: the lines' edges stay on the game's grid (the HoI4 symptom reproduced)");
+        expect(pct(result[1].still, result[1].edges) < 1.0, "after: under 1 % of the picture's edges stay still while the jitter moves");
+        expect(pct(result[1].line_still, result[1].line_edges) < 1.0 && pct(result[1].text_still, result[1].text_edges) < 1.0,
+               "after: the lines and labels move with the jitter");
+        expect(result[0].hud_same && result[1].hud_same, "the interface after the hand-over stays exactly on the game's grid");
+        expect(pct(result[1].panel_still, result[1].panel_edges) < 1.0, "after: a scissored panel before the hand-over moves with the jitter");
+        expect(result[0].panel_outside == 0 && result[1].panel_outside == 0, "the scissored panel stays inside its scissor (the scissor is the game's)");
+        DeleteFileW(ini.c_str());
+        std::printf(g_failed ? "FAIL: %d overlay check(s) failed\n" : "PASS: overlays drawn without the depth test take the jitter\n", g_failed);
+        std::fflush(stdout);
+        ExitProcess(g_failed ? 1u : 0u);
+    }
     if (fold_level) {
         // The game draws at full size; from the level's first shown frame on, its main scene draws are shaded
         // in blocks (pixel-shader invocations: one half / one quarter), the shadow pass, the tone map and the
@@ -2576,7 +2851,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         }
         std::printf("  switches (longest frame, steady DLAA frame %.1f ms): first frames %.1f ms (DLAA and the levels' DLSS made); DLAA -> %s %.1f ms; %s -> %s %.1f ms (on screen after %d frames); -> DLAA %.1f ms\n",
                     dlaa_ms, start_max_ms, level_name, switch_max_ms, level_name, other_name, other_max_ms, other_at, back_max_ms);
-        const double margin = dlaa_ms * 0.2 + 4.0;
+        // One DLSS feature at a time (coordinator 2026-11-27): the new feature is made off the frame, and the switch frame waits
+        // only for what is left of NVIDIA's work. The bar is the coordinator's: no switch more than 20 ms over a steady frame.
+        const double margin = 20.0;
         const auto cs = na::native11::GetCoarseShadingStats();
         const double r_scene = fold_n ? double(fold_scene) / fold_n / (double(dlaa_scene) / dlaa_n) : 0;
         const double r_post = fold_n ? double(fold_post) / fold_n / (double(dlaa_post) / dlaa_n) : 0;

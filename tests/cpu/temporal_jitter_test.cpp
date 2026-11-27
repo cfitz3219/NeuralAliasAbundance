@@ -50,6 +50,20 @@ int main() { return test::run({
         no = m; no.mesh = false; CHECK(!StillMeshTakesJitter(no));             // a full-screen pass never moves
         no = m; no.scene_viewport = false; CHECK(!StillMeshTakesJitter(no));   // a partial view
     }},
+    {"an overlay drawn into the scene colour without the depth test takes the sample", [] {
+        SceneOverlay o;
+        o.active = o.scene_depth_bound = o.scene_colour = o.mesh = o.scene_viewport = true;
+        CHECK(SceneOverlayTakesJitter(o));                                        // rails, borders, labels on the map
+        auto no = o; no.enabled = false; CHECK(!SceneOverlayTakesJitter(no));     // jitter/depth-tested-only
+        no = o; no.active = false; CHECK(!SceneOverlayTakesJitter(no));           // no sample in force
+        no = o; no.tests_depth = true; CHECK(!SceneOverlayTakesJitter(no));       // the ordinary rule's draw
+        no = o; no.scene_depth_bound = false; CHECK(!SceneOverlayTakesJitter(no)); // another view
+        no = o; no.scene_colour = false; CHECK(!SceneOverlayTakesJitter(no));     // another target (a mask, a shadow)
+        no = o; no.mesh = false; CHECK(!SceneOverlayTakesJitter(no));             // a full-screen pass never moves
+        no = o; no.scene_viewport = false; CHECK(!SceneOverlayTakesJitter(no));   // its own viewport (a minimap)
+        no = o; no.after_handover = true; CHECK(!SceneOverlayTakesJitter(no));    // the interface after the hand-over
+        no = o; no.reads_stationary_layer = true; CHECK(!SceneOverlayTakesJitter(no)); // reads a layer on the game's grid: stays on it
+    }},
     {"known Halton samples and wrapping", [] {
         const double xs[] = {0, -.25, .25, -.375};
         const double ys[] = {-1./6, 1./6, -7./18, -1./18};
