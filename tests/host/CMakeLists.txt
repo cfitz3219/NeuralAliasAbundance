@@ -214,6 +214,8 @@ na_host_test(overlay_bootstrap_test SOURCES overlay_bootstrap_test.cpp LIBS host
 na_host_test(dx11_proxy_chain_test SOURCES dx11_proxy_chain_test.cpp LIBS host_dx12 user32 d3d11 d3d12 dxgi LABELS gpu)
 # HUD-free picture on the native DX11 route: both shapes learned from one frame, through the real hooks (exact).
 na_host_test(hud_free11_test SOURCES hud_free11_test.cpp LIBS host_dx12 user32 d3d11 d3d12 dxgi d3dcompiler LABELS gpu)
+# NVIDIA's D3D11 coarse shading (NVAPI), the basis of DLSS Quality / Performance on the native DX11 route.
+na_host_test(vrs11_test SOURCES vrs11_test.cpp LIBS d3d11 d3d12 dxgi d3dcompiler nvapi_headers LABELS gpu)
 add_test(NAME host_overlay_bootstrap_automatic_test COMMAND overlay_bootstrap_test --automatic)
 set_tests_properties(host_overlay_bootstrap_automatic_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS host)
 add_test(NAME host_added_upscaling_off_test COMMAND overlay_bootstrap_test --added-upscaling-off)
