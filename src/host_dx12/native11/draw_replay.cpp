@@ -1,5 +1,6 @@
 // Draw replay on the native DX11 route: see draw_replay.hpp. Mirrors observe/producers.cpp "Draw
 // replay" (DX12) step by step; where D3D11 differs it says so.
+#include "core/replay_depth.hpp"
 #include "host_dx12/native11/draw_replay.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 
@@ -324,10 +325,10 @@ void AfterDraw(ID3D11DeviceContext* c, const DrawFacts& facts, const DrawArgs& a
                 for (UINT i = 0; i < (b.IndependentBlendEnable ? 8u : 1u); ++i) blended = blended || b.RenderTarget[i].BlendEnable != FALSE;
             }
         }
-        const bool matched = d.DepthEnable && !written && !blended &&
-            (d.DepthFunc == D3D11_COMPARISON_EQUAL || d.DepthFunc == D3D11_COMPARISON_LESS_EQUAL || d.DepthFunc == D3D11_COMPARISON_GREATER_EQUAL);
-        if (!written && !matched) { gate(kGateNoDepthWrite); return; }
-        if (matched) gate(kGateDepthMatched);
+        // The same rule as DX12's recipe and gate (core/replay_depth.hpp).
+        const auto use = na::replay::DepthUseOf(d.DepthEnable != FALSE, written, blended, static_cast<uint32_t>(d.DepthFunc));
+        if (use == na::replay::DepthUse::No) { gate(kGateNoDepthWrite); return; }
+        if (use == na::replay::DepthUse::Matched) gate(kGateDepthMatched);
     }
     Held<ID3D11VertexShader> vs;
     c->VSGetShader(&vs.p, nullptr, nullptr);

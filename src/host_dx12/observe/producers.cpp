@@ -46,6 +46,7 @@
 #include "host_dx12/host_observe_internal.hpp"
 #include "host_dx12/host_observe_samples.h"
 #include "host_dx12/observe/d3d12_slots.hpp"
+#include "core/replay_depth.hpp"
 
 namespace na::observe {
 namespace {
@@ -3540,7 +3541,7 @@ void make_pso_twins(IUnknown* pso, const void* rs, Make make, RecipeFn&& recipe_
     // replaced sets (if any) are released outside g_m
 }
 
-void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d); // Draw replay (below)
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const na_ev_pipeline_created& e); // Draw replay (below)
 HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out)
 {
     const CostScope cost(kCostPso, !t_host_work);
@@ -3569,7 +3570,7 @@ HRESULT STDMETHODCALLTYPE D_CreateGraphicsPipelineState(ID3D12Device* dev, const
     g_next_blend_class=blend_class(d->BlendState);
     g_next_stream_output=d->StreamOutput.NumEntries!=0;
     emit_pipeline(dev, obj, e, d->pRootSignature);
-    replay_note_pipeline(dev, obj, *d);
+    replay_note_pipeline(dev, obj, *d, e);
     make_pso_twins(obj, d->pRootSignature, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC c = *d;
         c.pRootSignature = trs;
@@ -3630,6 +3631,15 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     size_t at = 0;
     size_t rs_offset = SIZE_MAX, cached_offset = SIZE_MAX; // live mip bias: subobjects patched in the twins
     bool saw_depth = false;
+    // Draw replay: the stream's graphics state as a description (its defaults where a subobject is absent),
+    // so a stream-created pipeline gets a replay recipe like a described one.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC replay_desc{};
+    replay_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    replay_desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    replay_desc.RasterizerState.DepthClipEnable = TRUE;
+    replay_desc.SampleMask = UINT_MAX;
+    replay_desc.SampleDesc.Count = 1;
+    bool replay_unusable = false;
     while (at + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= d->SizeInBytes) {
         const auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(p + at);
         const size_t n = sub_size(type);
@@ -3639,18 +3649,24 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
         }
         const uint8_t* s = p + at;
         switch (type) {
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: rs = inner_of<ID3D12RootSignature*>(s); rs_offset = at; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: rs = inner_of<ID3D12RootSignature*>(s); rs_offset = at; replay_desc.pRootSignature = rs; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: replay_desc.InputLayout = inner_of<D3D12_INPUT_LAYOUT_DESC>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: replay_desc.IBStripCutValue = inner_of<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: replay_desc.PrimitiveTopologyType = inner_of<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: replay_desc.RasterizerState = inner_of<D3D12_RASTERIZER_DESC>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: replay_desc.NodeMask = inner_of<UINT>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: replay_unusable = true; break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: cached_offset = at; break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: bytecode(e, NA_STAGE_VS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: bytecode(e, NA_STAGE_VS, inner_of<D3D12_SHADER_BYTECODE>(s)); replay_desc.VS = inner_of<D3D12_SHADER_BYTECODE>(s); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: bytecode(e, NA_STAGE_PS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: bytecode(e, NA_STAGE_DS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: bytecode(e, NA_STAGE_HS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: bytecode(e, NA_STAGE_GS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: bytecode(e, NA_STAGE_DS, inner_of<D3D12_SHADER_BYTECODE>(s)); replay_desc.DS = inner_of<D3D12_SHADER_BYTECODE>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: bytecode(e, NA_STAGE_HS, inner_of<D3D12_SHADER_BYTECODE>(s)); replay_desc.HS = inner_of<D3D12_SHADER_BYTECODE>(s); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: bytecode(e, NA_STAGE_GS, inner_of<D3D12_SHADER_BYTECODE>(s)); replay_desc.GS = inner_of<D3D12_SHADER_BYTECODE>(s); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: bytecode(e, NA_STAGE_CS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: bytecode(e, NA_STAGE_AS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: bytecode(e, NA_STAGE_MS, inner_of<D3D12_SHADER_BYTECODE>(s)); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: blend_mask(e, inner_of<D3D12_BLEND_DESC>(s)); g_next_hud_affine=hud_affine(inner_of<D3D12_BLEND_DESC>(s)); g_next_blend_class=blend_class(inner_of<D3D12_BLEND_DESC>(s)); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: g_next_stream_output=inner_of<D3D12_STREAM_OUTPUT_DESC>(s).NumEntries!=0;break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: g_next_stream_output=inner_of<D3D12_STREAM_OUTPUT_DESC>(s).NumEntries!=0;replay_desc.StreamOutput=inner_of<D3D12_STREAM_OUTPUT_DESC>(s);break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
             const auto& ds = inner_of<D3D12_DEPTH_STENCIL_DESC>(s);
             depth_blend(e, ds.DepthEnable, ds.DepthWriteMask, ds.DepthFunc);
@@ -3679,6 +3695,9 @@ HRESULT STDMETHODCALLTYPE D_CreatePipelineState(ID3D12Device2* dev, const D3D12_
     if (!saw_depth && e.stage_hash[NA_STAGE_CS] == 0) depth_blend(e, TRUE, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_COMPARISON_FUNC_LESS);
     if (e.blend_enable_mask == NA_UNKNOWN_U32 && e.stage_hash[NA_STAGE_CS] == 0) e.blend_enable_mask = 0; // default: no blending
     emit_pipeline(dev, obj, e, rs);
+    // Draw replay: a stream-created graphics pipeline gets a recipe too (before 2026-11-27 only described ones did).
+    if (!replay_unusable && e.stage_hash[NA_STAGE_CS] == 0 && e.stage_hash[NA_STAGE_MS] == 0 && e.stage_hash[NA_STAGE_AS] == 0)
+        replay_note_pipeline(dev, obj, replay_desc, e);
     if (rs_offset != SIZE_MAX)
         make_pso_twins(obj, rs, [&](int, ID3D12RootSignature* trs) -> IUnknown* {
             // Copy the stream, point its root-signature subobject at the twin, drop any cache.
@@ -5945,13 +5964,14 @@ void so_worker()
         }
     }
 }
-// Called from the pipeline-creation hook for every graphics pipeline: keeps a creation copy of the
-// ones a scene draw could replay (no hull/domain/geometry stage, no stream output of its own).
-void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d)
+// Called from the pipeline-creation hooks for every graphics pipeline (description and stream): keeps a
+// creation copy of the ones a scene draw could replay (no hull/domain/geometry stage, no stream output of
+// its own), by the same depth rule as the per-draw gate (core/replay_depth.hpp), from the same facts.
+void replay_note_pipeline(ID3D12Device* dev, IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const na_ev_pipeline_created& facts)
 {
     if (t_host_work || !pso || !d.pRootSignature || !d.VS.pShaderBytecode || d.HS.pShaderBytecode || d.DS.pShaderBytecode ||
-        d.GS.pShaderBytecode || d.StreamOutput.NumEntries || !d.DepthStencilState.DepthEnable ||
-        d.DepthStencilState.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ALL ||
+        d.GS.pShaderBytecode || d.StreamOutput.NumEntries ||
+        na::replay::DepthUseOf(facts.depth_enable == 1, facts.depth_write == 1, facts.blend_enable_mask != 0, facts.depth_func) == na::replay::DepthUse::No ||
         d.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return;
     auto e = std::make_shared<SoEntry>();
     e->recipe = recipe_of(dev, d);
@@ -6068,12 +6088,10 @@ void replay_after_draw(GL* l, bool indexed, UINT count, UINT instances, UINT a2,
         // Opaque geometry whose depth is already in the scene depth also qualifies: engines with a
         // depth pre-pass draw their G-buffer pass with depth writes off and an EQUAL / LESS_EQUAL
         // (GREATER_EQUAL when reversed) test. Blended or other-test draws stay out.
-        const bool depth_written = pc->depth_enable == 1 && pc->depth_write == 1;
-        const bool depth_matched = pc->depth_enable == 1 && pc->depth_write == 0 && pc->blend_enable_mask == 0 &&
-                                   (pc->depth_func == D3D12_COMPARISON_FUNC_EQUAL || pc->depth_func == D3D12_COMPARISON_FUNC_LESS_EQUAL ||
-                                    pc->depth_func == D3D12_COMPARISON_FUNC_GREATER_EQUAL);
-        if (!depth_written && !depth_matched) { rp_gate(kGateNoDepthWrite); return; }
-        if (depth_matched) rp_gate(kGateDepthMatched);
+        // The same rule as the recipe kept at creation (core/replay_depth.hpp), from the same facts.
+        const auto depth_use = na::replay::DepthUseOf(pc->depth_enable == 1, pc->depth_write == 1, pc->blend_enable_mask != 0, pc->depth_func);
+        if (depth_use == na::replay::DepthUse::No) { rp_gate(kGateNoDepthWrite); return; }
+        if (depth_use == na::replay::DepthUse::Matched) rp_gate(kGateDepthMatched);
         if (pc->stage_hash[NA_STAGE_GS] || pc->stage_hash[NA_STAGE_HS] || pc->stage_hash[NA_STAGE_DS] || pc->stage_hash[NA_STAGE_MS]) { rp_count(kRpStages); return; }
         if (!ls->raster_topology_known || ls->raster_topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) { rp_count(kRpTopology); return; }
         if (pc->sample_count != 1) { rp_gate(kGateMsaa); return; }
