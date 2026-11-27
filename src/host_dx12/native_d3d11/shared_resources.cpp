@@ -76,16 +76,21 @@ bool CompatibleImageCopy(const D3D11_TEXTURE2D_DESC& native, UINT subresource,
            std::max(1u, native.Height >> mip) == shared.height;
 }
 
-HRESULT SharedTexture::Create(ID3D11Device* native, ID3D12Device* effects, const ImageDesc& desc)
+HRESULT SharedTexture::Create(ID3D11Device* native, ID3D12Device* effects, const ImageDesc& desc,
+                              const char** failed_operation)
 {
+    const auto failure = [failed_operation](HRESULT hr, const char* operation) {
+        if (failed_operation) *failed_operation = operation;
+        return hr;
+    };
     // Objects are created once per resource generation, never overwritten while
     // an old generation might be submitted. The owner retires the whole old slot.
-    if (native_ || effects_) return DXGI_ERROR_INVALID_CALL;
-    if (!desc.width || !desc.height || desc.format == DXGI_FORMAT_UNKNOWN) return E_INVALIDARG;
+    if (native_ || effects_) return failure(DXGI_ERROR_INVALID_CALL, "slot_already_allocated");
+    if (!desc.width || !desc.height || desc.format == DXGI_FORMAT_UNKNOWN) return failure(E_INVALIDARG, "validate_shared_image");
     HRESULT hr = SameAdapter(native, effects);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) return failure(hr, "check_shared_adapter");
     ComPtr<ID3D11Device1> d11;
-    if (FAILED(hr = native->QueryInterface(IID_PPV_ARGS(&d11)))) return hr;
+    if (FAILED(hr = native->QueryInterface(IID_PPV_ARGS(&d11)))) return failure(hr, "query_DX11_device1");
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     heap.CreationNodeMask = heap.VisibleNodeMask = 1;
@@ -101,15 +106,15 @@ HRESULT SharedTexture::Create(ID3D11Device* native, ID3D12Device* effects, const
     if (desc.writable12) image.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ComPtr<ID3D12Resource> r12;
     if (FAILED(hr = effects->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &image,
-        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r12)))) return hr;
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r12)))) return failure(hr, "DX12_CreateCommittedResource");
     Handle shared;
-    if (FAILED(hr = effects->CreateSharedHandle(r12.Get(), nullptr, GENERIC_ALL, nullptr, &shared.value))) return hr;
+    if (FAILED(hr = effects->CreateSharedHandle(r12.Get(), nullptr, GENERIC_ALL, nullptr, &shared.value))) return failure(hr, "DX12_CreateSharedHandle");
     ComPtr<ID3D11Texture2D> r11;
-    if (FAILED(hr = d11->OpenSharedResource1(shared.value, IID_PPV_ARGS(&r11)))) return hr;
+    if (FAILED(hr = d11->OpenSharedResource1(shared.value, IID_PPV_ARGS(&r11)))) return failure(hr, "DX11_OpenSharedResource1");
     D3D11_TEXTURE2D_DESC opened{};
     r11->GetDesc(&opened);
     if (opened.Width != desc.width || opened.Height != desc.height || opened.Format != desc.format ||
-        opened.ArraySize != 1 || opened.MipLevels != 1 || opened.SampleDesc.Count != 1) return E_UNEXPECTED;
+        opened.ArraySize != 1 || opened.MipLevels != 1 || opened.SampleDesc.Count != 1) return failure(E_UNEXPECTED, "validate_opened_DX11_texture");
     native_ = std::move(r11); effects_ = std::move(r12); desc_ = desc;
     return S_OK;
 }

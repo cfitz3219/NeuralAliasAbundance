@@ -529,6 +529,8 @@ if(TARGET host_native11)
     add_test(NAME host_native11_dlaa_automatic_test COMMAND native11_dlaa_test --automatic)
     set_tests_properties(host_native11_dlaa_automatic_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_test(NAME host_native11_dlaa_camera_off_start_test COMMAND native11_dlaa_test --camera-off-start)
+    add_test(NAME host_native11_replay_handoff_test COMMAND native11_dlaa_test --replay-handoff)
+    set_tests_properties(host_native11_replay_handoff_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     # DLSS Quality / Performance on the native DX11 route: coarse shading on the scene draws (NVAPI), the shared
     # fold pass, DLAA on screen until the level is ready, then back to DLAA.
     add_test(NAME host_native11_fold_quality_test COMMAND native11_dlaa_test --fold-quality)
