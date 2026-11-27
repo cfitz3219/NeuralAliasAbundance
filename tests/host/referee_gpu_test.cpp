@@ -9,6 +9,7 @@
 #include "test_support.hpp"
 #include "referee_gpu_scene.hpp"
 #include "host_dx12/capture/referee_gpu.hpp"
+#include "host_dx12/capture/referee_route_a.hpp"
 #include "host_dx12/capture/screen_marker.hpp"
 #include "core/referee_recovery.hpp"
 #include "host_dx12/background/work.hpp"
@@ -1171,6 +1172,76 @@ int main(int argc, char** argv)
             if (residual <= (std::min)(.04, .25 * p[na::referee::kStill])) ++interiors;
         }
         CHECK(interiors > 3000 && measured.light_compatible >= interiors);
+    }
+    {
+        // Gap audit 2026-11-21 item 12: a game that runs its own DLSS (Route A). The witness
+        // records into the game's list after the evaluation, counts it only when that list is
+        // submitted before the next present, and owns the present receipt no other route owns.
+        namespace ra = na::referee::route_a;
+        const auto frame = [&](ID3D12Resource* color, const float* jitter, bool submit) {
+            ra::Evaluated e;
+            e.feature = 77;
+            e.color = color; e.motion = t_motion.Get(); e.output = t_output.Get();
+            e.render_w = e.output_w = rs::kW; e.render_h = e.output_h = rs::kH;
+            e.jitter_x = jitter[0]; e.jitter_y = jitter[1];
+            e.mv_low_res = true;
+            ra::OnEvaluated(l.list.Get(), e);
+            ID3D12CommandList* raw = l.list.Get();
+            if (submit) {
+                Run(d, l);
+                ra::OnExecuted(d.queue.Get(), 1, &raw);
+            }
+            rg::Presentation receipt{0, &d};
+            ra::OnPresent(receipt);
+            if (receipt.ordinal) rg::OnPresent(receipt, d.queue.Get(), t_screen.Get(), Execute);
+            return receipt;
+        };
+        const auto settle = [&] {
+            d.WaitIdle();
+            rg::Wanted();
+            return na::background::WaitIdle(3000);
+        };
+        Sleep(150);
+        const auto before = rg::GetStats().samples;
+        const auto base = ra::GetStats();
+        // The first present only establishes that no other route owns the receipt.
+        const auto first = frame(t_prev.Get(), rs::kJitterBefore, true);
+        CHECK(!first.ordinal && ra::GetStats().recorded == base.recorded);
+        const auto earlier = frame(t_prev.Get(), rs::kJitterBefore, true);
+        CHECK(earlier.ordinal && earlier.eligible && earlier.submitted);
+        const auto current = frame(t_input.Get(), rs::kJitterNow, true);
+        CHECK(current.ordinal == earlier.ordinal + 1 && current.submitted);
+        REQUIRE(settle());
+        const auto seen = ra::GetStats();
+        std::printf("route A witness: evaluations=%llu recorded=%llu submitted=%llu presents=%llu samples=%llu\n",
+                    static_cast<unsigned long long>(seen.evaluations - base.evaluations),
+                    static_cast<unsigned long long>(seen.recorded - base.recorded),
+                    static_cast<unsigned long long>(seen.submitted - base.submitted),
+                    static_cast<unsigned long long>(seen.presents - base.presents),
+                    static_cast<unsigned long long>(rg::GetStats().samples - before));
+        CHECK(seen.recorded - base.recorded == 2 && seen.submitted - base.submitted == 2 && seen.active);
+        CHECK(rg::GetStats().samples == before + 1);
+        const auto witnessed = rg::GetLastSample();
+        CHECK(witnessed.screen && witnessed.pair);
+
+        // Negative: the list is recorded in one frame and submitted after the present.
+        // That capture cannot be tied to a present and must not become a sample.
+        Sleep(150);
+        const auto unsampled = rg::GetStats().samples;
+        const auto held = frame(t_prev.Get(), rs::kJitterBefore, false);
+        CHECK(held.ordinal && held.eligible && !held.submitted);
+        ID3D12CommandList* late = l.list.Get();
+        Run(d, l);
+        ra::OnExecuted(d.queue.Get(), 1, &late);
+        CHECK(ra::GetStats().other_frame == seen.other_frame + 1 && ra::GetStats().submitted == seen.submitted);
+        REQUIRE(settle());
+        CHECK(rg::GetStats().samples == unsampled && !rg::GetStats().stopped);
+        // Hand the receipt back: a present another route owns ends the witness.
+        rg::Presentation owned{ordinal + 1000, &d};
+        ra::OnPresent(owned);
+        CHECK(owned.ordinal == ordinal + 1000 && !ra::GetStats().active);
+        ordinal += 2000; // later cases use their own, larger ordinals
+        got = rg::GetLastSample(); // the closing case below counts from the newest sample
     }
     Sleep(150);
     REQUIRE(rg::Wanted());

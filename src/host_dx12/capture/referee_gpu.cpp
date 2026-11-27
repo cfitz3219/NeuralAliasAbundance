@@ -131,6 +131,7 @@ struct State {
         float win_black_events = 0, win_black_cells = 0;
         std::array<float, FlickerTransition::count> dropout_view{};
         bool dropout_view_known = false;
+        ULONGLONG dropout_observed_at = 0;
         uint64_t dropout_events = 0, dropout_logged = 0;
     };
     std::array<JitterControl, 2> jitter_controls;
@@ -730,8 +731,12 @@ void collect_sample()
                     ++control.win_pairs;
                     control.win_black_events += pair.Any() ? 1.f : 0.f;
                     control.win_black_cells += float(pair.black);
-                    control.dropout_view = trial.image;
-                    control.dropout_view_known = true;
+                    // Keep comparing against the symptom's picture until the trial ends.
+                    if (control.dropout.Current() != DropoutWatch::Phase::Trial) {
+                        control.dropout_view = trial.image;
+                        control.dropout_view_known = true;
+                    }
+                    control.dropout_observed_at = GetTickCount64();
                     // VARIANT: jitter/scene-overlays: its guard first; the still-mesh move waits while it tries.
                     const bool overlay_changed = control.overlay.Observe(pair, same_view,
                         g.overlays_moved[index].load(std::memory_order_relaxed) != 0);
@@ -1687,7 +1692,8 @@ bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, 
     const auto& control = g.jitter_controls[index];
     const auto& scene = control.scene;
     if (control.source != swapchain || path != scene.placement.path ||
-        frame < control.ordinal || frame - control.ordinal > DropoutWatch::kWindow) return false;
+        frame < control.ordinal || !control.dropout_observed_at ||
+        GetTickCount64() - control.dropout_observed_at > 4 * every_ms() + kStuckMs) return false;
     const bool rotating = path == shadow::Path::Native11 && screen_proof && scene.native_screen_proof;
     if (depth != scene.depth || generation != scene.generation || (color != scene.color && !rotating)) return false;
     return control.dropout.MoveStillMeshes() || control.trial.MoveUnjittered();

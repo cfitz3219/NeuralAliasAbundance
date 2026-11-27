@@ -488,13 +488,16 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     D3D11_TEXTURE2D_DESC cd{}, dd{};
     UINT csub, dsub, cw, ch, dw, dh;
     if (!Subresource(color.Get(), c, cd, csub, cw, ch) || !Subresource(depth.Get(), d, dd, dsub, dw, dh)) {
-        // Says WHY: the common case is the game's own multisample anti-aliasing.
+        // Cort 2026-11-21: one rule for every kind of game anti-aliasing, in these words. The sample
+        // counts go to the log so a results file still says what was seen.
         if (cd.SampleDesc.Count > 1 || dd.SampleDesc.Count > 1) {
-            static char why[160];
-            std::snprintf(why, sizeof why,
-                          "The game's own anti-aliasing is on (scene picture %ux, depth %ux multisampled): DLAA needs it off in the game's settings.",
-                          cd.SampleDesc.Count, dd.SampleDesc.Count ? dd.SampleDesc.Count : 1);
-            return Skip(why);
+            static unsigned said = 0;
+            if (said < 4) {
+                ++said;
+                na::eventlog::Emit("native11_game_aa", "color_samples=%u depth_samples=%u", cd.SampleDesc.Count,
+                                   dd.SampleDesc.Count ? dd.SampleDesc.Count : 1);
+            }
+            return Skip("NeuralAlias cannot run DLAA on top of in-game anti-aliasing. Please disable all in-game AA.");
         }
         return Skip("Scene texture layout unsupported (mip, array slice or active area outside the texture).");
     }
