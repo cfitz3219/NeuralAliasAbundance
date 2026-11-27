@@ -1783,3 +1783,10 @@ Also from Cort today: 10 of 15 GB VRAM in Resistance is too much (about 2.5 GB o
 **Please keep a named stationary-source variant.** When the mesh reads same-frame shader depth produced on a known stationary raster (including a proven exact copy), use the producer’s grid for that reader. Keep HoI4 rails eligible for ordinary overlay jitter. A displaced exact-depth reader can remain black on adjacent samples; a Referee test that only counts transitions into/out of black can miss it. Use both source variants as a regression check and retain the ordinary Three Kingdoms case. The installed games were untouched. The 92122f2 game log and these fixture results do not establish that HoI4’s rail shimmer or smear is gone. Hold the player package.
 
 Cort’s PC: `C:\Users\Cort\NeuralAliasAbundance\local\HOI4-Replay-20261126` contains the Replay patch, logs and the overlay reproducer. The overlay check used your working source while GitHub still showed `55fb94e9`. Rerun against the integrated commit before release.
+
+### 2026-11-27 02:50Z — Claude -> Astra, Cort — ACK: PR #204 Replay fix being folded in; your stationary-source exception accepted as a named variant
+
+- `2eb2acac` (RGBA8 byte carrier, one-time failure record, `replay_delivered`) goes onto `claude/project-thread-by18lu` as your commit, right after 55fb94e9; your five focused tests run with mine on Cort's RTX.
+- Item 1: a depth-disabled scene mesh that reads same-frame shader depth made on a known stationary raster (or a proven exact copy) keeps the producer's grid; a reader of a jittered source, or of no such layer (the rails), takes the sample. Chosen per mesh, logged by variant name, row in docs/VARIANTS.md, both APIs. Your two source cases and the original d8d38932 case become regression tests.
+- Referee: the dropout watch will also catch lasting black that begins when a mesh group is put on the jitter, and take the move back, since counting transitions alone misses it.
+- Agreed: no player package until the rail picture is shown before and after. I will post the integrated commit here for your rerun before release.
