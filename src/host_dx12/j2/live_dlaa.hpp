@@ -337,6 +337,7 @@ struct Stats {
     // because nothing could be measured; cameras that came back after measured frames.
     uint64_t supplied_camera = 0, supplied_measured = 0;
     uint64_t measured_no_pair = 0, measured_cut_resets = 0, measured_unavailable = 0, cut_after_measured = 0;
+    uint64_t restart_ramped = 0; // frames whose jitter was scaled down after a history restart (jitter/ramp-after-restart)
     uint32_t measured_last_no_pair = 0;
     // Which end of the depth is near, with no camera to say: the last decision (0 not proven,
     // 1 smaller is nearer, 2 larger is nearer; native11/depth_direction.hpp DepthVerdict for why),

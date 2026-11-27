@@ -94,6 +94,9 @@ void SetScreenFit(bool on);
 struct Gates { float image_ratio, image_abs, texture_min, agree_px, agree_cos, consistency_px; uint32_t agree_min; bool sky; };
 Gates GatesFor(uint32_t percent); // pure, for tests and the panel
 void Reset(); // old contexts stay retained by their executable/GPU recordings
+// The numbers logged with every scene cut the pictures confirmed (camera_cut verdict=reset_confirmed_by_pictures):
+// the newest completed pair's screen fit (a pan fits the whole screen; a new scene does not) and the cut count.
+int FormatCutNumbers(char* out, size_t n);
 // Another picture size is coming (a folded DLSS level measures at its own size): its working
 // resources and programs are built on a thread of their own, and Record takes them when a picture of
 // that size arrives, keeping the present size's for the way back. No frame waits on it. Ready says

@@ -5,6 +5,7 @@
 // writes 1 where its own depth equals the layer's and 0 where it does not.
 #include "test_support.hpp"
 #include "host_dx12/observe/producers.hpp"
+#include "core/referee_coverage.hpp"
 #include <d3dcompiler.h>
 #include <cmath>
 void __cdecl sink(const na_event_batch*,void*){}
@@ -246,6 +247,52 @@ O PSRead(V v){float s=layer.Load(int3(v.p.xy,0));O o;o.a=o.b=float4(abs(s-v.p.z)
     stats=na::observe::GetViewportJitterStats();
     std::printf("stationary source: left_on_game_grid{stationary_source=%llu}\n",(unsigned long long)stats.left.stationary_source);
     CHECK(stats.left.stationary_source>=2);
+
+    // VARIANT: referee/coverage-trial on DX12: with the overlay rule off, the copy reader is left on the game's grid
+    // (class rule_off). The Referee moving that class puts it on the sample; a trial put back demotes the pipeline,
+    // which then stays on the game's grid even while the class is moved again.
+    {
+        na::observe::SetSceneOverlayJitter(false,"test: the coverage trial");
+        const auto frame_with=[&](uint32_t f)->std::pair<float,float>{
+            na::observe::SetSceneViewportJitter(f,.323165f,-.452396f);
+            l.Reset();
+            {
+                D3D12_RESOURCE_BARRIER b[2]{test::Transition(layer.Get(),PSR,RT),test::Transition(copy.Get(),PSR,D3D12_RESOURCE_STATE_COPY_DEST)};
+                l.list->ResourceBarrier(2,b);
+            }
+            produce(l.list.Get());
+            {
+                D3D12_RESOURCE_BARRIER b[2]{test::Transition(layer.Get(),RT,D3D12_RESOURCE_STATE_COPY_SOURCE),test::Transition(copy.Get(),D3D12_RESOURCE_STATE_COPY_DEST,PSR)};
+                l.list->ResourceBarrier(1,&b[0]);l.list->CopyResource(copy.Get(),layer.Get());
+                b[0]=test::Transition(layer.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,PSR);l.list->ResourceBarrier(2,b);
+            }
+            consume(l.list.Get());read_back(l.list.Get());
+            if(FAILED(l.list->Close()))return {-1.f,-1.f};
+            d.queue->ExecuteCommandLists(1,one);d.WaitIdle();
+            float* pixels=nullptr;if(FAILED(rb->Map(0,nullptr,reinterpret_cast<void**>(&pixels))))return {-1.f,-1.f};
+            const std::pair<float,float> r{pixels[(15*W+24)*4],pixels[(15*W+48)*4]};rb->Unmap(0,nullptr);return r;
+        };
+        constexpr unsigned rule_off=unsigned(na::referee::LeftClass::RuleOff);
+        uint64_t left[na::referee::kLeftClasses];na::observe::LeftByClass(left);
+        na::observe::SetCoverage(0,-1,0,-1,false);
+        const auto still=frame_with(11);
+        na::observe::LeftByClass(left);
+        const uint64_t left_rule_off=left[rule_off];
+        na::observe::SetCoverage(1u<<rule_off,int(rule_off),0,-1,false); // on trial
+        const auto moved=frame_with(12);
+        const uint64_t moved_draws=na::observe::CoverageMovedDraws();
+        na::observe::SetCoverage(0,-1,1,int(rule_off),false);             // put back: its pipeline is demoted
+        na::observe::SetCoverage(1u<<rule_off,-1,1,int(rule_off),false);  // the class moved again later
+        const auto demoted=frame_with(13);
+        std::printf("coverage trial (dx12): rule_off left %llu; copy reader %.0f/%.0f left, %.0f/%.0f moved by the Referee (%llu draws), "
+                    "%.0f/%.0f after its pipeline was put back\n",(unsigned long long)left_rule_off,still.first,still.second,moved.first,moved.second,
+                    (unsigned long long)moved_draws,demoted.first,demoted.second);
+        CHECK(left_rule_off>=1);
+        CHECK(still.first==0.f&&still.second==0.f);
+        CHECK(moved.first==1.f&&moved.second==1.f&&moved_draws>=1);
+        CHECK(demoted.first==0.f&&demoted.second==0.f);
+        na::observe::SetCoverage(0,-1,1,int(rule_off),false);
+    }
     CHECK(dev->GetDeviceRemovedReason()==S_OK);na_observe_stop();na::observe::SetProcessExiting();
     return test::finish("shader_depth_jitter_test");
 }

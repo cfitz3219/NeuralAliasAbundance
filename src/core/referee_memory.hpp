@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/referee_coverage.hpp"
 #include "core/referee_recovery.hpp"
 
 #include <cstdio>
@@ -26,7 +27,8 @@ namespace na::referee {
 // the runtime changed (the two identity strings below), or the schema did.
 class Memory {
 public:
-    static constexpr unsigned schema = 1;
+    // Schema 2 (2026-11-27): also the coverage trial's classes (core/referee_coverage.hpp), as "c" rows.
+    static constexpr unsigned schema = 2;
     static constexpr unsigned apis = 2, stages = 3, tools = 5;
     struct Entry {
         uint32_t kept = 0, harm = 0, inconclusive = 0;
@@ -37,7 +39,28 @@ public:
     bool Empty() const
     {
         for (const auto& e : entries_) if (e.kept || e.harm || e.inconclusive) return false;
+        for (const auto& e : coverage_) if (e.kept || e.harm) return false;
         return true;
+    }
+    // VARIANT: referee/coverage-trial: a class of draws left off the jitter was kept on the sample, or put back.
+    bool NoteCoverage(bool dx12, unsigned cls, bool kept)
+    {
+        if (cls >= kLeftClasses) return false;
+        auto& e = coverage_[(dx12 ? 1u : 0u) * kLeftClasses + cls];
+        constexpr uint32_t limit = 1000000;
+        if (kept) { if (e.kept < limit) ++e.kept; }
+        else if (e.harm < limit) ++e.harm;
+        return true;
+    }
+    // Classes put back and never kept in earlier launches: tried after the others (hints, never verdicts).
+    uint32_t CoverageAvoided(bool dx12) const
+    {
+        uint32_t bits = 0;
+        for (unsigned c = 0; c < kLeftClasses; ++c) {
+            const auto& e = coverage_[(dx12 ? 1u : 0u) * kLeftClasses + c];
+            if (e.harm && !e.kept) bits |= 1u << c;
+        }
+        return bits;
     }
     // Returns true when the record changed and should be saved.
     bool Note(bool dx12, FlickerStage stage, RecoveryTool tool, TrialOutcome outcome, float reduction = -1.f)
@@ -89,6 +112,11 @@ public:
             out << i / (stages * tools) << ' ' << i / tools % stages << ' ' << i % tools << ' '
                 << e.kept << ' ' << e.harm << ' ' << e.inconclusive << ' ' << reduction << '\n';
         }
+        for (unsigned i = 0; i < coverage_.size(); ++i) {
+            const auto& e = coverage_[i];
+            if (!e.kept && !e.harm) continue;
+            out << "c " << i / kLeftClasses << ' ' << i % kLeftClasses << ' ' << e.kept << ' ' << e.harm << '\n';
+        }
         return out.str();
     }
     enum class Load { Loaded, Missing, Invalid, Stale };
@@ -107,6 +135,18 @@ public:
         for (unsigned lines = 0;; ++lines) {
             unsigned api = 0, stage = 0, tool = 0;
             Entry e;
+            in >> std::ws;
+            if (in.peek() == 'c') {
+                char tag = 0;
+                unsigned capi = 0, cls = 0;
+                Entry ce;
+                in >> tag >> capi >> cls >> ce.kept >> ce.harm;
+                if (!in || capi >= apis || cls >= kLeftClasses) return Load::Invalid;
+                auto& slot = read.coverage_[capi * kLeftClasses + cls];
+                if (slot.kept || slot.harm) return Load::Invalid;
+                slot = ce;
+                continue;
+            }
             in >> api;
             if (in.eof() && in.fail()) break;
             in >> stage >> tool >> e.kept >> e.harm >> e.inconclusive >> e.reduction;
@@ -146,6 +186,7 @@ private:
         return bits;
     }
     std::array<Entry, apis * stages * tools> entries_{};
+    std::array<Entry, apis * kLeftClasses> coverage_{};
 };
 
 } // namespace na::referee

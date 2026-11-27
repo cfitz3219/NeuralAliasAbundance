@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include "core/referee_coverage.hpp"
 
 namespace na::referee { struct TrialSample; struct PlacementScope; enum class RecoveryTool : uint8_t; }
 
@@ -205,6 +206,14 @@ void SetSceneOverlayJitter(bool on, const char* why);
 bool SceneOverlayJitter();
 void ForceSceneOverlayJitterForTests(int forced); // -1: the Referee decides; 0: the earlier rule; 1: overlays
 uint32_t UnjitteredSceneMeshes();
+// VARIANT: referee/coverage-trial (core/referee_coverage.hpp): this frame's untested scene-colour draws left off
+// the jitter by the Referee's class; the classes the Referee moves onto the sample, the one on trial, and its last
+// decision (a put-back trial's draw signatures stay on the game's grid from then on).
+void LeftByClass(uint64_t (&out)[na::referee::kLeftClasses]);
+void SetCoverage(uint32_t mask, int trial, uint64_t decisions, int last_class, bool last_kept);
+struct CoverageStats { uint32_t mask = 0; int trial = -1; uint64_t moved_draws = 0, left_by_signature = 0; size_t still_signatures = 0;
+                       uint64_t left_total[na::referee::kLeftClasses] = {}; };
+CoverageStats GetCoverageStats();
 uint32_t OverlayMeshesMoved(); // this frame's overlay meshes that took the sample
 // Coarse shading on the scene's draws (the fold, core/fold_shading.hpp; native11/coarse11.hpp): from the
 // next frame, the draws that take the scene's sample (or, with no sample, the depth-tested draws into

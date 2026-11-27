@@ -468,6 +468,11 @@ if(NA_HAVE_NGX_LIB)
            COMMAND dlss_real_test "${CMAKE_CURRENT_BINARY_DIR}/dlss-stationary-test" --stationary)
   set_tests_properties(host_dlss_stationary_stability_test
     PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+  # VARIANT jitter/ramp-after-restart: the wobble after a history restart, full jitter against the ramp.
+  add_test(NAME host_dlss_restart_wobble_test
+           COMMAND dlss_real_test "${CMAKE_CURRENT_BINARY_DIR}/dlss-restart-test" --restart-wobble)
+  set_tests_properties(host_dlss_restart_wobble_test
+    PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   if(NA_DLSS_DLL)
     add_custom_command(TARGET dlss_real_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")
@@ -565,6 +570,18 @@ if(TARGET host_native11)
     add_test(NAME host_native11_fg_x2_quality_test COMMAND native11_dlaa_test --fg-x2-quality)
     add_test(NAME host_native11_fg_x2_performance_test COMMAND native11_dlaa_test --fg-x2-performance)
     set_tests_properties(host_native11_fg_x2_quality_test host_native11_fg_x2_performance_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    # x2 with map names drawn after the hand-over that move with a panning map (hudpaste/moves-with-scene),
+    # at three pan speeds, and the same pasted the T2 way (hudpaste/screen-fixed) for the before figures.
+    foreach(speed IN ITEMS slow mid fast)
+      if(speed STREQUAL "mid")
+        set(names_arg "--fg-x2-names")
+      else()
+        set(names_arg "--fg-x2-names-${speed}")
+      endif()
+      add_test(NAME host_native11_fg_x2_names_${speed}_test COMMAND native11_dlaa_test ${names_arg})
+      add_test(NAME host_native11_fg_x2_names_${speed}_t2_test COMMAND native11_dlaa_test ${names_arg}-t2)
+      set_tests_properties(host_native11_fg_x2_names_${speed}_test host_native11_fg_x2_names_${speed}_t2_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+    endforeach()
     # The same in the automatic-API mode (graphics API found at the first present, proxy from chain creation),
     # an interface drawn through deferred contexts (x2 waits with the plain reason), and a chain made before the takeover.
     add_test(NAME host_native11_fg_x2_auto_test COMMAND native11_dlaa_test --fg-x2-auto)
@@ -614,6 +631,19 @@ if(TARGET host_native11)
       set_tests_properties(host_native11_dlaa_camera_off_start_companion_test PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
         LABELS "host;gpu;nvidia" ENVIRONMENT "NA_DLAA_COMPANION=1")
     endif()
+  elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # Gap audit 2026-11-21 item 12: the real 32-bit arrangement. A Win32 host never links the
+    # DLSS library; DLSS runs in the 64-bit companion. Before running, put NeuralAliasDlaa64.exe
+    # (from an x64 build of the same commit) and nvngx_dlss.dll beside native11_dlaa_test.exe.
+    # These are the same on-screen Referee cases the x64 build runs with NA_DLAA_COMPANION=1.
+    na_host_test(native11_dlaa_test SOURCES native11/provider_test.cpp LIBS host_dx12 LABELS "gpu;nvidia")
+    target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
+    add_test(NAME host_native11_dlaa_win32_route_trial_test COMMAND native11_dlaa_test --lit-role-trial)
+    add_test(NAME host_native11_dlaa_win32_route_trial_disagreeing_scene_test COMMAND native11_dlaa_test --lit-role-trial-disagreeing-scene)
+    add_test(NAME host_native11_dlaa_win32_parity_lighting_test COMMAND native11_dlaa_test --lit-role-parity)
+    set_tests_properties(host_native11_dlaa_win32_route_trial_test host_native11_dlaa_win32_route_trial_disagreeing_scene_test
+      host_native11_dlaa_win32_parity_lighting_test
+      PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   endif()
 endif()
 # C8b: a frame with known passes must come back as exactly those ops (ABI 0.2).
@@ -687,6 +717,8 @@ set_tests_properties(host_overlay_menu_failure_test PROPERTIES TIMEOUT 30 SKIP_R
 na_host_test(presenter_ownership_test SOURCES presenter_ownership_test.cpp LIBS host_dx12 user32)
 # Live Frame Generation T2 HUD paste on the GPU equals the CPU reference (WARP when no GPU).
 na_host_test(fg_hud_paste_test SOURCES fg_hud_paste_test.cpp LIBS host_dx12 d3d12 dxgi LABELS gpu)
+# VARIANT hudpaste/moves-with-scene: interface anchored to a panning map placed at the generated picture's time.
+na_host_test(fg_hud_move_test SOURCES fg_hud_move_test.cpp LIBS host_dx12 d3d12 dxgi d3dcompiler LABELS gpu)
 # Live x2 still-area steadying equals Astra's reference shader; motion fill and dead zone (WARP when no GPU).
 na_host_test(fg_steady_pass_test SOURCES fg_steady_pass_test.cpp LIBS host_dx12 d3d12 dxgi d3dcompiler LABELS gpu)
 # Live Frame Generation: the HUD sheet state at the final draw from same-recording barriers only (WARP).

@@ -184,7 +184,7 @@ add_library(host_settings STATIC src/host_dx12/settings.cpp)
 target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole32)
 
 add_library(host_capture STATIC src/host_dx12/capture/frame_capture.cpp src/host_dx12/capture/j2_capture.cpp src/host_dx12/capture/capture_session.cpp
-  src/host_dx12/capture/referee_gpu.cpp)
+  src/host_dx12/capture/referee_gpu.cpp src/host_dx12/capture/referee_route_a.cpp)
 target_link_libraries(host_capture PUBLIC abundance_options d3d12 dxgi PRIVATE host_settings d3dcompiler shell32 ole32)
 include(cmake/referee_shaders.cmake)
 
@@ -234,6 +234,7 @@ add_library(host_dx12 STATIC
   src/host_dx12/fg/camera.cpp
   src/host_dx12/fg/frame_gen.cpp
   src/host_dx12/fg/hud_paste.cpp
+  src/host_dx12/fg/hud_move.cpp
   src/host_dx12/fg/steady_pass.cpp
   src/host_dx12/fg/motion_prep.cpp
   src/host_dx12/fg/preset_profile.cpp

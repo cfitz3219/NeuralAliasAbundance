@@ -107,6 +107,14 @@ void gs_passthrough(triangle GsVertex input[3], inout TriangleStream<GsVertex> o
     [unroll] for (uint i = 0; i < 3; ++i) output.Append(input[i]);
 }
 float4 ps_scene(float4 p : SV_Position) : SV_Target { return float4(0.25, 0.5, 0.75, 1.0); }
+// The names fixture's map: a textured map panned by offset.z pixels, with a unit at x = offset.w moving against the pan.
+float4 ps_map(float4 p : SV_Position) : SV_Target {
+    if (p.x >= offset.w && p.x < offset.w + 64.0 && p.y >= 600.0 && p.y < 640.0) return float4(0.7, 0.08, 0.06, 1.0);
+    float x = p.x + offset.z, y = p.y;
+    float v = 0.12 + 0.06 * sin(x * 0.21) * cos(y * 0.17) + 0.04 * sin((x + y) * 0.05);
+    if (fmod(abs(x * 0.7 + y * 0.3), 40.0) < 1.6) v += 0.1;
+    return float4(v * 0.9, v * 1.1, v * 0.8, 1.0);
+}
 float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_letterbox(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(0,2), 0)); }
@@ -243,7 +251,14 @@ struct Game {
     DXGI_FORMAT back_format = DXGI_FORMAT_R8G8B8A8_UNORM; // the swap chain's format
     ComPtr<ID3D11RasterizerState> hud_scissor;            // set: the HUD covers only kHudRect
     ID3D11Query* main_stats = nullptr;                    // set: pipeline statistics around the main scene's draws only
-    ComPtr<ID3D11PixelShader> ps_scene_main, ps_hud_main;  // set: the main scene's and the HUD's shading (fold fixture)
+    ComPtr<ID3D11PixelShader> ps_scene_main, ps_hud_main;
+    // The x2 names fixture (--fg-x2-names*): a map panned `pan` pixels a frame and names drawn after the hand-over
+    // that move with it (and the HUD panel that does not).
+    ComPtr<ID3D11PixelShader> ps_map;
+    ComPtr<ID3D11RasterizerState> names_rs; // no culling, no scissor: the full-screen passes and the names are drawn
+    bool names = false;
+    float pan = 0;
+    int frame_now = 0;  // set: the main scene's and the HUD's shading (fold fixture)
     ComPtr<ID3D11UnorderedAccessView> count_uav;           // set: their invocations, counted (u1)
     ComPtr<ID3D11RasterizerState> scene_rs;                // set: the main scene drawn with no face culling (its quads face away)
     // The interface recorded on a deferred context and run by the immediate one (multithreaded DX11):
@@ -517,6 +532,23 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false, boo
     c->ClearRenderTargetView(rt, clear);
     c->ClearDepthStencilView(g.dsv.Get(), g.shader_depth ? D3D11_CLEAR_DEPTH : D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
     Viewport(c, g.w, g.h);
+    if (g.names && g.ps_map) { // the names fixture: one depth-tested map draw (the objects after it fail the depth test)
+        g.frame_now = frame;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(c->Map(g.obj_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            const float o[4] = {0, 0, g.pan * float(frame), 200.f + 3.f * float(frame % 300)};
+            std::memcpy(m.pData, o, 16);
+            c->Unmap(g.obj_cb.Get(), 0);
+        }
+        ID3D11Buffer* ob = g.obj_cb.Get();
+        c->PSSetConstantBuffers(1, 1, &ob);
+        c->VSSetShader(g.vs_post.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_map.Get(), nullptr, 0);
+        c->RSSetState(g.names_rs.Get());
+        c->Draw(4, 0);
+        c->VSSetShader(g.vs.Get(), nullptr, 0);
+        c->PSSetShader(g.ps_scene.Get(), nullptr, 0);
+    }
     if (g.campaign_split_camera) BindSplitCamera(c, g);
     if (g.ps_scene_main) c->PSSetShader(g.ps_scene_main.Get(), nullptr, 0);
     if (g.scene_rs) c->RSSetState(g.scene_rs.Get());
@@ -600,6 +632,9 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false, boo
 
 
 constexpr LONG kHudRect[4] = {40, 30, 200, 90}; // left, top, right, bottom (the live x2 fixture's HUD panel)
+constexpr float kNameW = 48.f, kNameH = 12.f;
+float NameY(int row) { return 150.f + 150.f * float(row) + (row == 3 ? 12.f : 0.f); } // row 3 lies over the unit's path
+float NameX(const Game& g, int row, int i) { return 100.f + 160.f * float(i) + 37.f * float(row) - g.pan * float(g.frame_now); }
 void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
 {
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -620,6 +655,7 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
         return;
     }
     c->OMSetRenderTargets(1, &bb, nullptr);
+    if (g.names) c->RSSetState(g.names_rs.Get()); // the tonemap and the names (the HUD panel sets its own state)
     ID3D11ShaderResourceView* srv = g.color_srv.Get();
     c->PSSetShaderResources(0, 1, &srv);
     if (immediate) g_tonemap_bound = true;
@@ -661,6 +697,19 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
     }
     for (int i = 0; i < 6; ++i) c->Draw(4, 0);
     if (g.hud_scissor) c->RSSetState(nullptr);
+    if (g.names) { // map names: interface drawn after the hand-over, anchored to the panning map
+        c->RSSetState(g.names_rs.Get());
+        c->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+        for (int row = 0; row < 4; ++row)
+            for (int i = 0; i < 80; ++i) {
+                const float x = NameX(g, row, i), y = NameY(row);
+                if (x < -60.f || x > float(g.w) + 10.f) continue;
+                const D3D11_VIEWPORT vp{x, y, kNameW, kNameH, 0.f, 1.f};
+                c->RSSetViewports(1, &vp);
+                c->Draw(4, 0);
+            }
+        Viewport(c, g.w, g.h);
+    }
     c->OMSetBlendState(nullptr, bf, 0xffffffffu);
 }
 
@@ -2088,7 +2137,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
     // x2 together with a DLSS level (the fold): Frame Generation gets the level's folded depth and motion.
     const uint32_t fg_fold = !std::strcmp(arg1, "--fg-x2-quality") ? 1u : !std::strcmp(arg1, "--fg-x2-performance") ? 2u : 0u;
-    const bool fg_x2 = fg_x2_hdr || fg_auto != 0 || fg_fold != 0 || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
+    // The names fixture (VARIANT hudpaste/moves-with-scene): map names drawn after the hand-over that move with a
+    // panning map, under x2. --fg-x2-names[-slow|-fast][-t2]: pan 5 px a frame (1.5 slow, 16 fast); -t2 pastes the
+    // interface the T2 way (hudpaste/screen-fixed) for the before figures.
+    const char* names_arg = std::strncmp(arg1, "--fg-x2-names", 13) == 0 ? arg1 + 13 : nullptr;
+    const bool fg_names = names_arg != nullptr;
+    const bool names_t2 = fg_names && std::strstr(names_arg, "-t2") != nullptr;
+    const float names_pan = !fg_names ? 0.f : std::strstr(names_arg, "-slow") ? 1.5f : std::strstr(names_arg, "-fast") ? 16.f : 5.f;
+    const bool fg_x2 = fg_x2_hdr || fg_auto != 0 || fg_fold != 0 || fg_names || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
     const bool proxy_env_off = GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) != 0;
     // DLSS Quality / Performance on the native DX11 route (the fold: coarse shading through NVAPI, the
     // shared fold pass, the waiting period with DLAA on screen).
@@ -2149,7 +2205,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     g.padded_hdr = padded_hdr;
     if (fg_x2_hdr) g.back_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (fold_measured || overlay_level >= 0) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
+    if (fold_measured || overlay_level >= 0 || fg_names) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
     {   // NA_TEST_FOLD_SIZE=WxH: the fold fixture at another picture size (e.g. 3440x1440 for the memory figure).
         wchar_t sz[32]{};
         unsigned fw = 0, fh = 0;
@@ -2351,6 +2407,16 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             ExitProcess(g_failed ? 1u : 0u);
         }
         if (fg_fold) st.j2_fold_mode.store(fg_fold); // the level is asked for from the first frame; x2 runs beside it
+        if (fg_names) {
+            const auto code = Compile("ps_map", "ps_5_0");
+            expect(code && SUCCEEDED(g.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g.ps_map)), "the map shader");
+            D3D11_RASTERIZER_DESC nr{};
+            nr.FillMode = D3D11_FILL_SOLID; nr.CullMode = D3D11_CULL_NONE; nr.DepthClipEnable = TRUE;
+            expect(SUCCEEDED(g.device->CreateRasterizerState(&nr, &g.names_rs)), "the names fixture's rasterizer state");
+            g.names = true;
+            g.pan = names_pan;
+            st.fg_hud_move.store(names_t2 ? 0u : 1u);
+        }
         const char* fold_name = fg_fold == 2 ? "Performance" : "Quality";
         const auto fold_on_screen = [&] {
             char fs11[512]{};
@@ -2374,6 +2440,26 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             Pump();
             Scene(g.ctx.Get(), g, frame);
             Post(g.ctx.Get(), g, true);
+            if (fg_names && (frame == 3 || frame == 20)) { // what the game's own picture holds before Present (map, names)
+                ComPtr<ID3D11Texture2D> bb, stg;
+                if (SUCCEEDED(g.swap->GetBuffer(0, IID_PPV_ARGS(&bb)))) {
+                    D3D11_TEXTURE2D_DESC d{};
+                    bb->GetDesc(&d);
+                    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+                    if (SUCCEEDED(g.device->CreateTexture2D(&d, nullptr, &stg))) {
+                        g.ctx->CopyResource(stg.Get(), bb.Get());
+                        D3D11_MAPPED_SUBRESOURCE m{};
+                        if (SUCCEEDED(g.ctx->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+                            const auto px = [&](int x, int y) { const auto* p = static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch + size_t(x) * 4; return std::array<int, 3>{p[0], p[1], p[2]}; };
+                            const float nx = NameX(g, 0, 1);
+                            const auto a = px(600, 400), b = px(int(nx) + 20, 156), c = px(100, 60);
+                            std::printf("  frame %d back buffer: map (600,400) %d,%d,%d; name at x %.1f: %d,%d,%d; HUD panel %d,%d,%d\n", frame, a[0], a[1], a[2], nx,
+                                        b[0], b[1], b[2], c[0], c[1], c[2]);
+                            g.ctx->Unmap(stg.Get(), 0);
+                        }
+                    }
+                }
+            }
             g.swap->Present(0, 0);
             if (GetTickCount64() - t0 > 200) std::printf("  frame %d took %llu ms\n", frame, GetTickCount64() - t0);
             const auto pr = na::present::GetStats();
@@ -2452,6 +2538,69 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             }
             std::printf("  presented burst: %zu pictures, %u generated pictures checked, HUD pixels differing from the next real frame: %u\n", kinds.size(), checked, wrong);
             expect(checked >= 2 && wrong == 0, "the interface is exact in generated pictures (the newer real frame's own HUD)");
+            if (fg_names && bpp == 4) {
+                // Each name's centre (threshold crossings, to a fraction of a pixel) in the previous real, generated and
+                // next real pictures; the true place on the generated picture is halfway between the two real ones.
+                const auto centres = [&](const std::vector<uint8_t>& pic, int row) {
+                    std::vector<float> out;
+                    const UINT stride = UINT(pic.size() / (size_t(H) * 4));
+                    const int y = int(NameY(row) + kNameH * .5f);
+                    const auto lum = [&](int x) { const uint8_t* p = &pic[(size_t(y) * stride + size_t(x)) * 4]; return (p[0] + p[1] + p[2]) / (3.f * 255.f); };
+                    const float thr = .52f;
+                    for (int x = 1; x + 1 < int(W);) {
+                        if (lum(x) <= thr || lum(x - 1) > thr) { ++x; continue; }
+                        int e = x;
+                        while (e + 1 < int(W) && lum(e + 1) > thr) ++e;
+                        if (e - x >= 30 && x > 2 && e < int(W) - 3) {
+                            const float l0 = lum(x - 1), l1 = lum(x), r0 = lum(e), r1 = lum(e + 1);
+                            const float left = float(x - 1) + (l1 != l0 ? (thr - l0) / (l1 - l0) : 1.f);
+                            const float right = float(e) + (r1 != r0 ? (r0 - thr) / (r0 - r1) : 0.f);
+                            out.push_back(.5f * (left + right));
+                        }
+                        x = e + 1;
+                    }
+                    return out;
+                };
+                float worst = 0, sum = 0, worst_unit = 0;
+                int n = 0, n_unit = 0;
+                for (size_t i = 1; i + 1 < kinds.size(); ++i) {
+                    if (kinds[i] != "generated" || kinds[i + 1] != "next-real" || kinds[i - 1].find("real") == std::string::npos) continue;
+                    const auto prev = read(files[i - 1]), gen = read(files[i]), next = read(files[i + 1]);
+                    if (prev.size() != gen.size() || next.size() != gen.size() || gen.empty()) continue;
+                    for (int row = 0; row < 4; ++row) {
+                        const auto cp = centres(prev, row), cg = centres(gen, row), cn = centres(next, row);
+                        for (const float x : cg) {
+                            float bp = 1e9f, bn = 1e9f;
+                            for (const float p : cp) if (std::fabs(p - x) < std::fabs(bp - x)) bp = p;
+                            for (const float q : cn) if (std::fabs(q - x) < std::fabs(bn - x)) bn = q;
+                            if (std::fabs(bp - bn) > 2.f * g.pan + 4.f || std::fabs(bp - x) > g.pan + 4.f) continue; // not the same name
+                            if (std::fabs((bp - bn) - g.pan) > 1.f) continue; // the two real pictures are not consecutive frames (one was not shown)
+                            if (x > kHudRect[0] - 60 && x < kHudRect[2] + 60 && row == 0) continue;
+                            const float err = std::fabs(x - .5f * (bp + bn));
+                            if (err > .6f) std::printf("    name row %d at x %.2f: previous %.2f, next %.2f, error %.2f px (picture %zu)\n", row, x, bp, bn, err, i);
+                            if (row == 3) { worst_unit = (std::max)(worst_unit, err); ++n_unit; }
+                            worst = (std::max)(worst, err);
+                            sum += err;
+                            ++n;
+                        }
+                    }
+                }
+                const auto ls = na::present::GetLiveStats();
+                std::printf("  names (%s, pan %.1f px a frame): %d measured, mean error %.2f px, worst %.2f px (row over the moving unit: %d, worst %.2f px); "
+                            "hud_move frames %llu, pictures %llu, tiles moving %llu fixed %llu, mean shift %.2f px, pasted T2 pair=%llu reset=%llu motion=%llu off=%llu size=%llu\n",
+                            names_t2 ? "hudpaste/screen-fixed, before" : "hudpaste/moves-with-scene, after", g.pan, n, n ? sum / n : 0.f, worst, n_unit, worst_unit,
+                            static_cast<unsigned long long>(ls.move_frames), static_cast<unsigned long long>(ls.move_pictures),
+                            static_cast<unsigned long long>(ls.move_tiles_moving), static_cast<unsigned long long>(ls.move_tiles_fixed), ls.move_shift_px,
+                            static_cast<unsigned long long>(ls.move_fb_pair), static_cast<unsigned long long>(ls.move_fb_reset),
+                            static_cast<unsigned long long>(ls.move_fb_motion), static_cast<unsigned long long>(ls.move_fb_off),
+                            static_cast<unsigned long long>(ls.move_fb_size));
+                expect(n >= 4, "names were measured on generated pictures");
+                if (names_t2) expect(n && sum / n > .5f * g.pan - .6f, "pasted the T2 way, the names sit about half a real-frame step away");
+                else expect(n && worst < .6f, "names that move with the map are placed at the generated picture's time (within 0.6 px)");
+            }
+            if (fg_names && GetEnvironmentVariableW(L"NA_TEST_KEEP_CAPTURE", nullptr, 0)) {
+                std::printf("  capture kept: %s\n", cap.string().c_str());
+            } else
             for (const auto& e : std::filesystem::directory_iterator(cap)) { std::error_code ec; std::filesystem::remove(e.path(), ec); }
             std::error_code ec; std::filesystem::remove(cap, ec);
         }

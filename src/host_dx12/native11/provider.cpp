@@ -48,6 +48,7 @@
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <array>
@@ -61,6 +62,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace na::native11 {
@@ -523,7 +525,82 @@ std::atomic<bool> g_vpj_overlays{true};
 uint32_t g_vpj_frame_overlay_moved = 0;
 // Untested scene meshes that kept the game's grid, by why (counted per frame for the log).
 enum StillClass : uint8_t { kStillNone = 0, kStillDeferred, kStillOtherTarget, kStillOwnViewport, kStillRuleOff, kStillOther,
-                            kStillStationarySource, kStillClasses };
+                            kStillStationarySource, kStillFullScreen, kStillClasses };
+// VARIANT: referee/coverage-trial: the Referee's class (core/referee_coverage.hpp LeftClass) of a StillClass.
+int CoverageClassOf(uint8_t still)
+{
+    using L = na::referee::LeftClass;
+    switch (still) {
+    case kStillOtherTarget: return int(L::OtherTarget);
+    case kStillOwnViewport: return int(L::OwnViewport);
+    case kStillRuleOff: return int(L::RuleOff);
+    case kStillStationarySource: return int(L::StationarySource);
+    case kStillDeferred: return int(L::Deferred);
+    case kStillOther: return int(L::Other);
+    case kStillFullScreen: return int(L::FullScreen);
+    default: return -1;
+    }
+}
+const char* StillClassName(uint8_t still)
+{
+    const int c = CoverageClassOf(still);
+    return c >= 0 ? na::referee::LeftClassName(unsigned(c)) : "none";
+}
+// The classes the Referee moves onto the sample (kept, or on trial), the one on trial, and the draw signatures:
+// moved during the current trial, and put back by an earlier one (those stay on the game's grid).
+std::atomic<uint32_t> g_cov_mask{0};
+std::atomic<int> g_cov_trial{-1};
+std::mutex g_cov_m;
+std::unordered_set<uint64_t> g_cov_trial_sigs, g_cov_still_sigs; // under g_cov_m
+uint64_t g_cov_decisions = 0;                                    // under g_cov_m
+std::atomic<uint64_t> g_cov_moved{0}, g_cov_kept_still{0};
+std::atomic<uint64_t> g_cov_left_total[8]{}; // every frame's left-off draws by LeftClass, summed (tests, log)
+uint64_t CoverageSignature(const void* pixel_shader, uint64_t vertices, uint8_t still)
+{
+    return (reinterpret_cast<uintptr_t>(pixel_shader) * 1099511628211ull) ^ (vertices << 8) ^ still;
+}
+// WHY log (owed 2026-11-27): once a minute, every scene-colour draw of one frame left off the jitter, named.
+std::atomic<bool> g_left_name_frame{false};
+// WHY log (owed 2026-11-27): our CPU time on the game's thread, timed on one frame in eight (the timer itself costs):
+// camera finding and constant-upload keeping (camera), our own work around each draw call (draw_ours, the game's
+// draw call itself excluded, which is draw_driver). Reported per timed frame in milliseconds.
+std::atomic<bool> g_time_frame{false};
+std::atomic<uint64_t> g_tsc_camera{0}, g_tsc_draw_ours{0}, g_tsc_draw_driver{0}, g_timed_frames{0};
+std::atomic<uint64_t> g_cal_tsc0{0}, g_cal_qpc0{0};
+struct TscScope {
+    uint64_t t0;
+    std::atomic<uint64_t>& acc;
+    explicit TscScope(std::atomic<uint64_t>& a) : t0(g_time_frame.load(std::memory_order_relaxed) ? __rdtsc() : 0), acc(a) {}
+    ~TscScope() { if (t0) acc.fetch_add(__rdtsc() - t0, std::memory_order_relaxed); }
+};
+struct DrawTimer {
+    uint64_t t0 = g_time_frame.load(std::memory_order_relaxed) ? __rdtsc() : 0, driver = 0;
+    ~DrawTimer()
+    {
+        if (!t0) return;
+        const uint64_t all = __rdtsc() - t0;
+        g_tsc_draw_ours.fetch_add(all > driver ? all - driver : 0, std::memory_order_relaxed);
+        g_tsc_draw_driver.fetch_add(driver, std::memory_order_relaxed);
+    }
+};
+struct DriverScope {
+    DrawTimer& t;
+    uint64_t t0;
+    explicit DriverScope(DrawTimer& timer) : t(timer), t0(timer.t0 ? __rdtsc() : 0) {}
+    ~DriverScope() { if (t0) t.driver += __rdtsc() - t0; }
+};
+double TscPerMs()
+{
+    LARGE_INTEGER q{}, f{};
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&f);
+    const uint64_t t0 = g_cal_tsc0.load(), q0 = g_cal_qpc0.load();
+    if (!t0 || !f.QuadPart || uint64_t(q.QuadPart) <= q0) return 0;
+    const double ms = double(uint64_t(q.QuadPart) - q0) * 1000.0 / double(f.QuadPart);
+    return ms > 100 ? double(__rdtsc() - t0) / ms : 0;
+}
+std::atomic<uint64_t> g_left_name_at{0};
+uint32_t g_left_named = 0;
 // The context's stationary layers of this frame (jitter/stationary-source-readers).
 bool StationaryHas(const Ctx* x, Id r);
 void StationaryAdd(Ctx* x, Id r);
@@ -1472,12 +1549,16 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         // WHY log: what the consumer is told the jitter was, beside what the scene draws carried.
         // The first frames of a session, then a burst of sixteen about every ten seconds, so one
         // whole jitter cycle is on record each time.
+        // After the first 1,500 lines, one a minute for the rest of the run (owed 2026-11-27: the 0f63301 run's
+        // detail stopped at 19:55, three and a half hours before the end).
         static uint32_t logged = 0;
-        static uint64_t burst_tick = 0, burst_left = 48;
+        static uint64_t burst_tick = 0, burst_left = 48, late_tick = 0;
         const uint64_t now = GetTickCount64();
         if (!burst_left && now - burst_tick >= 10000) burst_left = 16;
-        if (burst_left && logged < 1500 && (f.camera.jitter_applied || vpj_route)) {
-            if (!--burst_left) burst_tick = now;
+        const bool late = logged >= 1500 && now - late_tick >= 60000;
+        if (((burst_left && logged < 1500) || late) && (f.camera.jitter_applied || vpj_route)) {
+            if (late) late_tick = now;
+            else if (!--burst_left) burst_tick = now;
             ++logged;
             float shift[2]{};
             std::memcpy(shift, &g_vpj_executed_sample, sizeof shift);
@@ -1660,6 +1741,7 @@ void RememberSplitDraw(const Event& e, int ws, int ps, const CameraUpload& world
 void RememberSceneUploads(const Event& e, const std::vector<ExactRange>* exact = nullptr)
 {
     if (e.kind != Kind::Draw || !CameraTracking() || !g_model.IsSceneDraw(e)) return;
+    TscScope timed(g_tsc_camera);
     // Ranges read at this very draw stand for the draw's own upload version.
     std::array<CameraUpload, kCbBindSlots> exact_upload;
     if (exact) {
@@ -1710,8 +1792,24 @@ void NoteViewportDraw(const Event& e)
     if (!g_vpj_route.load(std::memory_order_relaxed) || e.kind != Kind::Draw) return;
     // WHY log: draws into the scene colour that kept the game's own viewport on a frame whose
     // depth-tested scene draws were shifted (full-screen and untested passes).
-    if (!e.viewport_sample && g_vpj_executed_sample && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed))
+    if (!e.viewport_sample && g_vpj_executed_sample && e.rt0 && e.rt0 == g_sel_color.load(std::memory_order_relaxed)) {
         ++g_vpj_frame_unshifted;
+        if (e.still_class == kStillFullScreen && g_vpj_sample.load(std::memory_order_relaxed)) ++g_vpj_frame_still_by[kStillFullScreen];
+        if (g_left_name_frame.load(std::memory_order_relaxed) && g_left_named < 32) {
+            ++g_left_named;
+            const bool live = g_vpj_sample.load(std::memory_order_relaxed) != 0;
+            na::eventlog::Emit("native11_left_draw",
+                "frame=%llu class=%s vertices=%llu depth_test=%d depth_bound=%s rt_count=%u deferred_list=%d why=\"%s\"",
+                static_cast<unsigned long long>(g_frame), !live ? "after_handover" : e.still_class ? StillClassName(e.still_class) : "tested_or_other",
+                static_cast<unsigned long long>(e.vertices), e.depth_test ? 1 : 0,
+                !e.depth ? "none" : e.depth == g_sel_depth.load(std::memory_order_relaxed) ? "scene" : "other", unsigned(e.rt_count),
+                e.still_class == kStillDeferred ? 1 : 0,
+                !live ? "drawn into the scene colour after the hand-over: not part of what DLSS resolves, left on the game's grid by design"
+                : e.still_class == kStillFullScreen ? "a full-screen pass (the coverage trial tries it last)"
+                : e.still_class ? "an untested scene mesh the overlay rule left on the game's grid (the coverage trial may move its class)"
+                : "kept the game's viewport for another reason");
+        }
+    }
     if (e.viewport_sample) {
         g_vpj_frame_shader_depth += e.viewport_shader_depth ? 1u : 0u;
         g_vpj_frame_still_moved += e.viewport_still_mesh ? 1u : 0u;
@@ -1920,10 +2018,36 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x, uint64_t vertices = 0)
             x->vpj_still_class = x->deferred ? kStillDeferred : !o.scene_colour ? kStillOtherTarget : !o.scene_viewport ? kStillOwnViewport
                                : !o.enabled ? kStillRuleOff : o.reads_stationary_layer ? kStillStationarySource : kStillOther;
     }
+    // A full-screen pass into the scene colour while the sample is in force (before the hand-over): left still by
+    // design; the Referee's coverage trial may try it, last.
+    bool force = false;
+    if (on && !x->depth_test && !x->vpj_shader_depth && !x->vpj_still_mesh && !x->vpj_overlay && vertices && vertices <= kFullScreenPassVertices) {
+        const Id colour = g_sel_color.load(std::memory_order_relaxed);
+        if (colour && x->rt0 == colour) x->vpj_still_class = kStillFullScreen;
+    }
+    // VARIANT: referee/coverage-trial: the classes the Referee moves onto the sample, draw signature by draw signature.
+    if (on && x->vpj_still_class != kStillNone) {
+        const uint32_t mask = g_cov_mask.load(std::memory_order_acquire);
+        const int cls = CoverageClassOf(x->vpj_still_class);
+        if (cls >= 0 && (mask >> unsigned(cls)) & 1u) {
+            const uint64_t sig = CoverageSignature(x->pixel_shader, vertices, x->vpj_still_class);
+            std::lock_guard<std::mutex> lock(g_cov_m);
+            if (g_cov_still_sigs.count(sig)) {
+                g_cov_kept_still.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (g_cov_trial.load(std::memory_order_relaxed) == cls) g_cov_trial_sigs.insert(sig);
+                g_cov_moved.fetch_add(1, std::memory_order_relaxed);
+                if (x->vpj_still_class == kStillFullScreen) force = true;
+                else x->vpj_overlay = true;
+                x->vpj_still_class = kStillNone;
+            }
+        }
+    }
     const bool tests_scene_depth = x->depth_test || x->vpj_shader_depth || x->vpj_still_mesh || x->vpj_overlay;
     const bool scene = on && scene_depth && x->depth == scene_depth && tests_scene_depth;
     if (scene && !x->vp_n) g_vpj_unknown.fetch_add(1, std::memory_order_relaxed);
-    const bool want = WantsViewportJitter(on, x->depth, scene_depth, tests_scene_depth, x->vp_n);
+    const bool want = WantsViewportJitter(on, x->depth, scene_depth, tests_scene_depth, x->vp_n) ||
+                      (on && x->vp_n && (force || (x->vpj_overlay && x->depth != scene_depth)));
     x->vpj_want = want;
     const UINT n = x->vp_n;
     if (want) {
@@ -2107,6 +2231,7 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
     e.still_class = x->vpj_still_class;
     const bool camera_tracking = CameraTracking();
     if (camera_tracking) {
+        TscScope timed(g_tsc_camera);
         std::memcpy(e.cb, x->cb, sizeof(e.cb));
         for (int i = 0; i < kCbBindSlots; ++i) {
             e.cb_first[i] = static_cast<uint16_t>(x->cb_first[i]);
@@ -2142,7 +2267,7 @@ Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
         }
     }
     ExactSet exact;
-    if ((picture_draw || layer_draw) && camera_tracking) exact = ExactForDraw(c, x); // camera bytes: not read when no camera is looked for
+    if ((picture_draw || layer_draw) && camera_tracking) { TscScope timed(g_tsc_camera); exact = ExactForDraw(c, x); } // camera bytes: not read when no camera is looked for
     Emit(x, c, e, {}, exact);
     if (!x->deferred) refresh_samplers(); // this draw may be the first after the scene (the HUD rules hand over inside Emit)
     return x;
@@ -2835,51 +2960,58 @@ void ReplayAfterDraw(ID3D11DeviceContext* c, Ctx* x, const draw_replay::DrawArgs
 }
 void STDMETHODCALLTYPE DrawIndexed_d(ID3D11DeviceContext* c, UINT count, UINT start, INT base)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, count, false);
     HudFreeBeforeDraw(c, x, {true, false, count, 1, start, 0, base});
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed(c, count, start, base); });
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_indexed(c, count, start, base); });
     ReplayAfterDraw(c, x, {true, false, count, 1, start, 0, base});
 }
 void STDMETHODCALLTYPE Draw_d(ID3D11DeviceContext* c, UINT count, UINT start)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, count, false);
     HudFreeBeforeDraw(c, x, {false, false, count, 1, start, 0, 0});
-    ForwardGameDraw(c, x, [&] { O(c, x).draw(c, count, start); });
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw(c, count, start); });
     ReplayAfterDraw(c, x, {false, false, count, 1, start, 0, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, INT base, UINT start_inst)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
     HudFreeBeforeDraw(c, x, {true, false, count, inst, start, start_inst, base});
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_indexed_instanced(c, count, inst, start, base, start_inst); });
     if (inst) ReplayAfterDraw(c, x, {true, false, count, inst, start, start_inst, base});
 }
 void STDMETHODCALLTYPE DrawInstanced_d(ID3D11DeviceContext* c, UINT count, UINT inst, UINT start, UINT start_inst)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, uint64_t(count) * (inst ? inst : 1), false);
     HudFreeBeforeDraw(c, x, {false, false, count, inst, start, start_inst, 0});
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_instanced(c, count, inst, start, start_inst); });
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_instanced(c, count, inst, start, start_inst); });
     if (inst) ReplayAfterDraw(c, x, {false, false, count, inst, start, start_inst, 0});
 }
 void STDMETHODCALLTYPE DrawIndexedInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, 0, true);
     HudFreeBeforeDraw(c, x, {true, true});
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_indexed_indirect(c, b, off); });
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_indexed_indirect(c, b, off); });
     ReplayAfterDraw(c, x, {true, true});
 }
 void STDMETHODCALLTYPE DrawInstancedIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, 0, true);
     HudFreeBeforeDraw(c, x, {false, true});
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_indirect(c, b, off); });
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_indirect(c, b, off); });
     ReplayAfterDraw(c, x, {false, true});
 }
 void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
 {
+    DrawTimer timer;
     Ctx* x = DrawEvent(c, 0, true);
     HudFreeBeforeDraw(c, x, {false, true});
-    ForwardGameDraw(c, x, [&] { O(c, x).draw_auto(c); });
+    ForwardGameDraw(c, x, [&] { DriverScope drv(timer); O(c, x).draw_auto(c); });
     ReplayAfterDraw(c, x, {false, true});
 }
 void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
@@ -2898,6 +3030,7 @@ HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT 
     const HRESULT hr = O(c, x).map(c, r, sub, type, flags, m);
     if (x && CameraTracking() && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
                                     type == D3D11_MAP_READ_WRITE)) {
+        TscScope timed(g_tsc_camera);
         const Id id = IdOf(r);
         UINT size = 0;
         if (IsCandidate(id) && IsConstantBuffer(r, &size)) {
@@ -2925,6 +3058,7 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
             O(c, x).unmap(c, r, sub);
             return;
         }
+        TscScope timed(g_tsc_camera);
         UINT size = 0;
         bool cb = false;
         {
@@ -2955,6 +3089,7 @@ void STDMETHODCALLTYPE Unmap_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT s
 void UpdateCommon(ID3D11DeviceContext* c, Ctx* x, ID3D11Resource* r, const D3D11_BOX* box, const void*& src, std::vector<uint8_t>& tmp)
 {
     if (!x || !r || !src || !CameraTracking()) return;
+    TscScope timed(g_tsc_camera);
     UINT size = 0;
     bool cb = false;
     {
@@ -3468,9 +3603,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         char why[224];
         switch (refused.why) {
         case FrameModel::NoScene::Multisampled:
-            std::snprintf(why, sizeof why,
-                "The game's own anti-aliasing is on (scene picture %ux multisampled, %ux%u inside a %ux%u screen): DLAA needs it off in the game's settings.",
-                refused.samples, refused.width, refused.height, refused.screen_width, refused.screen_height);
+            std::snprintf(why, sizeof why, "%s", "NeuralAlias cannot run DLAA on top of in-game anti-aliasing. Please disable all in-game AA.");
             break;
         default:
             std::snprintf(why, sizeof why,
@@ -3721,7 +3854,28 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_vpj_frame_shifted_vertices = g_vpj_frame_still_vertices = 0;
     g_vpj_frame_still_meshes = g_vpj_frame_still_untested = g_vpj_frame_shader_depth = g_vpj_frame_still_moved = 0;
     g_vpj_frame_overlay_moved = 0;
+    for (uint8_t sc = 0; sc < kStillClasses; ++sc) {
+        const int cls = CoverageClassOf(sc);
+        if (cls >= 0 && g_vpj_frame_still_by[sc]) g_cov_left_total[cls].fetch_add(g_vpj_frame_still_by[sc], std::memory_order_relaxed);
+    }
     for (auto& n : g_vpj_frame_still_by) n = 0;
+    {   // once a minute, one frame's draws left off the jitter are named in the log (native11_left_draw)
+        const uint64_t tick = GetTickCount64();
+        const bool name = tick - g_left_name_at.load(std::memory_order_relaxed) >= 60000;
+        if (name) g_left_name_at.store(tick, std::memory_order_relaxed);
+        g_left_name_frame.store(name, std::memory_order_relaxed);
+        g_left_named = 0;
+        static uint64_t frames = 0;
+        if (!g_cal_tsc0.load(std::memory_order_relaxed)) {
+            LARGE_INTEGER q{};
+            QueryPerformanceCounter(&q);
+            g_cal_qpc0.store(uint64_t(q.QuadPart));
+            g_cal_tsc0.store(__rdtsc());
+        }
+        const bool timed = (++frames & 7) == 0;
+        g_time_frame.store(timed, std::memory_order_relaxed);
+        if (timed) g_timed_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     g_vpj_seen_draw = g_vpj_mixed = false;
     g_vpj_executed_sample = 0;
     g_vpj_executed_expanded = false;
@@ -4091,6 +4245,42 @@ void SetSceneOverlayJitter(bool on, const char* why)
 }
 bool SceneOverlayJitter() { return g_vpj_overlays.load(std::memory_order_relaxed); }
 uint32_t UnjitteredSceneMeshes() { return g_vpj_frame_still_meshes; }
+void LeftByClass(uint64_t (&out)[na::referee::kLeftClasses])
+{
+    for (auto& n : out) n = 0;
+    for (uint8_t s = 0; s < kStillClasses; ++s) {
+        const int c = CoverageClassOf(s);
+        if (c >= 0) out[c] += g_vpj_frame_still_by[s];
+    }
+}
+void SetCoverage(uint32_t mask, int trial, uint64_t decisions, int last_class, bool last_kept)
+{
+    g_cov_mask.store(mask, std::memory_order_release);
+    g_cov_trial.store(trial, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_cov_m);
+    if (decisions == g_cov_decisions) return;
+    g_cov_decisions = decisions;
+    // The trial's draw signatures: put back with their class, they stay on the game's grid from now on
+    // (a later trial of the same class moves only the others); kept, the class mask moves them.
+    if (!last_kept && last_class >= 0) g_cov_still_sigs.insert(g_cov_trial_sigs.begin(), g_cov_trial_sigs.end());
+    na::eventlog::Emit("native11_coverage", "decision=%llu class=%s %s signatures=%zu still_signatures=%zu moved_draws=%llu left_by_signature=%llu",
+                       static_cast<unsigned long long>(decisions), na::referee::LeftClassName(unsigned(last_class)),
+                       last_kept ? "kept" : "put_back", g_cov_trial_sigs.size(), g_cov_still_sigs.size(),
+                       static_cast<unsigned long long>(g_cov_moved.load()), static_cast<unsigned long long>(g_cov_kept_still.load()));
+    g_cov_trial_sigs.clear();
+}
+CoverageStats GetCoverageStats()
+{
+    CoverageStats s;
+    s.mask = g_cov_mask.load();
+    s.trial = g_cov_trial.load();
+    s.moved_draws = g_cov_moved.load();
+    s.left_by_signature = g_cov_kept_still.load();
+    for (unsigned c = 0; c < na::referee::kLeftClasses; ++c) s.left_total[c] = g_cov_left_total[c].load();
+    std::lock_guard<std::mutex> lock(g_cov_m);
+    s.still_signatures = g_cov_still_sigs.size();
+    return s;
+}
 uint32_t OverlayMeshesMoved() { return g_vpj_frame_overlay_moved; }
 
 void SetSceneCoarseShading(uint32_t rate) { g_coarse.store(rate, std::memory_order_relaxed); }
@@ -4168,6 +4358,8 @@ int FormatStatus(char* out, unsigned long n)
             if (g_backbuffer) is_backbuffer = selection.color == g_backbuffer ? 1 : 0;
         }
     }
+    const double tsc_ms = TscPerMs();
+    const auto cpu_ms = [&](const std::atomic<uint64_t>& t) { const uint64_t f = g_timed_frames.load(); return tsc_ms > 0 && f ? double(t.load()) / tsc_ms / double(f) : 0.0; };
     const int head = std::snprintf(out, n,
                          "native11 frames=%llu fired=%llu missed=%llu unplaceable=%llu contradictions=%llu selection_changes=%llu "
                          "camera_found=%llu camera_missing=%llu camera_held=%llu jitter_written=%llu "
@@ -4179,7 +4371,7 @@ int FormatStatus(char* out, unsigned long n)
                          "viewport_jitter{route=%d on=%d frames=%llu scene_draws=%llu last_frame_draws=%u sets=%llu restores=%llu unknown_viewports=%llu mixed=%llu} "
                          "exact_ranges{reads=%llu failed=%llu draws=%llu} "
                          "camera_path{steps=%llu reversals=%llu jumps=%llu} "
-                         "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu} "
+                         "jitter_told{px=%.4f,%.4f unshifted_colour_draws=%llu} cpu_ms_per_frame{camera=%.3f draw_ours=%.3f draw_driver=%.3f timed_frames=%llu} "
                          "scene{picture=%s layered_frames=%llu colour_fmt=%u colour_float=%d} "
                          "scene_boundary{selected=%llu draws=%u scene_draws=%u reads=%u after_scene_read=%u after_scene_draw=%u "
                          "learned_read=%u learned_hud=%u backbuffer=%d color_samples=%u depth_samples=%u "
@@ -4217,6 +4409,8 @@ int FormatStatus(char* out, unsigned long n)
                          static_cast<unsigned long long>(s.camera_steps), static_cast<unsigned long long>(s.camera_reversals),
                          static_cast<unsigned long long>(s.camera_jumps), told[0], told[1],
                          static_cast<unsigned long long>(g_vpj_unshifted.load()),
+                         cpu_ms(g_tsc_camera), cpu_ms(g_tsc_draw_ours), cpu_ms(g_tsc_draw_driver),
+                         static_cast<unsigned long long>(g_timed_frames.load()),
                          scene_layered ? "after-layers" : "most-drawn", static_cast<unsigned long long>(scene_layered_frames),
                          scene_format, scene_float ? 1 : 0,
                          static_cast<unsigned long long>(placement.selected_frames),

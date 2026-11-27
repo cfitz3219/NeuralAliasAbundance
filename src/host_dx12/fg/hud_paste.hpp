@@ -1,3 +1,4 @@
+// VARIANT: hudpaste/screen-fixed (see fg/hud_move.hpp for hudpaste/moves-with-scene, the default)
 // The HUD of a generated picture, exact by the T2 method (offline 2026-11-25): Frame Generation is
 // given the HUD-free picture as its back buffer, so it never warps the HUD; afterwards every pixel
 // of the generated picture within one pixel of the newer real frame's HUD is replaced by that real

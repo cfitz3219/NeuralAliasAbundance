@@ -55,7 +55,14 @@ public:
     bool NeedsReference() const {
         return phase_ == Phase::Confirm || phase_ == Phase::Reduce || phase_ == Phase::Recheck || phase_ == Phase::Keep;
     }
-    uint8_t Amount() const { return phase_ == Phase::Reduce || phase_ == Phase::Keep ? strength_ : normal_jitter; }
+    // VARIANT: referee/no-strength-reduction (coordinator 2026-11-27): the Referee never weakens the jitter.
+    // Halving it (22 times in Cort's 0f63301 Hearts of Iron IV run, 3 minutes of weaker anti-aliasing) fixed
+    // nothing; vibrating edges are answered by moving the scene draws left off the jitter onto the sample.
+    uint8_t Amount() const { return normal_jitter; }
+    // The same displayed edges vibrated twice and no scene mesh was left off the jitter by the dropout rule:
+    // the Referee's coverage trial (core/referee_coverage.hpp) tries the classes of draws left still.
+    bool ClassTrialWanted() const { return class_trial_; }
+    void ClassTrialTaken() { class_trial_ = false; }
     // Scene meshes the host left off the frame's sample on the frames being compared (0: none).
     void NoteUnjittered(uint64_t meshes) { unjittered_meshes_ = meshes; }
     // The answer to vibration when such meshes exist: the host moves them onto the sample.
@@ -72,10 +79,7 @@ public:
         if (NeedsReference() && now >= deadline_) Reject(now, "comparable raster and screen evidence expired");
         else if (phase_ == Phase::Cooldown && now >= deadline_) phase_ = Phase::Observe;
     }
-    void Bypassed(uint64_t now)
-    {
-        if (Amount() != normal_jitter) Reject(now, "the presented picture bypassed DLAA under reduced jitter");
-    }
+    void Bypassed(uint64_t) {}
     void Observe(const Measurement& m, uint8_t amount, uint64_t now)
     {
         if (amount != Amount() || !std::isfinite(m.detail) || !std::isfinite(m.shift) || phase_ == Phase::Cooldown) return;
@@ -86,79 +90,24 @@ public:
                     [](float detail) { return detail >= .02f; }) < 3) return;
             if (rejected_view_ && SameJitterPicture(reference_.image, m.image)) return;
             rejected_view_ = false;
-            strength_ = reduced_jitter;
             reference_ = m;
             candidate_ = 0;
-            Set(Phase::Confirm, now, "checking the same problem edges again before adjusting jitter");
+            Set(Phase::Confirm, now, "checking the same problem edges again before trying the draws left off the jitter");
             return;
         }
         if (m.field != reference_.field || !SameView(m)) return;
         const bool repeated = m.locked && m.shift * reference_.shift > 0.f &&
             wobble >= .70f * Baseline() && wobble <= 1.45f * Baseline();
-        if (phase_ == Phase::Confirm) {
-            if (repeated) {
-                // Edges that vibrate while scene meshes were drawn off the jitter are those meshes, not the
-                // jitter's strength: they take the frame's sample first, and strength stays as it is.
-                if (unjittered_meshes_) {
-                    move_unjittered_ = true;
-                    Reject(now, "the vibrating edges belong to scene meshes drawn off the jitter: those meshes take the frame's sample first (strength unchanged)");
-                    return;
-                }
-                Set(Phase::Reduce, now, "the same displayed edges vibrated in a second independent window (no scene mesh was left off the jitter)");
-            }
-            return;
-        }
-        if (m.field && amount != normal_jitter) {
-            // Follow the original group of problem edges. One improving edge cannot
-            // hide persistent shimmer at the other locations that triggered the test.
-            if (!reference_.witnesses.empty() && m.regional_checks*2 < reference_.witnesses.size()) return;
-            if (m.regional_worse) {
-                if (++losses_ >= 2) Reject(now, "a measured edge elsewhere became less stable");
+        if (phase_ == Phase::Confirm && repeated) {
+            // Edges that vibrate while scene meshes were drawn off the jitter are those meshes: they take the
+            // frame's sample first. Otherwise the coverage trial tries the classes of draws left still.
+            if (unjittered_meshes_) {
+                move_unjittered_ = true;
+                Reject(now, "the vibrating edges belong to scene meshes drawn off the jitter: those meshes take the frame's sample first (strength unchanged)");
                 return;
             }
-
-            unsigned common = 0;
-            bool lost = false;
-            for (unsigned i = 0; i < kTiles; ++i) {
-                const auto& a = reference_.controls;
-                const auto& b = m.controls;
-                if (!(a.output & b.output & (1u << i)) || a.detail[i] < .02f ||
-                    a.at[i].x != b.at[i].x || a.at[i].y != b.at[i].y ||
-                    (std::abs(a.at[i].x + int(kTile/2) - m.at.x) < int(kTile) &&
-                     std::abs(a.at[i].y + int(kTile/2) - m.at.y) < int(kTile))) continue;
-                ++common;
-                lost |= b.detail[i] < .95f * a.detail[i];
-            }
-            if (common < 3) return;
-            if (lost) {
-                if (++losses_ >= 2) Reject(now, "reduced jitter softened detail elsewhere on screen");
-                return;
-            }
-        }
-        if (Amount() != normal_jitter) {
-            if (m.detail < reference_.detail * .90f) {
-                if (++losses_ >= 2) Reject(now, "reduced jitter softened the problem edge");
-                return;
-            }
-            if (!Improves(wobble, Baseline()) || m.regional_improved*4 < m.regional_checks*3) {
-                if (++losses_ < 2) return;
-                if (m.field && phase_ == Phase::Reduce && strength_ == reduced_jitter &&
-                    wobble < .92f * Baseline() && !m.regional_worse) {
-                    strength_ = quarter_jitter;
-                    Set(Phase::Reduce, now, "half jitter helped but left visible movement; comparing quarter jitter");
-                } else Reject(now, "the same group of displayed edges did not improve enough");
-                return;
-            }
-            losses_ = 0;
-            if (phase_ == Phase::Keep) { deadline_ = now + comparison_ms; return; }
-            candidate_ = wobble;
-            Set(Phase::Recheck, now, "displayed edge improved and retained detail");
-            return;
-        }
-        if (repeated && Improves(candidate_, wobble)) {
-            Set(Phase::Keep, now, "the same vibration returned at normal strength");
-        } else {
-            Reject(now, "the original vibration did not repeat");
+            class_trial_ = true;
+            Reject(now, "the same displayed edges vibrated in a second independent window: the scene draws left off the jitter are tried, class by class (the jitter is never weakened)");
         }
     }
 
@@ -190,12 +139,12 @@ private:
     Measurement reference_;
     Phase phase_ = Phase::Observe;
     unsigned losses_ = 0;
-    uint8_t strength_ = reduced_jitter;
     uint64_t deadline_ = 0;
     float candidate_ = 0;
     bool rejected_view_ = false;
     uint64_t unjittered_meshes_ = 0;
     bool move_unjittered_ = false;
+    bool class_trial_ = false;
     const char* reason_ = "";
 };
 

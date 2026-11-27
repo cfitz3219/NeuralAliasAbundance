@@ -215,6 +215,24 @@ inline void Collect(StageRecovery& recovery, uint64_t frame)
                    (unsigned long long)frame, recovery.Dx12() ? "dx12" : "dx11", StageName(result.stage), ToolName(result.tool),
                    TrialOutcomeName(result.outcome), result.reduction, unsigned(result.hinted));
 }
+// VARIANT: referee/coverage-trial: what a class trial established, and the hints for this launch's order.
+inline void NoteCoverage(bool dx12, unsigned cls, bool kept)
+{
+    auto& store = State();
+    std::lock_guard<std::mutex> lock(store.m);
+    if (!store.enabled || !store.record.NoteCoverage(dx12, cls, kept)) return;
+    store.dirty = true;
+    store.save_failed = false;
+    ScheduleLocked(store);
+    eventlog::Emit("referee_memory", "action=note api=%s coverage_class=%s outcome=%s", dx12 ? "dx12" : "dx11", LeftClassName(cls),
+                   kept ? "kept" : "put_back");
+}
+inline uint32_t CoverageAvoided(bool dx12)
+{
+    auto& store = State();
+    std::lock_guard<std::mutex> lock(store.m);
+    return store.enabled ? store.record.CoverageAvoided(dx12) : 0u;
+}
 } // namespace memory
 
 // Both API adapters poll the same bounded GPU mailbox after closing a frame.

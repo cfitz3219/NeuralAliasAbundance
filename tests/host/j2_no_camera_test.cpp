@@ -93,6 +93,9 @@ void Store(uint8_t* dst, const M& m)
 
 int main(int argc, char** argv)
 {
+    // jitter/full-after-restart: these checks follow the sample frame by frame across the first frames, where the
+    // restart ramp (jitter/ramp-after-restart) would hold it at zero.
+    na::settings::Get().j2_restart_ramp.store(0);
     na::gpu::SetBackendForTests(na::gpu::TestBackend::Native);
     setvbuf(stdout, nullptr, _IONBF, 0); // progress survives a timeout kill
     test::Device d;

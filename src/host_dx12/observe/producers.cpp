@@ -38,6 +38,8 @@
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
+#include "core/referee_coverage.hpp"
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -217,7 +219,12 @@ struct ListState {
     // answer to "does this draw's shader read a layer".
     na_object_id vpj_layer_seen_rt = 0;
     uint32_t vpj_layer_seen_frame = 0;
-    struct VpjLayerRead { uint64_t state_revision = 0, registry_revision = 0; uint32_t frame = 0; bool valid = false, reads = false; } vpj_layer_read;
+    struct VpjLayerRead {
+        uint64_t state_revision = 0, registry_revision = 0;
+        uint32_t frame = 0, count = 0;
+        std::array<na_object_id, 4> layers{};
+        bool valid = false, reads = false;
+    } vpj_layer_read;
     uint32_t cur_ds_sub = NA_UNKNOWN_U32, cur_rt_sub = NA_UNKNOWN_U32;
     na_object_id pending_entry = 0; // selected colour whose handoff awaits its first actual operation
     uint32_t entry_barrier=0;
@@ -5496,6 +5503,15 @@ std::atomic<uint64_t> g_vpj_overlay_moved{0};
 // another target than the scene colour, their own viewport, the rule switched off, after the hand-over.
 std::atomic<uint64_t> g_vpj_left_other_target{0}, g_vpj_left_own_viewport{0}, g_vpj_left_rule_off{0}, g_vpj_left_after_handover{0};
 std::atomic<uint64_t> g_vpj_left_total{0};
+// VARIANT: referee/coverage-trial (core/referee_coverage.hpp): the classes the Referee moves onto the sample, the
+// one on trial, and the pipeline signatures moved during the trial / put back by an earlier one.
+std::atomic<uint32_t> g_cov_mask{0};
+std::atomic<int> g_cov_trial{-1};
+std::mutex g_cov_m;
+std::unordered_set<uint64_t> g_cov_trial_sigs, g_cov_still_sigs; // under g_cov_m
+uint64_t g_cov_decisions = 0;                                    // under g_cov_m
+std::atomic<uint64_t> g_cov_moved{0}, g_cov_kept_still{0};
+uint64_t g_cov_last_left[na::referee::kLeftClasses] = {};          // cumulative counts at the last LeftByClass
 inline uint32_t vpj_frame(uint64_t sample) { return static_cast<uint32_t>(sample >> 32); }
 // this frame, the one before, or (a list still recording the frame before) the one after
 inline bool vpj_layer_fresh(uint32_t frame, uint32_t layer_frame) { return layer_frame && frame - layer_frame + 1u <= 2u; }
@@ -5589,7 +5605,8 @@ bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* l
 {
     auto& cached = ls.vpj_layer_read;
     const uint64_t revision_now = g_operation_revision.load();
-    if (use_cache && cached.valid && cached.state_revision == ls.read_revision[0] && cached.registry_revision == revision_now && cached.frame == frame)
+    if (use_cache && cached.valid && cached.state_revision == ls.read_revision[0] && cached.registry_revision == revision_now && cached.frame == frame &&
+        cached.count == count && std::equal(layers, layers + count, cached.layers.begin()))
         return cached.reads;
     bool reads = false;
     if (const Obj* sig = root_sig_obj_locked(ls, 0)) {
@@ -5622,6 +5639,8 @@ bool vpj_reads_layer_locked(ListState& ls, uint32_t frame, const na_object_id* l
     cached.state_revision = ls.read_revision[0];
     cached.registry_revision = revision_now;
     cached.frame = frame;
+    cached.count = count;
+    std::copy_n(layers, count, cached.layers.begin());
     cached.reads = reads;
     cached.valid = true;
     return reads;
@@ -5762,6 +5781,22 @@ void vpj_before_draw_body(GL* l, uint64_t vertices, int* coarse_set)
                 o.reads_stationary_layer = sn && vpj_reads_layer_locked(*ls, vpj_frame(sample), still, sn, false);
             }
             overlay = neural_alias::SceneOverlayTakesJitter(o);
+            if (!overlay) {
+                // VARIANT: referee/coverage-trial: a class the Referee moves onto the sample, pipeline by pipeline.
+                using L = na::referee::LeftClass;
+                const L cls = !o.scene_colour ? L::OtherTarget : !o.scene_viewport ? L::OwnViewport
+                            : o.reads_stationary_layer ? L::StationarySource : L::RuleOff;
+                if ((g_cov_mask.load(std::memory_order_acquire) >> unsigned(cls)) & 1u) {
+                    const uint64_t sig = (reinterpret_cast<uintptr_t>(pso_obj_locked(*ls)) * 1099511628211ull) ^ unsigned(cls);
+                    std::lock_guard<std::mutex> cov_lock(g_cov_m);
+                    if (g_cov_still_sigs.count(sig)) g_cov_kept_still.fetch_add(1, std::memory_order_relaxed);
+                    else {
+                        if (g_cov_trial.load(std::memory_order_relaxed) == int(cls)) g_cov_trial_sigs.insert(sig);
+                        g_cov_moved.fetch_add(1, std::memory_order_relaxed);
+                        overlay = true;
+                    }
+                }
+            }
             if (overlay) tests_depth = true;
             else {
                 g_vpj_left_total.fetch_add(1, std::memory_order_relaxed);
@@ -9953,6 +9988,34 @@ void SetSceneOverlayJitter(bool on, const char* why)
 }
 bool SceneOverlayJitter() { return g_vpj_overlays.load(std::memory_order_relaxed); }
 uint64_t UnjitteredSceneMeshes() { return g_vpj_left_total.load(std::memory_order_relaxed); }
+void LeftByClass(uint64_t (&out)[na::referee::kLeftClasses])
+{
+    using L = na::referee::LeftClass;
+    uint64_t now[na::referee::kLeftClasses] = {};
+    now[unsigned(L::OtherTarget)] = g_vpj_left_other_target.load(std::memory_order_relaxed);
+    now[unsigned(L::OwnViewport)] = g_vpj_left_own_viewport.load(std::memory_order_relaxed);
+    now[unsigned(L::RuleOff)] = g_vpj_left_rule_off.load(std::memory_order_relaxed);
+    now[unsigned(L::StationarySource)] = g_vpj_left_stationary.load(std::memory_order_relaxed);
+    for (unsigned c = 0; c < na::referee::kLeftClasses; ++c) {
+        out[c] = now[c] >= g_cov_last_left[c] ? now[c] - g_cov_last_left[c] : 0;
+        g_cov_last_left[c] = now[c];
+    }
+}
+void SetCoverage(uint32_t mask, int trial, uint64_t decisions, int last_class, bool last_kept)
+{
+    g_cov_mask.store(mask, std::memory_order_release);
+    g_cov_trial.store(trial, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_cov_m);
+    if (decisions == g_cov_decisions) return;
+    g_cov_decisions = decisions;
+    if (!last_kept && last_class >= 0) g_cov_still_sigs.insert(g_cov_trial_sigs.begin(), g_cov_trial_sigs.end());
+    na::eventlog::Emit("dx12_coverage", "decision=%llu class=%s %s signatures=%zu still_signatures=%zu moved_draws=%llu left_by_signature=%llu",
+                       static_cast<unsigned long long>(decisions), na::referee::LeftClassName(unsigned(last_class)),
+                       last_kept ? "kept" : "put_back", g_cov_trial_sigs.size(), g_cov_still_sigs.size(),
+                       static_cast<unsigned long long>(g_cov_moved.load()), static_cast<unsigned long long>(g_cov_kept_still.load()));
+    g_cov_trial_sigs.clear();
+}
+uint64_t CoverageMovedDraws() { return g_cov_moved.load(std::memory_order_relaxed); }
 void SetStillMeshJitter(bool asked)
 {
     if (g_vpj_still_meshes.exchange(asked, std::memory_order_relaxed) != asked && asked)

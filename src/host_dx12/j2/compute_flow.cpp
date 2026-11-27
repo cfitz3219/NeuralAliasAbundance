@@ -612,6 +612,13 @@ bool Ready(unsigned w,unsigned h){
     for(const auto& c:cached)if(c->w==w && c->h==h)return true;
     return false;
 }
+int FormatCutNumbers(char* out,size_t n){
+    const Stats s=GetStats();
+    const float agree=s.screen_samples>0?s.screen_agree/s.screen_samples:0.f;
+    return std::snprintf(out,n,"screen_fit{frame=%llu model=%d samples=%.0f agree_share=%.3f energy_px2=%.3f translation_px=%.2f,%.2f} cuts_measured=%llu pairs=%llu",
+        static_cast<unsigned long long>(s.screen_frame),s.screen_last_valid?1:0,s.screen_samples,agree,s.screen_energy,
+        s.screen_theta[0],s.screen_theta[1],static_cast<unsigned long long>(s.total_cuts),static_cast<unsigned long long>(s.total_pairs));
+}
 void Reset(){std::lock_guard<std::mutex> lock(mutex);current.reset();cached.clear();last_submit_tick=sample_tick=0;stats={};}
 Stats GetStats(){na::nr::native::Maintain();std::lock_guard<std::mutex> lock(mutex);if(current){collect(*current);stats.colour_jitter_convention=static_cast<uint32_t>(current->raster_confirmed?na::jitter::Convention::Raster:current->colour_jitter.Get());stats.colour_jitter_epoch=current->colour_jitter.Epoch();}const auto now=GetTickCount64();stats.submit_age_ms=last_submit_tick?now-last_submit_tick:0;stats.sample_age_ms=sample_tick?now-sample_tick:0;return stats;}
 void DescribeStats(const Stats& s,char* text,size_t capacity){

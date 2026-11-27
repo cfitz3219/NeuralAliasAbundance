@@ -81,6 +81,7 @@ struct Session {
     camera::CameraTracker camera;
     native11::CameraPick pick;
     uint64_t stream = 0, last_frame = 0; // the last DELIVERED frame and its input stream
+    uint32_t since_restart = 0;           // frames since DLSS's history last restarted (jitter/ramp-after-restart)
     uint64_t requested_jitter_frame = 0;
     float requested_jitter_x = 0.f, requested_jitter_y = 0.f;
     uint8_t requested_jitter_amount = 0;
@@ -145,6 +146,7 @@ std::atomic<uint64_t> resets_cut{0}, resets_changed{0}, resets_gap{0}, resets_ji
 std::atomic<uint64_t> supplied_camera{0}, supplied_measured{0}, resets_no_pair{0}, resets_measured_cut{0};
 std::atomic<uint64_t> cuts_camera{0}, cuts_measured_instead{0}; // camera-reported cuts, and those measured instead of reset
 std::atomic<uint64_t> measured_unavailable{0}, jitter_kept_after_miss{0};
+std::atomic<uint64_t> restart_ramped{0}; // frames whose jitter was scaled down after a history restart
 std::atomic<uint32_t> last_no_pair{0};
 // Jitter for the next frame is asked for once this frame's recording is submitted, for this many
 // frames after the last delivered one. Longer without a delivery and it stops, so a game whose
@@ -534,13 +536,16 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     D3D11_TEXTURE2D_DESC cd{}, dd{};
     UINT csub, dsub, cw, ch, dw, dh;
     if (!Subresource(color.Get(), c, cd, csub, cw, ch) || !Subresource(depth.Get(), d, dd, dsub, dw, dh)) {
-        // Says WHY: the common case is the game's own multisample anti-aliasing.
+        // Cort 2026-11-21: one rule for every kind of game anti-aliasing, in these words. The sample
+        // counts go to the log so a results file still says what was seen.
         if (cd.SampleDesc.Count > 1 || dd.SampleDesc.Count > 1) {
-            static char why[160];
-            std::snprintf(why, sizeof why,
-                          "The game's own anti-aliasing is on (scene picture %ux, depth %ux multisampled): DLAA needs it off in the game's settings.",
-                          cd.SampleDesc.Count, dd.SampleDesc.Count ? dd.SampleDesc.Count : 1);
-            return Skip(why);
+            static unsigned said = 0;
+            if (said < 4) {
+                ++said;
+                na::eventlog::Emit("native11_game_aa", "color_samples=%u depth_samples=%u", cd.SampleDesc.Count,
+                                   dd.SampleDesc.Count ? dd.SampleDesc.Count : 1);
+            }
+            return Skip("NeuralAlias cannot run DLAA on top of in-game anti-aliasing. Please disable all in-game AA.");
         }
         return Skip("Scene texture layout unsupported (mip, array slice or active area outside the texture).");
     }
@@ -874,8 +879,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                     // this frame carries the reset. Until then those frames showed their own picture.
                     reset_history = true;
                     resets_measured_cut.fetch_add(1, std::memory_order_relaxed);
-                    na::eventlog::Emit("camera_cut", "api=dx11 frame=%llu verdict=reset_confirmed_by_pictures camera_cut_frame=%d",
-                                       static_cast<unsigned long long>(frame.frame), camera_cut_unconfirmed ? 1 : 0);
+                    char numbers[256] = "";
+                    j2::compute_flow::FormatCutNumbers(numbers, sizeof numbers);
+                    na::eventlog::Emit("camera_cut", "api=dx11 frame=%llu verdict=reset_confirmed_by_pictures camera_cut_frame=%d %s",
+                                       static_cast<unsigned long long>(frame.frame), camera_cut_unconfirmed ? 1 : 0, numbers);
                 }
             } else {
                 // The first picture of a pair: nothing to measure against yet. DLSS starts a new
@@ -1557,6 +1564,14 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             const char* why = nullptr;
             const bool overlays = debug_jitter.value || referee::gpu::SceneOverlays(frame.presentation_source, referee::shadow::Path::Native11, &why);
             native11::SetSceneOverlayJitter(overlays, why);
+            // VARIANT: referee/coverage-trial: this frame's draws left off the jitter, by class, to the Referee; its
+            // classes back to the provider.
+            uint64_t left[na::referee::kLeftClasses];
+            native11::LeftByClass(left);
+            referee::gpu::NoteLeftByClass(referee::shadow::Path::Native11, left);
+            const auto decision = referee::gpu::LastCoverageDecision(referee::shadow::Path::Native11);
+            native11::SetCoverage(referee::gpu::CoverageMoveMask(referee::shadow::Path::Native11), decision.trial, decision.decisions,
+                                  decision.cls, decision.kept);
         }
         const auto amount = !frame.raster.shader_depth_aligned && !still_meshes && !debug_jitter.value &&
             frame.recovery_tool == referee::RecoveryTool::None &&
@@ -1566,13 +1581,17 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             : referee::normal_jitter;
         s.requested_jitter_frame = frame.frame + 1;
         s.requested_jitter_amount = amount;
+        // VARIANT: jitter/ramp-after-restart: no offset on the first frame after a history restart, then back in steps.
+        const float ramp = neural_alias::RestartJitterScale(s.since_restart + 1, settings::Get().j2_restart_ramp.load(std::memory_order_relaxed));
+        if (ramp < 1.f) restart_ramped.fetch_add(1, std::memory_order_relaxed);
         // A folded level: the sample moves around the kept pixel's block, at the block's scale.
-        s.requested_jitter_x = static_cast<float>(sample.x_pixels) * (amount * .01f) * static_cast<float>(fold_block.x) +
+        s.requested_jitter_x = static_cast<float>(sample.x_pixels) * (amount * .01f) * ramp * static_cast<float>(fold_block.x) +
                                na::fold::KeptPixelCentring(fold_block.x, fold_pick.x); // 0 for a one-pixel block
-        s.requested_jitter_y = static_cast<float>(sample.y_pixels) * (amount * .01f) * static_cast<float>(fold_block.y) +
+        s.requested_jitter_y = static_cast<float>(sample.y_pixels) * (amount * .01f) * ramp * static_cast<float>(fold_block.y) +
                                na::fold::KeptPixelCentring(fold_block.y, fold_pick.y);
         native11::SetNextJitter(s.requested_jitter_x, s.requested_jitter_y);
     };
+    s.since_restart = reset_history ? 0u : s.since_restart + 1u;
     // Measured: the next frame's sample is asked for here, not at delivery, so one failed DLSS step
     // does not take a sample out of the sequence. Bounded: see kJitterGraceFrames.
     if (measured && frame.raster.qualified && j2::Jitter() && s.last_frame && frame.frame > s.last_frame &&
@@ -1724,7 +1743,8 @@ int FormatStatus(char* out, size_t capacity)
     // a measured scene cut), frames left alone because nothing could be measured, and jitter samples
     // kept in sequence after a frame that was not delivered.
     int n = std::snprintf(out, capacity, "native11_dlaa delivered=%llu last_ms=%lld busy=%llu rejected=%llu preset=%u sharpness=%u raster_slot=%d history_resets{camera_cut=%llu inputs_changed=%llu frame_gap=%llu jitter_switch=%llu} "
-                         "camera_cuts{reported=%llu measured_instead=%llu} camera_setting=%d motion_supplier{camera=%llu measured=%llu} replay_delivered=%llu measured{reset_first_picture=%llu last_no_pair=%u reset_scene_cut=%llu unavailable=%llu jitter_kept_after_miss=%llu} \"%s\"",
+                         "camera_cuts{reported=%llu measured_instead=%llu} camera_setting=%d motion_supplier{camera=%llu measured=%llu} replay_delivered=%llu measured{reset_first_picture=%llu last_no_pair=%u reset_scene_cut=%llu unavailable=%llu jitter_kept_after_miss=%llu} "
+                         "restart_ramp{frames=%u ramped=%llu} \"%s\"",
                          static_cast<unsigned long long>(delivered.load()), last_ms,
                          static_cast<unsigned long long>(busy.load()),
                          static_cast<unsigned long long>(rejected.load()), applied_preset.load(), applied_sharpness.load(),
@@ -1739,6 +1759,8 @@ int FormatStatus(char* out, size_t capacity)
                          static_cast<unsigned long long>(resets_measured_cut.load()),
                          static_cast<unsigned long long>(measured_unavailable.load()),
                          static_cast<unsigned long long>(jitter_kept_after_miss.load()),
+                         settings::Get().j2_restart_ramp.load(std::memory_order_relaxed),
+                         static_cast<unsigned long long>(restart_ramped.load()),
                          reason.load());
     // Per-stage GPU ms on this route (last/average), and the level on screen.
     if (n > 0 && static_cast<size_t>(n) + 200 < capacity) {

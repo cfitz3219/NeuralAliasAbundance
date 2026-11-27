@@ -157,6 +157,12 @@ struct LiveStats {
     uint64_t steady_frames = 0, steady_off_frames = 0;
     float steady_share = 0, steady_ms = 0, steady_avg = 0;
     uint64_t steady_drop_gap = 0, steady_drop_reset = 0, steady_drop_motion = 0, steady_drop_relearn = 0, steady_drop_resize = 0, steady_drop_refused = 0;
+    // hudpaste/moves-with-scene (fg/hud_move.hpp): frames classified, generated pictures placed, interface tiles and
+    // pixels of each class (summed over frames), mean placement shift, frames pasted the T2 way and why.
+    uint32_t move_on = 1, move_ready = 0;
+    uint64_t move_frames = 0, move_pictures = 0, move_tiles_moving = 0, move_tiles_fixed = 0, move_pixels_moving = 0, move_pixels_fixed = 0;
+    float move_shift_px = 0;
+    uint64_t move_fb_pair = 0, move_fb_reset = 0, move_fb_motion = 0, move_fb_off = 0, move_fb_size = 0;
     char steady_why[112] = "";
     // Display: the refresh rate Windows reports now, the display's maximum (x2's ceiling), whether
     // dynamic refresh is on, and frames shown without x2 because even the maximum is below the real rate.

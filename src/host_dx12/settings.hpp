@@ -136,6 +136,9 @@ struct Settings {
     // the opposite sign, 0 = off: the camera-matrix route). Cort 2026-11-04. Loading the ini
     // turns it on unless the ini says otherwise; without a Load (tests) the camera-matrix route stays.
     std::atomic<int32_t> j2_viewport_jitter{0};
+    // VARIANT: jitter/ramp-after-restart: frames over which the jitter comes back after a DLSS history restart
+    // (core/temporal_jitter.hpp RestartJitterScale); 0 = jitter/full-after-restart. Hidden: [j2] restart_ramp.
+    std::atomic<uint32_t> j2_restart_ramp{8};
     // VARIANT: camera/optional
     // [j2] camera: what the scene camera is to DLAA on the native DX11 route (2026-11-16, Cort:
     // "eliminate the dependency"). 1 = used when found (default): a frame without one still gets DLAA,
@@ -184,6 +187,9 @@ struct Settings {
     // Route B live x2: Astra's still-area steadying on the generated picture (fg/steady_pass.hpp).
     // 1 On (default), 0 Off. Remembered per game under [fg_steady_games] <game key>; applies live.
     std::atomic<uint32_t> fg_steady{1};
+    // VARIANT: hudpaste/moves-with-scene (1, default) | hudpaste/screen-fixed (0): x2 places interface that
+    // moves with the scene (map names) at each generated picture's time (fg/hud_move.hpp). Hidden: [fg] hud_move.
+    std::atomic<uint32_t> fg_hud_move{1};
     // A69: the freeze watchdog switched Frame Generation off at this time
     // (seconds since 1970, 0 = never). Shown in the menu until FG is re-enabled.
     std::atomic<uint32_t> fg_frozen_at{0};
