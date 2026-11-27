@@ -199,6 +199,16 @@ void SetNextJitter(float x_px, float y_px);
 // test off and the scene depth bound takes the frame's full sample too (core/temporal_jitter.hpp,
 // StillMeshTakesJitter). The DX11 side of na::observe::SetStillMeshJitter.
 void SetStillMeshJitter(bool asked);
+// Coarse shading on the scene's draws (the fold, core/fold_shading.hpp; native11/coarse11.hpp): from the
+// next frame, the draws that take the scene's sample (or, with no sample, the depth-tested draws into
+// the scene depth until the scene is handed over) are shaded once per block. 0 = one shading per pixel,
+// 4 = 2x1 blocks, 5 = 2x2 blocks. Every other draw, and every command list the immediate context runs,
+// is switched back to one shading per pixel first.
+void SetSceneCoarseShading(uint32_t rate);
+// Whether the game's device can shade in blocks; `why` in plain words when it cannot.
+bool CoarseShadingAvailable(const char** why = nullptr);
+struct CoarseShadingStats { uint32_t rate = 0; uint64_t draws = 0, sets = 0, restores = 0, failures = 0, before_lists = 0, frames = 0; };
+CoarseShadingStats GetCoarseShadingStats();
 // How SetNextJitter's sample reaches the picture.
 //  Matrix (default):  written into the scene camera's ViewProjection at the game's upload. Needs a
 //                     camera layout the adapter has qualified for the raster transform.

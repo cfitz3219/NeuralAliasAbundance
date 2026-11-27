@@ -41,6 +41,8 @@
 #include "host_dx12/fg/frame_gen.hpp"
 #include "core/live_frame_gen.hpp"
 #include "host_dx12/settings.hpp"
+#include "core/fold_shading.hpp"
+#include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "host_dx12/native11/texture_loader.hpp"
 #include "host_dx12/native11/textures.hpp"
@@ -107,6 +109,12 @@ float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(i
 float4 ps_letterbox(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(0,2), 0)); }
 float4 ps_centered_scene(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(44,0), 0)); }
 float4 ps_hud(float4 p : SV_Position) : SV_Target { return float4(1, 1, 1, 0.5); }
+// The fold fixture: shading that depends on the pixel (a constant colour is not counted as pixel shading
+// by the driver's statistics, and a pattern shows where blocks were shaded once).
+// Each invocation also counts itself (the driver's own statistics leave these draws out).
+RWByteAddressBuffer shading_count : register(u1);
+float4 ps_scene_coords(float4 p : SV_Position) : SV_Target { shading_count.InterlockedAdd(0, 1); return float4(frac(p.x / 16.0), frac(p.y / 16.0), 0.5, 1.0); }
+float4 ps_hud_coords(float4 p : SV_Position) : SV_Target { shading_count.InterlockedAdd(4, 1); return float4(frac(p.x / 8.0), 1, 1, 0.5); }
 float4 ps_screen_check(float4 p : SV_Position) : SV_Target { return float4(scene.Load(int3(int2(p.xy), 0)).rgb * 0.75, 1); }
 struct LitVertex { float4 p : SV_Position; float2 surface : TEXCOORD0; };
 LitVertex vs_reflection(uint id : SV_VertexID) {
@@ -202,6 +210,10 @@ struct Game {
     bool shader_depth = false;
     DXGI_FORMAT back_format = DXGI_FORMAT_R8G8B8A8_UNORM; // the swap chain's format
     ComPtr<ID3D11RasterizerState> hud_scissor;            // set: the HUD covers only kHudRect
+    ID3D11Query* main_stats = nullptr;                    // set: pipeline statistics around the main scene's draws only
+    ComPtr<ID3D11PixelShader> ps_scene_main, ps_hud_main;  // set: the main scene's and the HUD's shading (fold fixture)
+    ComPtr<ID3D11UnorderedAccessView> count_uav;           // set: their invocations, counted (u1)
+    ComPtr<ID3D11RasterizerState> scene_rs;                // set: the main scene drawn with no face culling (its quads face away)
     // The interface recorded on a deferred context and run by the immediate one (multithreaded DX11):
     // 1 = the whole interface, 2 = part of it, between the scene and the immediate interface draws.
     int deferred_hud = 0;
@@ -466,6 +478,13 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
     c->ClearDepthStencilView(g.dsv.Get(), g.shader_depth ? D3D11_CLEAR_DEPTH : D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.f, 0);
     Viewport(c, g.w, g.h);
     if (g.campaign_split_camera) BindSplitCamera(c, g);
+    if (g.ps_scene_main) c->PSSetShader(g.ps_scene_main.Get(), nullptr, 0);
+    if (g.scene_rs) c->RSSetState(g.scene_rs.Get());
+    if (g.count_uav) {
+        ID3D11UnorderedAccessView* u = g.count_uav.Get();
+        c->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 1, 1, &u, nullptr);
+    }
+    if (g.main_stats) c->Begin(g.main_stats);
     for (int i = 0; i < 40; ++i) {
         // Rewrite the same buffer to an identity-basis object pose. These
         // draws must never get the support of the earlier world-buffer version.
@@ -488,6 +507,8 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false)
         }
         SetObject(c, g, i); c->Draw(4, 0);
     }
+    if (g.main_stats) c->End(g.main_stats);
+    if (g.scene_rs) c->RSSetState(nullptr);
     if (g.layered) {
         // Lighting: reads the layers, writes the picture, no depth.
         c->OMSetRenderTargets(1, &rt, nullptr);
@@ -558,7 +579,11 @@ void Post(ID3D11DeviceContext* c, Game& g, bool immediate)
         if (g.deferred_hud == 1) return;
     }
     c->OMSetBlendState(g.blend.Get(), bf, 0xffffffffu);
-    c->PSSetShader(g.ps_hud.Get(), nullptr, 0);
+    c->PSSetShader(g.ps_hud_main ? g.ps_hud_main.Get() : g.ps_hud.Get(), nullptr, 0);
+    if (g.count_uav) {
+        ID3D11UnorderedAccessView* u = g.count_uav.Get();
+        c->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 1, 1, &u, nullptr);
+    }
     if (g.hud_scissor) { // a HUD panel, not the whole screen (live x2 fixture)
         c->RSSetState(g.hud_scissor.Get());
         const D3D11_RECT r{kHudRect[0], kHudRect[1], kHudRect[2], kHudRect[3]};
@@ -1977,6 +2002,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
     const bool fg_x2 = fg_x2_hdr || fg_auto != 0 || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
     const bool proxy_env_off = GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) != 0;
+    // DLSS Quality / Performance on the native DX11 route (the fold: coarse shading through NVAPI, the
+    // shared fold pass, the waiting period with DLAA on screen).
+    const uint32_t fold_level = !std::strcmp(arg1, "--fold-quality") || !std::strcmp(arg1, "--fold-quality-measured") ? 1u
+                              : !std::strcmp(arg1, "--fold-performance") || !std::strcmp(arg1, "--fold-performance-measured") ? 2u : 0u;
+    const bool fold_measured = fold_level && std::strstr(arg1, "-measured") != nullptr; // no camera: motion measured, folded flow
     wchar_t fg_folder[MAX_PATH]{};
     if (fg_x2 && !GetEnvironmentVariableW(L"NA_FG_SEARCH", fg_folder, MAX_PATH)) {
         std::printf("SKIP: NA_FG_SEARCH (the folder with nvngx_dlssg.dll) is not set\n");
@@ -2010,7 +2040,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         !set(L"fsr", L"enabled", L"0") || !set(L"xess", L"enabled", L"0") ||
         !set(L"j2", L"enabled", L"1") ||
         !set(L"referee", L"enabled", L"0") || // legacy disabled package
-        !set(L"j2", L"camera", (camera_off_start || fg_x2 || adaptive || rotating_lights) ? L"0" : L"2") ||
+        !set(L"j2", L"camera", (camera_off_start || fg_x2 || adaptive || rotating_lights || fold_measured) ? L"0" : L"2") ||
         (fg_x2 && (!set(L"fg", L"live", L"1") || !set(L"fg", L"search_path", fg_folder))) ||
         (GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) && !set(L"present", L"dx11_proxy", L"0")) ||
 
@@ -2028,6 +2058,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     g.padded_hdr = padded_hdr;
     if (fg_x2_hdr) g.back_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (fold_measured) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
 #endif
     const bool centered_scene = argc > 1 && std::strcmp(argv[1], "--centered-scene") == 0;
     if (centered_scene) g.screen_extra_width = 88;
@@ -2324,6 +2355,223 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         expect(pr.device_hr == S_OK, "no device removal");
         DeleteFileW(ini.c_str());
         std::printf(g_failed ? "FAIL: %d live x2 check(s) failed\n" : "PASS: live x2 on a DX11 game\n", g_failed);
+        std::fflush(stdout);
+        ExitProcess(g_failed ? 1u : 0u);
+    }
+    if (fold_level) {
+        // The game draws at full size; from the level's first shown frame on, its main scene draws are shaded
+        // in blocks (pixel-shader invocations: one half / one quarter), the shadow pass, the tone map and the
+        // HUD are not, DLSS rebuilds the full picture from the kept pixels, and DLAA stays on screen until
+        // the level has proven itself (no frozen frame). Then back to DLAA.
+        na::native11::SetJitterRoute(na::native11::JitterRoute::Viewport);
+        D3D11_RASTERIZER_DESC rd{};
+        rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+        expect(SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.hud_scissor)), "HUD panel state");
+        rd.ScissorEnable = FALSE;
+        expect(SUCCEEDED(g.device->CreateRasterizerState(&rd, &g.scene_rs)), "scene state with no culling");
+        ComPtr<ID3D11Query> main_q, post_q;
+        const D3D11_QUERY_DESC qd{D3D11_QUERY_PIPELINE_STATISTICS, 0};
+        expect(SUCCEEDED(g.device->CreateQuery(&qd, &main_q)) && SUCCEEDED(g.device->CreateQuery(&qd, &post_q)), "pipeline statistics queries");
+        g.main_stats = main_q.Get();
+        {
+            auto ps1 = Compile("ps_scene_coords", "ps_5_0"), ps2 = Compile("ps_hud_coords", "ps_5_0");
+            expect(ps1 && ps2 && SUCCEEDED(g.device->CreatePixelShader(ps1->GetBufferPointer(), ps1->GetBufferSize(), nullptr, &g.ps_scene_main)) &&
+                   SUCCEEDED(g.device->CreatePixelShader(ps2->GetBufferPointer(), ps2->GetBufferSize(), nullptr, &g.ps_hud_main)), "pixel-dependent shading for the fixture");
+        }
+        ComPtr<ID3D11Buffer> count_buf, count_stg;
+        {
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = 16; bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS; bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = DXGI_FORMAT_R32_TYPELESS; ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER; ud.Buffer.NumElements = 4; ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+            D3D11_BUFFER_DESC sd2 = bd;
+            sd2.BindFlags = 0; sd2.MiscFlags = 0; sd2.Usage = D3D11_USAGE_STAGING; sd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            expect(SUCCEEDED(g.device->CreateBuffer(&bd, nullptr, &count_buf)) && SUCCEEDED(g.device->CreateUnorderedAccessView(count_buf.Get(), &ud, &g.count_uav)) &&
+                   SUCCEEDED(g.device->CreateBuffer(&sd2, nullptr, &count_stg)), "the shading counter");
+        }
+        D3D11_TEXTURE2D_DESC cd{};
+        g.color->GetDesc(&cd);
+        cd.Usage = D3D11_USAGE_STAGING; cd.BindFlags = 0; cd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; cd.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> stg;
+        expect(SUCCEEDED(g.device->CreateTexture2D(&cd, nullptr, &stg)), "picture read-back");
+        std::vector<float> prev, cur;
+        // The picture the game reads after DLSS (the scene colour, written back): RGB as floats.
+        const auto read_picture = [&](std::vector<float>& out) {
+            out.assign(size_t(g.w) * g.h * 3, 0.f);
+            g.ctx->CopyResource(stg.Get(), g.color.Get());
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (FAILED(g.ctx->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+            bool finite = true;
+            for (UINT y = 0; y < g.h; ++y) {
+                const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch);
+                for (UINT x = 0; x < g.w; ++x) {
+                    DirectX::PackedVector::XMFLOAT3PK pk(row[x]);
+                    DirectX::XMFLOAT3 f;
+                    DirectX::XMStoreFloat3(&f, DirectX::PackedVector::XMLoadFloat3PK(&pk));
+                    float* o = &out[(size_t(y) * g.w + x) * 3];
+                    o[0] = f.x; o[1] = f.y; o[2] = f.z;
+                    finite = finite && std::isfinite(f.x) && std::isfinite(f.y) && std::isfinite(f.z) && f.x < 64.f && f.y < 64.f && f.z < 64.f;
+                }
+            }
+            g.ctx->Unmap(stg.Get(), 0);
+            return finite;
+        };
+        const auto diff = [&](const std::vector<float>& a, const std::vector<float>& b) {
+            double s = 0;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) s += std::fabs(double(a[i]) - double(b[i]));
+            return a.empty() ? 0.0 : s / double(a.size());
+        };
+        struct Sample { UINT64 scene = 0, post = 0; double ms = 0, change = 0; bool finite = true; };
+        LARGE_INTEGER hz{};
+        QueryPerformanceFrequency(&hz);
+        const auto run = [&](int frame) {
+            Sample s;
+            LARGE_INTEGER t0{}, t1{};
+            QueryPerformanceCounter(&t0);
+            Pump();
+            const UINT zero[4] = {};
+            g.ctx->ClearUnorderedAccessViewUint(g.count_uav.Get(), zero);
+            Scene(g.ctx.Get(), g, frame);
+            g.ctx->Begin(post_q.Get());
+            Post(g.ctx.Get(), g, true);
+            g.ctx->End(post_q.Get());
+            g.ctx->CopyResource(count_stg.Get(), count_buf.Get());
+            g.swap->Present(0, 0);
+            QueryPerformanceCounter(&t1);
+            s.ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(hz.QuadPart);
+            D3D11_QUERY_DATA_PIPELINE_STATISTICS a{}, b{};
+            while (g.ctx->GetData(main_q.Get(), &a, sizeof a, 0) == S_FALSE) Sleep(0);
+            while (g.ctx->GetData(post_q.Get(), &b, sizeof b, 0) == S_FALSE) Sleep(0);
+            s.scene = a.PSInvocations; s.post = b.PSInvocations;
+            {
+                D3D11_MAPPED_SUBRESOURCE cm{};
+                if (SUCCEEDED(g.ctx->Map(count_stg.Get(), 0, D3D11_MAP_READ, 0, &cm))) {
+                    const auto* v = static_cast<const uint32_t*>(cm.pData);
+                    s.scene = v[0]; s.post = v[1]; // the main scene's and the HUD's own shading, counted by the shaders
+                    g.ctx->Unmap(count_stg.Get(), 0);
+                }
+            }
+            s.finite = read_picture(cur);
+            s.change = prev.empty() ? 0.0 : diff(cur, prev);
+            prev.swap(cur);
+            return s;
+        };
+        const auto shown_now = [] {
+            char status[512]{};
+            na::native_d3d11::FoldStatus(status, sizeof status);
+            return std::string(status);
+        };
+        auto& st = na::settings::Get();
+        const char* level_name = fold_level == 2 ? "Performance" : "Quality";
+        int frame = 0;
+        // A. DLAA.
+        st.j2_fold_mode.store(0);
+        double dlaa_ms_sum = 0, dlaa_change = 0;
+        UINT64 dlaa_scene = 0, dlaa_post = 0;
+        int dlaa_n = 0;
+        double start_max_ms = 0; // the first frames: DLAA starts, and the levels' DLSS is made with it
+        for (; frame < 60; ++frame) {
+            const Sample s = run(frame);
+            if (frame < 10) start_max_ms = (std::max)(start_max_ms, s.ms);
+            if (frame >= 30) { dlaa_ms_sum += s.ms; dlaa_scene += s.scene; dlaa_post += s.post; dlaa_change += s.change; ++dlaa_n; }
+        }
+        const double dlaa_ms = dlaa_ms_sum / dlaa_n;
+        // B. The level asked for: DLAA stays on screen while it is readied, then the switch.
+        st.j2_fold_mode.store(fold_level);
+        const int asked_at = frame;
+        int switched_at = -1;
+        double switch_max_ms = 0;
+        bool finite = true;
+        for (; frame < asked_at + 200 && switched_at < 0; ++frame) {
+            const Sample s = run(frame);
+            if (s.ms > dlaa_ms + 3.0) std::printf("  frame %d (waiting period): %.1f ms\n", frame, s.ms);
+            switch_max_ms = (std::max)(switch_max_ms, s.ms);
+            finite = finite && s.finite;
+            if (shown_now().find(std::string("On screen: ") + level_name) != std::string::npos) switched_at = frame;
+        }
+        const std::string status_after = shown_now();
+        // C. The level on screen.
+        double fold_ms_sum = 0, fold_change = 0, switch_change = 0;
+        UINT64 fold_scene = 0, fold_post = 0;
+        int fold_n = 0;
+        for (int k = 0; k < 90 && switched_at >= 0; ++k, ++frame) {
+            const Sample s = run(frame);
+            finite = finite && s.finite;
+            if (k < 3) switch_change = (std::max)(switch_change, s.change);
+            if (k >= 30) { fold_ms_sum += s.ms; fold_scene += s.scene; fold_post += s.post; fold_change += s.change; ++fold_n; }
+        }
+        static char line11[8192]{};
+        na::native_d3d11::FormatStatus(line11, sizeof line11);
+        const char* gpu = std::strstr(line11, "gpu_ms{");
+        const char* f11 = std::strstr(line11, "fold11{");
+        // E. The other level, straight from this one.
+        const uint32_t other_level = fold_level == 1 ? 2u : 1u;
+        const char* other_name = other_level == 2 ? "Performance" : "Quality";
+        st.j2_fold_mode.store(other_level);
+        double other_max_ms = 0;
+        int other_at = -1;
+        for (int k = 0; k < 200 && other_at < 0; ++k, ++frame) {
+            const Sample s = run(frame);
+            other_max_ms = (std::max)(other_max_ms, s.ms);
+            if (s.ms > dlaa_ms + 3.0) std::printf("  to %s, frame +%d: %.1f ms\n", other_name, k, s.ms);
+            if (shown_now().find(std::string("On screen: ") + other_name) != std::string::npos) other_at = k;
+        }
+        if (other_at < 0) std::printf("  %s never came on screen: %s (DLSS: %s, NGX result 0x%08x)\n", other_name, shown_now().c_str(), na::dlss::GetStats().reason,
+                                      static_cast<unsigned>(na::dlss::GetStats().last_ngx_result));
+        for (int k = 0; k < 20; ++k, ++frame) other_max_ms = (std::max)(other_max_ms, run(frame).ms);
+        // D. Back to DLAA.
+        st.j2_fold_mode.store(0);
+        UINT64 back_scene = 0;
+        int back_n = 0;
+        double back_max_ms = 0;
+        for (int k = 0; k < 40; ++k, ++frame) {
+            const Sample s = run(frame);
+            if (k < 20) back_max_ms = (std::max)(back_max_ms, s.ms);
+            if (k < 20 && s.ms > dlaa_ms + 3.0) std::printf("  back to DLAA, frame +%d: %.1f ms\n", k, s.ms);
+            if (k >= 20) { back_scene += s.scene; ++back_n; }
+        }
+        std::printf("  switches (longest frame, steady DLAA frame %.1f ms): first frames %.1f ms (DLAA and the levels' DLSS made); DLAA -> %s %.1f ms; %s -> %s %.1f ms (on screen after %d frames); -> DLAA %.1f ms\n",
+                    dlaa_ms, start_max_ms, level_name, switch_max_ms, level_name, other_name, other_max_ms, other_at, back_max_ms);
+        const double margin = dlaa_ms * 0.2 + 4.0;
+        const auto cs = na::native11::GetCoarseShadingStats();
+        const double r_scene = fold_n ? double(fold_scene) / fold_n / (double(dlaa_scene) / dlaa_n) : 0;
+        const double r_post = fold_n ? double(fold_post) / fold_n / (double(dlaa_post) / dlaa_n) : 0;
+        const double r_back = back_n ? double(back_scene) / back_n / (double(dlaa_scene) / dlaa_n) : 0;
+        std::printf("fold %s on the DX11 test game (%ux%u):\n"
+                    "  pixel-shader invocations per frame: main scene DLAA %.0f -> %s %.0f (x%.3f), HUD %.0f -> %.0f (x%.3f), back on DLAA x%.3f\n"
+                    "  waiting period: asked at frame %d, on screen at frame %d (%d frames); frame time DLAA %.1f ms, slowest while readied %.1f ms, on the level %.1f ms\n"
+                    "  picture change between frames (mean |d| RGB): DLAA %.5f, at the switch %.5f, on the level %.5f; finite %d\n"
+                    "  menu: %s\n  %.*s\n  %.*s\n  coarse: draws %llu sets %llu restores %llu before_lists %llu failures %llu frames %llu\n",
+                    level_name, g.w, g.h, double(dlaa_scene) / dlaa_n, level_name, fold_n ? double(fold_scene) / fold_n : 0.0, r_scene,
+                    double(dlaa_post) / dlaa_n, fold_n ? double(fold_post) / fold_n : 0.0, r_post, r_back,
+                    asked_at, switched_at, switched_at - asked_at, dlaa_ms, switch_max_ms, fold_n ? fold_ms_sum / fold_n : 0.0,
+                    dlaa_change / dlaa_n, switch_change, fold_n ? fold_change / fold_n : 0.0, finite ? 1 : 0, status_after.c_str(),
+                    gpu ? int(std::strcspn(gpu, "}") + 1) : 0, gpu ? gpu : "", f11 ? int(std::strcspn(f11, "}") + 1) : 0, f11 ? f11 : "",
+                    static_cast<unsigned long long>(cs.draws), static_cast<unsigned long long>(cs.sets), static_cast<unsigned long long>(cs.restores),
+                    static_cast<unsigned long long>(cs.before_lists), static_cast<unsigned long long>(cs.failures), static_cast<unsigned long long>(cs.frames));
+        expect(switched_at >= asked_at + int(na::fold::Handover::kWarmFrames), "DLAA stays on screen until the level has proven itself (8 good frames)");
+        expect(switch_max_ms < dlaa_ms + margin, "no slow frame from DLAA to the level (within 20 % + 4 ms of a steady frame)");
+        expect(other_at >= 0 && other_max_ms < dlaa_ms + margin, "no slow frame from one level to the other");
+        expect(back_max_ms < dlaa_ms + margin, "no slow frame back to DLAA");
+        const bool quarter = fold_level == 2;
+        expect(quarter ? (r_scene > 0.22 && r_scene < 0.34) : (r_scene > 0.47 && r_scene < 0.60),
+               quarter ? "the main scene's draws run about a quarter of the pixel shading" : "the main scene's draws run about half of the pixel shading");
+        expect(r_post > 0.999 && r_post < 1.001, "the HUD keeps full-rate shading");
+        expect(r_back > 0.999 && r_back < 1.001, "back on DLAA the scene is shaded per pixel again");
+        expect(finite && fold_n && fold_change / fold_n < 3.0 * (dlaa_change / dlaa_n) + 0.002 && switch_change < 4.0 * (dlaa_change / dlaa_n) + 0.004,
+               "DLSS's folded picture is sane: it changes from frame to frame like DLAA's, with no jump at the switch");
+        expect(gpu && std::strstr(gpu, "samples=0") == nullptr, "per-stage GPU ms are logged on the DX11 route");
+        expect(cs.failures == 0 && cs.draws > 0, "coarse shading was set with no failure");
+        if (fold_measured) {
+            const char* ff = f11 ? std::strstr(f11, "folded_flow=") : nullptr;
+            const char* sm = f11 ? std::strstr(f11, "sampled_motion=") : nullptr;
+            { const auto fs = na::j2::compute_flow::GetStats(); std::printf("  folded working set: prepared %llu, failed %llu\n", (unsigned long long)fs.prepared, (unsigned long long)fs.prepare_failed); }
+            expect(sm && std::strtoull(sm + 15, nullptr, 10) >= 30, "with no camera the motion is sampled: only the kept pixels are decided");
+            expect(ff && std::strtoull(ff + 12, nullptr, 10) >= 30, "with no camera the motion search runs on the folded picture");
+        }
+        DeleteFileW(ini.c_str());
+        if (g_failed) std::printf("FAIL: %d fold check(s) failed\n", g_failed);
+        else std::printf("PASS: DLSS %s on the native DX11 route\n", level_name);
         std::fflush(stdout);
         ExitProcess(g_failed ? 1u : 0u);
     }

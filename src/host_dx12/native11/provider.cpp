@@ -41,6 +41,7 @@
 #include "host_dx12/native11/lit_scene.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
+#include "host_dx12/native11/coarse11.hpp"
 #include "providers/camera/camera_admission.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
@@ -278,6 +279,9 @@ struct Ctx {
     D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {}; // the game's own viewports
     UINT vp_n = 0;
     bool vpj_applied = false;          // our offset copies are bound on this context now
+    bool vpj_want = false;             // the draw being decided takes the scene's sample (VpjBeforeDraw)
+    uint32_t coarse_rate = 0;          // the shading rate we set on this context (0: one per pixel); never cleared by the
+                                       // game's state calls (NVAPI keeps it), reset by FinishCommandList
     bool vpj_expanded = false;
     uint64_t vpj_sample = 0;          // the exact sample they carry
     uint32_t cb_num[kCbBindSlots] = {};   // *SSetConstantBuffers1 constant count per slot (0 = whole buffer)
@@ -486,6 +490,10 @@ bool g_jitter_written = false; // this frame's camera upload carried our sample
 // without g_mu. While it is the route, the camera-matrix write (JitterUpload) stays out of it.
 std::atomic<bool> g_vpj_route{false}; // SetJitterRoute; the host turns it on for the native path
 std::atomic<uint64_t> g_vpj_sample{0}; // publish both float axes as one value
+// Coarse shading (SetSceneCoarseShading): the rate asked for, and whether this frame's scene is still open.
+std::atomic<uint32_t> g_coarse{0};
+std::atomic<bool> g_coarse_open{false};
+std::atomic<uint64_t> g_coarse_draws{0}, g_coarse_sets{0}, g_coarse_restores{0}, g_coarse_failures{0}, g_coarse_before_lists{0}, g_coarse_frames{0};
 std::atomic<Id> g_sel_depth{0};
 std::atomic<uint64_t> g_vpj_stopped_after_scene{0};
 std::atomic<Id> g_sel_depth2{0}; // the second depth the picture is drawn with (scene/after-layers-second-depth)
@@ -1811,6 +1819,7 @@ void Emit(Ctx* x, ID3D11DeviceContext* c, const Event& e, CameraUploads uploads 
 // Bound offset copies go back to the game's own viewports at the next draw.
 void StopViewportJitterAfterScene()
 {
+    g_coarse_open.store(false, std::memory_order_relaxed); // the scene is handed over: nothing after it is shaded in blocks
     if (g_vpj_sample.load(std::memory_order_relaxed)) {
         g_vpj_sample.store(0, std::memory_order_release);
         g_vpj_stopped_after_scene.fetch_add(1, std::memory_order_relaxed);
@@ -1824,6 +1833,7 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x, uint64_t vertices = 0)
     const uint64_t sample = g_vpj_sample.load(std::memory_order_acquire);
     const bool on = sample != 0;
     x->vpj_shader_depth = x->vpj_still_mesh = false;
+    x->vpj_want = false;
     if (!on && !x->vpj_applied) return;
     Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
     // VARIANT: scene/after-layers-second-depth
@@ -1864,6 +1874,7 @@ void VpjBeforeDraw(ID3D11DeviceContext* c, Ctx* x, uint64_t vertices = 0)
     const bool scene = on && scene_depth && x->depth == scene_depth && tests_scene_depth;
     if (scene && !x->vp_n) g_vpj_unknown.fetch_add(1, std::memory_order_relaxed);
     const bool want = WantsViewportJitter(on, x->depth, scene_depth, tests_scene_depth, x->vp_n);
+    x->vpj_want = want;
     const UINT n = x->vp_n;
     if (want) {
         g_vpj_draws.fetch_add(1, std::memory_order_relaxed);
@@ -1977,11 +1988,44 @@ ExactSet ExactForDraw(ID3D11DeviceContext* c, Ctx* x)
     return x->exact_set;
 }
 
+// Coarse shading before a game draw (SetSceneCoarseShading): the draws that take the scene's sample are
+// the draws shaded in blocks, one rule with the DX12 route (observe/producers.cpp); with no sample this
+// frame, the depth-tested draws into the scene depth until the scene is handed over.
+void CoarseApply(ID3D11DeviceContext* c, Ctx* x, uint32_t rate)
+{
+    Inside in;
+    ID3D11Device* dev = g_device_raw.load(std::memory_order_acquire);
+    if (coarse::Apply(c, dev, rate, x->vp_n, g_sel_depth_w.load(std::memory_order_relaxed), g_sel_depth_h.load(std::memory_order_relaxed))) {
+        x->coarse_rate = rate;
+        (rate ? g_coarse_sets : g_coarse_restores).fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_coarse_failures.fetch_add(1, std::memory_order_relaxed);
+        if (!rate) x->coarse_rate = 0; // nothing more can be done about it
+    }
+}
+void CoarseBeforeDraw(ID3D11DeviceContext* c, Ctx* x)
+{
+    const uint32_t rate = g_coarse.load(std::memory_order_relaxed);
+    if (!rate && !x->coarse_rate) return;
+    bool want = false;
+    if (rate && g_coarse_open.load(std::memory_order_relaxed)) {
+        if (g_vpj_sample.load(std::memory_order_relaxed)) want = x->vpj_want;
+        else {
+            const Id scene_depth = g_sel_depth.load(std::memory_order_relaxed);
+            want = scene_depth && x->depth == scene_depth && x->depth_test && x->vp_n;
+        }
+    }
+    const uint32_t r = want ? rate : 0;
+    if (r) g_coarse_draws.fetch_add(1, std::memory_order_relaxed);
+    if (r != x->coarse_rate) CoarseApply(c, x, r);
+}
+
 Ctx* DrawEvent(ID3D11DeviceContext* c, uint64_t vertices, bool indirect)
 {
     Ctx* x = Get(c);
     if (!x) return nullptr;
     VpjBeforeDraw(c, x, vertices);
+    CoarseBeforeDraw(c, x);
     const auto refresh_samplers = [&] {
         const uint64_t policy = SamplerPolicyKey();
         if (x->sampler_policy != policy) {
@@ -2637,6 +2681,8 @@ void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
     // same draw is forwarded. Restore it on that draw, not one draw later.
     if (state && !state->deferred && state->vpj_applied && !g_vpj_sample.load(std::memory_order_acquire))
         VpjBeforeDraw(c, state);
+    if (state && !state->deferred && state->coarse_rate && !g_coarse_open.load(std::memory_order_relaxed))
+        CoarseBeforeDraw(c, state); // the scene was handed over by this very draw's event: it is not shaded in blocks
     ForwardDepthRead(c, state, false, forward);
     if (state && !state->deferred && state->depth_layer_target) {
         auto& layer = state->raster_depth_layer;
@@ -3148,6 +3194,7 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
         }
         x->events.clear();
         x->events_truncated = false;
+        x->coarse_rate = 0; // the driver starts the next recording at one shading per pixel (vrs11_test (ii))
         x->list_writes.clear();
         x->list_writes_unknown = false;
         x->cb_bytes.clear();
@@ -3165,6 +3212,12 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
 void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11CommandList* list, BOOL restore)
 {
     Ctx* x = Get(c);
+    if (x && !x->deferred && x->coarse_rate && !t_inside) {
+        // The immediate context's coarse shading would also apply to the list's draws (vrs11_test (ii)):
+        // a list shades in blocks only what its own recording asked for.
+        g_coarse_before_lists.fetch_add(1, std::memory_order_relaxed);
+        CoarseApply(c, x, 0);
+    }
     if (x && list && !t_inside && (x->deferred || hud_free::Wanted())) {
         // What the list's recording wrote: carried into an enclosing recording, or told to the HUD-free picture.
         std::vector<Id> writes;
@@ -3592,6 +3645,9 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     }
     g_vpj_sample.store(sample, std::memory_order_release);
     g_jitter_requested = false;
+    const bool coarse = g_coarse.load(std::memory_order_relaxed) != 0;
+    g_coarse_open.store(coarse, std::memory_order_relaxed); // the next frame's scene may be shaded in blocks
+    if (coarse) g_coarse_frames.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -3933,6 +3989,24 @@ void SetCameraUse(CameraUse use)
 }
 
 void SetStillMeshJitter(bool asked) { g_vpj_still_asked.store(asked, std::memory_order_relaxed); }
+
+void SetSceneCoarseShading(uint32_t rate) { g_coarse.store(rate, std::memory_order_relaxed); }
+bool CoarseShadingAvailable(const char** why)
+{
+    return coarse::Available(g_device_raw.load(std::memory_order_acquire), why);
+}
+CoarseShadingStats GetCoarseShadingStats()
+{
+    CoarseShadingStats s;
+    s.rate = g_coarse.load(std::memory_order_relaxed);
+    s.draws = g_coarse_draws.load(std::memory_order_relaxed);
+    s.sets = g_coarse_sets.load(std::memory_order_relaxed);
+    s.restores = g_coarse_restores.load(std::memory_order_relaxed);
+    s.failures = g_coarse_failures.load(std::memory_order_relaxed);
+    s.before_lists = g_coarse_before_lists.load(std::memory_order_relaxed);
+    s.frames = g_coarse_frames.load(std::memory_order_relaxed);
+    return s;
+}
 
 void SetNextJitter(float x_px, float y_px)
 {

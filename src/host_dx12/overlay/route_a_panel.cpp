@@ -956,9 +956,10 @@ void DrawLiveDlaa()
             na::observe::SetSamplerMipBiasLive(on ? na::settings::DlaaMipBias(na::settings::Get()) : 0.0f);
     }
     EndRow();
-    if (!na::on12::NativeRoute()) {
-        // Fold the shading, live test (Cort 2026-11-25; core/fold_shading.hpp). One control; DLAA stays
-        // on screen until the chosen level has proven itself. Not saved: every launch starts on DLAA.
+    {
+        // Fold the shading, live test (Cort 2026-11-25; core/fold_shading.hpp). One control on both routes
+        // (DX12, native DX11); DLAA stays on screen until the chosen level has proven itself. Not saved:
+        // every launch starts on DLAA.
         static const char* kFoldLevels[] = {"DLAA (full size)", "Quality (test)", "Performance (test)"};
         na::settings::Settings& fs = na::settings::Get();
         int level = static_cast<int>((std::min)(fs.j2_fold_mode.load(), 2u));
@@ -967,7 +968,8 @@ void DrawLiveDlaa()
         if (ImGui::Combo("##j2fold", &level, kFoldLevels, 3)) fs.j2_fold_mode.store(static_cast<uint32_t>(level));
         EndRow();
         char fold_status[320]{};
-        na::j2::FoldStatus(fold_status, sizeof fold_status);
+        if (na::on12::NativeRoute()) na::native_d3d11::FoldStatus(fold_status, sizeof fold_status);
+        else na::j2::FoldStatus(fold_status, sizeof fold_status);
         if (level != 0 || std::strstr(fold_status, "DLAA (full size)") == nullptr) Hint(fold_status);
     }
     char native_status[200]{};

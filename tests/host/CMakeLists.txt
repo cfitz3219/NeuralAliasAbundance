@@ -529,6 +529,15 @@ if(TARGET host_native11)
     add_test(NAME host_native11_dlaa_automatic_test COMMAND native11_dlaa_test --automatic)
     set_tests_properties(host_native11_dlaa_automatic_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     add_test(NAME host_native11_dlaa_camera_off_start_test COMMAND native11_dlaa_test --camera-off-start)
+    # DLSS Quality / Performance on the native DX11 route: coarse shading on the scene draws (NVAPI), the shared
+    # fold pass, DLAA on screen until the level is ready, then back to DLAA.
+    add_test(NAME host_native11_fold_quality_test COMMAND native11_dlaa_test --fold-quality)
+    add_test(NAME host_native11_fold_performance_test COMMAND native11_dlaa_test --fold-performance)
+    # The same with no camera: motion measured, sampled at the kept pixels, the search on the folded picture.
+    add_test(NAME host_native11_fold_quality_measured_test COMMAND native11_dlaa_test --fold-quality-measured)
+    add_test(NAME host_native11_fold_performance_measured_test COMMAND native11_dlaa_test --fold-performance-measured)
+    set_tests_properties(host_native11_fold_quality_test host_native11_fold_performance_test host_native11_fold_quality_measured_test
+      host_native11_fold_performance_measured_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
     # Stage 3: live x2 on a DX11 game with the real nvngx_dlssg (NA_FG_SEARCH names its folder; skipped without it).
     add_test(NAME host_native11_fg_x2_test COMMAND native11_dlaa_test --fg-x2)
     add_test(NAME host_native11_fg_x2_fp16_test COMMAND native11_dlaa_test --fg-x2-fp16)
