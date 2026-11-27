@@ -58,6 +58,7 @@
 #include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <array>
@@ -2000,7 +2001,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     // One presenter for both APIs, stage 3: live x2 on a DX11 game (proxy chain, native DLAA inputs,
     // HUD-free picture, presenter), 8-bit SDR or FP16 back buffer.
     const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
-    const bool fg_x2 = fg_x2_hdr || fg_auto != 0 || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
+    // x2 together with a DLSS level (the fold): Frame Generation gets the level's folded depth and motion.
+    const uint32_t fg_fold = !std::strcmp(arg1, "--fg-x2-quality") ? 1u : !std::strcmp(arg1, "--fg-x2-performance") ? 2u : 0u;
+    const bool fg_x2 = fg_x2_hdr || fg_auto != 0 || fg_fold != 0 || (argc > 1 && std::strcmp(argv[1], "--fg-x2") == 0);
     const bool proxy_env_off = GetEnvironmentVariableW(L"NA_TEST_PROXY_OFF", nullptr, 0) != 0;
     // DLSS Quality / Performance on the native DX11 route (the fold: coarse shading through NVAPI, the
     // shared fold pass, the waiting period with DLAA on screen).
@@ -2059,6 +2062,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     g.padded_hdr = padded_hdr;
     if (fg_x2_hdr) g.back_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (fold_measured) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
+    {   // NA_TEST_FOLD_SIZE=WxH: the fold fixture at another picture size (e.g. 3440x1440 for the memory figure).
+        wchar_t sz[32]{};
+        unsigned fw = 0, fh = 0;
+        if (fold_level && GetEnvironmentVariableW(L"NA_TEST_FOLD_SIZE", sz, 32) && swscanf_s(sz, L"%ux%u", &fw, &fh) == 2 && fw && fh) { g.w = fw; g.h = fh; }
+    }
 #endif
     const bool centered_scene = argc > 1 && std::strcmp(argv[1], "--centered-scene") == 0;
     if (centered_scene) g.screen_extra_width = 88;
@@ -2254,6 +2262,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             std::fflush(stdout);
             ExitProcess(g_failed ? 1u : 0u);
         }
+        if (fg_fold) st.j2_fold_mode.store(fg_fold); // the level is asked for from the first frame; x2 runs beside it
+        const char* fold_name = fg_fold == 2 ? "Performance" : "Quality";
+        const auto fold_on_screen = [&] {
+            char fs11[512]{};
+            na::native_d3d11::FoldStatus(fs11, sizeof fs11);
+            return std::string(fs11).find(std::string("On screen: ") + fold_name) != std::string::npos;
+        };
         bool asked = false;
         static std::atomic<ULONGLONG> last_frame_at{GetTickCount64()};
         std::thread([] { // a frame that never returns: say where everything stood, then stop
@@ -2274,7 +2289,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             g.swap->Present(0, 0);
             if (GetTickCount64() - t0 > 200) std::printf("  frame %d took %llu ms\n", frame, GetTickCount64() - t0);
             const auto pr = na::present::GetStats();
-            if (!asked && pr.generated_shown >= 20) { // x2 runs: save the presented real / generated / real pictures
+            if (!asked && pr.generated_shown >= 20 && (!fg_fold || fold_on_screen())) { // x2 runs: save the presented real / generated / real pictures
                 char why[160]{};
                 asked = na::present::RequestOutputCapture(3, why, sizeof why);
                 expect(asked, "the presented-picture capture starts");
@@ -2353,6 +2368,16 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             std::error_code ec; std::filesystem::remove(cap, ec);
         }
         expect(pr.device_hr == S_OK, "no device removal");
+        if (fg_fold) {
+            char fs11[512]{};
+            na::native_d3d11::FoldStatus(fs11, sizeof fs11);
+            const auto cs = na::native11::GetCoarseShadingStats();
+            std::printf("  with %s: menu \"%s\"; coarse frames %llu, draws %llu, before lists %llu, failures %llu\n", fold_name, fs11,
+                        static_cast<unsigned long long>(cs.frames), static_cast<unsigned long long>(cs.draws),
+                        static_cast<unsigned long long>(cs.before_lists), static_cast<unsigned long long>(cs.failures));
+            expect(fold_on_screen(), "the DLSS level is on screen while x2 runs");
+            expect(cs.frames > 0 && cs.failures == 0, "the scene was shaded in blocks with no failure");
+        }
         DeleteFileW(ini.c_str());
         std::printf(g_failed ? "FAIL: %d live x2 check(s) failed\n" : "PASS: live x2 on a DX11 game\n", g_failed);
         std::fflush(stdout);
@@ -2462,6 +2487,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             return std::string(status);
         };
         auto& st = na::settings::Get();
+        // NA_TEST_NO_PREWARM: the levels' DLSS is not made with DLAA's (for the memory comparison only).
+        if (GetEnvironmentVariableW(L"NA_TEST_NO_PREWARM", nullptr, 0)) st.j2_fold_prewarm.store(0);
         const char* level_name = fold_level == 2 ? "Performance" : "Quality";
         int frame = 0;
         // A. DLAA.
@@ -2476,6 +2503,16 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             if (frame >= 30) { dlaa_ms_sum += s.ms; dlaa_scene += s.scene; dlaa_post += s.post; dlaa_change += s.change; ++dlaa_n; }
         }
         const double dlaa_ms = dlaa_ms_sum / dlaa_n;
+        {   // Video memory this process holds after DLAA has run (with or without the levels' DLSS made beside it).
+            ComPtr<IDXGIDevice> dd;
+            ComPtr<IDXGIAdapter> da;
+            ComPtr<IDXGIAdapter3> a3;
+            DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+            if (SUCCEEDED(g.device.As(&dd)) && SUCCEEDED(dd->GetAdapter(&da)) && SUCCEEDED(da.As(&a3)) &&
+                SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
+                std::printf("  video memory held on DLAA at %ux%u (levels' DLSS made with DLAA's: %s): %.1f MB\n", g.w, g.h,
+                            st.j2_fold_prewarm.load() ? "yes" : "no", double(mi.CurrentUsage) / 1048576.0);
+        }
         // B. The level asked for: DLAA stays on screen while it is readied, then the switch.
         st.j2_fold_mode.store(fold_level);
         const int asked_at = frame;
