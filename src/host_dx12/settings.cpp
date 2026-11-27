@@ -194,6 +194,7 @@ void load_from(const wchar_t* ini, bool only_if_present,Settings& target=g_setti
         target.j2_jitter_conv_final.store(jn > 3 ? 0 : jn);
         const int js = static_cast<int>(GetPrivateProfileIntW(L"j2", L"jitter_shift", 1, ini));
         target.j2_jitter_shift.store(js < 0 ? -1 : (js > 0 ? 1 : 0));
+        target.j2_restart_ramp.store((std::min)(64u, static_cast<uint32_t>(GetPrivateProfileIntW(L"j2", L"restart_ramp", 8, ini))));
         const int vj = static_cast<int>(GetPrivateProfileIntW(L"j2", L"viewport_jitter", 1, ini));
         target.j2_viewport_jitter.store(vj < 0 ? -1 : (vj > 0 ? 1 : 0));
         target.j2_draw_replay.store(GetPrivateProfileIntW(L"j2", L"draw_replay", 0, ini) ? 1u : 0u);

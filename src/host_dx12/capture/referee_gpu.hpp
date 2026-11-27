@@ -18,6 +18,7 @@
 #include <vector>
 #include "core/referee_selection.hpp"
 #include "core/referee_trial.hpp"
+#include "core/referee_coverage.hpp"
 
 namespace na::referee { struct PlacementScope; }
 namespace na::referee::gpu {
@@ -78,6 +79,15 @@ bool SceneOverlays(const void* swapchain, shadow::Path path, const char** why = 
 // The host's counts for its last frame: overlay meshes that took the sample, and scene meshes it left on the
 // game's grid. The overlay watch and the jitter-strength trial read them.
 void NoteSceneMeshes(shadow::Path path, uint64_t overlays_moved, uint64_t left_unjittered);
+// VARIANT: referee/coverage-trial (core/referee_coverage.hpp)
+// The host's scene-colour draws left off the jitter on its last frame, by class (LeftClass order); summed over the
+// Referee's window. The classes the Referee moves onto the sample (bit per LeftClass: kept ones and the one on
+// trial), and its last decision (the host promotes or demotes the draw signatures it moved during that trial).
+void NoteLeftByClass(shadow::Path path, const uint64_t (&left)[na::referee::kLeftClasses]);
+uint32_t CoverageMoveMask(shadow::Path path);
+struct CoverageDecision { uint64_t decisions = 0; int cls = -1; bool kept = false; int trial = -1; };
+CoverageDecision LastCoverageDecision(shadow::Path path);
+void SetCoverageMaskForTests(shadow::Path path, uint32_t mask);
 bool SceneStillMeshes(const void* swapchain, shadow::Path path, uint64_t color, uint64_t depth,
                       uint64_t generation, uint64_t frame, uint64_t screen_proof = 0);
 void InvalidatePresentation(const void* swapchain);

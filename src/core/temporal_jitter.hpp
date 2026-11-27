@@ -101,6 +101,17 @@ constexpr bool SceneOverlayTakesJitter(const SceneOverlay& o)
     return o.enabled && o.active && !o.tests_depth && o.scene_depth_bound && o.scene_colour && o.mesh && o.scene_viewport &&
            !o.after_handover && !o.reads_stationary_layer;
 }
+// VARIANT: jitter/ramp-after-restart (default, [j2] restart_ramp frames) | jitter/full-after-restart (0)
+// After DLSS's history restarts, its first frames show the jittered input almost as it is: the wobble of the
+// jitter itself, "like jitter viewed straight on" (Cort, Hearts of Iron IV 2026-11-27, 104 restarts in a run, 25 in
+// two minutes). The frames after a restart therefore start with no offset and take the jitter back in steps:
+// frame k after the restart (k = 1 the first frame accumulated on the new history) gets k / ramp of the sample.
+// The restart frame itself was already drawn with its sample.
+constexpr float RestartJitterScale(uint32_t frames_since_restart, uint32_t ramp)
+{
+    if (!ramp || frames_since_restart > ramp) return 1.f;
+    return frames_since_restart <= 1 ? 0.f : float(frames_since_restart - 1) / float(ramp);
+}
 // The overlay owns this session-only transform. NVIDIA's F9/F10 hotkeys
 // have no reported state we can reliably return to zero.
 struct JitterDiagnostic {

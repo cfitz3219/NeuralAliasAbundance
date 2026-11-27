@@ -361,21 +361,16 @@ int TestAdaptiveJitter(test::Device& d, test::List& l, bool localized = false, b
                 }
                 return true;
             };
-            REQUIRE(window(normal_jitter));
-            CHECK(amount() == normal_jitter);
-            REQUIRE(window(normal_jitter));
-            CHECK(amount() == reduced_jitter);
-            REQUIRE(window(reduced_jitter));
-            if (try_quarter) {
-                CHECK(amount() == quarter_jitter);
-                REQUIRE(window(quarter_jitter));
+            // VARIANT: referee/no-strength-reduction: the same vibrating edges, window after window, never weaken
+            // the jitter (the coverage trial answers them by moving draws left off the jitter).
+            (void)try_quarter;
+            for (int round = 0; round < 4; ++round) {
+                REQUIRE(window(normal_jitter));
+                CHECK(amount() == normal_jitter);
             }
-            CHECK(amount() == normal_jitter);
-            REQUIRE(window(normal_jitter));
-            CHECK(amount() == (try_quarter ? quarter_jitter : reduced_jitter));
             CHECK(rg::SceneJitterAmount(&d, path, 1, 3, 3, ordinal, proof) == normal_jitter);
             CHECK(rg::SceneJitterAmount(&l, path, 1, 2, 3, ordinal, proof) == normal_jitter);
-            std::printf("Referee jitter %s: kept strength %u\n", shadow::Name(path), unsigned(amount()));
+            std::printf("Referee jitter %s: strength stays %u after repeated vibration\n", shadow::Name(path), unsigned(amount()));
             na::settings::Get().referee_enabled.store(0);
             CHECK(amount() == normal_jitter);
             CHECK(!rg::Wanted());

@@ -468,6 +468,11 @@ if(NA_HAVE_NGX_LIB)
            COMMAND dlss_real_test "${CMAKE_CURRENT_BINARY_DIR}/dlss-stationary-test" --stationary)
   set_tests_properties(host_dlss_stationary_stability_test
     PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
+  # VARIANT jitter/ramp-after-restart: the wobble after a history restart, full jitter against the ramp.
+  add_test(NAME host_dlss_restart_wobble_test
+           COMMAND dlss_real_test "${CMAKE_CURRENT_BINARY_DIR}/dlss-restart-test" --restart-wobble)
+  set_tests_properties(host_dlss_restart_wobble_test
+    PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 LABELS "host;gpu;nvidia")
   if(NA_DLSS_DLL)
     add_custom_command(TARGET dlss_real_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")

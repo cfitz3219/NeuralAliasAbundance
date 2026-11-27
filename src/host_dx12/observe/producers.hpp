@@ -537,6 +537,12 @@ void SetSceneOverlayJitter(bool on, const char* why);
 bool SceneOverlayJitter();
 // Untested scene meshes left on the game's grid so far (all reasons).
 uint64_t UnjitteredSceneMeshes();
+// VARIANT: referee/coverage-trial (core/referee_coverage.hpp, LeftClass order): untested scene meshes left off the
+// jitter by class since the last call; the classes the Referee moves onto the sample, the one on trial, and its
+// last decision (a put-back trial's pipelines stay on the game's grid from then on); draws moved so far.
+void LeftByClass(uint64_t (&out)[7]);
+void SetCoverage(uint32_t mask, int trial, uint64_t decisions, int last_class, bool last_kept);
+uint64_t CoverageMovedDraws();
 // Wall time inside each outermost command-list hook (ours + driver), ExecuteCommandLists
 // ("exec") and pipeline creation ("pso") since the previous call: one status line,
 // "hook_cost ... s<slot>{ms_per_s calls_per_s us}" (slot = ID3D12GraphicsCommandList vtable index).

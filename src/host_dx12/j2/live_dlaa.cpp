@@ -221,6 +221,7 @@ struct State {
     std::atomic<bool> configured{false};
     std::atomic<bool> paused{false}; // the user's on/off switch in the overlay
     bool resume_reset = false;       // history is stale after a pause
+    uint32_t since_restart = 0;      // frames since DLSS's history last restarted (jitter/ramp-after-restart)
     neural_alias::JitterMode jitter_history{}, small_jitter_history{};
     bool inl_redirected = false;     // the pending inline DLSS also rebound the game's pass (counted when submitted)
     bool latched = false;            // stopped for this session after a failure (reason kept)
@@ -3373,13 +3374,24 @@ void vpj_advance()
         const char* why = nullptr;
         const bool overlays = !g.recovery_swapchain || referee::gpu::SceneOverlays(g.recovery_swapchain, referee::shadow::Path::Inline, &why);
         na::observe::SetSceneOverlayJitter(overlays, why);
+        // VARIANT: referee/coverage-trial: the draws left off the jitter since the last frame, by class, to the
+        // Referee; its classes back to the producers.
+        uint64_t left_by[na::referee::kLeftClasses];
+        na::observe::LeftByClass(left_by);
+        referee::gpu::NoteLeftByClass(referee::shadow::Path::Inline, left_by);
+        const auto decision = referee::gpu::LastCoverageDecision(referee::shadow::Path::Inline);
+        na::observe::SetCoverage(referee::gpu::CoverageMoveMask(referee::shadow::Path::Inline), decision.trial, decision.decisions,
+                                 decision.cls, decision.kept);
     }
     auto& e = g.vpj[g.frame % 8];
     // A folded scene's sample covers a whole block, not one pixel (core/fold_shading.hpp).
     const auto fold_block = g_fold.spacing.block;
     const auto fold_pick = g_fold.spacing.pick;
-    e = {g.frame, static_cast<float>(js.x_pixels) * (amount * .01f) * static_cast<float>(fold_block.x) + na::fold::KeptPixelCentring(fold_block.x, fold_pick.x),
-                  static_cast<float>(js.y_pixels) * (amount * .01f) * static_cast<float>(fold_block.y) + na::fold::KeptPixelCentring(fold_block.y, fold_pick.y), amount};
+    // VARIANT: jitter/ramp-after-restart: no offset on the first frame after a history restart, then back in steps.
+    const float ramp = neural_alias::RestartJitterScale(g.since_restart + 1, settings::Get().j2_restart_ramp.load(std::memory_order_relaxed));
+    if (ramp < 1.f) ++g.stats.restart_ramped;
+    e = {g.frame, static_cast<float>(js.x_pixels) * (amount * .01f) * ramp * static_cast<float>(fold_block.x) + na::fold::KeptPixelCentring(fold_block.x, fold_pick.x),
+                  static_cast<float>(js.y_pixels) * (amount * .01f) * ramp * static_cast<float>(fold_block.y) + na::fold::KeptPixelCentring(fold_block.y, fold_pick.y), amount};
     // Exactly what the draws will carry, so the request and the drawn sample compare equal.
     e.x = std::round(e.x * na::observe::kSceneViewportJitterUnits) / na::observe::kSceneViewportJitterUnits;
     e.y = std::round(e.y * na::observe::kSceneViewportJitterUnits) / na::observe::kSceneViewportJitterUnits;
@@ -5810,7 +5822,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         // carries the reset. Until now those frames showed their own picture (RecordCutShow below).
         ++g.stats.measured_cut_resets;
         e.reset = true;
-        na::eventlog::Emit("camera_cut", "api=dx12 frame=%llu verdict=reset_confirmed_by_pictures", static_cast<unsigned long long>(g.frame));
+        char numbers[256] = "";
+        na::j2::compute_flow::FormatCutNumbers(numbers, sizeof numbers);
+        na::eventlog::Emit("camera_cut", "api=dx12 frame=%llu verdict=reset_confirmed_by_pictures %s", static_cast<unsigned long long>(g.frame), numbers);
     }
     e.hdr = is_float_color(cf);
     e.depth_inverted = reversed;
@@ -5843,6 +5857,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if ((smear == 4) != preset_test) { preset_test = smear == 4; na::dlss::ReleaseView(kViewId); e.reset = true; }
         if (smear == 4) e.preset = 12; // NVSDK_NGX_DLSS_Hint_Render_Preset_L
     }
+    g.since_restart = e.reset ? 0u : g.since_restart + 1u; // jitter/ramp-after-restart
     // Fold the shading (core/fold_shading.hpp). The mode on screen keeps running; a newly asked mode is
     // run beside it into a picture nobody sees until it has proven itself (Handover).
     ID3D12Resource* const full_color = e.color; // full size: what a measured cut shows (RecordCutShow)

@@ -139,6 +139,9 @@ struct Settings {
     // the opposite sign, 0 = off: the camera-matrix route). Cort 2026-11-04. Loading the ini
     // turns it on unless the ini says otherwise; without a Load (tests) the camera-matrix route stays.
     std::atomic<int32_t> j2_viewport_jitter{0};
+    // VARIANT: jitter/ramp-after-restart: frames over which the jitter comes back after a DLSS history restart
+    // (core/temporal_jitter.hpp RestartJitterScale); 0 = jitter/full-after-restart. Hidden: [j2] restart_ramp.
+    std::atomic<uint32_t> j2_restart_ramp{8};
     // VARIANT: camera/optional
     // [j2] camera: what the scene camera is to DLAA on the native DX11 route (2026-11-16, Cort:
     // "eliminate the dependency"). 1 = used when found (default): a frame without one still gets DLAA,

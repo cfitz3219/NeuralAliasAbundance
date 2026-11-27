@@ -108,4 +108,13 @@ int main() { return test::run({
         NEAR((mul(j, 1) / mul(j, 3) - mul(m, 1) / mul(m, 3)) * -300, -.375, 1e-12);
         NEAR(mul(j, 2), mul(m, 2), 0); NEAR(mul(j, 3), mul(m, 3), 0); CHECK(m == original);
     }},
+    {"jitter/ramp-after-restart: no offset on the first frame after a restart, then back in steps", [] {
+        // jitter/full-after-restart (ramp 0): always the full sample.
+        CHECK(RestartJitterScale(0, 0) == 1.f && RestartJitterScale(1, 0) == 1.f);
+        // Ramp 8: the first frame accumulated on the new history has no offset, frame 9 on the full sample.
+        CHECK(RestartJitterScale(1, 8) == 0.f);
+        CHECK(RestartJitterScale(2, 8) == .125f && RestartJitterScale(5, 8) == .5f && RestartJitterScale(8, 8) == .875f);
+        CHECK(RestartJitterScale(9, 8) == 1.f && RestartJitterScale(1000, 8) == 1.f);
+        for (uint32_t k = 1; k < 9; ++k) CHECK(RestartJitterScale(k + 1, 8) > RestartJitterScale(k, 8));
+    }},
 }); }
