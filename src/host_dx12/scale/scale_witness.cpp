@@ -557,7 +557,9 @@ void write_verdict()
     FILE* f = nullptr;
     if (_wfopen_s(&f, g.verdict_path.c_str(), L"w") != 0 || !f) return;
     SYSTEMTIME now; GetSystemTime(&now);
-    std::fprintf(f, "NeuralAlias render-scale finder test (log only: nothing in the game was changed)\n");
+    std::fprintf(f, "NeuralAlias render-scale finder test (%s)\n", g.search_wanted.load() ? "The Search: candidate numbers are nudged by 5 points "
+                 "for under a second each and put back" : g.trial_wanted.load() ? "confirmed numbers are nudged by 5 points and put back"
+                 : "log only: nothing in the game was changed");
     std::fprintf(f, "Written %04u-%02u-%02u %02u:%02u:%02u UTC, game process %lu\n\n", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
                  now.wSecond, GetCurrentProcessId());
     std::fprintf(f, "RESULT: %s\nREASON: %s\n\n", pass ? "PASS" : "FAIL", reason);
