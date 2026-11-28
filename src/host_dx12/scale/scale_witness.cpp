@@ -1002,7 +1002,8 @@ void run_trial()
     }
     const double home = start.Ratio();
     // Ask for something clearly different from where the game is, and inside what any game allows.
-    const double goal = home > 0.85 ? 0.70 : 1.0;
+    // A small nudge the player will not notice: five points down, or up when the game is already low.
+    const double goal = home > 0.60 ? home - 0.05 : home + 0.05;
     watch_rearm(); // threads the game started since
     line("trial: starting. World %ux%u (%.1f%%), asking each of %zu confirmed numbers for %.0f%%", start.world_w, start.world_h, home * 100.0, scales.size(), goal * 100.0);
     { std::lock_guard<std::mutex> l(g.trial_m); g.trial_state = 1; }
