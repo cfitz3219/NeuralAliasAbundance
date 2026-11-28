@@ -1192,7 +1192,20 @@ bool do_poke(int poke)
     EnumWindows(&pick_window, reinterpret_cast<LPARAM>(&pick));
     const HWND w = pick.best;
     RECT client{}, outer{};
-    if (!w || !GetClientRect(w, &client) || !GetWindowRect(w, &outer)) return false;
+    static std::atomic<bool> said{false};
+    if (!w || !GetClientRect(w, &client) || !GetWindowRect(w, &outer)) {
+        if (!said.exchange(true)) line("poke: the game has no visible window to signal");
+        return false;
+    }
+    if (!said.exchange(true)) {
+        const LONG_PTR style = GetWindowLongPtrW(w, GWL_STYLE), ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        const bool covers = outer.right - outer.left >= sw && outer.bottom - outer.top >= sh;
+        line("poke: the game's window is %ldx%ld (client %ldx%ld) on a %dx%d screen, %s, %s (style 0x%llx, extended 0x%llx)", outer.right - outer.left,
+             outer.bottom - outer.top, client.right, client.bottom, sw, sh, (style & WS_CAPTION) == WS_CAPTION ? "with a title bar (windowed)" : "no title bar",
+             covers ? "covers the screen (borderless or fullscreen)" : "smaller than the screen", static_cast<unsigned long long>(style),
+             static_cast<unsigned long long>(ex));
+    }
     if (poke == 1) {
         PostMessageW(w, WM_SIZE, SIZE_RESTORED, MAKELPARAM(client.right, client.bottom));
         PostMessageW(w, WM_EXITSIZEMOVE, 0, 0);
