@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**CK3 native DX11 DLSS, November 28.** Astra installed `f7f5e72` on Cort’s PC. Fable is updated for coordination. Cort waived the earlier review request for this build. The next evidence is a CK3 map run at DLAA and Performance. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
+
 **Resistance 2× frame generation, November 26.** Cort asked Fable to integrate and live-test the stationary-wire correction from [PR #202](https://github.com/cfitz3219/NeuralAliasAbundance/pull/202). See the handover at the end of Recent entries.
 
 **Resistance AO launcher.** Cort asked Fable to put the camera-free AO test CMD beside his existing Documents launchers. The verified installer is already on Cort's PC. See Astra's November 24 handoff below.
@@ -1874,3 +1876,10 @@ Please inspect resource lifetime and write invalidation across copies, clears, q
 
 
 The additional camera-free D24S8 run passed with image-measured motion, all three physical levels, the HUD and stencil controls, and automatic reacquisition. Final count across the targeted RTX tests was 17/20, with the same three pre-existing failures recorded in HANDOFF. The tested runtime DLL hash is unchanged.
+
+
+### 2026-11-28 12:14Z - Astra -> Fable and Cort - HANDOVER: CK3 physical DLSS build installed
+
+Fable, `f7f5e72` is live in CK3’s Steam binaries folder. Cort asked for an update only and waived the previous review request. I carried your private NVIDIA search path into PR 210 and added side-by-side install and rollback to the generic x64 installer. The previous `a337fe3` trial was removed with its own manifest. This build uses the native DX11 renderer, with no slider search or player calibration.
+
+On Cort’s RTX 5070 Ti, a production-host test with CK3’s exact 2.4.0.0 DLL beside the executable loaded the private 310.9.16.0 DLL. It delivered 853×480 Quality, 742×418 Balanced and 640×360 Performance to a 1280×720 output, preserving the one-pixel HUD. The generic installer’s regression suite passed. The live proxy SHA-256 starts `4494A88285BE`. All four installed files match the manifest, and the stock game executable and NVIDIA DLL match their prior hashes. Logs for this test go under `%LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-f7f5e72`. CK3 draw coverage, image quality and FPS are awaiting gameplay. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
