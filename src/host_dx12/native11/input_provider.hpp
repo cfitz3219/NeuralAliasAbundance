@@ -91,6 +91,12 @@ enum class Boundary : uint8_t {
     BeforeHud,   // scene-in-back-buffer games: before the first non-scene draw into the colour
 };
 
+// Recorded at the draw only after its marked scene texels reached the presented picture.
+struct ScaledReaderFacts {
+    uint64_t target = 0, shader = 0; // object incarnations on this device
+    uint32_t slot = 0, width = 0, height = 0;
+    bool display_size = false; // a reduced-size pass can feed a later compositor
+};
 struct SceneFrame {
     const void* presentation_source = nullptr; // identity only, valid for this provider frame
     uint64_t frame = 0;            // provider frame counter (advances at Present)
@@ -109,6 +115,7 @@ struct SceneFrame {
     // changes, appears or goes does not move it (it moves `stream`, which the camera's consumer reads).
     uint64_t scene_stream = 0;
     uint64_t screen_proof = 0;     // current verified reader, or zero for ordinary placement
+    ScaledReaderFacts scaled_reader{};
     uint64_t trial_ticket = 0;     // valid only in a measured, post-warmup trial window
     referee::RecoveryTool recovery_tool{};
     uint64_t recovery_configuration = 0;
@@ -151,6 +158,7 @@ struct ProviderStats {
     // proven yet, and frames on which a proven direction and the camera's own answer disagreed.
     uint64_t depth_unproven = 0, depth_camera_disagrees = 0;
     uint64_t screen_confirmed = 0, screen_refuted = 0, screen_pairs = 0, screen_delivered = 0;
+    uint64_t scaled_compositor_confirmed = 0, scaled_compositor_refuted = 0, scaled_compositor_draws = 0;
     const char* last_miss = "";
 };
 
@@ -164,7 +172,7 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present 
 using ParitySignal = bool (*)(const void* swapchain, const referee::PlacementScope& scope);
 void SetParitySignal(ParitySignal seen);
 // The hosted path receives DXGI events through the overlay's existing hooks.
-void SetScreenCheck(bool on);
+void SetScreenCheck(bool on, bool discover_scale = false);
 void RejectScreenProof(uint64_t proof);
 // The native provider closes the frame on the same hook that samples it.
 struct PresentReceipt {

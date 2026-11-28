@@ -196,6 +196,19 @@ public:
         swap_w_ = w;
         swap_h_ = h;
     }
+    // A reduced world and a full-size destination. Allow one source texel of rounding
+    // on either axis (including NVIDIA's recommended levels on ultrawide displays).
+    bool IsDisplayExtent(const ResourceInfo& r) const { return r.width == swap_w_ && r.height == swap_h_; }
+    bool IsReducedPicture(const ResourceInfo& source) const
+    {
+        if (!source.width || !source.height || source.width >= swap_w_ || source.height >= swap_h_ ||
+            uint64_t(source.width) * 100 >= uint64_t(swap_w_) * 98 ||
+            uint64_t(source.width) * 2 < swap_w_ || uint64_t(source.height) * 2 < swap_h_)
+            return false;
+        const auto a = uint64_t(source.width) * swap_h_;
+        const auto b = uint64_t(source.height) * swap_w_;
+        return (a > b ? a - b : b - a) <= (std::max)(swap_w_, swap_h_);
+    }
     // VARIANT: scene/pushed-without-screen-proof
     // A picture that is not the screen's shape could not be matched to the screen pixel for pixel
     // (the game stretches it, or draws it through passes the challenge cannot follow). It is still

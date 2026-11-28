@@ -129,6 +129,18 @@ float4 ps_scene_coords(float4 p : SV_Position) : SV_Target { shading_count.Inter
 float4 ps_hud_coords(float4 p : SV_Position) : SV_Target { shading_count.InterlockedAdd(4, 1); return float4(frac(p.x / 8.0), 1, 1, 0.5); }
 float4 ps_screen_check(float4 p : SV_Position) : SV_Target { return float4(scene.Load(int3(int2(p.xy), 0)).rgb * 0.75, 1); }
 struct LitVertex { float4 p : SV_Position; float2 surface : TEXCOORD0; };
+Texture2D<float4> scaled_scene : register(t7);
+LitVertex vs_scaled_scene(uint id : SV_VertexID) {
+    LitVertex v;
+    v.p = vs_post(id);
+    v.surface = float2(v.p.x + 1, 1 - v.p.y) * 0.5;
+    return v;
+}
+float4 ps_scaled_scene(LitVertex v) : SV_Target {
+    uint w, h;
+    scaled_scene.GetDimensions(w, h);
+    return scaled_scene.Load(int3(uint2(v.surface * float2(w, h)), 0));
+}
 LitVertex vs_reflection(uint id : SV_VertexID) {
     LitVertex v;
     v.p = vs_post(id);
@@ -246,7 +258,7 @@ struct Game {
     ComPtr<IDXGISwapChain> swap;
     HWND wnd = nullptr;
     UINT w = 320, h = 180;
-    UINT screen_extra_width = 0;
+    UINT screen_extra_width = 0, screen_extra_height = 0;
     bool padded_hdr = false;
     bool shader_depth = false;
     DXGI_FORMAT back_format = DXGI_FORMAT_R8G8B8A8_UNORM; // the swap chain's format
@@ -360,7 +372,7 @@ bool MakeGame(Game& g, bool warp, bool debug = false)
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 2;
     sd.BufferDesc.Width = g.w + g.screen_extra_width;
-    sd.BufferDesc.Height = g.h + (g.padded_hdr ? 3 : 0);
+    sd.BufferDesc.Height = g.h + g.screen_extra_height + (g.padded_hdr ? 3 : 0);
     sd.BufferDesc.Format = g.back_format;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = g.wnd;
@@ -1178,41 +1190,73 @@ int DepthReadFixture(Game& g, bool debug_layer)
 }
 #endif
 
-// A game sends a native-sized picture to the middle of a wider swap chain.
-// The same source can feed an invisible target first; that read cannot authorize DLAA.
-int CenteredSceneFixture(Game& game)
+// A centered picture or a reduced world reaches the screen after an identical-looking decoy draw.
+// The reduced world can also go through another texture before presentation.
+int ScreenExtentFixture(Game& game, bool scaled, bool through_post)
 {
     D3D11_TEXTURE2D_DESC d{};
     game.color->GetDesc(&d);
+    if (scaled) {
+        d.Width += game.screen_extra_width;
+        d.Height += game.screen_extra_height;
+        d.Format = game.back_format;
+    }
     ComPtr<ID3D11Texture2D> decoy;
     ComPtr<ID3D11RenderTargetView> decoy_rtv;
     if (FAILED(game.device->CreateTexture2D(&d, nullptr, &decoy)) ||
         FAILED(game.device->CreateRenderTargetView(decoy.Get(), nullptr, &decoy_rtv))) return 1;
-    const auto ps_code = Compile("ps_centered_scene", "ps_5_0");
+    const auto ps_code = Compile(scaled ? "ps_scaled_scene" : "ps_centered_scene", "ps_5_0");
     ComPtr<ID3D11PixelShader> ps;
     if (!ps_code || FAILED(game.device->CreatePixelShader(ps_code->GetBufferPointer(), ps_code->GetBufferSize(), nullptr, &ps))) return 1;
 
+    ComPtr<ID3D11VertexShader> post = game.vs_post;
+    if (scaled) {
+        const auto code = Compile("vs_scaled_scene", "vs_5_0");
+        post.Reset();
+        if (!code || FAILED(game.device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &post))) return 1;
+    }
+    ComPtr<ID3D11Texture2D> intermediate;
+    ComPtr<ID3D11RenderTargetView> post_target;
+    ComPtr<ID3D11ShaderResourceView> post_input;
+    if (through_post) {
+        D3D11_TEXTURE2D_DESC reduced{};
+        game.color->GetDesc(&reduced);
+        if (FAILED(game.device->CreateTexture2D(&reduced, nullptr, &intermediate)) ||
+            FAILED(game.device->CreateRenderTargetView(intermediate.Get(), nullptr, &post_target)) ||
+            FAILED(game.device->CreateShaderResourceView(intermediate.Get(), nullptr, &post_input))) return 1;
+    }
     struct Consumer {
         Game& game;
+        bool scaled, through_post;
+        ID3D11RenderTargetView* expected;
         unsigned accepted = 0;
-    } consumer{game};
+    } consumer{game, scaled, through_post, through_post ? post_target.Get() : game.back_rtv.Get()};
     const auto evaluate = [](void* opaque, void* context, const na::native11::SceneFrame& f) {
         auto& state = *static_cast<Consumer*>(opaque);
         const auto& g = state.game;
+        // Ordinary DLAA can continue while Referee tests candidates at Quality.
+        if (state.scaled && !f.screen_proof) return true;
         expect(f.screen_proof && f.color.d3d11_resource == g.color.Get() && f.depth.d3d11_resource == g.depth.Get() &&
                f.color.active_w == g.w && f.color.active_h == g.h && !f.color.active_x && !f.color.active_y,
                "the evaluator receives the exact native scene rectangle with a screen receipt");
         auto* ctx = static_cast<ID3D11DeviceContext*>(context);
         ComPtr<ID3D11RenderTargetView> target;
         ctx->OMGetRenderTargets(1, &target, nullptr);
-        expect(target.Get() == g.back_rtv.Get(), "only the visible reader can enter the evaluator");
+        expect(target.Get() == state.expected, "only the visible reader can enter the evaluator");
+        if (state.scaled) {
+            const auto& r = f.scaled_reader;
+            expect(r.target && r.shader && r.slot == 7 && r.display_size == (!state.through_post || !g.screen_extra_width) &&
+                   r.width == g.w + (state.through_post ? 0 : g.screen_extra_width) &&
+                   r.height == g.h + (state.through_post ? 0 : g.screen_extra_height),
+                   "receipt identifies the actual shader slot and extent of the world reader");
+        }
         const float replacement[]{.75f, .25f, .125f, 1.f};
         ctx->ClearRenderTargetView(g.color_rtv.Get(), replacement);
         ++state.accepted;
         return true;
     };
     if (!na::native11::Install(game.device.Get(), evaluate, &consumer)) return 1;
-    na::native11::SetScreenCheck(true);
+    na::native11::SetScreenCheck(true, scaled);
     D3D11_RASTERIZER_DESC raster{};
     raster.FillMode = D3D11_FILL_SOLID;
     raster.CullMode = D3D11_CULL_NONE;
@@ -1220,6 +1264,11 @@ int CenteredSceneFixture(Game& game)
     ComPtr<ID3D11RasterizerState> visible_quads;
     if (FAILED(game.device->CreateRasterizerState(&raster, &visible_quads))) return 1;
     game.ctx->RSSetState(visible_quads.Get());
+    ComPtr<ID3D11RasterizerState> clipped_quads;
+    if (through_post) {
+        raster.ScissorEnable = TRUE;
+        if (FAILED(game.device->CreateRasterizerState(&raster, &clipped_quads))) return 1;
+    }
     D3D11_TEXTURE2D_DESC pixel_desc{};
     pixel_desc.Width = pixel_desc.Height = pixel_desc.MipLevels = pixel_desc.ArraySize = 1;
     pixel_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1229,17 +1278,19 @@ int CenteredSceneFixture(Game& game)
     ComPtr<ID3D11Texture2D> pixel;
     if (FAILED(game.device->CreateTexture2D(&pixel_desc, nullptr, &pixel))) return 1;
 
-    auto frame = [&](bool show) {
+    auto frame = [&](bool show, bool overwrite_post = false) {
         Pump();
         auto* ctx = game.ctx.Get();
         Scene(ctx, game, 0);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        ctx->VSSetShader(game.vs_post.Get(), nullptr, 0);
+        ctx->VSSetShader(post.Get(), nullptr, 0);
         auto* rt = decoy_rtv.Get();
         ctx->OMSetRenderTargets(1, &rt, nullptr);
         auto* view = game.color_srv.Get();
-        ctx->PSSetShaderResources(0, 1, &view);
-        ctx->PSSetShader(game.ps_tonemap.Get(), nullptr, 0);
+        const UINT slot = scaled ? 7 : 0;
+        if (scaled) Viewport(ctx, d.Width, d.Height);
+        ctx->PSSetShaderResources(slot, 1, &view);
+        ctx->PSSetShader(scaled ? ps.Get() : game.ps_tonemap.Get(), nullptr, 0);
         ctx->Draw(4, 0);
 
         rt = game.back_rtv.Get();
@@ -1247,14 +1298,38 @@ int CenteredSceneFixture(Game& game)
         constexpr float black[]{0.f, 0.f, 0.f, 1.f};
         ctx->ClearRenderTargetView(rt, black);
         if (show) {
+            if (through_post) {
+                ctx->OMSetRenderTargets(1, post_target.GetAddressOf(), nullptr);
+                Viewport(ctx, game.w, game.h);
+                ctx->PSSetShaderResources(slot, 1, &view);
+                ctx->PSSetShader(ps.Get(), nullptr, 0);
+                ctx->Draw(4, 0);
+                if (overwrite_post) ctx->ClearRenderTargetView(post_target.Get(), black);
+                ctx->OMSetRenderTargets(1, decoy_rtv.GetAddressOf(), nullptr);
+                Viewport(ctx, d.Width, d.Height);
+                ctx->PSSetShaderResources(slot, 1, post_input.GetAddressOf());
+                ctx->Draw(4, 0);
+                ctx->OMSetRenderTargets(1, &rt, nullptr);
+                view = post_input.Get();
+            }
             const D3D11_VIEWPORT vp{44.f, 0.f, float(game.w), float(game.h), 0.f, 1.f};
-            ctx->RSSetViewports(1, &vp);
-            ctx->PSSetShaderResources(0, 1, &view);
+            if (scaled) Viewport(ctx, d.Width, d.Height);
+            else ctx->RSSetViewports(1, &vp);
+            ctx->PSSetShaderResources(slot, 1, &view);
             ctx->PSSetShader(ps.Get(), nullptr, 0);
+            if (through_post) {
+                const D3D11_RECT hud{0, 0, 1, 1};
+                ctx->RSSetScissorRects(1, &hud);
+                ctx->RSSetState(clipped_quads.Get());
+                // Same target, same shader, same real source and same slot. The game's UI clip
+                // is the only distinction between this batch and the full-picture draw.
+                for (unsigned i = 0; i != 139; ++i) ctx->Draw(4, 0);
+                ctx->RSSetState(visible_quads.Get());
+            }
             ctx->Draw(4, 0);
         }
         view = nullptr;
-        ctx->PSSetShaderResources(0, 1, &view);
+        ctx->PSSetShaderResources(slot, 1, &view);
         bool displayed = false;
         if (show && consumer.accepted) {
             na::native11::OwnWorkScope own;
@@ -1269,23 +1344,40 @@ int CenteredSceneFixture(Game& game)
                     ctx->Unmap(pixel.Get(), 0);
                     return red;
                 };
-                displayed = std::abs(read_red(46) - 191) <= 2 && read_red(2) == 0 && read_red(game.w + 50) == 0;
+                if (scaled) displayed = std::abs(read_red(2) - 191) <= 2 && std::abs(read_red(d.Width - 3) - 191) <= 2;
+                else displayed = std::abs(read_red(46) - 191) <= 2 && read_red(2) == 0 && read_red(game.w + 50) == 0;
             }
         }
-        expect(SUCCEEDED(game.swap->Present(0, 0)), "present the centered scene");
+        expect(SUCCEEDED(game.swap->Present(0, 0)), "present the scene");
         return displayed;
     };
 
     for (unsigned i = 0; i < 42; ++i) frame(false);
     const auto invisible = na::native11::Stats();
     expect(!consumer.accepted && invisible.screen_refuted >= 1 && !invisible.screen_confirmed,
-           "an otherwise identical offscreen reader fails the centered screen challenge");
+           "the offscreen reader fails the screen challenge");
     unsigned visible = 0;
     for (unsigned i = 0; i < 46; ++i) visible += frame(true);
     const auto shown = na::native11::Stats();
     expect(shown.screen_confirmed == 1 && consumer.accepted >= 16 && visible == consumer.accepted,
-           "the centered reader carries every accepted result to the display with the side bars intact");
-    std::printf("centered scene: decoy rejected=%llu, screen confirmed=%llu, displayed=%u\n",
+           "every accepted result reaches its intended screen edges");
+    if (through_post) {
+        expect(shown.scaled_compositor_confirmed == 1 && shown.scaled_compositor_refuted &&
+               shown.scaled_compositor_draws >= 2 && shown.scaled_compositor_draws <= visible,
+               "the second challenge identifies the native screen reader among 139 clipped draws");
+        std::printf("post compositor: rejected=%llu confirmed=%llu reached=%llu\n",
+                    (unsigned long long)shown.scaled_compositor_refuted, (unsigned long long)shown.scaled_compositor_confirmed,
+                    (unsigned long long)shown.scaled_compositor_draws);
+        frame(true, true);
+        expect(na::native11::Stats().scaled_compositor_draws == shown.scaled_compositor_draws,
+               "a cleared intermediate cannot supply a current-frame compositor receipt");
+        na::native11::SetScreenCheck(true, false);
+        for (unsigned i = 0; i < 4; ++i) frame(true);
+        expect(na::native11::Stats().scaled_compositor_draws == shown.scaled_compositor_draws,
+               "switching the scale search off stops verified compositor deliveries");
+    }
+    std::printf("%s scene: decoy rejected=%llu, screen confirmed=%llu, displayed=%u\n",
+                through_post ? "postprocessed" : scaled ? "scaled" : "centered",
                 (unsigned long long)shown.screen_refuted, (unsigned long long)shown.screen_confirmed, visible);
     na::native11::Uninstall();
     return g_failed ? 1 : 0;
@@ -2214,7 +2306,17 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     }
 #endif
     const bool centered_scene = argc > 1 && std::strcmp(argv[1], "--centered-scene") == 0;
-    if (centered_scene) g.screen_extra_width = 88;
+    const bool scaled_half = argc > 1 && std::strcmp(argv[1], "--scaled-scene-performance") == 0;
+    const bool scaled_other = argc > 1 && std::strcmp(argv[1], "--scaled-scene-quality") == 0;
+    const bool scaled_post = argc > 1 && std::strcmp(argv[1], "--scaled-scene-post") == 0;
+    const auto configure_screen_extent = [&](Game& fixture) {
+        if (centered_scene) fixture.screen_extra_width = 88;
+        if (scaled_half || scaled_other || scaled_post) {
+            fixture.screen_extra_width = scaled_half ? fixture.w : 160;
+            fixture.screen_extra_height = scaled_half ? fixture.h : 90;
+        }
+    };
+    configure_screen_extent(g);
     bool warp = false;
     const bool screen_warp = argc > 1 && (std::strcmp(argv[1], "--screen-check-warp") == 0 ||
                                          std::strcmp(argv[1], "--adaptive-screen-warp") == 0);
@@ -2227,7 +2329,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #endif
     if (screen_warp || depth_warp || depth_debug || !MakeGame(g, false)) {
         g = Game{};
-        if (centered_scene) g.screen_extra_width = 88;
+        configure_screen_extent(g);
         g.shader_depth = depth_reads;
         if (!MakeGame(g, true, depth_debug)) {
             std::printf("SKIP: no %s DX11 device\n", depth_debug ? "debug-layer" : "WARP");
@@ -2241,7 +2343,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (SUCCEEDED(g.device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter))) adapter->GetDesc(&adapter_desc);
     std::printf("device: %ls (%s)\n", adapter_desc.Description, warp ? "WARP" : "hardware");
 #if !defined(NA_TEST_NATIVE_DLAA)
-    if (centered_scene) return CenteredSceneFixture(g);
+    const bool native_post = argc > 1 && std::strcmp(argv[1], "--scaled-scene-native") == 0;
+    if (centered_scene || scaled_other || scaled_half || scaled_post || native_post)
+        return ScreenExtentFixture(g, !centered_scene, scaled_post || native_post);
     if (adaptive || screen_warp || (argc > 1 && std::strcmp(argv[1], "--screen-check") == 0)) return ScreenCheckFixture(g, adaptive, missed_order);
 #endif
 #if defined(NA_TEST_NATIVE_DLAA)
