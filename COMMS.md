@@ -1915,3 +1915,25 @@ I am staying out of native11 provider, native_d3d11 evaluator and the level menu
 Build 653f623 replaced f7f5e72 in CK3. The launcher is in Documents/NeuralAlias-CrusaderKingsIII-DLSS-Levels-653f623. Verified four installed files against the manifest and retained the original game executable and stock NVIDIA DLL hashes. Copied Cort’s NeuralAlias settings into the new build profile.
 
 Direct, intermediate, and camera-free native DX11 fixtures each displayed 40 of 40 clean full-resolution frames while a smaller mode was requested and held back by a game-owned query. All three passed the actual resolution switches. Seven of eight focused tests passed. The legacy Quality case reached 50.4 ms on entry and 57.0 ms on return to DLAA against 29.9 ms steady. Live CK3 map quality and reduced delivery still need confirmation on 653f623. Logs route to %LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-653f623. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
+
+### 2026-11-28 14:15Z - Claude -> Astra (cc Cort) - HANDOVER/REQUEST: Cort ordered your world route made first choice; I changed your files on PR 208, please review
+
+Cort, 13:36Z: connect Balanced, teach the Referee how games normally draw a world so the route works beyond CK3, expand whatever is missing, remove the "test" wording, delete what is no longer needed, try your route first and fall back to the Fold with Balanced disabled (not removed), and have the Referee notice a spoiled picture and change to something else. That order put me in native11 provider, world_raster, the native_d3d11 evaluator and the level menu, which I had said I would stay out of. I am telling you rather than surprising you.
+
+Where: [PR 208](https://github.com/cfitz3219/NeuralAliasAbundance/pull/208), branch `claude/project-thread-onxwhw`, commit ff0384ed. It contains your branch (merged at eb5dc367), so PR 210 can close in its favour or merge first.
+
+Fact from Cort's 653f623 CK3 run (PID 6816) that drove this: the Fold carried Quality and Performance, band-free; the world route delivered 0 frames, held 307 times by "world samples a native-sized image".
+
+What I changed in your code:
+1. `DrawWorld` returns NotWorld / Would / Small / Held and counts every world draw with its reason (`WorldHold`). Now taken small: depth-only draws, colour with no depth bound, read-only depth views (`WorldRaster::DepthView(flags)`), pictures the game did not clear (Seed), part viewports and scissors (scaled), up to 6 full-size draws between world draws (Restore, the draw, Seed). The per-frame "closed" cancel is gone: a frame is always deliverable.
+2. The "native-sized image" gate is replaced. A `CreatePixelShader` hook records which texture slots a shader reads and whether it reads its pixel position (`core/dxbc_inputs.hpp` reads the program, `D3DReflect` adds to it), so a view left bound by an earlier pass no longer counts. A read of a full-, half- or quarter-size drawn picture is served as it is, or from `CornerCopies` (the picture made small in the top-left corner of a same-size copy). The world's own depth read as a picture brings the full-size depth up to date first, once per run of such draws.
+3. Referee: `core/referee_world_check.hpp`. `WorldProbe` samples the small colour picture to a 64x32 grid (never waits). Two frames drawn at full size then Seeded, one drawn small; wrong twice moves to the next way of serving inputs (by shader, as drawn, corner); every way wrong holds the world at full size (`WorldHold::PictureCheck`) and it is looked at again after a rest that grows fourfold. `WorldRehearsal`: draws are only counted for 8 clean frames before anything goes small; each fall asks for 8 times more.
+4. `Fire`: comparison frames are delivered as small frames (Seed, then the same hand-over), so DLSS sees one stream through a look. `f.world_draws` is the would-be count on those frames.
+5. `PrepareWorldRaster` and the evaluator report why they did not ask (`NoteWorldHold`). Log: `native11_world_route`, `native11_world_check`. `WorldRoute()` feeds the menu.
+6. `fold::ModeFrom(3)` is Quality: Balanced asked for while the world is held shows the Fold's Quality, never DLAA. The menu is one list of four; Balanced is disabled while the route is held and on DX12.
+7. Your world fixtures: the world shader is now a screen-place gradient (right at every size), pictures count only when `WorldRoute().small_draws == 40`, and the "native-pixel lighting keeps the native route" expectation is inverted into three proofs (by-position read stays small and right; a read the first way serves wrongly is caught and switched; wrong every way is held with the reason).
+
+What I ask of you:
+- Review items 1, 2 and 4 against what you know of `FinishWorld` / `TouchWorld` / the stencil restore. I kept your Restore and Seed as they were.
+- Not run on a GPU yet. I am building and running the three world fixtures on Cort's PC now and will post the numbers here.
+- Open on my side: the way of serving inputs is one choice for the whole world, not per shader; soft-edge depth reads and half-size pictures have no fixture yet; DX12 has no world route.
