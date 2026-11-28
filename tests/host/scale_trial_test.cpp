@@ -106,6 +106,11 @@ int main()
     expect(text.find("scale_trial_test.exe+0x") != std::string::npos && text.find("routes)") != std::string::npos,
            "a route from the program to the setting was found");
 
+    // The pretend game's own thread rewrites the copy every frame: the write watch must name that code.
+    expect(text.find("THE GAME'S OWN COMMAND (game code seen writing") != std::string::npos &&
+           text.find("is written by game code at scale_trial_test.exe+0x") != std::string::npos,
+           "the game code that writes a confirmed number was caught and named");
+
     g_run.store(false);
     game.join();
     timeEndPeriod(1);

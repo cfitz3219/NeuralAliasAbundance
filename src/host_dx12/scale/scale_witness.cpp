@@ -1,5 +1,6 @@
 #include "host_dx12/scale/scale_witness.hpp"
 #include <windows.h>
+#include <tlhelp32.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -70,6 +71,12 @@ struct State {
     std::mutex log_m; FILE* log = nullptr; unsigned lines = 0;
     // Code worker only.
     std::map<uint64_t, Module> modules; std::set<uint64_t> chains; uint64_t self_base = 0;
+    // (the writer search reads modules too, under this lock)
+    std::mutex modules_m; std::set<uint64_t> creation_functions; // game functions on the trails that created world-sized pictures
+    std::map<uint64_t, std::string> named_functions; // game functions that use a render-scale setting name (under modules_m)
+    // Who writes the confirmed numbers (processor write watch): filled by the exception handler.
+    std::atomic<uint64_t> trial_writing{0}; // the number the trial is writing right now (0: none)
+    std::vector<std::string> writer_lines;  // under trial_m
     // The world's size right now (largest viewport of the last 100 ms), for the writing trial.
     std::atomic<uint64_t> fast_start{0}, fast_best{0}, live_size{0}, live_ms{0};
     // The writing trial ([scale] trial=1): NeuralAlias sets each confirmed number itself and the judge
@@ -268,6 +275,7 @@ void log_ranking(const char* when)
 // ---- method: call chain / creation (read the game code on the stack) ----
 void analyse(const Capture& c)
 {
+    std::lock_guard<std::mutex> modules_lock(g.modules_m);
     struct Frame { Module* mod; uint32_t rva; Function fn; };
     std::vector<Frame> frames;
     uint64_t key = 1469598103934665603ull ^ c.method;
@@ -280,6 +288,7 @@ void analyse(const Capture& c)
         const Function fn = locator::owner(mod->image, rva);
         if (!fn.size) continue;
         frames.push_back({mod, rva, fn});
+        if (c.method == hunt::kCreation && g.creation_functions.size() < 4096) g.creation_functions.insert(mod->base + fn.start);
         key = (key ^ (mod->base + fn.start)) * 1099511628211ull;
     }
     const char* method = c.method == hunt::kCreation ? "creation" : "call chain";
@@ -315,12 +324,23 @@ void analyse(const Capture& c)
 
 // ---- method: named (setting names in the game's own program file) ----
 // Generic words for this setting in any engine; never a game's name.
-const char* const kWords[] = {"renderscale", "render_scale", "render scale", "resolutionscale", "resolution_scale", "resolution scale",
-                              "screenpercentage", "screen_percentage", "screen percentage", "renderresolution", "render_resolution",
-                              "resscale", "res_scale", "internalres", "internal_res", "internal res", "renderpercent", "render_percent",
-                              "resolutionpercent", "resolution_percent", "scalefactor", "scale_factor", "upscal", "supersampl",
-                              "dynamicres", "dynamic_res", "dynres", "viewportscale", "viewport_scale", "3dscale", "3d_scale", "3d scale",
-                              "3dresolution", "3d_resolution", "3d resolution"};
+// Matched anywhere inside a name, so "ApplyRenderScale", "r.ScreenPercentage" and "m_renderScale" are all
+// found by their noun. The list is what engines in general call this setting.
+const char* const kWords[] = {
+    "renderscale", "render_scale", "render scale", "renderingscale", "rendering_scale", "rendering scale",
+    "resolutionscale", "resolution_scale", "resolution scale", "resscale", "res_scale", "resolutionscaling", "resolution_scaling",
+    "screenpercentage", "screen_percentage", "screen percentage", "screenscale", "screen_scale",
+    "renderresolution", "render_resolution", "render resolution", "renderingresolution", "rendering_resolution",
+    "internalres", "internal_res", "internal res", "renderpercent", "render_percent", "resolutionpercent", "resolution_percent",
+    "resolutionquality", "resolution_quality", "resolutionmultiplier", "resolution_multiplier", "resmult", "res_mult",
+    "resolutionfactor", "resolution_factor", "resolutionmodifier", "resolution_modifier", "renderfactor", "render_factor",
+    "scalefactor", "scale_factor", "scalingfactor", "scaling_factor", "pixeldensity", "pixel_density",
+    "imagequality", "image_quality", "image quality", "upscal", "supersampl", "super_sampl", "subsampl", "downsampl",
+    "superresolution", "super_resolution", "super resolution",
+    "dynamicres", "dynamic_res", "dynamic res", "dynres", "dyn_res", "adaptiveres", "adaptive_res", "scalablebuffer",
+    "viewportscale", "viewport_scale", "viewport scale", "bufferscale", "buffer_scale", "targetscale", "target_scale",
+    "sceneresolution", "scene_resolution", "scenescale", "scene_scale", "worldresolution", "world_resolution",
+    "3dscale", "3d_scale", "3d scale", "3dresolution", "3d_resolution", "3d resolution", "3dres", "3d_res"};
 char lower(uint8_t c) { return c >= 'A' && c <= 'Z' ? char(c + 32) : char(c); }
 bool name_char(uint8_t p)
 {
@@ -329,13 +349,15 @@ bool name_char(uint8_t p)
 // Finds each word in the read-only data as ASCII (step 1) or UTF-16 (step 2), case-insensitive.
 void find_words(const Image& im, std::vector<std::pair<uint32_t, std::string>>& out, size_t cap)
 {
+    bool first[256]{};
+    for (const char* word : kWords) first[uint8_t(word[0])] = true;
     for (const auto& range : im.ranges) {
         if (range.executable) continue;
         const uint8_t* b = im.bytes + range.start;
         for (uint32_t step = 1; step <= 2; ++step)
             for (uint32_t i = 0; i + 8 < range.size && out.size() < cap; ++i) {
                 const char c = lower(b[i]);
-                if (c != 'r' && c != 's' && c != 'i' && c != 'u' && c != 'd' && c != 'v' && c != '3') continue;
+                if (!first[uint8_t(c)]) continue;
                 for (const char* word : kWords) {
                     if (word[0] != c) continue;
                     const uint32_t n = uint32_t(std::strlen(word));
@@ -361,7 +383,7 @@ void find_words(const Image& im, std::vector<std::pair<uint32_t, std::string>>& 
 void named_search(Module& mod)
 {
     std::vector<std::pair<uint32_t, std::string>> names;
-    find_words(mod.image, names, 256);
+    find_words(mod.image, names, 2048);
     if (names.empty()) { line("named: no setting names found in %s", mod.name.c_str()); return; }
     std::map<uint32_t, std::string> by_rva;
     for (auto& n : names) by_rva.emplace(n.first, n.second);
@@ -380,6 +402,10 @@ void named_search(Module& mod)
             if (name == by_rva.end()) continue;
             const Function fn = locator::owner(mod.image, p);
             if (!fn.size) continue;
+            if (g.named_functions.size() < 8192) {
+                std::string& uses = g.named_functions[mod.base + fn.start];
+                if (uses.size() < 160 && uses.find(name->second) == std::string::npos) uses += (uses.empty() ? "" : ", ") + name->second;
+            }
             auto it = decoded.find(fn.start);
             if (it == decoded.end()) {
                 if (decoded.size() >= 512) continue;
@@ -394,8 +420,8 @@ void named_search(Module& mod)
     }
     report(found, hunt::kNamed);
     g.names_found.store(by_rva.size()); g.candidates_from_code.fetch_add(found.size());
-    line("named: %s has %zu setting names, %u code references to %zu of them, candidates=%zu", mod.name.c_str(), by_rva.size(), refs,
-         used.size(), found.size());
+    line("named: %s has %zu setting names, %u code references to %zu of them from %zu functions, candidates=%zu", mod.name.c_str(),
+         by_rva.size(), refs, used.size(), g.named_functions.size(), found.size());
     unsigned shown = 0;
     for (const auto& n : by_rva) {
         if (++shown > 40) { line("named: ... %zu more names not listed", by_rva.size() - 40); break; }
@@ -407,7 +433,10 @@ void code_worker()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     // The named search needs nothing from the game but its program file: it runs at once.
+    {
+        std::lock_guard<std::mutex> modules_lock(g.modules_m);
     if (Module* exe = module_at(reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr)) + 0x1000)) named_search(*exe);
+    }
     for (;;) {
         Capture c;
         {
@@ -561,6 +590,11 @@ void write_verdict()
                 std::fprintf(f, "; writes %u; the game %s our value in memory; put back: %s%s%s\n", r.writes, r.kept_value ? "kept" : "replaced",
                              r.restored ? "yes" : "NO", r.note[0] ? "; " : "", r.note);
             }
+            if (!g.writer_lines.empty()) {
+                std::fprintf(f, "  THE GAME'S OWN COMMAND (game code seen writing the confirmed numbers; %zu writing place(s)):\n", g.writer_lines.size());
+                for (const auto& w : g.writer_lines) std::fprintf(f, "    %s\n", w.c_str());
+            } else if (g.trial_state >= 2)
+                std::fprintf(f, "  THE GAME'S OWN COMMAND: no game code was seen writing the confirmed numbers while the watch was on.\n");
             if (!g.trial_paths.empty()) {
                 std::fprintf(f, "  How to reach the working number from the game's program on a later launch (%zu routes):\n", g.trial_paths.size());
                 for (const auto& path : g.trial_paths) std::fprintf(f, "    %s\n", path.c_str());
@@ -784,6 +818,179 @@ void find_routes(uint64_t address)
     std::lock_guard<std::mutex> l(g.trial_m);
     g.trial_paths = routes;
 }
+// ---- who writes the number: the game's own "apply render scale" code gives itself away ----
+// A processor write watch on up to four confirmed numbers (the debug registers of every thread of the
+// game). When game code changes one, the processor reports the instruction and the handler keeps the
+// trail of calls that led there. Log only: nothing in the game is changed by it.
+#if defined(_M_X64)
+constexpr unsigned kWatchSlots = 4, kWatchHits = 256, kWatchPerSlot = 48, kWatchFrames = 20;
+struct WatchHit { uint64_t rip, during, tick; uint32_t slot, thread; void* frames[kWatchFrames]; unsigned count; };
+uint64_t g_watch_address[kWatchSlots]{};
+hunt::Kind g_watch_kind[kWatchSlots]{};
+std::atomic<bool> g_watch_on{false}, g_watch_done{false};
+std::atomic<uint32_t> g_watch_count{0}, g_watch_slot_hits[kWatchSlots]{};
+WatchHit g_watch_hits[kWatchHits];
+void* g_watch_handler = nullptr;
+
+LONG CALLBACK watch_handler(EXCEPTION_POINTERS* x)
+{
+    if (x->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !g_watch_on.load(std::memory_order_relaxed)) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = x->ContextRecord;
+    const DWORD64 which = c->Dr6 & 0xf;
+    if (!which) return EXCEPTION_CONTINUE_SEARCH; // somebody else's single step
+    for (uint32_t slot = 0; slot < kWatchSlots; ++slot) {
+        if (!(which & (1ull << slot))) continue;
+        const uint32_t seen = g_watch_slot_hits[slot].fetch_add(1, std::memory_order_relaxed);
+        if (seen >= kWatchPerSlot) { c->Dr7 &= ~(3ull << (slot * 2)); continue; } // a number rewritten every frame: enough seen, stop watching it on this thread
+        const uint32_t i = g_watch_count.fetch_add(1, std::memory_order_relaxed);
+        if (i >= kWatchHits) continue;
+        WatchHit& h = g_watch_hits[i];
+        h.rip = c->Rip; h.slot = slot; h.thread = GetCurrentThreadId(); h.tick = GetTickCount64();
+        h.during = g.trial_writing.load(std::memory_order_relaxed);
+        // The trail, walked from where the game was (not from inside this handler). First entry: the
+        // instruction after the write. A function with no unwind record is a leaf: its caller is on the stack.
+        CONTEXT u = *c;
+        h.count = 0;
+        h.frames[h.count++] = reinterpret_cast<void*>(u.Rip);
+        while (h.count < kWatchFrames) {
+            DWORD64 base = 0;
+            if (PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(u.Rip, &base, nullptr)) {
+                void* handler_data = nullptr; DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, u.Rip, rf, &u, &handler_data, &frame, nullptr);
+            } else {
+                DWORD64 ret = 0;
+                if (!safe_read(u.Rsp, &ret, sizeof ret)) break;
+                u.Rip = ret; u.Rsp += 8;
+            }
+            if (u.Rip < 0x10000) break;
+            h.frames[h.count++] = reinterpret_cast<void*>(u.Rip);
+        }
+    }
+    c->Dr6 &= ~0xfull;
+    c->ContextFlags |= CONTEXT_DEBUG_REGISTERS; // so a watch turned off above stays off
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+// Set (or clear) the watch on every thread of the game but this one. Between suspending a thread and
+// letting it go on, only kernel calls are made: nothing here can wait on a lock that thread holds.
+unsigned watch_threads(bool on)
+{
+    static DWORD ids[1024];
+    unsigned n = 0, done = 0;
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te{}; te.dwSize = sizeof te;
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    for (BOOL ok = Thread32First(snap, &te); ok && n < 1024; ok = Thread32Next(snap, &te))
+        if (te.th32OwnerProcessID == pid && te.th32ThreadID != self) ids[n++] = te.th32ThreadID;
+    CloseHandle(snap);
+    DWORD64 dr7 = 0;
+    if (on)
+        for (unsigned slot = 0; slot < kWatchSlots; ++slot) {
+            if (!g_watch_address[slot]) continue;
+            const DWORD64 len = g_watch_kind[slot] == hunt::Kind::ScaleF64 ? 2 : 3; // 8 bytes : 4 bytes
+            dr7 |= (1ull << (slot * 2)) | (1ull << (16 + slot * 4)) | (len << (18 + slot * 4)); // local enable, break on write
+        }
+    for (unsigned i = 0; i < n; ++i) {
+        const HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, ids[i]);
+        if (!t) continue;
+        if (SuspendThread(t) != DWORD(-1)) {
+            CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(t, &c)) {
+                c.Dr0 = g_watch_address[0]; c.Dr1 = g_watch_address[1]; c.Dr2 = g_watch_address[2]; c.Dr3 = g_watch_address[3];
+                c.Dr6 = 0; c.Dr7 = dr7; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (SetThreadContext(t, &c)) ++done;
+            }
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+    }
+    return done;
+}
+void watch_start(const std::vector<hunt::Entry>& scales)
+{
+    unsigned slots = 0;
+    for (const hunt::Entry& e : scales) {
+        if (slots >= kWatchSlots) break;
+        const uint64_t mask = e.kind == hunt::Kind::ScaleF64 ? 7 : 3;
+        if (e.address & mask) continue; // the processor watches aligned places only
+        g_watch_address[slots] = e.address; g_watch_kind[slots] = e.kind; ++slots;
+    }
+    if (!slots) { line("writer watch: none of the confirmed numbers can be watched"); return; }
+    if (!g_watch_handler) g_watch_handler = AddVectoredExceptionHandler(1, &watch_handler);
+    g_watch_on.store(true);
+    const unsigned threads = watch_threads(true);
+    line("writer watch: on for %u confirmed number(s) on %u game threads. The next change of render scale shows which game code writes them", slots, threads);
+}
+// What the watch saw, in words: one line per distinct writing instruction.
+void watch_report(bool final)
+{
+    const uint32_t n = (std::min)(g_watch_count.load(), uint32_t(kWatchHits));
+    struct Writer { uint64_t rip; uint32_t slot; unsigned times, during_trial; uint32_t first; };
+    std::vector<Writer> writers;
+    for (uint32_t i = 0; i < n; ++i) {
+        const WatchHit& h = g_watch_hits[i];
+        auto it = std::find_if(writers.begin(), writers.end(), [&](const Writer& w) { return w.rip == h.rip && w.slot == h.slot; });
+        if (it == writers.end()) { writers.push_back(Writer{h.rip, h.slot, 0, 0, i}); it = writers.end() - 1; }
+        ++it->times; if (h.during) ++it->during_trial;
+    }
+    std::vector<std::string> lines;
+    {
+        std::lock_guard<std::mutex> modules_lock(g.modules_m);
+        for (const Writer& w : writers) {
+            const WatchHit& h = g_watch_hits[w.first];
+            std::string text = where_text(g_watch_address[w.slot]) + " is written by game code at " + where_text(h.rip - 1);
+            char buf[200];
+            std::snprintf(buf, sizeof buf, " (%u time(s), %u of them right after NeuralAlias wrote another number, thread %u). Called from: ", w.times, w.during_trial, h.thread);
+            text += buf;
+            if (g_watch_slot_hits[w.slot].load() >= kWatchPerSlot) text += "[rewritten constantly: this number is a copy the game keeps refreshing] ";
+            unsigned shown = 0; std::string shared, named;
+            for (unsigned k = 0; k < h.count && shown < kGameFrames; ++k) {
+                const uint64_t a = reinterpret_cast<uint64_t>(h.frames[k]) - 1;
+                Module* mod = module_at(a);
+                if (!mod || mod->base == g.self_base) continue;
+                const Function fn = locator::owner(mod->image, uint32_t(a - mod->base));
+                if (!fn.size) continue;
+                std::snprintf(buf, sizeof buf, "%s%s+0x%x", shown ? " <- " : "", mod->name.c_str(), fn.start);
+                text += buf; ++shown;
+                if (shared.empty() && g.creation_functions.count(mod->base + fn.start)) { std::snprintf(buf, sizeof buf, "%s+0x%x", mod->name.c_str(), fn.start); shared = buf; }
+                if (named.empty()) {
+                    const auto uses = g.named_functions.find(mod->base + fn.start);
+                    if (uses != g.named_functions.end()) { std::snprintf(buf, sizeof buf, "%s+0x%x", mod->name.c_str(), fn.start); named = std::string(buf) + " (uses \"" + uses->second + "\")"; }
+                }
+            }
+            if (!shown) text += "(no readable game code on the trail)";
+            if (!shared.empty()) text += ". Nearest function that is also on a trail that rebuilt the 3D pictures: " + shared;
+            if (!named.empty()) text += ". Nearest function on the trail that uses a render-scale setting name: " + named;
+            lines.push_back(text);
+        }
+    }
+    for (const auto& l : lines) line("writer: %s", l.c_str());
+    if (lines.empty() && final) line("writer watch: no game code wrote the watched numbers while it was on");
+    std::lock_guard<std::mutex> l(g.trial_m);
+    g.writer_lines = lines;
+}
+void watch_stop()
+{
+    if (!g_watch_on.load()) return;
+    watch_threads(false);
+    g_watch_on.store(false);
+    g_watch_done.store(true);
+    for (auto& a : g_watch_address) a = 0;
+}
+bool watch_on() { return g_watch_on.load(); }
+bool watch_done() { return g_watch_done.load(); }
+uint32_t watch_count() { return g_watch_count.load(); }
+void watch_rearm() { if (g_watch_on.load()) watch_threads(true); }
+#else // the write watch is built for 64-bit games first
+void watch_start(const std::vector<hunt::Entry>&) {}
+void watch_report(bool) {}
+void watch_stop() {}
+bool watch_on() { return false; }
+bool watch_done() { return true; }
+uint32_t watch_count() { return 0; }
+void watch_rearm() {}
+#endif
+
 void run_trial()
 {
     std::vector<hunt::Entry> scales; hunt::Target start;
@@ -796,6 +1003,7 @@ void run_trial()
     const double home = start.Ratio();
     // Ask for something clearly different from where the game is, and inside what any game allows.
     const double goal = home > 0.85 ? 0.70 : 1.0;
+    watch_rearm(); // threads the game started since
     line("trial: starting. World %ux%u (%.1f%%), asking each of %zu confirmed numbers for %.0f%%", start.world_w, start.world_h, home * 100.0, scales.size(), goal * 100.0);
     { std::lock_guard<std::mutex> l(g.trial_m); g.trial_state = 1; }
     g.trial_active.store(true);
@@ -810,6 +1018,7 @@ void run_trial()
         else if (!ReadKind(reader(), e.address, e.kind, &row.before)) { row.skipped = true; row.note = "it could not be read"; }
         if (!row.skipped) {
             hunt::ResponseJudge judge;
+            g.trial_writing.store(e.address);
             drive(judge, e.address, e.kind, goal, 3000, &row);
             row.verdict = judge.State(); row.hold = judge.HoldPolicy(); row.reverts = judge.Reverts(); row.achieved = judge.Achieved();
             if (row.verdict == hunt::Verdict::Reverted || row.verdict == hunt::Verdict::Waiting)
@@ -835,6 +1044,7 @@ void run_trial()
                 back = undo.State() == hunt::Verdict::Responded || undo.State() == hunt::Verdict::Snapped;
             }
             row.restored = back;
+            g.trial_writing.store(0);
             line("trial: %s at %s: was %g, asked %.0f%% -> %s (achieved %.1f%%, %u ms, hold %s, reverts %u, writes %u, value %s, put back %s)",
                  hunt::KindName(e.kind), where_text(e.address).c_str(), row.before, goal * 100.0, hunt::VerdictName(row.verdict), row.achieved * 100.0,
                  row.respond_ms, hunt::HoldName(row.hold), row.reverts, row.writes, row.kept_value ? "kept" : "replaced", back ? "yes" : "NO");
@@ -854,6 +1064,9 @@ void run_trial()
         if (stopped) g.trial_note = "After one try the game's 3D world did not return to its own size, so no further numbers were tried. "
                                     "Set Render Scale in the game's menu to put it right.";
     }
+    Sleep(1500); // the game's own writes that answer our last one
+    watch_report(true);
+    watch_stop();
     write_verdict();
     if (works) { find_routes(works); write_verdict(); }
     line("trial: finished");
@@ -861,9 +1074,21 @@ void run_trial()
 void trial_worker()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    uint32_t reported = 0;
     for (;;) {
         Sleep(500);
         if (g.sweeping.load()) continue;
+        // The writer watch goes on as soon as a scale number is confirmed, so a further change by the
+        // player is caught too; what it has seen so far is reported as it comes.
+        if (!watch_on() && !watch_done()) {
+            std::vector<hunt::Entry> scales;
+            {
+                std::lock_guard<std::mutex> l(g.board_m);
+                if (g.have_target)
+                    for (const auto& e : g.board.Ranked(256)) if (e.Confirmed() && !hunt::IsSizePair(e.kind)) scales.push_back(e);
+            }
+            if (!scales.empty()) watch_start(scales);
+        } else if (watch_count() != reported) { reported = watch_count(); watch_report(false); write_verdict(); }
         const uint64_t last = g.last_size_event_ms.load();
         if (!last || GetTickCount64() - last < 6000) continue; // the player may still be changing it
         bool ready = false;
