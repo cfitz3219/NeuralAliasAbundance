@@ -11,6 +11,8 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/overlay/dlss_debug.hpp"
+#include <cstdlib>
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "core/first_setup.hpp"
@@ -1610,6 +1612,23 @@ bool EvaluateFrameTimed(void* context, const native11::SceneFrame& frame)
     // The replay buffers this frame wrote or read are free again once this frame's DX12 work is done.
     for (const int used : {replay_cur, replay_prev_used})
         if (used >= 0) { s.replay_buffers[used].native_done = slot.native_done; s.replay_buffers[used].effects_done = slot.effects_done; }
+    if (!s.companion) {
+        // Which DLSS file is in use, once it is loaded; and when frames are refused with a file older than
+        // 3.x in use, the reason names it (an old file a game ships beside its program refuses DLAA).
+        static std::atomic<int> said{0};
+        static char old_file[224] = "";
+        if (said.load(std::memory_order_relaxed) < 2) {
+            const auto file = na::dlss_debug::Query();
+            if (file.loaded && file.version[0] && said.exchange(2, std::memory_order_relaxed) < 2) {
+                na::eventlog::Emit("dlss_file", "api=dx11 in use: %ls version %s (%s)", file.path, file.version,
+                                   na::dlss::OwnDlssFolder()[0] ? "NeuralAlias's own folder is searched first" : "no NeuralAlias-DLSS folder was found");
+                if (std::atoi(file.version) < 3)
+                    std::snprintf(old_file, sizeof old_file, "DLAA refused: the DLSS file in use is version %s, an old file beside the game's program. "
+                                  "NeuralAlias's own DLSS file (folder NeuralAlias-DLSS) was not found.", file.version);
+            }
+        }
+        if (!evaluated && old_file[0]) return Skip(old_file);
+    }
     if (!evaluated) {
         if (!s.companion) return Skip("DLAA evaluation rejected this frame.");
         static char why[200];
