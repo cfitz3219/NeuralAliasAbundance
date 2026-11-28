@@ -256,7 +256,6 @@ struct Ctx {
         DXGI_FORMAT color_format{}, depth_format{};
         std::atomic<bool> ready{false};
         std::atomic<bool> refused{false}, proof_current{true};
-        bool feature_ready = false;
         uint64_t last_receipt = 0;
         unsigned missed_evaluations = 0;
         uint64_t retry_after = 0;
@@ -1807,7 +1806,6 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     if (!ok && f.world_level && world) {
         // Restore already placed the spatial result. A rejecting evaluator cannot repeatedly
         // reduce the next frame; the ordinary renderer and the other resolution routes resume.
-        world->feature_ready = false;
         if (++world->missed_evaluations >= 3) {
             world->refused.store(true, std::memory_order_release);
             world->ready.store(false, std::memory_order_release);
@@ -3061,7 +3059,7 @@ bool DrawWorld(ID3D11DeviceContext* c, Ctx* x, Forward& forward)
 {
     if (!x || !x->world || x->deferred) return false;
     auto& job = *x->world;
-    if (x->world_closed_frame == g_frame || !job.feature_ready || g_frame < job.retry_after || g_frame - job.last_receipt > 1 || !job.ready.load(std::memory_order_acquire) || job.level != g_world_level.load() ||
+    if (x->world_closed_frame == g_frame || g_frame < job.retry_after || g_frame - job.last_receipt > 1 || !job.ready.load(std::memory_order_acquire) || job.level != g_world_level.load() ||
         x->rt0 != job.color || x->depth != job.depth || x->rt_count != 1 || x->depth_read_only ||
         x->raster_queries || !x->depth_test || x->vp_n != 1 ||
         x->world_color_clear != g_frame || x->world_depth_clear != g_frame ||
@@ -3760,9 +3758,10 @@ void STDMETHODCALLTYPE SwapState_d(ID3D11DeviceContext1* c, ID3DDeviceContextSta
     if (x && x->world) {
         x->world_uavs.reset();
         x->world_color_clear = x->world_depth_clear = x->world_frame = ~uint64_t{0};
-        // This state object may contain render state set outside the observed context.
-        x->world->feature_ready = false;
-        x->world.reset();
+        // Unknown bindings invalidate draw eligibility. The job's color, depth and
+        // copy lists still belong to the same objects across a context state swap.
+        x->reset_state();
+        x->pristine_color = x->pristine_depth = false;
     }
     O(c,x).swap_state(c,state,previous);
 }
@@ -4498,7 +4497,7 @@ bool InstallHooks(bool host_owns_present)
 
 } // namespace
 
-bool PrepareWorldRaster(void* context, const SceneFrame& f, uint32_t level, uint32_t w, uint32_t h, bool feature_ready)
+bool PrepareWorldRaster(void* context, const SceneFrame& f, uint32_t level, uint32_t w, uint32_t h)
 {
     if (!level || !w || !h || !f.screen_proof || !f.scaled_reader.target || f.world_level) return false;
     std::lock_guard<std::mutex> lock(g_mu);
@@ -4513,7 +4512,6 @@ bool PrepareWorldRaster(void* context, const SceneFrame& f, uint32_t level, uint
     auto job = x.world;
     if (job && job->level == level && job->proof == f.screen_proof &&
         job->color == f.color.resource && job->depth == f.depth.resource && job->width == w && job->height == h) {
-        job->feature_ready = feature_ready;
         return f.frame >= job->retry_after && !job->refused.load(std::memory_order_acquire);
     }
     ComPtr<ID3D11Resource> color = static_cast<ID3D11Resource*>(f.color.d3d11_resource);
@@ -4521,7 +4519,6 @@ bool PrepareWorldRaster(void* context, const SceneFrame& f, uint32_t level, uint
     job = std::make_shared<Ctx::WorldJob>();
     job->color = f.color.resource; job->depth = f.depth.resource;
     job->color_format = DXGI_FORMAT(f.color.view_format); job->depth_format = DXGI_FORMAT(f.depth.view_format);
-    job->feature_ready = feature_ready;
     job->last_receipt = f.frame;
     job->proof = f.screen_proof; job->level = level; job->width = w; job->height = h;
     if (!background::Submit([job, color, depth] {

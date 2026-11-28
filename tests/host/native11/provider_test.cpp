@@ -1325,10 +1325,35 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_wo
         auto ps_world = Compile("ps_world_position", "ps_5_0");
         if (!ps_world || FAILED(game.device->CreatePixelShader(ps_world->GetBufferPointer(), ps_world->GetBufferSize(), nullptr, &game.ps_scene_main))) return 1;
     }
+    // Some native renderers switch context state between every pair of scenes.
+    // Changing bindings must keep the already prepared surfaces for these objects.
+    ComPtr<ID3D11DeviceContext1> swap_context;
+    ComPtr<ID3DDeviceContextState> other_state;
+    if (live_world && through_post) {
+        ComPtr<ID3D11Device1> device;
+        const D3D_FEATURE_LEVEL feature = game.device->GetFeatureLevel();
+        if (FAILED(game.device.As(&device)) || FAILED(game.ctx.As(&swap_context)) ||
+            FAILED(device->CreateDeviceContextState(0, &feature, 1, D3D11_SDK_VERSION,
+                __uuidof(ID3D11Device), nullptr, &other_state))) return 1;
+    }
+    // Inspect a strip of flat blue in the synthetic world. A single center pixel
+    // misses the horizontal bands from creating an unused smaller NGX feature.
+    ComPtr<ID3D11Texture2D> color_strip;
+    bool check_native_strip = false;
+    if (live_world) {
+        auto strip_desc = pixel_desc;
+        strip_desc.Height = 64;
+        if (FAILED(game.device->CreateTexture2D(&strip_desc, nullptr, &color_strip))) return 1;
+    }
     uint64_t scene_pixels = 0;
     unsigned sample_ordinal = 0;
     auto frame = [&](bool show, bool overwrite_post = false) {
         Pump();
+        if (swap_context) {
+            ComPtr<ID3DDeviceContextState> saved;
+            swap_context->SwapDeviceContextState(other_state.Get(), &saved);
+            swap_context->SwapDeviceContextState(saved.Get(), nullptr);
+        }
         const UINT8 reference = (++sample_ordinal & 1) ? 0xa5 : 0x3c;
         if (stencil_write) game.ctx->OMSetDepthStencilState(stencil_write.Get(), reference);
         auto* ctx = game.ctx.Get();
@@ -1407,6 +1432,18 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_wo
                     const int expected = int(255.f * (consumer.width[level] / 2.f) / 1280.f);
                     displayed = read_red(2) == 255 && read_red(1) < 100 && read_red(3) < 100 &&
                         std::abs(read_red(game.w/2, game.h/2) - expected) < 18;
+                    if (check_native_strip) {
+                        const UINT x = game.w / 2, y = game.h / 2 - 32;
+                        const D3D11_BOX strip{x,y,0,x+1,y+64,1};
+                        ctx->CopySubresourceRegion(color_strip.Get(), 0, 0, 0, 0, screen.Get(), 0, &strip);
+                        D3D11_MAPPED_SUBRESOURCE map{};
+                        if (FAILED(ctx->Map(color_strip.Get(), 0, D3D11_MAP_READ, 0, &map))) return false;
+                        for (UINT row = 0; row < 64; ++row) {
+                            const auto* rgb = static_cast<const uint8_t*>(map.pData) + row * map.RowPitch;
+                            displayed &= std::abs(int(rgb[0]) - 128) < 16 && std::abs(int(rgb[2]) - 64) < 16;
+                        }
+                        ctx->Unmap(color_strip.Get(), 0);
+                    }
                 } else if (scaled) displayed = std::abs(read_red(2) - 191) <= 2 && std::abs(read_red(d.Width - 3) - 191) <= 2;
                 else displayed = std::abs(read_red(46) - 191) <= 2 && read_red(2) == 0 && read_red(game.w + 50) == 0;
             }
@@ -1460,6 +1497,23 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_wo
         }
         expect(dimensions[0] == game.w && dimensions[0] > dimensions[1] && dimensions[1] > dimensions[3] &&
             dimensions[3] > dimensions[2], "native, Quality, Balanced and Performance have four actual raster resolutions");
+        // Balanced has no coarse mode. A game-owned query keeps the physically
+        // smaller image unavailable while full-size DLAA is still evaluated.
+        game.referee_test_query = false;
+        check_native_strip = true;
+        na::settings::Get().j2_fold_mode.store(3);
+        const unsigned old_balanced = consumer.count[3];
+        unsigned clean_frames = 0;
+        for (unsigned i = 0; i < 40; ++i) {
+            const unsigned before = consumer.count[0];
+            const bool clean = frame(true);
+            if (consumer.count[0] > before && clean) ++clean_frames;
+        }
+        std::printf("held Balanced: clean full-size images=%u/40\n", clean_frames);
+        expect(consumer.count[3] == old_balanced && clean_frames >= 38,
+               "a held smaller level keeps full-size DLAA free of colored bands");
+        check_native_strip = false;
+        game.referee_test_query = true;
         // An unrelated pass begins supplying a full-resolution image indexed by pixel position.
         // Referee must preserve that coordinate system, then retry when the dependency disappears.
         auto light_code = Compile("ps_world_lighting","ps_5_0");

@@ -177,7 +177,7 @@ using ParitySignal = bool (*)(const void* swapchain, const referee::PlacementSco
 void SetParitySignal(ParitySignal seen);
 // The hosted path receives DXGI events through the overlay's existing hooks.
 void SetScreenCheck(bool on, uint32_t scale_level = 0);
-bool PrepareWorldRaster(void* context, const SceneFrame& frame, uint32_t level, uint32_t width, uint32_t height, bool feature_ready);
+bool PrepareWorldRaster(void* context, const SceneFrame& frame, uint32_t level, uint32_t width, uint32_t height);
 void RejectScreenProof(uint64_t proof);
 // The native provider closes the frame on the same hook that samples it.
 struct PresentReceipt {

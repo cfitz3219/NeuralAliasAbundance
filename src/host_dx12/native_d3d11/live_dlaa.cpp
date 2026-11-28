@@ -773,24 +773,15 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // written straight into its folded motion plane.
     na::fold::Mode sampled_mode = na::fold::Mode::Off;
     ID3D12Resource* sampled_motion = nullptr;
-    dlss::EvalDesc world_request{};
-    bool world_pending = false, warm_world = false;
     if (!physical && frame.scaled_reader.target && frame.screen_proof && !s.companion &&
         level && level == s.optimal_level && s.optimal.valid && cw == s.optimal_w && ch == s.optimal_h) {
-        world_request.render_w = s.optimal.render_w; world_request.render_h = s.optimal.render_h;
-        world_request.out_w = cw; world_request.out_h = ch;
-        world_request.hdr = world_request.auto_exposure = hdr;
-        world_request.depth_inverted = frame.reversed_depth;
-        world_request.preset = preset == 255 ? 12 : preset;
-        world_request.view_id = kNativeView + 0x100 + level;
-        world_request.ordered_feature_group = kNativeView;
-        world_request.quality = quality(level);
-        const auto prep = dlss::PreparedState(world_request);
-        world_pending = prep != dlss::Prepared::Failed &&
-            native11::PrepareWorldRaster(context, frame, level, world_request.render_w, world_request.render_h, prep == dlss::Prepared::Ready);
-        warm_world = world_pending && prep == dlss::Prepared::None;
+        // A candidate can remain unqualified indefinitely. Creating a smaller NGX feature
+        // while the larger preset-M feature is still displayed corrupts its history.
+        // Prepare only D3D11 surfaces here. Evaluate creates the NGX feature in queue
+        // order on the first frame that actually supplies the smaller image.
+        native11::PrepareWorldRaster(context, frame, level, s.optimal.render_w, s.optimal.render_h);
     }
-    const na::fold::Mode fold_setting = (physical || world_pending || !j2::Enabled() || j2::Paused()) ? na::fold::Mode::Off
+    const na::fold::Mode fold_setting = (physical || !j2::Enabled() || j2::Paused()) ? na::fold::Mode::Off
                                         : na::fold::ModeFrom(settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
     {
         const na::fold::Mode shown = s.fold.hand.shown;
@@ -1170,9 +1161,19 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const auto now_ms = [] { LARGE_INTEGER t, f; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f); return double(t.QuadPart) * 1000.0 / double(f.QuadPart); };
     double fold_cpu_prepare = 0, fold_cpu_show = 0;
     bool fold_log_frame = false;
-    if (physical || world_pending) {
+    if (physical) {
+        const auto previous = s.fold.hand.shown;
+        if (s.fold.hand.Begin(na::fold::Mode::Off, false, true).switched) {
+            s.fold_release_view_after = kFoldView + static_cast<uint64_t>(previous);
+            eval.reset = true;
+        }
         s.fold_next = na::fold::Mode::Off;
         fold_rate(s, s.fold_next, frame.frame);
+        g_fold_status.asked.store(0, std::memory_order_relaxed);
+        g_fold_status.shown.store(0, std::memory_order_relaxed);
+        g_fold_status.warming.store(0, std::memory_order_relaxed);
+        g_fold_status.w.store(eval.render_w, std::memory_order_relaxed);
+        g_fold_status.h.store(eval.render_h, std::memory_order_relaxed);
     } else {
         using na::fold::Mode;
         const bool paused = !j2::Enabled() || j2::Paused();
@@ -1361,8 +1362,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         evaluated = dlss::Evaluate(list, eval);
         fold_cpu_show = now_ms() - t_show;
     }
-    {   // One DLSS feature at a time (the fold block above): the old mode's view goes on the frame the new
-        // one is shown, and the next mode's feature is started now, right after this Evaluate.
+    {   // A superseded view can retire after recording the replacement.
+        if (evaluated && physical && s.fold_prepare_after) s.fold_prepare_after = false;
+        if (evaluated && s.last_world_level && s.last_world_level != frame.world_level)
+            dlss::ReleaseView(kNativeView + 0x100 + s.last_world_level);
         if (s.fold_release_view_after) { dlss::ReleaseView(s.fold_release_view_after); s.fold_release_view_after = 0; }
         if (!evaluated && fold_shown != na::fold::Mode::Off && !s.companion) {
             s.fold.hand.Refuse(fold_shown);
@@ -1370,8 +1373,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             na::eventlog::Emit("fold11", "REFUSED %s at frame %llu: DLSS did not accept the folded picture (%ux%u). DLAA takes over.",
                                na::fold::Name(fold_shown), static_cast<unsigned long long>(frame.frame), eval.render_w, eval.render_h);
         }
-        if (warm_world) dlss::PrepareFeature(world_request);
-        if (!world_pending && !physical && s.fold_prepare_after) {
+        if (!physical && s.fold_prepare_after) {
             s.fold_prepare_after = false;
             dlss::PrepareFeature(s.fold_prepare_desc);
         }
