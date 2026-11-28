@@ -88,6 +88,7 @@ struct State {
     std::atomic<bool> control_ready{false}, control_thread{false};
     uint64_t control_address = 0; hunt::Kind control_kind = hunt::Kind::ScaleF32; double control_home = 1.0; // fixed once ready
     std::atomic<uint32_t> control_asked{0}; // wanted scale in 1/10000; 0: the game's own value
+    std::atomic<uint64_t> control_changed_ms{0};
     int search_state = 0;            // under trial_m. 0 not started, 1 running, 2 found, 3 not found, 4 stopped
     std::string search_text;         // under trial_m: the one-sentence outcome and why
     std::vector<std::string> search_lines; // under trial_m: what each step saw
@@ -645,7 +646,9 @@ void memory_worker()
         // The writing trial changes the world's size itself: those changes are not the player's, and
         // prove nothing about the candidates. Nothing is counted during it or for 6 s after.
         const uint64_t ended = g.trial_ended_ms.load();
-        const bool ours = g.trial_active.load() || (ended && GetTickCount64() - ended < 6000);
+        const uint64_t driven = g.control_changed_ms.load(); // the Connection's own changes are not the player's either
+        const bool ours = g.trial_active.load() || (ended && GetTickCount64() - ended < 6000) || g.control_asked.load() ||
+                          (driven && GetTickCount64() - driven < 6000);
         if (!event) {
             // Quiet time: a candidate that changes while the world does not is a timer, not a setting.
             if (!ours) {
@@ -1464,6 +1467,7 @@ bool ControlReady() { return g.control_ready.load(std::memory_order_relaxed); }
 bool RequestScale(double ratio)
 {
     if (!ControlReady() || (ratio != 0.0 && !(ratio >= 0.25 && ratio <= 1.0))) return false;
+    g.control_changed_ms.store(GetTickCount64());
     g.control_asked.store(ratio == 0.0 ? 0u : uint32_t(ratio * 10000.0 + 0.5));
     if (!g.control_thread.exchange(true)) {
         try { std::thread(control_worker).detach(); } catch (...) { g.control_thread.store(false); return false; }
