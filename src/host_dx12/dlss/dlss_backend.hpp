@@ -173,6 +173,9 @@ bool InitOwn(ID3D12Device* device, const wchar_t* data_path);
 // feature files (nvngx_dlssg.dll), given to our own NGX instance at start-up. Empty = none.
 void SetOwnSearchFolder(const wchar_t* folder);
 const wchar_t* OwnSearchFolder();
+// Private DLSS directory, independent of the optional frame-generation search path.
+void SetOwnDlssFolder(const wchar_t* folder);
+const wchar_t* OwnDlssFolder();
 // Called once our own NGX instance is attached, with its entry points (Frame Generation uses the
 // same instance). Null = none.
 using OwnAttachedFn = void (*)(const Api& api);

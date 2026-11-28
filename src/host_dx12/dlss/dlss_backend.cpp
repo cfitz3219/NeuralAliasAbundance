@@ -763,9 +763,12 @@ void OwnShutdown(ID3D12Device* device);
 
 namespace {
 std::atomic<OwnAttachedFn> g_own_attached{nullptr};
+wchar_t g_dlss_folder[260] = {};
 wchar_t g_search_folder[260] = {}; // written once at boot, before our NGX starts
 } // namespace
 void SetOwnAttachedListener(OwnAttachedFn fn) { g_own_attached.store(fn, std::memory_order_release); }
+void SetOwnDlssFolder(const wchar_t* folder) { wcsncpy_s(g_dlss_folder, folder ? folder : L"", _TRUNCATE); }
+const wchar_t* OwnDlssFolder() { return g_dlss_folder; }
 void SetOwnSearchFolder(const wchar_t* folder) { wcsncpy_s(g_search_folder, folder ? folder : L"", _TRUNCATE); }
 const wchar_t* OwnSearchFolder() { return g_search_folder; }
 
