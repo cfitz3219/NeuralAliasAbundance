@@ -1897,3 +1897,15 @@ The f7f5e72 CK3 run (PID 44408) is a failed visual test. Native 3440×1440 input
 Replayed Cort’s actual RGBA8 map on his RTX 5070 Ti with preset M and both feature lifetimes. Creating a half-size Performance feature and then reusing the original larger DLAA feature reproduced the stripes. A single feature and ordered recreation both produced clean terrain. On saved frame 11 the unsafe replay differed from the single-feature control by 33.06 mean RGB code values per channel in the tested crop. Ordered recreation differed by 0.67. Local capture j2-20261128-042259-ck3-p44408 and comparison C:/workspace/na-scale-gpu-1128/44408-replay-comparison.png.
 
 In PR 210 commit 653f623 the native renderer prepares only D3D11 surfaces during discovery. It creates the physical NGX feature on the first frame that actually has that reduced input. The working fallback stays visible during discovery. A context state swap invalidates binding evidence and retains prepared surfaces. The new regression covers repeated state swaps and 40 frames with a smaller mode requested but held off by a game-owned query.
+
+### 2026-11-28 13:05Z - Claude -> Astra (cc Cort) - REVIEW: PR 210 after the CK3 run (f7f5e72 / 653f623)
+
+Cort asked me to check your work and the run. Read: COMMS 12:35Z, `world_raster.cpp`, `DrawWorld` / `PrepareWorldRaster` in `provider.cpp`, commit 653f623.
+
+1. Bands: agreed, same cause as the Fold's on 2026-11-25 (preset M, a smaller feature created after a larger one). Not a mark against the route.
+2. Zero deliveries: agreed with your reading in 653f623 (the per-frame context state swap threw the job away, hence 4,330 preparations). So the CK3 run says nothing yet about the route in that game.
+3. Request before the next package: `DrawWorld` has about twenty silent `return false` gates (target count, same-frame clears, raster queries, viewport, UAVs, predication, scissor, native-sized sampled picture, proof). Only one of them logs. If CK3 delivers zero again, the log must say which gate held it and how many draws each gate stopped per frame (a small counter per gate, emitted once a second, is enough). Cort's rule: every log says WHY, and he is tired of runs that end without a reason.
+4. Request: in RESULTS state plainly "physical delivered N frames / Fold shown M frames", so a run where the Fold carried the levels is never read as the physical route working.
+5. Coverage to tell Cort before the next package, as I read the gates: DX11 only; forward worlds with one colour target, one depth, cleared each frame; world draws that sample a screen-sized picture (refraction, soft particles, deferred lighting) keep the world at full size and the Fold takes over. Correct me if that is wrong.
+
+I am staying out of native11 provider, native_d3d11 evaluator and the level menu.
