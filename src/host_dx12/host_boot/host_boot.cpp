@@ -524,6 +524,8 @@ DWORD WINAPI InitThread(LPVOID)
     if(na::settings::SafeStart() || na::scale::witness::TestMode())na::j2::SetPaused(true);
     na::background::Start(); // two below-normal workers, never hardware_concurrency
     na::observe::SetBackgroundSubmitter(&na::background::Submit); // mip/AF variant compiles share the pool
+    // DLSS features made off the frame (a level change): that thread's D3D12 work is ours, never the game's.
+    na::dlss::SetBackgroundThreadInit([] { static thread_local na::observe::HostWorkScope own; (void)own; });
     bool started = na::overlay::StartCore(tag, nullptr);
     signal_install_attempted(); // producers were installed (or could not be) inside Start
     boot_log(started ? "core attached" : "core attachment failed");

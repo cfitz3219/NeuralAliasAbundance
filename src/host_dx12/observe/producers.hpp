@@ -515,6 +515,9 @@ struct ReplayObservation { uint64_t sig = 0, vb = 0; uint32_t visible = 0, apart
 void ReplayLearn(const ReplayObservation* seen, size_t count);
 bool ReplayTakeFrame(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue, ReplayFrame* f);
 void GetDrawReplayStats(DrawReplayStats* out);
+// Draw replay is off: its position buffers are released (made again when it is next on). False while a
+// frame in flight still uses them (call again later); never waits.
+bool ReleaseDrawReplayBuffers();
 bool DecodeSceneViewportJitter(uint64_t packed, uint32_t* frame, float* x, float* y);
 // Packed value the last scene draw of this recording used (0 = none since Reset).
 uint64_t ListSceneViewportJitter(ID3D12CommandList* list,uint64_t scene_depth=0);

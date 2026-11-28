@@ -7,6 +7,7 @@
 #include "core/replay_budget.hpp"
 #include "core/replay_movers.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
 
 #include <d3d11.h>
@@ -173,6 +174,7 @@ RWTexture2D<unorm float4> packed : register(u0);
     na::eventlog::Emit("draw_replay11_buffers", "ok=%d bytes=%u", ok ? 1 : 0, bd.ByteWidth);
     if (!ok) return false;
     g_so = std::move(so); g_so_view = std::move(view); g_pack = std::move(pack);
+    na::vram::Set("draw_replay_dx11_stream", na::vram::SizeOf(g_so.Get()), "draw replay is on: the frame's stream-output positions");
     return true;
 }
 
@@ -244,6 +246,18 @@ void Configure(bool on, uint64_t budget, bool movers)
     }
 }
 bool Active() { return g_on.load(std::memory_order_relaxed); }
+
+void ReleaseBuffers()
+{
+    if (g_on.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(g_m);
+    if (!g_so) return;
+    g_so.Reset();
+    g_so_view.Reset();
+    g_buffers_tried = false; // made again the next time replay is on
+    g_acc = {};
+    na::vram::Set("draw_replay_dx11_stream", 0, "draw replay has been off for a few seconds: its stream-output buffer is released");
+}
 
 void AfterDraw(ID3D11DeviceContext* c, const DrawFacts& facts, const DrawArgs& args)
 {

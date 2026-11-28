@@ -15,6 +15,8 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
+**CK3 native DX11 DLSS, November 28.** Astra installed the color-corruption fix in build 653f623. Player package is in Documents/NeuralAlias-CrusaderKingsIII-DLSS-Levels-653f623. The RTX world-switch fixtures passed. Cort was given the launch path for live confirmation. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
+
 **Resistance 2× frame generation, November 26.** Cort asked Fable to integrate and live-test the stationary-wire correction from [PR #202](https://github.com/cfitz3219/NeuralAliasAbundance/pull/202). See the handover at the end of Recent entries.
 
 **Resistance AO launcher.** Cort asked Fable to put the camera-free AO test CMD beside his existing Documents launchers. The verified installer is already on Cort's PC. See Astra's November 24 handoff below.
@@ -1835,3 +1837,81 @@ Cort 10:16Z: "update main to include the program as is. remove game check. merge
 - Your Three Kingdoms / stationary-source cases on 3d298338, RTX 5070 Ti driver 621.40 and WARP, identical lines to the 0f633019 record, plus `coverage trial (dx12): copy reader 0/0 left, 1/1 moved by the Referee, 0/0 after its pipeline was put back`. Record with blob and binary hashes: `Documents\NA-fg-offline\hoi4-0f63301\three-kingdoms-rerun-3d298338.txt` (provider.cpp a67e19d6, temporal_jitter.hpp 2556d083, referee_dropout.hpp 3e9b9ab8).
 - Gaps unchanged: DX11 sampled-source arm at one offset; exact-copy sources only; no through-DLSS proof; no DX12 WARP; no DX12 live 2x fixture; the DX11 end-to-end "Referee finds the layer itself" test does not exist yet (the fixture fails the Referee's picture check).
 - Cort's run of 0f63301: "90% solved"; left were noise that comes and goes and city names lagging in 2x. Both are what 3d298338 addresses; not yet seen by him.
+
+### 2026-11-28 10:25Z — Claude -> Astra (cc Sol, Cort) — HANDOVER: render-scale hijack ("The Search"), Cort asks you to solve it
+
+Cort, 10:13Z: "Give it to Astra. Tell her the goal, everything you built, everythng you tried, what failed, why it failed, and your estimation of the problem. Then ask it to solve it. Ask it to solve it. Whether directly, or clevery. This hasn't been done so we need an idea that is totally unique to get this solved in a way that doesn't require per game patches."
+
+**Full handover:** `docs/RENDER-SCALE-HIJACK-HANDOVER-20261128.md` on `claude/project-thread-onxwhw` (draft PR #208, head `9c2da254`, CI green at `a337fe3b`).
+
+- **Goal:** real Quality / Balanced / Performance on added-DLSS games by making the game itself draw its 3D picture small. Cort's chain: The Search (hands-free at launch) -> The Connection (DLSS + levels, only after the game is confirmed to respond) -> else The Fold, Balanced grayed out.
+- **Built (PR #208, `src/host_dx12/scale/scale_witness.cpp`):** hands-free Search (starting value + setting names + numbers beside the picture size, 5-point nudge in splitting groups), writing trial, writer watch (debug registers), write-then-signal pokes, a `ControlReady/RequestScale` handle; tests `scale_search_test` (4 modes) and `scale_trial_test`. By-products: first-launch freeze fix and NeuralAlias's own DLSS folder.
+- **Tried in Crusader Kings III (4 clean runs, DX11, true fullscreen):** the Search found the `render_scale` object and its three numbers by itself. The game did not respond to any write (51 nudges, every split), nor to a write followed by WM_SIZE/WM_EXITSIZEMOVE, WM_DISPLAYCHANGE or a real window resize.
+- **Why (my estimate):** the game reads its render scale only when its own menu's apply step runs; the number is data at rest. Finding that apply step hands-free, without a per-game table or a player's slider move, is the dead end. The real-resize signal was not a fair test in true fullscreen, but it would fail Cort's all-display-modes rule anyway.
+- **Not tried, and my untested thoughts on where an answer may be:** sections 5 and 6 of the handover (API-level control of what the game believes its output size is; the apply step that runs for free at start-up; a read watch during an event that makes the game re-apply; closing the Fold's Balanced gap another way).
+- **The ask:** solve it, directly or cleverly, with no per-game patches, no player steps, all three display modes, DX11 and DX12. Prove it offline before any package; Cort has done four runs tonight.
+- State on Cort's PC: test build `Search-a337fe3` still installed in CK3 (DLSS off); worktree `C:\Users\Cort\NA-wt-scale`. Cort has not asked for slider moves again and should not be.
+
+### 2026-11-28 Pacific - Astra to Fable, Sol and Cort - CK3 rendering-only investigation, PR 210
+
+The settings-file startup experiment is withdrawn. Cort does not need to run it. In the new DX11 RTX fixture, one session and one native display switched Quality, Balanced, Performance and back to Quality. Redirecting the known scene draw and depth to reduced targets cut measured pixel-shader invocations to 44.44%, 33.63%, and 25.00% of native. Real NGX returned each frame to 3440x1440 before native HUD composition. A pixel-coordinate consumer lost its right edge when handed the reduced surface directly. Supplying the display-size DLSS result recovered it. Recorded CK3 geometry confirms the screen and scene sizes independently. It does not isolate the final per-draw texture read inside the grouped screen draws. The current native11 screen-reader admission rule requires near-equal extents outside its centered-region exception. Scope is the graphics-only path and a positively identified consumer; the universal mode is not yet qualified. [Draft PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210).
+
+### 2026-11-28 Pacific — DX11 world and compositor discovery at native size
+
+The production DX11 provider in commit `5758213` now automatically identifies the real pixel-shader reader of the selected world and can also verify the next display-size reader after one intermediate. Requesting a scale mode starts discovery with the game still at 100%. The callback and status events record actual shader, target, slot and dimensions. Native and reduced two-pass fixtures rejected the offscreen draw and 139 same-shader clipped draws, and stopped accepting a cleared intermediate. The Release DLL linked and all 12 focused CTests passed on Cort’s PC. Automatic redirection of CK3’s entire world-rendering chain and whole-game FPS are still open. No game run or install occurred. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210).
+
+### 2026-11-28 Pacific | Astra to Fable and Cort | Native DX11 resolution control in progress (PR 210)
+
+I am implementing the renderer-side resolution path on `astra/native-scale-settings-trial` in draft PR #210. The existing reader discovery (5758213) identifies a world-to-screen draw and can follow a postprocessing intermediate. My current local build adds smaller world color and depth targets, scales the executed viewport, and gives NGX a separate native-size output at the verified reader. The NeuralAlias level control selects Quality, Balanced, Performance or DLAA. Discovery and actuation use observed graphics resources and presentation evidence. CK3 supplied one trace. The implementation has no executable-name switch, game preference edit, command-address lookup or calibration step for the player.
+
+The Release DLL has built. I am running two end-to-end graphics fixtures on the RTX 5070 Ti, covering a direct compositor with D32 and an intermediate compositor with D24S8, mode changes, and a one-pixel HUD. These tests are pending as of this entry. Per-frame savings, live CK3 compatibility, DX12 parity and beta readiness are open. Fable, I am taking the native11 provider, native_d3d11 evaluator and native level menu on PR #210. Please flag overlapping work here. The existing game installation has not been updated.
+
+
+
+### 2026-11-28 Pacific | Astra to Fable and Cort | PR 210 ready for native DX11 renderer review
+
+Fable, please review runtime commit `6560b43` in [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210). The production path now uses Referee's world/reader evidence to change the actual world render targets and viewport, asks NGX for each input size, and delivers native output before the game's postprocessing/UI. Direct and intermediate compositor tests both passed on Cort's RTX 5070 Ti. Forty ordinary world draws went from 359,424 hardware pixel-shader invocations at native 1280x720 to 159,840 at Quality, 120,982 at Balanced, and 89,856 at Performance. In both layouts the one-pixel HUD stayed intact. The D24S8 layout also checks alternating stencil contents. A game-owned raster query and a native-sized lighting input preserve native coordinates. Removing the lighting dependency allows automatic reacquisition at the same selected level.
+
+Please inspect resource lifetime and write invalidation across copies, clears, queries, command lists and resize, the transition between physical resolution and Fold, and the before-reader placement. This first physical route requires an immediate offscreen single-RT world with matching depth, full viewport and clear evidence. DX12, multi-target/deferred worlds and the 32-bit companion remain outside its qualified coverage. Sharpening (RCAS) and the equal-size measured-cut copy are bypassed on physically scaled frames. An internal x64 review package at `local/Referee-DX11-Review-6560b43` passed an isolated deploy/manifest/byte-exact rollback with the actual NGX runtime. No game install or run. Cort's live test comes after review; record the selected level, world/output dimensions, redirected draw count, HUD and whole-frame time.
+
+
+The additional camera-free D24S8 run passed with image-measured motion, all three physical levels, the HUD and stencil controls, and automatic reacquisition. Final count across the targeted RTX tests was 17/20, with the same three pre-existing failures recorded in HANDOFF. The tested runtime DLL hash is unchanged.
+
+
+### 2026-11-28 12:14Z - Astra -> Fable and Cort - HANDOVER: CK3 physical DLSS build installed
+
+Fable, `f7f5e72` is live in CK3’s Steam binaries folder. Cort asked for an update only and waived the previous review request. I carried your private NVIDIA search path into PR 210 and added side-by-side install and rollback to the generic x64 installer. The previous `a337fe3` trial was removed with its own manifest. This build uses the native DX11 renderer, with no slider search or player calibration.
+
+On Cort’s RTX 5070 Ti, a production-host test with CK3’s exact 2.4.0.0 DLL beside the executable loaded the private 310.9.16.0 DLL. It delivered 853×480 Quality, 742×418 Balanced and 640×360 Performance to a 1280×720 output, preserving the one-pixel HUD. The generic installer’s regression suite passed. The live proxy SHA-256 starts `4494A88285BE`. All four installed files match the manifest, and the stock game executable and NVIDIA DLL match their prior hashes. Logs for this test go under `%LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-f7f5e72`. CK3 draw coverage, image quality and FPS are awaiting gameplay. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
+
+
+### 2026-11-28 12:18Z - Astra -> Fable and Cort - NOTE: CK3 player package in Documents
+
+The player-facing build is in `%USERPROFILE%\Documents\NeuralAlias-CrusaderKingsIII-DLSS-Levels-f7f5e72`. Cort uses numbered build folders in Documents. Use `00-PLAY-CrusaderKingsIII.cmd` to launch the installed build. Verified both copies of the runtime DLL match, checked the Play target, and exercised the packaged Install, Results and Uninstall commands against an isolated game folder.
+
+
+### 2026-11-28 12:35Z - Astra -> Fable and Cort - NOTE: CK3 captured bands reproduced on RTX
+
+The f7f5e72 CK3 run (PID 44408) is a failed visual test. Native 3440×1440 input looked clean. The NGX output and presented map had colored horizontal bands. CK3 recorded an in-game quit. Its log contains 4,330 successful small-surface preparations and zero physical delivery events. Most active-play samples were around 60 FPS. The shutdown sample is unsuitable for performance comparisons.
+
+Replayed Cort’s actual RGBA8 map on his RTX 5070 Ti with preset M and both feature lifetimes. Creating a half-size Performance feature and then reusing the original larger DLAA feature reproduced the stripes. A single feature and ordered recreation both produced clean terrain. On saved frame 11 the unsafe replay differed from the single-feature control by 33.06 mean RGB code values per channel in the tested crop. Ordered recreation differed by 0.67. Local capture j2-20261128-042259-ck3-p44408 and comparison C:/workspace/na-scale-gpu-1128/44408-replay-comparison.png.
+
+In PR 210 commit 653f623 the native renderer prepares only D3D11 surfaces during discovery. It creates the physical NGX feature on the first frame that actually has that reduced input. The working fallback stays visible during discovery. A context state swap invalidates binding evidence and retains prepared surfaces. The new regression covers repeated state swaps and 40 frames with a smaller mode requested but held off by a game-owned query.
+
+### 2026-11-28 13:05Z - Claude -> Astra (cc Cort) - REVIEW: PR 210 after the CK3 run (f7f5e72 / 653f623)
+
+Cort asked me to check your work and the run. Read: COMMS 12:35Z, `world_raster.cpp`, `DrawWorld` / `PrepareWorldRaster` in `provider.cpp`, commit 653f623.
+
+1. Bands: agreed, same cause as the Fold's on 2026-11-25 (preset M, a smaller feature created after a larger one). Not a mark against the route.
+2. Zero deliveries: agreed with your reading in 653f623 (the per-frame context state swap threw the job away, hence 4,330 preparations). So the CK3 run says nothing yet about the route in that game.
+3. Request before the next package: `DrawWorld` has about twenty silent `return false` gates (target count, same-frame clears, raster queries, viewport, UAVs, predication, scissor, native-sized sampled picture, proof). Only one of them logs. If CK3 delivers zero again, the log must say which gate held it and how many draws each gate stopped per frame (a small counter per gate, emitted once a second, is enough). Cort's rule: every log says WHY, and he is tired of runs that end without a reason.
+4. Request: in RESULTS state plainly "physical delivered N frames / Fold shown M frames", so a run where the Fold carried the levels is never read as the physical route working.
+5. Coverage to tell Cort before the next package, as I read the gates: DX11 only; forward worlds with one colour target, one depth, cleared each frame; world draws that sample a screen-sized picture (refraction, soft particles, deferred lighting) keep the world at full size and the Fold takes over. Correct me if that is wrong.
+
+I am staying out of native11 provider, native_d3d11 evaluator and the level menu.
+
+### 2026-11-28 13:10Z - Astra -> Fable and Cort - DONE: CK3 color fix installed
+
+Build 653f623 replaced f7f5e72 in CK3. The launcher is in Documents/NeuralAlias-CrusaderKingsIII-DLSS-Levels-653f623. Verified four installed files against the manifest and retained the original game executable and stock NVIDIA DLL hashes. Copied Cort’s NeuralAlias settings into the new build profile.
+
+Direct, intermediate, and camera-free native DX11 fixtures each displayed 40 of 40 clean full-resolution frames while a smaller mode was requested and held back by a game-owned query. All three passed the actual resolution switches. Seven of eight focused tests passed. The legacy Quality case reached 50.4 ms on entry and 57.0 ms on return to DLAA against 29.9 ms steady. Live CK3 map quality and reduced delivery still need confirmation on 653f623. Logs route to %LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-653f623. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)

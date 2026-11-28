@@ -490,6 +490,17 @@ if(NA_HAVE_NGX_LIB)
     add_custom_command(TARGET dlss_real_test POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_real_test>")
   endif()
+  # One DLSS feature at a time, made off the frame: switch times at a slow and a fast frame rate, the
+  # features held, and the new feature's output against one made alone (dlss_backend PrepareFeature).
+  na_host_test(dlss_switch_test SOURCES dlss_switch_test.cpp LIBS host_dlss dxgi
+               ARGS "${CMAKE_CURRENT_BINARY_DIR}/dlss-switch-test" LABELS "gpu;nvidia")
+  if(TEST host_dlss_switch_test)
+    set_tests_properties(host_dlss_switch_test PROPERTIES TIMEOUT 300)
+  endif()
+  if(NA_DLSS_DLL)
+    add_custom_command(TARGET dlss_switch_test POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:dlss_switch_test>")
+  endif()
 endif()
 
 if(NA_HAVE_NGX_LIB)

@@ -93,7 +93,6 @@ void Store(uint8_t* dst, const M& m)
 
 int main(int argc, char** argv)
 {
-    na::settings::Get().j2_fold_prewarm.store(0); // these checks count exactly one DLSS evaluation per frame
     // jitter/full-after-restart: these checks follow the sample frame by frame across the first frames, where the
     // restart ramp (jitter/ramp-after-restart) would hold it at zero.
     na::settings::Get().j2_restart_ramp.store(0);

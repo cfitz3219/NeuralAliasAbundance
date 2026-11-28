@@ -281,3 +281,30 @@ Cort sees heat-wave ripples around thin lines even while holding the camera stil
 Astra’s [PR #204](https://github.com/cfitz3219/NeuralAliasAbundance/pull/204) supplies Replay motion over the native DX11/DX12 bridge on top of Fable’s #200. Code commit `2eb2acac`. On the RTX 5070 Ti, the old shared texture failed at DX11 OpenSharedResource1. The accepted texture preserved every byte of 1,038 positions. The test delivered 46 DLAA frames, 44 with Replay motion. A deliberately rejected allocation logged once and normal DLAA delivered all 46 frames.
 
 Fable’s unpublished overlay variant preserved the original Three Kingdoms material at both recorded offsets. A second RTX/WARP case proves that an otherwise eligible mesh reading stationary shader depth can turn black when moved. Both the two-grid reproducer and the full Replay results are in `local/HOI4-Replay-20261126` on Cort’s PC. The COMMS entry gives Fable the two measured outcomes and the requested per-reader handling. Live HoI4 quality and the final integrated overlay revision remain open. Cort’s instruction to hold the player build applies.
+
+## 2026-11-28 — Native DX11 live DLSS scale test
+
+Astra withdrew the startup settings trial and disabled its launcher. No player test is requested. The graphics test switched Quality → Balanced → Performance → Quality in one process on the RTX 5070 Ti. The controlled world draw consumed 44.44%, 33.63% and 25.00% of its native pixel shader invocations. NGX produced a 3440×1440 result before a native-pixel reader and the single-pixel-wide HUD stayed intact. Referee’s screen check rejected a matching offscreen draw and selected the visible draw in every mode. The fixture supplied the candidates. Live CK3 world-pass discovery, screen-reader nomination and whole-game FPS are still open. [Draft PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210).
+
+### 2026-11-28 Pacific — DX11 world and compositor discovery at native size
+
+The production DX11 provider in commit `5758213` now automatically identifies the real pixel-shader reader of the selected world and can also verify the next display-size reader after one intermediate. Requesting a scale mode starts discovery with the game still at 100%. The callback and status events record actual shader, target, slot and dimensions. Native and reduced two-pass fixtures rejected the offscreen draw and 139 same-shader clipped draws, and stopped accepting a cleared intermediate. The Release DLL linked and all 12 focused CTests passed on Cort’s PC. Automatic redirection of CK3’s entire world-rendering chain and whole-game FPS are still open. No game run or install occurred. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210).
+
+
+### 2026-11-28 Pacific | Native DX11 physical DLSS levels ready for review
+
+Runtime `6560b43` in [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210) delivers real, automatically discovered reduced world color and depth to NGX and writes its full-resolution answer back before the verified consumer. Direct-to-screen composition and a separate postprocessing intermediate both passed on the RTX 5070 Ti. The intermediate also passed with camera discovery off and image-measured motion active. World-only hardware pixel counts at 1280x720 were 359,424 native, 159,840 Quality, 120,982 Balanced and 89,856 Performance. The one-pixel HUD, alternating stencil, game query, native-coordinate lighting and automatic reacquisition controls passed. Across the release matrix and the camera-free test, 17/20 passed. The three previous failures are the native DLAA R2/toggle checks in two variants and the legacy Fold Quality transition (58.0 ms against 29.9 ms steady this run).
+
+The hashed internal x64 review package is `local/Referee-DX11-Review-6560b43`; the actual DLL and NGX passed an isolated deploy and rollback. Fable has the review request in COMMS. A reviewed live run must still establish the route chosen, draw coverage, frame time and visual quality in an actual game. The game and its resolution settings were untouched. The new path requires a single native-sized immediate-context offscreen color/depth pair; the runtime log names each delivered level and the physical output sizes. DX12 and MRT/deferred worlds remain outside this physical route.
+
+
+### 2026-11-28 | CK3 installed for the hands-free native DX11 DLSS test
+
+Cort authorized proceeding with Fable informed. At 04:14 Pacific, Astra verified all four files from build `f7f5e72` in the live CK3 binaries folder. CK3’s own 2.4.0.0 NVIDIA DLL and ck3.exe matched their original hashes. The host uses its private 310.9.16.0 DLL. The RTX test with both versions present measured the intended render dimensions and preserved the HUD at all three reduced levels. The game starts at full-size DLAA. The Home menu’s Live DLAA group contains the level selector. CK3 map coverage and frame time require a player run. The new per-run logs are in `%LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-f7f5e72`. The local package under `local/Referee-DX11-f7f5e72` contains the previous install backup and `Install-CK3.ps1 -Action Remove` for a return to stock with CK3 closed.
+
+
+### 2026-11-28 13:10Z - Astra -> Fable and Cort - DONE: CK3 color fix installed
+
+Build 653f623 replaced f7f5e72 in CK3. The launcher is in Documents/NeuralAlias-CrusaderKingsIII-DLSS-Levels-653f623. Verified four installed files against the manifest and retained the original game executable and stock NVIDIA DLL hashes. Copied Cort’s NeuralAlias settings into the new build profile.
+
+Direct, intermediate, and camera-free native DX11 fixtures each displayed 40 of 40 clean full-resolution frames while a smaller mode was requested and held back by a game-owned query. All three passed the actual resolution switches. Seven of eight focused tests passed. The legacy Quality case reached 50.4 ms on entry and 57.0 ms on return to DLAA against 29.9 ms steady. Live CK3 map quality and reduced delivery still need confirmation on 653f623. Logs route to %LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-653f623. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
