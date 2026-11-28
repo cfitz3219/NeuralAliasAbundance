@@ -84,6 +84,10 @@ struct State {
     std::atomic<bool> trial_wanted{false}, trial_active{false}, sweeping{false};
     // The Search ([scale] search=1): the number is found at launch with no slider moves.
     std::atomic<bool> search_wanted{false}, names_done{false};
+    // The handle the Connection drives: the one number the game obeys (set once the writing trial passed).
+    std::atomic<bool> control_ready{false}, control_thread{false};
+    uint64_t control_address = 0; hunt::Kind control_kind = hunt::Kind::ScaleF32; double control_home = 1.0; // fixed once ready
+    std::atomic<uint32_t> control_asked{0}; // wanted scale in 1/10000; 0: the game's own value
     int search_state = 0;            // under trial_m. 0 not started, 1 running, 2 found, 3 not found, 4 stopped
     std::string search_text;         // under trial_m: the one-sentence outcome and why
     std::vector<std::string> search_lines; // under trial_m: what each step saw
@@ -1075,7 +1079,10 @@ void run_trial(const std::vector<hunt::Entry>& given = {})
             line("trial: %s at %s: was %g, asked %.0f%% -> %s (achieved %.1f%%, %u ms, hold %s, reverts %u, writes %u, value %s, put back %s)",
                  hunt::KindName(e.kind), where_text(e.address).c_str(), row.before, goal * 100.0, hunt::VerdictName(row.verdict), row.achieved * 100.0,
                  row.respond_ms, hunt::HoldName(row.hold), row.reverts, row.writes, row.kept_value ? "kept" : "replaced", back ? "yes" : "NO");
-            if (!works && back && (row.verdict == hunt::Verdict::Responded || row.verdict == hunt::Verdict::Snapped)) works = e.address;
+            if (!works && back && (row.verdict == hunt::Verdict::Responded || row.verdict == hunt::Verdict::Snapped)) {
+                works = e.address;
+                g.control_address = e.address; g.control_kind = e.kind; g.control_home = home;
+            }
             if (!back) stopped = true;
         } else line("trial: %s at %s: not tried (%s)", hunt::KindName(e.kind), where_text(e.address).c_str(), row.note);
         { std::lock_guard<std::mutex> l(g.trial_m); g.trial_rows.push_back(row); }
@@ -1095,7 +1102,12 @@ void run_trial(const std::vector<hunt::Entry>& given = {})
     watch_report(true);
     watch_stop();
     write_verdict();
-    if (works) { find_routes(works); write_verdict(); }
+    if (works) {
+        g.control_ready.store(true);
+        line("control: ready. %s at %s is the handle for the game's render scale (its own value: %.1f%%)", hunt::KindName(g.control_kind),
+             where_text(works).c_str(), home * 100.0);
+        find_routes(works); write_verdict();
+    }
     line("trial: finished");
 }
 
@@ -1423,6 +1435,41 @@ void trial_worker()
 }
 } // namespace
 
+namespace {
+// Keeps the game's render scale where the Connection asked: writes the number whenever it does not hold
+// the asked value (once is enough for a game that keeps it; a game that puts its own back is corrected
+// within a few milliseconds). Asked 0: the game's own value is written back once.
+void control_worker()
+{
+    uint32_t last = 0;
+    for (;;) {
+        Sleep(4);
+        const uint32_t asked = g.control_asked.load(std::memory_order_relaxed);
+        if (!asked && !last) { Sleep(30); continue; }
+        const double want = asked ? double(asked) / 10000.0 : g.control_home;
+        hunt::Target t; t.out_w = 10000; t.out_h = 10000; t.world_w = uint32_t(want * 10000.0 + 0.5); t.world_h = t.world_w;
+        if (!holds(g.control_address, g.control_kind, t) || asked != last) {
+            if (!write_scale(g.control_address, g.control_kind, want)) {
+                line("control: the number at %s can no longer be written; the game's render scale is released", where_text(g.control_address).c_str());
+                g.control_ready.store(false); g.control_asked.store(0);
+                return;
+            }
+            if (asked != last) line("control: render scale asked %.1f%%%s", want * 100.0, asked ? "" : " (the game's own value, given back)");
+        }
+        last = asked;
+    }
+}
+} // namespace
+bool ControlReady() { return g.control_ready.load(std::memory_order_relaxed); }
+bool RequestScale(double ratio)
+{
+    if (!ControlReady() || (ratio != 0.0 && !(ratio >= 0.25 && ratio <= 1.0))) return false;
+    g.control_asked.store(ratio == 0.0 ? 0u : uint32_t(ratio * 10000.0 + 0.5));
+    if (!g.control_thread.exchange(true)) {
+        try { std::thread(control_worker).detach(); } catch (...) { g.control_thread.store(false); return false; }
+    }
+    return true;
+}
 void SetTrial(bool on) { g.trial_wanted.store(on); }
 void SetSearch(bool on) { g.search_wanted.store(on); if (on) g.trial_wanted.store(true); }
 void Start(const wchar_t* log_path, const wchar_t* verdict_path)

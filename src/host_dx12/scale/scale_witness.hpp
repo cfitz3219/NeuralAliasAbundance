@@ -52,6 +52,12 @@ void SetTrial(bool on);
 // beside the 3D picture's size, nudges them by five points in halving groups, and keeps the one the game
 // obeys. The writing trial then runs on it. Results: "SEARCH: ..." and "NEXT STAGE: ..." in the verdict file.
 void SetSearch(bool on);
+// The handle for The Connection. ControlReady: the Search (or the slider test) found the one number the game
+// obeys and the writing trial passed. RequestScale(ratio in 0.25..1.0) keeps the game's 3D picture at that
+// share of the screen from then on; RequestScale(0) gives the game its own value back. False: not ready, or
+// a ratio outside the range. Nothing is written until the first request.
+bool ControlReady();
+bool RequestScale(double ratio);
 
 namespace analysis {
 namespace locator = na::scale::native::locator;

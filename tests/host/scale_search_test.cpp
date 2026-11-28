@@ -118,6 +118,23 @@ int main()
     expect(untouched, "every look-alike number was put back");
     expect(g_fake_renderer->world_w == int32_t(kOutW), "the 3D world is back at its own size");
 
+    // The handle the Connection will drive: ask for the DLSS levels' sizes and give the game's own back.
+    expect(witness::ControlReady(), "the render-scale handle is ready after the Search");
+    expect(!witness::RequestScale(0.1), "a size outside 25%..100% is refused");
+    auto world_becomes = [&](int32_t want) {
+        for (int i = 0; i < 100; ++i) { if (g_fake_renderer->world_w == want) return true; Sleep(10); }
+        return false;
+    };
+    expect(witness::RequestScale(2.0 / 3.0) && world_becomes(1280), "asked 66.7% (Quality): the 3D world became 1280 wide");
+    expect(witness::RequestScale(0.58) && world_becomes(1114), "asked 58% (Balanced): the 3D world became 1114 wide");
+    expect(witness::RequestScale(0.5) && world_becomes(960), "asked 50% (Performance): the 3D world became 960 wide");
+    g_fake_settings->render_scale = 1.0f; // the game puts its own value back
+    Sleep(100);
+    expect(world_becomes(960), "the game's own write was corrected: still 960 wide");
+    expect(witness::RequestScale(0.0) && world_becomes(int32_t(kOutW)), "given back: the 3D world is at the game's own size again");
+    Sleep(200);
+    expect(std::fabs(g_fake_settings->render_scale - 1.0f) < 1e-6f, "the game's own value is in place");
+
     g_run.store(false);
     game.join();
     timeEndPeriod(1);
