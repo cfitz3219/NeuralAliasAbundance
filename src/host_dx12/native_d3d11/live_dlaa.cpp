@@ -11,8 +11,11 @@
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/depth_format.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
+#include "host_dx12/overlay/dlss_debug.hpp"
+#include <cstdlib>
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "core/first_setup.hpp"
 #include "host_dx12/diag/vram_ledger.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
@@ -38,6 +41,7 @@
 #include <cstring>
 #include <vector>
 #include <atomic>
+#include <thread>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -113,6 +117,8 @@ struct Session {
     bool companion = false;
     // DLSS Quality / Performance (the fold, shared with the DX12 route: fold/fold_pass.hpp).
     na::fold::Pass fold;
+    unsigned last_world_level = 0, optimal_level = 0, optimal_w = 0, optimal_h = 0;
+    dlss::OptimalSettings optimal{};
     na::fold::Mode fold_next = na::fold::Mode::Off; // the level the next frame's scene is drawn for
     uint64_t fold_rate_frame = 0;                   // the frame the current shading rate was asked after
     uint64_t fold_shown_frames[na::fold::kModes]{}, fold_warm_frames = 0, fold_warm_failed = 0, fold_coarse_frames = 0, fold_fine_frames = 0, fold_unable = 0;
@@ -135,6 +141,12 @@ struct Session {
 // immediate context and can still have queued copies when shutdown starts.
 Session& State() { static auto* s = new Session; return *s; }
 std::mutex mutex;
+// First-time set-up (our own DX12 device, DLSS start, the passes' programs) runs on a thread of its own
+// and holds `mutex` for all of it. The game's threads read this before they would take `mutex`, so they
+// never wait: 0 not started, 1 running, 2 finished (s.native set = ready, else it failed).
+// Cort 2026-11-27: this work froze a game for longer than Windows allows when it ran on the game's thread.
+std::atomic<int> g_first_setup{0};
+constexpr char kGettingReady[] = "DLAA is getting ready (first-time set-up runs beside the game; the game keeps drawing).";
 std::atomic<const char*> reason{"Waiting for a native scene."};
 std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
 // WHY log: frames on which DLSS was told to drop its history, by cause. A reset on every frame
@@ -306,10 +318,11 @@ void CopyDepth(Session& s, Slot& slot, ID3D11DeviceContext* ctx, ID3D11Texture2D
     for (UINT i = 0; i < count; ++i) if (instances[i]) instances[i]->Release();
 }
 
-bool Prepare(Session& s, Slot& slot, const ImageDesc& color, const ImageDesc& depth, DXGI_FORMAT packed)
+bool Prepare(Session& s, Slot& slot, const ImageDesc& color, const ImageDesc& depth, DXGI_FORMAT packed, UINT output_w, UINT output_h)
 {
     auto* dev = s.device.Get();
     auto out = color;
+    out.width = output_w; out.height = output_h;
     out.writable12 = true;
     if (FAILED(slot.color.Create(s.native.Get(), dev, color)) ||
         FAILED(slot.depth.Create(s.native.Get(), dev, depth)) ||
@@ -458,7 +471,7 @@ void SyncCameraUse()
         // Coarse shading only while folded frames are really delivered: a paused or stalled DLAA never
         // leaves the game's own picture drawn in blocks.
         const auto last = delivered_at.load(std::memory_order_relaxed);
-        if (paused || !last || GetTickCount64() - last > 250) {
+        if ((paused || !last || GetTickCount64() - last > 250) && g_first_setup.load(std::memory_order_acquire) != 1) {
             std::lock_guard<std::mutex> lk(mutex);
             auto& s = State();
             fold_rate(s, na::fold::Mode::Off, 0);
@@ -481,7 +494,35 @@ void SyncCameraUse()
         (setting == 1 || ambient) ? native11::CameraUse::Optional : native11::CameraUse::Off);
 }
 
+namespace {
+bool EvaluateFrameTimed(void* context, const native11::SceneFrame& frame);
+std::atomic<uint64_t> g_longest_call_ms{0};
+}
+uint64_t LongestCallMs() { return g_longest_call_ms.load(std::memory_order_relaxed); }
+
+// The game's thread waits for this call. Its time is measured, and a long one is logged with the reason
+// the frame ended on, so a stall names itself in the log instead of needing a debugger.
 bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
+{
+    LARGE_INTEGER t0, t1, hz;
+    QueryPerformanceCounter(&t0);
+    const bool result = EvaluateFrameTimed(context, frame);
+    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&hz);
+    const uint64_t ms = static_cast<uint64_t>((t1.QuadPart - t0.QuadPart) * 1000 / hz.QuadPart);
+    uint64_t longest = g_longest_call_ms.load(std::memory_order_relaxed);
+    while (ms > longest && !g_longest_call_ms.compare_exchange_weak(longest, ms, std::memory_order_relaxed)) {}
+    if (ms >= 100) {
+        static std::atomic<unsigned> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 24)
+            na::eventlog::Emit("first_setup", "api=dx11 the game's thread waited %llu ms in DLAA's frame work at frame %llu (%s): %s",
+                               static_cast<unsigned long long>(ms), static_cast<unsigned long long>(frame.frame),
+                               result ? "delivered" : "not delivered", reason.load(std::memory_order_relaxed));
+    }
+    return result;
+}
+
+namespace {
+bool EvaluateFrameTimed(void* context, const native11::SceneFrame& frame)
 {
     // The native provider has witnessed a real rendered scene. Wake the
     // existing session worker so it can qualify settings and enable effects.
@@ -492,6 +533,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                                 SUCCEEDED(State().replay_handoff_hr.load(std::memory_order_relaxed));
     const auto sealed = replay_setting ? native11::draw_replay::Seal(frame.frame) : native11::draw_replay::Sealed{};
     if (!context || !j2::Enabled() || j2::Paused()) return Skip("DLAA paused.");
+    if (g_first_setup.load(std::memory_order_acquire) == 1) return Skip(kGettingReady); // its thread holds `mutex`
     std::lock_guard<std::mutex> lock(mutex);
     auto& s = State();
     if (s.failed) return false;
@@ -624,13 +666,79 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         if (alternative == tool) applied_tool |= referee::Bit(alternative);
     };
     observe::HostWorkScope own;
-    if (!s.native && !Start(s, native.Get())) {
+    if (!s.native && g_first_setup.load(std::memory_order_acquire) == 0 && na::first_setup::InlineForTests().load(std::memory_order_relaxed)) {
+        Start(s, native.Get()); // tests that count frames from the first call (core/first_setup.hpp)
+        g_first_setup.store(2, std::memory_order_release);
+    }
+    if (!s.native && g_first_setup.load(std::memory_order_acquire) == 0) {
+        // Not on the game's thread. This frame and the ones until it finishes are left as the game drew them.
+        g_first_setup.store(1, std::memory_order_release);
+        const bool replay_wanted = replay_setting;
+        const bool flow_wanted = measured || j2::flow::Enabled();
+        const unsigned w = ci.width, h = ci.height;
+        std::thread([native, replay_wanted, flow_wanted, w, h] {
+            const uint64_t began = GetTickCount64();
+            bool ok;
+            uint64_t start_ms, passes_ms;
+            {
+                std::lock_guard<std::mutex> setup(mutex);
+                auto& st = State();
+                observe::HostWorkScope own;
+                ok = Start(st, native.Get());
+                start_ms = GetTickCount64() - began;
+                if (ok) {
+                    // The levels' pass, when levels are in use (asked for again where it is used; nothing is built twice).
+                    if (!st.companion && settings::Get().j2_fold_mode.load(std::memory_order_relaxed))
+                        st.fold.Init(st.device.Get(), kSlots);
+                    if (replay_wanted && !st.replay_tried) {
+                        st.replay_tried = true;
+                        if (st.replay.Init(st.device.Get())) st.replay.SetLearnSink(&ReplayLearnSink);
+                        na::eventlog::Emit("draw_replay11_pass", "ready=%d", st.replay.Ready() ? 1 : 0);
+                    }
+                    if (flow_wanted) j2::compute_flow::Warm(st.device.Get(), st.queue.Get(), w, h);
+                }
+                passes_ms = GetTickCount64() - began - start_ms;
+            }
+            na::eventlog::Emit("first_setup", "api=dx11 %s on its own thread (the game kept drawing): device, queue and DLSS start %llu ms, passes %llu ms",
+                               ok ? "ready" : "FAILED", static_cast<unsigned long long>(start_ms), static_cast<unsigned long long>(passes_ms));
+            g_first_setup.store(2, std::memory_order_release);
+        }).detach();
+        return Skip(kGettingReady);
+    }
+    if (!s.native) {
         // Says WHY: on the companion route the companion's own reason is the useful one.
         static char why[200];
         const auto remote = dlaa_remote::GetStats();
         if (!s.companion || !remote.reason[0]) return FailSession(s, "Native DX12 effects device could not start.");
         std::snprintf(why, sizeof why, "DLAA companion: %s", remote.reason);
         return FailSession(s, why);
+    }
+    // The motion measurement's working set for this picture size (also after a change of size).
+    if ((measured || j2::flow::Enabled()) && !j2::compute_flow::Warm(s.device.Get(), s.queue.Get(), ci.width, ci.height))
+        return Skip(kGettingReady);
+    const uint32_t level = settings::Get().j2_fold_mode.load(std::memory_order_relaxed);
+    const bool physical = frame.world_level != 0;
+    const auto quality = [](uint32_t mode) {
+        return mode == 1 ? dlss::Quality::MaxQuality : mode == 2 ? dlss::Quality::MaxPerformance : dlss::Quality::Balanced;
+    };
+    ID3D11Resource* destination = cr;
+    UINT out_w = ci.width, out_h = ci.height;
+    if (physical) {
+        destination = static_cast<ID3D11Resource*>(frame.native_output.d3d11_resource);
+        out_w = frame.native_output.width; out_h = frame.native_output.height;
+        ComPtr<ID3D11Texture2D> out;
+        D3D11_TEXTURE2D_DESC desc{};
+        if (!destination || FAILED(destination->QueryInterface(IID_PPV_ARGS(&out)))) return Skip("World output disappeared.");
+        out->GetDesc(&desc);
+        if (s.companion || level != frame.world_level || !CompatibleImageCopy(desc, 0, {out_w, out_h, cf}))
+            return Skip("World resolution changed before DLSS delivery.");
+    } else if (!s.companion && level && level <= 3 && frame.screen_proof && frame.scaled_reader.target) {
+        if (s.optimal_level != level || s.optimal_w != cw || s.optimal_h != ch) {
+            s.optimal = {};
+            if (dlss::QueryOptimal(cw, ch, quality(level), &s.optimal)) {
+                s.optimal_level = level; s.optimal_w = cw; s.optimal_h = ch;
+            }
+        }
     }
     UINT index = 0;
     for (; index < kSlots; ++index) {
@@ -643,9 +751,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     }
     auto& owned = s.slots[index];
     if (!owned || owned->color.Description().width != ci.width || owned->color.Description().height != ci.height ||
+        owned->output.Description().width != out_w || owned->output.Description().height != out_h ||
         owned->color.Description().format != ci.format || owned->depth_format != df) {
         auto slot = std::make_unique<Slot>();
-        if (!Prepare(s, *slot, ci, di, df)) return FailSession(s, "Could not create shared native scene images.");
+        if (!Prepare(s, *slot, ci, di, df, out_w, out_h)) return FailSession(s, "Could not create shared native scene images.");
         if (s.companion && !dlaa_remote::Bind(index, ci.width, ci.height, slot->color.Effects(), slot->depth.Effects(),
                                               slot->motion.Get(), slot->output.Effects()))
             return FailSession(s, "The DLAA companion could not open the shared scene images.");
@@ -739,13 +848,28 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const auto jitter_history = neural_alias::JitterHistoryForFrame(s.jitter_history, jitter_requested,
                                                                    frame.raster.applied, debug_jitter);
     const bool jitter_switched = neural_alias::JitterHistoryChanged(s.jitter_history, jitter_history);
-    reset_history |= jitter_switched;
+    reset_history |= jitter_switched || s.last_world_level != frame.world_level;
     // Sampled motion (as on DX12): while a folded level is settled on screen and nothing else needs the
     // whole motion field, the per-pixel passes decide only the pixel that level keeps of each block,
     // written straight into its folded motion plane.
     na::fold::Mode sampled_mode = na::fold::Mode::Off;
     ID3D12Resource* sampled_motion = nullptr;
-    const na::fold::Mode fold_setting = (!j2::Enabled() || j2::Paused()) ? na::fold::Mode::Off
+    if (!physical && level && level <= 3) {
+        // The world drawn small is the first choice for every level; the Fold shows meanwhile and whenever it
+        // cannot be had. Each reason for not asking is told, so the log and the menu can say WHY.
+        if (s.companion) native11::NoteWorldHold(native11::WorldHold::HelperProgram);
+        else if (!frame.scaled_reader.target || !frame.screen_proof) native11::NoteWorldHold(native11::WorldHold::Reader);
+        else if (level != s.optimal_level || !s.optimal.valid || cw != s.optimal_w || ch != s.optimal_h)
+            native11::NoteWorldHold(native11::WorldHold::NoRenderSize);
+        else {
+            // A candidate can remain unqualified indefinitely. Creating a smaller NGX feature
+            // while the larger preset-M feature is still displayed corrupts its history.
+            // Prepare only D3D11 surfaces here. Evaluate creates the NGX feature in queue
+            // order on the first frame that actually supplies the smaller image.
+            native11::PrepareWorldRaster(context, frame, level, s.optimal.render_w, s.optimal.render_h);
+        }
+    }
+    const na::fold::Mode fold_setting = (physical || !j2::Enabled() || j2::Paused()) ? na::fold::Mode::Off
                                         : na::fold::ModeFrom(settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
     {
         const na::fold::Mode shown = s.fold.hand.shown;
@@ -805,7 +929,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         ff.use_screen_fit = tool != Tool::ScreenFit;
         ff.total = measured; ff.last_reset_frame = s.last_reset_frame;
         {   // A folded frame (core/fold_shading.hpp): the picture is in blocks; strict acceptance rules (as on DX12).
-            const na::fold::Mode drawn = g_fold_rate.load(std::memory_order_relaxed) && frame.frame > s.fold_rate_frame ? s.fold.hand.shown : na::fold::Mode::Off;
+            const na::fold::Mode drawn = !physical && g_fold_rate.load(std::memory_order_relaxed) && frame.frame > s.fold_rate_frame ? s.fold.hand.shown : na::fold::Mode::Off;
             if (drawn != na::fold::Mode::Off) {
                 const auto fb = na::fold::BlockFor(drawn);
                 ff.block_x = static_cast<uint8_t>(fb.x); ff.block_y = static_cast<uint8_t>(fb.y);
@@ -1091,9 +1215,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     eval.depth = shared_depth;
     eval.motion = slot.motion.Get();
     eval.output = slot.output.Effects();
-    eval.render_w = eval.out_w = ci.width;
-    eval.render_h = eval.out_h = ci.height;
-    eval.quality = dlss::Quality::DLAA;
+    eval.render_w = ci.width; eval.out_w = out_w;
+    eval.render_h = ci.height; eval.out_h = out_h;
+    eval.quality = physical ? quality(frame.world_level) : dlss::Quality::DLAA;
     eval.hdr = eval.auto_exposure = hdr;
     eval.depth_inverted = frame.reversed_depth;
     const auto declared = debug_jitter.Declared(in.jitter_current_px[0], in.jitter_current_px[1]);
@@ -1101,7 +1225,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     eval.jitter_y = declared.y;
     eval.reset = reset_history;
     eval.preset = preset == 255 ? 12 : preset;
-    eval.view_id = kNativeView;
+    eval.view_id = physical ? kNativeView + 0x100 + frame.world_level : kNativeView;
     eval.ordered_feature_group = kNativeView; // the folded levels' features are created in the safe order (dlss_backend)
     if (lighting.tone || lighting.bloom) {
         donut::Inputs gi;
@@ -1125,7 +1249,20 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const auto now_ms = [] { LARGE_INTEGER t, f; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f); return double(t.QuadPart) * 1000.0 / double(f.QuadPart); };
     double fold_cpu_prepare = 0, fold_cpu_show = 0;
     bool fold_log_frame = false;
-    {
+    if (physical) {
+        const auto previous = s.fold.hand.shown;
+        if (s.fold.hand.Begin(na::fold::Mode::Off, false, true).switched) {
+            s.fold_release_view_after = kFoldView + static_cast<uint64_t>(previous);
+            eval.reset = true;
+        }
+        s.fold_next = na::fold::Mode::Off;
+        fold_rate(s, s.fold_next, frame.frame);
+        g_fold_status.asked.store(0, std::memory_order_relaxed);
+        g_fold_status.shown.store(0, std::memory_order_relaxed);
+        g_fold_status.warming.store(0, std::memory_order_relaxed);
+        g_fold_status.w.store(eval.render_w, std::memory_order_relaxed);
+        g_fold_status.h.store(eval.render_h, std::memory_order_relaxed);
+    } else {
         using na::fold::Mode;
         const bool paused = !j2::Enabled() || j2::Paused();
         const Mode asked = paused ? Mode::Off : na::fold::ModeFrom(settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
@@ -1313,8 +1450,10 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         evaluated = dlss::Evaluate(list, eval);
         fold_cpu_show = now_ms() - t_show;
     }
-    {   // One DLSS feature at a time (the fold block above): the old mode's view goes on the frame the new
-        // one is shown, and the next mode's feature is started now, right after this Evaluate.
+    {   // A superseded view can retire after recording the replacement.
+        if (evaluated && physical && s.fold_prepare_after) s.fold_prepare_after = false;
+        if (evaluated && s.last_world_level && s.last_world_level != frame.world_level)
+            dlss::ReleaseView(kNativeView + 0x100 + s.last_world_level);
         if (s.fold_release_view_after) { dlss::ReleaseView(s.fold_release_view_after); s.fold_release_view_after = 0; }
         if (!evaluated && fold_shown != na::fold::Mode::Off && !s.companion) {
             s.fold.hand.Refuse(fold_shown);
@@ -1322,7 +1461,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
             na::eventlog::Emit("fold11", "REFUSED %s at frame %llu: DLSS did not accept the folded picture (%ux%u). DLAA takes over.",
                                na::fold::Name(fold_shown), static_cast<unsigned long long>(frame.frame), eval.render_w, eval.render_h);
         }
-        if (s.fold_prepare_after) {
+        if (!physical && s.fold_prepare_after) {
             s.fold_prepare_after = false;
             dlss::PrepareFeature(s.fold_prepare_desc);
         }
@@ -1390,7 +1529,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // A measured scene cut that DLSS has not been reset for yet: the temporal output still holds the
     // old scene, so those frames show the picture DLSS was given instead. Decided on the GPU, in
     // execution order, with no wait (compute_flow.hpp RecordCutShow). Nothing happens on other frames.
-    if (measured && evaluated && flow.pair)
+    if (!physical && measured && evaluated && flow.pair)
         j2::compute_flow::RecordCutShow(list, flow, full_color, slot.output.Effects());
     if (capture_armed) {
         // A saved capture also takes the scene's source textures, once per capture folder.
@@ -1451,7 +1590,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     const uint32_t slider = (std::min)(settings::Get().j2_sharpness.load(), 100u);
     const bool reduced = tool == Tool::Sharpen;
     const uint32_t sharpness = settings::RcasStrength(slider, reduced);
-    if (evaluated && sharpness) {
+    if (!physical && evaluated && sharpness) {
         Barrier(list, slot.output.Effects(), kWrite, kRead);
         Barrier(list, slot.color.Effects(), kRead, kWrite);
         if (j2::RecordNativeRcas(s.device.Get(), list, slot.output.Effects(), slot.color.Effects(), shared_depth,
@@ -1601,7 +1740,8 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                                na::fold::KeptPixelCentring(fold_block.x, fold_pick.x); // 0 for a one-pixel block
         s.requested_jitter_y = static_cast<float>(sample.y_pixels) * (amount * .01f) * ramp * static_cast<float>(fold_block.y) +
                                na::fold::KeptPixelCentring(fold_block.y, fold_pick.y);
-        native11::SetNextJitter(s.requested_jitter_x, s.requested_jitter_y);
+        native11::SetNextJitter(s.requested_jitter_x * (float(out_w) / ci.width),
+                                s.requested_jitter_y * (float(out_h) / ci.height));
     };
     s.since_restart = reset_history ? 0u : s.since_restart + 1u;
     // Measured: the next frame's sample is asked for here, not at delivery, so one failed DLSS step
@@ -1621,6 +1761,23 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
     // The replay buffers this frame wrote or read are free again once this frame's DX12 work is done.
     for (const int used : {replay_cur, replay_prev_used})
         if (used >= 0) { s.replay_buffers[used].native_done = slot.native_done; s.replay_buffers[used].effects_done = slot.effects_done; }
+    if (!s.companion) {
+        // Which DLSS file is in use, once it is loaded; and when frames are refused with a file older than
+        // 3.x in use, the reason names it (an old file a game ships beside its program refuses DLAA).
+        static std::atomic<int> said{0};
+        static char old_file[224] = "";
+        if (said.load(std::memory_order_relaxed) < 2) {
+            const auto file = na::dlss_debug::Query();
+            if (file.loaded && file.version[0] && said.exchange(2, std::memory_order_relaxed) < 2) {
+                na::eventlog::Emit("dlss_file", "api=dx11 in use: %ls version %s (%s)", file.path, file.version,
+                                   na::dlss::OwnDlssFolder()[0] ? "NeuralAlias's own folder is searched first" : "no NeuralAlias-DLSS folder was found");
+                if (std::atoi(file.version) < 3)
+                    std::snprintf(old_file, sizeof old_file, "DLAA refused: the DLSS file in use is version %s, an old file beside the game's program. "
+                                  "NeuralAlias's own DLSS file (folder NeuralAlias-DLSS) was not found.", file.version);
+            }
+        }
+        if (!evaluated && old_file[0]) return Skip(old_file);
+    }
     if (!evaluated) {
         if (!s.companion) return Skip("DLAA evaluation rejected this frame.");
         static char why[200];
@@ -1629,10 +1786,15 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         return Skip(why);
     }
     if (FAILED(s.fences.WaitNative(slot.effects_done))) return FailSession(s, "Native result dependency failed.");
-    ctx->CopySubresourceRegion(color.Get(), csub, c.active_x, c.active_y, 0, result, 0, nullptr);
+    ctx->CopySubresourceRegion(destination, physical ? 0 : csub, physical ? 0 : c.active_x, physical ? 0 : c.active_y, 0, result, 0, nullptr);
     // This signal retires the slot. The game's subsequent submission can
     // flush it naturally because no effects queue waits on the value.
     if (FAILED(s.fences.SignalNative(&slot.native_done, false))) return FailSession(s, "Native result submission failed.");
+    if (s.last_world_level != frame.world_level || (frame.world_level && frame.frame % 300 == 0))
+        na::eventlog::Emit("native11_world_delivery", "frame=%llu level=%u render=%ux%u output=%ux%u redirected_draws=%u scene_draws=%u proof=%llu",
+            (unsigned long long)frame.frame, frame.world_level, ci.width, ci.height, out_w, out_h,
+            frame.world_draws, frame.scene_draws, (unsigned long long)frame.screen_proof);
+    s.last_world_level = frame.world_level;
     s.jitter_history = jitter_history;
     if (jitter_switched) resets_jitter_switch.fetch_add(1, std::memory_order_relaxed);
     s.stream = frame.stream;
@@ -1656,6 +1818,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                           : "Native DX11 DLAA delivered before the scene consumer.", std::memory_order_relaxed);
     return true;
 }
+} // namespace
 
 void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue,
                     const native11::PresentReceipt& receipt, PresentPicture picture)
@@ -1684,8 +1847,11 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue,
         // The inputs, copies and witness reduction must use the same queue.
         // The overlay's separate queue can reach Present before our sample
         // fence completes, even when both queues belong to the same device.
-        std::lock_guard<std::mutex> lock(mutex);
-        evaluation_queue = State().queue;
+        // During first-time set-up there is no evaluation queue yet, and `mutex` is held by its thread.
+        if (g_first_setup.load(std::memory_order_acquire) != 1) {
+            std::lock_guard<std::mutex> lock(mutex);
+            evaluation_queue = State().queue;
+        }
     }
     auto* queue = evaluation_queue ? evaluation_queue.Get() : fallback_queue;
     const auto execute = [](ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) { q->ExecuteCommandLists(n, lists); };
@@ -1801,7 +1967,18 @@ int FormatStatus(char* out, size_t capacity)
     }
     return n;
 }
-void FoldStatus(char* out, size_t capacity) { g_fold_status.Format(out, capacity); }
+void FoldStatus(char* out, size_t capacity)
+{
+    // The menu runs on Present. An evaluation can hold the session lock while NVIDIA works.
+    std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+    if (lock && State().last_world_level && !j2::Paused()) {
+        const auto& s = State();
+        const auto size = delivered_size.load();
+        std::snprintf(out, capacity, "DLSS %s: world %ux%u, output %ux%u",
+            s.last_world_level == 1 ? "Quality" : s.last_world_level == 2 ? "Performance" : "Balanced",
+            UINT(size >> 32), UINT(size), s.optimal_w, s.optimal_h);
+    } else g_fold_status.Format(out, capacity);
+}
 float FoldMipExtra() { return static_cast<float>(g_fold_mip_extra.load(std::memory_order_relaxed)); }
 
 bool FormatReplayStatus(char* out, size_t capacity)

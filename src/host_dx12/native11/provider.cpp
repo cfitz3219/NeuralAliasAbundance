@@ -38,6 +38,10 @@
 #include "host_dx12/native11/depth_reads.hpp"
 #include "host_dx12/native11/frame_model.hpp"
 #include "host_dx12/native11/screen_check.hpp"
+#include "host_dx12/native11/world_raster.hpp"
+#include "core/referee_world_check.hpp"
+#include "core/dxbc_inputs.hpp"
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/native11/lit_scene.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
@@ -46,6 +50,8 @@
 #include "providers/camera/camera_tracker.hpp"
 
 #include <d3d11_4.h>
+#include <d3d11shader.h>
+#include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <intrin.h>
@@ -80,6 +86,7 @@ enum CtxSlot : uint32_t {
     kClearRenderTargetView = 50, kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
     kClearState = 110, kFinishCommandList = 114,
     // ID3D11DeviceContext1
+    kCopyRegion1 = 115, kDiscardResource = 117, kDiscardView = 118, kSwapContextState = 131, kClearView = 132, kDiscardView1 = 133,
     kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
 };
 enum SwapSlot : uint32_t { kPresent = 8, kResizeBuffers = 13, kPresent1 = 22 };
@@ -245,6 +252,60 @@ struct DepthReads {
 // The view the scene used on a selected texture (typed format, subresource).
 struct ViewUse { uint32_t format = 0, mip = 0, slice = 0; bool texture2d = false; };
 struct Ctx {
+    struct WorldJob {
+        WorldRaster raster;
+        Id color = 0, depth = 0;
+        uint64_t proof = 0;
+        UINT level = 0, width = 0, height = 0;
+        DXGI_FORMAT color_format{}, depth_format{};
+        std::atomic<bool> ready{false};
+        std::atomic<bool> refused{false}, proof_current{true};
+        uint64_t last_receipt = 0;
+        unsigned missed_evaluations = 0;
+        CornerCopies corners; // full-size pictures the world reads, made small in a corner (the game's main thread only)
+        WorldProbe probe;     // the Referee's eye on the small picture
+    };
+    std::shared_ptr<WorldJob> world;
+    bool world_dirty = false;
+    uint64_t world_closed_frame = ~uint64_t{0};
+    std::optional<bool> world_uavs;
+    // The full-size pictures the bound pixel shader reads (a copy of the frame for water, depth for soft
+    // edges): which slots, and whether the shader finds its place by pixel position. Settled once per
+    // binding of shader and views (ScanWorldInputs).
+    struct WorldInputUse {
+        bool scanned = false, impossible = false, by_position = true;
+        bool own_colour = false, own_depth = false; // the world's own picture is among them
+        uint8_t n = 0;
+        uint8_t slot[4] = {};
+        uint32_t w[4] = {}, h[4] = {}; // the size each takes when made small (a half-size picture stays half the small size)
+        uint64_t shader = 0;
+    } world_inputs;
+    std::unordered_set<uint64_t> world_inputs_seen; // shaders with such reads the Referee has been asked to look at
+    bool world_inputs_new = false;
+    // This frame's count of the world's draws: the rehearsal and the WHY log read it at the frame's end.
+    struct WorldTally {
+        uint32_t went_small = 0, would = 0, breaks = 0, inputs = 0, corners = 0; // ("small" alone is a macro in the Windows headers)
+        uint32_t restores = 0; // times the full-size pictures were (or, in a rehearsal, would be) brought up to date mid-frame
+        uint32_t held[size_t(WorldHold::kCount)] = {};
+        bool last_passed = false;
+    } tally;
+    uint64_t tally_frame = ~uint64_t{0};
+    uint64_t world_small_frame = ~uint64_t{0};    // the last frame some draw went to the small pictures
+    uint64_t world_given_up_frame = ~uint64_t{0}; // too many full-size draws between the small ones: the rest stay full size
+    uint64_t world_list_frame = ~uint64_t{0};     // a played-back recording wrote the world's pictures
+    uint64_t world_run = 0;                       // moves whenever a full-size picture the world reads may have changed
+    uint64_t world_own_run = 0;                   // moves whenever the world's own full-size pictures changed
+    bool world_depth_dirty = false;               // the small depth holds draws the full-size depth does not have yet
+    bool would_dirty = false, would_depth_dirty = false; // the same two, as they would be, while the draws are only counted
+    bool would_depth_write = false;               // the draw just counted writes depth
+    bool world_stencil_written = false, stencil_writes = false;
+    bool pristine_color = false, pristine_depth = false;
+    FLOAT clear_rgba[4]{}, clear_z = 1;
+    UINT clear_flags = 0; UINT8 clear_s = 0;
+    uint64_t world_color_clear = ~uint64_t{0}, world_depth_clear = ~uint64_t{0};
+    uint64_t world_frame = ~uint64_t{0};
+    uint64_t world_draw_frame = ~uint64_t{0};
+    uint32_t world_draws = 0;
     bool game = false; // a context of the game's device
     uint32_t gen = 0;  // the game-device generation that answer was given in
     uint64_t sampler_policy = ~uint64_t{0};
@@ -255,6 +316,13 @@ struct Ctx {
     uint64_t writer_shader = 0;
     bool pixel_shader_known = false;
     std::bitset<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> screen_slots;
+    // One scene-size intermediate whose producer has already passed the screen challenge.
+    // D3D11 unbinds its input views when it is bound for writing. Track subsequent bindings.
+    struct PostPicture {
+        Id resource = 0;
+        uint64_t incarnation = 0, root_proof = 0, frame = 0;
+        std::bitset<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> slots;
+    } post;
     PsShadow ps_shadow;                // the game's views behind bound material replacements (textures.hpp)
     bool deferred = false;
     Id rt0 = 0, depth = 0;
@@ -323,7 +391,10 @@ struct Ctx {
         writer_shader = 0;
         pixel_shader_known = false;
         screen_slots.reset();
+        post = {};
         rt0 = depth = 0;
+        world_inputs.scanned = false;
+        stencil_writes = false;
         rt_view = ds_view = {};
         rt_count = 0;
         raster_depth_layer = {};
@@ -364,6 +435,7 @@ std::atomic<ParitySignal> g_parity_signal{nullptr}; // referee/parity-role-swap
 std::mutex g_mu; // model, lists, camera bytes, references, stats
 FrameModel g_model;
 ScreenCheck g_screen;
+ScreenCheck g_post_screen;
 LitScene g_lit;
 referee::PlacementTrial g_placement{uint64_t{1} << 57};
 referee::StageRecovery g_recovery;
@@ -379,6 +451,27 @@ referee::PlacementTrial::Scope LightingScope()
 std::atomic<Id> g_lit_peer{0};
 uint64_t g_last_lit_generation = 0;
 std::atomic<bool> g_screen_enabled{false};
+std::atomic<bool> g_discover_scale{false};
+std::atomic<uint32_t> g_world_level{0};
+// The world drawn small (DrawWorld, WorldRouteFrame): this frame's plan, and the books.
+std::atomic<bool> g_world_live{false};      // this frame the world's draws really go to the small pictures
+std::atomic<bool> g_world_reference{false}; // this frame is drawn at full size and made small afterwards (the Referee's comparison picture)
+std::atomic<uint8_t> g_world_inputs{0};     // referee::WorldInputs for this frame
+std::atomic<uint8_t> g_world_frame_hold{0}; // a reason from outside the draws that holds the whole world (WorldHold)
+std::atomic<const char*> g_world_input_why{nullptr}; // the last reason a full-size input could not be made small
+
+struct WorldRouteState { // under g_mu
+    referee::WorldCheck check;
+    referee::WorldRehearsal rehearsal;
+    WorldRouteStatus status;
+    uint64_t probe_seq = 0, frame_tag = 0, steady_frame = 0, logged_frame = 0, asked_frame = 0, last_small_frame = 0;
+    bool frame_small = false, frame_reference = false, frame_inputs = false, live = false;
+    WorldHold logged_why = WorldHold::None;
+    WorldRouteStatus::State logged_state = WorldRouteStatus::State::Off;
+    uint64_t job_color = 0, job_depth = 0, job_proof = 0;
+    uint32_t job_level = 0;
+} g_route;
+bool g_was_discovering_scale = false;
 std::atomic<bool> g_adaptive_scene{false}; // skip writer tagging on stable frames
 std::unordered_map<ID3D11DeviceContext*, std::unique_ptr<Ctx>> g_ctx;
 std::map<ID3D11CommandList*, ListRecord> g_lists;
@@ -635,6 +728,37 @@ struct Inside {
     ~Inside() { t_inside = was; }
 };
 
+// The game sees its own full-size views whenever control returns to it. Materialize
+// deferred pixel writes before a consumer or a game write can observe those views.
+void FinishWorld(ID3D11DeviceContext* c, Ctx* x)
+{
+    if (!x) return;
+    if (x->would_dirty) { // counted only: this is where the full-size pictures would be brought up to date
+        x->would_dirty = x->would_depth_dirty = false;
+        if (x->tally_frame == g_frame) ++x->tally.restores;
+    }
+    if (!x->world_dirty) return;
+    Inside own;
+    x->world->raster.Restore(c, x->world_stencil_written);
+    x->world_stencil_written = false;
+    x->world_dirty = x->world_depth_dirty = false;
+    ++x->world_own_run;
+    if (x->tally_frame == g_frame) ++x->tally.restores;
+}
+void TouchWorld(ID3D11DeviceContext* c, Ctx* x, Id id, bool write, bool picture = true)
+{
+    if (!x) return;
+    if (write && picture) ++x->world_run; // a copy, a clear or a full-size draw: a picture the world reads may have changed
+    if (!x->world || (id != x->world->color && id != x->world->depth)) return;
+    FinishWorld(c, x);
+    if (write) {
+        x->world_frame = ~uint64_t{0};
+        ++x->world_own_run;
+        if (id == x->world->color) x->pristine_color = false;
+        else x->pristine_depth = false;
+    }
+}
+
 void SetReason(const char* r)
 {
     std::snprintf(g_reason, sizeof g_reason, "%s", r);
@@ -722,6 +846,10 @@ Ctx* Get(ID3D11DeviceContext* c)
             if (is && !was) g_ctx_became_game.fetch_add(1, std::memory_order_relaxed);
             // What was remembered belongs to the other device's objects.
             slot->reset_state();
+            slot->world.reset();
+            slot->world_dirty = false;
+            slot->world_uavs.reset();
+            slot->world_frame = slot->world_color_clear = slot->world_depth_clear = ~uint64_t{0};
             slot->depth_reads = {};
             slot->raster_queries = 0;
             slot->events.clear();
@@ -800,6 +928,12 @@ struct Originals {
     PFN_CopyResource copy_resource = nullptr;
     PFN_UpdateSub update = nullptr;
     PFN_UpdateSub1 update1 = nullptr;
+    void (STDMETHODCALLTYPE *copy1)(ID3D11DeviceContext1*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT, const D3D11_BOX*, UINT) = nullptr;
+    void (STDMETHODCALLTYPE *discard_resource)(ID3D11DeviceContext1*, ID3D11Resource*) = nullptr;
+    void (STDMETHODCALLTYPE *discard_view)(ID3D11DeviceContext1*, ID3D11View*) = nullptr;
+    void (STDMETHODCALLTYPE *discard_view1)(ID3D11DeviceContext1*, ID3D11View*, const D3D11_RECT*, UINT) = nullptr;
+    void (STDMETHODCALLTYPE *clear_view)(ID3D11DeviceContext1*, ID3D11View*, const FLOAT*, const D3D11_RECT*, UINT) = nullptr;
+    void (STDMETHODCALLTYPE *swap_state)(ID3D11DeviceContext1*, ID3DDeviceContextState*, ID3DDeviceContextState**) = nullptr;
     PFN_ClearDSV clear_dsv = nullptr;
     PFN_Resolve resolve = nullptr;
     PFN_Execute execute = nullptr;
@@ -1318,7 +1452,7 @@ void DiagnoseCameraMiss()
 // before the read is forwarded. g_mu is let go during the callback so the game's other threads never
 // wait behind it; the facts handed over are copies or references we hold.
 void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boundary boundary, bool verified_reader = false,
-          ID3D11Resource* lit_color = nullptr, ViewUse lit_view = {}, uint64_t lit_proof = 0)
+          ID3D11Resource* lit_color = nullptr, ViewUse lit_view = {}, uint64_t lit_proof = 0, ScaledReaderFacts scaled = {})
 {
     ++g_stats.fired;
     SetSceneHanded(true); // whatever the outcome below, the game's scene draws for this frame are over
@@ -1614,6 +1748,18 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     f.boundary = boundary;
     f.screen_proof = lit_color ? lit_proof : verified_reader ? g_screen.Proof() : 0;
+    f.scaled_reader = scaled;
+    if (scaled.target && f.screen_proof) {
+        static uint64_t reported = 0;
+        if (reported != f.screen_proof) {
+            reported = f.screen_proof;
+            na::eventlog::Emit("native11_scaled_reader",
+                "frame=%llu proof=%llu scene=%ux%u target=%llu extent=%ux%u display_size=%u shader=%llu ps_slot=%u",
+                (unsigned long long)f.frame, (unsigned long long)f.screen_proof, sel.color_info.width, sel.color_info.height,
+                (unsigned long long)scaled.target, scaled.width, scaled.height, unsigned(scaled.display_size),
+                (unsigned long long)scaled.shader, scaled.slot);
+        }
+    }
     if (g_trial_reader && g_screen_enabled.load(std::memory_order_relaxed)) {
         const auto lighting = LightingScope();
         const bool trial = g_placement.Matches(lighting);
@@ -1674,6 +1820,71 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     f.stream = g_stream;
     g_last_selection = cam_sel;
+    std::shared_ptr<Ctx::WorldJob> world;
+    auto world_ctx = g_ctx.find(immediate);
+    if (!lit_color && world_ctx != g_ctx.end()) {
+        auto* x = world_ctx->second.get();
+        FinishWorld(immediate, x);
+        x->world_closed_frame = g_frame;
+        world = x->world;
+        const bool ours = world && world->proof == f.screen_proof && world->color == f.color.resource && world->depth == f.depth.resource;
+        if (ours) world->last_receipt = g_frame;
+        // Delivered small: some draw went to the small pictures, or this is the Referee's comparison picture
+        // (drawn at full size by plan, its draws all able to go small).
+        const bool drawn_small = x->world_small_frame == g_frame;
+        const bool comparison = !drawn_small && g_world_reference.load(std::memory_order_relaxed) && x->tally_frame == g_frame && x->tally.would;
+        if (ours && (drawn_small || comparison) && world->ready.load(std::memory_order_acquire) && world->level == g_world_level.load()) {
+            Inside own;
+            // The full-size pictures are the newer ones (the comparison picture, or full-size draws after the
+            // last small one): the small pictures are made from them, so DLSS is given the whole frame.
+            if (x->world_frame != g_frame) world->raster.Seed(immediate);
+            g_route.frame_small = drawn_small;
+            g_route.frame_reference = comparison;
+            g_route.frame_inputs = x->tally.inputs != 0;
+            if (g_route.check.WantsSample()) {
+                const uint64_t tag = ++g_route.probe_seq;
+                if (world->probe.Note(immediate, tag)) g_route.frame_tag = tag;
+            }
+            f.native_output = f.color;
+            f.world_level = world->level;
+            f.world_draws = drawn_small ? x->world_draws : x->tally.would;
+            const auto lower = [&](TextureFacts& facts, ID3D11Texture2D* low) {
+                D3D11_TEXTURE2D_DESC desc{};
+                low->GetDesc(&desc);
+                facts.format = desc.Format;
+                facts.resource = IdOf(low);
+                facts.incarnation = IncarnationOf(low);
+                facts.d3d11_resource = low;
+                facts.active_w = facts.width = desc.Width;
+                facts.active_h = facts.height = desc.Height;
+            };
+            lower(f.color, world->raster.Color());
+            lower(f.depth, world->raster.Depth());
+            for (int axis = 0; axis < 2; ++axis) {
+                const float ratio = axis ? float(f.color.height) / f.native_output.height : float(f.color.width) / f.native_output.width;
+                f.raster.jitter_px[axis] *= ratio;
+                f.camera.jitter_px[axis] *= ratio;
+            }
+        }
+        if (world && world->probe.Ready()) {
+            // A sampled picture that has come back: the Referee's verdict on the frame drawn small.
+            Inside own;
+            uint64_t tag = 0;
+            referee::WorldGrid cells;
+            if (world->probe.Poll(immediate, tag, cells)) {
+                using V = referee::WorldCheck::Verdict;
+                const V verdict = g_route.check.Sampled(tag, cells);
+                if (verdict != V::None) {
+                    if (verdict == V::Passed || verdict == V::PassedUnseen) g_route.steady_frame = g_frame;
+                    na::eventlog::Emit("native11_world_check", "frame=%llu verdict=%s inputs=%s differs=%.3f moved=%.3f looks=%u",
+                        (unsigned long long)g_frame,
+                        verdict == V::Passed ? "right" : verdict == V::PassedUnseen ? "let-through-unjudged(view moving)" :
+                        verdict == V::Retry ? "look-again" : verdict == V::NextInputs ? "wrong:next-inputs" : "wrong:every-way",
+                        referee::Name(g_route.check.Inputs()), g_route.check.LastFraction(), g_route.check.LastMotion(), g_route.check.Looks());
+                }
+            }
+        }
+    }
     const SceneCallback cb = g_cb;
     void* user = g_cb_user;
     lk.unlock();
@@ -1683,6 +1894,15 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         ok = cb(user, immediate, f);
     }
     lk.lock();
+    if (!ok && f.world_level && world) {
+        // Restore already placed the spatial result. A rejecting evaluator cannot repeatedly
+        // reduce the next frame; the ordinary renderer and the other resolution routes resume.
+        if (++world->missed_evaluations >= 3) {
+            world->refused.store(true, std::memory_order_release);
+            world->ready.store(false, std::memory_order_release);
+        }
+    }
+    if (ok && f.world_level && world) world->missed_evaluations = 0;
     if (!ok) ++g_stats.missed;
     else if (g_frame == f.frame) {
         g_frame_delivered = true;
@@ -2322,6 +2542,8 @@ void ReadEvents(ID3D11DeviceContext* c, DepthStage stage, UINT start, UINT n, ID
         }
         if (screen && start < x->screen_slots.size() && i < x->screen_slots.size() - start)
             x->screen_slots.set(start + i, r && (r == color || r == peer));
+        if (screen && x->post.resource && start < x->post.slots.size() && i < x->post.slots.size() - start)
+            x->post.slots.set(start + i, r == x->post.resource);
         if (track_depth && start < kDepthSlots && i < kDepthSlots - start)
             depth_slots.set(start + i, r && r == depth);
         if (stage == DepthStage::Pixel && !x->deferred && x->stationary.frame == g_exact_frame.load(std::memory_order_relaxed) &&
@@ -2533,6 +2755,7 @@ void STDMETHODCALLTYPE PSSetShader_d(ID3D11DeviceContext* c, ID3D11PixelShader* 
         x->pixel_shader = shader;
         x->pixel_shader_known = true;
         x->writer_shader = 0;
+        x->world_inputs.scanned = false;
     }
     O(c, x).ps_shader(c, shader, instances, count);
 }
@@ -2543,6 +2766,7 @@ void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start
     // Material textures: a published replacement is bound in place of the game's view (textures.hpp).
     ID3D11ShaderResourceView* swapped[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
     Ctx* x = Get(c); // null inside our own work and on other devices' contexts: bound as given
+    if (x) x->world_inputs.scanned = false;
     const auto* bind = x ? SwapTextures(c, x->ps_shadow, start, n, v, swapped) : v;
     O(c, x).ps_srv(c, start, n, bind);
     if (bind != v) EndTextureSwap(n, v, bind);
@@ -2576,7 +2800,7 @@ bool CountsRasterWork(ID3D11Asynchronous* object)
 void STDMETHODCALLTYPE Begin_d(ID3D11DeviceContext* c, ID3D11Asynchronous* object)
 {
     Ctx* x = Get(c);
-    if (x && !x->deferred && CountsRasterWork(object)) ++x->raster_queries;
+    if (x && !x->deferred && CountsRasterWork(object)) { FinishWorld(c, x); ++x->raster_queries; }
     O(c, x).begin(c, object);
 }
 
@@ -2709,13 +2933,21 @@ void ForwardDepthRead(ID3D11DeviceContext* context, Ctx* state, bool dispatch, F
 ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
 {
     if (!x || x->deferred || x->rt_count != 1 || !x->rt0 || (x->depth && x->depth_test) ||
-        x->screen_slots.none() || x->vp_n != 1 ||
+        (x->screen_slots.none() && x->post.slots.none()) || x->vp_n != 1 ||
         !g_screen_enabled.load(std::memory_order_relaxed)) return {};
 
     std::unique_lock<std::mutex> lock(g_mu);
     const auto& scene = g_model.Current();
     const auto draws = g_model.SceneDrawsThisFrame();
-    const bool inspect = scene.screen_region || g_screen.MayInspect();
+    ResourceInfo output{};
+    if (!g_model.InfoOf(x->rt0, output) || output.samples != 1 || scene.color_info.samples != 1) return {};
+    const bool native_output = g_model.IsDisplayExtent(output);
+    const bool same_size_post = output.width == scene.color_info.width && output.height == scene.color_info.height;
+    const bool scale_search = g_discover_scale.load(std::memory_order_relaxed);
+    const bool scaled = scale_search && (g_model.IsDisplayExtent(scene.color_info) || g_model.IsReducedPicture(scene.color_info)) &&
+        (native_output || same_size_post) &&
+        !x->vp_x && !x->vp_y && x->vp_w == float(output.width) && x->vp_h == float(output.height);
+    const bool inspect = scaled || scene.screen_region || g_screen.MayInspect();
     const Id lit = scene.screen_region ? 0 : g_lit.Predicted(g_model);
     const uint64_t lit_write = lit ? g_model.LitWrite(g_lit.Peer(lit), lit) : 0;
     const bool missed_ordinal = !scene.screen_region && !g_model.FiredThisFrame() && g_model.LearnedPointKind() == 1 &&
@@ -2723,17 +2955,15 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     if ((!inspect && !missed_ordinal && !lit_write) || !draws || !scene.valid() || scene.color != x->screen_color || x->rt0 == scene.color ||
         scene.color == g_backbuffer || !g_swap || x->raster_queries ||
         IdOf(g_color_ref.Get()) != scene.color || g_color_view.mip || g_color_view.slice) return {};
-    ResourceInfo output{};
     // A compositor may draw the active picture into an alignment-padded target.
     // Qualify that reader by its on-screen pixels, with a bounded extent check.
     const auto close_extent = [](uint32_t a, uint32_t b) {
         return a && b && uint64_t((std::min)(a, b)) * 100 >= uint64_t((std::max)(a, b)) * 98;
     };
-    if (!g_model.InfoOf(x->rt0, output) || output.samples != 1 || scene.color_info.samples != 1) return {};
     const auto& source_size = scene.color_info;
     const bool direct_region = scene.screen_region && x->rt0 == g_backbuffer &&
         referee::PaddedLayouts(source_size.width, source_size.height, output.width, output.height) != 0;
-    if (!direct_region && (!close_extent(output.width, source_size.width) ||
+    if (!scaled && !direct_region && (!close_extent(output.width, source_size.width) ||
                            !close_extent(output.height, source_size.height))) return {};
     const auto covers_picture = [](float viewport, uint32_t extent) {
         // Alignment padding can leave a few unused rows in a full-size texture.
@@ -2753,6 +2983,19 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     BOOL predicate_value = FALSE;
     c->GetPredication(&predicate, &predicate_value);
     if (predicate) return {};
+    if (scaled) {
+        ComPtr<ID3D11RasterizerState> raster;
+        c->RSGetState(&raster);
+        D3D11_RASTERIZER_DESC rs{};
+        if (raster) raster->GetDesc(&rs);
+        if (rs.ScissorEnable) {
+            UINT count = 1;
+            D3D11_RECT clip{};
+            c->RSGetScissorRects(&count, &clip);
+            if (!count || clip.left > 0 || clip.top > 0 ||
+                clip.right < LONG(output.width) || clip.bottom < LONG(output.height)) return {};
+        }
+    }
     ComPtr<ID3D11PixelShader> shader;
     c->PSGetShader(&shader, nullptr, nullptr);
     if (!shader) return {};
@@ -2765,16 +3008,45 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
     ComPtr<ID3D11Resource> destination;
     target->GetResource(&destination);
     if (IdOf(destination.Get()) != x->rt0) return {};
+    const bool follow_post = scaled && native_output && x->post.resource && x->post.frame == g_frame &&
+        x->post.root_proof && x->post.root_proof == g_screen.Proof();
     for (UINT slot = 0; slot < x->screen_slots.size(); ++slot) {
-        if (!x->screen_slots.test(slot)) continue;
+        if (!x->screen_slots.test(slot) && !(follow_post && x->post.slots.test(slot))) continue;
         ComPtr<ID3D11ShaderResourceView> view;
         c->PSGetShaderResources(slot, 1, &view); // the runtime may have automatically unbound it
         if (!view) continue;
         const Id bound = ResourceOfView(view.Get());
-        if (bound != scene.color && bound != lit) continue;
         D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
         view->GetDesc(&desc);
         if (desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || desc.Texture2D.MostDetailedMip) continue;
+        if (follow_post && bound == x->post.resource) {
+            ComPtr<ID3D11Resource> source;
+            view->GetResource(&source);
+            if (IncarnationOf(source.Get()) != x->post.incarnation) continue;
+            g_post_screen.SetScene(x->post.incarnation, x->post.root_proof);
+            ScreenCheck::Reader end{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format)};
+            end.scaled = true;
+            if (g_post_screen.Matches(end)) {
+                g_post_screen.NoteDelivery(true, draws);
+                static uint64_t reported = 0;
+                if (reported != g_post_screen.Proof()) {
+                    reported = g_post_screen.Proof();
+                    na::eventlog::Emit("native11_scaled_compositor",
+                        "frame=%llu upstream_proof=%llu proof=%llu input=%llu target=%llu extent=%ux%u shader=%llu ps_slot=%u",
+                        (unsigned long long)g_frame, (unsigned long long)x->post.root_proof, (unsigned long long)reported,
+                        (unsigned long long)x->post.incarnation, (unsigned long long)end.output, output.width, output.height,
+                        (unsigned long long)end.shader, slot);
+                }
+            } else if (!g_screen.AwaitingSamples() && !g_lit.screen.AwaitingSamples()) {
+                ComPtr<ID3D11Texture2D> texture;
+                if (SUCCEEDED(source.As(&texture))) {
+                    auto mark = g_post_screen.Begin(c, end, texture.Get(), desc.Format, g_frame, draws);
+                    if (mark.source) return mark;
+                }
+            }
+            continue;
+        }
+        if (bound != scene.color && bound != lit) continue;
         if (lit_write && bound == lit && !g_lit.Peer(x->rt0) && IdOf(g_depth_ref.Get()) == g_lit.depth &&
             g_color_view.format == static_cast<uint32_t>(desc.Format) &&
             x->vp_w == g_scene_vp_w && x->vp_h == g_scene_vp_h && !g_scene_vp_x && !g_scene_vp_y) {
@@ -2813,7 +3085,7 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
                     g_lit.observed_proven = g_frame_delivered;
                 }
                 if (g_lit.steer) return {};
-            } else if (!g_screen.AwaitingSamples()) {
+            } else if (!g_screen.AwaitingSamples() && !g_post_screen.AwaitingSamples()) {
                 auto mark = probe.Begin(c, reader, texture.Get(), desc.Format, g_frame, draws);
                 if (mark.source) {
                     g_lit.observed_member = lit;
@@ -2828,6 +3100,9 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
         if (missed_ordinal) g_screen.NoteActualPixel(draws);
         if (!inspect) return {};
         ScreenCheck::Reader reader{IncarnationOf(destination.Get()), IncarnationOf(shader.Get()), slot, uint32_t(target_view.Format)};
+        reader.scaled = scaled;
+        const ScaledReaderFacts scaled_facts = scaled ?
+            ScaledReaderFacts{reader.output, reader.shader, slot, output.width, output.height, native_output} : ScaledReaderFacts{};
         if (g_screen.Adaptive()) {
             reader.color = IncarnationOf(g_color_ref.Get());
             if (IdOf(g_depth_ref.Get()) != scene.depth) return {};
@@ -2836,32 +3111,441 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
             if (!g_screen.Select(reader, !g_model.FiredThisFrame())) {
                 ComPtr<ID3D11Texture2D> source;
                 if (FAILED(g_color_ref.As(&source))) return {};
-                if (!g_lit.screen.AwaitingSamples()) return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+                if (!g_lit.screen.AwaitingSamples() && !g_post_screen.AwaitingSamples())
+                    return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
                 continue;
             }
-            if (g_model.FiredThisFrame()) return {}; // witness the route without evaluating twice
-            g_model.MarkFired();
-            Fire(c, lock, Boundary::BeforeRead, true);
-            StopViewportJitterAfterScene();
-            return {};
+        } else if (g_screen.Verified(scene.color, scene.depth)) {
+            if (!g_screen.Matches(reader)) continue;
+        } else {
+            ComPtr<ID3D11Texture2D> source;
+            if (FAILED(g_color_ref.As(&source))) return {};
+            if (!g_lit.screen.AwaitingSamples() && !g_post_screen.AwaitingSamples())
+                return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+            continue;
         }
-        if (g_screen.Verified(scene.color, scene.depth)) {
-            if (!g_screen.Matches(reader) || g_model.FiredThisFrame()) return {};
-            g_model.MarkFired();
-            Fire(c, lock, Boundary::BeforeRead, true);
-            StopViewportJitterAfterScene();
-            return {};
+        if (scaled && same_size_post && x->rt0 != g_backbuffer && g_screen.Proof()) {
+            ComPtr<ID3D11Texture2D> intermediate;
+            D3D11_TEXTURE2D_DESC image{};
+            if (SUCCEEDED(destination.As(&intermediate))) intermediate->GetDesc(&image);
+            if ((image.BindFlags & D3D11_BIND_SHADER_RESOURCE) && !(image.BindFlags & D3D11_BIND_UNORDERED_ACCESS) &&
+                image.Usage == D3D11_USAGE_DEFAULT && !image.CPUAccessFlags && image.ArraySize == 1 && image.MipLevels == 1) {
+                x->post = {};
+                x->post.resource = x->rt0;
+                x->post.incarnation = reader.output;
+                x->post.root_proof = g_screen.Proof();
+                x->post.frame = g_frame;
+            }
         }
-        ComPtr<ID3D11Texture2D> source;
-        if (FAILED(g_color_ref.As(&source))) return {};
-        if (!g_lit.screen.AwaitingSamples()) return g_screen.Begin(c, reader, source.Get(), DXGI_FORMAT(g_color_view.format), g_frame, draws);
+        if (g_model.FiredThisFrame()) return {};
+        g_model.MarkFired();
+        Fire(c, lock, Boundary::BeforeRead, true, nullptr, {}, 0, scaled_facts);
+        StopViewportJitterAfterScene();
+        return {};
     }
     return {};
+}
+
+// ---- The world drawn small -------------------------------------------------------------------------
+// The game's own world draws are sent to smaller colour and depth pictures with a scaled viewport
+// (world_raster.hpp); DLSS brings the picture back to full size before the game's reader draws it.
+//
+// How games draw a world, and what each needs here:
+//   * colour and depth together, one draw after another: the plain case;
+//   * a depth pass first (no colour bound), then colour testing against it: both go to the small pictures,
+//     or the colour pass would test small depth against full-size depth;
+//   * colour with no depth bound (sky, fog, a full-screen layer): goes to the small colour;
+//   * depth tested but not written while a shader reads it (soft edges): the small depth through a
+//     read-only view;
+//   * a draw that reads a full-size picture of the frame (water bending what is behind it, soft edges,
+//     screen-space shading): the picture is first made small into the corner of a full-size copy when the
+//     shader finds its place by pixel position, or given as it is when it addresses it 0..1; the Referee
+//     looks at the result and changes the way when the picture comes out wrong (referee_world_check.hpp);
+//   * a part viewport or a scissor rectangle: scaled with the picture;
+//   * a few draws that cannot go small (several targets, a visibility query, a predicated draw) between
+//     the others: the full-size pictures are brought up to date, the draw runs as the game issued it, and
+//     the small pictures are refilled from the result. More than kWorldBreaks of those in a frame and the
+//     world keeps its full size, with the reason counted.
+// Every world draw is counted (small, would-be small, held and why) so the log, RESULTS and the menu can
+// say WHY the smaller picture is not being delivered.
+constexpr uint32_t kWorldBreaks = 6;
+// Each time another picture's draw sits between the world's draws, the full-size pictures are brought up
+// to date first (a whole-screen copy). More of those in a frame than this and drawing small would cost
+// what it saves: the world keeps its full size.
+constexpr uint32_t kWorldRestores = 8;
+enum : uint32_t { kCreatePixelShader = 15 }; // ID3D11Device
+
+const char* WorldHoldName(WorldHold why)
+{
+    static const char* const names[] = {"none", "preparing", "helper-program", "no-render-size", "reader", "on-screen", "other-size", "picture-kind",
+        "no-world-draws", "recorded-lists", "several-targets", "viewports", "uavs", "predicated", "full-size-input", "interleaved", "picture-check", "evaluator"};
+    static_assert(sizeof names / sizeof names[0] == size_t(WorldHold::kCount), "one name per reason");
+    return size_t(why) < size_t(WorldHold::kCount) ? names[size_t(why)] : "?";
+}
+
+// What a pixel shader reads, from its own reflection data when the game creates it: which texture slots it
+// really uses (a view left bound by an earlier pass is not a read), and whether it uses its pixel position.
+struct PsFacts { uint64_t slots[2] = {}; uint8_t known = 0, position = 0; };
+const GUID kPsFactsGuid = {0x6b0a61d4, 0x3f0e, 0x4c7f, {0x9a, 0x51, 0x2e, 0x7c, 0x10, 0x6d, 0x88, 0x31}};
+using CreatePixelShaderFn = HRESULT (STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
+CreatePixelShaderFn g_create_ps = nullptr;
+std::atomic<uint64_t> g_ps_known{0}, g_ps_unknown{0};
+HRESULT STDMETHODCALLTYPE CreatePixelShader_d(ID3D11Device* dev, const void* code, SIZE_T size, ID3D11ClassLinkage* linkage, ID3D11PixelShader** out)
+{
+    const HRESULT hr = g_create_ps(dev, code, size, linkage, out);
+    if (FAILED(hr) || !out || !*out || !code || !size || t_inside) return hr;
+    PsFacts facts;
+    // The program itself is read first (it works on shaders whose description data was stripped); what the
+    // description data says is added to it.
+    na::dxbc::PixelInputs read;
+    if (na::dxbc::ReadPixelInputs(code, size, read)) {
+        facts.known = 1;
+        facts.slots[0] = read.slots[0]; facts.slots[1] = read.slots[1];
+        facts.position = read.position ? 1 : 0;
+    }
+    ComPtr<ID3D11ShaderReflection> reflection;
+    D3D11_SHADER_DESC d{};
+    if (SUCCEEDED(D3DReflect(code, size, IID_PPV_ARGS(&reflection))) && SUCCEEDED(reflection->GetDesc(&d))) {
+        for (UINT i = 0; i < d.BoundResources; ++i) {
+            D3D11_SHADER_INPUT_BIND_DESC b{};
+            if (FAILED(reflection->GetResourceBindingDesc(i, &b)) || b.Type != D3D_SIT_TEXTURE) continue;
+            for (UINT k = 0; k < (std::max)(b.BindCount, 1u) && b.BindPoint + k < 128; ++k)
+                facts.slots[(b.BindPoint + k) >> 6] |= uint64_t{1} << ((b.BindPoint + k) & 63);
+        }
+        for (UINT i = 0; i < d.InputParameters; ++i) {
+            D3D11_SIGNATURE_PARAMETER_DESC p{};
+            if (SUCCEEDED(reflection->GetInputParameterDesc(i, &p)) && p.SystemValueType == D3D_NAME_POSITION && (p.ReadWriteMask & 3))
+                facts.position = 1;
+        }
+    }
+    (facts.known ? g_ps_known : g_ps_unknown).fetch_add(1, std::memory_order_relaxed);
+    (*out)->SetPrivateData(kPsFactsGuid, sizeof facts, &facts);
+    return hr;
+}
+
+// The full-size pictures the bound pixel shader reads. Called inside our own work.
+void ScanWorldInputs(ID3D11DeviceContext* c, Ctx* x, const Ctx::WorldJob& job)
+{
+    auto& use = x->world_inputs;
+    use = {};
+    use.scanned = true;
+    ComPtr<ID3D11PixelShader> shader;
+    c->PSGetShader(&shader, nullptr, nullptr);
+    if (!shader) return;
+    PsFacts facts;
+    UINT size = sizeof facts;
+    if (FAILED(shader->GetPrivateData(kPsFactsGuid, &size, &facts)) || size != sizeof facts) facts = {}; // made before our hook: every bound view counts
+    use.shader = IncarnationOf(shader.Get());
+    use.by_position = !facts.known || facts.position;
+    ID3D11ShaderResourceView* views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT]{};
+    c->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, views);
+    for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++i) {
+        auto* view = views[i];
+        if (!view) continue;
+        if (!facts.known || ((facts.slots[i >> 6] >> (i & 63)) & 1)) {
+            ComPtr<ID3D11Resource> resource;
+            view->GetResource(&resource);
+            ComPtr<ID3D11Texture2D> texture;
+            if (resource && SUCCEEDED(resource.As(&texture))) {
+                D3D11_TEXTURE2D_DESC desc{};
+                texture->GetDesc(&desc);
+                // A picture of the frame has the screen's size, or a half or a quarter of it (shading and fog
+                // are often drawn at those), and is drawn or copied into: art loaded once (immutable,
+                // CPU-written, or mipped without being a target) only happens to have such a size.
+                const UINT nw = job.raster.native_width, nh = job.raster.native_height;
+                UINT part = 0;
+                for (UINT k : {1u, 2u, 4u})
+                    if ((desc.Width == nw / k || desc.Width == (nw + k - 1) / k) && (desc.Height == nh / k || desc.Height == (nh + k - 1) / k)) { part = k; break; }
+                const bool target = (desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) != 0;
+                const bool drawn = desc.Usage == D3D11_USAGE_DEFAULT && (target || (part == 1 && desc.MipLevels == 1));
+                if (drawn && part) {
+                    if (use.n < 4) {
+                        use.w[use.n] = (std::max)(1u, UINT((uint64_t(desc.Width) * job.width + nw / 2) / nw));
+                        use.h[use.n] = (std::max)(1u, UINT((uint64_t(desc.Height) * job.height + nh / 2) / nh));
+                        use.slot[use.n++] = uint8_t(i);
+                        const Id id = IdOf(texture.Get());
+                        if (id == job.color) use.own_colour = true;
+                        if (id == job.depth) use.own_depth = true;
+                    } else use.impossible = true;
+                }
+            }
+        }
+        view->Release();
+    }
+}
+
+enum class WorldDraw : uint8_t { NotWorld, Would, Small, Held };
+template<class Forward>
+WorldDraw DrawWorld(ID3D11DeviceContext* c, Ctx* x, Forward& forward)
+{
+    if (!x || !x->world || x->deferred) return WorldDraw::NotWorld;
+    auto& job = *x->world;
+    const bool colour = x->rt0 == job.color, depth = x->depth == job.depth;
+    // After the reader has drawn, the pictures are the game's again for the rest of the frame.
+    if ((!colour && !depth) || x->world_closed_frame == g_frame) return WorldDraw::NotWorld;
+    if (x->tally_frame != g_frame) { x->tally = {}; x->tally_frame = g_frame; }
+    const auto held = [&](WorldHold why) {
+        ++x->tally.held[size_t(why)];
+        if (x->tally.last_passed) {
+            x->tally.last_passed = false;
+            if (++x->tally.breaks > kWorldBreaks) x->world_given_up_frame = g_frame;
+        }
+        return WorldDraw::Held;
+    };
+    if (job.refused.load(std::memory_order_acquire)) return held(job.missed_evaluations >= 3 ? WorldHold::Evaluator : WorldHold::PictureKind);
+    if (!job.ready.load(std::memory_order_acquire) || job.level != g_world_level.load()) return held(WorldHold::Preparing);
+    if (g_frame - job.last_receipt > 1 || !job.proof_current.load(std::memory_order_relaxed) ||
+        g_sel_color.load() != job.color || g_sel_depth.load() != job.depth) return held(WorldHold::Reader);
+    // Another picture drawn with the world's depth, several pictures at once, or the world's colour with a depth of its own.
+    if (!colour ? x->rt_count != 0 : (x->rt_count != 1 || (x->depth && !depth))) return held(WorldHold::SeveralTargets);
+    if (x->vp_n != 1) return held(WorldHold::Viewports);
+    if (x->raster_queries) return held(WorldHold::Interleaved); // a visibility query counts full-size pixels
+    if (x->world_given_up_frame == g_frame) return held(WorldHold::Interleaved);
+    Inside own;
+    if (!x->world_uavs.has_value()) {
+        ComPtr<ID3D11Device> device; c->GetDevice(&device);
+        const UINT slots = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1 ? D3D11_1_UAV_SLOT_COUNT : D3D11_PS_CS_UAV_REGISTER_COUNT;
+        ID3D11UnorderedAccessView* views[D3D11_1_UAV_SLOT_COUNT]{};
+        c->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, slots, views);
+        x->world_uavs = false;
+        for (UINT i = 0; i < slots; ++i) if (views[i]) { x->world_uavs = true; views[i]->Release(); }
+    }
+    if (*x->world_uavs) return held(WorldHold::Uavs);
+    ComPtr<ID3D11Predicate> pred; BOOL value;
+    c->GetPredication(&pred, &value);
+    if (pred) return held(WorldHold::Predicated);
+    ComPtr<ID3D11RenderTargetView> target;
+    ComPtr<ID3D11DepthStencilView> depth_view;
+    c->OMGetRenderTargets(1, &target, &depth_view);
+    ID3D11DepthStencilView* low_depth = nullptr;
+    bool depth_written = false;
+    if (colour) {
+        D3D11_RENDER_TARGET_VIEW_DESC cv{};
+        if (!target) return held(WorldHold::PictureKind);
+        target->GetDesc(&cv);
+        if (ResourceOfView(target.Get()) != job.color || cv.Format != job.color_format || cv.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D ||
+            cv.Texture2D.MipSlice) return held(WorldHold::PictureKind);
+    }
+    if (depth) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+        if (!depth_view) return held(WorldHold::PictureKind);
+        depth_view->GetDesc(&dv);
+        if (ResourceOfView(depth_view.Get()) != job.depth || dv.Format != job.depth_format || dv.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2D ||
+            dv.Texture2D.MipSlice) return held(WorldHold::PictureKind);
+        low_depth = job.raster.DepthView(dv.Flags);
+        if (!low_depth) return held(WorldHold::PictureKind);
+        depth_written = !(dv.Flags & D3D11_DSV_READ_ONLY_DEPTH);
+    }
+    if (!x->world_inputs.scanned) ScanWorldInputs(c, x, job);
+    auto& use = x->world_inputs;
+    if (use.impossible) return held(WorldHold::FullSizeInput);
+    const auto policy = static_cast<referee::WorldInputs>(g_world_inputs.load(std::memory_order_relaxed));
+    const bool corner = use.n && (policy == referee::WorldInputs::Corner || (policy == referee::WorldInputs::ByShader && use.by_position));
+    const bool live = g_world_live.load(std::memory_order_relaxed) && !g_world_reference.load(std::memory_order_relaxed);
+    // The world's own depth or colour read as a picture (soft edges read the depth): the full-size one must
+    // hold this frame so far before it is read or made small. Only when it is behind: a run of such draws
+    // that do not write depth brings it up to date once.
+    if (live ? (use.own_depth && x->world_depth_dirty) || (use.own_colour && x->world_dirty)
+             : (use.own_depth && x->would_depth_dirty) || (use.own_colour && x->would_dirty)) FinishWorld(c, x);
+    ID3D11ShaderResourceView* sources[4]{};
+    ID3D11ShaderResourceView* copies[4]{};
+    const auto release_sources = [&] { for (auto*& v : sources) if (v) { v->Release(); v = nullptr; } };
+    if (corner) {
+        for (uint8_t i = 0; i < use.n; ++i) c->PSGetShaderResources(use.slot[i], 1, &sources[i]);
+        for (uint8_t i = 0; i < use.n && !use.impossible; ++i) {
+            const char* why = nullptr;
+            if (!sources[i]) continue;
+            const Id id = ResourceOfView(sources[i]);
+            const uint64_t run = id == job.color || id == job.depth ? x->world_own_run : x->world_run;
+            if (live) copies[i] = job.corners.Get(c, sources[i], use.w[i], use.h[i], run, g_frame, &why);
+            else if (!job.corners.Can(sources[i], use.w[i], use.h[i], g_frame, &why)) use.impossible = true;
+            if (live && !copies[i]) use.impossible = true;
+            if (use.impossible) g_world_input_why.store(why, std::memory_order_relaxed);
+        }
+        if (use.impossible) { release_sources(); return held(WorldHold::FullSizeInput); }
+    }
+    if (use.n) {
+        ++x->tally.inputs;
+        if (corner) ++x->tally.corners;
+    }
+    x->tally.last_passed = true;
+    if (!live) {
+        // A rehearsal frame, or the Referee's comparison picture: counted, drawn as the game issued it.
+        release_sources();
+        ++x->tally.would;
+        x->would_depth_write = depth_written;
+        return WorldDraw::Would;
+    }
+    if (use.n) {
+        // A shader with such a read drawn small for the first time: the Referee looks at the picture again.
+        if (x->world_inputs_seen.size() > 8192) x->world_inputs_seen.clear();
+        if (x->world_inputs_seen.insert(use.shader).second) x->world_inputs_new = true;
+    }
+    D3D11_VIEWPORT original{}; UINT count = 1;
+    c->RSGetViewports(&count, &original);
+    D3D11_RECT rects[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT rect_count = 0;
+    {
+        ComPtr<ID3D11RasterizerState> state;
+        c->RSGetState(&state);
+        D3D11_RASTERIZER_DESC rs{};
+        if (state) state->GetDesc(&rs);
+        if (rs.ScissorEnable) {
+            rect_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+            c->RSGetScissorRects(&rect_count, rects);
+        }
+    }
+    if (!x->world_dirty && x->world_frame != g_frame) {
+        const bool has_stencil = job.depth_format == DXGI_FORMAT_D24_UNORM_S8_UINT || job.depth_format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        if (x->pristine_color && x->pristine_depth && (!has_stencil || (x->clear_flags & D3D11_CLEAR_STENCIL))) {
+            c->ClearRenderTargetView(job.raster.Target(), x->clear_rgba);
+            c->ClearDepthStencilView(job.raster.DepthView(), x->clear_flags, x->clear_z, x->clear_s);
+        } else job.raster.Seed(c); // what the full-size pictures hold (an earlier pass, a full-size draw) comes along
+    }
+    if (depth) x->world_stencil_written |= x->stencil_writes;
+    x->pristine_color = x->pristine_depth = false;
+    const float sx = float(job.width) / job.raster.native_width, sy = float(job.height) / job.raster.native_height;
+    auto scaled_view = original;
+    scaled_view.TopLeftX *= sx; scaled_view.Width *= sx;
+    scaled_view.TopLeftY *= sy; scaled_view.Height *= sy;
+    if (rect_count) {
+        D3D11_RECT scaled[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        for (UINT i = 0; i < rect_count; ++i)
+            scaled[i] = {LONG(std::floor(rects[i].left * sx)), LONG(std::floor(rects[i].top * sy)),
+                         LONG(std::ceil(rects[i].right * sx)), LONG(std::ceil(rects[i].bottom * sy))};
+        c->RSSetScissorRects(rect_count, scaled);
+    }
+    if (x->coarse_rate) CoarseApply(c, x, 0);
+    auto* low = job.raster.Target();
+    c->OMSetRenderTargets(colour ? 1 : 0, colour ? &low : nullptr, low_depth);
+    c->RSSetViewports(1, &scaled_view);
+    if (corner) for (uint8_t i = 0; i < use.n; ++i) if (copies[i]) c->PSSetShaderResources(use.slot[i], 1, &copies[i]);
+    forward();
+    if (corner) for (uint8_t i = 0; i < use.n; ++i) if (copies[i]) c->PSSetShaderResources(use.slot[i], 1, &sources[i]);
+    release_sources();
+    auto* high = target.Get();
+    c->OMSetRenderTargets(colour ? 1 : 0, colour ? &high : nullptr, depth_view.Get());
+    c->RSSetViewports(1, &original);
+    if (rect_count) c->RSSetScissorRects(rect_count, rects);
+    x->world_frame = g_frame;
+    x->world_small_frame = g_frame;
+    x->world_dirty = true;
+    if (depth_written) x->world_depth_dirty = true;
+    if (x->world_draw_frame != g_frame) { x->world_draw_frame = g_frame; x->world_draws = 0; }
+    ++x->world_draws;
+    ++x->tally.went_small;
+    return WorldDraw::Small;
+}
+
+
+// The frame that just ended is entered in the books (was the world delivered small, and if not, WHY),
+// and the coming frame is planned: counted only, drawn small, or drawn at full size for the Referee's
+// comparison. Under g_mu, on the presenting thread.
+void WorldRouteFrame(uint64_t ended)
+{
+    using State = WorldRouteStatus::State;
+    auto& r = g_route;
+    auto& st = r.status;
+    const uint32_t asked = g_world_level.load();
+    const auto outside = WorldHold(g_world_frame_hold.exchange(0, std::memory_order_relaxed));
+    if (!asked) {
+        if (st.state != State::Off) {
+            na::eventlog::Emit("native11_world_route", "state=off small_frames=%llu comparison_frames=%llu held_frames=%llu looks=%u",
+                (unsigned long long)st.small_frames, (unsigned long long)st.reference_frames, (unsigned long long)st.held_frames, r.check.Looks());
+            r = {};
+        }
+        g_world_live.store(false, std::memory_order_relaxed);
+        g_world_reference.store(false, std::memory_order_relaxed);
+        return;
+    }
+    Ctx* owner = nullptr;
+    for (auto& entry : g_ctx)
+        if (entry.second->world && !entry.second->deferred) owner = entry.second.get();
+    const auto* job = owner ? owner->world.get() : nullptr;
+    // Another level, another world or another proven reader: counted and looked at afresh.
+    if (st.level != asked || !r.asked_frame) { r.check.Reset(); r.rehearsal.Reset(); r.asked_frame = ended; r.last_small_frame = 0; r.live = false; st.level = asked; }
+    if (job && (job->color != r.job_color || job->depth != r.job_depth || job->proof != r.job_proof || job->level != r.job_level)) {
+        r.check.Reset(); r.rehearsal.Reset(); r.live = false;
+        r.job_color = job->color; r.job_depth = job->depth; r.job_proof = job->proof; r.job_level = job->level;
+    }
+    WorldHold why = WorldHold::None;
+    bool clean = false;
+    Ctx::WorldTally tally{};
+    // No world to draw small yet. With no reason given from outside, the picture has not been handed over at
+    // all: after ten seconds that is said, not "preparing" for ever.
+    if (!job) why = outside != WorldHold::None ? outside : ended - r.asked_frame < 600 ? WorldHold::Preparing : WorldHold::Reader;
+    else {
+        if (owner->tally_frame == ended) tally = owner->tally;
+        WorldHold most = WorldHold::None;
+        for (size_t i = 1; i < size_t(WorldHold::kCount); ++i)
+            if (tally.held[i] && (most == WorldHold::None || tally.held[i] > tally.held[size_t(most)])) most = WorldHold(i);
+        if (job->refused.load(std::memory_order_acquire)) why = job->missed_evaluations >= 3 ? WorldHold::Evaluator : WorldHold::PictureKind;
+        else if (!job->ready.load(std::memory_order_acquire)) why = WorldHold::Preparing;
+        else if (!(tally.went_small + tally.would))
+            why = most != WorldHold::None ? most : owner->world_list_frame == ended ? WorldHold::RecordedLists : outside != WorldHold::None ? outside : WorldHold::NoWorldDraws;
+        else if (tally.breaks > kWorldBreaks || tally.restores > kWorldRestores) why = most != WorldHold::None ? most : WorldHold::Interleaved;
+        else if (job->last_receipt != ended) why = WorldHold::Reader;
+        else clean = true;
+        owner->world->corners.Trim(ended);
+    }
+    r.rehearsal.Frame(clean);
+    // The frame that ended, for the Referee.
+    const bool delivered = r.frame_small || r.frame_reference;
+    r.check.Drawn(r.frame_small ? referee::WorldCheck::Frame::Small : referee::WorldCheck::Frame::Reference, delivered ? r.frame_tag : 0, r.frame_inputs);
+    if (r.frame_small) { ++st.small_frames; r.last_small_frame = ended; }
+    else if (r.frame_reference) { ++st.reference_frames; r.last_small_frame = ended; }
+    else ++st.held_frames;
+    r.frame_small = r.frame_reference = r.frame_inputs = false;
+    r.frame_tag = 0;
+    if (r.check.Rest())
+        na::eventlog::Emit("native11_world_check", "frame=%llu verdict=look-again-after-rest next_rest_frames=%u",
+            (unsigned long long)ended, r.check.RestFrames());
+    if (r.check.Failed()) why = WorldHold::PictureCheck;
+    r.live = job && r.rehearsal.Live() && !r.check.Failed();
+    if (r.live) {
+        // Nothing drawn small goes unjudged: the first small frame, a shader that reads a full-size picture met
+        // for the first time, and a picture once let through because the view was moving.
+        if (!r.check.Steady() && !r.check.Looking()) r.check.Begin();
+        else if (r.check.Steady() && (owner->world_inputs_new || (r.check.Unjudged() && ended - r.steady_frame > 600))) r.check.Begin();
+    }
+    if (owner) owner->world_inputs_new = false;
+    g_world_live.store(r.live, std::memory_order_relaxed);
+    g_world_reference.store(r.live && r.check.Next() == referee::WorldCheck::Frame::Reference, std::memory_order_relaxed);
+    g_world_inputs.store(uint8_t(r.check.Inputs()), std::memory_order_relaxed);
+    // What the menu and the log are told.
+    const bool small_now = !r.check.Failed() && (delivered || (st.small_frames + st.reference_frames && ended - r.last_small_frame < 30));
+    st.state = small_now ? (r.check.Looking() ? State::Checking : State::Small)
+             : (why == WorldHold::Preparing || why == WorldHold::None || ended - r.asked_frame < 240) && !r.check.Failed() ? State::Preparing : State::Held;
+    st.why = small_now ? WorldHold::None : why;
+    st.small_draws = tally.went_small; st.held_draws = 0; st.breaks = tally.breaks;
+    for (size_t i = 1; i < size_t(WorldHold::kCount); ++i) st.held_draws += tally.held[i];
+    st.looks = r.check.Looks();
+    st.inputs = referee::Name(r.check.Inputs());
+    st.corner_fills = job ? job->corners.fills : 0;
+    if (st.state != r.logged_state || st.why != r.logged_why || ended - r.logged_frame >= 600) {
+        r.logged_state = st.state; r.logged_why = st.why; r.logged_frame = ended;
+        char holds[160] = "";
+        int at = 0;
+        for (size_t i = 1; i < size_t(WorldHold::kCount) && at < int(sizeof holds) - 40; ++i)
+            if (tally.held[i]) at += std::snprintf(holds + at, sizeof holds - at, " %s=%u", WorldHoldName(WorldHold(i)), unsigned(tally.held[i]));
+        const char* input_why = g_world_input_why.load(std::memory_order_relaxed);
+        na::eventlog::Emit("native11_world_route",
+            "state=%s level=%u why=\"%s\" frames{small=%llu comparison=%llu held=%llu} last_frame{small_draws=%u would_be_small=%u held_draws=%u breaks=%u brought_up_to_date=%u reads_full_size=%u corner_copies=%u}"
+            " held_by{%s } rehearsal=%u/%u live=%d inputs=%s looks=%u corner_fills=%llu shaders{known=%llu unknown=%llu}%s%s",
+            st.state == State::Small ? "small" : st.state == State::Checking ? "small(referee-looking)" : st.state == State::Preparing ? "preparing" : "held",
+            asked, WorldHoldText(st.why), (unsigned long long)st.small_frames, (unsigned long long)st.reference_frames, (unsigned long long)st.held_frames,
+            tally.went_small, tally.would, st.held_draws, tally.breaks, tally.restores, tally.inputs, tally.corners, holds, r.rehearsal.Clean(), r.rehearsal.Needed(), int(r.live),
+            st.inputs, st.looks, (unsigned long long)st.corner_fills,
+            (unsigned long long)g_ps_known.load(std::memory_order_relaxed), (unsigned long long)g_ps_unknown.load(std::memory_order_relaxed),
+            input_why ? " input_refused=" : "", input_why ? input_why : "");
+    }
 }
 
 template<class Forward>
 void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
 {
+    if (state && state->post.resource && (state->rt0 == state->post.resource || state->rt_count > 1))
+        state->post = {};
     const auto mark = CheckScreenReader(c, state);
     // The draw event or this reader can complete the scene before the
     // same draw is forwarded. Restore it on that draw, not one draw later.
@@ -2869,7 +3553,24 @@ void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
         VpjBeforeDraw(c, state);
     if (state && !state->deferred && state->coarse_rate && !g_coarse_open.load(std::memory_order_relaxed))
         CoarseBeforeDraw(c, state); // the scene was handed over by this very draw's event: it is not shaded in blocks
-    ForwardDepthRead(c, state, false, forward);
+    const WorldDraw drawn = DrawWorld(c, state, forward);
+    if (drawn != WorldDraw::Small) {
+        if (state && state->world) {
+            // A draw at full size (another picture's, one the world could not take small, a rehearsal
+            // frame's): the full-size pictures are brought up to date before it, and what it writes into
+            // them is carried into the small ones before the next small draw (DrawWorld's Seed).
+            // A draw that was only counted stands for a small one: nothing would be brought up to date for
+            // it, and after it the small pictures would be ahead again.
+            const bool counted = drawn == WorldDraw::Would;
+            const bool depth_ahead = counted && (state->would_depth_dirty || state->would_depth_write);
+            if (counted) state->would_dirty = state->would_depth_dirty = false;
+            FinishWorld(c, state);
+            TouchWorld(c, state, state->rt0, true);
+            TouchWorld(c, state, state->depth, true);
+            if (counted) { state->would_dirty = true; state->would_depth_dirty = depth_ahead; }
+        }
+        ForwardDepthRead(c, state, false, forward);
+    }
     if (state && !state->deferred && state->depth_layer_target) {
         // VARIANT: jitter/stationary-source-readers: a depth-like layer drawn this frame while the sample is live by a
         // draw that kept the game's grid; drawn by a draw on the sample's grid, it is no longer one.
@@ -3016,17 +3717,22 @@ void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
 }
 void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
 {
-    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? Get(c) : nullptr;
+    Ctx* x = (g_world_level.load(std::memory_order_relaxed) || g_depth_reads_enabled.load(std::memory_order_relaxed)) ? Get(c) : nullptr;
+    FinishWorld(c, x);
+    if (x) { ++x->world_run; ++x->world_own_run; } // a compute pass may write a picture the world reads
     ForwardDepthRead(c, x, true, [&] { O(c, x).dispatch(c, x_groups, y_groups, z_groups); });
 }
 void STDMETHODCALLTYPE DispatchIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT offset)
 {
-    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? Get(c) : nullptr;
+    Ctx* x = (g_world_level.load(std::memory_order_relaxed) || g_depth_reads_enabled.load(std::memory_order_relaxed)) ? Get(c) : nullptr;
+    FinishWorld(c, x);
+    if (x) { ++x->world_run; ++x->world_own_run; } // a compute pass may write a picture the world reads
     ForwardDepthRead(c, x, true, [&] { O(c, x).dispatch_indirect(c, args, offset); });
 }
 HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m)
 {
     Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(r), type != D3D11_MAP_READ, false); // buffers are mapped between all draws
     const HRESULT hr = O(c, x).map(c, r, sub, type, flags, m);
     if (x && CameraTracking() && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
                                     type == D3D11_MAP_READ_WRITE)) {
@@ -3114,6 +3820,7 @@ void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resourc
 {
     Ctx* x = Get(c);
     std::vector<uint8_t> tmp;
+    TouchWorld(c, x, IdOf(r), true, false);
     UpdateCommon(c, x, r, box, src, tmp);
     TrackPlacementColorWrite(c, x, IdOf(r));
     if (x && x->deferred) NoteListWrite(x, IdOf(r));
@@ -3125,6 +3832,7 @@ void STDMETHODCALLTYPE UpdateSubresource1_d(ID3D11DeviceContext1* c, ID3D11Resou
 {
     Ctx* x = Get(c);
     std::vector<uint8_t> tmp;
+    TouchWorld(c, x, IdOf(r), true, false);
     UpdateCommon(c, x, r, box, src, tmp);
     TrackPlacementColorWrite(c, x, IdOf(r));
     O(c, x).update1(c, r, sub, box, src, rp, dp, flags);
@@ -3218,13 +3926,16 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
 void STDMETHODCALLTYPE OMSetRenderTargets_d(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv)
 {
     Ctx* x = Get(c);
-    if (x) TrackTargets(x, n, rtvs, dsv);
+    FinishWorld(c, x);
+    if (x) { x->world_uavs.reset(); TrackTargets(x, n, rtvs, dsv); }
     O(c, x).om_rt(c, n, rtvs, dsv);
 }
 void STDMETHODCALLTYPE OMSetRenderTargetsAndUAVs_d(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv,
                                                    UINT us, UINT un, ID3D11UnorderedAccessView* const* uavs, const UINT* counts)
 {
     Ctx* x = Get(c);
+    FinishWorld(c, x);
+    if (x) x->world_uavs.reset();
     if (x && n != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) TrackTargets(x, n, rtvs, dsv);
     O(c, x).om_rt_uav(c, n, rtvs, dsv, us, un, uavs, counts);
 }
@@ -3232,11 +3943,17 @@ void STDMETHODCALLTYPE OMSetDepthStencilState_d(ID3D11DeviceContext* c, ID3D11De
 {
     Ctx* x = Get(c);
     if (x) {
+        x->stencil_writes = false;
         if (!s) { x->depth_test = true; x->depth_func = kCompareLess; } // default state: depth test on, LESS, writing
         else {
             D3D11_DEPTH_STENCIL_DESC d{};
             Inside in;
             s->GetDesc(&d);
+            const auto changes_stencil = [](const D3D11_DEPTH_STENCILOP_DESC& face) {
+                return face.StencilFailOp != D3D11_STENCIL_OP_KEEP || face.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP ||
+                    face.StencilPassOp != D3D11_STENCIL_OP_KEEP;
+            };
+            x->stencil_writes = d.StencilEnable && d.StencilWriteMask && (changes_stencil(d.FrontFace) || changes_stencil(d.BackFace));
             x->depth_test = d.DepthEnable != FALSE;
             // Depth direction evidence: the comparison counts only on draws that also write the depth.
             x->depth_func = d.DepthEnable && d.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL ? static_cast<uint8_t>(d.DepthFunc) : uint8_t{0};
@@ -3305,6 +4022,7 @@ void StationaryRemove(Ctx* x, Id r)
 void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
 {
     if (!x || !resource) return;
+    if (x->post.resource == resource) x->post = {};
     if (x->raster_depth_layer.resource == resource) x->raster_depth_layer = {};
     const Id peer = g_lit_peer.load(std::memory_order_relaxed);
     if ((!peer && !g_adaptive_scene.load(std::memory_order_relaxed)) ||
@@ -3318,7 +4036,16 @@ void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
 void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11RenderTargetView* view, const FLOAT color[4])
 {
     Ctx* x = Get(c);
-    if (x && (x->raster_depth_layer.resource || g_adaptive_scene.load(std::memory_order_relaxed) ||
+    if (x && x->world) {
+        const auto id = ResourceOfView(view);
+        TouchWorld(c, x, id, true);
+        if (id == x->world->color) {
+            x->world_color_clear = g_frame;
+            std::copy_n(color, 4, x->clear_rgba);
+            x->pristine_color = true;
+        }
+    }
+    if (x && (x->post.resource || x->raster_depth_layer.resource || g_adaptive_scene.load(std::memory_order_relaxed) ||
               g_lit_peer.load(std::memory_order_relaxed)))
         TrackPlacementColorWrite(c, x, ResourceOfView(view));
     if (x && x->deferred) NoteListWrite(x, ResourceOfView(view));
@@ -3328,8 +4055,10 @@ void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11Ren
 void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y0, UINT z0, ID3D11Resource* src,
                                                UINT ss, const D3D11_BOX* box)
 {
-    ReadResource(c, src);
     Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(src), false);
+    TouchWorld(c, x, IdOf(dst), true);
+    ReadResource(c, src);
     if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
     if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     auto* source = !ds && !ss && !x0 && !y0 && !z0 && !box ? DepthCopySource(c, x, dst, src) : src;
@@ -3339,8 +4068,10 @@ void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Res
 }
 void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src)
 {
-    ReadResource(c, src);
     Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(src), false);
+    TouchWorld(c, x, IdOf(dst), true);
+    ReadResource(c, src);
     if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
     if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     O(c, x).copy_resource(c, dst, DepthCopySource(c, x, dst, src));
@@ -3351,8 +4082,10 @@ void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* ds
 }
 void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT f)
 {
-    ReadResource(c, src);
     Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(src), false);
+    TouchWorld(c, x, IdOf(dst), true);
+    ReadResource(c, src);
     if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     O(c, x).resolve(c, dst, ds, src, ss, f);
     InvalidateDepthWrite(x, dst);
@@ -3361,6 +4094,15 @@ void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resour
 void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT flags, FLOAT d, UINT8 s)
 {
     Ctx* x = Get(c);
+    if (x && x->world) {
+        const auto id = ResourceOfView(v);
+        TouchWorld(c, x, id, true);
+        if (id == x->world->depth && (flags & D3D11_CLEAR_DEPTH)) {
+            x->world_depth_clear = g_frame;
+            x->clear_flags = flags; x->clear_z = d; x->clear_s = s;
+            x->pristine_depth = true;
+        }
+    }
     if (x && v && (flags & D3D11_CLEAR_DEPTH)) {
         Id id = 0;
         {
@@ -3382,10 +4124,51 @@ void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11Dep
     }
     O(c, x).clear_dsv(c, v, flags, d, s);
 }
+// D3D11.1 can access or discard a view without an OM binding change.
+void STDMETHODCALLTYPE CopyRegion1_d(ID3D11DeviceContext1* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y, UINT z,
+                                     ID3D11Resource* src, UINT ss, const D3D11_BOX* box, UINT flags)
+{
+    Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(src), false); TouchWorld(c, x, IdOf(dst), true);
+    O(c,x).copy1(c,dst,ds,x0,y,z,src,ss,box,flags);
+}
+void STDMETHODCALLTYPE DiscardResource_d(ID3D11DeviceContext1* c, ID3D11Resource* r)
+{
+    Ctx* x = Get(c); TouchWorld(c,x,IdOf(r),true); O(c,x).discard_resource(c,r);
+}
+void STDMETHODCALLTYPE DiscardView_d(ID3D11DeviceContext1* c, ID3D11View* view)
+{
+    Ctx* x = Get(c); if (x && x->world) TouchWorld(c,x,ResourceOfView(view),true);
+    O(c,x).discard_view(c,view);
+}
+void STDMETHODCALLTYPE DiscardView1_d(ID3D11DeviceContext1* c, ID3D11View* view,const D3D11_RECT* rects, UINT n)
+{
+    Ctx* x = Get(c); if (x && x->world) TouchWorld(c,x,ResourceOfView(view),true);
+    O(c,x).discard_view1(c,view,rects,n);
+}
+void STDMETHODCALLTYPE ClearView_d(ID3D11DeviceContext1* c, ID3D11View* view,const FLOAT* color,const D3D11_RECT* rects, UINT n)
+{
+    Ctx* x = Get(c); if (x && x->world) TouchWorld(c,x,ResourceOfView(view),true);
+    O(c,x).clear_view(c,view,color,rects,n);
+}
+void STDMETHODCALLTYPE SwapState_d(ID3D11DeviceContext1* c, ID3DDeviceContextState* state, ID3DDeviceContextState** previous)
+{
+    Ctx* x = Get(c); FinishWorld(c,x);
+    if (x && x->world) {
+        x->world_uavs.reset();
+        x->world_color_clear = x->world_depth_clear = x->world_frame = ~uint64_t{0};
+        // Unknown bindings invalidate draw eligibility. The job's color, depth and
+        // copy lists still belong to the same objects across a context state swap.
+        x->reset_state();
+        x->pristine_color = x->pristine_depth = false;
+    }
+    O(c,x).swap_state(c,state,previous);
+}
 void STDMETHODCALLTYPE ClearState_d(ID3D11DeviceContext* c)
 {
     Ctx* x = Get(c);
-    if (x) x->reset_state();
+    FinishWorld(c, x);
+    if (x) { x->world_uavs = false; x->reset_state(); }
     O(c, x).clear_state(c);
 }
 HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL restore, ID3D11CommandList** out)
@@ -3437,6 +4220,17 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
 void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11CommandList* list, BOOL restore)
 {
     Ctx* x = Get(c);
+    FinishWorld(c, x);
+    if (x && list) { x->post = {}; x->world_frame = ~uint64_t{0}; ++x->world_run; ++x->world_own_run; }
+    if (x && list && x->world && !x->deferred && !t_inside && x->world_list_frame != g_frame) {
+        // WHY log: a world drawn through recordings made on other threads cannot be redirected here.
+        std::lock_guard<std::mutex> l(g_mu);
+        auto it = g_lists.find(list);
+        if (it != g_lists.end() && it->second.incarnation == IncarnationOf(list)) {
+            const auto& w = it->second.writes;
+            if (it->second.writes_unknown || std::find(w.begin(), w.end(), x->world->color) != w.end()) x->world_list_frame = g_frame;
+        }
+    }
     if (x && !x->deferred && x->coarse_rate && !t_inside) {
         // The immediate context's coarse shading would also apply to the list's draws (vrs11_test (ii)):
         // a list shades in blocks only what its own recording asked for.
@@ -3529,6 +4323,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         if (FAILED(swap->GetDevice(IID_PPV_ARGS(&d))) || d.Get() != game) return false;
         g_swap = swap;
         g_screen.ResetPlacement();
+        g_post_screen.ResetPlacement();
         g_placement.ClearPresentation();
         g_lit.Clear();
         g_recovery.Clear();
@@ -3538,6 +4333,9 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
     }
+    for (auto& entry : g_ctx)
+        if (entry.second->game && entry.second->gen == g_device_gen.load() && !entry.second->deferred)
+            FinishWorld(entry.first, entry.second.get());
     if (hud_free::Wanted()) { // the HUD-free picture: the frame ends here (learning, per-frame counts)
         Inside in;
         DXGI_SWAP_CHAIN_DESC hd{};
@@ -3547,12 +4345,20 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         hud_free::OnPresent(immediate.Get(), uint64_t(g_backbuffer), hd.BufferDesc.Width, hd.BufferDesc.Height);
     }
     const auto previous = g_model.Current();
+    const bool scale_search = g_discover_scale.load(std::memory_order_relaxed);
+    if (scale_search != g_was_discovering_scale) {
+        g_was_discovering_scale = scale_search;
+        if (g_model.IsDisplayExtent(previous.color_info) || g_model.IsReducedPicture(previous.color_info)) {
+            g_screen.ResetPlacement();
+            g_post_screen.ResetPlacement();
+        }
+    }
     const bool reserved_before = g_screen.ReservesPixelRead();
     if (g_screen_enabled.load(std::memory_order_relaxed)) {
         Inside own;
         ComPtr<ID3D11DeviceContext> context;
         ComPtr<ID3D11Texture2D> screen;
-        if (g_screen.AwaitingSamples() || g_lit.screen.AwaitingSamples()) {
+        if (g_screen.AwaitingSamples() || g_lit.screen.AwaitingSamples() || g_post_screen.AwaitingSamples()) {
             game->GetImmediateContext(&context);
             swap->GetBuffer(0, IID_PPV_ARGS(&screen));
         }
@@ -3565,7 +4371,12 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
             if (const char* outcome = g_lit.screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), g_model.FiredThisFrame(), receipt != nullptr))
                 na::eventlog::Emit("native11_lit_role", "frame=%llu reader=%s", (unsigned long long)g_frame, outcome);
         }
-    } else if (g_screen.Active()) g_screen.ResetPlacement();
+        if (g_post_screen.Active())
+            g_post_screen.Present(context.Get(), screen.Get(), g_frame, g_model.SceneDrawsThisFrame(), false, receipt != nullptr);
+    } else {
+        if (g_screen.Active()) g_screen.ResetPlacement();
+        if (g_post_screen.Active()) g_post_screen.ResetPlacement();
+    }
     if (receipt) *receipt = {g_frame, g_frame_delivered || g_model.SceneDrawsThisFrame() != 0, g_frame_delivered,
                              g_eval_paused.load(std::memory_order_relaxed)};
     ++g_frame;
@@ -3595,6 +4406,7 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_model.EndFrame(check_lit && !previous.screen_region,
         check_lit && was_steering ? g_lit.Peer(g_model.Current().color) : 0, check_lit);
     const auto& picked = g_model.Current();
+    if (picked.color != previous.color || picked.depth != previous.depth) g_post_screen.ResetPlacement();
     // WHY log: frames keep coming with a scene-like picture that cannot be used. Said once per reason
     // and extent, and again every 600 frames while it lasts, in the words the results file shows.
     if (const auto& refused = g_model.RefusedScene(); !picked.valid() && refused.why != FrameModel::NoScene::None) {
@@ -3881,6 +4693,13 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_vpj_executed_expanded = false;
     g_vpj_last_frame_draws.store(jittered_draws, std::memory_order_relaxed);
     if (jittered_draws) g_vpj_frames.fetch_add(1, std::memory_order_relaxed);
+    WorldRouteFrame(g_frame - 1);
+    for (auto& entry : g_ctx) {
+        auto& x = *entry.second;
+        if (!x.world) continue;
+        x.world->proof_current.store(g_screen.KnowsProof(x.world->proof), std::memory_order_relaxed);
+        if (!g_world_level.load() || x.world->color != s.color || x.world->depth != s.depth) x.world.reset();
+    }
     g_sel_depth.store(s.depth, std::memory_order_relaxed);
     g_sel_depth_w.store(s.depth_info.width, std::memory_order_relaxed);
     g_sel_depth_h.store(s.depth_info.height, std::memory_order_relaxed);
@@ -3933,11 +4752,17 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
     std::lock_guard<std::mutex> l(g_mu);
     if (s == g_swap) {
         g_screen.ResetPlacement();
+        g_post_screen.ResetPlacement();
         g_placement.ClearPresentation();
         g_lit.Clear();
         g_recovery.Clear();
         g_lit_peer.store(0, std::memory_order_relaxed);
         g_adaptive_scene.store(false, std::memory_order_relaxed);
+        for (auto& entry : g_ctx) {
+            FinishWorld(entry.first, entry.second.get());
+            entry.second->world.reset();
+            entry.second->world_frame = ~uint64_t{0};
+        }
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
         g_color_ref.Reset();
         g_depth_ref.Reset();
@@ -4008,6 +4833,12 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     else hooks.push_back({kExecuteCommandList, reinterpret_cast<void*>(&ExecuteCommandList_d), reinterpret_cast<void**>(&o.execute)});
     ComPtr<ID3D11DeviceContext1> c1;
     if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) {
+        hooks.push_back({kCopyRegion1, reinterpret_cast<void*>(&CopyRegion1_d), reinterpret_cast<void**>(&o.copy1)});
+        hooks.push_back({kDiscardResource, reinterpret_cast<void*>(&DiscardResource_d), reinterpret_cast<void**>(&o.discard_resource)});
+        hooks.push_back({kDiscardView, reinterpret_cast<void*>(&DiscardView_d), reinterpret_cast<void**>(&o.discard_view)});
+        hooks.push_back({kDiscardView1, reinterpret_cast<void*>(&DiscardView1_d), reinterpret_cast<void**>(&o.discard_view1)});
+        hooks.push_back({kClearView, reinterpret_cast<void*>(&ClearView_d), reinterpret_cast<void**>(&o.clear_view)});
+        hooks.push_back({kSwapContextState, reinterpret_cast<void*>(&SwapState_d), reinterpret_cast<void**>(&o.swap_state)});
         hooks.push_back({kUpdateSubresource1, reinterpret_cast<void*>(&UpdateSubresource1_d), reinterpret_cast<void**>(&o.update1)});
         hooks.push_back({kVSSetConstantBuffers1, reinterpret_cast<void*>(&VSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.vs_cb1)});
         hooks.push_back({kPSSetConstantBuffers1, reinterpret_cast<void*>(&PSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.ps_cb1)});
@@ -4054,6 +4885,7 @@ bool InstallHooks(bool host_owns_present)
     ComPtr<IDXGISwapChain1> swap1;
     swap.As(&swap1);
     bool ok = na::hooking::BeginInstallWait("native11");
+    ok = ok && na::hooking::PrepareVTableSlot(dev.Get(), kCreatePixelShader, reinterpret_cast<void*>(&CreatePixelShader_d), reinterpret_cast<void**>(&g_create_ps));
     ok = ok && HookCtx(imm.Get(), 0, false);
     ok = ok && (!def || HookCtx(def.Get(), 1, true));
     if (!host_owns_present) {
@@ -4075,12 +4907,104 @@ bool InstallHooks(bool host_owns_present)
 
 } // namespace
 
-void SetScreenCheck(bool on) { g_screen_enabled.store(on, std::memory_order_relaxed); }
+bool PrepareWorldRaster(void* context, const SceneFrame& f, uint32_t level, uint32_t w, uint32_t h)
+{
+    if (f.world_level) return false; // already small
+    const auto hold = [](WorldHold why) { g_world_frame_hold.store(uint8_t(why), std::memory_order_relaxed); return false; };
+    if (!level || !w || !h) return hold(WorldHold::NoRenderSize);
+    if (!f.screen_proof || !f.scaled_reader.target) return hold(WorldHold::Reader);
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_ctx.find(static_cast<ID3D11DeviceContext*>(context));
+    if (it == g_ctx.end() || !g_swap || level != g_world_level.load()) return hold(WorldHold::Preparing);
+    if (f.screen_proof != g_screen.Proof()) return hold(WorldHold::Reader);
+    if (f.color.resource == g_backbuffer) return hold(WorldHold::OnScreen);
+    if (!g_model.IsDisplayExtent(g_model.Current().color_info)) return hold(WorldHold::OtherSize);
+    if (f.color.active_x || f.color.active_y || f.depth.active_x || f.depth.active_y ||
+        f.color.width != f.color.active_w || f.color.height != f.color.active_h ||
+        f.depth.width != f.color.width || f.depth.height != f.color.height || f.color.mip || f.depth.mip ||
+        f.color.array_slice || f.depth.array_slice || w >= f.color.width || h >= f.color.height) return hold(WorldHold::PictureKind);
+    auto& x = *it->second;
+    auto job = x.world;
+    if (job && job->level == level && job->proof == f.screen_proof &&
+        job->color == f.color.resource && job->depth == f.depth.resource && job->width == w && job->height == h) {
+        return !job->refused.load(std::memory_order_acquire);
+    }
+    ComPtr<ID3D11Resource> color = static_cast<ID3D11Resource*>(f.color.d3d11_resource);
+    ComPtr<ID3D11Resource> depth = static_cast<ID3D11Resource*>(f.depth.d3d11_resource);
+    job = std::make_shared<Ctx::WorldJob>();
+    job->color = f.color.resource; job->depth = f.depth.resource;
+    job->color_format = DXGI_FORMAT(f.color.view_format); job->depth_format = DXGI_FORMAT(f.depth.view_format);
+    job->last_receipt = f.frame;
+    job->proof = f.screen_proof; job->level = level; job->width = w; job->height = h;
+    if (!background::Submit([job, color, depth] {
+        OwnWorkScope own;
+        ComPtr<ID3D11Device> device; color->GetDevice(&device);
+        D3D11_RENDER_TARGET_VIEW_DESC cv{}; cv.Format = job->color_format; cv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{}; dv.Format = job->depth_format; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        ComPtr<ID3D11RenderTargetView> rtv; ComPtr<ID3D11DepthStencilView> dsv;
+        const bool pictures = SUCCEEDED(device->CreateRenderTargetView(color.Get(), &cv, &rtv)) &&
+            SUCCEEDED(device->CreateDepthStencilView(depth.Get(), &dv, &dsv)) && job->raster.Prepare(rtv.Get(), dsv.Get(), job->width, job->height);
+        // Without the Referee's eye nothing drawn small could be judged: no eye, no small world.
+        const bool ok = pictures && job->probe.Prepare(device.Get(), job->raster.Color(), job->color_format);
+        job->ready.store(ok, std::memory_order_release);
+        job->refused.store(!ok, std::memory_order_release);
+        na::eventlog::Emit("native11_world_raster", "level=%u prepared=%d pictures=%d render=%ux%u", job->level, int(ok), int(pictures), job->width, job->height);
+    })) return hold(WorldHold::Preparing);
+    FinishWorld(it->first, &x);
+    x.world_inputs.scanned = false;
+    x.world_inputs_seen.clear();
+    x.world_inputs_new = false;
+    x.world = std::move(job);
+    x.world_frame = x.world_small_frame = x.world_color_clear = x.world_depth_clear = ~uint64_t{0};
+    return true;
+}
+
+void NoteWorldHold(WorldHold why) { g_world_frame_hold.store(uint8_t(why), std::memory_order_relaxed); }
+
+const char* WorldHoldText(WorldHold why)
+{
+    switch (why) {
+    case WorldHold::None: return "";
+    case WorldHold::Preparing: return "the smaller pictures are being prepared and the game's draws are being counted";
+    case WorldHold::HelperProgram: return "DLSS runs in the separate 64-bit helper program for this 32-bit game, which cannot take a smaller picture yet";
+    case WorldHold::NoRenderSize: return "DLSS gave no render size for this level";
+    case WorldHold::Reader: return "the draw that puts the game's 3D picture on screen has not been proven yet";
+    case WorldHold::OnScreen: return "the game draws its 3D picture straight onto the screen, with no later step to hand the full-size picture to";
+    case WorldHold::OtherSize: return "the game's 3D picture is not the size of the screen (the game is already scaling it itself)";
+    case WorldHold::PictureKind: return "the game's 3D picture is of a kind that has no small twin (several samples per pixel, part of a larger picture, or an unusual depth format)";
+    case WorldHold::NoWorldDraws: return "no draw into the game's 3D picture was seen on its main drawing context";
+    case WorldHold::RecordedLists: return "the game records its 3D drawing on other threads and plays it back, which cannot be redirected yet";
+    case WorldHold::SeveralTargets: return "the game's 3D draws write several pictures at once (deferred shading), which cannot be redirected yet";
+    case WorldHold::Viewports: return "the game's 3D draws use several viewports at once";
+    case WorldHold::Uavs: return "the game's 3D draws write through unordered-access views";
+    case WorldHold::Predicated: return "the game's 3D draws are predicated on earlier visibility results";
+    case WorldHold::FullSizeInput: return "a 3D draw reads a full-size picture that cannot be made small";
+    case WorldHold::Interleaved: return "too many draws that must stay full size (visibility queries, other pictures) sit between the game's 3D draws";
+    case WorldHold::PictureCheck: return "the Referee saw a wrong picture with every way of drawing this game's 3D picture small";
+    case WorldHold::Evaluator: return "DLSS refused the smaller picture three times";
+    default: return "?";
+    }
+}
+WorldRouteStatus WorldRoute()
+{
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_route.status;
+}
+
+void SetScreenCheck(bool on, uint32_t discover_scale)
+{
+    g_world_level.store(on && discover_scale <= 3 ? discover_scale : 0);
+    g_discover_scale.store(on && discover_scale, std::memory_order_relaxed);
+    g_screen_enabled.store(on, std::memory_order_relaxed);
+}
 
 void RejectScreenProof(uint64_t proof)
 {
     if (!proof || !g_screen_enabled.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lock(g_mu);
+    for (auto& entry : g_ctx)
+        if (entry.second->world && entry.second->world->proof == proof)
+            entry.second->world->proof_current.store(false, std::memory_order_relaxed);
     if (g_lit.Revoke(proof, g_frame) || g_screen.RejectProof(proof, g_frame))
         na::eventlog::Emit("native11_screen", "candidate=replaced_after_delivery proof=%llu",
                            static_cast<unsigned long long>(proof));
@@ -4095,6 +5019,7 @@ void ObservePresentResult(void* swapchain, uint64_t ordinal, bool accepted)
     std::lock_guard<std::mutex> lock(g_mu);
     if (swapchain != g_swap) return;
     g_screen.PresentResult(ordinal, accepted);
+    g_post_screen.PresentResult(ordinal, accepted);
     g_lit.screen.PresentResult(ordinal, accepted);
 }
 void BeforeResize(void* swapchain) { ReleaseResizeInputs(static_cast<IDXGISwapChain*>(swapchain)); }
@@ -4151,12 +5076,20 @@ void Uninstall()
     g_cb_user = nullptr;
     g_trial_reader = nullptr;
     g_screen = {};
+    g_post_screen = {};
     g_placement.ClearPresentation();
     g_lit.Clear();
     g_recovery.Clear();
     g_lit_peer.store(0, std::memory_order_relaxed);
     g_adaptive_scene.store(false, std::memory_order_relaxed);
+    g_world_level.store(0);
+    g_route = {};
+    g_world_live.store(false);
+    g_world_reference.store(false);
+    g_world_frame_hold.store(0);
     g_screen_enabled.store(false, std::memory_order_relaxed);
+    g_discover_scale.store(false, std::memory_order_relaxed);
+    g_was_discovering_scale = false;
     g_swap = nullptr;
     g_backbuffer = 0;
     g_collect_all = false;
@@ -4317,6 +5250,9 @@ ProviderStats Stats()
     stats.screen_refuted = g_screen.Refuted();
     stats.screen_pairs = g_screen.Paired();
     stats.screen_delivered = g_screen.Delivered();
+    stats.scaled_compositor_confirmed = g_post_screen.Confirmed();
+    stats.scaled_compositor_refuted = g_post_screen.Refuted();
+    stats.scaled_compositor_draws = g_post_screen.Delivered();
     return stats;
 }
 

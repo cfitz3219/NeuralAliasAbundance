@@ -103,6 +103,10 @@ int FormatCutNumbers(char* out, size_t n);
 // whether Record would find that size without building anything.
 void Prepare(ID3D12Device*,ID3D12CommandQueue*,unsigned w,unsigned h);
 bool Ready(unsigned w,unsigned h);
+// The size a frame is about to measure at. False = it is being built on its own thread: leave this
+// frame as the game drew it and ask again on the next. True = Record will not build on the game's thread
+// (or only Record can say why it cannot be had).
+bool Warm(ID3D12Device*,ID3D12CommandQueue*,unsigned w,unsigned h);
 // The working set of this size is still wanted (it is not given back while asked for; one unused for a few
 // seconds is). Builds nothing.
 void Keep(unsigned w,unsigned h);

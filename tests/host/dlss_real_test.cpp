@@ -568,6 +568,13 @@ int main(int argc, char** argv)
         data_dir.assign(a.begin(), a.end());
         CreateDirectoryW(data_dir.c_str(), nullptr);
     }
+    // Which DLSS file NVIDIA's runtime takes when an old one sits beside the program (a game that ships
+    // one it never uses, Crusader Kings III 2026-11-27) and ours is in the extra search folder.
+    wchar_t search[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"NA_TEST_DLSS_SEARCH", search, MAX_PATH)) {
+        na::dlss::SetOwnSearchFolder(search);
+        std::printf("extra DLSS search folder: %ls\n", search);
+    }
     const bool init_ok = na::dlss::InitOwn(d.device.Get(), data_dir.c_str());
     const auto caps = na::dlss::GetCapabilities();
     std::printf("NGX own instance: %s; DLSS available=%d driver-update-needed=%d (min %u.%u) init-result=0x%08X optimal-cb=%d\n",
@@ -772,6 +779,12 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(st.features_released), static_cast<unsigned long long>(st.features_pending),
                 static_cast<unsigned long long>(st.features_leaked), static_cast<unsigned long long>(st.untracked));
     CHECK(st.features_created == 1); // same size/flags throughout: never recreated
+    {
+        wchar_t path[MAX_PATH] = {};
+        HMODULE m = GetModuleHandleW(L"nvngx_dlss.dll");
+        if (m) GetModuleFileNameW(m, path, MAX_PATH);
+        std::printf("DLSS file in use: %ls\n", m ? path : L"(nvngx_dlss.dll is not loaded in this process)");
+    }
     d.WaitIdle();
     na::dlss::Shutdown();
     return test::finish("dlss_real_test");

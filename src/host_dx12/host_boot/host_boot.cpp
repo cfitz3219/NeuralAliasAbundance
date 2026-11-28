@@ -355,6 +355,25 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
+    // NeuralAlias's own DLSS file: in a folder of its own beside NeuralAlias (NeuralAlias-DLSS), so a
+    // package never replaces a file of the game's, and an old DLSS file a game ships beside its program
+    // is not the one used (Crusader Kings III 2026-11-27: 2.4.0.0, which refuses DLAA on every frame).
+    if (na::j2::Configured()) {
+        wchar_t folder[MAX_PATH] = {}, file[MAX_PATH] = {};
+        lstrcpynW(folder, g_ini, MAX_PATH);
+        for (int i = lstrlenW(folder) - 1; i >= 0; --i)
+            if (folder[i] == L'\\' || folder[i] == L'/') { folder[i] = 0; break; }
+        if (lstrlenW(folder) + 40 < MAX_PATH) {
+            lstrcatW(folder, L"\\NeuralAlias-DLSS");
+            wsprintfW(file, L"%s\\nvngx_dlss.dll", folder);
+            if (GetFileAttributesW(file) != INVALID_FILE_ATTRIBUTES) {
+                na::dlss::SetOwnDlssFolder(folder);
+                boot_log("DLSS file: NeuralAlias's own (folder NeuralAlias-DLSS beside NeuralAlias), searched before the game's folder");
+            } else {
+                boot_log("DLSS file: no NeuralAlias-DLSS folder with nvngx_dlss.dll beside NeuralAlias; the file beside the game's program is used");
+            }
+        }
+    }
     // Route B live Frame Generation ([fg] live=1, 2026-11-26). The presenter serves the swap chain
     // from its creation so Off / x2 switches live with no restart (Off presents inline on the
     // game's thread); NVIDIA's file is read from [fg] search_path (read-only, never copied).
