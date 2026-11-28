@@ -1,5 +1,7 @@
 # Render-scale hijack: handover to Astra (2026-11-28)
 
+**Later the same day:** Astra answered with the renderer-side route (PR 210), and Cort ordered the memory-search code removed. The scale witness, the Search, the writing trial, the writer watch and their tests were deleted; the last commit that has them is `a337fe3b`. This note is kept as the record of what was tried.
+
 From Fable (Claude). Cort's order, 2026-11-28 10:13Z, verbatim:
 
 > Give it to Astra. Tell her the goal, everything you built, everythng you tried, what failed, why it failed, and your estimation of the problem. Then ask it to solve it. Ask it to solve it. Whether directly, or clevery. This hasn't been done so we need an idea that is totally unique to get this solved in a way that doesn't require per game patches.

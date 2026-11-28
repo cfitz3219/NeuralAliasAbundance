@@ -1,5 +1,4 @@
 // Native DX11 route: material texture census and replacement (see textures.hpp).
-#include "host_dx12/scale/scale_witness.hpp"
 #include "host_dx12/native11/textures.hpp"
 #include "host_dx12/native11/proxy_views.hpp"
 
@@ -274,9 +273,6 @@ HRESULT STDMETHODCALLTYPE CreateTexture2D_d(ID3D11Device* dev, const D3D11_TEXTU
 {
     const HRESULT hr = g_create_texture(dev, desc, initial, out);
     if (FAILED(hr) || !desc || !out || !*out || dev != g_device.load(std::memory_order_acquire) || IsOwnWork()) return hr;
-    // Scale witness (log only): the game code that creates world-sized pictures to draw into.
-    if ((desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) && na::scale::witness::Active())
-        na::scale::witness::OnTargetCreated("DX11", desc->Width, desc->Height);
     MaterialsOnTextureCreated(dev, *desc, initial, *out);
     return hr;
 }

@@ -763,7 +763,6 @@ void OwnShutdown(ID3D12Device* device);
 
 namespace {
 std::atomic<OwnAttachedFn> g_own_attached{nullptr};
-wchar_t g_dlss_folder[260] = {};
 wchar_t g_search_folder[260] = {}; // written once at boot, before our NGX starts
 wchar_t g_dlss_folder[260] = {};   // the same: NeuralAlias's own DLSS file's folder
 } // namespace
@@ -772,8 +771,6 @@ void SetOwnDlssFolder(const wchar_t* folder) { wcsncpy_s(g_dlss_folder, folder ?
 const wchar_t* OwnDlssFolder() { return g_dlss_folder; }
 void SetOwnSearchFolder(const wchar_t* folder) { wcsncpy_s(g_search_folder, folder ? folder : L"", _TRUNCATE); }
 const wchar_t* OwnSearchFolder() { return g_search_folder; }
-void SetOwnDlssFolder(const wchar_t* folder) { wcsncpy_s(g_dlss_folder, folder ? folder : L"", _TRUNCATE); }
-const wchar_t* OwnDlssFolder() { return g_dlss_folder; }
 
 bool Attach(ID3D12Device* device, const Api& api)
 {

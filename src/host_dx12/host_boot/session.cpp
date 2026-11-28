@@ -1,4 +1,3 @@
-#include "host_dx12/scale/scale_witness.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/settings.hpp"
 #include "host_dx12/hooking/vtable_hook.hpp"
@@ -95,7 +94,7 @@ void ActivateSavedRequests(const wchar_t* ini){
     const bool safe=settings::SafeStart();auto& st=settings::Get();
     if(settings::CanPersist())na::fg::preset::Initialize();
     slb::SetFgRequest(safe?slb::FgRequest{}:slb::FgRequest{static_cast<slb::FgMode>(st.native_fg_mode.load()),st.native_fg_frames.load()});
-    j2::SetPaused(safe || na::scale::witness::TestMode());
+    j2::SetPaused(safe);
     if(j2::Configured()){
         // The menu's Texture mip bias choice (automatic = total -1). The old [j2] mip_bias key
         // chooses nothing: a legacy saved Off must not switch texture detail off.

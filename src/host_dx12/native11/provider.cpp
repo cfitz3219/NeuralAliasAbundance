@@ -44,7 +44,6 @@
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
 #include "host_dx12/native11/coarse11.hpp"
-#include "host_dx12/scale/scale_witness.hpp"
 #include "providers/camera/camera_admission.hpp"
 #include "providers/camera/camera_tracker.hpp"
 
@@ -310,7 +309,6 @@ struct Ctx {
     } raster_depth_layer;
     uint32_t target_width = 0, target_height = 0;
     bool depth_layer_target = false, material_layer_target = false;
-    bool world_bound = false; // the Referee's world colour or depth is bound (scale witness)
     bool vpj_shader_depth = false;
     bool vpj_still_mesh = false; // VARIANT: referee/sample-locked-dropout (moved at the Referee's ask)
     bool vpj_overlay = false;    // VARIANT: jitter/scene-overlays (an untested mesh into the scene colour)
@@ -371,7 +369,6 @@ struct Ctx {
         raster_depth_layer = {};
         target_width = target_height = 0;
         depth_layer_target = material_layer_target = vpj_shader_depth = vpj_still_mesh = vpj_overlay = false;
-        world_bound = false;
         stationary = {};
         vpj_still_class = 0;
         depth_test = true;
@@ -3483,8 +3480,6 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
     x->ds_view = ds_use;
     x->depth_layer_target = x->material_layer_target = false;
     x->target_width = x->target_height = 0;
-    const bool was_world = x->world_bound;
-    x->world_bound = false;
     UINT bound = 0;
     for (UINT i = 0; rtvs && i < n; ++i)
         if (rtvs[i]) ++bound;
@@ -3521,8 +3516,6 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
                 g_depth_view = ds_use;
             }
         }
-        const auto& world = g_model.Current();
-        x->world_bound = world.valid() && ((rt && IdOf(rt) == world.color) || (ds && IdOf(ds) == world.depth));
         if (rt && IdOf(rt) == g_model.Current().color) {
             if (g_color_ref.Get() != rt) g_color_ref = rt;
             g_color_view = rt_use;
@@ -3530,9 +3523,6 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
     }
     if (rt) rt->Release();
     if (ds) ds->Release();
-    // Scale witness: the world was just bound with a viewport already set.
-    if (x->world_bound && !was_world && !t_inside && x->vp_n && na::scale::witness::Active())
-        na::scale::witness::OnWorldViewport("DX11", x->vp_w, x->vp_h);
 }
 void STDMETHODCALLTYPE OMSetRenderTargets_d(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv)
 {
@@ -3584,8 +3574,6 @@ void STDMETHODCALLTYPE RSSetViewports_d(ID3D11DeviceContext* c, UINT n, const D3
         x->vp_n = v ? (std::min)(n, UINT(D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)) : 0u;
         for (UINT i = 0; i < x->vp_n; ++i) x->vps[i] = v[i];
         x->vpj_applied = false;
-        // Scale witness (log only): which game code sizes the world, and with what number.
-        if (x->world_bound && !t_inside && n && v && na::scale::witness::Active()) na::scale::witness::OnWorldViewport("DX11", v[0].Width, v[0].Height);
     }
     O(c, x).rs_vp(c, n, v);
 }
@@ -3935,7 +3923,6 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         DXGI_SWAP_CHAIN_DESC sd{};
         swap->GetDesc(&sd);
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
-        na::scale::witness::NoteOutput(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
     }
     for (auto& entry : g_ctx)
@@ -4348,11 +4335,6 @@ HRESULT STDMETHODCALLTYPE ResizeBuffers_d(IDXGISwapChain* s, UINT n, UINT w, UIN
     BeforeResize(s);
     const HRESULT hr = g_resize(s, n, w, h, f, flags);
     AfterResize(s, hr);
-    if (SUCCEEDED(hr) && na::scale::witness::Active()) {
-        DXGI_SWAP_CHAIN_DESC sd{};
-        Inside in;
-        if (SUCCEEDED(s->GetDesc(&sd))) na::scale::witness::NoteOutput(sd.BufferDesc.Width, sd.BufferDesc.Height);
-    }
     return hr;
 }
 

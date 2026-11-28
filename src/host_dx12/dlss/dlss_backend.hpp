@@ -173,13 +173,9 @@ bool InitOwn(ID3D12Device* device, const wchar_t* data_path);
 // feature files (nvngx_dlssg.dll), given to our own NGX instance at start-up. Empty = none.
 void SetOwnSearchFolder(const wchar_t* folder);
 const wchar_t* OwnSearchFolder();
-<<<<<<< HEAD
 // NeuralAlias's own DLSS file (nvngx_dlss.dll) in a folder of its own, searched BEFORE the program's
 // folder. A game can ship an old DLSS file it never uses (Crusader Kings III: 2.4.0.0, which refuses
 // DLAA); the game's file is never replaced, ours is simply found first. Empty = none.
-=======
-// Private DLSS directory, independent of the optional frame-generation search path.
->>>>>>> origin/astra/native-scale-settings-trial
 void SetOwnDlssFolder(const wchar_t* folder);
 const wchar_t* OwnDlssFolder();
 // Called once our own NGX instance is attached, with its entry points (Frame Generation uses the

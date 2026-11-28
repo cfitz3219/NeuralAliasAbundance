@@ -1,4 +1,3 @@
-#include "host_dx12/scale/scale_witness.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/capture/capture_session.hpp"
@@ -178,43 +177,6 @@ DWORD WINAPI InitThread(LPVOID)
             boot_log(ready?"native scale: engine-owned settings control installed":"native scale: settings relationship unavailable; native DLAA retained");
         }else boot_log(na::scale::StartSliderRoute(mode, scale_log) ? "slider route: settings read hook installed" : "slider route: read hook failed");
     }
-    // Scale witness (Cort 2026-11-28, log only): finds the game code and the number that size the
-    // world, the first step to hijacking the game's own render-scale command. Never writes game
-    // memory. [scale] witness=0 turns it off. Its log goes beside the status log.
-    if (GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 && GetPrivateProfileIntW(L"scale", L"witness", 1, g_ini) != 0 &&
-        !na::settings::SafeStart()) {
-        wchar_t witness_log[MAX_PATH];
-        lstrcpynW(witness_log, g_ini, MAX_PATH);
-        wchar_t custom[MAX_PATH] = {};
-        if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(witness_log, custom, MAX_PATH);
-        for (int i = lstrlenW(witness_log) - 1; i >= 0; --i)
-            if (witness_log[i] == L'\\' || witness_log[i] == L'/') { witness_log[i] = 0; break; }
-        wchar_t name[64];
-        swprintf_s(name, L"\\NeuralAlias-scale-witness-%lu.log", GetCurrentProcessId());
-        // [scale] test=1: the finder test. DLSS/DLAA is held off so the run tests the finder alone,
-        // and a PASS/FAIL file with the reason is written beside the log.
-        const bool finder_test = GetPrivateProfileIntW(L"scale", L"test", 0, g_ini) == 1;
-        wchar_t verdict[MAX_PATH];
-        lstrcpynW(verdict, witness_log, MAX_PATH);
-        const wchar_t* verdict_name = L"\\NeuralAlias-scale-test-result.txt";
-        const bool verdict_fits = lstrlenW(verdict) + lstrlenW(verdict_name) < MAX_PATH;
-        if (verdict_fits) lstrcatW(verdict, verdict_name);
-        if (lstrlenW(witness_log) + lstrlenW(name) < MAX_PATH) {
-            lstrcatW(witness_log, name);
-            na::scale::witness::SetTestMode(finder_test);
-            if (finder_test && GetPrivateProfileIntW(L"scale", L"trial", 0, g_ini) == 1) {
-                na::scale::witness::SetTrial(true);
-                boot_log("scale witness: WRITING TRIAL on (after a scale number is confirmed, NeuralAlias sets it itself and puts it back)");
-            }
-            if (finder_test && GetPrivateProfileIntW(L"scale", L"search", 0, g_ini) == 1) {
-                na::scale::witness::SetSearch(true);
-                boot_log("scale witness: THE SEARCH on (NeuralAlias finds the render-scale number by itself: starting value, names, a 5-point nudge)");
-            }
-            if (finder_test) boot_log("scale witness: FINDER TEST, DLSS/DLAA held off; result in NeuralAlias-scale-test-result.txt");
-            na::scale::witness::Start(witness_log, finder_test && verdict_fits ? verdict : nullptr);
-            boot_log("scale witness: on (log only; several searches for the game's render-scale number run together)");
-        } else boot_log("scale witness: off (the log folder's path is too long)");
-    }
     // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
     // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1
     // = -1 at native). Configure before installing producer hooks, after the
@@ -393,13 +355,9 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
-<<<<<<< HEAD
     // NeuralAlias's own DLSS file: in a folder of its own beside NeuralAlias (NeuralAlias-DLSS), so a
     // package never replaces a file of the game's, and an old DLSS file a game ships beside its program
     // is not the one used (Crusader Kings III 2026-11-27: 2.4.0.0, which refuses DLAA on every frame).
-=======
-    // Prefer the private DLSS supplied beside our configuration for added AA.
->>>>>>> origin/astra/native-scale-settings-trial
     if (na::j2::Configured()) {
         wchar_t folder[MAX_PATH] = {}, file[MAX_PATH] = {};
         lstrcpynW(folder, g_ini, MAX_PATH);
@@ -525,7 +483,7 @@ DWORD WINAPI InitThread(LPVOID)
         na::overlay::RegisterLiveDlaaMenu();
     }
     na::j2::flow::SetEnabled(na::j2::Configured());
-    if(na::settings::SafeStart() || na::scale::witness::TestMode())na::j2::SetPaused(true);
+    if(na::settings::SafeStart())na::j2::SetPaused(true);
     na::background::Start(); // two below-normal workers, never hardware_concurrency
     na::observe::SetBackgroundSubmitter(&na::background::Submit); // mip/AF variant compiles share the pool
     // DLSS features made off the frame (a level change): that thread's D3D12 work is ours, never the game's.
