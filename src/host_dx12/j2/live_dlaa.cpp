@@ -2917,7 +2917,7 @@ bool jshift_dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* in, ID3D12Res
     ++g.stats.jitter_shifted;
     return true;
 }
-// ---- Fold the shading (core/fold_shading.hpp; Cort 2026-11-25, live test) ---------------------
+// ---- Fold the shading (core/fold_shading.hpp; Cort 2026-11-25) ---------------------
 // The game draws at full size with its scene shaded once per block (coarse shading, set on the
 // scene's draws by na::observe::SetSceneCoarseShading). Here one pixel of every block is kept from
 // colour, depth and motion, DLSS gets that smaller picture and writes the full-size one into the

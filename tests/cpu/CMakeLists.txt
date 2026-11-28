@@ -76,6 +76,8 @@ na_add_cpu_test(replay_movers)
 # The referee's scoring (stage 1 of the unify plan): picture, result, motion, jitter on known pictures.
 na_add_cpu_test(referee)
 na_add_cpu_test(referee_dropout)
+na_add_cpu_test(referee_world_check)
+na_add_cpu_test(dxbc_inputs)
 # The Referee's coverage trial: classes of draws left off the jitter tried on the sample, one at a time.
 na_add_cpu_test(referee_coverage)
 add_executable(na_referee_replay referee_replay.cpp)

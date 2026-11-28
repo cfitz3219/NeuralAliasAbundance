@@ -688,8 +688,7 @@ bool EvaluateFrameTimed(void* context, const native11::SceneFrame& frame)
                 start_ms = GetTickCount64() - began;
                 if (ok) {
                     // The levels' pass, when levels are in use (asked for again where it is used; nothing is built twice).
-                    if (!st.companion && (settings::Get().j2_fold_prewarm.load(std::memory_order_relaxed) ||
-                                          settings::Get().j2_fold_mode.load(std::memory_order_relaxed)))
+                    if (!st.companion && settings::Get().j2_fold_mode.load(std::memory_order_relaxed))
                         st.fold.Init(st.device.Get(), kSlots);
                     if (replay_wanted && !st.replay_tried) {
                         st.replay_tried = true;
@@ -855,13 +854,20 @@ bool EvaluateFrameTimed(void* context, const native11::SceneFrame& frame)
     // written straight into its folded motion plane.
     na::fold::Mode sampled_mode = na::fold::Mode::Off;
     ID3D12Resource* sampled_motion = nullptr;
-    if (!physical && frame.scaled_reader.target && frame.screen_proof && !s.companion &&
-        level && level == s.optimal_level && s.optimal.valid && cw == s.optimal_w && ch == s.optimal_h) {
-        // A candidate can remain unqualified indefinitely. Creating a smaller NGX feature
-        // while the larger preset-M feature is still displayed corrupts its history.
-        // Prepare only D3D11 surfaces here. Evaluate creates the NGX feature in queue
-        // order on the first frame that actually supplies the smaller image.
-        native11::PrepareWorldRaster(context, frame, level, s.optimal.render_w, s.optimal.render_h);
+    if (!physical && level && level <= 3) {
+        // The world drawn small is the first choice for every level; the Fold shows meanwhile and whenever it
+        // cannot be had. Each reason for not asking is told, so the log and the menu can say WHY.
+        if (s.companion) native11::NoteWorldHold(native11::WorldHold::HelperProgram);
+        else if (!frame.scaled_reader.target || !frame.screen_proof) native11::NoteWorldHold(native11::WorldHold::Reader);
+        else if (level != s.optimal_level || !s.optimal.valid || cw != s.optimal_w || ch != s.optimal_h)
+            native11::NoteWorldHold(native11::WorldHold::NoRenderSize);
+        else {
+            // A candidate can remain unqualified indefinitely. Creating a smaller NGX feature
+            // while the larger preset-M feature is still displayed corrupts its history.
+            // Prepare only D3D11 surfaces here. Evaluate creates the NGX feature in queue
+            // order on the first frame that actually supplies the smaller image.
+            native11::PrepareWorldRaster(context, frame, level, s.optimal.render_w, s.optimal.render_h);
+        }
     }
     const na::fold::Mode fold_setting = (physical || !j2::Enabled() || j2::Paused()) ? na::fold::Mode::Off
                                         : na::fold::ModeFrom(settings::Get().j2_fold_mode.load(std::memory_order_relaxed));

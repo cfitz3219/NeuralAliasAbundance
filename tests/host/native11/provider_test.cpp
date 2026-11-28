@@ -44,6 +44,7 @@
 #include "core/live_frame_gen.hpp"
 #include "host_dx12/settings.hpp"
 #include "core/fold_shading.hpp"
+#include "core/referee_world_check.hpp"
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/diag/release_trace.hpp"
 #include "host_dx12/native11/samplers.hpp"
@@ -119,7 +120,6 @@ float4 ps_map(float4 p : SV_Position) : SV_Target {
 }
 Texture2D<float4> native_lighting : register(t5);
 float4 ps_world_lighting(float4 p : SV_Position) : SV_Target { return native_lighting.Load(int3(p.xy,0)); }
-float4 ps_world_position(float4 p : SV_Position) : SV_Target { return float4(p.x/1280., p.y/720., .25, 1); }
 float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_letterbox(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(0,2), 0)); }
@@ -144,6 +144,33 @@ float4 ps_scaled_scene(LitVertex v) : SV_Target {
     uint w, h;
     scaled_scene.GetDimensions(w, h);
     return scaled_scene.Load(int3(uint2(v.surface * float2(w, h)), 0));
+}
+// The world fixture's scene. Its colour is the place on the screen (0..1), so the right picture is the
+// same at every size the world is drawn in.
+LitVertex vs_world_uv(uint id : SV_VertexID) {
+    LitVertex v;
+    v.p = vs(id);
+    v.surface = float2(v.p.x + 1, 1 - v.p.y) * 0.5;
+    return v;
+}
+LitVertex vs_lightmap(uint id : SV_VertexID) {
+    LitVertex v;
+    v.p = vs_post(id);
+    v.surface = float2(v.p.x + 1, 1 - v.p.y) * 0.5;
+    return v;
+}
+float4 ps_world_uv(LitVertex v) : SV_Target { return float4(v.surface, .25, 1); }
+// Reads a full-size picture of the frame at 0..1 of its own size; its pixel position is used for a faint
+// dither only. Given the corner copy it reads the wrong place.
+float4 ps_world_surface_read(LitVertex v) : SV_Target {
+    uint w, h;
+    native_lighting.GetDimensions(w, h);
+    float4 c = native_lighting.Load(int3(uint2(v.surface * float2(w, h)), 0));
+    return float4(c.rgb + frac(v.p.x * .5) * .004, 1);
+}
+// Shades by the number of the pixel: wrong at any smaller size, whatever picture it is given.
+float4 ps_world_pixel_number(float4 p : SV_Position) : SV_Target {
+    return float4(p.x/1280., p.y/720., .25, 1) + .02 * native_lighting.Load(int3(p.xy,0));
 }
 LitVertex vs_reflection(uint id : SV_VertexID) {
     LitVertex v;
@@ -1323,8 +1350,12 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_wo
             staging.Format = DXGI_FORMAT_R24G8_TYPELESS; staging.BindFlags = 0; staging.Usage = D3D11_USAGE_STAGING; staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             if (FAILED(game.device->CreateTexture2D(&staging,nullptr,&stencil_snapshot))) return 1;
         }
-        auto ps_world = Compile("ps_world_position", "ps_5_0");
-        if (!ps_world || FAILED(game.device->CreatePixelShader(ps_world->GetBufferPointer(), ps_world->GetBufferSize(), nullptr, &game.ps_scene_main))) return 1;
+        auto ps_world = Compile("ps_world_uv", "ps_5_0");
+        auto vs_world = Compile("vs_world_uv", "vs_5_0");
+        game.vs.Reset();
+        if (!ps_world || !vs_world ||
+            FAILED(game.device->CreatePixelShader(ps_world->GetBufferPointer(), ps_world->GetBufferSize(), nullptr, &game.ps_scene_main)) ||
+            FAILED(game.device->CreateVertexShader(vs_world->GetBufferPointer(), vs_world->GetBufferSize(), nullptr, &game.vs))) return 1;
     }
     // Some native renderers switch context state between every pair of scenes.
     // Changing bindings must keep the already prepared surfaces for these objects.
@@ -1429,8 +1460,7 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_wo
                     return red;
                 };
                 if (live_world) {
-                    const auto level = consumer.last_level;
-                    const int expected = int(255.f * (consumer.width[level] / 2.f) / 1280.f);
+                    const int expected = 127; // the middle of the screen, at every size the world is drawn in
                     displayed = read_red(2) == 255 && read_red(1) < 100 && read_red(3) < 100 &&
                         std::abs(read_red(game.w/2, game.h/2) - expected) < 18;
                     if (check_native_strip) {
@@ -1474,19 +1504,34 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_wo
     if (live_world) {
         unsigned dimensions[4]{};
         uint64_t invocations[4]{};
+        // A frame counts as a smaller picture only when the world's draws really went to the small pictures
+        // (the Referee's comparison frames are drawn at full size and made small afterwards).
+        unsigned wrong_small = 0;
+        bool measure = true; // the level loop's frames give the shading counts (later segments add our own input copies)
+        const auto small_pictures = [&](unsigned level, unsigned frames, unsigned want, ID3D11ShaderResourceView* input = nullptr) {
+            unsigned pictures = 0;
+            for (unsigned i = 0; i < frames && pictures < want; ++i) {
+                if (input) game.ctx->PSSetShaderResources(5, 1, &input);
+                const auto delivered = consumer.count[level];
+                const bool pixels_ok = frame(true);
+                if (consumer.count[level] == delivered || (level && na::native11::WorldRoute().small_draws != 40)) continue;
+                if (pixels_ok) { ++pictures; if (measure) invocations[level] = scene_pixels; }
+                else ++wrong_small;
+            }
+            return pictures;
+        };
         for (unsigned level : {1u,3u,2u,1u,0u}) {
             na::settings::Get().j2_fold_mode.store(level);
             const auto before = consumer.count[level];
-            unsigned pictures = 0;
-            for (unsigned i = 0; i < 180 && pictures < 4; ++i) {
-                const auto delivered = consumer.count[level];
-                const bool pixels_ok = frame(true);
-                if (consumer.count[level] > delivered && pixels_ok) { ++pictures; invocations[level] = scene_pixels; }
-            }
-            std::printf("world path level=%u delivered=%u images=%u input=%ux%u output=%ux%u\n",
-                level, consumer.count[level]-before, pictures, consumer.width[level], consumer.height[level], game.w, game.h);
+            const unsigned pictures = small_pictures(level, 180, 4);
+            const auto route = na::native11::WorldRoute();
+            std::printf("world path level=%u delivered=%u images=%u input=%ux%u output=%ux%u small_frames=%llu comparison_frames=%llu looks=%u\n",
+                level, consumer.count[level]-before, pictures, consumer.width[level], consumer.height[level], game.w, game.h,
+                (unsigned long long)route.small_frames, (unsigned long long)route.reference_frames, route.looks);
             std::printf("world pixel shader invocations level=%u count=%llu\n", level, (unsigned long long)invocations[level]);
             dimensions[level] = consumer.width[level];
+            if (level) expect(route.state == na::native11::WorldRouteStatus::State::Small && route.looks >= 1,
+                              "the Referee looked at the smaller picture before it stayed");
             if (level == 3 && pictures == 4) {
                 game.referee_test_query = false; // same query, now visible as the game's own query
                 const auto old = consumer.count[level];
@@ -1496,10 +1541,12 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_wo
             }
             expect(pictures == 4, "four current DLSS deliveries preserve world coordinates and the one-pixel HUD");
         }
+        expect(!wrong_small, "no smaller picture of the plain world came out wrong");
+        measure = false;
         expect(dimensions[0] == game.w && dimensions[0] > dimensions[1] && dimensions[1] > dimensions[3] &&
             dimensions[3] > dimensions[2], "native, Quality, Balanced and Performance have four actual raster resolutions");
-        // Balanced has no coarse mode. A game-owned query keeps the physically
-        // smaller image unavailable while full-size DLAA is still evaluated.
+        // A game-owned query keeps the physically smaller picture unavailable: the world stays at full
+        // size (the other route carries the level), free of coloured bands, and the reason is on record.
         game.referee_test_query = false;
         check_native_strip = true;
         na::settings::Get().j2_fold_mode.store(3);
@@ -1512,32 +1559,119 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_wo
         }
         std::printf("held Balanced: clean full-size images=%u/40\n", clean_frames);
         expect(consumer.count[3] == old_balanced && clean_frames >= 38,
-               "a held smaller level keeps full-size DLAA free of colored bands");
+               "a held smaller level keeps the full-size picture free of colored bands");
+        {
+            const auto route = na::native11::WorldRoute();
+            std::printf("held Balanced: why=%s\n", na::native11::WorldHoldText(route.why));
+            expect(route.state != na::native11::WorldRouteStatus::State::Small && route.why == na::native11::WorldHold::Interleaved,
+                   "the held level names its reason");
+        }
         check_native_strip = false;
         game.referee_test_query = true;
-        // An unrelated pass begins supplying a full-resolution image indexed by pixel position.
-        // Referee must preserve that coordinate system, then retry when the dependency disappears.
-        auto light_code = Compile("ps_world_lighting","ps_5_0");
-        ComPtr<ID3D11PixelShader> lit;
+
+        // World draws that read a full-size picture of the frame (water, soft edges, screen-space shading).
+        D3D11_TEXTURE2D_DESC map_desc{};
+        game.color->GetDesc(&map_desc);
+        map_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        map_desc.MipLevels = 1;
+        map_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> lightmap;
+        ComPtr<ID3D11RenderTargetView> lightmap_rtv;
         ComPtr<ID3D11ShaderResourceView> light;
-        if (!light_code || FAILED(game.device->CreatePixelShader(light_code->GetBufferPointer(),light_code->GetBufferSize(),nullptr,&lit)) ||
-            FAILED(game.device->CreateShaderResourceView(decoy.Get(),nullptr,&light))) return 1;
-        na::settings::Get().j2_fold_mode.store(1);
-        unsigned quality_before = consumer.count[1];
-        for (unsigned i = 0; i < 180 && consumer.count[1] == quality_before; ++i) frame(true);
-        expect(consumer.count[1] > quality_before, "Quality re-enters before testing a new world input");
-        std::swap(game.ps_scene_main,lit);
-        quality_before = consumer.count[1];
-        for (unsigned i=0; i<6; ++i) {
-            game.ctx->PSSetShaderResources(5,1,light.GetAddressOf());
-            frame(true);
+        ComPtr<ID3D11VertexShader> vs_map;
+        ComPtr<ID3D11PixelShader> ps_map, by_position, by_surface, by_pixel_number;
+        const auto make_ps = [&](const char* entry, ComPtr<ID3D11PixelShader>& out) {
+            const auto code = Compile(entry, "ps_5_0");
+            return code && SUCCEEDED(game.device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &out));
+        };
+        const auto vs_map_code = Compile("vs_lightmap", "vs_5_0");
+        if (!vs_map_code || FAILED(game.device->CreateVertexShader(vs_map_code->GetBufferPointer(), vs_map_code->GetBufferSize(), nullptr, &vs_map)) ||
+            !make_ps("ps_world_uv", ps_map) || !make_ps("ps_world_lighting", by_position) ||
+            !make_ps("ps_world_surface_read", by_surface) || !make_ps("ps_world_pixel_number", by_pixel_number) ||
+            FAILED(game.device->CreateTexture2D(&map_desc, nullptr, &lightmap)) ||
+            FAILED(game.device->CreateRenderTargetView(lightmap.Get(), nullptr, &lightmap_rtv)) ||
+            FAILED(game.device->CreateShaderResourceView(lightmap.Get(), nullptr, &light))) return 1;
+        {
+            // The full-size picture those draws read: the place on the screen, like the world itself.
+            auto* ctx = game.ctx.Get();
+            ctx->OMSetRenderTargets(1, lightmap_rtv.GetAddressOf(), nullptr);
+            Viewport(ctx, game.w, game.h);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ctx->VSSetShader(vs_map.Get(), nullptr, 0);
+            ctx->PSSetShader(ps_map.Get(), nullptr, 0);
+            ctx->Draw(4, 0);
+            ID3D11RenderTargetView* none = nullptr;
+            ctx->OMSetRenderTargets(1, &none, nullptr);
         }
-        expect(consumer.count[1] == quality_before, "native-pixel lighting selects the native coordinate route");
-        std::swap(game.ps_scene_main,lit);
+        using RouteState = na::native11::WorldRouteStatus::State;
+        na::settings::Get().j2_fold_mode.store(1);
+        wrong_small = 0;
+        expect(small_pictures(1, 180, 4) == 4, "Quality re-enters before a new kind of world draw appears");
+
+        // 1. Read by pixel position: the draw is given the picture made small in the corner of a full-size copy.
+        auto before_route = na::native11::WorldRoute();
+        std::swap(game.ps_scene_main, by_position);
+        unsigned right = 0;
+        for (unsigned i = 0; i < 240 && (right < 4 || na::native11::WorldRoute().looks == before_route.looks ||
+                                          na::native11::WorldRoute().state != RouteState::Small); ++i)
+            right += small_pictures(1, 1, 1, light.Get());
+        auto route = na::native11::WorldRoute();
+        std::printf("read by pixel position: right=%u wrong=%u inputs=%s corner_fills=%llu looks=%u\n", right, wrong_small, route.inputs,
+            (unsigned long long)(route.corner_fills - before_route.corner_fills), route.looks - before_route.looks);
+        expect(right >= 4 && !wrong_small && route.state == RouteState::Small && route.looks > before_route.looks &&
+               route.corner_fills > before_route.corner_fills && !std::strcmp(route.inputs, "by-shader"),
+               "a world draw that reads a full-size picture by pixel position stays small and right, and the Referee looked at it");
+        std::swap(game.ps_scene_main, by_position);
+
+        // 2. Read at 0..1 by a shader that also uses its pixel position: the first way gives it the wrong
+        // picture, the Referee sees that and changes the way.
+        before_route = route;
+        wrong_small = 0;
+        std::swap(game.ps_scene_main, by_surface);
+        right = 0;
+        for (unsigned i = 0; i < 360 && (right < 4 || std::strcmp(na::native11::WorldRoute().inputs, "as-drawn") ||
+                                          na::native11::WorldRoute().state != RouteState::Small); ++i) {
+            if (std::strcmp(na::native11::WorldRoute().inputs, "as-drawn")) right = 0; // only pictures drawn the new way count
+            right += small_pictures(1, 1, 1, light.Get());
+        }
+        route = na::native11::WorldRoute();
+        std::printf("read at 0..1: right=%u wrong_shown=%u inputs=%s looks=%u\n", right, wrong_small, route.inputs, route.looks - before_route.looks);
+        expect(right >= 4 && route.state == RouteState::Small && !std::strcmp(route.inputs, "as-drawn"),
+               "the Referee saw the wrong picture, changed how the draw is given its input, and the smaller picture is right");
+        expect(wrong_small >= 1 && wrong_small <= 8, "the wrong picture was really drawn, and only for the Referee's few looks");
+        std::swap(game.ps_scene_main, by_surface);
+
+        // 3. Shaded by the number of the pixel: wrong whatever it is given. The world keeps its full size.
+        before_route = route;
+        wrong_small = 0;
+        std::swap(game.ps_scene_main, by_pixel_number);
+        for (unsigned i = 0; i < 480 && !(na::native11::WorldRoute().state == RouteState::Held &&
+                                          na::native11::WorldRoute().why == na::native11::WorldHold::PictureCheck); ++i)
+            small_pictures(1, 1, 1, light.Get());
+        route = na::native11::WorldRoute();
+        std::printf("shaded by pixel number: wrong_shown=%u looks=%u state=%d why=%s\n", wrong_small, route.looks - before_route.looks,
+            int(route.state), na::native11::WorldHoldText(route.why));
+        expect(route.state == RouteState::Held && route.why == na::native11::WorldHold::PictureCheck,
+               "a world that comes out wrong every way is kept at full size, with the reason named");
+        expect(wrong_small <= 3 * (na::referee::WorldCheck::kStrikes + 1) + 1, "the wrong picture was shown only for the Referee's few looks");
+        unsigned full_right = 0;
+        const auto small_before = route.small_frames;
+        for (unsigned i = 0; i < 20; ++i) {
+            game.ctx->PSSetShaderResources(5, 1, light.GetAddressOf());
+            const unsigned before = consumer.count[0];
+            const bool pixels_ok = frame(true);
+            if (consumer.count[0] > before && pixels_ok) ++full_right;
+        }
+        std::printf("kept at full size: right full-size images=%u/20\n", full_right);
+        expect(full_right >= 16 && na::native11::WorldRoute().small_frames == small_before,
+               "after the verdict every frame is the full-size picture, and it is right");
+        std::swap(game.ps_scene_main, by_pixel_number);
         ID3D11ShaderResourceView* unbound = nullptr;
-        game.ctx->PSSetShaderResources(5,1,&unbound);
-        for (unsigned i=0; i<100 && consumer.count[1] == quality_before; ++i) frame(true);
-        expect(consumer.count[1] > quality_before, "Referee reacquires physical Quality without another menu change");
+        game.ctx->PSSetShaderResources(5, 1, &unbound);
+        // That kind of draw is gone and the player picks another level: looked at afresh.
+        na::settings::Get().j2_fold_mode.store(2);
+        wrong_small = 0;
+        expect(small_pictures(2, 240, 4) == 4 && !wrong_small, "with that draw gone, another level brings the smaller picture back");
         for (unsigned level : {1u, 2u, 3u}) {
             const double grid = double(dimensions[level])*consumer.height[level] / (game.w*game.h);
             expect(invocations[0] && std::abs(double(invocations[level])/invocations[0] - grid) < .04,

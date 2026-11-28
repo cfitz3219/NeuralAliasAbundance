@@ -178,6 +178,44 @@ void SetParitySignal(ParitySignal seen);
 // The hosted path receives DXGI events through the overlay's existing hooks.
 void SetScreenCheck(bool on, uint32_t scale_level = 0);
 bool PrepareWorldRaster(void* context, const SceneFrame& frame, uint32_t level, uint32_t width, uint32_t height);
+// ---- The world drawn small: where it stands, and WHY it is not small when it is not ----------------
+// Why a world draw (or the whole world) kept its full size. One reason is named in the log, in RESULTS and
+// on the menu whenever the smaller picture is not being delivered.
+enum class WorldHold : uint8_t {
+    None,
+    Preparing,      // the smaller pictures are being made, or the draws are still being counted
+    HelperProgram,  // DLSS runs in the separate helper program for this game
+    NoRenderSize,   // DLSS gave no render size for this level
+    Reader,         // the draw that puts the 3D picture on screen is not proven yet
+    OnScreen,       // the 3D picture is drawn straight onto the screen
+    OtherSize,      // the 3D picture is not the size of the screen
+    PictureKind,    // multisampled, an array, a mip, part of a larger picture, or a depth format without a copy
+    NoWorldDraws,   // no draw into the 3D picture was seen on the game's main thread
+    RecordedLists,  // the world is drawn through recorded command lists
+    SeveralTargets, // world draws write several pictures at once
+    Viewports,      // several viewports at once
+    Uavs,           // world draws write through unordered-access views
+    Predicated,     // world draws are predicated
+    FullSizeInput,  // a world draw reads a full-size picture that cannot be made small
+    Interleaved,    // too many draws that must stay full size sit between the world's draws
+    PictureCheck,   // the Referee saw a wrong picture with every way of drawing it small
+    Evaluator,      // DLSS refused the smaller picture three times
+    kCount
+};
+const char* WorldHoldText(WorldHold why);
+struct WorldRouteStatus {
+    enum class State : uint8_t { Off, Preparing, Checking, Small, Held } state = State::Off;
+    WorldHold why = WorldHold::None;
+    uint32_t level = 0;                   // the level the world is being drawn small for
+    uint64_t small_frames = 0, reference_frames = 0, held_frames = 0;
+    uint32_t small_draws = 0, held_draws = 0, breaks = 0; // the last frame
+    uint32_t looks = 0;                   // Referee looks finished
+    const char* inputs = "";              // how draws that read a full-size picture are served
+    uint64_t corner_fills = 0;
+};
+WorldRouteStatus WorldRoute();
+// The caller's own reason for not asking (PrepareWorldRaster was not called this frame).
+void NoteWorldHold(WorldHold why);
 void RejectScreenProof(uint64_t proof);
 // The native provider closes the frame on the same hook that samples it.
 struct PresentReceipt {

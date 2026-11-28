@@ -1,5 +1,5 @@
 #pragma once
-// Fold the shading (Cort 2026-11-25, live test): the game keeps drawing at full size, but its scene
+// Fold the shading (Cort 2026-11-25): the game keeps drawing at full size, but its scene
 // draws are shaded once per block of pixels (Direct3D coarse shading: 2x1 blocks = half the shading,
 // 2x2 = a quarter). One pixel of every block is then kept, which gives DLSS a smaller picture, and
 // DLSS rebuilds the full-size one. The game is never told and its HUD is never touched.
@@ -11,7 +11,12 @@
 namespace na::fold {
 enum class Mode : uint8_t { Off = 0, Quality = 1, Performance = 2 };
 constexpr uint32_t kModes = 3;
-constexpr Mode ModeFrom(uint32_t v) { return v == 1 ? Mode::Quality : v == 2 ? Mode::Performance : Mode::Off; }
+// The level setting (settings.hpp j2_fold_mode): 0 DLAA, 1 Quality, 2 Performance, 3 Balanced. The Fold has no
+// Balanced (its blocks are two pixels or four). Balanced is only truly had when the game's 3D picture is drawn
+// small; asked for while that cannot be done, the Fold shows Quality, the nearest level that keeps more detail,
+// and never DLAA: a level never falls to full size by itself.
+constexpr uint32_t kLevelBalanced = 3;
+constexpr Mode ModeFrom(uint32_t v) { return v == 1 || v == kLevelBalanced ? Mode::Quality : v == 2 ? Mode::Performance : Mode::Off; }
 constexpr const char* Name(Mode m) { return m == Mode::Quality ? "Quality" : m == Mode::Performance ? "Performance" : "DLAA"; }
 
 struct Block { uint32_t x = 1, y = 1; };

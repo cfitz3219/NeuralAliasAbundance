@@ -44,6 +44,7 @@
 #include "host_dx12/j2/hud_unblend.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/native_d3d11/live_dlaa.hpp"
+#include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/on12/d3d11_on12.hpp"
 #include "host_dx12/j2/j2_flow.hpp"
 #include "host_dx12/effects/xegtao.hpp"
@@ -957,25 +958,52 @@ void DrawLiveDlaa()
     }
     EndRow();
     {
-        // Fold the shading, live test (Cort 2026-11-25; core/fold_shading.hpp). One control on both routes
-        // (DX12, native DX11); DLAA stays on screen until the chosen level has proven itself. Not saved:
-        // every launch starts on DLAA.
-        static const char* kFoldLevels[] = {"DLAA (full size)", "Quality (test)", "Performance (test)"};
+        // DLSS level, one control on both routes. First choice on every level: the game's own 3D picture drawn
+        // small (native DX11 route; the true Quality / Balanced / Performance render sizes), which the Referee
+        // watches. When that cannot be had, the Fold (shading in blocks, core/fold_shading.hpp) carries Quality
+        // and Performance, and Balanced stays in the list but cannot be chosen (Cort 2026-11-28). DLAA stays on
+        // screen until a chosen level has proven itself. Not saved: every launch starts on DLAA.
+        static const char* kLevels[] = {"DLAA (full size)", "Quality", "Balanced", "Performance"};
+        constexpr uint32_t storage[]{0, 1, 3, 2}; // the setting's values in the list's order (Balanced was added last)
         na::settings::Settings& fs = na::settings::Get();
         const bool native = na::on12::NativeRoute();
-        static const char* native_levels[]{"DLAA (full size)", "Quality (test)", "Balanced (test)", "Performance (test)"};
-        constexpr uint32_t storage[]{0, 1, 3, 2};
         const uint32_t saved = fs.j2_fold_mode.load();
-        int level = native ? (saved == 2 ? 3 : saved == 3 ? 2 : int((std::min)(saved, 1u))) : int((std::min)(saved, 2u));
-        BeginRow("DLSS level (test)", native ? "Referee looks for the world and its visible reader. On a qualified scene, DLSS rebuilds the smaller world before the game draws its interface. Quality and Performance can also use coarse shading." : "DLAA rebuilds the picture at full size. Quality and Performance make the game shade its 3D picture in small blocks (two pixels, or four) and let DLSS rebuild the full picture from one pixel of each block. The game's own settings and its HUD are not touched. DLAA stays on screen until the new level is truly ready, so there is no frozen picture. This is a test: every launch starts on DLAA.", S(220));
+        const int level = saved == 2 ? 3 : saved == 3 ? 2 : int((std::min)(saved, 1u));
+        using WorldState = na::native11::WorldRouteStatus::State;
+        const na::native11::WorldRouteStatus world = native ? na::native11::WorldRoute() : na::native11::WorldRouteStatus{};
+        const bool balanced_offered = native && world.state != WorldState::Held;
+        BeginRow("DLSS level", "DLAA rebuilds the picture at full size. Quality, Balanced and Performance make the game draw its 3D picture smaller (67%, 58%, 50% of each side) and let DLSS rebuild it to full size; the game's own settings and its HUD are not touched. Where a game cannot draw its 3D picture small, Quality and Performance shade it in small blocks instead (the Fold) and Balanced cannot be chosen. DLAA stays on screen until the new level is truly ready, so there is no frozen picture.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2fold", &level, native ? native_levels : kFoldLevels, native ? 4 : 3))
-            fs.j2_fold_mode.store(native ? storage[level] : static_cast<uint32_t>(level));
+        if (ImGui::BeginCombo("##j2fold", kLevels[level])) {
+            for (int i = 0; i < 4; ++i) {
+                const bool unavailable = i == 2 && !balanced_offered;
+                if (ImGui::Selectable(kLevels[i], i == level, unavailable ? ImGuiSelectableFlags_Disabled : 0) && !unavailable)
+                    fs.j2_fold_mode.store(storage[i]);
+            }
+            ImGui::EndCombo();
+        }
         EndRow();
         char fold_status[320]{};
-        if (na::on12::NativeRoute()) na::native_d3d11::FoldStatus(fold_status, sizeof fold_status);
+        if (native) na::native_d3d11::FoldStatus(fold_status, sizeof fold_status);
         else na::j2::FoldStatus(fold_status, sizeof fold_status);
         if (level != 0 || std::strstr(fold_status, "DLAA (full size)") == nullptr) Hint(fold_status);
+        // Which method carries the level, and WHY when it is not the smaller picture.
+        char method[420]{};
+        if (!native)
+            Hint("Balanced needs the game's 3D picture drawn small, which NeuralAlias can do on DirectX 11 games only so far. Here Quality and Performance use the Fold.");
+        else if (level != 0 && world.state == WorldState::Held) {
+            std::snprintf(method, sizeof method, "The Fold carries this level: %s.%s", na::native11::WorldHoldText(world.why),
+                          saved == 3 ? " Balanced needs the smaller picture, so Quality is shown instead." : " Balanced needs the smaller picture, so it cannot be chosen.");
+            Hint(method);
+        } else if (level != 0 && world.state == WorldState::Preparing) {
+            std::snprintf(method, sizeof method, "The Referee is finding out whether this game can draw its 3D picture small (%s). The Fold shows meanwhile%s.",
+                          world.why == na::native11::WorldHold::None ? "counting its draws" : na::native11::WorldHoldText(world.why),
+                          saved == 3 ? ", as Quality" : "");
+            Hint(method);
+        } else if (level != 0 && world.state == WorldState::Checking)
+            Hint("The game is drawing its 3D picture small. The Referee is comparing it with the full-size picture.");
+        else if (level != 0 && world.state == WorldState::Small)
+            Hint("The game is drawing its 3D picture small and the Referee has checked it against the full-size picture.");
     }
     char native_status[200]{};
     const bool recording_ready = na::on12::NativeRoute() ? na::native_d3d11::FormatMenuStatus(native_status, sizeof native_status) : st.active;
