@@ -3890,7 +3890,7 @@ struct Native11Present {
         na::native_d3d11::SyncCameraUse(); // [j2] camera, live: before this present closes the frame
         na::native11::SetScreenCheck(na::j2::Enabled() && !na::j2::Paused() &&
             na::settings::Get().referee_enabled.load(std::memory_order_relaxed),
-            na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed) != 0);
+            na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
         observed = na::native11::ObservePresent(sc, &receipt);
         if (!observed) return;
         std::lock_guard<std::mutex> lock(g_state.mutex);

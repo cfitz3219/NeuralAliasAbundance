@@ -129,6 +129,13 @@ public:
     bool Matches(Reader reader) const { return reader == verified_; }
     uint64_t Proof() const { return adaptive_ ? frame_proof_ : verified_ ? proof_ : 0; }
 
+    bool KnowsProof(uint64_t proof) const
+    {
+        if (!proof) return false;
+        if (!adaptive_) return verified_ && proof_ == proof;
+        return std::any_of(routes_.begin(), routes_.end(), [proof](const Route& r) { return r.proof == proof; });
+    }
+
     bool ReservesPixelRead() const { return adaptive_ && steering_; }
 
     bool Select(Reader reader, bool available)

@@ -116,6 +116,10 @@ struct SceneFrame {
     uint64_t scene_stream = 0;
     uint64_t screen_proof = 0;     // current verified reader, or zero for ordinary placement
     ScaledReaderFacts scaled_reader{};
+    // Physical world inputs and a separate, native-size destination. The original picture already
+    // contains the spatial fallback if the evaluator declines this frame.
+    TextureFacts native_output{};
+    uint32_t world_level = 0, world_draws = 0;
     uint64_t trial_ticket = 0;     // valid only in a measured, post-warmup trial window
     referee::RecoveryTool recovery_tool{};
     uint64_t recovery_configuration = 0;
@@ -172,7 +176,8 @@ bool Install(void* device, SceneCallback cb, void* user, bool host_owns_present 
 using ParitySignal = bool (*)(const void* swapchain, const referee::PlacementScope& scope);
 void SetParitySignal(ParitySignal seen);
 // The hosted path receives DXGI events through the overlay's existing hooks.
-void SetScreenCheck(bool on, bool discover_scale = false);
+void SetScreenCheck(bool on, uint32_t scale_level = 0);
+bool PrepareWorldRaster(void* context, const SceneFrame& frame, uint32_t level, uint32_t width, uint32_t height, bool feature_ready);
 void RejectScreenProof(uint64_t proof);
 // The native provider closes the frame on the same hook that samples it.
 struct PresentReceipt {

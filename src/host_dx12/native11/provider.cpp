@@ -38,6 +38,8 @@
 #include "host_dx12/native11/depth_reads.hpp"
 #include "host_dx12/native11/frame_model.hpp"
 #include "host_dx12/native11/screen_check.hpp"
+#include "host_dx12/native11/world_raster.hpp"
+#include "host_dx12/background/work.hpp"
 #include "host_dx12/native11/lit_scene.hpp"
 #include "host_dx12/native11/split_camera.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
@@ -80,6 +82,7 @@ enum CtxSlot : uint32_t {
     kClearRenderTargetView = 50, kClearDepthStencilView = 53, kResolveSubresource = 57, kExecuteCommandList = 58, kCSSetShaderResources = 67,
     kClearState = 110, kFinishCommandList = 114,
     // ID3D11DeviceContext1
+    kCopyRegion1 = 115, kDiscardResource = 117, kDiscardView = 118, kSwapContextState = 131, kClearView = 132, kDiscardView1 = 133,
     kUpdateSubresource1 = 116, kVSSetConstantBuffers1 = 119, kPSSetConstantBuffers1 = 123,
 };
 enum SwapSlot : uint32_t { kPresent = 8, kResizeBuffers = 13, kPresent1 = 22 };
@@ -245,6 +248,34 @@ struct DepthReads {
 // The view the scene used on a selected texture (typed format, subresource).
 struct ViewUse { uint32_t format = 0, mip = 0, slice = 0; bool texture2d = false; };
 struct Ctx {
+    struct WorldJob {
+        WorldRaster raster;
+        Id color = 0, depth = 0;
+        uint64_t proof = 0;
+        UINT level = 0, width = 0, height = 0;
+        DXGI_FORMAT color_format{}, depth_format{};
+        std::atomic<bool> ready{false};
+        std::atomic<bool> refused{false}, proof_current{true};
+        bool feature_ready = false;
+        uint64_t last_receipt = 0;
+        unsigned missed_evaluations = 0;
+        uint64_t retry_after = 0;
+    };
+    std::shared_ptr<WorldJob> world;
+    bool world_dirty = false;
+    uint64_t world_closed_frame = ~uint64_t{0};
+    std::optional<bool> world_uavs;
+    // A full-resolution input sampled by a world pixel shader may use integer screen
+    // coordinates. The coarse-shading route preserves that coordinate system.
+    std::optional<bool> world_pixel_dependency;
+    bool world_stencil_written = false, stencil_writes = false;
+    bool pristine_color = false, pristine_depth = false;
+    FLOAT clear_rgba[4]{}, clear_z = 1;
+    UINT clear_flags = 0; UINT8 clear_s = 0;
+    uint64_t world_color_clear = ~uint64_t{0}, world_depth_clear = ~uint64_t{0};
+    uint64_t world_frame = ~uint64_t{0};
+    uint64_t world_draw_frame = ~uint64_t{0};
+    uint32_t world_draws = 0;
     bool game = false; // a context of the game's device
     uint32_t gen = 0;  // the game-device generation that answer was given in
     uint64_t sampler_policy = ~uint64_t{0};
@@ -332,6 +363,8 @@ struct Ctx {
         screen_slots.reset();
         post = {};
         rt0 = depth = 0;
+        world_pixel_dependency.reset();
+        stencil_writes = false;
         rt_view = ds_view = {};
         rt_count = 0;
         raster_depth_layer = {};
@@ -389,6 +422,7 @@ std::atomic<Id> g_lit_peer{0};
 uint64_t g_last_lit_generation = 0;
 std::atomic<bool> g_screen_enabled{false};
 std::atomic<bool> g_discover_scale{false};
+std::atomic<uint32_t> g_world_level{0};
 bool g_was_discovering_scale = false;
 std::atomic<bool> g_adaptive_scene{false}; // skip writer tagging on stable frames
 std::unordered_map<ID3D11DeviceContext*, std::unique_ptr<Ctx>> g_ctx;
@@ -646,6 +680,27 @@ struct Inside {
     ~Inside() { t_inside = was; }
 };
 
+// The game sees its own full-size views whenever control returns to it. Materialize
+// deferred pixel writes before a consumer or a game write can observe those views.
+void FinishWorld(ID3D11DeviceContext* c, Ctx* x)
+{
+    if (!x || !x->world_dirty) return;
+    Inside own;
+    x->world->raster.Restore(c, x->world_stencil_written);
+    x->world_stencil_written = false;
+    x->world_dirty = false;
+}
+void TouchWorld(ID3D11DeviceContext* c, Ctx* x, Id id, bool write)
+{
+    if (!x || !x->world || (id != x->world->color && id != x->world->depth)) return;
+    FinishWorld(c, x);
+    if (write) {
+        x->world_frame = ~uint64_t{0};
+        if (id == x->world->color) x->pristine_color = false;
+        else x->pristine_depth = false;
+    }
+}
+
 void SetReason(const char* r)
 {
     std::snprintf(g_reason, sizeof g_reason, "%s", r);
@@ -733,6 +788,10 @@ Ctx* Get(ID3D11DeviceContext* c)
             if (is && !was) g_ctx_became_game.fetch_add(1, std::memory_order_relaxed);
             // What was remembered belongs to the other device's objects.
             slot->reset_state();
+            slot->world.reset();
+            slot->world_dirty = false;
+            slot->world_uavs.reset();
+            slot->world_frame = slot->world_color_clear = slot->world_depth_clear = ~uint64_t{0};
             slot->depth_reads = {};
             slot->raster_queries = 0;
             slot->events.clear();
@@ -811,6 +870,12 @@ struct Originals {
     PFN_CopyResource copy_resource = nullptr;
     PFN_UpdateSub update = nullptr;
     PFN_UpdateSub1 update1 = nullptr;
+    void (STDMETHODCALLTYPE *copy1)(ID3D11DeviceContext1*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT, const D3D11_BOX*, UINT) = nullptr;
+    void (STDMETHODCALLTYPE *discard_resource)(ID3D11DeviceContext1*, ID3D11Resource*) = nullptr;
+    void (STDMETHODCALLTYPE *discard_view)(ID3D11DeviceContext1*, ID3D11View*) = nullptr;
+    void (STDMETHODCALLTYPE *discard_view1)(ID3D11DeviceContext1*, ID3D11View*, const D3D11_RECT*, UINT) = nullptr;
+    void (STDMETHODCALLTYPE *clear_view)(ID3D11DeviceContext1*, ID3D11View*, const FLOAT*, const D3D11_RECT*, UINT) = nullptr;
+    void (STDMETHODCALLTYPE *swap_state)(ID3D11DeviceContext1*, ID3DDeviceContextState*, ID3DDeviceContextState**) = nullptr;
     PFN_ClearDSV clear_dsv = nullptr;
     PFN_Resolve resolve = nullptr;
     PFN_Execute execute = nullptr;
@@ -1697,6 +1762,39 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
     }
     f.stream = g_stream;
     g_last_selection = cam_sel;
+    std::shared_ptr<Ctx::WorldJob> world;
+    auto world_ctx = g_ctx.find(immediate);
+    if (!lit_color && world_ctx != g_ctx.end()) {
+        auto* x = world_ctx->second.get();
+        FinishWorld(immediate, x);
+        x->world_closed_frame = g_frame;
+        world = x->world;
+        if (world && world->proof == f.screen_proof && world->color == f.color.resource && world->depth == f.depth.resource)
+            world->last_receipt = g_frame;
+        if (world && x->world_frame == g_frame && world->proof == f.screen_proof &&
+            world->level == g_world_level.load() && world->color == f.color.resource && world->depth == f.depth.resource) {
+            f.native_output = f.color;
+            f.world_level = world->level;
+            f.world_draws = x->world_draws;
+            const auto lower = [&](TextureFacts& facts, ID3D11Texture2D* low) {
+                D3D11_TEXTURE2D_DESC desc{};
+                low->GetDesc(&desc);
+                facts.format = desc.Format;
+                facts.resource = IdOf(low);
+                facts.incarnation = IncarnationOf(low);
+                facts.d3d11_resource = low;
+                facts.active_w = facts.width = desc.Width;
+                facts.active_h = facts.height = desc.Height;
+            };
+            lower(f.color, world->raster.Color());
+            lower(f.depth, world->raster.Depth());
+            for (int axis = 0; axis < 2; ++axis) {
+                const float ratio = axis ? float(f.color.height) / f.native_output.height : float(f.color.width) / f.native_output.width;
+                f.raster.jitter_px[axis] *= ratio;
+                f.camera.jitter_px[axis] *= ratio;
+            }
+        }
+    }
     const SceneCallback cb = g_cb;
     void* user = g_cb_user;
     lk.unlock();
@@ -1706,6 +1804,16 @@ void Fire(ID3D11DeviceContext* immediate, std::unique_lock<std::mutex>& lk, Boun
         ok = cb(user, immediate, f);
     }
     lk.lock();
+    if (!ok && f.world_level && world) {
+        // Restore already placed the spatial result. A rejecting evaluator cannot repeatedly
+        // reduce the next frame; the ordinary renderer and the other resolution routes resume.
+        world->feature_ready = false;
+        if (++world->missed_evaluations >= 3) {
+            world->refused.store(true, std::memory_order_release);
+            world->ready.store(false, std::memory_order_release);
+        }
+    }
+    if (ok && f.world_level && world) world->missed_evaluations = 0;
     if (!ok) ++g_stats.missed;
     else if (g_frame == f.frame) {
         g_frame_delivered = true;
@@ -2568,6 +2676,7 @@ void STDMETHODCALLTYPE PSSetShaderResources_d(ID3D11DeviceContext* c, UINT start
     // Material textures: a published replacement is bound in place of the game's view (textures.hpp).
     ID3D11ShaderResourceView* swapped[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
     Ctx* x = Get(c); // null inside our own work and on other devices' contexts: bound as given
+    if (x) x->world_pixel_dependency.reset();
     const auto* bind = x ? SwapTextures(c, x->ps_shadow, start, n, v, swapped) : v;
     O(c, x).ps_srv(c, start, n, bind);
     if (bind != v) EndTextureSwap(n, v, bind);
@@ -2601,7 +2710,7 @@ bool CountsRasterWork(ID3D11Asynchronous* object)
 void STDMETHODCALLTYPE Begin_d(ID3D11DeviceContext* c, ID3D11Asynchronous* object)
 {
     Ctx* x = Get(c);
-    if (x && !x->deferred && CountsRasterWork(object)) ++x->raster_queries;
+    if (x && !x->deferred && CountsRasterWork(object)) { FinishWorld(c, x); ++x->raster_queries; }
     O(c, x).begin(c, object);
 }
 
@@ -2948,6 +3057,102 @@ ScreenCheck::Mark CheckScreenReader(ID3D11DeviceContext* c, Ctx* x)
 }
 
 template<class Forward>
+bool DrawWorld(ID3D11DeviceContext* c, Ctx* x, Forward& forward)
+{
+    if (!x || !x->world || x->deferred) return false;
+    auto& job = *x->world;
+    if (x->world_closed_frame == g_frame || !job.feature_ready || g_frame < job.retry_after || g_frame - job.last_receipt > 1 || !job.ready.load(std::memory_order_acquire) || job.level != g_world_level.load() ||
+        x->rt0 != job.color || x->depth != job.depth || x->rt_count != 1 || x->depth_read_only ||
+        x->raster_queries || !x->depth_test || x->vp_n != 1 ||
+        x->world_color_clear != g_frame || x->world_depth_clear != g_frame ||
+        x->vp_x || x->vp_y || x->vp_w != job.raster.native_width || x->vp_h != job.raster.native_height ||
+        g_sel_color.load() != job.color || g_sel_depth.load() != job.depth || !job.proof_current.load(std::memory_order_relaxed)) return false;
+    Inside own;
+    if (!x->world_uavs.has_value()) {
+        ComPtr<ID3D11Device> device; c->GetDevice(&device);
+        const UINT slots = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1 ? D3D11_1_UAV_SLOT_COUNT : D3D11_PS_CS_UAV_REGISTER_COUNT;
+        ID3D11UnorderedAccessView* views[D3D11_1_UAV_SLOT_COUNT]{};
+        c->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, slots, views);
+        x->world_uavs = false;
+        for (UINT i = 0; i < slots; ++i) if (views[i]) { x->world_uavs = true; views[i]->Release(); }
+    }
+    if (*x->world_uavs) return false;
+    if (!x->world_pixel_dependency) {
+        ID3D11ShaderResourceView* views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT]{};
+        c->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, views);
+        bool scene_sized = false;
+        for (auto* view : views) if (view) {
+            ComPtr<ID3D11Resource> resource;
+            view->GetResource(&resource);
+            ComPtr<ID3D11Texture2D> texture;
+            if (SUCCEEDED(resource.As(&texture))) {
+                D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
+                scene_sized |= desc.Width == job.raster.native_width && desc.Height == job.raster.native_height;
+            }
+            view->Release();
+        }
+        x->world_pixel_dependency = scene_sized;
+    }
+    if (*x->world_pixel_dependency) {
+        job.retry_after = g_frame + 32;
+        na::eventlog::Emit("native11_world_raster", "world samples a native-sized image; retain native coordinates");
+        return false;
+    }
+    ComPtr<ID3D11Predicate> pred; BOOL value;
+    c->GetPredication(&pred, &value);
+    if (pred) return false;
+    ComPtr<ID3D11RenderTargetView> target;
+    ComPtr<ID3D11DepthStencilView> depth;
+    c->OMGetRenderTargets(1, &target, &depth);
+    D3D11_RENDER_TARGET_VIEW_DESC cv{};
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+    if (!target || !depth) return false;
+    target->GetDesc(&cv); depth->GetDesc(&dv);
+    if (ResourceOfView(target.Get()) != job.color || ResourceOfView(depth.Get()) != job.depth || cv.Format != job.color_format || dv.Format != job.depth_format || dv.Flags) return false;
+    // Scissored geometry may be UI, even when it shares the world's depth buffer.
+    ComPtr<ID3D11RasterizerState> state;
+    c->RSGetState(&state);
+    if (state) {
+        D3D11_RASTERIZER_DESC rs{}; state->GetDesc(&rs);
+        if (rs.ScissorEnable) {
+            UINT n = 1; D3D11_RECT r{};
+            c->RSGetScissorRects(&n, &r);
+            if (n != 1 || r.left != 0 || r.top != 0 || r.right < LONG(job.raster.native_width) ||
+                r.bottom < LONG(job.raster.native_height)) return false;
+        }
+    }
+    D3D11_VIEWPORT original{}; UINT count = 1;
+    c->RSGetViewports(&count, &original);
+    if (count != 1) return false;
+    if (!x->world_dirty && x->world_frame != g_frame) {
+        const bool has_stencil = dv.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || dv.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        if (x->pristine_color && x->pristine_depth && (!has_stencil || (x->clear_flags & D3D11_CLEAR_STENCIL))) {
+            c->ClearRenderTargetView(job.raster.Target(), x->clear_rgba);
+            c->ClearDepthStencilView(job.raster.DepthView(), x->clear_flags, x->clear_z, x->clear_s);
+        } else job.raster.Seed(c);
+    }
+    x->world_stencil_written |= x->stencil_writes;
+    x->pristine_color = x->pristine_depth = false;
+    auto scaled_view = original;
+    const float sx = float(job.width) / job.raster.native_width, sy = float(job.height) / job.raster.native_height;
+    scaled_view.TopLeftX *= sx; scaled_view.Width *= sx;
+    scaled_view.TopLeftY *= sy; scaled_view.Height *= sy;
+    if (x->coarse_rate) CoarseApply(c, x, 0);
+    auto* low = job.raster.Target();
+    c->OMSetRenderTargets(1, &low, job.raster.DepthView());
+    c->RSSetViewports(1, &scaled_view);
+    forward();
+    auto* high = target.Get();
+    c->OMSetRenderTargets(1, &high, depth.Get());
+    c->RSSetViewports(1, &original);
+    x->world_frame = g_frame;
+    x->world_dirty = true;
+    if (x->world_draw_frame != g_frame) { x->world_draw_frame = g_frame; x->world_draws = 0; }
+    ++x->world_draws;
+    return true;
+}
+
+template<class Forward>
 void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
 {
     if (state && state->post.resource && (state->rt0 == state->post.resource || state->rt_count > 1))
@@ -2959,7 +3164,18 @@ void ForwardGameDraw(ID3D11DeviceContext* c, Ctx* state, Forward forward)
         VpjBeforeDraw(c, state);
     if (state && !state->deferred && state->coarse_rate && !g_coarse_open.load(std::memory_order_relaxed))
         CoarseBeforeDraw(c, state); // the scene was handed over by this very draw's event: it is not shaded in blocks
-    ForwardDepthRead(c, state, false, forward);
+    if (!DrawWorld(c, state, forward)) {
+        if (state && state->world) {
+            FinishWorld(c, state);
+            // A native draw into this picture after redirecting it may be a HUD, a protected
+            // query, or an unsupported layer. Keep its pixels native for the rest of this frame.
+            if (state->rt0 == state->world->color && state->world_frame == g_frame)
+                state->world_closed_frame = g_frame;
+            TouchWorld(c, state, state->rt0, true);
+            TouchWorld(c, state, state->depth, true);
+        }
+        ForwardDepthRead(c, state, false, forward);
+    }
     if (state && !state->deferred && state->depth_layer_target) {
         // VARIANT: jitter/stationary-source-readers: a depth-like layer drawn this frame while the sample is live by a
         // draw that kept the game's grid; drawn by a draw on the sample's grid, it is no longer one.
@@ -3106,17 +3322,20 @@ void STDMETHODCALLTYPE DrawAuto_d(ID3D11DeviceContext* c)
 }
 void STDMETHODCALLTYPE Dispatch_d(ID3D11DeviceContext* c, UINT x_groups, UINT y_groups, UINT z_groups)
 {
-    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? Get(c) : nullptr;
+    Ctx* x = (g_world_level.load(std::memory_order_relaxed) || g_depth_reads_enabled.load(std::memory_order_relaxed)) ? Get(c) : nullptr;
+    FinishWorld(c, x);
     ForwardDepthRead(c, x, true, [&] { O(c, x).dispatch(c, x_groups, y_groups, z_groups); });
 }
 void STDMETHODCALLTYPE DispatchIndirect_d(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT offset)
 {
-    Ctx* x = g_depth_reads_enabled.load(std::memory_order_relaxed) ? Get(c) : nullptr;
+    Ctx* x = (g_world_level.load(std::memory_order_relaxed) || g_depth_reads_enabled.load(std::memory_order_relaxed)) ? Get(c) : nullptr;
+    FinishWorld(c, x);
     ForwardDepthRead(c, x, true, [&] { O(c, x).dispatch_indirect(c, args, offset); });
 }
 HRESULT STDMETHODCALLTYPE Map_d(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m)
 {
     Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(r), type != D3D11_MAP_READ);
     const HRESULT hr = O(c, x).map(c, r, sub, type, flags, m);
     if (x && CameraTracking() && SUCCEEDED(hr) && m && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE || type == D3D11_MAP_WRITE ||
                                     type == D3D11_MAP_READ_WRITE)) {
@@ -3204,6 +3423,7 @@ void STDMETHODCALLTYPE UpdateSubresource_d(ID3D11DeviceContext* c, ID3D11Resourc
 {
     Ctx* x = Get(c);
     std::vector<uint8_t> tmp;
+    TouchWorld(c, x, IdOf(r), true);
     UpdateCommon(c, x, r, box, src, tmp);
     TrackPlacementColorWrite(c, x, IdOf(r));
     if (x && x->deferred) NoteListWrite(x, IdOf(r));
@@ -3215,6 +3435,7 @@ void STDMETHODCALLTYPE UpdateSubresource1_d(ID3D11DeviceContext1* c, ID3D11Resou
 {
     Ctx* x = Get(c);
     std::vector<uint8_t> tmp;
+    TouchWorld(c, x, IdOf(r), true);
     UpdateCommon(c, x, r, box, src, tmp);
     TrackPlacementColorWrite(c, x, IdOf(r));
     O(c, x).update1(c, r, sub, box, src, rp, dp, flags);
@@ -3308,13 +3529,16 @@ void TrackTargets(Ctx* x, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11Dep
 void STDMETHODCALLTYPE OMSetRenderTargets_d(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv)
 {
     Ctx* x = Get(c);
-    if (x) TrackTargets(x, n, rtvs, dsv);
+    FinishWorld(c, x);
+    if (x) { x->world_uavs.reset(); TrackTargets(x, n, rtvs, dsv); }
     O(c, x).om_rt(c, n, rtvs, dsv);
 }
 void STDMETHODCALLTYPE OMSetRenderTargetsAndUAVs_d(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv,
                                                    UINT us, UINT un, ID3D11UnorderedAccessView* const* uavs, const UINT* counts)
 {
     Ctx* x = Get(c);
+    FinishWorld(c, x);
+    if (x) x->world_uavs.reset();
     if (x && n != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) TrackTargets(x, n, rtvs, dsv);
     O(c, x).om_rt_uav(c, n, rtvs, dsv, us, un, uavs, counts);
 }
@@ -3322,11 +3546,17 @@ void STDMETHODCALLTYPE OMSetDepthStencilState_d(ID3D11DeviceContext* c, ID3D11De
 {
     Ctx* x = Get(c);
     if (x) {
+        x->stencil_writes = false;
         if (!s) { x->depth_test = true; x->depth_func = kCompareLess; } // default state: depth test on, LESS, writing
         else {
             D3D11_DEPTH_STENCIL_DESC d{};
             Inside in;
             s->GetDesc(&d);
+            const auto changes_stencil = [](const D3D11_DEPTH_STENCILOP_DESC& face) {
+                return face.StencilFailOp != D3D11_STENCIL_OP_KEEP || face.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP ||
+                    face.StencilPassOp != D3D11_STENCIL_OP_KEEP;
+            };
+            x->stencil_writes = d.StencilEnable && d.StencilWriteMask && (changes_stencil(d.FrontFace) || changes_stencil(d.BackFace));
             x->depth_test = d.DepthEnable != FALSE;
             // Depth direction evidence: the comparison counts only on draws that also write the depth.
             x->depth_func = d.DepthEnable && d.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL ? static_cast<uint8_t>(d.DepthFunc) : uint8_t{0};
@@ -3409,6 +3639,15 @@ void TrackPlacementColorWrite(ID3D11DeviceContext* c, Ctx* x, Id resource)
 void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11RenderTargetView* view, const FLOAT color[4])
 {
     Ctx* x = Get(c);
+    if (x && x->world) {
+        const auto id = ResourceOfView(view);
+        TouchWorld(c, x, id, true);
+        if (id == x->world->color) {
+            x->world_color_clear = g_frame;
+            std::copy_n(color, 4, x->clear_rgba);
+            x->pristine_color = true;
+        }
+    }
     if (x && (x->post.resource || x->raster_depth_layer.resource || g_adaptive_scene.load(std::memory_order_relaxed) ||
               g_lit_peer.load(std::memory_order_relaxed)))
         TrackPlacementColorWrite(c, x, ResourceOfView(view));
@@ -3419,8 +3658,10 @@ void STDMETHODCALLTYPE ClearRenderTargetView_d(ID3D11DeviceContext* c, ID3D11Ren
 void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y0, UINT z0, ID3D11Resource* src,
                                                UINT ss, const D3D11_BOX* box)
 {
-    ReadResource(c, src);
     Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(src), false);
+    TouchWorld(c, x, IdOf(dst), true);
+    ReadResource(c, src);
     if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
     if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     auto* source = !ds && !ss && !x0 && !y0 && !z0 && !box ? DepthCopySource(c, x, dst, src) : src;
@@ -3430,8 +3671,10 @@ void STDMETHODCALLTYPE CopySubresourceRegion_d(ID3D11DeviceContext* c, ID3D11Res
 }
 void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src)
 {
-    ReadResource(c, src);
     Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(src), false);
+    TouchWorld(c, x, IdOf(dst), true);
+    ReadResource(c, src);
     if (x && !x->deferred && !t_inside) hud_free::BeforeCopy(uint64_t(IdOf(dst)), 0, 0);
     if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     O(c, x).copy_resource(c, dst, DepthCopySource(c, x, dst, src));
@@ -3442,8 +3685,10 @@ void STDMETHODCALLTYPE CopyResource_d(ID3D11DeviceContext* c, ID3D11Resource* ds
 }
 void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT f)
 {
-    ReadResource(c, src);
     Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(src), false);
+    TouchWorld(c, x, IdOf(dst), true);
+    ReadResource(c, src);
     if (x && x->deferred) NoteListWrite(x, IdOf(dst));
     O(c, x).resolve(c, dst, ds, src, ss, f);
     InvalidateDepthWrite(x, dst);
@@ -3452,6 +3697,15 @@ void STDMETHODCALLTYPE ResolveSubresource_d(ID3D11DeviceContext* c, ID3D11Resour
 void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT flags, FLOAT d, UINT8 s)
 {
     Ctx* x = Get(c);
+    if (x && x->world) {
+        const auto id = ResourceOfView(v);
+        TouchWorld(c, x, id, true);
+        if (id == x->world->depth && (flags & D3D11_CLEAR_DEPTH)) {
+            x->world_depth_clear = g_frame;
+            x->clear_flags = flags; x->clear_z = d; x->clear_s = s;
+            x->pristine_depth = true;
+        }
+    }
     if (x && v && (flags & D3D11_CLEAR_DEPTH)) {
         Id id = 0;
         {
@@ -3473,10 +3727,50 @@ void STDMETHODCALLTYPE ClearDepthStencilView_d(ID3D11DeviceContext* c, ID3D11Dep
     }
     O(c, x).clear_dsv(c, v, flags, d, s);
 }
+// D3D11.1 can access or discard a view without an OM binding change.
+void STDMETHODCALLTYPE CopyRegion1_d(ID3D11DeviceContext1* c, ID3D11Resource* dst, UINT ds, UINT x0, UINT y, UINT z,
+                                     ID3D11Resource* src, UINT ss, const D3D11_BOX* box, UINT flags)
+{
+    Ctx* x = Get(c);
+    TouchWorld(c, x, IdOf(src), false); TouchWorld(c, x, IdOf(dst), true);
+    O(c,x).copy1(c,dst,ds,x0,y,z,src,ss,box,flags);
+}
+void STDMETHODCALLTYPE DiscardResource_d(ID3D11DeviceContext1* c, ID3D11Resource* r)
+{
+    Ctx* x = Get(c); TouchWorld(c,x,IdOf(r),true); O(c,x).discard_resource(c,r);
+}
+void STDMETHODCALLTYPE DiscardView_d(ID3D11DeviceContext1* c, ID3D11View* view)
+{
+    Ctx* x = Get(c); if (x && x->world) TouchWorld(c,x,ResourceOfView(view),true);
+    O(c,x).discard_view(c,view);
+}
+void STDMETHODCALLTYPE DiscardView1_d(ID3D11DeviceContext1* c, ID3D11View* view,const D3D11_RECT* rects, UINT n)
+{
+    Ctx* x = Get(c); if (x && x->world) TouchWorld(c,x,ResourceOfView(view),true);
+    O(c,x).discard_view1(c,view,rects,n);
+}
+void STDMETHODCALLTYPE ClearView_d(ID3D11DeviceContext1* c, ID3D11View* view,const FLOAT* color,const D3D11_RECT* rects, UINT n)
+{
+    Ctx* x = Get(c); if (x && x->world) TouchWorld(c,x,ResourceOfView(view),true);
+    O(c,x).clear_view(c,view,color,rects,n);
+}
+void STDMETHODCALLTYPE SwapState_d(ID3D11DeviceContext1* c, ID3DDeviceContextState* state, ID3DDeviceContextState** previous)
+{
+    Ctx* x = Get(c); FinishWorld(c,x);
+    if (x && x->world) {
+        x->world_uavs.reset();
+        x->world_color_clear = x->world_depth_clear = x->world_frame = ~uint64_t{0};
+        // This state object may contain render state set outside the observed context.
+        x->world->feature_ready = false;
+        x->world.reset();
+    }
+    O(c,x).swap_state(c,state,previous);
+}
 void STDMETHODCALLTYPE ClearState_d(ID3D11DeviceContext* c)
 {
     Ctx* x = Get(c);
-    if (x) x->reset_state();
+    FinishWorld(c, x);
+    if (x) { x->world_uavs = false; x->reset_state(); }
     O(c, x).clear_state(c);
 }
 HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL restore, ID3D11CommandList** out)
@@ -3528,7 +3822,8 @@ HRESULT STDMETHODCALLTYPE FinishCommandList_d(ID3D11DeviceContext* c, BOOL resto
 void STDMETHODCALLTYPE ExecuteCommandList_d(ID3D11DeviceContext* c, ID3D11CommandList* list, BOOL restore)
 {
     Ctx* x = Get(c);
-    if (x && list) x->post = {};
+    FinishWorld(c, x);
+    if (x && list) { x->post = {}; x->world_frame = ~uint64_t{0}; }
     if (x && !x->deferred && x->coarse_rate && !t_inside) {
         // The immediate context's coarse shading would also apply to the list's draws (vrs11_test (ii)):
         // a list shades in blocks only what its own recording asked for.
@@ -3631,6 +3926,9 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
         g_model.SetSwapChainSize(sd.BufferDesc.Width, sd.BufferDesc.Height);
         ObserveBackbuffer(swap);
     }
+    for (auto& entry : g_ctx)
+        if (entry.second->game && entry.second->gen == g_device_gen.load() && !entry.second->deferred)
+            FinishWorld(entry.first, entry.second.get());
     if (hud_free::Wanted()) { // the HUD-free picture: the frame ends here (learning, per-frame counts)
         Inside in;
         DXGI_SWAP_CHAIN_DESC hd{};
@@ -3988,6 +4286,12 @@ bool OnPresent(IDXGISwapChain* swap, PresentReceipt* receipt = nullptr)
     g_vpj_executed_expanded = false;
     g_vpj_last_frame_draws.store(jittered_draws, std::memory_order_relaxed);
     if (jittered_draws) g_vpj_frames.fetch_add(1, std::memory_order_relaxed);
+    for (auto& entry : g_ctx) {
+        auto& x = *entry.second;
+        if (!x.world) continue;
+        x.world->proof_current.store(g_screen.KnowsProof(x.world->proof), std::memory_order_relaxed);
+        if (!g_world_level.load() || x.world->color != s.color || x.world->depth != s.depth) x.world.reset();
+    }
     g_sel_depth.store(s.depth, std::memory_order_relaxed);
     g_sel_depth_w.store(s.depth_info.width, std::memory_order_relaxed);
     g_sel_depth_h.store(s.depth_info.height, std::memory_order_relaxed);
@@ -4046,6 +4350,11 @@ void ReleaseResizeInputs(IDXGISwapChain* s)
         g_recovery.Clear();
         g_lit_peer.store(0, std::memory_order_relaxed);
         g_adaptive_scene.store(false, std::memory_order_relaxed);
+        for (auto& entry : g_ctx) {
+            FinishWorld(entry.first, entry.second.get());
+            entry.second->world.reset();
+            entry.second->world_frame = ~uint64_t{0};
+        }
         // Release everything that could hold a back buffer, or ResizeBuffers fails.
         g_color_ref.Reset();
         g_depth_ref.Reset();
@@ -4116,6 +4425,12 @@ bool HookCtx(ID3D11DeviceContext* ctx, int set, bool deferred)
     else hooks.push_back({kExecuteCommandList, reinterpret_cast<void*>(&ExecuteCommandList_d), reinterpret_cast<void**>(&o.execute)});
     ComPtr<ID3D11DeviceContext1> c1;
     if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&c1)))) {
+        hooks.push_back({kCopyRegion1, reinterpret_cast<void*>(&CopyRegion1_d), reinterpret_cast<void**>(&o.copy1)});
+        hooks.push_back({kDiscardResource, reinterpret_cast<void*>(&DiscardResource_d), reinterpret_cast<void**>(&o.discard_resource)});
+        hooks.push_back({kDiscardView, reinterpret_cast<void*>(&DiscardView_d), reinterpret_cast<void**>(&o.discard_view)});
+        hooks.push_back({kDiscardView1, reinterpret_cast<void*>(&DiscardView1_d), reinterpret_cast<void**>(&o.discard_view1)});
+        hooks.push_back({kClearView, reinterpret_cast<void*>(&ClearView_d), reinterpret_cast<void**>(&o.clear_view)});
+        hooks.push_back({kSwapContextState, reinterpret_cast<void*>(&SwapState_d), reinterpret_cast<void**>(&o.swap_state)});
         hooks.push_back({kUpdateSubresource1, reinterpret_cast<void*>(&UpdateSubresource1_d), reinterpret_cast<void**>(&o.update1)});
         hooks.push_back({kVSSetConstantBuffers1, reinterpret_cast<void*>(&VSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.vs_cb1)});
         hooks.push_back({kPSSetConstantBuffers1, reinterpret_cast<void*>(&PSSetConstantBuffers1_d), reinterpret_cast<void**>(&o.ps_cb1)});
@@ -4183,8 +4498,54 @@ bool InstallHooks(bool host_owns_present)
 
 } // namespace
 
-void SetScreenCheck(bool on, bool discover_scale)
+bool PrepareWorldRaster(void* context, const SceneFrame& f, uint32_t level, uint32_t w, uint32_t h, bool feature_ready)
 {
+    if (!level || !w || !h || !f.screen_proof || !f.scaled_reader.target || f.world_level) return false;
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_ctx.find(static_cast<ID3D11DeviceContext*>(context));
+    if (it == g_ctx.end() || !g_swap || level != g_world_level.load() || f.screen_proof != g_screen.Proof() ||
+        f.color.resource == g_backbuffer || !g_model.IsDisplayExtent(g_model.Current().color_info) ||
+        f.color.active_x || f.color.active_y || f.depth.active_x || f.depth.active_y ||
+        f.color.width != f.color.active_w || f.color.height != f.color.active_h ||
+        f.depth.width != f.color.width || f.depth.height != f.color.height || f.color.mip || f.depth.mip ||
+        f.color.array_slice || f.depth.array_slice || w >= f.color.width || h >= f.color.height) return false;
+    auto& x = *it->second;
+    auto job = x.world;
+    if (job && job->level == level && job->proof == f.screen_proof &&
+        job->color == f.color.resource && job->depth == f.depth.resource && job->width == w && job->height == h) {
+        job->feature_ready = feature_ready;
+        return f.frame >= job->retry_after && !job->refused.load(std::memory_order_acquire);
+    }
+    ComPtr<ID3D11Resource> color = static_cast<ID3D11Resource*>(f.color.d3d11_resource);
+    ComPtr<ID3D11Resource> depth = static_cast<ID3D11Resource*>(f.depth.d3d11_resource);
+    job = std::make_shared<Ctx::WorldJob>();
+    job->color = f.color.resource; job->depth = f.depth.resource;
+    job->color_format = DXGI_FORMAT(f.color.view_format); job->depth_format = DXGI_FORMAT(f.depth.view_format);
+    job->feature_ready = feature_ready;
+    job->last_receipt = f.frame;
+    job->proof = f.screen_proof; job->level = level; job->width = w; job->height = h;
+    if (!background::Submit([job, color, depth] {
+        OwnWorkScope own;
+        ComPtr<ID3D11Device> device; color->GetDevice(&device);
+        D3D11_RENDER_TARGET_VIEW_DESC cv{}; cv.Format = job->color_format; cv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{}; dv.Format = job->depth_format; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        ComPtr<ID3D11RenderTargetView> rtv; ComPtr<ID3D11DepthStencilView> dsv;
+        const bool ok = SUCCEEDED(device->CreateRenderTargetView(color.Get(), &cv, &rtv)) &&
+            SUCCEEDED(device->CreateDepthStencilView(depth.Get(), &dv, &dsv)) && job->raster.Prepare(rtv.Get(), dsv.Get(), job->width, job->height);
+        job->ready.store(ok, std::memory_order_release);
+        job->refused.store(!ok, std::memory_order_release);
+        na::eventlog::Emit("native11_world_raster", "level=%u prepared=%d render=%ux%u", job->level, int(ok), job->width, job->height);
+    })) return false;
+    FinishWorld(it->first, &x);
+    x.world_pixel_dependency.reset();
+    x.world = std::move(job);
+    x.world_frame = x.world_color_clear = x.world_depth_clear = ~uint64_t{0};
+    return true;
+}
+
+void SetScreenCheck(bool on, uint32_t discover_scale)
+{
+    g_world_level.store(on && discover_scale <= 3 ? discover_scale : 0);
     g_discover_scale.store(on && discover_scale, std::memory_order_relaxed);
     g_screen_enabled.store(on, std::memory_order_relaxed);
 }
@@ -4193,6 +4554,9 @@ void RejectScreenProof(uint64_t proof)
 {
     if (!proof || !g_screen_enabled.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lock(g_mu);
+    for (auto& entry : g_ctx)
+        if (entry.second->world && entry.second->world->proof == proof)
+            entry.second->world->proof_current.store(false, std::memory_order_relaxed);
     if (g_lit.Revoke(proof, g_frame) || g_screen.RejectProof(proof, g_frame))
         na::eventlog::Emit("native11_screen", "candidate=replaced_after_delivery proof=%llu",
                            static_cast<unsigned long long>(proof));
@@ -4270,6 +4634,7 @@ void Uninstall()
     g_recovery.Clear();
     g_lit_peer.store(0, std::memory_order_relaxed);
     g_adaptive_scene.store(false, std::memory_order_relaxed);
+    g_world_level.store(0);
     g_screen_enabled.store(false, std::memory_order_relaxed);
     g_discover_scale.store(false, std::memory_order_relaxed);
     g_was_discovering_scale = false;

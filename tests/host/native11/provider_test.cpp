@@ -116,6 +116,9 @@ float4 ps_map(float4 p : SV_Position) : SV_Target {
     if (fmod(abs(x * 0.7 + y * 0.3), 40.0) < 1.6) v += 0.1;
     return float4(v * 0.9, v * 1.1, v * 0.8, 1.0);
 }
+Texture2D<float4> native_lighting : register(t5);
+float4 ps_world_lighting(float4 p : SV_Position) : SV_Target { return native_lighting.Load(int3(p.xy,0)); }
+float4 ps_world_position(float4 p : SV_Position) : SV_Target { return float4(p.x/1280., p.y/720., .25, 1); }
 float4 ps_scene_variant(float4 p : SV_Position) : SV_Target { return float4(0.3, 0.6, 0.25, 1.0); }
 float4 ps_tonemap(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy), 0)); }
 float4 ps_letterbox(float4 p : SV_Position) : SV_Target { return scene.Load(int3(int2(p.xy) - int2(0,2), 0)); }
@@ -263,6 +266,7 @@ struct Game {
     bool shader_depth = false;
     DXGI_FORMAT back_format = DXGI_FORMAT_R8G8B8A8_UNORM; // the swap chain's format
     ComPtr<ID3D11RasterizerState> hud_scissor;            // set: the HUD covers only kHudRect
+    bool referee_test_query = false; // offline measurement, distinct from a game-owned query
     ID3D11Query* main_stats = nullptr;                    // set: pipeline statistics around the main scene's draws only
     ComPtr<ID3D11PixelShader> ps_scene_main, ps_hud_main;
     // The x2 names fixture (--fg-x2-names*): a map panned `pan` pixels a frame and names drawn after the hand-over
@@ -569,7 +573,10 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false, boo
         ID3D11UnorderedAccessView* u = g.count_uav.Get();
         c->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 1, 1, &u, nullptr);
     }
-    if (g.main_stats) c->Begin(g.main_stats);
+    if (g.main_stats) {
+        if (g.referee_test_query) { na::native11::OwnWorkScope own; c->Begin(g.main_stats); }
+        else c->Begin(g.main_stats);
+    }
     for (int i = 0; i < 40; ++i) {
         // Rewrite the same buffer to an identity-basis object pose. These
         // draws must never get the support of the earlier world-buffer version.
@@ -622,7 +629,10 @@ void Scene(ID3D11DeviceContext* c, Game& g, int frame, bool no_pose = false, boo
         c->VSSetShader(g.vs.Get(), nullptr, 0);
         c->PSSetShader(g.ps_scene_main ? g.ps_scene_main.Get() : g.ps_scene.Get(), nullptr, 0);
     }
-    if (g.main_stats) c->End(g.main_stats);
+    if (g.main_stats) {
+        if (g.referee_test_query) { na::native11::OwnWorkScope own; c->End(g.main_stats); }
+        else c->End(g.main_stats);
+    }
     if (g.scene_rs) c->RSSetState(nullptr);
     if (g.layered) {
         // Lighting: reads the layers, writes the picture, no depth.
@@ -1192,7 +1202,7 @@ int DepthReadFixture(Game& g, bool debug_layer)
 
 // A centered picture or a reduced world reaches the screen after an identical-looking decoy draw.
 // The reduced world can also go through another texture before presentation.
-int ScreenExtentFixture(Game& game, bool scaled, bool through_post)
+int ScreenExtentFixture(Game& game, bool scaled, bool through_post, bool live_world = false)
 {
     D3D11_TEXTURE2D_DESC d{};
     game.color->GetDesc(&d);
@@ -1229,11 +1239,27 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post)
         Game& game;
         bool scaled, through_post;
         ID3D11RenderTargetView* expected;
-        unsigned accepted = 0;
+        unsigned accepted = 0, count[4]{}, width[4]{}, height[4]{}, last_level = 0;
+        bool live = false;
     } consumer{game, scaled, through_post, through_post ? post_target.Get() : game.back_rtv.Get()};
+    consumer.live = live_world;
     const auto evaluate = [](void* opaque, void* context, const na::native11::SceneFrame& f) {
         auto& state = *static_cast<Consumer*>(opaque);
         const auto& g = state.game;
+#if defined(NA_TEST_NATIVE_DLAA)
+        if (state.live) {
+            const bool delivered = na::native_d3d11::EvaluateFrame(nullptr, context, f);
+            if (delivered && f.world_level <= 3) {
+                if (f.world_level && (f.world_draws != 40 || f.native_output.d3d11_resource != g.color.Get() || !f.screen_proof ||
+                    f.color.active_w >= g.w || f.depth.active_h != f.color.active_h ||
+                    f.color.d3d11_resource == g.color.Get() || f.depth.d3d11_resource == g.depth.Get())) ++g_failed;
+                state.width[f.world_level] = f.color.active_w; state.height[f.world_level] = f.color.active_h;
+                ++state.count[f.world_level]; ++state.accepted;
+                state.last_level = f.world_level;
+            }
+            return delivered;
+        }
+#endif
         // Ordinary DLAA can continue while Referee tests candidates at Quality.
         if (state.scaled && !f.screen_proof) return true;
         expect(f.screen_proof && f.color.d3d11_resource == g.color.Get() && f.depth.d3d11_resource == g.depth.Get() &&
@@ -1265,7 +1291,7 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post)
     if (FAILED(game.device->CreateRasterizerState(&raster, &visible_quads))) return 1;
     game.ctx->RSSetState(visible_quads.Get());
     ComPtr<ID3D11RasterizerState> clipped_quads;
-    if (through_post) {
+    if (through_post || live_world) {
         raster.ScissorEnable = TRUE;
         if (FAILED(game.device->CreateRasterizerState(&raster, &clipped_quads))) return 1;
     }
@@ -1278,8 +1304,33 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post)
     ComPtr<ID3D11Texture2D> pixel;
     if (FAILED(game.device->CreateTexture2D(&pixel_desc, nullptr, &pixel))) return 1;
 
+    ComPtr<ID3D11Query> pixels;
+    ComPtr<ID3D11Texture2D> stencil_snapshot;
+    ComPtr<ID3D11DepthStencilState> stencil_write;
+    if (live_world) {
+        D3D11_QUERY_DESC query{D3D11_QUERY_PIPELINE_STATISTICS, 0};
+        if (FAILED(game.device->CreateQuery(&query, &pixels))) return 1;
+        game.main_stats = pixels.Get();
+        game.referee_test_query = true;
+        if (through_post) {
+            D3D11_DEPTH_STENCIL_DESC z{};
+            z.DepthEnable = TRUE; z.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; z.DepthFunc = D3D11_COMPARISON_LESS;
+            z.StencilEnable = TRUE; z.StencilReadMask = z.StencilWriteMask = 0xff;
+            z.FrontFace = z.BackFace = {D3D11_STENCIL_OP_KEEP,D3D11_STENCIL_OP_KEEP,D3D11_STENCIL_OP_REPLACE,D3D11_COMPARISON_ALWAYS};
+            if (FAILED(game.device->CreateDepthStencilState(&z,&stencil_write))) return 1;
+            D3D11_TEXTURE2D_DESC staging{}; game.depth->GetDesc(&staging);
+            staging.Format = DXGI_FORMAT_R24G8_TYPELESS; staging.BindFlags = 0; staging.Usage = D3D11_USAGE_STAGING; staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(game.device->CreateTexture2D(&staging,nullptr,&stencil_snapshot))) return 1;
+        }
+        auto ps_world = Compile("ps_world_position", "ps_5_0");
+        if (!ps_world || FAILED(game.device->CreatePixelShader(ps_world->GetBufferPointer(), ps_world->GetBufferSize(), nullptr, &game.ps_scene_main))) return 1;
+    }
+    uint64_t scene_pixels = 0;
+    unsigned sample_ordinal = 0;
     auto frame = [&](bool show, bool overwrite_post = false) {
         Pump();
+        const UINT8 reference = (++sample_ordinal & 1) ? 0xa5 : 0x3c;
+        if (stencil_write) game.ctx->OMSetDepthStencilState(stencil_write.Get(), reference);
         auto* ctx = game.ctx.Get();
         Scene(ctx, game, 0);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -1331,12 +1382,19 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post)
         view = nullptr;
         ctx->PSSetShaderResources(slot, 1, &view);
         bool displayed = false;
+        if (live_world && show) {
+            // A one-pixel UI draw after composition. Verify its immediate neighbours as well.
+            D3D11_RECT clip{2,2,3,3};
+            ctx->RSSetScissorRects(1, &clip); ctx->RSSetState(clipped_quads.Get());
+            ctx->PSSetShader(game.ps_hud.Get(), nullptr, 0); ctx->Draw(4,0);
+            ctx->RSSetState(visible_quads.Get());
+        }
         if (show && consumer.accepted) {
             na::native11::OwnWorkScope own;
             ComPtr<ID3D11Texture2D> screen;
             if (SUCCEEDED(game.swap->GetBuffer(0, IID_PPV_ARGS(&screen)))) {
-                const auto read_red = [&](UINT x) {
-                    const D3D11_BOX box{x, 2, 0, x + 1, 3, 1};
+                const auto read_red = [&](UINT x, UINT y = 2) {
+                    const D3D11_BOX box{x, y, 0, x + 1, y + 1, 1};
                     ctx->CopySubresourceRegion(pixel.Get(), 0, 0, 0, 0, screen.Get(), 0, &box);
                     D3D11_MAPPED_SUBRESOURCE map{};
                     if (FAILED(ctx->Map(pixel.Get(), 0, D3D11_MAP_READ, 0, &map))) return -1;
@@ -1344,14 +1402,95 @@ int ScreenExtentFixture(Game& game, bool scaled, bool through_post)
                     ctx->Unmap(pixel.Get(), 0);
                     return red;
                 };
-                if (scaled) displayed = std::abs(read_red(2) - 191) <= 2 && std::abs(read_red(d.Width - 3) - 191) <= 2;
+                if (live_world) {
+                    const auto level = consumer.last_level;
+                    const int expected = int(255.f * (consumer.width[level] / 2.f) / 1280.f);
+                    displayed = read_red(2) == 255 && read_red(1) < 100 && read_red(3) < 100 &&
+                        std::abs(read_red(game.w/2, game.h/2) - expected) < 18;
+                } else if (scaled) displayed = std::abs(read_red(2) - 191) <= 2 && std::abs(read_red(d.Width - 3) - 191) <= 2;
                 else displayed = std::abs(read_red(46) - 191) <= 2 && read_red(2) == 0 && read_red(game.w + 50) == 0;
             }
+        }
+        if (live_world) {
+            na::native11::OwnWorkScope own;
+            if (stencil_snapshot && consumer.accepted) {
+                ctx->CopyResource(stencil_snapshot.Get(), game.depth.Get());
+                D3D11_MAPPED_SUBRESOURCE m{};
+                if (FAILED(ctx->Map(stencil_snapshot.Get(),0,D3D11_MAP_READ,0,&m))) return false;
+                auto stencil_at = [&](UINT x,UINT y) {
+                    return static_cast<const uint8_t*>(m.pData)[y*m.RowPitch + x*4 + 3];
+                };
+                displayed = displayed && stencil_at(game.w / 2, game.h / 2) == reference && !stencil_at(2,2);
+                ctx->Unmap(stencil_snapshot.Get(),0);
+            }
+            D3D11_QUERY_DATA_PIPELINE_STATISTICS stats{};
+            HRESULT hr;
+            do { hr = ctx->GetData(pixels.Get(), &stats, sizeof stats, 0); if (hr == S_FALSE) Sleep(0); } while (hr == S_FALSE);
+            scene_pixels = SUCCEEDED(hr) ? stats.PSInvocations : 0;
         }
         expect(SUCCEEDED(game.swap->Present(0, 0)), "present the scene");
         return displayed;
     };
 
+#if defined(NA_TEST_NATIVE_DLAA)
+    if (live_world) {
+        unsigned dimensions[4]{};
+        uint64_t invocations[4]{};
+        for (unsigned level : {1u,3u,2u,1u,0u}) {
+            na::settings::Get().j2_fold_mode.store(level);
+            const auto before = consumer.count[level];
+            unsigned pictures = 0;
+            for (unsigned i = 0; i < 180 && pictures < 4; ++i) {
+                const auto delivered = consumer.count[level];
+                const bool pixels_ok = frame(true);
+                if (consumer.count[level] > delivered && pixels_ok) { ++pictures; invocations[level] = scene_pixels; }
+            }
+            std::printf("world path level=%u delivered=%u images=%u input=%ux%u output=%ux%u\n",
+                level, consumer.count[level]-before, pictures, consumer.width[level], consumer.height[level], game.w, game.h);
+            std::printf("world pixel shader invocations level=%u count=%llu\n", level, (unsigned long long)invocations[level]);
+            dimensions[level] = consumer.width[level];
+            if (level == 3 && pictures == 4) {
+                game.referee_test_query = false; // same query, now visible as the game's own query
+                const auto old = consumer.count[level];
+                for (unsigned i = 0; i < 4; ++i) frame(true);
+                expect(consumer.count[level] == old, "game-owned raster statistics keep scene draws at native resolution");
+                game.referee_test_query = true;
+            }
+            expect(pictures == 4, "four current DLSS deliveries preserve world coordinates and the one-pixel HUD");
+        }
+        expect(dimensions[0] == game.w && dimensions[0] > dimensions[1] && dimensions[1] > dimensions[3] &&
+            dimensions[3] > dimensions[2], "native, Quality, Balanced and Performance have four actual raster resolutions");
+        // An unrelated pass begins supplying a full-resolution image indexed by pixel position.
+        // Referee must preserve that coordinate system, then retry when the dependency disappears.
+        auto light_code = Compile("ps_world_lighting","ps_5_0");
+        ComPtr<ID3D11PixelShader> lit;
+        ComPtr<ID3D11ShaderResourceView> light;
+        if (!light_code || FAILED(game.device->CreatePixelShader(light_code->GetBufferPointer(),light_code->GetBufferSize(),nullptr,&lit)) ||
+            FAILED(game.device->CreateShaderResourceView(decoy.Get(),nullptr,&light))) return 1;
+        na::settings::Get().j2_fold_mode.store(1);
+        unsigned quality_before = consumer.count[1];
+        for (unsigned i = 0; i < 180 && consumer.count[1] == quality_before; ++i) frame(true);
+        expect(consumer.count[1] > quality_before, "Quality re-enters before testing a new world input");
+        std::swap(game.ps_scene_main,lit);
+        quality_before = consumer.count[1];
+        for (unsigned i=0; i<6; ++i) {
+            game.ctx->PSSetShaderResources(5,1,light.GetAddressOf());
+            frame(true);
+        }
+        expect(consumer.count[1] == quality_before, "native-pixel lighting selects the native coordinate route");
+        std::swap(game.ps_scene_main,lit);
+        ID3D11ShaderResourceView* unbound = nullptr;
+        game.ctx->PSSetShaderResources(5,1,&unbound);
+        for (unsigned i=0; i<100 && consumer.count[1] == quality_before; ++i) frame(true);
+        expect(consumer.count[1] > quality_before, "Referee reacquires physical Quality without another menu change");
+        for (unsigned level : {1u, 2u, 3u}) {
+            const double grid = double(dimensions[level])*consumer.height[level] / (game.w*game.h);
+            expect(invocations[0] && std::abs(double(invocations[level])/invocations[0] - grid) < .04,
+                   "hardware world shading count follows the actual low raster area");
+        }
+        return g_failed ? 1 : 0;
+    }
+#endif
     for (unsigned i = 0; i < 42; ++i) frame(false);
     const auto invisible = na::native11::Stats();
     expect(!consumer.accepted && invisible.screen_refuted >= 1 && !invisible.screen_confirmed,
@@ -2223,6 +2362,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool compare_routes = composition_fault || trial_reused_depth || disagreeing_scene || parity_roles ||
         (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
+    const bool world_direct = !std::strcmp(arg1, "--world-direct"), world_post = !std::strcmp(arg1, "--world-post");
     const bool replay_handoff = !std::strcmp(arg1, "--replay-handoff");
     const bool camera_off_start = replay_handoff || !std::strcmp(arg1, "--camera-off-start");
     // One presenter for both APIs, stage 3: live x2 on a DX11 game (proxy chain, native DLAA inputs,
@@ -2298,7 +2438,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 #if defined(NA_TEST_NATIVE_DLAA)
     g.padded_hdr = padded_hdr;
     if (fg_x2_hdr) g.back_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (fold_measured || overlay_level >= 0 || fg_names) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
+    if (fold_measured || overlay_level >= 0 || fg_names || world_direct || world_post) { g.w = 1280; g.h = 720; } // the folded flow needs a working size the optical flow accepts
     {   // NA_TEST_FOLD_SIZE=WxH: the fold fixture at another picture size (e.g. 3440x1440 for the memory figure).
         wchar_t sz[32]{};
         unsigned fw = 0, fh = 0;
@@ -2325,6 +2465,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool depth_reads = depth_warp || depth_debug || (argc > 1 && std::strcmp(argv[1], "--depth-reads") == 0);
     g.shader_depth = depth_reads;
 #if defined(NA_TEST_NATIVE_DLAA)
+    if (world_direct) g.shader_depth = true; // D32 direct, D24S8 with postprocessing
     if (fg_auto == 4) na::on12::SetNativeProxyForTests(false); // the chain is made as if NeuralAlias had not seen it
 #endif
     if (screen_warp || depth_warp || depth_debug || !MakeGame(g, false)) {
@@ -2398,6 +2539,10 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
            std::strstr(activation, "dx11on12 enabled=0") != nullptr && std::strstr(activation, "wrapped=0") != nullptr,
            "production host installed the native provider exactly once");
     if (g_failed) return 1;
+    if (world_direct || world_post) {
+        const auto result = ScreenExtentFixture(g, true, world_post, true);
+        DeleteFileW(ini.c_str()); std::fflush(stdout); ExitProcess(result);
+    }
     if (adaptive || rotating_lights) {
         na::j2::SetJitter(true);
         const int result = ScreenCheckFixture(g, adaptive, missed_order, rotating_lights, compare_routes,
