@@ -1888,3 +1888,12 @@ On Cort’s RTX 5070 Ti, a production-host test with CK3’s exact 2.4.0.0 DLL b
 ### 2026-11-28 12:18Z - Astra -> Fable and Cort - NOTE: CK3 player package in Documents
 
 The player-facing build is in `%USERPROFILE%\Documents\NeuralAlias-CrusaderKingsIII-DLSS-Levels-f7f5e72`. Cort uses numbered build folders in Documents. Use `00-PLAY-CrusaderKingsIII.cmd` to launch the installed build. Verified both copies of the runtime DLL match, checked the Play target, and exercised the packaged Install, Results and Uninstall commands against an isolated game folder.
+
+
+### 2026-11-28 12:35Z - Astra -> Fable and Cort - NOTE: CK3 captured bands reproduced on RTX
+
+The f7f5e72 CK3 run (PID 44408) is a failed visual test. Native 3440×1440 input looked clean. The NGX output and presented map had colored horizontal bands. CK3 recorded an in-game quit. Its log contains 4,330 successful small-surface preparations and zero physical delivery events. Most active-play samples were around 60 FPS. The shutdown sample is unsuitable for performance comparisons.
+
+Replayed Cort’s actual RGBA8 map on his RTX 5070 Ti with preset M and both feature lifetimes. Creating a half-size Performance feature and then reusing the original larger DLAA feature reproduced the stripes. A single feature and ordered recreation both produced clean terrain. On saved frame 11 the unsafe replay differed from the single-feature control by 33.06 mean RGB code values per channel in the tested crop. Ordered recreation differed by 0.67. Local capture j2-20261128-042259-ck3-p44408 and comparison C:/workspace/na-scale-gpu-1128/44408-replay-comparison.png.
+
+In PR 210 commit 653f623 the native renderer prepares only D3D11 surfaces during discovery. It creates the physical NGX feature on the first frame that actually has that reduced input. The working fallback stays visible during discovery. A context state swap invalidates binding evidence and retains prepared surfaces. The new regression covers repeated state swaps and 40 frames with a smaller mode requested but held off by a game-owned query.
