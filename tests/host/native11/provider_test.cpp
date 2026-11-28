@@ -2362,9 +2362,10 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     const bool compare_routes = composition_fault || trial_reused_depth || disagreeing_scene || parity_roles ||
         (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
-    const bool world_direct = !std::strcmp(arg1, "--world-direct"), world_post = !std::strcmp(arg1, "--world-post");
+    const bool world_measured = !std::strcmp(arg1, "--world-measured");
+    const bool world_direct = !std::strcmp(arg1, "--world-direct"), world_post = world_measured || !std::strcmp(arg1, "--world-post");
     const bool replay_handoff = !std::strcmp(arg1, "--replay-handoff");
-    const bool camera_off_start = replay_handoff || !std::strcmp(arg1, "--camera-off-start");
+    const bool camera_off_start = world_measured || replay_handoff || !std::strcmp(arg1, "--camera-off-start");
     // One presenter for both APIs, stage 3: live x2 on a DX11 game (proxy chain, native DLAA inputs,
     // HUD-free picture, presenter), 8-bit SDR or FP16 back buffer.
     const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
@@ -2541,7 +2542,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     if (g_failed) return 1;
     if (world_direct || world_post) {
         const auto result = ScreenExtentFixture(g, true, world_post, true);
-        DeleteFileW(ini.c_str()); std::fflush(stdout); ExitProcess(result);
+        if (world_measured) {
+            char report[8192]{};
+            na::native_d3d11::FormatStatus(report, sizeof report);
+            expect(std::strstr(report, "camera_setting=0") && std::strstr(report, "measured=0}") == nullptr &&
+                   na::native11::Stats().camera_found == 0, "the physical world uses measured motion with camera discovery disabled");
+        }
+        DeleteFileW(ini.c_str()); std::fflush(stdout); ExitProcess(result || g_failed ? 1 : 0);
     }
     if (adaptive || rotating_lights) {
         na::j2::SetJitter(true);
