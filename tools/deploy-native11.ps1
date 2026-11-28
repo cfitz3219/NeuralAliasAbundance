@@ -64,6 +64,8 @@ function Save-Results([string] $why) {
         if (Test-Path -LiteralPath $rs) { . $rs; foreach ($l in (Get-RefereeSummary $lines)) { $summary.Add($l) } }
         $vs = Join-Path $PSScriptRoot 'vram-summary.ps1'
         if (Test-Path -LiteralPath $vs) { . $vs; foreach ($l in (Get-VramSummary $lines)) { $summary.Add($l) } }
+        $js = Join-Path $PSScriptRoot 'jitter-summary.ps1'
+        if (Test-Path -LiteralPath $js) { . $js; foreach ($l in (Get-JitterSummary $lines)) { $summary.Add($l) } }
     }
     foreach ($s in @($logs | Where-Object { $_.Name -like 'startup*' })) {
         $summary.Add(''); $summary.Add("== $($s.Name) (first 60 lines)")
