@@ -1371,11 +1371,24 @@ struct Nudger {
         int r = nudge(set, what);
         if (r < 0) return r == -2 ? -2 : -3;
         if (r == 0) {
-            // Nothing as a whole: perhaps a setting and its applied copy cancelled out. Try three other splits.
+            // Nothing as a whole: perhaps a setting and its applied copy cancelled out. Split by each bit of the
+            // position in the list: any two numbers are apart in at least one of these splits, so a setting is
+            // certain to be nudged without its copy once.
             if (set.size() < 2) return -1;
-            r = answering_half(set, &seed, 3, what);
-            if (r < 0) return r == -2 ? -2 : -3;
-            if (r == 0) return -1;
+            const uint32_t whole_wait = wait_ms;
+            wait_ms = (std::min<uint32_t>)(wait_ms, 1500);
+            bool got = false;
+            for (size_t bit = 1; bit < set.size() && !got; bit <<= 1) {
+                std::vector<size_t> a, b;
+                for (size_t i = 0; i < set.size(); ++i) ((i & bit) ? a : b).push_back(set[i]);
+                r = nudge(a, what);
+                if (r < 0) return r == -2 ? -2 : -3;
+                if (r == 1) { set.swap(a); got = true; break; }
+                r = nudge(b, what);
+                if (r < 0) return r == -2 ? -2 : -3;
+                if (r == 1) { set.swap(b); got = true; }
+            }
+            if (!got) { wait_ms = whole_wait; return -1; }
         }
         while (set.size() > 1) {
             r = answering_half(set, &seed, 4, what);
@@ -1521,7 +1534,7 @@ bool run_search()
         if (group[k].empty()) continue;
         const long long r = n.find(group[k], kGroup[k]);
         search_say("Group \"%s\" (%zu numbers): %s.", kGroup[k], group[k].size(), r >= 0 ? "one number moved the 3D picture alone"
-                   : r == -1 ? "no answer, whole or in 3 other splits" : r == -4 ? "a group answered but no single number did" : r == -2
+                   : r == -1 ? "no answer, as a whole or in any split" : r == -4 ? "a group answered but no single number did" : r == -2
                    ? "the picture did not come back" : "no 3D picture to judge by");
         if (r == -4) { cancelled = true; continue; }
         if (r == -2 || r == -3) { at = r; break; }
