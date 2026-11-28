@@ -16,6 +16,9 @@
 namespace {
 struct Settings { uint64_t tag = 0x5345545453455453ull; char name[16] = "render_scale"; int quality = 3; float render_scale = 1.0f; int other = 7; };
 struct Decoy { char name[24] = "ui_scale_factor"; float value = 1.0f; int other = 0; };
+// "--copy": the game also keeps what is applied now, under a render-scale name of its own, and acts only when
+// the setting differs from it (moving both together cancels out).
+struct Applied { char name[24] = "render_scale_applied"; float value = 1.0f; int other = 0; };
 constexpr int kDecoys = 300;
 struct Renderer { int32_t world_w = 0, world_h = 0; float scale_copy = 1.0f; };
 std::atomic<bool> g_run{true};
@@ -47,9 +50,13 @@ bool wait_for(const std::wstring& path, const char* needle, int seconds, std::st
 Settings* g_fake_settings = nullptr;
 Renderer* g_fake_renderer = nullptr;
 Decoy* g_fake_decoys = nullptr;
+Applied* g_fake_applied = nullptr;
+bool g_copy_mode = false;
 
-int main()
+int main(int argc, char** argv)
 {
+    g_copy_mode = argc > 1 && std::strcmp(argv[1], "--copy") == 0;
+    std::printf("pretend game: %s\n", g_copy_mode ? "acts only when the setting differs from its applied copy" : "reads the setting every frame");
     using namespace na::scale;
     constexpr uint32_t kOutW = 1920, kOutH = 1080;
     wchar_t temp[MAX_PATH]{};
@@ -62,10 +69,17 @@ int main()
     g_fake_settings = new Settings; // after the look-alikes: not the first candidate
     g_fake_renderer = new Renderer;
     Decoy* more = new Decoy[kDecoys];
+    for (int i = 0; i < kDecoys; ++i) strcpy_s(more[i].name, "ui_resolution_scale"); // precise look-alikes
+    g_fake_applied = new Applied;
     timeBeginPeriod(1);
     std::thread game([] {
         while (g_run.load()) {
+            static float in_use = 1.0f;
             float s = g_fake_settings->render_scale;
+            if (g_copy_mode) {
+                if (s != g_fake_applied->value) { in_use = s; g_fake_applied->value = s; } // the apply step
+                s = in_use;
+            }
             if (!(s >= 0.25f)) s = 0.25f;
             if (s > 2.0f) s = 2.0f;
             g_fake_renderer->world_w = int32_t(std::lround(kOutW * s));
@@ -128,9 +142,11 @@ int main()
     expect(witness::RequestScale(2.0 / 3.0) && world_becomes(1280), "asked 66.7% (Quality): the 3D world became 1280 wide");
     expect(witness::RequestScale(0.58) && world_becomes(1114), "asked 58% (Balanced): the 3D world became 1114 wide");
     expect(witness::RequestScale(0.5) && world_becomes(960), "asked 50% (Performance): the 3D world became 960 wide");
-    g_fake_settings->render_scale = 1.0f; // the game puts its own value back
-    Sleep(100);
-    expect(world_becomes(960), "the game's own write was corrected: still 960 wide");
+    if (!g_copy_mode) {
+        g_fake_settings->render_scale = 1.0f; // the game puts its own value back
+        Sleep(100);
+        expect(world_becomes(960), "the game's own write was corrected: still 960 wide");
+    }
     expect(witness::RequestScale(0.0) && world_becomes(int32_t(kOutW)), "given back: the 3D world is at the game's own size again");
     Sleep(200);
     expect(std::fabs(g_fake_settings->render_scale - 1.0f) < 1e-6f, "the game's own value is in place");

@@ -145,6 +145,8 @@ set_tests_properties(host_scale_trial_test PROPERTIES TIMEOUT 420)
 # The Search end to end with a pretend game (no GPU, no slider moves): NeuralAlias finds the number itself.
 na_host_test(scale_search_test SOURCES scale_search_test.cpp LIBS host_scale_witness winmm)
 set_tests_properties(host_scale_search_test PROPERTIES TIMEOUT 420)
+add_test(NAME host_scale_search_copy_test COMMAND scale_search_test --copy)
+set_tests_properties(host_scale_search_copy_test PROPERTIES TIMEOUT 420)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
 na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12)
