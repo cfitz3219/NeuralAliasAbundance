@@ -92,6 +92,7 @@ struct State {
     int search_state = 0;            // under trial_m. 0 not started, 1 running, 2 found, 3 not found, 4 stopped
     std::string search_text;         // under trial_m: the one-sentence outcome and why
     std::vector<std::string> search_lines; // under trial_m: what each step saw
+    std::map<uint64_t, uint8_t> search_cands; // under trial_m: every number the Search nudged, and by which clue
     std::vector<uint64_t> name_addresses, loose_name_addresses; // under modules_m: where the setting names are in the game's program
     std::atomic<uint64_t> last_size_event_ms{0}, trial_ended_ms{0};
     std::mutex trial_m; std::vector<TrialRow> trial_rows; std::vector<std::string> trial_paths;
@@ -795,6 +796,8 @@ void scan_pointers(const std::vector<uint64_t>& targets, uint32_t reach, std::ve
     uint64_t at = reinterpret_cast<uint64_t>(si.lpMinimumApplicationAddress), scanned = 0;
     const uint64_t top = reinterpret_cast<uint64_t>(si.lpMaximumApplicationAddress);
     const uint64_t own = reinterpret_cast<uint64_t>(buffer.data());
+    const uint64_t own_targets = reinterpret_cast<uint64_t>(targets.data()), own_targets_end = own_targets + targets.size() * sizeof(uint64_t);
+    const uint64_t own_sorted = reinterpret_cast<uint64_t>(sorted.data()), own_sorted_end = own_sorted + sorted.size() * sizeof(sorted[0]);
     while (at < top && scanned < kSweepBudget && out->size() < limit) {
         MEMORY_BASIC_INFORMATION m{};
         if (!VirtualQuery(ptr(at), &m, sizeof m)) break;
@@ -813,6 +816,8 @@ void scan_pointers(const std::vector<uint64_t>& targets, uint32_t reach, std::ve
                 if (v < lowest || v > highest) continue;
                 auto it = std::lower_bound(sorted.begin(), sorted.end(), std::make_pair(v, uint32_t(0)));
                 if (it == sorted.end() || it->first - v > reach) continue;
+                const uint64_t here = base + off + i; // not this search's own lists of the addresses it looks for
+                if ((here >= own_targets && here < own_targets_end) || (here >= own_sorted && here < own_sorted_end)) continue;
                 out->push_back(PointerHit{base + off + i, uint32_t(it->first - v), it->second, in_program});
                 if (out->size() >= limit) break;
             }
@@ -1040,6 +1045,9 @@ uint32_t watch_count() { return 0; }
 void watch_rearm() {}
 #endif
 
+// The clues of the Search (below), named here because the trial reports against them.
+enum : uint8_t { kByCode = 1, kByName = 2, kBySize = 4, kByLooseName = 8 };
+
 void run_trial(const std::vector<hunt::Entry>& given = {})
 {
     std::vector<hunt::Entry> scales; hunt::Target start;
@@ -1050,6 +1058,29 @@ void run_trial(const std::vector<hunt::Entry>& given = {})
             if (e.Confirmed() && !hunt::IsSizePair(e.kind) && scales.size() < 12) scales.push_back(e);
     }
     if (!given.empty()) scales = given; // the Search found it without the player's help
+    else if (g.search_wanted.load()) {
+        // The player moved the slider after all: that shows which numbers are the real ones. Were they
+        // among the numbers the Search nudged? (This is what tells a missed clue from a game that does not obey.)
+        std::vector<std::string> notes;
+        {
+            std::lock_guard<std::mutex> l(g.trial_m);
+            for (const hunt::Entry& e : scales) {
+                const auto it = g.search_cands.find(e.address);
+                char buf[300];
+                if (it == g.search_cands.end())
+                    std::snprintf(buf, sizeof buf, "Checked against the slider: %s followed the slider but was NOT among the numbers the Search nudged "
+                                  "(no clue pointed at it).", where_text(e.address).c_str());
+                else
+                    std::snprintf(buf, sizeof buf, "Checked against the slider: %s followed the slider and WAS among the numbers the Search nudged "
+                                  "(clue:%s%s%s%s).", where_text(e.address).c_str(), (it->second & kByCode) ? " render-scale code" : "",
+                                  (it->second & kByName) ? " precise name" : "", (it->second & kBySize) ? " beside the picture size" : "",
+                                  (it->second & kByLooseName) ? " loose name" : "");
+                notes.push_back(buf);
+            }
+            for (const auto& n : notes) g.search_lines.push_back(n);
+        }
+        for (const auto& n : notes) line("search: %s", n.c_str());
+    }
     const double home = start.Ratio();
     // A small nudge the player will not notice: five points down, or up when the game is already low.
     const double goal = home > 0.60 ? home - 0.05 : home + 0.05;
@@ -1119,7 +1150,10 @@ void run_trial(const std::vector<hunt::Entry>& given = {})
     }
     Sleep(1500); // the game's own writes that answer our last one
     watch_report(true);
-    watch_stop();
+    // A game that did not obey a written number applies its scale by a command: the watch stays on, so the
+    // next change of the slider shows which game code that is.
+    if (works || !given.empty()) watch_stop();
+    else line("writer watch: stays on (no written number moved the 3D picture): the next change of Render Scale shows the game's own apply code");
     write_verdict();
     if (works) {
         g.control_ready.store(true);
@@ -1137,14 +1171,23 @@ void run_trial(const std::vector<hunt::Entry>& given = {})
 // A game may keep the setting AND a copy of what is applied now, and act only when the two differ: moving
 // both together cancels out. So a group that does not answer is re-split at random before it is given up,
 // and a half is never assumed to hold the number because the other half did not answer.
-enum : uint8_t { kByCode = 1, kByName = 2, kBySize = 4, kByLooseName = 8 };
 struct Cand { uint64_t address = 0; hunt::Kind kind = hunt::Kind::ScaleF32; uint8_t source = 0; uint8_t saved[8]{}; bool written = false; };
 struct NameText { uint64_t address = 0; bool precise = false; char text[48]{}; };
+// Kept in a memory region of its own, which the text search skips: the list holds copies of the very
+// names it looks for, and would otherwise find itself over and over.
+struct NameList {
+    NameText* items = nullptr; size_t count = 0, cap = 0;
+    explicit NameList(size_t n) : items(static_cast<NameText*>(VirtualAlloc(nullptr, n * sizeof(NameText), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))), cap(items ? n : 0) {}
+    ~NameList() { if (items) VirtualFree(items, 0, MEM_RELEASE); }
+    NameList(const NameList&) = delete; NameList& operator=(const NameList&) = delete;
+    const NameText* begin() const { return items; }
+    const NameText* end() const { return items + count; }
+};
 
 // The setting names as text in the game's writable memory: a settings object often carries its own name.
 // Precise names (render scale, resolution scale, screen percentage...) and loose ones (scale factor,
 // upscale, sampling...) are limited separately, so a game full of loose names cannot crowd out the precise.
-void sweep_name_text(std::vector<NameText>* found, size_t precise_limit, size_t loose_limit, size_t* precise_left_out, size_t* loose_left_out)
+void sweep_name_text(NameList* found, size_t precise_limit, size_t loose_limit, size_t* precise_left_out, size_t* loose_left_out)
 {
     bool first[256]{};
     for (const char* word : kWords) first[uint8_t(word[0])] = true;
@@ -1154,14 +1197,14 @@ void sweep_name_text(std::vector<NameText>* found, size_t precise_limit, size_t 
     SYSTEM_INFO si{}; GetSystemInfo(&si);
     uint64_t at = reinterpret_cast<uint64_t>(si.lpMinimumApplicationAddress), scanned = 0;
     const uint64_t top = reinterpret_cast<uint64_t>(si.lpMaximumApplicationAddress);
-    const uint64_t own = reinterpret_cast<uint64_t>(buffer.data());
+    const uint64_t own = reinterpret_cast<uint64_t>(buffer.data()), own_list = reinterpret_cast<uint64_t>(found->items);
     while (at < top && scanned < kSweepBudget) {
         MEMORY_BASIC_INFORMATION m{};
         if (!VirtualQuery(ptr(at), &m, sizeof m)) break;
         const uint64_t base = reinterpret_cast<uint64_t>(m.BaseAddress), size = m.RegionSize;
         at = base + size;
         if (m.State != MEM_COMMIT || !writable_protect(m.Protect) || m.Type == MEM_MAPPED) continue;
-        if (base <= own && own < base + size) continue;
+        if ((base <= own && own < base + size) || (base <= own_list && own_list < base + size)) continue;
         for (uint64_t off = 0; off < size && scanned < kSweepBudget; off += kChunk) {
             const size_t want = size_t((std::min<uint64_t>)(kChunk + kTail, size - off));
             SIZE_T got = 0;
@@ -1180,12 +1223,12 @@ void sweep_name_text(std::vector<NameText>* found, size_t precise_limit, size_t 
                     for (size_t k = 1; k < n && same; ++k) same = lower(b[i + k]) == word[k];
                     if (!same) continue;
                     const bool is_precise = !loose_word(word);
-                    if (is_precise ? precise >= precise_limit : loose >= loose_limit) { ++*(is_precise ? precise_left_out : loose_left_out); i += n; break; }
+                    if (found->count >= found->cap || (is_precise ? precise >= precise_limit : loose >= loose_limit)) { ++*(is_precise ? precise_left_out : loose_left_out); i += n; break; }
                     size_t start = i;
                     while (start > 0 && i - start < 96 && name_char(b[start - 1])) --start;
-                    NameText t; t.address = base + off + start; t.precise = is_precise;
+                    NameText& t = found->items[found->count++];
+                    t = NameText{}; t.address = base + off + start; t.precise = is_precise;
                     for (size_t k = start, o = 0; k < got && o + 1 < sizeof t.text && b[k] >= 32 && b[k] < 127; ++k, ++o) t.text[o] = char(b[k]);
-                    found->push_back(t);
                     ++(is_precise ? precise : loose);
                     i += n;
                     break;
@@ -1387,7 +1430,7 @@ bool run_search()
     }
     const size_t by_code = found.size();
     // Clue: objects that carry a render-scale name (as text, or as a pointer to the text). Precise names first.
-    std::vector<NameText> names;
+    NameList names(24000);
     size_t precise_out = 0, loose_out = 0;
     sweep_name_text(&names, 20000, 4000, &precise_out, &loose_out);
     std::vector<uint64_t> precise_targets, loose_targets;
@@ -1426,6 +1469,7 @@ bool run_search()
     std::vector<Cand> c;
     c.reserve(found.size());
     for (const auto& kv : found) c.push_back(kv.second);
+    { std::lock_guard<std::mutex> l(g.trial_m); g.search_cands.clear(); for (const Cand& k : c) g.search_cands[k.address] = k.source; }
     // Groups in the order of how telling the clue is.
     std::vector<size_t> group[4];
     static const char* const kGroup[4] = {"read by the game's render-scale code", "in objects with a precise render-scale name", "beside the 3D picture's size",
@@ -1436,7 +1480,7 @@ bool run_search()
                "%zu %s [%zu size places], %zu %s [%zu name texts, %zu pointers].",
                double(GetTickCount64() - began) / 1000.0, c.size(), home * 100.0, group[0].size(), kGroup[0], group[1].size(), kGroup[1], precise_texts,
                precise_pointers.size(), group[2].size(), kGroup[2], (std::min<size_t>)(pairs, 6000), group[3].size(), kGroup[3],
-               names.size() - precise_texts, loose_pointers.size());
+               names.count - precise_texts, loose_pointers.size());
     if (precise_out || loose_out || found.size() >= kMaxCands || precise_pointers.size() >= 60000 || pairs > 6000)
         search_say("LIMITS REACHED, so some places were not looked at: %zu precise name texts and %zu loose name texts left out; candidate list %s; "
                    "pointers to precise names %s; size places %s.", precise_out, loose_out, found.size() >= kMaxCands ? "full" : "not full",
@@ -1550,6 +1594,10 @@ void trial_worker()
         hunt::Frame f;
         if (!ready || !live_frame(&f, 0)) continue;
         run_trial();
+        while (watch_on()) { // only when no written number worked: report the game's own writes as they come
+            Sleep(500);
+            if (watch_count() != reported) { reported = watch_count(); watch_report(false); write_verdict(); }
+        }
         return; // once a run
     }
 }
