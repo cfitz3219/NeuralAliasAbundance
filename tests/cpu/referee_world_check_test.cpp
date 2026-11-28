@@ -19,7 +19,7 @@ WorldGrid Wrong(const WorldGrid& from)
     return g;
 }
 // One look: two comparison frames and one small frame; returns the verdict of the small frame.
-WorldCheck::Verdict Look(WorldCheck& c, uint64_t& tag, const WorldGrid& ref0, const WorldGrid& ref1, const WorldGrid& small, bool inputs = true)
+WorldCheck::Verdict Look(WorldCheck& c, uint64_t& tag, const WorldGrid& ref0, const WorldGrid& ref1, const WorldGrid& drawn_small, bool inputs = true)
 {
     CHECK(c.Next() == WorldCheck::Frame::Reference && c.WantsSample());
     c.Drawn(WorldCheck::Frame::Reference, ++tag, inputs);
@@ -31,7 +31,7 @@ WorldCheck::Verdict Look(WorldCheck& c, uint64_t& tag, const WorldGrid& ref0, co
     CHECK(c.Next() == WorldCheck::Frame::Reference && !c.WantsSample());
     CHECK(c.Sampled(tag - 2, ref0) == WorldCheck::Verdict::None);
     CHECK(c.Sampled(tag - 1, ref1) == WorldCheck::Verdict::None);
-    return c.Sampled(tag, small);
+    return c.Sampled(tag, drawn_small);
 }
 } // namespace
 int main() { return test::run({

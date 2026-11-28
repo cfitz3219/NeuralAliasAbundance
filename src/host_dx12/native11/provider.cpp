@@ -284,7 +284,7 @@ struct Ctx {
     bool world_inputs_new = false;
     // This frame's count of the world's draws: the rehearsal and the WHY log read it at the frame's end.
     struct WorldTally {
-        uint32_t small = 0, would = 0, breaks = 0, inputs = 0, corners = 0;
+        uint32_t went_small = 0, would = 0, breaks = 0, inputs = 0, corners = 0; // ("small" alone is a macro in the Windows headers)
         uint32_t restores = 0; // times the full-size pictures were (or, in a rehearsal, would be) brought up to date mid-frame
         uint32_t held[size_t(WorldHold::kCount)] = {};
         bool last_passed = false;
@@ -3433,7 +3433,7 @@ WorldDraw DrawWorld(ID3D11DeviceContext* c, Ctx* x, Forward& forward)
     if (depth_written) x->world_depth_dirty = true;
     if (x->world_draw_frame != g_frame) { x->world_draw_frame = g_frame; x->world_draws = 0; }
     ++x->world_draws;
-    ++x->tally.small;
+    ++x->tally.went_small;
     return WorldDraw::Small;
 }
 
@@ -3481,7 +3481,7 @@ void WorldRouteFrame(uint64_t ended)
             if (tally.held[i] && (most == WorldHold::None || tally.held[i] > tally.held[size_t(most)])) most = WorldHold(i);
         if (job->refused.load(std::memory_order_acquire)) why = job->missed_evaluations >= 3 ? WorldHold::Evaluator : WorldHold::PictureKind;
         else if (!job->ready.load(std::memory_order_acquire)) why = WorldHold::Preparing;
-        else if (!(tally.small + tally.would))
+        else if (!(tally.went_small + tally.would))
             why = most != WorldHold::None ? most : owner->world_list_frame == ended ? WorldHold::RecordedLists : outside != WorldHold::None ? outside : WorldHold::NoWorldDraws;
         else if (tally.breaks > kWorldBreaks || tally.restores > kWorldRestores) why = most != WorldHold::None ? most : WorldHold::Interleaved;
         else if (job->last_receipt != ended) why = WorldHold::Reader;
@@ -3517,7 +3517,7 @@ void WorldRouteFrame(uint64_t ended)
     st.state = small_now ? (r.check.Looking() ? State::Checking : State::Small)
              : (why == WorldHold::Preparing || why == WorldHold::None || ended - r.asked_frame < 240) && !r.check.Failed() ? State::Preparing : State::Held;
     st.why = small_now ? WorldHold::None : why;
-    st.small_draws = tally.small; st.held_draws = 0; st.breaks = tally.breaks;
+    st.small_draws = tally.went_small; st.held_draws = 0; st.breaks = tally.breaks;
     for (size_t i = 1; i < size_t(WorldHold::kCount); ++i) st.held_draws += tally.held[i];
     st.looks = r.check.Looks();
     st.inputs = referee::Name(r.check.Inputs());
@@ -3534,7 +3534,7 @@ void WorldRouteFrame(uint64_t ended)
             " held_by{%s } rehearsal=%u/%u live=%d inputs=%s looks=%u corner_fills=%llu shaders{known=%llu unknown=%llu}%s%s",
             st.state == State::Small ? "small" : st.state == State::Checking ? "small(referee-looking)" : st.state == State::Preparing ? "preparing" : "held",
             asked, WorldHoldText(st.why), (unsigned long long)st.small_frames, (unsigned long long)st.reference_frames, (unsigned long long)st.held_frames,
-            tally.small, tally.would, st.held_draws, tally.breaks, tally.restores, tally.inputs, tally.corners, holds, r.rehearsal.Clean(), r.rehearsal.Needed(), int(r.live),
+            tally.went_small, tally.would, st.held_draws, tally.breaks, tally.restores, tally.inputs, tally.corners, holds, r.rehearsal.Clean(), r.rehearsal.Needed(), int(r.live),
             st.inputs, st.looks, (unsigned long long)st.corner_fills,
             (unsigned long long)g_ps_known.load(std::memory_order_relaxed), (unsigned long long)g_ps_unknown.load(std::memory_order_relaxed),
             input_why ? " input_refused=" : "", input_why ? input_why : "");
