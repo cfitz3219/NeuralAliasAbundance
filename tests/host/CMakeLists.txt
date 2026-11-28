@@ -540,6 +540,10 @@ if(TARGET host_native11)
   set_tests_properties(host_native11_depth_reads_test host_native11_depth_reads_warp_test host_native11_depth_reads_debug_test
     PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "host;gpu")
   if(NA_HAVE_NGX_LIB AND NA_DLSS_DLL)
+    na_host_test(native11_scaled_output_test SOURCES native11_scaled_output_test.cpp
+      LIBS host_native_d3d11_shared host_dlss d3dcompiler ARGS "${CMAKE_CURRENT_BINARY_DIR}/native11-scaled-output" LABELS "gpu;nvidia")
+    add_custom_command(TARGET native11_scaled_output_test POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${NA_DLSS_DLL}" "$<TARGET_FILE_DIR:native11_scaled_output_test>")
     na_host_test(native11_dlaa_test SOURCES native11/provider_test.cpp LIBS host_dx12 LABELS "gpu;nvidia")
     target_compile_definitions(native11_dlaa_test PRIVATE NA_TEST_NATIVE_DLAA)
     add_test(NAME host_native11_dlaa_automatic_test COMMAND native11_dlaa_test --automatic)
