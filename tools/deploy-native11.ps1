@@ -94,15 +94,26 @@ function Save-Results([string] $why) {
     Log "Results saved to $dst"
     return $dst
 }
+function Assert-PrivateFolder([string] $folder) {
+    if (Test-Path -LiteralPath $folder) {
+        $item = Get-Item -LiteralPath $folder -Force
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Private DLSS folder is not a regular directory: $folder"
+        }
+    }
+}
 function Invoke-Rollback {
     if (-not (Test-Path -LiteralPath $Manifest)) { Log 'No installation record found; nothing to remove.'; return }
     $m = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
     if ($m.restoredUtc) { Log 'Already removed.'; return }
+    $private = Join-Path $GameDir 'NeuralAlias-DLSS'
+    if ($m.privateDlss) { Assert-PrivateFolder $private }
     foreach ($f in $m.files) {
         $name = [IO.Path]::GetFileName($f.path)
         $full = [IO.Path]::GetFullPath($f.path)
         # Our own files sit beside the exe; a component (another lane's file, e.g. a material pack) sits at its recorded place below it.
         $mine = if ($f.component) { $full.StartsWith($GameDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) } else { $name -in $Owned -and $full -eq (Join-Path $GameDir $name) }
+        if ($m.privateDlss -and $full -eq (Join-Path $private 'nvngx_dlss.dll')) { $mine = $true }
         if (-not $mine) { throw 'The installation record does not match this game folder. Nothing removed.' }
         if ($name -eq 'NeuralAliasHost.ini') { continue } # menu settings are saved into it: no hash guard
         if ((Test-Path -LiteralPath $f.path) -and (Get-FileHash -LiteralPath $f.path).Hash -ne $f.deployedHash) { throw "Changed since install, left untouched: $($f.path)" }
@@ -111,6 +122,10 @@ function Invoke-Rollback {
         if (-not (Test-Path -LiteralPath $f.path)) { continue }
         if ([IO.Path]::GetFileName($f.path) -eq 'NeuralAliasHost.ini') { Copy-Item -LiteralPath $f.path -Destination (Join-Path $Evid 'NeuralAliasHost-saved.ini') -Force }
         Remove-Item -LiteralPath $f.path
+    }
+    if ($m.createdPrivateDirectory -and (Test-Path -LiteralPath $private -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $private -Force).Count -eq 0) {
+        [IO.Directory]::Delete($private, $false)
     }
     $now = @(Get-ChildItem -LiteralPath $GameDir -Force | ForEach-Object { "{0}|{1}" -f $_.Name, $(if ($_.PSIsContainer) { 'dir' } else { $_.Length }) })
     $diff = Compare-Object -ReferenceObject @($m.folderSnapshot) -DifferenceObject $now
@@ -171,7 +186,18 @@ try {
         Move-Item -LiteralPath $Evid -Destination ($Evid + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
     }
     New-Item -ItemType Directory -Force -Path $Evid | Out-Null
-    foreach ($n in $Owned + 'd3d11.dll' + @($components | ForEach-Object { [string]$_.dest })) { if (Test-Path -LiteralPath (Join-Path $GameDir $n)) { throw "$n already exists in the game folder. This script never overwrites game files. Nothing changed." } }
+    $private = Join-Path $GameDir 'NeuralAlias-DLSS'
+    $privateDlss = $haveDlss -and $gameBits -eq '64-bit' -and (Test-Path -LiteralPath (Join-Path $GameDir 'nvngx_dlss.dll') -PathType Leaf)
+    $createPrivateDirectory = $false
+    $destinations = $Owned
+    $dlssDest = 'nvngx_dlss.dll'
+    if ($privateDlss) {
+        Assert-PrivateFolder $private
+        $createPrivateDirectory = -not (Test-Path -LiteralPath $private)
+        $dlssDest = 'NeuralAlias-DLSS\nvngx_dlss.dll'
+        $destinations = @($Owned | Where-Object { $_ -ne 'nvngx_dlss.dll' }) + $dlssDest
+    }
+    foreach ($n in $destinations + 'd3d11.dll' + @($components | ForEach-Object { [string]$_.dest })) { if (Test-Path -LiteralPath (Join-Path $GameDir $n)) { throw "$n already exists in the game folder. This script never overwrites game files. Nothing changed." } }
 
     $ini = Join-Path $Evid 'NeuralAliasHost.ini'
     @"
@@ -248,7 +274,7 @@ camera_inputs=1
 enabled=0
 "@ | Set-Content -LiteralPath $ini -Encoding ascii
     $sources = [ordered]@{ 'dxgi.dll' = $dll; 'NeuralAliasHost.ini' = $ini }
-    if ($haveDlss) { $sources['nvngx_dlss.dll'] = $sdkDll }
+    if ($haveDlss) { $sources[$dlssDest] = $sdkDll }
     if ($haveDlss -and $haveCompanion) { $sources['NeuralAliasDlaa64.exe'] = $companion }
     $lic = Join-Path $PSScriptRoot 'AMD-OpticalFlow-LICENSE.txt'
     if (Test-Path -LiteralPath $lic) { $sources['NeuralAlias-AMD-OpticalFlow-LICENSE.txt'] = $lic }
@@ -256,8 +282,10 @@ enabled=0
     $files += @(foreach ($c in $components) { @{ path = (Join-Path $GameDir ([string]$c.dest)); source = (Join-Path $PSScriptRoot $c.name); deployedHash = [string]$c.sha256; component = $true } })
     $snapshot = @(Get-ChildItem -LiteralPath $GameDir -Force | ForEach-Object { "{0}|{1}" -f $_.Name, $(if ($_.PSIsContainer) { 'dir' } else { $_.Length }) })
     @{ createdUtc = [DateTime]::UtcNow.ToString('o'); sourceCommit = $commit; gameBits = $gameBits; proxyBits = $proxyBits; dlssRuntime = $haveDlss
+       privateDlss = $privateDlss; createdPrivateDirectory = $createPrivateDirectory
        folderSnapshot = $snapshot; gameExeHash = (Get-FileHash -LiteralPath $gameExe).Hash; files = $files } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Manifest
     $installStarted = $true
+    if ($createPrivateDirectory) { New-Item -ItemType Directory -Path $private -ErrorAction Stop | Out-Null }
     foreach ($f in $files) {
         [IO.File]::Copy($f.source, $f.path, $false)
         if ((Get-FileHash -LiteralPath $f.path).Hash -ne $f.deployedHash) { throw 'Install hash mismatch' }

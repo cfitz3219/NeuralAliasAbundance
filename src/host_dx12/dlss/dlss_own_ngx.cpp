@@ -8,6 +8,7 @@
 #include <nvsdk_ngx_defs.h>
 
 #include <cstdio>
+#include <initializer_list>
 
 namespace na::dlss {
 
@@ -25,16 +26,20 @@ bool OwnInit(ID3D12Device* device, const wchar_t* data_path, Api* api, char* rea
     }
     // Route B live Frame Generation: the package's own folder is one more read-only place NVIDIA's
     // runtime looks for its feature files (nvngx_dlssg.dll). Nothing is copied anywhere.
+    // NeuralAlias's own DLSS file's folder comes first: it is found before an old file a game ships
+    // beside its program (measured 2026-11-27: with 2.4.0.0 beside the program and 310.9.16 here, 310.9.16 is used).
     NVSDK_NGX_FeatureCommonInfo info{};
-    const wchar_t* folder = OwnSearchFolder();
-    const wchar_t* paths[1] = {folder};
-    if (folder && folder[0]) {
+    const wchar_t* paths[2] = {};
+    unsigned count = 0;
+    for (const wchar_t* folder : {OwnDlssFolder(), OwnSearchFolder()})
+        if (folder && folder[0]) paths[count++] = folder;
+    if (count) {
         info.PathListInfo.Path = paths;
-        info.PathListInfo.Length = 1;
+        info.PathListInfo.Length = count;
     }
     const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM,
                                                                    kEngineVersion, data_path, device,
-                                                                   folder && folder[0] ? &info : nullptr);
+                                                                   count ? &info : nullptr);
     if (NVSDK_NGX_FAILED(r)) {
         std::snprintf(reason, 128, "The NVIDIA DLSS runtime did not start (code 0x%08X). Is this an RTX GPU with a current driver?",
                       static_cast<unsigned>(r));

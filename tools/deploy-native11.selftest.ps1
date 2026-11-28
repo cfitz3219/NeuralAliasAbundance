@@ -57,6 +57,16 @@ Check ((Test-Path -LiteralPath (Join-Path $same 'NeuralAliasDlaa64.exe')) -eq $d
 Check ((Run 'Rollback' $same 'same') -eq 0) 'uninstalls all of it'
 $after = @(Get-ChildItem -LiteralPath $same -Force -Recurse | ForEach-Object FullName)
 Check (-not (Compare-Object $before $after)) 'game folder and its subfolders are exactly as before'
+if (-not $dllIs32) {
+    $stock = Join-Path $same 'nvngx_dlss.dll'
+    Copy-Item -LiteralPath (Join-Path $env:WINDIR 'System32\kernel32.dll') -Destination $stock
+    $stockHash = (Get-FileHash -LiteralPath $stock).Hash
+    Check ((Run 'Deploy' $same 'same') -eq 0) 'a bundled game runtime permits a private side-by-side install'
+    $private = Join-Path $same 'NeuralAlias-DLSS'
+    Check ((Get-FileHash -LiteralPath (Join-Path $private 'nvngx_dlss.dll')).Hash -eq (Get-FileHash -LiteralPath (Join-Path $pkg 'nvngx_dlss.dll')).Hash) 'the private runtime matches the package'
+    Check ((Run 'Rollback' $same 'same') -eq 0) 'rolls back the private installation'
+    Check (((Get-FileHash -LiteralPath $stock).Hash -eq $stockHash) -and -not (Test-Path -LiteralPath $private)) 'rollback keeps the original game DLL and removes only its own private folder'
+}
 Write-Package @(@{ name = 'extra.pack'; sha256 = (Get-FileHash -LiteralPath (Join-Path $pkg 'extra.pack')).Hash; dest = '..\escape.pack' })
 Check ((Run 'Deploy' $same 'same') -ne 0) 'refuses a component that points outside the game folder'
 Check (-not (Test-Path -LiteralPath (Join-Path $same 'dxgi.dll'))) 'and installs nothing in that case'
