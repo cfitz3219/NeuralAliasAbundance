@@ -3,6 +3,7 @@
 #include "core/replay_movers.hpp"
 #include "core/anisotropic_auto.hpp"
 #include "core/temporal_jitter.hpp"
+#include "host_dx12/scale/scale_witness.hpp"
 #include "host_dx12/diag/event_log.hpp"
 #include "host_dx12/observe/producers.hpp"
 
@@ -4250,8 +4251,10 @@ struct On<sl::list::RSSetViewports> {
     {
         Rec r;
         if (!begin_op(l, &r)) return;
+        na_object_id bound_rt = 0, bound_ds = 0;
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
+            bound_rt = ls.cur_rt; bound_ds = ls.cur_ds;
             ++ls.viewport_serial;ls.raster_viewports_known = n <= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE && (!n || v);
             if (ls.raster_viewports_known) {
                 ls.raster_viewport_count = n;
@@ -4259,6 +4262,13 @@ struct On<sl::list::RSSetViewports> {
             }
         });
         if (!n || !v) return;
+        // Scale witness (log only): which game code sizes the world, and with what number.
+        if (na::scale::witness::Active() && (bound_rt || bound_ds)) {
+            uint64_t live_depth = 0, live_color = 0;
+            GetLiveSelection(&live_depth, &live_color);
+            if ((live_color && bound_rt == live_color) || (live_depth && bound_ds == live_depth))
+                na::scale::witness::OnWorldViewport("DX12", v[0].Width, v[0].Height);
+        }
         // Every viewport (review): 6 floats each, first one also in a[].
         constexpr UINT kMax = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
         float all[kMax * 6];
@@ -8115,6 +8125,7 @@ PresentToken PresentBegin(IDXGISwapChain* chain)
         if (SUCCEEDED(chain->GetDesc(&d))) {
             e.buffer_count=d.BufferCount;e.format=d.BufferDesc.Format;
             e.width=d.BufferDesc.Width;e.height=d.BufferDesc.Height;
+            na::scale::witness::NoteOutput(e.width,e.height);
         }
         remember_creation(chain,e);emit(e,NA_GROUP_SWAPCHAIN);
     }
@@ -8152,6 +8163,7 @@ void SwapchainResized(IDXGISwapChain* chain,int32_t result)
     if(known){
         e.width=desc.BufferDesc.Width;e.height=desc.BufferDesc.Height;
         e.format=desc.BufferDesc.Format;e.buffer_count=desc.BufferCount;
+        na::scale::witness::NoteOutput(e.width,e.height);
         // Snapshot/restart consumers also need the latest description. Preserve
         // original creation provenance; an unobserved generation stays unknown.
         std::unique_lock<RegistryLock> lock(g_m);

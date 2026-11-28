@@ -1,3 +1,4 @@
+#include "host_dx12/scale/scale_witness.hpp"
 #include "host_dx12/capture/j2_capture.hpp"
 #include "host_dx12/background/work.hpp"
 #include "host_dx12/capture/capture_session.hpp"
@@ -176,6 +177,23 @@ DWORD WINAPI InitThread(LPVOID)
             if(ready)na::j2::EnableNativeScaleBridge(true);
             boot_log(ready?"native scale: engine-owned settings control installed":"native scale: settings relationship unavailable; native DLAA retained");
         }else boot_log(na::scale::StartSliderRoute(mode, scale_log) ? "slider route: settings read hook installed" : "slider route: read hook failed");
+    }
+    // Scale witness (Cort 2026-11-28, log only): finds the game code and the number that size the
+    // world, the first step to hijacking the game's own render-scale command. Never writes game
+    // memory. [scale] witness=0 turns it off. Its log goes beside the status log.
+    if (GetPrivateProfileIntW(L"j2", L"enabled", 0, g_ini) == 1 && GetPrivateProfileIntW(L"scale", L"witness", 1, g_ini) != 0 &&
+        !na::settings::SafeStart()) {
+        wchar_t witness_log[MAX_PATH];
+        lstrcpynW(witness_log, g_ini, MAX_PATH);
+        wchar_t custom[MAX_PATH] = {};
+        if (GetPrivateProfileStringW(L"host", L"status_log", L"", custom, MAX_PATH, g_ini) > 0) lstrcpynW(witness_log, custom, MAX_PATH);
+        for (int i = lstrlenW(witness_log) - 1; i >= 0; --i)
+            if (witness_log[i] == L'\\' || witness_log[i] == L'/') { witness_log[i] = 0; break; }
+        wchar_t name[64];
+        swprintf_s(name, L"\\NeuralAlias-scale-witness-%lu.log", GetCurrentProcessId());
+        lstrcatW(witness_log, name);
+        na::scale::witness::Start(witness_log);
+        boot_log("scale witness: on (log only; finds the game code and number that size the world)");
     }
     // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
     // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1

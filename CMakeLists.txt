@@ -156,6 +156,10 @@ add_subdirectory(src/host_dx12/native_present)
 add_library(host_scale STATIC src/host_dx12/scale/settings_read_hook.cpp src/host_dx12/scale/live_driver.cpp
   src/host_dx12/scale/native_control.cpp)
 target_link_libraries(host_scale PUBLIC abundance_options host_hooking)
+# Scale witness (Cort 2026-11-28): log-only finder of the game code and number that size the
+# world (the render scale), for hijacking the game's own slider command. Both APIs call it.
+add_library(host_scale_witness STATIC src/host_dx12/scale/scale_witness.cpp)
+target_link_libraries(host_scale_witness PUBLIC abundance_options PRIVATE minhook)
 
 add_library(host_observe STATIC src/host_dx12/host_observe.cpp)
 target_link_libraries(host_observe PUBLIC abundance_options)
@@ -171,14 +175,14 @@ add_library(host_observe_producers STATIC
   src/host_dx12/observe/producers.cpp
   src/host_dx12/observe/d3d12_slots_check.cpp)
 target_sources(host_observe_producers PRIVATE src/host_dx12/observe/shader_dimensions.cpp)
-target_link_libraries(host_observe_producers PUBLIC abundance_options host_observe host_hooking d3d12 d3dcompiler)
+target_link_libraries(host_observe_producers PUBLIC abundance_options host_observe host_hooking host_scale_witness d3d12 d3dcompiler)
 
 # Plan B1 (native DX11 route): D3D11 input provider. Isolated and inactive:
 # nothing installs it until Astra's B2 handoff lands; built so CI compiles it.
 add_library(host_native11 STATIC src/host_dx12/native11/provider.cpp src/host_dx12/native11/samplers.cpp
             src/host_dx12/native11/textures.cpp src/host_dx12/native11/proxy_views.cpp src/host_dx12/native11/hud_free.cpp src/host_dx12/native11/coarse11.cpp src/host_dx12/native11/texture_loader.cpp src/host_dx12/native11/depth_reads.cpp
             src/host_dx12/native11/draw_replay.cpp)
-target_link_libraries(host_native11 PUBLIC abundance_options host_hooking host_native_d3d11_shared d3d11 dxgi PRIVATE d3dcompiler nvapi_headers)
+target_link_libraries(host_native11 PUBLIC abundance_options host_hooking host_scale_witness host_native_d3d11_shared d3d11 dxgi PRIVATE d3dcompiler nvapi_headers)
 
 add_library(host_settings STATIC src/host_dx12/settings.cpp)
 target_link_libraries(host_settings PUBLIC abundance_options PRIVATE shell32 ole32)

@@ -138,6 +138,7 @@ na_host_test(gpu_constants_test SOURCES gpu_constants_test.cpp LIBS host_scene_s
 na_host_test(shader_operation_test SOURCES shader_operation_test.cpp LIBS host_observe_producers d3d12 dxgi d3dcompiler)
 na_host_test(render_scale_patch_test SOURCES render_scale_patch_test.cpp)
 na_host_test(settings_read_hook_test SOURCES settings_read_hook_test.cpp LIBS host_scale)
+na_host_test(scale_witness_test SOURCES scale_witness_test.cpp LIBS minhook)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
 na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12)
