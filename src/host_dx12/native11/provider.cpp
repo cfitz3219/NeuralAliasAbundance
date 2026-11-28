@@ -331,6 +331,7 @@ struct Ctx {
         raster_depth_layer = {};
         target_width = target_height = 0;
         depth_layer_target = material_layer_target = vpj_shader_depth = vpj_still_mesh = vpj_overlay = false;
+        world_bound = false;
         stationary = {};
         vpj_still_class = 0;
         depth_test = true;

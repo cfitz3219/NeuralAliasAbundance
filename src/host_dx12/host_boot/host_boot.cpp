@@ -191,9 +191,11 @@ DWORD WINAPI InitThread(LPVOID)
             if (witness_log[i] == L'\\' || witness_log[i] == L'/') { witness_log[i] = 0; break; }
         wchar_t name[64];
         swprintf_s(name, L"\\NeuralAlias-scale-witness-%lu.log", GetCurrentProcessId());
-        lstrcatW(witness_log, name);
-        na::scale::witness::Start(witness_log);
-        boot_log("scale witness: on (log only; finds the game code and number that size the world)");
+        if (lstrlenW(witness_log) + lstrlenW(name) < MAX_PATH) {
+            lstrcatW(witness_log, name);
+            na::scale::witness::Start(witness_log);
+            boot_log("scale witness: on (log only; several searches for the game's render-scale number run together)");
+        } else boot_log("scale witness: off (the log folder's path is too long)");
     }
     // J2 DLAA reconstructs texture detail over frames: the game's mip-mapped
     // samplers sample one mip sharper (temporal-upscaler rule log2(render/display) - 1

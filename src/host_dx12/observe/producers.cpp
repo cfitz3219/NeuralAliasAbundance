@@ -1119,6 +1119,10 @@ void note_resource(ID3D12Device* dev, IUnknown* obj, uint32_t creation_kind, ID3
         cpu_visible = cpu_visible_heap(hp);
     }
     res->Release();
+    // Scale witness (log only): the game code that creates world-sized pictures to draw into.
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && !t_host_work &&
+        (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) && na::scale::witness::Active())
+        na::scale::witness::OnTargetCreated("DX12", static_cast<uint32_t>(d.Width), d.Height);
 
     const na_object_id dev_id = device_id(dev);
     const na_object_id id = register_object(obj, NA_OBJ_RESOURCE);
@@ -4760,10 +4764,23 @@ struct On<sl::list::OMSetRenderTargets> {
         }
         emit_op(r, NA_OP_OM_SET_RENDER_TARGETS, {std::min<UINT>(n, 8), dsv ? 1u : 0u}, refs, m * static_cast<uint32_t>(sizeof(na_view_ref)), sizeof(na_view_ref), 0,
                 NA_GROUP_RESOURCE_USE);
+        float world_vp_w = 0, world_vp_h = 0;
+        na_object_id bound_rt = 0, bound_ds = 0;
         with_list_state(l, [&](ListState& ls) {
             std::lock_guard<std::mutex> bl(ls.bind_m);
             set_targets_locked(ls, refs, m, dsv != nullptr);
+            if (ls.raster_viewports_known && ls.raster_viewport_count) {
+                bound_rt = ls.cur_rt; bound_ds = ls.cur_ds;
+                world_vp_w = ls.raster_viewports[0].Width; world_vp_h = ls.raster_viewports[0].Height;
+            }
         });
+        // Scale witness (log only): engines that set the viewport before binding the world.
+        if (world_vp_w > 0 && (bound_rt || bound_ds) && na::scale::witness::Active()) {
+            uint64_t live_depth = 0, live_color = 0;
+            GetLiveSelection(&live_depth, &live_color);
+            if ((live_color && bound_rt == live_color) || (live_depth && bound_ds == live_depth))
+                na::scale::witness::OnWorldViewport("DX12", world_vp_w, world_vp_h);
+        }
         notify_raster_state(l);
     }
 };
