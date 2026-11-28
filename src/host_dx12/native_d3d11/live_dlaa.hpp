@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 
 struct IDXGISwapChain;
 struct ID3D12CommandQueue;
