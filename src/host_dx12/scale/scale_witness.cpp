@@ -89,6 +89,7 @@ struct State {
     uint64_t control_address = 0; hunt::Kind control_kind = hunt::Kind::ScaleF32; double control_home = 1.0; // fixed once ready
     std::atomic<uint32_t> control_asked{0}; // wanted scale in 1/10000; 0: the game's own value
     std::atomic<uint64_t> control_changed_ms{0};
+    std::atomic<int> control_poke{0}; // 0: the game reads the number by itself; else the poke that makes it re-apply
     int search_state = 0;            // under trial_m. 0 not started, 1 running, 2 found, 3 not found, 4 stopped
     std::string search_text;         // under trial_m: the one-sentence outcome and why
     std::vector<std::string> search_lines; // under trial_m: what each step saw
@@ -617,7 +618,10 @@ void write_verdict()
             for (const auto& r : g.trial_rows)
                 if (!r.skipped && (r.verdict == hunt::Verdict::Responded || r.verdict == hunt::Verdict::Snapped) && r.restored && !works) works = &r;
             std::fprintf(f, "\nWRITING TRIAL (NeuralAlias sets the number itself; the game's own value is put back after each try)\n");
-            if (g.trial_state == 0)
+            if (g.trial_state == 0 && g.control_ready.load() && g.control_poke.load())
+                std::fprintf(f, "HIJACK: PASS. The game takes a new render scale when the number is written and the game is then given a signal "
+                                "to rebuild its pictures. NeuralAlias did both by itself and put the game's own value back.\n");
+            else if (g.trial_state == 0)
                 std::fprintf(f, "HIJACK: NOT RUN YET. It starts by itself once a scale number is confirmed and the world has been steady for 6 seconds.\n");
             else if (g.trial_state == 1) std::fprintf(f, "HIJACK: RUNNING (%zu tried so far)\n", g.trial_rows.size());
             else if (g.trial_state == 3) std::fprintf(f, "HIJACK: STOPPED. %s\n", g.trial_note.c_str());
@@ -1164,6 +1168,49 @@ void run_trial(const std::vector<hunt::Entry>& given = {})
     line("trial: finished");
 }
 
+// ---- pokes: signals every game answers by rebuilding its pictures, at which point it reads its settings ----
+// For a game that reads its render scale only when its own apply step runs (Crusader Kings III 2026-11-28:
+// the numbers beside "render_scale" were found, and writing them changed nothing).
+constexpr int kPokes = 3;
+const char* const kPokeName[kPokes + 1] = {"nothing more", "a window-size message", "a display-change message", "a brief real change of the window's size"};
+struct WindowPick { HWND best = nullptr; long long area = 0; };
+BOOL CALLBACK pick_window(HWND w, LPARAM p)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    RECT r{};
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(w) || !GetClientRect(w, &r)) return TRUE;
+    WindowPick* pick = reinterpret_cast<WindowPick*>(p);
+    const long long area = static_cast<long long>(r.right) * r.bottom;
+    if (area > pick->area) { pick->area = area; pick->best = w; }
+    return TRUE;
+}
+// Never waits on the game's thread: messages are posted, and the real resize is asynchronous.
+bool do_poke(int poke)
+{
+    WindowPick pick;
+    EnumWindows(&pick_window, reinterpret_cast<LPARAM>(&pick));
+    const HWND w = pick.best;
+    RECT client{}, outer{};
+    if (!w || !GetClientRect(w, &client) || !GetWindowRect(w, &outer)) return false;
+    if (poke == 1) {
+        PostMessageW(w, WM_SIZE, SIZE_RESTORED, MAKELPARAM(client.right, client.bottom));
+        PostMessageW(w, WM_EXITSIZEMOVE, 0, 0);
+        Sleep(100);
+    } else if (poke == 2) {
+        PostMessageW(w, WM_DISPLAYCHANGE, 32, MAKELPARAM(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)));
+        Sleep(100);
+    } else if (poke == 3) {
+        const int width = outer.right - outer.left, height = outer.bottom - outer.top;
+        const UINT flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+        if (height < 64 || !SetWindowPos(w, nullptr, 0, 0, width, height - 8, flags)) return false;
+        Sleep(700);
+        SetWindowPos(w, nullptr, 0, 0, width, height, flags);
+        Sleep(500);
+    } else return false;
+    return true;
+}
+
 // ---- THE SEARCH: find the render-scale number at launch, with no help from the player ----
 // What never changes between launches: the number holds the starting value, it sits in an object that
 // carries a render-scale name or beside the 3D picture's size, and the game obeys it. Candidates are
@@ -1282,6 +1329,7 @@ struct Nudger {
     uint32_t wait_ms = 2500;   // how long a game is given to answer; shortened once its speed is known
     unsigned nudges = 0, answered = 0;
     uint32_t slowest_answer_ms = 0;
+    int poke = 0;              // after writing (and after putting back), give the game this signal to re-apply
 
     // Writes the nudge to every listed candidate, watches the world, puts every value back and waits for the
     // world to come home. 1: the world moved. 0: it did not. -1: no evidence (a menu). -2: it did not come home.
@@ -1296,19 +1344,22 @@ struct Nudger {
             if (!safe_read(k.address, k.saved, n) || !hunt::Holds(k.saved, n, k.kind, start)) continue; // gone, or the game changed it
             k.written = write_scale(k.address, k.kind, goal);
         }
+        if (poke) do_poke(poke);
         const uint64_t t0 = GetTickCount64();
         int away = 0, seen = 0;
         bool moved = false;
+        const int enough = poke ? 10 : 3; // a poke rebuilds the pictures: only a size that stays counts
         while (GetTickCount64() - t0 < wait_ms && !moved) {
             Sleep(kTickMs);
             if (!live_frame(&f, 0)) continue;
             ++seen;
             away = std::fabs(double(f.world_w) / double(f.out_w) - home) > 0.012 ? away + 1 : 0;
-            moved = away >= 3;
+            moved = away >= enough;
         }
         const uint32_t took = uint32_t(GetTickCount64() - t0);
         for (const size_t i : set)
             if (c[i].written) safe_write(c[i].address, c[i].saved, kind_bytes(c[i].kind));
+        if (poke) do_poke(poke);
         const uint64_t t1 = GetTickCount64();
         int steady = 0; bool back = false, live = false;
         while (GetTickCount64() - t1 < 6000 && !back) {
@@ -1370,6 +1421,7 @@ struct Nudger {
         uint32_t seed = 0x9e3779b9u;
         int r = nudge(set, what);
         if (r < 0) return r == -2 ? -2 : -3;
+        if (r == 0 && poke) return -1; // a forced re-apply reads the setting whatever the copies hold: no cancelling to rule out
         if (r == 0) {
             // Nothing as a whole: perhaps a setting and its applied copy cancelled out. Split by each bit of the
             // position in the list: any two numbers are apart in at least one of these splits, so a setting is
@@ -1542,6 +1594,27 @@ bool run_search()
     }
     search_say("Nudged to %.0f%%: %u nudges in %.1f s (%u answered; slowest answer %u ms), every value put back after each.", goal * 100.0, n.nudges,
                double(GetTickCount64() - nudging) / 1000.0, n.answered, n.slowest_answer_ms);
+    // No number is read by the game on its own. Then: write, and tell the game its window changed, so that
+    // it rebuilds its pictures and reads its settings. The loose-name group is left out (too many unrelated
+    // numbers to hold changed through a rebuild).
+    int used_poke = 0;
+    if (at == -1 && !cancelled) {
+        const uint64_t poking = GetTickCount64();
+        const unsigned before = n.nudges;
+        for (int poke = 1; poke <= kPokes && at == -1; ++poke) {
+            n.poke = poke; n.wait_ms = 3000;
+            for (int k = 0; k < 3 && at == -1; ++k) {
+                if (group[k].empty()) continue;
+                const long long r = n.find(group[k], kGroup[k]);
+                search_say("Written, then %s: group \"%s\" (%zu numbers): %s.", kPokeName[poke], kGroup[k], group[k].size(),
+                           r >= 0 ? "one number moved the 3D picture" : r == -1 ? "no answer" : r == -4 ? "the group answered but no single number did"
+                           : r == -2 ? "the picture did not come back" : "no 3D picture to judge by");
+                if (r == -2 || r == -3) at = r;
+                else if (r >= 0) { at = r; from = k; used_poke = poke; }
+            }
+        }
+        search_say("Write-then-signal: %u nudges in %.1f s.", n.nudges - before, double(GetTickCount64() - poking) / 1000.0);
+    }
     if (at < 0) {
         if (at == -2)
             search_end(4, "After a nudge the game's 3D picture did not return to its own size, so the Search stopped. Set Render Scale in the "
@@ -1551,12 +1624,29 @@ bool run_search()
             search_end(3, "A group of numbers moved the 3D picture but no single one did when nudged alone: this game needs more than one "
                           "number changed together.");
         else
-            search_end(3, "None of the %zu numbers moved the 3D picture when nudged to %.0f%%, as whole groups or split (each given %.1f s to "
-                          "answer): the game does not act on a change of these numbers. Its own apply command is the next thing to look for.",
-                       c.size(), goal * 100.0, 2.5);
+            search_end(3, "None of the %zu numbers moved the 3D picture when nudged to %.0f%%: not by itself (whole groups and every split, %.1f s "
+                          "each), and not when the game was then told its window changed (size message, display message, a brief real "
+                          "resize). The game applies its render scale only through its own menu.", c.size(), goal * 100.0, 2.5);
         return finish(false);
     }
     const Cand& hit = c[size_t(at)];
+    if (used_poke) {
+        search_end(2, "%s at %s is the game's render scale. The game reads it only when it rebuilds its pictures: written alone and followed by "
+                      "%s, it moved the 3D picture to %.0f%%, three times out of three, and the picture came back each time. Clue that led "
+                      "to it: %s. Whole Search: %.1f s, no slider moves.", hunt::KindName(hit.kind), where_text(hit.address).c_str(),
+                   kPokeName[used_poke], goal * 100.0, kGroup[from], double(GetTickCount64() - began) / 1000.0);
+        g.control_address = hit.address; g.control_kind = hit.kind; g.control_home = home;
+        g.control_poke.store(used_poke);
+        g.control_ready.store(true);
+        line("control: ready. %s at %s is the handle for the game's render scale; each change is followed by %s", hunt::KindName(hit.kind),
+             where_text(hit.address).c_str(), kPokeName[used_poke]);
+        g.trial_ended_ms.store(GetTickCount64());
+        g.trial_active.store(false);
+        write_verdict();
+        find_routes(hit.address);
+        write_verdict();
+        return true;
+    }
     search_end(2, "%s at %s is the game's render scale: nudged alone to %.0f%% it moved the 3D picture, three times out of three, and the "
                   "picture came back each time. Clue that led to it: %s. Whole Search: %.1f s, no slider moves.",
                hunt::KindName(hit.kind), where_text(hit.address).c_str(), goal * 100.0, kGroup[from], double(GetTickCount64() - began) / 1000.0);
@@ -1635,7 +1725,12 @@ void control_worker()
                 g.control_ready.store(false); g.control_asked.store(0);
                 return;
             }
-            if (asked != last) line("control: render scale asked %.1f%%%s", want * 100.0, asked ? "" : " (the game's own value, given back)");
+            if (asked != last) {
+                const int poke = g.control_poke.load();
+                if (poke) do_poke(poke);
+                line("control: render scale asked %.1f%%%s%s%s", want * 100.0, asked ? "" : " (the game's own value, given back)", poke ? ", then " : "",
+                     poke ? kPokeName[poke] : "");
+            }
         }
         last = asked;
     }

@@ -52,11 +52,29 @@ Renderer* g_fake_renderer = nullptr;
 Decoy* g_fake_decoys = nullptr;
 Applied* g_fake_applied = nullptr;
 bool g_copy_mode = false;
+// "--apply-message" / "--apply-resize": the game reads its setting only when it rebuilds its pictures, which
+// it does when its window gets a size message / when its window's size really changes (as Crusader Kings III
+// appeared to on 2026-11-28: the numbers beside "render_scale" were found, and writing them changed nothing).
+int g_apply_mode = 0; // 0: reads the setting every frame. 1: on a size message. 2: on a real change of size.
+std::atomic<int> g_rebuilds{0};
+LRESULT CALLBACK game_window(HWND w, UINT m, WPARAM wp, LPARAM lp)
+{
+    static LPARAM last_size = -1;
+    if (m == WM_SIZE || m == WM_EXITSIZEMOVE) {
+        const bool changed = m == WM_SIZE && lp != last_size && last_size != -1;
+        if (m == WM_SIZE) last_size = lp;
+        if (g_apply_mode == 1 || (g_apply_mode == 2 && changed)) g_rebuilds.fetch_add(1);
+    }
+    return DefWindowProcW(w, m, wp, lp);
+}
 
 int main(int argc, char** argv)
 {
     g_copy_mode = argc > 1 && std::strcmp(argv[1], "--copy") == 0;
-    std::printf("pretend game: %s\n", g_copy_mode ? "acts only when the setting differs from its applied copy" : "reads the setting every frame");
+    g_apply_mode = argc > 1 && std::strcmp(argv[1], "--apply-message") == 0 ? 1 : argc > 1 && std::strcmp(argv[1], "--apply-resize") == 0 ? 2 : 0;
+    std::printf("pretend game: %s\n", g_copy_mode ? "acts only when the setting differs from its applied copy"
+                : g_apply_mode == 1 ? "reads the setting only when its window gets a size message"
+                : g_apply_mode == 2 ? "reads the setting only when its window's size really changes" : "reads the setting every frame");
     using namespace na::scale;
     constexpr uint32_t kOutW = 1920, kOutH = 1080;
     wchar_t temp[MAX_PATH]{};
@@ -73,9 +91,24 @@ int main(int argc, char** argv)
     g_fake_applied = new Applied;
     timeBeginPeriod(1);
     std::thread game([] {
+        int rebuilt = 0;
+        if (g_apply_mode) { // a real window, as a game has: the signals go to it
+            WNDCLASSW wc{};
+            wc.lpfnWndProc = &game_window; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"NaPretendGame";
+            RegisterClassW(&wc);
+            CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, wc.lpszClassName, L"pretend game", WS_POPUP | WS_VISIBLE, 0, 0, 320, 240, nullptr, nullptr,
+                            wc.hInstance, nullptr);
+        }
         while (g_run.load()) {
             static float in_use = 1.0f;
+            MSG msg;
+            while (g_apply_mode && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
             float s = g_fake_settings->render_scale;
+            if (g_apply_mode) {
+                const int now = g_rebuilds.load();
+                if (now != rebuilt) { rebuilt = now; in_use = s; } // the rebuild is where the setting is read
+                s = in_use;
+            }
             if (g_copy_mode) {
                 if (s != g_fake_applied->value) { in_use = s; g_fake_applied->value = s; } // the apply step
                 s = in_use;
@@ -99,7 +132,7 @@ int main(int argc, char** argv)
     std::string text;
     const uint64_t began = GetTickCount64();
     // The "player" never touches anything.
-    const bool finished = wait_for(verdict, "How to reach the working number", 240, &text) || text.find("SEARCH: NOT FOUND") != std::string::npos ||
+    const bool finished = wait_for(verdict, "How to reach the working number", 420, &text) || text.find("SEARCH: NOT FOUND") != std::string::npos ||
                           text.find("SEARCH: STOPPED") != std::string::npos || text.find("HIJACK: FAIL") != std::string::npos;
     std::printf("the run took %.1f s from start to result\n", double(GetTickCount64() - began) / 1000.0);
     Sleep(1000);
@@ -136,13 +169,13 @@ int main(int argc, char** argv)
     expect(witness::ControlReady(), "the render-scale handle is ready after the Search");
     expect(!witness::RequestScale(0.1), "a size outside 25%..100% is refused");
     auto world_becomes = [&](int32_t want) {
-        for (int i = 0; i < 100; ++i) { if (g_fake_renderer->world_w == want) return true; Sleep(10); }
+        for (int i = 0; i < 400; ++i) { if (g_fake_renderer->world_w == want) return true; Sleep(10); }
         return false;
     };
     expect(witness::RequestScale(2.0 / 3.0) && world_becomes(1280), "asked 66.7% (Quality): the 3D world became 1280 wide");
     expect(witness::RequestScale(0.58) && world_becomes(1114), "asked 58% (Balanced): the 3D world became 1114 wide");
     expect(witness::RequestScale(0.5) && world_becomes(960), "asked 50% (Performance): the 3D world became 960 wide");
-    if (!g_copy_mode) {
+    if (!g_copy_mode && !g_apply_mode) {
         g_fake_settings->render_scale = 1.0f; // the game puts its own value back
         Sleep(100);
         expect(world_becomes(960), "the game's own write was corrected: still 960 wide");
@@ -150,6 +183,10 @@ int main(int argc, char** argv)
     expect(witness::RequestScale(0.0) && world_becomes(int32_t(kOutW)), "given back: the 3D world is at the game's own size again");
     Sleep(200);
     expect(std::fabs(g_fake_settings->render_scale - 1.0f) < 1e-6f, "the game's own value is in place");
+    if (g_apply_mode) {
+        const char* by = g_apply_mode == 1 ? "followed by a window-size message" : "followed by a brief real change of the window's size";
+        expect(text.find(by) != std::string::npos, "the result names the signal that made the game re-apply");
+    }
 
     g_run.store(false);
     game.join();
