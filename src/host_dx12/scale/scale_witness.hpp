@@ -36,8 +36,12 @@ void OnTargetCreated(const char* api, uint32_t w, uint32_t h);
 void NoteOutput(uint32_t w, uint32_t h);
 // Starts the witness and its background threads; its log is written to log_path. Call once,
 // outside DllMain.
-void Start(const wchar_t* log_path);
+// verdict_path (optional): a short PASS/FAIL file with the reason, rewritten as the run goes.
+void Start(const wchar_t* log_path, const wchar_t* verdict_path = nullptr);
 bool Active();
+// Finder test ([scale] test=1): the witness runs with DLSS/DLAA held off, and writes the verdict file.
+void SetTestMode(bool on);
+bool TestMode();
 
 namespace analysis {
 namespace locator = na::scale::native::locator;

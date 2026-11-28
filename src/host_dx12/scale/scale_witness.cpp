@@ -45,7 +45,10 @@ struct State {
     std::atomic<uint64_t> next_chain_ms{0}, window_start{0};
     std::atomic<uint64_t> window_best{0}, window_last{0}, published{0}; // packed w<<32|h
     std::mutex seen_m; std::set<uint64_t> viewport_sizes, created_sizes; std::map<uint64_t, unsigned> created_count;
-    std::wstring log_path;
+    std::wstring log_path, verdict_path;
+    // Test verdict counters.
+    std::atomic<uint64_t> viewports{0}, created{0}, chains_read{0}, names_found{0}, bytes_searched{0}, candidates_from_code{0};
+    std::atomic<uint32_t> scale_changes{0};
     // Code worker: call chains (and the named search at start).
     std::mutex code_m; std::condition_variable code_cv; std::deque<Capture> captures;
     // Memory worker: size events.
@@ -283,6 +286,7 @@ void analyse(const Capture& c)
         }
     }
     report(found, c.method);
+    g.chains_read.fetch_add(1); g.candidates_from_code.fetch_add(found.size());
     line("%s #%zu api=%s size=%ux%u code=[%s] number_loads=%u followed_to_an_address=%u not_followed=%u constants_skipped=%u "
          "functions_partly_unreadable=%u candidates=%zu",
          method, g.chains.size(), c.api, c.w, c.h, text.c_str(), st.loads, st.resolved, st.unresolved, st.constants, st.undecodable, found.size());
@@ -368,6 +372,7 @@ void named_search(Module& mod)
         }
     }
     report(found, hunt::kNamed);
+    g.names_found.store(by_rva.size()); g.candidates_from_code.fetch_add(found.size());
     line("named: %s has %zu setting names, %u code references to %zu of them, candidates=%zu", mod.name.c_str(), by_rva.size(), refs,
          used.size(), found.size());
     unsigned shown = 0;
@@ -431,9 +436,74 @@ void sweep(const hunt::Target& t)
             if (((off / kChunk) & 15) == 15) Sleep(1); // every 16 MB: let the game have the core
         }
     }
+    g.bytes_searched.fetch_add(scanned);
     line("memory: searched %.1f GB in %llu regions in %.1f s for world %ux%u (scale %.4f%s): %llu matches", double(scanned) / double(1ull << 30),
          static_cast<unsigned long long>(regions), double(GetTickCount64() - started) / 1000.0, t.world_w, t.world_h, t.Ratio(),
          t.Distinct() ? "" : ", full size: size pairs only", static_cast<unsigned long long>(total_hits));
+}
+// ---- the test verdict: PASS or FAIL with the reason, rewritten after every event ----
+void write_verdict()
+{
+    if (g.verdict_path.empty()) return;
+    std::vector<hunt::Entry> top; hunt::Target t; bool have; size_t size;
+    {
+        std::lock_guard<std::mutex> l(g.board_m);
+        top = g.board.Ranked(64); t = g.target; have = g.have_target; size = g.board.Size();
+    }
+    const uint32_t changes = g.scale_changes.load();
+    std::vector<hunt::Entry> scales, pairs;
+    for (const auto& e : top)
+        if (e.Confirmed()) (hunt::IsSizePair(e.kind) ? pairs : scales).push_back(e);
+    bool pass = false;
+    char reason[512];
+    if (!have) {
+        if (!g.viewports.load())
+            std::snprintf(reason, sizeof reason, "NeuralAlias never saw the game draw its 3D world (no world picture was chosen, or the game was "
+                          "only in menus). Load into the game map/level and wait 10 seconds.");
+        else std::snprintf(reason, sizeof reason, "The 3D world was seen but its size never held steady for one second.");
+    } else if (!changes) {
+        std::snprintf(reason, sizeof reason, "The world stayed at %ux%u the whole run: the game's Render Scale was not changed, or the game "
+                      "only applies it after a restart. Change Render Scale in the game's menu, apply, wait 5 seconds, then change it again.",
+                      t.world_w, t.world_h);
+    } else if (!scales.empty()) {
+        pass = true;
+        std::snprintf(reason, sizeof reason, "The game's render-scale number was found: %s at %s, found by [%s]. It followed %u of %u size "
+                      "changes and never changed on its own.", hunt::KindName(scales[0].kind), where_text(scales[0].address).c_str(),
+                      methods_text(scales[0].methods).c_str(), scales[0].followed, scales[0].followed + scales[0].missed);
+    } else if (!pairs.empty()) {
+        std::snprintf(reason, sizeof reason, "Only the RESULT was found (where the game keeps the world's size: %zu places), not the scale "
+                      "setting itself. %s", pairs.size(), changes < 2 ? "The memory search needs a second change to confirm the setting: "
+                      "change Render Scale once more." : "After two or more changes no scale number followed: this game may compute the "
+                      "size without storing a scale.");
+    } else {
+        std::snprintf(reason, sizeof reason, "The world changed size %u time(s) but no number in the game followed it (%zu candidates "
+                      "checked).", changes, size);
+    }
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, g.verdict_path.c_str(), L"w") != 0 || !f) return;
+    SYSTEMTIME now; GetSystemTime(&now);
+    std::fprintf(f, "NeuralAlias render-scale finder test (log only: nothing in the game was changed)\n");
+    std::fprintf(f, "Written %04u-%02u-%02u %02u:%02u:%02u UTC, game process %lu\n\n", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                 now.wSecond, GetCurrentProcessId());
+    std::fprintf(f, "RESULT: %s\nREASON: %s\n\n", pass ? "PASS" : "FAIL", reason);
+    std::fprintf(f, "What each step saw:\n");
+    if (have) std::fprintf(f, "  3D world seen:            yes, now %ux%u on a %ux%u screen (%.1f%%)\n", t.world_w, t.world_h, t.out_w, t.out_h, t.Ratio() * 100.0);
+    else std::fprintf(f, "  3D world seen:            no (%llu world viewports)\n", static_cast<unsigned long long>(g.viewports.load()));
+    std::fprintf(f, "  Render scale changes:     %u\n", changes);
+    std::fprintf(f, "  Game code paths read:     %llu (world-sized pictures created: %llu)\n", static_cast<unsigned long long>(g.chains_read.load()),
+                 static_cast<unsigned long long>(g.created.load()));
+    std::fprintf(f, "  Setting names in program: %llu\n", static_cast<unsigned long long>(g.names_found.load()));
+    std::fprintf(f, "  Numbers taken from code:  %llu\n", static_cast<unsigned long long>(g.candidates_from_code.load()));
+    std::fprintf(f, "  Memory searched:          %.1f GB\n", double(g.bytes_searched.load()) / double(1ull << 30));
+    std::fprintf(f, "  Candidates on the board:  %zu (confirmed scale numbers: %zu, confirmed size results: %zu)\n\n", size, scales.size(), pairs.size());
+    unsigned n = 0;
+    for (const auto& e : scales) {
+        if (++n > 8) break;
+        double v = 0; ReadKind(reader(), e.address, e.kind, &v);
+        std::fprintf(f, "  CONFIRMED %s at %s, value now %g, found by [%s], followed %u\n", hunt::KindName(e.kind), where_text(e.address).c_str(), v,
+                     methods_text(e.methods).c_str(), e.followed);
+    }
+    std::fclose(f);
 }
 void memory_worker()
 {
@@ -447,24 +517,32 @@ void memory_worker()
         }
         if (!event) {
             // Quiet time: a candidate that changes while the world does not is a timer, not a setting.
-            std::lock_guard<std::mutex> l(g.board_m);
-            if (g.have_target) g.board.Steady(g.target, &holds);
+            {
+                std::lock_guard<std::mutex> l(g.board_m);
+                if (g.have_target) g.board.Steady(g.target, &holds);
+            }
+            write_verdict();
             continue;
         }
-        bool first;
+        bool first, scale_changed = false;
         {
             std::lock_guard<std::mutex> l(g.board_m);
             first = !g.have_target;
-            if (!first) g.board.SizeChanged(t, &holds);
+            // Only a change of world/screen is the render scale moving. A resized window or a new
+            // screen mode changes both together and proves nothing about the scale.
+            scale_changed = !first && std::fabs(t.Ratio() - g.target.Ratio()) > 0.01;
+            if (scale_changed) g.board.SizeChanged(t, &holds);
             g.target = t; g.have_target = true;
         }
         if (first) line("world: %ux%u on a %ux%u screen (scale %.4f)", t.world_w, t.world_h, t.out_w, t.out_h, t.Ratio());
-        else {
-            line("world size changed to %ux%u on a %ux%u screen (scale %.4f)", t.world_w, t.world_h, t.out_w, t.out_h, t.Ratio());
-            log_ranking("after the size change, before the new search");
-        }
+        else if (scale_changed) {
+            g.scale_changes.fetch_add(1);
+            line("render scale changed: world now %ux%u on a %ux%u screen (scale %.4f)", t.world_w, t.world_h, t.out_w, t.out_h, t.Ratio());
+            log_ranking("after the scale change, before the new search");
+        } else line("screen size changed (same scale): world now %ux%u on a %ux%u screen", t.world_w, t.world_h, t.out_w, t.out_h);
         sweep(t); // also finds settings objects the game created since the last search
         log_ranking(first ? "after the first search" : "after the new search");
+        write_verdict();
     }
 }
 
@@ -483,10 +561,11 @@ void enqueue_chain(const char* api, uint32_t method, uint32_t w, uint32_t h)
 }
 } // namespace
 
-void Start(const wchar_t* log_path)
+void Start(const wchar_t* log_path, const wchar_t* verdict_path)
 {
     if (g.active.load() || !log_path || !*log_path) return;
     g.log_path = log_path;
+    if (verdict_path) g.verdict_path = verdict_path;
     g.self_base = reinterpret_cast<uint64_t>(module_handle(reinterpret_cast<uint64_t>(&Start), false));
     try {
         std::thread(code_worker).detach();
@@ -495,6 +574,9 @@ void Start(const wchar_t* log_path)
     g.active.store(true);
 }
 bool Active() { return g.active.load(std::memory_order_relaxed); }
+std::atomic<bool> g_test_mode{false};
+void SetTestMode(bool on) { g_test_mode.store(on); }
+bool TestMode() { return g_test_mode.load(); }
 
 void NoteOutput(uint32_t w, uint32_t h)
 {
@@ -507,6 +589,7 @@ void OnWorldViewport(const char* api, float fw, float fh)
 {
     if (!g.active.load(std::memory_order_relaxed) || !(fw >= 64) || !(fh >= 64) || fw > 32768 || fh > 32768) return;
     const uint32_t w = uint32_t(fw + 0.5f), h = uint32_t(fh + 0.5f);
+    g.viewports.fetch_add(1, std::memory_order_relaxed);
     const uint64_t size = pack(w, h), now = GetTickCount64();
     // The world's size = the largest viewport set on it within a window (smaller ones are
     // part-screen passes). A size must hold for two windows before it counts as a change.
@@ -556,6 +639,7 @@ void OnTargetCreated(const char* api, uint32_t w, uint32_t h)
         }
         if (++g.created_count[size] > 6) return; // the first few creators of each size
     }
+    g.created.fetch_add(1, std::memory_order_relaxed);
     enqueue_chain(api, hunt::kCreation, w, h);
 }
 } // namespace na::scale::witness

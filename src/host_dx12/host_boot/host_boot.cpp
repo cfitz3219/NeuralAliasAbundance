@@ -191,9 +191,19 @@ DWORD WINAPI InitThread(LPVOID)
             if (witness_log[i] == L'\\' || witness_log[i] == L'/') { witness_log[i] = 0; break; }
         wchar_t name[64];
         swprintf_s(name, L"\\NeuralAlias-scale-witness-%lu.log", GetCurrentProcessId());
+        // [scale] test=1: the finder test. DLSS/DLAA is held off so the run tests the finder alone,
+        // and a PASS/FAIL file with the reason is written beside the log.
+        const bool finder_test = GetPrivateProfileIntW(L"scale", L"test", 0, g_ini) == 1;
+        wchar_t verdict[MAX_PATH];
+        lstrcpynW(verdict, witness_log, MAX_PATH);
+        const wchar_t* verdict_name = L"\\NeuralAlias-scale-test-result.txt";
+        const bool verdict_fits = lstrlenW(verdict) + lstrlenW(verdict_name) < MAX_PATH;
+        if (verdict_fits) lstrcatW(verdict, verdict_name);
         if (lstrlenW(witness_log) + lstrlenW(name) < MAX_PATH) {
             lstrcatW(witness_log, name);
-            na::scale::witness::Start(witness_log);
+            na::scale::witness::SetTestMode(finder_test);
+            if (finder_test) boot_log("scale witness: FINDER TEST, DLSS/DLAA held off; result in NeuralAlias-scale-test-result.txt");
+            na::scale::witness::Start(witness_log, finder_test && verdict_fits ? verdict : nullptr);
             boot_log("scale witness: on (log only; several searches for the game's render-scale number run together)");
         } else boot_log("scale witness: off (the log folder's path is too long)");
     }
@@ -484,7 +494,7 @@ DWORD WINAPI InitThread(LPVOID)
         na::overlay::RegisterLiveDlaaMenu();
     }
     na::j2::flow::SetEnabled(na::j2::Configured());
-    if(na::settings::SafeStart())na::j2::SetPaused(true);
+    if(na::settings::SafeStart() || na::scale::witness::TestMode())na::j2::SetPaused(true);
     na::background::Start(); // two below-normal workers, never hardware_concurrency
     na::observe::SetBackgroundSubmitter(&na::background::Submit); // mip/AF variant compiles share the pool
     bool started = na::overlay::StartCore(tag, nullptr);
