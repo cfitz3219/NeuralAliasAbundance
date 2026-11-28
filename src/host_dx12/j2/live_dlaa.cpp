@@ -1,4 +1,5 @@
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 #include "host_dx12/diag/referee_recovery.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/gpu/services.hpp"
@@ -2935,12 +2936,15 @@ struct FoldPass {
     int mip_extra = 0;
     // Counters and the plain-word state for the menu and the log.
     uint64_t shown_frames[na::fold::kModes]{}, warm_frames = 0, warm_failed = 0, coarse_frames = 0, fine_frames = 0, unable_frames = 0;
-    // The picture the levels' DLSS features were made for, with DLAA's (see the fold block).
-    uint32_t levels_w = 0, levels_h = 0, levels_preset = ~0u;
-    DXGI_FORMAT levels_format = DXGI_FORMAT_UNKNOWN;
+    // One DLSS feature at a time (fold block): the feature the mode being prepared needs is started right
+    // after this frame's Evaluate; the frame that shows a new mode releases the view the old one used.
+    bool prepare_after = false;
+    na::dlss::EvalDesc prepare_desc{};
+    uint64_t release_view_after = 0;
+    double prepare_wait_ms = 0, prepare_wait_longest_ms = 0; // how long a switch frame waited for NVIDIA
     na::fold::Status st;
 } g_fold;
-bool fold_init() { return g_fold.pass.Init(g.device.Get(), kRing); }
+bool fold_init() { const bool ok = g_fold.pass.Init(g.device.Get(), kRing); g_fold.pass.Tag("dx12"); return ok; }
 // The folded planes of one mode and the unseen output (fold/fold_pass.hpp).
 bool fold_targets(na::fold::Mode m, uint32_t w, uint32_t h, DXGI_FORMAT color_format, uint32_t ow, uint32_t oh, DXGI_FORMAT out_format)
 {
@@ -2979,7 +2983,7 @@ void fold_advance(bool running)
     const bool back_to_dlaa = na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed) == 0;
     const na::fold::Mode m = running && !g.paused.load() && !back_to_dlaa ? g_fold.pass.hand.shown : na::fold::Mode::Off;
     g_fold.frame_mode = m;
-    g_fold.spacing = na::fold::JitterSpacing(m, m != na::fold::Mode::Off ? g_fold.pass.hand.warming : na::fold::Mode::Off);
+    g_fold.spacing = na::fold::JitterSpacing(m, na::fold::Mode::Off); // nothing runs unseen beside the shown mode
     const uint32_t rate = g_fold.vrs_ok ? na::fold::ShadingRateFor(m) : 0u;
     if (rate != g_fold.rate_set) {
         na::observe::SetSceneCoarseShading(rate);
@@ -3283,6 +3287,15 @@ void update_draw_replay()
     na::observe::SetDrawReplayBudget(na::settings::Get().j2_replay_budget.load(std::memory_order_relaxed));
     na::observe::SetDrawReplayMovers(na::settings::Get().j2_replay_movers.load(std::memory_order_relaxed) != 0);
     na::observe::SetDrawReplay(replay ? g.frame : 0, retain_replay);
+    {   // Off for a few seconds: its buffers are given back (made again when replay is next on).
+        static ULONGLONG off_since = 0;
+        static bool released = true; // nothing is made before replay is first on
+        if (replay) { off_since = 0; released = false; }
+        else if (!released) {
+            if (!off_since) off_since = GetTickCount64();
+            else if (GetTickCount64() - off_since > 3000) released = na::observe::ReleaseDrawReplayBuffers();
+        }
+    }
     {
         static uint64_t next_log = 0, logs = 0;
         if (replay && g.frame >= next_log) {
@@ -5080,6 +5093,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         }
         g.w = w; g.h = h; g.color_format = cf;
         g.rw = rw; g.rh = rh; g.ow = ow; g.oh = oh;
+        na::vram::Set("dlaa_core_dx12", na::vram::SizeOf(g.depth32.Get()) + na::vram::SizeOf(g.motion.Get()) + na::vram::SizeOf(g.provenance.Get()) +
+                      na::vram::SizeOf(g.output.Get()) + na::vram::SizeOf(g.color_in.Get()) + na::vram::SizeOf(g.sharp.Get()),
+                      "DLAA's working textures at this picture size (depth, motion, provenance, colour in, output, sharpened)");
         g.samples = cd.SampleDesc.Count; g.sample_quality = cd.SampleDesc.Quality;
         g.depth_samples = dd.SampleDesc.Count; g.depth_quality = dd.SampleDesc.Quality; g.depth_format = dd.Format;
         g.resume_reset = true; // remains pending if this recording is not submitted
@@ -5373,7 +5389,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     {
         const na::fold::Mode shown = g_fold.pass.hand.shown;
         const na::fold::Mode asked = na::fold::ModeFrom(na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
-        if (shown != na::fold::Mode::Off && asked == shown && g_fold.pass.hand.warming == na::fold::Mode::Off && g.arbiter_ok && !deferred &&
+        if (shown != na::fold::Mode::Off && asked == shown && g_fold.pass.hand.preparing == na::fold::Mode::Off && g.arbiter_ok && !deferred &&
             rw == w && rh == h && ow == w && oh == h && !color_msaa && smear < 0 && g_debug_view.load(std::memory_order_relaxed) == 0 &&
             !na::capture::j2::Armed() && !(na::settings::Get().xegtao_enabled.load(std::memory_order_relaxed) && !no_camera)) {
             const auto blk = na::fold::BlockFor(shown);
@@ -5403,6 +5419,9 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     bool folded_ready = false;
     {
         const na::fold::Mode fold_asked = na::fold::ModeFrom(na::settings::Get().j2_fold_mode.load(std::memory_order_relaxed));
+        // The whole picture's working set is kept while motion is measured (a level searching its folded
+        // picture does not use it, but DLAA and a missed folded frame do); other sizes go once unused.
+        if (measured) na::j2::compute_flow::Keep(rw, rh);
         if (fold_asked != na::fold::Mode::Off && measured && g_fold.pass.Ok()) {
             const auto asked_blk = na::fold::BlockFor(fold_asked);
             na::j2::compute_flow::Prepare(g.device.Get(), g.queue.Get(), na::fold::Folded(rw, asked_blk.x), na::fold::Folded(rh, asked_blk.y));
@@ -5858,8 +5877,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if (smear == 4) e.preset = 12; // NVSDK_NGX_DLSS_Hint_Render_Preset_L
     }
     g.since_restart = e.reset ? 0u : g.since_restart + 1u; // jitter/ramp-after-restart
-    // Fold the shading (core/fold_shading.hpp). The mode on screen keeps running; a newly asked mode is
-    // run beside it into a picture nobody sees until it has proven itself (Handover).
+    // Fold the shading (core/fold_shading.hpp). The mode on screen keeps running while everything a newly
+    // asked mode needs is made beside it, off the frame; the screen changes once it all exists (Handover).
     ID3D12Resource* const full_color = e.color; // full size: what a measured cut shows (RecordCutShow)
     na::fold::Mode fold_shown = na::fold::Mode::Off;
     e.ordered_feature_group = kViewId;
@@ -5879,54 +5898,60 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         }
         fold_why(why);
         if (why) ++g_fold.unable_frames;
-        // The levels' DLSS features are made together with DLAA's, on the first frame at this picture size and
-        // before DLAA's own (smallest first: DLSS 310.9.16 spoils a larger feature when a smaller one is made after
-        // it, and making DLAA's again costs the same once more and restarts its history). A level asked for later
-        // has nothing left to make: its waiting period only warms its history and the switch adds no work.
-        bool prewarmed = false;
-        {
-            const DXGI_FORMAT in_format = e.color->GetDesc().Format;
-            const uint32_t preset_now = na::settings::Get().j2_preset.load();
-            if (na::settings::Get().j2_fold_prewarm.load(std::memory_order_relaxed) && g_fold.vrs_checked && g_fold.vrs_ok && rw == w && rh == h && ow == w && oh == h && !color_msaa && smear < 0 &&
-                (g_fold.levels_w != rw || g_fold.levels_h != rh || g_fold.levels_format != in_format || g_fold.levels_preset != preset_now)) {
-                bool ok = fold_init();
-                for (const Mode m : {Mode::Performance, Mode::Quality}) ok = ok && fold_targets(m, rw, rh, in_format, ow, oh, cf);
-                for (const Mode m : {Mode::Performance, Mode::Quality}) {
-                    if (!ok) break;
-                    na::dlss::EvalDesc pe{};
-                    fold_record(l, e, m, g.slot, m == Mode::Quality, &pe); // its own descriptor table each
-                    pe.output = g_fold.pass.Unseen();
-                    pe.reset = true;
-                    ok = na::dlss::Evaluate(l, pe);
-                    fold_done(l, m);
+        // One DLSS feature at a time (coordinator 2026-11-27). The mode asked for is ready once its folded
+        // planes (above) and its measured-motion working set exist and its DLSS feature has been made: that
+        // is started right after an Evaluate (below) on a thread of its own, and the next frame shows the
+        // mode, waiting here only for whatever of NVIDIA's work is left (about none when a frame takes
+        // longer than the creation). The old mode's feature is never evaluated after the new one exists.
+        bool ready = false;
+        g_fold.prepare_wait_ms = 0;
+        const Mode shown_before = g_fold.pass.hand.shown;
+        const Mode target = why ? Mode::Off : (asked != Mode::Off && asked == g_fold.pass.hand.refused ? shown_before : asked);
+        if (target != shown_before) {
+            bool others = true;
+            if (measured) { // the measuring stage's working set at the size the target mode measures at
+                const auto blk = na::fold::BlockFor(target);
+                const unsigned mw = target == Mode::Off ? rw : na::fold::Folded(rw, blk.x), mh = target == Mode::Off ? rh : na::fold::Folded(rh, blk.y);
+                na::j2::compute_flow::Prepare(g.device.Get(), g.queue.Get(), mw, mh);
+                // Waits only while that size is being built: a size the flow cannot work at (too small) leaves the
+                // level on the whole picture's motion, as before.
+                others = na::j2::compute_flow::Ready(mw, mh) || !na::j2::compute_flow::Building(mw, mh);
+                // ...and for at most 1.5 s: the mode never waits on a working set that does not come.
+                static ULONGLONG waiting_since = 0;
+                if (others) waiting_since = 0;
+                else if (!waiting_since) waiting_since = GetTickCount64();
+                else if (GetTickCount64() - waiting_since > 1500) others = true;
+            }
+            if (others) {
+                na::dlss::EvalDesc want{};
+                if (target == Mode::Off) want = e;
+                else na::fold::Pass::Describe(e, target, kFoldViewId, na::settings::Get().j2_preset.load(), &want);
+                auto st = na::dlss::PreparedState(want);
+                if (st == na::dlss::Prepared::Making) {
+                    st = na::dlss::WaitPrepared(want, &g_fold.prepare_wait_ms);
+                    g_fold.prepare_wait_longest_ms = (std::max)(g_fold.prepare_wait_longest_ms, g_fold.prepare_wait_ms);
                 }
-                prewarmed = true;
-                g_fold.levels_w = rw; g_fold.levels_h = rh; g_fold.levels_format = in_format; g_fold.levels_preset = preset_now;
-                na::eventlog::Emit("fold", "levels' DLSS made with DLAA's at %ux%u (Performance, then Quality, then DLAA): %s", rw, rh,
-                                   ok ? "ready" : "NOT made (a level asked for will make its own in its waiting period)");
+                if (st == na::dlss::Prepared::Ready) ready = true;
+                else if (st == na::dlss::Prepared::Failed) {
+                    g_fold.pass.hand.Refuse(target);
+                    fold_why("NVIDIA did not make the DLSS feature for this level");
+                    na::eventlog::Emit("fold", "REFUSED %s: NVIDIA did not make its DLSS feature (%ux%u -> %ux%u). The screen stays on %s.",
+                                       na::fold::Name(target), want.render_w, want.render_h, want.out_w, want.out_h, na::fold::Name(shown_before));
+                } else if (st == na::dlss::Prepared::None) {
+                    g_fold.prepare_desc = want; // started right after this frame's Evaluate
+                    g_fold.prepare_after = true;
+                }
             }
         }
-        // On that frame the tables are taken: the screen shows DLAA (a new picture size starts DLSS over anyway).
-        const auto step = g_fold.pass.hand.Begin(prewarmed ? Mode::Off : asked, !why && !prewarmed);
+        const auto step = g_fold.pass.hand.Begin(asked, !why, ready);
+        if (step.switched)
+            g_fold.release_view_after = shown_before == Mode::Off ? kViewId : kFoldViewId + static_cast<uint64_t>(shown_before);
+        // Planes of a mode neither on screen nor asked for are given back (a few seconds later: Collect).
+        for (const Mode m : {Mode::Quality, Mode::Performance})
+            if (m != step.show && m != asked) g_fold.pass.Release(m);
+        g_fold.pass.Collect();
         // This frame's scene was drawn in blocks only if that was asked for before its draws were recorded.
         const bool coarse = g_fold.rate_set != 0 && g.frame > g_fold.rate_frame;
-        if (step.warm != Mode::Off) {
-            na::dlss::EvalDesc we{};
-            fold_record(l, e, step.warm, g.slot, true, &we);
-            we.output = g_fold.pass.Unseen();
-            we.reset = e.reset || step.warm_reset;
-            const bool ok = na::dlss::Evaluate(l, we);
-            fold_done(l, step.warm);
-            g_fold.pass.hand.WarmResult(ok);
-            ++g_fold.warm_frames;
-            if (!ok) {
-                ++g_fold.warm_failed;
-                fold_why("DLSS did not accept the folded picture while it was being readied");
-            }
-            if (g_fold.pass.hand.refused == step.warm)
-                na::eventlog::Emit("fold", "REFUSED %s after %u failed warm-up frames: DLSS did not accept the folded picture (%ux%u from %ux%u). The screen stays on %s.",
-                                   na::fold::Name(step.warm), na::fold::Handover::kGiveUp, we.render_w, we.render_h, rw, rh, na::fold::Name(g_fold.pass.hand.shown));
-        }
         if (step.show_reset) e.reset = true;
         // Sampled motion holds only the kept pixels of the level decided before this point. Should the
         // screen not show that level after all (refused, or its planes were made again), this frame has no
@@ -5955,7 +5980,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
         if ((asked != Mode::Off || step.show != Mode::Off) && g.frame % 600 == 0)
             na::eventlog::Emit("fold", "asked=%s shown=%s warming=%s good=%u | frames dlaa=%llu quality=%llu performance=%llu warm=%llu warm_failed=%llu drawn_in_blocks=%llu drawn_per_pixel=%llu unable=%llu | "
                                "coarse rate=%u draws=%llu sets=%llu restores=%llu no_interface=%llu | jitter phases=%u declared=%.4f,%.4f input=%ux%u kept_pixel=last flow_rules=strict motion=%s sampled_pairs=%llu",
-                               na::fold::Name(asked), na::fold::Name(step.show), na::fold::Name(g_fold.pass.hand.warming), g_fold.pass.hand.good,
+                               na::fold::Name(asked), na::fold::Name(step.show), na::fold::Name(g_fold.pass.hand.preparing), g_fold.pass.hand.waited,
                                static_cast<unsigned long long>(g_fold.shown_frames[0]), static_cast<unsigned long long>(g_fold.shown_frames[1]),
                                static_cast<unsigned long long>(g_fold.shown_frames[2]), static_cast<unsigned long long>(g_fold.warm_frames),
                                static_cast<unsigned long long>(g_fold.warm_failed), static_cast<unsigned long long>(g_fold.coarse_frames),
@@ -5966,8 +5991,8 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
                                folded_flow ? "folded-search" : sampled_mode != Mode::Off ? "sampled" : "whole", static_cast<unsigned long long>(na::j2::compute_flow::GetStats().sampled_pairs));
         g_fold.st.asked.store(static_cast<uint32_t>(asked), std::memory_order_relaxed);
         g_fold.st.shown.store(static_cast<uint32_t>(step.show), std::memory_order_relaxed);
-        g_fold.st.warming.store(static_cast<uint32_t>(g_fold.pass.hand.warming), std::memory_order_relaxed);
-        g_fold.st.good.store(g_fold.pass.hand.good, std::memory_order_relaxed);
+        g_fold.st.warming.store(static_cast<uint32_t>(g_fold.pass.hand.preparing), std::memory_order_relaxed);
+        g_fold.st.good.store(g_fold.pass.hand.waited, std::memory_order_relaxed);
         g_fold.st.refused.store(static_cast<uint32_t>(g_fold.pass.hand.refused), std::memory_order_relaxed);
         g_fold.st.w.store(e.render_w, std::memory_order_relaxed);
         g_fold.st.h.store(e.render_h, std::memory_order_relaxed);
@@ -5978,8 +6003,34 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     // not be put on DLSS or cleared of it). Only on the game's own list: the timer learns of the submission
     // from the game's ExecuteCommandLists.
     if (inl) na::gputime::Begin(l);
+    {   // VARIANT: dlss/levels-warmed-at-start: the levels' features as they will be asked for, made and released in
+        // the background before DLAA's first one (once per picture size).
+        static uint32_t warmed_w = 0, warmed_h = 0;
+        if (e.render_w == e.out_w && e.render_h == e.out_h && (warmed_w != e.out_w || warmed_h != e.out_h)) {
+            warmed_w = e.out_w;
+            warmed_h = e.out_h;
+            na::dlss::EvalDesc q{}, p{};
+            na::fold::Pass::Describe(e, na::fold::Mode::Quality, kFoldViewId, na::settings::Get().j2_preset.load(), &q);
+            na::fold::Pass::Describe(e, na::fold::Mode::Performance, kFoldViewId, na::settings::Get().j2_preset.load(), &p);
+            na::dlss::WarmLevels(q, p);
+        }
+    }
     const bool evaluated = na::dlss::Evaluate(l, e, &history_reset);
     if (inl) na::gputime::End(l);
+    {   // One DLSS feature at a time (the fold block above): the view the old mode used is released on the
+        // frame the new one is shown, and the next mode's feature is started now, right after this Evaluate.
+        if (g_fold.release_view_after) { na::dlss::ReleaseView(g_fold.release_view_after); g_fold.release_view_after = 0; }
+        if (!evaluated && fold_shown != na::fold::Mode::Off) {
+            g_fold.pass.hand.Refuse(fold_shown);
+            fold_why("DLSS did not accept the folded picture");
+            na::eventlog::Emit("fold", "REFUSED %s at frame %llu: DLSS did not accept the folded picture (%ux%u). DLAA takes over.",
+                               na::fold::Name(fold_shown), static_cast<unsigned long long>(g.frame), e.render_w, e.render_h);
+        }
+        if (g_fold.prepare_after) {
+            g_fold.prepare_after = false;
+            na::dlss::PrepareFeature(g_fold.prepare_desc);
+        }
+    }
     if (evaluated) e.reset = history_reset;
     pending.reset = e.reset;
     if (evaluated && g_live_fg.load(std::memory_order_relaxed) && na::fg::WantsInputs()) {
@@ -6014,7 +6065,7 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
             na::eventlog::Emit("fold", "after switch: frame=%llu level=%s dlss_ok=%d reset=%d input=%ux%u output=%ux%u declared=%.4f,%.4f blocks_asked=%u since_frame=%llu warming=%s",
                                static_cast<unsigned long long>(g.frame), na::fold::Name(fold_shown), evaluated ? 1 : 0, e.reset ? 1 : 0, e.render_w, e.render_h,
                                e.out_w, e.out_h, e.jitter_x, e.jitter_y, g_fold.rate_set, static_cast<unsigned long long>(g_fold.rate_frame),
-                               na::fold::Name(g_fold.pass.hand.warming));
+                               na::fold::Name(g_fold.pass.hand.preparing));
         }
     }
     if (evaluated) pending.jitter_history = jitter_history;

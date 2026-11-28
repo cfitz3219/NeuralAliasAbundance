@@ -79,55 +79,53 @@ constexpr uint32_t JitterPhases(Spacing s, uint32_t dlaa_phases)
 }
 
 // The hand-over. Cort: "Make sure that it keeps DLAA going until the handover is truly ready, no need to
-// leave me sitting at a frozen picture wondering if it'll crash." While a new mode is asked for, the
-// mode on screen keeps running untouched, and the new one is run beside it into a picture nobody
-// sees. Only after kWarmFrames of those in a row succeeded does the screen change. If the new mode
-// keeps failing, the screen stays as it is and the reason is kept for the menu and the log.
+// leave me sitting at a frozen picture wondering if it'll crash." While a new mode is asked for, the mode
+// on screen keeps running untouched and everything the new one needs is made beside it, off the frame:
+// its folded planes, its measured-motion working set, and last its DLSS feature (coordinator 2026-11-27:
+// one DLSS feature at a time, so nothing is run unseen and no second feature is held). The screen changes
+// on the first frame after all of it exists, with a new history (the size changes, so DLSS starts over
+// anyway). A mode whose feature NVIDIA refuses, or that fails on screen, is given up on with the reason
+// kept for the menu and the log.
 struct Handover {
-    static constexpr uint32_t kWarmFrames = 8;
-    static constexpr uint32_t kGiveUp = 120; // failed warm-up frames before the request is refused
     Mode shown = Mode::Off;
-    Mode warming = Mode::Off;
-    Mode refused = Mode::Off; // a request that was given up on (cleared when another mode is asked for)
-    uint32_t good = 0, failed = 0;
+    Mode preparing = Mode::Off; // asked for and being made ready (Off: nothing)
+    Mode refused = Mode::Off;   // a request that was given up on (cleared when another mode is asked for)
+    uint32_t waited = 0;        // frames the mode being prepared has waited so far
     uint64_t switches = 0, refusals = 0;
 
     struct Step {
         Mode show = Mode::Off;     // what this frame puts on screen
-        Mode warm = Mode::Off;     // also run this one, unseen (Off: nothing)
+        Mode prepare = Mode::Off;  // asked for but not ready: keep making it (Off: nothing)
         bool show_reset = false;   // the shown mode starts a new history this frame
-        bool warm_reset = false;   // the warming mode starts a new history this frame
         bool switched = false;     // the screen changes mode with this frame
     };
-    // Once per delivered frame, before DLSS runs. `able` false: the fold cannot run on this picture.
-    constexpr Step Begin(Mode asked, bool able)
+    // Once per delivered frame, before DLSS runs. `able` false: the fold cannot run on this picture (the
+    // screen goes back to DLAA at once). `ready`: everything mode `asked` needs exists now.
+    constexpr Step Begin(Mode asked, bool able, bool ready)
     {
-        if (!able) asked = Mode::Off;
+        if (!able) { asked = Mode::Off; ready = true; }
         if (asked != refused) refused = asked == Mode::Off ? Mode::Off : refused == asked ? refused : Mode::Off;
         if (asked == refused && asked != Mode::Off) asked = shown; // given up on: stay where we are
         Step s;
-        if (asked == shown) { warming = Mode::Off; good = failed = 0; s.show = shown; return s; }
-        if (asked == Mode::Off) { // back to DLAA: its feature is still there, only its history is old
-            shown = Mode::Off; warming = Mode::Off; good = failed = 0; ++switches;
-            s.show = Mode::Off; s.show_reset = true; s.switched = true;
+        if (asked == shown) { preparing = Mode::Off; waited = 0; s.show = shown; return s; }
+        if (preparing != asked) { preparing = asked; waited = 0; }
+        if (ready) { // the screen changes now
+            shown = asked; preparing = Mode::Off; waited = 0; ++switches;
+            s.show = shown; s.show_reset = true; s.switched = true;
             return s;
         }
-        if (warming != asked) { warming = asked; good = failed = 0; }
-        if (good >= kWarmFrames) { // proven: the screen changes now, on a history that is already warm
-            shown = asked; warming = Mode::Off; good = failed = 0; ++switches;
-            s.show = shown; s.switched = true;
-            return s;
-        }
-        s.show = shown; s.warm = asked; s.warm_reset = good == 0;
+        ++waited;
+        s.show = shown; s.prepare = asked;
         return s;
     }
-    // After the unseen run of a warming frame.
-    constexpr void WarmResult(bool ok)
+    // Mode m cannot run here (NVIDIA refused its feature, or it failed on screen): it is given up on until
+    // another mode is asked for; if it was on screen, DLAA takes over.
+    constexpr void Refuse(Mode m)
     {
-        if (warming == Mode::Off) return;
-        if (ok) { ++good; return; }
-        good = 0;
-        if (++failed >= kGiveUp) { refused = warming; warming = Mode::Off; failed = 0; ++refusals; }
+        if (m == Mode::Off) return;
+        refused = m; ++refusals; waited = 0;
+        if (preparing == m) preparing = Mode::Off;
+        if (shown == m) { shown = Mode::Off; ++switches; }
     }
 };
 } // namespace na::fold

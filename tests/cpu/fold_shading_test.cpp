@@ -55,51 +55,57 @@ int main() { return test::run({
         CHECK(JitterSpacing(Mode::Performance, Mode::Quality).block.x == 2 && JitterSpacing(Mode::Performance, Mode::Quality).block.y == 1);
         CHECK(JitterPhases(JitterSpacing(Mode::Off, Mode::Off), 16) == 16 && JitterPhases(JitterSpacing(Mode::Performance, Mode::Off), 16) == 32);
     }},
-    {"the screen keeps its mode until the new one has proven itself", [] {
+    {"the screen keeps its mode until everything the new one needs exists", [] {
         Handover h;
-        auto s = h.Begin(Mode::Off, true);
-        CHECK(s.show == Mode::Off && s.warm == Mode::Off && !s.switched);
-        for (uint32_t i = 0; i < Handover::kWarmFrames; ++i) {
-            s = h.Begin(Mode::Performance, true);
-            CHECK(s.show == Mode::Off && s.warm == Mode::Performance && !s.switched && !s.show_reset);
-            CHECK(s.warm_reset == (i == 0));
-            h.WarmResult(true);
+        auto s = h.Begin(Mode::Off, true, true);
+        CHECK(s.show == Mode::Off && s.prepare == Mode::Off && !s.switched);
+        for (uint32_t i = 0; i < 5; ++i) { // its planes, motion working set and DLSS feature are being made
+            s = h.Begin(Mode::Performance, true, false);
+            CHECK(s.show == Mode::Off && s.prepare == Mode::Performance && !s.switched && !s.show_reset);
+            CHECK(h.waited == i + 1);
         }
-        s = h.Begin(Mode::Performance, true);
-        CHECK(s.show == Mode::Performance && s.warm == Mode::Off && s.switched && !s.show_reset);
-        s = h.Begin(Mode::Performance, true);
+        s = h.Begin(Mode::Performance, true, true); // all made: the screen changes now, on a new history
+        CHECK(s.show == Mode::Performance && s.prepare == Mode::Off && s.switched && s.show_reset);
+        s = h.Begin(Mode::Performance, true, false);
         CHECK(s.show == Mode::Performance && !s.switched);
-        // one fold to the other: the first stays on screen while the second warms
-        s = h.Begin(Mode::Quality, true);
-        CHECK(s.show == Mode::Performance && s.warm == Mode::Quality);
-        // back to DLAA is immediate, with a new history
-        s = h.Begin(Mode::Off, true);
+        // one level to the other: the first stays on screen while the second is made
+        s = h.Begin(Mode::Quality, true, false);
+        CHECK(s.show == Mode::Performance && s.prepare == Mode::Quality);
+        // back to DLAA waits for DLAA's feature the same way
+        s = h.Begin(Mode::Off, true, false);
+        CHECK(s.show == Mode::Performance && s.prepare == Mode::Off && !s.switched);
+        s = h.Begin(Mode::Off, true, true);
         CHECK(s.show == Mode::Off && s.switched && s.show_reset);
         CHECK(h.switches == 2);
     }},
-    {"a failed warm-up frame starts the count again and never reaches the screen", [] {
+    {"a level NVIDIA refuses is given up on and the screen stays", [] {
         Handover h;
-        for (uint32_t i = 0; i < 5; ++i) { h.Begin(Mode::Quality, true); h.WarmResult(true); }
-        auto s = h.Begin(Mode::Quality, true); h.WarmResult(false);
-        CHECK(s.show == Mode::Off && h.good == 0);
-        s = h.Begin(Mode::Quality, true);
-        CHECK(s.show == Mode::Off && s.warm == Mode::Quality && s.warm_reset);
+        h.Begin(Mode::Quality, true, false);
+        h.Refuse(Mode::Quality);
+        CHECK(h.refused == Mode::Quality && h.refusals == 1 && h.preparing == Mode::Off);
+        auto s = h.Begin(Mode::Quality, true, true);
+        CHECK(s.show == Mode::Off && s.prepare == Mode::Off && !s.switched); // no more attempts for the same request
+        s = h.Begin(Mode::Performance, true, false);                       // another request is tried afresh
+        CHECK(s.prepare == Mode::Performance && h.refused == Mode::Off);
+        h.Begin(Mode::Off, true, true);
+        s = h.Begin(Mode::Quality, true, false);                           // asking again after DLAA tries again
+        CHECK(s.prepare == Mode::Quality);
     }},
-    {"a mode that keeps failing is refused and DLAA stays", [] {
+    {"a level that fails on screen hands the screen back to DLAA", [] {
         Handover h;
-        for (uint32_t i = 0; i < Handover::kGiveUp; ++i) { const auto s = h.Begin(Mode::Performance, true); CHECK(s.show == Mode::Off); h.WarmResult(false); }
-        CHECK(h.refused == Mode::Performance && h.refusals == 1);
-        auto s = h.Begin(Mode::Performance, true);
-        CHECK(s.show == Mode::Off && s.warm == Mode::Off); // no more attempts for the same request
-        s = h.Begin(Mode::Quality, true);                  // another request is tried afresh
-        CHECK(s.warm == Mode::Quality && h.refused == Mode::Off);
-        h.Begin(Mode::Off, true);
-        s = h.Begin(Mode::Performance, true);              // asking again after DLAA tries again
-        CHECK(s.warm == Mode::Performance);
+        h.Begin(Mode::Performance, true, true);
+        CHECK(h.shown == Mode::Performance);
+        h.Refuse(Mode::Performance);
+        CHECK(h.shown == Mode::Off && h.refused == Mode::Performance);
+        const auto s = h.Begin(Mode::Performance, true, true);
+        CHECK(s.show == Mode::Off && !s.switched);
     }},
-    {"a picture the fold cannot run on stays on DLAA", [] {
+    {"a picture the fold cannot run on goes back to DLAA at once", [] {
         Handover h;
-        const auto s = h.Begin(Mode::Performance, false);
-        CHECK(s.show == Mode::Off && s.warm == Mode::Off);
+        auto s = h.Begin(Mode::Performance, false, false);
+        CHECK(s.show == Mode::Off && s.prepare == Mode::Off);
+        h.Begin(Mode::Performance, true, true);
+        s = h.Begin(Mode::Performance, false, false);
+        CHECK(s.show == Mode::Off && s.switched);
     }},
 }); }

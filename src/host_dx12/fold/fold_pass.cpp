@@ -1,6 +1,8 @@
 #include "host_dx12/fold/fold_pass.hpp"
 
 #include "host_dx12/diag/event_log.hpp"
+#include "host_dx12/diag/release_trace.hpp"
+#include "host_dx12/diag/vram_ledger.hpp"
 #include "host_dx12/gpu/mem_alloc.hpp"
 #include "host_dx12/j2/fold_shader.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
@@ -9,7 +11,10 @@
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <vector>
+#include <thread>
+#include <iterator>
 
 using Microsoft::WRL::ComPtr;
 
@@ -114,16 +119,68 @@ bool Pass::Targets(Mode m, uint32_t w, uint32_t h, DXGI_FORMAT color_format, uin
         p.color->SetName(L"NeuralAlias folded colour");
         p.depth->SetName(L"NeuralAlias folded depth");
         p.motion->SetName(L"NeuralAlias folded motion");
+        char name[48];
+        std::snprintf(name, sizeof name, "fold_planes_%s_%s", tag_, Name(m));
+        na::vram::Set(name, na::vram::SizeOf(p.color.Get()) + na::vram::SizeOf(p.depth.Get()) + na::vram::SizeOf(p.motion.Get()),
+                      "a DLSS level was asked for: its folded colour, depth and motion");
     }
-    if (unseen_) {
-        const auto d = unseen_->GetDesc();
-        if (d.Width != ow || d.Height != oh || d.Format != out_format) unseen_.Reset();
-    }
-    if (!unseen_) {
-        if (!texture(device_.Get(), ow, oh, out_format, unseen_)) return false;
-        unseen_->SetName(L"NeuralAlias fold warm-up output");
-    }
+    (void)ow; (void)oh; (void)out_format;
     return true;
+}
+
+void Pass::Release(Mode m)
+{
+    auto& p = planes_[static_cast<uint32_t>(m)];
+    if (!p.color && !p.depth && !p.motion) return;
+    released_.push_back({p, static_cast<uint64_t>(GetTickCount64())});
+    p = Planes{};
+    char name[48];
+    std::snprintf(name, sizeof name, "fold_planes_%s_%s", tag_, Name(m));
+    na::vram::Set(name, 0, "the level is not on screen or asked for: its folded planes are released");
+}
+
+void Pass::Collect()
+{
+    constexpr uint64_t kAfterMs = 2000; // every frame that used them has long finished on the GPU
+    const uint64_t now = GetTickCount64();
+    const auto keep = std::stable_partition(released_.begin(), released_.end(), [now](const Released& r) { return now - r.at_ms < kAfterMs; });
+    if (keep == released_.end()) return;
+    // The planes' last references are dropped on a thread of their own: giving a level's planes back to the
+    // driver can take a frame's worth of time (measured for the motion contexts: a 66 ms frame).
+    std::vector<Released> gone(std::make_move_iterator(keep), std::make_move_iterator(released_.end()));
+    released_.erase(keep, released_.end());
+    try {
+        std::thread([g = std::move(gone)]() mutable {
+            LARGE_INTEGER q0{}, q1{}, hz{};
+            const ULONGLONG t0 = GetTickCount64();
+            QueryPerformanceCounter(&q0);
+            const size_t n = g.size();
+            g.clear();
+            QueryPerformanceCounter(&q1);
+            QueryPerformanceFrequency(&hz);
+            const double ms = double(q1.QuadPart - q0.QuadPart) * 1000.0 / double(hz.QuadPart);
+            na::diag::release_trace::Note("fold_planes", ms, t0);
+            na::eventlog::Emit("release_trace", "what=fold_planes sets=%zu thread=background ms=%.2f at_tick=%llu", n, ms,
+                               static_cast<unsigned long long>(t0));
+        }).detach();
+    } catch (...) {
+    }
+}
+
+void Pass::Describe(const dlss::EvalDesc& base, Mode m, uint64_t view_base, uint32_t preset, dlss::EvalDesc* out)
+{
+    *out = base;
+    if (m == Mode::Off) return;
+    const auto blk = BlockFor(m);
+    const uint32_t fw = Folded(base.render_w, blk.x), fh = Folded(base.render_h, blk.y);
+    out->color = out->depth = out->motion = nullptr;
+    out->render_w = out->max_render_w = fw;
+    out->render_h = out->max_render_h = fh;
+    out->mv_display_res = false;
+    out->quality = m == Mode::Performance ? dlss::Quality::MaxPerformance : dlss::Quality::MaxQuality;
+    out->preset = na::j2::PresetFor(preset, fw, base.out_w);
+    out->view_id = view_base + static_cast<uint64_t>(m);
+    out->bias_current_color = nullptr;
 }
 
 void Pass::Dispatch(ID3D12GraphicsCommandList* l, ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motion,
@@ -219,7 +276,7 @@ void Status::Format(char* out, size_t n)
     else if (a != s && *reason)
         std::snprintf(out, n, "%s stays on screen: %s.", Name(s), reason);
     else if (wm != Mode::Off)
-        std::snprintf(out, n, "Getting %s ready (%u of %u good frames). %s stays on screen until it is.", Name(wm), good.load(), Handover::kWarmFrames, Name(s));
+        std::snprintf(out, n, "Getting %s ready (%u frames so far). %s stays on screen until it is.", Name(wm), good.load(), Name(s));
     else if (s == Mode::Off)
         std::snprintf(out, n, "On screen: DLAA (full size).");
     else

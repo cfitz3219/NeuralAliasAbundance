@@ -196,6 +196,39 @@ bool QueryOptimal(uint32_t out_w, uint32_t out_h, Quality q, OptimalSettings* ou
 // invalid input or when latched off; the reason is in GetStats().
 bool Evaluate(ID3D12GraphicsCommandList* list, const EvalDesc& d, bool* history_reset = nullptr);
 
+// One DLSS feature at a time (coordinator 2026-11-27: a DLSS level change holds only the feature in use).
+// A level change makes the next feature off the frame: PrepareFeature, called right after a frame's
+// Evaluate, starts a background thread that makes the feature `d` describes (render and output size,
+// quality, flags, preset, view) on its own command list and queue. NVIDIA's NGX is not thread safe, so it
+// holds the backend's lock while NVIDIA makes it: an Evaluate that comes during that time waits for it.
+// The view's next Evaluate whose description matches adopts the feature (its GPU work waits for the
+// feature's own on the GPU, never on the CPU) and the view's old feature is retired. The caller releases
+// the view that was on screen (ReleaseView) right after that Evaluate, so the old feature is never
+// evaluated again after the new one exists (DLSS 310.9.16 spoils a larger feature evaluated after a
+// smaller one was made; see ordered_feature_group).
+enum class Prepared { None, Making, Ready, Failed };
+Prepared PrepareFeature(const EvalDesc& d);
+// The state for `d` without starting anything (None: nothing is being made for it).
+Prepared PreparedState(const EvalDesc& d);
+// Waits until the feature being made for `d` is made (Ready / Failed), or returns None at once when
+// nothing is being made for it. *waited_ms: how long this call waited.
+Prepared WaitPrepared(const EvalDesc& d, double* waited_ms = nullptr);
+// A made feature nobody adopted is retired (the request changed).
+void CancelPrepared();
+// Called first on each background thread of the backend (the host marks the thread's D3D12 work as its own).
+void SetBackgroundThreadInit(void (*init)());
+// The last off-frame creation: how long NVIDIA took (CPU) and for which size.
+struct PrepareStats {
+    uint64_t made = 0, failed = 0, adopted = 0, cancelled = 0; double last_ms = 0, longest_ms = 0; uint32_t w = 0, h = 0;
+    // Features no longer in use, released off the frame (their own thread): how long NVIDIA took per release,
+    // and its size report after them.
+    uint64_t released_off_frame = 0; double release_last_ms = 0, release_longest_ms = 0, size_query_longest_ms = 0;
+    // The start-up warm-up of the levels (dlss/levels-warmed-at-start): NVIDIA's time to make each level's
+    // feature and to release both, the whole warm-up, and how long first frames waited for it.
+    bool warmed = false; double warm_quality_ms = 0, warm_performance_ms = 0, warm_release_ms = 0, warm_total_ms = 0, warm_waited_ms = 0;
+};
+PrepareStats GetPrepareStats();
+
 // From the host's ExecuteCommandLists path, after the original call returned
 // (no waits): signals completion for tracked evaluations in this submission
 // and releases retired features whose last use has completed.
@@ -225,6 +258,14 @@ bool EnsureOn(ID3D12Device* device, const wchar_t* data_path);
 // Test seams (never set in the product): replace our own NGX start-up and the
 // device-removed check.
 void SetInitOwnOverrideForTests(bool (*init)(ID3D12Device* device, const wchar_t* data_path));
+// Unit tests that count creations and releases one by one: no start-up warm-up of the levels and releases done
+// in place (off: the shipped behaviour, a background warm-up and releases on their own thread).
+void SetInlineForTests(bool inline_work);
+// VARIANT: dlss/levels-warmed-at-start: before the session's first DLSS feature, make the levels' features exactly
+// as they will be asked for and release them again, on a background thread (the first real creation of each level
+// then costs what later ones do). The first Evaluate that makes a feature waits for it. false: not started (no
+// runtime, already warmed for these descriptions, or warming now).
+bool WarmLevels(const EvalDesc& quality, const EvalDesc& performance);
 void SetDeviceRemovedProbeForTests(bool (*removed)(ID3D12Device* device));
 
 // The source of `view_id` is gone (e.g. its FSR/XeSS context was destroyed):

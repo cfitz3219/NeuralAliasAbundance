@@ -103,13 +103,18 @@ int FormatCutNumbers(char* out, size_t n);
 // whether Record would find that size without building anything.
 void Prepare(ID3D12Device*,ID3D12CommandQueue*,unsigned w,unsigned h);
 bool Ready(unsigned w,unsigned h);
+// The working set of this size is still wanted (it is not given back while asked for; one unused for a few
+// seconds is). Builds nothing.
+void Keep(unsigned w,unsigned h);
+// Prepare is still building this size on its thread (false: built, failed, or never asked).
+bool Building(unsigned w,unsigned h);
 struct Stats {
     uint64_t recorded=0,submitted=0,pairs=0,busy=0,resets=0,accepted=0,total=0;
     uint64_t context_swaps=0,prepared=0,prepare_failed=0; // sizes taken from the kept contexts; built ahead by Prepare; failed there
     uint64_t attempts=0,submitted_pairs=0,waiting_history=0,unavailable=0,samples=0;
     uint64_t last_submitted_frame=0,sample_frame=0,submit_age_ms=0,sample_age_ms=0;
     uint64_t rejected_invalid=0,rejected_small=0,rejected_cost=0,rejected_offscreen=0,rejected_image=0,rejected_flicker=0; // flicker: passed every check, no agreeing previous pair yet
-    uint32_t recording_slots=0,image_slots=0;
+    uint32_t recording_slots=0,image_slots=0,images_busy_peak=0; // busy: kept pictures still in use (this one, the last, and frames in flight) when a recording picked one
     uint32_t loosen=0; // flow_loosen used by the latest recording
     uint32_t colour_jitter_convention=0;uint64_t colour_jitter_epoch=0,colour_jitter_changes=0;
     // Every completed pair's pixel counts summed (not one sample per 5 s): accepted, invalid,
