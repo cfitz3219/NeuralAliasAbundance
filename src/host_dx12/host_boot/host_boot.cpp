@@ -393,9 +393,13 @@ DWORD WINAPI InitThread(LPVOID)
         boot_log(!na::j2::Configured() ? "render-small: requested but OFF ([j2] enabled=1 and [observe] producers=1 needed)"
                                        : "render-small: requested but OFF ([present] proxy=0)");
     na::j2::SetRenderSmall(render_small);
+<<<<<<< HEAD
     // NeuralAlias's own DLSS file: in a folder of its own beside NeuralAlias (NeuralAlias-DLSS), so a
     // package never replaces a file of the game's, and an old DLSS file a game ships beside its program
     // is not the one used (Crusader Kings III 2026-11-27: 2.4.0.0, which refuses DLAA on every frame).
+=======
+    // Prefer the private DLSS supplied beside our configuration for added AA.
+>>>>>>> origin/astra/native-scale-settings-trial
     if (na::j2::Configured()) {
         wchar_t folder[MAX_PATH] = {}, file[MAX_PATH] = {};
         lstrcpynW(folder, g_ini, MAX_PATH);

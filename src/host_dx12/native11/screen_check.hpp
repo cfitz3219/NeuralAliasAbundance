@@ -34,10 +34,12 @@ public:
         UINT slot = 0, format = 0;
         uint64_t color = 0, depth = 0, writer = 0;
         uint32_t context = 0;
+        bool scaled = false;
         bool operator==(const Reader& other) const
         {
             return output == other.output && shader == other.shader && slot == other.slot && format == other.format &&
-                   color == other.color && depth == other.depth && writer == other.writer && context == other.context;
+                   color == other.color && depth == other.depth && writer == other.writer && context == other.context &&
+                   scaled == other.scaled;
         }
         explicit operator bool() const { return output && shader; }
     };
@@ -126,6 +128,13 @@ public:
     bool Verified(Id color, Id depth) const { return color_ == color && depth_ == depth && !!verified_; }
     bool Matches(Reader reader) const { return reader == verified_; }
     uint64_t Proof() const { return adaptive_ ? frame_proof_ : verified_ ? proof_ : 0; }
+
+    bool KnowsProof(uint64_t proof) const
+    {
+        if (!proof) return false;
+        if (!adaptive_) return verified_ && proof_ == proof;
+        return std::any_of(routes_.begin(), routes_.end(), [proof](const Route& r) { return r.proof == proof; });
+    }
 
     bool ReservesPixelRead() const { return adaptive_ && steering_; }
 
@@ -322,7 +331,7 @@ public:
                 return finish("adaptive_candidate_mid_scene");
             }
         }
-        if (!adaptive_ && ordinary_completed) {
+        if (!adaptive_ && ordinary_completed && !candidate_.scaled && !verified_.scaled) {
             ordinary_gaps_ = 0;
             if (candidate_ || verified_) {
                 verified_ = {};
@@ -367,8 +376,13 @@ public:
                     MakeStrip(context, desc.Format, true, slot->image);
                 }
                 if (slot->image) {
-                    CopyPoints(context, screen, slot->image.Get(), Points(desc.Width, desc.Height));
-                    slot->layouts = na::referee::PaddedLayouts(marker_width_, marker_height_, desc.Width, desc.Height);
+                    // Read where the centres of the exact marked source texels land after scaling.
+                    // Recomputing the marker spacing at display resolution misses adjacent source texels.
+                    const auto points_on_screen = candidate_.scaled ?
+                        ScaledPoints(marker_width_, marker_height_, desc.Width, desc.Height) : Points(desc.Width, desc.Height);
+                    CopyPoints(context, screen, slot->image.Get(), points_on_screen);
+                    slot->layouts = candidate_.scaled ? 0 :
+                        na::referee::PaddedLayouts(marker_width_, marker_height_, desc.Width, desc.Height);
                     for (UINT layout = 0; layout < slot->layouts; ++layout) {
                         const UINT dx = desc.Width - marker_width_, dy = desc.Height - marker_height_;
                         const LONG x = LONG(dx / 2 + layout % (1 + (dx & 1)));
@@ -392,7 +406,7 @@ public:
         const bool sampled_all = samples_ == screen_marker::kSession;
         bool confirmed = false, any_response = false;
         bool refuted = sampled_all;
-        for (size_t i = centered_only ? 1 : 0; i < votes_.size(); ++i) {
+        for (size_t i = centered_only && !candidate_.scaled ? 1 : 0; i < votes_.size(); ++i) {
             const auto& layout = votes_[i];
             confirmed |= sampled_all && (layout.follow == samples_ || layout.invert == samples_);
             any_response |= layout.follow || layout.invert;
@@ -492,6 +506,20 @@ private:
             const LONG y = LONG(height * screen_marker::kAt[i][1]);
             points[2 * i] = {x, y, x + 1, y + 1};
             points[2 * i + 1] = {x + spacing, y, x + spacing + 1, y + 1};
+        }
+        return points;
+    }
+
+    static ProbeRects ScaledPoints(UINT src_w, UINT src_h, UINT dst_w, UINT dst_h)
+    {
+        const auto center = [](LONG pixel, UINT from, UINT to) {
+            return LONG((2 * uint64_t(pixel) + 1) * to / (2 * uint64_t(from)));
+        };
+        auto points = Points(src_w, src_h);
+        for (auto& rect : points) {
+            const LONG x = center(rect.left, src_w, dst_w);
+            const LONG y = center(rect.top, src_h, dst_h);
+            rect = {x, y, x + 1, y + 1};
         }
         return points;
     }

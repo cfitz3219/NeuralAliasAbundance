@@ -967,10 +967,15 @@ void DrawLiveDlaa()
         // every launch starts on DLAA.
         static const char* kFoldLevels[] = {"DLAA (full size)", "Quality (test)", "Performance (test)"};
         na::settings::Settings& fs = na::settings::Get();
-        int level = static_cast<int>((std::min)(fs.j2_fold_mode.load(), 2u));
-        BeginRow("DLSS level (test)", "DLAA rebuilds the picture at full size. Quality and Performance make the game shade its 3D picture in small blocks (two pixels, or four) and let DLSS rebuild the full picture from one pixel of each block. The game's own settings and its HUD are not touched. DLAA stays on screen until the new level is truly ready, so there is no frozen picture. This is a test: every launch starts on DLAA.", S(220));
+        const bool native = na::on12::NativeRoute();
+        static const char* native_levels[]{"DLAA (full size)", "Quality (test)", "Balanced (test)", "Performance (test)"};
+        constexpr uint32_t storage[]{0, 1, 3, 2};
+        const uint32_t saved = fs.j2_fold_mode.load();
+        int level = native ? (saved == 2 ? 3 : saved == 3 ? 2 : int((std::min)(saved, 1u))) : int((std::min)(saved, 2u));
+        BeginRow("DLSS level (test)", native ? "Referee looks for the world and its visible reader. On a qualified scene, DLSS rebuilds the smaller world before the game draws its interface. Quality and Performance can also use coarse shading." : "DLAA rebuilds the picture at full size. Quality and Performance make the game shade its 3D picture in small blocks (two pixels, or four) and let DLSS rebuild the full picture from one pixel of each block. The game's own settings and its HUD are not touched. DLAA stays on screen until the new level is truly ready, so there is no frozen picture. This is a test: every launch starts on DLAA.", S(220));
         ImGui::SetNextItemWidth(S(220));
-        if (ImGui::Combo("##j2fold", &level, kFoldLevels, 3)) fs.j2_fold_mode.store(static_cast<uint32_t>(level));
+        if (ImGui::Combo("##j2fold", &level, native ? native_levels : kFoldLevels, native ? 4 : 3))
+            fs.j2_fold_mode.store(native ? storage[level] : static_cast<uint32_t>(level));
         EndRow();
         char fold_status[320]{};
         if (na::on12::NativeRoute()) na::native_d3d11::FoldStatus(fold_status, sizeof fold_status);
