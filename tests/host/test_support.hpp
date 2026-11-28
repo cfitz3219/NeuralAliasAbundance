@@ -13,8 +13,12 @@
 #include <string>
 #include <dbghelp.h>
 #include <tlhelp32.h>
+#include "core/first_setup.hpp"
 
 namespace test {
+// These tests count delivered frames from the very first call: first-time set-up is done inside that call
+// here. The product does it on its own thread (core/first_setup.hpp); native11_dlaa_test --first-setup tests that.
+inline const bool g_inline_first_setup = (na::first_setup::InlineForTests().store(true), true);
 using Microsoft::WRL::ComPtr;
 constexpr int kSkip = 77;
 inline int g_failures = 0;

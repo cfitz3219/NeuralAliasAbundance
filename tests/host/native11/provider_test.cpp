@@ -14,6 +14,7 @@
 // consumer's own D3D11 work is not observed; jitter from SetNextJitter reaches the GPU's camera (rows
 // 0/1 only) and is reported back; the stream id holds across frames and changes after a resize.
 // Hardware first, then WARP; exit 77 (SKIP) only without any DX11 device.
+#include "core/first_setup.hpp"
 #include "host_dx12/native11/camera_pick.hpp"
 #include "host_dx12/native11/input_provider.hpp"
 #include "host_dx12/native11/viewport_jitter.hpp"
@@ -2130,7 +2131,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         (argc > 1 && std::strcmp(argv[1], "--lit-role-trial") == 0);
     const bool rotating_lights = compare_routes || padded_hdr || reuse_depth || (argc > 1 && std::strcmp(argv[1], "--lit-role") == 0);
     const bool replay_handoff = !std::strcmp(arg1, "--replay-handoff");
-    const bool camera_off_start = replay_handoff || !std::strcmp(arg1, "--camera-off-start");
+    // First-time set-up beside the game (core/first_setup.hpp): the product's order. Every other case
+    // counts delivered frames from its first call and asks for set-up inside that call.
+    const bool first_setup = !std::strcmp(arg1, "--first-setup");
+    na::first_setup::InlineForTests().store(!first_setup);
+    const bool camera_off_start = replay_handoff || first_setup || !std::strcmp(arg1, "--camera-off-start");
     // One presenter for both APIs, stage 3: live x2 on a DX11 game (proxy chain, native DLAA inputs,
     // HUD-free picture, presenter), 8-bit SDR or FP16 back buffer.
     const bool fg_x2_hdr = argc > 1 && std::strcmp(argv[1], "--fg-x2-fp16") == 0;
@@ -3056,6 +3061,47 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
             na::settings::Get().j2_draw_replay.store(1);
             na::settings::Get().j2_replay_budget.store(0);
             na::settings::Get().j2_replay_movers.store(0);
+        }
+        if (first_setup) {
+            // Cort's Crusader Kings III run of 2026-11-27: DLAA's first start did seconds of set-up on the
+            // game's drawing thread and the game stopped drawing. Here the "game" keeps drawing frames
+            // from a cold start; no single DLAA call may hold its thread, and DLAA must then arrive.
+            LARGE_INTEGER hz, start, t0, t1;
+            QueryPerformanceFrequency(&hz); QueryPerformanceCounter(&start);
+            const auto ms_since = [&](const LARGE_INTEGER& from) {
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                return double(now.QuadPart - from.QuadPart) * 1000.0 / double(hz.QuadPart);
+            };
+            double longest_frame_ms = 0, first_delivery_ms = -1;
+            int frames = 0, frames_before = 0;
+            const auto delivered0 = evaluations;
+            while (ms_since(start) < 120000.0 && evaluations < delivered0 + 30) {
+                Pump();
+                QueryPerformanceCounter(&t0);
+                Scene(g.ctx.Get(), g, frames, false, false);
+                Post(g.ctx.Get(), g, true);
+                g.swap->Present(0, 0);
+                QueryPerformanceCounter(&t1);
+                longest_frame_ms = (std::max)(longest_frame_ms, double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(hz.QuadPart));
+                ++frames;
+                if (evaluations == delivered0) ++frames_before;
+                else if (first_delivery_ms < 0) first_delivery_ms = ms_since(start);
+            }
+            char wide[8192]{};
+            na::native_d3d11::FormatStatus(wide, sizeof wide);
+            const unsigned long long longest_call = na::native_d3d11::LongestCallMs();
+            std::printf("first set-up beside the game: frames drawn=%d, frames before DLAA=%d, DLAA first delivered after %.0f ms, "
+                        "delivered=%llu, longest wait of the game's thread in one DLAA call=%llu ms, longest whole frame=%.0f ms | %s\n",
+                        frames, frames_before, first_delivery_ms, static_cast<unsigned long long>(evaluations - delivered0), longest_call,
+                        longest_frame_ms, wide);
+            expect(evaluations >= delivered0 + 30, "DLAA arrives after first-time set-up and keeps delivering");
+            expect(frames_before >= 1, "the game drew frames of its own while set-up ran (set-up was not inside the first call)");
+            expect(longest_call < 500, "no DLAA call held the game's thread for half a second (Windows marks a game not responding at 5 s)");
+            expect(longest_frame_ms < 1000.0, "no whole frame took a second during or after first-time set-up");
+            if (g_failed) std::printf("FAIL: %d first-set-up check(s) failed\n", g_failed);
+            else std::printf("PASS: first-time set-up runs beside the game\n");
+            std::fflush(stdout);
+            ExitProcess(g_failed ? 1u : 0u);
         }
         for (int frame = 0; frame < 48; ++frame) {
             Pump();

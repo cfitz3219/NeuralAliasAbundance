@@ -1,3 +1,4 @@
+#include "host_dx12/scale/scale_witness.hpp"
 #include "host_dx12/native11/samplers.hpp"
 #include "core/temporal_jitter.hpp"
 #include <cstring>
@@ -947,8 +948,12 @@ void DrawLiveDlaa()
     const na::j2::Stats st = na::j2::GetStats();
     BeginGroupBox("Live DLAA");
     bool on = !na::j2::Paused();
-    BeginRow("NeuralAlias DLAA (test)", "NVIDIA DLSS at full resolution on this game's 3D picture. Switch off to compare.", SwitchWidth());
-    if (Switch("j2", &on)) {
+    // Render-scale finder test ([scale] test=1): DLSS/DLAA stays off for the whole run, so this switch
+    // does nothing there (Cort's 2026-11-27 run: it lifted the hold and DLAA started mid-test).
+    const bool finder_test = na::scale::witness::TestMode();
+    BeginRow("NeuralAlias DLAA (test)", finder_test ? "Held off for this run: the render-scale finder test is running. This switch does nothing in the test."
+                                                    : "NVIDIA DLSS at full resolution on this game's 3D picture. Switch off to compare.", SwitchWidth());
+    if (Switch("j2", &on) && !finder_test) {
         na::j2::SetPaused(!on);
         const auto mip = na::observe::GetMipLiveStats();
         if (mip.enabled && !na::j2::RenderSmall() &&

@@ -1,6 +1,8 @@
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/j2/flow_shaders.hpp"
 #include "host_dx12/settings.hpp"
+#include "host_dx12/diag/event_log.hpp"
+#include "core/first_setup.hpp"
 #include "host_dx12/ffx_flow/ffx_flow.hpp"
 #include "host_dx12/ffx_flow/ffx_flow_shaders.hpp"
 #include "host_dx12/nvof/flow_expand.hpp"
@@ -137,6 +139,7 @@ std::mutex mutex;std::shared_ptr<Context> current;Stats stats;uint64_t last_subm
 // measures at its own size; switching levels must not build programs on the frame's own time), and
 // the sizes Prepare is building on its own thread.
 std::vector<std::shared_ptr<Context>> cached;std::vector<std::pair<unsigned,unsigned>> building;
+std::vector<std::pair<unsigned,unsigned>> warm_failed; // sizes whose build on its own thread failed (Warm)
 constexpr size_t kCachedContexts=3;
 void reason(const char* r){strncpy_s(stats.reason,r,_TRUNCATE);}
 bool compile_flow_shader(const char* source,size_t bytes,const char* name,const char* entry,ComPtr<ID3DBlob>& result){
@@ -273,7 +276,11 @@ Ticket Record(ID3D12GraphicsCommandList* l,ID3D12CommandQueue* queue,ID3D12Resou
         if(next)++stats.context_swaps;
         else{
             reason("AMD working resources unavailable; camera motion used");
-            next=std::make_shared<Context>();if(!build(*next,device.Get(),queue,w,h))return {};++stats.resets;
+            const uint64_t began=GetTickCount64();
+            next=std::make_shared<Context>();const bool built=build(*next,device.Get(),queue,w,h);
+            na::eventlog::Emit("first_setup","motion working set %ux%u %s in %llu ms ON THE GAME'S THREAD (not warmed first)",w,h,built?"built":"FAILED to build",
+                               static_cast<unsigned long long>(GetTickCount64()-began));
+            if(!built)return {};++stats.resets;
         }
         if(current){cached.push_back(std::move(current));if(cached.size()>kCachedContexts)cached.erase(cached.begin());}
         current=std::move(next);
@@ -551,13 +558,32 @@ void Prepare(ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,unsigned 
     building.emplace_back(w,h);
     ComPtr<ID3D12Device> dev(device);ComPtr<ID3D12CommandQueue> q(queue);
     std::thread([dev,q,w,h]{
+        const uint64_t began=GetTickCount64();
         auto next=std::make_shared<Context>();const bool ok=build(*next,dev.Get(),q.Get(),w,h);
+        na::eventlog::Emit("first_setup","motion working set %ux%u %s in %llu ms on its own thread (the game kept drawing)",w,h,ok?"built":"FAILED to build",
+                           static_cast<unsigned long long>(GetTickCount64()-began));
         std::lock_guard<std::mutex> lock(mutex);
         building.erase(std::remove(building.begin(),building.end(),std::make_pair(w,h)),building.end());
-        if(!ok){++stats.prepare_failed;return;}
+        if(!ok){++stats.prepare_failed;warm_failed.emplace_back(w,h);return;}
         if(current && (current->device.Get()!=dev.Get() || current->queue.Get()!=q.Get()))return;
         cached.push_back(std::move(next));++stats.prepared;if(cached.size()>kCachedContexts)cached.erase(cached.begin());
     }).detach();
+}
+// First-time set-up never runs on the game's thread (Cort 2026-11-27: a game froze when it did).
+// True: Record can take this size without building anything, or only Record can settle it (another
+// device, no programs, or a build that already failed here: Record then says why). False: the size is
+// being built on its own thread; the caller leaves this frame as the game drew it and asks again.
+bool Warm(ID3D12Device* device,ID3D12CommandQueue* queue,unsigned w,unsigned h){
+    if(!device || !queue || !w || !h || !na::ffx_flow::Built() || na::first_setup::InlineForTests().load(std::memory_order_relaxed))return true;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if(current && (current->device.Get()!=device || current->queue.Get()!=queue))return true;
+        if(current && current->w==w && current->h==h)return true;
+        for(const auto& c:cached)if(c->w==w && c->h==h)return true; // same device: taken; another: Record settles it
+        for(const auto& f:warm_failed)if(f.first==w && f.second==h)return true;
+    }
+    Prepare(device,queue,w,h);
+    return false;
 }
 bool Ready(unsigned w,unsigned h){
     std::lock_guard<std::mutex> lock(mutex);

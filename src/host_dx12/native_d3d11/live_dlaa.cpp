@@ -13,6 +13,7 @@
 #include "host_dx12/dlss/dlss_backend.hpp"
 #include "host_dx12/host_boot/session.hpp"
 #include "host_dx12/diag/event_log.hpp"
+#include "core/first_setup.hpp"
 #include "host_dx12/j2/live_dlaa.hpp"
 #include "host_dx12/j2/compute_flow.hpp"
 #include "host_dx12/j2/replay_motion.hpp"
@@ -37,6 +38,7 @@
 #include <cstring>
 #include <vector>
 #include <atomic>
+#include <thread>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -131,6 +133,12 @@ struct Session {
 // immediate context and can still have queued copies when shutdown starts.
 Session& State() { static auto* s = new Session; return *s; }
 std::mutex mutex;
+// First-time set-up (our own DX12 device, DLSS start, the passes' programs) runs on a thread of its own
+// and holds `mutex` for all of it. The game's threads read this before they would take `mutex`, so they
+// never wait: 0 not started, 1 running, 2 finished (s.native set = ready, else it failed).
+// Cort 2026-11-27: this work froze a game for longer than Windows allows when it ran on the game's thread.
+std::atomic<int> g_first_setup{0};
+constexpr char kGettingReady[] = "DLAA is getting ready (first-time set-up runs beside the game; the game keeps drawing).";
 std::atomic<const char*> reason{"Waiting for a native scene."};
 std::atomic<uint64_t> delivered{0}, busy{0}, rejected{0};
 // WHY log: frames on which DLSS was told to drop its history, by cause. A reset on every frame
@@ -437,7 +445,7 @@ void SyncCameraUse()
         // Coarse shading only while folded frames are really delivered: a paused or stalled DLAA never
         // leaves the game's own picture drawn in blocks.
         const auto last = delivered_at.load(std::memory_order_relaxed);
-        if (paused || !last || GetTickCount64() - last > 250) {
+        if ((paused || !last || GetTickCount64() - last > 250) && g_first_setup.load(std::memory_order_acquire) != 1) {
             std::lock_guard<std::mutex> lk(mutex);
             auto& s = State();
             fold_rate(s, na::fold::Mode::Off, 0);
@@ -460,7 +468,35 @@ void SyncCameraUse()
         (setting == 1 || ambient) ? native11::CameraUse::Optional : native11::CameraUse::Off);
 }
 
+namespace {
+bool EvaluateFrameTimed(void* context, const native11::SceneFrame& frame);
+std::atomic<uint64_t> g_longest_call_ms{0};
+}
+uint64_t LongestCallMs() { return g_longest_call_ms.load(std::memory_order_relaxed); }
+
+// The game's thread waits for this call. Its time is measured, and a long one is logged with the reason
+// the frame ended on, so a stall names itself in the log instead of needing a debugger.
 bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
+{
+    LARGE_INTEGER t0, t1, hz;
+    QueryPerformanceCounter(&t0);
+    const bool result = EvaluateFrameTimed(context, frame);
+    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&hz);
+    const uint64_t ms = static_cast<uint64_t>((t1.QuadPart - t0.QuadPart) * 1000 / hz.QuadPart);
+    uint64_t longest = g_longest_call_ms.load(std::memory_order_relaxed);
+    while (ms > longest && !g_longest_call_ms.compare_exchange_weak(longest, ms, std::memory_order_relaxed)) {}
+    if (ms >= 100) {
+        static std::atomic<unsigned> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 24)
+            na::eventlog::Emit("first_setup", "api=dx11 the game's thread waited %llu ms in DLAA's frame work at frame %llu (%s): %s",
+                               static_cast<unsigned long long>(ms), static_cast<unsigned long long>(frame.frame),
+                               result ? "delivered" : "not delivered", reason.load(std::memory_order_relaxed));
+    }
+    return result;
+}
+
+namespace {
+bool EvaluateFrameTimed(void* context, const native11::SceneFrame& frame)
 {
     // The native provider has witnessed a real rendered scene. Wake the
     // existing session worker so it can qualify settings and enable effects.
@@ -471,6 +507,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                                 SUCCEEDED(State().replay_handoff_hr.load(std::memory_order_relaxed));
     const auto sealed = replay_setting ? native11::draw_replay::Seal(frame.frame) : native11::draw_replay::Sealed{};
     if (!context || !j2::Enabled() || j2::Paused()) return Skip("DLAA paused.");
+    if (g_first_setup.load(std::memory_order_acquire) == 1) return Skip(kGettingReady); // its thread holds `mutex`
     std::lock_guard<std::mutex> lock(mutex);
     auto& s = State();
     if (s.failed) return false;
@@ -576,7 +613,47 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         if (alternative == tool) applied_tool |= referee::Bit(alternative);
     };
     observe::HostWorkScope own;
-    if (!s.native && !Start(s, native.Get())) {
+    if (!s.native && g_first_setup.load(std::memory_order_acquire) == 0 && na::first_setup::InlineForTests().load(std::memory_order_relaxed)) {
+        Start(s, native.Get()); // tests that count frames from the first call (core/first_setup.hpp)
+        g_first_setup.store(2, std::memory_order_release);
+    }
+    if (!s.native && g_first_setup.load(std::memory_order_acquire) == 0) {
+        // Not on the game's thread. This frame and the ones until it finishes are left as the game drew them.
+        g_first_setup.store(1, std::memory_order_release);
+        const bool replay_wanted = replay_setting;
+        const bool flow_wanted = measured || j2::flow::Enabled();
+        const unsigned w = ci.width, h = ci.height;
+        std::thread([native, replay_wanted, flow_wanted, w, h] {
+            const uint64_t began = GetTickCount64();
+            bool ok;
+            uint64_t start_ms, passes_ms;
+            {
+                std::lock_guard<std::mutex> setup(mutex);
+                auto& st = State();
+                observe::HostWorkScope own;
+                ok = Start(st, native.Get());
+                start_ms = GetTickCount64() - began;
+                if (ok) {
+                    // The levels' pass, when levels are in use (asked for again where it is used; nothing is built twice).
+                    if (!st.companion && (settings::Get().j2_fold_prewarm.load(std::memory_order_relaxed) ||
+                                          settings::Get().j2_fold_mode.load(std::memory_order_relaxed)))
+                        st.fold.Init(st.device.Get(), kSlots);
+                    if (replay_wanted && !st.replay_tried) {
+                        st.replay_tried = true;
+                        if (st.replay.Init(st.device.Get())) st.replay.SetLearnSink(&ReplayLearnSink);
+                        na::eventlog::Emit("draw_replay11_pass", "ready=%d", st.replay.Ready() ? 1 : 0);
+                    }
+                    if (flow_wanted) j2::compute_flow::Warm(st.device.Get(), st.queue.Get(), w, h);
+                }
+                passes_ms = GetTickCount64() - began - start_ms;
+            }
+            na::eventlog::Emit("first_setup", "api=dx11 %s on its own thread (the game kept drawing): device, queue and DLSS start %llu ms, passes %llu ms",
+                               ok ? "ready" : "FAILED", static_cast<unsigned long long>(start_ms), static_cast<unsigned long long>(passes_ms));
+            g_first_setup.store(2, std::memory_order_release);
+        }).detach();
+        return Skip(kGettingReady);
+    }
+    if (!s.native) {
         // Says WHY: on the companion route the companion's own reason is the useful one.
         static char why[200];
         const auto remote = dlaa_remote::GetStats();
@@ -584,6 +661,9 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
         std::snprintf(why, sizeof why, "DLAA companion: %s", remote.reason);
         return FailSession(s, why);
     }
+    // The motion measurement's working set for this picture size (also after a change of size).
+    if ((measured || j2::flow::Enabled()) && !j2::compute_flow::Warm(s.device.Get(), s.queue.Get(), ci.width, ci.height))
+        return Skip(kGettingReady);
     UINT index = 0;
     for (; index < kSlots; ++index) {
         const auto& slot = s.slots[index];
@@ -1565,6 +1645,7 @@ bool EvaluateFrame(void*, void* context, const native11::SceneFrame& frame)
                           : "Native DX11 DLAA delivered before the scene consumer.", std::memory_order_relaxed);
     return true;
 }
+} // namespace
 
 void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue,
                     const native11::PresentReceipt& receipt, PresentPicture picture)
@@ -1593,8 +1674,11 @@ void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue,
         // The inputs, copies and witness reduction must use the same queue.
         // The overlay's separate queue can reach Present before our sample
         // fence completes, even when both queues belong to the same device.
-        std::lock_guard<std::mutex> lock(mutex);
-        evaluation_queue = State().queue;
+        // During first-time set-up there is no evaluation queue yet, and `mutex` is held by its thread.
+        if (g_first_setup.load(std::memory_order_acquire) != 1) {
+            std::lock_guard<std::mutex> lock(mutex);
+            evaluation_queue = State().queue;
+        }
     }
     auto* queue = evaluation_queue ? evaluation_queue.Get() : fallback_queue;
     const auto execute = [](ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) { q->ExecuteCommandLists(n, lists); };

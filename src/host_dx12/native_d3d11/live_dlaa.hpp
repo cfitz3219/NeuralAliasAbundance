@@ -7,6 +7,9 @@ namespace na::native11 { struct SceneFrame; struct PresentReceipt; }
 
 namespace na::native_d3d11 {
 bool EvaluateFrame(void* user, void* context, const native11::SceneFrame& frame);
+// The longest the game's thread has waited in one EvaluateFrame call, in ms (first-time set-up runs on
+// its own thread: this stays small). Logged as `first_setup` when a call takes 100 ms or more.
+uint64_t LongestCallMs();
 enum class PresentPicture { Game, WithHome };
 void CapturePresent(IDXGISwapChain* swap, ID3D12CommandQueue* fallback_queue,
                     const native11::PresentReceipt& receipt, PresentPicture picture);

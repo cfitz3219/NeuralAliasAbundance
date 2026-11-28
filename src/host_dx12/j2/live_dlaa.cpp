@@ -3027,9 +3027,13 @@ bool ensure_device(ID3D12CommandQueue* q)
             return false;
         s.list->Close();
     }
+    // Still on the game's thread on this route: timed, so the log says what a first start costs here.
+    const uint64_t began = GetTickCount64();
     g.arbiter_ok = g.arbiter.Init(dev.Get(), kRing);
     g.game_motion_ok = g.game_motion.Init(dev.Get(), kRing);
     g.replay_ok = g.replay.Init(dev.Get());
+    na::eventlog::Emit("first_setup", "api=dx12 the game's thread waited %llu ms for the motion, game-motion and replay passes (arbiter=%d game_motion=%d replay=%d)",
+                       static_cast<unsigned long long>(GetTickCount64() - began), g.arbiter_ok ? 1 : 0, g.game_motion_ok ? 1 : 0, g.replay_ok ? 1 : 0);
     return true;
 }
 
@@ -3041,7 +3045,17 @@ bool dlss_on()
     if (!n || n >= MAX_PATH - 20) { reason("No folder for DLSS data."); return false; }
     wcscat_s(path, L"NeuralAlias-ngx");
     CreateDirectoryW(path, nullptr);
-    if (!na::dlss::EnsureOn(g.device.Get(), path)) { reason("DLSS did not start on this device (see DLSS details)."); return false; }
+    const uint64_t began = GetTickCount64();
+    const bool on = na::dlss::EnsureOn(g.device.Get(), path);
+    {
+        static unsigned said = 0;
+        const uint64_t ms = GetTickCount64() - began;
+        if (said < 4 && (ms >= 20 || !on)) {
+            ++said;
+            na::eventlog::Emit("first_setup", "api=dx12 the game's thread waited %llu ms for DLSS to start (%s)", static_cast<unsigned long long>(ms), on ? "started" : "did NOT start");
+        }
+    }
+    if (!on) { reason("DLSS did not start on this device (see DLSS details)."); return false; }
     g.dlss_ready = true;
     return true;
 }
@@ -5172,6 +5186,15 @@ bool record(ID3D12CommandList* const* lists, UINT scene, na_object_id depth_id, 
     const bool measured = no_camera || camera_cut_unconfirmed ||
                           (tracker_stale && cam.camera_cut && camera_use != 2 && !cannot_measure && !gap_restart && !resize &&
                            !g.measured_refused);
+    // First-time set-up never runs on the game's thread (as on the DX11 route): the motion measurement's
+    // working set for this picture size is built on its own thread, also after a change of size, and
+    // until it is there the frame is left as the game drew it. Not built when nothing would measure.
+    if ((measured || na::j2::flow::Enabled()) && g.color_in) {
+        const auto picture = g.color_in->GetDesc();
+        if (!na::j2::compute_flow::Warm(g.device.Get(), g.queue.Get(), static_cast<unsigned>(picture.Width), picture.Height)) {
+            ++g.stats.busy; reason("DLAA is getting ready (first-time set-up runs beside the game; the game keeps drawing)."); return false;
+        }
+    }
     bool viewport_sample_known=false;
     if (vpj_mode()) { // the camera is the game's own (no J1 write); the sample is in the viewports
         float vx = 0.f, vy = 0.f;
