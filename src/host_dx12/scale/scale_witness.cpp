@@ -82,6 +82,12 @@ struct State {
     // The writing trial ([scale] trial=1): NeuralAlias sets each confirmed number itself and the judge
     // watches whether the game's world follows.
     std::atomic<bool> trial_wanted{false}, trial_active{false}, sweeping{false};
+    // The Search ([scale] search=1): the number is found at launch with no slider moves.
+    std::atomic<bool> search_wanted{false}, names_done{false};
+    int search_state = 0;            // under trial_m. 0 not started, 1 running, 2 found, 3 not found, 4 stopped
+    std::string search_text;         // under trial_m: the one-sentence outcome and why
+    std::vector<std::string> search_lines; // under trial_m: what each step saw
+    std::vector<uint64_t> name_addresses;  // under modules_m: where the setting names are in the game's program
     std::atomic<uint64_t> last_size_event_ms{0}, trial_ended_ms{0};
     std::mutex trial_m; std::vector<TrialRow> trial_rows; std::vector<std::string> trial_paths;
     int trial_state = 0; // 0 not run, 1 running, 2 finished, 3 stopped (the world did not come back)
@@ -420,6 +426,7 @@ void named_search(Module& mod)
     }
     report(found, hunt::kNamed);
     g.names_found.store(by_rva.size()); g.candidates_from_code.fetch_add(found.size());
+    for (const auto& n : by_rva) if (g.name_addresses.size() < 2048) g.name_addresses.push_back(mod.base + n.first);
     line("named: %s has %zu setting names, %u code references to %zu of them from %zu functions, candidates=%zu", mod.name.c_str(),
          by_rva.size(), refs, used.size(), g.named_functions.size(), found.size());
     unsigned shown = 0;
@@ -437,6 +444,7 @@ void code_worker()
         std::lock_guard<std::mutex> modules_lock(g.modules_m);
     if (Module* exe = module_at(reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr)) + 0x1000)) named_search(*exe);
     }
+    g.names_done.store(true);
     for (;;) {
         Capture c;
         {
@@ -539,6 +547,13 @@ void write_verdict()
         std::snprintf(reason, sizeof reason, "The world changed size %u time(s) but no number in the game followed it (%zu candidates "
                       "checked).", changes, size);
     }
+    if (g.search_wanted.load() && !changes) { // hands-free run: the outcome is the Search's, not the slider test's
+        std::lock_guard<std::mutex> l(g.trial_m);
+        pass = g.search_state == 2;
+        if (g.search_state >= 2) std::snprintf(reason, sizeof reason, "%s", g.search_text.c_str());
+        else if (have) std::snprintf(reason, sizeof reason, "%s", g.search_state == 1 ? "The Search is running." : "The Search has not started yet: it "
+                           "starts by itself once the game's 3D world has been on screen and steady for 6 seconds. No slider moves are needed.");
+    }
     FILE* f = nullptr;
     if (_wfopen_s(&f, g.verdict_path.c_str(), L"w") != 0 || !f) return;
     SYSTEMTIME now; GetSystemTime(&now);
@@ -565,6 +580,14 @@ void write_verdict()
     }
     {   // The writing trial: did the game follow when NeuralAlias set the number itself?
         std::lock_guard<std::mutex> l(g.trial_m);
+        if (g.search_wanted.load()) {
+            static const char* const kState[] = {"NOT STARTED", "RUNNING", "FOUND", "NOT FOUND", "STOPPED"};
+            std::fprintf(f, "\nTHE SEARCH (NeuralAlias finds the render-scale number by itself; no slider moves)\n");
+            std::fprintf(f, "SEARCH: %s. %s\n", kState[g.search_state], g.search_text.c_str());
+            for (const auto& s : g.search_lines) std::fprintf(f, "  %s\n", s.c_str());
+            if (g.search_state == 2) std::fprintf(f, "NEXT STAGE: THE CONNECTION (DLSS on the game's smaller picture; Quality, Balanced, Performance).\n");
+            else if (g.search_state >= 3) std::fprintf(f, "NEXT STAGE: THE FOLD (the Search did not succeed; Quality and Performance only, Balanced unavailable).\n");
+        }
         if (g.trial_wanted.load()) {
             const TrialRow* works = nullptr;
             for (const auto& r : g.trial_rows)
@@ -992,7 +1015,7 @@ uint32_t watch_count() { return 0; }
 void watch_rearm() {}
 #endif
 
-void run_trial()
+void run_trial(const std::vector<hunt::Entry>& given = {})
 {
     std::vector<hunt::Entry> scales; hunt::Target start;
     {
@@ -1001,6 +1024,7 @@ void run_trial()
         for (const auto& e : g.board.Ranked(256))
             if (e.Confirmed() && !hunt::IsSizePair(e.kind) && scales.size() < 12) scales.push_back(e);
     }
+    if (!given.empty()) scales = given; // the Search found it without the player's help
     const double home = start.Ratio();
     // A small nudge the player will not notice: five points down, or up when the game is already low.
     const double goal = home > 0.60 ? home - 0.05 : home + 0.05;
@@ -1072,13 +1096,304 @@ void run_trial()
     if (works) { find_routes(works); write_verdict(); }
     line("trial: finished");
 }
+
+// ---- THE SEARCH: find the render-scale number at launch, with no help from the player ----
+// What never changes between launches: the number holds the starting value, it sits in an object that
+// carries a render-scale name or beside the 3D picture's size, and the game obeys it. Candidates are
+// gathered by those clues, then nudged by five points in halving groups until one number is left.
+enum : uint8_t { kByCode = 1, kByName = 2, kBySize = 4 };
+struct Cand { uint64_t address = 0; hunt::Kind kind = hunt::Kind::ScaleF32; uint8_t source = 0; uint8_t saved[8]{}; bool written = false; };
+
+// The setting names as text in the game's writable memory: a settings object often carries its own name.
+void sweep_name_text(std::vector<uint64_t>* found, size_t limit)
+{
+    bool first[256]{};
+    for (const char* word : kWords) first[uint8_t(word[0])] = true;
+    constexpr size_t kTail = 64;
+    std::vector<uint8_t> buffer(kChunk + kTail);
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    uint64_t at = reinterpret_cast<uint64_t>(si.lpMinimumApplicationAddress), scanned = 0;
+    const uint64_t top = reinterpret_cast<uint64_t>(si.lpMaximumApplicationAddress);
+    const uint64_t own = reinterpret_cast<uint64_t>(buffer.data());
+    while (at < top && scanned < kSweepBudget && found->size() < limit) {
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQuery(ptr(at), &m, sizeof m)) break;
+        const uint64_t base = reinterpret_cast<uint64_t>(m.BaseAddress), size = m.RegionSize;
+        at = base + size;
+        if (m.State != MEM_COMMIT || !writable_protect(m.Protect) || m.Type == MEM_MAPPED) continue;
+        if (base <= own && own < base + size) continue;
+        for (uint64_t off = 0; off < size && scanned < kSweepBudget && found->size() < limit; off += kChunk) {
+            const size_t want = size_t((std::min<uint64_t>)(kChunk + kTail, size - off));
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), ptr(base + off), buffer.data(), want, &got) || got < 8) break;
+            const uint8_t* b = buffer.data();
+            const size_t starts = (std::min<size_t>)(got, kChunk);
+            scanned += starts;
+            for (size_t i = 0; i < starts && found->size() < limit; ++i) {
+                const char c = lower(b[i]);
+                if (!first[uint8_t(c)]) continue;
+                for (const char* word : kWords) {
+                    if (word[0] != c) continue;
+                    const size_t n = std::strlen(word);
+                    if (i + n > got) continue;
+                    bool same = true;
+                    for (size_t k = 1; k < n && same; ++k) same = lower(b[i + k]) == word[k];
+                    if (!same) continue;
+                    size_t start = i;
+                    while (start > 0 && i - start < 96 && name_char(b[start - 1])) --start;
+                    found->push_back(base + off + start);
+                    i += n;
+                    break;
+                }
+            }
+            if (((off / kChunk) & 15) == 15) Sleep(1);
+        }
+    }
+    g.bytes_searched.fetch_add(scanned);
+}
+// Every number within `reach` bytes of `center` that holds the game's current scale becomes a candidate.
+void add_near(uint64_t center, uint32_t reach, uint8_t source, const hunt::Target& t, std::map<uint64_t, Cand>* out, size_t limit)
+{
+    MEMORY_BASIC_INFORMATION m{};
+    if (center < 0x10000 || !VirtualQuery(ptr(center), &m, sizeof m) || m.State != MEM_COMMIT || !writable_protect(m.Protect)) return;
+    const uint64_t region = reinterpret_cast<uint64_t>(m.BaseAddress), region_end = region + m.RegionSize;
+    const uint64_t lo = ((std::max)(region, center > reach ? center - reach : 0) + 3) & ~3ull;
+    const uint64_t hi = (std::min)(region_end, center + reach + 8);
+    uint8_t block[1040];
+    if (hi <= lo + 4 || hi - lo > sizeof block) return;
+    const size_t n = size_t(hi - lo);
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), ptr(lo), block, n, &got) || got != n) return;
+    if (reinterpret_cast<uint64_t>(module_handle(lo, false)) == g.self_base && g.self_base) return; // never NeuralAlias's own numbers
+    for (size_t o = 0; o + 4 <= n; o += 4) {
+        const uint64_t address = lo + o;
+        hunt::Kind kind = hunt::Kind::ScaleF32; bool is = true;
+        if (hunt::Holds(block + o, n - o, hunt::Kind::ScaleF32, t)) kind = hunt::Kind::ScaleF32;
+        else if (!(address & 7) && o + 8 <= n && hunt::Holds(block + o, n - o, hunt::Kind::ScaleF64, t)) kind = hunt::Kind::ScaleF64;
+        else if (hunt::Holds(block + o, n - o, hunt::Kind::PercentF32, t)) kind = hunt::Kind::PercentF32;
+        // A whole number such as 100 is too common beside a size; beside the setting's own name it is telling.
+        else if ((source & kByName) && hunt::Holds(block + o, n - o, hunt::Kind::PercentI32, t)) kind = hunt::Kind::PercentI32;
+        else is = false;
+        if (!is) continue;
+        auto it = out->find(address);
+        if (it == out->end()) {
+            if (out->size() >= limit) return;
+            it = out->emplace(address, Cand{}).first;
+            it->second.address = address; it->second.kind = kind;
+        }
+        it->second.source |= source;
+    }
+}
+// Writes the nudge to every candidate in [lo, hi), watches the world, puts every value back and waits for
+// the world to come home. 1: the world moved. 0: it did not. -1: no evidence (a menu). -2: it did not come home.
+int nudge_once(std::vector<Cand>& c, size_t lo, size_t hi, const hunt::Target& start, double home, double goal)
+{
+    hunt::Frame f;
+    if (!live_frame(&f, 0)) return -1;
+    for (size_t i = lo; i < hi; ++i) {
+        Cand& k = c[i];
+        k.written = false;
+        const size_t n = kind_bytes(k.kind);
+        if (!safe_read(k.address, k.saved, n) || !hunt::Holds(k.saved, n, k.kind, start)) continue; // gone, or the game changed it
+        k.written = write_scale(k.address, k.kind, goal);
+    }
+    const uint64_t t0 = GetTickCount64();
+    int away = 0, seen = 0;
+    bool moved = false;
+    while (GetTickCount64() - t0 < 800 && !moved) {
+        Sleep(kTickMs);
+        if (!live_frame(&f, 0)) continue;
+        ++seen;
+        away = std::fabs(double(f.world_w) / double(f.out_w) - home) > 0.012 ? away + 1 : 0;
+        moved = away >= 3;
+    }
+    for (size_t i = lo; i < hi; ++i)
+        if (c[i].written) safe_write(c[i].address, c[i].saved, kind_bytes(c[i].kind));
+    const uint64_t t1 = GetTickCount64();
+    int steady = 0; bool back = false, live = false;
+    while (GetTickCount64() - t1 < 5000 && !back) {
+        Sleep(kTickMs);
+        if (!live_frame(&f, 0)) continue;
+        live = true;
+        steady = std::fabs(double(f.world_w) / double(f.out_w) - home) <= 0.012 ? steady + 1 : 0;
+        back = steady >= 6;
+    }
+    if (!back) return live ? -2 : -1;
+    if (!seen) return -1;
+    return moved ? 1 : 0;
+}
+int nudge(std::vector<Cand>& c, size_t lo, size_t hi, const hunt::Target& start, double home, double goal, unsigned* steps)
+{
+    for (int tries = 0; tries < 15; ++tries) {
+        const int r = nudge_once(c, lo, hi, start, home, goal);
+        ++*steps;
+        if (r != -1) return r;
+        Sleep(2000); // a menu or a loading screen: wait for the 3D world
+    }
+    return -1;
+}
+// Halving. Returns the index of the one number the game obeys, or -1 none in this group, -2 the world
+// did not come home, -3 no evidence, -4 the group moved the world but no single number did.
+long long hunt_in(std::vector<Cand>& c, size_t lo, size_t hi, const hunt::Target& start, double home, double goal, unsigned* steps)
+{
+    if (lo >= hi) return -1;
+    int r = nudge(c, lo, hi, start, home, goal, steps);
+    if (r != 1) return r == 0 ? -1 : r == -2 ? -2 : -3;
+    while (hi - lo > 1) {
+        const size_t mid = lo + (hi - lo) / 2;
+        r = nudge(c, lo, mid, start, home, goal, steps);
+        if (r == 1) hi = mid;
+        else if (r == 0) lo = mid; // then it is in the other half: checked alone below
+        else return r == -2 ? -2 : -3;
+    }
+    for (int again = 0; again < 2; ++again) { // alone, twice: no coincidence
+        r = nudge(c, lo, hi, start, home, goal, steps);
+        if (r != 1) return r == 0 ? -4 : r == -2 ? -2 : -3;
+    }
+    return static_cast<long long>(lo);
+}
+void search_say(const char* fmt, ...)
+{
+    char buf[400];
+    va_list a; va_start(a, fmt); std::vsnprintf(buf, sizeof buf, fmt, a); va_end(a);
+    line("search: %s", buf);
+    std::lock_guard<std::mutex> l(g.trial_m);
+    g.search_lines.push_back(buf);
+}
+void search_end(int state, const char* fmt, ...)
+{
+    char buf[480];
+    va_list a; va_start(a, fmt); std::vsnprintf(buf, sizeof buf, fmt, a); va_end(a);
+    line("search: RESULT %s: %s", state == 2 ? "FOUND" : state == 4 ? "STOPPED" : "NOT FOUND", buf);
+    std::lock_guard<std::mutex> l(g.trial_m);
+    g.search_state = state; g.search_text = buf;
+}
+// True when the number was found (the writing trial then measured how it must be held).
+bool run_search()
+{
+    hunt::Target start; std::vector<hunt::Entry> board;
+    {
+        std::lock_guard<std::mutex> l(g.board_m);
+        start = g.target; board = g.board.Ranked(200000);
+    }
+    const double home = start.Ratio(), goal = home > 0.60 ? home - 0.05 : home + 0.05;
+    const uint64_t began = GetTickCount64();
+    { std::lock_guard<std::mutex> l(g.trial_m); g.search_state = 1; g.search_text = "The Search is running."; }
+    g.trial_active.store(true);
+    write_verdict();
+    line("search: starting. World %ux%u on a %ux%u screen: the starting value is %.1f%%", start.world_w, start.world_h, start.out_w, start.out_h, home * 100.0);
+    constexpr size_t kMaxCands = 8192;
+    std::map<uint64_t, Cand> found;
+    // Clue: numbers the game's own code reads beside a render-scale name, or on the trail that built the 3D pictures.
+    for (const hunt::Entry& e : board) {
+        if (hunt::IsSizePair(e.kind) || !(e.methods & ~uint32_t(hunt::kMemory)) || !holds(e.address, e.kind, start)) continue;
+        if (found.size() >= kMaxCands) break;
+        Cand& c = found[e.address];
+        c.address = e.address; c.kind = e.kind; c.source |= kByCode;
+    }
+    const size_t by_code = found.size();
+    // Clue: objects that carry a render-scale name (as text, or as a pointer to the text).
+    std::vector<uint64_t> names;
+    sweep_name_text(&names, 4096);
+    std::vector<uint64_t> targets = names;
+    { std::lock_guard<std::mutex> l(g.modules_m); targets.insert(targets.end(), g.name_addresses.begin(), g.name_addresses.end()); }
+    std::vector<PointerHit> pointers;
+    if (!targets.empty()) scan_pointers(targets, 0, &pointers, 8192);
+    for (const uint64_t a : names) add_near(a, 256, kByName, start, &found, kMaxCands);
+    for (const PointerHit& p : pointers) add_near(p.at, 256, kByName, start, &found, kMaxCands);
+    const size_t strong = found.size();
+    // Clue: numbers right beside where the game keeps the 3D picture's size.
+    size_t pairs = 0;
+    for (const hunt::Entry& e : board) {
+        if (!hunt::IsSizePair(e.kind) || !holds(e.address, e.kind, start)) continue;
+        if (++pairs > 4000) break;
+        add_near(e.address, 64, kBySize, start, &found, kMaxCands);
+    }
+    std::vector<Cand> c;
+    c.reserve(found.size());
+    for (const auto& kv : found) if (kv.second.source & (kByCode | kByName)) c.push_back(kv.second);
+    const size_t first_group = c.size();
+    for (const auto& kv : found) if (!(kv.second.source & (kByCode | kByName))) c.push_back(kv.second);
+    search_say("Clues gathered in %.1f s: %zu numbers hold the starting value %.1f%% (%zu read by the game's own render-scale code, %zu in objects "
+               "that carry a render-scale name [%zu name texts, %zu pointers to names], %zu beside the 3D picture's size [%zu size places]).",
+               double(GetTickCount64() - began) / 1000.0, c.size(), home * 100.0, by_code, strong - by_code, names.size(), pointers.size(),
+               c.size() - first_group, (std::min<size_t>)(pairs, 4000));
+    auto finish = [&](bool ok) {
+        g.trial_ended_ms.store(GetTickCount64());
+        if (!ok) g.trial_active.store(false);
+        write_verdict();
+        return ok;
+    };
+    if (c.empty()) {
+        search_end(3, "No number in the game holds the starting value %.1f%% near a render-scale name or beside the 3D picture's size, so there "
+                      "was nothing to nudge.", home * 100.0);
+        return finish(false);
+    }
+    // The world must be steady by itself, or a nudge proves nothing.
+    {
+        hunt::Frame f; int seen = 0, off = 0;
+        const uint64_t t0 = GetTickCount64();
+        while (GetTickCount64() - t0 < 1000) {
+            Sleep(kTickMs);
+            if (!live_frame(&f, 0)) continue;
+            ++seen;
+            if (std::fabs(double(f.world_w) / double(f.out_w) - home) > 0.012) ++off;
+        }
+        if (seen && off * 4 > seen) {
+            search_end(3, "The game changes the size of its 3D picture on its own (it moved in %d of %d checks within a second with nothing "
+                          "written): it is driving its own dynamic resolution, so a nudge cannot be told apart.", off, seen);
+            return finish(false);
+        }
+    }
+    unsigned steps = 0;
+    long long at = hunt_in(c, 0, first_group, start, home, goal, &steps);
+    if (at == -1) at = hunt_in(c, first_group, c.size(), start, home, goal, &steps);
+    search_say("Nudged to %.0f%% in halving groups: %u nudges in %.1f s, every value put back after each.", goal * 100.0, steps,
+               double(GetTickCount64() - began) / 1000.0);
+    if (at < 0) {
+        if (at == -2)
+            search_end(4, "After a nudge the game's 3D picture did not return to its own size, so the Search stopped. Set Render Scale in the "
+                          "game's menu to put it right.");
+        else if (at == -3) search_end(3, "The game stayed in a menu or on a loading screen, so the nudges could not be judged.");
+        else if (at == -4)
+            search_end(3, "A group of numbers moved the 3D picture but no single one did when nudged alone: this game needs more than one "
+                          "number changed together.");
+        else
+            search_end(3, "None of the %zu numbers moved the 3D picture when nudged to %.0f%%: this game does not read its render scale from a "
+                          "number near its name or its picture size.", c.size(), goal * 100.0);
+        return finish(false);
+    }
+    const Cand& hit = c[size_t(at)];
+    search_end(2, "%s at %s is the game's render scale: nudged alone to %.0f%% it moved the 3D picture, three times out of three, and the "
+                  "picture came back each time. Found by: %s%s%s. Whole Search: %.1f s, no slider moves.",
+               hunt::KindName(hit.kind), where_text(hit.address).c_str(), goal * 100.0, (hit.source & kByCode) ? "[the game's render-scale code] " : "",
+               (hit.source & kByName) ? "[an object carrying a render-scale name] " : "", (hit.source & kBySize) ? "[beside the 3D picture's size]" : "",
+               double(GetTickCount64() - began) / 1000.0);
+    finish(true);
+    hunt::Entry e; e.address = hit.address; e.kind = hit.kind;
+    run_trial(std::vector<hunt::Entry>{e}); // how it must be held, and the routes to it
+    return true;
+}
 void trial_worker()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     uint32_t reported = 0;
+    bool searched = false;
     for (;;) {
         Sleep(500);
         if (g.sweeping.load()) continue;
+        // The Search: once the world has been steady since the first memory search, with no slider moves.
+        if (g.search_wanted.load() && !searched && !g.scale_changes.load() && g.names_done.load()) {
+            const uint64_t since = g.last_size_event_ms.load();
+            bool have;
+            { std::lock_guard<std::mutex> l(g.board_m); have = g.have_target; }
+            hunt::Frame f;
+            if (have && since && GetTickCount64() - since >= 6000 && live_frame(&f, 0)) {
+                searched = true;
+                if (run_search()) return;
+                continue;
+            }
+        }
         // The writer watch goes on as soon as a scale number is confirmed, so a further change by the
         // player is caught too; what it has seen so far is reported as it comes.
         if (!watch_on() && !watch_done()) {
@@ -1107,6 +1422,7 @@ void trial_worker()
 } // namespace
 
 void SetTrial(bool on) { g.trial_wanted.store(on); }
+void SetSearch(bool on) { g.search_wanted.store(on); if (on) g.trial_wanted.store(true); }
 void Start(const wchar_t* log_path, const wchar_t* verdict_path)
 {
     if (g.active.load() || !log_path || !*log_path) return;

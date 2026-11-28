@@ -206,6 +206,10 @@ DWORD WINAPI InitThread(LPVOID)
                 na::scale::witness::SetTrial(true);
                 boot_log("scale witness: WRITING TRIAL on (after a scale number is confirmed, NeuralAlias sets it itself and puts it back)");
             }
+            if (finder_test && GetPrivateProfileIntW(L"scale", L"search", 0, g_ini) == 1) {
+                na::scale::witness::SetSearch(true);
+                boot_log("scale witness: THE SEARCH on (NeuralAlias finds the render-scale number by itself: starting value, names, a 5-point nudge)");
+            }
             if (finder_test) boot_log("scale witness: FINDER TEST, DLSS/DLAA held off; result in NeuralAlias-scale-test-result.txt");
             na::scale::witness::Start(witness_log, finder_test && verdict_fits ? verdict : nullptr);
             boot_log("scale witness: on (log only; several searches for the game's render-scale number run together)");

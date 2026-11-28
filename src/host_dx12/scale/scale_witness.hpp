@@ -47,6 +47,11 @@ bool TestMode();
 // the game's world follows and how it must be held, the game's value is put back, and routes from the
 // game's program to the working number are searched. Results go to the verdict file ("HIJACK: ...").
 void SetTrial(bool on);
+// The Search ([scale] search=1, with the finder test; call before Start): at launch, with no slider moves,
+// NeuralAlias gathers the numbers that hold the starting value in objects carrying a render-scale name or
+// beside the 3D picture's size, nudges them by five points in halving groups, and keeps the one the game
+// obeys. The writing trial then runs on it. Results: "SEARCH: ..." and "NEXT STAGE: ..." in the verdict file.
+void SetSearch(bool on);
 
 namespace analysis {
 namespace locator = na::scale::native::locator;
