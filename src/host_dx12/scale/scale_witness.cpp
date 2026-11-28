@@ -941,8 +941,9 @@ void watch_report(bool final)
             std::string text = where_text(g_watch_address[w.slot]) + " is written by game code at " + where_text(h.rip - 1);
             char buf[200];
             std::snprintf(buf, sizeof buf, " (%u time(s), %u of them right after NeuralAlias wrote another number, thread %u). Called from: ", w.times, w.during_trial, h.thread);
+            if (g_watch_slot_hits[w.slot].load() >= kWatchPerSlot)
+                text.insert(text.find(" is written by"), " [rewritten constantly: a copy the game keeps refreshing]");
             text += buf;
-            if (g_watch_slot_hits[w.slot].load() >= kWatchPerSlot) text += "[rewritten constantly: this number is a copy the game keeps refreshing] ";
             unsigned shown = 0; std::string shared, named;
             for (unsigned k = 0; k < h.count && shown < kGameFrames; ++k) {
                 const uint64_t a = reinterpret_cast<uint64_t>(h.frames[k]) - 1;
@@ -1001,7 +1002,6 @@ void run_trial()
             if (e.Confirmed() && !hunt::IsSizePair(e.kind) && scales.size() < 12) scales.push_back(e);
     }
     const double home = start.Ratio();
-    // Ask for something clearly different from where the game is, and inside what any game allows.
     // A small nudge the player will not notice: five points down, or up when the game is already low.
     const double goal = home > 0.60 ? home - 0.05 : home + 0.05;
     watch_rearm(); // threads the game started since
