@@ -139,6 +139,9 @@ na_host_test(shader_operation_test SOURCES shader_operation_test.cpp LIBS host_o
 na_host_test(render_scale_patch_test SOURCES render_scale_patch_test.cpp)
 na_host_test(settings_read_hook_test SOURCES settings_read_hook_test.cpp LIBS host_scale)
 na_host_test(scale_witness_test SOURCES scale_witness_test.cpp LIBS minhook)
+# The writing trial end to end with a pretend game (no GPU): NeuralAlias sets the confirmed number itself.
+na_host_test(scale_trial_test SOURCES scale_trial_test.cpp LIBS host_scale_witness winmm)
+set_tests_properties(host_scale_trial_test PROPERTIES TIMEOUT 420)
 na_host_test(session_exit_test SOURCES session_exit_test.cpp LIBS host_dx12)
 na_host_test(nr_settings_trace_test SOURCES nr_settings_trace_test.cpp LIBS host_settings)
 na_host_test(route_a_menu_test SOURCES route_a_menu_test.cpp ${NA_UI_RESOURCES} LIBS host_dx12)

@@ -42,6 +42,11 @@ bool Active();
 // Finder test ([scale] test=1): the witness runs with DLSS/DLAA held off, and writes the verdict file.
 void SetTestMode(bool on);
 bool TestMode();
+// Writing trial ([scale] trial=1, with the finder test; call before Start): once a scale number is confirmed
+// and the world is steady, NeuralAlias writes each confirmed number itself, a ResponseJudge watches whether
+// the game's world follows and how it must be held, the game's value is put back, and routes from the
+// game's program to the working number are searched. Results go to the verdict file ("HIJACK: ...").
+void SetTrial(bool on);
 
 namespace analysis {
 namespace locator = na::scale::native::locator;

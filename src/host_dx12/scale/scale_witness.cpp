@@ -12,6 +12,9 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
+#include <algorithm>
+#include <cmath>
 
 namespace na::scale::witness {
 namespace {
@@ -24,6 +27,7 @@ constexpr unsigned kMaxChains = 48, kMaxSizesSeen = 16, kMaxLogLines = 6000, kTo
 constexpr size_t kChunk = 1u << 20;         // memory sweep: 1 MB at a time
 constexpr uint64_t kSweepBudget = 24ull << 30;
 constexpr size_t kMaxImage = 1u << 30;
+constexpr size_t kPercentRoom = 50000;      // of the board's 200,000 places
 
 struct Capture {
     const char* api = "";
@@ -31,6 +35,14 @@ struct Capture {
     uint32_t w = 0, h = 0;
     void* frames[kFrames]{};
     unsigned count = 0;
+};
+struct TrialRow {
+    uint64_t address = 0; hunt::Kind kind = hunt::Kind::ScaleF32;
+    double before = 0, asked = 0, achieved = 0;
+    hunt::Verdict verdict = hunt::Verdict::Idle; hunt::Hold hold = hunt::Hold::Once;
+    uint32_t reverts = 0, writes = 0, respond_ms = 0;
+    bool kept_value = false, restored = false, skipped = false;
+    const char* note = "";
 };
 struct Module {
     uint64_t base = 0; size_t size = 0; std::string name;
@@ -58,6 +70,15 @@ struct State {
     std::mutex log_m; FILE* log = nullptr; unsigned lines = 0;
     // Code worker only.
     std::map<uint64_t, Module> modules; std::set<uint64_t> chains; uint64_t self_base = 0;
+    // The world's size right now (largest viewport of the last 100 ms), for the writing trial.
+    std::atomic<uint64_t> fast_start{0}, fast_best{0}, live_size{0}, live_ms{0};
+    // The writing trial ([scale] trial=1): NeuralAlias sets each confirmed number itself and the judge
+    // watches whether the game's world follows.
+    std::atomic<bool> trial_wanted{false}, trial_active{false}, sweeping{false};
+    std::atomic<uint64_t> last_size_event_ms{0}, trial_ended_ms{0};
+    std::mutex trial_m; std::vector<TrialRow> trial_rows; std::vector<std::string> trial_paths;
+    int trial_state = 0; // 0 not run, 1 running, 2 finished, 3 stopped (the world did not come back)
+    std::string trial_note;
 };
 State& g = *new State;
 
@@ -405,7 +426,7 @@ void sweep(const hunt::Target& t)
     std::vector<uint8_t> buffer(kChunk + 8);
     std::vector<hunt::Hit> hits;
     hunt::SweepOptions options;
-    uint64_t scanned = 0, regions = 0, total_hits = 0;
+    uint64_t scanned = 0, regions = 0, total_hits = 0, percent_left_out = 0;
     SYSTEM_INFO si{}; GetSystemInfo(&si);
     uint64_t at = reinterpret_cast<uint64_t>(si.lpMinimumApplicationAddress);
     const uint64_t top = reinterpret_cast<uint64_t>(si.lpMaximumApplicationAddress);
@@ -430,7 +451,13 @@ void sweep(const hunt::Target& t)
             hunt::SweepBlock(buffer.data(), got, base + off, t, options, hits);
             if (!hits.empty()) {
                 std::lock_guard<std::mutex> l(g.board_m);
-                for (const hunt::Hit& h : hits) g.board.Report(h.address, h.kind, hunt::kMemory, true);
+                for (const hunt::Hit& h : hits) {
+                    // A whole number such as 70 or 50 is everywhere in a program's memory. Such finds may
+                    // fill a quarter of the board, never the room the scale numbers and sizes need
+                    // (Crusader Kings III 2026-11-28: over a million dropped at the board's limit).
+                    if (h.kind == hunt::Kind::PercentI32 && g.board.Size() >= kPercentRoom) { ++percent_left_out; continue; }
+                    g.board.Report(h.address, h.kind, hunt::kMemory, true);
+                }
                 total_hits += hits.size();
             }
             if (((off / kChunk) & 15) == 15) Sleep(1); // every 16 MB: let the game have the core
@@ -440,11 +467,15 @@ void sweep(const hunt::Target& t)
     line("memory: searched %.1f GB in %llu regions in %.1f s for world %ux%u (scale %.4f%s): %llu matches", double(scanned) / double(1ull << 30),
          static_cast<unsigned long long>(regions), double(GetTickCount64() - started) / 1000.0, t.world_w, t.world_h, t.Ratio(),
          t.Distinct() ? "" : ", full size: size pairs only", static_cast<unsigned long long>(total_hits));
+    if (percent_left_out) line("memory: %llu whole-number percent matches left out (that kind is limited to %zu places on the board)",
+                               static_cast<unsigned long long>(percent_left_out), kPercentRoom);
 }
 // ---- the test verdict: PASS or FAIL with the reason, rewritten after every event ----
 void write_verdict()
 {
     if (g.verdict_path.empty()) return;
+    static std::mutex one_writer; // the memory worker and the trial both rewrite the file
+    std::lock_guard<std::mutex> writer(one_writer);
     std::vector<hunt::Entry> top; hunt::Target t; bool have; size_t size;
     {
         std::lock_guard<std::mutex> l(g.board_m);
@@ -503,6 +534,39 @@ void write_verdict()
         std::fprintf(f, "  CONFIRMED %s at %s, value now %g, found by [%s], followed %u\n", hunt::KindName(e.kind), where_text(e.address).c_str(), v,
                      methods_text(e.methods).c_str(), e.followed);
     }
+    {   // The writing trial: did the game follow when NeuralAlias set the number itself?
+        std::lock_guard<std::mutex> l(g.trial_m);
+        if (g.trial_wanted.load()) {
+            const TrialRow* works = nullptr;
+            for (const auto& r : g.trial_rows)
+                if (!r.skipped && (r.verdict == hunt::Verdict::Responded || r.verdict == hunt::Verdict::Snapped) && r.restored && !works) works = &r;
+            std::fprintf(f, "\nWRITING TRIAL (NeuralAlias sets the number itself; the game's own value is put back after each try)\n");
+            if (g.trial_state == 0)
+                std::fprintf(f, "HIJACK: NOT RUN YET. It starts by itself once a scale number is confirmed and the world has been steady for 6 seconds.\n");
+            else if (g.trial_state == 1) std::fprintf(f, "HIJACK: RUNNING (%zu tried so far)\n", g.trial_rows.size());
+            else if (g.trial_state == 3) std::fprintf(f, "HIJACK: STOPPED. %s\n", g.trial_note.c_str());
+            else if (works)
+                std::fprintf(f, "HIJACK: PASS. Writing %s at %s moved the game's 3D world to %.1f%% in %u ms; the game %s. It was put back afterwards.\n",
+                             hunt::KindName(works->kind), where_text(works->address).c_str(), works->achieved * 100.0, works->respond_ms,
+                             works->hold == hunt::Hold::Once ? "kept it with one write" : works->hold == hunt::Hold::EveryFrame ? "needs it written every frame"
+                             : works->hold == hunt::Hold::Periodic ? "needs it written again on a rhythm" : "puts its own value back now and then, and a new write restores it");
+            else std::fprintf(f, "HIJACK: FAIL. None of the %zu confirmed numbers moved the world when written: this game applies its render scale "
+                              "through a command, not by reading the number each frame.\n", g.trial_rows.size());
+            for (const auto& r : g.trial_rows) {
+                if (r.skipped) { std::fprintf(f, "  %s at %s: not tried (%s)\n", hunt::KindName(r.kind), where_text(r.address).c_str(), r.note); continue; }
+                std::fprintf(f, "  %s at %s: was %g, asked %.0f%% -> %s", hunt::KindName(r.kind), where_text(r.address).c_str(), r.before, r.asked * 100.0,
+                             hunt::VerdictName(r.verdict));
+                if (r.verdict == hunt::Verdict::Responded || r.verdict == hunt::Verdict::Snapped)
+                    std::fprintf(f, " at %.1f%% after %u ms, hold: %s, reverts %u", r.achieved * 100.0, r.respond_ms, hunt::HoldName(r.hold), r.reverts);
+                std::fprintf(f, "; writes %u; the game %s our value in memory; put back: %s%s%s\n", r.writes, r.kept_value ? "kept" : "replaced",
+                             r.restored ? "yes" : "NO", r.note[0] ? "; " : "", r.note);
+            }
+            if (!g.trial_paths.empty()) {
+                std::fprintf(f, "  How to reach the working number from the game's program on a later launch (%zu routes):\n", g.trial_paths.size());
+                for (const auto& path : g.trial_paths) std::fprintf(f, "    %s\n", path.c_str());
+            }
+        }
+    }
     std::fclose(f);
 }
 void memory_worker()
@@ -515,15 +579,26 @@ void memory_worker()
             g.mem_cv.wait_for(l, std::chrono::seconds(5), [] { return !g.sizes.empty(); });
             if (!g.sizes.empty()) { t = g.sizes.back(); g.sizes.clear(); event = true; } // only the newest size matters
         }
+        // The writing trial changes the world's size itself: those changes are not the player's, and
+        // prove nothing about the candidates. Nothing is counted during it or for 6 s after.
+        const uint64_t ended = g.trial_ended_ms.load();
+        const bool ours = g.trial_active.load() || (ended && GetTickCount64() - ended < 6000);
         if (!event) {
             // Quiet time: a candidate that changes while the world does not is a timer, not a setting.
-            {
+            if (!ours) {
                 std::lock_guard<std::mutex> l(g.board_m);
                 if (g.have_target) g.board.Steady(g.target, &holds);
             }
             write_verdict();
             continue;
         }
+        if (ours) continue;
+        {
+            std::lock_guard<std::mutex> l(g.board_m);
+            if (g.have_target && t.world_w == g.target.world_w && t.world_h == g.target.world_h &&
+                t.out_w == g.target.out_w && t.out_h == g.target.out_h) continue; // back where it was
+        }
+        g.last_size_event_ms.store(GetTickCount64());
         bool first, scale_changed = false;
         {
             std::lock_guard<std::mutex> l(g.board_m);
@@ -540,7 +615,10 @@ void memory_worker()
             line("render scale changed: world now %ux%u on a %ux%u screen (scale %.4f)", t.world_w, t.world_h, t.out_w, t.out_h, t.Ratio());
             log_ranking("after the scale change, before the new search");
         } else line("screen size changed (same scale): world now %ux%u on a %ux%u screen", t.world_w, t.world_h, t.out_w, t.out_h);
+        g.sweeping.store(true);
         sweep(t); // also finds settings objects the game created since the last search
+        g.sweeping.store(false);
+        g.last_size_event_ms.store(GetTickCount64());
         log_ranking(first ? "after the first search" : "after the new search");
         write_verdict();
     }
@@ -561,6 +639,248 @@ void enqueue_chain(const char* api, uint32_t method, uint32_t w, uint32_t h)
 }
 } // namespace
 
+namespace {
+// ---- the writing trial ----
+bool safe_write(uint64_t address, const void* in, size_t n)
+{
+    MEMORY_BASIC_INFORMATION m{};
+    if (address < 0x10000 || !VirtualQuery(ptr(address), &m, sizeof m) || m.State != MEM_COMMIT || !writable_protect(m.Protect)) return false;
+    if (address + n > reinterpret_cast<uint64_t>(m.BaseAddress) + m.RegionSize) return false;
+    SIZE_T put = 0;
+    return WriteProcessMemory(GetCurrentProcess(), const_cast<void*>(ptr(address)), in, n, &put) && put == n;
+}
+size_t kind_bytes(hunt::Kind k) { return k == hunt::Kind::ScaleF64 ? 8 : 4; }
+bool write_scale(uint64_t address, hunt::Kind k, double scale)
+{
+    switch (k) {
+    case hunt::Kind::ScaleF32: { const float v = float(scale); return safe_write(address, &v, 4); }
+    case hunt::Kind::ScaleF64: return safe_write(address, &scale, 8);
+    case hunt::Kind::PercentI32: { const int32_t v = int32_t(scale * 100.0 + 0.5); return safe_write(address, &v, 4); }
+    case hunt::Kind::PercentF32: { const float v = float(scale * 100.0); return safe_write(address, &v, 4); }
+    default: return false; // a size is the result, not the command
+    }
+}
+// The world as it is drawn right now. False in a menu or on a loading screen.
+bool live_frame(hunt::Frame* f, uint64_t index)
+{
+    f->index = index;
+    f->out_w = g.out_w.load(std::memory_order_relaxed); f->out_h = g.out_h.load(std::memory_order_relaxed);
+    const uint64_t size = g.live_size.load(std::memory_order_relaxed), at = g.live_ms.load(std::memory_order_relaxed);
+    f->world_seen = size && f->out_w && GetTickCount64() - at < 400;
+    f->world_w = uint32_t(size >> 32); f->world_h = uint32_t(size & 0xffffffffu);
+    return f->world_seen;
+}
+constexpr DWORD kTickMs = 16;
+// Ask for `goal` by writing `address` whenever the judge says a write is due; watch for up to `watch_ms`
+// after the game answered (that is where a game that puts its own value back shows itself).
+void drive(hunt::ResponseJudge& judge, uint64_t address, hunt::Kind kind, double goal, uint32_t watch_ms, TrialRow* row)
+{
+    uint64_t index = 0;
+    const uint64_t began = GetTickCount64();
+    uint64_t answered = 0;
+    judge.Ask(goal, index);
+    for (;;) {
+        ++index;
+        if (judge.NeedsCommand(index)) {
+            if (write_scale(address, kind, goal)) { judge.Commanded(index); if (row) ++row->writes; }
+            else break; // the memory went away
+        }
+        Sleep(kTickMs);
+        hunt::Frame f;
+        live_frame(&f, index);
+        const hunt::Verdict v = judge.Observe(f);
+        const uint64_t now = GetTickCount64();
+        if ((v == hunt::Verdict::Responded || v == hunt::Verdict::Snapped) && !answered) {
+            answered = now;
+            if (row) row->respond_ms = uint32_t(now - began);
+        }
+        if (v == hunt::Verdict::Ignored || v == hunt::Verdict::Refused) break;
+        if (answered && now - answered >= watch_ms) break;
+        if (now - began > 20000) break; // menus give no evidence: never wait for ever
+    }
+}
+// Where in the game's memory do pointers to these places live? One pass over memory for all of them.
+struct PointerHit { uint64_t at = 0; uint32_t offset = 0; uint32_t child = 0; bool in_program = false; };
+void scan_pointers(const std::vector<uint64_t>& targets, uint32_t reach, std::vector<PointerHit>* out, size_t limit)
+{
+    if (targets.empty()) return;
+    std::vector<std::pair<uint64_t, uint32_t>> sorted; // address, index in targets
+    for (uint32_t i = 0; i < targets.size(); ++i) sorted.emplace_back(targets[i], i);
+    std::sort(sorted.begin(), sorted.end());
+    const uint64_t lowest = sorted.front().first >= reach ? sorted.front().first - reach : 0, highest = sorted.back().first;
+    std::vector<uint8_t> buffer(kChunk + 8);
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    uint64_t at = reinterpret_cast<uint64_t>(si.lpMinimumApplicationAddress), scanned = 0;
+    const uint64_t top = reinterpret_cast<uint64_t>(si.lpMaximumApplicationAddress);
+    const uint64_t own = reinterpret_cast<uint64_t>(buffer.data());
+    while (at < top && scanned < kSweepBudget && out->size() < limit) {
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQuery(ptr(at), &m, sizeof m)) break;
+        const uint64_t base = reinterpret_cast<uint64_t>(m.BaseAddress), size = m.RegionSize;
+        at = base + size;
+        if (m.State != MEM_COMMIT || !writable_protect(m.Protect) || m.Type == MEM_MAPPED) continue;
+        if (base <= own && own < base + size) continue;
+        const bool in_program = m.Type == MEM_IMAGE;
+        for (uint64_t off = 0; off < size && scanned < kSweepBudget && out->size() < limit; off += kChunk) {
+            const size_t want = size_t((std::min<uint64_t>)(kChunk, size - off));
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), ptr(base + off), buffer.data(), want, &got) || got < 8) break;
+            scanned += got;
+            for (size_t i = 0; i + 8 <= got; i += 8) {
+                uint64_t v; std::memcpy(&v, buffer.data() + i, 8);
+                if (v < lowest || v > highest) continue;
+                auto it = std::lower_bound(sorted.begin(), sorted.end(), std::make_pair(v, uint32_t(0)));
+                if (it == sorted.end() || it->first - v > reach) continue;
+                out->push_back(PointerHit{base + off + i, uint32_t(it->first - v), it->second, in_program});
+                if (out->size() >= limit) break;
+            }
+            if (((off / kChunk) & 15) == 15) Sleep(1);
+        }
+    }
+}
+// Routes from the game's own program (a fixed place on every launch) to the working number: at most
+// three pointers deep. Logged and put in the result; a later launch can follow one instead of searching.
+void find_routes(uint64_t address)
+{
+    struct Node { uint64_t at; uint32_t offset; int parent; }; // parent = index of the node this one points to (-1: the number)
+    std::vector<Node> nodes;
+    std::vector<uint64_t> targets{address};
+    std::vector<int> target_node{-1};
+    std::vector<std::string> routes;
+    constexpr uint32_t kReach = 0x1000;
+    const uint64_t began = GetTickCount64();
+    for (int depth = 1; depth <= 3 && routes.size() < 8 && !targets.empty(); ++depth) {
+        std::vector<PointerHit> hits;
+        scan_pointers(targets, kReach, &hits, 200000);
+        // Nearest pointers first: an object's own fields are close to its start.
+        std::sort(hits.begin(), hits.end(), [](const PointerHit& a, const PointerHit& b) {
+            return a.in_program != b.in_program ? a.in_program : a.offset < b.offset;
+        });
+        std::vector<uint64_t> next; std::vector<int> next_node;
+        for (const PointerHit& h : hits) {
+            const int node = int(nodes.size());
+            if (h.in_program) {
+                if (routes.size() >= 8) continue;
+                // Written from the program outwards: [program place] +offset -> ... -> the number.
+                std::string text = where_text(h.at);
+                char part[48];
+                std::snprintf(part, sizeof part, " -> +0x%x", h.offset);
+                text += part;
+                for (int p = target_node[h.child]; p >= 0; p = nodes[size_t(p)].parent) {
+                    std::snprintf(part, sizeof part, " -> +0x%x", nodes[size_t(p)].offset);
+                    text += part;
+                }
+                routes.push_back(text);
+            } else if (next.size() < 2048) {
+                nodes.push_back(Node{h.at, h.offset, target_node[h.child]});
+                next.push_back(h.at); next_node.push_back(node);
+            }
+        }
+        line("trial: route search depth %d: %zu pointers found, %zu routes from the program so far", depth, hits.size(), routes.size());
+        targets.swap(next); target_node.swap(next_node);
+    }
+    line("trial: route search took %.1f s; %zu routes", double(GetTickCount64() - began) / 1000.0, routes.size());
+    for (const auto& r : routes) line("trial: route %s", r.c_str());
+    std::lock_guard<std::mutex> l(g.trial_m);
+    g.trial_paths = routes;
+}
+void run_trial()
+{
+    std::vector<hunt::Entry> scales; hunt::Target start;
+    {
+        std::lock_guard<std::mutex> l(g.board_m);
+        start = g.target;
+        for (const auto& e : g.board.Ranked(256))
+            if (e.Confirmed() && !hunt::IsSizePair(e.kind) && scales.size() < 12) scales.push_back(e);
+    }
+    const double home = start.Ratio();
+    // Ask for something clearly different from where the game is, and inside what any game allows.
+    const double goal = home > 0.85 ? 0.70 : 1.0;
+    line("trial: starting. World %ux%u (%.1f%%), asking each of %zu confirmed numbers for %.0f%%", start.world_w, start.world_h, home * 100.0, scales.size(), goal * 100.0);
+    { std::lock_guard<std::mutex> l(g.trial_m); g.trial_state = 1; }
+    g.trial_active.store(true);
+    uint64_t works = 0; bool stopped = false;
+    for (const hunt::Entry& e : scales) {
+        TrialRow row; row.address = e.address; row.kind = e.kind; row.asked = goal;
+        uint8_t saved[8]{};
+        const size_t n = kind_bytes(e.kind);
+        hunt::Frame now_frame;
+        if (!live_frame(&now_frame, 0)) { row.skipped = true; row.note = "the game was in a menu or loading"; }
+        else if (!safe_read(e.address, saved, n) || !holds(e.address, e.kind, start)) { row.skipped = true; row.note = "it no longer holds the game's current scale"; }
+        else if (!ReadKind(reader(), e.address, e.kind, &row.before)) { row.skipped = true; row.note = "it could not be read"; }
+        if (!row.skipped) {
+            hunt::ResponseJudge judge;
+            drive(judge, e.address, e.kind, goal, 3000, &row);
+            row.verdict = judge.State(); row.hold = judge.HoldPolicy(); row.reverts = judge.Reverts(); row.achieved = judge.Achieved();
+            if (row.verdict == hunt::Verdict::Reverted || row.verdict == hunt::Verdict::Waiting)
+                row.verdict = row.respond_ms ? hunt::Verdict::Responded : hunt::Verdict::Ignored; // ended mid-watch
+            hunt::Target asked = start; asked.world_w = uint32_t(start.out_w * goal + 0.5); asked.world_h = uint32_t(start.out_h * goal + 0.5);
+            row.kept_value = holds(e.address, e.kind, asked);
+            // Put the game's own value back, and make sure the world is back before the next try.
+            safe_write(e.address, saved, n);
+            hunt::Frame f;
+            const uint64_t t0 = GetTickCount64();
+            bool back = false;
+            int steady = 0;
+            while (GetTickCount64() - t0 < 6000 && !back) {
+                Sleep(kTickMs);
+                if (!live_frame(&f, 0)) continue;
+                steady = std::fabs(double(f.world_w) / double(f.out_w) - home) <= 0.012 ? steady + 1 : 0;
+                back = steady >= 20;
+            }
+            if (!back) { // the game kept our size: ask for the original the same way
+                hunt::ResponseJudge undo;
+                drive(undo, e.address, e.kind, home, 500, nullptr);
+                safe_write(e.address, saved, n);
+                back = undo.State() == hunt::Verdict::Responded || undo.State() == hunt::Verdict::Snapped;
+            }
+            row.restored = back;
+            line("trial: %s at %s: was %g, asked %.0f%% -> %s (achieved %.1f%%, %u ms, hold %s, reverts %u, writes %u, value %s, put back %s)",
+                 hunt::KindName(e.kind), where_text(e.address).c_str(), row.before, goal * 100.0, hunt::VerdictName(row.verdict), row.achieved * 100.0,
+                 row.respond_ms, hunt::HoldName(row.hold), row.reverts, row.writes, row.kept_value ? "kept" : "replaced", back ? "yes" : "NO");
+            if (!works && back && (row.verdict == hunt::Verdict::Responded || row.verdict == hunt::Verdict::Snapped)) works = e.address;
+            if (!back) stopped = true;
+        } else line("trial: %s at %s: not tried (%s)", hunt::KindName(e.kind), where_text(e.address).c_str(), row.note);
+        { std::lock_guard<std::mutex> l(g.trial_m); g.trial_rows.push_back(row); }
+        write_verdict();
+        if (stopped) break;
+        Sleep(700);
+    }
+    g.trial_ended_ms.store(GetTickCount64());
+    g.trial_active.store(false);
+    {
+        std::lock_guard<std::mutex> l(g.trial_m);
+        g.trial_state = stopped ? 3 : 2;
+        if (stopped) g.trial_note = "After one try the game's 3D world did not return to its own size, so no further numbers were tried. "
+                                    "Set Render Scale in the game's menu to put it right.";
+    }
+    write_verdict();
+    if (works) { find_routes(works); write_verdict(); }
+    line("trial: finished");
+}
+void trial_worker()
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        Sleep(500);
+        if (g.sweeping.load()) continue;
+        const uint64_t last = g.last_size_event_ms.load();
+        if (!last || GetTickCount64() - last < 6000) continue; // the player may still be changing it
+        bool ready = false;
+        {
+            std::lock_guard<std::mutex> l(g.board_m);
+            if (g.have_target)
+                for (const auto& e : g.board.Ranked(256)) if (e.Confirmed() && !hunt::IsSizePair(e.kind)) { ready = true; break; }
+        }
+        hunt::Frame f;
+        if (!ready || !live_frame(&f, 0)) continue;
+        run_trial();
+        return; // once a run
+    }
+}
+} // namespace
+
+void SetTrial(bool on) { g.trial_wanted.store(on); }
 void Start(const wchar_t* log_path, const wchar_t* verdict_path)
 {
     if (g.active.load() || !log_path || !*log_path) return;
@@ -570,6 +890,7 @@ void Start(const wchar_t* log_path, const wchar_t* verdict_path)
     try {
         std::thread(code_worker).detach();
         std::thread(memory_worker).detach();
+        if (g.trial_wanted.load()) std::thread(trial_worker).detach();
     } catch (...) { return; }
     g.active.store(true);
 }
@@ -591,6 +912,15 @@ void OnWorldViewport(const char* api, float fw, float fh)
     const uint32_t w = uint32_t(fw + 0.5f), h = uint32_t(fh + 0.5f);
     g.viewports.fetch_add(1, std::memory_order_relaxed);
     const uint64_t size = pack(w, h), now = GetTickCount64();
+    {   // The size right now: the largest viewport of each 100 ms.
+        uint64_t fb = g.fast_best.load(std::memory_order_relaxed);
+        if (uint64_t(w) * h > (fb >> 32) * (fb & 0xffffffffu)) g.fast_best.store(size, std::memory_order_relaxed);
+        uint64_t fs = g.fast_start.load(std::memory_order_relaxed);
+        if (now - fs >= 100 && g.fast_start.compare_exchange_strong(fs, now, std::memory_order_relaxed)) {
+            const uint64_t done = g.fast_best.exchange(0, std::memory_order_relaxed);
+            if (done) { g.live_size.store(done, std::memory_order_relaxed); g.live_ms.store(now, std::memory_order_relaxed); }
+        }
+    }
     // The world's size = the largest viewport set on it within a window (smaller ones are
     // part-screen passes). A size must hold for two windows before it counts as a change.
     uint64_t best = g.window_best.load(std::memory_order_relaxed);
