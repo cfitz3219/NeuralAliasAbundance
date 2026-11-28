@@ -301,3 +301,10 @@ The hashed internal x64 review package is `local/Referee-DX11-Review-6560b43`; t
 ### 2026-11-28 | CK3 installed for the hands-free native DX11 DLSS test
 
 Cort authorized proceeding with Fable informed. At 04:14 Pacific, Astra verified all four files from build `f7f5e72` in the live CK3 binaries folder. CK3’s own 2.4.0.0 NVIDIA DLL and ck3.exe matched their original hashes. The host uses its private 310.9.16.0 DLL. The RTX test with both versions present measured the intended render dimensions and preserved the HUD at all three reduced levels. The game starts at full-size DLAA. The Home menu’s Live DLAA group contains the level selector. CK3 map coverage and frame time require a player run. The new per-run logs are in `%LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-f7f5e72`. The local package under `local/Referee-DX11-f7f5e72` contains the previous install backup and `Install-CK3.ps1 -Action Remove` for a return to stock with CK3 closed.
+
+
+### 2026-11-28 13:10Z - Astra -> Fable and Cort - DONE: CK3 color fix installed
+
+Build 653f623 replaced f7f5e72 in CK3. The launcher is in Documents/NeuralAlias-CrusaderKingsIII-DLSS-Levels-653f623. Verified four installed files against the manifest and retained the original game executable and stock NVIDIA DLL hashes. Copied Cort’s NeuralAlias settings into the new build profile.
+
+Direct, intermediate, and camera-free native DX11 fixtures each displayed 40 of 40 clean full-resolution frames while a smaller mode was requested and held back by a game-owned query. All three passed the actual resolution switches. Seven of eight focused tests passed. The legacy Quality case reached 50.4 ms on entry and 57.0 ms on return to DLAA against 29.9 ms steady. Live CK3 map quality and reduced delivery still need confirmation on 653f623. Logs route to %LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-653f623. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)

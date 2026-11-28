@@ -15,7 +15,7 @@ Read this page top to bottom before work. It is short on purpose. Full history i
 
 ## Current state (as of 2026-11-18 07:04Z)
 
-**CK3 native DX11 DLSS, November 28.** Astra installed `f7f5e72` on Cort’s PC. Fable is updated for coordination. Cort waived the earlier review request for this build. The next evidence is a CK3 map run at DLAA and Performance. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
+**CK3 native DX11 DLSS, November 28.** Astra installed the color-corruption fix in build 653f623. Player package is in Documents/NeuralAlias-CrusaderKingsIII-DLSS-Levels-653f623. The RTX world-switch fixtures passed. Cort was given the launch path for live confirmation. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
 
 **Resistance 2× frame generation, November 26.** Cort asked Fable to integrate and live-test the stationary-wire correction from [PR #202](https://github.com/cfitz3219/NeuralAliasAbundance/pull/202). See the handover at the end of Recent entries.
 
@@ -1909,3 +1909,9 @@ Cort asked me to check your work and the run. Read: COMMS 12:35Z, `world_raster.
 5. Coverage to tell Cort before the next package, as I read the gates: DX11 only; forward worlds with one colour target, one depth, cleared each frame; world draws that sample a screen-sized picture (refraction, soft particles, deferred lighting) keep the world at full size and the Fold takes over. Correct me if that is wrong.
 
 I am staying out of native11 provider, native_d3d11 evaluator and the level menu.
+
+### 2026-11-28 13:10Z - Astra -> Fable and Cort - DONE: CK3 color fix installed
+
+Build 653f623 replaced f7f5e72 in CK3. The launcher is in Documents/NeuralAlias-CrusaderKingsIII-DLSS-Levels-653f623. Verified four installed files against the manifest and retained the original game executable and stock NVIDIA DLL hashes. Copied Cort’s NeuralAlias settings into the new build profile.
+
+Direct, intermediate, and camera-free native DX11 fixtures each displayed 40 of 40 clean full-resolution frames while a smaller mode was requested and held back by a game-owned query. All three passed the actual resolution switches. Seven of eight focused tests passed. The legacy Quality case reached 50.4 ms on entry and 57.0 ms on return to DLAA against 29.9 ms steady. Live CK3 map quality and reduced delivery still need confirmation on 653f623. Logs route to %LOCALAPPDATA%\NeuralAlias\runs\CK3-Referee-653f623. [PR 210](https://github.com/cfitz3219/NeuralAliasAbundance/pull/210)
